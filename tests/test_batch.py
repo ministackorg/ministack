@@ -214,6 +214,14 @@ def test_batch_update_compute_environment_create_update_describe(batch):
     assert ce["context"] == "tf-update"
 
 
+def test_batch_update_policy_operation_contract(batch):
+    model = batch.meta.service_model
+    create = model.operation_model("CreateComputeEnvironment").input_shape.members
+    update = model.operation_model("UpdateComputeEnvironment").input_shape.members
+    assert "updatePolicy" not in create
+    assert "updatePolicy" in update
+
+
 def test_batch_update_compute_environment_by_arn(batch):
     name = f"ce-arn-{_uid()}"
     created = batch.create_compute_environment(
@@ -299,8 +307,7 @@ def test_batch_update_compute_environment_merges_compute_resources(batch):
     assert ce["computeResources"]["securityGroupIds"] == ["sg-aaa"]
 
 
-def test_batch_create_compute_environment_persists_update_policy(batch):
-    """CreateComputeEnvironment stores updatePolicy when present (botocore omits it; raw JSON)."""
+def test_batch_create_compute_environment_ignores_update_policy(batch):
     import json
     import urllib.request
 
@@ -333,4 +340,4 @@ def test_batch_create_compute_environment_persists_update_policy(batch):
     ce = batch.describe_compute_environments(computeEnvironments=[name])[
         "computeEnvironments"
     ][0]
-    assert ce["updatePolicy"] == policy
+    assert "updatePolicy" not in ce

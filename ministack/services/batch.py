@@ -175,8 +175,6 @@ def _create_compute_environment(p):
         "serviceRole": p.get("serviceRole", ""),
         "tags": p.get("tags", {}),
     }
-    if "updatePolicy" in p:
-        rec["updatePolicy"] = p["updatePolicy"]
     if "unmanagedvCpus" in p:
         rec["unmanagedvCpus"] = p["unmanagedvCpus"]
     if "context" in p:
