@@ -321,6 +321,284 @@ def test_kms_generate_data_key_without_plaintext(kms_client):
     assert resp["CiphertextBlob"]
     assert "Plaintext" not in resp
 
+def test_kms_generate_data_key_pair_ed25519(kms_client):
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    resp = kms_client.generate_data_key_pair(
+        KeyId=key_id, KeyPairSpec="ECC_NIST_EDWARDS25519"
+    )
+    assert key_id in resp["KeyId"]
+    assert resp["KeyPairSpec"] == "ECC_NIST_EDWARDS25519"
+    assert resp["PrivateKeyCiphertextBlob"]
+    # Unlike the WithoutPlaintext variant, this one does hand back the private key.
+    assert len(resp["PrivateKeyPlaintext"]) == 48
+    assert len(resp["PublicKey"]) == 44
+
+def test_kms_generate_data_key_pair_plaintext_matches_ciphertext(kms_client):
+    """PrivateKeyPlaintext must be the same key that PrivateKeyCiphertextBlob wraps."""
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    resp = kms_client.generate_data_key_pair(
+        KeyId=key_id, KeyPairSpec="ECC_NIST_EDWARDS25519"
+    )
+    dec_resp = kms_client.decrypt(
+        CiphertextBlob=resp["PrivateKeyCiphertextBlob"], KeyId=key_id
+    )
+    assert dec_resp["Plaintext"] == resp["PrivateKeyPlaintext"]
+
+def test_kms_generate_data_key_pair_rsa(kms_client):
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    resp = kms_client.generate_data_key_pair(KeyId=key_id, KeyPairSpec="RSA_2048")
+    assert resp["KeyPairSpec"] == "RSA_2048"
+    assert resp["PrivateKeyPlaintext"]
+    assert resp["PublicKey"].startswith(bytes.fromhex("3082012230"))
+
+def test_kms_generate_data_key_pair_variants_agree(kms_client):
+    """The two variants differ in exactly one field: PrivateKeyPlaintext."""
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    with_pt = kms_client.generate_data_key_pair(
+        KeyId=key_id, KeyPairSpec="ECC_NIST_EDWARDS25519"
+    )
+    without_pt = kms_client.generate_data_key_pair_without_plaintext(
+        KeyId=key_id, KeyPairSpec="ECC_NIST_EDWARDS25519"
+    )
+
+    def shape(resp):
+        return {k for k in resp if k != "ResponseMetadata"}
+
+    assert shape(with_pt) - shape(without_pt) == {"PrivateKeyPlaintext"}
+    assert shape(without_pt) - shape(with_pt) == set()
+
+def test_kms_generate_data_key_pair_usable_for_signing(kms_client):
+    """The returned plaintext private key must actually work with the public key."""
+    serialization = pytest.importorskip(
+        "cryptography.hazmat.primitives.serialization"
+    )
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    resp = kms_client.generate_data_key_pair(
+        KeyId=key_id, KeyPairSpec="ECC_NIST_EDWARDS25519"
+    )
+    private_key = serialization.load_der_private_key(
+        resp["PrivateKeyPlaintext"], password=None
+    )
+    public_key = serialization.load_der_public_key(resp["PublicKey"])
+    public_key.verify(private_key.sign(b"message"), b"message")
+
+def test_kms_generate_data_key_pair_requires_symmetric_key(kms_client):
+    key = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.generate_data_key_pair(
+            KeyId=key_id, KeyPairSpec="ECC_NIST_EDWARDS25519"
+        )
+    assert exc.value.response["Error"]["Code"] == "UnsupportedOperationException"
+    assert "GenerateDataKeyPair requires" in exc.value.response["Error"]["Message"]
+
+def test_kms_generate_data_key_pair_without_plaintext_ed25519(kms_client):
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    resp = kms_client.generate_data_key_pair_without_plaintext(
+        KeyId=key_id, KeyPairSpec="ECC_NIST_EDWARDS25519"
+    )
+    assert key_id in resp["KeyId"]
+    assert resp["KeyPairSpec"] == "ECC_NIST_EDWARDS25519"
+    assert resp["PrivateKeyCiphertextBlob"]
+    # The entire point of the WithoutPlaintext variant: the private key
+    # plaintext is never returned to the caller.
+    assert "PrivateKeyPlaintext" not in resp
+    # Ed25519 SubjectPublicKeyInfo is a fixed 44 bytes: a 12-byte header
+    # (SEQUENCE + AlgorithmIdentifier for OID 1.3.101.112) + the 32-byte key.
+    assert resp["PublicKey"].startswith(bytes.fromhex("302a300506032b6570032100"))
+    assert len(resp["PublicKey"]) == 44
+
+def test_kms_generate_data_key_pair_without_plaintext_rsa(kms_client):
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    resp = kms_client.generate_data_key_pair_without_plaintext(
+        KeyId=key_id, KeyPairSpec="RSA_2048"
+    )
+    assert resp["KeyPairSpec"] == "RSA_2048"
+    assert resp["PrivateKeyCiphertextBlob"]
+    assert "PrivateKeyPlaintext" not in resp
+    # SubjectPublicKeyInfo for RSA-2048.
+    assert resp["PublicKey"].startswith(bytes.fromhex("3082012230"))
+
+def test_kms_generate_data_key_pair_without_plaintext_decrypt_roundtrip(kms_client):
+    """The wrapped private key decrypts back to a PKCS#8 DER private key."""
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    gen_resp = kms_client.generate_data_key_pair_without_plaintext(
+        KeyId=key_id, KeyPairSpec="ECC_NIST_EDWARDS25519"
+    )
+    dec_resp = kms_client.decrypt(
+        CiphertextBlob=gen_resp["PrivateKeyCiphertextBlob"], KeyId=key_id
+    )
+    # PKCS#8 DER for an Ed25519 private key is a fixed 48 bytes.
+    assert len(dec_resp["Plaintext"]) == 48
+    assert dec_resp["Plaintext"].startswith(bytes.fromhex("302e020100300506032b657004220420"))
+
+def test_kms_generate_data_key_pair_without_plaintext_encryption_context(kms_client):
+    """EncryptionContext binds the wrapped private key: decrypt must supply the same one."""
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+    context = {"purpose": "signing", "owner": "svc-a"}
+
+    gen_resp = kms_client.generate_data_key_pair_without_plaintext(
+        KeyId=key_id,
+        KeyPairSpec="ECC_NIST_EDWARDS25519",
+        EncryptionContext=context,
+    )
+    dec_resp = kms_client.decrypt(
+        CiphertextBlob=gen_resp["PrivateKeyCiphertextBlob"],
+        KeyId=key_id,
+        EncryptionContext=context,
+    )
+    assert len(dec_resp["Plaintext"]) == 48
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.decrypt(
+            CiphertextBlob=gen_resp["PrivateKeyCiphertextBlob"],
+            KeyId=key_id,
+            EncryptionContext={"purpose": "signing", "owner": "svc-b"},
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidCiphertextException"
+
+def test_kms_generate_data_key_pair_without_plaintext_keys_match(kms_client):
+    """The wrapped private key must actually pair with the returned public key.
+
+    Guards against a key pair whose metadata and material disagree — the public
+    key is useless if it does not verify what the private key signs.
+    """
+    serialization = pytest.importorskip(
+        "cryptography.hazmat.primitives.serialization"
+    )
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    gen_resp = kms_client.generate_data_key_pair_without_plaintext(
+        KeyId=key_id, KeyPairSpec="ECC_NIST_EDWARDS25519"
+    )
+    dec_resp = kms_client.decrypt(
+        CiphertextBlob=gen_resp["PrivateKeyCiphertextBlob"], KeyId=key_id
+    )
+
+    private_key = serialization.load_der_private_key(dec_resp["Plaintext"], password=None)
+    derived_public = private_key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    assert derived_public == gen_resp["PublicKey"]
+
+    # And the pair actually works end to end.
+    signature = private_key.sign(b"message")
+    public_key = serialization.load_der_public_key(gen_resp["PublicKey"])
+    public_key.verify(signature, b"message")
+
+def test_kms_generate_data_key_pair_without_plaintext_requires_symmetric_key(kms_client):
+    """The CMK wraps the generated private key, so it must be symmetric."""
+    key = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.generate_data_key_pair_without_plaintext(
+            KeyId=key_id, KeyPairSpec="ECC_NIST_EDWARDS25519"
+        )
+    assert exc.value.response["Error"]["Code"] == "UnsupportedOperationException"
+    # Names this operation, not the GenerateDataKeyPair variant it shares a helper with.
+    assert (
+        "GenerateDataKeyPairWithoutPlaintext requires"
+        in exc.value.response["Error"]["Message"]
+    )
+
+def test_kms_generate_data_key_pair_without_plaintext_rejects_bad_spec(kms_client):
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.generate_data_key_pair_without_plaintext(
+            KeyId=key_id, KeyPairSpec="ECC_NIST_P224"
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+def test_kms_generate_data_key_pair_without_plaintext_nonexistent_key(kms_client):
+    with pytest.raises(ClientError) as exc:
+        kms_client.generate_data_key_pair_without_plaintext(
+            KeyId=str(_uuid_mod.uuid4()), KeyPairSpec="ECC_NIST_EDWARDS25519"
+        )
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+def test_kms_ciphertext_uses_per_blob_nonce(kms_client):
+    """Same plaintext + CMK + EncryptionContext must not yield identical
+    ciphertext. Each blob carries a random nonce mixed into key derivation, so
+    the XOR keystream never repeats across blobs. Without it the keystream would
+    recur, and a wrapped key pair's private half would be recoverable from the
+    public outputs (the DER embeds the public modulus). Both blobs must still
+    decrypt back to the same plaintext."""
+    key = kms_client.create_key()
+    key_id = key["KeyMetadata"]["KeyId"]
+    ctx = {"app": "prod"}
+    zeros = b"\x00" * 48
+    c1 = kms_client.encrypt(KeyId=key_id, Plaintext=zeros, EncryptionContext=ctx)["CiphertextBlob"]
+    c2 = kms_client.encrypt(KeyId=key_id, Plaintext=zeros, EncryptionContext=ctx)["CiphertextBlob"]
+    assert c1 != c2, "identical ciphertext means the keystream repeats (no nonce)"
+    assert kms_client.decrypt(CiphertextBlob=c1, EncryptionContext=ctx)["Plaintext"] == zeros
+    assert kms_client.decrypt(CiphertextBlob=c2, EncryptionContext=ctx)["Plaintext"] == zeros
+
+def test_kms_data_key_pair_private_key_resists_keystream_attack(kms_client):
+    """A wrapped private key must not fall out of a keystream-reuse attack.
+    The attacker grabs a keystream via a chosen-plaintext Encrypt under the same
+    CMK + EncryptionContext, then XORs it into the pair blob's data region. The
+    per-blob nonce makes the two keystreams differ, so the recovered bytes are
+    not a valid private key. Without the nonce this would reconstruct the DER."""
+    serialization = pytest.importorskip("cryptography.hazmat.primitives.serialization")
+    key = kms_client.create_key()
+    key_id = key["KeyMetadata"]["KeyId"]
+    ctx = {"app": "prod"}
+    blob = kms_client.generate_data_key_pair_without_plaintext(
+        KeyId=key_id, KeyPairSpec="ECC_NIST_EDWARDS25519", EncryptionContext=ctx
+    )["PrivateKeyCiphertextBlob"]
+    keystream_blob = kms_client.encrypt(
+        KeyId=key_id, Plaintext=b"\x00" * len(blob), EncryptionContext=ctx
+    )["CiphertextBlob"]
+    # data region starts after key_id(36) + ctx_hash(32) + nonce(16) = 84
+    guess = bytes(a ^ b for a, b in zip(blob[84:], keystream_blob[84:]))
+    with pytest.raises(Exception):
+        serialization.load_der_private_key(guess, password=None)
+
 def test_kms_get_public_key(kms_client):
     key = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")
     key_id = key["KeyMetadata"]["KeyId"]

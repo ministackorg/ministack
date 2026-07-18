@@ -3,7 +3,8 @@ KMS (Key Management Service) Emulator.
 JSON-based API via X-Amz-Target (prefix: TrentService).
 Supports: CreateKey, ListKeys, DescribeKey, Sign, Verify,
           Encrypt, Decrypt, GenerateDataKey,
-          GenerateDataKeyWithoutPlaintext.
+          GenerateDataKeyWithoutPlaintext, GenerateDataKeyPair,
+          GenerateDataKeyPairWithoutPlaintext.
 """
 
 import base64
@@ -688,13 +689,15 @@ def _encrypt(data):
         # ciphertext is: key_id_bytes(36) + context_hash(32) + xor_encrypted_data.
         # EncryptionContext is mixed into key derivation so decrypt
         # must supply the same context or get different plaintext.
-        key_bytes = _derive_with_context(rec["_symmetric_key"], enc_context)
+        nonce = os.urandom(16)
+        key_bytes = _derive_with_context(rec["_symmetric_key"], enc_context, nonce)
         pad_stream = _expand_key(key_bytes, len(plaintext))
         encrypted = bytes(a ^ b for a, b in zip(plaintext, pad_stream))
         ctx_hash = hashlib.sha256(
             json.dumps(enc_context, sort_keys=True).encode()
         ).digest()
-        ciphertext = rec["KeyId"].encode() + ctx_hash + encrypted
+        # Layout: key_id(36) + ctx_hash(32) + nonce(16) + xor_encrypted_data.
+        ciphertext = rec["KeyId"].encode() + ctx_hash + nonce + encrypted
     elif "_private_key" in rec and rec["KeyUsage"] == "ENCRYPT_DECRYPT":
         if enc_context:
             return error_response_json(
@@ -777,8 +780,10 @@ def _decrypt(data):
                 "EncryptionContext does not match",
                 400,
             )
-        encrypted_data = ciphertext[68:]
-        key_bytes = _derive_with_context(rec["_symmetric_key"], enc_context)
+        # Layout: key_id(36) + ctx_hash(32) + nonce(16) + xor_encrypted_data.
+        nonce = ciphertext[68:84]
+        encrypted_data = ciphertext[84:]
+        key_bytes = _derive_with_context(rec["_symmetric_key"], enc_context, nonce)
         pad_stream = _expand_key(key_bytes, len(encrypted_data))
         plaintext = bytes(a ^ b for a, b in zip(encrypted_data, pad_stream))
     elif "_private_key" in rec:
@@ -855,13 +860,15 @@ def _generate_data_key_common(data):
         data_key = os.urandom(32)
 
     enc_context = data.get("EncryptionContext", {})
-    cmk_bytes = _derive_with_context(rec["_symmetric_key"], enc_context)
+    nonce = os.urandom(16)
+    cmk_bytes = _derive_with_context(rec["_symmetric_key"], enc_context, nonce)
     pad_stream = _expand_key(cmk_bytes, len(data_key))
     encrypted = bytes(a ^ b for a, b in zip(data_key, pad_stream))
     ctx_hash = hashlib.sha256(
         json.dumps(enc_context, sort_keys=True).encode()
     ).digest()
-    ciphertext = rec["KeyId"].encode() + ctx_hash + encrypted
+    # Layout: key_id(36) + ctx_hash(32) + nonce(16) + xor_encrypted_data.
+    ciphertext = rec["KeyId"].encode() + ctx_hash + nonce + encrypted
 
     return rec, data_key, ciphertext
 
@@ -878,6 +885,128 @@ def _generate_data_key(data):
     })
 
 
+def _generate_data_key_pair_common(data, action):
+    """Shared logic for GenerateDataKeyPair and GenerateDataKeyPairWithoutPlaintext.
+
+    Generates a data key pair and wraps the private key under the CMK. `action`
+    is the caller's operation name, so errors name the operation the client
+    actually invoked rather than whichever variant this helper was written for.
+
+    Returns (payload, private_key_der, None) on success, or (None, None, error)
+    on failure. The two operations differ in exactly one thing: whether
+    PrivateKeyPlaintext gets added to the payload -- so the caller decides that
+    and nothing else.
+
+    KeyPairSpec follows the real AWS enum, minus SM2 (which _create_key does not
+    implement either). Note this is a superset of _create_key's asymmetric specs:
+    _create_key still lacks RSA_3072, a pre-existing gap not repeated here.
+    """
+    key_id = data.get("KeyId", "")
+    rec = _resolve_key(key_id)
+    if not rec:
+        return None, None, error_response_json(
+            "NotFoundException", f"Key {key_id} not found", 400
+        )
+    err = _check_key_state(rec)
+    if err:
+        return None, None, err
+    # The CMK must be symmetric: it wraps the generated private key.
+    if "_symmetric_key" not in rec:
+        return None, None, error_response_json(
+            "UnsupportedOperationException",
+            f"{action} requires a symmetric key",
+            400,
+        )
+    err = _require_crypto(action)
+    if err:
+        return None, None, err
+
+    spec = data.get("KeyPairSpec", "")
+    if spec in ("RSA_2048", "RSA_3072", "RSA_4096"):
+        private_key = rsa.generate_private_key(
+            public_exponent=65537, key_size=int(spec.split("_")[1])
+        )
+    elif spec in ("ECC_NIST_P256", "ECC_NIST_P384", "ECC_NIST_P521", "ECC_SECG_P256K1"):
+        curve_map = {
+            "ECC_NIST_P256": ec.SECP256R1(),
+            "ECC_NIST_P384": ec.SECP384R1(),
+            "ECC_NIST_P521": ec.SECP521R1(),
+            "ECC_SECG_P256K1": ec.SECP256K1(),
+        }
+        private_key = ec.generate_private_key(curve_map[spec])
+    elif spec == "ECC_NIST_EDWARDS25519":
+        private_key = ed25519.Ed25519PrivateKey.generate()
+    else:
+        return None, None, error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{spec}' at 'keyPairSpec' "
+            "failed to satisfy constraint: Member must satisfy enum value set: "
+            "[RSA_2048, RSA_3072, RSA_4096, ECC_NIST_P256, ECC_NIST_P384, "
+            "ECC_NIST_P521, ECC_SECG_P256K1, ECC_NIST_EDWARDS25519]",
+            400,
+        )
+
+    private_der = private_key.private_bytes(
+        serialization.Encoding.DER,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    public_der = private_key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+    enc_context = data.get("EncryptionContext", {})
+    # Ciphertext layout: key_id(36) + ctx_hash(32) + nonce(16) + xor_encrypted_data.
+    # The per-blob nonce is what stops the wrapped private key from leaking:
+    # without it the keystream repeats across every blob sharing this CMK and
+    # EncryptionContext. Must stay in step with _encrypt,
+    # _generate_data_key_common and _decrypt, which spell out this layout by hand.
+    nonce = os.urandom(16)
+    cmk_bytes = _derive_with_context(rec["_symmetric_key"], enc_context, nonce)
+    pad_stream = _expand_key(cmk_bytes, len(private_der))
+    encrypted = bytes(a ^ b for a, b in zip(private_der, pad_stream))
+    ctx_hash = hashlib.sha256(
+        json.dumps(enc_context, sort_keys=True).encode()
+    ).digest()
+    ciphertext = rec["KeyId"].encode() + ctx_hash + nonce + encrypted
+
+    logger.info("Generated data key pair %s under CMK %s", spec, rec["KeyId"])
+    payload = {
+        "KeyId": rec["Arn"],
+        "KeyPairSpec": spec,
+        "PrivateKeyCiphertextBlob": base64.b64encode(ciphertext).decode(),
+        "PublicKey": base64.b64encode(public_der).decode(),
+    }
+    return payload, private_der, None
+
+
+def _generate_data_key_pair(data):
+    payload, private_der, err = _generate_data_key_pair_common(
+        data, "GenerateDataKeyPair"
+    )
+    if err:
+        return err
+    payload["PrivateKeyPlaintext"] = base64.b64encode(private_der).decode()
+    return json_response(payload)
+
+
+def _generate_data_key_pair_without_plaintext(data):
+    """Same as GenerateDataKeyPair, minus PrivateKeyPlaintext.
+
+    That omission is the whole point of this variant: the private key exists
+    only inside this process for the moment it takes to wrap it, so the caller
+    can persist the ciphertext + public key without ever holding the private
+    key material.
+    """
+    payload, _private_der, err = _generate_data_key_pair_common(
+        data, "GenerateDataKeyPairWithoutPlaintext"
+    )
+    if err:
+        return err
+    return json_response(payload)
+
+
 def _generate_data_key_without_plaintext(data):
     rec, _data_key, result = _generate_data_key_common(data)
     if rec is None:
@@ -888,10 +1017,17 @@ def _generate_data_key_without_plaintext(data):
     })
 
 
-def _derive_with_context(key_bytes, enc_context):
-    """Mix EncryptionContext into key material so decrypt requires the same context."""
+def _derive_with_context(key_bytes, enc_context, nonce):
+    """Mix EncryptionContext and a per-blob nonce into key material.
+
+    The nonce makes the keystream unique per ciphertext even under the same CMK
+    and EncryptionContext, so wrapping a partly-predictable plaintext (e.g. a
+    key pair's DER, whose public half is recoverable from the returned
+    PublicKey) no longer leaks the keystream. decrypt reads the nonce back out
+    of the ciphertext layout.
+    """
     ctx_bytes = json.dumps(enc_context, sort_keys=True).encode()
-    return hashlib.sha256(key_bytes + ctx_bytes).digest()
+    return hashlib.sha256(key_bytes + ctx_bytes + nonce).digest()
 
 
 def _expand_key(key_bytes, length):
@@ -1125,6 +1261,8 @@ async def handle_request(method, path, headers, body, query_params):
         "Decrypt": _decrypt,
         "GenerateDataKey": _generate_data_key,
         "GenerateDataKeyWithoutPlaintext": _generate_data_key_without_plaintext,
+        "GenerateDataKeyPair": _generate_data_key_pair,
+        "GenerateDataKeyPairWithoutPlaintext": _generate_data_key_pair_without_plaintext,
         "CreateAlias": _create_alias,
         "DeleteAlias": _delete_alias,
         "ListAliases": _list_aliases,
