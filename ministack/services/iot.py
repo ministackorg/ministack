@@ -1500,6 +1500,41 @@ def _compute_delta(desired: dict, reported: dict):
     return delta
 
 
+def _merge_metadata(base: dict, patch: dict, ts: int) -> dict:
+    """Stamp a new ``timestamp`` only for the leaves the patch changes,
+    preserving the timestamps of attributes the patch does not touch (a
+    ``null`` removes the key). Mirrors ``_deep_merge`` so metadata tracks
+    per-attribute update times like real AWS IoT, instead of re-stamping the
+    whole document on every update."""
+    for k, v in patch.items():
+        if v is None:
+            base.pop(k, None)
+        elif isinstance(v, dict):
+            sub = base.get(k)
+            if not isinstance(sub, dict):
+                sub = {}
+                base[k] = sub
+            _merge_metadata(sub, v, ts)
+        else:
+            base[k] = {"timestamp": ts}
+    return base
+
+
+def _metadata_for_delta(delta: dict, desired_meta: dict) -> dict:
+    """Project the ``desired`` metadata onto the delta shape — AWS reports the
+    delta's metadata as the metadata of the matching desired attributes."""
+    out = {}
+    for k, dv in delta.items():
+        dm = desired_meta.get(k) if isinstance(desired_meta, dict) else None
+        if isinstance(dv, dict):
+            out[k] = _metadata_for_delta(dv, dm if isinstance(dm, dict) else {})
+        elif isinstance(dm, dict):
+            out[k] = dm
+        else:
+            out[k] = {"timestamp": _shadow_now()}
+    return out
+
+
 def _shadow_error(status: int, message: str) -> tuple:
     return status, {"message": message}
 
@@ -1511,7 +1546,12 @@ def update_thing_shadow(thing_name: str, shadow_name: str, request: dict) -> tup
 
     req_state = request["state"]
     key = (thing_name, shadow_name)
-    rec = _shadows.get(key) or {"state": {"desired": {}, "reported": {}}, "version": 0}
+    rec = _shadows.get(key)
+    if rec is None or rec.get("deleted"):
+        # A deleted shadow keeps its version — AWS does not reset it to 0, so
+        # the next update resumes from the retained version instead of 1.
+        rec = {"state": {"desired": {}, "reported": {}},
+               "version": rec["version"] if rec else 0}
 
     expected = request.get("version")
     if expected is not None and expected != rec["version"]:
@@ -1527,10 +1567,14 @@ def update_thing_shadow(thing_name: str, shadow_name: str, request: dict) -> tup
                 _deep_merge(rec["state"].setdefault(section, {}), patch)
 
     rec["version"] += 1
-    rec["metadata"] = {
-        "desired": _build_metadata(rec["state"].get("desired", {}), ts),
-        "reported": _build_metadata(rec["state"].get("reported", {}), ts),
-    }
+    meta = rec.setdefault("metadata", {"desired": {}, "reported": {}})
+    for section in ("desired", "reported"):
+        if section in req_state:
+            patch = req_state[section]
+            if patch is None:
+                meta[section] = {}
+            elif isinstance(patch, dict):
+                _merge_metadata(meta.setdefault(section, {}), patch, ts)
     _shadows[key] = rec
 
     # The /accepted response echoes only the sections present in the request.
@@ -1545,7 +1589,7 @@ def update_thing_shadow(thing_name: str, shadow_name: str, request: dict) -> tup
 def get_thing_shadow(thing_name: str, shadow_name: str) -> tuple:
     """Return (status, full_shadow_doc) or a 404 error doc if none exists."""
     rec = _shadows.get((thing_name, shadow_name))
-    if rec is None:
+    if rec is None or rec.get("deleted"):
         label = f"{thing_name}" if not shadow_name else f"{thing_name}/{shadow_name}"
         return _shadow_error(404, f"No shadow exists with name: {label}")
 
@@ -1556,12 +1600,14 @@ def get_thing_shadow(thing_name: str, shadow_name: str) -> tuple:
         state["desired"] = desired
     if reported:
         state["reported"] = reported
+    metadata = dict(rec.get("metadata", {"desired": {}, "reported": {}}))
     delta = _compute_delta(desired, reported)
     if delta:
         state["delta"] = delta
+        metadata["delta"] = _metadata_for_delta(delta, metadata.get("desired", {}))
     doc = {
         "state": state,
-        "metadata": rec.get("metadata", {"desired": {}, "reported": {}}),
+        "metadata": metadata,
         "version": rec["version"],
         "timestamp": _shadow_now(),
     }
@@ -1572,11 +1618,13 @@ def delete_thing_shadow(thing_name: str, shadow_name: str) -> tuple:
     """Delete a shadow. Returns (status, doc). 404 if it does not exist."""
     key = (thing_name, shadow_name)
     rec = _shadows.get(key)
-    if rec is None:
+    if rec is None or rec.get("deleted"):
         label = f"{thing_name}" if not shadow_name else f"{thing_name}/{shadow_name}"
         return _shadow_error(404, f"No shadow exists with name: {label}")
-    _shadows.pop(key, None)
-    return 200, {"version": rec["version"], "timestamp": _shadow_now()}
+    version = rec["version"]
+    # Retain the version as a tombstone — AWS does not reset it on delete.
+    _shadows[key] = {"deleted": True, "version": version}
+    return 200, {"version": version, "timestamp": _shadow_now()}
 
 
 # ===========================================================================
