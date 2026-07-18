@@ -836,6 +836,364 @@ def test_ecs_attributes_survive_warm_boot():
     mod.reset()
 
 
+def test_ecs_region_scoped_state_survives_warm_boot(monkeypatch):
+    """ECS v2 persistence retains every resource's account and region scope."""
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _get_module("ecs")
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    cluster_name = "warm-boot-cluster"
+    family = "warm-boot-family"
+
+    monkeypatch.setattr(mod, "_get_docker", lambda: None)
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        for region, revision in (("us-east-1", 2), ("us-west-2", 1)):
+            set_request_region(region)
+            cluster_arn = f"arn:aws:ecs:{region}:{account_id}:cluster/{cluster_name}"
+            td_key = f"{family}:{revision}"
+            td_arn = f"arn:aws:ecs:{region}:{account_id}:task-definition/{td_key}"
+            service_key = f"{cluster_name}/warm-boot-service"
+            service_arn = (
+                f"arn:aws:ecs:{region}:{account_id}:service/"
+                f"{cluster_name}/warm-boot-service"
+            )
+            task_arn = f"arn:aws:ecs:{region}:{account_id}:task/{cluster_name}/{region}"
+            cp_arn = f"arn:aws:ecs:{region}:{account_id}:capacity-provider/warm-boot-cp"
+
+            mod._clusters[cluster_name] = {
+                "clusterArn": cluster_arn,
+                "clusterName": cluster_name,
+                "status": "ACTIVE",
+            }
+            mod._task_defs[td_key] = {
+                "taskDefinitionArn": td_arn,
+                "family": family,
+                "revision": revision,
+            }
+            mod._task_def_latest[family] = revision
+            mod._services[service_key] = {
+                "serviceArn": service_arn,
+                "serviceName": "warm-boot-service",
+                "clusterArn": cluster_arn,
+            }
+            mod._tasks[task_arn] = {
+                "taskArn": task_arn,
+                "clusterArn": cluster_arn,
+                "lastStatus": "RUNNING",
+                "_docker_ids": [f"stale-{region}"],
+            }
+            mod._capacity_providers["warm-boot-cp"] = {
+                "capacityProviderArn": cp_arn,
+                "name": "warm-boot-cp",
+            }
+            mod._attributes["i-warm:zone"] = {
+                "targetId": "i-warm",
+                "name": "zone",
+                "value": region,
+            }
+            mod._account_settings["containerInsights"] = region
+            mod._tags[cluster_arn] = [{"key": "region", "value": region}]
+
+        _round_trip_dict(mod, "ecs")
+
+        for region, revision in (("us-east-1", 2), ("us-west-2", 1)):
+            cluster_arn = f"arn:aws:ecs:{region}:{account_id}:cluster/{cluster_name}"
+            task_arn = f"arn:aws:ecs:{region}:{account_id}:task/{cluster_name}/{region}"
+            assert mod._clusters.get_scoped(account_id, region, cluster_name)["clusterArn"] == (
+                cluster_arn
+            )
+            assert mod._task_def_latest.get_scoped(account_id, region, family) == revision
+            assert mod._account_settings.get_scoped(
+                account_id, region, "containerInsights"
+            ) == region
+            assert mod._attributes.get_scoped(account_id, region, "i-warm:zone")["value"] == (
+                region
+            )
+            restored_task = mod._tasks.get_scoped(account_id, region, task_arn)
+            assert restored_task["lastStatus"] == "STOPPED"
+            assert restored_task["_docker_ids"] == []
+            assert mod._tags.get_scoped(account_id, region, cluster_arn) == [
+                {"key": "region", "value": region}
+            ]
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_ecs_legacy_account_scoped_state_migrates_by_arn(monkeypatch, tmp_path):
+    """Legacy ECS state adopts ARN regions and boot-scopes ARN-less stores."""
+    import json as _json
+
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _get_module("ecs")
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    resource_region = "us-west-2"
+    cluster_name = "legacy-cluster"
+    family = "legacy-family"
+    cluster_arn = f"arn:aws:ecs:{resource_region}:{account_id}:cluster/{cluster_name}"
+    service_key = f"{cluster_name}/legacy-service"
+    service_arn = (
+        f"arn:aws:ecs:{resource_region}:{account_id}:service/"
+        f"{cluster_name}/legacy-service"
+    )
+    task_arn = (
+        f"arn:aws:ecs:{resource_region}:{account_id}:task/"
+        f"{cluster_name}/legacy-task"
+    )
+
+    def scoped(key, value):
+        store = AccountScopedDict()
+        store._data[(account_id, key)] = value
+        return store
+
+    legacy_payload = {
+        "clusters": scoped(cluster_name, {
+            "clusterArn": cluster_arn,
+            "clusterName": cluster_name,
+            "status": "ACTIVE",
+        }),
+        "task_defs": scoped(family + ":3", {
+            "taskDefinitionArn": (
+                f"arn:aws:ecs:{resource_region}:{account_id}:"
+                f"task-definition/{family}:3"
+            ),
+            "family": family,
+            "revision": 3,
+        }),
+        "task_def_latest": scoped(family, 3),
+        "services": scoped(service_key, {
+            "serviceArn": service_arn,
+            "serviceName": "legacy-service",
+            "clusterArn": cluster_arn,
+        }),
+        "tasks": scoped(task_arn, {
+            "taskArn": task_arn,
+            "clusterArn": cluster_arn,
+            "lastStatus": "RUNNING",
+            "_docker_ids": ["stale-container"],
+        }),
+        "account_settings": scoped("containerInsights", "enabled"),
+        "attributes": scoped("i-legacy:zone", {
+            "targetId": "i-legacy",
+            "name": "zone",
+            "value": "legacy",
+        }),
+    }
+
+    monkeypatch.setattr(mod, "_get_docker", lambda: None)
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        with open(tmp_path / "ecs.json", "w") as f:
+            _json.dump(legacy_payload, f, default=persistence._json_default)
+
+        loaded = persistence.load_state("ecs")
+        assert isinstance(loaded["tasks"], AccountScopedDict)
+        mod.restore_state(loaded)
+
+        assert mod._clusters.get_scoped(account_id, resource_region, cluster_name)[
+            "clusterArn"
+        ] == cluster_arn
+        assert mod._services.get_scoped(account_id, resource_region, service_key)[
+            "serviceArn"
+        ] == service_arn
+        restored_task = mod._tasks.get_scoped(account_id, resource_region, task_arn)
+        assert restored_task["lastStatus"] == "STOPPED"
+        assert restored_task["_docker_ids"] == []
+
+        assert mod._task_def_latest.get_scoped(account_id, boot_region, family) is None
+        assert mod._task_def_latest.get_scoped(account_id, resource_region, family) == 3
+
+        set_request_region(resource_region)
+        described = _json.loads(
+            mod._describe_task_definition({"taskDefinition": family})[2]
+        )["taskDefinition"]
+        assert described["taskDefinitionArn"].endswith(
+            f"task-definition/{family}:3"
+        )
+
+        registered = _json.loads(mod._register_task_definition({
+            "family": family,
+            "containerDefinitions": [{"name": "app", "image": "busybox"}],
+        })[2])["taskDefinition"]
+        assert registered["revision"] == 4
+        assert mod._task_defs.get_scoped(
+            account_id, resource_region, family + ":3"
+        )["taskDefinitionArn"] == described["taskDefinitionArn"]
+        assert mod._task_defs.get_scoped(
+            account_id, resource_region, family + ":4"
+        )["taskDefinitionArn"] == registered["taskDefinitionArn"]
+
+        # Other ARN-less legacy stores intentionally adopt the boot region.
+        assert mod._account_settings.get_scoped(
+            account_id, boot_region, "containerInsights"
+        ) == "enabled"
+        assert mod._attributes.get_scoped(account_id, boot_region, "i-legacy:zone")[
+            "value"
+        ] == "legacy"
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_ecs_legacy_task_revision_migration_reconstructs_each_region(monkeypatch):
+    """Legacy shared counters do not reset revisions in other ARN regions."""
+    import json as _json
+
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _get_module("ecs")
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    other_region = "us-west-2"
+    family = "multi-region-legacy-family"
+
+    legacy_task_defs = AccountScopedDict()
+    for region, revision, marker in (
+        (boot_region, 1, "east-original"),
+        (other_region, 2, "west-original"),
+    ):
+        key = f"{family}:{revision}"
+        legacy_task_defs._data[(account_id, key)] = {
+            "taskDefinitionArn": (
+                f"arn:aws:ecs:{region}:{account_id}:task-definition/{key}"
+            ),
+            "family": family,
+            "revision": revision,
+            "status": "ACTIVE",
+            "marker": marker,
+        }
+
+    legacy_latest = AccountScopedDict()
+    legacy_latest._data[(account_id, family)] = 2
+
+    monkeypatch.setattr(mod, "_get_docker", lambda: None)
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        mod.restore_state({
+            "task_defs": legacy_task_defs,
+            "task_def_latest": legacy_latest,
+        })
+
+        assert mod._task_def_latest.get_scoped(
+            account_id, boot_region, family
+        ) == 1
+        assert mod._task_def_latest.get_scoped(
+            account_id, other_region, family
+        ) == 2
+
+        for region, restored_revision, next_revision in (
+            (boot_region, 1, 2),
+            (other_region, 2, 3),
+        ):
+            set_request_region(region)
+            status, _, body = mod._describe_task_definition({
+                "taskDefinition": family,
+            })
+            assert status == 200
+            described = _json.loads(body)["taskDefinition"]
+            assert described["revision"] == restored_revision
+            assert described["taskDefinitionArn"].startswith(
+                f"arn:aws:ecs:{region}:{account_id}:"
+            )
+
+            status, _, body = mod._register_task_definition({
+                "family": family,
+                "containerDefinitions": [{"name": "app", "image": "busybox"}],
+            })
+            assert status == 200
+            assert _json.loads(body)["taskDefinition"]["revision"] == next_revision
+
+        assert mod._task_defs.get_scoped(
+            account_id, boot_region, f"{family}:1"
+        )["marker"] == "east-original"
+        assert mod._task_defs.get_scoped(
+            account_id, other_region, f"{family}:2"
+        )["marker"] == "west-original"
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_ecs_plain_dict_tasks_migrate_to_arn_region(monkeypatch):
+    """Oldest bare-dict task state restores under the task ARN region."""
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _get_module("ecs")
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    resource_region = "us-west-2"
+    task_arn = f"arn:aws:ecs:{resource_region}:{account_id}:task/legacy-cluster/legacy-task"
+
+    monkeypatch.setattr(mod, "_get_docker", lambda: None)
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        mod.restore_state(
+            {
+                "tasks": {
+                    task_arn: {
+                        "taskArn": task_arn,
+                        "lastStatus": "RUNNING",
+                        "_docker_ids": ["stale-container"],
+                    },
+                },
+            }
+        )
+
+        restored_task = mod._tasks.get_scoped(account_id, resource_region, task_arn)
+        assert restored_task["lastStatus"] == "STOPPED"
+        assert restored_task["_docker_ids"] == []
+        assert mod._tasks.get_scoped(account_id, boot_region, task_arn) is None
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 # ── sns._platform_applications + sns._platform_endpoints ──────────────
 
 def test_sns_platform_applications_survive_warm_boot():
@@ -1348,22 +1706,52 @@ def test_legacy_unwrapped_state_file_loads_and_migrates_region(monkeypatch, tmp_
     assert region_store["res-1"]["Arn"].startswith("arn:aws:appconfig:eu-west-1")
 
 
-def test_state_format_version_stamp_round_trips_and_refuses_newer(monkeypatch, tmp_path):
-    """U4: save_state stamps the on-disk format version and load_state unwraps
-    it; a file written by a NEWER binary is refused rather than mis-parsed."""
+def test_default_state_format_version_stays_v2_and_refuses_newer(monkeypatch, tmp_path):
+    """U4: unchanged services stay on v2 and refuse newer state files."""
     import json as _json
 
     monkeypatch.setattr(persistence, "PERSIST_STATE", True)
     monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
 
-    persistence.save_state("ver", {"k": "v"})
-    raw = _json.loads((tmp_path / "ver.json").read_text())
-    assert raw["__ministack_format__"] == persistence.STATE_FORMAT_VERSION
+    persistence.save_state("sqs", {"k": "v"})
+    raw = _json.loads((tmp_path / "sqs.json").read_text())
+    assert raw["__ministack_format__"] == persistence.STATE_FORMAT_VERSION == 2
     assert raw["payload"] == {"k": "v"}
-    assert persistence.load_state("ver") == {"k": "v"}
+    assert persistence.load_state("sqs") == {"k": "v"}
 
     (tmp_path / "future.json").write_text(_json.dumps({
         "__ministack_format__": persistence.STATE_FORMAT_VERSION + 1,
         "payload": {"k": "v"},
     }))
     assert persistence.load_state("future") is None
+
+
+def test_ecs_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject ECS's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    clusters = AccountRegionScopedDict()
+    clusters.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-cluster",
+        {"clusterArn": "arn:aws:ecs:us-west-2:000000000000:cluster/regional-cluster"},
+    )
+    persistence.save_state("ecs", {"clusters": clusters})
+
+    raw = _json.loads((tmp_path / "ecs.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_clusters = persistence.load_state("ecs")["clusters"]
+    assert loaded_clusters.get_scoped(
+        "000000000000", "us-west-2", "regional-cluster"
+    )["clusterArn"].endswith("cluster/regional-cluster")
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("ecs") is None

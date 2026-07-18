@@ -2444,9 +2444,11 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
     log_output = result.get("log", "")
     if log_output:
         logger.info("Lambda %s output:\n%s", name, log_output)
-        resp_headers["X-Amz-Log-Result"] = base64.b64encode(
-            log_output.encode("utf-8"),
-        ).decode()
+        log_type = headers.get("x-amz-log-type") or headers.get("X-Amz-Log-Type") or "None"
+        if log_type.lower() == "tail":
+            resp_headers["X-Amz-Log-Result"] = base64.b64encode(
+                log_output.encode("utf-8")[-4096:],
+            ).decode()
 
     # Throttling takes a separate status path: HTTP 429 with the error body
     # shaped as a service-level exception, NOT the 200+X-Amz-Function-Error
@@ -5476,6 +5478,12 @@ _kinesis_positions = AccountRegionScopedDict()
 # Per-ESM DynamoDB stream tracking: esm_uuid -> {shard_id: position}
 _dynamodb_stream_positions = AccountRegionScopedDict()
 _dynamodb_stream_positions_lock = threading.Lock()
+# Per-ESM invoke-failure cooldown: esm_uuid -> monotonic time before which the
+# poller skips this ESM. Keeps a broken ESM's retries paced even while other
+# ESMs are busy and keep _poll_loop from sleeping between passes. Not
+# persisted — a warm boot simply starts with no cooldowns in effect.
+_esm_backoff_until = AccountRegionScopedDict()
+_ESM_BACKOFF_SECONDS = 1.0
 
 
 def _init_stream_position(esm_id, source_arn, starting):
@@ -5511,19 +5519,24 @@ def _ensure_poller():
 def _poll_loop():
     """Background thread: polls SQS/Kinesis/DynamoDB for active ESMs and invokes Lambda."""
     while True:
+        processed = False
         try:
-            _poll_sqs()
+            processed = _poll_sqs() or processed
         except Exception as e:
             logger.error("ESM SQS poller error: %s", e)
         try:
-            _poll_kinesis()
+            processed = _poll_kinesis() or processed
         except Exception as e:
             logger.error("ESM Kinesis poller error: %s", e)
         try:
-            _poll_dynamodb_streams()
+            processed = _poll_dynamodb_streams() or processed
         except Exception as e:
             logger.error("ESM DynamoDB streams poller error: %s", e)
-        time.sleep(1 if _esms.has_any() else 5)
+        # A pass that found work likely left more behind it - loop again 
+        # immediately rather than waiting out the idle cadence below, so
+        # throughput isn't throttled to batch_size-per-tick.
+        if not processed:
+            time.sleep(1 if _esms.has_any() else 5)
 
 
 def _iter_all_esms():
@@ -5550,7 +5563,11 @@ def _sqs_message_attributes_to_camel_case(attrs: dict) -> dict:
 
 
 def _poll_sqs():
+    """Returns True if any ESM advanced past a batch this pass (successfully
+    invoked, or filtered out entirely)."""
     from ministack.services import sqs as _sqs
+
+    processed_any = False
 
     for acct_id, region, esm in _iter_all_esms():
         account_token = _request_account_id.set(acct_id)
@@ -5582,6 +5599,10 @@ def _poll_sqs():
             queue_url = _sqs._queue_url(queue_name)
             queue = _sqs._queues.get(queue_url)
             if not queue or queue.get("attributes", {}).get("QueueArn") != source_arn:
+                continue
+
+            esm_id = esm["UUID"]
+            if _esm_backoff_until.get(esm_id, 0) > time.time():
                 continue
 
             batch_size = esm.get("BatchSize", 10)
@@ -5621,6 +5642,7 @@ def _poll_sqs():
                 # All records filtered out — treat the batch as processed.
                 for msg in batch:
                     queue["messages"].remove(msg)
+                processed_any = True
                 continue
 
             event = {"Records": records}
@@ -5635,7 +5657,12 @@ def _poll_sqs():
                     "ESM: Lambda %s failed processing SQS batch from %s (errorType=%s errorMessage=%s)\n%s",
                     func_name, queue_name, err_type, err_msg, result.get("log", ""),
                 )
+                # Failed messages stay invisible for their visibility timeout
+                # rather than advancing, so don't report this as processed.
+                _esm_backoff_until[esm_id] = time.time() + _ESM_BACKOFF_SECONDS
             else:
+                processed_any = True
+                _esm_backoff_until.pop(esm_id, None)
                 # Check for ReportBatchItemFailures — partial batch response
                 failed_ids = set()
                 if "ReportBatchItemFailures" in esm.get("FunctionResponseTypes", []):
@@ -5676,9 +5703,15 @@ def _poll_sqs():
             _request_account_id.reset(account_token)
             _request_region.reset(region_token)
 
+    return processed_any
+
 
 def _poll_kinesis():
+    """Returns True if any shard advanced past a batch this pass (successfully
+    invoked, or filtered out entirely)."""
     from ministack.services import kinesis as _kin
+
+    processed_any = False
 
     for acct_id, region, esm in _iter_all_esms():
         account_token = _request_account_id.set(acct_id)
@@ -5712,6 +5745,9 @@ def _poll_kinesis():
                 continue
 
             esm_id = esm["UUID"]
+            if _esm_backoff_until.get(esm_id, 0) > time.time():
+                continue
+
             if esm_id not in _kinesis_positions:
                 starting = esm.get("StartingPosition", "LATEST")
                 _kinesis_positions[esm_id] = {}
@@ -5772,6 +5808,7 @@ def _poll_kinesis():
                 records = _apply_filter_criteria(records, esm)
                 if not records:
                     _kinesis_positions[esm_id][shard_id] = pos + len(raw_records)
+                    processed_any = True
                     continue
 
                 event = {"Records": records}
@@ -5786,7 +5823,13 @@ def _poll_kinesis():
                         "ESM: Lambda %s failed processing Kinesis batch from %s/%s (errorType=%s errorMessage=%s)\n%s",
                         func_name, stream_name, shard_id, err_type, err_msg, result.get("log", ""),
                     )
+                    # Position doesn't advance on failure, so the next pass
+                    # would refetch this exact batch — don't report it as
+                    # processed.
+                    _esm_backoff_until[esm_id] = time.time() + _ESM_BACKOFF_SECONDS
                 else:
+                    processed_any = True
+                    _esm_backoff_until.pop(esm_id, None)
                     positions[shard_id] = pos + len(raw_records)
                     esm["LastProcessingResult"] = f"OK - {len(raw_records)} records"
                     log_output = result.get("log", "")
@@ -5800,13 +5843,19 @@ def _poll_kinesis():
             _request_account_id.reset(account_token)
             _request_region.reset(region_token)
 
+    return processed_any
+
 
 def _poll_dynamodb_streams():
+    """Returns True if any table advanced past a batch this pass (successfully
+    invoked, or filtered out entirely)."""
     from ministack.services import dynamodb as _ddb
 
     stream_records = getattr(_ddb, "_stream_records", None)
     if stream_records is None:
-        return
+        return False
+
+    processed_any = False
 
     for acct_id, region, esm in _iter_all_esms():
         account_token = _request_account_id.set(acct_id)
@@ -5844,6 +5893,9 @@ def _poll_dynamodb_streams():
                 continue
 
             esm_id = esm["UUID"]
+            if _esm_backoff_until.get(esm_id, 0) > time.time():
+                continue
+
             with _dynamodb_stream_positions_lock:
                 if esm_id not in _dynamodb_stream_positions:
                     starting = esm.get("StartingPosition", "LATEST")
@@ -5864,6 +5916,7 @@ def _poll_dynamodb_streams():
                 # All records filtered — advance position so we don't re-evaluate.
                 with _dynamodb_stream_positions_lock:
                     _dynamodb_stream_positions[esm_id] = pos + raw_len
+                processed_any = True
                 continue
 
             event = {"Records": batch}
@@ -5878,7 +5931,13 @@ def _poll_dynamodb_streams():
                     "ESM: Lambda %s failed processing DynamoDB stream batch from %s (errorType=%s errorMessage=%s)\n%s",
                     func_name, table_name, err_type, err_msg, result.get("log", ""),
                 )
+                # Position doesn't advance on failure, so the next pass
+                # would refetch this exact batch — don't report it as
+                # processed.
+                _esm_backoff_until[esm_id] = time.time() + _ESM_BACKOFF_SECONDS
             else:
+                processed_any = True
+                _esm_backoff_until.pop(esm_id, None)
                 with _dynamodb_stream_positions_lock:
                     _dynamodb_stream_positions[esm_id] = pos + raw_len
                 esm["LastProcessingResult"] = f"OK - {len(batch)} records"
@@ -5892,6 +5951,8 @@ def _poll_dynamodb_streams():
         finally:
             _request_account_id.reset(account_token)
             _request_region.reset(region_token)
+
+    return processed_any
 
 
 # ---------------------------------------------------------------------------
@@ -5995,6 +6056,7 @@ def reset():
     _function_urls.clear()
     _kinesis_positions.clear()
     _dynamodb_stream_positions.clear()
+    _esm_backoff_until.clear()
     _pool_clear_all()
     lambda_runtime.reset()
     with _provided_code_lock:
