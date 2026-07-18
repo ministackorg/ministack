@@ -215,11 +215,11 @@ use1.list_tables()["TableNames"]   # → ["users"]
 euw1.list_tables()["TableNames"]   # → [] — eu-west-1 is independent
 ```
 
-**Region-isolated services:** AppConfig, Bedrock (all four services), CloudWatch, CloudWatch Logs, DynamoDB (tables, metadata, Streams), Lambda (functions, event source mappings, durable executions), MSK, RDS, S3 Tables, Secrets Manager, SQS, SSM Parameter Store, and Step Functions (1.4.0); EventBridge Pipes (1.4.1); SNS, Kinesis, KMS, and ElastiCache (1.4.2).
+**Region-isolated services:** AppConfig, Bedrock (all four services), CloudWatch, CloudWatch Logs, DynamoDB (tables, metadata, Streams), Lambda (functions, event source mappings, durable executions), MSK, RDS, S3 Tables, Secrets Manager, SQS, SSM Parameter Store, and Step Functions (1.4.0); EventBridge Pipes (1.4.1); SNS, Kinesis, KMS, and ElastiCache (1.4.2); EventBridge, ECS, and Firehose (1.4.3).
 
 Cross-resource references resolve in the referenced ARN's own account and region (SNS→SQS fanout, EventBridge targets, event source mappings), and cross-region references that real AWS rejects return the same errors AWS returns — e.g. invoking a `eu-west-1` Lambda from a `us-east-1` Step Functions task fails with `Functions from 'eu-west-1' are not reachable in this region`, exactly as on AWS.
 
-**Not yet region-isolated:** S3, IAM/STS, EC2, EventBridge, ECS, ECR, EKS, EFS, Glue, Athena, API Gateway v1/v2, Cognito, CloudFormation, CloudFront, Route 53, EMR, Firehose, SES, CodeBuild, AutoScaling, WAF, ACM, Backup, Organizations, EventBridge Scheduler, Transfer Family, AppSync, CloudTrail, and the remaining control-plane services — these share state across regions within an account (as all services did before 1.4.0); use unique resource names there if your tests exercise two regions. Region isolation for them lands in subsequent releases.
+**Not yet region-isolated:** S3, IAM/STS, EC2, ECR, EKS, EFS, Glue, Athena, API Gateway v1/v2, Cognito, CloudFormation, CloudFront, Route 53, EMR, SES, CodeBuild, AutoScaling, WAF, ACM, Backup, Organizations, EventBridge Scheduler, Transfer Family, AppSync, CloudTrail, and the remaining control-plane services — these share state across regions within an account (as all services did before 1.4.0); use unique resource names there if your tests exercise two regions. Region isolation for them lands in subsequent releases.
 
 **Upgrading with `PERSIST_STATE=1`:** existing state files load and migrate automatically (on-disk format v2 with a version stamp — a newer-format file is refused instead of mis-parsed on downgrade). Each record's region is recovered from its stored ARNs; legacy records that carry no ARN migrate to the default region (`MINISTACK_REGION`).
 
