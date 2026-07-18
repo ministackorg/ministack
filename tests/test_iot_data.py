@@ -363,6 +363,107 @@ def test_iot_ws_same_account_publish_delivers(iot_data_client):
 
 
 # ---------------------------------------------------------------------------
+# Device Shadow (GetThingShadow / UpdateThingShadow / DeleteThingShadow)
+# ---------------------------------------------------------------------------
+
+
+def _read_shadow(resp) -> dict:
+    return json.loads(resp["payload"].read())
+
+
+def test_get_thing_shadow_missing_raises_not_found(iot_data_client):
+    with pytest.raises(ClientError) as ei:
+        iot_data_client.get_thing_shadow(thingName=_unique("nothing"))
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_update_thing_shadow_reported_and_read_back(iot_data_client):
+    thing = _unique("dev")
+    resp = iot_data_client.update_thing_shadow(
+        thingName=thing,
+        payload=json.dumps({"state": {"reported": {"temp": 22, "missedReadings": 3}}}).encode(),
+    )
+    accepted = _read_shadow(resp)
+    # The /accepted response echoes only the reported section it received.
+    assert accepted["state"] == {"reported": {"temp": 22, "missedReadings": 3}}
+    assert accepted["version"] == 1
+    assert "reported" in accepted["metadata"]
+
+    got = _read_shadow(iot_data_client.get_thing_shadow(thingName=thing))
+    assert got["state"]["reported"] == {"temp": 22, "missedReadings": 3}
+    assert got["version"] == 1
+
+
+def test_update_thing_shadow_merges_and_computes_delta(iot_data_client):
+    thing = _unique("dev")
+    iot_data_client.update_thing_shadow(
+        thingName=thing, payload=json.dumps({"state": {"reported": {"temp": 22}}}).encode()
+    )
+    iot_data_client.update_thing_shadow(
+        thingName=thing, payload=json.dumps({"state": {"desired": {"temp": 25}}}).encode()
+    )
+    got = _read_shadow(iot_data_client.get_thing_shadow(thingName=thing))
+    assert got["state"]["desired"] == {"temp": 25}
+    assert got["state"]["reported"] == {"temp": 22}
+    # delta = desired fields differing from reported.
+    assert got["state"]["delta"] == {"temp": 25}
+    assert got["version"] == 2
+
+
+def test_update_thing_shadow_null_removes_field(iot_data_client):
+    thing = _unique("dev")
+    iot_data_client.update_thing_shadow(
+        thingName=thing,
+        payload=json.dumps({"state": {"reported": {"a": 1, "b": 2}}}).encode(),
+    )
+    iot_data_client.update_thing_shadow(
+        thingName=thing, payload=json.dumps({"state": {"reported": {"b": None}}}).encode()
+    )
+    got = _read_shadow(iot_data_client.get_thing_shadow(thingName=thing))
+    assert got["state"]["reported"] == {"a": 1}
+
+
+def test_named_shadow_is_isolated_from_classic(iot_data_client):
+    thing = _unique("dev")
+    iot_data_client.update_thing_shadow(
+        thingName=thing, payload=json.dumps({"state": {"reported": {"classic": True}}}).encode()
+    )
+    iot_data_client.update_thing_shadow(
+        thingName=thing, shadowName="cfg",
+        payload=json.dumps({"state": {"reported": {"named": True}}}).encode(),
+    )
+    classic = _read_shadow(iot_data_client.get_thing_shadow(thingName=thing))
+    named = _read_shadow(iot_data_client.get_thing_shadow(thingName=thing, shadowName="cfg"))
+    assert classic["state"]["reported"] == {"classic": True}
+    assert named["state"]["reported"] == {"named": True}
+
+
+def test_delete_thing_shadow(iot_data_client):
+    thing = _unique("dev")
+    iot_data_client.update_thing_shadow(
+        thingName=thing, payload=json.dumps({"state": {"reported": {"x": 1}}}).encode()
+    )
+    iot_data_client.delete_thing_shadow(thingName=thing)
+    with pytest.raises(ClientError) as ei:
+        iot_data_client.get_thing_shadow(thingName=thing)
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_update_thing_shadow_version_conflict(iot_data_client):
+    thing = _unique("dev")
+    iot_data_client.update_thing_shadow(
+        thingName=thing, payload=json.dumps({"state": {"reported": {"x": 1}}}).encode()
+    )
+    # Stale version is rejected.
+    with pytest.raises(ClientError) as ei:
+        iot_data_client.update_thing_shadow(
+            thingName=thing,
+            payload=json.dumps({"state": {"reported": {"x": 2}}, "version": 99}).encode(),
+        )
+    assert ei.value.response["Error"]["Code"] == "ConflictException"
+
+
+# ---------------------------------------------------------------------------    
 # Topic-rule routing (publish → rule → Lambda)
 # ---------------------------------------------------------------------------
 

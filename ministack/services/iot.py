@@ -76,6 +76,7 @@ _thing_groups: AccountScopedDict = AccountScopedDict()
 _certificates: AccountScopedDict = AccountScopedDict()  # certificateId -> Certificate dict
 _policies: AccountScopedDict = AccountScopedDict()  # policyName -> Policy dict
 _topic_rules: AccountScopedDict = AccountScopedDict()  # ruleName -> TopicRule dict
+_shadows: AccountScopedDict = AccountScopedDict()  # (thingName, shadowName) -> shadow dict
 
 # Local CA state — lazily generated on first use, persisted across restarts.
 import threading
@@ -157,6 +158,7 @@ def get_state() -> dict:
         "certificates": copy.deepcopy(_certificates),
         "policies": copy.deepcopy(_policies),
         "topic_rules": copy.deepcopy(_topic_rules),
+        "shadows": copy.deepcopy(_shadows),
         "ca": {"ca_cert_pem": _ca_cert_pem, "ca_key_pem": _ca_key_pem}
         if _ca_cert_pem and _ca_key_pem
         else {},
@@ -174,6 +176,7 @@ def restore_state(data: dict | None) -> None:
     _certificates.update(data.get("certificates", {}))
     _policies.update(data.get("policies", {}))
     _topic_rules.update(data.get("topic_rules", {}))
+    _shadows.update(data.get("shadows", {}))
     ca_data = data.get("ca")
     if ca_data:
         cert = ca_data.get("ca_cert_pem")
@@ -194,6 +197,7 @@ def reset() -> None:
     _certificates.clear()
     _policies.clear()
     _topic_rules.clear()
+    _shadows.clear()
     with _CA_LOCK:
         _ca_cert_pem = None
         _ca_key_pem = None
@@ -1452,6 +1456,127 @@ def _list_topic_rules(qp: dict) -> tuple:
 def lookup_certificate_by_id(cert_id: str) -> dict | None:
     """Return the Certificate record for a given certificateId in the current account, or None."""
     return _certificates.get(cert_id)
+
+
+# ---------------------------------------------------------------------------
+# Device Shadow (consumed by iot_data.py)
+# ---------------------------------------------------------------------------
+
+
+def _shadow_now() -> int:
+    return int(time.time())
+
+
+def _deep_merge(base: dict, patch: dict) -> dict:
+    """Merge ``patch`` into ``base`` in place. A ``null`` value removes the key."""
+    for k, v in patch.items():
+        if v is None:
+            base.pop(k, None)
+        elif isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
+def _build_metadata(state: dict, ts: int):
+    """Mirror a state subtree, replacing each leaf with ``{"timestamp": ts}``."""
+    if isinstance(state, dict):
+        return {k: _build_metadata(v, ts) for k, v in state.items()}
+    return {"timestamp": ts}
+
+
+def _compute_delta(desired: dict, reported: dict):
+    """Fields in ``desired`` that differ from ``reported`` (recursing into dicts)."""
+    delta = {}
+    for k, dv in desired.items():
+        rv = reported.get(k)
+        if isinstance(dv, dict) and isinstance(rv, dict):
+            sub = _compute_delta(dv, rv)
+            if sub:
+                delta[k] = sub
+        elif dv != rv:
+            delta[k] = dv
+    return delta
+
+
+def _shadow_error(status: int, message: str) -> tuple:
+    return status, {"message": message}
+
+
+def update_thing_shadow(thing_name: str, shadow_name: str, request: dict) -> tuple:
+    """Merge ``request`` into the shadow. Returns (status, response_doc)."""
+    if not isinstance(request, dict) or not isinstance(request.get("state"), dict):
+        return _shadow_error(400, "Missing required node: state")
+
+    req_state = request["state"]
+    key = (thing_name, shadow_name)
+    rec = _shadows.get(key) or {"state": {"desired": {}, "reported": {}}, "version": 0}
+
+    expected = request.get("version")
+    if expected is not None and expected != rec["version"]:
+        return _shadow_error(409, "Version conflict")
+
+    ts = _shadow_now()
+    for section in ("desired", "reported"):
+        if section in req_state:
+            patch = req_state[section]
+            if patch is None:
+                rec["state"][section] = {}
+            elif isinstance(patch, dict):
+                _deep_merge(rec["state"].setdefault(section, {}), patch)
+
+    rec["version"] += 1
+    rec["metadata"] = {
+        "desired": _build_metadata(rec["state"].get("desired", {}), ts),
+        "reported": _build_metadata(rec["state"].get("reported", {}), ts),
+    }
+    _shadows[key] = rec
+
+    # The /accepted response echoes only the sections present in the request.
+    resp_state = {s: req_state[s] for s in ("desired", "reported") if s in req_state and req_state[s] is not None}
+    resp_meta = {s: _build_metadata(req_state[s], ts) for s in resp_state}
+    doc = {"state": resp_state, "metadata": resp_meta, "version": rec["version"], "timestamp": ts}
+    if request.get("clientToken") is not None:
+        doc["clientToken"] = request["clientToken"]
+    return 200, doc
+
+
+def get_thing_shadow(thing_name: str, shadow_name: str) -> tuple:
+    """Return (status, full_shadow_doc) or a 404 error doc if none exists."""
+    rec = _shadows.get((thing_name, shadow_name))
+    if rec is None:
+        label = f"{thing_name}" if not shadow_name else f"{thing_name}/{shadow_name}"
+        return _shadow_error(404, f"No shadow exists with name: {label}")
+
+    desired = rec["state"].get("desired", {})
+    reported = rec["state"].get("reported", {})
+    state = {}
+    if desired:
+        state["desired"] = desired
+    if reported:
+        state["reported"] = reported
+    delta = _compute_delta(desired, reported)
+    if delta:
+        state["delta"] = delta
+    doc = {
+        "state": state,
+        "metadata": rec.get("metadata", {"desired": {}, "reported": {}}),
+        "version": rec["version"],
+        "timestamp": _shadow_now(),
+    }
+    return 200, doc
+
+
+def delete_thing_shadow(thing_name: str, shadow_name: str) -> tuple:
+    """Delete a shadow. Returns (status, doc). 404 if it does not exist."""
+    key = (thing_name, shadow_name)
+    rec = _shadows.get(key)
+    if rec is None:
+        label = f"{thing_name}" if not shadow_name else f"{thing_name}/{shadow_name}"
+        return _shadow_error(404, f"No shadow exists with name: {label}")
+    _shadows.pop(key, None)
+    return 200, {"version": rec["version"], "timestamp": _shadow_now()}
 
 
 # ===========================================================================
