@@ -616,6 +616,168 @@ def test_s3_bucket_tagging(s3):
         s3.get_bucket_tagging(Bucket=bkt)
     assert exc.value.response["Error"]["Code"] == "NoSuchTagSet"
 
+def test_s3_create_bucket_with_tags(s3):
+    """Tags supplied in the CreateBucket request body must be applied to the
+    bucket, so a follow-up GetBucketTagging returns them.
+    """
+    bkt = "intg-s3-createbkt-tags"
+    s3.create_bucket(
+        Bucket=bkt,
+        CreateBucketConfiguration={
+            "Tags": [
+                {"Key": "project", "Value": "Trinity"},
+                {"Key": "env", "Value": "prod"},
+            ]
+        },
+    )
+    resp = s3.get_bucket_tagging(Bucket=bkt)
+    tags = {t["Key"]: t["Value"] for t in resp["TagSet"]}
+    assert tags == {"project": "Trinity", "env": "prod"}
+
+def test_s3_create_bucket_with_tags_and_location(s3):
+    """Tags and LocationConstraint can be supplied together in the CreateBucket
+    body; both must take effect."""
+    bkt = "intg-s3-createbkt-tags-loc"
+    s3.create_bucket(
+        Bucket=bkt,
+        CreateBucketConfiguration={
+            "LocationConstraint": "us-west-2",
+            "Tags": [{"Key": "project", "Value": "Trinity"}],
+        },
+    )
+    resp = s3.get_bucket_tagging(Bucket=bkt)
+    tags = {t["Key"]: t["Value"] for t in resp["TagSet"]}
+    assert tags == {"project": "Trinity"}
+    loc = s3.get_bucket_location(Bucket=bkt)
+    assert loc["LocationConstraint"] == "us-west-2"
+
+def test_s3_create_bucket_without_tags_has_no_tag_set(s3):
+    """A CreateBucket with no tags must not create an empty tag set — a
+    GetBucketTagging should still return NoSuchTagSet."""
+    bkt = "intg-s3-createbkt-notags"
+    s3.create_bucket(Bucket=bkt)
+    with pytest.raises(ClientError) as exc:
+        s3.get_bucket_tagging(Bucket=bkt)
+    assert exc.value.response["Error"]["Code"] == "NoSuchTagSet"
+
+def test_s3_create_bucket_empty_tag_value_allowed(s3):
+    """Tag values may be empty (minimum length 0); only the key is required."""
+    bkt = "intg-s3-createbkt-emptyval"
+    s3.create_bucket(
+        Bucket=bkt,
+        CreateBucketConfiguration={"Tags": [{"Key": "project", "Value": ""}]},
+    )
+    resp = s3.get_bucket_tagging(Bucket=bkt)
+    assert resp["TagSet"] == [{"Key": "project", "Value": ""}]
+
+def test_s3_create_bucket_rejects_key_too_long(s3):
+    """A tag key longer than 128 characters is rejected with InvalidTag."""
+    bkt = "intg-s3-createbkt-longkey"
+    with pytest.raises(ClientError) as exc:
+        s3.create_bucket(
+            Bucket=bkt,
+            CreateBucketConfiguration={"Tags": [{"Key": "p" * 129, "Value": "Trinity"}]},
+        )
+    err = exc.value.response["Error"]
+    assert err["Code"] == "InvalidTag"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert err["Message"] == "The TagKey you have provided is invalid"
+    # The bucket must not have been created.
+    with pytest.raises(ClientError):
+        s3.head_bucket(Bucket=bkt)
+
+def test_s3_create_bucket_rejects_value_too_long(s3):
+    """A tag value longer than 256 characters is rejected with InvalidTag."""
+    bkt = "intg-s3-createbkt-longval"
+    with pytest.raises(ClientError) as exc:
+        s3.create_bucket(
+            Bucket=bkt,
+            CreateBucketConfiguration={"Tags": [{"Key": "project", "Value": "T" * 257}]},
+        )
+    err = exc.value.response["Error"]
+    assert err["Code"] == "InvalidTag"
+    assert err["Message"] == "The TagValue you have provided is invalid"
+    # The bucket must not have been created.
+    with pytest.raises(ClientError):
+        s3.head_bucket(Bucket=bkt)
+
+def test_s3_create_bucket_rejects_reserved_aws_prefix(s3):
+    """Tag keys starting with the reserved 'aws:' prefix are rejected."""
+    bkt = "intg-s3-createbkt-awsprefix"
+    with pytest.raises(ClientError) as exc:
+        s3.create_bucket(
+            Bucket=bkt,
+            CreateBucketConfiguration={"Tags": [{"Key": "aws:project", "Value": "Trinity"}]},
+        )
+    err = exc.value.response["Error"]
+    assert err["Code"] == "InvalidTag"
+    assert err["Message"] == (
+        'User-defined tag keys can\'t start with "aws:". This prefix is '
+        'reserved for system tags. Remove "aws:" from your tag keys and '
+        "try again."
+    )
+    # The bucket must not have been created.
+    with pytest.raises(ClientError):
+        s3.head_bucket(Bucket=bkt)
+
+def test_s3_create_bucket_duplicate_keys_internal_error(s3):
+    """A duplicate tag key in a CreateBucket body returns a 500 InternalError."""
+    bkt = "intg-s3-createbkt-dupkey"
+    with pytest.raises(ClientError) as exc:
+        s3.create_bucket(
+            Bucket=bkt,
+            CreateBucketConfiguration={
+                "Tags": [
+                    {"Key": "env", "Value": "prod"},
+                    {"Key": "env", "Value": "staging"},
+                ]
+            },
+        )
+    assert exc.value.response["Error"]["Code"] == "InternalError"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 500
+    # The bucket must not have been created.
+    with pytest.raises(ClientError):
+        s3.head_bucket(Bucket=bkt)
+
+def test_s3_create_bucket_rejects_too_many_tags(s3):
+    """A bucket accepts at most 50 tags in the CreateBucket body."""
+    bkt = "intg-s3-createbkt-toomany"
+    with pytest.raises(ClientError) as exc:
+        s3.create_bucket(
+            Bucket=bkt,
+            CreateBucketConfiguration={
+                "Tags": [{"Key": f"project{i}", "Value": "Trinity"} for i in range(51)]
+            },
+        )
+    err = exc.value.response["Error"]
+    assert err["Code"] == "BadRequest"
+    assert err["Message"] == "Bucket tag count cannot be greater than 50"
+    # The bucket must not have been created.
+    with pytest.raises(ClientError):
+        s3.head_bucket(Bucket=bkt)
+
+def test_s3_create_bucket_tags_readable_via_s3control(s3):
+    """Tags set in the CreateBucket body must also be visible through the
+    S3 Control ListTagsForResource API, not just GetBucketTagging."""
+    from conftest import make_client
+
+    bkt = "intg-s3control-createbkt-tags"
+    s3.create_bucket(
+        Bucket=bkt,
+        CreateBucketConfiguration={
+            "Tags": [
+                {"Key": "project", "Value": "Trinity"},
+                {"Key": "env", "Value": "prod"},
+            ]
+        },
+    )
+    s3control = make_client("s3control")
+    account_id = "123456789012"
+    arn = f"arn:aws:s3:::{bkt}"
+    resp = s3control.list_tags_for_resource(AccountId=account_id, ResourceArn=arn)
+    tags = {t["Key"]: t["Value"] for t in resp.get("Tags", [])}
+    assert tags == {"project": "Trinity", "env": "prod"}
+
 def test_s3_control_list_tags_for_resource(s3):
     """S3 Control ListTagsForResource must return tags set via PutBucketTagging.
 
@@ -2197,6 +2359,68 @@ def test_s3_put_object_content_type_preserved(s3):
     resp = s3.get_object(Bucket="qa-s3-ct", Key="page.html")
     assert "text/html" in resp["ContentType"]
 
+
+def test_s3_versioned_get_object_preserves_content_type(s3):
+    """Content-Type set on PutObject is returned when reading by VersionId."""
+    bucket = "qa-s3-versioned-ct"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(
+        Bucket=bucket,
+        VersioningConfiguration={"Status": "Enabled"},
+    )
+
+    put = s3.put_object(
+        Bucket=bucket,
+        Key="page.html",
+        Body=b"<html/>",
+        ContentType="text/html; charset=utf-8",
+    )
+
+    response = s3.get_object(
+        Bucket=bucket,
+        Key="page.html",
+        VersionId=put["VersionId"],
+    )
+    assert response["ContentType"] == "text/html; charset=utf-8"
+
+
+def test_s3_versioned_get_object_preserves_content_type_per_version(s3):
+    """Each object version returns the Content-Type supplied for that version."""
+    bucket = "qa-s3-versioned-ct-history"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(
+        Bucket=bucket,
+        VersioningConfiguration={"Status": "Enabled"},
+    )
+
+    text_version = s3.put_object(
+        Bucket=bucket,
+        Key="document",
+        Body=b"plain text",
+        ContentType="text/plain",
+    )["VersionId"]
+    json_version = s3.put_object(
+        Bucket=bucket,
+        Key="document",
+        Body=b'{"value": 1}',
+        ContentType="application/json",
+    )["VersionId"]
+
+    text_response = s3.get_object(
+        Bucket=bucket,
+        Key="document",
+        VersionId=text_version,
+    )
+    json_response = s3.get_object(
+        Bucket=bucket,
+        Key="document",
+        VersionId=json_version,
+    )
+
+    assert text_response["ContentType"] == "text/plain"
+    assert json_response["ContentType"] == "application/json"
+
+
 def test_s3_put_object_storage_class_roundtrip(s3):
     """PutObject with StorageClass is returned by GetObject and HeadObject (#534)."""
     s3.create_bucket(Bucket="qa-s3-sc")
@@ -3310,3 +3534,103 @@ def test_s3_put_object_with_crc32_checksum_roundtrips(s3):
 
     s3.delete_object(Bucket=bucket, Key="k")
     s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_delete_object_by_version_id_purges_version(s3):
+    """DeleteObject with an explicit VersionId must physically remove exactly
+    that version (not add a delete marker). Repro for the versioned-delete bug:
+    the handler ignored VersionId and always appended a delete marker, so the
+    version count went UP instead of to zero."""
+    bkt = "intg-s3-verdel-single"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+
+    v1 = s3.put_object(Bucket=bkt, Key="a", Body=b"v1")["VersionId"]
+    v2 = s3.put_object(Bucket=bkt, Key="a", Body=b"v2")["VersionId"]
+    assert v1 != v2
+
+    # Delete the older version by id — the newer one must survive.
+    s3.delete_object(Bucket=bkt, Key="a", VersionId=v1)
+    versions = s3.list_object_versions(Bucket=bkt, Prefix="a").get("Versions", [])
+    ids = [v["VersionId"] for v in versions]
+    assert ids == [v2], f"expected only {v2!r} to remain, got {ids!r}"
+    assert not s3.list_object_versions(Bucket=bkt, Prefix="a").get("DeleteMarkers")
+
+    # Delete the last version by id — nothing should remain.
+    s3.delete_object(Bucket=bkt, Key="a", VersionId=v2)
+    listing = s3.list_object_versions(Bucket=bkt, Prefix="a")
+    assert listing.get("Versions", []) == []
+    assert listing.get("DeleteMarkers", []) == []
+
+
+def test_s3_delete_object_without_version_id_still_creates_marker(s3):
+    """Regression guard: DeleteObject WITHOUT a VersionId must keep creating a
+    delete marker (logical delete) rather than purging history."""
+    bkt = "intg-s3-verdel-marker"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+
+    s3.put_object(Bucket=bkt, Key="a", Body=b"v1")
+    resp = s3.delete_object(Bucket=bkt, Key="a")
+    assert resp.get("DeleteMarker") is True
+
+    listing = s3.list_object_versions(Bucket=bkt, Prefix="a")
+    assert len(listing.get("Versions", [])) == 1
+    assert len(listing.get("DeleteMarkers", [])) == 1
+    # The current version is now the delete marker → HeadObject 404s.
+    with pytest.raises(ClientError) as exc:
+        s3.head_object(Bucket=bkt, Key="a")
+    assert exc.value.response["Error"]["Code"] in ("404", "NoSuchKey")
+
+
+def test_s3_delete_objects_batch_by_version_id_purges_all(s3):
+    """Batch DeleteObjects with explicit {Key, VersionId} entries must remove
+    every addressed version AND delete marker. This is the reported repro:
+    2 versions + 1 delete marker, purged by id, must leave ListObjectVersions
+    completely empty."""
+    bkt = "intg-s3-verdel-batch"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+
+    s3.put_object(Bucket=bkt, Key="a", Body=b"v1")
+    s3.put_object(Bucket=bkt, Key="a", Body=b"v2")
+    s3.delete_object(Bucket=bkt, Key="a")  # delete marker
+
+    listing = s3.list_object_versions(Bucket=bkt, Prefix="a")
+    assert len(listing.get("Versions", [])) == 2
+    assert len(listing.get("DeleteMarkers", [])) == 1
+
+    objects = [
+        {"Key": o["Key"], "VersionId": o["VersionId"]}
+        for o in listing.get("Versions", []) + listing.get("DeleteMarkers", [])
+    ]
+    resp = s3.delete_objects(Bucket=bkt, Delete={"Objects": objects})
+    assert len(resp.get("Deleted", [])) == 3
+    assert resp.get("Errors", []) == []
+
+    after = s3.list_object_versions(Bucket=bkt, Prefix="a")
+    assert after.get("Versions", []) == []
+    assert after.get("DeleteMarkers", []) == []
+
+
+def test_s3_delete_delete_marker_by_version_id_restores_object(s3):
+    """Deleting the latest delete marker by its VersionId must make the object
+    visible again (its previous version becomes current)."""
+    bkt = "intg-s3-verdel-restore"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+
+    s3.put_object(Bucket=bkt, Key="a", Body=b"hello")
+    marker_id = s3.delete_object(Bucket=bkt, Key="a")["VersionId"]
+
+    # Marker shadows the object.
+    with pytest.raises(ClientError):
+        s3.head_object(Bucket=bkt, Key="a")
+
+    # Remove the marker → the object reappears.
+    s3.delete_object(Bucket=bkt, Key="a", VersionId=marker_id)
+    got = s3.get_object(Bucket=bkt, Key="a")
+    assert got["Body"].read() == b"hello"
+
+    markers = s3.list_object_versions(Bucket=bkt, Prefix="a").get("DeleteMarkers", [])
+    assert markers == []
