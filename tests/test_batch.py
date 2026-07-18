@@ -184,6 +184,9 @@ def test_batch_update_compute_environment_create_update_describe(batch):
     )
     assert created["computeEnvironmentName"] == name
     assert created["computeEnvironmentArn"].endswith(f"compute-environment/{name}")
+    assert "updatePolicy" not in batch.describe_compute_environments(
+        computeEnvironments=[name]
+    )["computeEnvironments"][0]
 
     updated = batch.update_compute_environment(
         computeEnvironment=name,
@@ -214,12 +217,35 @@ def test_batch_update_compute_environment_create_update_describe(batch):
     assert ce["context"] == "tf-update"
 
 
-def test_batch_update_policy_operation_contract(batch):
+def test_batch_update_policy_is_update_only(batch):
     model = batch.meta.service_model
     create = model.operation_model("CreateComputeEnvironment").input_shape.members
     update = model.operation_model("UpdateComputeEnvironment").input_shape.members
     assert "updatePolicy" not in create
     assert "updatePolicy" in update
+
+    from ministack.services import batch as batch_svc
+
+    name = f"ce-policy-{_uid()}"
+    policy = {
+        "jobExecutionTimeoutMinutes": 30,
+        "terminateJobsOnUpdate": False,
+    }
+    status, _, _ = batch_svc._create_compute_environment({
+        "computeEnvironmentName": name,
+        "type": "MANAGED",
+        "serviceRole": "arn:aws:iam::000000000000:role/batch",
+        "updatePolicy": policy,
+    })
+    assert status == 200
+    assert "updatePolicy" not in batch_svc._compute_envs[name]
+
+    status, _, _ = batch_svc._update_compute_environment({
+        "computeEnvironment": name,
+        "updatePolicy": policy,
+    })
+    assert status == 200
+    assert batch_svc._compute_envs[name]["updatePolicy"] == policy
 
 
 def test_batch_update_compute_environment_by_arn(batch):
@@ -305,39 +331,3 @@ def test_batch_update_compute_environment_merges_compute_resources(batch):
     assert ce["computeResources"]["instanceTypes"] == ["m5.large"]
     assert ce["computeResources"]["subnets"] == ["subnet-aaa"]
     assert ce["computeResources"]["securityGroupIds"] == ["sg-aaa"]
-
-
-def test_batch_create_compute_environment_ignores_update_policy(batch):
-    import json
-    import urllib.request
-
-    name = f"ce-policy-{_uid()}"
-    policy = {
-        "jobExecutionTimeoutMinutes": 30,
-        "terminateJobsOnUpdate": False,
-    }
-    body = json.dumps({
-        "computeEnvironmentName": name,
-        "type": "MANAGED",
-        "serviceRole": "arn:aws:iam::000000000000:role/batch",
-        "updatePolicy": policy,
-    }).encode()
-    req = urllib.request.Request(
-        f"{ENDPOINT}/v1/createcomputeenvironment",
-        data=body,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": (
-                "AWS4-HMAC-SHA256 Credential=test/20240101/us-east-1/batch/aws4_request, "
-                "SignedHeaders=host, Signature=fake"
-            ),
-        },
-    )
-    with urllib.request.urlopen(req, timeout=5) as resp:
-        assert resp.status == 200
-
-    ce = batch.describe_compute_environments(computeEnvironments=[name])[
-        "computeEnvironments"
-    ][0]
-    assert "updatePolicy" not in ce
