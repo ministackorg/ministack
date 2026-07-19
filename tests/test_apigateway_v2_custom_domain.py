@@ -92,6 +92,35 @@ def _deploy_http_hello(
 # ---------------------------------------------------------------------------
 
 
+def test_v2_create_domain_name_input_contract(apigw):
+    model = apigw.meta.service_model
+    create = model.operation_model("CreateDomainName").input_shape.members
+    output = model.operation_model("CreateDomainName").output_shape.members
+    assert "CertificateArn" not in create
+    assert "ApiMappingSelectionExpression" not in create
+    assert "DomainNameConfigurations" in create
+    assert "ApiMappingSelectionExpression" in output
+
+    from ministack.services import apigateway as apigw_svc
+
+    domain = _uid("v2contract.example.com")
+    try:
+        status, _, body = apigw_svc._create_domain_name({
+            "domainName": domain,
+            "certificateArn": "arn:aws:acm:us-east-1:000000000000:certificate/smuggled",
+            "apiMappingSelectionExpression": "$request.path",
+        })
+        assert status == 201
+        dn = json.loads(body)
+        assert dn["apiMappingSelectionExpression"] == "$request.basepath"
+        cfg = dn["domainNameConfigurations"][0]
+        assert cfg.get("certificateArn", "") == ""
+    finally:
+        apigw_svc._domain_names.pop(domain, None)
+        apigw_svc._domain_name_regions.pop(domain, None)
+        apigw_svc._api_mappings.pop(domain, None)
+
+
 def test_v2_create_get_list_delete_domain_name(apigw):
     domain = _uid("v2.example.com")
     try:

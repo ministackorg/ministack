@@ -8,7 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
-- **API Gateway v2 — custom-domain control plane** — HTTP APIs now implement the complete boto3/Terraform `DomainName` and `ApiMapping` CRUD surface, including account/region-scoped persisted state, mapping conflicts, lifecycle validation, and domain tag ARNs. TLS/DNS and CloudFormation resources remain out of scope. Reported by @liammizrahi (#1030).
+- **API Gateway v2 — custom-domain control plane** — HTTP APIs now implement boto3/Terraform `DomainName` and `ApiMapping` CRUD, including account/region-scoped persisted state, mapping conflicts, lifecycle validation, and domain tag ARNs. TLS/DNS, pagination (`MaxResults`/`NextToken`), and CloudFormation domain resources remain out of scope. Reported by @liammizrahi (#1030).
 
 ### Fixed
 - **API Gateway — custom domains now route data-plane requests (v1 + v2)** — custom `Host` requests ignored REST `BasePathMapping` state and HTTP `ApiMapping` state, often falling through to S3 as `NoSuchBucket`. Registered domains now select the longest matching key, support the v1 `(none)` and v2 empty-key fallbacks, strip the selected prefix, use the mapped stage, preserve API Gateway OPTIONS handling, and report the custom domain in v2 Lambda request context. Unmapped registered domains return API Gateway `Forbidden` instead of reaching S3. Reported by @liammizrahi (#1030).

@@ -1840,7 +1840,7 @@ def _default_domain_name_configuration(data: dict) -> dict:
     cfg.setdefault("endpointType", "REGIONAL")
     cfg.setdefault("securityPolicy", "TLS_1_2")
     cfg.setdefault("domainNameStatus", "AVAILABLE")
-    cfg.setdefault("certificateArn", data.get("certificateArn", ""))
+    cfg.setdefault("certificateArn", "")
     cfg.setdefault("hostedZoneId", "Z1UJRXOUMOOFQ8")
     cfg.setdefault("ipAddressType", "ipv4")
     return cfg
@@ -1864,9 +1864,7 @@ def _create_domain_name(data):
     dn = {
         "domainName": domain_name,
         "domainNameConfigurations": [cfg],
-        "apiMappingSelectionExpression": data.get(
-            "apiMappingSelectionExpression", "$request.basepath"
-        ),
+        "apiMappingSelectionExpression": "$request.basepath",
         "tags": data.get("tags", {}),
     }
     if "mutualTlsAuthentication" in data:
