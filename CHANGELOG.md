@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **ALB — data-plane forwarding to `instance`/`ip` targets** — the ALB data plane previously routed live traffic to Lambda targets only; forwarding to an `instance` or `ip` target group returned `502 Target type not supported`. Requests are now proxied over HTTP to the registered target, using the target `Id` as the host (an IP address for `ip` target groups; for `instance` target groups the `Id` is resolved as a hostname, since an emulator has no EC2 metadata to resolve instance ids against). Mirrors real ALB behavior: hop-by-hop headers are stripped, `X-Forwarded-For`/`X-Forwarded-Proto`/`X-Forwarded-Port` and a per-request `X-Amzn-Trace-Id` are injected, the target's HTTP error responses pass through unchanged, and connection failures surface as `502 Bad Gateway`. Multiple registered targets are balanced per-request. Existing listener rule conditions and `forward`/`redirect`/`fixed-response` actions apply unchanged. Contributed by @jasondcamp.
+
 ## [1.4.3] — 2026-07-18
 
 ### Added
