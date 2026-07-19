@@ -1733,7 +1733,9 @@ def test_cognito_saml_presignup_lambda_autoconfirms_invited_user(cognito_idp, la
         pass
 
     user = cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_invited@example.com")
-    assert user["UserStatus"] == "CONFIRMED"
+    # A federated (external-IdP) user is always EXTERNAL_PROVIDER — autoConfirmUser
+    # does not flip that status. autoVerifyEmail, however, still applies.
+    assert user["UserStatus"] == "EXTERNAL_PROVIDER"
     attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
     assert attrs.get("email_verified") == "true"
 
