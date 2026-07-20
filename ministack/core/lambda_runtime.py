@@ -76,6 +76,30 @@ def _account_region_from_function_config(config: dict) -> tuple[str, str]:
 _workers: dict = {}
 _lock = threading.Lock()
 
+
+def stop_workers_for_function(function_arn: str) -> None:
+    """Terminate and remove all persistent workers for a Lambda function ARN.
+
+    Used when a function's configuration (or code) changes so that subsequent
+    invocations spawn fresh containers with the updated configuration.
+    """
+    with _lock:
+        keys_to_remove = [k for k in _workers if k == function_arn]
+        for key in keys_to_remove:
+            worker = _workers.pop(key, None)
+            if worker is None:
+                continue
+            proc = worker.get("proc")
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except Exception:  # pragma: no cover - best effort cleanup
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
 # ---------------------------------------------------------------------------
 # Python worker script (runs inside a persistent subprocess)
 # ---------------------------------------------------------------------------
