@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **ElastiCache — Valkey engine support** — `Engine=valkey` previously fell into the memcached branch of the container spawner: a nonexistent `memcached:<version>-alpine` image was requested, the spawn failed, and the cluster silently fell back to the shared sidecar advertising memcached's port 11211. `CreateCacheCluster` and `CreateReplicationGroup` now spawn a real `valkey/valkey:<major.minor>-alpine` container (AWS-supported versions 7.2, 8.0, 8.1) on port 6379, the no-Docker fallback advertises the Redis sidecar port, the default `EngineVersion` for valkey is `8.0` (previously memcached's `1.6.17`), and `DescribeCacheEngineVersions` lists valkey versions with their `valkey7`/`valkey8` parameter-group families (the `default.valkey*` groups already existed). `ELASTICACHE_CLUSTER_MODE_REAL` replication groups accept valkey too — the official valkey image ships `redis-*` compatibility symlinks, so the cluster bootstrap (`redis-cli --cluster create`) works unchanged.
+
 ## [1.4.3] — 2026-07-18
 
 ### Added
