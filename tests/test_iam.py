@@ -966,7 +966,6 @@ def test_iam_account_authorization_details_filter(iam):
 
 
 def test_iam_account_authorization_details_tolerates_cfn_attached_policy_dicts():
-    """CFN historically stored AttachedPolicies as dicts; auth-details must not crash."""
     from ministack.core.responses import set_request_account_id, set_request_region
     from ministack.services import iam as iam_mod
 

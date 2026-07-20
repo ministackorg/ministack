@@ -1297,12 +1297,7 @@ async def _handle_execute_api_request(
 async def _handle_custom_domain_request(
     host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict
 ):
-    """Handle API Gateway custom-domain data plane requests (#1030).
-
-    Tries v1 (REST BasePathMapping) then v2 (HTTP ApiMapping). A registered
-    domain with no matching mapping returns Forbidden and must not fall through
-    to S3 virtual-host routing.
-    """
+    """Route a registered API Gateway custom-domain Host request."""
     service = _custom_domain_service(host)
     if service is None:
         return None

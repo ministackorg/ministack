@@ -1056,8 +1056,6 @@ async def handle_websocket(scope, receive, send, api_id: str):
             try:
                 await send({"type": "websocket.send", "text": json.dumps(item)})
             except Exception:
-                # A transient send failure must not kill the drain forever —
-                # otherwise publish_success / data / ka never reach the client.
                 logger.exception("AppSync Events outbox send failed; continuing drain")
                 continue
 
@@ -1234,8 +1232,6 @@ async def _handle_client_frame(api_id: str, connection_id: str, frame: dict, out
             })
             return
         successful, failed, to_deliver = _plan_publish(events)
-        # Ack before peer fan-out so publish_success is not delayed behind
-        # listener drain work under parallel shared-server load.
         await outbox.put({
             "type": "publish_success",
             "id": pub_id,

@@ -2110,12 +2110,7 @@ def has_custom_domain(host: str) -> bool:
 
 
 def _remaining_path_for_base_path(path: str, base_path: str) -> str | None:
-    """If ``base_path`` matches ``path`` on a segment boundary, return the rest.
-
-    AWS strips the matched mapping key before resource matching. Single-level
-    and multi-level keys are both matched as full path prefixes bounded by ``/``
-    (so ``/shophello`` does not match ``shop``).
-    """
+    """Strip a matching base path prefix from ``path``, or return None."""
     if base_path in ("", "(none)"):
         return None
     key = base_path.strip("/")

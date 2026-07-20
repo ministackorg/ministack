@@ -176,13 +176,7 @@ def _make_aws_managed_record(name: str, document: str, description: str = "") ->
 
 
 def _attached_policy_arn(entry):
-    """Normalize an AttachedPolicies entry to an ARN string.
-
-    IAM APIs store ARN strings. Older CloudFormation writers stored
-    ``{"PolicyName", "PolicyArn"}`` dicts; accept both so shared-server
-    reads (GetAccountAuthorizationDetails, ListAttached*) do not raise
-    ``unhashable type: 'dict'``.
-    """
+    """Return an ARN string from an AttachedPolicies entry (str or dict)."""
     if isinstance(entry, str):
         return entry
     if isinstance(entry, dict):

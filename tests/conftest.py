@@ -60,8 +60,6 @@ _SERIAL_TESTS = {
     "tests/test_eks.py::test_eks_restore_state_normalizes_endpoint_to_localhost",
     "tests/test_lambda.py::test_lambda_reset_terminates_workers",
     "tests/test_lambda.py::test_lambda_dynamodb_stream_esm_latest_processes_first_record",
-    # Durable Lambda cold-starts under xdist shared-server pressure; invoke can
-    # return an error payload without the handler's env-echo keys.
     "tests/test_lambda.py::test_lambda_durable_runtime_env_vars_present",
     "tests/test_ministack.py::test_ministack_config_invalid_key_ignored",
     "tests/test_ses.py::test_ses_messages_endpoint_reset",
@@ -106,7 +104,6 @@ _SERIAL_TESTS = {
     "tests/test_appsync.py::test_appsync_lambda_failing_authorizer_returns_unauthorized",
     # AppSync Events service mutations; shared state racing under xdist.
     "tests/test_appsync_events.py::test_publish_with_appsync_sigv4_scope_on_events_vhost",
-    # WebSocket publish ack races peer fan-out under xdist shared-server load.
     "tests/test_appsync_events.py::test_websocket_publish_frame_acks_and_fans_out",
     # Credential report reflects all users in the account; run serially to avoid
     # parallel-test interference on the account-global CSV snapshot.

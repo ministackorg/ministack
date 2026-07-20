@@ -1777,13 +1777,7 @@ def _find_registered_domain_name(hostname: str) -> str | None:
 
 
 def _request_context_domain_name(api_id: str, headers: dict) -> str:
-    """Return the domainName reported in the Lambda proxy requestContext.
-
-    Host-based execute-api and registered custom domains use the inbound Host
-    (without port). Path-based addressing keeps the synthetic
-    ``{apiId}.execute-api.{MINISTACK_HOST}`` form so a gateway Host like
-    ``localhost`` / ``127.0.0.1`` does not leak into the event (#1030).
-    """
+    """Lambda proxy requestContext.domainName for execute-api or custom domains."""
     default = f"{api_id}.execute-api.{_HOST}"
     host = headers.get("host", "").split(":", 1)[0]
     if not host:

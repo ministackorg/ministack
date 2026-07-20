@@ -606,9 +606,7 @@ def _iam_role_create(logical_id, props, stack_name):
         "Tags": [],
     }
 
-    # ManagedPolicyArns — IAM stores ARN strings (same as AttachRolePolicy).
-    # Dict-shaped entries break GetAccountAuthorizationDetails / ListAttached*
-    # via AccountScopedDict lookups (unhashable type: 'dict').
+    # ManagedPolicyArns as ARN strings (AttachRolePolicy shape).
     managed = props.get("ManagedPolicyArns", [])
     for policy_arn in managed:
         if isinstance(policy_arn, dict):
@@ -660,7 +658,6 @@ def _iam_policy_create(logical_id, props, stack_name):
         "CreateDate": created,
         "UpdateDate": created,
         "Description": props.get("Description", ""),
-        # Match IAM CreatePolicy: Versions is a version-id → record map.
         "Versions": {
             "v1": {
                 "VersionId": "v1",

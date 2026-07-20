@@ -660,7 +660,6 @@ def test_v2_path_based_execute_api_keeps_execute_api_domain_name(apigw, lam):
     try:
         url = f"{_endpoint}/_aws/execute-api/{api_id}/$default/hello"
         req = urllib.request.Request(url, method="GET")
-        # Intentionally leave Host as the gateway host (localhost).
         try:
             with urllib.request.urlopen(req, timeout=5) as resp:
                 status, body = resp.status, resp.read()

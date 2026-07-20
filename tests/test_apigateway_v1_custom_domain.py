@@ -1,14 +1,4 @@
-"""API Gateway v1 custom-domain data-plane routing (#1030).
-
-Control-plane DomainName / BasePathMapping already exist. These tests require
-the data plane to resolve Host + path using AWS mapping rules:
-
-  - longest matching base path wins
-  - ``(none)`` is the catch-all empty mapping
-  - strip the matched base path before resource matching
-  - stage comes from the mapping, never from the URL
-  - registered custom domains must not fall through to S3 vhost
-"""
+"""API Gateway v1 custom-domain data-plane routing (#1030)."""
 
 from __future__ import annotations
 
@@ -304,7 +294,6 @@ def test_custom_domain_explicit_base_path_invokes_mapped_api(apigw_v1):
             domainName=domain, basePath="shop", restApiId=api_id, stage=stage
         )
 
-        # Control: normal execute-api still works.
         status, body, _ = _http_get(
             f"/{stage}/hello",
             host=f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}",
@@ -312,7 +301,6 @@ def test_custom_domain_explicit_base_path_invokes_mapped_api(apigw_v1):
         assert status == 200
         assert json.loads(body)["via"] == "custom-domain"
 
-        # Custom domain: strip /shop, stage from mapping.
         status, body, _ = _http_get("/shop/hello", host=domain)
         assert status == 200, body
         assert json.loads(body) == {"via": "custom-domain", "route": "hello"}
@@ -353,7 +341,6 @@ def test_custom_domain_longest_base_path_wins(apigw_v1):
         apigw_v1.create_base_path_mapping(
             domainName=domain, basePath="orders", restApiId=short_api, stage="a"
         )
-        # Multi-segment key: stored if create accepts it; exercise longest-match.
         apigw_v1.create_base_path_mapping(
             domainName=domain, basePath="orders/v1", restApiId=long_api, stage="b"
         )
@@ -461,7 +448,6 @@ def test_custom_domain_options_skips_generic_preflight(apigw_v1):
             domainName=domain, basePath="shop", restApiId=api_id, stage="local"
         )
         status, body, headers = _http_options("/shop/hello", host=domain)
-        # Must be handled as API Gateway traffic (not crash / not S3).
         assert status in (200, 204, 403, 404, 405), (status, body, headers)
         assert b"NoSuchBucket" not in body
     finally:
