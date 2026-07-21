@@ -410,7 +410,7 @@ def test_kms_generate_data_key_pair_requires_symmetric_key(kms_client):
         kms_client.generate_data_key_pair(
             KeyId=key_id, KeyPairSpec="ECC_NIST_EDWARDS25519"
         )
-    assert exc.value.response["Error"]["Code"] == "UnsupportedOperationException"
+    assert exc.value.response["Error"]["Code"] == "InvalidKeyUsageException"
     assert "GenerateDataKeyPair requires" in exc.value.response["Error"]["Message"]
 
 def test_kms_generate_data_key_pair_without_plaintext_ed25519(kms_client):
@@ -535,7 +535,7 @@ def test_kms_generate_data_key_pair_without_plaintext_requires_symmetric_key(kms
         kms_client.generate_data_key_pair_without_plaintext(
             KeyId=key_id, KeyPairSpec="ECC_NIST_EDWARDS25519"
         )
-    assert exc.value.response["Error"]["Code"] == "UnsupportedOperationException"
+    assert exc.value.response["Error"]["Code"] == "InvalidKeyUsageException"
     # Names this operation, not the GenerateDataKeyPair variant it shares a helper with.
     assert (
         "GenerateDataKeyPairWithoutPlaintext requires"

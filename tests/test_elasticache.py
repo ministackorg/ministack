@@ -82,6 +82,44 @@ def test_elasticache_engines(ec):
     assert len(resp["CacheEngineVersions"]) > 0
 
 @requires_docker
+def test_elasticache_valkey_engine_versions(ec):
+    resp = ec.describe_cache_engine_versions(Engine="valkey")
+    versions = resp["CacheEngineVersions"]
+    assert len(versions) > 0
+    assert all(v["Engine"] == "valkey" for v in versions)
+    assert all(v["CacheParameterGroupFamily"].startswith("valkey") for v in versions)
+
+@requires_docker
+def test_elasticache_valkey_create_cluster(ec):
+    ec.create_cache_cluster(
+        CacheClusterId="test-valkey",
+        Engine="valkey",
+        EngineVersion="8.0",
+        CacheNodeType="cache.t3.micro",
+        NumCacheNodes=1,
+    )
+    resp = ec.describe_cache_clusters(CacheClusterId="test-valkey", ShowCacheNodeInfo=True)
+    cluster = resp["CacheClusters"][0]
+    assert cluster["Engine"] == "valkey"
+    assert cluster["EngineVersion"] == "8.0"
+    assert cluster["CacheParameterGroup"]["CacheParameterGroupName"] == "default.valkey8"
+    # A real valkey container (or the redis-protocol fallback) — never memcached's port.
+    assert cluster["CacheNodes"][0]["Endpoint"]["Port"] != 11211
+
+@requires_docker
+def test_elasticache_valkey_replication_group(ec):
+    ec.create_replication_group(
+        ReplicationGroupId="test-valkey-rg",
+        ReplicationGroupDescription="Valkey replication group",
+        Engine="valkey",
+        CacheNodeType="cache.t3.micro",
+    )
+    resp = ec.describe_replication_groups(ReplicationGroupId="test-valkey-rg")
+    rg = resp["ReplicationGroups"][0]
+    assert rg["ReplicationGroupId"] == "test-valkey-rg"
+    assert rg["NodeGroups"][0]["PrimaryEndpoint"]["Port"] != 11211
+
+@requires_docker
 def test_elasticache_modify_subnet_group(ec):
     ec.create_cache_subnet_group(
         CacheSubnetGroupName="test-mod-ecsg",

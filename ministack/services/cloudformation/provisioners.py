@@ -1922,6 +1922,50 @@ def _apigw_account_delete(physical_id, props):
     _apigw_v1._account_settings["settings"] = settings
 
 
+# --- API Gateway GatewayResponse ---
+
+def _apigw_gateway_response_create(logical_id, props, stack_name):
+    """Provision an ``AWS::ApiGateway::GatewayResponse`` customization."""
+    api_id = props.get("RestApiId", "")
+    response_type = props.get("ResponseType", "")
+    data = {
+        "responseParameters": props.get("ResponseParameters", {}),
+        "responseTemplates": props.get("ResponseTemplates", {}),
+    }
+    if "StatusCode" in props:
+        data["statusCode"] = props["StatusCode"]
+
+    status, _headers, body = _apigw_v1._put_gateway_response(api_id, response_type, data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::GatewayResponse create failed: {body!r}")
+
+    physical_id = f"{api_id}/{response_type}"
+    return physical_id, {"Id": physical_id}
+
+
+def _apigw_gateway_response_update(physical_id, old_props, new_props, stack_name):
+    # RestApiId and ResponseType require replacement in the AWS CFN resource
+    # specification. Create the replacement first, then reset the old
+    # customization so a failed create cannot destroy the working resource.
+    if any(new_props.get(key) != old_props.get(key) for key in ("RestApiId", "ResponseType")):
+        new_id, attrs = _apigw_gateway_response_create(physical_id, new_props, stack_name)
+        _apigw_gateway_response_delete(physical_id, old_props)
+        return new_id, attrs
+
+    _new_id, attrs = _apigw_gateway_response_create(physical_id, new_props, stack_name)
+    return physical_id, attrs
+
+
+def _apigw_gateway_response_delete(physical_id, props):
+    api_id = props.get("RestApiId", "")
+    response_type = props.get("ResponseType", "")
+    # Deletion resets the customization to API Gateway's generated default.
+    # Keep CloudFormation cleanup idempotent when the parent REST API has
+    # already gone away during rollback.
+    if api_id in _apigw_v1._rest_apis:
+        _apigw_v1._delete_gateway_response(api_id, response_type)
+
+
 # --- Lambda EventSourceMapping ---
 
 def _lambda_esm_create(logical_id, props, stack_name):
@@ -4373,6 +4417,11 @@ _RESOURCE_HANDLERS = {
     "AWS::ApiGateway::Deployment": {"create": _apigw_deployment_create, "delete": _apigw_deployment_delete},
     "AWS::ApiGateway::Stage": {"create": _apigw_stage_create, "delete": _apigw_stage_delete},
     "AWS::ApiGateway::Account": {"create": _apigw_account_create, "delete": _apigw_account_delete},
+    "AWS::ApiGateway::GatewayResponse": {
+        "create": _apigw_gateway_response_create,
+        "update": _apigw_gateway_response_update,
+        "delete": _apigw_gateway_response_delete,
+    },
     "AWS::Lambda::EventSourceMapping": {"create": _lambda_esm_create, "update": _lambda_esm_update, "delete": _lambda_esm_delete},
     "AWS::Pipes::Pipe": {"create": _pipes_pipe_create, "delete": _pipes_pipe_delete},
     "AWS::Lambda::Alias": {"create": _lambda_alias_create, "delete": _lambda_alias_delete},
