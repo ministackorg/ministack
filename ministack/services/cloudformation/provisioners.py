@@ -2367,6 +2367,46 @@ def _cognito_user_pool_client_delete(physical_id, props):
         pool["_clients"].pop(physical_id, None)
 
 
+# --- Cognito UserPoolGroup ---
+
+def _cognito_user_pool_group_create(logical_id, props, stack_name):
+    pid = props.get("UserPoolId", "")
+    pool = _cognito._user_pools.get(pid)
+    if not pool:
+        raise ValueError(f"UserPool {pid} not found for UserPoolGroup")
+
+    name = props.get("GroupName") or _physical_name(stack_name, logical_id, max_len=128)
+    now = _cognito._now_epoch()
+    group = {
+        "GroupName": name,
+        "UserPoolId": pid,
+        "Description": props.get("Description", ""),
+        "RoleArn": props.get("RoleArn", ""),
+        "Precedence": props.get("Precedence", 0),
+        "CreationDate": now,
+        "LastModifiedDate": now,
+        "_members": [],
+    }
+    pool["_groups"][name] = group
+    # Ref on this resource type returns the GroupName (matches real AWS —
+    # see https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cognito-userpoolgroup.html#aws-resource-cognito-userpoolgroup-return-values).
+    return name, {}
+
+
+def _cognito_user_pool_group_delete(physical_id, props):
+    pid = props.get("UserPoolId", "")
+    pool = _cognito._user_pools.get(pid)
+    if not pool:
+        return
+    group = pool["_groups"].pop(physical_id, None)
+    if not group:
+        return
+    for username in group.get("_members", []):
+        user = pool["_users"].get(username)
+        if user and physical_id in user.get("_groups", []):
+            user["_groups"].remove(physical_id)
+
+
 # --- Cognito IdentityPool ---
 
 def _cognito_identity_pool_create(logical_id, props, stack_name):
@@ -4386,6 +4426,7 @@ _RESOURCE_HANDLERS = {
     "AWS::SecretsManager::Secret": {"create": _sm_secret_create, "delete": _sm_secret_delete},
     "AWS::Cognito::UserPool": {"create": _cognito_user_pool_create, "delete": _cognito_user_pool_delete},
     "AWS::Cognito::UserPoolClient": {"create": _cognito_user_pool_client_create, "delete": _cognito_user_pool_client_delete},
+    "AWS::Cognito::UserPoolGroup": {"create": _cognito_user_pool_group_create, "delete": _cognito_user_pool_group_delete},
     "AWS::Cognito::IdentityPool": {"create": _cognito_identity_pool_create, "delete": _cognito_identity_pool_delete},
     "AWS::Cognito::UserPoolDomain": {"create": _cognito_user_pool_domain_create, "delete": _cognito_user_pool_domain_delete},
     "AWS::ECR::Repository": {"create": _ecr_repo_create, "delete": _ecr_repo_delete},

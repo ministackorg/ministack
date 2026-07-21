@@ -3157,6 +3157,57 @@ Outputs:
     assert not without_resp["UserPoolClient"].get("ClientSecret"), "GenerateSecret=false should leave ClientSecret empty"
 
 
+def test_cfn_cognito_user_pool_group(cfn, cognito_idp):
+    """CFN AWS::Cognito::UserPoolGroup creates a group whose Ref resolves to
+    its GroupName, matching real AWS, and admin_add_user_to_group can then
+    reference it."""
+    template = """
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  Pool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: cfn-group-pool
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref Pool
+      GroupName: admins
+      Description: Administrators
+      Precedence: 1
+Outputs:
+  PoolId:
+    Value: !Ref Pool
+  GroupRef:
+    Value: !Ref AdminGroup
+"""
+    stack_name = "cfn-cognito-group"
+    try:
+        cfn.delete_stack(StackName=stack_name)
+    except Exception:
+        pass
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    _wait_stack(cfn, stack_name)
+
+    stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    assert outputs["GroupRef"] == "admins"
+
+    group = cognito_idp.get_group(UserPoolId=outputs["PoolId"], GroupName="admins")["Group"]
+    assert group["Description"] == "Administrators"
+    assert group["Precedence"] == 1
+
+    cognito_idp.admin_create_user(UserPoolId=outputs["PoolId"], Username="alice")
+    cognito_idp.admin_add_user_to_group(UserPoolId=outputs["PoolId"], Username="alice", GroupName="admins")
+    groups = cognito_idp.admin_list_groups_for_user(UserPoolId=outputs["PoolId"], Username="alice")["Groups"]
+    assert any(g["GroupName"] == "admins" for g in groups)
+
+    cfn.delete_stack(StackName=stack_name)
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.get_group(UserPoolId=outputs["PoolId"], GroupName="admins")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 # ---------------------------------------------------------------------------
 # ApiGatewayV2 Integration + Route provisioners
 # ---------------------------------------------------------------------------
