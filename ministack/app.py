@@ -344,7 +344,7 @@ _state_map = {
     "stepfunctions": "stepfunctions", "alb": "alb",
     "glue": "glue", "mwaa": "mwaa", "efs": "efs", "waf": "waf",
     "athena": "athena", "emr": "emr", "cloudfront": "cloudfront",
-    "codebuild": "codebuild", "acm": "acm", "firehose": "firehose",
+    "codebuild": "codebuild", "batch": "batch", "acm": "acm", "firehose": "firehose",
     "ses": "ses", "ses_v2": "ses_v2",
     "servicediscovery": "servicediscovery", "s3files": "s3files",
     "appconfig": "appconfig", "transfer": "transfer",

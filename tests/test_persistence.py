@@ -1938,3 +1938,45 @@ def test_batch_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_pat
     # Simulate the previous binary, whose highest understood format is v2.
     monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
     assert persistence.load_state("batch") is None
+
+
+def test_batch_persistence_lifecycle_restores_regional_state(monkeypatch, tmp_path):
+    """The gateway save map and Batch import-time restore must preserve state
+    outside the ambient boot region across a process-shaped reload."""
+    import importlib
+
+    from ministack.app import _build_persistence_save_dict, _state_map
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import batch as service
+
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    resource_region = "us-west-2"
+    job_id = "regional-job"
+    job = {
+        "jobArn": f"arn:aws:batch:{resource_region}:{account_id}:job/{job_id}",
+        "status": "SUCCEEDED",
+    }
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+    set_request_account_id(account_id)
+    set_request_region(boot_region)
+    service.reset()
+    try:
+        service._jobs.set_scoped(account_id, resource_region, job_id, job)
+
+        assert _state_map["batch"] == "batch"
+        save_dict = _build_persistence_save_dict()
+        assert "batch" in save_dict
+        persistence.save_all({"batch": save_dict["batch"]})
+
+        service.reset()
+        importlib.reload(service)
+
+        assert service._jobs.get_scoped(
+            account_id, resource_region, job_id
+        ) == job
+        assert service._jobs.get_scoped(account_id, boot_region, job_id) is None
+    finally:
+        service.reset()

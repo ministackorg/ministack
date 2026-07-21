@@ -14,6 +14,7 @@ import re
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     error_response_json,
@@ -61,6 +62,14 @@ def restore_state(data):
         restored = data.get(key)
         if restored is not None:
             store.update(restored)
+
+
+try:
+    _restored = load_state("batch")
+    if _restored:
+        restore_state(_restored)
+except Exception:
+    logger.exception("Failed to restore persisted state; continuing with fresh store")
 
 
 def _json(status, body):
