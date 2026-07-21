@@ -2642,3 +2642,58 @@ def test_describe_fleets_unknown_id_returns_invalid_fleet_id(ec2):
         ec2.describe_fleets(FleetIds=[bogus])
     assert exc.value.response["Error"]["Code"] == "InvalidFleetId.NotFound"
 
+
+def test_describe_security_group_rules_by_id_without_group_filter(ec2):
+    """Regression for #1121: Terraform's aws_vpc_security_group_ingress_rule
+    refreshes by calling DescribeSecurityGroupRules(SecurityGroupRuleIds=[...])
+    with no group filter, and the rule id must stay stable when other rules on
+    the same group are revoked."""
+    vpc = ec2.create_vpc(CidrBlock="10.0.0.0/16")["Vpc"]
+    sg = ec2.create_security_group(
+        GroupName=f"sgr-1121-{_uuid_mod.uuid4().hex[:8]}",
+        Description="issue-1121",
+        VpcId=vpc["VpcId"],
+    )["GroupId"]
+
+    rule_a = ec2.authorize_security_group_ingress(
+        GroupId=sg,
+        IpPermissions=[{
+            "IpProtocol": "tcp", "FromPort": 22, "ToPort": 22,
+            "IpRanges": [{"CidrIp": "10.0.0.0/24"}],
+        }],
+    )["SecurityGroupRules"][0]["SecurityGroupRuleId"]
+    rule_b = ec2.authorize_security_group_ingress(
+        GroupId=sg,
+        IpPermissions=[{
+            "IpProtocol": "tcp", "FromPort": 80, "ToPort": 80,
+            "IpRanges": [{"CidrIp": "10.0.1.0/24"}],
+        }],
+    )["SecurityGroupRules"][0]["SecurityGroupRuleId"]
+
+    assert rule_a.startswith("sgr-") and rule_b.startswith("sgr-")
+    assert rule_a != rule_b
+
+    # Refresh by id with NO group filter -- the exact call Terraform makes.
+    found = ec2.describe_security_group_rules(
+        SecurityGroupRuleIds=[rule_b],
+    )["SecurityGroupRules"]
+    assert [r["SecurityGroupRuleId"] for r in found] == [rule_b]
+
+    # Revoking rule_a must not shift rule_b's id (index-based ids did).
+    ec2.revoke_security_group_ingress(
+        GroupId=sg,
+        IpPermissions=[{
+            "IpProtocol": "tcp", "FromPort": 22, "ToPort": 22,
+            "IpRanges": [{"CidrIp": "10.0.0.0/24"}],
+        }],
+    )
+    still_found = ec2.describe_security_group_rules(
+        SecurityGroupRuleIds=[rule_b],
+    )["SecurityGroupRules"]
+    assert [r["SecurityGroupRuleId"] for r in still_found] == [rule_b]
+
+    # The revoked rule's id no longer resolves.
+    assert ec2.describe_security_group_rules(
+        SecurityGroupRuleIds=[rule_a],
+    )["SecurityGroupRules"] == []
+

@@ -910,10 +910,12 @@ def _generate_data_key_pair_common(data, action):
     err = _check_key_state(rec)
     if err:
         return None, None, err
-    # The CMK must be symmetric: it wraps the generated private key.
+    # The CMK must be symmetric: it wraps the generated private key. Real AWS
+    # rejects an asymmetric CMK here with InvalidKeyUsageException (the KeyUsage
+    # is incompatible with generating data keys), not UnsupportedOperationException.
     if "_symmetric_key" not in rec:
         return None, None, error_response_json(
-            "UnsupportedOperationException",
+            "InvalidKeyUsageException",
             f"{action} requires a symmetric key",
             400,
         )

@@ -2706,21 +2706,27 @@ def _pool_clear_all() -> None:
 def _pool_kill_function(account: str, func_name: str) -> None:
     """Kill every pooled docker container for a function across all qualifiers.
 
-    The pool key is ``{account}:{func_name}:zip:{CodeSha256}`` (or
+    The pool key is ``{account}:{region}:{func_name}:zip:{CodeSha256}`` (or
     ``:image:{ImageUri}``). UpdateFunctionConfiguration changes attributes that
     don't show up in the key (Layers / Environment / MemorySize / VpcConfig /
     Architectures / FileSystemConfigs / Runtime / Handler), so the same key
     would otherwise hand back a stale container that was spawned before the
-    config change. Issue #816 docker-executor follow-up: a layer attached
-    after the first invoke was never mounted on the reused warm container,
-    so handler imports from the layer kept failing even after the layer's
-    extracted dir was correct.
+    config change.
+
+    The region segment sits between ``account`` and ``func_name`` (added when the
+    warm-pool key became region-scoped). Match on the account and func_name
+    positions rather than a leading ``{account}:{func_name}:`` prefix -- that
+    prefix stopped matching any key after regionalization and left the old
+    container running with stale config after every UpdateFunctionConfiguration
+    (issue #1118). Issue #816 docker-executor follow-up: a layer attached after
+    the first invoke was never mounted on the reused warm container.
     """
-    prefix = f"{account}:{func_name}:"
     to_kill = []
     with _warm_pool_lock:
         for key in list(_warm_pool.keys()):
-            if key.startswith(prefix):
+            # key == "{account}:{region}:{func_name}:{zip|image}:{...}"
+            parts = key.split(":")
+            if len(parts) >= 3 and parts[0] == account and parts[2] == func_name:
                 to_kill.extend(_warm_pool.pop(key))
     for e in to_kill:
         _kill_pool_entry(e)
