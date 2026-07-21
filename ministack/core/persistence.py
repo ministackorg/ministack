@@ -21,11 +21,15 @@ STATE_DIR = os.environ.get("STATE_DIR", "/tmp/ministack-state")
 #   {"__ministack_format__": N, "payload": <service state>}
 # load_state refuses a file whose version is NEWER than this binary understands
 # rather than mis-parsing it (the downgrade-corruption guard). Version 2 is the
-# default and introduced region-scoped (AccountRegionScopedDict) stores. ECS
-# uses version 3 because its service state was regionalized. Legacy unwrapped
-# files (implicit v1, account-scoped) still load and migrate. (U4)
+# default and introduced region-scoped (AccountRegionScopedDict) stores.
+# Services regionalized after v2 use version 3 so a v2 rollback refuses their
+# incompatible snapshots. Legacy unwrapped files (implicit v1, account-scoped)
+# still load and migrate. (U4)
 STATE_FORMAT_VERSION = 2
-SERVICE_STATE_FORMAT_VERSIONS = {"ecs": 3}
+SERVICE_STATE_FORMAT_VERSIONS = {
+    "codebuild": 3,
+    "ecs": 3,
+}
 
 
 def _state_format_version(service: str) -> int:
