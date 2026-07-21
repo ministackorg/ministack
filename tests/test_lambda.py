@@ -2860,7 +2860,13 @@ def test_lambda_pool_kill_function_reaps_all_qualifiers():
     config-only updates leave stale entries unless explicitly reaped). Issue
     #816 docker-executor follow-up. Wired into _update_config / _delete_function
     so layer attach via UpdateFunctionConfiguration displaces the pre-attach
-    container before the next invoke."""
+    container before the next invoke.
+
+    Regression for #1118: the warm-pool key is region-scoped
+    ({account}:{region}:{func}:zip:{sha}), so the keys here MUST carry the region
+    segment. A previous prefix match of ``{account}:{func}:`` silently matched
+    nothing once the key gained a region, so UpdateFunctionConfiguration left the
+    old docker container running with stale config."""
     from ministack.services import lambda_svc as _svc
 
     class _StubContainer:
@@ -2874,9 +2880,9 @@ def test_lambda_pool_kill_function_reaps_all_qualifiers():
 
     stubs = [_StubContainer() for _ in range(3)]
     keys = [
-        "111122223333:fn-A:zip:sha-v1",
-        "111122223333:fn-A:zip:sha-v2",
-        "111122223333:fn-B:zip:sha-v1",   # different function — must NOT be touched
+        "111122223333:us-east-1:fn-A:zip:sha-v1",
+        "111122223333:us-east-1:fn-A:zip:sha-v2",
+        "111122223333:us-east-1:fn-B:zip:sha-v1",   # different function — must NOT be touched
     ]
     with _svc._warm_pool_lock:
         for k, s in zip(keys, stubs):
@@ -2889,10 +2895,10 @@ def test_lambda_pool_kill_function_reaps_all_qualifiers():
         _svc._pool_kill_function("111122223333", "fn-A")
 
         with _svc._warm_pool_lock:
-            assert _svc._warm_pool.get("111122223333:fn-A:zip:sha-v1", []) == []
-            assert _svc._warm_pool.get("111122223333:fn-A:zip:sha-v2", []) == []
+            assert _svc._warm_pool.get("111122223333:us-east-1:fn-A:zip:sha-v1", []) == []
+            assert _svc._warm_pool.get("111122223333:us-east-1:fn-A:zip:sha-v2", []) == []
             # fn-B must be untouched
-            assert len(_svc._warm_pool.get("111122223333:fn-B:zip:sha-v1", [])) == 1
+            assert len(_svc._warm_pool.get("111122223333:us-east-1:fn-B:zip:sha-v1", [])) == 1
 
         assert stubs[0].stopped and stubs[0].removed, "fn-A v1 container not killed"
         assert stubs[1].stopped and stubs[1].removed, "fn-A v2 container not killed"

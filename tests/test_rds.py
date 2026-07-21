@@ -2,7 +2,9 @@ import asyncio
 import io
 import json
 import os
+import sys
 import time
+import types
 import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
@@ -1117,6 +1119,1279 @@ def test_rds_aurora_cluster_endpoints_follow_backing_instance(rds):
     assert cluster["Port"] == inst["Endpoint"]["Port"]
 
 
+def test_rds_aurora_cluster_members_share_one_container(monkeypatch):
+    """Cluster members attach to one cluster-owned container and member delete keeps it alive."""
+    import threading
+
+    from ministack.services import rds as m
+
+    runs = []
+    containers = {}
+    next_ports = []
+    removed_volumes = []
+    wait_calls = []
+    stale_wait_started = threading.Event()
+    release_stale_wait = threading.Event()
+
+    class FakeContainer:
+        def __init__(self, name):
+            self.id = "cluster-container-id"
+            self.name = name
+            self.status = "running"
+            self.attrs = {"NetworkSettings": {"Networks": {}}}
+            self.stop_calls = 0
+            self.start_calls = 0
+            self.remove_calls = 0
+
+        def reload(self):
+            pass
+
+        def stop(self, timeout=5):
+            self.stop_calls += 1
+            self.status = "exited"
+
+        def start(self):
+            self.start_calls += 1
+            self.status = "running"
+
+        def remove(self, v=False, force=False):
+            self.remove_calls += 1
+
+    class FakeContainers:
+        def run(self, **kwargs):
+            runs.append(kwargs)
+            container = FakeContainer(kwargs["name"])
+            containers[container.id] = container
+            containers[container.name] = container
+            return container
+
+        def get(self, identifier):
+            if identifier not in containers:
+                raise Exception("not found")
+            return containers[identifier]
+
+    class FakeVolume:
+        def __init__(self, name):
+            self.name = name
+
+        def remove(self):
+            removed_volumes.append(self.name)
+
+    class FakeVolumes:
+        def get(self, name):
+            return FakeVolume(name)
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+            self.volumes = FakeVolumes()
+
+    fake_docker = FakeDocker()
+
+    def _next_port():
+        port = 16000 + len(next_ports)
+        next_ports.append(port)
+        return port
+
+    def _wait_for_database_ready(*_args):
+        wait_calls.append(len(wait_calls) + 1)
+        if len(wait_calls) == 2:
+            stale_wait_started.set()
+            release_stale_wait.wait(timeout=2)
+            return False
+        return True
+
+    monkeypatch.setattr(m, "_get_docker", lambda: fake_docker)
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: None)
+    monkeypatch.setattr(m, "_next_port", _next_port)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    monkeypatch.setattr(m, "_wait_for_database_ready", _wait_for_database_ready)
+    monkeypatch.setattr(m, "_grant_mysql_master_user_privileges", lambda *_args: None)
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "shared-cluster",
+            "Engine": "aurora-mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        for db_id in ("shared-writer", "shared-reader"):
+            m._create_db_instance({
+                "DBInstanceIdentifier": db_id,
+                "DBClusterIdentifier": "shared-cluster",
+                "DBInstanceClass": "db.r6g.large",
+                "Engine": "aurora-mysql",
+            })
+
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            if all(
+                m._instances.get(db_id, {}).get("DBInstanceStatus") == "available"
+                for db_id in ("shared-writer", "shared-reader")
+            ):
+                break
+            time.sleep(0.01)
+
+        cluster = m._clusters.get("shared-cluster")
+        writer = m._instances.get("shared-writer")
+        reader = m._instances.get("shared-reader")
+        assert len(runs) == 1
+        assert next_ports == [16000]
+        assert runs[0]["name"] == m._rds_cluster_docker_name("shared-cluster")
+        assert runs[0]["labels"]["cluster_id"] == "shared-cluster"
+        volume_name = m._rds_cluster_docker_volume_name("shared-cluster")
+        assert runs[0]["volumes"] == {
+            volume_name: {"bind": "/var/lib/mysql", "mode": "rw"},
+        }
+        assert writer["_docker_container_id"] == reader["_docker_container_id"]
+        assert writer["Endpoint"] == reader["Endpoint"] == cluster["_shared_endpoint"]
+        assert cluster["Endpoint"] == cluster["ReaderEndpoint"] == writer["Endpoint"]["Address"]
+
+        persisted = m.get_state()
+        assert "_shared_container_id" not in persisted["clusters"].get("shared-cluster")
+        assert "_docker_container_id" not in persisted["instances"].get("shared-writer")
+
+        container = containers[writer["_docker_container_id"]]
+        m._delete_db_instance({
+            "DBInstanceIdentifier": "shared-reader",
+            "SkipFinalSnapshot": "true",
+        })
+        assert container.stop_calls == 0
+        assert container.remove_calls == 0
+
+        m._delete_db_instance({
+            "DBInstanceIdentifier": "shared-writer",
+            "SkipFinalSnapshot": "true",
+        })
+        assert cluster["Status"] == "available"
+        assert cluster["DBClusterMembers"] == []
+        assert cluster["_shared_container_ready"] is False
+        assert container.stop_calls == 1
+        assert container.remove_calls == 0
+
+        m._create_db_instance({
+            "DBInstanceIdentifier": "shared-stale-restart",
+            "DBClusterIdentifier": "shared-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+        assert stale_wait_started.wait(timeout=1)
+        stale_epoch = cluster["_shared_container_epoch"]
+        m._delete_db_instance({
+            "DBInstanceIdentifier": "shared-stale-restart",
+            "SkipFinalSnapshot": "true",
+        })
+
+        m._create_db_instance({
+            "DBInstanceIdentifier": "shared-replacement",
+            "DBClusterIdentifier": "shared-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            replacement = m._instances.get("shared-replacement")
+            if replacement and replacement.get("DBInstanceStatus") == "available":
+                break
+            time.sleep(0.01)
+        replacement = m._instances.get("shared-replacement")
+        assert replacement["DBInstanceStatus"] == "available"
+        assert replacement["_docker_container_id"] == container.id
+        assert cluster["_shared_container_ready"] is True
+        assert cluster["_shared_container_epoch"] > stale_epoch
+        release_stale_wait.set()
+        time.sleep(0.05)
+        assert replacement["DBInstanceStatus"] == "available"
+        assert cluster["_shared_container_ready"] is True
+        assert container.start_calls == 2
+        assert len(runs) == 1
+
+        m._delete_db_instance({
+            "DBInstanceIdentifier": "shared-replacement",
+            "SkipFinalSnapshot": "true",
+        })
+        assert container.stop_calls == 3
+        assert container.remove_calls == 0
+
+        m._delete_db_cluster({
+            "DBClusterIdentifier": "shared-cluster",
+            "SkipFinalSnapshot": "true",
+        })
+        assert container.stop_calls == 4
+        assert container.remove_calls == 1
+        assert removed_volumes == [volume_name]
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_new_member_retries_failed_shared_container(monkeypatch):
+    """A new member restarts shared compute after its first boot fails."""
+    from ministack.services import rds as m
+
+    runs = []
+    readiness_calls = []
+
+    class FakeContainer:
+        def __init__(self, name):
+            self.id = "failed-shared-container"
+            self.name = name
+            self.status = "running"
+            self.attrs = {"NetworkSettings": {"Networks": {}}}
+            self.start_calls = 0
+
+        def reload(self):
+            pass
+
+        def start(self):
+            self.start_calls += 1
+            self.status = "running"
+
+    container = FakeContainer(
+        m._rds_cluster_docker_name("failed-retry-cluster"),
+    )
+
+    class FakeContainers:
+        def run(self, **kwargs):
+            runs.append(kwargs)
+            return container
+
+        def get(self, identifier):
+            if identifier in (container.id, container.name):
+                return container
+            raise Exception("not found")
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+
+    def _wait_for_database_ready(*_args):
+        readiness_calls.append(len(readiness_calls) + 1)
+        if len(readiness_calls) == 1:
+            container.status = "exited"
+            return False
+        return True
+
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: None)
+    monkeypatch.setattr(m, "_next_port", lambda: 16041)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    monkeypatch.setattr(m, "_wait_for_database_ready", _wait_for_database_ready)
+    monkeypatch.setattr(m, "_grant_mysql_master_user_privileges", lambda *_args: None)
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "failed-retry-cluster",
+            "Engine": "aurora-mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        m._create_db_instance({
+            "DBInstanceIdentifier": "failed-original",
+            "DBClusterIdentifier": "failed-retry-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            if m._instances["failed-original"]["DBInstanceStatus"] == "failed":
+                break
+            time.sleep(0.01)
+
+        cluster = m._clusters["failed-retry-cluster"]
+        assert m._instances["failed-original"]["DBInstanceStatus"] == "failed"
+        assert cluster["_shared_container_ready"] is False
+        assert cluster["_shared_container_id"] == container.id
+        assert container.status == "exited"
+
+        m._create_db_instance({
+            "DBInstanceIdentifier": "failed-replacement",
+            "DBClusterIdentifier": "failed-retry-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            if all(
+                m._instances[db_id]["DBInstanceStatus"] == "available"
+                for db_id in ("failed-original", "failed-replacement")
+            ):
+                break
+            time.sleep(0.01)
+
+        assert readiness_calls == [1, 2]
+        assert container.start_calls == 1
+        assert len(runs) == 1
+        assert cluster["_shared_container_ready"] is True
+        assert all(
+            m._instances[db_id]["DBInstanceStatus"] == "available"
+            for db_id in ("failed-original", "failed-replacement")
+        )
+        assert all(
+            m._instances[db_id]["_docker_container_id"] == container.id
+            for db_id in ("failed-original", "failed-replacement")
+        )
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_password_change_after_failed_shared_start_uses_new_password(
+    monkeypatch,
+):
+    """A fresh retry must not rotate credentials on compute that never started."""
+    from ministack.services import rds as m
+
+    runs = []
+    readiness_passwords = []
+    rotation_calls = []
+
+    class FakeContainer:
+        id = "password-retry-container"
+        status = "running"
+        attrs = {"NetworkSettings": {"Networks": {}}}
+
+        def reload(self):
+            pass
+
+    container = FakeContainer()
+
+    class FakeContainers:
+        def run(self, **kwargs):
+            runs.append(kwargs)
+            if len(runs) == 1:
+                raise RuntimeError("initial start failed")
+            return container
+
+        def get(self, identifier):
+            if identifier == container.id:
+                return container
+            raise Exception("not found")
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+
+    def _wait_for_database_ready(_host, _port, _engine, _user, password, *_args):
+        readiness_passwords.append(password)
+        return True
+
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: None)
+    monkeypatch.setattr(m, "_next_port", lambda: 16042)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    monkeypatch.setattr(m, "_wait_for_database_ready", _wait_for_database_ready)
+    monkeypatch.setattr(m, "_grant_mysql_master_user_privileges", lambda *_args: None)
+    monkeypatch.setattr(
+        m,
+        "_rotate_real_password",
+        lambda *_args: rotation_calls.append(True) or False,
+    )
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "password-retry-cluster",
+            "Engine": "aurora-mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "old-password",
+        })
+        m._create_db_instance({
+            "DBInstanceIdentifier": "password-retry-original",
+            "DBClusterIdentifier": "password-retry-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+
+        cluster = m._clusters["password-retry-cluster"]
+        original = m._instances["password-retry-original"]
+        assert original["DBInstanceStatus"] == "failed"
+        assert cluster["_shared_container_id"] is None
+        assert cluster["_shared_container_ready"] is False
+
+        m._modify_db_cluster({
+            "DBClusterIdentifier": "password-retry-cluster",
+            "MasterUserPassword": "new-password",
+        })
+        assert rotation_calls == []
+        assert "_pending_master_password_rotation" not in cluster
+
+        m._create_db_instance({
+            "DBInstanceIdentifier": "password-retry-replacement",
+            "DBClusterIdentifier": "password-retry-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            if all(
+                m._instances[db_id]["DBInstanceStatus"] == "available"
+                for db_id in (
+                    "password-retry-original",
+                    "password-retry-replacement",
+                )
+            ):
+                break
+            time.sleep(0.01)
+
+        assert len(runs) == 2
+        assert runs[1]["environment"]["MYSQL_ROOT_PASSWORD"] == "new-password"
+        assert readiness_passwords == ["new-password"]
+        assert all(
+            m._instances[db_id]["DBInstanceStatus"] == "available"
+            for db_id in (
+                "password-retry-original",
+                "password-retry-replacement",
+            )
+        )
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_restored_initialized_storage_defers_password_rotation(monkeypatch):
+    """Persisted initialized storage still contains the previous password."""
+    from ministack.services import rds as m
+
+    rotation_calls = []
+    monkeypatch.setattr(
+        m,
+        "_rotate_real_password",
+        lambda *_args: rotation_calls.append(True) or False,
+    )
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "restored-password-cluster",
+            "Engine": "aurora-mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "old-password",
+        })
+        cluster = m._clusters["restored-password-cluster"]
+        cluster.update({
+            "_shared_container_id": "stopped-shared-container",
+            "_shared_storage_initialized": True,
+            "_shared_volume_name": "restored-password-volume",
+            "_shared_container_ready": False,
+        })
+
+        persisted = m.get_state()
+        persisted_cluster = persisted["clusters"]["restored-password-cluster"]
+        assert "_shared_container_id" not in persisted_cluster
+        assert persisted_cluster["_shared_storage_initialized"] is True
+
+        m._clusters.clear()
+        m.restore_state(persisted)
+        restored = m._clusters["restored-password-cluster"]
+        assert restored["_shared_container_id"] is None
+
+        m._modify_db_cluster({
+            "DBClusterIdentifier": "restored-password-cluster",
+            "MasterUserPassword": "new-password",
+        })
+
+        assert rotation_calls == []
+        assert restored["_pending_master_password_rotation"] == {
+            "old_password": "old-password",
+            "new_password": "new-password",
+        }
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_last_member_delete_wins_after_readiness_epoch_check(monkeypatch):
+    """A worker already finalizing readiness cannot revive stopped compute."""
+    import threading
+
+    from ministack.services import rds as m
+
+    grant_entered = threading.Event()
+    release_grant = threading.Event()
+    stop_entered = threading.Event()
+    delete_done = threading.Event()
+    grant_calls = []
+
+    class FakeContainer:
+        id = "readiness-race-container"
+        attrs = {"NetworkSettings": {"Networks": {}}}
+
+        def __init__(self):
+            self.status = "running"
+
+        def reload(self):
+            pass
+
+        def start(self):
+            self.status = "running"
+
+        def stop(self, timeout=5):
+            self.status = "exited"
+
+    container = FakeContainer()
+
+    class FakeContainers:
+        def run(self, **_kwargs):
+            return container
+
+        def get(self, identifier):
+            if identifier in (
+                container.id,
+                m._rds_cluster_docker_name("readiness-race-cluster"),
+            ):
+                return container
+            raise Exception("not found")
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: None)
+    monkeypatch.setattr(m, "_next_port", lambda: 16020)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    monkeypatch.setattr(m, "_wait_for_database_ready", lambda *_args: True)
+
+    def _grant(*_args):
+        grant_calls.append(True)
+        if len(grant_calls) == 2:
+            grant_entered.set()
+            release_grant.wait(timeout=2)
+
+    monkeypatch.setattr(m, "_grant_mysql_master_user_privileges", _grant)
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "readiness-race-cluster",
+            "Engine": "aurora-mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        m._create_db_instance({
+            "DBInstanceIdentifier": "readiness-race-original",
+            "DBClusterIdentifier": "readiness-race-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            if m._instances.get("readiness-race-original", {}).get(
+                "DBInstanceStatus",
+            ) == "available":
+                break
+            time.sleep(0.01)
+        m._delete_db_instance({
+            "DBInstanceIdentifier": "readiness-race-original",
+            "SkipFinalSnapshot": "true",
+        })
+
+        original_stop = m._stop_empty_cluster_shared_container
+
+        def _observed_stop(cluster_id, cluster):
+            stop_entered.set()
+            return original_stop(cluster_id, cluster)
+
+        monkeypatch.setattr(
+            m, "_stop_empty_cluster_shared_container", _observed_stop,
+        )
+        m._create_db_instance({
+            "DBInstanceIdentifier": "readiness-race-replacement",
+            "DBClusterIdentifier": "readiness-race-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+        assert grant_entered.wait(timeout=1)
+
+        def _delete_replacement():
+            m._delete_db_instance({
+                "DBInstanceIdentifier": "readiness-race-replacement",
+                "SkipFinalSnapshot": "true",
+            })
+            delete_done.set()
+
+        delete_thread = threading.Thread(target=_delete_replacement)
+        delete_thread.start()
+        assert stop_entered.wait(timeout=1)
+        assert not delete_done.is_set()
+        release_grant.set()
+        delete_thread.join(timeout=2)
+
+        cluster = m._clusters.get("readiness-race-cluster")
+        assert delete_done.is_set()
+        assert cluster["DBClusterMembers"] == []
+        assert cluster["_shared_container_ready"] is False
+        assert container.status == "exited"
+    finally:
+        release_grant.set()
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_stale_readiness_ignores_same_id_cluster_recreation(monkeypatch):
+    """Epoch reuse cannot let an old container worker mutate a new cluster."""
+    from ministack.services import rds as m
+
+    workers = []
+    containers = {}
+    ports = iter((16050, 16051))
+    run_count = [0]
+
+    class DeferredThread:
+        def __init__(self, target, args=(), **_kwargs):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            workers.append(self)
+
+    class FakeContainer:
+        attrs = {"NetworkSettings": {"Networks": {}}}
+
+        def __init__(self, name):
+            run_count[0] += 1
+            self.id = f"recreated-container-{run_count[0]}"
+            self.name = name
+            self.status = "running"
+
+        def reload(self):
+            pass
+
+        def stop(self, timeout=5):
+            self.status = "exited"
+
+        def remove(self, **_kwargs):
+            containers.pop(self.id, None)
+            containers.pop(self.name, None)
+
+    class FakeContainers:
+        def run(self, **kwargs):
+            container = FakeContainer(kwargs["name"])
+            containers[container.id] = container
+            containers[container.name] = container
+            return container
+
+        def get(self, identifier):
+            if identifier not in containers:
+                raise Exception("not found")
+            return containers[identifier]
+
+    class FakeVolume:
+        def remove(self):
+            pass
+
+    class FakeVolumes:
+        def get(self, _name):
+            return FakeVolume()
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+            self.volumes = FakeVolumes()
+
+    monkeypatch.setattr(m.threading, "Thread", DeferredThread)
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: None)
+    monkeypatch.setattr(m, "_next_port", lambda: next(ports))
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    monkeypatch.setattr(
+        m,
+        "_wait_for_database_ready",
+        lambda _host, port, *_args: port == 16051,
+    )
+    monkeypatch.setattr(m, "_grant_mysql_master_user_privileges", lambda *_args: None)
+
+    cluster_id = "recreated-readiness-cluster"
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        for member_id in ("old-member", "new-member"):
+            m._create_db_cluster({
+                "DBClusterIdentifier": cluster_id,
+                "Engine": "aurora-mysql",
+                "MasterUsername": "admin",
+                "MasterUserPassword": "password123",
+            })
+            m._create_db_instance({
+                "DBInstanceIdentifier": member_id,
+                "DBClusterIdentifier": cluster_id,
+                "DBInstanceClass": "db.r6g.large",
+                "Engine": "aurora-mysql",
+            })
+            if member_id == "old-member":
+                old_container_id = m._clusters[cluster_id][
+                    "_shared_container_id"
+                ]
+                m._delete_db_instance({
+                    "DBInstanceIdentifier": member_id,
+                    "SkipFinalSnapshot": "true",
+                })
+                m._delete_db_cluster({
+                    "DBClusterIdentifier": cluster_id,
+                    "SkipFinalSnapshot": "true",
+                })
+
+        cluster = m._clusters[cluster_id]
+        new_container_id = cluster["_shared_container_id"]
+        assert old_container_id != new_container_id
+        assert len(workers) == 2
+
+        # Finalize the replacement first. Both cluster incarnations use epoch
+        # 1, so epoch-only validation cannot distinguish the old worker.
+        workers[1].target(*workers[1].args)
+        assert cluster["_shared_container_epoch"] == 1
+        assert cluster["_shared_container_ready"] is True
+        assert m._instances["new-member"]["DBInstanceStatus"] == "available"
+
+        workers[0].target(*workers[0].args)
+        assert cluster["_shared_container_ready"] is True
+        assert m._instances["new-member"]["DBInstanceStatus"] == "available"
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_empty_control_plane_cluster_accepts_new_member(monkeypatch):
+    """A no-Docker cluster becomes connectable again when compute returns."""
+    from ministack.services import rds as m
+
+    monkeypatch.setattr(m, "_get_docker", lambda: None)
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "control-plane-cluster",
+            "Engine": "aurora-mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        m._create_db_instance({
+            "DBInstanceIdentifier": "control-plane-original",
+            "DBClusterIdentifier": "control-plane-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+        m._delete_db_instance({
+            "DBInstanceIdentifier": "control-plane-original",
+            "SkipFinalSnapshot": "true",
+        })
+
+        cluster = m._clusters.get("control-plane-cluster")
+        assert cluster["DBClusterMembers"] == []
+        assert cluster["_shared_container_ready"] is False
+
+        m._create_db_instance({
+            "DBInstanceIdentifier": "control-plane-replacement",
+            "DBClusterIdentifier": "control-plane-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+        replacement = m._instances.get("control-plane-replacement")
+        assert replacement["DBInstanceStatus"] == "available"
+        assert cluster["_shared_container_ready"] is True
+        assert [
+            member["DBInstanceIdentifier"]
+            for member in cluster["DBClusterMembers"]
+        ] == ["control-plane-replacement"]
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_invalid_member_does_not_restart_empty_cluster(monkeypatch):
+    """Request validation happens before a stopped cluster becomes reachable."""
+    from ministack.services import rds as m
+
+    start_calls = []
+
+    class FakeContainer:
+        status = "exited"
+        attrs = {"NetworkSettings": {"Networks": {}}}
+
+        def start(self):
+            start_calls.append(True)
+
+        def reload(self):
+            pass
+
+    class FakeContainers:
+        def get(self, identifier):
+            assert identifier == "stopped-shared-container"
+            return FakeContainer()
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    m._instances.clear()
+    m._clusters.clear()
+    m._param_groups.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "invalid-member-cluster",
+            "Engine": "aurora-mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        cluster = m._clusters["invalid-member-cluster"]
+        cluster.update({
+            "_shared_container_id": "stopped-shared-container",
+            "_shared_host_port": 16042,
+            "_shared_endpoint": {
+                "Address": "localhost",
+                "Port": 16042,
+                "HostedZoneId": "Z2R2ITUGPM61AM",
+            },
+            "_shared_container_ready": False,
+        })
+
+        m._create_db_instance({
+            "DBInstanceIdentifier": "invalid-member",
+            "DBClusterIdentifier": "invalid-member-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+            "DBParameterGroupName": "missing-custom-group",
+        })
+
+        assert start_calls == []
+        assert "invalid-member" not in m._instances
+        assert cluster["DBClusterMembers"] == []
+        assert cluster["_shared_container_ready"] is False
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+        m._param_groups.clear()
+
+
+def test_rds_cluster_member_connection_fields_are_normalized(monkeypatch):
+    from ministack.services import rds as m
+
+    monkeypatch.setattr(m, "_get_docker", lambda: None)
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "credential-cluster",
+            "Engine": "aurora-mysql",
+            "MasterUsername": "cluster_admin",
+            "MasterUserPassword": "cluster-password",
+            "DatabaseName": "cluster_db",
+        })
+        m._create_db_instance({
+            "DBInstanceIdentifier": "credential-member",
+            "DBClusterIdentifier": "credential-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-postgresql",
+            "MasterUsername": "wrong_admin",
+            "MasterUserPassword": "wrong-password",
+            "DBName": "wrong_db",
+        })
+
+        member = m._instances.get("credential-member")
+        assert member["Engine"] == "aurora-mysql"
+        assert member["MasterUsername"] == "cluster_admin"
+        assert member["_MasterUserPassword"] == "cluster-password"
+        assert member["DBName"] == "cluster_db"
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+@pytest.mark.parametrize("rotation_succeeds", [True, False])
+def test_rds_empty_cluster_applies_pending_password_on_restart(
+    monkeypatch, rotation_succeeds,
+):
+    from ministack.services import rds as m
+
+    readiness_passwords = []
+    rotations = []
+    grants = []
+
+    class FakeContainer:
+        id = "pending-password-container"
+        attrs = {"NetworkSettings": {"Networks": {}}}
+
+        def __init__(self):
+            self.status = "exited"
+
+        def start(self):
+            self.status = "running"
+
+        def reload(self):
+            pass
+
+    container = FakeContainer()
+
+    class FakeContainers:
+        def get(self, identifier):
+            assert identifier == container.id
+            return container
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+
+    def _wait_for_database_ready(_host, _port, _engine, _user, password, *_args):
+        readiness_passwords.append(password)
+        return True
+
+    def _rotate(_cluster, old_password, new_password):
+        rotations.append((old_password, new_password))
+        return rotation_succeeds
+
+    def _grant(_host, _port, user, password, db_id):
+        grants.append((user, password, db_id))
+
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: None)
+    monkeypatch.setattr(m, "_wait_for_database_ready", _wait_for_database_ready)
+    monkeypatch.setattr(m, "_rotate_real_password", _rotate)
+    monkeypatch.setattr(m, "_grant_mysql_master_user_privileges", _grant)
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "pending-password-cluster",
+            "Engine": "aurora-mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "old-password",
+            "DatabaseName": "appdb",
+        })
+        cluster = m._clusters.get("pending-password-cluster")
+        cluster.update({
+            "_shared_container_id": container.id,
+            "_shared_host_port": 16021,
+            "_shared_endpoint": {
+                "Address": "localhost",
+                "Port": 16021,
+                "HostedZoneId": "Z2R2ITUGPM61AM",
+            },
+            "_shared_container_ready": False,
+            "_shared_container_epoch": 1,
+        })
+
+        m._modify_db_cluster({
+            "DBClusterIdentifier": "pending-password-cluster",
+            "MasterUserPassword": "new-password",
+        })
+        assert cluster["_pending_master_password_rotation"] == {
+            "old_password": "old-password",
+            "new_password": "new-password",
+        }
+
+        m._create_db_instance({
+            "DBInstanceIdentifier": "pending-password-writer",
+            "DBClusterIdentifier": "pending-password-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+            "MasterUserPassword": "member-password-must-be-ignored",
+        })
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            if m._instances.get("pending-password-writer", {}).get(
+                "DBInstanceStatus",
+            ) in {"available", "failed"}:
+                break
+            time.sleep(0.01)
+
+        member = m._instances.get("pending-password-writer")
+        assert readiness_passwords == ["old-password"]
+        assert rotations == [("old-password", "new-password")]
+        assert member["_MasterUserPassword"] == "new-password"
+        if rotation_succeeds:
+            assert member["DBInstanceStatus"] == "available"
+            assert cluster["_shared_container_ready"] is True
+            assert "_pending_master_password_rotation" not in cluster
+            assert grants == [
+                ("admin", "new-password", "pending-password-cluster"),
+            ]
+        else:
+            assert member["DBInstanceStatus"] == "failed"
+            assert cluster["_shared_container_ready"] is False
+            assert cluster["_pending_master_password_rotation"] == {
+                "old_password": "old-password",
+                "new_password": "new-password",
+            }
+            assert grants == []
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_rotate_real_mysql_master_password(monkeypatch):
+    from ministack.services import rds as m
+
+    connects = []
+    executions = []
+
+    class FakeCursor:
+        def execute(self, query, params):
+            executions.append((query, params))
+
+        def close(self):
+            pass
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            pass
+
+    def _connect(**kwargs):
+        connects.append(kwargs)
+        return FakeConnection()
+
+    fake_pymysql = types.ModuleType("pymysql")
+    fake_pymysql.connect = _connect
+    monkeypatch.setitem(sys.modules, "pymysql", fake_pymysql)
+    m._instances.clear()
+    try:
+        m._instances["rotation-member"] = {
+            "DBInstanceIdentifier": "rotation-member",
+            "DBClusterIdentifier": "rotation-cluster",
+            "Endpoint": {"Address": "localhost", "Port": 16031},
+        }
+        assert m._rotate_real_password({
+            "DBClusterIdentifier": "rotation-cluster",
+            "Engine": "aurora-mysql",
+            "MasterUsername": "app_admin",
+        }, "old-password", "new-password") is True
+
+        assert connects == [{
+            "host": "localhost",
+            "port": 16031,
+            "user": "root",
+            "password": "old-password",
+            "autocommit": True,
+        }]
+        assert executions == [
+            (
+                "ALTER USER %s@'%%' IDENTIFIED BY %s",
+                ("app_admin", "new-password"),
+            ),
+            ("ALTER USER 'root'@'%%' IDENTIFIED BY %s", ("new-password",)),
+        ]
+    finally:
+        m._instances.clear()
+
+
+def test_rds_password_change_serializes_with_readiness_finalization(monkeypatch):
+    """A rotation racing final readiness is applied exactly once."""
+    import threading
+
+    from ministack.services import rds as m
+
+    grant_entered = threading.Event()
+    release_grant = threading.Event()
+    modify_done = threading.Event()
+    rotations = []
+
+    class FakeContainer:
+        id = "password-race-container"
+        attrs = {"NetworkSettings": {"Networks": {}}}
+        status = "running"
+
+        def reload(self):
+            pass
+
+    class FakeContainers:
+        def run(self, **_kwargs):
+            return FakeContainer()
+
+        def get(self, identifier):
+            if identifier == FakeContainer.id:
+                return FakeContainer()
+            raise Exception("not found")
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+
+    def _grant(*_args):
+        grant_entered.set()
+        release_grant.wait(timeout=2)
+
+    def _rotate(_cluster, old_password, new_password):
+        rotations.append((old_password, new_password))
+        return True
+
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: None)
+    monkeypatch.setattr(m, "_next_port", lambda: 16033)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    monkeypatch.setattr(m, "_wait_for_database_ready", lambda *_args: True)
+    monkeypatch.setattr(m, "_grant_mysql_master_user_privileges", _grant)
+    monkeypatch.setattr(m, "_rotate_real_password", _rotate)
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "password-race-cluster",
+            "Engine": "aurora-mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "old-password",
+        })
+        m._create_db_instance({
+            "DBInstanceIdentifier": "password-race-writer",
+            "DBClusterIdentifier": "password-race-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+        assert grant_entered.wait(timeout=1)
+
+        def _modify_password():
+            m._modify_db_cluster({
+                "DBClusterIdentifier": "password-race-cluster",
+                "MasterUserPassword": "new-password",
+            })
+            modify_done.set()
+
+        modify_thread = threading.Thread(target=_modify_password)
+        modify_thread.start()
+        time.sleep(0.05)
+        assert not modify_done.is_set()
+
+        release_grant.set()
+        modify_thread.join(timeout=2)
+
+        cluster = m._clusters.get("password-race-cluster")
+        member = m._instances.get("password-race-writer")
+        assert modify_done.is_set()
+        assert rotations == [("old-password", "new-password")]
+        assert cluster["_MasterUserPassword"] == "new-password"
+        assert "_pending_master_password_rotation" not in cluster
+        assert cluster["_shared_container_ready"] is True
+        assert member["DBInstanceStatus"] == "available"
+    finally:
+        release_grant.set()
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_rotate_real_postgres_master_password(monkeypatch):
+    from ministack.services import rds as m
+
+    connects = []
+    executions = []
+
+    class FakeCursor:
+        def execute(self, query, params):
+            executions.append((query, params))
+
+        def close(self):
+            pass
+
+    class FakeConnection:
+        autocommit = False
+
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            pass
+
+    def _connect(**kwargs):
+        connects.append(kwargs)
+        return FakeConnection()
+
+    class FakeIdentifier:
+        def __init__(self, value):
+            self.value = value
+
+        def __repr__(self):
+            return f"Identifier({self.value!r})"
+
+    class FakeSQL:
+        def __init__(self, value):
+            self.value = value
+
+        def format(self, **kwargs):
+            return self.value, kwargs
+
+    fake_psycopg2 = types.ModuleType("psycopg2")
+    fake_psycopg2.connect = _connect
+    fake_psycopg2.sql = types.SimpleNamespace(
+        Identifier=FakeIdentifier,
+        SQL=FakeSQL,
+    )
+    monkeypatch.setitem(sys.modules, "psycopg2", fake_psycopg2)
+    m._instances.clear()
+    try:
+        m._instances["rotation-member"] = {
+            "DBInstanceIdentifier": "rotation-member",
+            "DBClusterIdentifier": "rotation-cluster",
+            "Endpoint": {"Address": "localhost", "Port": 16032},
+        }
+        assert m._rotate_real_password({
+            "DBClusterIdentifier": "rotation-cluster",
+            "Engine": "aurora-postgresql",
+            "MasterUsername": "app_admin",
+            "DatabaseName": "appdb",
+        }, "old-password", "new-password") is True
+
+        assert connects == [{
+            "host": "localhost",
+            "port": 16032,
+            "user": "app_admin",
+            "password": "old-password",
+            "dbname": "appdb",
+        }]
+        assert len(executions) == 1
+        assert "Identifier('app_admin')" in repr(executions[0][0])
+        assert executions[0][1] == ("new-password",)
+    finally:
+        m._instances.clear()
+
+
+def test_rds_delete_cluster_rejects_attached_members(monkeypatch):
+    from ministack.services import rds as m
+
+    monkeypatch.setattr(m, "_get_docker", lambda: None)
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "member-owned-cluster",
+            "Engine": "aurora-mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        m._create_db_instance({
+            "DBInstanceIdentifier": "member-owned-writer",
+            "DBClusterIdentifier": "member-owned-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+
+        status, _, body = m._delete_db_cluster({
+            "DBClusterIdentifier": "member-owned-cluster",
+            "SkipFinalSnapshot": "true",
+        })
+
+        assert status == 400
+        assert b"InvalidDBClusterStateFault" in body
+        assert m._clusters.get("member-owned-cluster") is not None
+        assert m._instances.get("member-owned-writer")["DBInstanceStatus"] == "available"
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
 def test_rds_mysql_master_user_privilege_grants(monkeypatch):
     """MySQL master users get admin grants, with dynamic grants best-effort."""
     import sys
@@ -1257,6 +2532,52 @@ def test_rds_modify_instance_password(rds):
     assert inst["MasterUsername"] == "admin"
     assert inst["Engine"] == "postgres"
     assert inst["DBInstanceStatus"] == "available"
+
+
+def test_rds_modify_cluster_member_password_is_rejected(monkeypatch):
+    from ministack.services import rds as m
+
+    rotations = []
+    monkeypatch.setattr(
+        m,
+        "_rotate_instance_password",
+        lambda *_args: rotations.append(_args),
+    )
+    monkeypatch.setattr(m, "_get_docker", lambda: None)
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "member-password-cluster",
+            "Engine": "aurora-mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "cluster-password",
+        })
+        m._create_db_instance({
+            "DBInstanceIdentifier": "member-password-writer",
+            "DBClusterIdentifier": "member-password-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+        member = m._instances.get("member-password-writer")
+
+        status, _, body = m._modify_db_instance({
+            "DBInstanceIdentifier": "member-password-writer",
+            "MasterUserPassword": "member-password",
+            "ApplyImmediately": "true",
+        })
+
+        assert status == 400
+        assert b"InvalidParameterCombination" in body
+        assert b"Use ModifyDBCluster instead" in body
+        assert member["_MasterUserPassword"] == "cluster-password"
+        assert m._clusters.get("member-password-cluster")[
+            "_MasterUserPassword"
+        ] == "cluster-password"
+        assert rotations == []
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1787,6 +3108,834 @@ def test_rds_restore_state_respawns_docker_container(monkeypatch):
     m._instances.clear()
 
 
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "ready",
+        "not-ready",
+        "writer-removal-fails",
+        "reader-removal-fails",
+        "ownership-mismatch",
+        "member-added-during-readiness",
+        "member-added-during-migration",
+        "pending-password-rotation",
+        "last-member-deleted-during-readiness",
+        "last-members-deleted-before-start",
+    ],
+)
+def test_rds_restore_state_respawns_one_container_per_cluster(
+    monkeypatch, scenario,
+):
+    """Legacy volumes are reaped only after the adopted writer is ready."""
+    import threading
+
+    from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region
+    from ministack.services import rds as m
+
+    runs = []
+    removed_containers = []
+    removed_volumes = []
+    readiness_credentials = []
+    rotations = []
+    grants = []
+    remaining_legacy_names = set()
+    legacy_owner_by_name = {}
+    writer_legacy_container_name = [None]
+    reader_legacy_container_name = [None]
+    callback_action_done = [False]
+    migration_pause_done = [False]
+    migration_remove_started = threading.Event()
+    release_migration_remove = threading.Event()
+    database_ready = scenario != "not-ready"
+    writer_removal_succeeds = scenario != "writer-removal-fails"
+    reader_removal_succeeds = scenario != "reader-removal-fails"
+
+    class FakeContainer:
+        id = "restored-shared-container"
+        attrs = {"NetworkSettings": {"Networks": {}}}
+        status = "running"
+
+        def reload(self):
+            pass
+
+    class FakeLegacyContainer:
+        def __init__(self, name):
+            self.name = name
+            self.labels = {
+                "ministack": "rds",
+                "db_id": legacy_owner_by_name[name],
+                "account_id": get_account_id(),
+                "region": get_region(),
+            }
+            if (
+                scenario == "ownership-mismatch"
+                and name == reader_legacy_container_name[0]
+            ):
+                self.labels.pop("db_id")
+                self.labels["cluster_id"] = "different-current-cluster"
+            self.attrs = {"Config": {"Labels": self.labels}}
+
+        def remove(self, force=False, v=False):
+            assert force is True
+            assert v is False
+            if (
+                scenario in (
+                    "last-members-deleted-before-start",
+                    "member-added-during-migration",
+                )
+                and not migration_pause_done[0]
+            ):
+                migration_pause_done[0] = True
+                migration_remove_started.set()
+                release_migration_remove.wait(timeout=2)
+            if (
+                self.name == writer_legacy_container_name[0]
+                and not writer_removal_succeeds
+            ):
+                raise Exception("writer container remains running")
+            if (
+                self.name == reader_legacy_container_name[0]
+                and not reader_removal_succeeds
+            ):
+                raise Exception("reader container remains running")
+            if scenario == "ownership-mismatch" and self.name == (
+                reader_legacy_container_name[0]
+            ):
+                raise AssertionError("unowned current container must not be removed")
+            removed_containers.append(self.name)
+            remaining_legacy_names.discard(self.name)
+
+    class FakeContainers:
+        def get(self, identifier):
+            if identifier in remaining_legacy_names:
+                return FakeLegacyContainer(identifier)
+            raise Exception("not found")
+
+        def run(self, **kwargs):
+            runs.append(kwargs)
+            return FakeContainer()
+
+    class FakeVolume:
+        def __init__(self, name):
+            self.name = name
+
+        def remove(self):
+            removed_volumes.append(self.name)
+
+    class FakeVolumes:
+        def get(self, name):
+            return FakeVolume(name)
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+            self.volumes = FakeVolumes()
+
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: None)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    def _wait_for_database_ready(
+        _host, _port, _engine, user, password, db_name, *_args,
+    ):
+        readiness_credentials.append((user, password, db_name))
+        if (
+            scenario == "member-added-during-readiness"
+            and not callback_action_done[0]
+        ):
+            callback_action_done[0] = True
+            m._create_db_instance({
+                "DBInstanceIdentifier": "restored-late-reader",
+                "DBClusterIdentifier": "restored-shared-cluster",
+                "DBInstanceClass": "db.r6g.large",
+                "Engine": "aurora-mysql",
+            })
+        elif (
+            scenario == "last-member-deleted-during-readiness"
+            and not callback_action_done[0]
+        ):
+            callback_action_done[0] = True
+            for db_id in ("restored-reader", "restored-writer"):
+                del m._instances[db_id]
+                m._unregister_instance_from_clusters(db_id)
+            restored_cluster = m._clusters["restored-shared-cluster"]
+            m._stop_empty_cluster_shared_container(
+                "restored-shared-cluster", restored_cluster,
+            )
+        return database_ready
+
+    def _rotate(_cluster, old_password, new_password):
+        rotations.append((old_password, new_password))
+        return True
+
+    def _grant(_host, _port, user, password, db_id):
+        grants.append((user, password, db_id))
+
+    monkeypatch.setattr(m, "_wait_for_database_ready", _wait_for_database_ready)
+    monkeypatch.setattr(m, "_rotate_real_password", _rotate)
+    monkeypatch.setattr(m, "_grant_mysql_master_user_privileges", _grant)
+
+    account_id = get_account_id()
+    region = get_region()
+    cluster_id = "restored-shared-cluster"
+    legacy_container_names = {
+        m._legacy_scoped_rds_docker_name(
+            db_id, account_id, region,
+        )
+        for db_id in ("restored-writer", "restored-reader")
+    }
+    remaining_legacy_names.update(legacy_container_names)
+    legacy_owner_by_name.update({
+        m._legacy_scoped_rds_docker_name(db_id, account_id, region): db_id
+        for db_id in ("restored-writer", "restored-reader")
+    })
+    writer_legacy_container_name[0] = m._legacy_scoped_rds_docker_name(
+        "restored-writer", account_id, region,
+    )
+    reader_legacy_container_name[0] = m._legacy_scoped_rds_docker_name(
+        "restored-reader", account_id, region,
+    )
+    clusters = AccountRegionScopedDict()
+    cluster_record = {
+        "DBClusterIdentifier": cluster_id,
+        "Engine": "aurora-mysql",
+        "EngineVersion": DEFAULT_AURORA_MYSQL_ENGINE_VERSION,
+        "MasterUsername": "cluster-admin",
+        "_MasterUserPassword": "cluster-password",
+        "DatabaseName": "cluster-db",
+        "Port": 3306,
+        "HostedZoneId": "Z2R2ITUGPM61AM",
+        "DBClusterMembers": [
+            {"DBInstanceIdentifier": "restored-writer", "IsClusterWriter": True},
+            {"DBInstanceIdentifier": "restored-reader", "IsClusterWriter": False},
+        ],
+        "_shared_container_id": "stale-container-id",
+        "_shared_host_port": 16010,
+        "_shared_endpoint": {
+            "Address": "localhost",
+            "Port": 16010,
+            "HostedZoneId": "Z2R2ITUGPM61AM",
+        },
+    }
+    if scenario == "pending-password-rotation":
+        cluster_record["_MasterUserPassword"] = "rotated-password"
+        cluster_record["_pending_master_password_rotation"] = {
+            "old_password": "writer-password",
+            "new_password": "rotated-password",
+        }
+    clusters.set_scoped(account_id, region, cluster_id, cluster_record)
+    instances = AccountRegionScopedDict()
+    for db_id in ("restored-writer", "restored-reader"):
+        instances.set_scoped(account_id, region, db_id, {
+            "DBInstanceIdentifier": db_id,
+            "DBClusterIdentifier": cluster_id,
+            "Engine": "aurora-mysql",
+            "EngineVersion": DEFAULT_AURORA_MYSQL_ENGINE_VERSION,
+            "MasterUsername": (
+                "writer-admin" if db_id == "restored-writer" else "reader-admin"
+            ),
+            "_MasterUserPassword": (
+                "writer-password" if db_id == "restored-writer" else "reader-password"
+            ),
+            "DBName": "writer-db" if db_id == "restored-writer" else "reader-db",
+            "DBInstanceStatus": "available",
+            "Endpoint": {"Address": "localhost", "Port": 16010},
+            "_docker_container_id": "stale-container-id",
+            "_docker_volume_name": f"legacy-{db_id}-volume",
+        })
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m.restore_state({
+            "instances": instances,
+            "clusters": clusters,
+            "subnet_groups": {},
+            "param_groups": {},
+            "snapshots": {},
+            "db_cluster_param_groups": {},
+            "db_cluster_snapshots": {},
+            "option_groups": {},
+            "global_clusters": {},
+            "tags": {},
+            "port_counter": 16010,
+        })
+
+        if scenario == "last-members-deleted-before-start":
+            assert migration_remove_started.wait(timeout=1)
+            for db_id in ("restored-reader", "restored-writer"):
+                del m._instances[db_id]
+                m._unregister_instance_from_clusters(db_id)
+            restored_cluster = m._clusters[cluster_id]
+            m._stop_empty_cluster_shared_container(
+                cluster_id,
+                restored_cluster,
+            )
+            release_migration_remove.set()
+        elif scenario == "member-added-during-migration":
+            assert migration_remove_started.wait(timeout=1)
+            restored_cluster = m._clusters[cluster_id]
+            assert restored_cluster["_shared_legacy_migration_in_progress"] is True
+            response = m._create_db_instance({
+                "DBInstanceIdentifier": "racing-migration-member",
+                "DBClusterIdentifier": cluster_id,
+                "DBInstanceClass": "db.r6g.large",
+                "Engine": "aurora-mysql",
+            })
+            assert response[0] == 400
+            assert "racing-migration-member" not in m._instances
+            assert runs == []
+            release_migration_remove.set()
+
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            if scenario in (
+                "last-member-deleted-during-readiness",
+                "last-members-deleted-before-start",
+            ):
+                if m._clusters.get(cluster_id, {}).get("DBClusterMembers") == []:
+                    break
+                time.sleep(0.01)
+                continue
+            statuses = {
+                m._instances.get(db_id, {}).get("DBInstanceStatus")
+                for db_id in ("restored-writer", "restored-reader")
+            }
+            if statuses <= {"available", "failed"}:
+                break
+            time.sleep(0.01)
+
+        if not writer_removal_succeeds or not reader_removal_succeeds or (
+            scenario == "ownership-mismatch"
+        ):
+            assert runs == []
+            assert readiness_credentials == []
+            expected_remaining_name = (
+                writer_legacy_container_name[0]
+                if not writer_removal_succeeds
+                else reader_legacy_container_name[0]
+            )
+            assert expected_remaining_name in remaining_legacy_names
+            assert removed_volumes == []
+            restored_cluster = m._clusters.get(cluster_id)
+            assert restored_cluster[
+                "_shared_legacy_migration_blocked"
+            ] is True
+            m._create_db_instance({
+                "DBInstanceIdentifier": "blocked-migration-member",
+                "DBClusterIdentifier": cluster_id,
+                "DBInstanceClass": "db.r6g.large",
+                "Engine": "aurora-mysql",
+            })
+            assert "blocked-migration-member" not in m._instances
+            assert runs == []
+            assert all(
+                m._instances.get(db_id)["DBInstanceStatus"] == "failed"
+                for db_id in ("restored-writer", "restored-reader")
+            )
+            return
+
+        if scenario == "last-members-deleted-before-start":
+            restored_cluster = m._clusters.get(cluster_id)
+            assert runs == []
+            assert readiness_credentials == []
+            assert restored_cluster["DBClusterMembers"] == []
+            assert restored_cluster["_shared_container_ready"] is False
+            assert restored_cluster["_shared_container_epoch"] > 0
+            assert rotations == []
+            assert grants == []
+            assert removed_volumes == []
+            return
+
+        if scenario == "last-member-deleted-during-readiness":
+            restored_cluster = m._clusters.get(cluster_id)
+            assert restored_cluster["DBClusterMembers"] == []
+            assert restored_cluster["_shared_container_ready"] is False
+            assert restored_cluster["_shared_container_epoch"] > 1
+            assert rotations == []
+            assert grants == []
+            assert removed_volumes == []
+            return
+
+        assert len(runs) == 1
+        assert runs[0]["name"] == m._rds_cluster_docker_name(cluster_id)
+        assert runs[0]["environment"]["MYSQL_USER"] == "writer-admin"
+        expected_password = (
+            "rotated-password"
+            if scenario == "pending-password-rotation"
+            else "writer-password"
+        )
+        assert runs[0]["environment"]["MYSQL_ROOT_PASSWORD"] == expected_password
+        assert runs[0]["environment"]["MYSQL_DATABASE"] == "writer-db"
+        assert readiness_credentials == [
+            ("writer-admin", "writer-password", "writer-db"),
+        ]
+        assert runs[0]["volumes"] == {
+            "legacy-restored-writer-volume": {
+                "bind": "/var/lib/mysql",
+                "mode": "rw",
+            },
+        }
+        assert set(removed_containers) == legacy_container_names
+        assert removed_volumes == (
+            ["legacy-restored-reader-volume"] if database_ready else []
+        )
+        restored_cluster = m._clusters.get(cluster_id)
+        assert restored_cluster["_shared_container_id"] == "restored-shared-container"
+        assert restored_cluster["_shared_volume_name"] == "legacy-restored-writer-volume"
+        assert restored_cluster["MasterUsername"] == "writer-admin"
+        assert restored_cluster["_MasterUserPassword"] == expected_password
+        assert restored_cluster["DatabaseName"] == "writer-db"
+        assert restored_cluster["_shared_container_ready"] is database_ready
+        assert restored_cluster["Endpoint"] == restored_cluster["ReaderEndpoint"]
+        assert rotations == (
+            [("writer-password", "rotated-password")]
+            if scenario == "pending-password-rotation"
+            else []
+        )
+        assert grants == (
+            [("writer-admin", expected_password, cluster_id)]
+            if database_ready
+            else []
+        )
+        for db_id in ("restored-writer", "restored-reader"):
+            instance = m._instances.get(db_id)
+            assert instance["MasterUsername"] == "writer-admin"
+            assert instance["_MasterUserPassword"] == expected_password
+            assert instance["DBName"] == "writer-db"
+            assert instance["_docker_container_id"] == "restored-shared-container"
+            assert instance["_shared_cluster_id"] == cluster_id
+            assert instance["Endpoint"] == restored_cluster["_shared_endpoint"]
+            assert instance["DBInstanceStatus"] == (
+                "available" if database_ready else "failed"
+            )
+        if scenario == "member-added-during-readiness":
+            late_member = m._instances.get("restored-late-reader")
+            assert late_member["DBInstanceStatus"] == "available"
+            assert late_member["_docker_container_id"] == (
+                "restored-shared-container"
+            )
+            assert restored_cluster["Status"] == "available"
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+@pytest.mark.parametrize("cleanup_action", ["delete", "delete-arn", "reset"])
+def test_rds_restored_empty_cluster_cleanup_recovers_container_by_name(
+    monkeypatch, cleanup_action,
+):
+    from ministack.services import rds as m
+
+    stopped = []
+    removed_containers = []
+    removed_volumes = []
+    cluster_id = f"restored-empty-{cleanup_action}"
+    container_name = m._rds_cluster_docker_name(cluster_id)
+    volume_name = m._rds_cluster_docker_volume_name(cluster_id)
+
+    class FakeContainer:
+        def stop(self, timeout=5):
+            stopped.append(timeout)
+
+        def remove(self, v=False):
+            removed_containers.append(v)
+
+    class FakeContainers:
+        def get(self, identifier):
+            if identifier == container_name:
+                return FakeContainer()
+            raise Exception("not found")
+
+    class FakeVolume:
+        def remove(self):
+            removed_volumes.append(volume_name)
+
+    class FakeVolumes:
+        def get(self, name):
+            assert name == volume_name
+            return FakeVolume()
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+            self.volumes = FakeVolumes()
+
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": cluster_id,
+            "Engine": "aurora-mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        cluster = m._clusters.get(cluster_id)
+        cluster.update({
+            "_shared_container_id": "unrestorable-container-id",
+            "_shared_endpoint": {
+                "Address": "localhost",
+                "Port": 16022,
+                "HostedZoneId": "Z2R2ITUGPM61AM",
+            },
+            "_shared_volume_name": volume_name,
+            "_shared_container_ready": False,
+        })
+        persisted = m.get_state()
+        m._clusters.clear()
+        m.restore_state(persisted)
+
+        restored = m._clusters.get(cluster_id)
+        assert restored["DBClusterMembers"] == []
+        assert restored["_shared_container_id"] is None
+        if cleanup_action in ("delete", "delete-arn"):
+            cluster_identifier = (
+                restored["DBClusterArn"]
+                if cleanup_action == "delete-arn"
+                else cluster_id
+            )
+            status, _, _ = m._delete_db_cluster({
+                "DBClusterIdentifier": cluster_identifier,
+                "SkipFinalSnapshot": "true",
+            })
+            assert status == 200
+        else:
+            m.reset()
+
+        assert stopped == [5 if cleanup_action in ("delete", "delete-arn") else 2]
+        assert removed_containers == [True]
+        assert removed_volumes == [volume_name]
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_reset_removes_shared_container_once(monkeypatch):
+    """Reset reaps cluster-owned containers and volumes once."""
+    from ministack.services import rds as m
+
+    stop_calls = []
+    remove_calls = []
+    removed_volumes = []
+
+    class FakeContainer:
+        def stop(self, timeout=2):
+            stop_calls.append(timeout)
+
+        def remove(self, v=False):
+            remove_calls.append(v)
+
+    class FakeContainers:
+        def get(self, identifier):
+            assert identifier == "shared-reset-container"
+            return FakeContainer()
+
+    class FakeVolume:
+        def remove(self):
+            removed_volumes.append("shared-reset-volume")
+
+    class FakeVolumes:
+        def get(self, name):
+            assert name == "shared-reset-volume"
+            return FakeVolume()
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+            self.volumes = FakeVolumes()
+
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._clusters["reset-cluster"] = {
+            "DBClusterIdentifier": "reset-cluster",
+            "_shared_container_id": "shared-reset-container",
+            "_shared_volume_name": "shared-reset-volume",
+        }
+        for db_id in ("reset-writer", "reset-reader"):
+            m._instances[db_id] = {
+                "DBInstanceIdentifier": db_id,
+                "_docker_container_id": "shared-reset-container",
+                "_shared_cluster_id": "reset-cluster",
+            }
+
+        m.reset()
+
+        assert stop_calls == [2]
+        assert remove_calls == [True]
+        assert removed_volumes == ["shared-reset-volume"]
+        assert not m._instances
+        assert not m._clusters
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_reset_uses_each_clusters_account_and_region(monkeypatch):
+    from ministack.services import rds as m
+
+    foreign_account = "111122223333"
+    foreign_region = "us-west-2"
+    cluster_id = "foreign-empty-cluster"
+    container_name = m._rds_cluster_docker_name(
+        cluster_id, foreign_account, foreign_region,
+    )
+    volume_name = m._rds_cluster_docker_volume_name(
+        cluster_id, foreign_account, foreign_region,
+    )
+    container_lookups = []
+    volume_lookups = []
+    stop_calls = []
+    remove_calls = []
+
+    class FakeContainer:
+        def stop(self, timeout=2):
+            stop_calls.append(timeout)
+
+        def remove(self, v=False):
+            remove_calls.append(v)
+
+    class FakeContainers:
+        def get(self, identifier):
+            container_lookups.append(identifier)
+            if identifier == container_name:
+                return FakeContainer()
+            raise Exception("not found")
+
+    class FakeVolume:
+        def remove(self):
+            pass
+
+    class FakeVolumes:
+        def get(self, name):
+            volume_lookups.append(name)
+            if name == volume_name:
+                return FakeVolume()
+            raise Exception("not found")
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+            self.volumes = FakeVolumes()
+
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._clusters.set_scoped(
+            foreign_account,
+            foreign_region,
+            cluster_id,
+            {
+                "DBClusterIdentifier": cluster_id,
+                "DBClusterMembers": [],
+                "_shared_container_id": None,
+                "_shared_endpoint": {
+                    "Address": "localhost",
+                    "Port": 16040,
+                },
+                "_shared_volume_name": None,
+            },
+        )
+
+        m.reset()
+
+        assert container_lookups == [container_name]
+        assert volume_lookups == [volume_name]
+        assert stop_calls == [2]
+        assert remove_calls == [True]
+        assert not m._clusters.has_any()
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_host_port_probe_rejects_loopback_listener():
+    """A loopback listener must not be mistaken for a reusable Docker port."""
+    import socket
+
+    from ministack.services import rds as m
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    try:
+        assert not m._is_host_port_free(listener.getsockname()[1])
+    finally:
+        listener.close()
+
+
+def test_rds_container_names_separate_instances_from_clusters():
+    from ministack.services import rds as m
+
+    assert m._rds_docker_name("cluster-orders") != m._rds_cluster_docker_name(
+        "orders",
+    )
+    assert "-instance-cluster-orders" in m._rds_docker_name("cluster-orders")
+    assert "-cluster-orders" in m._rds_cluster_docker_name("orders")
+
+
+def test_rds_cluster_volume_name_cannot_match_legacy_instance():
+    from ministack.services import rds as m
+
+    assert m._rds_cluster_docker_volume_name(
+        "orders",
+    ) != m._legacy_scoped_rds_docker_volume_name("cluster-orders")
+    assert "ministack-rds-cluster-" in m._rds_cluster_docker_volume_name(
+        "orders",
+    )
+
+
+def test_rds_restore_migrates_legacy_instance_name_before_cluster_claims_it(
+    monkeypatch,
+):
+    from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region
+    from ministack.services import rds as m
+
+    account_id = get_account_id()
+    region = get_region()
+    cluster_id = "orders"
+    standalone_id = "cluster-orders"
+    collision_name = m._legacy_scoped_rds_docker_name(
+        standalone_id, account_id, region,
+    )
+    assert collision_name == m._rds_cluster_docker_name(
+        cluster_id, account_id, region,
+    )
+    containers = {}
+    removed = []
+    runs = []
+
+    class FakeContainer:
+        def __init__(self, name, container_id, labels=None):
+            self.name = name
+            self.id = container_id
+            self.labels = labels or {}
+            self.attrs = {
+                "Config": {"Labels": self.labels},
+                "NetworkSettings": {"Networks": {}},
+            }
+
+        def reload(self):
+            pass
+
+        def remove(self, force=False, v=False):
+            removed.append((self.name, self.id, force, v))
+            containers.pop(self.name, None)
+            containers.pop(self.id, None)
+
+    legacy = FakeContainer(
+        collision_name,
+        "legacy-standalone-container",
+        labels={
+            "ministack": "rds",
+            "db_id": standalone_id,
+            "account_id": account_id,
+            "region": region,
+        },
+    )
+    containers[legacy.name] = legacy
+    containers[legacy.id] = legacy
+
+    class FakeContainers:
+        def get(self, identifier):
+            if identifier not in containers:
+                raise Exception("not found")
+            return containers[identifier]
+
+        def run(self, **kwargs):
+            container = FakeContainer(
+                kwargs["name"], f"new-container-{len(runs)}",
+            )
+            runs.append(kwargs)
+            containers[container.name] = container
+            containers[container.id] = container
+            return container
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+
+    class ImmediateThread:
+        def __init__(self, target, args=(), **_kwargs):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            self.target(*self.args)
+
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: None)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    monkeypatch.setattr(m.threading, "Thread", ImmediateThread)
+
+    clusters = AccountRegionScopedDict()
+    clusters.set_scoped(account_id, region, cluster_id, {
+        "DBClusterIdentifier": cluster_id,
+        "DBClusterArn": f"arn:aws:rds:{region}:{account_id}:cluster:{cluster_id}",
+        "Engine": "aurora-mysql",
+        "EngineVersion": DEFAULT_AURORA_MYSQL_ENGINE_VERSION,
+        "MasterUsername": "admin",
+        "_MasterUserPassword": "password123",
+        "DatabaseName": "mydb",
+        "Port": 3306,
+        "DBClusterMembers": [
+            {"DBInstanceIdentifier": "orders-writer", "IsClusterWriter": True},
+        ],
+    })
+    instances = AccountRegionScopedDict()
+    for db_id, parent_id in (
+        ("orders-writer", cluster_id),
+        (standalone_id, ""),
+    ):
+        instances.set_scoped(account_id, region, db_id, {
+            "DBInstanceIdentifier": db_id,
+            "DBClusterIdentifier": parent_id,
+            "DBInstanceArn": f"arn:aws:rds:{region}:{account_id}:db:{db_id}",
+            "Engine": "aurora-mysql" if parent_id else "mysql",
+            "EngineVersion": "8.0",
+            "MasterUsername": "admin",
+            "_MasterUserPassword": "password123",
+            "DBName": "mydb",
+            "DBInstanceStatus": "available",
+            "Endpoint": {"Address": "localhost", "Port": 16030},
+        })
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m.restore_state({
+            "instances": instances,
+            "clusters": clusters,
+            "subnet_groups": {},
+            "param_groups": {},
+            "snapshots": {},
+            "db_cluster_param_groups": {},
+            "db_cluster_snapshots": {},
+            "option_groups": {},
+            "global_clusters": {},
+            "tags": {},
+            "port_counter": 16030,
+        })
+
+        assert removed == [
+            (collision_name, "legacy-standalone-container", True, False),
+        ]
+        assert {run["name"] for run in runs} == {
+            m._rds_cluster_docker_name(cluster_id),
+            m._rds_docker_name(standalone_id),
+        }
+        assert containers[collision_name].id != "legacy-standalone-container"
+        assert containers[collision_name].name == m._rds_cluster_docker_name(
+            cluster_id,
+        )
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
 def test_rds_restore_state_removes_stale_container_before_respawn(monkeypatch):
     """If a container with the deterministic name already exists, restore
     must remove the stale one before re-creating, otherwise containers.run
@@ -1808,7 +3957,7 @@ def test_rds_restore_state_removes_stale_container_before_respawn(monkeypatch):
         def remove(self, **kwargs):
             removed.append(self.name)
 
-    stale_name = m._rds_docker_name("stale-db")
+    stale_name = m._legacy_scoped_rds_docker_name("stale-db")
     stale = FakeContainer(name=stale_name, container_id="cid-stale")
 
     class FakeContainers:
@@ -1858,7 +4007,7 @@ def test_rds_restore_state_removes_stale_container_before_respawn(monkeypatch):
 
     assert stale_name in removed, "stale container not removed"
     assert runs, "fresh container not spawned after removing stale one"
-    assert runs[0]["name"] == stale_name
+    assert runs[0]["name"] == m._rds_docker_name("stale-db")
 
     m._instances.clear()
 

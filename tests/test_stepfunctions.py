@@ -4366,6 +4366,7 @@ def test_sfn_aws_sdk_rdsdata_execute_statement(sfn, sfn_sync, rds, sm):
     rds.create_db_cluster(
         DBClusterIdentifier=cluster_id,
         Engine="aurora-mysql",
+        EngineMode="serverless",
         MasterUsername="admin",
         MasterUserPassword="testpass123",
     )
@@ -4447,6 +4448,7 @@ def test_sfn_aws_sdk_rdsdata_output_uses_sfn_key_convention(sfn, sfn_sync, rds, 
     rds.create_db_cluster(
         DBClusterIdentifier=cluster_id,
         Engine="aurora-mysql",
+        EngineMode="serverless",
         MasterUsername="admin",
         MasterUserPassword="testpass123",
     )
@@ -4728,6 +4730,7 @@ def test_sfn_rest_json_pascal_to_camel_conversion(sfn, sfn_sync, rds, sm):
     rds.create_db_cluster(
         DBClusterIdentifier=cluster_id,
         Engine="aurora-mysql",
+        EngineMode="serverless",
         MasterUsername="admin",
         MasterUserPassword="testpass123",
     )
