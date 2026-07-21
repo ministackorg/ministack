@@ -1907,3 +1907,34 @@ def test_codebuild_region_scoped_state_is_rejected_by_v2_reader(
     # Simulate the previous binary, whose highest understood format is v2.
     monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
     assert persistence.load_state("codebuild") is None
+
+
+def test_batch_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject Batch's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    jobs = AccountRegionScopedDict()
+    jobs.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-job",
+        {"jobArn": "arn:aws:batch:us-west-2:000000000000:job/regional-job"},
+    )
+    persistence.save_state("batch", {"jobs": jobs})
+
+    raw = _json.loads((tmp_path / "batch.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_jobs = persistence.load_state("batch")["jobs"]
+    assert loaded_jobs.get_scoped(
+        "000000000000", "us-west-2", "regional-job"
+    )["jobArn"].endswith("job/regional-job")
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("batch") is None

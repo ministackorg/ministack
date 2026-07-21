@@ -451,3 +451,41 @@ def test_batch_restore_legacy_state_uses_resource_arn_region():
             assert store.get_scoped(account_id, boot_region, resource_key) is None
     finally:
         service.reset()
+
+
+def test_batch_restore_current_state_preserves_non_boot_regions():
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import batch as service
+
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    resource_region = "us-west-2"
+    resources = {
+        "compute_envs": ("regional-ce", {"state": "ENABLED"}),
+        "job_queues": ("regional-queue", {"state": "ENABLED"}),
+        "job_definitions": ("regional-definition", [{"revision": 1}]),
+        "jobs": ("regional-job", {"status": "SUCCEEDED"}),
+    }
+
+    set_request_account_id(account_id)
+    set_request_region(boot_region)
+    service.reset()
+    try:
+        for state_key, (resource_key, value) in resources.items():
+            getattr(service, f"_{state_key}").set_scoped(
+                account_id, resource_region, resource_key, value
+            )
+
+        snapshot = service.get_state()
+        assert not snapshot["compute_envs"]
+
+        service.reset()
+        service.restore_state(snapshot)
+
+        for state_key, (resource_key, value) in resources.items():
+            store = getattr(service, f"_{state_key}")
+            assert store.get_scoped(
+                account_id, resource_region, resource_key
+            ) == value
+    finally:
+        service.reset()

@@ -58,7 +58,9 @@ def restore_state(data):
         (_jobs, "jobs"),
     ):
         store.clear()
-        store.update(data.get(key) or {})
+        restored = data.get(key)
+        if restored is not None:
+            store.update(restored)
 
 
 def _json(status, body):
