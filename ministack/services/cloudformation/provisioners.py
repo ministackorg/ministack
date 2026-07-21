@@ -2319,6 +2319,7 @@ def _cognito_user_pool_create(logical_id, props, stack_name):
         "_clients": {},
         "_users": {},
         "_groups": {},
+        "_resource_servers": {},
     }
     _cognito._user_pools[pid] = pool
     arn = _cognito._pool_arn(pid)
@@ -2365,6 +2366,31 @@ def _cognito_user_pool_client_delete(physical_id, props):
     pool = _cognito._user_pools.get(pid)
     if pool:
         pool["_clients"].pop(physical_id, None)
+
+
+# --- Cognito UserPoolResourceServer ---
+
+def _cognito_user_pool_resource_server_create(logical_id, props, stack_name):
+    pid = props.get("UserPoolId", "")
+    pool = _cognito._user_pools.get(pid)
+    if not pool:
+        raise ValueError(f"UserPool {pid} not found for UserPoolResourceServer")
+
+    identifier = props.get("Identifier", "")
+    server = _cognito._resource_server_dict(
+        pid, identifier, props.get("Name", identifier), props.get("Scopes", []),
+    )
+    # Ref on this resource type returns the Identifier (matches real AWS —
+    # see https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cognito-userpoolresourceserver.html#aws-resource-cognito-userpoolresourceserver-return-values).
+    _cognito._pool_resource_servers(pool)[identifier] = server
+    return identifier, {}
+
+
+def _cognito_user_pool_resource_server_delete(physical_id, props):
+    pid = props.get("UserPoolId", "")
+    pool = _cognito._user_pools.get(pid)
+    if pool:
+        _cognito._pool_resource_servers(pool).pop(physical_id, None)
 
 
 # --- Cognito IdentityPool ---
@@ -4386,6 +4412,7 @@ _RESOURCE_HANDLERS = {
     "AWS::SecretsManager::Secret": {"create": _sm_secret_create, "delete": _sm_secret_delete},
     "AWS::Cognito::UserPool": {"create": _cognito_user_pool_create, "delete": _cognito_user_pool_delete},
     "AWS::Cognito::UserPoolClient": {"create": _cognito_user_pool_client_create, "delete": _cognito_user_pool_client_delete},
+    "AWS::Cognito::UserPoolResourceServer": {"create": _cognito_user_pool_resource_server_create, "delete": _cognito_user_pool_resource_server_delete},
     "AWS::Cognito::IdentityPool": {"create": _cognito_identity_pool_create, "delete": _cognito_identity_pool_delete},
     "AWS::Cognito::UserPoolDomain": {"create": _cognito_user_pool_domain_create, "delete": _cognito_user_pool_domain_delete},
     "AWS::ECR::Repository": {"create": _ecr_repo_create, "delete": _ecr_repo_delete},
