@@ -249,13 +249,50 @@ def _resolve_cluster(resource_arn):
     engine = cluster.get("Engine", "postgres")
     cluster_id = cluster["DBClusterIdentifier"]
 
+    # Aurora Serverless has no customer-managed DB instances and retains its
+    # intentional in-memory Data API stub. Provisioned clusters, however, must
+    # have an available member before SQL can run.
+    if cluster.get("EngineMode") == "serverless":
+        return cluster, engine
+
+    member_ids = {
+        member.get("DBInstanceIdentifier")
+        for member in cluster.get("DBClusterMembers", [])
+        if member.get("DBInstanceIdentifier")
+    }
+    if not member_ids or not cluster.get("_shared_container_ready", True):
+        return None, engine
+
     # Find an instance belonging to this cluster
     for inst in rds._instances.values_scoped(spec.account_id, spec.region):
-        if inst.get("DBClusterIdentifier") == cluster_id:
+        if (
+            inst.get("DBClusterIdentifier") == cluster_id
+            and inst.get("DBInstanceIdentifier") in member_ids
+            and inst.get("DBInstanceStatus") == "available"
+        ):
+            # Aurora members intentionally share one backing container. During
+            # creation, recover its endpoint from the cluster if this member's
+            # control-plane record has not been stamped yet.
+            if not inst.get("Endpoint") and cluster.get("_shared_endpoint"):
+                inst["Endpoint"] = dict(cluster["_shared_endpoint"])
+                inst["_docker_container_id"] = cluster.get("_shared_container_id")
+                inst["_internal_address"] = cluster.get("_shared_internal_address")
+                inst["_internal_port"] = cluster.get("_shared_internal_port")
             return inst, engine
 
-    # No instance found — return cluster info but no connectable instance
-    return cluster, engine
+    # The cluster exists, but it has no available compute to accept SQL.
+    return None, engine
+
+
+def _cluster_resolution_error(resource_arn, engine):
+    if engine:
+        return _transient_database_error(
+            f"Database cluster has no available DB instances: {resource_arn}",
+        )
+    return _error(
+        "BadRequestException",
+        f"Database cluster not found for ARN: {resource_arn}",
+    )
 
 
 def _get_secret_credentials(secret_arn):
@@ -490,8 +527,7 @@ def _execute_statement(data):
 
     instance, engine = _resolve_cluster(resource_arn)
     if not instance:
-        return _error("BadRequestException",
-                       f"Database cluster not found for ARN: {resource_arn}")
+        return _cluster_resolution_error(resource_arn, engine)
 
     # Keep stub mode for intentional mock environments only. Once RDS has a
     # real container-backed endpoint, connection failures must surface as
@@ -570,8 +606,7 @@ def _begin_transaction(data):
 
     instance, engine = _resolve_cluster(resource_arn)
     if not instance:
-        return _error("BadRequestException",
-                       f"Database cluster not found for ARN: {resource_arn}")
+        return _cluster_resolution_error(resource_arn, engine)
 
     secret_user, password = _get_secret_credentials(secret_arn)
 
@@ -656,8 +691,7 @@ def _batch_execute_statement(data):
 
     instance, engine = _resolve_cluster(resource_arn)
     if not instance:
-        return _error("BadRequestException",
-                       f"Database cluster not found for ARN: {resource_arn}")
+        return _cluster_resolution_error(resource_arn, engine)
 
     secret_user, password = _get_secret_credentials(secret_arn)
 
