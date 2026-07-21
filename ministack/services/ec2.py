@@ -1020,10 +1020,39 @@ def _describe_security_groups(p):
                 f"<securityGroupInfo>{items}</securityGroupInfo>")
 
 
-def _sg_rule_xml(sg_id, rule, idx, is_egress=False):
-    """Build <securityGroupRuleSet> items for Authorize responses (provider v6)."""
+def _sg_rule_id(sg_id, is_egress, rule):
+    """Stable, content-derived SecurityGroupRuleId.
+
+    Real AWS assigns a durable ``sgr-*`` id at authorize time, and Terraform's
+    ``aws_vpc_security_group_ingress_rule`` tracks that id across refreshes. An
+    index-based id shifts when any earlier rule is revoked, so a later
+    DescribeSecurityGroupRules by id returns nothing -- issue #1121. Deriving the
+    id from the rule's content keeps it stable regardless of list position or
+    process restarts, and identical between Authorize and Describe.
+    """
     direction = "egress" if is_egress else "ingress"
-    rule_id = f"sgr-{sg_id[3:]}-{direction}-{idx}"
+    parts = [
+        sg_id,
+        direction,
+        str(rule.get("IpProtocol", "-1")),
+        str(rule.get("FromPort", -1)),
+        str(rule.get("ToPort", -1)),
+    ]
+    for cidr in rule.get("IpRanges", []):
+        parts.append("v4:" + (cidr.get("CidrIp", "") if isinstance(cidr, dict) else str(cidr)))
+    for cidr6 in rule.get("Ipv6Ranges", []):
+        parts.append("v6:" + (cidr6.get("CidrIpv6", "") if isinstance(cidr6, dict) else str(cidr6)))
+    for pair in rule.get("UserIdGroupPairs", []):
+        parts.append("g:" + (pair.get("GroupId", "") if isinstance(pair, dict) else str(pair)))
+    for prefix in rule.get("PrefixListIds", []):
+        parts.append("p:" + (prefix.get("PrefixListId", "") if isinstance(prefix, dict) else str(prefix)))
+    digest = hashlib.sha1("|".join(parts).encode()).hexdigest()[:17]
+    return f"sgr-{digest}"
+
+
+def _sg_rule_xml(sg_id, rule, is_egress=False):
+    """Build <securityGroupRuleSet> items for Authorize responses (provider v6)."""
+    rule_id = _sg_rule_id(sg_id, is_egress, rule)
     items = ""
     for cidr in rule.get("IpRanges", []):
         items += (f"<item>"
@@ -1076,9 +1105,8 @@ def _sg_rule_xml(sg_id, rule, idx, is_egress=False):
     return items
 
 
-def _revoked_sg_rule_xml(sg_id, rule, idx, is_egress=False):
-    direction = "egress" if is_egress else "ingress"
-    rule_id = f"sgr-{sg_id[3:]}-{direction}-{idx}"
+def _revoked_sg_rule_xml(sg_id, rule, is_egress=False):
+    rule_id = _sg_rule_id(sg_id, is_egress, rule)
 
     def _item(extra_xml=""):
         from_port = f"<fromPort>{rule['FromPort']}</fromPort>" if "FromPort" in rule else ""
@@ -1147,8 +1175,7 @@ def _authorize_sg_ingress(p):
         # Terraform InvalidPermission.Duplicate when the provider re-authorizes unchanged rules).
         if not any(_rules_match(r, existing) for existing in sg["IpPermissions"]):
             sg["IpPermissions"].append(r)
-            idx = len(sg["IpPermissions"]) - 1
-            rule_items += _sg_rule_xml(sg_id, r, idx, is_egress=False)
+            rule_items += _sg_rule_xml(sg_id, r, is_egress=False)
     return _xml(200, "AuthorizeSecurityGroupIngressResponse",
                 f"<return>true</return><securityGroupRuleSet>{rule_items}</securityGroupRuleSet>")
 
@@ -1174,8 +1201,7 @@ def _authorize_sg_egress(p):
     for r in rules:
         if not any(_rules_match(r, existing) for existing in sg["IpPermissionsEgress"]):
             sg["IpPermissionsEgress"].append(r)
-            idx = len(sg["IpPermissionsEgress"]) - 1
-            rule_items += _sg_rule_xml(sg_id, r, idx, is_egress=True)
+            rule_items += _sg_rule_xml(sg_id, r, is_egress=True)
     return _xml(200, "AuthorizeSecurityGroupEgressResponse",
                 f"<return>true</return><securityGroupRuleSet>{rule_items}</securityGroupRuleSet>")
 
@@ -1188,9 +1214,9 @@ def _revoke_sg_egress(p):
     rules = _parse_ip_permissions(p, "IpPermissions")
     revoked_items = ""
     remaining = []
-    for idx, existing in enumerate(sg["IpPermissionsEgress"]):
+    for existing in sg["IpPermissionsEgress"]:
         if any(_rules_match(r, existing) for r in rules):
-            revoked_items += _revoked_sg_rule_xml(sg_id, existing, idx, is_egress=True)
+            revoked_items += _revoked_sg_rule_xml(sg_id, existing, is_egress=True)
         else:
             remaining.append(existing)
     sg["IpPermissionsEgress"] = remaining
@@ -4637,73 +4663,30 @@ def _describe_addresses_attribute(p):
 
 
 def _describe_security_group_rules(p):
-    sg_ids = _parse_member_list(p, "SecurityGroupId") or []
+    # Terraform's aws_vpc_security_group_ingress_rule refreshes by calling
+    # DescribeSecurityGroupRules with SecurityGroupRuleIds and no group filter,
+    # so honoring the rule-id filter is what stops the "Resource Not Found During
+    # Refresh" in issue #1121. group-id / SecurityGroupId still scope the scan;
+    # with neither filter, AWS returns every rule in the region.
     filters = _parse_filters(p)
-    sg_id_filter = filters.get("group-id", [])
-    if sg_id_filter:
-        sg_ids = sg_id_filter
+    rule_id_filter = set(_parse_member_list(p, "SecurityGroupRuleId") or [])
+    rule_id_filter.update(filters.get("security-group-rule-id", []))
+
+    sg_ids = filters.get("group-id") or _parse_member_list(p, "SecurityGroupId") or []
+    if sg_ids:
+        groups = [(gid, _security_groups.get(gid)) for gid in sg_ids]
+    else:
+        groups = [(sg.get("GroupId"), sg) for sg in _security_groups.values()]
 
     items = ""
-    for sg_id in sg_ids:
-        sg = _security_groups.get(sg_id)
+    for sg_id, sg in groups:
         if not sg:
             continue
-        for i, rule in enumerate(sg.get("IpPermissions", [])):
-            rule_id = f"sgr-{sg_id[3:]}-ingress-{i}"
-            for cidr in rule.get("IpRanges", []):
-                items += f"""<item>
-                    <securityGroupRuleId>{rule_id}</securityGroupRuleId>
-                    <groupId>{sg_id}</groupId>
-                    <groupOwnerId>{get_account_id()}</groupOwnerId>
-                    <isEgress>false</isEgress>
-                    <ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>
-                    <fromPort>{rule.get('FromPort', -1)}</fromPort>
-                    <toPort>{rule.get('ToPort', -1)}</toPort>
-                    <cidrIpv4>{cidr.get('CidrIp', '')}</cidrIpv4>
-                </item>"""
-            for pair in rule.get("UserIdGroupPairs", []):
-                gid = pair.get("GroupId", "") if isinstance(pair, dict) else str(pair)
-                items += f"""<item>
-                    <securityGroupRuleId>{rule_id}</securityGroupRuleId>
-                    <groupId>{sg_id}</groupId>
-                    <groupOwnerId>{get_account_id()}</groupOwnerId>
-                    <isEgress>false</isEgress>
-                    <ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>
-                    <fromPort>{rule.get('FromPort', -1)}</fromPort>
-                    <toPort>{rule.get('ToPort', -1)}</toPort>
-                    <referencedGroupInfo>
-                        <groupId>{gid}</groupId>
-                        <userId>{get_account_id()}</userId>
-                    </referencedGroupInfo>
-                </item>"""
-        for i, rule in enumerate(sg.get("IpPermissionsEgress", [])):
-            rule_id = f"sgr-{sg_id[3:]}-egress-{i}"
-            for cidr in rule.get("IpRanges", []):
-                items += f"""<item>
-                    <securityGroupRuleId>{rule_id}</securityGroupRuleId>
-                    <groupId>{sg_id}</groupId>
-                    <groupOwnerId>{get_account_id()}</groupOwnerId>
-                    <isEgress>true</isEgress>
-                    <ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>
-                    <fromPort>{rule.get('FromPort', -1)}</fromPort>
-                    <toPort>{rule.get('ToPort', -1)}</toPort>
-                    <cidrIpv4>{cidr.get('CidrIp', '')}</cidrIpv4>
-                </item>"""
-            for pair in rule.get("UserIdGroupPairs", []):
-                gid = pair.get("GroupId", "") if isinstance(pair, dict) else str(pair)
-                items += f"""<item>
-                    <securityGroupRuleId>{rule_id}</securityGroupRuleId>
-                    <groupId>{sg_id}</groupId>
-                    <groupOwnerId>{get_account_id()}</groupOwnerId>
-                    <isEgress>true</isEgress>
-                    <ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>
-                    <fromPort>{rule.get('FromPort', -1)}</fromPort>
-                    <toPort>{rule.get('ToPort', -1)}</toPort>
-                    <referencedGroupInfo>
-                        <groupId>{gid}</groupId>
-                        <userId>{get_account_id()}</userId>
-                    </referencedGroupInfo>
-                </item>"""
+        for is_egress, key in ((False, "IpPermissions"), (True, "IpPermissionsEgress")):
+            for rule in sg.get(key, []):
+                if rule_id_filter and _sg_rule_id(sg_id, is_egress, rule) not in rule_id_filter:
+                    continue
+                items += _sg_rule_xml(sg_id, rule, is_egress=is_egress)
     return _xml(200, "DescribeSecurityGroupRulesResponse", f"<securityGroupRuleSet>{items}</securityGroupRuleSet>")
 
 

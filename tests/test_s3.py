@@ -1282,6 +1282,22 @@ def test_s3_put_object_with_tagging_header(s3):
     assert tags["env"] == "prod"
     assert tags["team"] == "backend"
 
+def test_s3_put_object_with_tagging_header_no_value(s3):
+    """A --tagging value with no '=' (bare key, e.g. `tagging-hdr-no-value`) is a valid tag
+    with an empty value — matches real AWS, repro from `aws s3api put-object
+    --tagging tagging-hdr-no-value` followed by `get-object-tagging` returning
+    {"Key": "tagging-hdr-no-value", "Value": ""}."""
+    bkt = "intg-s3-put-tag-hdr-noval"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(
+        Bucket=bkt,
+        Key="tagged-without-value.txt",
+        Body=b"hello",
+        Tagging="tagging-hdr-no-value",
+    )
+    resp = s3.get_object_tagging(Bucket=bkt, Key="tagged-without-value.txt")
+    assert resp["TagSet"] == [{"Key": "tagging-hdr-no-value", "Value": ""}]
+
 def test_s3_default_retention_applied(s3):
     bkt = "intg-s3-default-ret"
     s3.create_bucket(Bucket=bkt, ObjectLockEnabledForBucket=True)
