@@ -115,6 +115,92 @@ def test_apigwv1_delete_rest_api(apigw_v1):
         apigw_v1.get_rest_api(restApiId=api_id)
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
 
+
+def test_apigwv1_gateway_response_crud_resets_to_default(apigw_v1):
+    """GatewayResponse customizations round-trip and deletion restores AWS defaults."""
+    api_id = apigw_v1.create_rest_api(name="v1-gateway-response-test")["id"]
+    response_type = "BAD_REQUEST_BODY"
+    response_parameters = {
+        "gatewayresponse.header.Access-Control-Allow-Origin": "'*'",
+    }
+    response_templates = {
+        "application/json": '{"error":"$context.error.messageString"}',
+    }
+
+    try:
+        default = apigw_v1.get_gateway_response(
+            restApiId=api_id,
+            responseType=response_type,
+        )
+        assert default["defaultResponse"] is True
+        assert default["statusCode"] == "400"
+
+        created = apigw_v1.put_gateway_response(
+            restApiId=api_id,
+            responseType=response_type,
+            statusCode="422",
+            responseParameters=response_parameters,
+            responseTemplates=response_templates,
+        )
+        assert created["defaultResponse"] is False
+        assert created["statusCode"] == "422"
+
+        fetched = apigw_v1.get_gateway_response(
+            restApiId=api_id,
+            responseType=response_type,
+        )
+        assert fetched["responseParameters"] == response_parameters
+        assert fetched["responseTemplates"] == response_templates
+
+        listed = apigw_v1.get_gateway_responses(restApiId=api_id)["items"]
+        listed_response = next(item for item in listed if item["responseType"] == response_type)
+        assert listed_response["defaultResponse"] is False
+        assert listed_response["statusCode"] == "422"
+
+        apigw_v1.delete_gateway_response(
+            restApiId=api_id,
+            responseType=response_type,
+        )
+        reset_response = apigw_v1.get_gateway_response(
+            restApiId=api_id,
+            responseType=response_type,
+        )
+        assert reset_response["defaultResponse"] is True
+        assert reset_response["statusCode"] == "400"
+        assert reset_response["responseParameters"] == {}
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_gateway_response_state_survives_persistence_roundtrip():
+    """Customized gateway responses participate in API Gateway v1 persistence."""
+    from ministack.services import apigateway_v1 as service
+
+    service.reset()
+    try:
+        _status, _headers, body = service._create_rest_api({"name": "persist-gateway-response"})
+        api_id = json.loads(body)["id"]
+        service._put_gateway_response(
+            api_id,
+            "BAD_REQUEST_BODY",
+            {
+                "statusCode": "422",
+                "responseParameters": {"gatewayresponse.header.X-Test": "'yes'"},
+                "responseTemplates": {"application/json": '{"persisted":true}'},
+            },
+        )
+
+        snapshot = service.get_state()
+        service.reset()
+        service.load_persisted_state(snapshot)
+
+        restored = service._gateway_responses[api_id]["BAD_REQUEST_BODY"]
+        assert restored["statusCode"] == "422"
+        assert restored["responseTemplates"] == {"application/json": '{"persisted":true}'}
+    finally:
+        service.reset()
+
+
 def test_apigwv1_create_resource(apigw_v1):
     """CreateResource creates a child resource with computed path."""
     api_id = apigw_v1.create_rest_api(name="v1-resource-create")["id"]

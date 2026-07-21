@@ -488,6 +488,7 @@ subnet = ec2.create_subnet(
 | `AWS::ApiGateway::Method` | Method ID | — |
 | `AWS::ApiGateway::Deployment` | Deployment ID | — |
 | `AWS::ApiGateway::Stage` | Stage name | — |
+| `AWS::ApiGateway::GatewayResponse` | Response ID | Id |
 | `AWS::AppConfig::Application` | Application ID | ApplicationId |
 | `AWS::AppSync::GraphQLApi` | API ID | Arn, GraphQLUrl, ApiId |
 | `AWS::AppSync::DataSource` | DataSource name | DataSourceArn |
