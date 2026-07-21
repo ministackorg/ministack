@@ -17,16 +17,29 @@ import time
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, json_response, new_uuid, now_iso
-from ministack.services.ses import _build_mime_message, _parse_raw_mime, _sent_emails_list, _smtp_relay
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    get_account_id,
+    get_region,
+    json_response,
+    new_uuid,
+    now_iso,
+)
+from ministack.services.ses import (
+    _build_mime_message,
+    _parse_raw_mime,
+    _restore_regional_store,
+    _sent_emails_list,
+    _smtp_relay,
+)
 
 logger = logging.getLogger("ses-v2")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-_identities = AccountScopedDict()        # identity -> dict
-_config_sets = AccountScopedDict()       # name -> dict
-_ses_tags = AccountScopedDict()          # resource_arn -> [tags]
+_identities = AccountRegionScopedDict()  # identity -> dict
+_config_sets = AccountRegionScopedDict()  # name -> dict
+_ses_tags = AccountRegionScopedDict()  # resource_arn -> [tags]
 
 
 def get_state() -> dict:
@@ -38,9 +51,9 @@ def get_state() -> dict:
 
 
 def restore_state(data: dict):
-    _identities.update(data.get("_identities", {}))
-    _config_sets.update(data.get("_config_sets", {}))
-    _ses_tags.update(data.get("_ses_tags", {}))
+    _restore_regional_store(_identities, data.get("_identities", {}))
+    _restore_regional_store(_config_sets, data.get("_config_sets", {}))
+    _restore_regional_store(_ses_tags, data.get("_ses_tags", {}))
 
 
 try:
