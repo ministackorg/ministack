@@ -23,11 +23,13 @@ from urllib.parse import unquote
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     get_account_id,
     get_region,
     new_uuid,
     set_request_account_id,
+    set_request_region,
 )
 
 logger = logging.getLogger("scheduler")
@@ -38,9 +40,9 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # State
 # ---------------------------------------------------------------------------
 
-_schedules = AccountScopedDict()       # (group, name) -> schedule record
-_schedule_groups = AccountScopedDict()  # group_name -> group record
-_tags = AccountScopedDict()            # arn -> {key: value}
+_schedules = AccountRegionScopedDict()  # "group/name" -> schedule record
+_schedule_groups = AccountRegionScopedDict()  # group_name -> group record
+_tags = AccountScopedDict()  # ARN key embeds region; account scoping is sufficient.
 
 
 def reset():
@@ -50,10 +52,9 @@ def reset():
 
 
 def get_state():
-    # Preserve AccountScopedDict wrappers; casting to a plain dict drops the
-    # per-account scoping and would persist only the current request's
-    # tenants. AccountScopedDict has a JSON encoder hook in core/persistence
-    # that round-trips the (account, key) tuple correctly.
+    # Preserve scoped wrappers; casting to a plain dict drops account/region
+    # metadata and would persist only the current request's resources. Both
+    # wrapper types have JSON encoder hooks in core/persistence.
     return {
         "schedules": copy.deepcopy(_schedules),
         "schedule_groups": copy.deepcopy(_schedule_groups),
@@ -478,6 +479,8 @@ async def handle_request(method, path, headers, body_bytes, query_params):
         if method == "DELETE":
             return _untag_resource(arn, query)
 
+    return _error(400, "ValidationException", f"No route for {method} {path}")
+
 
 # ---------------------------------------------------------------------------
 # Schedule firing (issue #958)
@@ -490,7 +493,7 @@ async def handle_request(method, path, headers, body_bytes, query_params):
 # ``ActionAfterCompletion`` one-shot delete, ``State`` and ``StartDate``/``EndDate``.
 
 _SCHEDULE_TICK_INTERVAL = 10  # seconds between sweeps
-_schedule_last_fired: dict = {}  # (account_id, (group, name)) -> epoch; not persisted
+_schedule_last_fired: dict = {}  # (account_id, region, "group/name") -> epoch; not persisted
 _ticker_thread: "threading.Thread | None" = None
 
 
@@ -529,78 +532,91 @@ def _tick_schedules():
 
     now = time.time()
     now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
-    for state_key, sched in list(_schedules._data.items()):
-        account_id, key = state_key
-        if sched.get("State") != "ENABLED":
-            continue
-        end = _to_epoch(sched.get("EndDate"))
-        if end is not None and now > end:
-            # A recurring schedule past its EndDate has "completed".
-            if sched.get("ActionAfterCompletion") == "DELETE":
+    previous_account = get_account_id()
+    previous_region = get_region()
+    try:
+        for state_key, sched in list(_schedules._data.items()):
+            account_id, region, key = state_key
+            if sched.get("State") != "ENABLED":
+                continue
+            end = _to_epoch(sched.get("EndDate"))
+            if end is not None and now > end:
+                # A recurring schedule past its EndDate has "completed".
+                if sched.get("ActionAfterCompletion") == "DELETE":
+                    _schedules._data.pop(state_key, None)
+                    _schedule_last_fired.pop(state_key, None)
+                continue
+            start = _to_epoch(sched.get("StartDate"))
+            if start is not None and now < start:
+                continue
+
+            expr = sched.get("ScheduleExpression", "")
+            one_shot = False
+
+            at_epoch = _at_time_epoch(expr)
+            if at_epoch is not None:
+                # One-time at(): fire once when the moment has passed.
+                if now < at_epoch or state_key in _schedule_last_fired:
+                    continue
+                one_shot = True
+            else:
+                interval = _eb._parse_rate_seconds(expr)
+                if interval is not None:
+                    # rate(): countdown anchored to creation, then every interval.
+                    if state_key not in _schedule_last_fired:
+                        _schedule_last_fired[state_key] = sched.get("CreationDate", now)
+                    if now - _schedule_last_fired[state_key] < interval:
+                        continue
+                else:
+                    fields = _eb._parse_cron_fields(expr)
+                    if fields is None:
+                        continue  # unsupported / unparseable expression
+                    # cron(): fire once per scheduled occurrence.
+                    if state_key not in _schedule_last_fired:
+                        _schedule_last_fired[state_key] = now
+                        continue
+                    last_dt = datetime.fromtimestamp(_schedule_last_fired[state_key], tz=timezone.utc)
+                    next_fire = _eb._cron_next_fire(fields, last_dt)
+                    if next_fire is None or now_dt < next_fire:
+                        continue
+
+            _schedule_last_fired[state_key] = now
+            target = sched.get("Target") or {}
+            if not target.get("Arn"):
+                continue
+            # Fire under the schedule's own account and region so target dispatch
+            # observes the same request scope as the schedule resource.
+            set_request_account_id(account_id)
+            set_request_region(region)
+            event = {
+                "EventId": new_uuid(),
+                "Source": "aws.scheduler",
+                "DetailType": "Scheduled Event",
+                "Detail": "{}",
+                "Time": now,
+                "Resources": [sched.get("Arn", "")],
+                "Account": account_id,
+                "Region": get_region(),
+            }
+            try:
+                _eb._invoke_target(target, event, sched)
+            except Exception:
+                logger.exception(
+                    "Scheduler dispatch error for %s (account %s, region %s)",
+                    key,
+                    account_id,
+                    region,
+                )
+
+            # ActionAfterCompletion=DELETE on a one-time at() schedule: remove after
+            # firing. Recurring DELETE schedules "complete" at EndDate (handled above);
+            # at() with NONE stays but never refires (guarded by _schedule_last_fired).
+            if one_shot and sched.get("ActionAfterCompletion") == "DELETE":
                 _schedules._data.pop(state_key, None)
                 _schedule_last_fired.pop(state_key, None)
-            continue
-        start = _to_epoch(sched.get("StartDate"))
-        if start is not None and now < start:
-            continue
-
-        expr = sched.get("ScheduleExpression", "")
-        one_shot = False
-
-        at_epoch = _at_time_epoch(expr)
-        if at_epoch is not None:
-            # One-time at(): fire once when the moment has passed.
-            if now < at_epoch or state_key in _schedule_last_fired:
-                continue
-            one_shot = True
-        else:
-            interval = _eb._parse_rate_seconds(expr)
-            if interval is not None:
-                # rate(): countdown anchored to creation, then every interval.
-                if state_key not in _schedule_last_fired:
-                    _schedule_last_fired[state_key] = sched.get("CreationDate", now)
-                if now - _schedule_last_fired[state_key] < interval:
-                    continue
-            else:
-                fields = _eb._parse_cron_fields(expr)
-                if fields is None:
-                    continue  # unsupported / unparseable expression
-                # cron(): fire once per scheduled occurrence.
-                if state_key not in _schedule_last_fired:
-                    _schedule_last_fired[state_key] = now
-                    continue
-                last_dt = datetime.fromtimestamp(_schedule_last_fired[state_key], tz=timezone.utc)
-                next_fire = _eb._cron_next_fire(fields, last_dt)
-                if next_fire is None or now_dt < next_fire:
-                    continue
-
-        _schedule_last_fired[state_key] = now
-        target = sched.get("Target") or {}
-        if not target.get("Arn"):
-            continue
-        # Fire under the schedule's own tenant so ARN-building / dispatch scope right.
-        set_request_account_id(account_id)
-        event = {
-            "EventId": new_uuid(),
-            "Source": "aws.scheduler",
-            "DetailType": "Scheduled Event",
-            "Detail": "{}",
-            "Time": now,
-            "Resources": [sched.get("Arn", "")],
-            "Account": account_id,
-            "Region": get_region(),
-        }
-        try:
-            _eb._invoke_target(target, event, sched)
-        except Exception:
-            logger.exception("Scheduler dispatch error for %s (account %s)", key, account_id)
-
-        # ActionAfterCompletion=DELETE on a one-time at() schedule: remove after
-        # firing. Recurring DELETE schedules "complete" at EndDate (handled above);
-        # at() with NONE stays but never refires (guarded by _schedule_last_fired).
-        if one_shot and sched.get("ActionAfterCompletion") == "DELETE":
-            _schedules._data.pop(state_key, None)
-            _schedule_last_fired.pop(state_key, None)
+    finally:
+        set_request_account_id(previous_account)
+        set_request_region(previous_region)
 
 
 def _ticker_loop():
@@ -622,5 +638,3 @@ def start_scheduler() -> None:
         target=_ticker_loop, daemon=True, name="evb-scheduler-ticker"
     )
     _ticker_thread.start()
-
-    return _error(400, "ValidationException", f"No route for {method} {path}")
