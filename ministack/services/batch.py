@@ -82,6 +82,42 @@ def _job_arn(job_id):
     return f"arn:aws:batch:{get_region()}:{get_account_id()}:job/{job_id}"
 
 
+_CE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _compute_environment_name_from_ref(ref):
+    if not ref:
+        return "", error_response_json(
+            "ClientException", "computeEnvironment is required", 400
+        )
+    if not ref.startswith("arn:"):
+        return ref, None
+    try:
+        spec = parse_arn(ref)
+    except ArnParseError:
+        return "", error_response_json(
+            "ClientException", f"Object does not exist: {ref}", 400
+        )
+    if spec.service != "batch" or spec.account_id != get_account_id():
+        return "", error_response_json(
+            "ClientException", f"Object does not exist: {ref}", 400
+        )
+    if spec.region != get_region():
+        return "", error_response_json(
+            "ClientException", f"Object does not exist: {ref}", 400
+        )
+    if not spec.resource.startswith("compute-environment/"):
+        return "", error_response_json(
+            "ClientException", f"Object does not exist: {ref}", 400
+        )
+    name = spec.resource.split("/", 1)[1]
+    if not _CE_NAME_RE.fullmatch(name):
+        return "", error_response_json(
+            "ClientException", f"Object does not exist: {ref}", 400
+        )
+    return name, None
+
+
 def _job_queue_name_from_ref(ref):
     if not ref or not ref.startswith("arn:"):
         return ref, None
@@ -139,9 +175,45 @@ def _create_compute_environment(p):
         "serviceRole": p.get("serviceRole", ""),
         "tags": p.get("tags", {}),
     }
+    if "unmanagedvCpus" in p:
+        rec["unmanagedvCpus"] = p["unmanagedvCpus"]
+    if "context" in p:
+        rec["context"] = p["context"]
     _compute_envs[name] = rec
     return _json(200, {"computeEnvironmentName": name,
                        "computeEnvironmentArn": rec["computeEnvironmentArn"]})
+
+
+def _update_compute_environment(p):
+    name, error = _compute_environment_name_from_ref(p.get("computeEnvironment"))
+    if error:
+        return error
+    rec = _compute_envs.get(name)
+    if rec is None:
+        return error_response_json(
+            "ClientException", f"Object does not exist: {name}", 400
+        )
+    if "state" in p:
+        rec["state"] = p["state"]
+    if "serviceRole" in p:
+        rec["serviceRole"] = p["serviceRole"]
+    if "computeResources" in p and p["computeResources"] is not None:
+        existing = rec.get("computeResources") or {}
+        if not isinstance(existing, dict):
+            existing = {}
+        merged = dict(existing)
+        merged.update(p["computeResources"])
+        rec["computeResources"] = merged
+    if "updatePolicy" in p:
+        rec["updatePolicy"] = p["updatePolicy"]
+    if "unmanagedvCpus" in p:
+        rec["unmanagedvCpus"] = p["unmanagedvCpus"]
+    if "context" in p:
+        rec["context"] = p["context"]
+    return _json(200, {
+        "computeEnvironmentName": name,
+        "computeEnvironmentArn": rec["computeEnvironmentArn"],
+    })
 
 
 def _describe_compute_environments(p):
@@ -275,6 +347,7 @@ def _list_jobs(p):
 
 _DISPATCH = {
     "/v1/createcomputeenvironment": _create_compute_environment,
+    "/v1/updatecomputeenvironment": _update_compute_environment,
     "/v1/describecomputeenvironments": _describe_compute_environments,
     "/v1/createjobqueue": _create_job_queue,
     "/v1/describejobqueues": _describe_job_queues,
