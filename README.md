@@ -160,7 +160,7 @@ Since 1.4.0 state is additionally isolated per **region** — see [Multi-Region]
 | `111111111111` | `111111111111` |
 | `048408301323` | `048408301323` |
 | `test` | `000000000000` (default) |
-| `test-key-do-not-use` | `000000000000` (default) |
+| `AKIAIOSFODNN7EXAMPLE` | `000000000000` (default) |
 
 **Terraform** — set `access_key` in your provider block:
 ```hcl
