@@ -502,9 +502,8 @@ def _find_xml_tag(parent, tag_name, ns=S3_NS):
     return el
 
 
-def _parse_tags_xml(body: bytes) -> dict:
-    xml_root = fromstring(body)
-    tags = {}
+def _iter_tag_pairs(xml_root):
+    """Yield (key, value) for each <Tag> element, preserving duplicate keys."""
     for tag_el in xml_root.iter():
         local = tag_el.tag.split("}")[-1] if "}" in tag_el.tag else tag_el.tag
         if local == "Tag":
@@ -518,8 +517,61 @@ def _parse_tags_xml(body: bytes) -> dict:
                 elif child_local == "Value":
                     val_text = child.text
             if key_text is not None:
-                tags[key_text] = val_text or ""
-    return tags
+                yield key_text, val_text or ""
+
+def _parse_tags_xml(body: bytes) -> dict:
+    """Parse a <Tag> set into {key: value}. Duplicate keys collapse last-writer-wins."""
+    return {key: value for key, value in _iter_tag_pairs(fromstring(body))}
+
+def _duplicate_tag_error(xml_root, resource: str = ""):
+    """Return the 500 InternalError that real S3 raises when a CreateBucket
+    <Tags> body repeats a tag key, or None when every key is unique."""
+    seen = set()
+    for key, _value in _iter_tag_pairs(xml_root):
+        if key in seen:
+            return _error(
+                "InternalError",
+                "We encountered an internal error. Please try again.",
+                500, resource,
+            )
+        seen.add(key)
+    return None
+
+
+def _validate_bucket_tags(tags: dict, resource: str = ""):
+    """Validate an already-parsed {key: value} bucket tag set against the S3
+    tag constraints. Returns an S3 error-response tuple on the first violation,
+    or None when the tag set is valid:
+      key   : 1-128 Unicode chars, cannot use the reserved "aws:" prefix
+      value : 0-256 Unicode chars (an empty value is allowed)
+      at most 50 tags per bucket.
+    """
+    for key, value in tags.items():
+        if not (1 <= len(key) <= 128):
+            return _error(
+                "InvalidTag",
+                "The TagKey you have provided is invalid",
+                400, resource,
+            )
+        if len(value) > 256:
+            return _error(
+                "InvalidTag",
+                "The TagValue you have provided is invalid",
+                400, resource,
+            )
+        if key.startswith("aws:"):
+            return _error(
+                "InvalidTag",
+                'User-defined tag keys can\'t start with "aws:". This prefix is '
+                'reserved for system tags. Remove "aws:" from your tag keys and '
+                "try again.",
+                400, resource,
+            )
+    if len(tags) > 50:
+        return _error(
+            "BadRequest", "Bucket tag count cannot be greater than 50", 400, resource,
+        )
+    return None
 
 
 def _extract_user_metadata(headers: dict) -> dict:
@@ -938,16 +990,29 @@ def _create_bucket(name: str, body: bytes, headers: dict = None):
         return 200, {"Location": f"/{name}"}, b""
 
     region = None
+    tags = {}
     if body:
         try:
             xml_root = fromstring(body)
             loc_el = _find_xml_tag(xml_root, "LocationConstraint")
             if loc_el is not None and loc_el.text:
                 region = loc_el.text
+
+            err = _duplicate_tag_error(xml_root, resource=f"/{name}")
+            if err is not None:
+                return err
+
+            tags = _parse_tags_xml(body)
         except Exception:
             pass
 
+    err = _validate_bucket_tags(tags, resource=f"/{name}")
+    if err is not None:
+        return err
+
     _buckets[name] = {"created": now_iso(), "objects": {}, "region": region}
+    if tags:
+        _bucket_tags[name] = tags
 
     if headers.get("x-amz-bucket-object-lock-enabled", "").lower() == "true":
         _bucket_object_lock[name] = {"enabled": True, "default_retention": None}
