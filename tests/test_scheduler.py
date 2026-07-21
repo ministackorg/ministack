@@ -9,11 +9,19 @@ ENDPOINT = "http://localhost:4566"
 REGION = "us-east-1"
 
 
+def _scheduler_client(region):
+    return boto3.client(
+        "scheduler",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region,
+    )
+
+
 @pytest.fixture(scope="module")
 def scheduler():
-    return boto3.client("scheduler", endpoint_url=ENDPOINT,
-                        aws_access_key_id="test", aws_secret_access_key="test",
-                        region_name=REGION)
+    return _scheduler_client(REGION)
 
 
 @pytest.fixture(scope="module")
@@ -58,6 +66,105 @@ def test_scheduler_create_get_delete_group(scheduler):
     with pytest.raises(ClientError) as exc:
         scheduler.get_schedule_group(Name=name)
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_scheduler_groups_schedules_and_tags_are_region_scoped(scheduler):
+    west = _scheduler_client("us-west-2")
+    group = f"region-group-{_uid()}"
+    name = f"region-schedule-{_uid()}"
+
+    east_group_arn = scheduler.create_schedule_group(Name=group)["ScheduleGroupArn"]
+    west_group_arn = west.create_schedule_group(Name=group)["ScheduleGroupArn"]
+    assert east_group_arn == f"arn:aws:scheduler:us-east-1:000000000000:schedule-group/{group}"
+    assert west_group_arn == f"arn:aws:scheduler:us-west-2:000000000000:schedule-group/{group}"
+    assert [item["Arn"] for item in scheduler.list_schedule_groups(NamePrefix=group)["ScheduleGroups"]] == [
+        east_group_arn
+    ]
+    assert [item["Arn"] for item in west.list_schedule_groups(NamePrefix=group)["ScheduleGroups"]] == [
+        west_group_arn
+    ]
+
+    east_schedule_arn = scheduler.create_schedule(
+        Name=name,
+        GroupName=group,
+        ScheduleExpression="rate(1 hour)",
+        FlexibleTimeWindow={"Mode": "OFF"},
+        Target={
+            "Arn": "arn:aws:lambda:us-east-1:000000000000:function:east-target",
+            "RoleArn": "arn:aws:iam::000000000000:role/test",
+        },
+    )["ScheduleArn"]
+    west_schedule_arn = west.create_schedule(
+        Name=name,
+        GroupName=group,
+        ScheduleExpression="rate(2 hours)",
+        FlexibleTimeWindow={"Mode": "OFF"},
+        Target={
+            "Arn": "arn:aws:lambda:us-west-2:000000000000:function:west-target",
+            "RoleArn": "arn:aws:iam::000000000000:role/test",
+        },
+    )["ScheduleArn"]
+    assert east_schedule_arn == f"arn:aws:scheduler:us-east-1:000000000000:schedule/{group}/{name}"
+    assert west_schedule_arn == f"arn:aws:scheduler:us-west-2:000000000000:schedule/{group}/{name}"
+
+    assert scheduler.get_schedule(Name=name, GroupName=group)["ScheduleExpression"] == "rate(1 hour)"
+    assert west.get_schedule(Name=name, GroupName=group)["ScheduleExpression"] == "rate(2 hours)"
+    assert [item["Arn"] for item in scheduler.list_schedules(GroupName=group)["Schedules"]] == [
+        east_schedule_arn
+    ]
+    assert [item["Arn"] for item in west.list_schedules(GroupName=group)["Schedules"]] == [
+        west_schedule_arn
+    ]
+
+    scheduler.tag_resource(ResourceArn=east_schedule_arn, Tags=[{"Key": "region", "Value": "east"}])
+    west.tag_resource(ResourceArn=west_schedule_arn, Tags=[{"Key": "region", "Value": "west"}])
+    assert scheduler.list_tags_for_resource(ResourceArn=east_schedule_arn)["Tags"] == [
+        {"Key": "region", "Value": "east"}
+    ]
+    assert west.list_tags_for_resource(ResourceArn=west_schedule_arn)["Tags"] == [
+        {"Key": "region", "Value": "west"}
+    ]
+
+    scheduler.update_schedule(
+        Name=name,
+        GroupName=group,
+        ScheduleExpression="rate(3 hours)",
+        FlexibleTimeWindow={"Mode": "OFF"},
+        Target={
+            "Arn": "arn:aws:lambda:us-east-1:000000000000:function:east-target-updated",
+            "RoleArn": "arn:aws:iam::000000000000:role/test",
+        },
+    )
+    assert scheduler.get_schedule(Name=name, GroupName=group)["ScheduleExpression"] == "rate(3 hours)"
+    assert west.get_schedule(Name=name, GroupName=group)["ScheduleExpression"] == "rate(2 hours)"
+
+    scheduler.delete_schedule(Name=name, GroupName=group)
+    with pytest.raises(ClientError) as exc:
+        scheduler.get_schedule(Name=name, GroupName=group)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    with pytest.raises(ClientError) as exc:
+        scheduler.update_schedule(
+            Name=name,
+            GroupName=group,
+            ScheduleExpression="rate(4 hours)",
+            FlexibleTimeWindow={"Mode": "OFF"},
+            Target={
+                "Arn": "arn:aws:lambda:us-east-1:000000000000:function:missing",
+                "RoleArn": "arn:aws:iam::000000000000:role/test",
+            },
+        )
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    with pytest.raises(ClientError) as exc:
+        scheduler.delete_schedule(Name=name, GroupName=group)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    scheduler.delete_schedule_group(Name=group)
+    assert west.get_schedule_group(Name=group)["Arn"] == west_group_arn
+    assert west.get_schedule(Name=name, GroupName=group)["Arn"] == west_schedule_arn
+    assert west.list_tags_for_resource(ResourceArn=west_schedule_arn)["Tags"] == [
+        {"Key": "region", "Value": "west"}
+    ]
+    west.delete_schedule_group(Name=group)
 
 
 def test_scheduler_create_duplicate_group(scheduler):

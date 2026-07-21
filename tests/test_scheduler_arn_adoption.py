@@ -5,7 +5,12 @@ import uuid
 import pytest
 
 import ministack.services.scheduler as scheduler
-from ministack.core.responses import set_request_account_id, set_request_region
+from ministack.core.responses import (
+    get_account_id,
+    get_region,
+    set_request_account_id,
+    set_request_region,
+)
 
 
 def _uid():
@@ -17,8 +22,12 @@ def _reset_scheduler():
     set_request_account_id("000000000000")
     set_request_region("us-east-1")
     scheduler.reset()
+    scheduler._schedule_last_fired.clear()
+    scheduler._ticker_thread = None
     yield
     scheduler.reset()
+    scheduler._schedule_last_fired.clear()
+    scheduler._ticker_thread = None
 
 
 def _request(method, path, body=None, query=None):
@@ -112,6 +121,95 @@ def test_scheduler_tag_apis_do_not_resolve_same_named_resources_from_other_regio
 
     assert scheduler._tags.get(west_schedule_arn) is None
     assert scheduler._tags.get(west_group_arn) is None
+
+
+def test_scheduler_ticker_dispatches_in_schedule_region_and_restores_context(monkeypatch):
+    from ministack.services import eventbridge
+
+    account_id = "000000000000"
+    name = f"ticker-{_uid()}"
+    key = f"default/{name}"
+    expected = {}
+    for region in ("us-east-1", "us-west-2"):
+        schedule_arn = f"arn:aws:scheduler:{region}:{account_id}:schedule/{key}"
+        target_arn = f"arn:aws:lambda:{region}:{account_id}:function:ticker-target"
+        expected[region] = (schedule_arn, target_arn)
+        scheduler._schedules.set_scoped(
+            account_id,
+            region,
+            key,
+            {
+                "Arn": schedule_arn,
+                "Name": name,
+                "GroupName": "default",
+                "ScheduleExpression": "at(1970-01-01T00:00:01)",
+                "Target": {"Arn": target_arn},
+                "State": "ENABLED",
+                "ActionAfterCompletion": "NONE",
+                "CreationDate": 1,
+            },
+        )
+    set_request_account_id("111111111111")
+    set_request_region("eu-west-1")
+
+    calls = []
+
+    def _capture_target(target, event, schedule):
+        calls.append((get_account_id(), get_region(), target, event, schedule))
+
+    monkeypatch.setattr(eventbridge, "_invoke_target", _capture_target)
+    monkeypatch.setattr(scheduler.time, "time", lambda: 2.0)
+
+    scheduler._tick_schedules()
+
+    assert len(calls) == 2
+    calls_by_region = {call[1]: call for call in calls}
+    assert set(calls_by_region) == set(expected)
+    for region, (schedule_arn, target_arn) in expected.items():
+        dispatch_account, dispatch_region, target, event, schedule = calls_by_region[region]
+        assert (dispatch_account, dispatch_region) == (account_id, region)
+        assert target["Arn"] == target_arn
+        assert event["Account"] == account_id
+        assert event["Region"] == region
+        assert event["Resources"] == [schedule_arn]
+        assert schedule["Arn"] == schedule_arn
+    assert (get_account_id(), get_region()) == ("111111111111", "eu-west-1")
+
+
+def test_scheduler_start_scheduler_starts_daemon_once(monkeypatch):
+    created_threads = []
+
+    class _FakeThread:
+        def __init__(self, *, target, daemon, name):
+            self.target = target
+            self.daemon = daemon
+            self.name = name
+            self.started = False
+            created_threads.append(self)
+
+        def start(self):
+            self.started = True
+
+        def is_alive(self):
+            return self.started
+
+    monkeypatch.setattr(scheduler.threading, "Thread", _FakeThread)
+
+    scheduler.start_scheduler()
+    scheduler.start_scheduler()
+
+    assert len(created_threads) == 1
+    thread = created_threads[0]
+    assert thread.target is scheduler._ticker_loop
+    assert thread.daemon is True
+    assert thread.name == "evb-scheduler-ticker"
+    assert thread.started is True
+
+
+def test_scheduler_unknown_route_returns_validation_error():
+    response = _request("GET", "/unknown")
+
+    _assert_error(response, 400, "ValidationException")
 
 
 @pytest.mark.parametrize(
