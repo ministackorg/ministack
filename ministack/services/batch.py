@@ -2,7 +2,7 @@
 AWS Batch stub (rest-json).
 
 Endpoints under ``/v1/``. Stores compute environments, job queues, job
-definitions, and jobs in account-scoped state. Submitted jobs immediately
+definitions, and jobs in account-and-region-scoped state. Submitted jobs immediately
 transition to ``SUCCEEDED`` — Batch is a control-plane/scheduler emulator
 here, not a real container runner.
 """
@@ -15,7 +15,7 @@ import time
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
-    AccountScopedDict,
+    AccountRegionScopedDict,
     error_response_json,
     get_account_id,
     get_region,
@@ -24,10 +24,10 @@ from ministack.core.responses import (
 
 logger = logging.getLogger("batch")
 
-_compute_envs = AccountScopedDict()   # name -> dict
-_job_queues = AccountScopedDict()     # name -> dict
-_job_definitions = AccountScopedDict()  # name -> [revisions]
-_jobs = AccountScopedDict()           # job_id -> dict
+_compute_envs = AccountRegionScopedDict()   # name -> dict
+_job_queues = AccountRegionScopedDict()     # name -> dict
+_job_definitions = AccountRegionScopedDict()  # name -> [revisions]
+_jobs = AccountRegionScopedDict()           # job_id -> dict
 
 _JOB_QUEUE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
@@ -58,8 +58,7 @@ def restore_state(data):
         (_jobs, "jobs"),
     ):
         store.clear()
-        for k, v in (data.get(key) or {}).items():
-            store[k] = v
+        store.update(data.get(key) or {})
 
 
 def _json(status, body):
