@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **RDS — `DisableHttpEndpoint`** — the Data API HTTP endpoint on an Aurora cluster could be enabled via `EnableHttpEndpoint` but never disabled: `DisableHttpEndpoint` returned `InvalidAction: Unknown RDS action: DisableHttpEndpoint`, which broke workflows that turn the endpoint off before resizing a cluster to a Data-API-incompatible instance class. The action now mirrors `EnableHttpEndpoint`: it sets `HttpEndpointEnabled` to `false` on the cluster matching `ResourceArn` and returns `DBClusterNotFoundFault` when no cluster matches. Contributed by @jayjanssen.
+
 ## [1.4.3] — 2026-07-18
 
 ### Added
