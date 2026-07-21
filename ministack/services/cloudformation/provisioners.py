@@ -41,6 +41,7 @@ import ministack.services.pipes as _pipes
 import ministack.services.rds as _rds
 import ministack.services.route53 as _r53
 import ministack.services.s3 as _s3
+import ministack.services.s3tables as _s3tables
 import ministack.services.secretsmanager as _sm
 import ministack.services.ses as _ses
 import ministack.services.sns as _sns
@@ -4349,9 +4350,82 @@ def _backup_plan_delete(physical_id, props):
     _backup._plans.pop(physical_id, None)
 
 
+def _s3tables_bucket_create(logical_id, props, stack_name):
+    name = props.get("TableBucketName") or _physical_name(stack_name, logical_id, lowercase=True, max_len=63)
+    arn = _s3tables._bucket_arn(name)
+    _s3tables._table_buckets[name] = {
+        "arn": arn, "name": name,
+        "ownerAccountId": get_account_id(),
+        "createdAt": now_iso(), "tableCount": 0,
+    }
+    _s3._buckets.setdefault(name, {"created": now_iso(), "objects": {}, "region": get_region()})
+    return arn, {"TableBucketARN": arn}
+
+
+def _s3tables_bucket_delete(physical_id, props):
+    name = physical_id.rsplit("/", 1)[-1]
+    _s3tables._table_buckets.pop(name, None)
+    _s3._buckets.pop(name, None)
+
+
+def _s3tables_namespace_create(logical_id, props, stack_name):
+    bucket_arn = props.get("TableBucketARN", "")
+    namespace = props.get("Namespace", "")
+    key = _s3tables._ns_key(bucket_arn, namespace)
+    _s3tables._namespaces[key] = {
+        "namespace": [namespace], "createdAt": now_iso(),
+        "createdBy": get_account_id(), "ownerAccountId": get_account_id(),
+        "tableBucketARN": bucket_arn,
+    }
+    return f"{bucket_arn}|{namespace}", {"TableBucketARN": bucket_arn, "Namespace": namespace}
+
+
+def _s3tables_namespace_delete(physical_id, props):
+    bucket_arn = props.get("TableBucketARN", "")
+    namespace = props.get("Namespace", "")
+    _s3tables._namespaces.pop(_s3tables._ns_key(bucket_arn, namespace), None)
+
+
+def _s3tables_table_create(logical_id, props, stack_name):
+    bucket_arn = props.get("TableBucketARN", "")
+    namespace = props.get("Namespace", "")
+    table_name = props.get("TableName", "")
+    bucket_name = bucket_arn.rsplit("/", 1)[-1]
+    location = f"s3://{bucket_name}/{namespace}/{table_name}"
+    iceberg_metadata = _s3tables._initial_iceberg_metadata(table_name, [], location)
+    metadata_location = f"s3://{bucket_name}/{namespace}/{table_name}/metadata/v0.metadata.json"
+    table_arn = _s3tables._table_arn(bucket_arn, namespace, table_name)
+    key = _s3tables._table_key(bucket_arn, namespace, table_name)
+    _s3tables._tables[key] = {
+        "name": table_name, "tableARN": table_arn, "namespace": [namespace],
+        "tableBucketARN": bucket_arn, "format": "ICEBERG",
+        "createdAt": now_iso(), "modifiedAt": now_iso(),
+        "ownerAccountId": get_account_id(),
+        "metadataLocation": metadata_location, "warehouseLocation": location,
+        "_iceberg_metadata": iceberg_metadata, "_metadata_version": 0,
+        "_schema_fields": [],
+    }
+    for b in _s3tables._table_buckets.values():
+        if b["arn"] == bucket_arn:
+            b["tableCount"] = b.get("tableCount", 0) + 1
+            break
+    return table_arn, {"TableArn": table_arn, "TableBucketARN": bucket_arn,
+                       "Namespace": namespace, "TableName": table_name}
+
+
+def _s3tables_table_delete(physical_id, props):
+    bucket_arn = props.get("TableBucketARN", "")
+    namespace = props.get("Namespace", "")
+    table_name = props.get("TableName", "")
+    _s3tables._tables.pop(_s3tables._table_key(bucket_arn, namespace, table_name), None)
+
+
 _RESOURCE_HANDLERS = {
     "AWS::S3::Bucket": {"create": _s3_create, "update": _s3_update, "delete": _s3_delete},
     "AWS::S3::BucketPolicy": {"create": _s3_bucket_policy_create, "delete": _s3_bucket_policy_delete},
+    "AWS::S3Tables::TableBucket": {"create": _s3tables_bucket_create, "delete": _s3tables_bucket_delete},
+    "AWS::S3Tables::Namespace": {"create": _s3tables_namespace_create, "delete": _s3tables_namespace_delete},
+    "AWS::S3Tables::Table": {"create": _s3tables_table_create, "delete": _s3tables_table_delete},
     "AWS::SQS::Queue": {"create": _sqs_create, "delete": _sqs_delete},
     "AWS::SNS::Topic": {"create": _sns_create, "delete": _sns_delete},
     "AWS::SNS::Subscription": {"create": _sns_sub_create, "delete": _sns_sub_delete},

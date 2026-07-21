@@ -4642,3 +4642,62 @@ def test_cfn_sam_transform_missing_translator_falls_back(monkeypatch):
     # Templates that don't use the SAM transform are unaffected.
     plain = {"Resources": {"B": {"Type": "AWS::S3::Bucket", "Properties": {}}}}
     assert _apply_sam_transform_if_applicable(plain) is plain
+
+
+def test_cfn_s3tables_resources(cfn, s3tables):
+    """CloudFormation can provision AWS::S3Tables::TableBucket, Namespace, and Table."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Bucket": {
+                "Type": "AWS::S3Tables::TableBucket",
+                "Properties": {"TableBucketName": "cfn-s3tables-test"},
+            },
+            "Ns": {
+                "Type": "AWS::S3Tables::Namespace",
+                "Properties": {
+                    "TableBucketARN": {"Fn::GetAtt": ["Bucket", "TableBucketARN"]},
+                    "Namespace": "myns",
+                },
+                "DependsOn": "Bucket",
+            },
+            "Table": {
+                "Type": "AWS::S3Tables::Table",
+                "Properties": {
+                    "TableBucketARN": {"Fn::GetAtt": ["Bucket", "TableBucketARN"]},
+                    "Namespace": "myns",
+                    "TableName": "mytable",
+                    "OpenTableFormat": "ICEBERG",
+                },
+                "DependsOn": "Ns",
+            },
+        },
+        "Outputs": {
+            "BucketArn": {"Value": {"Fn::GetAtt": ["Bucket", "TableBucketARN"]}},
+            "TableArn": {"Value": {"Fn::GetAtt": ["Table", "TableArn"]}},
+        },
+    }
+
+    stack_name = "cfn-s3tables-t01"
+    try:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+    except Exception:
+        pass
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    bucket_arn = outputs["BucketArn"]
+    table_arn = outputs["TableArn"]
+    assert "cfn-s3tables-test" in bucket_arn
+    assert "mytable" in table_arn
+
+    table = s3tables.get_table(tableBucketARN=bucket_arn, namespace="myns", name="mytable")
+    assert table["name"] == "mytable"
+    assert table["format"] == "ICEBERG"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
