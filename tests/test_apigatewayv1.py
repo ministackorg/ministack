@@ -204,6 +204,86 @@ def test_apigwv1_gateway_response_state_survives_persistence_roundtrip():
         service.reset()
 
 
+def test_apigwv1_documentation_part_crud(apigw_v1):
+    """Documentation parts create, list, update, and delete through the SDK."""
+    api_id = apigw_v1.create_rest_api(name="v1-documentation-part-test")["id"]
+    created = apigw_v1.create_documentation_part(
+        restApiId=api_id,
+        location={"type": "RESOURCE", "path": "/pets"},
+        properties='{"description":"Pet operations"}',
+    )
+    part_id = created["id"]
+
+    try:
+        fetched = apigw_v1.get_documentation_part(
+            restApiId=api_id,
+            documentationPartId=part_id,
+        )
+        assert fetched["location"] == {"type": "RESOURCE", "path": "/pets"}
+        assert fetched["properties"] == '{"description":"Pet operations"}'
+
+        listed = apigw_v1.get_documentation_parts(
+            restApiId=api_id,
+            type="RESOURCE",
+            path="/pets",
+        )["items"]
+        assert [part["id"] for part in listed] == [part_id]
+
+        updated = apigw_v1.update_documentation_part(
+            restApiId=api_id,
+            documentationPartId=part_id,
+            patchOperations=[
+                {
+                    "op": "replace",
+                    "path": "/properties",
+                    "value": '{"description":"Updated pet operations"}',
+                },
+            ],
+        )
+        assert updated["id"] == part_id
+        assert updated["properties"] == '{"description":"Updated pet operations"}'
+
+        apigw_v1.delete_documentation_part(
+            restApiId=api_id,
+            documentationPartId=part_id,
+        )
+        with pytest.raises(ClientError) as exc:
+            apigw_v1.get_documentation_part(
+                restApiId=api_id,
+                documentationPartId=part_id,
+            )
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_documentation_part_state_survives_persistence_roundtrip():
+    from ministack.services import apigateway_v1 as service
+
+    service.reset()
+    try:
+        _status, _headers, body = service._create_rest_api({"name": "persist-doc-part"})
+        api_id = json.loads(body)["id"]
+        _status, _headers, body = service._create_documentation_part(
+            api_id,
+            {
+                "location": {"type": "API"},
+                "properties": '{"description":"Persisted"}',
+            },
+        )
+        part_id = json.loads(body)["id"]
+
+        snapshot = service.get_state()
+        service.reset()
+        service.load_persisted_state(snapshot)
+
+        restored = service._documentation_parts[api_id][part_id]
+        assert restored["location"] == {"type": "API"}
+        assert restored["properties"] == '{"description":"Persisted"}'
+    finally:
+        service.reset()
+
+
 def test_apigwv1_create_resource(apigw_v1):
     """CreateResource creates a child resource with computed path."""
     api_id = apigw_v1.create_rest_api(name="v1-resource-create")["id"]
