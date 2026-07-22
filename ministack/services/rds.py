@@ -20,7 +20,8 @@ Supports: CreateDBInstance, DeleteDBInstance, DescribeDBInstances, ModifyDBInsta
           DescribePendingMaintenanceActions,
           CreateGlobalCluster, DescribeGlobalClusters, DeleteGlobalCluster,
           RemoveFromGlobalCluster, ModifyGlobalCluster,
-          SwitchoverGlobalCluster, FailoverGlobalCluster.
+          SwitchoverGlobalCluster, FailoverGlobalCluster,
+          EnableHttpEndpoint, DisableHttpEndpoint.
 
 When Docker is available, CreateDBInstance spins up a real Postgres/MySQL container
 and returns the actual host:port as the endpoint.
@@ -4110,6 +4111,19 @@ def _enable_http_endpoint(p):
     return _error("DBClusterNotFoundFault", f"Cluster with ARN {arn} not found.", 404)
 
 
+def _disable_http_endpoint(p):
+    arn = _p(p, "ResourceArn")
+    for cluster in _clusters.values():
+        if cluster.get("DBClusterArn") == arn:
+            cluster["HttpEndpointEnabled"] = False
+            return _xml(200, "DisableHttpEndpointResponse",
+                f"<DisableHttpEndpointResult>"
+                f"<ResourceArn>{arn}</ResourceArn>"
+                f"<HttpEndpointEnabled>false</HttpEndpointEnabled>"
+                f"</DisableHttpEndpointResult>")
+    return _error("DBClusterNotFoundFault", f"Cluster with ARN {arn} not found.", 404)
+
+
 def _global_cluster_xml(gc):
     _refresh_global_cluster_readers(gc)
     member_xml = ""
@@ -4983,6 +4997,7 @@ _ACTION_MAP = {
     "SwitchoverGlobalCluster": _switchover_global_cluster,
     "FailoverGlobalCluster": _failover_global_cluster,
     "EnableHttpEndpoint": _enable_http_endpoint,
+    "DisableHttpEndpoint": _disable_http_endpoint,
 }
 
 

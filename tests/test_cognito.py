@@ -2184,8 +2184,9 @@ from conftest import ENDPOINT, make_client
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _setup_pool_with_user(cognito_idp, generate_secret=True):
-    """Create a user pool with a confirmed user and an OAuth-enabled client."""
+def _setup_pool_with_user(cognito_idp, generate_secret=True, force_change_password=False):
+    """Create a user pool with a confirmed (or FORCE_CHANGE_PASSWORD) user and an
+    OAuth-enabled client."""
     pool = cognito_idp.create_user_pool(PoolName='OAuth2TestPool')
     pool_id = pool['UserPool']['Id']
 
@@ -2214,9 +2215,10 @@ def _setup_pool_with_user(cognito_idp, generate_secret=True):
             {'Name': 'name', 'Value': 'Test User'},
         ],
     )
-    cognito_idp.admin_set_user_password(
-        UserPoolId=pool_id, Username='testuser', Password='TestPass1!', Permanent=True,
-    )
+    if not force_change_password:
+        cognito_idp.admin_set_user_password(
+            UserPoolId=pool_id, Username='testuser', Password='TestPass1!', Permanent=True,
+        )
 
     return pool_id, client
 
@@ -2224,6 +2226,14 @@ def _setup_pool_with_user(cognito_idp, generate_secret=True):
 def _lower_headers(h):
     """Return a plain dict with all header names lowercased."""
     return {k.lower(): v for k, v in h.items()}
+
+
+def _extract_np_token(html):
+    """Pull the `np_token` hidden-field value out of the new-password form HTML."""
+    marker = 'name="np_token" value="'
+    start = html.index(marker) + len(marker)
+    end = html.index('"', start)
+    return html[start:end]
 
 
 def _get(url, follow_redirects=True):
@@ -2383,6 +2393,154 @@ def test_oauth2_login_failure_shows_error():
     assert status == 200
     html = body.decode('utf-8')
     assert 'Incorrect username or password' in html
+
+
+def test_oauth2_login_force_change_password_shows_new_password_form():
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(cognito_idp, force_change_password=True)
+    client_id = client['ClientId']
+
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login',
+        {
+            'username': 'testuser',
+            'password': 'TempPass1!',
+            'client_id': client_id,
+            'redirect_uri': 'http://localhost:3000/callback',
+            'scope': 'openid email',
+            'state': 'mystate',
+            'response_type': 'code',
+        },
+    )
+
+    assert status == 200
+    html = body.decode('utf-8')
+    assert '<form' in html
+    assert 'new_password' in html
+    assert 'confirm_password' in html
+    assert 'np_token' in html
+
+
+def test_oauth2_new_password_submit_success_redirects_with_code():
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(cognito_idp, force_change_password=True)
+    client_id = client['ClientId']
+
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login',
+        {
+            'username': 'testuser',
+            'password': 'TempPass1!',
+            'client_id': client_id,
+            'redirect_uri': 'http://localhost:3000/callback',
+            'scope': 'openid email',
+            'state': 'mystate',
+            'response_type': 'code',
+        },
+    )
+    np_token = _extract_np_token(body.decode('utf-8'))
+
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login',
+        {
+            'np_token': np_token,
+            'new_password': 'NewPass1!',
+            'confirm_password': 'NewPass1!',
+        },
+        follow_redirects=False,
+    )
+
+    assert status == 302
+    location = headers.get('location', '')
+    assert location.startswith('http://localhost:3000/callback')
+    parsed = urllib.parse.urlparse(location)
+    qs = urllib.parse.parse_qs(parsed.query)
+    assert 'code' in qs
+    assert qs['state'] == ['mystate']
+
+    user = cognito_idp.admin_get_user(UserPoolId=pool_id, Username='testuser')
+    assert user['UserStatus'] == 'CONFIRMED'
+
+
+def test_oauth2_new_password_submit_mismatch_shows_error():
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(cognito_idp, force_change_password=True)
+    client_id = client['ClientId']
+
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login',
+        {
+            'username': 'testuser',
+            'password': 'TempPass1!',
+            'client_id': client_id,
+            'redirect_uri': 'http://localhost:3000/callback',
+            'scope': 'openid',
+            'state': 'xyz',
+            'response_type': 'code',
+        },
+    )
+    np_token = _extract_np_token(body.decode('utf-8'))
+
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login',
+        {
+            'np_token': np_token,
+            'new_password': 'NewPass1!',
+            'confirm_password': 'Different1!',
+        },
+    )
+
+    assert status == 200
+    html = body.decode('utf-8')
+    assert 'Passwords do not match' in html
+
+
+def test_oauth2_new_password_submit_policy_violation_shows_error():
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(cognito_idp, force_change_password=True)
+    client_id = client['ClientId']
+
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login',
+        {
+            'username': 'testuser',
+            'password': 'TempPass1!',
+            'client_id': client_id,
+            'redirect_uri': 'http://localhost:3000/callback',
+            'scope': 'openid',
+            'state': 'xyz',
+            'response_type': 'code',
+        },
+    )
+    np_token = _extract_np_token(body.decode('utf-8'))
+
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login',
+        {
+            'np_token': np_token,
+            'new_password': 'short',
+            'confirm_password': 'short',
+        },
+    )
+
+    assert status == 200
+    html = body.decode('utf-8')
+    assert 'did not conform with policy' in html
+
+
+def test_oauth2_new_password_submit_invalid_token():
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login',
+        {
+            'np_token': 'nonexistent-token',
+            'new_password': 'NewPass1!',
+            'confirm_password': 'NewPass1!',
+        },
+    )
+    resp = json.loads(body)
+
+    assert status == 400
+    assert resp['error'] == 'invalid_request'
 
 
 # ---------------------------------------------------------------------------
