@@ -2079,14 +2079,55 @@ def _apigw_stage_create(logical_id, props, stack_name):
         "tags": {t["Key"]: t["Value"] for t in props.get("Tags", [])},
     }
     _apigw_v1._create_stage(api_id, data)
-    pid = f"{api_id}-{stage_name}"
-    return pid, {"StageName": stage_name}
+    # AWS::ApiGateway::Stage Ref returns the stage name. The physical ID feeds
+    # MiniStack's generic Ref resolver, so it must not include the REST API ID.
+    return stage_name, {"StageName": stage_name}
 
 
 def _apigw_stage_delete(physical_id, props):
     api_id = props.get("RestApiId", "")
     stage_name = props.get("StageName", "")
     _apigw_v1._delete_stage(api_id, stage_name)
+
+
+# --- API Gateway BasePathMapping ---
+
+def _apigw_base_path_mapping_identity(props):
+    domain_name = props.get("DomainName", "")
+    base_path = props.get("BasePath") or "(none)"
+    return domain_name, base_path, f"{domain_name}/{base_path}"
+
+
+def _apigw_base_path_mapping_create(logical_id, props, stack_name):
+    domain_name, base_path, physical_id = _apigw_base_path_mapping_identity(props)
+    data = {
+        "basePath": base_path,
+        "restApiId": props.get("RestApiId", ""),
+        "stage": props.get("Stage", ""),
+    }
+    status, _headers, body = _apigw_v1._create_base_path_mapping(domain_name, data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::BasePathMapping create failed: {body!r}")
+    return physical_id, {}
+
+
+def _apigw_base_path_mapping_update(physical_id, old_props, new_props, stack_name):
+    old_domain, old_base_path, _old_id = _apigw_base_path_mapping_identity(old_props)
+    new_domain, new_base_path, _new_id = _apigw_base_path_mapping_identity(new_props)
+
+    # BasePath and DomainName require replacement; RestApiId and Stage update
+    # without interruption. The in-memory API Gateway implementation treats a
+    # create against an existing key as an upsert, which gives both paths the
+    # same atomic create-before-delete behavior here.
+    new_id, attrs = _apigw_base_path_mapping_create(physical_id, new_props, stack_name)
+    if (new_domain, new_base_path) != (old_domain, old_base_path):
+        _apigw_v1._delete_base_path_mapping(old_domain, old_base_path)
+    return new_id, attrs
+
+
+def _apigw_base_path_mapping_delete(physical_id, props):
+    domain_name, base_path, _mapping_id = _apigw_base_path_mapping_identity(props)
+    _apigw_v1._delete_base_path_mapping(domain_name, base_path)
 
 
 def _apigw_account_create(logical_id, props, stack_name):
@@ -2228,6 +2269,72 @@ def _apigw_gateway_response_delete(physical_id, props):
     # already gone away during rollback.
     if api_id in _apigw_v1._rest_apis:
         _apigw_v1._delete_gateway_response(api_id, response_type)
+
+
+# --- API Gateway DocumentationPart ---
+
+def _apigw_documentation_part_create(logical_id, props, stack_name):
+    """Provision an ``AWS::ApiGateway::DocumentationPart``."""
+    api_id = props.get("RestApiId", "")
+    cfn_location = props.get("Location", {})
+    location_keys = {
+        "Type": "type",
+        "Path": "path",
+        "Method": "method",
+        "StatusCode": "statusCode",
+        "Name": "name",
+    }
+    data = {
+        "location": {
+            api_key: cfn_location[cfn_key]
+            for cfn_key, api_key in location_keys.items()
+            if cfn_key in cfn_location
+        },
+        "properties": props.get("Properties"),
+    }
+    status, _headers, body = _apigw_v1._create_documentation_part(api_id, data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::DocumentationPart create failed: {body!r}")
+
+    part = json.loads(body) if isinstance(body, (bytes, bytearray)) else json.loads(body)
+    part_id = part.get("id", "")
+    # AWS exposes only DocumentationPartId via Fn::GetAtt for this resource.
+    return part_id, {"DocumentationPartId": part_id}
+
+
+def _apigw_documentation_part_update(physical_id, old_props, new_props, stack_name):
+    # RestApiId and Location require replacement in the AWS CFN resource
+    # specification; Properties is mutable in place.
+    if any(new_props.get(key) != old_props.get(key) for key in ("RestApiId", "Location")):
+        new_id, attrs = _apigw_documentation_part_create(physical_id, new_props, stack_name)
+        _apigw_documentation_part_delete(physical_id, old_props)
+        return new_id, attrs
+
+    if new_props.get("Properties") != old_props.get("Properties"):
+        api_id = new_props.get("RestApiId", "")
+        data = {
+            "patchOperations": [
+                {
+                    "op": "replace",
+                    "path": "/properties",
+                    "value": new_props.get("Properties", ""),
+                },
+            ],
+        }
+        status, _headers, body = _apigw_v1._update_documentation_part(
+            api_id, physical_id, data,
+        )
+        if status >= 400:
+            raise ValueError(f"AWS::ApiGateway::DocumentationPart update failed: {body!r}")
+    return physical_id, {"DocumentationPartId": physical_id}
+
+
+def _apigw_documentation_part_delete(physical_id, props):
+    api_id = props.get("RestApiId", "")
+    parts = _apigw_v1._documentation_parts.get(api_id, {})
+    # Keep rollback and parent-first cleanup idempotent.
+    if physical_id in parts:
+        _apigw_v1._delete_documentation_part(api_id, physical_id)
 
 
 # --- Lambda EventSourceMapping ---
@@ -2685,6 +2792,7 @@ def _cognito_user_pool_create(logical_id, props, stack_name):
             "AllowAdminCreateUserOnly": False,
             "UnusedAccountValidityDays": 7,
         }),
+        "LambdaConfig": props.get("LambdaConfig", {}),
         "Domain": None,
         "_clients": {},
         "_users": {},
@@ -4069,6 +4177,50 @@ def _cw_metric_alarm_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
+# CloudWatch Dashboard
+# ---------------------------------------------------------------------------
+
+
+def _cw_dashboard_name(logical_id, props, stack_name):
+    name = props.get("DashboardName") or _physical_name(
+        stack_name, logical_id, max_len=255
+    )
+    if not isinstance(name, str) or not 1 <= len(name) <= 255:
+        raise ValueError("DashboardName must be between 1 and 255 characters")
+    return name
+
+
+def _cw_dashboard_body(props):
+    body = props.get("DashboardBody")
+    if not isinstance(body, str) or not body:
+        raise ValueError("DashboardBody is required for AWS::CloudWatch::Dashboard")
+    return body
+
+
+def _cw_dashboard_create(logical_id, props, stack_name):
+    name = _cw_dashboard_name(logical_id, props, stack_name)
+    _cw.cloudformation_put_dashboard(name, _cw_dashboard_body(props))
+    return name, {}
+
+
+def _cw_dashboard_update(physical_id, old_props, new_props, stack_name):
+    # DashboardBody updates happen in place. DashboardName changes require
+    # replacement, which we model by creating the new dashboard before
+    # deleting the previous physical resource.
+    name = new_props.get("DashboardName") or physical_id
+    if not isinstance(name, str) or not 1 <= len(name) <= 255:
+        raise ValueError("DashboardName must be between 1 and 255 characters")
+    _cw.cloudformation_put_dashboard(name, _cw_dashboard_body(new_props))
+    if name != physical_id:
+        _cw.cloudformation_delete_dashboard(physical_id)
+    return name, {}
+
+
+def _cw_dashboard_delete(physical_id, props):
+    _cw.cloudformation_delete_dashboard(physical_id)
+
+
+# ---------------------------------------------------------------------------
 # ApiGatewayV2 Api
 # ---------------------------------------------------------------------------
 
@@ -4895,6 +5047,11 @@ _RESOURCE_HANDLERS = {
     "AWS::ApiGateway::Authorizer": {"create": _apigw_authorizer_create, "delete": _apigw_authorizer_delete},
     "AWS::ApiGateway::Deployment": {"create": _apigw_deployment_create, "delete": _apigw_deployment_delete},
     "AWS::ApiGateway::Stage": {"create": _apigw_stage_create, "delete": _apigw_stage_delete},
+    "AWS::ApiGateway::BasePathMapping": {
+        "create": _apigw_base_path_mapping_create,
+        "update": _apigw_base_path_mapping_update,
+        "delete": _apigw_base_path_mapping_delete,
+    },
     "AWS::ApiGateway::Account": {"create": _apigw_account_create, "delete": _apigw_account_delete},
     "AWS::ApiGateway::DomainName": {
         "create": _apigw_domain_name_create,
@@ -4905,6 +5062,11 @@ _RESOURCE_HANDLERS = {
         "create": _apigw_gateway_response_create,
         "update": _apigw_gateway_response_update,
         "delete": _apigw_gateway_response_delete,
+    },
+    "AWS::ApiGateway::DocumentationPart": {
+        "create": _apigw_documentation_part_create,
+        "update": _apigw_documentation_part_update,
+        "delete": _apigw_documentation_part_delete,
     },
     "AWS::Lambda::EventSourceMapping": {"create": _lambda_esm_create, "update": _lambda_esm_update, "delete": _lambda_esm_delete},
     "AWS::Lambda::EventInvokeConfig": {
@@ -4964,6 +5126,11 @@ _RESOURCE_HANDLERS = {
     "AWS::CloudFront::Distribution": {"create": _cf_distribution_create, "delete": _cf_distribution_delete},
     "AWS::CloudFront::KeyValueStore": {"create": _cf_kvs_create, "update": _cf_kvs_update, "delete": _cf_kvs_delete},
     "AWS::CloudWatch::Alarm": {"create": _cw_metric_alarm_create, "delete": _cw_metric_alarm_delete},
+    "AWS::CloudWatch::Dashboard": {
+        "create": _cw_dashboard_create,
+        "update": _cw_dashboard_update,
+        "delete": _cw_dashboard_delete,
+    },
     "AWS::RDS::DBCluster": {"create": _rds_db_cluster_create, "delete": _rds_db_cluster_delete},
     "AWS::RDS::DBInstance": {"create": _rds_db_instance_create, "delete": _rds_db_instance_delete},
     "AWS::IoT::TopicRule": {"create": _iot_topic_rule_create, "delete": _iot_topic_rule_delete},

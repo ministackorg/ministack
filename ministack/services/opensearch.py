@@ -103,6 +103,8 @@ _NAME_RE = re.compile(r"^[a-z][a-z0-9\-]{2,27}$")
 _domains = AccountScopedDict()        # name -> DomainStatus dict (+ private _* fields)
 _tags = AccountScopedDict()           # arn -> [{Key, Value}, ...]
 _change_progress = AccountScopedDict()  # name -> change progress record
+_packages = AccountScopedDict()       # PackageID -> PackageDetails (+ private _* fields)
+_domain_packages = AccountScopedDict()  # "PackageID:DomainName" -> DomainPackageDetails
 
 # Port counter and Docker handle are process-global (data plane is shared).
 _port_counter = [BASE_PORT]
@@ -125,6 +127,8 @@ def reset():
     _domains.clear()
     _tags.clear()
     _change_progress.clear()
+    _packages.clear()
+    _domain_packages.clear()
     docker = _get_docker()
     if docker is not None:
         for c in docker.containers.list(
@@ -143,6 +147,8 @@ def get_state():
         "domains": copy.deepcopy(_domains),
         "tags": copy.deepcopy(_tags),
         "change_progress": copy.deepcopy(_change_progress),
+        "packages": copy.deepcopy(_packages),
+        "domain_packages": copy.deepcopy(_domain_packages),
     }
 
 
@@ -153,6 +159,8 @@ def restore_state(data):
         (_domains, "domains"),
         (_tags, "tags"),
         (_change_progress, "change_progress"),
+        (_packages, "packages"),
+        (_domain_packages, "domain_packages"),
     ):
         store.clear()
         for k, v in (data.get(key) or {}).items():
@@ -738,6 +746,19 @@ _VERSIONS_RE = re.compile(r"^/2021-01-01/(?:opensearch/)?versions/?$")
 _COMPAT_RE = re.compile(r"^/2021-01-01/(?:opensearch/)?compatibleVersions/?$")
 _TAGS_RE = re.compile(r"^/2021-01-01/tags/?$")
 _TAGS_REMOVAL_RE = re.compile(r"^/2021-01-01/tags-removal/?$")
+# Package management. The literal sub-paths (update/describe/associate/
+# dissociate) are matched before the generic ``packages/{PackageID}`` so those
+# segments aren't captured as an id.
+_PACKAGES_RE = re.compile(r"^/2021-01-01/packages/?$")
+_PACKAGES_UPDATE_RE = re.compile(r"^/2021-01-01/packages/update/?$")
+_PACKAGES_DESCRIBE_RE = re.compile(r"^/2021-01-01/packages/describe/?$")
+_PACKAGES_ASSOCIATE_RE = re.compile(
+    r"^/2021-01-01/packages/associate/(?P<pid>[^/]+)/(?P<domain>[^/]+)/?$")
+_PACKAGES_DISSOCIATE_RE = re.compile(
+    r"^/2021-01-01/packages/dissociate/(?P<pid>[^/]+)/(?P<domain>[^/]+)/?$")
+_PACKAGE_RE = re.compile(r"^/2021-01-01/packages/(?P<pid>[^/]+)/?$")
+_DOMAIN_PACKAGES_RE = re.compile(
+    r"^/2021-01-01/(?:opensearch/)?domain/(?P<name>[^/]+)/packages/?$")
 
 
 def _qp(query_params, key) -> str:
@@ -920,6 +941,153 @@ def _remove_tags(payload):
 
 
 # ---------------------------------------------------------------------------
+# Packages
+# ---------------------------------------------------------------------------
+# CRUD + domain association, keyed by the service-generated PackageID. Like the
+# domain change-progress model, status transitions complete synchronously:
+# a package is AVAILABLE the moment it is created/updated, and an association
+# is ACTIVE the moment it is made, so a client's poll succeeds on first call.
+
+def _new_package_id() -> str:
+    return f"F{new_uuid().replace('-', '')[:10].upper()}"
+
+
+def _public_package(rec: dict) -> dict:
+    """Strip internal _-prefixed fields. PackageSource is an input-only shape
+    (AWS does not echo it from DescribePackages), so it is stored privately."""
+    return {k: v for k, v in rec.items() if not k.startswith("_")}
+
+
+def _create_package(payload):
+    name = payload.get("PackageName")
+    ptype = payload.get("PackageType")
+    source = payload.get("PackageSource")
+    if not name:
+        return _error(400, "ValidationException", "PackageName is required")
+    if not ptype:
+        return _error(400, "ValidationException", "PackageType is required")
+    if source is None:
+        return _error(400, "ValidationException", "PackageSource is required")
+    now = _now()
+    pid = _new_package_id()
+    rec = {
+        "PackageID": pid,
+        "PackageName": name,
+        "PackageType": ptype,
+        "PackageDescription": payload.get("PackageDescription", ""),
+        "PackageStatus": "AVAILABLE",
+        "CreatedAt": now,
+        "LastUpdatedAt": now,
+        "AvailablePackageVersion": "1",
+        "_PackageSource": source,
+    }
+    _packages[pid] = rec
+    return _json(200, {"PackageDetails": _public_package(rec)})
+
+
+def _update_package(payload):
+    pid = payload.get("PackageID")
+    rec = _packages.get(pid)
+    if not rec:
+        return _error(404, "ResourceNotFoundException", f"Package not found: {pid}")
+    if "PackageSource" in payload:
+        rec["_PackageSource"] = payload["PackageSource"]
+    if "PackageDescription" in payload:
+        rec["PackageDescription"] = payload["PackageDescription"]
+    try:
+        rec["AvailablePackageVersion"] = str(int(rec.get("AvailablePackageVersion", "1")) + 1)
+    except (TypeError, ValueError):
+        rec["AvailablePackageVersion"] = "2"
+    rec["LastUpdatedAt"] = _now()
+    rec["PackageStatus"] = "AVAILABLE"
+    return _json(200, {"PackageDetails": _public_package(rec)})
+
+
+def _describe_packages(payload):
+    results = list(_packages.values())
+    for f in payload.get("Filters") or []:
+        fname = f.get("Name")
+        fvals = f.get("Value") or []
+        if not fvals:
+            continue
+        if fname in ("PackageID", "PackageName", "PackageStatus", "PackageType"):
+            results = [p for p in results if p.get(fname) in fvals]
+    results = sorted(results, key=lambda p: p["PackageID"])
+    start = int(payload["NextToken"]) if payload.get("NextToken") else 0
+    max_results = payload.get("MaxResults")
+    if max_results:
+        page = results[start:start + max_results]
+        resp = {"PackageDetailsList": [_public_package(p) for p in page]}
+        if start + max_results < len(results):
+            resp["NextToken"] = str(start + max_results)
+    else:
+        resp = {"PackageDetailsList": [_public_package(p) for p in results[start:]]}
+    return _json(200, resp)
+
+
+def _delete_package(pid):
+    rec = _packages.pop(pid, None)
+    if not rec:
+        return _error(404, "ResourceNotFoundException", f"Package not found: {pid}")
+    # Cascade: drop any domain associations this package still had.
+    for key in [k for k in _domain_packages.keys() if k.split(":", 1)[0] == pid]:
+        _domain_packages.pop(key, None)
+    out = dict(rec)
+    out["PackageStatus"] = "DELETED"
+    return _json(200, {"PackageDetails": _public_package(out)})
+
+
+def _associate_package(pid, domain_name):
+    rec = _packages.get(pid)
+    if not rec:
+        return _error(404, "ResourceNotFoundException", f"Package not found: {pid}")
+    if domain_name not in _domains:
+        return _error(404, "ResourceNotFoundException", f"Domain not found: {domain_name}")
+    detail = {
+        "PackageID": pid,
+        "PackageName": rec["PackageName"],
+        "PackageType": rec["PackageType"],
+        "DomainName": domain_name,
+        "DomainPackageStatus": "ACTIVE",
+        "PackageVersion": rec["AvailablePackageVersion"],
+        "LastUpdated": _now(),
+        "ReferencePath": f"packages/{rec['PackageName']}",
+    }
+    _domain_packages[f"{pid}:{domain_name}"] = detail
+    return _json(200, {"DomainPackageDetails": detail})
+
+
+def _dissociate_package(pid, domain_name):
+    detail = _domain_packages.pop(f"{pid}:{domain_name}", None)
+    if not detail:
+        return _error(404, "ResourceNotFoundException",
+                      f"Package {pid} is not associated with domain {domain_name}")
+    out = dict(detail)
+    out["DomainPackageStatus"] = "DISSOCIATING"
+    return _json(200, {"DomainPackageDetails": out})
+
+
+def _list_packages_for_domain(domain_name, query_params):
+    if domain_name not in _domains:
+        return _error(404, "ResourceNotFoundException", f"Domain not found: {domain_name}")
+    details = sorted(
+        (v for k, v in _domain_packages.items() if k.split(":", 1)[-1] == domain_name),
+        key=lambda d: d["PackageID"],
+    )
+    start = int(_qp(query_params, "nextToken")) if _qp(query_params, "nextToken") else 0
+    mr = _qp(query_params, "maxResults")
+    if mr:
+        limit = int(mr)
+        page = details[start:start + limit]
+        resp = {"DomainPackageDetailsList": page}
+        if start + limit < len(details):
+            resp["NextToken"] = str(start + limit)
+    else:
+        resp = {"DomainPackageDetailsList": details[start:]}
+    return _json(200, resp)
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 
@@ -953,6 +1121,26 @@ async def handle_request(method, path, headers, body_bytes, query_params):
 
     if method == "POST" and _DOMAIN_INFO_RE.match(path):
         return _describe_domains(payload)
+
+    # Packages — literal sub-paths before the generic packages/{PackageID}.
+    if method == "POST" and _PACKAGES_UPDATE_RE.match(path):
+        return _update_package(payload)
+    if method == "POST" and _PACKAGES_DESCRIBE_RE.match(path):
+        return _describe_packages(payload)
+    m = _PACKAGES_ASSOCIATE_RE.match(path)
+    if method == "POST" and m:
+        return _associate_package(m.group("pid"), m.group("domain"))
+    m = _PACKAGES_DISSOCIATE_RE.match(path)
+    if method == "POST" and m:
+        return _dissociate_package(m.group("pid"), m.group("domain"))
+    m = _PACKAGE_RE.match(path)
+    if method == "DELETE" and m:
+        return _delete_package(m.group("pid"))
+    if method == "POST" and _PACKAGES_RE.match(path):
+        return _create_package(payload)
+    m = _DOMAIN_PACKAGES_RE.match(path)
+    if method == "GET" and m:
+        return _list_packages_for_domain(m.group("name"), query_params)
 
     m = _DOMAIN_CONFIG_RE.match(path)
     if m:
