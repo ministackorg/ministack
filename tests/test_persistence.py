@@ -1907,3 +1907,36 @@ def test_codebuild_region_scoped_state_is_rejected_by_v2_reader(
     # Simulate the previous binary, whose highest understood format is v2.
     monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
     assert persistence.load_state("codebuild") is None
+
+
+def test_ses_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject both SES persistence files after their
+    stores become regional instead of accepting v2 and restoring them empty."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    for service in ("ses", "ses_v2"):
+        identities = AccountRegionScopedDict()
+        identities.set_scoped(
+            "000000000000",
+            "us-west-2",
+            "regional@example.com",
+            {"VerificationStatus": "Success"},
+        )
+        persistence.save_state(service, {"_identities": identities})
+
+        raw = _json.loads((tmp_path / f"{service}.json").read_text())
+        assert raw["__ministack_format__"] == 3
+        loaded_identities = persistence.load_state(service)["_identities"]
+        assert loaded_identities.get_scoped(
+            "000000000000", "us-west-2", "regional@example.com"
+        )["VerificationStatus"] == "Success"
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("ses") is None
+    assert persistence.load_state("ses_v2") is None

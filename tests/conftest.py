@@ -420,6 +420,11 @@ def cfn():
 
 
 @pytest.fixture(scope="session")
+def opensearch():
+    return make_client("opensearch")
+
+
+@pytest.fixture(scope="session")
 def kms_client():
     return make_client("kms")
 
