@@ -1963,6 +1963,62 @@ def test_cfn_cloudwatch_alarm_lifecycle(cfn, cw):
     assert resp2["MetricAlarms"] == []
 
 
+def test_cfn_cloudwatch_dashboard_lifecycle(cfn, cw):
+    """CloudFormation creates, updates, and removes a CloudWatch dashboard."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cwdash-{uid}"
+    dashboard_name = f"cfn-dashboard-{uid}"
+    replacement_name = f"cfn-dashboard-replaced-{uid}"
+    body = json.dumps({"widgets": [{"type": "text", "properties": {"markdown": "Created"}}]})
+    updated_body = json.dumps({"widgets": [{"type": "text", "properties": {"markdown": "Updated"}}]})
+
+    def template(dashboard_body, name=dashboard_name):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "Dashboard": {
+                    "Type": "AWS::CloudWatch::Dashboard",
+                    "Properties": {
+                        "DashboardName": name,
+                        "DashboardBody": dashboard_body,
+                    },
+                },
+            },
+            "Outputs": {
+                "DashboardName": {"Value": {"Ref": "Dashboard"}},
+            },
+        }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template(body)))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    assert stack["Outputs"][0]["OutputValue"] == dashboard_name
+    assert cw.get_dashboard(DashboardName=dashboard_name)["DashboardBody"] == body
+
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(template(updated_body)))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+    assert cw.get_dashboard(DashboardName=dashboard_name)["DashboardBody"] == updated_body
+
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template(updated_body, replacement_name)),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+    assert stack["Outputs"][0]["OutputValue"] == replacement_name
+    with pytest.raises(ClientError) as exc:
+        cw.get_dashboard(DashboardName=dashboard_name)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFound"
+    assert cw.get_dashboard(DashboardName=replacement_name)["DashboardBody"] == updated_body
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+    with pytest.raises(ClientError) as exc:
+        cw.get_dashboard(DashboardName=replacement_name)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFound"
+
+
 def test_cfn_route53_hosted_zone_and_record_set(cfn, r53):
     """CloudFormation provisions Route53 HostedZone + RecordSet and removes records on delete."""
     uid = _uuid_mod.uuid4().hex[:8]
@@ -3293,6 +3349,55 @@ Outputs:
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
+def test_cfn_cognito_user_pool_resource_server(cfn, cognito_idp):
+    """CFN AWS::Cognito::UserPoolResourceServer creates a resource server
+    whose Ref resolves to its Identifier, matching real AWS."""
+    template = """
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  Pool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: cfn-resource-server-pool
+  ApiResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref Pool
+      Identifier: API
+      Name: API
+      Scopes:
+        - ScopeName: resource.get
+          ScopeDescription: Read access
+Outputs:
+  PoolId:
+    Value: !Ref Pool
+  ResourceServerRef:
+    Value: !Ref ApiResourceServer
+"""
+    stack_name = "cfn-resource-server"
+    try:
+        cfn.delete_stack(StackName=stack_name)
+    except Exception:
+        pass
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    _wait_stack(cfn, stack_name)
+
+    stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    assert outputs["ResourceServerRef"] == "API"
+
+    server = cognito_idp.describe_resource_server(
+        UserPoolId=outputs["PoolId"], Identifier="API",
+    )["ResourceServer"]
+    assert server["Name"] == "API"
+    assert server["Scopes"] == [{"ScopeName": "resource.get", "ScopeDescription": "Read access"}]
+
+    cfn.delete_stack(StackName=stack_name)
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.describe_resource_server(UserPoolId=outputs["PoolId"], Identifier="API")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 # ---------------------------------------------------------------------------
 # ApiGatewayV2 Integration + Route provisioners
 # ---------------------------------------------------------------------------
@@ -4202,6 +4307,101 @@ def test_cfn_apigateway_authorizer_provisions(cfn):
     _wait_stack(cfn, stack_name)
 
 
+def test_cfn_apigateway_base_path_mapping_lifecycle(cfn, apigw_v1):
+    """AWS::ApiGateway::BasePathMapping creates, updates, replaces, and deletes."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-base-path-mapping-{suffix}"
+    domain_name = f"cfn-base-path-{suffix}.example.com"
+    first_api_id = apigw_v1.create_rest_api(name=f"base-path-first-{suffix}")["id"]
+    second_api_id = apigw_v1.create_rest_api(name=f"base-path-second-{suffix}")["id"]
+    stack_deleted = False
+
+    apigw_v1.create_domain_name(domainName=domain_name)
+
+    def template(base_path, rest_api_id, stage):
+        properties = {
+            "DomainName": domain_name,
+            "RestApiId": rest_api_id,
+            "Stage": stage,
+        }
+        if base_path is not None:
+            properties["BasePath"] = base_path
+        return {
+            "Resources": {
+                "Mapping": {
+                    "Type": "AWS::ApiGateway::BasePathMapping",
+                    "Properties": properties,
+                },
+            },
+            "Outputs": {"MappingRef": {"Value": {"Ref": "Mapping"}}},
+        }
+
+    def physical_id():
+        detail = cfn.describe_stack_resource(
+            StackName=stack_name,
+            LogicalResourceId="Mapping",
+        )["StackResourceDetail"]
+        return detail["PhysicalResourceId"]
+
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template(None, first_api_id, "prod")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() == f"{domain_name}/(none)"
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack.get("Outputs", [])}
+        assert outputs["MappingRef"] == f"{domain_name}/(none)"
+
+        mapping = apigw_v1.get_base_path_mapping(domainName=domain_name, basePath="(none)")
+        assert mapping["restApiId"] == first_api_id
+        assert mapping["stage"] == "prod"
+
+        # RestApiId and Stage update without replacing the physical resource.
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template(None, second_api_id, "beta")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() == f"{domain_name}/(none)"
+        mapping = apigw_v1.get_base_path_mapping(domainName=domain_name, basePath="(none)")
+        assert mapping["restApiId"] == second_api_id
+        assert mapping["stage"] == "beta"
+
+        # BasePath requires replacement and removes the previous mapping.
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("v2", second_api_id, "beta")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() == f"{domain_name}/v2"
+        with pytest.raises(ClientError) as exc:
+            apigw_v1.get_base_path_mapping(domainName=domain_name, basePath="(none)")
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+        mapping = apigw_v1.get_base_path_mapping(domainName=domain_name, basePath="v2")
+        assert mapping["restApiId"] == second_api_id
+
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        stack_deleted = True
+        with pytest.raises(ClientError) as exc:
+            apigw_v1.get_base_path_mapping(domainName=domain_name, basePath="v2")
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    finally:
+        if not stack_deleted:
+            try:
+                cfn.delete_stack(StackName=stack_name)
+                _wait_stack(cfn, stack_name)
+            except ClientError:
+                pass
+        apigw_v1.delete_rest_api(restApiId=first_api_id)
+        apigw_v1.delete_rest_api(restApiId=second_api_id)
+        apigw_v1.delete_domain_name(domainName=domain_name)
+
+
 def test_cfn_apigateway_account_provisions(cfn, apigw_v1):
     """AWS::ApiGateway::Account is the CDK ``cloudWatchRole: true`` resource.
     Without a registered handler, stacks fail with ``Unsupported resource
@@ -4523,6 +4723,113 @@ def test_cfn_apigateway_gateway_response_lifecycle(cfn, apigw_v1):
         )
         assert reset_response["defaultResponse"] is True
         assert reset_response["statusCode"] == "400"
+    finally:
+        if not stack_deleted:
+            try:
+                cfn.delete_stack(StackName=stack_name)
+                _wait_stack(cfn, stack_name)
+            except ClientError:
+                pass
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_cfn_apigateway_documentation_part_lifecycle(cfn, apigw_v1):
+    """DocumentationPart supports create, update, replacement, Ref, and delete.
+
+    Regression for #1159: the resource type previously failed stack creation
+    with ``Unsupported resource type: AWS::ApiGateway::DocumentationPart``.
+    """
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-documentation-part-{suffix}"
+    api_id = apigw_v1.create_rest_api(name=f"documentation-part-{suffix}")["id"]
+    stack_deleted = False
+
+    def template(location, description):
+        return {
+            "Resources": {
+                "DocumentationPart": {
+                    "Type": "AWS::ApiGateway::DocumentationPart",
+                    "Properties": {
+                        "RestApiId": api_id,
+                        "Location": location,
+                        "Properties": json.dumps({"description": description}),
+                    },
+                },
+            },
+            "Outputs": {
+                "DocumentationPartId": {"Value": {"Ref": "DocumentationPart"}},
+            },
+        }
+
+    def physical_id():
+        detail = cfn.describe_stack_resource(
+            StackName=stack_name,
+            LogicalResourceId="DocumentationPart",
+        )["StackResourceDetail"]
+        return detail["PhysicalResourceId"]
+
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template({"Type": "API"}, "Created")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        created_id = physical_id()
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack.get("Outputs", [])}
+        assert outputs["DocumentationPartId"] == created_id
+        created = apigw_v1.get_documentation_part(
+            restApiId=api_id,
+            documentationPartId=created_id,
+        )
+        assert created["location"] == {"type": "API"}
+        assert json.loads(created["properties"])["description"] == "Created"
+
+        # Properties updates in place.
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template({"Type": "API"}, "Updated")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() == created_id
+        updated = apigw_v1.get_documentation_part(
+            restApiId=api_id,
+            documentationPartId=created_id,
+        )
+        assert json.loads(updated["properties"])["description"] == "Updated"
+
+        # Location is immutable and replaces the documentation part.
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(
+                template({"Type": "RESOURCE", "Path": "/pets"}, "Replacement")
+            ),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        replacement_id = physical_id()
+        assert replacement_id != created_id
+        with pytest.raises(ClientError):
+            apigw_v1.get_documentation_part(
+                restApiId=api_id,
+                documentationPartId=created_id,
+            )
+        replacement = apigw_v1.get_documentation_part(
+            restApiId=api_id,
+            documentationPartId=replacement_id,
+        )
+        assert replacement["location"] == {"type": "RESOURCE", "path": "/pets"}
+
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        stack_deleted = True
+        with pytest.raises(ClientError):
+            apigw_v1.get_documentation_part(
+                restApiId=api_id,
+                documentationPartId=replacement_id,
+            )
     finally:
         if not stack_deleted:
             try:
