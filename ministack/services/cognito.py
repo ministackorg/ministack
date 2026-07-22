@@ -1495,6 +1495,7 @@ async def _dispatch_idp(action: str, data: dict):
         "AdminInitiateAuth": _admin_initiate_auth,
         "AdminRespondToAuthChallenge": _admin_respond_to_auth_challenge,
         "InitiateAuth": _initiate_auth,
+        "GetTokensFromRefreshToken": _get_tokens_from_refresh_token,
         "RespondToAuthChallenge": _respond_to_auth_challenge,
         "GlobalSignOut": _global_sign_out,
         "RevokeToken": _revoke_token,
@@ -2857,6 +2858,62 @@ def _admin_respond_to_auth_challenge(data):
     return error_response_json("InvalidParameterException", f"Unsupported challenge: {challenge_name}", 400)
 
 
+def _pool_for_client(cid):
+    """Return (pool, pool_id) for the client id, or (None, None)."""
+    for p_id, p in _user_pools.items():
+        if cid in p["_clients"]:
+            return p, p_id
+    return None, None
+
+
+def _refresh_auth_result(pool, pid, cid, refresh_token):
+    """Shared REFRESH_TOKEN_AUTH core. Returns (auth_result_dict, error_response);
+    exactly one is non-None. Used by InitiateAuth's REFRESH_TOKEN_AUTH branch and
+    by GetTokensFromRefreshToken so both mint tokens identically."""
+    if not refresh_token:
+        return None, error_response_json("NotAuthorizedException", "Refresh token is missing.", 400)
+    # Decode stub token to find the correct user by sub.
+    user = _user_from_token(refresh_token, pool)
+    if not user:
+        users = list(pool["_users"].values())
+        if not users:
+            return None, error_response_json("NotAuthorizedException", "No users in pool.", 400)
+        user = users[0]
+    if _refresh_token_revoked(refresh_token, user):
+        return None, error_response_json("NotAuthorizedException",
+                                         "Refresh Token has been revoked", 400)
+    result = _build_auth_result(pid, cid, user, trigger_source="TokenGeneration_RefreshTokens")
+    result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
+    return result, None
+
+
+def _get_tokens_from_refresh_token(data):
+    """GetTokensFromRefreshToken — the only session-refresh path aws-amplify
+    v6.15+ uses (added by AWS in 2025 alongside refresh token rotation). Accepts
+    a top-level ``RefreshToken``/``ClientId`` and reuses the REFRESH_TOKEN_AUTH
+    core, returning the same ``AuthenticationResult`` shape.
+
+    Refresh token rotation (reissuing the RefreshToken and the
+    ``RefreshTokenReuseException`` grace period) is not modeled; with rotation
+    disabled — the pool default — AWS returns no new refresh token here, so the
+    result carries AccessToken/IdToken/ExpiresIn/TokenType only."""
+    cid = data.get("ClientId")
+    refresh_token = data.get("RefreshToken")
+    if not cid:
+        return error_response_json("InvalidParameterException",
+                                   "Missing required parameter ClientId", 400)
+    if not refresh_token:
+        return error_response_json("InvalidParameterException",
+                                   "Missing required parameter RefreshToken", 400)
+    pool, pid = _pool_for_client(cid)
+    if not pool:
+        return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
+    result, err = _refresh_auth_result(pool, pid, cid, refresh_token)
+    if err:
+        return err
+    return json_response({"AuthenticationResult": result})
+
+
 def _initiate_auth(data):
     """Public InitiateAuth — same logic as AdminInitiateAuth but no UserPoolId required."""
     cid = data.get("ClientId")
@@ -2901,22 +2958,9 @@ def _initiate_auth(data):
         return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
 
     if auth_flow in ("REFRESH_TOKEN_AUTH", "REFRESH_TOKEN"):
-        refresh_token = auth_params.get("REFRESH_TOKEN", "")
-        if not refresh_token:
-            return error_response_json("NotAuthorizedException", "Refresh token is missing.", 400)
-        # Decode stub token to find the correct user by sub
-        user = _user_from_token(refresh_token, pool)
-        if not user:
-            users = list(pool["_users"].values())
-            if not users:
-                return error_response_json("NotAuthorizedException", "No users in pool.", 400)
-            user = users[0]
-        if _refresh_token_revoked(refresh_token, user):
-            return error_response_json("NotAuthorizedException",
-                                       "Refresh Token has been revoked", 400)
-        result = _build_auth_result(pid, cid, user,
-                                     trigger_source="TokenGeneration_RefreshTokens")
-        result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
+        result, err = _refresh_auth_result(pool, pid, cid, auth_params.get("REFRESH_TOKEN", ""))
+        if err:
+            return err
         return json_response({"AuthenticationResult": result})
 
     # USER_SRP_AUTH — return SRP challenge stub

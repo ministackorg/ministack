@@ -518,6 +518,62 @@ def test_cognito_global_sign_out(cognito_idp):
             AuthParameters={"REFRESH_TOKEN": refresh_token},
         )
 
+
+def test_cognito_get_tokens_from_refresh_token(cognito_idp):
+    """aws-amplify v6.15+ refreshes sessions only via GetTokensFromRefreshToken;
+    it returns the same AuthenticationResult shape as REFRESH_TOKEN_AUTH."""
+    pid = cognito_idp.create_user_pool(PoolName="GTFRTPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="GTFRTApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="ada")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="ada", Password="AdaPass1!", Permanent=True)
+    auth = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "ada", "PASSWORD": "AdaPass1!"},
+    )["AuthenticationResult"]
+
+    result = cognito_idp.get_tokens_from_refresh_token(
+        ClientId=cid, RefreshToken=auth["RefreshToken"],
+    )["AuthenticationResult"]
+    assert result["AccessToken"]
+    assert result["IdToken"]
+    assert result["TokenType"] == "Bearer"
+    assert result["ExpiresIn"] > 0
+    # With rotation disabled (the pool default) AWS returns no new refresh token.
+    assert "RefreshToken" not in result
+    # The refreshed access token is usable.
+    assert cognito_idp.get_user(AccessToken=result["AccessToken"])["Username"] == "ada"
+
+
+def test_cognito_get_tokens_from_refresh_token_unknown_client(cognito_idp):
+    with pytest.raises(cognito_idp.exceptions.ResourceNotFoundException):
+        cognito_idp.get_tokens_from_refresh_token(ClientId="nonexistent", RefreshToken="dummy")
+
+
+def test_cognito_get_tokens_from_refresh_token_revoked(cognito_idp):
+    """A globally-signed-out refresh token is rejected, matching REFRESH_TOKEN_AUTH."""
+    pid = cognito_idp.create_user_pool(PoolName="GTFRTRevokePool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="GTFRTRevokeApp",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="grace")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="grace", Password="GracePass1!", Permanent=True)
+    auth = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "grace", "PASSWORD": "GracePass1!"},
+    )["AuthenticationResult"]
+    time.sleep(1.1)
+    cognito_idp.global_sign_out(AccessToken=auth["AccessToken"])
+    with pytest.raises(cognito_idp.exceptions.NotAuthorizedException):
+        cognito_idp.get_tokens_from_refresh_token(
+            ClientId=cid, RefreshToken=auth["RefreshToken"])
+
+
 def test_cognito_admin_confirm_signup(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="AdminConfirmPool")["UserPool"]["Id"]
     cid = cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="AdminConfirmApp")["UserPoolClient"][
