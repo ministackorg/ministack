@@ -4251,6 +4251,101 @@ def test_cfn_apigateway_authorizer_provisions(cfn):
     _wait_stack(cfn, stack_name)
 
 
+def test_cfn_apigateway_base_path_mapping_lifecycle(cfn, apigw_v1):
+    """AWS::ApiGateway::BasePathMapping creates, updates, replaces, and deletes."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-base-path-mapping-{suffix}"
+    domain_name = f"cfn-base-path-{suffix}.example.com"
+    first_api_id = apigw_v1.create_rest_api(name=f"base-path-first-{suffix}")["id"]
+    second_api_id = apigw_v1.create_rest_api(name=f"base-path-second-{suffix}")["id"]
+    stack_deleted = False
+
+    apigw_v1.create_domain_name(domainName=domain_name)
+
+    def template(base_path, rest_api_id, stage):
+        properties = {
+            "DomainName": domain_name,
+            "RestApiId": rest_api_id,
+            "Stage": stage,
+        }
+        if base_path is not None:
+            properties["BasePath"] = base_path
+        return {
+            "Resources": {
+                "Mapping": {
+                    "Type": "AWS::ApiGateway::BasePathMapping",
+                    "Properties": properties,
+                },
+            },
+            "Outputs": {"MappingRef": {"Value": {"Ref": "Mapping"}}},
+        }
+
+    def physical_id():
+        detail = cfn.describe_stack_resource(
+            StackName=stack_name,
+            LogicalResourceId="Mapping",
+        )["StackResourceDetail"]
+        return detail["PhysicalResourceId"]
+
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template(None, first_api_id, "prod")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() == f"{domain_name}/(none)"
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack.get("Outputs", [])}
+        assert outputs["MappingRef"] == f"{domain_name}/(none)"
+
+        mapping = apigw_v1.get_base_path_mapping(domainName=domain_name, basePath="(none)")
+        assert mapping["restApiId"] == first_api_id
+        assert mapping["stage"] == "prod"
+
+        # RestApiId and Stage update without replacing the physical resource.
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template(None, second_api_id, "beta")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() == f"{domain_name}/(none)"
+        mapping = apigw_v1.get_base_path_mapping(domainName=domain_name, basePath="(none)")
+        assert mapping["restApiId"] == second_api_id
+        assert mapping["stage"] == "beta"
+
+        # BasePath requires replacement and removes the previous mapping.
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("v2", second_api_id, "beta")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() == f"{domain_name}/v2"
+        with pytest.raises(ClientError) as exc:
+            apigw_v1.get_base_path_mapping(domainName=domain_name, basePath="(none)")
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+        mapping = apigw_v1.get_base_path_mapping(domainName=domain_name, basePath="v2")
+        assert mapping["restApiId"] == second_api_id
+
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        stack_deleted = True
+        with pytest.raises(ClientError) as exc:
+            apigw_v1.get_base_path_mapping(domainName=domain_name, basePath="v2")
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    finally:
+        if not stack_deleted:
+            try:
+                cfn.delete_stack(StackName=stack_name)
+                _wait_stack(cfn, stack_name)
+            except ClientError:
+                pass
+        apigw_v1.delete_rest_api(restApiId=first_api_id)
+        apigw_v1.delete_rest_api(restApiId=second_api_id)
+        apigw_v1.delete_domain_name(domainName=domain_name)
+
+
 def test_cfn_apigateway_account_provisions(cfn, apigw_v1):
     """AWS::ApiGateway::Account is the CDK ``cloudWatchRole: true`` resource.
     Without a registered handler, stacks fail with ``Unsupported resource
