@@ -10,6 +10,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Added
 - **Cognito — resource servers** (`CreateResourceServer`, `UpdateResourceServer`, `DescribeResourceServer`, `DeleteResourceServer`, `ListResourceServers`) plus `AWS::Cognito::UserPoolResourceServer` CloudFormation support. Previously every resource-server action returned `InvalidAction: Unknown Cognito IDP action`, and the CFN resource type failed the whole stack with `Unsupported resource type`, so any app pool defining custom OAuth scopes (`{identifier}/{scopeName}`, e.g. for `HttpJwtAuthorizer` `authorizationScopes` gating on API Gateway) couldn't deploy against MiniStack at all. Resource servers are keyed by their caller-supplied `Identifier` within a pool, matching real AWS, and `Ref` on the CFN resource returns that `Identifier`. Contributed by @ryan-bennett.
 
+### Fixed
+- **Cognito — `AWS::Cognito::UserPool` `LambdaConfig` dropped by CloudFormation** — the CFN provisioner built a pool's state without ever reading `LambdaConfig` from the template properties, so any Lambda trigger (PreTokenGeneration, PreSignUp, PostConfirmation, etc.) configured on a CFN-provisioned pool was silently never invoked, even though the identical raw `CreateUserPool` API call already honored it correctly. `LambdaConfig` is now copied onto the pool the same way the raw API does. Contributed by @ryan-bennett.
+
 ## [1.4.4] — 2026-07-22
 
 ### Added
