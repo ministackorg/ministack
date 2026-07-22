@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **CloudWatch — `AWS::CloudWatch::Dashboard` CloudFormation support** — stacks containing CloudWatch dashboards no longer roll back with `Unsupported resource type`. Dashboard creation, in-place body updates, name replacement, `Ref`, and deletion now use the existing CloudWatch dashboard store. Fixes #1155.
+
 ## [1.4.4] — 2026-07-22
 
 ### Added

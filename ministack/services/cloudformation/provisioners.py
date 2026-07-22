@@ -3678,6 +3678,50 @@ def _cw_metric_alarm_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
+# CloudWatch Dashboard
+# ---------------------------------------------------------------------------
+
+
+def _cw_dashboard_name(logical_id, props, stack_name):
+    name = props.get("DashboardName") or _physical_name(
+        stack_name, logical_id, max_len=255
+    )
+    if not isinstance(name, str) or not 1 <= len(name) <= 255:
+        raise ValueError("DashboardName must be between 1 and 255 characters")
+    return name
+
+
+def _cw_dashboard_body(props):
+    body = props.get("DashboardBody")
+    if not isinstance(body, str) or not body:
+        raise ValueError("DashboardBody is required for AWS::CloudWatch::Dashboard")
+    return body
+
+
+def _cw_dashboard_create(logical_id, props, stack_name):
+    name = _cw_dashboard_name(logical_id, props, stack_name)
+    _cw.cloudformation_put_dashboard(name, _cw_dashboard_body(props))
+    return name, {}
+
+
+def _cw_dashboard_update(physical_id, old_props, new_props, stack_name):
+    # DashboardBody updates happen in place. DashboardName changes require
+    # replacement, which we model by creating the new dashboard before
+    # deleting the previous physical resource.
+    name = new_props.get("DashboardName") or physical_id
+    if not isinstance(name, str) or not 1 <= len(name) <= 255:
+        raise ValueError("DashboardName must be between 1 and 255 characters")
+    _cw.cloudformation_put_dashboard(name, _cw_dashboard_body(new_props))
+    if name != physical_id:
+        _cw.cloudformation_delete_dashboard(physical_id)
+    return name, {}
+
+
+def _cw_dashboard_delete(physical_id, props):
+    _cw.cloudformation_delete_dashboard(physical_id)
+
+
+# ---------------------------------------------------------------------------
 # ApiGatewayV2 Api
 # ---------------------------------------------------------------------------
 
@@ -4548,6 +4592,11 @@ _RESOURCE_HANDLERS = {
     "AWS::CloudFront::Distribution": {"create": _cf_distribution_create, "delete": _cf_distribution_delete},
     "AWS::CloudFront::KeyValueStore": {"create": _cf_kvs_create, "update": _cf_kvs_update, "delete": _cf_kvs_delete},
     "AWS::CloudWatch::Alarm": {"create": _cw_metric_alarm_create, "delete": _cw_metric_alarm_delete},
+    "AWS::CloudWatch::Dashboard": {
+        "create": _cw_dashboard_create,
+        "update": _cw_dashboard_update,
+        "delete": _cw_dashboard_delete,
+    },
     "AWS::RDS::DBCluster": {"create": _rds_db_cluster_create, "delete": _rds_db_cluster_delete},
     "AWS::RDS::DBInstance": {"create": _rds_db_instance_create, "delete": _rds_db_instance_delete},
     "AWS::IoT::TopicRule": {"create": _iot_topic_rule_create, "delete": _iot_topic_rule_delete},
