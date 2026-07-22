@@ -3924,6 +3924,48 @@ def test_cfn_cloudfront_keyvaluestore_create_update_delete(cfn, cloudfront):
     assert exc.value.response["Error"]["Code"] == "EntityNotFound"
 
 
+def test_cfn_cloudfront_distribution_supports_invalidations(cfn, cloudfront):
+    """A distribution provisioned through CloudFormation must initialize the
+    invalidation state used by the native CloudFront API (#1147)."""
+    stack_name = f"cfn-cloudfront-invalidation-{_uuid_mod.uuid4().hex[:8]}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Distribution": {
+                "Type": "AWS::CloudFront::Distribution",
+                "Properties": {
+                    "DistributionConfig": {
+                        "Enabled": True,
+                    },
+                },
+            },
+        },
+        "Outputs": {
+            "DistributionId": {"Value": {"Ref": "Distribution"}},
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+    dist_id = outputs["DistributionId"]
+    response = cloudfront.create_invalidation(
+        DistributionId=dist_id,
+        InvalidationBatch={
+            "Paths": {"Quantity": 1, "Items": ["/*"]},
+            "CallerReference": f"cfn-invalidation-{_uuid_mod.uuid4().hex}",
+        },
+    )
+    assert response["Invalidation"]["Status"] == "Completed"
+    assert response["Invalidation"]["InvalidationBatch"]["Paths"]["Items"] == ["/*"]
+
+    cfn.delete_stack(StackName=stack_name)
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "DELETE_COMPLETE"
+
+
 def test_cfn_auto_named_s3_bucket_stable_across_updates(cfn, s3):
     """Regression: auto-named S3 buckets (no explicit BucketName) must keep
     the same physical resource ID across stack updates.  Before the fix,

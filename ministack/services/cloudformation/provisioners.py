@@ -4318,11 +4318,13 @@ def _cf_distribution_create(logical_id, props, stack_name):
         "config_xml": "",
         "enabled": dist_config.get("Enabled", True),
     }
+    _cf._invalidations[dist_id] = []
     return dist_id, {"Arn": arn, "DomainName": f"{dist_id}.cloudfront.net", "Id": dist_id}
 
 
 def _cf_distribution_delete(physical_id, props):
     _cf._distributions.pop(physical_id, None)
+    _cf._invalidations.pop(physical_id, None)
 
 
 # ---------------------------------------------------------------------------
