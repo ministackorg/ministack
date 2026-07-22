@@ -29,6 +29,7 @@ STATE_FORMAT_VERSION = 2
 SERVICE_STATE_FORMAT_VERSIONS = {
     "ecs": 3,
     "resource_groups": 3,
+    "codebuild": 3,
 }
 
 
