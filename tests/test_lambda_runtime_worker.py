@@ -1,5 +1,5 @@
 """
-Unit tests for Worker resource-cleanup fixes:
+Unit tests for the Lambda warm-worker runtime:
 
   test_tmpdir_cleaned_before_respawn
     -- _spawn() must shutil.rmtree the old tmpdir before mkdtemp on re-spawn.
@@ -7,10 +7,13 @@ Unit tests for Worker resource-cleanup fixes:
   test_process_terminated_on_error_response
     -- invoke() must call proc.terminate() when the handler returns status=error.
 
-Both tests mock subprocess so no running Docker/Ministack instance is required.
+The cleanup/protocol tests mock subprocesses; context coverage runs a real local
+Python worker. No Docker or running Ministack instance is required.
 """
 
+import io
 import json
+import zipfile
 from unittest.mock import MagicMock, mock_open, patch
 
 from ministack.core.lambda_runtime import Worker
@@ -141,6 +144,53 @@ def test_process_terminated_on_error_response():
     assert result["status"] == "error", "invoke() should surface the error status"
     proc.terminate.assert_called_once_with()
     assert worker._proc is None, "_proc must be cleared after an error response"
+
+
+def test_python_worker_exposes_standard_lambda_context_fields():
+    """Warm Python workers expose the context fields documented by Lambda."""
+    code = """\
+import os
+
+def handler(event, context):
+    return {
+        "function_name": context.function_name,
+        "function_version": context.function_version,
+        "memory_limit_in_mb": context.memory_limit_in_mb,
+        "invoked_function_arn": context.invoked_function_arn,
+        "aws_request_id": context.aws_request_id,
+        "log_group_name": context.log_group_name,
+        "log_stream_name": context.log_stream_name,
+        "env_log_stream_name": os.environ["AWS_LAMBDA_LOG_STREAM_NAME"],
+        "identity": context.identity,
+        "client_context": context.client_context,
+        "remaining_time": context.get_remaining_time_in_millis(),
+    }
+"""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("index.py", code)
+
+    config = _config()
+    config["Version"] = "$LATEST"
+    worker = Worker("test-fn", config, buf.getvalue())
+    try:
+        result = worker.invoke({}, request_id="context-request-id")
+    finally:
+        worker.kill()
+
+    assert result["status"] == "ok", result
+    context = result["result"]
+    assert context["function_name"] == "test-fn"
+    assert context["function_version"] == "$LATEST"
+    assert context["memory_limit_in_mb"] == 128
+    assert context["invoked_function_arn"] == config["FunctionArn"]
+    assert context["aws_request_id"] == "context-request-id"
+    assert context["log_group_name"] == "/aws/lambda/test-fn"
+    assert context["log_stream_name"]
+    assert context["log_stream_name"] == context["env_log_stream_name"]
+    assert context["identity"] is None
+    assert context["client_context"] is None
+    assert 0 < context["remaining_time"] <= 30_000
 
 
 def test_invoke_ignores_json_logs_on_stdout():
