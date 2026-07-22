@@ -4649,7 +4649,7 @@ def handle_login_submit(method, path, headers, body, query_params):
         _pending_new_password[np_token] = {
             "pool_id": pool_id,
             "client_id": client_id,
-            "username": username,
+            "username": user["Username"],
             "redirect_uri": redirect_uri,
             "scope": scope,
             "state": state,
@@ -4663,7 +4663,7 @@ def handle_login_submit(method, path, headers, body, query_params):
         return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
 
     return _issue_auth_code_redirect(
-        client_id, pool_id, redirect_uri, scope, username, nonce,
+        client_id, pool_id, redirect_uri, scope, user["Username"], nonce,
         code_challenge, code_challenge_method, state,
     )
 
@@ -4710,7 +4710,7 @@ def _handle_new_password_submit(np_token, form):
 
     return _issue_auth_code_redirect(
         session["client_id"], session["pool_id"], session["redirect_uri"], session["scope"],
-        session["username"], session["nonce"], session["code_challenge"],
+        user["Username"], session["nonce"], session["code_challenge"],
         session["code_challenge_method"], session["state"],
     )
 
