@@ -2089,6 +2089,46 @@ def _apigw_stage_delete(physical_id, props):
     _apigw_v1._delete_stage(api_id, stage_name)
 
 
+# --- API Gateway BasePathMapping ---
+
+def _apigw_base_path_mapping_identity(props):
+    domain_name = props.get("DomainName", "")
+    base_path = props.get("BasePath") or "(none)"
+    return domain_name, base_path, f"{domain_name}/{base_path}"
+
+
+def _apigw_base_path_mapping_create(logical_id, props, stack_name):
+    domain_name, base_path, physical_id = _apigw_base_path_mapping_identity(props)
+    data = {
+        "basePath": base_path,
+        "restApiId": props.get("RestApiId", ""),
+        "stage": props.get("Stage", ""),
+    }
+    status, _headers, body = _apigw_v1._create_base_path_mapping(domain_name, data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::BasePathMapping create failed: {body!r}")
+    return physical_id, {}
+
+
+def _apigw_base_path_mapping_update(physical_id, old_props, new_props, stack_name):
+    old_domain, old_base_path, _old_id = _apigw_base_path_mapping_identity(old_props)
+    new_domain, new_base_path, _new_id = _apigw_base_path_mapping_identity(new_props)
+
+    # BasePath and DomainName require replacement; RestApiId and Stage update
+    # without interruption. The in-memory API Gateway implementation treats a
+    # create against an existing key as an upsert, which gives both paths the
+    # same atomic create-before-delete behavior here.
+    new_id, attrs = _apigw_base_path_mapping_create(physical_id, new_props, stack_name)
+    if (new_domain, new_base_path) != (old_domain, old_base_path):
+        _apigw_v1._delete_base_path_mapping(old_domain, old_base_path)
+    return new_id, attrs
+
+
+def _apigw_base_path_mapping_delete(physical_id, props):
+    domain_name, base_path, _mapping_id = _apigw_base_path_mapping_identity(props)
+    _apigw_v1._delete_base_path_mapping(domain_name, base_path)
+
+
 def _apigw_account_create(logical_id, props, stack_name):
     """``AWS::ApiGateway::Account`` is a singleton per AWS account storing the
     IAM role API Gateway uses to push logs to CloudWatch. CDK's
@@ -4895,6 +4935,11 @@ _RESOURCE_HANDLERS = {
     "AWS::ApiGateway::Authorizer": {"create": _apigw_authorizer_create, "delete": _apigw_authorizer_delete},
     "AWS::ApiGateway::Deployment": {"create": _apigw_deployment_create, "delete": _apigw_deployment_delete},
     "AWS::ApiGateway::Stage": {"create": _apigw_stage_create, "delete": _apigw_stage_delete},
+    "AWS::ApiGateway::BasePathMapping": {
+        "create": _apigw_base_path_mapping_create,
+        "update": _apigw_base_path_mapping_update,
+        "delete": _apigw_base_path_mapping_delete,
+    },
     "AWS::ApiGateway::Account": {"create": _apigw_account_create, "delete": _apigw_account_delete},
     "AWS::ApiGateway::DomainName": {
         "create": _apigw_domain_name_create,
