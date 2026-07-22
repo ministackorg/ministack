@@ -683,6 +683,8 @@ def _lambda_create(logical_id, props, stack_name):
         "next_version": 1,
         "tags": {},
         "policy": {"Version": "2012-10-17", "Id": "default", "Statement": []},
+        "event_invoke_config": None,
+        "event_invoke_configs": {},
         "aliases": {},
         "concurrency": None,
         "provisioned_concurrency": {},
@@ -2246,6 +2248,68 @@ def _lambda_esm_update(physical_id, old_props, new_props, stack_name):
         esm["FunctionArn"] = func_arn + (f":{qualifier}" if qualifier else "")
     esm["LastModified"] = int(time.time())
     return physical_id, {"UUID": physical_id}
+
+
+# --- Lambda EventInvokeConfig ---
+
+def _lambda_event_invoke_config_create(logical_id, props, stack_name):
+    func, func_name, _resource_arn, _embedded_qualifier = _lambda_function_for_cfn_ref(
+        props.get("FunctionName", "")
+    )
+    qualifier = props.get("Qualifier", "")
+    if func is None:
+        raise ValueError(f"Lambda function not found: {props.get('FunctionName', '')}")
+    if not qualifier or not _lambda_svc._function_qualifier_exists(func, qualifier):
+        raise ValueError(f"Lambda function qualifier not found: {func_name}:{qualifier}")
+
+    data = {
+        key: props[key]
+        for key in (
+            "DestinationConfig",
+            "MaximumEventAgeInSeconds",
+            "MaximumRetryAttempts",
+        )
+        if key in props
+    }
+    status, _headers, body = _lambda_svc._put_event_invoke_config(
+        func_name, qualifier, data
+    )
+    if status >= 400:
+        raise ValueError(
+            f"AWS::Lambda::EventInvokeConfig create failed: {body.decode('utf-8')}"
+        )
+    return f"{func_name}:{qualifier}", {}
+
+
+def _lambda_event_invoke_config_update(physical_id, old_props, new_props, stack_name):
+    replacement = any(
+        old_props.get(key) != new_props.get(key)
+        for key in ("FunctionName", "Qualifier")
+    )
+    new_id, attrs = _lambda_event_invoke_config_create(
+        physical_id, new_props, stack_name
+    )
+    if replacement:
+        _lambda_event_invoke_config_delete(physical_id, old_props)
+        return new_id, attrs
+    return physical_id, attrs
+
+
+def _lambda_event_invoke_config_delete(physical_id, props):
+    func, func_name, _resource_arn, _embedded_qualifier = _lambda_function_for_cfn_ref(
+        props.get("FunctionName", "")
+    )
+    if func is None:
+        return
+    qualifier = props.get("Qualifier", "") or None
+    status, _headers, _body = _lambda_svc._delete_event_invoke_config(
+        func_name, qualifier
+    )
+    # Stack rollback/delete is idempotent when the config has already gone.
+    if status not in (204, 404):
+        raise ValueError(
+            f"AWS::Lambda::EventInvokeConfig delete failed with status {status}"
+        )
 
 
 # --- EventBridge Pipes (minimal: DynamoDB Streams -> SNS) ---
@@ -4763,6 +4827,11 @@ _RESOURCE_HANDLERS = {
         "delete": _apigw_gateway_response_delete,
     },
     "AWS::Lambda::EventSourceMapping": {"create": _lambda_esm_create, "update": _lambda_esm_update, "delete": _lambda_esm_delete},
+    "AWS::Lambda::EventInvokeConfig": {
+        "create": _lambda_event_invoke_config_create,
+        "update": _lambda_event_invoke_config_update,
+        "delete": _lambda_event_invoke_config_delete,
+    },
     "AWS::Pipes::Pipe": {"create": _pipes_pipe_create, "delete": _pipes_pipe_delete},
     "AWS::Lambda::Alias": {"create": _lambda_alias_create, "delete": _lambda_alias_delete},
     "AWS::SQS::QueuePolicy": {"create": _sqs_queue_policy_create, "delete": _sqs_queue_policy_delete},

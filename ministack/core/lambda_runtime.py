@@ -81,7 +81,7 @@ _lock = threading.Lock()
 # ---------------------------------------------------------------------------
 
 _PYTHON_WORKER_SCRIPT = '''
-import sys, json, importlib, traceback, os
+import sys, json, importlib, traceback, os, time
 
 def run():
     # Redirect print() to stderr so stdout stays clean for JSON-line protocol
@@ -133,11 +133,19 @@ def run():
             os.environ["_X_AMZN_TRACE_ID"] = _xray_tid
         elif "_X_AMZN_TRACE_ID" in os.environ:
             del os.environ["_X_AMZN_TRACE_ID"]
+        _function_name = init.get("function_name", "")
+        _deadline = time.time() + float(os.environ.get("_LAMBDA_TIMEOUT", "3"))
         context = type("Context", (), {
             "function_name": init.get("function_name", ""),
+            "function_version": os.environ.get("AWS_LAMBDA_FUNCTION_VERSION", "$LATEST"),
             "memory_limit_in_mb": init.get("memory", 128),
             "invoked_function_arn": init.get("arn", ""),
             "aws_request_id": event.pop("_request_id", ""),
+            "log_group_name": os.environ.get("AWS_LAMBDA_LOG_GROUP_NAME", "/aws/lambda/" + _function_name),
+            "log_stream_name": os.environ.get("AWS_LAMBDA_LOG_STREAM_NAME", ""),
+            "identity": None,
+            "client_context": None,
+            "get_remaining_time_in_millis": lambda self: max(0, int((_deadline - time.time()) * 1000)),
         })()
         try:
             result = handler_fn(event, context)

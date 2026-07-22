@@ -480,6 +480,7 @@ subnet = ec2.create_subnet(
 | `AWS::Lambda::Version` | Version ARN | Version |
 | `AWS::Lambda::Alias` | Alias ARN | — |
 | `AWS::Lambda::EventSourceMapping` | UUID | — |
+| `AWS::Lambda::EventInvokeConfig` | Unique function/qualifier identifier | — |
 | `AWS::S3::BucketPolicy` | Bucket name | — |
 | `AWS::SQS::QueuePolicy` | Policy ID | — |
 | `AWS::SNS::TopicPolicy` | Policy ID | — |

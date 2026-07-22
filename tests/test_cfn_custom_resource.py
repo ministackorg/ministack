@@ -114,6 +114,37 @@ def handler(event, context):
 """
 
 
+_CR_HANDLER_CDK_COMPAT = """\
+import json, urllib.request
+
+def handler(event, context):
+    props = event["ResourceProperties"]
+    managed = props.get("Managed", "true").lower() == "true"
+    skip_validation = props.get("SkipDestinationValidation", "false").lower() == "true"
+    payload = json.dumps({
+        "Status": "SUCCESS",
+        "Reason": f"See the details in CloudWatch Log Stream: {context.log_stream_name}",
+        "RequestId": event["RequestId"],
+        "StackId": event["StackId"],
+        "LogicalResourceId": event["LogicalResourceId"],
+        "PhysicalResourceId": "cdk-compatible-resource",
+        "Data": {
+            "Managed": str(managed),
+            "SkipDestinationValidation": str(skip_validation),
+            "NestedEnabled": props["Nested"]["Enabled"],
+            "NestedCount": props["Nested"]["Count"],
+        },
+    }).encode()
+    req = urllib.request.Request(
+        event["ResponseURL"],
+        data=payload,
+        method="PUT",
+        headers={"content-type": "", "content-length": str(len(payload))},
+    )
+    urllib.request.urlopen(req, timeout=10)
+"""
+
+
 def test_custom_resource_create_success(cfn, lam):
     lam.create_function(
         FunctionName="cr-test-success",
@@ -136,6 +167,50 @@ def test_custom_resource_create_success(cfn, lam):
         cfn.delete_stack(StackName="cr-t01")
         _wait_stack(cfn, "cr-t01")
         lam.delete_function(FunctionName="cr-test-success")
+
+
+def test_custom_resource_cdk_boolean_properties_and_lambda_context(cfn, lam):
+    """CDK-style handlers receive string leaves and standard Lambda context."""
+    lam.create_function(
+        FunctionName="cr-test-cdk-compat",
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(_CR_HANDLER_CDK_COMPAT)},
+    )
+    props = {
+        "ServiceTimeout": "2",
+        "Managed": True,
+        "SkipDestinationValidation": False,
+        "Nested": {"Enabled": True, "Count": 2},
+    }
+    outputs = {
+        "Managed": {"Value": {"Fn::GetAtt": ["CR", "Managed"]}},
+        "SkipDestinationValidation": {
+            "Value": {"Fn::GetAtt": ["CR", "SkipDestinationValidation"]}
+        },
+        "NestedEnabled": {"Value": {"Fn::GetAtt": ["CR", "NestedEnabled"]}},
+        "NestedCount": {"Value": {"Fn::GetAtt": ["CR", "NestedCount"]}},
+    }
+    try:
+        cfn.create_stack(
+            StackName="cr-t01-cdk-compat",
+            TemplateBody=_cfn_template("cr-test-cdk-compat", extra_props=props, outputs=outputs),
+        )
+        stack = _wait_stack(cfn, "cr-t01-cdk-compat")
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        values = {item["OutputKey"]: item["OutputValue"] for item in stack.get("Outputs", [])}
+        assert values == {
+            "Managed": "True",
+            "SkipDestinationValidation": "False",
+            "NestedEnabled": "true",
+            "NestedCount": "2",
+        }
+    finally:
+        cfn.delete_stack(StackName="cr-t01-cdk-compat")
+        _wait_stack(cfn, "cr-t01-cdk-compat")
+        lam.delete_function(FunctionName="cr-test-cdk-compat")
 
 
 def test_custom_resource_type_prefix(cfn, lam):

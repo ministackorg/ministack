@@ -1187,6 +1187,91 @@ def test_cfn_lambda_version(cfn, lam):
     lam.delete_function(FunctionName="cfn-ver-fn")
 
 
+def test_cfn_lambda_event_invoke_config_lifecycle(cfn, lam):
+    """AWS::Lambda::EventInvokeConfig creates, updates, and deletes cleanly."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cfn-event-invoke-{suffix}"
+    stack_name = f"cfn-event-invoke-{suffix}"
+    destination = f"arn:aws:sqs:us-east-1:000000000000:failure-{suffix}"
+    code = "def handler(e,c): return {}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.11",
+        Role="arn:aws:iam::000000000000:role/r",
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+
+    def template(retries, event_age):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "InvokeConfig": {
+                    "Type": "AWS::Lambda::EventInvokeConfig",
+                    "Properties": {
+                        "FunctionName": fn,
+                        "Qualifier": "$LATEST",
+                        "MaximumRetryAttempts": retries,
+                        "MaximumEventAgeInSeconds": event_age,
+                        "DestinationConfig": {
+                            "OnFailure": {"Destination": destination},
+                        },
+                    },
+                },
+            },
+            "Outputs": {
+                "InvokeConfigId": {"Value": {"Ref": "InvokeConfig"}},
+            },
+        }
+
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template(1, 300)),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert stack["Outputs"][0]["OutputValue"] == f"{fn}:$LATEST"
+
+        config = lam.get_function_event_invoke_config(
+            FunctionName=fn, Qualifier="$LATEST"
+        )
+        assert config["FunctionArn"].endswith(f":function:{fn}:$LATEST")
+        assert config["MaximumRetryAttempts"] == 1
+        assert config["MaximumEventAgeInSeconds"] == 300
+        assert config["DestinationConfig"]["OnFailure"]["Destination"] == destination
+
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template(0, 120)),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        updated = lam.get_function_event_invoke_config(
+            FunctionName=fn, Qualifier="$LATEST"
+        )
+        assert updated["MaximumRetryAttempts"] == 0
+        assert updated["MaximumEventAgeInSeconds"] == 120
+
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        with pytest.raises(ClientError) as exc:
+            lam.get_function_event_invoke_config(
+                FunctionName=fn, Qualifier="$LATEST"
+            )
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        except Exception:
+            pass
+        lam.delete_function(FunctionName=fn)
+
+
 def test_cfn_esm_filter_criteria_round_trips(cfn, lam, ddb):
     code = "def handler(e,c): return {'ok': True}"
     buf = io.BytesIO()

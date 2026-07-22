@@ -42,6 +42,25 @@ def _response_url(token: str) -> str:
     return f"http://{_HOST}:{_PORT}/_ministack/cfn-response/{token}"
 
 
+def _normalise_resource_properties(value):
+    """Match CloudFormation's custom-resource property wire representation.
+
+    CloudFormation preserves maps and lists in ``ResourceProperties`` but
+    serialises primitive property values as strings.  CDK's bundled custom
+    resource handlers rely on this behaviour (for example, the S3 bucket
+    notifications handler calls ``.lower()`` on boolean template properties).
+    """
+    if isinstance(value, dict):
+        return {key: _normalise_resource_properties(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_normalise_resource_properties(item) for item in value]
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return value
+
+
 def invoke_custom_resource(
     request_type: str,
     logical_id: str,
@@ -102,12 +121,12 @@ def invoke_custom_resource(
         "ResponseURL": _response_url(token),
         "ResourceType": resource_type,
         "LogicalResourceId": logical_id,
-        "ResourceProperties": dict(props),
+        "ResourceProperties": _normalise_resource_properties(props),
     }
     if physical_id is not None:
         cfn_event["PhysicalResourceId"] = physical_id
     if old_props is not None:
-        cfn_event["OldResourceProperties"] = dict(old_props)
+        cfn_event["OldResourceProperties"] = _normalise_resource_properties(old_props)
 
     event_obj = register_token(token)
 
