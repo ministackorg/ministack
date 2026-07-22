@@ -2079,8 +2079,9 @@ def _apigw_stage_create(logical_id, props, stack_name):
         "tags": {t["Key"]: t["Value"] for t in props.get("Tags", [])},
     }
     _apigw_v1._create_stage(api_id, data)
-    pid = f"{api_id}-{stage_name}"
-    return pid, {"StageName": stage_name}
+    # AWS::ApiGateway::Stage Ref returns the stage name. The physical ID feeds
+    # MiniStack's generic Ref resolver, so it must not include the REST API ID.
+    return stage_name, {"StageName": stage_name}
 
 
 def _apigw_stage_delete(physical_id, props):

@@ -4431,6 +4431,58 @@ def test_cfn_apigateway_account_provisions(cfn, apigw_v1):
     _wait_stack(cfn, stack_name)
 
 
+def test_cfn_apigateway_stage_ref_returns_stage_name(cfn, apigw_v1):
+    """Stage Ref is directly usable as the stageName in API Gateway calls.
+
+    Regression for #1161: MiniStack previously returned ``<api-id>-<stage>``
+    from Ref, causing dependent custom resources to fail GetStage with
+    ``Invalid Stage identifier specified``.
+    """
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-apigw-stage-ref-{suffix}"
+    stage_name = "prod"
+    template = {
+        "Resources": {
+            "Api": {
+                "Type": "AWS::ApiGateway::RestApi",
+                "Properties": {"Name": f"stage-ref-{suffix}"},
+            },
+            "Deployment": {
+                "Type": "AWS::ApiGateway::Deployment",
+                "Properties": {"RestApiId": {"Ref": "Api"}},
+            },
+            "Stage": {
+                "Type": "AWS::ApiGateway::Stage",
+                "Properties": {
+                    "RestApiId": {"Ref": "Api"},
+                    "DeploymentId": {"Ref": "Deployment"},
+                    "StageName": stage_name,
+                },
+            },
+        },
+        "Outputs": {
+            "ApiId": {"Value": {"Ref": "Api"}},
+            "StageName": {"Value": {"Ref": "Stage"}},
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    outputs = {item["OutputKey"]: item["OutputValue"] for item in stack.get("Outputs", [])}
+    assert outputs["StageName"] == stage_name
+
+    stage = apigw_v1.get_stage(
+        restApiId=outputs["ApiId"],
+        stageName=outputs["StageName"],
+    )
+    assert stage["stageName"] == stage_name
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
 def test_cfn_apigateway_domain_name_lifecycle(cfn, apigw_v1):
     """CloudFormation provisions CDK-style regional and edge custom domains."""
     suffix = _uuid_mod.uuid4().hex[:8]
