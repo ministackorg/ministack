@@ -431,3 +431,93 @@ def test_opensearch_dataplane_cluster_health():
         pytest.fail(f"cluster never became healthy: {last_err!r}")
     finally:
         o.delete_domain(DomainName=name)
+
+
+# ---------------------------------------------------------------------------
+# Packages
+# ---------------------------------------------------------------------------
+
+
+def _pkg_source():
+    return {"S3BucketName": "my-bucket", "S3Key": "synonyms.txt"}
+
+
+def test_opensearch_package_create_describe_update(os_client):
+    name = f"pkg-{_uid()}"
+    created = os_client.create_package(
+        PackageName=name,
+        PackageType="TXT-DICTIONARY",
+        PackageDescription="synonyms",
+        PackageSource=_pkg_source(),
+    )["PackageDetails"]
+    pid = created["PackageID"]
+    try:
+        assert created["PackageStatus"] == "AVAILABLE"
+        assert created["AvailablePackageVersion"] == "1"
+        # PackageSource is input-only — AWS does not echo it from the API.
+        assert "PackageSource" not in created
+
+        described = os_client.describe_packages(
+            Filters=[{"Name": "PackageID", "Value": [pid]}]
+        )["PackageDetailsList"]
+        assert len(described) == 1
+        assert described[0]["PackageName"] == name
+        assert described[0]["PackageStatus"] == "AVAILABLE"
+
+        updated = os_client.update_package(
+            PackageID=pid,
+            PackageSource={"S3BucketName": "my-bucket", "S3Key": "synonyms-v2.txt"},
+        )["PackageDetails"]
+        assert updated["AvailablePackageVersion"] == "2"
+        assert updated["PackageStatus"] == "AVAILABLE"
+    finally:
+        os_client.delete_package(PackageID=pid)
+
+    # A deleted package no longer appears in DescribePackages.
+    assert os_client.describe_packages(
+        Filters=[{"Name": "PackageID", "Value": [pid]}]
+    )["PackageDetailsList"] == []
+
+
+def test_opensearch_package_associate_list_dissociate(os_client):
+    domain = f"pkgdom-{_uid()}"
+    name = f"pkg-{_uid()}"
+    os_client.create_domain(DomainName=domain)
+    pid = os_client.create_package(
+        PackageName=name, PackageType="TXT-DICTIONARY", PackageSource=_pkg_source(),
+    )["PackageDetails"]["PackageID"]
+    try:
+        assoc = os_client.associate_package(PackageID=pid, DomainName=domain)[
+            "DomainPackageDetails"
+        ]
+        assert assoc["DomainPackageStatus"] == "ACTIVE"
+        assert assoc["PackageID"] == pid
+        assert assoc["DomainName"] == domain
+
+        listed = os_client.list_packages_for_domain(DomainName=domain)[
+            "DomainPackageDetailsList"
+        ]
+        assert [d["PackageID"] for d in listed] == [pid]
+
+        dissoc = os_client.dissociate_package(PackageID=pid, DomainName=domain)[
+            "DomainPackageDetails"
+        ]
+        assert dissoc["DomainPackageStatus"] == "DISSOCIATING"
+        assert os_client.list_packages_for_domain(DomainName=domain)[
+            "DomainPackageDetailsList"
+        ] == []
+    finally:
+        os_client.delete_package(PackageID=pid)
+        os_client.delete_domain(DomainName=domain)
+
+
+def test_opensearch_package_not_found_errors(os_client):
+    with pytest.raises(ClientError) as exc:
+        os_client.update_package(PackageID="Fmissing", PackageSource=_pkg_source())
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    with pytest.raises(ClientError) as exc:
+        os_client.delete_package(PackageID="Fmissing")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    with pytest.raises(ClientError) as exc:
+        os_client.associate_package(PackageID="Fmissing", DomainName="missing-domain")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"

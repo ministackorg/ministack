@@ -3208,6 +3208,55 @@ Outputs:
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
+def test_cfn_cognito_user_pool_resource_server(cfn, cognito_idp):
+    """CFN AWS::Cognito::UserPoolResourceServer creates a resource server
+    whose Ref resolves to its Identifier, matching real AWS."""
+    template = """
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  Pool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: cfn-resource-server-pool
+  ApiResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref Pool
+      Identifier: API
+      Name: API
+      Scopes:
+        - ScopeName: resource.get
+          ScopeDescription: Read access
+Outputs:
+  PoolId:
+    Value: !Ref Pool
+  ResourceServerRef:
+    Value: !Ref ApiResourceServer
+"""
+    stack_name = "cfn-resource-server"
+    try:
+        cfn.delete_stack(StackName=stack_name)
+    except Exception:
+        pass
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    _wait_stack(cfn, stack_name)
+
+    stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    assert outputs["ResourceServerRef"] == "API"
+
+    server = cognito_idp.describe_resource_server(
+        UserPoolId=outputs["PoolId"], Identifier="API",
+    )["ResourceServer"]
+    assert server["Name"] == "API"
+    assert server["Scopes"] == [{"ScopeName": "resource.get", "ScopeDescription": "Read access"}]
+
+    cfn.delete_stack(StackName=stack_name)
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.describe_resource_server(UserPoolId=outputs["PoolId"], Identifier="API")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 # ---------------------------------------------------------------------------
 # ApiGatewayV2 Integration + Route provisioners
 # ---------------------------------------------------------------------------
