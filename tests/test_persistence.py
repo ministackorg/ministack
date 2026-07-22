@@ -1868,6 +1868,37 @@ def test_appsync_region_scoped_state_is_rejected_by_v2_reader(
     assert persistence.load_state("appsync") is None
 
 
+def test_inspector2_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject Inspector2 regional account buckets."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    configs = AccountRegionScopedDict()
+    configs.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "000000000000",
+        {"ecr": {"status": "ENABLED"}},
+    )
+    persistence.save_state("inspector2", {"account_config": configs})
+
+    raw = _json.loads((tmp_path / "inspector2.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded = persistence.load_state("inspector2")["account_config"]
+    assert loaded.get_scoped(
+        "000000000000", "us-west-2", "000000000000"
+    ) == {"ecr": {"status": "ENABLED"}}
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("inspector2") is None
+
+
 def test_resource_groups_region_scoped_state_is_rejected_by_v2_reader(
     monkeypatch, tmp_path
 ):
