@@ -1186,6 +1186,91 @@ def test_cfn_lambda_version(cfn, lam):
     lam.delete_function(FunctionName="cfn-ver-fn")
 
 
+def test_cfn_lambda_event_invoke_config_lifecycle(cfn, lam):
+    """AWS::Lambda::EventInvokeConfig creates, updates, and deletes cleanly."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cfn-event-invoke-{suffix}"
+    stack_name = f"cfn-event-invoke-{suffix}"
+    destination = f"arn:aws:sqs:us-east-1:000000000000:failure-{suffix}"
+    code = "def handler(e,c): return {}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.11",
+        Role="arn:aws:iam::000000000000:role/r",
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+
+    def template(retries, event_age):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "InvokeConfig": {
+                    "Type": "AWS::Lambda::EventInvokeConfig",
+                    "Properties": {
+                        "FunctionName": fn,
+                        "Qualifier": "$LATEST",
+                        "MaximumRetryAttempts": retries,
+                        "MaximumEventAgeInSeconds": event_age,
+                        "DestinationConfig": {
+                            "OnFailure": {"Destination": destination},
+                        },
+                    },
+                },
+            },
+            "Outputs": {
+                "InvokeConfigId": {"Value": {"Ref": "InvokeConfig"}},
+            },
+        }
+
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template(1, 300)),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert stack["Outputs"][0]["OutputValue"] == f"{fn}:$LATEST"
+
+        config = lam.get_function_event_invoke_config(
+            FunctionName=fn, Qualifier="$LATEST"
+        )
+        assert config["FunctionArn"].endswith(f":function:{fn}:$LATEST")
+        assert config["MaximumRetryAttempts"] == 1
+        assert config["MaximumEventAgeInSeconds"] == 300
+        assert config["DestinationConfig"]["OnFailure"]["Destination"] == destination
+
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template(0, 120)),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        updated = lam.get_function_event_invoke_config(
+            FunctionName=fn, Qualifier="$LATEST"
+        )
+        assert updated["MaximumRetryAttempts"] == 0
+        assert updated["MaximumEventAgeInSeconds"] == 120
+
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        with pytest.raises(ClientError) as exc:
+            lam.get_function_event_invoke_config(
+                FunctionName=fn, Qualifier="$LATEST"
+            )
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        except Exception:
+            pass
+        lam.delete_function(FunctionName=fn)
+
+
 def test_cfn_esm_filter_criteria_round_trips(cfn, lam, ddb):
     code = "def handler(e,c): return {'ok': True}"
     buf = io.BytesIO()
@@ -3888,6 +3973,48 @@ def test_cfn_cloudfront_keyvaluestore_create_update_delete(cfn, cloudfront):
     assert exc.value.response["Error"]["Code"] == "EntityNotFound"
 
 
+def test_cfn_cloudfront_distribution_supports_invalidations(cfn, cloudfront):
+    """A distribution provisioned through CloudFormation must initialize the
+    invalidation state used by the native CloudFront API (#1147)."""
+    stack_name = f"cfn-cloudfront-invalidation-{_uuid_mod.uuid4().hex[:8]}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Distribution": {
+                "Type": "AWS::CloudFront::Distribution",
+                "Properties": {
+                    "DistributionConfig": {
+                        "Enabled": True,
+                    },
+                },
+            },
+        },
+        "Outputs": {
+            "DistributionId": {"Value": {"Ref": "Distribution"}},
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+    dist_id = outputs["DistributionId"]
+    response = cloudfront.create_invalidation(
+        DistributionId=dist_id,
+        InvalidationBatch={
+            "Paths": {"Quantity": 1, "Items": ["/*"]},
+            "CallerReference": f"cfn-invalidation-{_uuid_mod.uuid4().hex}",
+        },
+    )
+    assert response["Invalidation"]["Status"] == "Completed"
+    assert response["Invalidation"]["InvalidationBatch"]["Paths"]["Items"] == ["/*"]
+
+    cfn.delete_stack(StackName=stack_name)
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "DELETE_COMPLETE"
+
+
 def test_cfn_auto_named_s3_bucket_stable_across_updates(cfn, s3):
     """Regression: auto-named S3 buckets (no explicit BucketName) must keep
     the same physical resource ID across stack updates.  Before the fix,
@@ -4016,6 +4143,72 @@ def test_cfn_lambda_s3_ref_bucket_has_code_size(cfn, lam, s3):
     _wait_stack(cfn, stack_name)
 
 
+# -- AWS::ApiGateway::Model --------------------------------------------
+
+
+def test_cfn_apigateway_model_lifecycle(cfn, apigw_v1):
+    """A CDK-style API Gateway model provisions, updates, and deletes through
+    CloudFormation; Ref resolves to the model name and Schema is normalized
+    from CFN's JSON value to the API Gateway string representation."""
+    api_id = apigw_v1.create_rest_api(name="cfn-model-api")["id"]
+    stack_name = f"intg-cfn-model-{_uuid_mod.uuid4().hex[:8]}"
+    model_name = f"AggregatedMetric{_uuid_mod.uuid4().hex[:8]}"
+    schema = {
+        "$schema": "http://json-schema.org/draft-04/schema#",
+        "title": "AggregatedMetric",
+        "type": "object",
+        "properties": {
+            "metric": {"type": "string"},
+            "value": {"type": "number"},
+        },
+        "required": ["metric", "value"],
+    }
+    template = {
+        "Resources": {
+            "SchemasAggregatedMetric": {
+                "Type": "AWS::ApiGateway::Model",
+                "Properties": {
+                    "RestApiId": api_id,
+                    "Name": model_name,
+                    "ContentType": "application/json",
+                    "Description": "Aggregated metric schema",
+                    "Schema": schema,
+                },
+            },
+        },
+        "Outputs": {"ModelName": {"Value": {"Ref": "SchemasAggregatedMetric"}}},
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    assert outputs["ModelName"] == model_name
+
+    model = apigw_v1.get_model(restApiId=api_id, modelName=model_name)
+    assert model["description"] == "Aggregated metric schema"
+    assert json.loads(model["schema"]) == schema
+
+    updated = json.loads(json.dumps(template))
+    updated_props = updated["Resources"]["SchemasAggregatedMetric"]["Properties"]
+    updated_props["Description"] = "Updated schema"
+    updated_props["Schema"]["properties"]["timestamp"] = {"type": "string"}
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(updated))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+
+    model = apigw_v1.get_model(restApiId=api_id, modelName=model_name)
+    assert model["description"] == "Updated schema"
+    assert "timestamp" in json.loads(model["schema"])["properties"]
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+    with pytest.raises(ClientError) as exc:
+        apigw_v1.get_model(restApiId=api_id, modelName=model_name)
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+    apigw_v1.delete_rest_api(restApiId=api_id)
+
+
 # -- AWS::ApiGateway::Authorizer ---------------------------------------
 
 
@@ -4085,6 +4278,93 @@ def test_cfn_apigateway_account_provisions(cfn, apigw_v1):
 
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
+
+
+def test_cfn_apigateway_domain_name_lifecycle(cfn, apigw_v1):
+    """CloudFormation provisions CDK-style regional and edge custom domains."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-apigw-domain-{suffix}"
+    regional_name = f"regional-{suffix}.example.local"
+    edge_name = f"edge-{suffix}.example.local"
+    regional_certificate_arn = (
+        f"arn:aws:acm:us-east-1:000000000000:certificate/regional-{suffix}"
+    )
+    edge_certificate_arn = (
+        f"arn:aws:acm:us-east-1:000000000000:certificate/edge-{suffix}"
+    )
+    template = {
+        "Resources": {
+            "RegionalDomain": {
+                "Type": "AWS::ApiGateway::DomainName",
+                "Properties": {
+                    "DomainName": regional_name,
+                    "EndpointConfiguration": {"Types": ["REGIONAL"]},
+                    "RegionalCertificateArn": regional_certificate_arn,
+                    "SecurityPolicy": "TLS_1_2",
+                    "Tags": [{"Key": "created-by", "Value": "cloudformation"}],
+                },
+            },
+            "EdgeDomain": {
+                "Type": "AWS::ApiGateway::DomainName",
+                "Properties": {
+                    "DomainName": edge_name,
+                    "EndpointConfiguration": {"Types": ["EDGE"]},
+                    "CertificateArn": edge_certificate_arn,
+                    "SecurityPolicy": "TLS_1_2",
+                },
+            },
+        },
+        "Outputs": {
+            "RegionalRef": {"Value": {"Ref": "RegionalDomain"}},
+            "RegionalDomainName": {
+                "Value": {"Fn::GetAtt": ["RegionalDomain", "RegionalDomainName"]},
+            },
+            "RegionalHostedZoneId": {
+                "Value": {"Fn::GetAtt": ["RegionalDomain", "RegionalHostedZoneId"]},
+            },
+            "RegionalDomainNameArn": {
+                "Value": {"Fn::GetAtt": ["RegionalDomain", "DomainNameArn"]},
+            },
+            "DistributionDomainName": {
+                "Value": {"Fn::GetAtt": ["EdgeDomain", "DistributionDomainName"]},
+            },
+            "DistributionHostedZoneId": {
+                "Value": {"Fn::GetAtt": ["EdgeDomain", "DistributionHostedZoneId"]},
+            },
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    outputs = {item["OutputKey"]: item["OutputValue"] for item in stack.get("Outputs", [])}
+    assert outputs["RegionalRef"] == regional_name
+    assert outputs["RegionalDomainName"] == (
+        f"{regional_name}.execute-api.us-east-1.amazonaws.com"
+    )
+    assert outputs["RegionalHostedZoneId"] == "Z1UJRXOUMOOFQ8"
+    assert outputs["RegionalDomainNameArn"] == (
+        f"arn:aws:apigateway:us-east-1::/domainnames/{regional_name}"
+    )
+    assert outputs["DistributionDomainName"] == f"{edge_name}.cloudfront.net"
+    assert outputs["DistributionHostedZoneId"] == "Z2FDTNDATAQYW2"
+
+    regional = apigw_v1.get_domain_name(domainName=regional_name)
+    assert regional["endpointConfiguration"] == {"types": ["REGIONAL"]}
+    assert regional["regionalCertificateArn"] == regional_certificate_arn
+    assert regional["tags"] == {"created-by": "cloudformation"}
+    edge = apigw_v1.get_domain_name(domainName=edge_name)
+    assert edge["endpointConfiguration"] == {"types": ["EDGE"]}
+    assert edge["certificateArn"] == edge_certificate_arn
+
+    cfn.delete_stack(StackName=stack_name)
+    deleted = _wait_stack(cfn, stack_name)
+    assert deleted["StackStatus"] == "DELETE_COMPLETE"
+    for domain_name in (regional_name, edge_name):
+        with pytest.raises(ClientError) as exc:
+            apigw_v1.get_domain_name(domainName=domain_name)
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
 
 
 def test_cfn_apigateway_gateway_response_resolves_rest_api_ref(cfn, apigw_v1):

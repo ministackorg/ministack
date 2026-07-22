@@ -3326,6 +3326,64 @@ def test_lambda_event_invoke_config_crud(lam):
 
     lam.delete_function(FunctionName="eic-fn")
 
+
+def test_lambda_event_invoke_configs_are_isolated_by_qualifier(lam):
+    """Versions and $LATEST retain independent async invocation configs."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"eic-qualified-{suffix}"
+    code = "def handler(e,c): return {}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.11",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+    version = lam.publish_version(FunctionName=fn)["Version"]
+
+    try:
+        lam.put_function_event_invoke_config(
+            FunctionName=fn,
+            Qualifier="$LATEST",
+            MaximumRetryAttempts=0,
+        )
+        lam.put_function_event_invoke_config(
+            FunctionName=fn,
+            Qualifier=version,
+            MaximumRetryAttempts=1,
+        )
+
+        latest = lam.get_function_event_invoke_config(
+            FunctionName=fn, Qualifier="$LATEST"
+        )
+        published = lam.get_function_event_invoke_config(
+            FunctionName=fn, Qualifier=version
+        )
+        assert latest["MaximumRetryAttempts"] == 0
+        assert latest["FunctionArn"].endswith(":$LATEST")
+        assert published["MaximumRetryAttempts"] == 1
+        assert published["FunctionArn"].endswith(f":{version}")
+
+        configs = lam.list_function_event_invoke_configs(FunctionName=fn)[
+            "FunctionEventInvokeConfigs"
+        ]
+        assert {config["FunctionArn"] for config in configs} == {
+            latest["FunctionArn"], published["FunctionArn"]
+        }
+
+        lam.delete_function_event_invoke_config(
+            FunctionName=fn, Qualifier="$LATEST"
+        )
+        assert lam.get_function_event_invoke_config(
+            FunctionName=fn, Qualifier=version
+        )["MaximumRetryAttempts"] == 1
+    finally:
+        lam.delete_function(FunctionName=fn)
+
+
 def test_lambda_provisioned_concurrency_crud(lam):
     """Put/Get/Delete ProvisionedConcurrencyConfig lifecycle."""
     code = "def handler(e,c): return {}"

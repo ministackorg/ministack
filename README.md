@@ -480,14 +480,17 @@ subnet = ec2.create_subnet(
 | `AWS::Lambda::Version` | Version ARN | Version |
 | `AWS::Lambda::Alias` | Alias ARN | — |
 | `AWS::Lambda::EventSourceMapping` | UUID | — |
+| `AWS::Lambda::EventInvokeConfig` | Unique function/qualifier identifier | — |
 | `AWS::S3::BucketPolicy` | Bucket name | — |
 | `AWS::SQS::QueuePolicy` | Policy ID | — |
 | `AWS::SNS::TopicPolicy` | Policy ID | — |
 | `AWS::ApiGateway::RestApi` | API ID | RootResourceId |
 | `AWS::ApiGateway::Resource` | Resource ID | — |
 | `AWS::ApiGateway::Method` | Method ID | — |
+| `AWS::ApiGateway::Model` | Model name | — |
 | `AWS::ApiGateway::Deployment` | Deployment ID | — |
 | `AWS::ApiGateway::Stage` | Stage name | — |
+| `AWS::ApiGateway::DomainName` | Domain name | DistributionDomainName, DistributionHostedZoneId, DomainNameArn, RegionalDomainName, RegionalHostedZoneId |
 | `AWS::ApiGateway::GatewayResponse` | Response ID | Id |
 | `AWS::AppConfig::Application` | Application ID | ApplicationId |
 | `AWS::AppSync::GraphQLApi` | API ID | Arn, GraphQLUrl, ApiId |
