@@ -5120,3 +5120,5 @@ def reset():
     _auth_codes.clear()
     _authorization_codes.clear()
     _refresh_tokens.clear()
+    _challenge_sessions.clear()
+    _pending_new_password.clear()

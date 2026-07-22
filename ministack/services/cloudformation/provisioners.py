@@ -4409,8 +4409,9 @@ def _s3tables_table_create(logical_id, props, stack_name):
         if b["arn"] == bucket_arn:
             b["tableCount"] = b.get("tableCount", 0) + 1
             break
-    return table_arn, {"TableArn": table_arn, "TableBucketARN": bucket_arn,
-                       "Namespace": namespace, "TableName": table_name}
+    return table_arn, {"TableARN": table_arn, "TableBucketARN": bucket_arn,
+                       "WarehouseLocation": location, "Namespace": namespace,
+                       "TableName": table_name}
 
 
 def _s3tables_table_delete(physical_id, props):
