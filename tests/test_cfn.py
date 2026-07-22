@@ -4053,6 +4053,169 @@ def test_cfn_apigateway_account_provisions(cfn, apigw_v1):
     _wait_stack(cfn, stack_name)
 
 
+def test_cfn_apigateway_gateway_response_resolves_rest_api_ref(cfn, apigw_v1):
+    """The issue #1124 CDK shape provisions a response against a stack REST API."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-gateway-response-ref-{suffix}"
+    template = {
+        "Resources": {
+            "Api": {
+                "Type": "AWS::ApiGateway::RestApi",
+                "Properties": {"Name": f"gateway-response-ref-{suffix}"},
+            },
+            "BadRequestBody": {
+                "Type": "AWS::ApiGateway::GatewayResponse",
+                "Properties": {
+                    "RestApiId": {"Ref": "Api"},
+                    "ResponseType": "BAD_REQUEST_BODY",
+                    "StatusCode": "400",
+                    "ResponseParameters": {
+                        "gatewayresponse.header.Access-Control-Allow-Origin": "'*'",
+                    },
+                },
+            },
+        },
+        "Outputs": {"ApiId": {"Value": {"Ref": "Api"}}},
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    api_id = next(
+        item["OutputValue"]
+        for item in stack.get("Outputs", [])
+        if item["OutputKey"] == "ApiId"
+    )
+    response = apigw_v1.get_gateway_response(
+        restApiId=api_id,
+        responseType="BAD_REQUEST_BODY",
+    )
+    assert response["defaultResponse"] is False
+    assert response["responseParameters"] == {
+        "gatewayresponse.header.Access-Control-Allow-Origin": "'*'",
+    }
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_apigateway_gateway_response_lifecycle(cfn, apigw_v1):
+    """GatewayResponse creates, updates, replaces, and resets through CFN.
+
+    Regression for #1124: the resource type previously failed immediately as
+    unsupported, rolling back every CDK stack that declared a gateway response.
+    """
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-gateway-response-{suffix}"
+    api_id = apigw_v1.create_rest_api(name=f"gateway-response-{suffix}")["id"]
+    stack_deleted = False
+
+    def template(response_type, status_code, marker):
+        return {
+            "Resources": {
+                "GatewayResponse": {
+                    "Type": "AWS::ApiGateway::GatewayResponse",
+                    "Properties": {
+                        "RestApiId": api_id,
+                        "ResponseType": response_type,
+                        "StatusCode": status_code,
+                        "ResponseParameters": {
+                            "gatewayresponse.header.X-Marker": f"'{marker}'",
+                        },
+                        "ResponseTemplates": {
+                            "application/json": f'{{"marker":"{marker}"}}',
+                        },
+                    },
+                },
+            },
+            "Outputs": {
+                "GatewayResponseId": {
+                    "Value": {"Fn::GetAtt": ["GatewayResponse", "Id"]},
+                },
+            },
+        }
+
+    def physical_id():
+        detail = cfn.describe_stack_resource(
+            StackName=stack_name,
+            LogicalResourceId="GatewayResponse",
+        )["StackResourceDetail"]
+        return detail["PhysicalResourceId"]
+
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("BAD_REQUEST_BODY", "400", "created")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        created_id = physical_id()
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack.get("Outputs", [])}
+        assert outputs["GatewayResponseId"] == created_id
+
+        created = apigw_v1.get_gateway_response(
+            restApiId=api_id,
+            responseType="BAD_REQUEST_BODY",
+        )
+        assert created["defaultResponse"] is False
+        assert created["responseTemplates"] == {"application/json": '{"marker":"created"}'}
+
+        # Mutable properties update in place and keep the physical id.
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("BAD_REQUEST_BODY", "422", "updated")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() == created_id
+        updated = apigw_v1.get_gateway_response(
+            restApiId=api_id,
+            responseType="BAD_REQUEST_BODY",
+        )
+        assert updated["statusCode"] == "422"
+        assert updated["responseParameters"] == {
+            "gatewayresponse.header.X-Marker": "'updated'",
+        }
+
+        # ResponseType is immutable: replace the physical resource and reset
+        # the previous response type to its generated default.
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("BAD_REQUEST_PARAMETERS", "409", "replacement")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        replacement_id = physical_id()
+        assert replacement_id != created_id
+        assert apigw_v1.get_gateway_response(
+            restApiId=api_id,
+            responseType="BAD_REQUEST_BODY",
+        )["defaultResponse"] is True
+        assert apigw_v1.get_gateway_response(
+            restApiId=api_id,
+            responseType="BAD_REQUEST_PARAMETERS",
+        )["statusCode"] == "409"
+
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        stack_deleted = True
+        reset_response = apigw_v1.get_gateway_response(
+            restApiId=api_id,
+            responseType="BAD_REQUEST_PARAMETERS",
+        )
+        assert reset_response["defaultResponse"] is True
+        assert reset_response["statusCode"] == "400"
+    finally:
+        if not stack_deleted:
+            try:
+                cfn.delete_stack(StackName=stack_name)
+                _wait_stack(cfn, stack_name)
+            except ClientError:
+                pass
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
 # ---------------------------------------------------------------------------
 # ApiGatewayV1 Integration with OpenAPI spec parsing
 # ---------------------------------------------------------------------------
@@ -4545,3 +4708,62 @@ def test_cfn_sam_transform_missing_translator_falls_back(monkeypatch):
     # Templates that don't use the SAM transform are unaffected.
     plain = {"Resources": {"B": {"Type": "AWS::S3::Bucket", "Properties": {}}}}
     assert _apply_sam_transform_if_applicable(plain) is plain
+
+
+def test_cfn_s3tables_resources(cfn, s3tables):
+    """CloudFormation can provision AWS::S3Tables::TableBucket, Namespace, and Table."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Bucket": {
+                "Type": "AWS::S3Tables::TableBucket",
+                "Properties": {"TableBucketName": "cfn-s3tables-test"},
+            },
+            "Ns": {
+                "Type": "AWS::S3Tables::Namespace",
+                "Properties": {
+                    "TableBucketARN": {"Fn::GetAtt": ["Bucket", "TableBucketARN"]},
+                    "Namespace": "myns",
+                },
+                "DependsOn": "Bucket",
+            },
+            "Table": {
+                "Type": "AWS::S3Tables::Table",
+                "Properties": {
+                    "TableBucketARN": {"Fn::GetAtt": ["Bucket", "TableBucketARN"]},
+                    "Namespace": "myns",
+                    "TableName": "mytable",
+                    "OpenTableFormat": "ICEBERG",
+                },
+                "DependsOn": "Ns",
+            },
+        },
+        "Outputs": {
+            "BucketArn": {"Value": {"Fn::GetAtt": ["Bucket", "TableBucketARN"]}},
+            "TableArn": {"Value": {"Fn::GetAtt": ["Table", "TableArn"]}},
+        },
+    }
+
+    stack_name = "cfn-s3tables-t01"
+    try:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+    except Exception:
+        pass
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    bucket_arn = outputs["BucketArn"]
+    table_arn = outputs["TableArn"]
+    assert "cfn-s3tables-test" in bucket_arn
+    assert "mytable" in table_arn
+
+    table = s3tables.get_table(tableBucketARN=bucket_arn, namespace="myns", name="mytable")
+    assert table["name"] == "mytable"
+    assert table["format"] == "ICEBERG"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)

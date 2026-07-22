@@ -43,6 +43,10 @@ Control plane endpoints implemented:
   GET    /restapis/{id}/models                                             — GetModels
   GET    /restapis/{id}/models/{modelName}                                 — GetModel
   DELETE /restapis/{id}/models/{modelName}                                 — DeleteModel
+  PUT    /restapis/{id}/gatewayresponses/{responseType}                    — PutGatewayResponse
+  GET    /restapis/{id}/gatewayresponses                                   — GetGatewayResponses
+  GET    /restapis/{id}/gatewayresponses/{responseType}                    — GetGatewayResponse
+  DELETE /restapis/{id}/gatewayresponses/{responseType}                    — DeleteGatewayResponse
   GET    /apikeys                                                          — GetApiKeys
   POST   /apikeys                                                          — CreateApiKey
   GET    /apikeys/{keyId}                                                  — GetApiKey
@@ -115,6 +119,56 @@ _domain_name_regions = AccountScopedDict()  # domain_name -> owning region
 _base_path_mappings = AccountScopedDict()  # domain_name -> {base_path -> BasePathMapping}
 _v1_tags = AccountScopedDict()             # resource_arn -> {key -> value}
 _account_settings = AccountScopedDict()    # singleton per account: stores fields set via UpdateAccount
+_gateway_responses = AccountScopedDict()   # rest_api_id -> {response_type -> customized GatewayResponse}
+
+
+_GATEWAY_RESPONSE_TYPES = (
+    "DEFAULT_4XX",
+    "DEFAULT_5XX",
+    "RESOURCE_NOT_FOUND",
+    "UNAUTHORIZED",
+    "INVALID_API_KEY",
+    "ACCESS_DENIED",
+    "AUTHORIZER_FAILURE",
+    "AUTHORIZER_CONFIGURATION_ERROR",
+    "INVALID_SIGNATURE",
+    "EXPIRED_TOKEN",
+    "MISSING_AUTHENTICATION_TOKEN",
+    "INTEGRATION_FAILURE",
+    "INTEGRATION_TIMEOUT",
+    "API_CONFIGURATION_ERROR",
+    "UNSUPPORTED_MEDIA_TYPE",
+    "BAD_REQUEST_PARAMETERS",
+    "BAD_REQUEST_BODY",
+    "REQUEST_TOO_LARGE",
+    "THROTTLED",
+    "QUOTA_EXCEEDED",
+    "WAF_FILTERED",
+)
+
+_DEFAULT_GATEWAY_RESPONSE_STATUS_CODES = {
+    "RESOURCE_NOT_FOUND": "404",
+    "UNAUTHORIZED": "401",
+    "INVALID_API_KEY": "403",
+    "ACCESS_DENIED": "403",
+    "AUTHORIZER_FAILURE": "500",
+    "AUTHORIZER_CONFIGURATION_ERROR": "500",
+    "INVALID_SIGNATURE": "403",
+    "EXPIRED_TOKEN": "403",
+    "MISSING_AUTHENTICATION_TOKEN": "403",
+    "INTEGRATION_FAILURE": "504",
+    "INTEGRATION_TIMEOUT": "504",
+    "API_CONFIGURATION_ERROR": "500",
+    "UNSUPPORTED_MEDIA_TYPE": "415",
+    "BAD_REQUEST_PARAMETERS": "400",
+    "BAD_REQUEST_BODY": "400",
+    "REQUEST_TOO_LARGE": "413",
+    "THROTTLED": "429",
+    "QUOTA_EXCEEDED": "429",
+    "WAF_FILTERED": "403",
+}
+
+_DEFAULT_GATEWAY_RESPONSE_TEMPLATE = '{"message":$context.error.messageString}'
 
 
 # ---- Helpers ----
@@ -593,6 +647,7 @@ def get_state():
         "base_path_mappings": copy.deepcopy(_base_path_mappings),
         "v1_tags": copy.deepcopy(_v1_tags),
         "account_settings": copy.deepcopy(_account_settings),
+        "gateway_responses": copy.deepcopy(_gateway_responses),
     }
 
 
@@ -670,6 +725,7 @@ def load_persisted_state(data):
     _base_path_mappings.update(data.get("base_path_mappings", {}))
     _v1_tags.update(data.get("v1_tags", {}))
     _account_settings.update(data.get("account_settings", {}))
+    _gateway_responses.update(data.get("gateway_responses", {}))
     _backfill_tag_region_map(_rest_apis, _rest_api_regions, _region_from_rest_api_record)
     _backfill_tag_region_map(_api_keys, _api_key_regions, _region_from_api_key_record)
     _backfill_tag_region_map(_usage_plans, _usage_plan_regions, _region_from_usage_plan_record)
@@ -695,6 +751,7 @@ def reset():
     _base_path_mappings.clear()
     _v1_tags.clear()
     _account_settings.clear()
+    _gateway_responses.clear()
 
 
 # ---- Control plane router ----
@@ -964,6 +1021,20 @@ async def handle_request(method, path, headers, body, query_params):
                     return _update_model(api_id, model_name, data)
                 if method == "DELETE":
                     return _delete_model(api_id, model_name)
+
+        # /restapis/{id}/gatewayresponses[/{responseType}]
+        elif sub == "gatewayresponses":
+            response_type = parts[3] if len(parts) > 3 else None
+            if response_type is None:
+                if method == "GET":
+                    return _get_gateway_responses(api_id)
+            else:
+                if method == "PUT":
+                    return _put_gateway_response(api_id, response_type, data)
+                if method == "GET":
+                    return _get_gateway_response(api_id, response_type)
+                if method == "DELETE":
+                    return _delete_gateway_response(api_id, response_type)
 
     return _v1_error("NotFoundException", f"Unknown API Gateway v1 path: {path}", 404)
 
@@ -1321,6 +1392,7 @@ def _create_rest_api(data):
     _deployments_v1[api_id] = {}
     _authorizers_v1[api_id] = {}
     _models[api_id] = {}
+    _gateway_responses[api_id] = {}
 
     # Create root resource "/"
     root_id = _new_id()[:8]
@@ -1367,6 +1439,7 @@ def _delete_rest_api(api_id):
     _deployments_v1.pop(api_id, None)
     _authorizers_v1.pop(api_id, None)
     _models.pop(api_id, None)
+    _gateway_responses.pop(api_id, None)
     _v1_tags.pop(_rest_api_arn(api_id), None)
     return 202, {}, b""
 
@@ -1941,6 +2014,88 @@ def _delete_model(api_id, model_name):
     if model_name not in _models.get(api_id, {}):
         return _v1_error("NotFoundException", "Invalid Model identifier specified", 404)
     _models[api_id].pop(model_name, None)
+    return 202, {}, b""
+
+
+# ---- Control plane: Gateway Responses ----
+
+def _default_gateway_response(response_type):
+    """Return the API Gateway-generated response used when no customization exists."""
+    response = {
+        "defaultResponse": True,
+        "responseType": response_type,
+        "responseParameters": {},
+        "responseTemplates": {
+            "application/json": _DEFAULT_GATEWAY_RESPONSE_TEMPLATE,
+        },
+    }
+    status_code = _DEFAULT_GATEWAY_RESPONSE_STATUS_CODES.get(response_type)
+    if status_code is not None:
+        response["statusCode"] = status_code
+    return response
+
+
+def _validate_gateway_response_target(api_id, response_type):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    if response_type not in _GATEWAY_RESPONSE_TYPES:
+        return _v1_error(
+            "BadRequestException",
+            f"Invalid gateway response type: {response_type}",
+            400,
+        )
+    return None
+
+
+def _put_gateway_response(api_id, response_type, data):
+    error = _validate_gateway_response_target(api_id, response_type)
+    if error is not None:
+        return error
+
+    status_code = data.get("statusCode")
+    if status_code is not None and not re.fullmatch(r"[1-5]\d\d", str(status_code)):
+        return _v1_error(
+            "BadRequestException",
+            "Invalid status code specified",
+            400,
+        )
+
+    response = _default_gateway_response(response_type)
+    response["defaultResponse"] = False
+    if status_code is not None:
+        response["statusCode"] = str(status_code)
+    response["responseParameters"] = dict(data.get("responseParameters") or {})
+    response["responseTemplates"] = dict(data.get("responseTemplates") or {})
+    _gateway_responses.setdefault(api_id, {})[response_type] = response
+    return _v1_response(response, 201)
+
+
+def _get_gateway_response(api_id, response_type):
+    error = _validate_gateway_response_target(api_id, response_type)
+    if error is not None:
+        return error
+    response = _gateway_responses.get(api_id, {}).get(response_type)
+    return _v1_response(response or _default_gateway_response(response_type))
+
+
+def _get_gateway_responses(api_id):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    customized = _gateway_responses.get(api_id, {})
+    responses = [
+        customized.get(response_type) or _default_gateway_response(response_type)
+        for response_type in _GATEWAY_RESPONSE_TYPES
+    ]
+    # AWS returns the complete GatewayResponses collection and ignores the
+    # otherwise-standard API Gateway pagination parameters for this operation.
+    return _v1_response({"item": responses})
+
+
+def _delete_gateway_response(api_id, response_type):
+    error = _validate_gateway_response_target(api_id, response_type)
+    if error is not None:
+        return error
+    _gateway_responses.get(api_id, {}).pop(response_type, None)
     return 202, {}, b""
 
 
