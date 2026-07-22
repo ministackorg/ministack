@@ -17,23 +17,20 @@ BUCKET_ARN = "arn:aws:s3:::test-bucket"
 ROLE_ARN = "arn:aws:iam::000000000000:role/s3files-role"
 
 
-def _auth(account="000000000000"):
+def _auth(account="000000000000", region="us-east-1"):
     return (
         f"AWS4-HMAC-SHA256 "
-        f"Credential={account}/20260504/us-east-1/s3files/aws4_request, "
+        f"Credential={account}/20260504/{region}/s3files/aws4_request, "
         f"SignedHeaders=host, Signature=00"
     )
 
 
-_AUTH = _auth()
-
-
-def _req(method, path, body=None, query=None, account=None):
+def _req(method, path, body=None, query=None, account=None, region="us-east-1"):
     url = ENDPOINT + path
     if query:
         url += "?" + urllib.parse.urlencode(query, doseq=True)
     data = None
-    headers = {"Authorization": _auth(account) if account else _AUTH}
+    headers = {"Authorization": _auth(account or "000000000000", region)}
     if body is not None:
         data = json.dumps(body).encode()
         headers["Content-Type"] = "application/json"
@@ -84,6 +81,191 @@ def test_create_file_system_uses_put_and_camel_case():
     assert body["ownerId"] == "000000000000"
     fs_id = body["fileSystemId"]
     _req("DELETE", f"/file-systems/{fs_id}")
+
+
+def test_file_systems_are_region_scoped():
+    _, east_fs = _req(
+        "PUT",
+        "/file-systems",
+        {"bucket": BUCKET_ARN, "roleArn": ROLE_ARN},
+        region="us-east-1",
+    )
+    _, west_fs = _req(
+        "PUT",
+        "/file-systems",
+        {"bucket": BUCKET_ARN, "roleArn": ROLE_ARN},
+        region="us-west-2",
+    )
+    try:
+        _, east_list = _req("GET", "/file-systems", region="us-east-1")
+        _, west_list = _req("GET", "/file-systems", region="us-west-2")
+        east_ids = {fs["fileSystemId"] for fs in east_list["fileSystems"]}
+        west_ids = {fs["fileSystemId"] for fs in west_list["fileSystems"]}
+
+        assert east_fs["fileSystemId"] in east_ids
+        assert east_fs["fileSystemId"] not in west_ids
+        assert west_fs["fileSystemId"] in west_ids
+        assert west_fs["fileSystemId"] not in east_ids
+        assert ":us-east-1:" in east_fs["fileSystemArn"]
+        assert ":us-west-2:" in west_fs["fileSystemArn"]
+    finally:
+        _req(
+            "DELETE",
+            f"/file-systems/{east_fs['fileSystemId']}",
+            region="us-east-1",
+        )
+        _req(
+            "DELETE",
+            f"/file-systems/{west_fs['fileSystemId']}",
+            region="us-west-2",
+        )
+
+
+def test_legacy_child_state_restores_beside_parent_resource():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import s3files as service
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    resource_region = "us-west-2"
+    fs_id = "fs-11111111111111111"
+    mt_id = "fsmt-11111111111111111"
+    ap_id = "fsap-11111111111111111"
+    file_systems = AccountScopedDict()
+    mount_targets = AccountScopedDict()
+    access_points = AccountScopedDict()
+
+    set_request_account_id(account_id)
+    set_request_region(boot_region)
+    file_systems[fs_id] = {
+        "fileSystemId": fs_id,
+        "fileSystemArn": (
+            f"arn:aws:s3files:{resource_region}:{account_id}:file-system/{fs_id}"
+        ),
+    }
+    mount_targets[mt_id] = {"mountTargetId": mt_id, "fileSystemId": fs_id}
+    access_points[ap_id] = {
+        "accessPointId": ap_id,
+        "fileSystemId": fs_id,
+        "accessPointArn": (
+            f"arn:aws:s3files:{resource_region}:{account_id}:"
+            f"file-system/{fs_id}/access-point/{ap_id}"
+        ),
+    }
+    payload = {
+        "file_systems": file_systems,
+        "mount_targets": mount_targets,
+        "access_points": access_points,
+    }
+    for state_key, resource_id, value in (
+        ("policies", fs_id, "legacy-policy"),
+        ("sync_configs", fs_id, {"latestVersionNumber": 1}),
+        ("tags", ap_id, [{"key": "legacy", "value": "true"}]),
+    ):
+        store = AccountScopedDict()
+        store[resource_id] = value
+        payload[state_key] = store
+
+    service.reset()
+    try:
+        service.restore_state(payload)
+        assert service._file_systems.get_scoped(
+            account_id, resource_region, fs_id
+        )["fileSystemId"] == fs_id
+        assert service._mount_targets.get_scoped(
+            account_id, resource_region, mt_id
+        )["fileSystemId"] == fs_id
+        assert service._access_points.get_scoped(
+            account_id, resource_region, ap_id
+        )["fileSystemId"] == fs_id
+        assert service._policies.get_scoped(
+            account_id, resource_region, fs_id
+        ) == "legacy-policy"
+        assert service._sync_configs.get_scoped(
+            account_id, resource_region, fs_id
+        ) == {"latestVersionNumber": 1}
+        assert service._tags.get_scoped(account_id, resource_region, ap_id) == [
+            {"key": "legacy", "value": "true"}
+        ]
+    finally:
+        service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_legacy_orphaned_mount_target_restores_to_availability_zone_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import s3files as service
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    resource_region = "us-west-2"
+    mt_id = "fsmt-11111111111111111"
+    mount_targets = AccountScopedDict()
+
+    set_request_account_id(account_id)
+    set_request_region(boot_region)
+    mount_targets[mt_id] = {
+        "mountTargetId": mt_id,
+        "fileSystemId": "fs-11111111111111111",
+        "availabilityZoneId": f"{resource_region}-az1",
+    }
+
+    service.reset()
+    try:
+        service.restore_state({"mount_targets": mount_targets})
+        assert service._mount_targets.get_scoped(
+            account_id, resource_region, mt_id
+        )["mountTargetId"] == mt_id
+        assert (
+            service._mount_targets.get_scoped(account_id, boot_region, mt_id) is None
+        )
+    finally:
+        service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_reset_clears_s3files_state_across_regions():
+    from ministack.core.responses import get_region, set_request_region
+    from ministack.services import s3files as service
+
+    original_region = get_region()
+    stores = (
+        service._file_systems,
+        service._mount_targets,
+        service._access_points,
+        service._policies,
+        service._sync_configs,
+        service._tags,
+    )
+    service.reset()
+    try:
+        for region in ("us-east-1", "us-west-2"):
+            set_request_region(region)
+            for store in stores:
+                store[f"resource-{region}"] = {"region": region}
+        service.reset()
+        assert all(not store.has_any() for store in stores)
+    finally:
+        service.reset()
+        set_request_region(original_region)
 
 
 def test_create_file_system_post_is_not_supported():

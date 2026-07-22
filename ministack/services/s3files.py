@@ -23,6 +23,7 @@ from urllib.parse import unquote
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -43,12 +44,21 @@ def _empty_200():
 
 logger = logging.getLogger("s3files")
 
-_file_systems = AccountScopedDict()
-_mount_targets = AccountScopedDict()
-_access_points = AccountScopedDict()
-_policies = AccountScopedDict()
-_sync_configs = AccountScopedDict()
-_tags = AccountScopedDict()
+_file_systems = AccountRegionScopedDict()
+_mount_targets = AccountRegionScopedDict()
+_access_points = AccountRegionScopedDict()
+_policies = AccountRegionScopedDict()
+_sync_configs = AccountRegionScopedDict()
+_tags = AccountRegionScopedDict()
+
+
+def _clear_state():
+    _file_systems.clear()
+    _mount_targets.clear()
+    _access_points.clear()
+    _policies.clear()
+    _sync_configs.clear()
+    _tags.clear()
 
 
 def get_state():
@@ -65,12 +75,68 @@ def get_state():
 def restore_state(data):
     if not data:
         return
+    _clear_state()
     _file_systems.update(data.get("file_systems", {}))
-    _mount_targets.update(data.get("mount_targets", {}))
     _access_points.update(data.get("access_points", {}))
-    _policies.update(data.get("policies", {}))
-    _sync_configs.update(data.get("sync_configs", {}))
-    _tags.update(data.get("tags", {}))
+
+    resource_regions = {
+        (account_id, resource_id): region
+        for store in (_file_systems, _access_points)
+        for (account_id, region, resource_id), _resource in store.all_items()
+    }
+    _restore_child_store(
+        _mount_targets,
+        data.get("mount_targets", {}),
+        resource_regions,
+        lambda key, value: value.get("fileSystemId", key),
+        _mount_target_legacy_region,
+    )
+    for store, key in (
+        (_policies, "policies"),
+        (_sync_configs, "sync_configs"),
+        (_tags, "tags"),
+    ):
+        _restore_child_store(
+            store,
+            data.get(key, {}),
+            resource_regions,
+            lambda resource_id, _value: resource_id,
+        )
+
+
+def _mount_target_legacy_region(key, value):
+    availability_zone_id = value.get("availabilityZoneId", "")
+    region, separator, zone_id = availability_zone_id.rpartition("-az")
+    if separator and region and zone_id.isdigit():
+        return region
+    return _mount_targets._region_for_legacy_value(key, value)
+
+
+def _restore_child_store(
+    store, restored, resource_regions, parent_id, legacy_region=None
+):
+    """Adopt legacy child state into its file system or access point region."""
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+
+    if isinstance(restored, AccountScopedDict):
+        items = restored._data.items()
+    else:
+        account_id = get_account_id()
+        items = (((account_id, key), value) for key, value in restored.items())
+
+    for (account_id, key), value in items:
+        fallback_region = (
+            legacy_region(key, value)
+            if legacy_region is not None
+            else store._region_for_legacy_value(key, value)
+        )
+        region = resource_regions.get(
+            (account_id, parent_id(key, value)),
+            fallback_region,
+        )
+        store.set_scoped(account_id, region, key, value)
 
 
 try:
@@ -82,12 +148,7 @@ except Exception:
 
 
 def reset():
-    _file_systems.clear()
-    _mount_targets.clear()
-    _access_points.clear()
-    _policies.clear()
-    _sync_configs.clear()
-    _tags.clear()
+    _clear_state()
 
 
 # ---------------------------------------------------------------------------

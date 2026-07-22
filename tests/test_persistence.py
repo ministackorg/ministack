@@ -1868,6 +1868,45 @@ def test_appsync_region_scoped_state_is_rejected_by_v2_reader(
     assert persistence.load_state("appsync") is None
 
 
+def test_s3files_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject S3 Files' regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    file_systems = AccountRegionScopedDict()
+    file_systems.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "fs-11111111111111111",
+        {
+            "fileSystemId": "fs-11111111111111111",
+            "fileSystemArn": (
+                "arn:aws:s3files:us-west-2:000000000000:"
+                "file-system/fs-11111111111111111"
+            ),
+        },
+    )
+    persistence.save_state("s3files", {"file_systems": file_systems})
+
+    raw = _json.loads((tmp_path / "s3files.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_file_systems = persistence.load_state("s3files")["file_systems"]
+    assert loaded_file_systems.get_scoped(
+        "000000000000", "us-west-2", "fs-11111111111111111"
+    )["fileSystemId"] == "fs-11111111111111111"
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("s3files") is None
+
+
 def test_resource_groups_region_scoped_state_is_rejected_by_v2_reader(
     monkeypatch, tmp_path
 ):
