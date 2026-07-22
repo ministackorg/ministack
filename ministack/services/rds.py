@@ -87,6 +87,17 @@ _docker = None
 _ministack_network = None
 _shared_container_lock = threading.RLock()
 
+_MYSQL_REPLICATION_USER = "rdsrepladmin"
+_MYSQL_REPLICATION_PASSWORD = "ministack-rds-replication"
+_MYSQL_CONTROL_USER = "rdsadmin"
+_MYSQL_CONTROL_PASSWORD = "ministack-rds-control"
+_MYSQL_REPLICATION_RETRY_ATTEMPTS = 60
+_MYSQL_REPLICATION_RETRY_INTERVAL = 1
+_MYSQL_BINLOG_RETENTION_SECONDS = max(
+    1,
+    int(os.environ.get("RDS_MYSQL_BINLOG_RETENTION_SECONDS", "604800")),
+)
+
 # Aurora MySQL versions are the creatable set returned by AWS RDS as of
 # 2026-07-09. Refresh with:
 #   aws rds describe-db-engine-versions --engine aurora-mysql \
@@ -180,6 +191,13 @@ def restore_state(data):
     for key in list(_clusters._data):
         cluster = _clusters._data[key]
         cluster["_shared_container_id"] = None
+        cluster.pop("_mysql_replication_retry_marker", None)
+        if cluster.get("_mysql_replication_source_arn"):
+            # A respawned MySQL container gets a new hostname, while the
+            # persisted replica repository and relay-log names belong to the
+            # previous container. Recover the channel from the durable GTID
+            # execution set before relinking it to the restored source.
+            cluster["_mysql_replication_reset_pending"] = True
         if cluster.get("_shared_endpoint"):
             cluster["_shared_container_ready"] = False
     _subnet_groups.update(data.get("subnet_groups", {}))
@@ -189,6 +207,14 @@ def restore_state(data):
     _db_cluster_snapshots.update(data.get("db_cluster_snapshots", {}))
     _option_groups.update(data.get("option_groups", {}))
     _global_clusters.update(data.get("global_clusters", {}))
+    # Persistence contains every account, while AccountScopedDict.values()
+    # intentionally exposes only the active request account. Reconcile the
+    # raw persisted records so a warm boot cannot leave secondary metadata
+    # stale merely because another account happened to be active at startup.
+    for global_cluster in _global_clusters._data.values():
+        writer = _global_cluster_writer_cluster(global_cluster)
+        if writer and _aurora_mysql_8_replication_enabled(writer):
+            _sync_global_mysql_credentials(writer, global_cluster)
     _tags.update(data.get("tags", {}))
     if "port_counter" in data:
         _port_counter[0] = data["port_counter"]
@@ -252,6 +278,15 @@ def restore_state(data):
         else:
             standalone.append((account_id, region, db_id, inst))
 
+    # A global secondary keeps applying source GTIDs after its final DB
+    # instance is deleted.  There is no instance record to pull an empty
+    # secondary into ``shared_groups`` on warm boot, so retain the explicit
+    # headless-applier intent as its own restore work item.
+    for key, cluster in list(_clusters._data.items()):
+        account_id, region, cluster_id = key
+        if cluster.get("_mysql_headless_applier_required"):
+            shared_groups.setdefault((account_id, region, cluster_id), [])
+
     # A pre-namespace standalone named ``cluster-<id>`` used the same Docker
     # name now reserved for cluster ``<id>``. Remove those legacy containers
     # before any asynchronous cluster runner can claim the name, and mark the
@@ -293,7 +328,7 @@ def restore_state(data):
         cluster = _clusters.get_scoped(
             account_id or get_account_id(), region, cluster_id,
         )
-        if cluster:
+        if cluster and members:
             # Publish the restore/migration gate before the daemon starts. A
             # create arriving immediately after restore_state() must not start
             # fresh cluster storage before the writer volume is adopted.
@@ -335,14 +370,14 @@ def restore_state(data):
                 ),
                 None,
             )
-            writer = member_by_id.get(writer_id) or members[0]
+            writer = member_by_id.get(writer_id) or (members[0] if members else None)
             legacy_volumes = {
                 member.get("_docker_volume_name")
                 for member in members
                 if member.get("_docker_volume_name")
             }
             adopted_volume = cluster.get("_shared_volume_name")
-            if not adopted_volume:
+            if not adopted_volume and writer is not None:
                 adopted_volume = writer.get("_docker_volume_name")
                 if adopted_volume:
                     cluster["_shared_volume_name"] = adopted_volume
@@ -466,11 +501,19 @@ def restore_state(data):
                     and _instances.get(member_id) is member_by_id[member_id]
                     for member_id in original_member_ids
                 )
+                headless_applier_still_required = bool(
+                    not original_member_ids
+                    and not current_member_ids
+                    and cluster.get("_mysql_headless_applier_required")
+                )
                 if (
                     current_cluster is not cluster
                     or int(cluster.get("_shared_container_epoch", 0))
                     != restore_epoch
-                    or not original_member_still_attached
+                    or not (
+                        original_member_still_attached
+                        or headless_applier_still_required
+                    )
                 ):
                     if current_cluster is cluster:
                         cluster.pop(
@@ -515,15 +558,28 @@ def restore_state(data):
                         if pending_rotation
                         else cluster.get("_MasterUserPassword", "password")
                     )
+                    readiness_user = cluster.get("MasterUsername", "admin")
+                    if _mysql_replication_secondary(cluster):
+                        # A fresh secondary volume has only the image's local
+                        # root account.  Once replication setup creates the
+                        # non-binlogged control account, persisted restarts use
+                        # that stable credential instead of the replicated
+                        # application administrator.
+                        readiness_user = "root"
+                        if cluster.get("_mysql_control_user_ready"):
+                            readiness_user = _MYSQL_CONTROL_USER
+                            readiness_password = _MYSQL_CONTROL_PASSWORD
                 authenticated_ready = _wait_for_database_ready(
                     result.get("readiness_host")
                     or cluster["_shared_endpoint"]["Address"],
                     result.get("readiness_port")
                     or cluster["_shared_endpoint"]["Port"],
                     cluster.get("Engine", "aurora-postgresql"),
-                    cluster.get("MasterUsername", "admin"),
+                    readiness_user,
                     readiness_password,
-                    cluster.get("DatabaseName") or "mydb",
+                    None
+                    if _mysql_replication_secondary(cluster)
+                    else cluster.get("DatabaseName") or "mydb",
                     _container_alive,
                 )
                 with _shared_container_lock:
@@ -551,11 +607,12 @@ def restore_state(data):
                             cluster.pop(
                                 "_pending_master_password_rotation", None,
                             )
+                            _sync_global_mysql_credentials(cluster)
                     if authenticated_ready:
                         cluster["_shared_storage_initialized"] = True
                     if authenticated_ready and _is_mysql_engine(
                         cluster.get("Engine", ""),
-                    ):
+                    ) and not _mysql_replication_secondary(cluster):
                         _grant_mysql_master_user_privileges(
                             result.get("readiness_host")
                             or cluster["_shared_endpoint"]["Address"],
@@ -566,6 +623,10 @@ def restore_state(data):
                             cluster_id,
                         )
                     cluster["_shared_container_ready"] = authenticated_ready
+                    if authenticated_ready and _aurora_mysql_8_replication_enabled(
+                        cluster,
+                    ):
+                        _configure_or_defer_mysql_replication(cluster_id, cluster)
                     status = "available" if authenticated_ready else "failed"
                     for current_member in cluster.get(
                         "DBClusterMembers", [],
@@ -729,6 +790,14 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
     )
     if not image:
         return {"started": False, "failed": False, "readiness_host": None, "readiness_port": None}
+    if _mysql_replication_secondary(cluster):
+        # The writer's retained GTID history must be the sole creator of the
+        # application database and master user on a fresh global secondary.
+        # Letting both image entrypoints create them assigns different local
+        # GTIDs and makes replay stop on duplicate CREATE USER / DATABASE.
+        env = dict(env)
+        for key in ("MYSQL_DATABASE", "MYSQL_USER", "MYSQL_PASSWORD"):
+            env.pop(key, None)
 
     container_name = _rds_cluster_docker_name(cluster_id)
     if remove_stale:
@@ -775,6 +844,20 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
             "region": get_region(),
         },
     )
+    if _prepare_mysql_gtid_history(cluster):
+        server_id = _mysql_replication_server_id(
+            get_account_id(),
+            get_region(),
+            cluster_id,
+        )
+        container_kwargs["command"] = [
+            f"--server-id={server_id}",
+            "--log-bin=mysql-bin",
+            "--gtid-mode=ON",
+            "--enforce-gtid-consistency=ON",
+            "--log-replica-updates",
+            f"--binlog-expire-logs-seconds={_MYSQL_BINLOG_RETENTION_SECONDS}",
+        ]
     if ms_network:
         container_kwargs["network"] = ms_network
     # Aurora storage belongs to the cluster, not to any member instance. Use a
@@ -1202,6 +1285,519 @@ def _is_postgres_engine(engine):
     return any(e in engine for e in ("postgres", "aurora-postgresql"))
 
 
+def _aurora_mysql_8_replication_enabled(cluster):
+    """Return whether this cluster is in the native-replication spike scope."""
+    return (
+        cluster.get("Engine") == "aurora-mysql"
+        and _mysql_community_major_minor(cluster.get("EngineVersion")) == "8.0"
+    )
+
+
+def _prepare_mysql_gtid_history(cluster):
+    """Enable GTID history only before a cluster volume is initialized.
+
+    New Aurora MySQL 8 clusters always start GTID-capable so they can later be
+    attached as a global source without omitting pre-attach transactions. A
+    persisted volume from an older MiniStack release has anonymous history;
+    starting it with GTID enabled would make auto-position appear healthy
+    while leaving that history absent on a fresh secondary.
+    """
+    if not _aurora_mysql_8_replication_enabled(cluster):
+        return False
+    if cluster.get("_mysql_gtid_initialized_at_creation"):
+        return True
+    if cluster.get("_shared_storage_initialized"):
+        return False
+    cluster["_mysql_gtid_initialized_at_creation"] = True
+    return True
+
+
+def _mysql_gtid_history_ready(cluster):
+    return bool(
+        not _aurora_mysql_8_replication_enabled(cluster)
+        or cluster.get("_mysql_gtid_initialized_at_creation")
+    )
+
+
+def _mysql_replication_server_id(account_id, region, cluster_id):
+    """Derive a stable, non-zero MySQL server ID from the cluster scope."""
+    identity = f"{account_id}/{region}/{cluster_id}".encode()
+    return int.from_bytes(hashlib.sha256(identity).digest()[:4], "big") or 1
+
+
+def _global_cluster_member_for_cluster(cluster):
+    global_id = cluster.get("GlobalClusterIdentifier")
+    if not global_id:
+        return None, None
+    global_cluster = _global_clusters.get(global_id)
+    if not global_cluster:
+        return None, None
+    member = next(
+        (
+            item
+            for item in global_cluster.get("GlobalClusterMembers", [])
+            if item.get("DBClusterArn") == cluster.get("DBClusterArn")
+        ),
+        None,
+    )
+    return global_cluster, member
+
+
+def _mysql_replication_secondary(cluster):
+    if not _aurora_mysql_8_replication_enabled(cluster):
+        return False
+    _global_cluster, member = _global_cluster_member_for_cluster(cluster)
+    return bool(member and not member.get("IsWriter"))
+
+
+def _resolve_global_member_cluster(member):
+    parsed = _parse_rds_arn(member.get("DBClusterArn", "")) if member else None
+    if not parsed:
+        return None
+    spec, resource_type, cluster_id = parsed
+    if resource_type != "cluster":
+        return None
+    return _clusters.get_scoped(spec.account_id, spec.region, cluster_id)
+
+
+def _global_cluster_writer_cluster(global_cluster):
+    writer_member = next(
+        (
+            member
+            for member in global_cluster.get("GlobalClusterMembers", [])
+            if member.get("IsWriter")
+        ),
+        None,
+    )
+    return _resolve_global_member_cluster(writer_member)
+
+
+def _sync_global_mysql_credentials(writer, global_cluster=None):
+    """Keep member metadata aligned with credentials replicated from writer."""
+    if global_cluster is None:
+        global_cluster, writer_member = _global_cluster_member_for_cluster(writer)
+    else:
+        writer_member = next(
+            (
+                member
+                for member in global_cluster.get("GlobalClusterMembers", [])
+                if member.get("DBClusterArn") == writer.get("DBClusterArn")
+            ),
+            None,
+        )
+    if not global_cluster or not writer_member or not writer_member.get("IsWriter"):
+        return
+    for member in global_cluster.get("GlobalClusterMembers", []):
+        cluster = _resolve_global_member_cluster(member)
+        if cluster is None or cluster is writer:
+            continue
+        cluster["MasterUsername"] = writer.get("MasterUsername", "admin")
+        cluster["_MasterUserPassword"] = writer.get(
+            "_MasterUserPassword",
+            "password",
+        )
+        cluster["DatabaseName"] = writer.get("DatabaseName")
+        parsed = _parse_rds_arn(cluster.get("DBClusterArn", ""))
+        for cluster_member in cluster.get("DBClusterMembers", []):
+            instance = None
+            if parsed:
+                spec, resource_type, _cluster_id = parsed
+                if resource_type == "cluster":
+                    instance = _instances.get_scoped(
+                        spec.account_id,
+                        spec.region,
+                        cluster_member.get("DBInstanceIdentifier"),
+                    )
+            if instance is not None:
+                _attach_instance_to_shared_cluster(instance, cluster)
+
+
+def _mysql_cluster_connection(cluster, user, password):
+    import pymysql
+
+    endpoint = cluster.get("_shared_endpoint") or {}
+    host = cluster.get("_shared_internal_address") or endpoint.get("Address")
+    port = cluster.get("_shared_internal_port") or endpoint.get("Port")
+    if not host or not port:
+        return None
+    return pymysql.connect(
+        host=host,
+        port=int(port),
+        user=user,
+        password=password,
+        autocommit=True,
+        connect_timeout=3,
+    )
+
+
+def _mysql_admin_connection(cluster):
+    return _mysql_cluster_connection(
+        cluster,
+        "root",
+        cluster.get("_MasterUserPassword", "password"),
+    )
+
+
+def _mysql_replication_connection(cluster):
+    return _mysql_cluster_connection(
+        cluster,
+        _MYSQL_CONTROL_USER,
+        _MYSQL_CONTROL_PASSWORD,
+    )
+
+
+def _ensure_mysql_control_user(cluster):
+    """Create a local, non-replicated account for replica lifecycle SQL."""
+    if cluster.get("_mysql_control_user_ready"):
+        return True
+    cluster_id = cluster.get("DBClusterIdentifier", "unknown")
+    conn = None
+    cur = None
+    try:
+        conn = _mysql_admin_connection(cluster)
+        if conn is None:
+            return False
+        cur = conn.cursor()
+        cur.execute("SET SESSION sql_log_bin=0")
+        cur.execute(
+            "CREATE USER IF NOT EXISTS %s@'%%' "
+            "IDENTIFIED WITH mysql_native_password BY %s",
+            (_MYSQL_CONTROL_USER, _MYSQL_CONTROL_PASSWORD),
+        )
+        cur.execute(
+            "GRANT RELOAD ON *.* TO %s@'%%'",
+            (_MYSQL_CONTROL_USER,),
+        )
+        cur.execute(
+            "GRANT CONNECTION_ADMIN, REPLICATION_SLAVE_ADMIN, "
+            "SYSTEM_VARIABLES_ADMIN ON *.* TO %s@'%%'",
+            (_MYSQL_CONTROL_USER,),
+        )
+        cur.execute("FLUSH PRIVILEGES")
+        cluster["_mysql_control_user_ready"] = True
+        return True
+    except Exception as e:
+        logger.warning(
+            "RDS: failed to prepare local MySQL control account for %s: %s",
+            cluster_id,
+            e,
+        )
+        return False
+    finally:
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            conn.close()
+
+
+def _ensure_mysql_replication_user(cluster):
+    """Ensure the internal replication account exists on a writer cluster."""
+    cluster_id = cluster.get("DBClusterIdentifier", "unknown")
+    conn = None
+    cur = None
+    try:
+        conn = _mysql_admin_connection(cluster)
+        if conn is None:
+            return False
+        cur = conn.cursor()
+        cur.execute(
+            "CREATE USER IF NOT EXISTS %s@'%%' "
+            "IDENTIFIED WITH mysql_native_password BY %s",
+            (_MYSQL_REPLICATION_USER, _MYSQL_REPLICATION_PASSWORD),
+        )
+        cur.execute(
+            "GRANT REPLICATION SLAVE ON *.* TO %s@'%%'",
+            (_MYSQL_REPLICATION_USER,),
+        )
+        cur.execute("FLUSH PRIVILEGES")
+        return True
+    except Exception as e:
+        logger.warning(
+            "RDS: failed to prepare MySQL replication source %s: %s",
+            cluster_id,
+            e,
+        )
+        return False
+    finally:
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            conn.close()
+
+
+def _configure_mysql_replication(cluster_id, cluster):
+    """Configure an Aurora MySQL 8 global member as source or replica.
+
+    Returns True when configuration is complete, False when it should be
+    retried, and None when replication does not apply to this cluster.
+    """
+    if not _aurora_mysql_8_replication_enabled(cluster):
+        return None
+
+    global_cluster, member = _global_cluster_member_for_cluster(cluster)
+    if not global_cluster or not member:
+        return None
+    if not cluster.get("_shared_container_ready"):
+        return False
+    if not _mysql_gtid_history_ready(cluster):
+        cluster["_mysql_replication_blocked_reason"] = "legacy-non-gtid-volume"
+        cluster["_shared_container_ready"] = False
+        for cluster_member in cluster.get("DBClusterMembers", []):
+            instance = _instances.get(
+                cluster_member.get("DBInstanceIdentifier"),
+            )
+            if instance is not None:
+                instance["DBInstanceStatus"] = "failed"
+        logger.error(
+            "RDS: refusing MySQL replication for %s because its initialized "
+            "volume predates GTID-at-creation tracking",
+            cluster_id,
+        )
+        return None
+    if not _ensure_mysql_control_user(cluster):
+        return False
+    cluster.pop("_mysql_replication_blocked_reason", None)
+
+    if member.get("IsWriter"):
+        if not _ensure_mysql_replication_user(cluster):
+            return False
+        for secondary_member in global_cluster.get("GlobalClusterMembers", []):
+            if secondary_member.get("IsWriter"):
+                continue
+            secondary = _resolve_global_member_cluster(secondary_member)
+            if secondary and secondary.get("_shared_container_ready"):
+                secondary_id = secondary.get("DBClusterIdentifier", "unknown")
+                if _configure_mysql_replication(secondary_id, secondary) is False:
+                    _schedule_mysql_replication_retry(secondary_id, secondary)
+        return True
+
+    writer_member = next(
+        (
+            item
+            for item in global_cluster.get("GlobalClusterMembers", [])
+            if item.get("IsWriter")
+        ),
+        None,
+    )
+    writer = _resolve_global_member_cluster(writer_member)
+    if (
+        not writer
+        or not _aurora_mysql_8_replication_enabled(writer)
+        or not writer.get("_shared_container_ready")
+        or not writer.get("_shared_internal_address")
+        or not writer.get("_shared_internal_port")
+        or not cluster.get("_shared_internal_address")
+    ):
+        return False
+    if not _ensure_mysql_replication_user(writer):
+        return False
+
+    conn = None
+    cur = None
+    try:
+        conn = _mysql_replication_connection(cluster)
+        if conn is None:
+            return False
+        cur = conn.cursor()
+        try:
+            cur.execute("STOP REPLICA")
+        except Exception as e:
+            logger.debug(
+                "RDS: STOP REPLICA was a no-op for %s: %s",
+                cluster_id,
+                e,
+            )
+        if cluster.get("_mysql_replication_reset_pending"):
+            # RESET REPLICA ALL clears stale connection/applier repositories
+            # and relay logs but deliberately preserves gtid_executed. Within
+            # the source's configured retention window, auto-position can
+            # request every transaction not yet applied before the restart.
+            cur.execute("RESET REPLICA ALL")
+        cur.execute(
+            "CHANGE REPLICATION SOURCE TO "
+            "SOURCE_HOST=%s, SOURCE_PORT=%s, SOURCE_USER=%s, "
+            "SOURCE_PASSWORD=%s, SOURCE_AUTO_POSITION=1, "
+            "GET_SOURCE_PUBLIC_KEY=1",
+            (
+                writer["_shared_internal_address"],
+                int(writer["_shared_internal_port"]),
+                _MYSQL_REPLICATION_USER,
+                _MYSQL_REPLICATION_PASSWORD,
+            ),
+        )
+        cur.execute("START REPLICA")
+        cur.execute("SET GLOBAL super_read_only=ON")
+    except Exception as e:
+        logger.warning(
+            "RDS: failed to configure MySQL replication for %s: %s",
+            cluster_id,
+            e,
+        )
+        return False
+    finally:
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            conn.close()
+
+    cluster["_mysql_replication_source_arn"] = writer.get("DBClusterArn")
+    cluster.pop("_mysql_replication_reset_pending", None)
+    cluster.pop("_mysql_replication_retry_marker", None)
+    # If MiniStack restarted or a detach statement failed after the channel
+    # had been changed, successful reconfiguration is the rollback/repair
+    # point.  Global membership remains authoritative until RemoveFromGlobal
+    # Cluster commits its metadata update.
+    cluster.pop("_mysql_replication_detach_state", None)
+    logger.info(
+        "RDS: configured MySQL replication for %s from %s",
+        cluster_id,
+        writer.get("DBClusterIdentifier", "unknown"),
+    )
+    return True
+
+
+def _detach_mysql_replication(cluster_id, cluster):
+    """Stop a global secondary and make its data plane writable."""
+    if not _mysql_replication_secondary(cluster):
+        return True
+    if not cluster.get("_shared_storage_initialized"):
+        return True
+    if not cluster.get("_shared_container_ready"):
+        return False
+    if not _ensure_mysql_control_user(cluster):
+        return False
+
+    # Persist the transition before destructive SQL.  A failed request keeps
+    # global membership intact; immediate rollback (or the normal restore-time
+    # configure path after a process restart) relinks the channel and clears
+    # this marker.  Successful detach leaves the marker until the caller
+    # commits the global/member metadata update under the same lifecycle lock.
+    state = cluster.setdefault("_mysql_replication_detach_state", "requested")
+    conn = None
+    cur = None
+    try:
+        conn = _mysql_replication_connection(cluster)
+        if conn is None:
+            return False
+        cur = conn.cursor()
+        if state == "requested":
+            cur.execute("STOP REPLICA")
+            cluster["_mysql_replication_detach_state"] = "stopped"
+            state = "stopped"
+        if state in ("stopped", "resetting"):
+            # ``resetting`` is written first so a crash between MySQL applying
+            # RESET and Python publishing the next state is recoverable.
+            cluster["_mysql_replication_detach_state"] = "resetting"
+            cur.execute("RESET REPLICA ALL")
+            cluster["_mysql_replication_detach_state"] = "reset"
+            state = "reset"
+        if state == "reset":
+            cur.execute("SET GLOBAL super_read_only=OFF")
+    except Exception as e:
+        logger.warning(
+            "RDS: failed to detach MySQL replication for %s: %s",
+            cluster_id,
+            e,
+        )
+        # Best-effort atomic rollback: if the connection is still usable (or a
+        # fresh one can be opened), restore auto-position and read-only mode.
+        # If that is temporarily impossible, the durable state remains and the
+        # normal readiness/configuration path repairs it on retry or restart.
+        if _configure_mysql_replication(cluster_id, cluster) is True:
+            logger.info(
+                "RDS: restored MySQL replication for %s after detach failed",
+                cluster_id,
+            )
+        else:
+            # Reconfiguration may fail after recreating or starting the
+            # channel.  Do not trust the detach stage recorded before that
+            # partial rollback: the next detach attempt must conservatively
+            # stop and reset any channel that may now exist.
+            cluster["_mysql_replication_detach_state"] = "requested"
+        return False
+    finally:
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            conn.close()
+
+    return True
+
+
+def _clear_mysql_replication_metadata(cluster):
+    """Commit the metadata half of a successful global-secondary detach."""
+    for field in (
+        "_mysql_replication_source_arn",
+        "_mysql_replication_reset_pending",
+        "_mysql_replication_retry_marker",
+        "_mysql_replication_blocked_reason",
+        "_mysql_replication_detach_state",
+        "_mysql_headless_applier_required",
+    ):
+        cluster.pop(field, None)
+
+
+def _schedule_mysql_replication_retry(cluster_id, cluster):
+    """Retry a deferred cross-region link without blocking RDS readiness."""
+    parsed = _parse_rds_arn(cluster.get("DBClusterArn", ""))
+    if not parsed:
+        return
+    spec, resource_type, parsed_cluster_id = parsed
+    if resource_type != "cluster":
+        return
+    epoch = cluster.get("_shared_container_epoch")
+    marker = (epoch, cluster.get("GlobalClusterIdentifier"))
+    if cluster.get("_mysql_replication_retry_marker") == marker:
+        return
+    cluster["_mysql_replication_retry_marker"] = marker
+    ctx = contextvars.copy_context()
+
+    def _retry():
+        for _attempt in range(_MYSQL_REPLICATION_RETRY_ATTEMPTS):
+            time.sleep(_MYSQL_REPLICATION_RETRY_INTERVAL)
+            with _shared_container_lock:
+                current = _clusters.get_scoped(
+                    spec.account_id,
+                    spec.region,
+                    parsed_cluster_id,
+                )
+                if (
+                    current is not cluster
+                    or current.get("_shared_container_epoch") != epoch
+                    or current.get("_mysql_replication_retry_marker") != marker
+                ):
+                    return
+                result = _configure_mysql_replication(cluster_id, current)
+                if result is not False:
+                    current.pop("_mysql_replication_retry_marker", None)
+                    return
+        with _shared_container_lock:
+            current = _clusters.get_scoped(
+                spec.account_id,
+                spec.region,
+                parsed_cluster_id,
+            )
+            if (
+                current is cluster
+                and current.get("_shared_container_epoch") == epoch
+                and current.get("_mysql_replication_retry_marker") == marker
+            ):
+                current.pop("_mysql_replication_retry_marker", None)
+        logger.warning(
+            "RDS: MySQL replication for %s did not become configurable "
+            "after %s attempts",
+            cluster_id,
+            _MYSQL_REPLICATION_RETRY_ATTEMPTS,
+        )
+
+    threading.Thread(target=ctx.run, args=(_retry,), daemon=True).start()
+
+
+def _configure_or_defer_mysql_replication(cluster_id, cluster):
+    if _configure_mysql_replication(cluster_id, cluster) is False:
+        _schedule_mysql_replication_retry(cluster_id, cluster)
+
+
 def _grant_mysql_master_user_privileges(host, port, master_user, master_pass, db_id):
     """Grant the emulated MySQL master user AWS/RDS-like admin privileges."""
     try:
@@ -1256,7 +1852,7 @@ def _try_database_connect(host, port, engine, user, password, db_name):
             except ImportError:
                 return _wait_for_port(host, port, timeout=1)
             conn = pymysql.connect(
-                host=host, port=int(port), user="root",
+                host=host, port=int(port), user=user,
                 password=password, database=db_name or None,
                 connect_timeout=2, read_timeout=2, write_timeout=2,
                 autocommit=True)
@@ -1756,6 +2352,7 @@ def _register_instance_in_cluster(instance):
         "IsClusterWriter": is_writer,
         "PromotionTier": int(instance.get("PromotionTier", 1)),
     })
+    cluster.pop("_mysql_headless_applier_required", None)
     _sync_cluster_endpoints(cluster)
     _refresh_cluster_status(cid)
 
@@ -2160,11 +2757,23 @@ def _create_db_instance(p):
                     return c.status not in ("exited", "dead", "removing")
                 except Exception:
                     return False
-            database_ready = _wait_for_database_ready(
-                ready_host, ready_port, engine, master_user,
-                readiness_master_pass, db_name, _container_alive,
+            readiness_cluster = _clusters.get(cluster_id) if cluster_id else None
+            readiness_user = master_user
+            if readiness_cluster and _mysql_replication_secondary(readiness_cluster):
+                readiness_user = "root"
+                if readiness_cluster.get("_mysql_control_user_ready"):
+                    readiness_user = _MYSQL_CONTROL_USER
+                    readiness_master_pass = _MYSQL_CONTROL_PASSWORD
+            readiness_db_name = (
+                None
+                if readiness_cluster and _mysql_replication_secondary(readiness_cluster)
+                else db_name
             )
-            cluster = _clusters.get(cluster_id) if cluster_id else None
+            database_ready = _wait_for_database_ready(
+                ready_host, ready_port, engine, readiness_user,
+                readiness_master_pass, readiness_db_name, _container_alive,
+            )
+            cluster = readiness_cluster
             if cluster:
                 with _shared_container_lock:
                     if (
@@ -2219,14 +2828,19 @@ def _create_db_instance(p):
                         return
                     if pending_rotation:
                         cluster.pop("_pending_master_password_rotation", None)
+                        _sync_global_mysql_credentials(cluster)
 
-                    if _is_mysql_engine(engine):
+                    if _is_mysql_engine(engine) and not _mysql_replication_secondary(
+                        cluster,
+                    ):
                         _grant_mysql_master_user_privileges(
                             ready_host, ready_port, master_user,
                             cluster.get("_MasterUserPassword", master_pass),
                             cluster_id,
                         )
                     cluster["_shared_container_ready"] = True
+                    if _aurora_mysql_8_replication_enabled(cluster):
+                        _configure_or_defer_mysql_replication(cluster_id, cluster)
                     for member in cluster.get("DBClusterMembers", []):
                         inst = _instances.get(member.get("DBInstanceIdentifier"))
                         if inst is not None:
@@ -2310,7 +2924,14 @@ def _delete_db_instance(p):
     if shared_cluster_id:
         cluster = _resolve_cluster_in_request_region(shared_cluster_id)
         if cluster and not cluster.get("DBClusterMembers"):
-            _stop_empty_cluster_shared_container(shared_cluster_id, cluster)
+            if _mysql_replication_secondary(cluster):
+                # Aurora global headless secondaries have no query compute but
+                # their storage continues to synchronize.  MiniStack's single
+                # shared process is also the applier, so preserve it until the
+                # secondary is detached, deleted, or gains compute again.
+                cluster["_mysql_headless_applier_required"] = True
+            else:
+                _stop_empty_cluster_shared_container(shared_cluster_id, cluster)
 
     docker_client = _get_docker()
     if (
@@ -2719,7 +3340,52 @@ def _create_db_cluster(p):
             )
         engine_version = expected_engine_version or engine_version
     port = int(_p(p, "Port") or _default_port(engine))
-    master_user = _p(p, "MasterUsername") or "admin"
+    explicit_master_user = _p(p, "MasterUsername") or None
+    explicit_master_pass = _p(p, "MasterUserPassword") or None
+    explicit_database_name = _p(p, "DatabaseName") or None
+    global_writer = (
+        _global_cluster_writer_cluster(global_cluster)
+        if global_cluster
+        else None
+    )
+    if global_writer:
+        inherited_fields = (
+            ("MasterUsername", explicit_master_user, global_writer.get("MasterUsername")),
+            (
+                "MasterUserPassword",
+                explicit_master_pass,
+                global_writer.get("_MasterUserPassword"),
+            ),
+            ("DatabaseName", explicit_database_name, global_writer.get("DatabaseName")),
+        )
+        conflicting_field = next(
+            (
+                field
+                for field, explicit_value, inherited_value in inherited_fields
+                if explicit_value is not None
+                and explicit_value != inherited_value
+            ),
+            None,
+        )
+        if conflicting_field:
+            return _error(
+                "InvalidParameterValue",
+                f"{conflicting_field} must match the global writer when "
+                "creating a secondary cluster.",
+                400,
+            )
+        if not _mysql_gtid_history_ready(global_writer):
+            return _error(
+                "InvalidDBClusterStateFault",
+                "The global writer volume predates GTID-at-creation tracking "
+                "and cannot safely seed a secondary.",
+                400,
+            )
+    master_user = (
+        global_writer.get("MasterUsername", "admin")
+        if global_writer
+        else explicit_master_user or "admin"
+    )
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster:{cluster_id}"
     unique_suffix = new_uuid()[:8]
     now_ts = time.time()
@@ -2730,7 +3396,16 @@ def _create_db_cluster(p):
     if not az_list:
         az_list = [f"{get_region()}a", f"{get_region()}b", f"{get_region()}c"]
 
-    master_pass = _p(p, "MasterUserPassword") or "password"
+    master_pass = (
+        global_writer.get("_MasterUserPassword", "password")
+        if global_writer
+        else explicit_master_pass or "password"
+    )
+    database_name = (
+        global_writer.get("DatabaseName")
+        if global_writer
+        else explicit_database_name
+    )
 
     cluster = {
         "DBClusterIdentifier": cluster_id,
@@ -2741,7 +3416,7 @@ def _create_db_cluster(p):
         "Status": "available",
         "MasterUsername": master_user,
         "_MasterUserPassword": master_pass,
-        "DatabaseName": _p(p, "DatabaseName") or None,
+        "DatabaseName": database_name,
         "NetworkType": _p(p, "NetworkType") or "IPV4",
         "EngineLifecycleSupport": _p(p, "EngineLifecycleSupport") or "open-source-rds-extended-support",
         "Endpoint": f"{cluster_id}.cluster-{unique_suffix}.{get_region()}.rds.amazonaws.com",
@@ -2785,6 +3460,7 @@ def _create_db_cluster(p):
         "_shared_container_epoch": 0,
         "_shared_storage_initialized": False,
     }
+    _prepare_mysql_gtid_history(cluster)
     _clusters[cluster_id] = cluster
     if global_cluster:
         is_first_member = not global_cluster.get("GlobalClusterMembers")
@@ -2994,6 +3670,12 @@ def _modify_db_cluster(p):
     if _p(p, "EngineVersion"):
         cluster["EngineVersion"] = _p(p, "EngineVersion")
     if _p(p, "MasterUserPassword"):
+        if _mysql_replication_secondary(cluster):
+            return _error(
+                "InvalidDBClusterStateFault",
+                "MasterUserPassword must be changed on the global writer.",
+                400,
+            )
         new_pass = _p(p, "MasterUserPassword")
         with _shared_container_lock:
             old_pass = cluster.get("_MasterUserPassword", "password")
@@ -3015,6 +3697,7 @@ def _modify_db_cluster(p):
                 cluster, rotation_old_pass, new_pass,
             ):
                 cluster.pop("_pending_master_password_rotation", None)
+                _sync_global_mysql_credentials(cluster)
             elif (
                 cluster.get("_shared_container_id")
                 or cluster.get("_shared_storage_initialized")
@@ -3829,10 +4512,9 @@ def _invalid_global_cluster_identifier_error(global_id):
 # ---------------------------------------------------------------------------
 # Global Clusters
 #
-# Emulation scope: metadata-level Aurora Global Database membership.  This
-# supports the create/read/update/delete control-plane path needed by local
-# acceptance tests, without simulating storage replication, failover, or
-# switchover.
+# Emulation scope: Aurora Global Database membership plus native MySQL 8 GTID
+# replication between provisioned members. Failover and switchover remain
+# metadata-only; their data-plane promotion behavior is a separate phase.
 # ---------------------------------------------------------------------------
 
 def _create_global_cluster(p):
@@ -3873,6 +4555,16 @@ def _create_global_cluster(p):
                 "InvalidDBClusterStateFault",
                 f"DBCluster {source_cluster_id} is already a member of "
                 f"global cluster {existing_global_id}.",
+                400,
+            )
+        if (
+            _aurora_mysql_8_replication_enabled(source_cluster)
+            and not _prepare_mysql_gtid_history(source_cluster)
+        ):
+            return _error(
+                "InvalidDBClusterStateFault",
+                "The source cluster volume predates GTID-at-creation tracking "
+                "and cannot safely become a global writer.",
                 400,
             )
         engine = source_cluster["Engine"]
@@ -3953,25 +4645,52 @@ def _remove_from_global_cluster(p):
         return _error("GlobalClusterNotFoundFault",
             f"Global cluster {gc_id} not found.", 404)
 
-    members = gc.get("GlobalClusterMembers", [])
-    cluster = _resolve_cluster(db_cluster_id)
-    db_cluster_arn = cluster["DBClusterArn"] if cluster else db_cluster_id
-    member = next((m for m in members if m["DBClusterArn"] == db_cluster_arn), None)
-    if not member:
-        return _error("DBClusterNotFoundFault",
-            f"DBCluster {db_cluster_id} is not a member of global cluster {gc_id}.", 404)
-    if member.get("IsWriter") and len(members) > 1:
-        return _error("InvalidGlobalClusterStateFault",
-            "Cannot remove the writer DB cluster while reader members remain.", 400)
+    with _shared_container_lock:
+        members = gc.get("GlobalClusterMembers", [])
+        cluster = _resolve_cluster(db_cluster_id)
+        db_cluster_arn = cluster["DBClusterArn"] if cluster else db_cluster_id
+        member = next(
+            (m for m in members if m["DBClusterArn"] == db_cluster_arn),
+            None,
+        )
+        if not member:
+            return _error("DBClusterNotFoundFault",
+                f"DBCluster {db_cluster_id} is not a member of global cluster {gc_id}.", 404)
+        if member.get("IsWriter") and len(members) > 1:
+            return _error("InvalidGlobalClusterStateFault",
+                "Cannot remove the writer DB cluster while reader members remain.", 400)
 
-    new_members = [m for m in members if m["DBClusterArn"] != db_cluster_arn]
-    gc["GlobalClusterMembers"] = new_members
-    _refresh_global_cluster_readers(gc)
-    if not cluster:
-        cluster = _resolve_cluster(db_cluster_arn)
-    if cluster:
-        cluster.pop("GlobalClusterIdentifier", None)
-        cluster.pop("GlobalWriteForwardingStatus", None)
+        if not cluster:
+            cluster = _resolve_cluster(db_cluster_arn)
+        if (
+            cluster
+            and not member.get("IsWriter")
+            and not _detach_mysql_replication(
+                cluster.get("DBClusterIdentifier", db_cluster_id),
+                cluster,
+            )
+        ):
+            return _error(
+                "InvalidDBClusterStateFault",
+                "Cannot detach the secondary until its replication channel "
+                "is stopped and reset.",
+                400,
+            )
+
+        gc["GlobalClusterMembers"] = [
+            m for m in members if m["DBClusterArn"] != db_cluster_arn
+        ]
+        _refresh_global_cluster_readers(gc)
+        if cluster:
+            cluster.pop("GlobalClusterIdentifier", None)
+            cluster.pop("GlobalWriteForwardingStatus", None)
+            if not member.get("IsWriter"):
+                _clear_mysql_replication_metadata(cluster)
+                if not cluster.get("DBClusterMembers"):
+                    _stop_empty_cluster_shared_container(
+                        cluster.get("DBClusterIdentifier", db_cluster_id),
+                        cluster,
+                    )
     return _xml(200, "RemoveFromGlobalClusterResponse",
         f"<RemoveFromGlobalClusterResult><GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster></RemoveFromGlobalClusterResult>")
 
