@@ -506,15 +506,90 @@ def test_scheduler_round_trip():
     # pre-existing inline comment on the dict mis-describes the shape. Use
     # the real production key shape so this test catches a regression that
     # broke string-key serialisation.
+    from ministack.core.responses import get_region, set_request_region
+
+    original_region = get_region()
+
     def populate(mod):
-        mod._schedule_groups["default"] = {"Name": "default"}
-        mod._schedules["default/sched-test"] = {"Name": "sched-test"}
+        set_request_region("us-east-1")
+        mod._schedule_groups["default"] = {
+            "Arn": "arn:aws:scheduler:us-east-1:000000000000:schedule-group/default",
+            "Name": "default",
+        }
+        mod._schedules["default/sched-test"] = {
+            "Arn": "arn:aws:scheduler:us-east-1:000000000000:schedule/default/sched-test",
+            "Name": "sched-test",
+            "ScheduleExpression": "rate(1 hour)",
+        }
+        set_request_region("us-west-2")
+        mod._schedule_groups["default"] = {
+            "Arn": "arn:aws:scheduler:us-west-2:000000000000:schedule-group/default",
+            "Name": "default",
+        }
+        mod._schedules["default/sched-test"] = {
+            "Arn": "arn:aws:scheduler:us-west-2:000000000000:schedule/default/sched-test",
+            "Name": "sched-test",
+            "ScheduleExpression": "rate(2 hours)",
+        }
 
     def observe(mod):
-        assert "default" in mod._schedule_groups
-        assert "default/sched-test" in mod._schedules
+        set_request_region("us-east-1")
+        assert mod._schedules["default/sched-test"]["ScheduleExpression"] == "rate(1 hour)"
+        set_request_region("us-west-2")
+        assert mod._schedules["default/sched-test"]["ScheduleExpression"] == "rate(2 hours)"
 
-    _round_trip("scheduler", "scheduler", populate, observe)
+    try:
+        _round_trip("scheduler", "scheduler", populate, observe)
+    finally:
+        set_request_region(original_region)
+
+
+def test_scheduler_legacy_account_scoped_state_uses_resource_arn_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import scheduler as mod
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    region = "us-west-2"
+    group = "legacy-group"
+    schedule_key = f"{group}/legacy-schedule"
+    legacy_groups = AccountScopedDict()
+    legacy_groups._data[(account_id, group)] = {
+        "Arn": f"arn:aws:scheduler:{region}:{account_id}:schedule-group/{group}",
+        "Name": group,
+    }
+    legacy_schedules = AccountScopedDict()
+    legacy_schedules._data[(account_id, schedule_key)] = {
+        "Arn": f"arn:aws:scheduler:{region}:{account_id}:schedule/{schedule_key}",
+        "Name": "legacy-schedule",
+        "GroupName": group,
+    }
+
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region("us-east-1")
+        mod.restore_state(
+            {"schedule_groups": legacy_groups, "schedules": legacy_schedules}
+        )
+
+        assert mod._schedule_groups.get_scoped(account_id, "us-east-1", group) is None
+        assert mod._schedules.get_scoped(account_id, "us-east-1", schedule_key) is None
+        assert mod._schedule_groups.get_scoped(account_id, region, group)["Name"] == group
+        assert mod._schedules.get_scoped(account_id, region, schedule_key)["Name"] == (
+            "legacy-schedule"
+        )
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
 
 
 def test_pipes_round_trip():

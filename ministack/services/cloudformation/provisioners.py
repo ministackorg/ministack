@@ -41,6 +41,7 @@ import ministack.services.pipes as _pipes
 import ministack.services.rds as _rds
 import ministack.services.route53 as _r53
 import ministack.services.s3 as _s3
+import ministack.services.s3tables as _s3tables
 import ministack.services.secretsmanager as _sm
 import ministack.services.ses as _ses
 import ministack.services.sns as _sns
@@ -1920,6 +1921,50 @@ def _apigw_account_delete(physical_id, props):
     settings = dict(_apigw_v1._account_settings.get("settings") or {})
     settings.pop("cloudwatchRoleArn", None)
     _apigw_v1._account_settings["settings"] = settings
+
+
+# --- API Gateway GatewayResponse ---
+
+def _apigw_gateway_response_create(logical_id, props, stack_name):
+    """Provision an ``AWS::ApiGateway::GatewayResponse`` customization."""
+    api_id = props.get("RestApiId", "")
+    response_type = props.get("ResponseType", "")
+    data = {
+        "responseParameters": props.get("ResponseParameters", {}),
+        "responseTemplates": props.get("ResponseTemplates", {}),
+    }
+    if "StatusCode" in props:
+        data["statusCode"] = props["StatusCode"]
+
+    status, _headers, body = _apigw_v1._put_gateway_response(api_id, response_type, data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::GatewayResponse create failed: {body!r}")
+
+    physical_id = f"{api_id}/{response_type}"
+    return physical_id, {"Id": physical_id}
+
+
+def _apigw_gateway_response_update(physical_id, old_props, new_props, stack_name):
+    # RestApiId and ResponseType require replacement in the AWS CFN resource
+    # specification. Create the replacement first, then reset the old
+    # customization so a failed create cannot destroy the working resource.
+    if any(new_props.get(key) != old_props.get(key) for key in ("RestApiId", "ResponseType")):
+        new_id, attrs = _apigw_gateway_response_create(physical_id, new_props, stack_name)
+        _apigw_gateway_response_delete(physical_id, old_props)
+        return new_id, attrs
+
+    _new_id, attrs = _apigw_gateway_response_create(physical_id, new_props, stack_name)
+    return physical_id, attrs
+
+
+def _apigw_gateway_response_delete(physical_id, props):
+    api_id = props.get("RestApiId", "")
+    response_type = props.get("ResponseType", "")
+    # Deletion resets the customization to API Gateway's generated default.
+    # Keep CloudFormation cleanup idempotent when the parent REST API has
+    # already gone away during rollback.
+    if api_id in _apigw_v1._rest_apis:
+        _apigw_v1._delete_gateway_response(api_id, response_type)
 
 
 # --- Lambda EventSourceMapping ---
@@ -4305,9 +4350,82 @@ def _backup_plan_delete(physical_id, props):
     _backup._plans.pop(physical_id, None)
 
 
+def _s3tables_bucket_create(logical_id, props, stack_name):
+    name = props.get("TableBucketName") or _physical_name(stack_name, logical_id, lowercase=True, max_len=63)
+    arn = _s3tables._bucket_arn(name)
+    _s3tables._table_buckets[name] = {
+        "arn": arn, "name": name,
+        "ownerAccountId": get_account_id(),
+        "createdAt": now_iso(), "tableCount": 0,
+    }
+    _s3._buckets.setdefault(name, {"created": now_iso(), "objects": {}, "region": get_region()})
+    return arn, {"TableBucketARN": arn}
+
+
+def _s3tables_bucket_delete(physical_id, props):
+    name = physical_id.rsplit("/", 1)[-1]
+    _s3tables._table_buckets.pop(name, None)
+    _s3._buckets.pop(name, None)
+
+
+def _s3tables_namespace_create(logical_id, props, stack_name):
+    bucket_arn = props.get("TableBucketARN", "")
+    namespace = props.get("Namespace", "")
+    key = _s3tables._ns_key(bucket_arn, namespace)
+    _s3tables._namespaces[key] = {
+        "namespace": [namespace], "createdAt": now_iso(),
+        "createdBy": get_account_id(), "ownerAccountId": get_account_id(),
+        "tableBucketARN": bucket_arn,
+    }
+    return f"{bucket_arn}|{namespace}", {"TableBucketARN": bucket_arn, "Namespace": namespace}
+
+
+def _s3tables_namespace_delete(physical_id, props):
+    bucket_arn = props.get("TableBucketARN", "")
+    namespace = props.get("Namespace", "")
+    _s3tables._namespaces.pop(_s3tables._ns_key(bucket_arn, namespace), None)
+
+
+def _s3tables_table_create(logical_id, props, stack_name):
+    bucket_arn = props.get("TableBucketARN", "")
+    namespace = props.get("Namespace", "")
+    table_name = props.get("TableName", "")
+    bucket_name = bucket_arn.rsplit("/", 1)[-1]
+    location = f"s3://{bucket_name}/{namespace}/{table_name}"
+    iceberg_metadata = _s3tables._initial_iceberg_metadata(table_name, [], location)
+    metadata_location = f"s3://{bucket_name}/{namespace}/{table_name}/metadata/v0.metadata.json"
+    table_arn = _s3tables._table_arn(bucket_arn, namespace, table_name)
+    key = _s3tables._table_key(bucket_arn, namespace, table_name)
+    _s3tables._tables[key] = {
+        "name": table_name, "tableARN": table_arn, "namespace": [namespace],
+        "tableBucketARN": bucket_arn, "format": "ICEBERG",
+        "createdAt": now_iso(), "modifiedAt": now_iso(),
+        "ownerAccountId": get_account_id(),
+        "metadataLocation": metadata_location, "warehouseLocation": location,
+        "_iceberg_metadata": iceberg_metadata, "_metadata_version": 0,
+        "_schema_fields": [],
+    }
+    for b in _s3tables._table_buckets.values():
+        if b["arn"] == bucket_arn:
+            b["tableCount"] = b.get("tableCount", 0) + 1
+            break
+    return table_arn, {"TableArn": table_arn, "TableBucketARN": bucket_arn,
+                       "Namespace": namespace, "TableName": table_name}
+
+
+def _s3tables_table_delete(physical_id, props):
+    bucket_arn = props.get("TableBucketARN", "")
+    namespace = props.get("Namespace", "")
+    table_name = props.get("TableName", "")
+    _s3tables._tables.pop(_s3tables._table_key(bucket_arn, namespace, table_name), None)
+
+
 _RESOURCE_HANDLERS = {
     "AWS::S3::Bucket": {"create": _s3_create, "update": _s3_update, "delete": _s3_delete},
     "AWS::S3::BucketPolicy": {"create": _s3_bucket_policy_create, "delete": _s3_bucket_policy_delete},
+    "AWS::S3Tables::TableBucket": {"create": _s3tables_bucket_create, "delete": _s3tables_bucket_delete},
+    "AWS::S3Tables::Namespace": {"create": _s3tables_namespace_create, "delete": _s3tables_namespace_delete},
+    "AWS::S3Tables::Table": {"create": _s3tables_table_create, "delete": _s3tables_table_delete},
     "AWS::SQS::Queue": {"create": _sqs_create, "delete": _sqs_delete},
     "AWS::SNS::Topic": {"create": _sns_create, "delete": _sns_delete},
     "AWS::SNS::Subscription": {"create": _sns_sub_create, "delete": _sns_sub_delete},
@@ -4373,6 +4491,11 @@ _RESOURCE_HANDLERS = {
     "AWS::ApiGateway::Deployment": {"create": _apigw_deployment_create, "delete": _apigw_deployment_delete},
     "AWS::ApiGateway::Stage": {"create": _apigw_stage_create, "delete": _apigw_stage_delete},
     "AWS::ApiGateway::Account": {"create": _apigw_account_create, "delete": _apigw_account_delete},
+    "AWS::ApiGateway::GatewayResponse": {
+        "create": _apigw_gateway_response_create,
+        "update": _apigw_gateway_response_update,
+        "delete": _apigw_gateway_response_delete,
+    },
     "AWS::Lambda::EventSourceMapping": {"create": _lambda_esm_create, "update": _lambda_esm_update, "delete": _lambda_esm_delete},
     "AWS::Pipes::Pipe": {"create": _pipes_pipe_create, "delete": _pipes_pipe_delete},
     "AWS::Lambda::Alias": {"create": _lambda_alias_create, "delete": _lambda_alias_delete},
