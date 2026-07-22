@@ -2881,6 +2881,40 @@ def test_rds_enable_http_endpoint_not_found(rds):
     assert exc.value.response["Error"]["Code"] == "DBClusterNotFoundFault"
 
 
+def test_rds_disable_http_endpoint(rds):
+    """DisableHttpEndpoint disables Data API on an Aurora cluster."""
+    rds.create_db_cluster(
+        DBClusterIdentifier="http-ep-disable-cluster",
+        Engine="aurora-mysql",
+        MasterUsername="admin",
+        MasterUserPassword="password123",
+    )
+    try:
+        cluster_arn = rds.describe_db_clusters(
+            DBClusterIdentifier="http-ep-disable-cluster"
+        )["DBClusters"][0]["DBClusterArn"]
+
+        rds.enable_http_endpoint(ResourceArn=cluster_arn)
+
+        resp = rds.disable_http_endpoint(ResourceArn=cluster_arn)
+        assert resp["ResourceArn"] == cluster_arn
+        assert resp["HttpEndpointEnabled"] is False
+
+        desc = rds.describe_db_clusters(DBClusterIdentifier="http-ep-disable-cluster")
+        assert desc["DBClusters"][0]["HttpEndpointEnabled"] is False
+    finally:
+        rds.delete_db_cluster(DBClusterIdentifier="http-ep-disable-cluster", SkipFinalSnapshot=True)
+
+
+def test_rds_disable_http_endpoint_not_found(rds):
+    """DisableHttpEndpoint fails when the cluster ARN does not exist."""
+    with pytest.raises(ClientError) as exc:
+        rds.disable_http_endpoint(
+            ResourceArn="arn:aws:rds:us-east-1:123456789012:cluster:no-such-cluster"
+        )
+    assert exc.value.response["Error"]["Code"] == "DBClusterNotFoundFault"
+
+
 # ── Postgres 18+ mount-path compatibility ──────────────────
 
 
