@@ -27,6 +27,7 @@ STATE_DIR = os.environ.get("STATE_DIR", "/tmp/ministack-state")
 # still load and migrate. (U4)
 STATE_FORMAT_VERSION = 2
 SERVICE_STATE_FORMAT_VERSIONS = {
+    "athena": 3,
     "batch": 3,
     "ecs": 3,
     "resource_groups": 3,
