@@ -1050,9 +1050,29 @@ def _sg_rule_id(sg_id, is_egress, rule):
     return f"sgr-{digest}"
 
 
+def _sg_rule_arn(rule_id):
+    return f"arn:aws:ec2:{get_region()}:{get_account_id()}:security-group-rule/{rule_id}"
+
+
+def _sg_rule_tag_suffix(rule_id):
+    """AWS returns securityGroupRuleArn and a tagSet on every rule. Tags are
+    keyed by the content-derived rule id in the shared ``_tags`` store (set at
+    authorize time or via CreateTags on the sgr- id)."""
+    suffix = f"<securityGroupRuleArn>{_sg_rule_arn(rule_id)}</securityGroupRuleArn>"
+    tags = _tags.get(rule_id) or []
+    if tags:
+        tag_items = "".join(
+            f"<item><key>{_esc(t['Key'])}</key><value>{_esc(t.get('Value', ''))}</value></item>"
+            for t in tags
+        )
+        suffix += f"<tagSet>{tag_items}</tagSet>"
+    return suffix
+
+
 def _sg_rule_xml(sg_id, rule, is_egress=False):
     """Build <securityGroupRuleSet> items for Authorize responses (provider v6)."""
     rule_id = _sg_rule_id(sg_id, is_egress, rule)
+    suffix = _sg_rule_tag_suffix(rule_id)
     items = ""
     for cidr in rule.get("IpRanges", []):
         items += (f"<item>"
@@ -1064,6 +1084,7 @@ def _sg_rule_xml(sg_id, rule, is_egress=False):
                   f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
                   f"<toPort>{rule.get('ToPort', -1)}</toPort>"
                   f"<cidrIpv4>{cidr.get('CidrIp', '')}</cidrIpv4>"
+                  f"{suffix}"
                   f"</item>")
     for cidr6 in rule.get("Ipv6Ranges", []):
         items += (f"<item>"
@@ -1075,6 +1096,7 @@ def _sg_rule_xml(sg_id, rule, is_egress=False):
                   f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
                   f"<toPort>{rule.get('ToPort', -1)}</toPort>"
                   f"<cidrIpv6>{cidr6.get('CidrIpv6', '')}</cidrIpv6>"
+                  f"{suffix}"
                   f"</item>")
     for pair in rule.get("UserIdGroupPairs", []):
         ref_gid = pair.get("GroupId", "") if isinstance(pair, dict) else str(pair)
@@ -1090,6 +1112,7 @@ def _sg_rule_xml(sg_id, rule, is_egress=False):
                   f"<groupId>{ref_gid}</groupId>"
                   f"<userId>{get_account_id()}</userId>"
                   f"</referencedGroupInfo>"
+                  f"{suffix}"
                   f"</item>")
     if not items:
         # No CIDR ranges — still return the rule (e.g. referenced group)
@@ -1101,6 +1124,7 @@ def _sg_rule_xml(sg_id, rule, is_egress=False):
                  f"<ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>"
                  f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
                  f"<toPort>{rule.get('ToPort', -1)}</toPort>"
+                 f"{suffix}"
                  f"</item>")
     return items
 
@@ -1163,18 +1187,41 @@ def _is_malformed_security_group_id(group_id):
     return group_id in _KNOWN_MALFORMED_SECURITY_GROUP_IDS or not _SECURITY_GROUP_ID_RE.fullmatch(group_id or "")
 
 
+def _sg_rule_tag_specifications(p):
+    """Tags from a ``TagSpecification`` whose ResourceType is
+    ``security-group-rule`` — how the AWS provider tags a rule at authorize
+    time (aws_vpc_security_group_ingress_rule). They apply to every rule
+    created by the call."""
+    tags = []
+    i = 1
+    while _p(p, f"TagSpecification.{i}.ResourceType"):
+        if _p(p, f"TagSpecification.{i}.ResourceType") == "security-group-rule":
+            j = 1
+            while _p(p, f"TagSpecification.{i}.Tag.{j}.Key"):
+                tags.append({
+                    "Key": _p(p, f"TagSpecification.{i}.Tag.{j}.Key"),
+                    "Value": _p(p, f"TagSpecification.{i}.Tag.{j}.Value", ""),
+                })
+                j += 1
+        i += 1
+    return tags
+
+
 def _authorize_sg_ingress(p):
     sg_id = _p(p, "GroupId")
     sg = _security_groups.get(sg_id)
     if not sg:
         return _error("InvalidGroup.NotFound", f"Security group {sg_id} not found", 400)
     rules = _parse_ip_permissions(p, "IpPermissions")
+    rule_tags = _sg_rule_tag_specifications(p)
     rule_items = ""
     for r in rules:
         # Idempotent: skip rules that already exist (matches egress behavior and avoids
         # Terraform InvalidPermission.Duplicate when the provider re-authorizes unchanged rules).
         if not any(_rules_match(r, existing) for existing in sg["IpPermissions"]):
             sg["IpPermissions"].append(r)
+            if rule_tags:
+                _tags[_sg_rule_id(sg_id, False, r)] = list(rule_tags)
             rule_items += _sg_rule_xml(sg_id, r, is_egress=False)
     return _xml(200, "AuthorizeSecurityGroupIngressResponse",
                 f"<return>true</return><securityGroupRuleSet>{rule_items}</securityGroupRuleSet>")
@@ -1187,6 +1234,9 @@ def _revoke_sg_ingress(p):
         return _error("InvalidGroup.NotFound", f"Security group {sg_id} not found", 400)
     rules = _parse_ip_permissions(p, "IpPermissions")
     for r in rules:
+        for existing in sg["IpPermissions"]:
+            if _rules_match(r, existing):
+                _tags.pop(_sg_rule_id(sg_id, False, existing), None)
         sg["IpPermissions"] = [e for e in sg["IpPermissions"] if not _rules_match(r, e)]
     return _xml(200, "RevokeSecurityGroupIngressResponse", "<return>true</return>")
 
@@ -1197,10 +1247,13 @@ def _authorize_sg_egress(p):
     if not sg:
         return _error("InvalidGroup.NotFound", f"Security group {sg_id} not found", 400)
     rules = _parse_ip_permissions(p, "IpPermissions")
+    rule_tags = _sg_rule_tag_specifications(p)
     rule_items = ""
     for r in rules:
         if not any(_rules_match(r, existing) for existing in sg["IpPermissionsEgress"]):
             sg["IpPermissionsEgress"].append(r)
+            if rule_tags:
+                _tags[_sg_rule_id(sg_id, True, r)] = list(rule_tags)
             rule_items += _sg_rule_xml(sg_id, r, is_egress=True)
     return _xml(200, "AuthorizeSecurityGroupEgressResponse",
                 f"<return>true</return><securityGroupRuleSet>{rule_items}</securityGroupRuleSet>")
@@ -1217,6 +1270,7 @@ def _revoke_sg_egress(p):
     for existing in sg["IpPermissionsEgress"]:
         if any(_rules_match(r, existing) for r in rules):
             revoked_items += _revoked_sg_rule_xml(sg_id, existing, is_egress=True)
+            _tags.pop(_sg_rule_id(sg_id, True, existing), None)
         else:
             remaining.append(existing)
     sg["IpPermissionsEgress"] = remaining
@@ -3256,6 +3310,7 @@ def _now_ts():
 def _guess_resource_type(resource_id):
     _PREFIX_MAP = {
         "i-": "instance",
+        "sgr-": "security-group-rule",
         "sg-": "security-group",
         "vpc-": "vpc",
         "subnet-": "subnet",
@@ -4678,14 +4733,24 @@ def _describe_security_group_rules(p):
     else:
         groups = [(sg.get("GroupId"), sg) for sg in _security_groups.values()]
 
+    tag_filters = {k[len("tag:"):]: set(v) for k, v in filters.items() if k.startswith("tag:")}
+    tag_key_filter = set(filters.get("tag-key", []))
+
     items = ""
     for sg_id, sg in groups:
         if not sg:
             continue
         for is_egress, key in ((False, "IpPermissions"), (True, "IpPermissionsEgress")):
             for rule in sg.get(key, []):
-                if rule_id_filter and _sg_rule_id(sg_id, is_egress, rule) not in rule_id_filter:
+                rule_id = _sg_rule_id(sg_id, is_egress, rule)
+                if rule_id_filter and rule_id not in rule_id_filter:
                     continue
+                if tag_filters or tag_key_filter:
+                    tmap = {t["Key"]: t.get("Value", "") for t in (_tags.get(rule_id) or [])}
+                    if any(tmap.get(k) not in vals for k, vals in tag_filters.items()):
+                        continue
+                    if tag_key_filter and not (tag_key_filter & set(tmap)):
+                        continue
                 items += _sg_rule_xml(sg_id, rule, is_egress=is_egress)
     return _xml(200, "DescribeSecurityGroupRulesResponse", f"<securityGroupRuleSet>{items}</securityGroupRuleSet>")
 

@@ -2697,3 +2697,63 @@ def test_describe_security_group_rules_by_id_without_group_filter(ec2):
         SecurityGroupRuleIds=[rule_a],
     )["SecurityGroupRules"] == []
 
+
+def test_security_group_rule_tags_and_arn_round_trip(ec2):
+    """Regression for #1121 follow-up: DescribeSecurityGroupRules must return a
+    rule's Tags and SecurityGroupRuleArn, so Terraform's
+    aws_vpc_security_group_ingress_rule stops perpetually diffing tags_all."""
+    vpc = ec2.create_vpc(CidrBlock="10.100.100.0/24")["Vpc"]["VpcId"]
+    sg = ec2.create_security_group(
+        GroupName=f"sgr-tags-{_uuid_mod.uuid4().hex[:8]}",
+        Description="issue-1121-tags",
+        VpcId=vpc,
+    )["GroupId"]
+
+    # The AWS provider tags the rule at authorize time via a security-group-rule
+    # TagSpecification; the response echoes Tags and the ARN.
+    created = ec2.authorize_security_group_ingress(
+        GroupId=sg,
+        IpPermissions=[{
+            "IpProtocol": "tcp", "FromPort": 5678, "ToPort": 5678,
+            "IpRanges": [{"CidrIp": "10.100.100.0/24"}],
+        }],
+        TagSpecifications=[{
+            "ResourceType": "security-group-rule",
+            "Tags": [{"Key": "Name", "Value": "mytest-ingress-5678"}],
+        }],
+    )["SecurityGroupRules"][0]
+    rule_id = created["SecurityGroupRuleId"]
+    assert created["Tags"] == [{"Key": "Name", "Value": "mytest-ingress-5678"}]
+    assert created["SecurityGroupRuleArn"] == (
+        f"arn:aws:ec2:us-east-1:000000000000:security-group-rule/{rule_id}"
+    )
+
+    # The Terraform refresh path (describe by id) returns the same Tags + ARN.
+    refreshed = ec2.describe_security_group_rules(
+        SecurityGroupRuleIds=[rule_id],
+    )["SecurityGroupRules"][0]
+    assert refreshed["Tags"] == [{"Key": "Name", "Value": "mytest-ingress-5678"}]
+    assert refreshed["SecurityGroupRuleArn"] == created["SecurityGroupRuleArn"]
+
+    # tag: filter selects the rule, and CreateTags on the sgr- id also applies.
+    assert len(ec2.describe_security_group_rules(
+        Filters=[{"Name": "tag:Name", "Values": ["mytest-ingress-5678"]}],
+    )["SecurityGroupRules"]) == 1
+    ec2.create_tags(Resources=[rule_id], Tags=[{"Key": "Env", "Value": "test"}])
+    tags_now = {t["Key"]: t["Value"] for t in ec2.describe_security_group_rules(
+        SecurityGroupRuleIds=[rule_id],
+    )["SecurityGroupRules"][0]["Tags"]}
+    assert tags_now == {"Name": "mytest-ingress-5678", "Env": "test"}
+
+    # Revoking the rule drops its tags.
+    ec2.revoke_security_group_ingress(
+        GroupId=sg,
+        IpPermissions=[{
+            "IpProtocol": "tcp", "FromPort": 5678, "ToPort": 5678,
+            "IpRanges": [{"CidrIp": "10.100.100.0/24"}],
+        }],
+    )
+    assert ec2.describe_tags(
+        Filters=[{"Name": "resource-id", "Values": [rule_id]}],
+    )["Tags"] == []
+

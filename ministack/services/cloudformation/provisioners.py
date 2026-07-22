@@ -2297,7 +2297,8 @@ def _apigw_documentation_part_create(logical_id, props, stack_name):
 
     part = json.loads(body) if isinstance(body, (bytes, bytearray)) else json.loads(body)
     part_id = part.get("id", "")
-    return part_id, {"Id": part_id, "DocumentationPartId": part_id}
+    # AWS exposes only DocumentationPartId via Fn::GetAtt for this resource.
+    return part_id, {"DocumentationPartId": part_id}
 
 
 def _apigw_documentation_part_update(physical_id, old_props, new_props, stack_name):
@@ -2324,7 +2325,7 @@ def _apigw_documentation_part_update(physical_id, old_props, new_props, stack_na
         )
         if status >= 400:
             raise ValueError(f"AWS::ApiGateway::DocumentationPart update failed: {body!r}")
-    return physical_id, {"Id": physical_id, "DocumentationPartId": physical_id}
+    return physical_id, {"DocumentationPartId": physical_id}
 
 
 def _apigw_documentation_part_delete(physical_id, props):

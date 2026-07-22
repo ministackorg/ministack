@@ -492,7 +492,7 @@ subnet = ec2.create_subnet(
 | `AWS::ApiGateway::Stage` | Stage name | — |
 | `AWS::ApiGateway::DomainName` | Domain name | DistributionDomainName, DistributionHostedZoneId, DomainNameArn, RegionalDomainName, RegionalHostedZoneId |
 | `AWS::ApiGateway::GatewayResponse` | Response ID | Id |
-| `AWS::ApiGateway::DocumentationPart` | Documentation part ID | — |
+| `AWS::ApiGateway::DocumentationPart` | Documentation part ID | DocumentationPartId |
 | `AWS::AppConfig::Application` | Application ID | ApplicationId |
 | `AWS::AppSync::GraphQLApi` | API ID | Arn, GraphQLUrl, ApiId |
 | `AWS::AppSync::DataSource` | DataSource name | DataSourceArn |
