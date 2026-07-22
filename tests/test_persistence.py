@@ -1868,6 +1868,41 @@ def test_appsync_region_scoped_state_is_rejected_by_v2_reader(
     assert persistence.load_state("appsync") is None
 
 
+def test_emr_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject EMR regional state instead of dropping it."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    clusters = AccountRegionScopedDict()
+    clusters.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "j-LEGACYCLUSTER",
+        {
+            "Id": "j-LEGACYCLUSTER",
+            "ClusterArn": (
+                "arn:aws:elasticmapreduce:us-west-2:000000000000:"
+                "cluster/j-LEGACYCLUSTER"
+            ),
+        },
+    )
+    persistence.save_state("emr", {"_clusters": clusters})
+
+    raw = _json.loads((tmp_path / "emr.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded = persistence.load_state("emr")["_clusters"]
+    assert loaded.get_scoped(
+        "000000000000", "us-west-2", "j-LEGACYCLUSTER"
+    )["Id"] == "j-LEGACYCLUSTER"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("emr") is None
+
+
 def test_resource_groups_region_scoped_state_is_rejected_by_v2_reader(
     monkeypatch, tmp_path
 ):
