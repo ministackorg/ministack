@@ -374,6 +374,25 @@ def test_tagging_get_resources_appsync(tagging, appsync):
     assert api_arn in arns
 
 
+def test_tagging_get_resources_appsync_is_region_scoped():
+    east_appsync = _regional_client("appsync", "us-east-1")
+    west_tagging = _regional_client("resourcegroupstaggingapi", "us-west-2")
+    api = east_appsync.create_graphql_api(
+        name="tg-appsync-regional",
+        authenticationType="API_KEY",
+        tags={_TAG_KEY: "appsync-east"},
+    )["graphqlApi"]
+
+    try:
+        resp = west_tagging.get_resources(
+            TagFilters=[{"Key": _TAG_KEY, "Values": ["appsync-east"]}]
+        )
+        arns = [r["ResourceARN"] for r in resp["ResourceTagMappingList"]]
+        assert api["arn"] not in arns
+    finally:
+        east_appsync.delete_graphql_api(apiId=api["apiId"])
+
+
 def test_tagging_get_resources_scheduler(tagging, scheduler):
     scheduler.create_schedule(
         Name="tg-scheduler-sched",

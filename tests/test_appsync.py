@@ -5,12 +5,23 @@ import time
 import urllib.request
 import uuid as _uuid_mod
 import zipfile
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
+import boto3
 import pytest
 from botocore.exceptions import ClientError
 
 _ENDPOINT = "http://localhost:4566"
+
+
+def _client(region):
+    return boto3.client(
+        "appsync",
+        endpoint_url=_ENDPOINT,
+        region_name=region,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+    )
 
 
 def test_appsync_create_and_list_api():
@@ -25,6 +36,245 @@ def test_appsync_create_and_list_api():
 
     apis = appsync.list_graphql_apis()["graphqlApis"]
     assert any(a["apiId"] == api["apiId"] for a in apis)
+
+
+def test_appsync_graphql_apis_are_region_scoped():
+    east = _client("us-east-1")
+    west = _client("us-west-2")
+    east_api = east.create_graphql_api(
+        name="regional-api-east", authenticationType="API_KEY"
+    )["graphqlApi"]
+    west_api = west.create_graphql_api(
+        name="regional-api-west", authenticationType="API_KEY"
+    )["graphqlApi"]
+
+    try:
+        east_ids = {api["apiId"] for api in east.list_graphql_apis()["graphqlApis"]}
+        west_ids = {api["apiId"] for api in west.list_graphql_apis()["graphqlApis"]}
+        assert east_api["apiId"] in east_ids
+        assert east_api["apiId"] not in west_ids
+        assert west_api["apiId"] in west_ids
+        assert west_api["apiId"] not in east_ids
+        assert ":us-east-1:" in east_api["arn"]
+        assert ":us-west-2:" in west_api["arn"]
+
+        # Local data-plane URLs do not encode or sign a region. The API ID
+        # must select its stored region before resolver execution.
+        west_graphql = _appsync_graphql_post(
+            f"{_ENDPOINT}/v1/apis/{west_api['apiId']}/graphql",
+            "{ __typename }",
+        )
+        assert "errors" not in west_graphql
+    finally:
+        east.delete_graphql_api(apiId=east_api["apiId"])
+        west.delete_graphql_api(apiId=west_api["apiId"])
+
+
+@pytest.mark.parametrize("credential_location", ["header", "query"])
+def test_appsync_signed_graphql_request_preserves_region(credential_location):
+    east = _client("us-east-1")
+    api = east.create_graphql_api(
+        name=f"signed-region-{credential_location}", authenticationType="API_KEY"
+    )["graphqlApi"]
+    url = f"{_ENDPOINT}/v1/apis/{api['apiId']}/graphql"
+    headers = {}
+    credential = "test/20260722/us-west-2/appsync/aws4_request"
+    if credential_location == "header":
+        headers["Authorization"] = (
+            f"AWS4-HMAC-SHA256 Credential={credential}, "
+            "SignedHeaders=host;x-amz-date, Signature=fake"
+        )
+    else:
+        url = f"{url}?X-Amz-Credential={quote(credential, safe='')}"
+
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _appsync_graphql_post(url, "{ __typename }", headers=headers)
+        assert exc.value.code == 404
+    finally:
+        east.delete_graphql_api(apiId=api["apiId"])
+
+
+@pytest.mark.parametrize("api_selector", ["api_key", "single_api_fallback"])
+def test_appsync_signed_root_graphql_request_preserves_region(api_selector):
+    east = _client("us-east-1")
+    api = east.create_graphql_api(
+        name=f"signed-root-region-{api_selector}",
+        authenticationType="API_KEY" if api_selector == "api_key" else "AWS_IAM",
+    )["graphqlApi"]
+    url = f"{_ENDPOINT}/graphql"
+    headers = {
+        "Host": f"{api['apiId']}.appsync-api.us-east-1.localhost:4566",
+        "Authorization": (
+            "AWS4-HMAC-SHA256 "
+            "Credential=test/20260722/us-west-2/appsync/aws4_request, "
+            "SignedHeaders=host;x-amz-date, Signature=fake"
+        ),
+    }
+    if api_selector == "api_key":
+        headers["x-api-key"] = east.create_api_key(apiId=api["apiId"])["apiKey"]["id"]
+
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _appsync_graphql_post(url, "{ __typename }", headers=headers)
+        assert exc.value.code == 401
+    finally:
+        east.delete_graphql_api(apiId=api["apiId"])
+
+
+def test_appsync_signed_root_graphql_request_uses_current_region_fallback():
+    west = _client("us-west-2")
+    api = west.create_graphql_api(
+        name="signed-root-current-region-fallback",
+        authenticationType="AWS_IAM",
+    )["graphqlApi"]
+    headers = {
+        "Host": f"{api['apiId']}.appsync-api.us-west-2.localhost:4566",
+        "Authorization": (
+            "AWS4-HMAC-SHA256 "
+            "Credential=test/20260722/us-west-2/appsync/aws4_request, "
+            "SignedHeaders=host;x-amz-date, Signature=fake"
+        ),
+    }
+
+    try:
+        response = _appsync_graphql_post(
+            f"{_ENDPOINT}/graphql",
+            "{ __typename }",
+            headers=headers,
+        )
+        assert "errors" not in response
+    finally:
+        west.delete_graphql_api(apiId=api["apiId"])
+
+
+def test_appsync_graphql_honors_dynamodb_data_source_region():
+    east_ddb = boto3.client(
+        "dynamodb",
+        endpoint_url=_ENDPOINT,
+        region_name="us-east-1",
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+    )
+    west_appsync = _client("us-west-2")
+    table_name = f"appsync-cross-region-{_uuid_mod.uuid4().hex[:12]}"
+    east_ddb.create_table(
+        TableName=table_name,
+        KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    east_ddb.put_item(
+        TableName=table_name,
+        Item={"id": {"S": "item-1"}, "name": {"S": "East item"}},
+    )
+    api = west_appsync.create_graphql_api(
+        name="cross-region-ddb", authenticationType="API_KEY"
+    )["graphqlApi"]
+    west_appsync.create_data_source(
+        apiId=api["apiId"],
+        name="east-table",
+        type="AMAZON_DYNAMODB",
+        dynamodbConfig={"tableName": table_name, "awsRegion": "us-east-1"},
+    )
+    west_appsync.create_resolver(
+        apiId=api["apiId"],
+        typeName="Query",
+        fieldName="getItem",
+        dataSourceName="east-table",
+    )
+
+    try:
+        response = _appsync_graphql_post(
+            f"{_ENDPOINT}/v1/apis/{api['apiId']}/graphql",
+            'query { getItem(id: "item-1") { id name } }',
+        )
+        assert response["data"]["getItem"] == {
+            "id": "item-1",
+            "name": "East item",
+        }
+    finally:
+        west_appsync.delete_graphql_api(apiId=api["apiId"])
+        east_ddb.delete_table(TableName=table_name)
+
+
+def test_appsync_legacy_children_restore_beside_parent_api():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import appsync as service
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    api_region = "us-west-2"
+    api_id = "legacy-api"
+    apis = AccountScopedDict()
+    tags = AccountScopedDict()
+
+    set_request_account_id(account_id)
+    set_request_region(boot_region)
+    api_arn = f"arn:aws:appsync:{api_region}:{account_id}:apis/{api_id}"
+    apis[api_id] = {"apiId": api_id, "arn": api_arn}
+    tags[api_arn] = {"legacy": "true"}
+    payload = {"apis": apis, "tags": tags}
+    for key in ("api_keys", "data_sources", "resolvers", "types"):
+        children = AccountScopedDict()
+        children[api_id] = {"legacy": key}
+        payload[key] = children
+
+    service.reset()
+    try:
+        service.restore_state(payload)
+        assert service._apis.get_scoped(account_id, api_region, api_id)["arn"] == api_arn
+        for store in (
+            service._api_keys,
+            service._data_sources,
+            service._resolvers,
+            service._types,
+        ):
+            assert store.get_scoped(account_id, api_region, api_id) is not None
+            assert store.get_scoped(account_id, boot_region, api_id) is None
+        assert service._tags.get(api_arn) == {"legacy": "true"}
+    finally:
+        service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_appsync_reset_clears_all_regions():
+    from ministack.core.responses import get_region, set_request_region
+    from ministack.services import appsync as service
+
+    original_region = get_region()
+    regional_stores = (
+        service._apis,
+        service._api_keys,
+        service._data_sources,
+        service._resolvers,
+        service._types,
+    )
+    service.reset()
+    try:
+        for region in ("us-east-1", "us-west-2"):
+            set_request_region(region)
+            for store in regional_stores:
+                store[f"resource-{region}"] = {"region": region}
+        service._tags["arn:aws:appsync:us-east-1:000000000000:apis/tagged"] = {
+            "tag": "value"
+        }
+
+        service.reset()
+        assert all(not store.has_any() for store in regional_stores)
+        assert not service._tags._data
+    finally:
+        service.reset()
+        set_request_region(original_region)
 
 def test_appsync_get_and_delete_api():
     from conftest import make_client
