@@ -1868,6 +1868,41 @@ def test_appsync_region_scoped_state_is_rejected_by_v2_reader(
     assert persistence.load_state("appsync") is None
 
 
+def test_efs_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject EFS regional state instead of dropping it."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    file_systems = AccountRegionScopedDict()
+    file_systems.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "fs-11111111111111111",
+        {
+            "FileSystemId": "fs-11111111111111111",
+            "FileSystemArn": (
+                "arn:aws:elasticfilesystem:us-west-2:000000000000:"
+                "file-system/fs-11111111111111111"
+            ),
+        },
+    )
+    persistence.save_state("efs", {"file_systems": file_systems})
+
+    raw = _json.loads((tmp_path / "efs.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded = persistence.load_state("efs")["file_systems"]
+    assert loaded.get_scoped(
+        "000000000000", "us-west-2", "fs-11111111111111111"
+    )["FileSystemId"] == "fs-11111111111111111"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("efs") is None
+
+
 def test_resource_groups_region_scoped_state_is_rejected_by_v2_reader(
     monkeypatch, tmp_path
 ):
