@@ -2244,10 +2244,17 @@ def _create_domain_name(data):
         "domainName": domain_name,
         "certificateName": data.get("certificateName", ""),
         "certificateArn": data.get("certificateArn", ""),
+        "regionalCertificateName": data.get("regionalCertificateName", ""),
+        "regionalCertificateArn": data.get("regionalCertificateArn", ""),
         "distributionDomainName": f"{domain_name}.cloudfront.net",
+        "distributionHostedZoneId": "Z2FDTNDATAQYW2",
         "regionalDomainName": f"{domain_name}.execute-api.{get_region()}.amazonaws.com",
         "regionalHostedZoneId": "Z1UJRXOUMOOFQ8",
         "endpointConfiguration": data.get("endpointConfiguration", {"types": ["REGIONAL"]}),
+        "endpointAccessMode": data.get("endpointAccessMode", ""),
+        "mutualTlsAuthentication": data.get("mutualTlsAuthentication", {}),
+        "ownershipVerificationCertificateArn": data.get("ownershipVerificationCertificateArn", ""),
+        "routingMode": data.get("routingMode", "BASE_PATH_MAPPING_ONLY"),
         # securityPolicy is an opaque enum at the wire level; AWS keeps adding
         # new values (e.g. SecurityPolicy-TLS13-1-2-FIPS-PFS-PQ-2025-09 in
         # 2026-03). Accept whatever the caller sends; default mirrors AWS.
