@@ -1830,3 +1830,80 @@ def test_ecs_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path)
     # Simulate the previous binary, whose highest understood format is v2.
     monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
     assert persistence.load_state("ecs") is None
+
+
+def test_resource_groups_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject Resource Groups' regional schema instead
+    of accepting it as v2 and silently dropping every regional store."""
+
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    groups = AccountRegionScopedDict()
+    groups.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-group",
+        {
+            "GroupArn": (
+                "arn:aws:resource-groups:us-west-2:000000000000:"
+                "group/regional-group"
+            )
+        },
+    )
+    persistence.save_state("resource_groups", {"groups": groups})
+
+    raw = _json.loads((tmp_path / "resource_groups.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_groups = persistence.load_state("resource_groups")["groups"]
+    assert loaded_groups.get_scoped(
+        "000000000000", "us-west-2", "regional-group"
+    )["GroupArn"].endswith("group/regional-group")
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("resource_groups") is None
+
+
+def test_codebuild_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject CodeBuild's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    projects = AccountRegionScopedDict()
+    projects.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-project",
+        {
+            "arn": (
+                "arn:aws:codebuild:us-west-2:000000000000:"
+                "project/regional-project"
+            )
+        },
+    )
+    persistence.save_state("codebuild", {"projects": projects})
+
+    raw = _json.loads((tmp_path / "codebuild.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_projects = persistence.load_state("codebuild")["projects"]
+    assert loaded_projects.get_scoped(
+        "000000000000", "us-west-2", "regional-project"
+    )["arn"].endswith("project/regional-project")
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("codebuild") is None

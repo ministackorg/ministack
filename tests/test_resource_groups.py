@@ -6,6 +6,7 @@ exercised — they aren't reachable through the AWS CLI or Terraform.
 """
 
 import json
+import os
 import uuid
 
 import boto3
@@ -13,15 +14,15 @@ import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-ENDPOINT = "http://localhost:4566"
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 REGION = "us-east-1"
 
 
-def _client(account="test"):
+def _client(account="test", region=REGION):
     return boto3.client(
         "resource-groups",
         endpoint_url=ENDPOINT,
-        region_name=REGION,
+        region_name=region,
         aws_access_key_id=account,
         aws_secret_access_key="test",
         config=Config(retries={"mode": "standard"}),
@@ -393,3 +394,87 @@ def test_account_isolation_for_groups():
         assert exc.value.response["Error"]["Code"] == "NotFoundException"
     finally:
         a.delete_group(Group=name)
+
+
+def test_region_isolation_for_groups_and_account_settings():
+    east = _client(region="us-east-1")
+    west = _client(region="us-west-2")
+    name = f"region-{_uid()}"
+
+    east.create_group(
+        Name=name,
+        Description="east",
+        ResourceQuery=_tag_query("region", "east"),
+    )
+    west.create_group(
+        Name=name,
+        Description="west",
+        ResourceQuery=_tag_query("region", "west"),
+    )
+    try:
+        east_group = east.get_group(GroupName=name)["Group"]
+        west_group = west.get_group(GroupName=name)["Group"]
+        assert east_group["Description"] == "east"
+        assert west_group["Description"] == "west"
+        assert ":us-east-1:" in east_group["GroupArn"]
+        assert ":us-west-2:" in west_group["GroupArn"]
+
+        east.update_account_settings(GroupLifecycleEventsDesiredStatus="ACTIVE")
+        assert (
+            east.get_account_settings()["AccountSettings"][
+                "GroupLifecycleEventsDesiredStatus"
+            ]
+            == "ACTIVE"
+        )
+        assert (
+            west.get_account_settings()["AccountSettings"][
+                "GroupLifecycleEventsDesiredStatus"
+            ]
+            == "INACTIVE"
+        )
+    finally:
+        east.update_account_settings(GroupLifecycleEventsDesiredStatus="INACTIVE")
+        east.delete_group(Group=name)
+        west.delete_group(Group=name)
+
+
+def test_restore_legacy_child_state_uses_parent_group_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import resource_groups as service
+
+    account_id = "111111111111"
+    group_name = "legacy-group"
+    resource_region = "us-west-2"
+    boot_region = "us-east-1"
+    groups = AccountScopedDict()
+    queries = AccountScopedDict()
+
+    set_request_account_id(account_id)
+    set_request_region(boot_region)
+    groups[group_name] = {
+        "GroupArn": (
+            f"arn:aws:resource-groups:{resource_region}:{account_id}:"
+            f"group/{group_name}"
+        ),
+        "Name": group_name,
+    }
+    queries[group_name] = _tag_query("region", "legacy")
+
+    service.reset()
+    try:
+        service.restore_state({"groups": groups, "group_queries": queries})
+        assert service._groups.get_scoped(
+            account_id, resource_region, group_name
+        )["Name"] == group_name
+        assert service._group_queries.get_scoped(
+            account_id, resource_region, group_name
+        ) == _tag_query("region", "legacy")
+        assert service._group_queries.get_scoped(
+            account_id, boot_region, group_name
+        ) is None
+    finally:
+        service.reset()

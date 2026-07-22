@@ -272,6 +272,14 @@ _identity_tags = AccountScopedDict()   # identity_pool_id -> {key: value}
 _auth_codes = {}   # code -> {pool_id, client_id, username, redirect_uri, scopes, state, created_at}
 _AUTH_CODE_TTL = 300  # 5 minutes
 
+# Managed-login (Hosted UI) NEW_PASSWORD_REQUIRED sessions. Plain dict for the
+# same reason as `_auth_codes` above — no SigV4 on /login, so AccountScopedDict
+# would add no isolation; the unguessable token is the isolation boundary.
+_pending_new_password = {}   # token -> {pool_id, client_id, username, redirect_uri,
+                              #           scope, state, response_type, nonce,
+                              #           code_challenge, code_challenge_method, expires_at}
+_NEW_PASSWORD_SESSION_TTL = 300  # 5 minutes
+
 # ---------------------------------------------------------------------------
 # In-memory state — CUSTOM_AUTH Challenge Sessions
 # ---------------------------------------------------------------------------
@@ -1804,8 +1812,8 @@ def _update_user_pool_client(data):
     return json_response({"UserPoolClient": {k: v for k, v in client.items() if v is not None}})
 
 
-def _validate_password(pool, password):
-    """Validate password against the pool's PasswordPolicy. Returns error response or None."""
+def _password_policy_errors(pool, password):
+    """Return a list of PasswordPolicy violation strings, or [] if compliant."""
     policy = pool.get("Policies", {}).get("PasswordPolicy", {})
     min_len = policy.get("MinimumLength", 8)
     errors = []
@@ -1819,6 +1827,12 @@ def _validate_password(pool, password):
         errors.append("Password must have numeric characters")
     if policy.get("RequireSymbols", True) and not any(c in "^$*.[]{}()?-\"!@#%&/\\,><':;|_~`+=" for c in password):
         errors.append("Password must have symbol characters")
+    return errors
+
+
+def _validate_password(pool, password):
+    """Validate password against the pool's PasswordPolicy. Returns error response or None."""
+    errors = _password_policy_errors(pool, password)
     if errors:
         return error_response_json(
             "InvalidPasswordException",
@@ -3836,6 +3850,54 @@ button:hover{{background:#005a94}}
 </html>"""
 
 
+def _new_password_page_html(np_token, error_message=""):
+    esc = html_mod.escape
+    err_block = ""
+    if error_message:
+        err_block = f'<div class="error">{esc(error_message)}</div>'
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Change password</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  background:#f0f2f5;display:flex;justify-content:center;align-items:center;min-height:100vh}}
+.card{{background:#fff;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.1);
+  padding:40px;width:400px;max-width:90vw}}
+h1{{font-size:24px;font-weight:600;color:#232f3e;margin-bottom:24px;text-align:center}}
+label{{display:block;font-size:14px;font-weight:500;color:#545b64;margin-bottom:4px}}
+input[type=password]{{width:100%;padding:10px 12px;border:1px solid #aab7b8;
+  border-radius:4px;font-size:14px;margin-bottom:16px;outline:none;transition:border-color .15s}}
+input[type=password]:focus{{border-color:#0073bb;box-shadow:0 0 0 2px rgba(0,115,187,.2)}}
+button{{width:100%;padding:10px;background:#0073bb;color:#fff;border:none;border-radius:4px;
+  font-size:16px;font-weight:500;cursor:pointer;transition:background .15s}}
+button:hover{{background:#005a94}}
+.error{{background:#fce8e6;color:#d13212;border:1px solid #d13212;border-radius:4px;
+  padding:10px;margin-bottom:16px;font-size:13px;text-align:center}}
+.footer{{text-align:center;margin-top:20px;font-size:12px;color:#879596}}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>Set a new password</h1>
+{err_block}
+<form method="POST" action="/login">
+<input type="hidden" name="np_token" value="{esc(np_token)}">
+<label for="new_password">New password</label>
+<input type="password" id="new_password" name="new_password" autocomplete="new-password" required autofocus>
+<label for="confirm_password">Confirm new password</label>
+<input type="password" id="confirm_password" name="confirm_password" autocomplete="new-password" required>
+<button type="submit">Update password</button>
+</form>
+<div class="footer">Powered by ministack</div>
+</div>
+</body>
+</html>"""
+
+
 # -- /oauth2/authorize (GET) ------------------------------------------------
 
 def _oauth2_authorize_federation(query_params):
@@ -4333,6 +4395,30 @@ def _oauth2_idp_response(method, body, query_params):
 
 # -- /login (POST) ----------------------------------------------------------
 
+def _issue_auth_code_redirect(client_id, pool_id, redirect_uri, scope, username, nonce,
+                               code_challenge, code_challenge_method, state):
+    """Mint an authorization code and build the 302 redirect response for the Hosted UI."""
+    code = _generate_auth_code()
+    _authorization_codes[code] = {
+        "client_id": client_id,
+        "pool_id": pool_id,
+        "redirect_uri": redirect_uri,
+        "scope": scope,
+        "username": username,
+        "nonce": nonce,
+        "code_challenge": code_challenge,
+        "code_challenge_method": code_challenge_method,
+        "expires_at": time.time() + 300,
+    }
+
+    sep = "&" if "?" in redirect_uri else "?"
+    location = f"{redirect_uri}{sep}code={quote(code)}"
+    if state:
+        location += f"&state={quote(state)}"
+
+    return 302, {"Location": location, "Cache-Control": "no-store"}, b""
+
+
 def handle_login_submit(method, path, headers, body, query_params):
     """POST /login — process the login form and redirect with auth code."""
     form: dict = {}
@@ -4342,6 +4428,10 @@ def handle_login_submit(method, path, headers, body, query_params):
             form = {k: v[0] for k, v in parsed.items()}
         except Exception:
             pass
+
+    np_token = form.get("np_token", "")
+    if np_token:
+        return _handle_new_password_submit(np_token, form)
 
     username = form.get("username", "")
     password = form.get("password", "")
@@ -4379,27 +4469,75 @@ def handle_login_submit(method, path, headers, body, query_params):
         )
         return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
 
-    # Generate authorization code
-    code = _generate_auth_code()
-    _authorization_codes[code] = {
-        "client_id": client_id,
-        "pool_id": pool_id,
-        "redirect_uri": redirect_uri,
-        "scope": scope,
-        "username": username,
-        "nonce": nonce,
-        "code_challenge": code_challenge,
-        "code_challenge_method": code_challenge_method,
-        "expires_at": time.time() + 300,
-    }
+    if user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
+        np_token = secrets.token_urlsafe(24)
+        _pending_new_password[np_token] = {
+            "pool_id": pool_id,
+            "client_id": client_id,
+            "username": username,
+            "redirect_uri": redirect_uri,
+            "scope": scope,
+            "state": state,
+            "response_type": response_type,
+            "nonce": nonce,
+            "code_challenge": code_challenge,
+            "code_challenge_method": code_challenge_method,
+            "expires_at": time.time() + _NEW_PASSWORD_SESSION_TTL,
+        }
+        html_body = _new_password_page_html(np_token)
+        return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
 
-    # Redirect with code
-    sep = "&" if "?" in redirect_uri else "?"
-    location = f"{redirect_uri}{sep}code={quote(code)}"
-    if state:
-        location += f"&state={quote(state)}"
+    return _issue_auth_code_redirect(
+        client_id, pool_id, redirect_uri, scope, username, nonce,
+        code_challenge, code_challenge_method, state,
+    )
 
-    return 302, {"Location": location, "Cache-Control": "no-store"}, b""
+
+def _handle_new_password_submit(np_token, form):
+    """POST /login with `np_token` — finalize a FORCE_CHANGE_PASSWORD flow started by the
+    Hosted UI login form."""
+    session = _pending_new_password.get(np_token)
+    if not session or session["expires_at"] < time.time():
+        _pending_new_password.pop(np_token, None)
+        return _oauth2_error("invalid_request", "Session has expired. Please sign in again.")
+
+    new_password = form.get("new_password", "")
+    confirm_password = form.get("confirm_password", "")
+
+    if new_password != confirm_password:
+        html_body = _new_password_page_html(np_token, error_message="Passwords do not match.")
+        return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+
+    pool = _get_pool_unscoped(session["pool_id"])
+    if not pool:
+        _pending_new_password.pop(np_token, None)
+        return error_response_json("ResourceNotFoundException",
+                                   f"User pool {session['pool_id']} not found.", 400)
+
+    policy_errors = _password_policy_errors(pool, new_password)
+    if policy_errors:
+        html_body = _new_password_page_html(
+            np_token,
+            error_message="Password did not conform with policy: " + "; ".join(policy_errors),
+        )
+        return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+
+    user, err = _resolve_user(pool, session["username"])
+    if err:
+        _pending_new_password.pop(np_token, None)
+        return err
+
+    user["_password"] = new_password
+    user["UserStatus"] = "CONFIRMED"
+    user["UserLastModifiedDate"] = _now_epoch()
+
+    del _pending_new_password[np_token]
+
+    return _issue_auth_code_redirect(
+        session["client_id"], session["pool_id"], session["redirect_uri"], session["scope"],
+        session["username"], session["nonce"], session["code_challenge"],
+        session["code_challenge_method"], session["state"],
+    )
 
 
 # -- /oauth2/token (POST) ---------------------------------------------------
@@ -4982,3 +5120,5 @@ def reset():
     _auth_codes.clear()
     _authorization_codes.clear()
     _refresh_tokens.clear()
+    _challenge_sessions.clear()
+    _pending_new_password.clear()

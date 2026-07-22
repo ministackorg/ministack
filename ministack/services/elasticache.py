@@ -16,8 +16,8 @@ Supports: CreateCacheCluster, DeleteCacheCluster, DescribeCacheClusters,
           CreateSnapshot, DeleteSnapshot, DescribeSnapshots,
           DescribeEvents.
 
-When Docker is available, CreateCacheCluster spins up a real Redis/Memcached container.
-Otherwise returns localhost:6379 (assumes Redis sidecar in docker-compose).
+When Docker is available, CreateCacheCluster spins up a real Redis/Valkey/Memcached
+container. Otherwise returns localhost:6379 (assumes Redis sidecar in docker-compose).
 """
 
 import copy
@@ -412,15 +412,32 @@ def _get_docker():
 
 
 
+def _engine_image_and_port(engine, engine_version):
+    """Docker image and in-container port for a cache engine.
+
+    Valkey images live under the ``valkey/`` Docker Hub org and tag by
+    major.minor (AWS engine versions are two-part: 7.2, 8.0, 8.1); redis tags
+    by major. The official valkey image ships ``redis-*`` compatibility
+    symlinks, so the redis-cli readiness/bootstrap probes work unchanged.
+    """
+    if engine == "valkey":
+        parts = [p for p in (engine_version or "").split(".") if p]
+        tag = ".".join(parts[:2]) if len(parts) >= 2 else (parts[0] if parts else "8.0")
+        return apply_image_prefix(f"valkey/valkey:{tag}-alpine"), 6379
+    if engine == "redis":
+        return apply_image_prefix(f"redis:{engine_version.split('.')[0]}-alpine"), 6379
+    return apply_image_prefix(f"memcached:{engine_version}-alpine"), 11211
+
+
 def _spawn_redis_container(name, engine, engine_version, labels):
-    """Start a redis/memcached container.
+    """Start a redis/valkey/memcached container.
 
     Returns ``(host, port, container_id)``. On any failure (docker unavailable,
     image pull failed, etc.) returns ``(REDIS_DEFAULT_HOST, default_port, None)``
     so callers always have a usable endpoint shape — same fallback contract as
     the original inline spawn block.
     """
-    default_port = REDIS_DEFAULT_PORT if engine == "redis" else 11211
+    default_port = REDIS_DEFAULT_PORT if engine in ("redis", "valkey") else 11211
     docker_client = _get_docker()
     if not docker_client:
         return REDIS_DEFAULT_HOST, default_port, None
@@ -430,12 +447,7 @@ def _spawn_redis_container(name, engine, engine_version, labels):
     endpoint_host = _MINISTACK_HOST
     endpoint_port = host_port
 
-    if engine == "redis":
-        image = apply_image_prefix(f"redis:{engine_version.split('.')[0]}-alpine")
-        container_port = 6379
-    else:
-        image = apply_image_prefix(f"memcached:{engine_version}-alpine")
-        container_port = 11211
+    image, container_port = _engine_image_and_port(engine, engine_version)
 
     try:
         run_kwargs = dict(
@@ -467,8 +479,8 @@ def _spawn_redis_container(name, engine, engine_version, labels):
         return REDIS_DEFAULT_HOST, default_port, None
 
 
-def _spawn_redis_cluster_node(name, engine_version, labels):
-    """Spawn a redis container with cluster-mode enabled.
+def _spawn_redis_cluster_node(name, engine, engine_version, labels):
+    """Spawn a redis/valkey container with cluster-mode enabled.
 
     Requires DOCKER_NETWORK to be set so nodes can reach each other on the
     cluster bus. Returns ``(container_ip, port, container_id)`` on success;
@@ -481,8 +493,7 @@ def _spawn_redis_cluster_node(name, engine_version, labels):
     if not docker_client:
         return None, None, None
 
-    image = apply_image_prefix(f"redis:{engine_version.split('.')[0]}-alpine")
-    port = 6379
+    image, port = _engine_image_and_port(engine, engine_version)
     cmd = [
         "redis-server",
         "--cluster-enabled", "yes",
@@ -585,7 +596,7 @@ def _teardown_containers(docker_client, container_ids):
             logger.warning("ElastiCache: cleanup failed for %s: %s", cid, e)
 
 
-def _build_real_cluster_rg(rg_id, engine_version, num_node_groups, replicas_per_shard):
+def _build_real_cluster_rg(rg_id, engine, engine_version, num_node_groups, replicas_per_shard):
     """Spawn cluster-enabled nodes and run ``redis-cli --cluster create``.
 
     Returns ``(node_groups, container_ids)`` on success, or
@@ -622,6 +633,7 @@ def _build_real_cluster_rg(rg_id, engine_version, num_node_groups, replicas_per_
         name = f"ministack-elasticache-rg-{account_id}-{region}-{rg_id}-{ng_id}-p"
         ip, port, cid = _spawn_redis_cluster_node(
             name=name,
+            engine=engine,
             engine_version=engine_version,
             labels={**common_labels, "node_group": ng_id, "role": "primary"},
         )
@@ -637,6 +649,7 @@ def _build_real_cluster_rg(rg_id, engine_version, num_node_groups, replicas_per_
             name = f"ministack-elasticache-rg-{account_id}-{region}-{rg_id}-{ng_id}-r{r}"
             ip, port, cid = _spawn_redis_cluster_node(
                 name=name,
+                engine=engine,
                 engine_version=engine_version,
                 labels={
                     **common_labels,
@@ -861,7 +874,7 @@ async def handle_request(method, path, headers, body, query_params):
 def _create_cache_cluster(p):
     cluster_id = _p(p, "CacheClusterId")
     engine = _p(p, "Engine") or "redis"
-    engine_version = _p(p, "EngineVersion") or ("7.0.12" if engine == "redis" else "1.6.17")
+    engine_version = _p(p, "EngineVersion") or {"redis": "7.0.12", "valkey": "8.0"}.get(engine, "1.6.17")
     node_type = _p(p, "CacheNodeType") or "cache.t3.micro"
     num_nodes = int(_p(p, "NumCacheNodes") or "1")
 
@@ -1020,7 +1033,7 @@ def _create_replication_group(p):
     desc = _p(p, "ReplicationGroupDescription") or ""
     node_type = _p(p, "CacheNodeType") or "cache.t3.micro"
     engine = _p(p, "Engine") or "redis"
-    engine_version = _p(p, "EngineVersion") or "7.0.12"
+    engine_version = _p(p, "EngineVersion") or ("8.0" if engine == "valkey" else "7.0.12")
     num_node_groups = int(_p(p, "NumNodeGroups") or "1")
     num_cache_clusters = int(_p(p, "NumCacheClusters") or "1")
     replicas_per_node_group = int(_p(p, "ReplicasPerNodeGroup") or max(num_cache_clusters - 1, 0))
@@ -1046,8 +1059,8 @@ def _create_replication_group(p):
 
     # Three paths for the spawn step:
     #   (a) Real cluster-mode bootstrap — only when ALL of: num_node_groups>1,
-    #       engine=redis, ELASTICACHE_CLUSTER_MODE_REAL=1, DOCKER_NETWORK set,
-    #       docker reachable. Spawns N×(1+R) cluster-enabled nodes and runs
+    #       engine=redis/valkey, ELASTICACHE_CLUSTER_MODE_REAL=1, DOCKER_NETWORK
+    #       set, docker reachable. Spawns N×(1+R) cluster-enabled nodes and runs
     #       ``redis-cli --cluster create`` so CLUSTER SLOTS is real.
     #   (b) Per-shard fan-out — num_node_groups>=1 but cluster-mode prerequisites
     #       not met. One container per shard, members within a shard share the
@@ -1058,7 +1071,7 @@ def _create_replication_group(p):
 
     use_real_cluster = (
         num_node_groups > 1
-        and engine == "redis"
+        and engine in ("redis", "valkey")
         and ELASTICACHE_CLUSTER_MODE_REAL
         and DOCKER_NETWORK
         and _get_docker() is not None
@@ -1074,7 +1087,7 @@ def _create_replication_group(p):
 
     if use_real_cluster:
         node_groups, container_ids = _build_real_cluster_rg(
-            rg_id, engine_version, num_node_groups, replicas_per_node_group,
+            rg_id, engine, engine_version, num_node_groups, replicas_per_node_group,
         )
         if node_groups is None:
             # Bootstrap failed — clean up partial state and fall back.
@@ -1662,7 +1675,11 @@ except Exception:
 
 def _describe_engine_versions(p):
     engine = _p(p, "Engine") or "redis"
-    versions = {"redis": ["7.1.0", "7.0.12", "6.2.14", "5.0.6"], "memcached": ["1.6.22", "1.6.17", "1.6.12"]}
+    versions = {
+        "redis": ["7.1.0", "7.0.12", "6.2.14", "5.0.6"],
+        "valkey": ["8.1", "8.0", "7.2"],
+        "memcached": ["1.6.22", "1.6.17", "1.6.12"],
+    }
     # CacheEngineVersionList.member.locationName = "CacheEngineVersion"
     members = "".join(
         f"<CacheEngineVersion><Engine>{engine}</Engine><EngineVersion>{v}</EngineVersion>"

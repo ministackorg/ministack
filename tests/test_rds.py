@@ -1,16 +1,21 @@
 import asyncio
+import contextlib
 import io
 import json
 import os
 import sys
 import time
 import types
+import uuid
 import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
+from conftest import ENDPOINT
 
 DEFAULT_AURORA_MYSQL_ENGINE_VERSION = "8.0.mysql_aurora.3.10.3"
 UNSUPPORTED_AURORA_MYSQL_ENGINE_VERSION = "9.0.mysql_aurora.9.0.1"
@@ -2881,6 +2886,40 @@ def test_rds_enable_http_endpoint_not_found(rds):
     assert exc.value.response["Error"]["Code"] == "DBClusterNotFoundFault"
 
 
+def test_rds_disable_http_endpoint(rds):
+    """DisableHttpEndpoint disables Data API on an Aurora cluster."""
+    rds.create_db_cluster(
+        DBClusterIdentifier="http-ep-disable-cluster",
+        Engine="aurora-mysql",
+        MasterUsername="admin",
+        MasterUserPassword="password123",
+    )
+    try:
+        cluster_arn = rds.describe_db_clusters(
+            DBClusterIdentifier="http-ep-disable-cluster"
+        )["DBClusters"][0]["DBClusterArn"]
+
+        rds.enable_http_endpoint(ResourceArn=cluster_arn)
+
+        resp = rds.disable_http_endpoint(ResourceArn=cluster_arn)
+        assert resp["ResourceArn"] == cluster_arn
+        assert resp["HttpEndpointEnabled"] is False
+
+        desc = rds.describe_db_clusters(DBClusterIdentifier="http-ep-disable-cluster")
+        assert desc["DBClusters"][0]["HttpEndpointEnabled"] is False
+    finally:
+        rds.delete_db_cluster(DBClusterIdentifier="http-ep-disable-cluster", SkipFinalSnapshot=True)
+
+
+def test_rds_disable_http_endpoint_not_found(rds):
+    """DisableHttpEndpoint fails when the cluster ARN does not exist."""
+    with pytest.raises(ClientError) as exc:
+        rds.disable_http_endpoint(
+            ResourceArn="arn:aws:rds:us-east-1:123456789012:cluster:no-such-cluster"
+        )
+    assert exc.value.response["Error"]["Code"] == "DBClusterNotFoundFault"
+
+
 # ── Postgres 18+ mount-path compatibility ──────────────────
 
 
@@ -4494,3 +4533,1403 @@ exports.handler = async (event) => {{
             )
         except Exception:
             pass
+
+
+# ===========================================================================
+# Region scoping, ARN adoption, password rotation, and live Aurora shared-
+# storage. Folded from test_rds_{regions,arn_adoption,password_rotation,
+# aurora_cluster_integration}.py. The 3 tests that were duplicated across
+# regions+arn_adoption keep the arn_adoption (superset) versions; aurora
+# tests carry a per-test DOCKER_NETWORK skip (was a module-level pytestmark).
+# ===========================================================================
+
+
+def _regional_rds(region, access_key_id="test"):
+    return boto3.client(
+        "rds",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id=access_key_id,
+        aws_secret_access_key="test",
+        region_name=region,
+        config=Config(region_name=region, retries={"mode": "standard"}),
+    )
+
+
+def _delete_cluster(client, cluster_id):
+    try:
+        client.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+    except ClientError:
+        pass
+
+
+def _delete_instance(client, instance_id):
+    try:
+        client.delete_db_instance(DBInstanceIdentifier=instance_id, SkipFinalSnapshot=True)
+    except ClientError:
+        pass
+
+
+def _remove_global_member(client, global_id, cluster_id):
+    try:
+        client.remove_from_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            DbClusterIdentifier=cluster_id,
+        )
+    except ClientError:
+        pass
+
+
+def _delete_global_cluster(client, global_id):
+    try:
+        client.modify_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            DeletionProtection=False,
+        )
+    except ClientError:
+        pass
+    try:
+        client.delete_global_cluster(GlobalClusterIdentifier=global_id)
+    except ClientError:
+        pass
+
+
+def _cleanup_two_member_global(east, global_id, primary_arn=None, secondary_arn=None):
+    if primary_arn:
+        try:
+            east.switchover_global_cluster(
+                GlobalClusterIdentifier=global_id,
+                TargetDbClusterIdentifier=primary_arn,
+            )
+        except ClientError:
+            pass
+    for cluster_arn in (secondary_arn, primary_arn):
+        if cluster_arn:
+            _remove_global_member(east, global_id, cluster_arn)
+    _delete_global_cluster(east, global_id)
+
+
+def test_rds_clusters_are_region_scoped():
+    east = _regional_rds("us-east-1")
+    west = _regional_rds("us-west-2")
+    east_only = f"rds-east-only-{uuid.uuid4().hex[:8]}"
+    shared = f"rds-shared-{uuid.uuid4().hex[:8]}"
+
+    try:
+        east.create_db_cluster(
+            DBClusterIdentifier=east_only,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )
+        with pytest.raises(ClientError) as exc:
+            west.describe_db_clusters(DBClusterIdentifier=east_only)
+        assert exc.value.response["Error"]["Code"] == "DBClusterNotFoundFault"
+
+        east.create_db_cluster(
+            DBClusterIdentifier=shared,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+            DatabaseName="eastdb",
+        )
+        west.create_db_cluster(
+            DBClusterIdentifier=shared,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+            DatabaseName="westdb",
+        )
+
+        east_cluster = east.describe_db_clusters(DBClusterIdentifier=shared)["DBClusters"][0]
+        west_cluster = west.describe_db_clusters(DBClusterIdentifier=shared)["DBClusters"][0]
+        assert east_cluster["DBClusterArn"] != west_cluster["DBClusterArn"]
+        assert ":us-east-1:" in east_cluster["DBClusterArn"]
+        assert ":us-west-2:" in west_cluster["DBClusterArn"]
+        assert east_cluster["DatabaseName"] == "eastdb"
+        assert west_cluster["DatabaseName"] == "westdb"
+    finally:
+        for client, cluster_id in (
+            (east, east_only),
+            (east, shared),
+            (west, shared),
+        ):
+            _delete_cluster(client, cluster_id)
+
+
+def test_rds_cluster_arn_lookup_rejects_foreign_account():
+    account_a = _regional_rds("us-west-2", access_key_id="111111111111")
+    account_b = _regional_rds("us-west-2", access_key_id="222222222222")
+    cluster_id = f"rds-cross-account-{uuid.uuid4().hex[:8]}"
+
+    try:
+        cluster = account_a.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+
+        same_account = account_a.describe_db_clusters(
+            DBClusterIdentifier=cluster["DBClusterArn"],
+        )["DBClusters"][0]
+        assert same_account["DBClusterIdentifier"] == cluster_id
+
+        with pytest.raises(ClientError) as exc:
+            account_b.describe_db_clusters(DBClusterIdentifier=cluster["DBClusterArn"])
+        assert exc.value.response["Error"]["Code"] == "DBClusterNotFoundFault"
+    finally:
+        _delete_cluster(account_a, cluster_id)
+
+
+def test_rds_regional_cluster_apis_reject_foreign_region_arns():
+    east = _regional_rds("us-east-1")
+    west = _regional_rds("us-west-2")
+    cluster_id = f"rds-foreign-region-{uuid.uuid4().hex[:8]}"
+    instance_id = f"rds-foreign-region-{uuid.uuid4().hex[:8]}"
+    global_id = f"global-foreign-region-{uuid.uuid4().hex[:8]}"
+
+    try:
+        cluster = west.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+        cluster_arn = cluster["DBClusterArn"]
+
+        same_region = west.describe_db_clusters(
+            DBClusterIdentifier=cluster_arn,
+        )["DBClusters"][0]
+        assert same_region["DBClusterIdentifier"] == cluster_id
+
+        with pytest.raises(ClientError) as exc:
+            east.describe_db_clusters(DBClusterIdentifier=cluster_arn)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            east.modify_db_cluster(
+                DBClusterIdentifier=cluster_arn,
+                BackupRetentionPeriod=1,
+                ApplyImmediately=True,
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            east.delete_db_cluster(DBClusterIdentifier=cluster_arn, SkipFinalSnapshot=True)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            east.enable_http_endpoint(ResourceArn=cluster_arn)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundFault"
+
+        with pytest.raises(ClientError) as exc:
+            east.create_db_instance(
+                DBInstanceIdentifier=instance_id,
+                DBClusterIdentifier=cluster_arn,
+                DBInstanceClass="db.t3.micro",
+                Engine="aurora-mysql",
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            east.create_global_cluster(
+                GlobalClusterIdentifier=global_id,
+                SourceDBClusterIdentifier=cluster_arn,
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            west.describe_db_instances(DBInstanceIdentifier=instance_id)
+        assert exc.value.response["Error"]["Code"] == "DBInstanceNotFound"
+    finally:
+        _delete_global_cluster(east, global_id)
+        _delete_instance(west, instance_id)
+        _delete_cluster(west, cluster_id)
+
+
+def test_rds_instances_are_region_scoped():
+    east = _regional_rds("us-east-1")
+    west = _regional_rds("us-west-2")
+    shared = f"rds-inst-shared-{uuid.uuid4().hex[:8]}"
+
+    try:
+        east.create_db_instance(
+            DBInstanceIdentifier=shared,
+            DBInstanceClass="db.t3.micro",
+            Engine="postgres",
+            MasterUsername="admin",
+            MasterUserPassword="pass",
+            AllocatedStorage=10,
+        )
+        west.create_db_instance(
+            DBInstanceIdentifier=shared,
+            DBInstanceClass="db.t3.small",
+            Engine="postgres",
+            MasterUsername="admin",
+            MasterUserPassword="pass",
+            AllocatedStorage=20,
+        )
+
+        east_instance = east.describe_db_instances(DBInstanceIdentifier=shared)["DBInstances"][0]
+        west_instance = west.describe_db_instances(DBInstanceIdentifier=shared)["DBInstances"][0]
+        assert east_instance["DBInstanceArn"] != west_instance["DBInstanceArn"]
+        assert ":us-east-1:" in east_instance["DBInstanceArn"]
+        assert ":us-west-2:" in west_instance["DBInstanceArn"]
+        assert east_instance["DBInstanceClass"] == "db.t3.micro"
+        assert west_instance["DBInstanceClass"] == "db.t3.small"
+    finally:
+        _delete_instance(east, shared)
+        _delete_instance(west, shared)
+
+
+def test_rds_regional_instance_apis_reject_foreign_region_arns():
+    east = _regional_rds("us-east-1")
+    west = _regional_rds("us-west-2")
+    instance_id = f"rds-inst-arn-{uuid.uuid4().hex[:8]}"
+    snapshot_id = f"rds-inst-arn-snap-{uuid.uuid4().hex[:8]}"
+
+    try:
+        instance = west.create_db_instance(
+            DBInstanceIdentifier=instance_id,
+            DBInstanceClass="db.t3.micro",
+            Engine="postgres",
+            MasterUsername="admin",
+            MasterUserPassword="pass",
+            AllocatedStorage=10,
+        )["DBInstance"]
+        instance_arn = instance["DBInstanceArn"]
+
+        same_region = west.describe_db_instances(DBInstanceIdentifier=instance_arn)["DBInstances"][0]
+        assert same_region["DBInstanceIdentifier"] == instance_id
+
+        with pytest.raises(ClientError) as exc:
+            east.describe_db_instances(DBInstanceIdentifier=instance_arn)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            east.modify_db_instance(
+                DBInstanceIdentifier=instance_arn,
+                DBInstanceClass="db.t3.small",
+                ApplyImmediately=True,
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            east.create_db_snapshot(
+                DBSnapshotIdentifier=snapshot_id,
+                DBInstanceIdentifier=instance_arn,
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            east.delete_db_instance(DBInstanceIdentifier=instance_arn, SkipFinalSnapshot=True)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+    finally:
+        try:
+            west.delete_db_instance(DBInstanceIdentifier=instance_id, SkipFinalSnapshot=True)
+        except ClientError:
+            pass
+
+
+def test_rds_legacy_instance_restore_preserves_arn_region(monkeypatch):
+    from ministack.core.responses import AccountScopedDict, get_region, set_request_region
+    from ministack.services import rds
+
+    class ImmediateThread:
+        def __init__(self, target, args=(), daemon=None):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            self.target(*self.args)
+
+    original_region = get_region()
+    instance_id = f"rds-restore-{uuid.uuid4().hex[:8]}"
+    instance = {
+        "DBInstanceIdentifier": instance_id,
+        "DBInstanceArn": f"arn:aws:rds:us-west-2:000000000000:db:{instance_id}",
+    }
+    legacy = AccountScopedDict()
+    legacy.set_scoped("000000000000", "us-east-1", instance_id, instance)
+
+    monkeypatch.setattr(rds, "_get_docker", lambda: None)
+    monkeypatch.setattr(rds.threading, "Thread", ImmediateThread)
+
+    try:
+        rds.reset()
+        rds.restore_state({"instances": legacy})
+
+        assert rds._instances.get_scoped("000000000000", "us-east-1", instance_id) is None
+        restored = rds._instances.get_scoped("000000000000", "us-west-2", instance_id)
+        assert restored["DBInstanceArn"] == instance["DBInstanceArn"]
+        assert restored["DBInstanceStatus"] == "available"
+    finally:
+        rds.reset()
+        set_request_region(original_region)
+
+
+def test_rds_docker_artifact_names_are_region_scoped():
+    from ministack.core.responses import get_region, set_request_region
+    from ministack.services import rds
+
+    original_region = get_region()
+    try:
+        set_request_region("us-east-1")
+        east_name = rds._rds_docker_name("shared-db")
+        east_volume = rds._rds_docker_volume_name("shared-db")
+
+        set_request_region("us-west-2")
+        west_name = rds._rds_docker_name("shared-db")
+        west_volume = rds._rds_docker_volume_name("shared-db")
+
+        assert east_name != west_name
+        assert east_volume != west_volume
+        assert east_name.endswith("-shared-db")
+        assert west_name.endswith("-shared-db")
+    finally:
+        set_request_region(original_region)
+
+
+def test_create_db_cluster_first_global_member_is_writer():
+    east = _regional_rds("us-east-1")
+    suffix = uuid.uuid4().hex[:8]
+    global_id = f"global-empty-{suffix}"
+    cluster_id = f"global-first-{suffix}"
+
+    try:
+        east.create_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            Engine="aurora-mysql",
+        )
+        cluster = east.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            GlobalClusterIdentifier=global_id,
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+
+        global_cluster = east.describe_global_clusters(
+            GlobalClusterIdentifier=global_id,
+        )["GlobalClusters"][0]
+        members = {m["DBClusterArn"]: m for m in global_cluster["GlobalClusterMembers"]}
+        assert members[cluster["DBClusterArn"]]["IsWriter"] is True
+    finally:
+        _remove_global_member(east, global_id, cluster_id)
+        _delete_cluster(east, cluster_id)
+        _delete_global_cluster(east, global_id)
+
+
+def test_create_db_cluster_validates_global_cluster_identifier_and_engine():
+    east = _regional_rds("us-east-1")
+    suffix = uuid.uuid4().hex[:8]
+    global_id = f"global-validate-{suffix}"
+    global_arn_id = f"arn:aws:rds::000000000000:global-cluster:{global_id}"
+    cluster_id = f"global-validate-member-{suffix}"
+
+    try:
+        global_cluster = east.create_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            Engine="aurora-postgresql",
+            EngineVersion="15.3",
+        )["GlobalCluster"]
+
+        with pytest.raises(ClientError) as exc:
+            east.create_db_cluster(
+                DBClusterIdentifier=f"{cluster_id}-arn",
+                Engine="aurora-postgresql",
+                GlobalClusterIdentifier=global_arn_id,
+                MasterUsername="admin",
+                MasterUserPassword="password123",
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            east.create_db_cluster(
+                DBClusterIdentifier=f"{cluster_id}-engine",
+                Engine="aurora-mysql",
+                GlobalClusterIdentifier=global_id,
+                MasterUsername="admin",
+                MasterUserPassword="password123",
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            east.create_db_cluster(
+                DBClusterIdentifier=f"{cluster_id}-version",
+                Engine="aurora-postgresql",
+                EngineVersion="14.8",
+                GlobalClusterIdentifier=global_id,
+                MasterUsername="admin",
+                MasterUserPassword="password123",
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        member = east.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-postgresql",
+            GlobalClusterIdentifier=global_id,
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+        assert member["Engine"] == global_cluster["Engine"]
+        assert member["EngineVersion"] == global_cluster["EngineVersion"]
+
+        with pytest.raises(ClientError) as exc:
+            east.create_db_cluster(
+                DBClusterIdentifier=f"{cluster_id}-same-region",
+                Engine="aurora-postgresql",
+                GlobalClusterIdentifier=global_id,
+                MasterUsername="admin",
+                MasterUserPassword="password123",
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+    finally:
+        _remove_global_member(east, global_id, cluster_id)
+        _delete_cluster(east, cluster_id)
+        _delete_global_cluster(east, global_id)
+
+
+def test_aurora_global_metadata_spans_regions():
+    east = _regional_rds("us-east-1")
+    west = _regional_rds("us-west-2")
+    suffix = uuid.uuid4().hex[:8]
+    primary_id = f"global-primary-{suffix}"
+    secondary_id = f"global-secondary-{suffix}"
+    global_id = f"global-metadata-{suffix}"
+
+    try:
+        primary = east.create_db_cluster(
+            DBClusterIdentifier=primary_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+        east.create_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            SourceDBClusterIdentifier=primary["DBClusterArn"],
+            DeletionProtection=True,
+        )
+
+        primary_after_attach = east.describe_db_clusters(
+            DBClusterIdentifier=primary_id,
+        )["DBClusters"][0]
+        assert primary_after_attach["GlobalClusterIdentifier"] == global_id
+
+        west.create_db_cluster(
+            DBClusterIdentifier=secondary_id,
+            Engine="aurora-mysql",
+            GlobalClusterIdentifier=global_id,
+            KmsKeyId="alias/aws/rds",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )
+        secondary = west.describe_db_clusters(
+            DBClusterIdentifier=secondary_id,
+        )["DBClusters"][0]
+        assert secondary["GlobalClusterIdentifier"] == global_id
+        assert secondary["KmsKeyId"] == "alias/aws/rds"
+
+        east_global = east.describe_global_clusters(
+            GlobalClusterIdentifier=global_id,
+        )["GlobalClusters"][0]
+        west_global = west.describe_global_clusters(
+            GlobalClusterIdentifier=global_id,
+        )["GlobalClusters"][0]
+        assert east_global == west_global
+        assert east_global["DeletionProtection"] is True
+
+        by_arn = {m["DBClusterArn"]: m for m in east_global["GlobalClusterMembers"]}
+        assert set(by_arn) == {primary["DBClusterArn"], secondary["DBClusterArn"]}
+        assert by_arn[primary["DBClusterArn"]]["IsWriter"] is True
+        assert by_arn[secondary["DBClusterArn"]]["IsWriter"] is False
+        assert by_arn[secondary["DBClusterArn"]]["SynchronizationStatus"] == "connected"
+        assert by_arn[secondary["DBClusterArn"]]["GlobalWriteForwardingStatus"] == "disabled"
+
+        with pytest.raises(ClientError) as exc:
+            west.delete_db_cluster(DBClusterIdentifier=secondary_id, SkipFinalSnapshot=True)
+        assert exc.value.response["Error"]["Code"] == "InvalidDBClusterStateFault"
+
+        east.modify_global_cluster(GlobalClusterIdentifier=global_id, DeletionProtection=False)
+        east.modify_db_cluster(DBClusterIdentifier=primary_id, DeletionProtection=True)
+        primary_modified = east.describe_db_clusters(
+            DBClusterIdentifier=primary_id,
+        )["DBClusters"][0]
+        assert primary_modified["DeletionProtection"] is True
+        east.modify_db_cluster(DBClusterIdentifier=primary_id, DeletionProtection=False)
+
+        with pytest.raises(ClientError) as exc:
+            east.delete_global_cluster(GlobalClusterIdentifier=global_id)
+        assert exc.value.response["Error"]["Code"] == "InvalidGlobalClusterStateFault"
+
+        with pytest.raises(ClientError) as exc:
+            west.remove_from_global_cluster(
+                GlobalClusterIdentifier=global_id,
+                DbClusterIdentifier=primary["DBClusterArn"],
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidGlobalClusterStateFault"
+
+        east.remove_from_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            DbClusterIdentifier=secondary["DBClusterArn"],
+        )
+        secondary_after_detach = west.describe_db_clusters(
+            DBClusterIdentifier=secondary_id,
+        )["DBClusters"][0]
+        assert "GlobalClusterIdentifier" not in secondary_after_detach
+        remaining = east.describe_global_clusters(
+            GlobalClusterIdentifier=global_id,
+        )["GlobalClusters"][0]["GlobalClusterMembers"]
+        assert len(remaining) == 1
+        west.delete_db_cluster(DBClusterIdentifier=secondary_id, SkipFinalSnapshot=True)
+
+        east.remove_from_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            DbClusterIdentifier=primary["DBClusterArn"],
+        )
+        empty_global = east.describe_global_clusters(
+            GlobalClusterIdentifier=global_id,
+        )["GlobalClusters"][0]
+        assert empty_global["GlobalClusterMembers"] == []
+        east.delete_global_cluster(GlobalClusterIdentifier=global_id)
+        east.delete_db_cluster(DBClusterIdentifier=primary_id, SkipFinalSnapshot=True)
+    finally:
+        _remove_global_member(west, global_id, secondary_id)
+        _remove_global_member(east, global_id, primary_id)
+        _delete_global_cluster(east, global_id)
+        _delete_cluster(west, secondary_id)
+        _delete_cluster(east, primary_id)
+
+
+def test_switchover_global_cluster_promotes_foreign_region_member_arn():
+    east = _regional_rds("us-east-1")
+    west = _regional_rds("us-west-2")
+    suffix = uuid.uuid4().hex[:8]
+    primary_id = f"global-switch-primary-{suffix}"
+    secondary_id = f"global-switch-secondary-{suffix}"
+    global_id = f"global-switch-{suffix}"
+    primary_arn = None
+    secondary_arn = None
+
+    try:
+        primary = east.create_db_cluster(
+            DBClusterIdentifier=primary_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+        primary_arn = primary["DBClusterArn"]
+        east.create_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            SourceDBClusterIdentifier=primary_arn,
+        )
+        secondary = west.create_db_cluster(
+            DBClusterIdentifier=secondary_id,
+            Engine="aurora-mysql",
+            GlobalClusterIdentifier=global_id,
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+        secondary_arn = secondary["DBClusterArn"]
+
+        response = east.switchover_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            TargetDbClusterIdentifier=secondary_arn,
+        )["GlobalCluster"]
+        assert response["Status"] == "switching-over"
+        assert response["FailoverState"]["Status"] == "pending"
+        assert response["FailoverState"]["FromDbClusterArn"] == primary_arn
+        assert response["FailoverState"]["ToDbClusterArn"] == secondary_arn
+        assert response["FailoverState"]["IsDataLossAllowed"] is False
+
+        members = {m["DBClusterArn"]: m for m in response["GlobalClusterMembers"]}
+        assert members[primary_arn]["IsWriter"] is False
+        assert members[secondary_arn]["IsWriter"] is True
+        assert members[secondary_arn]["Readers"] == [primary_arn]
+
+        final = west.describe_global_clusters(
+            GlobalClusterIdentifier=global_id,
+        )["GlobalClusters"][0]
+        final_members = {m["DBClusterArn"]: m for m in final["GlobalClusterMembers"]}
+        assert final["Status"] == "available"
+        assert "FailoverState" not in final
+        assert final_members[primary_arn]["IsWriter"] is False
+        assert final_members[secondary_arn]["IsWriter"] is True
+
+        switchback = west.switchover_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            TargetDbClusterIdentifier=primary_arn,
+        )["GlobalCluster"]
+        switchback_members = {
+            m["DBClusterArn"]: m for m in switchback["GlobalClusterMembers"]
+        }
+        assert switchback_members[primary_arn]["IsWriter"] is True
+        assert switchback_members[secondary_arn]["IsWriter"] is False
+    finally:
+        _cleanup_two_member_global(east, global_id, primary_arn, secondary_arn)
+        _delete_cluster(west, secondary_id)
+        _delete_cluster(east, primary_id)
+
+
+def test_failover_global_cluster_allows_data_loss_promotes_target():
+    east = _regional_rds("us-east-1")
+    west = _regional_rds("us-west-2")
+    suffix = uuid.uuid4().hex[:8]
+    primary_id = f"global-fail-primary-{suffix}"
+    secondary_id = f"global-fail-secondary-{suffix}"
+    global_id = f"global-fail-{suffix}"
+    primary_arn = None
+    secondary_arn = None
+
+    try:
+        primary = east.create_db_cluster(
+            DBClusterIdentifier=primary_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+        primary_arn = primary["DBClusterArn"]
+        east.create_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            SourceDBClusterIdentifier=primary_arn,
+        )
+        secondary = west.create_db_cluster(
+            DBClusterIdentifier=secondary_id,
+            Engine="aurora-mysql",
+            GlobalClusterIdentifier=global_id,
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+        secondary_arn = secondary["DBClusterArn"]
+
+        response = east.failover_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            TargetDbClusterIdentifier=secondary_arn,
+            AllowDataLoss=True,
+        )["GlobalCluster"]
+        assert response["Status"] == "failing-over"
+        assert response["FailoverState"]["Status"] == "pending"
+        assert response["FailoverState"]["IsDataLossAllowed"] is True
+        members = {m["DBClusterArn"]: m for m in response["GlobalClusterMembers"]}
+        assert members[primary_arn]["IsWriter"] is False
+        assert members[secondary_arn]["IsWriter"] is True
+
+        with pytest.raises(ClientError) as exc:
+            east.failover_global_cluster(
+                GlobalClusterIdentifier=global_id,
+                TargetDbClusterIdentifier=primary_arn,
+                AllowDataLoss=True,
+                Switchover=True,
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+
+        with pytest.raises(ClientError) as exc:
+            east.failover_global_cluster(
+                GlobalClusterIdentifier=global_id,
+                TargetDbClusterIdentifier=primary_arn,
+                AllowDataLoss=False,
+                Switchover=True,
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+    finally:
+        _cleanup_two_member_global(east, global_id, primary_arn, secondary_arn)
+        _delete_cluster(west, secondary_id)
+        _delete_cluster(east, primary_id)
+
+
+def test_failover_global_cluster_missing_global_validated_before_parameter_combo():
+    east = _regional_rds("us-east-1")
+    with pytest.raises(ClientError) as exc:
+        east.failover_global_cluster(
+            GlobalClusterIdentifier=f"missing-global-{uuid.uuid4().hex[:8]}",
+            TargetDbClusterIdentifier="arn:aws:rds:us-east-1:000000000000:cluster:missing-secondary",
+            AllowDataLoss=True,
+            Switchover=True,
+        )
+    assert exc.value.response["Error"]["Code"] == "GlobalClusterNotFoundFault"
+
+
+def test_create_global_cluster_rejects_already_attached_source_cluster():
+    east = _regional_rds("us-east-1")
+    suffix = uuid.uuid4().hex[:8]
+    cluster_id = f"global-reuse-source-{suffix}"
+    first_global_id = f"global-reuse-first-{suffix}"
+    second_global_id = f"global-reuse-second-{suffix}"
+
+    try:
+        cluster = east.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+        east.create_global_cluster(
+            GlobalClusterIdentifier=first_global_id,
+            SourceDBClusterIdentifier=cluster["DBClusterArn"],
+        )
+
+        with pytest.raises(ClientError) as exc:
+            east.create_global_cluster(
+                GlobalClusterIdentifier=second_global_id,
+                SourceDBClusterIdentifier=cluster["DBClusterArn"],
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidDBClusterStateFault"
+
+        first_global = east.describe_global_clusters(
+            GlobalClusterIdentifier=first_global_id,
+        )["GlobalClusters"][0]
+        assert [m["DBClusterArn"] for m in first_global["GlobalClusterMembers"]] == [
+            cluster["DBClusterArn"],
+        ]
+        with pytest.raises(ClientError):
+            east.describe_global_clusters(GlobalClusterIdentifier=second_global_id)
+    finally:
+        _remove_global_member(east, first_global_id, cluster_id)
+        _delete_global_cluster(east, first_global_id)
+        _delete_global_cluster(east, second_global_id)
+        _delete_cluster(east, cluster_id)
+
+
+def test_aurora_engine_versions_advertise_global_database_support():
+    rds = _regional_rds("us-east-1")
+
+    resp = rds.describe_db_engine_versions(Engine="aurora-mysql")
+    assert resp["DBEngineVersions"]
+    assert all(v["SupportsGlobalDatabases"] is True for v in resp["DBEngineVersions"])
+
+
+def test_rds_same_region_arn_lookup_requires_stored_resource_arn_match():
+    east = _regional_rds("us-east-1")
+    west = _regional_rds("us-west-2")
+    suffix = uuid.uuid4().hex[:8]
+    cluster_id = f"rds-fabricated-arn-{suffix}"
+    instance_id = f"rds-fabricated-arn-{suffix}"
+
+    try:
+        cluster = west.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+        instance = west.create_db_instance(
+            DBInstanceIdentifier=instance_id,
+            DBInstanceClass="db.t3.micro",
+            Engine="postgres",
+            MasterUsername="admin",
+            MasterUserPassword="pass",
+            AllocatedStorage=10,
+        )["DBInstance"]
+
+        fabricated_cluster_arn = cluster["DBClusterArn"].replace(":us-west-2:", ":us-east-1:")
+        fabricated_instance_arn = instance["DBInstanceArn"].replace(":us-west-2:", ":us-east-1:")
+
+        with pytest.raises(ClientError) as exc:
+            east.describe_db_clusters(DBClusterIdentifier=fabricated_cluster_arn)
+        assert exc.value.response["Error"]["Code"] == "DBClusterNotFoundFault"
+
+        with pytest.raises(ClientError) as exc:
+            east.describe_db_instances(DBInstanceIdentifier=fabricated_instance_arn)
+        assert exc.value.response["Error"]["Code"] == "DBInstanceNotFound"
+    finally:
+        _delete_instance(west, instance_id)
+        _delete_cluster(west, cluster_id)
+
+
+def test_rds_db_snapshot_filter_by_instance_arn_survives_source_deletion():
+    east = _regional_rds("us-east-1")
+    suffix = uuid.uuid4().hex[:8]
+    instance_id = f"rds-snap-src-arn-{suffix}"
+    snapshot_id = f"rds-snap-src-arn-{suffix}"
+
+    try:
+        instance = east.create_db_instance(
+            DBInstanceIdentifier=instance_id,
+            DBInstanceClass="db.t3.micro",
+            Engine="postgres",
+            MasterUsername="admin",
+            MasterUserPassword="pass",
+            AllocatedStorage=10,
+        )["DBInstance"]
+        east.create_db_snapshot(
+            DBSnapshotIdentifier=snapshot_id,
+            DBInstanceIdentifier=instance["DBInstanceArn"],
+        )
+        east.delete_db_instance(DBInstanceIdentifier=instance_id, SkipFinalSnapshot=True)
+
+        by_source_arn = east.describe_db_snapshots(
+            DBInstanceIdentifier=instance["DBInstanceArn"],
+        )["DBSnapshots"]
+        assert any(s["DBSnapshotIdentifier"] == snapshot_id for s in by_source_arn)
+    finally:
+        try:
+            east.delete_db_snapshot(DBSnapshotIdentifier=snapshot_id)
+        except ClientError:
+            pass
+        _delete_instance(east, instance_id)
+
+
+def test_rds_create_instance_with_cluster_arn_stores_canonical_cluster_id():
+    east = _regional_rds("us-east-1")
+    suffix = uuid.uuid4().hex[:8]
+    cluster_id = f"rds-inst-cluster-arn-{suffix}"
+    instance_id = f"rds-inst-cluster-arn-{suffix}"
+
+    try:
+        cluster = east.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+        east.create_db_instance(
+            DBInstanceIdentifier=instance_id,
+            DBClusterIdentifier=cluster["DBClusterArn"],
+            DBInstanceClass="db.t3.micro",
+            Engine="aurora-mysql",
+        )
+
+        instance = east.describe_db_instances(DBInstanceIdentifier=instance_id)["DBInstances"][0]
+        assert instance["DBClusterIdentifier"] == cluster_id
+
+        cluster = east.describe_db_clusters(DBClusterIdentifier=cluster_id)["DBClusters"][0]
+        members = cluster["DBClusterMembers"]
+        assert any(member["DBInstanceIdentifier"] == instance_id for member in members)
+    finally:
+        _delete_instance(east, instance_id)
+        _delete_cluster(east, cluster_id)
+
+
+def test_rds_protected_cluster_member_delete_preserves_membership():
+    east = _regional_rds("us-east-1")
+    suffix = uuid.uuid4().hex[:8]
+    cluster_id = f"rds-protected-member-{suffix}"
+    instance_id = f"rds-protected-member-{suffix}"
+
+    try:
+        cluster = east.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+        instance = east.create_db_instance(
+            DBInstanceIdentifier=instance_id,
+            DBClusterIdentifier=cluster["DBClusterArn"],
+            DBInstanceClass="db.t3.micro",
+            Engine="aurora-mysql",
+            DeletionProtection=True,
+        )["DBInstance"]
+
+        for identifier in (instance["DBInstanceArn"], instance["DbiResourceId"]):
+            with pytest.raises(ClientError) as exc:
+                east.delete_db_instance(
+                    DBInstanceIdentifier=identifier,
+                    SkipFinalSnapshot=True,
+                )
+            assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+
+            cluster_after = east.describe_db_clusters(
+                DBClusterIdentifier=cluster_id,
+            )["DBClusters"][0]
+            members = cluster_after["DBClusterMembers"]
+            assert any(
+                member["DBInstanceIdentifier"] == instance_id
+                for member in members
+            )
+    finally:
+        try:
+            east.modify_db_instance(
+                DBInstanceIdentifier=instance_id,
+                DeletionProtection=False,
+                ApplyImmediately=True,
+            )
+        except ClientError:
+            pass
+        _delete_instance(east, instance_id)
+        _delete_cluster(east, cluster_id)
+
+
+def test_rds_read_replica_from_instance_arn_stores_canonical_source_id():
+    east = _regional_rds("us-east-1")
+    suffix = uuid.uuid4().hex[:8]
+    source_id = f"rds-replica-arn-src-{suffix}"
+    replica_id = f"rds-replica-arn-{suffix}"
+
+    try:
+        source = east.create_db_instance(
+            DBInstanceIdentifier=source_id,
+            DBInstanceClass="db.t3.micro",
+            Engine="postgres",
+            MasterUsername="admin",
+            MasterUserPassword="pass",
+            AllocatedStorage=10,
+        )["DBInstance"]
+        replica = east.create_db_instance_read_replica(
+            DBInstanceIdentifier=replica_id,
+            SourceDBInstanceIdentifier=source["DBInstanceArn"],
+        )["DBInstance"]
+
+        assert replica["ReadReplicaSourceDBInstanceIdentifier"] == source_id
+
+        source = east.describe_db_instances(DBInstanceIdentifier=source_id)["DBInstances"][0]
+        assert replica_id in source["ReadReplicaDBInstanceIdentifiers"]
+    finally:
+        _delete_instance(east, replica_id)
+        _delete_instance(east, source_id)
+
+
+def test_rds_tag_resource_arns_are_request_region_scoped():
+    east = _regional_rds("us-east-1")
+    west = _regional_rds("us-west-2")
+    cluster_id = f"rds-tag-scope-{uuid.uuid4().hex[:8]}"
+
+    try:
+        cluster = west.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+        cluster_arn = cluster["DBClusterArn"]
+        bogus_account_arn = cluster_arn.replace(":000000000000:", ":111111111111:")
+
+        west.add_tags_to_resource(
+            ResourceName=cluster_arn,
+            Tags=[{"Key": "scope", "Value": "west"}],
+        )
+        assert west.list_tags_for_resource(ResourceName=cluster_arn)["TagList"] == [
+            {"Key": "scope", "Value": "west"},
+        ]
+
+        with pytest.raises(ClientError) as exc:
+            east.add_tags_to_resource(
+                ResourceName=cluster_arn,
+                Tags=[{"Key": "scope", "Value": "east"}],
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            east.list_tags_for_resource(ResourceName=cluster_arn)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            west.add_tags_to_resource(
+                ResourceName=bogus_account_arn,
+                Tags=[{"Key": "scope", "Value": "bogus"}],
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        cluster = west.describe_db_clusters(DBClusterIdentifier=cluster_id)["DBClusters"][0]
+        assert cluster["TagList"] == [{"Key": "scope", "Value": "west"}]
+    finally:
+        _delete_cluster(west, cluster_id)
+
+
+def test_rds_cluster_snapshot_from_arn_stores_canonical_cluster_id():
+    east = _regional_rds("us-east-1")
+    suffix = uuid.uuid4().hex[:8]
+    cluster_id = f"rds-snap-arn-{suffix}"
+    snapshot_id = f"rds-snap-arn-{suffix}"
+
+    try:
+        cluster = east.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )["DBCluster"]
+        east.create_db_cluster_snapshot(
+            DBClusterSnapshotIdentifier=snapshot_id,
+            DBClusterIdentifier=cluster["DBClusterArn"],
+        )
+
+        by_snapshot = east.describe_db_cluster_snapshots(
+            DBClusterSnapshotIdentifier=snapshot_id,
+        )["DBClusterSnapshots"][0]
+        assert by_snapshot["DBClusterIdentifier"] == cluster_id
+
+        by_cluster = east.describe_db_cluster_snapshots(
+            DBClusterIdentifier=cluster["DBClusterArn"],
+        )["DBClusterSnapshots"]
+        assert any(s["DBClusterSnapshotIdentifier"] == snapshot_id for s in by_cluster)
+
+        east.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+
+        by_deleted_source_arn = east.describe_db_cluster_snapshots(
+            DBClusterIdentifier=cluster["DBClusterArn"],
+        )["DBClusterSnapshots"]
+        assert any(
+            s["DBClusterSnapshotIdentifier"] == snapshot_id
+            for s in by_deleted_source_arn
+        )
+    finally:
+        try:
+            east.delete_db_cluster_snapshot(DBClusterSnapshotIdentifier=snapshot_id)
+        except ClientError:
+            pass
+        _delete_cluster(east, cluster_id)
+
+
+def test_describe_global_clusters_rejects_global_cluster_arns():
+    account_a = _regional_rds("us-east-1", access_key_id="111111111111")
+    account_b = _regional_rds("us-east-1", access_key_id="222222222222")
+    global_id = f"global-cross-account-{uuid.uuid4().hex[:8]}"
+    global_arn_id = f"arn:aws:rds::{111111111111}:global-cluster:{global_id}-arn"
+
+    try:
+        with pytest.raises(ClientError) as exc:
+            account_a.create_global_cluster(
+                GlobalClusterIdentifier=global_arn_id,
+                Engine="aurora-mysql",
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        global_cluster = account_a.create_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            Engine="aurora-mysql",
+        )["GlobalCluster"]
+
+        same_account = account_a.describe_global_clusters(
+            GlobalClusterIdentifier=global_id,
+        )["GlobalClusters"][0]
+        assert same_account["GlobalClusterIdentifier"] == global_id
+
+        with pytest.raises(ClientError) as exc:
+            account_a.describe_global_clusters(
+                GlobalClusterIdentifier=global_cluster["GlobalClusterArn"],
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            account_b.describe_global_clusters(
+                GlobalClusterIdentifier=global_cluster["GlobalClusterArn"],
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            account_a.modify_global_cluster(
+                GlobalClusterIdentifier=global_cluster["GlobalClusterArn"],
+                DeletionProtection=False,
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            account_a.modify_global_cluster(
+                GlobalClusterIdentifier=global_id,
+                NewGlobalClusterIdentifier=global_arn_id,
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            account_a.remove_from_global_cluster(
+                GlobalClusterIdentifier=global_cluster["GlobalClusterArn"],
+                DbClusterIdentifier="does-not-matter",
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        with pytest.raises(ClientError) as exc:
+            account_a.delete_global_cluster(
+                GlobalClusterIdentifier=global_cluster["GlobalClusterArn"],
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+    finally:
+        _delete_global_cluster(account_a, global_id)
+
+
+def test_rds_mysql_readiness_probe_requires_successful_query(monkeypatch):
+    """MySQL readiness requires an executable query, not only connection auth."""
+    from ministack.services import rds
+
+    attempts = []
+
+    class FakeCursor:
+        def execute(self, sql, params=None):
+            attempts.append(sql)
+            raise RuntimeError("(2013, 'Lost connection to MySQL server during query')")
+
+        def close(self):
+            attempts.append("cursor.close")
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            attempts.append("connection.close")
+
+    def connect(**kwargs):
+        return FakeConnection()
+
+    monkeypatch.setitem(sys.modules, "pymysql", types.SimpleNamespace(connect=connect))
+
+    assert not rds._try_database_connect(
+        "127.0.0.1",
+        3306,
+        "aurora-mysql",
+        "admin",
+        "old_pass",
+        None,
+    )
+    assert attempts == ["SELECT 1", "cursor.close", "connection.close"]
+
+
+def test_rds_cluster_password_rotation_alters_mysql_password(monkeypatch):
+    """Password rotation assumes the instance already passed readiness."""
+    from ministack.services import rds
+
+    attempts = []
+
+    class FakeCursor:
+        def execute(self, sql, params=None):
+            attempts.append((sql, params))
+
+        def close(self):
+            attempts.append(("cursor.close", None))
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            attempts.append(("connection.close", None))
+
+    def connect(**kwargs):
+        attempts.append(("connect", kwargs))
+        return FakeConnection()
+
+    monkeypatch.setitem(sys.modules, "pymysql", types.SimpleNamespace(connect=connect))
+    instances = rds.AccountRegionScopedDict()
+    instances["pw-retry-instance"] = {
+        "DBClusterIdentifier": "pw-retry-cluster",
+        "Engine": "aurora-mysql",
+        "_internal_address": "127.0.0.1",
+        "_internal_port": 3306,
+    }
+    monkeypatch.setattr(rds, "_instances", instances)
+
+    assert rds._rotate_real_password(
+        {"DBClusterIdentifier": "pw-retry-cluster"},
+        "old_pass",
+        "new_pass",
+    )
+    assert (
+        "ALTER USER 'root'@'%%' IDENTIFIED BY %s",
+        ("new_pass",),
+    ) in attempts
+
+
+PASSWORD = "SharedStorage123!"
+
+
+DATABASE = "paritydb"
+
+
+def _wait_for_instance(rds, db_id, timeout=120):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        instance = rds.describe_db_instances(
+            DBInstanceIdentifier=db_id,
+        )["DBInstances"][0]
+        if instance["DBInstanceStatus"] == "available":
+            return instance
+        if instance["DBInstanceStatus"] == "failed":
+            pytest.fail(f"RDS instance {db_id} failed while starting")
+        time.sleep(2)
+    raise TimeoutError(f"RDS instance {db_id} not available after {timeout}s")
+
+
+def _aurora_connect(endpoint, user="admin", password=PASSWORD, database=DATABASE):
+    import pymysql
+
+    return pymysql.connect(
+        host=endpoint["Address"],
+        port=int(endpoint["Port"]),
+        user=user,
+        password=password,
+        database=database,
+        autocommit=True,
+        connect_timeout=5,
+    )
+
+
+@contextlib.contextmanager
+def _live_cluster(rds):
+    suffix = uuid.uuid4().hex[:10]
+    cluster_id = f"shared-{suffix}"
+    writer_id = f"{cluster_id}-writer"
+    reader_id = f"{cluster_id}-reader"
+    try:
+        rds.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword=PASSWORD,
+            DatabaseName=DATABASE,
+        )
+        for db_id in (writer_id, reader_id):
+            rds.create_db_instance(
+                DBInstanceIdentifier=db_id,
+                DBClusterIdentifier=cluster_id,
+                DBInstanceClass="db.r6g.large",
+                Engine="aurora-mysql",
+            )
+        writer = _wait_for_instance(rds, writer_id)
+        reader = _wait_for_instance(rds, reader_id)
+        cluster = rds.describe_db_clusters(
+            DBClusterIdentifier=cluster_id,
+        )["DBClusters"][0]
+        yield cluster_id, writer_id, reader_id, writer, reader, cluster
+    finally:
+        for db_id in (reader_id, writer_id):
+            try:
+                rds.delete_db_instance(
+                    DBInstanceIdentifier=db_id,
+                    SkipFinalSnapshot=True,
+                )
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "DBInstanceNotFound":
+                    raise
+        try:
+            rds.delete_db_cluster(
+                DBClusterIdentifier=cluster_id,
+                SkipFinalSnapshot=True,
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "DBClusterNotFoundFault":
+                raise
+
+
+@pytest.mark.skipif(not os.environ.get("DOCKER_NETWORK"), reason="DOCKER_NETWORK not set -- live Aurora")
+def test_aurora_writer_data_is_visible_through_reader(rds):
+    with _live_cluster(rds) as (_cid, _wid, _rid, writer, reader, _cluster):
+        with _aurora_connect(writer["Endpoint"]) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("CREATE TABLE shared_rows (id INT PRIMARY KEY, value VARCHAR(32))")
+                cursor.execute("INSERT INTO shared_rows VALUES (1, 'writer-data')")
+        with _aurora_connect(reader["Endpoint"]) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT id, value FROM shared_rows")
+                assert cursor.fetchall() == ((1, "writer-data"),)
+
+
+@pytest.mark.skipif(not os.environ.get("DOCKER_NETWORK"), reason="DOCKER_NETWORK not set -- live Aurora")
+def test_aurora_user_and_grant_are_visible_through_reader(rds):
+    with _live_cluster(rds) as (_cid, _wid, _rid, writer, reader, _cluster):
+        app_user = f"app_{uuid.uuid4().hex[:8]}"
+        app_password = "AppPassword123!"
+        with _aurora_connect(writer["Endpoint"]) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("CREATE TABLE granted_rows (id INT PRIMARY KEY)")
+                cursor.execute(f"CREATE USER `{app_user}`@'%%' IDENTIFIED BY %s", (app_password,))
+                cursor.execute(f"GRANT SELECT ON `{DATABASE}`.* TO `{app_user}`@'%'")
+        with _aurora_connect(reader["Endpoint"], app_user, app_password) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT COUNT(*) FROM granted_rows")
+                assert cursor.fetchone() == (0,)
+
+
+@pytest.mark.skipif(not os.environ.get("DOCKER_NETWORK"), reason="DOCKER_NETWORK not set -- live Aurora")
+def test_aurora_cluster_uses_one_backing_container(rds):
+    import docker
+
+    with _live_cluster(rds) as (cluster_id, _wid, _rid, writer, reader, cluster):
+        containers = docker.from_env().containers.list(
+            all=True,
+            filters={"label": ["ministack=rds", f"cluster_id={cluster_id}"]},
+        )
+        assert len(containers) == 1
+        assert writer["Endpoint"] == reader["Endpoint"]
+        assert cluster["Endpoint"] == cluster["ReaderEndpoint"]
+        assert cluster["Endpoint"] == writer["Endpoint"]["Address"]
+        assert cluster["Port"] == writer["Endpoint"]["Port"]
+
+
+@pytest.mark.skipif(not os.environ.get("DOCKER_NETWORK"), reason="DOCKER_NETWORK not set -- live Aurora")
+def test_aurora_delete_member_keeps_shared_data(rds, rds_data):
+    import docker
+    import pymysql
+
+    with _live_cluster(rds) as (
+        cluster_id,
+        writer_id,
+        reader_id,
+        writer,
+        _reader,
+        cluster,
+    ):
+        with _aurora_connect(writer["Endpoint"]) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("CREATE TABLE durable_rows (id INT PRIMARY KEY)")
+                cursor.execute("INSERT INTO durable_rows VALUES (7)")
+        rds.delete_db_instance(
+            DBInstanceIdentifier=reader_id,
+            SkipFinalSnapshot=True,
+        )
+        with _aurora_connect(writer["Endpoint"]) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT id FROM durable_rows")
+                assert cursor.fetchone() == (7,)
+
+        containers = docker.from_env().containers.list(
+            all=True,
+            filters={"label": ["ministack=rds", f"cluster_id={cluster_id}"]},
+        )
+        assert len(containers) == 1
+        container = containers[0]
+        original_container_id = container.id
+
+        rds.delete_db_instance(
+            DBInstanceIdentifier=writer_id,
+            SkipFinalSnapshot=True,
+        )
+        empty_cluster = rds.describe_db_clusters(
+            DBClusterIdentifier=cluster_id,
+        )["DBClusters"][0]
+        assert empty_cluster["Status"] == "available"
+        assert empty_cluster["DBClusterMembers"] == []
+
+        container.reload()
+        assert container.status == "exited"
+        with pytest.raises((pymysql.err.OperationalError, OSError)):
+            _aurora_connect(writer["Endpoint"])
+        with pytest.raises(ClientError) as exc_info:
+            rds_data.execute_statement(
+                resourceArn=cluster["DBClusterArn"],
+                secretArn=(
+                    "arn:aws:secretsmanager:us-east-1:000000000000:secret:unused"
+                ),
+                sql="SELECT 1",
+            )
+        assert exc_info.value.response["Error"]["Code"] == "DatabaseUnavailableException"
+
+        replacement_id = f"{cluster_id}-replacement"
+        try:
+            rds.create_db_instance(
+                DBInstanceIdentifier=replacement_id,
+                DBClusterIdentifier=cluster_id,
+                DBInstanceClass="db.r6g.large",
+                Engine="aurora-mysql",
+            )
+            replacement = _wait_for_instance(rds, replacement_id)
+            container.reload()
+            assert container.status == "running"
+            assert container.id == original_container_id
+            with _aurora_connect(replacement["Endpoint"]) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT id FROM durable_rows")
+                    assert cursor.fetchone() == (7,)
+        finally:
+            try:
+                rds.delete_db_instance(
+                    DBInstanceIdentifier=replacement_id,
+                    SkipFinalSnapshot=True,
+                )
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "DBInstanceNotFound":
+                    raise
+    containers = docker.from_env().containers.list(
+        all=True,
+        filters={"label": ["ministack=rds", f"cluster_id={cluster_id}"]},
+    )
+    assert containers == []

@@ -552,3 +552,8 @@ def inspector2():
 @pytest.fixture(scope="session")
 def mq():
     return make_client("mq")
+
+
+@pytest.fixture(scope="session")
+def s3tables():
+    return make_client("s3tables")
