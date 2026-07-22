@@ -425,6 +425,11 @@ SERVICE_PATTERNS = {
 }
 
 
+_OPENSEARCH_PATH_PREFIXES = tuple(
+    prefix.lower() for prefix in SERVICE_PATTERNS["opensearch"]["path_prefixes"]
+)
+
+
 def detect_service(method: str, path: str, headers: dict, query_params: dict) -> str:
     """Detect which AWS service a request is targeting."""
     host = headers.get("host", "")
@@ -946,6 +951,12 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         return "cloudfront"
     if path_lower.startswith("/2013-04-01/"):
         return "route53"
+    # OpenSearch's REST-JSON management API may arrive without a usable
+    # SigV4 Authorization header when invoked from Lambda custom-resource
+    # providers. Route its versioned paths before the generic S3 fallback;
+    # otherwise POST UpdateDomainConfig returns S3's XML MethodNotAllowed.
+    if path_lower.startswith(_OPENSEARCH_PATH_PREFIXES):
+        return "opensearch"
     if (path_lower.startswith("/v2/apis") or path_lower.startswith("/v2/tags")) and (
         re.search(r"appsync-api\.", host) or re.search(r"appsync-realtime-api\.", host)
     ):
