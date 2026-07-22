@@ -8,8 +8,8 @@ ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 REGION = "us-east-1"
 
 
-def _client(service, account="test"):
-    return boto3.client(service, endpoint_url=ENDPOINT, region_name=REGION,
+def _client(service, account="test", region=REGION):
+    return boto3.client(service, endpoint_url=ENDPOINT, region_name=region,
                         aws_access_key_id=account, aws_secret_access_key="test")
 
 
@@ -331,3 +331,161 @@ def test_batch_update_compute_environment_merges_compute_resources(batch):
     assert ce["computeResources"]["instanceTypes"] == ["m5.large"]
     assert ce["computeResources"]["subnets"] == ["subnet-aaa"]
     assert ce["computeResources"]["securityGroupIds"] == ["sg-aaa"]
+
+def test_batch_resources_are_region_scoped():
+    east = _client("batch", region="us-east-1")
+    west = _client("batch", region="us-west-2")
+    suffix = _uid()
+    ce_name = f"ce-region-{suffix}"
+    jq_name = f"jq-region-{suffix}"
+    jd_name = f"jd-region-{suffix}"
+    job_name = f"job-region-{suffix}"
+
+    for client in (east, west):
+        ce = client.create_compute_environment(
+            computeEnvironmentName=ce_name,
+            type="MANAGED",
+            serviceRole="arn:aws:iam::000000000000:role/batch",
+        )
+        jq = client.create_job_queue(
+            jobQueueName=jq_name,
+            priority=1,
+            computeEnvironmentOrder=[{"order": 1, "computeEnvironment": ce["computeEnvironmentArn"]}],
+        )
+        jd = client.register_job_definition(
+            jobDefinitionName=jd_name,
+            type="container",
+            containerProperties={"image": "busybox", "memory": 128, "vcpus": 1},
+        )
+        client.submit_job(
+            jobName=job_name,
+            jobQueue=jq["jobQueueArn"],
+            jobDefinition=jd["jobDefinitionArn"],
+        )
+
+    for client, region in ((east, "us-east-1"), (west, "us-west-2")):
+        compute_envs = client.describe_compute_environments(
+            computeEnvironments=[ce_name]
+        )["computeEnvironments"]
+        queues = client.describe_job_queues(jobQueues=[jq_name])["jobQueues"]
+        definitions = client.describe_job_definitions(
+            jobDefinitionName=jd_name,
+        )["jobDefinitions"]
+        jobs = client.list_jobs(jobQueue=jq_name)["jobSummaryList"]
+
+        assert len(compute_envs) == 1
+        assert len(queues) == 1
+        assert len(definitions) == 1
+        assert len(jobs) == 1
+        assert f":{region}:" in compute_envs[0]["computeEnvironmentArn"]
+        assert f":{region}:" in queues[0]["jobQueueArn"]
+        assert f":{region}:" in definitions[0]["jobDefinitionArn"]
+        assert f":{region}:" in jobs[0]["jobArn"]
+
+
+def test_batch_restore_legacy_state_uses_resource_arn_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import batch as service
+
+    account_id = "111111111111"
+    resource_region = "us-west-2"
+    boot_region = "us-east-1"
+    stores = {
+        "compute_envs": (
+            "legacy-ce",
+            {
+                "computeEnvironmentArn": (
+                    f"arn:aws:batch:{resource_region}:{account_id}:"
+                    "compute-environment/legacy-ce"
+                )
+            },
+        ),
+        "job_queues": (
+            "legacy-queue",
+            {
+                "jobQueueArn": (
+                    f"arn:aws:batch:{resource_region}:{account_id}:"
+                    "job-queue/legacy-queue"
+                )
+            },
+        ),
+        "job_definitions": (
+            "legacy-definition",
+            [
+                {
+                    "jobDefinitionArn": (
+                        f"arn:aws:batch:{resource_region}:{account_id}:job-definition/legacy-definition:1"
+                    )
+                }
+            ],
+        ),
+        "jobs": (
+            "legacy-job-id",
+            {
+                "jobArn": (
+                    f"arn:aws:batch:{resource_region}:{account_id}:"
+                    "job/legacy-job-id"
+                )
+            },
+        ),
+    }
+
+    set_request_account_id(account_id)
+    set_request_region(boot_region)
+    legacy_state = {}
+    for state_key, (resource_key, value) in stores.items():
+        store = AccountScopedDict()
+        store[resource_key] = value
+        legacy_state[state_key] = store
+
+    service.reset()
+    try:
+        service.restore_state(legacy_state)
+        for state_key, (resource_key, value) in stores.items():
+            store = getattr(service, f"_{state_key}")
+            assert store.get_scoped(account_id, resource_region, resource_key) == value
+            assert store.get_scoped(account_id, boot_region, resource_key) is None
+    finally:
+        service.reset()
+
+
+def test_batch_restore_current_state_preserves_non_boot_regions():
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import batch as service
+
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    resource_region = "us-west-2"
+    resources = {
+        "compute_envs": ("regional-ce", {"state": "ENABLED"}),
+        "job_queues": ("regional-queue", {"state": "ENABLED"}),
+        "job_definitions": ("regional-definition", [{"revision": 1}]),
+        "jobs": ("regional-job", {"status": "SUCCEEDED"}),
+    }
+
+    set_request_account_id(account_id)
+    set_request_region(boot_region)
+    service.reset()
+    try:
+        for state_key, (resource_key, value) in resources.items():
+            getattr(service, f"_{state_key}").set_scoped(
+                account_id, resource_region, resource_key, value
+            )
+
+        snapshot = service.get_state()
+        assert not snapshot["compute_envs"]
+
+        service.reset()
+        service.restore_state(snapshot)
+
+        for state_key, (resource_key, value) in resources.items():
+            store = getattr(service, f"_{state_key}")
+            assert store.get_scoped(
+                account_id, resource_region, resource_key
+            ) == value
+    finally:
+        service.reset()
