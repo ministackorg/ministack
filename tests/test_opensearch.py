@@ -6,14 +6,15 @@ by ``OPENSEARCH_DATAPLANE=1`` and exercised separately when that env var
 is set.
 """
 
+import json
 import os
 import time
+import urllib.request
 import uuid
 
 import boto3
 import pytest
 from botocore.exceptions import ClientError
-
 
 ENDPOINT = "http://localhost:4566"
 REGION = "us-east-1"
@@ -227,6 +228,26 @@ def test_opensearch_update_domain_config_persists(os_client):
         os_client.delete_domain(DomainName=name)
 
 
+def test_opensearch_unsigned_update_domain_config_does_not_route_to_s3(os_client):
+    """CDK custom-resource REST requests route by path when SigV4 is unavailable."""
+    name = f"raw-{_uid()}"
+    os_client.create_domain(DomainName=name)
+    try:
+        policy = '{"Version":"2012-10-17","Statement":[]}'
+        request = urllib.request.Request(
+            f"{ENDPOINT}/2021-01-01/opensearch/domain/{name}/config",
+            data=json.dumps({"AccessPolicies": policy}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request) as response:
+            assert response.headers.get_content_type() == "application/json"
+            result = json.load(response)
+        assert result["DomainConfig"]["AccessPolicies"]["Options"] == policy
+    finally:
+        os_client.delete_domain(DomainName=name)
+
+
 def test_opensearch_describe_domain_change_progress(os_client):
     name = f"prog-{_uid()}"
     os_client.create_domain(DomainName=name)
@@ -387,8 +408,8 @@ def test_opensearch_dataplane_cluster_health():
     """When OPENSEARCH_DATAPLANE=1 is set on the ministack server, CreateDomain
     spawns a real opensearchproject/opensearch container and DescribeDomain
     returns its endpoint. Verify cluster health responds."""
-    import urllib.request
     import json as _json
+    import urllib.request
 
     o = _client()
     name = f"dp-{_uid()}"
