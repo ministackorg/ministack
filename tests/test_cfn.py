@@ -1963,6 +1963,62 @@ def test_cfn_cloudwatch_alarm_lifecycle(cfn, cw):
     assert resp2["MetricAlarms"] == []
 
 
+def test_cfn_cloudwatch_dashboard_lifecycle(cfn, cw):
+    """CloudFormation creates, updates, and removes a CloudWatch dashboard."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cwdash-{uid}"
+    dashboard_name = f"cfn-dashboard-{uid}"
+    replacement_name = f"cfn-dashboard-replaced-{uid}"
+    body = json.dumps({"widgets": [{"type": "text", "properties": {"markdown": "Created"}}]})
+    updated_body = json.dumps({"widgets": [{"type": "text", "properties": {"markdown": "Updated"}}]})
+
+    def template(dashboard_body, name=dashboard_name):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "Dashboard": {
+                    "Type": "AWS::CloudWatch::Dashboard",
+                    "Properties": {
+                        "DashboardName": name,
+                        "DashboardBody": dashboard_body,
+                    },
+                },
+            },
+            "Outputs": {
+                "DashboardName": {"Value": {"Ref": "Dashboard"}},
+            },
+        }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template(body)))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    assert stack["Outputs"][0]["OutputValue"] == dashboard_name
+    assert cw.get_dashboard(DashboardName=dashboard_name)["DashboardBody"] == body
+
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(template(updated_body)))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+    assert cw.get_dashboard(DashboardName=dashboard_name)["DashboardBody"] == updated_body
+
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template(updated_body, replacement_name)),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+    assert stack["Outputs"][0]["OutputValue"] == replacement_name
+    with pytest.raises(ClientError) as exc:
+        cw.get_dashboard(DashboardName=dashboard_name)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFound"
+    assert cw.get_dashboard(DashboardName=replacement_name)["DashboardBody"] == updated_body
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+    with pytest.raises(ClientError) as exc:
+        cw.get_dashboard(DashboardName=replacement_name)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFound"
+
+
 def test_cfn_route53_hosted_zone_and_record_set(cfn, r53):
     """CloudFormation provisions Route53 HostedZone + RecordSet and removes records on delete."""
     uid = _uuid_mod.uuid4().hex[:8]

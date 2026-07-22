@@ -534,6 +534,7 @@ subnet = ec2.create_subnet(
 | `AWS::WAFv2::WebACL` | WebACL ID | Arn, Id |
 | `AWS::CloudFront::Distribution` | Distribution ID | Arn, DomainName, Id |
 | `AWS::CloudWatch::Alarm` | Alarm name | Arn |
+| `AWS::CloudWatch::Dashboard` | Dashboard name | — |
 | `AWS::RDS::DBCluster` | Cluster ID | Arn, Endpoint.Address, Endpoint.Port, ReadEndpoint.Address |
 | `AWS::AutoScaling::AutoScalingGroup` | ASG name | Arn |
 | `AWS::AutoScaling::LaunchConfiguration` | LC name | Arn |
