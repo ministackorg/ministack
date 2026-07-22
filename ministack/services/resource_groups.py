@@ -24,6 +24,7 @@ import re
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     get_account_id,
     get_region,
@@ -35,12 +36,12 @@ _GROUP_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,300}$")
 _AWS_PARTITION_RE = re.compile(r"^aws(?:-[a-z]+)*$")
 _VALID_QUERY_TYPES = {"TAG_FILTERS_1_0", "CLOUDFORMATION_STACK_1_0"}
 
-_groups = AccountScopedDict()           # name -> Group dict
-_group_queries = AccountScopedDict()    # name -> ResourceQuery dict
-_group_configs = AccountScopedDict()    # name -> [GroupConfigurationItem]
-_group_members = AccountScopedDict()    # name -> [resource_arn]
-_group_tags = AccountScopedDict()       # name -> {tag_key: tag_value}
-_account_settings = AccountScopedDict()  # "settings" -> AccountSettings dict
+_groups = AccountRegionScopedDict()           # name -> Group dict
+_group_queries = AccountRegionScopedDict()    # name -> ResourceQuery dict
+_group_configs = AccountRegionScopedDict()    # name -> [GroupConfigurationItem]
+_group_members = AccountRegionScopedDict()    # name -> [resource_arn]
+_group_tags = AccountRegionScopedDict()       # name -> {tag_key: tag_value}
+_account_settings = AccountRegionScopedDict()  # "settings" -> AccountSettings dict
 
 
 def get_state():
@@ -57,12 +58,37 @@ def get_state():
 def restore_state(data):
     if not data:
         return
-    _groups.update(data.get("groups", {}))
-    _group_queries.update(data.get("group_queries", {}))
-    _group_configs.update(data.get("group_configs", {}))
-    _group_members.update(data.get("group_members", {}))
-    _group_tags.update(data.get("group_tags", {}))
+    restored_groups = data.get("groups", {})
+    legacy_group_regions = {}
+    if isinstance(restored_groups, AccountScopedDict):
+        legacy_group_regions = {
+            (account_id, group_name): _groups._region_for_legacy_value(
+                group_name, group
+            )
+            for (account_id, group_name), group in restored_groups._data.items()
+        }
+    _groups.update(restored_groups)
+    for store, key in (
+        (_group_queries, "group_queries"),
+        (_group_configs, "group_configs"),
+        (_group_members, "group_members"),
+        (_group_tags, "group_tags"),
+    ):
+        _restore_group_child_store(
+            store, data.get(key, {}), legacy_group_regions
+        )
     _account_settings.update(data.get("account_settings", {}))
+
+
+def _restore_group_child_store(store, restored, legacy_group_regions):
+    """Adopt legacy name-keyed child state into its parent group's region."""
+    if not isinstance(restored, AccountScopedDict):
+        store.update(restored)
+        return
+
+    for (account_id, group_name), value in restored._data.items():
+        region = legacy_group_regions.get((account_id, group_name), get_region())
+        store.set_scoped(account_id, region, group_name, value)
 
 
 try:

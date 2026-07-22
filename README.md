@@ -215,7 +215,7 @@ use1.list_tables()["TableNames"]   # → ["users"]
 euw1.list_tables()["TableNames"]   # → [] — eu-west-1 is independent
 ```
 
-**Region-isolated services:** AppConfig, Bedrock (all four services), CloudWatch, CloudWatch Logs, DynamoDB (tables, metadata, Streams), Lambda (functions, event source mappings, durable executions), MSK, RDS, S3 Tables, Secrets Manager, SQS, SSM Parameter Store, and Step Functions (1.4.0); EventBridge Pipes (1.4.1); SNS, Kinesis, KMS, and ElastiCache (1.4.2); EventBridge, ECS, and Firehose (1.4.3).
+**Region-isolated services:** AppConfig, Bedrock (all four services), CloudWatch, CloudWatch Logs, DynamoDB (tables, metadata, Streams), Lambda (functions, event source mappings, durable executions), MSK, RDS, S3 Tables, Secrets Manager, SQS, SSM Parameter Store, and Step Functions (1.4.0); EventBridge Pipes (1.4.1); SNS, Kinesis, KMS, and ElastiCache (1.4.2); EventBridge, ECS, and Firehose (1.4.3); EventBridge Scheduler, CodeBuild, and Resource Groups (1.4.4).
 
 Cross-resource references resolve in the referenced ARN's own account and region (SNS→SQS fanout, EventBridge targets, event source mappings), and cross-region references that real AWS rejects return the same errors AWS returns — e.g. invoking a `eu-west-1` Lambda from a `us-east-1` Step Functions task fails with `Functions from 'eu-west-1' are not reachable in this region`, exactly as on AWS.
 
