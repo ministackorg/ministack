@@ -2112,6 +2112,80 @@ def _apigw_account_delete(physical_id, props):
     _apigw_v1._account_settings["settings"] = settings
 
 
+# --- API Gateway DomainName ---
+
+def _apigw_domain_name_create(logical_id, props, stack_name):
+    """Provision an ``AWS::ApiGateway::DomainName`` through API Gateway v1."""
+    endpoint = props.get("EndpointConfiguration") or {}
+    endpoint_configuration = {
+        "types": endpoint.get("Types", ["REGIONAL"]),
+    }
+    if "IpAddressType" in endpoint:
+        endpoint_configuration["ipAddressType"] = endpoint["IpAddressType"]
+    if "VpcEndpointIds" in endpoint:
+        endpoint_configuration["vpcEndpointIds"] = endpoint["VpcEndpointIds"]
+
+    mutual_tls = props.get("MutualTlsAuthentication") or {}
+    mutual_tls_configuration = {}
+    if "TruststoreUri" in mutual_tls:
+        mutual_tls_configuration["truststoreUri"] = mutual_tls["TruststoreUri"]
+    if "TruststoreVersion" in mutual_tls:
+        mutual_tls_configuration["truststoreVersion"] = mutual_tls["TruststoreVersion"]
+
+    data = {
+        "domainName": props.get("DomainName", ""),
+        "endpointConfiguration": endpoint_configuration,
+        "tags": {tag["Key"]: tag["Value"] for tag in props.get("Tags", [])},
+    }
+    property_map = {
+        "CertificateArn": "certificateArn",
+        "EndpointAccessMode": "endpointAccessMode",
+        "OwnershipVerificationCertificateArn": "ownershipVerificationCertificateArn",
+        "RegionalCertificateArn": "regionalCertificateArn",
+        "RoutingMode": "routingMode",
+        "SecurityPolicy": "securityPolicy",
+    }
+    for cfn_name, api_name in property_map.items():
+        if cfn_name in props:
+            data[api_name] = props[cfn_name]
+    if mutual_tls_configuration:
+        data["mutualTlsAuthentication"] = mutual_tls_configuration
+
+    status, _headers, body = _apigw_v1._create_domain_name(data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::DomainName create failed: {body!r}")
+    domain = json.loads(body)
+    domain_name = domain["domainName"]
+    attrs = {
+        "DistributionDomainName": domain["distributionDomainName"],
+        "DistributionHostedZoneId": domain["distributionHostedZoneId"],
+        "DomainNameArn": f"arn:aws:apigateway:{get_region()}::/domainnames/{domain_name}",
+        "RegionalDomainName": domain["regionalDomainName"],
+        "RegionalHostedZoneId": domain["regionalHostedZoneId"],
+    }
+    return domain_name, attrs
+
+
+def _apigw_domain_name_update(physical_id, old_props, new_props, stack_name):
+    existing_mappings = _apigw_v1._base_path_mappings.get(physical_id)
+    new_domain_name = new_props.get("DomainName", "")
+    new_id, attrs = _apigw_domain_name_create(physical_id, new_props, stack_name)
+    if new_domain_name != physical_id:
+        _apigw_domain_name_delete(physical_id, old_props)
+    elif existing_mappings is not None:
+        # The native create helper initializes this collection. Preserve
+        # dependent mappings while mutable domain properties update in place.
+        _apigw_v1._base_path_mappings[physical_id] = existing_mappings
+    return new_id, attrs
+
+
+def _apigw_domain_name_delete(physical_id, props):
+    # Rollback and repeated stack deletion should remain harmless when the
+    # underlying custom domain has already been removed.
+    if physical_id in _apigw_v1._domain_names:
+        _apigw_v1._delete_domain_name(physical_id)
+
+
 # --- API Gateway GatewayResponse ---
 
 def _apigw_gateway_response_create(logical_id, props, stack_name):
@@ -4822,6 +4896,11 @@ _RESOURCE_HANDLERS = {
     "AWS::ApiGateway::Deployment": {"create": _apigw_deployment_create, "delete": _apigw_deployment_delete},
     "AWS::ApiGateway::Stage": {"create": _apigw_stage_create, "delete": _apigw_stage_delete},
     "AWS::ApiGateway::Account": {"create": _apigw_account_create, "delete": _apigw_account_delete},
+    "AWS::ApiGateway::DomainName": {
+        "create": _apigw_domain_name_create,
+        "update": _apigw_domain_name_update,
+        "delete": _apigw_domain_name_delete,
+    },
     "AWS::ApiGateway::GatewayResponse": {
         "create": _apigw_gateway_response_create,
         "update": _apigw_gateway_response_update,
