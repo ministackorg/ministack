@@ -3399,6 +3399,100 @@ Outputs:
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
+def test_cfn_cognito_user_pool_lambda_config(cfn, cognito_idp):
+    """AWS::Cognito::UserPool's LambdaConfig property is honored when the pool
+    is provisioned via CloudFormation, not just via the raw CreateUserPool API.
+
+    _cognito_user_pool_create previously built the pool's state dict without
+    ever reading props["LambdaConfig"], so a CFN-provisioned pool's Lambda
+    triggers (PreTokenGeneration here, but the gap applied to all of them)
+    were silently dropped — the trigger Lambda was never invoked and tokens
+    were issued unmodified, even though the identical raw API call already
+    honored LambdaConfig correctly.
+    """
+    template = """
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  TriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+  TriggerFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt TriggerRole.Arn
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              event['response']['claimsOverrideDetails'] = {
+                  'claimsToAddOrOverride': {'injected_claim': 'from-cfn-trigger'},
+              }
+              return event
+  Pool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: cfn-pretoken-pool
+      LambdaConfig:
+        PreTokenGeneration: !GetAtt TriggerFn.Arn
+  Client:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref Pool
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+Outputs:
+  PoolId:
+    Value: !Ref Pool
+  ClientId:
+    Value: !Ref Client
+"""
+    stack_name = "cfn-cognito-pretoken"
+    try:
+        cfn.delete_stack(StackName=stack_name)
+    except Exception:
+        pass
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    _wait_stack(cfn, stack_name)
+
+    stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    pool_id, client_id = outputs["PoolId"], outputs["ClientId"]
+
+    desc = cognito_idp.describe_user_pool(UserPoolId=pool_id)["UserPool"]
+    assert desc["LambdaConfig"]["PreTokenGeneration"]
+
+    cognito_idp.admin_create_user(
+        UserPoolId=pool_id, Username="pretoken-user",
+        TemporaryPassword="Temp1234!", MessageAction="SUPPRESS",
+    )
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pool_id, Username="pretoken-user", Password="Pwd1234!", Permanent=True,
+    )
+    tok = cognito_idp.initiate_auth(
+        ClientId=client_id, AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "pretoken-user", "PASSWORD": "Pwd1234!"},
+    )["AuthenticationResult"]
+
+    id_payload = tok["IdToken"].split(".")[1]
+    id_payload += "=" * (-len(id_payload) % 4)
+    id_claims = json.loads(base64.urlsafe_b64decode(id_payload))
+    assert id_claims.get("injected_claim") == "from-cfn-trigger"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.describe_user_pool(UserPoolId=pool_id)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 # ---------------------------------------------------------------------------
 # ApiGatewayV2 Integration + Route provisioners
 # ---------------------------------------------------------------------------
