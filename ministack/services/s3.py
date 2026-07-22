@@ -2273,7 +2273,7 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     pending_tags = None
     tagging_header = headers.get("x-amz-tagging", "")
     if tagging_header:
-        pending_tags = {k: v[0] for k, v in _parse_qs(tagging_header).items()}
+        pending_tags = {k: v[0] for k, v in _parse_qs(tagging_header, keep_blank_values=True).items()}
         if len(pending_tags) > 10:
             return _error("BadRequest", "Object tags cannot be greater than 10", 400)
 
@@ -2472,7 +2472,7 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
     pending_tags = None
     tagging_header = synth.get("x-amz-tagging", "")
     if tagging_header:
-        parsed = {k: v[0] for k, v in _parse_qs(tagging_header).items()}
+        parsed = {k: v[0] for k, v in _parse_qs(tagging_header, keep_blank_values=True).items()}
         if len(parsed) <= 10:
             pending_tags = parsed
 
@@ -2984,7 +2984,7 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         tagging_header = headers.get("x-amz-tagging", "")
         if tagging_header:
             pending_dest_tags = {
-                k: v[0] for k, v in _parse_qs(tagging_header).items()
+                k: v[0] for k, v in _parse_qs(tagging_header, keep_blank_values=True).items()
             }
     else:
         src_tags = _object_tags.get(
