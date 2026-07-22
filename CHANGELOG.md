@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **API Gateway v2 — `queryStringParameters`/`body` sent as `null` instead of omitted** — the HTTP API v2 Lambda proxy event included `queryStringParameters`/`body` with a `null` value when a request had no query string or no payload, rather than omitting the key entirely as real AWS does. Strict event-shape validators (e.g. AWS Lambda Powertools' `isAPIGatewayProxyEventV2`) accept `undefined` or a proper value but reject `null`, so every bodyless or querystring-less request against such a validator failed with an unhandled `InvalidEventError`, even though the invocation itself succeeded and the Lambda's own business logic never ran. Contributed by @ryan-bennett.
+
 ### Added
 - **Cognito — resource servers** (`CreateResourceServer`, `UpdateResourceServer`, `DescribeResourceServer`, `DeleteResourceServer`, `ListResourceServers`) plus `AWS::Cognito::UserPoolResourceServer` CloudFormation support. Previously every resource-server action returned `InvalidAction: Unknown Cognito IDP action`, and the CFN resource type failed the whole stack with `Unsupported resource type`, so any app pool defining custom OAuth scopes (`{identifier}/{scopeName}`, e.g. for `HttpJwtAuthorizer` `authorizationScopes` gating on API Gateway) couldn't deploy against MiniStack at all. Resource servers are keyed by their caller-supplied `Identifier` within a pool, matching real AWS, and `Ref` on the CFN resource returns that `Identifier`. Contributed by @ryan-bennett.
 
