@@ -683,6 +683,8 @@ def _lambda_create(logical_id, props, stack_name):
         "next_version": 1,
         "tags": {},
         "policy": {"Version": "2012-10-17", "Id": "default", "Statement": []},
+        "event_invoke_config": None,
+        "event_invoke_configs": {},
         "aliases": {},
         "concurrency": None,
         "provisioned_concurrency": {},
@@ -2087,6 +2089,46 @@ def _apigw_stage_delete(physical_id, props):
     _apigw_v1._delete_stage(api_id, stage_name)
 
 
+# --- API Gateway BasePathMapping ---
+
+def _apigw_base_path_mapping_identity(props):
+    domain_name = props.get("DomainName", "")
+    base_path = props.get("BasePath") or "(none)"
+    return domain_name, base_path, f"{domain_name}/{base_path}"
+
+
+def _apigw_base_path_mapping_create(logical_id, props, stack_name):
+    domain_name, base_path, physical_id = _apigw_base_path_mapping_identity(props)
+    data = {
+        "basePath": base_path,
+        "restApiId": props.get("RestApiId", ""),
+        "stage": props.get("Stage", ""),
+    }
+    status, _headers, body = _apigw_v1._create_base_path_mapping(domain_name, data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::BasePathMapping create failed: {body!r}")
+    return physical_id, {}
+
+
+def _apigw_base_path_mapping_update(physical_id, old_props, new_props, stack_name):
+    old_domain, old_base_path, _old_id = _apigw_base_path_mapping_identity(old_props)
+    new_domain, new_base_path, _new_id = _apigw_base_path_mapping_identity(new_props)
+
+    # BasePath and DomainName require replacement; RestApiId and Stage update
+    # without interruption. The in-memory API Gateway implementation treats a
+    # create against an existing key as an upsert, which gives both paths the
+    # same atomic create-before-delete behavior here.
+    new_id, attrs = _apigw_base_path_mapping_create(physical_id, new_props, stack_name)
+    if (new_domain, new_base_path) != (old_domain, old_base_path):
+        _apigw_v1._delete_base_path_mapping(old_domain, old_base_path)
+    return new_id, attrs
+
+
+def _apigw_base_path_mapping_delete(physical_id, props):
+    domain_name, base_path, _mapping_id = _apigw_base_path_mapping_identity(props)
+    _apigw_v1._delete_base_path_mapping(domain_name, base_path)
+
+
 def _apigw_account_create(logical_id, props, stack_name):
     """``AWS::ApiGateway::Account`` is a singleton per AWS account storing the
     IAM role API Gateway uses to push logs to CloudWatch. CDK's
@@ -2108,6 +2150,80 @@ def _apigw_account_delete(physical_id, props):
     settings = dict(_apigw_v1._account_settings.get("settings") or {})
     settings.pop("cloudwatchRoleArn", None)
     _apigw_v1._account_settings["settings"] = settings
+
+
+# --- API Gateway DomainName ---
+
+def _apigw_domain_name_create(logical_id, props, stack_name):
+    """Provision an ``AWS::ApiGateway::DomainName`` through API Gateway v1."""
+    endpoint = props.get("EndpointConfiguration") or {}
+    endpoint_configuration = {
+        "types": endpoint.get("Types", ["REGIONAL"]),
+    }
+    if "IpAddressType" in endpoint:
+        endpoint_configuration["ipAddressType"] = endpoint["IpAddressType"]
+    if "VpcEndpointIds" in endpoint:
+        endpoint_configuration["vpcEndpointIds"] = endpoint["VpcEndpointIds"]
+
+    mutual_tls = props.get("MutualTlsAuthentication") or {}
+    mutual_tls_configuration = {}
+    if "TruststoreUri" in mutual_tls:
+        mutual_tls_configuration["truststoreUri"] = mutual_tls["TruststoreUri"]
+    if "TruststoreVersion" in mutual_tls:
+        mutual_tls_configuration["truststoreVersion"] = mutual_tls["TruststoreVersion"]
+
+    data = {
+        "domainName": props.get("DomainName", ""),
+        "endpointConfiguration": endpoint_configuration,
+        "tags": {tag["Key"]: tag["Value"] for tag in props.get("Tags", [])},
+    }
+    property_map = {
+        "CertificateArn": "certificateArn",
+        "EndpointAccessMode": "endpointAccessMode",
+        "OwnershipVerificationCertificateArn": "ownershipVerificationCertificateArn",
+        "RegionalCertificateArn": "regionalCertificateArn",
+        "RoutingMode": "routingMode",
+        "SecurityPolicy": "securityPolicy",
+    }
+    for cfn_name, api_name in property_map.items():
+        if cfn_name in props:
+            data[api_name] = props[cfn_name]
+    if mutual_tls_configuration:
+        data["mutualTlsAuthentication"] = mutual_tls_configuration
+
+    status, _headers, body = _apigw_v1._create_domain_name(data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::DomainName create failed: {body!r}")
+    domain = json.loads(body)
+    domain_name = domain["domainName"]
+    attrs = {
+        "DistributionDomainName": domain["distributionDomainName"],
+        "DistributionHostedZoneId": domain["distributionHostedZoneId"],
+        "DomainNameArn": f"arn:aws:apigateway:{get_region()}::/domainnames/{domain_name}",
+        "RegionalDomainName": domain["regionalDomainName"],
+        "RegionalHostedZoneId": domain["regionalHostedZoneId"],
+    }
+    return domain_name, attrs
+
+
+def _apigw_domain_name_update(physical_id, old_props, new_props, stack_name):
+    existing_mappings = _apigw_v1._base_path_mappings.get(physical_id)
+    new_domain_name = new_props.get("DomainName", "")
+    new_id, attrs = _apigw_domain_name_create(physical_id, new_props, stack_name)
+    if new_domain_name != physical_id:
+        _apigw_domain_name_delete(physical_id, old_props)
+    elif existing_mappings is not None:
+        # The native create helper initializes this collection. Preserve
+        # dependent mappings while mutable domain properties update in place.
+        _apigw_v1._base_path_mappings[physical_id] = existing_mappings
+    return new_id, attrs
+
+
+def _apigw_domain_name_delete(physical_id, props):
+    # Rollback and repeated stack deletion should remain harmless when the
+    # underlying custom domain has already been removed.
+    if physical_id in _apigw_v1._domain_names:
+        _apigw_v1._delete_domain_name(physical_id)
 
 
 # --- API Gateway GatewayResponse ---
@@ -2311,6 +2427,68 @@ def _lambda_esm_update(physical_id, old_props, new_props, stack_name):
         esm["FunctionArn"] = func_arn + (f":{qualifier}" if qualifier else "")
     esm["LastModified"] = int(time.time())
     return physical_id, {"UUID": physical_id}
+
+
+# --- Lambda EventInvokeConfig ---
+
+def _lambda_event_invoke_config_create(logical_id, props, stack_name):
+    func, func_name, _resource_arn, _embedded_qualifier = _lambda_function_for_cfn_ref(
+        props.get("FunctionName", "")
+    )
+    qualifier = props.get("Qualifier", "")
+    if func is None:
+        raise ValueError(f"Lambda function not found: {props.get('FunctionName', '')}")
+    if not qualifier or not _lambda_svc._function_qualifier_exists(func, qualifier):
+        raise ValueError(f"Lambda function qualifier not found: {func_name}:{qualifier}")
+
+    data = {
+        key: props[key]
+        for key in (
+            "DestinationConfig",
+            "MaximumEventAgeInSeconds",
+            "MaximumRetryAttempts",
+        )
+        if key in props
+    }
+    status, _headers, body = _lambda_svc._put_event_invoke_config(
+        func_name, qualifier, data
+    )
+    if status >= 400:
+        raise ValueError(
+            f"AWS::Lambda::EventInvokeConfig create failed: {body.decode('utf-8')}"
+        )
+    return f"{func_name}:{qualifier}", {}
+
+
+def _lambda_event_invoke_config_update(physical_id, old_props, new_props, stack_name):
+    replacement = any(
+        old_props.get(key) != new_props.get(key)
+        for key in ("FunctionName", "Qualifier")
+    )
+    new_id, attrs = _lambda_event_invoke_config_create(
+        physical_id, new_props, stack_name
+    )
+    if replacement:
+        _lambda_event_invoke_config_delete(physical_id, old_props)
+        return new_id, attrs
+    return physical_id, attrs
+
+
+def _lambda_event_invoke_config_delete(physical_id, props):
+    func, func_name, _resource_arn, _embedded_qualifier = _lambda_function_for_cfn_ref(
+        props.get("FunctionName", "")
+    )
+    if func is None:
+        return
+    qualifier = props.get("Qualifier", "") or None
+    status, _headers, _body = _lambda_svc._delete_event_invoke_config(
+        func_name, qualifier
+    )
+    # Stack rollback/delete is idempotent when the config has already gone.
+    if status not in (204, 404):
+        raise ValueError(
+            f"AWS::Lambda::EventInvokeConfig delete failed with status {status}"
+        )
 
 
 # --- EventBridge Pipes (minimal: DynamoDB Streams -> SNS) ---
@@ -3996,6 +4174,50 @@ def _cw_metric_alarm_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
+# CloudWatch Dashboard
+# ---------------------------------------------------------------------------
+
+
+def _cw_dashboard_name(logical_id, props, stack_name):
+    name = props.get("DashboardName") or _physical_name(
+        stack_name, logical_id, max_len=255
+    )
+    if not isinstance(name, str) or not 1 <= len(name) <= 255:
+        raise ValueError("DashboardName must be between 1 and 255 characters")
+    return name
+
+
+def _cw_dashboard_body(props):
+    body = props.get("DashboardBody")
+    if not isinstance(body, str) or not body:
+        raise ValueError("DashboardBody is required for AWS::CloudWatch::Dashboard")
+    return body
+
+
+def _cw_dashboard_create(logical_id, props, stack_name):
+    name = _cw_dashboard_name(logical_id, props, stack_name)
+    _cw.cloudformation_put_dashboard(name, _cw_dashboard_body(props))
+    return name, {}
+
+
+def _cw_dashboard_update(physical_id, old_props, new_props, stack_name):
+    # DashboardBody updates happen in place. DashboardName changes require
+    # replacement, which we model by creating the new dashboard before
+    # deleting the previous physical resource.
+    name = new_props.get("DashboardName") or physical_id
+    if not isinstance(name, str) or not 1 <= len(name) <= 255:
+        raise ValueError("DashboardName must be between 1 and 255 characters")
+    _cw.cloudformation_put_dashboard(name, _cw_dashboard_body(new_props))
+    if name != physical_id:
+        _cw.cloudformation_delete_dashboard(physical_id)
+    return name, {}
+
+
+def _cw_dashboard_delete(physical_id, props):
+    _cw.cloudformation_delete_dashboard(physical_id)
+
+
+# ---------------------------------------------------------------------------
 # ApiGatewayV2 Api
 # ---------------------------------------------------------------------------
 
@@ -4245,11 +4467,13 @@ def _cf_distribution_create(logical_id, props, stack_name):
         "config_xml": "",
         "enabled": dist_config.get("Enabled", True),
     }
+    _cf._invalidations[dist_id] = []
     return dist_id, {"Arn": arn, "DomainName": f"{dist_id}.cloudfront.net", "Id": dist_id}
 
 
 def _cf_distribution_delete(physical_id, props):
     _cf._distributions.pop(physical_id, None)
+    _cf._invalidations.pop(physical_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -4820,7 +5044,17 @@ _RESOURCE_HANDLERS = {
     "AWS::ApiGateway::Authorizer": {"create": _apigw_authorizer_create, "delete": _apigw_authorizer_delete},
     "AWS::ApiGateway::Deployment": {"create": _apigw_deployment_create, "delete": _apigw_deployment_delete},
     "AWS::ApiGateway::Stage": {"create": _apigw_stage_create, "delete": _apigw_stage_delete},
+    "AWS::ApiGateway::BasePathMapping": {
+        "create": _apigw_base_path_mapping_create,
+        "update": _apigw_base_path_mapping_update,
+        "delete": _apigw_base_path_mapping_delete,
+    },
     "AWS::ApiGateway::Account": {"create": _apigw_account_create, "delete": _apigw_account_delete},
+    "AWS::ApiGateway::DomainName": {
+        "create": _apigw_domain_name_create,
+        "update": _apigw_domain_name_update,
+        "delete": _apigw_domain_name_delete,
+    },
     "AWS::ApiGateway::GatewayResponse": {
         "create": _apigw_gateway_response_create,
         "update": _apigw_gateway_response_update,
@@ -4832,6 +5066,11 @@ _RESOURCE_HANDLERS = {
         "delete": _apigw_documentation_part_delete,
     },
     "AWS::Lambda::EventSourceMapping": {"create": _lambda_esm_create, "update": _lambda_esm_update, "delete": _lambda_esm_delete},
+    "AWS::Lambda::EventInvokeConfig": {
+        "create": _lambda_event_invoke_config_create,
+        "update": _lambda_event_invoke_config_update,
+        "delete": _lambda_event_invoke_config_delete,
+    },
     "AWS::Pipes::Pipe": {"create": _pipes_pipe_create, "delete": _pipes_pipe_delete},
     "AWS::Lambda::Alias": {"create": _lambda_alias_create, "delete": _lambda_alias_delete},
     "AWS::SQS::QueuePolicy": {"create": _sqs_queue_policy_create, "delete": _sqs_queue_policy_delete},
@@ -4884,6 +5123,11 @@ _RESOURCE_HANDLERS = {
     "AWS::CloudFront::Distribution": {"create": _cf_distribution_create, "delete": _cf_distribution_delete},
     "AWS::CloudFront::KeyValueStore": {"create": _cf_kvs_create, "update": _cf_kvs_update, "delete": _cf_kvs_delete},
     "AWS::CloudWatch::Alarm": {"create": _cw_metric_alarm_create, "delete": _cw_metric_alarm_delete},
+    "AWS::CloudWatch::Dashboard": {
+        "create": _cw_dashboard_create,
+        "update": _cw_dashboard_update,
+        "delete": _cw_dashboard_delete,
+    },
     "AWS::RDS::DBCluster": {"create": _rds_db_cluster_create, "delete": _rds_db_cluster_delete},
     "AWS::RDS::DBInstance": {"create": _rds_db_instance_create, "delete": _rds_db_instance_delete},
     "AWS::IoT::TopicRule": {"create": _iot_topic_rule_create, "delete": _iot_topic_rule_delete},

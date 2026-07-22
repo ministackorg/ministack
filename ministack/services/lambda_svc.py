@@ -13,7 +13,7 @@ Supports: CreateFunction, DeleteFunction, GetFunction, GetFunctionConfiguration,
           GetLayerVersionPolicy,
           CreateEventSourceMapping, DeleteEventSourceMapping,
           GetEventSourceMapping, ListEventSourceMappings, UpdateEventSourceMapping,
-          GetFunctionEventInvokeConfig, PutFunctionEventInvokeConfig (stub),
+          GetFunctionEventInvokeConfig, PutFunctionEventInvokeConfig,
           PutFunctionConcurrency, GetFunctionConcurrency, DeleteFunctionConcurrency,
           GetFunctionCodeSigningConfig (stub),
           CreateFunctionUrlConfig, GetFunctionUrlConfig, UpdateFunctionUrlConfig,
@@ -1569,13 +1569,16 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
     # --- Event Invoke Config: /2019-09-25/functions/{name}/event-invoke-config ---
     if "event-invoke-config" in path:
         m = re.search(r"/functions/([^/]+)/event-invoke-config", path)
-        fname = _resolve_request_scoped_name(m.group(1)) if m else ""
+        fname, path_qualifier = (
+            _resolve_request_scoped_name_and_qualifier(m.group(1)) if m else ("", None)
+        )
+        qualifier = _qualifier_from_path_or_query(path_qualifier, query_params)
         if method == "GET":
-            return _get_event_invoke_config(fname)
+            return _get_event_invoke_config(fname, qualifier)
         if method == "PUT":
-            return _put_event_invoke_config(fname, data)
+            return _put_event_invoke_config(fname, qualifier, data)
         if method == "DELETE":
-            return _delete_event_invoke_config(fname)
+            return _delete_event_invoke_config(fname, qualifier)
 
     # --- Provisioned Concurrency: /2019-09-30/functions/{name}/provisioned-concurrency ---
     if "provisioned-concurrency" in path:
@@ -1808,6 +1811,7 @@ def _create_function(data: dict):
         "tags": data.get("Tags", {}),
         "policy": {"Version": "2012-10-17", "Id": "default", "Statement": []},
         "event_invoke_config": None,
+        "event_invoke_configs": {},
         "aliases": {},
         "concurrency": None,
         "provisioned_concurrency": {},
@@ -1892,25 +1896,20 @@ def _get_function_config(name: str, qualifier: str | None = None):
 
 
 def _list_function_event_invoke_configs(func_name: str, query_params: dict):
-    """AWS `ListFunctionEventInvokeConfigs` — returns the set of per-qualifier
-    event-invoke configs for a function. We store one per function on the
-    primary record (no per-qualifier split), so the result is 0 or 1 items."""
+    """AWS `ListFunctionEventInvokeConfigs` — return every qualifier config."""
     if func_name not in _functions:
         return error_response_json(
             "ResourceNotFoundException",
             f"Function not found: {_func_arn(func_name)}", 404,
         )
-    eic = _functions[func_name].get("event_invoke_config")
-    items = []
-    if eic:
-        arn = _func_arn(func_name)
-        items.append({
-            "FunctionArn": arn,
-            "LastModified": int(time.time()),
-            "MaximumRetryAttempts": eic.get("MaximumRetryAttempts", 2),
-            "MaximumEventAgeInSeconds": eic.get("MaximumEventAgeInSeconds", 21600),
-            "DestinationConfig": eic.get("DestinationConfig", {}),
-        })
+    func = _functions[func_name]
+    configs = dict(func.get("event_invoke_configs") or {})
+    # Backward compatibility for persisted state created before configs were
+    # qualifier-aware.
+    legacy = func.get("event_invoke_config")
+    if legacy and "" not in configs:
+        configs[""] = legacy
+    items = list(configs.values())
     return json_response({"FunctionEventInvokeConfigs": items})
 
 
@@ -2811,7 +2810,11 @@ def invoke_async_with_retry(func: dict, event: dict) -> None:
         _request_account_id.set(account_id)
         _request_region.set(region)
         fn_name = config.get("FunctionName", "unknown")
-        eic = func.get("event_invoke_config") or {}
+        eic = (
+            func.get("event_invoke_config")
+            or (func.get("event_invoke_configs") or {}).get("$LATEST")
+            or {}
+        )
         max_retries = eic.get("MaximumRetryAttempts")
         if max_retries is None:
             max_retries = 2
@@ -5106,34 +5109,50 @@ def serve_layer_content(
 
 
 # ---------------------------------------------------------------------------
-# Event Invoke Config (stubs — enough for Terraform to not error)
+# Event Invoke Config
 # ---------------------------------------------------------------------------
 
 
-def _get_event_invoke_config(func_name: str):
+def _event_invoke_config(func: dict, qualifier: str | None) -> dict | None:
+    configs = func.get("event_invoke_configs") or {}
+    key = qualifier or ""
+    if key in configs:
+        return configs[key]
+    # Read legacy unqualified state written by older MiniStack versions.
+    if not qualifier:
+        return func.get("event_invoke_config")
+    return None
+
+
+def _get_event_invoke_config(func_name: str, qualifier: str | None = None):
     if func_name not in _functions:
         return error_response_json(
             "ResourceNotFoundException",
             f"Function not found: {_func_arn(func_name)}",
             404,
         )
-    eic = _functions[func_name].get("event_invoke_config")
+    if not _function_qualifier_exists(_functions[func_name], qualifier):
+        return _function_qualifier_not_found(func_name, qualifier)
+    eic = _event_invoke_config(_functions[func_name], qualifier)
     if not eic:
+        suffix = f":{qualifier}" if qualifier else ""
         return error_response_json(
             "ResourceNotFoundException",
-            f"The function {func_name} doesn't have an EventInvokeConfig",
+            f"The function {func_name}{suffix} doesn't have an EventInvokeConfig",
             404,
         )
     return json_response(eic)
 
 
-def _put_event_invoke_config(func_name: str, data: dict):
+def _put_event_invoke_config(func_name: str, qualifier: str | None, data: dict):
     if func_name not in _functions:
         return error_response_json(
             "ResourceNotFoundException",
             f"Function not found: {_func_arn(func_name)}",
             404,
         )
+    if not _function_qualifier_exists(_functions[func_name], qualifier):
+        return _function_qualifier_not_found(func_name, qualifier)
     destination_config = data.get(
         "DestinationConfig",
         {
@@ -5144,25 +5163,45 @@ def _put_event_invoke_config(func_name: str, data: dict):
     err = _validate_destination_config(destination_config)
     if err:
         return err
+    function_arn = _func_arn(func_name)
+    if qualifier:
+        function_arn = f"{function_arn}:{qualifier}"
     eic = {
-        "FunctionArn": _func_arn(func_name),
+        "FunctionArn": function_arn,
         "MaximumRetryAttempts": data.get("MaximumRetryAttempts", 2),
         "MaximumEventAgeInSeconds": data.get("MaximumEventAgeInSeconds", 21600),
         "LastModified": int(time.time()),
         "DestinationConfig": destination_config,
     }
-    _functions[func_name]["event_invoke_config"] = eic
+    func = _functions[func_name]
+    func.setdefault("event_invoke_configs", {})[qualifier or ""] = eic
+    if not qualifier:
+        func["event_invoke_config"] = eic
     return json_response(eic)
 
 
-def _delete_event_invoke_config(func_name: str):
+def _delete_event_invoke_config(func_name: str, qualifier: str | None = None):
     if func_name not in _functions:
         return error_response_json(
             "ResourceNotFoundException",
             f"Function not found: {_func_arn(func_name)}",
             404,
         )
-    _functions[func_name]["event_invoke_config"] = None
+    if not _function_qualifier_exists(_functions[func_name], qualifier):
+        return _function_qualifier_not_found(func_name, qualifier)
+    func = _functions[func_name]
+    configs = func.setdefault("event_invoke_configs", {})
+    key = qualifier or ""
+    if key not in configs and not (not qualifier and func.get("event_invoke_config")):
+        suffix = f":{qualifier}" if qualifier else ""
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"The function {func_name}{suffix} doesn't have an EventInvokeConfig",
+            404,
+        )
+    configs.pop(key, None)
+    if not qualifier:
+        func["event_invoke_config"] = None
     return 204, {}, b""
 
 

@@ -480,6 +480,7 @@ subnet = ec2.create_subnet(
 | `AWS::Lambda::Version` | Version ARN | Version |
 | `AWS::Lambda::Alias` | Alias ARN | — |
 | `AWS::Lambda::EventSourceMapping` | UUID | — |
+| `AWS::Lambda::EventInvokeConfig` | Unique function/qualifier identifier | — |
 | `AWS::S3::BucketPolicy` | Bucket name | — |
 | `AWS::SQS::QueuePolicy` | Policy ID | — |
 | `AWS::SNS::TopicPolicy` | Policy ID | — |
@@ -489,6 +490,7 @@ subnet = ec2.create_subnet(
 | `AWS::ApiGateway::Model` | Model name | — |
 | `AWS::ApiGateway::Deployment` | Deployment ID | — |
 | `AWS::ApiGateway::Stage` | Stage name | — |
+| `AWS::ApiGateway::DomainName` | Domain name | DistributionDomainName, DistributionHostedZoneId, DomainNameArn, RegionalDomainName, RegionalHostedZoneId |
 | `AWS::ApiGateway::GatewayResponse` | Response ID | Id |
 | `AWS::ApiGateway::DocumentationPart` | Documentation part ID | — |
 | `AWS::AppConfig::Application` | Application ID | ApplicationId |
@@ -533,6 +535,7 @@ subnet = ec2.create_subnet(
 | `AWS::WAFv2::WebACL` | WebACL ID | Arn, Id |
 | `AWS::CloudFront::Distribution` | Distribution ID | Arn, DomainName, Id |
 | `AWS::CloudWatch::Alarm` | Alarm name | Arn |
+| `AWS::CloudWatch::Dashboard` | Dashboard name | — |
 | `AWS::RDS::DBCluster` | Cluster ID | Arn, Endpoint.Address, Endpoint.Port, ReadEndpoint.Address |
 | `AWS::AutoScaling::AutoScalingGroup` | ASG name | Arn |
 | `AWS::AutoScaling::LaunchConfiguration` | LC name | Arn |
