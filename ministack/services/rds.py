@@ -4113,6 +4113,9 @@ def _enable_http_endpoint(p):
 
 def _disable_http_endpoint(p):
     arn = _p(p, "ResourceArn")
+    wrong_region = _resource_not_found_error_for_arn(arn)
+    if wrong_region:
+        return wrong_region
     for cluster in _clusters.values():
         if cluster.get("DBClusterArn") == arn:
             cluster["HttpEndpointEnabled"] = False

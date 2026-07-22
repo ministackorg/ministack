@@ -4674,7 +4674,7 @@ def test_cfn_s3tables_resources(cfn, s3tables):
         },
         "Outputs": {
             "BucketArn": {"Value": {"Fn::GetAtt": ["Bucket", "TableBucketARN"]}},
-            "TableArn": {"Value": {"Fn::GetAtt": ["Table", "TableArn"]}},
+            "TableArn": {"Value": {"Fn::GetAtt": ["Table", "TableARN"]}},
         },
     }
 
