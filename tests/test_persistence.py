@@ -1832,6 +1832,44 @@ def test_ecs_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path)
     assert persistence.load_state("ecs") is None
 
 
+def test_autoscaling_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject Auto Scaling's regional schema instead
+    of accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    asgs = AccountRegionScopedDict()
+    asgs.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-asg",
+        {
+            "AutoScalingGroupARN": (
+                "arn:aws:autoscaling:us-west-2:000000000000:"
+                "autoScalingGroup:regional:autoScalingGroupName/regional-asg"
+            )
+        },
+    )
+    persistence.save_state("autoscaling", {"asgs": asgs})
+
+    raw = _json.loads((tmp_path / "autoscaling.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_asgs = persistence.load_state("autoscaling")["asgs"]
+    assert loaded_asgs.get_scoped(
+        "000000000000", "us-west-2", "regional-asg"
+    )["AutoScalingGroupARN"].endswith("autoScalingGroupName/regional-asg")
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("autoscaling") is None
+
+
 def test_resource_groups_region_scoped_state_is_rejected_by_v2_reader(
     monkeypatch, tmp_path
 ):
