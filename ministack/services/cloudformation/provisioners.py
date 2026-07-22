@@ -1967,6 +1967,71 @@ def _apigw_gateway_response_delete(physical_id, props):
         _apigw_v1._delete_gateway_response(api_id, response_type)
 
 
+# --- API Gateway DocumentationPart ---
+
+def _apigw_documentation_part_create(logical_id, props, stack_name):
+    """Provision an ``AWS::ApiGateway::DocumentationPart``."""
+    api_id = props.get("RestApiId", "")
+    cfn_location = props.get("Location", {})
+    location_keys = {
+        "Type": "type",
+        "Path": "path",
+        "Method": "method",
+        "StatusCode": "statusCode",
+        "Name": "name",
+    }
+    data = {
+        "location": {
+            api_key: cfn_location[cfn_key]
+            for cfn_key, api_key in location_keys.items()
+            if cfn_key in cfn_location
+        },
+        "properties": props.get("Properties"),
+    }
+    status, _headers, body = _apigw_v1._create_documentation_part(api_id, data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::DocumentationPart create failed: {body!r}")
+
+    part = json.loads(body) if isinstance(body, (bytes, bytearray)) else json.loads(body)
+    part_id = part.get("id", "")
+    return part_id, {"Id": part_id, "DocumentationPartId": part_id}
+
+
+def _apigw_documentation_part_update(physical_id, old_props, new_props, stack_name):
+    # RestApiId and Location require replacement in the AWS CFN resource
+    # specification; Properties is mutable in place.
+    if any(new_props.get(key) != old_props.get(key) for key in ("RestApiId", "Location")):
+        new_id, attrs = _apigw_documentation_part_create(physical_id, new_props, stack_name)
+        _apigw_documentation_part_delete(physical_id, old_props)
+        return new_id, attrs
+
+    if new_props.get("Properties") != old_props.get("Properties"):
+        api_id = new_props.get("RestApiId", "")
+        data = {
+            "patchOperations": [
+                {
+                    "op": "replace",
+                    "path": "/properties",
+                    "value": new_props.get("Properties", ""),
+                },
+            ],
+        }
+        status, _headers, body = _apigw_v1._update_documentation_part(
+            api_id, physical_id, data,
+        )
+        if status >= 400:
+            raise ValueError(f"AWS::ApiGateway::DocumentationPart update failed: {body!r}")
+    return physical_id, {"Id": physical_id, "DocumentationPartId": physical_id}
+
+
+def _apigw_documentation_part_delete(physical_id, props):
+    api_id = props.get("RestApiId", "")
+    parts = _apigw_v1._documentation_parts.get(api_id, {})
+    # Keep rollback and parent-first cleanup idempotent.
+    if physical_id in parts:
+        _apigw_v1._delete_documentation_part(api_id, physical_id)
+
+
 # --- Lambda EventSourceMapping ---
 
 def _lambda_esm_create(logical_id, props, stack_name):
@@ -4496,6 +4561,11 @@ _RESOURCE_HANDLERS = {
         "create": _apigw_gateway_response_create,
         "update": _apigw_gateway_response_update,
         "delete": _apigw_gateway_response_delete,
+    },
+    "AWS::ApiGateway::DocumentationPart": {
+        "create": _apigw_documentation_part_create,
+        "update": _apigw_documentation_part_update,
+        "delete": _apigw_documentation_part_delete,
     },
     "AWS::Lambda::EventSourceMapping": {"create": _lambda_esm_create, "update": _lambda_esm_update, "delete": _lambda_esm_delete},
     "AWS::Pipes::Pipe": {"create": _pipes_pipe_create, "delete": _pipes_pipe_delete},

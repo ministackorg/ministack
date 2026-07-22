@@ -43,6 +43,11 @@ Control plane endpoints implemented:
   GET    /restapis/{id}/models                                             — GetModels
   GET    /restapis/{id}/models/{modelName}                                 — GetModel
   DELETE /restapis/{id}/models/{modelName}                                 — DeleteModel
+  POST   /restapis/{id}/documentation/parts                                — CreateDocumentationPart
+  GET    /restapis/{id}/documentation/parts                                — GetDocumentationParts
+  GET    /restapis/{id}/documentation/parts/{partId}                       — GetDocumentationPart
+  PATCH  /restapis/{id}/documentation/parts/{partId}                       — UpdateDocumentationPart
+  DELETE /restapis/{id}/documentation/parts/{partId}                       — DeleteDocumentationPart
   PUT    /restapis/{id}/gatewayresponses/{responseType}                    — PutGatewayResponse
   GET    /restapis/{id}/gatewayresponses                                   — GetGatewayResponses
   GET    /restapis/{id}/gatewayresponses/{responseType}                    — GetGatewayResponse
@@ -120,6 +125,7 @@ _base_path_mappings = AccountScopedDict()  # domain_name -> {base_path -> BasePa
 _v1_tags = AccountScopedDict()             # resource_arn -> {key -> value}
 _account_settings = AccountScopedDict()    # singleton per account: stores fields set via UpdateAccount
 _gateway_responses = AccountScopedDict()   # rest_api_id -> {response_type -> customized GatewayResponse}
+_documentation_parts = AccountScopedDict()  # rest_api_id -> {part_id -> DocumentationPart}
 
 
 _GATEWAY_RESPONSE_TYPES = (
@@ -169,6 +175,23 @@ _DEFAULT_GATEWAY_RESPONSE_STATUS_CODES = {
 }
 
 _DEFAULT_GATEWAY_RESPONSE_TEMPLATE = '{"message":$context.error.messageString}'
+
+_DOCUMENTATION_LOCATION_TYPES = frozenset(
+    {
+        "API",
+        "AUTHORIZER",
+        "MODEL",
+        "RESOURCE",
+        "METHOD",
+        "PATH_PARAMETER",
+        "QUERY_PARAMETER",
+        "REQUEST_HEADER",
+        "REQUEST_BODY",
+        "RESPONSE",
+        "RESPONSE_HEADER",
+        "RESPONSE_BODY",
+    }
+)
 
 
 # ---- Helpers ----
@@ -648,6 +671,7 @@ def get_state():
         "v1_tags": copy.deepcopy(_v1_tags),
         "account_settings": copy.deepcopy(_account_settings),
         "gateway_responses": copy.deepcopy(_gateway_responses),
+        "documentation_parts": copy.deepcopy(_documentation_parts),
     }
 
 
@@ -726,6 +750,7 @@ def load_persisted_state(data):
     _v1_tags.update(data.get("v1_tags", {}))
     _account_settings.update(data.get("account_settings", {}))
     _gateway_responses.update(data.get("gateway_responses", {}))
+    _documentation_parts.update(data.get("documentation_parts", {}))
     _backfill_tag_region_map(_rest_apis, _rest_api_regions, _region_from_rest_api_record)
     _backfill_tag_region_map(_api_keys, _api_key_regions, _region_from_api_key_record)
     _backfill_tag_region_map(_usage_plans, _usage_plan_regions, _region_from_usage_plan_record)
@@ -752,6 +777,7 @@ def reset():
     _v1_tags.clear()
     _account_settings.clear()
     _gateway_responses.clear()
+    _documentation_parts.clear()
 
 
 # ---- Control plane router ----
@@ -1021,6 +1047,22 @@ async def handle_request(method, path, headers, body, query_params):
                     return _update_model(api_id, model_name, data)
                 if method == "DELETE":
                     return _delete_model(api_id, model_name)
+
+        # /restapis/{id}/documentation/parts[/{partId}]
+        elif sub == "documentation" and len(parts) > 3 and parts[3] == "parts":
+            part_id = parts[4] if len(parts) > 4 else None
+            if part_id is None:
+                if method == "POST":
+                    return _create_documentation_part(api_id, data)
+                if method == "GET":
+                    return _get_documentation_parts(api_id, query_params)
+            else:
+                if method == "GET":
+                    return _get_documentation_part(api_id, part_id)
+                if method == "PATCH":
+                    return _update_documentation_part(api_id, part_id, data)
+                if method == "DELETE":
+                    return _delete_documentation_part(api_id, part_id)
 
         # /restapis/{id}/gatewayresponses[/{responseType}]
         elif sub == "gatewayresponses":
@@ -1393,6 +1435,7 @@ def _create_rest_api(data):
     _authorizers_v1[api_id] = {}
     _models[api_id] = {}
     _gateway_responses[api_id] = {}
+    _documentation_parts[api_id] = {}
 
     # Create root resource "/"
     root_id = _new_id()[:8]
@@ -1440,6 +1483,7 @@ def _delete_rest_api(api_id):
     _authorizers_v1.pop(api_id, None)
     _models.pop(api_id, None)
     _gateway_responses.pop(api_id, None)
+    _documentation_parts.pop(api_id, None)
     _v1_tags.pop(_rest_api_arn(api_id), None)
     return 202, {}, b""
 
@@ -2014,6 +2058,112 @@ def _delete_model(api_id, model_name):
     if model_name not in _models.get(api_id, {}):
         return _v1_error("NotFoundException", "Invalid Model identifier specified", 404)
     _models[api_id].pop(model_name, None)
+    return 202, {}, b""
+
+
+# ---- Control plane: Documentation Parts ----
+
+def _validate_documentation_api(api_id):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    return None
+
+
+def _create_documentation_part(api_id, data):
+    error = _validate_documentation_api(api_id)
+    if error is not None:
+        return error
+
+    location = dict(data.get("location") or {})
+    location_type = location.get("type")
+    if location_type not in _DOCUMENTATION_LOCATION_TYPES:
+        return _v1_error(
+            "BadRequestException",
+            "Invalid documentation part location type specified",
+            400,
+        )
+    if data.get("properties") is None:
+        return _v1_error(
+            "BadRequestException",
+            "Documentation part properties must be specified",
+            400,
+        )
+
+    part_id = _new_id()
+    part = {
+        "id": part_id,
+        "location": location,
+        "properties": data["properties"],
+    }
+    _documentation_parts.setdefault(api_id, {})[part_id] = part
+    return _v1_response(part, 201)
+
+
+def _get_documentation_part(api_id, part_id):
+    error = _validate_documentation_api(api_id)
+    if error is not None:
+        return error
+    part = _documentation_parts.get(api_id, {}).get(part_id)
+    if part is None:
+        return _v1_error(
+            "NotFoundException",
+            "Invalid DocumentationPart identifier specified",
+            404,
+        )
+    return _v1_response(part)
+
+
+def _get_documentation_parts(api_id, query_params):
+    error = _validate_documentation_api(api_id)
+    if error is not None:
+        return error
+
+    parts = list(_documentation_parts.get(api_id, {}).values())
+    location_type = _qp(query_params, "type")
+    name_query = _qp(query_params, "name")
+    path = _qp(query_params, "path")
+    location_status = _qp(query_params, "locationStatus")
+    if location_type:
+        parts = [part for part in parts if part["location"].get("type") == location_type]
+    if name_query:
+        parts = [part for part in parts if name_query in part["location"].get("name", "")]
+    if path:
+        parts = [part for part in parts if part["location"].get("path") == path]
+    # Stored parts are documented by definition. API Gateway also synthesizes
+    # undocumented API entities for this filter; MiniStack has no need to
+    # materialize those placeholder records.
+    if location_status == "UNDOCUMENTED":
+        parts = []
+    return _v1_paginated_response(parts, query_params)
+
+
+def _update_documentation_part(api_id, part_id, data):
+    error = _validate_documentation_api(api_id)
+    if error is not None:
+        return error
+    part = _documentation_parts.get(api_id, {}).get(part_id)
+    if part is None:
+        return _v1_error(
+            "NotFoundException",
+            "Invalid DocumentationPart identifier specified",
+            404,
+        )
+    _apply_patch(part, data.get("patchOperations", []))
+    return _v1_response(part)
+
+
+def _delete_documentation_part(api_id, part_id):
+    error = _validate_documentation_api(api_id)
+    if error is not None:
+        return error
+    parts = _documentation_parts.get(api_id, {})
+    if part_id not in parts:
+        return _v1_error(
+            "NotFoundException",
+            "Invalid DocumentationPart identifier specified",
+            404,
+        )
+    parts.pop(part_id, None)
     return 202, {}, b""
 
 

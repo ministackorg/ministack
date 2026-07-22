@@ -4150,6 +4150,113 @@ def test_cfn_apigateway_gateway_response_lifecycle(cfn, apigw_v1):
         apigw_v1.delete_rest_api(restApiId=api_id)
 
 
+def test_cfn_apigateway_documentation_part_lifecycle(cfn, apigw_v1):
+    """DocumentationPart supports create, update, replacement, Ref, and delete.
+
+    Regression for #1159: the resource type previously failed stack creation
+    with ``Unsupported resource type: AWS::ApiGateway::DocumentationPart``.
+    """
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-documentation-part-{suffix}"
+    api_id = apigw_v1.create_rest_api(name=f"documentation-part-{suffix}")["id"]
+    stack_deleted = False
+
+    def template(location, description):
+        return {
+            "Resources": {
+                "DocumentationPart": {
+                    "Type": "AWS::ApiGateway::DocumentationPart",
+                    "Properties": {
+                        "RestApiId": api_id,
+                        "Location": location,
+                        "Properties": json.dumps({"description": description}),
+                    },
+                },
+            },
+            "Outputs": {
+                "DocumentationPartId": {"Value": {"Ref": "DocumentationPart"}},
+            },
+        }
+
+    def physical_id():
+        detail = cfn.describe_stack_resource(
+            StackName=stack_name,
+            LogicalResourceId="DocumentationPart",
+        )["StackResourceDetail"]
+        return detail["PhysicalResourceId"]
+
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template({"Type": "API"}, "Created")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        created_id = physical_id()
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack.get("Outputs", [])}
+        assert outputs["DocumentationPartId"] == created_id
+        created = apigw_v1.get_documentation_part(
+            restApiId=api_id,
+            documentationPartId=created_id,
+        )
+        assert created["location"] == {"type": "API"}
+        assert json.loads(created["properties"])["description"] == "Created"
+
+        # Properties updates in place.
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template({"Type": "API"}, "Updated")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() == created_id
+        updated = apigw_v1.get_documentation_part(
+            restApiId=api_id,
+            documentationPartId=created_id,
+        )
+        assert json.loads(updated["properties"])["description"] == "Updated"
+
+        # Location is immutable and replaces the documentation part.
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(
+                template({"Type": "RESOURCE", "Path": "/pets"}, "Replacement")
+            ),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        replacement_id = physical_id()
+        assert replacement_id != created_id
+        with pytest.raises(ClientError):
+            apigw_v1.get_documentation_part(
+                restApiId=api_id,
+                documentationPartId=created_id,
+            )
+        replacement = apigw_v1.get_documentation_part(
+            restApiId=api_id,
+            documentationPartId=replacement_id,
+        )
+        assert replacement["location"] == {"type": "RESOURCE", "path": "/pets"}
+
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        stack_deleted = True
+        with pytest.raises(ClientError):
+            apigw_v1.get_documentation_part(
+                restApiId=api_id,
+                documentationPartId=replacement_id,
+            )
+    finally:
+        if not stack_deleted:
+            try:
+                cfn.delete_stack(StackName=stack_name)
+                _wait_stack(cfn, stack_name)
+            except ClientError:
+                pass
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
 # ---------------------------------------------------------------------------
 # ApiGatewayV1 Integration with OpenAPI spec parsing
 # ---------------------------------------------------------------------------
