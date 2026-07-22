@@ -3987,6 +3987,93 @@ def test_cfn_apigateway_account_provisions(cfn, apigw_v1):
     _wait_stack(cfn, stack_name)
 
 
+def test_cfn_apigateway_domain_name_lifecycle(cfn, apigw_v1):
+    """CloudFormation provisions CDK-style regional and edge custom domains."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-apigw-domain-{suffix}"
+    regional_name = f"regional-{suffix}.example.local"
+    edge_name = f"edge-{suffix}.example.local"
+    regional_certificate_arn = (
+        f"arn:aws:acm:us-east-1:000000000000:certificate/regional-{suffix}"
+    )
+    edge_certificate_arn = (
+        f"arn:aws:acm:us-east-1:000000000000:certificate/edge-{suffix}"
+    )
+    template = {
+        "Resources": {
+            "RegionalDomain": {
+                "Type": "AWS::ApiGateway::DomainName",
+                "Properties": {
+                    "DomainName": regional_name,
+                    "EndpointConfiguration": {"Types": ["REGIONAL"]},
+                    "RegionalCertificateArn": regional_certificate_arn,
+                    "SecurityPolicy": "TLS_1_2",
+                    "Tags": [{"Key": "created-by", "Value": "cloudformation"}],
+                },
+            },
+            "EdgeDomain": {
+                "Type": "AWS::ApiGateway::DomainName",
+                "Properties": {
+                    "DomainName": edge_name,
+                    "EndpointConfiguration": {"Types": ["EDGE"]},
+                    "CertificateArn": edge_certificate_arn,
+                    "SecurityPolicy": "TLS_1_2",
+                },
+            },
+        },
+        "Outputs": {
+            "RegionalRef": {"Value": {"Ref": "RegionalDomain"}},
+            "RegionalDomainName": {
+                "Value": {"Fn::GetAtt": ["RegionalDomain", "RegionalDomainName"]},
+            },
+            "RegionalHostedZoneId": {
+                "Value": {"Fn::GetAtt": ["RegionalDomain", "RegionalHostedZoneId"]},
+            },
+            "RegionalDomainNameArn": {
+                "Value": {"Fn::GetAtt": ["RegionalDomain", "DomainNameArn"]},
+            },
+            "DistributionDomainName": {
+                "Value": {"Fn::GetAtt": ["EdgeDomain", "DistributionDomainName"]},
+            },
+            "DistributionHostedZoneId": {
+                "Value": {"Fn::GetAtt": ["EdgeDomain", "DistributionHostedZoneId"]},
+            },
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    outputs = {item["OutputKey"]: item["OutputValue"] for item in stack.get("Outputs", [])}
+    assert outputs["RegionalRef"] == regional_name
+    assert outputs["RegionalDomainName"] == (
+        f"{regional_name}.execute-api.us-east-1.amazonaws.com"
+    )
+    assert outputs["RegionalHostedZoneId"] == "Z1UJRXOUMOOFQ8"
+    assert outputs["RegionalDomainNameArn"] == (
+        f"arn:aws:apigateway:us-east-1::/domainnames/{regional_name}"
+    )
+    assert outputs["DistributionDomainName"] == f"{edge_name}.cloudfront.net"
+    assert outputs["DistributionHostedZoneId"] == "Z2FDTNDATAQYW2"
+
+    regional = apigw_v1.get_domain_name(domainName=regional_name)
+    assert regional["endpointConfiguration"] == {"types": ["REGIONAL"]}
+    assert regional["regionalCertificateArn"] == regional_certificate_arn
+    assert regional["tags"] == {"created-by": "cloudformation"}
+    edge = apigw_v1.get_domain_name(domainName=edge_name)
+    assert edge["endpointConfiguration"] == {"types": ["EDGE"]}
+    assert edge["certificateArn"] == edge_certificate_arn
+
+    cfn.delete_stack(StackName=stack_name)
+    deleted = _wait_stack(cfn, stack_name)
+    assert deleted["StackStatus"] == "DELETE_COMPLETE"
+    for domain_name in (regional_name, edge_name):
+        with pytest.raises(ClientError) as exc:
+            apigw_v1.get_domain_name(domainName=domain_name)
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
 def test_cfn_apigateway_gateway_response_resolves_rest_api_ref(cfn, apigw_v1):
     """The issue #1124 CDK shape provisions a response against a stack REST API."""
     suffix = _uuid_mod.uuid4().hex[:8]
