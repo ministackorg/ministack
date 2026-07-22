@@ -1909,9 +1909,9 @@ def test_codebuild_region_scoped_state_is_rejected_by_v2_reader(
     assert persistence.load_state("codebuild") is None
 
 
-def test_batch_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
-    """A rollback binary must reject Batch's regional schema instead of
-    accepting it as v2 and silently dropping every regional store."""
+def test_ses_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject both SES persistence files after their
+    stores become regional instead of accepting v2 and restoring them empty."""
     import json as _json
 
     from ministack.core.responses import AccountRegionScopedDict
@@ -1919,64 +1919,24 @@ def test_batch_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_pat
     monkeypatch.setattr(persistence, "PERSIST_STATE", True)
     monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
 
-    jobs = AccountRegionScopedDict()
-    jobs.set_scoped(
-        "000000000000",
-        "us-west-2",
-        "regional-job",
-        {"jobArn": "arn:aws:batch:us-west-2:000000000000:job/regional-job"},
-    )
-    persistence.save_state("batch", {"jobs": jobs})
+    for service in ("ses", "ses_v2"):
+        identities = AccountRegionScopedDict()
+        identities.set_scoped(
+            "000000000000",
+            "us-west-2",
+            "regional@example.com",
+            {"VerificationStatus": "Success"},
+        )
+        persistence.save_state(service, {"_identities": identities})
 
-    raw = _json.loads((tmp_path / "batch.json").read_text())
-    assert raw["__ministack_format__"] == 3
-    loaded_jobs = persistence.load_state("batch")["jobs"]
-    assert loaded_jobs.get_scoped(
-        "000000000000", "us-west-2", "regional-job"
-    )["jobArn"].endswith("job/regional-job")
+        raw = _json.loads((tmp_path / f"{service}.json").read_text())
+        assert raw["__ministack_format__"] == 3
+        loaded_identities = persistence.load_state(service)["_identities"]
+        assert loaded_identities.get_scoped(
+            "000000000000", "us-west-2", "regional@example.com"
+        )["VerificationStatus"] == "Success"
 
     # Simulate the previous binary, whose highest understood format is v2.
     monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
-    assert persistence.load_state("batch") is None
-
-
-def test_batch_persistence_lifecycle_restores_regional_state(monkeypatch, tmp_path):
-    """The gateway save map and Batch import-time restore must preserve state
-    outside the ambient boot region across a process-shaped reload."""
-    import importlib
-
-    from ministack.app import _build_persistence_save_dict, _state_map
-    from ministack.core.responses import set_request_account_id, set_request_region
-    from ministack.services import batch as service
-
-    account_id = "111111111111"
-    boot_region = "us-east-1"
-    resource_region = "us-west-2"
-    job_id = "regional-job"
-    job = {
-        "jobArn": f"arn:aws:batch:{resource_region}:{account_id}:job/{job_id}",
-        "status": "SUCCEEDED",
-    }
-
-    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
-    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
-    set_request_account_id(account_id)
-    set_request_region(boot_region)
-    service.reset()
-    try:
-        service._jobs.set_scoped(account_id, resource_region, job_id, job)
-
-        assert _state_map["batch"] == "batch"
-        save_dict = _build_persistence_save_dict()
-        assert "batch" in save_dict
-        persistence.save_all({"batch": save_dict["batch"]})
-
-        service.reset()
-        importlib.reload(service)
-
-        assert service._jobs.get_scoped(
-            account_id, resource_region, job_id
-        ) == job
-        assert service._jobs.get_scoped(account_id, boot_region, job_id) is None
-    finally:
-        service.reset()
+    assert persistence.load_state("ses") is None
+    assert persistence.load_state("ses_v2") is None

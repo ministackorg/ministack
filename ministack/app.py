@@ -689,8 +689,7 @@ async def _handle_ses_messages_request(method: str, path: str, headers: dict, qu
     """Handle SES messages inspection endpoint.
 
     Supports filtering by account via the 'account' query parameter. When provided,
-    sets the request context to that account so emails are retrieved from the correct
-    AccountScopedDict._sent_emails_list.
+    returns messages grouped by account across the service's regional stores.
     """
     if path != "/_ministack/ses/messages" or method != "GET":
         return None
@@ -716,9 +715,15 @@ async def _handle_ses_messages_request(method: str, path: str, headers: dict, qu
         sent_emails_dict = {}
         try:
             all_data = mod._sent_emails.to_dict()
-            for (acct, key), val in all_data.items():
+            for scoped_key, val in all_data.items():
+                if len(scoped_key) == 2:
+                    acct, key = scoped_key
+                elif len(scoped_key) == 3:
+                    acct, _region, key = scoped_key
+                else:
+                    continue
                 if key == "entries" and isinstance(val, list):
-                    sent_emails_dict[acct] = val
+                    sent_emails_dict.setdefault(acct, []).extend(val)
         except Exception:
             # Fallback: empty dict on any unexpected shape
             sent_emails_dict = {}
