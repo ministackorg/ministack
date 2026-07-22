@@ -3,12 +3,14 @@ CloudFormation provisioners — resource create/delete handlers for each AWS res
 """
 
 import base64
+import copy
 import hashlib
 import io
 import json
 import logging
 import os
 import random
+import re
 import string
 import time
 import zipfile
@@ -37,6 +39,7 @@ import ministack.services.iot as _iot
 import ministack.services.kinesis as _kinesis
 import ministack.services.kms as _kms
 import ministack.services.lambda_svc as _lambda_svc
+import ministack.services.opensearch as _opensearch
 import ministack.services.pipes as _pipes
 import ministack.services.rds as _rds
 import ministack.services.route53 as _r53
@@ -124,6 +127,10 @@ def _update_resource(resource_type: str, physical_id: str, old_props: dict,
     """
     handler = _RESOURCE_HANDLERS.get(resource_type)
     if handler and "update" in handler:
+        if handler.get("update_with_logical_id"):
+            return handler["update"](
+                physical_id, old_props, new_props, stack_name, logical_id
+            )
         return handler["update"](physical_id, old_props, new_props, stack_name)
     # Custom resource types
     if resource_type.startswith("Custom::") or resource_type == "AWS::CloudFormation::CustomResource":
@@ -140,6 +147,116 @@ def _update_resource(resource_type: str, physical_id: str, old_props: dict,
 # ===========================================================================
 # Resource Provisioners
 # ===========================================================================
+
+# --- OpenSearch Domain ---
+
+_OPENSEARCH_MODELED_PROPERTIES = {
+    "EngineVersion",
+    "ClusterConfig",
+    "EBSOptions",
+    "AccessPolicies",
+    "SnapshotOptions",
+    "CognitoOptions",
+    "EncryptionAtRestOptions",
+    "NodeToNodeEncryptionOptions",
+    "AdvancedOptions",
+    "DomainEndpointOptions",
+    "AdvancedSecurityOptions",
+    "VPCOptions",
+    "AutoTuneOptions",
+    "OffPeakWindowOptions",
+    "SoftwareUpdateOptions",
+}
+
+
+def _opensearch_physical_name(stack_name, logical_id):
+    """Generate a valid 28-character OpenSearch name without losing its suffix."""
+    source = f"{stack_name}-{logical_id}".lower()
+    prefix = re.sub(r"[^a-z0-9-]", "-", source).strip("-")
+    if not prefix or not prefix[0].isalpha():
+        prefix = f"d-{prefix}"
+    suffix = new_uuid().replace("-", "")[:8]
+    prefix = prefix[:19].rstrip("-") or "domain"
+    return f"{prefix}-{suffix}"
+
+
+def _opensearch_create_payload(props, domain_name):
+    desired = copy.deepcopy(props or {})
+    tags = desired.pop("Tags", [])
+    desired["DomainName"] = domain_name
+    desired["TagList"] = copy.deepcopy(tags)
+    if isinstance(desired.get("AccessPolicies"), (dict, list)):
+        desired["AccessPolicies"] = json.dumps(
+            desired["AccessPolicies"], sort_keys=True, separators=(",", ":")
+        )
+    compatibility = {
+        key: copy.deepcopy(value)
+        for key, value in (props or {}).items()
+        if key not in _OPENSEARCH_MODELED_PROPERTIES
+        and key not in {"DomainName", "Tags"}
+    }
+    return desired, compatibility
+
+
+def _opensearch_attributes(rec):
+    endpoint = rec.get("Endpoint") or (rec.get("Endpoints") or {}).get("vpc")
+    if not endpoint:
+        raise ValueError(f"OpenSearch domain {rec.get('DomainName', '')} has no endpoint")
+    arn = rec["ARN"]
+    return {
+        "Arn": arn,
+        "DomainArn": arn,
+        "DomainEndpoint": endpoint,
+        "Id": rec["DomainId"],
+    }
+
+
+def _opensearch_domain_create(logical_id, props, stack_name):
+    name = props.get("DomainName") or _opensearch_physical_name(stack_name, logical_id)
+    payload, compatibility = _opensearch_create_payload(props, name)
+    rec = None
+    try:
+        rec = _opensearch.create_domain_record(payload, compatibility)
+        return name, _opensearch_attributes(rec)
+    except Exception:
+        # Only delete if this call actually allocated the record. In
+        # particular, a duplicate-name error must not delete the pre-existing
+        # domain that caused it.
+        if rec is not None:
+            _opensearch.delete_domain_record(name, missing_ok=True)
+        raise
+
+
+def _opensearch_domain_update(physical_id, old_props, new_props, stack_name,
+                              logical_id=None):
+    old_was_explicit = "DomainName" in old_props
+    new_is_explicit = "DomainName" in new_props
+    replacement_required = (
+        (new_is_explicit and new_props.get("DomainName") != physical_id)
+        or (old_was_explicit and not new_is_explicit)
+    )
+
+    if replacement_required:
+        replacement_logical_id = logical_id or physical_id
+        new_id, attrs = _opensearch_domain_create(
+            replacement_logical_id, new_props, stack_name
+        )
+        try:
+            _opensearch.delete_domain_record(physical_id, missing_ok=True)
+        except Exception:
+            _opensearch.delete_domain_record(new_id, missing_ok=True)
+            raise
+        return new_id, attrs
+
+    payload, compatibility = _opensearch_create_payload(new_props, physical_id)
+    rec = _opensearch.update_domain_from_cloudformation(
+        physical_id, payload, compatibility
+    )
+    return physical_id, _opensearch_attributes(rec)
+
+
+def _opensearch_domain_delete(physical_id, props):
+    _opensearch.delete_domain_record(physical_id, missing_ok=True)
 
 # --- S3 Bucket ---
 
@@ -2364,6 +2481,7 @@ def _cognito_user_pool_create(logical_id, props, stack_name):
         "_clients": {},
         "_users": {},
         "_groups": {},
+        "_resource_servers": {},
     }
     _cognito._user_pools[pid] = pool
     arn = _cognito._pool_arn(pid)
@@ -2410,6 +2528,71 @@ def _cognito_user_pool_client_delete(physical_id, props):
     pool = _cognito._user_pools.get(pid)
     if pool:
         pool["_clients"].pop(physical_id, None)
+
+
+# --- Cognito UserPoolResourceServer ---
+
+def _cognito_user_pool_resource_server_create(logical_id, props, stack_name):
+    pid = props.get("UserPoolId", "")
+    pool = _cognito._user_pools.get(pid)
+    if not pool:
+        raise ValueError(f"UserPool {pid} not found for UserPoolResourceServer")
+
+    identifier = props.get("Identifier", "")
+    server = _cognito._resource_server_dict(
+        pid, identifier, props.get("Name", identifier), props.get("Scopes", []),
+    )
+    # Ref on this resource type returns the Identifier (matches real AWS —
+    # see https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cognito-userpoolresourceserver.html#aws-resource-cognito-userpoolresourceserver-return-values).
+    _cognito._pool_resource_servers(pool)[identifier] = server
+    return identifier, {}
+
+
+def _cognito_user_pool_resource_server_delete(physical_id, props):
+    pid = props.get("UserPoolId", "")
+    pool = _cognito._user_pools.get(pid)
+    if pool:
+        _cognito._pool_resource_servers(pool).pop(physical_id, None)
+
+
+# --- Cognito UserPoolGroup ---
+
+def _cognito_user_pool_group_create(logical_id, props, stack_name):
+    pid = props.get("UserPoolId", "")
+    pool = _cognito._user_pools.get(pid)
+    if not pool:
+        raise ValueError(f"UserPool {pid} not found for UserPoolGroup")
+
+    name = props.get("GroupName") or _physical_name(stack_name, logical_id, max_len=128)
+    now = _cognito._now_epoch()
+    group = {
+        "GroupName": name,
+        "UserPoolId": pid,
+        "Description": props.get("Description", ""),
+        "RoleArn": props.get("RoleArn", ""),
+        "Precedence": props.get("Precedence", 0),
+        "CreationDate": now,
+        "LastModifiedDate": now,
+        "_members": [],
+    }
+    pool["_groups"][name] = group
+    # Ref on this resource type returns the GroupName (matches real AWS —
+    # see https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cognito-userpoolgroup.html#aws-resource-cognito-userpoolgroup-return-values).
+    return name, {}
+
+
+def _cognito_user_pool_group_delete(physical_id, props):
+    pid = props.get("UserPoolId", "")
+    pool = _cognito._user_pools.get(pid)
+    if not pool:
+        return
+    group = pool["_groups"].pop(physical_id, None)
+    if not group:
+        return
+    for username in group.get("_members", []):
+        user = pool["_users"].get(username)
+        if user and physical_id in user.get("_groups", []):
+            user["_groups"].remove(physical_id)
 
 
 # --- Cognito IdentityPool ---
@@ -4422,6 +4605,12 @@ def _s3tables_table_delete(physical_id, props):
 
 
 _RESOURCE_HANDLERS = {
+    "AWS::OpenSearchService::Domain": {
+        "create": _opensearch_domain_create,
+        "update": _opensearch_domain_update,
+        "update_with_logical_id": True,
+        "delete": _opensearch_domain_delete,
+    },
     "AWS::S3::Bucket": {"create": _s3_create, "update": _s3_update, "delete": _s3_delete},
     "AWS::S3::BucketPolicy": {"create": _s3_bucket_policy_create, "delete": _s3_bucket_policy_delete},
     "AWS::S3Tables::TableBucket": {"create": _s3tables_bucket_create, "delete": _s3tables_bucket_delete},
@@ -4510,6 +4699,8 @@ _RESOURCE_HANDLERS = {
     "AWS::SecretsManager::Secret": {"create": _sm_secret_create, "delete": _sm_secret_delete},
     "AWS::Cognito::UserPool": {"create": _cognito_user_pool_create, "delete": _cognito_user_pool_delete},
     "AWS::Cognito::UserPoolClient": {"create": _cognito_user_pool_client_create, "delete": _cognito_user_pool_client_delete},
+    "AWS::Cognito::UserPoolResourceServer": {"create": _cognito_user_pool_resource_server_create, "delete": _cognito_user_pool_resource_server_delete},
+    "AWS::Cognito::UserPoolGroup": {"create": _cognito_user_pool_group_create, "delete": _cognito_user_pool_group_delete},
     "AWS::Cognito::IdentityPool": {"create": _cognito_identity_pool_create, "delete": _cognito_identity_pool_delete},
     "AWS::Cognito::UserPoolDomain": {"create": _cognito_user_pool_domain_create, "delete": _cognito_user_pool_domain_delete},
     "AWS::ECR::Repository": {"create": _ecr_repo_create, "delete": _ecr_repo_delete},

@@ -74,6 +74,24 @@ _SUPPORTED_VERSIONS = [
 
 _DEFAULT_VERSION = "OpenSearch_3.5"
 
+_MODELED_DOMAIN_PROPERTIES = (
+    "EngineVersion",
+    "ClusterConfig",
+    "EBSOptions",
+    "AccessPolicies",
+    "SnapshotOptions",
+    "CognitoOptions",
+    "EncryptionAtRestOptions",
+    "NodeToNodeEncryptionOptions",
+    "AdvancedOptions",
+    "DomainEndpointOptions",
+    "AdvancedSecurityOptions",
+    "VPCOptions",
+    "AutoTuneOptions",
+    "OffPeakWindowOptions",
+    "SoftwareUpdateOptions",
+)
+
 # AWS allows lowercase letters, digits, hyphens; first character must be
 # lowercase letter; 3-28 chars.
 _NAME_RE = re.compile(r"^[a-z][a-z0-9\-]{2,27}$")
@@ -91,6 +109,16 @@ _port_counter = [BASE_PORT]
 _dashboards_port_counter = [DASHBOARDS_BASE_PORT]
 _state_lock = threading.Lock()
 _docker_client = None
+
+
+class OpenSearchServiceError(ValueError):
+    """Actionable service error shared by HTTP and internal callers."""
+
+    def __init__(self, status, code, message):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
 
 
 def reset():
@@ -181,7 +209,13 @@ def _engine_type(version: str) -> str:
 
 def _public(d: dict) -> dict:
     """Strip internal _-prefixed bookkeeping fields before serialising."""
-    out = {k: v for k, v in d.items() if not k.startswith("_")}
+    out = copy.deepcopy({k: v for k, v in d.items() if not k.startswith("_")})
+    # MasterUserOptions is an input-only shape and may contain a plaintext
+    # password. AWS does not return it from DescribeDomain, and neither should
+    # MiniStack's raw JSON response.
+    advanced_security = out.get("AdvancedSecurityOptions")
+    if isinstance(advanced_security, dict):
+        advanced_security.pop("MasterUserOptions", None)
     if not out.get("VPCOptions"):
         out.pop("VPCOptions", None)
     return out
@@ -333,6 +367,20 @@ def _teardown_dataplane(rec: dict) -> None:
             pass
 
 
+def _teardown_named_dataplane(domain_name: str) -> None:
+    """Best-effort cleanup for a create that failed before returning a record."""
+    docker = _get_docker()
+    if docker is None:
+        return
+    for name in (_container_name(domain_name), _dashboards_container_name(domain_name)):
+        try:
+            c = docker.containers.get(name)
+            c.stop(timeout=2)
+            c.remove(force=True)
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # DomainStatus / DomainConfig builders
 # ---------------------------------------------------------------------------
@@ -421,7 +469,9 @@ def _new_domain_record(name, payload):
         "ClusterConfig": cluster_cfg,
         "EBSOptions": ebs_opts,
         "AccessPolicies": access_policies,
-        "SnapshotOptions": {"AutomatedSnapshotStartHour": 0},
+        "SnapshotOptions": payload.get(
+            "SnapshotOptions", {"AutomatedSnapshotStartHour": 0}
+        ),
         "CognitoOptions": payload.get("CognitoOptions", {"Enabled": False}),
         "EncryptionAtRestOptions": payload.get(
             "EncryptionAtRestOptions", {"Enabled": False}
@@ -448,10 +498,14 @@ def _new_domain_record(name, payload):
             "AdvancedSecurityOptions",
             {"Enabled": False, "InternalUserDatabaseEnabled": False},
         ),
-        "AutoTuneOptions": {"State": "DISABLED"},
+        "AutoTuneOptions": payload.get("AutoTuneOptions", {"State": "DISABLED"}),
         "ChangeProgressDetails": {},
-        "OffPeakWindowOptions": {"Enabled": False},
-        "SoftwareUpdateOptions": {"AutoSoftwareUpdateEnabled": False},
+        "OffPeakWindowOptions": payload.get(
+            "OffPeakWindowOptions", {"Enabled": False}
+        ),
+        "SoftwareUpdateOptions": payload.get(
+            "SoftwareUpdateOptions", {"AutoSoftwareUpdateEnabled": False}
+        ),
         "_Endpoint": endpoint,
         "_CreatedTime": _now(),
         "_UpdatedTime": _now(),
@@ -494,7 +548,11 @@ def _domain_config(rec: dict) -> dict:
         "NodeToNodeEncryptionOptions": wrap(rec["NodeToNodeEncryptionOptions"]),
         "AdvancedOptions": wrap(rec["AdvancedOptions"]),
         "DomainEndpointOptions": wrap(rec["DomainEndpointOptions"]),
-        "AdvancedSecurityOptions": wrap(rec["AdvancedSecurityOptions"]),
+        "AdvancedSecurityOptions": wrap({
+            k: copy.deepcopy(v)
+            for k, v in rec["AdvancedSecurityOptions"].items()
+            if k != "MasterUserOptions"
+        }),
         "AutoTuneOptions": wrap(rec["AutoTuneOptions"]),
         "ChangeProgressDetails": rec.get("ChangeProgressDetails", {}),
         "OffPeakWindowOptions": wrap(rec["OffPeakWindowOptions"]),
@@ -503,6 +561,169 @@ def _domain_config(rec: dict) -> dict:
     if rec.get("VPCOptions"):
         config["VPCOptions"] = wrap(rec["VPCOptions"])
     return config
+
+
+def _normalise_tags(tag_list):
+    """Return an exact, detached tag set with the last value winning by key."""
+    by_key = {}
+    for tag in tag_list or []:
+        detached = copy.deepcopy(tag)
+        by_key[detached.get("Key", "")] = detached
+    return list(by_key.values())
+
+
+def _desired_modeled_configuration(payload):
+    """Expand a full create-shaped payload into the desired domain state."""
+    return {
+        "EngineVersion": copy.deepcopy(payload.get("EngineVersion", _DEFAULT_VERSION)),
+        "ClusterConfig": _default_cluster_config(copy.deepcopy(payload.get("ClusterConfig"))),
+        "EBSOptions": _default_ebs_options(copy.deepcopy(payload.get("EBSOptions"))),
+        "AccessPolicies": copy.deepcopy(payload.get("AccessPolicies", "")),
+        "SnapshotOptions": copy.deepcopy(payload.get(
+            "SnapshotOptions", {"AutomatedSnapshotStartHour": 0}
+        )),
+        "CognitoOptions": copy.deepcopy(payload.get("CognitoOptions", {"Enabled": False})),
+        "EncryptionAtRestOptions": copy.deepcopy(payload.get(
+            "EncryptionAtRestOptions", {"Enabled": False}
+        )),
+        "NodeToNodeEncryptionOptions": copy.deepcopy(payload.get(
+            "NodeToNodeEncryptionOptions", {"Enabled": False}
+        )),
+        "AdvancedOptions": copy.deepcopy(payload.get("AdvancedOptions", {})),
+        "DomainEndpointOptions": copy.deepcopy(payload.get(
+            "DomainEndpointOptions",
+            {"EnforceHTTPS": True, "TLSSecurityPolicy": "Policy-Min-TLS-1-2-2019-07"},
+        )),
+        "AdvancedSecurityOptions": copy.deepcopy(payload.get(
+            "AdvancedSecurityOptions",
+            {"Enabled": False, "InternalUserDatabaseEnabled": False},
+        )),
+        "VPCOptions": _normalise_vpc_options(copy.deepcopy(payload.get("VPCOptions"))),
+        "AutoTuneOptions": copy.deepcopy(payload.get("AutoTuneOptions", {"State": "DISABLED"})),
+        "OffPeakWindowOptions": copy.deepcopy(payload.get(
+            "OffPeakWindowOptions", {"Enabled": False}
+        )),
+        "SoftwareUpdateOptions": copy.deepcopy(payload.get(
+            "SoftwareUpdateOptions", {"AutoSoftwareUpdateEnabled": False}
+        )),
+    }
+
+
+def create_domain_record(payload, compatibility_properties=None):
+    """Create a domain through the shared management-plane lifecycle.
+
+    Internal callers receive the live private record. HTTP handlers pass it
+    through ``_public`` before serialising it.
+    """
+    detached_payload = copy.deepcopy(payload or {})
+    name = detached_payload.get("DomainName")
+    if not name:
+        raise OpenSearchServiceError(400, "ValidationException", "DomainName is required")
+    if not _NAME_RE.match(name):
+        raise OpenSearchServiceError(
+            400,
+            "ValidationException",
+            "DomainName must start with a lowercase letter, contain only "
+            "lowercase letters, digits, and hyphens, and be 3-28 characters",
+        )
+    if name in _domains:
+        raise OpenSearchServiceError(
+            409, "ResourceAlreadyExistsException", f"Domain already exists: {name}"
+        )
+
+    rec = None
+    try:
+        rec = _new_domain_record(name, detached_payload)
+        if compatibility_properties is not None:
+            rec["_CloudFormationCompatibility"] = copy.deepcopy(
+                compatibility_properties
+            )
+        _domains[name] = rec
+        tags = _normalise_tags(detached_payload.get("TagList"))
+        if tags:
+            _tags[rec["ARN"]] = tags
+        else:
+            _tags.pop(rec["ARN"], None)
+        return rec
+    except Exception:
+        if rec is not None:
+            _teardown_dataplane(rec)
+        _teardown_named_dataplane(name)
+        _domains.pop(name, None)
+        _tags.pop(_arn(name), None)
+        _change_progress.pop(name, None)
+        raise
+
+
+def update_domain_from_cloudformation(name, payload, compatibility_properties):
+    """Apply a complete CloudFormation desired state to an existing domain."""
+    rec = _domains.get(name)
+    if not rec:
+        raise OpenSearchServiceError(
+            404, "ResourceNotFoundException", f"Domain not found: {name}"
+        )
+
+    detached_payload = copy.deepcopy(payload or {})
+    desired = _desired_modeled_configuration(detached_payload)
+    detached_compatibility = copy.deepcopy(compatibility_properties or {})
+    desired_tags = _normalise_tags(detached_payload.get("TagList"))
+    current_tags = _normalise_tags(_tags.get(rec["ARN"]) or [])
+
+    changed_properties = []
+    for key in _MODELED_DOMAIN_PROPERTIES:
+        wanted = desired[key]
+        current = rec.get(key)
+        if key == "VPCOptions":
+            current = rec.get("VPCOptions")
+        if current != wanted:
+            changed_properties.append(key)
+            if key == "VPCOptions":
+                _set_vpc_options(rec, wanted)
+            else:
+                rec[key] = copy.deepcopy(wanted)
+                if key == "EngineVersion":
+                    rec["ServiceSoftwareOptions"]["CurrentVersion"] = wanted
+
+    if rec.get("_CloudFormationCompatibility", {}) != detached_compatibility:
+        rec["_CloudFormationCompatibility"] = detached_compatibility
+        changed_properties.append("CompatibilityProperties")
+
+    if current_tags != desired_tags:
+        if desired_tags:
+            _tags[rec["ARN"]] = desired_tags
+        else:
+            _tags.pop(rec["ARN"], None)
+
+    if changed_properties:
+        rec["_UpdatedTime"] = _now()
+        _change_progress[name] = {
+            "ChangeId": new_uuid(),
+            "StartTime": _now(),
+            "Status": "COMPLETED",
+            "PendingProperties": [],
+            "CompletedProperties": changed_properties,
+            "TotalNumberOfStages": 0,
+            "ConfigChangeStatus": "Completed",
+        }
+    return rec
+
+
+def delete_domain_record(name, missing_ok=False):
+    """Delete all domain-owned state and containers, optionally idempotently."""
+    rec = _domains.pop(name, None)
+    if not rec and not missing_ok:
+        raise OpenSearchServiceError(
+            404, "ResourceNotFoundException", f"Domain not found: {name}"
+        )
+    if rec:
+        _teardown_dataplane(rec)
+        arn = rec.get("ARN", _arn(name))
+    else:
+        arn = _arn(name)
+    _teardown_named_dataplane(name)
+    _tags.pop(arn, None)
+    _change_progress.pop(name, None)
+    return rec
 
 
 # ---------------------------------------------------------------------------
@@ -533,21 +754,10 @@ def _qp(query_params, key) -> str:
 # ---------------------------------------------------------------------------
 
 def _create_domain(payload):
-    name = payload.get("DomainName")
-    if not name:
-        return _error(400, "ValidationException", "DomainName is required")
-    if not _NAME_RE.match(name):
-        return _error(400, "ValidationException",
-                      "DomainName must start with a lowercase letter, contain only "
-                      "lowercase letters, digits, and hyphens, and be 3-28 characters")
-    if name in _domains:
-        return _error(409, "ResourceAlreadyExistsException",
-                      f"Domain already exists: {name}")
-    rec = _new_domain_record(name, payload)
-    _domains[name] = rec
-    tag_list = payload.get("TagList") or []
-    if tag_list:
-        _tags[_arn(name)] = list(tag_list)
+    try:
+        rec = create_domain_record(payload)
+    except OpenSearchServiceError as exc:
+        return _error(exc.status, exc.code, exc.message)
     return _json(200, {"DomainStatus": _public(rec)})
 
 
@@ -559,12 +769,10 @@ def _describe_domain(name):
 
 
 def _delete_domain(name):
-    rec = _domains.pop(name, None)
-    if not rec:
-        return _error(404, "ResourceNotFoundException", f"Domain not found: {name}")
-    _teardown_dataplane(rec)
-    _tags.pop(_arn(name), None)
-    _change_progress.pop(name, None)
+    try:
+        rec = delete_domain_record(name)
+    except OpenSearchServiceError as exc:
+        return _error(exc.status, exc.code, exc.message)
     out = dict(rec)
     out["Deleted"] = True
     return _json(200, {"DomainStatus": _public(out)})
@@ -607,7 +815,7 @@ def _update_domain_config(name, payload):
             if k == "VPCOptions":
                 _set_vpc_options(rec, v)
             else:
-                rec[k] = v
+                rec[k] = copy.deepcopy(v)
     rec["_UpdatedTime"] = _now()
 
     # Real AWS marks the domain Processing while config rollout happens; we
@@ -684,7 +892,7 @@ def _add_tags(payload):
     by_key = {t["Key"]: t for t in existing}
     for t in tag_list:
         by_key[t["Key"]] = t
-    _tags[arn] = list(by_key.values())
+    _tags[arn] = copy.deepcopy(list(by_key.values()))
     return _json(200, {})
 
 
@@ -695,7 +903,7 @@ def _list_tags(query_params):
     arn, err = _resolve_taggable_opensearch_arn(arn)
     if err:
         return err
-    return _json(200, {"TagList": list(_tags.get(arn) or [])})
+    return _json(200, {"TagList": copy.deepcopy(list(_tags.get(arn) or []))})
 
 
 def _remove_tags(payload):
