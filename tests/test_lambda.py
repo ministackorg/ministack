@@ -3326,6 +3326,64 @@ def test_lambda_event_invoke_config_crud(lam):
 
     lam.delete_function(FunctionName="eic-fn")
 
+
+def test_lambda_event_invoke_configs_are_isolated_by_qualifier(lam):
+    """Versions and $LATEST retain independent async invocation configs."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"eic-qualified-{suffix}"
+    code = "def handler(e,c): return {}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.11",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+    version = lam.publish_version(FunctionName=fn)["Version"]
+
+    try:
+        lam.put_function_event_invoke_config(
+            FunctionName=fn,
+            Qualifier="$LATEST",
+            MaximumRetryAttempts=0,
+        )
+        lam.put_function_event_invoke_config(
+            FunctionName=fn,
+            Qualifier=version,
+            MaximumRetryAttempts=1,
+        )
+
+        latest = lam.get_function_event_invoke_config(
+            FunctionName=fn, Qualifier="$LATEST"
+        )
+        published = lam.get_function_event_invoke_config(
+            FunctionName=fn, Qualifier=version
+        )
+        assert latest["MaximumRetryAttempts"] == 0
+        assert latest["FunctionArn"].endswith(":$LATEST")
+        assert published["MaximumRetryAttempts"] == 1
+        assert published["FunctionArn"].endswith(f":{version}")
+
+        configs = lam.list_function_event_invoke_configs(FunctionName=fn)[
+            "FunctionEventInvokeConfigs"
+        ]
+        assert {config["FunctionArn"] for config in configs} == {
+            latest["FunctionArn"], published["FunctionArn"]
+        }
+
+        lam.delete_function_event_invoke_config(
+            FunctionName=fn, Qualifier="$LATEST"
+        )
+        assert lam.get_function_event_invoke_config(
+            FunctionName=fn, Qualifier=version
+        )["MaximumRetryAttempts"] == 1
+    finally:
+        lam.delete_function(FunctionName=fn)
+
+
 def test_lambda_provisioned_concurrency_crud(lam):
     """Put/Get/Delete ProvisionedConcurrencyConfig lifecycle."""
     code = "def handler(e,c): return {}"
@@ -6712,7 +6770,7 @@ exports.handler = async () => {
 
 
 def test_nodejs_worker_aws_sdk_v3_stub_resolves():
-    """@aws-sdk/client-lambda, @aws-sdk/client-sfn, @aws-sdk/client-ssm resolve.
+    """Lambda, OpenSearch, SFN, and SSM SDK v3 packages resolve.
 
     Real AWS Lambda (Node.js 18+) ships these built-in. Ministack injects
     stubs: Lambda uses a dedicated REST stub; sfn/ssm use the generic JSON-RPC
@@ -6720,6 +6778,7 @@ def test_nodejs_worker_aws_sdk_v3_stub_resolves():
     """
     handler_js = """\
 const { Lambda, LambdaClient, InvokeCommand, waitUntilFunctionActiveV2 } = require("@aws-sdk/client-lambda");
+const { OpenSearch, OpenSearchClient, UpdateDomainConfigCommand } = require("@aws-sdk/client-opensearch");
 const { SFN, SFNClient } = require("@aws-sdk/client-sfn");
 const { SSM, SSMClient, PutParameterCommand, GetParameterCommand } = require("@aws-sdk/client-ssm");
 exports.handler = async (_event, _ctx) => ({
@@ -6727,6 +6786,9 @@ exports.handler = async (_event, _ctx) => ({
   hasLambdaClient: typeof LambdaClient === "function",
   hasInvokeCommand: typeof InvokeCommand === "function",
   hasWaiter: typeof waitUntilFunctionActiveV2 === "function",
+  hasOpenSearch: typeof OpenSearch === "function",
+  hasOpenSearchClient: typeof OpenSearchClient === "function",
+  hasUpdateDomainConfigCommand: typeof UpdateDomainConfigCommand === "function",
   hasSFN: typeof SFN === "function",
   hasSFNClient: typeof SFNClient === "function",
   hasSSM: typeof SSM === "function",
@@ -6742,12 +6804,79 @@ exports.handler = async (_event, _ctx) => ({
     assert r["hasLambdaClient"] is True
     assert r["hasInvokeCommand"] is True
     assert r["hasWaiter"] is True
+    assert r["hasOpenSearch"] is True
+    assert r["hasOpenSearchClient"] is True
+    assert r["hasUpdateDomainConfigCommand"] is True
     assert r["hasSFN"] is True
     assert r["hasSFNClient"] is True
     assert r["hasSSM"] is True
     assert r["hasSSMClient"] is True
     assert r["hasPutParameterCommand"] is True
     assert r["hasGetParameterCommand"] is True
+
+
+def test_nodejs_worker_opensearch_sdk_v3_stub_uses_rest_json():
+    """The OpenSearch shim serializes UpdateDomainConfig like the real SDK."""
+    handler_js = """\
+const http = require("http");
+
+exports.handler = async () => {
+  let received;
+  const srv = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => body += chunk);
+    req.on("end", () => {
+      received = {
+        method: req.method,
+        path: req.url,
+        host: req.headers.host,
+        body: JSON.parse(body),
+      };
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        DomainConfig: {
+          AccessPolicies: {
+            Options: body && JSON.parse(body).AccessPolicies,
+            Status: { State: "Active", UpdateVersion: 2 },
+          },
+        },
+      }));
+    });
+  });
+  await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+  process.env.AWS_ENDPOINT_URL = "http://localhost:" + srv.address().port;
+
+  const {
+    OpenSearchClient,
+    UpdateDomainConfigCommand,
+  } = require("@aws-sdk/client-opensearch");
+  const client = new OpenSearchClient({ apiVersion: "2021-01-01", region: "eu-west-2" });
+  const result = await client.send(new UpdateDomainConfigCommand({
+    DomainName: "domain with spaces",
+    AccessPolicies: "policy-json",
+  }));
+  const config = {
+    apiVersion: client.config.apiVersion,
+    region: await client.config.region(),
+  };
+  await new Promise((resolve) => srv.close(resolve));
+  return { received, result, config };
+};
+"""
+    result = _run_nodejs_worker(handler_js)
+    assert result.get("status") == "ok", result
+    received = result["result"]["received"]
+    assert received["method"] == "POST"
+    assert received["path"] == "/2021-01-01/opensearch/domain/domain%20with%20spaces/config"
+    assert received["host"].startswith("localhost:")
+    assert received["body"] == {"AccessPolicies": "policy-json"}
+    access_policies = result["result"]["result"]["DomainConfig"]["AccessPolicies"]
+    assert access_policies["Options"] == "policy-json"
+    assert access_policies["Status"]["State"] == "Active"
+    assert result["result"]["config"] == {
+        "apiVersion": "2021-01-01",
+        "region": "eu-west-2",
+    }
 
 
 def test_nodejs_worker_json_rpc_error_has_name():

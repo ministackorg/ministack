@@ -224,6 +224,7 @@ _user_pools = AccountScopedDict()
 #   _users:   {username -> user_dict},
 #   _groups:  {group_name -> group_dict},
 #   _identity_providers: {provider_name -> provider_dict},
+#   _resource_servers: {identifier -> resource_server_dict},
 # }
 
 _pool_domain_map = AccountScopedDict()   # domain -> pool_id
@@ -1468,6 +1469,12 @@ async def _dispatch_idp(action: str, data: dict):
         "DescribeUserPoolClient": _describe_user_pool_client,
         "ListUserPoolClients": _list_user_pool_clients,
         "UpdateUserPoolClient": _update_user_pool_client,
+        # Resource Servers
+        "CreateResourceServer": _create_resource_server,
+        "UpdateResourceServer": _update_resource_server,
+        "DescribeResourceServer": _describe_resource_server,
+        "DeleteResourceServer": _delete_resource_server,
+        "ListResourceServers": _list_resource_servers,
         # User management
         "AdminCreateUser": _admin_create_user,
         "AdminDeleteUser": _admin_delete_user,
@@ -1623,6 +1630,7 @@ def _create_user_pool(data):
         "_users": {},
         "_groups": {},
         "_identity_providers": {},
+        "_resource_servers": {},
     }
     if data.get("DeviceConfiguration"):
         pool["DeviceConfiguration"] = data["DeviceConfiguration"]
@@ -1810,6 +1818,129 @@ def _update_user_pool_client(data):
             client[k] = data[k]
     client["LastModifiedDate"] = _now_epoch()
     return json_response({"UserPoolClient": {k: v for k, v in client.items() if v is not None}})
+
+
+# ---------------------------------------------------------------------------
+# Resource Servers
+# ---------------------------------------------------------------------------
+# Scoped to what CDK/Terraform actually exercise: CRUD + list, keyed by the
+# caller-supplied Identifier (not a separately generated id — that matches
+# real AWS, where Identifier is also the resource server's primary key
+# within a pool and is reused directly in OAuth scope strings as
+# "{Identifier}/{ScopeName}").
+
+def _resource_server_dict(pool_id, identifier, name, scopes):
+    return {
+        "UserPoolId": pool_id,
+        "Identifier": identifier,
+        "Name": name,
+        "Scopes": scopes,
+    }
+
+
+def _pool_resource_servers(pool):
+    # setdefault, not direct indexing — pools created before this field
+    # existed (or via a CFN provisioner that builds its own pool dict, e.g.
+    # _cognito_user_pool_create) may not have "_resource_servers" yet.
+    return pool.setdefault("_resource_servers", {})
+
+
+def _create_resource_server(data):
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+    resource_servers = _pool_resource_servers(pool)
+
+    identifier = data.get("Identifier")
+    if not identifier:
+        return error_response_json(
+            "InvalidParameterException", "Identifier is required.", 400,
+        )
+    if identifier in resource_servers:
+        return error_response_json(
+            "InvalidParameterException",
+            f"Resource server {identifier} already exists.", 400,
+        )
+
+    server = _resource_server_dict(
+        pid, identifier, data.get("Name", identifier), data.get("Scopes", []),
+    )
+    resource_servers[identifier] = server
+    return json_response({"ResourceServer": server})
+
+
+def _update_resource_server(data):
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+
+    identifier = data.get("Identifier")
+    server = _pool_resource_servers(pool).get(identifier)
+    if not server:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Resource server {identifier} does not exist.", 400,
+        )
+
+    if "Name" in data:
+        server["Name"] = data["Name"]
+    if "Scopes" in data:
+        server["Scopes"] = data["Scopes"]
+    return json_response({"ResourceServer": server})
+
+
+def _describe_resource_server(data):
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+
+    identifier = data.get("Identifier")
+    server = _pool_resource_servers(pool).get(identifier)
+    if not server:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Resource server {identifier} does not exist.", 400,
+        )
+    return json_response({"ResourceServer": server})
+
+
+def _delete_resource_server(data):
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+
+    identifier = data.get("Identifier")
+    resource_servers = _pool_resource_servers(pool)
+    if identifier not in resource_servers:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Resource server {identifier} does not exist.", 400,
+        )
+    del resource_servers[identifier]
+    return json_response({})
+
+
+def _list_resource_servers(data):
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+
+    max_results = min(data.get("MaxResults", 50), 50)
+    next_token = data.get("NextToken")
+    servers = sorted(
+        _pool_resource_servers(pool).values(), key=lambda s: s["Identifier"],
+    )
+    start = int(next_token) if next_token else 0
+    page = servers[start:start + max_results]
+    resp = {"ResourceServers": page}
+    if start + max_results < len(servers):
+        resp["NextToken"] = str(start + max_results)
+    return json_response(resp)
 
 
 def _password_policy_errors(pool, password):

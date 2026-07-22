@@ -87,6 +87,74 @@ def test_cognito_list_user_pool_clients(cognito_idp):
     assert "App1" in names
     assert "App2" in names
 
+def test_cognito_create_and_describe_resource_server(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="ResourceServerPool")["UserPool"]["Id"]
+    resp = cognito_idp.create_resource_server(
+        UserPoolId=pid,
+        Identifier="API",
+        Name="API",
+        Scopes=[{"ScopeName": "resource.get", "ScopeDescription": "Read access"}],
+    )
+    server = resp["ResourceServer"]
+    assert server["Identifier"] == "API"
+    assert server["Scopes"] == [{"ScopeName": "resource.get", "ScopeDescription": "Read access"}]
+
+    desc = cognito_idp.describe_resource_server(UserPoolId=pid, Identifier="API")["ResourceServer"]
+    assert desc["Identifier"] == "API"
+    assert desc["Name"] == "API"
+
+def test_cognito_create_resource_server_duplicate_identifier_error(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="ResourceServerDupPool")["UserPool"]["Id"]
+    cognito_idp.create_resource_server(UserPoolId=pid, Identifier="API", Name="API")
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.create_resource_server(UserPoolId=pid, Identifier="API", Name="API")
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+def test_cognito_list_resource_servers(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="ResourceServerListPool")["UserPool"]["Id"]
+    cognito_idp.create_resource_server(UserPoolId=pid, Identifier="API1", Name="API1")
+    cognito_idp.create_resource_server(UserPoolId=pid, Identifier="API2", Name="API2")
+    identifiers = [
+        s["Identifier"]
+        for s in cognito_idp.list_resource_servers(UserPoolId=pid, MaxResults=50)["ResourceServers"]
+    ]
+    assert "API1" in identifiers
+    assert "API2" in identifiers
+
+def test_cognito_update_resource_server(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="ResourceServerUpdatePool")["UserPool"]["Id"]
+    cognito_idp.create_resource_server(UserPoolId=pid, Identifier="API", Name="Old Name")
+    updated = cognito_idp.update_resource_server(
+        UserPoolId=pid,
+        Identifier="API",
+        Name="New Name",
+        Scopes=[{"ScopeName": "resource.put", "ScopeDescription": "Write access"}],
+    )["ResourceServer"]
+    assert updated["Name"] == "New Name"
+    assert updated["Scopes"] == [{"ScopeName": "resource.put", "ScopeDescription": "Write access"}]
+
+def test_cognito_delete_resource_server(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="ResourceServerDeletePool")["UserPool"]["Id"]
+    cognito_idp.create_resource_server(UserPoolId=pid, Identifier="API", Name="API")
+    cognito_idp.delete_resource_server(UserPoolId=pid, Identifier="API")
+    identifiers = [
+        s["Identifier"]
+        for s in cognito_idp.list_resource_servers(UserPoolId=pid, MaxResults=50)["ResourceServers"]
+    ]
+    assert "API" not in identifiers
+
+def test_cognito_resource_server_not_found_errors(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="ResourceServerNotFoundPool")["UserPool"]["Id"]
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.describe_resource_server(UserPoolId=pid, Identifier="Missing")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.update_resource_server(UserPoolId=pid, Identifier="Missing", Name="x")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.delete_resource_server(UserPoolId=pid, Identifier="Missing")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
 def test_cognito_admin_create_and_get_user(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="AdminUserPool")["UserPool"]["Id"]
     cognito_idp.admin_create_user(

@@ -81,7 +81,7 @@ _lock = threading.Lock()
 # ---------------------------------------------------------------------------
 
 _PYTHON_WORKER_SCRIPT = '''
-import sys, json, importlib, traceback, os
+import sys, json, importlib, traceback, os, time
 
 def run():
     # Redirect print() to stderr so stdout stays clean for JSON-line protocol
@@ -133,11 +133,19 @@ def run():
             os.environ["_X_AMZN_TRACE_ID"] = _xray_tid
         elif "_X_AMZN_TRACE_ID" in os.environ:
             del os.environ["_X_AMZN_TRACE_ID"]
+        _function_name = init.get("function_name", "")
+        _deadline = time.time() + float(os.environ.get("_LAMBDA_TIMEOUT", "3"))
         context = type("Context", (), {
             "function_name": init.get("function_name", ""),
+            "function_version": os.environ.get("AWS_LAMBDA_FUNCTION_VERSION", "$LATEST"),
             "memory_limit_in_mb": init.get("memory", 128),
             "invoked_function_arn": init.get("arn", ""),
             "aws_request_id": event.pop("_request_id", ""),
+            "log_group_name": os.environ.get("AWS_LAMBDA_LOG_GROUP_NAME", "/aws/lambda/" + _function_name),
+            "log_stream_name": os.environ.get("AWS_LAMBDA_LOG_STREAM_NAME", ""),
+            "identity": None,
+            "client_context": None,
+            "get_remaining_time_in_millis": lambda self: max(0, int((_deadline - time.time()) * 1000)),
         })()
         try:
             result = handler_fn(event, context)
@@ -240,6 +248,190 @@ fs.write = function(fd, ...args) {
     }
     async function waitUntilFunctionActiveV2() { return { state: "SUCCESS" }; }
     return { Lambda, LambdaClient, InvokeCommand, waitUntilFunctionActiveV2 };
+  }
+
+  // ── OpenSearch stub (REST-JSON, not JSON-RPC) ─────────────────────────
+  function _openSearchRequest(opName, params) {
+    const ep = new URL(process.env.AWS_ENDPOINT_URL || "http://127.0.0.1:4566");
+    const input = Object.assign({}, params || {});
+    const domainName = input.DomainName;
+    const encodedName = encodeURIComponent(domainName || "");
+    let method = "GET";
+    let requestPath;
+    let body;
+
+    switch (opName) {
+      case "CreateDomain":
+        method = "POST";
+        requestPath = "/2021-01-01/opensearch/domain";
+        body = input;
+        break;
+      case "DescribeDomain":
+        requestPath = "/2021-01-01/opensearch/domain/" + encodedName;
+        break;
+      case "DescribeDomains":
+        method = "POST";
+        requestPath = "/2021-01-01/opensearch/domain-info";
+        body = input;
+        break;
+      case "DeleteDomain":
+        method = "DELETE";
+        requestPath = "/2021-01-01/opensearch/domain/" + encodedName;
+        break;
+      case "ListDomainNames":
+        requestPath = "/2021-01-01/opensearch/domain";
+        if (input.EngineType) {
+          requestPath += "?engineType=" + encodeURIComponent(input.EngineType);
+        }
+        break;
+      case "UpdateDomainConfig":
+        method = "POST";
+        requestPath = "/2021-01-01/opensearch/domain/" + encodedName + "/config";
+        delete input.DomainName;
+        body = input;
+        break;
+      case "DescribeDomainConfig":
+        requestPath = "/2021-01-01/opensearch/domain/" + encodedName + "/config";
+        break;
+      case "DescribeDomainChangeProgress":
+        requestPath = "/2021-01-01/opensearch/domain/" + encodedName + "/progress";
+        if (input.ChangeId) {
+          requestPath += "?changeId=" + encodeURIComponent(input.ChangeId);
+        }
+        break;
+      case "ListVersions": {
+        requestPath = "/2021-01-01/opensearch/versions";
+        const query = new URLSearchParams();
+        if (input.MaxResults !== undefined) query.set("maxResults", input.MaxResults);
+        if (input.NextToken) query.set("nextToken", input.NextToken);
+        const suffix = query.toString();
+        if (suffix) requestPath += "?" + suffix;
+        break;
+      }
+      case "GetCompatibleVersions":
+        requestPath = "/2021-01-01/opensearch/compatibleVersions";
+        if (input.DomainName) {
+          requestPath += "?domainName=" + encodeURIComponent(input.DomainName);
+        }
+        break;
+      case "AddTags":
+        method = "POST";
+        requestPath = "/2021-01-01/tags";
+        body = input;
+        break;
+      case "ListTags":
+        requestPath = "/2021-01-01/tags?arn=" + encodeURIComponent(input.ARN || "");
+        break;
+      case "RemoveTags":
+        method = "POST";
+        requestPath = "/2021-01-01/tags-removal";
+        body = input;
+        break;
+      default:
+        return Promise.reject(new Error("Unsupported OpenSearch operation: " + opName));
+    }
+
+    const encodedBody = body === undefined ? "" : JSON.stringify(body);
+    return new Promise((resolve, reject) => {
+      // REST-JSON requests do not carry X-Amz-Target. The lightweight shim
+      // does not cryptographically sign them, but supplies the credential
+      // scope MiniStack's router uses to select OpenSearch. Let Node set Host
+      // from the endpoint: a synthetic ``opensearch.localhost`` host is
+      // indistinguishable from a virtual-hosted S3 bucket at the edge.
+      const headers = {
+        "Accept": "application/json",
+      };
+      const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-east-1";
+      const accessKey = process.env.AWS_ACCESS_KEY_ID || "test";
+      headers["Authorization"] =
+        "AWS4-HMAC-SHA256 Credential=" + accessKey + "/19700101/" + region
+        + "/es/aws4_request, SignedHeaders=host, Signature=ministack";
+      if (encodedBody) {
+        headers["Content-Type"] = "application/json";
+        headers["Content-Length"] = Buffer.byteLength(encodedBody);
+      }
+      const req = http.request(
+        {
+          hostname: ep.hostname,
+          port: parseInt(ep.port || "4566", 10),
+          method: method,
+          path: requestPath,
+          headers: headers,
+        },
+        (res) => {
+          const chunks = [];
+          res.on("data", (c) => chunks.push(c));
+          res.on("end", () => {
+            const text = Buffer.concat(chunks).toString();
+            let parsed;
+            try { parsed = text ? JSON.parse(text) : {}; } catch (_) { parsed = {}; }
+            if (res.statusCode >= 400) {
+              const type = parsed.__type || parsed.Code || "OpenSearchServiceError";
+              const code = String(type).split("#").pop();
+              const err = new Error(
+                parsed.Message || parsed.message || text || "OpenSearch service error"
+              );
+              err.statusCode = res.statusCode;
+              err.code = code;
+              err.name = code;
+              reject(err);
+            } else {
+              resolve(parsed);
+            }
+          });
+        }
+      );
+      req.on("error", reject);
+      if (encodedBody) req.write(encodedBody);
+      req.end();
+    });
+  }
+
+  function _makeOpenSearchClientModule() {
+    class OpenSearchClient {
+      constructor(cfg) {
+        const clientConfig = cfg || {};
+        this.config = {
+          apiVersion: clientConfig.apiVersion,
+          region: async () => clientConfig.region
+            || process.env.AWS_REGION
+            || process.env.AWS_DEFAULT_REGION
+            || "us-east-1",
+        };
+      }
+      send(cmd) { return cmd._run(); }
+    }
+
+    class OpenSearch {
+      constructor(_cfg) {}
+    }
+
+    const operations = [
+      "CreateDomain",
+      "DescribeDomain",
+      "DescribeDomains",
+      "DeleteDomain",
+      "ListDomainNames",
+      "UpdateDomainConfig",
+      "DescribeDomainConfig",
+      "DescribeDomainChangeProgress",
+      "ListVersions",
+      "GetCompatibleVersions",
+      "AddTags",
+      "ListTags",
+      "RemoveTags",
+    ];
+    const exports = { OpenSearch, OpenSearchClient };
+    for (const opName of operations) {
+      OpenSearch.prototype[opName[0].toLowerCase() + opName.slice(1)] = function(params) {
+        return _openSearchRequest(opName, params);
+      };
+      exports[opName + "Command"] = class {
+        constructor(params) { this._params = params; }
+        _run() { return _openSearchRequest(opName, this._params); }
+      };
+    }
+    return exports;
   }
 
   // ── Generic JSON-RPC stub (covers SSM, SFN, STS, CloudWatch, Logs, etc.) ─
@@ -377,6 +569,7 @@ fs.write = function(fd, ...args) {
   // ── require() intercept ────────────────────────────────────────────────
   const _SPECIFIC_STUBS = {
     "@aws-sdk/client-lambda": _makeLambdaClientModule(),
+    "@aws-sdk/client-opensearch": _makeOpenSearchClientModule(),
   };
   const _SDK_CLIENT_RE = /^@aws-sdk\/client-(.+)$/;
 
