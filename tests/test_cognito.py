@@ -2961,6 +2961,83 @@ def test_oauth2_token_client_auth_basic():
     assert 'access_token' in resp
 
 
+def test_oauth2_login_username_attributes_email_alias_completes_token_exchange():
+    """With UsernameAttributes=["email"], logging in via the Hosted UI with
+    an email alias that differs from the real Username must still complete
+    the authorization code exchange. Logging in with the real Username must
+    also keep working."""
+    cognito_idp = make_client('cognito-idp')
+    pool = cognito_idp.create_user_pool(
+        PoolName='UsernameAttrsOAuthPool',
+        UsernameAttributes=['email'],
+    )
+    pool_id = pool['UserPool']['Id']
+
+    client_resp = cognito_idp.create_user_pool_client(
+        UserPoolId=pool_id,
+        ClientName='oauth2-test-client',
+        GenerateSecret=True,
+        AllowedOAuthFlows=['code'],
+        AllowedOAuthScopes=['openid', 'email', 'profile'],
+        AllowedOAuthFlowsUserPoolClient=True,
+        CallbackURLs=['http://localhost:3000/callback'],
+        LogoutURLs=['http://localhost:3000/logout'],
+        DefaultRedirectURI='http://localhost:3000/callback',
+        ExplicitAuthFlows=['ALLOW_USER_PASSWORD_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
+    )
+    client = client_resp['UserPoolClient']
+    client_id = client['ClientId']
+    client_secret = client['ClientSecret']
+
+    real_username = 'alice-sub-uuid'
+    cognito_idp.admin_create_user(
+        UserPoolId=pool_id,
+        Username=real_username,
+        UserAttributes=[
+            {'Name': 'email', 'Value': 'alice@example.com'},
+            {'Name': 'email_verified', 'Value': 'true'},
+        ],
+    )
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pool_id, Username=real_username, Password='TestPass1!', Permanent=True,
+    )
+
+    def _login_and_exchange(username, state):
+        status, headers, body = _post_form(
+            f'{ENDPOINT}/login',
+            {
+                'username': username,
+                'password': 'TestPass1!',
+                'client_id': client_id,
+                'redirect_uri': 'http://localhost:3000/callback',
+                'scope': 'openid email',
+                'state': state,
+                'response_type': 'code',
+            },
+            follow_redirects=False,
+        )
+        assert status == 302
+        location = headers.get('location', '')
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(location).query)
+        code = qs['code'][0]
+
+        status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+            'grant_type': 'authorization_code',
+            'code': code,
+            'redirect_uri': 'http://localhost:3000/callback',
+            'client_id': client_id,
+            'client_secret': client_secret,
+        })
+        assert status == 200
+        resp = json.loads(body)
+        assert 'access_token' in resp
+
+    # Login via the email alias (differs from the real Username).
+    _login_and_exchange('alice@example.com', 'alias-state')
+    # Login via the real Username.
+    _login_and_exchange(real_username, 'real-state')
+
+
 # ---------------------------------------------------------------------------
 # Tests — /oauth2/userInfo
 # ---------------------------------------------------------------------------
