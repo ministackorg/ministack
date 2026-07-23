@@ -838,19 +838,22 @@ def _resolve_user(pool: dict, username: str):
 
     # AliasAttributes (email, phone_number, preferred_username) and
     # UsernameAttributes (email, phone_number) let users sign in / be looked
-    # up via those attribute values. Real Cognito requires email/phone aliases
-    # to be verified (email_verified/phone_number_verified == "true") before
-    # the alias resolves; preferred_username has no verification requirement.
-    alias_attrs = set(pool.get("AliasAttributes") or []) | set(
-        pool.get("UsernameAttributes") or []
-    )
+    # up via those attribute values. Real Cognito requires email/phone
+    # AliasAttributes to be verified (email_verified/phone_number_verified ==
+    # "true") before the alias resolves; preferred_username has no
+    # verification requirement. UsernameAttributes is different: it's the
+    # pool's actual sign-in identifier (AdminCreateUser stores the given
+    # value there without auto-verifying it), so it resolves unverified too.
+    username_attrs = set(pool.get("UsernameAttributes") or [])
+    alias_only_attrs = set(pool.get("AliasAttributes") or []) - username_attrs
+    alias_attrs = username_attrs | alias_only_attrs
     if alias_attrs:
         for u in pool["_users"].values():
             attrs = _attr_list_to_dict(u.get("Attributes", []))
             for alias in alias_attrs:
                 if attrs.get(alias) != username:
                     continue
-                if alias in ("email", "phone_number"):
+                if alias in alias_only_attrs and alias in ("email", "phone_number"):
                     if str(attrs.get(f"{alias}_verified", "")).lower() != "true":
                         continue
                 return u, None
@@ -2148,6 +2151,23 @@ def _send_verification_email(pool, username, attr_dict, code, attribute_name="em
 # USER MANAGEMENT
 # ===========================================================================
 
+def _username_alias_attribute(pool: dict, username: str):
+    """Return which UsernameAttributes alias ("email"/"phone_number") the
+    given Username value should be registered as, or None if the pool
+    doesn't use UsernameAttributes. Real Cognito never uses the caller-
+    supplied value as the actual Username in this mode: it auto-generates a
+    UUID Username and stores the supplied value as the alias attribute.
+    """
+    username_attrs = set(pool.get("UsernameAttributes") or [])
+    if "email" in username_attrs and "phone_number" in username_attrs:
+        return "phone_number" if username.startswith("+") else "email"
+    if "email" in username_attrs:
+        return "email"
+    if "phone_number" in username_attrs:
+        return "phone_number"
+    return None
+
+
 def _admin_create_user(data):
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
@@ -2158,8 +2178,12 @@ def _admin_create_user(data):
     if not username:
         return error_response_json("InvalidParameterException", "Username is required.", 400)
 
+    alias_attr = _username_alias_attribute(pool, username)
     message_action = (data.get("MessageAction") or "").upper()
-    existing = pool["_users"].get(username)
+    if alias_attr:
+        existing, _ = _resolve_user(pool, username)
+    else:
+        existing = pool["_users"].get(username)
     if message_action == "RESEND":
         if not existing:
             return error_response_json(
@@ -2168,7 +2192,9 @@ def _admin_create_user(data):
         existing["UserLastModifiedDate"] = _now_epoch()
         attr_dict = _attr_list_to_dict(existing.get("Attributes", []))
         if _wants_email_delivery(data):
-            _send_invitation_email(pool, username, existing.get("_password", ""), attr_dict)
+            _send_invitation_email(
+                pool, existing["Username"], existing.get("_password", ""), attr_dict,
+            )
         return json_response({"User": _user_out(existing)})
 
     if existing:
@@ -2187,10 +2213,15 @@ def _admin_create_user(data):
     attr_dict = _attr_list_to_dict(attrs)
     if "sub" not in attr_dict:
         attr_dict["sub"] = new_uuid()
+    if alias_attr:
+        attr_dict.setdefault(alias_attr, username)
+        real_username = new_uuid()
+    else:
+        real_username = username
     attrs = _dict_to_attr_list(attr_dict)
 
     user = {
-        "Username": username,
+        "Username": real_username,
         "Attributes": attrs,
         "UserCreateDate": now,
         "UserLastModifiedDate": now,
@@ -2201,12 +2232,12 @@ def _admin_create_user(data):
         "_groups": [],
         "_tokens": [],
     }
-    pool["_users"][username] = user
+    pool["_users"][real_username] = user
     pool["EstimatedNumberOfUsers"] = len(pool["_users"])
-    logger.info("Cognito: AdminCreateUser %s in pool %s", username, pid)
+    logger.info("Cognito: AdminCreateUser %s in pool %s", real_username, pid)
 
     if message_action != "SUPPRESS" and _wants_email_delivery(data):
-        _send_invitation_email(pool, username, temp_password, attr_dict)
+        _send_invitation_email(pool, real_username, temp_password, attr_dict)
 
     return json_response({"User": _user_out(user)})
 
