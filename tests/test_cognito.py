@@ -2989,15 +2989,12 @@ def test_oauth2_login_username_attributes_email_alias_completes_token_exchange()
     client_id = client['ClientId']
     client_secret = client['ClientSecret']
 
-    real_username = 'alice-sub-uuid'
-    cognito_idp.admin_create_user(
+    create_resp = cognito_idp.admin_create_user(
         UserPoolId=pool_id,
-        Username=real_username,
-        UserAttributes=[
-            {'Name': 'email', 'Value': 'alice@example.com'},
-            {'Name': 'email_verified', 'Value': 'true'},
-        ],
+        Username='alice@example.com',
     )
+    real_username = create_resp['User']['Username']
+    assert real_username != 'alice@example.com'
     cognito_idp.admin_set_user_password(
         UserPoolId=pool_id, Username=real_username, Password='TestPass1!', Permanent=True,
     )
@@ -3036,6 +3033,101 @@ def test_oauth2_login_username_attributes_email_alias_completes_token_exchange()
     _login_and_exchange('alice@example.com', 'alias-state')
     # Login via the real Username.
     _login_and_exchange(real_username, 'real-state')
+
+
+def test_oauth2_login_after_email_change_completes_token_exchange():
+    """Regression for #006 + #007 combined: with UsernameAttributes=["email"],
+    the real Username is an immutable UUID and email is just a mutable alias.
+    After AdminUpdateUserAttributes changes the email, logging in via the
+    Hosted UI with the *new* email must still complete the authorization
+    code exchange, and the old email must no longer resolve."""
+    cognito_idp = make_client('cognito-idp')
+    pool = cognito_idp.create_user_pool(
+        PoolName='UsernameAttrsEmailChangePool',
+        UsernameAttributes=['email'],
+    )
+    pool_id = pool['UserPool']['Id']
+
+    client_resp = cognito_idp.create_user_pool_client(
+        UserPoolId=pool_id,
+        ClientName='oauth2-test-client',
+        GenerateSecret=True,
+        AllowedOAuthFlows=['code'],
+        AllowedOAuthScopes=['openid', 'email', 'profile'],
+        AllowedOAuthFlowsUserPoolClient=True,
+        CallbackURLs=['http://localhost:3000/callback'],
+        LogoutURLs=['http://localhost:3000/logout'],
+        DefaultRedirectURI='http://localhost:3000/callback',
+        ExplicitAuthFlows=['ALLOW_USER_PASSWORD_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
+    )
+    client = client_resp['UserPoolClient']
+    client_id = client['ClientId']
+    client_secret = client['ClientSecret']
+
+    create_resp = cognito_idp.admin_create_user(
+        UserPoolId=pool_id,
+        Username='test@example.com',
+    )
+    real_username = create_resp['User']['Username']
+    assert _uuid_mod.UUID(real_username)
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pool_id, Username=real_username, Password='TestPass1!', Permanent=True,
+    )
+
+    # Changing the email must not change the real Username (it stays UUID).
+    cognito_idp.admin_update_user_attributes(
+        UserPoolId=pool_id,
+        Username=real_username,
+        UserAttributes=[{'Name': 'email', 'Value': 'alice@example.com'}],
+    )
+    unchanged = cognito_idp.admin_get_user(UserPoolId=pool_id, Username=real_username)
+    assert unchanged['Username'] == real_username
+
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login',
+        {
+            'username': 'alice@example.com',
+            'password': 'TestPass1!',
+            'client_id': client_id,
+            'redirect_uri': 'http://localhost:3000/callback',
+            'scope': 'openid email',
+            'state': 'new-email-state',
+            'response_type': 'code',
+        },
+        follow_redirects=False,
+    )
+    assert status == 302
+    location = headers.get('location', '')
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(location).query)
+    code = qs['code'][0]
+
+    status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+        'grant_type': 'authorization_code',
+        'code': code,
+        'redirect_uri': 'http://localhost:3000/callback',
+        'client_id': client_id,
+        'client_secret': client_secret,
+    })
+    assert status == 200
+    resp = json.loads(body)
+    assert 'access_token' in resp
+
+    # The old email must no longer resolve to the user.
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login',
+        {
+            'username': 'test@example.com',
+            'password': 'TestPass1!',
+            'client_id': client_id,
+            'redirect_uri': 'http://localhost:3000/callback',
+            'scope': 'openid email',
+            'state': 'old-email-state',
+            'response_type': 'code',
+        },
+        follow_redirects=False,
+    )
+    assert status == 200
+    assert b'Incorrect username or password' in body
 
 
 # ---------------------------------------------------------------------------
@@ -3621,21 +3713,24 @@ def test_cognito_alias_attributes_auth_with_email(cognito_idp):
 
 
 def test_cognito_username_attributes_lookup_by_email(cognito_idp):
-    """UsernameAttributes also enables email-based lookup."""
+    """UsernameAttributes also enables email-based lookup. Real Cognito
+    never uses the supplied value as the actual Username in this mode: it
+    auto-generates a UUID Username and stores the value as the email
+    attribute instead."""
     pid = cognito_idp.create_user_pool(
         PoolName="UsernameAttrsPool",
         UsernameAttributes=["email"],
     )["UserPool"]["Id"]
-    cognito_idp.admin_create_user(
+    create_resp = cognito_idp.admin_create_user(
         UserPoolId=pid,
-        Username="dave-sub-uuid",
-        UserAttributes=[
-            {"Name": "email", "Value": "dave@example.com"},
-            {"Name": "email_verified", "Value": "true"},
-        ],
+        Username="dave@example.com",
     )
+    real_username = create_resp["User"]["Username"]
+    assert real_username != "dave@example.com"
+    assert _uuid_mod.UUID(real_username)
+
     user = cognito_idp.admin_get_user(UserPoolId=pid, Username="dave@example.com")
-    assert user["Username"] == "dave-sub-uuid"
+    assert user["Username"] == real_username
 
 
 def test_auth_codes_dict_types_are_plain_builtin_dict():
