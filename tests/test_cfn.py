@@ -4984,6 +4984,67 @@ def test_cfn_apigateway_documentation_part_lifecycle(cfn, apigw_v1):
         apigw_v1.delete_rest_api(restApiId=api_id)
 
 
+def test_cfn_apigateway_documentation_version_lifecycle(cfn, apigw_v1):
+    """DocumentationVersion has a stable CFN identity and supports replacement."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-documentation-version-{suffix}"
+    api_id = apigw_v1.create_rest_api(name=f"documentation-version-{suffix}")["id"]
+
+    def template(version, description):
+        return {
+            "Resources": {
+                "DocumentationVersion": {
+                    "Type": "AWS::ApiGateway::DocumentationVersion",
+                    "Properties": {
+                        "RestApiId": api_id,
+                        "DocumentationVersion": version,
+                        "Description": description,
+                    },
+                },
+            },
+        }
+
+    def physical_id():
+        detail = cfn.describe_stack_resource(
+            StackName=stack_name,
+            LogicalResourceId="DocumentationVersion",
+        )["StackResourceDetail"]
+        return detail["PhysicalResourceId"]
+
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("v1", "Created")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        created_id = physical_id()
+        assert created_id == f"{api_id}/v1"
+
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("v1", "Updated")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() == created_id
+
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("v2", "Replacement")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() == f"{api_id}/v2"
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        except ClientError:
+            pass
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
 # ---------------------------------------------------------------------------
 # ApiGatewayV1 Integration with OpenAPI spec parsing
 # ---------------------------------------------------------------------------
