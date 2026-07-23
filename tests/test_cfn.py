@@ -1838,6 +1838,55 @@ def test_cfn_ec2_launch_template(cfn, ec2):
     desc2 = ec2.describe_launch_templates(LaunchTemplateIds=[lt_id])
     assert len(desc2["LaunchTemplates"]) == 0
 
+
+def test_cfn_ec2_vpc_endpoint_uses_ec2_state(cfn, ec2):
+    """CloudFormation VPC endpoints share the EC2 API state and expose their ID."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-vpce-{suffix}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Vpc": {
+                "Type": "AWS::EC2::VPC",
+                "Properties": {"CidrBlock": "10.40.0.0/16"},
+            },
+            "Endpoint": {
+                "Type": "AWS::EC2::VPCEndpoint",
+                "Properties": {
+                    "VpcEndpointType": "Gateway",
+                    "VpcId": {"Ref": "Vpc"},
+                    "ServiceName": "com.amazonaws.us-east-1.s3",
+                    "Tags": [{"Key": "source", "Value": "cloudformation"}],
+                },
+            },
+        },
+        "Outputs": {
+            "RefId": {"Value": {"Ref": "Endpoint"}},
+            "GetAttId": {"Value": {"Fn::GetAtt": ["Endpoint", "Id"]}},
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+    assert outputs["RefId"] == outputs["GetAttId"]
+    assert outputs["RefId"].startswith("vpce-")
+
+    endpoints = ec2.describe_vpc_endpoints(
+        VpcEndpointIds=[outputs["RefId"]]
+    )["VpcEndpoints"]
+    assert len(endpoints) == 1
+    assert endpoints[0]["VpcEndpointId"] == outputs["RefId"]
+    assert endpoints[0]["ServiceName"] == "com.amazonaws.us-east-1.s3"
+    assert endpoints[0]["Tags"] == [{"Key": "source", "Value": "cloudformation"}]
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+    assert ec2.describe_vpc_endpoints(
+        VpcEndpointIds=[outputs["RefId"]]
+    )["VpcEndpoints"] == []
+
 def test_cfn_elbv2_load_balancer_and_listener(cfn, elbv2):
     """CloudFormation provisions ELBv2 LoadBalancer + Listener and cleans both on delete."""
     uid = _uuid_mod.uuid4().hex[:8]
