@@ -432,6 +432,20 @@ def _provision(transfer, s3, *, bucket=None, home_prefix="", logical_mappings=No
     }
 
 
+def _regional_transfer_client(region):
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client(
+        "transfer",
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region,
+        config=Config(region_name=region, retries={"mode": "standard"}),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Happy path
 # ---------------------------------------------------------------------------
@@ -680,11 +694,9 @@ def test_sftp_concurrent_uploads_two_users(transfer, s3):
     transfer.delete_server(ServerId=b["server_id"])
 
 
-def test_sftp_key_disambiguates_overlapping_usernames(transfer, s3):
-    """Two servers, same UserName, different keys: each user's key routes
-    to the correct server's bucket. This is the AWS-faithful single-port
-    behavior — username alone isn't enough, the SSH key is the
-    disambiguator."""
+def test_sftp_key_disambiguates_overlapping_usernames(s3):
+    """Same UserName in two regions with distinct keys routes each login to
+    the matching regional user, server, and home-directory bucket."""
     suffix = uuid.uuid4().hex[:8]
     user_name = f"shared-{suffix}"
     bucket_a = f"sftp-share-a-{suffix}"
@@ -692,17 +704,19 @@ def test_sftp_key_disambiguates_overlapping_usernames(transfer, s3):
     s3.create_bucket(Bucket=bucket_a)
     s3.create_bucket(Bucket=bucket_b)
 
-    sid_a = transfer.create_server()["ServerId"]
-    sid_b = transfer.create_server()["ServerId"]
+    east = _regional_transfer_client("us-east-1")
+    west = _regional_transfer_client("us-west-2")
+    sid_a = east.create_server()["ServerId"]
+    sid_b = west.create_server()["ServerId"]
     priv_a, pub_a = _gen_keypair()
     priv_b, pub_b = _gen_keypair()
-    transfer.create_user(
+    east.create_user(
         ServerId=sid_a, UserName=user_name,
         Role="arn:aws:iam::000000000000:role/r",
         HomeDirectoryType="PATH", HomeDirectory=f"/{bucket_a}",
         SshPublicKeyBody=pub_a,
     )
-    transfer.create_user(
+    west.create_user(
         ServerId=sid_b, UserName=user_name,
         Role="arn:aws:iam::000000000000:role/r",
         HomeDirectoryType="PATH", HomeDirectory=f"/{bucket_b}",
@@ -720,8 +734,85 @@ def test_sftp_key_disambiguates_overlapping_usernames(transfer, s3):
 
     assert s3.get_object(Bucket=bucket_a, Key="marker")["Body"].read() == b"from-a"
     assert s3.get_object(Bucket=bucket_b, Key="marker")["Body"].read() == b"from-b"
-    transfer.delete_server(ServerId=sid_a)
-    transfer.delete_server(ServerId=sid_b)
+    east.delete_server(ServerId=sid_a)
+    west.delete_server(ServerId=sid_b)
+
+
+def test_sftp_auth_uses_server_region_and_stashes_connection_metadata():
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import transfer as service
+
+    class _FakeConnection:
+        def __init__(self):
+            self.extra_info = {}
+
+        def set_extra_info(self, **kwargs):
+            self.extra_info.update(kwargs)
+
+    account_id = "111111111111"
+    east_region = "us-east-1"
+    west_region = "us-west-2"
+    server_id = "s-sharedregional01"
+    user_name = "shared-regional-user"
+    user_key = f"{server_id}/{user_name}"
+    original_account = get_account_id()
+    original_region = get_region()
+    _priv_east, pub_east = _gen_keypair()
+    _priv_west, pub_west = _gen_keypair()
+    east_user = {
+        "ServerId": server_id,
+        "UserName": user_name,
+        "SshPublicKeys": [{"SshPublicKeyBody": pub_east}],
+    }
+    west_user = {
+        "ServerId": server_id,
+        "UserName": user_name,
+        "SshPublicKeys": [{"SshPublicKeyBody": pub_west}],
+    }
+
+    service.reset()
+    try:
+        set_request_account_id(account_id)
+        service._servers.set_scoped(
+            account_id, east_region, server_id, {"State": "ONLINE"}
+        )
+        service._servers.set_scoped(
+            account_id, west_region, server_id, {"State": "OFFLINE"}
+        )
+        service._users.set_scoped(account_id, east_region, user_key, east_user)
+        service._users.set_scoped(account_id, west_region, user_key, west_user)
+
+        assert service._sftp_server_state(account_id, east_region, server_id) == "ONLINE"
+        assert service._sftp_server_state(account_id, west_region, server_id) == "OFFLINE"
+
+        connection = _FakeConnection()
+        auth_server = service._MiniStackSSHServer()
+        auth_server.connection_made(connection)
+        assert auth_server.validate_public_key(
+            user_name, asyncssh.import_public_key(pub_east)
+        )
+        assert auth_server._resolved == (
+            account_id, east_region, server_id, east_user
+        )
+        assert connection.extra_info["ministack_account_id"] == account_id
+        assert connection.extra_info["ministack_region"] == east_region
+        assert connection.extra_info["ministack_server_id"] == server_id
+        assert connection.extra_info["ministack_user"] == east_user
+
+        denied_server = service._MiniStackSSHServer()
+        denied_server.connection_made(_FakeConnection())
+        assert not denied_server.validate_public_key(
+            user_name, asyncssh.import_public_key(pub_west)
+        )
+    finally:
+        service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
 
 
 # ---------------------------------------------------------------------------

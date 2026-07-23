@@ -1903,6 +1903,64 @@ def test_emr_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path)
     assert persistence.load_state("emr") is None
 
 
+def test_transfer_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject Transfer's regional schema instead of
+    accepting it as v2 and silently dropping regional servers and users."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    servers = AccountRegionScopedDict()
+    servers.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "s-regionalserver01",
+        {
+            "ServerId": "s-regionalserver01",
+            "Arn": (
+                "arn:aws:transfer:us-west-2:000000000000:"
+                "server/s-regionalserver01"
+            ),
+        },
+    )
+    users = AccountRegionScopedDict()
+    users.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "s-regionalserver01/regional-user",
+        {
+            "ServerId": "s-regionalserver01",
+            "UserName": "regional-user",
+            "Arn": (
+                "arn:aws:transfer:us-west-2:000000000000:"
+                "user/s-regionalserver01/regional-user"
+            ),
+        },
+    )
+    persistence.save_state("transfer", {"servers": servers, "users": users})
+
+    raw = _json.loads((tmp_path / "transfer.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_servers = persistence.load_state("transfer")["servers"]
+    assert loaded_servers.get_scoped(
+        "000000000000", "us-west-2", "s-regionalserver01"
+    )["ServerId"] == "s-regionalserver01"
+    loaded_users = persistence.load_state("transfer")["users"]
+    assert loaded_users.get_scoped(
+        "000000000000",
+        "us-west-2",
+        "s-regionalserver01/regional-user",
+    )["UserName"] == "regional-user"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("transfer") is None
+
+
 def test_resource_groups_region_scoped_state_is_rejected_by_v2_reader(
     monkeypatch, tmp_path
 ):
