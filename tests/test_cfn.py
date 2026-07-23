@@ -1102,6 +1102,82 @@ def test_cfn_lambda_permission(cfn, lam):
     lam.delete_function(FunctionName="cfn-perm-fn")
 
 
+def test_cfn_lambda_url_uses_function_url_state(cfn, lam):
+    """CloudFormation Lambda URLs share state with the Lambda Function URL API."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-lambda-url-{suffix}"
+    function_name = f"cfn-url-{suffix}"
+
+    def template(auth_type, invoke_mode):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "Function": {
+                    "Type": "AWS::Lambda::Function",
+                    "Properties": {
+                        "FunctionName": function_name,
+                        "Runtime": "python3.12",
+                        "Handler": "index.handler",
+                        "Role": "arn:aws:iam::000000000000:role/lambda-role",
+                        "Code": {
+                            "ZipFile": "def handler(event, context):\n    return {'statusCode': 200}\n"
+                        },
+                    },
+                },
+                "FunctionUrl": {
+                    "Type": "AWS::Lambda::Url",
+                    "Properties": {
+                        "TargetFunctionArn": {"Ref": "Function"},
+                        "AuthType": auth_type,
+                        "InvokeMode": invoke_mode,
+                        "Cors": {"AllowOrigins": ["https://example.com"]},
+                    },
+                },
+            },
+            "Outputs": {
+                "UrlRef": {"Value": {"Ref": "FunctionUrl"}},
+                "FunctionArn": {
+                    "Value": {"Fn::GetAtt": ["FunctionUrl", "FunctionArn"]}
+                },
+                "FunctionUrl": {
+                    "Value": {"Fn::GetAtt": ["FunctionUrl", "FunctionUrl"]}
+                },
+            },
+        }
+
+    cfn.create_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template("NONE", "BUFFERED")),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+    assert outputs["UrlRef"] == function_name
+    config = lam.get_function_url_config(FunctionName=function_name)
+    assert config["FunctionUrl"] == outputs["FunctionUrl"]
+    assert config["FunctionArn"] == outputs["FunctionArn"]
+    assert config["AuthType"] == "NONE"
+    assert config["InvokeMode"] == "BUFFERED"
+    original_url = config["FunctionUrl"]
+
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template("AWS_IAM", "RESPONSE_STREAM")),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    config = lam.get_function_url_config(FunctionName=function_name)
+    assert config["FunctionUrl"] == original_url
+    assert config["AuthType"] == "AWS_IAM"
+    assert config["InvokeMode"] == "RESPONSE_STREAM"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+    assert lam.list_function_url_configs(
+        FunctionName=function_name
+    )["FunctionUrlConfigs"] == []
+
+
 def test_cfn_lambda_permission_qualified_arn_uses_base_function_policy(cfn, lam):
     """Qualified FunctionName refs should add permission to the base function policy."""
     suffix = _uuid_mod.uuid4().hex[:8]
