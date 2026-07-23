@@ -3133,6 +3133,73 @@ def _ec2_vpc_delete(physical_id, props):
     _ec2._vpcs.pop(physical_id, None)
 
 
+def _ec2_vpc_endpoint_attributes(endpoint):
+    return {
+        "CreationTimestamp": endpoint["CreationTimestamp"],
+        "DnsEntries": endpoint.get("DnsEntries", []),
+        "Id": endpoint["VpcEndpointId"],
+        "NetworkInterfaceIds": endpoint.get("NetworkInterfaceIds", []),
+    }
+
+
+def _ec2_vpc_endpoint_create(logical_id, props, stack_name):
+    endpoint_id = "vpce-" + "".join(random.choices(string.hexdigits[:16], k=17))
+    endpoint = {
+        "VpcEndpointId": endpoint_id,
+        "VpcEndpointType": props.get("VpcEndpointType", "Gateway"),
+        "VpcId": props.get("VpcId", _ec2._DEFAULT_VPC_ID),
+        "ServiceName": props.get("ServiceName", ""),
+        "State": "available",
+        "RouteTableIds": list(props.get("RouteTableIds", [])),
+        "SubnetIds": list(props.get("SubnetIds", [])),
+        "SecurityGroupIds": list(props.get("SecurityGroupIds", [])),
+        "NetworkInterfaceIds": [],
+        "DnsEntries": [],
+        "PrivateDnsEnabled": props.get("PrivateDnsEnabled", False),
+        "PolicyDocument": props.get("PolicyDocument"),
+        "OwnerId": get_account_id(),
+        "CreationTimestamp": now_iso(),
+    }
+    _ec2._vpc_endpoints[endpoint_id] = endpoint
+    tags = [
+        {"Key": tag.get("Key", ""), "Value": tag.get("Value", "")}
+        for tag in props.get("Tags", [])
+    ]
+    if tags:
+        _ec2._tags[endpoint_id] = tags
+    return endpoint_id, _ec2_vpc_endpoint_attributes(endpoint)
+
+
+def _ec2_vpc_endpoint_update(physical_id, old_props, new_props, stack_name):
+    endpoint = _ec2._vpc_endpoints.get(physical_id)
+    if not endpoint:
+        return _ec2_vpc_endpoint_create(physical_id, new_props, stack_name)
+    endpoint.update({
+        "VpcEndpointType": new_props.get("VpcEndpointType", "Gateway"),
+        "VpcId": new_props.get("VpcId", _ec2._DEFAULT_VPC_ID),
+        "ServiceName": new_props.get("ServiceName", ""),
+        "RouteTableIds": list(new_props.get("RouteTableIds", [])),
+        "SubnetIds": list(new_props.get("SubnetIds", [])),
+        "SecurityGroupIds": list(new_props.get("SecurityGroupIds", [])),
+        "PrivateDnsEnabled": new_props.get("PrivateDnsEnabled", False),
+        "PolicyDocument": new_props.get("PolicyDocument"),
+    })
+    tags = [
+        {"Key": tag.get("Key", ""), "Value": tag.get("Value", "")}
+        for tag in new_props.get("Tags", [])
+    ]
+    if tags:
+        _ec2._tags[physical_id] = tags
+    else:
+        _ec2._tags.pop(physical_id, None)
+    return physical_id, _ec2_vpc_endpoint_attributes(endpoint)
+
+
+def _ec2_vpc_endpoint_delete(physical_id, props):
+    _ec2._vpc_endpoints.pop(physical_id, None)
+    _ec2._tags.pop(physical_id, None)
+
+
 def _ec2_subnet_create(logical_id, props, stack_name):
     import random
     import string
@@ -5099,6 +5166,11 @@ _RESOURCE_HANDLERS = {
     "AWS::KMS::Key": {"create": _kms_key_create, "delete": _kms_key_delete},
     "AWS::KMS::Alias": {"create": _kms_alias_create, "delete": _kms_alias_delete},
     "AWS::EC2::VPC": {"create": _ec2_vpc_create, "delete": _ec2_vpc_delete},
+    "AWS::EC2::VPCEndpoint": {
+        "create": _ec2_vpc_endpoint_create,
+        "update": _ec2_vpc_endpoint_update,
+        "delete": _ec2_vpc_endpoint_delete,
+    },
     "AWS::EC2::Subnet": {"create": _ec2_subnet_create, "delete": _ec2_subnet_delete},
     "AWS::EC2::SecurityGroup": {"create": _ec2_sg_create, "delete": _ec2_sg_delete},
     "AWS::EC2::InternetGateway": {"create": _ec2_igw_create, "delete": _ec2_igw_delete},

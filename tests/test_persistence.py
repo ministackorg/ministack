@@ -1832,6 +1832,39 @@ def test_ecs_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path)
     assert persistence.load_state("ecs") is None
 
 
+def test_athena_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject Athena's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    workgroups = AccountRegionScopedDict()
+    workgroups.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-workgroup",
+        {"Name": "regional-workgroup", "Description": "west"},
+    )
+    persistence.save_state("athena", {"_workgroups": workgroups})
+
+    raw = _json.loads((tmp_path / "athena.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_workgroups = persistence.load_state("athena")["_workgroups"]
+    assert loaded_workgroups.get_scoped(
+        "000000000000", "us-west-2", "regional-workgroup"
+    )["Description"] == "west"
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("athena") is None
+
+
 def test_resource_groups_region_scoped_state_is_rejected_by_v2_reader(
     monkeypatch, tmp_path
 ):
