@@ -1136,6 +1136,25 @@ def _cwlogs_delete(physical_id, props):
     _cw_logs._log_groups.pop(physical_id, None)
 
 
+# --- CloudWatch Logs ResourcePolicy ---
+
+def _cwlogs_resource_policy_create(logical_id, props, stack_name):
+    policy_name = props.get("PolicyName")
+    if not policy_name:
+        raise ValueError("AWS::Logs::ResourcePolicy requires PolicyName")
+    # Local log delivery is intentionally permissive, so the policy only needs
+    # its CloudFormation identity rather than a data-plane enforcement store.
+    return policy_name, {}
+
+
+def _cwlogs_resource_policy_update(physical_id, old_props, new_props, stack_name):
+    return _cwlogs_resource_policy_create(physical_id, new_props, stack_name)
+
+
+def _cwlogs_resource_policy_delete(physical_id, props):
+    pass
+
+
 # --- CloudWatch Logs SubscriptionFilter (#896) ---
 
 def _cwlogs_subfilter_create(logical_id, props, stack_name):
@@ -5018,6 +5037,11 @@ _RESOURCE_HANDLERS = {
         "delete": _appconfig_deployment_delete,
     },
     "AWS::Logs::LogGroup": {"create": _cwlogs_create, "delete": _cwlogs_delete},
+    "AWS::Logs::ResourcePolicy": {
+        "create": _cwlogs_resource_policy_create,
+        "update": _cwlogs_resource_policy_update,
+        "delete": _cwlogs_resource_policy_delete,
+    },
     "AWS::Logs::SubscriptionFilter": {"create": _cwlogs_subfilter_create, "delete": _cwlogs_subfilter_delete},
     "AWS::Events::Rule": {"create": _eb_rule_create, "delete": _eb_rule_delete},
     "AWS::Events::EventBus": {"create": _eb_event_bus_create, "delete": _eb_event_bus_delete},

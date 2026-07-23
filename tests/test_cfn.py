@@ -5140,6 +5140,68 @@ def test_cfn_logs_subscription_filter_provisions(cfn, logs):
         logs.describe_subscription_filters(logGroupName="/cfn/subfilter-test")
 
 
+def test_cfn_logs_resource_policy_identity_and_lifecycle(cfn):
+    """Logs resource policies expose their policy name without enforcing it."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-logs-policy-{suffix}"
+    policy_name = f"logs-policy-{suffix}"
+
+    def template(statement_sid, name=policy_name):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "LogsPolicy": {
+                    "Type": "AWS::Logs::ResourcePolicy",
+                    "Properties": {
+                        "PolicyName": name,
+                        "PolicyDocument": json.dumps({
+                            "Version": "2012-10-17",
+                            "Statement": [{
+                                "Sid": statement_sid,
+                                "Effect": "Allow",
+                                "Principal": {"Service": "route53.amazonaws.com"},
+                                "Action": "logs:PutLogEvents",
+                                "Resource": "*",
+                            }],
+                        }),
+                    },
+                },
+            },
+            "Outputs": {
+                "PolicyName": {"Value": {"Ref": "LogsPolicy"}},
+            },
+        }
+
+    cfn.create_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template("InitialPolicy")),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    assert stack["Outputs"][0]["OutputValue"] == policy_name
+
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template("UpdatedPolicy")),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    assert stack["Outputs"][0]["OutputValue"] == policy_name
+
+    updated_name = f"{policy_name}-updated"
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template("UpdatedPolicy", updated_name)),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    assert stack["Outputs"][0]["OutputValue"] == updated_name
+
+    cfn.delete_stack(StackName=stack_name)
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "DELETE_COMPLETE"
+
+
 def test_cfn_change_set_detects_parameter_driven_change(cfn, s3):
     """A change set must detect a parameter-driven property change (e.g. a Lambda
     Code S3Key behind a Ref) so `aws cloudformation deploy` doesn't silently
