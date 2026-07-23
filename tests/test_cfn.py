@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import os
+import re
 import time
 import urllib.request
 import uuid as _uuid_mod
@@ -4122,6 +4123,66 @@ def test_cfn_cloudfront_keyvaluestore_create_update_delete(cfn, cloudfront):
     with pytest.raises(ClientError) as exc:
         cloudfront.describe_key_value_store(Name=kvs_name)
     assert exc.value.response["Error"]["Code"] == "EntityNotFound"
+
+
+def test_cfn_cloudfront_origin_access_identity_attributes(cfn):
+    """CloudFront OAIs expose stable CFN identities and canonical user IDs."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cloudfront-oai-{suffix}"
+
+    def template(comment):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "OriginAccessIdentity": {
+                    "Type": "AWS::CloudFront::CloudFrontOriginAccessIdentity",
+                    "Properties": {
+                        "CloudFrontOriginAccessIdentityConfig": {
+                            "Comment": comment,
+                        },
+                    },
+                },
+            },
+            "Outputs": {
+                "OaiRef": {"Value": {"Ref": "OriginAccessIdentity"}},
+                "OaiId": {
+                    "Value": {"Fn::GetAtt": ["OriginAccessIdentity", "Id"]},
+                },
+                "CanonicalUserId": {
+                    "Value": {
+                        "Fn::GetAtt": [
+                            "OriginAccessIdentity",
+                            "S3CanonicalUserId",
+                        ],
+                    },
+                },
+            },
+        }
+
+    cfn.create_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template("initial comment")),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+    assert outputs["OaiRef"] == outputs["OaiId"]
+    assert re.fullmatch(r"E[A-Z0-9]{13}", outputs["OaiId"])
+    assert re.fullmatch(r"[0-9a-f]{64}", outputs["CanonicalUserId"])
+
+    original_outputs = outputs
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template("updated comment")),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+    assert outputs == original_outputs
+
+    cfn.delete_stack(StackName=stack_name)
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "DELETE_COMPLETE"
 
 
 def test_cfn_cloudfront_distribution_supports_invalidations(cfn, cloudfront):
