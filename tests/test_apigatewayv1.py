@@ -8,6 +8,7 @@ import zipfile
 from urllib.parse import urlparse
 
 import pytest
+import yaml
 from botocore.exceptions import ClientError
 
 from ministack.core.responses import set_request_region
@@ -435,6 +436,235 @@ def test_apigwv1_create_stage(apigw_v1):
     assert resp["stageName"] == "prod"
     assert resp["deploymentId"] == dep_id
     apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_get_export_oas30_json(apigw_v1):
+    """GetExport returns an OpenAPI 3 document instead of matching GetStage."""
+    api_id = apigw_v1.create_rest_api(
+        name="v1-export-oas30",
+        description="Export regression test",
+        version="2026-07-22",
+    )["id"]
+    try:
+        apigw_v1.create_model(
+            restApiId=api_id,
+            name="Thing",
+            contentType="application/json",
+            schema=json.dumps({
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+            }),
+        )
+        root = next(
+            resource
+            for resource in apigw_v1.get_resources(restApiId=api_id)["items"]
+            if resource["path"] == "/"
+        )
+        things_id = apigw_v1.create_resource(
+            restApiId=api_id,
+            parentId=root["id"],
+            pathPart="things",
+        )["id"]
+        thing_id = apigw_v1.create_resource(
+            restApiId=api_id,
+            parentId=things_id,
+            pathPart="{thingId}",
+        )["id"]
+        apigw_v1.put_method(
+            restApiId=api_id,
+            resourceId=thing_id,
+            httpMethod="GET",
+            authorizationType="NONE",
+            operationName="GetThing",
+            requestParameters={
+                "method.request.path.thingId": True,
+                "method.request.querystring.verbose": False,
+            },
+            requestModels={"application/json": "Thing"},
+        )
+        apigw_v1.put_method_response(
+            restApiId=api_id,
+            resourceId=thing_id,
+            httpMethod="GET",
+            statusCode="200",
+            responseModels={"application/json": "Thing"},
+            responseParameters={"method.response.header.X-Request-Id": False},
+        )
+        apigw_v1.put_integration(
+            restApiId=api_id,
+            resourceId=thing_id,
+            httpMethod="GET",
+            type="MOCK",
+            integrationHttpMethod="POST",
+            requestTemplates={"application/json": '{"statusCode": 200}'},
+        )
+        apigw_v1.put_integration_response(
+            restApiId=api_id,
+            resourceId=thing_id,
+            httpMethod="GET",
+            statusCode="200",
+        )
+        deployment_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
+        apigw_v1.create_stage(
+            restApiId=api_id,
+            stageName="prod",
+            deploymentId=deployment_id,
+        )
+
+        response = apigw_v1.get_export(
+            restApiId=api_id,
+            stageName="prod",
+            exportType="oas30",
+            accepts="application/json",
+            parameters={"extensions": "integrations"},
+        )
+        document = json.loads(response["body"].read())
+
+        assert response["contentType"] == "application/json"
+        assert response["contentDisposition"].endswith('v1-export-oas30-prod-oas30.json"')
+        assert document["openapi"] == "3.0.1"
+        assert document["info"] == {
+            "title": "v1-export-oas30",
+            "version": "2026-07-22",
+            "description": "Export regression test",
+        }
+        assert document["servers"] == [{
+            "url": f"https://{api_id}.execute-api.us-east-1.amazonaws.com/prod"
+        }]
+        assert document["components"]["schemas"]["Thing"]["required"] == ["id"]
+
+        operation = document["paths"]["/things/{thingId}"]["get"]
+        assert operation["operationId"] == "GetThing"
+        assert operation["requestBody"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/Thing"
+        }
+        assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/Thing"
+        }
+        assert operation["responses"]["200"]["headers"]["X-Request-Id"] == {
+            "schema": {"type": "string"}
+        }
+        assert {parameter["name"] for parameter in operation["parameters"]} == {
+            "thingId", "verbose"
+        }
+        assert operation["x-amazon-apigateway-integration"]["type"] == "mock"
+        assert operation["x-amazon-apigateway-integration"]["responses"]["default"] == {
+            "statusCode": "200"
+        }
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigatewayv1_get_export_swagger_yaml(apigw_v1):
+    """GetExport supports Swagger 2.0 and YAML response bodies."""
+    api_id = apigw_v1.create_rest_api(name="v1-export-swagger")["id"]
+    try:
+        apigw_v1.create_model(
+            restApiId=api_id,
+            name="Result",
+            contentType="application/json",
+            schema='{"type":"object"}',
+        )
+        root = next(
+            resource
+            for resource in apigw_v1.get_resources(restApiId=api_id)["items"]
+            if resource["path"] == "/"
+        )
+        apigw_v1.put_method(
+            restApiId=api_id,
+            resourceId=root["id"],
+            httpMethod="ANY",
+            authorizationType="NONE",
+            apiKeyRequired=True,
+            requestModels={"application/json": "Result"},
+        )
+        apigw_v1.put_method_response(
+            restApiId=api_id,
+            resourceId=root["id"],
+            httpMethod="ANY",
+            statusCode="200",
+            responseModels={"application/json": "Result"},
+        )
+        deployment_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
+        apigw_v1.create_stage(
+            restApiId=api_id,
+            stageName="local",
+            deploymentId=deployment_id,
+        )
+
+        response = apigw_v1.get_export(
+            restApiId=api_id,
+            stageName="local",
+            exportType="swagger",
+            accepts="application/yaml",
+        )
+        document = yaml.safe_load(response["body"].read())
+
+        assert response["contentType"] == "application/yaml"
+        assert document["swagger"] == "2.0"
+        assert document["host"] == f"{api_id}.execute-api.us-east-1.amazonaws.com"
+        assert document["basePath"] == "/local"
+        assert document["definitions"]["Result"] == {"type": "object"}
+        assert document["securityDefinitions"]["api_key"] == {
+            "type": "apiKey",
+            "name": "x-api-key",
+            "in": "header",
+        }
+        operation = document["paths"]["/"]["x-amazon-apigateway-any-method"]
+        assert operation["security"] == [{"api_key": []}]
+        assert operation["parameters"][0]["schema"] == {"$ref": "#/definitions/Result"}
+        assert operation["responses"]["200"]["schema"] == {"$ref": "#/definitions/Result"}
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigatewayv1_get_export_validates_stage_and_format(apigw_v1):
+    api_id = apigw_v1.create_rest_api(name="v1-export-validation")["id"]
+    try:
+        with pytest.raises(ClientError) as missing_stage:
+            apigw_v1.get_export(
+                restApiId=api_id,
+                stageName="missing",
+                exportType="oas30",
+                accepts="application/json",
+            )
+        assert missing_stage.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+        deployment_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
+        apigw_v1.create_stage(
+            restApiId=api_id,
+            stageName="prod",
+            deploymentId=deployment_id,
+        )
+        empty_export = apigw_v1.get_export(
+            restApiId=api_id,
+            stageName="prod",
+            exportType="oas30",
+            accepts="application/json",
+        )
+        assert json.loads(empty_export["body"].read())["components"]["schemas"] == {}
+
+        with pytest.raises(ClientError) as invalid_export_type:
+            apigw_v1.get_export(
+                restApiId=api_id,
+                stageName="prod",
+                exportType="invalid",
+                accepts="application/json",
+            )
+        assert invalid_export_type.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+        with pytest.raises(ClientError) as invalid_accept:
+            apigw_v1.get_export(
+                restApiId=api_id,
+                stageName="prod",
+                exportType="oas30",
+                accepts="text/plain",
+            )
+        assert invalid_accept.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
 
 def test_apigwv1_update_stage(apigw_v1):
     """UpdateStage (PATCH) updates stage variables."""

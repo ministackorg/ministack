@@ -32,6 +32,7 @@ Control plane endpoints implemented:
   POST   /restapis/{id}/stages                                             — CreateStage
   GET    /restapis/{id}/stages                                             — GetStages
   GET    /restapis/{id}/stages/{stageName}                                 — GetStage
+  GET    /restapis/{id}/stages/{stageName}/exports/{exportType}            — GetExport
   PATCH  /restapis/{id}/stages/{stageName}                                 — UpdateStage
   DELETE /restapis/{id}/stages/{stageName}                                 — DeleteStage
   POST   /restapis/{id}/authorizers                                        — CreateAuthorizer
@@ -87,6 +88,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+import yaml
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
@@ -1003,12 +1006,17 @@ async def handle_request(method, path, headers, body, query_params):
         # /restapis/{id}/stages[/{stageName}]
         elif sub == "stages":
             stage_name = parts[3] if len(parts) > 3 else None
+            stage_sub = parts[4] if len(parts) > 4 else None
+            export_type = parts[5] if len(parts) > 5 else None
             if not stage_name:
                 if method == "POST":
                     return _create_stage(api_id, data)
                 if method == "GET":
                     return _get_stages(api_id)
-            else:
+            elif stage_sub == "exports":
+                if method == "GET" and export_type and len(parts) == 6:
+                    return _get_export(api_id, stage_name, export_type, headers, query_params)
+            elif stage_sub is None:
                 if method == "GET":
                     return _get_stage(api_id, stage_name)
                 if method == "PATCH":
@@ -1546,6 +1554,285 @@ def _import_operation(api_id, resource_id, http_method, operation):
             "httpMethod": integration.get("httpMethod"),
             "uri": integration.get("uri"),
         })
+
+
+def _schema_ref(model_name, export_type):
+    escaped_name = str(model_name).replace("~", "~0").replace("/", "~1")
+    container = "components/schemas" if export_type == "oas30" else "definitions"
+    return {"$ref": f"#/{container}/{escaped_name}"}
+
+
+def _export_model_schemas(api_id):
+    schemas = {}
+    for model_name, model in _models.get(api_id, {}).items():
+        schema = model.get("schema")
+        if isinstance(schema, dict):
+            schemas[model_name] = schema
+            continue
+        try:
+            schemas[model_name] = json.loads(schema or "{}")
+        except (TypeError, json.JSONDecodeError):
+            schemas[model_name] = {}
+    return schemas
+
+
+def _export_method_parameters(method_obj, export_type):
+    parameters = []
+    location_map = {"path": "path", "querystring": "query", "header": "header"}
+    for parameter_name, required in method_obj.get("requestParameters", {}).items():
+        parts = parameter_name.split(".", 3)
+        if len(parts) != 4 or parts[:2] != ["method", "request"]:
+            continue
+        location = location_map.get(parts[2])
+        if location is None:
+            continue
+        parameter = {
+            "name": parts[3],
+            "in": location,
+            "required": True if location == "path" else bool(required),
+        }
+        if export_type == "oas30":
+            parameter["schema"] = {"type": "string"}
+        else:
+            parameter["type"] = "string"
+        parameters.append(parameter)
+    return parameters
+
+
+def _export_method_responses(method_obj, export_type):
+    exported = {}
+    for status_code, response in method_obj.get("methodResponses", {}).items():
+        item = {"description": f"{status_code} response"}
+        response_models = response.get("responseModels", {})
+        response_parameters = response.get("responseParameters", {})
+
+        if export_type == "oas30":
+            content = {}
+            for content_type, model_name in response_models.items():
+                content[content_type] = {"schema": _schema_ref(model_name, export_type)}
+            if content:
+                item["content"] = content
+            headers = {}
+            for parameter_name in response_parameters:
+                prefix = "method.response.header."
+                if parameter_name.startswith(prefix):
+                    headers[parameter_name[len(prefix):]] = {"schema": {"type": "string"}}
+            if headers:
+                item["headers"] = headers
+        else:
+            if response_models:
+                model_name = response_models.get("application/json") or next(iter(response_models.values()))
+                item["schema"] = _schema_ref(model_name, export_type)
+            headers = {}
+            for parameter_name in response_parameters:
+                prefix = "method.response.header."
+                if parameter_name.startswith(prefix):
+                    headers[parameter_name[len(prefix):]] = {"type": "string"}
+            if headers:
+                item["headers"] = headers
+
+        exported[str(status_code)] = item
+
+    if not exported:
+        exported["200"] = {"description": "200 response"}
+    return exported
+
+
+def _export_integration(integration):
+    result = {
+        "type": str(integration.get("type", "aws_proxy")).lower(),
+        "httpMethod": integration.get("httpMethod"),
+        "uri": integration.get("uri"),
+        "connectionType": integration.get("connectionType"),
+        "requestParameters": integration.get("requestParameters", {}),
+        "requestTemplates": integration.get("requestTemplates", {}),
+        "passthroughBehavior": integration.get("passthroughBehavior"),
+        "cacheNamespace": integration.get("cacheNamespace"),
+        "cacheKeyParameters": integration.get("cacheKeyParameters", []),
+        "timeoutInMillis": integration.get("timeoutInMillis"),
+    }
+    for optional_key in ("credentials", "contentHandling"):
+        if integration.get(optional_key) is not None:
+            result[optional_key] = integration[optional_key]
+
+    responses = {}
+    for response in integration.get("integrationResponses", {}).values():
+        response_key = response.get("selectionPattern") or "default"
+        exported_response = {"statusCode": response.get("statusCode")}
+        for optional_key in ("responseParameters", "responseTemplates", "contentHandling"):
+            value = response.get(optional_key)
+            if value not in (None, {}, []):
+                exported_response[optional_key] = value
+        responses[response_key] = exported_response
+    if responses:
+        result["responses"] = responses
+
+    return {key: value for key, value in result.items() if value is not None}
+
+
+def _export_operation(method_obj, export_type, include_integrations):
+    operation = {"responses": _export_method_responses(method_obj, export_type)}
+    if method_obj.get("operationName"):
+        operation["operationId"] = method_obj["operationName"]
+
+    parameters = _export_method_parameters(method_obj, export_type)
+    request_models = method_obj.get("requestModels", {})
+    if export_type == "oas30":
+        content = {
+            content_type: {"schema": _schema_ref(model_name, export_type)}
+            for content_type, model_name in request_models.items()
+        }
+        if content:
+            operation["requestBody"] = {"content": content}
+    elif request_models:
+        content_types = list(request_models)
+        model_name = request_models.get("application/json") or request_models[content_types[0]]
+        parameters.append({
+            "name": "body",
+            "in": "body",
+            "required": False,
+            "schema": _schema_ref(model_name, export_type),
+        })
+        operation["consumes"] = content_types
+
+    if parameters:
+        operation["parameters"] = parameters
+
+    response_models = method_obj.get("methodResponses", {}).values()
+    produced_types = {
+        content_type
+        for response in response_models
+        for content_type in response.get("responseModels", {})
+    }
+    if export_type == "swagger" and produced_types:
+        operation["produces"] = sorted(produced_types)
+
+    if method_obj.get("apiKeyRequired"):
+        operation["security"] = [{"api_key": []}]
+
+    integration = method_obj.get("methodIntegration")
+    if include_integrations and integration:
+        operation["x-amazon-apigateway-integration"] = _export_integration(integration)
+    return operation
+
+
+def _get_export_extensions(query_params):
+    # API Gateway's query-string map is flattened by botocore, so
+    # parameters={"extensions": "integrations"} is sent as
+    # ?extensions=integrations. Keep the bracketed form as a compatibility
+    # fallback for callers which serialize REST query maps that way.
+    raw = query_params.get("extensions") or query_params.get("parameters[extensions]", [])
+    if not raw:
+        return set()
+    if isinstance(raw, str):
+        raw = [raw]
+    return {
+        extension.strip().lower()
+        for value in raw
+        for extension in value.split(",")
+        if extension.strip()
+    }
+
+
+def _build_api_export(api_id, stage_name, export_type, include_integrations):
+    api = _rest_apis[api_id]
+    version = api.get("version") or "1.0"
+    info = {"title": api.get("name", "unnamed"), "version": version}
+    if api.get("description"):
+        info["description"] = api["description"]
+
+    schemas = _export_model_schemas(api_id)
+    paths = {}
+    has_api_key_method = False
+    for resource in _resources.get(api_id, {}).values():
+        exported_methods = {}
+        for http_method, method_obj in resource.get("resourceMethods", {}).items():
+            method_key = (
+                "x-amazon-apigateway-any-method"
+                if http_method.upper() == "ANY"
+                else http_method.lower()
+            )
+            exported_methods[method_key] = _export_operation(
+                method_obj, export_type, include_integrations
+            )
+            has_api_key_method = has_api_key_method or bool(method_obj.get("apiKeyRequired"))
+        if exported_methods:
+            paths[resource.get("path", "/")] = exported_methods
+
+    region = _rest_api_regions.get(api_id) or get_region()
+    execute_url = f"https://{api_id}.execute-api.{region}.amazonaws.com/{stage_name}"
+    if export_type == "oas30":
+        components = {"schemas": schemas}
+        if has_api_key_method:
+            components["securitySchemes"] = {
+                "api_key": {"type": "apiKey", "name": "x-api-key", "in": "header"}
+            }
+        return {
+            "openapi": "3.0.1",
+            "info": info,
+            "servers": [{"url": execute_url}],
+            "paths": paths,
+            "components": components,
+        }
+
+    document = {
+        "swagger": "2.0",
+        "info": info,
+        "host": f"{api_id}.execute-api.{region}.amazonaws.com",
+        "basePath": f"/{stage_name}",
+        "schemes": ["https"],
+        "paths": paths,
+        "definitions": schemas,
+    }
+    if has_api_key_method:
+        document["securityDefinitions"] = {
+            "api_key": {"type": "apiKey", "name": "x-api-key", "in": "header"}
+        }
+    return document
+
+
+def _get_export(api_id, stage_name, export_type, headers, query_params):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    if stage_name not in _stages_v1.get(api_id, {}):
+        return _v1_error("NotFoundException", "Invalid Stage identifier specified", 404)
+
+    export_type = export_type.lower()
+    if export_type not in ("oas30", "swagger"):
+        return _v1_error(
+            "BadRequestException",
+            "Invalid export type. Supported types are 'oas30' and 'swagger'",
+            400,
+        )
+
+    accept = (headers.get("accept") or "application/json").split(",", 1)[0].split(";", 1)[0].strip().lower()
+    if accept == "application/json":
+        content_type = "application/json"
+        extension = "json"
+    elif accept in ("application/yaml", "application/x-yaml", "text/yaml"):
+        content_type = "application/yaml"
+        extension = "yaml"
+    else:
+        return _v1_error(
+            "BadRequestException",
+            "Invalid Accept header. Supported values are 'application/json' and 'application/yaml'",
+            400,
+        )
+
+    export_extensions = _get_export_extensions(query_params)
+    include_integrations = bool({"integrations", "apigateway"} & export_extensions)
+    document = _build_api_export(api_id, stage_name, export_type, include_integrations)
+    if extension == "json":
+        body = json.dumps(document, ensure_ascii=False).encode("utf-8")
+    else:
+        body = yaml.safe_dump(document, sort_keys=False).encode("utf-8")
+
+    api_name = re.sub(r"[^A-Za-z0-9._-]+", "-", _rest_apis[api_id].get("name", "api"))
+    filename = f"{api_name}-{stage_name}-{export_type}.{extension}"
+    return 200, {
+        "Content-Type": content_type,
+        "Content-Disposition": f'attachment; filename="{filename}"',
+    }, body
 
 
 # ---- Control plane: Resources ----

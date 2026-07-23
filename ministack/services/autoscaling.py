@@ -23,17 +23,33 @@ import time
 from collections import defaultdict
 
 from ministack.core.persistence import load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid, now_iso
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    AccountScopedDict,
+    get_account_id,
+    get_region,
+    new_uuid,
+    now_iso,
+)
 
 logger = logging.getLogger("autoscaling")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-_asgs = AccountScopedDict()
-_launch_configs = AccountScopedDict()
-_policies = AccountScopedDict()
-_hooks = AccountScopedDict()
-_scheduled_actions = AccountScopedDict()
-_tags = AccountScopedDict()  # asg_name -> [{"Key":..., "Value":...}, ...]
+_asgs = AccountRegionScopedDict()
+_launch_configs = AccountRegionScopedDict()
+_policies = AccountRegionScopedDict()
+_hooks = AccountRegionScopedDict()
+_scheduled_actions = AccountRegionScopedDict()
+_tags = AccountRegionScopedDict()  # asg_name -> [{"Key":..., "Value":...}, ...]
+
+
+def _clear_state():
+    _asgs.clear()
+    _launch_configs.clear()
+    _policies.clear()
+    _hooks.clear()
+    _scheduled_actions.clear()
+    _tags.clear()
 
 
 def get_state():
@@ -48,13 +64,45 @@ def get_state():
 
 
 def restore_state(data):
-    if data:
-        _asgs.update(data.get("asgs", {}))
-        _launch_configs.update(data.get("launch_configs", {}))
-        _policies.update(data.get("policies", {}))
-        _hooks.update(data.get("hooks", {}))
-        _scheduled_actions.update(data.get("scheduled_actions", {}))
-        _tags.update(data.get("tags", {}))
+    if not data:
+        return
+
+    _clear_state()
+    _asgs.update(data.get("asgs", {}))
+    _launch_configs.update(data.get("launch_configs", {}))
+
+    asg_regions = {
+        (account_id, asg_name): region
+        for (account_id, region, asg_name), _asg in _asgs.all_items()
+    }
+    for store, key in (
+        (_policies, "policies"),
+        (_hooks, "hooks"),
+        (_scheduled_actions, "scheduled_actions"),
+        (_tags, "tags"),
+    ):
+        _restore_asg_child_store(store, data.get(key, {}), asg_regions)
+
+
+def _restore_asg_child_store(store, restored, asg_regions):
+    """Adopt legacy name-keyed child state into its parent ASG's region."""
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+
+    if isinstance(restored, AccountScopedDict):
+        items = restored._data.items()
+    else:
+        account_id = get_account_id()
+        items = (((account_id, key), value) for key, value in restored.items())
+
+    for (account_id, key), value in items:
+        asg_name = value.get("AutoScalingGroupName") if isinstance(value, dict) else key
+        region = asg_regions.get(
+            (account_id, asg_name),
+            store._region_for_legacy_value(key, value),
+        )
+        store.set_scoped(account_id, region, key, value)
 
 
 try:
@@ -66,12 +114,7 @@ except Exception:
 
 
 def reset():
-    _asgs.clear()
-    _launch_configs.clear()
-    _policies.clear()
-    _hooks.clear()
-    _scheduled_actions.clear()
-    _tags.clear()
+    _clear_state()
 
 
 def _p(params, key):
