@@ -1832,6 +1832,77 @@ def test_ecs_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path)
     assert persistence.load_state("ecs") is None
 
 
+def test_appsync_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject AppSync's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    apis = AccountRegionScopedDict()
+    apis.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-api",
+        {
+            "apiId": "regional-api",
+            "arn": "arn:aws:appsync:us-west-2:000000000000:apis/regional-api",
+        },
+    )
+    persistence.save_state("appsync", {"apis": apis})
+
+    raw = _json.loads((tmp_path / "appsync.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_apis = persistence.load_state("appsync")["apis"]
+    assert loaded_apis.get_scoped(
+        "000000000000", "us-west-2", "regional-api"
+    )["apiId"] == "regional-api"
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("appsync") is None
+
+
+def test_emr_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject EMR regional state instead of dropping it."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    clusters = AccountRegionScopedDict()
+    clusters.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "j-LEGACYCLUSTER",
+        {
+            "Id": "j-LEGACYCLUSTER",
+            "ClusterArn": (
+                "arn:aws:elasticmapreduce:us-west-2:000000000000:"
+                "cluster/j-LEGACYCLUSTER"
+            ),
+        },
+    )
+    persistence.save_state("emr", {"_clusters": clusters})
+
+    raw = _json.loads((tmp_path / "emr.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded = persistence.load_state("emr")["_clusters"]
+    assert loaded.get_scoped(
+        "000000000000", "us-west-2", "j-LEGACYCLUSTER"
+    )["Id"] == "j-LEGACYCLUSTER"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("emr") is None
+
+
 def test_resource_groups_region_scoped_state_is_rejected_by_v2_reader(
     monkeypatch, tmp_path
 ):
@@ -1907,6 +1978,40 @@ def test_codebuild_region_scoped_state_is_rejected_by_v2_reader(
     # Simulate the previous binary, whose highest understood format is v2.
     monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
     assert persistence.load_state("codebuild") is None
+
+
+def test_mq_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject MQ's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    brokers = AccountRegionScopedDict()
+    brokers.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-broker",
+        {
+            "brokerArn": (
+                "arn:aws:mq:us-west-2:000000000000:broker:regional-broker"
+            )
+        },
+    )
+    persistence.save_state("mq", {"brokers": brokers})
+
+    raw = _json.loads((tmp_path / "mq.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_brokers = persistence.load_state("mq")["brokers"]
+    assert loaded_brokers.get_scoped(
+        "000000000000", "us-west-2", "regional-broker"
+    )["brokerArn"].endswith("broker:regional-broker")
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("mq") is None
 
 
 def test_ses_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):

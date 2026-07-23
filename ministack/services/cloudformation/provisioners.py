@@ -702,6 +702,70 @@ def _lambda_delete(physical_id, props):
     _lambda_svc._functions.pop(physical_id, None)
 
 
+def _lambda_url_target(props):
+    func, func_name, _resource_arn, target_qualifier = _lambda_function_for_cfn_ref(
+        props.get("TargetFunctionArn", "")
+    )
+    qualifier = props.get("Qualifier") or target_qualifier
+    return func, func_name, qualifier
+
+
+def _lambda_url_config_data(props):
+    data = {
+        "AuthType": props.get("AuthType", "NONE"),
+        "InvokeMode": props.get("InvokeMode", "BUFFERED"),
+    }
+    if "Cors" in props:
+        data["Cors"] = props["Cors"]
+    return data
+
+
+def _lambda_url_attributes(config):
+    return {
+        "FunctionArn": config["FunctionArn"],
+        "FunctionUrl": config["FunctionUrl"],
+    }
+
+
+def _lambda_url_create(logical_id, props, stack_name):
+    func, func_name, qualifier = _lambda_url_target(props)
+    if not func:
+        raise ValueError(f"Lambda function not found: {props.get('TargetFunctionArn', '')}")
+    status, _headers, body = _lambda_svc._create_function_url_config(
+        func_name, _lambda_url_config_data(props), qualifier,
+    )
+    if status >= 400:
+        raise ValueError(f"AWS::Lambda::Url create failed: {body!r}")
+    config = json.loads(body)
+    resource_name = _lambda_svc._url_config_key(func_name, qualifier)
+    return resource_name, _lambda_url_attributes(config)
+
+
+def _lambda_url_update(physical_id, old_props, new_props, stack_name):
+    if any(
+        new_props.get(key) != old_props.get(key)
+        for key in ("TargetFunctionArn", "Qualifier")
+    ):
+        new_id, attrs = _lambda_url_create(physical_id, new_props, stack_name)
+        _lambda_url_delete(physical_id, old_props)
+        return new_id, attrs
+
+    _func, func_name, qualifier = _lambda_url_target(new_props)
+    data = _lambda_url_config_data(new_props)
+    if "Cors" not in new_props and "Cors" in old_props:
+        data["Cors"] = {}
+    status, _headers, body = _lambda_svc._update_function_url_config(
+        func_name, data, qualifier,
+    )
+    if status >= 400:
+        raise ValueError(f"AWS::Lambda::Url update failed: {body!r}")
+    return physical_id, _lambda_url_attributes(json.loads(body))
+
+
+def _lambda_url_delete(physical_id, props):
+    _lambda_svc._function_urls.pop(physical_id, None)
+
+
 # --- IAM Role ---
 
 def _iam_role_create(logical_id, props, stack_name):
@@ -1134,6 +1198,25 @@ def _cwlogs_create(logical_id, props, stack_name):
 
 def _cwlogs_delete(physical_id, props):
     _cw_logs._log_groups.pop(physical_id, None)
+
+
+# --- CloudWatch Logs ResourcePolicy ---
+
+def _cwlogs_resource_policy_create(logical_id, props, stack_name):
+    policy_name = props.get("PolicyName")
+    if not policy_name:
+        raise ValueError("AWS::Logs::ResourcePolicy requires PolicyName")
+    # Local log delivery is intentionally permissive, so the policy only needs
+    # its CloudFormation identity rather than a data-plane enforcement store.
+    return policy_name, {}
+
+
+def _cwlogs_resource_policy_update(physical_id, old_props, new_props, stack_name):
+    return _cwlogs_resource_policy_create(physical_id, new_props, stack_name)
+
+
+def _cwlogs_resource_policy_delete(physical_id, props):
+    pass
 
 
 # --- CloudWatch Logs SubscriptionFilter (#896) ---
@@ -2337,6 +2420,27 @@ def _apigw_documentation_part_delete(physical_id, props):
         _apigw_v1._delete_documentation_part(api_id, physical_id)
 
 
+# --- API Gateway DocumentationVersion ---
+
+def _apigw_documentation_version_identity(props):
+    return f"{props.get('RestApiId', '')}/{props.get('DocumentationVersion', '')}"
+
+
+def _apigw_documentation_version_create(logical_id, props, stack_name):
+    # Documentation snapshots do not affect MiniStack's permissive local API
+    # request handling. A native CFN identity is sufficient for templates and
+    # dependent resources to complete their lifecycle.
+    return _apigw_documentation_version_identity(props), {}
+
+
+def _apigw_documentation_version_update(physical_id, old_props, new_props, stack_name):
+    return _apigw_documentation_version_identity(new_props), {}
+
+
+def _apigw_documentation_version_delete(physical_id, props):
+    pass
+
+
 # --- Lambda EventSourceMapping ---
 
 def _lambda_esm_create(logical_id, props, stack_name):
@@ -3131,6 +3235,73 @@ def _ec2_vpc_create(logical_id, props, stack_name):
 
 def _ec2_vpc_delete(physical_id, props):
     _ec2._vpcs.pop(physical_id, None)
+
+
+def _ec2_vpc_endpoint_attributes(endpoint):
+    return {
+        "CreationTimestamp": endpoint["CreationTimestamp"],
+        "DnsEntries": endpoint.get("DnsEntries", []),
+        "Id": endpoint["VpcEndpointId"],
+        "NetworkInterfaceIds": endpoint.get("NetworkInterfaceIds", []),
+    }
+
+
+def _ec2_vpc_endpoint_create(logical_id, props, stack_name):
+    endpoint_id = "vpce-" + "".join(random.choices(string.hexdigits[:16], k=17))
+    endpoint = {
+        "VpcEndpointId": endpoint_id,
+        "VpcEndpointType": props.get("VpcEndpointType", "Gateway"),
+        "VpcId": props.get("VpcId", _ec2._DEFAULT_VPC_ID),
+        "ServiceName": props.get("ServiceName", ""),
+        "State": "available",
+        "RouteTableIds": list(props.get("RouteTableIds", [])),
+        "SubnetIds": list(props.get("SubnetIds", [])),
+        "SecurityGroupIds": list(props.get("SecurityGroupIds", [])),
+        "NetworkInterfaceIds": [],
+        "DnsEntries": [],
+        "PrivateDnsEnabled": props.get("PrivateDnsEnabled", False),
+        "PolicyDocument": props.get("PolicyDocument"),
+        "OwnerId": get_account_id(),
+        "CreationTimestamp": now_iso(),
+    }
+    _ec2._vpc_endpoints[endpoint_id] = endpoint
+    tags = [
+        {"Key": tag.get("Key", ""), "Value": tag.get("Value", "")}
+        for tag in props.get("Tags", [])
+    ]
+    if tags:
+        _ec2._tags[endpoint_id] = tags
+    return endpoint_id, _ec2_vpc_endpoint_attributes(endpoint)
+
+
+def _ec2_vpc_endpoint_update(physical_id, old_props, new_props, stack_name):
+    endpoint = _ec2._vpc_endpoints.get(physical_id)
+    if not endpoint:
+        return _ec2_vpc_endpoint_create(physical_id, new_props, stack_name)
+    endpoint.update({
+        "VpcEndpointType": new_props.get("VpcEndpointType", "Gateway"),
+        "VpcId": new_props.get("VpcId", _ec2._DEFAULT_VPC_ID),
+        "ServiceName": new_props.get("ServiceName", ""),
+        "RouteTableIds": list(new_props.get("RouteTableIds", [])),
+        "SubnetIds": list(new_props.get("SubnetIds", [])),
+        "SecurityGroupIds": list(new_props.get("SecurityGroupIds", [])),
+        "PrivateDnsEnabled": new_props.get("PrivateDnsEnabled", False),
+        "PolicyDocument": new_props.get("PolicyDocument"),
+    })
+    tags = [
+        {"Key": tag.get("Key", ""), "Value": tag.get("Value", "")}
+        for tag in new_props.get("Tags", [])
+    ]
+    if tags:
+        _ec2._tags[physical_id] = tags
+    else:
+        _ec2._tags.pop(physical_id, None)
+    return physical_id, _ec2_vpc_endpoint_attributes(endpoint)
+
+
+def _ec2_vpc_endpoint_delete(physical_id, props):
+    _ec2._vpc_endpoints.pop(physical_id, None)
+    _ec2._tags.pop(physical_id, None)
 
 
 def _ec2_subnet_create(logical_id, props, stack_name):
@@ -5021,6 +5192,11 @@ _RESOURCE_HANDLERS = {
     # before delegating to the Table engine.
     "AWS::DynamoDB::GlobalTable": {"create": _ddb_global_table_create, "delete": _ddb_global_table_delete},
     "AWS::Lambda::Function": {"create": _lambda_create, "delete": _lambda_delete},
+    "AWS::Lambda::Url": {
+        "create": _lambda_url_create,
+        "update": _lambda_url_update,
+        "delete": _lambda_url_delete,
+    },
     "AWS::IAM::Role": {"create": _iam_role_create, "delete": _iam_role_delete},
     "AWS::IAM::Policy": {"create": _iam_policy_create, "delete": _iam_policy_delete},
     "AWS::IAM::InstanceProfile": {"create": _iam_ip_create, "delete": _iam_ip_delete},
@@ -5050,6 +5226,11 @@ _RESOURCE_HANDLERS = {
         "delete": _appconfig_deployment_delete,
     },
     "AWS::Logs::LogGroup": {"create": _cwlogs_create, "delete": _cwlogs_delete},
+    "AWS::Logs::ResourcePolicy": {
+        "create": _cwlogs_resource_policy_create,
+        "update": _cwlogs_resource_policy_update,
+        "delete": _cwlogs_resource_policy_delete,
+    },
     "AWS::Logs::SubscriptionFilter": {"create": _cwlogs_subfilter_create, "delete": _cwlogs_subfilter_delete},
     "AWS::Events::Rule": {"create": _eb_rule_create, "delete": _eb_rule_delete},
     "AWS::Events::EventBus": {"create": _eb_event_bus_create, "delete": _eb_event_bus_delete},
@@ -5100,6 +5281,11 @@ _RESOURCE_HANDLERS = {
         "update": _apigw_documentation_part_update,
         "delete": _apigw_documentation_part_delete,
     },
+    "AWS::ApiGateway::DocumentationVersion": {
+        "create": _apigw_documentation_version_create,
+        "update": _apigw_documentation_version_update,
+        "delete": _apigw_documentation_version_delete,
+    },
     "AWS::Lambda::EventSourceMapping": {"create": _lambda_esm_create, "update": _lambda_esm_update, "delete": _lambda_esm_delete},
     "AWS::Lambda::EventInvokeConfig": {
         "create": _lambda_event_invoke_config_create,
@@ -5131,6 +5317,11 @@ _RESOURCE_HANDLERS = {
     "AWS::KMS::Key": {"create": _kms_key_create, "delete": _kms_key_delete},
     "AWS::KMS::Alias": {"create": _kms_alias_create, "delete": _kms_alias_delete},
     "AWS::EC2::VPC": {"create": _ec2_vpc_create, "delete": _ec2_vpc_delete},
+    "AWS::EC2::VPCEndpoint": {
+        "create": _ec2_vpc_endpoint_create,
+        "update": _ec2_vpc_endpoint_update,
+        "delete": _ec2_vpc_endpoint_delete,
+    },
     "AWS::EC2::Subnet": {"create": _ec2_subnet_create, "delete": _ec2_subnet_delete},
     "AWS::EC2::SecurityGroup": {"create": _ec2_sg_create, "delete": _ec2_sg_delete},
     "AWS::EC2::InternetGateway": {"create": _ec2_igw_create, "delete": _ec2_igw_delete},

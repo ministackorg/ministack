@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 import os
@@ -480,3 +481,195 @@ def test_servicediscovery_tag_apis_reject_missing_local_resources(resource_arn, 
         assert body["__type"] == expected_error
 
     assert sd_svc._resource_tags.get(resource_arn) is None
+
+
+def _create_http_namespace_direct(name, tags=None):
+    status, _, body = _json_result(
+        asyncio.run(
+            sd_svc._create_namespace(
+                {
+                    "Name": name,
+                    "Tags": tags or [],
+                    "_action": "CreateHttpNamespace",
+                }
+            )
+        )
+    )
+    assert status == 200
+    operation = _json_result(
+        sd_svc._get_operation({"OperationId": body["OperationId"]})
+    )[2]["Operation"]
+    return operation["Targets"]["NAMESPACE"]
+
+
+def _create_service_direct(namespace_id, name):
+    status, _, body = _json_result(
+        sd_svc._create_service({"NamespaceId": namespace_id, "Name": name})
+    )
+    assert status == 200
+    return body["Service"]["Id"]
+
+
+def test_servicediscovery_state_is_isolated_by_region():
+    from ministack.core.responses import set_request_region
+
+    namespace_name = "shared-http-namespace"
+    service_name = "shared-service"
+
+    east_namespace_id = _create_http_namespace_direct(
+        namespace_name, [{"Key": "region", "Value": "east"}]
+    )
+    east_service_id = _create_service_direct(east_namespace_id, service_name)
+    assert _json_result(
+        sd_svc._register_instance(
+            {
+                "ServiceId": east_service_id,
+                "InstanceId": "shared-instance",
+                "Attributes": {"AWS_INSTANCE_IPV4": "10.0.0.1"},
+            }
+        )
+    )[0] == 200
+    east_operation_ids = set(sd_svc._operations.keys())
+
+    set_request_region("us-west-2")
+    west_namespace_id = _create_http_namespace_direct(
+        namespace_name, [{"Key": "region", "Value": "west"}]
+    )
+    west_service_id = _create_service_direct(west_namespace_id, service_name)
+    assert _json_result(
+        sd_svc._register_instance(
+            {
+                "ServiceId": west_service_id,
+                "InstanceId": "shared-instance",
+                "Attributes": {"AWS_INSTANCE_IPV4": "10.0.0.2"},
+            }
+        )
+    )[0] == 200
+    west_operation_ids = set(sd_svc._operations.keys())
+
+    assert _json_result(sd_svc._list_namespaces({}))[2]["Namespaces"] == [
+        sd_svc._namespaces[west_namespace_id]
+    ]
+    assert _json_result(sd_svc._list_services({}))[2]["Services"] == [
+        sd_svc._services[west_service_id]
+    ]
+    listed_west_operation_ids = {
+        operation["Id"]
+        for operation in _json_result(sd_svc._list_operations({}))[2]["Operations"]
+    }
+    assert listed_west_operation_ids == west_operation_ids
+    assert listed_west_operation_ids.isdisjoint(east_operation_ids)
+    assert _json_result(sd_svc._get_namespace({"Id": east_namespace_id}))[0] == 404
+    assert _json_result(sd_svc._get_service({"Id": east_service_id}))[0] == 404
+    assert _json_result(
+        sd_svc._get_instance(
+            {"ServiceId": east_service_id, "InstanceId": "shared-instance"}
+        )
+    )[0] == 404
+
+    set_request_region("us-east-1")
+    assert _json_result(sd_svc._list_namespaces({}))[2]["Namespaces"] == [
+        sd_svc._namespaces[east_namespace_id]
+    ]
+    assert _json_result(
+        asyncio.run(sd_svc._create_namespace({"Name": namespace_name}))
+    )[0] == 409
+
+
+def test_servicediscovery_legacy_children_follow_parent_service_region():
+    from ministack.core.responses import AccountScopedDict
+
+    account_id = "000000000000"
+    region = "us-west-2"
+    namespace_id = "ns-legacy"
+    service_id = "srv-legacy"
+    operation_id = "op-legacy"
+    namespace_arn = (
+        f"arn:aws:servicediscovery:{region}:{account_id}:namespace/{namespace_id}"
+    )
+    service_arn = (
+        f"arn:aws:servicediscovery:{region}:{account_id}:service/{service_id}"
+    )
+
+    def legacy_store(key, value):
+        store = AccountScopedDict()
+        store.set_scoped(account_id, "ignored", key, value)
+        return store
+
+    sd_svc.load_persisted_state(
+        {
+            "namespaces": legacy_store(
+                namespace_id,
+                {"Id": namespace_id, "Arn": namespace_arn, "Name": "legacy.local"},
+            ),
+            "services": legacy_store(
+                service_id,
+                {
+                    "Id": service_id,
+                    "Arn": service_arn,
+                    "Name": "legacy-service",
+                    "NamespaceId": namespace_id,
+                },
+            ),
+            "instances": legacy_store(
+                service_id, {"instance-1": {"Id": "instance-1"}}
+            ),
+            "operations": legacy_store(
+                operation_id,
+                {
+                    "Id": operation_id,
+                    "Targets": {"SERVICE": service_id},
+                    "Status": "SUCCESS",
+                },
+            ),
+            "resource_tags": legacy_store(
+                service_arn, [{"Key": "legacy", "Value": "true"}]
+            ),
+            "service_attributes": legacy_store(service_id, {"team": "legacy"}),
+            "instance_health_status": legacy_store(
+                service_id, {"instance-1": "HEALTHY"}
+            ),
+            "instances_revision": legacy_store(service_id, 7),
+        }
+    )
+
+    for store in (
+        sd_svc._services,
+        sd_svc._instances,
+        sd_svc._service_attributes,
+        sd_svc._instance_health_status,
+        sd_svc._instances_revision,
+    ):
+        assert store.get_scoped(account_id, region, service_id) is not None
+        assert store.get_scoped(account_id, "us-east-1", service_id) is None
+    assert sd_svc._namespaces.get_scoped(account_id, region, namespace_id) is not None
+    assert sd_svc._operations.get_scoped(account_id, region, operation_id) is not None
+    assert sd_svc._resource_tags.get_scoped(account_id, "ignored", service_arn) == [
+        {"Key": "legacy", "Value": "true"}
+    ]
+
+
+def test_servicediscovery_reset_clears_all_regions():
+    from ministack.core.responses import set_request_region
+
+    regional_stores = (
+        sd_svc._namespaces,
+        sd_svc._services,
+        sd_svc._instances,
+        sd_svc._operations,
+        sd_svc._service_attributes,
+        sd_svc._instance_health_status,
+        sd_svc._instances_revision,
+    )
+    for region in ("us-east-1", "us-west-2"):
+        set_request_region(region)
+        for store in regional_stores:
+            store[f"key-{region}"] = {}
+        sd_svc._resource_tags[
+            f"arn:aws:servicediscovery:{region}:000000000000:service/key-{region}"
+        ] = []
+
+    sd_svc.reset()
+
+    assert all(not store.has_any() for store in regional_stores)
+    assert sd_svc._resource_tags._data == {}
