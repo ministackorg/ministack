@@ -702,6 +702,70 @@ def _lambda_delete(physical_id, props):
     _lambda_svc._functions.pop(physical_id, None)
 
 
+def _lambda_url_target(props):
+    func, func_name, _resource_arn, target_qualifier = _lambda_function_for_cfn_ref(
+        props.get("TargetFunctionArn", "")
+    )
+    qualifier = props.get("Qualifier") or target_qualifier
+    return func, func_name, qualifier
+
+
+def _lambda_url_config_data(props):
+    data = {
+        "AuthType": props.get("AuthType", "NONE"),
+        "InvokeMode": props.get("InvokeMode", "BUFFERED"),
+    }
+    if "Cors" in props:
+        data["Cors"] = props["Cors"]
+    return data
+
+
+def _lambda_url_attributes(config):
+    return {
+        "FunctionArn": config["FunctionArn"],
+        "FunctionUrl": config["FunctionUrl"],
+    }
+
+
+def _lambda_url_create(logical_id, props, stack_name):
+    func, func_name, qualifier = _lambda_url_target(props)
+    if not func:
+        raise ValueError(f"Lambda function not found: {props.get('TargetFunctionArn', '')}")
+    status, _headers, body = _lambda_svc._create_function_url_config(
+        func_name, _lambda_url_config_data(props), qualifier,
+    )
+    if status >= 400:
+        raise ValueError(f"AWS::Lambda::Url create failed: {body!r}")
+    config = json.loads(body)
+    resource_name = _lambda_svc._url_config_key(func_name, qualifier)
+    return resource_name, _lambda_url_attributes(config)
+
+
+def _lambda_url_update(physical_id, old_props, new_props, stack_name):
+    if any(
+        new_props.get(key) != old_props.get(key)
+        for key in ("TargetFunctionArn", "Qualifier")
+    ):
+        new_id, attrs = _lambda_url_create(physical_id, new_props, stack_name)
+        _lambda_url_delete(physical_id, old_props)
+        return new_id, attrs
+
+    _func, func_name, qualifier = _lambda_url_target(new_props)
+    data = _lambda_url_config_data(new_props)
+    if "Cors" not in new_props and "Cors" in old_props:
+        data["Cors"] = {}
+    status, _headers, body = _lambda_svc._update_function_url_config(
+        func_name, data, qualifier,
+    )
+    if status >= 400:
+        raise ValueError(f"AWS::Lambda::Url update failed: {body!r}")
+    return physical_id, _lambda_url_attributes(json.loads(body))
+
+
+def _lambda_url_delete(physical_id, props):
+    _lambda_svc._function_urls.pop(physical_id, None)
+
+
 # --- IAM Role ---
 
 def _iam_role_create(logical_id, props, stack_name):
@@ -2335,6 +2399,27 @@ def _apigw_documentation_part_delete(physical_id, props):
     # Keep rollback and parent-first cleanup idempotent.
     if physical_id in parts:
         _apigw_v1._delete_documentation_part(api_id, physical_id)
+
+
+# --- API Gateway DocumentationVersion ---
+
+def _apigw_documentation_version_identity(props):
+    return f"{props.get('RestApiId', '')}/{props.get('DocumentationVersion', '')}"
+
+
+def _apigw_documentation_version_create(logical_id, props, stack_name):
+    # Documentation snapshots do not affect MiniStack's permissive local API
+    # request handling. A native CFN identity is sufficient for templates and
+    # dependent resources to complete their lifecycle.
+    return _apigw_documentation_version_identity(props), {}
+
+
+def _apigw_documentation_version_update(physical_id, old_props, new_props, stack_name):
+    return _apigw_documentation_version_identity(new_props), {}
+
+
+def _apigw_documentation_version_delete(physical_id, props):
+    pass
 
 
 # --- Lambda EventSourceMapping ---
@@ -5056,6 +5141,11 @@ _RESOURCE_HANDLERS = {
     # before delegating to the Table engine.
     "AWS::DynamoDB::GlobalTable": {"create": _ddb_global_table_create, "delete": _ddb_global_table_delete},
     "AWS::Lambda::Function": {"create": _lambda_create, "delete": _lambda_delete},
+    "AWS::Lambda::Url": {
+        "create": _lambda_url_create,
+        "update": _lambda_url_update,
+        "delete": _lambda_url_delete,
+    },
     "AWS::IAM::Role": {"create": _iam_role_create, "delete": _iam_role_delete},
     "AWS::IAM::Policy": {"create": _iam_policy_create, "delete": _iam_policy_delete},
     "AWS::IAM::InstanceProfile": {"create": _iam_ip_create, "delete": _iam_ip_delete},
@@ -5134,6 +5224,11 @@ _RESOURCE_HANDLERS = {
         "create": _apigw_documentation_part_create,
         "update": _apigw_documentation_part_update,
         "delete": _apigw_documentation_part_delete,
+    },
+    "AWS::ApiGateway::DocumentationVersion": {
+        "create": _apigw_documentation_version_create,
+        "update": _apigw_documentation_version_update,
+        "delete": _apigw_documentation_version_delete,
     },
     "AWS::Lambda::EventSourceMapping": {"create": _lambda_esm_create, "update": _lambda_esm_update, "delete": _lambda_esm_delete},
     "AWS::Lambda::EventInvokeConfig": {

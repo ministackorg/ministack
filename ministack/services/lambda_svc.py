@@ -6070,6 +6070,8 @@ def _update_function_url_config(func_name: str, data: dict, qualifier: str | Non
         cfg["AuthType"] = data["AuthType"]
     if "Cors" in data:
         cfg["Cors"] = data["Cors"]
+    if "InvokeMode" in data:
+        cfg["InvokeMode"] = data["InvokeMode"]
     cfg["LastModifiedTime"] = _now_iso()
     return json_response(cfg)
 

@@ -31,6 +31,8 @@ SERVICE_STATE_FORMAT_VERSIONS = {
     "autoscaling": 3,
     "athena": 3,
     "inspector2": 3,
+    "efs": 3,
+    "s3files": 3,
     "batch": 3,
     "ecs": 3,
     "resource_groups": 3,
