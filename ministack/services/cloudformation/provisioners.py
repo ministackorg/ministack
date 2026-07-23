@@ -4620,6 +4620,38 @@ def _waf_web_acl_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
+# CloudFront Origin Access Identity
+# ---------------------------------------------------------------------------
+
+def _cf_oai_attributes(oai_id):
+    canonical_user_id = hashlib.sha256(
+        f"{get_account_id()}:{oai_id}".encode()
+    ).hexdigest()
+    return {"Id": oai_id, "S3CanonicalUserId": canonical_user_id}
+
+
+def _cf_oai_create(logical_id, props, stack_name):
+    config = props.get("CloudFrontOriginAccessIdentityConfig")
+    if not isinstance(config, dict):
+        raise ValueError(
+            "AWS::CloudFront::CloudFrontOriginAccessIdentity requires "
+            "CloudFrontOriginAccessIdentityConfig"
+        )
+    oai_id = _cf._dist_id()
+    return oai_id, _cf_oai_attributes(oai_id)
+
+
+def _cf_oai_update(physical_id, old_props, new_props, stack_name):
+    # Comment is mutable but local CloudFront/S3 access remains permissive, so
+    # retaining the identity is the only state required for an in-place update.
+    return physical_id, _cf_oai_attributes(physical_id)
+
+
+def _cf_oai_delete(physical_id, props):
+    pass
+
+
+# ---------------------------------------------------------------------------
 # CloudFront Distribution
 # ---------------------------------------------------------------------------
 
@@ -5314,6 +5346,11 @@ _RESOURCE_HANDLERS = {
     "AWS::ApiGatewayV2::Authorizer": {"create": _apigw_v2_authorizer_create, "delete": _apigw_v2_authorizer_delete},
     "AWS::SES::EmailIdentity": {"create": _ses_email_identity_create, "delete": _ses_email_identity_delete},
     "AWS::WAFv2::WebACL": {"create": _waf_web_acl_create, "delete": _waf_web_acl_delete},
+    "AWS::CloudFront::CloudFrontOriginAccessIdentity": {
+        "create": _cf_oai_create,
+        "update": _cf_oai_update,
+        "delete": _cf_oai_delete,
+    },
     "AWS::CloudFront::Distribution": {"create": _cf_distribution_create, "delete": _cf_distribution_delete},
     "AWS::CloudFront::KeyValueStore": {"create": _cf_kvs_create, "update": _cf_kvs_update, "delete": _cf_kvs_delete},
     "AWS::CloudWatch::Alarm": {"create": _cw_metric_alarm_create, "delete": _cw_metric_alarm_delete},
