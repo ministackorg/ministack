@@ -971,6 +971,61 @@ def test_apigw_query_params_and_headers_in_event(apigw, lam):
         lam.delete_function(FunctionName=fname)
 
 
+def test_apigw_v2_event_omits_null_fields_when_absent(apigw, lam):
+    """Real AWS omits queryStringParameters/body from the v2 proxy event
+    entirely when there is no query string / no request body, rather than
+    including the key with a null value. Strict event-shape validators (e.g.
+    AWS Lambda Powertools' isAPIGatewayProxyEventV2) accept `undefined`
+    (Python: key absent) or a proper value, but reject `null` — a
+    present-but-null key broke every bodyless/querystring-less request
+    against such a validator, even though the invocation itself succeeded.
+
+    dict.get() can't distinguish an absent key from one explicitly set to
+    None, so this checks for key presence via `in` rather than the value.
+    """
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-nullfields-{_uuid.uuid4().hex[:8]}"
+    code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200, 'body': json.dumps({\n"
+        "        'hasQs': 'queryStringParameters' in event,\n"
+        "        'hasBody': 'body' in event,\n"
+        "    })}\n"
+    )
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+    api_id = apigw.create_api(Name=f"nullfields-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="GET /nofields", Target=f"integrations/{int_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    try:
+        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/nofields"
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        resp = _urlreq.urlopen(req)
+        assert resp.status == 200
+        body = json.loads(resp.read())
+        assert body["hasQs"] is False
+        assert body["hasBody"] is False
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+
+
 def test_apigw_raw_query_string_percent_encoded(apigw, lam):
     """rawQueryString must stay percent-encoded like AWS: a space in a value comes
     back as %20, not a literal space (which breaks lambda_http / http::Uri) — #1035."""
