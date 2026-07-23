@@ -28,10 +28,13 @@ STATE_DIR = os.environ.get("STATE_DIR", "/tmp/ministack-state")
 STATE_FORMAT_VERSION = 2
 SERVICE_STATE_FORMAT_VERSIONS = {
     "autoscaling": 3,
+    "athena": 3,
     "batch": 3,
     "ecs": 3,
     "resource_groups": 3,
     "codebuild": 3,
+    "mq": 3,
+    "servicediscovery": 3,
     "ses": 3,
     "ses_v2": 3,
 }
