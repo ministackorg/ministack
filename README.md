@@ -1360,6 +1360,7 @@ See [`Testcontainers/java-testcontainers`](Testcontainers/java-testcontainers), 
 
 | Project | Description |
 |---------|-------------|
+| [**OpenArchFlow**](https://github.com/dmux/OpenArchFlow) | Open-source Progressive Web App for generating interactive AWS architecture diagrams from natural language descriptions using AI, LLMs, AI Agents, and AWS MCP. |
 | [**StackPort**](https://github.com/DaviReisVieira/stackport) | **Web UI** — visual dashboard to browse and inspect AWS resources in MiniStack. Available on [PyPI](https://pypi.org/project/stackport/) and [Docker Hub](https://hub.docker.com/r/davireis/stackport). |
 | [**McDoit.Aspire.Hosting.Ministack**](https://github.com/McDoit/aspire-hosting-ministack) | .NET Aspire hosting integration for MiniStack. |
 
