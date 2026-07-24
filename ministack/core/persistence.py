@@ -39,6 +39,7 @@ SERVICE_STATE_FORMAT_VERSIONS = {
     "resource_groups": 3,
     "codebuild": 3,
     "mq": 3,
+    "mwaa": 3,
     "servicediscovery": 3,
     "ses": 3,
     "ses_v2": 3,
