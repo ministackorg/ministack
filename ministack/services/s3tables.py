@@ -522,7 +522,10 @@ def _iceberg_commit_table(namespace, table_name, data, allow_cross_region):
                     metadata["last-column-id"] = max(metadata.get("last-column-id", 0), max(field_ids))
             elif action == "set-current-schema":
                 metadata["current-schema-id"] = update.get("schema-id", 0)
-            elif action == "add-partition-spec":
+            elif action in ("add-spec", "add-partition-spec"):
+                # The Iceberg REST spec's real wire name is "add-spec" (what
+                # spec-compliant clients like duckdb-iceberg send); "add-partition-spec"
+                # is accepted too for callers still using the non-standard name.
                 metadata.setdefault("partition-specs", []).append(update.get("spec", {}))
             elif action == "set-default-spec":
                 metadata["default-spec-id"] = update.get("spec-id", 0)

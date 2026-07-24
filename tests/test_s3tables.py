@@ -696,3 +696,49 @@ def test_s3tables_iceberg_add_schema_advances_last_column_id(s3tables):
         except Exception:
             pass
         s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
+
+
+def test_s3tables_iceberg_add_spec_uses_real_wire_action_name(s3tables):
+    """The Iceberg REST spec's real action name for adding a partition spec is
+    "add-spec" (what duckdb-iceberg actually sends) — not "add-partition-spec",
+    a non-standard name only some hand-rolled callers use. Both must work."""
+    bucket_name = f"tb-spec-{_uuid_mod.uuid4().hex[:6]}"
+    bucket_arn = s3tables.create_table_bucket(name=bucket_name)["arn"]
+    ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
+    table = f"t_{_uuid_mod.uuid4().hex[:6]}"
+    try:
+        s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
+        s3tables.create_table(tableBucketARN=bucket_arn, namespace=ns, name=table, format="ICEBERG")
+
+        _iceberg_json(
+            f"/iceberg/v1/namespaces/{ns}/tables/{table}",
+            method="POST",
+            payload={
+                "requirements": [],
+                "updates": [
+                    {
+                        "action": "add-spec",
+                        "spec": {
+                            "spec-id": 1,
+                            "fields": [{"source-id": 1, "field-id": 1000, "name": "day_col", "transform": "day"}],
+                        },
+                    },
+                    {"action": "set-default-spec", "spec-id": 1},
+                ],
+            },
+        )
+        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        metadata = loaded["metadata"]
+        spec_ids = [s["spec-id"] for s in metadata["partition-specs"]]
+        assert 1 in spec_ids, "add-spec must append the new partition spec"
+        assert metadata["default-spec-id"] == 1
+    finally:
+        try:
+            s3tables.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=table)
+        except Exception:
+            pass
+        try:
+            s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
+        except Exception:
+            pass
+        s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
