@@ -48,10 +48,19 @@ jobs:
             (`Dockerfile`, `.dockerignore`, or files under `.github/`). A maintainer
             will review and build the preview image manually before it is published.
 
+      # checkout@v6 now refuses fork-PR checkouts from pull_request_target
+      # unless explicitly allowed, which has failed this job for every fork PR
+      # since 2026-07-20. Checking out the PR head is intentional here: the
+      # guard above keeps PRs that touch the build/CI surface from reaching
+      # this step, and the build passes no secrets (only MINISTACK_VERSION as
+      # a build-arg). persist-credentials is disabled so the untrusted tree
+      # never holds the repo token — no later step needs git credentials.
       - uses: actions/checkout@v6
         if: steps.guard.outputs.skip != 'true'
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+          allow-unsafe-pr-checkout: true
+          persist-credentials: false
 
       - name: Get short SHA
         id: short_sha

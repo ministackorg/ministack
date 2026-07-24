@@ -34,6 +34,7 @@ from datetime import datetime, timedelta, timezone
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -93,26 +94,26 @@ def _coerce_timestamp(value):
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 
-# Per-account bus registry. The "default" bus is lazily created per account
-# on first access so every tenant has its own default bus with an ARN whose
-# account-id segment matches the caller.
-_event_buses = AccountScopedDict()
-_rules = AccountScopedDict()
-_targets = AccountScopedDict()
-# Per-account event log — AccountScopedDict under "entries" keeps the list
-# semantics while scoping reads to the caller's account.
-_events_log = AccountScopedDict()
-_tags = AccountScopedDict()
-_archives = AccountScopedDict()
-_event_bus_policies = AccountScopedDict()  # bus_name -> {Statement: [...]}
-_connections = AccountScopedDict()         # connection_name -> {...}
-_api_destinations = AccountScopedDict()    # destination_name -> {...}
-_replays = AccountScopedDict()              # replay_name -> replay record
-_endpoints = AccountScopedDict()            # endpoint name -> endpoint record
-# Partner event sources, per-account (key: "account|name" pattern inside each tenant).
-_partner_event_sources = AccountScopedDict()
+# Per-account and per-region registries. The "default" bus is lazily created
+# per account/region on first access so every tenant has its own default bus
+# with ARN account-id and region segments matching the caller.
+_event_buses = AccountRegionScopedDict()
+_rules = AccountRegionScopedDict()
+_targets = AccountRegionScopedDict()
+# AccountRegionScopedDict under "entries" keeps list semantics while scoping
+# reads to the caller's account and region.
+_events_log = AccountRegionScopedDict()
+_tags = AccountRegionScopedDict()
+_archives = AccountRegionScopedDict()
+_event_bus_policies = AccountRegionScopedDict()  # bus_name -> {Statement: [...]}
+_connections = AccountRegionScopedDict()         # connection_name -> {...}
+_api_destinations = AccountRegionScopedDict()    # destination_name -> {...}
+_replays = AccountRegionScopedDict()             # replay_name -> replay record
+_endpoints = AccountRegionScopedDict()           # endpoint name -> endpoint record
+# Partner event sources, per-account/region (key: "account|name" pattern inside each tenant).
+_partner_event_sources = AccountRegionScopedDict()
 
-# Tracks when each scheduled rule last fired: {(account_id, rule_key): timestamp}.
+# Tracks when each scheduled rule last fired: {(account_id, region, rule_key): timestamp}.
 # Plain dict (not AccountScopedDict) because the scheduler thread owns it globally.
 _rule_last_fired: dict = {}
 
@@ -159,7 +160,7 @@ def restore_state(data):
     if data:
         _event_buses.update(data.get("buses", {}))
         _rules.update(data.get("rules", {}))
-        _targets.update(data.get("targets", {}))
+        _restore_targets_store(data.get("targets", {}))
         _tags.update(data.get("tags", {}))
         _archives.update(data.get("archives", {}))
         _replays.update(data.get("replays", {}))
@@ -172,17 +173,17 @@ def restore_state(data):
             _partner_event_sources.clear()
             _partner_event_sources.update(pe)
 
-        for bus in _event_buses.values():
+        for bus in _event_buses.all_values():
             if "CreationTime" in bus:
                 bus["CreationTime"] = _coerce_timestamp(bus["CreationTime"])
             if "LastModifiedTime" in bus:
                 bus["LastModifiedTime"] = _coerce_timestamp(bus["LastModifiedTime"])
 
-        for rule in _rules.values():
+        for rule in _rules.all_values():
             if "CreationTime" in rule:
                 rule["CreationTime"] = _coerce_timestamp(rule["CreationTime"])
 
-        for rep in _replays.values():
+        for rep in _replays.all_values():
             for tk in ("ReplayStartTime", "ReplayEndTime", "EventStartTime", "EventEndTime"):
                 if tk in rep and rep[tk] is not None:
                     rep[tk] = _coerce_timestamp(rep[tk])
@@ -193,6 +194,61 @@ def restore_state(data):
             if rep.get("State") in ("STARTING", "RUNNING"):
                 rep["State"] = "FAILED"
                 rep["ReplayEndTime"] = _now_ts()
+
+
+def _events_record_scope(record: dict | None, default_account_id: str | None = None) -> tuple[str, str]:
+    if isinstance(record, dict):
+        for key in (
+            "Arn",
+            "ArchiveArn",
+            "ReplayArn",
+            "ConnectionArn",
+            "ApiDestinationArn",
+            "EventSourceArn",
+        ):
+            arn = record.get(key)
+            if not isinstance(arn, str) or not arn.startswith("arn:"):
+                continue
+            try:
+                spec = parse_arn(arn)
+            except ArnParseError:
+                continue
+            if spec.service == "events":
+                return spec.account_id or default_account_id or get_account_id(), spec.region or get_region()
+    return default_account_id or get_account_id(), get_region()
+
+
+def _rule_scope(rule_key: str, default_account_id: str | None = None) -> tuple[str, str]:
+    for (account_id, region, key), rule in _rules.all_items():
+        if key != rule_key:
+            continue
+        if default_account_id is not None and account_id != default_account_id:
+            continue
+        scoped_account_id, scoped_region = _events_record_scope(rule, account_id)
+        return scoped_account_id, scoped_region
+    return default_account_id or get_account_id(), get_region()
+
+
+def _restore_targets_store(data) -> None:
+    if isinstance(data, AccountRegionScopedDict):
+        _targets.update(data)
+        return
+    if isinstance(data, AccountScopedDict):
+        for (account_id, rule_key), targets in data._data.items():
+            scoped_account_id, region = _rule_scope(rule_key, account_id)
+            _targets.set_scoped(scoped_account_id, region, rule_key, copy.deepcopy(targets))
+        return
+    if isinstance(data, dict):
+        for key, targets in data.items():
+            if isinstance(key, tuple) and len(key) == 3:
+                account_id, region, rule_key = key
+            elif isinstance(key, tuple) and len(key) == 2:
+                account_id, rule_key = key
+                account_id, region = _rule_scope(rule_key, account_id)
+            else:
+                rule_key = key
+                account_id, region = _rule_scope(rule_key)
+            _targets.set_scoped(account_id, region, rule_key, copy.deepcopy(targets))
 
 
 try:
@@ -1139,7 +1195,16 @@ def _invoke_target(target, event, rule):
         elif spec.service == "states":
             _dispatch_to_stepfunctions(arn, event_payload)
         elif not _target_matches_request_scope(spec):
-            logger.warning("EventBridge: target %s is outside the current account/region scope", arn)
+            # AWS parity: EventBridge accepts cross-region SNS/SQS targets at PutTargets, then records a
+            # FailedInvocations delivery failure without cross-region delivery. MiniStack does not model
+            # that metric or DLQs, so the faithful observable outcome is to accept the target and drop
+            # the invocation here. Confirmed against AWS on 2026-07-13; see
+            # RESEARCH/MINISTACK_CROSSREGION_SNS_TARGET_POLICY.md.
+            logger.warning(
+                "EventBridge: target %s not delivered: cross-region invocation failed "
+                "(FailedInvocation-equivalent)",
+                arn,
+            )
         elif spec.service == "lambda":
             _dispatch_to_lambda(arn, event_payload)
         elif spec.service == "sqs":
@@ -1153,6 +1218,7 @@ def _invoke_target(target, event, rule):
 
 
 def _target_matches_request_scope(spec) -> bool:
+    # Cross-region targets are accepted at PutTargets but fail delivery here for AWS parity.
     return spec.account_id == get_account_id() and spec.region == get_region()
 
 
@@ -1553,18 +1619,28 @@ def _start_replay(data):
         "ReplayStartTime": now,
     }
     _replays[name] = replay
+    replay_account_id = get_account_id()
+    replay_region = get_region()
 
     def _run():
-        replay["State"] = "RUNNING"
-        for event in list(archive.get("Events", [])):
-            ts = event.get("Time", 0)
-            if not (event_start <= ts <= event_end):
-                continue
-            replayed = dict(event)
-            replayed["EventBusName"] = dest_bus_name
-            _dispatch_event(replayed)
-        replay["State"] = "COMPLETED"
-        replay["ReplayEndTime"] = _now_ts()
+        previous_account = get_account_id()
+        previous_region = get_region()
+        set_request_account_id(replay_account_id)
+        set_request_region(replay_region)
+        try:
+            replay["State"] = "RUNNING"
+            for event in list(archive.get("Events", [])):
+                ts = event.get("Time", 0)
+                if not (event_start <= ts <= event_end):
+                    continue
+                replayed = dict(event)
+                replayed["EventBusName"] = dest_bus_name
+                _dispatch_event(replayed)
+            replay["State"] = "COMPLETED"
+            replay["ReplayEndTime"] = _now_ts()
+        finally:
+            set_request_account_id(previous_account)
+            set_request_region(previous_region)
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
@@ -2382,13 +2458,13 @@ def _tick_scheduled_rules():
     """Fire any enabled scheduled rule whose interval has elapsed."""
     now = _now_ts()
     now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
-    # Iterate _rules._data directly so we see every account, not just the
-    # ContextVar default.  Keys are (account_id, rule_key) tuples.
-    for (account_id, rule_key), rule in list(_rules._data.items()):
+    # Iterate _rules._data directly so we see every account/region, not just
+    # the ContextVar default. Keys are (account_id, region, rule_key) tuples.
+    for (account_id, region, rule_key), rule in list(_rules._data.items()):
         if rule.get("State") != "ENABLED":
             continue
         schedule = rule.get("ScheduleExpression", "")
-        state_key = (account_id, rule_key)
+        state_key = (account_id, region, rule_key)
 
         interval = _parse_rate_seconds(schedule)
         if interval is not None:
@@ -2416,7 +2492,7 @@ def _tick_scheduled_rules():
                 continue
 
         _rule_last_fired[state_key] = now
-        targets = _targets._data.get((account_id, rule_key), [])
+        targets = _targets._data.get((account_id, region, rule_key), [])
         if not targets:
             continue
         try:
@@ -2432,6 +2508,7 @@ def _tick_scheduled_rules():
             rule_arn.service != "events"
             or not rule_arn.region
             or rule_arn.account_id != account_id
+            or rule_arn.region != region
             or not rule_arn.resource.startswith("rule/")
         ):
             logger.warning(
@@ -2443,7 +2520,7 @@ def _tick_scheduled_rules():
         previous_account = get_account_id()
         previous_region = get_region()
         set_request_account_id(account_id)
-        set_request_region(rule_arn.region)
+        set_request_region(region)
         try:
             event = {
                 "EventId": new_uuid(),

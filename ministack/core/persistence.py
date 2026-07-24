@@ -17,13 +17,36 @@ logger = logging.getLogger("persistence")
 PERSIST_STATE = os.environ.get("PERSIST_STATE", "0") == "1"
 STATE_DIR = os.environ.get("STATE_DIR", "/tmp/ministack-state")
 
-# On-disk state format version. Files are wrapped as
+# On-disk state format versions. Files are wrapped as
 #   {"__ministack_format__": N, "payload": <service state>}
 # load_state refuses a file whose version is NEWER than this binary understands
-# rather than mis-parsing it (the downgrade-corruption guard). Version 2
-# introduced region-scoped (AccountRegionScopedDict) stores; legacy unwrapped
-# files (implicit v1, account-scoped) still load and migrate. (U4)
+# rather than mis-parsing it (the downgrade-corruption guard). Version 2 is the
+# default and introduced region-scoped (AccountRegionScopedDict) stores.
+# Services regionalized after v2 use version 3 so a v2 rollback refuses their
+# incompatible snapshots. Legacy unwrapped files (implicit v1, account-scoped)
+# still load and migrate. (U4)
 STATE_FORMAT_VERSION = 2
+SERVICE_STATE_FORMAT_VERSIONS = {
+    "appsync": 3,
+    "autoscaling": 3,
+    "athena": 3,
+    "emr": 3,
+    "inspector2": 3,
+    "efs": 3,
+    "s3files": 3,
+    "batch": 3,
+    "ecs": 3,
+    "resource_groups": 3,
+    "codebuild": 3,
+    "mq": 3,
+    "servicediscovery": 3,
+    "ses": 3,
+    "ses_v2": 3,
+}
+
+
+def _state_format_version(service: str) -> int:
+    return SERVICE_STATE_FORMAT_VERSIONS.get(service, STATE_FORMAT_VERSION)
 
 
 def _json_default(obj):
@@ -95,7 +118,7 @@ def save_state(service: str, data: dict) -> None:
         try:
             with open(tmp, "w") as f:
                 json.dump(
-                    {"__ministack_format__": STATE_FORMAT_VERSION, "payload": data},
+                    {"__ministack_format__": _state_format_version(service), "payload": data},
                     f, default=_json_default,
                 )
             os.replace(tmp, path)
@@ -126,11 +149,12 @@ def load_state(service: str) -> dict | None:
         # it would corrupt state on downgrade. (U4)
         if isinstance(data, dict) and "__ministack_format__" in data:
             version = data.get("__ministack_format__")
-            if isinstance(version, int) and version > STATE_FORMAT_VERSION:
+            supported_version = _state_format_version(service)
+            if isinstance(version, int) and version > supported_version:
                 logger.error(
                     "Persistence: %s state is format v%s but this MiniStack only "
                     "understands v%s — refusing to load (downgrade not supported)",
-                    service, version, STATE_FORMAT_VERSION,
+                    service, version, supported_version,
                 )
                 return None
             data = data.get("payload")

@@ -12,6 +12,7 @@ import xml.etree.ElementTree as ET
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -25,15 +26,16 @@ logger = logging.getLogger("servicediscovery")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-# In-memory state
-_namespaces = AccountScopedDict()     # ns_id -> namespace dict
-_services = AccountScopedDict()       # svc_id -> service dict
-_instances = AccountScopedDict()      # svc_id -> {instance_id -> instance dict}
-_operations = AccountScopedDict()     # op_id -> operation dict
-_resource_tags = AccountScopedDict()  # resource_arn -> [{"Key": ..., "Value": ...}]
-_service_attributes = AccountScopedDict()      # svc_id -> {key: value}
-_instance_health_status = AccountScopedDict()  # svc_id -> {instance_id: status}
-_instances_revision = AccountScopedDict()      # svc_id -> int
+# In-memory state. Resource and child stores are regional. ARN-keyed tags stay
+# account-scoped because the resource ARN already includes its region.
+_namespaces = AccountRegionScopedDict()     # ns_id -> namespace dict
+_services = AccountRegionScopedDict()       # svc_id -> service dict
+_instances = AccountRegionScopedDict()      # svc_id -> {instance_id -> instance dict}
+_operations = AccountRegionScopedDict()     # op_id -> operation dict
+_resource_tags = AccountScopedDict()        # resource_arn -> [{"Key": ..., "Value": ...}]
+_service_attributes = AccountRegionScopedDict()      # svc_id -> {key: value}
+_instance_health_status = AccountRegionScopedDict()  # svc_id -> {instance_id: status}
+_instances_revision = AccountRegionScopedDict()      # svc_id -> int
 
 
 def get_state():
@@ -49,17 +51,65 @@ def get_state():
     }
 
 
+def _restore_regional_store(target, saved, region_for_value=None):
+    if isinstance(saved, AccountRegionScopedDict):
+        target.update(saved)
+        return
+
+    if isinstance(saved, AccountScopedDict):
+        saved_items = saved._data.items()
+    else:
+        account_id = get_account_id()
+        saved_items = (((account_id, key), value) for key, value in saved.items())
+
+    for (account_id, key), value in saved_items:
+        region = region_for_value(account_id, key, value) if region_for_value else None
+        region = region or target._region_for_legacy_value(key, value)
+        target.set_scoped(account_id, region, key, value)
+
+
 def load_persisted_state(data):
     if not data:
         return
     _namespaces.update(data.get("namespaces", {}))
     _services.update(data.get("services", {}))
-    _instances.update(data.get("instances", {}))
-    _operations.update(data.get("operations", {}))
+
+    namespace_regions = {
+        (account_id, namespace_id): region
+        for (account_id, region, namespace_id), _namespace in _namespaces.all_items()
+    }
+    service_regions = {
+        (account_id, service_id): region
+        for (account_id, region, service_id), _service in _services.all_items()
+    }
+
+    def service_region(account_id, service_id, _value):
+        return service_regions.get((account_id, service_id))
+
+    def operation_region(account_id, _operation_id, operation):
+        targets = operation.get("Targets", {})
+        service_id = targets.get("SERVICE")
+        namespace_id = targets.get("NAMESPACE")
+        return service_regions.get((account_id, service_id)) or namespace_regions.get(
+            (account_id, namespace_id)
+        )
+
+    # Legacy child records have no ARN of their own. Keep them beside their
+    # migrated parent service instead of assigning them to the boot region.
+    _restore_regional_store(_instances, data.get("instances", {}), service_region)
+    _restore_regional_store(_operations, data.get("operations", {}), operation_region)
     _resource_tags.update(data.get("resource_tags", {}))
-    _service_attributes.update(data.get("service_attributes", {}))
-    _instance_health_status.update(data.get("instance_health_status", {}))
-    _instances_revision.update(data.get("instances_revision", {}))
+    _restore_regional_store(
+        _service_attributes, data.get("service_attributes", {}), service_region
+    )
+    _restore_regional_store(
+        _instance_health_status,
+        data.get("instance_health_status", {}),
+        service_region,
+    )
+    _restore_regional_store(
+        _instances_revision, data.get("instances_revision", {}), service_region
+    )
 
 
 def reset():

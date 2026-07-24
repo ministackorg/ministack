@@ -1,14 +1,18 @@
+import base64
 import io
 import json
 import os
+import re
 import time
+import urllib.request
 import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
 
 import pytest
-import urllib.request
 from botocore.exceptions import ClientError
+
+from ministack.services import pipes as _pipes
 
 
 def _wait_stack(cfn, name, timeout=30):
@@ -1099,6 +1103,82 @@ def test_cfn_lambda_permission(cfn, lam):
     lam.delete_function(FunctionName="cfn-perm-fn")
 
 
+def test_cfn_lambda_url_uses_function_url_state(cfn, lam):
+    """CloudFormation Lambda URLs share state with the Lambda Function URL API."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-lambda-url-{suffix}"
+    function_name = f"cfn-url-{suffix}"
+
+    def template(auth_type, invoke_mode):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "Function": {
+                    "Type": "AWS::Lambda::Function",
+                    "Properties": {
+                        "FunctionName": function_name,
+                        "Runtime": "python3.12",
+                        "Handler": "index.handler",
+                        "Role": "arn:aws:iam::000000000000:role/lambda-role",
+                        "Code": {
+                            "ZipFile": "def handler(event, context):\n    return {'statusCode': 200}\n"
+                        },
+                    },
+                },
+                "FunctionUrl": {
+                    "Type": "AWS::Lambda::Url",
+                    "Properties": {
+                        "TargetFunctionArn": {"Ref": "Function"},
+                        "AuthType": auth_type,
+                        "InvokeMode": invoke_mode,
+                        "Cors": {"AllowOrigins": ["https://example.com"]},
+                    },
+                },
+            },
+            "Outputs": {
+                "UrlRef": {"Value": {"Ref": "FunctionUrl"}},
+                "FunctionArn": {
+                    "Value": {"Fn::GetAtt": ["FunctionUrl", "FunctionArn"]}
+                },
+                "FunctionUrl": {
+                    "Value": {"Fn::GetAtt": ["FunctionUrl", "FunctionUrl"]}
+                },
+            },
+        }
+
+    cfn.create_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template("NONE", "BUFFERED")),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+    assert outputs["UrlRef"] == function_name
+    config = lam.get_function_url_config(FunctionName=function_name)
+    assert config["FunctionUrl"] == outputs["FunctionUrl"]
+    assert config["FunctionArn"] == outputs["FunctionArn"]
+    assert config["AuthType"] == "NONE"
+    assert config["InvokeMode"] == "BUFFERED"
+    original_url = config["FunctionUrl"]
+
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template("AWS_IAM", "RESPONSE_STREAM")),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    config = lam.get_function_url_config(FunctionName=function_name)
+    assert config["FunctionUrl"] == original_url
+    assert config["AuthType"] == "AWS_IAM"
+    assert config["InvokeMode"] == "RESPONSE_STREAM"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+    assert lam.list_function_url_configs(
+        FunctionName=function_name
+    )["FunctionUrlConfigs"] == []
+
+
 def test_cfn_lambda_permission_qualified_arn_uses_base_function_policy(cfn, lam):
     """Qualified FunctionName refs should add permission to the base function policy."""
     suffix = _uuid_mod.uuid4().hex[:8]
@@ -1182,6 +1262,91 @@ def test_cfn_lambda_version(cfn, lam):
     cfn.delete_stack(StackName="cfn-lambda-ver")
     _wait_stack(cfn, "cfn-lambda-ver")
     lam.delete_function(FunctionName="cfn-ver-fn")
+
+
+def test_cfn_lambda_event_invoke_config_lifecycle(cfn, lam):
+    """AWS::Lambda::EventInvokeConfig creates, updates, and deletes cleanly."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cfn-event-invoke-{suffix}"
+    stack_name = f"cfn-event-invoke-{suffix}"
+    destination = f"arn:aws:sqs:us-east-1:000000000000:failure-{suffix}"
+    code = "def handler(e,c): return {}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.11",
+        Role="arn:aws:iam::000000000000:role/r",
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+
+    def template(retries, event_age):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "InvokeConfig": {
+                    "Type": "AWS::Lambda::EventInvokeConfig",
+                    "Properties": {
+                        "FunctionName": fn,
+                        "Qualifier": "$LATEST",
+                        "MaximumRetryAttempts": retries,
+                        "MaximumEventAgeInSeconds": event_age,
+                        "DestinationConfig": {
+                            "OnFailure": {"Destination": destination},
+                        },
+                    },
+                },
+            },
+            "Outputs": {
+                "InvokeConfigId": {"Value": {"Ref": "InvokeConfig"}},
+            },
+        }
+
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template(1, 300)),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert stack["Outputs"][0]["OutputValue"] == f"{fn}:$LATEST"
+
+        config = lam.get_function_event_invoke_config(
+            FunctionName=fn, Qualifier="$LATEST"
+        )
+        assert config["FunctionArn"].endswith(f":function:{fn}:$LATEST")
+        assert config["MaximumRetryAttempts"] == 1
+        assert config["MaximumEventAgeInSeconds"] == 300
+        assert config["DestinationConfig"]["OnFailure"]["Destination"] == destination
+
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template(0, 120)),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        updated = lam.get_function_event_invoke_config(
+            FunctionName=fn, Qualifier="$LATEST"
+        )
+        assert updated["MaximumRetryAttempts"] == 0
+        assert updated["MaximumEventAgeInSeconds"] == 120
+
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        with pytest.raises(ClientError) as exc:
+            lam.get_function_event_invoke_config(
+                FunctionName=fn, Qualifier="$LATEST"
+            )
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        except Exception:
+            pass
+        lam.delete_function(FunctionName=fn)
 
 
 def test_cfn_esm_filter_criteria_round_trips(cfn, lam, ddb):
@@ -1700,7 +1865,9 @@ def test_cfn_cdk_bootstrap_resources(cfn, s3, ecr):
         },
     }
     cfn.create_stack(StackName="CDKToolkit-v44", TemplateBody=json.dumps(template))
-    import time as _t; _t.sleep(2)
+    import time as _t
+
+    _t.sleep(2)
     stack = cfn.describe_stacks(StackName="CDKToolkit-v44")["Stacks"][0]
     assert stack["StackStatus"] == "CREATE_COMPLETE"
 
@@ -1747,6 +1914,135 @@ def test_cfn_ec2_launch_template(cfn, ec2):
 
     desc2 = ec2.describe_launch_templates(LaunchTemplateIds=[lt_id])
     assert len(desc2["LaunchTemplates"]) == 0
+
+
+def test_cfn_appsync_function_configuration_attributes(cfn, appsync):
+    """AppSync pipeline functions expose the identities consumed by resolvers."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-appsync-function-{suffix}"
+    api_id = appsync.create_graphql_api(
+        name=f"pipeline-api-{suffix}",
+        authenticationType="API_KEY",
+    )["graphqlApi"]["apiId"]
+    appsync.create_data_source(
+        apiId=api_id,
+        name="NoneSource",
+        type="NONE",
+    )
+
+    def template(function_name):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "PipelineFunction": {
+                    "Type": "AWS::AppSync::FunctionConfiguration",
+                    "Properties": {
+                        "ApiId": api_id,
+                        "DataSourceName": "NoneSource",
+                        "Name": function_name,
+                        "FunctionVersion": "2018-05-29",
+                        "RequestMappingTemplate": "{}",
+                        "ResponseMappingTemplate": "$util.toJson($ctx.result)",
+                    },
+                },
+            },
+            "Outputs": {
+                "RefArn": {"Value": {"Ref": "PipelineFunction"}},
+                "FunctionArn": {
+                    "Value": {"Fn::GetAtt": ["PipelineFunction", "FunctionArn"]}
+                },
+                "FunctionId": {
+                    "Value": {"Fn::GetAtt": ["PipelineFunction", "FunctionId"]}
+                },
+                "FunctionName": {
+                    "Value": {"Fn::GetAtt": ["PipelineFunction", "Name"]}
+                },
+                "DataSourceName": {
+                    "Value": {"Fn::GetAtt": ["PipelineFunction", "DataSourceName"]}
+                },
+            },
+        }
+
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("ExampleFunction")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+        assert outputs["RefArn"] == outputs["FunctionArn"]
+        assert outputs["RefArn"].endswith(f"/functions/{outputs['FunctionId']}")
+        assert outputs["FunctionName"] == "ExampleFunction"
+        assert outputs["DataSourceName"] == "NoneSource"
+        original_arn = outputs["FunctionArn"]
+
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("UpdatedFunction")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+        assert outputs["FunctionArn"] == original_arn
+        assert outputs["FunctionName"] == "UpdatedFunction"
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        except ClientError:
+            pass
+        appsync.delete_graphql_api(apiId=api_id)
+
+
+def test_cfn_ec2_vpc_endpoint_uses_ec2_state(cfn, ec2):
+    """CloudFormation VPC endpoints share the EC2 API state and expose their ID."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-vpce-{suffix}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Vpc": {
+                "Type": "AWS::EC2::VPC",
+                "Properties": {"CidrBlock": "10.40.0.0/16"},
+            },
+            "Endpoint": {
+                "Type": "AWS::EC2::VPCEndpoint",
+                "Properties": {
+                    "VpcEndpointType": "Gateway",
+                    "VpcId": {"Ref": "Vpc"},
+                    "ServiceName": "com.amazonaws.us-east-1.s3",
+                    "Tags": [{"Key": "source", "Value": "cloudformation"}],
+                },
+            },
+        },
+        "Outputs": {
+            "RefId": {"Value": {"Ref": "Endpoint"}},
+            "GetAttId": {"Value": {"Fn::GetAtt": ["Endpoint", "Id"]}},
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+    assert outputs["RefId"] == outputs["GetAttId"]
+    assert outputs["RefId"].startswith("vpce-")
+
+    endpoints = ec2.describe_vpc_endpoints(
+        VpcEndpointIds=[outputs["RefId"]]
+    )["VpcEndpoints"]
+    assert len(endpoints) == 1
+    assert endpoints[0]["VpcEndpointId"] == outputs["RefId"]
+    assert endpoints[0]["ServiceName"] == "com.amazonaws.us-east-1.s3"
+    assert endpoints[0]["Tags"] == [{"Key": "source", "Value": "cloudformation"}]
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+    assert ec2.describe_vpc_endpoints(
+        VpcEndpointIds=[outputs["RefId"]]
+    )["VpcEndpoints"] == []
+
 
 def test_cfn_elbv2_load_balancer_and_listener(cfn, elbv2):
     """CloudFormation provisions ELBv2 LoadBalancer + Listener and cleans both on delete."""
@@ -1872,6 +2168,62 @@ def test_cfn_cloudwatch_alarm_lifecycle(cfn, cw):
     _wait_stack(cfn, stack_name)
     resp2 = cw.describe_alarms(AlarmNames=[alarm_name])
     assert resp2["MetricAlarms"] == []
+
+
+def test_cfn_cloudwatch_dashboard_lifecycle(cfn, cw):
+    """CloudFormation creates, updates, and removes a CloudWatch dashboard."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cwdash-{uid}"
+    dashboard_name = f"cfn-dashboard-{uid}"
+    replacement_name = f"cfn-dashboard-replaced-{uid}"
+    body = json.dumps({"widgets": [{"type": "text", "properties": {"markdown": "Created"}}]})
+    updated_body = json.dumps({"widgets": [{"type": "text", "properties": {"markdown": "Updated"}}]})
+
+    def template(dashboard_body, name=dashboard_name):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "Dashboard": {
+                    "Type": "AWS::CloudWatch::Dashboard",
+                    "Properties": {
+                        "DashboardName": name,
+                        "DashboardBody": dashboard_body,
+                    },
+                },
+            },
+            "Outputs": {
+                "DashboardName": {"Value": {"Ref": "Dashboard"}},
+            },
+        }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template(body)))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    assert stack["Outputs"][0]["OutputValue"] == dashboard_name
+    assert cw.get_dashboard(DashboardName=dashboard_name)["DashboardBody"] == body
+
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(template(updated_body)))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+    assert cw.get_dashboard(DashboardName=dashboard_name)["DashboardBody"] == updated_body
+
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template(updated_body, replacement_name)),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+    assert stack["Outputs"][0]["OutputValue"] == replacement_name
+    with pytest.raises(ClientError) as exc:
+        cw.get_dashboard(DashboardName=dashboard_name)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFound"
+    assert cw.get_dashboard(DashboardName=replacement_name)["DashboardBody"] == updated_body
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+    with pytest.raises(ClientError) as exc:
+        cw.get_dashboard(DashboardName=replacement_name)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFound"
 
 
 def test_cfn_route53_hosted_zone_and_record_set(cfn, r53):
@@ -2347,6 +2699,61 @@ def test_cfn_pipes_dynamodb_stream_to_sns(cfn, ddb, sqs):
 
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
+
+
+def test_cfn_pipes_rejects_cross_region_target(cfn):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-pipe-xreg-{uid}"
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "DdbToSnsPipe": {
+                "Type": "AWS::Pipes::Pipe",
+                "Properties": {
+                    "Name": f"{stack_name}-pipe",
+                    "RoleArn": "arn:aws:iam::000000000000:role/test-pipe-role",
+                    "Source": (
+                        "arn:aws:dynamodb:us-east-1:000000000000:"
+                        f"table/{stack_name}-table/stream/2026-05-22T00:00:00.000"
+                    ),
+                    "Target": f"arn:aws:sns:us-west-2:000000000000:{stack_name}-topic",
+                    "SourceParameters": {
+                        "DynamoDBStreamParameters": {"StartingPosition": "TRIM_HORIZON"}
+                    },
+                },
+            },
+        },
+    }
+
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template),
+            DisableRollback=True,
+        )
+        stack = _wait_stack(cfn, stack_name)
+
+        assert stack["StackStatus"] == "CREATE_FAILED"
+        assert _pipes.CROSS_REGION_PIPE_ERROR in stack.get("StackStatusReason", "")
+
+        events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+        pipe_events = [
+            event
+            for event in events
+            if event["LogicalResourceId"] == "DdbToSnsPipe"
+        ]
+        assert any(
+            event["ResourceStatus"] == "CREATE_FAILED"
+            and _pipes.CROSS_REGION_PIPE_ERROR in event.get("ResourceStatusReason", "")
+            for event in pipe_events
+        )
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        except ClientError:
+            pass
 
 
 def test_cfn_sns_topic_subscription_filter_policy_scope(cfn, sns, sqs):
@@ -3098,6 +3505,200 @@ Outputs:
     assert not without_resp["UserPoolClient"].get("ClientSecret"), "GenerateSecret=false should leave ClientSecret empty"
 
 
+def test_cfn_cognito_user_pool_group(cfn, cognito_idp):
+    """CFN AWS::Cognito::UserPoolGroup creates a group whose Ref resolves to
+    its GroupName, matching real AWS, and admin_add_user_to_group can then
+    reference it."""
+    template = """
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  Pool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: cfn-group-pool
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref Pool
+      GroupName: admins
+      Description: Administrators
+      Precedence: 1
+Outputs:
+  PoolId:
+    Value: !Ref Pool
+  GroupRef:
+    Value: !Ref AdminGroup
+"""
+    stack_name = "cfn-cognito-group"
+    try:
+        cfn.delete_stack(StackName=stack_name)
+    except Exception:
+        pass
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    _wait_stack(cfn, stack_name)
+
+    stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    assert outputs["GroupRef"] == "admins"
+
+    group = cognito_idp.get_group(UserPoolId=outputs["PoolId"], GroupName="admins")["Group"]
+    assert group["Description"] == "Administrators"
+    assert group["Precedence"] == 1
+
+    cognito_idp.admin_create_user(UserPoolId=outputs["PoolId"], Username="alice")
+    cognito_idp.admin_add_user_to_group(UserPoolId=outputs["PoolId"], Username="alice", GroupName="admins")
+    groups = cognito_idp.admin_list_groups_for_user(UserPoolId=outputs["PoolId"], Username="alice")["Groups"]
+    assert any(g["GroupName"] == "admins" for g in groups)
+
+    cfn.delete_stack(StackName=stack_name)
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.get_group(UserPoolId=outputs["PoolId"], GroupName="admins")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_cfn_cognito_user_pool_resource_server(cfn, cognito_idp):
+    """CFN AWS::Cognito::UserPoolResourceServer creates a resource server
+    whose Ref resolves to its Identifier, matching real AWS."""
+    template = """
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  Pool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: cfn-resource-server-pool
+  ApiResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref Pool
+      Identifier: API
+      Name: API
+      Scopes:
+        - ScopeName: resource.get
+          ScopeDescription: Read access
+Outputs:
+  PoolId:
+    Value: !Ref Pool
+  ResourceServerRef:
+    Value: !Ref ApiResourceServer
+"""
+    stack_name = "cfn-resource-server"
+    try:
+        cfn.delete_stack(StackName=stack_name)
+    except Exception:
+        pass
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    _wait_stack(cfn, stack_name)
+
+    stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    assert outputs["ResourceServerRef"] == "API"
+
+    server = cognito_idp.describe_resource_server(
+        UserPoolId=outputs["PoolId"], Identifier="API",
+    )["ResourceServer"]
+    assert server["Name"] == "API"
+    assert server["Scopes"] == [{"ScopeName": "resource.get", "ScopeDescription": "Read access"}]
+
+    cfn.delete_stack(StackName=stack_name)
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.describe_resource_server(UserPoolId=outputs["PoolId"], Identifier="API")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_cfn_cognito_user_pool_lambda_config(cfn, cognito_idp):
+    """AWS::Cognito::UserPool's LambdaConfig property is honored when the pool
+    is provisioned via CloudFormation, not just via the raw CreateUserPool API.
+
+    _cognito_user_pool_create previously built the pool's state dict without
+    ever reading props["LambdaConfig"], so a CFN-provisioned pool's Lambda
+    triggers (PreTokenGeneration here, but the gap applied to all of them)
+    were silently dropped — the trigger Lambda was never invoked and tokens
+    were issued unmodified, even though the identical raw API call already
+    honored LambdaConfig correctly.
+    """
+    template = """
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  TriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+  TriggerFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt TriggerRole.Arn
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              event['response']['claimsOverrideDetails'] = {
+                  'claimsToAddOrOverride': {'injected_claim': 'from-cfn-trigger'},
+              }
+              return event
+  Pool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: cfn-pretoken-pool
+      LambdaConfig:
+        PreTokenGeneration: !GetAtt TriggerFn.Arn
+  Client:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref Pool
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+Outputs:
+  PoolId:
+    Value: !Ref Pool
+  ClientId:
+    Value: !Ref Client
+"""
+    stack_name = "cfn-cognito-pretoken"
+    try:
+        cfn.delete_stack(StackName=stack_name)
+    except Exception:
+        pass
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    _wait_stack(cfn, stack_name)
+
+    stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    pool_id, client_id = outputs["PoolId"], outputs["ClientId"]
+
+    desc = cognito_idp.describe_user_pool(UserPoolId=pool_id)["UserPool"]
+    assert desc["LambdaConfig"]["PreTokenGeneration"]
+
+    cognito_idp.admin_create_user(
+        UserPoolId=pool_id, Username="pretoken-user",
+        TemporaryPassword="Temp1234!", MessageAction="SUPPRESS",
+    )
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pool_id, Username="pretoken-user", Password="Pwd1234!", Permanent=True,
+    )
+    tok = cognito_idp.initiate_auth(
+        ClientId=client_id, AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "pretoken-user", "PASSWORD": "Pwd1234!"},
+    )["AuthenticationResult"]
+
+    id_payload = tok["IdToken"].split(".")[1]
+    id_payload += "=" * (-len(id_payload) % 4)
+    id_claims = json.loads(base64.urlsafe_b64decode(id_payload))
+    assert id_claims.get("injected_claim") == "from-cfn-trigger"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.describe_user_pool(UserPoolId=pool_id)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 # ---------------------------------------------------------------------------
 # ApiGatewayV2 Integration + Route provisioners
 # ---------------------------------------------------------------------------
@@ -3228,6 +3829,87 @@ def test_cfn_apigwv2_route_basic(cfn, apigw):
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
     assert apigw.get_routes(ApiId=api_id)["Items"] == []
+
+
+def test_cfn_apigwv2_authorizer_jwt(cfn, apigw):
+    """CFN stack with an AWS::ApiGatewayV2::Authorizer deploys successfully and
+    a Route referencing it via AuthorizerId is enforced at request time.
+
+    Regression test: AWS::ApiGatewayV2::Authorizer previously had no CFN
+    provisioner at all ("Unsupported resource type"), even though the
+    control-plane CreateAuthorizer API (and Terraform's
+    aws_apigatewayv2_authorizer) already worked.
+    """
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "HttpApi": {
+                "Type": "AWS::ApiGatewayV2::Api",
+                "Properties": {
+                    "Name": "cfn-apigwv2-authorizer-t01",
+                    "ProtocolType": "HTTP",
+                },
+            },
+            "Integration": {
+                "Type": "AWS::ApiGatewayV2::Integration",
+                "Properties": {
+                    "ApiId": {"Ref": "HttpApi"},
+                    "IntegrationType": "AWS_PROXY",
+                    "IntegrationUri": "arn:aws:lambda:us-east-1:000000000000:function:dummy",
+                    "PayloadFormatVersion": "2.0",
+                },
+            },
+            "JwtAuthorizer": {
+                "Type": "AWS::ApiGatewayV2::Authorizer",
+                "Properties": {
+                    "ApiId": {"Ref": "HttpApi"},
+                    "Name": "cfn-apigwv2-authorizer-t01-jwt",
+                    "AuthorizerType": "JWT",
+                    "IdentitySource": ["$request.header.Authorization"],
+                    "JwtConfiguration": {
+                        "Audience": ["client-id"],
+                        "Issuer": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_example",
+                    },
+                },
+            },
+            "ProtectedRoute": {
+                "Type": "AWS::ApiGatewayV2::Route",
+                "Properties": {
+                    "ApiId": {"Ref": "HttpApi"},
+                    "RouteKey": "GET /protected",
+                    "Target": {"Fn::Join": ["/", ["integrations", {"Ref": "Integration"}]]},
+                    "AuthorizationType": "JWT",
+                    "AuthorizerId": {"Ref": "JwtAuthorizer"},
+                },
+            },
+        },
+    }
+    stack_name = "cfn-apigwv2-authorizer-t01"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    resources = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+    api_res = [r for r in resources if r["ResourceType"] == "AWS::ApiGatewayV2::Api"][0]
+    api_id = api_res["PhysicalResourceId"]
+    authorizer_res = [r for r in resources if r["ResourceType"] == "AWS::ApiGatewayV2::Authorizer"][0]
+    authorizer_id = authorizer_res["PhysicalResourceId"]
+
+    authorizers = apigw.get_authorizers(ApiId=api_id)["Items"]
+    assert len(authorizers) == 1
+    assert authorizers[0]["AuthorizerId"] == authorizer_id
+    assert authorizers[0]["AuthorizerType"] == "JWT"
+    assert authorizers[0]["JwtConfiguration"]["Audience"] == ["client-id"]
+    assert authorizers[0]["JwtConfiguration"]["Issuer"] == "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_example"
+
+    routes = apigw.get_routes(ApiId=api_id)["Items"]
+    assert len(routes) == 1
+    assert routes[0]["AuthorizationType"] == "JWT"
+    assert routes[0]["AuthorizerId"] == authorizer_id
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+    assert apigw.get_authorizers(ApiId=api_id)["Items"] == []
 
 
 def test_cfn_apigwv2_integration_getatt(cfn, apigw):
@@ -3648,6 +4330,108 @@ def test_cfn_cloudfront_keyvaluestore_create_update_delete(cfn, cloudfront):
     assert exc.value.response["Error"]["Code"] == "EntityNotFound"
 
 
+def test_cfn_cloudfront_origin_access_identity_attributes(cfn):
+    """CloudFront OAIs expose stable CFN identities and canonical user IDs."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cloudfront-oai-{suffix}"
+
+    def template(comment):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "OriginAccessIdentity": {
+                    "Type": "AWS::CloudFront::CloudFrontOriginAccessIdentity",
+                    "Properties": {
+                        "CloudFrontOriginAccessIdentityConfig": {
+                            "Comment": comment,
+                        },
+                    },
+                },
+            },
+            "Outputs": {
+                "OaiRef": {"Value": {"Ref": "OriginAccessIdentity"}},
+                "OaiId": {
+                    "Value": {"Fn::GetAtt": ["OriginAccessIdentity", "Id"]},
+                },
+                "CanonicalUserId": {
+                    "Value": {
+                        "Fn::GetAtt": [
+                            "OriginAccessIdentity",
+                            "S3CanonicalUserId",
+                        ],
+                    },
+                },
+            },
+        }
+
+    cfn.create_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template("initial comment")),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+    assert outputs["OaiRef"] == outputs["OaiId"]
+    assert re.fullmatch(r"E[A-Z0-9]{13}", outputs["OaiId"])
+    assert re.fullmatch(r"[0-9a-f]{64}", outputs["CanonicalUserId"])
+
+    original_outputs = outputs
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template("updated comment")),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+    assert outputs == original_outputs
+
+    cfn.delete_stack(StackName=stack_name)
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "DELETE_COMPLETE"
+
+
+def test_cfn_cloudfront_distribution_supports_invalidations(cfn, cloudfront):
+    """A distribution provisioned through CloudFormation must initialize the
+    invalidation state used by the native CloudFront API (#1147)."""
+    stack_name = f"cfn-cloudfront-invalidation-{_uuid_mod.uuid4().hex[:8]}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Distribution": {
+                "Type": "AWS::CloudFront::Distribution",
+                "Properties": {
+                    "DistributionConfig": {
+                        "Enabled": True,
+                    },
+                },
+            },
+        },
+        "Outputs": {
+            "DistributionId": {"Value": {"Ref": "Distribution"}},
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+    dist_id = outputs["DistributionId"]
+    response = cloudfront.create_invalidation(
+        DistributionId=dist_id,
+        InvalidationBatch={
+            "Paths": {"Quantity": 1, "Items": ["/*"]},
+            "CallerReference": f"cfn-invalidation-{_uuid_mod.uuid4().hex}",
+        },
+    )
+    assert response["Invalidation"]["Status"] == "Completed"
+    assert response["Invalidation"]["InvalidationBatch"]["Paths"]["Items"] == ["/*"]
+
+    cfn.delete_stack(StackName=stack_name)
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "DELETE_COMPLETE"
+
+
 def test_cfn_auto_named_s3_bucket_stable_across_updates(cfn, s3):
     """Regression: auto-named S3 buckets (no explicit BucketName) must keep
     the same physical resource ID across stack updates.  Before the fix,
@@ -3776,6 +4560,72 @@ def test_cfn_lambda_s3_ref_bucket_has_code_size(cfn, lam, s3):
     _wait_stack(cfn, stack_name)
 
 
+# -- AWS::ApiGateway::Model --------------------------------------------
+
+
+def test_cfn_apigateway_model_lifecycle(cfn, apigw_v1):
+    """A CDK-style API Gateway model provisions, updates, and deletes through
+    CloudFormation; Ref resolves to the model name and Schema is normalized
+    from CFN's JSON value to the API Gateway string representation."""
+    api_id = apigw_v1.create_rest_api(name="cfn-model-api")["id"]
+    stack_name = f"intg-cfn-model-{_uuid_mod.uuid4().hex[:8]}"
+    model_name = f"AggregatedMetric{_uuid_mod.uuid4().hex[:8]}"
+    schema = {
+        "$schema": "http://json-schema.org/draft-04/schema#",
+        "title": "AggregatedMetric",
+        "type": "object",
+        "properties": {
+            "metric": {"type": "string"},
+            "value": {"type": "number"},
+        },
+        "required": ["metric", "value"],
+    }
+    template = {
+        "Resources": {
+            "SchemasAggregatedMetric": {
+                "Type": "AWS::ApiGateway::Model",
+                "Properties": {
+                    "RestApiId": api_id,
+                    "Name": model_name,
+                    "ContentType": "application/json",
+                    "Description": "Aggregated metric schema",
+                    "Schema": schema,
+                },
+            },
+        },
+        "Outputs": {"ModelName": {"Value": {"Ref": "SchemasAggregatedMetric"}}},
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    assert outputs["ModelName"] == model_name
+
+    model = apigw_v1.get_model(restApiId=api_id, modelName=model_name)
+    assert model["description"] == "Aggregated metric schema"
+    assert json.loads(model["schema"]) == schema
+
+    updated = json.loads(json.dumps(template))
+    updated_props = updated["Resources"]["SchemasAggregatedMetric"]["Properties"]
+    updated_props["Description"] = "Updated schema"
+    updated_props["Schema"]["properties"]["timestamp"] = {"type": "string"}
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(updated))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+
+    model = apigw_v1.get_model(restApiId=api_id, modelName=model_name)
+    assert model["description"] == "Updated schema"
+    assert "timestamp" in json.loads(model["schema"])["properties"]
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+    with pytest.raises(ClientError) as exc:
+        apigw_v1.get_model(restApiId=api_id, modelName=model_name)
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+    apigw_v1.delete_rest_api(restApiId=api_id)
+
+
 # -- AWS::ApiGateway::Authorizer ---------------------------------------
 
 
@@ -3818,6 +4668,101 @@ def test_cfn_apigateway_authorizer_provisions(cfn):
     _wait_stack(cfn, stack_name)
 
 
+def test_cfn_apigateway_base_path_mapping_lifecycle(cfn, apigw_v1):
+    """AWS::ApiGateway::BasePathMapping creates, updates, replaces, and deletes."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-base-path-mapping-{suffix}"
+    domain_name = f"cfn-base-path-{suffix}.example.com"
+    first_api_id = apigw_v1.create_rest_api(name=f"base-path-first-{suffix}")["id"]
+    second_api_id = apigw_v1.create_rest_api(name=f"base-path-second-{suffix}")["id"]
+    stack_deleted = False
+
+    apigw_v1.create_domain_name(domainName=domain_name)
+
+    def template(base_path, rest_api_id, stage):
+        properties = {
+            "DomainName": domain_name,
+            "RestApiId": rest_api_id,
+            "Stage": stage,
+        }
+        if base_path is not None:
+            properties["BasePath"] = base_path
+        return {
+            "Resources": {
+                "Mapping": {
+                    "Type": "AWS::ApiGateway::BasePathMapping",
+                    "Properties": properties,
+                },
+            },
+            "Outputs": {"MappingRef": {"Value": {"Ref": "Mapping"}}},
+        }
+
+    def physical_id():
+        detail = cfn.describe_stack_resource(
+            StackName=stack_name,
+            LogicalResourceId="Mapping",
+        )["StackResourceDetail"]
+        return detail["PhysicalResourceId"]
+
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template(None, first_api_id, "prod")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() == f"{domain_name}/(none)"
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack.get("Outputs", [])}
+        assert outputs["MappingRef"] == f"{domain_name}/(none)"
+
+        mapping = apigw_v1.get_base_path_mapping(domainName=domain_name, basePath="(none)")
+        assert mapping["restApiId"] == first_api_id
+        assert mapping["stage"] == "prod"
+
+        # RestApiId and Stage update without replacing the physical resource.
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template(None, second_api_id, "beta")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() == f"{domain_name}/(none)"
+        mapping = apigw_v1.get_base_path_mapping(domainName=domain_name, basePath="(none)")
+        assert mapping["restApiId"] == second_api_id
+        assert mapping["stage"] == "beta"
+
+        # BasePath requires replacement and removes the previous mapping.
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("v2", second_api_id, "beta")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() == f"{domain_name}/v2"
+        with pytest.raises(ClientError) as exc:
+            apigw_v1.get_base_path_mapping(domainName=domain_name, basePath="(none)")
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+        mapping = apigw_v1.get_base_path_mapping(domainName=domain_name, basePath="v2")
+        assert mapping["restApiId"] == second_api_id
+
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        stack_deleted = True
+        with pytest.raises(ClientError) as exc:
+            apigw_v1.get_base_path_mapping(domainName=domain_name, basePath="v2")
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    finally:
+        if not stack_deleted:
+            try:
+                cfn.delete_stack(StackName=stack_name)
+                _wait_stack(cfn, stack_name)
+            except ClientError:
+                pass
+        apigw_v1.delete_rest_api(restApiId=first_api_id)
+        apigw_v1.delete_rest_api(restApiId=second_api_id)
+        apigw_v1.delete_domain_name(domainName=domain_name)
+
+
 def test_cfn_apigateway_account_provisions(cfn, apigw_v1):
     """AWS::ApiGateway::Account is the CDK ``cloudWatchRole: true`` resource.
     Without a registered handler, stacks fail with ``Unsupported resource
@@ -3845,6 +4790,547 @@ def test_cfn_apigateway_account_provisions(cfn, apigw_v1):
 
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
+
+
+def test_cfn_apigateway_stage_ref_returns_stage_name(cfn, apigw_v1):
+    """Stage Ref is directly usable as the stageName in API Gateway calls.
+
+    Regression for #1161: MiniStack previously returned ``<api-id>-<stage>``
+    from Ref, causing dependent custom resources to fail GetStage with
+    ``Invalid Stage identifier specified``.
+    """
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-apigw-stage-ref-{suffix}"
+    stage_name = "prod"
+    template = {
+        "Resources": {
+            "Api": {
+                "Type": "AWS::ApiGateway::RestApi",
+                "Properties": {"Name": f"stage-ref-{suffix}"},
+            },
+            "Deployment": {
+                "Type": "AWS::ApiGateway::Deployment",
+                "Properties": {"RestApiId": {"Ref": "Api"}},
+            },
+            "Stage": {
+                "Type": "AWS::ApiGateway::Stage",
+                "Properties": {
+                    "RestApiId": {"Ref": "Api"},
+                    "DeploymentId": {"Ref": "Deployment"},
+                    "StageName": stage_name,
+                },
+            },
+        },
+        "Outputs": {
+            "ApiId": {"Value": {"Ref": "Api"}},
+            "StageName": {"Value": {"Ref": "Stage"}},
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    outputs = {item["OutputKey"]: item["OutputValue"] for item in stack.get("Outputs", [])}
+    assert outputs["StageName"] == stage_name
+
+    stage = apigw_v1.get_stage(
+        restApiId=outputs["ApiId"],
+        stageName=outputs["StageName"],
+    )
+    assert stage["stageName"] == stage_name
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_apigateway_domain_name_lifecycle(cfn, apigw_v1):
+    """CloudFormation provisions CDK-style regional and edge custom domains."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-apigw-domain-{suffix}"
+    regional_name = f"regional-{suffix}.example.local"
+    edge_name = f"edge-{suffix}.example.local"
+    regional_certificate_arn = (
+        f"arn:aws:acm:us-east-1:000000000000:certificate/regional-{suffix}"
+    )
+    edge_certificate_arn = (
+        f"arn:aws:acm:us-east-1:000000000000:certificate/edge-{suffix}"
+    )
+    template = {
+        "Resources": {
+            "RegionalDomain": {
+                "Type": "AWS::ApiGateway::DomainName",
+                "Properties": {
+                    "DomainName": regional_name,
+                    "EndpointConfiguration": {"Types": ["REGIONAL"]},
+                    "RegionalCertificateArn": regional_certificate_arn,
+                    "SecurityPolicy": "TLS_1_2",
+                    "Tags": [{"Key": "created-by", "Value": "cloudformation"}],
+                },
+            },
+            "EdgeDomain": {
+                "Type": "AWS::ApiGateway::DomainName",
+                "Properties": {
+                    "DomainName": edge_name,
+                    "EndpointConfiguration": {"Types": ["EDGE"]},
+                    "CertificateArn": edge_certificate_arn,
+                    "SecurityPolicy": "TLS_1_2",
+                },
+            },
+        },
+        "Outputs": {
+            "RegionalRef": {"Value": {"Ref": "RegionalDomain"}},
+            "RegionalDomainName": {
+                "Value": {"Fn::GetAtt": ["RegionalDomain", "RegionalDomainName"]},
+            },
+            "RegionalHostedZoneId": {
+                "Value": {"Fn::GetAtt": ["RegionalDomain", "RegionalHostedZoneId"]},
+            },
+            "RegionalDomainNameArn": {
+                "Value": {"Fn::GetAtt": ["RegionalDomain", "DomainNameArn"]},
+            },
+            "DistributionDomainName": {
+                "Value": {"Fn::GetAtt": ["EdgeDomain", "DistributionDomainName"]},
+            },
+            "DistributionHostedZoneId": {
+                "Value": {"Fn::GetAtt": ["EdgeDomain", "DistributionHostedZoneId"]},
+            },
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    outputs = {item["OutputKey"]: item["OutputValue"] for item in stack.get("Outputs", [])}
+    assert outputs["RegionalRef"] == regional_name
+    assert outputs["RegionalDomainName"] == (
+        f"{regional_name}.execute-api.us-east-1.amazonaws.com"
+    )
+    assert outputs["RegionalHostedZoneId"] == "Z1UJRXOUMOOFQ8"
+    assert outputs["RegionalDomainNameArn"] == (
+        f"arn:aws:apigateway:us-east-1::/domainnames/{regional_name}"
+    )
+    assert outputs["DistributionDomainName"] == f"{edge_name}.cloudfront.net"
+    assert outputs["DistributionHostedZoneId"] == "Z2FDTNDATAQYW2"
+
+    regional = apigw_v1.get_domain_name(domainName=regional_name)
+    assert regional["endpointConfiguration"] == {"types": ["REGIONAL"]}
+    assert regional["regionalCertificateArn"] == regional_certificate_arn
+    assert regional["tags"] == {"created-by": "cloudformation"}
+    edge = apigw_v1.get_domain_name(domainName=edge_name)
+    assert edge["endpointConfiguration"] == {"types": ["EDGE"]}
+    assert edge["certificateArn"] == edge_certificate_arn
+
+    cfn.delete_stack(StackName=stack_name)
+    deleted = _wait_stack(cfn, stack_name)
+    assert deleted["StackStatus"] == "DELETE_COMPLETE"
+    for domain_name in (regional_name, edge_name):
+        with pytest.raises(ClientError) as exc:
+            apigw_v1.get_domain_name(domainName=domain_name)
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+def test_cfn_apigateway_gateway_response_resolves_rest_api_ref(cfn, apigw_v1):
+    """The issue #1124 CDK shape provisions a response against a stack REST API."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-gateway-response-ref-{suffix}"
+    template = {
+        "Resources": {
+            "Api": {
+                "Type": "AWS::ApiGateway::RestApi",
+                "Properties": {"Name": f"gateway-response-ref-{suffix}"},
+            },
+            "BadRequestBody": {
+                "Type": "AWS::ApiGateway::GatewayResponse",
+                "Properties": {
+                    "RestApiId": {"Ref": "Api"},
+                    "ResponseType": "BAD_REQUEST_BODY",
+                    "StatusCode": "400",
+                    "ResponseParameters": {
+                        "gatewayresponse.header.Access-Control-Allow-Origin": "'*'",
+                    },
+                },
+            },
+        },
+        "Outputs": {"ApiId": {"Value": {"Ref": "Api"}}},
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    api_id = next(
+        item["OutputValue"]
+        for item in stack.get("Outputs", [])
+        if item["OutputKey"] == "ApiId"
+    )
+    response = apigw_v1.get_gateway_response(
+        restApiId=api_id,
+        responseType="BAD_REQUEST_BODY",
+    )
+    assert response["defaultResponse"] is False
+    assert response["responseParameters"] == {
+        "gatewayresponse.header.Access-Control-Allow-Origin": "'*'",
+    }
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_apigateway_gateway_response_lifecycle(cfn, apigw_v1):
+    """GatewayResponse creates, updates, replaces, and resets through CFN.
+
+    Regression for #1124: the resource type previously failed immediately as
+    unsupported, rolling back every CDK stack that declared a gateway response.
+    """
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-gateway-response-{suffix}"
+    api_id = apigw_v1.create_rest_api(name=f"gateway-response-{suffix}")["id"]
+    stack_deleted = False
+
+    def template(response_type, status_code, marker):
+        return {
+            "Resources": {
+                "GatewayResponse": {
+                    "Type": "AWS::ApiGateway::GatewayResponse",
+                    "Properties": {
+                        "RestApiId": api_id,
+                        "ResponseType": response_type,
+                        "StatusCode": status_code,
+                        "ResponseParameters": {
+                            "gatewayresponse.header.X-Marker": f"'{marker}'",
+                        },
+                        "ResponseTemplates": {
+                            "application/json": f'{{"marker":"{marker}"}}',
+                        },
+                    },
+                },
+            },
+            "Outputs": {
+                "GatewayResponseId": {
+                    "Value": {"Fn::GetAtt": ["GatewayResponse", "Id"]},
+                },
+            },
+        }
+
+    def physical_id():
+        detail = cfn.describe_stack_resource(
+            StackName=stack_name,
+            LogicalResourceId="GatewayResponse",
+        )["StackResourceDetail"]
+        return detail["PhysicalResourceId"]
+
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("BAD_REQUEST_BODY", "400", "created")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        created_id = physical_id()
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack.get("Outputs", [])}
+        assert outputs["GatewayResponseId"] == created_id
+
+        created = apigw_v1.get_gateway_response(
+            restApiId=api_id,
+            responseType="BAD_REQUEST_BODY",
+        )
+        assert created["defaultResponse"] is False
+        assert created["responseTemplates"] == {"application/json": '{"marker":"created"}'}
+
+        # Mutable properties update in place and keep the physical id.
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("BAD_REQUEST_BODY", "422", "updated")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() == created_id
+        updated = apigw_v1.get_gateway_response(
+            restApiId=api_id,
+            responseType="BAD_REQUEST_BODY",
+        )
+        assert updated["statusCode"] == "422"
+        assert updated["responseParameters"] == {
+            "gatewayresponse.header.X-Marker": "'updated'",
+        }
+
+        # ResponseType is immutable: replace the physical resource and reset
+        # the previous response type to its generated default.
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("BAD_REQUEST_PARAMETERS", "409", "replacement")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        replacement_id = physical_id()
+        assert replacement_id != created_id
+        assert apigw_v1.get_gateway_response(
+            restApiId=api_id,
+            responseType="BAD_REQUEST_BODY",
+        )["defaultResponse"] is True
+        assert apigw_v1.get_gateway_response(
+            restApiId=api_id,
+            responseType="BAD_REQUEST_PARAMETERS",
+        )["statusCode"] == "409"
+
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        stack_deleted = True
+        reset_response = apigw_v1.get_gateway_response(
+            restApiId=api_id,
+            responseType="BAD_REQUEST_PARAMETERS",
+        )
+        assert reset_response["defaultResponse"] is True
+        assert reset_response["statusCode"] == "400"
+    finally:
+        if not stack_deleted:
+            try:
+                cfn.delete_stack(StackName=stack_name)
+                _wait_stack(cfn, stack_name)
+            except ClientError:
+                pass
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_cfn_apigateway_documentation_part_lifecycle(cfn, apigw_v1):
+    """DocumentationPart supports create, update, replacement, Ref, and delete.
+
+    Regression for #1159: the resource type previously failed stack creation
+    with ``Unsupported resource type: AWS::ApiGateway::DocumentationPart``.
+    """
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-documentation-part-{suffix}"
+    api_id = apigw_v1.create_rest_api(name=f"documentation-part-{suffix}")["id"]
+    stack_deleted = False
+
+    def template(location, description):
+        return {
+            "Resources": {
+                "DocumentationPart": {
+                    "Type": "AWS::ApiGateway::DocumentationPart",
+                    "Properties": {
+                        "RestApiId": api_id,
+                        "Location": location,
+                        "Properties": json.dumps({"description": description}),
+                    },
+                },
+            },
+            "Outputs": {
+                "DocumentationPartId": {"Value": {"Ref": "DocumentationPart"}},
+            },
+        }
+
+    def physical_id():
+        detail = cfn.describe_stack_resource(
+            StackName=stack_name,
+            LogicalResourceId="DocumentationPart",
+        )["StackResourceDetail"]
+        return detail["PhysicalResourceId"]
+
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template({"Type": "API"}, "Created")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        created_id = physical_id()
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack.get("Outputs", [])}
+        assert outputs["DocumentationPartId"] == created_id
+        created = apigw_v1.get_documentation_part(
+            restApiId=api_id,
+            documentationPartId=created_id,
+        )
+        assert created["location"] == {"type": "API"}
+        assert json.loads(created["properties"])["description"] == "Created"
+
+        # Properties updates in place.
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template({"Type": "API"}, "Updated")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() == created_id
+        updated = apigw_v1.get_documentation_part(
+            restApiId=api_id,
+            documentationPartId=created_id,
+        )
+        assert json.loads(updated["properties"])["description"] == "Updated"
+
+        # Location is immutable and replaces the documentation part.
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(
+                template({"Type": "RESOURCE", "Path": "/pets"}, "Replacement")
+            ),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        replacement_id = physical_id()
+        assert replacement_id != created_id
+        with pytest.raises(ClientError):
+            apigw_v1.get_documentation_part(
+                restApiId=api_id,
+                documentationPartId=created_id,
+            )
+        replacement = apigw_v1.get_documentation_part(
+            restApiId=api_id,
+            documentationPartId=replacement_id,
+        )
+        assert replacement["location"] == {"type": "RESOURCE", "path": "/pets"}
+
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        stack_deleted = True
+        with pytest.raises(ClientError):
+            apigw_v1.get_documentation_part(
+                restApiId=api_id,
+                documentationPartId=replacement_id,
+            )
+    finally:
+        if not stack_deleted:
+            try:
+                cfn.delete_stack(StackName=stack_name)
+                _wait_stack(cfn, stack_name)
+            except ClientError:
+                pass
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_cfn_apigateway_request_validator_identity(cfn, apigw_v1):
+    """RequestValidator exposes its ID while local requests remain permissive."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-request-validator-{suffix}"
+    api_id = apigw_v1.create_rest_api(name=f"request-validator-{suffix}")["id"]
+
+    def template(name, validate_body):
+        return {
+            "Resources": {
+                "RequestValidator": {
+                    "Type": "AWS::ApiGateway::RequestValidator",
+                    "Properties": {
+                        "RestApiId": api_id,
+                        "Name": name,
+                        "ValidateRequestBody": validate_body,
+                        "ValidateRequestParameters": True,
+                    },
+                },
+            },
+            "Outputs": {
+                "RefId": {"Value": {"Ref": "RequestValidator"}},
+                "GetAttId": {
+                    "Value": {
+                        "Fn::GetAtt": ["RequestValidator", "RequestValidatorId"]
+                    }
+                },
+            },
+        }
+
+    def physical_id():
+        detail = cfn.describe_stack_resource(
+            StackName=stack_name,
+            LogicalResourceId="RequestValidator",
+        )["StackResourceDetail"]
+        return detail["PhysicalResourceId"]
+
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("body-and-parameters", True)),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        created_id = physical_id()
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+        assert outputs == {"RefId": created_id, "GetAttId": created_id}
+
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("body-and-parameters", False)),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() == created_id
+
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("replacement", False)),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() != created_id
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        except ClientError:
+            pass
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_cfn_apigateway_documentation_version_lifecycle(cfn, apigw_v1):
+    """DocumentationVersion has a stable CFN identity and supports replacement."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-documentation-version-{suffix}"
+    api_id = apigw_v1.create_rest_api(name=f"documentation-version-{suffix}")["id"]
+
+    def template(version, description):
+        return {
+            "Resources": {
+                "DocumentationVersion": {
+                    "Type": "AWS::ApiGateway::DocumentationVersion",
+                    "Properties": {
+                        "RestApiId": api_id,
+                        "DocumentationVersion": version,
+                        "Description": description,
+                    },
+                },
+            },
+        }
+
+    def physical_id():
+        detail = cfn.describe_stack_resource(
+            StackName=stack_name,
+            LogicalResourceId="DocumentationVersion",
+        )["StackResourceDetail"]
+        return detail["PhysicalResourceId"]
+
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("v1", "Created")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        created_id = physical_id()
+        assert created_id == f"{api_id}/v1"
+
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("v1", "Updated")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() == created_id
+
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("v2", "Replacement")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() == f"{api_id}/v2"
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        except ClientError:
+            pass
+        apigw_v1.delete_rest_api(restApiId=api_id)
 
 
 # ---------------------------------------------------------------------------
@@ -4050,6 +5536,68 @@ def test_cfn_logs_subscription_filter_provisions(cfn, logs):
     # gone with it — describing it now raises ResourceNotFoundException.
     with pytest.raises(ClientError):
         logs.describe_subscription_filters(logGroupName="/cfn/subfilter-test")
+
+
+def test_cfn_logs_resource_policy_identity_and_lifecycle(cfn):
+    """Logs resource policies expose their policy name without enforcing it."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-logs-policy-{suffix}"
+    policy_name = f"logs-policy-{suffix}"
+
+    def template(statement_sid, name=policy_name):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "LogsPolicy": {
+                    "Type": "AWS::Logs::ResourcePolicy",
+                    "Properties": {
+                        "PolicyName": name,
+                        "PolicyDocument": json.dumps({
+                            "Version": "2012-10-17",
+                            "Statement": [{
+                                "Sid": statement_sid,
+                                "Effect": "Allow",
+                                "Principal": {"Service": "route53.amazonaws.com"},
+                                "Action": "logs:PutLogEvents",
+                                "Resource": "*",
+                            }],
+                        }),
+                    },
+                },
+            },
+            "Outputs": {
+                "PolicyName": {"Value": {"Ref": "LogsPolicy"}},
+            },
+        }
+
+    cfn.create_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template("InitialPolicy")),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    assert stack["Outputs"][0]["OutputValue"] == policy_name
+
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template("UpdatedPolicy")),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    assert stack["Outputs"][0]["OutputValue"] == policy_name
+
+    updated_name = f"{policy_name}-updated"
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template("UpdatedPolicy", updated_name)),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    assert stack["Outputs"][0]["OutputValue"] == updated_name
+
+    cfn.delete_stack(StackName=stack_name)
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "DELETE_COMPLETE"
 
 
 def test_cfn_change_set_detects_parameter_driven_change(cfn, s3):
@@ -4339,3 +5887,569 @@ def test_cfn_sam_transform_missing_translator_falls_back(monkeypatch):
     # Templates that don't use the SAM transform are unaffected.
     plain = {"Resources": {"B": {"Type": "AWS::S3::Bucket", "Properties": {}}}}
     assert _apply_sam_transform_if_applicable(plain) is plain
+
+
+# AWS::OpenSearchService::Domain
+
+
+def _opensearch_stack_template(domain_props):
+    return {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "SearchDomain": {
+                "Type": "AWS::OpenSearchService::Domain",
+                "Properties": domain_props,
+            },
+        },
+        "Outputs": {
+            "Ref": {"Value": {"Ref": "SearchDomain"}},
+            "Arn": {"Value": {"Fn::GetAtt": ["SearchDomain", "Arn"]}},
+            "DomainArn": {
+                "Value": {"Fn::GetAtt": ["SearchDomain", "DomainArn"]}
+            },
+            "Endpoint": {
+                "Value": {"Fn::GetAtt": ["SearchDomain", "DomainEndpoint"]}
+            },
+            "Id": {"Value": {"Fn::GetAtt": ["SearchDomain", "Id"]},},
+        },
+    }
+
+
+def _stack_resource(cfn, stack_name, logical_id="SearchDomain"):
+    return cfn.describe_stack_resource(
+        StackName=stack_name, LogicalResourceId=logical_id
+    )["StackResourceDetail"]
+
+
+def test_cfn_opensearch_domain_create_update_replace_and_idempotent_delete(
+        cfn, opensearch):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-os-{suffix}"
+    domain_name = f"search-{suffix}"
+    sentinel = f"NeverLog-{suffix}"
+    all_properties = {
+        "AccessPolicies": {
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Action": "es:*", "Resource": "*"}],
+        },
+        "AdvancedOptions": {"indices.fielddata.cache.size": "20"},
+        "AdvancedSecurityOptions": {
+            "Enabled": True,
+            "InternalUserDatabaseEnabled": True,
+            "MasterUserOptions": {
+                "MasterUserName": "admin",
+                "MasterUserPassword": sentinel,
+            },
+        },
+        "AIMLOptions": {"NaturalLanguageQueryGenerationOptions": {"DesiredState": "ENABLED"}},
+        "AutomatedSnapshotPauseOptions": {"Enabled": True},
+        "ClusterConfig": {"InstanceCount": 1, "InstanceType": "t3.small.search"},
+        "CognitoOptions": {"Enabled": False},
+        "DeploymentStrategyOptions": {"DeploymentStrategy": "BLUE_GREEN"},
+        "DomainEndpointOptions": {"EnforceHTTPS": False},
+        "DomainName": domain_name,
+        "EBSOptions": {"EBSEnabled": True, "VolumeSize": 20, "VolumeType": "gp3"},
+        "EncryptionAtRestOptions": {"Enabled": True},
+        "EngineVersion": "OpenSearch_2.15",
+        "IdentityCenterOptions": {"EnabledAPIAccess": False},
+        "IPAddressType": "ipv4",
+        "LogPublishingOptions": {},
+        "NodeToNodeEncryptionOptions": {"Enabled": True},
+        "OffPeakWindowOptions": {"Enabled": True},
+        "SkipShardMigrationWait": True,
+        "SnapshotOptions": {"AutomatedSnapshotStartHour": 7},
+        "SoftwareUpdateOptions": {"AutoSoftwareUpdateEnabled": True},
+        "Tags": [
+            {"Key": "Environment", "Value": "test"},
+            {"Key": "Changing", "Value": "old"},
+        ],
+        "VPCOptions": {},
+    }
+
+    cfn.create_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(_opensearch_stack_template(all_properties)),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    resource = _stack_resource(cfn, stack_name)
+    assert resource["PhysicalResourceId"] == domain_name
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+    expected_arn = f"arn:aws:es:us-east-1:000000000000:domain/{domain_name}"
+    assert outputs == {
+        "Ref": domain_name,
+        "Arn": expected_arn,
+        "DomainArn": expected_arn,
+        "Endpoint": f"{domain_name}.ministack.local:9200",
+        "Id": f"000000000000/{domain_name}",
+    }
+
+    status = opensearch.describe_domain(DomainName=domain_name)["DomainStatus"]
+    assert status["EngineVersion"] == "OpenSearch_2.15"
+    assert status["ClusterConfig"]["InstanceType"] == "t3.small.search"
+    assert status["SnapshotOptions"]["AutomatedSnapshotStartHour"] == 7
+    assert status["OffPeakWindowOptions"]["Enabled"] is True
+    assert status["SoftwareUpdateOptions"]["AutoSoftwareUpdateEnabled"] is True
+    assert sentinel not in json.dumps(status, default=str)
+    tags = opensearch.list_tags(ARN=expected_arn)["TagList"]
+    assert {t["Key"]: t["Value"] for t in tags} == {
+        "Environment": "test", "Changing": "old"
+    }
+    assert domain_name in {
+        item["DomainName"] for item in opensearch.list_domain_names()["DomainNames"]
+    }
+
+    updated_properties = {
+        "DomainName": domain_name,
+        "EngineVersion": "OpenSearch_2.17",
+        "ClusterConfig": {"InstanceCount": 2},
+        "AIMLOptions": {"NaturalLanguageQueryGenerationOptions": {"DesiredState": "DISABLED"}},
+        "Tags": [
+            {"Key": "Changing", "Value": "new"},
+            {"Key": "Added", "Value": "yes"},
+        ],
+    }
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(_opensearch_stack_template(updated_properties)),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    assert _stack_resource(cfn, stack_name)["PhysicalResourceId"] == domain_name
+    status = opensearch.describe_domain(DomainName=domain_name)["DomainStatus"]
+    assert status["EngineVersion"] == "OpenSearch_2.17"
+    assert status["ClusterConfig"]["InstanceCount"] == 2
+    assert status["EBSOptions"]["VolumeSize"] == 10
+    assert status["AdvancedOptions"] == {}
+    assert status["OffPeakWindowOptions"] == {"Enabled": False}
+    tags = opensearch.list_tags(ARN=expected_arn)["TagList"]
+    assert {t["Key"]: t["Value"] for t in tags} == {
+        "Changing": "new", "Added": "yes"
+    }
+    progress = opensearch.describe_domain_change_progress(DomainName=domain_name)[
+        "ChangeProgressStatus"
+    ]
+    assert progress["Status"] == "COMPLETED"
+    assert progress["ConfigChangeStatus"] == "Completed"
+
+    replacement_name = f"replace-{suffix}"
+    replacement_props = {
+        "DomainName": replacement_name,
+        "Tags": [{"Key": "Replacement", "Value": "true"}],
+    }
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(_opensearch_stack_template(replacement_props)),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    assert _stack_resource(cfn, stack_name)["PhysicalResourceId"] == replacement_name
+    with pytest.raises(ClientError) as exc:
+        opensearch.describe_domain(DomainName=domain_name)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    opensearch.describe_domain(DomainName=replacement_name)
+
+    # Removing an explicit DomainName is also a replacement, with a newly
+    # generated physical name derived from the stack and logical ID.
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(_opensearch_stack_template({"Tags": []})),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    generated_name = _stack_resource(cfn, stack_name)["PhysicalResourceId"]
+    assert generated_name != replacement_name
+    assert len(generated_name) <= 28
+    with pytest.raises(ClientError):
+        opensearch.describe_domain(DomainName=replacement_name)
+
+    # Manual removal must not make CloudFormation deletion fail.
+    opensearch.delete_domain(DomainName=generated_name)
+    cfn.delete_stack(StackName=stack_name)
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+
+
+def test_cfn_opensearch_auto_name_is_stable_across_update(cfn, opensearch):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-os-auto-{suffix}"
+    template = _opensearch_stack_template({"EngineVersion": "OpenSearch_2.15"})
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    physical_id = _stack_resource(cfn, stack_name)["PhysicalResourceId"]
+    assert len(physical_id) <= 28
+    assert len(physical_id) >= 3
+    assert physical_id[0].islower()
+    assert all(c.islower() or c.isdigit() or c == "-" for c in physical_id)
+
+    template = _opensearch_stack_template({
+        "EngineVersion": "OpenSearch_2.17",
+        "VPCOptions": {
+            "SubnetIds": ["subnet-control-plane"],
+            "SecurityGroupIds": ["sg-control-plane"],
+        },
+    })
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    assert _stack_resource(cfn, stack_name)["PhysicalResourceId"] == physical_id
+    status = opensearch.describe_domain(DomainName=physical_id)["DomainStatus"]
+    assert status["EngineVersion"] == "OpenSearch_2.17"
+    assert status["Endpoints"]["vpc"] == f"{physical_id}.ministack.local:9200"
+
+    # Removing VPCOptions is an in-place control-plane update and restores the
+    # public endpoint response shape.
+    template = _opensearch_stack_template({"EngineVersion": "OpenSearch_2.17"})
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    assert _stack_resource(cfn, stack_name)["PhysicalResourceId"] == physical_id
+    status = opensearch.describe_domain(DomainName=physical_id)["DomainStatus"]
+    assert status["Endpoint"] == f"{physical_id}.ministack.local:9200"
+    assert "Endpoints" not in status
+
+    cfn.delete_stack(StackName=stack_name)
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+
+
+def test_cfn_opensearch_vpc_refs_use_vpc_endpoint(cfn, opensearch):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-os-vpc-{suffix}"
+    domain_name = f"vpc-{suffix}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Vpc": {"Type": "AWS::EC2::VPC", "Properties": {"CidrBlock": "10.0.0.0/16"}},
+            "Subnet": {
+                "Type": "AWS::EC2::Subnet",
+                "Properties": {"VpcId": {"Ref": "Vpc"}, "CidrBlock": "10.0.1.0/24"},
+            },
+            "SecurityGroup": {
+                "Type": "AWS::EC2::SecurityGroup",
+                "Properties": {"VpcId": {"Ref": "Vpc"}, "GroupDescription": "search"},
+            },
+            "SearchDomain": {
+                "Type": "AWS::OpenSearchService::Domain",
+                "Properties": {
+                    "DomainName": domain_name,
+                    "VPCOptions": {
+                        "SubnetIds": [{"Ref": "Subnet"}],
+                        "SecurityGroupIds": [{"Ref": "SecurityGroup"}],
+                    },
+                },
+            },
+        },
+        "Outputs": {
+            "Endpoint": {"Value": {"Fn::GetAtt": ["SearchDomain", "DomainEndpoint"]}}
+        },
+    }
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    status = opensearch.describe_domain(DomainName=domain_name)["DomainStatus"]
+    endpoint = status["Endpoints"]["vpc"]
+    assert {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]} == {
+        "Endpoint": endpoint
+    }
+    resources = {
+        r["LogicalResourceId"]: r
+        for r in cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+    }
+    assert status["VPCOptions"]["SubnetIds"] == [resources["Subnet"]["PhysicalResourceId"]]
+    assert status["VPCOptions"]["SecurityGroupIds"] == [
+        resources["SecurityGroup"]["PhysicalResourceId"]
+    ]
+    cfn.delete_stack(StackName=stack_name)
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+
+
+def test_cfn_opensearch_failed_replacement_preserves_original(cfn, opensearch):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-os-failure-{suffix}"
+    original = f"original-{suffix}"
+    duplicate = f"duplicate-{suffix}"
+    opensearch.create_domain(DomainName=duplicate)
+    cfn.create_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(_opensearch_stack_template({"DomainName": original})),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(_opensearch_stack_template({"DomainName": duplicate})),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+    assert opensearch.describe_domain(DomainName=original)["DomainStatus"]["DomainName"] == original
+    assert opensearch.describe_domain(DomainName=duplicate)["DomainStatus"]["DomainName"] == duplicate
+    assert _stack_resource(cfn, stack_name)["PhysicalResourceId"] == original
+
+    cfn.delete_stack(StackName=stack_name)
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+    opensearch.delete_domain(DomainName=duplicate)
+
+
+def test_cfn_opensearch_invalid_create_redacts_secret_and_rolls_back(cfn, opensearch):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-os-invalid-{suffix}"
+    sentinel = f"SentinelPassword-{suffix}"
+    invalid_name = f"INVALID-{suffix}"
+    template = _opensearch_stack_template({
+        "DomainName": invalid_name,
+        "AdvancedSecurityOptions": {
+            "Enabled": True,
+            "MasterUserOptions": {
+                "MasterUserName": "admin",
+                "MasterUserPassword": sentinel,
+            },
+        },
+    })
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "ROLLBACK_COMPLETE"
+    events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+    assert sentinel not in json.dumps(events, default=str)
+    assert sentinel not in json.dumps(stack, default=str)
+    with pytest.raises(ClientError) as exc:
+        opensearch.describe_domain(DomainName=invalid_name)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_cfn_opensearch_private_compatibility_state_is_detached_and_replaced():
+    from ministack.services import opensearch as service
+    from ministack.services.cloudformation.provisioners import (
+        _opensearch_domain_create,
+        _opensearch_domain_delete,
+        _opensearch_domain_update,
+    )
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    name = f"private-{suffix}"
+    compatibility = {"AIMLOptions": {"Nested": ["original"]}}
+    props = {
+        "DomainName": name,
+        **compatibility,
+        "Tags": [{"Key": "Original", "Value": "yes"}],
+    }
+    physical_id, _ = _opensearch_domain_create("SearchDomain", props, "unit-stack")
+    try:
+        props["AIMLOptions"]["Nested"].append("mutated")
+        props["Tags"][0]["Value"] = "mutated"
+        rec = service._domains[physical_id]
+        assert rec["_CloudFormationCompatibility"] == {
+            "AIMLOptions": {"Nested": ["original"]}
+        }
+        assert service._tags[rec["ARN"]] == [{"Key": "Original", "Value": "yes"}]
+
+        same_id, _ = _opensearch_domain_update(
+            physical_id,
+            {"DomainName": name, "AIMLOptions": compatibility["AIMLOptions"]},
+            {"DomainName": name},
+            "unit-stack",
+            "SearchDomain",
+        )
+        assert same_id == physical_id
+        assert service._domains[physical_id]["_CloudFormationCompatibility"] == {}
+        assert service._tags.get(rec["ARN"]) is None
+    finally:
+        _opensearch_domain_delete(physical_id, {})
+        _opensearch_domain_delete(physical_id, {})
+        assert service._domains.get(physical_id) is None
+        assert service._change_progress.get(physical_id) is None
+
+
+def test_cfn_cdk_opensearch_access_policy_custom_resource(cfn, opensearch):
+    """CDK's provider Lambda can load the OpenSearch SDK v3 package.
+
+    The OpenSearch Domain L2 emits Custom::OpenSearchAccessPolicy with
+    InstallLatestAwsSdk=false. Its shared provider dynamically loads
+    @aws-sdk/client-opensearch and sends UpdateDomainConfigCommand.
+    """
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-os-access-{suffix}"
+    domain_name = f"access-{suffix}"
+    function_name = f"cfn-os-provider-{suffix}"
+    access_policy = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "es:*",
+            "Resource": "*",
+        }],
+    }, separators=(",", ":"))
+    provider_code = r"""
+const http = require("http");
+
+function respond(event, status, reason, physicalId, data) {
+  const body = JSON.stringify({
+    Status: status,
+    Reason: reason,
+    PhysicalResourceId: physicalId,
+    StackId: event.StackId,
+    RequestId: event.RequestId,
+    LogicalResourceId: event.LogicalResourceId,
+    NoEcho: false,
+    Data: data || {},
+  });
+  const target = new URL(event.ResponseURL);
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: target.hostname,
+      port: target.port,
+      path: target.pathname + target.search,
+      method: "PUT",
+      headers: {
+        "Content-Type": "",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    }, (res) => {
+      res.resume();
+      res.on("end", resolve);
+    });
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+exports.handler = async (event) => {
+  let physicalId = event.PhysicalResourceId || event.LogicalResourceId;
+  try {
+    const raw = event.ResourceProperties[event.RequestType];
+    if (raw) {
+      const call = typeof raw === "string" ? JSON.parse(raw) : raw;
+      physicalId = call.physicalResourceId?.id || physicalId;
+      const sdk = require("@aws-sdk/client-opensearch");
+      const clientClass = Object.entries(sdk).find(([name]) => name === "OpenSearchClient")?.[1];
+      const commandName = call.action[0].toUpperCase() + call.action.slice(1) + "Command";
+      const commandClass = Object.entries(sdk).find(([name]) => name === commandName)?.[1];
+      if (!clientClass || !commandClass) throw new Error("OpenSearch SDK exports not found");
+      const client = new clientClass({ apiVersion: "2021-01-01" });
+      const result = await client.send(new commandClass(call.parameters));
+      result.apiVersion = client.config.apiVersion;
+      result.region = await client.config.region().catch(() => undefined);
+      await respond(event, "SUCCESS", "OK", physicalId, result);
+    } else {
+      await respond(event, "SUCCESS", "OK", physicalId, {});
+    }
+  } catch (err) {
+    await respond(event, "FAILED", err.message || String(err), physicalId, {});
+  }
+};
+"""
+    call_prefix = (
+        '{"action":"updateDomainConfig","service":"OpenSearch",'
+        f'"parameters":{{"DomainName":"{domain_name}",'
+        f'"AccessPolicies":{json.dumps(access_policy)}}},'
+        f'"physicalResourceId":{{"id":"{domain_name}AccessPolicy"}}}}'
+    )
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "SearchDomain": {
+                "Type": "AWS::OpenSearchService::Domain",
+                "Properties": {"DomainName": domain_name},
+            },
+            "Provider": {
+                "Type": "AWS::Lambda::Function",
+                "Properties": {
+                    "FunctionName": function_name,
+                    "Runtime": "nodejs18.x",
+                    "Handler": "index.handler",
+                    "Role": "arn:aws:iam::000000000000:role/custom-resource",
+                    "Timeout": 10,
+                    "Code": {"ZipFile": provider_code},
+                    # CDK local tooling sets this exact hostname. The SDK shim
+                    # must not turn it into the S3-shaped
+                    # ``opensearch.localhost`` virtual host.
+                    "Environment": {
+                        "Variables": {"AWS_ENDPOINT_URL": "http://localhost:4566"},
+                    },
+                },
+            },
+            "AccessPolicy": {
+                "Type": "Custom::OpenSearchAccessPolicy",
+                "Properties": {
+                    "ServiceToken": {"Fn::GetAtt": ["Provider", "Arn"]},
+                    "Create": call_prefix,
+                    "Update": call_prefix,
+                    "InstallLatestAwsSdk": False,
+                    "ServiceTimeout": 5,
+                },
+                "DependsOn": ["SearchDomain", "Provider"],
+            },
+        },
+    }
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    config = opensearch.describe_domain_config(DomainName=domain_name)["DomainConfig"]
+    assert config["AccessPolicies"]["Options"] == access_policy
+    resource = _stack_resource(cfn, stack_name, "AccessPolicy")
+    assert resource["PhysicalResourceId"] == f"{domain_name}AccessPolicy"
+
+    cfn.delete_stack(StackName=stack_name)
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+
+
+def test_cfn_s3tables_resources(cfn, s3tables):
+    """CloudFormation can provision AWS::S3Tables::TableBucket, Namespace, and Table."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Bucket": {
+                "Type": "AWS::S3Tables::TableBucket",
+                "Properties": {"TableBucketName": "cfn-s3tables-test"},
+            },
+            "Ns": {
+                "Type": "AWS::S3Tables::Namespace",
+                "Properties": {
+                    "TableBucketARN": {"Fn::GetAtt": ["Bucket", "TableBucketARN"]},
+                    "Namespace": "myns",
+                },
+                "DependsOn": "Bucket",
+            },
+            "Table": {
+                "Type": "AWS::S3Tables::Table",
+                "Properties": {
+                    "TableBucketARN": {"Fn::GetAtt": ["Bucket", "TableBucketARN"]},
+                    "Namespace": "myns",
+                    "TableName": "mytable",
+                    "OpenTableFormat": "ICEBERG",
+                },
+                "DependsOn": "Ns",
+            },
+        },
+        "Outputs": {
+            "BucketArn": {"Value": {"Fn::GetAtt": ["Bucket", "TableBucketARN"]}},
+            "TableArn": {"Value": {"Fn::GetAtt": ["Table", "TableARN"]}},
+        },
+    }
+
+    stack_name = "cfn-s3tables-t01"
+    try:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+    except Exception:
+        pass
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    bucket_arn = outputs["BucketArn"]
+    table_arn = outputs["TableArn"]
+    assert "cfn-s3tables-test" in bucket_arn
+    assert "mytable" in table_arn
+
+    table = s3tables.get_table(tableBucketARN=bucket_arn, namespace="myns", name="mytable")
+    assert table["name"] == "mytable"
+    assert table["format"] == "ICEBERG"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)

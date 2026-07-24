@@ -61,6 +61,43 @@ def test_sqs_list_queues(sqs):
     assert any("intg-sqs-list-alpha" in u for u in urls)
     assert any("intg-sqs-list-beta" in u for u in urls)
 
+def test_sqs_list_queues_paginates_with_max_results(sqs):
+    prefix = f"intg-sqs-page-{_uuid_mod.uuid4().hex[:8]}-"
+    for i in range(5):
+        sqs.create_queue(QueueName=f"{prefix}{i}")
+
+    first = sqs.list_queues(QueueNamePrefix=prefix, MaxResults=2)
+    assert len(first["QueueUrls"]) == 2
+    assert "NextToken" in first
+
+    collected = list(first["QueueUrls"])
+    token = first["NextToken"]
+    while token:
+        page = sqs.list_queues(QueueNamePrefix=prefix, MaxResults=2, NextToken=token)
+        collected.extend(page["QueueUrls"])
+        token = page.get("NextToken")
+
+    assert len(collected) == 5
+    assert len(set(collected)) == 5
+
+
+def test_sqs_list_queues_no_next_token_without_max_results(sqs):
+    prefix = f"intg-sqs-nopage-{_uuid_mod.uuid4().hex[:8]}-"
+    sqs.create_queue(QueueName=f"{prefix}only")
+    resp = sqs.list_queues(QueueNamePrefix=prefix)
+    assert len(resp["QueueUrls"]) == 1
+    assert "NextToken" not in resp
+
+
+def test_sqs_list_queues_no_next_token_on_exact_fit(sqs):
+    prefix = f"intg-sqs-exact-{_uuid_mod.uuid4().hex[:8]}-"
+    for i in range(3):
+        sqs.create_queue(QueueName=f"{prefix}{i}")
+    resp = sqs.list_queues(QueueNamePrefix=prefix, MaxResults=3)
+    assert len(resp["QueueUrls"]) == 3
+    assert "NextToken" not in resp
+
+
 def test_sqs_get_queue_url(sqs):
     sqs.create_queue(QueueName="intg-sqs-geturl")
     resp = sqs.get_queue_url(QueueName="intg-sqs-geturl")

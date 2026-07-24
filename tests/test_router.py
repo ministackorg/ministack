@@ -82,3 +82,24 @@ def test_lambda_credential_scope_still_routes_when_path_unknown():
         ),
     }
     assert detect_service("GET", "/2099-01-01/something-new", headers, {}) == "lambda"
+
+
+@pytest.mark.parametrize(("method", "path"), [
+    ("POST", "/2021-01-01/opensearch/domain/example/config"),
+    ("GET", "/2021-01-01/opensearch/domain/example"),
+    ("POST", "/2021-01-01/opensearch/domain-info"),
+    ("GET", "/2021-01-01/domain/example"),
+    ("GET", "/2021-01-01/versions"),
+    ("GET", "/2021-01-01/compatibleVersions"),
+    ("POST", "/2021-01-01/tags"),
+    ("POST", "/2021-01-01/tags-removal"),
+])
+def test_opensearch_management_paths_route_without_sigv4(method, path):
+    """OpenSearch custom-resource calls must not fall through to S3."""
+    assert detect_service(method, path, _HEADERS, {}) == "opensearch"
+
+
+def test_unknown_opensearch_version_path_still_falls_back_to_s3():
+    assert detect_service(
+        "POST", "/2021-01-01/not-opensearch/domain/example/config", _HEADERS, {}
+    ) == "s3"

@@ -166,6 +166,12 @@ def _collect_cognito():
 def _collect_appsync():
     import ministack.services.appsync as svc
     for arn, tags in svc._tags.items():
+        try:
+            spec = parse_arn(arn)
+        except ArnParseError:
+            continue
+        if spec.region != get_region():
+            continue
         yield arn, _normalise_flat(tags)
 
 

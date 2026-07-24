@@ -29,7 +29,13 @@ from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    AccountScopedDict,
+    get_account_id,
+    get_region,
+    new_uuid,
+)
 
 logger = logging.getLogger("mq")
 
@@ -37,16 +43,17 @@ logger = logging.getLogger("mq")
 # ============================================================================
 # Module State
 # ============================================================================
-# These module-level dicts are scoped per AWS account/region via AccountScopedDict.
+# Broker-owned state is scoped per AWS account and region. ARN-keyed tags stay
+# account-scoped because the ARN itself includes the resource region.
 # Invariants to maintain:
 #   - _name_index[name] must exist iff _brokers[id].brokerName == name
 #   - _tags[arn] exists iff _brokers[id] with matching arn exists
 #   - _users[id] exists iff _brokers[id].engineType == "ACTIVEMQ"
 
-_brokers: AccountScopedDict = AccountScopedDict()
-_name_index: AccountScopedDict = AccountScopedDict()
+_brokers: AccountRegionScopedDict = AccountRegionScopedDict()
+_name_index: AccountRegionScopedDict = AccountRegionScopedDict()
 _tags: AccountScopedDict = AccountScopedDict()
-_users: AccountScopedDict = AccountScopedDict()
+_users: AccountRegionScopedDict = AccountRegionScopedDict()
 
 
 # ============================================================================
@@ -283,9 +290,40 @@ def restore_state(data: dict) -> None:
     if not data:
         return
     _brokers.update(data.get("brokers", {}))
-    _name_index.update(data.get("name_index", {}))
+
+    saved_name_index = data.get("name_index", {})
+    if isinstance(saved_name_index, AccountRegionScopedDict):
+        _name_index.update(saved_name_index)
+    else:
+        # Legacy name indexes carry neither an ARN nor a region. Rebuild the
+        # index from the broker records after their ARN-based migration.
+        for (account_id, region, broker_id), broker in _brokers.all_items():
+            broker_name = broker.get("brokerName")
+            if broker_name:
+                _name_index.set_scoped(account_id, region, broker_name, broker_id)
+
     _tags.update(data.get("tags", {}))
-    _users.update(data.get("users", {}))
+
+    saved_users = data.get("users", {})
+    if isinstance(saved_users, AccountRegionScopedDict):
+        _users.update(saved_users)
+    else:
+        if isinstance(saved_users, AccountScopedDict):
+            legacy_users = saved_users._data.items()
+        else:
+            account_id = get_account_id()
+            legacy_users = (((account_id, broker_id), users) for broker_id, users in saved_users.items())
+
+        # User maps are keyed only by broker ID, so place them beside their
+        # migrated parent broker rather than in the ambient startup region.
+        broker_regions = {
+            (account_id, broker_id): region
+            for (account_id, region, broker_id), _broker in _brokers.all_items()
+        }
+        for (account_id, broker_id), users in legacy_users:
+            region = broker_regions.get((account_id, broker_id))
+            if region:
+                _users.set_scoped(account_id, region, broker_id, users)
 
 
 try:

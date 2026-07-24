@@ -786,3 +786,96 @@ def test_alb_set_security_groups(elbv2):
     )["LoadBalancers"][0]["LoadBalancerArn"]
     resp = elbv2.set_security_groups(LoadBalancerArn=arn, SecurityGroups=["sg-bbb", "sg-ccc"])
     assert resp["SecurityGroupIds"] == ["sg-bbb", "sg-ccc"]
+
+
+def _alb_http_target_setup(elbv2, lb_name, target_id, target_port, target_type="ip"):
+    """Create LB + instance/ip TG + listener + register an HTTP target.
+    Returns (lb_arn, tg_arn, l_arn).
+    """
+    lb_arn = elbv2.create_load_balancer(Name=lb_name)["LoadBalancers"][0]["LoadBalancerArn"]
+    tg_arn = elbv2.create_target_group(
+        Name=f"{lb_name}-tg",
+        Protocol="HTTP",
+        Port=target_port,
+        VpcId="vpc-00000001",
+        TargetType=target_type,
+    )["TargetGroups"][0]["TargetGroupArn"]
+    elbv2.register_targets(TargetGroupArn=tg_arn, Targets=[{"Id": target_id, "Port": target_port}])
+    l_arn = elbv2.create_listener(
+        LoadBalancerArn=lb_arn,
+        Protocol="HTTP",
+        Port=80,
+        DefaultActions=[{"Type": "forward", "TargetGroupArn": tg_arn}],
+    )["Listeners"][0]["ListenerArn"]
+    return lb_arn, tg_arn, l_arn
+
+
+def _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn):
+    for fn, kwargs in (
+        (elbv2.delete_listener, {"ListenerArn": l_arn}),
+        (elbv2.delete_target_group, {"TargetGroupArn": tg_arn}),
+        (elbv2.delete_load_balancer, {"LoadBalancerArn": lb_arn}),
+    ):
+        try:
+            fn(**kwargs)
+        except Exception:
+            pass
+
+
+@pytest.mark.serial
+def test_elbv2_dataplane_forward_ip_target(elbv2):
+    """ALB data plane proxies instance/ip targets over HTTP.
+
+    The emulator's own health endpoint (127.0.0.1:4566 from inside the
+    server process) doubles as the backend, so the test needs no external
+    HTTP server and works both in-container and locally.
+    """
+    import urllib.request as _req
+
+    lb_name = "dp-alb-ip"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", 4566)
+    try:
+        url = f"{_endpoint}/_alb/{lb_name}/_ministack/health"
+        resp = _req.urlopen(_req.Request(url, method="GET"))
+        assert resp.status == 200
+        body = json.loads(resp.read())
+        assert "services" in body
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+
+
+@pytest.mark.serial
+def test_elbv2_dataplane_forward_instance_target_hostname(elbv2):
+    """Instance targets resolve the Id as a hostname (no EC2 metadata in an
+    emulator), so localhost works as an instance Id too."""
+    import urllib.request as _req
+
+    lb_name = "dp-alb-inst"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(
+        elbv2, lb_name, "localhost", 4566, target_type="instance"
+    )
+    try:
+        url = f"{_endpoint}/_alb/{lb_name}/_ministack/health"
+        resp = _req.urlopen(_req.Request(url, method="GET"))
+        assert resp.status == 200
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+
+
+@pytest.mark.serial
+def test_elbv2_dataplane_ip_target_unreachable_returns_502(elbv2):
+    """Connection failures surface as 502 Bad Gateway, like a real ALB."""
+    import urllib.error as _err
+    import urllib.request as _req
+
+    lb_name = "dp-alb-dead"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", 59999)
+    try:
+        url = f"{_endpoint}/_alb/{lb_name}/anything"
+        with pytest.raises(_err.HTTPError) as exc_info:
+            _req.urlopen(_req.Request(url, method="GET"))
+        assert exc_info.value.code == 502
+        body = json.loads(exc_info.value.read())
+        assert "connect error" in body["message"]
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)

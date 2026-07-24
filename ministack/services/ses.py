@@ -39,18 +39,24 @@ from email.policy import default as default_policy
 from urllib.parse import parse_qs, unquote
 
 from ministack.core.persistence import PERSIST_STATE, load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    AccountScopedDict,
+    get_account_id,
+    get_region,
+    new_uuid,
+)
 
 logger = logging.getLogger("ses")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-_identities = AccountScopedDict()
-# Per-account sent-mail record. AccountScopedDict under "entries" so the list
-# manipulation stays simple but GetSendStatistics / inspection is scoped.
-_sent_emails = AccountScopedDict()
-_templates = AccountScopedDict()
-_configuration_sets = AccountScopedDict()
+_identities = AccountRegionScopedDict()
+# Per-account-and-region sent-mail record. The scoped dict stays under
+# "entries" so list manipulation remains simple while statistics stay regional.
+_sent_emails = AccountRegionScopedDict()
+_templates = AccountRegionScopedDict()
+_configuration_sets = AccountRegionScopedDict()
 
 
 def _sent_emails_list() -> list:
@@ -74,9 +80,25 @@ def get_state() -> dict:
 
 
 def restore_state(data: dict):
-    _identities.update(data.get("_identities", {}))
-    _templates.update(data.get("_templates", {}))
-    _configuration_sets.update(data.get("_configuration_sets", {}))
+    _restore_regional_store(_identities, data.get("_identities", {}))
+    _restore_regional_store(_templates, data.get("_templates", {}))
+    _restore_regional_store(
+        _configuration_sets, data.get("_configuration_sets", {})
+    )
+
+
+def _restore_regional_store(store, restored):
+    """Map legacy SES state to the boot region without inspecting content ARNs."""
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+    if isinstance(restored, AccountScopedDict):
+        region = get_region()
+        for (account_id, key), value in restored._data.items():
+            store.set_scoped(account_id, region, key, value)
+        return
+    for key, value in restored.items():
+        store[key] = value
 
 
 try:

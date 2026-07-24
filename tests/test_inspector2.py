@@ -4,9 +4,157 @@ Integration tests for the Inspector2 emulator.
 
 import json
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
 from conftest import ENDPOINT
+
+
+def _client(region="us-east-1", access_key="test"):
+    return boto3.client(
+        "inspector2",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id=access_key,
+        aws_secret_access_key="test",
+        region_name=region,
+        config=Config(region_name=region, retries={"max_attempts": 0}),
+    )
+
+
+def test_inspector2_state_is_region_scoped():
+    east = _client("us-east-1")
+    west = _client("us-west-2")
+    filter_name = "same-name-regional-filter"
+
+    east.disable(resourceTypes=[])
+    west.disable(resourceTypes=[])
+    east.enable(resourceTypes=["ECR"])
+    west.enable(resourceTypes=["EC2"])
+    east_filter = east.create_filter(
+        name=filter_name,
+        action="NONE",
+        filterCriteria={},
+    )
+    west_filter = west.create_filter(
+        name=filter_name,
+        action="NONE",
+        filterCriteria={},
+    )
+    east.tag_resource(resourceArn=east_filter["arn"], tags={"region": "east"})
+    west.tag_resource(resourceArn=west_filter["arn"], tags={"region": "west"})
+
+    try:
+        east_findings = east.list_findings()["findings"]
+        west_findings = west.list_findings()["findings"]
+        assert east_findings
+        assert west_findings
+        assert {resource["type"] for finding in east_findings for resource in finding["resources"]} == {
+            "AWS_ECR_CONTAINER_IMAGE"
+        }
+        assert {resource["type"] for finding in west_findings for resource in finding["resources"]} == {
+            "AWS_EC2_INSTANCE"
+        }
+        assert east.list_coverage()["coveredResources"]
+        assert west.list_coverage()["coveredResources"]
+        assert east.list_filters()["filters"][0]["arn"] == east_filter["arn"]
+        assert west.list_filters()["filters"][0]["arn"] == west_filter["arn"]
+        assert ":us-east-1:" in east_filter["arn"]
+        assert ":us-west-2:" in west_filter["arn"]
+        assert east.list_tags_for_resource(resourceArn=east_filter["arn"])["tags"] == {
+            "region": "east"
+        }
+        assert west.list_tags_for_resource(resourceArn=west_filter["arn"])["tags"] == {
+            "region": "west"
+        }
+    finally:
+        east.delete_filter(arn=east_filter["arn"])
+        west.delete_filter(arn=west_filter["arn"])
+        east.disable(resourceTypes=[])
+        west.disable(resourceTypes=[])
+
+
+def test_inspector2_legacy_buckets_restore_to_boot_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import inspector2 as service
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    embedded_region = "us-west-2"
+    finding_arn = f"arn:aws:inspector2:{embedded_region}:{account_id}:finding/legacy"
+
+    set_request_account_id(account_id)
+    set_request_region(boot_region)
+    payload = {}
+    for state_key, value in (
+        ("account_config", {"ecr": {"status": "ENABLED"}}),
+        ("findings", [{"findingArn": finding_arn}]),
+        ("coverage", [{"resourceId": "legacy-resource"}]),
+        ("scan_history", {"lastScanAt": "legacy"}),
+        ("filters", {"legacy": {"arn": f"arn:aws:inspector2:{embedded_region}:{account_id}:filter/legacy"}}),
+    ):
+        store = AccountScopedDict()
+        store[account_id] = value
+        payload[state_key] = store
+    tags = AccountScopedDict()
+    tags[account_id] = {finding_arn: {"legacy": "true"}}
+    payload["tags"] = tags
+
+    service.reset()
+    try:
+        service.restore_state(payload)
+        for state_key in (
+            "account_config",
+            "findings",
+            "coverage",
+            "scan_history",
+            "filters",
+        ):
+            store = getattr(service, f"_{state_key}")
+            assert store.get_scoped(account_id, boot_region, account_id) is not None
+            assert store.get_scoped(account_id, embedded_region, account_id) is None
+        assert service._tags.get_scoped(account_id, "", account_id) == {
+            finding_arn: {"legacy": "true"}
+        }
+    finally:
+        service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_inspector2_reset_clears_state_across_regions():
+    from ministack.core.responses import get_region, set_request_region
+    from ministack.services import inspector2 as service
+
+    original_region = get_region()
+    regional_stores = (
+        service._account_config,
+        service._findings,
+        service._coverage,
+        service._scan_history,
+        service._filters,
+    )
+    service.reset()
+    try:
+        for region in ("us-east-1", "us-west-2"):
+            set_request_region(region)
+            for store in regional_stores:
+                store["000000000000"] = {"region": region}
+        service._tags["000000000000"] = {"arn": {"tag": "value"}}
+        service.reset()
+        assert all(not store.has_any() for store in regional_stores)
+        assert not service._tags.to_dict()
+    finally:
+        service.reset()
+        set_request_region(original_region)
 
 
 class TestEnableDisable:
@@ -419,17 +567,7 @@ class TestMultitenancy:
     """Verify Inspector2 state is isolated per account ID."""
 
     def _client(self, access_key):
-        import boto3
-        from botocore.config import Config
-
-        return boto3.client(
-            "inspector2",
-            endpoint_url=ENDPOINT,
-            aws_access_key_id=access_key,
-            aws_secret_access_key="test",
-            region_name="us-east-1",
-            config=Config(region_name="us-east-1", retries={"max_attempts": 0}),
-        )
+        return _client(access_key=access_key)
 
     def test_findings_isolated_by_account(self):
         from ministack.services import inspector2 as _inspector2

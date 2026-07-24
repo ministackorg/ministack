@@ -1157,6 +1157,11 @@ async def _forward_to_tg(tg_arn, method, path, headers, body, query_params):
         return await _invoke_lambda_target(func_id, tg_arn, method, path,
                                            headers, body, query_params)
 
+    if target_type in ("instance", "ip"):
+        target = random.choice(registered)
+        return await _proxy_http_target(target, tg, method, path,
+                                        headers, body, query_params)
+
     return (502, {"Content-Type": "application/json"},
             json.dumps({"message": f"Target type '{target_type}' not supported."}).encode())
 
@@ -1257,6 +1262,53 @@ async def _invoke_lambda_target(function_ref, tg_arn, method, path, headers, bod
     except Exception:
         raw = json.dumps(lambda_response).encode()
         return 200, {"Content-Type": "text/plain"}, raw
+
+
+async def _proxy_http_target(target, tg, method, path, headers, body, query_params):
+    """Forward a data-plane request to an instance/ip target over HTTP.
+
+    The target Id is used as the host to connect to — an IP address for
+    ip target groups, or any resolvable hostname for instance target
+    groups (an emulator has no EC2 metadata to resolve instance ids
+    against, so a hostname is the useful interpretation). Mirrors ALB
+    behavior: hop-by-hop headers are stripped, X-Forwarded-* and
+    X-Amzn-Trace-Id are injected, target HTTP errors pass through, and
+    connection failures surface as 502.
+    """
+    import urllib.error
+    import urllib.request
+    from urllib.parse import urlencode
+
+    host = str(target.get("Id", ""))
+    port = int(target.get("Port") or tg.get("Port") or 80)
+    qs = {k: (v[0] if isinstance(v, list) else v) for k, v in (query_params or {}).items()}
+    url = f"http://{host}:{port}{path}" + (f"?{urlencode(qs)}" if qs else "")
+
+    hop_by_hop = {"host", "content-length", "connection", "transfer-encoding",
+                  "accept-encoding"}
+    fwd = {k: v for k, v in (headers or {}).items() if k.lower() not in hop_by_hop}
+    fwd["X-Forwarded-For"] = (headers or {}).get("x-forwarded-for") or "127.0.0.1"
+    fwd.setdefault("X-Forwarded-Proto", "http")
+    fwd.setdefault("X-Forwarded-Port", "80")
+    fwd["X-Amzn-Trace-Id"] = "Root=1-%08x-%s" % (
+        int(time.time()),
+        "".join(random.choices("0123456789abcdef", k=24)),
+    )
+
+    data = body if isinstance(body, (bytes, bytearray)) else (body.encode() if body else None)
+
+    def _do():
+        req = urllib.request.Request(url, data=data, method=method.upper(), headers=fwd)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return resp.status, dict(resp.headers), resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, dict(e.headers), e.read()
+        except Exception as e:
+            return (502, {"Content-Type": "application/json"},
+                    json.dumps({"message": f"Target {host}:{port} connect error: {e}"}).encode())
+
+    return await asyncio.to_thread(_do)
 
 
 # ---------------------------------------------------------------------------

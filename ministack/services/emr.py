@@ -24,6 +24,7 @@ import time
 
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -40,12 +41,29 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # State
 # ---------------------------------------------------------------------------
 
-_clusters = AccountScopedDict()   # cluster_id -> cluster record
-_steps = AccountScopedDict()      # cluster_id -> [step records]
-_block_public_access: dict = {
-    "BlockPublicSecurityGroupRules": False,
-    "PermittedPublicSecurityGroupRuleRanges": [],
-}
+_clusters = AccountRegionScopedDict()   # cluster_id -> cluster record
+_steps = AccountRegionScopedDict()      # cluster_id -> [step records]
+_block_public_access = AccountRegionScopedDict()
+_BLOCK_PUBLIC_ACCESS_KEY = "configuration"
+
+
+def _default_block_public_access():
+    return {
+        "BlockPublicSecurityGroupRules": False,
+        "PermittedPublicSecurityGroupRuleRanges": [],
+    }
+
+
+def _get_block_public_access():
+    if _BLOCK_PUBLIC_ACCESS_KEY not in _block_public_access:
+        _block_public_access[_BLOCK_PUBLIC_ACCESS_KEY] = _default_block_public_access()
+    return _block_public_access[_BLOCK_PUBLIC_ACCESS_KEY]
+
+
+def _clear_state():
+    _clusters.clear()
+    _steps.clear()
+    _block_public_access.clear()
 
 
 def get_state():
@@ -57,9 +75,59 @@ def get_state():
 
 
 def restore_state(data):
+    if not data:
+        return
+    _clear_state()
     _clusters.update(data.get("_clusters", {}))
-    _steps.update(data.get("_steps", {}))
-    _block_public_access.update(data.get("_block_public_access", {}))
+    cluster_regions = {
+        (account_id, cluster_id): region
+        for (account_id, region, cluster_id), _cluster in _clusters.all_items()
+    }
+    _restore_steps(data.get("_steps", {}), cluster_regions)
+    _restore_block_public_access(data.get("_block_public_access", {}))
+
+
+def _restore_steps(restored, cluster_regions):
+    """Adopt legacy step lists into their parent cluster's region."""
+    if isinstance(restored, AccountRegionScopedDict):
+        _steps.update(restored)
+        return
+
+    if isinstance(restored, AccountScopedDict):
+        items = restored._data.items()
+    else:
+        account_id = get_account_id()
+        items = (((account_id, key), value) for key, value in restored.items())
+
+    for (account_id, cluster_id), value in items:
+        # Step arguments can contain unrelated regional ARNs, so an orphaned
+        # step list stays in the boot region instead of inferring from content.
+        region = cluster_regions.get(
+            (account_id, cluster_id),
+            get_region(),
+        )
+        _steps.set_scoped(account_id, region, cluster_id, value)
+
+
+def _restore_block_public_access(restored):
+    if isinstance(restored, AccountRegionScopedDict):
+        _block_public_access.update(restored)
+        return
+
+    if isinstance(restored, AccountScopedDict):
+        for (account_id, key), value in restored._data.items():
+            _block_public_access.set_scoped(account_id, get_region(), key, value)
+        return
+
+    if "BlockPublicSecurityGroupRules" in restored:
+        _block_public_access[_BLOCK_PUBLIC_ACCESS_KEY] = {
+            "BlockPublicSecurityGroupRules": restored.get(
+                "BlockPublicSecurityGroupRules", False
+            ),
+            "PermittedPublicSecurityGroupRuleRanges": restored.get(
+                "PermittedPublicSecurityGroupRuleRanges", []
+            ),
+        }
 
 
 try:
@@ -537,7 +605,7 @@ def _remove_tags(data):
 
 def _get_block_public_access_configuration(data):
     return json_response({
-        "BlockPublicAccessConfiguration": _block_public_access,
+        "BlockPublicAccessConfiguration": _get_block_public_access(),
         "BlockPublicAccessConfigurationMetadata": {
             "CreationDateTime": _now_iso(),
             "CreatedByArn": f"arn:aws:iam::{get_account_id()}:root",
@@ -547,10 +615,11 @@ def _get_block_public_access_configuration(data):
 
 def _put_block_public_access_configuration(data):
     config = data.get("BlockPublicAccessConfiguration", {})
-    _block_public_access["BlockPublicSecurityGroupRules"] = config.get(
+    scoped_config = _get_block_public_access()
+    scoped_config["BlockPublicSecurityGroupRules"] = config.get(
         "BlockPublicSecurityGroupRules", False
     )
-    _block_public_access["PermittedPublicSecurityGroupRuleRanges"] = config.get(
+    scoped_config["PermittedPublicSecurityGroupRuleRanges"] = config.get(
         "PermittedPublicSecurityGroupRuleRanges", []
     )
     return json_response({})
@@ -606,7 +675,4 @@ async def handle_request(method, path, headers, body, query_params):
 # ---------------------------------------------------------------------------
 
 def reset():
-    _clusters.clear()
-    _steps.clear()
-    _block_public_access["BlockPublicSecurityGroupRules"] = False
-    _block_public_access["PermittedPublicSecurityGroupRuleRanges"] = []
+    _clear_state()

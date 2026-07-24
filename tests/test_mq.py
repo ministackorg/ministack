@@ -7,6 +7,34 @@ import uuid
 import pytest
 from botocore.exceptions import ClientError
 
+
+@pytest.fixture
+def isolated_mq_module_state():
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import mq as service
+
+    original_account = get_account_id()
+    original_region = get_region()
+    stores = (service._brokers, service._name_index, service._tags, service._users)
+    original_data = [dict(store._data) for store in stores]
+
+    service.reset()
+    set_request_account_id("111111111111")
+    set_request_region("us-east-1")
+    try:
+        yield service
+    finally:
+        service.reset()
+        for store, data in zip(stores, original_data):
+            store._data.update(data)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
 # ###########################################################################
 # Helpers
 # ###########################################################################
@@ -955,9 +983,9 @@ def test_mq_update_user(mq):
 
     # Verify updates
     user = mq.describe_user(BrokerId=broker_id, Username="full_update_user")
-    assert user["ConsoleAccess"] == True
+    assert user["ConsoleAccess"]
     assert set(user["Groups"]) == {"admins", "ops"}
-    assert user["ReplicationUser"] == True
+    assert user["ReplicationUser"]
 
 def test_mq_update_user_with_non_existent_username(mq):
     broker_id = _create(mq, BrokerName=_name("user"), EngineType="ACTIVEMQ", EngineVersion="5.19")["BrokerId"]
@@ -1175,8 +1203,8 @@ def test_mq_multiple_brokers_isolated_users(mq):
 
     assert user1 is not None
     assert user2 is not None
-    assert user1["ConsoleAccess"] == True
-    assert user2["ConsoleAccess"] == False
+    assert user1["ConsoleAccess"]
+    assert not user2["ConsoleAccess"]
 
 
 def test_mq_recreate_broker_after_delete_has_fresh_tags_and_users(mq):
@@ -1228,3 +1256,118 @@ def test_mq_recreate_broker_after_delete_has_fresh_tags_and_users(mq):
 
     # Verify old ARN is different from new ARN
     assert broker_arn1 != broker_arn2
+
+
+def _regional_broker_body(name):
+    return {
+        "brokerName": name,
+        "engineType": "ACTIVEMQ",
+        "engineVersion": "5.19",
+        "hostInstanceType": "mq.m5.large",
+        "publiclyAccessible": False,
+        "deploymentMode": "SINGLE_INSTANCE",
+    }
+
+
+def test_mq_brokers_are_isolated_by_region(isolated_mq_module_state):
+    import json
+
+    from ministack.core.responses import set_request_region
+
+    service = isolated_mq_module_state
+    broker_name = "regional-shared-name"
+
+    east_status, _headers, east_body = service._create_broker(
+        _regional_broker_body(broker_name)
+    )
+    east_broker_id = json.loads(east_body)["brokerId"]
+
+    set_request_region("us-west-2")
+    west_status, _headers, west_body = service._create_broker(
+        _regional_broker_body(broker_name)
+    )
+    west_broker_id = json.loads(west_body)["brokerId"]
+
+    assert east_status == west_status == 200
+    assert east_broker_id != west_broker_id
+    _status, _headers, west_list_body = service._list_brokers({})
+    assert [b["brokerId"] for b in json.loads(west_list_body)["brokerSummaries"]] == [
+        west_broker_id
+    ]
+    assert service._describe_broker(east_broker_id)[0] == 404
+
+    set_request_region("us-east-1")
+    _status, _headers, east_list_body = service._list_brokers({})
+    assert [b["brokerId"] for b in json.loads(east_list_body)["brokerSummaries"]] == [
+        east_broker_id
+    ]
+    assert service._create_broker(_regional_broker_body(broker_name))[0] == 409
+
+
+def test_mq_legacy_state_follows_parent_broker_region(isolated_mq_module_state):
+    from ministack.core.responses import AccountScopedDict
+
+    service = isolated_mq_module_state
+    account_id = "111111111111"
+    broker_id = "legacy-broker-id"
+    broker_name = "legacy-broker"
+    broker_arn = f"arn:aws:mq:us-west-2:{account_id}:broker:{broker_id}"
+
+    brokers = AccountScopedDict()
+    brokers.set_scoped(account_id, "ignored", broker_id, {
+        "brokerId": broker_id,
+        "brokerName": broker_name,
+        "brokerArn": broker_arn,
+    })
+    name_index = AccountScopedDict()
+    name_index.set_scoped(account_id, "ignored", broker_name, broker_id)
+    tags = AccountScopedDict()
+    tags.set_scoped(account_id, "ignored", broker_arn, {"env": "legacy"})
+    users = AccountScopedDict()
+    users.set_scoped(account_id, "ignored", broker_id, {
+        "legacy-user": {"username": "legacy-user"}
+    })
+
+    service.restore_state({
+        "brokers": brokers,
+        "name_index": name_index,
+        "tags": tags,
+        "users": users,
+    })
+
+    assert service._brokers.get_scoped(account_id, "us-west-2", broker_id) is not None
+    assert service._brokers.get_scoped(account_id, "us-east-1", broker_id) is None
+    assert service._name_index.get_scoped(account_id, "us-west-2", broker_name) == broker_id
+    assert "legacy-user" in service._users.get_scoped(account_id, "us-west-2", broker_id)
+    assert service._tags.get_scoped(account_id, "ignored", broker_arn) == {"env": "legacy"}
+
+
+def test_mq_legacy_orphaned_users_are_dropped(isolated_mq_module_state):
+    from ministack.core.responses import AccountScopedDict
+
+    service = isolated_mq_module_state
+    account_id = "111111111111"
+    users = AccountScopedDict()
+    users.set_scoped(account_id, "ignored", "missing-broker-id", {
+        "orphaned-user": {"username": "orphaned-user"}
+    })
+
+    service.restore_state({"users": users})
+
+    assert not service._users.has_any()
+
+
+def test_mq_reset_clears_all_regions(isolated_mq_module_state):
+    from ministack.core.responses import set_request_region
+
+    service = isolated_mq_module_state
+    assert service._create_broker(_regional_broker_body("east-broker"))[0] == 200
+    set_request_region("us-west-2")
+    assert service._create_broker(_regional_broker_body("west-broker"))[0] == 200
+
+    service.reset()
+
+    assert not service._brokers.has_any()
+    assert not service._name_index.has_any()
+    assert not service._users.has_any()
+    assert service._tags._data == {}

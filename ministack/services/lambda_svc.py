@@ -13,7 +13,7 @@ Supports: CreateFunction, DeleteFunction, GetFunction, GetFunctionConfiguration,
           GetLayerVersionPolicy,
           CreateEventSourceMapping, DeleteEventSourceMapping,
           GetEventSourceMapping, ListEventSourceMappings, UpdateEventSourceMapping,
-          GetFunctionEventInvokeConfig, PutFunctionEventInvokeConfig (stub),
+          GetFunctionEventInvokeConfig, PutFunctionEventInvokeConfig,
           PutFunctionConcurrency, GetFunctionConcurrency, DeleteFunctionConcurrency,
           GetFunctionCodeSigningConfig (stub),
           CreateFunctionUrlConfig, GetFunctionUrlConfig, UpdateFunctionUrlConfig,
@@ -995,6 +995,18 @@ def _normalize_endpoint_url(value: str) -> str:
     return f"http://{host}"
 
 
+def _rewrite_host_for_container(url: str) -> str:
+    """Rewrite a ``localhost``/``127.0.0.1`` URL to ``host.docker.internal`` so a
+    Docker Lambda container can reach ministack on the host. Explicitly
+    configured hosts (e.g. a Docker-network name) are left untouched."""
+    if not url:
+        return url
+    for host in ("localhost", "127.0.0.1"):
+        url = url.replace(f"://{host}:", "://host.docker.internal:")
+        url = url.replace(f"://{host}/", "://host.docker.internal/")
+    return url
+
+
 def _fetch_code_from_s3(bucket: str, key: str, version_id: str | None = None) -> bytes | None:
     """Fetch Lambda code zip from the in-memory S3 service.
 
@@ -1569,13 +1581,16 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
     # --- Event Invoke Config: /2019-09-25/functions/{name}/event-invoke-config ---
     if "event-invoke-config" in path:
         m = re.search(r"/functions/([^/]+)/event-invoke-config", path)
-        fname = _resolve_request_scoped_name(m.group(1)) if m else ""
+        fname, path_qualifier = (
+            _resolve_request_scoped_name_and_qualifier(m.group(1)) if m else ("", None)
+        )
+        qualifier = _qualifier_from_path_or_query(path_qualifier, query_params)
         if method == "GET":
-            return _get_event_invoke_config(fname)
+            return _get_event_invoke_config(fname, qualifier)
         if method == "PUT":
-            return _put_event_invoke_config(fname, data)
+            return _put_event_invoke_config(fname, qualifier, data)
         if method == "DELETE":
-            return _delete_event_invoke_config(fname)
+            return _delete_event_invoke_config(fname, qualifier)
 
     # --- Provisioned Concurrency: /2019-09-30/functions/{name}/provisioned-concurrency ---
     if "provisioned-concurrency" in path:
@@ -1808,6 +1823,7 @@ def _create_function(data: dict):
         "tags": data.get("Tags", {}),
         "policy": {"Version": "2012-10-17", "Id": "default", "Statement": []},
         "event_invoke_config": None,
+        "event_invoke_configs": {},
         "aliases": {},
         "concurrency": None,
         "provisioned_concurrency": {},
@@ -1892,25 +1908,20 @@ def _get_function_config(name: str, qualifier: str | None = None):
 
 
 def _list_function_event_invoke_configs(func_name: str, query_params: dict):
-    """AWS `ListFunctionEventInvokeConfigs` — returns the set of per-qualifier
-    event-invoke configs for a function. We store one per function on the
-    primary record (no per-qualifier split), so the result is 0 or 1 items."""
+    """AWS `ListFunctionEventInvokeConfigs` — return every qualifier config."""
     if func_name not in _functions:
         return error_response_json(
             "ResourceNotFoundException",
             f"Function not found: {_func_arn(func_name)}", 404,
         )
-    eic = _functions[func_name].get("event_invoke_config")
-    items = []
-    if eic:
-        arn = _func_arn(func_name)
-        items.append({
-            "FunctionArn": arn,
-            "LastModified": int(time.time()),
-            "MaximumRetryAttempts": eic.get("MaximumRetryAttempts", 2),
-            "MaximumEventAgeInSeconds": eic.get("MaximumEventAgeInSeconds", 21600),
-            "DestinationConfig": eic.get("DestinationConfig", {}),
-        })
+    func = _functions[func_name]
+    configs = dict(func.get("event_invoke_configs") or {})
+    # Backward compatibility for persisted state created before configs were
+    # qualifier-aware.
+    legacy = func.get("event_invoke_config")
+    if legacy and "" not in configs:
+        configs[""] = legacy
+    items = list(configs.values())
     return json_response({"FunctionEventInvokeConfigs": items})
 
 
@@ -2444,9 +2455,11 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
     log_output = result.get("log", "")
     if log_output:
         logger.info("Lambda %s output:\n%s", name, log_output)
-        resp_headers["X-Amz-Log-Result"] = base64.b64encode(
-            log_output.encode("utf-8"),
-        ).decode()
+        log_type = headers.get("x-amz-log-type") or headers.get("X-Amz-Log-Type") or "None"
+        if log_type.lower() == "tail":
+            resp_headers["X-Amz-Log-Result"] = base64.b64encode(
+                log_output.encode("utf-8")[-4096:],
+            ).decode()
 
     # Throttling takes a separate status path: HTTP 429 with the error body
     # shaped as a service-level exception, NOT the 200+X-Amz-Function-Error
@@ -2704,21 +2717,27 @@ def _pool_clear_all() -> None:
 def _pool_kill_function(account: str, func_name: str) -> None:
     """Kill every pooled docker container for a function across all qualifiers.
 
-    The pool key is ``{account}:{func_name}:zip:{CodeSha256}`` (or
+    The pool key is ``{account}:{region}:{func_name}:zip:{CodeSha256}`` (or
     ``:image:{ImageUri}``). UpdateFunctionConfiguration changes attributes that
     don't show up in the key (Layers / Environment / MemorySize / VpcConfig /
     Architectures / FileSystemConfigs / Runtime / Handler), so the same key
     would otherwise hand back a stale container that was spawned before the
-    config change. Issue #816 docker-executor follow-up: a layer attached
-    after the first invoke was never mounted on the reused warm container,
-    so handler imports from the layer kept failing even after the layer's
-    extracted dir was correct.
+    config change.
+
+    The region segment sits between ``account`` and ``func_name`` (added when the
+    warm-pool key became region-scoped). Match on the account and func_name
+    positions rather than a leading ``{account}:{func_name}:`` prefix -- that
+    prefix stopped matching any key after regionalization and left the old
+    container running with stale config after every UpdateFunctionConfiguration
+    (issue #1118). Issue #816 docker-executor follow-up: a layer attached after
+    the first invoke was never mounted on the reused warm container.
     """
-    prefix = f"{account}:{func_name}:"
     to_kill = []
     with _warm_pool_lock:
         for key in list(_warm_pool.keys()):
-            if key.startswith(prefix):
+            # key == "{account}:{region}:{func_name}:{zip|image}:{...}"
+            parts = key.split(":")
+            if len(parts) >= 3 and parts[0] == account and parts[2] == func_name:
                 to_kill.extend(_warm_pool.pop(key))
     for e in to_kill:
         _kill_pool_entry(e)
@@ -2803,7 +2822,11 @@ def invoke_async_with_retry(func: dict, event: dict) -> None:
         _request_account_id.set(account_id)
         _request_region.set(region)
         fn_name = config.get("FunctionName", "unknown")
-        eic = func.get("event_invoke_config") or {}
+        eic = (
+            func.get("event_invoke_config")
+            or (func.get("event_invoke_configs") or {}).get("$LATEST")
+            or {}
+        )
         max_retries = eic.get("MaximumRetryAttempts")
         if max_retries is None:
             max_retries = 2
@@ -3074,6 +3097,13 @@ def _docker_cp_dir(container, src_dir: str, dest_dir: str, arcname: str = "."):
 def _invoke_rie(container, event: dict, timeout: int) -> dict:
     """POST event to a running RIE container's HTTP endpoint."""
     import urllib.request
+    # A CloudFormation custom-resource ResponseURL points at ministack on the
+    # host; rewrite localhost/127.0.0.1 to host.docker.internal so the callback
+    # is reachable from inside the container (issue #1149), consistent with the
+    # AWS_ENDPOINT_URL rewrite. Without this the PUT fails with ConnectionRefused
+    # and the stack hangs on the custom resource until ServiceTimeout.
+    if isinstance(event, dict) and event.get("ResponseURL"):
+        event = {**event, "ResponseURL": _rewrite_host_for_container(event["ResponseURL"])}
     max_attempts = int(timeout * 10) + 20
     for _attempt in range(max_attempts):
         container.reload()
@@ -3335,10 +3365,7 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
         endpoint = f"http://host.docker.internal:{port}"
     else:
         # Rewrite localhost/127.0.0.1 → host.docker.internal for container access
-        endpoint = endpoint.replace("://localhost:", "://host.docker.internal:")
-        endpoint = endpoint.replace("://localhost/", "://host.docker.internal/")
-        endpoint = endpoint.replace("://127.0.0.1:", "://host.docker.internal:")
-        endpoint = endpoint.replace("://127.0.0.1/", "://host.docker.internal/")
+        endpoint = _rewrite_host_for_container(endpoint)
     container_env["AWS_ENDPOINT_URL"] = endpoint
 
     # Mounts (Zip only — Image bakes code in). Layers are NEVER bind-mounted:
@@ -5098,34 +5125,50 @@ def serve_layer_content(
 
 
 # ---------------------------------------------------------------------------
-# Event Invoke Config (stubs — enough for Terraform to not error)
+# Event Invoke Config
 # ---------------------------------------------------------------------------
 
 
-def _get_event_invoke_config(func_name: str):
+def _event_invoke_config(func: dict, qualifier: str | None) -> dict | None:
+    configs = func.get("event_invoke_configs") or {}
+    key = qualifier or ""
+    if key in configs:
+        return configs[key]
+    # Read legacy unqualified state written by older MiniStack versions.
+    if not qualifier:
+        return func.get("event_invoke_config")
+    return None
+
+
+def _get_event_invoke_config(func_name: str, qualifier: str | None = None):
     if func_name not in _functions:
         return error_response_json(
             "ResourceNotFoundException",
             f"Function not found: {_func_arn(func_name)}",
             404,
         )
-    eic = _functions[func_name].get("event_invoke_config")
+    if not _function_qualifier_exists(_functions[func_name], qualifier):
+        return _function_qualifier_not_found(func_name, qualifier)
+    eic = _event_invoke_config(_functions[func_name], qualifier)
     if not eic:
+        suffix = f":{qualifier}" if qualifier else ""
         return error_response_json(
             "ResourceNotFoundException",
-            f"The function {func_name} doesn't have an EventInvokeConfig",
+            f"The function {func_name}{suffix} doesn't have an EventInvokeConfig",
             404,
         )
     return json_response(eic)
 
 
-def _put_event_invoke_config(func_name: str, data: dict):
+def _put_event_invoke_config(func_name: str, qualifier: str | None, data: dict):
     if func_name not in _functions:
         return error_response_json(
             "ResourceNotFoundException",
             f"Function not found: {_func_arn(func_name)}",
             404,
         )
+    if not _function_qualifier_exists(_functions[func_name], qualifier):
+        return _function_qualifier_not_found(func_name, qualifier)
     destination_config = data.get(
         "DestinationConfig",
         {
@@ -5136,25 +5179,45 @@ def _put_event_invoke_config(func_name: str, data: dict):
     err = _validate_destination_config(destination_config)
     if err:
         return err
+    function_arn = _func_arn(func_name)
+    if qualifier:
+        function_arn = f"{function_arn}:{qualifier}"
     eic = {
-        "FunctionArn": _func_arn(func_name),
+        "FunctionArn": function_arn,
         "MaximumRetryAttempts": data.get("MaximumRetryAttempts", 2),
         "MaximumEventAgeInSeconds": data.get("MaximumEventAgeInSeconds", 21600),
         "LastModified": int(time.time()),
         "DestinationConfig": destination_config,
     }
-    _functions[func_name]["event_invoke_config"] = eic
+    func = _functions[func_name]
+    func.setdefault("event_invoke_configs", {})[qualifier or ""] = eic
+    if not qualifier:
+        func["event_invoke_config"] = eic
     return json_response(eic)
 
 
-def _delete_event_invoke_config(func_name: str):
+def _delete_event_invoke_config(func_name: str, qualifier: str | None = None):
     if func_name not in _functions:
         return error_response_json(
             "ResourceNotFoundException",
             f"Function not found: {_func_arn(func_name)}",
             404,
         )
-    _functions[func_name]["event_invoke_config"] = None
+    if not _function_qualifier_exists(_functions[func_name], qualifier):
+        return _function_qualifier_not_found(func_name, qualifier)
+    func = _functions[func_name]
+    configs = func.setdefault("event_invoke_configs", {})
+    key = qualifier or ""
+    if key not in configs and not (not qualifier and func.get("event_invoke_config")):
+        suffix = f":{qualifier}" if qualifier else ""
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"The function {func_name}{suffix} doesn't have an EventInvokeConfig",
+            404,
+        )
+    configs.pop(key, None)
+    if not qualifier:
+        func["event_invoke_config"] = None
     return 204, {}, b""
 
 
@@ -5476,6 +5539,12 @@ _kinesis_positions = AccountRegionScopedDict()
 # Per-ESM DynamoDB stream tracking: esm_uuid -> {shard_id: position}
 _dynamodb_stream_positions = AccountRegionScopedDict()
 _dynamodb_stream_positions_lock = threading.Lock()
+# Per-ESM invoke-failure cooldown: esm_uuid -> monotonic time before which the
+# poller skips this ESM. Keeps a broken ESM's retries paced even while other
+# ESMs are busy and keep _poll_loop from sleeping between passes. Not
+# persisted — a warm boot simply starts with no cooldowns in effect.
+_esm_backoff_until = AccountRegionScopedDict()
+_ESM_BACKOFF_SECONDS = 1.0
 
 
 def _init_stream_position(esm_id, source_arn, starting):
@@ -5511,19 +5580,24 @@ def _ensure_poller():
 def _poll_loop():
     """Background thread: polls SQS/Kinesis/DynamoDB for active ESMs and invokes Lambda."""
     while True:
+        processed = False
         try:
-            _poll_sqs()
+            processed = _poll_sqs() or processed
         except Exception as e:
             logger.error("ESM SQS poller error: %s", e)
         try:
-            _poll_kinesis()
+            processed = _poll_kinesis() or processed
         except Exception as e:
             logger.error("ESM Kinesis poller error: %s", e)
         try:
-            _poll_dynamodb_streams()
+            processed = _poll_dynamodb_streams() or processed
         except Exception as e:
             logger.error("ESM DynamoDB streams poller error: %s", e)
-        time.sleep(1 if _esms.has_any() else 5)
+        # A pass that found work likely left more behind it - loop again 
+        # immediately rather than waiting out the idle cadence below, so
+        # throughput isn't throttled to batch_size-per-tick.
+        if not processed:
+            time.sleep(1 if _esms.has_any() else 5)
 
 
 def _iter_all_esms():
@@ -5550,7 +5624,11 @@ def _sqs_message_attributes_to_camel_case(attrs: dict) -> dict:
 
 
 def _poll_sqs():
+    """Returns True if any ESM advanced past a batch this pass (successfully
+    invoked, or filtered out entirely)."""
     from ministack.services import sqs as _sqs
+
+    processed_any = False
 
     for acct_id, region, esm in _iter_all_esms():
         account_token = _request_account_id.set(acct_id)
@@ -5582,6 +5660,10 @@ def _poll_sqs():
             queue_url = _sqs._queue_url(queue_name)
             queue = _sqs._queues.get(queue_url)
             if not queue or queue.get("attributes", {}).get("QueueArn") != source_arn:
+                continue
+
+            esm_id = esm["UUID"]
+            if _esm_backoff_until.get(esm_id, 0) > time.time():
                 continue
 
             batch_size = esm.get("BatchSize", 10)
@@ -5621,6 +5703,7 @@ def _poll_sqs():
                 # All records filtered out — treat the batch as processed.
                 for msg in batch:
                     queue["messages"].remove(msg)
+                processed_any = True
                 continue
 
             event = {"Records": records}
@@ -5635,7 +5718,12 @@ def _poll_sqs():
                     "ESM: Lambda %s failed processing SQS batch from %s (errorType=%s errorMessage=%s)\n%s",
                     func_name, queue_name, err_type, err_msg, result.get("log", ""),
                 )
+                # Failed messages stay invisible for their visibility timeout
+                # rather than advancing, so don't report this as processed.
+                _esm_backoff_until[esm_id] = time.time() + _ESM_BACKOFF_SECONDS
             else:
+                processed_any = True
+                _esm_backoff_until.pop(esm_id, None)
                 # Check for ReportBatchItemFailures — partial batch response
                 failed_ids = set()
                 if "ReportBatchItemFailures" in esm.get("FunctionResponseTypes", []):
@@ -5676,9 +5764,15 @@ def _poll_sqs():
             _request_account_id.reset(account_token)
             _request_region.reset(region_token)
 
+    return processed_any
+
 
 def _poll_kinesis():
+    """Returns True if any shard advanced past a batch this pass (successfully
+    invoked, or filtered out entirely)."""
     from ministack.services import kinesis as _kin
+
+    processed_any = False
 
     for acct_id, region, esm in _iter_all_esms():
         account_token = _request_account_id.set(acct_id)
@@ -5712,6 +5806,9 @@ def _poll_kinesis():
                 continue
 
             esm_id = esm["UUID"]
+            if _esm_backoff_until.get(esm_id, 0) > time.time():
+                continue
+
             if esm_id not in _kinesis_positions:
                 starting = esm.get("StartingPosition", "LATEST")
                 _kinesis_positions[esm_id] = {}
@@ -5772,6 +5869,7 @@ def _poll_kinesis():
                 records = _apply_filter_criteria(records, esm)
                 if not records:
                     _kinesis_positions[esm_id][shard_id] = pos + len(raw_records)
+                    processed_any = True
                     continue
 
                 event = {"Records": records}
@@ -5786,7 +5884,13 @@ def _poll_kinesis():
                         "ESM: Lambda %s failed processing Kinesis batch from %s/%s (errorType=%s errorMessage=%s)\n%s",
                         func_name, stream_name, shard_id, err_type, err_msg, result.get("log", ""),
                     )
+                    # Position doesn't advance on failure, so the next pass
+                    # would refetch this exact batch — don't report it as
+                    # processed.
+                    _esm_backoff_until[esm_id] = time.time() + _ESM_BACKOFF_SECONDS
                 else:
+                    processed_any = True
+                    _esm_backoff_until.pop(esm_id, None)
                     positions[shard_id] = pos + len(raw_records)
                     esm["LastProcessingResult"] = f"OK - {len(raw_records)} records"
                     log_output = result.get("log", "")
@@ -5800,13 +5904,19 @@ def _poll_kinesis():
             _request_account_id.reset(account_token)
             _request_region.reset(region_token)
 
+    return processed_any
+
 
 def _poll_dynamodb_streams():
+    """Returns True if any table advanced past a batch this pass (successfully
+    invoked, or filtered out entirely)."""
     from ministack.services import dynamodb as _ddb
 
     stream_records = getattr(_ddb, "_stream_records", None)
     if stream_records is None:
-        return
+        return False
+
+    processed_any = False
 
     for acct_id, region, esm in _iter_all_esms():
         account_token = _request_account_id.set(acct_id)
@@ -5844,6 +5954,9 @@ def _poll_dynamodb_streams():
                 continue
 
             esm_id = esm["UUID"]
+            if _esm_backoff_until.get(esm_id, 0) > time.time():
+                continue
+
             with _dynamodb_stream_positions_lock:
                 if esm_id not in _dynamodb_stream_positions:
                     starting = esm.get("StartingPosition", "LATEST")
@@ -5864,6 +5977,7 @@ def _poll_dynamodb_streams():
                 # All records filtered — advance position so we don't re-evaluate.
                 with _dynamodb_stream_positions_lock:
                     _dynamodb_stream_positions[esm_id] = pos + raw_len
+                processed_any = True
                 continue
 
             event = {"Records": batch}
@@ -5878,7 +5992,13 @@ def _poll_dynamodb_streams():
                     "ESM: Lambda %s failed processing DynamoDB stream batch from %s (errorType=%s errorMessage=%s)\n%s",
                     func_name, table_name, err_type, err_msg, result.get("log", ""),
                 )
+                # Position doesn't advance on failure, so the next pass
+                # would refetch this exact batch — don't report it as
+                # processed.
+                _esm_backoff_until[esm_id] = time.time() + _ESM_BACKOFF_SECONDS
             else:
+                processed_any = True
+                _esm_backoff_until.pop(esm_id, None)
                 with _dynamodb_stream_positions_lock:
                     _dynamodb_stream_positions[esm_id] = pos + raw_len
                 esm["LastProcessingResult"] = f"OK - {len(batch)} records"
@@ -5892,6 +6012,8 @@ def _poll_dynamodb_streams():
         finally:
             _request_account_id.reset(account_token)
             _request_region.reset(region_token)
+
+    return processed_any
 
 
 # ---------------------------------------------------------------------------
@@ -5964,6 +6086,8 @@ def _update_function_url_config(func_name: str, data: dict, qualifier: str | Non
         cfg["AuthType"] = data["AuthType"]
     if "Cors" in data:
         cfg["Cors"] = data["Cors"]
+    if "InvokeMode" in data:
+        cfg["InvokeMode"] = data["InvokeMode"]
     cfg["LastModifiedTime"] = _now_iso()
     return json_response(cfg)
 
@@ -5995,6 +6119,7 @@ def reset():
     _function_urls.clear()
     _kinesis_positions.clear()
     _dynamodb_stream_positions.clear()
+    _esm_backoff_until.clear()
     _pool_clear_all()
     lambda_runtime.reset()
     with _provided_code_lock:

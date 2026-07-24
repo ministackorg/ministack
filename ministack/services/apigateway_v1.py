@@ -32,6 +32,7 @@ Control plane endpoints implemented:
   POST   /restapis/{id}/stages                                             — CreateStage
   GET    /restapis/{id}/stages                                             — GetStages
   GET    /restapis/{id}/stages/{stageName}                                 — GetStage
+  GET    /restapis/{id}/stages/{stageName}/exports/{exportType}            — GetExport
   PATCH  /restapis/{id}/stages/{stageName}                                 — UpdateStage
   DELETE /restapis/{id}/stages/{stageName}                                 — DeleteStage
   POST   /restapis/{id}/authorizers                                        — CreateAuthorizer
@@ -43,6 +44,15 @@ Control plane endpoints implemented:
   GET    /restapis/{id}/models                                             — GetModels
   GET    /restapis/{id}/models/{modelName}                                 — GetModel
   DELETE /restapis/{id}/models/{modelName}                                 — DeleteModel
+  POST   /restapis/{id}/documentation/parts                                — CreateDocumentationPart
+  GET    /restapis/{id}/documentation/parts                                — GetDocumentationParts
+  GET    /restapis/{id}/documentation/parts/{partId}                       — GetDocumentationPart
+  PATCH  /restapis/{id}/documentation/parts/{partId}                       — UpdateDocumentationPart
+  DELETE /restapis/{id}/documentation/parts/{partId}                       — DeleteDocumentationPart
+  PUT    /restapis/{id}/gatewayresponses/{responseType}                    — PutGatewayResponse
+  GET    /restapis/{id}/gatewayresponses                                   — GetGatewayResponses
+  GET    /restapis/{id}/gatewayresponses/{responseType}                    — GetGatewayResponse
+  DELETE /restapis/{id}/gatewayresponses/{responseType}                    — DeleteGatewayResponse
   GET    /apikeys                                                          — GetApiKeys
   POST   /apikeys                                                          — CreateApiKey
   GET    /apikeys/{keyId}                                                  — GetApiKey
@@ -78,6 +88,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+import yaml
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
@@ -115,6 +127,74 @@ _domain_name_regions = AccountScopedDict()  # domain_name -> owning region
 _base_path_mappings = AccountScopedDict()  # domain_name -> {base_path -> BasePathMapping}
 _v1_tags = AccountScopedDict()             # resource_arn -> {key -> value}
 _account_settings = AccountScopedDict()    # singleton per account: stores fields set via UpdateAccount
+_gateway_responses = AccountScopedDict()   # rest_api_id -> {response_type -> customized GatewayResponse}
+_documentation_parts = AccountScopedDict()  # rest_api_id -> {part_id -> DocumentationPart}
+
+
+_GATEWAY_RESPONSE_TYPES = (
+    "DEFAULT_4XX",
+    "DEFAULT_5XX",
+    "RESOURCE_NOT_FOUND",
+    "UNAUTHORIZED",
+    "INVALID_API_KEY",
+    "ACCESS_DENIED",
+    "AUTHORIZER_FAILURE",
+    "AUTHORIZER_CONFIGURATION_ERROR",
+    "INVALID_SIGNATURE",
+    "EXPIRED_TOKEN",
+    "MISSING_AUTHENTICATION_TOKEN",
+    "INTEGRATION_FAILURE",
+    "INTEGRATION_TIMEOUT",
+    "API_CONFIGURATION_ERROR",
+    "UNSUPPORTED_MEDIA_TYPE",
+    "BAD_REQUEST_PARAMETERS",
+    "BAD_REQUEST_BODY",
+    "REQUEST_TOO_LARGE",
+    "THROTTLED",
+    "QUOTA_EXCEEDED",
+    "WAF_FILTERED",
+)
+
+_DEFAULT_GATEWAY_RESPONSE_STATUS_CODES = {
+    "RESOURCE_NOT_FOUND": "404",
+    "UNAUTHORIZED": "401",
+    "INVALID_API_KEY": "403",
+    "ACCESS_DENIED": "403",
+    "AUTHORIZER_FAILURE": "500",
+    "AUTHORIZER_CONFIGURATION_ERROR": "500",
+    "INVALID_SIGNATURE": "403",
+    "EXPIRED_TOKEN": "403",
+    "MISSING_AUTHENTICATION_TOKEN": "403",
+    "INTEGRATION_FAILURE": "504",
+    "INTEGRATION_TIMEOUT": "504",
+    "API_CONFIGURATION_ERROR": "500",
+    "UNSUPPORTED_MEDIA_TYPE": "415",
+    "BAD_REQUEST_PARAMETERS": "400",
+    "BAD_REQUEST_BODY": "400",
+    "REQUEST_TOO_LARGE": "413",
+    "THROTTLED": "429",
+    "QUOTA_EXCEEDED": "429",
+    "WAF_FILTERED": "403",
+}
+
+_DEFAULT_GATEWAY_RESPONSE_TEMPLATE = '{"message":$context.error.messageString}'
+
+_DOCUMENTATION_LOCATION_TYPES = frozenset(
+    {
+        "API",
+        "AUTHORIZER",
+        "MODEL",
+        "RESOURCE",
+        "METHOD",
+        "PATH_PARAMETER",
+        "QUERY_PARAMETER",
+        "REQUEST_HEADER",
+        "REQUEST_BODY",
+        "RESPONSE",
+        "RESPONSE_HEADER",
+        "RESPONSE_BODY",
+    }
+)
 
 
 # ---- Helpers ----
@@ -593,6 +673,8 @@ def get_state():
         "base_path_mappings": copy.deepcopy(_base_path_mappings),
         "v1_tags": copy.deepcopy(_v1_tags),
         "account_settings": copy.deepcopy(_account_settings),
+        "gateway_responses": copy.deepcopy(_gateway_responses),
+        "documentation_parts": copy.deepcopy(_documentation_parts),
     }
 
 
@@ -670,6 +752,8 @@ def load_persisted_state(data):
     _base_path_mappings.update(data.get("base_path_mappings", {}))
     _v1_tags.update(data.get("v1_tags", {}))
     _account_settings.update(data.get("account_settings", {}))
+    _gateway_responses.update(data.get("gateway_responses", {}))
+    _documentation_parts.update(data.get("documentation_parts", {}))
     _backfill_tag_region_map(_rest_apis, _rest_api_regions, _region_from_rest_api_record)
     _backfill_tag_region_map(_api_keys, _api_key_regions, _region_from_api_key_record)
     _backfill_tag_region_map(_usage_plans, _usage_plan_regions, _region_from_usage_plan_record)
@@ -695,6 +779,8 @@ def reset():
     _base_path_mappings.clear()
     _v1_tags.clear()
     _account_settings.clear()
+    _gateway_responses.clear()
+    _documentation_parts.clear()
 
 
 # ---- Control plane router ----
@@ -920,12 +1006,17 @@ async def handle_request(method, path, headers, body, query_params):
         # /restapis/{id}/stages[/{stageName}]
         elif sub == "stages":
             stage_name = parts[3] if len(parts) > 3 else None
+            stage_sub = parts[4] if len(parts) > 4 else None
+            export_type = parts[5] if len(parts) > 5 else None
             if not stage_name:
                 if method == "POST":
                     return _create_stage(api_id, data)
                 if method == "GET":
                     return _get_stages(api_id)
-            else:
+            elif stage_sub == "exports":
+                if method == "GET" and export_type and len(parts) == 6:
+                    return _get_export(api_id, stage_name, export_type, headers, query_params)
+            elif stage_sub is None:
                 if method == "GET":
                     return _get_stage(api_id, stage_name)
                 if method == "PATCH":
@@ -964,6 +1055,36 @@ async def handle_request(method, path, headers, body, query_params):
                     return _update_model(api_id, model_name, data)
                 if method == "DELETE":
                     return _delete_model(api_id, model_name)
+
+        # /restapis/{id}/documentation/parts[/{partId}]
+        elif sub == "documentation" and len(parts) > 3 and parts[3] == "parts":
+            part_id = parts[4] if len(parts) > 4 else None
+            if part_id is None:
+                if method == "POST":
+                    return _create_documentation_part(api_id, data)
+                if method == "GET":
+                    return _get_documentation_parts(api_id, query_params)
+            else:
+                if method == "GET":
+                    return _get_documentation_part(api_id, part_id)
+                if method == "PATCH":
+                    return _update_documentation_part(api_id, part_id, data)
+                if method == "DELETE":
+                    return _delete_documentation_part(api_id, part_id)
+
+        # /restapis/{id}/gatewayresponses[/{responseType}]
+        elif sub == "gatewayresponses":
+            response_type = parts[3] if len(parts) > 3 else None
+            if response_type is None:
+                if method == "GET":
+                    return _get_gateway_responses(api_id)
+            else:
+                if method == "PUT":
+                    return _put_gateway_response(api_id, response_type, data)
+                if method == "GET":
+                    return _get_gateway_response(api_id, response_type)
+                if method == "DELETE":
+                    return _delete_gateway_response(api_id, response_type)
 
     return _v1_error("NotFoundException", f"Unknown API Gateway v1 path: {path}", 404)
 
@@ -1321,6 +1442,8 @@ def _create_rest_api(data):
     _deployments_v1[api_id] = {}
     _authorizers_v1[api_id] = {}
     _models[api_id] = {}
+    _gateway_responses[api_id] = {}
+    _documentation_parts[api_id] = {}
 
     # Create root resource "/"
     root_id = _new_id()[:8]
@@ -1367,6 +1490,8 @@ def _delete_rest_api(api_id):
     _deployments_v1.pop(api_id, None)
     _authorizers_v1.pop(api_id, None)
     _models.pop(api_id, None)
+    _gateway_responses.pop(api_id, None)
+    _documentation_parts.pop(api_id, None)
     _v1_tags.pop(_rest_api_arn(api_id), None)
     return 202, {}, b""
 
@@ -1429,6 +1554,285 @@ def _import_operation(api_id, resource_id, http_method, operation):
             "httpMethod": integration.get("httpMethod"),
             "uri": integration.get("uri"),
         })
+
+
+def _schema_ref(model_name, export_type):
+    escaped_name = str(model_name).replace("~", "~0").replace("/", "~1")
+    container = "components/schemas" if export_type == "oas30" else "definitions"
+    return {"$ref": f"#/{container}/{escaped_name}"}
+
+
+def _export_model_schemas(api_id):
+    schemas = {}
+    for model_name, model in _models.get(api_id, {}).items():
+        schema = model.get("schema")
+        if isinstance(schema, dict):
+            schemas[model_name] = schema
+            continue
+        try:
+            schemas[model_name] = json.loads(schema or "{}")
+        except (TypeError, json.JSONDecodeError):
+            schemas[model_name] = {}
+    return schemas
+
+
+def _export_method_parameters(method_obj, export_type):
+    parameters = []
+    location_map = {"path": "path", "querystring": "query", "header": "header"}
+    for parameter_name, required in method_obj.get("requestParameters", {}).items():
+        parts = parameter_name.split(".", 3)
+        if len(parts) != 4 or parts[:2] != ["method", "request"]:
+            continue
+        location = location_map.get(parts[2])
+        if location is None:
+            continue
+        parameter = {
+            "name": parts[3],
+            "in": location,
+            "required": True if location == "path" else bool(required),
+        }
+        if export_type == "oas30":
+            parameter["schema"] = {"type": "string"}
+        else:
+            parameter["type"] = "string"
+        parameters.append(parameter)
+    return parameters
+
+
+def _export_method_responses(method_obj, export_type):
+    exported = {}
+    for status_code, response in method_obj.get("methodResponses", {}).items():
+        item = {"description": f"{status_code} response"}
+        response_models = response.get("responseModels", {})
+        response_parameters = response.get("responseParameters", {})
+
+        if export_type == "oas30":
+            content = {}
+            for content_type, model_name in response_models.items():
+                content[content_type] = {"schema": _schema_ref(model_name, export_type)}
+            if content:
+                item["content"] = content
+            headers = {}
+            for parameter_name in response_parameters:
+                prefix = "method.response.header."
+                if parameter_name.startswith(prefix):
+                    headers[parameter_name[len(prefix):]] = {"schema": {"type": "string"}}
+            if headers:
+                item["headers"] = headers
+        else:
+            if response_models:
+                model_name = response_models.get("application/json") or next(iter(response_models.values()))
+                item["schema"] = _schema_ref(model_name, export_type)
+            headers = {}
+            for parameter_name in response_parameters:
+                prefix = "method.response.header."
+                if parameter_name.startswith(prefix):
+                    headers[parameter_name[len(prefix):]] = {"type": "string"}
+            if headers:
+                item["headers"] = headers
+
+        exported[str(status_code)] = item
+
+    if not exported:
+        exported["200"] = {"description": "200 response"}
+    return exported
+
+
+def _export_integration(integration):
+    result = {
+        "type": str(integration.get("type", "aws_proxy")).lower(),
+        "httpMethod": integration.get("httpMethod"),
+        "uri": integration.get("uri"),
+        "connectionType": integration.get("connectionType"),
+        "requestParameters": integration.get("requestParameters", {}),
+        "requestTemplates": integration.get("requestTemplates", {}),
+        "passthroughBehavior": integration.get("passthroughBehavior"),
+        "cacheNamespace": integration.get("cacheNamespace"),
+        "cacheKeyParameters": integration.get("cacheKeyParameters", []),
+        "timeoutInMillis": integration.get("timeoutInMillis"),
+    }
+    for optional_key in ("credentials", "contentHandling"):
+        if integration.get(optional_key) is not None:
+            result[optional_key] = integration[optional_key]
+
+    responses = {}
+    for response in integration.get("integrationResponses", {}).values():
+        response_key = response.get("selectionPattern") or "default"
+        exported_response = {"statusCode": response.get("statusCode")}
+        for optional_key in ("responseParameters", "responseTemplates", "contentHandling"):
+            value = response.get(optional_key)
+            if value not in (None, {}, []):
+                exported_response[optional_key] = value
+        responses[response_key] = exported_response
+    if responses:
+        result["responses"] = responses
+
+    return {key: value for key, value in result.items() if value is not None}
+
+
+def _export_operation(method_obj, export_type, include_integrations):
+    operation = {"responses": _export_method_responses(method_obj, export_type)}
+    if method_obj.get("operationName"):
+        operation["operationId"] = method_obj["operationName"]
+
+    parameters = _export_method_parameters(method_obj, export_type)
+    request_models = method_obj.get("requestModels", {})
+    if export_type == "oas30":
+        content = {
+            content_type: {"schema": _schema_ref(model_name, export_type)}
+            for content_type, model_name in request_models.items()
+        }
+        if content:
+            operation["requestBody"] = {"content": content}
+    elif request_models:
+        content_types = list(request_models)
+        model_name = request_models.get("application/json") or request_models[content_types[0]]
+        parameters.append({
+            "name": "body",
+            "in": "body",
+            "required": False,
+            "schema": _schema_ref(model_name, export_type),
+        })
+        operation["consumes"] = content_types
+
+    if parameters:
+        operation["parameters"] = parameters
+
+    response_models = method_obj.get("methodResponses", {}).values()
+    produced_types = {
+        content_type
+        for response in response_models
+        for content_type in response.get("responseModels", {})
+    }
+    if export_type == "swagger" and produced_types:
+        operation["produces"] = sorted(produced_types)
+
+    if method_obj.get("apiKeyRequired"):
+        operation["security"] = [{"api_key": []}]
+
+    integration = method_obj.get("methodIntegration")
+    if include_integrations and integration:
+        operation["x-amazon-apigateway-integration"] = _export_integration(integration)
+    return operation
+
+
+def _get_export_extensions(query_params):
+    # API Gateway's query-string map is flattened by botocore, so
+    # parameters={"extensions": "integrations"} is sent as
+    # ?extensions=integrations. Keep the bracketed form as a compatibility
+    # fallback for callers which serialize REST query maps that way.
+    raw = query_params.get("extensions") or query_params.get("parameters[extensions]", [])
+    if not raw:
+        return set()
+    if isinstance(raw, str):
+        raw = [raw]
+    return {
+        extension.strip().lower()
+        for value in raw
+        for extension in value.split(",")
+        if extension.strip()
+    }
+
+
+def _build_api_export(api_id, stage_name, export_type, include_integrations):
+    api = _rest_apis[api_id]
+    version = api.get("version") or "1.0"
+    info = {"title": api.get("name", "unnamed"), "version": version}
+    if api.get("description"):
+        info["description"] = api["description"]
+
+    schemas = _export_model_schemas(api_id)
+    paths = {}
+    has_api_key_method = False
+    for resource in _resources.get(api_id, {}).values():
+        exported_methods = {}
+        for http_method, method_obj in resource.get("resourceMethods", {}).items():
+            method_key = (
+                "x-amazon-apigateway-any-method"
+                if http_method.upper() == "ANY"
+                else http_method.lower()
+            )
+            exported_methods[method_key] = _export_operation(
+                method_obj, export_type, include_integrations
+            )
+            has_api_key_method = has_api_key_method or bool(method_obj.get("apiKeyRequired"))
+        if exported_methods:
+            paths[resource.get("path", "/")] = exported_methods
+
+    region = _rest_api_regions.get(api_id) or get_region()
+    execute_url = f"https://{api_id}.execute-api.{region}.amazonaws.com/{stage_name}"
+    if export_type == "oas30":
+        components = {"schemas": schemas}
+        if has_api_key_method:
+            components["securitySchemes"] = {
+                "api_key": {"type": "apiKey", "name": "x-api-key", "in": "header"}
+            }
+        return {
+            "openapi": "3.0.1",
+            "info": info,
+            "servers": [{"url": execute_url}],
+            "paths": paths,
+            "components": components,
+        }
+
+    document = {
+        "swagger": "2.0",
+        "info": info,
+        "host": f"{api_id}.execute-api.{region}.amazonaws.com",
+        "basePath": f"/{stage_name}",
+        "schemes": ["https"],
+        "paths": paths,
+        "definitions": schemas,
+    }
+    if has_api_key_method:
+        document["securityDefinitions"] = {
+            "api_key": {"type": "apiKey", "name": "x-api-key", "in": "header"}
+        }
+    return document
+
+
+def _get_export(api_id, stage_name, export_type, headers, query_params):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    if stage_name not in _stages_v1.get(api_id, {}):
+        return _v1_error("NotFoundException", "Invalid Stage identifier specified", 404)
+
+    export_type = export_type.lower()
+    if export_type not in ("oas30", "swagger"):
+        return _v1_error(
+            "BadRequestException",
+            "Invalid export type. Supported types are 'oas30' and 'swagger'",
+            400,
+        )
+
+    accept = (headers.get("accept") or "application/json").split(",", 1)[0].split(";", 1)[0].strip().lower()
+    if accept == "application/json":
+        content_type = "application/json"
+        extension = "json"
+    elif accept in ("application/yaml", "application/x-yaml", "text/yaml"):
+        content_type = "application/yaml"
+        extension = "yaml"
+    else:
+        return _v1_error(
+            "BadRequestException",
+            "Invalid Accept header. Supported values are 'application/json' and 'application/yaml'",
+            400,
+        )
+
+    export_extensions = _get_export_extensions(query_params)
+    include_integrations = bool({"integrations", "apigateway"} & export_extensions)
+    document = _build_api_export(api_id, stage_name, export_type, include_integrations)
+    if extension == "json":
+        body = json.dumps(document, ensure_ascii=False).encode("utf-8")
+    else:
+        body = yaml.safe_dump(document, sort_keys=False).encode("utf-8")
+
+    api_name = re.sub(r"[^A-Za-z0-9._-]+", "-", _rest_apis[api_id].get("name", "api"))
+    filename = f"{api_name}-{stage_name}-{export_type}.{extension}"
+    return 200, {
+        "Content-Type": content_type,
+        "Content-Disposition": f'attachment; filename="{filename}"',
+    }, body
 
 
 # ---- Control plane: Resources ----
@@ -1944,6 +2348,194 @@ def _delete_model(api_id, model_name):
     return 202, {}, b""
 
 
+# ---- Control plane: Documentation Parts ----
+
+def _validate_documentation_api(api_id):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    return None
+
+
+def _create_documentation_part(api_id, data):
+    error = _validate_documentation_api(api_id)
+    if error is not None:
+        return error
+
+    location = dict(data.get("location") or {})
+    location_type = location.get("type")
+    if location_type not in _DOCUMENTATION_LOCATION_TYPES:
+        return _v1_error(
+            "BadRequestException",
+            "Invalid documentation part location type specified",
+            400,
+        )
+    if data.get("properties") is None:
+        return _v1_error(
+            "BadRequestException",
+            "Documentation part properties must be specified",
+            400,
+        )
+
+    part_id = _new_id()
+    part = {
+        "id": part_id,
+        "location": location,
+        "properties": data["properties"],
+    }
+    _documentation_parts.setdefault(api_id, {})[part_id] = part
+    return _v1_response(part, 201)
+
+
+def _get_documentation_part(api_id, part_id):
+    error = _validate_documentation_api(api_id)
+    if error is not None:
+        return error
+    part = _documentation_parts.get(api_id, {}).get(part_id)
+    if part is None:
+        return _v1_error(
+            "NotFoundException",
+            "Invalid DocumentationPart identifier specified",
+            404,
+        )
+    return _v1_response(part)
+
+
+def _get_documentation_parts(api_id, query_params):
+    error = _validate_documentation_api(api_id)
+    if error is not None:
+        return error
+
+    parts = list(_documentation_parts.get(api_id, {}).values())
+    location_type = _qp(query_params, "type")
+    name_query = _qp(query_params, "name")
+    path = _qp(query_params, "path")
+    location_status = _qp(query_params, "locationStatus")
+    if location_type:
+        parts = [part for part in parts if part["location"].get("type") == location_type]
+    if name_query:
+        parts = [part for part in parts if name_query in part["location"].get("name", "")]
+    if path:
+        parts = [part for part in parts if part["location"].get("path") == path]
+    # Stored parts are documented by definition. API Gateway also synthesizes
+    # undocumented API entities for this filter; MiniStack has no need to
+    # materialize those placeholder records.
+    if location_status == "UNDOCUMENTED":
+        parts = []
+    return _v1_paginated_response(parts, query_params)
+
+
+def _update_documentation_part(api_id, part_id, data):
+    error = _validate_documentation_api(api_id)
+    if error is not None:
+        return error
+    part = _documentation_parts.get(api_id, {}).get(part_id)
+    if part is None:
+        return _v1_error(
+            "NotFoundException",
+            "Invalid DocumentationPart identifier specified",
+            404,
+        )
+    _apply_patch(part, data.get("patchOperations", []))
+    return _v1_response(part)
+
+
+def _delete_documentation_part(api_id, part_id):
+    error = _validate_documentation_api(api_id)
+    if error is not None:
+        return error
+    parts = _documentation_parts.get(api_id, {})
+    if part_id not in parts:
+        return _v1_error(
+            "NotFoundException",
+            "Invalid DocumentationPart identifier specified",
+            404,
+        )
+    parts.pop(part_id, None)
+    return 202, {}, b""
+
+
+# ---- Control plane: Gateway Responses ----
+
+def _default_gateway_response(response_type):
+    """Return the API Gateway-generated response used when no customization exists."""
+    response = {
+        "defaultResponse": True,
+        "responseType": response_type,
+        "responseParameters": {},
+        "responseTemplates": {
+            "application/json": _DEFAULT_GATEWAY_RESPONSE_TEMPLATE,
+        },
+    }
+    status_code = _DEFAULT_GATEWAY_RESPONSE_STATUS_CODES.get(response_type)
+    if status_code is not None:
+        response["statusCode"] = status_code
+    return response
+
+
+def _validate_gateway_response_target(api_id, response_type):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    if response_type not in _GATEWAY_RESPONSE_TYPES:
+        return _v1_error(
+            "BadRequestException",
+            f"Invalid gateway response type: {response_type}",
+            400,
+        )
+    return None
+
+
+def _put_gateway_response(api_id, response_type, data):
+    error = _validate_gateway_response_target(api_id, response_type)
+    if error is not None:
+        return error
+
+    status_code = data.get("statusCode")
+    if status_code is not None and not re.fullmatch(r"[1-5]\d\d", str(status_code)):
+        return _v1_error(
+            "BadRequestException",
+            "Invalid status code specified",
+            400,
+        )
+
+    response = _default_gateway_response(response_type)
+    response["defaultResponse"] = False
+    if status_code is not None:
+        response["statusCode"] = str(status_code)
+    response["responseParameters"] = dict(data.get("responseParameters") or {})
+    response["responseTemplates"] = dict(data.get("responseTemplates") or {})
+    _gateway_responses.setdefault(api_id, {})[response_type] = response
+    return _v1_response(response, 201)
+
+
+def _get_gateway_response(api_id, response_type):
+    error = _validate_gateway_response_target(api_id, response_type)
+    if error is not None:
+        return error
+    response = _gateway_responses.get(api_id, {}).get(response_type)
+    return _v1_response(response or _default_gateway_response(response_type))
+
+
+def _get_gateway_responses(api_id):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    customized = _gateway_responses.get(api_id, {})
+    responses = [
+        customized.get(response_type) or _default_gateway_response(response_type)
+        for response_type in _GATEWAY_RESPONSE_TYPES
+    ]
+    # AWS returns the complete GatewayResponses collection and ignores the
+    # otherwise-standard API Gateway pagination parameters for this operation.
+    return _v1_response({"item": responses})
+
+
+def _delete_gateway_response(api_id, response_type):
+    error = _validate_gateway_response_target(api_id, response_type)
+    if error is not None:
+        return error
+    _gateway_responses.get(api_id, {}).pop(response_type, None)
+    return 202, {}, b""
+
+
 # ---- Control plane: API Keys ----
 
 def _create_api_key(data):
@@ -2089,10 +2681,17 @@ def _create_domain_name(data):
         "domainName": domain_name,
         "certificateName": data.get("certificateName", ""),
         "certificateArn": data.get("certificateArn", ""),
+        "regionalCertificateName": data.get("regionalCertificateName", ""),
+        "regionalCertificateArn": data.get("regionalCertificateArn", ""),
         "distributionDomainName": f"{domain_name}.cloudfront.net",
+        "distributionHostedZoneId": "Z2FDTNDATAQYW2",
         "regionalDomainName": f"{domain_name}.execute-api.{get_region()}.amazonaws.com",
         "regionalHostedZoneId": "Z1UJRXOUMOOFQ8",
         "endpointConfiguration": data.get("endpointConfiguration", {"types": ["REGIONAL"]}),
+        "endpointAccessMode": data.get("endpointAccessMode", ""),
+        "mutualTlsAuthentication": data.get("mutualTlsAuthentication", {}),
+        "ownershipVerificationCertificateArn": data.get("ownershipVerificationCertificateArn", ""),
+        "routingMode": data.get("routingMode", "BASE_PATH_MAPPING_ONLY"),
         # securityPolicy is an opaque enum at the wire level; AWS keeps adding
         # new values (e.g. SecurityPolicy-TLS13-1-2-FIPS-PFS-PQ-2025-09 in
         # 2026-03). Accept whatever the caller sends; default mirrors AWS.

@@ -29,6 +29,7 @@ from ministack.core.responses import (
 logger = logging.getLogger("pipes")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+CROSS_REGION_PIPE_ERROR = "Creating cross-region pipe is not permitted."
 
 _pipes = AccountRegionScopedDict()       # pipe_name -> pipe record
 _positions = AccountRegionScopedDict()   # pipe_arn -> next stream record index
@@ -142,7 +143,17 @@ def register_pipe(
     starting_position: str = "LATEST",
     tags: dict | None = None,
 ):
-    arn = f"arn:aws:pipes:{get_region()}:{get_account_id()}:pipe/{name}"
+    pipe_region = get_region()
+    # AWS rejects cross-region source/target ARNs before role validation.
+    for component_arn in (source, target):
+        try:
+            component_region = parse_arn(component_arn).region
+        except ArnParseError:
+            continue
+        if component_region and component_region != pipe_region:
+            raise ValueError(CROSS_REGION_PIPE_ERROR)
+
+    arn = f"arn:aws:pipes:{pipe_region}:{get_account_id()}:pipe/{name}"
     state = "STOPPED" if str(desired_state).upper() == "STOPPED" else "RUNNING"
     start = str(starting_position or "LATEST").upper()
     if start not in ("LATEST", "TRIM_HORIZON"):

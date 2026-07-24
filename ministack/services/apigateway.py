@@ -1045,7 +1045,6 @@ async def _invoke_lambda_proxy(
         "rawPath": path,
         "rawQueryString": raw_qs,
         "headers": dict(headers),
-        "queryStringParameters": qs,
         "requestContext": {
             "accountId": get_account_id(),
             "apiId": api_id,
@@ -1064,9 +1063,21 @@ async def _invoke_lambda_proxy(
             "timeEpoch": int(time.time() * 1000),
         },
         "pathParameters": path_params,
-        "body": req_body,
         "isBase64Encoded": req_is_base64,
     }
+    # Real AWS omits body entirely for a bodyless request rather than sending
+    # it as null — same isAPIGatewayProxyEventV2 rejection as
+    # queryStringParameters below (undefined/a string are accepted, null is
+    # not), so this broke every GET/DELETE-style request with no payload.
+    if req_body is not None:
+        event["body"] = req_body
+    # Real AWS omits queryStringParameters entirely when there is no query
+    # string, rather than sending it as null — strict event-shape validators
+    # (e.g. Powertools' isAPIGatewayProxyEventV2) accept undefined/a record
+    # but reject null, so a present-but-null key fails every request lacking
+    # a query string.
+    if qs:
+        event["queryStringParameters"] = qs
     if authorizer_claims is not None:
         event["requestContext"]["authorizer"] = {
             "jwt": {

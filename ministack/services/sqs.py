@@ -415,10 +415,20 @@ def _act_delete_queue(data: dict, qurl: str) -> dict:
 
 def _act_list_queues(data: dict, _u: str) -> dict:
     pfx = data.get("QueueNamePrefix", "")
-    mx = int(data.get("MaxResults", 1000))
     urls = [u for u, q in _queues.items()
             if not pfx or q["name"].startswith(pfx)]
-    return {"QueueUrls": urls[:mx]}
+    # AWS parity: without MaxResults the response holds up to 1000 results
+    # and never a NextToken; with MaxResults, NextToken is returned whenever
+    # more results remain.
+    max_results = data.get("MaxResults")
+    if max_results is None:
+        return {"QueueUrls": urls[:1000]}
+    mx = int(max_results)
+    start = int(data.get("NextToken") or 0)
+    resp: dict = {"QueueUrls": urls[start:start + mx]}
+    if start + mx < len(urls):
+        resp["NextToken"] = str(start + mx)
+    return resp
 
 
 def _act_get_queue_url(data: dict, _u: str) -> dict:
@@ -1327,6 +1337,8 @@ def _to_xml(action: str, result: dict) -> tuple:
         members = "".join(
             f"<QueueUrl>{_esc(u)}</QueueUrl>"
             for u in result.get("QueueUrls", []))
+        if "NextToken" in result:
+            members += f"<NextToken>{_esc(result['NextToken'])}</NextToken>"
         return _xml_resp(200, "ListQueuesResponse",
                          f"<ListQueuesResult>{members}</ListQueuesResult>")
 
@@ -1503,7 +1515,7 @@ def _normalise(action: str, params: dict) -> dict:
     for key in ("QueueName", "QueueUrl", "MessageBody", "ReceiptHandle",
                 "VisibilityTimeout", "DelaySeconds", "WaitTimeSeconds",
                 "MaxNumberOfMessages", "MaxResults", "QueueNamePrefix",
-                "MessageGroupId", "MessageDeduplicationId",
+                "NextToken", "MessageGroupId", "MessageDeduplicationId",
                 "ReceiveRequestAttemptId"):
         v = _p(params, key)
         if v:

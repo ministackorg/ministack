@@ -27,7 +27,7 @@ import time
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
-    AccountScopedDict,
+    AccountRegionScopedDict,
     error_response_json,
     get_account_id,
     get_region,
@@ -45,15 +45,15 @@ _S3_BUCKET_NAME_RE = re.compile(
 
 # ─── in-memory state ──────────────────────────────────────────────────────────
 
-_streams = AccountScopedDict()          # name -> stream descriptor
+_streams = AccountRegionScopedDict()     # (account, region, name) -> stream descriptor
 _lock = threading.Lock()
 _dest_counter = 0
 
 
 def reset():
-    global _streams, _dest_counter
+    global _dest_counter
     with _lock:
-        _streams = {}
+        _streams.clear()
         _dest_counter = 0
 
 
@@ -62,7 +62,7 @@ def get_state() -> dict:
 
 
 def restore_state(data: dict):
-    global _streams, _dest_counter
+    global _dest_counter
     _streams.update(data.get("_streams", {}))
     _dest_counter = data.get("_dest_counter", _dest_counter)
 

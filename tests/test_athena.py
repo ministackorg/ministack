@@ -6,8 +6,21 @@ import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
+
+
+def _client(region):
+    return boto3.client(
+        "athena",
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        region_name=region,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        config=Config(retries={"mode": "standard"}),
+    )
 
 
 def test_athena_query(athena):
@@ -90,6 +103,273 @@ def test_athena_workgroup_v2(athena):
     athena.delete_work_group(WorkGroup="ath-wg-v2", RecursiveDeleteOption=True)
     with pytest.raises(ClientError):
         athena.get_work_group(WorkGroup="ath-wg-v2")
+
+
+def test_athena_named_resources_are_region_scoped():
+    east = _client("us-east-1")
+    west = _client("us-west-2")
+    suffix = _uuid_mod.uuid4().hex[:8]
+    workgroup = f"ath-region-wg-{suffix}"
+    catalog = f"ath-region-catalog-{suffix}"
+    statement = f"ath-region-statement-{suffix}"
+
+    for client, region in ((east, "east"), (west, "west")):
+        client.create_work_group(Name=workgroup, Description=region)
+        client.create_data_catalog(Name=catalog, Type="HIVE", Description=region)
+        client.create_prepared_statement(
+            StatementName=statement,
+            WorkGroup=workgroup,
+            QueryStatement=f"SELECT '{region}'",
+        )
+
+    try:
+        assert east.get_work_group(WorkGroup=workgroup)["WorkGroup"][
+            "Description"
+        ] == "east"
+        assert west.get_work_group(WorkGroup=workgroup)["WorkGroup"][
+            "Description"
+        ] == "west"
+        assert east.get_data_catalog(Name=catalog)["DataCatalog"][
+            "Description"
+        ] == "east"
+        assert west.get_data_catalog(Name=catalog)["DataCatalog"][
+            "Description"
+        ] == "west"
+        assert east.get_prepared_statement(
+            StatementName=statement, WorkGroup=workgroup
+        )["PreparedStatement"]["QueryStatement"] == "SELECT 'east'"
+        assert west.get_prepared_statement(
+            StatementName=statement, WorkGroup=workgroup
+        )["PreparedStatement"]["QueryStatement"] == "SELECT 'west'"
+    finally:
+        for client in (east, west):
+            client.delete_prepared_statement(
+                StatementName=statement, WorkGroup=workgroup
+            )
+            client.delete_data_catalog(Name=catalog)
+            client.delete_work_group(
+                WorkGroup=workgroup, RecursiveDeleteOption=True
+            )
+
+
+def test_athena_defaults_are_seeded_per_region():
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import athena as service
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+
+    service.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region("us-east-1")
+        service._ensure_default_workgroup()
+        service._ensure_default_data_catalog()
+        service._workgroups["primary"]["Description"] = "east primary"
+
+        set_request_region("us-west-2")
+        service._ensure_default_workgroup()
+        service._ensure_default_data_catalog()
+
+        assert service._workgroups["primary"]["Description"] == "Primary workgroup"
+        assert service._data_catalogs["AwsDataCatalog"]["Type"] == "GLUE"
+        assert service._workgroups.get_scoped(
+            account_id, "us-east-1", "primary"
+        )["Description"] == "east primary"
+        assert service._data_catalogs.get_scoped(
+            account_id, "us-east-1", "AwsDataCatalog"
+        )["Type"] == "GLUE"
+    finally:
+        service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_athena_legacy_state_migrates_to_configured_boot_region(monkeypatch):
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import athena as service
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    boot_region = "us-west-2"
+    first_request_region = "eu-central-1"
+    tags = AccountScopedDict()
+    stores = {
+        "_executions": ("legacy-execution", {"QueryExecutionId": "legacy-execution"}),
+        "_workgroups": ("legacy-workgroup", {"Name": "legacy-workgroup"}),
+        "_named_queries": ("legacy-query", {"NamedQueryId": "legacy-query"}),
+        "_data_catalogs": ("legacy-catalog", {"Name": "legacy-catalog"}),
+        "_prepared_statements": (
+            "legacy-workgroup/legacy-statement",
+            {"StatementName": "legacy-statement", "WorkGroup": "legacy-workgroup"},
+        ),
+    }
+
+    set_request_account_id(account_id)
+    monkeypatch.setattr(service, "REGION", boot_region)
+    set_request_region(first_request_region)
+    payload = {}
+    for store_name, (key, value) in stores.items():
+        legacy = AccountScopedDict()
+        legacy[key] = value
+        payload[store_name] = legacy
+    tag_arn = f"arn:aws:athena:{boot_region}:{account_id}:workgroup/legacy-workgroup"
+    tags[tag_arn] = {"legacy": "true"}
+    payload["_tags"] = tags
+
+    service.reset()
+    try:
+        service.restore_state(payload)
+        for store_name, (key, value) in stores.items():
+            restored = getattr(service, store_name).get_scoped(
+                account_id, boot_region, key
+            )
+            assert restored == value
+            assert (
+                getattr(service, store_name).get_scoped(
+                    account_id, first_request_region, key
+                )
+                is None
+            )
+        assert service._tags.get(tag_arn) == {"legacy": "true"}
+        assert get_region() == first_request_region
+    finally:
+        service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_athena_legacy_children_follow_workgroup_region(monkeypatch):
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import athena as service
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    workgroup_region = "us-west-2"
+    first_request_region = "eu-central-1"
+    workgroup_name = "legacy-workgroup"
+
+    def legacy_store(key, value):
+        store = AccountScopedDict()
+        store._data[(account_id, key)] = value
+        return store
+
+    payload = {
+        "_workgroups": legacy_store(
+            workgroup_name,
+            {
+                "Name": workgroup_name,
+                "Configuration": {
+                    "ResultConfiguration": {
+                        "EncryptionConfiguration": {
+                            "KmsKey": (
+                                f"arn:aws:kms:{workgroup_region}:{account_id}:key/key-id"
+                            )
+                        }
+                    }
+                },
+            },
+        ),
+        "_executions": legacy_store(
+            "legacy-execution",
+            {"QueryExecutionId": "legacy-execution", "WorkGroup": workgroup_name},
+        ),
+        "_named_queries": legacy_store(
+            "legacy-query",
+            {"NamedQueryId": "legacy-query", "WorkGroup": workgroup_name},
+        ),
+        "_prepared_statements": legacy_store(
+            f"{workgroup_name}/legacy-statement",
+            {
+                "StatementName": "legacy-statement",
+                "WorkGroupName": workgroup_name,
+            },
+        ),
+        "_data_catalogs": legacy_store(
+            "legacy-catalog", {"Name": "legacy-catalog"}
+        ),
+    }
+
+    monkeypatch.setattr(service, "REGION", boot_region)
+    set_request_account_id(account_id)
+    set_request_region(first_request_region)
+    service.reset()
+    try:
+        assert service.REGION != first_request_region
+        service.restore_state(payload)
+
+        assert service._workgroups.get_scoped(
+            account_id, workgroup_region, workgroup_name
+        )
+        for store_name, key in (
+            ("_executions", "legacy-execution"),
+            ("_named_queries", "legacy-query"),
+            ("_prepared_statements", f"{workgroup_name}/legacy-statement"),
+        ):
+            store = getattr(service, store_name)
+            assert store.get_scoped(account_id, workgroup_region, key)
+            assert store.get_scoped(account_id, boot_region, key) is None
+            assert store.get_scoped(account_id, first_request_region, key) is None
+        assert service._data_catalogs.get_scoped(
+            account_id, boot_region, "legacy-catalog"
+        )
+        assert get_region() == first_request_region
+    finally:
+        service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_reset_clears_athena_state_across_regions():
+    from ministack.core.responses import get_region, set_request_region
+    from ministack.services import athena as service
+
+    original_region = get_region()
+    regional_stores = (
+        service._executions,
+        service._workgroups,
+        service._named_queries,
+        service._data_catalogs,
+        service._prepared_statements,
+    )
+
+    service.reset()
+    try:
+        for region in ("us-east-1", "us-west-2"):
+            set_request_region(region)
+            for store in regional_stores:
+                store[f"resource-{region}"] = {"region": region}
+        service._tags["arn:aws:athena:us-east-1:000000000000:workgroup/tagged"] = {
+            "tag": "value"
+        }
+
+        service.reset()
+        assert all(not store.has_any() for store in regional_stores)
+        assert not service._tags._data
+    finally:
+        service.reset()
+        set_request_region(original_region)
 
 def test_athena_named_query_v2(athena):
     resp = athena.create_named_query(

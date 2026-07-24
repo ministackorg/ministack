@@ -6,8 +6,178 @@ import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
+
+
+def _emr_client(region):
+    return boto3.client(
+        "emr",
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region,
+        config=Config(region_name=region, retries={"mode": "standard"}),
+    )
+
+
+def _run_regional_cluster(client, name):
+    return client.run_job_flow(
+        Name=name,
+        ReleaseLabel="emr-6.10.0",
+        Instances={
+            "MasterInstanceType": "m5.xlarge",
+            "InstanceCount": 1,
+            "KeepJobFlowAliveWhenNoSteps": True,
+        },
+        JobFlowRole="EMR_EC2_DefaultRole",
+        ServiceRole="EMR_DefaultRole",
+    )
+
+
+def test_emr_state_and_block_public_access_are_region_scoped():
+    east = _emr_client("us-east-1")
+    west = _emr_client("us-west-2")
+    east_cluster = _run_regional_cluster(east, "same-name-regional-cluster")
+    west_cluster = _run_regional_cluster(west, "same-name-regional-cluster")
+    east_step = east.add_job_flow_steps(
+        JobFlowId=east_cluster["JobFlowId"],
+        Steps=[{"Name": "east-step", "HadoopJarStep": {"Jar": "command-runner.jar"}}],
+    )["StepIds"][0]
+    west_step = west.add_job_flow_steps(
+        JobFlowId=west_cluster["JobFlowId"],
+        Steps=[{"Name": "west-step", "HadoopJarStep": {"Jar": "command-runner.jar"}}],
+    )["StepIds"][0]
+
+    try:
+        east_ids = {cluster["Id"] for cluster in east.list_clusters()["Clusters"]}
+        west_ids = {cluster["Id"] for cluster in west.list_clusters()["Clusters"]}
+        assert east_cluster["JobFlowId"] in east_ids
+        assert east_cluster["JobFlowId"] not in west_ids
+        assert west_cluster["JobFlowId"] in west_ids
+        assert west_cluster["JobFlowId"] not in east_ids
+        assert ":us-east-1:" in east_cluster["ClusterArn"]
+        assert ":us-west-2:" in west_cluster["ClusterArn"]
+        assert east.list_steps(ClusterId=east_cluster["JobFlowId"])["Steps"][0]["Id"] == east_step
+        assert west.list_steps(ClusterId=west_cluster["JobFlowId"])["Steps"][0]["Id"] == west_step
+
+        assert east.get_block_public_access_configuration()["BlockPublicAccessConfiguration"] == {
+            "BlockPublicSecurityGroupRules": False,
+            "PermittedPublicSecurityGroupRuleRanges": [],
+        }
+        assert west.get_block_public_access_configuration()["BlockPublicAccessConfiguration"] == {
+            "BlockPublicSecurityGroupRules": False,
+            "PermittedPublicSecurityGroupRuleRanges": [],
+        }
+        east.put_block_public_access_configuration(
+            BlockPublicAccessConfiguration={
+                "BlockPublicSecurityGroupRules": True,
+                "PermittedPublicSecurityGroupRuleRanges": [{"MinRange": 22, "MaxRange": 22}],
+            }
+        )
+        assert east.get_block_public_access_configuration()["BlockPublicAccessConfiguration"][
+            "BlockPublicSecurityGroupRules"
+        ] is True
+        assert west.get_block_public_access_configuration()["BlockPublicAccessConfiguration"] == {
+            "BlockPublicSecurityGroupRules": False,
+            "PermittedPublicSecurityGroupRuleRanges": [],
+        }
+    finally:
+        east.put_block_public_access_configuration(
+            BlockPublicAccessConfiguration={"BlockPublicSecurityGroupRules": False}
+        )
+        west.put_block_public_access_configuration(
+            BlockPublicAccessConfiguration={"BlockPublicSecurityGroupRules": False}
+        )
+        east.terminate_job_flows(JobFlowIds=[east_cluster["JobFlowId"]])
+        west.terminate_job_flows(JobFlowIds=[west_cluster["JobFlowId"]])
+
+
+def test_emr_legacy_state_restores_children_beside_parent():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import emr as service
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    cluster_region = "us-west-2"
+    cluster_id = "j-LEGACYCLUSTER"
+    orphan_id = "j-ORPHANCLUSTER"
+    clusters = AccountScopedDict()
+    steps = AccountScopedDict()
+
+    set_request_account_id(account_id)
+    set_request_region(boot_region)
+    clusters[cluster_id] = {
+        "Id": cluster_id,
+        "ClusterArn": f"arn:aws:elasticmapreduce:{cluster_region}:{account_id}:cluster/{cluster_id}",
+    }
+    steps[cluster_id] = [{"Id": "s-LEGACY", "Name": "legacy-step"}]
+    steps[orphan_id] = [
+        {
+            "Id": "s-ORPHAN",
+            "Name": "orphan-step",
+            "Config": {
+                "Args": [
+                    f"arn:aws:lambda:{cluster_region}:{account_id}:function:incidental"
+                ]
+            },
+        }
+    ]
+
+    service.reset()
+    try:
+        service.restore_state(
+            {
+                "_clusters": clusters,
+                "_steps": steps,
+                "_block_public_access": {
+                    "BlockPublicSecurityGroupRules": True,
+                    "PermittedPublicSecurityGroupRuleRanges": [{"MinRange": 22, "MaxRange": 22}],
+                },
+            }
+        )
+        assert service._clusters.get_scoped(account_id, cluster_region, cluster_id)["Id"] == cluster_id
+        assert service._steps.get_scoped(account_id, cluster_region, cluster_id)[0]["Id"] == "s-LEGACY"
+        assert service._steps.get_scoped(account_id, boot_region, orphan_id)[0]["Id"] == "s-ORPHAN"
+        assert service._block_public_access.get_scoped(
+            account_id, boot_region, service._BLOCK_PUBLIC_ACCESS_KEY
+        )["BlockPublicSecurityGroupRules"] is True
+        assert service._block_public_access.get_scoped(
+            account_id, cluster_region, service._BLOCK_PUBLIC_ACCESS_KEY
+        ) is None
+    finally:
+        service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_emr_reset_clears_state_across_regions():
+    from ministack.core.responses import get_region, set_request_region
+    from ministack.services import emr as service
+
+    original_region = get_region()
+    stores = (service._clusters, service._steps, service._block_public_access)
+    service.reset()
+    try:
+        for region in ("us-east-1", "us-west-2"):
+            set_request_region(region)
+            for store in stores:
+                store[f"resource-{region}"] = {"region": region}
+        service.reset()
+        assert all(not store.has_any() for store in stores)
+    finally:
+        service.reset()
+        set_request_region(original_region)
 
 
 def test_emr_run_job_flow_simple(emr):

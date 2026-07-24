@@ -76,6 +76,7 @@ _thing_groups: AccountScopedDict = AccountScopedDict()
 _certificates: AccountScopedDict = AccountScopedDict()  # certificateId -> Certificate dict
 _policies: AccountScopedDict = AccountScopedDict()  # policyName -> Policy dict
 _topic_rules: AccountScopedDict = AccountScopedDict()  # ruleName -> TopicRule dict
+_shadows: AccountScopedDict = AccountScopedDict()  # (thingName, shadowName) -> shadow dict
 
 # Local CA state — lazily generated on first use, persisted across restarts.
 import threading
@@ -157,6 +158,7 @@ def get_state() -> dict:
         "certificates": copy.deepcopy(_certificates),
         "policies": copy.deepcopy(_policies),
         "topic_rules": copy.deepcopy(_topic_rules),
+        "shadows": copy.deepcopy(_shadows),
         "ca": {"ca_cert_pem": _ca_cert_pem, "ca_key_pem": _ca_key_pem}
         if _ca_cert_pem and _ca_key_pem
         else {},
@@ -174,6 +176,7 @@ def restore_state(data: dict | None) -> None:
     _certificates.update(data.get("certificates", {}))
     _policies.update(data.get("policies", {}))
     _topic_rules.update(data.get("topic_rules", {}))
+    _shadows.update(data.get("shadows", {}))
     ca_data = data.get("ca")
     if ca_data:
         cert = ca_data.get("ca_cert_pem")
@@ -194,6 +197,7 @@ def reset() -> None:
     _certificates.clear()
     _policies.clear()
     _topic_rules.clear()
+    _shadows.clear()
     with _CA_LOCK:
         _ca_cert_pem = None
         _ca_key_pem = None
@@ -1454,6 +1458,175 @@ def lookup_certificate_by_id(cert_id: str) -> dict | None:
     return _certificates.get(cert_id)
 
 
+# ---------------------------------------------------------------------------
+# Device Shadow (consumed by iot_data.py)
+# ---------------------------------------------------------------------------
+
+
+def _shadow_now() -> int:
+    return int(time.time())
+
+
+def _deep_merge(base: dict, patch: dict) -> dict:
+    """Merge ``patch`` into ``base`` in place. A ``null`` value removes the key."""
+    for k, v in patch.items():
+        if v is None:
+            base.pop(k, None)
+        elif isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
+def _build_metadata(state: dict, ts: int):
+    """Mirror a state subtree, replacing each leaf with ``{"timestamp": ts}``."""
+    if isinstance(state, dict):
+        return {k: _build_metadata(v, ts) for k, v in state.items()}
+    return {"timestamp": ts}
+
+
+def _compute_delta(desired: dict, reported: dict):
+    """Fields in ``desired`` that differ from ``reported`` (recursing into dicts)."""
+    delta = {}
+    for k, dv in desired.items():
+        rv = reported.get(k)
+        if isinstance(dv, dict) and isinstance(rv, dict):
+            sub = _compute_delta(dv, rv)
+            if sub:
+                delta[k] = sub
+        elif dv != rv:
+            delta[k] = dv
+    return delta
+
+
+def _merge_metadata(base: dict, patch: dict, ts: int) -> dict:
+    """Stamp a new ``timestamp`` only for the leaves the patch changes,
+    preserving the timestamps of attributes the patch does not touch (a
+    ``null`` removes the key). Mirrors ``_deep_merge`` so metadata tracks
+    per-attribute update times like real AWS IoT, instead of re-stamping the
+    whole document on every update."""
+    for k, v in patch.items():
+        if v is None:
+            base.pop(k, None)
+        elif isinstance(v, dict):
+            sub = base.get(k)
+            if not isinstance(sub, dict):
+                sub = {}
+                base[k] = sub
+            _merge_metadata(sub, v, ts)
+        else:
+            base[k] = {"timestamp": ts}
+    return base
+
+
+def _metadata_for_delta(delta: dict, desired_meta: dict) -> dict:
+    """Project the ``desired`` metadata onto the delta shape — AWS reports the
+    delta's metadata as the metadata of the matching desired attributes."""
+    out = {}
+    for k, dv in delta.items():
+        dm = desired_meta.get(k) if isinstance(desired_meta, dict) else None
+        if isinstance(dv, dict):
+            out[k] = _metadata_for_delta(dv, dm if isinstance(dm, dict) else {})
+        elif isinstance(dm, dict):
+            out[k] = dm
+        else:
+            out[k] = {"timestamp": _shadow_now()}
+    return out
+
+
+def _shadow_error(status: int, message: str) -> tuple:
+    return status, {"message": message}
+
+
+def update_thing_shadow(thing_name: str, shadow_name: str, request: dict) -> tuple:
+    """Merge ``request`` into the shadow. Returns (status, response_doc)."""
+    if not isinstance(request, dict) or not isinstance(request.get("state"), dict):
+        return _shadow_error(400, "Missing required node: state")
+
+    req_state = request["state"]
+    key = (thing_name, shadow_name)
+    rec = _shadows.get(key)
+    if rec is None or rec.get("deleted"):
+        # A deleted shadow keeps its version — AWS does not reset it to 0, so
+        # the next update resumes from the retained version instead of 1.
+        rec = {"state": {"desired": {}, "reported": {}},
+               "version": rec["version"] if rec else 0}
+
+    expected = request.get("version")
+    if expected is not None and expected != rec["version"]:
+        return _shadow_error(409, "Version conflict")
+
+    ts = _shadow_now()
+    for section in ("desired", "reported"):
+        if section in req_state:
+            patch = req_state[section]
+            if patch is None:
+                rec["state"][section] = {}
+            elif isinstance(patch, dict):
+                _deep_merge(rec["state"].setdefault(section, {}), patch)
+
+    rec["version"] += 1
+    meta = rec.setdefault("metadata", {"desired": {}, "reported": {}})
+    for section in ("desired", "reported"):
+        if section in req_state:
+            patch = req_state[section]
+            if patch is None:
+                meta[section] = {}
+            elif isinstance(patch, dict):
+                _merge_metadata(meta.setdefault(section, {}), patch, ts)
+    _shadows[key] = rec
+
+    # The /accepted response echoes only the sections present in the request.
+    resp_state = {s: req_state[s] for s in ("desired", "reported") if s in req_state and req_state[s] is not None}
+    resp_meta = {s: _build_metadata(req_state[s], ts) for s in resp_state}
+    doc = {"state": resp_state, "metadata": resp_meta, "version": rec["version"], "timestamp": ts}
+    if request.get("clientToken") is not None:
+        doc["clientToken"] = request["clientToken"]
+    return 200, doc
+
+
+def get_thing_shadow(thing_name: str, shadow_name: str) -> tuple:
+    """Return (status, full_shadow_doc) or a 404 error doc if none exists."""
+    rec = _shadows.get((thing_name, shadow_name))
+    if rec is None or rec.get("deleted"):
+        label = f"{thing_name}" if not shadow_name else f"{thing_name}/{shadow_name}"
+        return _shadow_error(404, f"No shadow exists with name: {label}")
+
+    desired = rec["state"].get("desired", {})
+    reported = rec["state"].get("reported", {})
+    state = {}
+    if desired:
+        state["desired"] = desired
+    if reported:
+        state["reported"] = reported
+    metadata = dict(rec.get("metadata", {"desired": {}, "reported": {}}))
+    delta = _compute_delta(desired, reported)
+    if delta:
+        state["delta"] = delta
+        metadata["delta"] = _metadata_for_delta(delta, metadata.get("desired", {}))
+    doc = {
+        "state": state,
+        "metadata": metadata,
+        "version": rec["version"],
+        "timestamp": _shadow_now(),
+    }
+    return 200, doc
+
+
+def delete_thing_shadow(thing_name: str, shadow_name: str) -> tuple:
+    """Delete a shadow. Returns (status, doc). 404 if it does not exist."""
+    key = (thing_name, shadow_name)
+    rec = _shadows.get(key)
+    if rec is None or rec.get("deleted"):
+        label = f"{thing_name}" if not shadow_name else f"{thing_name}/{shadow_name}"
+        return _shadow_error(404, f"No shadow exists with name: {label}")
+    version = rec["version"]
+    # Retain the version as a tombstone — AWS does not reset it on delete.
+    _shadows[key] = {"deleted": True, "version": version}
+    return 200, {"version": version, "timestamp": _shadow_now()}
+
+
 # ===========================================================================
 # MQTT Broker — embedded MQTT 3.1.1 broker logic over WebSocket
 # ===========================================================================
@@ -1606,6 +1779,55 @@ async def broker_stop() -> None:
         _persistent_sessions.clear()
 
 
+_BASIC_INGEST_PREFIX = "$aws/rules/"
+
+
+def _rules_for_account(account_id: str) -> list[dict]:
+    return [v for (acct, _key), v in _topic_rules._data.items() if acct == account_id]
+
+
+def _rule_event(payload: bytes):
+    """Decode a publish payload into a rule event (JSON, else raw text)."""
+    try:
+        return json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return (payload or b"").decode("utf-8", "replace")
+
+
+def _dispatch_rule_to_lambda(account_id: str, function_arn: str, event) -> None:
+    from ministack.services import lambda_svc
+
+    func, config, name = lambda_svc._get_func_record_for_ref_in_scope(
+        function_arn, account_id=account_id
+    )
+    if not func or not config:
+        _broker_logger.warning("IoT rule → Lambda: function %s not found", function_arn)
+        return
+    exec_record = lambda_svc._execution_record_for_config(func, config)
+    threading.Thread(
+        target=lambda_svc._execute_function_with_config_scope,
+        args=(exec_record, event),
+        daemon=True,
+    ).start()
+
+
+def _run_rule_actions(account_id: str, rule: dict, payload: bytes) -> None:
+    if not rule or rule.get("ruleDisabled"):
+        return
+    event = _rule_event(payload)
+    for action in rule.get("actions", []) or []:
+        lam = action.get("lambda")
+        if lam and lam.get("functionArn"):
+            _dispatch_rule_to_lambda(account_id, lam["functionArn"], event)
+
+
+def _evaluate_topic_rules(account_id: str, topic: str, payload: bytes) -> None:
+    for rule in _rules_for_account(account_id):
+        filter_ = _rule_topic_filter(rule.get("sql", ""))
+        if filter_ and _topic_matches(filter_, topic):
+            _run_rule_actions(account_id, rule, payload)
+
+
 async def broker_publish(
     account_id: str,
     topic: str,
@@ -1613,6 +1835,13 @@ async def broker_publish(
     qos: int = 0,
     retain: bool = False,
 ) -> None:
+    # Basic Ingest: a publish to `$aws/rules/<ruleName>` is delivered straight
+    # to that rule's actions and bypasses pub/sub delivery entirely.
+    if topic.startswith(_BASIC_INGEST_PREFIX):
+        rule_name = topic[len(_BASIC_INGEST_PREFIX):].split("/", 1)[0]
+        _run_rule_actions(account_id, _topic_rules.get_scoped(account_id, None, rule_name), payload)
+        return
+
     scoped = _scoped_topic(account_id, topic)
 
     if retain:
@@ -1648,6 +1877,8 @@ async def broker_publish(
                     if len(ps.queued_messages) > _MAX_QUEUED_MESSAGES:
                         ps.queued_messages = ps.queued_messages[-_MAX_QUEUED_MESSAGES:]
                     break
+
+    _evaluate_topic_rules(account_id, topic, payload)
 
 
 async def broker_subscribe(

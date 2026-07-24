@@ -1,5 +1,5 @@
 """
-Unit tests for Worker resource-cleanup fixes:
+Unit tests for the Lambda warm-worker runtime:
 
   test_tmpdir_cleaned_before_respawn
     -- _spawn() must shutil.rmtree the old tmpdir before mkdtemp on re-spawn.
@@ -7,10 +7,13 @@ Unit tests for Worker resource-cleanup fixes:
   test_process_terminated_on_error_response
     -- invoke() must call proc.terminate() when the handler returns status=error.
 
-Both tests mock subprocess so no running Docker/Ministack instance is required.
+The cleanup/protocol tests mock subprocesses; context coverage runs a real local
+Python worker. No Docker or running Ministack instance is required.
 """
 
+import io
 import json
+import zipfile
 from unittest.mock import MagicMock, mock_open, patch
 
 from ministack.core.lambda_runtime import Worker
@@ -40,6 +43,26 @@ def _spawn_proc():
     proc.stderr = iter([])
     proc.poll.return_value = None
     return proc
+
+
+def _protocol_line(status, **fields):
+    return json.dumps({"status": status, **fields}) + "\n"
+
+
+def _mock_worker(stdout_lines):
+    worker = Worker("test-fn", _config(), b"ignored-zip")
+    proc = MagicMock()
+    proc.poll.return_value = None
+    proc.stdout.readline.side_effect = list(stdout_lines)
+    proc.stdin = MagicMock()
+    proc.stderr = iter([])
+    worker._proc = proc
+    return worker, proc
+
+
+def _invoke_worker(stdout_lines, request_id="req"):
+    worker, proc = _mock_worker(stdout_lines)
+    return worker.invoke({}, request_id=request_id), proc, worker
 
 
 # ---------------------------------------------------------------------------
@@ -114,26 +137,156 @@ def test_tmpdir_cleaned_before_respawn():
 
 
 def test_process_terminated_on_error_response():
-    """invoke() must call proc.terminate() when the handler returns status=error.
-
-    Verifies the fix: the worker subprocess is terminated rather than silently
-    orphaned when _read_response() receives {"status": "error"}.
-    """
-    worker = Worker("test-fn", _config(), b"ignored-zip")
-
-    proc = MagicMock()
-    proc.poll.return_value = None  # process appears alive when invoke() checks it
-
-    error_line = json.dumps({"status": "error", "error": "handler blew up"}) + "\n"
-    proc.stdout.readline.side_effect = [error_line]
-    proc.stdin = MagicMock()
-    proc.stderr = iter([])
-
-    # Pre-set _proc so invoke() skips _spawn() entirely
-    worker._proc = proc
-
-    result = worker.invoke({"key": "val"}, request_id="req-001")
+    """invoke() must call proc.terminate() when the handler returns status=error."""
+    error_line = _protocol_line("error", error="handler blew up")
+    result, proc, worker = _invoke_worker([error_line], request_id="req-001")
 
     assert result["status"] == "error", "invoke() should surface the error status"
     proc.terminate.assert_called_once_with()
     assert worker._proc is None, "_proc must be cleared after an error response"
+
+
+def test_python_worker_exposes_standard_lambda_context_fields():
+    """Warm Python workers expose the context fields documented by Lambda."""
+    code = """\
+import os
+
+def handler(event, context):
+    return {
+        "function_name": context.function_name,
+        "function_version": context.function_version,
+        "memory_limit_in_mb": context.memory_limit_in_mb,
+        "invoked_function_arn": context.invoked_function_arn,
+        "aws_request_id": context.aws_request_id,
+        "log_group_name": context.log_group_name,
+        "log_stream_name": context.log_stream_name,
+        "env_log_stream_name": os.environ["AWS_LAMBDA_LOG_STREAM_NAME"],
+        "identity": context.identity,
+        "client_context": context.client_context,
+        "remaining_time": context.get_remaining_time_in_millis(),
+    }
+"""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("index.py", code)
+
+    config = _config()
+    config["Version"] = "$LATEST"
+    worker = Worker("test-fn", config, buf.getvalue())
+    try:
+        result = worker.invoke({}, request_id="context-request-id")
+    finally:
+        worker.kill()
+
+    assert result["status"] == "ok", result
+    context = result["result"]
+    assert context["function_name"] == "test-fn"
+    assert context["function_version"] == "$LATEST"
+    assert context["memory_limit_in_mb"] == 128
+    assert context["invoked_function_arn"] == config["FunctionArn"]
+    assert context["aws_request_id"] == "context-request-id"
+    assert context["log_group_name"] == "/aws/lambda/test-fn"
+    assert context["log_stream_name"]
+    assert context["log_stream_name"] == context["env_log_stream_name"]
+    assert context["identity"] is None
+    assert context["client_context"] is None
+    assert 0 < context["remaining_time"] <= 30_000
+
+
+def test_invoke_ignores_json_logs_on_stdout():
+    """Pino-style JSON on fd 1 must not be mistaken for the protocol response."""
+    ok_line = _protocol_line("ok", result={"ok": True})
+    log_line = json.dumps({"level": 30, "msg": "hi"}) + "\n"
+    result, _, _ = _invoke_worker([log_line, ok_line])
+
+    assert result["status"] == "ok"
+    assert result["result"] == {"ok": True}
+
+
+def test_invoke_ignores_raw_text_on_stdout():
+    """Plain fd-1 writes must not prevent reading the protocol response."""
+    ok_line = _protocol_line("ok", result={"ok": True})
+    result, _, _ = _invoke_worker(["hi\n", ok_line])
+
+    assert result["status"] == "ok"
+    assert result["result"] == {"ok": True}
+
+
+def test_invoke_ignores_json_with_unrelated_status_key():
+    """HTTP-style JSON logs with a status code must not end the read loop."""
+    junk = json.dumps({"status": 200, "message": "ok"}) + "\n"
+    ok_line = _protocol_line("ok", result={"n": 1})
+    result, _, _ = _invoke_worker([junk, ok_line])
+
+    assert result["status"] == "ok"
+    assert result["result"] == {"n": 1}
+
+
+def test_invoke_ignores_many_log_lines_before_protocol():
+    """A burst of structured logs must not hide the real protocol line."""
+    logs = [
+        json.dumps({"level": 30, "msg": f"line-{i}"}) + "\n"
+        for i in range(8)
+    ]
+    ok_line = _protocol_line("ok", result={"done": True})
+    result, _, _ = _invoke_worker(logs + [ok_line])
+
+    assert result["status"] == "ok"
+    assert result["result"] == {"done": True}
+
+
+def test_invoke_skips_malformed_json_lines():
+    """Broken JSON on stdout must be ignored, not treated as the response."""
+    ok_line = _protocol_line("ok", result={})
+    result, _, _ = _invoke_worker(['{"truncated":\n', ok_line])
+
+    assert result["status"] == "ok"
+
+
+def test_invoke_skips_empty_lines():
+    """Blank lines between junk output and the protocol line are ignored."""
+    ok_line = _protocol_line("ok", result={"x": 1})
+    result, _, _ = _invoke_worker(["\n", "noise\n", "\n", ok_line])
+
+    assert result["status"] == "ok"
+    assert result["result"] == {"x": 1}
+
+
+def test_invoke_skips_ready_status_during_invoke():
+    """Init-only ready messages must not satisfy an invocation read."""
+    ready = _protocol_line("ready", cold=False)
+    ok_line = _protocol_line("ok", result={"v": 2})
+    result, _, _ = _invoke_worker([ready, ok_line])
+
+    assert result["status"] == "ok"
+    assert result["result"] == {"v": 2}
+
+
+def test_invoke_still_surfaces_protocol_error():
+    """Protocol error lines must still fail the invocation."""
+    error_line = _protocol_line("error", error="boom")
+    result, proc, _ = _invoke_worker([error_line])
+
+    assert result["status"] == "error"
+    assert result["error"] == "boom"
+    proc.terminate.assert_called_once_with()
+
+
+def test_invoke_error_after_junk_stdout():
+    """Handler errors must win even when stdout already has log noise."""
+    junk = json.dumps({"level": 50, "msg": "warn"}) + "\n"
+    err_line = _protocol_line("error", error="fail")
+    result, proc, _ = _invoke_worker([junk, "oops\n", err_line])
+
+    assert result["status"] == "error"
+    assert result["error"] == "fail"
+    proc.terminate.assert_called_once_with()
+
+
+def test_invoke_gives_up_after_max_lines():
+    """Stop after 200 non-protocol lines instead of hanging forever."""
+    worker, proc = _mock_worker(["noise\n"] * 201)
+    result = worker.invoke({}, request_id="req-max")
+
+    assert result["status"] == "error"
+    assert "No JSON response" in result["error"]

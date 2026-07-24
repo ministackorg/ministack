@@ -583,12 +583,11 @@ def test_ses_messages_endpoint_reset(ses):
 # Verifies that the ?account query parameter properly validates and filters emails.
 # Invalid non-12-digit accounts now return a 400 InvalidAccountID error.
 # ---------------------------------------------------------------------------
-def _client(service, access_key="test"):
+def _client(service, access_key="test", region="us-east-1"):
     """Create a boto3 client with a specific access key."""
     import boto3
     from botocore.config import Config
     endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
-    region = "us-east-1"
     return boto3.client(
         service,
         endpoint_url=endpoint,
@@ -684,4 +683,219 @@ def test_ses_messages_endpoint_account_filter():
     # Should return empty list (no emails for this account)
     assert "messages" in data
     assert data["messages"].get("123456789012", []) == [], "Expected 0 messages for account with no emails"
-  
+
+
+def test_ses_resources_and_send_statistics_are_region_scoped():
+    import urllib.request
+
+    east = _client("ses", region="us-east-1")
+    west = _client("ses", region="us-west-2")
+    suffix = _uuid_mod.uuid4().hex[:8]
+    identity = f"same-region-{suffix}@example.com"
+    template = f"same-region-template-{suffix}"
+    configuration_set = f"same-region-config-{suffix}"
+
+    for client, label in ((east, "east"), (west, "west")):
+        client.verify_email_identity(EmailAddress=identity)
+        client.create_template(
+            Template={
+                "TemplateName": template,
+                "SubjectPart": label,
+                "TextPart": label,
+            }
+        )
+        client.create_configuration_set(
+            ConfigurationSet={"Name": configuration_set}
+        )
+
+    assert east.get_template(TemplateName=template)["Template"]["SubjectPart"] == "east"
+    assert west.get_template(TemplateName=template)["Template"]["SubjectPart"] == "west"
+
+    east.delete_identity(Identity=identity)
+    east.delete_configuration_set(ConfigurationSetName=configuration_set)
+    assert identity not in east.list_identities()["Identities"]
+    assert identity in west.list_identities()["Identities"]
+    assert not any(
+        item["Name"] == configuration_set
+        for item in east.list_configuration_sets()["ConfigurationSets"]
+    )
+    assert any(
+        item["Name"] == configuration_set
+        for item in west.list_configuration_sets()["ConfigurationSets"]
+    )
+
+    east_before = east.get_send_quota()["SentLast24Hours"]
+    west_before = west.get_send_quota()["SentLast24Hours"]
+    for client, label in ((east, "east"), (west, "west")):
+        client.send_email(
+            Source=f"{label}-{identity}",
+            Destination={"ToAddresses": ["recipient@example.com"]},
+            Message={
+                "Subject": {"Data": label},
+                "Body": {"Text": {"Data": label}},
+            },
+        )
+
+    assert east.get_send_quota()["SentLast24Hours"] == east_before + 1
+    assert west.get_send_quota()["SentLast24Hours"] == west_before + 1
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    with urllib.request.urlopen(f"{endpoint}/_ministack/ses/messages") as response:
+        messages = json.loads(response.read())["messages"]["000000000000"]
+    sources = {message["Source"] for message in messages}
+    assert f"east-{identity}" in sources
+    assert f"west-{identity}" in sources
+
+
+def test_ses_v2_resources_and_tags_are_region_scoped():
+    east = _client("sesv2", region="us-east-1")
+    west = _client("sesv2", region="us-west-2")
+    suffix = _uuid_mod.uuid4().hex[:8]
+    identity = f"same-v2-region-{suffix}.example.com"
+    configuration_set = f"same-v2-region-config-{suffix}"
+
+    for client, label in ((east, "east"), (west, "west")):
+        tags = [{"Key": "region", "Value": label}]
+        client.create_email_identity(EmailIdentity=identity, Tags=tags)
+        client.create_configuration_set(
+            ConfigurationSetName=configuration_set,
+            Tags=tags,
+        )
+
+    assert east.get_email_identity(EmailIdentity=identity)["Tags"] == [
+        {"Key": "region", "Value": "east"}
+    ]
+    assert west.get_email_identity(EmailIdentity=identity)["Tags"] == [
+        {"Key": "region", "Value": "west"}
+    ]
+
+    for client, region, label in (
+        (east, "us-east-1", "east"),
+        (west, "us-west-2", "west"),
+    ):
+        arn = (
+            f"arn:aws:ses:{region}:000000000000:"
+            f"configuration-set/{configuration_set}"
+        )
+        assert client.list_tags_for_resource(ResourceArn=arn)["Tags"] == [
+            {"Key": "region", "Value": label}
+        ]
+
+    east.delete_email_identity(EmailIdentity=identity)
+    east.delete_configuration_set(ConfigurationSetName=configuration_set)
+    assert not any(
+        item["IdentityName"] == identity
+        for item in east.list_email_identities()["EmailIdentities"]
+    )
+    assert any(
+        item["IdentityName"] == identity
+        for item in west.list_email_identities()["EmailIdentities"]
+    )
+    assert configuration_set not in east.list_configuration_sets()[
+        "ConfigurationSets"
+    ]
+    assert configuration_set in west.list_configuration_sets()["ConfigurationSets"]
+
+
+def test_ses_restore_legacy_state_maps_unregionalized_values_to_boot_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import ses as service
+
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    foreign_region = "us-west-2"
+    values = {
+        "_identities": (
+            "legacy@example.com",
+            {
+                "VerificationStatus": "Success",
+                "NotificationTopics": {
+                    "Bounce": "arn:aws:sns:us-west-2:111111111111:legacy"
+                },
+            },
+        ),
+        "_templates": (
+            "legacy-template",
+            {
+                "TemplateName": "legacy-template",
+                "TextPart": "arn:aws:sns:us-west-2:111111111111:content",
+            },
+        ),
+        "_configuration_sets": (
+            "legacy-config",
+            {"Name": "legacy-config"},
+        ),
+    }
+
+    set_request_account_id(account_id)
+    set_request_region(boot_region)
+    legacy_state = {}
+    for state_key, (resource_key, value) in values.items():
+        store = AccountScopedDict()
+        store[resource_key] = value
+        legacy_state[state_key] = store
+
+    service.reset()
+    try:
+        service.restore_state(legacy_state)
+        for state_key, (resource_key, value) in values.items():
+            store = getattr(service, state_key)
+            assert store.get_scoped(account_id, boot_region, resource_key) == value
+            assert store.get_scoped(account_id, foreign_region, resource_key) is None
+    finally:
+        service.reset()
+
+
+def test_ses_v2_restore_legacy_state_maps_unregionalized_values_to_boot_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import ses_v2 as service
+
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    foreign_region = "us-west-2"
+    values = {
+        "_identities": (
+            "legacy.example.com",
+            {"EmailIdentity": "legacy.example.com"},
+        ),
+        "_config_sets": (
+            "legacy-config",
+            {"ConfigurationSetName": "legacy-config"},
+        ),
+        "_ses_tags": (
+            "arn:aws:ses:us-west-2:111111111111:identity/legacy.example.com",
+            [{"Key": "legacy", "Value": "true"}],
+        ),
+    }
+
+    set_request_account_id(account_id)
+    set_request_region(boot_region)
+    legacy_state = {}
+    for state_key, (resource_key, value) in values.items():
+        store = AccountScopedDict()
+        store[resource_key] = value
+        legacy_state[state_key] = store
+
+    service.reset()
+    try:
+        service.restore_state(legacy_state)
+        for state_key, (resource_key, value) in values.items():
+            store = getattr(service, state_key)
+            expected_key = resource_key
+            if state_key == "_ses_tags":
+                expected_key = resource_key.replace(
+                    f":{foreign_region}:", f":{boot_region}:"
+                )
+                assert store.get_scoped(account_id, boot_region, resource_key) is None
+            assert store.get_scoped(account_id, boot_region, expected_key) == value
+            assert store.get_scoped(account_id, foreign_region, resource_key) is None
+    finally:
+        service.reset()

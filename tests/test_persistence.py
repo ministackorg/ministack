@@ -506,15 +506,90 @@ def test_scheduler_round_trip():
     # pre-existing inline comment on the dict mis-describes the shape. Use
     # the real production key shape so this test catches a regression that
     # broke string-key serialisation.
+    from ministack.core.responses import get_region, set_request_region
+
+    original_region = get_region()
+
     def populate(mod):
-        mod._schedule_groups["default"] = {"Name": "default"}
-        mod._schedules["default/sched-test"] = {"Name": "sched-test"}
+        set_request_region("us-east-1")
+        mod._schedule_groups["default"] = {
+            "Arn": "arn:aws:scheduler:us-east-1:000000000000:schedule-group/default",
+            "Name": "default",
+        }
+        mod._schedules["default/sched-test"] = {
+            "Arn": "arn:aws:scheduler:us-east-1:000000000000:schedule/default/sched-test",
+            "Name": "sched-test",
+            "ScheduleExpression": "rate(1 hour)",
+        }
+        set_request_region("us-west-2")
+        mod._schedule_groups["default"] = {
+            "Arn": "arn:aws:scheduler:us-west-2:000000000000:schedule-group/default",
+            "Name": "default",
+        }
+        mod._schedules["default/sched-test"] = {
+            "Arn": "arn:aws:scheduler:us-west-2:000000000000:schedule/default/sched-test",
+            "Name": "sched-test",
+            "ScheduleExpression": "rate(2 hours)",
+        }
 
     def observe(mod):
-        assert "default" in mod._schedule_groups
-        assert "default/sched-test" in mod._schedules
+        set_request_region("us-east-1")
+        assert mod._schedules["default/sched-test"]["ScheduleExpression"] == "rate(1 hour)"
+        set_request_region("us-west-2")
+        assert mod._schedules["default/sched-test"]["ScheduleExpression"] == "rate(2 hours)"
 
-    _round_trip("scheduler", "scheduler", populate, observe)
+    try:
+        _round_trip("scheduler", "scheduler", populate, observe)
+    finally:
+        set_request_region(original_region)
+
+
+def test_scheduler_legacy_account_scoped_state_uses_resource_arn_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import scheduler as mod
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    region = "us-west-2"
+    group = "legacy-group"
+    schedule_key = f"{group}/legacy-schedule"
+    legacy_groups = AccountScopedDict()
+    legacy_groups._data[(account_id, group)] = {
+        "Arn": f"arn:aws:scheduler:{region}:{account_id}:schedule-group/{group}",
+        "Name": group,
+    }
+    legacy_schedules = AccountScopedDict()
+    legacy_schedules._data[(account_id, schedule_key)] = {
+        "Arn": f"arn:aws:scheduler:{region}:{account_id}:schedule/{schedule_key}",
+        "Name": "legacy-schedule",
+        "GroupName": group,
+    }
+
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region("us-east-1")
+        mod.restore_state(
+            {"schedule_groups": legacy_groups, "schedules": legacy_schedules}
+        )
+
+        assert mod._schedule_groups.get_scoped(account_id, "us-east-1", group) is None
+        assert mod._schedules.get_scoped(account_id, "us-east-1", schedule_key) is None
+        assert mod._schedule_groups.get_scoped(account_id, region, group)["Name"] == group
+        assert mod._schedules.get_scoped(account_id, region, schedule_key)["Name"] == (
+            "legacy-schedule"
+        )
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
 
 
 def test_pipes_round_trip():
@@ -836,6 +911,364 @@ def test_ecs_attributes_survive_warm_boot():
     mod.reset()
 
 
+def test_ecs_region_scoped_state_survives_warm_boot(monkeypatch):
+    """ECS v2 persistence retains every resource's account and region scope."""
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _get_module("ecs")
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    cluster_name = "warm-boot-cluster"
+    family = "warm-boot-family"
+
+    monkeypatch.setattr(mod, "_get_docker", lambda: None)
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        for region, revision in (("us-east-1", 2), ("us-west-2", 1)):
+            set_request_region(region)
+            cluster_arn = f"arn:aws:ecs:{region}:{account_id}:cluster/{cluster_name}"
+            td_key = f"{family}:{revision}"
+            td_arn = f"arn:aws:ecs:{region}:{account_id}:task-definition/{td_key}"
+            service_key = f"{cluster_name}/warm-boot-service"
+            service_arn = (
+                f"arn:aws:ecs:{region}:{account_id}:service/"
+                f"{cluster_name}/warm-boot-service"
+            )
+            task_arn = f"arn:aws:ecs:{region}:{account_id}:task/{cluster_name}/{region}"
+            cp_arn = f"arn:aws:ecs:{region}:{account_id}:capacity-provider/warm-boot-cp"
+
+            mod._clusters[cluster_name] = {
+                "clusterArn": cluster_arn,
+                "clusterName": cluster_name,
+                "status": "ACTIVE",
+            }
+            mod._task_defs[td_key] = {
+                "taskDefinitionArn": td_arn,
+                "family": family,
+                "revision": revision,
+            }
+            mod._task_def_latest[family] = revision
+            mod._services[service_key] = {
+                "serviceArn": service_arn,
+                "serviceName": "warm-boot-service",
+                "clusterArn": cluster_arn,
+            }
+            mod._tasks[task_arn] = {
+                "taskArn": task_arn,
+                "clusterArn": cluster_arn,
+                "lastStatus": "RUNNING",
+                "_docker_ids": [f"stale-{region}"],
+            }
+            mod._capacity_providers["warm-boot-cp"] = {
+                "capacityProviderArn": cp_arn,
+                "name": "warm-boot-cp",
+            }
+            mod._attributes["i-warm:zone"] = {
+                "targetId": "i-warm",
+                "name": "zone",
+                "value": region,
+            }
+            mod._account_settings["containerInsights"] = region
+            mod._tags[cluster_arn] = [{"key": "region", "value": region}]
+
+        _round_trip_dict(mod, "ecs")
+
+        for region, revision in (("us-east-1", 2), ("us-west-2", 1)):
+            cluster_arn = f"arn:aws:ecs:{region}:{account_id}:cluster/{cluster_name}"
+            task_arn = f"arn:aws:ecs:{region}:{account_id}:task/{cluster_name}/{region}"
+            assert mod._clusters.get_scoped(account_id, region, cluster_name)["clusterArn"] == (
+                cluster_arn
+            )
+            assert mod._task_def_latest.get_scoped(account_id, region, family) == revision
+            assert mod._account_settings.get_scoped(
+                account_id, region, "containerInsights"
+            ) == region
+            assert mod._attributes.get_scoped(account_id, region, "i-warm:zone")["value"] == (
+                region
+            )
+            restored_task = mod._tasks.get_scoped(account_id, region, task_arn)
+            assert restored_task["lastStatus"] == "STOPPED"
+            assert restored_task["_docker_ids"] == []
+            assert mod._tags.get_scoped(account_id, region, cluster_arn) == [
+                {"key": "region", "value": region}
+            ]
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_ecs_legacy_account_scoped_state_migrates_by_arn(monkeypatch, tmp_path):
+    """Legacy ECS state adopts ARN regions and boot-scopes ARN-less stores."""
+    import json as _json
+
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _get_module("ecs")
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    resource_region = "us-west-2"
+    cluster_name = "legacy-cluster"
+    family = "legacy-family"
+    cluster_arn = f"arn:aws:ecs:{resource_region}:{account_id}:cluster/{cluster_name}"
+    service_key = f"{cluster_name}/legacy-service"
+    service_arn = (
+        f"arn:aws:ecs:{resource_region}:{account_id}:service/"
+        f"{cluster_name}/legacy-service"
+    )
+    task_arn = (
+        f"arn:aws:ecs:{resource_region}:{account_id}:task/"
+        f"{cluster_name}/legacy-task"
+    )
+
+    def scoped(key, value):
+        store = AccountScopedDict()
+        store._data[(account_id, key)] = value
+        return store
+
+    legacy_payload = {
+        "clusters": scoped(cluster_name, {
+            "clusterArn": cluster_arn,
+            "clusterName": cluster_name,
+            "status": "ACTIVE",
+        }),
+        "task_defs": scoped(family + ":3", {
+            "taskDefinitionArn": (
+                f"arn:aws:ecs:{resource_region}:{account_id}:"
+                f"task-definition/{family}:3"
+            ),
+            "family": family,
+            "revision": 3,
+        }),
+        "task_def_latest": scoped(family, 3),
+        "services": scoped(service_key, {
+            "serviceArn": service_arn,
+            "serviceName": "legacy-service",
+            "clusterArn": cluster_arn,
+        }),
+        "tasks": scoped(task_arn, {
+            "taskArn": task_arn,
+            "clusterArn": cluster_arn,
+            "lastStatus": "RUNNING",
+            "_docker_ids": ["stale-container"],
+        }),
+        "account_settings": scoped("containerInsights", "enabled"),
+        "attributes": scoped("i-legacy:zone", {
+            "targetId": "i-legacy",
+            "name": "zone",
+            "value": "legacy",
+        }),
+    }
+
+    monkeypatch.setattr(mod, "_get_docker", lambda: None)
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        with open(tmp_path / "ecs.json", "w") as f:
+            _json.dump(legacy_payload, f, default=persistence._json_default)
+
+        loaded = persistence.load_state("ecs")
+        assert isinstance(loaded["tasks"], AccountScopedDict)
+        mod.restore_state(loaded)
+
+        assert mod._clusters.get_scoped(account_id, resource_region, cluster_name)[
+            "clusterArn"
+        ] == cluster_arn
+        assert mod._services.get_scoped(account_id, resource_region, service_key)[
+            "serviceArn"
+        ] == service_arn
+        restored_task = mod._tasks.get_scoped(account_id, resource_region, task_arn)
+        assert restored_task["lastStatus"] == "STOPPED"
+        assert restored_task["_docker_ids"] == []
+
+        assert mod._task_def_latest.get_scoped(account_id, boot_region, family) is None
+        assert mod._task_def_latest.get_scoped(account_id, resource_region, family) == 3
+
+        set_request_region(resource_region)
+        described = _json.loads(
+            mod._describe_task_definition({"taskDefinition": family})[2]
+        )["taskDefinition"]
+        assert described["taskDefinitionArn"].endswith(
+            f"task-definition/{family}:3"
+        )
+
+        registered = _json.loads(mod._register_task_definition({
+            "family": family,
+            "containerDefinitions": [{"name": "app", "image": "busybox"}],
+        })[2])["taskDefinition"]
+        assert registered["revision"] == 4
+        assert mod._task_defs.get_scoped(
+            account_id, resource_region, family + ":3"
+        )["taskDefinitionArn"] == described["taskDefinitionArn"]
+        assert mod._task_defs.get_scoped(
+            account_id, resource_region, family + ":4"
+        )["taskDefinitionArn"] == registered["taskDefinitionArn"]
+
+        # Other ARN-less legacy stores intentionally adopt the boot region.
+        assert mod._account_settings.get_scoped(
+            account_id, boot_region, "containerInsights"
+        ) == "enabled"
+        assert mod._attributes.get_scoped(account_id, boot_region, "i-legacy:zone")[
+            "value"
+        ] == "legacy"
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_ecs_legacy_task_revision_migration_reconstructs_each_region(monkeypatch):
+    """Legacy shared counters do not reset revisions in other ARN regions."""
+    import json as _json
+
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _get_module("ecs")
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    other_region = "us-west-2"
+    family = "multi-region-legacy-family"
+
+    legacy_task_defs = AccountScopedDict()
+    for region, revision, marker in (
+        (boot_region, 1, "east-original"),
+        (other_region, 2, "west-original"),
+    ):
+        key = f"{family}:{revision}"
+        legacy_task_defs._data[(account_id, key)] = {
+            "taskDefinitionArn": (
+                f"arn:aws:ecs:{region}:{account_id}:task-definition/{key}"
+            ),
+            "family": family,
+            "revision": revision,
+            "status": "ACTIVE",
+            "marker": marker,
+        }
+
+    legacy_latest = AccountScopedDict()
+    legacy_latest._data[(account_id, family)] = 2
+
+    monkeypatch.setattr(mod, "_get_docker", lambda: None)
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        mod.restore_state({
+            "task_defs": legacy_task_defs,
+            "task_def_latest": legacy_latest,
+        })
+
+        assert mod._task_def_latest.get_scoped(
+            account_id, boot_region, family
+        ) == 1
+        assert mod._task_def_latest.get_scoped(
+            account_id, other_region, family
+        ) == 2
+
+        for region, restored_revision, next_revision in (
+            (boot_region, 1, 2),
+            (other_region, 2, 3),
+        ):
+            set_request_region(region)
+            status, _, body = mod._describe_task_definition({
+                "taskDefinition": family,
+            })
+            assert status == 200
+            described = _json.loads(body)["taskDefinition"]
+            assert described["revision"] == restored_revision
+            assert described["taskDefinitionArn"].startswith(
+                f"arn:aws:ecs:{region}:{account_id}:"
+            )
+
+            status, _, body = mod._register_task_definition({
+                "family": family,
+                "containerDefinitions": [{"name": "app", "image": "busybox"}],
+            })
+            assert status == 200
+            assert _json.loads(body)["taskDefinition"]["revision"] == next_revision
+
+        assert mod._task_defs.get_scoped(
+            account_id, boot_region, f"{family}:1"
+        )["marker"] == "east-original"
+        assert mod._task_defs.get_scoped(
+            account_id, other_region, f"{family}:2"
+        )["marker"] == "west-original"
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_ecs_plain_dict_tasks_migrate_to_arn_region(monkeypatch):
+    """Oldest bare-dict task state restores under the task ARN region."""
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _get_module("ecs")
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    resource_region = "us-west-2"
+    task_arn = f"arn:aws:ecs:{resource_region}:{account_id}:task/legacy-cluster/legacy-task"
+
+    monkeypatch.setattr(mod, "_get_docker", lambda: None)
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        mod.restore_state(
+            {
+                "tasks": {
+                    task_arn: {
+                        "taskArn": task_arn,
+                        "lastStatus": "RUNNING",
+                        "_docker_ids": ["stale-container"],
+                    },
+                },
+            }
+        )
+
+        restored_task = mod._tasks.get_scoped(account_id, resource_region, task_arn)
+        assert restored_task["lastStatus"] == "STOPPED"
+        assert restored_task["_docker_ids"] == []
+        assert mod._tasks.get_scoped(account_id, boot_region, task_arn) is None
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 # ── sns._platform_applications + sns._platform_endpoints ──────────────
 
 def test_sns_platform_applications_survive_warm_boot():
@@ -949,6 +1382,208 @@ def test_sns_region_scoped_stores_survive_warm_boot_in_original_scope():
         assert mod._sub_arn_to_topic.get(sub_arn) is None
         assert mod._platform_applications.get(app_arn) is None
         assert mod._platform_endpoints.get(endpoint_arn) is None
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_eventbridge_region_scoped_stores_survive_warm_boot_in_original_scope():
+    """EventBridge regional stores remain in their original account/region
+    after the real JSON persistence path."""
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _get_module("eventbridge")
+    mod.reset()
+    original_account = get_account_id()
+    original_region = get_region()
+    try:
+        set_request_account_id("111111111111")
+        set_request_region("us-west-2")
+
+        now = mod._now_ts()
+        bus_name = "persisted-bus"
+        rule_name = "persisted-rule"
+        archive_name = "persisted-archive"
+        replay_name = "persisted-replay"
+        endpoint_name = "persisted-endpoint"
+        connection_name = "persisted-connection"
+        api_destination_name = "persisted-api"
+        partner_name = "persisted-partner"
+        bus_arn = f"arn:aws:events:us-west-2:111111111111:event-bus/{bus_name}"
+        rule_key = mod._rule_key(rule_name, bus_name)
+        rule_arn = f"arn:aws:events:us-west-2:111111111111:rule/{bus_name}/{rule_name}"
+        archive_arn = f"arn:aws:events:us-west-2:111111111111:archive/{archive_name}"
+        replay_arn = f"arn:aws:events:us-west-2:111111111111:replay/{replay_name}"
+        endpoint_arn = f"arn:aws:events:us-west-2:111111111111:endpoint/{endpoint_name}"
+        connection_arn = f"arn:aws:events:us-west-2:111111111111:connection/{connection_name}"
+        api_destination_arn = (
+            f"arn:aws:events:us-west-2:111111111111:api-destination/{api_destination_name}"
+        )
+        partner_arn = f"arn:aws:events:us-west-2:222222222222:event-source/{partner_name}"
+
+        mod._event_buses[bus_name] = {
+            "Name": bus_name,
+            "Arn": bus_arn,
+            "CreationTime": now,
+            "LastModifiedTime": now,
+        }
+        mod._rules[rule_key] = {
+            "Name": rule_name,
+            "Arn": rule_arn,
+            "EventBusName": bus_name,
+            "ScheduleExpression": "rate(5 minutes)",
+            "State": "ENABLED",
+            "CreationTime": now,
+        }
+        mod._targets[rule_key] = [
+            {
+                "Id": "persisted-target",
+                "Arn": "arn:aws:sqs:us-west-2:111111111111:persisted-queue",
+            }
+        ]
+        mod._tags[rule_arn] = {"env": "test"}
+        mod._archives[archive_name] = {
+            "ArchiveName": archive_name,
+            "ArchiveArn": archive_arn,
+            "EventSourceArn": bus_arn,
+            "State": "ENABLED",
+            "CreationTime": now,
+            "EventCount": 0,
+            "Events": [],
+        }
+        mod._replays[replay_name] = {
+            "ReplayName": replay_name,
+            "ReplayArn": replay_arn,
+            "EventSourceArn": archive_arn,
+            "Destination": {"Arn": bus_arn},
+            "State": "COMPLETED",
+            "ReplayStartTime": now,
+            "ReplayEndTime": now,
+        }
+        mod._endpoints[endpoint_name] = {
+            "Name": endpoint_name,
+            "Arn": endpoint_arn,
+            "EndpointUrl": f"https://{endpoint_name}.global-events.us-west-2.amazonaws.com",
+            "State": "ACTIVE",
+            "CreationTime": now,
+            "LastModifiedTime": now,
+        }
+        mod._event_bus_policies[bus_name] = {
+            "Version": "2012-10-17",
+            "Statement": [{"Sid": "Allow", "Resource": bus_arn}],
+        }
+        mod._connections[connection_name] = {
+            "Name": connection_name,
+            "ConnectionArn": connection_arn,
+            "ConnectionState": "AUTHORIZED",
+            "AuthorizationType": "API_KEY",
+            "CreationTime": now,
+            "LastModifiedTime": now,
+        }
+        mod._api_destinations[api_destination_name] = {
+            "Name": api_destination_name,
+            "ApiDestinationArn": api_destination_arn,
+            "ApiDestinationState": "ACTIVE",
+            "ConnectionArn": connection_arn,
+            "InvocationEndpoint": "https://example.com",
+            "HttpMethod": "POST",
+            "CreationTime": now,
+            "LastModifiedTime": now,
+        }
+        mod._partner_event_sources[mod._partner_key("222222222222", partner_name)] = {
+            "Name": partner_name,
+            "Account": "222222222222",
+            "EventSourceArn": partner_arn,
+        }
+
+        _round_trip_dict(mod, "eventbridge")
+
+        assert mod._event_buses[bus_name]["Arn"] == bus_arn
+        assert mod._rules[rule_key]["Arn"] == rule_arn
+        assert mod._targets[rule_key][0]["Id"] == "persisted-target"
+        assert mod._tags[rule_arn]["env"] == "test"
+        assert mod._archives[archive_name]["ArchiveArn"] == archive_arn
+        assert mod._replays[replay_name]["ReplayArn"] == replay_arn
+        assert mod._endpoints[endpoint_name]["Arn"] == endpoint_arn
+        assert mod._event_bus_policies[bus_name]["Statement"][0]["Resource"] == bus_arn
+        assert mod._connections[connection_name]["ConnectionArn"] == connection_arn
+        assert mod._api_destinations[api_destination_name]["ApiDestinationArn"] == api_destination_arn
+        partner_key = mod._partner_key("222222222222", partner_name)
+        assert mod._partner_event_sources[partner_key]["EventSourceArn"] == partner_arn
+
+        set_request_region("us-east-1")
+        assert mod._event_buses.get(bus_name) is None
+        assert mod._rules.get(rule_key) is None
+        assert mod._targets.get(rule_key) is None
+        assert mod._tags.get(rule_arn) is None
+        assert mod._archives.get(archive_name) is None
+        assert mod._replays.get(replay_name) is None
+        assert mod._endpoints.get(endpoint_name) is None
+        assert mod._event_bus_policies.get(bus_name) is None
+        assert mod._connections.get(connection_name) is None
+        assert mod._api_destinations.get(api_destination_name) is None
+        assert mod._partner_event_sources.get(partner_key) is None
+
+        set_request_account_id("222222222222")
+        set_request_region("us-west-2")
+        assert mod._event_buses.get(bus_name) is None
+        assert mod._rules.get(rule_key) is None
+        assert mod._targets.get(rule_key) is None
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_eventbridge_legacy_account_scoped_targets_restore_to_rule_region():
+    """Legacy target stores are scoped to the EventBridge rule region, not the
+    target ARN region, when migrating from account-only persistence."""
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _get_module("eventbridge")
+    mod.reset()
+    original_account = get_account_id()
+    original_region = get_region()
+    try:
+        set_request_account_id("111111111111")
+        set_request_region("us-east-1")
+        rule_key = mod._rule_key("legacy-rule", "default")
+        legacy_rules = AccountScopedDict()
+        legacy_targets = AccountScopedDict()
+        legacy_rules[rule_key] = {
+            "Name": "legacy-rule",
+            "Arn": "arn:aws:events:us-west-2:111111111111:rule/legacy-rule",
+            "EventBusName": "default",
+            "ScheduleExpression": "rate(5 minutes)",
+            "State": "ENABLED",
+        }
+        legacy_targets[rule_key] = [
+            {
+                "Id": "foreign-sns",
+                "Arn": "arn:aws:sns:eu-central-1:111111111111:legacy-topic",
+            }
+        ]
+
+        mod.restore_state({"rules": legacy_rules, "targets": legacy_targets})
+
+        set_request_region("us-west-2")
+        assert mod._rules[rule_key]["Name"] == "legacy-rule"
+        assert mod._targets[rule_key][0]["Id"] == "foreign-sns"
+
+        set_request_region("eu-central-1")
+        assert mod._targets.get(rule_key) is None
     finally:
         mod.reset()
         set_request_account_id(original_account)
@@ -1146,22 +1781,553 @@ def test_legacy_unwrapped_state_file_loads_and_migrates_region(monkeypatch, tmp_
     assert region_store["res-1"]["Arn"].startswith("arn:aws:appconfig:eu-west-1")
 
 
-def test_state_format_version_stamp_round_trips_and_refuses_newer(monkeypatch, tmp_path):
-    """U4: save_state stamps the on-disk format version and load_state unwraps
-    it; a file written by a NEWER binary is refused rather than mis-parsed."""
+def test_default_state_format_version_stays_v2_and_refuses_newer(monkeypatch, tmp_path):
+    """U4: unchanged services stay on v2 and refuse newer state files."""
     import json as _json
 
     monkeypatch.setattr(persistence, "PERSIST_STATE", True)
     monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
 
-    persistence.save_state("ver", {"k": "v"})
-    raw = _json.loads((tmp_path / "ver.json").read_text())
-    assert raw["__ministack_format__"] == persistence.STATE_FORMAT_VERSION
+    persistence.save_state("sqs", {"k": "v"})
+    raw = _json.loads((tmp_path / "sqs.json").read_text())
+    assert raw["__ministack_format__"] == persistence.STATE_FORMAT_VERSION == 2
     assert raw["payload"] == {"k": "v"}
-    assert persistence.load_state("ver") == {"k": "v"}
+    assert persistence.load_state("sqs") == {"k": "v"}
 
     (tmp_path / "future.json").write_text(_json.dumps({
         "__ministack_format__": persistence.STATE_FORMAT_VERSION + 1,
         "payload": {"k": "v"},
     }))
     assert persistence.load_state("future") is None
+
+
+def test_ecs_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject ECS's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    clusters = AccountRegionScopedDict()
+    clusters.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-cluster",
+        {"clusterArn": "arn:aws:ecs:us-west-2:000000000000:cluster/regional-cluster"},
+    )
+    persistence.save_state("ecs", {"clusters": clusters})
+
+    raw = _json.loads((tmp_path / "ecs.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_clusters = persistence.load_state("ecs")["clusters"]
+    assert loaded_clusters.get_scoped(
+        "000000000000", "us-west-2", "regional-cluster"
+    )["clusterArn"].endswith("cluster/regional-cluster")
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("ecs") is None
+
+
+def test_appsync_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject AppSync's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    apis = AccountRegionScopedDict()
+    apis.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-api",
+        {
+            "apiId": "regional-api",
+            "arn": "arn:aws:appsync:us-west-2:000000000000:apis/regional-api",
+        },
+    )
+    persistence.save_state("appsync", {"apis": apis})
+
+    raw = _json.loads((tmp_path / "appsync.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_apis = persistence.load_state("appsync")["apis"]
+    assert loaded_apis.get_scoped(
+        "000000000000", "us-west-2", "regional-api"
+    )["apiId"] == "regional-api"
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("appsync") is None
+
+
+def test_emr_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject EMR regional state instead of dropping it."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    clusters = AccountRegionScopedDict()
+    clusters.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "j-LEGACYCLUSTER",
+        {
+            "Id": "j-LEGACYCLUSTER",
+            "ClusterArn": (
+                "arn:aws:elasticmapreduce:us-west-2:000000000000:"
+                "cluster/j-LEGACYCLUSTER"
+            ),
+        },
+    )
+    persistence.save_state("emr", {"_clusters": clusters})
+
+    raw = _json.loads((tmp_path / "emr.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded = persistence.load_state("emr")["_clusters"]
+    assert loaded.get_scoped(
+        "000000000000", "us-west-2", "j-LEGACYCLUSTER"
+    )["Id"] == "j-LEGACYCLUSTER"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("emr") is None
+
+
+def test_resource_groups_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject Resource Groups' regional schema instead
+    of accepting it as v2 and silently dropping every regional store."""
+
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    groups = AccountRegionScopedDict()
+    groups.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-group",
+        {
+            "GroupArn": (
+                "arn:aws:resource-groups:us-west-2:000000000000:"
+                "group/regional-group"
+            )
+        },
+    )
+    persistence.save_state("resource_groups", {"groups": groups})
+
+    raw = _json.loads((tmp_path / "resource_groups.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_groups = persistence.load_state("resource_groups")["groups"]
+    assert loaded_groups.get_scoped(
+        "000000000000", "us-west-2", "regional-group"
+    )["GroupArn"].endswith("group/regional-group")
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("resource_groups") is None
+
+
+def test_codebuild_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject CodeBuild's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    projects = AccountRegionScopedDict()
+    projects.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-project",
+        {
+            "arn": (
+                "arn:aws:codebuild:us-west-2:000000000000:"
+                "project/regional-project"
+            )
+        },
+    )
+    persistence.save_state("codebuild", {"projects": projects})
+
+    raw = _json.loads((tmp_path / "codebuild.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_projects = persistence.load_state("codebuild")["projects"]
+    assert loaded_projects.get_scoped(
+        "000000000000", "us-west-2", "regional-project"
+    )["arn"].endswith("project/regional-project")
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("codebuild") is None
+
+
+def test_mq_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject MQ's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    brokers = AccountRegionScopedDict()
+    brokers.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-broker",
+        {
+            "brokerArn": (
+                "arn:aws:mq:us-west-2:000000000000:broker:regional-broker"
+            )
+        },
+    )
+    persistence.save_state("mq", {"brokers": brokers})
+
+    raw = _json.loads((tmp_path / "mq.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_brokers = persistence.load_state("mq")["brokers"]
+    assert loaded_brokers.get_scoped(
+        "000000000000", "us-west-2", "regional-broker"
+    )["brokerArn"].endswith("broker:regional-broker")
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("mq") is None
+
+
+def test_ses_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject both SES persistence files after their
+    stores become regional instead of accepting v2 and restoring them empty."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    for service in ("ses", "ses_v2"):
+        identities = AccountRegionScopedDict()
+        identities.set_scoped(
+            "000000000000",
+            "us-west-2",
+            "regional@example.com",
+            {"VerificationStatus": "Success"},
+        )
+        persistence.save_state(service, {"_identities": identities})
+
+        raw = _json.loads((tmp_path / f"{service}.json").read_text())
+        assert raw["__ministack_format__"] == 3
+        loaded_identities = persistence.load_state(service)["_identities"]
+        assert loaded_identities.get_scoped(
+            "000000000000", "us-west-2", "regional@example.com"
+        )["VerificationStatus"] == "Success"
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("ses") is None
+    assert persistence.load_state("ses_v2") is None
+
+
+def test_batch_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject Batch's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    jobs = AccountRegionScopedDict()
+    jobs.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-job",
+        {"jobArn": "arn:aws:batch:us-west-2:000000000000:job/regional-job"},
+    )
+    persistence.save_state("batch", {"jobs": jobs})
+
+    raw = _json.loads((tmp_path / "batch.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_jobs = persistence.load_state("batch")["jobs"]
+    assert loaded_jobs.get_scoped(
+        "000000000000", "us-west-2", "regional-job"
+    )["jobArn"].endswith("job/regional-job")
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("batch") is None
+
+
+def test_autoscaling_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject Auto Scaling's regional schema instead
+    of accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    asgs = AccountRegionScopedDict()
+    asgs.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-asg",
+        {
+            "AutoScalingGroupARN": (
+                "arn:aws:autoscaling:us-west-2:000000000000:"
+                "autoScalingGroup:regional:autoScalingGroupName/regional-asg"
+            )
+        },
+    )
+    persistence.save_state("autoscaling", {"asgs": asgs})
+
+    raw = _json.loads((tmp_path / "autoscaling.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_asgs = persistence.load_state("autoscaling")["asgs"]
+    assert loaded_asgs.get_scoped(
+        "000000000000", "us-west-2", "regional-asg"
+    )["AutoScalingGroupARN"].endswith("autoScalingGroupName/regional-asg")
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("autoscaling") is None
+
+
+def test_athena_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject Athena's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    workgroups = AccountRegionScopedDict()
+    workgroups.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-workgroup",
+        {"Name": "regional-workgroup", "Description": "west"},
+    )
+    persistence.save_state("athena", {"_workgroups": workgroups})
+
+    raw = _json.loads((tmp_path / "athena.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_workgroups = persistence.load_state("athena")["_workgroups"]
+    assert loaded_workgroups.get_scoped(
+        "000000000000", "us-west-2", "regional-workgroup"
+    )["Description"] == "west"
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("athena") is None
+
+
+def test_inspector2_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject Inspector2 regional account buckets."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    configs = AccountRegionScopedDict()
+    configs.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "000000000000",
+        {"ecr": {"status": "ENABLED"}},
+    )
+    persistence.save_state("inspector2", {"account_config": configs})
+
+    raw = _json.loads((tmp_path / "inspector2.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded = persistence.load_state("inspector2")["account_config"]
+    assert loaded.get_scoped(
+        "000000000000", "us-west-2", "000000000000"
+    ) == {"ecr": {"status": "ENABLED"}}
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("inspector2") is None
+
+
+def test_efs_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject EFS regional state instead of dropping it."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    file_systems = AccountRegionScopedDict()
+    file_systems.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "fs-11111111111111111",
+        {
+            "FileSystemId": "fs-11111111111111111",
+            "FileSystemArn": (
+                "arn:aws:elasticfilesystem:us-west-2:000000000000:"
+                "file-system/fs-11111111111111111"
+            ),
+        },
+    )
+    persistence.save_state("efs", {"file_systems": file_systems})
+
+    raw = _json.loads((tmp_path / "efs.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded = persistence.load_state("efs")["file_systems"]
+    assert loaded.get_scoped(
+        "000000000000", "us-west-2", "fs-11111111111111111"
+    )["FileSystemId"] == "fs-11111111111111111"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("efs") is None
+
+
+def test_s3files_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject S3 Files' regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    file_systems = AccountRegionScopedDict()
+    file_systems.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "fs-11111111111111111",
+        {
+            "fileSystemId": "fs-11111111111111111",
+            "fileSystemArn": (
+                "arn:aws:s3files:us-west-2:000000000000:"
+                "file-system/fs-11111111111111111"
+            ),
+        },
+    )
+    persistence.save_state("s3files", {"file_systems": file_systems})
+
+    raw = _json.loads((tmp_path / "s3files.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_file_systems = persistence.load_state("s3files")["file_systems"]
+    assert loaded_file_systems.get_scoped(
+        "000000000000", "us-west-2", "fs-11111111111111111"
+    )["fileSystemId"] == "fs-11111111111111111"
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("s3files") is None
+
+
+def test_servicediscovery_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject Cloud Map's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    namespaces = AccountRegionScopedDict()
+    namespaces.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "ns-regional",
+        {
+            "Arn": (
+                "arn:aws:servicediscovery:us-west-2:000000000000:"
+                "namespace/ns-regional"
+            )
+        },
+    )
+    persistence.save_state("servicediscovery", {"namespaces": namespaces})
+
+    raw = _json.loads((tmp_path / "servicediscovery.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_namespaces = persistence.load_state("servicediscovery")["namespaces"]
+    assert loaded_namespaces.get_scoped(
+        "000000000000", "us-west-2", "ns-regional"
+    )["Arn"].endswith("namespace/ns-regional")
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("servicediscovery") is None
+
+
+def test_batch_persistence_lifecycle_restores_regional_state(monkeypatch, tmp_path):
+    """The gateway save map and Batch import-time restore must preserve state
+    outside the ambient boot region across a process-shaped reload."""
+    import importlib
+
+    from ministack.app import _build_persistence_save_dict, _state_map
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import batch as service
+
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    resource_region = "us-west-2"
+    job_id = "regional-job"
+    job = {
+        "jobArn": f"arn:aws:batch:{resource_region}:{account_id}:job/{job_id}",
+        "status": "SUCCEEDED",
+    }
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+    set_request_account_id(account_id)
+    set_request_region(boot_region)
+    service.reset()
+    try:
+        service._jobs.set_scoped(account_id, resource_region, job_id, job)
+
+        assert _state_map["batch"] == "batch"
+        save_dict = _build_persistence_save_dict()
+        assert "batch" in save_dict
+        persistence.save_all({"batch": save_dict["batch"]})
+
+        service.reset()
+        importlib.reload(service)
+
+        assert service._jobs.get_scoped(
+            account_id, resource_region, job_id
+        ) == job
+        assert service._jobs.get_scoped(account_id, boot_region, job_id) is None
+    finally:
+        service.reset()

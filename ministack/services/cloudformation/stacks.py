@@ -135,7 +135,8 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                     )
                 else:
                     physical_id, attrs = _update_resource(
-                        resource_type, old_pid, old_props, resolved_props, stack_name
+                        resource_type, old_pid, old_props, resolved_props,
+                        stack_name, logical_id
                     )
             else:
                 if _is_custom_resource(resource_type):

@@ -83,6 +83,10 @@ async def handle_request(
     if method == "POST" and path.startswith("/topics/"):
         return await _publish(path[len("/topics/"):], body, qp)
 
+    # Device Shadow: /things/{thingName}/shadow[?name={shadowName}]
+    if path.startswith("/things/") and path.endswith("/shadow"):
+        return _shadow(method, path, body, qp)
+
     # Placeholders — return 501 so SDKs that probe these endpoints
     # get a clear "not implemented" rather than a generic 404.
     if path == "/retainedMessage":
@@ -101,6 +105,35 @@ async def handle_request(
     return error_response_json(
         "InvalidRequestException", f"Unsupported iot-data path: {method} {path}", 400
     )
+
+
+def _shadow(method: str, path: str, body: bytes, qp: dict) -> tuple:
+    """Route ``GetThingShadow`` / ``UpdateThingShadow`` / ``DeleteThingShadow``."""
+    thing = unquote(path[len("/things/"):-len("/shadow")])
+    shadow_name = qp.get("name", "") or ""
+
+    if method == "GET":
+        status, doc = _iot_module.get_thing_shadow(thing, shadow_name)
+    elif method == "POST":
+        try:
+            request = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            return error_response_json("InvalidRequestException", "Invalid JSON", 400)
+        status, doc = _iot_module.update_thing_shadow(thing, shadow_name, request)
+    elif method == "DELETE":
+        status, doc = _iot_module.delete_thing_shadow(thing, shadow_name)
+    else:
+        return error_response_json(
+            "InvalidRequestException", f"Unsupported iot-data path: {method} {path}", 400
+        )
+
+    if status == 404:
+        return error_response_json("ResourceNotFoundException", doc["message"], 404)
+    if status == 409:
+        return error_response_json("ConflictException", doc["message"], 409)
+    if status >= 400:
+        return error_response_json("InvalidRequestException", doc["message"], status)
+    return json_response(doc)
 
 
 async def _publish(raw_topic: str, body: bytes, qp: dict) -> tuple:

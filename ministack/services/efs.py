@@ -26,7 +26,12 @@ import time
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    AccountScopedDict,
+    get_account_id,
+    get_region,
+)
 
 logger = logging.getLogger("efs")
 
@@ -36,9 +41,9 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # State
 # ---------------------------------------------------------------------------
 
-_file_systems = AccountScopedDict()    # fs_id -> fs record
-_mount_targets = AccountScopedDict()   # mt_id -> mount target record
-_access_points = AccountScopedDict()   # ap_id -> access point record
+_file_systems = AccountRegionScopedDict()    # fs_id -> fs record
+_mount_targets = AccountRegionScopedDict()   # mt_id -> mount target record
+_access_points = AccountRegionScopedDict()   # ap_id -> access point record
 
 # ---------------------------------------------------------------------------
 # ID generators
@@ -384,8 +389,16 @@ def _find_resource(resource_id, resource_type=None):
 # Lifecycle / Backup / Account (stubs)
 # ---------------------------------------------------------------------------
 
-_lifecycle_configs = AccountScopedDict()
-_backup_policies = AccountScopedDict()
+_lifecycle_configs = AccountRegionScopedDict()
+_backup_policies = AccountRegionScopedDict()
+
+
+def _clear_state():
+    _file_systems.clear()
+    _mount_targets.clear()
+    _access_points.clear()
+    _lifecycle_configs.clear()
+    _backup_policies.clear()
 
 
 def get_state():
@@ -399,16 +412,45 @@ def get_state():
 
 
 def restore_state(data):
-    _file_systems.clear()
+    if not data:
+        return
+    _clear_state()
     _file_systems.update(data.get("file_systems", {}))
-    _mount_targets.clear()
     _mount_targets.update(data.get("mount_targets", {}))
-    _access_points.clear()
     _access_points.update(data.get("access_points", {}))
-    _lifecycle_configs.clear()
-    _lifecycle_configs.update(data.get("lifecycle_configs", {}))
-    _backup_policies.clear()
-    _backup_policies.update(data.get("backup_policies", {}))
+    fs_regions = {
+        (account_id, fs_id): region
+        for (account_id, region, fs_id), _fs in _file_systems.all_items()
+    }
+    for store, state_key in (
+        (_lifecycle_configs, "lifecycle_configs"),
+        (_backup_policies, "backup_policies"),
+    ):
+        _restore_file_system_child_store(
+            store,
+            data.get(state_key, {}),
+            fs_regions,
+        )
+
+
+def _restore_file_system_child_store(store, restored, fs_regions):
+    """Adopt legacy ARN-less state into its parent file system's region."""
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+
+    if isinstance(restored, AccountScopedDict):
+        items = restored._data.items()
+    else:
+        account_id = get_account_id()
+        items = (((account_id, key), value) for key, value in restored.items())
+
+    for (account_id, fs_id), value in items:
+        region = fs_regions.get(
+            (account_id, fs_id),
+            store._region_for_legacy_value(fs_id, value),
+        )
+        store.set_scoped(account_id, region, fs_id, value)
 
 
 try:
@@ -590,8 +632,4 @@ def _error(status, code, message):
 # ---------------------------------------------------------------------------
 
 def reset():
-    _file_systems.clear()
-    _mount_targets.clear()
-    _access_points.clear()
-    _lifecycle_configs.clear()
-    _backup_policies.clear()
+    _clear_state()

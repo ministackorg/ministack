@@ -1,11 +1,25 @@
+import os
 import uuid
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 
 def _uid(prefix="test"):
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+
+def _client(region):
+    return boto3.client(
+        "autoscaling",
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        region_name=region,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        config=Config(retries={"mode": "standard"}),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +72,142 @@ def test_create_asg_duplicate_fails(autoscaling):
         assert "AlreadyExists" in str(exc.value)
     finally:
         autoscaling.delete_auto_scaling_group(AutoScalingGroupName=name)
+
+
+def test_autoscaling_groups_and_tags_are_region_scoped():
+    east = _client("us-east-1")
+    west = _client("us-west-2")
+    name = _uid("asg-region")
+
+    east.create_auto_scaling_group(
+        AutoScalingGroupName=name,
+        MinSize=1,
+        MaxSize=3,
+        AvailabilityZones=["us-east-1a"],
+        Tags=[{"Key": "region", "Value": "east", "PropagateAtLaunch": True}],
+    )
+    west.create_auto_scaling_group(
+        AutoScalingGroupName=name,
+        MinSize=2,
+        MaxSize=4,
+        AvailabilityZones=["us-west-2a"],
+        Tags=[{"Key": "region", "Value": "west", "PropagateAtLaunch": True}],
+    )
+    try:
+        east_group = east.describe_auto_scaling_groups(
+            AutoScalingGroupNames=[name]
+        )["AutoScalingGroups"][0]
+        west_group = west.describe_auto_scaling_groups(
+            AutoScalingGroupNames=[name]
+        )["AutoScalingGroups"][0]
+
+        assert east_group["MinSize"] == 1
+        assert west_group["MinSize"] == 2
+        assert ":us-east-1:" in east_group["AutoScalingGroupARN"]
+        assert ":us-west-2:" in west_group["AutoScalingGroupARN"]
+        assert east_group["Tags"][0]["Value"] == "east"
+        assert west_group["Tags"][0]["Value"] == "west"
+    finally:
+        east.delete_auto_scaling_group(AutoScalingGroupName=name)
+        west.delete_auto_scaling_group(AutoScalingGroupName=name)
+
+
+def test_restore_legacy_child_state_uses_parent_asg_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import autoscaling as service
+
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    resource_region = "us-west-2"
+    asg_name = "legacy-asg"
+    child_key = f"{asg_name}/legacy-child"
+    original_account = get_account_id()
+    original_region = get_region()
+
+    asgs = AccountScopedDict()
+    policies = AccountScopedDict()
+    hooks = AccountScopedDict()
+    scheduled_actions = AccountScopedDict()
+    tags = AccountScopedDict()
+
+    set_request_account_id(account_id)
+    set_request_region(boot_region)
+    asgs[asg_name] = {
+        "AutoScalingGroupName": asg_name,
+        "AutoScalingGroupARN": (
+            f"arn:aws:autoscaling:{resource_region}:{account_id}:"
+            f"autoScalingGroup:legacy:autoScalingGroupName/{asg_name}"
+        ),
+    }
+    policies[child_key] = {"AutoScalingGroupName": asg_name}
+    hooks[child_key] = {"AutoScalingGroupName": asg_name}
+    scheduled_actions[child_key] = {"AutoScalingGroupName": asg_name}
+    tags[asg_name] = [{"Key": "legacy", "Value": "true"}]
+
+    service.reset()
+    try:
+        service.restore_state(
+            {
+                "asgs": asgs,
+                "policies": policies,
+                "hooks": hooks,
+                "scheduled_actions": scheduled_actions,
+                "tags": tags,
+            }
+        )
+        assert service._asgs.get_scoped(
+            account_id, resource_region, asg_name
+        )["AutoScalingGroupName"] == asg_name
+        for store in (
+            service._policies,
+            service._hooks,
+            service._scheduled_actions,
+        ):
+            assert (
+                store.get_scoped(account_id, resource_region, child_key) is not None
+            )
+            assert store.get_scoped(account_id, boot_region, child_key) is None
+        assert service._tags.get_scoped(account_id, resource_region, asg_name) == [
+            {"Key": "legacy", "Value": "true"}
+        ]
+        assert service._tags.get_scoped(account_id, boot_region, asg_name) is None
+    finally:
+        service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_reset_clears_autoscaling_state_across_regions():
+    from ministack.core.responses import get_region, set_request_region
+    from ministack.services import autoscaling as service
+
+    original_region = get_region()
+    stores = (
+        service._asgs,
+        service._launch_configs,
+        service._policies,
+        service._hooks,
+        service._scheduled_actions,
+        service._tags,
+    )
+    service.reset()
+    try:
+        for region in ("us-east-1", "us-west-2"):
+            set_request_region(region)
+            for store in stores:
+                store[f"resource-{region}"] = {"region": region}
+
+        service.reset()
+        assert all(not store.has_any() for store in stores)
+    finally:
+        service.reset()
+        set_request_region(original_region)
 
 
 def test_describe_asgs_empty(autoscaling):

@@ -224,6 +224,7 @@ _user_pools = AccountScopedDict()
 #   _users:   {username -> user_dict},
 #   _groups:  {group_name -> group_dict},
 #   _identity_providers: {provider_name -> provider_dict},
+#   _resource_servers: {identifier -> resource_server_dict},
 # }
 
 _pool_domain_map = AccountScopedDict()   # domain -> pool_id
@@ -271,6 +272,14 @@ _identity_tags = AccountScopedDict()   # identity_pool_id -> {key: value}
 
 _auth_codes = {}   # code -> {pool_id, client_id, username, redirect_uri, scopes, state, created_at}
 _AUTH_CODE_TTL = 300  # 5 minutes
+
+# Managed-login (Hosted UI) NEW_PASSWORD_REQUIRED sessions. Plain dict for the
+# same reason as `_auth_codes` above — no SigV4 on /login, so AccountScopedDict
+# would add no isolation; the unguessable token is the isolation boundary.
+_pending_new_password = {}   # token -> {pool_id, client_id, username, redirect_uri,
+                              #           scope, state, response_type, nonce,
+                              #           code_challenge, code_challenge_method, expires_at}
+_NEW_PASSWORD_SESSION_TTL = 300  # 5 minutes
 
 # ---------------------------------------------------------------------------
 # In-memory state — CUSTOM_AUTH Challenge Sessions
@@ -587,7 +596,7 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
             raise RuntimeError(f"PreTokenGeneration error: {result.get('body')}")
         return claims
     payload = result.get("body") if isinstance(result, dict) else result
-    response = _extract_pretoken_response(payload)
+    response = _extract_trigger_response(payload)
     if not response:
         return claims
 
@@ -667,12 +676,13 @@ def _build_pretoken_event(pool_id: str, client_id: str, username: str,
     }
 
 
-def _extract_pretoken_response(payload) -> dict | None:
-    """Pull the ``response`` block from a Lambda invocation result.
+def _extract_trigger_response(payload) -> dict | None:
+    """Pull the ``response`` block from a Lambda trigger invocation result.
 
-    Lambdas return the full event echoed back with their overrides written
-    into ``response.claimsAndScopeOverrideDetails`` (V2/V3) or
-    ``response.claimsOverrideDetails`` (V1). Accept already-parsed dicts,
+    Cognito Lambda triggers return the full event echoed back with their
+    overrides written into the ``response`` block (e.g.
+    ``response.claimsAndScopeOverrideDetails`` for PreTokenGeneration V2/V3,
+    ``response.autoConfirmUser`` for PreSignUp). Accept already-parsed dicts,
     JSON strings, and bytes.
     """
     if payload is None:
@@ -690,6 +700,100 @@ def _extract_pretoken_response(payload) -> dict | None:
     if not isinstance(payload, dict):
         return None
     return payload.get("response") if isinstance(payload.get("response"), dict) else payload
+
+
+class _PreSignUpRejected(Exception):
+    """Raised when a PreSignUp Lambda trigger rejects a federated sign-up."""
+
+
+def _apply_presignup_trigger(pool_id: str, client_id: str, username: str,
+                              user_attrs: dict,
+                              trigger_source: str = "PreSignUp_ExternalProvider") -> dict:
+    """Invoke the user pool's PreSignUp Lambda before persisting a federated user.
+
+    Emulates AWS's ``PreSignUp_ExternalProvider`` trigger, which fires
+    immediately before Cognito persists a user provisioned through IdP
+    federation. Unlike ``_apply_pretoken_trigger``, this is fail-closed: on
+    real AWS a Lambda that throws blocks the sign-up outright
+    (``UserLambdaValidationException``), so any invocation failure or
+    Lambda-reported error raises ``_PreSignUpRejected`` instead of being
+    swallowed.
+
+    Returns the trigger's ``autoConfirmUser``/``autoVerifyEmail``/
+    ``autoVerifyPhone`` overrides (all ``False`` if the pool has no
+    ``LambdaConfig.PreSignUp`` configured, which is a no-op).
+    """
+    defaults = {"autoConfirmUser": False, "autoVerifyEmail": False, "autoVerifyPhone": False}
+    pool = _user_pools.get(pool_id)
+    if not pool:
+        return defaults
+    cfg = pool.get("LambdaConfig") or {}
+    arn = cfg.get("PreSignUp")
+    if not arn:
+        return defaults
+
+    event = _build_presignup_event(
+        pool_id=pool_id, client_id=client_id, username=username,
+        user_attrs=user_attrs, trigger_source=trigger_source,
+    )
+
+    try:
+        # Lazy import to avoid a circular dependency between cognito and lambda_svc.
+        from ministack.services import lambda_svc
+        record, config, _name = lambda_svc._get_func_record_for_ref(arn)
+        if record is None or config is None:
+            raise RuntimeError(f"PreSignUp Lambda not found: {arn}")
+        exec_record = lambda_svc._execution_record_for_config(record, config)
+        result = lambda_svc._execute_function_with_config_scope(exec_record, event)
+    except Exception as e:
+        logger.warning("PreSignUp Lambda invocation failed for pool %s: %s", pool_id, e)
+        raise _PreSignUpRejected(str(e)) from e
+
+    if isinstance(result, dict) and result.get("error"):
+        reason = result.get("body") or "PreSignUp Lambda rejected the request."
+        logger.info("PreSignUp Lambda rejected sign-up for pool %s user %s: %s",
+                    pool_id, username, reason)
+        raise _PreSignUpRejected(str(reason))
+
+    payload = result.get("body") if isinstance(result, dict) else result
+    response = _extract_trigger_response(payload) or {}
+    return {
+        "autoConfirmUser": bool(response.get("autoConfirmUser")),
+        "autoVerifyEmail": bool(response.get("autoVerifyEmail")),
+        "autoVerifyPhone": bool(response.get("autoVerifyPhone")),
+    }
+
+
+def _build_presignup_event(pool_id: str, client_id: str, username: str,
+                            user_attrs: dict, trigger_source: str) -> dict:
+    """Construct the event payload AWS sends to a PreSignUp Lambda.
+
+    Shape from the Cognito Developer Guide
+    (https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-lambda-pre-sign-up.html).
+    ``validationData`` is always empty for federated sign-in — it only carries
+    data supplied via ``ClientMetadata`` on the native ``SignUp`` API.
+    """
+    return {
+        "version": "1",
+        "triggerSource": trigger_source,
+        "region": _pool_region(pool_id),
+        "userPoolId": pool_id,
+        "userName": username or "",
+        "callerContext": {
+            "awsSdkVersion": "ministack",
+            "clientId": client_id or "",
+        },
+        "request": {
+            "userAttributes": {k: v for k, v in (user_attrs or {}).items()
+                               if isinstance(v, (str, int, float, bool))},
+            "validationData": {},
+        },
+        "response": {
+            "autoConfirmUser": False,
+            "autoVerifyEmail": False,
+            "autoVerifyPhone": False,
+        },
+    }
 
 
 def _user_from_token(token: str, pool: dict):
@@ -1365,6 +1469,12 @@ async def _dispatch_idp(action: str, data: dict):
         "DescribeUserPoolClient": _describe_user_pool_client,
         "ListUserPoolClients": _list_user_pool_clients,
         "UpdateUserPoolClient": _update_user_pool_client,
+        # Resource Servers
+        "CreateResourceServer": _create_resource_server,
+        "UpdateResourceServer": _update_resource_server,
+        "DescribeResourceServer": _describe_resource_server,
+        "DeleteResourceServer": _delete_resource_server,
+        "ListResourceServers": _list_resource_servers,
         # User management
         "AdminCreateUser": _admin_create_user,
         "AdminDeleteUser": _admin_delete_user,
@@ -1385,6 +1495,7 @@ async def _dispatch_idp(action: str, data: dict):
         "AdminInitiateAuth": _admin_initiate_auth,
         "AdminRespondToAuthChallenge": _admin_respond_to_auth_challenge,
         "InitiateAuth": _initiate_auth,
+        "GetTokensFromRefreshToken": _get_tokens_from_refresh_token,
         "RespondToAuthChallenge": _respond_to_auth_challenge,
         "GlobalSignOut": _global_sign_out,
         "RevokeToken": _revoke_token,
@@ -1520,6 +1631,7 @@ def _create_user_pool(data):
         "_users": {},
         "_groups": {},
         "_identity_providers": {},
+        "_resource_servers": {},
     }
     if data.get("DeviceConfiguration"):
         pool["DeviceConfiguration"] = data["DeviceConfiguration"]
@@ -1709,8 +1821,131 @@ def _update_user_pool_client(data):
     return json_response({"UserPoolClient": {k: v for k, v in client.items() if v is not None}})
 
 
-def _validate_password(pool, password):
-    """Validate password against the pool's PasswordPolicy. Returns error response or None."""
+# ---------------------------------------------------------------------------
+# Resource Servers
+# ---------------------------------------------------------------------------
+# Scoped to what CDK/Terraform actually exercise: CRUD + list, keyed by the
+# caller-supplied Identifier (not a separately generated id — that matches
+# real AWS, where Identifier is also the resource server's primary key
+# within a pool and is reused directly in OAuth scope strings as
+# "{Identifier}/{ScopeName}").
+
+def _resource_server_dict(pool_id, identifier, name, scopes):
+    return {
+        "UserPoolId": pool_id,
+        "Identifier": identifier,
+        "Name": name,
+        "Scopes": scopes,
+    }
+
+
+def _pool_resource_servers(pool):
+    # setdefault, not direct indexing — pools created before this field
+    # existed (or via a CFN provisioner that builds its own pool dict, e.g.
+    # _cognito_user_pool_create) may not have "_resource_servers" yet.
+    return pool.setdefault("_resource_servers", {})
+
+
+def _create_resource_server(data):
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+    resource_servers = _pool_resource_servers(pool)
+
+    identifier = data.get("Identifier")
+    if not identifier:
+        return error_response_json(
+            "InvalidParameterException", "Identifier is required.", 400,
+        )
+    if identifier in resource_servers:
+        return error_response_json(
+            "InvalidParameterException",
+            f"Resource server {identifier} already exists.", 400,
+        )
+
+    server = _resource_server_dict(
+        pid, identifier, data.get("Name", identifier), data.get("Scopes", []),
+    )
+    resource_servers[identifier] = server
+    return json_response({"ResourceServer": server})
+
+
+def _update_resource_server(data):
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+
+    identifier = data.get("Identifier")
+    server = _pool_resource_servers(pool).get(identifier)
+    if not server:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Resource server {identifier} does not exist.", 400,
+        )
+
+    if "Name" in data:
+        server["Name"] = data["Name"]
+    if "Scopes" in data:
+        server["Scopes"] = data["Scopes"]
+    return json_response({"ResourceServer": server})
+
+
+def _describe_resource_server(data):
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+
+    identifier = data.get("Identifier")
+    server = _pool_resource_servers(pool).get(identifier)
+    if not server:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Resource server {identifier} does not exist.", 400,
+        )
+    return json_response({"ResourceServer": server})
+
+
+def _delete_resource_server(data):
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+
+    identifier = data.get("Identifier")
+    resource_servers = _pool_resource_servers(pool)
+    if identifier not in resource_servers:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Resource server {identifier} does not exist.", 400,
+        )
+    del resource_servers[identifier]
+    return json_response({})
+
+
+def _list_resource_servers(data):
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+
+    max_results = min(data.get("MaxResults", 50), 50)
+    next_token = data.get("NextToken")
+    servers = sorted(
+        _pool_resource_servers(pool).values(), key=lambda s: s["Identifier"],
+    )
+    start = int(next_token) if next_token else 0
+    page = servers[start:start + max_results]
+    resp = {"ResourceServers": page}
+    if start + max_results < len(servers):
+        resp["NextToken"] = str(start + max_results)
+    return json_response(resp)
+
+
+def _password_policy_errors(pool, password):
+    """Return a list of PasswordPolicy violation strings, or [] if compliant."""
     policy = pool.get("Policies", {}).get("PasswordPolicy", {})
     min_len = policy.get("MinimumLength", 8)
     errors = []
@@ -1724,6 +1959,12 @@ def _validate_password(pool, password):
         errors.append("Password must have numeric characters")
     if policy.get("RequireSymbols", True) and not any(c in "^$*.[]{}()?-\"!@#%&/\\,><':;|_~`+=" for c in password):
         errors.append("Password must have symbol characters")
+    return errors
+
+
+def _validate_password(pool, password):
+    """Validate password against the pool's PasswordPolicy. Returns error response or None."""
+    errors = _password_policy_errors(pool, password)
     if errors:
         return error_response_json(
             "InvalidPasswordException",
@@ -2270,16 +2511,19 @@ def _mfa_challenge_for_user(pool: dict, user: dict, pid: str, username: str) -> 
     }
 
 
-def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = "") -> dict:
+def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = "",
+                        trigger_source: str = "TokenGeneration_Authentication") -> dict:
     attrs = _attr_list_to_dict(user.get("Attributes", []))
     sub = attrs.get("sub", user["Username"])
     username = user.get("Username", "")
     groups = user.get("_groups", [])
     return {
         "AccessToken": _fake_token(sub, pool_id, client_id, "access", username=username,
-                                    user_attrs=attrs, groups=groups),
+                                    user_attrs=attrs, groups=groups,
+                                    trigger_source=trigger_source),
         "IdToken": _fake_token(sub, pool_id, client_id, "id", username=username,
-                               user_attrs=attrs, groups=groups, nonce=nonce),
+                               user_attrs=attrs, groups=groups, nonce=nonce,
+                               trigger_source=trigger_source),
         "RefreshToken": _fake_token(sub, pool_id, client_id, "refresh"),
         "TokenType": "Bearer",
         "ExpiresIn": 3600,
@@ -2339,7 +2583,8 @@ def _admin_initiate_auth(data):
         if _refresh_token_revoked(refresh_token, user):
             return error_response_json("NotAuthorizedException",
                                        "Refresh Token has been revoked", 400)
-        result = _build_auth_result(pid, cid, user)
+        result = _build_auth_result(pid, cid, user,
+                                     trigger_source="TokenGeneration_RefreshTokens")
         result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
         return json_response({"AuthenticationResult": result})
 
@@ -2613,6 +2858,62 @@ def _admin_respond_to_auth_challenge(data):
     return error_response_json("InvalidParameterException", f"Unsupported challenge: {challenge_name}", 400)
 
 
+def _pool_for_client(cid):
+    """Return (pool, pool_id) for the client id, or (None, None)."""
+    for p_id, p in _user_pools.items():
+        if cid in p["_clients"]:
+            return p, p_id
+    return None, None
+
+
+def _refresh_auth_result(pool, pid, cid, refresh_token):
+    """Shared REFRESH_TOKEN_AUTH core. Returns (auth_result_dict, error_response);
+    exactly one is non-None. Used by InitiateAuth's REFRESH_TOKEN_AUTH branch and
+    by GetTokensFromRefreshToken so both mint tokens identically."""
+    if not refresh_token:
+        return None, error_response_json("NotAuthorizedException", "Refresh token is missing.", 400)
+    # Decode stub token to find the correct user by sub.
+    user = _user_from_token(refresh_token, pool)
+    if not user:
+        users = list(pool["_users"].values())
+        if not users:
+            return None, error_response_json("NotAuthorizedException", "No users in pool.", 400)
+        user = users[0]
+    if _refresh_token_revoked(refresh_token, user):
+        return None, error_response_json("NotAuthorizedException",
+                                         "Refresh Token has been revoked", 400)
+    result = _build_auth_result(pid, cid, user, trigger_source="TokenGeneration_RefreshTokens")
+    result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
+    return result, None
+
+
+def _get_tokens_from_refresh_token(data):
+    """GetTokensFromRefreshToken — the only session-refresh path aws-amplify
+    v6.15+ uses (added by AWS in 2025 alongside refresh token rotation). Accepts
+    a top-level ``RefreshToken``/``ClientId`` and reuses the REFRESH_TOKEN_AUTH
+    core, returning the same ``AuthenticationResult`` shape.
+
+    Refresh token rotation (reissuing the RefreshToken and the
+    ``RefreshTokenReuseException`` grace period) is not modeled; with rotation
+    disabled — the pool default — AWS returns no new refresh token here, so the
+    result carries AccessToken/IdToken/ExpiresIn/TokenType only."""
+    cid = data.get("ClientId")
+    refresh_token = data.get("RefreshToken")
+    if not cid:
+        return error_response_json("InvalidParameterException",
+                                   "Missing required parameter ClientId", 400)
+    if not refresh_token:
+        return error_response_json("InvalidParameterException",
+                                   "Missing required parameter RefreshToken", 400)
+    pool, pid = _pool_for_client(cid)
+    if not pool:
+        return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
+    result, err = _refresh_auth_result(pool, pid, cid, refresh_token)
+    if err:
+        return err
+    return json_response({"AuthenticationResult": result})
+
+
 def _initiate_auth(data):
     """Public InitiateAuth — same logic as AdminInitiateAuth but no UserPoolId required."""
     cid = data.get("ClientId")
@@ -2657,21 +2958,9 @@ def _initiate_auth(data):
         return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
 
     if auth_flow in ("REFRESH_TOKEN_AUTH", "REFRESH_TOKEN"):
-        refresh_token = auth_params.get("REFRESH_TOKEN", "")
-        if not refresh_token:
-            return error_response_json("NotAuthorizedException", "Refresh token is missing.", 400)
-        # Decode stub token to find the correct user by sub
-        user = _user_from_token(refresh_token, pool)
-        if not user:
-            users = list(pool["_users"].values())
-            if not users:
-                return error_response_json("NotAuthorizedException", "No users in pool.", 400)
-            user = users[0]
-        if _refresh_token_revoked(refresh_token, user):
-            return error_response_json("NotAuthorizedException",
-                                       "Refresh Token has been revoked", 400)
-        result = _build_auth_result(pid, cid, user)
-        result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
+        result, err = _refresh_auth_result(pool, pid, cid, auth_params.get("REFRESH_TOKEN", ""))
+        if err:
+            return err
         return json_response({"AuthenticationResult": result})
 
     # USER_SRP_AUTH — return SRP challenge stub
@@ -3736,6 +4025,54 @@ button:hover{{background:#005a94}}
 </html>"""
 
 
+def _new_password_page_html(np_token, error_message=""):
+    esc = html_mod.escape
+    err_block = ""
+    if error_message:
+        err_block = f'<div class="error">{esc(error_message)}</div>'
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Change password</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  background:#f0f2f5;display:flex;justify-content:center;align-items:center;min-height:100vh}}
+.card{{background:#fff;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.1);
+  padding:40px;width:400px;max-width:90vw}}
+h1{{font-size:24px;font-weight:600;color:#232f3e;margin-bottom:24px;text-align:center}}
+label{{display:block;font-size:14px;font-weight:500;color:#545b64;margin-bottom:4px}}
+input[type=password]{{width:100%;padding:10px 12px;border:1px solid #aab7b8;
+  border-radius:4px;font-size:14px;margin-bottom:16px;outline:none;transition:border-color .15s}}
+input[type=password]:focus{{border-color:#0073bb;box-shadow:0 0 0 2px rgba(0,115,187,.2)}}
+button{{width:100%;padding:10px;background:#0073bb;color:#fff;border:none;border-radius:4px;
+  font-size:16px;font-weight:500;cursor:pointer;transition:background .15s}}
+button:hover{{background:#005a94}}
+.error{{background:#fce8e6;color:#d13212;border:1px solid #d13212;border-radius:4px;
+  padding:10px;margin-bottom:16px;font-size:13px;text-align:center}}
+.footer{{text-align:center;margin-top:20px;font-size:12px;color:#879596}}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>Set a new password</h1>
+{err_block}
+<form method="POST" action="/login">
+<input type="hidden" name="np_token" value="{esc(np_token)}">
+<label for="new_password">New password</label>
+<input type="password" id="new_password" name="new_password" autocomplete="new-password" required autofocus>
+<label for="confirm_password">Confirm new password</label>
+<input type="password" id="confirm_password" name="confirm_password" autocomplete="new-password" required>
+<button type="submit">Update password</button>
+</form>
+<div class="footer">Powered by ministack</div>
+</div>
+</body>
+</html>"""
+
+
 # -- /oauth2/authorize (GET) ------------------------------------------------
 
 def _oauth2_authorize_federation(query_params):
@@ -3951,9 +4288,19 @@ def _saml2_idp_response(body: bytes, query_params):
         sub = existing_dict.get("sub", new_uuid())
     else:
         sub = new_uuid()
-        user_attrs["sub"] = sub
         if "email" not in user_attrs:
             user_attrs["email"] = name_id if "@" in name_id else ""
+        try:
+            presignup = _apply_presignup_trigger(pool_id, client_id, username, user_attrs)
+        except _PreSignUpRejected as e:
+            logger.info("Cognito: PreSignUp Lambda rejected SAML federation sign-up for %s: %s",
+                        username, e)
+            return error_response_json("UserLambdaValidationException", str(e), 400)
+        if presignup["autoVerifyEmail"] and "email" in user_attrs:
+            user_attrs["email_verified"] = "true"
+        if presignup["autoVerifyPhone"] and "phone_number" in user_attrs:
+            user_attrs["phone_number_verified"] = "true"
+        user_attrs["sub"] = sub
         user = {
             "Username": username,
             "Attributes": _dict_to_attr_list(user_attrs),
@@ -4170,9 +4517,19 @@ def _oauth2_idp_response(method, body, query_params):
         sub = existing_dict.get("sub", new_uuid())
     else:
         sub = new_uuid()
-        user_attrs["sub"] = sub
         if "email" not in user_attrs and "@" in name_id:
             user_attrs["email"] = name_id
+        try:
+            presignup = _apply_presignup_trigger(pool_id, client_id, username, user_attrs)
+        except _PreSignUpRejected as e:
+            logger.info("Cognito: PreSignUp Lambda rejected OIDC federation sign-up for %s: %s",
+                        username, e)
+            return error_response_json("UserLambdaValidationException", str(e), 400)
+        if presignup["autoVerifyEmail"] and "email" in user_attrs:
+            user_attrs["email_verified"] = "true"
+        if presignup["autoVerifyPhone"] and "phone_number" in user_attrs:
+            user_attrs["phone_number_verified"] = "true"
+        user_attrs["sub"] = sub
         user = {
             "Username": username,
             "Attributes": _dict_to_attr_list(user_attrs),
@@ -4213,6 +4570,30 @@ def _oauth2_idp_response(method, body, query_params):
 
 # -- /login (POST) ----------------------------------------------------------
 
+def _issue_auth_code_redirect(client_id, pool_id, redirect_uri, scope, username, nonce,
+                               code_challenge, code_challenge_method, state):
+    """Mint an authorization code and build the 302 redirect response for the Hosted UI."""
+    code = _generate_auth_code()
+    _authorization_codes[code] = {
+        "client_id": client_id,
+        "pool_id": pool_id,
+        "redirect_uri": redirect_uri,
+        "scope": scope,
+        "username": username,
+        "nonce": nonce,
+        "code_challenge": code_challenge,
+        "code_challenge_method": code_challenge_method,
+        "expires_at": time.time() + 300,
+    }
+
+    sep = "&" if "?" in redirect_uri else "?"
+    location = f"{redirect_uri}{sep}code={quote(code)}"
+    if state:
+        location += f"&state={quote(state)}"
+
+    return 302, {"Location": location, "Cache-Control": "no-store"}, b""
+
+
 def handle_login_submit(method, path, headers, body, query_params):
     """POST /login — process the login form and redirect with auth code."""
     form: dict = {}
@@ -4222,6 +4603,10 @@ def handle_login_submit(method, path, headers, body, query_params):
             form = {k: v[0] for k, v in parsed.items()}
         except Exception:
             pass
+
+    np_token = form.get("np_token", "")
+    if np_token:
+        return _handle_new_password_submit(np_token, form)
 
     username = form.get("username", "")
     password = form.get("password", "")
@@ -4259,27 +4644,75 @@ def handle_login_submit(method, path, headers, body, query_params):
         )
         return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
 
-    # Generate authorization code
-    code = _generate_auth_code()
-    _authorization_codes[code] = {
-        "client_id": client_id,
-        "pool_id": pool_id,
-        "redirect_uri": redirect_uri,
-        "scope": scope,
-        "username": username,
-        "nonce": nonce,
-        "code_challenge": code_challenge,
-        "code_challenge_method": code_challenge_method,
-        "expires_at": time.time() + 300,
-    }
+    if user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
+        np_token = secrets.token_urlsafe(24)
+        _pending_new_password[np_token] = {
+            "pool_id": pool_id,
+            "client_id": client_id,
+            "username": user["Username"],
+            "redirect_uri": redirect_uri,
+            "scope": scope,
+            "state": state,
+            "response_type": response_type,
+            "nonce": nonce,
+            "code_challenge": code_challenge,
+            "code_challenge_method": code_challenge_method,
+            "expires_at": time.time() + _NEW_PASSWORD_SESSION_TTL,
+        }
+        html_body = _new_password_page_html(np_token)
+        return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
 
-    # Redirect with code
-    sep = "&" if "?" in redirect_uri else "?"
-    location = f"{redirect_uri}{sep}code={quote(code)}"
-    if state:
-        location += f"&state={quote(state)}"
+    return _issue_auth_code_redirect(
+        client_id, pool_id, redirect_uri, scope, user["Username"], nonce,
+        code_challenge, code_challenge_method, state,
+    )
 
-    return 302, {"Location": location, "Cache-Control": "no-store"}, b""
+
+def _handle_new_password_submit(np_token, form):
+    """POST /login with `np_token` — finalize a FORCE_CHANGE_PASSWORD flow started by the
+    Hosted UI login form."""
+    session = _pending_new_password.get(np_token)
+    if not session or session["expires_at"] < time.time():
+        _pending_new_password.pop(np_token, None)
+        return _oauth2_error("invalid_request", "Session has expired. Please sign in again.")
+
+    new_password = form.get("new_password", "")
+    confirm_password = form.get("confirm_password", "")
+
+    if new_password != confirm_password:
+        html_body = _new_password_page_html(np_token, error_message="Passwords do not match.")
+        return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+
+    pool = _get_pool_unscoped(session["pool_id"])
+    if not pool:
+        _pending_new_password.pop(np_token, None)
+        return error_response_json("ResourceNotFoundException",
+                                   f"User pool {session['pool_id']} not found.", 400)
+
+    policy_errors = _password_policy_errors(pool, new_password)
+    if policy_errors:
+        html_body = _new_password_page_html(
+            np_token,
+            error_message="Password did not conform with policy: " + "; ".join(policy_errors),
+        )
+        return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+
+    user, err = _resolve_user(pool, session["username"])
+    if err:
+        _pending_new_password.pop(np_token, None)
+        return err
+
+    user["_password"] = new_password
+    user["UserStatus"] = "CONFIRMED"
+    user["UserLastModifiedDate"] = _now_epoch()
+
+    del _pending_new_password[np_token]
+
+    return _issue_auth_code_redirect(
+        session["client_id"], session["pool_id"], session["redirect_uri"], session["scope"],
+        user["Username"], session["nonce"], session["code_challenge"],
+        session["code_challenge_method"], session["state"],
+    )
 
 
 # -- /oauth2/token (POST) ---------------------------------------------------
@@ -4346,7 +4779,8 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             if not user:
                 return _oauth2_error("server_error", "User not found.")
 
-            result = _build_auth_result(pool_id, cid, user, nonce=entry.get("nonce", ""))
+            result = _build_auth_result(pool_id, cid, user, nonce=entry.get("nonce", ""),
+                                         trigger_source="TokenGeneration_HostedAuth")
             refresh_val = result["RefreshToken"]
             _refresh_tokens[refresh_val] = {
                 "pool_id": pool_id,
@@ -4385,8 +4819,10 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
                 if user:
                     user_attrs = _attr_list_to_dict(user.get("Attributes", []))
 
-            access_token = _fake_token(sub, pool_id, effective_client_id, "access", username)
-            id_token = _fake_token(sub, pool_id, effective_client_id, "id", username, user_attrs=user_attrs)
+            access_token = _fake_token(sub, pool_id, effective_client_id, "access", username,
+                                        trigger_source="TokenGeneration_HostedAuth")
+            id_token = _fake_token(sub, pool_id, effective_client_id, "id", username, user_attrs=user_attrs,
+                                    trigger_source="TokenGeneration_HostedAuth")
             refresh_token = secrets.token_urlsafe(48)
 
             return json_response({
@@ -4424,8 +4860,10 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         sub = attrs.get("sub", user["Username"])
         username = user.get("Username", "")
         resp = {
-            "access_token": _fake_token(sub, pool_id, client_id, "access", username=username),
-            "id_token": _fake_token(sub, pool_id, client_id, "id", username=username, user_attrs=attrs),
+            "access_token": _fake_token(sub, pool_id, client_id, "access", username=username,
+                                         trigger_source="TokenGeneration_RefreshTokens"),
+            "id_token": _fake_token(sub, pool_id, client_id, "id", username=username, user_attrs=attrs,
+                                     trigger_source="TokenGeneration_RefreshTokens"),
             "token_type": "Bearer",
             "expires_in": 3600,
         }
@@ -4829,7 +5267,11 @@ def _apply_user_filter(users: list, filter_str: str) -> list:
         if attr_name == "username":
             field_val = user.get("Username", "")
         elif attr_name == "status":
-            field_val = user.get("UserStatus", "")
+            # "status" filters on the account's Enabled/Disabled state (toggled by
+            # AdminEnableUser/AdminDisableUser), not the UserStatus confirmation-state enum
+            # (CONFIRMED, FORCE_CHANGE_PASSWORD, etc.). Matches real AWS Cognito's ListUsers
+            # Filter semantics, where "status" = "Enabled" never matches UserStatus values.
+            field_val = "Enabled" if user.get("Enabled", True) else "Disabled"
         elif attr_name == "email_verified":
             field_val = attr_dict.get("email_verified", "")
         if op == "=" and field_val == value:
@@ -4853,3 +5295,5 @@ def reset():
     _auth_codes.clear()
     _authorization_codes.clear()
     _refresh_tokens.clear()
+    _challenge_sessions.clear()
+    _pending_new_password.clear()

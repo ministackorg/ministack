@@ -1,6 +1,99 @@
+import pytest
+
 from ministack.core.responses import _request_region
 from ministack.services import dynamodb as _ddb
 from ministack.services import pipes as _pipes
+
+
+def _stream_arn(region, table_name="PipeTable"):
+    return (
+        f"arn:aws:dynamodb:{region}:000000000000:"
+        f"table/{table_name}/stream/2026-05-22T00:00:00.000"
+    )
+
+
+def _topic_arn(region, topic_name="PipeTopic"):
+    return f"arn:aws:sns:{region}:000000000000:{topic_name}"
+
+
+def test_register_pipe_rejects_cross_region_target(monkeypatch):
+    _pipes.reset()
+    monkeypatch.setattr(_pipes, "_ensure_poller", lambda: None)
+    region_token = _request_region.set("us-east-1")
+    try:
+        with pytest.raises(ValueError) as exc:
+            _pipes.register_pipe(
+                name="CrossRegionTargetPipe",
+                source=_stream_arn("us-east-1"),
+                target=_topic_arn("us-west-2"),
+                role_arn="arn:aws:iam::000000000000:role/test-pipe-role",
+            )
+
+        assert str(exc.value) == _pipes.CROSS_REGION_PIPE_ERROR
+        assert _pipes._pipes.get("CrossRegionTargetPipe") is None
+        assert not _pipes._positions.has_any()
+    finally:
+        _request_region.reset(region_token)
+        _pipes.reset()
+
+
+def test_register_pipe_rejects_cross_region_source(monkeypatch):
+    _pipes.reset()
+    monkeypatch.setattr(_pipes, "_ensure_poller", lambda: None)
+    region_token = _request_region.set("us-east-1")
+    try:
+        with pytest.raises(ValueError) as exc:
+            _pipes.register_pipe(
+                name="CrossRegionSourcePipe",
+                source=_stream_arn("us-west-2"),
+                target=_topic_arn("us-east-1"),
+                role_arn="arn:aws:iam::000000000000:role/test-pipe-role",
+            )
+
+        assert str(exc.value) == _pipes.CROSS_REGION_PIPE_ERROR
+        assert _pipes._pipes.get("CrossRegionSourcePipe") is None
+        assert not _pipes._positions.has_any()
+    finally:
+        _request_region.reset(region_token)
+        _pipes.reset()
+
+
+def test_register_pipe_allows_same_region_components(monkeypatch):
+    _pipes.reset()
+    monkeypatch.setattr(_pipes, "_ensure_poller", lambda: None)
+    region_token = _request_region.set("us-east-1")
+    try:
+        pipe = _pipes.register_pipe(
+            name="SameRegionPipe",
+            source=_stream_arn("us-east-1"),
+            target=_topic_arn("us-east-1"),
+            role_arn="arn:aws:iam::000000000000:role/test-pipe-role",
+        )
+
+        assert pipe["Arn"] == "arn:aws:pipes:us-east-1:000000000000:pipe/SameRegionPipe"
+        assert _pipes._pipes.get("SameRegionPipe") == pipe
+        assert _pipes._positions.get(pipe["Arn"]) == 0
+    finally:
+        _request_region.reset(region_token)
+        _pipes.reset()
+
+
+def test_register_pipe_region_guard_ignores_malformed_or_global_arns(monkeypatch):
+    _pipes.reset()
+    monkeypatch.setattr(_pipes, "_ensure_poller", lambda: None)
+    region_token = _request_region.set("us-east-1")
+    try:
+        pipe = _pipes.register_pipe(
+            name="GlobalOrMalformedPipe",
+            source="arn:aws:s3:::pipe-source-bucket/key",
+            target="not-an-arn",
+            role_arn="arn:aws:iam::000000000000:role/test-pipe-role",
+        )
+
+        assert _pipes._pipes.get("GlobalOrMalformedPipe") == pipe
+    finally:
+        _request_region.reset(region_token)
+        _pipes.reset()
 
 
 def test_pipes_stream_table_name_parser_requires_dynamodb_stream_arn():

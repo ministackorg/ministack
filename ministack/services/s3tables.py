@@ -53,6 +53,12 @@ _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _GATEWAY_PORT = os.environ.get("GATEWAY_PORT", "4566")
 _SIGV4_CREDENTIAL_REGION_RE = re.compile(r"Credential=[^/]+/[^/]+/([^/]+)/")
 
+
+def _gateway_url() -> str:
+    from ministack.core import tls as _tls
+    scheme = "https" if _tls.use_ssl_enabled() else "http"
+    return f"{scheme}://{_MINISTACK_HOST}:{_GATEWAY_PORT}"
+
 # ── In-memory state ────────────────────────────────────────
 
 _table_buckets = AccountRegionScopedDict()
@@ -212,6 +218,11 @@ def _create_table_bucket(data):
     arn = _bucket_arn(name)
     _table_buckets[name] = {"arn": arn, "name": name, "ownerAccountId": get_account_id(),
                              "createdAt": now_iso(), "tableCount": 0}
+    # Provision the backing S3 bucket so data-plane writes (Parquet, manifests)
+    # have somewhere to land — mirrors real AWS where S3 Tables manages its own
+    # underlying storage transparently.
+    import ministack.services.s3 as _s3
+    _s3._buckets.setdefault(name, {"created": now_iso(), "objects": {}, "region": get_region()})
     logger.info("S3Tables: created table bucket %s", name)
     return json_response({"arn": arn})
 
@@ -246,6 +257,8 @@ def _delete_table_bucket(arn):
         if key.startswith(arn + "\x00"):
             del _namespaces[key]
     del _table_buckets[name]
+    import ministack.services.s3 as _s3
+    _s3._buckets.pop(name, None)
     return json_response({})
 
 
@@ -421,7 +434,13 @@ def _update_table_metadata_location(bucket_arn, namespace, table_name, data):
 # ── Iceberg REST catalog (data plane for Spark) ───────────
 
 def _iceberg_config():
-    return json_response({"defaults": {}, "overrides": {}})
+    return json_response({"defaults": {
+        "client.region": get_region(),
+        "s3.endpoint": _gateway_url(),
+        "s3.access-key-id": "test",
+        "s3.secret-access-key": "test",
+        "s3.path-style-access": "true",
+    }, "overrides": {}})
 
 
 def _iceberg_allows_cross_region(headers):
@@ -461,7 +480,8 @@ def _iceberg_load_table(namespace, table_name, allow_cross_region):
             "metadata": table.get("_iceberg_metadata", {}),
             "config": {
                 "s3.access-key-id": "test", "s3.secret-access-key": "test",
-                "s3.endpoint": f"http://{_MINISTACK_HOST}:{_GATEWAY_PORT}", "s3.path-style-access": "true",
+                "s3.endpoint": _gateway_url(), "s3.path-style-access": "true",
+                "s3.region": get_region(), "client.region": get_region(),
             },
         })
     return error_response_json("NotFoundException", f"Table {namespace}.{table_name} not found", 404)
@@ -566,38 +586,62 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
     if parts[1] == "v1" and len(parts) == 3 and parts[2] == "config" and method == "GET":
         return _iceberg_config()
 
-    if len(parts) < 4:
+    # POST /iceberg/v1/transactions/commit — DuckDB atomic multi-table commit
+    if parts[1] == "v1" and parts[2] == "transactions" and method == "POST":
+        data = json.loads(body) if body else {}
+        for change in data.get("table-changes", []):
+            ident = change.get("identifier", {})
+            ns = ident.get("namespace", [""])
+            ns = ns[0] if isinstance(ns, list) else ns
+            tbl = ident.get("name", "")
+            result = _iceberg_commit_table(ns, tbl, change, allow_cross_region)
+            if result and result[0] not in (200, 204):
+                return result
+        return json_response({})
+
+    if len(parts) < 3:
         return None
 
-    # parts[2] = prefix (catalog name), parts[3] = "namespaces"
-    if parts[3] == "namespaces":
-        if len(parts) == 4 and method == "GET":
-            return _iceberg_list_namespaces(allow_cross_region)
-        if len(parts) == 5 and method == "GET":
-            return _iceberg_get_namespace(parts[4], allow_cross_region)
-        if len(parts) >= 6 and parts[5] == "tables":
-            namespace = parts[4]
-            if len(parts) == 6:
-                if method == "GET":
-                    return _iceberg_list_tables(namespace, allow_cross_region)
-                if method == "POST":
-                    data = json.loads(body) if body else {}
-                    return _iceberg_create_table(namespace, data, allow_cross_region)
-            if len(parts) == 7:
-                table_name = parts[6]
-                if method == "GET":
-                    return _iceberg_load_table(namespace, table_name, allow_cross_region)
-                if method == "POST":
-                    data = json.loads(body) if body else {}
-                    return _iceberg_commit_table(namespace, table_name, data, allow_cross_region)
-                if method == "HEAD":
-                    if _iceberg_values(
-                        _tables,
-                        lambda table: _namespace_name(table) == namespace and table["name"] == table_name,
-                        allow_cross_region,
-                    ):
-                        return 200, {}, b""
-                    return 404, {}, b""
+    # Support two URL formats:
+    #   Standard Iceberg REST: /iceberg/v1/{prefix}/namespaces/...
+    #   S3 Tables (no prefix): /iceberg/v1/namespaces/...  (warehouse in query param)
+    if parts[2] == "namespaces":
+        ns_idx = 2
+    elif len(parts) >= 4 and parts[3] == "namespaces":
+        ns_idx = 3
+    else:
+        return None
+
+    rest = parts[ns_idx + 1:]  # segments after "namespaces"
+
+    if len(rest) == 0 and method == "GET":
+        return _iceberg_list_namespaces(allow_cross_region)
+    if len(rest) == 1 and method == "GET":
+        return _iceberg_get_namespace(rest[0], allow_cross_region)
+    if len(rest) >= 2 and rest[1] == "tables":
+        namespace = rest[0]
+        table_rest = rest[2:]
+        if len(table_rest) == 0:
+            if method == "GET":
+                return _iceberg_list_tables(namespace, allow_cross_region)
+            if method == "POST":
+                data = json.loads(body) if body else {}
+                return _iceberg_create_table(namespace, data, allow_cross_region)
+        if len(table_rest) == 1:
+            table_name = table_rest[0]
+            if method == "GET":
+                return _iceberg_load_table(namespace, table_name, allow_cross_region)
+            if method == "POST":
+                data = json.loads(body) if body else {}
+                return _iceberg_commit_table(namespace, table_name, data, allow_cross_region)
+            if method == "HEAD":
+                if _iceberg_values(
+                    _tables,
+                    lambda table: _namespace_name(table) == namespace and table["name"] == table_name,
+                    allow_cross_region,
+                ):
+                    return 200, {}, b""
+                return 404, {}, b""
     return None
 
 

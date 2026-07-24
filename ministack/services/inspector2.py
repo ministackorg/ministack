@@ -12,6 +12,7 @@ import uuid
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -21,12 +22,12 @@ from ministack.core.responses import (
 
 logger = logging.getLogger("inspector2")
 
-_account_config = AccountScopedDict()
-_findings = AccountScopedDict()
-_coverage = AccountScopedDict()
-_scan_history = AccountScopedDict()
+_account_config = AccountRegionScopedDict()
+_findings = AccountRegionScopedDict()
+_coverage = AccountRegionScopedDict()
+_scan_history = AccountRegionScopedDict()
 _tags = AccountScopedDict()
-_filters = AccountScopedDict()
+_filters = AccountRegionScopedDict()
 
 
 def _now_iso():
@@ -1025,37 +1026,62 @@ async def handle_request(method, path, headers, body, query_params):
 
 
 def get_state():
-    return {
-        "account_config": copy.deepcopy(dict(_account_config._data)),
-        "findings": copy.deepcopy(dict(_findings._data)),
-        "coverage": copy.deepcopy(dict(_coverage._data)),
-        "scan_history": copy.deepcopy(dict(_scan_history._data)),
-        "tags": copy.deepcopy(dict(_tags._data)),
-        "filters": copy.deepcopy(dict(_filters._data)),
-    }
+    return copy.deepcopy(
+        {
+            "account_config": _account_config,
+            "findings": _findings,
+            "coverage": _coverage,
+            "scan_history": _scan_history,
+            "tags": _tags,
+            "filters": _filters,
+        }
+    )
 
 
 def restore_state(data):
     if not data:
         return
-    acc_config = data.get("account_config", {})
-    if acc_config:
-        _account_config._data.update(acc_config)
-    findings = data.get("findings", {})
-    if findings:
-        _findings._data.update(findings)
-    coverage = data.get("coverage", {})
-    if coverage:
-        _coverage._data.update(coverage)
-    scan_history = data.get("scan_history", {})
-    if scan_history:
-        _scan_history._data.update(scan_history)
-    tags = data.get("tags", {})
-    if tags:
-        _tags._data.update(tags)
-    filters_data = data.get("filters", {})
-    if filters_data:
-        _filters._data.update(filters_data)
+    reset()
+    for store, state_key in (
+        (_account_config, "account_config"),
+        (_findings, "findings"),
+        (_coverage, "coverage"),
+        (_scan_history, "scan_history"),
+        (_filters, "filters"),
+    ):
+        _restore_regional_bucket(store, data.get(state_key, {}))
+    _restore_account_bucket(_tags, data.get("tags", {}))
+
+
+def _restore_regional_bucket(store, restored):
+    """Restore each legacy account bucket intact into the boot region."""
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+
+    if isinstance(restored, AccountScopedDict):
+        items = restored._data.items()
+    else:
+        items = restored.items()
+
+    boot_region = get_region()
+    for key, value in items:
+        if isinstance(key, tuple) and len(key) == 2:
+            account_id, bucket_key = key
+        else:
+            account_id, bucket_key = get_account_id(), key
+        store.set_scoped(account_id, boot_region, bucket_key, value)
+
+
+def _restore_account_bucket(store, restored):
+    if isinstance(restored, AccountScopedDict):
+        store.update(restored)
+        return
+    for key, value in restored.items():
+        if isinstance(key, tuple) and len(key) == 2:
+            store._data[key] = value
+        else:
+            store[key] = value
 
 
 def reset():

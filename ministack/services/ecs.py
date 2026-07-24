@@ -34,6 +34,7 @@ import time
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -50,20 +51,21 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _GATEWAY_PORT = os.environ.get("GATEWAY_PORT", "4566")
 
-_clusters = AccountScopedDict()
-_task_defs = AccountScopedDict()
-_task_def_latest = AccountScopedDict()
-_services = AccountScopedDict()
-_tasks = AccountScopedDict()
+_clusters = AccountRegionScopedDict()
+_task_defs = AccountRegionScopedDict()
+_task_def_latest = AccountRegionScopedDict()
+_services = AccountRegionScopedDict()
+_tasks = AccountRegionScopedDict()
+# Account-scoped is deliberate: keys are region-embedding resource ARNs.
 _tags = AccountScopedDict()
-_account_settings = AccountScopedDict()
-_capacity_providers = AccountScopedDict()
+_account_settings = AccountRegionScopedDict()
+_capacity_providers = AccountRegionScopedDict()
 # `_attributes` was originally declared next to its handler block much
 # further down the file. Moved up here so the import-time `load_state`
 # block (which calls `restore_state` and references `_attributes`) sees
 # it defined; otherwise warm-boot fires NameError, the surrounding
 # try/except swallows it, and ALL ECS state silently fails to restore.
-_attributes = AccountScopedDict()
+_attributes = AccountRegionScopedDict()
 
 _docker = None
 
@@ -122,9 +124,8 @@ def get_state():
         "attributes": copy.deepcopy(_attributes),
     }
     # Save tasks but strip Docker container IDs.
-    # Iterate _data directly to capture ALL accounts.
-    from ministack.core.responses import AccountScopedDict
-    tasks = AccountScopedDict()
+    # Iterate _data directly to capture ALL accounts and regions.
+    tasks = AccountRegionScopedDict()
     for scoped_key, task in _tasks._data.items():
         t = copy.deepcopy(task)
         t.pop("_docker_ids", None)
@@ -134,29 +135,89 @@ def get_state():
     return state
 
 
+def _restore_task_def_latest(latest_data):
+    if isinstance(latest_data, AccountRegionScopedDict):
+        _task_def_latest.update(latest_data)
+        return
+
+    task_defs = _task_defs.all_items()
+    for (account_id, region, _key), task_def in task_defs:
+        if not isinstance(task_def, dict):
+            continue
+        family = task_def.get("family")
+        revision = task_def.get("revision")
+        if not family or not isinstance(revision, int):
+            continue
+        current_revision = _task_def_latest.get_scoped(
+            account_id, region, family
+        )
+        if current_revision is None or revision > current_revision:
+            _task_def_latest.set_scoped(account_id, region, family, revision)
+
+    if not latest_data:
+        return
+
+    if isinstance(latest_data, AccountScopedDict):
+        latest_items = latest_data._data.items()
+    else:
+        latest_items = (
+            ((get_account_id(), family), revision)
+            for family, revision in latest_data.items()
+        )
+
+    for (account_id, family), revision in latest_items:
+        exact_key = f"{family}:{revision}"
+        exact_regions = {
+            region
+            for (candidate_account, region, key), _task_def in task_defs
+            if candidate_account == account_id and key == exact_key
+        }
+        family_regions = {
+            region
+            for (candidate_account, region, _key), task_def in task_defs
+            if candidate_account == account_id
+            and isinstance(task_def, dict)
+            and task_def.get("family") == family
+        }
+        matching_regions = exact_regions or family_regions
+        region = next(iter(matching_regions)) if len(matching_regions) == 1 else get_region()
+        current_revision = _task_def_latest.get_scoped(account_id, region, family)
+        if current_revision is None or revision > current_revision:
+            _task_def_latest.set_scoped(account_id, region, family, revision)
+
+
 def restore_state(data):
     if not data:
         return
     _clusters.update(data.get("clusters", {}))
     _task_defs.update(data.get("task_defs", {}))
-    _task_def_latest.update(data.get("task_def_latest", {}))
+    _restore_task_def_latest(data.get("task_def_latest", {}))
     _services.update(data.get("services", {}))
     _tags.update(data.get("tags", {}))
     _account_settings.update(data.get("account_settings", {}))
     _capacity_providers.update(data.get("capacity_providers", {}))
     _attributes.update(data.get("attributes", {}))
-    from ministack.core.responses import AccountScopedDict
     tasks_data = data.get("tasks", {})
-    if isinstance(tasks_data, AccountScopedDict):
+    if isinstance(tasks_data, AccountRegionScopedDict):
         for scoped_key, task in tasks_data._data.items():
-            task["_docker_ids"] = []
-            task["lastStatus"] = "STOPPED"
-            _tasks._data[scoped_key] = task
+            restored_task = copy.deepcopy(task)
+            restored_task["_docker_ids"] = []
+            restored_task["lastStatus"] = "STOPPED"
+            _tasks._data[scoped_key] = restored_task
+    elif isinstance(tasks_data, AccountScopedDict):
+        for (account_id, arn), task in tasks_data._data.items():
+            restored_task = copy.deepcopy(task)
+            restored_task["_docker_ids"] = []
+            restored_task["lastStatus"] = "STOPPED"
+            region = _tasks._region_for_legacy_value(arn, restored_task)
+            _tasks.set_scoped(account_id, region, arn, restored_task)
     else:
         for arn, task in tasks_data.items():
-            task["_docker_ids"] = []
-            task["lastStatus"] = "STOPPED"
-            _tasks[arn] = task
+            restored_task = copy.deepcopy(task)
+            restored_task["_docker_ids"] = []
+            restored_task["lastStatus"] = "STOPPED"
+            region = _tasks._region_for_legacy_value(arn, restored_task)
+            _tasks.set_scoped(get_account_id(), region, arn, restored_task)
 
 
 try:

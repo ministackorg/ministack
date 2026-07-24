@@ -420,6 +420,11 @@ def cfn():
 
 
 @pytest.fixture(scope="session")
+def opensearch():
+    return make_client("opensearch")
+
+
+@pytest.fixture(scope="session")
 def kms_client():
     return make_client("kms")
 
@@ -552,3 +557,8 @@ def inspector2():
 @pytest.fixture(scope="session")
 def mq():
     return make_client("mq")
+
+
+@pytest.fixture(scope="session")
+def s3tables():
+    return make_client("s3tables")

@@ -1401,13 +1401,7 @@ def _put_dashboard(params, cbor_data, is_cbor, is_json=False):
             use_json=is_json, use_cbor=is_cbor,
         )
 
-    _dashboards[name] = {
-        "DashboardName": name,
-        "DashboardBody": body,
-        "DashboardArn": f"arn:aws:cloudwatch::{get_account_id()}:dashboard/{name}",
-        "LastModified": int(time.time()),
-        "Size": len(body),
-    }
+    cloudformation_put_dashboard(name, body)
 
     if is_cbor:
         return _cbor_ok({"DashboardValidationMessages": []})
@@ -1479,7 +1473,7 @@ def _delete_dashboards(params, cbor_data, is_cbor, is_json=False):
                        404, use_json=is_json, use_cbor=is_cbor)
 
     for n in names:
-        _dashboards.pop(n, None)
+        cloudformation_delete_dashboard(n)
 
     if is_cbor:
         return _cbor_ok({})
@@ -1630,6 +1624,27 @@ def cloudformation_delete_metric_alarm(name: str) -> None:
     _alarms.pop(name, None)
     _resource_tags.pop(
         f"arn:aws:cloudwatch:{get_region()}:{get_account_id()}:alarm:{name}", None
+    )
+
+
+def cloudformation_put_dashboard(name: str, body: str) -> str:
+    """Create or replace a dashboard from a CloudFormation resource."""
+    arn = f"arn:aws:cloudwatch::{get_account_id()}:dashboard/{name}"
+    _dashboards[name] = {
+        "DashboardName": name,
+        "DashboardBody": body,
+        "DashboardArn": arn,
+        "LastModified": int(time.time()),
+        "Size": len(body),
+    }
+    return arn
+
+
+def cloudformation_delete_dashboard(name: str) -> None:
+    """Remove a dashboard created from a CloudFormation resource."""
+    _dashboards.pop(name, None)
+    _resource_tags.pop(
+        f"arn:aws:cloudwatch::{get_account_id()}:dashboard/{name}", None
     )
 
 

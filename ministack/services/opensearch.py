@@ -74,6 +74,24 @@ _SUPPORTED_VERSIONS = [
 
 _DEFAULT_VERSION = "OpenSearch_3.5"
 
+_MODELED_DOMAIN_PROPERTIES = (
+    "EngineVersion",
+    "ClusterConfig",
+    "EBSOptions",
+    "AccessPolicies",
+    "SnapshotOptions",
+    "CognitoOptions",
+    "EncryptionAtRestOptions",
+    "NodeToNodeEncryptionOptions",
+    "AdvancedOptions",
+    "DomainEndpointOptions",
+    "AdvancedSecurityOptions",
+    "VPCOptions",
+    "AutoTuneOptions",
+    "OffPeakWindowOptions",
+    "SoftwareUpdateOptions",
+)
+
 # AWS allows lowercase letters, digits, hyphens; first character must be
 # lowercase letter; 3-28 chars.
 _NAME_RE = re.compile(r"^[a-z][a-z0-9\-]{2,27}$")
@@ -85,6 +103,8 @@ _NAME_RE = re.compile(r"^[a-z][a-z0-9\-]{2,27}$")
 _domains = AccountScopedDict()        # name -> DomainStatus dict (+ private _* fields)
 _tags = AccountScopedDict()           # arn -> [{Key, Value}, ...]
 _change_progress = AccountScopedDict()  # name -> change progress record
+_packages = AccountScopedDict()       # PackageID -> PackageDetails (+ private _* fields)
+_domain_packages = AccountScopedDict()  # "PackageID:DomainName" -> DomainPackageDetails
 
 # Port counter and Docker handle are process-global (data plane is shared).
 _port_counter = [BASE_PORT]
@@ -93,10 +113,22 @@ _state_lock = threading.Lock()
 _docker_client = None
 
 
+class OpenSearchServiceError(ValueError):
+    """Actionable service error shared by HTTP and internal callers."""
+
+    def __init__(self, status, code, message):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+
+
 def reset():
     _domains.clear()
     _tags.clear()
     _change_progress.clear()
+    _packages.clear()
+    _domain_packages.clear()
     docker = _get_docker()
     if docker is not None:
         for c in docker.containers.list(
@@ -115,6 +147,8 @@ def get_state():
         "domains": copy.deepcopy(_domains),
         "tags": copy.deepcopy(_tags),
         "change_progress": copy.deepcopy(_change_progress),
+        "packages": copy.deepcopy(_packages),
+        "domain_packages": copy.deepcopy(_domain_packages),
     }
 
 
@@ -125,6 +159,8 @@ def restore_state(data):
         (_domains, "domains"),
         (_tags, "tags"),
         (_change_progress, "change_progress"),
+        (_packages, "packages"),
+        (_domain_packages, "domain_packages"),
     ):
         store.clear()
         for k, v in (data.get(key) or {}).items():
@@ -181,7 +217,13 @@ def _engine_type(version: str) -> str:
 
 def _public(d: dict) -> dict:
     """Strip internal _-prefixed bookkeeping fields before serialising."""
-    out = {k: v for k, v in d.items() if not k.startswith("_")}
+    out = copy.deepcopy({k: v for k, v in d.items() if not k.startswith("_")})
+    # MasterUserOptions is an input-only shape and may contain a plaintext
+    # password. AWS does not return it from DescribeDomain, and neither should
+    # MiniStack's raw JSON response.
+    advanced_security = out.get("AdvancedSecurityOptions")
+    if isinstance(advanced_security, dict):
+        advanced_security.pop("MasterUserOptions", None)
     if not out.get("VPCOptions"):
         out.pop("VPCOptions", None)
     return out
@@ -333,6 +375,20 @@ def _teardown_dataplane(rec: dict) -> None:
             pass
 
 
+def _teardown_named_dataplane(domain_name: str) -> None:
+    """Best-effort cleanup for a create that failed before returning a record."""
+    docker = _get_docker()
+    if docker is None:
+        return
+    for name in (_container_name(domain_name), _dashboards_container_name(domain_name)):
+        try:
+            c = docker.containers.get(name)
+            c.stop(timeout=2)
+            c.remove(force=True)
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # DomainStatus / DomainConfig builders
 # ---------------------------------------------------------------------------
@@ -421,7 +477,9 @@ def _new_domain_record(name, payload):
         "ClusterConfig": cluster_cfg,
         "EBSOptions": ebs_opts,
         "AccessPolicies": access_policies,
-        "SnapshotOptions": {"AutomatedSnapshotStartHour": 0},
+        "SnapshotOptions": payload.get(
+            "SnapshotOptions", {"AutomatedSnapshotStartHour": 0}
+        ),
         "CognitoOptions": payload.get("CognitoOptions", {"Enabled": False}),
         "EncryptionAtRestOptions": payload.get(
             "EncryptionAtRestOptions", {"Enabled": False}
@@ -448,10 +506,14 @@ def _new_domain_record(name, payload):
             "AdvancedSecurityOptions",
             {"Enabled": False, "InternalUserDatabaseEnabled": False},
         ),
-        "AutoTuneOptions": {"State": "DISABLED"},
+        "AutoTuneOptions": payload.get("AutoTuneOptions", {"State": "DISABLED"}),
         "ChangeProgressDetails": {},
-        "OffPeakWindowOptions": {"Enabled": False},
-        "SoftwareUpdateOptions": {"AutoSoftwareUpdateEnabled": False},
+        "OffPeakWindowOptions": payload.get(
+            "OffPeakWindowOptions", {"Enabled": False}
+        ),
+        "SoftwareUpdateOptions": payload.get(
+            "SoftwareUpdateOptions", {"AutoSoftwareUpdateEnabled": False}
+        ),
         "_Endpoint": endpoint,
         "_CreatedTime": _now(),
         "_UpdatedTime": _now(),
@@ -494,7 +556,11 @@ def _domain_config(rec: dict) -> dict:
         "NodeToNodeEncryptionOptions": wrap(rec["NodeToNodeEncryptionOptions"]),
         "AdvancedOptions": wrap(rec["AdvancedOptions"]),
         "DomainEndpointOptions": wrap(rec["DomainEndpointOptions"]),
-        "AdvancedSecurityOptions": wrap(rec["AdvancedSecurityOptions"]),
+        "AdvancedSecurityOptions": wrap({
+            k: copy.deepcopy(v)
+            for k, v in rec["AdvancedSecurityOptions"].items()
+            if k != "MasterUserOptions"
+        }),
         "AutoTuneOptions": wrap(rec["AutoTuneOptions"]),
         "ChangeProgressDetails": rec.get("ChangeProgressDetails", {}),
         "OffPeakWindowOptions": wrap(rec["OffPeakWindowOptions"]),
@@ -503,6 +569,169 @@ def _domain_config(rec: dict) -> dict:
     if rec.get("VPCOptions"):
         config["VPCOptions"] = wrap(rec["VPCOptions"])
     return config
+
+
+def _normalise_tags(tag_list):
+    """Return an exact, detached tag set with the last value winning by key."""
+    by_key = {}
+    for tag in tag_list or []:
+        detached = copy.deepcopy(tag)
+        by_key[detached.get("Key", "")] = detached
+    return list(by_key.values())
+
+
+def _desired_modeled_configuration(payload):
+    """Expand a full create-shaped payload into the desired domain state."""
+    return {
+        "EngineVersion": copy.deepcopy(payload.get("EngineVersion", _DEFAULT_VERSION)),
+        "ClusterConfig": _default_cluster_config(copy.deepcopy(payload.get("ClusterConfig"))),
+        "EBSOptions": _default_ebs_options(copy.deepcopy(payload.get("EBSOptions"))),
+        "AccessPolicies": copy.deepcopy(payload.get("AccessPolicies", "")),
+        "SnapshotOptions": copy.deepcopy(payload.get(
+            "SnapshotOptions", {"AutomatedSnapshotStartHour": 0}
+        )),
+        "CognitoOptions": copy.deepcopy(payload.get("CognitoOptions", {"Enabled": False})),
+        "EncryptionAtRestOptions": copy.deepcopy(payload.get(
+            "EncryptionAtRestOptions", {"Enabled": False}
+        )),
+        "NodeToNodeEncryptionOptions": copy.deepcopy(payload.get(
+            "NodeToNodeEncryptionOptions", {"Enabled": False}
+        )),
+        "AdvancedOptions": copy.deepcopy(payload.get("AdvancedOptions", {})),
+        "DomainEndpointOptions": copy.deepcopy(payload.get(
+            "DomainEndpointOptions",
+            {"EnforceHTTPS": True, "TLSSecurityPolicy": "Policy-Min-TLS-1-2-2019-07"},
+        )),
+        "AdvancedSecurityOptions": copy.deepcopy(payload.get(
+            "AdvancedSecurityOptions",
+            {"Enabled": False, "InternalUserDatabaseEnabled": False},
+        )),
+        "VPCOptions": _normalise_vpc_options(copy.deepcopy(payload.get("VPCOptions"))),
+        "AutoTuneOptions": copy.deepcopy(payload.get("AutoTuneOptions", {"State": "DISABLED"})),
+        "OffPeakWindowOptions": copy.deepcopy(payload.get(
+            "OffPeakWindowOptions", {"Enabled": False}
+        )),
+        "SoftwareUpdateOptions": copy.deepcopy(payload.get(
+            "SoftwareUpdateOptions", {"AutoSoftwareUpdateEnabled": False}
+        )),
+    }
+
+
+def create_domain_record(payload, compatibility_properties=None):
+    """Create a domain through the shared management-plane lifecycle.
+
+    Internal callers receive the live private record. HTTP handlers pass it
+    through ``_public`` before serialising it.
+    """
+    detached_payload = copy.deepcopy(payload or {})
+    name = detached_payload.get("DomainName")
+    if not name:
+        raise OpenSearchServiceError(400, "ValidationException", "DomainName is required")
+    if not _NAME_RE.match(name):
+        raise OpenSearchServiceError(
+            400,
+            "ValidationException",
+            "DomainName must start with a lowercase letter, contain only "
+            "lowercase letters, digits, and hyphens, and be 3-28 characters",
+        )
+    if name in _domains:
+        raise OpenSearchServiceError(
+            409, "ResourceAlreadyExistsException", f"Domain already exists: {name}"
+        )
+
+    rec = None
+    try:
+        rec = _new_domain_record(name, detached_payload)
+        if compatibility_properties is not None:
+            rec["_CloudFormationCompatibility"] = copy.deepcopy(
+                compatibility_properties
+            )
+        _domains[name] = rec
+        tags = _normalise_tags(detached_payload.get("TagList"))
+        if tags:
+            _tags[rec["ARN"]] = tags
+        else:
+            _tags.pop(rec["ARN"], None)
+        return rec
+    except Exception:
+        if rec is not None:
+            _teardown_dataplane(rec)
+        _teardown_named_dataplane(name)
+        _domains.pop(name, None)
+        _tags.pop(_arn(name), None)
+        _change_progress.pop(name, None)
+        raise
+
+
+def update_domain_from_cloudformation(name, payload, compatibility_properties):
+    """Apply a complete CloudFormation desired state to an existing domain."""
+    rec = _domains.get(name)
+    if not rec:
+        raise OpenSearchServiceError(
+            404, "ResourceNotFoundException", f"Domain not found: {name}"
+        )
+
+    detached_payload = copy.deepcopy(payload or {})
+    desired = _desired_modeled_configuration(detached_payload)
+    detached_compatibility = copy.deepcopy(compatibility_properties or {})
+    desired_tags = _normalise_tags(detached_payload.get("TagList"))
+    current_tags = _normalise_tags(_tags.get(rec["ARN"]) or [])
+
+    changed_properties = []
+    for key in _MODELED_DOMAIN_PROPERTIES:
+        wanted = desired[key]
+        current = rec.get(key)
+        if key == "VPCOptions":
+            current = rec.get("VPCOptions")
+        if current != wanted:
+            changed_properties.append(key)
+            if key == "VPCOptions":
+                _set_vpc_options(rec, wanted)
+            else:
+                rec[key] = copy.deepcopy(wanted)
+                if key == "EngineVersion":
+                    rec["ServiceSoftwareOptions"]["CurrentVersion"] = wanted
+
+    if rec.get("_CloudFormationCompatibility", {}) != detached_compatibility:
+        rec["_CloudFormationCompatibility"] = detached_compatibility
+        changed_properties.append("CompatibilityProperties")
+
+    if current_tags != desired_tags:
+        if desired_tags:
+            _tags[rec["ARN"]] = desired_tags
+        else:
+            _tags.pop(rec["ARN"], None)
+
+    if changed_properties:
+        rec["_UpdatedTime"] = _now()
+        _change_progress[name] = {
+            "ChangeId": new_uuid(),
+            "StartTime": _now(),
+            "Status": "COMPLETED",
+            "PendingProperties": [],
+            "CompletedProperties": changed_properties,
+            "TotalNumberOfStages": 0,
+            "ConfigChangeStatus": "Completed",
+        }
+    return rec
+
+
+def delete_domain_record(name, missing_ok=False):
+    """Delete all domain-owned state and containers, optionally idempotently."""
+    rec = _domains.pop(name, None)
+    if not rec and not missing_ok:
+        raise OpenSearchServiceError(
+            404, "ResourceNotFoundException", f"Domain not found: {name}"
+        )
+    if rec:
+        _teardown_dataplane(rec)
+        arn = rec.get("ARN", _arn(name))
+    else:
+        arn = _arn(name)
+    _teardown_named_dataplane(name)
+    _tags.pop(arn, None)
+    _change_progress.pop(name, None)
+    return rec
 
 
 # ---------------------------------------------------------------------------
@@ -517,6 +746,19 @@ _VERSIONS_RE = re.compile(r"^/2021-01-01/(?:opensearch/)?versions/?$")
 _COMPAT_RE = re.compile(r"^/2021-01-01/(?:opensearch/)?compatibleVersions/?$")
 _TAGS_RE = re.compile(r"^/2021-01-01/tags/?$")
 _TAGS_REMOVAL_RE = re.compile(r"^/2021-01-01/tags-removal/?$")
+# Package management. The literal sub-paths (update/describe/associate/
+# dissociate) are matched before the generic ``packages/{PackageID}`` so those
+# segments aren't captured as an id.
+_PACKAGES_RE = re.compile(r"^/2021-01-01/packages/?$")
+_PACKAGES_UPDATE_RE = re.compile(r"^/2021-01-01/packages/update/?$")
+_PACKAGES_DESCRIBE_RE = re.compile(r"^/2021-01-01/packages/describe/?$")
+_PACKAGES_ASSOCIATE_RE = re.compile(
+    r"^/2021-01-01/packages/associate/(?P<pid>[^/]+)/(?P<domain>[^/]+)/?$")
+_PACKAGES_DISSOCIATE_RE = re.compile(
+    r"^/2021-01-01/packages/dissociate/(?P<pid>[^/]+)/(?P<domain>[^/]+)/?$")
+_PACKAGE_RE = re.compile(r"^/2021-01-01/packages/(?P<pid>[^/]+)/?$")
+_DOMAIN_PACKAGES_RE = re.compile(
+    r"^/2021-01-01/(?:opensearch/)?domain/(?P<name>[^/]+)/packages/?$")
 
 
 def _qp(query_params, key) -> str:
@@ -533,21 +775,10 @@ def _qp(query_params, key) -> str:
 # ---------------------------------------------------------------------------
 
 def _create_domain(payload):
-    name = payload.get("DomainName")
-    if not name:
-        return _error(400, "ValidationException", "DomainName is required")
-    if not _NAME_RE.match(name):
-        return _error(400, "ValidationException",
-                      "DomainName must start with a lowercase letter, contain only "
-                      "lowercase letters, digits, and hyphens, and be 3-28 characters")
-    if name in _domains:
-        return _error(409, "ResourceAlreadyExistsException",
-                      f"Domain already exists: {name}")
-    rec = _new_domain_record(name, payload)
-    _domains[name] = rec
-    tag_list = payload.get("TagList") or []
-    if tag_list:
-        _tags[_arn(name)] = list(tag_list)
+    try:
+        rec = create_domain_record(payload)
+    except OpenSearchServiceError as exc:
+        return _error(exc.status, exc.code, exc.message)
     return _json(200, {"DomainStatus": _public(rec)})
 
 
@@ -559,12 +790,10 @@ def _describe_domain(name):
 
 
 def _delete_domain(name):
-    rec = _domains.pop(name, None)
-    if not rec:
-        return _error(404, "ResourceNotFoundException", f"Domain not found: {name}")
-    _teardown_dataplane(rec)
-    _tags.pop(_arn(name), None)
-    _change_progress.pop(name, None)
+    try:
+        rec = delete_domain_record(name)
+    except OpenSearchServiceError as exc:
+        return _error(exc.status, exc.code, exc.message)
     out = dict(rec)
     out["Deleted"] = True
     return _json(200, {"DomainStatus": _public(out)})
@@ -607,7 +836,7 @@ def _update_domain_config(name, payload):
             if k == "VPCOptions":
                 _set_vpc_options(rec, v)
             else:
-                rec[k] = v
+                rec[k] = copy.deepcopy(v)
     rec["_UpdatedTime"] = _now()
 
     # Real AWS marks the domain Processing while config rollout happens; we
@@ -684,7 +913,7 @@ def _add_tags(payload):
     by_key = {t["Key"]: t for t in existing}
     for t in tag_list:
         by_key[t["Key"]] = t
-    _tags[arn] = list(by_key.values())
+    _tags[arn] = copy.deepcopy(list(by_key.values()))
     return _json(200, {})
 
 
@@ -695,7 +924,7 @@ def _list_tags(query_params):
     arn, err = _resolve_taggable_opensearch_arn(arn)
     if err:
         return err
-    return _json(200, {"TagList": list(_tags.get(arn) or [])})
+    return _json(200, {"TagList": copy.deepcopy(list(_tags.get(arn) or []))})
 
 
 def _remove_tags(payload):
@@ -709,6 +938,153 @@ def _remove_tags(payload):
     existing = _tags.get(arn) or []
     _tags[arn] = [t for t in existing if t["Key"] not in keys]
     return _json(200, {})
+
+
+# ---------------------------------------------------------------------------
+# Packages
+# ---------------------------------------------------------------------------
+# CRUD + domain association, keyed by the service-generated PackageID. Like the
+# domain change-progress model, status transitions complete synchronously:
+# a package is AVAILABLE the moment it is created/updated, and an association
+# is ACTIVE the moment it is made, so a client's poll succeeds on first call.
+
+def _new_package_id() -> str:
+    return f"F{new_uuid().replace('-', '')[:10].upper()}"
+
+
+def _public_package(rec: dict) -> dict:
+    """Strip internal _-prefixed fields. PackageSource is an input-only shape
+    (AWS does not echo it from DescribePackages), so it is stored privately."""
+    return {k: v for k, v in rec.items() if not k.startswith("_")}
+
+
+def _create_package(payload):
+    name = payload.get("PackageName")
+    ptype = payload.get("PackageType")
+    source = payload.get("PackageSource")
+    if not name:
+        return _error(400, "ValidationException", "PackageName is required")
+    if not ptype:
+        return _error(400, "ValidationException", "PackageType is required")
+    if source is None:
+        return _error(400, "ValidationException", "PackageSource is required")
+    now = _now()
+    pid = _new_package_id()
+    rec = {
+        "PackageID": pid,
+        "PackageName": name,
+        "PackageType": ptype,
+        "PackageDescription": payload.get("PackageDescription", ""),
+        "PackageStatus": "AVAILABLE",
+        "CreatedAt": now,
+        "LastUpdatedAt": now,
+        "AvailablePackageVersion": "1",
+        "_PackageSource": source,
+    }
+    _packages[pid] = rec
+    return _json(200, {"PackageDetails": _public_package(rec)})
+
+
+def _update_package(payload):
+    pid = payload.get("PackageID")
+    rec = _packages.get(pid)
+    if not rec:
+        return _error(404, "ResourceNotFoundException", f"Package not found: {pid}")
+    if "PackageSource" in payload:
+        rec["_PackageSource"] = payload["PackageSource"]
+    if "PackageDescription" in payload:
+        rec["PackageDescription"] = payload["PackageDescription"]
+    try:
+        rec["AvailablePackageVersion"] = str(int(rec.get("AvailablePackageVersion", "1")) + 1)
+    except (TypeError, ValueError):
+        rec["AvailablePackageVersion"] = "2"
+    rec["LastUpdatedAt"] = _now()
+    rec["PackageStatus"] = "AVAILABLE"
+    return _json(200, {"PackageDetails": _public_package(rec)})
+
+
+def _describe_packages(payload):
+    results = list(_packages.values())
+    for f in payload.get("Filters") or []:
+        fname = f.get("Name")
+        fvals = f.get("Value") or []
+        if not fvals:
+            continue
+        if fname in ("PackageID", "PackageName", "PackageStatus", "PackageType"):
+            results = [p for p in results if p.get(fname) in fvals]
+    results = sorted(results, key=lambda p: p["PackageID"])
+    start = int(payload["NextToken"]) if payload.get("NextToken") else 0
+    max_results = payload.get("MaxResults")
+    if max_results:
+        page = results[start:start + max_results]
+        resp = {"PackageDetailsList": [_public_package(p) for p in page]}
+        if start + max_results < len(results):
+            resp["NextToken"] = str(start + max_results)
+    else:
+        resp = {"PackageDetailsList": [_public_package(p) for p in results[start:]]}
+    return _json(200, resp)
+
+
+def _delete_package(pid):
+    rec = _packages.pop(pid, None)
+    if not rec:
+        return _error(404, "ResourceNotFoundException", f"Package not found: {pid}")
+    # Cascade: drop any domain associations this package still had.
+    for key in [k for k in _domain_packages.keys() if k.split(":", 1)[0] == pid]:
+        _domain_packages.pop(key, None)
+    out = dict(rec)
+    out["PackageStatus"] = "DELETED"
+    return _json(200, {"PackageDetails": _public_package(out)})
+
+
+def _associate_package(pid, domain_name):
+    rec = _packages.get(pid)
+    if not rec:
+        return _error(404, "ResourceNotFoundException", f"Package not found: {pid}")
+    if domain_name not in _domains:
+        return _error(404, "ResourceNotFoundException", f"Domain not found: {domain_name}")
+    detail = {
+        "PackageID": pid,
+        "PackageName": rec["PackageName"],
+        "PackageType": rec["PackageType"],
+        "DomainName": domain_name,
+        "DomainPackageStatus": "ACTIVE",
+        "PackageVersion": rec["AvailablePackageVersion"],
+        "LastUpdated": _now(),
+        "ReferencePath": f"packages/{rec['PackageName']}",
+    }
+    _domain_packages[f"{pid}:{domain_name}"] = detail
+    return _json(200, {"DomainPackageDetails": detail})
+
+
+def _dissociate_package(pid, domain_name):
+    detail = _domain_packages.pop(f"{pid}:{domain_name}", None)
+    if not detail:
+        return _error(404, "ResourceNotFoundException",
+                      f"Package {pid} is not associated with domain {domain_name}")
+    out = dict(detail)
+    out["DomainPackageStatus"] = "DISSOCIATING"
+    return _json(200, {"DomainPackageDetails": out})
+
+
+def _list_packages_for_domain(domain_name, query_params):
+    if domain_name not in _domains:
+        return _error(404, "ResourceNotFoundException", f"Domain not found: {domain_name}")
+    details = sorted(
+        (v for k, v in _domain_packages.items() if k.split(":", 1)[-1] == domain_name),
+        key=lambda d: d["PackageID"],
+    )
+    start = int(_qp(query_params, "nextToken")) if _qp(query_params, "nextToken") else 0
+    mr = _qp(query_params, "maxResults")
+    if mr:
+        limit = int(mr)
+        page = details[start:start + limit]
+        resp = {"DomainPackageDetailsList": page}
+        if start + limit < len(details):
+            resp["NextToken"] = str(start + limit)
+    else:
+        resp = {"DomainPackageDetailsList": details[start:]}
+    return _json(200, resp)
 
 
 # ---------------------------------------------------------------------------
@@ -745,6 +1121,26 @@ async def handle_request(method, path, headers, body_bytes, query_params):
 
     if method == "POST" and _DOMAIN_INFO_RE.match(path):
         return _describe_domains(payload)
+
+    # Packages — literal sub-paths before the generic packages/{PackageID}.
+    if method == "POST" and _PACKAGES_UPDATE_RE.match(path):
+        return _update_package(payload)
+    if method == "POST" and _PACKAGES_DESCRIBE_RE.match(path):
+        return _describe_packages(payload)
+    m = _PACKAGES_ASSOCIATE_RE.match(path)
+    if method == "POST" and m:
+        return _associate_package(m.group("pid"), m.group("domain"))
+    m = _PACKAGES_DISSOCIATE_RE.match(path)
+    if method == "POST" and m:
+        return _dissociate_package(m.group("pid"), m.group("domain"))
+    m = _PACKAGE_RE.match(path)
+    if method == "DELETE" and m:
+        return _delete_package(m.group("pid"))
+    if method == "POST" and _PACKAGES_RE.match(path):
+        return _create_package(payload)
+    m = _DOMAIN_PACKAGES_RE.match(path)
+    if method == "GET" and m:
+        return _list_packages_for_domain(m.group("name"), query_params)
 
     m = _DOMAIN_CONFIG_RE.match(path)
     if m:

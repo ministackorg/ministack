@@ -1,3 +1,4 @@
+import copy
 import io
 import json
 import os
@@ -1186,5 +1187,180 @@ def test_ecs_container_secret_ssm_valuefrom_is_region_scoped():
         assert ecs_service._resolve_container_secrets(arn_cdef) == {"DB_PASS": "east-secret"}
     finally:
         ssm_service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_ecs_resource_state_is_region_scoped(monkeypatch):
+    """Same-named ECS resources coexist without leaking across regions."""
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    cluster_name = f"scope-cluster-{_uuid_mod.uuid4().hex[:8]}"
+    family = f"scope-family-{_uuid_mod.uuid4().hex[:8]}"
+    service_name = f"scope-service-{_uuid_mod.uuid4().hex[:8]}"
+    capacity_provider = f"scope-cp-{_uuid_mod.uuid4().hex[:8]}"
+    attribute_key = "i-scope:zone"
+    task_definition = {
+        "family": family,
+        "containerDefinitions": [{"name": "app", "image": "busybox"}],
+    }
+
+    monkeypatch.setattr(ecs_service, "_get_docker", lambda: None)
+    ecs_service.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region("us-east-1")
+        east_cluster = json.loads(ecs_service._create_cluster({
+            "clusterName": cluster_name,
+            "tags": [{"key": "region", "value": "east"}],
+        })[2])["cluster"]
+        ecs_service._register_task_definition(copy.deepcopy(task_definition))
+        east_td = json.loads(ecs_service._register_task_definition(
+            copy.deepcopy(task_definition)
+        )[2])["taskDefinition"]
+        east_service = json.loads(ecs_service._create_service({
+            "cluster": cluster_name,
+            "serviceName": service_name,
+            "taskDefinition": family,
+            "desiredCount": 0,
+        })[2])["service"]
+        east_task = json.loads(ecs_service._run_task({
+            "cluster": cluster_name,
+            "taskDefinition": family,
+        })[2])["tasks"][0]
+        east_cp = json.loads(ecs_service._create_capacity_provider({
+            "name": capacity_provider,
+        })[2])["capacityProvider"]
+        ecs_service._put_attributes({"attributes": [{
+            "targetId": "i-scope",
+            "name": "zone",
+            "value": "east",
+            "targetType": "container-instance",
+        }]})
+        ecs_service._put_account_setting({"name": "containerInsights", "value": "east"})
+
+        set_request_region("us-west-2")
+        assert cluster_name not in ecs_service._clusters
+        assert family not in ecs_service._task_def_latest
+        assert f"{cluster_name}/{service_name}" not in ecs_service._services
+        assert capacity_provider not in ecs_service._capacity_providers
+        assert attribute_key not in ecs_service._attributes
+        assert "containerInsights" not in ecs_service._account_settings
+        assert json.loads(ecs_service._list_tasks({"cluster": cluster_name})[2])["taskArns"] == []
+
+        west_cluster = json.loads(ecs_service._create_cluster({
+            "clusterName": cluster_name,
+            "tags": [{"key": "region", "value": "west"}],
+        })[2])["cluster"]
+        west_td = json.loads(ecs_service._register_task_definition(
+            copy.deepcopy(task_definition)
+        )[2])["taskDefinition"]
+        west_service = json.loads(ecs_service._create_service({
+            "cluster": cluster_name,
+            "serviceName": service_name,
+            "taskDefinition": family,
+            "desiredCount": 0,
+        })[2])["service"]
+        west_task = json.loads(ecs_service._run_task({
+            "cluster": cluster_name,
+            "taskDefinition": family,
+        })[2])["tasks"][0]
+        west_cp = json.loads(ecs_service._create_capacity_provider({
+            "name": capacity_provider,
+        })[2])["capacityProvider"]
+        ecs_service._put_attributes({"attributes": [{
+            "targetId": "i-scope",
+            "name": "zone",
+            "value": "west",
+            "targetType": "container-instance",
+        }]})
+        ecs_service._put_account_setting({"name": "containerInsights", "value": "west"})
+
+        assert west_cluster["clusterArn"] != east_cluster["clusterArn"]
+        assert west_td["revision"] == 1
+        assert east_td["revision"] == 2
+        assert west_service["serviceArn"] != east_service["serviceArn"]
+        assert west_task["taskArn"] != east_task["taskArn"]
+        assert west_cp["capacityProviderArn"] != east_cp["capacityProviderArn"]
+        assert ecs_service._attributes[attribute_key]["value"] == "west"
+        assert ecs_service._account_settings["containerInsights"] == "west"
+        assert json.loads(ecs_service._list_tasks({"cluster": cluster_name})[2])["taskArns"] == [
+            west_task["taskArn"]
+        ]
+
+        # Tags remain account-scoped because their keys are region-bearing ARNs.
+        assert json.loads(ecs_service._list_tags_for_resource({
+            "resourceArn": east_cluster["clusterArn"],
+        })[2])["tags"] == [{"key": "region", "value": "east"}]
+        ecs_service._untag_resource({
+            "resourceArn": east_cluster["clusterArn"],
+            "tagKeys": ["region"],
+        })
+        assert json.loads(ecs_service._list_tags_for_resource({
+            "resourceArn": west_cluster["clusterArn"],
+        })[2])["tags"] == [{"key": "region", "value": "west"}]
+
+        set_request_region("us-east-1")
+        assert ecs_service._task_def_latest[family] == 2
+        assert ecs_service._attributes[attribute_key]["value"] == "east"
+        assert ecs_service._account_settings["containerInsights"] == "east"
+        assert json.loads(ecs_service._list_tasks({"cluster": cluster_name})[2])["taskArns"] == [
+            east_task["taskArn"]
+        ]
+        assert json.loads(ecs_service._list_tags_for_resource({
+            "resourceArn": east_cluster["clusterArn"],
+        })[2])["tags"] == []
+    finally:
+        ecs_service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_ecs_container_secret_arn_selects_the_requested_region():
+    """Full secret ARNs select their embedded region without same-name leaks."""
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import secretsmanager as sm_service
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    name = f"ecs-secret-scope-{_uuid_mod.uuid4().hex[:8]}"
+
+    sm_service.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region("us-east-1")
+        east_arn = json.loads(sm_service._create_secret({
+            "Name": name,
+            "SecretString": "east-secret",
+        })[2])["ARN"]
+
+        set_request_region("us-west-2")
+        west_arn = json.loads(sm_service._create_secret({
+            "Name": name,
+            "SecretString": "west-secret",
+        })[2])["ARN"]
+
+        assert ecs_service._resolve_container_secrets({
+            "secrets": [{"name": "DB_PASS", "valueFrom": west_arn}],
+        }) == {"DB_PASS": "west-secret"}
+        assert ecs_service._resolve_container_secrets({
+            "secrets": [{"name": "DB_PASS", "valueFrom": east_arn}],
+        }) == {"DB_PASS": "east-secret"}
+    finally:
+        sm_service.reset()
         set_request_account_id(original_account)
         set_request_region(original_region)
