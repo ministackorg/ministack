@@ -509,7 +509,17 @@ def _iceberg_commit_table(namespace, table_name, data, allow_cross_region):
                     "snapshot-id": update.get("snapshot-id", -1),
                     "type": update.get("type", "branch")}
             elif action == "add-schema":
-                metadata.setdefault("schemas", []).append(update.get("schema", {}))
+                new_schema = update.get("schema", {})
+                metadata.setdefault("schemas", []).append(new_schema)
+                # Real Iceberg REST catalogs track the high-water mark of assigned
+                # field IDs so clients can allocate the next one; this was static from
+                # table creation, so every add-schema after the first computed its next
+                # field ID from the same stale value, colliding IDs across ALTER TABLE
+                # ADD COLUMN calls (each landed on the same "next" ID instead of a fresh
+                # one).
+                field_ids = [f["id"] for f in new_schema.get("fields", []) if "id" in f]
+                if field_ids:
+                    metadata["last-column-id"] = max(metadata.get("last-column-id", 0), max(field_ids))
             elif action == "set-current-schema":
                 metadata["current-schema-id"] = update.get("schema-id", 0)
             elif action == "add-partition-spec":

@@ -625,3 +625,74 @@ def test_s3tables_iceberg_transactions_commit(s3tables):
         except Exception:
             pass
         s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
+
+
+def test_s3tables_iceberg_add_schema_advances_last_column_id(s3tables):
+    """Each add-schema commit must bump last-column-id to the new schema's highest
+    field ID, so a client allocating the *next* column's ID (e.g. DuckDB's
+    ALTER TABLE ... ADD COLUMN) doesn't collide with a previous add-schema's fields."""
+    bucket_name = f"tb-lcid-{_uuid_mod.uuid4().hex[:6]}"
+    bucket_arn = s3tables.create_table_bucket(name=bucket_name)["arn"]
+    ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
+    table = f"t_{_uuid_mod.uuid4().hex[:6]}"
+    try:
+        s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
+        s3tables.create_table(tableBucketARN=bucket_arn, namespace=ns, name=table, format="ICEBERG")
+
+        _iceberg_json(
+            f"/iceberg/v1/namespaces/{ns}/tables/{table}",
+            method="POST",
+            payload={
+                "requirements": [],
+                "updates": [
+                    {
+                        "action": "add-schema",
+                        "schema": {
+                            "type": "struct", "schema-id": 1,
+                            "fields": [{"id": 1, "name": "colA", "required": False, "type": "string"}],
+                        },
+                    },
+                    {"action": "set-current-schema", "schema-id": 1},
+                ],
+            },
+        )
+        first = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        assert first["metadata"]["last-column-id"] == 1
+
+        _iceberg_json(
+            f"/iceberg/v1/namespaces/{ns}/tables/{table}",
+            method="POST",
+            payload={
+                "requirements": [],
+                "updates": [
+                    {
+                        "action": "add-schema",
+                        "schema": {
+                            "type": "struct", "schema-id": 2,
+                            "fields": [
+                                {"id": 1, "name": "colA", "required": False, "type": "string"},
+                                {"id": 2, "name": "colB", "required": False, "type": "long"},
+                            ],
+                        },
+                    },
+                    {"action": "set-current-schema", "schema-id": 2},
+                ],
+            },
+        )
+        second = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        metadata = second["metadata"]
+        assert metadata["last-column-id"] == 2
+
+        current_schema = next(s for s in metadata["schemas"] if s["schema-id"] == metadata["current-schema-id"])
+        field_ids = [f["id"] for f in current_schema["fields"]]
+        assert field_ids == [1, 2], "field IDs must not collide across separate add-schema commits"
+    finally:
+        try:
+            s3tables.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=table)
+        except Exception:
+            pass
+        try:
+            s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
+        except Exception:
+            pass
+        s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
