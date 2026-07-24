@@ -42,6 +42,7 @@ SERVICE_STATE_FORMAT_VERSIONS = {
     "servicediscovery": 3,
     "ses": 3,
     "ses_v2": 3,
+    "transfer": 3,
 }
 
 
