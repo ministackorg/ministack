@@ -157,17 +157,16 @@ def get_state():
     }
 
 
-def _restore_access_policy_store(restored, access_entry_regions):
-    """Adopt legacy policy associations into their parent entry's region.
+def _restore_cluster_child_store(store, restored, cluster_regions, separator):
+    """Adopt legacy child records into their parent cluster's region.
 
-    Access-policy records contain only the regionless AWS-managed policy ARN,
-    access scope, and timestamps. Generic ARN-derived migration would therefore
-    place them in the ambient boot region, potentially separating them from a
-    foreign-region access entry restored from its ``accessEntryArn``.
+    Legacy account-scoped EKS state allowed a request in one region to create
+    a child for a cluster created in another. Preserve that reachable parent /
+    child relationship instead of splitting the records by their individual
+    ARNs. Orphans retain the generic ARN-derived (or boot-region) fallback.
     """
     if isinstance(restored, AccountRegionScopedDict):
-        if restored.has_any():
-            _access_policies.update(restored)
+        store.update(restored)
         return
 
     if not restored:
@@ -180,26 +179,33 @@ def _restore_access_policy_store(restored, access_entry_regions):
         items = (((account_id, key), value) for key, value in restored.items())
 
     for (account_id, key), value in items:
-        access_entry_key = key.rsplit("\x00", 1)[0] if isinstance(key, str) else None
-        region = access_entry_regions.get((account_id, access_entry_key), get_region())
-        _access_policies.set_scoped(account_id, region, key, value)
+        cluster_name = key.split(separator, 1)[0] if isinstance(key, str) else None
+        region = cluster_regions.get((account_id, cluster_name))
+        if region is None:
+            region = store._region_for_legacy_value(key, value)
+        store.set_scoped(account_id, region, key, value)
 
 
 def restore_state(data):
     _clusters.update(data.get("clusters", {}))
-    _nodegroups.update(data.get("nodegroups", {}))
-    _addons.update(data.get("addons", {}))
-    _access_entries.update(data.get("access_entries", {}))
-    access_entry_regions = {
-        (account_id, key): region
-        for (account_id, region, key), _entry in _access_entries.all_items()
+    cluster_regions = {
+        (account_id, cluster_name): region
+        for (account_id, region, cluster_name), _cluster in _clusters.all_items()
     }
-    _restore_access_policy_store(
-        data.get("access_policies", {}),
-        access_entry_regions,
-    )
+    for store, state_key, separator in (
+        (_nodegroups, "nodegroups", "/"),
+        (_addons, "addons", "/"),
+        (_access_entries, "access_entries", "\x00"),
+        (_access_policies, "access_policies", "\x00"),
+        (_idp_configs, "idp_configs", "\x00"),
+    ):
+        _restore_cluster_child_store(
+            store,
+            data.get(state_key, {}),
+            cluster_regions,
+            separator,
+        )
     _tags.update(data.get("tags", {}))
-    _idp_configs.update(data.get("idp_configs", {}))
     if "port_counter" in data:
         _port_counter[0] = data["port_counter"]
     # Restored clusters have no running k3s container. Drop the stale docker id and

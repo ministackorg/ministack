@@ -569,6 +569,8 @@ def test_eks_access_policies_round_trip_outside_boot_region():
 
 
 def test_eks_legacy_state_uses_arn_and_parent_regions():
+    import json as _json
+
     from ministack.core.responses import (
         AccountScopedDict,
         get_account_id,
@@ -582,7 +584,8 @@ def test_eks_legacy_state_uses_arn_and_parent_regions():
     original_region = get_region()
     account_id = "000000000000"
     boot_region = "us-east-1"
-    resource_region = "us-west-2"
+    parent_region = "us-west-2"
+    child_arn_region = "eu-west-1"
     cluster_name = "legacy-cluster"
     principal_arn = f"arn:aws:iam::{account_id}:role/legacy-role"
     entry_key = f"{cluster_name}\x00{principal_arn}"
@@ -596,7 +599,7 @@ def test_eks_legacy_state_uses_arn_and_parent_regions():
     legacy_clusters._data[(account_id, cluster_name)] = {
         "name": cluster_name,
         "arn": (
-            f"arn:aws:eks:{resource_region}:{account_id}:"
+            f"arn:aws:eks:{parent_region}:{account_id}:"
             f"cluster/{cluster_name}"
         ),
         "status": "ACTIVE",
@@ -608,7 +611,7 @@ def test_eks_legacy_state_uses_arn_and_parent_regions():
         "clusterName": cluster_name,
         "principalArn": principal_arn,
         "accessEntryArn": (
-            f"arn:aws:eks:{resource_region}:{account_id}:"
+            f"arn:aws:eks:{child_arn_region}:{account_id}:"
             f"access-entry/{cluster_name}/role/{account_id}/legacy-role/id"
         ),
     }
@@ -618,7 +621,7 @@ def test_eks_legacy_state_uses_arn_and_parent_regions():
         "clusterName": cluster_name,
         "nodegroupName": "legacy-workers",
         "nodegroupArn": (
-            f"arn:aws:eks:{resource_region}:{account_id}:"
+            f"arn:aws:eks:{child_arn_region}:{account_id}:"
             f"nodegroup/{cluster_name}/legacy-workers/id"
         ),
     }
@@ -628,7 +631,7 @@ def test_eks_legacy_state_uses_arn_and_parent_regions():
         "clusterName": cluster_name,
         "addonName": "vpc-cni",
         "addonArn": (
-            f"arn:aws:eks:{resource_region}:{account_id}:"
+            f"arn:aws:eks:{child_arn_region}:{account_id}:"
             f"addon/{cluster_name}/vpc-cni/id"
         ),
     }
@@ -646,8 +649,12 @@ def test_eks_legacy_state_uses_arn_and_parent_regions():
     legacy_idp_configs._data[(account_id, idp_key)] = {
         "clusterName": cluster_name,
         "name": "legacy-idp",
+        "oidc": {
+            "clientId": "legacy-client",
+            "issuerUrl": "https://legacy.example.test",
+        },
         "arn": (
-            f"arn:aws:eks:{resource_region}:{account_id}:"
+            f"arn:aws:eks:{child_arn_region}:{account_id}:"
             f"identityproviderconfig/{cluster_name}/oidc/legacy-idp"
         ),
     }
@@ -668,21 +675,21 @@ def test_eks_legacy_state_uses_arn_and_parent_regions():
         )
 
         cluster = mod._clusters.get_scoped(
-            account_id, resource_region, cluster_name
+            account_id, parent_region, cluster_name
         )
         assert cluster["_docker_id"] is None
         assert cluster["endpoint"] == "https://localhost:16443"
         assert mod._access_entries.contains_scoped(
-            account_id, resource_region, entry_key
+            account_id, parent_region, entry_key
         )
         assert mod._nodegroups.contains_scoped(
-            account_id, resource_region, nodegroup_key
+            account_id, parent_region, nodegroup_key
         )
         assert mod._addons.contains_scoped(
-            account_id, resource_region, addon_key
+            account_id, parent_region, addon_key
         )
         assert mod._access_policies.contains_scoped(
-            account_id, resource_region, policy_key
+            account_id, parent_region, policy_key
         )
         assert not mod._access_policies.contains_scoped(
             account_id, boot_region, policy_key
@@ -691,8 +698,61 @@ def test_eks_legacy_state_uses_arn_and_parent_regions():
             account_id, boot_region, orphan_key
         )
         assert mod._idp_configs.contains_scoped(
-            account_id, resource_region, idp_key
+            account_id, parent_region, idp_key
         )
+        for store, key in (
+            (mod._nodegroups, nodegroup_key),
+            (mod._addons, addon_key),
+            (mod._access_entries, entry_key),
+            (mod._access_policies, policy_key),
+            (mod._idp_configs, idp_key),
+        ):
+            assert not store.contains_scoped(account_id, child_arn_region, key)
+
+        # The legacy child records remain reachable through their normal API
+        # paths in the restored parent region even though their persisted ARNs
+        # were minted by cross-region legacy requests.
+        set_request_region(parent_region)
+        status, _, body = mod._list_nodegroups(cluster_name, {})
+        assert status == 200
+        assert _json.loads(body)["nodegroups"] == ["legacy-workers"]
+        status, _, body = mod._describe_nodegroup(
+            cluster_name, "legacy-workers"
+        )
+        assert status == 200
+        assert _json.loads(body)["nodegroup"]["nodegroupName"] == "legacy-workers"
+
+        status, _, body = mod._list_addons(cluster_name, {})
+        assert status == 200
+        assert _json.loads(body)["addons"] == ["vpc-cni"]
+        status, _, body = mod._describe_addon(cluster_name, "vpc-cni")
+        assert status == 200
+        assert _json.loads(body)["addon"]["addonName"] == "vpc-cni"
+
+        status, _, body = mod._list_access_entries(cluster_name, {})
+        assert status == 200
+        assert _json.loads(body)["accessEntries"] == [principal_arn]
+        status, _, body = mod._list_associated_access_policies(
+            cluster_name, principal_arn, {}
+        )
+        assert status == 200
+        assert _json.loads(body)["associatedAccessPolicies"][0][
+            "policyArn"
+        ] == policy_arn
+
+        status, _, body = mod._describe_identity_provider_config(
+            cluster_name,
+            {
+                "identityProviderConfig": {
+                    "type": "oidc",
+                    "name": "legacy-idp",
+                }
+            },
+        )
+        assert status == 200
+        assert _json.loads(body)["identityProviderConfig"]["oidc"][
+            "identityProviderConfigName"
+        ] == "legacy-idp"
     finally:
         mod.reset()
         set_request_account_id(original_account)
