@@ -3158,6 +3158,8 @@ def test_rds_restore_state_respawns_docker_container(monkeypatch):
         "member-added-during-readiness",
         "member-added-during-migration",
         "pending-password-rotation",
+        "global-secondary",
+        "global-secondary-before-control-user",
         "last-member-deleted-during-readiness",
         "last-members-deleted-before-start",
     ],
@@ -3177,6 +3179,7 @@ def test_rds_restore_state_respawns_one_container_per_cluster(
     readiness_credentials = []
     rotations = []
     grants = []
+    replication_configs = []
     remaining_legacy_names = set()
     legacy_owner_by_name = {}
     writer_legacy_container_name = [None]
@@ -3309,9 +3312,26 @@ def test_rds_restore_state_respawns_one_container_per_cluster(
     def _grant(_host, _port, user, password, db_id):
         grants.append((user, password, db_id))
 
+    def _configure_replication(db_id, cluster):
+        replication_configs.append(
+            (
+                db_id,
+                cluster.get("_shared_container_epoch"),
+                cluster.get("_shared_container_ready"),
+                cluster.get("_mysql_replication_reset_pending"),
+            )
+        )
+
     monkeypatch.setattr(m, "_wait_for_database_ready", _wait_for_database_ready)
     monkeypatch.setattr(m, "_rotate_real_password", _rotate)
     monkeypatch.setattr(m, "_grant_mysql_master_user_privileges", _grant)
+    monkeypatch.setattr(
+        m,
+        "_configure_or_defer_mysql_replication",
+        _configure_replication,
+    )
+    if scenario.startswith("global-secondary"):
+        monkeypatch.setattr(m, "_mysql_replication_secondary", lambda _cluster: True)
 
     account_id = get_account_id()
     region = get_region()
@@ -3361,6 +3381,13 @@ def test_rds_restore_state_respawns_one_container_per_cluster(
             "old_password": "writer-password",
             "new_password": "rotated-password",
         }
+    elif scenario.startswith("global-secondary"):
+        cluster_record["_mysql_replication_source_arn"] = (
+            "arn:aws:rds:us-east-1:111111111111:cluster:global-primary"
+        )
+        cluster_record["_mysql_gtid_initialized_at_creation"] = True
+        if scenario == "global-secondary":
+            cluster_record["_mysql_control_user_ready"] = True
     clusters.set_scoped(account_id, region, cluster_id, cluster_record)
     instances = AccountRegionScopedDict()
     for db_id in ("restored-writer", "restored-reader"):
@@ -3497,16 +3524,40 @@ def test_rds_restore_state_respawns_one_container_per_cluster(
 
         assert len(runs) == 1
         assert runs[0]["name"] == m._rds_cluster_docker_name(cluster_id)
-        assert runs[0]["environment"]["MYSQL_USER"] == "writer-admin"
+        if scenario.startswith("global-secondary"):
+            assert "MYSQL_USER" not in runs[0]["environment"]
+            assert "MYSQL_PASSWORD" not in runs[0]["environment"]
+            assert "MYSQL_DATABASE" not in runs[0]["environment"]
+        else:
+            assert runs[0]["environment"]["MYSQL_USER"] == "writer-admin"
         expected_password = (
             "rotated-password"
             if scenario == "pending-password-rotation"
             else "writer-password"
         )
         assert runs[0]["environment"]["MYSQL_ROOT_PASSWORD"] == expected_password
-        assert runs[0]["environment"]["MYSQL_DATABASE"] == "writer-db"
+        if not scenario.startswith("global-secondary"):
+            assert runs[0]["environment"]["MYSQL_DATABASE"] == "writer-db"
         assert readiness_credentials == [
-            ("writer-admin", "writer-password", "writer-db"),
+            (
+                (
+                    m._MYSQL_CONTROL_USER
+                    if scenario == "global-secondary"
+                    else "root"
+                    if scenario == "global-secondary-before-control-user"
+                    else "writer-admin"
+                ),
+                (
+                    m._MYSQL_CONTROL_PASSWORD
+                    if scenario == "global-secondary"
+                    else "writer-password"
+                ),
+                (
+                    None
+                    if scenario.startswith("global-secondary")
+                    else "writer-db"
+                ),
+            ),
         ]
         assert runs[0]["volumes"] == {
             "legacy-restored-writer-volume": {
@@ -3533,6 +3584,22 @@ def test_rds_restore_state_respawns_one_container_per_cluster(
         )
         assert grants == (
             [("writer-admin", expected_password, cluster_id)]
+            if database_ready and not scenario.startswith("global-secondary")
+            else []
+        )
+        assert replication_configs == (
+            [
+                (
+                    cluster_id,
+                    restored_cluster["_shared_container_epoch"],
+                    True,
+                    (
+                        True
+                        if scenario.startswith("global-secondary")
+                        else None
+                    ),
+                )
+            ]
             if database_ready
             else []
         )
@@ -5674,6 +5741,53 @@ def test_rds_mysql_readiness_probe_requires_successful_query(monkeypatch):
     assert attempts == ["SELECT 1", "cursor.close", "connection.close"]
 
 
+def test_rds_mysql_readiness_probe_uses_supplied_control_user(monkeypatch):
+    """Replica readiness must authenticate as the local control account."""
+    from ministack.services import rds
+
+    connection_args = []
+
+    class FakeCursor:
+        def execute(self, sql):
+            assert sql == "SELECT 1"
+
+        def close(self):
+            pass
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            pass
+
+    def connect(**kwargs):
+        connection_args.append(kwargs)
+        return FakeConnection()
+
+    monkeypatch.setitem(sys.modules, "pymysql", types.SimpleNamespace(connect=connect))
+
+    assert rds._try_database_connect(
+        "127.0.0.1",
+        3306,
+        "aurora-mysql",
+        rds._MYSQL_CONTROL_USER,
+        rds._MYSQL_CONTROL_PASSWORD,
+        None,
+    )
+    assert connection_args == [{
+        "host": "127.0.0.1",
+        "port": 3306,
+        "user": rds._MYSQL_CONTROL_USER,
+        "password": rds._MYSQL_CONTROL_PASSWORD,
+        "database": None,
+        "connect_timeout": 2,
+        "read_timeout": 2,
+        "write_timeout": 2,
+        "autocommit": True,
+    }]
+
+
 def test_rds_cluster_password_rotation_alters_mysql_password(monkeypatch):
     """Password rotation assumes the instance already passed readiness."""
     from ministack.services import rds
@@ -5933,3 +6047,1709 @@ def test_aurora_delete_member_keeps_shared_data(rds, rds_data):
         filters={"label": ["ministack=rds", f"cluster_id={cluster_id}"]},
     )
     assert containers == []
+
+
+def test_rds_aurora_mysql_8_replication_command_is_stable_and_scoped(monkeypatch):
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import rds as m
+
+    runs = []
+
+    class FakeContainer:
+        def __init__(self, name):
+            self.id = f"container-{len(runs)}"
+            self.name = name
+            self.attrs = {"NetworkSettings": {"Networks": {}}}
+
+        def reload(self):
+            pass
+
+    class FakeContainers:
+        def run(self, **kwargs):
+            runs.append(kwargs)
+            return FakeContainer(kwargs["name"])
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: None)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    monkeypatch.setattr(m, "_port_counter", [17000])
+    monkeypatch.setattr(
+        m,
+        "_mysql_replication_secondary",
+        lambda cluster: cluster.get("DBClusterIdentifier") == "global-secondary",
+    )
+
+    original_account = get_account_id()
+    original_region = get_region()
+
+    def command_for(
+        account,
+        region,
+        cluster_id,
+        engine="aurora-mysql",
+        engine_version="8.0.mysql_aurora.3.10.3",
+    ):
+        set_request_account_id(account)
+        set_request_region(region)
+        cluster = {
+            "DBClusterIdentifier": cluster_id,
+            "Engine": engine,
+            "EngineVersion": engine_version,
+            "MasterUsername": "admin",
+            "_MasterUserPassword": "password123",
+            "DatabaseName": "mydb",
+        }
+        m._start_cluster_shared_container(cluster_id, cluster)
+        return runs[-1]
+
+    try:
+        east_first = command_for("111111111111", "us-east-1", "global-primary")
+        east_again = command_for("111111111111", "us-east-1", "global-primary")
+        west = command_for("111111111111", "us-west-2", "global-secondary")
+        other_account = command_for("222222222222", "us-east-1", "global-primary")
+        mysql_57 = command_for(
+            "111111111111",
+            "us-east-1",
+            "mysql-57-cluster",
+            engine_version="5.7.mysql_aurora.2.12.6",
+        )
+        mysql_84 = command_for(
+            "111111111111",
+            "us-east-1",
+            "mysql-84-cluster",
+            engine_version="8.4.mysql_aurora.8.4.7",
+        )
+        postgres = command_for(
+            "111111111111",
+            "us-east-1",
+            "postgres-cluster",
+            engine="aurora-postgresql",
+            engine_version="15.3",
+        )
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+    required_flags = {
+        "--log-bin=mysql-bin",
+        "--gtid-mode=ON",
+        "--enforce-gtid-consistency=ON",
+        "--log-replica-updates",
+        f"--binlog-expire-logs-seconds={m._MYSQL_BINLOG_RETENTION_SECONDS}",
+    }
+    for run in (east_first, east_again, west, other_account):
+        assert required_flags <= set(run["command"])
+
+    def server_id(run):
+        raw = next(
+            arg.removeprefix("--server-id=")
+            for arg in run["command"]
+            if arg.startswith("--server-id=")
+        )
+        parsed = int(raw)
+        assert 1 <= parsed <= 2**32 - 1
+        return parsed
+
+    assert server_id(east_first) == server_id(east_again)
+    assert len(
+        {
+            server_id(east_first),
+            server_id(west),
+            server_id(other_account),
+        }
+    ) == 3
+    for unsupported in (mysql_57, mysql_84, postgres):
+        assert "command" not in unsupported
+    assert "--binlog-expire-logs-seconds=0" not in east_first["command"]
+    assert east_first["environment"]["MYSQL_USER"] == "admin"
+    assert east_first["environment"]["MYSQL_DATABASE"] == "mydb"
+    assert west["environment"] == {
+        "MYSQL_ROOT_PASSWORD": "password123",
+        "MYSQL_ROOT_HOST": "%",
+    }
+
+
+def _mysql_replication_unit_topology():
+    writer = {
+        "DBClusterIdentifier": "primary",
+        "DBClusterArn": "arn:aws:rds:us-east-1:111111111111:cluster:primary",
+        "Engine": "aurora-mysql",
+        "EngineVersion": "8.0.mysql_aurora.3.10.3",
+        "GlobalClusterIdentifier": "global-repl",
+        "_mysql_gtid_initialized_at_creation": True,
+        "_shared_container_ready": True,
+        "_shared_internal_address": "172.20.0.10",
+        "_shared_internal_port": 3306,
+    }
+    secondary = {
+        "DBClusterIdentifier": "secondary",
+        "DBClusterArn": "arn:aws:rds:us-west-2:111111111111:cluster:secondary",
+        "Engine": "aurora-mysql",
+        "EngineVersion": "8.0.mysql_aurora.3.10.3",
+        "GlobalClusterIdentifier": "global-repl",
+        "_mysql_gtid_initialized_at_creation": True,
+        "_shared_container_ready": True,
+        "_shared_internal_address": "172.20.0.20",
+        "_shared_internal_port": 3306,
+    }
+    writer_member = {"DBClusterArn": writer["DBClusterArn"], "IsWriter": True}
+    secondary_member = {
+        "DBClusterArn": secondary["DBClusterArn"],
+        "IsWriter": False,
+    }
+    global_cluster = {
+        "GlobalClusterIdentifier": "global-repl",
+        "GlobalClusterMembers": [writer_member, secondary_member],
+    }
+    return writer, secondary, writer_member, secondary_member, global_cluster
+
+
+def _patch_mysql_replication_unit_topology(monkeypatch, m, topology):
+    writer, secondary, writer_member, secondary_member, global_cluster = topology
+
+    def member_for(cluster):
+        member = writer_member if cluster is writer else secondary_member
+        return global_cluster, member
+
+    def resolve(member):
+        return writer if member is writer_member else secondary
+
+    monkeypatch.setattr(m, "_global_cluster_member_for_cluster", member_for)
+    monkeypatch.setattr(m, "_resolve_global_member_cluster", resolve)
+    monkeypatch.setattr(m, "_ensure_mysql_control_user", lambda _cluster: True)
+
+
+@pytest.mark.parametrize(
+    ("control_ready", "expected_user", "expected_password"),
+    [
+        (False, "root", "global-password"),
+        (True, "rdsadmin", "ministack-rds-control"),
+    ],
+)
+def test_rds_global_secondary_readiness_uses_bootstrap_state_credentials(
+    monkeypatch,
+    control_ready,
+    expected_user,
+    expected_password,
+):
+    """The real create-member readiness call distinguishes fresh and restored."""
+    import threading
+
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_region,
+    )
+    from ministack.services import rds as m
+
+    account_id = get_account_id()
+    original_region = get_region()
+    topology = _mysql_replication_unit_topology()
+    writer, secondary, _writer_member, _secondary_member, global_cluster = topology
+    writer.update({
+        "MasterUsername": "global_admin",
+        "_MasterUserPassword": "global-password",
+        "DatabaseName": "global_db",
+    })
+    secondary.update({
+        "MasterUsername": "global_admin",
+        "_MasterUserPassword": "global-password",
+        "DatabaseName": "global_db",
+        "DBClusterMembers": [],
+        "Port": 3306,
+    })
+    if control_ready:
+        secondary["_mysql_control_user_ready"] = True
+
+    readiness_credentials = []
+    readiness_finished = threading.Event()
+
+    class FakeContainer:
+        status = "running"
+
+        def reload(self):
+            pass
+
+    class FakeContainers:
+        def get(self, _container_id):
+            return FakeContainer()
+
+    class FakeDocker:
+        containers = FakeContainers()
+
+    def start_cluster(_cluster_id, cluster, remove_stale=False):
+        assert remove_stale is False
+        cluster.update({
+            "_shared_container_id": "secondary-container",
+            "_shared_container_epoch": 1,
+            "_shared_container_ready": False,
+            "_shared_endpoint": {"Address": "127.0.0.1", "Port": 3306},
+            "_shared_internal_address": "172.20.0.20",
+            "_shared_internal_port": 3306,
+        })
+        return {
+            "started": True,
+            "failed": False,
+            "readiness_host": "127.0.0.1",
+            "readiness_port": 3306,
+            "container_epoch": 1,
+        }
+
+    def wait_for_ready(_host, _port, _engine, user, password, db_name, *_args):
+        readiness_credentials.append((user, password, db_name))
+        return True
+
+    def configured(*_args):
+        readiness_finished.set()
+
+    m._instances.clear()
+    m._clusters.clear()
+    m._global_clusters.clear()
+    try:
+        m._clusters.set_scoped(account_id, "us-east-1", "primary", writer)
+        m._clusters.set_scoped(account_id, "us-west-2", "secondary", secondary)
+        m._global_clusters["global-repl"] = global_cluster
+        set_request_region("us-west-2")
+        monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+        monkeypatch.setattr(m, "_start_cluster_shared_container", start_cluster)
+        monkeypatch.setattr(m, "_wait_for_database_ready", wait_for_ready)
+        monkeypatch.setattr(m, "_configure_or_defer_mysql_replication", configured)
+
+        status, _, body = m._create_db_instance({
+            "DBInstanceIdentifier": "secondary-reader",
+            "DBClusterIdentifier": "secondary",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+
+        assert status == 200, body
+        assert readiness_finished.wait(timeout=1)
+        assert readiness_credentials == [
+            (expected_user, expected_password, None),
+        ]
+    finally:
+        set_request_region(original_region)
+        m._instances.clear()
+        m._clusters.clear()
+        m._global_clusters.clear()
+
+
+def test_rds_mysql_replication_secondary_sql_is_idempotent(monkeypatch):
+    from ministack.services import rds as m
+
+    topology = _mysql_replication_unit_topology()
+    writer, secondary, _writer_member, _secondary_member, _global = topology
+    _patch_mysql_replication_unit_topology(monkeypatch, m, topology)
+    ensured = []
+    statements = []
+    closed = []
+
+    class FakeCursor:
+        def execute(self, statement, params=None):
+            statements.append((statement, params))
+
+        def close(self):
+            closed.append("cursor")
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            closed.append("connection")
+
+    monkeypatch.setattr(
+        m,
+        "_ensure_mysql_replication_user",
+        lambda cluster: ensured.append(cluster) or True,
+    )
+    monkeypatch.setattr(
+        m,
+        "_mysql_replication_connection",
+        lambda cluster: FakeConnection() if cluster is secondary else None,
+    )
+
+    assert m._configure_mysql_replication("secondary", secondary) is True
+    assert m._configure_mysql_replication("secondary", secondary) is True
+
+    assert ensured == [writer, writer]
+    assert [statement for statement, _params in statements] == [
+        "STOP REPLICA",
+        (
+            "CHANGE REPLICATION SOURCE TO "
+            "SOURCE_HOST=%s, SOURCE_PORT=%s, SOURCE_USER=%s, "
+            "SOURCE_PASSWORD=%s, SOURCE_AUTO_POSITION=1, "
+            "GET_SOURCE_PUBLIC_KEY=1"
+        ),
+        "START REPLICA",
+        "SET GLOBAL super_read_only=ON",
+    ] * 2
+    assert statements[1][1] == (
+        writer["_shared_internal_address"],
+        writer["_shared_internal_port"],
+        m._MYSQL_REPLICATION_USER,
+        m._MYSQL_REPLICATION_PASSWORD,
+    )
+    assert statements[5][1] == statements[1][1]
+    assert closed == ["cursor", "connection"] * 2
+    assert secondary["_mysql_replication_source_arn"] == writer["DBClusterArn"]
+    secondary["_mysql_replication_detach_state"] = "resetting"
+    assert m._configure_mysql_replication("secondary", secondary) is True
+    assert "_mysql_replication_detach_state" not in secondary
+
+
+def test_rds_mysql_replication_restore_resets_once_then_is_idempotent(monkeypatch):
+    from ministack.services import rds as m
+
+    topology = _mysql_replication_unit_topology()
+    writer, secondary, _writer_member, _secondary_member, _global = topology
+    _patch_mysql_replication_unit_topology(monkeypatch, m, topology)
+    secondary["_mysql_replication_source_arn"] = writer["DBClusterArn"]
+    secondary["_mysql_replication_reset_pending"] = True
+    statements = []
+
+    class FakeCursor:
+        def execute(self, statement, params=None):
+            statements.append((statement, params))
+
+        def close(self):
+            pass
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(m, "_ensure_mysql_replication_user", lambda _cluster: True)
+    monkeypatch.setattr(
+        m,
+        "_mysql_replication_connection",
+        lambda cluster: FakeConnection() if cluster is secondary else None,
+    )
+
+    assert m._configure_mysql_replication("secondary", secondary) is True
+    assert "_mysql_replication_reset_pending" not in secondary
+    assert m._configure_mysql_replication("secondary", secondary) is True
+
+    assert [statement for statement, _params in statements] == [
+        "STOP REPLICA",
+        "RESET REPLICA ALL",
+        (
+            "CHANGE REPLICATION SOURCE TO "
+            "SOURCE_HOST=%s, SOURCE_PORT=%s, SOURCE_USER=%s, "
+            "SOURCE_PASSWORD=%s, SOURCE_AUTO_POSITION=1, "
+            "GET_SOURCE_PUBLIC_KEY=1"
+        ),
+        "START REPLICA",
+        "SET GLOBAL super_read_only=ON",
+        "STOP REPLICA",
+        (
+            "CHANGE REPLICATION SOURCE TO "
+            "SOURCE_HOST=%s, SOURCE_PORT=%s, SOURCE_USER=%s, "
+            "SOURCE_PASSWORD=%s, SOURCE_AUTO_POSITION=1, "
+            "GET_SOURCE_PUBLIC_KEY=1"
+        ),
+        "START REPLICA",
+        "SET GLOBAL super_read_only=ON",
+    ]
+    assert sum(
+        statement == "RESET REPLICA ALL" for statement, _params in statements
+    ) == 1
+    assert secondary["_mysql_replication_source_arn"] == writer["DBClusterArn"]
+
+
+def test_rds_mysql_replication_writer_sweep_closes_reverse_readiness_race(
+    monkeypatch,
+):
+    from ministack.services import rds as m
+
+    topology = _mysql_replication_unit_topology()
+    writer, secondary, _writer_member, _secondary_member, _global = topology
+    _patch_mysql_replication_unit_topology(monkeypatch, m, topology)
+    secondary["_shared_container_ready"] = True
+    writer["_shared_container_ready"] = False
+    scheduled = []
+    statements = []
+
+    class FakeCursor:
+        def execute(self, statement, params=None):
+            statements.append((statement, params))
+
+        def close(self):
+            pass
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(m, "_ensure_mysql_replication_user", lambda _cluster: True)
+    monkeypatch.setattr(
+        m,
+        "_mysql_replication_connection",
+        lambda cluster: FakeConnection() if cluster is secondary else None,
+    )
+    monkeypatch.setattr(
+        m,
+        "_schedule_mysql_replication_retry",
+        lambda cluster_id, cluster: scheduled.append((cluster_id, cluster)),
+    )
+
+    m._configure_or_defer_mysql_replication("secondary", secondary)
+    assert scheduled == [("secondary", secondary)]
+    assert statements == []
+
+    writer["_shared_container_ready"] = True
+    assert m._configure_mysql_replication("primary", writer) is True
+    assert [statement for statement, _params in statements] == [
+        "STOP REPLICA",
+        (
+            "CHANGE REPLICATION SOURCE TO "
+            "SOURCE_HOST=%s, SOURCE_PORT=%s, SOURCE_USER=%s, "
+            "SOURCE_PASSWORD=%s, SOURCE_AUTO_POSITION=1, "
+            "GET_SOURCE_PUBLIC_KEY=1"
+        ),
+        "START REPLICA",
+        "SET GLOBAL super_read_only=ON",
+    ]
+    assert secondary["_mysql_replication_source_arn"] == writer["DBClusterArn"]
+
+
+def test_rds_mysql_replication_failure_is_retryable_and_closes_connections(
+    monkeypatch,
+    caplog,
+):
+    from ministack.services import rds as m
+
+    topology = _mysql_replication_unit_topology()
+    _writer, secondary, _writer_member, _secondary_member, _global = topology
+    _patch_mysql_replication_unit_topology(monkeypatch, m, topology)
+    scheduled = []
+    closed = []
+
+    class FakeCursor:
+        def execute(self, statement, params=None):
+            if statement.startswith("CHANGE REPLICATION SOURCE"):
+                raise RuntimeError("source is temporarily unavailable")
+
+        def close(self):
+            closed.append("cursor")
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            closed.append("connection")
+
+    monkeypatch.setattr(m, "_ensure_mysql_replication_user", lambda _cluster: True)
+    monkeypatch.setattr(m, "_mysql_replication_connection", lambda _cluster: FakeConnection())
+    monkeypatch.setattr(
+        m,
+        "_schedule_mysql_replication_retry",
+        lambda cluster_id, cluster: scheduled.append((cluster_id, cluster)),
+    )
+
+    with caplog.at_level("WARNING"):
+        m._configure_or_defer_mysql_replication("secondary", secondary)
+
+    assert scheduled == [("secondary", secondary)]
+    assert closed == ["cursor", "connection"]
+    assert "_mysql_replication_source_arn" not in secondary
+    assert "source is temporarily unavailable" in caplog.text
+
+
+def test_rds_mysql_replication_retry_ignores_stale_container_epoch(monkeypatch):
+    from ministack.services import rds as m
+
+    cluster = {
+        "DBClusterIdentifier": "secondary",
+        "DBClusterArn": "arn:aws:rds:us-west-2:111111111111:cluster:secondary",
+        "GlobalClusterIdentifier": "global-repl",
+        "_shared_container_epoch": 7,
+    }
+    threads = []
+    configured = []
+
+    class FakeClusters:
+        def get_scoped(self, _account_id, _region, _cluster_id):
+            return cluster
+
+    class DeferredThread:
+        def __init__(self, target, args=(), daemon=None):
+            self.target = target
+            self.args = args
+            threads.append(self)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(m, "_clusters", FakeClusters())
+    monkeypatch.setattr(m.threading, "Thread", DeferredThread)
+    monkeypatch.setattr(m.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        m,
+        "_configure_mysql_replication",
+        lambda cluster_id, current: configured.append((cluster_id, current)) or True,
+    )
+
+    m._schedule_mysql_replication_retry("secondary", cluster)
+    assert cluster["_mysql_replication_retry_marker"] == (7, "global-repl")
+    assert len(threads) == 1
+
+    cluster["_shared_container_epoch"] = 8
+    m._schedule_mysql_replication_retry("secondary", cluster)
+    assert cluster["_mysql_replication_retry_marker"] == (8, "global-repl")
+    assert len(threads) == 2
+
+    threads[0].target(*threads[0].args)
+    assert configured == []
+
+    threads[1].target(*threads[1].args)
+    assert configured == [("secondary", cluster)]
+    assert "_mysql_replication_retry_marker" not in cluster
+
+
+def test_rds_mysql_replication_retry_exhaustion_preserves_new_epoch_marker(
+    monkeypatch,
+):
+    from ministack.services import rds as m
+
+    cluster = {
+        "DBClusterIdentifier": "secondary",
+        "DBClusterArn": "arn:aws:rds:us-west-2:111111111111:cluster:secondary",
+        "GlobalClusterIdentifier": "global-repl",
+        "_shared_container_epoch": 7,
+    }
+    threads = []
+
+    class FakeClusters:
+        def get_scoped(self, _account_id, _region, _cluster_id):
+            return cluster
+
+    class DeferredThread:
+        def __init__(self, target, args=(), daemon=None):
+            self.target = target
+            self.args = args
+            threads.append(self)
+
+        def start(self):
+            pass
+
+    class EpochHandoffLock:
+        enters = 0
+
+        def __enter__(self):
+            self.enters += 1
+            if self.enters == 2:
+                cluster["_shared_container_epoch"] = 8
+                cluster["_mysql_replication_retry_marker"] = (8, "global-repl")
+
+        def __exit__(self, *_args):
+            pass
+
+    monkeypatch.setattr(m, "_clusters", FakeClusters())
+    monkeypatch.setattr(m, "_shared_container_lock", EpochHandoffLock())
+    monkeypatch.setattr(m.threading, "Thread", DeferredThread)
+    monkeypatch.setattr(m.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(m, "_MYSQL_REPLICATION_RETRY_ATTEMPTS", 1)
+    monkeypatch.setattr(m, "_configure_mysql_replication", lambda *_args: False)
+
+    m._schedule_mysql_replication_retry("secondary", cluster)
+    threads[0].target(*threads[0].args)
+
+    assert cluster["_mysql_replication_retry_marker"] == (8, "global-repl")
+
+
+def test_rds_mysql_replication_legacy_volume_fails_closed_on_global_attach():
+    from ministack.services import rds as m
+
+    cluster_id = "legacy-source"
+    cluster = {
+        "DBClusterIdentifier": cluster_id,
+        "DBClusterArn": f"arn:aws:rds:us-east-1:000000000000:cluster:{cluster_id}",
+        "Engine": "aurora-mysql",
+        "EngineVersion": "8.0.mysql_aurora.3.10.3",
+        "_shared_storage_initialized": True,
+    }
+    m._clusters.clear()
+    m._global_clusters.clear()
+    try:
+        m._clusters[cluster_id] = cluster
+
+        status, _, body = m._create_global_cluster({
+            "GlobalClusterIdentifier": "legacy-global",
+            "SourceDBClusterIdentifier": cluster["DBClusterArn"],
+        })
+
+        assert status == 400
+        assert b"InvalidDBClusterStateFault" in body
+        assert b"predates GTID-at-creation tracking" in body
+        assert "legacy-global" not in m._global_clusters
+        assert "GlobalClusterIdentifier" not in cluster
+    finally:
+        m._clusters.clear()
+        m._global_clusters.clear()
+
+
+def test_rds_global_secondary_inherits_writer_credentials_and_database():
+    from ministack.core.responses import (
+        get_region,
+        set_request_region,
+    )
+    from ministack.services import rds as m
+
+    writer = {
+        "DBClusterIdentifier": "primary",
+        "DBClusterArn": "arn:aws:rds:us-east-1:000000000000:cluster:primary",
+        "Engine": "aurora-mysql",
+        "EngineVersion": "8.0.mysql_aurora.3.10.3",
+        "MasterUsername": "global_admin",
+        "_MasterUserPassword": "global-password",
+        "DatabaseName": "global_db",
+        "_mysql_gtid_initialized_at_creation": True,
+    }
+    global_cluster = {
+        "GlobalClusterIdentifier": "global-repl",
+        "Engine": writer["Engine"],
+        "EngineVersion": writer["EngineVersion"],
+        "GlobalClusterMembers": [
+            {"DBClusterArn": writer["DBClusterArn"], "IsWriter": True},
+        ],
+    }
+    m._clusters.clear()
+    m._global_clusters.clear()
+    original_region = get_region()
+    try:
+        m._clusters["primary"] = writer
+        m._global_clusters["global-repl"] = global_cluster
+        set_request_region("us-west-2")
+
+        status, _, _body = m._create_db_cluster({
+            "DBClusterIdentifier": "secondary",
+            "Engine": "aurora-mysql",
+            "EngineVersion": writer["EngineVersion"],
+            "GlobalClusterIdentifier": "global-repl",
+        })
+
+        assert status == 200, _body
+        secondary = m._clusters["secondary"]
+        assert secondary["MasterUsername"] == "global_admin"
+        assert secondary["_MasterUserPassword"] == "global-password"
+        assert secondary["DatabaseName"] == "global_db"
+
+        status, _, body = m._create_db_cluster({
+            "DBClusterIdentifier": "conflicting-secondary",
+            "Engine": "aurora-mysql",
+            "EngineVersion": writer["EngineVersion"],
+            "GlobalClusterIdentifier": "global-repl",
+            "MasterUsername": "different_admin",
+        })
+        assert status == 400
+        assert b"InvalidParameterValue" in body
+        assert "conflicting-secondary" not in m._clusters
+    finally:
+        set_request_region(original_region)
+        m._clusters.clear()
+        m._global_clusters.clear()
+
+
+def test_rds_deleting_last_global_secondary_instance_preserves_headless_applier(
+    monkeypatch,
+):
+    from ministack.core.responses import get_account_id, get_region, set_request_region
+    from ministack.services import rds as m
+
+    account_id = get_account_id()
+    original_region = get_region()
+    writer, secondary, _writer_member, _secondary_member, global_cluster = (
+        _mysql_replication_unit_topology()
+    )
+    secondary.update({
+        "DBClusterMembers": [{
+            "DBInstanceIdentifier": "secondary-reader",
+            "IsClusterWriter": True,
+        }],
+        "_shared_storage_initialized": True,
+        "_shared_container_id": "secondary-container",
+    })
+    instance = {
+        "DBInstanceIdentifier": "secondary-reader",
+        "DBInstanceClass": "db.r6g.large",
+        "Engine": "aurora-mysql",
+        "EngineVersion": DEFAULT_AURORA_MYSQL_ENGINE_VERSION,
+        "DBInstanceStatus": "available",
+        "MasterUsername": "admin",
+        "Endpoint": {"Address": "secondary", "Port": 3306},
+        "AllocatedStorage": 1,
+        "DBInstanceArn": (
+            f"arn:aws:rds:us-west-2:{account_id}:db:secondary-reader"
+        ),
+        "DBClusterIdentifier": "secondary",
+        "_shared_cluster_id": "secondary",
+        "DeletionProtection": False,
+    }
+    stopped = []
+
+    m._instances.clear()
+    m._clusters.clear()
+    m._global_clusters.clear()
+    try:
+        m._clusters.set_scoped(account_id, "us-east-1", "primary", writer)
+        m._clusters.set_scoped(account_id, "us-west-2", "secondary", secondary)
+        m._instances.set_scoped(
+            account_id,
+            "us-west-2",
+            "secondary-reader",
+            instance,
+        )
+        m._global_clusters["global-repl"] = global_cluster
+        set_request_region("us-west-2")
+        monkeypatch.setattr(
+            m,
+            "_stop_empty_cluster_shared_container",
+            lambda cluster_id, cluster: stopped.append((cluster_id, cluster)),
+        )
+
+        status, _, body = m._delete_db_instance({
+            "DBInstanceIdentifier": "secondary-reader",
+            "SkipFinalSnapshot": "true",
+        })
+
+        assert status == 200, body
+        assert stopped == []
+        assert secondary["DBClusterMembers"] == []
+        assert secondary["_shared_container_ready"] is True
+        assert secondary["_mysql_headless_applier_required"] is True
+    finally:
+        set_request_region(original_region)
+        m._instances.clear()
+        m._clusters.clear()
+        m._global_clusters.clear()
+
+
+def test_rds_restore_respawns_persisted_headless_secondary_applier(monkeypatch):
+    import threading
+
+    from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict
+    from ministack.services import rds as m
+
+    account_id = "000000000000"
+    writer_arn = f"arn:aws:rds:us-east-1:{account_id}:cluster:primary"
+    secondary_arn = f"arn:aws:rds:us-west-2:{account_id}:cluster:secondary"
+    writer = {
+        "DBClusterIdentifier": "primary",
+        "DBClusterArn": writer_arn,
+        "Engine": "aurora-mysql",
+        "EngineVersion": DEFAULT_AURORA_MYSQL_ENGINE_VERSION,
+        "GlobalClusterIdentifier": "global-repl",
+        "MasterUsername": "admin",
+        "_MasterUserPassword": "password123",
+        "DatabaseName": "mydb",
+        "DBClusterMembers": [],
+    }
+    secondary = {
+        "DBClusterIdentifier": "secondary",
+        "DBClusterArn": secondary_arn,
+        "Engine": "aurora-mysql",
+        "EngineVersion": DEFAULT_AURORA_MYSQL_ENGINE_VERSION,
+        "GlobalClusterIdentifier": "global-repl",
+        "MasterUsername": "admin",
+        "_MasterUserPassword": "password123",
+        "DatabaseName": "mydb",
+        "DBClusterMembers": [],
+        "Port": 3306,
+        "_shared_storage_initialized": True,
+        "_shared_volume_name": "secondary-volume",
+        "_shared_endpoint": {"Address": "127.0.0.1", "Port": 16020},
+        "_mysql_gtid_initialized_at_creation": True,
+        "_mysql_control_user_ready": True,
+        "_mysql_replication_source_arn": writer_arn,
+        "_mysql_headless_applier_required": True,
+    }
+    clusters = AccountRegionScopedDict()
+    clusters.set_scoped(account_id, "us-east-1", "primary", writer)
+    clusters.set_scoped(account_id, "us-west-2", "secondary", secondary)
+    global_clusters = AccountScopedDict()
+    global_clusters.set_scoped(account_id, None, "global-repl", {
+        "GlobalClusterIdentifier": "global-repl",
+        "GlobalClusterMembers": [
+            {"DBClusterArn": writer_arn, "IsWriter": True},
+            {"DBClusterArn": secondary_arn, "IsWriter": False},
+        ],
+    })
+    started = []
+    readiness_credentials = []
+    configured = threading.Event()
+
+    class FakeContainer:
+        status = "running"
+
+        def reload(self):
+            pass
+
+    class FakeContainers:
+        def get(self, _container_id):
+            return FakeContainer()
+
+    class FakeDocker:
+        containers = FakeContainers()
+
+    def start_cluster(cluster_id, cluster, remove_stale=False):
+        started.append((cluster_id, remove_stale))
+        cluster.update({
+            "_shared_container_id": "restored-headless-container",
+            "_shared_container_epoch": 1,
+            "_shared_container_ready": False,
+            "_shared_endpoint": {"Address": "127.0.0.1", "Port": 16020},
+            "_shared_internal_address": "172.20.0.20",
+            "_shared_internal_port": 3306,
+        })
+        return {
+            "started": True,
+            "failed": False,
+            "readiness_host": "127.0.0.1",
+            "readiness_port": 16020,
+            "container_epoch": 1,
+        }
+
+    def wait_for_ready(_host, _port, _engine, user, password, db_name, *_args):
+        readiness_credentials.append((user, password, db_name))
+        return True
+
+    def configure(cluster_id, cluster):
+        assert cluster_id == "secondary"
+        assert cluster["_mysql_headless_applier_required"] is True
+        configured.set()
+
+    m._instances.clear()
+    m._clusters.clear()
+    m._global_clusters.clear()
+    try:
+        monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+        monkeypatch.setattr(m, "_start_cluster_shared_container", start_cluster)
+        monkeypatch.setattr(m, "_wait_for_database_ready", wait_for_ready)
+        monkeypatch.setattr(m, "_configure_or_defer_mysql_replication", configure)
+
+        m.restore_state({
+            "instances": AccountRegionScopedDict(),
+            "clusters": clusters,
+            "global_clusters": global_clusters,
+        })
+
+        assert configured.wait(timeout=1)
+        assert started == [("secondary", True)]
+        assert readiness_credentials == [
+            (m._MYSQL_CONTROL_USER, m._MYSQL_CONTROL_PASSWORD, None),
+        ]
+        restored = m._clusters.get_scoped(
+            account_id,
+            "us-west-2",
+            "secondary",
+        )
+        assert restored["_shared_container_ready"] is True
+        assert restored["DBClusterMembers"] == []
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+        m._global_clusters.clear()
+
+
+def test_rds_mysql_replication_detach_stops_resets_and_enables_writes(
+    monkeypatch,
+):
+    from ministack.services import rds as m
+
+    topology = _mysql_replication_unit_topology()
+    _writer, secondary, _writer_member, _secondary_member, _global = topology
+    _patch_mysql_replication_unit_topology(monkeypatch, m, topology)
+    secondary.update({
+        "_shared_storage_initialized": True,
+        "_mysql_replication_source_arn": "source-arn",
+        "_mysql_replication_reset_pending": True,
+        "_mysql_replication_retry_marker": (7, "global-repl"),
+    })
+    statements = []
+
+    class FakeCursor:
+        def execute(self, statement, params=None):
+            statements.append((statement, params))
+
+        def close(self):
+            pass
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        m,
+        "_mysql_replication_connection",
+        lambda cluster: FakeConnection() if cluster is secondary else None,
+    )
+
+    assert m._detach_mysql_replication("secondary", secondary) is True
+    assert [statement for statement, _params in statements] == [
+        "STOP REPLICA",
+        "RESET REPLICA ALL",
+        "SET GLOBAL super_read_only=OFF",
+    ]
+    assert secondary["_mysql_replication_detach_state"] == "reset"
+    assert secondary["_mysql_replication_source_arn"] == "source-arn"
+
+    m._clear_mysql_replication_metadata(secondary)
+    assert "_mysql_replication_source_arn" not in secondary
+    assert "_mysql_replication_reset_pending" not in secondary
+    assert "_mysql_replication_retry_marker" not in secondary
+    assert "_mysql_replication_detach_state" not in secondary
+
+
+@pytest.mark.parametrize(
+    "failed_statement",
+    [
+        "STOP REPLICA",
+        "RESET REPLICA ALL",
+        "SET GLOBAL super_read_only=OFF",
+    ],
+)
+def test_rds_mysql_replication_detach_statement_failures_are_recoverable(
+    monkeypatch,
+    failed_statement,
+):
+    from ministack.services import rds as m
+
+    topology = _mysql_replication_unit_topology()
+    _writer, secondary, _writer_member, _secondary_member, _global = topology
+    _patch_mysql_replication_unit_topology(monkeypatch, m, topology)
+    secondary.update({
+        "_shared_storage_initialized": True,
+        "_mysql_replication_source_arn": "source-arn",
+    })
+    statements = []
+    closed = []
+
+    class FakeCursor:
+        def execute(self, statement, params=None):
+            statements.append((statement, params))
+            if statement == failed_statement:
+                raise RuntimeError(f"failed: {statement}")
+
+        def close(self):
+            closed.append("cursor")
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            closed.append("connection")
+
+    monkeypatch.setattr(
+        m,
+        "_mysql_replication_connection",
+        lambda cluster: FakeConnection() if cluster is secondary else None,
+    )
+    rollback_attempts = []
+    monkeypatch.setattr(
+        m,
+        "_configure_mysql_replication",
+        lambda cluster_id, cluster: rollback_attempts.append(
+            (cluster_id, cluster),
+        ) or False,
+    )
+
+    assert m._detach_mysql_replication("secondary", secondary) is False
+    assert secondary["_mysql_replication_detach_state"] == "requested"
+    assert secondary["_mysql_replication_source_arn"] == "source-arn"
+    assert rollback_attempts == [("secondary", secondary)]
+    assert [statement for statement, _params in statements][-1] == failed_statement
+    assert closed == ["cursor", "connection"]
+
+
+@pytest.mark.parametrize(
+    "failed_statement",
+    [
+        "STOP REPLICA",
+        "RESET REPLICA ALL",
+        "SET GLOBAL super_read_only=OFF",
+    ],
+)
+def test_rds_mysql_replication_detach_failure_rolls_channel_back_atomically(
+    monkeypatch,
+    failed_statement,
+):
+    from ministack.services import rds as m
+
+    topology = _mysql_replication_unit_topology()
+    writer, secondary, _writer_member, _secondary_member, _global = topology
+    _patch_mysql_replication_unit_topology(monkeypatch, m, topology)
+    secondary.update({
+        "_shared_storage_initialized": True,
+        "_mysql_replication_source_arn": writer["DBClusterArn"],
+    })
+    statements = []
+    failure_remaining = [True]
+
+    class FakeCursor:
+        def execute(self, statement, params=None):
+            statements.append((statement, params))
+            if statement == failed_statement and failure_remaining[0]:
+                failure_remaining[0] = False
+                raise RuntimeError(f"failed once: {statement}")
+
+        def close(self):
+            pass
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(m, "_ensure_mysql_replication_user", lambda _cluster: True)
+    monkeypatch.setattr(m, "_mysql_replication_connection", lambda _cluster: FakeConnection())
+
+    assert m._detach_mysql_replication("secondary", secondary) is False
+    assert "_mysql_replication_detach_state" not in secondary
+    assert secondary["_mysql_replication_source_arn"] == writer["DBClusterArn"]
+    rollback_statements = [statement for statement, _params in statements]
+    assert "CHANGE REPLICATION SOURCE TO " in rollback_statements[-3]
+    assert rollback_statements[-2:] == [
+        "START REPLICA",
+        "SET GLOBAL super_read_only=ON",
+    ]
+
+
+@pytest.mark.parametrize(
+    "rollback_failed_statement",
+    [
+        "START REPLICA",
+        "SET GLOBAL super_read_only=ON",
+    ],
+)
+def test_rds_mysql_replication_detach_partial_rollback_retries_from_requested(
+    monkeypatch,
+    rollback_failed_statement,
+):
+    from ministack.services import rds as m
+
+    topology = _mysql_replication_unit_topology()
+    writer, secondary, _writer_member, _secondary_member, _global = topology
+    _patch_mysql_replication_unit_topology(monkeypatch, m, topology)
+    secondary.update({
+        "_shared_storage_initialized": True,
+        "_mysql_replication_source_arn": writer["DBClusterArn"],
+    })
+    statements = []
+    failures = {
+        "SET GLOBAL super_read_only=OFF": 1,
+        rollback_failed_statement: 1,
+    }
+
+    class FakeCursor:
+        def execute(self, statement, params=None):
+            statements.append((statement, params))
+            if failures.get(statement, 0):
+                failures[statement] -= 1
+                raise RuntimeError(f"failed once: {statement}")
+
+        def close(self):
+            pass
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(m, "_ensure_mysql_replication_user", lambda _cluster: True)
+    monkeypatch.setattr(m, "_mysql_replication_connection", lambda _cluster: FakeConnection())
+
+    assert m._detach_mysql_replication("secondary", secondary) is False
+    assert secondary["_mysql_replication_detach_state"] == "requested"
+    assert secondary["_mysql_replication_source_arn"] == writer["DBClusterArn"]
+
+    retry_start = len(statements)
+    assert m._detach_mysql_replication("secondary", secondary) is True
+    assert [statement for statement, _params in statements[retry_start:]] == [
+        "STOP REPLICA",
+        "RESET REPLICA ALL",
+        "SET GLOBAL super_read_only=OFF",
+    ]
+    assert secondary["_mysql_replication_detach_state"] == "reset"
+
+
+def test_rds_remove_global_secondary_keeps_membership_when_detach_fails(
+    monkeypatch,
+):
+    from ministack.core.responses import (
+        get_account_id,
+        set_request_account_id,
+    )
+    from ministack.services import rds as m
+
+    writer, secondary, writer_member, secondary_member, global_cluster = (
+        _mysql_replication_unit_topology()
+    )
+    m._clusters.clear()
+    m._global_clusters.clear()
+    original_account = get_account_id()
+    try:
+        set_request_account_id("111111111111")
+        m._clusters.set_scoped(
+            "111111111111", "us-east-1", "primary", writer,
+        )
+        m._clusters.set_scoped(
+            "111111111111", "us-west-2", "secondary", secondary,
+        )
+        m._global_clusters["global-repl"] = global_cluster
+        monkeypatch.setattr(m, "_detach_mysql_replication", lambda *_args: False)
+
+        status, _, body = m._remove_from_global_cluster({
+            "GlobalClusterIdentifier": "global-repl",
+            "DbClusterIdentifier": secondary["DBClusterArn"],
+        })
+
+        assert status == 400
+        assert b"InvalidDBClusterStateFault" in body
+        assert global_cluster["GlobalClusterMembers"] == [
+            writer_member,
+            secondary_member,
+        ]
+        assert secondary["GlobalClusterIdentifier"] == "global-repl"
+    finally:
+        set_request_account_id(original_account)
+        m._clusters.clear()
+        m._global_clusters.clear()
+
+
+def test_rds_remove_headless_global_secondary_commits_detach_and_stops_applier(
+    monkeypatch,
+):
+    from ministack.core.responses import get_account_id, set_request_account_id
+    from ministack.services import rds as m
+
+    original_account = get_account_id()
+    account_id = "111111111111"
+    writer, secondary, writer_member, _secondary_member, global_cluster = (
+        _mysql_replication_unit_topology()
+    )
+    global_cluster.update({
+        "GlobalClusterArn": (
+            f"arn:aws:rds::{account_id}:global-cluster:global-repl"
+        ),
+        "GlobalClusterResourceId": "cluster-global-repl",
+        "Engine": "aurora-mysql",
+        "EngineVersion": DEFAULT_AURORA_MYSQL_ENGINE_VERSION,
+        "Status": "available",
+    })
+    secondary.update({
+        "DBClusterMembers": [],
+        "_shared_storage_initialized": True,
+        "_mysql_headless_applier_required": True,
+        "_mysql_replication_source_arn": writer["DBClusterArn"],
+        "_mysql_replication_detach_state": "reset",
+    })
+    stopped = []
+
+    m._clusters.clear()
+    m._global_clusters.clear()
+    try:
+        set_request_account_id(account_id)
+        m._clusters.set_scoped(account_id, "us-east-1", "primary", writer)
+        m._clusters.set_scoped(account_id, "us-west-2", "secondary", secondary)
+        m._global_clusters["global-repl"] = global_cluster
+        monkeypatch.setattr(m, "_detach_mysql_replication", lambda *_args: True)
+        monkeypatch.setattr(
+            m,
+            "_stop_empty_cluster_shared_container",
+            lambda cluster_id, cluster: stopped.append((cluster_id, cluster)),
+        )
+
+        status, _, body = m._remove_from_global_cluster({
+            "GlobalClusterIdentifier": "global-repl",
+            "DbClusterIdentifier": secondary["DBClusterArn"],
+        })
+
+        assert status == 200, body
+        assert global_cluster["GlobalClusterMembers"] == [writer_member]
+        assert "GlobalClusterIdentifier" not in secondary
+        assert "_mysql_headless_applier_required" not in secondary
+        assert "_mysql_replication_source_arn" not in secondary
+        assert "_mysql_replication_detach_state" not in secondary
+        assert stopped == [("secondary", secondary)]
+    finally:
+        set_request_account_id(original_account)
+        m._clusters.clear()
+        m._global_clusters.clear()
+
+
+def test_rds_mysql_writer_password_rotation_syncs_global_member_metadata(
+    monkeypatch,
+):
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import rds as m
+
+    writer, secondary, _writer_member, _secondary_member, global_cluster = (
+        _mysql_replication_unit_topology()
+    )
+    writer.update({
+        "MasterUsername": "admin",
+        "_MasterUserPassword": "old-password",
+        "Status": "available",
+        "Port": 3306,
+        "DBClusterMembers": [{"DBInstanceIdentifier": "writer-instance"}],
+        "_shared_container_id": "writer-container",
+    })
+    secondary.update({
+        "MasterUsername": "admin",
+        "_MasterUserPassword": "old-password",
+        "DBClusterMembers": [{"DBInstanceIdentifier": "secondary-instance"}],
+        "_shared_endpoint": {"Address": "secondary", "Port": 3306},
+    })
+    secondary_instance = {"DBInstanceIdentifier": "secondary-instance"}
+    m._clusters.clear()
+    m._global_clusters.clear()
+    m._instances.clear()
+    original_account = get_account_id()
+    original_region = get_region()
+    try:
+        set_request_account_id("111111111111")
+        set_request_region("us-east-1")
+        m._clusters.set_scoped(
+            "111111111111", "us-east-1", "primary", writer,
+        )
+        m._clusters.set_scoped(
+            "111111111111", "us-west-2", "secondary", secondary,
+        )
+        m._global_clusters["global-repl"] = global_cluster
+        m._instances.set_scoped(
+            "111111111111",
+            "us-west-2",
+            "secondary-instance",
+            secondary_instance,
+        )
+        monkeypatch.setattr(m, "_rotate_real_password", lambda *_args: True)
+
+        status, _, _body = m._modify_db_cluster({
+            "DBClusterIdentifier": "primary",
+            "MasterUserPassword": "new-password",
+        })
+
+        assert status == 200
+        assert writer["_MasterUserPassword"] == "new-password"
+        assert secondary["_MasterUserPassword"] == "new-password"
+        assert secondary_instance["_MasterUserPassword"] == "new-password"
+
+        set_request_region("us-west-2")
+        status, _, body = m._modify_db_cluster({
+            "DBClusterIdentifier": "secondary",
+            "MasterUserPassword": "secondary-only-password",
+        })
+        assert status == 400
+        assert b"InvalidDBClusterStateFault" in body
+        assert secondary["_MasterUserPassword"] == "new-password"
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+        m._instances.clear()
+        m._clusters.clear()
+        m._global_clusters.clear()
+
+
+@pytest.mark.parametrize("persisted_account", ["000000000000", "222222222222"])
+def test_rds_restore_syncs_stale_secondary_credentials_from_global_writer(
+    persisted_account,
+):
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        AccountScopedDict,
+        get_account_id,
+    )
+    from ministack.services import rds as m
+
+    active_account = get_account_id()
+    account_id = persisted_account
+    assert active_account == "000000000000"
+    writer_arn = f"arn:aws:rds:us-east-1:{account_id}:cluster:primary"
+    secondary_arn = f"arn:aws:rds:us-west-2:{account_id}:cluster:secondary"
+    writer = {
+        "DBClusterIdentifier": "primary",
+        "DBClusterArn": writer_arn,
+        "Engine": "aurora-mysql",
+        "EngineVersion": "8.0.mysql_aurora.3.10.3",
+        "GlobalClusterIdentifier": "global-repl",
+        "MasterUsername": "admin",
+        "_MasterUserPassword": "rotated-password",
+        "DatabaseName": "global_db",
+        "DBClusterMembers": [],
+    }
+    secondary = {
+        "DBClusterIdentifier": "secondary",
+        "DBClusterArn": secondary_arn,
+        "Engine": "aurora-mysql",
+        "EngineVersion": "8.0.mysql_aurora.3.10.3",
+        "GlobalClusterIdentifier": "global-repl",
+        "MasterUsername": "stale-admin",
+        "_MasterUserPassword": "stale-password",
+        "DatabaseName": "stale_db",
+        "DBClusterMembers": [],
+    }
+    clusters = AccountRegionScopedDict()
+    clusters.set_scoped(account_id, "us-east-1", "primary", writer)
+    clusters.set_scoped(account_id, "us-west-2", "secondary", secondary)
+    global_clusters = AccountScopedDict()
+    global_clusters.set_scoped(account_id, None, "global-repl", {
+        "GlobalClusterIdentifier": "global-repl",
+        "GlobalClusterMembers": [
+            {"DBClusterArn": writer_arn, "IsWriter": True},
+            {"DBClusterArn": secondary_arn, "IsWriter": False},
+        ],
+    })
+
+    m._instances.clear()
+    m._clusters.clear()
+    m._global_clusters.clear()
+    try:
+        m.restore_state({
+            "instances": AccountRegionScopedDict(),
+            "clusters": clusters,
+            "global_clusters": global_clusters,
+        })
+
+        restored_secondary = m._clusters.get_scoped(
+            account_id,
+            "us-west-2",
+            "secondary",
+        )
+        assert restored_secondary["MasterUsername"] == "admin"
+        assert restored_secondary["_MasterUserPassword"] == "rotated-password"
+        assert restored_secondary["DatabaseName"] == "global_db"
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+        m._global_clusters.clear()
+
+
+def test_rds_mysql_control_user_is_local_and_used_for_replica_sql(monkeypatch):
+    from ministack.services import rds as m
+
+    cluster = {"DBClusterIdentifier": "secondary"}
+    statements = []
+    connection_args = []
+
+    class FakeCursor:
+        def execute(self, statement, params=None):
+            statements.append((statement, params))
+
+        def close(self):
+            pass
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(m, "_mysql_admin_connection", lambda _cluster: FakeConnection())
+
+    assert m._ensure_mysql_control_user(cluster) is True
+    assert statements[0][0] == "SET SESSION sql_log_bin=0"
+    assert cluster["_mysql_control_user_ready"] is True
+
+    monkeypatch.setattr(
+        m,
+        "_mysql_cluster_connection",
+        lambda target, user, password: connection_args.append(
+            (target, user, password),
+        ) or FakeConnection(),
+    )
+    m._mysql_replication_connection(cluster)
+    assert connection_args == [
+        (cluster, m._MYSQL_CONTROL_USER, m._MYSQL_CONTROL_PASSWORD),
+    ]
+
+
+def _wait_for_replica_status(endpoint, timeout=120):
+    import pymysql
+
+    deadline = time.time() + timeout
+    last_status = None
+    while time.time() < deadline:
+        try:
+            with _aurora_connect(endpoint) as conn:
+                with conn.cursor(pymysql.cursors.DictCursor) as cursor:
+                    cursor.execute("SHOW REPLICA STATUS")
+                    last_status = cursor.fetchone()
+            if (
+                last_status
+                and last_status["Replica_IO_Running"] == "Yes"
+                and last_status["Replica_SQL_Running"] == "Yes"
+            ):
+                return last_status
+        except (pymysql.err.OperationalError, OSError):
+            pass
+        time.sleep(1)
+    pytest.fail(f"replica was not healthy after {timeout}s: {last_status!r}")
+
+
+def _wait_for_gtid(
+    writer_endpoint,
+    secondary_endpoint,
+    timeout=30,
+    password=PASSWORD,
+):
+    with _aurora_connect(writer_endpoint, password=password) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT @@GLOBAL.gtid_executed")
+            executed = cursor.fetchone()[0]
+    assert executed, "writer did not report an executed GTID set"
+
+    with _aurora_connect(secondary_endpoint, password=password) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT WAIT_FOR_EXECUTED_GTID_SET(%s, %s)",
+                (executed, timeout),
+            )
+            result = cursor.fetchone()[0]
+    assert result == 0, (
+        f"secondary did not execute writer GTID set within {timeout}s: "
+        f"result={result!r}, gtid={executed!r}"
+    )
+
+
+@pytest.mark.skipif(
+    not os.environ.get("DOCKER_NETWORK"),
+    reason="DOCKER_NETWORK not set -- live Aurora global replication",
+)
+def test_aurora_mysql_global_replication_replays_and_streams_rows():
+    import pymysql
+
+    east = _regional_rds("us-east-1")
+    west = _regional_rds("us-west-2")
+    suffix = uuid.uuid4().hex[:10]
+    global_id = f"global-repl-{suffix}"
+    primary_id = f"global-repl-primary-{suffix}"
+    primary_instance_id = f"{primary_id}-writer"
+    secondary_id = f"global-repl-secondary-{suffix}"
+    secondary_instance_id = f"{secondary_id}-reader"
+    engine_version = "8.0.mysql_aurora.3.10.3"
+    rotated_password = f"rotated-{suffix}"
+    primary_arn = None
+    secondary_arn = None
+
+    try:
+        primary = east.create_db_cluster(
+            DBClusterIdentifier=primary_id,
+            Engine="aurora-mysql",
+            EngineVersion=engine_version,
+            MasterUsername="admin",
+            MasterUserPassword=PASSWORD,
+            DatabaseName=DATABASE,
+        )["DBCluster"]
+        primary_arn = primary["DBClusterArn"]
+        east.create_db_instance(
+            DBInstanceIdentifier=primary_instance_id,
+            DBClusterIdentifier=primary_id,
+            DBInstanceClass="db.r6g.large",
+            Engine="aurora-mysql",
+        )
+        primary_instance = _wait_for_instance(east, primary_instance_id)
+
+        with _aurora_connect(primary_instance["Endpoint"]) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "CREATE TABLE global_replication_rows "
+                    "(id INT PRIMARY KEY, value VARCHAR(32))"
+                )
+                cursor.execute(
+                    "INSERT INTO global_replication_rows VALUES (1, 'before-link')"
+                )
+
+        east.create_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            SourceDBClusterIdentifier=primary_arn,
+        )
+        secondary = west.create_db_cluster(
+            DBClusterIdentifier=secondary_id,
+            Engine="aurora-mysql",
+            EngineVersion=engine_version,
+            GlobalClusterIdentifier=global_id,
+            MasterUsername="admin",
+            MasterUserPassword=PASSWORD,
+            DatabaseName=DATABASE,
+        )["DBCluster"]
+        secondary_arn = secondary["DBClusterArn"]
+        west.create_db_instance(
+            DBInstanceIdentifier=secondary_instance_id,
+            DBClusterIdentifier=secondary_id,
+            DBInstanceClass="db.r6g.large",
+            Engine="aurora-mysql",
+        )
+        secondary_instance = _wait_for_instance(west, secondary_instance_id)
+
+        replica_status = _wait_for_replica_status(secondary_instance["Endpoint"])
+        assert int(replica_status["Auto_Position"]) == 1
+        assert replica_status["Last_IO_Error"] == ""
+        assert replica_status["Last_SQL_Error"] == ""
+
+        _wait_for_gtid(
+            primary_instance["Endpoint"],
+            secondary_instance["Endpoint"],
+        )
+        with _aurora_connect(secondary_instance["Endpoint"]) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT id, value FROM global_replication_rows ORDER BY id")
+                assert cursor.fetchall() == ((1, "before-link"),)
+
+        with _aurora_connect(primary_instance["Endpoint"]) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO global_replication_rows VALUES (2, 'after-link')"
+                )
+        _wait_for_gtid(
+            primary_instance["Endpoint"],
+            secondary_instance["Endpoint"],
+        )
+        with _aurora_connect(secondary_instance["Endpoint"]) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT id, value FROM global_replication_rows ORDER BY id")
+                assert cursor.fetchall() == (
+                    (1, "before-link"),
+                    (2, "after-link"),
+                )
+                with pytest.raises(pymysql.err.OperationalError) as exc_info:
+                    cursor.execute(
+                        "INSERT INTO global_replication_rows VALUES (3, 'secondary-write')"
+                    )
+                assert exc_info.value.args[0] == 1290
+
+        with _aurora_connect(primary_instance["Endpoint"]) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO global_replication_rows VALUES (3, 'primary-write')"
+                )
+        _wait_for_gtid(
+            primary_instance["Endpoint"],
+            secondary_instance["Endpoint"],
+        )
+
+        east.modify_db_cluster(
+            DBClusterIdentifier=primary_id,
+            MasterUserPassword=rotated_password,
+        )
+        _wait_for_gtid(
+            primary_instance["Endpoint"],
+            secondary_instance["Endpoint"],
+            password=rotated_password,
+        )
+
+        # A global secondary without DB instances still owns synchronized
+        # storage.  The saved endpoint is intentionally used only as a direct
+        # test probe for MiniStack's internal applier after the public instance
+        # record is gone.
+        headless_applier_endpoint = secondary_instance["Endpoint"]
+        west.delete_db_instance(
+            DBInstanceIdentifier=secondary_instance_id,
+            SkipFinalSnapshot=True,
+        )
+        with pytest.raises(ClientError) as exc_info:
+            west.describe_db_instances(
+                DBInstanceIdentifier=secondary_instance_id,
+            )
+        assert exc_info.value.response["Error"]["Code"] == "DBInstanceNotFound"
+
+        with _aurora_connect(
+            primary_instance["Endpoint"],
+            password=rotated_password,
+        ) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO global_replication_rows VALUES "
+                    "(4, 'while-secondary-headless')"
+                )
+        _wait_for_gtid(
+            primary_instance["Endpoint"],
+            headless_applier_endpoint,
+            password=rotated_password,
+        )
+
+        east.remove_from_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            DbClusterIdentifier=secondary_arn,
+        )
+        west.create_db_instance(
+            DBInstanceIdentifier=secondary_instance_id,
+            DBClusterIdentifier=secondary_id,
+            DBInstanceClass="db.r6g.large",
+            Engine="aurora-mysql",
+        )
+        secondary_instance = _wait_for_instance(west, secondary_instance_id)
+        with _aurora_connect(
+            secondary_instance["Endpoint"],
+            password=rotated_password,
+        ) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO global_replication_rows VALUES "
+                    "(5, 'detached-secondary')"
+                )
+
+        with _aurora_connect(
+            primary_instance["Endpoint"],
+            password=rotated_password,
+        ) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO global_replication_rows VALUES (6, 'after-detach')"
+                )
+        time.sleep(2)
+        with _aurora_connect(
+            secondary_instance["Endpoint"],
+            password=rotated_password,
+        ) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT id, value FROM global_replication_rows ORDER BY id"
+                )
+                assert cursor.fetchall() == (
+                    (1, "before-link"),
+                    (2, "after-link"),
+                    (3, "primary-write"),
+                    (4, "while-secondary-headless"),
+                    (5, "detached-secondary"),
+                )
+    finally:
+        if secondary_arn:
+            _remove_global_member(east, global_id, secondary_arn)
+        if primary_arn:
+            _remove_global_member(east, global_id, primary_arn)
+        _delete_instance(west, secondary_instance_id)
+        _delete_instance(east, primary_instance_id)
+        _delete_cluster(west, secondary_id)
+        _delete_cluster(east, primary_id)
+        _delete_global_cluster(east, global_id)
