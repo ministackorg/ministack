@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **SQS — `QueueUrl` used a hardcoded `localhost` host, breaking Docker-executed Lambdas (#1152)** — a Node.js Lambda running under `LAMBDA_EXECUTOR=docker` could not post to SQS without hardcoding the endpoint in its client: the AWS JS SDK v3 SQS client uses the returned `QueueUrl` as its request endpoint (`useQueueUrlAsEndpoint`), and every URL was rendered as `http://localhost:4566/…`, which inside the Lambda container resolves to the container itself rather than the host running MiniStack, so the request failed with connection refused. `CreateQueue`, `GetQueueUrl`, and `ListQueues` now render `QueueUrl`(s) using the caller's incoming `Host` header (how they actually reached MiniStack, e.g. `host.docker.internal:4566`), the same approach LocalStack takes; internal queue state stays keyed on canonical URLs and lookups remain host-agnostic. An explicitly configured `MINISTACK_HOST` pins the host and disables the rewrite.
+
 ## [1.4.6] — 2026-07-24
 
 ### Added
