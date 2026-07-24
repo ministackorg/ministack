@@ -25,6 +25,7 @@ import urllib.parse
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     apply_image_prefix,
     error_response_json,
@@ -54,13 +55,13 @@ except ImportError:
 # State
 # ---------------------------------------------------------------------------
 
-_clusters = AccountScopedDict()       # name -> cluster record
-_nodegroups = AccountScopedDict()     # "cluster/nodegroup" -> nodegroup record
-_addons = AccountScopedDict()         # "cluster/addonName" -> addon record
-_access_entries = AccountScopedDict() # "cluster\x00principalArn" -> access entry record
-_access_policies = AccountScopedDict()# "cluster\x00principalArn\x00policyArn" -> associated policy
+_clusters = AccountRegionScopedDict()       # name -> cluster record
+_nodegroups = AccountRegionScopedDict()     # "cluster/nodegroup" -> nodegroup record
+_addons = AccountRegionScopedDict()         # "cluster/addonName" -> addon record
+_access_entries = AccountRegionScopedDict() # "cluster\x00principalArn" -> access entry record
+_access_policies = AccountRegionScopedDict()# "cluster\x00principalArn\x00policyArn" -> associated policy
 _tags = AccountScopedDict()           # arn -> {key: value}
-_idp_configs = AccountScopedDict()     # "cluster\x00idp_name" -> idp record
+_idp_configs = AccountRegionScopedDict()     # "cluster\x00idp_name" -> idp record
 _port_counter_lock = threading.Lock()
 _port_counter = [EKS_BASE_PORT]
 _oidc_keypair_lock = threading.Lock()
@@ -138,7 +139,7 @@ def reset():
 def get_state():
     clusters = copy.deepcopy(_clusters)
     # Strip Docker container IDs (not restorable across restarts)
-    if isinstance(clusters, AccountScopedDict):
+    if isinstance(clusters, AccountRegionScopedDict):
         for key in list(clusters._data):
             clusters._data[key].pop("_docker_id", None)
     else:
@@ -156,14 +157,55 @@ def get_state():
     }
 
 
+def _restore_cluster_child_store(store, restored, cluster_regions, separator):
+    """Adopt legacy child records into their parent cluster's region.
+
+    Legacy account-scoped EKS state allowed a request in one region to create
+    a child for a cluster created in another. Preserve that reachable parent /
+    child relationship instead of splitting the records by their individual
+    ARNs. Orphans retain the generic ARN-derived (or boot-region) fallback.
+    """
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+
+    if not restored:
+        return
+
+    if isinstance(restored, AccountScopedDict):
+        items = restored._data.items()
+    else:
+        account_id = get_account_id()
+        items = (((account_id, key), value) for key, value in restored.items())
+
+    for (account_id, key), value in items:
+        cluster_name = key.split(separator, 1)[0] if isinstance(key, str) else None
+        region = cluster_regions.get((account_id, cluster_name))
+        if region is None:
+            region = store._region_for_legacy_value(key, value)
+        store.set_scoped(account_id, region, key, value)
+
+
 def restore_state(data):
     _clusters.update(data.get("clusters", {}))
-    _nodegroups.update(data.get("nodegroups", {}))
-    _addons.update(data.get("addons", {}))
-    _access_entries.update(data.get("access_entries", {}))
-    _access_policies.update(data.get("access_policies", {}))
+    cluster_regions = {
+        (account_id, cluster_name): region
+        for (account_id, region, cluster_name), _cluster in _clusters.all_items()
+    }
+    for store, state_key, separator in (
+        (_nodegroups, "nodegroups", "/"),
+        (_addons, "addons", "/"),
+        (_access_entries, "access_entries", "\x00"),
+        (_access_policies, "access_policies", "\x00"),
+        (_idp_configs, "idp_configs", "\x00"),
+    ):
+        _restore_cluster_child_store(
+            store,
+            data.get(state_key, {}),
+            cluster_regions,
+            separator,
+        )
     _tags.update(data.get("tags", {}))
-    _idp_configs.update(data.get("idp_configs", {}))
     if "port_counter" in data:
         _port_counter[0] = data["port_counter"]
     # Restored clusters have no running k3s container. Drop the stale docker id and
@@ -176,7 +218,11 @@ def restore_state(data):
     # to_dict() yields every account's live record dict so the rewrite is applied
     # across all tenants — the account-scoped views (values()/items()) would see
     # only the default account because no request scope is set at import time.
-    clusters = _clusters.to_dict().values() if isinstance(_clusters, AccountScopedDict) else _clusters.values()
+    clusters = (
+        _clusters.to_dict().values()
+        if isinstance(_clusters, AccountRegionScopedDict)
+        else _clusters.values()
+    )
     for c in clusters:
         c["_docker_id"] = None
         port = c.get("_port")
@@ -325,7 +371,14 @@ def _collect_node_labels(cluster: dict) -> list[str]:
     return [f"--node-label={k}={v}" for k, v in labels.items()]
 
 
-def _k3s_run_kwargs(name: str, port: int, ms_network: str | None = None, oidc_args: list[str] | None = None, node_labels: list[str] | None = None) -> dict:
+def _k3s_run_kwargs(
+    name: str,
+    region: str,
+    port: int,
+    ms_network: str | None = None,
+    oidc_args: list[str] | None = None,
+    node_labels: list[str] | None = None,
+) -> dict:
     """Build the docker run kwargs for a k3s server container.
 
     `privileged=True` is required: k3s server mode remounts `/sys/fs/cgroup`,
@@ -362,8 +415,8 @@ def _k3s_run_kwargs(name: str, port: int, ms_network: str | None = None, oidc_ar
         security_opt=["seccomp=unconfined", "apparmor=unconfined"],
         devices=["/dev/fuse"],
         ports={"6443/tcp": port},
-        name=f"ministack-eks-{name}",
-        labels={"ministack": "eks", "cluster_name": name},
+        name=f"ministack-eks-{region}-{name}",
+        labels={"ministack": "eks", "cluster_name": name, "region": region},
         environment={"K3S_KUBECONFIG_MODE": "644"},
         volumes={"/lib/modules": {"bind": "/lib/modules", "mode": "ro"}},
         tmpfs={"/run": "", "/var/run": "", "/tmp": ""},
@@ -555,6 +608,7 @@ def _create_cluster(body):
     if cluster["tags"]:
         _tags[arn] = dict(cluster["tags"])
 
+    region = get_region()
     oidc_args, _idp_cfg_refs = _collect_oidc_state(name)
     node_labels = _collect_node_labels(cluster)
 
@@ -567,7 +621,14 @@ def _create_cluster(body):
         ms_network = None
         try:
             ms_network = _get_ministack_network(client)
-            run_kwargs = _k3s_run_kwargs(name=name, port=port, ms_network=ms_network, oidc_args=oidc_args, node_labels=node_labels)
+            run_kwargs = _k3s_run_kwargs(
+                name=name,
+                region=region,
+                port=port,
+                ms_network=ms_network,
+                oidc_args=oidc_args,
+                node_labels=node_labels,
+            )
 
             registries_yaml = _k3s_registries_yaml(client, ms_network, _ecr_registry_hosts(cluster))
             container = _start_k3s_container(client, run_kwargs, registries_yaml)
@@ -1022,9 +1083,9 @@ def _restart_k3s(cluster_name, oidc_args=None, idp_cfg_refs=None):
     """Restart the cluster's k3s container with the supplied OIDC args.
 
     Both ``oidc_args`` and ``idp_cfg_refs`` must be captured by the CALLER
-    inside the request context (where AccountScopedDict can resolve the
-    account). The background thread closes over them so it never needs the
-    request's contextvars.
+    inside the request context (where AccountRegionScopedDict can resolve the
+    account and region). The background thread closes over them so it never
+    needs the request's contextvars.
     """
     cluster = _clusters.get(cluster_name)
     if not cluster:
@@ -1038,6 +1099,7 @@ def _restart_k3s(cluster_name, oidc_args=None, idp_cfg_refs=None):
     # only.
     oidc_args = oidc_args or []
     idp_cfg_refs = idp_cfg_refs or []
+    region = get_region()
     node_labels = _collect_node_labels(cluster)
 
     def _mark_idp_active():
@@ -1058,7 +1120,14 @@ def _restart_k3s(cluster_name, oidc_args=None, idp_cfg_refs=None):
                 cluster["_docker_id"] = None
 
             ms_network = _get_ministack_network(client)
-            run_kwargs = _k3s_run_kwargs(name=cluster_name, port=cluster["_port"], ms_network=ms_network, oidc_args=oidc_args, node_labels=node_labels)
+            run_kwargs = _k3s_run_kwargs(
+                name=cluster_name,
+                region=region,
+                port=cluster["_port"],
+                ms_network=ms_network,
+                oidc_args=oidc_args,
+                node_labels=node_labels,
+            )
 
             registries_yaml = _k3s_registries_yaml(client, ms_network, _ecr_registry_hosts(cluster))
             container = _start_k3s_container(client, run_kwargs, registries_yaml)
@@ -1257,15 +1326,19 @@ def _resolve_tag_resource_arn(arn):
         spec.partition != "aws"
         or spec.service != "eks"
         or spec.account_id != get_account_id()
-        or spec.region != get_region()
     ):
         return None, _invalid_tag_resource_arn(arn)
 
+    request_region = get_region()
     parts = spec.resource.split("/")
     resource_type = parts[0] if parts else ""
 
+    # Legacy account-scoped state could create a child in a different region
+    # from its parent. Restore co-locates those children with the parent while
+    # preserving their ARN (and the ARN-keyed persisted tags). Accept that
+    # exact ARN only when the child exists in the current scoped store.
     if resource_type == "cluster":
-        if len(parts) != 2 or not parts[1]:
+        if len(parts) != 2 or not parts[1] or spec.region != request_region:
             return None, _invalid_tag_resource_arn(arn)
         cluster = _clusters.get(parts[1])
         if not cluster or cluster.get("arn") != arn:
@@ -1277,6 +1350,8 @@ def _resolve_tag_resource_arn(arn):
             return None, _invalid_tag_resource_arn(arn)
         nodegroup = _nodegroups.get(f"{parts[1]}/{parts[2]}")
         if not nodegroup or nodegroup.get("nodegroupArn") != arn:
+            if spec.region != request_region:
+                return None, _invalid_tag_resource_arn(arn)
             return None, _tag_resource_not_found(arn)
         return nodegroup["nodegroupArn"], None
 
@@ -1285,6 +1360,8 @@ def _resolve_tag_resource_arn(arn):
             return None, _invalid_tag_resource_arn(arn)
         addon = _addons.get(f"{parts[1]}/{parts[2]}")
         if not addon or addon.get("addonArn") != arn:
+            if spec.region != request_region:
+                return None, _invalid_tag_resource_arn(arn)
             return None, _tag_resource_not_found(arn)
         return addon["addonArn"], None
 
@@ -1294,6 +1371,8 @@ def _resolve_tag_resource_arn(arn):
         for entry in _access_entries.values():
             if entry.get("clusterName") == parts[1] and entry.get("accessEntryArn") == arn:
                 return entry["accessEntryArn"], None
+        if spec.region != request_region:
+            return None, _invalid_tag_resource_arn(arn)
         return None, _tag_resource_not_found(arn)
 
     if resource_type == "identityproviderconfig":
@@ -1301,6 +1380,8 @@ def _resolve_tag_resource_arn(arn):
             return None, _invalid_tag_resource_arn(arn)
         cfg = _idp_configs.get(f"{parts[1]}\x00{parts[3]}")
         if not cfg or cfg.get("arn") != arn:
+            if spec.region != request_region:
+                return None, _invalid_tag_resource_arn(arn)
             return None, _tag_resource_not_found(arn)
         return cfg["arn"], None
 

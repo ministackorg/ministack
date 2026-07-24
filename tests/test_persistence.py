@@ -500,6 +500,297 @@ def test_eks_round_trip():
     _round_trip("eks", "eks", populate, observe)
 
 
+def test_eks_access_policies_round_trip_outside_boot_region():
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    boot_region = "us-east-1"
+    resource_region = "us-west-2"
+    cluster_name = "regional-cluster"
+    principal_arn = f"arn:aws:iam::{account_id}:role/regional-role"
+    entry_key = f"{cluster_name}\x00{principal_arn}"
+    policy_arn = (
+        "arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy"
+    )
+    policy_key = f"{entry_key}\x00{policy_arn}"
+    mod = _module("eks")
+
+    def populate(mod):
+        mod._access_entries.set_scoped(
+            account_id,
+            resource_region,
+            entry_key,
+            {
+                "clusterName": cluster_name,
+                "principalArn": principal_arn,
+                "accessEntryArn": (
+                    f"arn:aws:eks:{resource_region}:{account_id}:"
+                    f"access-entry/{cluster_name}/role/{account_id}/"
+                    "regional-role/id"
+                ),
+            },
+        )
+        mod._access_policies.set_scoped(
+            account_id,
+            resource_region,
+            policy_key,
+            {
+                "policyArn": policy_arn,
+                "accessScope": {"type": "cluster", "namespaces": []},
+            },
+        )
+        # Restore below runs in the boot scope, where this west-only store is
+        # false even though it contains persisted data in another region.
+        set_request_region(boot_region)
+
+    def observe(mod):
+        assert mod._access_policies.contains_scoped(
+            account_id, resource_region, policy_key
+        )
+        assert not mod._access_policies.contains_scoped(
+            account_id, boot_region, policy_key
+        )
+
+    try:
+        set_request_account_id(account_id)
+        set_request_region(resource_region)
+        _round_trip("eks", "eks", populate, observe)
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_eks_legacy_state_uses_arn_and_parent_regions():
+    import json as _json
+
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import eks as mod
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    boot_region = "us-east-1"
+    parent_region = "us-west-2"
+    child_arn_region = "eu-west-1"
+    cluster_name = "legacy-cluster"
+    principal_arn = f"arn:aws:iam::{account_id}:role/legacy-role"
+    entry_key = f"{cluster_name}\x00{principal_arn}"
+    policy_arn = (
+        "arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy"
+    )
+    policy_key = f"{entry_key}\x00{policy_arn}"
+    orphan_key = f"orphan-cluster\x00{principal_arn}\x00{policy_arn}"
+
+    legacy_clusters = AccountScopedDict()
+    legacy_clusters._data[(account_id, cluster_name)] = {
+        "name": cluster_name,
+        "arn": (
+            f"arn:aws:eks:{parent_region}:{account_id}:"
+            f"cluster/{cluster_name}"
+        ),
+        "status": "ACTIVE",
+        "_port": 16443,
+        "_docker_id": "stale-container",
+    }
+    legacy_entries = AccountScopedDict()
+    legacy_entries._data[(account_id, entry_key)] = {
+        "clusterName": cluster_name,
+        "principalArn": principal_arn,
+        "accessEntryArn": (
+            f"arn:aws:eks:{child_arn_region}:{account_id}:"
+            f"access-entry/{cluster_name}/legacy-entry-id"
+        ),
+    }
+    nodegroup_key = f"{cluster_name}/legacy-workers"
+    legacy_nodegroups = AccountScopedDict()
+    legacy_nodegroups._data[(account_id, nodegroup_key)] = {
+        "clusterName": cluster_name,
+        "nodegroupName": "legacy-workers",
+        "nodegroupArn": (
+            f"arn:aws:eks:{child_arn_region}:{account_id}:"
+            f"nodegroup/{cluster_name}/legacy-workers/id"
+        ),
+    }
+    addon_key = f"{cluster_name}/vpc-cni"
+    legacy_addons = AccountScopedDict()
+    legacy_addons._data[(account_id, addon_key)] = {
+        "clusterName": cluster_name,
+        "addonName": "vpc-cni",
+        "addonArn": (
+            f"arn:aws:eks:{child_arn_region}:{account_id}:"
+            f"addon/{cluster_name}/vpc-cni/id"
+        ),
+    }
+    legacy_policies = AccountScopedDict()
+    legacy_policies._data[(account_id, policy_key)] = {
+        "policyArn": policy_arn,
+        "accessScope": {"type": "cluster", "namespaces": []},
+    }
+    legacy_policies._data[(account_id, orphan_key)] = {
+        "policyArn": policy_arn,
+        "accessScope": {"type": "cluster", "namespaces": []},
+    }
+    idp_key = f"{cluster_name}\x00legacy-idp"
+    legacy_idp_configs = AccountScopedDict()
+    legacy_idp_configs._data[(account_id, idp_key)] = {
+        "clusterName": cluster_name,
+        "name": "legacy-idp",
+        "oidc": {
+            "clientId": "legacy-client",
+            "issuerUrl": "https://legacy.example.test",
+        },
+        "arn": (
+            f"arn:aws:eks:{child_arn_region}:{account_id}:"
+            f"identityproviderconfig/{cluster_name}/oidc/legacy-idp/id"
+        ),
+    }
+    child_arns = (
+        legacy_nodegroups._data[(account_id, nodegroup_key)]["nodegroupArn"],
+        legacy_addons._data[(account_id, addon_key)]["addonArn"],
+        legacy_entries._data[(account_id, entry_key)]["accessEntryArn"],
+        legacy_idp_configs._data[(account_id, idp_key)]["arn"],
+    )
+    legacy_tags = AccountScopedDict()
+    for child_arn in child_arns:
+        legacy_tags._data[(account_id, child_arn)] = {"legacy": "true"}
+
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        mod.restore_state(
+            {
+                "clusters": legacy_clusters,
+                "nodegroups": legacy_nodegroups,
+                "addons": legacy_addons,
+                "access_entries": legacy_entries,
+                "access_policies": legacy_policies,
+                "idp_configs": legacy_idp_configs,
+                "tags": legacy_tags,
+            }
+        )
+
+        cluster = mod._clusters.get_scoped(
+            account_id, parent_region, cluster_name
+        )
+        assert cluster["_docker_id"] is None
+        assert cluster["endpoint"] == "https://localhost:16443"
+        assert mod._access_entries.contains_scoped(
+            account_id, parent_region, entry_key
+        )
+        assert mod._nodegroups.contains_scoped(
+            account_id, parent_region, nodegroup_key
+        )
+        assert mod._addons.contains_scoped(
+            account_id, parent_region, addon_key
+        )
+        assert mod._access_policies.contains_scoped(
+            account_id, parent_region, policy_key
+        )
+        assert not mod._access_policies.contains_scoped(
+            account_id, boot_region, policy_key
+        )
+        assert mod._access_policies.contains_scoped(
+            account_id, boot_region, orphan_key
+        )
+        assert mod._idp_configs.contains_scoped(
+            account_id, parent_region, idp_key
+        )
+        for store, key in (
+            (mod._nodegroups, nodegroup_key),
+            (mod._addons, addon_key),
+            (mod._access_entries, entry_key),
+            (mod._access_policies, policy_key),
+            (mod._idp_configs, idp_key),
+        ):
+            assert not store.contains_scoped(account_id, child_arn_region, key)
+
+        # The legacy child records remain reachable through their normal API
+        # paths in the restored parent region even though their persisted ARNs
+        # were minted by cross-region legacy requests.
+        set_request_region(parent_region)
+        status, _, body = mod._list_nodegroups(cluster_name, {})
+        assert status == 200
+        assert _json.loads(body)["nodegroups"] == ["legacy-workers"]
+        status, _, body = mod._describe_nodegroup(
+            cluster_name, "legacy-workers"
+        )
+        assert status == 200
+        assert _json.loads(body)["nodegroup"]["nodegroupName"] == "legacy-workers"
+
+        status, _, body = mod._list_addons(cluster_name, {})
+        assert status == 200
+        assert _json.loads(body)["addons"] == ["vpc-cni"]
+        status, _, body = mod._describe_addon(cluster_name, "vpc-cni")
+        assert status == 200
+        assert _json.loads(body)["addon"]["addonName"] == "vpc-cni"
+
+        status, _, body = mod._list_access_entries(cluster_name, {})
+        assert status == 200
+        assert _json.loads(body)["accessEntries"] == [principal_arn]
+        status, _, body = mod._list_associated_access_policies(
+            cluster_name, principal_arn, {}
+        )
+        assert status == 200
+        assert _json.loads(body)["associatedAccessPolicies"][0][
+            "policyArn"
+        ] == policy_arn
+
+        status, _, body = mod._describe_identity_provider_config(
+            cluster_name,
+            {
+                "identityProviderConfig": {
+                    "type": "oidc",
+                    "name": "legacy-idp",
+                }
+            },
+        )
+        assert status == 200
+        assert _json.loads(body)["identityProviderConfig"]["oidc"][
+            "identityProviderConfigName"
+        ] == "legacy-idp"
+
+        # Tag APIs accept the original child ARN in the region where migration
+        # co-located the child with its parent. Keep that persisted ARN as the
+        # tag-store key so legacy tags survive the round trip.
+        for child_arn in child_arns:
+            status, _, body = mod._list_tags(child_arn)
+            assert status == 200
+            assert _json.loads(body)["tags"] == {"legacy": "true"}
+
+        nodegroup_arn = child_arns[0]
+        status, _, _body = mod._tag_resource(
+            nodegroup_arn, {"tags": {"owner": "platform"}}
+        )
+        assert status == 200
+        status, _, _body = mod._untag_resource(
+            nodegroup_arn, {"tagKeys": ["legacy"]}
+        )
+        assert status == 200
+        status, _, body = mod._list_tags(nodegroup_arn)
+        assert status == 200
+        assert _json.loads(body)["tags"] == {"owner": "platform"}
+        assert mod._tags.get(nodegroup_arn) == {"owner": "platform"}
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_scheduler_round_trip():
     # Production code keys _schedules by `f"{group}/{name}"` strings (see
     # scheduler.py CreateSchedule etc.), not tuples — even though the
@@ -1866,6 +2157,41 @@ def test_appsync_region_scoped_state_is_rejected_by_v2_reader(
     # Simulate the previous binary, whose highest understood format is v2.
     monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
     assert persistence.load_state("appsync") is None
+
+
+def test_eks_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject EKS regional state instead of dropping it."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    clusters = AccountRegionScopedDict()
+    clusters.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-cluster",
+        {
+            "name": "regional-cluster",
+            "arn": (
+                "arn:aws:eks:us-west-2:000000000000:"
+                "cluster/regional-cluster"
+            ),
+        },
+    )
+    persistence.save_state("eks", {"clusters": clusters})
+
+    raw = _json.loads((tmp_path / "eks.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_clusters = persistence.load_state("eks")["clusters"]
+    assert loaded_clusters.get_scoped(
+        "000000000000", "us-west-2", "regional-cluster"
+    )["arn"].endswith("cluster/regional-cluster")
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("eks") is None
 
 
 def test_emr_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
