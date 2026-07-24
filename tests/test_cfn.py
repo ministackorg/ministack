@@ -1994,6 +1994,56 @@ def test_cfn_appsync_function_configuration_attributes(cfn, appsync):
             pass
         appsync.delete_graphql_api(apiId=api_id)
 
+
+def test_cfn_ec2_vpc_endpoint_uses_ec2_state(cfn, ec2):
+    """CloudFormation VPC endpoints share the EC2 API state and expose their ID."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-vpce-{suffix}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Vpc": {
+                "Type": "AWS::EC2::VPC",
+                "Properties": {"CidrBlock": "10.40.0.0/16"},
+            },
+            "Endpoint": {
+                "Type": "AWS::EC2::VPCEndpoint",
+                "Properties": {
+                    "VpcEndpointType": "Gateway",
+                    "VpcId": {"Ref": "Vpc"},
+                    "ServiceName": "com.amazonaws.us-east-1.s3",
+                    "Tags": [{"Key": "source", "Value": "cloudformation"}],
+                },
+            },
+        },
+        "Outputs": {
+            "RefId": {"Value": {"Ref": "Endpoint"}},
+            "GetAttId": {"Value": {"Fn::GetAtt": ["Endpoint", "Id"]}},
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+    assert outputs["RefId"] == outputs["GetAttId"]
+    assert outputs["RefId"].startswith("vpce-")
+
+    endpoints = ec2.describe_vpc_endpoints(
+        VpcEndpointIds=[outputs["RefId"]]
+    )["VpcEndpoints"]
+    assert len(endpoints) == 1
+    assert endpoints[0]["VpcEndpointId"] == outputs["RefId"]
+    assert endpoints[0]["ServiceName"] == "com.amazonaws.us-east-1.s3"
+    assert endpoints[0]["Tags"] == [{"Key": "source", "Value": "cloudformation"}]
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+    assert ec2.describe_vpc_endpoints(
+        VpcEndpointIds=[outputs["RefId"]]
+    )["VpcEndpoints"] == []
+
+
 def test_cfn_elbv2_load_balancer_and_listener(cfn, elbv2):
     """CloudFormation provisions ELBv2 LoadBalancer + Listener and cleans both on delete."""
     uid = _uuid_mod.uuid4().hex[:8]
@@ -5213,6 +5263,67 @@ def test_cfn_apigateway_request_validator_identity(cfn, apigw_v1):
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
         assert physical_id() != created_id
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        except ClientError:
+            pass
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_cfn_apigateway_documentation_version_lifecycle(cfn, apigw_v1):
+    """DocumentationVersion has a stable CFN identity and supports replacement."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-documentation-version-{suffix}"
+    api_id = apigw_v1.create_rest_api(name=f"documentation-version-{suffix}")["id"]
+
+    def template(version, description):
+        return {
+            "Resources": {
+                "DocumentationVersion": {
+                    "Type": "AWS::ApiGateway::DocumentationVersion",
+                    "Properties": {
+                        "RestApiId": api_id,
+                        "DocumentationVersion": version,
+                        "Description": description,
+                    },
+                },
+            },
+        }
+
+    def physical_id():
+        detail = cfn.describe_stack_resource(
+            StackName=stack_name,
+            LogicalResourceId="DocumentationVersion",
+        )["StackResourceDetail"]
+        return detail["PhysicalResourceId"]
+
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("v1", "Created")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        created_id = physical_id()
+        assert created_id == f"{api_id}/v1"
+
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("v1", "Updated")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() == created_id
+
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("v2", "Replacement")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() == f"{api_id}/v2"
     finally:
         try:
             cfn.delete_stack(StackName=stack_name)

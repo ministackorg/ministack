@@ -8420,3 +8420,58 @@ def test_lambda_durable_resume_captures_region_and_account():
         d._executions._data.pop(("111111111111", arn), None)
         _request_account_id.reset(tok_a)
         _request_region.reset(tok_r)
+
+
+def test_rewrite_host_for_container_rewrites_localhost():
+    from ministack.services.lambda_svc import _rewrite_host_for_container as rw
+    assert rw("http://localhost:4566/_ministack/cfn-response/tok") == \
+        "http://host.docker.internal:4566/_ministack/cfn-response/tok"
+    assert rw("http://127.0.0.1:4566/x") == "http://host.docker.internal:4566/x"
+    # Explicit Docker-network hostnames and empty values are left untouched.
+    assert rw("http://ministack:4566/x") == "http://ministack:4566/x"
+    assert rw("http://host.docker.internal:4566/x") == "http://host.docker.internal:4566/x"
+    assert rw("") == ""
+
+
+def test_invoke_rie_rewrites_custom_resource_response_url():
+    """Regression for #1149: a docker-executed custom resource's ResponseURL
+    (default localhost) must be rewritten to host.docker.internal before the
+    event is POSTed to the RIE, or the callback hits the container itself and
+    the stack hangs to ServiceTimeout."""
+    from ministack.services.lambda_svc import _invoke_rie
+
+    class _FakeContainer:
+        status = "running"
+        attrs = {"NetworkSettings": {"Networks": {}}}
+        ports = {"8080/tcp": [{"HostPort": "12345"}]}
+
+        def reload(self):
+            pass
+
+        def logs(self, **_kw):
+            return b""
+
+    class _FakeResp:
+        headers = {}
+
+        def read(self):
+            return json.dumps({"Status": "SUCCESS"}).encode()
+
+    captured = {}
+
+    def _fake_urlopen(req, timeout=None):
+        captured["body"] = json.loads(req.data.decode())
+        return _FakeResp()
+
+    event = {
+        "RequestType": "Create",
+        "ResponseURL": "http://localhost:4566/_ministack/cfn-response/tok",
+        "ResourceProperties": {},
+    }
+    with patch("urllib.request.urlopen", _fake_urlopen):
+        _invoke_rie(_FakeContainer(), event, timeout=5)
+
+    assert captured["body"]["ResponseURL"] == \
+        "http://host.docker.internal:4566/_ministack/cfn-response/tok"
+    # The caller's event dict must not be mutated in place.
+    assert event["ResponseURL"] == "http://localhost:4566/_ministack/cfn-response/tok"

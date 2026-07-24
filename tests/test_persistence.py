@@ -2078,6 +2078,219 @@ def test_batch_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_pat
     assert persistence.load_state("batch") is None
 
 
+def test_autoscaling_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject Auto Scaling's regional schema instead
+    of accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    asgs = AccountRegionScopedDict()
+    asgs.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-asg",
+        {
+            "AutoScalingGroupARN": (
+                "arn:aws:autoscaling:us-west-2:000000000000:"
+                "autoScalingGroup:regional:autoScalingGroupName/regional-asg"
+            )
+        },
+    )
+    persistence.save_state("autoscaling", {"asgs": asgs})
+
+    raw = _json.loads((tmp_path / "autoscaling.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_asgs = persistence.load_state("autoscaling")["asgs"]
+    assert loaded_asgs.get_scoped(
+        "000000000000", "us-west-2", "regional-asg"
+    )["AutoScalingGroupARN"].endswith("autoScalingGroupName/regional-asg")
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("autoscaling") is None
+
+
+def test_athena_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject Athena's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    workgroups = AccountRegionScopedDict()
+    workgroups.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-workgroup",
+        {"Name": "regional-workgroup", "Description": "west"},
+    )
+    persistence.save_state("athena", {"_workgroups": workgroups})
+
+    raw = _json.loads((tmp_path / "athena.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_workgroups = persistence.load_state("athena")["_workgroups"]
+    assert loaded_workgroups.get_scoped(
+        "000000000000", "us-west-2", "regional-workgroup"
+    )["Description"] == "west"
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("athena") is None
+
+
+def test_inspector2_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject Inspector2 regional account buckets."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    configs = AccountRegionScopedDict()
+    configs.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "000000000000",
+        {"ecr": {"status": "ENABLED"}},
+    )
+    persistence.save_state("inspector2", {"account_config": configs})
+
+    raw = _json.loads((tmp_path / "inspector2.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded = persistence.load_state("inspector2")["account_config"]
+    assert loaded.get_scoped(
+        "000000000000", "us-west-2", "000000000000"
+    ) == {"ecr": {"status": "ENABLED"}}
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("inspector2") is None
+
+
+def test_efs_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject EFS regional state instead of dropping it."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    file_systems = AccountRegionScopedDict()
+    file_systems.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "fs-11111111111111111",
+        {
+            "FileSystemId": "fs-11111111111111111",
+            "FileSystemArn": (
+                "arn:aws:elasticfilesystem:us-west-2:000000000000:"
+                "file-system/fs-11111111111111111"
+            ),
+        },
+    )
+    persistence.save_state("efs", {"file_systems": file_systems})
+
+    raw = _json.loads((tmp_path / "efs.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded = persistence.load_state("efs")["file_systems"]
+    assert loaded.get_scoped(
+        "000000000000", "us-west-2", "fs-11111111111111111"
+    )["FileSystemId"] == "fs-11111111111111111"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("efs") is None
+
+
+def test_s3files_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject S3 Files' regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    file_systems = AccountRegionScopedDict()
+    file_systems.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "fs-11111111111111111",
+        {
+            "fileSystemId": "fs-11111111111111111",
+            "fileSystemArn": (
+                "arn:aws:s3files:us-west-2:000000000000:"
+                "file-system/fs-11111111111111111"
+            ),
+        },
+    )
+    persistence.save_state("s3files", {"file_systems": file_systems})
+
+    raw = _json.loads((tmp_path / "s3files.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_file_systems = persistence.load_state("s3files")["file_systems"]
+    assert loaded_file_systems.get_scoped(
+        "000000000000", "us-west-2", "fs-11111111111111111"
+    )["fileSystemId"] == "fs-11111111111111111"
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("s3files") is None
+
+
+def test_servicediscovery_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject Cloud Map's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    namespaces = AccountRegionScopedDict()
+    namespaces.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "ns-regional",
+        {
+            "Arn": (
+                "arn:aws:servicediscovery:us-west-2:000000000000:"
+                "namespace/ns-regional"
+            )
+        },
+    )
+    persistence.save_state("servicediscovery", {"namespaces": namespaces})
+
+    raw = _json.loads((tmp_path / "servicediscovery.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_namespaces = persistence.load_state("servicediscovery")["namespaces"]
+    assert loaded_namespaces.get_scoped(
+        "000000000000", "us-west-2", "ns-regional"
+    )["Arn"].endswith("namespace/ns-regional")
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("servicediscovery") is None
+
+
 def test_batch_persistence_lifecycle_restores_regional_state(monkeypatch, tmp_path):
     """The gateway save map and Batch import-time restore must preserve state
     outside the ambient boot region across a process-shaped reload."""

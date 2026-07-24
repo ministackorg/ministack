@@ -995,6 +995,18 @@ def _normalize_endpoint_url(value: str) -> str:
     return f"http://{host}"
 
 
+def _rewrite_host_for_container(url: str) -> str:
+    """Rewrite a ``localhost``/``127.0.0.1`` URL to ``host.docker.internal`` so a
+    Docker Lambda container can reach ministack on the host. Explicitly
+    configured hosts (e.g. a Docker-network name) are left untouched."""
+    if not url:
+        return url
+    for host in ("localhost", "127.0.0.1"):
+        url = url.replace(f"://{host}:", "://host.docker.internal:")
+        url = url.replace(f"://{host}/", "://host.docker.internal/")
+    return url
+
+
 def _fetch_code_from_s3(bucket: str, key: str, version_id: str | None = None) -> bytes | None:
     """Fetch Lambda code zip from the in-memory S3 service.
 
@@ -3085,6 +3097,13 @@ def _docker_cp_dir(container, src_dir: str, dest_dir: str, arcname: str = "."):
 def _invoke_rie(container, event: dict, timeout: int) -> dict:
     """POST event to a running RIE container's HTTP endpoint."""
     import urllib.request
+    # A CloudFormation custom-resource ResponseURL points at ministack on the
+    # host; rewrite localhost/127.0.0.1 to host.docker.internal so the callback
+    # is reachable from inside the container (issue #1149), consistent with the
+    # AWS_ENDPOINT_URL rewrite. Without this the PUT fails with ConnectionRefused
+    # and the stack hangs on the custom resource until ServiceTimeout.
+    if isinstance(event, dict) and event.get("ResponseURL"):
+        event = {**event, "ResponseURL": _rewrite_host_for_container(event["ResponseURL"])}
     max_attempts = int(timeout * 10) + 20
     for _attempt in range(max_attempts):
         container.reload()
@@ -3346,10 +3365,7 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
         endpoint = f"http://host.docker.internal:{port}"
     else:
         # Rewrite localhost/127.0.0.1 → host.docker.internal for container access
-        endpoint = endpoint.replace("://localhost:", "://host.docker.internal:")
-        endpoint = endpoint.replace("://localhost/", "://host.docker.internal/")
-        endpoint = endpoint.replace("://127.0.0.1:", "://host.docker.internal:")
-        endpoint = endpoint.replace("://127.0.0.1/", "://host.docker.internal/")
+        endpoint = _rewrite_host_for_container(endpoint)
     container_env["AWS_ENDPOINT_URL"] = endpoint
 
     # Mounts (Zip only — Image bakes code in). Layers are NEVER bind-mounted:
