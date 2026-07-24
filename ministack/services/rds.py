@@ -93,10 +93,11 @@ _MYSQL_CONTROL_USER = "rdsadmin"
 _MYSQL_CONTROL_PASSWORD = "ministack-rds-control"
 _MYSQL_REPLICATION_RETRY_ATTEMPTS = 60
 _MYSQL_REPLICATION_RETRY_INTERVAL = 1
-_MYSQL_BINLOG_RETENTION_SECONDS = max(
-    1,
-    int(os.environ.get("RDS_MYSQL_BINLOG_RETENTION_SECONDS", "604800")),
-)
+# Internal binlog retention for the local MySQL container, long enough for
+# replicas to catch up. Not an AWS-facing knob: Aurora exposes retention per
+# cluster through the mysql.rds_set_configuration stored procedure (hours),
+# not an environment variable.
+_MYSQL_BINLOG_RETENTION_SECONDS = 604800  # 7 days
 
 # Aurora MySQL versions are the creatable set returned by AWS RDS as of
 # 2026-07-09. Refresh with:
