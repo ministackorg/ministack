@@ -160,7 +160,7 @@ Since 1.4.0 state is additionally isolated per **region** — see [Multi-Region]
 | `111111111111` | `111111111111` |
 | `048408301323` | `048408301323` |
 | `test` | `000000000000` (default) |
-| `AKIAIOSFODNN7EXAMPLE` | `000000000000` (default) |
+| `AKIA_TEST_KEY_DO_NOT_USE` | `000000000000` (default) |
 
 **Terraform** — set `access_key` in your provider block:
 ```hcl
@@ -963,9 +963,10 @@ aws --endpoint-url=http://localhost:4566 eks create-cluster \
   --name my-cluster --role-arn arn:aws:iam::000000000000:role/eks \
   --resources-vpc-config subnetIds=subnet-1
 
-# Get the k3s kubeconfig (container name follows ministack-eks-{name} pattern)
-docker exec ministack-eks-my-cluster cat /etc/rancher/k3s/k3s.yaml \
-  | sed "s/127.0.0.1:6443/localhost:$(docker port ministack-eks-my-cluster 6443/tcp | cut -d: -f2)/" \
+# Get the k3s kubeconfig (container name follows
+# ministack-eks-{region}-{name}; this example uses eu-central-1)
+docker exec ministack-eks-eu-central-1-my-cluster cat /etc/rancher/k3s/k3s.yaml \
+  | sed "s/127.0.0.1:6443/localhost:$(docker port ministack-eks-eu-central-1-my-cluster 6443/tcp | cut -d: -f2)/" \
   > /tmp/ministack-kubeconfig.yaml
 
 # Use kubectl against real Kubernetes

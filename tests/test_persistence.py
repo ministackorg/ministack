@@ -612,7 +612,7 @@ def test_eks_legacy_state_uses_arn_and_parent_regions():
         "principalArn": principal_arn,
         "accessEntryArn": (
             f"arn:aws:eks:{child_arn_region}:{account_id}:"
-            f"access-entry/{cluster_name}/role/{account_id}/legacy-role/id"
+            f"access-entry/{cluster_name}/legacy-entry-id"
         ),
     }
     nodegroup_key = f"{cluster_name}/legacy-workers"
@@ -655,9 +655,18 @@ def test_eks_legacy_state_uses_arn_and_parent_regions():
         },
         "arn": (
             f"arn:aws:eks:{child_arn_region}:{account_id}:"
-            f"identityproviderconfig/{cluster_name}/oidc/legacy-idp"
+            f"identityproviderconfig/{cluster_name}/oidc/legacy-idp/id"
         ),
     }
+    child_arns = (
+        legacy_nodegroups._data[(account_id, nodegroup_key)]["nodegroupArn"],
+        legacy_addons._data[(account_id, addon_key)]["addonArn"],
+        legacy_entries._data[(account_id, entry_key)]["accessEntryArn"],
+        legacy_idp_configs._data[(account_id, idp_key)]["arn"],
+    )
+    legacy_tags = AccountScopedDict()
+    for child_arn in child_arns:
+        legacy_tags._data[(account_id, child_arn)] = {"legacy": "true"}
 
     mod.reset()
     try:
@@ -671,6 +680,7 @@ def test_eks_legacy_state_uses_arn_and_parent_regions():
                 "access_entries": legacy_entries,
                 "access_policies": legacy_policies,
                 "idp_configs": legacy_idp_configs,
+                "tags": legacy_tags,
             }
         )
 
@@ -753,6 +763,28 @@ def test_eks_legacy_state_uses_arn_and_parent_regions():
         assert _json.loads(body)["identityProviderConfig"]["oidc"][
             "identityProviderConfigName"
         ] == "legacy-idp"
+
+        # Tag APIs accept the original child ARN in the region where migration
+        # co-located the child with its parent. Keep that persisted ARN as the
+        # tag-store key so legacy tags survive the round trip.
+        for child_arn in child_arns:
+            status, _, body = mod._list_tags(child_arn)
+            assert status == 200
+            assert _json.loads(body)["tags"] == {"legacy": "true"}
+
+        nodegroup_arn = child_arns[0]
+        status, _, _body = mod._tag_resource(
+            nodegroup_arn, {"tags": {"owner": "platform"}}
+        )
+        assert status == 200
+        status, _, _body = mod._untag_resource(
+            nodegroup_arn, {"tagKeys": ["legacy"]}
+        )
+        assert status == 200
+        status, _, body = mod._list_tags(nodegroup_arn)
+        assert status == 200
+        assert _json.loads(body)["tags"] == {"owner": "platform"}
+        assert mod._tags.get(nodegroup_arn) == {"owner": "platform"}
     finally:
         mod.reset()
         set_request_account_id(original_account)

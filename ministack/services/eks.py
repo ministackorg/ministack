@@ -1326,15 +1326,19 @@ def _resolve_tag_resource_arn(arn):
         spec.partition != "aws"
         or spec.service != "eks"
         or spec.account_id != get_account_id()
-        or spec.region != get_region()
     ):
         return None, _invalid_tag_resource_arn(arn)
 
+    request_region = get_region()
     parts = spec.resource.split("/")
     resource_type = parts[0] if parts else ""
 
+    # Legacy account-scoped state could create a child in a different region
+    # from its parent. Restore co-locates those children with the parent while
+    # preserving their ARN (and the ARN-keyed persisted tags). Accept that
+    # exact ARN only when the child exists in the current scoped store.
     if resource_type == "cluster":
-        if len(parts) != 2 or not parts[1]:
+        if len(parts) != 2 or not parts[1] or spec.region != request_region:
             return None, _invalid_tag_resource_arn(arn)
         cluster = _clusters.get(parts[1])
         if not cluster or cluster.get("arn") != arn:
@@ -1346,6 +1350,8 @@ def _resolve_tag_resource_arn(arn):
             return None, _invalid_tag_resource_arn(arn)
         nodegroup = _nodegroups.get(f"{parts[1]}/{parts[2]}")
         if not nodegroup or nodegroup.get("nodegroupArn") != arn:
+            if spec.region != request_region:
+                return None, _invalid_tag_resource_arn(arn)
             return None, _tag_resource_not_found(arn)
         return nodegroup["nodegroupArn"], None
 
@@ -1354,6 +1360,8 @@ def _resolve_tag_resource_arn(arn):
             return None, _invalid_tag_resource_arn(arn)
         addon = _addons.get(f"{parts[1]}/{parts[2]}")
         if not addon or addon.get("addonArn") != arn:
+            if spec.region != request_region:
+                return None, _invalid_tag_resource_arn(arn)
             return None, _tag_resource_not_found(arn)
         return addon["addonArn"], None
 
@@ -1363,6 +1371,8 @@ def _resolve_tag_resource_arn(arn):
         for entry in _access_entries.values():
             if entry.get("clusterName") == parts[1] and entry.get("accessEntryArn") == arn:
                 return entry["accessEntryArn"], None
+        if spec.region != request_region:
+            return None, _invalid_tag_resource_arn(arn)
         return None, _tag_resource_not_found(arn)
 
     if resource_type == "identityproviderconfig":
@@ -1370,6 +1380,8 @@ def _resolve_tag_resource_arn(arn):
             return None, _invalid_tag_resource_arn(arn)
         cfg = _idp_configs.get(f"{parts[1]}\x00{parts[3]}")
         if not cfg or cfg.get("arn") != arn:
+            if spec.region != request_region:
+                return None, _invalid_tag_resource_arn(arn)
             return None, _tag_resource_not_found(arn)
         return cfg["arn"], None
 
