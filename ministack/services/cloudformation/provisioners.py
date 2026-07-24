@@ -1200,6 +1200,25 @@ def _cwlogs_delete(physical_id, props):
     _cw_logs._log_groups.pop(physical_id, None)
 
 
+# --- CloudWatch Logs ResourcePolicy ---
+
+def _cwlogs_resource_policy_create(logical_id, props, stack_name):
+    policy_name = props.get("PolicyName")
+    if not policy_name:
+        raise ValueError("AWS::Logs::ResourcePolicy requires PolicyName")
+    # Local log delivery is intentionally permissive, so the policy only needs
+    # its CloudFormation identity rather than a data-plane enforcement store.
+    return policy_name, {}
+
+
+def _cwlogs_resource_policy_update(physical_id, old_props, new_props, stack_name):
+    return _cwlogs_resource_policy_create(physical_id, new_props, stack_name)
+
+
+def _cwlogs_resource_policy_delete(physical_id, props):
+    pass
+
+
 # --- CloudWatch Logs SubscriptionFilter (#896) ---
 
 def _cwlogs_subfilter_create(logical_id, props, stack_name):
@@ -2401,24 +2420,22 @@ def _apigw_documentation_part_delete(physical_id, props):
         _apigw_v1._delete_documentation_part(api_id, physical_id)
 
 
-# --- API Gateway DocumentationVersion ---
+# --- API Gateway RequestValidator ---
 
-def _apigw_documentation_version_identity(props):
-    return f"{props.get('RestApiId', '')}/{props.get('DocumentationVersion', '')}"
-
-
-def _apigw_documentation_version_create(logical_id, props, stack_name):
-    # Documentation snapshots do not affect MiniStack's permissive local API
-    # request handling. A native CFN identity is sufficient for templates and
-    # dependent resources to complete their lifecycle.
-    return _apigw_documentation_version_identity(props), {}
+def _apigw_request_validator_create(logical_id, props, stack_name):
+    validator_id = new_uuid().replace("-", "")[:8]
+    return validator_id, {"RequestValidatorId": validator_id}
 
 
-def _apigw_documentation_version_update(physical_id, old_props, new_props, stack_name):
-    return _apigw_documentation_version_identity(new_props), {}
+def _apigw_request_validator_update(physical_id, old_props, new_props, stack_name):
+    # RestApiId and Name require replacement. Validation flags update in place;
+    # request handling remains deliberately permissive in the local data plane.
+    if any(new_props.get(key) != old_props.get(key) for key in ("RestApiId", "Name")):
+        return _apigw_request_validator_create(physical_id, new_props, stack_name)
+    return physical_id, {"RequestValidatorId": physical_id}
 
 
-def _apigw_documentation_version_delete(physical_id, props):
+def _apigw_request_validator_delete(physical_id, props):
     pass
 
 
@@ -2739,6 +2756,40 @@ def _appsync_ds_delete(physical_id, props):
     parts = physical_id.split("/", 1)
     if len(parts) == 2:
         _appsync._data_sources.get(parts[0], {}).pop(parts[1], None)
+
+
+def _appsync_function_attributes(api_id, function_id, props):
+    function_arn = (
+        f"arn:aws:appsync:{get_region()}:{get_account_id()}:"
+        f"apis/{api_id}/functions/{function_id}"
+    )
+    return {
+        "DataSourceName": props.get("DataSourceName", ""),
+        "FunctionArn": function_arn,
+        "FunctionId": function_id,
+        "Name": props.get("Name", ""),
+    }
+
+
+def _appsync_function_create(logical_id, props, stack_name):
+    api_id = props.get("ApiId", "")
+    function_id = new_uuid().replace("-", "")[:26]
+    attrs = _appsync_function_attributes(api_id, function_id, props)
+    # Pipeline execution remains permissive; the CFN identity and documented
+    # attributes are enough for resolvers to reference the local function.
+    return attrs["FunctionArn"], attrs
+
+
+def _appsync_function_update(physical_id, old_props, new_props, stack_name):
+    if new_props.get("ApiId") != old_props.get("ApiId"):
+        return _appsync_function_create(physical_id, new_props, stack_name)
+    function_id = physical_id.rsplit("/", 1)[-1]
+    attrs = _appsync_function_attributes(new_props.get("ApiId", ""), function_id, new_props)
+    return physical_id, attrs
+
+
+def _appsync_function_delete(physical_id, props):
+    pass
 
 
 def _appsync_resolver_create(logical_id, props, stack_name):
@@ -4601,6 +4652,38 @@ def _waf_web_acl_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
+# CloudFront Origin Access Identity
+# ---------------------------------------------------------------------------
+
+def _cf_oai_attributes(oai_id):
+    canonical_user_id = hashlib.sha256(
+        f"{get_account_id()}:{oai_id}".encode()
+    ).hexdigest()
+    return {"Id": oai_id, "S3CanonicalUserId": canonical_user_id}
+
+
+def _cf_oai_create(logical_id, props, stack_name):
+    config = props.get("CloudFrontOriginAccessIdentityConfig")
+    if not isinstance(config, dict):
+        raise ValueError(
+            "AWS::CloudFront::CloudFrontOriginAccessIdentity requires "
+            "CloudFrontOriginAccessIdentityConfig"
+        )
+    oai_id = _cf._dist_id()
+    return oai_id, _cf_oai_attributes(oai_id)
+
+
+def _cf_oai_update(physical_id, old_props, new_props, stack_name):
+    # Comment is mutable but local CloudFront/S3 access remains permissive, so
+    # retaining the identity is the only state required for an in-place update.
+    return physical_id, _cf_oai_attributes(physical_id)
+
+
+def _cf_oai_delete(physical_id, props):
+    pass
+
+
+# ---------------------------------------------------------------------------
 # CloudFront Distribution
 # ---------------------------------------------------------------------------
 
@@ -5175,6 +5258,11 @@ _RESOURCE_HANDLERS = {
         "delete": _appconfig_deployment_delete,
     },
     "AWS::Logs::LogGroup": {"create": _cwlogs_create, "delete": _cwlogs_delete},
+    "AWS::Logs::ResourcePolicy": {
+        "create": _cwlogs_resource_policy_create,
+        "update": _cwlogs_resource_policy_update,
+        "delete": _cwlogs_resource_policy_delete,
+    },
     "AWS::Logs::SubscriptionFilter": {"create": _cwlogs_subfilter_create, "delete": _cwlogs_subfilter_delete},
     "AWS::Events::Rule": {"create": _eb_rule_create, "delete": _eb_rule_delete},
     "AWS::Events::EventBus": {"create": _eb_event_bus_create, "delete": _eb_event_bus_delete},
@@ -5225,6 +5313,10 @@ _RESOURCE_HANDLERS = {
         "update": _apigw_documentation_part_update,
         "delete": _apigw_documentation_part_delete,
     },
+    "AWS::ApiGateway::RequestValidator": {
+        "create": _apigw_request_validator_create,
+        "update": _apigw_request_validator_update,
+        "delete": _apigw_request_validator_delete,
     "AWS::ApiGateway::DocumentationVersion": {
         "create": _apigw_documentation_version_create,
         "update": _apigw_documentation_version_update,
@@ -5242,6 +5334,11 @@ _RESOURCE_HANDLERS = {
     "AWS::SNS::TopicPolicy": {"create": _sns_topic_policy_create, "delete": _sns_topic_policy_delete},
     "AWS::AppSync::GraphQLApi": {"create": _appsync_api_create, "delete": _appsync_api_delete},
     "AWS::AppSync::DataSource": {"create": _appsync_ds_create, "delete": _appsync_ds_delete},
+    "AWS::AppSync::FunctionConfiguration": {
+        "create": _appsync_function_create,
+        "update": _appsync_function_update,
+        "delete": _appsync_function_delete,
+    },
     "AWS::AppSync::Resolver": {"create": _appsync_resolver_create, "delete": _appsync_resolver_delete},
     "AWS::AppSync::GraphQLSchema": {"create": _appsync_schema_create},
     "AWS::AppSync::ApiKey": {"create": _appsync_apikey_create, "delete": _appsync_apikey_delete},
@@ -5290,6 +5387,11 @@ _RESOURCE_HANDLERS = {
     "AWS::ApiGatewayV2::Authorizer": {"create": _apigw_v2_authorizer_create, "delete": _apigw_v2_authorizer_delete},
     "AWS::SES::EmailIdentity": {"create": _ses_email_identity_create, "delete": _ses_email_identity_delete},
     "AWS::WAFv2::WebACL": {"create": _waf_web_acl_create, "delete": _waf_web_acl_delete},
+    "AWS::CloudFront::CloudFrontOriginAccessIdentity": {
+        "create": _cf_oai_create,
+        "update": _cf_oai_update,
+        "delete": _cf_oai_delete,
+    },
     "AWS::CloudFront::Distribution": {"create": _cf_distribution_create, "delete": _cf_distribution_delete},
     "AWS::CloudFront::KeyValueStore": {"create": _cf_kvs_create, "update": _cf_kvs_update, "delete": _cf_kvs_delete},
     "AWS::CloudWatch::Alarm": {"create": _cw_metric_alarm_create, "delete": _cw_metric_alarm_delete},
