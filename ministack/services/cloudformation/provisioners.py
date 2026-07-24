@@ -2420,24 +2420,22 @@ def _apigw_documentation_part_delete(physical_id, props):
         _apigw_v1._delete_documentation_part(api_id, physical_id)
 
 
-# --- API Gateway DocumentationVersion ---
+# --- API Gateway RequestValidator ---
 
-def _apigw_documentation_version_identity(props):
-    return f"{props.get('RestApiId', '')}/{props.get('DocumentationVersion', '')}"
-
-
-def _apigw_documentation_version_create(logical_id, props, stack_name):
-    # Documentation snapshots do not affect MiniStack's permissive local API
-    # request handling. A native CFN identity is sufficient for templates and
-    # dependent resources to complete their lifecycle.
-    return _apigw_documentation_version_identity(props), {}
+def _apigw_request_validator_create(logical_id, props, stack_name):
+    validator_id = new_uuid().replace("-", "")[:8]
+    return validator_id, {"RequestValidatorId": validator_id}
 
 
-def _apigw_documentation_version_update(physical_id, old_props, new_props, stack_name):
-    return _apigw_documentation_version_identity(new_props), {}
+def _apigw_request_validator_update(physical_id, old_props, new_props, stack_name):
+    # RestApiId and Name require replacement. Validation flags update in place;
+    # request handling remains deliberately permissive in the local data plane.
+    if any(new_props.get(key) != old_props.get(key) for key in ("RestApiId", "Name")):
+        return _apigw_request_validator_create(physical_id, new_props, stack_name)
+    return physical_id, {"RequestValidatorId": physical_id}
 
 
-def _apigw_documentation_version_delete(physical_id, props):
+def _apigw_request_validator_delete(physical_id, props):
     pass
 
 
@@ -5315,6 +5313,10 @@ _RESOURCE_HANDLERS = {
         "update": _apigw_documentation_part_update,
         "delete": _apigw_documentation_part_delete,
     },
+    "AWS::ApiGateway::RequestValidator": {
+        "create": _apigw_request_validator_create,
+        "update": _apigw_request_validator_update,
+        "delete": _apigw_request_validator_delete,
     "AWS::ApiGateway::DocumentationVersion": {
         "create": _apigw_documentation_version_create,
         "update": _apigw_documentation_version_update,
