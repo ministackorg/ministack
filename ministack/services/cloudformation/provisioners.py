@@ -2439,6 +2439,27 @@ def _apigw_request_validator_delete(physical_id, props):
     pass
 
 
+# --- API Gateway DocumentationVersion ---
+
+def _apigw_documentation_version_identity(props):
+    return f"{props.get('RestApiId', '')}/{props.get('DocumentationVersion', '')}"
+
+
+def _apigw_documentation_version_create(logical_id, props, stack_name):
+    # Documentation snapshots do not affect MiniStack's permissive local API
+    # request handling. A native CFN identity is sufficient for templates and
+    # dependent resources to complete their lifecycle.
+    return _apigw_documentation_version_identity(props), {}
+
+
+def _apigw_documentation_version_update(physical_id, old_props, new_props, stack_name):
+    return _apigw_documentation_version_identity(new_props), {}
+
+
+def _apigw_documentation_version_delete(physical_id, props):
+    pass
+
+
 # --- Lambda EventSourceMapping ---
 
 def _lambda_esm_create(logical_id, props, stack_name):
@@ -5317,6 +5338,7 @@ _RESOURCE_HANDLERS = {
         "create": _apigw_request_validator_create,
         "update": _apigw_request_validator_update,
         "delete": _apigw_request_validator_delete,
+    },
     "AWS::ApiGateway::DocumentationVersion": {
         "create": _apigw_documentation_version_create,
         "update": _apigw_documentation_version_update,
