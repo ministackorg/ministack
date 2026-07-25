@@ -39,7 +39,6 @@ from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
-    error_response_iceberg,
     error_response_json,
     get_account_id,
     get_region,
@@ -434,6 +433,13 @@ def _update_table_metadata_location(bucket_arn, namespace, table_name, data):
 
 # ── Iceberg REST catalog (data plane for Spark) ───────────
 
+def _error_response_iceberg(error_type: str, message: str, status: int = 400) -> tuple:
+    """Iceberg REST catalog error response, per the spec's ErrorModel."""
+    data = {"error": {"message": message, "type": error_type, "code": status}}
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    return status, {"Content-Type": "application/json"}, body
+
+
 def _iceberg_config():
     return json_response({"defaults": {
         "client.region": get_region(),
@@ -458,7 +464,7 @@ def _iceberg_list_namespaces(allow_cross_region):
 def _iceberg_get_namespace(namespace, allow_cross_region):
     if _iceberg_values(_namespaces, lambda ns: _namespace_name(ns) == namespace, allow_cross_region):
         return json_response({"namespace": [namespace], "properties": {}})
-    return error_response_iceberg("NoSuchNamespaceException", f"Namespace {namespace} not found", 404)
+    return _error_response_iceberg("NoSuchNamespaceException", f"Namespace {namespace} not found", 404)
 
 
 def _iceberg_list_tables(namespace, allow_cross_region):
@@ -485,7 +491,7 @@ def _iceberg_load_table(namespace, table_name, allow_cross_region):
                 "s3.region": get_region(), "client.region": get_region(),
             },
         })
-    return error_response_iceberg("NoSuchTableException", f"Table {namespace}.{table_name} not found", 404)
+    return _error_response_iceberg("NoSuchTableException", f"Table {namespace}.{table_name} not found", 404)
 
 
 def _iceberg_commit_table(namespace, table_name, data, allow_cross_region):
@@ -512,21 +518,16 @@ def _iceberg_commit_table(namespace, table_name, data, allow_cross_region):
             elif action == "add-schema":
                 new_schema = update.get("schema", {})
                 metadata.setdefault("schemas", []).append(new_schema)
-                # Real Iceberg REST catalogs track the high-water mark of assigned
-                # field IDs so clients can allocate the next one; this was static from
-                # table creation, so every add-schema after the first computed its next
-                # field ID from the same stale value, colliding IDs across ALTER TABLE
-                # ADD COLUMN calls (each landed on the same "next" ID instead of a fresh
-                # one).
+                # Advance last-column-id to the highest field ID seen, so the next
+                # add-schema allocates fresh IDs instead of colliding with these.
                 field_ids = [f["id"] for f in new_schema.get("fields", []) if "id" in f]
                 if field_ids:
                     metadata["last-column-id"] = max(metadata.get("last-column-id", 0), max(field_ids))
             elif action == "set-current-schema":
                 metadata["current-schema-id"] = update.get("schema-id", 0)
             elif action in ("add-spec", "add-partition-spec"):
-                # The Iceberg REST spec's real wire name is "add-spec" (what
-                # spec-compliant clients like duckdb-iceberg send); "add-partition-spec"
-                # is accepted too for callers still using the non-standard name.
+                # Accepts both "add-spec" (the spec's wire name) and the
+                # non-standard "add-partition-spec".
                 metadata.setdefault("partition-specs", []).append(update.get("spec", {}))
             elif action == "set-default-spec":
                 metadata["default-spec-id"] = update.get("spec-id", 0)
@@ -550,7 +551,7 @@ def _iceberg_commit_table(namespace, table_name, data, allow_cross_region):
         table["modifiedAt"] = now_iso()
         return json_response({"metadata-location": new_loc, "metadata": metadata})
 
-    return error_response_iceberg("NoSuchTableException", f"Table {namespace}.{table_name} not found", 404)
+    return _error_response_iceberg("NoSuchTableException", f"Table {namespace}.{table_name} not found", 404)
 
 
 def _iceberg_create_table(namespace, data, allow_cross_region):
@@ -561,7 +562,7 @@ def _iceberg_create_table(namespace, data, allow_cross_region):
     if matches:
         bucket_arn = matches[0].get("tableBucketARN")
     if not bucket_arn:
-        return error_response_iceberg("NoSuchNamespaceException", f"Namespace {namespace} not found", 404)
+        return _error_response_iceberg("NoSuchNamespaceException", f"Namespace {namespace} not found", 404)
 
     schema_fields = [{"name": f.get("name", ""), "type": f.get("type", "string") if isinstance(f.get("type"), str) else "string",
                        "required": f.get("required", False)} for f in schema.get("fields", [])]
@@ -573,11 +574,8 @@ def _iceberg_create_table(namespace, data, allow_cross_region):
         iceberg_metadata["schemas"] = [schema]
     partition_spec = data.get("partition-spec")
     if partition_spec:
-        # _initial_iceberg_metadata hardcodes an empty spec-id-0 spec; honor whatever
-        # partition spec the client actually asked for at creation time instead (e.g.
-        # duckdb-iceberg's CREATE TABLE ... PARTITIONED BY), or the client's own later
-        # add-spec/set-default-spec commit -- which reads this response back into its
-        # local table state -- ends up asserting the empty one right back at us.
+        # Use the client's requested partition spec as the table's default spec,
+        # so a later add-spec/set-default-spec commit matches it and doesn't fail.
         iceberg_metadata["partition-specs"] = [partition_spec]
         iceberg_metadata["default-spec-id"] = partition_spec.get("spec-id", 0)
     metadata_location = f"s3://{bucket_name}/{namespace}/{table_name}/metadata/v0.metadata.json"
