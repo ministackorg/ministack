@@ -571,6 +571,15 @@ def _iceberg_create_table(namespace, data, allow_cross_region):
     iceberg_metadata = _initial_iceberg_metadata(table_name, schema_fields, location)
     if schema:
         iceberg_metadata["schemas"] = [schema]
+    partition_spec = data.get("partition-spec")
+    if partition_spec:
+        # _initial_iceberg_metadata hardcodes an empty spec-id-0 spec; honor whatever
+        # partition spec the client actually asked for at creation time instead (e.g.
+        # duckdb-iceberg's CREATE TABLE ... PARTITIONED BY), or the client's own later
+        # add-spec/set-default-spec commit -- which reads this response back into its
+        # local table state -- ends up asserting the empty one right back at us.
+        iceberg_metadata["partition-specs"] = [partition_spec]
+        iceberg_metadata["default-spec-id"] = partition_spec.get("spec-id", 0)
     metadata_location = f"s3://{bucket_name}/{namespace}/{table_name}/metadata/v0.metadata.json"
     arn = _table_arn(bucket_arn, namespace, table_name)
     key = _table_key(bucket_arn, namespace, table_name)

@@ -774,3 +774,47 @@ def test_s3tables_iceberg_404_uses_spec_error_shape(s3tables):
         except Exception:
             pass
         s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
+
+
+def test_s3tables_iceberg_create_table_honors_requested_partition_spec(s3tables):
+    """The create-table endpoint's response must echo back the partition spec the
+    client actually asked for, not a hardcoded empty one -- clients (e.g.
+    duckdb-iceberg) initialize their own local table state from this response, so an
+    empty echo here gets asserted right back at the server on the very next commit,
+    permanently losing the partition spec even though it was in the original request."""
+    bucket_name = f"tb-createspec-{_uuid_mod.uuid4().hex[:6]}"
+    bucket_arn = s3tables.create_table_bucket(name=bucket_name)["arn"]
+    ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
+    table = f"t_{_uuid_mod.uuid4().hex[:6]}"
+    try:
+        s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
+
+        created = _iceberg_json(
+            f"/iceberg/v1/namespaces/{ns}/tables",
+            method="POST",
+            payload={
+                "name": table,
+                "schema": {
+                    "type": "struct", "schema-id": 0,
+                    "fields": [{"id": 1, "name": "ts", "required": False, "type": "timestamp"}],
+                },
+                "partition-spec": {
+                    "spec-id": 0,
+                    "fields": [{"source-id": 1, "field-id": 1000, "name": "day_ts", "transform": "day"}],
+                },
+            },
+        )
+        metadata = created["metadata"]
+        spec = next(s for s in metadata["partition-specs"] if s["spec-id"] == metadata["default-spec-id"])
+        assert spec["fields"], "create-table response must echo back the requested partition spec, not an empty one"
+        assert spec["fields"][0]["transform"] == "day"
+    finally:
+        try:
+            s3tables.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=table)
+        except Exception:
+            pass
+        try:
+            s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
+        except Exception:
+            pass
+        s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
