@@ -421,6 +421,20 @@ def error_response_json(code: str, message: str, status: int = 400) -> tuple:
     }, body
 
 
+def error_response_iceberg(error_type: str, message: str, status: int = 400) -> tuple:
+    """Iceberg REST catalog error response, per the spec's ErrorModel.
+
+    This is a different wire shape from AWS's own JSON-1.0 errors (`error_response_json`)
+    -- clients speaking the Iceberg REST protocol (e.g. duckdb-iceberg) require a top-level
+    `error` object with `message`/`type`/`code`, or they can't tell "not found" apart from
+    any other failure and raise an opaque error instead of proceeding (e.g. treating a
+    missing table as create-worthy).
+    """
+    data = {"error": {"message": message, "type": error_type, "code": status}}
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    return status, {"Content-Type": "application/json"}, body
+
+
 def now_iso() -> str:
     """Current time in AWS ISO format."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"

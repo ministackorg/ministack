@@ -39,6 +39,7 @@ from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
+    error_response_iceberg,
     error_response_json,
     get_account_id,
     get_region,
@@ -457,7 +458,7 @@ def _iceberg_list_namespaces(allow_cross_region):
 def _iceberg_get_namespace(namespace, allow_cross_region):
     if _iceberg_values(_namespaces, lambda ns: _namespace_name(ns) == namespace, allow_cross_region):
         return json_response({"namespace": [namespace], "properties": {}})
-    return error_response_json("NotFoundException", f"Namespace {namespace} not found", 404)
+    return error_response_iceberg("NoSuchNamespaceException", f"Namespace {namespace} not found", 404)
 
 
 def _iceberg_list_tables(namespace, allow_cross_region):
@@ -484,7 +485,7 @@ def _iceberg_load_table(namespace, table_name, allow_cross_region):
                 "s3.region": get_region(), "client.region": get_region(),
             },
         })
-    return error_response_json("NotFoundException", f"Table {namespace}.{table_name} not found", 404)
+    return error_response_iceberg("NoSuchTableException", f"Table {namespace}.{table_name} not found", 404)
 
 
 def _iceberg_commit_table(namespace, table_name, data, allow_cross_region):
@@ -549,7 +550,7 @@ def _iceberg_commit_table(namespace, table_name, data, allow_cross_region):
         table["modifiedAt"] = now_iso()
         return json_response({"metadata-location": new_loc, "metadata": metadata})
 
-    return error_response_json("NotFoundException", f"Table {namespace}.{table_name} not found", 404)
+    return error_response_iceberg("NoSuchTableException", f"Table {namespace}.{table_name} not found", 404)
 
 
 def _iceberg_create_table(namespace, data, allow_cross_region):
@@ -560,7 +561,7 @@ def _iceberg_create_table(namespace, data, allow_cross_region):
     if matches:
         bucket_arn = matches[0].get("tableBucketARN")
     if not bucket_arn:
-        return error_response_json("NotFoundException", f"Namespace {namespace} not found", 404)
+        return error_response_iceberg("NoSuchNamespaceException", f"Namespace {namespace} not found", 404)
 
     schema_fields = [{"name": f.get("name", ""), "type": f.get("type", "string") if isinstance(f.get("type"), str) else "string",
                        "required": f.get("required", False)} for f in schema.get("fields", [])]
