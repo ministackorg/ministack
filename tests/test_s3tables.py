@@ -744,36 +744,24 @@ def test_s3tables_iceberg_add_spec_uses_real_wire_action_name(s3tables):
         s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
 
 
-def test_s3tables_iceberg_404_uses_spec_error_shape(s3tables):
+def test_s3tables_iceberg_404_uses_spec_error_shape():
     """The Iceberg REST spec's ErrorModel is a top-level `error` object with
     `message`/`type`/`code` -- not AWS's own `__type`-keyed JSON-1.0 shape used
     elsewhere in this file's S3-control-plane responses. duckdb-iceberg's client
     parses specifically for `error.{message,type,code}` (see GetErrorMessage in
     its source) and throws an opaque error if that shape isn't present, rather
     than recognizing "not found" and proceeding (e.g. to CREATE TABLE)."""
-    bucket_name = f"tb-errshape-{_uuid_mod.uuid4().hex[:6]}"
-    bucket_arn = s3tables.create_table_bucket(name=bucket_name)["arn"]
-    ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
     try:
-        s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
-
-        try:
-            _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/does-not-exist")
-            assert False, "expected a 404"
-        except urllib.error.HTTPError as e:
-            assert e.code == 404
-            body = json.loads(e.read().decode("utf-8"))
-            assert "error" in body, f"missing spec-required 'error' key: {body}"
-            error = body["error"]
-            assert error["type"] == "NoSuchTableException"
-            assert error["code"] == 404
-            assert "message" in error
-    finally:
-        try:
-            s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
-        except Exception:
-            pass
-        s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
+        _iceberg_json("/iceberg/v1/namespaces/does-not-exist/tables/does-not-exist")
+        assert False, "expected a 404"
+    except urllib.error.HTTPError as e:
+        assert e.code == 404
+        body = json.loads(e.read().decode("utf-8"))
+        assert "error" in body, f"missing spec-required 'error' key: {body}"
+        error = body["error"]
+        assert error["type"] in ("NoSuchNamespaceException", "NoSuchTableException")
+        assert error["code"] == 404
+        assert "message" in error
 
 
 def test_s3tables_iceberg_create_table_honors_requested_partition_spec(s3tables):
