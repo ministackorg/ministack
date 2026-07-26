@@ -443,6 +443,19 @@ def _iceberg_config():
     }, "overrides": {}})
 
 
+def _iceberg_error(message, exc_type, code):
+    """Iceberg REST catalog error envelope, per the Iceberg REST OpenAPI
+    ``ErrorModel`` (``{"error": {"message", "type", "code"}}``). This is the
+    shape spec-compliant REST clients (DuckDB, Spark, Trino) require, and is
+    distinct from the AWS ``{"__type", "message"}`` shape the S3 Tables control
+    plane returns. A client hitting LoadTable on a not-yet-created table must
+    receive a proper ``NoSuchTableException`` so it proceeds to create it."""
+    body = json.dumps(
+        {"error": {"message": message, "type": exc_type, "code": code}}
+    ).encode("utf-8")
+    return code, {"Content-Type": "application/json"}, body
+
+
 def _iceberg_allows_cross_region(headers):
     return _SIGV4_CREDENTIAL_REGION_RE.search(headers.get("authorization", "")) is None
 
@@ -457,7 +470,7 @@ def _iceberg_list_namespaces(allow_cross_region):
 def _iceberg_get_namespace(namespace, allow_cross_region):
     if _iceberg_values(_namespaces, lambda ns: _namespace_name(ns) == namespace, allow_cross_region):
         return json_response({"namespace": [namespace], "properties": {}})
-    return error_response_json("NotFoundException", f"Namespace {namespace} not found", 404)
+    return _iceberg_error(f"Namespace {namespace} not found", "NoSuchNamespaceException", 404)
 
 
 def _iceberg_list_tables(namespace, allow_cross_region):
@@ -484,7 +497,7 @@ def _iceberg_load_table(namespace, table_name, allow_cross_region):
                 "s3.region": get_region(), "client.region": get_region(),
             },
         })
-    return error_response_json("NotFoundException", f"Table {namespace}.{table_name} not found", 404)
+    return _iceberg_error(f"Table {namespace}.{table_name} not found", "NoSuchTableException", 404)
 
 
 def _iceberg_commit_table(namespace, table_name, data, allow_cross_region):
@@ -536,7 +549,7 @@ def _iceberg_commit_table(namespace, table_name, data, allow_cross_region):
         table["modifiedAt"] = now_iso()
         return json_response({"metadata-location": new_loc, "metadata": metadata})
 
-    return error_response_json("NotFoundException", f"Table {namespace}.{table_name} not found", 404)
+    return _iceberg_error(f"Table {namespace}.{table_name} not found", "NoSuchTableException", 404)
 
 
 def _iceberg_create_table(namespace, data, allow_cross_region):
@@ -547,7 +560,7 @@ def _iceberg_create_table(namespace, data, allow_cross_region):
     if matches:
         bucket_arn = matches[0].get("tableBucketARN")
     if not bucket_arn:
-        return error_response_json("NotFoundException", f"Namespace {namespace} not found", 404)
+        return _iceberg_error(f"Namespace {namespace} not found", "NoSuchNamespaceException", 404)
 
     schema_fields = [{"name": f.get("name", ""), "type": f.get("type", "string") if isinstance(f.get("type"), str) else "string",
                        "required": f.get("required", False)} for f in schema.get("fields", [])]

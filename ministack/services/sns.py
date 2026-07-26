@@ -6,7 +6,8 @@ Supports: CreateTopic, DeleteTopic, ListTopics, GetTopicAttributes, SetTopicAttr
           GetSubscriptionAttributes, SetSubscriptionAttributes,
           Publish, PublishBatch,
           ListTagsForResource, TagResource, UntagResource,
-          CreatePlatformApplication, DeletePlatformApplication,
+          CreatePlatformApplication, ListPlatformApplications,
+          DeletePlatformApplication,
           CreatePlatformEndpoint, GetEndpointAttributes, SetEndpointAttributes,
           DeleteEndpoint.
 SNS → Lambda fanout dispatches via _execute_function (synchronous).
@@ -182,6 +183,7 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
         "TagResource": _tag_resource,
         "UntagResource": _untag_resource,
         "CreatePlatformApplication": _create_platform_application,
+        "ListPlatformApplications": _list_platform_applications,
         "CreatePlatformEndpoint": _create_platform_endpoint,
         "DeletePlatformApplication": _delete_platform_application,
         "GetEndpointAttributes": _get_endpoint_attributes,
@@ -1160,6 +1162,41 @@ def _create_platform_application(params):
                 f"<CreatePlatformApplicationResult>"
                 f"<PlatformApplicationArn>{arn}</PlatformApplicationArn>"
                 f"</CreatePlatformApplicationResult>")
+
+
+def _list_platform_applications(params):
+    # https://docs.aws.amazon.com/sns/latest/api/API_ListPlatformApplications.html
+    # Returns up to 100 per page; NextToken is the numeric offset of the next
+    # page. The store is account+region scoped, so .values() already filters to
+    # the caller's region, matching AWS's per-region platform applications.
+    all_apps = list(_platform_applications.values())
+    next_token = _p(params, "NextToken")
+    start = 0
+    if next_token:
+        try:
+            start = int(next_token)
+        except ValueError:
+            start = 0
+    page = all_apps[start:start + 100]
+    members = "".join(
+        "<member>"
+        f"<PlatformApplicationArn>{_xml_escape(app['arn'])}</PlatformApplicationArn>"
+        "<Attributes>"
+        + "".join(
+            f"<entry><key>{_xml_escape(k)}</key><value>{_xml_escape(v)}</value></entry>"
+            for k, v in app.get("attributes", {}).items()
+        )
+        + "</Attributes>"
+        "</member>"
+        for app in page
+    )
+    next_token_xml = ""
+    if start + 100 < len(all_apps):
+        next_token_xml = f"<NextToken>{start + 100}</NextToken>"
+    return _xml(200, "ListPlatformApplicationsResponse",
+                f"<ListPlatformApplicationsResult>"
+                f"<PlatformApplications>{members}</PlatformApplications>"
+                f"{next_token_xml}</ListPlatformApplicationsResult>")
 
 
 def _create_platform_endpoint(params):

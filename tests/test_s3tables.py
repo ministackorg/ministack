@@ -479,6 +479,21 @@ def test_s3tables_iceberg_catalog_prefers_signed_region_for_duplicate_names():
                 pass
 
 
+def test_iceberg_rest_error_uses_spec_envelope():
+    """The /iceberg REST surface must return the Iceberg REST OpenAPI ErrorModel
+    ({"error": {message, type, code}}), not the AWS {"__type"} shape. A LoadTable
+    on a missing table must be a proper NoSuchTableException so spec-compliant
+    writers (DuckDB, Spark) proceed to create it instead of aborting."""
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _iceberg_json("/iceberg/v1/catalog/namespaces/nope/tables/missing")
+    assert exc.value.code == 404
+    body = json.loads(exc.value.read().decode("utf-8"))
+    assert "__type" not in body
+    assert body["error"]["type"] == "NoSuchTableException"
+    assert body["error"]["code"] == 404
+    assert body["error"]["message"]
+
+
 def test_s3tables_iceberg_catalog_no_prefix_url_format(s3tables):
     """S3 Tables uses /iceberg/v1/namespaces/... (no catalog prefix in path,
     warehouse in query param) — the format DuckDB sends with ENDPOINT_TYPE s3_tables

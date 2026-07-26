@@ -137,6 +137,8 @@ def _account_from_arn(arn: str) -> str:
 
 REGION = os.environ.get("MINISTACK_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
 LAMBDA_EXECUTOR = os.environ.get("LAMBDA_EXECUTOR", "local").lower()
+# Deprecated and ignored (#1205): in-container runs now populate the sibling
+# Lambda container via docker cp. Kept defined to avoid breaking any importer.
 LAMBDA_DOCKER_VOLUME_MOUNT = os.environ.get("LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT", "")
 LAMBDA_DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "") or os.environ.get("LAMBDA_DOCKER_NETWORK", "")
 LAMBDA_DOCKER_FLAGS = os.environ.get("LAMBDA_DOCKER_FLAGS", "")
@@ -3378,18 +3380,18 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
     _cp_layers = bool(layers_dirs)
     mounts: list = []
     if package_type == "Zip":
-        host_code_dir = LAMBDA_DOCKER_VOLUME_MOUNT or code_dir
-        if LAMBDA_DOCKER_VOLUME_MOUNT:
-            mounts.append(docker_lib.types.Mount("/var/task", host_code_dir, type="bind", read_only=True))
-            if is_provided:
-                mounts.append(docker_lib.types.Mount("/var/runtime", host_code_dir, type="bind", read_only=True))
-        elif _running_in_container():
-            # DinD: host daemon can't see our tmpfs — populate via docker cp after create
+        if _running_in_container():
+            # DinD: the host Docker daemon can't see our tmpfs, so populate the
+            # runtime container's /var/task (and /var/runtime for provided) via
+            # docker cp after create. This supersedes the legacy
+            # LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT named-volume mount, which is now
+            # a deprecated no-op: it mounted the volume name as a bind path,
+            # which Docker rejects with "mount path must be absolute" (#1205).
             _use_docker_cp = True
         else:
-            mounts.append(docker_lib.types.Mount("/var/task", host_code_dir, type="bind", read_only=True))
+            mounts.append(docker_lib.types.Mount("/var/task", code_dir, type="bind", read_only=True))
             if is_provided:
-                mounts.append(docker_lib.types.Mount("/var/runtime", host_code_dir, type="bind", read_only=True))
+                mounts.append(docker_lib.types.Mount("/var/runtime", code_dir, type="bind", read_only=True))
 
     # CMD / EntryPoint
     run_kwargs: dict = {

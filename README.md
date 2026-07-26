@@ -914,7 +914,7 @@ Supported runtimes and the AWS public ECR images MiniStack pulls for them:
 
 Containers are named `lambda-<random-hex-16>` and pooled across invocations. Idle containers are reaped after `LAMBDA_WARM_TTL_SECONDS` (default 300s) — no manual cleanup needed. The pool is also drained on `/_ministack/reset`.
 
-**Docker-in-Docker:** when MiniStack itself runs inside a container, set `LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT` to a Docker named volume that is also mounted at `/var/task` inside the MiniStack container. MiniStack writes the Lambda code into the volume so the sibling Lambda container (started via the host Docker socket) can read it. Not needed when MiniStack runs directly on the host.
+**Docker-in-Docker:** when MiniStack itself runs inside a container (with the host Docker socket mounted), it detects that automatically and copies each Lambda's code into the sibling runtime container over the socket. No shared volume or extra configuration is required. The legacy `LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT` env var is deprecated and ignored.
 
 **Networking:** when MiniStack runs in Docker Compose, set `DOCKER_NETWORK` to the Compose network name. All container-backed services (Lambda, RDS, EKS, ElastiCache) then attach to that network so Lambda code can reach MiniStack at `http://<ministack-service-name>:4566`. The legacy `LAMBDA_DOCKER_NETWORK` is still accepted (Lambda only) as a fallback.
 
@@ -930,16 +930,11 @@ services:
     environment:
       LAMBDA_EXECUTOR: docker
       DOCKER_NETWORK: ${COMPOSE_PROJECT_NAME}_infra-network
-      LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT: ${COMPOSE_PROJECT_NAME}_lambda-docker-volume
       AWS_DEFAULT_REGION: ${AWS_REGION:-eu-central-1}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - lambda-docker-volume:/var/task
     networks:
       - infra-network
-
-volumes:
-  lambda-docker-volume:
 
 networks:
   infra-network:
