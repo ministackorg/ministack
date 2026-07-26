@@ -603,25 +603,395 @@ import asyncio
 import struct
 
 from ministack.services.iot import (
+    _RETRANSMIT_INTERVAL_SECONDS,
     PKT_CONNACK,
     PKT_CONNECT,
     PKT_DISCONNECT,
     PKT_PUBACK,
     PKT_PUBLISH,
     PKT_SUBSCRIBE,
-    _InFlightMessage,
-    _RETRANSMIT_INTERVAL_SECONDS,
-    _Subscription,
-    _WSSession,
     _encode_remaining_length,
     _encode_string,
+    _InFlightMessage,
     _make_puback,
     _make_suback,
     _persistent_sessions,
-    broker_publish as publish,
-    broker_reset as reset,
-    broker_subscribe as subscribe,
+    broker_publish,
+    broker_subscribe,
 )
+from ministack.services.iot import (
+    _Subscription as _IoTSubscription,
+)
+from ministack.services.iot import (
+    _WSSession as _IoTWSSession,
+)
+from ministack.services.iot import (
+    broker_reset as reset,
+)
+
+_TEST_REGION = "us-east-1"
+
+
+def _WSSession(send, account_id, region=_TEST_REGION):
+    return _IoTWSSession(send, account_id, region)
+
+
+def _Subscription(
+    filter_prefixed,
+    account_id,
+    deliver,
+    granted_qos=0,
+    region=_TEST_REGION,
+):
+    return _IoTSubscription(
+        filter_prefixed,
+        account_id,
+        region,
+        deliver,
+        granted_qos,
+    )
+
+
+async def publish(account_id, topic, payload, **kwargs):
+    await broker_publish(
+        account_id, _TEST_REGION, topic, payload, **kwargs
+    )
+
+
+async def subscribe(account_id, topic_filter, callback, granted_qos=0):
+    return await broker_subscribe(
+        account_id,
+        _TEST_REGION,
+        topic_filter,
+        callback,
+        granted_qos,
+    )
+
+
+def test_iot_control_plane_identity_stores_are_region_scoped():
+    from ministack.core.responses import AccountRegionScopedDict
+    from ministack.services import iot as iot_module
+
+    stores = (
+        iot_module._things,
+        iot_module._thing_types,
+        iot_module._thing_groups,
+        iot_module._certificates,
+        iot_module._policies,
+        iot_module._topic_rules,
+        iot_module._shadows,
+    )
+    assert all(isinstance(store, AccountRegionScopedDict) for store in stores)
+
+
+def test_iot_region_scoped_control_plane_accepts_same_resource_names():
+    from ministack.core.responses import (
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import iot as iot_module
+
+    account_id = "123456789012"
+    resource_name = "same_regional_name"
+    policy_document = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [],
+    })
+
+    async def _request(region, method, path, payload=None):
+        set_request_account_id(account_id)
+        set_request_region(region)
+        body = json.dumps(payload or {}).encode()
+        return await iot_module.handle_request(
+            method, path, {}, body, {}
+        )
+
+    async def _run():
+        try:
+            east_thing = await _request(
+                "us-east-1",
+                "POST",
+                f"/things/{resource_name}",
+                {"attributePayload": {"attributes": {"scope": "east"}}},
+            )
+            west_thing = await _request(
+                "us-west-2",
+                "POST",
+                f"/things/{resource_name}",
+                {"attributePayload": {"attributes": {"scope": "west"}}},
+            )
+            assert east_thing[0] == 200
+            assert west_thing[0] == 200
+
+            for region, expected in (
+                ("us-east-1", "east"),
+                ("us-west-2", "west"),
+            ):
+                response = await _request(
+                    region, "GET", f"/things/{resource_name}"
+                )
+                assert response[0] == 200
+                assert json.loads(response[2])["attributes"]["scope"] == expected
+
+                policy = await _request(
+                    region,
+                    "POST",
+                    f"/policies/{resource_name}",
+                    {"policyDocument": policy_document},
+                )
+                rule = await _request(
+                    region,
+                    "POST",
+                    f"/rules/{resource_name}",
+                    {
+                        "sql": "SELECT * FROM 'regional/topic'",
+                        "actions": [],
+                    },
+                )
+                assert policy[0] == 200
+                assert rule[0] == 200
+        finally:
+            iot_module.reset()
+            iot_module.broker_reset()
+
+    asyncio.run(_run())
+
+
+def test_iot_broker_publish_and_retained_messages_are_region_isolated():
+    reset()
+
+    async def _run():
+        account_id = "123456789012"
+        east_received = []
+        west_received = []
+
+        async def east_callback(topic, payload, qos):
+            east_received.append((topic, payload, qos))
+
+        async def west_callback(topic, payload, qos):
+            west_received.append((topic, payload, qos))
+
+        await broker_subscribe(
+            account_id,
+            "us-east-1",
+            "sensors/temp",
+            east_callback,
+        )
+        await broker_subscribe(
+            account_id,
+            "us-west-2",
+            "sensors/temp",
+            west_callback,
+        )
+        await broker_publish(
+            account_id,
+            "us-east-1",
+            "sensors/temp",
+            b"21C",
+            retain=True,
+        )
+
+        assert east_received == [("sensors/temp", b"21C", 0)]
+        assert west_received == []
+
+        east_retained = []
+        west_retained = []
+
+        async def east_retained_callback(topic, payload, qos):
+            east_retained.append((topic, payload, qos))
+
+        async def west_retained_callback(topic, payload, qos):
+            west_retained.append((topic, payload, qos))
+
+        await broker_subscribe(
+            account_id,
+            "us-east-1",
+            "sensors/temp",
+            east_retained_callback,
+        )
+        await broker_subscribe(
+            account_id,
+            "us-west-2",
+            "sensors/temp",
+            west_retained_callback,
+        )
+
+        assert east_retained == [("sensors/temp", b"21C", 0)]
+        assert west_retained == []
+
+    asyncio.run(_run())
+    reset()
+
+
+@pytest.mark.parametrize("wildcard_region", ["+", "#"])
+def test_iot_broker_region_wildcards_cannot_bypass_isolation(
+    wildcard_region,
+):
+    reset()
+
+    async def _run():
+        account_id = "123456789012"
+        live_received = []
+        retained_received = []
+
+        async def live_callback(topic, payload, qos):
+            live_received.append((topic, payload, qos))
+
+        async def retained_callback(topic, payload, qos):
+            retained_received.append((topic, payload, qos))
+
+        await broker_subscribe(
+            account_id,
+            wildcard_region,
+            "sensors/temp",
+            live_callback,
+        )
+        await broker_publish(
+            account_id,
+            "us-east-1",
+            "sensors/temp",
+            b"east",
+            retain=True,
+        )
+        await broker_subscribe(
+            account_id,
+            wildcard_region,
+            "sensors/temp",
+            retained_callback,
+        )
+
+        assert live_received == []
+        assert retained_received == []
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_iot_broker_persistent_sessions_are_region_isolated():
+    reset()
+
+    async def _run():
+        account_id = "123456789012"
+        client_id = "shared-regional-client"
+        connect = _build_connect_body(
+            client_id=client_id, clean_session=False
+        )
+
+        east_send, _ = _mock_send()
+        east_session = _WSSession(
+            east_send, account_id, region="us-east-1"
+        )
+        await east_session.handle_packet(PKT_CONNECT, 0, connect)
+        await east_session.handle_packet(
+            PKT_SUBSCRIBE,
+            0x02,
+            _build_subscribe_body(1, [("events/#", 1)]),
+        )
+        await east_session.handle_packet(PKT_DISCONNECT, 0, b"")
+        await east_session.cleanup()
+
+        west_send, west_sent = _mock_send()
+        west_session = _WSSession(
+            west_send, account_id, region="us-west-2"
+        )
+        await west_session.handle_packet(PKT_CONNECT, 0, connect)
+
+        session_present, return_code = _parse_connack(west_sent)
+        assert session_present is False
+        assert return_code == 0
+        assert (
+            account_id,
+            "us-east-1",
+            client_id,
+        ) in _persistent_sessions
+        assert (
+            account_id,
+            "us-west-2",
+            client_id,
+        ) in _persistent_sessions
+
+        await west_session.cleanup()
+        await broker_publish(
+            account_id,
+            "us-east-1",
+            "events/one",
+            b"east-only",
+            qos=1,
+        )
+        east_state = _persistent_sessions[
+            (account_id, "us-east-1", client_id)
+        ]
+        west_state = _persistent_sessions[
+            (account_id, "us-west-2", client_id)
+        ]
+        assert east_state.queued_messages == [
+            ("events/one", b"east-only", 1)
+        ]
+        assert west_state.queued_messages == []
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_iot_topic_rules_and_basic_ingest_use_publish_region(monkeypatch):
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    east_rule = {
+        "ruleName": "regional_rule",
+        "sql": "SELECT * FROM 'sensors/#'",
+        "ruleDisabled": False,
+        "actions": [],
+    }
+    west_rule = {
+        **east_rule,
+        "sql": "SELECT * FROM 'west/#'",
+        "description": "west",
+    }
+    iot_module._topic_rules.set_scoped(
+        account_id, "us-east-1", "regional_rule", east_rule
+    )
+    iot_module._topic_rules.set_scoped(
+        account_id, "us-west-2", "regional_rule", west_rule
+    )
+    dispatched = []
+
+    def _capture_rule_action(dispatched_account_id, rule, payload):
+        dispatched.append((dispatched_account_id, rule, payload))
+
+    monkeypatch.setattr(
+        iot_module, "_run_rule_actions", _capture_rule_action
+    )
+
+    async def _run():
+        await broker_publish(
+            account_id,
+            "us-east-1",
+            "sensors/temperature",
+            b'{"value": 21}',
+        )
+        assert dispatched == [
+            (account_id, east_rule, b'{"value": 21}')
+        ]
+
+        dispatched.clear()
+        await broker_publish(
+            account_id,
+            "us-west-2",
+            "$aws/rules/regional_rule",
+            b'{"value": 22}',
+        )
+        assert dispatched == [
+            (account_id, west_rule, b'{"value": 22}')
+        ]
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
 
 
 def _build_connect_body(
@@ -1089,7 +1459,11 @@ def test_clean_session_1_discards_prior_state():
         await session1.cleanup()
 
         # Verify persistent session exists
-        assert ("123456789012", "device2") in _persistent_sessions
+        assert (
+            "123456789012",
+            _TEST_REGION,
+            "device2",
+        ) in _persistent_sessions
 
         # Second connection: cleanSession=1 — should discard prior state
         send2, sent2 = _mock_send()
@@ -1103,7 +1477,11 @@ def test_clean_session_1_discards_prior_state():
         assert return_code == 0
 
         # Verify persistent session was discarded
-        assert ("123456789012", "device2") not in _persistent_sessions
+        assert (
+            "123456789012",
+            _TEST_REGION,
+            "device2",
+        ) not in _persistent_sessions
 
         # Publish to the old subscription topic — should NOT be delivered
         await publish("123456789012", "alerts/fire", b"alarm", qos=1)
@@ -1147,7 +1525,9 @@ def test_offline_qos1_messages_queued_and_delivered_on_reconnect():
         await publish("123456789012", "data/stream", b"msg3", qos=1)
 
         # Verify messages are queued
-        ps = _persistent_sessions.get(("123456789012", "device3"))
+        ps = _persistent_sessions.get(
+            ("123456789012", _TEST_REGION, "device3")
+        )
         assert ps is not None
         assert len(ps.queued_messages) == 3
 
@@ -1202,7 +1582,9 @@ def test_qos0_messages_not_queued_for_offline_sessions():
         await publish("123456789012", "events/log", b"info2", qos=0)
 
         # Verify no messages queued (QoS 0 not queued)
-        ps = _persistent_sessions.get(("123456789012", "device4"))
+        ps = _persistent_sessions.get(
+            ("123456789012", _TEST_REGION, "device4")
+        )
         assert ps is not None
         assert len(ps.queued_messages) == 0
 
@@ -1234,7 +1616,9 @@ def test_queue_bounded_to_1000_messages():
             await publish("123456789012", "bulk/data", f"msg{i}".encode(), qos=1)
 
         # Verify queue is bounded to 1000
-        ps = _persistent_sessions.get(("123456789012", "device5"))
+        ps = _persistent_sessions.get(
+            ("123456789012", _TEST_REGION, "device5")
+        )
         assert ps is not None
         assert len(ps.queued_messages) == 1000
 
@@ -1268,7 +1652,9 @@ def test_expired_session_not_restored():
         await session1.cleanup()
 
         # Manually expire the session by setting created_at far in the past
-        ps = _persistent_sessions.get(("123456789012", "device6"))
+        ps = _persistent_sessions.get(
+            ("123456789012", _TEST_REGION, "device6")
+        )
         assert ps is not None
         ps.created_at = time.time() - 7200  # 2 hours ago (default expiry is 1 hour)
 
@@ -1334,7 +1720,7 @@ def test_wildcard_subscription_persisted_and_restored():
 
 
 def test_different_accounts_sessions_isolated():
-    """Persistent sessions are scoped by (account_id, client_id)."""
+    """Persistent sessions are scoped by account, region, and client ID."""
     reset()
 
     async def _run():

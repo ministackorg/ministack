@@ -357,12 +357,11 @@ def test_save_dict_includes_sibling_imported_modules():
     dropped. The fallback through `sys.modules` is the fix."""
     import sys as _sys
 
-    from ministack.app import _build_persistence_save_dict, _loaded_modules
-
     # Force-import appsync_events the way appsync.py does it — a plain
     # sibling import that bypasses `_get_module` and therefore does NOT
     # populate `_loaded_modules`.
     import ministack.services.appsync_events  # noqa: F401
+    from ministack.app import _build_persistence_save_dict, _loaded_modules
 
     # Simulate the bug condition: module is in sys.modules but absent
     # from _loaded_modules.
@@ -2188,6 +2187,198 @@ def test_default_state_format_version_stays_v2_and_refuses_newer(monkeypatch, tm
         "payload": {"k": "v"},
     }))
     assert persistence.load_state("future") is None
+
+
+def test_iot_legacy_state_migrates_resource_and_retained_regions():
+    import base64
+
+    from ministack.core.responses import (
+        AccountScopedDict,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import iot
+
+    account_id = "123456789012"
+    boot_region = "us-east-1"
+    resource_region = "us-west-2"
+    resource_name = "legacy-regional"
+
+    def legacy_store(value):
+        store = AccountScopedDict()
+        store._data[(account_id, resource_name)] = value
+        return store
+
+    legacy_state = {
+        "things": legacy_store({
+            "thingName": resource_name,
+            "thingArn": (
+                f"arn:aws:iot:{resource_region}:{account_id}:"
+                f"thing/{resource_name}"
+            ),
+        }),
+        "certificates": legacy_store({
+            "certificateId": resource_name,
+            "certificateArn": (
+                f"arn:aws:iot:{resource_region}:{account_id}:"
+                f"cert/{resource_name}"
+            ),
+        }),
+        "policies": legacy_store({
+            "policyName": resource_name,
+            "policyArn": (
+                f"arn:aws:iot:{resource_region}:{account_id}:"
+                f"policy/{resource_name}"
+            ),
+        }),
+        "topic_rules": legacy_store({
+            "ruleName": resource_name,
+            "ruleArn": (
+                f"arn:aws:iot:{resource_region}:{account_id}:"
+                f"rule/{resource_name}"
+            ),
+        }),
+        "mqtt_broker": {
+            "retained": [{
+                "topic": f"{account_id}/sensors/temperature",
+                "payload": base64.b64encode(b"21C").decode("ascii"),
+                "qos": 1,
+            }],
+        },
+    }
+
+    set_request_account_id(account_id)
+    set_request_region(boot_region)
+    iot.reset()
+    iot.broker_reset()
+    try:
+        iot.restore_state(legacy_state)
+
+        for store in (
+            iot._things,
+            iot._certificates,
+            iot._policies,
+            iot._topic_rules,
+        ):
+            assert store.get_scoped(
+                account_id, resource_region, resource_name
+            ) is not None
+            assert store.get_scoped(
+                account_id, boot_region, resource_name
+            ) is None
+
+        retained_key = (
+            f"{account_id}/{boot_region}/sensors/temperature"
+        )
+        assert iot._retained[retained_key].payload == b"21C"
+        assert (
+            f"{account_id}/{resource_region}/sensors/temperature"
+            not in iot._retained
+        )
+    finally:
+        iot.reset()
+        iot.broker_reset()
+
+
+def test_iot_region_scoped_v3_state_is_idempotent(monkeypatch, tmp_path):
+    import base64
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    account_id = "123456789012"
+    region = "us-west-2"
+    resource_name = "regional-resource"
+
+    def regional_store(value):
+        store = AccountRegionScopedDict()
+        store.set_scoped(account_id, region, resource_name, value)
+        return store
+
+    state = {
+        "things": regional_store({
+            "thingName": resource_name,
+            "thingArn": (
+                f"arn:aws:iot:{region}:{account_id}:thing/{resource_name}"
+            ),
+        }),
+        "certificates": regional_store({
+            "certificateId": resource_name,
+            "certificateArn": (
+                f"arn:aws:iot:{region}:{account_id}:cert/{resource_name}"
+            ),
+        }),
+        "policies": regional_store({
+            "policyName": resource_name,
+            "policyArn": (
+                f"arn:aws:iot:{region}:{account_id}:policy/{resource_name}"
+            ),
+        }),
+        "topic_rules": regional_store({
+            "ruleName": resource_name,
+            "ruleArn": (
+                f"arn:aws:iot:{region}:{account_id}:rule/{resource_name}"
+            ),
+        }),
+        "mqtt_broker": {
+            "region_scoped": True,
+            "retained": [{
+                "topic": f"{account_id}/{region}/sensors/temperature",
+                "payload": base64.b64encode(b"21C").decode("ascii"),
+                "qos": 1,
+            }],
+        },
+    }
+
+    persistence.save_state("iot", state)
+    first_snapshot = _json.loads((tmp_path / "iot.json").read_text())
+    assert first_snapshot["__ministack_format__"] == 3
+
+    loaded = persistence.load_state("iot")
+    assert loaded is not None
+    persistence.save_state("iot", loaded)
+    second_snapshot = _json.loads((tmp_path / "iot.json").read_text())
+
+    assert second_snapshot == first_snapshot
+
+
+def test_iot_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    things = AccountRegionScopedDict()
+    things.set_scoped(
+        "123456789012",
+        "us-west-2",
+        "regional-thing",
+        {
+            "thingName": "regional-thing",
+            "thingArn": (
+                "arn:aws:iot:us-west-2:123456789012:"
+                "thing/regional-thing"
+            ),
+        },
+    )
+    persistence.save_state("iot", {"things": things})
+
+    raw = _json.loads((tmp_path / "iot.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded = persistence.load_state("iot")["things"]
+    assert loaded.get_scoped(
+        "123456789012", "us-west-2", "regional-thing"
+    )["thingName"] == "regional-thing"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("iot") is None
 
 
 def test_ecs_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):

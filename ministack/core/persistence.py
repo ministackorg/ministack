@@ -34,6 +34,7 @@ SERVICE_STATE_FORMAT_VERSIONS = {
     "emr": 3,
     "eks": 3,
     "inspector2": 3,
+    "iot": 3,
     "efs": 3,
     "s3files": 3,
     "batch": 3,
