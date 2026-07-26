@@ -31,6 +31,7 @@ SERVICE_STATE_FORMAT_VERSIONS = {
     "autoscaling": 3,
     "athena": 3,
     "emr": 3,
+    "eks": 3,
     "inspector2": 3,
     "efs": 3,
     "s3files": 3,
@@ -39,9 +40,11 @@ SERVICE_STATE_FORMAT_VERSIONS = {
     "resource_groups": 3,
     "codebuild": 3,
     "mq": 3,
+    "mwaa": 3,
     "servicediscovery": 3,
     "ses": 3,
     "ses_v2": 3,
+    "transfer": 3,
 }
 
 

@@ -34,6 +34,7 @@ import ministack.services.ec2 as _ec2
 import ministack.services.ecr as _ecr
 import ministack.services.ecs as _ecs
 import ministack.services.eventbridge as _eb
+import ministack.services.firehose as _firehose
 import ministack.services.iam as _iam
 import ministack.services.iot as _iot
 import ministack.services.kinesis as _kinesis
@@ -5222,6 +5223,59 @@ def _s3tables_table_delete(physical_id, props):
     _s3tables._tables.pop(_s3tables._table_key(bucket_arn, namespace, table_name), None)
 
 
+# --- Kinesis Data Firehose DeliveryStream ---
+
+def _firehose_delivery_stream_create(logical_id, props, stack_name):
+    # CFN Properties mirror the CreateDeliveryStream API shape (destination
+    # configs, DeliveryStreamType, Tags), so pass them straight through to the
+    # existing Firehose control plane. Ref returns the stream name; Fn::GetAtt
+    # Arn returns the stream ARN.
+    name = props.get("DeliveryStreamName") or _physical_name(
+        stack_name, logical_id, max_len=64
+    )
+    data = dict(props)
+    data["DeliveryStreamName"] = name
+    status, _headers, body = _firehose._create_delivery_stream(data)
+    if status >= 400:
+        raise ValueError(
+            f"AWS::KinesisFirehose::DeliveryStream create failed: {body!r}"
+        )
+    return name, {"Arn": _firehose._stream_arn(name)}
+
+
+def _firehose_delivery_stream_update(physical_id, old_props, new_props, stack_name):
+    # DeliveryStreamName, DeliveryStreamType, and the source configs require
+    # replacement; destination configuration changes apply in place.
+    replace_keys = (
+        "DeliveryStreamName", "DeliveryStreamType",
+        "KinesisStreamSourceConfiguration", "MSKSourceConfiguration",
+    )
+    if any(new_props.get(k) != old_props.get(k) for k in replace_keys):
+        new_id, attrs = _firehose_delivery_stream_create(
+            physical_id, new_props, stack_name
+        )
+        _firehose_delivery_stream_delete(physical_id, old_props)
+        return new_id, attrs
+    stream = _firehose._streams.get(physical_id)
+    if stream is None:
+        return _firehose_delivery_stream_create(physical_id, new_props, stack_name)
+    dtype, cfg = _firehose._resolve_dest_type_and_config(new_props)
+    if dtype and cfg is not None:
+        stream["destinations"] = [{
+            "id": _firehose._next_dest_id(),
+            "type": dtype,
+            "config": cfg,
+            "records": [],
+        }]
+        stream["version"] = stream.get("version", 1) + 1
+        stream["updated_at"] = _firehose.now_epoch()
+    return physical_id, {"Arn": _firehose._stream_arn(physical_id)}
+
+
+def _firehose_delivery_stream_delete(physical_id, props):
+    _firehose._delete_delivery_stream({"DeliveryStreamName": physical_id})
+
+
 _RESOURCE_HANDLERS = {
     "AWS::OpenSearchService::Domain": {
         "create": _opensearch_domain_create,
@@ -5288,6 +5342,11 @@ _RESOURCE_HANDLERS = {
     "AWS::Events::Rule": {"create": _eb_rule_create, "delete": _eb_rule_delete},
     "AWS::Events::EventBus": {"create": _eb_event_bus_create, "delete": _eb_event_bus_delete},
     "AWS::Kinesis::Stream": {"create": _kinesis_stream_create, "delete": _kinesis_stream_delete},
+    "AWS::KinesisFirehose::DeliveryStream": {
+        "create": _firehose_delivery_stream_create,
+        "update": _firehose_delivery_stream_update,
+        "delete": _firehose_delivery_stream_delete,
+    },
     "AWS::Lambda::Permission": {"create": _lambda_permission_create, "delete": _lambda_permission_delete},
     "AWS::Lambda::Version": {"create": _lambda_version_create},
     "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create},

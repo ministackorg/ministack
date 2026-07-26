@@ -479,6 +479,21 @@ def test_s3tables_iceberg_catalog_prefers_signed_region_for_duplicate_names():
                 pass
 
 
+def test_iceberg_rest_error_uses_spec_envelope():
+    """The /iceberg REST surface must return the Iceberg REST OpenAPI ErrorModel
+    ({"error": {message, type, code}}), not the AWS {"__type"} shape. A LoadTable
+    on a missing table must be a proper NoSuchTableException so spec-compliant
+    writers (DuckDB, Spark) proceed to create it instead of aborting."""
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _iceberg_json("/iceberg/v1/catalog/namespaces/nope/tables/missing")
+    assert exc.value.code == 404
+    body = json.loads(exc.value.read().decode("utf-8"))
+    assert "__type" not in body
+    assert body["error"]["type"] == "NoSuchTableException"
+    assert body["error"]["code"] == 404
+    assert body["error"]["message"]
+
+
 def test_s3tables_iceberg_catalog_no_prefix_url_format(s3tables):
     """S3 Tables uses /iceberg/v1/namespaces/... (no catalog prefix in path,
     warehouse in query param) — the format DuckDB sends with ENDPOINT_TYPE s3_tables
@@ -615,6 +630,242 @@ def test_s3tables_iceberg_transactions_commit(s3tables):
         snap_ids = [s.get("snapshot-id") for s in metadata.get("snapshots", [])]
         assert snapshot_id in snap_ids, f"snapshot {snapshot_id} not found after commit"
         assert metadata.get("current-snapshot-id") == snapshot_id
+    finally:
+        try:
+            s3tables.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=table)
+        except Exception:
+            pass
+        try:
+            s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
+        except Exception:
+            pass
+        s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
+
+
+
+def test_s3tables_iceberg_create_table_rejects_resend_instead_of_wiping_data(s3tables):
+    """CreateTable is not idempotent per the Iceberg REST spec -- a resent create
+    (e.g. a client retry after a lost response to a create that already landed)
+    must be rejected with a conflict, matching the S3 Tables control-plane path's
+    existing 409 behaviour. Before this guard, a resend silently replaced the
+    table's metadata with a fresh empty one, discarding any snapshots/schema
+    already committed -- worse than a crash, since nothing signals data was lost."""
+    bucket_name = f"tb-createretry-{_uuid_mod.uuid4().hex[:6]}"
+    bucket_arn = s3tables.create_table_bucket(name=bucket_name)["arn"]
+    ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
+    table = f"t_{_uuid_mod.uuid4().hex[:6]}"
+    try:
+        s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
+
+        _iceberg_json(
+            f"/iceberg/v1/namespaces/{ns}/tables",
+            method="POST",
+            payload={"name": table, "schema": {"type": "struct", "schema-id": 0, "fields": []}},
+        )
+        # Commit a snapshot so there's real state a resent create could destroy.
+        snapshot_id = 42
+        _iceberg_json(
+            f"/iceberg/v1/namespaces/{ns}/tables/{table}",
+            method="POST",
+            payload={
+                "requirements": [],
+                "updates": [
+                    {
+                        "action": "add-snapshot",
+                        "snapshot": {
+                            "snapshot-id": snapshot_id,
+                            "sequence-number": 1,
+                            "timestamp-ms": 1700000000000,
+                            "manifest-list": f"s3://{bucket_name}/{ns}/{table}/metadata/snap.avro",
+                            "summary": {"operation": "append"},
+                        },
+                    },
+                ],
+            },
+        )
+
+        # Resend the identical create, simulating a retry of a create whose first
+        # response was lost.
+        try:
+            _iceberg_json(
+                f"/iceberg/v1/namespaces/{ns}/tables",
+                method="POST",
+                payload={"name": table, "schema": {"type": "struct", "schema-id": 0, "fields": []}},
+            )
+            assert False, "expected a 409 conflict on resent CreateTable"
+        except urllib.error.HTTPError as e:
+            assert e.code == 409
+            body = json.loads(e.read().decode("utf-8"))
+            assert body["error"]["type"] == "AlreadyExistsException"
+
+        # The original snapshot must still be there -- not wiped by the resend.
+        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        snap_ids = [s.get("snapshot-id") for s in loaded["metadata"]["snapshots"]]
+        assert snapshot_id in snap_ids, "resent create-table must not wipe existing table state"
+    finally:
+        try:
+            s3tables.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=table)
+        except Exception:
+            pass
+        try:
+            s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
+        except Exception:
+            pass
+        s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
+
+
+
+def test_s3tables_iceberg_add_schema_advances_last_column_id(s3tables):
+    """Each add-schema commit must bump last-column-id to the new schema's highest
+    field ID, so a client allocating the *next* column's ID (e.g. DuckDB's
+    ALTER TABLE ... ADD COLUMN) doesn't collide with a previous add-schema's fields."""
+    bucket_name = f"tb-lcid-{_uuid_mod.uuid4().hex[:6]}"
+    bucket_arn = s3tables.create_table_bucket(name=bucket_name)["arn"]
+    ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
+    table = f"t_{_uuid_mod.uuid4().hex[:6]}"
+    try:
+        s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
+        s3tables.create_table(tableBucketARN=bucket_arn, namespace=ns, name=table, format="ICEBERG")
+
+        _iceberg_json(
+            f"/iceberg/v1/namespaces/{ns}/tables/{table}",
+            method="POST",
+            payload={
+                "requirements": [],
+                "updates": [
+                    {
+                        "action": "add-schema",
+                        "schema": {
+                            "type": "struct", "schema-id": 1,
+                            "fields": [{"id": 1, "name": "colA", "required": False, "type": "string"}],
+                        },
+                    },
+                    {"action": "set-current-schema", "schema-id": 1},
+                ],
+            },
+        )
+        first = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        assert first["metadata"]["last-column-id"] == 1
+
+        _iceberg_json(
+            f"/iceberg/v1/namespaces/{ns}/tables/{table}",
+            method="POST",
+            payload={
+                "requirements": [],
+                "updates": [
+                    {
+                        "action": "add-schema",
+                        "schema": {
+                            "type": "struct", "schema-id": 2,
+                            "fields": [
+                                {"id": 1, "name": "colA", "required": False, "type": "string"},
+                                {"id": 2, "name": "colB", "required": False, "type": "long"},
+                            ],
+                        },
+                    },
+                    {"action": "set-current-schema", "schema-id": 2},
+                ],
+            },
+        )
+        second = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        metadata = second["metadata"]
+        assert metadata["last-column-id"] == 2
+
+        current_schema = next(s for s in metadata["schemas"] if s["schema-id"] == metadata["current-schema-id"])
+        field_ids = [f["id"] for f in current_schema["fields"]]
+        assert field_ids == [1, 2], "field IDs must not collide across separate add-schema commits"
+    finally:
+        try:
+            s3tables.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=table)
+        except Exception:
+            pass
+        try:
+            s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
+        except Exception:
+            pass
+        s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
+
+
+
+def test_s3tables_iceberg_add_spec_uses_real_wire_action_name(s3tables):
+    """The Iceberg REST spec's real action name for adding a partition spec is
+    "add-spec" (what duckdb-iceberg actually sends) — not "add-partition-spec",
+    a non-standard name only some hand-rolled callers use. Both must work."""
+    bucket_name = f"tb-spec-{_uuid_mod.uuid4().hex[:6]}"
+    bucket_arn = s3tables.create_table_bucket(name=bucket_name)["arn"]
+    ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
+    table = f"t_{_uuid_mod.uuid4().hex[:6]}"
+    try:
+        s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
+        s3tables.create_table(tableBucketARN=bucket_arn, namespace=ns, name=table, format="ICEBERG")
+
+        _iceberg_json(
+            f"/iceberg/v1/namespaces/{ns}/tables/{table}",
+            method="POST",
+            payload={
+                "requirements": [],
+                "updates": [
+                    {
+                        "action": "add-spec",
+                        "spec": {
+                            "spec-id": 1,
+                            "fields": [{"source-id": 1, "field-id": 1000, "name": "day_col", "transform": "day"}],
+                        },
+                    },
+                    {"action": "set-default-spec", "spec-id": 1},
+                ],
+            },
+        )
+        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        metadata = loaded["metadata"]
+        spec_ids = [s["spec-id"] for s in metadata["partition-specs"]]
+        assert 1 in spec_ids, "add-spec must append the new partition spec"
+        assert metadata["default-spec-id"] == 1
+    finally:
+        try:
+            s3tables.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=table)
+        except Exception:
+            pass
+        try:
+            s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
+        except Exception:
+            pass
+        s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
+
+
+
+def test_s3tables_iceberg_create_table_honors_requested_partition_spec(s3tables):
+    """The create-table endpoint's response must echo back the partition spec the
+    client actually asked for, not a hardcoded empty one -- clients (e.g.
+    duckdb-iceberg) initialize their own local table state from this response, so an
+    empty echo here gets asserted right back at the server on the very next commit,
+    permanently losing the partition spec even though it was in the original request."""
+    bucket_name = f"tb-createspec-{_uuid_mod.uuid4().hex[:6]}"
+    bucket_arn = s3tables.create_table_bucket(name=bucket_name)["arn"]
+    ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
+    table = f"t_{_uuid_mod.uuid4().hex[:6]}"
+    try:
+        s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
+
+        created = _iceberg_json(
+            f"/iceberg/v1/namespaces/{ns}/tables",
+            method="POST",
+            payload={
+                "name": table,
+                "schema": {
+                    "type": "struct", "schema-id": 0,
+                    "fields": [{"id": 1, "name": "ts", "required": False, "type": "timestamp"}],
+                },
+                "partition-spec": {
+                    "spec-id": 0,
+                    "fields": [{"source-id": 1, "field-id": 1000, "name": "day_ts", "transform": "day"}],
+                },
+            },
+        )
+        metadata = created["metadata"]
+        spec = next(s for s in metadata["partition-specs"] if s["spec-id"] == metadata["default-spec-id"])
+        assert spec["fields"], "create-table response must echo back the requested partition spec, not an empty one"
+        assert spec["fields"][0]["transform"] == "day"
     finally:
         try:
             s3tables.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=table)

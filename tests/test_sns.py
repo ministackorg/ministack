@@ -1544,6 +1544,20 @@ def test_sns_create_platform_application(sns):
     assert ":app/GCM/intg-sns-pe-create-app" in app_arn
 
 
+def test_sns_list_platform_applications(sns):
+    name = f"intg-sns-list-app-{_uuid_mod.uuid4().hex[:8]}"
+    app_arn = sns.create_platform_application(
+        Name=name, Platform="GCM", Attributes={"PlatformCredential": "cred-xyz"},
+    )["PlatformApplicationArn"]
+    try:
+        apps = sns.list_platform_applications()["PlatformApplications"]
+        mine = [a for a in apps if a["PlatformApplicationArn"] == app_arn]
+        assert len(mine) == 1
+        assert mine[0]["Attributes"].get("PlatformCredential") == "cred-xyz"
+    finally:
+        sns.delete_platform_application(PlatformApplicationArn=app_arn)
+
+
 def test_sns_platform_applications_and_endpoints_are_region_scoped(sns):
     west = _regional_client("sns", "us-west-2")
     name = f"mr-sns-platform-region-{_uuid_mod.uuid4().hex[:8]}"

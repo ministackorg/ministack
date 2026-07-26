@@ -160,7 +160,7 @@ Since 1.4.0 state is additionally isolated per **region** — see [Multi-Region]
 | `111111111111` | `111111111111` |
 | `048408301323` | `048408301323` |
 | `test` | `000000000000` (default) |
-| `AKIAIOSFODNN7EXAMPLE` | `000000000000` (default) |
+| `AKIA_TEST_KEY_DO_NOT_USE` | `000000000000` (default) |
 
 **Terraform** — set `access_key` in your provider block:
 ```hcl
@@ -914,7 +914,7 @@ Supported runtimes and the AWS public ECR images MiniStack pulls for them:
 
 Containers are named `lambda-<random-hex-16>` and pooled across invocations. Idle containers are reaped after `LAMBDA_WARM_TTL_SECONDS` (default 300s) — no manual cleanup needed. The pool is also drained on `/_ministack/reset`.
 
-**Docker-in-Docker:** when MiniStack itself runs inside a container, set `LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT` to a Docker named volume that is also mounted at `/var/task` inside the MiniStack container. MiniStack writes the Lambda code into the volume so the sibling Lambda container (started via the host Docker socket) can read it. Not needed when MiniStack runs directly on the host.
+**Docker-in-Docker:** when MiniStack itself runs inside a container (with the host Docker socket mounted), it detects that automatically and copies each Lambda's code into the sibling runtime container over the socket. No shared volume or extra configuration is required. The legacy `LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT` env var is deprecated and ignored.
 
 **Networking:** when MiniStack runs in Docker Compose, set `DOCKER_NETWORK` to the Compose network name. All container-backed services (Lambda, RDS, EKS, ElastiCache) then attach to that network so Lambda code can reach MiniStack at `http://<ministack-service-name>:4566`. The legacy `LAMBDA_DOCKER_NETWORK` is still accepted (Lambda only) as a fallback.
 
@@ -930,16 +930,11 @@ services:
     environment:
       LAMBDA_EXECUTOR: docker
       DOCKER_NETWORK: ${COMPOSE_PROJECT_NAME}_infra-network
-      LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT: ${COMPOSE_PROJECT_NAME}_lambda-docker-volume
       AWS_DEFAULT_REGION: ${AWS_REGION:-eu-central-1}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - lambda-docker-volume:/var/task
     networks:
       - infra-network
-
-volumes:
-  lambda-docker-volume:
 
 networks:
   infra-network:
@@ -963,9 +958,10 @@ aws --endpoint-url=http://localhost:4566 eks create-cluster \
   --name my-cluster --role-arn arn:aws:iam::000000000000:role/eks \
   --resources-vpc-config subnetIds=subnet-1
 
-# Get the k3s kubeconfig (container name follows ministack-eks-{name} pattern)
-docker exec ministack-eks-my-cluster cat /etc/rancher/k3s/k3s.yaml \
-  | sed "s/127.0.0.1:6443/localhost:$(docker port ministack-eks-my-cluster 6443/tcp | cut -d: -f2)/" \
+# Get the k3s kubeconfig (container name follows
+# ministack-eks-{region}-{name}; this example uses eu-central-1)
+docker exec ministack-eks-eu-central-1-my-cluster cat /etc/rancher/k3s/k3s.yaml \
+  | sed "s/127.0.0.1:6443/localhost:$(docker port ministack-eks-eu-central-1-my-cluster 6443/tcp | cut -d: -f2)/" \
   > /tmp/ministack-kubeconfig.yaml
 
 # Use kubectl against real Kubernetes
@@ -1360,6 +1356,7 @@ See [`Testcontainers/java-testcontainers`](Testcontainers/java-testcontainers), 
 
 | Project | Description |
 |---------|-------------|
+| [**OpenArchFlow**](https://github.com/dmux/OpenArchFlow) | Open-source Progressive Web App for generating interactive AWS architecture diagrams from natural language descriptions using AI, LLMs, AI Agents, and AWS MCP. |
 | [**StackPort**](https://github.com/DaviReisVieira/stackport) | **Web UI** — visual dashboard to browse and inspect AWS resources in MiniStack. Available on [PyPI](https://pypi.org/project/stackport/) and [Docker Hub](https://hub.docker.com/r/davireis/stackport). |
 | [**McDoit.Aspire.Hosting.Ministack**](https://github.com/McDoit/aspire-hosting-ministack) | .NET Aspire hosting integration for MiniStack. |
 

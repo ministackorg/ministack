@@ -24,13 +24,15 @@ import time
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
-    AccountScopedDict,
+    AccountRegionScopedDict,
     apply_image_prefix,
     error_response_json,
     get_account_id,
     get_region,
     json_response,
     new_uuid,
+    set_request_account_id,
+    set_request_region,
 )
 
 logger = logging.getLogger("mwaa")
@@ -40,7 +42,7 @@ MWAA_PERSIST = os.environ.get("MWAA_PERSIST", "0").lower() in ("1", "true", "yes
 DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
 DEFAULT_AIRFLOW_IMAGE = os.environ.get("MWAA_AIRFLOW_IMAGE", "apache/airflow:3.0.6")
 
-_environments = AccountScopedDict()
+_environments = AccountRegionScopedDict()
 _port_counter = [BASE_PORT]
 _allocated_ports: set[int] = set()
 _freed_ports: list[int] = []
@@ -60,25 +62,40 @@ def restore_state(data):
     if not data:
         return
     envs_data = data.get("environments")
-    if not envs_data:
+    if envs_data is None:
         return
-    names_to_restart = []
-    if isinstance(envs_data, AccountScopedDict):
-        for key, env in list(envs_data._data.items()):
-            env["_docker_container_id"] = None
-            env["Status"] = "CREATING"
-            _environments._data[key] = env
-            names_to_restart.append((env.get("Name", key), env))
-    else:
-        for name, env in envs_data.items():
-            env["_docker_container_id"] = None
-            env["Status"] = "CREATING"
-            _environments[name] = env
-            names_to_restart.append((name, env))
+
+    if not isinstance(envs_data, AccountRegionScopedDict):
+        # Pre-regional snapshots used unqualified named volumes. Persist those
+        # names on the migrated environment so this and later regional boots
+        # continue mounting the existing Airflow metadata and DAG contents.
+        legacy_items = (
+            envs_data._data.items()
+            if hasattr(envs_data, "_data")
+            else envs_data.items()
+        )
+        for key, env in legacy_items:
+            env_name = key[-1] if isinstance(key, tuple) else key
+            env.setdefault(
+                "_docker_dags_volume_name",
+                f"ministack-mwaa-{env_name}-dags",
+            )
+            env.setdefault(
+                "_docker_db_volume_name",
+                f"ministack-mwaa-{env_name}-db",
+            )
+
+    _environments.update(envs_data)
 
     # Re-spin containers for persisted environments
-    for name, env in names_to_restart:
-        threading.Thread(target=_start_airflow_container, args=(name, env), daemon=True).start()
+    for (account_id, region, name), env in list(_environments.all_items()):
+        env["_docker_container_id"] = None
+        env["Status"] = "CREATING"
+        threading.Thread(
+            target=_start_airflow_container,
+            args=(account_id, region, name, env),
+            daemon=True,
+        ).start()
 
 
 try:
@@ -260,7 +277,19 @@ def _sync_dags_from_s3(env, docker_client, container):
         logger.exception("MWAA: failed to sync DAGs from S3")
 
 
-def _start_airflow_container(env_name, env):
+def _start_airflow_container(account_id, region, env_name, env):
+    previous_account = get_account_id()
+    previous_region = get_region()
+    set_request_account_id(account_id)
+    set_request_region(region)
+    try:
+        _start_airflow_container_in_scope(account_id, region, env_name, env)
+    finally:
+        set_request_account_id(previous_account)
+        set_request_region(previous_region)
+
+
+def _start_airflow_container_in_scope(account_id, region, env_name, env):
     docker_client = _get_docker()
     if not docker_client:
         logger.warning("MWAA: Docker not available — environment %s will be stub-only", env_name)
@@ -309,14 +338,18 @@ def _start_airflow_container(env_name, env):
         container_env[f"AIRFLOW__{env_key}"] = value
 
     try:
-        container_name = f"ministack-mwaa-{env_name}"
+        container_name = f"ministack-mwaa-{region}-{env_name}"
+        legacy_container_name = f"ministack-mwaa-{env_name}"
 
-        # Remove stale container from previous runs (same pattern as RDS)
-        try:
-            existing = docker_client.containers.get(container_name)
-            existing.remove(force=True)
-        except Exception:
-            pass
+        # Remove stale current and pre-regional containers before binding the
+        # environment's host port. A container left by the previous naming
+        # scheme can otherwise survive an upgrade and block the regional one.
+        for stale_name in (container_name, legacy_container_name):
+            try:
+                existing = docker_client.containers.get(stale_name)
+                existing.remove(force=True)
+            except Exception:
+                pass
 
         container_kwargs = dict(
             image=image,
@@ -325,16 +358,24 @@ def _start_airflow_container(env_name, env):
             environment=container_env,
             ports={f"{container_port}/tcp": host_port},
             name=container_name,
-            labels={"ministack": "mwaa", "env_name": env_name},
+            labels={"ministack": "mwaa", "region": region, "env_name": env_name},
         )
 
         if ms_network:
             container_kwargs["network"] = ms_network
 
         if MWAA_PERSIST:
+            dags_volume_name = env.setdefault(
+                "_docker_dags_volume_name",
+                f"{container_name}-dags",
+            )
+            db_volume_name = env.setdefault(
+                "_docker_db_volume_name",
+                f"{container_name}-db",
+            )
             container_kwargs["volumes"] = {
-                f"ministack-mwaa-{env_name}-dags": {"bind": "/opt/airflow/dags", "mode": "rw"},
-                f"ministack-mwaa-{env_name}-db": {"bind": "/opt/airflow", "mode": "rw"},
+                dags_volume_name: {"bind": "/opt/airflow/dags", "mode": "rw"},
+                db_volume_name: {"bind": "/opt/airflow", "mode": "rw"},
             }
 
         container = docker_client.containers.run(**container_kwargs)
@@ -354,27 +395,35 @@ def _start_airflow_container(env_name, env):
         env["WebserverUrl"] = f"{internal_host}:{internal_port}"
 
         def _bg_init():
-            if _wait_for_port(internal_host, internal_port, timeout=120):
-                logger.info("MWAA: Airflow container for %s ready at %s:%s",
-                            env_name, internal_host, internal_port)
-                env["Status"] = "AVAILABLE"
-                # Sync DAGs from S3 once Airflow is ready
-                _sync_dags_from_s3(env, docker_client, container)
-                # Airflow 2 standalone generates a random admin password and
-                # writes it to standalone_admin_password.txt. Capture it so
-                # _invoke_rest_api can authenticate against /api/v1/ — basic
-                # auth `admin:admin` from the env vars only takes effect
-                # outside standalone mode. v3 uses Simple Auth Manager with
-                # ALL_ADMINS=true so no token is needed.
-                if not is_v3:
-                    _capture_v2_admin_password(env, container)
-            else:
-                logger.warning("MWAA: Airflow container for %s not ready after timeout", env_name)
-                env["Status"] = "CREATE_FAILED"
-                env.setdefault("LastUpdate", {})["Error"] = {
-                    "ErrorCode": "CONTAINER_STARTUP_TIMEOUT",
-                    "ErrorMessage": "Airflow container did not become healthy within 120s",
-                }
+            previous_account = get_account_id()
+            previous_region = get_region()
+            set_request_account_id(account_id)
+            set_request_region(region)
+            try:
+                if _wait_for_port(internal_host, internal_port, timeout=120):
+                    logger.info("MWAA: Airflow container for %s ready at %s:%s",
+                                env_name, internal_host, internal_port)
+                    env["Status"] = "AVAILABLE"
+                    # Sync DAGs from S3 once Airflow is ready
+                    _sync_dags_from_s3(env, docker_client, container)
+                    # Airflow 2 standalone generates a random admin password and
+                    # writes it to standalone_admin_password.txt. Capture it so
+                    # _invoke_rest_api can authenticate against /api/v1/ — basic
+                    # auth `admin:admin` from the env vars only takes effect
+                    # outside standalone mode. v3 uses Simple Auth Manager with
+                    # ALL_ADMINS=true so no token is needed.
+                    if not is_v3:
+                        _capture_v2_admin_password(env, container)
+                else:
+                    logger.warning("MWAA: Airflow container for %s not ready after timeout", env_name)
+                    env["Status"] = "CREATE_FAILED"
+                    env.setdefault("LastUpdate", {})["Error"] = {
+                        "ErrorCode": "CONTAINER_STARTUP_TIMEOUT",
+                        "ErrorMessage": "Airflow container did not become healthy within 120s",
+                    }
+            finally:
+                set_request_account_id(previous_account)
+                set_request_region(previous_region)
 
         threading.Thread(target=_bg_init, daemon=True).start()
 
@@ -444,7 +493,11 @@ def _create_environment(method, path, headers, body, query_params):
     _environments[name] = env
 
     # Start container in background
-    threading.Thread(target=_start_airflow_container, args=(name, env), daemon=True).start()
+    threading.Thread(
+        target=_start_airflow_container,
+        args=(account_id, region, name, env),
+        daemon=True,
+    ).start()
 
     return json_response({"Arn": env["Arn"]}, status=200)
 
@@ -676,7 +729,7 @@ async def handle_request(method, path, headers, body, query_params):
 def reset():
     """Stop all containers and clear state."""
     docker_client = _get_docker()
-    for name, env in list(_environments.items()):
+    for (_, _, name), env in list(_environments.all_items()):
         container_id = env.get("_docker_container_id")
         if container_id and docker_client:
             try:

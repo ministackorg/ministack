@@ -855,3 +855,83 @@ def test_firehose_kinesis_source_ingest_is_region_scoped():
         _fh.reset()
         set_request_account_id(original_account)
         set_request_region(original_region)
+
+
+def _iceberg_test_con(bucket_arn):
+    """DuckDB connection attached to MiniStack's S3 Tables Iceberg REST catalog.
+    Skips the test if the iceberg/httpfs extensions or REST-catalog writes are
+    unavailable in this environment (e.g. offline CI or an old DuckDB)."""
+    import duckdb
+
+    parsed = urlparse(ENDPOINT)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 4566
+    con = duckdb.connect()
+    try:
+        con.execute("INSTALL iceberg; LOAD iceberg; INSTALL httpfs; LOAD httpfs;")
+        con.execute(
+            f"CREATE SECRET s (TYPE S3, KEY_ID 'test', SECRET 'test', "
+            f"ENDPOINT '{host}:{port}', URL_STYLE 'path', USE_SSL false, "
+            f"REGION 'us-east-1')"
+        )
+        con.execute(
+            f"ATTACH '{bucket_arn}' AS cat (TYPE ICEBERG, "
+            f"ENDPOINT '{ENDPOINT}/iceberg', AUTHORIZATION_TYPE 'none')"
+        )
+    except Exception as exc:  # pragma: no cover - environment dependent
+        con.close()
+        pytest.skip(f"DuckDB Iceberg REST writes unavailable: {exc}")
+    return con
+
+
+def test_firehose_iceberg_delivery_writes_queryable_rows(fh):
+    """DirectPut records delivered to an Iceberg (S3 Tables) destination are
+    written into the table via the Iceberg REST catalog and are queryable,
+    matching real Amazon Data Firehose. Operation defaults to insert."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    s3t = _regional_client("s3tables", "us-east-1")
+    bucket = s3t.create_table_bucket(name=f"fh-ice-{suffix}")["arn"]
+    s3t.create_namespace(tableBucketARN=bucket, namespace=["analytics"])
+    con = _iceberg_test_con(bucket)
+    con.execute("CREATE TABLE cat.analytics.events (id INTEGER, name VARCHAR)")
+    con.close()
+
+    stream = f"fh-ice-{suffix}"
+    fh.create_delivery_stream(
+        DeliveryStreamName=stream,
+        DeliveryStreamType="DirectPut",
+        IcebergDestinationConfiguration={
+            "RoleARN": "arn:aws:iam::000000000000:role/firehose-role",
+            "CatalogConfiguration": {"CatalogARN": bucket},
+            "S3Configuration": {
+                "BucketARN": "arn:aws:s3:::fh-ice-errors",
+                "RoleARN": "arn:aws:iam::000000000000:role/firehose-role",
+            },
+            "DestinationTableConfigurationList": [{
+                "DestinationDatabaseName": "analytics",
+                "DestinationTableName": "events",
+                "UniqueKeys": ["id"],
+            }],
+        },
+    )
+    try:
+        fh.put_record(
+            DeliveryStreamName=stream,
+            Record={"Data": json.dumps({"id": 1, "name": "alice"}).encode()},
+        )
+        rows = None
+        for _ in range(60):
+            try:
+                q = _iceberg_test_con(bucket)
+                rows = q.execute(
+                    "SELECT id, name FROM cat.analytics.events ORDER BY id"
+                ).fetchall()
+                q.close()
+                if rows == [(1, "alice")]:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
+        assert rows == [(1, "alice")]
+    finally:
+        fh.delete_delivery_stream(DeliveryStreamName=stream)
