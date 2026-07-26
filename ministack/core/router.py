@@ -524,6 +524,10 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             # Map common credential scope names
             scope_map = {
                 "monitoring": "monitoring",
+                # bedrock-agentcore-control and bedrock-agentcore both sign with
+                # credential scope "bedrock-agentcore" (verified via botocore
+                # signing_name); one handler serves both, dispatching by path.
+                "bedrock-agentcore": "bedrock-agentcore",
                 "execute-api": "apigateway",
                 "ses": "ses",
                 "states": "states",

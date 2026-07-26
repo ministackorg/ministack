@@ -29,6 +29,7 @@ STATE_FORMAT_VERSION = 2
 SERVICE_STATE_FORMAT_VERSIONS = {
     "appsync": 3,
     "autoscaling": 3,
+    "bedrock_agentcore": 3,
     "athena": 3,
     "emr": 3,
     "eks": 3,

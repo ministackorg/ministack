@@ -2667,6 +2667,48 @@ def test_athena_region_scoped_state_is_rejected_by_v2_reader(
     assert persistence.load_state("athena") is None
 
 
+def test_bedrock_agentcore_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject AgentCore's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    runtimes = AccountRegionScopedDict()
+    runtimes.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-runtime",
+        {
+            "agentRuntimeId": "regional-runtime",
+            "agentRuntimeArn": (
+                "arn:aws:bedrock-agentcore:us-west-2:000000000000:"
+                "agent/11111111-1111-1111-1111-111111111111:1"
+            ),
+        },
+    )
+    persistence.save_state(
+        "bedrock_agentcore",
+        {"runtimes": runtimes, "endpoints": AccountRegionScopedDict()},
+    )
+
+    raw = _json.loads((tmp_path / "bedrock_agentcore.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded = persistence.load_state("bedrock_agentcore")["runtimes"]
+    assert loaded.get_scoped(
+        "000000000000", "us-west-2", "regional-runtime"
+    )["agentRuntimeArn"].endswith(":1")
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("bedrock_agentcore") is None
+
+
 def test_inspector2_region_scoped_state_is_rejected_by_v2_reader(
     monkeypatch, tmp_path
 ):

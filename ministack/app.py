@@ -317,6 +317,7 @@ SERVICE_REGISTRY = {
     "bedrock-runtime": {"module": "bedrock_runtime"},
     "bedrock-agent": {"module": "bedrock_agent"},
     "bedrock-agent-runtime": {"module": "bedrock_agent_runtime"},
+    "bedrock-agentcore": {"module": "bedrock_agentcore"},
     "kafka": {"module": "msk"},
 }
 
@@ -361,6 +362,7 @@ _state_map = {
     "bedrock_runtime": "bedrock_runtime",
     "bedrock_agent": "bedrock_agent",
     "bedrock_agent_runtime": "bedrock_agent_runtime",
+    "bedrock_agentcore": "bedrock_agentcore",
     "msk": "msk",
 }
 
