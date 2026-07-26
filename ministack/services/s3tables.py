@@ -204,6 +204,7 @@ def _initial_iceberg_metadata(table_name, schema_fields, location):
         "sort-orders": [{"order-id": 0, "fields": []}],
         "properties": {}, "current-snapshot-id": -1, "refs": {},
         "snapshots": [], "statistics": [], "snapshot-log": [], "metadata-log": [],
+        "next-row-id": 0,
     }
 
 
@@ -511,13 +512,27 @@ def _iceberg_commit_table(namespace, table_name, data, allow_cross_region):
                 metadata["current-snapshot-id"] = snapshot.get("snapshot-id", -1)
                 metadata["last-updated-ms"] = int(time.time() * 1000)
                 metadata["last-sequence-number"] = metadata.get("last-sequence-number", 0) + 1
+                # V3 row lineage: advance the table's next-row-id past whatever
+                # row-ids this snapshot claims to have assigned (added-rows),
+                # so later commits/reads see a consistent, always-present value.
+                metadata["next-row-id"] = metadata.get("next-row-id", 0) + snapshot.get("added-rows", 0)
             elif action == "set-snapshot-ref":
                 metadata.setdefault("refs", {})[update.get("ref-name", "main")] = {
                     "snapshot-id": update.get("snapshot-id", -1),
                     "type": update.get("type", "branch")}
             elif action == "add-schema":
                 new_schema = update.get("schema", {})
-                metadata.setdefault("schemas", []).append(new_schema)
+                # Idempotent per the Iceberg REST spec: clients (e.g. Spark and
+                # DuckDB) re-send add-schema on every commit even when nothing
+                # changed, and don't always serialize the same schema identically
+                # (e.g. an empty identifier-field-ids present or absent) -- so
+                # comparing schemas isn't reliable. What actually breaks readers
+                # (Spark's schemasById()) is two entries sharing a schema-id, so
+                # enforce that invariant directly rather than deduping by content.
+                existing = metadata.setdefault("schemas", [])
+                new_id = new_schema.get("schema-id")
+                if not any(s.get("schema-id") == new_id for s in existing):
+                    existing.append(new_schema)
                 # Advance last-column-id to the highest field ID seen, so the next
                 # add-schema allocates fresh IDs instead of colliding with these.
                 field_ids = [f["id"] for f in new_schema.get("fields", []) if "id" in f]
@@ -527,12 +542,22 @@ def _iceberg_commit_table(namespace, table_name, data, allow_cross_region):
                 metadata["current-schema-id"] = update.get("schema-id", 0)
             elif action in ("add-spec", "add-partition-spec"):
                 # Accepts both "add-spec" (the spec's wire name) and the
-                # non-standard "add-partition-spec".
-                metadata.setdefault("partition-specs", []).append(update.get("spec", {}))
+                # non-standard "add-partition-spec". Idempotent by spec-id, same
+                # reasoning as add-schema above -- clients re-declare unchanged
+                # specs on every commit.
+                new_spec = update.get("spec", {})
+                specs = metadata.setdefault("partition-specs", [])
+                new_spec_id = new_spec.get("spec-id")
+                if not any(s.get("spec-id") == new_spec_id for s in specs):
+                    specs.append(new_spec)
             elif action == "set-default-spec":
                 metadata["default-spec-id"] = update.get("spec-id", 0)
             elif action == "add-sort-order":
-                metadata.setdefault("sort-orders", []).append(update.get("sort-order", {}))
+                new_order = update.get("sort-order", {})
+                orders = metadata.setdefault("sort-orders", [])
+                new_order_id = new_order.get("order-id")
+                if not any(o.get("order-id") == new_order_id for o in orders):
+                    orders.append(new_order)
             elif action == "set-default-sort-order":
                 metadata["default-sort-order-id"] = update.get("sort-order-id", 0)
             elif action == "set-properties":
