@@ -232,7 +232,8 @@ def _resolve_dest_update_config(data: dict):
     return None, None
 
 
-def _apply_lambda_processors(stream: dict, dest: dict, records: list) -> list:
+def _apply_lambda_processors(stream: dict, dest: dict, records: list,
+                             metadata_sink: dict = None) -> list:
     """Apply a destination's ProcessingConfiguration Lambda processors to a
     batch of records.
 
@@ -326,6 +327,13 @@ def _apply_lambda_processors(stream: dict, dest: dict, records: list) -> list:
                 # rather than silently dropping.
                 next_round.append((rid, raw))
                 continue
+            # Iceberg routing: capture the record's otfMetadata
+            # (destinationDatabaseName / destinationTableName / operation) that
+            # a transform Lambda attaches under `metadata.otfMetadata`.
+            if metadata_sink is not None:
+                otf = (r.get("metadata") or {}).get("otfMetadata")
+                if isinstance(otf, dict):
+                    metadata_sink[rid] = otf
             outcome = r.get("result", "Ok")
             if outcome in ("Dropped", "ProcessingFailed"):
                 continue
@@ -374,6 +382,158 @@ def _deliver_to_s3(stream: dict, dest: dict, record_data: bytes):
             asyncio.run(_put())
     except Exception as e:
         logger.warning("Firehose S3 delivery failed: %s", e)
+
+
+def _gateway_port() -> str:
+    return os.environ.get("GATEWAY_PORT", "4566")
+
+
+# Iceberg commits use optimistic concurrency: two writes racing on the same
+# table conflict and one loses. Real Firehose buffers and writes in batches;
+# MiniStack delivers per record, so serialize the commits to avoid conflicts.
+_ICEBERG_WRITE_LOCK = threading.Lock()
+
+
+def _iceberg_unique_keys(table_cfgs: list, db: str, table: str) -> list:
+    for tc in table_cfgs:
+        if (tc.get("DestinationDatabaseName") == db
+                and tc.get("DestinationTableName") == table):
+            return list(tc.get("UniqueKeys") or [])
+    return []
+
+
+def _iceberg_write_group(warehouse: str, db: str, table: str, keys: list, group: dict):
+    """Write one (db, table) batch into the Iceberg table via DuckDB, the
+    engine MiniStack already ships. Runs on a worker thread (it makes loopback
+    HTTP calls back into the gateway, so it must not run on the event loop).
+
+    Mirrors real Firehose Merge-on-Read semantics: ``insert`` appends,
+    ``update``/``delete`` match on the destination table's UniqueKeys.
+    """
+    import os as _os
+    import tempfile
+
+    import duckdb
+
+    port = _gateway_port()
+    region = get_region()
+    con = duckdb.connect()
+    con.execute("INSTALL iceberg; LOAD iceberg; INSTALL httpfs; LOAD httpfs;")
+    tbl = f'__cat."{db}"."{table}"'
+
+    def _tmp(recs):
+        fh = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump(recs, fh)
+        fh.close()
+        return fh.name
+
+    _ICEBERG_WRITE_LOCK.acquire()
+    try:
+        con.execute(
+            f"CREATE SECRET __ms_fh (TYPE S3, KEY_ID 'test', SECRET 'test', "
+            f"ENDPOINT 'localhost:{port}', URL_STYLE 'path', USE_SSL false, "
+            f"REGION '{region}')"
+        )
+        con.execute(
+            f"ATTACH '{warehouse}' AS __cat (TYPE ICEBERG, "
+            f"ENDPOINT 'http://localhost:{port}/iceberg', AUTHORIZATION_TYPE 'none')"
+        )
+        if group.get("insert"):
+            path = _tmp(group["insert"])
+            con.execute(
+                f"INSERT INTO {tbl} BY NAME "
+                f"SELECT * FROM read_json(?, format='array')", [path])
+            _os.unlink(path)
+        if group.get("update") and keys:
+            cols = [row[0] for row in con.execute(f"DESCRIBE {tbl}").fetchall()]
+            set_cols = [c for c in cols if c not in keys] or keys
+            on = " AND ".join(f't."{k}" = s."{k}"' for k in keys)
+            set_clause = ", ".join(f'"{c}" = s."{c}"' for c in set_cols)
+            path = _tmp(group["update"])
+            con.execute(
+                f"MERGE INTO {tbl} AS t USING "
+                f"(SELECT * FROM read_json(?, format='array')) AS s ON {on} "
+                f"WHEN MATCHED THEN UPDATE SET {set_clause}", [path])
+            _os.unlink(path)
+        if group.get("delete") and keys:
+            on = " AND ".join(f't."{k}" = s."{k}"' for k in keys)
+            path = _tmp(group["delete"])
+            con.execute(
+                f"MERGE INTO {tbl} AS t USING "
+                f"(SELECT * FROM read_json(?, format='array')) AS s ON {on} "
+                f"WHEN MATCHED THEN DELETE", [path])
+            _os.unlink(path)
+    finally:
+        try:
+            con.close()
+        finally:
+            _ICEBERG_WRITE_LOCK.release()
+
+
+def _deliver_to_iceberg(stream: dict, dest: dict, records: list):
+    """Deliver a batch of records to an Apache Iceberg destination (S3 Tables).
+
+    Per-record routing follows real Firehose: a transform Lambda's
+    ``otfMetadata`` (destinationDatabaseName / destinationTableName / operation)
+    takes precedence, otherwise the single ``DestinationTableConfigurationList``
+    entry is used. Operation defaults to ``insert``; ``update``/``delete``
+    require the destination table's ``UniqueKeys`` (otherwise AWS routes the
+    record to the S3 error bucket — here we log and skip).
+    """
+    cfg = dest.get("config") or {}
+    warehouse = (cfg.get("CatalogConfiguration") or {}).get("CatalogARN", "")
+    table_cfgs = cfg.get("DestinationTableConfigurationList") or []
+    default_tc = table_cfgs[0] if table_cfgs else {}
+    name = stream.get("name", "?")
+
+    meta: dict = {}
+    processed = _apply_lambda_processors(stream, dest, records, metadata_sink=meta)
+
+    groups: dict = {}
+    for rid, payload in processed:
+        try:
+            record = json.loads(payload)
+        except (ValueError, TypeError):
+            logger.warning("Firehose %s: non-JSON record for Iceberg "
+                           "destination dropped (AWS routes to S3 error bucket)", name)
+            continue
+        otf = meta.get(rid) or {}
+        db = otf.get("destinationDatabaseName") or default_tc.get("DestinationDatabaseName")
+        table = otf.get("destinationTableName") or default_tc.get("DestinationTableName")
+        op = (otf.get("operation") or "insert").lower()
+        if op not in ("insert", "update", "delete"):
+            op = "insert"
+        if not db or not table:
+            logger.warning("Firehose %s: record has no destination database/table; "
+                           "routed to S3 error bucket", name)
+            continue
+        keys = _iceberg_unique_keys(table_cfgs, db, table)
+        if op in ("update", "delete") and not keys:
+            logger.warning("Firehose %s: '%s' on %s.%s requires UniqueKeys; "
+                           "record routed to S3 error bucket", name, op, db, table)
+            continue
+        g = groups.setdefault(
+            (warehouse, db, table, tuple(keys)),
+            {"insert": [], "update": [], "delete": []},
+        )
+        g[op].append(record)
+
+    if not groups:
+        return
+
+    def _run():
+        for (wh, db, table, keys), group in groups.items():
+            try:
+                _iceberg_write_group(wh, db, table, list(keys), group)
+            except Exception as exc:
+                logger.warning("Firehose %s: Iceberg delivery to %s.%s failed: %s",
+                               name, db, table, exc)
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, _run)
+    except RuntimeError:
+        _run()
 
 
 def _record_id() -> str:
@@ -586,6 +746,8 @@ def _put_record(data: dict):
                     stream, dest, [(record_id, decoded)]
                 ):
                     _deliver_to_s3(stream, dest, payload)
+            elif dest["type"] == "Iceberg":
+                _deliver_to_iceberg(stream, dest, [(record_id, decoded)])
 
     return json_response({"RecordId": record_id, "Encrypted": False})
 
@@ -622,6 +784,8 @@ def _put_record_batch(data: dict):
                             stream, dest, [(record_id, decoded)]
                         ):
                             _deliver_to_s3(stream, dest, payload)
+                    elif dest["type"] == "Iceberg":
+                        _deliver_to_iceberg(stream, dest, [(record_id, decoded)])
                 responses.append({"RecordId": record_id, "Encrypted": False})
             except Exception as e:
                 failed += 1

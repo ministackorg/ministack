@@ -145,6 +145,171 @@ def test_eks_list_clusters(eks):
     eks.delete_cluster(name=name)
 
 
+def test_eks_resources_are_region_scoped_direct(eks_mod):
+    """Same-name clusters and children remain independent across regions."""
+    from ministack.core.responses import set_request_region
+
+    cluster_name = f"regional-{_uid()}"
+    nodegroup_name = "workers"
+    addon_name = "vpc-cni"
+    idp_name = "regional-idp"
+    principal_arn = "arn:aws:iam::000000000000:role/regional-access"
+    policy_arn = (
+        "arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy"
+    )
+    regions = {
+        "us-east-1": "east",
+        "us-west-2": "west",
+    }
+    cluster_arns = {}
+
+    for region, marker in regions.items():
+        set_request_region(region)
+        cluster_arn = _eks_direct_create_cluster(eks_mod, cluster_name)
+        cluster_arns[region] = cluster_arn
+        assert f":{region}:" in cluster_arn
+
+        status, _headers, _body = _eks_direct(
+            eks_mod,
+            "POST",
+            f"/clusters/{cluster_name}/node-groups",
+            {
+                "nodegroupName": nodegroup_name,
+                "nodeRole": "arn:aws:iam::000000000000:role/node-role",
+                "subnets": ["subnet-1"],
+            },
+        )
+        assert status == 200
+
+        status, _headers, _body = _eks_direct(
+            eks_mod,
+            "POST",
+            f"/clusters/{cluster_name}/addons",
+            {"addonName": addon_name},
+        )
+        assert status == 200
+
+        status, _headers, _body = _eks_direct(
+            eks_mod,
+            "POST",
+            f"/clusters/{cluster_name}/access-entries",
+            {"principalArn": principal_arn},
+        )
+        assert status == 200
+
+        encoded_principal = quote(principal_arn, safe="")
+        status, _headers, _body = _eks_direct(
+            eks_mod,
+            "POST",
+            (
+                f"/clusters/{cluster_name}/access-entries/"
+                f"{encoded_principal}/access-policies"
+            ),
+            {
+                "policyArn": policy_arn,
+                "accessScope": {"type": "cluster", "namespaces": []},
+            },
+        )
+        assert status == 200
+
+        status, _headers, _body = _eks_direct(
+            eks_mod,
+            "POST",
+            f"/clusters/{cluster_name}/identity-provider-configs/associate",
+            {
+                "oidc": {
+                    "identityProviderConfigName": idp_name,
+                    "issuerUrl": f"https://{marker}.example/issuer",
+                    "clientId": f"{marker}-client",
+                },
+            },
+        )
+        assert status == 200
+
+        status, _headers, _body = _eks_direct(
+            eks_mod,
+            "POST",
+            f"/tags/{quote(cluster_arn, safe='')}",
+            {"tags": {"region": marker}},
+        )
+        assert status == 200
+
+    for region, marker in regions.items():
+        set_request_region(region)
+        status, _headers, body = _eks_direct(
+            eks_mod, "GET", f"/clusters/{cluster_name}"
+        )
+        assert status == 200
+        assert body["cluster"]["arn"] == cluster_arns[region]
+
+        status, _headers, body = _eks_direct(
+            eks_mod, "GET", f"/clusters/{cluster_name}/node-groups"
+        )
+        assert status == 200
+        assert body["nodegroups"] == [nodegroup_name]
+
+        status, _headers, body = _eks_direct(
+            eks_mod, "GET", f"/clusters/{cluster_name}/addons"
+        )
+        assert status == 200
+        assert body["addons"] == [addon_name]
+
+        status, _headers, body = _eks_direct(
+            eks_mod, "GET", f"/clusters/{cluster_name}/access-entries"
+        )
+        assert status == 200
+        assert body["accessEntries"] == [principal_arn]
+
+        status, _headers, body = _eks_direct(
+            eks_mod,
+            "GET",
+            (
+                f"/clusters/{cluster_name}/access-entries/"
+                f"{quote(principal_arn, safe='')}/access-policies"
+            ),
+        )
+        assert status == 200
+        assert [policy["policyArn"] for policy in body["associatedAccessPolicies"]] == [
+            policy_arn
+        ]
+
+        status, _headers, body = _eks_direct(
+            eks_mod,
+            "POST",
+            f"/clusters/{cluster_name}/identity-provider-configs/describe",
+            {"identityProviderConfig": {"type": "oidc", "name": idp_name}},
+        )
+        assert status == 200
+        oidc = body["identityProviderConfig"]["oidc"]
+        assert oidc["clientId"] == f"{marker}-client"
+
+        status, _headers, body = _eks_direct(
+            eks_mod,
+            "GET",
+            f"/tags/{quote(cluster_arns[region], safe='')}",
+        )
+        assert status == 200
+        assert body["tags"] == {"region": marker}
+
+    set_request_region("us-east-1")
+    status, _headers, _body = _eks_direct(
+        eks_mod, "DELETE", f"/clusters/{cluster_name}"
+    )
+    assert status == 200
+
+    set_request_region("us-west-2")
+    status, _headers, body = _eks_direct(
+        eks_mod, "GET", f"/clusters/{cluster_name}"
+    )
+    assert status == 200
+    assert body["cluster"]["arn"] == cluster_arns["us-west-2"]
+    status, _headers, body = _eks_direct(
+        eks_mod, "GET", f"/clusters/{cluster_name}/node-groups"
+    )
+    assert status == 200
+    assert body["nodegroups"] == [nodegroup_name]
+
+
 def test_eks_delete_nonexistent_cluster(eks):
     with pytest.raises(ClientError) as exc:
         eks.delete_cluster(name="nonexistent-cluster-xyz")
@@ -440,7 +605,7 @@ def test_eks_k3s_run_kwargs_includes_privileged():
     """Regression for #611: k3s server mode needs privileged=True."""
     from ministack.services.eks import _k3s_run_kwargs
 
-    kwargs = _k3s_run_kwargs(name="test-cluster", port=16443)
+    kwargs = _k3s_run_kwargs(name="test-cluster", region=REGION, port=16443)
 
     assert kwargs["privileged"] is True, (
         "k3s requires privileged=True — without it the cgroup remount fails "
@@ -453,7 +618,7 @@ def test_eks_k3s_run_kwargs_port_mapping():
     as missing — it wasn't, but lock it in so it stays present)."""
     from ministack.services.eks import _k3s_run_kwargs
 
-    kwargs = _k3s_run_kwargs(name="test-cluster", port=16443)
+    kwargs = _k3s_run_kwargs(name="test-cluster", region=REGION, port=16443)
     assert kwargs["ports"] == {"6443/tcp": 16443}
 
 
@@ -461,21 +626,30 @@ def test_eks_k3s_run_kwargs_network_optional():
     """`network` is set only when ms_network is provided."""
     from ministack.services.eks import _k3s_run_kwargs
 
-    no_net = _k3s_run_kwargs(name="c1", port=16443)
+    no_net = _k3s_run_kwargs(name="c1", region=REGION, port=16443)
     assert "network" not in no_net
 
-    with_net = _k3s_run_kwargs(name="c1", port=16443, ms_network="ministack-net")
+    with_net = _k3s_run_kwargs(
+        name="c1", region=REGION, port=16443, ms_network="ministack-net"
+    )
     assert with_net["network"] == "ministack-net"
 
 
-def test_eks_k3s_run_kwargs_container_name_and_labels():
-    """Each cluster's k3s container is named and labelled so `_stop_all_k3s`
-    can find it. Lock the shape used by that lookup."""
+def test_eks_k3s_run_kwargs_container_name_and_labels_are_region_scoped():
+    """Same-name clusters in different regions need distinct containers."""
     from ministack.services.eks import _k3s_run_kwargs
 
-    kwargs = _k3s_run_kwargs(name="my-cluster", port=16443)
-    assert kwargs["name"] == "ministack-eks-my-cluster"
-    assert kwargs["labels"] == {"ministack": "eks", "cluster_name": "my-cluster"}
+    east = _k3s_run_kwargs(name="my-cluster", region="us-east-1", port=16443)
+    west = _k3s_run_kwargs(name="my-cluster", region="us-west-2", port=16444)
+
+    assert east["name"] == "ministack-eks-us-east-1-my-cluster"
+    assert west["name"] == "ministack-eks-us-west-2-my-cluster"
+    assert east["labels"] == {
+        "ministack": "eks",
+        "cluster_name": "my-cluster",
+        "region": "us-east-1",
+    }
+    assert west["labels"]["region"] == "us-west-2"
 
 
 def test_eks_k3s_run_kwargs_host_gateway_extra_host():
@@ -483,7 +657,7 @@ def test_eks_k3s_run_kwargs_host_gateway_extra_host():
     registry mirroring (#1054) — host.docker.internal via host-gateway."""
     from ministack.services.eks import _k3s_run_kwargs
 
-    kwargs = _k3s_run_kwargs(name="c1", port=16443)
+    kwargs = _k3s_run_kwargs(name="c1", region=REGION, port=16443)
     assert kwargs["extra_hosts"] == {"host.docker.internal": "host-gateway"}
 
 
@@ -1108,6 +1282,7 @@ def test_eks_k3s_run_kwargs_appends_node_labels():
 
     run_kwargs = _k3s_run_kwargs(
         name="t",
+        region=REGION,
         port=16443,
         node_labels=["--node-label=topology.kubernetes.io/zone=us-east-1a"],
     )
