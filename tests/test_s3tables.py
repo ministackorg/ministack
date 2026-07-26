@@ -627,6 +627,59 @@ def test_s3tables_iceberg_transactions_commit(s3tables):
         s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
 
 
+def test_s3tables_iceberg_add_snapshot_is_idempotent_by_snapshot_id(s3tables):
+    """A resent add-snapshot commit (e.g. a client retry after a timed-out response
+    that actually landed) must not duplicate the snapshot -- Iceberg's own
+    snapshotsById() crashes with "Multiple entries with same key" if it does, since
+    it maps the snapshots list by snapshot-id."""
+    bucket_name = f"tb-snap-{_uuid_mod.uuid4().hex[:6]}"
+    bucket_arn = s3tables.create_table_bucket(name=bucket_name)["arn"]
+    ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
+    table = f"t_{_uuid_mod.uuid4().hex[:6]}"
+    try:
+        s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
+        s3tables.create_table(tableBucketARN=bucket_arn, namespace=ns, name=table, format="ICEBERG")
+
+        snapshot_id = 4546744772296523781
+        payload = {
+            "requirements": [],
+            "updates": [
+                {
+                    "action": "add-snapshot",
+                    "snapshot": {
+                        "snapshot-id": snapshot_id,
+                        "sequence-number": 1,
+                        "timestamp-ms": 1700000000000,
+                        "manifest-list": f"s3://{bucket_name}/{ns}/{table}/metadata/snap.avro",
+                        "summary": {"operation": "append", "added-rows": 4},
+                    },
+                },
+            ],
+        }
+
+        # Send the identical commit twice, simulating a client retry of a commit
+        # whose first response was lost (e.g. a slow/overloaded server).
+        for _ in range(2):
+            _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}", method="POST", payload=payload)
+
+        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        metadata = loaded["metadata"]
+        snap_ids = [s.get("snapshot-id") for s in metadata["snapshots"]]
+        assert snap_ids.count(snapshot_id) == 1, "resent add-snapshot must not duplicate the snapshot"
+        assert metadata["current-snapshot-id"] == snapshot_id
+        assert metadata["last-sequence-number"] == 1, "a no-op retry must not advance last-sequence-number again"
+    finally:
+        try:
+            s3tables.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=table)
+        except Exception:
+            pass
+        try:
+            s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
+        except Exception:
+            pass
+        s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
+
+
 def test_s3tables_iceberg_add_schema_advances_last_column_id(s3tables):
     """Each add-schema commit must bump last-column-id to the new schema's highest
     field ID, so a client allocating the *next* column's ID (e.g. DuckDB's

@@ -507,15 +507,23 @@ def _iceberg_commit_table(namespace, table_name, data, allow_cross_region):
         for update in data.get("updates", []):
             action = update.get("action", "")
             if action == "add-snapshot":
+                # Idempotent per the Iceberg REST spec, same reasoning as add-schema
+                # below -- a client can resend a commit whose response it never saw
+                # (e.g. a timeout) after it already landed. Guard by snapshot-id like
+                # the other add-* actions do, instead of appending unconditionally,
+                # or a resent commit duplicates the snapshot and later readers
+                # (Iceberg's snapshotsById()) crash with "Multiple entries with same key".
                 snapshot = update.get("snapshot", {})
-                metadata.setdefault("snapshots", []).append(snapshot)
+                existing = metadata.setdefault("snapshots", [])
+                if not any(s.get("snapshot-id") == snapshot.get("snapshot-id") for s in existing):
+                    existing.append(snapshot)
+                    # V3 row lineage: advance the table's next-row-id past whatever
+                    # row-ids this snapshot claims to have assigned (added-rows), so
+                    # later commits/reads see a consistent, always-present value.
+                    metadata["next-row-id"] = metadata.get("next-row-id", 0) + snapshot.get("added-rows", 0)
+                    metadata["last-sequence-number"] = metadata.get("last-sequence-number", 0) + 1
                 metadata["current-snapshot-id"] = snapshot.get("snapshot-id", -1)
                 metadata["last-updated-ms"] = int(time.time() * 1000)
-                metadata["last-sequence-number"] = metadata.get("last-sequence-number", 0) + 1
-                # V3 row lineage: advance the table's next-row-id past whatever
-                # row-ids this snapshot claims to have assigned (added-rows),
-                # so later commits/reads see a consistent, always-present value.
-                metadata["next-row-id"] = metadata.get("next-row-id", 0) + snapshot.get("added-rows", 0)
             elif action == "set-snapshot-ref":
                 metadata.setdefault("refs", {})[update.get("ref-name", "main")] = {
                     "snapshot-id": update.get("snapshot-id", -1),
