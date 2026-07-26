@@ -627,6 +627,77 @@ def test_s3tables_iceberg_transactions_commit(s3tables):
         s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
 
 
+def test_s3tables_iceberg_create_table_rejects_resend_instead_of_wiping_data(s3tables):
+    """CreateTable is not idempotent per the Iceberg REST spec -- a resent create
+    (e.g. a client retry after a lost response to a create that already landed)
+    must be rejected with a conflict, matching the S3 Tables control-plane path's
+    existing 409 behaviour. Before this guard, a resend silently replaced the
+    table's metadata with a fresh empty one, discarding any snapshots/schema
+    already committed -- worse than a crash, since nothing signals data was lost."""
+    bucket_name = f"tb-createretry-{_uuid_mod.uuid4().hex[:6]}"
+    bucket_arn = s3tables.create_table_bucket(name=bucket_name)["arn"]
+    ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
+    table = f"t_{_uuid_mod.uuid4().hex[:6]}"
+    try:
+        s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
+
+        _iceberg_json(
+            f"/iceberg/v1/namespaces/{ns}/tables",
+            method="POST",
+            payload={"name": table, "schema": {"type": "struct", "schema-id": 0, "fields": []}},
+        )
+        # Commit a snapshot so there's real state a resent create could destroy.
+        snapshot_id = 42
+        _iceberg_json(
+            f"/iceberg/v1/namespaces/{ns}/tables/{table}",
+            method="POST",
+            payload={
+                "requirements": [],
+                "updates": [
+                    {
+                        "action": "add-snapshot",
+                        "snapshot": {
+                            "snapshot-id": snapshot_id,
+                            "sequence-number": 1,
+                            "timestamp-ms": 1700000000000,
+                            "manifest-list": f"s3://{bucket_name}/{ns}/{table}/metadata/snap.avro",
+                            "summary": {"operation": "append"},
+                        },
+                    },
+                ],
+            },
+        )
+
+        # Resend the identical create, simulating a retry of a create whose first
+        # response was lost.
+        try:
+            _iceberg_json(
+                f"/iceberg/v1/namespaces/{ns}/tables",
+                method="POST",
+                payload={"name": table, "schema": {"type": "struct", "schema-id": 0, "fields": []}},
+            )
+            assert False, "expected a 409 conflict on resent CreateTable"
+        except urllib.error.HTTPError as e:
+            assert e.code == 409
+            body = json.loads(e.read().decode("utf-8"))
+            assert body["error"]["type"] == "AlreadyExistsException"
+
+        # The original snapshot must still be there -- not wiped by the resend.
+        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        snap_ids = [s.get("snapshot-id") for s in loaded["metadata"]["snapshots"]]
+        assert snapshot_id in snap_ids, "resent create-table must not wipe existing table state"
+    finally:
+        try:
+            s3tables.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=table)
+        except Exception:
+            pass
+        try:
+            s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
+        except Exception:
+            pass
+        s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
+
+
 def test_s3tables_iceberg_add_snapshot_is_idempotent_by_snapshot_id(s3tables):
     """A resent add-snapshot commit (e.g. a client retry after a timed-out response
     that actually landed) must not duplicate the snapshot -- Iceberg's own

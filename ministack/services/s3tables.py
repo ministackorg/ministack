@@ -597,6 +597,19 @@ def _iceberg_create_table(namespace, data, allow_cross_region):
     if not bucket_arn:
         return _error_response_iceberg("NoSuchNamespaceException", f"Namespace {namespace} not found", 404)
 
+    key = _table_key(bucket_arn, namespace, table_name)
+    if key in _tables:
+        # Not idempotent by design, per the Iceberg REST spec -- a resent CreateTable
+        # (e.g. a client retry after a lost response to a create that already landed)
+        # must be rejected, the same conflict the S3 Tables control-plane path
+        # (_create_table, above) already enforces. Without this check, a retry
+        # silently wipes the existing table's schemas/snapshots/data and replaces
+        # it with an empty fresh one -- worse than a crash, since it loses data
+        # with no error raised at all.
+        return _error_response_iceberg(
+            "AlreadyExistsException", f"Table already exists: {namespace}.{table_name}", 409
+        )
+
     schema_fields = [{"name": f.get("name", ""), "type": f.get("type", "string") if isinstance(f.get("type"), str) else "string",
                        "required": f.get("required", False)} for f in schema.get("fields", [])]
 
@@ -613,7 +626,6 @@ def _iceberg_create_table(namespace, data, allow_cross_region):
         iceberg_metadata["default-spec-id"] = partition_spec.get("spec-id", 0)
     metadata_location = f"s3://{bucket_name}/{namespace}/{table_name}/metadata/v0.metadata.json"
     arn = _table_arn(bucket_arn, namespace, table_name)
-    key = _table_key(bucket_arn, namespace, table_name)
 
     table = {
         "name": table_name, "tableARN": arn, "namespace": [namespace],
