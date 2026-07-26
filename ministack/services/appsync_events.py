@@ -28,6 +28,7 @@ import time
 
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -45,15 +46,15 @@ _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 # ---------------------------------------------------------------------------
 
 # apiId -> api record
-_apis = AccountScopedDict()
+_apis = AccountRegionScopedDict()
 # apiId -> {name -> channel namespace record}
-_channel_namespaces = AccountScopedDict()
+_channel_namespaces = AccountRegionScopedDict()
 # apiId -> {keyId -> api key record}
-_api_keys = AccountScopedDict()
+_api_keys = AccountRegionScopedDict()
 
 # Active realtime connections, keyed by opaque connection id assigned on accept.
-# {connection_id -> {"api_id": str, "account_id": str, "outbox": asyncio.Queue,
-#                     "subscriptions": {sub_id -> pattern}}}
+# {connection_id -> {"api_id": str, "account_id": str, "region": str,
+#                     "outbox": asyncio.Queue, "subscriptions": {sub_id -> pattern}}}
 _connections: dict[str, dict] = {}
 _connections_lock: asyncio.Lock | None = None
 
@@ -63,6 +64,14 @@ def _get_connections_lock() -> asyncio.Lock:
     if _connections_lock is None:
         _connections_lock = asyncio.Lock()
     return _connections_lock
+
+
+def _discover_api_scope(api_id: str, account_id: str) -> tuple[str, str] | None:
+    """Return the API's account/region scope without crossing tenants."""
+    for (scoped_account_id, region, scoped_api_id), _api in _apis.all_items():
+        if scoped_account_id == account_id and scoped_api_id == api_id:
+            return scoped_account_id, region
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -79,12 +88,37 @@ def get_state():
     }
 
 
+def _restore_api_child_store(
+    store: AccountRegionScopedDict,
+    restored: AccountRegionScopedDict | AccountScopedDict | dict,
+) -> None:
+    """Adopt legacy namespace/key records into their parent API's region."""
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+    if not restored:
+        return
+
+    if isinstance(restored, AccountScopedDict):
+        items = restored._data.items()
+    else:
+        account_id = get_account_id()
+        items = (((account_id, api_id), value) for api_id, value in restored.items())
+
+    for (account_id, api_id), value in items:
+        api_scope = _discover_api_scope(api_id, account_id)
+        region = api_scope[1] if api_scope else get_region()
+        store.set_scoped(account_id, region, api_id, value)
+
+
 def restore_state(data):
     if not data:
         return
     _apis.update(data.get("apis", {}))
-    _channel_namespaces.update(data.get("channel_namespaces", {}))
-    _api_keys.update(data.get("api_keys", {}))
+    _restore_api_child_store(
+        _channel_namespaces, data.get("channel_namespaces", {})
+    )
+    _restore_api_child_store(_api_keys, data.get("api_keys", {}))
 
 
 # Same contract as apigateway.py (used by app.py persistence loader)
@@ -110,7 +144,15 @@ def reset():
 # Helpers
 # ---------------------------------------------------------------------------
 
-_APPSYNC_API_HOST_RE = re.compile(r"^([a-z0-9]+)\.appsync-api\.")
+_AWS_REGION_HOST_SEGMENT = r"[a-z0-9]+(?:-[a-z0-9]+)+-\d+"
+_APPSYNC_API_HOST_RE = re.compile(
+    rf"^([a-z0-9]+)\.appsync-api"
+    rf"(?:\.({_AWS_REGION_HOST_SEGMENT}))?(?:[.:]|$)"
+)
+_APPSYNC_REALTIME_HOST_RE = re.compile(
+    rf"^([a-z0-9]+)\.appsync-realtime-api"
+    rf"(?:\.({_AWS_REGION_HOST_SEGMENT}))?(?:[.:]|$)"
+)
 
 
 def _now() -> int:
@@ -153,6 +195,18 @@ def _default_dns_for_api(api_id: str) -> dict[str, str]:
             f"{api_id}.appsync-realtime-api.{region}.{mini_host}:{port}"
         ),
     }
+
+
+def _is_advertised_dns_host(
+    api_id: str, host: str, dns_kind: str
+) -> bool:
+    """Return whether ``host`` is the stored endpoint for the scoped API."""
+    api = _apis.get(api_id)
+    advertised_host = api.get("dns", {}).get(dns_kind) if api else None
+    return (
+        isinstance(advertised_host, str)
+        and host.lower() == advertised_host.lower()
+    )
 
 
 def _default_event_config(requested: dict | None) -> dict:
@@ -531,7 +585,14 @@ async def handle_request(method, path, headers, body, query_params):
     host = headers.get("host", "")
     host_match = _APPSYNC_API_HOST_RE.match(host)
     if host_match and path == "/event" and method == "POST":
-        return await _publish(host_match.group(1), headers, body)
+        return await _publish_from_host(
+            host_match.group(1),
+            host_match.group(2),
+            host,
+            headers,
+            body,
+            query_params,
+        )
 
     if path.startswith("/v2/apis"):
         return await _handle_mgmt(method, path, headers, body, query_params)
@@ -811,6 +872,53 @@ def _delete_api_key(api_id, key_id):
 # Data plane — HTTP publish
 # ---------------------------------------------------------------------------
 
+def _has_sigv4_credentials(headers: dict, query_params: dict | None) -> bool:
+    """Return whether the publish request carries an explicit SigV4 region."""
+    query_params = query_params or {}
+    auth = headers.get("authorization") or headers.get("Authorization") or ""
+    if auth.startswith("AWS4-HMAC-SHA256") and "Credential=" in auth:
+        return True
+
+    credential = (
+        query_params.get("X-Amz-Credential")
+        or query_params.get("x-amz-credential")
+    )
+    if isinstance(credential, (list, tuple)):
+        credential = credential[0] if credential else ""
+    return bool(credential)
+
+
+async def _publish_from_host(
+    api_id: str,
+    host_region: str | None,
+    host: str,
+    headers: dict,
+    body: bytes,
+    query_params: dict | None,
+):
+    """Publish in the host API's region when API-key auth supplies no SigV4 scope."""
+    if _has_sigv4_credentials(headers, query_params):
+        return await _publish(api_id, headers, body)
+
+    api_scope = _discover_api_scope(api_id, get_account_id())
+    if api_scope is None:
+        return _not_found(f"Api {api_id} not found")
+
+    from ministack.core.responses import _request_region
+
+    region_token = _request_region.set(api_scope[1])
+    try:
+        if (
+            not _is_advertised_dns_host(api_id, host, "HTTP")
+            and host_region is not None
+            and api_scope[1] != host_region
+        ):
+            return _not_found(f"Api {api_id} not found")
+        return await _publish(api_id, headers, body)
+    finally:
+        _request_region.reset(region_token)
+
+
 async def _publish(api_id: str, headers: dict, body: bytes):
     if api_id not in _apis:
         return _not_found(f"Api {api_id} not found")
@@ -935,6 +1043,48 @@ async def handle_websocket(scope, receive, send, api_id: str):
     if msg.get("type") != "websocket.connect":
         return
 
+    host = ""
+    for name, value in scope.get("headers", []):
+        if name.decode("latin-1").lower() == "host":
+            host = value.decode("latin-1")
+            break
+    host_match = _APPSYNC_REALTIME_HOST_RE.match(host)
+    host_region = host_match.group(2) if host_match else None
+
+    account_id = get_account_id()
+    api_scope = _discover_api_scope(api_id, account_id)
+    if api_scope is None:
+        await send({"type": "websocket.close", "code": 1008})
+        return
+
+    from ministack.core.responses import _request_account_id, _request_region
+    account_id, region = api_scope
+    account_token = _request_account_id.set(account_id)
+    region_token = _request_region.set(region)
+    try:
+        if (
+            not _is_advertised_dns_host(api_id, host, "REALTIME")
+            and host_region is not None
+            and region != host_region
+        ):
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        await _handle_websocket_in_api_scope(
+            scope, receive, send, api_id, account_id, region
+        )
+    finally:
+        _request_region.reset(region_token)
+        _request_account_id.reset(account_token)
+
+
+async def _handle_websocket_in_api_scope(
+    scope,
+    receive,
+    send,
+    api_id: str,
+    account_id: str,
+    region: str,
+):
     if api_id not in _apis:
         await send({"type": "websocket.close", "code": 1008})
         return
@@ -1015,16 +1165,13 @@ async def handle_websocket(scope, receive, send, api_id: str):
         ):
             return
 
-    from ministack.core.responses import _request_account_id
-    account_id = get_account_id()
-    token = _request_account_id.set(account_id)
-
     connection_id = new_uuid()
     outbox: asyncio.Queue = asyncio.Queue()
     async with _get_connections_lock():
         _connections[connection_id] = {
             "api_id": api_id,
             "account_id": account_id,
+            "region": region,
             "outbox": outbox,
             "subscriptions": {},
             "auth": conn_auth,
@@ -1089,7 +1236,6 @@ async def handle_websocket(scope, receive, send, api_id: str):
         ka_task.cancel()
         async with _get_connections_lock():
             _connections.pop(connection_id, None)
-        _request_account_id.reset(token)
         try:
             await send({"type": "websocket.close", "code": 1000})
         except Exception:

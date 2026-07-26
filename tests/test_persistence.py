@@ -259,6 +259,163 @@ def test_account_scoped_dict_helpers_remain_account_only():
         set_request_account_id(original_account)
 
 
+def test_appsync_events_legacy_children_follow_parent_api_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import appsync_events as service
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    api_region = "us-west-2"
+    api_id = "legacy-regional-api"
+    orphan_api_id = "legacy-orphan-api"
+
+    apis = AccountScopedDict()
+    apis._data[(account_id, api_id)] = {
+        "name": "legacy-api",
+        "apiArn": f"arn:aws:appsync:{api_region}:{account_id}:apis/{api_id}",
+    }
+    namespaces = AccountScopedDict()
+    namespaces._data[(account_id, api_id)] = {
+        "default": {"created": 1},
+    }
+    namespaces._data[(account_id, orphan_api_id)] = {
+        "orphan": {"created": 2},
+    }
+    api_keys = AccountScopedDict()
+    api_keys._data[(account_id, api_id)] = {
+        "da2-legacy": {"description": "legacy"},
+    }
+
+    service.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        service.restore_state(
+            {
+                "apis": apis,
+                "channel_namespaces": namespaces,
+                "api_keys": api_keys,
+            }
+        )
+
+        assert service._apis.get_scoped(account_id, api_region, api_id)[
+            "apiArn"
+        ].startswith(f"arn:aws:appsync:{api_region}:")
+        assert service._channel_namespaces.get_scoped(
+            account_id, api_region, api_id
+        ) == {"default": {"created": 1}}
+        assert service._api_keys.get_scoped(account_id, api_region, api_id) == {
+            "da2-legacy": {"description": "legacy"},
+        }
+        assert (
+            service._channel_namespaces.get_scoped(
+                account_id, boot_region, api_id
+            )
+            is None
+        )
+        assert (
+            service._api_keys.get_scoped(account_id, boot_region, api_id) is None
+        )
+        assert service._channel_namespaces.get_scoped(
+            account_id, boot_region, orphan_api_id
+        ) == {"orphan": {"created": 2}}
+    finally:
+        service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_appsync_events_v2_region_scoped_state_round_trip(monkeypatch, tmp_path):
+    import json as _json
+
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import appsync_events as service
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    api_region = "us-west-2"
+    api_id = "current-regional-api"
+
+    apis = AccountRegionScopedDict()
+    apis.set_scoped(
+        account_id,
+        api_region,
+        api_id,
+        {
+            "name": "current-api",
+            "apiArn": f"arn:aws:appsync:{api_region}:{account_id}:apis/{api_id}",
+        },
+    )
+    namespaces = AccountRegionScopedDict()
+    namespaces.set_scoped(
+        account_id,
+        api_region,
+        api_id,
+        {"default": {"created": 1}},
+    )
+    api_keys = AccountRegionScopedDict()
+    api_keys.set_scoped(
+        account_id,
+        api_region,
+        api_id,
+        {"da2-current": {"description": "current"}},
+    )
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+    (tmp_path / "appsync_events.json").write_text(
+        _json.dumps(
+            {
+                "__ministack_format__": 2,
+                "payload": {
+                    "apis": apis,
+                    "channel_namespaces": namespaces,
+                    "api_keys": api_keys,
+                },
+            },
+            default=persistence._json_default,
+        )
+    )
+
+    loaded = persistence.load_state("appsync_events")
+    service.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        service.restore_state(loaded)
+
+        assert service._apis.get_scoped(account_id, api_region, api_id)[
+            "apiArn"
+        ].startswith(f"arn:aws:appsync:{api_region}:")
+        assert service._channel_namespaces.get_scoped(
+            account_id, api_region, api_id
+        ) == {"default": {"created": 1}}
+        assert service._api_keys.get_scoped(account_id, api_region, api_id) == {
+            "da2-current": {"description": "current"},
+        }
+        assert service._apis.get_scoped(account_id, boot_region, api_id) is None
+    finally:
+        service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 @pytest.mark.parametrize("svc_key,mod_name", ALL_PERSISTED_SERVICES)
 def test_service_has_restore_path(svc_key, mod_name):
     """Every service in `_state_map` must expose a way to restore its own state.
@@ -2255,6 +2412,43 @@ def test_appsync_region_scoped_state_is_rejected_by_v2_reader(
     # Simulate the previous binary, whose highest understood format is v2.
     monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
     assert persistence.load_state("appsync") is None
+
+
+def test_appsync_events_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject AppSync Events' regional schema instead
+    of accepting it as v2 and silently dropping APIs, namespaces, and keys."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    apis = AccountRegionScopedDict()
+    apis.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-events-api",
+        {
+            "apiArn": (
+                "arn:aws:appsync:us-west-2:000000000000:"
+                "apis/regional-events-api"
+            ),
+        },
+    )
+    persistence.save_state("appsync_events", {"apis": apis})
+
+    raw = _json.loads((tmp_path / "appsync_events.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_apis = persistence.load_state("appsync_events")["apis"]
+    assert loaded_apis.get_scoped(
+        "000000000000", "us-west-2", "regional-events-api"
+    )["apiArn"].endswith("apis/regional-events-api")
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("appsync_events") is None
 
 
 def test_eks_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
