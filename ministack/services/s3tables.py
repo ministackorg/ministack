@@ -204,6 +204,7 @@ def _initial_iceberg_metadata(table_name, schema_fields, location):
         "sort-orders": [{"order-id": 0, "fields": []}],
         "properties": {}, "current-snapshot-id": -1, "refs": {},
         "snapshots": [], "statistics": [], "snapshot-log": [], "metadata-log": [],
+        "next-row-id": 0,
     }
 
 
@@ -443,6 +444,19 @@ def _iceberg_config():
     }, "overrides": {}})
 
 
+def _iceberg_error(message, exc_type, code):
+    """Iceberg REST catalog error envelope, per the Iceberg REST OpenAPI
+    ``ErrorModel`` (``{"error": {"message", "type", "code"}}``). This is the
+    shape spec-compliant REST clients (DuckDB, Spark, Trino) require, and is
+    distinct from the AWS ``{"__type", "message"}`` shape the S3 Tables control
+    plane returns. A client hitting LoadTable on a not-yet-created table must
+    receive a proper ``NoSuchTableException`` so it proceeds to create it."""
+    body = json.dumps(
+        {"error": {"message": message, "type": exc_type, "code": code}}
+    ).encode("utf-8")
+    return code, {"Content-Type": "application/json"}, body
+
+
 def _iceberg_allows_cross_region(headers):
     return _SIGV4_CREDENTIAL_REGION_RE.search(headers.get("authorization", "")) is None
 
@@ -457,7 +471,7 @@ def _iceberg_list_namespaces(allow_cross_region):
 def _iceberg_get_namespace(namespace, allow_cross_region):
     if _iceberg_values(_namespaces, lambda ns: _namespace_name(ns) == namespace, allow_cross_region):
         return json_response({"namespace": [namespace], "properties": {}})
-    return error_response_json("NotFoundException", f"Namespace {namespace} not found", 404)
+    return _iceberg_error(f"Namespace {namespace} not found", "NoSuchNamespaceException", 404)
 
 
 def _iceberg_list_tables(namespace, allow_cross_region):
@@ -484,7 +498,7 @@ def _iceberg_load_table(namespace, table_name, allow_cross_region):
                 "s3.region": get_region(), "client.region": get_region(),
             },
         })
-    return error_response_json("NotFoundException", f"Table {namespace}.{table_name} not found", 404)
+    return _iceberg_error(f"Table {namespace}.{table_name} not found", "NoSuchTableException", 404)
 
 
 def _iceberg_commit_table(namespace, table_name, data, allow_cross_region):
@@ -509,10 +523,20 @@ def _iceberg_commit_table(namespace, table_name, data, allow_cross_region):
                     "snapshot-id": update.get("snapshot-id", -1),
                     "type": update.get("type", "branch")}
             elif action == "add-schema":
-                metadata.setdefault("schemas", []).append(update.get("schema", {}))
+                new_schema = update.get("schema", {})
+                metadata.setdefault("schemas", []).append(new_schema)
+                # Advance last-column-id to the highest field ID in the new
+                # schema, so a client allocating the next column's ID (e.g.
+                # DuckDB ALTER TABLE ADD COLUMN) doesn't collide with these.
+                field_ids = [f["id"] for f in new_schema.get("fields", []) if "id" in f]
+                if field_ids:
+                    metadata["last-column-id"] = max(metadata.get("last-column-id", 0), max(field_ids))
             elif action == "set-current-schema":
                 metadata["current-schema-id"] = update.get("schema-id", 0)
-            elif action == "add-partition-spec":
+            elif action in ("add-spec", "add-partition-spec"):
+                # "add-spec" is the Iceberg REST spec's action name (what
+                # duckdb-iceberg sends); "add-partition-spec" is a non-standard
+                # alias some hand-rolled callers use. Accept both.
                 metadata.setdefault("partition-specs", []).append(update.get("spec", {}))
             elif action == "set-default-spec":
                 metadata["default-spec-id"] = update.get("spec-id", 0)
@@ -536,7 +560,7 @@ def _iceberg_commit_table(namespace, table_name, data, allow_cross_region):
         table["modifiedAt"] = now_iso()
         return json_response({"metadata-location": new_loc, "metadata": metadata})
 
-    return error_response_json("NotFoundException", f"Table {namespace}.{table_name} not found", 404)
+    return _iceberg_error(f"Table {namespace}.{table_name} not found", "NoSuchTableException", 404)
 
 
 def _iceberg_create_table(namespace, data, allow_cross_region):
@@ -547,7 +571,15 @@ def _iceberg_create_table(namespace, data, allow_cross_region):
     if matches:
         bucket_arn = matches[0].get("tableBucketARN")
     if not bucket_arn:
-        return error_response_json("NotFoundException", f"Namespace {namespace} not found", 404)
+        return _iceberg_error(f"Namespace {namespace} not found", "NoSuchNamespaceException", 404)
+
+    # createTable is not idempotent: a create for a table that already exists is
+    # a 409, matching the Iceberg REST spec and the S3 Tables control plane. A
+    # resent create must not silently replace the table (wiping its snapshots).
+    key = _table_key(bucket_arn, namespace, table_name)
+    if key in _tables:
+        return _iceberg_error(
+            f"Table already exists: {namespace}.{table_name}", "AlreadyExistsException", 409)
 
     schema_fields = [{"name": f.get("name", ""), "type": f.get("type", "string") if isinstance(f.get("type"), str) else "string",
                        "required": f.get("required", False)} for f in schema.get("fields", [])]
@@ -557,9 +589,15 @@ def _iceberg_create_table(namespace, data, allow_cross_region):
     iceberg_metadata = _initial_iceberg_metadata(table_name, schema_fields, location)
     if schema:
         iceberg_metadata["schemas"] = [schema]
+    partition_spec = data.get("partition-spec")
+    if partition_spec:
+        # Echo back the client's requested partition spec as the default, so a
+        # later commit initialized from this response matches it instead of
+        # asserting an empty spec back at us.
+        iceberg_metadata["partition-specs"] = [partition_spec]
+        iceberg_metadata["default-spec-id"] = partition_spec.get("spec-id", 0)
     metadata_location = f"s3://{bucket_name}/{namespace}/{table_name}/metadata/v0.metadata.json"
     arn = _table_arn(bucket_arn, namespace, table_name)
-    key = _table_key(bucket_arn, namespace, table_name)
 
     table = {
         "name": table_name, "tableARN": arn, "namespace": [namespace],
