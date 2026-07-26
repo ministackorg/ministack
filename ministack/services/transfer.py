@@ -44,7 +44,7 @@ from typing import AsyncIterator, Optional
 
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
-    AccountScopedDict,
+    AccountRegionScopedDict,
     error_response_json,
     get_account_id,
     get_region,
@@ -75,8 +75,8 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # ---------------------------------------------------------------------------
 # In-memory state
 # ---------------------------------------------------------------------------
-_servers = AccountScopedDict()  # server_id -> server record
-_users = AccountScopedDict()    # "{server_id}/{user_name}" -> user record
+_servers = AccountRegionScopedDict()  # server_id -> server record
+_users = AccountRegionScopedDict()    # "{server_id}/{user_name}" -> user record
 
 
 def reset():
@@ -610,29 +610,29 @@ def _sftp_normalize_key(key_body: str) -> str:
 
 def _sftp_resolve_user_by_key(username: str, presented_key_body: str):
     """Scan every Transfer user across every account for a matching
-    (UserName, SshPublicKey) pair. Returns ``(account_id, server_id, user)``
-    or ``None``.
+    (UserName, SshPublicKey) pair. Returns
+    ``(account_id, region, server_id, user)`` or ``None``.
 
-    AccountScopedDict stores entries under tuple keys ``(account_id, key)``,
-    so we iterate ``_data.items()`` directly to scan across accounts —
-    `__iter__` would only yield the current request's account, which isn't
-    set during SFTP auth.
+    AccountRegionScopedDict stores entries under tuple keys
+    ``(account_id, region, key)``, so we iterate ``_data.items()`` directly
+    to scan across accounts and regions — `__iter__` would only yield the
+    current request's scope, which isn't set during SFTP auth.
     """
     presented = _sftp_normalize_key(presented_key_body)
     for scoped_key, user in _users._data.items():
-        account_id, _ = scoped_key
+        account_id, region, _ = scoped_key
         if user.get("UserName") != username:
             continue
         for key_record in user.get("SshPublicKeys", []):
             if _sftp_normalize_key(key_record.get("SshPublicKeyBody", "")) == presented:
-                return account_id, user["ServerId"], user
+                return account_id, region, user["ServerId"], user
     return None
 
 
-def _sftp_server_state(account_id: str, server_id: str):
+def _sftp_server_state(account_id: str, region: str, server_id: str):
     """Return the State of a Transfer server (ONLINE / OFFLINE) or None
-    if the server doesn't exist for the given account."""
-    server = _servers._data.get((account_id, server_id))
+    if the server doesn't exist for the given account and region."""
+    server = _servers.get_scoped(account_id, region, server_id)
     return server["State"] if server else None
 
 
@@ -785,9 +785,9 @@ def _sftp_build_server_factory(restrict_to_server_id: Optional[str] = None):
 
 
 class _MiniStackSSHServer(asyncssh.SSHServer if _ASYNCSSH_AVAILABLE else object):
-    """SSH-side auth callback. Resolves the (account, server, user) tuple
-    from the presented public key and stashes it on the connection so the
-    SFTP layer can read it back.
+    """SSH-side auth callback. Resolves the (account, region, server, user)
+    tuple from the presented public key and stashes it on the connection so
+    the SFTP layer can read it back.
 
     Subclassing :class:`asyncssh.SSHServer` (rather than just duck-typing
     the relevant methods) is required because asyncssh probes a wide set
@@ -839,17 +839,18 @@ class _MiniStackSSHServer(asyncssh.SSHServer if _ASYNCSSH_AVAILABLE else object)
         if not match:
             return False
 
-        account_id, server_id, user = match
+        account_id, region, server_id, user = match
         if self._restrict_to_server_id and server_id != self._restrict_to_server_id:
             return False
-        if _sftp_server_state(account_id, server_id) != "ONLINE":
+        if _sftp_server_state(account_id, region, server_id) != "ONLINE":
             return False
 
-        self._resolved = (account_id, server_id, user)
+        self._resolved = (account_id, region, server_id, user)
         if self._conn is not None:
             self._conn.set_extra_info(ministack_user=user)
             self._conn.set_extra_info(ministack_server_id=server_id)
             self._conn.set_extra_info(ministack_account_id=account_id)
+            self._conn.set_extra_info(ministack_region=region)
         return True
 
 
@@ -879,6 +880,7 @@ class _MiniStackSFTPServer(asyncssh.SFTPServer if _ASYNCSSH_AVAILABLE else objec
             conn = chan._conn
         self._user = conn.get_extra_info("ministack_user") if conn else None
         self._account_id = conn.get_extra_info("ministack_account_id") if conn else None
+        self._region = conn.get_extra_info("ministack_region") if conn else None
         self._server_id = conn.get_extra_info("ministack_server_id") if conn else None
         # Open-file map. Reads use BytesIO over the existing object body;
         # writes accumulate into a BytesIO that we PUT on close.
@@ -888,10 +890,12 @@ class _MiniStackSFTPServer(asyncssh.SFTPServer if _ASYNCSSH_AVAILABLE else objec
     def _resolve(self, path):
         """bytes path → (bucket, key) for the currently authenticated user,
         within their account context."""
-        from ministack.core.responses import set_request_account_id
+        from ministack.core.responses import set_request_account_id, set_request_region
 
         if self._account_id:
             set_request_account_id(self._account_id)
+        if self._region:
+            set_request_region(self._region)
         virtual = path.decode("utf-8", errors="replace") if isinstance(path, bytes) else path
         return _sftp_resolve_s3_target(self._user or {}, virtual)
 
