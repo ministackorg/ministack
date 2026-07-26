@@ -507,12 +507,7 @@ def _iceberg_commit_table(namespace, table_name, data, allow_cross_region):
         for update in data.get("updates", []):
             action = update.get("action", "")
             if action == "add-snapshot":
-                # Idempotent per the Iceberg REST spec, same reasoning as add-schema
-                # below -- a client can resend a commit whose response it never saw
-                # (e.g. a timeout) after it already landed. Guard by snapshot-id like
-                # the other add-* actions do, instead of appending unconditionally,
-                # or a resent commit duplicates the snapshot and later readers
-                # (Iceberg's snapshotsById()) crash with "Multiple entries with same key".
+                # Idempotent per the Iceberg REST spec
                 snapshot = update.get("snapshot", {})
                 existing = metadata.setdefault("snapshots", [])
                 if not any(s.get("snapshot-id") == snapshot.get("snapshot-id") for s in existing):
@@ -530,15 +525,9 @@ def _iceberg_commit_table(namespace, table_name, data, allow_cross_region):
                     "type": update.get("type", "branch")}
             elif action == "add-schema":
                 new_schema = update.get("schema", {})
-                # Idempotent per the Iceberg REST spec: clients (e.g. Spark and
-                # DuckDB) re-send add-schema on every commit even when nothing
-                # changed, and don't always serialize the same schema identically
-                # (e.g. an empty identifier-field-ids present or absent) -- so
-                # comparing schemas isn't reliable. What actually breaks readers
-                # (Spark's schemasById()) is two entries sharing a schema-id, so
-                # enforce that invariant directly rather than deduping by content.
                 existing = metadata.setdefault("schemas", [])
                 new_id = new_schema.get("schema-id")
+                # Idempotent per the Iceberg REST spec
                 if not any(s.get("schema-id") == new_id for s in existing):
                     existing.append(new_schema)
                 # Advance last-column-id to the highest field ID seen, so the next
@@ -550,12 +539,11 @@ def _iceberg_commit_table(namespace, table_name, data, allow_cross_region):
                 metadata["current-schema-id"] = update.get("schema-id", 0)
             elif action in ("add-spec", "add-partition-spec"):
                 # Accepts both "add-spec" (the spec's wire name) and the
-                # non-standard "add-partition-spec". Idempotent by spec-id, same
-                # reasoning as add-schema above -- clients re-declare unchanged
-                # specs on every commit.
+                # non-standard "add-partition-spec"
                 new_spec = update.get("spec", {})
                 specs = metadata.setdefault("partition-specs", [])
                 new_spec_id = new_spec.get("spec-id")
+                # Idempotent per the Iceberg REST spec
                 if not any(s.get("spec-id") == new_spec_id for s in specs):
                     specs.append(new_spec)
             elif action == "set-default-spec":
@@ -599,13 +587,6 @@ def _iceberg_create_table(namespace, data, allow_cross_region):
 
     key = _table_key(bucket_arn, namespace, table_name)
     if key in _tables:
-        # Not idempotent by design, per the Iceberg REST spec -- a resent CreateTable
-        # (e.g. a client retry after a lost response to a create that already landed)
-        # must be rejected, the same conflict the S3 Tables control-plane path
-        # (_create_table, above) already enforces. Without this check, a retry
-        # silently wipes the existing table's schemas/snapshots/data and replaces
-        # it with an empty fresh one -- worse than a crash, since it loses data
-        # with no error raised at all.
         return _error_response_iceberg(
             "AlreadyExistsException", f"Table already exists: {namespace}.{table_name}", 409
         )
