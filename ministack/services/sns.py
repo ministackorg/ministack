@@ -1474,12 +1474,17 @@ def _matches_filter_policy(sub: dict, message_attributes: dict) -> bool:
         return True
 
     for key, allowed_values in policy.items():
-        attr = message_attributes.get(key)
-        if attr is None:
-            return False
-        attr_value = attr.get("StringValue", "")
         if not isinstance(allowed_values, list):
             allowed_values = [allowed_values]
+        attr = message_attributes.get(key)
+        if attr is None:
+            # ``{"exists": false}`` is evaluated against attribute presence, not
+            # against a value, so a missing attribute must not short-circuit to
+            # "no match" before that rule is considered.
+            if any(isinstance(rule, dict) and rule.get("exists") is False for rule in allowed_values):
+                continue
+            return False
+        attr_value = attr.get("StringValue", "")
         if not _attr_matches_any(attr_value, allowed_values):
             return False
     return True

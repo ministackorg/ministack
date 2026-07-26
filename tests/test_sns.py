@@ -587,6 +587,30 @@ def test_sns_filter_policy_blocks_non_matching(sns, sqs):
     body = json.loads(msgs2["Messages"][0]["Body"])
     assert body["Message"] == "blue message"
 
+def test_sns_filter_policy_exists_false_matches_absent_attribute(sns, sqs):
+    """`{"exists": false}` matches messages that omit the attribute entirely."""
+    topic_arn = sns.create_topic(Name="qa-sns-filter-exists")["TopicArn"]
+    q_url = sqs.create_queue(QueueName="qa-sns-filter-exists-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    sub_arn = sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)["SubscriptionArn"]
+    sns.set_subscription_attributes(
+        SubscriptionArn=sub_arn,
+        AttributeName="FilterPolicy",
+        AttributeValue=json.dumps({"store": [{"exists": False}]}),
+    )
+    sns.publish(
+        TopicArn=topic_arn,
+        Message="with store",
+        MessageAttributes={"store": {"DataType": "String", "StringValue": "example"}},
+    )
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=0)
+    assert len(msgs.get("Messages", [])) == 0, "Message carrying the attribute must not be delivered"
+    sns.publish(TopicArn=topic_arn, Message="without store")
+    msgs2 = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert len(msgs2.get("Messages", [])) == 1, "Message without the attribute must be delivered"
+    body = json.loads(msgs2["Messages"][0]["Body"])
+    assert body["Message"] == "without store"
+
 def test_sns_raw_message_delivery(sns, sqs):
     """RawMessageDelivery=true delivers raw message body, not SNS envelope."""
     topic_arn = sns.create_topic(Name="qa-sns-raw")["TopicArn"]
