@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **Step Functions — context object paths now resolve array indexes** — JSONPath references such as `$$.Map.Item.Value.values[0].name` returned `null` because context paths used a separate dotted-key-only resolver. Context paths now retain their distinct `$$.` root while sharing the standard path traversal, so indexed references work in `ItemSelector` fields and intrinsic-function arguments. Contributed by @felixp-square.
+- **Step Functions — JSONPath wildcard projections** — paths such as `$.results[*].previews[0].changes[*]` now project and flatten matching values instead of resolving to `null`. Wildcard paths with no matches return an empty array, allowing intrinsics such as `States.ArrayContains` to evaluate them safely. Contributed by @felixp-square.
 
 ## [1.4.7] — 2026-07-26
 
