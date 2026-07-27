@@ -12,6 +12,19 @@ RUN pip install --no-cache-dir --no-compile \
         "boto3>=1.34" \
         "awscli"
 
+# duckdb publishes no musllinux wheels on PyPI, so it must be compiled from
+# source here — this is why it was excluded from the image previously (see
+# the original Dockerfile's now-removed "excluded intentionally" comment),
+# but the Firehose Iceberg-delivery path (added in 1.4.7) now hard-depends
+# on it at runtime, so the image needs to actually provide it.
+# CMAKE_BUILD_PARALLEL_LEVEL is capped at 3: an unbounded ninja job count
+# (one per core) can OOM-kill the compiler mid-build, since several of
+# DuckDB's unity-build translation units need multiple GB of RAM each on
+# their own; 3 keeps peak memory well under typical CI budgets at the cost
+# of a longer build.
+RUN apk add --no-cache gcc g++ make cmake ninja git python3-dev musl-dev linux-headers \
+    && CMAKE_BUILD_PARALLEL_LEVEL=3 pip install --no-cache-dir --no-compile duckdb
+
 # Strip awscli help examples (~25 MB) and Python cache files (~15 MB).
 RUN rm -rf /usr/local/lib/python3.13/site-packages/awscli/examples \
     && find /usr/local/lib/python3.13/site-packages -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null \
@@ -24,7 +37,10 @@ LABEL maintainer="MiniStack" \
       description="Local AWS Service Emulator — drop-in LocalStack replacement"
 
 # Upgrade base packages to pick up latest security patches.
-RUN apk upgrade --no-cache && apk add --no-cache nodejs bash openssl && rm -f /usr/bin/wget /bin/wget \
+# libstdc++/libgcc: runtime shared libraries the compiled duckdb extension
+# (see builder stage) needs — duckdb itself isn't installed in this stage,
+# only its runtime dependencies.
+RUN apk upgrade --no-cache && apk add --no-cache nodejs bash openssl libstdc++ libgcc && rm -f /usr/bin/wget /bin/wget \
     && rm -rf /usr/local/lib/python3.13/site-packages/pip* \
               /usr/local/bin/pip*
 
