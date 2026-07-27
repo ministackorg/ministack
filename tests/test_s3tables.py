@@ -876,3 +876,135 @@ def test_s3tables_iceberg_create_table_honors_requested_partition_spec(s3tables)
         except Exception:
             pass
         s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
+
+
+def test_s3tables_iceberg_add_schema_is_idempotent_by_schema_id(s3tables):
+    """A resent add-schema commit for an already-registered schema-id (Spark
+    re-declares its current schema on every write) must not append a second
+    entry -- Iceberg's own schemasById() crashes on load with "Multiple entries
+    with same key: <id>=table {...}" if the schemas list has a duplicate id."""
+    bucket_name = f"tb-schemadup-{_uuid_mod.uuid4().hex[:6]}"
+    bucket_arn = s3tables.create_table_bucket(name=bucket_name)["arn"]
+    ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
+    table = f"t_{_uuid_mod.uuid4().hex[:6]}"
+    try:
+        s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
+        s3tables.create_table(tableBucketARN=bucket_arn, namespace=ns, name=table, format="ICEBERG")
+
+        payload = {
+            "requirements": [],
+            "updates": [
+                {
+                    "action": "add-schema",
+                    "schema": {
+                        "type": "struct", "schema-id": 0,
+                        "fields": [{"id": 1, "name": "colA", "required": False, "type": "string"}],
+                    },
+                },
+                {"action": "set-current-schema", "schema-id": 0},
+            ],
+        }
+        # Send the identical commit twice, simulating Spark re-declaring its
+        # current schema on a second, unrelated write.
+        for _ in range(2):
+            _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}", method="POST", payload=payload)
+
+        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        schema_ids = [s.get("schema-id") for s in loaded["metadata"]["schemas"]]
+        assert schema_ids.count(0) == 1, "resent add-schema must not duplicate the schema-id entry"
+    finally:
+        try:
+            s3tables.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=table)
+        except Exception:
+            pass
+        try:
+            s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
+        except Exception:
+            pass
+        s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
+
+
+def test_s3tables_iceberg_add_spec_is_idempotent_by_spec_id(s3tables):
+    """A resent add-spec commit for an already-registered spec-id must not
+    append a second entry -- Iceberg's own specsById() crashes the same way
+    schemasById() does on a duplicate id."""
+    bucket_name = f"tb-specdup-{_uuid_mod.uuid4().hex[:6]}"
+    bucket_arn = s3tables.create_table_bucket(name=bucket_name)["arn"]
+    ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
+    table = f"t_{_uuid_mod.uuid4().hex[:6]}"
+    try:
+        s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
+        s3tables.create_table(tableBucketARN=bucket_arn, namespace=ns, name=table, format="ICEBERG")
+
+        payload = {
+            "requirements": [],
+            "updates": [
+                {
+                    "action": "add-spec",
+                    "spec": {
+                        "spec-id": 1,
+                        "fields": [{"source-id": 1, "field-id": 1000, "name": "day_col", "transform": "day"}],
+                    },
+                },
+                {"action": "set-default-spec", "spec-id": 1},
+            ],
+        }
+        for _ in range(2):
+            _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}", method="POST", payload=payload)
+
+        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        spec_ids = [s.get("spec-id") for s in loaded["metadata"]["partition-specs"]]
+        assert spec_ids.count(1) == 1, "resent add-spec must not duplicate the spec-id entry"
+    finally:
+        try:
+            s3tables.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=table)
+        except Exception:
+            pass
+        try:
+            s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
+        except Exception:
+            pass
+        s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
+
+
+def test_s3tables_iceberg_add_sort_order_is_idempotent_by_order_id(s3tables):
+    """A resent add-sort-order commit for an already-registered order-id must
+    not append a second entry -- Iceberg's own sortOrdersById() crashes the
+    same way schemasById() does on a duplicate id."""
+    bucket_name = f"tb-orderdup-{_uuid_mod.uuid4().hex[:6]}"
+    bucket_arn = s3tables.create_table_bucket(name=bucket_name)["arn"]
+    ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
+    table = f"t_{_uuid_mod.uuid4().hex[:6]}"
+    try:
+        s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
+        s3tables.create_table(tableBucketARN=bucket_arn, namespace=ns, name=table, format="ICEBERG")
+
+        payload = {
+            "requirements": [],
+            "updates": [
+                {
+                    "action": "add-sort-order",
+                    "sort-order": {
+                        "order-id": 1,
+                        "fields": [{"source-id": 1, "transform": "identity", "direction": "asc", "null-order": "nulls-first"}],
+                    },
+                },
+                {"action": "set-default-sort-order", "sort-order-id": 1},
+            ],
+        }
+        for _ in range(2):
+            _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}", method="POST", payload=payload)
+
+        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        order_ids = [o.get("order-id") for o in loaded["metadata"]["sort-orders"]]
+        assert order_ids.count(1) == 1, "resent add-sort-order must not duplicate the order-id entry"
+    finally:
+        try:
+            s3tables.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=table)
+        except Exception:
+            pass
+        try:
+            s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
+        except Exception:
+            pass
+        s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
