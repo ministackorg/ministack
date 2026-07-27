@@ -5694,6 +5694,61 @@ def test_sfn_map_iterations_proceed_under_non_default_account_id():
         sfn.delete_state_machine(stateMachineArn=sm)
 
 
+def test_sfn_map_item_selector_context_path_resolves_array_index(sfn):
+    """ItemSelector context paths must traverse arrays within the Map item."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    sm = sfn.create_state_machine(
+        name=f"map-context-array-index-{uid}",
+        definition=json.dumps({
+            "StartAt": "ProjectItems",
+            "States": {
+                "ProjectItems": {
+                    "Type": "Map",
+                    "ItemsPath": "$.items",
+                    "ItemSelector": {
+                        "expected.$": "$.expected",
+                        "observed.$": (
+                            "$$.Map.Item.Value.values[0].name"
+                        ),
+                        "formattedObserved.$": (
+                            "States.Format('{}', "
+                            "$$.Map.Item.Value.values[0].name)"
+                        ),
+                    },
+                    "Iterator": {
+                        "StartAt": "Echo",
+                        "States": {"Echo": {"Type": "Pass", "End": True}},
+                    },
+                    "End": True,
+                }
+            },
+        }),
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )["stateMachineArn"]
+    try:
+        exec_resp = sfn.start_execution(
+            stateMachineArn=sm,
+            name=f"e-{uid}",
+            input=json.dumps({
+                "expected": "first",
+                "items": [{
+                    "values": [{
+                        "name": "first",
+                    }],
+                }],
+            }),
+        )
+        desc = _wait_sfn(sfn, exec_resp["executionArn"], timeout=10)
+        assert desc["status"] == "SUCCEEDED"
+        assert json.loads(desc["output"]) == [{
+            "expected": "first",
+            "observed": "first",
+            "formattedObserved": "first",
+        }]
+    finally:
+        sfn.delete_state_machine(stateMachineArn=sm)
+
+
 # ---------------------------------------------------------------------------
 # JSONata variable assignment (`Assign` field + `$variable` refs) — issue #645
 # ---------------------------------------------------------------------------

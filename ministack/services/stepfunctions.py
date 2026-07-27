@@ -3734,14 +3734,7 @@ def _resolve_params_obj(template, data, ctx=None):
 def _resolve_ctx_path(path, ctx):
     if not path.startswith("$$."):
         return None
-    parts = path[3:].split(".")
-    cur = ctx
-    for p in parts:
-        if isinstance(cur, dict) and p in cur:
-            cur = cur[p]
-        else:
-            return None
-    return cur
+    return _resolve_path(path[1:], ctx)
 
 
 # ===================================================================
