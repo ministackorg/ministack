@@ -2757,3 +2757,74 @@ def test_security_group_rule_tags_and_arn_round_trip(ec2):
         Filters=[{"Name": "resource-id", "Values": [rule_id]}],
     )["Tags"] == []
 
+
+def test_security_group_rule_description_round_trip(ec2):
+    """DescribeSecurityGroupRules must return the top-level rule Description."""
+    vpc = ec2.create_vpc(CidrBlock="10.101.0.0/24")['Vpc']['VpcId']
+    sg = ec2.create_security_group(
+        GroupName=f"sgr-desc-{_uuid_mod.uuid4().hex[:8]}",
+        Description="issue-1121-desc",
+        VpcId=vpc,
+    )["GroupId"]
+
+    created = ec2.authorize_security_group_ingress(
+        GroupId=sg,
+        IpPermissions=[{
+            "IpProtocol": "tcp", "FromPort": 5678, "ToPort": 5678,
+            "IpRanges": [{"CidrIp": "10.101.0.0/24", "Description": "allow app traffic"}],
+        }],
+    )["SecurityGroupRules"][0]
+
+    described = ec2.describe_security_group_rules(
+        SecurityGroupRuleIds=[created["SecurityGroupRuleId"]],
+    )["SecurityGroupRules"]
+    assert len(described) == 1
+    assert described[0]["SecurityGroupRuleId"] == created["SecurityGroupRuleId"]
+    assert described[0]["Description"] == "allow app traffic"
+
+    ec2.delete_security_group(GroupId=sg)
+    ec2.delete_vpc(VpcId=vpc)
+
+
+def test_modify_security_group_rules_updates_description(ec2):
+    """ModifySecurityGroupRules must update rule fields by rule id."""
+    vpc = ec2.create_vpc(CidrBlock="10.102.0.0/24")["Vpc"]["VpcId"]
+    sg = ec2.create_security_group(
+        GroupName=f"sgr-mod-{_uuid_mod.uuid4().hex[:8]}",
+        Description="issue-modify-sgr",
+        VpcId=vpc,
+    )["GroupId"]
+
+    created = ec2.authorize_security_group_ingress(
+        GroupId=sg,
+        IpPermissions=[{
+            "IpProtocol": "tcp", "FromPort": 5678, "ToPort": 5678,
+            "IpRanges": [{"CidrIp": "10.102.0.0/24", "Description": "old desc"}],
+        }],
+    )["SecurityGroupRules"][0]
+    rule_id = created["SecurityGroupRuleId"]
+
+    ec2.modify_security_group_rules(
+        GroupId=sg,
+        SecurityGroupRules=[{
+            "SecurityGroupRuleId": rule_id,
+            "SecurityGroupRule": {
+                "Description": "new desc",
+                "FromPort": 5679,
+                "ToPort": 5679,
+            },
+        }],
+    )
+
+    described = ec2.describe_security_group_rules(
+        SecurityGroupRuleIds=[rule_id],
+    )["SecurityGroupRules"]
+    assert len(described) == 1
+    assert described[0]["SecurityGroupRuleId"] == rule_id
+    assert described[0]["Description"] == "new desc"
+    assert described[0]["FromPort"] == 5679
+    assert described[0]["ToPort"] == 5679
+
+    ec2.delete_security_group(GroupId=sg)
+    ec2.delete_vpc(VpcId=vpc)
+
