@@ -28,6 +28,7 @@ STATE_DIR = os.environ.get("STATE_DIR", "/tmp/ministack-state")
 STATE_FORMAT_VERSION = 2
 SERVICE_STATE_FORMAT_VERSIONS = {
     "appsync": 3,
+    "appsync_events": 3,
     "autoscaling": 3,
     "bedrock_agentcore": 3,
     "athena": 3,

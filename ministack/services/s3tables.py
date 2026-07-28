@@ -524,7 +524,13 @@ def _iceberg_commit_table(namespace, table_name, data, allow_cross_region):
                     "type": update.get("type", "branch")}
             elif action == "add-schema":
                 new_schema = update.get("schema", {})
-                metadata.setdefault("schemas", []).append(new_schema)
+                existing = metadata.setdefault("schemas", [])
+                # Idempotent by schema-id: a client re-declaring its current,
+                # unchanged schema on every write (Spark does this) must not pile
+                # up a second entry with the same id -- Iceberg's schemasById()
+                # crashes on load with "Multiple entries with same key" if it does.
+                if not any(s.get("schema-id") == new_schema.get("schema-id") for s in existing):
+                    existing.append(new_schema)
                 # Advance last-column-id to the highest field ID in the new
                 # schema, so a client allocating the next column's ID (e.g.
                 # DuckDB ALTER TABLE ADD COLUMN) doesn't collide with these.
@@ -537,11 +543,19 @@ def _iceberg_commit_table(namespace, table_name, data, allow_cross_region):
                 # "add-spec" is the Iceberg REST spec's action name (what
                 # duckdb-iceberg sends); "add-partition-spec" is a non-standard
                 # alias some hand-rolled callers use. Accept both.
-                metadata.setdefault("partition-specs", []).append(update.get("spec", {}))
+                new_spec = update.get("spec", {})
+                specs = metadata.setdefault("partition-specs", [])
+                # Idempotent by spec-id, for the same reason as add-schema above.
+                if not any(s.get("spec-id") == new_spec.get("spec-id") for s in specs):
+                    specs.append(new_spec)
             elif action == "set-default-spec":
                 metadata["default-spec-id"] = update.get("spec-id", 0)
             elif action == "add-sort-order":
-                metadata.setdefault("sort-orders", []).append(update.get("sort-order", {}))
+                new_order = update.get("sort-order", {})
+                orders = metadata.setdefault("sort-orders", [])
+                # Idempotent by order-id, for the same reason as add-schema above.
+                if not any(o.get("order-id") == new_order.get("order-id") for o in orders):
+                    orders.append(new_order)
             elif action == "set-default-sort-order":
                 metadata["default-sort-order-id"] = update.get("sort-order-id", 0)
             elif action == "set-properties":

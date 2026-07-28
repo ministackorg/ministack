@@ -26,6 +26,7 @@ import struct
 import time
 from urllib.parse import urlparse
 
+import boto3
 import pytest
 from botocore.exceptions import ClientError
 
@@ -164,6 +165,16 @@ def _create_api(appsync, name):
     return appsync.create_api(name=name, eventConfig=_DEFAULT_EVENT_CONFIG)["api"]
 
 
+def _appsync_client(region: str, account: str = "test"):
+    return boto3.client(
+        "appsync",
+        endpoint_url=_ENDPOINT,
+        region_name=region,
+        aws_access_key_id=account,
+        aws_secret_access_key="test",
+    )
+
+
 async def _invoke_asgi_http(
     method: str,
     path: str,
@@ -228,7 +239,7 @@ def _create_namespace(appsync, api_id, name):
     return appsync.create_channel_namespace(apiId=api_id, name=name)["channelNamespace"]
 
 
-def _minimal_sigv4_appsync_authorization() -> str:
+def _minimal_sigv4_appsync_authorization(region: str = "us-east-1") -> str:
     """SigV4-shaped header with credential scope ``.../appsync/aws4_request`` (unsigned).
 
     MiniStack's router only inspects the ``Credential=`` segment — real Lambdas
@@ -236,7 +247,7 @@ def _minimal_sigv4_appsync_authorization() -> str:
     """
     return (
         "AWS4-HMAC-SHA256 "
-        "Credential=testkey/20260127/us-east-1/appsync/aws4_request, "
+        f"Credential=testkey/20260127/{region}/appsync/aws4_request, "
         "SignedHeaders=host;x-amz-date, "
         "Signature=" + "0" * 64
     )
@@ -404,6 +415,65 @@ def test_get_list_update_delete_api(appsync):
     assert exc.value.response["Error"]["Code"] == "NotFoundException"
 
 
+def test_event_apis_and_children_are_region_scoped():
+    east = _appsync_client("us-east-1")
+    west = _appsync_client("us-west-2")
+    east_api = _create_api(east, "same-regional-events-api")
+    west_api = _create_api(west, "same-regional-events-api")
+
+    try:
+        east.create_channel_namespace(apiId=east_api["apiId"], name="east-only")
+        west.create_channel_namespace(apiId=west_api["apiId"], name="west-only")
+        east_key = east.create_api_key(
+            apiId=east_api["apiId"], description="east-only"
+        )["apiKey"]
+        west_key = west.create_api_key(
+            apiId=west_api["apiId"], description="west-only"
+        )["apiKey"]
+
+        assert east.get_api(apiId=east_api["apiId"])["api"]["apiId"] == east_api[
+            "apiId"
+        ]
+        assert west.get_api(apiId=west_api["apiId"])["api"]["apiId"] == west_api[
+            "apiId"
+        ]
+        with pytest.raises(ClientError):
+            west.get_api(apiId=east_api["apiId"])
+        with pytest.raises(ClientError):
+            east.get_api(apiId=west_api["apiId"])
+
+        east_ids = {api["apiId"] for api in east.list_apis()["apis"]}
+        west_ids = {api["apiId"] for api in west.list_apis()["apis"]}
+        assert east_api["apiId"] in east_ids
+        assert west_api["apiId"] not in east_ids
+        assert west_api["apiId"] in west_ids
+        assert east_api["apiId"] not in west_ids
+
+        assert {
+            ns["name"]
+            for ns in east.list_channel_namespaces(apiId=east_api["apiId"])[
+                "channelNamespaces"
+            ]
+        } == {"east-only"}
+        assert {
+            ns["name"]
+            for ns in west.list_channel_namespaces(apiId=west_api["apiId"])[
+                "channelNamespaces"
+            ]
+        } == {"west-only"}
+        assert {
+            key["id"]
+            for key in east.list_api_keys(apiId=east_api["apiId"])["apiKeys"]
+        } == {east_key["id"]}
+        assert {
+            key["id"]
+            for key in west.list_api_keys(apiId=west_api["apiId"])["apiKeys"]
+        } == {west_key["id"]}
+    finally:
+        east.delete_api(apiId=east_api["apiId"])
+        west.delete_api(apiId=west_api["apiId"])
+
+
 def test_api_key_crud_via_v1_path(appsync, api):
     """boto3's ``create_api_key`` / ``list_api_keys`` / ``delete_api_key`` all
     target the v1 GraphQL endpoint. The Terraform AWS provider's
@@ -548,6 +618,113 @@ def test_publish_with_appsync_sigv4_scope_on_events_vhost():
     asyncio.run(_run())
 
 
+def test_unsigned_api_key_publish_discovers_event_api_host_region(monkeypatch):
+    """API-key publish uses the Event API host region when SigV4 supplies none."""
+    from ministack.core.responses import get_region
+    from ministack.services import appsync_events as ae
+
+    monkeypatch.setenv("APPSYNC_EVENTS_ENFORCE_AUTH", "1")
+    monkeypatch.setenv(
+        "APPSYNC_EVENTS_HTTP_HOST_TEMPLATE",
+        "{api_id}.appsync-api.internal-edge-1:{port}",
+    )
+    monkeypatch.setenv(
+        "APPSYNC_EVENTS_REALTIME_HOST_TEMPLATE",
+        "{api_id}.appsync-realtime-api.internal-edge-1:{port}",
+    )
+    ae.reset()
+    west_auth = _minimal_sigv4_appsync_authorization("us-west-2")
+    east_auth = _minimal_sigv4_appsync_authorization()
+    mgmt_host = "example.appsync-api.us-west-2.localhost:4566"
+
+    async def _run():
+        create_body = json.dumps(
+            {"name": "api-key-pub-west", "eventConfig": _DEFAULT_EVENT_CONFIG}
+        ).encode()
+        post_msgs = await _invoke_asgi_http(
+            "POST",
+            "/v2/apis",
+            mgmt_host,
+            create_body,
+            extra_headers={"authorization": west_auth},
+        )
+        post_status, _, post_body = _asgi_response(post_msgs)
+        assert post_status == 200
+        created = json.loads(post_body.decode())["api"]
+        api_id = created["apiId"]
+        custom_pub_host = created["dns"]["HTTP"]
+        assert custom_pub_host == (
+            f"{api_id}.appsync-api.internal-edge-1:4566"
+        )
+
+        ns_msgs = await _invoke_asgi_http(
+            "POST",
+            f"/v2/apis/{api_id}/channelNamespaces",
+            mgmt_host,
+            json.dumps({"name": "default"}).encode(),
+            extra_headers={"authorization": west_auth},
+        )
+        ns_status, _, ns_raw = _asgi_response(ns_msgs)
+        assert ns_status == 200, ns_raw
+
+        key_msgs = await _invoke_asgi_http(
+            "POST",
+            f"/v1/apis/{api_id}/apikeys",
+            mgmt_host,
+            json.dumps({"description": "regional-publisher"}).encode(),
+            extra_headers={"authorization": west_auth},
+        )
+        key_status, _, key_raw = _asgi_response(key_msgs)
+        assert key_status == 200, key_raw
+        api_key = json.loads(key_raw.decode())["apiKey"]["id"]
+
+        pub_host = f"{api_id}.appsync-api.us-west-2.amazonaws.com"
+        pub_body = json.dumps(
+            {"channel": "/default/room1", "events": [json.dumps("west")]}
+        ).encode()
+        pub_msgs = await _invoke_asgi_http(
+            "POST",
+            "/event",
+            pub_host,
+            pub_body,
+            extra_headers={"x-api-key": api_key},
+        )
+        pub_status, _, pub_raw = _asgi_response(pub_msgs)
+        assert pub_status == 200, pub_raw
+        assert len(json.loads(pub_raw.decode())["successful"]) == 1
+        assert get_region() == "us-east-1"
+
+        custom_pub_msgs = await _invoke_asgi_http(
+            "POST",
+            "/event",
+            custom_pub_host,
+            pub_body,
+            extra_headers={"x-api-key": api_key},
+        )
+        custom_status, _, custom_raw = _asgi_response(custom_pub_msgs)
+        assert custom_status == 200, custom_raw
+        assert len(json.loads(custom_raw.decode())["successful"]) == 1
+        assert get_region() == "us-east-1"
+
+        wrong_region_msgs = await _invoke_asgi_http(
+            "POST",
+            "/event",
+            pub_host,
+            pub_body,
+            extra_headers={
+                "authorization": east_auth,
+                "x-api-key": api_key,
+            },
+        )
+        wrong_status, _, wrong_raw = _asgi_response(wrong_region_msgs)
+        assert wrong_status == 404, wrong_raw
+
+    try:
+        asyncio.run(_run())
+    finally:
+        ae.reset()
+
+
 def test_publish_with_appsync_sigv4_on_management_host_still_404():
     """``POST /event`` on the AppSync *management* vhost is not an Events publish URL."""
     auth = _minimal_sigv4_appsync_authorization()
@@ -640,6 +817,390 @@ def test_websocket_unsubscribe_stops_delivery(api):
         assert after is None
     finally:
         ws.close()
+
+
+def test_websocket_discovers_resource_region_and_pins_frame_context(monkeypatch):
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import appsync_events as ae
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    wrong_account_id = "222222222222"
+    resource_region = "us-west-2"
+    credential_region = "us-east-1"
+    authorizer_arn = (
+        f"arn:aws:lambda:{resource_region}:{account_id}:function:events-authorizer"
+    )
+    ae.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(resource_region)
+        status, _, body = ae._create_api(
+            json.dumps(
+                {
+                    "name": "regional-websocket-api",
+                    "eventConfig": {
+                        "authProviders": [
+                            {
+                                "authType": "AWS_LAMBDA",
+                                "lambdaAuthorizerConfig": {
+                                    "authorizerUri": authorizer_arn,
+                                },
+                            }
+                        ],
+                    },
+                }
+            ).encode()
+        )
+        assert status == 200
+        api_id = json.loads(body)["api"]["apiId"]
+        assert ae._create_channel_namespace(
+            api_id, b'{"name":"default"}'
+        )[0] == 200
+
+        set_request_region(credential_region)
+        assert api_id not in ae._apis
+        assert ae._discover_api_scope(api_id, account_id) == (
+            account_id,
+            resource_region,
+        )
+        assert ae._discover_api_scope(api_id, wrong_account_id) is None
+
+        authorizer_calls = []
+
+        def _fake_authorizer(
+            arn,
+            api_id_arg,
+            operation,
+            channel,
+            namespace,
+            authorization_token,
+            request_headers,
+        ):
+            authorizer_calls.append(
+                {
+                    "arn": arn,
+                    "api_id": api_id_arg,
+                    "operation": operation,
+                    "account_id": get_account_id(),
+                    "region": get_region(),
+                }
+            )
+            return authorization_token == "allow", {"region": get_region()}
+
+        monkeypatch.setattr(ae, "_events_authorizer_invoke", _fake_authorizer)
+
+        async def _run():
+            incoming: asyncio.Queue = asyncio.Queue()
+            sent = []
+
+            async def receive():
+                return await incoming.get()
+
+            async def send(message):
+                sent.append(message)
+
+            async def wait_for_frame(frame_type):
+                for _ in range(200):
+                    for message in sent:
+                        if message.get("type") != "websocket.send":
+                            continue
+                        frame = json.loads(message["text"])
+                        if frame.get("type") == frame_type:
+                            return frame
+                    await asyncio.sleep(0.005)
+                raise AssertionError(f"timed out waiting for {frame_type}")
+
+            protocols = (
+                f"{_encode_auth_header({'Authorization': 'allow'})}, "
+                "aws-appsync-event-ws"
+            )
+            scope = {
+                "headers": [
+                    (
+                        b"host",
+                        (
+                            f"{api_id}.appsync-realtime-api."
+                            f"{resource_region}.amazonaws.com"
+                        ).encode("ascii"),
+                    ),
+                    (b"sec-websocket-protocol", protocols.encode("utf-8")),
+                ],
+            }
+            task = asyncio.create_task(
+                ae.handle_websocket(scope, receive, send, api_id)
+            )
+            await incoming.put({"type": "websocket.connect"})
+            for _ in range(200):
+                if any(msg.get("type") == "websocket.accept" for msg in sent):
+                    break
+                await asyncio.sleep(0.005)
+            else:
+                raise AssertionError("websocket was not accepted")
+
+            await incoming.put(
+                {
+                    "type": "websocket.receive",
+                    "text": json.dumps({"type": "connection_init"}),
+                }
+            )
+            await wait_for_frame("connection_ack")
+            connection = next(iter(ae._connections.values()))
+            assert connection["region"] == resource_region
+
+            await incoming.put(
+                {
+                    "type": "websocket.receive",
+                    "text": json.dumps(
+                        {
+                            "type": "subscribe",
+                            "id": "sub-regional",
+                            "channel": "/default/room",
+                        }
+                    ),
+                }
+            )
+            await wait_for_frame("subscribe_success")
+
+            event = json.dumps({"message": "regional"})
+            await incoming.put(
+                {
+                    "type": "websocket.receive",
+                    "text": json.dumps(
+                        {
+                            "type": "publish",
+                            "id": "pub-regional",
+                            "channel": "/default/room",
+                            "events": [event],
+                        }
+                    ),
+                }
+            )
+            publish = await wait_for_frame("publish_success")
+            data = await wait_for_frame("data")
+            assert publish["id"] == "pub-regional"
+            assert data == {
+                "type": "data",
+                "id": "sub-regional",
+                "event": [event],
+            }
+
+            await incoming.put({"type": "websocket.disconnect"})
+            await task
+
+        asyncio.run(_run())
+
+        assert {
+            call["operation"] for call in authorizer_calls
+        } == {
+            ae.EVENT_CONNECT,
+            ae.EVENT_SUBSCRIBE,
+            ae.EVENT_PUBLISH,
+        }
+        assert all(call["arn"] == authorizer_arn for call in authorizer_calls)
+        assert all(call["account_id"] == account_id for call in authorizer_calls)
+        assert all(call["region"] == resource_region for call in authorizer_calls)
+        assert get_account_id() == account_id
+        assert get_region() == credential_region
+        assert ae._connections == {}
+    finally:
+        ae.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_websocket_rejects_host_region_that_differs_from_api_scope():
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import appsync_events as ae
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    resource_region = "us-west-2"
+    credential_region = "us-east-1"
+    ae.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(resource_region)
+        status, _, body = ae._create_api(
+            json.dumps(
+                {
+                    "name": "regional-websocket-host-check",
+                    "eventConfig": _DEFAULT_EVENT_CONFIG,
+                }
+            ).encode()
+        )
+        assert status == 200
+        api_id = json.loads(body)["api"]["apiId"]
+
+        set_request_region(credential_region)
+
+        async def _run():
+            sent = []
+
+            async def receive():
+                return {"type": "websocket.connect"}
+
+            async def send(message):
+                sent.append(message)
+
+            protocols = (
+                f"{_encode_auth_header({'x-api-key': 'da2-local-test-key'})}, "
+                "aws-appsync-event-ws"
+            )
+            scope = {
+                "headers": [
+                    (
+                        b"host",
+                        (
+                            f"{api_id}.appsync-realtime-api."
+                            f"{credential_region}.amazonaws.com"
+                        ).encode("ascii"),
+                    ),
+                    (b"sec-websocket-protocol", protocols.encode("utf-8")),
+                ],
+            }
+            await ae.handle_websocket(scope, receive, send, api_id)
+            assert sent == [{"type": "websocket.close", "code": 1008}]
+
+        asyncio.run(_run())
+        assert get_account_id() == account_id
+        assert get_region() == credential_region
+    finally:
+        ae.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_websocket_accepts_region_shaped_configured_custom_host(monkeypatch):
+    from ministack.core.responses import (
+        get_region,
+        set_request_region,
+    )
+    from ministack.services import appsync_events as ae
+
+    original_region = get_region()
+    resource_region = "us-west-2"
+    monkeypatch.setenv(
+        "APPSYNC_EVENTS_HTTP_HOST_TEMPLATE",
+        "{api_id}.appsync-api.internal-edge-1:{port}",
+    )
+    monkeypatch.setenv(
+        "APPSYNC_EVENTS_REALTIME_HOST_TEMPLATE",
+        "{api_id}.appsync-realtime-api.internal-edge-1:{port}",
+    )
+    ae.reset()
+    try:
+        set_request_region(resource_region)
+        status, _, body = ae._create_api(
+            json.dumps(
+                {
+                    "name": "custom-websocket-host",
+                    "eventConfig": _DEFAULT_EVENT_CONFIG,
+                }
+            ).encode()
+        )
+        assert status == 200
+        created = json.loads(body)["api"]
+        api_id = created["apiId"]
+        custom_host = created["dns"]["REALTIME"]
+        assert custom_host == (
+            f"{api_id}.appsync-realtime-api.internal-edge-1:4566"
+        )
+
+        set_request_region("us-east-1")
+
+        async def _run():
+            incoming = iter(
+                [
+                    {"type": "websocket.connect"},
+                    {"type": "websocket.disconnect"},
+                ]
+            )
+            sent = []
+
+            async def receive():
+                return next(incoming)
+
+            async def send(message):
+                sent.append(message)
+
+            scope = {
+                "headers": [
+                    (b"host", custom_host.encode("ascii")),
+                    (
+                        b"sec-websocket-protocol",
+                        b"aws-appsync-event-ws",
+                    ),
+                ],
+            }
+            await ae.handle_websocket(scope, receive, send, api_id)
+            assert any(
+                message.get("type") == "websocket.accept"
+                for message in sent
+            )
+            assert not any(
+                message == {"type": "websocket.close", "code": 1008}
+                for message in sent
+            )
+
+        asyncio.run(_run())
+        assert get_region() == "us-east-1"
+    finally:
+        ae.reset()
+        set_request_region(original_region)
+
+
+def test_fanout_publish_isolates_connections_by_api_id():
+    from ministack.services import appsync_events as ae
+
+    async def _run():
+        first_outbox = asyncio.Queue()
+        second_outbox = asyncio.Queue()
+        ae._connections.update(
+            {
+                "first": {
+                    "api_id": "api-first",
+                    "subscriptions": {"sub-first": "/default/room"},
+                    "outbox": first_outbox,
+                },
+                "second": {
+                    "api_id": "api-second",
+                    "subscriptions": {"sub-second": "/default/room"},
+                    "outbox": second_outbox,
+                },
+            }
+        )
+
+        event = json.dumps({"message": "first-only"})
+        successful, failed = await ae._fanout_publish(
+            "api-first", "/default/room", [event]
+        )
+        assert len(successful) == 1
+        assert failed == []
+        assert await first_outbox.get() == {
+            "type": "data",
+            "id": "sub-first",
+            "event": [event],
+        }
+        assert second_outbox.empty()
+
+    ae.reset()
+    try:
+        asyncio.run(_run())
+    finally:
+        ae.reset()
 
 
 # ---------------------------------------------------------------------------

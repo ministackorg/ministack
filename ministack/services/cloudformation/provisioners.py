@@ -5194,7 +5194,20 @@ def _s3tables_table_create(logical_id, props, stack_name):
     table_name = props.get("TableName", "")
     bucket_name = bucket_arn.rsplit("/", 1)[-1]
     location = f"s3://{bucket_name}/{namespace}/{table_name}"
-    iceberg_metadata = _s3tables._initial_iceberg_metadata(table_name, [], location)
+    # IcebergMetadata.IcebergSchema.SchemaFieldList is how CFN (and CDK's
+    # Table L1/L2 constructs) declare the table's columns; without parsing it
+    # here every CFN-created table ends up with an empty Iceberg schema, which
+    # then fails downstream (e.g. a Firehose Iceberg-destination delivery
+    # errors with "does not have a column with name ...") even though the
+    # template clearly declares one.
+    schema_field_list = (
+        props.get("IcebergMetadata", {}).get("IcebergSchema", {}).get("SchemaFieldList", [])
+    )
+    schema_fields = [
+        {"name": f["Name"], "type": f.get("Type", "string"), "required": f.get("Required", False)}
+        for f in schema_field_list
+    ]
+    iceberg_metadata = _s3tables._initial_iceberg_metadata(table_name, schema_fields, location)
     metadata_location = f"s3://{bucket_name}/{namespace}/{table_name}/metadata/v0.metadata.json"
     table_arn = _s3tables._table_arn(bucket_arn, namespace, table_name)
     key = _s3tables._table_key(bucket_arn, namespace, table_name)
@@ -5205,7 +5218,7 @@ def _s3tables_table_create(logical_id, props, stack_name):
         "ownerAccountId": get_account_id(),
         "metadataLocation": metadata_location, "warehouseLocation": location,
         "_iceberg_metadata": iceberg_metadata, "_metadata_version": 0,
-        "_schema_fields": [],
+        "_schema_fields": schema_fields,
     }
     for b in _s3tables._table_buckets.values():
         if b["arn"] == bucket_arn:

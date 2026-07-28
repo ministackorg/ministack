@@ -15,6 +15,25 @@ from botocore.exceptions import ClientError
 from ministack.services import pipes as _pipes
 
 
+def _cfn_iceberg_json(path):
+    """Hit the S3 Tables Iceberg REST catalog directly (LoadTable etc.) — the
+    boto3 s3tables client only exposes the control-plane view, not the actual
+    Iceberg schema/metadata a query engine like DuckDB reads."""
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    req = urllib.request.Request(
+        f"{endpoint}{path}",
+        headers={
+            "Authorization": (
+                "AWS4-HMAC-SHA256 "
+                "Credential=test/20260604/us-east-1/s3tables/aws4_request, "
+                "SignedHeaders=host, Signature=test"
+            ),
+        },
+    )
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read().decode("utf-8") or "{}")
+
+
 def _wait_stack(cfn, name, timeout=30):
     """Poll until stack reaches terminal status."""
     deadline = time.time() + timeout
@@ -6551,6 +6570,69 @@ def test_cfn_s3tables_resources(cfn, s3tables):
     table = s3tables.get_table(tableBucketARN=bucket_arn, namespace="myns", name="mytable")
     assert table["name"] == "mytable"
     assert table["format"] == "ICEBERG"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_s3tables_table_schema_from_iceberg_metadata(cfn, s3tables):
+    """AWS::S3Tables::Table's IcebergMetadata.IcebergSchema.SchemaFieldList must
+    populate the table's actual Iceberg schema — not just be accepted and
+    discarded. A table created with an empty schema silently breaks any
+    consumer relying on the declared columns (e.g. a Firehose Iceberg
+    destination fails to insert with a "does not have a column" error even
+    though the CFN template clearly declares one)."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Bucket": {
+                "Type": "AWS::S3Tables::TableBucket",
+                "Properties": {"TableBucketName": "cfn-s3tables-schema-test"},
+            },
+            "Ns": {
+                "Type": "AWS::S3Tables::Namespace",
+                "Properties": {
+                    "TableBucketARN": {"Fn::GetAtt": ["Bucket", "TableBucketARN"]},
+                    "Namespace": "myns",
+                },
+                "DependsOn": "Bucket",
+            },
+            "Table": {
+                "Type": "AWS::S3Tables::Table",
+                "Properties": {
+                    "TableBucketARN": {"Fn::GetAtt": ["Bucket", "TableBucketARN"]},
+                    "Namespace": "myns",
+                    "TableName": "mytable",
+                    "OpenTableFormat": "ICEBERG",
+                    "IcebergMetadata": {
+                        "IcebergSchema": {
+                            "SchemaFieldList": [
+                                {"Id": 1, "Name": "id", "Type": "string", "Required": True},
+                                {"Id": 2, "Name": "value", "Type": "string"},
+                            ],
+                        },
+                    },
+                },
+                "DependsOn": "Ns",
+            },
+        },
+    }
+
+    stack_name = "cfn-s3tables-schema-t01"
+    try:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+    except Exception:
+        pass
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    resp = _cfn_iceberg_json(f"/iceberg/v1/namespaces/myns/tables/mytable")
+    fields = resp.get("metadata", {}).get("schemas", [{}])[0].get("fields", [])
+    field_names = {f["name"] for f in fields}
+    assert field_names == {"id", "value"}, f"expected columns id/value, got {field_names}"
 
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
