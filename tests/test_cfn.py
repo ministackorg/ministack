@@ -6554,3 +6554,72 @@ def test_cfn_s3tables_resources(cfn, s3tables):
 
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
+
+
+def test_cfn_lambda_permission_function_name_from_getstackoutput(cfn, lam):
+    """aws-cdk-local rewrites a CDK cross-stack reference into Fn::GetStackOutput
+    (not Fn::ImportValue). A consumer stack whose AWS::Lambda::Permission
+    FunctionName is a Fn::GetStackOutput dict pointing at another stack's output
+    (the Lambda ARN) must resolve it, not crash the provisioner with
+    "'dict' object has no attribute 'startswith'". Regression for #1213."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    producer_name = f"getstackout-producer-{uid}"
+    consumer_name = f"getstackout-consumer-{uid}"
+    fn_name = f"gso-fn-{uid}"
+
+    producer = {
+        "Resources": {
+            "Func": {
+                "Type": "AWS::Lambda::Function",
+                "Properties": {
+                    "FunctionName": fn_name,
+                    "Runtime": "python3.12",
+                    "Handler": "index.handler",
+                    "Role": "arn:aws:iam::000000000000:role/gso-role",
+                    "Code": {"ZipFile": "def handler(e, c): return {}"},
+                },
+            },
+        },
+        "Outputs": {
+            "FnArn": {"Value": {"Fn::GetAtt": ["Func", "Arn"]}},
+        },
+    }
+    consumer = {
+        "Resources": {
+            "Perm": {
+                "Type": "AWS::Lambda::Permission",
+                "Properties": {
+                    "Action": "lambda:InvokeFunction",
+                    "Principal": "apigateway.amazonaws.com",
+                    "FunctionName": {
+                        "Fn::GetStackOutput": {
+                            "StackName": producer_name,
+                            "Region": "us-east-1",
+                            "OutputName": "FnArn",
+                        }
+                    },
+                },
+            },
+        },
+    }
+    try:
+        cfn.create_stack(StackName=producer_name, TemplateBody=json.dumps(producer))
+        p = _wait_stack(cfn, producer_name)
+        assert p["StackStatus"] == "CREATE_COMPLETE", p.get("StackStatusReason")
+
+        cfn.create_stack(StackName=consumer_name, TemplateBody=json.dumps(consumer))
+        c = _wait_stack(cfn, consumer_name)
+        assert c["StackStatus"] == "CREATE_COMPLETE", c.get("StackStatusReason")
+
+        # The cross-stack Lambda actually received the invoke permission.
+        policy = json.loads(lam.get_policy(FunctionName=fn_name)["Policy"])
+        principals = [s.get("Principal") for s in policy["Statement"]]
+        assert {"Service": "apigateway.amazonaws.com"} in principals or \
+            "apigateway.amazonaws.com" in principals, policy
+    finally:
+        for n in (consumer_name, producer_name):
+            try:
+                cfn.delete_stack(StackName=n)
+                _wait_stack(cfn, n)
+            except Exception:
+                pass

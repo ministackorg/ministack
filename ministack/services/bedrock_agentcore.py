@@ -3,8 +3,11 @@
 Covers the two AgentCore services, which both sign as ``bedrock-agentcore``:
 
   * ``bedrock-agentcore-control`` (rest-json) — agent runtime + endpoint control
-    plane: Create/Get/List/Update/Delete AgentRuntime and AgentRuntimeEndpoint,
-    plus ListAgentRuntimeVersions.
+    plane: CreateAgentRuntime, GetAgentRuntime, ListAgentRuntimes,
+    UpdateAgentRuntime, DeleteAgentRuntime, ListAgentRuntimeVersions,
+    CreateAgentRuntimeEndpoint, GetAgentRuntimeEndpoint,
+    ListAgentRuntimeEndpoints, UpdateAgentRuntimeEndpoint,
+    DeleteAgentRuntimeEndpoint.
   * ``bedrock-agentcore`` (rest-json) — data plane: InvokeAgentRuntime.
 
 Deterministic and stateful: resources provision instantly (``READY``) and
