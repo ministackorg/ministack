@@ -24,7 +24,6 @@ from urllib.parse import quote, urlparse
 import pytest
 from botocore.exceptions import ClientError
 
-
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
 
@@ -118,7 +117,6 @@ import asyncio  # noqa: E402
 
 import websockets  # noqa: E402
 
-
 # Minimal MQTT 3.1.1 codec for the test client.
 
 
@@ -186,14 +184,30 @@ def _parse_packet(buf: bytes) -> tuple[int, int, bytes, int] | None:
 async def _ws_subscribe_and_collect(
     ws_url: str, topic: str, ready_event: threading.Event, received: list, stop: threading.Event
 ):
+    def _record_publish(msg) -> int | None:
+        buf = msg if isinstance(msg, (bytes, bytearray)) else msg.encode("latin-1")
+        parsed = _parse_packet(bytes(buf))
+        if not parsed:
+            return None
+        ptype, _flags, body, _ = parsed
+        if ptype == 3:  # PUBLISH
+            topic_len = struct.unpack_from("!H", body, 0)[0]
+            delivered_topic = body[2:2 + topic_len].decode("utf-8")
+            payload = body[2 + topic_len:]
+            received.append((delivered_topic, payload))
+        return ptype
+
     async with websockets.connect(ws_url, subprotocols=["mqtt"]) as ws:
         await ws.send(_make_connect("test-client"))
         # Wait for CONNACK
         await asyncio.wait_for(ws.recv(), timeout=2.0)
         # Subscribe
         await ws.send(_make_subscribe(packet_id=1, topic=topic, qos=0))
-        # Wait for SUBACK
-        await asyncio.wait_for(ws.recv(), timeout=2.0)
+        # Retained PUBLISH frames may precede SUBACK in the in-process broker.
+        while True:
+            msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
+            if _record_publish(msg) == 9:  # SUBACK
+                break
         ready_event.set()
 
         # Collect PUBLISH frames until stop or timeout.
@@ -203,16 +217,7 @@ async def _ws_subscribe_and_collect(
                 msg = await asyncio.wait_for(ws.recv(), timeout=0.5)
             except asyncio.TimeoutError:
                 continue
-            buf = msg if isinstance(msg, (bytes, bytearray)) else msg.encode("latin-1")
-            parsed = _parse_packet(bytes(buf))
-            if not parsed:
-                continue
-            ptype, _flags, body, _ = parsed
-            if ptype == 3:  # PUBLISH
-                topic_len = struct.unpack_from("!H", body, 0)[0]
-                t = body[2:2 + topic_len].decode("utf-8")
-                payload = body[2 + topic_len:]
-                received.append((t, payload))
+            _record_publish(msg)
 
 
 def test_iot_lambda_publishes_browser_subscribes_e2e(iot_data_client):
@@ -252,6 +257,155 @@ def test_iot_lambda_publishes_browser_subscribes_e2e(iot_data_client):
     delivered_topic, delivered_payload = received[0]
     assert delivered_topic == topic
     assert delivered_payload == payload
+
+
+def test_iot_ws_publish_isolated_between_regions():
+    """The same account and topic must remain isolated by IoT data region."""
+    import boto3
+    from botocore.config import Config
+
+    topic = _unique("regional/sensor")
+    parsed = urlparse(ENDPOINT)
+    ws_host = parsed.hostname or "localhost"
+    ws_port = parsed.port or 4566
+
+    def _ws_url(region):
+        credential = quote(
+            f"test/20260726/{region}/iotdevicegateway/aws4_request",
+            safe="",
+        )
+        return (
+            f"ws://prefix-ats.iot.{region}.{ws_host}:{ws_port}/mqtt"
+            f"?X-Amz-Credential={credential}"
+        )
+
+    east_ready = threading.Event()
+    west_ready = threading.Event()
+    stop = threading.Event()
+    east_received = []
+    west_received = []
+
+    east_thread = threading.Thread(
+        target=lambda: asyncio.run(_ws_subscribe_and_collect(
+            _ws_url("us-east-1"),
+            topic,
+            east_ready,
+            east_received,
+            stop,
+        )),
+        daemon=True,
+    )
+    west_thread = threading.Thread(
+        target=lambda: asyncio.run(_ws_subscribe_and_collect(
+            _ws_url("us-west-2"),
+            topic,
+            west_ready,
+            west_received,
+            stop,
+        )),
+        daemon=True,
+    )
+    east_thread.start()
+    west_thread.start()
+    assert east_ready.wait(timeout=5)
+    assert west_ready.wait(timeout=5)
+
+    east_client = boto3.client(
+        "iot-data",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name="us-east-1",
+        config=Config(retries={"mode": "standard"}),
+    )
+    east_client.publish(topic=topic, payload=b"east-only")
+
+    deadline = time.time() + 5
+    while time.time() < deadline and not east_received:
+        time.sleep(0.05)
+    time.sleep(0.6)
+    stop.set()
+    east_thread.join(timeout=2)
+    west_thread.join(timeout=2)
+
+    assert east_received == [(topic, b"east-only")]
+    assert west_received == []
+
+
+@pytest.mark.parametrize("wildcard_region", ["+", "#"])
+def test_iot_ws_credential_region_wildcards_cannot_bypass_isolation(
+    wildcard_region,
+):
+    """Credential-region wildcards cannot receive live or retained messages."""
+    import boto3
+    from botocore.config import Config
+
+    topic = _unique("wildcard-region/sensor")
+    parsed = urlparse(ENDPOINT)
+    ws_host = parsed.hostname or "localhost"
+    ws_port = parsed.port or 4566
+    credential = quote(
+        (
+            "test/20260726/"
+            f"{wildcard_region}/iotdevicegateway/aws4_request"
+        ),
+        safe="",
+    )
+    ws_url = (
+        f"ws://prefix-ats.iot.us-east-1.{ws_host}:{ws_port}/mqtt"
+        f"?X-Amz-Credential={credential}"
+    )
+    live_ready = threading.Event()
+    live_stop = threading.Event()
+    live_received = []
+
+    live_thread = threading.Thread(
+        target=lambda: asyncio.run(_ws_subscribe_and_collect(
+            ws_url,
+            topic,
+            live_ready,
+            live_received,
+            live_stop,
+        )),
+        daemon=True,
+    )
+    live_thread.start()
+    assert live_ready.wait(timeout=5)
+
+    east_client = boto3.client(
+        "iot-data",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name="us-east-1",
+        config=Config(retries={"mode": "standard"}),
+    )
+    east_client.publish(topic=topic, payload=b"east", retain=True)
+
+    time.sleep(0.6)
+    live_stop.set()
+    live_thread.join(timeout=2)
+    assert live_received == []
+
+    retained_ready = threading.Event()
+    retained_stop = threading.Event()
+    retained_received = []
+    retained_thread = threading.Thread(
+        target=lambda: asyncio.run(_ws_subscribe_and_collect(
+            ws_url,
+            topic,
+            retained_ready,
+            retained_received,
+            retained_stop,
+        )),
+        daemon=True,
+    )
+    retained_thread.start()
+    assert retained_ready.wait(timeout=5)
+    time.sleep(0.6)
+    retained_stop.set()
+    retained_thread.join(timeout=2)
+    assert retained_received == []
 
 
 def test_iot_ws_topic_isolation_between_accounts(iot_data_client):
