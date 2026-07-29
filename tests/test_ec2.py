@@ -2,12 +2,29 @@ import io
 import json
 import os
 import time
+import urllib.error
+import urllib.request
 import uuid as _uuid_mod
 import zipfile
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
+
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+
+def _ec2_client(region, account_id="test"):
+    return boto3.client(
+        "ec2",
+        endpoint_url=ENDPOINT,
+        region_name=region,
+        aws_access_key_id=account_id,
+        aws_secret_access_key="test",
+        config=Config(region_name=region),
+    )
 
 
 def _create_ec2_iam_instance_profile(iam, suffix):
@@ -91,6 +108,122 @@ def test_ec2_describe_regions_all_regions_includes_opt_in(ec2):
     full = len(ec2.describe_regions(AllRegions=True)["Regions"])
     assert full == base
     assert base >= 30
+
+
+def test_ec2_default_network_resources_are_region_scoped():
+    east = _ec2_client("us-east-1")
+    west = _ec2_client("us-west-2")
+
+    east_vpcs = east.describe_vpcs(
+        Filters=[{"Name": "is-default", "Values": ["true"]}]
+    )["Vpcs"]
+    west_vpcs = west.describe_vpcs(
+        Filters=[{"Name": "is-default", "Values": ["true"]}]
+    )["Vpcs"]
+
+    assert len(east_vpcs) == 1
+    assert len(west_vpcs) == 1
+
+    east_subnets = east.describe_subnets(
+        Filters=[{"Name": "vpc-id", "Values": [east_vpcs[0]["VpcId"]]}]
+    )["Subnets"]
+    west_subnets = west.describe_subnets(
+        Filters=[{"Name": "vpc-id", "Values": [west_vpcs[0]["VpcId"]]}]
+    )["Subnets"]
+    west_default_sgs = west.describe_security_groups(
+        Filters=[
+            {"Name": "vpc-id", "Values": [west_vpcs[0]["VpcId"]]},
+            {"Name": "group-name", "Values": ["default"]},
+        ]
+    )["SecurityGroups"]
+
+    assert {s["AvailabilityZone"] for s in east_subnets} == {
+        "us-east-1a",
+        "us-east-1b",
+        "us-east-1c",
+    }
+    assert {s["AvailabilityZone"] for s in west_subnets} == {
+        "us-west-2a",
+        "us-west-2b",
+        "us-west-2c",
+    }
+    assert len(west_default_sgs) == 1
+    assert west_default_sgs[0]["VpcId"] == west_vpcs[0]["VpcId"]
+
+
+def test_ec2_named_resources_and_tags_are_region_scoped():
+    east = _ec2_client("us-east-1")
+    west = _ec2_client("us-west-2")
+    suffix = _uuid_mod.uuid4().hex[:8]
+    key_name = f"qa-ec2-key-region-{suffix}"
+    pg_name = f"qa-ec2-pg-region-{suffix}"
+    sg_name = f"qa-ec2-sg-region-{suffix}"
+
+    east.create_key_pair(KeyName=key_name)
+    west.create_key_pair(KeyName=key_name)
+    east.create_placement_group(GroupName=pg_name, Strategy="cluster")
+    west.create_placement_group(GroupName=pg_name, Strategy="cluster")
+    east_sg = east.create_security_group(GroupName=sg_name, Description="east")
+    west_sg = west.create_security_group(GroupName=sg_name, Description="west")
+    east.create_tags(Resources=[east_sg["GroupId"]], Tags=[{"Key": "Region", "Value": "east"}])
+    west.create_tags(Resources=[west_sg["GroupId"]], Tags=[{"Key": "Region", "Value": "west"}])
+    east_instance = east.run_instances(
+        ImageId="ami-00000000",
+        MinCount=1,
+        MaxCount=1,
+        InstanceType="t2.micro",
+    )["Instances"][0]
+
+    try:
+        east_key = east.describe_key_pairs(KeyNames=[key_name])["KeyPairs"][0]
+        west_key = west.describe_key_pairs(KeyNames=[key_name])["KeyPairs"][0]
+        east_pg = east.describe_placement_groups(GroupNames=[pg_name])["PlacementGroups"][0]
+        west_pg = west.describe_placement_groups(GroupNames=[pg_name])["PlacementGroups"][0]
+        east_group = east.describe_security_groups(GroupIds=[east_sg["GroupId"]])[
+            "SecurityGroups"
+        ][0]
+        west_group = west.describe_security_groups(GroupIds=[west_sg["GroupId"]])[
+            "SecurityGroups"
+        ][0]
+        east_instances = east.describe_instances(InstanceIds=[east_instance["InstanceId"]])[
+            "Reservations"
+        ][0]["Instances"]
+
+        assert east_key["KeyPairId"] != west_key["KeyPairId"]
+        assert ":us-east-1:" in east_pg["GroupArn"]
+        assert ":us-west-2:" in west_pg["GroupArn"]
+        assert east_group["Description"] == "east"
+        assert west_group["Description"] == "west"
+        assert east_instances[0]["InstanceId"] == east_instance["InstanceId"]
+        assert east.describe_tags(
+            Filters=[{"Name": "resource-id", "Values": [east_sg["GroupId"]]}]
+        )["Tags"][0]["Value"] == "east"
+        assert west.describe_tags(
+            Filters=[{"Name": "resource-id", "Values": [west_sg["GroupId"]]}]
+        )["Tags"][0]["Value"] == "west"
+        with pytest.raises(ClientError):
+            east.describe_security_groups(GroupIds=[west_sg["GroupId"]])
+        with pytest.raises(ClientError):
+            west.describe_instances(InstanceIds=[east_instance["InstanceId"]])
+    finally:
+        try:
+            east.terminate_instances(InstanceIds=[east_instance["InstanceId"]])
+        except ClientError:
+            pass
+        for client, sg_id in ((east, east_sg["GroupId"]), (west, west_sg["GroupId"])):
+            try:
+                client.delete_security_group(GroupId=sg_id)
+            except ClientError:
+                pass
+        for client in (east, west):
+            try:
+                client.delete_key_pair(KeyName=key_name)
+            except ClientError:
+                pass
+            try:
+                client.delete_placement_group(GroupName=pg_name)
+            except ClientError:
+                pass
 
 
 def test_ec2_run_describe_terminate_instances(ec2):
@@ -637,7 +770,7 @@ def test_ec2_placement_group_crud(ec2):
     assert created["Strategy"] == "cluster"
     assert created["GroupId"].startswith("pg-")
     assert created["GroupArn"] == (
-        f"arn:aws:ec2:us-east-1:000000000000:placement-group/qa-ec2-pg"
+        "arn:aws:ec2:us-east-1:000000000000:placement-group/qa-ec2-pg"
     )
 
     desc = ec2.describe_placement_groups(GroupNames=["qa-ec2-pg"])
@@ -1244,6 +1377,152 @@ def test_ec2_vpc_peering_crud(ec2):
     ec2.delete_vpc_peering_connection(VpcPeeringConnectionId=pcx_id)
     desc2 = ec2.describe_vpc_peering_connections(VpcPeeringConnectionIds=[pcx_id])
     assert desc2["VpcPeeringConnections"][0]["Status"]["Code"] == "deleted"
+
+
+def test_ec2_vpc_peering_accepts_from_peer_region():
+    east = _ec2_client("us-east-1")
+    west = _ec2_client("us-west-2")
+    east_vpc_id = east.create_vpc(CidrBlock="10.107.0.0/16")["Vpc"]["VpcId"]
+    west_vpc_id = west.create_vpc(CidrBlock="10.108.0.0/16")["Vpc"]["VpcId"]
+
+    resp = east.create_vpc_peering_connection(
+        VpcId=east_vpc_id,
+        PeerVpcId=west_vpc_id,
+        PeerRegion="us-west-2",
+        TagSpecifications=[
+            {
+                "ResourceType": "vpc-peering-connection",
+                "Tags": [{"Key": "Scope", "Value": "inter-region"}],
+            }
+        ],
+    )
+    pcx_id = resp["VpcPeeringConnection"]["VpcPeeringConnectionId"]
+
+    assert west.describe_vpc_peering_connections(
+        VpcPeeringConnectionIds=[pcx_id]
+    )["VpcPeeringConnections"][0]["Status"]["Code"] == "pending-acceptance"
+
+    accepted = west.accept_vpc_peering_connection(VpcPeeringConnectionId=pcx_id)
+    assert accepted["VpcPeeringConnection"]["Status"]["Code"] == "active"
+    assert east.describe_vpc_peering_connections(
+        VpcPeeringConnectionIds=[pcx_id]
+    )["VpcPeeringConnections"][0]["Status"]["Code"] == "active"
+    assert east.describe_tags(
+        Filters=[{"Name": "resource-id", "Values": [pcx_id]}]
+    )["Tags"][0]["Value"] == "inter-region"
+    assert west.describe_tags(
+        Filters=[{"Name": "resource-id", "Values": [pcx_id]}]
+    )["Tags"] == []
+
+    west.delete_vpc_peering_connection(VpcPeeringConnectionId=pcx_id)
+    assert east.describe_vpc_peering_connections(
+        VpcPeeringConnectionIds=[pcx_id]
+    )["VpcPeeringConnections"][0]["Status"]["Code"] == "deleted"
+
+
+def test_ec2_vpc_peering_tags_are_region_local():
+    east = _ec2_client("us-east-1")
+    west = _ec2_client("us-west-2")
+    east_vpc_id = east.create_vpc(CidrBlock="10.109.0.0/16")["Vpc"]["VpcId"]
+    west_vpc_id = west.create_vpc(CidrBlock="10.110.0.0/16")["Vpc"]["VpcId"]
+
+    resp = east.create_vpc_peering_connection(
+        VpcId=east_vpc_id,
+        PeerVpcId=west_vpc_id,
+        PeerRegion="us-west-2",
+        TagSpecifications=[
+            {
+                "ResourceType": "vpc-peering-connection",
+                "Tags": [{"Key": "Scope", "Value": "initial"}],
+            }
+        ],
+    )
+    pcx_id = resp["VpcPeeringConnection"]["VpcPeeringConnectionId"]
+
+    assert east.describe_tags(
+        Filters=[{"Name": "resource-id", "Values": [pcx_id]}]
+    )["Tags"][0]["Value"] == "initial"
+    assert west.describe_tags(
+        Filters=[{"Name": "resource-id", "Values": [pcx_id]}]
+    )["Tags"] == []
+    assert len(east.describe_vpc_peering_connections(
+        Filters=[{"Name": "tag:Scope", "Values": ["initial"]}]
+    )["VpcPeeringConnections"]) == 1
+    assert west.describe_vpc_peering_connections(
+        Filters=[{"Name": "tag:Scope", "Values": ["initial"]}]
+    )["VpcPeeringConnections"] == []
+
+    west.create_tags(Resources=[pcx_id], Tags=[{"Key": "Scope", "Value": "peer"}])
+    assert east.describe_tags(
+        Filters=[{"Name": "resource-id", "Values": [pcx_id]}]
+    )["Tags"][0]["Value"] == "initial"
+    assert west.describe_tags(
+        Filters=[{"Name": "resource-id", "Values": [pcx_id]}]
+    )["Tags"][0]["Value"] == "peer"
+    assert east.describe_vpc_peering_connections(
+        Filters=[{"Name": "tag:Scope", "Values": ["peer"]}]
+    )["VpcPeeringConnections"] == []
+    assert len(west.describe_vpc_peering_connections(
+        Filters=[{"Name": "tag:Scope", "Values": ["peer"]}]
+    )["VpcPeeringConnections"]) == 1
+
+    east.delete_tags(Resources=[pcx_id], Tags=[{"Key": "Scope"}])
+    assert east.describe_tags(
+        Filters=[{"Name": "resource-id", "Values": [pcx_id]}]
+    )["Tags"] == []
+    assert west.describe_tags(
+        Filters=[{"Name": "resource-id", "Values": [pcx_id]}]
+    )["Tags"][0]["Value"] == "peer"
+
+
+def test_ec2_vpc_peering_cross_account_tags_are_account_isolated():
+    requester_account = "111111111111"
+    accepter_account = "222222222222"
+    east = _ec2_client("us-east-1", requester_account)
+    west = _ec2_client("us-west-2", accepter_account)
+    east_vpc_id = east.create_vpc(CidrBlock="10.111.0.0/16")["Vpc"]["VpcId"]
+    west_vpc_id = west.create_vpc(CidrBlock="10.112.0.0/16")["Vpc"]["VpcId"]
+
+    resp = east.create_vpc_peering_connection(
+        VpcId=east_vpc_id,
+        PeerVpcId=west_vpc_id,
+        PeerOwnerId=accepter_account,
+        PeerRegion="us-west-2",
+        TagSpecifications=[
+            {
+                "ResourceType": "vpc-peering-connection",
+                "Tags": [{"Key": "Side", "Value": "requester"}],
+            }
+        ],
+    )
+    pcx_id = resp["VpcPeeringConnection"]["VpcPeeringConnectionId"]
+
+    assert east.describe_tags(
+        Filters=[{"Name": "resource-id", "Values": [pcx_id]}]
+    )["Tags"][0]["Value"] == "requester"
+    assert west.describe_tags(
+        Filters=[{"Name": "resource-id", "Values": [pcx_id]}]
+    )["Tags"] == []
+
+    west.create_tags(Resources=[pcx_id], Tags=[{"Key": "Side", "Value": "accepter"}])
+    assert west.describe_tags(
+        Filters=[{"Name": "resource-id", "Values": [pcx_id]}]
+    )["Tags"][0]["Value"] == "accepter"
+    assert east.describe_tags(
+        Filters=[{"Name": "resource-id", "Values": [pcx_id]}]
+    )["Tags"][0]["Value"] == "requester"
+
+    east.create_tags(
+        Resources=[pcx_id],
+        Tags=[{"Key": "Side", "Value": "requester-updated"}],
+    )
+    assert east.describe_tags(
+        Filters=[{"Name": "resource-id", "Values": [pcx_id]}]
+    )["Tags"][0]["Value"] == "requester-updated"
+    assert west.describe_tags(
+        Filters=[{"Name": "resource-id", "Values": [pcx_id]}]
+    )["Tags"][0]["Value"] == "accepter"
+
 
 def test_ec2_vpc_peering_not_found(ec2):
     from botocore.exceptions import ClientError
@@ -2425,6 +2704,52 @@ def test_ebs_copy_snapshot(ec2):
     assert new_snap_id != snap_id
     assert new_snap_id.startswith("snap-")
 
+
+def test_ebs_copy_snapshot_respects_source_region():
+    east = _ec2_client("us-east-1")
+    west = _ec2_client("us-west-2")
+
+    vol = east.create_volume(AvailabilityZone="us-east-1a", Size=10, VolumeType="gp2")
+    snap = east.create_snapshot(VolumeId=vol["VolumeId"], Description="east source")
+    snap_id = snap["SnapshotId"]
+
+    req = urllib.request.Request(
+        f"{ENDPOINT}/",
+        data=urlencode({
+            "Action": "CopySnapshot",
+            "Version": "2016-11-15",
+            "SourceSnapshotId": snap_id,
+            "Description": "missing source region",
+        }).encode("utf-8"),
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": (
+                "AWS4-HMAC-SHA256 "
+                "Credential=test/20260729/us-west-2/ec2/aws4_request, "
+                "SignedHeaders=host, Signature=test"
+            ),
+        },
+        method="POST",
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == 400
+    assert b"InvalidSnapshot.NotFound" in exc.value.read()
+
+    copied = west.copy_snapshot(
+        SourceRegion="us-east-1",
+        SourceSnapshotId=snap_id,
+        Description="west copy",
+    )
+    copied_id = copied["SnapshotId"]
+
+    assert copied_id != snap_id
+    assert east.describe_snapshots(SnapshotIds=[snap_id])["Snapshots"][0]["SnapshotId"] == snap_id
+    assert west.describe_snapshots(SnapshotIds=[copied_id])["Snapshots"][0]["Description"] == "west copy"
+    with pytest.raises(ClientError):
+        west.describe_snapshots(SnapshotIds=[snap_id])
+
+
 def test_ebs_snapshot_attribute(ec2):
     vol = ec2.create_volume(AvailabilityZone="us-east-1a", Size=10, VolumeType="gp2")
     snap = ec2.create_snapshot(VolumeId=vol["VolumeId"], Description="attr test")
@@ -2756,4 +3081,3 @@ def test_security_group_rule_tags_and_arn_round_trip(ec2):
     assert ec2.describe_tags(
         Filters=[{"Name": "resource-id", "Values": [rule_id]}],
     )["Tags"] == []
-

@@ -3199,6 +3199,323 @@ def test_s3files_region_scoped_state_is_rejected_by_v2_reader(
     assert persistence.load_state("s3files") is None
 
 
+def test_ec2_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject EC2 regional state instead of accepting
+    account-only stores that would collapse same-name resources across regions."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    key_pairs = AccountRegionScopedDict()
+    key_pairs.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "same-key",
+        {"KeyName": "same-key", "KeyPairId": "key-west"},
+    )
+    persistence.save_state("ec2", {"key_pairs": key_pairs})
+
+    raw = _json.loads((tmp_path / "ec2.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_key_pairs = persistence.load_state("ec2")["key_pairs"]
+    assert loaded_key_pairs.get_scoped(
+        "000000000000", "us-west-2", "same-key"
+    )["KeyPairId"] == "key-west"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("ec2") is None
+
+
+def test_ec2_legacy_state_restores_to_boot_region_without_arn_mining():
+    """Legacy EC2 state is one coherent graph even when records embed foreign ARNs."""
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import ec2
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "123456789012"
+    boot_region = "us-east-1"
+    foreign_region = "us-west-2"
+
+    vpcs = AccountScopedDict()
+    flow_logs = AccountScopedDict()
+
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        ec2.reset()
+
+        vpcs["vpc-legacy"] = {
+            "VpcId": "vpc-legacy",
+            "CidrBlock": "10.70.0.0/16",
+            "OwnerId": account_id,
+        }
+        flow_logs["fl-legacy"] = {
+            "FlowLogId": "fl-legacy",
+            "ResourceId": "vpc-legacy",
+            "DeliverLogsPermissionArn": (
+                f"arn:aws:logs:{foreign_region}:{account_id}:log-group:foreign"
+            ),
+            "LogDestination": f"arn:aws:logs:{foreign_region}:{account_id}:log-group:foreign",
+        }
+
+        ec2.restore_state({"vpcs": vpcs, "flow_logs": flow_logs})
+
+        assert ec2._vpcs.get_scoped(account_id, boot_region, "vpc-legacy")["VpcId"] == "vpc-legacy"
+        assert ec2._flow_logs.get_scoped(account_id, boot_region, "fl-legacy")["ResourceId"] == "vpc-legacy"
+        assert ec2._flow_logs.get_scoped(account_id, foreign_region, "fl-legacy") is None
+    finally:
+        ec2.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_ec2_legacy_vpc_peering_restores_to_boot_region_graph():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import ec2
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "123456789012"
+    boot_region = "us-east-1"
+    peer_region = "us-west-2"
+    pcx_id = "pcx-legacy000000001"
+
+    vpcs = AccountScopedDict()
+    peerings = AccountScopedDict()
+    tags = AccountScopedDict()
+
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        ec2.reset()
+
+        vpcs["vpc-east"] = {
+            "VpcId": "vpc-east",
+            "CidrBlock": "10.0.0.0/16",
+            "State": "available",
+            "IsDefault": False,
+            "OwnerId": account_id,
+        }
+        vpcs["vpc-west"] = {
+            "VpcId": "vpc-west",
+            "CidrBlock": "10.1.0.0/16",
+            "State": "available",
+            "IsDefault": False,
+            "OwnerId": account_id,
+        }
+        peerings[pcx_id] = {
+            "VpcPeeringConnectionId": pcx_id,
+            "RequesterVpcInfo": {
+                "VpcId": "vpc-east",
+                "OwnerId": account_id,
+                "Region": boot_region,
+            },
+            "AccepterVpcInfo": {
+                "VpcId": "vpc-west",
+                "OwnerId": account_id,
+                "Region": peer_region,
+            },
+            "Status": {
+                "Code": "pending-acceptance",
+                "Message": "Pending Acceptance",
+            },
+        }
+        tags[pcx_id] = [{"Key": "Scope", "Value": "legacy"}]
+
+        ec2.restore_state({"vpcs": vpcs, "vpc_peering": peerings, "tags": tags})
+
+        boot_record = ec2._vpc_peering.get_scoped(account_id, boot_region, pcx_id)
+        peer_record = ec2._vpc_peering.get_scoped(account_id, peer_region, pcx_id)
+        assert boot_record["VpcPeeringConnectionId"] == pcx_id
+        assert boot_record["RequesterVpcInfo"]["Region"] == boot_region
+        assert boot_record["AccepterVpcInfo"]["Region"] == boot_region
+        assert peer_record is None
+        assert ec2._vpcs.get_scoped(account_id, boot_region, "vpc-east") is not None
+        assert ec2._vpcs.get_scoped(account_id, boot_region, "vpc-west") is not None
+        assert ec2._vpcs.get_scoped(account_id, peer_region, "vpc-west") is None
+        assert ec2._tags.get_scoped(account_id, boot_region, pcx_id) == tags[pcx_id]
+        assert ec2._tags.get_scoped(account_id, peer_region, pcx_id) is None
+        assert (account_id, peer_region) not in ec2._default_initialized_scopes
+
+        set_request_region(peer_region)
+        ec2._ensure_defaults_initialized()
+        assert (
+            ec2._vpcs.get_scoped(account_id, peer_region, ec2._DEFAULT_VPC_ID)
+            is not None
+        )
+        ec2._set_vpc_peering_status(boot_record, "active", "Active")
+        assert (
+            ec2._vpc_peering.get_scoped(account_id, boot_region, pcx_id)["Status"]["Code"]
+            == "active"
+        )
+        assert ec2._vpc_peering.get_scoped(account_id, peer_region, pcx_id) is None
+    finally:
+        ec2.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_ec2_restore_preserves_deleted_default_resource_scope():
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import ec2
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "123456789012"
+    region = "us-west-2"
+
+    try:
+        set_request_account_id(account_id)
+        set_request_region(region)
+        ec2.reset()
+
+        for store in (
+            ec2._vpcs,
+            ec2._subnets,
+            ec2._security_groups,
+            ec2._network_acls,
+            ec2._internet_gateways,
+            ec2._route_tables,
+        ):
+            store.clear()
+
+        state = ec2.get_state()
+        assert {"AccountId": account_id, "Region": region} in state[
+            "default_initialized_scopes"
+        ]
+
+        ec2.restore_state(state)
+        ec2._ensure_defaults_initialized()
+
+        assert ec2._vpcs.get_scoped(account_id, region, ec2._DEFAULT_VPC_ID) is None
+        assert (
+            ec2._subnets.get_scoped(account_id, region, ec2._DEFAULT_SUBNET_ID)
+            is None
+        )
+        assert (
+            ec2._security_groups.get_scoped(account_id, region, ec2._DEFAULT_SG_ID)
+            is None
+        )
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+        ec2.reset()
+
+
+def test_ec2_legacy_generated_default_vpc_marks_scope_initialized():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import ec2
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "123456789012"
+    region = "us-west-2"
+    generated_default_vpc_id = "vpc-0abc1234def567890"
+
+    vpcs = AccountScopedDict()
+
+    try:
+        set_request_account_id(account_id)
+        set_request_region(region)
+        ec2.reset()
+
+        vpcs[generated_default_vpc_id] = {
+            "VpcId": generated_default_vpc_id,
+            "CidrBlock": "172.31.0.0/16",
+            "State": "available",
+            "IsDefault": True,
+            "DhcpOptionsId": "dopt-00000001",
+            "InstanceTenancy": "default",
+            "OwnerId": account_id,
+            "DefaultNetworkAclId": "acl-0abc1234def567890",
+            "DefaultSecurityGroupId": "sg-0abc1234def567890",
+            "MainRouteTableId": "rtb-0abc1234def567890",
+        }
+
+        ec2.restore_state({"vpcs": vpcs})
+        ec2._ensure_defaults_initialized()
+
+        assert (
+            ec2._vpcs.get_scoped(account_id, region, generated_default_vpc_id)
+            is not None
+        )
+        assert ec2._vpcs.get_scoped(account_id, region, ec2._DEFAULT_VPC_ID) is None
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+        ec2.reset()
+
+
+def test_ec2_region_scoped_v3_state_is_idempotent(monkeypatch, tmp_path):
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    account_id = "123456789012"
+    region = "us-west-2"
+
+    key_pairs = AccountRegionScopedDict()
+    key_pairs.set_scoped(
+        account_id,
+        region,
+        "regional-key",
+        {"KeyName": "regional-key", "KeyPairId": "key-west"},
+    )
+    flow_logs = AccountRegionScopedDict()
+    flow_logs.set_scoped(
+        account_id,
+        region,
+        "fl-regional",
+        {
+            "FlowLogId": "fl-regional",
+            "ResourceId": "vpc-regional",
+            "LogDestination": f"arn:aws:logs:{region}:{account_id}:log-group:regional",
+        },
+    )
+
+    persistence.save_state("ec2", {"key_pairs": key_pairs, "flow_logs": flow_logs})
+    first_snapshot = _json.loads((tmp_path / "ec2.json").read_text())
+    assert first_snapshot["__ministack_format__"] == 3
+    assert f"{account_id}\x00{region}\x00'regional-key'" in first_snapshot["payload"]["key_pairs"]["data"]
+
+    loaded = persistence.load_state("ec2")
+    assert loaded["key_pairs"].get_scoped(account_id, region, "regional-key")["KeyPairId"] == "key-west"
+    persistence.save_state("ec2", loaded)
+    second_snapshot = _json.loads((tmp_path / "ec2.json").read_text())
+
+    assert second_snapshot == first_snapshot
+
+
 def test_servicediscovery_region_scoped_state_is_rejected_by_v2_reader(
     monkeypatch, tmp_path
 ):

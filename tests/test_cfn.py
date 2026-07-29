@@ -2063,6 +2063,135 @@ def test_cfn_ec2_vpc_endpoint_uses_ec2_state(cfn, ec2):
     )["VpcEndpoints"] == []
 
 
+def test_cfn_ec2_resources_use_caller_region_context():
+    """EC2 CFN provisioners must write through the caller's region context."""
+    import boto3
+    from botocore.config import Config
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def _client(svc, region):
+        return boto3.client(
+            svc,
+            endpoint_url=endpoint,
+            region_name=region,
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+            config=Config(region_name=region, retries={"mode": "standard"}),
+        )
+
+    cfn_west = _client("cloudformation", "us-west-2")
+    cfn_east = _client("cloudformation", "us-east-1")
+    ec2_west = _client("ec2", "us-west-2")
+    ec2_east = _client("ec2", "us-east-1")
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-ec2-region-{suffix}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Vpc": {
+                "Type": "AWS::EC2::VPC",
+                "Properties": {"CidrBlock": "10.41.0.0/16"},
+            },
+            "Subnet": {
+                "Type": "AWS::EC2::Subnet",
+                "Properties": {
+                    "VpcId": {"Ref": "Vpc"},
+                    "CidrBlock": "10.41.1.0/24",
+                    "AvailabilityZone": "us-west-2a",
+                },
+            },
+            "SecurityGroup": {
+                "Type": "AWS::EC2::SecurityGroup",
+                "Properties": {
+                    "GroupDescription": "regional cfn default-vpc fallback proof",
+                },
+            },
+            "Endpoint": {
+                "Type": "AWS::EC2::VPCEndpoint",
+                "Properties": {
+                    "VpcEndpointType": "Gateway",
+                    "ServiceName": "com.amazonaws.us-west-2.s3",
+                },
+            },
+            "RouteTable": {
+                "Type": "AWS::EC2::RouteTable",
+                "Properties": {},
+            },
+        },
+        "Outputs": {
+            "VpcId": {"Value": {"Ref": "Vpc"}},
+            "SubnetId": {"Value": {"Ref": "Subnet"}},
+            "SecurityGroupId": {"Value": {"Ref": "SecurityGroup"}},
+            "EndpointId": {"Value": {"Ref": "Endpoint"}},
+            "RouteTableId": {"Value": {"Ref": "RouteTable"}},
+        },
+    }
+    outputs = {}
+
+    try:
+        cfn_west.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn_west, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+
+        assert ec2_west.describe_vpcs(VpcIds=[outputs["VpcId"]])["Vpcs"][0]["CidrBlock"] == "10.41.0.0/16"
+        assert ec2_west.describe_subnets(SubnetIds=[outputs["SubnetId"]])["Subnets"][0]["VpcId"] == outputs["VpcId"]
+        assert ec2_west.describe_security_groups(
+            GroupIds=[outputs["SecurityGroupId"]]
+        )["SecurityGroups"][0]["VpcId"] == "vpc-00000001"
+        assert ec2_west.describe_vpc_endpoints(
+            VpcEndpointIds=[outputs["EndpointId"]]
+        )["VpcEndpoints"][0]["VpcId"] == "vpc-00000001"
+        assert ec2_west.describe_route_tables(
+            RouteTableIds=[outputs["RouteTableId"]]
+        )["RouteTables"][0]["VpcId"] == "vpc-00000001"
+
+        with pytest.raises(ClientError):
+            ec2_east.describe_vpcs(VpcIds=[outputs["VpcId"]])
+        with pytest.raises(ClientError):
+            ec2_east.describe_subnets(SubnetIds=[outputs["SubnetId"]])
+        with pytest.raises(ClientError):
+            ec2_east.describe_security_groups(GroupIds=[outputs["SecurityGroupId"]])
+        assert ec2_east.describe_vpc_endpoints(VpcEndpointIds=[outputs["EndpointId"]])["VpcEndpoints"] == []
+
+        updated_template = json.loads(json.dumps(template))
+        updated_template["Resources"]["Endpoint2"] = {
+            "Type": "AWS::EC2::VPCEndpoint",
+            "Properties": {
+                "VpcEndpointType": "Gateway",
+                "ServiceName": "com.amazonaws.us-west-2.dynamodb",
+            },
+        }
+        updated_template["Outputs"]["Endpoint2Id"] = {"Value": {"Ref": "Endpoint2"}}
+
+        cfn_east.update_stack(StackName=stack_name, TemplateBody=json.dumps(updated_template))
+        stack = _wait_stack(cfn_east, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+        assert ec2_west.describe_vpc_endpoints(
+            VpcEndpointIds=[outputs["Endpoint2Id"]]
+        )["VpcEndpoints"][0]["VpcId"] == "vpc-00000001"
+        assert ec2_east.describe_vpc_endpoints(
+            VpcEndpointIds=[outputs["Endpoint2Id"]]
+        )["VpcEndpoints"] == []
+
+        cfn_east.delete_stack(StackName=stack_name)
+        _wait_stack(cfn_east, stack_name)
+        assert ec2_west.describe_vpc_endpoints(
+            VpcEndpointIds=[outputs["EndpointId"], outputs["Endpoint2Id"]]
+        )["VpcEndpoints"] == []
+    finally:
+        try:
+            cfn_west.delete_stack(StackName=stack_name)
+            _wait_stack(cfn_west, stack_name)
+        except ClientError:
+            pass
+
+    if outputs:
+        assert ec2_west.describe_vpc_endpoints(VpcEndpointIds=[outputs["EndpointId"]])["VpcEndpoints"] == []
+
+
 def test_cfn_elbv2_load_balancer_and_listener(cfn, elbv2):
     """CloudFormation provisions ELBv2 LoadBalancer + Listener and cleans both on delete."""
     uid = _uuid_mod.uuid4().hex[:8]
@@ -6392,6 +6521,7 @@ def test_cfn_cdk_opensearch_access_policy_custom_resource(cfn, opensearch):
     stack_name = f"cfn-os-access-{suffix}"
     domain_name = f"access-{suffix}"
     function_name = f"cfn-os-provider-{suffix}"
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
     access_policy = json.dumps({
         "Version": "2012-10-17",
         "Statement": [{
@@ -6483,11 +6613,11 @@ exports.handler = async (event) => {
                     "Role": "arn:aws:iam::000000000000:role/custom-resource",
                     "Timeout": 10,
                     "Code": {"ZipFile": provider_code},
-                    # CDK local tooling sets this exact hostname. The SDK shim
-                    # must not turn it into the S3-shaped
-                    # ``opensearch.localhost`` virtual host.
+                    # CDK local tooling sets a root MiniStack gateway endpoint.
+                    # The SDK shim must not turn it into the S3-shaped
+                    # ``opensearch.<gateway>`` virtual host.
                     "Environment": {
-                        "Variables": {"AWS_ENDPOINT_URL": "http://localhost:4566"},
+                        "Variables": {"AWS_ENDPOINT_URL": endpoint},
                     },
                 },
             },
@@ -6629,7 +6759,7 @@ def test_cfn_s3tables_table_schema_from_iceberg_metadata(cfn, s3tables):
     stack = _wait_stack(cfn, stack_name)
     assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
 
-    resp = _cfn_iceberg_json(f"/iceberg/v1/namespaces/myns/tables/mytable")
+    resp = _cfn_iceberg_json("/iceberg/v1/namespaces/myns/tables/mytable")
     fields = resp.get("metadata", {}).get("schemas", [{}])[0].get("fields", [])
     field_names = {f["name"] for f in fields}
     assert field_names == {"id", "value"}, f"expected columns id/value, got {field_names}"
