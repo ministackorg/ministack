@@ -14,12 +14,13 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
   - ``DescribeEndpoint`` returning a per-account hostname
 
 This is the control plane — pure HTTP/JSON, no MQTT broker
-dependency. The data plane (``iot_data.py``, ``iot_broker.py``) is
+dependency. The data plane (``iot_data.py``) is
 implemented separately and only depends on this module for certificate
 lookups (mTLS).
 
-State is fully isolated per account via ``AccountScopedDict`` and persisted
-through ``get_state``/``restore_state``. The Local CA (used to sign
+State is fully isolated per account and region via
+``AccountRegionScopedDict`` and persisted through
+``get_state``/``restore_state``. The Local CA (used to sign
 ``CreateKeysAndCertificate`` certificates) is also persisted so previously
 issued client certificates remain valid across restarts.
 """
@@ -43,7 +44,7 @@ from typing import Awaitable, Callable
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
-    AccountScopedDict,
+    AccountRegionScopedDict,
     _request_account_id,
     error_response_json,
     get_account_id,
@@ -67,16 +68,16 @@ _NAME_RE = re.compile(r"^[a-zA-Z0-9:_-]{1,128}$")
 
 
 # ---------------------------------------------------------------------------
-# Module-level state (account-scoped)
+# Module-level state (account-and-region-scoped)
 # ---------------------------------------------------------------------------
 
-_things: AccountScopedDict = AccountScopedDict()  # thingName -> Thing dict
-_thing_types: AccountScopedDict = AccountScopedDict()
-_thing_groups: AccountScopedDict = AccountScopedDict()
-_certificates: AccountScopedDict = AccountScopedDict()  # certificateId -> Certificate dict
-_policies: AccountScopedDict = AccountScopedDict()  # policyName -> Policy dict
-_topic_rules: AccountScopedDict = AccountScopedDict()  # ruleName -> TopicRule dict
-_shadows: AccountScopedDict = AccountScopedDict()  # (thingName, shadowName) -> shadow dict
+_things: AccountRegionScopedDict = AccountRegionScopedDict()  # thingName -> Thing dict
+_thing_types: AccountRegionScopedDict = AccountRegionScopedDict()
+_thing_groups: AccountRegionScopedDict = AccountRegionScopedDict()
+_certificates: AccountRegionScopedDict = AccountRegionScopedDict()
+_policies: AccountRegionScopedDict = AccountRegionScopedDict()
+_topic_rules: AccountRegionScopedDict = AccountRegionScopedDict()
+_shadows: AccountRegionScopedDict = AccountRegionScopedDict()
 
 # Local CA state — lazily generated on first use, persisted across restarts.
 import threading
@@ -132,14 +133,21 @@ def _broker_get_state() -> dict:
             "payload": base64.b64encode(msg.payload).decode("ascii"),
             "qos": msg.qos,
         })
-    return {"retained": retained_list}
+    return {"region_scoped": True, "retained": retained_list}
 
 
 def _broker_restore_state(data: dict | None) -> None:
     if not data:
         return
+    legacy_topics = not data.get("region_scoped", False)
     for entry in data.get("retained", []):
         topic = entry["topic"]
+        if legacy_topics:
+            account_id, separator, unscoped_topic = topic.partition("/")
+            if separator:
+                topic = (
+                    f"{account_id}/{get_region()}/{unscoped_topic}"
+                )
         payload = base64.b64decode(entry["payload"])
         qos = entry.get("qos", 0)
         _retained[topic] = _RetainedMessage(topic, payload, qos)
@@ -1453,9 +1461,9 @@ def _list_topic_rules(qp: dict) -> tuple:
 # ---------------------------------------------------------------------------
 
 
-def lookup_certificate_by_id(cert_id: str) -> dict | None:
-    """Return the Certificate record for a given certificateId in the current account, or None."""
-    return _certificates.get(cert_id)
+def lookup_certificate_by_id(cert_id: str, region: str) -> dict | None:
+    """Return a certificate in the current account and explicit region."""
+    return _certificates.get_scoped(get_account_id(), region, cert_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1640,8 +1648,8 @@ def delete_thing_shadow(thing_name: str, shadow_name: str) -> tuple:
 #
 # Multi-tenancy is enforced by transparent topic prefixing: every
 # PUBLISH/SUBSCRIBE topic seen on the wire is internally prefixed with the
-# caller's account_id before it hits the registry, and the prefix is
-# stripped on outbound delivery.
+# caller's account_id and region before it hits the registry, and the prefix
+# is stripped on outbound delivery.
 
 _broker_logger = logging.getLogger("iot_broker")
 
@@ -1650,8 +1658,8 @@ _broker_logger = logging.getLogger("iot_broker")
 # ---------------------------------------------------------------------------
 
 _subscriptions: dict[str, set["_Subscription"]] = {}
-_connected_clients: dict[tuple[str, str], "_WSSession"] = {}
-_persistent_sessions: dict[tuple[str, str], "_PersistentSessionState"] = {}
+_connected_clients: dict[tuple[str, str, str], "_WSSession"] = {}
+_persistent_sessions: dict[tuple[str, str, str], "_PersistentSessionState"] = {}
 _broker_lock = asyncio.Lock()
 
 _SESSION_EXPIRY_SECONDS: int = int(os.environ.get("IOT_SESSION_EXPIRY_SECONDS", "3600"))
@@ -1686,18 +1694,27 @@ _RETRANSMIT_INTERVAL_SECONDS = int(os.environ.get("IOT_RETRANSMIT_SECONDS", "10"
 
 
 class _Subscription:
-    __slots__ = ("subscription_id", "filter_prefixed", "account_id", "deliver", "granted_qos")
+    __slots__ = (
+        "subscription_id",
+        "filter_prefixed",
+        "account_id",
+        "region",
+        "deliver",
+        "granted_qos",
+    )
 
     def __init__(
         self,
         filter_prefixed: str,
         account_id: str,
+        region: str,
         deliver: Callable[[str, bytes, int], Awaitable[None]],
         granted_qos: int = 0,
     ):
         self.subscription_id = uuid.uuid4().hex
         self.filter_prefixed = filter_prefixed
         self.account_id = account_id
+        self.region = region
         self.deliver = deliver
         self.granted_qos = granted_qos
 
@@ -1713,12 +1730,12 @@ class _Subscription:
 # ---------------------------------------------------------------------------
 
 
-def _scoped_topic(account_id: str, topic: str) -> str:
-    return f"{account_id}/{topic}"
+def _scoped_topic(account_id: str, region: str, topic: str) -> str:
+    return f"{account_id}/{region}/{topic}"
 
 
-def _unscope_topic(account_id: str, scoped_topic: str) -> str:
-    prefix = f"{account_id}/"
+def _unscope_topic(account_id: str, region: str, scoped_topic: str) -> str:
+    prefix = f"{account_id}/{region}/"
     if scoped_topic.startswith(prefix):
         return scoped_topic[len(prefix):]
     return scoped_topic
@@ -1782,8 +1799,12 @@ async def broker_stop() -> None:
 _BASIC_INGEST_PREFIX = "$aws/rules/"
 
 
-def _rules_for_account(account_id: str) -> list[dict]:
-    return [v for (acct, _key), v in _topic_rules._data.items() if acct == account_id]
+def _rules_for_account(account_id: str, region: str) -> list[dict]:
+    return [
+        value
+        for (acct, reg, _key), value in _topic_rules._data.items()
+        if acct == account_id and reg == region
+    ]
 
 
 def _rule_event(payload: bytes):
@@ -1821,8 +1842,10 @@ def _run_rule_actions(account_id: str, rule: dict, payload: bytes) -> None:
             _dispatch_rule_to_lambda(account_id, lam["functionArn"], event)
 
 
-def _evaluate_topic_rules(account_id: str, topic: str, payload: bytes) -> None:
-    for rule in _rules_for_account(account_id):
+def _evaluate_topic_rules(
+    account_id: str, region: str, topic: str, payload: bytes
+) -> None:
+    for rule in _rules_for_account(account_id, region):
         filter_ = _rule_topic_filter(rule.get("sql", ""))
         if filter_ and _topic_matches(filter_, topic):
             _run_rule_actions(account_id, rule, payload)
@@ -1830,6 +1853,7 @@ def _evaluate_topic_rules(account_id: str, topic: str, payload: bytes) -> None:
 
 async def broker_publish(
     account_id: str,
+    region: str,
     topic: str,
     payload: bytes,
     qos: int = 0,
@@ -1839,10 +1863,14 @@ async def broker_publish(
     # to that rule's actions and bypasses pub/sub delivery entirely.
     if topic.startswith(_BASIC_INGEST_PREFIX):
         rule_name = topic[len(_BASIC_INGEST_PREFIX):].split("/", 1)[0]
-        _run_rule_actions(account_id, _topic_rules.get_scoped(account_id, None, rule_name), payload)
+        _run_rule_actions(
+            account_id,
+            _topic_rules.get_scoped(account_id, region, rule_name),
+            payload,
+        )
         return
 
-    scoped = _scoped_topic(account_id, topic)
+    scoped = _scoped_topic(account_id, region, topic)
 
     if retain:
         if not payload:
@@ -1854,54 +1882,69 @@ async def broker_publish(
         subs = [s for sset in _subscriptions.values() for s in sset]
 
     for sub in subs:
+        if sub.account_id != account_id or sub.region != region:
+            continue
         if _topic_matches(sub.filter_prefixed, scoped):
             try:
                 effective_qos = min(qos, sub.granted_qos)
-                await sub.deliver(_unscope_topic(sub.account_id, scoped), payload, effective_qos)
+                await sub.deliver(
+                    _unscope_topic(sub.account_id, sub.region, scoped),
+                    payload,
+                    effective_qos,
+                )
             except Exception:
                 _broker_logger.exception("IoT broker: subscriber %s delivery failed", sub.subscription_id)
 
     if qos >= 1:
         for key, ps in list(_persistent_sessions.items()):
-            ps_account_id, ps_client_id = key
-            if ps_account_id != account_id:
+            ps_account_id, ps_region, _ps_client_id = key
+            if ps_account_id != account_id or ps_region != region:
                 continue
             if key in _connected_clients:
                 continue
             if _is_session_expired(ps):
                 continue
             for filt in ps.subscriptions:
-                scoped_filter = _scoped_topic(ps_account_id, filt)
+                scoped_filter = _scoped_topic(ps_account_id, ps_region, filt)
                 if _topic_matches(scoped_filter, scoped):
                     ps.queued_messages.append((topic, payload, qos))
                     if len(ps.queued_messages) > _MAX_QUEUED_MESSAGES:
                         ps.queued_messages = ps.queued_messages[-_MAX_QUEUED_MESSAGES:]
                     break
 
-    _evaluate_topic_rules(account_id, topic, payload)
+    _evaluate_topic_rules(account_id, region, topic, payload)
 
 
 async def broker_subscribe(
     account_id: str,
+    region: str,
     topic_filter: str,
     callback: Callable[[str, bytes, int], Awaitable[None]],
     granted_qos: int = 0,
 ) -> str:
-    filter_prefixed = _scoped_topic(account_id, topic_filter)
-    sub = _Subscription(filter_prefixed, account_id, callback, granted_qos)
+    filter_prefixed = _scoped_topic(account_id, region, topic_filter)
+    sub = _Subscription(
+        filter_prefixed, account_id, region, callback, granted_qos
+    )
     async with _broker_lock:
         _subscriptions.setdefault(filter_prefixed, set()).add(sub)
         has_wildcard = "+" in topic_filter or "#" in topic_filter
         if not has_wildcard:
+            scope_prefix = f"{account_id}/{region}/"
             retained_to_send = [
-                r for k, r in _retained.items() if _topic_matches(filter_prefixed, k)
+                r
+                for k, r in _retained.items()
+                if k.startswith(scope_prefix)
+                and _topic_matches(filter_prefixed, k)
             ]
         else:
             retained_to_send = []
 
     for r in retained_to_send:
         try:
-            await sub.deliver(_unscope_topic(account_id, r.topic), r.payload, r.qos)
+            await sub.deliver(
+                _unscope_topic(account_id, region, r.topic), r.payload, r.qos
+            )
         except Exception:
             _broker_logger.exception("IoT broker: retained-message delivery failed")
 
@@ -1930,16 +1973,20 @@ def broker_reset() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _register_client(account_id: str, client_id: str, session: "_WSSession") -> None:
-    _connected_clients[(account_id, client_id)] = session
+def _register_client(
+    account_id: str, region: str, client_id: str, session: "_WSSession"
+) -> None:
+    _connected_clients[(account_id, region, client_id)] = session
 
 
-def _deregister_client(account_id: str, client_id: str) -> None:
-    _connected_clients.pop((account_id, client_id), None)
+def _deregister_client(account_id: str, region: str, client_id: str) -> None:
+    _connected_clients.pop((account_id, region, client_id), None)
 
 
-async def _force_disconnect_duplicate(account_id: str, client_id: str) -> None:
-    key = (account_id, client_id)
+async def _force_disconnect_duplicate(
+    account_id: str, region: str, client_id: str
+) -> None:
+    key = (account_id, region, client_id)
     existing = _connected_clients.get(key)
     if existing is not None:
         _broker_logger.info("IoT broker: duplicate client_id=%s, forcing old connection closed", client_id)
@@ -2058,9 +2105,10 @@ def _max_frame_buffer_bytes() -> int:
 
 
 class _WSSession:
-    def __init__(self, send_coro, account_id: str):
+    def __init__(self, send_coro, account_id: str, region: str):
         self._send = send_coro
         self.account_id = account_id
+        self.region = region
         self._sub_ids: list[str] = []
         self._sub_filters: dict[str, str] = {}
         self._sub_granted_qos: dict[str, int] = {}
@@ -2183,10 +2231,14 @@ class _WSSession:
                 self._will_retain = False
 
             self._graceful_disconnect = False
-            await _force_disconnect_duplicate(self.account_id, self._client_id)
-            _register_client(self.account_id, self._client_id, self)
+            await _force_disconnect_duplicate(
+                self.account_id, self.region, self._client_id
+            )
+            _register_client(
+                self.account_id, self.region, self._client_id, self
+            )
 
-            session_key = (self.account_id, self._client_id)
+            session_key = (self.account_id, self.region, self._client_id)
             session_present = False
 
             if clean_session:
@@ -2197,7 +2249,11 @@ class _WSSession:
                     session_present = True
                     for topic_filter in existing_ps.subscriptions:
                         sid = await broker_subscribe(
-                            self.account_id, topic_filter, self.deliver_to_client, 1
+                            self.account_id,
+                            self.region,
+                            topic_filter,
+                            self.deliver_to_client,
+                            1,
                         )
                         self._sub_ids.append(sid)
                         self._sub_filters[sid] = topic_filter
@@ -2230,7 +2286,14 @@ class _WSSession:
                 _broker_logger.warning("IoT broker: PUBLISH rejected — invalid topic: %r", topic)
                 return False
             payload = body[off:]
-            await broker_publish(self.account_id, topic, payload, qos=qos, retain=retain)
+            await broker_publish(
+                self.account_id,
+                self.region,
+                topic,
+                payload,
+                qos=qos,
+                retain=retain,
+            )
             if qos == 1 and packet_id is not None:
                 await self.send_bytes(_make_puback(packet_id))
             return True
@@ -2245,7 +2308,13 @@ class _WSSession:
                 off += 1
                 granted_qos = min(req_qos, 1)
                 granted.append(granted_qos)
-                sid = await broker_subscribe(self.account_id, topic, self.deliver_to_client, granted_qos)
+                sid = await broker_subscribe(
+                    self.account_id,
+                    self.region,
+                    topic,
+                    self.deliver_to_client,
+                    granted_qos,
+                )
                 self._sub_ids.append(sid)
                 self._sub_filters[sid] = topic
                 self._sub_granted_qos[sid] = granted_qos
@@ -2288,6 +2357,7 @@ class _WSSession:
         if not self._graceful_disconnect and self._will_topic is not None:
             await broker_publish(
                 self.account_id,
+                self.region,
                 self._will_topic,
                 self._will_message or b"",
                 qos=self._will_qos,
@@ -2301,10 +2371,10 @@ class _WSSession:
         self._sub_filters.clear()
         self._sub_granted_qos.clear()
         if self._client_id:
-            _deregister_client(self.account_id, self._client_id)
+            _deregister_client(self.account_id, self.region, self._client_id)
 
     def _preserve_session(self) -> None:
-        session_key = (self.account_id, self._client_id)
+        session_key = (self.account_id, self.region, self._client_id)
         unprefixed_filters = list(self._sub_filters.values())
         existing = _persistent_sessions.get(session_key)
         if existing is not None:
@@ -2316,7 +2386,9 @@ class _WSSession:
             )
 
 
-async def handle_websocket(scope: dict, receive, send, account_id: str) -> None:
+async def handle_websocket(
+    scope: dict, receive, send, account_id: str, region: str
+) -> None:
     """Drive an MQTT-over-WebSocket session."""
     msg = await receive()
     if msg.get("type") != "websocket.connect":
@@ -2341,7 +2413,7 @@ async def handle_websocket(scope: dict, receive, send, account_id: str) -> None:
     await send(accept)
 
     ctx_token = _request_account_id.set(account_id)
-    session = _WSSession(send, account_id)
+    session = _WSSession(send, account_id, region)
     max_buffer = _max_frame_buffer_bytes()
 
     try:

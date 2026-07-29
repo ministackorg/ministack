@@ -1,7 +1,7 @@
 """
 S3 Service Emulator – AWS-compatible.
 Supports: CreateBucket, DeleteBucket, ListBuckets, HeadBucket,
-          PutObject, GetObject, DeleteObject, HeadObject, CopyObject,
+          PutObject, GetObject, GetObjectAttributes, DeleteObject, HeadObject, CopyObject,
           ListObjectsV1 (with Marker/NextMarker pagination),
           ListObjectsV2 (with ContinuationToken pagination),
           DeleteObjects (batch),

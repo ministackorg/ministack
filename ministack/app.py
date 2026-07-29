@@ -1709,7 +1709,8 @@ async def app(scope, receive, send):
         _ws_key = extract_access_key_id(ws_headers, ws_query)
         if _ws_key:
             set_request_account_id(_ws_key)
-        set_request_region(extract_region(ws_headers, ws_query))
+        ws_region = extract_region(ws_headers, ws_query)
+        set_request_region(ws_region)
         ws_host = ws_headers.get("host", "")
         ws_path = scope.get("path", "")
         parsed = _parse_execute_api_url(ws_host, ws_path)
@@ -1735,7 +1736,7 @@ async def app(scope, receive, send):
                 # params or Authorization header, fall back to default.
                 account_id = _ws_resolve_iot_account_id(scope, ws_headers)
                 await _get_module("iot").handle_websocket(
-                    scope, receive, send, account_id
+                    scope, receive, send, account_id, ws_region
                 )
         except Exception:
             logger.exception("Error in WebSocket dispatch")
