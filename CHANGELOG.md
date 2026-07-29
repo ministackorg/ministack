@@ -7,6 +7,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- **EC2 - `ModifySecurityGroupRules`** - this action was unimplemented and returned `InvalidAction: Unknown EC2 action: ModifySecurityGroupRules`. Full support is now provided.
+
 ## [1.4.8] — 2026-07-28
 
 ### Added
@@ -18,8 +20,6 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **S3 Tables — Iceberg REST commits duplicated schema/spec/sort-order entries, crashing Spark on load** — `_iceberg_commit_table` appended unconditionally on `add-schema`/`add-spec`/`add-sort-order`, but Spark re-declares its current unchanged schema, partition spec, and sort order on every write, so a second commit produced a duplicate id and the next table load failed building Iceberg's id-keyed maps (`Multiple entries with same key`). These updates are now idempotent by id, matching the invariant Iceberg's own `TableMetadata` builder enforces. `add-snapshot` deduplication is intentionally not added — that is an optimistic-concurrency concern, not a structural one. Contributed by @squirmy.
 - **S3 Tables — `AWS::S3Tables::Table` CloudFormation ignored the declared schema** — the provisioner hardcoded an empty Iceberg schema and never read `IcebergMetadata.IcebergSchema.SchemaFieldList`, so every table created through CloudFormation had zero columns regardless of the template, and downstream consumers failed (a Firehose Iceberg-destination delivery errored with `does not have a column with name …`). The provisioner now parses `SchemaFieldList` (`Name`/`Type`/`Required`) into the table's Iceberg schema, the same way the `CreateTable` API path does. Contributed by @ryan-bennett.
 - **CloudFormation — cross-stack CDK deploys crashed with `'dict' object has no attribute 'startswith'`** — `aws-cdk-local` rewrites a CDK cross-stack reference into the non-AWS `Fn::GetStackOutput` intrinsic instead of `Fn::ImportValue`, and the engine never resolved it, so the unresolved dict reached a provisioner (for example an `AWS::Lambda::Permission` `FunctionName`) and rolled the stack back. The engine now resolves `Fn::GetStackOutput` to the named output of the referenced already-deployed stack, so `cdklocal deploy --all` across dependent stacks works. Reported by @jacsonrsasse.
-
-- **EC2 - `ModifySecurityGroupRules`** - this action was unimplemented and returned `InvalidAction: Unknown EC2 action: ModifySecurityGroupRules`. Full support is now provided.
 
 ## [1.4.7] — 2026-07-26
 
