@@ -1815,11 +1815,13 @@ def _rule_event(payload: bytes):
         return (payload or b"").decode("utf-8", "replace")
 
 
-def _dispatch_rule_to_lambda(account_id: str, function_arn: str, event) -> None:
+def _dispatch_rule_to_lambda(
+    account_id: str, region: str, function_arn: str, event
+) -> None:
     from ministack.services import lambda_svc
 
     func, config, name = lambda_svc._get_func_record_for_ref_in_scope(
-        function_arn, account_id=account_id
+        function_arn, account_id=account_id, region=region
     )
     if not func or not config:
         _broker_logger.warning("IoT rule → Lambda: function %s not found", function_arn)
@@ -1832,14 +1834,14 @@ def _dispatch_rule_to_lambda(account_id: str, function_arn: str, event) -> None:
     ).start()
 
 
-def _run_rule_actions(account_id: str, rule: dict, payload: bytes) -> None:
+def _run_rule_actions(account_id: str, region: str, rule: dict, payload: bytes) -> None:
     if not rule or rule.get("ruleDisabled"):
         return
     event = _rule_event(payload)
     for action in rule.get("actions", []) or []:
         lam = action.get("lambda")
         if lam and lam.get("functionArn"):
-            _dispatch_rule_to_lambda(account_id, lam["functionArn"], event)
+            _dispatch_rule_to_lambda(account_id, region, lam["functionArn"], event)
 
 
 def _evaluate_topic_rules(
@@ -1848,7 +1850,7 @@ def _evaluate_topic_rules(
     for rule in _rules_for_account(account_id, region):
         filter_ = _rule_topic_filter(rule.get("sql", ""))
         if filter_ and _topic_matches(filter_, topic):
-            _run_rule_actions(account_id, rule, payload)
+            _run_rule_actions(account_id, region, rule, payload)
 
 
 async def broker_publish(
@@ -1865,6 +1867,7 @@ async def broker_publish(
         rule_name = topic[len(_BASIC_INGEST_PREFIX):].split("/", 1)[0]
         _run_rule_actions(
             account_id,
+            region,
             _topic_rules.get_scoped(account_id, region, rule_name),
             payload,
         )

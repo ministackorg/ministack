@@ -958,8 +958,8 @@ def test_iot_topic_rules_and_basic_ingest_use_publish_region(monkeypatch):
     )
     dispatched = []
 
-    def _capture_rule_action(dispatched_account_id, rule, payload):
-        dispatched.append((dispatched_account_id, rule, payload))
+    def _capture_rule_action(dispatched_account_id, dispatched_region, rule, payload):
+        dispatched.append((dispatched_account_id, dispatched_region, rule, payload))
 
     monkeypatch.setattr(
         iot_module, "_run_rule_actions", _capture_rule_action
@@ -973,7 +973,7 @@ def test_iot_topic_rules_and_basic_ingest_use_publish_region(monkeypatch):
             b'{"value": 21}',
         )
         assert dispatched == [
-            (account_id, east_rule, b'{"value": 21}')
+            (account_id, "us-east-1", east_rule, b'{"value": 21}')
         ]
 
         dispatched.clear()
@@ -984,12 +984,90 @@ def test_iot_topic_rules_and_basic_ingest_use_publish_region(monkeypatch):
             b'{"value": 22}',
         )
         assert dispatched == [
-            (account_id, west_rule, b'{"value": 22}')
+            (account_id, "us-west-2", west_rule, b'{"value": 22}')
         ]
 
     try:
         asyncio.run(_run())
     finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+@pytest.mark.parametrize("function_ref_kind", ["name", "full_arn"])
+def test_iot_rule_lambda_dispatch_uses_rule_region(function_ref_kind, monkeypatch):
+    from ministack.services import iot as iot_module
+    from ministack.services import lambda_svc
+
+    class _ImmediateThread:
+        def __init__(self, target, args=(), kwargs=None, daemon=None):
+            self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
+
+        def start(self):
+            self._target(*self._args, **self._kwargs)
+
+    account_id = "123456789012"
+    function_name = _unique("rulefn")
+    east_arn = f"arn:aws:lambda:us-east-1:{account_id}:function:{function_name}"
+    west_arn = f"arn:aws:lambda:us-west-2:{account_id}:function:{function_name}"
+
+    def _function_record(function_arn):
+        return {
+            "config": {
+                "FunctionName": function_name,
+                "FunctionArn": function_arn,
+            },
+            "aliases": {},
+            "versions": {},
+        }
+
+    dispatched = []
+
+    def _capture_execute(func, event):
+        dispatched.append((func["config"]["FunctionArn"], event))
+
+    monkeypatch.setattr(iot_module.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(
+        lambda_svc, "_execute_function_with_config_scope", _capture_execute
+    )
+
+    lambda_svc._functions.clear()
+    iot_module._topic_rules.clear()
+    reset()
+    try:
+        lambda_svc._functions.set_scoped(
+            account_id, "us-east-1", function_name, _function_record(east_arn)
+        )
+        lambda_svc._functions.set_scoped(
+            account_id, "us-west-2", function_name, _function_record(west_arn)
+        )
+        function_ref = function_name if function_ref_kind == "name" else west_arn
+        iot_module._topic_rules.set_scoped(
+            account_id,
+            "us-west-2",
+            "regional_rule",
+            {
+                "ruleName": "regional_rule",
+                "sql": "SELECT * FROM 'sensors/#'",
+                "ruleDisabled": False,
+                "actions": [{"lambda": {"functionArn": function_ref}}],
+            },
+        )
+
+        async def _run():
+            await broker_publish(
+                account_id,
+                "us-west-2",
+                "sensors/temperature",
+                b'{"temperature": 22}',
+            )
+
+        asyncio.run(_run())
+        assert dispatched == [(west_arn, {"temperature": 22})]
+    finally:
+        lambda_svc._functions.clear()
         iot_module._topic_rules.clear()
         reset()
 
