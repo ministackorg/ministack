@@ -701,6 +701,93 @@ def test_sfn_aws_sdk_secretsmanager_create_and_get(sfn, sfn_sync, sm):
     sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
 
 
+def test_sfn_aws_sdk_query_services_accept_string_parameters(sfn_sync, sns, sqs, cw):
+    """aws-sdk integrations for Query-protocol services dispatch succesfully."""
+    import uuid as _uuid
+
+    suffix = _uuid.uuid4().hex[:8]
+    topic_arn = sns.create_topic(Name=f"sfn-sdk-query-{suffix}")["TopicArn"]
+    queue_url = sqs.create_queue(QueueName=f"sfn-sdk-query-{suffix}")["QueueUrl"]
+
+    definition = json.dumps({
+        "StartAt": "GetCallerIdentity",
+        "States": {
+            "GetCallerIdentity": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:sts:getCallerIdentity",
+                # AWS requires Parameters on every aws-sdk Task, even empty.
+                "Parameters": {},
+                "ResultPath": "$.caller",
+                "Next": "Publish",
+            },
+            "Publish": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:sns:publish",
+                "Parameters": {"TopicArn": topic_arn, "Message": "hello from sfn"},
+                "ResultPath": "$.publish",
+                "Next": "SendMessage",
+            },
+            "SendMessage": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:sqs:sendMessage",
+                "Parameters": {"QueueUrl": queue_url, "MessageBody": "hello from sfn"},
+                "ResultPath": "$.send",
+                "Next": "GetQueueAttributes",
+            },
+            "GetQueueAttributes": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:sqs:getQueueAttributes",
+                "Parameters": {"QueueUrl": queue_url, "AttributeNames": ["All"]},
+                "ResultPath": "$.attributes",
+                "Next": "ListRoles",
+            },
+            "ListRoles": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:iam:listRoles",
+                "Parameters": {},
+                "ResultPath": "$.roles",
+                "Next": "PutMetricData",
+            },
+            "PutMetricData": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:cloudwatch:putMetricData",
+                "Parameters": {
+                    "Namespace": f"sfn-sdk-query-{suffix}",
+                    "MetricData": [{"MetricName": "calls", "Value": 1}],
+                },
+                "ResultPath": "$.metric",
+                "End": True,
+            },
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=f"sfn-sdk-query-{suffix}",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+    assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+
+    output = json.loads(resp["output"])
+    assert output["caller"]["Account"] == "000000000000"
+    assert output["publish"]["MessageId"]
+    assert output["send"]["MessageId"]
+    # Repeated result elements unwrap to a list; it must not break the dispatcher.
+    # Repeated <Attribute> elements become the SDK's Attributes map, as in AWS.
+    assert isinstance(output["attributes"]["Attributes"], dict)
+    assert output["attributes"]["Attributes"]["QueueArn"].endswith(f"sfn-sdk-query-{suffix}")
+    assert "roles" in output
+    assert "metric" in output
+    # The call reached the service, not just the adapter.
+    metrics = cw.list_metrics(Namespace=f"sfn-sdk-query-{suffix}")["Metrics"]
+    assert [m["MetricName"] for m in metrics] == ["calls"]
+
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+    sqs.delete_queue(QueueUrl=queue_url)
+    sns.delete_topic(TopicArn=topic_arn)
+
+
 def test_sfn_jsonata_arguments_output_and_catch_output(sfn, sfn_sync, sm):
     """JSONata Task states evaluate Arguments and Output for aws-sdk integrations."""
     import uuid as _uuid

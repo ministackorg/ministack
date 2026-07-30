@@ -4722,7 +4722,21 @@ def _normalize_ec2_security_group(group):
     return group
 
 
+def _normalize_sqs_attribute_map(result):
+    """Repeated <Attribute><Name>/<Value> children as the SDK's Attributes map."""
+    items = result if isinstance(result, list) else [result]
+    attributes = {}
+    for item in items:
+        if isinstance(item, dict) and "Name" in item:
+            attributes[item["Name"]] = item.get("Value", "")
+    return {"Attributes": attributes}
+
+
 def _normalize_query_response(service_key, action, result):
+    # GetQueueAttributes is the one Query result that arrives as a list, so it is
+    # handled before the struct guard below.
+    if service_key == "sqs" and action == "GetQueueAttributes":
+        return _normalize_sqs_attribute_map(result)
     if not isinstance(result, dict):
         return result
     if service_key == "ec2" and action == "DescribeSecurityGroups":
@@ -4767,7 +4781,8 @@ def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
         form_params.update(_flatten_ec2_query_params(wire_data))
     else:
         form_params.update(_flatten_query_params(wire_data))
-    body = urlencode(form_params)
+    # Query-protocol handlers follow HTTP-server contract and take body as bytes.
+    body = urlencode(form_params).encode("utf-8")
 
     headers = {
         "content-type": "application/x-www-form-urlencoded",
@@ -4826,9 +4841,9 @@ def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
             result_key = f"{pascal_action}Result"
             if result_key in result:
                 result = result[result_key]
-            # Drop ResponseMetadata
+        if isinstance(result, dict):
             result.pop("ResponseMetadata", None)
-            result = _normalize_query_response(service_key, pascal_action, result)
+        result = _normalize_query_response(service_key, pascal_action, result)
         return _convert_keys_to_sfn_convention(result)
     except ET.ParseError:
         raise _ExecutionError("States.Runtime", f"Failed to parse {service_name} XML response")
