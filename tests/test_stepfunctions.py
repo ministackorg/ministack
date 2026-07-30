@@ -4827,6 +4827,120 @@ def test_sfn_intrinsic_functions_batch_2(sfn, sfn_sync):
     sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
 
 
+@pytest.mark.parametrize(
+    ("path", "data", "expected"),
+    [
+        ("$.matrix[0][1]", {"matrix": [[1, 2]]}, 2),
+        ("$.matrix[*][*]", {"matrix": [[1, 2], [3]]}, [1, 2, 3]),
+        (
+            "$.abc.['def ghi'][*]",
+            {"abc": {"def ghi": ["first", "second"]}},
+            ["first", "second"],
+        ),
+        ("$.values.*", {"values": {"only": 1}}, [1]),
+        (
+            "$.items[*].value",
+            {"items": [{"value": None}, {}]},
+            [None],
+        ),
+        ("$.matrix[2]", {"matrix": [[1, 2]]}, None),
+        ("$.rows[*][0]", {"rows": [[1], [], [2]]}, [1, None, 2]),
+        (
+            "$.items[*].name",
+            {"items": [{"name": "first"}, {}, {"name": "third"}]},
+            ["first", "third"],
+        ),
+        ("$.items[*].missing", {"items": [{"name": "first"}]}, []),
+    ],
+)
+def test_sfn_jsonpath_resolution(path, data, expected):
+    from ministack.services.stepfunctions import _resolve_path
+
+    assert _resolve_path(path, data) == expected
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "$.",
+        "$.matrix[",
+        "$.matrix[*",
+    ],
+)
+def test_sfn_jsonpath_rejects_unsupported_syntax(path):
+    from ministack.services.stepfunctions import _parse_jsonpath_tokens
+
+    assert _parse_jsonpath_tokens(path) is None
+
+
+def test_sfn_jsonpath_wildcard_projection(sfn_sync):
+    """JSONPath wildcards project nested values for parameters and intrinsics."""
+    sm_name = f"wildcard-projection-{_uuid_mod.uuid4().hex[:8]}"
+    definition = json.dumps({
+        "StartAt": "Project",
+        "States": {
+            "Project": {
+                "Type": "Pass",
+                "Parameters": {
+                    "requiresAction.$": (
+                        "States.ArrayContains("
+                        "$.results[*].previews[0].requiresAction, true)"
+                    ),
+                    "changes.$": "$.results[*].previews[0].changes[*]",
+                },
+                "End": True,
+            },
+        },
+    })
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    result = sfn_sync.start_sync_execution(
+        stateMachineArn=sm_arn,
+        input=json.dumps({
+            "results": [
+                {
+                    "previews": [{
+                        "requiresAction": False,
+                        "changes": [{"id": "first"}],
+                    }],
+                },
+                {
+                    "previews": [{
+                        "requiresAction": True,
+                        "changes": [{"id": "second"}, {"id": "third"}],
+                    }],
+                },
+            ],
+        }),
+    )
+    assert result["status"] == "SUCCEEDED", (
+        f"Execution failed: {result.get('error')} — {result.get('cause')}"
+    )
+    assert json.loads(result["output"]) == {
+        "requiresAction": True,
+        "changes": [{"id": "first"}, {"id": "second"}, {"id": "third"}],
+    }
+
+    empty_result = sfn_sync.start_sync_execution(
+        stateMachineArn=sm_arn,
+        input=json.dumps({"results": []}),
+    )
+    assert empty_result["status"] == "SUCCEEDED", (
+        f"Execution failed: {empty_result.get('error')} — "
+        f"{empty_result.get('cause')}"
+    )
+    assert json.loads(empty_result["output"]) == {
+        "requiresAction": False,
+        "changes": [],
+    }
+
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
 def test_sfn_aws_sdk_error_prefix_catch(sfn, sm):
     """aws-sdk errors are prefixed with the service name so Catch blocks match.
 
