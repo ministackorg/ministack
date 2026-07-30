@@ -1030,6 +1030,12 @@ def _sg_rule_id(sg_id, is_egress, rule):
     id from the rule's content keeps it stable regardless of list position or
     process restarts, and identical between Authorize and Describe.
     """
+
+    # Keep the assigned rule id stable once present. Updates to (ports, CIDR,
+    # protocol, etc) should not change identity.
+    if rule.get("SecurityGroupRuleId"):
+        return rule["SecurityGroupRuleId"]
+
     direction = "egress" if is_egress else "ingress"
     parts = [
         sg_id,
@@ -1069,10 +1075,25 @@ def _sg_rule_tag_suffix(rule_id):
     return suffix
 
 
+def _sg_rule_description(rule):
+    # Prefer an explicitly stored top-level description. Nested descriptions are
+    # a fallback for rules created from IpPermissions-only requests.
+    if rule.get("Description"):
+        return rule["Description"]
+
+    for key in ("IpRanges", "Ipv6Ranges", "PrefixListIds", "UserIdGroupPairs"):
+        for entry in rule.get(key, []):
+            if isinstance(entry, dict) and entry.get("Description"):
+                return entry["Description"]
+    return ""
+
+
 def _sg_rule_xml(sg_id, rule, is_egress=False):
     """Build <securityGroupRuleSet> items for Authorize responses (provider v6)."""
     rule_id = _sg_rule_id(sg_id, is_egress, rule)
     suffix = _sg_rule_tag_suffix(rule_id)
+    desc = _sg_rule_description(rule)
+    desc_xml = f"<description>{_esc(desc)}</description>" if desc else ""
     items = ""
     for cidr in rule.get("IpRanges", []):
         items += (f"<item>"
@@ -1084,6 +1105,7 @@ def _sg_rule_xml(sg_id, rule, is_egress=False):
                   f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
                   f"<toPort>{rule.get('ToPort', -1)}</toPort>"
                   f"<cidrIpv4>{cidr.get('CidrIp', '')}</cidrIpv4>"
+                  f"{desc_xml}"
                   f"{suffix}"
                   f"</item>")
     for cidr6 in rule.get("Ipv6Ranges", []):
@@ -1096,6 +1118,7 @@ def _sg_rule_xml(sg_id, rule, is_egress=False):
                   f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
                   f"<toPort>{rule.get('ToPort', -1)}</toPort>"
                   f"<cidrIpv6>{cidr6.get('CidrIpv6', '')}</cidrIpv6>"
+                  f"{desc_xml}"
                   f"{suffix}"
                   f"</item>")
     for pair in rule.get("UserIdGroupPairs", []):
@@ -1112,6 +1135,7 @@ def _sg_rule_xml(sg_id, rule, is_egress=False):
                   f"<groupId>{ref_gid}</groupId>"
                   f"<userId>{get_account_id()}</userId>"
                   f"</referencedGroupInfo>"
+                  f"{desc_xml}"
                   f"{suffix}"
                   f"</item>")
     if not items:
@@ -1124,6 +1148,7 @@ def _sg_rule_xml(sg_id, rule, is_egress=False):
                  f"<ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>"
                  f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
                  f"<toPort>{rule.get('ToPort', -1)}</toPort>"
+                 f"{desc_xml}"
                  f"{suffix}"
                  f"</item>")
     return items
@@ -1169,7 +1194,10 @@ def _revoked_sg_rule_xml(sg_id, rule, is_egress=False):
 
 def _strip_descriptions(rule):
     """Return a copy of rule with Description stripped from all range entries for comparison."""
-    r = dict(rule)
+    r = {
+        k: v for k, v in dict(rule).items()
+        if k not in ("SecurityGroupRuleId", "Description")
+    }
     for key in ("IpRanges", "Ipv6Ranges"):
         r[key] = [{k: v for k, v in entry.items() if k != "Description"} for entry in r.get(key, [])]
     return r
@@ -1216,6 +1244,7 @@ def _authorize_sg_ingress(p):
     rule_tags = _sg_rule_tag_specifications(p)
     rule_items = ""
     for r in rules:
+        r.setdefault("SecurityGroupRuleId", _sg_rule_id(sg_id, False, r))
         # Idempotent: skip rules that already exist (matches egress behavior and avoids
         # Terraform InvalidPermission.Duplicate when the provider re-authorizes unchanged rules).
         if not any(_rules_match(r, existing) for existing in sg["IpPermissions"]):
@@ -1250,6 +1279,7 @@ def _authorize_sg_egress(p):
     rule_tags = _sg_rule_tag_specifications(p)
     rule_items = ""
     for r in rules:
+        r.setdefault("SecurityGroupRuleId", _sg_rule_id(sg_id, True, r))
         if not any(_rules_match(r, existing) for existing in sg["IpPermissionsEgress"]):
             sg["IpPermissionsEgress"].append(r)
             if rule_tags:
@@ -4755,6 +4785,139 @@ def _describe_security_group_rules(p):
     return _xml(200, "DescribeSecurityGroupRulesResponse", f"<securityGroupRuleSet>{items}</securityGroupRuleSet>")
 
 
+def _modify_security_group_rules(p):
+    sg_id = _p(p, "GroupId")
+    sg = _security_groups.get(sg_id)
+    if not sg:
+        return _error("InvalidGroup.NotFound", f"Security group {sg_id} not found", 400)
+
+    updates = []
+    i = 1
+    while True:
+        prefix = ""
+        rule_id = _p(p, f"SecurityGroupRule.{i}.SecurityGroupRuleId")
+        if rule_id:
+            prefix = "SecurityGroupRule"
+        else:
+            rule_id = _p(p, f"SecurityGroupRules.{i}.SecurityGroupRuleId")
+            if rule_id:
+                prefix = "SecurityGroupRules"
+        if not rule_id:
+            break
+
+        base = f"{prefix}.{i}.SecurityGroupRule"
+        updates.append({
+            "rule_id": rule_id,
+            "description": _p(p, f"{base}.Description", None),
+            "ip_protocol": _p(p, f"{base}.IpProtocol", None),
+            "from_port": _p(p, f"{base}.FromPort", None),
+            "to_port": _p(p, f"{base}.ToPort", None),
+            "cidr_ipv4": _p(p, f"{base}.CidrIpv4", None),
+            "cidr_ipv6": _p(p, f"{base}.CidrIpv6", None),
+            "prefix_list_id": _p(p, f"{base}.PrefixListId", None),
+            "referenced_group_id": _p(p, f"{base}.ReferencedGroupInfo.GroupId", None),
+        })
+        i += 1
+
+    if not updates:
+        return _error("MissingParameter", "SecurityGroupRule is required", 400)
+
+    for update in updates:
+        rule_id = update["rule_id"]
+        found = False
+        for is_egress, key in ((False, "IpPermissions"), (True, "IpPermissionsEgress")):
+            for rule in sg.get(key, []):
+                if _sg_rule_id(sg_id, is_egress, rule) != rule_id:
+                    continue
+
+                found = True
+                rule["SecurityGroupRuleId"] = rule_id
+
+                if update["ip_protocol"] is not None:
+                    rule["IpProtocol"] = update["ip_protocol"]
+                if update["from_port"] is not None:
+                    rule["FromPort"] = int(update["from_port"])
+                if update["to_port"] is not None:
+                    rule["ToPort"] = int(update["to_port"])
+
+                if update["cidr_ipv4"] is not None:
+                    first = {}
+                    if rule.get("IpRanges") and isinstance(rule["IpRanges"][0], dict):
+                        first = dict(rule["IpRanges"][0])
+                    first["CidrIp"] = update["cidr_ipv4"]
+                    rule["IpRanges"] = [first]
+                    rule["Ipv6Ranges"] = []
+                    rule["PrefixListIds"] = []
+                    rule["UserIdGroupPairs"] = []
+
+                if update["cidr_ipv6"] is not None:
+                    first = {}
+                    if rule.get("Ipv6Ranges") and isinstance(rule["Ipv6Ranges"][0], dict):
+                        first = dict(rule["Ipv6Ranges"][0])
+                    first["CidrIpv6"] = update["cidr_ipv6"]
+                    rule["Ipv6Ranges"] = [first]
+                    rule["IpRanges"] = []
+                    rule["PrefixListIds"] = []
+                    rule["UserIdGroupPairs"] = []
+
+                if update["prefix_list_id"] is not None:
+                    first = {}
+                    if rule.get("PrefixListIds") and isinstance(rule["PrefixListIds"][0], dict):
+                        first = dict(rule["PrefixListIds"][0])
+                    first["PrefixListId"] = update["prefix_list_id"]
+                    rule["PrefixListIds"] = [first]
+                    rule["IpRanges"] = []
+                    rule["Ipv6Ranges"] = []
+                    rule["UserIdGroupPairs"] = []
+
+                if update["referenced_group_id"] is not None:
+                    first = {}
+                    if rule.get("UserIdGroupPairs") and isinstance(rule["UserIdGroupPairs"][0], dict):
+                        first = dict(rule["UserIdGroupPairs"][0])
+                    first["GroupId"] = update["referenced_group_id"]
+                    first.setdefault("UserId", get_account_id())
+                    rule["UserIdGroupPairs"] = [first]
+                    rule["IpRanges"] = []
+                    rule["Ipv6Ranges"] = []
+                    rule["PrefixListIds"] = []
+
+                description = update["description"]
+                if description is not None:
+                    wrote_nested = False
+                    for collection in ("IpRanges", "Ipv6Ranges", "PrefixListIds", "UserIdGroupPairs"):
+                        for entry in rule.get(collection, []):
+                            if not isinstance(entry, dict):
+                                continue
+                            if description == "":
+                                entry.pop("Description", None)
+                            else:
+                                entry["Description"] = description
+                            wrote_nested = True
+
+                    if not wrote_nested:
+                        if description == "":
+                            rule.pop("Description", None)
+                        else:
+                            rule["Description"] = description
+                    elif description == "":
+                        rule.pop("Description", None)
+                    else:
+                        rule["Description"] = description
+                break
+
+            if found:
+                break
+
+        if not found:
+            return _error(
+                "InvalidSecurityGroupRuleId.NotFound",
+                f"The security group rule '{rule_id}' does not exist",
+                400,
+            )
+
+    return _xml(200, "ModifySecurityGroupRulesResponse", "<return>true</return>")
+
+
 # ---------------------------------------------------------------------------
 # Launch Templates
 # ---------------------------------------------------------------------------
@@ -5634,6 +5797,7 @@ _ACTION_MAP = {
     "DescribeVpcClassicLinkDnsSupport": _describe_vpc_classic_link_dns_support,
     "DescribeAddressesAttribute": _describe_addresses_attribute,
     "DescribeSecurityGroupRules": _describe_security_group_rules,
+    "ModifySecurityGroupRules": _modify_security_group_rules,
     "ModifySubnetAttribute": _modify_subnet_attribute,
     "CreateRouteTable": _create_route_table,
     "DeleteRouteTable": _delete_route_table,

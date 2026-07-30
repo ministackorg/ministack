@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **Cognito — `CUSTOM_AUTH` now honors Cognito-owned SRP challenges and passes `ClientMetadata` to DefineAuth** — Amplify `CUSTOM_WITH_SRP` failed with `USER_ID_FOR_SRP was not found` because `CUSTOM_AUTH` always invoked CreateAuth and returned `CUSTOM_CHALLENGE`, even when DefineAuth returned `PASSWORD_VERIFIER` / `SRP_A`. InitiateAuth with `SRP_A` now records `SRP_A` success (AWS-like), returns built-in `PASSWORD_VERIFIER` challenge parameters, and continues the custom-auth session after RespondToAuthChallenge so MFA `CUSTOM_CHALLENGE` rounds still work. DefineAuth also receives `ClientMetadata` (previously hard-coded `{}`), matching Create/Verify. Contributed by @onelshina.
+- **EC2 - `ModifySecurityGroupRules`** - this action was unimplemented and returned `InvalidAction: Unknown EC2 action: ModifySecurityGroupRules`. Full support is now provided.
 
 ## [1.4.8] — 2026-07-28
 
