@@ -777,7 +777,10 @@ def test_sfn_aws_sdk_query_services_accept_string_parameters(sfn_sync, sns, sqs,
     # Repeated <Attribute> elements become the SDK's Attributes map, as in AWS.
     assert isinstance(output["attributes"]["Attributes"], dict)
     assert output["attributes"]["Attributes"]["QueueArn"].endswith(f"sfn-sdk-query-{suffix}")
-    assert "roles" in output
+    # Collections are JSON arrays and IsTruncated a bool, as the SDK returns them,
+    # so an ASL definition can index or iterate the result.
+    assert isinstance(output["roles"]["Roles"], list)
+    assert output["roles"]["IsTruncated"] is False
     assert "metric" in output
     # The call reached the service, not just the adapter.
     metrics = cw.list_metrics(Namespace=f"sfn-sdk-query-{suffix}")["Metrics"]

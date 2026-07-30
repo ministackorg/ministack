@@ -4523,6 +4523,10 @@ _XML_LIST_WRAPPER_TAGS = frozenset({
     "EnabledCloudwatchLogsExports", "GlobalClusterMembers",
     "DBParameterGroups", "DBInstances", "DBClusters", "Readers",
     "SupportedNetworkTypes",
+    "Roles", "Users", "Groups", "Policies", "AttachedPolicies", "PolicyNames",
+    "InstanceProfiles", "ServerCertificateMetadataList", "AccessKeyMetadata",
+    "Metrics", "Dimensions", "MetricAlarms", "CompositeAlarms",
+    "MetricDataResults", "Datapoints", "QueueUrls",
 })
 _XML_BOOLEAN_FIELDS = frozenset({
     "MultiAZ", "Multiaz", "StorageEncrypted", "DeletionProtection",
@@ -4531,6 +4535,7 @@ _XML_BOOLEAN_FIELDS = frozenset({
     "PerformanceInsightsEnabled", "HttpEndpointEnabled",
     "CrossAccountClone", "CustomerOwnedIpEnabled",
     "IsStorageConfigUpgradeAvailable", "IsWriter", "IsDataLossAllowed",
+    "IsTruncated",
 })
 
 
