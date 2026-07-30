@@ -15,6 +15,7 @@ Supported operations:
 """
 
 import collections
+import copy
 import json
 import logging
 import os
@@ -22,17 +23,23 @@ import time
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    AccountScopedDict,
+    get_account_id,
+    get_region,
+    new_uuid,
+)
 
 logger = logging.getLogger("cloudtrail")
 
 _recording_enabled: bool = os.environ.get("CLOUDTRAIL_RECORDING", "0") == "1"
 _MAX_EVENTS: int = int(os.environ.get("CLOUDTRAIL_MAX_EVENTS", "10000"))
 
-_events = AccountScopedDict()           # "events" -> deque[event_dict]
-_trails = AccountScopedDict()           # trail_name -> trail_record
-_event_selectors = AccountScopedDict()  # trail_name -> list[EventSelector]
-_trail_tags = AccountScopedDict()       # trail_arn -> {tag_key: tag_value}
+_events = AccountRegionScopedDict()           # "events" -> deque[event_dict]
+_trails = AccountRegionScopedDict()           # trail_name -> trail_record, scoped to HomeRegion
+_event_selectors = AccountRegionScopedDict()  # trail_name -> list[EventSelector], scoped to HomeRegion
+_trail_tags = AccountScopedDict()             # trail_arn -> {tag_key: tag_value}
 
 _SCRUB_KEYS = frozenset(
     {
@@ -59,25 +66,70 @@ def reset():
 def get_state():
     # Trail config persists; events are ephemeral (timestamps meaningless after restart).
     return {
-        "trails": {k: v for k, v in _trails.items()},
-        "event_selectors": {k: v for k, v in _event_selectors.items()},
-        "trail_tags": {k: v for k, v in _trail_tags.items()},
+        "trails": copy.deepcopy(_trails),
+        "event_selectors": copy.deepcopy(_event_selectors),
+        "trail_tags": copy.deepcopy(_trail_tags),
     }
 
 
 def restore_state(data):
     if not isinstance(data, dict):
         return
-    for k, v in data.get("trails", {}).items():
-        _trails[k] = v
-    for k, v in data.get("event_selectors", {}).items():
-        _event_selectors[k] = v
-    for k, v in data.get("trail_tags", {}).items():
-        _trail_tags[k] = v
+    trail_regions = _restore_trails(data.get("trails", {}))
+    _restore_event_selectors(data.get("event_selectors", {}), trail_regions)
+    _restore_trail_tags(data.get("trail_tags", {}))
 
 
 def load_persisted_state(data):
     restore_state(data)
+
+
+def _restore_trails(saved) -> dict[tuple[str, str], str]:
+    trail_regions: dict[tuple[str, str], str] = {}
+    if isinstance(saved, AccountRegionScopedDict):
+        _trails.update(saved)
+        for (account_id, region, name), trail in saved.all_items():
+            trail_regions[(account_id, name)] = _trail_home_region(trail, fallback_region=region)
+        return trail_regions
+
+    for account_id, name, trail in _legacy_account_items(saved):
+        trail_copy = copy.deepcopy(trail)
+        region = _trail_home_region(trail_copy)
+        if isinstance(trail_copy, dict):
+            trail_copy.setdefault("HomeRegion", region)
+        _trails.set_scoped(account_id, region, name, trail_copy)
+        trail_regions[(account_id, name)] = region
+    return trail_regions
+
+
+def _restore_event_selectors(saved, trail_regions: dict[tuple[str, str], str]):
+    if isinstance(saved, AccountRegionScopedDict):
+        _event_selectors.update(saved)
+        return
+
+    boot_region = get_region()
+    for account_id, name, selectors in _legacy_account_items(saved):
+        region = trail_regions.get((account_id, name), boot_region)
+        _event_selectors.set_scoped(account_id, region, name, copy.deepcopy(selectors))
+
+
+def _restore_trail_tags(saved):
+    if isinstance(saved, AccountScopedDict):
+        _trail_tags.update(saved)
+        return
+    if isinstance(saved, dict):
+        for arn, tags in saved.items():
+            _trail_tags[arn] = copy.deepcopy(tags)
+
+
+def _legacy_account_items(saved):
+    if isinstance(saved, AccountScopedDict):
+        for (account_id, key), value in saved._data.items():
+            yield account_id, key, value
+    elif isinstance(saved, dict):
+        account_id = get_account_id()
+        for key, value in saved.items():
+            yield account_id, key, value
 
 
 def _scrub(params: dict) -> dict:
@@ -91,6 +143,113 @@ def _scrub(params: dict) -> dict:
 
 def _trail_arn(name: str) -> str:
     return f"arn:aws:cloudtrail:{get_region()}:{get_account_id()}:trail/{name}"
+
+
+def _trail_home_region(trail: dict | None, fallback_region: str | None = None) -> str:
+    if isinstance(trail, dict):
+        if trail.get("HomeRegion"):
+            return trail["HomeRegion"]
+        arn = trail.get("TrailARN")
+        if arn:
+            try:
+                spec, _ = _parse_trail_arn(arn)
+                if spec.region:
+                    return spec.region
+            except ValueError:
+                pass
+    return fallback_region or get_region()
+
+
+def _account_trail_items(account_id: str | None = None):
+    account_id = account_id or get_account_id()
+    for (trail_account_id, region, name), trail in _trails.all_items():
+        if trail_account_id == account_id:
+            yield region, name, trail
+
+
+def _visible_trail_items(*, include_shadow_trails: bool = True):
+    account_id = get_account_id()
+    region = get_region()
+    visible = []
+    seen = set()
+    for name, trail in _trails.items_scoped(account_id, region):
+        visible.append((region, name, trail))
+        seen.add(name)
+    for home_region, name, trail in _account_trail_items(account_id):
+        if home_region == region or name in seen:
+            continue
+        if include_shadow_trails and trail.get("IsMultiRegionTrail", False):
+            visible.append((home_region, name, trail))
+            seen.add(name)
+    return visible
+
+
+def _find_any_account_trail(name: str):
+    for home_region, trail_name, trail in _account_trail_items():
+        if trail_name == name:
+            return home_region, trail
+    return None, None
+
+
+def _has_peer_region_trail(name: str, home_region: str) -> bool:
+    for peer_region, trail_name, _trail in _account_trail_items():
+        if trail_name == name and peer_region != home_region:
+            return True
+    return False
+
+
+def _find_visible_trail(raw: str):
+    if raw.startswith("arn:"):
+        spec, name = _parse_trail_arn(raw)
+        if spec.account_id != get_account_id():
+            return name, None, None
+        trail = _trails.get_scoped(spec.account_id, spec.region, name)
+        if trail is None or trail.get("TrailARN") != str(spec):
+            return name, None, None
+        return name, spec.region, trail
+
+    trail = _trails.get(raw)
+    if trail is not None:
+        return raw, get_region(), trail
+
+    for home_region, name, trail in _account_trail_items():
+        if name == raw and trail.get("IsMultiRegionTrail", False):
+            return name, home_region, trail
+    return raw, None, None
+
+
+def _invalid_home_region_error(name: str, home_region: str):
+    return _err(
+        "InvalidHomeRegionException",
+        f"Trail {name!r} must be managed from its home region {home_region}.",
+    )
+
+
+def _find_mutable_trail(raw: str):
+    if raw.startswith("arn:"):
+        try:
+            spec, name = _parse_trail_arn(raw)
+        except ValueError as exc:
+            return None, None, None, _err("CloudTrailARNInvalidException", str(exc))
+        if spec.account_id != get_account_id():
+            return name, None, None, _err("TrailNotFoundException", f"Unknown trail: {raw!r}", 404)
+        trail = _trails.get_scoped(spec.account_id, spec.region, name)
+        if trail is None or trail.get("TrailARN") != str(spec):
+            return name, None, None, _err("TrailNotFoundException", f"Unknown trail: {raw!r}", 404)
+        if spec.region != get_region():
+            if trail.get("IsMultiRegionTrail", False):
+                return name, spec.region, trail, _invalid_home_region_error(name, spec.region)
+            return name, None, None, _err("TrailNotFoundException", f"Unknown trail: {raw!r}", 404)
+        return name, spec.region, trail, None
+
+    trail = _trails.get(raw)
+    if trail is not None:
+        return raw, get_region(), trail, None
+
+    home_region, trail = _find_any_account_trail(raw)
+    if trail is not None and trail.get("IsMultiRegionTrail", False):
+        return raw, home_region, trail, _invalid_home_region_error(raw, home_region)
+    return raw, None, None, _err("TrailNotFoundException", f"Unknown trail: {raw!r}", 404)
 
 
 def _parse_trail_arn(arn: str):
@@ -118,7 +277,7 @@ def _trail_name_from_read_arn(arn: str) -> str | None:
     spec, trail_name = _parse_trail_arn(arn)
     if spec.account_id != get_account_id():
         return None
-    trail = _trails.get(trail_name)
+    trail = _trails.get_scoped(spec.account_id, spec.region, trail_name)
     if trail is None or trail.get("TrailARN") != str(spec):
         return None
     return trail_name
@@ -301,7 +460,7 @@ def _validate_trail_arn(arn: str, *, require_existing: bool = False):
         return _err("CloudTrailARNInvalidException", "Invalid CloudTrail trail ARN.")
 
     if require_existing:
-        trail = _trails.get(trail_name)
+        trail = _trails.get_scoped(spec.account_id, spec.region, trail_name)
         if trail is None or trail.get("TrailARN") != str(spec):
             return _err("ResourceNotFoundException", f"Unknown trail: {arn!r}")
 
@@ -321,7 +480,9 @@ def _create_trail(body: dict):
     name = body.get("Name", "").strip()
     if not name:
         return _err("InvalidTrailNameException", "Trail name is required.")
-    if _trails.get(name) is not None:
+    is_multi_region = body.get("IsMultiRegionTrail", False)
+    _, visible_trail = _find_any_account_trail(name) if is_multi_region else (None, None)
+    if visible_trail is not None or _find_visible_trail(name)[2] is not None:
         return _err("TrailAlreadyExistsException", f"Trail {name!r} already exists.")
     arn = _trail_arn(name)
     trail = {
@@ -330,7 +491,7 @@ def _create_trail(body: dict):
         "S3KeyPrefix": body.get("S3KeyPrefix", ""),
         "SnsTopicName": body.get("SnsTopicName", ""),
         "IncludeGlobalServiceEvents": body.get("IncludeGlobalServiceEvents", True),
-        "IsMultiRegionTrail": body.get("IsMultiRegionTrail", False),
+        "IsMultiRegionTrail": is_multi_region,
         "LogFileValidationEnabled": body.get("EnableLogFileValidation", False),
         "HomeRegion": get_region(),
         "TrailARN": arn,
@@ -366,13 +527,11 @@ def _delete_trail(body: dict):
     raw = body.get("Name", "").strip()
     if not raw:
         return _err("InvalidTrailNameException", "Trail name is required.")
-    name, error = _resolve_trail_name_or_error(raw)
+    name, home_region, _trail, error = _find_mutable_trail(raw)
     if error:
         return error
-    if _trails.get(name) is None:
-        return _err("TrailNotFoundException", f"Unknown trail: {name!r}", 404)
-    del _trails[name]
-    _event_selectors.pop(name, None)
+    _trails.pop_scoped(get_account_id(), home_region, name, None)
+    _event_selectors.pop_scoped(get_account_id(), home_region, name, None)
     return _ok({})
 
 
@@ -382,10 +541,10 @@ def _get_trail(body: dict):
         return _err("InvalidTrailNameException", "Trail name is required.")
     if raw.startswith("arn:") and _is_non_aws_trail_arn_partition(raw):
         return _err("InvalidTrailNameException", "Invalid trail name.")
-    name, error = _resolve_trail_name_or_error(raw, allow_cross_region_arn=True)
-    if error:
-        return error
-    trail = _trails.get(name)
+    try:
+        name, _home_region, trail = _find_visible_trail(raw)
+    except ValueError as exc:
+        return _err("CloudTrailARNInvalidException", str(exc))
     if trail is None:
         return _err("TrailNotFoundException", f"Unknown trail: {name!r}", 404)
     return _ok({"Trail": trail})
@@ -393,15 +552,30 @@ def _get_trail(body: dict):
 
 def _describe_trails(body: dict):
     trail_names = body.get("trailNameList", [])
-    all_trails = [v for _, v in _trails.items()]
+    include_shadow_trails = body.get("includeShadowTrails", True)
+    all_trails = [
+        trail
+        for _home_region, _name, trail in _visible_trail_items(
+            include_shadow_trails=include_shadow_trails
+        )
+    ]
     if trail_names:
-        resolved = set()
+        resolved = []
         for trail_name in trail_names:
-            name, error = _resolve_trail_name_or_error(trail_name, allow_cross_region_arn=True)
-            if error:
-                return error
-            resolved.add(name)
-        all_trails = [t for t in all_trails if t["Name"] in resolved]
+            try:
+                _name, home_region, trail = _find_visible_trail(trail_name)
+            except ValueError as exc:
+                return _err("CloudTrailARNInvalidException", str(exc))
+            if (
+                trail is not None
+                and (
+                    include_shadow_trails
+                    or home_region == get_region()
+                    or not trail.get("IsMultiRegionTrail", False)
+                )
+            ):
+                resolved.append(trail)
+        all_trails = resolved
     return _ok({"trailList": all_trails})
 
 
@@ -409,10 +583,10 @@ def _get_trail_status(body: dict):
     raw = body.get("Name", "").strip()
     if not raw:
         return _err("InvalidTrailNameException", "Trail name is required.")
-    name, error = _resolve_trail_name_or_error(raw, allow_cross_region_arn=True)
-    if error:
-        return error
-    trail = _trails.get(name)
+    try:
+        name, _home_region, trail = _find_visible_trail(raw)
+    except ValueError as exc:
+        return _err("CloudTrailARNInvalidException", str(exc))
     if trail is None:
         return _err("TrailNotFoundException", f"Unknown trail: {name!r}", 404)
     now = int(time.time())
@@ -433,12 +607,9 @@ def _start_logging(body: dict):
     raw = body.get("Name", "").strip()
     if not raw:
         return _err("InvalidTrailNameException", "Trail name is required.")
-    name, error = _resolve_trail_name_or_error(raw)
+    _name, _home_region, trail, error = _find_mutable_trail(raw)
     if error:
         return error
-    trail = _trails.get(name)
-    if trail is None:
-        return _err("TrailNotFoundException", f"Unknown trail: {name!r}", 404)
     trail["IsLogging"] = True
     trail["_StartedAt"] = int(time.time())
     trail.pop("_StoppedAt", None)
@@ -449,12 +620,9 @@ def _stop_logging(body: dict):
     raw = body.get("Name", "").strip()
     if not raw:
         return _err("InvalidTrailNameException", "Trail name is required.")
-    name, error = _resolve_trail_name_or_error(raw)
+    _name, _home_region, trail, error = _find_mutable_trail(raw)
     if error:
         return error
-    trail = _trails.get(name)
-    if trail is None:
-        return _err("TrailNotFoundException", f"Unknown trail: {name!r}", 404)
     trail["IsLogging"] = False
     trail["_StoppedAt"] = int(time.time())
     return _ok({})
@@ -468,7 +636,7 @@ def _list_trails(body: dict):
             "Name": t["Name"],
             "HomeRegion": t.get("HomeRegion", get_region()),
         }
-        for t in _trails.values()
+        for _home_region, _name, t in _visible_trail_items()
     ]
     out = {"Trails": summaries}
     return _ok(out)
@@ -478,12 +646,15 @@ def _update_trail(body: dict):
     raw = body.get("Name", "").strip()
     if not raw:
         return _err("InvalidTrailNameException", "Trail name is required.")
-    name, error = _resolve_trail_name_or_error(raw)
+    name, home_region, trail, error = _find_mutable_trail(raw)
     if error:
         return error
-    trail = _trails.get(name)
-    if trail is None:
-        return _err("TrailNotFoundException", f"Unknown trail: {name!r}", 404)
+    if (
+        body.get("IsMultiRegionTrail") is True
+        and not trail.get("IsMultiRegionTrail", False)
+        and _has_peer_region_trail(name, home_region)
+    ):
+        return _err("TrailAlreadyExistsException", f"Trail {name!r} already exists.")
     for src, dst in (
         ("S3BucketName", "S3BucketName"),
         ("S3KeyPrefix", "S3KeyPrefix"),
@@ -531,23 +702,25 @@ def _put_event_selectors(body: dict):
     raw = body.get("TrailName", "").strip()
     if not raw:
         return _err("InvalidTrailNameException", "Trail name is required.")
-    name, error = _resolve_existing_trail_name_or_error(raw)
+    name, home_region, trail, error = _find_mutable_trail(raw)
     if error:
         return error
     selectors = body.get("EventSelectors", [])
-    _event_selectors[name] = selectors
-    return _ok({"TrailARN": _trail_arn(name), "EventSelectors": selectors})
+    _event_selectors.set_scoped(get_account_id(), home_region, name, selectors)
+    return _ok({"TrailARN": trail["TrailARN"], "EventSelectors": selectors})
 
 
 def _get_event_selectors(body: dict):
     raw = body.get("TrailName", "").strip()
     if not raw:
         return _err("InvalidTrailNameException", "Trail name is required.")
-    name, error = _resolve_existing_trail_name_or_error(raw, allow_cross_region_arn=True)
-    if error:
-        return error
-    trail = _trails.get(name) or {}
-    selectors = _event_selectors.get(name) or []
+    try:
+        name, home_region, trail = _find_visible_trail(raw)
+    except ValueError as exc:
+        return _err("CloudTrailARNInvalidException", str(exc))
+    if trail is None:
+        return _err("TrailNotFoundException", f"Unknown trail: {raw!r}", 404)
+    selectors = _event_selectors.get_scoped(get_account_id(), home_region, name) or []
     return _ok(
         {
             "TrailARN": trail.get("TrailARN", _trail_arn(name)),

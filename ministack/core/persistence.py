@@ -42,6 +42,7 @@ SERVICE_STATE_FORMAT_VERSIONS = {
     "ecs": 3,
     "resource_groups": 3,
     "codebuild": 3,
+    "cloudtrail": 3,
     "mq": 3,
     "mwaa": 3,
     "servicediscovery": 3,
