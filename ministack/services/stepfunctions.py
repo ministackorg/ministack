@@ -3500,33 +3500,126 @@ def _iter_top_level_chars(text):
             yield idx, ch
 
 
+def _parse_jsonpath_tokens(path):
+    """Parse the JSONPath subset used by ASL paths."""
+    tokens = []
+    pos = 1 # Skip the initial "$".
+
+    while pos < len(path):
+        if path[pos] == ".":
+            pos += 1
+
+            # Ending on "." is invalid.
+            if pos >= len(path):
+                return None
+
+            # ".*"
+            if path[pos] == "*":
+                tokens.append(("wildcard", None))
+                pos += 1
+                continue
+
+            # Bracket notation after "." - next pass will find the bracket.
+            if path[pos] == "[":
+                continue
+
+            # ".field"
+            start = pos
+            while pos < len(path) and path[pos] not in ".[":
+                pos += 1
+            if start == pos:
+                return None
+            tokens.append(("field", path[start:pos]))
+            continue
+
+        # No ".", so must have opening bracket.
+        if path[pos] != "[":
+            return None
+        pos += 1
+
+        # Ending on "[" is invalid.
+        if pos >= len(path):
+            return None
+
+        # "[*]"
+        if path[pos] == "*":
+            tokens.append(("wildcard", None))
+            pos += 1
+
+        # Array index, eg "[0]"
+        elif path[pos].isdigit():
+            start = pos
+            while pos < len(path) and path[pos].isdigit():
+                pos += 1
+            tokens.append(("index", int(path[start:pos])))
+
+        # Quoted field name, eg "['field']"
+        elif path[pos] in ("'", '"'):
+            start = pos
+            quote = path[pos]
+            pos += 1
+            escaped = False
+            while pos < len(path):
+                if escaped:
+                    escaped = False
+                elif path[pos] == "\\":
+                    escaped = True
+                elif path[pos] == quote:
+                    break
+                pos += 1
+            if pos >= len(path):
+                return None
+            try:
+                field = ast.literal_eval(path[start:pos + 1])
+            except (SyntaxError, ValueError):
+                return None
+            if not isinstance(field, str):
+                return None
+            tokens.append(("field", field))
+            pos += 1
+        else:
+            return None
+
+        # Ensure there's a closing bracket.
+        if pos >= len(path) or path[pos] != "]":
+            return None
+        pos += 1
+
+    return tokens
+
+
 def _resolve_path(path, data):
     if path == "$" or not path:
         return data
     if not path.startswith("$"):
         return data
 
-    parts = path[2:].split(".") if path.startswith("$.") else []
-    cur = data
-    for part in parts:
-        if not part:
-            continue
-        m = re.match(r"(\w+)\[(\d+)]", part)
-        if m:
-            field, idx = m.group(1), int(m.group(2))
-            if isinstance(cur, dict) and field in cur:
-                cur = cur[field]
-                if isinstance(cur, list) and idx < len(cur):
-                    cur = cur[idx]
-                else:
-                    return None
-            else:
-                return None
-        elif isinstance(cur, dict) and part in cur:
-            cur = cur[part]
-        else:
-            return None
-    return cur
+    tokens = _parse_jsonpath_tokens(path)
+    if tokens is None:
+        return None
+
+    projected = any(kind == "wildcard" for kind, _ in tokens)
+    values = [data]
+    for kind, value in tokens:
+        resolved = []
+        for current in values:
+            if kind == "field":
+                if isinstance(current, dict) and value in current:
+                    resolved.append(current[value])
+            elif kind == "index":
+                if isinstance(current, list) and value < len(current):
+                    resolved.append(current[value])
+                elif isinstance(current, list):
+                    resolved.append(None)
+            elif isinstance(current, list):
+                resolved.extend(current)
+            elif isinstance(current, dict):
+                resolved.extend(current.values())
+        values = resolved
+
+    if projected:
+        return values
+    return values[0] if values else None
 
 
 def _parse_intrinsic_args(s, pos):
