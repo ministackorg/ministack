@@ -5077,6 +5077,10 @@ def _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data
 #                  not a wrapped list).
 #   header_outputs:{HTTP-header-name: OutputFieldPascalCase} response headers
 #                  to fold into the result dict (e.g. ETag from PUT/COPY).
+#   metadata_output: collect the dynamic x-amz-meta-* response headers into a
+#                  result "Metadata" map (prefix stripped). Needed because
+#                  header_outputs maps exact header names and user metadata
+#                  arrives as N dynamic headers.
 #
 # Phase 1 covers non-Body operations (no GetObject/PutObject). Body shape for
 # aws-sdk:s3:getObject/putObject is convention-based (Java SDK V2 → base64) and
@@ -5144,6 +5148,7 @@ _S3_OP_SPECS = {
             "last-modified": "LastModified",
             "x-amz-version-id": "VersionId",
         },
+        "metadata_output": True,
     },
     "CopyObject": {
         "method": "PUT", "path": "/{Bucket}/{Key+}",
@@ -5378,7 +5383,20 @@ def _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data):
 
     result = _s3_normalize_lists(result, spec.get("list_fields") or ())
 
-    return _convert_keys_to_sfn_convention(result)
+    converted = _convert_keys_to_sfn_convention(result)
+
+    # User metadata keys are returned verbatim by AWS (S3 lowercases them on
+    # write), so they must be attached AFTER the SFN key conversion — running
+    # them through _api_name_to_sfn_key would turn "shardcount" into
+    # "Shardcount" and break $.Metadata.<key> paths.
+    if spec.get("metadata_output"):
+        converted["Metadata"] = {
+            hname[len("x-amz-meta-"):]: value
+            for hname, value in norm_resp_headers.items()
+            if hname.startswith("x-amz-meta-")
+        }
+
+    return converted
 
 
 def _invoke_aws_sdk_integration(resource, input_data):

@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Step Functions — `aws-sdk:s3:headObject` dropped the object's user `Metadata` map** — the S3 REST-XML SDK-integration spec maps response headers to output fields by exact name, which cannot express the N dynamic `x-amz-meta-*` headers, so the task result carried no `Metadata` key and an ASL reading `$.Metadata.<key>` (e.g. `States.StringToJson($.Metadata.shardcount)` to size a downstream fan-out) failed with `States.Runtime`. The dispatcher now collects `x-amz-meta-*` response headers into a `Metadata` map with the prefix stripped, attached after the SFN key-convention pass so the metadata keys stay verbatim (lowercase, as S3 stores them) instead of being title-cased like API member names. Contributed by @michael-denyer.
+
 ## [1.4.8] — 2026-07-28
 
 ### Added
