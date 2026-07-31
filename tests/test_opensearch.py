@@ -16,15 +16,15 @@ import boto3
 import pytest
 from botocore.exceptions import ClientError
 
-ENDPOINT = "http://localhost:4566"
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 REGION = "us-east-1"
 
 
-def _client(account="test"):
+def _client(account="test", region=REGION):
     return boto3.client(
         "opensearch",
         endpoint_url=ENDPOINT,
-        region_name=REGION,
+        region_name=region,
         aws_access_key_id=account,
         aws_secret_access_key="test",
     )
@@ -75,6 +75,27 @@ def test_opensearch_create_duplicate(os_client):
         os_client.delete_domain(DomainName=name)
 
 
+def test_opensearch_domains_are_region_scoped():
+    east = _client(region=REGION)
+    west = _client(region="us-west-2")
+    name = f"reg-{_uid()}"
+
+    east_rec = east.create_domain(DomainName=name)["DomainStatus"]
+    west_rec = west.create_domain(DomainName=name)["DomainStatus"]
+    try:
+        assert f":{REGION}:" in east_rec["ARN"]
+        assert ":us-west-2:" in west_rec["ARN"]
+        assert f".{REGION}.ministack.local" in east_rec["Endpoint"]
+        assert ".us-west-2.ministack.local" in west_rec["Endpoint"]
+
+        with pytest.raises(ClientError) as exc:
+            east.create_domain(DomainName=name)
+        assert exc.value.response["Error"]["Code"] == "ResourceAlreadyExistsException"
+    finally:
+        east.delete_domain(DomainName=name)
+        west.delete_domain(DomainName=name)
+
+
 def test_opensearch_invalid_name_rejected(os_client):
     """AWS DomainName rules: lowercase, 3-28 chars, alphanumeric + hyphens,
     first char must be a lowercase letter."""
@@ -112,6 +133,30 @@ def test_opensearch_list_domain_names_engine_filter(os_client):
     finally:
         os_client.delete_domain(DomainName=es_name)
         os_client.delete_domain(DomainName=os_name)
+
+
+def test_opensearch_list_and_describe_are_region_scoped():
+    east = _client(region=REGION)
+    west = _client(region="us-west-2")
+    east_name = f"east-{_uid()}"
+    west_name = f"west-{_uid()}"
+
+    east.create_domain(DomainName=east_name)
+    west.create_domain(DomainName=west_name)
+    try:
+        east_names = {d["DomainName"] for d in east.list_domain_names()["DomainNames"]}
+        west_names = {d["DomainName"] for d in west.list_domain_names()["DomainNames"]}
+        assert east_name in east_names
+        assert west_name not in east_names
+        assert west_name in west_names
+        assert east_name not in west_names
+
+        with pytest.raises(ClientError) as exc:
+            west.describe_domain(DomainName=east_name)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        east.delete_domain(DomainName=east_name)
+        west.delete_domain(DomainName=west_name)
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +420,23 @@ def test_opensearch_create_with_tag_list(os_client):
         os_client.delete_domain(DomainName=name)
 
 
+def test_opensearch_tag_arn_must_match_request_region():
+    east = _client(region=REGION)
+    west = _client(region="us-west-2")
+    name = f"tagreg-{_uid()}"
+    west_rec = west.create_domain(DomainName=name)["DomainStatus"]
+    try:
+        west.add_tags(ARN=west_rec["ARN"], TagList=[{"Key": "Env", "Value": "west"}])
+        west_tags = {t["Key"]: t["Value"] for t in west.list_tags(ARN=west_rec["ARN"])["TagList"]}
+        assert west_tags == {"Env": "west"}
+
+        with pytest.raises(ClientError) as exc:
+            east.list_tags(ARN=west_rec["ARN"])
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        west.delete_domain(DomainName=name)
+
+
 # ---------------------------------------------------------------------------
 # Multi-tenant
 # ---------------------------------------------------------------------------
@@ -511,6 +573,51 @@ def test_opensearch_package_associate_list_dissociate(os_client):
         os_client.delete_domain(DomainName=domain)
 
 
+def test_opensearch_packages_are_region_scoped():
+    east = _client(region=REGION)
+    west = _client(region="us-west-2")
+    east_domain = f"pkge-{_uid()}"
+    west_domain = f"pkgw-{_uid()}"
+    east.create_domain(DomainName=east_domain)
+    west.create_domain(DomainName=west_domain)
+    east_pid = east.create_package(
+        PackageName=f"pkge-{_uid()}",
+        PackageType="TXT-DICTIONARY",
+        PackageSource=_pkg_source(),
+    )["PackageDetails"]["PackageID"]
+    west_pid = west.create_package(
+        PackageName=f"pkgw-{_uid()}",
+        PackageType="TXT-DICTIONARY",
+        PackageSource=_pkg_source(),
+    )["PackageDetails"]["PackageID"]
+    try:
+        assert west.describe_packages(
+            Filters=[{"Name": "PackageID", "Value": [east_pid]}]
+        )["PackageDetailsList"] == []
+
+        with pytest.raises(ClientError) as exc:
+            west.associate_package(PackageID=east_pid, DomainName=east_domain)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        east.associate_package(PackageID=east_pid, DomainName=east_domain)
+        west.associate_package(PackageID=west_pid, DomainName=west_domain)
+        east.delete_package(PackageID=east_pid)
+
+        assert east.list_packages_for_domain(DomainName=east_domain)["DomainPackageDetailsList"] == []
+        west_assoc = west.list_packages_for_domain(DomainName=west_domain)[
+            "DomainPackageDetailsList"
+        ]
+        assert [d["PackageID"] for d in west_assoc] == [west_pid]
+    finally:
+        for client, pid in ((east, east_pid), (west, west_pid)):
+            try:
+                client.delete_package(PackageID=pid)
+            except ClientError:
+                pass
+        east.delete_domain(DomainName=east_domain)
+        west.delete_domain(DomainName=west_domain)
+
+
 def test_opensearch_package_not_found_errors(os_client):
     with pytest.raises(ClientError) as exc:
         os_client.update_package(PackageID="Fmissing", PackageSource=_pkg_source())
@@ -521,3 +628,47 @@ def test_opensearch_package_not_found_errors(os_client):
     with pytest.raises(ClientError) as exc:
         os_client.associate_package(PackageID="Fmissing", DomainName="missing-domain")
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_opensearch_reset_clears_all_regions():
+    from ministack.core.responses import get_region, set_request_region
+    from ministack.services import opensearch
+
+    original_region = get_region()
+    try:
+        set_request_region(REGION)
+        opensearch._domains["reset-east"] = {"DomainName": "reset-east"}
+        set_request_region("us-west-2")
+        opensearch._domains["reset-west"] = {"DomainName": "reset-west"}
+        opensearch._packages["pkg-west"] = {"PackageID": "pkg-west"}
+
+        opensearch.reset()
+
+        assert not opensearch._domains.has_any()
+        assert not opensearch._change_progress.has_any()
+        assert not opensearch._packages.has_any()
+        assert not opensearch._domain_packages.has_any()
+    finally:
+        opensearch.reset()
+        set_request_region(original_region)
+
+
+def test_opensearch_dataplane_names_include_region():
+    from ministack.core.responses import get_region, set_request_region
+    from ministack.services import opensearch
+
+    original_region = get_region()
+    try:
+        set_request_region(REGION)
+        assert opensearch._container_name("same") == f"ministack-opensearch-{REGION}-same"
+        assert opensearch._dashboards_container_name("same") == (
+            f"ministack-opensearch-dashboards-{REGION}-same"
+        )
+
+        set_request_region("us-west-2")
+        assert opensearch._container_name("same") == "ministack-opensearch-us-west-2-same"
+        assert opensearch._dashboards_container_name("same") == (
+            "ministack-opensearch-dashboards-us-west-2-same"
+        )
+    finally:
+        set_request_region(original_region)

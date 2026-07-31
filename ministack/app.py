@@ -356,6 +356,7 @@ _state_map = {
     "cloudtrail": "cloudtrail", "iot": "iot",
     "inspector2": "inspector2",
     "mq": "mq",
+    "opensearch": "opensearch",
     "s3tables": "s3tables",
     "lambda_durable": "lambda_durable",
     "bedrock": "bedrock",
@@ -1988,6 +1989,16 @@ def _load_persisted_state():
     if load_state("rds"):
         _get_module("rds")
         logger.info("RDS: eager-loaded module to respawn persisted containers at boot")
+
+    # OpenSearch has a routable management endpoint, but persisted domains must
+    # restore before the first request because restore_state() also recreates
+    # data-plane endpoints/containers. Waiting for the lazy router leaves a
+    # warm-boot window where DescribeDomain/ListDomainNames see empty state and
+    # data-plane traffic has no restored endpoint. Match RDS' conditional shape
+    # so stacks that do not persist OpenSearch pay no cold-start import cost.
+    if load_state("opensearch"):
+        _get_module("opensearch")
+        logger.info("OpenSearch: eager-loaded module to restore persisted domains")
 
     # `lambda_durable` is reached only via `lambda_svc.handle_request`, never
     # directly through the lazy router (no SERVICE_REGISTRY entry — it has no

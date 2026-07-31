@@ -46,6 +46,7 @@ SERVICE_STATE_FORMAT_VERSIONS = {
     "cloudtrail": 3,
     "mq": 3,
     "mwaa": 3,
+    "opensearch": 3,
     "servicediscovery": 3,
     "ses": 3,
     "ses_v2": 3,

@@ -6170,6 +6170,10 @@ def _stack_resource(cfn, stack_name, logical_id="SearchDomain"):
     )["StackResourceDetail"]
 
 
+def _opensearch_stub_endpoint(domain_name, region="us-east-1"):
+    return f"{domain_name}.{region}.ministack.local:9200"
+
+
 def test_cfn_opensearch_domain_create_update_replace_and_idempotent_delete(
         cfn, opensearch):
     suffix = _uuid_mod.uuid4().hex[:8]
@@ -6230,7 +6234,7 @@ def test_cfn_opensearch_domain_create_update_replace_and_idempotent_delete(
         "Ref": domain_name,
         "Arn": expected_arn,
         "DomainArn": expected_arn,
-        "Endpoint": f"{domain_name}.ministack.local:9200",
+        "Endpoint": _opensearch_stub_endpoint(domain_name),
         "Id": f"000000000000/{domain_name}",
     }
 
@@ -6345,7 +6349,7 @@ def test_cfn_opensearch_auto_name_is_stable_across_update(cfn, opensearch):
     assert _stack_resource(cfn, stack_name)["PhysicalResourceId"] == physical_id
     status = opensearch.describe_domain(DomainName=physical_id)["DomainStatus"]
     assert status["EngineVersion"] == "OpenSearch_2.17"
-    assert status["Endpoints"]["vpc"] == f"{physical_id}.ministack.local:9200"
+    assert status["Endpoints"]["vpc"] == _opensearch_stub_endpoint(physical_id)
 
     # Removing VPCOptions is an in-place control-plane update and restores the
     # public endpoint response shape.
@@ -6355,7 +6359,7 @@ def test_cfn_opensearch_auto_name_is_stable_across_update(cfn, opensearch):
     assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
     assert _stack_resource(cfn, stack_name)["PhysicalResourceId"] == physical_id
     status = opensearch.describe_domain(DomainName=physical_id)["DomainStatus"]
-    assert status["Endpoint"] == f"{physical_id}.ministack.local:9200"
+    assert status["Endpoint"] == _opensearch_stub_endpoint(physical_id)
     assert "Endpoints" not in status
 
     cfn.delete_stack(StackName=stack_name)

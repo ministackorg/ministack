@@ -1233,6 +1233,29 @@ def test_lambda_not_eager_loaded_without_persisted_esms(monkeypatch):
     assert "lambda_svc" not in requested
 
 
+def test_opensearch_eager_loaded_at_boot_when_persisted(monkeypatch):
+    """Persisted domains must be restored before the lazy router sees traffic."""
+    import ministack.app as app
+
+    requested = []
+
+    def fake_load_state(key):
+        if key == "opensearch":
+            return {
+                "domains": {
+                    "persisted-domain": {"DomainName": "persisted-domain"}
+                }
+            }
+        return None
+
+    monkeypatch.setattr(app, "load_state", fake_load_state)
+    monkeypatch.setattr(app, "_get_module", lambda name: requested.append(name) or object())
+
+    app._load_persisted_state()
+
+    assert "opensearch" in requested
+
+
 # ── PERSIST_STATE gating ──────────────────────────────────────────────
 
 @pytest.mark.parametrize("svc_key", [
@@ -3729,6 +3752,392 @@ def test_ec2_region_scoped_v3_state_is_idempotent(monkeypatch, tmp_path):
     second_snapshot = _json.loads((tmp_path / "ec2.json").read_text())
 
     assert second_snapshot == first_snapshot
+
+
+def test_opensearch_region_scoped_v3_state_is_idempotent(monkeypatch, tmp_path):
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    account_id = "123456789012"
+    region = "us-west-2"
+    domain_name = "regional-domain"
+    package_id = "FPKG123456"
+    association_key = f"{package_id}:{domain_name}"
+    domain_arn = f"arn:aws:es:{region}:{account_id}:domain/{domain_name}"
+
+    def regional_store(key, value):
+        store = AccountRegionScopedDict()
+        store.set_scoped(account_id, region, key, value)
+        return store
+
+    tags = AccountScopedDict()
+    tags._data[(account_id, domain_arn)] = [{"Key": "Env", "Value": "west"}]
+    state = {
+        "domains": regional_store(
+            domain_name,
+            {"DomainName": domain_name, "ARN": domain_arn},
+        ),
+        "tags": tags,
+        "change_progress": regional_store(
+            domain_name,
+            {"ChangeId": "change-1", "Status": "COMPLETED"},
+        ),
+        "packages": regional_store(
+            package_id,
+            {"PackageID": package_id, "PackageName": "synonyms"},
+        ),
+        "domain_packages": regional_store(
+            association_key,
+            {"PackageID": package_id, "DomainName": domain_name},
+        ),
+    }
+
+    persistence.save_state("opensearch", state)
+    first_snapshot = _json.loads((tmp_path / "opensearch.json").read_text())
+    assert first_snapshot["__ministack_format__"] == 3
+
+    loaded = persistence.load_state("opensearch")
+    assert loaded is not None
+    persistence.save_state("opensearch", loaded)
+    second_snapshot = _json.loads((tmp_path / "opensearch.json").read_text())
+
+    assert second_snapshot == first_snapshot
+
+
+def test_opensearch_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    domains = AccountRegionScopedDict()
+    domains.set_scoped(
+        "123456789012",
+        "us-west-2",
+        "regional-domain",
+        {
+            "DomainName": "regional-domain",
+            "ARN": "arn:aws:es:us-west-2:123456789012:domain/regional-domain",
+        },
+    )
+    persistence.save_state("opensearch", {"domains": domains})
+
+    raw = _json.loads((tmp_path / "opensearch.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_domains = persistence.load_state("opensearch")["domains"]
+    assert loaded_domains.get_scoped(
+        "123456789012", "us-west-2", "regional-domain"
+    )["DomainName"] == "regional-domain"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("opensearch") is None
+
+
+def test_opensearch_is_registered_for_persistence_save():
+    from ministack.app import _build_persistence_save_dict, _state_map
+    from ministack.services import opensearch
+
+    assert _state_map["opensearch"] == "opensearch"
+
+    opensearch.reset()
+    try:
+        opensearch._domains["persisted-domain"] = {
+            "DomainName": "persisted-domain",
+            "ARN": "arn:aws:es:us-east-1:000000000000:domain/persisted-domain",
+        }
+        save_dict = _build_persistence_save_dict()
+
+        assert "opensearch" in save_dict
+        assert save_dict["opensearch"]()["domains"]["persisted-domain"][
+            "DomainName"
+        ] == "persisted-domain"
+    finally:
+        opensearch.reset()
+
+
+def test_opensearch_legacy_state_migrates_domain_children_to_parent_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import opensearch
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "123456789012"
+    other_account = "210987654321"
+    boot_region = "us-east-1"
+    domain_region = "eu-west-1"
+    other_region = "us-west-2"
+    domain_name = "legacy-domain"
+    peer_domain_name = "peer-domain"
+    other_domain_name = "other-domain"
+    package_id = "FPKGDOMAIN1"
+    orphan_package_id = "FPKGBOOT001"
+    domain_package_key = f"{package_id}:{domain_name}"
+    peer_domain_package_key = f"{package_id}:{peer_domain_name}"
+    orphan_key = "FPKGORPHAN:missing-domain"
+    other_key = f"FPKGOTHER:{other_domain_name}"
+
+    def legacy_store(*entries):
+        store = AccountScopedDict()
+        for account, key, value in entries:
+            store._data[(account, key)] = value
+        return store
+
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        opensearch.reset()
+
+        opensearch.restore_state({
+            "domains": legacy_store(
+                (
+                    account_id,
+                    peer_domain_name,
+                    {
+                        "DomainName": peer_domain_name,
+                        "ARN": f"arn:aws:es:{other_region}:{account_id}:domain/{peer_domain_name}",
+                    },
+                ),
+                (
+                    account_id,
+                    domain_name,
+                    {
+                        "DomainName": domain_name,
+                        "ARN": f"arn:aws:es:{domain_region}:{account_id}:domain/{domain_name}",
+                    },
+                ),
+                (
+                    other_account,
+                    other_domain_name,
+                    {
+                        "DomainName": other_domain_name,
+                        "ARN": f"arn:aws:es:{other_region}:{other_account}:domain/{other_domain_name}",
+                    },
+                ),
+            ),
+            "change_progress": legacy_store(
+                (account_id, domain_name, {"ChangeId": "change-1"}),
+                (other_account, other_domain_name, {"ChangeId": "change-2"}),
+                (account_id, "missing-domain", {"ChangeId": "orphan-change"}),
+            ),
+            "packages": legacy_store(
+                (
+                    account_id,
+                    package_id,
+                    {
+                        "PackageID": package_id,
+                        "PackageName": "associated-package",
+                        "PackageOptions": {"analysis": {"enabled": True}},
+                    },
+                ),
+                (
+                    account_id,
+                    orphan_package_id,
+                    {
+                        "PackageID": orphan_package_id,
+                        "PackageName": "boot-package",
+                        "PackageDescription": (
+                            "user text arn:aws:lambda:us-west-2:123456789012:function:nope"
+                        ),
+                    },
+                ),
+            ),
+            "domain_packages": legacy_store(
+                (
+                    account_id,
+                    domain_package_key,
+                    {"PackageID": package_id, "DomainName": domain_name},
+                ),
+                (
+                    account_id,
+                    peer_domain_package_key,
+                    {"PackageID": package_id, "DomainName": peer_domain_name},
+                ),
+                (
+                    account_id,
+                    orphan_key,
+                    {"PackageID": "FPKGORPHAN", "DomainName": "missing-domain"},
+                ),
+                (
+                    other_account,
+                    other_key,
+                    {"PackageID": "FPKGOTHER", "DomainName": other_domain_name},
+                ),
+            ),
+        })
+
+        assert opensearch._domains.get_scoped(
+            account_id, domain_region, domain_name
+        )["DomainName"] == domain_name
+        assert opensearch._change_progress.get_scoped(
+            account_id, domain_region, domain_name
+        )["ChangeId"] == "change-1"
+        assert opensearch._domain_packages.get_scoped(
+            account_id, domain_region, domain_package_key
+        )["DomainName"] == domain_name
+        assert opensearch._domain_packages.get_scoped(
+            account_id, boot_region, domain_package_key
+        ) is None
+
+        assert opensearch._packages.get_scoped(
+            account_id, domain_region, package_id
+        )["PackageName"] == "associated-package"
+        peer_package = opensearch._packages.get_scoped(
+            account_id, other_region, package_id
+        )
+        assert peer_package["PackageName"] == "associated-package"
+        assert opensearch._domain_packages.get_scoped(
+            account_id, other_region, peer_domain_package_key
+        )["DomainName"] == peer_domain_name
+        package = opensearch._packages.get_scoped(
+            account_id, domain_region, package_id
+        )
+        assert package is not peer_package
+        package["PackageOptions"]["analysis"]["enabled"] = False
+        assert peer_package["PackageOptions"]["analysis"]["enabled"] is True
+        assert opensearch._packages.get_scoped(
+            account_id, boot_region, package_id
+        ) is None
+        assert opensearch._packages.get_scoped(
+            account_id, boot_region, orphan_package_id
+        )["PackageName"] == "boot-package"
+        assert opensearch._change_progress.get_scoped(
+            account_id, boot_region, "missing-domain"
+        )["ChangeId"] == "orphan-change"
+        assert opensearch._domain_packages.get_scoped(
+            account_id, boot_region, orphan_key
+        )["DomainName"] == "missing-domain"
+
+        assert opensearch._change_progress.get_scoped(
+            other_account, other_region, other_domain_name
+        )["ChangeId"] == "change-2"
+        assert opensearch._domain_packages.get_scoped(
+            other_account, other_region, other_key
+        )["DomainName"] == other_domain_name
+    finally:
+        opensearch.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_opensearch_restore_recreates_dataplane_in_domain_region(monkeypatch):
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import opensearch
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "123456789012"
+    boot_region = "us-east-1"
+    domain_region = "us-west-2"
+    domain_name = "restored-domain"
+    calls = []
+
+    def legacy_store(*entries):
+        store = AccountScopedDict()
+        for account, key, value in entries:
+            store._data[(account, key)] = value
+        return store
+
+    def fake_spawn(domain, engine_version):
+        calls.append((get_account_id(), get_region(), domain, engine_version))
+        return (
+            f"{domain}.{get_region()}.ministack.local",
+            9200,
+            f"new-{get_region()}",
+            f"{domain}.{get_region()}.dashboards.local:5601",
+            f"dash-{get_region()}",
+        )
+
+    def fake_teardown_dataplane(rec):
+        calls.append(
+            (
+                "teardown_ids",
+                get_account_id(),
+                get_region(),
+                rec.get("_ContainerId"),
+                rec.get("_DashboardsContainerId"),
+            )
+        )
+
+    def fake_teardown_named_dataplane(domain):
+        calls.append(("teardown_name", get_account_id(), get_region(), domain))
+
+    monkeypatch.setattr(opensearch, "_spawn_dataplane", fake_spawn)
+    monkeypatch.setattr(opensearch, "_teardown_dataplane", fake_teardown_dataplane)
+    monkeypatch.setattr(
+        opensearch, "_teardown_named_dataplane", fake_teardown_named_dataplane
+    )
+
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        opensearch.reset()
+
+        opensearch.restore_state({
+            "domains": legacy_store(
+                (
+                    account_id,
+                    domain_name,
+                    {
+                        "DomainName": domain_name,
+                        "ARN": f"arn:aws:es:{domain_region}:{account_id}:domain/{domain_name}",
+                        "EngineVersion": "OpenSearch_2.11",
+                        "Endpoint": "stale.local:9200",
+                        "_Endpoint": "stale.local:9200",
+                        "_ContainerId": "stale-container",
+                        "_DashboardsContainerId": "stale-dashboard",
+                        "DashboardEndpoint": "stale-dashboard.local:5601",
+                    },
+                ),
+            ),
+        })
+
+        assert calls == [
+            (
+                "teardown_ids",
+                account_id,
+                domain_region,
+                "stale-container",
+                "stale-dashboard",
+            ),
+            ("teardown_name", account_id, domain_region, domain_name),
+            (account_id, domain_region, domain_name, "OpenSearch_2.11"),
+        ]
+        assert get_account_id() == account_id
+        assert get_region() == boot_region
+        restored = opensearch._domains.get_scoped(
+            account_id, domain_region, domain_name
+        )
+        assert restored["Endpoint"] == (
+            f"{domain_name}.{domain_region}.ministack.local:9200"
+        )
+        assert restored["_Endpoint"] == restored["Endpoint"]
+        assert restored["_ContainerId"] == f"new-{domain_region}"
+        assert restored["_DashboardsContainerId"] == f"dash-{domain_region}"
+        assert restored["DashboardEndpoint"] == (
+            f"{domain_name}.{domain_region}.dashboards.local:5601"
+        )
+    finally:
+        opensearch.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
 
 
 def test_servicediscovery_region_scoped_state_is_rejected_by_v2_reader(
