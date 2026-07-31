@@ -3768,6 +3768,70 @@ def test_servicediscovery_region_scoped_state_is_rejected_by_v2_reader(
     assert persistence.load_state("servicediscovery") is None
 
 
+def test_glue_region_scoped_state_round_trips_and_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """Glue's same-key regional state must round-trip, while a v2 rollback
+    refuses the regional schema instead of silently collapsing partitions."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    account = "000000000000"
+    databases = AccountRegionScopedDict()
+    job_runs = AccountRegionScopedDict()
+    databases.set_scoped(
+        account,
+        "us-east-1",
+        "same-name",
+        {"Name": "same-name", "Description": "east"},
+    )
+    databases.set_scoped(
+        account,
+        "us-west-2",
+        "same-name",
+        {"Name": "same-name", "Description": "west"},
+    )
+    job_runs.set_scoped(
+        account,
+        "us-east-1",
+        "same-job",
+        [{"Id": "east-run", "JobName": "same-job"}],
+    )
+    job_runs.set_scoped(
+        account,
+        "us-west-2",
+        "same-job",
+        [{"Id": "west-run", "JobName": "same-job"}],
+    )
+
+    persistence.save_state(
+        "glue", {"databases": databases, "job_runs": job_runs}
+    )
+
+    raw = _json.loads((tmp_path / "glue.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded = persistence.load_state("glue")
+    assert loaded["databases"].get_scoped(
+        account, "us-east-1", "same-name"
+    )["Description"] == "east"
+    assert loaded["databases"].get_scoped(
+        account, "us-west-2", "same-name"
+    )["Description"] == "west"
+    assert loaded["job_runs"].get_scoped(
+        account, "us-east-1", "same-job"
+    )[0]["Id"] == "east-run"
+    assert loaded["job_runs"].get_scoped(
+        account, "us-west-2", "same-job"
+    )[0]["Id"] == "west-run"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("glue") is None
+
+
 def test_batch_persistence_lifecycle_restores_regional_state(monkeypatch, tmp_path):
     """The gateway save map and Batch import-time restore must preserve state
     outside the ambient boot region across a process-shaped reload."""

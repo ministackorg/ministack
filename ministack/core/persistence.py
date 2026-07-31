@@ -37,6 +37,7 @@ SERVICE_STATE_FORMAT_VERSIONS = {
     "inspector2": 3,
     "iot": 3,
     "efs": 3,
+    "glue": 3,
     "s3files": 3,
     "batch": 3,
     "ecs": 3,
