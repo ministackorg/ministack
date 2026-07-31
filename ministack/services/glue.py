@@ -27,6 +27,7 @@ from urllib.parse import unquote
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -99,23 +100,23 @@ def _is_spark_job(job):
     cmd_name = job.get("Command", {}).get("Name", "")
     return cmd_name in ("glueetl", "gluestreaming")
 
-_databases = AccountScopedDict()
-_tables = AccountScopedDict()       # "db_name/table_name" -> table dict
-_partitions = AccountScopedDict()   # "db_name/table_name" -> [partition, ...]
-_partition_indexes = AccountScopedDict()  # "db_name/table_name" -> [index, ...]
-_connections = AccountScopedDict()
-_crawlers = AccountScopedDict()
-_jobs = AccountScopedDict()
-_job_runs = AccountScopedDict()     # job_name -> [run, ...]
+_databases = AccountRegionScopedDict()
+_tables = AccountRegionScopedDict()       # "db_name/table_name" -> table dict
+_partitions = AccountRegionScopedDict()   # "db_name/table_name" -> [partition, ...]
+_partition_indexes = AccountRegionScopedDict()  # "db_name/table_name" -> [index, ...]
+_connections = AccountRegionScopedDict()
+_crawlers = AccountRegionScopedDict()
+_jobs = AccountRegionScopedDict()
+_job_runs = AccountRegionScopedDict()     # job_name -> [run, ...]
 _tags = AccountScopedDict()         # arn -> {key: value, ...}
-_security_configs = AccountScopedDict()
-_classifiers = AccountScopedDict()
-_triggers = AccountScopedDict()     # trigger_name -> trigger dict
-_workflows = AccountScopedDict()    # workflow_name -> workflow dict
-_workflow_runs = AccountScopedDict() # workflow_name -> [run, ...]
-_user_defined_functions = AccountScopedDict()  # "db_name/function_name" -> udf dict
-_table_column_statistics = AccountScopedDict()      # "db/table" -> {column_name: stats}
-_partition_column_statistics = AccountScopedDict()  # "db/table" -> [{"Values": [...], "Stats": {col: stats}}]
+_security_configs = AccountRegionScopedDict()
+_classifiers = AccountRegionScopedDict()
+_triggers = AccountRegionScopedDict()     # trigger_name -> trigger dict
+_workflows = AccountRegionScopedDict()    # workflow_name -> workflow dict
+_workflow_runs = AccountRegionScopedDict() # workflow_name -> [run, ...]
+_user_defined_functions = AccountRegionScopedDict()  # "db_name/function_name" -> udf dict
+_table_column_statistics = AccountRegionScopedDict()      # "db/table" -> {column_name: stats}
+_partition_column_statistics = AccountRegionScopedDict()  # "db/table" -> [{"Values": [...], "Stats": {col: stats}}]
 
 _ALL_STATE = {
     "databases": _databases,
@@ -145,7 +146,25 @@ def get_state():
 def restore_state(data):
     for key, store in _ALL_STATE.items():
         store.clear()
-        store.update(data.get(key, {}))
+        restored = data.get(key, {})
+        if key == "tags":
+            store.update(restored)
+        else:
+            _restore_regional_store(store, restored)
+
+
+def _restore_regional_store(store, restored):
+    """Map legacy Glue state to the boot region without mining nested ARNs."""
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+    if isinstance(restored, AccountScopedDict):
+        region = get_region()
+        for (account_id, key), value in restored._data.items():
+            store.set_scoped(account_id, region, key, value)
+        return
+    for key, value in restored.items():
+        store[key] = value
 
 
 try:

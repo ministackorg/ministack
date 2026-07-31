@@ -4411,22 +4411,76 @@ def _flatten_query_params(data, prefix=""):
     return params
 
 
-_EC2_QUERY_LIST_NAME_OVERRIDES = {
-    "Filters": "Filter",
-    "Values": "Value",
-    "GroupIds": "GroupId",
-    "GroupNames": "GroupName",
-    "TagSpecifications": "TagSpecification",
-    "Tags": "Tag",
+# Wire names EC2 numbers list parameters under. Mostly the singular of the SDK
+# member name (VolumeIds -> VolumeId.N), but sometimes the plural
+# (IpPermissions.N) and sometimes a different word (Resources -> ResourceId.N).
+# A wrong name is dropped silently — the call still succeeds and the parameter
+# never applies — so the exceptions are listed rather than guessed. Generated
+# from the botocore EC2 model (queryName, else capitalized locationName) for the
+# actions ec2.py serves; see check_sfn_ec2_list_params.py.
+_EC2_QUERY_LIST_NAMES = {
+    "ExecutableUsers": "ExecutableBy",
+    "Groups": "SecurityGroupId",
+    "IpPermissions": "IpPermissions",
+    "IpRanges": "IpRanges",
+    "Ipv6Ranges": "Ipv6Ranges",
+    "LaunchTemplateConfigs": "LaunchTemplateConfigs",
+    "Overrides": "Overrides",
+    "OwnerIds": "Owner",
+    "Resources": "ResourceId",
+    "RestorableByUserIds": "RestorableBy",
+    "TunnelOptions": "TunnelOptions",
+    "UserIdGroupPairs": "Groups",
+    "Versions": "LaunchTemplateVersion",
+}
+
+# Names spelled both ways across those actions, so they cannot go above. The
+# enclosing list settles most — PrefixListIds is plural inside an IpPermission
+# and singular in DescribePrefixLists — the rest are top-level, where only the
+# action can.
+_EC2_QUERY_LIST_NAMES_BY_PARENT = {
+    ("IpPermissions", "PrefixListIds"): "PrefixListIds",
+    ("NetworkInterfaces", "Ipv6Addresses"): "Ipv6Addresses",
+    ("NetworkInterfaces", "PrivateIpAddresses"): "PrivateIpAddresses",
+}
+
+_EC2_QUERY_LIST_NAMES_BY_ACTION = {
+    ("CreateNetworkInterface", "Ipv6Addresses"): "Ipv6Addresses",
+    ("CreateNetworkInterface", "PrivateIpAddresses"): "PrivateIpAddresses",
+    ("DescribeVpcClassicLinkDnsSupport", "VpcIds"): "VpcIds",
+    ("ModifySnapshotAttribute", "GroupNames"): "UserGroup",
 }
 
 
-def _flatten_ec2_query_params(data, prefix=""):
+def _ec2_query_list_name(key, action=None, parent=""):
+    """Wire name EC2 numbers a list parameter under: VolumeIds -> VolumeId.N."""
+    # Most specific context first: enclosing list, then action, then the names
+    # that are the same everywhere.
+    if (parent, key) in _EC2_QUERY_LIST_NAMES_BY_PARENT:
+        return _EC2_QUERY_LIST_NAMES_BY_PARENT[(parent, key)]
+    if (action, key) in _EC2_QUERY_LIST_NAMES_BY_ACTION:
+        return _EC2_QUERY_LIST_NAMES_BY_ACTION[(action, key)]
+    if key in _EC2_QUERY_LIST_NAMES:
+        return _EC2_QUERY_LIST_NAMES[key]
+    # Everything else is the singular of an English plural: Entries -> Entry,
+    # Ipv4Prefixes -> Ipv4Prefix, VolumeIds -> VolumeId.
+    if len(key) < 2 or not key.endswith("s") or key.endswith("ss"):
+        return key
+    if key.endswith("ies") and len(key) > 3:
+        return key[:-3] + "y"
+    if key.endswith(("ses", "xes", "zes", "ches", "shes")):
+        return key[:-2]
+    return key[:-1]
+
+
+def _flatten_ec2_query_params(data, prefix="", action=None, parent=""):
     """Flatten EC2 query params using EC2's numbered-list convention.
 
     Most query services in MiniStack use ``member.N`` in the Step Functions
     adapter. EC2's Query API expects bare numbered lists for the shapes used
-    here (e.g. ``Filter.1.Value.1`` and ``GroupId.1``).
+    here (e.g. ``Filter.1.Value.1`` and ``GroupId.1``). ``action`` and
+    ``parent`` — the list this one is nested in — select the names EC2 spells
+    differently depending on where they appear.
     """
     params = {}
     if not isinstance(data, dict):
@@ -4434,14 +4488,15 @@ def _flatten_ec2_query_params(data, prefix=""):
     for key, value in data.items():
         full_key = f"{prefix}{key}" if not prefix else f"{prefix}.{key}"
         if isinstance(value, dict):
-            params.update(_flatten_ec2_query_params(value, full_key))
+            # A struct member does not rename its children; the enclosing list does.
+            params.update(_flatten_ec2_query_params(value, full_key, action, parent))
         elif isinstance(value, list):
-            list_key = _EC2_QUERY_LIST_NAME_OVERRIDES.get(key, key)
+            list_key = _ec2_query_list_name(key, action, parent)
             full_list_key = f"{prefix}{list_key}" if not prefix else f"{prefix}.{list_key}"
             for i, item in enumerate(value, 1):
                 item_key = f"{full_list_key}.{i}"
                 if isinstance(item, dict):
-                    params.update(_flatten_ec2_query_params(item, item_key))
+                    params.update(_flatten_ec2_query_params(item, item_key, action, key))
                 else:
                     params[item_key] = str(item)
         elif isinstance(value, bool):
@@ -4468,6 +4523,10 @@ _XML_LIST_WRAPPER_TAGS = frozenset({
     "EnabledCloudwatchLogsExports", "GlobalClusterMembers",
     "DBParameterGroups", "DBInstances", "DBClusters", "Readers",
     "SupportedNetworkTypes",
+    "Roles", "Users", "Groups", "Policies", "AttachedPolicies", "PolicyNames",
+    "InstanceProfiles", "ServerCertificateMetadataList", "AccessKeyMetadata",
+    "Metrics", "Dimensions", "MetricAlarms", "CompositeAlarms",
+    "MetricDataResults", "Datapoints", "QueueUrls",
 })
 _XML_BOOLEAN_FIELDS = frozenset({
     "MultiAZ", "Multiaz", "StorageEncrypted", "DeletionProtection",
@@ -4476,6 +4535,7 @@ _XML_BOOLEAN_FIELDS = frozenset({
     "PerformanceInsightsEnabled", "HttpEndpointEnabled",
     "CrossAccountClone", "CustomerOwnedIpEnabled",
     "IsStorageConfigUpgradeAvailable", "IsWriter", "IsDataLossAllowed",
+    "IsTruncated",
 })
 
 
@@ -4722,7 +4782,21 @@ def _normalize_ec2_security_group(group):
     return group
 
 
+def _normalize_sqs_attribute_map(result):
+    """Repeated <Attribute><Name>/<Value> children as the SDK's Attributes map."""
+    items = result if isinstance(result, list) else [result]
+    attributes = {}
+    for item in items:
+        if isinstance(item, dict) and "Name" in item:
+            attributes[item["Name"]] = item.get("Value", "")
+    return {"Attributes": attributes}
+
+
 def _normalize_query_response(service_key, action, result):
+    # GetQueueAttributes is the one Query result that arrives as a list, so it is
+    # handled before the struct guard below.
+    if service_key == "sqs" and action == "GetQueueAttributes":
+        return _normalize_sqs_attribute_map(result)
     if not isinstance(result, dict):
         return result
     if service_key == "ec2" and action == "DescribeSecurityGroups":
@@ -4764,10 +4838,11 @@ def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
     wire_data = _convert_params_to_api_names(input_data, name_overrides)
     form_params = {"Action": pascal_action}
     if service_key == "ec2":
-        form_params.update(_flatten_ec2_query_params(wire_data))
+        form_params.update(_flatten_ec2_query_params(wire_data, action=pascal_action))
     else:
         form_params.update(_flatten_query_params(wire_data))
-    body = urlencode(form_params)
+    # Query-protocol handlers follow HTTP-server contract and take body as bytes.
+    body = urlencode(form_params).encode("utf-8")
 
     headers = {
         "content-type": "application/x-www-form-urlencoded",
@@ -4826,9 +4901,9 @@ def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
             result_key = f"{pascal_action}Result"
             if result_key in result:
                 result = result[result_key]
-            # Drop ResponseMetadata
+        if isinstance(result, dict):
             result.pop("ResponseMetadata", None)
-            result = _normalize_query_response(service_key, pascal_action, result)
+        result = _normalize_query_response(service_key, pascal_action, result)
         return _convert_keys_to_sfn_convention(result)
     except ET.ParseError:
         raise _ExecutionError("States.Runtime", f"Failed to parse {service_name} XML response")
