@@ -517,10 +517,10 @@ def test_get_state_preserves_certs_across_all_tenants():
 
     persisted = snapshot["_certificates"]
     raw_keys = list(persisted._data.keys())
-    accounts_persisted = {acct for acct, _ in raw_keys}
+    accounts_persisted = {acct for acct, *_ in raw_keys}
     assert accounts_persisted == {"111111111111", "222222222222"}, (
         "get_state() dropped a tenant's certs from the snapshot — only "
-        f"persisted accounts: {accounts_persisted}. AccountScopedDict.items() "
+        f"persisted accounts: {accounts_persisted}. AccountRegionScopedDict.items() "
         "is request-scoped; iterating _data is required to capture all "
         "tenants."
     )

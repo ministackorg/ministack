@@ -2265,9 +2265,12 @@ def test_s3_bucket_encryption(s3):
     rules = resp["ServerSideEncryptionConfiguration"]["Rules"]
     assert rules[0]["ApplyServerSideEncryptionByDefault"]["SSEAlgorithm"] == "AES256"
     s3.delete_bucket_encryption(Bucket="intg-s3-enc")
-    with pytest.raises(ClientError) as exc:
-        s3.get_bucket_encryption(Bucket="intg-s3-enc")
-    assert exc.value.response["Error"]["Code"] == "ServerSideEncryptionConfigurationNotFoundError"
+    # Since 5 Jan 2023 every bucket has SSE-S3 default encryption, so after
+    # deletion GetBucketEncryption returns the AES256 default instead of raising
+    # ServerSideEncryptionConfigurationNotFoundError.
+    default = s3.get_bucket_encryption(Bucket="intg-s3-enc")
+    default_rules = default["ServerSideEncryptionConfiguration"]["Rules"]
+    assert default_rules[0]["ApplyServerSideEncryptionByDefault"]["SSEAlgorithm"] == "AES256"
 
 def test_s3_bucket_lifecycle(s3):
     s3.create_bucket(Bucket="intg-s3-lifecycle")
