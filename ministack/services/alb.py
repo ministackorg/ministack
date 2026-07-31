@@ -30,7 +30,7 @@ from urllib.parse import parse_qs
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("alb")
 
@@ -40,15 +40,18 @@ NS = "http://elasticloadbalancing.amazonaws.com/doc/2015-12-01/"
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
-_lbs = AccountScopedDict()        # lb_arn   -> LB record
-_tgs = AccountScopedDict()        # tg_arn   -> TG record
-_listeners = AccountScopedDict()  # l_arn    -> Listener record
-_rules = AccountScopedDict()      # r_arn    -> Rule record
-_targets = AccountScopedDict()    # tg_arn   -> [target dict]
-_tags = AccountScopedDict()       # res_arn  -> [{Key, Value}]
-_lb_attrs = AccountScopedDict()   # lb_arn   -> [{Key, Value}]
-_tg_attrs = AccountScopedDict()   # tg_arn   -> [{Key, Value}]
-_listener_attrs = AccountScopedDict()  # l_arn -> [{Key, Value}]
+# Resource stores are region-scoped (ELBv2 resources are regional and List/
+# Describe are region-scoped). The ARN-keyed satellite stores below stay
+# account-scoped — their ARN key already embeds the region.
+_lbs = AccountRegionScopedDict()        # lb_arn   -> LB record
+_tgs = AccountRegionScopedDict()        # tg_arn   -> TG record
+_listeners = AccountRegionScopedDict()  # l_arn    -> Listener record
+_rules = AccountRegionScopedDict()      # r_arn    -> Rule record
+_targets = AccountScopedDict()    # tg_arn   -> [target dict] (ARN key embeds region)
+_tags = AccountScopedDict()       # res_arn  -> [{Key, Value}] (ARN key embeds region)
+_lb_attrs = AccountScopedDict()   # lb_arn   -> [{Key, Value}] (ARN key embeds region)
+_tg_attrs = AccountScopedDict()   # tg_arn   -> [{Key, Value}] (ARN key embeds region)
+_listener_attrs = AccountScopedDict()  # l_arn -> [{Key, Value}] (ARN key embeds region)
 
 
 def get_state():
@@ -65,11 +68,39 @@ def get_state():
     })
 
 
+def _region_from_arn(value, fallback):
+    if not isinstance(value, str) or not value.startswith("arn:"):
+        return fallback
+    try:
+        return parse_arn(value).region or fallback
+    except ArnParseError:
+        return fallback
+
+
+def _restore_region_scoped(store, restored):
+    """Re-home legacy account-scoped ALB records into their ARN's region.
+    New state already arrives region-scoped."""
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+    boot_region = get_region()
+    if isinstance(restored, AccountScopedDict):
+        entries = restored._data.items()
+    elif isinstance(restored, dict):
+        account_id = get_account_id()
+        entries = (((account_id, arn), rec) for arn, rec in restored.items())
+    else:
+        store.update(restored)
+        return
+    for (account_id, arn), rec in entries:
+        store.set_scoped(account_id, _region_from_arn(arn, boot_region), arn, rec)
+
+
 def restore_state(data):
-    _lbs.update(data.get("_lbs", {}))
-    _tgs.update(data.get("_tgs", {}))
-    _listeners.update(data.get("_listeners", {}))
-    _rules.update(data.get("_rules", {}))
+    _restore_region_scoped(_lbs, data.get("_lbs", {}))
+    _restore_region_scoped(_tgs, data.get("_tgs", {}))
+    _restore_region_scoped(_listeners, data.get("_listeners", {}))
+    _restore_region_scoped(_rules, data.get("_rules", {}))
     _targets.update(data.get("_targets", {}))
     _tags.update(data.get("_tags", {}))
     _lb_attrs.update(data.get("_lb_attrs", {}))

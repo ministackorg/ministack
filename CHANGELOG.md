@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **IAM — role update parity** — `CreateRole` and `GetRole` now round-trip `PermissionsBoundary`; `PutRolePermissionsBoundary` / `DeleteRolePermissionsBoundary` update it with AWS-shaped role output and missing-role errors; and `UpdateRoleDescription` now returns and persists the updated role. This unblocks Terraform providers that reconcile fixed boundaries and descriptions on service roles.
+
 ### Fixed
 - **Step Functions — `aws-sdk:s3:headObject` dropped the object's user `Metadata` map** — the S3 REST-XML SDK-integration spec maps response headers to output fields by exact name, which cannot express the N dynamic `x-amz-meta-*` headers, so the task result carried no `Metadata` key and an ASL reading `$.Metadata.<key>` (e.g. `States.StringToJson($.Metadata.shardcount)` to size a downstream fan-out) failed with `States.Runtime`. The dispatcher now collects `x-amz-meta-*` response headers into a `Metadata` map with the prefix stripped, attached after the SFN key-convention pass so the metadata keys stay verbatim (lowercase, as S3 stores them) instead of being title-cased like API member names. Contributed by @michael-denyer.
 - **Cognito — `CUSTOM_AUTH` now honors Cognito-owned SRP challenges and passes `ClientMetadata` to DefineAuth** — Amplify `CUSTOM_WITH_SRP` failed with `USER_ID_FOR_SRP was not found` because `CUSTOM_AUTH` always invoked CreateAuth and returned `CUSTOM_CHALLENGE`, even when DefineAuth returned `PASSWORD_VERIFIER` / `SRP_A`. InitiateAuth with `SRP_A` now records `SRP_A` success (AWS-like), returns built-in `PASSWORD_VERIFIER` challenge parameters, and continues the custom-auth session after RespondToAuthChallenge so MFA `CUSTOM_CHALLENGE` rounds still work. DefineAuth also receives `ClientMetadata` (previously hard-coded `{}`), matching Create/Verify. Contributed by @onelshina.

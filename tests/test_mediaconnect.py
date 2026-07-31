@@ -168,3 +168,22 @@ def test_mediaconnect_list_tags_requires_local_flow_arn(mc, arn, code):
     with pytest.raises(ClientError) as e:
         mc.list_tags_for_resource(ResourceArn=arn)
     assert e.value.response["Error"]["Code"] == code
+
+
+def test_mediaconnect_flows_are_region_isolated(mc):
+    """A flow created in us-east-1 must not be visible from us-west-2."""
+    mc_west = boto3.client(
+        "mediaconnect", endpoint_url=ENDPOINT,
+        aws_access_key_id="test", aws_secret_access_key="test",
+        region_name="us-west-2",
+    )
+    name = f"iso-{uuid.uuid4().hex[:8]}"
+    arn = mc.create_flow(
+        Name=name, Source=_basic_source(), AvailabilityZone=f"{REGION}a",
+    )["Flow"]["FlowArn"]
+    assert ":us-east-1:" in arn
+
+    east = [f["FlowArn"] for f in mc.list_flows()["Flows"]]
+    west = [f["FlowArn"] for f in mc_west.list_flows()["Flows"]]
+    assert arn in east
+    assert arn not in west

@@ -3424,6 +3424,64 @@ def test_athena_region_scoped_state_is_rejected_by_v2_reader(
     assert persistence.load_state("athena") is None
 
 
+def test_acm_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject ACM's regional schema instead of accepting
+    it as v2 and silently dropping every regional certificate store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    certificates = AccountRegionScopedDict()
+    arn = "arn:aws:acm:us-west-2:000000000000:certificate/regional-cert"
+    certificates.set_scoped(
+        "000000000000", "us-west-2", arn,
+        {"CertificateArn": arn, "DomainName": "west.example.com"},
+    )
+    persistence.save_state("acm", {"_certificates": certificates})
+
+    raw = _json.loads((tmp_path / "acm.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded = persistence.load_state("acm")["_certificates"]
+    assert loaded.get_scoped(
+        "000000000000", "us-west-2", arn
+    )["DomainName"] == "west.example.com"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("acm") is None
+
+
+def test_alb_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject ALB's regional schema instead of accepting
+    it as v2 and silently dropping every regional load-balancer store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    lbs = AccountRegionScopedDict()
+    arn = "arn:aws:elasticloadbalancing:us-west-2:000000000000:loadbalancer/app/west/1"
+    lbs.set_scoped(
+        "000000000000", "us-west-2", arn,
+        {"LoadBalancerArn": arn, "LoadBalancerName": "west"},
+    )
+    persistence.save_state("alb", {"_lbs": lbs})
+
+    raw = _json.loads((tmp_path / "alb.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded = persistence.load_state("alb")["_lbs"]
+    assert loaded.get_scoped(
+        "000000000000", "us-west-2", arn
+    )["LoadBalancerName"] == "west"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("alb") is None
+
+
 def test_bedrock_agentcore_region_scoped_state_is_rejected_by_v2_reader(
     monkeypatch, tmp_path
 ):

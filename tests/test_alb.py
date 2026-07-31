@@ -879,3 +879,26 @@ def test_elbv2_dataplane_ip_target_unreachable_returns_502(elbv2):
         assert "connect error" in body["message"]
     finally:
         _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+
+
+def test_alb_load_balancers_are_region_isolated(elbv2):
+    """A load balancer created in us-east-1 must not be visible from us-west-2."""
+    import boto3
+
+    elbv2_west = boto3.client(
+        "elbv2", endpoint_url="http://localhost:4566",
+        aws_access_key_id="test", aws_secret_access_key="test",
+        region_name="us-west-2",
+    )
+    name = f"iso-{_uuid_mod.uuid4().hex[:8]}"
+    arn = elbv2.create_load_balancer(
+        Name=name, Type="application", Scheme="internet-facing",
+    )["LoadBalancers"][0]["LoadBalancerArn"]
+    assert ":us-east-1:" in arn
+    try:
+        east = [lb["LoadBalancerArn"] for lb in elbv2.describe_load_balancers()["LoadBalancers"]]
+        west = [lb["LoadBalancerArn"] for lb in elbv2_west.describe_load_balancers()["LoadBalancers"]]
+        assert arn in east
+        assert arn not in west
+    finally:
+        elbv2.delete_load_balancer(LoadBalancerArn=arn)

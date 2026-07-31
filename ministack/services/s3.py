@@ -1149,12 +1149,19 @@ def _get_bucket_encryption(name: str):
     config = _bucket_encryption.get(name)
     if config:
         return 200, {"Content-Type": "application/xml"}, config
-    return _error(
-        "ServerSideEncryptionConfigurationNotFoundError",
-        "The server side encryption configuration was not found",
-        404,
-        f"/{name}",
+    # Since 5 Jan 2023 every S3 bucket has SSE-S3 (AES256) default encryption, so
+    # GetBucketEncryption returns that default configuration rather than the
+    # historical ServerSideEncryptionConfigurationNotFoundError when nothing was
+    # explicitly PUT.
+    default = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<ServerSideEncryptionConfiguration xmlns="{S3_NS}">'
+        "<Rule><ApplyServerSideEncryptionByDefault>"
+        "<SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault>"
+        "<BucketKeyEnabled>false</BucketKeyEnabled></Rule>"
+        "</ServerSideEncryptionConfiguration>"
     )
+    return 200, {"Content-Type": "application/xml"}, default
 
 
 def _put_bucket_encryption(name: str, body: bytes):
