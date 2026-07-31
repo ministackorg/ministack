@@ -4963,6 +4963,149 @@ def test_custom_auth_client_metadata_propagated_to_verify(cognito_idp, lam):
     assert "AuthenticationResult" in step2
 
 
+
+
+# ── Test 24b: CUSTOM_WITH_SRP — DefineAuth PASSWORD_VERIFIER is built-in ───────
+
+def test_custom_auth_with_srp_returns_password_verifier_params(cognito_idp, lam):
+    """Amplify CUSTOM_WITH_SRP: InitiateAuth+SRP_A yields PASSWORD_VERIFIER with SRP params."""
+    define_handler = (
+        "def handler(event, ctx):\n"
+        "    session = event['request']['session']\n"
+        "    if (len(session) == 1\n"
+        "            and session[0].get('challengeName') == 'SRP_A'\n"
+        "            and session[0].get('challengeResult')):\n"
+        "        event['response']['challengeName'] = 'PASSWORD_VERIFIER'\n"
+        "    elif (len(session) >= 2\n"
+        "            and session[1].get('challengeName') == 'PASSWORD_VERIFIER'\n"
+        "            and session[1].get('challengeResult')):\n"
+        "        event['response']['issueTokens'] = True\n"
+        "    else:\n"
+        "        event['response']['failAuthentication'] = True\n"
+        "    return event\n"
+    )
+    define_arn = _create_lambda(lam, "define-custom-srp-init", define_handler)
+    pid, cid = _setup_pool(cognito_idp, "CustomSrpInitPool", {
+        "DefineAuthChallenge": define_arn,
+    })
+
+    step1 = cognito_idp.initiate_auth(
+        ClientId=cid,
+        AuthFlow="CUSTOM_AUTH",
+        AuthParameters={
+            "USERNAME": "user@example.com",
+            "CHALLENGE_NAME": "SRP_A",
+            "SRP_A": "ab" * 128,
+        },
+        ClientMetadata={"deviceKeys": "[]"},
+    )
+    assert step1["ChallengeName"] == "PASSWORD_VERIFIER"
+    params = step1["ChallengeParameters"]
+    assert params.get("USER_ID_FOR_SRP") == "user@example.com"
+    assert "SALT" in params and params["SALT"]
+    assert "SRP_B" in params and params["SRP_B"]
+    assert "SECRET_BLOCK" in params and params["SECRET_BLOCK"]
+
+
+def test_custom_auth_with_srp_full_flow_issues_tokens(cognito_idp, lam):
+    """CUSTOM_AUTH SRP_A → PASSWORD_VERIFIER respond → tokens (no CreateAuth in between)."""
+    define_handler = (
+        "def handler(event, ctx):\n"
+        "    session = event['request']['session']\n"
+        "    if (len(session) == 1\n"
+        "            and session[0].get('challengeName') == 'SRP_A'\n"
+        "            and session[0].get('challengeResult')):\n"
+        "        event['response']['challengeName'] = 'PASSWORD_VERIFIER'\n"
+        "    elif (len(session) >= 2\n"
+        "            and session[1].get('challengeName') == 'PASSWORD_VERIFIER'\n"
+        "            and session[1].get('challengeResult')):\n"
+        "        event['response']['issueTokens'] = True\n"
+        "    else:\n"
+        "        event['response']['failAuthentication'] = True\n"
+        "    return event\n"
+    )
+    define_arn = _create_lambda(lam, "define-custom-srp-full", define_handler)
+    pid, cid = _setup_pool(cognito_idp, "CustomSrpFullPool", {
+        "DefineAuthChallenge": define_arn,
+    })
+
+    step1 = cognito_idp.initiate_auth(
+        ClientId=cid,
+        AuthFlow="CUSTOM_AUTH",
+        AuthParameters={
+            "USERNAME": "user@example.com",
+            "CHALLENGE_NAME": "SRP_A",
+            "SRP_A": "ab" * 128,
+        },
+    )
+    assert step1["ChallengeName"] == "PASSWORD_VERIFIER"
+    secret = step1["ChallengeParameters"]["SECRET_BLOCK"]
+
+    step2 = cognito_idp.respond_to_auth_challenge(
+        ClientId=cid,
+        ChallengeName="PASSWORD_VERIFIER",
+        Session=step1["Session"],
+        ChallengeResponses={
+            "USERNAME": "user@example.com",
+            "PASSWORD_CLAIM_SECRET_BLOCK": secret,
+            "PASSWORD_CLAIM_SIGNATURE": "deadbeef",
+            "TIMESTAMP": "Tue Jul 28 17:40:00 UTC 2026",
+        },
+    )
+    assert "AuthenticationResult" in step2
+    assert "AccessToken" in step2["AuthenticationResult"]
+
+
+def test_custom_auth_define_receives_client_metadata(cognito_idp, lam):
+    """ClientMetadata on RespondToAuthChallenge is passed into DefineAuthChallenge."""
+    create_handler = (
+        "def handler(event, ctx):\n"
+        "    event['response']['publicChallengeParameters'] = {'challenge': 'OTP'}\n"
+        "    return event\n"
+    )
+    verify_handler = (
+        "def handler(event, ctx):\n"
+        "    event['response']['answerCorrect'] = True\n"
+        "    return event\n"
+    )
+    define_handler = (
+        "def handler(event, ctx):\n"
+        "    session = event['request']['session']\n"
+        "    meta = event['request'].get('clientMetadata') or {}\n"
+        "    if not session:\n"
+        "        event['response']['challengeName'] = 'CUSTOM_CHALLENGE'\n"
+        "    elif session[-1].get('challengeResult') and meta.get('customChallengeName') == 'OTP_MFA':\n"
+        "        event['response']['issueTokens'] = True\n"
+        "    else:\n"
+        "        event['response']['failAuthentication'] = True\n"
+        "    return event\n"
+    )
+    create_arn = _create_lambda(lam, "create-define-meta", create_handler)
+    verify_arn = _create_lambda(lam, "verify-define-meta", verify_handler)
+    define_arn = _create_lambda(lam, "define-define-meta", define_handler)
+
+    pid, cid = _setup_pool(cognito_idp, "DefineMetaPool", {
+        "CreateAuthChallenge": create_arn,
+        "VerifyAuthChallengeResponse": verify_arn,
+        "DefineAuthChallenge": define_arn,
+    })
+
+    step1 = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="CUSTOM_AUTH",
+        AuthParameters={"USERNAME": "user@example.com"},
+    )
+    session = step1["Session"]
+
+    step2 = cognito_idp.respond_to_auth_challenge(
+        ClientId=cid,
+        ChallengeName="CUSTOM_CHALLENGE",
+        Session=session,
+        ChallengeResponses={"ANSWER": "123456", "USERNAME": "user@example.com"},
+        ClientMetadata={"customChallengeName": "OTP_MFA"},
+    )
+    assert "AuthenticationResult" in step2
+
+
 # ── Test 25: UpdateUserPool stores CUSTOM_AUTH LambdaConfig keys ──────────────
 
 def test_custom_auth_lambda_config_stored_via_update(cognito_idp):
