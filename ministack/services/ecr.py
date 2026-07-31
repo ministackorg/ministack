@@ -9,34 +9,38 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
     get_region,
     json_response,
     new_uuid,
+    set_request_account_id,
+    set_request_region,
 )
 
 logger = logging.getLogger("ecr")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-_repositories = AccountScopedDict()
-_images = AccountScopedDict()
-_lifecycle_policies = AccountScopedDict()
-_repo_policies = AccountScopedDict()
+_repositories = AccountRegionScopedDict()
+_images = AccountRegionScopedDict()
+_lifecycle_policies = AccountRegionScopedDict()
+_repo_policies = AccountRegionScopedDict()
 # Docker Registry HTTP API V2 backing storage.
 # _layer_blobs[repo] = {digest: bytes}     — finalised layer + config bytes addressable by digest.
 # _manifest_blobs[repo] = {digest: bytes}  — raw manifest bytes addressable by digest (for HEAD/GET by digest).
 # _uploads[repo] = {upload_uuid: bytearray} — in-flight chunked uploads (cleared on PUT).
-_layer_blobs = AccountScopedDict()
-_manifest_blobs = AccountScopedDict()
-_uploads = AccountScopedDict()
+_layer_blobs = AccountRegionScopedDict()
+_manifest_blobs = AccountRegionScopedDict()
+_uploads = AccountRegionScopedDict()
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -56,13 +60,60 @@ def get_state():
 
 
 def restore_state(data):
-    if data:
-        _repositories.update(data.get("repositories", {}))
-        _images.update(data.get("images", {}))
-        _lifecycle_policies.update(data.get("lifecycle_policies", {}))
-        _repo_policies.update(data.get("repo_policies", {}))
-        _layer_blobs.update(data.get("layer_blobs", {}))
-        _manifest_blobs.update(data.get("manifest_blobs", {}))
+    if not data:
+        return
+
+    restored_repositories = data.get("repositories", {})
+    legacy_repo_regions = {}
+    if isinstance(restored_repositories, AccountScopedDict):
+        legacy_repo_regions = {
+            (account_id, name): _repositories._region_for_legacy_value(
+                name, repository
+            )
+            for (account_id, name), repository in restored_repositories._data.items()
+        }
+    elif isinstance(restored_repositories, dict):
+        account_id = get_account_id()
+        legacy_repo_regions = {
+            (account_id, name): _repositories._region_for_legacy_value(
+                name, repository
+            )
+            for name, repository in restored_repositories.items()
+        }
+
+    _repositories.update(restored_repositories)
+    for store, key in (
+        (_images, "images"),
+        (_lifecycle_policies, "lifecycle_policies"),
+        (_repo_policies, "repo_policies"),
+        (_layer_blobs, "layer_blobs"),
+        (_manifest_blobs, "manifest_blobs"),
+    ):
+        _restore_repository_child_store(
+            store, data.get(key, {}), legacy_repo_regions
+        )
+
+
+def _restore_repository_child_store(store, restored, legacy_repo_regions):
+    """Adopt legacy name-keyed child state into its repository's region."""
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+
+    if isinstance(restored, AccountScopedDict):
+        entries = restored._data.items()
+    elif isinstance(restored, dict):
+        account_id = get_account_id()
+        entries = (
+            ((account_id, name), value) for name, value in restored.items()
+        )
+    else:
+        store.update(restored)
+        return
+
+    for (account_id, name), value in entries:
+        region = legacy_repo_regions.get((account_id, name), get_region())
+        store.set_scoped(account_id, region, name, value)
 
 
 try:
@@ -667,6 +718,9 @@ def reset():
 _REGISTRY_API_VERSION_HEADER = ("Docker-Distribution-API-Version", "registry/2.0")
 _DEFAULT_MANIFEST_MEDIA_TYPE = "application/vnd.docker.distribution.manifest.v2+json"
 _UPLOAD_PART_SIZE = 10 * 1024 * 1024  # advisory chunk size; clients ignore for chunked uploads
+_ECR_REGISTRY_HOST_RE = re.compile(
+    r"^(\d{12})\.dkr\.ecr\.([a-z0-9-]+)\."
+)
 
 
 def _registry_error(status, code, message, detail=None):
@@ -771,6 +825,42 @@ def _query_first(query_params, key):
     if isinstance(val, list):
         return val[0] if val else None
     return val
+
+
+def _registry_scope_hint(value):
+    if not isinstance(value, str):
+        return None
+    match = _ECR_REGISTRY_HOST_RE.match(value.lower())
+    return match.groups() if match else None
+
+
+def _select_registry_request_scope(name, headers, query_params):
+    """Pin an unsigned Registry V2 request to its repository's tenant scope."""
+    scope_hint = _registry_scope_hint(headers.get("host"))
+    if scope_hint is None:
+        scope_hint = _registry_scope_hint(_query_first(query_params, "ns"))
+    if scope_hint is not None:
+        account_id, region = scope_hint
+        set_request_account_id(account_id)
+        set_request_region(region)
+        return
+
+    if not name:
+        return
+
+    # Preserve the ambient request scope when it already resolves the repo.
+    if name in _repositories:
+        return
+
+    account_id = get_account_id()
+    matches = [
+        region
+        for (stored_account, region, stored_name), _repository
+        in _repositories.all_items()
+        if stored_account == account_id and stored_name == name
+    ]
+    if len(matches) == 1:
+        set_request_region(matches[0])
 
 
 def _v2_ping():
@@ -1242,6 +1332,8 @@ async def handle_registry_request(method, path, headers, body, query_params):
     verb, name, ref = parsed
     method = method.upper()
     headers = {k.lower(): v for k, v in (headers or {}).items()}
+
+    _select_registry_request_scope(name, headers, query_params)
 
     if verb == "ping":
         if method not in ("GET", "HEAD"):

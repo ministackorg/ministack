@@ -646,6 +646,105 @@ def test_backup_round_trip():
     _round_trip("backup", "backup", populate, observe)
 
 
+@pytest.mark.parametrize(
+    "legacy_account_scoped",
+    [True, False],
+    ids=["account-scoped", "plain-dict"],
+)
+def test_ecr_legacy_state_uses_parent_repository_region(
+    legacy_account_scoped,
+):
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import ecr as mod
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    boot_region = "us-east-1"
+    repository_region = "eu-west-1"
+    name = "legacy-repository"
+    orphan = "orphan-repository"
+
+    def legacy_store(values):
+        if not legacy_account_scoped:
+            return values
+        store = AccountScopedDict()
+        store._data.update(
+            {(account_id, key): value for key, value in values.items()}
+        )
+        return store
+
+    repositories = legacy_store(
+        {
+            name: {
+                "repositoryArn": (
+                    f"arn:aws:ecr:{repository_region}:{account_id}:repository/{name}"
+                ),
+                "repositoryName": name,
+            }
+        }
+    )
+    images = legacy_store(
+        {
+            name: [{"imageDigest": "sha256:image"}],
+            orphan: [{"imageDigest": "sha256:orphan"}],
+        }
+    )
+    lifecycle_policies = legacy_store({name: "legacy-lifecycle"})
+    repo_policies = legacy_store({name: "legacy-repository-policy"})
+    layer_blobs = legacy_store({name: {"sha256:layer": b"layer"}})
+    manifest_blobs = legacy_store(
+        {name: {"sha256:manifest": b"manifest"}}
+    )
+
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        mod.restore_state(
+            {
+                "repositories": repositories,
+                "images": images,
+                "lifecycle_policies": lifecycle_policies,
+                "repo_policies": repo_policies,
+                "layer_blobs": layer_blobs,
+                "manifest_blobs": manifest_blobs,
+            }
+        )
+
+        assert mod._repositories.get_scoped(
+            account_id, repository_region, name
+        )["repositoryName"] == name
+        assert mod._images.get_scoped(account_id, repository_region, name) == [
+            {"imageDigest": "sha256:image"}
+        ]
+        assert mod._lifecycle_policies.get_scoped(
+            account_id, repository_region, name
+        ) == "legacy-lifecycle"
+        assert mod._repo_policies.get_scoped(
+            account_id, repository_region, name
+        ) == "legacy-repository-policy"
+        assert mod._layer_blobs.get_scoped(
+            account_id, repository_region, name
+        ) == {"sha256:layer": b"layer"}
+        assert mod._manifest_blobs.get_scoped(
+            account_id, repository_region, name
+        ) == {"sha256:manifest": b"manifest"}
+        assert mod._images.get_scoped(account_id, boot_region, orphan) == [
+            {"imageDigest": "sha256:orphan"}
+        ]
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_eks_round_trip():
     def populate(mod):
         mod._clusters["cluster-test"] = {"name": "cluster-test", "status": "ACTIVE"}
@@ -2782,6 +2881,41 @@ def test_ecs_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path)
     # Simulate the previous binary, whose highest understood format is v2.
     monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
     assert persistence.load_state("ecs") is None
+
+
+def test_ecr_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject ECR's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    repositories = AccountRegionScopedDict()
+    repositories.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-repository",
+        {
+            "repositoryArn": (
+                "arn:aws:ecr:us-west-2:000000000000:"
+                "repository/regional-repository"
+            )
+        },
+    )
+    persistence.save_state("ecr", {"repositories": repositories})
+
+    raw = _json.loads((tmp_path / "ecr.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_repositories = persistence.load_state("ecr")["repositories"]
+    assert loaded_repositories.get_scoped(
+        "000000000000", "us-west-2", "regional-repository"
+    )["repositoryArn"].endswith("repository/regional-repository")
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("ecr") is None
 
 
 def test_appsync_region_scoped_state_is_rejected_by_v2_reader(
