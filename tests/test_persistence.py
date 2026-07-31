@@ -646,6 +646,190 @@ def test_backup_round_trip():
     _round_trip("backup", "backup", populate, observe)
 
 
+def test_backup_region_scoped_v3_state_is_idempotent(monkeypatch, tmp_path):
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    account_id = "123456789012"
+    region = "us-west-2"
+    vault_name = "regional-vault"
+    plan_id = "regional-plan"
+    selection_id = "regional-selection"
+    job_id = "regional-job"
+
+    def regional_store(key, value):
+        store = AccountRegionScopedDict()
+        store.set_scoped(account_id, region, key, value)
+        return store
+
+    state = {
+        "vaults": regional_store(
+            vault_name,
+            {
+                "BackupVaultName": vault_name,
+                "BackupVaultArn": f"arn:aws:backup:{region}:{account_id}:backup-vault:{vault_name}",
+            },
+        ),
+        "plans": regional_store(
+            plan_id,
+            {
+                "BackupPlanId": plan_id,
+                "BackupPlanArn": f"arn:aws:backup:{region}:{account_id}:backup-plan:{plan_id}",
+            },
+        ),
+        "selections": regional_store(
+            selection_id,
+            {
+                "SelectionId": selection_id,
+                "BackupPlanId": plan_id,
+                "Resources": [f"arn:aws:dynamodb:{region}:{account_id}:table/MyTable"],
+            },
+        ),
+        "jobs": regional_store(
+            job_id,
+            {
+                "BackupJobId": job_id,
+                "BackupJobArn": f"arn:aws:backup:{region}:{account_id}:backup-job:{job_id}",
+            },
+        ),
+    }
+
+    persistence.save_state("backup", state)
+    first_snapshot = _json.loads((tmp_path / "backup.json").read_text())
+    assert first_snapshot["__ministack_format__"] == 3
+
+    loaded = persistence.load_state("backup")
+    assert loaded is not None
+    persistence.save_state("backup", loaded)
+    second_snapshot = _json.loads((tmp_path / "backup.json").read_text())
+
+    assert second_snapshot == first_snapshot
+
+
+def test_backup_legacy_selection_migration_colocates_with_parent_plan():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import backup
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "123456789012"
+    boot_region = "us-east-1"
+    plan_region = "us-west-2"
+    plan_id = "legacy-plan"
+    colocated_selection_id = "legacy-selection"
+    orphan_selection_id = "orphan-selection"
+    vault_name = "legacy-vault"
+    job_id = "legacy-job"
+
+    def scoped_store(key, value):
+        store = AccountScopedDict()
+        store._data[(account_id, key)] = value
+        return store
+
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        backup.reset()
+
+        legacy_state = {
+            "vaults": scoped_store(
+                vault_name,
+                {
+                    "BackupVaultName": vault_name,
+                    "BackupVaultArn": f"arn:aws:backup:{plan_region}:{account_id}:backup-vault:{vault_name}",
+                },
+            ),
+            "plans": scoped_store(
+                plan_id,
+                {
+                    "BackupPlanId": plan_id,
+                    "BackupPlanArn": f"arn:aws:backup:{plan_region}:{account_id}:backup-plan:{plan_id}",
+                },
+            ),
+            "selections": AccountScopedDict(),
+            "jobs": scoped_store(
+                job_id,
+                {
+                    "BackupJobId": job_id,
+                    "BackupJobArn": f"arn:aws:backup:{plan_region}:{account_id}:backup-job:{job_id}",
+                },
+            ),
+        }
+        legacy_state["selections"]._data[(account_id, colocated_selection_id)] = {
+            "SelectionId": colocated_selection_id,
+            "BackupPlanId": plan_id,
+            "Resources": [f"arn:aws:dynamodb:{boot_region}:{account_id}:table/EastTable"],
+        }
+        legacy_state["selections"]._data[(account_id, orphan_selection_id)] = {
+            "SelectionId": orphan_selection_id,
+            "BackupPlanId": "missing-plan",
+            "Resources": [f"arn:aws:dynamodb:{plan_region}:{account_id}:table/WestTable"],
+        }
+
+        backup.restore_state(legacy_state)
+
+        assert backup._vaults.get_scoped(account_id, plan_region, vault_name) is not None
+        assert backup._plans.get_scoped(account_id, plan_region, plan_id) is not None
+        assert backup._jobs.get_scoped(account_id, plan_region, job_id) is not None
+        assert backup._selections.get_scoped(
+            account_id, plan_region, colocated_selection_id
+        )["BackupPlanId"] == plan_id
+        assert backup._selections.get_scoped(
+            account_id, boot_region, colocated_selection_id
+        ) is None
+        assert backup._selections.get_scoped(
+            account_id, boot_region, orphan_selection_id
+        )["BackupPlanId"] == "missing-plan"
+        assert backup._selections.get_scoped(
+            account_id, plan_region, orphan_selection_id
+        ) is None
+    finally:
+        backup.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_backup_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    vaults = AccountRegionScopedDict()
+    vaults.set_scoped(
+        "123456789012",
+        "us-west-2",
+        "regional-vault",
+        {
+            "BackupVaultName": "regional-vault",
+            "BackupVaultArn": "arn:aws:backup:us-west-2:123456789012:backup-vault:regional-vault",
+        },
+    )
+    persistence.save_state("backup", {"vaults": vaults})
+
+    raw = _json.loads((tmp_path / "backup.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_vaults = persistence.load_state("backup")["vaults"]
+    assert loaded_vaults.get_scoped(
+        "123456789012", "us-west-2", "regional-vault"
+    )["BackupVaultName"] == "regional-vault"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("backup") is None
+
+
 @pytest.mark.parametrize(
     "legacy_account_scoped",
     [True, False],
@@ -3657,6 +3841,116 @@ def test_ec2_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path)
 
     monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
     assert persistence.load_state("ec2") is None
+
+
+def test_waf_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject WAF's regional schema instead of accepting
+    account-only stores that would collapse REGIONAL and CLOUDFRONT scopes."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    web_acls = AccountRegionScopedDict()
+    web_acls.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-acl",
+        {
+            "ARN": (
+                "arn:aws:wafv2:us-west-2:000000000000:"
+                "regional/webacl/regional-acl/regional-acl"
+            ),
+            "Id": "regional-acl",
+            "Name": "regional-acl",
+            "Scope": "REGIONAL",
+        },
+    )
+    persistence.save_state("waf", {"_web_acls": web_acls})
+
+    raw = _json.loads((tmp_path / "waf.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_web_acls = persistence.load_state("waf")["_web_acls"]
+    assert loaded_web_acls.get_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-acl",
+    )["Name"] == "regional-acl"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("waf") is None
+
+
+def test_waf_region_scoped_v3_state_round_trips_idempotently(monkeypatch, tmp_path):
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    web_acls = AccountRegionScopedDict()
+    web_acls.set_scoped(
+        "000000000000",
+        "us-east-1",
+        "global-acl",
+        {
+            "ARN": (
+                "arn:aws:wafv2:us-east-1:000000000000:"
+                "global/webacl/global-acl/global-acl"
+            ),
+            "Id": "global-acl",
+            "Name": "global-acl",
+            "Scope": "CLOUDFRONT",
+        },
+    )
+    associations = AccountRegionScopedDict()
+    associations.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "arn:aws:elasticloadbalancing:us-west-2:000000000000:loadbalancer/app/app/id",
+        (
+            "arn:aws:wafv2:us-east-1:000000000000:"
+            "global/webacl/global-acl/global-acl"
+        ),
+    )
+    tags = AccountScopedDict()
+    tags.set_scoped(
+        "000000000000",
+        "us-west-2",
+        (
+            "arn:aws:wafv2:us-east-1:000000000000:"
+            "global/webacl/global-acl/global-acl"
+        ),
+        [{"Key": "scope", "Value": "global"}],
+    )
+
+    persistence.save_state(
+        "waf",
+        {
+            "_web_acls": web_acls,
+            "_associations": associations,
+            "_waf_tags": tags,
+        },
+    )
+    first_snapshot = _json.loads((tmp_path / "waf.json").read_text())
+    loaded = persistence.load_state("waf")
+    assert loaded["_web_acls"].get_scoped(
+        "000000000000",
+        "us-east-1",
+        "global-acl",
+    )["Scope"] == "CLOUDFRONT"
+    assert loaded["_associations"].get_scoped(
+        "000000000000",
+        "us-west-2",
+        "arn:aws:elasticloadbalancing:us-west-2:000000000000:loadbalancer/app/app/id",
+    ).endswith("global/webacl/global-acl/global-acl")
+
+    persistence.save_state("waf", loaded)
+    second_snapshot = _json.loads((tmp_path / "waf.json").read_text())
+    assert second_snapshot == first_snapshot
 
 
 def test_ec2_legacy_state_restores_to_boot_region_without_arn_mining():

@@ -4656,25 +4656,13 @@ def _ses_email_identity_delete(physical_id, props):
 
 def _waf_web_acl_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=128)
-    uid = new_uuid()
-    lock_token = new_uuid()
     scope = props.get("Scope", "REGIONAL")
-    arn = f"arn:aws:wafv2:{get_region()}:{get_account_id()}:{scope.lower()}/webacl/{name}/{uid}"
-    _waf._web_acls[uid] = {
-        "ARN": arn, "Id": uid, "Name": name,
-        "Description": props.get("Description", ""),
-        "DefaultAction": props.get("DefaultAction", {"Allow": {}}),
-        "Rules": props.get("Rules", []),
-        "VisibilityConfig": props.get("VisibilityConfig", {}),
-        "Capacity": 0,
-        "LockToken": lock_token,
-        "Scope": scope,
-    }
+    uid, arn, _record = _waf.create_web_acl_record(name, scope, props)
     return uid, {"Arn": arn, "Id": uid}
 
 
 def _waf_web_acl_delete(physical_id, props):
-    _waf._web_acls.pop(physical_id, None)
+    _waf.delete_web_acl_record(physical_id, props.get("Scope", "REGIONAL"))
 
 
 # ---------------------------------------------------------------------------

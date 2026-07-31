@@ -1384,6 +1384,136 @@ def test_cognito_jwks_endpoint():
     assert data["keys"][0]["kty"] == "RSA"
     assert data["keys"][0]["alg"] == "RS256"
 
+
+def _cognito_key_fingerprint_loader(state_dir, *, block_fcntl=False):
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["STATE_DIR"] = str(state_dir)
+    env["PYTHONPATH"] = (
+        f"{repo_root}{os.pathsep}{env['PYTHONPATH']}"
+        if env.get("PYTHONPATH")
+        else str(repo_root)
+    )
+    fcntl_blocker = (
+        "import importlib.abc\n"
+        "import sys\n"
+        "sys.modules.pop('fcntl', None)\n"
+        "class _BlockFcntl(importlib.abc.MetaPathFinder):\n"
+        "    def find_spec(self, fullname, path=None, target=None):\n"
+        "        if fullname == 'fcntl':\n"
+        "            raise ImportError('blocked fcntl')\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, _BlockFcntl())\n"
+    ) if block_fcntl else ""
+    script = (
+        fcntl_blocker +
+        "import hashlib; "
+        "from cryptography.hazmat.primitives import serialization; "
+        "import ministack.services.cognito as c; "
+        "pem = c._RSA_PRIVATE_KEY.private_bytes("
+        "encoding=serialization.Encoding.PEM, "
+        "format=serialization.PrivateFormat.PKCS8, "
+        "encryption_algorithm=serialization.NoEncryption()); "
+        "print(hashlib.sha256(pem).hexdigest())"
+    )
+
+    def _load_key_fingerprint(_idx):
+        return subprocess.check_output(
+            [sys.executable, "-c", script],
+            env=env,
+            text=True,
+            timeout=10,
+        ).strip()
+
+    return _load_key_fingerprint
+
+
+def _load_concurrent_cognito_key_fingerprints(state_dir, workers=8):
+    import concurrent.futures
+
+    _load_key_fingerprint = _cognito_key_fingerprint_loader(state_dir)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        return list(executor.map(_load_key_fingerprint, range(workers)))
+
+
+def test_cognito_rsa_key_creation_is_process_safe(tmp_path):
+    """Concurrent server/test-worker imports must converge on one JWKS key."""
+    fingerprints = _load_concurrent_cognito_key_fingerprints(tmp_path)
+
+    assert len(set(fingerprints)) == 1
+    assert (tmp_path / "cognito-rsa-key.pem").exists()
+
+
+def test_cognito_rsa_key_corruption_repair_is_process_safe(tmp_path):
+    """Concurrent imports must converge after replacing an unreadable JWKS key."""
+    from cryptography.hazmat.primitives import serialization
+
+    key_path = tmp_path / "cognito-rsa-key.pem"
+    key_path.write_text("not a private key")
+
+    fingerprints = _load_concurrent_cognito_key_fingerprints(tmp_path)
+
+    assert len(set(fingerprints)) == 1
+    serialization.load_pem_private_key(key_path.read_bytes(), password=None)
+
+
+def test_cognito_rsa_key_stale_repair_lock_is_recovered(tmp_path):
+    """A crashed repairer must not permanently block shared JWKS key recovery."""
+    from cryptography.hazmat.primitives import serialization
+
+    key_path = tmp_path / "cognito-rsa-key.pem"
+    lock_path = tmp_path / "cognito-rsa-key.pem.lock"
+    key_path.write_text("not a private key")
+    lock_path.mkdir()
+
+    fingerprints = _load_concurrent_cognito_key_fingerprints(tmp_path)
+
+    assert len(set(fingerprints)) == 1
+    assert lock_path.is_file()
+    serialization.load_pem_private_key(key_path.read_bytes(), password=None)
+
+
+def test_cognito_rsa_key_repair_waits_for_live_file_lock(tmp_path):
+    """Concurrent importers must wait for a live repair lock, not steal it."""
+    import concurrent.futures
+    import fcntl
+
+    from cryptography.hazmat.primitives import serialization
+
+    key_path = tmp_path / "cognito-rsa-key.pem"
+    lock_path = tmp_path / "cognito-rsa-key.pem.lock"
+    key_path.write_text("not a private key")
+    lock_path.touch()
+    _load_key_fingerprint = _cognito_key_fingerprint_loader(tmp_path)
+
+    with open(lock_path, "a") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(_load_key_fingerprint, idx) for idx in range(8)]
+            time.sleep(0.1)
+            assert not any(future.done() for future in futures)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            fingerprints = [future.result(timeout=10) for future in futures]
+
+    assert len(set(fingerprints)) == 1
+    serialization.load_pem_private_key(key_path.read_bytes(), password=None)
+
+
+def test_cognito_rsa_key_persists_when_fcntl_is_unavailable(tmp_path):
+    """Missing fcntl must not disable RSA signing or shared key persistence."""
+    loader = _cognito_key_fingerprint_loader(tmp_path, block_fcntl=True)
+
+    first_fingerprint = loader(0)
+    second_fingerprint = loader(1)
+
+    assert first_fingerprint == second_fingerprint
+    assert (tmp_path / "cognito-rsa-key.pem").exists()
+
+
 def test_cognito_openid_configuration():
     """/.well-known/openid-configuration returns valid discovery document."""
     import json as _json
