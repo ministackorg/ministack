@@ -19,7 +19,13 @@ import time
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    AccountScopedDict,
+    get_account_id,
+    get_region,
+    new_uuid,
+)
 
 logger = logging.getLogger("backup")
 
@@ -27,10 +33,10 @@ logger = logging.getLogger("backup")
 # State
 # ---------------------------------------------------------------------------
 
-_vaults     = AccountScopedDict()     # vault_name -> vault record
-_plans      = AccountScopedDict()     # plan_id -> plan record
-_selections = AccountScopedDict()     # selection_id -> selection record
-_jobs       = AccountScopedDict()     # job_id -> job record
+_vaults     = AccountRegionScopedDict()     # vault_name -> vault record
+_plans      = AccountRegionScopedDict()     # plan_id -> plan record
+_selections = AccountRegionScopedDict()     # selection_id -> selection record
+_jobs       = AccountRegionScopedDict()     # job_id -> job record
 
 
 def reset():
@@ -41,10 +47,10 @@ def reset():
 
 
 def get_state():
-    # Preserve AccountScopedDict wrappers; casting to a plain dict drops
-    # the per-account scoping and would persist only the current request's
-    # tenants. AccountScopedDict has a JSON encoder hook that round-trips
-    # the (account, key) tuple correctly.
+    # Preserve scoped wrappers; casting to a plain dict drops the per-account
+    # and per-region scoping and would persist only the current request's
+    # tenants. Scoped dicts have JSON encoder hooks that round-trip the
+    # tuple keys correctly.
     return {
         "vaults":     copy.deepcopy(_vaults),
         "plans":      copy.deepcopy(_plans),
@@ -56,8 +62,35 @@ def get_state():
 def restore_state(data):
     _vaults.update(data.get("vaults", {}))
     _plans.update(data.get("plans", {}))
-    _selections.update(data.get("selections", {}))
+    _restore_selections(data.get("selections", {}))
     _jobs.update(data.get("jobs", {}))
+
+
+def _restore_selections(restored):
+    if isinstance(restored, AccountRegionScopedDict):
+        _selections.update(restored)
+        return
+
+    if isinstance(restored, AccountScopedDict):
+        selection_items = restored._data.items()
+    elif isinstance(restored, dict):
+        account_id = get_account_id()
+        selection_items = [((account_id, selection_id), record) for selection_id, record in restored.items()]
+    else:
+        return
+
+    plan_regions = {
+        (account_id, plan_id): region
+        for (account_id, region, _plan_id), plan in _plans.all_items()
+        for plan_id in (plan.get("BackupPlanId", _plan_id),)
+    }
+    fallback_region = get_region()
+    for (account_id, selection_id), record in selection_items:
+        region = plan_regions.get(
+            (account_id, record.get("BackupPlanId")),
+            fallback_region,
+        )
+        _selections.set_scoped(account_id, region, selection_id, record)
 
 
 def load_persisted_state(data):

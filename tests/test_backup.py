@@ -1,8 +1,10 @@
+import os
+
 import boto3
 import pytest
 from botocore.exceptions import ClientError
 
-ENDPOINT = "http://localhost:4566"
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 REGION = "us-east-1"
 
 
@@ -14,6 +16,17 @@ def backup():
         aws_access_key_id="test",
         aws_secret_access_key="test",
         region_name=REGION,
+    )
+
+
+@pytest.fixture(scope="module")
+def backup_west():
+    return boto3.client(
+        "backup",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name="us-west-2",
     )
 
 
@@ -78,6 +91,29 @@ def test_backup_delete_vault_not_found(backup):
     with pytest.raises(ClientError) as exc:
         backup.delete_backup_vault(BackupVaultName="no-such-vault-xyz")
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_backup_vaults_are_region_scoped(backup, backup_west):
+    name = f"region-vault-{_uid()}"
+
+    east = backup.create_backup_vault(BackupVaultName=name)
+    west_names_before = {
+        vault["BackupVaultName"]
+        for vault in backup_west.list_backup_vaults()["BackupVaultList"]
+    }
+    assert name not in west_names_before
+
+    west = backup_west.create_backup_vault(BackupVaultName=name)
+
+    assert f":{REGION}:" in east["BackupVaultArn"]
+    assert ":us-west-2:" in west["BackupVaultArn"]
+
+    backup.delete_backup_vault(BackupVaultName=name)
+    with pytest.raises(ClientError) as exc:
+        backup.describe_backup_vault(BackupVaultName=name)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    assert backup_west.describe_backup_vault(BackupVaultName=name)["BackupVaultName"] == name
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +216,17 @@ def test_backup_delete_plan(backup):
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
+def test_backup_plans_are_region_scoped(backup, backup_west):
+    plan_id = backup.create_backup_plan(BackupPlan=_plan_body(f"regional-plan-{_uid()}"))["BackupPlanId"]
+
+    with pytest.raises(ClientError) as exc:
+        backup_west.get_backup_plan(BackupPlanId=plan_id)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    west_plans = backup_west.list_backup_plans()["BackupPlansList"]
+    assert plan_id not in {plan["BackupPlanId"] for plan in west_plans}
+
+
 # ---------------------------------------------------------------------------
 # Selection tests
 # ---------------------------------------------------------------------------
@@ -270,6 +317,25 @@ def test_backup_delete_selection(backup):
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
+def test_backup_selections_are_plan_region_scoped(backup, backup_west):
+    plan_id = _make_plan(backup)
+    sel_id = backup.create_backup_selection(
+        BackupPlanId=plan_id,
+        BackupSelection={
+            "SelectionName": "sel-regional",
+            "IamRoleArn": "arn:aws:iam::000000000000:role/BackupRole",
+        },
+    )["SelectionId"]
+
+    with pytest.raises(ClientError) as exc:
+        backup_west.get_backup_selection(BackupPlanId=plan_id, SelectionId=sel_id)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    with pytest.raises(ClientError) as exc:
+        backup_west.list_backup_selections(BackupPlanId=plan_id)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 # ---------------------------------------------------------------------------
 # Job tests
 # ---------------------------------------------------------------------------
@@ -340,6 +406,36 @@ def test_backup_start_job_increments_recovery_point_count(backup):
     )
     after = backup.describe_backup_vault(BackupVaultName=vault_name)["NumberOfRecoveryPoints"]
     assert after == before + 1
+
+
+def test_backup_jobs_are_region_scoped_and_increment_local_vault(backup, backup_west):
+    vault_name = f"job-region-vault-{_uid()}"
+    backup.create_backup_vault(BackupVaultName=vault_name)
+
+    with pytest.raises(ClientError) as exc:
+        backup_west.start_backup_job(
+            BackupVaultName=vault_name,
+            ResourceArn="arn:aws:dynamodb:us-west-2:000000000000:table/MyTable",
+            IamRoleArn="arn:aws:iam::000000000000:role/BackupRole",
+        )
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    before = backup.describe_backup_vault(BackupVaultName=vault_name)["NumberOfRecoveryPoints"]
+    job_id = backup.start_backup_job(
+        BackupVaultName=vault_name,
+        ResourceArn="arn:aws:dynamodb:us-east-1:000000000000:table/MyTable",
+        IamRoleArn="arn:aws:iam::000000000000:role/BackupRole",
+    )["BackupJobId"]
+    assert backup.describe_backup_vault(BackupVaultName=vault_name)["NumberOfRecoveryPoints"] == before + 1
+
+    with pytest.raises(ClientError) as exc:
+        backup_west.describe_backup_job(BackupJobId=job_id)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    west_job_ids = {
+        job["BackupJobId"]
+        for job in backup_west.list_backup_jobs(ByBackupVaultName=vault_name)["BackupJobs"]
+    }
+    assert job_id not in west_job_ids
 
 
 def test_backup_stop_job_not_found(backup):
@@ -483,3 +579,38 @@ def test_backup_list_tags_empty(backup):
     arn = f"arn:aws:backup:{REGION}:000000000000:backup-vault:{name}"
     resp = backup.list_tags(ResourceArn=arn)
     assert resp["Tags"] == {}
+
+
+def test_backup_tags_are_region_scoped(backup, backup_west):
+    name = f"tag-region-vault-{_uid()}"
+    backup.create_backup_vault(BackupVaultName=name)
+    backup_west.create_backup_vault(BackupVaultName=name)
+
+    east_arn = f"arn:aws:backup:{REGION}:000000000000:backup-vault:{name}"
+    west_arn = f"arn:aws:backup:us-west-2:000000000000:backup-vault:{name}"
+    backup.tag_resource(ResourceArn=east_arn, Tags={"Env": "east"})
+
+    assert backup.list_tags(ResourceArn=east_arn)["Tags"] == {"Env": "east"}
+    assert backup_west.list_tags(ResourceArn=west_arn)["Tags"] == {}
+
+
+def test_backup_reset_clears_all_regions():
+    from ministack.core.responses import get_region, set_request_region
+    from ministack.services import backup as backup_service
+
+    original_region = get_region()
+    try:
+        set_request_region(REGION)
+        backup_service._vaults["reset-east"] = {"BackupVaultName": "reset-east"}
+        set_request_region("us-west-2")
+        backup_service._vaults["reset-west"] = {"BackupVaultName": "reset-west"}
+
+        backup_service.reset()
+
+        assert not backup_service._vaults.has_any()
+        assert not backup_service._plans.has_any()
+        assert not backup_service._selections.has_any()
+        assert not backup_service._jobs.has_any()
+    finally:
+        backup_service.reset()
+        set_request_region(original_region)
