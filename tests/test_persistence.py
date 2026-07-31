@@ -2538,6 +2538,221 @@ def test_iot_region_scoped_state_is_rejected_by_v2_reader(
     assert persistence.load_state("iot") is None
 
 
+def test_cloudtrail_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject CloudTrail's regional schema instead of
+    accepting it as v2 and dropping non-boot-region trails."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    trails = AccountRegionScopedDict()
+    trails.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-trail",
+        {
+            "Name": "regional-trail",
+            "HomeRegion": "us-west-2",
+            "TrailARN": "arn:aws:cloudtrail:us-west-2:000000000000:trail/regional-trail",
+        },
+    )
+    persistence.save_state("cloudtrail", {"trails": trails})
+
+    raw = _json.loads((tmp_path / "cloudtrail.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_trails = persistence.load_state("cloudtrail")["trails"]
+    assert loaded_trails.get_scoped(
+        "000000000000", "us-west-2", "regional-trail"
+    )["HomeRegion"] == "us-west-2"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("cloudtrail") is None
+
+
+def test_cloudtrail_region_scoped_v3_state_round_trips_idempotently(
+    monkeypatch, tmp_path
+):
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    trails = AccountRegionScopedDict()
+    trails.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-trail",
+        {
+            "Name": "regional-trail",
+            "HomeRegion": "us-west-2",
+            "TrailARN": "arn:aws:cloudtrail:us-west-2:000000000000:trail/regional-trail",
+        },
+    )
+    selectors = AccountRegionScopedDict()
+    selectors.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-trail",
+        [{"ReadWriteType": "All", "IncludeManagementEvents": True}],
+    )
+
+    persistence.save_state(
+        "cloudtrail",
+        {"trails": trails, "event_selectors": selectors},
+    )
+    first_snapshot = _json.loads((tmp_path / "cloudtrail.json").read_text())
+    loaded = persistence.load_state("cloudtrail")
+    assert loaded["trails"].get_scoped(
+        "000000000000", "us-west-2", "regional-trail"
+    )["TrailARN"].endswith("trail/regional-trail")
+    assert loaded["event_selectors"].get_scoped(
+        "000000000000", "us-west-2", "regional-trail"
+    )[0]["ReadWriteType"] == "All"
+
+    persistence.save_state("cloudtrail", loaded)
+    second_snapshot = _json.loads((tmp_path / "cloudtrail.json").read_text())
+    assert second_snapshot == first_snapshot
+
+
+def test_cloudtrail_legacy_state_restores_trails_by_home_region():
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import cloudtrail
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    west_region = "us-west-2"
+    west_name = "legacy-west-trail"
+    east_name = "legacy-east-trail"
+    orphan_name = "legacy-orphan-trail"
+    west_arn = f"arn:aws:cloudtrail:{west_region}:{account_id}:trail/{west_name}"
+
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        cloudtrail.reset()
+        cloudtrail.restore_state(
+            {
+                "trails": {
+                    west_name: {
+                        "Name": west_name,
+                        "HomeRegion": west_region,
+                        "TrailARN": west_arn,
+                    },
+                    east_name: {
+                        "Name": east_name,
+                        "HomeRegion": boot_region,
+                        "TrailARN": (
+                            f"arn:aws:cloudtrail:{boot_region}:{account_id}:"
+                            f"trail/{east_name}"
+                        ),
+                    },
+                },
+                "event_selectors": {
+                    west_name: [{"ReadWriteType": "All"}],
+                    orphan_name: [{"ReadWriteType": "WriteOnly"}],
+                },
+                "trail_tags": {west_arn: {"env": "legacy"}},
+            }
+        )
+
+        assert cloudtrail._trails.get_scoped(account_id, west_region, west_name)[
+            "HomeRegion"
+        ] == west_region
+        assert cloudtrail._event_selectors.get_scoped(
+            account_id, west_region, west_name
+        ) == [{"ReadWriteType": "All"}]
+        assert cloudtrail._trails.get_scoped(account_id, boot_region, west_name) is None
+        assert cloudtrail._event_selectors.get_scoped(
+            account_id, boot_region, orphan_name
+        ) == [{"ReadWriteType": "WriteOnly"}]
+        assert cloudtrail._trail_tags.get_scoped(
+            account_id, boot_region, west_arn
+        ) == {"env": "legacy"}
+    finally:
+        cloudtrail.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_cloudtrail_persistence_lifecycle_restores_all_regional_accounts(
+    monkeypatch, tmp_path
+):
+    import importlib
+
+    from ministack.app import _build_persistence_save_dict, _state_map
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import cloudtrail
+
+    boot_region = "us-east-1"
+    west_region = "us-west-2"
+    first_account = "111111111111"
+    second_account = "222222222222"
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+    set_request_account_id(first_account)
+    set_request_region(boot_region)
+    cloudtrail.reset()
+    try:
+        cloudtrail._trails.set_scoped(
+            first_account,
+            west_region,
+            "acct-one-west",
+            {
+                "Name": "acct-one-west",
+                "HomeRegion": west_region,
+                "TrailARN": (
+                    f"arn:aws:cloudtrail:{west_region}:{first_account}:"
+                    "trail/acct-one-west"
+                ),
+            },
+        )
+        cloudtrail._trails.set_scoped(
+            second_account,
+            boot_region,
+            "acct-two-east",
+            {
+                "Name": "acct-two-east",
+                "HomeRegion": boot_region,
+                "TrailARN": (
+                    f"arn:aws:cloudtrail:{boot_region}:{second_account}:"
+                    "trail/acct-two-east"
+                ),
+            },
+        )
+
+        assert _state_map["cloudtrail"] == "cloudtrail"
+        save_dict = _build_persistence_save_dict()
+        persistence.save_all({"cloudtrail": save_dict["cloudtrail"]})
+
+        cloudtrail.reset()
+        importlib.reload(cloudtrail)
+
+        assert cloudtrail._trails.get_scoped(
+            first_account, west_region, "acct-one-west"
+        )["HomeRegion"] == west_region
+        assert cloudtrail._trails.get_scoped(
+            second_account, boot_region, "acct-two-east"
+        )["HomeRegion"] == boot_region
+        assert cloudtrail._trails.get_scoped(
+            first_account, boot_region, "acct-one-west"
+        ) is None
+    finally:
+        cloudtrail.reset()
+
+
 def test_ecs_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
     """A rollback binary must reject ECS's regional schema instead of
     accepting it as v2 and silently dropping every regional store."""
