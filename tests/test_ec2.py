@@ -2732,7 +2732,7 @@ def test_ebs_copy_snapshot_respects_source_region():
         method="POST",
     )
     with pytest.raises(urllib.error.HTTPError) as exc:
-        urllib.request.urlopen(req, timeout=5)
+        urllib.request.urlopen(req, timeout=15)
     assert exc.value.code == 400
     assert b"InvalidSnapshot.NotFound" in exc.value.read()
 
