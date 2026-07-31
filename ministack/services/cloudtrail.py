@@ -266,23 +266,6 @@ def _parse_trail_arn(arn: str):
     return spec, trail_name
 
 
-def _trail_name_from_arn(arn: str) -> str | None:
-    spec, trail_name = _parse_trail_arn(arn)
-    if spec.region != get_region() or spec.account_id != get_account_id():
-        return None
-    return trail_name
-
-
-def _trail_name_from_read_arn(arn: str) -> str | None:
-    spec, trail_name = _parse_trail_arn(arn)
-    if spec.account_id != get_account_id():
-        return None
-    trail = _trails.get_scoped(spec.account_id, spec.region, trail_name)
-    if trail is None or trail.get("TrailARN") != str(spec):
-        return None
-    return trail_name
-
-
 def _normalize_kms_key_id(value: str) -> str:
     """Echo the CMK as real AWS does — a full key ARN. A bare key id is expanded to
     its ARN; an ARN or an ``alias/...`` reference is kept as sent (resolving an alias
@@ -427,21 +410,6 @@ def _lookup_events(body: dict):
     return _ok({"Events": filtered})
 
 
-def _resolve_trail_name(name: str, *, allow_cross_region_arn: bool = False) -> str | None:
-    if name.startswith("arn:"):
-        if allow_cross_region_arn:
-            return _trail_name_from_read_arn(name)
-        return _trail_name_from_arn(name)
-    return name
-
-
-def _resolve_trail_name_or_error(name: str, *, allow_cross_region_arn: bool = False):
-    try:
-        return _resolve_trail_name(name, allow_cross_region_arn=allow_cross_region_arn), None
-    except ValueError as exc:
-        return None, _err("CloudTrailARNInvalidException", str(exc))
-
-
 def _is_non_aws_trail_arn_partition(raw: str) -> bool:
     try:
         spec, _ = _parse_trail_arn(raw)
@@ -465,15 +433,6 @@ def _validate_trail_arn(arn: str, *, require_existing: bool = False):
             return _err("ResourceNotFoundException", f"Unknown trail: {arn!r}")
 
     return None
-
-
-def _resolve_existing_trail_name_or_error(raw: str, *, allow_cross_region_arn: bool = False):
-    name, error = _resolve_trail_name_or_error(raw, allow_cross_region_arn=allow_cross_region_arn)
-    if error:
-        return None, error
-    if name is None or _trails.get(name) is None:
-        return None, _err("TrailNotFoundException", f"Unknown trail: {raw!r}", 404)
-    return name, None
 
 
 def _create_trail(body: dict):
