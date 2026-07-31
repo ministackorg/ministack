@@ -86,6 +86,29 @@ def test_ec2_describe_availability_zones(ec2):
     assert any("us-east-1" in az for az in azs)
 
 
+def test_ec2_availability_zone_ids_are_region_coded(ec2):
+    """ZoneId is the account-stable id ("use1-az1"), never the account-local ZoneName: code
+    handed an id has to resolve it here, and an id that equals the name hides that requirement
+    until it runs against real AWS."""
+    zones = ec2.describe_availability_zones()["AvailabilityZones"]
+    assert [z["ZoneId"] for z in zones] == ["use1-az1", "use1-az2", "use1-az3"]
+    assert all(z["ZoneId"] != z["ZoneName"] for z in zones)
+    assert [z["ZoneName"] for z in zones] == ["us-east-1a", "us-east-1b", "us-east-1c"]
+    assert all(z["RegionName"] == "us-east-1" and z["State"] == "available" for z in zones)
+
+    # The prefix follows AWS's own coding, including the compound directions.
+    from ministack.services.ec2 import _az_id_prefix
+    assert _az_id_prefix("eu-central-1") == "euc1"
+    assert _az_id_prefix("ap-southeast-2") == "apse2"
+    assert _az_id_prefix("ap-northeast-1") == "apne1"
+    assert _az_id_prefix("us-west-2") == "usw2"
+    assert _az_id_prefix("ca-central-1") == "cac1"
+    assert _az_id_prefix("sa-east-1") == "sae1"
+    # A partitioned region keeps every part between the geography and the index.
+    assert _az_id_prefix("us-gov-west-1") == "usgw1"
+    assert _az_id_prefix("cn-northwest-1") == "cnnw1"
+
+
 def test_ec2_describe_regions_returns_commercial_regions(ec2):
     """DescribeRegions must list at least the four legacy us-* regions
     with opt-in-not-required, and emit the shape AWS returns."""

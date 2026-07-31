@@ -2341,14 +2341,37 @@ def _describe_vpc_endpoint_services(p):
 # Availability Zones
 # ---------------------------------------------------------------------------
 
+_AZ_ID_DIRECTIONS = {
+    "north": "n", "south": "s", "east": "e", "west": "w", "central": "c",
+    "northeast": "ne", "northwest": "nw", "southeast": "se", "southwest": "sw",
+}
+
+
+def _az_id_prefix(region):
+    """Region -> the AZ-id prefix AWS codes it with: eu-central-1 -> euc1, ap-southeast-2 -> apse2."""
+
+    parts = region.split("-")
+    if len(parts) < 3:
+        return region.replace("-", "")
+    geo, middles, index = parts[0], parts[1:-1], parts[-1]
+    coded = "".join(_AZ_ID_DIRECTIONS.get(part, part[:1]) for part in middles)
+    return f"{geo}{coded}{index}"
+
+
 def _describe_availability_zones(p):
-    azs = [f"{get_region()}a", f"{get_region()}b", f"{get_region()}c"]
+    """AZ ids are deliberately unlike the zone names: AWS shuffles names per account, so AZa is different,
+    while az1 is the same across accounts. The shuffle on AWS is per-account stable."""
+
+    region = get_region()
+    prefix = _az_id_prefix(region)
+    # 3 AZs with a=1, b=2, c=3 for ministack
+    zones = [(f"{region}{letter}", f"{prefix}-az{n}") for n, letter in enumerate("abc", start=1)]
     items = "".join(f"""<item>
-        <zoneName>{az}</zoneName>
+        <zoneName>{name}</zoneName>
         <zoneState>available</zoneState>
-        <regionName>{get_region()}</regionName>
-        <zoneId>{az}</zoneId>
-    </item>""" for az in azs)
+        <regionName>{region}</regionName>
+        <zoneId>{zone_id}</zoneId>
+    </item>""" for name, zone_id in zones)
     return _xml(200, "DescribeAvailabilityZonesResponse",
                 f"<availabilityZoneInfo>{items}</availabilityZoneInfo>")
 
