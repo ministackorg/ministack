@@ -9,11 +9,24 @@ import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 import ministack.core.responses as _responses
 from ministack.core.router import detect_service
+
+
+def _glue_client(region):
+    return boto3.client(
+        "glue",
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        region_name=region,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        config=Config(region_name=region, retries={"mode": "standard"}),
+    )
 
 
 def test_glue_catalog(glue):
@@ -66,6 +79,121 @@ def test_glue_crawler(glue):
     resp = glue.get_crawler(Name="test-crawler")
     assert resp["Crawler"]["Name"] == "test-crawler"
     glue.start_crawler(Name="test-crawler")
+
+
+def test_glue_catalog_jobs_and_crawlers_are_region_scoped():
+    east = _glue_client("us-east-1")
+    west = _glue_client("us-west-2")
+    db_name = "glue-regional-db"
+    table_name = "glue-regional-table"
+    job_name = "glue-regional-job"
+    crawler_name = "glue-regional-crawler"
+
+    def create_resources(client, region):
+        client.create_database(
+            DatabaseInput={"Name": db_name, "Description": region}
+        )
+        client.create_table(
+            DatabaseName=db_name,
+            TableInput={
+                "Name": table_name,
+                "Description": region,
+                "StorageDescriptor": {
+                    "Columns": [],
+                    "Location": f"s3://bucket/{region}/",
+                    "InputFormat": "",
+                    "OutputFormat": "",
+                    "SerdeInfo": {},
+                },
+                "PartitionKeys": [{"Name": "region", "Type": "string"}],
+            },
+        )
+        client.create_partition(
+            DatabaseName=db_name,
+            TableName=table_name,
+            PartitionInput={
+                "Values": [region],
+                "StorageDescriptor": {
+                    "Columns": [],
+                    "Location": f"s3://bucket/{region}/region={region}",
+                    "InputFormat": "",
+                    "OutputFormat": "",
+                    "SerdeInfo": {},
+                },
+            },
+        )
+        client.create_job(
+            Name=job_name,
+            Description=region,
+            Role="arn:aws:iam::000000000000:role/GlueRole",
+            Command={"Name": "pythonshell", "ScriptLocation": ""},
+        )
+        run_id = client.start_job_run(JobName=job_name)["JobRunId"]
+        client.create_crawler(
+            Name=crawler_name,
+            Description=region,
+            Role="arn:aws:iam::000000000000:role/GlueRole",
+            DatabaseName=db_name,
+            Targets={"S3Targets": [{"Path": f"s3://bucket/{region}/"}]},
+        )
+        return run_id
+
+    try:
+        east_run_id = create_resources(east, "us-east-1")
+        west_run_id = create_resources(west, "us-west-2")
+
+        assert [db["Description"] for db in east.get_databases()["DatabaseList"]
+                if db["Name"] == db_name] == ["us-east-1"]
+        assert [db["Description"] for db in west.get_databases()["DatabaseList"]
+                if db["Name"] == db_name] == ["us-west-2"]
+        assert [table["Description"] for table in east.get_tables(
+            DatabaseName=db_name
+        )["TableList"]] == ["us-east-1"]
+        assert [table["Description"] for table in west.get_tables(
+            DatabaseName=db_name
+        )["TableList"]] == ["us-west-2"]
+        assert east.get_partitions(
+            DatabaseName=db_name, TableName=table_name
+        )["Partitions"][0]["Values"] == ["us-east-1"]
+        assert west.get_partitions(
+            DatabaseName=db_name, TableName=table_name
+        )["Partitions"][0]["Values"] == ["us-west-2"]
+        assert [job["Description"] for job in east.get_jobs()["Jobs"]
+                if job["Name"] == job_name] == ["us-east-1"]
+        assert [job["Description"] for job in west.get_jobs()["Jobs"]
+                if job["Name"] == job_name] == ["us-west-2"]
+        assert [run["Id"] for run in east.get_job_runs(JobName=job_name)["JobRuns"]] == [
+            east_run_id
+        ]
+        assert [run["Id"] for run in west.get_job_runs(JobName=job_name)["JobRuns"]] == [
+            west_run_id
+        ]
+        assert [crawler["Description"] for crawler in east.get_crawlers()["Crawlers"]
+                if crawler["Name"] == crawler_name] == ["us-east-1"]
+        assert [crawler["Description"] for crawler in west.get_crawlers()["Crawlers"]
+                if crawler["Name"] == crawler_name] == ["us-west-2"]
+
+        east.delete_database(Name=db_name)
+        with pytest.raises(ClientError) as exc:
+            east.get_database(Name=db_name)
+        assert exc.value.response["Error"]["Code"] == "EntityNotFoundException"
+        assert west.get_table(DatabaseName=db_name, Name=table_name)["Table"][
+            "Description"
+        ] == "us-west-2"
+        assert west.get_partitions(
+            DatabaseName=db_name, TableName=table_name
+        )["Partitions"][0]["Values"] == ["us-west-2"]
+    finally:
+        for client in (east, west):
+            for operation, kwargs in (
+                (client.delete_crawler, {"Name": crawler_name}),
+                (client.delete_job, {"JobName": job_name}),
+                (client.delete_database, {"Name": db_name}),
+            ):
+                try:
+                    operation(**kwargs)
+                except ClientError:
+                    pass
 
 def test_glue_database_location_uri(glue):
     glue.create_database(DatabaseInput={"Name": "db_no_location"})
@@ -1453,6 +1581,7 @@ def test_glue_start_job_run_resolves_script_in_worker_thread(tmp_path, monkeypat
     monkeypatch.setattr(gluemod, "S3_DATA_DIR", str(tmp_path))
 
     account = "210987654321"
+    region = "eu-west-1"
     captured = {}
     done = threading.Event()
 
@@ -1462,6 +1591,7 @@ def test_glue_start_job_run_resolves_script_in_worker_thread(tmp_path, monkeypat
         # Capture the account the worker thread actually runs under, then defer
         # to the real resolver so the on-disk lookup is genuinely exercised.
         captured["account"] = respmod.get_account_id()
+        captured["region"] = respmod.get_region()
         captured["resolved"] = real_resolve(location)
         done.set()
         return captured["resolved"]
@@ -1472,7 +1602,8 @@ def test_glue_start_job_run_resolves_script_in_worker_thread(tmp_path, monkeypat
     monkeypatch.setattr(gluemod, "_resolve_script", spy_resolve)
     monkeypatch.setattr(gluemod, "_execute_subprocess", noop_subprocess)
 
-    token = respmod._request_account_id.set(account)
+    account_token = respmod._request_account_id.set(account)
+    region_token = respmod._request_region.set(region)
     try:
         s3mod._persist_object("glue-scripts", "etl/main.py", b"print('ok')\n")
         persisted = s3mod._object_disk_path("glue-scripts", "etl/main.py")
@@ -1487,12 +1618,14 @@ def test_glue_start_job_run_resolves_script_in_worker_thread(tmp_path, monkeypat
         assert captured["account"] == account, (
             f"worker ran under {captured.get('account')!r}, not caller account {account!r}"
         )
+        assert captured["region"] == region
         assert captured["resolved"] is not None
         assert os.path.samefile(captured["resolved"], persisted)
     finally:
-        respmod._request_account_id.reset(token)
-        gluemod._jobs._data.pop((account, "ctx-job"), None)
-        gluemod._job_runs._data.pop((account, "ctx-job"), None)
+        respmod._request_region.reset(region_token)
+        respmod._request_account_id.reset(account_token)
+        gluemod._jobs.pop_scoped(account, region, "ctx-job", None)
+        gluemod._job_runs.pop_scoped(account, region, "ctx-job", None)
 
 
 def test_glue_crawler_completes_for_non_default_account(monkeypatch):
@@ -1511,10 +1644,12 @@ def test_glue_crawler_completes_for_non_default_account(monkeypatch):
     monkeypatch.setattr(gluemod, "CRAWLER_RUN_SECONDS", 0.2)
 
     account = "555555555555"
+    region = "us-west-2"
     name = "ctx-crawler"
-    token = respmod._request_account_id.set(account)
+    account_token = respmod._request_account_id.set(account)
+    region_token = respmod._request_region.set(region)
     try:
-        gluemod._crawlers._data.pop((account, name), None)
+        gluemod._crawlers.pop_scoped(account, region, name, None)
         gluemod._create_crawler({
             "Name": name,
             "Role": "arn:aws:iam::555555555555:role/GlueRole",
@@ -1534,8 +1669,130 @@ def test_glue_crawler_completes_for_non_default_account(monkeypatch):
         last_crawl = gluemod._crawlers[name]["LastCrawl"]
         assert last_crawl is not None and last_crawl["Status"] == "SUCCEEDED"
     finally:
-        respmod._request_account_id.reset(token)
-        gluemod._crawlers._data.pop((account, name), None)
+        respmod._request_region.reset(region_token)
+        respmod._request_account_id.reset(account_token)
+        gluemod._crawlers.pop_scoped(account, region, name, None)
+
+
+def test_glue_legacy_account_scoped_state_falls_back_to_ambient_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import glue as gluemod
+
+    account = "123456789012"
+    region = "eu-central-1"
+    original_account = get_account_id()
+    original_region = get_region()
+
+    def legacy_store(key, value):
+        store = AccountScopedDict()
+        store._data[(account, key)] = value
+        return store
+
+    state = {
+        "databases": legacy_store(
+            "legacy-db", {"Name": "legacy-db", "CatalogId": account}
+        ),
+        "tables": legacy_store(
+            "legacy-db/legacy-table",
+            {
+                "Name": "legacy-table",
+                "DatabaseName": "legacy-db",
+                "CatalogId": account,
+                "StorageDescriptor": {
+                    "SchemaReference": {
+                        "SchemaId": {
+                            "SchemaArn": (
+                                "arn:aws:glue:us-west-2:123456789012:"
+                                "schema/registry/schema"
+                            )
+                        }
+                    }
+                },
+            },
+        ),
+        "partitions": legacy_store(
+            "legacy-db/legacy-table",
+            [
+                {
+                    "Values": ["legacy"],
+                    "DatabaseName": "legacy-db",
+                    "TableName": "legacy-table",
+                    "CatalogId": account,
+                }
+            ],
+        ),
+        "job_runs": legacy_store(
+            "legacy-job",
+            [
+                {
+                    "Id": "legacy-run",
+                    "JobName": "legacy-job",
+                    "Arguments": {
+                        "--key": "arn:aws:kms:us-west-2:123456789012:key/legacy"
+                    },
+                }
+            ],
+        ),
+    }
+
+    try:
+        set_request_account_id(account)
+        set_request_region(region)
+        gluemod.restore_state(state)
+
+        assert gluemod._databases.get_scoped(account, region, "legacy-db")[
+            "Name"
+        ] == "legacy-db"
+        assert gluemod._tables.get_scoped(
+            account, region, "legacy-db/legacy-table"
+        )["Name"] == "legacy-table"
+        assert gluemod._partitions.get_scoped(
+            account, region, "legacy-db/legacy-table"
+        )[0]["Values"] == ["legacy"]
+        assert gluemod._job_runs.get_scoped(account, region, "legacy-job")[0][
+            "Id"
+        ] == "legacy-run"
+
+        for store, key in (
+            (gluemod._databases, "legacy-db"),
+            (gluemod._tables, "legacy-db/legacy-table"),
+            (gluemod._partitions, "legacy-db/legacy-table"),
+            (gluemod._job_runs, "legacy-job"),
+        ):
+            assert store.get_scoped(account, "us-east-1", key) is None
+            assert store.get_scoped(account, "us-west-2", key) is None
+    finally:
+        gluemod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_glue_reset_clears_every_store_across_regions():
+    from ministack.services import glue as gluemod
+
+    account = "123456789012"
+    regional_stores = {
+        key: store for key, store in gluemod._ALL_STATE.items() if key != "tags"
+    }
+    assert len(regional_stores) == 16
+
+    for index, store in enumerate(regional_stores.values()):
+        store.set_scoped(account, "us-east-1", f"east-{index}", {"scope": "east"})
+        store.set_scoped(account, "us-west-2", f"west-{index}", {"scope": "west"})
+    gluemod._tags._data[
+        (account, "arn:aws:glue:us-east-1:123456789012:database/tagged")
+    ] = {"team": "platform"}
+
+    gluemod.reset()
+
+    assert all(not store.has_any() for store in regional_stores.values())
+    assert not gluemod._tags._data
 
 
 def test_glue_resolve_script_isolated_per_account(tmp_path, monkeypatch):
@@ -1906,7 +2163,7 @@ def test_list_tables_hides_non_iceberg_glue_tables():
 
 _META_JSON = {
     "format-version": 2,
-    "table-uuid": "11111111-2222-3333-4444-555555555555",
+    "table-uuid": "deadbeef-dead-beef-dead-deadbeefdead",
     "location": "s3://lake/dim_application",
     "schemas": [{"schema-id": 0, "type": "struct", "fields": []}],
     "current-schema-id": 0,

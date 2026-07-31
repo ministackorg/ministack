@@ -2,7 +2,6 @@
 CloudFormation handlers — API action handlers for all supported CloudFormation actions.
 """
 
-import asyncio
 import copy
 import json
 import logging
@@ -26,7 +25,14 @@ from .engine import (
 )
 from .helpers import CFN_NS, _error, _esc, _extract_members, _extract_stack_status_filters, _p, _resolve_template, _xml
 from .provisioners import _provision_resource
-from .stacks import _add_event, _delete_stack_async, _deploy_stack_async, _diff_resources
+from .stacks import (
+    _add_event,
+    _create_stack_task_in_region,
+    _delete_stack_async,
+    _deploy_stack_async,
+    _diff_resources,
+    _stack_region_context,
+)
 
 logger = logging.getLogger("cloudformation")
 
@@ -92,6 +98,7 @@ def _create_stack(params):
         "Tags": tags,
         "Outputs": [],
         "DisableRollback": disable_rollback,
+        "_region": get_region(),
         "_resources": {},
         "_template": template,
         "_template_body": template_body,
@@ -105,9 +112,11 @@ def _create_stack(params):
                "AWS::CloudFormation::Stack", "CREATE_IN_PROGRESS",
                physical_id=stack_id)
 
-    asyncio.get_event_loop().create_task(
+    _create_stack_task_in_region(
         _deploy_stack_async(stack_name, stack_id, template,
-                            param_values, disable_rollback, tags)
+                            param_values, disable_rollback, tags),
+        stack,
+        stack_id,
     )
 
     return _xml(200, "CreateStackResponse",
@@ -439,7 +448,11 @@ def _delete_stack(params):
                                   f"Export {export_name} is imported by stack {other_name}")
 
     stack_id = stack["StackId"]
-    asyncio.get_event_loop().create_task(_delete_stack_async(stack_name, stack_id))
+    _create_stack_task_in_region(
+        _delete_stack_async(stack_name, stack_id),
+        stack,
+        stack_id,
+    )
 
     return _xml(200, "DeleteStackResponse", "")
 
@@ -508,17 +521,20 @@ def _update_stack(params):
         {"ParameterKey": k, "ParameterValue": v["Value"], "NoEcho": v["NoEcho"]}
         for k, v in param_values.items()
     ]
-    stack["_conditions"] = _evaluate_conditions(template, param_values)
+    with _stack_region_context(stack, stack_id):
+        stack["_conditions"] = _evaluate_conditions(template, param_values)
 
-    _add_event(stack_id, stack_name, stack_name,
-               "AWS::CloudFormation::Stack", "UPDATE_IN_PROGRESS",
-               physical_id=stack_id)
+        _add_event(stack_id, stack_name, stack_name,
+                   "AWS::CloudFormation::Stack", "UPDATE_IN_PROGRESS",
+                   physical_id=stack_id)
 
-    asyncio.get_event_loop().create_task(
-        _deploy_stack_async(stack_name, stack_id, template,
-                            param_values, disable_rollback, tags,
-                            is_update=True, previous_stack=previous_stack)
-    )
+        _create_stack_task_in_region(
+            _deploy_stack_async(stack_name, stack_id, template,
+                                param_values, disable_rollback, tags,
+                                is_update=True, previous_stack=previous_stack),
+            stack,
+            stack_id,
+        )
 
     return _xml(200, "UpdateStackResponse",
                 f"<UpdateStackResult><StackId>{stack_id}</StackId></UpdateStackResult>")

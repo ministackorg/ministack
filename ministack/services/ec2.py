@@ -72,7 +72,13 @@ from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
 from ministack.core.persistence import PERSIST_STATE, load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    AccountScopedDict,
+    get_account_id,
+    get_region,
+    new_uuid,
+)
 
 logger = logging.getLogger("ec2")
 
@@ -82,33 +88,36 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # State
 # ---------------------------------------------------------------------------
 
-_instances = AccountScopedDict()
-_security_groups = AccountScopedDict()
-_key_pairs = AccountScopedDict()
-_placement_groups = AccountScopedDict()  # group_name -> placement group record
-_vpcs = AccountScopedDict()
-_subnets = AccountScopedDict()
-_internet_gateways = AccountScopedDict()
-_addresses = AccountScopedDict()       # allocation_id -> address record
-_tags = AccountScopedDict()            # resource_id -> [{"Key": ..., "Value": ...}]
-_route_tables = AccountScopedDict()    # rtb_id -> route table record
-_network_interfaces = AccountScopedDict()  # eni_id -> ENI record
-_vpc_endpoints = AccountScopedDict()   # vpce_id -> endpoint record
-_volumes = AccountScopedDict()         # vol_id -> volume record
-_snapshots = AccountScopedDict()       # snap_id -> snapshot record
-_nat_gateways = AccountScopedDict()    # nat_id -> NAT gateway record
-_network_acls = AccountScopedDict()    # acl_id -> network ACL record
-_flow_logs = AccountScopedDict()       # flow_log_id -> flow log record
-_vpc_peering = AccountScopedDict()     # pcx_id -> peering connection record
-_dhcp_options = AccountScopedDict()    # dopt_id -> DHCP options record
-_egress_igws = AccountScopedDict()     # eigw_id -> egress-only internet gateway record
-_prefix_lists = AccountScopedDict()    # pl_id -> managed prefix list record
-_vpn_gateways = AccountScopedDict()    # vgw_id -> VPN gateway record
-_customer_gateways = AccountScopedDict()  # cgw_id -> customer gateway record
-_vpn_connections = AccountScopedDict()    # vpn_id -> VPN connection record
-_launch_templates = AccountScopedDict()   # lt_id -> launch template record (includes versions list)
-_fleets = AccountScopedDict()             # fleet_id -> fleet record
-_iam_instance_profile_associations = AccountScopedDict()  # assoc_id -> association record
+_instances = AccountRegionScopedDict()
+_security_groups = AccountRegionScopedDict()
+_key_pairs = AccountRegionScopedDict()
+_placement_groups = AccountRegionScopedDict()  # group_name -> placement group record
+_vpcs = AccountRegionScopedDict()
+_subnets = AccountRegionScopedDict()
+_internet_gateways = AccountRegionScopedDict()
+_addresses = AccountRegionScopedDict()       # allocation_id -> address record
+_tags = AccountRegionScopedDict()            # resource_id -> [{"Key": ..., "Value": ...}]
+_route_tables = AccountRegionScopedDict()    # rtb_id -> route table record
+_network_interfaces = AccountRegionScopedDict()  # eni_id -> ENI record
+_vpc_endpoints = AccountRegionScopedDict()   # vpce_id -> endpoint record
+_volumes = AccountRegionScopedDict()         # vol_id -> volume record
+_snapshots = AccountRegionScopedDict()       # snap_id -> snapshot record
+_nat_gateways = AccountRegionScopedDict()    # nat_id -> NAT gateway record
+_network_acls = AccountRegionScopedDict()    # acl_id -> network ACL record
+_flow_logs = AccountRegionScopedDict()       # flow_log_id -> flow log record
+_vpc_peering = AccountRegionScopedDict()     # pcx_id -> peering connection record
+_dhcp_options = AccountRegionScopedDict()    # dopt_id -> DHCP options record
+_egress_igws = AccountRegionScopedDict()     # eigw_id -> egress-only internet gateway record
+_prefix_lists = AccountRegionScopedDict()    # pl_id -> managed prefix list record
+_vpn_gateways = AccountRegionScopedDict()    # vgw_id -> VPN gateway record
+_customer_gateways = AccountRegionScopedDict()  # cgw_id -> customer gateway record
+_vpn_connections = AccountRegionScopedDict()    # vpn_id -> VPN connection record
+_launch_templates = AccountRegionScopedDict()   # lt_id -> launch template record (includes versions list)
+_fleets = AccountRegionScopedDict()             # fleet_id -> fleet record
+_iam_instance_profile_associations = AccountRegionScopedDict()  # assoc_id -> association record
+# Seed defaults once per account/region; do not recreate user-deleted defaults
+# on every later EC2 request in a scope.
+_default_initialized_scopes = set()
 
 
 
@@ -116,6 +125,10 @@ _iam_instance_profile_associations = AccountScopedDict()  # assoc_id -> associat
 
 def get_state():
     return {
+        "default_initialized_scopes": [
+            {"AccountId": account_id, "Region": region}
+            for account_id, region in sorted(_default_initialized_scopes)
+        ],
         "instances": copy.deepcopy(_instances),
         "security_groups": copy.deepcopy(_security_groups),
         "key_pairs": copy.deepcopy(_key_pairs),
@@ -146,37 +159,158 @@ def get_state():
     }
 
 
-def restore_state(data):
-    if data:
-        _instances.update(data.get("instances", {}))
-        _security_groups.update(data.get("security_groups", {}))
-        _key_pairs.update(data.get("key_pairs", {}))
-        _placement_groups.update(data.get("placement_groups", {}))
-        _vpcs.update(data.get("vpcs", {}))
-        _subnets.update(data.get("subnets", {}))
-        _internet_gateways.update(data.get("internet_gateways", {}))
-        _addresses.update(data.get("addresses", {}))
-        _tags.update(data.get("tags", {}))
-        _route_tables.update(data.get("route_tables", {}))
-        _network_interfaces.update(data.get("network_interfaces", {}))
-        _vpc_endpoints.update(data.get("vpc_endpoints", {}))
-        _volumes.update(data.get("volumes", {}))
-        _snapshots.update(data.get("snapshots", {}))
-        _nat_gateways.update(data.get("nat_gateways", {}))
-        _network_acls.update(data.get("network_acls", {}))
-        _flow_logs.update(data.get("flow_logs", {}))
-        _vpc_peering.update(data.get("vpc_peering", {}))
-        _dhcp_options.update(data.get("dhcp_options", {}))
-        _egress_igws.update(data.get("egress_igws", {}))
-        _prefix_lists.update(data.get("prefix_lists", {}))
-        _vpn_gateways.update(data.get("vpn_gateways", {}))
-        _customer_gateways.update(data.get("customer_gateways", {}))
-        _vpn_connections.update(data.get("vpn_connections", {}))
-        _launch_templates.update(data.get("launch_templates", {}))
-        _fleets.update(data.get("fleets", {}))
-        _iam_instance_profile_associations.update(
-            data.get("iam_instance_profile_associations", {})
+def _clear_state():
+    _instances.clear()
+    _security_groups.clear()
+    _key_pairs.clear()
+    _placement_groups.clear()
+    _vpcs.clear()
+    _subnets.clear()
+    _internet_gateways.clear()
+    _addresses.clear()
+    _tags.clear()
+    _route_tables.clear()
+    _network_interfaces.clear()
+    _vpc_endpoints.clear()
+    _volumes.clear()
+    _snapshots.clear()
+    _nat_gateways.clear()
+    _network_acls.clear()
+    _flow_logs.clear()
+    _vpc_peering.clear()
+    _dhcp_options.clear()
+    _egress_igws.clear()
+    _prefix_lists.clear()
+    _vpn_gateways.clear()
+    _customer_gateways.clear()
+    _vpn_connections.clear()
+    _launch_templates.clear()
+    _fleets.clear()
+    _iam_instance_profile_associations.clear()
+    _default_initialized_scopes.clear()
+
+
+def _vpc_peering_scopes(record, default_region=None, account_id=None):
+    default_region = default_region or get_region()
+    scopes = {
+        (
+            record["RequesterVpcInfo"]["OwnerId"],
+            record["RequesterVpcInfo"].get("Region") or default_region,
+        ),
+        (
+            record["AccepterVpcInfo"]["OwnerId"],
+            record["AccepterVpcInfo"].get("Region") or default_region,
+        ),
+    }
+    if account_id is not None:
+        scopes = {scope for scope in scopes if scope[0] == account_id}
+    return scopes
+
+
+def _put_vpc_peering_record(record, default_region=None):
+    pcx_id = record["VpcPeeringConnectionId"]
+    for account_id, region in _vpc_peering_scopes(record, default_region):
+        _vpc_peering.set_scoped(account_id, region, pcx_id, copy.deepcopy(record))
+
+
+def _legacy_vpc_peering_record_for_boot_region(record, region):
+    record = copy.deepcopy(record)
+    record.setdefault("RequesterVpcInfo", {})["Region"] = region
+    record.setdefault("AccepterVpcInfo", {})["Region"] = region
+    return record
+
+
+def _restore_default_initialized_scopes(data):
+    for item in data.get("default_initialized_scopes", []):
+        if isinstance(item, dict):
+            account_id = item.get("AccountId")
+            region = item.get("Region")
+        else:
+            try:
+                account_id, region = item
+            except (TypeError, ValueError):
+                continue
+        if account_id and region:
+            _default_initialized_scopes.add((account_id, region))
+
+
+def _infer_default_initialized_scopes_from_restored_stores():
+    for (account_id, region, _vpc_id), vpc in _vpcs.all_items():
+        if vpc.get("IsDefault"):
+            _default_initialized_scopes.add((account_id, region))
+
+
+def _restore_vpc_peering_store(restored):
+    if isinstance(restored, AccountRegionScopedDict):
+        for (_account_id, region, _key), record in restored.all_items():
+            _put_vpc_peering_record(record, default_region=region)
+        return
+    region = get_region()
+    if isinstance(restored, AccountScopedDict):
+        for (_account_id, _key), record in restored._data.items():
+            _put_vpc_peering_record(
+                _legacy_vpc_peering_record_for_boot_region(record, region),
+                default_region=region,
+            )
+        return
+    for _key, record in restored.items():
+        _put_vpc_peering_record(
+            _legacy_vpc_peering_record_for_boot_region(record, region),
+            default_region=region,
         )
+
+
+def restore_state(data):
+    if not data:
+        return
+    _clear_state()
+    _restore_default_initialized_scopes(data)
+    _restore_regional_store(_instances, data.get("instances", {}))
+    _restore_regional_store(_security_groups, data.get("security_groups", {}))
+    _restore_regional_store(_key_pairs, data.get("key_pairs", {}))
+    _restore_regional_store(_placement_groups, data.get("placement_groups", {}))
+    _restore_regional_store(_vpcs, data.get("vpcs", {}))
+    _restore_regional_store(_subnets, data.get("subnets", {}))
+    _restore_regional_store(_internet_gateways, data.get("internet_gateways", {}))
+    _restore_regional_store(_addresses, data.get("addresses", {}))
+    _restore_regional_store(_tags, data.get("tags", {}))
+    _restore_regional_store(_route_tables, data.get("route_tables", {}))
+    _restore_regional_store(_network_interfaces, data.get("network_interfaces", {}))
+    _restore_regional_store(_vpc_endpoints, data.get("vpc_endpoints", {}))
+    _restore_regional_store(_volumes, data.get("volumes", {}))
+    _restore_regional_store(_snapshots, data.get("snapshots", {}))
+    _restore_regional_store(_nat_gateways, data.get("nat_gateways", {}))
+    _restore_regional_store(_network_acls, data.get("network_acls", {}))
+    _restore_regional_store(_flow_logs, data.get("flow_logs", {}))
+    _restore_vpc_peering_store(data.get("vpc_peering", {}))
+    _restore_regional_store(_dhcp_options, data.get("dhcp_options", {}))
+    _restore_regional_store(_egress_igws, data.get("egress_igws", {}))
+    _restore_regional_store(_prefix_lists, data.get("prefix_lists", {}))
+    _restore_regional_store(_vpn_gateways, data.get("vpn_gateways", {}))
+    _restore_regional_store(_customer_gateways, data.get("customer_gateways", {}))
+    _restore_regional_store(_vpn_connections, data.get("vpn_connections", {}))
+    _restore_regional_store(_launch_templates, data.get("launch_templates", {}))
+    _restore_regional_store(_fleets, data.get("fleets", {}))
+    _restore_regional_store(
+        _iam_instance_profile_associations,
+        data.get("iam_instance_profile_associations", {})
+    )
+    if "default_initialized_scopes" not in data:
+        _infer_default_initialized_scopes_from_restored_stores()
+
+
+def _restore_regional_store(store, restored):
+    """Map legacy EC2 state to the boot region without mining embedded ARNs."""
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+    region = get_region()
+    if isinstance(restored, AccountScopedDict):
+        for (account_id, key), value in restored._data.items():
+            store.set_scoped(account_id, region, key, value)
+        return
+    for key, value in restored.items():
+        store.set_scoped(get_account_id(), region, key, value)
 
 
 try:
@@ -206,6 +340,7 @@ _KNOWN_MALFORMED_SECURITY_GROUP_IDS = {
 
 
 def _init_defaults():
+    _default_initialized_scopes.add((get_account_id(), get_region()))
     if _DEFAULT_VPC_ID not in _vpcs:
         _vpcs[_DEFAULT_VPC_ID] = {
             "VpcId": _DEFAULT_VPC_ID,
@@ -284,8 +419,12 @@ def _init_defaults():
             ],
         }
 
+def _ensure_defaults_initialized():
+    if (get_account_id(), get_region()) not in _default_initialized_scopes:
+        _init_defaults()
 
-_init_defaults()
+
+_ensure_defaults_initialized()
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +432,7 @@ _init_defaults()
 # ---------------------------------------------------------------------------
 
 async def handle_request(method, path, headers, body, query_params):
+    _ensure_defaults_initialized()
     params = dict(query_params)
     if method in ("POST", "PUT") and body:
         raw = body if isinstance(body, str) else body.decode("utf-8", errors="replace")
@@ -1030,6 +1170,12 @@ def _sg_rule_id(sg_id, is_egress, rule):
     id from the rule's content keeps it stable regardless of list position or
     process restarts, and identical between Authorize and Describe.
     """
+
+    # Keep the assigned rule id stable once present. Updates to (ports, CIDR,
+    # protocol, etc) should not change identity.
+    if rule.get("SecurityGroupRuleId"):
+        return rule["SecurityGroupRuleId"]
+
     direction = "egress" if is_egress else "ingress"
     parts = [
         sg_id,
@@ -1069,10 +1215,25 @@ def _sg_rule_tag_suffix(rule_id):
     return suffix
 
 
+def _sg_rule_description(rule):
+    # Prefer an explicitly stored top-level description. Nested descriptions are
+    # a fallback for rules created from IpPermissions-only requests.
+    if rule.get("Description"):
+        return rule["Description"]
+
+    for key in ("IpRanges", "Ipv6Ranges", "PrefixListIds", "UserIdGroupPairs"):
+        for entry in rule.get(key, []):
+            if isinstance(entry, dict) and entry.get("Description"):
+                return entry["Description"]
+    return ""
+
+
 def _sg_rule_xml(sg_id, rule, is_egress=False):
     """Build <securityGroupRuleSet> items for Authorize responses (provider v6)."""
     rule_id = _sg_rule_id(sg_id, is_egress, rule)
     suffix = _sg_rule_tag_suffix(rule_id)
+    desc = _sg_rule_description(rule)
+    desc_xml = f"<description>{_esc(desc)}</description>" if desc else ""
     items = ""
     for cidr in rule.get("IpRanges", []):
         items += (f"<item>"
@@ -1084,6 +1245,7 @@ def _sg_rule_xml(sg_id, rule, is_egress=False):
                   f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
                   f"<toPort>{rule.get('ToPort', -1)}</toPort>"
                   f"<cidrIpv4>{cidr.get('CidrIp', '')}</cidrIpv4>"
+                  f"{desc_xml}"
                   f"{suffix}"
                   f"</item>")
     for cidr6 in rule.get("Ipv6Ranges", []):
@@ -1096,6 +1258,7 @@ def _sg_rule_xml(sg_id, rule, is_egress=False):
                   f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
                   f"<toPort>{rule.get('ToPort', -1)}</toPort>"
                   f"<cidrIpv6>{cidr6.get('CidrIpv6', '')}</cidrIpv6>"
+                  f"{desc_xml}"
                   f"{suffix}"
                   f"</item>")
     for pair in rule.get("UserIdGroupPairs", []):
@@ -1112,6 +1275,7 @@ def _sg_rule_xml(sg_id, rule, is_egress=False):
                   f"<groupId>{ref_gid}</groupId>"
                   f"<userId>{get_account_id()}</userId>"
                   f"</referencedGroupInfo>"
+                  f"{desc_xml}"
                   f"{suffix}"
                   f"</item>")
     if not items:
@@ -1124,6 +1288,7 @@ def _sg_rule_xml(sg_id, rule, is_egress=False):
                  f"<ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>"
                  f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
                  f"<toPort>{rule.get('ToPort', -1)}</toPort>"
+                 f"{desc_xml}"
                  f"{suffix}"
                  f"</item>")
     return items
@@ -1169,7 +1334,10 @@ def _revoked_sg_rule_xml(sg_id, rule, is_egress=False):
 
 def _strip_descriptions(rule):
     """Return a copy of rule with Description stripped from all range entries for comparison."""
-    r = dict(rule)
+    r = {
+        k: v for k, v in dict(rule).items()
+        if k not in ("SecurityGroupRuleId", "Description")
+    }
     for key in ("IpRanges", "Ipv6Ranges"):
         r[key] = [{k: v for k, v in entry.items() if k != "Description"} for entry in r.get(key, [])]
     return r
@@ -1216,6 +1384,7 @@ def _authorize_sg_ingress(p):
     rule_tags = _sg_rule_tag_specifications(p)
     rule_items = ""
     for r in rules:
+        r.setdefault("SecurityGroupRuleId", _sg_rule_id(sg_id, False, r))
         # Idempotent: skip rules that already exist (matches egress behavior and avoids
         # Terraform InvalidPermission.Duplicate when the provider re-authorizes unchanged rules).
         if not any(_rules_match(r, existing) for existing in sg["IpPermissions"]):
@@ -1250,6 +1419,7 @@ def _authorize_sg_egress(p):
     rule_tags = _sg_rule_tag_specifications(p)
     rule_items = ""
     for r in rules:
+        r.setdefault("SecurityGroupRuleId", _sg_rule_id(sg_id, True, r))
         if not any(_rules_match(r, existing) for existing in sg["IpPermissionsEgress"]):
             sg["IpPermissionsEgress"].append(r)
             if rule_tags:
@@ -2676,7 +2846,8 @@ def _describe_snapshots(p):
 def _copy_snapshot(p):
     source_snap_id = _p(p, "SourceSnapshotId")
     description = _p(p, "Description") or ""
-    source = _snapshots.get(source_snap_id)
+    source_region = _p(p, "SourceRegion") or get_region()
+    source = _snapshots.get_scoped(get_account_id(), source_region, source_snap_id)
     if not source:
         return _error("InvalidSnapshot.NotFound", f"The snapshot '{source_snap_id}' does not exist.", 400)
     new_snap_id = _new_snapshot_id()
@@ -3660,6 +3831,15 @@ def _delete_flow_logs(params):
 # VPC Peering Connections
 # ---------------------------------------------------------------------------
 
+def _set_vpc_peering_status(record, code, message):
+    status = {"Code": code, "Message": message}
+    pcx_id = record["VpcPeeringConnectionId"]
+    for account_id, region in _vpc_peering_scopes(record):
+        scoped_record = _vpc_peering.get_scoped(account_id, region, pcx_id)
+        if scoped_record is not None:
+            scoped_record["Status"] = status
+
+
 def _create_vpc_peering_connection(params):
     vpc_id = _p(params, "VpcId")
     peer_vpc_id = _p(params, "PeerVpcId")
@@ -3676,7 +3856,7 @@ def _create_vpc_peering_connection(params):
         "ExpirationTime": _now_ts(),
         "Tags": [],
     }
-    _vpc_peering[pcx_id] = record
+    _put_vpc_peering_record(record)
     # TagSpecifications support for aws_vpc_peering_connection.tags on create.
     _parse_tag_specs(params, "vpc-peering-connection", pcx_id)
     inner = f"""<vpcPeeringConnection>
@@ -3694,8 +3874,8 @@ def _accept_vpc_peering_connection(params):
     if pcx_id not in _vpc_peering:
         return _error("InvalidVpcPeeringConnectionID.NotFound",
                       f"The VPC peering connection '{pcx_id}' does not exist", 400)
-    _vpc_peering[pcx_id]["Status"] = {"Code": "active", "Message": "Active"}
     pcx = _vpc_peering[pcx_id]
+    _set_vpc_peering_status(pcx, "active", "Active")
     inner = f"""<vpcPeeringConnection>
         <vpcPeeringConnectionId>{pcx_id}</vpcPeeringConnectionId>
         <requesterVpcInfo><vpcId>{pcx['RequesterVpcInfo']['VpcId']}</vpcId><ownerId>{pcx['RequesterVpcInfo']['OwnerId']}</ownerId><region>{pcx['RequesterVpcInfo']['Region']}</region></requesterVpcInfo>
@@ -3733,7 +3913,7 @@ def _delete_vpc_peering_connection(params):
     if pcx_id not in _vpc_peering:
         return _error("InvalidVpcPeeringConnectionID.NotFound",
                       f"The VPC peering connection '{pcx_id}' does not exist", 400)
-    _vpc_peering[pcx_id]["Status"] = {"Code": "deleted", "Message": "Deleted"}
+    _set_vpc_peering_status(_vpc_peering[pcx_id], "deleted", "Deleted")
     return _xml(200, "DeleteVpcPeeringConnectionResponse", "<return>true</return>")
 
 
@@ -4505,33 +4685,7 @@ def _delete_vpn_connection_route(p):
 # ---------------------------------------------------------------------------
 
 def reset():
-    _instances.clear()
-    _security_groups.clear()
-    _key_pairs.clear()
-    _placement_groups.clear()
-    _vpcs.clear()
-    _subnets.clear()
-    _internet_gateways.clear()
-    _addresses.clear()
-    _tags.clear()
-    _route_tables.clear()
-    _network_interfaces.clear()
-    _vpc_endpoints.clear()
-    _volumes.clear()
-    _snapshots.clear()
-    _nat_gateways.clear()
-    _network_acls.clear()
-    _flow_logs.clear()
-    _vpc_peering.clear()
-    _dhcp_options.clear()
-    _egress_igws.clear()
-    _prefix_lists.clear()
-    _vpn_gateways.clear()
-    _customer_gateways.clear()
-    _vpn_connections.clear()
-    _launch_templates.clear()
-    _fleets.clear()
-    _iam_instance_profile_associations.clear()
+    _clear_state()
     _init_defaults()
 
 
@@ -4753,6 +4907,139 @@ def _describe_security_group_rules(p):
                         continue
                 items += _sg_rule_xml(sg_id, rule, is_egress=is_egress)
     return _xml(200, "DescribeSecurityGroupRulesResponse", f"<securityGroupRuleSet>{items}</securityGroupRuleSet>")
+
+
+def _modify_security_group_rules(p):
+    sg_id = _p(p, "GroupId")
+    sg = _security_groups.get(sg_id)
+    if not sg:
+        return _error("InvalidGroup.NotFound", f"Security group {sg_id} not found", 400)
+
+    updates = []
+    i = 1
+    while True:
+        prefix = ""
+        rule_id = _p(p, f"SecurityGroupRule.{i}.SecurityGroupRuleId")
+        if rule_id:
+            prefix = "SecurityGroupRule"
+        else:
+            rule_id = _p(p, f"SecurityGroupRules.{i}.SecurityGroupRuleId")
+            if rule_id:
+                prefix = "SecurityGroupRules"
+        if not rule_id:
+            break
+
+        base = f"{prefix}.{i}.SecurityGroupRule"
+        updates.append({
+            "rule_id": rule_id,
+            "description": _p(p, f"{base}.Description", None),
+            "ip_protocol": _p(p, f"{base}.IpProtocol", None),
+            "from_port": _p(p, f"{base}.FromPort", None),
+            "to_port": _p(p, f"{base}.ToPort", None),
+            "cidr_ipv4": _p(p, f"{base}.CidrIpv4", None),
+            "cidr_ipv6": _p(p, f"{base}.CidrIpv6", None),
+            "prefix_list_id": _p(p, f"{base}.PrefixListId", None),
+            "referenced_group_id": _p(p, f"{base}.ReferencedGroupInfo.GroupId", None),
+        })
+        i += 1
+
+    if not updates:
+        return _error("MissingParameter", "SecurityGroupRule is required", 400)
+
+    for update in updates:
+        rule_id = update["rule_id"]
+        found = False
+        for is_egress, key in ((False, "IpPermissions"), (True, "IpPermissionsEgress")):
+            for rule in sg.get(key, []):
+                if _sg_rule_id(sg_id, is_egress, rule) != rule_id:
+                    continue
+
+                found = True
+                rule["SecurityGroupRuleId"] = rule_id
+
+                if update["ip_protocol"] is not None:
+                    rule["IpProtocol"] = update["ip_protocol"]
+                if update["from_port"] is not None:
+                    rule["FromPort"] = int(update["from_port"])
+                if update["to_port"] is not None:
+                    rule["ToPort"] = int(update["to_port"])
+
+                if update["cidr_ipv4"] is not None:
+                    first = {}
+                    if rule.get("IpRanges") and isinstance(rule["IpRanges"][0], dict):
+                        first = dict(rule["IpRanges"][0])
+                    first["CidrIp"] = update["cidr_ipv4"]
+                    rule["IpRanges"] = [first]
+                    rule["Ipv6Ranges"] = []
+                    rule["PrefixListIds"] = []
+                    rule["UserIdGroupPairs"] = []
+
+                if update["cidr_ipv6"] is not None:
+                    first = {}
+                    if rule.get("Ipv6Ranges") and isinstance(rule["Ipv6Ranges"][0], dict):
+                        first = dict(rule["Ipv6Ranges"][0])
+                    first["CidrIpv6"] = update["cidr_ipv6"]
+                    rule["Ipv6Ranges"] = [first]
+                    rule["IpRanges"] = []
+                    rule["PrefixListIds"] = []
+                    rule["UserIdGroupPairs"] = []
+
+                if update["prefix_list_id"] is not None:
+                    first = {}
+                    if rule.get("PrefixListIds") and isinstance(rule["PrefixListIds"][0], dict):
+                        first = dict(rule["PrefixListIds"][0])
+                    first["PrefixListId"] = update["prefix_list_id"]
+                    rule["PrefixListIds"] = [first]
+                    rule["IpRanges"] = []
+                    rule["Ipv6Ranges"] = []
+                    rule["UserIdGroupPairs"] = []
+
+                if update["referenced_group_id"] is not None:
+                    first = {}
+                    if rule.get("UserIdGroupPairs") and isinstance(rule["UserIdGroupPairs"][0], dict):
+                        first = dict(rule["UserIdGroupPairs"][0])
+                    first["GroupId"] = update["referenced_group_id"]
+                    first.setdefault("UserId", get_account_id())
+                    rule["UserIdGroupPairs"] = [first]
+                    rule["IpRanges"] = []
+                    rule["Ipv6Ranges"] = []
+                    rule["PrefixListIds"] = []
+
+                description = update["description"]
+                if description is not None:
+                    wrote_nested = False
+                    for collection in ("IpRanges", "Ipv6Ranges", "PrefixListIds", "UserIdGroupPairs"):
+                        for entry in rule.get(collection, []):
+                            if not isinstance(entry, dict):
+                                continue
+                            if description == "":
+                                entry.pop("Description", None)
+                            else:
+                                entry["Description"] = description
+                            wrote_nested = True
+
+                    if not wrote_nested:
+                        if description == "":
+                            rule.pop("Description", None)
+                        else:
+                            rule["Description"] = description
+                    elif description == "":
+                        rule.pop("Description", None)
+                    else:
+                        rule["Description"] = description
+                break
+
+            if found:
+                break
+
+        if not found:
+            return _error(
+                "InvalidSecurityGroupRuleId.NotFound",
+                f"The security group rule '{rule_id}' does not exist",
+                400,
+            )
+
+    return _xml(200, "ModifySecurityGroupRulesResponse", "<return>true</return>")
 
 
 # ---------------------------------------------------------------------------
@@ -5634,6 +5921,7 @@ _ACTION_MAP = {
     "DescribeVpcClassicLinkDnsSupport": _describe_vpc_classic_link_dns_support,
     "DescribeAddressesAttribute": _describe_addresses_attribute,
     "DescribeSecurityGroupRules": _describe_security_group_rules,
+    "ModifySecurityGroupRules": _modify_security_group_rules,
     "ModifySubnetAttribute": _modify_subnet_attribute,
     "CreateRouteTable": _create_route_table,
     "DeleteRouteTable": _delete_route_table,

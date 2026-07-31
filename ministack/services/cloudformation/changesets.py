@@ -2,12 +2,11 @@
 CloudFormation change set handlers — Create, Describe, Execute, Delete, List change sets.
 """
 
-import asyncio
 import copy
 import json
 import logging
 
-from ministack.core.responses import get_account_id, new_uuid, now_iso
+from ministack.core.responses import get_account_id, get_region, new_uuid, now_iso
 
 from .engine import (
     _NO_VALUE,
@@ -18,8 +17,14 @@ from .engine import (
     _resolve_refs,
 )
 from .helpers import CFN_NS, _error, _esc, _extract_members, _p, _resolve_template, _xml
-from .provisioners import REGION
-from .stacks import _add_event, _deploy_stack_async, _diff_resources
+from .stacks import (
+    _add_event,
+    _create_stack_task_in_region,
+    _deploy_stack_async,
+    _diff_resources,
+    _stack_region,
+    _stack_region_context,
+)
 
 logger = logging.getLogger("cloudformation")
 
@@ -100,7 +105,7 @@ def _create_change_set(params):
 
         # Create a placeholder stack in REVIEW_IN_PROGRESS
         stack_id = (
-            f"arn:aws:cloudformation:{REGION}:{get_account_id()}:"
+            f"arn:aws:cloudformation:{get_region()}:{get_account_id()}:"
             f"stack/{stack_name}/{new_uuid()}"
         )
         stack = {
@@ -115,6 +120,7 @@ def _create_change_set(params):
             "Tags": tags,
             "Outputs": [],
             "DisableRollback": False,
+            "_region": get_region(),
             "_resources": {},
             "_template": {},
             "_template_body": "",
@@ -152,12 +158,13 @@ def _create_change_set(params):
     # detected instead of compared as identical raw nodes (#897).
     old_template = stack.get("_template", {}) if cs_type == "UPDATE" else {}
     old_params = stack.get("_resolved_params", {}) if cs_type == "UPDATE" else {}
-    old_resolved = _resolve_props_for_diff(old_template, old_params, stack_name, stack_id)
-    new_resolved = _resolve_props_for_diff(template, param_values, stack_name, stack_id)
+    with _stack_region_context(stack, stack_id):
+        old_resolved = _resolve_props_for_diff(old_template, old_params, stack_name, stack_id)
+        new_resolved = _resolve_props_for_diff(template, param_values, stack_name, stack_id)
     changes = _diff_resources(old_resolved, new_resolved)
 
     cs_id = (
-        f"arn:aws:cloudformation:{REGION}:{get_account_id()}:"
+        f"arn:aws:cloudformation:{_stack_region(stack, stack_id)}:{get_account_id()}:"
         f"changeSet/{cs_name}/{new_uuid()}"
     )
 
@@ -300,18 +307,21 @@ def _execute_change_set(params):
         {"ParameterKey": k, "ParameterValue": v["Value"], "NoEcho": v["NoEcho"]}
         for k, v in param_values.items()
     ]
-    stack["_conditions"] = _evaluate_conditions(template, param_values)
+    with _stack_region_context(stack, stack_id):
+        stack["_conditions"] = _evaluate_conditions(template, param_values)
 
-    _add_event(stack_id, real_stack_name, real_stack_name,
-               "AWS::CloudFormation::Stack", f"{status_prefix}_IN_PROGRESS",
-               physical_id=stack_id)
+        _add_event(stack_id, real_stack_name, real_stack_name,
+                   "AWS::CloudFormation::Stack", f"{status_prefix}_IN_PROGRESS",
+                   physical_id=stack_id)
 
-    asyncio.get_event_loop().create_task(
-        _deploy_stack_async(real_stack_name, stack_id, template,
-                            param_values, False, tags,
-                            is_update=is_update,
-                            previous_stack=previous_stack)
-    )
+        _create_stack_task_in_region(
+            _deploy_stack_async(real_stack_name, stack_id, template,
+                                param_values, False, tags,
+                                is_update=is_update,
+                                previous_stack=previous_stack),
+            stack,
+            stack_id,
+        )
 
     cs["ExecutionStatus"] = "EXECUTE_COMPLETE"
     cs["Status"] = "EXECUTE_COMPLETE"
@@ -366,4 +376,3 @@ def _list_change_sets(params):
 
 
 # --- GetTemplateSummary ---
-

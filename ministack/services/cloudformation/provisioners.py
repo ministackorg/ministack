@@ -3301,6 +3301,7 @@ def _ec2_vpc_endpoint_attributes(endpoint):
 
 
 def _ec2_vpc_endpoint_create(logical_id, props, stack_name):
+    _ec2._ensure_defaults_initialized()
     endpoint_id = "vpce-" + "".join(random.choices(string.hexdigits[:16], k=17))
     endpoint = {
         "VpcEndpointId": endpoint_id,
@@ -3329,6 +3330,7 @@ def _ec2_vpc_endpoint_create(logical_id, props, stack_name):
 
 
 def _ec2_vpc_endpoint_update(physical_id, old_props, new_props, stack_name):
+    _ec2._ensure_defaults_initialized()
     endpoint = _ec2._vpc_endpoints.get(physical_id)
     if not endpoint:
         return _ec2_vpc_endpoint_create(physical_id, new_props, stack_name)
@@ -3384,6 +3386,7 @@ def _ec2_subnet_delete(physical_id, props):
 
 
 def _ec2_sg_create(logical_id, props, stack_name):
+    _ec2._ensure_defaults_initialized()
     name = props.get("GroupName", f"{stack_name}-{logical_id}")
     desc = props.get("GroupDescription", name)
     vpc_id = props.get("VpcId", _ec2._DEFAULT_VPC_ID)
@@ -3460,6 +3463,7 @@ def _ec2_vpc_gw_attach_delete(physical_id, props):
 
 
 def _ec2_rtb_create(logical_id, props, stack_name):
+    _ec2._ensure_defaults_initialized()
     import random
     import string
     vpc_id = props.get("VpcId", _ec2._DEFAULT_VPC_ID)
