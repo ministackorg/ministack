@@ -30,6 +30,7 @@ SERVICE_STATE_FORMAT_VERSIONS = {
     "appsync": 3,
     "appsync_events": 3,
     "autoscaling": 3,
+    "backup": 3,
     "bedrock_agentcore": 3,
     "lambda_microvms": 3,
     "acm": 3,
