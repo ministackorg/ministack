@@ -76,6 +76,62 @@ def test_iam_get_role(iam):
     resp = iam.get_role(RoleName="iam-test-role")
     assert resp["Role"]["RoleName"] == "iam-test-role"
 
+
+def test_iam_update_role_description(iam):
+    name = f"description-role-{_uuid_mod.uuid4().hex[:8]}"
+    iam.create_role(
+        RoleName=name,
+        AssumeRolePolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": []}),
+    )
+    updated = iam.update_role_description(RoleName=name, Description="updated description")["Role"]
+    assert updated["Description"] == "updated description"
+    assert iam.get_role(RoleName=name)["Role"]["Description"] == "updated description"
+    iam.delete_role(RoleName=name)
+
+
+def test_iam_role_permissions_boundary_roundtrip(iam):
+    name = f"boundary-role-{_uuid_mod.uuid4().hex[:8]}"
+    original_boundary = "arn:aws:iam::000000000000:policy/original-boundary"
+    replacement_boundary = "arn:aws:iam::000000000000:policy/replacement-boundary"
+    assume = json.dumps({"Version": "2012-10-17", "Statement": []})
+
+    created = iam.create_role(
+        RoleName=name,
+        AssumeRolePolicyDocument=assume,
+        PermissionsBoundary=original_boundary,
+    )["Role"]
+    assert created["PermissionsBoundary"] == {
+        "PermissionsBoundaryType": "Policy",
+        "PermissionsBoundaryArn": original_boundary,
+    }
+    assert iam.get_role(RoleName=name)["Role"]["PermissionsBoundary"]["PermissionsBoundaryArn"] == original_boundary
+
+    iam.put_role_permissions_boundary(RoleName=name, PermissionsBoundary=replacement_boundary)
+    assert iam.get_role(RoleName=name)["Role"]["PermissionsBoundary"] == {
+        "PermissionsBoundaryType": "Policy",
+        "PermissionsBoundaryArn": replacement_boundary,
+    }
+
+    iam.delete_role_permissions_boundary(RoleName=name)
+    assert "PermissionsBoundary" not in iam.get_role(RoleName=name)["Role"]
+    # AWS treats deletion as idempotent when the role exists without a boundary.
+    iam.delete_role_permissions_boundary(RoleName=name)
+    iam.delete_role(RoleName=name)
+
+
+@pytest.mark.parametrize("operation", ["put", "delete"])
+def test_iam_role_permissions_boundary_missing_role(iam, operation):
+    name = f"missing-boundary-role-{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        if operation == "put":
+            iam.put_role_permissions_boundary(
+                RoleName=name,
+                PermissionsBoundary="arn:aws:iam::000000000000:policy/boundary",
+            )
+        else:
+            iam.delete_role_permissions_boundary(RoleName=name)
+    assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
+
 def test_iam_list_roles(iam):
     resp = iam.list_roles()
     names = [r["RoleName"] for r in resp["Roles"]]
@@ -237,7 +293,7 @@ def test_iam_update_access_key(iam):
 
 def test_iam_update_access_key_not_found(iam):
     with pytest.raises(ClientError) as exc:
-        iam.update_access_key(AccessKeyId="AKIAIOSFODNN7EXAMPLE", Status="Inactive")
+        iam.update_access_key(AccessKeyId="test-key-do-not-use", Status="Inactive")
     assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
 
 
@@ -274,7 +330,7 @@ def test_iam_get_access_key_last_used(iam):
 
 def test_iam_get_access_key_last_used_not_found(iam):
     with pytest.raises(ClientError) as exc:
-        iam.get_access_key_last_used(AccessKeyId="AKIAIOSFODNN7EXAMPLE")
+        iam.get_access_key_last_used(AccessKeyId="test-key-do-not-use")
     assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
 
 

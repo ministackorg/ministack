@@ -336,6 +336,37 @@ def test_tagging_get_resources_glue(tagging, glue):
     assert db_arn in arns
 
 
+def test_tagging_get_resources_glue_is_region_scoped():
+    east_glue = _regional_client("glue", "us-east-1")
+    east_tagging = _regional_client("resourcegroupstaggingapi", "us-east-1")
+    west_tagging = _regional_client("resourcegroupstaggingapi", "us-west-2")
+    db_name = "tg-glue-regional"
+    db_arn = f"arn:aws:glue:us-east-1:000000000000:database/{db_name}"
+
+    east_glue.create_database(DatabaseInput={"Name": db_name})
+    try:
+        east_glue.tag_resource(
+            ResourceArn=db_arn,
+            TagsToAdd={_TAG_KEY: "glue-east-region"},
+        )
+        east_arns = [
+            resource["ResourceARN"]
+            for resource in east_tagging.get_resources(
+                TagFilters=[{"Key": _TAG_KEY, "Values": ["glue-east-region"]}]
+            )["ResourceTagMappingList"]
+        ]
+        west_arns = [
+            resource["ResourceARN"]
+            for resource in west_tagging.get_resources(
+                TagFilters=[{"Key": _TAG_KEY, "Values": ["glue-east-region"]}]
+            )["ResourceTagMappingList"]
+        ]
+        assert db_arn in east_arns
+        assert db_arn not in west_arns
+    finally:
+        east_glue.delete_database(Name=db_name)
+
+
 def test_tagging_get_resources_cognito_idp(tagging, cognito_idp):
     pool_id = cognito_idp.create_user_pool(PoolName="tg-cognito-pool")["UserPool"]["Id"]
     pool_arn = cognito_idp.describe_user_pool(UserPoolId=pool_id)["UserPool"]["Arn"]

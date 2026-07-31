@@ -150,6 +150,12 @@ def _collect_ecs():
 def _collect_glue():
     import ministack.services.glue as svc
     for arn, tags in svc._tags.items():
+        try:
+            spec = parse_arn(arn)
+        except ArnParseError:
+            continue
+        if spec.region != get_region():
+            continue
         yield arn, _normalise_flat(tags)
 
 

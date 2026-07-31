@@ -701,6 +701,96 @@ def test_sfn_aws_sdk_secretsmanager_create_and_get(sfn, sfn_sync, sm):
     sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
 
 
+def test_sfn_aws_sdk_query_services_accept_string_parameters(sfn_sync, sns, sqs, cw):
+    """aws-sdk integrations for Query-protocol services dispatch succesfully."""
+    import uuid as _uuid
+
+    suffix = _uuid.uuid4().hex[:8]
+    topic_arn = sns.create_topic(Name=f"sfn-sdk-query-{suffix}")["TopicArn"]
+    queue_url = sqs.create_queue(QueueName=f"sfn-sdk-query-{suffix}")["QueueUrl"]
+
+    definition = json.dumps({
+        "StartAt": "GetCallerIdentity",
+        "States": {
+            "GetCallerIdentity": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:sts:getCallerIdentity",
+                # AWS requires Parameters on every aws-sdk Task, even empty.
+                "Parameters": {},
+                "ResultPath": "$.caller",
+                "Next": "Publish",
+            },
+            "Publish": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:sns:publish",
+                "Parameters": {"TopicArn": topic_arn, "Message": "hello from sfn"},
+                "ResultPath": "$.publish",
+                "Next": "SendMessage",
+            },
+            "SendMessage": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:sqs:sendMessage",
+                "Parameters": {"QueueUrl": queue_url, "MessageBody": "hello from sfn"},
+                "ResultPath": "$.send",
+                "Next": "GetQueueAttributes",
+            },
+            "GetQueueAttributes": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:sqs:getQueueAttributes",
+                "Parameters": {"QueueUrl": queue_url, "AttributeNames": ["All"]},
+                "ResultPath": "$.attributes",
+                "Next": "ListRoles",
+            },
+            "ListRoles": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:iam:listRoles",
+                "Parameters": {},
+                "ResultPath": "$.roles",
+                "Next": "PutMetricData",
+            },
+            "PutMetricData": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:cloudwatch:putMetricData",
+                "Parameters": {
+                    "Namespace": f"sfn-sdk-query-{suffix}",
+                    "MetricData": [{"MetricName": "calls", "Value": 1}],
+                },
+                "ResultPath": "$.metric",
+                "End": True,
+            },
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=f"sfn-sdk-query-{suffix}",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+    assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+
+    output = json.loads(resp["output"])
+    assert output["caller"]["Account"] == "000000000000"
+    assert output["publish"]["MessageId"]
+    assert output["send"]["MessageId"]
+    # Repeated result elements unwrap to a list; it must not break the dispatcher.
+    # Repeated <Attribute> elements become the SDK's Attributes map, as in AWS.
+    assert isinstance(output["attributes"]["Attributes"], dict)
+    assert output["attributes"]["Attributes"]["QueueArn"].endswith(f"sfn-sdk-query-{suffix}")
+    # Collections are JSON arrays and IsTruncated a bool, as the SDK returns them,
+    # so an ASL definition can index or iterate the result.
+    assert isinstance(output["roles"]["Roles"], list)
+    assert output["roles"]["IsTruncated"] is False
+    assert "metric" in output
+    # The call reached the service, not just the adapter.
+    metrics = cw.list_metrics(Namespace=f"sfn-sdk-query-{suffix}")["Metrics"]
+    assert [m["MetricName"] for m in metrics] == ["calls"]
+
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+    sqs.delete_queue(QueueUrl=queue_url)
+    sns.delete_topic(TopicArn=topic_arn)
+
+
 def test_sfn_jsonata_arguments_output_and_catch_output(sfn, sfn_sync, sm):
     """JSONata Task states evaluate Arguments and Output for aws-sdk integrations."""
     import uuid as _uuid
@@ -1653,6 +1743,155 @@ def test_sfn_aws_sdk_ec2_security_group_duplicate_error(sfn_sync, ec2):
             ec2.delete_security_group(GroupId=group["GroupId"])
         if sm_arn:
             sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_aws_sdk_ec2_list_params_reach_the_service(sfn_sync, ec2):
+    """EC2 numbers list parameters in the singular: VolumeIds must arrive as VolumeId.N."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    az = ec2.describe_availability_zones()["AvailabilityZones"][0]["ZoneName"]
+    wanted = ec2.create_volume(AvailabilityZone=az, Size=1, VolumeType="gp3")["VolumeId"]
+    other = ec2.create_volume(AvailabilityZone=az, Size=1, VolumeType="gp3")["VolumeId"]
+    sm_arn = None
+    try:
+        definition = json.dumps({
+            "StartAt": "DescribeVolumes",
+            "States": {"DescribeVolumes": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:ec2:describeVolumes",
+                "Parameters": {"VolumeIds": [wanted]},
+                "End": True,
+            }},
+        })
+        sm_arn = sfn_sync.create_state_machine(
+            name=f"sdk-ec2-list-{suffix}", definition=definition,
+            roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        )["stateMachineArn"]
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+        assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+        output = resp["output"]
+        assert wanted in output
+        assert other not in output
+    finally:
+        if sm_arn:
+            sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+        for volume_id in (wanted, other):
+            ec2.delete_volume(VolumeId=volume_id)
+
+
+def test_sfn_aws_sdk_ec2_list_names_match_the_botocore_model():
+    """Every EC2 list parameter flattens to the name botocore puts on the wire."""
+    from botocore.loaders import Loader
+    from botocore.model import ServiceModel
+
+    from ministack.services.ec2 import _ACTION_MAP
+    from ministack.services.stepfunctions import _ec2_query_list_name
+
+    model = ServiceModel(Loader().load_service_model("ec2", "service-2"))
+
+    def wire_name(shape, member_name):
+        """botocore's EC2Serializer._get_serialized_name."""
+        serialization = shape.serialization
+        if "queryName" in serialization:
+            return serialization["queryName"]
+        if "name" in serialization:
+            name = serialization["name"]
+            return name[0].upper() + name[1:]
+        return member_name
+
+    def walk(shape, action, parent, seen, checked, wrong):
+        if (shape.name, parent) in seen:
+            return
+        seen.add((shape.name, parent))
+        for name, member in getattr(shape, "members", {}).items():
+            if member.type_name == "list":
+                checked.append(name)
+                expected = wire_name(member, name)
+                got = _ec2_query_list_name(name, action, parent)
+                if got != expected:
+                    wrong.append(f"{action}: {parent or '<top>'}.{name} -> {got}, want {expected}")
+                walk(member.member, action, name, seen, checked, wrong)
+            elif member.type_name == "structure":
+                walk(member, action, parent, seen, checked, wrong)
+
+    checked, wrong = [], []
+    for action in sorted(set(_ACTION_MAP) & set(model.operation_names)):
+        shape = model.operation_model(action).input_shape
+        if shape is not None:
+            walk(shape, action, "", set(), checked, wrong)
+
+    assert not wrong, "\n".join(wrong)
+    # Guard against the walk silently covering nothing after a model change.
+    assert len(checked) > 300
+
+
+def test_sfn_aws_sdk_ec2_plural_list_params_reach_the_service(sfn_sync, ec2):
+    """EC2 keeps some list parameters plural: IpPermissions must stay IpPermissions.N."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    group_name = f"sdk-ec2-perms-{suffix}"
+    group_id = ec2.create_security_group(
+        GroupName=group_name, Description="list param check", VpcId="vpc-00000001"
+    )["GroupId"]
+    sm_arn = None
+    try:
+        definition = json.dumps({
+            "StartAt": "Authorize",
+            "States": {"Authorize": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:ec2:authorizeSecurityGroupIngress",
+                "Parameters": {"GroupId": group_id, "IpPermissions": [{
+                    "IpProtocol": "tcp", "FromPort": 443, "ToPort": 443,
+                    # Nested lists stay plural too: IpPermissions.1.IpRanges.1.CidrIp
+                    "IpRanges": [{"CidrIp": "10.0.0.0/8"}],
+                }]},
+                "End": True,
+            }},
+        })
+        sm_arn = sfn_sync.create_state_machine(
+            name=f"sdk-ec2-perms-{suffix}", definition=definition,
+            roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        )["stateMachineArn"]
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+        assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+
+        rules = ec2.describe_security_groups(GroupIds=[group_id])["SecurityGroups"][0]["IpPermissions"]
+        assert [r["FromPort"] for r in rules] == [443], f"rule not applied: {rules}"
+        assert rules[0]["IpRanges"] == [{"CidrIp": "10.0.0.0/8"}]
+    finally:
+        if sm_arn:
+            sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+        ec2.delete_security_group(GroupId=group_id)
+
+
+def test_sfn_aws_sdk_ec2_irregular_list_params_reach_the_service(sfn_sync, ec2):
+    """EC2 renames some list parameters: Resources arrives as ResourceId.N."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    az = ec2.describe_availability_zones()["AvailabilityZones"][0]["ZoneName"]
+    volume_id = ec2.create_volume(AvailabilityZone=az, Size=1, VolumeType="gp3")["VolumeId"]
+    sm_arn = None
+    try:
+        definition = json.dumps({
+            "StartAt": "CreateTags",
+            "States": {"CreateTags": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:ec2:createTags",
+                "Parameters": {"Resources": [volume_id],
+                               "Tags": [{"Key": "checked-by", "Value": suffix}]},
+                "End": True,
+            }},
+        })
+        sm_arn = sfn_sync.create_state_machine(
+            name=f"sdk-ec2-tags-{suffix}", definition=definition,
+            roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        )["stateMachineArn"]
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+        assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+
+        tags = ec2.describe_volumes(VolumeIds=[volume_id])["Volumes"][0].get("Tags", [])
+        assert {"Key": "checked-by", "Value": suffix} in tags, f"tag not applied: {tags}"
+    finally:
+        if sm_arn:
+            sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+        ec2.delete_volume(VolumeId=volume_id)
 
 
 def test_sfn_aws_sdk_rds_create_and_describe_instance(sfn, sfn_sync):
