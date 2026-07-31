@@ -6,6 +6,7 @@ STS actions are in sts.py.
 IAM actions:
   CreateUser, GetUser, ListUsers, DeleteUser,
   CreateRole, GetRole, ListRoles, DeleteRole,
+  UpdateRoleDescription, PutRolePermissionsBoundary, DeleteRolePermissionsBoundary,
   CreatePolicy, GetPolicy, GetPolicyVersion, ListPolicyVersions, ListPolicies, DeletePolicy,
   CreatePolicyVersion, DeletePolicyVersion,
   AttachRolePolicy, DetachRolePolicy, ListAttachedRolePolicies,
@@ -471,6 +472,7 @@ def _create_role(p):
         "AssumeRolePolicyDocument": _p(p, "AssumeRolePolicyDocument"),
         "Description": _p(p, "Description"),
         "MaxSessionDuration": int(_p(p, "MaxSessionDuration") or 3600),
+        "PermissionsBoundary": _p(p, "PermissionsBoundary"),
         "AttachedPolicies": [],
         "InlinePolicies": {},
         "Tags": _extract_tags(p),
@@ -542,6 +544,38 @@ def _update_assume_role_policy(p):
                       f"Role {name} not found.", ns="iam")
     _roles[name]["AssumeRolePolicyDocument"] = _p(p, "PolicyDocument")
     return _xml(200, "UpdateAssumeRolePolicyResponse", "", ns="iam")
+
+
+def _update_role_description(p):
+    name = _p(p, "RoleName")
+    role = _roles.get(name)
+    if not role:
+        return _error(404, "NoSuchEntity",
+                      f"Role {name} not found.", ns="iam")
+    role["Description"] = _p(p, "Description")
+    return _xml(200, "UpdateRoleDescriptionResponse",
+                f"<UpdateRoleDescriptionResult><Role>{_role_xml(name)}</Role></UpdateRoleDescriptionResult>",
+                ns="iam")
+
+
+def _put_role_permissions_boundary(p):
+    name = _p(p, "RoleName")
+    role = _roles.get(name)
+    if not role:
+        return _error(404, "NoSuchEntity",
+                      f"Role {name} not found.", ns="iam")
+    role["PermissionsBoundary"] = _p(p, "PermissionsBoundary")
+    return _xml(200, "PutRolePermissionsBoundaryResponse", "", ns="iam")
+
+
+def _delete_role_permissions_boundary(p):
+    name = _p(p, "RoleName")
+    role = _roles.get(name)
+    if not role:
+        return _error(404, "NoSuchEntity",
+                      f"Role {name} not found.", ns="iam")
+    role["PermissionsBoundary"] = None
+    return _xml(200, "DeleteRolePermissionsBoundaryResponse", "", ns="iam")
 
 
 # -------------------- Managed policy management --------------------
@@ -2712,6 +2746,14 @@ def _role_xml(name):
             for t in r["Tags"]
         )
         tags_xml = f"<Tags>{tag_members}</Tags>"
+    boundary_xml = ""
+    if r.get("PermissionsBoundary"):
+        boundary_xml = (
+            "<PermissionsBoundary>"
+            "<PermissionsBoundaryType>Policy</PermissionsBoundaryType>"
+            f"<PermissionsBoundaryArn>{r['PermissionsBoundary']}</PermissionsBoundaryArn>"
+            "</PermissionsBoundary>"
+        )
     return (f"<RoleName>{r['RoleName']}</RoleName>"
             f"<RoleId>{r['RoleId']}</RoleId>"
             f"<Arn>{r['Arn']}</Arn>"
@@ -2720,6 +2762,7 @@ def _role_xml(name):
             f"<AssumeRolePolicyDocument>{assume_doc}</AssumeRolePolicyDocument>"
             f"<Description>{desc}</Description>"
             f"<MaxSessionDuration>{max_dur}</MaxSessionDuration>"
+            f"{boundary_xml}"
             f"{tags_xml}")
 
 
@@ -2865,6 +2908,9 @@ _IAM_HANDLERS = {
     "UntagInstanceProfile": _untag_instance_profile,
     "ListInstanceProfileTags": _list_instance_profile_tags,
     "UpdateAssumeRolePolicy": _update_assume_role_policy,
+    "UpdateRoleDescription": _update_role_description,
+    "PutRolePermissionsBoundary": _put_role_permissions_boundary,
+    "DeleteRolePermissionsBoundary": _delete_role_permissions_boundary,
     "TagRole": _tag_role,
     "UntagRole": _untag_role,
     "ListRoleTags": _list_role_tags,
