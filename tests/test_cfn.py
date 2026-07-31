@@ -1736,6 +1736,65 @@ def test_cfn_wait_condition(cfn):
     cfn.delete_stack(StackName="cfn-wait")
     _wait_stack(cfn, "cfn-wait")
 
+
+@pytest.mark.parametrize(
+    ("scope", "arn_region", "arn_segment"),
+    [
+        ("REGIONAL", "us-east-1", "regional"),
+        ("CLOUDFRONT", "us-east-1", "global"),
+    ],
+)
+def test_cfn_wafv2_web_acl_uses_canonical_arn(
+    cfn, wafv2, scope, arn_region, arn_segment
+):
+    scope_name = scope.lower()
+    stack_name = f"cfn-wafv2-{scope_name}"
+    acl_name = f"cfn-wafv2-{scope_name}-acl"
+    template = {
+        "Resources": {
+            "Acl": {
+                "Type": "AWS::WAFv2::WebACL",
+                "Properties": {
+                    "Name": acl_name,
+                    "Scope": scope,
+                    "DefaultAction": {"Allow": {}},
+                    "VisibilityConfig": {
+                        "SampledRequestsEnabled": False,
+                        "CloudWatchMetricsEnabled": False,
+                        "MetricName": acl_name,
+                    },
+                    "Tags": [{"Key": "from", "Value": "cfn"}],
+                },
+            },
+        },
+        "Outputs": {
+            "AclId": {"Value": {"Ref": "Acl"}},
+            "AclArn": {"Value": {"Fn::GetAtt": ["Acl", "Arn"]}},
+        },
+    }
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+
+        assert outputs["AclArn"] == (
+            f"arn:aws:wafv2:{arn_region}:000000000000:"
+            f"{arn_segment}/webacl/{acl_name}/{outputs['AclId']}"
+        )
+        acls = wafv2.list_web_acls(Scope=scope)["WebACLs"]
+        assert outputs["AclArn"] in {acl["ARN"] for acl in acls}
+        tags = wafv2.list_tags_for_resource(ResourceARN=outputs["AclArn"])
+        assert tags["TagInfoForResource"]["TagList"] == [
+            {"Key": "from", "Value": "cfn"}
+        ]
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+
+    acls = wafv2.list_web_acls(Scope=scope)["WebACLs"]
+    assert acl_name not in {acl["Name"] for acl in acls}
+
 def test_cfn_secretsmanager_generate_secret_string(cfn, sm):
     """CFN stack with SecretsManager::Secret + GenerateSecretString produces valid JSON secret."""
     template = {

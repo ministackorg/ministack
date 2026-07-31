@@ -3659,6 +3659,116 @@ def test_ec2_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path)
     assert persistence.load_state("ec2") is None
 
 
+def test_waf_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject WAF's regional schema instead of accepting
+    account-only stores that would collapse REGIONAL and CLOUDFRONT scopes."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    web_acls = AccountRegionScopedDict()
+    web_acls.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-acl",
+        {
+            "ARN": (
+                "arn:aws:wafv2:us-west-2:000000000000:"
+                "regional/webacl/regional-acl/regional-acl"
+            ),
+            "Id": "regional-acl",
+            "Name": "regional-acl",
+            "Scope": "REGIONAL",
+        },
+    )
+    persistence.save_state("waf", {"_web_acls": web_acls})
+
+    raw = _json.loads((tmp_path / "waf.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_web_acls = persistence.load_state("waf")["_web_acls"]
+    assert loaded_web_acls.get_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-acl",
+    )["Name"] == "regional-acl"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("waf") is None
+
+
+def test_waf_region_scoped_v3_state_round_trips_idempotently(monkeypatch, tmp_path):
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    web_acls = AccountRegionScopedDict()
+    web_acls.set_scoped(
+        "000000000000",
+        "us-east-1",
+        "global-acl",
+        {
+            "ARN": (
+                "arn:aws:wafv2:us-east-1:000000000000:"
+                "global/webacl/global-acl/global-acl"
+            ),
+            "Id": "global-acl",
+            "Name": "global-acl",
+            "Scope": "CLOUDFRONT",
+        },
+    )
+    associations = AccountRegionScopedDict()
+    associations.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "arn:aws:elasticloadbalancing:us-west-2:000000000000:loadbalancer/app/app/id",
+        (
+            "arn:aws:wafv2:us-east-1:000000000000:"
+            "global/webacl/global-acl/global-acl"
+        ),
+    )
+    tags = AccountScopedDict()
+    tags.set_scoped(
+        "000000000000",
+        "us-west-2",
+        (
+            "arn:aws:wafv2:us-east-1:000000000000:"
+            "global/webacl/global-acl/global-acl"
+        ),
+        [{"Key": "scope", "Value": "global"}],
+    )
+
+    persistence.save_state(
+        "waf",
+        {
+            "_web_acls": web_acls,
+            "_associations": associations,
+            "_waf_tags": tags,
+        },
+    )
+    first_snapshot = _json.loads((tmp_path / "waf.json").read_text())
+    loaded = persistence.load_state("waf")
+    assert loaded["_web_acls"].get_scoped(
+        "000000000000",
+        "us-east-1",
+        "global-acl",
+    )["Scope"] == "CLOUDFRONT"
+    assert loaded["_associations"].get_scoped(
+        "000000000000",
+        "us-west-2",
+        "arn:aws:elasticloadbalancing:us-west-2:000000000000:loadbalancer/app/app/id",
+    ).endswith("global/webacl/global-acl/global-acl")
+
+    persistence.save_state("waf", loaded)
+    second_snapshot = _json.loads((tmp_path / "waf.json").read_text())
+    assert second_snapshot == first_snapshot
+
+
 def test_ec2_legacy_state_restores_to_boot_region_without_arn_mining():
     """Legacy EC2 state is one coherent graph even when records embed foreign ARNs."""
     from ministack.core.responses import (

@@ -96,32 +96,96 @@ _JWKS_KEY: dict = {}
 # key to STATE_DIR so all processes share the same key.
 _STATE_DIR = os.environ.get("STATE_DIR", "/tmp/ministack-state")
 _RSA_KEY_PATH = os.path.join(_STATE_DIR, "cognito-rsa-key.pem")
+_RSA_KEY_LOCK_PATH = f"{_RSA_KEY_PATH}.lock"
 
 try:
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
 
-    _rsa_key = None
-    if os.path.exists(_RSA_KEY_PATH):
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+
+    def _load_rsa_key_from_disk():
         try:
             with open(_RSA_KEY_PATH, "rb") as _f:
-                _rsa_key = serialization.load_pem_private_key(_f.read(), password=None)
+                return serialization.load_pem_private_key(_f.read(), password=None)
         except Exception:
-            _rsa_key = None
-    if _rsa_key is None:
-        _rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            return None
+
+    def _open_rsa_key_lock_file():
+        while True:
+            try:
+                return open(_RSA_KEY_LOCK_PATH, "a")
+            except IsADirectoryError:
+                # Recover lock directories left by earlier MiniStack versions.
+                # rmdir only removes a directory, so a concurrent process that
+                # already converted the path to the new lock file cannot have
+                # its live lock stolen here.
+                try:
+                    os.rmdir(_RSA_KEY_LOCK_PATH)
+                except (FileNotFoundError, NotADirectoryError):
+                    continue
+                continue
+
+    def _persist_or_load_rsa_key(_key):
+        os.makedirs(_STATE_DIR, exist_ok=True)
+        _pem = _key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        _tmp_path = f"{_RSA_KEY_PATH}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
         try:
-            os.makedirs(_STATE_DIR, exist_ok=True)
-            _pem = _rsa_key.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.PKCS8,
-                encryption_algorithm=serialization.NoEncryption(),
-            )
-            with open(_RSA_KEY_PATH, "wb") as _f:
+            # A file lock gives process-safe creation/repair without relying
+            # on hard links, and the OS releases it if a process exits mid-repair.
+            if fcntl is not None:
+                with _open_rsa_key_lock_file() as _lock_file:
+                    fcntl.flock(_lock_file.fileno(), fcntl.LOCK_EX)
+                    # Another process may have generated or repaired the shared
+                    # key first. Reload that winner so pytest workers and the
+                    # server expose the same JWKS.
+                    _disk_key = _load_rsa_key_from_disk()
+                    if _disk_key is not None:
+                        return _disk_key
+                    with open(_tmp_path, "xb") as _f:
+                        _f.write(_pem)
+                        _f.flush()
+                        os.fsync(_f.fileno())
+                    os.replace(_tmp_path, _RSA_KEY_PATH)
+                    _tmp_path = None
+                    return _key
+            # Platforms without fcntl still get a stable signing key in-process
+            # and best-effort atomic persistence across restarts.
+            _disk_key = _load_rsa_key_from_disk()
+            if _disk_key is not None:
+                return _disk_key
+            with open(_tmp_path, "xb") as _f:
                 _f.write(_pem)
+                _f.flush()
+                os.fsync(_f.fileno())
+            os.replace(_tmp_path, _RSA_KEY_PATH)
+            _tmp_path = None
+            return _key
+        finally:
+            if _tmp_path is not None:
+                try:
+                    os.unlink(_tmp_path)
+                except FileNotFoundError:
+                    pass
+
+    def _persist_or_load_rsa_key_best_effort(_key):
+        try:
+            return _persist_or_load_rsa_key(_key)
         except Exception:
             # Persistence is best-effort — if it fails, fall back to in-memory key.
-            pass
+            return _key
+
+    _rsa_key = _load_rsa_key_from_disk() if os.path.exists(_RSA_KEY_PATH) else None
+    if _rsa_key is None:
+        _rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        _rsa_key = _persist_or_load_rsa_key_best_effort(_rsa_key)
     _RSA_PRIVATE_KEY = _rsa_key
 
     _pub = _rsa_key.public_key()
