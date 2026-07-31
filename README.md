@@ -140,13 +140,13 @@ MiniStack supports lightweight multi-tenancy without any configuration. If the `
 ```bash
 # Team A — gets account 111111111111
 export AWS_ACCESS_KEY_ID=111111111111
-export AWS_SECRET_ACCESS_KEY=anything
+export AWS_SECRET_ACCESS_KEY=test
 aws --endpoint-url=http://localhost:4566 sts get-caller-identity
 # → { "Account": "111111111111", ... }
 
 # Team B — gets account 222222222222
 export AWS_ACCESS_KEY_ID=222222222222
-export AWS_SECRET_ACCESS_KEY=anything
+export AWS_SECRET_ACCESS_KEY=test
 aws --endpoint-url=http://localhost:4566 sts get-caller-identity
 # → { "Account": "222222222222", ... }
 ```

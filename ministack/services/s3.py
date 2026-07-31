@@ -27,6 +27,7 @@ import contextvars
 import copy
 import datetime as _dt
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -748,10 +749,121 @@ def _object_response_headers(obj: dict, bucket_name: str = "", key: str = "",
 # ---------------------------------------------------------------------------
 
 
+_SIGV4_UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD"
+
+
+def _uri_encode(value: str, encode_slash: bool = True) -> str:
+    """RFC3986 encoding per the SigV4 spec: unreserved chars (A-Za-z0-9-_.~)
+    stay literal, everything else is percent-encoded. ``/`` is preserved in
+    the canonical URI (path separators) and encoded everywhere else."""
+    safe = "-_.~" + ("" if encode_slash else "/")
+    return url_quote(value, safe=safe)
+
+
+def _sigv4_signing_key(secret: str, date_stamp: str, region: str, service: str) -> bytes:
+    def _h(key, msg):
+        return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+    k_date = _h(("AWS4" + secret).encode("utf-8"), date_stamp)
+    k_region = _h(k_date, region)
+    k_service = _h(k_region, service)
+    return _h(k_service, "aws4_request")
+
+
+def _verify_presigned_sigv4(method, path, headers, query_params):
+    """Verify a SigV4 presigned S3 URL. Returns an error tuple for a bad
+    signature, or None when the request is not a SigV4 presigned URL (header-
+    signed and anonymous requests are handled elsewhere / left lax).
+
+    MiniStack has no IAM secret store, so it verifies against its own secret
+    (``AWS_SECRET_ACCESS_KEY``, default ``test``) — the same credential the
+    server and its Lambda runtimes use. A URL signed with any other secret, or
+    one whose signed headers (content-type, content-length, ...) were tampered
+    with after signing, does not recompute to the same signature and is
+    rejected with 403 SignatureDoesNotMatch, matching real S3.
+    """
+    signature = (_qp(query_params, "X-Amz-Signature", "")
+                 or _qp(query_params, "x-amz-signature", ""))
+    if not signature:
+        return None  # not a presigned URL
+    algorithm = (_qp(query_params, "X-Amz-Algorithm", "")
+                 or _qp(query_params, "x-amz-algorithm", ""))
+    if algorithm != "AWS4-HMAC-SHA256":
+        return None  # only SigV4 presigned URLs are verified
+
+    def _bad_signature():
+        return _error(
+            "SignatureDoesNotMatch",
+            "The request signature we calculated does not match the signature "
+            "you provided. Check your key and signing method.",
+            403, path,
+        )
+
+    credential = (_qp(query_params, "X-Amz-Credential", "")
+                  or _qp(query_params, "x-amz-credential", ""))
+    amz_date = (_qp(query_params, "X-Amz-Date", "")
+                or _qp(query_params, "x-amz-date", ""))
+    signed_headers = (_qp(query_params, "X-Amz-SignedHeaders", "")
+                      or _qp(query_params, "x-amz-signedheaders", ""))
+    cred_parts = credential.split("/")
+    if len(cred_parts) != 5 or not amz_date or not signed_headers:
+        return _bad_signature()
+    _akid, date_stamp, region, service, _terminator = cred_parts
+
+    # Canonical query string: every query param except X-Amz-Signature,
+    # RFC3986-encoded, sorted by encoded key then value.
+    pairs = []
+    for name, values in query_params.items():
+        if name.lower() == "x-amz-signature":
+            continue
+        vlist = values if isinstance(values, list) else [values]
+        for v in vlist:
+            pairs.append((_uri_encode(name), _uri_encode(v)))
+    pairs.sort()
+    canonical_qs = "&".join(f"{k}={v}" for k, v in pairs)
+
+    # Canonical headers: the signed headers, lowercased names, trimmed values.
+    canonical_headers = ""
+    for hname in (h for h in signed_headers.split(";") if h):
+        raw = headers.get(hname, headers.get(hname.lower(), ""))
+        canonical_headers += f"{hname.lower()}:{' '.join(str(raw).split())}\n"
+
+    canonical_request = "\n".join([
+        method,
+        _uri_encode(path, encode_slash=False),
+        canonical_qs,
+        canonical_headers,
+        signed_headers,
+        _SIGV4_UNSIGNED_PAYLOAD,
+    ])
+
+    string_to_sign = "\n".join([
+        "AWS4-HMAC-SHA256",
+        amz_date,
+        f"{date_stamp}/{region}/{service}/aws4_request",
+        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+    ])
+
+    secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "test")
+    signing_key = _sigv4_signing_key(secret, date_stamp, region, service)
+    computed = hmac.new(signing_key, string_to_sign.encode("utf-8"),
+                        hashlib.sha256).hexdigest()
+
+    if not hmac.compare_digest(computed, signature):
+        return _bad_signature()
+    return None
+
+
 async def handle_request(
     method: str, path: str, headers: dict, body: bytes, query_params: dict
 ) -> tuple:
     bucket, key = _parse_bucket_key(path, headers)
+
+    sig_error = _verify_presigned_sigv4(method, path, headers, query_params)
+    if sig_error is not None:
+        status, resp_headers, resp_body = sig_error
+        resp_headers.setdefault("x-amz-request-id", new_uuid())
+        resp_headers.setdefault("x-amz-id-2", base64.b64encode(os.urandom(48)).decode())
+        return status, resp_headers, resp_body
 
     result = _dispatch(method, bucket, key, headers, body, query_params)
 

@@ -2992,6 +2992,69 @@ def test_s3_get_object_non_latest_version_last_modified_is_rfc7231_http_date(s3)
     )
 
 
+def test_s3_presigned_url_signature_is_verified():
+    """Presigned SigV4 URLs are verified against the server secret: a bogus-
+    credential signature, or a signed header (content-type / content-length)
+    tampered with after signing, is rejected with 403 SignatureDoesNotMatch —
+    matching real S3. A valid, untampered presigned URL still succeeds."""
+    import urllib.error
+    import urllib.request
+
+    import boto3
+    from botocore.config import Config
+
+    ep = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    # Explicit s3v4 + path style so ContentType / ContentLength are signed into
+    # X-Amz-SignedHeaders (matches the reporter's config); otherwise boto3 would
+    # not sign those headers and tampering them would be legitimately allowed.
+    path_cfg = Config(signature_version="s3v4", s3={"addressing_style": "path"})
+    good = boto3.client(
+        "s3", endpoint_url=ep, region_name="us-east-1",
+        aws_access_key_id="test", aws_secret_access_key="test", config=path_cfg,
+    )
+    bogus = boto3.client(
+        "s3", endpoint_url=ep, region_name="us-east-1",
+        aws_access_key_id="wrongkey", aws_secret_access_key="wrongsecret",
+        config=path_cfg,
+    )
+    bucket = "presign-verify-bkt"
+    good.create_bucket(Bucket=bucket)
+    good.put_object(Bucket=bucket, Key="hello.txt", Body=b"hi")
+
+    def status(req):
+        try:
+            return urllib.request.urlopen(req).status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    # Bogus-credential signature is rejected.
+    u = bogus.generate_presigned_url(
+        "get_object", Params={"Bucket": bucket, "Key": "hello.txt"}, ExpiresIn=300)
+    assert status(urllib.request.Request(u, method="GET")) == 403
+
+    # Signed content-type tampered after signing is rejected.
+    u = good.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": bucket, "Key": "up.txt", "ContentType": "text/plain"},
+        ExpiresIn=300)
+    assert status(urllib.request.Request(
+        u, data=b"x", method="PUT",
+        headers={"Content-Type": "application/octet-stream"})) == 403
+
+    # Signed content-length tampered after signing is rejected.
+    u = good.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": bucket, "Key": "up2.txt", "ContentLength": 2},
+        ExpiresIn=300)
+    assert status(urllib.request.Request(
+        u, data=b"way more than two bytes", method="PUT")) == 403
+
+    # A valid, untampered presigned URL still succeeds.
+    u = good.generate_presigned_url(
+        "get_object", Params={"Bucket": bucket, "Key": "hello.txt"}, ExpiresIn=300)
+    assert status(urllib.request.Request(u, method="GET")) == 200
+
+
 def test_s3_eventbridge_notification_on_delete(s3, sqs, eb):
     """S3 delete_object should send EventBridge event when EventBridgeConfiguration is enabled."""
     bucket = "s3-eb-del-bkt"
