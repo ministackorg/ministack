@@ -615,3 +615,23 @@ def test_acm_list_certificates_omits_nexttoken_when_no_more_pages():
         "key. SDK consumers checking `if 'NextToken' in response` "
         "(Java, Go, raw HTTP — boto3 strips nulls) loop forever."
     )
+
+
+def test_acm_certificates_are_region_isolated(acm_client):
+    """A certificate requested in us-east-1 must not be visible from us-west-2."""
+    import boto3
+
+    acm_west = boto3.client(
+        "acm", endpoint_url="http://localhost:4566",
+        aws_access_key_id="test", aws_secret_access_key="test",
+        region_name="us-west-2",
+    )
+    arn = acm_client.request_certificate(DomainName="iso.example.com")["CertificateArn"]
+    assert ":us-east-1:" in arn
+    try:
+        east = [c["CertificateArn"] for c in acm_client.list_certificates()["CertificateSummaryList"]]
+        west = [c["CertificateArn"] for c in acm_west.list_certificates()["CertificateSummaryList"]]
+        assert arn in east
+        assert arn not in west
+    finally:
+        acm_client.delete_certificate(CertificateArn=arn)

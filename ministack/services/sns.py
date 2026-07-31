@@ -1477,12 +1477,38 @@ def _matches_filter_policy(sub: dict, message_attributes: dict) -> bool:
         attr = message_attributes.get(key)
         if attr is None:
             return False
-        attr_value = attr.get("StringValue", "")
         if not isinstance(allowed_values, list):
             allowed_values = [allowed_values]
-        if not _attr_matches_any(attr_value, allowed_values):
+        # A String.Array attribute carries a JSON array of values; AWS evaluates
+        # each element separately and the attribute matches if any element does.
+        candidates = _attr_candidate_values(attr)
+        if not any(_attr_matches_any(value, allowed_values) for value in candidates):
             return False
     return True
+
+
+def _attr_candidate_values(attr: dict) -> list:
+    """Values to match a message attribute against a filter policy. A scalar
+    attribute yields its single StringValue; a String.Array yields each element
+    (AWS matches an array attribute when any element matches)."""
+    raw = attr.get("StringValue", "")
+    if (attr.get("DataType") or "").strip() != "String.Array":
+        return [raw]
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return [raw]
+    if not isinstance(parsed, list):
+        return [raw]
+    values = []
+    for element in parsed:
+        if isinstance(element, bool):
+            values.append("true" if element else "false")
+        elif isinstance(element, str):
+            values.append(element)
+        elif isinstance(element, (int, float)):
+            values.append(str(element))
+    return values or [raw]
 
 
 def _attr_matches_any(attr_value: str, rules: list) -> bool:

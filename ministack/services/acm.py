@@ -16,6 +16,7 @@ import time
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -29,7 +30,7 @@ logger = logging.getLogger("acm")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-_certificates = AccountScopedDict()  # arn -> certificate dict
+_certificates = AccountRegionScopedDict()  # arn -> certificate dict (region-scoped)
 _CERTIFICATE_RESOURCE_PREFIX = "certificate/"
 
 
@@ -74,8 +75,37 @@ def _synthetic_pem(domain):
     )
 
 
+def _region_from_arn(value, fallback):
+    if not isinstance(value, str) or not value.startswith("arn:"):
+        return fallback
+    try:
+        return parse_arn(value).region or fallback
+    except ArnParseError:
+        return fallback
+
+
+def _restore_certificates(restored):
+    """Region-scope certificates on restore. New state is already region-scoped;
+    legacy account-scoped state is re-homed by mining the region from the
+    certificate ARN key (each cert lives in exactly one region)."""
+    if isinstance(restored, AccountRegionScopedDict):
+        _certificates.update(restored)
+        return
+    boot_region = get_region()
+    if isinstance(restored, AccountScopedDict):
+        entries = restored._data.items()
+    elif isinstance(restored, dict):
+        account_id = get_account_id()
+        entries = (((account_id, arn), cert) for arn, cert in restored.items())
+    else:
+        _certificates.update(restored)
+        return
+    for (account_id, arn), cert in entries:
+        _certificates.set_scoped(account_id, _region_from_arn(arn, boot_region), arn, cert)
+
+
 def restore_state(data):
-    _certificates.update(data.get("_certificates", {}))
+    _restore_certificates(data.get("_certificates", {}))
     # Backwards compat: pre-fix snapshots have certificates without
     # `_pem_body` / `_pem_chain` (the old GetCertificate path returned
     # a hard-coded literal regardless of stored data). Without backfill,

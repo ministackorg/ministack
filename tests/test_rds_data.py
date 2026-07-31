@@ -895,3 +895,37 @@ def test_rds_data_secret_credentials_reject_cross_account_secret_arn():
         secretsmanager._secrets.pop_scoped("111111111111", "us-east-1", "cross-account-cred", None)
         set_request_account_id(original_account)
         set_request_region(original_region)
+
+
+def test_rds_data_stub_state_is_region_isolated():
+    """The stub SQL-tracking stores must isolate by region: a database recorded
+    against a cluster in us-east-1 must not be visible in us-west-2."""
+    import ministack.services.rds_data as rd
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    original_account = get_account_id()
+    original_region = get_region()
+    try:
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+        rd._stub_databases.setdefault("iso-cluster", set()).add("db_east")
+
+        set_request_region("us-west-2")
+        assert "iso-cluster" not in rd._stub_databases
+        rd._stub_databases.setdefault("iso-cluster", set()).add("db_west")
+        assert rd._stub_databases.get("iso-cluster") == {"db_west"}
+
+        set_request_region("us-east-1")
+        assert rd._stub_databases.get("iso-cluster") == {"db_east"}
+    finally:
+        set_request_region("us-east-1")
+        rd._stub_databases.pop("iso-cluster", None)
+        set_request_region("us-west-2")
+        rd._stub_databases.pop("iso-cluster", None)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
