@@ -198,6 +198,66 @@ def test_apigw_delete_route(apigw):
     resp = apigw.get_routes(ApiId=api_id)
     assert not any(r["RouteId"] == route_id for r in resp["Items"])
 
+def _make_api_with_routes(apigw_mod, route_keys):
+    """Register an in-process HTTP API with the given route keys, in order.
+
+    Uses the real ``_create_route`` path so the routes are built and inserted
+    exactly as a live request would, letting the tests exercise creation order.
+    """
+    api_id = apigw_mod.new_uuid()[:8]
+    apigw_mod._apis[api_id] = {"apiId": api_id, "protocolType": "HTTP"}
+    for route_key in route_keys:
+        apigw_mod._create_route(api_id, {"routeKey": route_key})
+    return api_id
+
+
+@pytest.mark.parametrize("proxy_first", [False, True])
+def test_apigw_match_route_prefers_specific_over_proxy(proxy_first):
+    """The exact route wins over an ``ANY /{proxy+}`` catch-all in either order.
+
+    Real API Gateway dispatches to the most specific matching route regardless
+    of creation order; ministack must not fall back to first-match-wins.
+    """
+    from ministack.services import apigateway as apigw_mod
+
+    exact = "POST /api/v1/sql/execute"
+    proxy = "ANY /{proxy+}"
+    keys = [proxy, exact] if proxy_first else [exact, proxy]
+    api_id = _make_api_with_routes(apigw_mod, keys)
+
+    route = apigw_mod._match_route(api_id, "POST", "/api/v1/sql/execute")
+    assert route is not None
+    assert route["routeKey"] == exact
+
+
+@pytest.mark.parametrize("proxy_first", [False, True])
+def test_apigw_match_route_falls_through_to_proxy(proxy_first):
+    """A path only the catch-all matches still resolves to ``ANY /{proxy+}``."""
+    from ministack.services import apigateway as apigw_mod
+
+    exact = "POST /api/v1/sql/execute"
+    proxy = "ANY /{proxy+}"
+    keys = [proxy, exact] if proxy_first else [exact, proxy]
+    api_id = _make_api_with_routes(apigw_mod, keys)
+
+    route = apigw_mod._match_route(api_id, "GET", "/something/else")
+    assert route is not None
+    assert route["routeKey"] == proxy
+
+
+def test_apigw_match_route_default_fallback():
+    """When no specific route matches, the $default route is the fallback."""
+    from ministack.services import apigateway as apigw_mod
+
+    api_id = _make_api_with_routes(
+        apigw_mod, ["POST /api/v1/sql/execute", "$default"]
+    )
+
+    route = apigw_mod._match_route(api_id, "GET", "/unmatched/path")
+    assert route is not None
+    assert route["routeKey"] == "$default"
+
+
 def test_apigw_create_integration(apigw):
     api_id = apigw.create_api(Name="integ-api", ProtocolType="HTTP")["ApiId"]
     resp = apigw.create_integration(

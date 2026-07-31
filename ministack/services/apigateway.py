@@ -914,10 +914,39 @@ async def handle_execute(api_id, stage, path, method, headers, body, query_param
     return response
 
 
+def _route_specificity(method: str, route_path: str) -> tuple:
+    """Rank a candidate route by how specifically it matches a request.
+
+    Real API Gateway always dispatches to the most specific matching route,
+    independent of the order in which routes were created. We approximate that
+    ordering with a tuple compared lexicographically (higher is more specific):
+
+      1. Number of literal (non-parameter) path segments — an exact path beats
+         one with placeholders.
+      2. Explicit method over ``ANY`` — ``POST /items`` beats ``ANY /items``.
+      3. Non-greedy over greedy — a route without ``{proxy+}`` beats a catch-all.
+    """
+    segments = route_path.strip("/").split("/")
+    literal_segments = sum(
+        1 for s in segments if not (s.startswith("{") and s.endswith("}"))
+    )
+    is_greedy = any(s == "{proxy+}" for s in segments)
+    return (literal_segments, 0 if method == "ANY" else 1, 0 if is_greedy else 1)
+
+
 def _match_route(api_id, method, path):
-    """Find the best matching route for method+path. $default route is the fallback."""
+    """Find the best matching route for method+path. $default route is the fallback.
+
+    All routes matching the request are ranked by specificity (see
+    ``_route_specificity``) and the most specific one wins, mirroring real API
+    Gateway. This matters when a dedicated route (e.g. ``POST /items``) and a
+    greedy catch-all (e.g. ``ANY /{proxy+}``) both match: the dedicated route
+    must win regardless of which was registered first.
+    """
     routes = _routes.get(api_id, {})
-    # First pass: look for a specific method+path match (skip $default)
+    # First pass: collect every specific method+path match (skip $default).
+    best_route = None
+    best_specificity = None
     for route in routes.values():
         key = route.get("routeKey", "")
         if key == "$default":
@@ -926,7 +955,11 @@ def _match_route(api_id, method, path):
         if len(parts) == 2:
             r_method, r_path = parts
             if (r_method == "ANY" or r_method == method) and _path_matches(r_path, path):
-                return route
+                specificity = _route_specificity(r_method, r_path)
+                if best_specificity is None or specificity > best_specificity:
+                    best_route, best_specificity = route, specificity
+    if best_route is not None:
+        return best_route
     # Second pass: $default catch-all
     for route in routes.values():
         if route.get("routeKey") == "$default":
