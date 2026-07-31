@@ -4624,6 +4624,119 @@ def test_sfn_aws_sdk_s3_copy_object(sfn_sync, s3):
             sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
 
 
+def test_sfn_aws_sdk_s3_head_object_metadata(sfn_sync, s3):
+    """aws-sdk:s3:headObject returns the object's user Metadata map with keys verbatim."""
+    import uuid as _uuid
+
+    bucket = f"sfn-s3-head-{_uuid.uuid4().hex[:8]}"
+    sm_name = f"sdk-s3-head-{_uuid.uuid4().hex[:8]}"
+    sm_arn = None
+    try:
+        s3.create_bucket(Bucket=bucket)
+        s3.put_object(
+            Bucket=bucket,
+            Key="work/shard_manifest.json",
+            Body=b"{}",
+            Metadata={"shardcount": "2"},
+        )
+
+        definition = json.dumps({
+            "StartAt": "Head",
+            "States": {
+                "Head": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:s3:headObject",
+                    "Parameters": {"Bucket": bucket, "Key": "work/shard_manifest.json"},
+                    "End": True,
+                },
+            },
+        })
+
+        sm_arn = sfn_sync.create_state_machine(
+            name=sm_name,
+            definition=definition,
+            roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        )["stateMachineArn"]
+
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+        assert resp["status"] == "SUCCEEDED", f"{resp.get('error')} — {resp.get('cause')}"
+        output = json.loads(resp["output"])
+        # Keys must NOT be run through the SFN key convention: "shardcount",
+        # not "Shardcount". $.Metadata.shardcount is the path real ASLs use.
+        assert output["Metadata"] == {"shardcount": "2"}
+        assert output["ContentLength"] == 2
+    finally:
+        try:
+            s3.delete_object(Bucket=bucket, Key="work/shard_manifest.json")
+        except Exception:
+            pass
+        try:
+            s3.delete_bucket(Bucket=bucket)
+        except Exception:
+            pass
+        if sm_arn:
+            sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_aws_sdk_s3_head_object_metadata_result_selector(sfn_sync, s3):
+    """States.StringToJson($.Metadata.<key>) works on headObject output.
+
+    This is the real-world consumer shape: an ASL sizing a downstream fan-out
+    from a manifest object's metadata. It catches both failure modes — a
+    missing Metadata map and metadata keys mangled by the SFN key convention.
+    """
+    import uuid as _uuid
+
+    bucket = f"sfn-s3-headrs-{_uuid.uuid4().hex[:8]}"
+    sm_name = f"sdk-s3-headrs-{_uuid.uuid4().hex[:8]}"
+    sm_arn = None
+    try:
+        s3.create_bucket(Bucket=bucket)
+        s3.put_object(
+            Bucket=bucket,
+            Key="work/shard_manifest.json",
+            Body=b"{}",
+            Metadata={"shardcount": "2"},
+        )
+
+        definition = json.dumps({
+            "StartAt": "Head",
+            "States": {
+                "Head": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:s3:headObject",
+                    "Parameters": {"Bucket": bucket, "Key": "work/shard_manifest.json"},
+                    "ResultSelector": {
+                        "shard_count.$": "States.StringToJson($.Metadata.shardcount)",
+                    },
+                    "End": True,
+                },
+            },
+        })
+
+        sm_arn = sfn_sync.create_state_machine(
+            name=sm_name,
+            definition=definition,
+            roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        )["stateMachineArn"]
+
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+        assert resp["status"] == "SUCCEEDED", f"{resp.get('error')} — {resp.get('cause')}"
+        output = json.loads(resp["output"])
+        assert output == {"shard_count": 2}
+    finally:
+        try:
+            s3.delete_object(Bucket=bucket, Key="work/shard_manifest.json")
+        except Exception:
+            pass
+        try:
+            s3.delete_bucket(Bucket=bucket)
+        except Exception:
+            pass
+        if sm_arn:
+            sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
 def test_sfn_aws_sdk_s3_list_buckets(sfn_sync, s3):
     """aws-sdk:s3:listBuckets returns the bucket list via REST-XML."""
     import uuid as _uuid
