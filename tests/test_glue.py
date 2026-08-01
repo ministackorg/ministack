@@ -29,6 +29,22 @@ def _glue_client(region):
     )
 
 
+def _wait_for_crawler_completion(glue, name, timeout=10):
+    deadline = time.time() + timeout
+    while True:
+        crawler = glue.get_crawler(Name=name)["Crawler"]
+        last_crawl = crawler.get("LastCrawl") or {}
+        if crawler["State"] == "READY" and last_crawl.get("Status") == "SUCCEEDED":
+            return crawler
+        if time.time() >= deadline:
+            raise AssertionError(
+                f"Crawler {name} did not complete successfully; "
+                f"last state was {crawler['State']}, "
+                f"last crawl was {crawler.get('LastCrawl')}"
+            )
+        time.sleep(0.1)
+
+
 def test_glue_catalog(glue):
     glue.create_database(DatabaseInput={"Name": "test_db", "Description": "Test database"})
     glue.create_table(
@@ -356,8 +372,9 @@ def test_glue_crawler_v2(glue):
     assert cr["State"] == "READY"
 
     glue.start_crawler(Name="glue-cr-v2")
-    cr2 = glue.get_crawler(Name="glue-cr-v2")["Crawler"]
-    assert cr2["State"] == "RUNNING"
+    cr2 = _wait_for_crawler_completion(glue, "glue-cr-v2")
+    assert cr2["State"] == "READY"
+    assert cr2["LastCrawl"]["Status"] == "SUCCEEDED"
 
 def test_glue_tags_v2(glue):
     glue.create_database(DatabaseInput={"Name": "glue_tag_v2db"})
@@ -1022,17 +1039,55 @@ def test_glue_stop_crawler(glue):
         Targets={"S3Targets": [{"Path": "s3://b/d/"}]},
     )
     glue.start_crawler(Name=name)
-    cr = glue.get_crawler(Name=name)["Crawler"]
-    assert cr["State"] == "RUNNING"
-    glue.stop_crawler(Name=name)
-    cr2 = glue.get_crawler(Name=name)["Crawler"]
-    assert cr2["State"] == "READY"
+    try:
+        glue.stop_crawler(Name=name)
+    except ClientError as exc:
+        assert exc.response["Error"]["Code"] == "CrawlerNotRunningException"
+        cr2 = glue.get_crawler(Name=name)["Crawler"]
+        last_crawl = cr2.get("LastCrawl") or {}
+        assert cr2["State"] == "READY"
+        if last_crawl.get("Status") != "SUCCEEDED":
+            cr2 = _wait_for_crawler_completion(glue, name)
+        assert cr2["LastCrawl"]["Status"] == "SUCCEEDED"
+    else:
+        cr2 = glue.get_crawler(Name=name)["Crawler"]
+        assert cr2["State"] == "READY"
     # stopping a non-running crawler raises
     with pytest.raises(ClientError) as exc:
         glue.stop_crawler(Name=name)
     assert exc.value.response["Error"]["Code"] == "CrawlerNotRunningException"
     # cleanup
     glue.delete_crawler(Name=name)
+
+
+def test_glue_stop_crawler_service_stops_running_crawler():
+    from ministack.core import responses as respmod
+    from ministack.services import glue as gluemod
+
+    account = "000000000000"
+    region = "us-east-1"
+    name = "service-stop-cr"
+    account_token = respmod._request_account_id.set(account)
+    region_token = respmod._request_region.set(region)
+    try:
+        gluemod._crawlers.pop_scoped(account, region, name, None)
+        gluemod._create_crawler({
+            "Name": name,
+            "Role": "arn:aws:iam::000000000000:role/R",
+            "Targets": {"S3Targets": [{"Path": "s3://b/d/"}]},
+        })
+        gluemod._start_crawler({"Name": name})
+        assert gluemod._crawlers[name]["State"] == "RUNNING"
+
+        status, body = _glue_json(gluemod._stop_crawler({"Name": name}))
+
+        assert status == 200
+        assert body == {}
+        assert gluemod._crawlers[name]["State"] == "READY"
+    finally:
+        respmod._request_region.reset(region_token)
+        respmod._request_account_id.reset(account_token)
+        gluemod._crawlers.pop_scoped(account, region, name, None)
 
 
 # ---------------------------------------------------------------------------

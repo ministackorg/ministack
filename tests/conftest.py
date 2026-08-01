@@ -103,6 +103,12 @@ _SERIAL_TESTS = {
     "tests/test_appsync.py::test_appsync_lambda_failing_authorizer_returns_unauthorized",
     # AppSync Events service mutations; shared state racing under xdist.
     "tests/test_appsync_events.py::test_publish_with_appsync_sigv4_scope_on_events_vhost",
+    # AppSync Events realtime websocket fan-out uses shared subscriptions and
+    # connection delivery state; keep fan-out assertions out of the xdist lane.
+    "tests/test_appsync_events.py::test_websocket_subscribe_receives_published_event",
+    "tests/test_appsync_events.py::test_websocket_single_level_wildcard",
+    "tests/test_appsync_events.py::test_websocket_unsubscribe_stops_delivery",
+    "tests/test_appsync_events.py::test_websocket_publish_frame_acks_and_fans_out",
     # Credential report reflects all users in the account; run serially to avoid
     # parallel-test interference on the account-global CSV snapshot.
     "tests/test_iam.py::test_iam_credential_report_mfa_and_password",
