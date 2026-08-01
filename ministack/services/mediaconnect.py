@@ -25,6 +25,7 @@ import urllib.parse
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -39,8 +40,8 @@ logger = logging.getLogger("mediaconnect")
 # State
 # ---------------------------------------------------------------------------
 
-_flows = AccountScopedDict()   # flowArn -> flow record (camelCase fields)
-_tags = AccountScopedDict()    # arn -> {key: value}
+_flows = AccountRegionScopedDict()   # flowArn -> flow record (camelCase fields)
+_tags = AccountScopedDict()    # arn -> {key: value} (ARN key embeds region)
 
 
 def reset():
@@ -56,8 +57,39 @@ def get_state():
 
 
 def restore_state(data):
-    _flows.update(data.get("flows", {}))
+    if not data:
+        return
+    _restore_flows(data.get("flows", {}))
     _tags.update(data.get("tags", {}))
+
+
+def _region_from_arn(value, fallback):
+    if not isinstance(value, str) or not value.startswith("arn:"):
+        return fallback
+    try:
+        return parse_arn(value).region or fallback
+    except ArnParseError:
+        return fallback
+
+
+def _restore_flows(restored):
+    """Region-scope flows on restore. New state arrives already region-scoped;
+    legacy account-scoped state is re-homed by mining the region from the
+    flowArn key (each flow lives in exactly one region)."""
+    if isinstance(restored, AccountRegionScopedDict):
+        _flows.update(restored)
+        return
+    boot_region = get_region()
+    if isinstance(restored, AccountScopedDict):
+        entries = restored._data.items()
+    elif isinstance(restored, dict):
+        account_id = get_account_id()
+        entries = (((account_id, arn), flow) for arn, flow in restored.items())
+    else:
+        _flows.update(restored)
+        return
+    for (account_id, arn), flow in entries:
+        _flows.set_scoped(account_id, _region_from_arn(arn, boot_region), arn, flow)
 
 
 try:

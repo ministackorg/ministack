@@ -7,8 +7,9 @@ import copy
 import json
 import logging
 import time
+from contextlib import contextmanager
 
-from ministack.core.responses import get_account_id, new_uuid, now_iso
+from ministack.core.responses import get_account_id, get_region, new_uuid, now_iso, set_request_region
 
 from .engine import (
     _NO_VALUE,
@@ -18,9 +19,40 @@ from .engine import (
     _resolve_refs,
     _topological_sort,
 )
-from .provisioners import REGION, _delete_resource, _provision_resource, _update_resource
+from .provisioners import _delete_resource, _provision_resource, _update_resource
 
 logger = logging.getLogger("cloudformation")
+
+
+def _region_from_stack_id(stack_id: str | None) -> str | None:
+    if not stack_id:
+        return None
+    parts = stack_id.split(":")
+    if len(parts) > 3 and parts[3]:
+        return parts[3]
+    return None
+
+
+def _stack_region(stack: dict | None, stack_id: str | None = None) -> str:
+    if stack:
+        return stack.get("_region") or _region_from_stack_id(stack.get("StackId")) or get_region()
+    return _region_from_stack_id(stack_id) or get_region()
+
+
+@contextmanager
+def _stack_region_context(stack: dict | None, stack_id: str | None = None):
+    previous_region = get_region()
+    set_request_region(_stack_region(stack, stack_id))
+    try:
+        yield
+    finally:
+        set_request_region(previous_region)
+
+
+def _create_stack_task_in_region(coro, stack: dict | None, stack_id: str | None = None):
+    """Schedule a stack lifecycle coroutine in the stack's owning region."""
+    with _stack_region_context(stack, stack_id):
+        asyncio.get_event_loop().create_task(coro)
 
 
 def _is_custom_resource(resource_type: str) -> bool:

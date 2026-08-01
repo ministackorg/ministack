@@ -9,7 +9,7 @@ requests with the ``iotdata`` scope) or via the host pattern
 ``data-ats.iot.{region}.{host}`` / ``data.iot.{region}.{host}``.
 
 Bridges into the in-memory MQTT broker via :mod:`ministack.services.iot`,
-which applies account-scoped topic prefixing transparently.
+which applies account-and-region-scoped topic prefixing transparently.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from urllib.parse import unquote
 from ministack.core.responses import (
     error_response_json,
     get_account_id,
+    get_region,
     json_response,
 )
 from ministack.services import iot as _iot_module
@@ -168,7 +169,12 @@ async def _publish(raw_topic: str, body: bytes, qp: dict) -> tuple:
 
     try:
         await _iot_module.broker_publish(
-            get_account_id(), topic, body or b"", qos=qos, retain=retain
+            get_account_id(),
+            get_region(),
+            topic,
+            body or b"",
+            qos=qos,
+            retain=retain,
         )
     except Exception as e:
         logger.exception("iot-data publish failed")

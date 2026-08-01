@@ -248,6 +248,13 @@ _DDB_TXN_MAX_BYTES = 4 * 1024 * 1024
 # Batch caps.
 _DDB_BATCH_WRITE_MAX = 25
 _DDB_BATCH_GET_MAX = 100
+# Expression size limit (bytes of the expression string).
+_DDB_EXPR_MAX_BYTES = 4096
+# Key attribute value length limits.
+_DDB_KEY_MAX_BYTES = 2048
+_DDB_SORT_KEY_MAX_BYTES = 1024
+# Document nesting depth limit (32 levels, leaf is at level 32 means 31 nesting levels for containers).
+_DDB_MAX_NESTING_DEPTH = 32
 
 
 def _ddb_canonicalize_number(s: str) -> str | None:
@@ -263,7 +270,11 @@ def _ddb_canonicalize_number(s: str) -> str | None:
         return None
     if not isinstance(s, str) or not s:
         return None
-    raw = s.strip()
+    # AWS rejects numbers with whitespace or underscores even though Python's
+    # Decimal() accepts them (e.g. " 5", "5 ", "1_000").
+    if s != s.strip() or '_' in s:
+        return None
+    raw = s
     # Reject empty / sign-only / non-numeric.
     try:
         d = Decimal(raw)
@@ -314,10 +325,15 @@ def _ddb_canonicalize_number(s: str) -> str | None:
     return sign_str + text
 
 
-def _validate_attribute_value(attr_name: str, value: dict) -> tuple | None:
+def _validate_attribute_value(attr_name: str, value: dict, _depth: int = 1) -> tuple | None:
     """Recursively validate a single attribute value. Returns an error response
     tuple if invalid, or None if OK. May mutate `value` to canonicalize numbers.
+    _depth starts at 1 (top-level attribute value); containers increment before
+    recursing. AWS enforces a maximum nesting depth of 32 levels.
     """
+    if _depth > _DDB_MAX_NESTING_DEPTH:
+        return error_response_json("ValidationException",
+            "One or more parameter values were invalid: document path length exceeded limit", 400)
     if not isinstance(value, dict) or not value:
         return error_response_json("ValidationException",
             "Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes", 400)
@@ -385,10 +401,13 @@ def _validate_attribute_value(attr_name: str, value: dict) -> tuple | None:
                 "One or more parameter values were invalid: Binary sets should not be empty", 400)
         seen = set()
         for b in vval:
+            # Empty binary members (zero-length) ARE allowed in BS sets — only
+            # empty SS members (empty strings) are forbidden. Binary key attributes
+            # are forbidden separately; here we only validate the set value.
             key = b if isinstance(b, str) else (b.decode("latin-1") if isinstance(b, bytes) else None)
-            if key is None or key == "":
+            if key is None:
                 return error_response_json("ValidationException",
-                    "One or more parameter values were invalid: Binary set element may not be empty", 400)
+                    "One or more parameter values were invalid: Binary set element must be binary type", 400)
             if key in seen:
                 return error_response_json("ValidationException",
                     f"One or more parameter values were invalid: Input collection [{', '.join(str(v) for v in vval)}] contains duplicates.", 400)
@@ -398,7 +417,7 @@ def _validate_attribute_value(attr_name: str, value: dict) -> tuple | None:
             return error_response_json("ValidationException",
                 "One or more parameter values were invalid: List must be a list", 400)
         for sub in vval:
-            err = _validate_attribute_value(attr_name, sub)
+            err = _validate_attribute_value(attr_name, sub, _depth + 1)
             if err:
                 return err
     elif vtype == "M":
@@ -406,7 +425,7 @@ def _validate_attribute_value(attr_name: str, value: dict) -> tuple | None:
             return error_response_json("ValidationException",
                 "One or more parameter values were invalid: Map must be a map", 400)
         for k, sub in vval.items():
-            err = _validate_attribute_value(attr_name, sub)
+            err = _validate_attribute_value(attr_name, sub, _depth + 1)
             if err:
                 return err
     else:
@@ -500,6 +519,26 @@ def _validate_item(item: dict, pk_name: str | None = None, sk_name: str | None =
         err = _validate_attribute_value(name, value)
         if err:
             return err
+    # Key attribute value length limits: partition key max 2048 bytes, sort key max 1024 bytes.
+    for key_name, max_bytes in ((pk_name, _DDB_KEY_MAX_BYTES), (sk_name, _DDB_SORT_KEY_MAX_BYTES)):
+        if not key_name or key_name not in item:
+            continue
+        raw = item[key_name]
+        if not isinstance(raw, dict) or len(raw) != 1:
+            continue
+        (ktype, kval), = raw.items()
+        key_bytes = 0
+        if ktype == "S" and isinstance(kval, str):
+            key_bytes = len(kval.encode("utf-8"))
+        elif ktype == "B":
+            try:
+                key_bytes = len(base64.b64decode(kval)) if isinstance(kval, str) else len(kval)
+            except Exception:
+                key_bytes = len(kval) if isinstance(kval, (str, bytes)) else 0
+        if key_bytes > max_bytes:
+            return error_response_json("ValidationException",
+                f"One or more parameter values were invalid: Aggregated size of all range keys has exceeded the size limit of 1024 bytes" if key_name == sk_name else
+                f"One or more parameter values were invalid: Aggregated size of all hash keys has exceeded the size limit of 2048 bytes", 400)
     size = _item_size_bytes(item)
     if size > _DDB_ITEM_MAX_BYTES:
         return error_response_json("ValidationException",
@@ -999,6 +1038,28 @@ def _create_table(data):
                 f"One or more parameter values were invalid: Duplicate index name: {iname}", 400)
         if iname:
             seen_index_names.add(iname)
+
+    # Validate index Projection settings.
+    for idx in gsis + lsis:
+        idx_name = idx.get("IndexName", "<unnamed>")
+        proj = idx.get("Projection") or {}
+        ptype = proj.get("ProjectionType", "ALL")
+        if ptype not in _VALID_PROJECTION_TYPES:
+            return error_response_json("ValidationException",
+                f"One or more parameter values were invalid: Unknown ProjectionType: {ptype}", 400)
+        if ptype == "INCLUDE" and not proj.get("NonKeyAttributes"):
+            return error_response_json("ValidationException",
+                f"One or more parameter values were invalid: INCLUDE ProjectionType requires NonKeyAttributes to be specified", 400)
+        if ptype == "KEYS_ONLY" and proj.get("NonKeyAttributes"):
+            return error_response_json("ValidationException",
+                f"One or more parameter values were invalid: KEYS_ONLY projection type is not compatible with NonKeyAttributes", 400)
+
+    # Validate StreamSpecification: StreamEnabled:false with StreamViewType is invalid.
+    stream_spec = data.get("StreamSpecification")
+    if stream_spec and stream_spec.get("StreamEnabled") is False and stream_spec.get("StreamViewType"):
+        return error_response_json("ValidationException",
+            "One or more parameter values were invalid: StreamViewType can only be specified when StreamEnabled is true", 400)
+
     # Every attribute referenced in any index KeySchema must be in AttributeDefinitions.
     referenced_attrs = set()
     for ks in key_schema:
@@ -1157,7 +1218,12 @@ def _update_table(data):
         if new_billing == "PAY_PER_REQUEST":
             table["ProvisionedThroughput"] = {"ReadCapacityUnits": 0, "WriteCapacityUnits": 0}
     if "AttributeDefinitions" in data:
-        table["AttributeDefinitions"] = data["AttributeDefinitions"]
+        # Merge incoming AttributeDefinitions with existing ones (union by name).
+        # New definitions override existing ones with the same name.
+        existing_ad = {ad["AttributeName"]: ad for ad in table.get("AttributeDefinitions", [])}
+        for ad in data["AttributeDefinitions"]:
+            existing_ad[ad["AttributeName"]] = ad
+        table["AttributeDefinitions"] = list(existing_ad.values())
     if "StreamSpecification" in data:
         table["StreamSpecification"] = data["StreamSpecification"]
     if "SSESpecification" in data:
@@ -1226,6 +1292,19 @@ def _update_table(data):
                 if gsi["IndexName"] == idx_name:
                     if "ProvisionedThroughput" in update["Update"]:
                         gsi["ProvisionedThroughput"] = update["Update"]["ProvisionedThroughput"]
+
+    # After all GSI changes, prune AttributeDefinitions to only those attributes
+    # still referenced by the table's KeySchema or remaining indexes.
+    referenced = set()
+    for ks in table.get("KeySchema", []):
+        referenced.add(ks.get("AttributeName"))
+    for idx in table.get("GlobalSecondaryIndexes", []) + table.get("LocalSecondaryIndexes", []):
+        for ks in idx.get("KeySchema", []):
+            referenced.add(ks.get("AttributeName"))
+    table["AttributeDefinitions"] = [
+        ad for ad in table.get("AttributeDefinitions", [])
+        if ad["AttributeName"] in referenced
+    ]
 
     return json_response({"TableDescription": _table_description(name)})
 
@@ -1321,6 +1400,12 @@ def _validate_expression_attrs(data, expression_fields: tuple) -> tuple | None:
     no expression field references them at all, AND when any defined alias
     isn't used by any of the expressions, AND when any `:foo` or `#bar`
     referenced by an expression isn't defined."""
+    # Expression string length limit: 4096 bytes each.
+    for fname in expression_fields:
+        body = data.get(fname) or ""
+        if body and len(body.encode("utf-8")) > _DDB_EXPR_MAX_BYTES:
+            return error_response_json("ValidationException",
+                f"Invalid {fname}: expression size exceeds maximum allowed size of {_DDB_EXPR_MAX_BYTES} bytes", 400)
     has_any_expr = any(data.get(f) for f in expression_fields)
     eav = data.get("ExpressionAttributeValues")
     ean = data.get("ExpressionAttributeNames")
@@ -1427,6 +1512,10 @@ def _put_item(data):
 
     item = data.get("Item", {})
     err = _validate_item(item, table.get("pk_name"), table.get("sk_name"))
+    if err:
+        return err
+    # Validate GSI/LSI key attribute types and values.
+    err = _validate_index_key_values(table, item)
     if err:
         return err
     # Hash key must be present.
@@ -1674,6 +1763,10 @@ def _update_item(data):
     err = _validate_item(item, table.get("pk_name"), table.get("sk_name"))
     if err:
         return err
+    # Validate GSI/LSI key attribute types and values after the update is applied.
+    err = _validate_index_key_values(table, item)
+    if err:
+        return err
 
     table["items"][pk_val][sk_val] = item
     _update_counts(table)
@@ -1790,7 +1883,17 @@ def _query(data):
             "ALL_PROJECTED_ATTRIBUTES can be used only when Querying an index", 400)
     if select == "SPECIFIC_ATTRIBUTES" and not data.get("ProjectionExpression") and not data.get("AttributesToGet"):
         return error_response_json("ValidationException",
-            "SPECIFIC_ATTRIBUTES requires ProjectionExpression or AttributesToGet", 400)
+            "1 validation error detected: Must specify either a ProjectionExpression or non-empty AttributesToGet when Select is SPECIFIC_ATTRIBUTES", 400)
+    # ALL_ATTRIBUTES or COUNT cannot be combined with ProjectionExpression.
+    if select in ("ALL_ATTRIBUTES", "COUNT") and data.get("ProjectionExpression"):
+        return error_response_json("ValidationException",
+            f"One or more parameter values were invalid: Select value {select} is not compatible with ProjectionExpression", 400)
+    if select == "ALL_PROJECTED_ATTRIBUTES" and data.get("ProjectionExpression") and not index_name:
+        return error_response_json("ValidationException",
+            "Cannot specify the ProjectionExpression when ALL_PROJECTED_ATTRIBUTES Select is used without an index", 400)
+    if select == "ALL_PROJECTED_ATTRIBUTES" and data.get("ProjectionExpression") and index_name:
+        return error_response_json("ValidationException",
+            "Cannot specify the ProjectionExpression when ALL_PROJECTED_ATTRIBUTES Select is used", 400)
 
     pk_name, sk_name, is_gsi = _resolve_index_keys(table, index_name)
     # ConsistentRead on a GSI is invalid (only LSIs support strongly-consistent reads).
@@ -1888,6 +1991,10 @@ def _query(data):
         for pk_bucket in table["items"].values():
             for it in pk_bucket.values():
                 if pk_name in it and _extract_key_val(it[pk_name]) == pk_val:
+                    # Sparse index: for composite GSIs/LSIs, items that have the index
+                    # hash key but are missing the index range key are excluded.
+                    if sk_name and sk_name not in it:
+                        continue
                     candidates.append(it)
     else:
         candidates = list(table["items"].get(pk_val, {}).values())
@@ -2058,7 +2165,17 @@ def _scan(data):
             "ALL_PROJECTED_ATTRIBUTES can be used only when Scanning an index", 400)
     if select == "SPECIFIC_ATTRIBUTES" and not data.get("ProjectionExpression") and not data.get("AttributesToGet"):
         return error_response_json("ValidationException",
-            "SPECIFIC_ATTRIBUTES requires ProjectionExpression or AttributesToGet", 400)
+            "1 validation error detected: Must specify either a ProjectionExpression or non-empty AttributesToGet when Select is SPECIFIC_ATTRIBUTES", 400)
+    # ALL_ATTRIBUTES or COUNT cannot be combined with ProjectionExpression.
+    if select in ("ALL_ATTRIBUTES", "COUNT") and data.get("ProjectionExpression"):
+        return error_response_json("ValidationException",
+            f"One or more parameter values were invalid: Select value {select} is not compatible with ProjectionExpression", 400)
+    if select == "ALL_PROJECTED_ATTRIBUTES" and data.get("ProjectionExpression") and not index_name:
+        return error_response_json("ValidationException",
+            "ALL_PROJECTED_ATTRIBUTES can be used only when Scanning an index. Cannot specify the ProjectionExpression when ALL_PROJECTED_ATTRIBUTES Select is used without an index", 400)
+    if select == "ALL_PROJECTED_ATTRIBUTES" and data.get("ProjectionExpression") and index_name:
+        return error_response_json("ValidationException",
+            "Cannot specify the ProjectionExpression when ALL_PROJECTED_ATTRIBUTES Select is used", 400)
     # ConsistentRead on a GSI is invalid.
     if index_name and data.get("ConsistentRead"):
         _, _, is_gsi_scan = _resolve_index_keys(table, index_name)
@@ -2305,7 +2422,9 @@ def _partiql_update(table, parsed):
 
     for attr, val in set_attrs.items():
         item[attr] = val
-    return json_response({})
+    # AWS ExecuteStatement returns {"Items": []} for UPDATE/DELETE (not an
+    # empty object). Some SDKs check for the Items key presence.
+    return json_response({"Items": []})
 
 
 def _partiql_delete(table, parsed):
@@ -2325,7 +2444,9 @@ def _partiql_delete(table, parsed):
     if not table["items"][pk_key]:
         del table["items"][pk_key]
     _update_counts(table)
-    return json_response({})
+    # AWS ExecuteStatement returns {"Items": []} for UPDATE/DELETE (not an
+    # empty object). Some SDKs check for the Items key presence.
+    return json_response({"Items": []})
 
 
 # ---------------------------------------------------------------------------
@@ -2785,6 +2906,9 @@ def _batch_write_item(data):
                 _, _, key_err = _resolve_table_key_values(table, item, allow_extra=True)
                 if key_err:
                     return key_err
+                err = _validate_index_key_values(table, item)
+                if err:
+                    return err
                 key_repr = (table_name,
                             _extract_key_val(item.get(table.get("pk_name") or "")),
                             _extract_key_val(item.get(table.get("sk_name") or "")) if table.get("sk_name") else None)
@@ -4656,6 +4780,20 @@ def _evaluate_condition(expr, item, attr_values, attr_names,
         err = _check_reserved_keyword_usage(tokens)
         if err:
             raise ValueError(err)
+        # AWS validates BETWEEN bounds at parse time for ConditionExpression too:
+        # lower must be <= upper, or it's a ValidationException (not ConditionalCheckFailed).
+        for i, tok in enumerate(tokens):
+            if (tok[0] == "IDENT" and tok[1].upper() == "BETWEEN"
+                    and i + 3 < len(tokens)
+                    and tokens[i + 1][0] == "VALUE_REF"
+                    and tokens[i + 2][0] == "IDENT" and tokens[i + 2][1].upper() == "AND"
+                    and tokens[i + 3][0] == "VALUE_REF"):
+                _lo = attr_values.get(tokens[i + 1][1])
+                _hi = attr_values.get(tokens[i + 3][1])
+                _berr = _between_bounds_error(_lo, _hi)
+                if _berr:
+                    raise ValueError(
+                        f"Invalid {slot}: The BETWEEN operator requires upper bound to be greater than or equal to lower bound")
         return _ExprEval(tokens, item, attr_values, attr_names).evaluate()
     except ValueError as e:
         msg = str(e)
@@ -5228,6 +5366,42 @@ def _resolve_table_key_values(table, attrs, allow_extra):
 
 def _key_schema_validation_error():
     return error_response_json("ValidationException", "The provided key element does not match the schema", 400)
+
+
+def _validate_index_key_values(table: dict, item: dict) -> tuple | None:
+    """Validate that any GSI/LSI key attributes present in `item` have the
+    correct type and are not empty. AWS rejects puts/updates that would write
+    a wrong-typed, non-scalar, or empty-string/binary value into a secondary
+    index key attribute. Items missing a GSI key attribute entirely are fine —
+    they just won't appear in that sparse GSI."""
+    attr_defs = {ad["AttributeName"]: ad["AttributeType"]
+                 for ad in (table.get("AttributeDefinitions") or [])}
+    for idx in (table.get("GlobalSecondaryIndexes") or []) + (table.get("LocalSecondaryIndexes") or []):
+        for ks in (idx.get("KeySchema") or []):
+            key_name = ks.get("AttributeName")
+            if not key_name or key_name not in item:
+                continue  # sparse index — item simply won't appear in this index
+            expected_type = attr_defs.get(key_name)
+            if not expected_type:
+                continue
+            raw = item[key_name]
+            if not isinstance(raw, dict) or len(raw) != 1:
+                return error_response_json("ValidationException",
+                    f"One or more parameter values were invalid: Type mismatch for Index Key {key_name} Expected: {expected_type} Actual: map", 400)
+            actual_type = next(iter(raw))
+            # Must be a scalar type (S, N, B) — not SS, NS, BS, L, M, BOOL, NULL
+            if actual_type not in ("S", "N", "B"):
+                return error_response_json("ValidationException",
+                    f"One or more parameter values were invalid: Type mismatch for Index Key {key_name} Expected: {expected_type} Actual: {actual_type}", 400)
+            if actual_type != expected_type:
+                return error_response_json("ValidationException",
+                    f"One or more parameter values were invalid: Type mismatch for Index Key {key_name} Expected: {expected_type} Actual: {actual_type}", 400)
+            # Reject empty string/binary for index keys
+            err = _empty_key_value_error(key_name, raw)
+            if err:
+                return error_response_json("ValidationException",
+                    f"One or more parameter values were invalid: Condition parameter type does not match schema type", 400)
+    return None
 
 
 def _key_type_mismatch_reason(table, attrs):
@@ -5897,10 +6071,16 @@ def _add_consumed_capacity(result, data, table_name, write=False):
         return
     table = _tables.get(table_name, {})
     gsi_count = len(table.get("GlobalSecondaryIndexes", [])) if write else 0
-    units = 1.0 + gsi_count
+    # Eventually-consistent reads (ConsistentRead not set or False) cost 0.5 RCU;
+    # strongly-consistent reads cost 1.0 RCU. Writes always cost 1.0 WCU.
+    if write:
+        units = 1.0 + gsi_count
+    else:
+        consistent = data.get("ConsistentRead", False)
+        units = 1.0 if consistent else 0.5
     cap = {"TableName": table_name, "CapacityUnits": units}
     if rc == "INDEXES":
-        cap["Table"] = {"CapacityUnits": 1.0}
+        cap["Table"] = {"CapacityUnits": units}
         if write and gsi_count:
             cap["GlobalSecondaryIndexes"] = {
                 gsi["IndexName"]: {"CapacityUnits": 1.0}

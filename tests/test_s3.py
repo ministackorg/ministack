@@ -2265,9 +2265,12 @@ def test_s3_bucket_encryption(s3):
     rules = resp["ServerSideEncryptionConfiguration"]["Rules"]
     assert rules[0]["ApplyServerSideEncryptionByDefault"]["SSEAlgorithm"] == "AES256"
     s3.delete_bucket_encryption(Bucket="intg-s3-enc")
-    with pytest.raises(ClientError) as exc:
-        s3.get_bucket_encryption(Bucket="intg-s3-enc")
-    assert exc.value.response["Error"]["Code"] == "ServerSideEncryptionConfigurationNotFoundError"
+    # Since 5 Jan 2023 every bucket has SSE-S3 default encryption, so after
+    # deletion GetBucketEncryption returns the AES256 default instead of raising
+    # ServerSideEncryptionConfigurationNotFoundError.
+    default = s3.get_bucket_encryption(Bucket="intg-s3-enc")
+    default_rules = default["ServerSideEncryptionConfiguration"]["Rules"]
+    assert default_rules[0]["ApplyServerSideEncryptionByDefault"]["SSEAlgorithm"] == "AES256"
 
 def test_s3_bucket_lifecycle(s3):
     s3.create_bucket(Bucket="intg-s3-lifecycle")
@@ -2989,6 +2992,69 @@ def test_s3_get_object_non_latest_version_last_modified_is_rfc7231_http_date(s3)
     )
 
 
+def test_s3_presigned_url_signature_is_verified():
+    """Presigned SigV4 URLs are verified against the server secret: a bogus-
+    credential signature, or a signed header (content-type / content-length)
+    tampered with after signing, is rejected with 403 SignatureDoesNotMatch —
+    matching real S3. A valid, untampered presigned URL still succeeds."""
+    import urllib.error
+    import urllib.request
+
+    import boto3
+    from botocore.config import Config
+
+    ep = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    # Explicit s3v4 + path style so ContentType / ContentLength are signed into
+    # X-Amz-SignedHeaders (matches the reporter's config); otherwise boto3 would
+    # not sign those headers and tampering them would be legitimately allowed.
+    path_cfg = Config(signature_version="s3v4", s3={"addressing_style": "path"})
+    good = boto3.client(
+        "s3", endpoint_url=ep, region_name="us-east-1",
+        aws_access_key_id="test", aws_secret_access_key="test", config=path_cfg,
+    )
+    bogus = boto3.client(
+        "s3", endpoint_url=ep, region_name="us-east-1",
+        aws_access_key_id="wrongkey", aws_secret_access_key="wrongsecret",
+        config=path_cfg,
+    )
+    bucket = "presign-verify-bkt"
+    good.create_bucket(Bucket=bucket)
+    good.put_object(Bucket=bucket, Key="hello.txt", Body=b"hi")
+
+    def status(req):
+        try:
+            return urllib.request.urlopen(req).status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    # Bogus-credential signature is rejected.
+    u = bogus.generate_presigned_url(
+        "get_object", Params={"Bucket": bucket, "Key": "hello.txt"}, ExpiresIn=300)
+    assert status(urllib.request.Request(u, method="GET")) == 403
+
+    # Signed content-type tampered after signing is rejected.
+    u = good.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": bucket, "Key": "up.txt", "ContentType": "text/plain"},
+        ExpiresIn=300)
+    assert status(urllib.request.Request(
+        u, data=b"x", method="PUT",
+        headers={"Content-Type": "application/octet-stream"})) == 403
+
+    # Signed content-length tampered after signing is rejected.
+    u = good.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": bucket, "Key": "up2.txt", "ContentLength": 2},
+        ExpiresIn=300)
+    assert status(urllib.request.Request(
+        u, data=b"way more than two bytes", method="PUT")) == 403
+
+    # A valid, untampered presigned URL still succeeds.
+    u = good.generate_presigned_url(
+        "get_object", Params={"Bucket": bucket, "Key": "hello.txt"}, ExpiresIn=300)
+    assert status(urllib.request.Request(u, method="GET")) == 200
+
+
 def test_s3_eventbridge_notification_on_delete(s3, sqs, eb):
     """S3 delete_object should send EventBridge event when EventBridgeConfiguration is enabled."""
     bucket = "s3-eb-del-bkt"
@@ -3650,3 +3716,60 @@ def test_s3_delete_delete_marker_by_version_id_restores_object(s3):
 
     markers = s3.list_object_versions(Bucket=bkt, Prefix="a").get("DeleteMarkers", [])
     assert markers == []
+
+
+def test_s3_get_object_attributes(s3):
+    import hashlib
+    bkt = f"intg-s3-attrs-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+
+    # Single PUT (STANDARD): ETag has no quotes, StorageClass omitted, size echoed.
+    body = b"hello world"
+    s3.put_object(Bucket=bkt, Key="k1", Body=body)
+    r = s3.get_object_attributes(
+        Bucket=bkt, Key="k1", ObjectAttributes=["ETag", "ObjectSize", "StorageClass"])
+    assert r["ETag"] == hashlib.md5(body).hexdigest()  # no surrounding quotes
+    assert r["ObjectSize"] == len(body)
+    assert "StorageClass" not in r  # AWS omits StorageClass for S3 Standard
+
+    # Non-STANDARD storage class is reported.
+    s3.put_object(Bucket=bkt, Key="k2", Body=b"x", StorageClass="STANDARD_IA")
+    r = s3.get_object_attributes(Bucket=bkt, Key="k2", ObjectAttributes=["StorageClass"])
+    assert r["StorageClass"] == "STANDARD_IA"
+
+    # Checksum with its ChecksumType.
+    s3.put_object(Bucket=bkt, Key="k3", Body=b"abc", ChecksumAlgorithm="SHA256")
+    r = s3.get_object_attributes(Bucket=bkt, Key="k3", ObjectAttributes=["Checksum"])
+    assert "ChecksumSHA256" in r["Checksum"]
+    assert r["Checksum"]["ChecksumType"] == "FULL_OBJECT"
+
+    # Only requested attributes are returned.
+    r = s3.get_object_attributes(Bucket=bkt, Key="k1", ObjectAttributes=["ObjectSize"])
+    assert "ETag" not in r and r["ObjectSize"] == len(body)
+
+    # Multipart: ObjectParts lists the completed parts.
+    mp = s3.create_multipart_upload(Bucket=bkt, Key="k4")
+    uid = mp["UploadId"]
+    parts = []
+    for i in (1, 2):
+        p = s3.upload_part(Bucket=bkt, Key="k4", PartNumber=i, UploadId=uid,
+                           Body=b"z" * (5 * 1024 * 1024))
+        parts.append({"PartNumber": i, "ETag": p["ETag"]})
+    s3.complete_multipart_upload(Bucket=bkt, Key="k4", UploadId=uid,
+                                 MultipartUpload={"Parts": parts})
+    r = s3.get_object_attributes(Bucket=bkt, Key="k4", ObjectAttributes=["ObjectParts"])
+    assert r["ObjectParts"]["TotalPartsCount"] == 2
+    assert [p["PartNumber"] for p in r["ObjectParts"]["Parts"]] == [1, 2]
+
+    # Missing key → NoSuchKey.
+    with pytest.raises(ClientError) as exc:
+        s3.get_object_attributes(Bucket=bkt, Key="absent", ObjectAttributes=["ETag"])
+    assert exc.value.response["Error"]["Code"] == "NoSuchKey"
+
+    # Versioned read by versionId.
+    s3.put_bucket_versioning(Bucket=bkt,
+                             VersioningConfiguration={"Status": "Enabled"})
+    pv = s3.put_object(Bucket=bkt, Key="kv", Body=b"v1")
+    r = s3.get_object_attributes(Bucket=bkt, Key="kv", VersionId=pv["VersionId"],
+                                 ObjectAttributes=["ObjectSize"])
+    assert r["ObjectSize"] == 2 and r["VersionId"] == pv["VersionId"]

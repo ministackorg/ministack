@@ -14,8 +14,8 @@ Operations:
 - ListVersions, GetCompatibleVersions
 - AddTags, ListTags, RemoveTags
 
-State is account-scoped via AccountScopedDict so per-tenant isolation matches
-the rest of ministack.
+State is account- and region-scoped via AccountRegionScopedDict, except tags
+which stay account-scoped because their ARN keys embed region.
 """
 
 import copy
@@ -27,12 +27,16 @@ import threading
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.persistence import load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     apply_image_prefix,
     get_account_id,
     get_region,
     new_uuid,
+    set_request_account_id,
+    set_request_region,
 )
 
 logger = logging.getLogger("opensearch")
@@ -97,14 +101,14 @@ _MODELED_DOMAIN_PROPERTIES = (
 _NAME_RE = re.compile(r"^[a-z][a-z0-9\-]{2,27}$")
 
 # ---------------------------------------------------------------------------
-# State (account-scoped)
+# State
 # ---------------------------------------------------------------------------
 
-_domains = AccountScopedDict()        # name -> DomainStatus dict (+ private _* fields)
-_tags = AccountScopedDict()           # arn -> [{Key, Value}, ...]
-_change_progress = AccountScopedDict()  # name -> change progress record
-_packages = AccountScopedDict()       # PackageID -> PackageDetails (+ private _* fields)
-_domain_packages = AccountScopedDict()  # "PackageID:DomainName" -> DomainPackageDetails
+_domains = AccountRegionScopedDict()        # name -> DomainStatus dict (+ private _* fields)
+_tags = AccountScopedDict()                 # ARN key embeds region; account scoping is sufficient.
+_change_progress = AccountRegionScopedDict()  # name -> change progress record
+_packages = AccountRegionScopedDict()       # PackageID -> PackageDetails (+ private _* fields)
+_domain_packages = AccountRegionScopedDict()  # "PackageID:DomainName" -> DomainPackageDetails
 
 # Port counter and Docker handle are process-global (data plane is shared).
 _port_counter = [BASE_PORT]
@@ -155,16 +159,82 @@ def get_state():
 def restore_state(data):
     if not data:
         return
-    for store, key in (
-        (_domains, "domains"),
-        (_tags, "tags"),
-        (_change_progress, "change_progress"),
-        (_packages, "packages"),
-        (_domain_packages, "domain_packages"),
-    ):
-        store.clear()
-        for k, v in (data.get(key) or {}).items():
-            store[k] = v
+    _domains.update(data.get("domains") or {})
+    domain_regions = {
+        (account_id, name): region
+        for (account_id, region, name), _rec in _domains.all_items()
+    }
+    _restore_domain_child_store(
+        _change_progress,
+        data.get("change_progress") or {},
+        domain_regions,
+        key_to_domain=lambda key: key,
+    )
+    domain_packages = data.get("domain_packages") or {}
+    _restore_domain_child_store(
+        _domain_packages,
+        domain_packages,
+        domain_regions,
+        key_to_domain=lambda key: key.split(":", 1)[-1],
+    )
+    package_regions = _package_regions_from_domain_packages(
+        domain_packages, domain_regions
+    )
+    _restore_package_store(_packages, data.get("packages") or {}, package_regions)
+    _tags.update(data.get("tags") or {})
+    _restore_domain_dataplanes()
+
+
+def _legacy_items(restored):
+    if isinstance(restored, AccountScopedDict):
+        return restored._data.items()
+    if isinstance(restored, dict):
+        account_id = get_account_id()
+        return [((account_id, key), value) for key, value in restored.items()]
+    return ()
+
+
+def _package_regions_from_domain_packages(restored, domain_regions):
+    package_regions = {}
+    if isinstance(restored, AccountRegionScopedDict):
+        for (account_id, region, key), value in restored.all_items():
+            package_id = value.get("PackageID") or key.split(":", 1)[0]
+            package_regions.setdefault((account_id, package_id), set()).add(region)
+        return package_regions
+
+    for (account_id, key), value in _legacy_items(restored):
+        domain_name = value.get("DomainName") or key.split(":", 1)[-1]
+        package_id = value.get("PackageID") or key.split(":", 1)[0]
+        region = domain_regions.get((account_id, domain_name))
+        if region:
+            package_regions.setdefault((account_id, package_id), set()).add(region)
+    return package_regions
+
+
+def _restore_package_store(store, restored, package_regions):
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+
+    boot_region = get_region()
+    for (account_id, key), value in _legacy_items(restored):
+        regions = package_regions.get((account_id, key)) or {boot_region}
+        for region in regions:
+            store.set_scoped(account_id, region, key, copy.deepcopy(value))
+
+
+def _restore_domain_child_store(store, restored, domain_regions, key_to_domain):
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+
+    for (account_id, key), value in _legacy_items(restored):
+        domain_name = key_to_domain(key)
+        region = domain_regions.get(
+            (account_id, domain_name),
+            store._region_for_legacy_value(key, value),
+        )
+        store.set_scoped(account_id, region, key, value)
 
 
 # ---------------------------------------------------------------------------
@@ -249,11 +319,11 @@ def _get_docker():
 
 
 def _container_name(domain_name: str) -> str:
-    return f"ministack-opensearch-{domain_name}"
+    return f"ministack-opensearch-{get_region()}-{domain_name}"
 
 
 def _dashboards_container_name(domain_name: str) -> str:
-    return f"ministack-opensearch-dashboards-{domain_name}"
+    return f"ministack-opensearch-dashboards-{get_region()}-{domain_name}"
 
 
 def _spawn_dataplane(domain_name: str, engine_version: str):
@@ -263,7 +333,7 @@ def _spawn_dataplane(domain_name: str, engine_version: str):
     On any failure returns the stub endpoint shape so the management plane
     still works without a real cluster.
     """
-    stub_host = f"{domain_name}.ministack.local"
+    stub_host = f"{domain_name}.{get_region()}.ministack.local"
     stub_port = 9200
     if ENDPOINT_OVERRIDE:
         host, _, port_s = ENDPOINT_OVERRIDE.partition(":")
@@ -290,6 +360,7 @@ def _spawn_dataplane(domain_name: str, engine_version: str):
     labels = {
         "com.ministack.service": "opensearch",
         "com.ministack.domain": domain_name,
+        "com.ministack.region": get_region(),
         "com.docker.compose.project": "ministack",
     }
     env_vars = {
@@ -389,6 +460,34 @@ def _teardown_named_dataplane(domain_name: str) -> None:
             pass
 
 
+def _restore_domain_dataplanes() -> None:
+    original_account = get_account_id()
+    original_region = get_region()
+    try:
+        for (account_id, region, name), rec in list(_domains.all_items()):
+            if rec.get("Deleted"):
+                continue
+            set_request_account_id(account_id)
+            set_request_region(region)
+            _teardown_dataplane(rec)
+            _teardown_named_dataplane(name)
+            rec.pop("_ContainerId", None)
+            rec.pop("_DashboardsContainerId", None)
+            rec.pop("DashboardEndpoint", None)
+            host, port, cid, dash_endpoint, dash_cid = _spawn_dataplane(
+                name, rec.get("EngineVersion", _DEFAULT_VERSION)
+            )
+            rec["_Endpoint"] = f"{host}:{port}"
+            rec["_ContainerId"] = cid
+            rec["_DashboardsContainerId"] = dash_cid
+            if dash_endpoint:
+                rec["DashboardEndpoint"] = dash_endpoint
+            _set_vpc_options(rec, rec.get("VPCOptions"))
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 # ---------------------------------------------------------------------------
 # DomainStatus / DomainConfig builders
 # ---------------------------------------------------------------------------
@@ -453,6 +552,14 @@ def _set_vpc_options(rec: dict, options) -> None:
     if endpoint:
         rec["_Endpoint"] = endpoint
         rec["Endpoint"] = endpoint
+
+
+try:
+    _restored = load_state("opensearch")
+    if _restored:
+        restore_state(_restored)
+except Exception:
+    logger.exception("Failed to restore persisted OpenSearch state; continuing fresh")
 
 
 def _new_domain_record(name, payload):

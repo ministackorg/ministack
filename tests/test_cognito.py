@@ -1384,6 +1384,136 @@ def test_cognito_jwks_endpoint():
     assert data["keys"][0]["kty"] == "RSA"
     assert data["keys"][0]["alg"] == "RS256"
 
+
+def _cognito_key_fingerprint_loader(state_dir, *, block_fcntl=False):
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["STATE_DIR"] = str(state_dir)
+    env["PYTHONPATH"] = (
+        f"{repo_root}{os.pathsep}{env['PYTHONPATH']}"
+        if env.get("PYTHONPATH")
+        else str(repo_root)
+    )
+    fcntl_blocker = (
+        "import importlib.abc\n"
+        "import sys\n"
+        "sys.modules.pop('fcntl', None)\n"
+        "class _BlockFcntl(importlib.abc.MetaPathFinder):\n"
+        "    def find_spec(self, fullname, path=None, target=None):\n"
+        "        if fullname == 'fcntl':\n"
+        "            raise ImportError('blocked fcntl')\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, _BlockFcntl())\n"
+    ) if block_fcntl else ""
+    script = (
+        fcntl_blocker +
+        "import hashlib; "
+        "from cryptography.hazmat.primitives import serialization; "
+        "import ministack.services.cognito as c; "
+        "pem = c._RSA_PRIVATE_KEY.private_bytes("
+        "encoding=serialization.Encoding.PEM, "
+        "format=serialization.PrivateFormat.PKCS8, "
+        "encryption_algorithm=serialization.NoEncryption()); "
+        "print(hashlib.sha256(pem).hexdigest())"
+    )
+
+    def _load_key_fingerprint(_idx):
+        return subprocess.check_output(
+            [sys.executable, "-c", script],
+            env=env,
+            text=True,
+            timeout=10,
+        ).strip()
+
+    return _load_key_fingerprint
+
+
+def _load_concurrent_cognito_key_fingerprints(state_dir, workers=8):
+    import concurrent.futures
+
+    _load_key_fingerprint = _cognito_key_fingerprint_loader(state_dir)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        return list(executor.map(_load_key_fingerprint, range(workers)))
+
+
+def test_cognito_rsa_key_creation_is_process_safe(tmp_path):
+    """Concurrent server/test-worker imports must converge on one JWKS key."""
+    fingerprints = _load_concurrent_cognito_key_fingerprints(tmp_path)
+
+    assert len(set(fingerprints)) == 1
+    assert (tmp_path / "cognito-rsa-key.pem").exists()
+
+
+def test_cognito_rsa_key_corruption_repair_is_process_safe(tmp_path):
+    """Concurrent imports must converge after replacing an unreadable JWKS key."""
+    from cryptography.hazmat.primitives import serialization
+
+    key_path = tmp_path / "cognito-rsa-key.pem"
+    key_path.write_text("not a private key")
+
+    fingerprints = _load_concurrent_cognito_key_fingerprints(tmp_path)
+
+    assert len(set(fingerprints)) == 1
+    serialization.load_pem_private_key(key_path.read_bytes(), password=None)
+
+
+def test_cognito_rsa_key_stale_repair_lock_is_recovered(tmp_path):
+    """A crashed repairer must not permanently block shared JWKS key recovery."""
+    from cryptography.hazmat.primitives import serialization
+
+    key_path = tmp_path / "cognito-rsa-key.pem"
+    lock_path = tmp_path / "cognito-rsa-key.pem.lock"
+    key_path.write_text("not a private key")
+    lock_path.mkdir()
+
+    fingerprints = _load_concurrent_cognito_key_fingerprints(tmp_path)
+
+    assert len(set(fingerprints)) == 1
+    assert lock_path.is_file()
+    serialization.load_pem_private_key(key_path.read_bytes(), password=None)
+
+
+def test_cognito_rsa_key_repair_waits_for_live_file_lock(tmp_path):
+    """Concurrent importers must wait for a live repair lock, not steal it."""
+    import concurrent.futures
+    import fcntl
+
+    from cryptography.hazmat.primitives import serialization
+
+    key_path = tmp_path / "cognito-rsa-key.pem"
+    lock_path = tmp_path / "cognito-rsa-key.pem.lock"
+    key_path.write_text("not a private key")
+    lock_path.touch()
+    _load_key_fingerprint = _cognito_key_fingerprint_loader(tmp_path)
+
+    with open(lock_path, "a") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(_load_key_fingerprint, idx) for idx in range(8)]
+            time.sleep(0.1)
+            assert not any(future.done() for future in futures)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            fingerprints = [future.result(timeout=10) for future in futures]
+
+    assert len(set(fingerprints)) == 1
+    serialization.load_pem_private_key(key_path.read_bytes(), password=None)
+
+
+def test_cognito_rsa_key_persists_when_fcntl_is_unavailable(tmp_path):
+    """Missing fcntl must not disable RSA signing or shared key persistence."""
+    loader = _cognito_key_fingerprint_loader(tmp_path, block_fcntl=True)
+
+    first_fingerprint = loader(0)
+    second_fingerprint = loader(1)
+
+    assert first_fingerprint == second_fingerprint
+    assert (tmp_path / "cognito-rsa-key.pem").exists()
+
+
 def test_cognito_openid_configuration():
     """/.well-known/openid-configuration returns valid discovery document."""
     import json as _json
@@ -2989,15 +3119,12 @@ def test_oauth2_login_username_attributes_email_alias_completes_token_exchange()
     client_id = client['ClientId']
     client_secret = client['ClientSecret']
 
-    real_username = 'alice-sub-uuid'
-    cognito_idp.admin_create_user(
+    create_resp = cognito_idp.admin_create_user(
         UserPoolId=pool_id,
-        Username=real_username,
-        UserAttributes=[
-            {'Name': 'email', 'Value': 'alice@example.com'},
-            {'Name': 'email_verified', 'Value': 'true'},
-        ],
+        Username='alice@example.com',
     )
+    real_username = create_resp['User']['Username']
+    assert real_username != 'alice@example.com'
     cognito_idp.admin_set_user_password(
         UserPoolId=pool_id, Username=real_username, Password='TestPass1!', Permanent=True,
     )
@@ -3036,6 +3163,101 @@ def test_oauth2_login_username_attributes_email_alias_completes_token_exchange()
     _login_and_exchange('alice@example.com', 'alias-state')
     # Login via the real Username.
     _login_and_exchange(real_username, 'real-state')
+
+
+def test_oauth2_login_after_email_change_completes_token_exchange():
+    """Regression for #006 + #007 combined: with UsernameAttributes=["email"],
+    the real Username is an immutable UUID and email is just a mutable alias.
+    After AdminUpdateUserAttributes changes the email, logging in via the
+    Hosted UI with the *new* email must still complete the authorization
+    code exchange, and the old email must no longer resolve."""
+    cognito_idp = make_client('cognito-idp')
+    pool = cognito_idp.create_user_pool(
+        PoolName='UsernameAttrsEmailChangePool',
+        UsernameAttributes=['email'],
+    )
+    pool_id = pool['UserPool']['Id']
+
+    client_resp = cognito_idp.create_user_pool_client(
+        UserPoolId=pool_id,
+        ClientName='oauth2-test-client',
+        GenerateSecret=True,
+        AllowedOAuthFlows=['code'],
+        AllowedOAuthScopes=['openid', 'email', 'profile'],
+        AllowedOAuthFlowsUserPoolClient=True,
+        CallbackURLs=['http://localhost:3000/callback'],
+        LogoutURLs=['http://localhost:3000/logout'],
+        DefaultRedirectURI='http://localhost:3000/callback',
+        ExplicitAuthFlows=['ALLOW_USER_PASSWORD_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
+    )
+    client = client_resp['UserPoolClient']
+    client_id = client['ClientId']
+    client_secret = client['ClientSecret']
+
+    create_resp = cognito_idp.admin_create_user(
+        UserPoolId=pool_id,
+        Username='test@example.com',
+    )
+    real_username = create_resp['User']['Username']
+    assert _uuid_mod.UUID(real_username)
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pool_id, Username=real_username, Password='TestPass1!', Permanent=True,
+    )
+
+    # Changing the email must not change the real Username (it stays UUID).
+    cognito_idp.admin_update_user_attributes(
+        UserPoolId=pool_id,
+        Username=real_username,
+        UserAttributes=[{'Name': 'email', 'Value': 'alice@example.com'}],
+    )
+    unchanged = cognito_idp.admin_get_user(UserPoolId=pool_id, Username=real_username)
+    assert unchanged['Username'] == real_username
+
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login',
+        {
+            'username': 'alice@example.com',
+            'password': 'TestPass1!',
+            'client_id': client_id,
+            'redirect_uri': 'http://localhost:3000/callback',
+            'scope': 'openid email',
+            'state': 'new-email-state',
+            'response_type': 'code',
+        },
+        follow_redirects=False,
+    )
+    assert status == 302
+    location = headers.get('location', '')
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(location).query)
+    code = qs['code'][0]
+
+    status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+        'grant_type': 'authorization_code',
+        'code': code,
+        'redirect_uri': 'http://localhost:3000/callback',
+        'client_id': client_id,
+        'client_secret': client_secret,
+    })
+    assert status == 200
+    resp = json.loads(body)
+    assert 'access_token' in resp
+
+    # The old email must no longer resolve to the user.
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login',
+        {
+            'username': 'test@example.com',
+            'password': 'TestPass1!',
+            'client_id': client_id,
+            'redirect_uri': 'http://localhost:3000/callback',
+            'scope': 'openid email',
+            'state': 'old-email-state',
+            'response_type': 'code',
+        },
+        follow_redirects=False,
+    )
+    assert status == 200
+    assert b'Incorrect username or password' in body
 
 
 # ---------------------------------------------------------------------------
@@ -3621,21 +3843,24 @@ def test_cognito_alias_attributes_auth_with_email(cognito_idp):
 
 
 def test_cognito_username_attributes_lookup_by_email(cognito_idp):
-    """UsernameAttributes also enables email-based lookup."""
+    """UsernameAttributes also enables email-based lookup. Real Cognito
+    never uses the supplied value as the actual Username in this mode: it
+    auto-generates a UUID Username and stores the value as the email
+    attribute instead."""
     pid = cognito_idp.create_user_pool(
         PoolName="UsernameAttrsPool",
         UsernameAttributes=["email"],
     )["UserPool"]["Id"]
-    cognito_idp.admin_create_user(
+    create_resp = cognito_idp.admin_create_user(
         UserPoolId=pid,
-        Username="dave-sub-uuid",
-        UserAttributes=[
-            {"Name": "email", "Value": "dave@example.com"},
-            {"Name": "email_verified", "Value": "true"},
-        ],
+        Username="dave@example.com",
     )
+    real_username = create_resp["User"]["Username"]
+    assert real_username != "dave@example.com"
+    assert _uuid_mod.UUID(real_username)
+
     user = cognito_idp.admin_get_user(UserPoolId=pid, Username="dave@example.com")
-    assert user["Username"] == "dave-sub-uuid"
+    assert user["Username"] == real_username
 
 
 def test_auth_codes_dict_types_are_plain_builtin_dict():
@@ -4864,6 +5089,149 @@ def test_custom_auth_client_metadata_propagated_to_verify(cognito_idp, lam):
         Session=session,
         ChallengeResponses={"ANSWER": "code", "USERNAME": "user@example.com"},
         ClientMetadata={"signInMethod": "MAGIC_LINK"},
+    )
+    assert "AuthenticationResult" in step2
+
+
+
+
+# ── Test 24b: CUSTOM_WITH_SRP — DefineAuth PASSWORD_VERIFIER is built-in ───────
+
+def test_custom_auth_with_srp_returns_password_verifier_params(cognito_idp, lam):
+    """Amplify CUSTOM_WITH_SRP: InitiateAuth+SRP_A yields PASSWORD_VERIFIER with SRP params."""
+    define_handler = (
+        "def handler(event, ctx):\n"
+        "    session = event['request']['session']\n"
+        "    if (len(session) == 1\n"
+        "            and session[0].get('challengeName') == 'SRP_A'\n"
+        "            and session[0].get('challengeResult')):\n"
+        "        event['response']['challengeName'] = 'PASSWORD_VERIFIER'\n"
+        "    elif (len(session) >= 2\n"
+        "            and session[1].get('challengeName') == 'PASSWORD_VERIFIER'\n"
+        "            and session[1].get('challengeResult')):\n"
+        "        event['response']['issueTokens'] = True\n"
+        "    else:\n"
+        "        event['response']['failAuthentication'] = True\n"
+        "    return event\n"
+    )
+    define_arn = _create_lambda(lam, "define-custom-srp-init", define_handler)
+    pid, cid = _setup_pool(cognito_idp, "CustomSrpInitPool", {
+        "DefineAuthChallenge": define_arn,
+    })
+
+    step1 = cognito_idp.initiate_auth(
+        ClientId=cid,
+        AuthFlow="CUSTOM_AUTH",
+        AuthParameters={
+            "USERNAME": "user@example.com",
+            "CHALLENGE_NAME": "SRP_A",
+            "SRP_A": "ab" * 128,
+        },
+        ClientMetadata={"deviceKeys": "[]"},
+    )
+    assert step1["ChallengeName"] == "PASSWORD_VERIFIER"
+    params = step1["ChallengeParameters"]
+    assert params.get("USER_ID_FOR_SRP") == "user@example.com"
+    assert "SALT" in params and params["SALT"]
+    assert "SRP_B" in params and params["SRP_B"]
+    assert "SECRET_BLOCK" in params and params["SECRET_BLOCK"]
+
+
+def test_custom_auth_with_srp_full_flow_issues_tokens(cognito_idp, lam):
+    """CUSTOM_AUTH SRP_A → PASSWORD_VERIFIER respond → tokens (no CreateAuth in between)."""
+    define_handler = (
+        "def handler(event, ctx):\n"
+        "    session = event['request']['session']\n"
+        "    if (len(session) == 1\n"
+        "            and session[0].get('challengeName') == 'SRP_A'\n"
+        "            and session[0].get('challengeResult')):\n"
+        "        event['response']['challengeName'] = 'PASSWORD_VERIFIER'\n"
+        "    elif (len(session) >= 2\n"
+        "            and session[1].get('challengeName') == 'PASSWORD_VERIFIER'\n"
+        "            and session[1].get('challengeResult')):\n"
+        "        event['response']['issueTokens'] = True\n"
+        "    else:\n"
+        "        event['response']['failAuthentication'] = True\n"
+        "    return event\n"
+    )
+    define_arn = _create_lambda(lam, "define-custom-srp-full", define_handler)
+    pid, cid = _setup_pool(cognito_idp, "CustomSrpFullPool", {
+        "DefineAuthChallenge": define_arn,
+    })
+
+    step1 = cognito_idp.initiate_auth(
+        ClientId=cid,
+        AuthFlow="CUSTOM_AUTH",
+        AuthParameters={
+            "USERNAME": "user@example.com",
+            "CHALLENGE_NAME": "SRP_A",
+            "SRP_A": "ab" * 128,
+        },
+    )
+    assert step1["ChallengeName"] == "PASSWORD_VERIFIER"
+    secret = step1["ChallengeParameters"]["SECRET_BLOCK"]
+
+    step2 = cognito_idp.respond_to_auth_challenge(
+        ClientId=cid,
+        ChallengeName="PASSWORD_VERIFIER",
+        Session=step1["Session"],
+        ChallengeResponses={
+            "USERNAME": "user@example.com",
+            "PASSWORD_CLAIM_SECRET_BLOCK": secret,
+            "PASSWORD_CLAIM_SIGNATURE": "deadbeef",
+            "TIMESTAMP": "Tue Jul 28 17:40:00 UTC 2026",
+        },
+    )
+    assert "AuthenticationResult" in step2
+    assert "AccessToken" in step2["AuthenticationResult"]
+
+
+def test_custom_auth_define_receives_client_metadata(cognito_idp, lam):
+    """ClientMetadata on RespondToAuthChallenge is passed into DefineAuthChallenge."""
+    create_handler = (
+        "def handler(event, ctx):\n"
+        "    event['response']['publicChallengeParameters'] = {'challenge': 'OTP'}\n"
+        "    return event\n"
+    )
+    verify_handler = (
+        "def handler(event, ctx):\n"
+        "    event['response']['answerCorrect'] = True\n"
+        "    return event\n"
+    )
+    define_handler = (
+        "def handler(event, ctx):\n"
+        "    session = event['request']['session']\n"
+        "    meta = event['request'].get('clientMetadata') or {}\n"
+        "    if not session:\n"
+        "        event['response']['challengeName'] = 'CUSTOM_CHALLENGE'\n"
+        "    elif session[-1].get('challengeResult') and meta.get('customChallengeName') == 'OTP_MFA':\n"
+        "        event['response']['issueTokens'] = True\n"
+        "    else:\n"
+        "        event['response']['failAuthentication'] = True\n"
+        "    return event\n"
+    )
+    create_arn = _create_lambda(lam, "create-define-meta", create_handler)
+    verify_arn = _create_lambda(lam, "verify-define-meta", verify_handler)
+    define_arn = _create_lambda(lam, "define-define-meta", define_handler)
+
+    pid, cid = _setup_pool(cognito_idp, "DefineMetaPool", {
+        "CreateAuthChallenge": create_arn,
+        "VerifyAuthChallengeResponse": verify_arn,
+        "DefineAuthChallenge": define_arn,
+    })
+
+    step1 = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="CUSTOM_AUTH",
+        AuthParameters={"USERNAME": "user@example.com"},
+    )
+    session = step1["Session"]
+
+    step2 = cognito_idp.respond_to_auth_challenge(
+        ClientId=cid,
+        ChallengeName="CUSTOM_CHALLENGE",
+        Session=session,
+        ChallengeResponses={"ANSWER": "123456", "USERNAME": "user@example.com"},
+        ClientMetadata={"customChallengeName": "OTP_MFA"},
     )
     assert "AuthenticationResult" in step2
 

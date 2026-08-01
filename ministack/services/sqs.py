@@ -23,6 +23,7 @@ Actions:
 
 import asyncio
 import base64
+import contextvars
 import copy
 import hashlib
 import json
@@ -77,6 +78,61 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 DEFAULT_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 DEFAULT_PORT = os.environ.get("GATEWAY_PORT", "4566")
 _DEDUP_WINDOW_S = 300  # 5 minutes
+
+# When the operator pins MINISTACK_HOST explicitly, keep the configured host in
+# every QueueUrl and never rewrite from the request. Otherwise we reflect the
+# Host the caller reached us on (see _externalize_url) so a Lambda in the Docker
+# executor gets a QueueUrl that resolves back to ministack, not to itself.
+_HOST_EXPLICIT = "MINISTACK_HOST" in os.environ
+_CANONICAL_NETLOC = f"{DEFAULT_HOST}:{DEFAULT_PORT}"
+# Host is attacker-controlled header input that ends up in response bodies, so
+# only accept a conservative hostname/IPv6/port charset before echoing it back.
+_HOST_SANITY_RE = re.compile(r"^[A-Za-z0-9.\-\[\]:_]+$")
+_request_host: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_request_host", default="")
+
+
+def _externalize_url(url: str) -> str:
+    """Rewrite a canonical queue URL's host with the caller's Host header.
+
+    AWS JS SDK v3 uses the QueueUrl itself as the request endpoint
+    (useQueueUrlAsEndpoint defaults true), so a `localhost` URL handed to a
+    Lambda in the Docker executor points back at the Lambda container. Reflect
+    the host the caller actually used (like LocalStack) so the URL is reusable.
+    Internal state stays keyed on canonical URLs; lookups are host-agnostic.
+    """
+    if _HOST_EXPLICIT or not isinstance(url, str):
+        return url
+    host = _request_host.get()
+    if not host or not _HOST_SANITY_RE.match(host):
+        return url
+    parts = urlparse(url)
+    # Only touch our own canonical netloc; leave anything else untouched. Host
+    # is echoed verbatim — if it carries no port we don't invent one (a reverse
+    # proxy on port 80 is valid).
+    if parts.netloc != _CANONICAL_NETLOC:
+        return url
+    return parts._replace(netloc=host).geturl()
+
+
+def _externalize_result(result: dict) -> dict:
+    """Rewrite queue-URL keys in an outgoing result with the request Host.
+
+    Operates on a shallow copy so stored queue state stays canonical.
+    """
+    if _HOST_EXPLICIT or not isinstance(result, dict):
+        return result
+    host = _request_host.get()
+    if not host or not _HOST_SANITY_RE.match(host):
+        return result
+    if "QueueUrl" not in result and "QueueUrls" not in result:
+        return result
+    out = dict(result)
+    if "QueueUrl" in out:
+        out["QueueUrl"] = _externalize_url(out["QueueUrl"])
+    if "QueueUrls" in out:
+        out["QueueUrls"] = [_externalize_url(u) for u in out["QueueUrls"]]
+    return out
 
 
 # ── Exceptions ──────────────────────────────────────────────
@@ -201,6 +257,9 @@ except Exception:
 async def handle_request(method: str, path: str, headers: dict,
                          body: bytes, query_params: dict) -> tuple:
     """Handle SQS requests — supports both legacy Query API and modern JSON API."""
+    # Record how the caller reached us so responses can echo that host in
+    # queue URLs (see _externalize_url). Header keys are lowercased upstream.
+    _request_host.set(headers.get("host", ""))
     target = headers.get("x-amz-target", "")
 
     # JSON protocol  (X-Amz-Target: AmazonSQS.*)
@@ -260,7 +319,10 @@ async def _dispatch(action: str, data: dict, qurl: str) -> dict:
     result = fn(data, qurl)
     if asyncio.iscoroutine(result):
         result = await result
-    return result
+    # Single choke point for the two protocol layers (_handle_json /
+    # _handle_query). Internal callers (SNS fan-out, ESM helpers) invoke the
+    # action functions directly and so keep canonical URLs.
+    return _externalize_result(result)
 
 
 # ────────────────────────────────────────────────────────────

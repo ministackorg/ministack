@@ -1,7 +1,7 @@
 """
 S3 Service Emulator – AWS-compatible.
 Supports: CreateBucket, DeleteBucket, ListBuckets, HeadBucket,
-          PutObject, GetObject, DeleteObject, HeadObject, CopyObject,
+          PutObject, GetObject, GetObjectAttributes, DeleteObject, HeadObject, CopyObject,
           ListObjectsV1 (with Marker/NextMarker pagination),
           ListObjectsV2 (with ContinuationToken pagination),
           DeleteObjects (batch),
@@ -27,6 +27,7 @@ import contextvars
 import copy
 import datetime as _dt
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -748,10 +749,121 @@ def _object_response_headers(obj: dict, bucket_name: str = "", key: str = "",
 # ---------------------------------------------------------------------------
 
 
+_SIGV4_UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD"
+
+
+def _uri_encode(value: str, encode_slash: bool = True) -> str:
+    """RFC3986 encoding per the SigV4 spec: unreserved chars (A-Za-z0-9-_.~)
+    stay literal, everything else is percent-encoded. ``/`` is preserved in
+    the canonical URI (path separators) and encoded everywhere else."""
+    safe = "-_.~" + ("" if encode_slash else "/")
+    return url_quote(value, safe=safe)
+
+
+def _sigv4_signing_key(secret: str, date_stamp: str, region: str, service: str) -> bytes:
+    def _h(key, msg):
+        return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+    k_date = _h(("AWS4" + secret).encode("utf-8"), date_stamp)
+    k_region = _h(k_date, region)
+    k_service = _h(k_region, service)
+    return _h(k_service, "aws4_request")
+
+
+def _verify_presigned_sigv4(method, path, headers, query_params):
+    """Verify a SigV4 presigned S3 URL. Returns an error tuple for a bad
+    signature, or None when the request is not a SigV4 presigned URL (header-
+    signed and anonymous requests are handled elsewhere / left lax).
+
+    MiniStack has no IAM secret store, so it verifies against its own secret
+    (``AWS_SECRET_ACCESS_KEY``, default ``test``) — the same credential the
+    server and its Lambda runtimes use. A URL signed with any other secret, or
+    one whose signed headers (content-type, content-length, ...) were tampered
+    with after signing, does not recompute to the same signature and is
+    rejected with 403 SignatureDoesNotMatch, matching real S3.
+    """
+    signature = (_qp(query_params, "X-Amz-Signature", "")
+                 or _qp(query_params, "x-amz-signature", ""))
+    if not signature:
+        return None  # not a presigned URL
+    algorithm = (_qp(query_params, "X-Amz-Algorithm", "")
+                 or _qp(query_params, "x-amz-algorithm", ""))
+    if algorithm != "AWS4-HMAC-SHA256":
+        return None  # only SigV4 presigned URLs are verified
+
+    def _bad_signature():
+        return _error(
+            "SignatureDoesNotMatch",
+            "The request signature we calculated does not match the signature "
+            "you provided. Check your key and signing method.",
+            403, path,
+        )
+
+    credential = (_qp(query_params, "X-Amz-Credential", "")
+                  or _qp(query_params, "x-amz-credential", ""))
+    amz_date = (_qp(query_params, "X-Amz-Date", "")
+                or _qp(query_params, "x-amz-date", ""))
+    signed_headers = (_qp(query_params, "X-Amz-SignedHeaders", "")
+                      or _qp(query_params, "x-amz-signedheaders", ""))
+    cred_parts = credential.split("/")
+    if len(cred_parts) != 5 or not amz_date or not signed_headers:
+        return _bad_signature()
+    _akid, date_stamp, region, service, _terminator = cred_parts
+
+    # Canonical query string: every query param except X-Amz-Signature,
+    # RFC3986-encoded, sorted by encoded key then value.
+    pairs = []
+    for name, values in query_params.items():
+        if name.lower() == "x-amz-signature":
+            continue
+        vlist = values if isinstance(values, list) else [values]
+        for v in vlist:
+            pairs.append((_uri_encode(name), _uri_encode(v)))
+    pairs.sort()
+    canonical_qs = "&".join(f"{k}={v}" for k, v in pairs)
+
+    # Canonical headers: the signed headers, lowercased names, trimmed values.
+    canonical_headers = ""
+    for hname in (h for h in signed_headers.split(";") if h):
+        raw = headers.get(hname, headers.get(hname.lower(), ""))
+        canonical_headers += f"{hname.lower()}:{' '.join(str(raw).split())}\n"
+
+    canonical_request = "\n".join([
+        method,
+        _uri_encode(path, encode_slash=False),
+        canonical_qs,
+        canonical_headers,
+        signed_headers,
+        _SIGV4_UNSIGNED_PAYLOAD,
+    ])
+
+    string_to_sign = "\n".join([
+        "AWS4-HMAC-SHA256",
+        amz_date,
+        f"{date_stamp}/{region}/{service}/aws4_request",
+        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+    ])
+
+    secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "test")
+    signing_key = _sigv4_signing_key(secret, date_stamp, region, service)
+    computed = hmac.new(signing_key, string_to_sign.encode("utf-8"),
+                        hashlib.sha256).hexdigest()
+
+    if not hmac.compare_digest(computed, signature):
+        return _bad_signature()
+    return None
+
+
 async def handle_request(
     method: str, path: str, headers: dict, body: bytes, query_params: dict
 ) -> tuple:
     bucket, key = _parse_bucket_key(path, headers)
+
+    sig_error = _verify_presigned_sigv4(method, path, headers, query_params)
+    if sig_error is not None:
+        status, resp_headers, resp_body = sig_error
+        resp_headers.setdefault("x-amz-request-id", new_uuid())
+        resp_headers.setdefault("x-amz-id-2", base64.b64encode(os.urandom(48)).decode())
+        return status, resp_headers, resp_body
 
     result = _dispatch(method, bucket, key, headers, body, query_params)
 
@@ -785,6 +897,8 @@ def _dispatch(
                 return _get_object_legal_hold(bucket, key)
             if "acl" in query_params:
                 return _get_object_acl(bucket, key)
+            if "attributes" in query_params:
+                return _get_object_attributes(bucket, key, headers, query_params)
             return _get_object(bucket, key, headers, query_params)
 
         if method == "PUT":
@@ -1147,12 +1261,19 @@ def _get_bucket_encryption(name: str):
     config = _bucket_encryption.get(name)
     if config:
         return 200, {"Content-Type": "application/xml"}, config
-    return _error(
-        "ServerSideEncryptionConfigurationNotFoundError",
-        "The server side encryption configuration was not found",
-        404,
-        f"/{name}",
+    # Since 5 Jan 2023 every S3 bucket has SSE-S3 (AES256) default encryption, so
+    # GetBucketEncryption returns that default configuration rather than the
+    # historical ServerSideEncryptionConfigurationNotFoundError when nothing was
+    # explicitly PUT.
+    default = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<ServerSideEncryptionConfiguration xmlns="{S3_NS}">'
+        "<Rule><ApplyServerSideEncryptionByDefault>"
+        "<SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault>"
+        "<BucketKeyEnabled>false</BucketKeyEnabled></Rule>"
+        "</ServerSideEncryptionConfiguration>"
     )
+    return 200, {"Content-Type": "application/xml"}, default
 
 
 def _put_bucket_encryption(name: str, body: bytes):
@@ -2663,6 +2784,110 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
     return 200, resp_headers, body
 
 
+def _append_object_parts(root: Element, record: dict, headers: dict) -> None:
+    """Emit the ObjectParts (ListParts) block. Multipart-completed objects carry
+    retained `parts`; single-PUT objects have no parts and list an empty page."""
+    op = SubElement(root, "ObjectParts")
+    try:
+        max_parts = int(headers.get("x-amz-max-parts", 1000))
+    except (TypeError, ValueError):
+        max_parts = 1000
+    try:
+        marker = int(headers.get("x-amz-part-number-marker", 0))
+    except (TypeError, ValueError):
+        marker = 0
+    SubElement(op, "PartNumberMarker").text = str(marker)
+    SubElement(op, "MaxParts").text = str(max_parts)
+
+    parts = record.get("parts") or []
+    after = [p for p in parts if p["PartNumber"] > marker]
+    page = after[:max_parts] if max_parts >= 0 else after
+    truncated = len(after) > len(page)
+    SubElement(op, "IsTruncated").text = "true" if truncated else "false"
+    SubElement(op, "NextPartNumberMarker").text = str(
+        page[-1]["PartNumber"] if page else 0)
+    for p in page:
+        pe = SubElement(op, "Part")
+        SubElement(pe, "PartNumber").text = str(p["PartNumber"])
+        SubElement(pe, "Size").text = str(p["Size"])
+    # TotalPartsCount is reported only for genuine multipart objects.
+    if parts:
+        SubElement(op, "PartsCount").text = str(len(parts))
+
+
+def _get_object_attributes(bucket_name: str, key: str, headers: dict,
+                           query_params: dict):
+    """S3 GetObjectAttributes — GET /{bucket}/{key}?attributes. Returns only the
+    root-level fields named in the required `x-amz-object-attributes` header."""
+    bucket = _ensure_bucket(bucket_name)
+    if bucket is None:
+        return _no_such_bucket(bucket_name)
+
+    raw_attrs = headers.get("x-amz-object-attributes")
+    if not raw_attrs:
+        return _error(
+            "InvalidRequest",
+            "The x-amz-object-attributes header is required for GetObjectAttributes.",
+            400, f"/{bucket_name}/{key}")
+    requested = {a.strip() for a in raw_attrs.split(",") if a.strip()}
+
+    resp_headers = {"Content-Type": "application/xml"}
+    version_id = _qp(query_params, "versionId", "")
+    if version_id:
+        record = None
+        for v in _object_versions.get((bucket_name, key), []):
+            if v["version_id"] == version_id:
+                record = {
+                    "etag": v["etag"],
+                    "size": v["size"],
+                    "last_modified": v["last_modified"],
+                    "storage_class": v.get("storage_class") or "STANDARD",
+                    "checksums": v.get("checksums") or {},
+                    "parts": v.get("parts"),
+                }
+                break
+        if record is None:
+            return _error("NoSuchVersion", "The specified version does not exist.",
+                          404, f"/{bucket_name}/{key}")
+        resp_headers["x-amz-version-id"] = version_id
+    else:
+        obj = bucket["objects"].get(key)
+        if obj is None:
+            return _error("NoSuchKey", "The specified key does not exist.",
+                          404, f"/{bucket_name}/{key}")
+        record = obj
+        if obj.get("version_id"):
+            resp_headers["x-amz-version-id"] = obj["version_id"]
+
+    resp_headers["Last-Modified"] = iso_to_rfc7231(record["last_modified"])
+
+    # Emit only requested attributes, in the AWS response order.
+    root = Element("GetObjectAttributesResponse", xmlns=S3_NS)
+    if "ETag" in requested:
+        # GetObjectAttributes returns the ETag WITHOUT the surrounding quotes
+        # that the ETag HTTP header carries on Get/HeadObject.
+        SubElement(root, "ETag").text = (record.get("etag") or "").strip('"')
+    if "Checksum" in requested:
+        checksums = record.get("checksums") or {}
+        cks = SubElement(root, "Checksum")
+        for alg, val in checksums.items():
+            SubElement(cks, f"Checksum{alg}").text = val
+        if checksums:
+            SubElement(cks, "ChecksumType").text = (
+                "COMPOSITE" if record.get("parts") else "FULL_OBJECT")
+    if "ObjectParts" in requested:
+        _append_object_parts(root, record, headers)
+    if "StorageClass" in requested:
+        sc = record.get("storage_class") or "STANDARD"
+        # AWS returns StorageClass for every class except S3 Standard.
+        if sc != "STANDARD":
+            SubElement(root, "StorageClass").text = sc
+    if "ObjectSize" in requested:
+        SubElement(root, "ObjectSize").text = str(record["size"])
+
+    return 200, resp_headers, _xml_body(root)
+
+
 def _range_error_xml(bucket_name: str, key: str) -> Element:
     root = Element("Error")
     SubElement(root, "Code").text = "InvalidRange"
@@ -4118,6 +4343,7 @@ def _complete_multipart_upload(
 
     md5_digests = b""
     combined = b""
+    part_records = []
     for pn, req_etag in ordered_parts:
         if pn not in upload["parts"]:
             return _error(
@@ -4135,6 +4361,9 @@ def _complete_multipart_upload(
             )
         md5_digests += hashlib.md5(stored["body"]).digest()
         combined += stored["body"]
+        # Retained so GetObjectAttributes can report ObjectParts (ListParts
+        # functionality) for the completed multipart object.
+        part_records.append({"PartNumber": pn, "Size": len(stored["body"])})
 
     final_md5 = hashlib.md5(md5_digests).hexdigest()
     final_etag = f'"{final_md5}-{len(ordered_parts)}"'
@@ -4149,6 +4378,7 @@ def _complete_multipart_upload(
         "metadata": upload["metadata"],
         "preserved_headers": upload.get("preserved_headers", {}),
         "storage_class": upload.get("storage_class") or "STANDARD",
+        "parts": part_records,
     }
     bucket["objects"][key] = obj
 

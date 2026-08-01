@@ -34,6 +34,7 @@ import ministack.services.ec2 as _ec2
 import ministack.services.ecr as _ecr
 import ministack.services.ecs as _ecs
 import ministack.services.eventbridge as _eb
+import ministack.services.firehose as _firehose
 import ministack.services.iam as _iam
 import ministack.services.iot as _iot
 import ministack.services.kinesis as _kinesis
@@ -3300,6 +3301,7 @@ def _ec2_vpc_endpoint_attributes(endpoint):
 
 
 def _ec2_vpc_endpoint_create(logical_id, props, stack_name):
+    _ec2._ensure_defaults_initialized()
     endpoint_id = "vpce-" + "".join(random.choices(string.hexdigits[:16], k=17))
     endpoint = {
         "VpcEndpointId": endpoint_id,
@@ -3328,6 +3330,7 @@ def _ec2_vpc_endpoint_create(logical_id, props, stack_name):
 
 
 def _ec2_vpc_endpoint_update(physical_id, old_props, new_props, stack_name):
+    _ec2._ensure_defaults_initialized()
     endpoint = _ec2._vpc_endpoints.get(physical_id)
     if not endpoint:
         return _ec2_vpc_endpoint_create(physical_id, new_props, stack_name)
@@ -3383,6 +3386,7 @@ def _ec2_subnet_delete(physical_id, props):
 
 
 def _ec2_sg_create(logical_id, props, stack_name):
+    _ec2._ensure_defaults_initialized()
     name = props.get("GroupName", f"{stack_name}-{logical_id}")
     desc = props.get("GroupDescription", name)
     vpc_id = props.get("VpcId", _ec2._DEFAULT_VPC_ID)
@@ -3459,6 +3463,7 @@ def _ec2_vpc_gw_attach_delete(physical_id, props):
 
 
 def _ec2_rtb_create(logical_id, props, stack_name):
+    _ec2._ensure_defaults_initialized()
     import random
     import string
     vpc_id = props.get("VpcId", _ec2._DEFAULT_VPC_ID)
@@ -4651,25 +4656,13 @@ def _ses_email_identity_delete(physical_id, props):
 
 def _waf_web_acl_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=128)
-    uid = new_uuid()
-    lock_token = new_uuid()
     scope = props.get("Scope", "REGIONAL")
-    arn = f"arn:aws:wafv2:{get_region()}:{get_account_id()}:{scope.lower()}/webacl/{name}/{uid}"
-    _waf._web_acls[uid] = {
-        "ARN": arn, "Id": uid, "Name": name,
-        "Description": props.get("Description", ""),
-        "DefaultAction": props.get("DefaultAction", {"Allow": {}}),
-        "Rules": props.get("Rules", []),
-        "VisibilityConfig": props.get("VisibilityConfig", {}),
-        "Capacity": 0,
-        "LockToken": lock_token,
-        "Scope": scope,
-    }
+    uid, arn, _record = _waf.create_web_acl_record(name, scope, props)
     return uid, {"Arn": arn, "Id": uid}
 
 
 def _waf_web_acl_delete(physical_id, props):
-    _waf._web_acls.pop(physical_id, None)
+    _waf.delete_web_acl_record(physical_id, props.get("Scope", "REGIONAL"))
 
 
 # ---------------------------------------------------------------------------
@@ -5193,7 +5186,20 @@ def _s3tables_table_create(logical_id, props, stack_name):
     table_name = props.get("TableName", "")
     bucket_name = bucket_arn.rsplit("/", 1)[-1]
     location = f"s3://{bucket_name}/{namespace}/{table_name}"
-    iceberg_metadata = _s3tables._initial_iceberg_metadata(table_name, [], location)
+    # IcebergMetadata.IcebergSchema.SchemaFieldList is how CFN (and CDK's
+    # Table L1/L2 constructs) declare the table's columns; without parsing it
+    # here every CFN-created table ends up with an empty Iceberg schema, which
+    # then fails downstream (e.g. a Firehose Iceberg-destination delivery
+    # errors with "does not have a column with name ...") even though the
+    # template clearly declares one.
+    schema_field_list = (
+        props.get("IcebergMetadata", {}).get("IcebergSchema", {}).get("SchemaFieldList", [])
+    )
+    schema_fields = [
+        {"name": f["Name"], "type": f.get("Type", "string"), "required": f.get("Required", False)}
+        for f in schema_field_list
+    ]
+    iceberg_metadata = _s3tables._initial_iceberg_metadata(table_name, schema_fields, location)
     metadata_location = f"s3://{bucket_name}/{namespace}/{table_name}/metadata/v0.metadata.json"
     table_arn = _s3tables._table_arn(bucket_arn, namespace, table_name)
     key = _s3tables._table_key(bucket_arn, namespace, table_name)
@@ -5204,7 +5210,7 @@ def _s3tables_table_create(logical_id, props, stack_name):
         "ownerAccountId": get_account_id(),
         "metadataLocation": metadata_location, "warehouseLocation": location,
         "_iceberg_metadata": iceberg_metadata, "_metadata_version": 0,
-        "_schema_fields": [],
+        "_schema_fields": schema_fields,
     }
     for b in _s3tables._table_buckets.values():
         if b["arn"] == bucket_arn:
@@ -5220,6 +5226,59 @@ def _s3tables_table_delete(physical_id, props):
     namespace = props.get("Namespace", "")
     table_name = props.get("TableName", "")
     _s3tables._tables.pop(_s3tables._table_key(bucket_arn, namespace, table_name), None)
+
+
+# --- Kinesis Data Firehose DeliveryStream ---
+
+def _firehose_delivery_stream_create(logical_id, props, stack_name):
+    # CFN Properties mirror the CreateDeliveryStream API shape (destination
+    # configs, DeliveryStreamType, Tags), so pass them straight through to the
+    # existing Firehose control plane. Ref returns the stream name; Fn::GetAtt
+    # Arn returns the stream ARN.
+    name = props.get("DeliveryStreamName") or _physical_name(
+        stack_name, logical_id, max_len=64
+    )
+    data = dict(props)
+    data["DeliveryStreamName"] = name
+    status, _headers, body = _firehose._create_delivery_stream(data)
+    if status >= 400:
+        raise ValueError(
+            f"AWS::KinesisFirehose::DeliveryStream create failed: {body!r}"
+        )
+    return name, {"Arn": _firehose._stream_arn(name)}
+
+
+def _firehose_delivery_stream_update(physical_id, old_props, new_props, stack_name):
+    # DeliveryStreamName, DeliveryStreamType, and the source configs require
+    # replacement; destination configuration changes apply in place.
+    replace_keys = (
+        "DeliveryStreamName", "DeliveryStreamType",
+        "KinesisStreamSourceConfiguration", "MSKSourceConfiguration",
+    )
+    if any(new_props.get(k) != old_props.get(k) for k in replace_keys):
+        new_id, attrs = _firehose_delivery_stream_create(
+            physical_id, new_props, stack_name
+        )
+        _firehose_delivery_stream_delete(physical_id, old_props)
+        return new_id, attrs
+    stream = _firehose._streams.get(physical_id)
+    if stream is None:
+        return _firehose_delivery_stream_create(physical_id, new_props, stack_name)
+    dtype, cfg = _firehose._resolve_dest_type_and_config(new_props)
+    if dtype and cfg is not None:
+        stream["destinations"] = [{
+            "id": _firehose._next_dest_id(),
+            "type": dtype,
+            "config": cfg,
+            "records": [],
+        }]
+        stream["version"] = stream.get("version", 1) + 1
+        stream["updated_at"] = _firehose.now_epoch()
+    return physical_id, {"Arn": _firehose._stream_arn(physical_id)}
+
+
+def _firehose_delivery_stream_delete(physical_id, props):
+    _firehose._delete_delivery_stream({"DeliveryStreamName": physical_id})
 
 
 _RESOURCE_HANDLERS = {
@@ -5288,6 +5347,11 @@ _RESOURCE_HANDLERS = {
     "AWS::Events::Rule": {"create": _eb_rule_create, "delete": _eb_rule_delete},
     "AWS::Events::EventBus": {"create": _eb_event_bus_create, "delete": _eb_event_bus_delete},
     "AWS::Kinesis::Stream": {"create": _kinesis_stream_create, "delete": _kinesis_stream_delete},
+    "AWS::KinesisFirehose::DeliveryStream": {
+        "create": _firehose_delivery_stream_create,
+        "update": _firehose_delivery_stream_update,
+        "delete": _firehose_delivery_stream_delete,
+    },
     "AWS::Lambda::Permission": {"create": _lambda_permission_create, "delete": _lambda_permission_delete},
     "AWS::Lambda::Version": {"create": _lambda_version_create},
     "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create},

@@ -64,6 +64,14 @@ SERVICE_PATTERNS = {
         "target_prefixes": ["DynamoDB_20120810"],
         "host_patterns": [r"dynamodb\."],
     },
+    # Lambda MicroVMs (2025-09-09) sign with credential scope `lambda-microvms`
+    # and use host `lambda-microvms.{region}.amazonaws.com` — distinct from
+    # Lambda's `lambda.` host, so this must be its own entry. Listed before
+    # `lambda` for clarity; the patterns are disjoint.
+    "lambda-microvms": {
+        "path_patterns": [r"^/2025-09-09/microvm"],
+        "host_patterns": [r"lambda-microvms\."],
+    },
     "lambda": {
         "path_patterns": [
             r"^/2015-03-31/",
@@ -524,6 +532,10 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             # Map common credential scope names
             scope_map = {
                 "monitoring": "monitoring",
+                # bedrock-agentcore-control and bedrock-agentcore both sign with
+                # credential scope "bedrock-agentcore" (verified via botocore
+                # signing_name); one handler serves both, dispatching by path.
+                "bedrock-agentcore": "bedrock-agentcore",
                 "execute-api": "apigateway",
                 "ses": "ses",
                 "states": "states",
@@ -663,6 +675,9 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "ListInstanceProfiles": "iam",
             "ListInstanceProfilesForRole": "iam",
             "UpdateAssumeRolePolicy": "iam",
+            "UpdateRoleDescription": "iam",
+            "PutRolePermissionsBoundary": "iam",
+            "DeleteRolePermissionsBoundary": "iam",
             "AttachUserPolicy": "iam",
             "DetachUserPolicy": "iam",
             "ListAttachedUserPolicies": "iam",

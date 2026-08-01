@@ -140,13 +140,13 @@ MiniStack supports lightweight multi-tenancy without any configuration. If the `
 ```bash
 # Team A — gets account 111111111111
 export AWS_ACCESS_KEY_ID=111111111111
-export AWS_SECRET_ACCESS_KEY=anything
+export AWS_SECRET_ACCESS_KEY=test
 aws --endpoint-url=http://localhost:4566 sts get-caller-identity
 # → { "Account": "111111111111", ... }
 
 # Team B — gets account 222222222222
 export AWS_ACCESS_KEY_ID=222222222222
-export AWS_SECRET_ACCESS_KEY=anything
+export AWS_SECRET_ACCESS_KEY=test
 aws --endpoint-url=http://localhost:4566 sts get-caller-identity
 # → { "Account": "222222222222", ... }
 ```
@@ -160,7 +160,7 @@ Since 1.4.0 state is additionally isolated per **region** — see [Multi-Region]
 | `111111111111` | `111111111111` |
 | `048408301323` | `048408301323` |
 | `test` | `000000000000` (default) |
-| `AKIAIOSFODNN7EXAMPLE` | `000000000000` (default) |
+| `AKIA_TEST_KEY_DO_NOT_USE` | `000000000000` (default) |
 
 **Terraform** — set `access_key` in your provider block:
 ```hcl
@@ -215,11 +215,11 @@ use1.list_tables()["TableNames"]   # → ["users"]
 euw1.list_tables()["TableNames"]   # → [] — eu-west-1 is independent
 ```
 
-**Region-isolated services:** AppConfig, Bedrock (all four services), CloudWatch, CloudWatch Logs, DynamoDB (tables, metadata, Streams), Lambda (functions, event source mappings, durable executions), MSK, RDS, S3 Tables, Secrets Manager, SQS, SSM Parameter Store, and Step Functions (1.4.0); EventBridge Pipes (1.4.1); SNS, Kinesis, KMS, and ElastiCache (1.4.2); EventBridge, ECS, and Firehose (1.4.3); EventBridge Scheduler, CodeBuild, and Resource Groups (1.4.4); Batch and SES (1.4.5); Athena, Auto Scaling, Cloud Map, EFS, EMR, Inspector2, Amazon MQ, AppSync, and S3 Files (1.4.6).
+**Region-isolated services:** AppConfig, Bedrock (all four services), CloudWatch, CloudWatch Logs, DynamoDB (tables, metadata, Streams), Lambda (functions, event source mappings, durable executions), MSK, RDS, S3 Tables, Secrets Manager, SQS, SSM Parameter Store, and Step Functions (1.4.0); EventBridge Pipes (1.4.1); SNS, Kinesis, KMS, and ElastiCache (1.4.2); EventBridge, ECS, and Firehose (1.4.3); EventBridge Scheduler, CodeBuild, and Resource Groups (1.4.4); Batch and SES (1.4.5); Athena, Auto Scaling, Cloud Map, EFS, EMR, Inspector2, Amazon MQ, AppSync, and S3 Files (1.4.6); Amazon Bedrock AgentCore, Amazon MWAA, Amazon EKS, and AWS Transfer Family (1.4.7); AWS IoT and AppSync Events (1.4.8); EC2, CloudTrail, ECR, Glue, OpenSearch, WAFv2, Backup, ACM, Elastic Load Balancing (ALB/NLB), MediaConnect, and RDS Data (1.4.9).
 
 Cross-resource references resolve in the referenced ARN's own account and region (SNS→SQS fanout, EventBridge targets, event source mappings), and cross-region references that real AWS rejects return the same errors AWS returns — e.g. invoking a `eu-west-1` Lambda from a `us-east-1` Step Functions task fails with `Functions from 'eu-west-1' are not reachable in this region`, exactly as on AWS.
 
-**Not yet region-isolated:** S3, IAM/STS, EC2, ECR, EKS, EFS, Glue, Athena, API Gateway v1/v2, Cognito, CloudFormation, CloudFront, Route 53, EMR, SES, CodeBuild, AutoScaling, WAF, ACM, Backup, Organizations, EventBridge Scheduler, Transfer Family, AppSync, CloudTrail, and the remaining control-plane services — these share state across regions within an account (as all services did before 1.4.0); use unique resource names there if your tests exercise two regions. Region isolation for them lands in subsequent releases.
+**Not yet region-isolated:** S3, IAM/STS, EC2, ECR, Glue, API Gateway v1/v2, Cognito, CloudFormation, CloudFront, Route 53, WAF, ACM, Backup, Organizations, CloudTrail, and the remaining control-plane services — these share state across regions within an account (as all services did before 1.4.0); use unique resource names there if your tests exercise two regions. Region isolation for them lands in subsequent releases.
 
 **Upgrading with `PERSIST_STATE=1`:** existing state files load and migrate automatically (on-disk format v2 with a version stamp — a newer-format file is refused instead of mis-parsed on downgrade). Each record's region is recovered from its stored ARNs; legacy records that carry no ARN migrate to the default region (`MINISTACK_REGION`).
 
@@ -402,7 +402,7 @@ subnet = ec2.create_subnet(
 | **DynamoDB** | CreateTable, UpdateTable, DeleteTable, DescribeTable, ListTables, PutItem, GetItem, DeleteItem, UpdateItem, Query, Scan, BatchWriteItem, BatchGetItem, TransactWriteItems, TransactGetItems, DescribeTimeToLive, UpdateTimeToLive, DescribeContinuousBackups, UpdateContinuousBackups, DescribeEndpoints, TagResource, UntagResource, ListTagsOfResource, EnableKinesisStreamingDestination, DisableKinesisStreamingDestination, DescribeKinesisStreamingDestination, UpdateKinesisStreamingDestination | TTL enforced via thread-safe background reaper (60s cadence); DynamoDB Streams — `StreamSpecification` emits INSERT/MODIFY/REMOVE records on all write operations, respects `StreamViewType`; Kinesis streaming destinations (`aws_dynamodb_kinesis_streaming_destination`) fan item mutations out into any Kinesis stream by ARN while the destination is ACTIVE |
 | **DynamoDB Streams** | ListStreams, DescribeStream, GetShardIterator, GetRecords | Reads records emitted by the main DynamoDB service via `boto3.client("dynamodbstreams")` — single synthetic shard per stream; `TRIM_HORIZON`/`LATEST`/`AT_SEQUENCE_NUMBER`/`AFTER_SEQUENCE_NUMBER` iterator types; `NEW_AND_OLD_IMAGES`, `NEW_IMAGE`, `OLD_IMAGE`, `KEYS_ONLY` view types; opaque base64 iterator tokens |
 | **Lambda** | CreateFunction, DeleteFunction, GetFunction, GetFunctionConfiguration, ListFunctions, Invoke, UpdateFunctionCode, UpdateFunctionConfiguration, AddPermission, RemovePermission, GetPolicy, ListVersionsByFunction, PublishVersion, CreateAlias, GetAlias, UpdateAlias, DeleteAlias, ListAliases, TagResource, UntagResource, ListTags, CreateEventSourceMapping, DeleteEventSourceMapping, GetEventSourceMapping, ListEventSourceMappings, UpdateEventSourceMapping, CreateFunctionUrlConfig, GetFunctionUrlConfig, UpdateFunctionUrlConfig, DeleteFunctionUrlConfig, ListFunctionUrlConfigs, PutFunctionConcurrency, GetFunctionConcurrency, DeleteFunctionConcurrency, PutFunctionEventInvokeConfig, GetFunctionEventInvokeConfig, DeleteFunctionEventInvokeConfig, PublishLayerVersion, GetLayerVersion, GetLayerVersionByArn, ListLayerVersions, DeleteLayerVersion, ListLayers, AddLayerVersionPermission, RemoveLayerVersionPermission, GetLayerVersionPolicy, CheckpointDurableExecution, GetDurableExecution, GetDurableExecutionState, GetDurableExecutionHistory, ListDurableExecutionsByFunction, StopDurableExecution, SendDurableExecutionCallbackSuccess, SendDurableExecutionCallbackFailure, SendDurableExecutionCallbackHeartbeat | Python and Node.js runtimes execute with warm worker pool; `provided.al2023`/`provided.al2` runtimes execute via Docker RIE (Go, Rust, C++ support); `Publish=True` creates immutable numbered versions; Code via `ZipFile`, `S3Bucket`/`S3Key` (with optional `S3ObjectVersion`), or `ImageUri` (Docker image); `PackageType: Image` pulls and invokes user-provided Docker images via Lambda RIE; SQS, Kinesis, and DynamoDB Streams event source mappings; Function URL CRUD; Lambda Layers CRUD; Aliases; Concurrency; EventInvokeConfig; **Durable Functions** — `CreateFunction` accepts `DurableConfig`; checkpoint/state/history/list/stop ops at the preview API (`2025-12-01`); external `SendCallback{Success,Failure,Heartbeat}` resume the SDK across invocations; resume scheduler fires WAIT expiries, callback timeouts, and step-retry backoffs; verified against the official `aws-durable-execution-sdk-python` and `aws-durable-execution-sdk-java`; **X-Ray active tracing** — `TracingConfig.Mode=Active` injects `_X_AMZN_TRACE_ID` (`Root=1-<hex>-<hex>;Parent=<hex>;Sampled=1`) into the runtime per invocation so the AWS X-Ray SDK runs without `Missing AWS Lambda trace data`; supported on the warm Python / Node executor, provided runtimes, and the local subprocess fallback (docker RIE upstream does not implement X-Ray and is logged but unsupported) |
-| **IAM** | CreateUser, GetUser, ListUsers, DeleteUser, CreateRole, GetRole, ListRoles, DeleteRole, CreatePolicy, GetPolicy, DeletePolicy, AttachRolePolicy, DetachRolePolicy, PutRolePolicy, GetRolePolicy, DeleteRolePolicy, ListRolePolicies, ListAttachedRolePolicies, CreateAccessKey, ListAccessKeys, DeleteAccessKey, UpdateAccessKey, GetAccessKeyLastUsed, CreateInstanceProfile, GetInstanceProfile, DeleteInstanceProfile, AddRoleToInstanceProfile, RemoveRoleFromInstanceProfile, ListInstanceProfiles, TagInstanceProfile, UntagInstanceProfile, ListInstanceProfileTags, CreateGroup, GetGroup, AddUserToGroup, RemoveUserFromGroup, AttachGroupPolicy, DetachGroupPolicy, ListAttachedGroupPolicies, PutGroupPolicy, GetGroupPolicy, DeleteGroupPolicy, ListGroupPolicies, CreateServiceLinkedRole, DeleteServiceLinkedRole, GetServiceLinkedRoleDeletionStatus, CreateOpenIDConnectProvider, ListOpenIDConnectProviders, CreateSAMLProvider, GetSAMLProvider, ListSAMLProviders, UpdateSAMLProvider, DeleteSAMLProvider, CreateLoginProfile, GetLoginProfile, UpdateLoginProfile, DeleteLoginProfile, CreateVirtualMFADevice, EnableMFADevice, DeactivateMFADevice, ResyncMFADevice, ListMFADevices, ListVirtualMFADevices, DeleteVirtualMFADevice, GetAccountAuthorizationDetails, GenerateServiceLastAccessedDetails, GetServiceLastAccessedDetails, TagRole, UntagRole, TagUser, UntagUser, TagPolicy, UntagPolicy, GenerateCredentialReport, GetCredentialReport, GetAccountSummary, GetAccountPasswordPolicy, UpdateAccountPasswordPolicy, DeleteAccountPasswordPolicy, ListAccountAliases, CreateAccountAlias, DeleteAccountAlias | |
+| **IAM** | CreateUser, GetUser, ListUsers, DeleteUser, CreateRole, GetRole, ListRoles, DeleteRole, UpdateRoleDescription, PutRolePermissionsBoundary, DeleteRolePermissionsBoundary, CreatePolicy, GetPolicy, DeletePolicy, AttachRolePolicy, DetachRolePolicy, PutRolePolicy, GetRolePolicy, DeleteRolePolicy, ListRolePolicies, ListAttachedRolePolicies, CreateAccessKey, ListAccessKeys, DeleteAccessKey, UpdateAccessKey, GetAccessKeyLastUsed, CreateInstanceProfile, GetInstanceProfile, DeleteInstanceProfile, AddRoleToInstanceProfile, RemoveRoleFromInstanceProfile, ListInstanceProfiles, TagInstanceProfile, UntagInstanceProfile, ListInstanceProfileTags, CreateGroup, GetGroup, AddUserToGroup, RemoveUserFromGroup, AttachGroupPolicy, DetachGroupPolicy, ListAttachedGroupPolicies, PutGroupPolicy, GetGroupPolicy, DeleteGroupPolicy, ListGroupPolicies, CreateServiceLinkedRole, DeleteServiceLinkedRole, GetServiceLinkedRoleDeletionStatus, CreateOpenIDConnectProvider, ListOpenIDConnectProviders, CreateSAMLProvider, GetSAMLProvider, ListSAMLProviders, UpdateSAMLProvider, DeleteSAMLProvider, CreateLoginProfile, GetLoginProfile, UpdateLoginProfile, DeleteLoginProfile, CreateVirtualMFADevice, EnableMFADevice, DeactivateMFADevice, ResyncMFADevice, ListMFADevices, ListVirtualMFADevices, DeleteVirtualMFADevice, GetAccountAuthorizationDetails, GenerateServiceLastAccessedDetails, GetServiceLastAccessedDetails, TagRole, UntagRole, TagUser, UntagUser, TagPolicy, UntagPolicy, GenerateCredentialReport, GetCredentialReport, GetAccountSummary, GetAccountPasswordPolicy, UpdateAccountPasswordPolicy, DeleteAccountPasswordPolicy, ListAccountAliases, CreateAccountAlias, DeleteAccountAlias | Role descriptions and permissions boundaries round-trip through role reads; boundaries support put/delete updates. |
 | **STS** | GetCallerIdentity, AssumeRole, GetSessionToken, AssumeRoleWithWebIdentity | |
 | **IMDS** (EC2 Instance Metadata) | `PUT /latest/api/token`, `GET /latest/meta-data/instance-id`, `GET /latest/meta-data/iam/security-credentials/`, `GET /latest/meta-data/iam/security-credentials/<role>`, `GET /latest/meta-data/iam/info`, `GET /latest/meta-data/placement/{region,availability-zone,...}`, `GET /latest/dynamic/instance-identity/document` | IMDSv1 + IMDSv2; default credential chain falls through to a `ministack-instance-role` document with `ASIA*` session creds. Point SDKs at ministack via `AWS_EC2_METADATA_SERVICE_ENDPOINT=http://localhost:4566` (or `ec2_metadata_service_endpoint` in `~/.aws/config`); set `MINISTACK_IMDS_V2_REQUIRED=1` to require the token PUT |
 | **ECS Task Metadata V4** | `GET /v4/<token>`, `GET /v4/<token>/task`, `GET /v4/<token>/stats`, `GET /v4/<token>/task/stats` | Per-container token injected as `ECS_CONTAINER_METADATA_URI_V4` on every container started by `RunTask`. `/task` returns sibling containers in the same task. Containers reach the gateway via `host.docker.internal` (mapped through `extra_hosts: host-gateway`, so it works on user-defined Docker networks); `networkMode: host` containers use loopback. Volatile by design (stripped on persistence, cleared by `/_ministack/reset`) |
@@ -426,6 +426,7 @@ subnet = ec2.create_subnet(
 | **Bedrock Runtime** | Converse, ConverseStream, InvokeModel, InvokeModelWithResponseStream, ApplyGuardrail, StartAsyncInvoke, GetAsyncInvoke, ListAsyncInvokes | Real eventstream wire format on streaming operations; deterministic family-aware mock responses selected by model ID prefix (`anthropic.*`, `amazon.titan*`, `amazon.nova*`, `meta.llama*`, `mistral.*`, `cohere.*`, `ai21.*`); verified against botocore `bedrock-runtime-2023-09-30` |
 | **Bedrock Agent** | 72 operations — agents (versions, aliases, action groups, collaborators, agent knowledge bases, PrepareAgent), knowledge bases (data sources, ingestion jobs, documents), flows (aliases, versions, ValidateFlowDefinition, PrepareFlow), prompts with versions, tagging | All 72 operations verified against botocore `bedrock-agent-2023-06-05` |
 | **Bedrock Agent Runtime** | InvokeAgent, InvokeInlineAgent, GetAgentMemory, DeleteAgentMemory, Retrieve, RetrieveAndGenerate, RetrieveAndGenerateStream, Rerank, CreateSession, GetSession, UpdateSession, DeleteSession, EndSession, ListSessions, CreateInvocation, ListInvocations, PutInvocationStep, GetInvocationStep, ListInvocationSteps, InvokeFlow, StartFlowExecution, StopFlowExecution, GetFlowExecution, ListFlowExecutions, ListFlowExecutionEvents, GetExecutionFlowSnapshot, OptimizePrompt | All 31 operations verified against botocore `bedrock-agent-runtime-2023-07-26`; eventstream responses on streaming operations |
+| **Bedrock AgentCore** | Control plane (`bedrock-agentcore-control`): CreateAgentRuntime, GetAgentRuntime, ListAgentRuntimes, UpdateAgentRuntime, DeleteAgentRuntime, ListAgentRuntimeVersions, CreateAgentRuntimeEndpoint, GetAgentRuntimeEndpoint, ListAgentRuntimeEndpoints, UpdateAgentRuntimeEndpoint, DeleteAgentRuntimeEndpoint. Data plane (`bedrock-agentcore`): InvokeAgentRuntime | Agent-runtime lifecycle with `CREATING`/`UPDATING`→`READY` transitions, versioned ARNs (`agent/{uuid}:{version}`, `agentEndpoint/{uuid}`); request/response shapes verified against botocore `bedrock-agentcore-control` / `bedrock-agentcore`; account- and region-scoped state; `InvokeAgentRuntime` is a deterministic echo (no model inference), matching the requested emulation scope |
 | **MSK** | CreateCluster, ListClusters, DescribeCluster, DeleteCluster, GetBootstrapBrokers, ListNodes, CreateConfiguration, ListConfigurations, DescribeConfiguration, ListConfigurationRevisions, DescribeConfigurationRevision, BatchAssociateScramSecret, BatchDisassociateScramSecret, ListScramSecrets, TagResource, UntagResource, ListTagsForResource | Kafka control plane; `GetBootstrapBrokers` honors `MINISTACK_MSK_BOOTSTRAP` so clients route to a real broker you bring (Redpanda, Kafka, KRaft) — the Kafka wire protocol itself is not emulated |
 | **WAF v2** | CreateWebACL, GetWebACL, UpdateWebACL, DeleteWebACL, ListWebACLs, AssociateWebACL, DisassociateWebACL, GetWebACLForResource, ListResourcesForWebACL, CreateIPSet, GetIPSet, UpdateIPSet, DeleteIPSet, ListIPSets, CreateRuleGroup, GetRuleGroup, UpdateRuleGroup, DeleteRuleGroup, ListRuleGroups, TagResource, UntagResource, ListTagsForResource, CheckCapacity, DescribeManagedRuleGroup | LockToken enforced on Update/Delete; resource associations tracked |
 | **Step Functions** | CreateStateMachine, DeleteStateMachine, DescribeStateMachine, UpdateStateMachine, ListStateMachines, StartExecution, StartSyncExecution, StopExecution, DescribeExecution, DescribeStateMachineForExecution, ListExecutions, GetExecutionHistory, SendTaskSuccess, SendTaskFailure, SendTaskHeartbeat, CreateActivity, DeleteActivity, DescribeActivity, ListActivities, GetActivityTask, TestState, TagResource, UntagResource, ListTagsForResource | Full ASL interpreter; Retry/Catch; waitForTaskToken; Activities (worker pattern); Pass/Task/Choice/Wait/Succeed/Fail/Map/Parallel; TestState API with mock and inspectionLevel support; SFN_MOCK_CONFIG for AWS SFN Local compatible mock testing; intrinsic functions (States.StringToJson, States.JsonToString, States.JsonMerge, States.Format); nested startExecution.sync |
@@ -914,7 +915,7 @@ Supported runtimes and the AWS public ECR images MiniStack pulls for them:
 
 Containers are named `lambda-<random-hex-16>` and pooled across invocations. Idle containers are reaped after `LAMBDA_WARM_TTL_SECONDS` (default 300s) — no manual cleanup needed. The pool is also drained on `/_ministack/reset`.
 
-**Docker-in-Docker:** when MiniStack itself runs inside a container, set `LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT` to a Docker named volume that is also mounted at `/var/task` inside the MiniStack container. MiniStack writes the Lambda code into the volume so the sibling Lambda container (started via the host Docker socket) can read it. Not needed when MiniStack runs directly on the host.
+**Docker-in-Docker:** when MiniStack itself runs inside a container (with the host Docker socket mounted), it detects that automatically and copies each Lambda's code into the sibling runtime container over the socket. No shared volume or extra configuration is required. The legacy `LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT` env var is deprecated and ignored.
 
 **Networking:** when MiniStack runs in Docker Compose, set `DOCKER_NETWORK` to the Compose network name. All container-backed services (Lambda, RDS, EKS, ElastiCache) then attach to that network so Lambda code can reach MiniStack at `http://<ministack-service-name>:4566`. The legacy `LAMBDA_DOCKER_NETWORK` is still accepted (Lambda only) as a fallback.
 
@@ -930,16 +931,11 @@ services:
     environment:
       LAMBDA_EXECUTOR: docker
       DOCKER_NETWORK: ${COMPOSE_PROJECT_NAME}_infra-network
-      LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT: ${COMPOSE_PROJECT_NAME}_lambda-docker-volume
       AWS_DEFAULT_REGION: ${AWS_REGION:-eu-central-1}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - lambda-docker-volume:/var/task
     networks:
       - infra-network
-
-volumes:
-  lambda-docker-volume:
 
 networks:
   infra-network:
@@ -963,9 +959,10 @@ aws --endpoint-url=http://localhost:4566 eks create-cluster \
   --name my-cluster --role-arn arn:aws:iam::000000000000:role/eks \
   --resources-vpc-config subnetIds=subnet-1
 
-# Get the k3s kubeconfig (container name follows ministack-eks-{name} pattern)
-docker exec ministack-eks-my-cluster cat /etc/rancher/k3s/k3s.yaml \
-  | sed "s/127.0.0.1:6443/localhost:$(docker port ministack-eks-my-cluster 6443/tcp | cut -d: -f2)/" \
+# Get the k3s kubeconfig (container name follows
+# ministack-eks-{region}-{name}; this example uses eu-central-1)
+docker exec ministack-eks-eu-central-1-my-cluster cat /etc/rancher/k3s/k3s.yaml \
+  | sed "s/127.0.0.1:6443/localhost:$(docker port ministack-eks-eu-central-1-my-cluster 6443/tcp | cut -d: -f2)/" \
   > /tmp/ministack-kubeconfig.yaml
 
 # Use kubectl against real Kubernetes
@@ -1360,6 +1357,7 @@ See [`Testcontainers/java-testcontainers`](Testcontainers/java-testcontainers), 
 
 | Project | Description |
 |---------|-------------|
+| [**OpenArchFlow**](https://github.com/dmux/OpenArchFlow) | Open-source Progressive Web App for generating interactive AWS architecture diagrams from natural language descriptions using AI, LLMs, AI Agents, and AWS MCP. |
 | [**StackPort**](https://github.com/DaviReisVieira/stackport) | **Web UI** — visual dashboard to browse and inspect AWS resources in MiniStack. Available on [PyPI](https://pypi.org/project/stackport/) and [Docker Hub](https://hub.docker.com/r/davireis/stackport). |
 | [**McDoit.Aspire.Hosting.Ministack**](https://github.com/McDoit/aspire-hosting-ministack) | .NET Aspire hosting integration for MiniStack. |
 

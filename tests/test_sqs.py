@@ -150,6 +150,104 @@ def test_sqs_queue_url_reflects_env_host(sqs):
     assert expected_host in url
     assert "intg-sqs-urlhost" in url
 
+
+# ── #1152: QueueUrl reflects the caller's Host header ───────────────────────
+#
+# AWS JS SDK v3 uses the QueueUrl itself as the request endpoint
+# (useQueueUrlAsEndpoint), so a Lambda in the Docker executor needs a QueueUrl
+# whose host resolves back to ministack (e.g. host.docker.internal), not the
+# hardcoded `localhost`. When the operator pins MINISTACK_HOST the rewriting is
+# intentionally off, so these tests are skipped in that configuration.
+
+_DOCKER_HOST = "host.docker.internal:4566"
+
+_skip_if_host_pinned = pytest.mark.skipif(
+    bool(os.environ.get("MINISTACK_HOST")),
+    reason="explicit MINISTACK_HOST pins the queue-url host; rewriting is off",
+)
+
+
+def _json_sqs_with_host(target, payload_dict, host_header):
+    """Send a JSON-protocol SQS request with an explicit Host header and return
+    (status, parsed_body). Uses raw http.client so the Host header can be forced
+    to a value different from the TCP host boto3 would otherwise send."""
+    import http.client
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    p = urlparse(endpoint)
+    conn = http.client.HTTPConnection(p.hostname or "localhost", p.port or 4566)
+    body = json.dumps(payload_dict)
+    conn.putrequest("POST", "/", skip_host=True)
+    conn.putheader("Host", host_header)
+    conn.putheader("X-Amz-Target", f"AmazonSQS.{target}")
+    conn.putheader("Content-Type", "application/x-amz-json-1.0")
+    conn.putheader("Content-Length", str(len(body)))
+    conn.endheaders()
+    conn.send(body.encode())
+    resp = conn.getresponse()
+    status = resp.status
+    data = json.loads(resp.read() or b"{}")
+    conn.close()
+    return status, data
+
+
+@_skip_if_host_pinned
+def test_sqs_create_queue_reflects_request_host_json(sqs):
+    qname = f"intg-sqs-host-json-{_uuid_mod.uuid4().hex[:8]}"
+    status, payload = _json_sqs_with_host(
+        "CreateQueue", {"QueueName": qname}, _DOCKER_HOST)
+    assert status == 200, payload
+    assert payload["QueueUrl"].startswith(f"http://{_DOCKER_HOST}/")
+    assert qname in payload["QueueUrl"]
+    sqs.delete_queue(QueueUrl=sqs.get_queue_url(QueueName=qname)["QueueUrl"])
+
+
+@_skip_if_host_pinned
+def test_sqs_get_queue_url_reflects_request_host_json(sqs):
+    qname = f"intg-sqs-host-geturl-{_uuid_mod.uuid4().hex[:8]}"
+    sqs.create_queue(QueueName=qname)
+    status, payload = _json_sqs_with_host(
+        "GetQueueUrl", {"QueueName": qname}, _DOCKER_HOST)
+    assert status == 200, payload
+    assert payload["QueueUrl"].startswith(f"http://{_DOCKER_HOST}/")
+    assert qname in payload["QueueUrl"]
+    sqs.delete_queue(QueueUrl=sqs.get_queue_url(QueueName=qname)["QueueUrl"])
+
+
+@_skip_if_host_pinned
+def test_sqs_list_queues_reflects_request_host_json(sqs):
+    prefix = f"intg-sqs-host-list-{_uuid_mod.uuid4().hex[:8]}-"
+    sqs.create_queue(QueueName=f"{prefix}a")
+    sqs.create_queue(QueueName=f"{prefix}b")
+    status, payload = _json_sqs_with_host(
+        "ListQueues", {"QueueNamePrefix": prefix}, _DOCKER_HOST)
+    assert status == 200, payload
+    urls = payload.get("QueueUrls", [])
+    assert len(urls) >= 2
+    assert all(u.startswith(f"http://{_DOCKER_HOST}/") for u in urls)
+    for u in urls:
+        sqs.delete_queue(QueueUrl=u)
+
+
+@_skip_if_host_pinned
+def test_sqs_host_rewritten_url_is_usable_roundtrip(sqs):
+    """The rewritten host.docker.internal URL must still resolve to the queue via
+    host-agnostic lookup — proves we only rewrite the response, not stored state."""
+    qname = f"intg-sqs-host-rt-{_uuid_mod.uuid4().hex[:8]}"
+    status, payload = _json_sqs_with_host(
+        "CreateQueue", {"QueueName": qname}, _DOCKER_HOST)
+    assert status == 200, payload
+    docker_url = payload["QueueUrl"]
+    assert docker_url.startswith(f"http://{_DOCKER_HOST}/")
+    # boto3 is pointed at localhost; it passes QueueUrl in the request body, so
+    # the server must resolve the host.docker.internal URL by name.
+    sqs.send_message(QueueUrl=docker_url, MessageBody="via-docker-url")
+    msgs = sqs.receive_message(
+        QueueUrl=docker_url, MaxNumberOfMessages=1, WaitTimeSeconds=2)
+    assert [m["Body"] for m in msgs.get("Messages", [])] == ["via-docker-url"]
+    sqs.delete_queue(QueueUrl=docker_url)
+
+
 def test_sqs_send_receive_delete(sqs):
     url = sqs.create_queue(QueueName="intg-sqs-srd")["QueueUrl"]
     sqs.send_message(QueueUrl=url, MessageBody="test-body")

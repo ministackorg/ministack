@@ -283,6 +283,7 @@ SERVICE_REGISTRY = {
     "kinesis": {"module": "kinesis"},
     "kms": {"module": "kms"},
     "lambda": {"module": "lambda_svc"},
+    "lambda-microvms": {"module": "lambda_microvms"},
     "logs": {"module": "cloudwatch_logs", "aliases": ("cloudwatch-logs",)},
     "mediaconnect": {"module": "mediaconnect"},
     "opensearch": {"module": "opensearch", "aliases": ("es", "elasticsearch")},
@@ -317,6 +318,7 @@ SERVICE_REGISTRY = {
     "bedrock-runtime": {"module": "bedrock_runtime"},
     "bedrock-agent": {"module": "bedrock_agent"},
     "bedrock-agent-runtime": {"module": "bedrock_agent_runtime"},
+    "bedrock-agentcore": {"module": "bedrock_agentcore"},
     "kafka": {"module": "msk"},
 }
 
@@ -338,7 +340,8 @@ _state_map = {
     "cloudwatch_logs": "cloudwatch_logs", "kinesis": "kinesis",
     "ec2": "ec2", "route53": "route53", "cognito": "cognito",
     "ecr": "ecr", "cloudwatch": "cloudwatch", "s3": "s3",
-    "lambda": "lambda_svc", "rds": "rds", "ecs": "ecs",
+    "lambda": "lambda_svc", "lambda_microvms": "lambda_microvms",
+    "rds": "rds", "ecs": "ecs",
     "elasticache": "elasticache", "appsync": "appsync",
     "appsync_events": "appsync_events",
     "stepfunctions": "stepfunctions", "alb": "alb",
@@ -355,12 +358,14 @@ _state_map = {
     "cloudtrail": "cloudtrail", "iot": "iot",
     "inspector2": "inspector2",
     "mq": "mq",
+    "opensearch": "opensearch",
     "s3tables": "s3tables",
     "lambda_durable": "lambda_durable",
     "bedrock": "bedrock",
     "bedrock_runtime": "bedrock_runtime",
     "bedrock_agent": "bedrock_agent",
     "bedrock_agent_runtime": "bedrock_agent_runtime",
+    "bedrock_agentcore": "bedrock_agentcore",
     "msk": "msk",
 }
 
@@ -1707,7 +1712,8 @@ async def app(scope, receive, send):
         _ws_key = extract_access_key_id(ws_headers, ws_query)
         if _ws_key:
             set_request_account_id(_ws_key)
-        set_request_region(extract_region(ws_headers, ws_query))
+        ws_region = extract_region(ws_headers, ws_query)
+        set_request_region(ws_region)
         ws_host = ws_headers.get("host", "")
         ws_path = scope.get("path", "")
         parsed = _parse_execute_api_url(ws_host, ws_path)
@@ -1733,7 +1739,7 @@ async def app(scope, receive, send):
                 # params or Authorization header, fall back to default.
                 account_id = _ws_resolve_iot_account_id(scope, ws_headers)
                 await _get_module("iot").handle_websocket(
-                    scope, receive, send, account_id
+                    scope, receive, send, account_id, ws_region
                 )
         except Exception:
             logger.exception("Error in WebSocket dispatch")
@@ -1985,6 +1991,16 @@ def _load_persisted_state():
     if load_state("rds"):
         _get_module("rds")
         logger.info("RDS: eager-loaded module to respawn persisted containers at boot")
+
+    # OpenSearch has a routable management endpoint, but persisted domains must
+    # restore before the first request because restore_state() also recreates
+    # data-plane endpoints/containers. Waiting for the lazy router leaves a
+    # warm-boot window where DescribeDomain/ListDomainNames see empty state and
+    # data-plane traffic has no restored endpoint. Match RDS' conditional shape
+    # so stacks that do not persist OpenSearch pay no cold-start import cost.
+    if load_state("opensearch"):
+        _get_module("opensearch")
+        logger.info("OpenSearch: eager-loaded module to restore persisted domains")
 
     # `lambda_durable` is reached only via `lambda_svc.handle_request`, never
     # directly through the lazy router (no SERVICE_REGISTRY entry — it has no

@@ -11,6 +11,8 @@ Tests are split into two sections:
   - Event recording: LookupEvents and filter variants (require recording enabled)
 """
 
+import json
+import os
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -19,8 +21,9 @@ import pytest
 import requests
 from botocore.exceptions import ClientError
 
-ENDPOINT = "http://localhost:4566"
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 REGION = "us-east-1"
+WEST_REGION = "us-west-2"
 
 
 def _client(service, region=REGION):
@@ -141,7 +144,7 @@ def test_get_trail_does_not_resolve_foreign_region_arn_by_tail(ct):
 def test_read_trail_by_arn_from_different_request_region(ct):
     name = f"trail-cross-region-read-{_uid()}"
     arn = ct.create_trail(Name=name, S3BucketName="bucket")["TrailARN"]
-    west_ct = _client("cloudtrail", region="us-west-2")
+    west_ct = _client("cloudtrail", region=WEST_REGION)
 
     get_resp = west_ct.get_trail(Name=arn)
     assert get_resp["Trail"]["Name"] == name
@@ -151,6 +154,132 @@ def test_read_trail_by_arn_from_different_request_region(ct):
 
     desc_resp = west_ct.describe_trails(trailNameList=[arn])
     assert [trail["TrailARN"] for trail in desc_resp["trailList"]] == [arn]
+
+
+def test_single_region_trail_is_visible_only_from_home_region_by_name(ct):
+    name = f"trail-sr-scope-{_uid()}"
+    arn = ct.create_trail(Name=name, S3BucketName="bucket")["TrailARN"]
+    west_ct = _client("cloudtrail", region=WEST_REGION)
+
+    with pytest.raises(ClientError) as exc:
+        west_ct.get_trail(Name=name)
+    assert exc.value.response["Error"]["Code"] == "TrailNotFoundException"
+
+    assert not any(t["Name"] == name for t in west_ct.describe_trails()["trailList"])
+    assert not any(t["Name"] == name for t in west_ct.list_trails()["Trails"])
+    assert west_ct.describe_trails(trailNameList=[name])["trailList"] == []
+
+    # A full ARN is unambiguous and remains readable across regions.
+    assert west_ct.get_trail(Name=arn)["Trail"]["Name"] == name
+
+
+def test_multi_region_trail_is_shadow_visible_from_peer_region(ct):
+    name = f"trail-mr-scope-{_uid()}"
+    arn = ct.create_trail(
+        Name=name,
+        S3BucketName="bucket",
+        IsMultiRegionTrail=True,
+    )["TrailARN"]
+    selectors = [{"ReadWriteType": "All", "IncludeManagementEvents": True, "DataResources": []}]
+    ct.put_event_selectors(TrailName=name, EventSelectors=selectors)
+    west_ct = _client("cloudtrail", region=WEST_REGION)
+
+    assert west_ct.get_trail(Name=name)["Trail"]["HomeRegion"] == REGION
+    assert west_ct.get_trail_status(Name=name)["IsLogging"] is True
+    assert west_ct.describe_trails(trailNameList=[name])["trailList"][0]["TrailARN"] == arn
+    assert any(t["TrailARN"] == arn for t in west_ct.describe_trails()["trailList"])
+    assert any(t["TrailARN"] == arn for t in west_ct.list_trails()["Trails"])
+    assert west_ct.get_event_selectors(TrailName=name)["EventSelectors"] == selectors
+
+
+def test_describe_trails_can_exclude_multi_region_shadow_trails(ct):
+    name = f"trail-mr-shadow-{_uid()}"
+    arn = ct.create_trail(
+        Name=name,
+        S3BucketName="bucket",
+        IsMultiRegionTrail=True,
+    )["TrailARN"]
+    west_ct = _client("cloudtrail", region=WEST_REGION)
+
+    assert any(t["TrailARN"] == arn for t in west_ct.describe_trails()["trailList"])
+    assert west_ct.describe_trails(includeShadowTrails=False)["trailList"] == []
+    assert west_ct.describe_trails(
+        trailNameList=[name], includeShadowTrails=False
+    )["trailList"] == []
+
+
+def test_mutations_from_peer_region_follow_home_region_rules(ct):
+    mr_name = f"trail-mr-mutate-{_uid()}"
+    sr_name = f"trail-sr-mutate-{_uid()}"
+    mr_arn = ct.create_trail(
+        Name=mr_name,
+        S3BucketName="bucket",
+        IsMultiRegionTrail=True,
+    )["TrailARN"]
+    ct.create_trail(Name=sr_name, S3BucketName="bucket")
+    west_ct = _client("cloudtrail", region=WEST_REGION)
+
+    for operation, kwargs in (
+        (west_ct.update_trail, {"Name": mr_name, "S3BucketName": "west"}),
+        (west_ct.stop_logging, {"Name": mr_name}),
+        (
+            west_ct.put_event_selectors,
+            {
+                "TrailName": mr_name,
+                "EventSelectors": [{"ReadWriteType": "All", "IncludeManagementEvents": True}],
+            },
+        ),
+        (west_ct.delete_trail, {"Name": mr_name}),
+    ):
+        with pytest.raises(ClientError) as exc:
+            operation(**kwargs)
+        assert exc.value.response["Error"]["Code"] == "InvalidHomeRegionException"
+
+    with pytest.raises(ClientError) as exc:
+        west_ct.update_trail(Name=mr_arn, S3BucketName="west")
+    assert exc.value.response["Error"]["Code"] == "InvalidHomeRegionException"
+
+    with pytest.raises(ClientError) as exc:
+        west_ct.update_trail(Name=sr_name, S3BucketName="west")
+    assert exc.value.response["Error"]["Code"] == "TrailNotFoundException"
+
+    ct.update_trail(Name=mr_name, S3BucketName="east")
+    assert ct.get_trail(Name=mr_name)["Trail"]["S3BucketName"] == "east"
+
+
+def test_multi_region_trail_name_reserves_all_regions(ct):
+    name = f"trail-name-scope-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket", IsMultiRegionTrail=True)
+    west_ct = _client("cloudtrail", region=WEST_REGION)
+
+    with pytest.raises(ClientError) as exc:
+        west_ct.create_trail(Name=name, S3BucketName="bucket")
+    assert exc.value.response["Error"]["Code"] == "TrailAlreadyExistsException"
+
+    single_region_name = f"trail-sr-name-scope-{_uid()}"
+    east_arn = ct.create_trail(Name=single_region_name, S3BucketName="east")["TrailARN"]
+    west_arn = west_ct.create_trail(Name=single_region_name, S3BucketName="west")["TrailARN"]
+
+    assert east_arn != west_arn
+    assert ct.get_trail(Name=single_region_name)["Trail"]["S3BucketName"] == "east"
+    assert west_ct.get_trail(Name=single_region_name)["Trail"]["S3BucketName"] == "west"
+
+    west_ct.delete_trail(Name=single_region_name)
+    assert ct.get_trail(Name=single_region_name)["Trail"]["TrailARN"] == east_arn
+
+
+def test_update_trail_to_multi_region_rejects_peer_region_name_collision(ct):
+    name = f"trail-convert-collision-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="east")
+    west_ct = _client("cloudtrail", region=WEST_REGION)
+    west_ct.create_trail(Name=name, S3BucketName="west")
+
+    with pytest.raises(ClientError) as exc:
+        ct.update_trail(Name=name, IsMultiRegionTrail=True)
+    assert exc.value.response["Error"]["Code"] == "TrailAlreadyExistsException"
+
+    assert ct.get_trail(Name=name)["Trail"]["IsMultiRegionTrail"] is False
+    assert west_ct.get_trail(Name=name)["Trail"]["S3BucketName"] == "west"
 
 
 def test_get_trail_not_found(ct):
@@ -439,7 +568,7 @@ def test_add_tags_missing_aws_partition_trail_arn_returns_resource_not_found(ct)
 def test_add_tags_rejects_foreign_region_trail_arn(ct):
     name = f"trail-tags-foreign-{_uid()}"
     arn = ct.create_trail(Name=name, S3BucketName="bucket")["TrailARN"]
-    foreign_arn = arn.replace(f":{REGION}:", ":us-west-2:")
+    foreign_arn = arn.replace(f":{REGION}:", f":{WEST_REGION}:")
 
     with pytest.raises(ClientError) as exc:
         ct.add_tags(ResourceId=foreign_arn, TagsList=[{"Key": "env", "Value": "test"}])
@@ -617,6 +746,37 @@ def test_lookup_max_results(ct, s3):
         s3.create_bucket(Bucket=f"ct-maxr-{_uid()}")
     resp = ct.lookup_events(MaxResults=3)
     assert len(resp["Events"]) <= 3
+
+
+def test_lookup_events_are_region_scoped(ct):
+    east_queue = f"ct-east-{_uid()}"
+    west_queue = f"ct-west-{_uid()}"
+    east_sqs = _client("sqs", region=REGION)
+    west_sqs = _client("sqs", region=WEST_REGION)
+    west_ct = _client("cloudtrail", region=WEST_REGION)
+
+    east_sqs.create_queue(QueueName=east_queue)
+    west_sqs.create_queue(QueueName=west_queue)
+
+    east_events = ct.lookup_events(
+        LookupAttributes=[{"AttributeKey": "EventName", "AttributeValue": "CreateQueue"}]
+    )["Events"]
+    west_events = west_ct.lookup_events(
+        LookupAttributes=[{"AttributeKey": "EventName", "AttributeValue": "CreateQueue"}]
+    )["Events"]
+
+    def event_regions_for_queue(events, queue_name):
+        regions = set()
+        for event in events:
+            payload = json.loads(event["CloudTrailEvent"])
+            if payload.get("requestParameters", {}).get("QueueName") == queue_name:
+                regions.add(payload["awsRegion"])
+        return regions
+
+    assert event_regions_for_queue(east_events, east_queue) == {REGION}
+    assert event_regions_for_queue(east_events, west_queue) == set()
+    assert event_regions_for_queue(west_events, west_queue) == {WEST_REGION}
+    assert event_regions_for_queue(west_events, east_queue) == set()
 
 
 def test_lookup_newest_first(ct, s3):

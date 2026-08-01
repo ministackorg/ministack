@@ -15,6 +15,25 @@ from botocore.exceptions import ClientError
 from ministack.services import pipes as _pipes
 
 
+def _cfn_iceberg_json(path):
+    """Hit the S3 Tables Iceberg REST catalog directly (LoadTable etc.) — the
+    boto3 s3tables client only exposes the control-plane view, not the actual
+    Iceberg schema/metadata a query engine like DuckDB reads."""
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    req = urllib.request.Request(
+        f"{endpoint}{path}",
+        headers={
+            "Authorization": (
+                "AWS4-HMAC-SHA256 "
+                "Credential=test/20260604/us-east-1/s3tables/aws4_request, "
+                "SignedHeaders=host, Signature=test"
+            ),
+        },
+    )
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read().decode("utf-8") or "{}")
+
+
 def _wait_stack(cfn, name, timeout=30):
     """Poll until stack reaches terminal status."""
     deadline = time.time() + timeout
@@ -1717,6 +1736,65 @@ def test_cfn_wait_condition(cfn):
     cfn.delete_stack(StackName="cfn-wait")
     _wait_stack(cfn, "cfn-wait")
 
+
+@pytest.mark.parametrize(
+    ("scope", "arn_region", "arn_segment"),
+    [
+        ("REGIONAL", "us-east-1", "regional"),
+        ("CLOUDFRONT", "us-east-1", "global"),
+    ],
+)
+def test_cfn_wafv2_web_acl_uses_canonical_arn(
+    cfn, wafv2, scope, arn_region, arn_segment
+):
+    scope_name = scope.lower()
+    stack_name = f"cfn-wafv2-{scope_name}"
+    acl_name = f"cfn-wafv2-{scope_name}-acl"
+    template = {
+        "Resources": {
+            "Acl": {
+                "Type": "AWS::WAFv2::WebACL",
+                "Properties": {
+                    "Name": acl_name,
+                    "Scope": scope,
+                    "DefaultAction": {"Allow": {}},
+                    "VisibilityConfig": {
+                        "SampledRequestsEnabled": False,
+                        "CloudWatchMetricsEnabled": False,
+                        "MetricName": acl_name,
+                    },
+                    "Tags": [{"Key": "from", "Value": "cfn"}],
+                },
+            },
+        },
+        "Outputs": {
+            "AclId": {"Value": {"Ref": "Acl"}},
+            "AclArn": {"Value": {"Fn::GetAtt": ["Acl", "Arn"]}},
+        },
+    }
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+
+        assert outputs["AclArn"] == (
+            f"arn:aws:wafv2:{arn_region}:000000000000:"
+            f"{arn_segment}/webacl/{acl_name}/{outputs['AclId']}"
+        )
+        acls = wafv2.list_web_acls(Scope=scope)["WebACLs"]
+        assert outputs["AclArn"] in {acl["ARN"] for acl in acls}
+        tags = wafv2.list_tags_for_resource(ResourceARN=outputs["AclArn"])
+        assert tags["TagInfoForResource"]["TagList"] == [
+            {"Key": "from", "Value": "cfn"}
+        ]
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+
+    acls = wafv2.list_web_acls(Scope=scope)["WebACLs"]
+    assert acl_name not in {acl["Name"] for acl in acls}
+
 def test_cfn_secretsmanager_generate_secret_string(cfn, sm):
     """CFN stack with SecretsManager::Secret + GenerateSecretString produces valid JSON secret."""
     template = {
@@ -2042,6 +2120,135 @@ def test_cfn_ec2_vpc_endpoint_uses_ec2_state(cfn, ec2):
     assert ec2.describe_vpc_endpoints(
         VpcEndpointIds=[outputs["RefId"]]
     )["VpcEndpoints"] == []
+
+
+def test_cfn_ec2_resources_use_caller_region_context():
+    """EC2 CFN provisioners must write through the caller's region context."""
+    import boto3
+    from botocore.config import Config
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def _client(svc, region):
+        return boto3.client(
+            svc,
+            endpoint_url=endpoint,
+            region_name=region,
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+            config=Config(region_name=region, retries={"mode": "standard"}),
+        )
+
+    cfn_west = _client("cloudformation", "us-west-2")
+    cfn_east = _client("cloudformation", "us-east-1")
+    ec2_west = _client("ec2", "us-west-2")
+    ec2_east = _client("ec2", "us-east-1")
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-ec2-region-{suffix}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Vpc": {
+                "Type": "AWS::EC2::VPC",
+                "Properties": {"CidrBlock": "10.41.0.0/16"},
+            },
+            "Subnet": {
+                "Type": "AWS::EC2::Subnet",
+                "Properties": {
+                    "VpcId": {"Ref": "Vpc"},
+                    "CidrBlock": "10.41.1.0/24",
+                    "AvailabilityZone": "us-west-2a",
+                },
+            },
+            "SecurityGroup": {
+                "Type": "AWS::EC2::SecurityGroup",
+                "Properties": {
+                    "GroupDescription": "regional cfn default-vpc fallback proof",
+                },
+            },
+            "Endpoint": {
+                "Type": "AWS::EC2::VPCEndpoint",
+                "Properties": {
+                    "VpcEndpointType": "Gateway",
+                    "ServiceName": "com.amazonaws.us-west-2.s3",
+                },
+            },
+            "RouteTable": {
+                "Type": "AWS::EC2::RouteTable",
+                "Properties": {},
+            },
+        },
+        "Outputs": {
+            "VpcId": {"Value": {"Ref": "Vpc"}},
+            "SubnetId": {"Value": {"Ref": "Subnet"}},
+            "SecurityGroupId": {"Value": {"Ref": "SecurityGroup"}},
+            "EndpointId": {"Value": {"Ref": "Endpoint"}},
+            "RouteTableId": {"Value": {"Ref": "RouteTable"}},
+        },
+    }
+    outputs = {}
+
+    try:
+        cfn_west.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn_west, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+
+        assert ec2_west.describe_vpcs(VpcIds=[outputs["VpcId"]])["Vpcs"][0]["CidrBlock"] == "10.41.0.0/16"
+        assert ec2_west.describe_subnets(SubnetIds=[outputs["SubnetId"]])["Subnets"][0]["VpcId"] == outputs["VpcId"]
+        assert ec2_west.describe_security_groups(
+            GroupIds=[outputs["SecurityGroupId"]]
+        )["SecurityGroups"][0]["VpcId"] == "vpc-00000001"
+        assert ec2_west.describe_vpc_endpoints(
+            VpcEndpointIds=[outputs["EndpointId"]]
+        )["VpcEndpoints"][0]["VpcId"] == "vpc-00000001"
+        assert ec2_west.describe_route_tables(
+            RouteTableIds=[outputs["RouteTableId"]]
+        )["RouteTables"][0]["VpcId"] == "vpc-00000001"
+
+        with pytest.raises(ClientError):
+            ec2_east.describe_vpcs(VpcIds=[outputs["VpcId"]])
+        with pytest.raises(ClientError):
+            ec2_east.describe_subnets(SubnetIds=[outputs["SubnetId"]])
+        with pytest.raises(ClientError):
+            ec2_east.describe_security_groups(GroupIds=[outputs["SecurityGroupId"]])
+        assert ec2_east.describe_vpc_endpoints(VpcEndpointIds=[outputs["EndpointId"]])["VpcEndpoints"] == []
+
+        updated_template = json.loads(json.dumps(template))
+        updated_template["Resources"]["Endpoint2"] = {
+            "Type": "AWS::EC2::VPCEndpoint",
+            "Properties": {
+                "VpcEndpointType": "Gateway",
+                "ServiceName": "com.amazonaws.us-west-2.dynamodb",
+            },
+        }
+        updated_template["Outputs"]["Endpoint2Id"] = {"Value": {"Ref": "Endpoint2"}}
+
+        cfn_east.update_stack(StackName=stack_name, TemplateBody=json.dumps(updated_template))
+        stack = _wait_stack(cfn_east, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+        assert ec2_west.describe_vpc_endpoints(
+            VpcEndpointIds=[outputs["Endpoint2Id"]]
+        )["VpcEndpoints"][0]["VpcId"] == "vpc-00000001"
+        assert ec2_east.describe_vpc_endpoints(
+            VpcEndpointIds=[outputs["Endpoint2Id"]]
+        )["VpcEndpoints"] == []
+
+        cfn_east.delete_stack(StackName=stack_name)
+        _wait_stack(cfn_east, stack_name)
+        assert ec2_west.describe_vpc_endpoints(
+            VpcEndpointIds=[outputs["EndpointId"], outputs["Endpoint2Id"]]
+        )["VpcEndpoints"] == []
+    finally:
+        try:
+            cfn_west.delete_stack(StackName=stack_name)
+            _wait_stack(cfn_west, stack_name)
+        except ClientError:
+            pass
+
+    if outputs:
+        assert ec2_west.describe_vpc_endpoints(VpcEndpointIds=[outputs["EndpointId"]])["VpcEndpoints"] == []
 
 
 def test_cfn_elbv2_load_balancer_and_listener(cfn, elbv2):
@@ -5600,6 +5807,107 @@ def test_cfn_logs_resource_policy_identity_and_lifecycle(cfn):
     assert stack["StackStatus"] == "DELETE_COMPLETE"
 
 
+def test_cfn_kinesisfirehose_delivery_stream_shares_firehose_state(cfn, fh):
+    """AWS::KinesisFirehose::DeliveryStream provisions through CloudFormation and
+    shares state with the Firehose API; Ref returns the name, GetAtt Arn the ARN."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-firehose-{suffix}"
+    stream_name = f"cfn-fh-{suffix}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Stream": {
+                "Type": "AWS::KinesisFirehose::DeliveryStream",
+                "Properties": {
+                    "DeliveryStreamName": stream_name,
+                    "DeliveryStreamType": "DirectPut",
+                    "ExtendedS3DestinationConfiguration": {
+                        "BucketARN": "arn:aws:s3:::cfn-fh-bucket",
+                        "RoleARN": "arn:aws:iam::000000000000:role/firehose-role",
+                        "Prefix": "raw/",
+                    },
+                },
+            },
+        },
+        "Outputs": {
+            "RefName": {"Value": {"Ref": "Stream"}},
+            "StreamArn": {"Value": {"Fn::GetAtt": ["Stream", "Arn"]}},
+        },
+    }
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+        assert outputs["RefName"] == stream_name
+        assert outputs["StreamArn"].endswith(f":deliverystream/{stream_name}")
+
+        desc = fh.describe_delivery_stream(
+            DeliveryStreamName=stream_name
+        )["DeliveryStreamDescription"]
+        assert desc["DeliveryStreamStatus"] == "ACTIVE"
+        assert desc["DeliveryStreamARN"] == outputs["StreamArn"]
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        except ClientError:
+            pass
+
+    with pytest.raises(ClientError) as exc:
+        fh.describe_delivery_stream(DeliveryStreamName=stream_name)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_cfn_kinesisfirehose_iceberg_destination_provisions(cfn, fh):
+    """Regression for #1206: a stack with an Iceberg-destination Firehose stream
+    no longer fails with Unsupported resource type and reaches CREATE_COMPLETE."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-fh-iceberg-{suffix}"
+    stream_name = f"cfn-fh-ice-{suffix}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Stream": {
+                "Type": "AWS::KinesisFirehose::DeliveryStream",
+                "Properties": {
+                    "DeliveryStreamName": stream_name,
+                    "DeliveryStreamType": "DirectPut",
+                    "IcebergDestinationConfiguration": {
+                        "RoleARN": "arn:aws:iam::000000000000:role/firehose-role",
+                        "CatalogConfiguration": {
+                            "CatalogARN": "arn:aws:glue:us-east-1:000000000000:catalog"
+                        },
+                        "S3Configuration": {
+                            "BucketARN": "arn:aws:s3:::cfn-fh-ice-bucket",
+                            "RoleARN": "arn:aws:iam::000000000000:role/firehose-role",
+                        },
+                        "DestinationTableConfigurationList": [{
+                            "DestinationDatabaseName": "analytics",
+                            "DestinationTableName": "events",
+                            "UniqueKeys": ["id"],
+                        }],
+                    },
+                },
+            },
+        },
+        "Outputs": {"RefName": {"Value": {"Ref": "Stream"}}},
+    }
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert fh.describe_delivery_stream(
+            DeliveryStreamName=stream_name
+        )["DeliveryStreamDescription"]["DeliveryStreamStatus"] == "ACTIVE"
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        except ClientError:
+            pass
+
+
 def test_cfn_change_set_detects_parameter_driven_change(cfn, s3):
     """A change set must detect a parameter-driven property change (e.g. a Lambda
     Code S3Key behind a Ref) so `aws cloudformation deploy` doesn't silently
@@ -5921,6 +6229,10 @@ def _stack_resource(cfn, stack_name, logical_id="SearchDomain"):
     )["StackResourceDetail"]
 
 
+def _opensearch_stub_endpoint(domain_name, region="us-east-1"):
+    return f"{domain_name}.{region}.ministack.local:9200"
+
+
 def test_cfn_opensearch_domain_create_update_replace_and_idempotent_delete(
         cfn, opensearch):
     suffix = _uuid_mod.uuid4().hex[:8]
@@ -5981,7 +6293,7 @@ def test_cfn_opensearch_domain_create_update_replace_and_idempotent_delete(
         "Ref": domain_name,
         "Arn": expected_arn,
         "DomainArn": expected_arn,
-        "Endpoint": f"{domain_name}.ministack.local:9200",
+        "Endpoint": _opensearch_stub_endpoint(domain_name),
         "Id": f"000000000000/{domain_name}",
     }
 
@@ -6096,7 +6408,7 @@ def test_cfn_opensearch_auto_name_is_stable_across_update(cfn, opensearch):
     assert _stack_resource(cfn, stack_name)["PhysicalResourceId"] == physical_id
     status = opensearch.describe_domain(DomainName=physical_id)["DomainStatus"]
     assert status["EngineVersion"] == "OpenSearch_2.17"
-    assert status["Endpoints"]["vpc"] == f"{physical_id}.ministack.local:9200"
+    assert status["Endpoints"]["vpc"] == _opensearch_stub_endpoint(physical_id)
 
     # Removing VPCOptions is an in-place control-plane update and restores the
     # public endpoint response shape.
@@ -6106,7 +6418,7 @@ def test_cfn_opensearch_auto_name_is_stable_across_update(cfn, opensearch):
     assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
     assert _stack_resource(cfn, stack_name)["PhysicalResourceId"] == physical_id
     status = opensearch.describe_domain(DomainName=physical_id)["DomainStatus"]
-    assert status["Endpoint"] == f"{physical_id}.ministack.local:9200"
+    assert status["Endpoint"] == _opensearch_stub_endpoint(physical_id)
     assert "Endpoints" not in status
 
     cfn.delete_stack(StackName=stack_name)
@@ -6272,6 +6584,7 @@ def test_cfn_cdk_opensearch_access_policy_custom_resource(cfn, opensearch):
     stack_name = f"cfn-os-access-{suffix}"
     domain_name = f"access-{suffix}"
     function_name = f"cfn-os-provider-{suffix}"
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
     access_policy = json.dumps({
         "Version": "2012-10-17",
         "Statement": [{
@@ -6363,11 +6676,11 @@ exports.handler = async (event) => {
                     "Role": "arn:aws:iam::000000000000:role/custom-resource",
                     "Timeout": 10,
                     "Code": {"ZipFile": provider_code},
-                    # CDK local tooling sets this exact hostname. The SDK shim
-                    # must not turn it into the S3-shaped
-                    # ``opensearch.localhost`` virtual host.
+                    # CDK local tooling sets a root MiniStack gateway endpoint.
+                    # The SDK shim must not turn it into the S3-shaped
+                    # ``opensearch.<gateway>`` virtual host.
                     "Environment": {
-                        "Variables": {"AWS_ENDPOINT_URL": "http://localhost:4566"},
+                        "Variables": {"AWS_ENDPOINT_URL": endpoint},
                     },
                 },
             },
@@ -6450,6 +6763,69 @@ def test_cfn_s3tables_resources(cfn, s3tables):
     table = s3tables.get_table(tableBucketARN=bucket_arn, namespace="myns", name="mytable")
     assert table["name"] == "mytable"
     assert table["format"] == "ICEBERG"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_s3tables_table_schema_from_iceberg_metadata(cfn, s3tables):
+    """AWS::S3Tables::Table's IcebergMetadata.IcebergSchema.SchemaFieldList must
+    populate the table's actual Iceberg schema — not just be accepted and
+    discarded. A table created with an empty schema silently breaks any
+    consumer relying on the declared columns (e.g. a Firehose Iceberg
+    destination fails to insert with a "does not have a column" error even
+    though the CFN template clearly declares one)."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Bucket": {
+                "Type": "AWS::S3Tables::TableBucket",
+                "Properties": {"TableBucketName": "cfn-s3tables-schema-test"},
+            },
+            "Ns": {
+                "Type": "AWS::S3Tables::Namespace",
+                "Properties": {
+                    "TableBucketARN": {"Fn::GetAtt": ["Bucket", "TableBucketARN"]},
+                    "Namespace": "myns",
+                },
+                "DependsOn": "Bucket",
+            },
+            "Table": {
+                "Type": "AWS::S3Tables::Table",
+                "Properties": {
+                    "TableBucketARN": {"Fn::GetAtt": ["Bucket", "TableBucketARN"]},
+                    "Namespace": "myns",
+                    "TableName": "mytable",
+                    "OpenTableFormat": "ICEBERG",
+                    "IcebergMetadata": {
+                        "IcebergSchema": {
+                            "SchemaFieldList": [
+                                {"Id": 1, "Name": "id", "Type": "string", "Required": True},
+                                {"Id": 2, "Name": "value", "Type": "string"},
+                            ],
+                        },
+                    },
+                },
+                "DependsOn": "Ns",
+            },
+        },
+    }
+
+    stack_name = "cfn-s3tables-schema-t01"
+    try:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+    except Exception:
+        pass
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    resp = _cfn_iceberg_json("/iceberg/v1/namespaces/myns/tables/mytable")
+    fields = resp.get("metadata", {}).get("schemas", [{}])[0].get("fields", [])
+    field_names = {f["name"] for f in fields}
+    assert field_names == {"id", "value"}, f"expected columns id/value, got {field_names}"
 
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)

@@ -423,6 +423,33 @@ def _resolve_refs(value, resources, params, conditions, mappings,
             return export["Value"]
         raise ValueError(f"Export '{export_name}' not found")
 
+    # --- Fn::GetStackOutput (aws-cdk-local cross-stack reference) ---
+    # Not an AWS intrinsic: aws-cdk-local rewrites CDK cross-stack references
+    # into this instead of Fn::ImportValue, and resolves it to a named output
+    # of another already-deployed stack (deploy order is dependency-sorted, so
+    # the producer stack's outputs are present by the time the consumer stack
+    # resolves this). Left unresolved, the dict reaches provisioners as e.g. a
+    # Lambda::Permission FunctionName and crashes with
+    # "'dict' object has no attribute 'startswith'".
+    if "Fn::GetStackOutput" in value:
+        from ministack.services.cloudformation import _stacks
+        spec = value["Fn::GetStackOutput"]
+        if isinstance(spec, dict):
+            target_stack = _resolve_refs(spec.get("StackName", ""), resources,
+                                         params, conditions, mappings,
+                                         stack_name, stack_id)
+            output_name = _resolve_refs(spec.get("OutputName", ""), resources,
+                                        params, conditions, mappings,
+                                        stack_name, stack_id)
+            stack = _stacks.get(str(target_stack))
+            if stack:
+                for o in stack.get("Outputs", []):
+                    if o.get("OutputKey") == output_name:
+                        return o.get("OutputValue", "")
+            raise ValueError(
+                f"Output '{output_name}' not found in stack '{target_stack}'")
+        return ""
+
     # --- Fn::GetAZs ---
     if "Fn::GetAZs" in value:
         region = _resolve_refs(value["Fn::GetAZs"], resources, params,

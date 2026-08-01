@@ -6,7 +6,8 @@ Supports: CreateTopic, DeleteTopic, ListTopics, GetTopicAttributes, SetTopicAttr
           GetSubscriptionAttributes, SetSubscriptionAttributes,
           Publish, PublishBatch,
           ListTagsForResource, TagResource, UntagResource,
-          CreatePlatformApplication, DeletePlatformApplication,
+          CreatePlatformApplication, ListPlatformApplications,
+          DeletePlatformApplication,
           CreatePlatformEndpoint, GetEndpointAttributes, SetEndpointAttributes,
           DeleteEndpoint.
 SNS → Lambda fanout dispatches via _execute_function (synchronous).
@@ -182,6 +183,7 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
         "TagResource": _tag_resource,
         "UntagResource": _untag_resource,
         "CreatePlatformApplication": _create_platform_application,
+        "ListPlatformApplications": _list_platform_applications,
         "CreatePlatformEndpoint": _create_platform_endpoint,
         "DeletePlatformApplication": _delete_platform_application,
         "GetEndpointAttributes": _get_endpoint_attributes,
@@ -1162,6 +1164,41 @@ def _create_platform_application(params):
                 f"</CreatePlatformApplicationResult>")
 
 
+def _list_platform_applications(params):
+    # https://docs.aws.amazon.com/sns/latest/api/API_ListPlatformApplications.html
+    # Returns up to 100 per page; NextToken is the numeric offset of the next
+    # page. The store is account+region scoped, so .values() already filters to
+    # the caller's region, matching AWS's per-region platform applications.
+    all_apps = list(_platform_applications.values())
+    next_token = _p(params, "NextToken")
+    start = 0
+    if next_token:
+        try:
+            start = int(next_token)
+        except ValueError:
+            start = 0
+    page = all_apps[start:start + 100]
+    members = "".join(
+        "<member>"
+        f"<PlatformApplicationArn>{_xml_escape(app['arn'])}</PlatformApplicationArn>"
+        "<Attributes>"
+        + "".join(
+            f"<entry><key>{_xml_escape(k)}</key><value>{_xml_escape(v)}</value></entry>"
+            for k, v in app.get("attributes", {}).items()
+        )
+        + "</Attributes>"
+        "</member>"
+        for app in page
+    )
+    next_token_xml = ""
+    if start + 100 < len(all_apps):
+        next_token_xml = f"<NextToken>{start + 100}</NextToken>"
+    return _xml(200, "ListPlatformApplicationsResponse",
+                f"<ListPlatformApplicationsResult>"
+                f"<PlatformApplications>{members}</PlatformApplications>"
+                f"{next_token_xml}</ListPlatformApplicationsResult>")
+
+
 def _create_platform_endpoint(params):
     app_arn = _p(params, "PlatformApplicationArn")
     token = _p(params, "Token")
@@ -1440,12 +1477,38 @@ def _matches_filter_policy(sub: dict, message_attributes: dict) -> bool:
         attr = message_attributes.get(key)
         if attr is None:
             return False
-        attr_value = attr.get("StringValue", "")
         if not isinstance(allowed_values, list):
             allowed_values = [allowed_values]
-        if not _attr_matches_any(attr_value, allowed_values):
+        # A String.Array attribute carries a JSON array of values; AWS evaluates
+        # each element separately and the attribute matches if any element does.
+        candidates = _attr_candidate_values(attr)
+        if not any(_attr_matches_any(value, allowed_values) for value in candidates):
             return False
     return True
+
+
+def _attr_candidate_values(attr: dict) -> list:
+    """Values to match a message attribute against a filter policy. A scalar
+    attribute yields its single StringValue; a String.Array yields each element
+    (AWS matches an array attribute when any element matches)."""
+    raw = attr.get("StringValue", "")
+    if (attr.get("DataType") or "").strip() != "String.Array":
+        return [raw]
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return [raw]
+    if not isinstance(parsed, list):
+        return [raw]
+    values = []
+    for element in parsed:
+        if isinstance(element, bool):
+            values.append("true" if element else "false")
+        elif isinstance(element, str):
+            values.append(element)
+        elif isinstance(element, (int, float)):
+            values.append(str(element))
+    return values or [raw]
 
 
 def _attr_matches_any(attr_value: str, rules: list) -> bool:
