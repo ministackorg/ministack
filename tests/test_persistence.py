@@ -2652,6 +2652,175 @@ def test_default_state_format_version_stays_v2_and_refuses_newer(monkeypatch, tm
     assert persistence.load_state("future") is None
 
 
+@pytest.mark.parametrize(
+    "service",
+    [
+        "elasticache",
+        "eventbridge",
+        "firehose",
+        "kinesis",
+        "kms",
+        "mediaconnect",
+        "pipes",
+        "scheduler",
+        "sns",
+    ],
+)
+def test_region_scoped_backfill_services_stamp_v3_and_reject_v2_reader(
+    service, monkeypatch, tmp_path
+):
+    """Services regionalized after v2 must stamp v3 for rollback safety."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    account_id = "123456789012"
+    region = "us-west-2"
+    resource_name = f"{service}-regional-resource"
+    regional_store = AccountRegionScopedDict()
+    regional_store.set_scoped(
+        account_id,
+        region,
+        resource_name,
+        {
+            "Arn": (
+                f"arn:aws:{service}:{region}:{account_id}:"
+                f"resource/{resource_name}"
+            ),
+            "Name": resource_name,
+        },
+    )
+
+    assert persistence._state_format_version(service) == 3
+
+    persistence.save_state(service, {"resources": regional_store})
+    first_snapshot = _json.loads((tmp_path / f"{service}.json").read_text())
+    assert first_snapshot["__ministack_format__"] == 3
+
+    loaded = persistence.load_state(service)
+    assert loaded["resources"].get_scoped(
+        account_id, region, resource_name
+    )["Name"] == resource_name
+
+    persistence.save_state(service, loaded)
+    second_snapshot = _json.loads((tmp_path / f"{service}.json").read_text())
+    assert second_snapshot == first_snapshot
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state(service) is None
+
+
+def test_mediaconnect_is_registered_for_persistence_save():
+    from ministack.app import _build_persistence_save_dict, _state_map
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import mediaconnect
+
+    assert _state_map["mediaconnect"] == "mediaconnect"
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "123456789012"
+    region = "us-west-2"
+    flow_arn = (
+        f"arn:aws:mediaconnect:{region}:{account_id}:"
+        "flow:flow-1234:regional-flow"
+    )
+
+    mediaconnect.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(region)
+        mediaconnect._flows[flow_arn] = {
+            "flowArn": flow_arn,
+            "name": "regional-flow",
+        }
+        mediaconnect._tags[flow_arn] = {"Env": "west"}
+
+        save_dict = _build_persistence_save_dict()
+
+        assert "mediaconnect" in save_dict
+        state = save_dict["mediaconnect"]()
+        assert state["flows"].get_scoped(account_id, region, flow_arn)[
+            "name"
+        ] == "regional-flow"
+        assert state["tags"][flow_arn] == {"Env": "west"}
+    finally:
+        mediaconnect.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_mediaconnect_region_scoped_v3_state_round_trips(monkeypatch, tmp_path):
+    import json as _json
+
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import mediaconnect
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "123456789012"
+    region = "us-west-2"
+    other_region = "us-east-1"
+    flow_arn = (
+        f"arn:aws:mediaconnect:{region}:{account_id}:"
+        "flow:flow-1234:regional-flow"
+    )
+
+    mediaconnect.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(region)
+        mediaconnect._flows[flow_arn] = {
+            "flowArn": flow_arn,
+            "name": "regional-flow",
+        }
+        mediaconnect._tags[flow_arn] = {"Env": "west"}
+
+        persistence.save_state("mediaconnect", mediaconnect.get_state())
+        first_snapshot = _json.loads(
+            (tmp_path / "mediaconnect.json").read_text()
+        )
+        assert first_snapshot["__ministack_format__"] == 3
+
+        mediaconnect.reset()
+        loaded = persistence.load_state("mediaconnect")
+        assert loaded is not None
+        mediaconnect.restore_state(loaded)
+
+        set_request_region(region)
+        assert mediaconnect._flows[flow_arn]["name"] == "regional-flow"
+        assert mediaconnect._tags[flow_arn] == {"Env": "west"}
+
+        set_request_region(other_region)
+        assert flow_arn not in mediaconnect._flows
+
+        persistence.save_state("mediaconnect", mediaconnect.get_state())
+        second_snapshot = _json.loads(
+            (tmp_path / "mediaconnect.json").read_text()
+        )
+        assert second_snapshot == first_snapshot
+    finally:
+        mediaconnect.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_iot_legacy_state_migrates_resource_and_retained_regions():
     import base64
 
