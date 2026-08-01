@@ -50,6 +50,7 @@ SERVICE_STATE_FORMAT_VERSIONS = {
     "ec2": 3,
     "ecr": 3,
     "cloudtrail": 3,
+    "cognito": 3,
     "waf": 3,
     "mq": 3,
     "mwaa": 3,

@@ -3883,6 +3883,93 @@ def test_waf_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path)
     assert persistence.load_state("waf") is None
 
 
+def test_cognito_region_scoped_state_round_trips_and_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    import json as _json
+
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import cognito
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account = "111111111111"
+    pool_id = "us-west-2_roundtrip"
+    identity_pool_id = "us-west-2:00000000-0000-4000-8000-000000000002"
+
+    def _legacy_store(key, value):
+        store = AccountScopedDict()
+        store._data[(account, key)] = value
+        return store
+
+    legacy_payload = {
+        "user_pools": _legacy_store(
+            pool_id, {"Id": pool_id, "Name": "roundtrip"}
+        ),
+        "pool_domain_map": _legacy_store("roundtrip-domain", pool_id),
+        "identity_pools": _legacy_store(
+            identity_pool_id,
+            {
+                "IdentityPoolId": identity_pool_id,
+                "IdentityPoolName": "roundtrip",
+            },
+        ),
+        "identity_tags": _legacy_store(identity_pool_id, {"scope": "west"}),
+    }
+    (tmp_path / "cognito.json").write_text(
+        _json.dumps(
+            {"__ministack_format__": 2, "payload": legacy_payload},
+            default=persistence._json_default,
+        )
+    )
+
+    try:
+        set_request_account_id(account)
+        set_request_region("us-east-1")
+        cognito.reset()
+        cognito.restore_state(persistence.load_state("cognito"))
+
+        assert cognito._user_pools.get_scoped(
+            account, "us-west-2", pool_id
+        )["Name"] == "roundtrip"
+        assert cognito._user_pools.get_scoped(
+            account, "us-east-1", pool_id
+        ) is None
+        assert cognito._pool_domain_map.get_scoped(
+            account, "us-west-2", "roundtrip-domain"
+        ) == pool_id
+        assert cognito._identity_pools.get_scoped(
+            account, "us-west-2", identity_pool_id
+        )["IdentityPoolName"] == "roundtrip"
+        assert cognito._identity_tags.get_scoped(
+            account, "us-west-2", identity_pool_id
+        ) == {"scope": "west"}
+
+        persistence.save_state("cognito", cognito.get_state())
+        raw = _json.loads((tmp_path / "cognito.json").read_text())
+        assert raw["__ministack_format__"] == 3
+        loaded = persistence.load_state("cognito")["user_pools"]
+        assert loaded.get_scoped(account, "us-west-2", pool_id)[
+            "Name"
+        ] == "roundtrip"
+
+        monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+        assert persistence.load_state("cognito") is None
+    finally:
+        cognito.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_waf_region_scoped_v3_state_round_trips_idempotently(monkeypatch, tmp_path):
     import json as _json
 

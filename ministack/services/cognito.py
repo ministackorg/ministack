@@ -72,12 +72,15 @@ from defusedxml.ElementTree import fromstring as safe_xml_parse
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
     get_region,
     json_response,
     new_uuid,
+    set_request_account_id,
+    set_request_region,
 )
 
 logger = logging.getLogger("cognito")
@@ -263,7 +266,6 @@ def well_known_openid_configuration(pool_id: str, region: str | None = None, hos
     }
     return 200, {"Content-Type": "application/json"}, json.dumps(doc).encode()
 
-REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _MINISTACK_PORT = os.environ.get("GATEWAY_PORT", os.environ.get("EDGE_PORT", "4566"))
 
@@ -277,7 +279,7 @@ _SAML_NS = {
 # In-memory state — User Pools (cognito-idp)
 # ---------------------------------------------------------------------------
 
-_user_pools = AccountScopedDict()
+_user_pools = AccountRegionScopedDict()
 # pool_id -> {
 #   Id, Name, Arn, CreationDate, LastModifiedDate, Status,
 #   Policies, Schema, AutoVerifiedAttributes, UsernameAttributes,
@@ -291,7 +293,7 @@ _user_pools = AccountScopedDict()
 #   _resource_servers: {identifier -> resource_server_dict},
 # }
 
-_pool_domain_map = AccountScopedDict()   # domain -> pool_id
+_pool_domain_map = AccountRegionScopedDict()   # domain -> pool_id
 
 # ---------------------------------------------------------------------------
 # In-memory state — OAuth2 Authorization Codes & Refresh Tokens
@@ -305,7 +307,7 @@ _revoked_tokens: set = set()                 # refresh-token values invalidated 
 # In-memory state — Identity Pools (cognito-identity)
 # ---------------------------------------------------------------------------
 
-_identity_pools = AccountScopedDict()
+_identity_pools = AccountRegionScopedDict()
 # identity_pool_id -> {
 #   IdentityPoolId, IdentityPoolName, AllowUnauthenticatedIdentities,
 #   SupportedLoginProviders, DeveloperProviderName,
@@ -315,7 +317,7 @@ _identity_pools = AccountScopedDict()
 #   _identities: {identity_id -> identity_dict},
 # }
 
-_identity_tags = AccountScopedDict()   # identity_pool_id -> {key: value}
+_identity_tags = AccountRegionScopedDict()   # identity_pool_id -> {key: value}
 
 # ---------------------------------------------------------------------------
 # In-memory state — OAuth2 authorization codes
@@ -349,6 +351,10 @@ _NEW_PASSWORD_SESSION_TTL = 300  # 5 minutes
 # In-memory state — CUSTOM_AUTH Challenge Sessions
 # ---------------------------------------------------------------------------
 
+# Keep challenge sessions account-scoped: signed AdminInitiateAuth can mint a
+# session in any region, while unsigned RespondToAuthChallenge redeems the
+# opaque token without a SigV4 region. The session's pool_id pins downstream
+# regional pool access in the worker context.
 _challenge_sessions = AccountScopedDict()
 # token (base64-encoded session token, opaque to client) -> {
 #   'pool_id': str,
@@ -376,6 +382,25 @@ _MAX_CHALLENGE_ATTEMPTS = 3    # AWS parity — terminate CUSTOM_AUTH after 3 an
 
 # ── Persistence ────────────────────────────────────────────
 
+_REGION_PREFIX_RE = re.compile(r"^[a-z]+(-[a-z]+)+-\d+$")
+
+
+def _region_from_pool_id(pool_id: str) -> str:
+    if isinstance(pool_id, str) and "_" in pool_id:
+        candidate = pool_id.rsplit("_", 1)[0]
+        if _REGION_PREFIX_RE.match(candidate):
+            return candidate
+    return get_region()
+
+
+def _region_from_identity_id(identity_id: str) -> str:
+    if isinstance(identity_id, str) and ":" in identity_id:
+        candidate = identity_id.split(":", 1)[0]
+        if _REGION_PREFIX_RE.match(candidate):
+            return candidate
+    return get_region()
+
+
 def get_state():
     return {
         "user_pools": copy.deepcopy(_user_pools),
@@ -392,15 +417,49 @@ def get_state():
 
 def restore_state(data):
     if data:
-        _user_pools.update(data.get("user_pools", {}))
-        _pool_domain_map.update(data.get("pool_domain_map", {}))
-        _identity_pools.update(data.get("identity_pools", {}))
-        _identity_tags.update(data.get("identity_tags", {}))
+        _restore_regional_store(
+            _user_pools,
+            data.get("user_pools", {}),
+            lambda pool_id, _pool: _region_from_pool_id(pool_id),
+        )
+        _restore_regional_store(
+            _pool_domain_map,
+            data.get("pool_domain_map", {}),
+            lambda _domain, pool_id: _region_from_pool_id(pool_id),
+        )
+        _restore_regional_store(
+            _identity_pools,
+            data.get("identity_pools", {}),
+            lambda pool_id, _pool: _region_from_identity_id(pool_id),
+        )
+        _restore_regional_store(
+            _identity_tags,
+            data.get("identity_tags", {}),
+            lambda pool_id, _tags: _region_from_identity_id(pool_id),
+        )
         _authorization_codes.update(data.get("authorization_codes", {}))
         _refresh_tokens.update(data.get("refresh_tokens", {}))
         _revoked_tokens.update(data.get("revoked_tokens", []))
         _auth_codes.update(data.get("auth_codes", {}))
         _challenge_sessions.update(data.get("challenge_sessions", {}))
+
+
+def _restore_regional_store(store, restored, region_for_item):
+    """Restore a Cognito store, self-placing legacy records from their IDs."""
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+
+    if isinstance(restored, AccountScopedDict):
+        items = restored._data.items()
+    elif isinstance(restored, dict):
+        account_id = get_account_id()
+        items = (((account_id, key), value) for key, value in restored.items())
+    else:
+        return
+
+    for (account_id, key), value in items:
+        store.set_scoped(account_id, region_for_item(key, value), key, value)
 
 
 try:
@@ -441,11 +500,7 @@ def _pool_region(pool_id: str) -> str:
     ``eu-isoe-west-1``) — Cognito is available in GovCloud, so the parser must
     not silently fall through and reproduce the original `iss` bug there.
     """
-    if pool_id and "_" in pool_id:
-        candidate = pool_id.rsplit("_", 1)[0]
-        if re.match(r"^[a-z]+(-[a-z]+)+-\d+$", candidate):
-            return candidate
-    return get_region()
+    return _region_from_pool_id(pool_id)
 
 
 def _client_id() -> str:
@@ -1506,15 +1561,16 @@ def _all_pools():
     normal account-scoped iteration would miss pools created under a specific
     account.  Yields (pool_id, pool_dict) pairs.
     """
-    # _user_pools._data stores {(account_id, pool_id): pool_dict}
-    for (_, pid), pool in _user_pools._data.items():
+    for (_account_id, _region, pid), pool in _user_pools.all_items():
         yield pid, pool
 
 
 def _get_pool_unscoped(pool_id: str):
-    """Look up a pool by ID across ALL accounts."""
-    for pid, pool in _all_pools():
+    """Look up a pool globally and pin its owning scope for downstream work."""
+    for (account_id, region, pid), pool in _user_pools.all_items():
         if pid == pool_id:
+            set_request_account_id(account_id)
+            set_request_region(region)
             return pool
     return None
 
@@ -1526,9 +1582,11 @@ def _find_pool_by_client_id(client_id: str):
     browsers without AWS credentials, so the normal account-scoped lookup
     would miss pools created under a specific account.
     """
-    for pid, pool in _all_pools():
+    for (account_id, region, pid), pool in _user_pools.all_items():
         client = pool["_clients"].get(client_id)
         if client is not None:
+            set_request_account_id(account_id)
+            set_request_region(region)
             return pid, pool, client
     return None, None, None
 
@@ -1623,6 +1681,107 @@ async def handle_request(method, path, headers, body, query_params):
 # IDP dispatcher
 # ---------------------------------------------------------------------------
 
+_UNSIGNED_IDP_ACTIONS = {
+    "AssociateSoftwareToken",
+    "ChangePassword",
+    "ConfirmForgotPassword",
+    "ConfirmSignUp",
+    "DeleteUser",
+    "ForgotPassword",
+    "GetTokensFromRefreshToken",
+    "GetUser",
+    "GlobalSignOut",
+    "InitiateAuth",
+    "ResendConfirmationCode",
+    "RespondToAuthChallenge",
+    "RevokeToken",
+    "SetUserMFAPreference",
+    "SignUp",
+    "UpdateUserAttributes",
+    "VerifySoftwareToken",
+}
+
+_UNSIGNED_IDENTITY_ACTIONS = {
+    "GetCredentialsForIdentity",
+    "GetId",
+    "GetOpenIdToken",
+    "UnlinkIdentity",
+}
+
+
+def _pool_id_from_token(token: str) -> str:
+    if not isinstance(token, str) or not token:
+        return ""
+    try:
+        claims = _decode_id_token_unverified(token)
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return ""
+    if not isinstance(claims, dict):
+        return ""
+    issuer = claims.get("iss", "")
+    if not isinstance(issuer, str):
+        return ""
+    return issuer.rsplit("/", 1)[-1] if "/" in issuer else ""
+
+
+def _pool_scope_for_client(client_id: str):
+    """Find a client owner within the ambient account without widening tenants."""
+    if not client_id:
+        return None
+    account_id = get_account_id()
+    request_region = get_region()
+    matches = []
+    for (owner_account, region, pool_id), pool in _user_pools.all_items():
+        if owner_account != account_id or client_id not in pool.get("_clients", {}):
+            continue
+        if region == request_region:
+            return pool_id, region
+        matches.append((pool_id, region))
+    return matches[0] if len(matches) == 1 else None
+
+
+def _pin_unsigned_idp_scope(data: dict) -> None:
+    pool_id = data.get("UserPoolId", "")
+
+    if not pool_id:
+        session = _challenge_sessions.get(data.get("Session", ""))
+        if session:
+            pool_id = session.get("pool_id", "")
+
+    if not pool_id:
+        for field in ("AccessToken", "RefreshToken", "Token"):
+            token = data.get(field, "")
+            if not isinstance(token, str) or not token:
+                continue
+            pool_id = _pool_id_from_token(token)
+            if not pool_id:
+                pool_id = (_refresh_tokens.get(token) or {}).get("pool_id", "")
+            if pool_id:
+                break
+
+    if pool_id:
+        set_request_region(_pool_region(pool_id))
+        return
+
+    client_scope = _pool_scope_for_client(data.get("ClientId", ""))
+    if client_scope:
+        _pool_id, region = client_scope
+        set_request_region(region)
+
+
+def _run_idp_handler(handler, action: str, data: dict):
+    if action in _UNSIGNED_IDP_ACTIONS:
+        _pin_unsigned_idp_scope(data)
+    return handler(data)
+
+
+def _run_identity_handler(handler, action: str, data: dict):
+    if action in _UNSIGNED_IDENTITY_ACTIONS:
+        identity_id = data.get("IdentityPoolId") or data.get("IdentityId")
+        if identity_id:
+            set_request_region(_region_from_identity_id(identity_id))
+    return handler(data)
+
 async def _dispatch_idp(action: str, data: dict):
     handlers = {
         # User Pool CRUD
@@ -1713,7 +1872,7 @@ async def _dispatch_idp(action: str, data: dict):
     # back into ministack over HTTP) don't deadlock against a blocked event
     # loop. The Lambda response path needs the loop free to accept new
     # requests while _execute_function is running.
-    return await asyncio.to_thread(handler, data)
+    return await asyncio.to_thread(_run_idp_handler, handler, action, data)
 
 
 # ---------------------------------------------------------------------------
@@ -1744,7 +1903,7 @@ async def _dispatch_identity(action: str, data: dict):
     handler = handlers.get(action)
     if not handler:
         return error_response_json("InvalidAction", f"Unknown Cognito Identity action: {action}", 400)
-    return await asyncio.to_thread(handler, data)
+    return await asyncio.to_thread(_run_identity_handler, handler, action, data)
 
 
 # ===========================================================================
