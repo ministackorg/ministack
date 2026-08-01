@@ -1401,7 +1401,7 @@ def test_sfn_aws_sdk_lambda_respects_caller_account():
     def _client(service):
         return boto3.client(
             service,
-            endpoint_url="http://localhost:4566",
+            endpoint_url=ENDPOINT,
             aws_access_key_id=ACCOUNT,
             aws_secret_access_key="secret",
             region_name="us-east-1",
@@ -5398,7 +5398,7 @@ def test_sfn_wait_scale_zero_does_not_timeout_lambda_tasks(sfn, lam):
     """
     import urllib.request
 
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
     def _set_wait_scale(val):
         req = urllib.request.Request(
@@ -5468,7 +5468,7 @@ def test_sfn_wait_scale_zero_skips_wait(sfn):
     """
     import urllib.request
 
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
     def _set_wait_scale(val):
         req = urllib.request.Request(
@@ -6008,7 +6008,7 @@ def test_sfn_execution_proceeds_under_non_default_account_id():
 
     # Borrow ENDPOINT + REGION from conftest's _default_kwargs without
     # importing private names; rebuild a client with a 12-digit access key.
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     region = os.environ.get("MINISTACK_REGION", "us-east-1")
 
     alt_account_id = "123456789012"  # AWS docs placeholder account
@@ -6065,7 +6065,7 @@ def test_sfn_execution_proceeds_under_non_default_account_id():
 def _alt_account_sfn_client(account_id):
     import boto3
     from botocore.config import Config
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     region = os.environ.get("MINISTACK_REGION", "us-east-1")
     return boto3.client(
         "stepfunctions",

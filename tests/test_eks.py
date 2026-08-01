@@ -5,6 +5,7 @@ k3s Docker container tests require Docker socket access.
 """
 import asyncio
 import json
+import os
 import time
 import uuid
 from urllib.parse import quote
@@ -13,7 +14,7 @@ import boto3
 import pytest
 from botocore.exceptions import ClientError
 
-ENDPOINT = "http://localhost:4566"
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 REGION = "us-east-1"
 
 

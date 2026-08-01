@@ -127,7 +127,7 @@ TEST_CHAIN_PEM = (
     b"-----END CERTIFICATE-----\n"
 )
 TEST_PRIVATE_KEY_PEM = (
-    b"-----BEGIN PRIVATE KEY-----\n"
+    b"-----BEGIN PRIVATE KEY-----\n"  # sadscan:disable np.pem.1 - intentionally fake ACM test fixture.
     b"MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC0IamGfakeKey1\n"
     b"-----END PRIVATE KEY-----\n"
 )
@@ -593,7 +593,7 @@ def test_synthetic_pem_body_is_valid_base64():
 
 import urllib.request as _acm_urlreq
 
-_ACM_ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+_ACM_ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
 
 def test_acm_list_certificates_omits_nexttoken_when_no_more_pages():
@@ -622,7 +622,7 @@ def test_acm_certificates_are_region_isolated(acm_client):
     import boto3
 
     acm_west = boto3.client(
-        "acm", endpoint_url="http://localhost:4566",
+        "acm", endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/"),
         aws_access_key_id="test", aws_secret_access_key="test",
         region_name="us-west-2",
     )

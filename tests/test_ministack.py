@@ -11,6 +11,8 @@ from urllib.parse import urlparse
 import pytest
 from botocore.exceptions import ClientError
 
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+
 # ========== from test_ministack.py ==========
 
 _ministack_installed = True
@@ -37,7 +39,7 @@ def test_ministack_config_invalid_key_ignored():
     import json as _json
     import urllib.request
 
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     req = urllib.request.Request(
         f"{endpoint}/_ministack/config",
         data=_json.dumps(
@@ -56,18 +58,18 @@ def test_ministack_config_invalid_key_ignored():
 def test_ministack_health_endpoints():
     import urllib.request
 
-    resp_health = urllib.request.urlopen("http://localhost:4566/health")
+    resp_health = urllib.request.urlopen(f"{ENDPOINT}/health")
     assert resp_health.status == 200
     data_health = json.loads(resp_health.read())
     assert "services" in data_health
     assert "s3" in data_health["services"]
     assert data_health["edition"] == "light"
 
-    resp_ministack = urllib.request.urlopen("http://localhost:4566/_ministack/health")
+    resp_ministack = urllib.request.urlopen(f"{ENDPOINT}/_ministack/health")
     data_ministack = json.loads(resp_ministack.read())
     assert data_health == data_ministack
 
-    resp_localstack = urllib.request.urlopen("http://localhost:4566/_localstack/health")
+    resp_localstack = urllib.request.urlopen(f"{ENDPOINT}/_localstack/health")
     data_localstack = json.loads(resp_localstack.read())
     assert data_health == data_localstack
 
@@ -76,7 +78,7 @@ def test_localstack_unknown_paths_return_json_404():
     import urllib.error
     import urllib.request
 
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     for subpath in ("info", "plugins", "init"):
         url = f"{endpoint}/_localstack/{subpath}"
         try:
@@ -97,7 +99,7 @@ def test_localstack_health_still_returns_200():
     """/_localstack/health must still return 200 after the interceptor is wired in."""
     import urllib.request
 
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     resp = urllib.request.urlopen(f"{endpoint}/_localstack/health", timeout=5)
     assert resp.status == 200
     data = json.loads(resp.read())
@@ -547,7 +549,7 @@ def test_unit_h11_informational_has_reason_phrase():
 def test_wire_expect_100_continue_returns_canonical_status_line():
     """End-to-end: a raw PUT with Expect: 100-continue against ministack must
     receive a 100 Continue with the reason phrase intact (issue #389)."""
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     parsed = urlparse(endpoint)
     host = parsed.hostname or "localhost"
     port = parsed.port or 4566

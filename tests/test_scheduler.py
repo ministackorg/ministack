@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import time
 
 import boto3
@@ -14,7 +15,7 @@ from ministack.core.responses import (
     set_request_region,
 )
 
-ENDPOINT = "http://localhost:4566"
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 REGION = "us-east-1"
 
 
