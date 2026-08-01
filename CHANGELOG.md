@@ -7,7 +7,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
-- **EKS — OIDC Identity Provider Config list support** — adds `ListIdentityProviderConfigs` (`GET /clusters/{name}/identity-provider-configs`) API operation to EKS emulator. Allows listing OIDC identity provider configurations associated with a cluster.
+- **EKS - OIDC Identity Provider Config list support** - adds `ListIdentityProviderConfigs` (`GET /clusters/{name}/identity-provider-configs`) API operation to EKS emulator. Allows listing OIDC identity provider configurations associated with a cluster.
 
 ## [Unreleased]
 
