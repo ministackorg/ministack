@@ -30,6 +30,7 @@ STATE_FORMAT_VERSION = 2
 # alongside the version machinery itself (98fdacc), so the v2 default already
 # covers it; stamping v3 would only add needless rollback refusal.
 SERVICE_STATE_FORMAT_VERSIONS = {
+    "apigateway_v1": 3,
     "appsync": 3,
     "appsync_events": 3,
     "autoscaling": 3,

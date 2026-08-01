@@ -1254,8 +1254,8 @@ def _resolve_stage_and_path(api_id: str, tentative_stage: str, execute_path: str
       - Else fall through (``handle_execute`` will return "Stage not found").
     """
     apigw_v1 = _get_module("apigateway_v1")
-    if api_id in apigw_v1._rest_apis:
-        stages_map = apigw_v1._stages_v1.get(api_id, {})
+    if apigw_v1.find_api_scope(api_id) is not None:
+        stages_map = apigw_v1.stages_for_api(api_id)
     else:
         stages_map = _get_module("apigateway")._stages.get(api_id, {})
 
@@ -1288,8 +1288,9 @@ async def _handle_execute_api_request(
                 method, api_id, tentative_stage, connection_id, body, headers
             )
         stage, execute_path = _resolve_stage_and_path(api_id, tentative_stage, execute_path)
-        if api_id in _get_module("apigateway_v1")._rest_apis:
-            return await _get_module("apigateway_v1").handle_execute(
+        apigw_v1 = _get_module("apigateway_v1")
+        if apigw_v1.find_api_scope(api_id) is not None:
+            return await apigw_v1.handle_execute(
                 api_id, stage, method, execute_path, headers, body, query_params
             )
         return await _get_module("apigateway").handle_execute(

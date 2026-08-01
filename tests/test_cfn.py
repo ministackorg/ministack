@@ -9,7 +9,9 @@ import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from ministack.services import pipes as _pipes
@@ -5395,6 +5397,89 @@ def test_cfn_apigateway_stage_ref_returns_stage_name(cfn, apigw_v1):
 
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
+
+
+def test_cfn_apigateway_rest_api_tracks_stack_region(cfn, apigw_v1):
+    """A v1 REST API created by a regional stack is scoped to that region, while
+    unsigned execute-api data-plane requests still resolve by API id."""
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    port = urlparse(endpoint).port or 4566
+    west_cfn = boto3.client(
+        "cloudformation",
+        endpoint_url=endpoint,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name="us-west-2",
+        config=Config(region_name="us-west-2"),
+    )
+    west_apigw = boto3.client(
+        "apigateway",
+        endpoint_url=endpoint,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name="us-west-2",
+        config=Config(region_name="us-west-2"),
+    )
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"intg-cfn-apigw-region-{suffix}"
+    template = {
+        "Resources": {
+            "Api": {
+                "Type": "AWS::ApiGateway::RestApi",
+                "Properties": {"Name": f"region-cfn-{suffix}"},
+            },
+            "MockResource": {
+                "Type": "AWS::ApiGateway::Resource",
+                "Properties": {
+                    "RestApiId": {"Ref": "Api"},
+                    "ParentId": {"Fn::GetAtt": ["Api", "RootResourceId"]},
+                    "PathPart": "mock",
+                },
+            },
+            "MockMethod": {
+                "Type": "AWS::ApiGateway::Method",
+                "Properties": {
+                    "RestApiId": {"Ref": "Api"},
+                    "ResourceId": {"Ref": "MockResource"},
+                    "HttpMethod": "GET",
+                    "AuthorizationType": "NONE",
+                    "Integration": {"Type": "MOCK"},
+                },
+            },
+            "Deployment": {
+                "Type": "AWS::ApiGateway::Deployment",
+                "DependsOn": "MockMethod",
+                "Properties": {"RestApiId": {"Ref": "Api"}, "StageName": "prod"},
+            },
+        },
+        "Outputs": {"ApiId": {"Value": {"Ref": "Api"}}},
+    }
+
+    west_cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    try:
+        stack = _wait_stack(west_cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        api_id = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}[
+            "ApiId"
+        ]
+
+        assert west_apigw.get_rest_api(restApiId=api_id)["id"] == api_id
+        with pytest.raises(ClientError) as exc:
+            apigw_v1.get_rest_api(restApiId=api_id)
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/prod/mock",
+            method="GET",
+            headers={"Host": f"{api_id}.execute-api.localhost:{port}"},
+        )
+        with urllib.request.urlopen(req) as resp:
+            assert resp.status == 200
+            assert json.loads(resp.read() or b"{}") == {}
+    finally:
+        west_cfn.delete_stack(StackName=stack_name)
+        _wait_stack(west_cfn, stack_name)
 
 
 def test_cfn_apigateway_domain_name_lifecycle(cfn, apigw_v1):
