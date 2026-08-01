@@ -101,14 +101,14 @@ def test_iam_role_permissions_boundary_roundtrip(iam):
         PermissionsBoundary=original_boundary,
     )["Role"]
     assert created["PermissionsBoundary"] == {
-        "PermissionsBoundaryType": "Policy",
+        "PermissionsBoundaryType": "PermissionsBoundaryPolicy",
         "PermissionsBoundaryArn": original_boundary,
     }
     assert iam.get_role(RoleName=name)["Role"]["PermissionsBoundary"]["PermissionsBoundaryArn"] == original_boundary
 
     iam.put_role_permissions_boundary(RoleName=name, PermissionsBoundary=replacement_boundary)
     assert iam.get_role(RoleName=name)["Role"]["PermissionsBoundary"] == {
-        "PermissionsBoundaryType": "Policy",
+        "PermissionsBoundaryType": "PermissionsBoundaryPolicy",
         "PermissionsBoundaryArn": replacement_boundary,
     }
 

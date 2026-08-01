@@ -2750,7 +2750,7 @@ def _role_xml(name):
     if r.get("PermissionsBoundary"):
         boundary_xml = (
             "<PermissionsBoundary>"
-            "<PermissionsBoundaryType>Policy</PermissionsBoundaryType>"
+            "<PermissionsBoundaryType>PermissionsBoundaryPolicy</PermissionsBoundaryType>"
             f"<PermissionsBoundaryArn>{r['PermissionsBoundary']}</PermissionsBoundaryArn>"
             "</PermissionsBoundary>"
         )
