@@ -45,6 +45,275 @@ def _wait_stack(cfn, name, timeout=30):
         time.sleep(0.5)
     raise TimeoutError(f"Stack {name} stuck at {status}")
 
+
+def _regional_cfn_test_client(service, region):
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client(
+        service,
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        region_name=region,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        config=Config(retries={"mode": "standard"}),
+    )
+
+
+def _delete_cfn_test_stack(cfn, stack_name):
+    try:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+    except (ClientError, TimeoutError):
+        pass
+
+
+def test_cfn_region_scopes_stacks_change_sets_and_events():
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-regional-{suffix}"
+    change_set_name = f"regional-update-{suffix}"
+    east = _regional_cfn_test_client("cloudformation", "us-east-1")
+    west = _regional_cfn_test_client("cloudformation", "us-west-2")
+    empty_template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {},
+    }
+
+    try:
+        east.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(empty_template),
+        )
+        west.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(empty_template),
+        )
+        east_stack = _wait_stack(east, stack_name)
+        west_stack = _wait_stack(west, stack_name)
+
+        assert east_stack["StackStatus"] == "CREATE_COMPLETE"
+        assert west_stack["StackStatus"] == "CREATE_COMPLETE"
+        assert east_stack["StackId"] != west_stack["StackId"]
+        assert ":us-east-1:" in east_stack["StackId"]
+        assert ":us-west-2:" in west_stack["StackId"]
+
+        east_described_ids = {
+            stack["StackId"] for stack in east.describe_stacks()["Stacks"]
+        }
+        west_described_ids = {
+            stack["StackId"] for stack in west.describe_stacks()["Stacks"]
+        }
+        assert east_stack["StackId"] in east_described_ids
+        assert west_stack["StackId"] not in east_described_ids
+        assert west_stack["StackId"] in west_described_ids
+        assert east_stack["StackId"] not in west_described_ids
+
+        east_listed_ids = {
+            stack["StackId"] for stack in east.list_stacks()["StackSummaries"]
+        }
+        west_listed_ids = {
+            stack["StackId"] for stack in west.list_stacks()["StackSummaries"]
+        }
+        assert east_stack["StackId"] in east_listed_ids
+        assert west_stack["StackId"] not in east_listed_ids
+        assert west_stack["StackId"] in west_listed_ids
+        assert east_stack["StackId"] not in west_listed_ids
+
+        east_events = east.describe_stack_events(
+            StackName=east_stack["StackId"]
+        )["StackEvents"]
+        assert east_events
+        assert {event["StackId"] for event in east_events} == {
+            east_stack["StackId"]
+        }
+        with pytest.raises(ClientError) as exc:
+            west.describe_stack_events(StackName=east_stack["StackId"])
+        assert exc.value.response["Error"]["Code"] == "ValidationError"
+
+        change_template = {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "Handle": {
+                    "Type": "AWS::CloudFormation::WaitConditionHandle",
+                }
+            },
+        }
+        change_set_id = east.create_change_set(
+            StackName=stack_name,
+            ChangeSetName=change_set_name,
+            ChangeSetType="UPDATE",
+            TemplateBody=json.dumps(change_template),
+        )["Id"]
+        assert east.describe_change_set(ChangeSetName=change_set_id)[
+            "ChangeSetId"
+        ] == change_set_id
+        assert west.list_change_sets(StackName=stack_name)["Summaries"] == []
+        with pytest.raises(ClientError) as exc:
+            west.describe_change_set(ChangeSetName=change_set_id)
+        assert exc.value.response["Error"]["Code"] == "ChangeSetNotFoundException"
+
+        east.delete_stack(StackName=stack_name)
+        assert _wait_stack(east, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+        assert west.describe_stacks(StackName=stack_name)["Stacks"][0][
+            "StackId"
+        ] == west_stack["StackId"]
+    finally:
+        _delete_cfn_test_stack(east, stack_name)
+        _delete_cfn_test_stack(west, stack_name)
+
+
+def test_cfn_region_scopes_exports_imports_and_delete_checks():
+    suffix = _uuid_mod.uuid4().hex[:8]
+    export_name = f"cfn-regional-export-{suffix}"
+    producer_name = f"cfn-regional-producer-{suffix}"
+    consumer_name = f"cfn-regional-consumer-{suffix}"
+    decoy_name = f"cfn-regional-decoy-{suffix}"
+    east = _regional_cfn_test_client("cloudformation", "us-east-1")
+    west = _regional_cfn_test_client("cloudformation", "us-west-2")
+    producer_template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {},
+        "Outputs": {
+            "SharedValue": {
+                "Value": "east-value",
+                "Export": {"Name": export_name},
+            }
+        },
+    }
+    consumer_template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "ImportedParameter": {
+                "Type": "AWS::SSM::Parameter",
+                "Properties": {
+                    "Name": f"/cfn/regional/{suffix}",
+                    "Type": "String",
+                    "Value": {"Fn::ImportValue": export_name},
+                },
+            }
+        },
+    }
+    decoy_template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Metadata": {"CrossRegionReference": {"Fn::ImportValue": export_name}},
+        "Resources": {},
+    }
+
+    try:
+        east.create_stack(
+            StackName=producer_name,
+            TemplateBody=json.dumps(producer_template),
+        )
+        producer = _wait_stack(east, producer_name)
+        assert producer["StackStatus"] == "CREATE_COMPLETE"
+        assert {
+            export["Name"]: export["Value"]
+            for export in east.list_exports()["Exports"]
+        }[export_name] == "east-value"
+        assert export_name not in {
+            export["Name"] for export in west.list_exports()["Exports"]
+        }
+        with pytest.raises(ClientError) as exc:
+            west.describe_stacks(StackName=producer_name)
+        assert exc.value.response["Error"]["Code"] == "ValidationError"
+
+        west.create_stack(
+            StackName=consumer_name,
+            TemplateBody=json.dumps(consumer_template),
+            DisableRollback=True,
+        )
+        consumer = _wait_stack(west, consumer_name)
+        assert consumer["StackStatus"] == "CREATE_FAILED"
+        assert f"Export '{export_name}' not found" in consumer["StackStatusReason"]
+
+        west.create_stack(
+            StackName=decoy_name,
+            TemplateBody=json.dumps(decoy_template),
+        )
+        assert _wait_stack(west, decoy_name)["StackStatus"] == "CREATE_COMPLETE"
+
+        east.delete_stack(StackName=producer_name)
+        assert _wait_stack(east, producer_name)["StackStatus"] == "DELETE_COMPLETE"
+        assert west.describe_stacks(StackName=decoy_name)["Stacks"][0][
+            "StackStatus"
+        ] == "CREATE_COMPLETE"
+    finally:
+        _delete_cfn_test_stack(east, producer_name)
+        _delete_cfn_test_stack(west, consumer_name)
+        _delete_cfn_test_stack(west, decoy_name)
+
+
+def test_cfn_nested_stack_stays_in_parent_region():
+    suffix = _uuid_mod.uuid4().hex[:8]
+    parent_name = f"cfn-regional-parent-{suffix}"
+    templates_bucket = f"cfn-regional-templates-{suffix}"
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    east = _regional_cfn_test_client("cloudformation", "us-east-1")
+    west = _regional_cfn_test_client("cloudformation", "us-west-2")
+    west_s3 = _regional_cfn_test_client("s3", "us-west-2")
+    child_template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {},
+        "Outputs": {"ChildRegion": {"Value": {"Ref": "AWS::Region"}}},
+    }
+    parent_template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Nested": {
+                "Type": "AWS::CloudFormation::Stack",
+                "Properties": {
+                    "TemplateURL": f"{endpoint}/{templates_bucket}/child.json",
+                },
+            }
+        },
+        "Outputs": {
+            "ChildRegion": {
+                "Value": {"Fn::GetAtt": ["Nested", "Outputs.ChildRegion"]}
+            }
+        },
+    }
+
+    try:
+        west_s3.create_bucket(
+            Bucket=templates_bucket,
+            CreateBucketConfiguration={"LocationConstraint": "us-west-2"},
+        )
+        west_s3.put_object(
+            Bucket=templates_bucket,
+            Key="child.json",
+            Body=json.dumps(child_template).encode(),
+        )
+        west.create_stack(
+            StackName=parent_name,
+            TemplateBody=json.dumps(parent_template),
+        )
+        parent = _wait_stack(west, parent_name)
+        assert parent["StackStatus"] == "CREATE_COMPLETE", parent.get(
+            "StackStatusReason"
+        )
+        assert {
+            output["OutputKey"]: output["OutputValue"]
+            for output in parent["Outputs"]
+        }["ChildRegion"] == "us-west-2"
+
+        child = next(
+            stack
+            for stack in west.describe_stacks()["Stacks"]
+            if stack["StackName"].startswith(f"{parent_name}-Nested-")
+        )
+        assert ":us-west-2:" in child["StackId"]
+        with pytest.raises(ClientError) as exc:
+            east.describe_stacks(StackName=child["StackId"])
+        assert exc.value.response["Error"]["Code"] == "ValidationError"
+    finally:
+        _delete_cfn_test_stack(west, parent_name)
+        try:
+            west_s3.delete_object(Bucket=templates_bucket, Key="child.json")
+            west_s3.delete_bucket(Bucket=templates_bucket)
+        except ClientError:
+            pass
+
+
 _E2E_STACK = "e2e-test"
 
 _E2E_TEMPLATE = """
@@ -2224,8 +2493,18 @@ def test_cfn_ec2_resources_use_caller_region_context():
         }
         updated_template["Outputs"]["Endpoint2Id"] = {"Value": {"Ref": "Endpoint2"}}
 
-        cfn_east.update_stack(StackName=stack_name, TemplateBody=json.dumps(updated_template))
-        stack = _wait_stack(cfn_east, stack_name)
+        with pytest.raises(ClientError) as exc:
+            cfn_east.update_stack(
+                StackName=stack_name,
+                TemplateBody=json.dumps(updated_template),
+            )
+        assert exc.value.response["Error"]["Code"] == "ValidationError"
+
+        cfn_west.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(updated_template),
+        )
+        stack = _wait_stack(cfn_west, stack_name)
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
         outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
         assert ec2_west.describe_vpc_endpoints(
@@ -2235,8 +2514,8 @@ def test_cfn_ec2_resources_use_caller_region_context():
             VpcEndpointIds=[outputs["Endpoint2Id"]]
         )["VpcEndpoints"] == []
 
-        cfn_east.delete_stack(StackName=stack_name)
-        _wait_stack(cfn_east, stack_name)
+        cfn_west.delete_stack(StackName=stack_name)
+        _wait_stack(cfn_west, stack_name)
         assert ec2_west.describe_vpc_endpoints(
             VpcEndpointIds=[outputs["EndpointId"], outputs["Endpoint2Id"]]
         )["VpcEndpoints"] == []

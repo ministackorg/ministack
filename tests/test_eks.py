@@ -5,6 +5,7 @@ k3s Docker container tests require Docker socket access.
 """
 import asyncio
 import json
+import os
 import time
 import uuid
 from urllib.parse import quote
@@ -13,7 +14,7 @@ import boto3
 import pytest
 from botocore.exceptions import ClientError
 
-ENDPOINT = "http://localhost:4566"
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 REGION = "us-east-1"
 
 
@@ -1135,6 +1136,14 @@ def test_eks_identity_provider_config(eks):
         assert oidc_desc["issuerUrl"] == "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_000000000"
         assert oidc_desc["status"] in ("CREATING", "ACTIVE")
 
+        # 2b. List OIDC configs
+        list_resp = eks.list_identity_provider_configs(clusterName=cn)
+        assert "identityProviderConfigs" in list_resp
+        configs = list_resp["identityProviderConfigs"]
+        assert len(configs) == 1
+        assert configs[0]["name"] == "cognito-idp"
+        assert configs[0]["type"] == "oidc"
+
         # 3. Disassociate OIDC config
         dis_resp = eks.disassociate_identity_provider_config(
             clusterName=cn,
@@ -1142,6 +1151,15 @@ def test_eks_identity_provider_config(eks):
         )
         dis_upd = dis_resp["update"]
         assert dis_upd["type"] == "IdentityProviderConfigUpdate"
+
+        # 4. List after disassociate -> empty
+        empty_resp = eks.list_identity_provider_configs(clusterName=cn)
+        assert empty_resp["identityProviderConfigs"] == []
+
+        # 5. List on unknown cluster -> ResourceNotFoundException
+        with pytest.raises(ClientError) as exc:
+            eks.list_identity_provider_configs(clusterName=f"ghost-{_uid()}")
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
     finally:
         try:
