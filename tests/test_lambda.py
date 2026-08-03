@@ -90,6 +90,14 @@ def _regional_client(service: str, region: str):
     )
 
 
+def _list_all_functions(lam):
+    return [
+        function
+        for page in lam.get_paginator("list_functions").paginate()
+        for function in page["Functions"]
+    ]
+
+
 def _region_marker_code(marker: str) -> bytes:
     code = f"""
 import os
@@ -171,8 +179,8 @@ def test_lambda_functions_are_region_scoped():
     assert ":us-west-2:" in west_created["FunctionArn"]
     assert east_created["FunctionArn"] != west_created["FunctionArn"]
 
-    east_names = {fn["FunctionName"] for fn in east.list_functions()["Functions"]}
-    west_names = {fn["FunctionName"] for fn in west.list_functions()["Functions"]}
+    east_names = {fn["FunctionName"] for fn in _list_all_functions(east)}
+    west_names = {fn["FunctionName"] for fn in _list_all_functions(west)}
     assert name in east_names
     assert name in west_names
 
@@ -809,8 +817,8 @@ def test_lambda_create_invoke(lam):
         Handler="index.handler",
         Code={"ZipFile": buf.getvalue()},
     )
-    funcs = lam.list_functions()
-    assert any(f["FunctionName"] == "test-func-1" for f in funcs["Functions"])
+    funcs = _list_all_functions(lam)
+    assert any(f["FunctionName"] == "test-func-1" for f in funcs)
     resp = lam.invoke(FunctionName="test-func-1", Payload=json.dumps({"key": "value"}))
     payload = json.loads(resp["Payload"].read())
     assert payload["statusCode"] == 200
@@ -1050,8 +1058,7 @@ def test_lambda_get_function_not_found(lam):
     assert exc.value.response["ResponseMetadata"]["HTTPHeaders"].get("x-amzn-errortype") == "ResourceNotFoundException"
 
 def test_lambda_list_functions(lam):
-    resp = lam.list_functions()
-    names = [f["FunctionName"] for f in resp["Functions"]]
+    names = [f["FunctionName"] for f in _list_all_functions(lam)]
     assert "lam-create-test" in names
 
 def test_lambda_delete_function(lam):
