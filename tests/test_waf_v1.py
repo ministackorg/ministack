@@ -5,12 +5,16 @@ SDKs (Terraform, old CFN, JDK examples) targeting v1 don't get a 405.
 For real WebACL state, callers should use wafv2.
 """
 
+import os
+
 import boto3
 import pytest
 
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+
 
 def _client(service):
-    return boto3.client(service, endpoint_url="http://localhost:4566",
+    return boto3.client(service, endpoint_url=ENDPOINT,
                         region_name="us-east-1",
                         aws_access_key_id="test", aws_secret_access_key="test")
 

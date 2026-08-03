@@ -9,8 +9,14 @@ from urllib.parse import urlparse
 import pytest
 from botocore.exceptions import ClientError
 
-_endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+_endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 _EXECUTE_PORT = urlparse(_endpoint).port or 4566
+# Predict the server-side loopback port. Under the matched-port protocol,
+# MINISTACK_ENDPOINT alone implies a direct connection (endpoint port == server port);
+# split-port topologies must export GATEWAY_PORT/EDGE_PORT into the test env.
+_SERVER_GATEWAY_PORT = int(
+    os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or _EXECUTE_PORT
+)
 
 
 def test_elbv2_arn_tail_helpers_require_elbv2_resource_scope():
@@ -826,14 +832,16 @@ def _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn):
 def test_elbv2_dataplane_forward_ip_target(elbv2):
     """ALB data plane proxies instance/ip targets over HTTP.
 
-    The emulator's own health endpoint (127.0.0.1:4566 from inside the
+    The emulator's own health endpoint (127.0.0.1 at the configured gateway port from inside the
     server process) doubles as the backend, so the test needs no external
     HTTP server and works both in-container and locally.
     """
     import urllib.request as _req
 
     lb_name = "dp-alb-ip"
-    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", 4566)
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(
+        elbv2, lb_name, "127.0.0.1", _SERVER_GATEWAY_PORT
+    )
     try:
         url = f"{_endpoint}/_alb/{lb_name}/_ministack/health"
         resp = _req.urlopen(_req.Request(url, method="GET"))
@@ -852,7 +860,7 @@ def test_elbv2_dataplane_forward_instance_target_hostname(elbv2):
 
     lb_name = "dp-alb-inst"
     lb_arn, tg_arn, l_arn = _alb_http_target_setup(
-        elbv2, lb_name, "localhost", 4566, target_type="instance"
+        elbv2, lb_name, "localhost", _SERVER_GATEWAY_PORT, target_type="instance"
     )
     try:
         url = f"{_endpoint}/_alb/{lb_name}/_ministack/health"
@@ -886,7 +894,7 @@ def test_alb_load_balancers_are_region_isolated(elbv2):
     import boto3
 
     elbv2_west = boto3.client(
-        "elbv2", endpoint_url="http://localhost:4566",
+        "elbv2", endpoint_url=_endpoint,
         aws_access_key_id="test", aws_secret_access_key="test",
         region_name="us-west-2",
     )

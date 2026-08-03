@@ -12,7 +12,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 
-_ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+_ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
 
 def _ddb_client(region_name: str):
@@ -2541,7 +2541,7 @@ def test_update_rejects_invalid_precision(ddb, kin):
         "UpdateKinesisStreamingConfiguration": {"ApproximateCreationDateTimePrecision": "NANOSECOND"},
     }).encode("utf-8")
     req = urllib.request.Request(
-        "http://localhost:4566/",
+        f"{_ENDPOINT}/",
         data=body,
         headers={
             "Content-Type": "application/x-amz-json-1.0",
@@ -3788,7 +3788,7 @@ def _raw_ddb(target: str, body: dict):
     suite hits)."""
     import urllib.request, urllib.error
     req = urllib.request.Request(
-        "http://localhost:4566/",
+        f"{_ENDPOINT}/",
         data=json.dumps(body).encode("utf-8"),
         headers={
             "Content-Type": "application/x-amz-json-1.0",

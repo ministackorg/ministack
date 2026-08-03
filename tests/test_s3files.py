@@ -7,12 +7,13 @@ documented at docs.aws.amazon.com/AmazonS3/.../API_Operations_Amazon_S3_Files.ht
 """
 
 import json
+import os
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 
-ENDPOINT = "http://localhost:4566"
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 BUCKET_ARN = "arn:aws:s3:::test-bucket"
 ROLE_ARN = "arn:aws:iam::000000000000:role/s3files-role"
 

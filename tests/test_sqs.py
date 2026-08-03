@@ -22,7 +22,7 @@ _LAMBDA_ROLE = "arn:aws:iam::000000000000:role/lambda-role"
 
 
 def _regional_sqs(region_name):
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     return boto3.client(
         "sqs",
         endpoint_url=endpoint,
@@ -31,6 +31,21 @@ def _regional_sqs(region_name):
         region_name=region_name,
         config=Config(region_name=region_name, retries={"mode": "standard"}),
     )
+
+
+def _server_queue_url(queue_url: str) -> str:
+    # Predict the server-side canonical SQS URL. Under the matched-port protocol,
+    # MINISTACK_ENDPOINT alone implies a direct connection (queue URL port == server port);
+    # split-port topologies must export GATEWAY_PORT into the test env.
+    host = os.environ.get("MINISTACK_HOST", "localhost")
+    parsed = urlparse(queue_url)
+    if gateway_port := os.environ.get("GATEWAY_PORT"):
+        port = gateway_port
+    elif os.environ.get("EDGE_PORT"):
+        port = 4566
+    else:
+        port = parsed.port or 4566
+    return parsed._replace(netloc=f"{host}:{port}").geturl()
 
 
 def test_sqs_create_queue(sqs):
@@ -144,7 +159,10 @@ def test_sqs_queue_url_reflects_env_host(sqs):
     """QueueUrl host must come from MINISTACK_HOST env var, not hardcoded localhost."""
     import os
 
-    expected_host = os.environ.get("MINISTACK_HOST", "localhost")
+    expected_host = os.environ.get(
+        "MINISTACK_HOST",
+        urlparse(os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")).hostname or "localhost",
+    )
     resp = sqs.create_queue(QueueName="intg-sqs-urlhost")
     url = resp["QueueUrl"]
     assert expected_host in url
@@ -173,7 +191,7 @@ def _json_sqs_with_host(target, payload_dict, host_header):
     to a value different from the TCP host boto3 would otherwise send."""
     import http.client
 
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     p = urlparse(endpoint)
     conn = http.client.HTTPConnection(p.hostname or "localhost", p.port or 4566)
     body = json.dumps(payload_dict)
@@ -568,7 +586,7 @@ def test_sqs_tag_queue_rejects_null_tag_value(sqs):
     import urllib.request
     url = sqs.create_queue(QueueName="intg-sqs-tag-null")["QueueUrl"]
 
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     req = urllib.request.Request(
         endpoint + "/",
         data=_json.dumps({
@@ -898,7 +916,8 @@ def test_sqs_bare_queue_name_as_url(sqs):
 def test_sqs_localstack_queue_path_alias(sqs):
     queue_name = "intg-sqs-localstack-alias"
     sqs.create_queue(QueueName=queue_name)
-    alias_url = f"http://localhost:4566/queue/{queue_name}"
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+    alias_url = f"{endpoint}/queue/{queue_name}"
 
     sqs.send_message(QueueUrl=alias_url, MessageBody="via-alias")
 
@@ -1170,20 +1189,23 @@ def test_sqs_dlq_sweep_survives_legacy_double_encoded_policy():
 def test_sqs_messages_endpoint_basic(sqs):
     """GET /_ministack/sqs/messages returns sent messages grouped by account
     and queue URL, without affecting subsequent ReceiveMessage."""
+    import urllib.parse
     import urllib.request
     qurl = sqs.create_queue(QueueName=f"intg-peek-{_uuid_mod.uuid4().hex[:8]}")["QueueUrl"]
     sqs.send_message(QueueUrl=qurl, MessageBody="hello-peek-1")
     sqs.send_message(QueueUrl=qurl, MessageBody="hello-peek-2")
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
-    with urllib.request.urlopen(f"{endpoint}/_ministack/sqs/messages?QueueUrl={qurl}") as r:
+    admin_qurl = _server_queue_url(qurl)
+    query = urllib.parse.urlencode({"QueueUrl": admin_qurl})
+    with urllib.request.urlopen(f"{endpoint}/_ministack/sqs/messages?{query}") as r:
         data = json.loads(r.read())
 
     # One account, one queue, two messages.
     accts = list(data["messages"].keys())
     assert len(accts) == 1
-    assert qurl in data["messages"][accts[0]]["us-east-1"]
-    msgs = data["messages"][accts[0]]["us-east-1"][qurl]
+    assert admin_qurl in data["messages"][accts[0]]["us-east-1"]
+    msgs = data["messages"][accts[0]]["us-east-1"][admin_qurl]
     bodies = sorted(m["Body"] for m in msgs)
     assert bodies == ["hello-peek-1", "hello-peek-2"]
     # Peek must not have receive-counted the messages.
@@ -1202,6 +1224,7 @@ def test_sqs_messages_endpoint_basic(sqs):
 
 def test_sqs_messages_endpoint_separates_same_url_regions(sqs):
     """QueueUrl peeks keep same-name regional queues separate."""
+    import urllib.parse
     import urllib.request
 
     name = f"intg-peek-region-{_uuid_mod.uuid4().hex[:8]}"
@@ -1210,22 +1233,25 @@ def test_sqs_messages_endpoint_separates_same_url_regions(sqs):
     west_url = west.create_queue(QueueName=name)["QueueUrl"]
     sqs.send_message(QueueUrl=east_url, MessageBody="east-peek")
     west.send_message(QueueUrl=west_url, MessageBody="west-peek")
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
-    with urllib.request.urlopen(f"{endpoint}/_ministack/sqs/messages?QueueUrl={east_url}") as r:
+    admin_east_url = _server_queue_url(east_url)
+    admin_west_url = _server_queue_url(west_url)
+    query = urllib.parse.urlencode({"QueueUrl": admin_east_url})
+    with urllib.request.urlopen(f"{endpoint}/_ministack/sqs/messages?{query}") as r:
         data = json.loads(r.read())
 
     acct = next(iter(data["messages"]))
     by_region = data["messages"][acct]
-    assert [m["Body"] for m in by_region["us-east-1"][east_url]] == ["east-peek"]
-    assert [m["Body"] for m in by_region["us-west-2"][west_url]] == ["west-peek"]
+    assert [m["Body"] for m in by_region["us-east-1"][admin_east_url]] == ["east-peek"]
+    assert [m["Body"] for m in by_region["us-west-2"][admin_west_url]] == ["west-peek"]
 
 
 def test_sqs_messages_endpoint_invalid_account_rejected(sqs):
     """?account=<not-12-digit> returns 400 InvalidAccountID."""
     import urllib.error
     import urllib.request
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     try:
         urllib.request.urlopen(f"{endpoint}/_ministack/sqs/messages?account=abc")
         raise AssertionError("expected 400")
@@ -1436,7 +1462,7 @@ def test_sqs_xml_query_error_code_uses_legacy_namespace():
     import urllib.request
     import xml.etree.ElementTree as ET
 
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     try:
         urllib.request.urlopen(f"{endpoint}/?Action=GetQueueUrl&QueueName=nonexistent-xml-test-queue")
         raise AssertionError("expected HTTP error")

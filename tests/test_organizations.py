@@ -1,8 +1,10 @@
+import os
+
 import boto3
 import pytest
 from botocore.exceptions import ClientError
 
-ENDPOINT = "http://localhost:4566"
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 REGION = "us-east-1"
 
 
@@ -56,7 +58,7 @@ def test_organizations_create_nested_ou_path():
     import json as _json
     import urllib.request as _r
     req = _r.Request(
-        "http://localhost:4566/",
+        f"{ENDPOINT}/",
         data=_json.dumps({"OrganizationalUnitId": backend["Id"]}).encode(),
         headers={
             "X-Amz-Target": "AWSOrganizationsV20161128.DescribeOrganizationalUnit",

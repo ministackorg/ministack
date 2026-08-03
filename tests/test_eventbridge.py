@@ -10,11 +10,13 @@ import boto3
 import pytest
 from botocore.exceptions import ClientError
 
+_ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+
 
 def _events_client(region_name):
     return boto3.client(
         "events",
-        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        endpoint_url=_ENDPOINT,
         aws_access_key_id="test",
         aws_secret_access_key="test",
         region_name=region_name,
@@ -24,7 +26,7 @@ def _events_client(region_name):
 def _sqs_client(region_name):
     return boto3.client(
         "sqs",
-        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        endpoint_url=_ENDPOINT,
         aws_access_key_id="test",
         aws_secret_access_key="test",
         region_name=region_name,
@@ -1065,7 +1067,7 @@ def test_eventbridge_tag_resource_rejects_same_name_other_region_bus(eb):
     eb.create_event_bus(Name=name)
     west = boto3.client(
         "events",
-        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/"),
         aws_access_key_id="test",
         aws_secret_access_key="test",
         region_name="us-west-2",
@@ -1084,7 +1086,7 @@ def test_eventbridge_tag_resource_accepts_default_bus_in_secondary_region(eb):
     )
     west = boto3.client(
         "events",
-        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/"),
         aws_access_key_id="test",
         aws_secret_access_key="test",
         region_name="us-west-2",
@@ -2150,7 +2152,7 @@ def test_eventbridge_log_config_round_trip(eb):
 
     def _post(target, payload):
         req = _r.Request(
-            "http://localhost:4566/",
+            f"{_ENDPOINT}/",
             data=json.dumps(payload).encode(),
             headers={
                 "X-Amz-Target": f"AWSEvents.{target}",

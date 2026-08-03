@@ -19,6 +19,19 @@ from botocore.exceptions import ClientError
 
 from ministack.core import persistence
 
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+
+
+def _advertised_endpoint():
+    # Predict the server-side advertised port. Under the matched-port protocol,
+    # MINISTACK_ENDPOINT alone implies a direct connection (endpoint port == server port);
+    # split-port topologies must export GATEWAY_PORT/EDGE_PORT into the test env.
+    host = os.environ.get("MINISTACK_HOST", "localhost")
+    port = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or (
+        urlparse(ENDPOINT).port or 4566
+    )
+    return f"http://{host}:{port}"
+
 # ========== from test_cognito.py ==========
 
 
@@ -1375,7 +1388,7 @@ def test_cognito_jwks_endpoint():
     pool = cognito.create_user_pool(PoolName="jwks-pool")["UserPool"]
     pool_id = pool["Id"]
     req = urllib.request.Request(
-        f"http://localhost:4566/{pool_id}/.well-known/jwks.json",
+        f"{ENDPOINT}/{pool_id}/.well-known/jwks.json",
     )
     with urllib.request.urlopen(req) as r:
         data = _json.loads(r.read())
@@ -1524,7 +1537,7 @@ def test_cognito_openid_configuration():
     pool = cognito.create_user_pool(PoolName="oidc-pool")["UserPool"]
     pool_id = pool["Id"]
     req = urllib.request.Request(
-        f"http://localhost:4566/{pool_id}/.well-known/openid-configuration",
+        f"{ENDPOINT}/{pool_id}/.well-known/openid-configuration",
     )
     with urllib.request.urlopen(req) as r:
         data = _json.loads(r.read())
@@ -1555,7 +1568,7 @@ def test_cognito_browser_endpoints_send_cors_headers():
         f"/{pool_id}/.well-known/openid-configuration",
         f"/{pool_id}/.well-known/jwks.json",
     ):
-        with urllib.request.urlopen(f"http://localhost:4566{path}") as r:
+        with urllib.request.urlopen(f"{ENDPOINT}{path}") as r:
             assert r.headers.get("Access-Control-Allow-Origin") == "*", (
                 f"missing CORS header on {path}"
             )
@@ -1564,7 +1577,7 @@ def test_cognito_browser_endpoints_send_cors_headers():
     # about the body (an empty form yields a 4xx) — only that the CORS header
     # is present on the response.
     req = urllib.request.Request(
-        "http://localhost:4566/oauth2/token",
+        f"{ENDPOINT}/oauth2/token",
         data=b"grant_type=authorization_code",
         method="POST",
         headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -1712,9 +1725,6 @@ def test_cognito_describe_nonexistent_identity_provider(cognito_idp):
 # ===========================================================================
 # Federated SAML / OAuth2 flow
 # ===========================================================================
-
-ENDPOINT = "http://localhost:4566"
-
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Capture 302 redirects without following them."""
@@ -2113,7 +2123,7 @@ def test_cognito_oauth2_authorize_oidc_redirect(cognito_idp):
         assert qs["client_id"] == ["oidc-client-id"]
         # The redirect_uri MS hands to the IdP must point at MS's OIDC
         # callback, not the SAML one (regression guard for the original bug).
-        assert qs["redirect_uri"] == [f"{ENDPOINT}/oauth2/idpresponse"]
+        assert qs["redirect_uri"] == [f"{_advertised_endpoint()}/oauth2/idpresponse"]
         assert qs["state"]  # relay key present
     finally:
         stop()
@@ -2162,7 +2172,7 @@ def test_cognito_oidc_full_flow(cognito_idp):
         form = recorded["form"]
         assert form["grant_type"] == "authorization_code"
         assert form["code"] == "idp-issued-code"
-        assert form["redirect_uri"] == f"{ENDPOINT}/oauth2/idpresponse"
+        assert form["redirect_uri"] == f"{_advertised_endpoint()}/oauth2/idpresponse"
         assert form["client_id"] == "oidc-client-id"
         assert form["client_secret"] == "oidc-client-secret"
 
@@ -2432,16 +2442,27 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from conftest import ENDPOINT, make_client
+from conftest import ENDPOINT as _CONFTEST_ENDPOINT
+from conftest import make_client
+
+ENDPOINT = _CONFTEST_ENDPOINT.rstrip("/")
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _setup_pool_with_user(cognito_idp, generate_secret=True, force_change_password=False):
+def _setup_pool_with_user(
+    cognito_idp,
+    generate_secret=True,
+    force_change_password=False,
+    lambda_config=None,
+):
     """Create a user pool with a confirmed (or FORCE_CHANGE_PASSWORD) user and an
     OAuth-enabled client."""
-    pool = cognito_idp.create_user_pool(PoolName='OAuth2TestPool')
+    pool = cognito_idp.create_user_pool(
+        PoolName='OAuth2TestPool',
+        **({"LambdaConfig": lambda_config} if lambda_config else {}),
+    )
     pool_id = pool['UserPool']['Id']
 
     client_kwargs = {
@@ -3427,6 +3448,106 @@ def test_oauth2_full_flow():
     assert headers.get('location', '') == 'http://localhost:3000/logout'
 
 
+def test_oauth2_full_flow_for_non_boot_region_pool():
+    """Public discovery and hosted UI remain unscoped for regional pools."""
+    cognito_idp = _regional_cognito_client("cognito-idp", "eu-central-1")
+    lam = _regional_cognito_client("lambda", "eu-central-1")
+    function_name = f"regional-hosted-pretoken-{_uuid_mod.uuid4().hex[:10]}"
+    handler = (
+        "def handler(event, ctx):\n"
+        "    event['response']['claimsAndScopeOverrideDetails'] = {\n"
+        "        'accessTokenGeneration': {\n"
+        "            'claimsToAddOrOverride': {'hosted_region': 'eu-central-1'},\n"
+        "        },\n"
+        "    }\n"
+        "    return event\n"
+    )
+    lam.create_function(
+        FunctionName=function_name,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": _make_pretoken_lambda_zip(handler)},
+    )
+    function_arn = lam.get_function(FunctionName=function_name)["Configuration"][
+        "FunctionArn"
+    ]
+    pool_id, client = _setup_pool_with_user(
+        cognito_idp,
+        lambda_config={
+            "PreTokenGenerationConfig": {
+                "LambdaArn": function_arn,
+                "LambdaVersion": "V2_0",
+            }
+        },
+    )
+    client_id = client["ClientId"]
+
+    with urllib.request.urlopen(
+        f"{ENDPOINT}/{pool_id}/.well-known/jwks.json", timeout=10
+    ) as response:
+        assert json.loads(response.read())["keys"]
+    with urllib.request.urlopen(
+        f"{ENDPOINT}/{pool_id}/.well-known/openid-configuration", timeout=10
+    ) as response:
+        discovery = json.loads(response.read())
+    assert discovery["issuer"] == (
+        f"https://cognito-idp.eu-central-1.amazonaws.com/{pool_id}"
+    )
+
+    authorize_url = (
+        f"{ENDPOINT}/oauth2/authorize?response_type=code"
+        f"&client_id={client_id}"
+        f"&redirect_uri=http://localhost:3000/callback"
+        f"&scope=openid+email&state=regional-state"
+    )
+    status, _, body = _get(authorize_url)
+    assert status == 200
+    assert "<form" in body.decode("utf-8")
+
+    status, headers, _ = _post_form(
+        f"{ENDPOINT}/login",
+        {
+            "username": "testuser",
+            "password": "TestPass1!",
+            "client_id": client_id,
+            "redirect_uri": "http://localhost:3000/callback",
+            "scope": "openid email",
+            "state": "regional-state",
+            "response_type": "code",
+        },
+        follow_redirects=False,
+    )
+    assert status == 302
+    code = urllib.parse.parse_qs(
+        urllib.parse.urlparse(headers["location"]).query
+    )["code"][0]
+
+    status, _, body = _post_form(
+        f"{ENDPOINT}/oauth2/token",
+        {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": "http://localhost:3000/callback",
+            "client_id": client_id,
+            "client_secret": client["ClientSecret"],
+        },
+    )
+    assert status == 200
+    tokens = json.loads(body)
+    claims = _decode_jwt_claims(tokens["access_token"])
+    assert claims["iss"] == f"https://cognito-idp.eu-central-1.amazonaws.com/{pool_id}"
+    assert claims["hosted_region"] == "eu-central-1"
+
+    request = urllib.request.Request(
+        f"{ENDPOINT}/oauth2/userInfo",
+        headers={"Authorization": f"Bearer {tokens['access_token']}"},
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        user_info = json.loads(response.read())
+    assert user_info["cognito:username"] == "testuser"
+
+
 # ========== from test_cognito_auth_codes_persistence.py ==========
 # Two distinct OAuth2 code stores exist in services/cognito.py:
 #   - _authorization_codes — managed-login PKCE flow (already persisted)
@@ -3880,7 +4001,7 @@ def test_auth_codes_dict_types_are_plain_builtin_dict():
 
 def _fetch_ses_messages():
     """Pull SES outbox via the public inspection endpoint (account 000000000000)."""
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     url = f"{endpoint}/_ministack/ses/messages"
     with urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=5) as r:
         data = json.loads(r.read().decode())
@@ -4078,7 +4199,7 @@ def test_cognito_iss_claim_uses_pool_region():
     """
     import boto3
 
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     region = "eu-central-1"
     client = boto3.client(
         "cognito-idp",
@@ -4152,6 +4273,430 @@ def test_cognito_pool_region_parser_govcloud():
         )
 
 
+def _regional_cognito_client(service: str, region: str):
+    import boto3
+
+    return boto3.client(
+        service,
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region,
+    )
+
+
+def test_cognito_user_pools_and_domains_are_region_scoped():
+    east = _regional_cognito_client("cognito-idp", "us-east-1")
+    west = _regional_cognito_client("cognito-idp", "us-west-2")
+    suffix = _uuid_mod.uuid4().hex[:10]
+
+    east_pool = east.create_user_pool(PoolName=f"shared-{suffix}")["UserPool"]["Id"]
+    west_pool = west.create_user_pool(PoolName=f"shared-{suffix}")["UserPool"]["Id"]
+
+    east_pool_ids = {
+        pool["Id"]
+        for page in east.get_paginator("list_user_pools").paginate(MaxResults=60)
+        for pool in page["UserPools"]
+    }
+    west_pool_ids = {
+        pool["Id"]
+        for page in west.get_paginator("list_user_pools").paginate(MaxResults=60)
+        for pool in page["UserPools"]
+    }
+    assert east_pool in east_pool_ids
+    assert west_pool not in east_pool_ids
+    assert west_pool in west_pool_ids
+    assert east_pool not in west_pool_ids
+    with pytest.raises(ClientError) as exc:
+        east.describe_user_pool(UserPoolId=west_pool)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    for operation, kwargs in (
+        (east.create_user_pool_client, {"UserPoolId": west_pool, "ClientName": "wrong-region"}),
+        (east.admin_create_user, {"UserPoolId": west_pool, "Username": "wrong-region"}),
+        (east.create_group, {"UserPoolId": west_pool, "GroupName": "wrong-region"}),
+    ):
+        with pytest.raises(ClientError) as exc:
+            operation(**kwargs)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    domain = f"shared-{suffix}"
+    east.create_user_pool_domain(UserPoolId=east_pool, Domain=domain)
+    west.create_user_pool_domain(UserPoolId=west_pool, Domain=domain)
+    assert east.describe_user_pool_domain(Domain=domain)["DomainDescription"]["UserPoolId"] == east_pool
+    assert west.describe_user_pool_domain(Domain=domain)["DomainDescription"]["UserPoolId"] == west_pool
+
+    second_east_pool = east.create_user_pool(PoolName=f"duplicate-{suffix}")["UserPool"]["Id"]
+    with pytest.raises(ClientError) as exc:
+        east.create_user_pool_domain(UserPoolId=second_east_pool, Domain=domain)
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+
+def test_cognito_unsigned_user_pool_operations_pin_the_owning_region():
+    west = _regional_cognito_client("cognito-idp", "eu-central-1")
+    suffix = _uuid_mod.uuid4().hex[:10]
+    pool_id = west.create_user_pool(PoolName=f"unsigned-{suffix}")["UserPool"]["Id"]
+    client_id = west.create_user_pool_client(
+        UserPoolId=pool_id,
+        ClientName=f"unsigned-{suffix}",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+
+    west.admin_create_user(
+        UserPoolId=pool_id,
+        Username="challenge-user",
+        TemporaryPassword="TempPass1!",
+    )
+    challenge = west.initiate_auth(
+        ClientId=client_id,
+        AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "challenge-user", "PASSWORD": "TempPass1!"},
+    )
+    assert challenge["ChallengeName"] == "NEW_PASSWORD_REQUIRED"
+    west.respond_to_auth_challenge(
+        ClientId=client_id,
+        ChallengeName="NEW_PASSWORD_REQUIRED",
+        Session=challenge["Session"],
+        ChallengeResponses={"USERNAME": "challenge-user", "NEW_PASSWORD": "ChallengePass1!"},
+    )
+
+    west.sign_up(
+        ClientId=client_id,
+        Username="public-user",
+        Password="PublicPass1!",
+        UserAttributes=[{"Name": "email", "Value": f"{suffix}@example.com"}],
+    )
+    west.resend_confirmation_code(ClientId=client_id, Username="public-user")
+    west.confirm_sign_up(ClientId=client_id, Username="public-user", ConfirmationCode="123456")
+    west.forgot_password(ClientId=client_id, Username="public-user")
+    west.confirm_forgot_password(
+        ClientId=client_id,
+        Username="public-user",
+        ConfirmationCode="654321",
+        Password="ResetPass1!",
+    )
+
+    auth = west.initiate_auth(
+        ClientId=client_id,
+        AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "public-user", "PASSWORD": "ResetPass1!"},
+    )["AuthenticationResult"]
+    access_token = auth["AccessToken"]
+    refresh_token = auth["RefreshToken"]
+
+    assert west.get_user(AccessToken=access_token)["Username"] == "public-user"
+    west.update_user_attributes(
+        AccessToken=access_token,
+        UserAttributes=[{"Name": "name", "Value": "Regional User"}],
+    )
+    west.change_password(
+        AccessToken=access_token,
+        PreviousPassword="ResetPass1!",
+        ProposedPassword="ChangedPass1!",
+    )
+    software_token = west.associate_software_token(AccessToken=access_token)
+    assert software_token["SecretCode"]
+    assert west.verify_software_token(
+        AccessToken=access_token,
+        UserCode="123456",
+    )["Status"] == "SUCCESS"
+    west.set_user_mfa_preference(
+        AccessToken=access_token,
+        SoftwareTokenMfaSettings={"Enabled": True, "PreferredMfa": True},
+    )
+    refreshed = west.get_tokens_from_refresh_token(
+        ClientId=client_id,
+        RefreshToken=refresh_token,
+    )
+    assert refreshed["AuthenticationResult"]["AccessToken"]
+    west.revoke_token(Token=refresh_token, ClientId=client_id)
+    west.global_sign_out(AccessToken=access_token)
+
+    west.admin_create_user(UserPoolId=pool_id, Username="delete-user")
+    west.admin_set_user_password(
+        UserPoolId=pool_id,
+        Username="delete-user",
+        Password="DeletePass1!",
+        Permanent=True,
+    )
+    delete_access_token = west.initiate_auth(
+        ClientId=client_id,
+        AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "delete-user", "PASSWORD": "DeletePass1!"},
+    )["AuthenticationResult"]["AccessToken"]
+    west.delete_user(AccessToken=delete_access_token)
+    with pytest.raises(ClientError) as exc:
+        west.admin_get_user(UserPoolId=pool_id, Username="delete-user")
+    assert exc.value.response["Error"]["Code"] == "UserNotFoundException"
+
+
+def test_cognito_client_and_hosted_scans_preserve_account_boundaries():
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _cognito_module()
+    original_account = get_account_id()
+    original_region = get_region()
+    owner_account = "111111111111"
+    foreign_account = "222222222222"
+    pool_id = "us-west-2_accountscope"
+    client_id = "account-scoped-client"
+
+    try:
+        mod.reset()
+        set_request_account_id(owner_account)
+        set_request_region("us-west-2")
+        mod._user_pools[pool_id] = {"_clients": {client_id: {}}}
+
+        set_request_account_id(foreign_account)
+        set_request_region("us-east-1")
+        assert mod._pool_scope_for_client(client_id) is None
+
+        set_request_account_id(owner_account)
+        assert mod._pool_scope_for_client(client_id) == (pool_id, "us-west-2")
+
+        set_request_account_id(foreign_account)
+        set_request_region("us-east-1")
+        assert mod._get_pool_unscoped(pool_id) is mod._user_pools.get_scoped(
+            owner_account, "us-west-2", pool_id
+        )
+        assert get_account_id() == owner_account
+        assert get_region() == "us-west-2"
+
+        set_request_account_id(foreign_account)
+        set_request_region("us-east-1")
+        found_pool_id, found_pool, found_client = mod._find_pool_by_client_id(
+            client_id
+        )
+        assert found_pool_id == pool_id
+        assert found_pool is mod._user_pools.get_scoped(
+            owner_account, "us-west-2", pool_id
+        )
+        assert found_client == {}
+        assert get_account_id() == owner_account
+        assert get_region() == "us-west-2"
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+@pytest.mark.parametrize(
+    ("action", "payload_kind"),
+    (
+        ("GetUser", "user_pool_id"),
+        ("RespondToAuthChallenge", "session"),
+        ("GetUser", "access_token"),
+        ("GetTokensFromRefreshToken", "refresh_token"),
+        ("RevokeToken", "token"),
+        ("SignUp", "client_id"),
+    ),
+)
+def test_cognito_unsigned_idp_operations_pin_each_payload_path(
+    action, payload_kind
+):
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _cognito_module()
+    original_account = get_account_id()
+    original_region = get_region()
+    owner_account = "111111111111"
+    owner_region = "eu-central-1"
+    pool_id = f"{owner_region}_unsignedpin"
+    client_id = "unsigned-pin-client"
+    session = "unsigned-pin-session"
+    opaque_token = "unsigned-pin-opaque-token"
+    header = base64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=").decode()
+    claims = base64.urlsafe_b64encode(
+        json.dumps(
+            {"iss": f"https://cognito-idp.{owner_region}.amazonaws.com/{pool_id}"}
+        ).encode()
+    ).rstrip(b"=").decode()
+    access_token = f"{header}.{claims}.signature"
+    payloads = {
+        "user_pool_id": {"UserPoolId": pool_id},
+        "session": {"Session": session},
+        "access_token": {"AccessToken": access_token},
+        "refresh_token": {"RefreshToken": opaque_token},
+        "token": {"Token": opaque_token},
+        "client_id": {"ClientId": client_id},
+    }
+
+    try:
+        mod.reset()
+        set_request_account_id(owner_account)
+        set_request_region(owner_region)
+        mod._user_pools[pool_id] = {"_clients": {client_id: {}}}
+        mod._challenge_sessions[session] = {"pool_id": pool_id}
+        mod._refresh_tokens[opaque_token] = {"pool_id": pool_id}
+
+        set_request_region("us-east-1")
+        assert mod._run_idp_handler(
+            lambda _data: (get_account_id(), get_region()),
+            action,
+            payloads[payload_kind],
+        ) == (owner_account, owner_region)
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_cognito_unsigned_identity_operations_pin_the_owning_region():
+    west = _regional_cognito_client("cognito-identity", "us-west-2")
+    east = _regional_cognito_client("cognito-identity", "us-east-1")
+    pool_id = west.create_identity_pool(
+        IdentityPoolName=f"regional-{_uuid_mod.uuid4().hex[:10]}",
+        AllowUnauthenticatedIdentities=True,
+    )["IdentityPoolId"]
+    pool_arn = _identity_pool_arn(pool_id, region="us-west-2")
+    west.tag_resource(ResourceArn=pool_arn, Tags={"scope": "west"})
+    assert west.list_tags_for_resource(ResourceArn=pool_arn)["Tags"] == {
+        "scope": "west"
+    }
+    with pytest.raises(ClientError) as exc:
+        east.list_tags_for_resource(ResourceArn=pool_arn)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    identity_id = west.get_id(
+        AccountId="000000000000",
+        IdentityPoolId=pool_id,
+    )["IdentityId"]
+    assert identity_id.startswith("us-west-2:")
+    assert west.get_credentials_for_identity(IdentityId=identity_id)["Credentials"]["AccessKeyId"]
+    assert west.get_open_id_token(IdentityId=identity_id)["Token"]
+    west.unlink_identity(IdentityId=identity_id, Logins={}, LoginsToRemove=[])
+
+    from ministack.core.responses import get_region, set_request_region
+
+    mod = _cognito_module()
+    original_region = get_region()
+    try:
+        for action, data in (
+            ("GetId", {"IdentityPoolId": pool_id}),
+            ("GetCredentialsForIdentity", {"IdentityId": identity_id}),
+            ("GetOpenIdToken", {"IdentityId": identity_id}),
+            ("UnlinkIdentity", {"IdentityId": identity_id}),
+        ):
+            set_request_region("us-east-1")
+            assert mod._run_identity_handler(
+                lambda _data: get_region(), action, data
+            ) == "us-west-2"
+    finally:
+        set_request_region(original_region)
+
+    assert pool_id not in {
+        pool["IdentityPoolId"]
+        for pool in east.list_identity_pools(MaxResults=60)["IdentityPools"]
+    }
+    with pytest.raises(ClientError) as exc:
+        east.describe_identity_pool(IdentityPoolId=pool_id)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_cognito_unsigned_token_pinning_rejects_non_object_claims():
+    cognito_idp = _regional_cognito_client("cognito-idp", "us-east-1")
+
+    def _token(payload):
+        header = base64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=").decode()
+        body = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=").decode()
+        return f"{header}.{body}.signature"
+
+    for payload in ([], {"iss": 123}):
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.get_user(AccessToken=_token(payload))
+        assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
+
+    for token in ([], {}, 123, True):
+        request = urllib.request.Request(
+            ENDPOINT,
+            data=json.dumps({"AccessToken": token}).encode(),
+            headers={
+                "Content-Type": "application/x-amz-json-1.1",
+                "X-Amz-Target": "AWSCognitoIdentityProviderService.GetUser",
+            },
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(request, timeout=10)
+        assert exc.value.code == 400
+        assert json.loads(exc.value.read())["__type"].endswith(
+            "NotAuthorizedException"
+        )
+
+
+def test_cognito_legacy_state_self_places_by_pool_ids():
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _cognito_module()
+    original_account = get_account_id()
+    original_region = get_region()
+    account = "111111111111"
+    user_pool_id = "us-west-2_legacy123"
+    identity_pool_id = "us-west-2:00000000-0000-4000-8000-000000000001"
+
+    legacy_user_pools = AccountScopedDict()
+    legacy_user_pools._data[(account, user_pool_id)] = {"Id": user_pool_id, "Name": "legacy"}
+    legacy_domains = AccountScopedDict()
+    legacy_domains._data[(account, "legacy-domain")] = user_pool_id
+    legacy_identity_pools = AccountScopedDict()
+    legacy_identity_pools._data[(account, identity_pool_id)] = {
+        "IdentityPoolId": identity_pool_id,
+        "IdentityPoolName": "legacy",
+    }
+    legacy_identity_tags = AccountScopedDict()
+    legacy_identity_tags._data[(account, identity_pool_id)] = {"env": "legacy"}
+
+    try:
+        mod.reset()
+        set_request_account_id(account)
+        set_request_region("us-east-1")
+        mod.restore_state({
+            "user_pools": legacy_user_pools,
+            "pool_domain_map": legacy_domains,
+            "identity_pools": legacy_identity_pools,
+            "identity_tags": legacy_identity_tags,
+        })
+
+        assert mod._user_pools.get_scoped(account, "us-west-2", user_pool_id)["Name"] == "legacy"
+        assert mod._user_pools.get_scoped(account, "us-east-1", user_pool_id) is None
+        assert mod._pool_domain_map.get_scoped(account, "us-west-2", "legacy-domain") == user_pool_id
+        assert mod._identity_pools.get_scoped(account, "us-west-2", identity_pool_id)[
+            "IdentityPoolName"
+        ] == "legacy"
+        assert mod._identity_tags.get_scoped(account, "us-west-2", identity_pool_id) == {
+            "env": "legacy"
+        }
+
+        v3 = AccountRegionScopedDict()
+        v3.set_scoped(account, "eu-central-1", "eu-central-1_v3", {"Name": "v3"})
+        mod.reset()
+        mod.restore_state({"user_pools": v3})
+        assert mod._user_pools.get_scoped(account, "eu-central-1", "eu-central-1_v3") == {
+            "Name": "v3"
+        }
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_cognito_pool_arn_uses_pool_region():
     """`_pool_arn` must encode the pool's region, not the request region.
 
@@ -4193,7 +4738,7 @@ def test_cognito_user_pool_domain_cloudfront_uses_pool_region():
     """
     import boto3
 
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     region = "eu-central-1"
     client = boto3.client(
         "cognito-idp",

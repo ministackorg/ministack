@@ -11,7 +11,8 @@ import boto3
 import pytest
 from botocore.exceptions import ClientError
 
-_ENDPOINT = "http://localhost:4566"
+_ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+_ENDPOINT_NETLOC = urlparse(_ENDPOINT).netloc
 
 
 def _client(region):
@@ -104,7 +105,7 @@ def test_appsync_signed_root_graphql_request_preserves_region(api_selector):
     )["graphqlApi"]
     url = f"{_ENDPOINT}/graphql"
     headers = {
-        "Host": f"{api['apiId']}.appsync-api.us-east-1.localhost:4566",
+        "Host": f"{api['apiId']}.appsync-api.us-east-1.{_ENDPOINT_NETLOC}",
         "Authorization": (
             "AWS4-HMAC-SHA256 "
             "Credential=test/20260722/us-west-2/appsync/aws4_request, "
@@ -129,7 +130,7 @@ def test_appsync_signed_root_graphql_request_uses_current_region_fallback():
         authenticationType="AWS_IAM",
     )["graphqlApi"]
     headers = {
-        "Host": f"{api['apiId']}.appsync-api.us-west-2.localhost:4566",
+        "Host": f"{api['apiId']}.appsync-api.us-west-2.{_ENDPOINT_NETLOC}",
         "Authorization": (
             "AWS4-HMAC-SHA256 "
             "Credential=test/20260722/us-west-2/appsync/aws4_request, "
@@ -381,7 +382,7 @@ def test_appsync_graphql_create_and_query(ddb):
         "query": 'mutation CreateUser { createUser(input: {id: "u1", name: "Alice", email: "alice@example.com"}) { id name email } }',
     }).encode()
     req = urllib.request.Request(
-        f"http://localhost:4566/v1/apis/{api_id}/graphql",
+        f"{_ENDPOINT}/v1/apis/{api_id}/graphql",
         data=mutation,
         headers={"Content-Type": "application/json", "x-api-key": key["id"]},
     )
@@ -395,7 +396,7 @@ def test_appsync_graphql_create_and_query(ddb):
         "query": 'query GetUser { getUser(id: "u1") { id name email } }',
     }).encode()
     req = urllib.request.Request(
-        f"http://localhost:4566/v1/apis/{api_id}/graphql",
+        f"{_ENDPOINT}/v1/apis/{api_id}/graphql",
         data=query,
         headers={"Content-Type": "application/json", "x-api-key": key["id"]},
     )
@@ -409,7 +410,7 @@ def test_appsync_graphql_create_and_query(ddb):
         "query": "query ListUsers { listUsers { items { id name } } }",
     }).encode()
     req = urllib.request.Request(
-        f"http://localhost:4566/v1/apis/{api_id}/graphql",
+        f"{_ENDPOINT}/v1/apis/{api_id}/graphql",
         data=list_q,
         headers={"Content-Type": "application/json", "x-api-key": key["id"]},
     )
@@ -442,7 +443,7 @@ def test_appsync_graphql_update_mutation(ddb):
     appsync.create_resolver(apiId=api["apiId"], typeName="Query", fieldName="getItem", dataSourceName="ds")
 
     def gql(query):
-        req = urllib.request.Request(f"http://localhost:4566/v1/apis/{api['apiId']}/graphql",
+        req = urllib.request.Request(f"{_ENDPOINT}/v1/apis/{api['apiId']}/graphql",
             data=_json.dumps({"query": query}).encode(), headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req) as r:
             return _json.loads(r.read())
@@ -478,7 +479,7 @@ def test_appsync_graphql_delete_mutation(ddb):
     appsync.create_resolver(apiId=api["apiId"], typeName="Query", fieldName="getItem", dataSourceName="ds")
 
     def gql(query):
-        req = urllib.request.Request(f"http://localhost:4566/v1/apis/{api['apiId']}/graphql",
+        req = urllib.request.Request(f"{_ENDPOINT}/v1/apis/{api['apiId']}/graphql",
             data=_json.dumps({"query": query}).encode(), headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req) as r:
             return _json.loads(r.read())
@@ -515,7 +516,7 @@ def test_appsync_graphql_with_variables():
         body = {"query": query}
         if variables:
             body["variables"] = variables
-        req = urllib.request.Request(f"http://localhost:4566/v1/apis/{api['apiId']}/graphql",
+        req = urllib.request.Request(f"{_ENDPOINT}/v1/apis/{api['apiId']}/graphql",
             data=_json.dumps(body).encode(), headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req) as r:
             return _json.loads(r.read())
@@ -544,7 +545,7 @@ def test_appsync_graphql_nonexistent_item():
                                dynamodbConfig={"tableName": "gql-404", "awsRegion": "us-east-1"})
     appsync.create_resolver(apiId=api["apiId"], typeName="Query", fieldName="getItem", dataSourceName="ds")
 
-    req = urllib.request.Request(f"http://localhost:4566/v1/apis/{api['apiId']}/graphql",
+    req = urllib.request.Request(f"{_ENDPOINT}/v1/apis/{api['apiId']}/graphql",
         data=_json.dumps({"query": 'query { getItem(id: "ghost") { id } }'}).encode(),
         headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req) as r:
@@ -555,7 +556,7 @@ def test_appsync_graphql_nonexistent_api():
     """Query against a non-existent API returns 404."""
     import json as _json
     import urllib.request
-    req = urllib.request.Request("http://localhost:4566/v1/apis/fake-api-id/graphql",
+    req = urllib.request.Request(f"{_ENDPOINT}/v1/apis/fake-api-id/graphql",
         data=_json.dumps({"query": "{ getItem(id: \"1\") { id } }"}).encode(),
         headers={"Content-Type": "application/json"})
     try:
@@ -573,7 +574,7 @@ def test_appsync_graphql_empty_query():
     appsync = make_client("appsync")
     api = appsync.create_graphql_api(name="gql-empty", authenticationType="API_KEY")["graphqlApi"]
 
-    req = urllib.request.Request(f"http://localhost:4566/v1/apis/{api['apiId']}/graphql",
+    req = urllib.request.Request(f"{_ENDPOINT}/v1/apis/{api['apiId']}/graphql",
         data=_json.dumps({"query": ""}).encode(),
         headers={"Content-Type": "application/json"})
     try:

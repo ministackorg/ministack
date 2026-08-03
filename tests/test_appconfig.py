@@ -8,7 +8,7 @@ from botocore.exceptions import ClientError
 
 from ministack.services import appconfig as appconfig_service
 
-ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
 
 def _make_appconfig_client(region_name):
@@ -732,7 +732,7 @@ def test_appconfig_get_nonexistent_application(appconfig_client):
     import urllib.error
     import urllib.request
     req = urllib.request.Request(
-        "http://localhost:4566/applications/nonexistent",
+        f"{ENDPOINT}/applications/nonexistent",
         headers={"Authorization": "AWS4-HMAC-SHA256 Credential=test/20260501/us-east-1/appconfig/aws4_request"},
     )
     try:

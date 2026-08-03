@@ -1276,6 +1276,23 @@ def _disassociate_identity_provider_config(cluster_name, body):
     return _json_resp(200, {"update": update})
 
 
+def _list_identity_provider_configs(cluster_name):
+    cluster = _clusters.get(cluster_name)
+    if not cluster:
+        return _error(404, "ResourceNotFoundException", f"No cluster found for name: {cluster_name}.")
+
+    # AWS caps OIDC IdP configs at one per cluster (enforced in
+    # _associate_identity_provider_config), so this list is always <=1 entry
+    # and never needs maxResults / nextToken pagination.
+    configs = []
+    for key in _idp_configs.keys():
+        cn, _, name = key.partition("\x00")
+        if cn == cluster_name:
+            configs.append({"name": name, "type": "oidc"})
+
+    return _json_resp(200, {"identityProviderConfigs": configs})
+
+
 # ---------------------------------------------------------------------------
 # OIDC discovery / JWKS (IRSA support)
 # ---------------------------------------------------------------------------
@@ -1506,6 +1523,12 @@ async def handle_request(method, path, headers, body_bytes, query_params):
         if method == "POST":
             return _describe_identity_provider_config(cluster_name, body)
 
+    # GET /clusters/{name}/identity-provider-configs
+    m = re.fullmatch(r"/clusters/([A-Za-z0-9_-]+)/identity-provider-configs", path)
+    if m:
+        cluster_name = m.group(1)
+        if method == "GET":
+            return _list_identity_provider_configs(cluster_name)
 
     # OIDC discovery + JWKS (IRSA). Path matches AWS shape under the ministack
     # /oidc prefix because we can't own oidc.eks.{region}.amazonaws.com.
