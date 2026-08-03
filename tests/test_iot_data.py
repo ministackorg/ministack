@@ -11,6 +11,7 @@ bridge layer.
 
 from __future__ import annotations
 
+import base64
 import io as _io
 import json
 import os
@@ -720,6 +721,56 @@ def test_iot_disabled_rule_does_not_fire(iot_client, iot_data_client, lam, sqs):
         topic="sensors/a1/telemetry", payload=json.dumps({"temp": 1}).encode()
     )
     assert _poll_sink(sqs, sink, timeout=4) is None
+
+    iot_client.delete_topic_rule(ruleName=rule)
+
+
+# Every byte value: not valid UTF-8, so it survives the rule path only if the
+# payload is never text-decoded.
+_BINARY_PAYLOAD = bytes(range(256))
+
+
+def test_iot_rule_encode_base64_projection_basic_ingest(
+    iot_client, iot_data_client, lam, sqs
+):
+    sink = sqs.create_queue(QueueName=_unique("encode-sink"))["QueueUrl"]
+    fn_arn = _make_sink_lambda(lam, sink)
+    rule = _unique("encode").replace("-", "_")
+    iot_client.create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": "SELECT encode(*, 'base64') AS data FROM 'telemetry'",
+            "awsIotSqlVersion": "2016-03-23",
+            "actions": [{"lambda": {"functionArn": fn_arn}}],
+        },
+    )
+
+    iot_data_client.publish(topic=f"$aws/rules/{rule}", payload=_BINARY_PAYLOAD)
+    event = _poll_sink(sqs, sink)
+    assert list(event) == ["data"]
+    assert base64.b64decode(event["data"]) == _BINARY_PAYLOAD
+
+    iot_client.delete_topic_rule(ruleName=rule)
+
+
+def test_iot_rule_encode_base64_projection_topic_filter(
+    iot_client, iot_data_client, lam, sqs
+):
+    sink = sqs.create_queue(QueueName=_unique("encode-filter-sink"))["QueueUrl"]
+    fn_arn = _make_sink_lambda(lam, sink)
+    rule = _unique("encfilter").replace("-", "_")
+    iot_client.create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": "SELECT encode(*, 'base64') AS data FROM 'telemetry'",
+            "actions": [{"lambda": {"functionArn": fn_arn}}],
+        },
+    )
+
+    iot_data_client.publish(topic="telemetry", payload=_BINARY_PAYLOAD)
+    event = _poll_sink(sqs, sink)
+    assert list(event) == ["data"]
+    assert base64.b64decode(event["data"]) == _BINARY_PAYLOAD
 
     iot_client.delete_topic_rule(ruleName=rule)
 

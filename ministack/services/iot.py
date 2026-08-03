@@ -1444,7 +1444,29 @@ def _resolve_attribute(message, path: str):
     return value
 
 
-def _eval_select_function(name: str, args: list[str], topic: str, message):
+def _encode_base64(value, payload: bytes):
+    if value is _MISSING:
+        return _MISSING
+    if isinstance(value, (bytes, bytearray)):
+        raw = bytes(value)
+    elif isinstance(value, str):
+        raw = value.encode("utf-8")
+    else:
+        raw = json.dumps(value, separators=(",", ":")).encode("utf-8")
+    return base64.b64encode(raw).decode("ascii")
+
+
+def _eval_select_function(name: str, args: list[str], topic: str, payload: bytes, message):
+    if name == "encode":
+        if len(args) != 2:
+            return _MISSING
+        source, encoding = args[0].strip(), args[1].strip().strip("'").lower()
+        if encoding != "base64":
+            return _MISSING
+        # `encode(*, 'base64')` encodes the payload as published — the bytes
+        # never round-trip through a text decode.
+        value = payload if source == "*" else _eval_select_expr(source, topic, payload, message)
+        return _encode_base64(value, payload)
     if name == "topic":
         if not args:
             return topic
@@ -1461,7 +1483,7 @@ def _eval_select_function(name: str, args: list[str], topic: str, message):
     return _MISSING
 
 
-def _eval_select_expr(expr: str, topic: str, message):
+def _eval_select_expr(expr: str, topic: str, payload: bytes, message):
     expr = expr.strip()
     if expr == "*":
         return message
@@ -1473,6 +1495,7 @@ def _eval_select_expr(expr: str, topic: str, message):
             m.group("name").lower(),
             _split_select_items(m.group("args")),
             topic,
+            payload,
             message,
         )
     if _SELECT_ATTR_RE.match(expr):
@@ -1923,11 +1946,20 @@ def _rules_for_account(account_id: str, region: str) -> list[dict]:
 
 
 def _rule_message(payload: bytes):
-    """Decode a publish payload into the message the SELECT clause reads."""
+    """Decode a publish payload into the message the SELECT clause reads.
+
+    Returns ``_MISSING`` for a payload that is not valid UTF-8. Such a payload
+    has no attributes to project, but its bytes stay intact for
+    ``encode(*, 'base64')``; the decode is never lossy.
+    """
     try:
-        return json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return (payload or b"").decode("utf-8", "replace")
+        text = (payload or b"").decode("utf-8")
+    except UnicodeDecodeError:
+        return _MISSING
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
 
 
 def _rule_event(sql: str, topic: str, payload: bytes):
@@ -1944,7 +1976,7 @@ def _rule_event(sql: str, topic: str, payload: bytes):
     event: dict = {}
     for item in items:
         expr, alias = _split_select_alias(item)
-        value = _eval_select_expr(expr, topic, message)
+        value = _eval_select_expr(expr, topic, payload, message)
         if value is _MISSING:
             continue
         if expr == "*" and alias is None:
@@ -1980,6 +2012,13 @@ def _run_rule_actions(
     if not rule or rule.get("ruleDisabled"):
         return
     event = _rule_event(rule.get("sql", ""), topic, payload)
+    if event is _MISSING:
+        _broker_logger.warning(
+            "IoT rule %s: payload is not valid UTF-8 and its SELECT clause "
+            "projects no attributes — no action dispatched",
+            rule.get("ruleName"),
+        )
+        return
     for action in rule.get("actions", []) or []:
         lam = action.get("lambda")
         if lam and lam.get("functionArn"):

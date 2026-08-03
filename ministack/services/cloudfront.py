@@ -61,6 +61,21 @@ _FUN_NAME_RE = re.compile(r"^/2020-05-31/function/([^/]+)/?$")
 _KVS_LIST_RE = re.compile(r"^/2020-05-31/key-value-store/?$")
 _KVS_NAME_RE = re.compile(r"^/2020-05-31/key-value-store/([^/]+)/?$")
 
+_CACHE_POLICY_RE = re.compile(r"^/2020-05-31/cache-policy/?$")
+_CACHE_POLICY_CFG_RE = re.compile(r"^/2020-05-31/cache-policy/([^/]+)/config$")
+_CACHE_POLICY_ID_RE = re.compile(r"^/2020-05-31/cache-policy/([^/]+)/?$")
+_DIST_BY_CACHE_POLICY_RE = re.compile(r"^/2020-05-31/distributionsByCachePolicyId/([^/]+)/?$")
+
+_ORP_RE = re.compile(r"^/2020-05-31/origin-request-policy/?$")
+_ORP_CFG_RE = re.compile(r"^/2020-05-31/origin-request-policy/([^/]+)/config$")
+_ORP_ID_RE = re.compile(r"^/2020-05-31/origin-request-policy/([^/]+)/?$")
+_DIST_BY_ORP_RE = re.compile(r"^/2020-05-31/distributionsByOriginRequestPolicyId/([^/]+)/?$")
+
+_RHP_RE = re.compile(r"^/2020-05-31/response-headers-policy/?$")
+_RHP_CFG_RE = re.compile(r"^/2020-05-31/response-headers-policy/([^/]+)/config$")
+_RHP_ID_RE = re.compile(r"^/2020-05-31/response-headers-policy/([^/]+)/?$")
+_DIST_BY_RHP_RE = re.compile(r"^/2020-05-31/distributionsByResponseHeadersPolicyId/([^/]+)/?$")
+
 # ---------------------------------------------------------------------------
 # In-memory state
 # ---------------------------------------------------------------------------
@@ -70,6 +85,9 @@ _tags = AccountScopedDict()  # arn -> [{"Key": ..., "Value": ...}]
 _oacs = AccountScopedDict()  # Id -> OAC record
 _functions = AccountScopedDict()  # Name -> function record (CloudFront Functions API)
 _kvstores = AccountScopedDict()  # Name -> KVS record
+_cache_policies = AccountScopedDict()  # Id -> cache policy record
+_origin_request_policies = AccountScopedDict()  # Id -> origin request policy record
+_response_headers_policies = AccountScopedDict()  # Id -> response headers policy record
 
 
 def reset():
@@ -79,6 +97,9 @@ def reset():
     _oacs.clear()
     _functions.clear()
     _kvstores.clear()
+    _cache_policies.clear()
+    _origin_request_policies.clear()
+    _response_headers_policies.clear()
 
 
 def get_state():
@@ -90,6 +111,9 @@ def get_state():
             "oacs": _oacs,
             "functions": _functions,
             "kvstores": _kvstores,
+            "cache_policies": _cache_policies,
+            "origin_request_policies": _origin_request_policies,
+            "response_headers_policies": _response_headers_policies,
         }
     )
 
@@ -101,6 +125,9 @@ def restore_state(data):
     _oacs.update(data.get("oacs", {}))
     _functions.update(data.get("functions", {}))
     _kvstores.update(data.get("kvstores", {}))
+    _cache_policies.update(data.get("cache_policies", {}))
+    _origin_request_policies.update(data.get("origin_request_policies", {}))
+    _response_headers_policies.update(data.get("response_headers_policies", {}))
 
 
 try:
@@ -664,6 +691,696 @@ def _cf_delete_function(name: str, headers):
 
 
 # ---------------------------------------------------------------------------
+# Cache policies (Terraform aws_cloudfront_cache_policy)
+# Shapes verified against botocore cloudfront service-2.json (2020-05-31).
+# ---------------------------------------------------------------------------
+
+_CACHE_HEADER_BEHAVIORS = {"none", "whitelist"}
+_CACHE_COOKIE_BEHAVIORS = {"none", "whitelist", "allExcept", "all"}
+_CACHE_QUERYSTRING_BEHAVIORS = {"none", "whitelist", "allExcept", "all"}
+
+
+def _parse_name_items(block_el, names_tag):
+    """Pull <Items><Name>..</Name></Items> out of a Headers/Cookies/QueryStrings block."""
+    names = _find(block_el, names_tag) if block_el is not None else None
+    items = []
+    if names is not None:
+        items_el = _find(names, "Items")
+        if items_el is not None:
+            for child in items_el:
+                local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+                if local == "Name":
+                    items.append(child.text or "")
+    return items
+
+
+def _parse_cache_policy_config(el):
+    """Parse a <CachePolicyConfig> element into a stored dict, or return an _error tuple."""
+    name = _text(el, "Name")
+    if not name:
+        return None, _error("InvalidArgument", "The cache policy name is required.", 400)
+
+    min_ttl_el = _find(el, "MinTTL")
+    if min_ttl_el is None or not (min_ttl_el.text or "").strip():
+        return None, _error("InvalidArgument", "The MinTTL value is required.", 400)
+    try:
+        min_ttl = int(min_ttl_el.text)
+    except (TypeError, ValueError):
+        return None, _error("InvalidArgument", "The MinTTL value is not valid.", 400)
+
+    cfg = {"Name": name, "Comment": _text(el, "Comment"), "MinTTL": min_ttl}
+    for opt in ("DefaultTTL", "MaxTTL"):
+        opt_el = _find(el, opt)
+        if opt_el is not None and (opt_el.text or "").strip():
+            try:
+                cfg[opt] = int(opt_el.text)
+            except (TypeError, ValueError):
+                return None, _error("InvalidArgument", f"The {opt} value is not valid.", 400)
+
+    params_el = _find(el, "ParametersInCacheKeyAndForwardedToOrigin")
+    if params_el is not None:
+        headers_cfg = _find(params_el, "HeadersConfig")
+        cookies_cfg = _find(params_el, "CookiesConfig")
+        qs_cfg = _find(params_el, "QueryStringsConfig")
+        if headers_cfg is None or cookies_cfg is None or qs_cfg is None:
+            return None, _error(
+                "InvalidArgument",
+                "HeadersConfig, CookiesConfig, and QueryStringsConfig are required.",
+                400,
+            )
+        header_behavior = _text(headers_cfg, "HeaderBehavior")
+        cookie_behavior = _text(cookies_cfg, "CookieBehavior")
+        qs_behavior = _text(qs_cfg, "QueryStringBehavior")
+        if header_behavior not in _CACHE_HEADER_BEHAVIORS:
+            return None, _error("InvalidArgument", "Invalid HeaderBehavior value.", 400)
+        if cookie_behavior not in _CACHE_COOKIE_BEHAVIORS:
+            return None, _error("InvalidArgument", "Invalid CookieBehavior value.", 400)
+        if qs_behavior not in _CACHE_QUERYSTRING_BEHAVIORS:
+            return None, _error("InvalidArgument", "Invalid QueryStringBehavior value.", 400)
+        gzip_el = _find(params_el, "EnableAcceptEncodingGzip")
+        if gzip_el is None:
+            return None, _error("InvalidArgument", "EnableAcceptEncodingGzip is required.", 400)
+        cfg["Parameters"] = {
+            "EnableAcceptEncodingGzip": (gzip_el.text or "").strip().lower() == "true",
+            "EnableAcceptEncodingBrotli": _text(params_el, "EnableAcceptEncodingBrotli").strip().lower() == "true",
+            "HeaderBehavior": header_behavior,
+            "Headers": _parse_name_items(headers_cfg, "Headers"),
+            "CookieBehavior": cookie_behavior,
+            "Cookies": _parse_name_items(cookies_cfg, "Cookies"),
+            "QueryStringBehavior": qs_behavior,
+            "QueryStrings": _parse_name_items(qs_cfg, "QueryStrings"),
+        }
+    return cfg, None
+
+
+def _build_names_block(parent, names_tag, items):
+    block = SubElement(parent, names_tag)
+    SubElement(block, "Quantity").text = str(len(items))
+    if items:
+        items_el = SubElement(block, "Items")
+        for it in items:
+            SubElement(items_el, "Name").text = it
+
+
+def _build_cache_policy_config_xml(parent, cfg):
+    SubElement(parent, "Comment").text = cfg.get("Comment", "")
+    SubElement(parent, "Name").text = cfg["Name"]
+    # AWS fills the documented defaults when the caller omits these.
+    SubElement(parent, "DefaultTTL").text = str(cfg.get("DefaultTTL", 86400))
+    SubElement(parent, "MaxTTL").text = str(cfg.get("MaxTTL", 31536000))
+    SubElement(parent, "MinTTL").text = str(cfg["MinTTL"])
+    params = cfg.get("Parameters")
+    if params is not None:
+        p_el = SubElement(parent, "ParametersInCacheKeyAndForwardedToOrigin")
+        SubElement(p_el, "EnableAcceptEncodingGzip").text = "true" if params["EnableAcceptEncodingGzip"] else "false"
+        SubElement(p_el, "EnableAcceptEncodingBrotli").text = "true" if params["EnableAcceptEncodingBrotli"] else "false"
+        hc = SubElement(p_el, "HeadersConfig")
+        SubElement(hc, "HeaderBehavior").text = params["HeaderBehavior"]
+        _build_names_block(hc, "Headers", params["Headers"])
+        cc = SubElement(p_el, "CookiesConfig")
+        SubElement(cc, "CookieBehavior").text = params["CookieBehavior"]
+        _build_names_block(cc, "Cookies", params["Cookies"])
+        qc = SubElement(p_el, "QueryStringsConfig")
+        SubElement(qc, "QueryStringBehavior").text = params["QueryStringBehavior"]
+        _build_names_block(qc, "QueryStrings", params["QueryStrings"])
+
+
+def _build_cache_policy_xml(parent, policy):
+    SubElement(parent, "Id").text = policy["Id"]
+    SubElement(parent, "LastModifiedTime").text = policy["LastModifiedTime"]
+    cfg_el = SubElement(parent, "CachePolicyConfig")
+    _build_cache_policy_config_xml(cfg_el, policy["Config"])
+
+
+def _value_contains(obj, target):
+    """Best-effort recursive search for a policy Id anywhere in a distribution record."""
+    if isinstance(obj, str):
+        return obj == target
+    if isinstance(obj, dict):
+        return any(_value_contains(v, target) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return any(_value_contains(v, target) for v in obj)
+    return False
+
+
+def _distributions_using_cache_policy(policy_id):
+    return [d.get("Id", "") for d in _distributions.values() if _value_contains(d, policy_id)]
+
+
+def _create_cache_policy(body):
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+    cfg, err = _parse_cache_policy_config(el)
+    if err is not None:
+        return err
+    for existing in _cache_policies.values():
+        if existing["Config"]["Name"] == cfg["Name"]:
+            return _error("CachePolicyAlreadyExists", "A cache policy with the same name already exists.", 409)
+    policy_id = new_uuid()
+    etag = new_uuid()
+    policy = {"Id": policy_id, "ETag": etag, "LastModifiedTime": _now_iso(), "Config": cfg}
+    _cache_policies[policy_id] = policy
+    logger.info("CreateCachePolicy id=%s name=%s", policy_id, cfg["Name"])
+
+    def build(root):
+        _build_cache_policy_xml(root, policy)
+
+    return _xml_response(
+        "CachePolicy", build, status=201,
+        extra_headers={"ETag": etag, "Location": f"/2020-05-31/cache-policy/{policy_id}"},
+    )
+
+
+def _get_cache_policy(policy_id):
+    policy = _cache_policies.get(policy_id)
+    if not policy:
+        return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
+
+    def build(root):
+        _build_cache_policy_xml(root, policy)
+
+    return _xml_response("CachePolicy", build, extra_headers={"ETag": policy["ETag"]})
+
+
+def _get_cache_policy_config(policy_id):
+    policy = _cache_policies.get(policy_id)
+    if not policy:
+        return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
+
+    def build(root):
+        _build_cache_policy_config_xml(root, policy["Config"])
+
+    return _xml_response("CachePolicyConfig", build, extra_headers={"ETag": policy["ETag"]})
+
+
+def _update_cache_policy(policy_id, headers, body):
+    policy = _cache_policies.get(policy_id)
+    if not policy:
+        return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
+    if_match = headers.get("if-match")
+    if not if_match:
+        return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
+    if if_match != policy["ETag"]:
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+    cfg, err = _parse_cache_policy_config(el)
+    if err is not None:
+        return err
+    for existing in _cache_policies.values():
+        if existing["Id"] != policy_id and existing["Config"]["Name"] == cfg["Name"]:
+            return _error("CachePolicyAlreadyExists", "A cache policy with the same name already exists.", 409)
+    new_etag = new_uuid()
+    policy["Config"] = cfg
+    policy["ETag"] = new_etag
+    policy["LastModifiedTime"] = _now_iso()
+    logger.info("UpdateCachePolicy id=%s name=%s", policy_id, cfg["Name"])
+
+    def build(root):
+        _build_cache_policy_xml(root, policy)
+
+    return _xml_response("CachePolicy", build, extra_headers={"ETag": new_etag})
+
+
+def _delete_cache_policy(policy_id, headers):
+    policy = _cache_policies.get(policy_id)
+    if not policy:
+        return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
+    if_match = headers.get("if-match")
+    if not if_match:
+        return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
+    if if_match != policy["ETag"]:
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
+    if _distributions_using_cache_policy(policy_id):
+        return _error(
+            "CachePolicyInUse",
+            "The cache policy cannot be deleted because it is attached to one or more cache behaviors.",
+            409,
+        )
+    del _cache_policies[policy_id]
+    logger.info("DeleteCachePolicy id=%s", policy_id)
+    return 204, {}, b""
+
+
+def _list_distributions_by_cache_policy(policy_id):
+    if not _cache_policies.get(policy_id):
+        return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
+    dist_ids = _distributions_using_cache_policy(policy_id)
+
+    def build(root):
+        SubElement(root, "Marker").text = ""
+        SubElement(root, "MaxItems").text = "100"
+        SubElement(root, "IsTruncated").text = "false"
+        SubElement(root, "Quantity").text = str(len(dist_ids))
+        if dist_ids:
+            items_el = SubElement(root, "Items")
+            for did in dist_ids:
+                SubElement(items_el, "DistributionId").text = did
+
+    return _xml_response("DistributionIdList", build)
+
+
+# ---------------------------------------------------------------------------
+# Origin request policies (aws_cloudfront_origin_request_policy) and response
+# headers policies (aws_cloudfront_response_headers_policy) — #1249.
+# Shapes verified against botocore cloudfront service-2.json (2020-05-31).
+# ---------------------------------------------------------------------------
+
+
+def _xbool(el, tag, default=None):
+    """Parse a boolean child element; return ``default`` when it is absent."""
+    child = _find(el, tag)
+    if child is None:
+        return default
+    return (child.text or "").strip().lower() == "true"
+
+
+def _opt_text(el, tag):
+    """Return a child element's text, or None when the element is absent."""
+    child = _find(el, tag)
+    return (child.text or "") if child is not None else None
+
+
+def _bstr(value):
+    return "true" if value else "false"
+
+
+def _fmt_rate(x):
+    return "%g" % x
+
+
+def _parse_str_list_block(cfg_el, block_tag, item_tag):
+    """Parse ``<block_tag><Items><item_tag>..</item_tag></Items></block_tag>`` to a list."""
+    block = _find(cfg_el, block_tag)
+    items = []
+    if block is not None:
+        items_el = _find(block, "Items")
+        if items_el is not None:
+            for child in items_el:
+                local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+                if local == item_tag:
+                    items.append(child.text or "")
+    return items
+
+
+def _build_str_list_block(parent, block_tag, item_tag, items):
+    block = SubElement(parent, block_tag)
+    SubElement(block, "Quantity").text = str(len(items))
+    if items:
+        items_el = SubElement(block, "Items")
+        for it in items:
+            SubElement(items_el, item_tag).text = it
+
+
+def _distributions_using_policy(policy_id):
+    return [d.get("Id", "") for d in _distributions.values() if _value_contains(d, policy_id)]
+
+
+# ---- generic policy CRUD, shared by ORP and RHP ----
+
+
+def _policy_precheck_if_match(headers, policy):
+    if_match = headers.get("if-match")
+    if not if_match:
+        return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
+    if if_match != policy["ETag"]:
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
+    return None
+
+
+def _policy_create(store, spec, body):
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+    cfg, err = spec["parse"](el)
+    if err is not None:
+        return err
+    for existing in store.values():
+        if existing["Config"]["Name"] == cfg["Name"]:
+            return _error(spec["dup"], f"A {spec['label']} with the same name already exists.", 409)
+    pid = new_uuid()
+    etag = new_uuid()
+    policy = {"Id": pid, "ETag": etag, "LastModifiedTime": _now_iso(), "Config": cfg}
+    store[pid] = policy
+    logger.info("Create %s id=%s name=%s", spec["label"], pid, cfg["Name"])
+    return _xml_response(
+        spec["resource_tag"], lambda r: spec["build_resource"](r, policy),
+        status=201, extra_headers={"ETag": etag, "Location": f"{spec['path']}/{pid}"},
+    )
+
+
+def _policy_get(store, spec, pid):
+    policy = store.get(pid)
+    if not policy:
+        return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
+    return _xml_response(spec["resource_tag"], lambda r: spec["build_resource"](r, policy),
+                         extra_headers={"ETag": policy["ETag"]})
+
+
+def _policy_get_config(store, spec, pid):
+    policy = store.get(pid)
+    if not policy:
+        return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
+    return _xml_response(spec["config_tag"], lambda r: spec["build_config"](r, policy["Config"]),
+                         extra_headers={"ETag": policy["ETag"]})
+
+
+def _policy_update(store, spec, pid, headers, body):
+    policy = store.get(pid)
+    if not policy:
+        return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
+    pc = _policy_precheck_if_match(headers, policy)
+    if pc is not None:
+        return pc
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+    cfg, err = spec["parse"](el)
+    if err is not None:
+        return err
+    for existing in store.values():
+        if existing["Id"] != pid and existing["Config"]["Name"] == cfg["Name"]:
+            return _error(spec["dup"], f"A {spec['label']} with the same name already exists.", 409)
+    new_etag = new_uuid()
+    policy["Config"] = cfg
+    policy["ETag"] = new_etag
+    policy["LastModifiedTime"] = _now_iso()
+    return _xml_response(spec["resource_tag"], lambda r: spec["build_resource"](r, policy),
+                         extra_headers={"ETag": new_etag})
+
+
+def _policy_delete(store, spec, pid, headers):
+    policy = store.get(pid)
+    if not policy:
+        return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
+    pc = _policy_precheck_if_match(headers, policy)
+    if pc is not None:
+        return pc
+    if _distributions_using_policy(pid):
+        return _error(spec["in_use"],
+                      f"The {spec['label']} cannot be deleted because it is attached to one or more cache behaviors.",
+                      409)
+    del store[pid]
+    logger.info("Delete %s id=%s", spec["label"], pid)
+    return 204, {}, b""
+
+
+def _policy_list_distributions(store, spec, pid):
+    if not store.get(pid):
+        return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
+    dist_ids = _distributions_using_policy(pid)
+
+    def build(root):
+        SubElement(root, "Marker").text = ""
+        SubElement(root, "MaxItems").text = "100"
+        SubElement(root, "IsTruncated").text = "false"
+        SubElement(root, "Quantity").text = str(len(dist_ids))
+        if dist_ids:
+            items_el = SubElement(root, "Items")
+            for did in dist_ids:
+                SubElement(items_el, "DistributionId").text = did
+
+    return _xml_response("DistributionIdList", build)
+
+
+# ---- OriginRequestPolicy ----
+
+_ORP_HEADER_BEHAVIORS = {"none", "whitelist", "allViewer", "allViewerAndWhitelistCloudFront", "allExcept"}
+_ORP_COOKIE_BEHAVIORS = {"none", "whitelist", "all", "allExcept"}
+_ORP_QUERYSTRING_BEHAVIORS = {"none", "whitelist", "all", "allExcept"}
+
+
+def _parse_orp_config(el):
+    name = _text(el, "Name")
+    if not name:
+        return None, _error("InvalidArgument", "The origin request policy name is required.", 400)
+    headers_cfg = _find(el, "HeadersConfig")
+    cookies_cfg = _find(el, "CookiesConfig")
+    qs_cfg = _find(el, "QueryStringsConfig")
+    if headers_cfg is None or cookies_cfg is None or qs_cfg is None:
+        return None, _error("InvalidArgument",
+                            "HeadersConfig, CookiesConfig, and QueryStringsConfig are required.", 400)
+    hb = _text(headers_cfg, "HeaderBehavior")
+    cb = _text(cookies_cfg, "CookieBehavior")
+    qb = _text(qs_cfg, "QueryStringBehavior")
+    if hb not in _ORP_HEADER_BEHAVIORS:
+        return None, _error("InvalidArgument", "Invalid HeaderBehavior value.", 400)
+    if cb not in _ORP_COOKIE_BEHAVIORS:
+        return None, _error("InvalidArgument", "Invalid CookieBehavior value.", 400)
+    if qb not in _ORP_QUERYSTRING_BEHAVIORS:
+        return None, _error("InvalidArgument", "Invalid QueryStringBehavior value.", 400)
+    return {
+        "Name": name, "Comment": _text(el, "Comment"),
+        "HeaderBehavior": hb, "Headers": _parse_name_items(headers_cfg, "Headers"),
+        "CookieBehavior": cb, "Cookies": _parse_name_items(cookies_cfg, "Cookies"),
+        "QueryStringBehavior": qb, "QueryStrings": _parse_name_items(qs_cfg, "QueryStrings"),
+    }, None
+
+
+def _build_orp_config_xml(parent, cfg):
+    SubElement(parent, "Comment").text = cfg.get("Comment", "")
+    SubElement(parent, "Name").text = cfg["Name"]
+    hc = SubElement(parent, "HeadersConfig")
+    SubElement(hc, "HeaderBehavior").text = cfg["HeaderBehavior"]
+    _build_names_block(hc, "Headers", cfg["Headers"])
+    cc = SubElement(parent, "CookiesConfig")
+    SubElement(cc, "CookieBehavior").text = cfg["CookieBehavior"]
+    _build_names_block(cc, "Cookies", cfg["Cookies"])
+    qc = SubElement(parent, "QueryStringsConfig")
+    SubElement(qc, "QueryStringBehavior").text = cfg["QueryStringBehavior"]
+    _build_names_block(qc, "QueryStrings", cfg["QueryStrings"])
+
+
+def _build_orp_xml(parent, policy):
+    SubElement(parent, "Id").text = policy["Id"]
+    SubElement(parent, "LastModifiedTime").text = policy["LastModifiedTime"]
+    cfg_el = SubElement(parent, "OriginRequestPolicyConfig")
+    _build_orp_config_xml(cfg_el, policy["Config"])
+
+
+_ORP_SPEC = {
+    "label": "origin request policy", "resource_tag": "OriginRequestPolicy",
+    "config_tag": "OriginRequestPolicyConfig", "path": "/2020-05-31/origin-request-policy",
+    "missing": "NoSuchOriginRequestPolicy", "dup": "OriginRequestPolicyAlreadyExists",
+    "in_use": "OriginRequestPolicyInUse", "parse": _parse_orp_config,
+    "build_resource": _build_orp_xml, "build_config": _build_orp_config_xml,
+}
+
+
+# ---- ResponseHeadersPolicy ----
+
+_RHP_FRAME_OPTIONS = {"DENY", "SAMEORIGIN"}
+_RHP_REFERRER = {
+    "no-referrer", "no-referrer-when-downgrade", "origin", "origin-when-cross-origin",
+    "same-origin", "strict-origin", "strict-origin-when-cross-origin", "unsafe-url",
+}
+
+
+def _parse_rhp_config(el):
+    name = _text(el, "Name")
+    if not name:
+        return None, _error("InvalidArgument", "The response headers policy name is required.", 400)
+    cfg = {"Name": name, "Comment": _text(el, "Comment"), "Cors": None, "Security": None,
+           "ServerTiming": None, "CustomHeaders": [], "RemoveHeaders": []}
+
+    cors_el = _find(el, "CorsConfig")
+    if cors_el is not None:
+        cors = {
+            "AllowOrigins": _parse_str_list_block(cors_el, "AccessControlAllowOrigins", "Origin"),
+            "AllowHeaders": _parse_str_list_block(cors_el, "AccessControlAllowHeaders", "Header"),
+            "AllowMethods": _parse_str_list_block(cors_el, "AccessControlAllowMethods", "Method"),
+            "AllowCredentials": _xbool(cors_el, "AccessControlAllowCredentials", False),
+            "OriginOverride": _xbool(cors_el, "OriginOverride", False),
+            "ExposeHeaders": None, "MaxAgeSec": None,
+        }
+        if _find(cors_el, "AccessControlExposeHeaders") is not None:
+            cors["ExposeHeaders"] = _parse_str_list_block(cors_el, "AccessControlExposeHeaders", "Header")
+        maxage = _find(cors_el, "AccessControlMaxAgeSec")
+        if maxage is not None and (maxage.text or "").strip():
+            cors["MaxAgeSec"] = int(maxage.text)
+        cfg["Cors"] = cors
+
+    sec_el = _find(el, "SecurityHeadersConfig")
+    if sec_el is not None:
+        sec = {}
+        xss = _find(sec_el, "XSSProtection")
+        if xss is not None:
+            sec["XSSProtection"] = {
+                "Override": _xbool(xss, "Override", False),
+                "Protection": _xbool(xss, "Protection", False),
+                "ModeBlock": _xbool(xss, "ModeBlock"),
+                "ReportUri": _opt_text(xss, "ReportUri"),
+            }
+        fo = _find(sec_el, "FrameOptions")
+        if fo is not None:
+            fov = _text(fo, "FrameOption")
+            if fov not in _RHP_FRAME_OPTIONS:
+                return None, _error("InvalidArgument", "Invalid FrameOption value.", 400)
+            sec["FrameOptions"] = {"Override": _xbool(fo, "Override", False), "FrameOption": fov}
+        rp = _find(sec_el, "ReferrerPolicy")
+        if rp is not None:
+            rpv = _text(rp, "ReferrerPolicy")
+            if rpv not in _RHP_REFERRER:
+                return None, _error("InvalidArgument", "Invalid ReferrerPolicy value.", 400)
+            sec["ReferrerPolicy"] = {"Override": _xbool(rp, "Override", False), "ReferrerPolicy": rpv}
+        csp = _find(sec_el, "ContentSecurityPolicy")
+        if csp is not None:
+            sec["ContentSecurityPolicy"] = {"Override": _xbool(csp, "Override", False),
+                                            "ContentSecurityPolicy": _text(csp, "ContentSecurityPolicy")}
+        cto = _find(sec_el, "ContentTypeOptions")
+        if cto is not None:
+            sec["ContentTypeOptions"] = {"Override": _xbool(cto, "Override", False)}
+        hsts = _find(sec_el, "StrictTransportSecurity")
+        if hsts is not None:
+            sec["StrictTransportSecurity"] = {
+                "Override": _xbool(hsts, "Override", False),
+                "IncludeSubdomains": _xbool(hsts, "IncludeSubdomains"),
+                "Preload": _xbool(hsts, "Preload"),
+                "AccessControlMaxAgeSec": int(_text(hsts, "AccessControlMaxAgeSec") or "0"),
+            }
+        cfg["Security"] = sec
+
+    st_el = _find(el, "ServerTimingHeadersConfig")
+    if st_el is not None:
+        st = {"Enabled": _xbool(st_el, "Enabled", False), "SamplingRate": None}
+        sr = _find(st_el, "SamplingRate")
+        if sr is not None and (sr.text or "").strip():
+            st["SamplingRate"] = float(sr.text)
+        cfg["ServerTiming"] = st
+
+    ch_el = _find(el, "CustomHeadersConfig")
+    if ch_el is not None:
+        items_el = _find(ch_el, "Items")
+        if items_el is not None:
+            for it in items_el:
+                local = it.tag.split("}")[-1] if "}" in it.tag else it.tag
+                if local == "ResponseHeadersPolicyCustomHeader":
+                    cfg["CustomHeaders"].append({
+                        "Header": _text(it, "Header"), "Value": _text(it, "Value"),
+                        "Override": _xbool(it, "Override", False),
+                    })
+
+    rh_el = _find(el, "RemoveHeadersConfig")
+    if rh_el is not None:
+        items_el = _find(rh_el, "Items")
+        if items_el is not None:
+            for it in items_el:
+                local = it.tag.split("}")[-1] if "}" in it.tag else it.tag
+                if local == "ResponseHeadersPolicyRemoveHeader":
+                    cfg["RemoveHeaders"].append({"Header": _text(it, "Header")})
+
+    return cfg, None
+
+
+def _build_rhp_config_xml(parent, cfg):
+    SubElement(parent, "Comment").text = cfg.get("Comment", "")
+    SubElement(parent, "Name").text = cfg["Name"]
+
+    cors = cfg.get("Cors")
+    if cors is not None:
+        c = SubElement(parent, "CorsConfig")
+        _build_str_list_block(c, "AccessControlAllowOrigins", "Origin", cors["AllowOrigins"])
+        _build_str_list_block(c, "AccessControlAllowHeaders", "Header", cors["AllowHeaders"])
+        _build_str_list_block(c, "AccessControlAllowMethods", "Method", cors["AllowMethods"])
+        SubElement(c, "AccessControlAllowCredentials").text = _bstr(cors["AllowCredentials"])
+        if cors.get("ExposeHeaders") is not None:
+            _build_str_list_block(c, "AccessControlExposeHeaders", "Header", cors["ExposeHeaders"])
+        if cors.get("MaxAgeSec") is not None:
+            SubElement(c, "AccessControlMaxAgeSec").text = str(cors["MaxAgeSec"])
+        SubElement(c, "OriginOverride").text = _bstr(cors["OriginOverride"])
+
+    sec = cfg.get("Security")
+    if sec is not None:
+        s = SubElement(parent, "SecurityHeadersConfig")
+        if "XSSProtection" in sec:
+            x = SubElement(s, "XSSProtection")
+            SubElement(x, "Override").text = _bstr(sec["XSSProtection"]["Override"])
+            SubElement(x, "Protection").text = _bstr(sec["XSSProtection"]["Protection"])
+            if sec["XSSProtection"].get("ModeBlock") is not None:
+                SubElement(x, "ModeBlock").text = _bstr(sec["XSSProtection"]["ModeBlock"])
+            if sec["XSSProtection"].get("ReportUri") is not None:
+                SubElement(x, "ReportUri").text = sec["XSSProtection"]["ReportUri"]
+        if "FrameOptions" in sec:
+            f = SubElement(s, "FrameOptions")
+            SubElement(f, "Override").text = _bstr(sec["FrameOptions"]["Override"])
+            SubElement(f, "FrameOption").text = sec["FrameOptions"]["FrameOption"]
+        if "ReferrerPolicy" in sec:
+            r = SubElement(s, "ReferrerPolicy")
+            SubElement(r, "Override").text = _bstr(sec["ReferrerPolicy"]["Override"])
+            SubElement(r, "ReferrerPolicy").text = sec["ReferrerPolicy"]["ReferrerPolicy"]
+        if "ContentSecurityPolicy" in sec:
+            cs = SubElement(s, "ContentSecurityPolicy")
+            SubElement(cs, "Override").text = _bstr(sec["ContentSecurityPolicy"]["Override"])
+            SubElement(cs, "ContentSecurityPolicy").text = sec["ContentSecurityPolicy"]["ContentSecurityPolicy"]
+        if "ContentTypeOptions" in sec:
+            ct = SubElement(s, "ContentTypeOptions")
+            SubElement(ct, "Override").text = _bstr(sec["ContentTypeOptions"]["Override"])
+        if "StrictTransportSecurity" in sec:
+            h = SubElement(s, "StrictTransportSecurity")
+            SubElement(h, "Override").text = _bstr(sec["StrictTransportSecurity"]["Override"])
+            if sec["StrictTransportSecurity"].get("IncludeSubdomains") is not None:
+                SubElement(h, "IncludeSubdomains").text = _bstr(sec["StrictTransportSecurity"]["IncludeSubdomains"])
+            if sec["StrictTransportSecurity"].get("Preload") is not None:
+                SubElement(h, "Preload").text = _bstr(sec["StrictTransportSecurity"]["Preload"])
+            SubElement(h, "AccessControlMaxAgeSec").text = str(sec["StrictTransportSecurity"]["AccessControlMaxAgeSec"])
+
+    st = cfg.get("ServerTiming")
+    if st is not None:
+        stel = SubElement(parent, "ServerTimingHeadersConfig")
+        SubElement(stel, "Enabled").text = _bstr(st["Enabled"])
+        if st.get("SamplingRate") is not None:
+            SubElement(stel, "SamplingRate").text = _fmt_rate(st["SamplingRate"])
+
+    ch = SubElement(parent, "CustomHeadersConfig")
+    SubElement(ch, "Quantity").text = str(len(cfg["CustomHeaders"]))
+    if cfg["CustomHeaders"]:
+        items = SubElement(ch, "Items")
+        for hdr in cfg["CustomHeaders"]:
+            it = SubElement(items, "ResponseHeadersPolicyCustomHeader")
+            SubElement(it, "Header").text = hdr["Header"]
+            SubElement(it, "Value").text = hdr["Value"]
+            SubElement(it, "Override").text = _bstr(hdr["Override"])
+
+    rh = SubElement(parent, "RemoveHeadersConfig")
+    SubElement(rh, "Quantity").text = str(len(cfg["RemoveHeaders"]))
+    if cfg["RemoveHeaders"]:
+        items = SubElement(rh, "Items")
+        for hdr in cfg["RemoveHeaders"]:
+            it = SubElement(items, "ResponseHeadersPolicyRemoveHeader")
+            SubElement(it, "Header").text = hdr["Header"]
+
+
+def _build_rhp_xml(parent, policy):
+    SubElement(parent, "Id").text = policy["Id"]
+    SubElement(parent, "LastModifiedTime").text = policy["LastModifiedTime"]
+    cfg_el = SubElement(parent, "ResponseHeadersPolicyConfig")
+    _build_rhp_config_xml(cfg_el, policy["Config"])
+
+
+_RHP_SPEC = {
+    "label": "response headers policy", "resource_tag": "ResponseHeadersPolicy",
+    "config_tag": "ResponseHeadersPolicyConfig", "path": "/2020-05-31/response-headers-policy",
+    "missing": "NoSuchResponseHeadersPolicy", "dup": "ResponseHeadersPolicyAlreadyExists",
+    "in_use": "ResponseHeadersPolicyInUse", "parse": _parse_rhp_config,
+    "build_resource": _build_rhp_xml, "build_config": _build_rhp_config_xml,
+}
+
+
+# ---------------------------------------------------------------------------
 # Request dispatcher
 # ---------------------------------------------------------------------------
 
@@ -751,6 +1468,84 @@ async def handle_request(method, path, headers, body, query_params):
             return _get_oac(oac_id)
         if method == "DELETE":
             return _delete_oac(oac_id, headers)
+
+    # Cache policy routes
+    m = _CACHE_POLICY_CFG_RE.match(path)
+    if m:
+        if method == "GET":
+            return _get_cache_policy_config(m.group(1))
+
+    m = _CACHE_POLICY_RE.match(path)
+    if m:
+        if method == "POST":
+            return _create_cache_policy(body)
+
+    m = _CACHE_POLICY_ID_RE.match(path)
+    if m:
+        policy_id = m.group(1)
+        if method == "GET":
+            return _get_cache_policy(policy_id)
+        if method == "PUT":
+            return _update_cache_policy(policy_id, headers, body)
+        if method == "DELETE":
+            return _delete_cache_policy(policy_id, headers)
+
+    m = _DIST_BY_CACHE_POLICY_RE.match(path)
+    if m:
+        if method == "GET":
+            return _list_distributions_by_cache_policy(m.group(1))
+
+    # Origin request policy routes
+    m = _ORP_CFG_RE.match(path)
+    if m:
+        if method == "GET":
+            return _policy_get_config(_origin_request_policies, _ORP_SPEC, m.group(1))
+
+    m = _ORP_RE.match(path)
+    if m:
+        if method == "POST":
+            return _policy_create(_origin_request_policies, _ORP_SPEC, body)
+
+    m = _ORP_ID_RE.match(path)
+    if m:
+        pid = m.group(1)
+        if method == "GET":
+            return _policy_get(_origin_request_policies, _ORP_SPEC, pid)
+        if method == "PUT":
+            return _policy_update(_origin_request_policies, _ORP_SPEC, pid, headers, body)
+        if method == "DELETE":
+            return _policy_delete(_origin_request_policies, _ORP_SPEC, pid, headers)
+
+    m = _DIST_BY_ORP_RE.match(path)
+    if m:
+        if method == "GET":
+            return _policy_list_distributions(_origin_request_policies, _ORP_SPEC, m.group(1))
+
+    # Response headers policy routes
+    m = _RHP_CFG_RE.match(path)
+    if m:
+        if method == "GET":
+            return _policy_get_config(_response_headers_policies, _RHP_SPEC, m.group(1))
+
+    m = _RHP_RE.match(path)
+    if m:
+        if method == "POST":
+            return _policy_create(_response_headers_policies, _RHP_SPEC, body)
+
+    m = _RHP_ID_RE.match(path)
+    if m:
+        pid = m.group(1)
+        if method == "GET":
+            return _policy_get(_response_headers_policies, _RHP_SPEC, pid)
+        if method == "PUT":
+            return _policy_update(_response_headers_policies, _RHP_SPEC, pid, headers, body)
+        if method == "DELETE":
+            return _policy_delete(_response_headers_policies, _RHP_SPEC, pid, headers)
+
+    m = _DIST_BY_RHP_RE.match(path)
+    if m:
+        if method == "GET":
+            return _policy_list_distributions(_response_headers_policies, _RHP_SPEC, m.group(1))
 
     # CloudFront Functions API (used by Terraform aws_cloudfront_function)
     m = _FUN_DESCRIBE_RE.match(path)

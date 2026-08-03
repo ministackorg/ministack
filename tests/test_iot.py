@@ -5,6 +5,7 @@ Local CA), Policies, and DescribeEndpoint. The data plane (broker / WS /
 iot-data Publish) is covered separately in ``test_iot_data.py``.
 """
 
+import base64
 import json
 import time
 import uuid
@@ -2370,11 +2371,28 @@ def test_puback_for_first_of_multiple_in_flight():
 # Rule SQL SELECT projection (white-box tests for _rule_event).
 # ----------------------------------------------------------------------
 
+# Every byte value: not valid UTF-8, so it survives the rule path only if the
+# payload is never text-decoded.
+_BINARY_PAYLOAD = bytes(range(256))
+
+
 def test_rule_event_select_star_returns_parsed_json():
     from ministack.services.iot import _rule_event
 
     event = _rule_event("SELECT * FROM 'telemetry'", "telemetry", b'{"temp": 22}')
     assert event == {"temp": 22}
+
+
+def test_rule_event_encode_base64_round_trips_binary_payload():
+    from ministack.services.iot import _rule_event
+
+    event = _rule_event(
+        "SELECT encode(*, 'base64') AS data FROM 'telemetry'",
+        "telemetry",
+        _BINARY_PAYLOAD,
+    )
+    assert list(event) == ["data"]
+    assert base64.b64decode(event["data"]) == _BINARY_PAYLOAD
 
 
 def test_rule_event_projects_attributes_with_aliases():
@@ -2396,6 +2414,12 @@ def test_rule_event_omits_missing_attributes():
         "SELECT deviceId, absent FROM 'telemetry'", "telemetry", b'{"deviceId": "d1"}'
     )
     assert event == {"deviceId": "d1"}
+
+
+def test_rule_event_select_star_skips_non_utf8_payload():
+    from ministack.services.iot import _MISSING, _rule_event
+
+    assert _rule_event("SELECT * FROM 'telemetry'", "telemetry", _BINARY_PAYLOAD) is _MISSING
 
 
 def test_rule_event_aliased_star_nests_the_message():
