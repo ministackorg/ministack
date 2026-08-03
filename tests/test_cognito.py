@@ -19,6 +19,19 @@ from botocore.exceptions import ClientError
 
 from ministack.core import persistence
 
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+
+
+def _advertised_endpoint():
+    # Predict the server-side advertised port. Under the matched-port protocol,
+    # MINISTACK_ENDPOINT alone implies a direct connection (endpoint port == server port);
+    # split-port topologies must export GATEWAY_PORT/EDGE_PORT into the test env.
+    host = os.environ.get("MINISTACK_HOST", "localhost")
+    port = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or (
+        urlparse(ENDPOINT).port or 4566
+    )
+    return f"http://{host}:{port}"
+
 # ========== from test_cognito.py ==========
 
 
@@ -1375,7 +1388,7 @@ def test_cognito_jwks_endpoint():
     pool = cognito.create_user_pool(PoolName="jwks-pool")["UserPool"]
     pool_id = pool["Id"]
     req = urllib.request.Request(
-        f"http://localhost:4566/{pool_id}/.well-known/jwks.json",
+        f"{ENDPOINT}/{pool_id}/.well-known/jwks.json",
     )
     with urllib.request.urlopen(req) as r:
         data = _json.loads(r.read())
@@ -1524,7 +1537,7 @@ def test_cognito_openid_configuration():
     pool = cognito.create_user_pool(PoolName="oidc-pool")["UserPool"]
     pool_id = pool["Id"]
     req = urllib.request.Request(
-        f"http://localhost:4566/{pool_id}/.well-known/openid-configuration",
+        f"{ENDPOINT}/{pool_id}/.well-known/openid-configuration",
     )
     with urllib.request.urlopen(req) as r:
         data = _json.loads(r.read())
@@ -1555,7 +1568,7 @@ def test_cognito_browser_endpoints_send_cors_headers():
         f"/{pool_id}/.well-known/openid-configuration",
         f"/{pool_id}/.well-known/jwks.json",
     ):
-        with urllib.request.urlopen(f"http://localhost:4566{path}") as r:
+        with urllib.request.urlopen(f"{ENDPOINT}{path}") as r:
             assert r.headers.get("Access-Control-Allow-Origin") == "*", (
                 f"missing CORS header on {path}"
             )
@@ -1564,7 +1577,7 @@ def test_cognito_browser_endpoints_send_cors_headers():
     # about the body (an empty form yields a 4xx) — only that the CORS header
     # is present on the response.
     req = urllib.request.Request(
-        "http://localhost:4566/oauth2/token",
+        f"{ENDPOINT}/oauth2/token",
         data=b"grant_type=authorization_code",
         method="POST",
         headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -1712,9 +1725,6 @@ def test_cognito_describe_nonexistent_identity_provider(cognito_idp):
 # ===========================================================================
 # Federated SAML / OAuth2 flow
 # ===========================================================================
-
-ENDPOINT = "http://localhost:4566"
-
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Capture 302 redirects without following them."""
@@ -2113,7 +2123,7 @@ def test_cognito_oauth2_authorize_oidc_redirect(cognito_idp):
         assert qs["client_id"] == ["oidc-client-id"]
         # The redirect_uri MS hands to the IdP must point at MS's OIDC
         # callback, not the SAML one (regression guard for the original bug).
-        assert qs["redirect_uri"] == [f"{ENDPOINT}/oauth2/idpresponse"]
+        assert qs["redirect_uri"] == [f"{_advertised_endpoint()}/oauth2/idpresponse"]
         assert qs["state"]  # relay key present
     finally:
         stop()
@@ -2162,7 +2172,7 @@ def test_cognito_oidc_full_flow(cognito_idp):
         form = recorded["form"]
         assert form["grant_type"] == "authorization_code"
         assert form["code"] == "idp-issued-code"
-        assert form["redirect_uri"] == f"{ENDPOINT}/oauth2/idpresponse"
+        assert form["redirect_uri"] == f"{_advertised_endpoint()}/oauth2/idpresponse"
         assert form["client_id"] == "oidc-client-id"
         assert form["client_secret"] == "oidc-client-secret"
 
@@ -2432,7 +2442,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from conftest import ENDPOINT, make_client
+from conftest import ENDPOINT as _CONFTEST_ENDPOINT
+from conftest import make_client
+
+ENDPOINT = _CONFTEST_ENDPOINT.rstrip("/")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -3988,7 +4001,7 @@ def test_auth_codes_dict_types_are_plain_builtin_dict():
 
 def _fetch_ses_messages():
     """Pull SES outbox via the public inspection endpoint (account 000000000000)."""
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     url = f"{endpoint}/_ministack/ses/messages"
     with urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=5) as r:
         data = json.loads(r.read().decode())
@@ -4186,7 +4199,7 @@ def test_cognito_iss_claim_uses_pool_region():
     """
     import boto3
 
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     region = "eu-central-1"
     client = boto3.client(
         "cognito-idp",
@@ -4725,7 +4738,7 @@ def test_cognito_user_pool_domain_cloudfront_uses_pool_region():
     """
     import boto3
 
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     region = "eu-central-1"
     client = boto3.client(
         "cognito-idp",

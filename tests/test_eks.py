@@ -14,7 +14,7 @@ import boto3
 import pytest
 from botocore.exceptions import ClientError
 
-ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 REGION = "us-east-1"
 
 

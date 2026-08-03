@@ -19,7 +19,7 @@ def _cfn_iceberg_json(path):
     """Hit the S3 Tables Iceberg REST catalog directly (LoadTable etc.) — the
     boto3 s3tables client only exposes the control-plane view, not the actual
     Iceberg schema/metadata a query engine like DuckDB reads."""
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     req = urllib.request.Request(
         f"{endpoint}{path}",
         headers={
@@ -2396,7 +2396,7 @@ def test_cfn_ec2_resources_use_caller_region_context():
     import boto3
     from botocore.config import Config
 
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
     def _client(svc, region):
         return boto3.client(
@@ -3889,7 +3889,7 @@ def test_cfn_aws_region_pseudo_param_uses_caller_region():
     import boto3
     from botocore.config import Config
 
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
     # Caller explicitly uses us-east-2 via SigV4 Credential scope.
     def _client(svc: str):
@@ -4729,7 +4729,7 @@ def test_cfn_apigwv2_full_http_api_stack_invokes_lambda(cfn, apigw, lam):
     """
     import urllib.request as _urlreq
 
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     execute_port = urlparse(endpoint).port or 4566
 
     fname = f"cfn-e2e-fn-{_uuid_mod.uuid4().hex[:8]}"
@@ -6006,7 +6006,7 @@ def test_cfn_nested_stack_basic(cfn, s3):
             "Nested": {
                 "Type": "AWS::CloudFormation::Stack",
                 "Properties": {
-                    "TemplateURL": f"http://localhost:4566/{templates_bucket}/child.json",
+                    "TemplateURL": f"{os.environ.get('MINISTACK_ENDPOINT', 'http://localhost:4566')}/{templates_bucket}/child.json",
                     "Parameters": {"BucketSuffix": suffix},
                 },
             },
@@ -6930,7 +6930,7 @@ def test_cfn_cdk_opensearch_access_policy_custom_resource(cfn, opensearch):
     stack_name = f"cfn-os-access-{suffix}"
     domain_name = f"access-{suffix}"
     function_name = f"cfn-os-provider-{suffix}"
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     access_policy = json.dumps({
         "Version": "2012-10-17",
         "Statement": [{

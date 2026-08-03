@@ -10,6 +10,8 @@ import pytest
 from botocore.exceptions import ClientError
 from conftest import ENDPOINT_HOST, make_client, patch_endpoint_dns
 
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+
 # Last-Modified on S3 HTTP responses must be RFC 7231 HTTP-date (AWS / Smithy).
 _RFC7231_LAST_MODIFIED_RE = re.compile(
     r"^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$"
@@ -258,7 +260,7 @@ def test_s3_put_get_json_chunked(s3):
         chunk_body + b"\r\n" +
         b"0;chunk-signature=" + fake_sig + b"\r\n\r\n"
     )
-    endpoint = "http://localhost:4566/" + bucket + "/test.json"
+    endpoint = f"{ENDPOINT}/{bucket}/test.json"
     req = urllib.request.Request(endpoint, data=chunked, method="PUT", headers={
         "x-amz-content-sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
         "Content-Type": "application/json",
@@ -280,7 +282,7 @@ def test_s3_put_zero_byte_chunked(s3):
 
     fake_sig = b"abc123"
     chunked = b"0;chunk-signature=" + fake_sig + b"\r\n\r\n"
-    endpoint = "http://localhost:4566/" + bucket + "/empty.bin"
+    endpoint = f"{ENDPOINT}/{bucket}/empty.bin"
     req = urllib.request.Request(endpoint, data=chunked, method="PUT", headers={
         "x-amz-content-sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
         "Authorization": "AWS4-HMAC-SHA256 Credential=test/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake",
@@ -518,7 +520,7 @@ def test_s3_get_object_rejects_response_overrides_on_unsigned_request(s3):
     s3.create_bucket(Bucket=bkt)
     s3.put_object(Bucket=bkt, Key="data.txt", Body=b"hello")
 
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     # No Authorization header, no presign markers — raw anonymous GET.
     for param in (
         "response-cache-control=no-cache",
@@ -774,7 +776,8 @@ def test_s3_create_bucket_tags_readable_via_s3control(s3):
     s3control = make_client("s3control")
     account_id = "123456789012"
     arn = f"arn:aws:s3:::{bkt}"
-    resp = s3control.list_tags_for_resource(AccountId=account_id, ResourceArn=arn)
+    with patch_endpoint_dns():
+        resp = s3control.list_tags_for_resource(AccountId=account_id, ResourceArn=arn)
     tags = {t["Key"]: t["Value"] for t in resp.get("Tags", [])}
     assert tags == {"project": "Trinity", "env": "prod"}
 
@@ -796,7 +799,8 @@ def test_s3_control_list_tags_for_resource(s3):
 
     s3control = make_client("s3control")
     arn = f"arn:aws:s3:::{bkt}"
-    resp = s3control.list_tags_for_resource(AccountId=account_id, ResourceArn=arn)
+    with patch_endpoint_dns():
+        resp = s3control.list_tags_for_resource(AccountId=account_id, ResourceArn=arn)
     tags = {t["Key"]: t["Value"] for t in resp.get("Tags", [])}
     assert tags.get("name") == "ministack-test"
 
@@ -820,7 +824,7 @@ def test_s3_control_tag_resource_post_xml_stores_tags(s3):
         "</TagResourceRequest>"
     ).encode()
     req = urllib.request.Request(
-        f"http://localhost:4566/v20180820/tags/{arn}",
+        f"{ENDPOINT}/v20180820/tags/{arn}",
         method="POST",
         data=xml_body,
         headers={
@@ -839,7 +843,7 @@ def test_s3_control_tag_resource_post_xml_stores_tags(s3):
 
     # And via S3 Control GET /v20180820/tags/{arn}
     get_req = urllib.request.Request(
-        f"http://localhost:4566/v20180820/tags/{arn}",
+        f"{ENDPOINT}/v20180820/tags/{arn}",
         method="GET",
         headers={"x-amz-account-id": "000000000000"},
     )
@@ -861,11 +865,11 @@ def test_s3_control_list_tags_via_s3_control_host(s3):
     )
     arn = urllib.parse.quote(f"arn:aws:s3:::{bkt}", safe="")
     req = urllib.request.Request(
-        f"http://localhost:4566/v20180820/tags/{arn}",
+        f"{ENDPOINT}/v20180820/tags/{arn}",
         method="GET",
         headers={
             "x-amz-account-id": "000000000000",
-            "Host": "s3-control.localhost:4566",
+            "Host": f"s3-control.{urlparse(ENDPOINT).netloc}",
         },
     )
     with urllib.request.urlopen(req) as r:
@@ -1688,7 +1692,7 @@ def test_s3_event_notification_cross_account():
     import boto3
     from botocore.config import Config
 
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     account = "512354813215"
 
     def _acct_client(service):
@@ -1761,7 +1765,7 @@ def _regional_client(service: str, region: str):
 
     return boto3.client(
         service,
-        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/"),
         aws_access_key_id="test",
         aws_secret_access_key="test",
         region_name=region,
@@ -2584,7 +2588,7 @@ def test_s3_post_object_unquoted_field_names(s3):
         f"--{boundary}--\r\n"
     ).encode()
     r = requests.post(
-        "http://localhost:4566/qa-s3-post-tok",
+        f"{ENDPOINT}/qa-s3-post-tok",
         data=body,
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
     )
@@ -3003,7 +3007,7 @@ def test_s3_presigned_url_signature_is_verified():
     import boto3
     from botocore.config import Config
 
-    ep = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    ep = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     # Explicit s3v4 + path style so ContentType / ContentLength are signed into
     # X-Amz-SignedHeaders (matches the reporter's config); otherwise boto3 would
     # not sign those headers and tampering them would be legitimately allowed.
@@ -3172,7 +3176,7 @@ def test_s3_upload_part_copy_rejects_malformed_range(s3, bad_range):
     s3.put_object(Bucket=bkt, Key="src", Body=b"0123456789")
 
     upload_id = s3.create_multipart_upload(Bucket=bkt, Key="dst")["UploadId"]
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     r = requests.put(
         f"{endpoint}/{bkt}/dst",
         params={"partNumber": 1, "uploadId": upload_id},
@@ -3194,7 +3198,7 @@ def test_s3_upload_part_copy_rejects_out_of_bounds_range(s3):
     s3.put_object(Bucket=bkt, Key="src", Body=b"0123456789")  # 10 bytes
 
     upload_id = s3.create_multipart_upload(Bucket=bkt, Key="dst")["UploadId"]
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     r = requests.put(
         f"{endpoint}/{bkt}/dst",
         params={"partNumber": 1, "uploadId": upload_id},

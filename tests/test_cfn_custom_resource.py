@@ -4,6 +4,7 @@ Requires a running Ministack server at MINISTACK_ENDPOINT (default http://localh
 """
 import io
 import json
+import os
 import threading
 import time
 import urllib.request
@@ -15,7 +16,7 @@ import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-ENDPOINT = "http://localhost:4566"
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 _LAMBDA_ROLE = "arn:aws:iam::000000000000:role/lambda-role"
 
 
