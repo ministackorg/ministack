@@ -392,6 +392,41 @@ def test_tagging_get_resources_cognito_identity(tagging, cognito_identity):
     assert any(pool_id in a for a in arns)
 
 
+def test_tagging_get_resources_cognito_is_region_scoped():
+    east_idp = _regional_client("cognito-idp", "us-east-1")
+    west_idp = _regional_client("cognito-idp", "us-west-2")
+    east_tagging = _regional_client("resourcegroupstaggingapi", "us-east-1")
+    west_tagging = _regional_client("resourcegroupstaggingapi", "us-west-2")
+    tag_value = f"cognito-region-{_uid()}"
+
+    east_pool = east_idp.create_user_pool(
+        PoolName=f"east-{tag_value}",
+        UserPoolTags={_TAG_KEY: tag_value},
+    )["UserPool"]
+    west_pool = west_idp.create_user_pool(
+        PoolName=f"west-{tag_value}",
+        UserPoolTags={_TAG_KEY: tag_value},
+    )["UserPool"]
+
+    east_arns = {
+        resource["ResourceARN"]
+        for resource in east_tagging.get_resources(
+            TagFilters=[{"Key": _TAG_KEY, "Values": [tag_value]}]
+        )["ResourceTagMappingList"]
+    }
+    west_arns = {
+        resource["ResourceARN"]
+        for resource in west_tagging.get_resources(
+            TagFilters=[{"Key": _TAG_KEY, "Values": [tag_value]}]
+        )["ResourceTagMappingList"]
+    }
+
+    assert east_pool["Arn"] in east_arns
+    assert west_pool["Arn"] not in east_arns
+    assert west_pool["Arn"] in west_arns
+    assert east_pool["Arn"] not in west_arns
+
+
 def test_tagging_get_resources_appsync(tagging, appsync):
     api_id = appsync.create_graphql_api(
         name="tg-appsync-api",

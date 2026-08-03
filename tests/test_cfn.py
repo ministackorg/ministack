@@ -3991,6 +3991,73 @@ Outputs:
     assert not without_resp["UserPoolClient"].get("ClientSecret"), "GenerateSecret=false should leave ClientSecret empty"
 
 
+def test_cfn_cognito_resources_use_the_stack_region():
+    import boto3
+    from botocore.config import Config
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def _client(service, region):
+        return boto3.client(
+            service,
+            endpoint_url=endpoint,
+            region_name=region,
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+            config=Config(retries={"mode": "standard"}),
+        )
+
+    west_cfn = _client("cloudformation", "us-west-2")
+    west_cognito = _client("cognito-idp", "us-west-2")
+    east_cognito = _client("cognito-idp", "us-east-1")
+    suffix = _uuid_mod.uuid4().hex[:10]
+    stack_name = f"cfn-cognito-west-{suffix}"
+    domain = f"cfn-cognito-west-{suffix}"
+    template = f"""
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  Pool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: {stack_name}
+  Client:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref Pool
+      ClientName: west-client
+  Domain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref Pool
+      Domain: {domain}
+Outputs:
+  PoolId:
+    Value: !Ref Pool
+  ClientId:
+    Value: !Ref Client
+"""
+
+    west_cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    stack = _wait_stack(west_cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    outputs = {output["OutputKey"]: output["OutputValue"] for output in stack["Outputs"]}
+
+    west_cognito.describe_user_pool(UserPoolId=outputs["PoolId"])
+    west_cognito.describe_user_pool_client(
+        UserPoolId=outputs["PoolId"], ClientId=outputs["ClientId"]
+    )
+    assert west_cognito.describe_user_pool_domain(Domain=domain)["DomainDescription"][
+        "UserPoolId"
+    ] == outputs["PoolId"]
+
+    assert outputs["PoolId"] not in {
+        pool["Id"] for pool in east_cognito.list_user_pools(MaxResults=60)["UserPools"]
+    }
+    with pytest.raises(ClientError) as exc:
+        east_cognito.describe_user_pool(UserPoolId=outputs["PoolId"])
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 def test_cfn_cognito_user_pool_group(cfn, cognito_idp):
     """CFN AWS::Cognito::UserPoolGroup creates a group whose Ref resolves to
     its GroupName, matching real AWS, and admin_add_user_to_group can then
