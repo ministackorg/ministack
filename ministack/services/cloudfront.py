@@ -61,6 +61,11 @@ _FUN_NAME_RE = re.compile(r"^/2020-05-31/function/([^/]+)/?$")
 _KVS_LIST_RE = re.compile(r"^/2020-05-31/key-value-store/?$")
 _KVS_NAME_RE = re.compile(r"^/2020-05-31/key-value-store/([^/]+)/?$")
 
+_CACHE_POLICY_RE = re.compile(r"^/2020-05-31/cache-policy/?$")
+_CACHE_POLICY_CFG_RE = re.compile(r"^/2020-05-31/cache-policy/([^/]+)/config$")
+_CACHE_POLICY_ID_RE = re.compile(r"^/2020-05-31/cache-policy/([^/]+)/?$")
+_DIST_BY_CACHE_POLICY_RE = re.compile(r"^/2020-05-31/distributionsByCachePolicyId/([^/]+)/?$")
+
 # ---------------------------------------------------------------------------
 # In-memory state
 # ---------------------------------------------------------------------------
@@ -70,6 +75,7 @@ _tags = AccountScopedDict()  # arn -> [{"Key": ..., "Value": ...}]
 _oacs = AccountScopedDict()  # Id -> OAC record
 _functions = AccountScopedDict()  # Name -> function record (CloudFront Functions API)
 _kvstores = AccountScopedDict()  # Name -> KVS record
+_cache_policies = AccountScopedDict()  # Id -> cache policy record
 
 
 def reset():
@@ -79,6 +85,7 @@ def reset():
     _oacs.clear()
     _functions.clear()
     _kvstores.clear()
+    _cache_policies.clear()
 
 
 def get_state():
@@ -90,6 +97,7 @@ def get_state():
             "oacs": _oacs,
             "functions": _functions,
             "kvstores": _kvstores,
+            "cache_policies": _cache_policies,
         }
     )
 
@@ -101,6 +109,7 @@ def restore_state(data):
     _oacs.update(data.get("oacs", {}))
     _functions.update(data.get("functions", {}))
     _kvstores.update(data.get("kvstores", {}))
+    _cache_policies.update(data.get("cache_policies", {}))
 
 
 try:
@@ -664,6 +673,266 @@ def _cf_delete_function(name: str, headers):
 
 
 # ---------------------------------------------------------------------------
+# Cache policies (Terraform aws_cloudfront_cache_policy)
+# Shapes verified against botocore cloudfront service-2.json (2020-05-31).
+# ---------------------------------------------------------------------------
+
+_CACHE_HEADER_BEHAVIORS = {"none", "whitelist"}
+_CACHE_COOKIE_BEHAVIORS = {"none", "whitelist", "allExcept", "all"}
+_CACHE_QUERYSTRING_BEHAVIORS = {"none", "whitelist", "allExcept", "all"}
+
+
+def _parse_name_items(block_el, names_tag):
+    """Pull <Items><Name>..</Name></Items> out of a Headers/Cookies/QueryStrings block."""
+    names = _find(block_el, names_tag) if block_el is not None else None
+    items = []
+    if names is not None:
+        items_el = _find(names, "Items")
+        if items_el is not None:
+            for child in items_el:
+                local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+                if local == "Name":
+                    items.append(child.text or "")
+    return items
+
+
+def _parse_cache_policy_config(el):
+    """Parse a <CachePolicyConfig> element into a stored dict, or return an _error tuple."""
+    name = _text(el, "Name")
+    if not name:
+        return None, _error("InvalidArgument", "The cache policy name is required.", 400)
+
+    min_ttl_el = _find(el, "MinTTL")
+    if min_ttl_el is None or not (min_ttl_el.text or "").strip():
+        return None, _error("InvalidArgument", "The MinTTL value is required.", 400)
+    try:
+        min_ttl = int(min_ttl_el.text)
+    except (TypeError, ValueError):
+        return None, _error("InvalidArgument", "The MinTTL value is not valid.", 400)
+
+    cfg = {"Name": name, "Comment": _text(el, "Comment"), "MinTTL": min_ttl}
+    for opt in ("DefaultTTL", "MaxTTL"):
+        opt_el = _find(el, opt)
+        if opt_el is not None and (opt_el.text or "").strip():
+            try:
+                cfg[opt] = int(opt_el.text)
+            except (TypeError, ValueError):
+                return None, _error("InvalidArgument", f"The {opt} value is not valid.", 400)
+
+    params_el = _find(el, "ParametersInCacheKeyAndForwardedToOrigin")
+    if params_el is not None:
+        headers_cfg = _find(params_el, "HeadersConfig")
+        cookies_cfg = _find(params_el, "CookiesConfig")
+        qs_cfg = _find(params_el, "QueryStringsConfig")
+        if headers_cfg is None or cookies_cfg is None or qs_cfg is None:
+            return None, _error(
+                "InvalidArgument",
+                "HeadersConfig, CookiesConfig, and QueryStringsConfig are required.",
+                400,
+            )
+        header_behavior = _text(headers_cfg, "HeaderBehavior")
+        cookie_behavior = _text(cookies_cfg, "CookieBehavior")
+        qs_behavior = _text(qs_cfg, "QueryStringBehavior")
+        if header_behavior not in _CACHE_HEADER_BEHAVIORS:
+            return None, _error("InvalidArgument", "Invalid HeaderBehavior value.", 400)
+        if cookie_behavior not in _CACHE_COOKIE_BEHAVIORS:
+            return None, _error("InvalidArgument", "Invalid CookieBehavior value.", 400)
+        if qs_behavior not in _CACHE_QUERYSTRING_BEHAVIORS:
+            return None, _error("InvalidArgument", "Invalid QueryStringBehavior value.", 400)
+        gzip_el = _find(params_el, "EnableAcceptEncodingGzip")
+        if gzip_el is None:
+            return None, _error("InvalidArgument", "EnableAcceptEncodingGzip is required.", 400)
+        cfg["Parameters"] = {
+            "EnableAcceptEncodingGzip": (gzip_el.text or "").strip().lower() == "true",
+            "EnableAcceptEncodingBrotli": _text(params_el, "EnableAcceptEncodingBrotli").strip().lower() == "true",
+            "HeaderBehavior": header_behavior,
+            "Headers": _parse_name_items(headers_cfg, "Headers"),
+            "CookieBehavior": cookie_behavior,
+            "Cookies": _parse_name_items(cookies_cfg, "Cookies"),
+            "QueryStringBehavior": qs_behavior,
+            "QueryStrings": _parse_name_items(qs_cfg, "QueryStrings"),
+        }
+    return cfg, None
+
+
+def _build_names_block(parent, names_tag, items):
+    block = SubElement(parent, names_tag)
+    SubElement(block, "Quantity").text = str(len(items))
+    if items:
+        items_el = SubElement(block, "Items")
+        for it in items:
+            SubElement(items_el, "Name").text = it
+
+
+def _build_cache_policy_config_xml(parent, cfg):
+    SubElement(parent, "Comment").text = cfg.get("Comment", "")
+    SubElement(parent, "Name").text = cfg["Name"]
+    # AWS fills the documented defaults when the caller omits these.
+    SubElement(parent, "DefaultTTL").text = str(cfg.get("DefaultTTL", 86400))
+    SubElement(parent, "MaxTTL").text = str(cfg.get("MaxTTL", 31536000))
+    SubElement(parent, "MinTTL").text = str(cfg["MinTTL"])
+    params = cfg.get("Parameters")
+    if params is not None:
+        p_el = SubElement(parent, "ParametersInCacheKeyAndForwardedToOrigin")
+        SubElement(p_el, "EnableAcceptEncodingGzip").text = "true" if params["EnableAcceptEncodingGzip"] else "false"
+        SubElement(p_el, "EnableAcceptEncodingBrotli").text = "true" if params["EnableAcceptEncodingBrotli"] else "false"
+        hc = SubElement(p_el, "HeadersConfig")
+        SubElement(hc, "HeaderBehavior").text = params["HeaderBehavior"]
+        _build_names_block(hc, "Headers", params["Headers"])
+        cc = SubElement(p_el, "CookiesConfig")
+        SubElement(cc, "CookieBehavior").text = params["CookieBehavior"]
+        _build_names_block(cc, "Cookies", params["Cookies"])
+        qc = SubElement(p_el, "QueryStringsConfig")
+        SubElement(qc, "QueryStringBehavior").text = params["QueryStringBehavior"]
+        _build_names_block(qc, "QueryStrings", params["QueryStrings"])
+
+
+def _build_cache_policy_xml(parent, policy):
+    SubElement(parent, "Id").text = policy["Id"]
+    SubElement(parent, "LastModifiedTime").text = policy["LastModifiedTime"]
+    cfg_el = SubElement(parent, "CachePolicyConfig")
+    _build_cache_policy_config_xml(cfg_el, policy["Config"])
+
+
+def _value_contains(obj, target):
+    """Best-effort recursive search for a policy Id anywhere in a distribution record."""
+    if isinstance(obj, str):
+        return obj == target
+    if isinstance(obj, dict):
+        return any(_value_contains(v, target) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return any(_value_contains(v, target) for v in obj)
+    return False
+
+
+def _distributions_using_cache_policy(policy_id):
+    return [d.get("Id", "") for d in _distributions.values() if _value_contains(d, policy_id)]
+
+
+def _create_cache_policy(body):
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+    cfg, err = _parse_cache_policy_config(el)
+    if err is not None:
+        return err
+    for existing in _cache_policies.values():
+        if existing["Config"]["Name"] == cfg["Name"]:
+            return _error("CachePolicyAlreadyExists", "A cache policy with the same name already exists.", 409)
+    policy_id = new_uuid()
+    etag = new_uuid()
+    policy = {"Id": policy_id, "ETag": etag, "LastModifiedTime": _now_iso(), "Config": cfg}
+    _cache_policies[policy_id] = policy
+    logger.info("CreateCachePolicy id=%s name=%s", policy_id, cfg["Name"])
+
+    def build(root):
+        _build_cache_policy_xml(root, policy)
+
+    return _xml_response(
+        "CachePolicy", build, status=201,
+        extra_headers={"ETag": etag, "Location": f"/2020-05-31/cache-policy/{policy_id}"},
+    )
+
+
+def _get_cache_policy(policy_id):
+    policy = _cache_policies.get(policy_id)
+    if not policy:
+        return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
+
+    def build(root):
+        _build_cache_policy_xml(root, policy)
+
+    return _xml_response("CachePolicy", build, extra_headers={"ETag": policy["ETag"]})
+
+
+def _get_cache_policy_config(policy_id):
+    policy = _cache_policies.get(policy_id)
+    if not policy:
+        return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
+
+    def build(root):
+        _build_cache_policy_config_xml(root, policy["Config"])
+
+    return _xml_response("CachePolicyConfig", build, extra_headers={"ETag": policy["ETag"]})
+
+
+def _update_cache_policy(policy_id, headers, body):
+    policy = _cache_policies.get(policy_id)
+    if not policy:
+        return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
+    if_match = headers.get("if-match")
+    if not if_match:
+        return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
+    if if_match != policy["ETag"]:
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+    cfg, err = _parse_cache_policy_config(el)
+    if err is not None:
+        return err
+    for existing in _cache_policies.values():
+        if existing["Id"] != policy_id and existing["Config"]["Name"] == cfg["Name"]:
+            return _error("CachePolicyAlreadyExists", "A cache policy with the same name already exists.", 409)
+    new_etag = new_uuid()
+    policy["Config"] = cfg
+    policy["ETag"] = new_etag
+    policy["LastModifiedTime"] = _now_iso()
+    logger.info("UpdateCachePolicy id=%s name=%s", policy_id, cfg["Name"])
+
+    def build(root):
+        _build_cache_policy_xml(root, policy)
+
+    return _xml_response("CachePolicy", build, extra_headers={"ETag": new_etag})
+
+
+def _delete_cache_policy(policy_id, headers):
+    policy = _cache_policies.get(policy_id)
+    if not policy:
+        return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
+    if_match = headers.get("if-match")
+    if not if_match:
+        return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
+    if if_match != policy["ETag"]:
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
+    if _distributions_using_cache_policy(policy_id):
+        return _error(
+            "CachePolicyInUse",
+            "The cache policy cannot be deleted because it is attached to one or more cache behaviors.",
+            409,
+        )
+    del _cache_policies[policy_id]
+    logger.info("DeleteCachePolicy id=%s", policy_id)
+    return 204, {}, b""
+
+
+def _list_distributions_by_cache_policy(policy_id):
+    if not _cache_policies.get(policy_id):
+        return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
+    dist_ids = _distributions_using_cache_policy(policy_id)
+
+    def build(root):
+        SubElement(root, "Marker").text = ""
+        SubElement(root, "MaxItems").text = "100"
+        SubElement(root, "IsTruncated").text = "false"
+        SubElement(root, "Quantity").text = str(len(dist_ids))
+        if dist_ids:
+            items_el = SubElement(root, "Items")
+            for did in dist_ids:
+                SubElement(items_el, "DistributionId").text = did
+
+    return _xml_response("DistributionIdList", build)
+
+
+# ---------------------------------------------------------------------------
 # Request dispatcher
 # ---------------------------------------------------------------------------
 
@@ -751,6 +1020,32 @@ async def handle_request(method, path, headers, body, query_params):
             return _get_oac(oac_id)
         if method == "DELETE":
             return _delete_oac(oac_id, headers)
+
+    # Cache policy routes
+    m = _CACHE_POLICY_CFG_RE.match(path)
+    if m:
+        if method == "GET":
+            return _get_cache_policy_config(m.group(1))
+
+    m = _CACHE_POLICY_RE.match(path)
+    if m:
+        if method == "POST":
+            return _create_cache_policy(body)
+
+    m = _CACHE_POLICY_ID_RE.match(path)
+    if m:
+        policy_id = m.group(1)
+        if method == "GET":
+            return _get_cache_policy(policy_id)
+        if method == "PUT":
+            return _update_cache_policy(policy_id, headers, body)
+        if method == "DELETE":
+            return _delete_cache_policy(policy_id, headers)
+
+    m = _DIST_BY_CACHE_POLICY_RE.match(path)
+    if m:
+        if method == "GET":
+            return _list_distributions_by_cache_policy(m.group(1))
 
     # CloudFront Functions API (used by Terraform aws_cloudfront_function)
     m = _FUN_DESCRIBE_RE.match(path)

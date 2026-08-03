@@ -1987,31 +1987,6 @@ def _rule_event(sql: str, topic: str, payload: bytes):
     return event
 
 
-def _rule_event(sql: str, topic: str, payload: bytes):
-    """Project a publish payload through a rule's SELECT clause."""
-    payload = payload or b""
-    message = _rule_message(payload)
-    items = _split_select_items(_rule_select_clause(sql)) or ["*"]
-
-    if len(items) == 1:
-        expr, alias = _split_select_alias(items[0])
-        if expr == "*" and alias is None:
-            return message
-
-    event: dict = {}
-    for item in items:
-        expr, alias = _split_select_alias(item)
-        value = _eval_select_expr(expr, topic, message)
-        if value is _MISSING:
-            continue
-        if expr == "*" and alias is None:
-            if isinstance(value, dict):
-                event.update(value)
-            continue
-        event[alias or _select_default_key(expr)] = value
-    return event
-
-
 def _dispatch_rule_to_lambda(
     account_id: str, region: str, function_arn: str, event
 ) -> None:

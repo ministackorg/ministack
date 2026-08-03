@@ -2243,6 +2243,159 @@ def test_partiql_delete(ddb):
     assert "Item" not in resp
 
 
+def _mk_partiql_table(ddb, tname):
+    try:
+        ddb.delete_table(TableName=tname)
+    except ClientError:
+        pass
+    ddb.create_table(
+        TableName=tname,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+
+
+def test_partiql_select_multi_predicate_begins_with_not_last(ddb):
+    """A predicate AFTER begins_with must still be enforced. Regression: the
+    begins_with branch used to `return` inside the WHERE loop, so any condition
+    following it was silently ignored (order-dependent wrong results)."""
+    tname = "partiql-where-multi"
+    _mk_partiql_table(ddb, tname)
+    ddb.put_item(TableName=tname, Item={"pk": {"S": "a1"}, "name": {"S": "apple"}, "status": {"S": "active"}})
+    ddb.put_item(TableName=tname, Item={"pk": {"S": "a2"}, "name": {"S": "apricot"}, "status": {"S": "inactive"}})
+
+    resp = ddb.execute_statement(
+        Statement=f"SELECT * FROM \"{tname}\" WHERE begins_with(name, 'ap') AND status = ?",
+        Parameters=[{"S": "active"}],
+    )
+    # Both names begin with 'ap'; only one is active. The trailing status
+    # predicate must filter out apricot.
+    pks = sorted(it["pk"]["S"] for it in resp["Items"])
+    assert pks == ["a1"]
+
+
+def test_partiql_update_trailing_predicate_after_begins_with_enforced(ddb):
+    """UPDATE's non-key predicate after begins_with is a conditional check;
+    when it fails the item is left unchanged (ConditionalCheckFailedException)."""
+    tname = "partiql-update-multi"
+    _mk_partiql_table(ddb, tname)
+    ddb.put_item(TableName=tname, Item={"pk": {"S": "u1"}, "name": {"S": "apple"}, "status": {"S": "old"}})
+
+    with pytest.raises(ClientError) as exc:
+        ddb.execute_statement(
+            Statement=f"UPDATE \"{tname}\" SET status = ? WHERE pk = ? AND begins_with(name, 'ap') AND status = ?",
+            Parameters=[{"S": "new"}, {"S": "u1"}, {"S": "beta"}],
+        )
+    assert exc.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
+    # Item must be untouched.
+    got = ddb.get_item(TableName=tname, Key={"pk": {"S": "u1"}})
+    assert got["Item"]["status"]["S"] == "old"
+
+
+def test_partiql_update_returning_all_old(ddb):
+    tname = "partiql-ret-allold"
+    _mk_partiql_table(ddb, tname)
+    ddb.put_item(TableName=tname, Item={"pk": {"S": "r1"}, "status": {"S": "old"}})
+    resp = ddb.execute_statement(
+        Statement=f"UPDATE \"{tname}\" SET status = ? WHERE pk = ? RETURNING ALL OLD *",
+        Parameters=[{"S": "new"}, {"S": "r1"}],
+    )
+    assert resp["Items"] == [{"pk": {"S": "r1"}, "status": {"S": "old"}}]
+    assert ddb.get_item(TableName=tname, Key={"pk": {"S": "r1"}})["Item"]["status"]["S"] == "new"
+
+
+def test_partiql_update_returning_all_new(ddb):
+    tname = "partiql-ret-allnew"
+    _mk_partiql_table(ddb, tname)
+    ddb.put_item(TableName=tname, Item={"pk": {"S": "r1"}, "status": {"S": "old"}})
+    resp = ddb.execute_statement(
+        Statement=f"UPDATE \"{tname}\" SET status = ? WHERE pk = ? RETURNING ALL NEW *",
+        Parameters=[{"S": "new"}, {"S": "r1"}],
+    )
+    assert resp["Items"] == [{"pk": {"S": "r1"}, "status": {"S": "new"}}]
+
+
+def test_partiql_update_returning_modified(ddb):
+    tname = "partiql-ret-mod"
+    _mk_partiql_table(ddb, tname)
+    ddb.put_item(TableName=tname, Item={"pk": {"S": "r1"}, "status": {"S": "old"}, "keep": {"S": "same"}})
+    old = ddb.execute_statement(
+        Statement=f"UPDATE \"{tname}\" SET status = ? WHERE pk = ? RETURNING MODIFIED OLD *",
+        Parameters=[{"S": "new"}, {"S": "r1"}],
+    )
+    # Only the changed attribute, as it was before.
+    assert old["Items"] == [{"status": {"S": "old"}}]
+    new = ddb.execute_statement(
+        Statement=f"UPDATE \"{tname}\" SET status = ? WHERE pk = ? RETURNING MODIFIED NEW *",
+        Parameters=[{"S": "newer"}, {"S": "r1"}],
+    )
+    assert new["Items"] == [{"status": {"S": "newer"}}]
+
+
+def test_partiql_delete_returning_all_old(ddb):
+    tname = "partiql-del-ret"
+    _mk_partiql_table(ddb, tname)
+    ddb.put_item(TableName=tname, Item={"pk": {"S": "d1"}, "val": {"S": "x"}})
+    resp = ddb.execute_statement(
+        Statement=f"DELETE FROM \"{tname}\" WHERE pk = ? RETURNING ALL OLD *",
+        Parameters=[{"S": "d1"}],
+    )
+    assert resp["Items"] == [{"pk": {"S": "d1"}, "val": {"S": "x"}}]
+    assert "Item" not in ddb.get_item(TableName=tname, Key={"pk": {"S": "d1"}})
+
+
+def test_partiql_update_missing_item_conditional_check_failed(ddb):
+    """AWS: 'If the WHERE clause of the UPDATE statement does not evaluate to
+    true for any item, ConditionalCheckFailedException is returned.' No upsert."""
+    tname = "partiql-update-missing"
+    _mk_partiql_table(ddb, tname)
+    with pytest.raises(ClientError) as exc:
+        ddb.execute_statement(
+            Statement=f"UPDATE \"{tname}\" SET status = ? WHERE pk = ?",
+            Parameters=[{"S": "new"}, {"S": "ghost"}],
+        )
+    assert exc.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
+    assert "Item" not in ddb.get_item(TableName=tname, Key={"pk": {"S": "ghost"}})
+
+
+def test_partiql_update_remove_clause(ddb):
+    tname = "partiql-remove"
+    _mk_partiql_table(ddb, tname)
+    ddb.put_item(TableName=tname, Item={"pk": {"S": "u1"}, "a": {"S": "keep"}, "b": {"S": "drop"}})
+    ddb.execute_statement(
+        Statement=f"UPDATE \"{tname}\" REMOVE b WHERE pk = ?",
+        Parameters=[{"S": "u1"}],
+    )
+    item = ddb.get_item(TableName=tname, Key={"pk": {"S": "u1"}})["Item"]
+    assert item["a"]["S"] == "keep"
+    assert "b" not in item
+
+
+def test_partiql_select_in_and_is_missing(ddb):
+    """IN membership and IS MISSING / IS NOT MISSING predicates filter rows."""
+    tname = "partiql-in-missing"
+    _mk_partiql_table(ddb, tname)
+    ddb.put_item(TableName=tname, Item={"pk": {"S": "p1"}, "status": {"S": "active"}, "note": {"S": "hi"}})
+    ddb.put_item(TableName=tname, Item={"pk": {"S": "p2"}, "status": {"S": "pending"}})
+    ddb.put_item(TableName=tname, Item={"pk": {"S": "p3"}, "status": {"S": "closed"}, "note": {"S": "bye"}})
+
+    in_resp = ddb.execute_statement(
+        Statement=f"SELECT * FROM \"{tname}\" WHERE status IN ('active', 'pending')",
+    )
+    assert sorted(it["pk"]["S"] for it in in_resp["Items"]) == ["p1", "p2"]
+
+    missing = ddb.execute_statement(
+        Statement=f"SELECT * FROM \"{tname}\" WHERE note IS MISSING",
+    )
+    assert sorted(it["pk"]["S"] for it in missing["Items"]) == ["p2"]
+
+    not_missing = ddb.execute_statement(
+        Statement=f"SELECT * FROM \"{tname}\" WHERE note IS NOT MISSING",
+    )
+    assert sorted(it["pk"]["S"] for it in not_missing["Items"]) == ["p1", "p3"]
+
+
 def test_partiql_nonexistent_table(ddb):
     """ExecuteStatement on a nonexistent table should return ResourceNotFoundException."""
     with pytest.raises(ClientError) as exc:

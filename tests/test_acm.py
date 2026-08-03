@@ -28,6 +28,28 @@ def test_acm_describe_certificate(acm_client):
     assert len(cert["DomainValidationOptions"]) >= 1
     assert "ResourceRecord" in cert["DomainValidationOptions"][0]
 
+def test_acm_wildcard_san_validation_record_matches_base_domain(acm_client):
+    """A wildcard SAN validates through the same DNS record as its base domain:
+    real ACM strips the leading '*.' so '*.example.com' and 'example.com' share
+    one _acme-challenge.example.com CNAME with an identical name and value.
+    Regression for #1250 — aws_acm_certificate_validation could not find the
+    FQDN because the wildcard emitted _acme-challenge.*.example.com."""
+    arn = acm_client.request_certificate(
+        DomainName="wild.example.com",
+        ValidationMethod="DNS",
+        SubjectAlternativeNames=["*.wild.example.com"],
+    )["CertificateArn"]
+    cert = acm_client.describe_certificate(CertificateArn=arn)["Certificate"]
+    dvo = {o["DomainName"]: o["ResourceRecord"] for o in cert["DomainValidationOptions"]}
+
+    # The wildcard entry keeps its own DomainName but its record name has the
+    # '*.' stripped — never _acme-challenge.*.<domain>.
+    assert dvo["*.wild.example.com"]["Name"] == "_acme-challenge.wild.example.com."
+    assert "*." not in dvo["*.wild.example.com"]["Name"]
+    # Wildcard and apex collapse onto one identical CNAME (name AND value), so
+    # Terraform's for_each dedup and validation_record_fqdns line up.
+    assert dvo["*.wild.example.com"] == dvo["wild.example.com"]
+
 def test_acm_list_certificates(acm_client):
     arn = acm_client.request_certificate(DomainName="list.example.com")["CertificateArn"]
     resp = acm_client.list_certificates()

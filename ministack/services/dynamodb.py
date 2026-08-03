@@ -2199,6 +2199,9 @@ def _scan(data):
             # LSI: items lacking the index's RANGE attribute don't appear.
             if sk_name_idx:
                 all_items = [it for it in all_items if sk_name_idx in it]
+        # Sort by index key ordering so ESK/LEK pagination is consistent.
+        sort_keys = _index_order_keys(table, sk_name_idx)
+        all_items.sort(key=lambda it: tuple(_index_order_value(it, n, t) for n, t in sort_keys))
 
     # Parallel scan: partition items deterministically across segments by
     # hashing the partition key. AWS guarantees segments return disjoint
@@ -2230,7 +2233,13 @@ def _scan(data):
         if not required.issubset(esk.keys()):
             return error_response_json("ValidationException",
                 "The provided starting key is invalid: The provided key element does not match the schema", 400)
-        all_items = _apply_exclusive_start_key_scan(all_items, esk, table)
+        if index_name:
+            # For index scans, use index-aware ordering (same as Query pagination).
+            all_items = _apply_exclusive_start_key(
+                all_items, esk, pk_name_idx, sk_name_idx, scan_forward=True, table=table
+            )
+        else:
+            all_items = _apply_exclusive_start_key_scan(all_items, esk, table)
 
     # Same LastEvaluatedKey semantics as Query: stopping exactly at the limit
     # still yields a key, because AWS doesn't look ahead.
@@ -2268,7 +2277,12 @@ def _scan(data):
         }
 
     if has_more and all_items:
-        result["LastEvaluatedKey"] = _build_key(all_items[-1], table["pk_name"], table["sk_name"])
+        lek = _build_key(all_items[-1], table["pk_name"], table["sk_name"])
+        if index_name:
+            ik = _build_key(all_items[-1], pk_name_idx, sk_name_idx)
+            for k, v in ik.items():
+                lek.setdefault(k, v)
+        result["LastEvaluatedKey"] = lek
 
     _add_consumed_capacity(result, data, name)
     return json_response(result)
@@ -2391,14 +2405,41 @@ def _partiql_key_target(table, parsed):
     if pk_typed is None or (sk_attr and sk_typed is None):
         return None, None, None, error_response_json(
             "ValidationException",
-            "WHERE clause must specify every primary key attribute with equality.",
+            "Where clause does not contain a mandatory equality on all key attributes",
             400,
         )
 
     def non_key_fn(item):
+        # Each predicate is a fail-fast check: on a pass we fall through to the
+        # next condition rather than returning, so every predicate in a
+        # multi-condition WHERE is evaluated (not just the first special op).
         for attr, op, val in rest:
-            if not _compare_ddb(item.get(attr), op, val):
-                return False
+            if op == "begins_with":
+                iv = item.get(attr)
+                if iv is None or "S" not in iv:
+                    return False
+                prefix = val.get("S", "") if isinstance(val, dict) else str(val)
+                if not iv["S"].startswith(prefix):
+                    return False
+            elif op == "not_begins_with":
+                iv = item.get(attr)
+                if iv is not None and "S" in iv:
+                    prefix = val.get("S", "") if isinstance(val, dict) else str(val)
+                    if iv["S"].startswith(prefix):
+                        return False
+            elif op == "is_missing":
+                if item.get(attr) is not None:
+                    return False
+            elif op == "is_not_missing":
+                if item.get(attr) is None:
+                    return False
+            elif op == "IN":
+                iv = item.get(attr)
+                if iv is None or not any(_ddb_equals(iv, v) for v in val):
+                    return False
+            else:
+                if not _compare_ddb(item.get(attr), op, val):
+                    return False
         return True
 
     pk_key = _extract_key_val(pk_typed)
@@ -2406,46 +2447,132 @@ def _partiql_key_target(table, parsed):
     return pk_key, sk_key, non_key_fn, None
 
 
+def _build_partiql_returning(item_before, item_after, returning_clause):
+    """Build the Items list for a RETURNING clause response.
+
+    Supported: ALL OLD *, ALL NEW *, MODIFIED OLD *, MODIFIED NEW *
+    Returns (items_list, error_or_None)
+    """
+    if not returning_clause:
+        return [], None
+    r = returning_clause.upper().strip()
+    if r == "ALL OLD *":
+        return [item_before] if item_before else [], None
+    elif r == "ALL NEW *":
+        return [item_after] if item_after else [], None
+    elif r == "MODIFIED NEW *":
+        if not item_before or not item_after:
+            return [], None
+        changed = {k: v for k, v in item_after.items()
+                   if k not in item_before or item_before[k] != v}
+        return [changed] if changed else [], None
+    elif r == "MODIFIED OLD *":
+        if not item_before or not item_after:
+            return [], None
+        changed = {k: item_before[k] for k in item_before
+                   if k not in item_after or item_after[k] != item_before[k]}
+        return [changed] if changed else [], None
+    else:
+        return None, f"Invalid returning clause: {returning_clause}"
+
+
 def _partiql_update(table, parsed):
     set_attrs = parsed.get("set_attrs", {})
-    if not parsed.get("where_fn") or not set_attrs:
+    remove_attrs = parsed.get("remove_attrs", [])
+    returning = parsed.get("returning")
+
+    if not parsed.get("where_fn") and not parsed.get("conditions"):
         return error_response_json("ValidationException",
-                                   "UPDATE requires SET and WHERE clauses", 400)
+                                   "UPDATE requires a WHERE clause", 400)
+    if not set_attrs and not remove_attrs:
+        return error_response_json("ValidationException",
+                                   "UPDATE requires SET or REMOVE clause", 400)
+
+    # Validate RETURNING clause
+    if returning:
+        valid_returning = {"ALL OLD *", "ALL NEW *", "MODIFIED OLD *", "MODIFIED NEW *"}
+        if returning.upper().strip() not in valid_returning:
+            return error_response_json("ValidationException",
+                f"Invalid returning clause: RETURNING {returning} is not supported", 400)
 
     pk_key, sk_key, non_key_fn, err = _partiql_key_target(table, parsed)
     if err:
         return err
 
     item = table["items"].get(pk_key, {}).get(sk_key)
-    if item is None or not non_key_fn(item):
+    # UPDATE on a missing key → ConditionalCheckFailedException (not upsert).
+    if item is None:
+        return _conditional_check_failed({}, None)
+    if not non_key_fn(item):
         return _conditional_check_failed({}, item)
 
+    item_before = copy.deepcopy(item) if returning else None
     for attr, val in set_attrs.items():
-        item[attr] = val
-    # AWS ExecuteStatement returns {"Items": []} for UPDATE/DELETE (not an
-    # empty object). Some SDKs check for the Items key presence.
+        # Handle arithmetic: {"__partiql_arith": {"attr": "n", "op": "+", "val": {"N": "1"}}}
+        if isinstance(val, dict) and "__partiql_arith" in val:
+            arith = val["__partiql_arith"]
+            src_attr = arith["attr"]
+            op = arith["op"]
+            operand = arith["val"]
+            cur = item.get(src_attr)
+            if cur and "N" in cur and "N" in operand:
+                from decimal import Decimal
+                result_n = Decimal(cur["N"]) + Decimal(operand["N"]) if op == "+" else Decimal(cur["N"]) - Decimal(operand["N"])
+                item[attr] = {"N": str(result_n)}
+            else:
+                item[attr] = operand  # fallback: just set to operand
+        else:
+            item[attr] = val
+    for attr in remove_attrs:
+        item.pop(attr, None)
+    item_after = item
+
+    if returning:
+        items_list, ret_err = _build_partiql_returning(item_before, item_after, returning)
+        if ret_err:
+            return error_response_json("ValidationException", ret_err, 400)
+        return json_response({"Items": items_list})
     return json_response({"Items": []})
 
 
 def _partiql_delete(table, parsed):
-    if not parsed.get("where_fn"):
+    returning = parsed.get("returning")
+    if not parsed.get("where_fn") and not parsed.get("conditions"):
         return error_response_json("ValidationException",
                                    "DELETE requires a WHERE clause", 400)
+
+    # Validate RETURNING clause — DELETE only supports ALL OLD *
+    if returning:
+        r = returning.upper().strip()
+        if r not in ("ALL OLD *",):
+            return error_response_json("ValidationException",
+                f"Only RETURNING ALL OLD * is allowed on DELETE statements; got: RETURNING {returning}", 400)
 
     pk_key, sk_key, non_key_fn, err = _partiql_key_target(table, parsed)
     if err:
         return err
 
     item = table["items"].get(pk_key, {}).get(sk_key)
-    if item is None or not non_key_fn(item):
+
+    # If item doesn't exist and there are non-key predicates, that's a silent no-op.
+    # If item doesn't exist and there are NO non-key predicates, also a silent no-op.
+    if item is None:
+        if returning and returning.upper().strip() == "ALL OLD *":
+            return json_response({"Items": []})
+        return json_response({"Items": []})
+
+    # Non-key predicate fails → ConditionalCheckFailed
+    if not non_key_fn(item):
         return _conditional_check_failed({}, item)
 
+    item_before = copy.deepcopy(item) if returning else None
     del table["items"][pk_key][sk_key]
     if not table["items"][pk_key]:
         del table["items"][pk_key]
     _update_counts(table)
-    # AWS ExecuteStatement returns {"Items": []} for UPDATE/DELETE (not an
-    # empty object). Some SDKs check for the Items key presence.
+
+    if returning and returning.upper().strip() == "ALL OLD *":
+        return json_response({"Items": [item_before] if item_before else []})
     return json_response({"Items": []})
 
 
@@ -2468,7 +2595,25 @@ def _batch_execute_statement(data):
     rc = data.get("ReturnConsumedCapacity", "NONE")
     per_table_units: dict[str, float] = {}
     for stmt in statements:
-        sub = {"Statement": stmt.get("Statement"), "Parameters": stmt.get("Parameters", [])}
+        raw_stmt = stmt.get("Statement", "")
+        # Pre-check: RETURNING clause in batch is surfaced as per-statement error.
+        import re as _re
+        _ret_match = _re.search(r'\s+RETURNING\s+', raw_stmt, _re.IGNORECASE)
+        if _ret_match:
+            # Check if it's a valid RETURNING variant — invalid ones get ValidationError.
+            _ret_clause = raw_stmt[_ret_match.end():].strip().rstrip(';').strip().upper()
+            _valid_ret = {"ALL OLD *", "ALL NEW *", "MODIFIED OLD *", "MODIFIED NEW *"}
+            # For DELETE, only ALL OLD * is valid.
+            _is_delete = raw_stmt.strip().upper().startswith("DELETE")
+            if _is_delete and _ret_clause not in ("ALL OLD *",):
+                responses.append({"Error": {"Code": "ValidationError",
+                    "Message": f"Only RETURNING ALL OLD * is allowed on DELETE statements"}})
+                continue
+            if _ret_clause not in _valid_ret:
+                responses.append({"Error": {"Code": "ValidationError",
+                    "Message": f"Invalid RETURNING clause: {_ret_clause}"}})
+                continue
+        sub = {"Statement": raw_stmt, "Parameters": stmt.get("Parameters", [])}
         status, _, body = _execute_statement(sub)
         try:
             payload = json.loads(body)
@@ -2476,23 +2621,26 @@ def _batch_execute_statement(data):
             payload = {}
         if status == 200:
             entry: dict = {}
-            if payload.get("Items") is not None:
-                entry["Item"] = payload["Items"][0] if payload["Items"] else None
-            if entry.get("Item") is None and "Item" in entry:
-                entry.pop("Item")
+            items = payload.get("Items")
+            if items is not None:
+                # RETURNING responses: include the item if present
+                if items:
+                    entry["Item"] = items[0]
             responses.append(entry)
         else:
             err_code = payload.get("__type", "ValidationException")
             err_msg = payload.get("message", "")
-            # Per-statement error code in BatchExecuteStatement is the short
-            # form ('ResourceNotFound', not 'ResourceNotFoundException').
+            # Per-statement error code: AWS uses "ValidationError" for validation
+            # errors, and the short name (sans Exception) for other errors.
             short = err_code.split("#")[-1]
-            if short.endswith("Exception"):
+            if short == "ValidationException":
+                short = "ValidationError"
+            elif short.endswith("Exception"):
                 short = short[: -len("Exception")]
             responses.append({"Error": {"Code": short, "Message": err_msg}})
-        # Crude per-table unit attribution.
+        # Per-table unit attribution.
         try:
-            parsed = _parse_partiql(stmt.get("Statement", ""), stmt.get("Parameters", []))
+            parsed = _parse_partiql(raw_stmt, stmt.get("Parameters", []))
             per_table_units[parsed["table"]] = per_table_units.get(parsed["table"], 0.0) + 1.0
         except Exception:
             pass
@@ -2539,6 +2687,11 @@ def _execute_transaction(data):
     for stmt in statements:
         statement = stmt.get("Statement", "")
         parameters = stmt.get("Parameters", [])
+        # RETURNING clause is not allowed in transaction statements.
+        import re as _re2
+        if _re2.search(r'\s+RETURNING\s+', statement, _re2.IGNORECASE):
+            return error_response_json("ValidationException",
+                "RETURNING clause is not supported in TransactStatement", 400)
         try:
             parsed = _parse_partiql(statement, parameters)
         except ValueError as e:
@@ -2680,36 +2833,70 @@ def _parse_partiql_insert(s, parameters):
 
 def _parse_partiql_update(s, parameters):
     import re
-    # UPDATE <table> SET <attr>=<val>[,...] WHERE <condition>
+    # UPDATE <table> SET <assignments> [REMOVE <paths>] WHERE <condition> [RETURNING <clause>]
+    # Strip RETURNING clause first (it's always at the end).
+    returning = None
+    ret_match = re.search(r'\s+RETURNING\s+(.+)$', s, re.IGNORECASE)
+    if ret_match:
+        returning = ret_match.group(1).strip()
+        s = s[:ret_match.start()].strip()
+
+    # Try SET ... WHERE form first.
     m = re.match(
         r"UPDATE\s+\"?([A-Za-z0-9_.\-]+)\"?\s+SET\s+(.+?)\s+WHERE\s+(.+)$",
         s, re.IGNORECASE | re.DOTALL,
     )
-    if not m:
-        raise ValueError(f"Could not parse UPDATE statement: {s}")
+    if m:
+        table_name = m.group(1).strip()
+        set_str = m.group(2).strip()
+        where_str = m.group(3).strip()
+        remove_str = None
+        # Check for embedded REMOVE clause within SET string (SET x=v REMOVE y WHERE ...)
+        rem_in_set = re.search(r'\s+REMOVE\s+(.+)$', set_str, re.IGNORECASE)
+        if rem_in_set:
+            remove_str = rem_in_set.group(1).strip()
+            set_str = set_str[:rem_in_set.start()].strip()
+        set_attrs = {}
+        param_idx = [0]
+        for assignment in _split_top_level(set_str, ','):
+            parts = assignment.split("=", 1)
+            if len(parts) != 2:
+                raise ValueError(f"Invalid SET assignment: {assignment}")
+            attr = parts[0].strip().strip('"')
+            val_str = parts[1].strip()
+            set_attrs[attr] = _parse_partiql_literal(val_str, parameters, param_idx)
+        where_fn, conditions = _build_partiql_where(where_str, parameters, param_idx)
+        return {"op": "UPDATE", "table": table_name, "set_attrs": set_attrs,
+                "remove_attrs": [r.strip() for r in remove_str.split(",")] if remove_str else [],
+                "where_fn": where_fn, "conditions": conditions, "returning": returning}
 
-    table_name = m.group(1).strip()
-    set_str = m.group(2).strip()
-    where_str = m.group(3).strip()
+    # Try REMOVE ... WHERE form.
+    m = re.match(
+        r"UPDATE\s+\"?([A-Za-z0-9_.\-]+)\"?\s+REMOVE\s+(.+?)\s+WHERE\s+(.+)$",
+        s, re.IGNORECASE | re.DOTALL,
+    )
+    if m:
+        table_name = m.group(1).strip()
+        remove_str = m.group(2).strip()
+        where_str = m.group(3).strip()
+        param_idx = [0]
+        where_fn, conditions = _build_partiql_where(where_str, parameters, param_idx)
+        return {"op": "UPDATE", "table": table_name, "set_attrs": {},
+                "remove_attrs": [r.strip() for r in remove_str.split(",")],
+                "where_fn": where_fn, "conditions": conditions, "returning": returning}
 
-    # Parse SET assignments
-    set_attrs = {}
-    param_idx = [0]
-    for assignment in _split_top_level(set_str, ','):
-        parts = assignment.split("=", 1)
-        if len(parts) != 2:
-            raise ValueError(f"Invalid SET assignment: {assignment}")
-        attr = parts[0].strip().strip('"')
-        val_str = parts[1].strip()
-        set_attrs[attr] = _parse_partiql_literal(val_str, parameters, param_idx)
-
-    where_fn, conditions = _build_partiql_where(where_str, parameters, param_idx)
-    return {"op": "UPDATE", "table": table_name, "set_attrs": set_attrs,
-            "where_fn": where_fn, "conditions": conditions}
+    raise ValueError(f"Could not parse UPDATE statement: {s}")
 
 
 def _parse_partiql_delete(s, parameters):
     import re
+    # Strip RETURNING clause first.
+    returning = None
+    ret_match = re.search(r'\s+RETURNING\s+(.+)$', s, re.IGNORECASE)
+    if ret_match:
+        returning = ret_match.group(1).strip()
+        s = s[:ret_match.start()].strip()
+
     # DELETE FROM <table> WHERE <condition>
     m = re.match(
         r"DELETE\s+FROM\s+\"?([A-Za-z0-9_.\-]+)\"?\s+WHERE\s+(.+)$",
@@ -2717,12 +2904,11 @@ def _parse_partiql_delete(s, parameters):
     )
     if not m:
         raise ValueError(f"Could not parse DELETE statement: {s}")
-
     table_name = m.group(1).strip()
     where_str = m.group(2).strip()
     where_fn, conditions = _build_partiql_where(where_str, parameters)
     return {"op": "DELETE", "table": table_name, "where_fn": where_fn,
-            "conditions": conditions}
+            "conditions": conditions, "returning": returning}
 
 
 def _build_partiql_where(where_str, parameters, param_idx=None):
@@ -2735,10 +2921,35 @@ def _build_partiql_where(where_str, parameters, param_idx=None):
     conditions = _parse_partiql_conditions(where_str, parameters, param_idx)
 
     def where_fn(item):
+        # Fail-fast per predicate (see non_key_fn): a passing condition falls
+        # through to the next one instead of returning, so every predicate in a
+        # multi-condition WHERE is evaluated regardless of order.
         for attr, op, val in conditions:
             item_val = item.get(attr)
-            if not _compare_ddb(item_val, op, val):
-                return False
+            if op == "begins_with":
+                if item_val is None or not isinstance(item_val, dict) or "S" not in item_val:
+                    return False
+                prefix = val.get("S", "") if isinstance(val, dict) else str(val)
+                if not item_val["S"].startswith(prefix):
+                    return False
+            elif op == "not_begins_with":
+                # missing attribute / non-string → NOT begins_with is True (pass)
+                if item_val is not None and isinstance(item_val, dict) and "S" in item_val:
+                    prefix = val.get("S", "") if isinstance(val, dict) else str(val)
+                    if item_val["S"].startswith(prefix):
+                        return False
+            elif op == "is_missing":
+                if item_val is not None:
+                    return False
+            elif op == "is_not_missing":
+                if item_val is None:
+                    return False
+            elif op == "IN":
+                if item_val is None or not any(_ddb_equals(item_val, v) for v in val):
+                    return False
+            else:
+                if not _compare_ddb(item_val, op, val):
+                    return False
         return True
 
     return where_fn, conditions
@@ -2748,10 +2959,45 @@ def _parse_partiql_conditions(where_str, parameters, param_idx):
     """Parse WHERE conditions joined by AND. Returns list of (attr, op, ddb_value)."""
     import re
     conditions = []
-    # Split on AND (case-insensitive, word boundary)
-    parts = re.split(r'\s+AND\s+', where_str, flags=re.IGNORECASE)
+    # Split on AND (case-insensitive, word boundary) — but not inside parens.
+    parts = _split_top_level_by_and(where_str)
     for part in parts:
         part = part.strip()
+        # begins_with(attr, val)
+        m = re.match(r'begins_with\s*\(\s*"?([A-Za-z0-9_.\-]+)"?\s*,\s*(.+)\s*\)\s*$', part, re.IGNORECASE)
+        if m:
+            attr = m.group(1)
+            val = _parse_partiql_literal(m.group(2).strip(), parameters, param_idx)
+            conditions.append((attr, "begins_with", val))
+            continue
+        # NOT begins_with(attr, val)
+        m = re.match(r'NOT\s+begins_with\s*\(\s*"?([A-Za-z0-9_.\-]+)"?\s*,\s*(.+)\s*\)\s*$', part, re.IGNORECASE)
+        if m:
+            attr = m.group(1)
+            val = _parse_partiql_literal(m.group(2).strip(), parameters, param_idx)
+            conditions.append((attr, "not_begins_with", val))
+            continue
+        # attr IS MISSING
+        m = re.match(r'"?([A-Za-z0-9_.\-]+)"?\s+IS\s+MISSING\s*$', part, re.IGNORECASE)
+        if m:
+            conditions.append((m.group(1), "is_missing", None))
+            continue
+        # attr IS NOT MISSING
+        m = re.match(r'"?([A-Za-z0-9_.\-]+)"?\s+IS\s+NOT\s+MISSING\s*$', part, re.IGNORECASE)
+        if m:
+            conditions.append((m.group(1), "is_not_missing", None))
+            continue
+        # attr IN ('v1', 'v2', ...)
+        m = re.match(r'"?([A-Za-z0-9_.\-]+)"?\s+IN\s*\[(.+)\]\s*$', part, re.IGNORECASE)
+        if not m:
+            m = re.match(r'"?([A-Za-z0-9_.\-]+)"?\s+IN\s*\((.+)\)\s*$', part, re.IGNORECASE)
+        if m:
+            attr = m.group(1)
+            vals = [_parse_partiql_literal(v.strip(), parameters, param_idx)
+                    for v in _split_top_level(m.group(2), ',')]
+            conditions.append((attr, "IN", vals))
+            continue
+        # Standard comparison
         m = re.match(r'"?([A-Za-z0-9_.\-]+)"?\s*(=|<>|!=|<=|>=|<|>)\s*(.+)$', part)
         if not m:
             raise ValueError(f"Could not parse WHERE condition: {part}")
@@ -2763,6 +3009,52 @@ def _parse_partiql_conditions(where_str, parameters, param_idx):
         val = _parse_partiql_literal(val_str, parameters, param_idx)
         conditions.append((attr, op, val))
     return conditions
+
+
+def _split_top_level_by_and(s):
+    """Split a WHERE string on AND at the top level (respecting parens/quotes)."""
+    import re
+    # Use the existing _split_top_level approach but with AND as delimiter
+    parts = []
+    depth = 0
+    in_str = None
+    current = []
+    i = 0
+    s_up = s.upper()
+    while i < len(s):
+        ch = s[i]
+        if in_str:
+            current.append(ch)
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            in_str = ch
+            current.append(ch)
+            i += 1
+            continue
+        if ch in ('(', '[', '{'):
+            depth += 1
+            current.append(ch)
+            i += 1
+            continue
+        if ch in (')', ']', '}'):
+            depth -= 1
+            current.append(ch)
+            i += 1
+            continue
+        # Check for AND keyword at depth 0
+        if depth == 0 and s_up[i:i+4] == ' AND' and (i + 4 >= len(s) or s[i+4] == ' '):
+            parts.append("".join(current))
+            current = []
+            i += 4  # skip " AND"
+            continue
+        current.append(ch)
+        i += 1
+    if current:
+        parts.append("".join(current))
+    return [p.strip() for p in parts if p.strip()]
 
 
 def _parse_partiql_literal(val_str, parameters, param_idx=None):
@@ -2799,6 +3091,15 @@ def _parse_partiql_literal(val_str, parameters, param_idx=None):
         return {"N": val_str}
     except (InvalidOperation, ValueError):
         pass
+
+    # Arithmetic expression: attr +/- number (e.g. "n + 1")
+    arith_m = re.match(r'^"?([A-Za-z0-9_.\-]+)"?\s*([+\-])\s*(.+)$', val_str)
+    if arith_m:
+        left_attr = arith_m.group(1)
+        operator = arith_m.group(2)
+        right_str = arith_m.group(3).strip()
+        right_val = _parse_partiql_literal(right_str, parameters, param_idx)
+        return {"__partiql_arith": {"attr": left_attr, "op": operator, "val": right_val}}
 
     raise ValueError(f"Cannot parse PartiQL value: {val_str}")
 
@@ -5746,7 +6047,8 @@ def _parse_projection_path(path: str, attr_names: dict) -> list:
 def _project_one(node, path_parts):
     """Walk `path_parts` into a DynamoDB AttributeValue `node` and return a
     pruned copy that contains only the path, or None if the path doesn't
-    exist."""
+    exist. For list indices, returns a sparse dict-based representation
+    so that _merge_projection can identify and merge same-index paths."""
     if not path_parts:
         return node
     if not isinstance(node, dict) or len(node) != 1:
@@ -5769,14 +6071,20 @@ def _project_one(node, path_parts):
         sub = _project_one(vval[key], rest)
         if sub is None:
             return None
-        return {"L": [sub]}
+        # Represent as a sparse list with the element at position `key`.
+        # This allows _merge_projection to correctly merge same-index paths.
+        sparse = [None] * (key + 1)
+        sparse[key] = sub
+        return {"L": sparse}
     return None
 
 
 def _merge_projection(into: dict | None, add: dict | None) -> dict | None:
     """Merge two projection-result AttributeValues at the same level.
     Both must share the same wrapping type (M or L); merging M unions keys,
-    merging L unions indices (kept in original order)."""
+    merging L merges elements that share the same index (AWS behaviour: two
+    paths referencing sub-attributes of the same list index produce one element,
+    not two separate single-element lists)."""
     if into is None:
         return add
     if add is None:
@@ -5795,9 +6103,25 @@ def _merge_projection(into: dict | None, add: dict | None) -> dict | None:
             merged[k] = _merge_projection(merged.get(k), v) if k in merged else v
         return {"M": merged}
     if it_t == "L" and isinstance(it_v, list) and isinstance(ad_v, list):
-        # When two paths reference the same list, AWS preserves the union of
-        # indices in original order.
-        return {"L": it_v + [x for x in ad_v if x not in it_v]}
+        # AWS merges sub-attributes of the same list index into one element.
+        # We reconstruct a merged list: for each index present in either side,
+        # deep-merge the elements if both sides provide it, otherwise take
+        # whichever side has it.
+        # Represent each list as a dict[index -> value] for merging.
+        def _to_indexed(lst):
+            return {i: v for i, v in enumerate(lst)}
+        into_idx = _to_indexed(it_v)
+        add_idx = _to_indexed(ad_v)
+        all_indices = sorted(set(into_idx) | set(add_idx))
+        merged_list = []
+        for idx in all_indices:
+            if idx in into_idx and idx in add_idx:
+                merged_list.append(_merge_projection(into_idx[idx], add_idx[idx]))
+            elif idx in into_idx:
+                merged_list.append(into_idx[idx])
+            else:
+                merged_list.append(add_idx[idx])
+        return {"L": merged_list}
     return into
 
 
@@ -5812,9 +6136,50 @@ def _project_item(item, proj_expr, attr_names):
         head = path.split(".")[0].split("[")[0].strip()
         if head and not head.startswith("#") and head.upper() in AWS_KEYWORDS:
             raise ValueError(f"Invalid ProjectionExpression: Attribute name is a reserved keyword; reserved keyword: {head}")
-    result: dict = {}
+
+    # Resolve all paths to their canonical (alias-substituted) string forms
+    # and check for duplicates or parent/child overlaps — AWS rejects these.
+    resolved_paths = []
     for path in paths:
         parts = _parse_projection_path(path, attr_names or {})
+        resolved_paths.append(parts)
+
+    def _path_str(parts):
+        s = ""
+        for kind, key in parts:
+            if kind == "name":
+                s += ("." if s else "") + key
+            else:
+                s += f"[{key}]"
+        return s
+
+    canonical = [_path_str(p) for p in resolved_paths]
+    # Check for duplicates and parent/child overlaps.
+    for i, p1 in enumerate(canonical):
+        for j, p2 in enumerate(canonical):
+            if i >= j:
+                continue
+            if p1 == p2:
+                raise ValueError(
+                    f"Invalid ProjectionExpression: Two document paths overlap with each other; "
+                    f"must remove or rewrite one of these paths; path one: [{p1}], path two: [{p2}]"
+                )
+            # Check parent/child: p1 is ancestor of p2 if p2 starts with p1 followed by . or [
+            p1_prefix_dot = p1 + "."
+            p1_prefix_bracket = p1 + "["
+            if p2.startswith(p1_prefix_dot) or p2.startswith(p1_prefix_bracket):
+                raise ValueError(
+                    f"Invalid ProjectionExpression: Two document paths overlap with each other; "
+                    f"must remove or rewrite one of these paths; path one: [{p1}], path two: [{p2}]"
+                )
+            if p1.startswith(p2 + ".") or p1.startswith(p2 + "["):
+                raise ValueError(
+                    f"Invalid ProjectionExpression: Two document paths overlap with each other; "
+                    f"must remove or rewrite one of these paths; path one: [{p2}], path two: [{p1}]"
+                )
+
+    result: dict = {}
+    for parts in resolved_paths:
         if not parts:
             continue
         root_kind, root_name = parts[0]
@@ -5829,7 +6194,23 @@ def _project_item(item, proj_expr, attr_names):
             result[root_name] = _merge_projection(result[root_name], sub)
         else:
             result[root_name] = sub
-    return result
+    # Compact sparse lists: remove None placeholders and collapse to dense lists.
+    return _compact_projection(result)
+
+
+def _compact_projection(value):
+    """Recursively compact projection results: remove None placeholders from
+    sparse L lists, preserving order of non-None elements."""
+    if not isinstance(value, dict):
+        return value
+    if len(value) == 1:
+        (vtype, vval), = value.items()
+        if vtype == "L" and isinstance(vval, list):
+            compacted = [_compact_projection(x) for x in vval if x is not None]
+            return {"L": compacted}
+        if vtype == "M" and isinstance(vval, dict):
+            return {"M": {k: _compact_projection(v) for k, v in vval.items()}}
+    return value
 
 
 # ---------------------------------------------------------------------------

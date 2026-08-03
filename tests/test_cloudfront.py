@@ -1257,3 +1257,136 @@ def test_kvs_dataplane_list_keys_pagination(cloudfront, cloudfront_kvs):
 
     all_keys = [item["Key"] for item in resp["Items"] + resp2["Items"]]
     assert len(set(all_keys)) == 4
+
+
+# ---------------------------------------------------------------------------
+# Cache policies (aws_cloudfront_cache_policy) — #1249
+# ---------------------------------------------------------------------------
+
+
+def _cache_policy_config(name):
+    return {
+        "Name": name,
+        "Comment": "test cache policy",
+        "DefaultTTL": 3600,
+        "MaxTTL": 86400,
+        "MinTTL": 1,
+        "ParametersInCacheKeyAndForwardedToOrigin": {
+            "EnableAcceptEncodingGzip": True,
+            "EnableAcceptEncodingBrotli": True,
+            "HeadersConfig": {
+                "HeaderBehavior": "whitelist",
+                "Headers": {"Quantity": 1, "Items": ["Authorization"]},
+            },
+            "CookiesConfig": {"CookieBehavior": "none"},
+            "QueryStringsConfig": {
+                "QueryStringBehavior": "whitelist",
+                "QueryStrings": {"Quantity": 2, "Items": ["a", "b"]},
+            },
+        },
+    }
+
+
+def test_cloudfront_create_and_get_cache_policy(cloudfront):
+    name = f"cp-{_uuid_mod.uuid4().hex[:8]}"
+    create = cloudfront.create_cache_policy(CachePolicyConfig=_cache_policy_config(name))
+    assert create["ETag"]
+    policy = create["CachePolicy"]
+    pid = policy["Id"]
+    assert policy["Id"]
+    assert "LastModifiedTime" in policy
+
+    got = cloudfront.get_cache_policy(Id=pid)
+    cfg = got["CachePolicy"]["CachePolicyConfig"]
+    assert got["ETag"] == create["ETag"]
+    assert cfg["Name"] == name
+    assert cfg["MinTTL"] == 1
+    assert cfg["DefaultTTL"] == 3600
+    assert cfg["MaxTTL"] == 86400
+    params = cfg["ParametersInCacheKeyAndForwardedToOrigin"]
+    assert params["EnableAcceptEncodingGzip"] is True
+    assert params["EnableAcceptEncodingBrotli"] is True
+    assert params["HeadersConfig"]["HeaderBehavior"] == "whitelist"
+    assert params["HeadersConfig"]["Headers"]["Items"] == ["Authorization"]
+    assert params["CookiesConfig"]["CookieBehavior"] == "none"
+    assert params["QueryStringsConfig"]["QueryStringBehavior"] == "whitelist"
+    assert params["QueryStringsConfig"]["QueryStrings"]["Items"] == ["a", "b"]
+
+    cloudfront.delete_cache_policy(Id=pid, IfMatch=got["ETag"])
+
+
+def test_cloudfront_get_cache_policy_config(cloudfront):
+    name = f"cp-{_uuid_mod.uuid4().hex[:8]}"
+    create = cloudfront.create_cache_policy(CachePolicyConfig=_cache_policy_config(name))
+    pid = create["CachePolicy"]["Id"]
+    resp = cloudfront.get_cache_policy_config(Id=pid)
+    assert resp["ETag"] == create["ETag"]
+    assert resp["CachePolicyConfig"]["Name"] == name
+    assert resp["CachePolicyConfig"]["MinTTL"] == 1
+    cloudfront.delete_cache_policy(Id=pid, IfMatch=create["ETag"])
+
+
+def test_cloudfront_update_cache_policy(cloudfront):
+    name = f"cp-{_uuid_mod.uuid4().hex[:8]}"
+    create = cloudfront.create_cache_policy(CachePolicyConfig=_cache_policy_config(name))
+    pid = create["CachePolicy"]["Id"]
+
+    # No If-Match -> InvalidIfMatchVersion.
+    updated_cfg = _cache_policy_config(name)
+    updated_cfg["MinTTL"] = 5
+    with pytest.raises(ClientError) as exc:
+        cloudfront.update_cache_policy(CachePolicyConfig=updated_cfg, Id=pid)
+    assert exc.value.response["Error"]["Code"] == "InvalidIfMatchVersion"
+
+    # Stale If-Match -> PreconditionFailed.
+    with pytest.raises(ClientError) as exc:
+        cloudfront.update_cache_policy(CachePolicyConfig=updated_cfg, Id=pid, IfMatch="stale-etag")
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+
+    upd = cloudfront.update_cache_policy(CachePolicyConfig=updated_cfg, Id=pid, IfMatch=create["ETag"])
+    assert upd["ETag"] != create["ETag"]
+    assert upd["CachePolicy"]["CachePolicyConfig"]["MinTTL"] == 5
+    cloudfront.delete_cache_policy(Id=pid, IfMatch=upd["ETag"])
+
+
+def test_cloudfront_delete_cache_policy(cloudfront):
+    name = f"cp-{_uuid_mod.uuid4().hex[:8]}"
+    create = cloudfront.create_cache_policy(CachePolicyConfig=_cache_policy_config(name))
+    pid = create["CachePolicy"]["Id"]
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.delete_cache_policy(Id=pid)
+    assert exc.value.response["Error"]["Code"] == "InvalidIfMatchVersion"
+
+    cloudfront.delete_cache_policy(Id=pid, IfMatch=create["ETag"])
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_cache_policy(Id=pid)
+    assert exc.value.response["Error"]["Code"] == "NoSuchCachePolicy"
+
+
+def test_cloudfront_cache_policy_duplicate_name_rejected(cloudfront):
+    name = f"cp-{_uuid_mod.uuid4().hex[:8]}"
+    create = cloudfront.create_cache_policy(CachePolicyConfig=_cache_policy_config(name))
+    pid = create["CachePolicy"]["Id"]
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_cache_policy(CachePolicyConfig=_cache_policy_config(name))
+    assert exc.value.response["Error"]["Code"] == "CachePolicyAlreadyExists"
+    cloudfront.delete_cache_policy(Id=pid, IfMatch=create["ETag"])
+
+
+def test_cloudfront_get_missing_cache_policy(cloudfront):
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_cache_policy(Id="no-such-cache-policy")
+    assert exc.value.response["Error"]["Code"] == "NoSuchCachePolicy"
+
+
+def test_cloudfront_list_distributions_by_cache_policy(cloudfront):
+    name = f"cp-{_uuid_mod.uuid4().hex[:8]}"
+    create = cloudfront.create_cache_policy(CachePolicyConfig=_cache_policy_config(name))
+    pid = create["CachePolicy"]["Id"]
+    resp = cloudfront.list_distributions_by_cache_policy_id(CachePolicyId=pid)
+    dil = resp["DistributionIdList"]
+    assert dil["Quantity"] == 0
+    assert dil["IsTruncated"] is False
+    assert dil.get("Items", []) == []
+    cloudfront.delete_cache_policy(Id=pid, IfMatch=create["ETag"])

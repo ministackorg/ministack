@@ -8,6 +8,7 @@ Supports: RequestCertificate, DescribeCertificate, ListCertificates,
 """
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -178,14 +179,23 @@ def _certificate_not_found(arn):
 
 
 def _validation_options(domain, method):
+    # A wildcard SAN validates through the same DNS record as its base domain:
+    # real ACM strips the leading "*." so "*.example.com" and "example.com"
+    # both resolve to a single _acme-challenge.example.com CNAME whose name AND
+    # value are identical. Terraform's aws_route53_record for_each keyed by
+    # domain_validation_options then collapses the two onto one record, and
+    # aws_acm_certificate_validation finds the FQDN it created (#1250). The
+    # value is derived from the base domain so the wildcard/apex pair match.
+    base = domain[2:] if domain.startswith("*.") else domain
+    digest = hashlib.sha256(base.encode("utf-8")).hexdigest()[:8]
     return {
         "DomainName": domain,
         "ValidationMethod": method,
         "ValidationStatus": "SUCCESS",
         "ResourceRecord": {
-            "Name": f"_acme-challenge.{domain}.",
+            "Name": f"_acme-challenge.{base}.",
             "Type": "CNAME",
-            "Value": f"fake-validation-{new_uuid()[:8]}.acm.amazonaws.com.",
+            "Value": f"fake-validation-{digest}.acm.amazonaws.com.",
         },
     }
 
