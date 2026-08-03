@@ -6471,6 +6471,61 @@ def test_sfn_map_item_selector_context_path_resolves_array_index(sfn):
         sfn.delete_state_machine(stateMachineArn=sm)
 
 
+def test_sfn_map_parameters_is_the_item_selector(sfn):
+    """A Map's `Parameters` is the legacy `ItemSelector`, applied per item and nothing else.
+
+    Applying it to the state input as well resolved $$.Map.Item.Value before any item existed and
+    left ItemsPath resolving against the item template, so a three-item plan ran once with every
+    field null -- and reported SUCCEEDED, which is how it reaches the next state as an empty id.
+    """
+    uid = _uuid_mod.uuid4().hex[:8]
+    template = {
+        "az_name.$": "$$.Map.Item.Value.az_name",
+        "cidr.$": "$$.Map.Item.Value.cidr",
+        "org_id.$": "$.org_id",              # a state-input path, gone once Parameters is applied
+        "vpc_id.$": "$.vpc.vpc_id",          # nested, so a flattened input cannot satisfy it
+    }
+    state_input = {
+        "org_id": "org-1",
+        "vpc": {"vpc_id": "vpc-123"},
+        "subnet_plan": [{"az_name": "eu-central-1a", "cidr": "10.0.1.0/24"},
+                        {"az_name": "eu-central-1b", "cidr": "10.0.2.0/24"},
+                        {"az_name": "eu-central-1c", "cidr": "10.0.3.0/24"}],
+    }
+    expected = [{"az_name": item["az_name"], "cidr": item["cidr"],
+                 "org_id": "org-1", "vpc_id": "vpc-123"}
+                for item in state_input["subnet_plan"]]
+
+    def run(selector_field):
+        sm = sfn.create_state_machine(
+            name=f"map-{selector_field.lower()}-{uid}",
+            definition=json.dumps({
+                "StartAt": "Fan",
+                "States": {"Fan": {
+                    "Type": "Map",
+                    "ItemsPath": "$.subnet_plan",
+                    selector_field: template,
+                    "Iterator": {"StartAt": "Echo",
+                                 "States": {"Echo": {"Type": "Pass", "End": True}}},
+                    "End": True,
+                }},
+            }),
+            roleArn="arn:aws:iam::000000000000:role/r",
+        )["stateMachineArn"]
+        try:
+            execution = sfn.start_execution(stateMachineArn=sm, name=f"e-{selector_field}-{uid}",
+                                            input=json.dumps(state_input))
+            desc = _wait_sfn(sfn, execution["executionArn"], timeout=10)
+            assert desc["status"] == "SUCCEEDED", f"{selector_field}: {desc.get('cause')}"
+            return json.loads(desc["output"])
+        finally:
+            sfn.delete_state_machine(stateMachineArn=sm)
+
+    # Both spellings are the same field, so they cannot diverge.
+    assert run("Parameters") == expected
+    assert run("ItemSelector") == expected
+
+
 # ---------------------------------------------------------------------------
 # JSONata variable assignment (`Assign` field + `$variable` refs) — issue #645
 # ---------------------------------------------------------------------------
