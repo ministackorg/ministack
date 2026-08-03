@@ -13,9 +13,11 @@ Python worker. No Docker or running Ministack instance is required.
 
 import io
 import json
+import time
 import zipfile
 from unittest.mock import MagicMock, mock_open, patch
 
+from ministack.core import lambda_runtime
 from ministack.core.lambda_runtime import Worker
 
 # ---------------------------------------------------------------------------
@@ -290,3 +292,104 @@ def test_invoke_gives_up_after_max_lines():
 
     assert result["status"] == "error"
     assert "No JSON response" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# Warm pool bounds: idle release and LRU ceiling
+# ---------------------------------------------------------------------------
+
+
+def _warm_worker(name="test-fn", last_used=None):
+    """Pooled worker with a live process mock, as after a cold start."""
+    worker = Worker(name, _config(), b"ignored-zip")
+    proc = MagicMock()
+    proc.poll.return_value = None
+    proc.stderr = iter([])
+    worker._proc = proc
+    worker._cold = False
+    if last_used is not None:
+        worker.last_used = last_used
+    return worker, proc
+
+
+def test_release_if_idle_reclaims_subprocess_but_keeps_worker_poolable():
+    worker, proc = _warm_worker()
+
+    assert worker.is_warm
+    assert worker.release_if_idle() is True
+
+    proc.terminate.assert_called_once_with()
+    assert worker._proc is None, "released worker must drop its process handle"
+    assert not worker.is_warm
+    assert worker.release_if_idle() is False, "second pass has nothing to reclaim"
+
+
+def test_release_if_idle_skips_worker_with_invocation_in_flight():
+    worker, proc = _warm_worker()
+    worker._lock.acquire()
+    try:
+        assert worker.release_if_idle() is False
+        proc.terminate.assert_not_called()
+        assert worker.is_warm
+    finally:
+        worker._lock.release()
+
+
+def test_invoke_refreshes_last_used():
+    worker, _proc = _mock_worker([_protocol_line("ok", result={})])
+    worker.last_used = time.time() - 3600
+
+    worker.invoke({}, request_id="req-idle")
+
+    assert time.time() - worker.last_used < 5, "invoke() must refresh idle age"
+
+
+def test_release_idle_workers_only_reaps_past_the_ttl():
+    fresh, fresh_proc = _warm_worker("fresh")
+    stale, stale_proc = _warm_worker("stale", last_used=time.time() - 10_000)
+
+    with patch.dict(
+        lambda_runtime._workers, {"a:fresh": fresh, "a:stale": stale}, clear=True
+    ):
+        assert lambda_runtime.release_idle_workers() == 1
+
+    stale_proc.terminate.assert_called_once_with()
+    fresh_proc.terminate.assert_not_called()
+    assert fresh.is_warm
+
+
+def test_warm_cap_releases_least_recently_used():
+    now = time.time()
+    oldest, oldest_proc = _warm_worker("oldest", last_used=now - 300)
+    middle, middle_proc = _warm_worker("middle", last_used=now - 200)
+    newest, newest_proc = _warm_worker("newest", last_used=now - 100)
+    spawning, spawning_proc = _warm_worker("spawning", last_used=now)
+
+    pool = {
+        "a:oldest": oldest, "a:middle": middle,
+        "a:newest": newest, "a:spawning": spawning,
+    }
+    # Cap 2, one slot taken by `spawning` — the two oldest must go.
+    with (
+        patch.dict(lambda_runtime._workers, pool, clear=True),
+        patch.object(lambda_runtime, "_MAX_WARM_WORKERS", 2),
+    ):
+        assert lambda_runtime._enforce_warm_cap(exclude=spawning) == 2
+
+    oldest_proc.terminate.assert_called_once_with()
+    middle_proc.terminate.assert_called_once_with()
+    newest_proc.terminate.assert_not_called()
+    spawning_proc.terminate.assert_not_called()
+    assert newest.is_warm and spawning.is_warm
+
+
+def test_warm_cap_disabled_by_zero():
+    worker, proc = _warm_worker("only", last_used=time.time() - 300)
+
+    with (
+        patch.dict(lambda_runtime._workers, {"a:only": worker}, clear=True),
+        patch.object(lambda_runtime, "_MAX_WARM_WORKERS", 0),
+    ):
+        assert lambda_runtime._enforce_warm_cap() == 0
+
+    proc.terminate.assert_not_called()
