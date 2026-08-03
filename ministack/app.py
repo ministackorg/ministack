@@ -39,6 +39,11 @@ if _VERSION == "dev":
 _EXECUTE_API_RE = re.compile(
     r"^([a-f0-9]{8})\.execute-api\." + re.escape(_MINISTACK_HOST) + r"(?::\d+)?$"
 )
+# Lambda Function URL: {urlId}.lambda-url.{region}.<anything>[:port]. The stored
+# FunctionUrl carries AWS's own `.on.aws` suffix, so we match any suffix rather
+# than only _MINISTACK_HOST — pointing a proxy or an /etc/hosts entry at the
+# AWS-shaped hostname is the whole point of addressing a function this way.
+_LAMBDA_URL_RE = re.compile(r"^([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})\.lambda-url\.[a-z0-9-]+\.")
 # AppSync Events realtime WebSocket: {apiId}.appsync-realtime-api.<anything>[:port].
 _APPSYNC_REALTIME_RE = re.compile(r"^([a-z0-9]+)\.appsync-realtime-api\.")
 # IoT data plane WebSocket: anything containing ".iot." in the host header.
@@ -136,7 +141,9 @@ def _extract_s3_vhost_bucket(host: str):
     if first_tail_segment == "s3" or first_tail_segment.startswith(("s3-", "s3express-")):
         return candidate
     return None
-_S3_VHOST_EXCLUDE_RE = re.compile(r"\.(execute-api|alb|emr|efs|elasticache|s3-control|appsync-api|appsync-realtime-api|iot)\.")
+_S3_VHOST_EXCLUDE_RE = re.compile(
+    r"\.(execute-api|lambda-url|alb|emr|efs|elasticache|s3-control|appsync-api|appsync-realtime-api|iot)\."
+)
 _HEALTH_PATHS = ("/_ministack/health", "/_localstack/health", "/health")
 _BODY_METHODS = ("POST", "PUT", "PATCH")
 _COGNITO_USERINFO_PATHS = ("/oauth2/userInfo", "/oauth2/userinfo")
@@ -865,12 +872,12 @@ async def _handle_sqs_messages_request(method: str, path: str, headers: dict, qu
 async def _handle_pre_body_request(method: str, path: str, headers: dict, query_params: dict, request_id: str):
     """Handle fast-path routes that do not require request body parsing."""
     # OPTIONS on an execute-api host / path MUST flow through apigateway.handle_execute
-    # so the API's own corsConfiguration is applied (#406). Skip the generic wildcard
-    # preflight in that case.
+    # so the API's own corsConfiguration is applied (#406). A Function URL owns its
+    # CORS config the same way. Skip the generic wildcard preflight in both cases.
     host = headers.get("host", "")
-    is_execute_api = _parse_execute_api_url(host, path) is not None
+    owns_cors = _parse_execute_api_url(host, path) is not None or _parse_lambda_url(host, path) is not None
     for response in (
-        None if is_execute_api else _handle_options_request(method, request_id),
+        None if owns_cors else _handle_options_request(method, request_id),
         _handle_health_request(path, request_id),
         _handle_ready_request(path, request_id),
         _handle_unknown_localstack_request(path, request_id),
@@ -1310,6 +1317,46 @@ def _is_potential_alb_request(host: str, path: str) -> bool:
     )
 
 
+def _parse_lambda_url(host: str, path: str) -> tuple[str, str] | None:
+    """Resolve a Function URL request into ``(url_id, function_path)``.
+
+    Two addressing modes, mirroring execute-api:
+      1. Host-based (AWS-native): ``{urlId}.lambda-url.{region}.<host>[:port]/{path}``
+      2. Path-based:              ``<host>[:port]/_aws/lambda-url/{urlId}/{path}``
+
+    The path-based form exists for the same reason as its execute-api
+    counterpart: browsers on macOS don't resolve ``*.localhost``, and many HTTP
+    clients can't override the ``Host`` header.
+    """
+    m = _LAMBDA_URL_RE.match(host)
+    if m:
+        return m.group(1), path or "/"
+
+    if path.startswith("/_aws/lambda-url/"):
+        rest = path[len("/_aws/lambda-url/") :]
+        url_id, _, remainder = rest.partition("/")
+        if url_id:
+            return url_id, "/" + remainder
+    return None
+
+
+async def _handle_lambda_url_request(
+    host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict
+):
+    """Handle Lambda Function URL data plane requests (Host-based + path-based)."""
+    parsed = _parse_lambda_url(host, path)
+    if parsed is None:
+        return None
+    url_id, function_path = parsed
+    try:
+        return await _get_module("lambda_svc").handle_function_url_request(
+            url_id, method, function_path, headers, body, query_params
+        )
+    except Exception as e:
+        logger.exception("Error in Lambda Function URL dispatch: %s", e)
+        return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
+
+
 async def _handle_alb_request(host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict):
     """Handle ALB data-plane requests for host-based and /_alb-prefixed addressing."""
     if not _is_potential_alb_request(host, path):
@@ -1432,6 +1479,8 @@ async def _handle_special_data_plane_request(
 
     host = headers.get("host", "")
     if response := await _handle_execute_api_request(host, path, method, headers, body, query_params):
+        return _with_data_plane_headers(response, request_id, wildcard_cors=False)
+    if response := await _handle_lambda_url_request(host, path, method, headers, body, query_params):
         return _with_data_plane_headers(response, request_id, wildcard_cors=False)
     if response := await _handle_s3_vhost_request(host, path, method, headers, body, query_params):
         return _with_data_plane_headers(response, request_id, include_s3_id=True)

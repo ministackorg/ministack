@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Lambda — Function URL data plane** — `CreateFunctionUrlConfig` returned a `{urlId}.lambda-url.{region}.on.aws` URL that nothing served: a request addressed to it matched no route, fell through to S3 virtual-host addressing, and came back as `NoSuchBucket`. Function URLs are now invocable. A request reaching the gateway on a `{urlId}.lambda-url.{region}.*` host — or on the path-based `/_aws/lambda-url/{urlId}/...` form, for clients that can't set `Host` and browsers that won't resolve `*.localhost` — resolves the URL id to its function and invokes it with a payload-format-2.0 event carrying `$default` for `routeKey` and `stage`, `rawPath`/`rawQueryString` percent-encoded as AWS sends them, and `body`/`queryStringParameters` omitted rather than null. `AuthType` is enforced (`AWS_IAM` returns `403 Forbidden` to an unsigned request, header-signed and presigned both pass; `NONE` is open), the `Cors` config drives preflight and response headers with a non-allowed origin getting none, and `InvokeMode: RESPONSE_STREAM` responses are unwrapped from the `HttpResponseStream` framing so the prelude supplies the status and headers instead of leaking into the body. Cookies returned via the format-2.0 `cookies` array become `Set-Cookie` headers. Contributed by @liammizrahi.
+
 ## [1.4.10] — 2026-08-03
 
 ### Added

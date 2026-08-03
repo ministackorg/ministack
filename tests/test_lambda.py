@@ -4,6 +4,8 @@ import io
 import json
 import os
 import time
+import urllib.error as _urlerr
+import urllib.request as _urlreq
 import uuid as _uuid_mod
 import zipfile
 from unittest.mock import patch
@@ -8475,3 +8477,275 @@ def test_invoke_rie_rewrites_custom_resource_response_url():
         "http://host.docker.internal:4566/_ministack/cfn-response/tok"
     # The caller's event dict must not be mutated in place.
     assert event["ResponseURL"] == "http://localhost:4566/_ministack/cfn-response/tok"
+
+
+# ---------------------------------------------------------------------------
+# Function URL data plane
+# ---------------------------------------------------------------------------
+
+_FUNCTION_URL_ECHO_JS = """
+exports.handler = async (event) => ({
+  statusCode: 200,
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({
+    version: event.version,
+    routeKey: event.routeKey,
+    rawPath: event.rawPath,
+    rawQueryString: event.rawQueryString,
+    method: event.requestContext.http.method,
+    stage: event.requestContext.stage,
+    domainName: event.requestContext.domainName,
+    body: event.body ?? null,
+    hasQueryStringParameters: "queryStringParameters" in event,
+  }),
+});
+"""
+
+_FUNCTION_URL_STREAM_JS = """
+exports.handler = awslambda.streamifyResponse(async (event, responseStream) => {
+  const stream = awslambda.HttpResponseStream.from(responseStream, {
+    statusCode: 201,
+    headers: { "content-type": "text/event-stream", "x-from-prelude": "yes" },
+  });
+  stream.write("data: one\\n\\n");
+  stream.write("data: two\\n\\n");
+  stream.end();
+});
+"""
+
+
+def _function_url_id(function_url: str) -> str:
+    """Return the URL id (first host label) of a ``FunctionUrl``."""
+    return function_url.split("://", 1)[-1].split(".", 1)[0]
+
+
+def _function_url_request(url_id: str, path="/", method="GET", data=None, headers=None):
+    """Call a Function URL through the AWS-shaped host, returning the raw response."""
+    host = f"{url_id}.lambda-url.us-east-1.localhost:{_EXECUTE_PORT}"
+    req = _urlreq.Request(f"{_endpoint}{path}", method=method, data=data)
+    req.add_header("Host", host)
+    for name, value in (headers or {}).items():
+        req.add_header(name, value)
+    return req
+
+
+def test_lambda_function_url_data_plane_invokes_with_payload_format_2(lam):
+    with _nodejs_lambda(lam, _FUNCTION_URL_ECHO_JS, prefix="fu-echo") as fname:
+        created = lam.create_function_url_config(FunctionName=fname, AuthType="NONE")
+        url_id = _function_url_id(created["FunctionUrl"])
+        try:
+            req = _function_url_request(url_id, path="/orders/42?q=a%20b")
+            with _urlreq.urlopen(req) as resp:
+                assert resp.status == 200
+                payload = json.loads(resp.read())
+
+            assert payload["version"] == "2.0"
+            # Function URLs always report the $default route and stage.
+            assert payload["routeKey"] == "$default"
+            assert payload["stage"] == "$default"
+            assert payload["rawPath"] == "/orders/42"
+            assert payload["rawQueryString"] == "q=a%20b"
+            assert payload["method"] == "GET"
+            assert payload["domainName"].startswith(f"{url_id}.lambda-url.")
+            # A bodyless request omits `body` rather than sending null.
+            assert payload["body"] is None
+        finally:
+            lam.delete_function_url_config(FunctionName=fname)
+
+
+def test_lambda_function_url_data_plane_omits_query_string_parameters_when_absent(lam):
+    with _nodejs_lambda(lam, _FUNCTION_URL_ECHO_JS, prefix="fu-noqs") as fname:
+        created = lam.create_function_url_config(FunctionName=fname, AuthType="NONE")
+        url_id = _function_url_id(created["FunctionUrl"])
+        try:
+            with _urlreq.urlopen(_function_url_request(url_id)) as resp:
+                payload = json.loads(resp.read())
+            assert payload["hasQueryStringParameters"] is False
+        finally:
+            lam.delete_function_url_config(FunctionName=fname)
+
+
+def test_lambda_function_url_data_plane_forwards_request_body(lam):
+    with _nodejs_lambda(lam, _FUNCTION_URL_ECHO_JS, prefix="fu-post") as fname:
+        created = lam.create_function_url_config(FunctionName=fname, AuthType="NONE")
+        url_id = _function_url_id(created["FunctionUrl"])
+        try:
+            req = _function_url_request(
+                url_id,
+                path="/submit",
+                method="POST",
+                data=b'{"hello":"world"}',
+                headers={"Content-Type": "application/json"},
+            )
+            with _urlreq.urlopen(req) as resp:
+                payload = json.loads(resp.read())
+            assert payload["method"] == "POST"
+            assert payload["body"] == '{"hello":"world"}'
+        finally:
+            lam.delete_function_url_config(FunctionName=fname)
+
+
+def test_lambda_function_url_data_plane_path_based_addressing(lam):
+    """`/_aws/lambda-url/{urlId}/...` works where `*.localhost` won't resolve."""
+    with _nodejs_lambda(lam, _FUNCTION_URL_ECHO_JS, prefix="fu-path") as fname:
+        created = lam.create_function_url_config(FunctionName=fname, AuthType="NONE")
+        url_id = _function_url_id(created["FunctionUrl"])
+        try:
+            req = _urlreq.Request(f"{_endpoint}/_aws/lambda-url/{url_id}/orders/42", method="GET")
+            with _urlreq.urlopen(req) as resp:
+                payload = json.loads(resp.read())
+            assert payload["rawPath"] == "/orders/42"
+        finally:
+            lam.delete_function_url_config(FunctionName=fname)
+
+
+def test_lambda_function_url_data_plane_unknown_url_id_returns_404(lam):
+    unknown = "00000000-0000-0000-0000-000000000000"
+    with pytest.raises(_urlerr.HTTPError) as exc:
+        _urlreq.urlopen(_function_url_request(unknown))
+    assert exc.value.code == 404
+
+
+def test_lambda_function_url_data_plane_aws_iam_rejects_unsigned(lam):
+    with _nodejs_lambda(lam, _FUNCTION_URL_ECHO_JS, prefix="fu-iam") as fname:
+        created = lam.create_function_url_config(FunctionName=fname, AuthType="AWS_IAM")
+        url_id = _function_url_id(created["FunctionUrl"])
+        try:
+            with pytest.raises(_urlerr.HTTPError) as exc:
+                _urlreq.urlopen(_function_url_request(url_id))
+            assert exc.value.code == 403
+
+            signed = _function_url_request(
+                url_id, headers={"Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/lambda/aws4_request"}
+            )
+            with _urlreq.urlopen(signed) as resp:
+                assert resp.status == 200
+        finally:
+            lam.delete_function_url_config(FunctionName=fname)
+
+
+def test_lambda_function_url_data_plane_applies_cors_config(lam):
+    cors = {
+        "AllowOrigins": ["https://app.example.com"],
+        "AllowMethods": ["GET", "POST"],
+        "AllowHeaders": ["content-type"],
+        "MaxAge": 600,
+    }
+    with _nodejs_lambda(lam, _FUNCTION_URL_ECHO_JS, prefix="fu-cors") as fname:
+        created = lam.create_function_url_config(FunctionName=fname, AuthType="NONE", Cors=cors)
+        url_id = _function_url_id(created["FunctionUrl"])
+        try:
+            preflight = _function_url_request(
+                url_id,
+                method="OPTIONS",
+                headers={"Origin": "https://app.example.com", "Access-Control-Request-Method": "POST"},
+            )
+            with _urlreq.urlopen(preflight) as resp:
+                assert resp.status == 200
+                assert resp.headers["Access-Control-Allow-Origin"] == "https://app.example.com"
+                assert resp.headers["Access-Control-Allow-Methods"] == "GET,POST"
+                assert resp.headers["Access-Control-Max-Age"] == "600"
+
+            # An origin outside AllowOrigins gets no CORS headers, as on AWS.
+            disallowed = _function_url_request(
+                url_id, method="OPTIONS", headers={"Origin": "https://evil.example.com"}
+            )
+            with _urlreq.urlopen(disallowed) as resp:
+                assert resp.headers.get("Access-Control-Allow-Origin") is None
+        finally:
+            lam.delete_function_url_config(FunctionName=fname)
+
+
+def test_lambda_function_url_response_stream_consumes_prelude_without_streamify(lam):
+    """The prelude framing is consumed whatever produced it.
+
+    Runs on every executor: the handler returns the framed payload directly
+    rather than going through `awslambda.streamifyResponse`, which only exists
+    in the real Lambda runtime.
+    """
+    prelude = '{"statusCode":201,"headers":{"content-type":"text/event-stream","x-from-prelude":"yes"}}'
+    code = (
+        "def handler(event, context):\n"
+        f"    return {prelude!r} + '\\x00' * 8 + 'data: one\\n\\ndata: two\\n\\n'\n"
+    )
+    fname = f"fu-framed-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+    try:
+        created = lam.create_function_url_config(
+            FunctionName=fname, AuthType="NONE", InvokeMode="RESPONSE_STREAM"
+        )
+        url_id = _function_url_id(created["FunctionUrl"])
+        try:
+            with _urlreq.urlopen(_function_url_request(url_id)) as resp:
+                assert resp.status == 201
+                assert resp.headers["content-type"] == "text/event-stream"
+                assert resp.headers["x-from-prelude"] == "yes"
+                body = resp.read()
+            assert body == b"data: one\n\ndata: two\n\n"
+            assert b"\x00" not in body
+            assert b"statusCode" not in body
+        finally:
+            lam.delete_function_url_config(FunctionName=fname)
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_lambda_function_url_response_stream_without_prelude_defaults_to_200(lam):
+    """A stream carrying no prelude is served whole, with a 200."""
+    code = "def handler(event, context):\n    return 'raw stream body'\n"
+    fname = f"fu-noprelude-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+    try:
+        created = lam.create_function_url_config(
+            FunctionName=fname, AuthType="NONE", InvokeMode="RESPONSE_STREAM"
+        )
+        url_id = _function_url_id(created["FunctionUrl"])
+        try:
+            with _urlreq.urlopen(_function_url_request(url_id)) as resp:
+                assert resp.status == 200
+                assert resp.read() == b"raw stream body"
+        finally:
+            lam.delete_function_url_config(FunctionName=fname)
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+@pytest.mark.skipif(
+    os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
+    reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
+)
+def test_lambda_function_url_response_stream_consumes_prelude(lam):
+    """RESPONSE_STREAM status/headers come from the prelude, and it never reaches the body.
+
+    `awslambda.streamifyResponse` is provided by the Lambda runtime interface
+    client, so this end-to-end variant needs the Docker executor.
+    """
+    with _nodejs_lambda(lam, _FUNCTION_URL_STREAM_JS, prefix="fu-stream", runtime="nodejs22.x") as fname:
+        created = lam.create_function_url_config(
+            FunctionName=fname, AuthType="NONE", InvokeMode="RESPONSE_STREAM"
+        )
+        url_id = _function_url_id(created["FunctionUrl"])
+        try:
+            with _urlreq.urlopen(_function_url_request(url_id)) as resp:
+                assert resp.status == 201
+                assert resp.headers["content-type"] == "text/event-stream"
+                assert resp.headers["x-from-prelude"] == "yes"
+                body = resp.read()
+            assert body == b"data: one\n\ndata: two\n\n"
+            # The eight-NUL separator and the JSON prelude must be consumed.
+            assert b"\x00" not in body
+            assert b"statusCode" not in body
+        finally:
+            lam.delete_function_url_config(FunctionName=fname)

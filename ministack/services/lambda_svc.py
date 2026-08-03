@@ -46,7 +46,7 @@ import urllib.request
 import zipfile
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.lambda_runtime import get_or_create_worker, invalidate_worker
@@ -6108,6 +6108,258 @@ def _delete_function_url_config(func_name: str, qualifier: str | None):
 def _list_function_url_configs(func_name: str, query_params: dict):
     configs = [v for k, v in _function_urls.items() if k == func_name or k.startswith(f"{func_name}:")]
     return json_response({"FunctionUrlConfigs": configs})
+
+
+# ---------------------------------------------------------------------------
+# Function URL data plane
+# ---------------------------------------------------------------------------
+
+# `awslambda.HttpResponseStream.from()` frames a RESPONSE_STREAM reply as the
+# JSON prelude (status + headers), eight NUL bytes, then the body. Real Function
+# URLs consume that framing at the edge; so do we.
+_STREAM_PRELUDE_SEPARATOR = b"\x00" * 8
+
+# Content types a Function URL delivers to the handler as a UTF-8 string rather
+# than base64. Function URLs use payload format 2.0, same rule as HTTP API v2.
+_FUNCTION_URL_TEXT_TYPES = ("application/json", "application/xml", "application/javascript")
+
+
+def _function_url_id(function_url: str) -> str:
+    """Return the URL id (first host label) of a stored ``FunctionUrl``."""
+    return function_url.split("://", 1)[-1].split(".", 1)[0]
+
+
+def resolve_function_url(url_id: str) -> tuple[str, str, str, str | None, dict] | None:
+    """Resolve a Function URL id to ``(account, region, func_name, qualifier, config)``.
+
+    The scan spans every account/region scope: a data-plane request carries no
+    credentials to scope the lookup by, and the URL id is globally unique.
+    """
+    for (account_id, region, key), cfg in _function_urls.all_items():
+        if _function_url_id(cfg.get("FunctionUrl", "")) == url_id:
+            name, _, qualifier = key.partition(":")
+            return account_id, region, name, (qualifier or None), cfg
+    return None
+
+
+def _function_url_cors_headers(cfg: dict, request_headers: dict) -> dict:
+    """Build CORS response headers from a Function URL's ``Cors`` config.
+
+    Returns an empty dict when the URL has no CORS config — real Function URLs
+    send no CORS headers at all in that case, so a browser blocks the response
+    exactly as it would against AWS.
+    """
+    cors = cfg.get("Cors") or {}
+    if not cors:
+        return {}
+    origin = request_headers.get("origin", "")
+    allowed = cors.get("AllowOrigins") or []
+    if "*" in allowed:
+        allow_origin = "*"
+    elif origin and origin in allowed:
+        allow_origin = origin
+    else:
+        return {}
+    cors_headers = {"Access-Control-Allow-Origin": allow_origin}
+    if allow_origin != "*":
+        cors_headers["Vary"] = "Origin"
+    if cors.get("AllowMethods"):
+        cors_headers["Access-Control-Allow-Methods"] = ",".join(cors["AllowMethods"])
+    if cors.get("AllowHeaders"):
+        cors_headers["Access-Control-Allow-Headers"] = ",".join(cors["AllowHeaders"])
+    if cors.get("ExposeHeaders"):
+        cors_headers["Access-Control-Expose-Headers"] = ",".join(cors["ExposeHeaders"])
+    if cors.get("AllowCredentials"):
+        cors_headers["Access-Control-Allow-Credentials"] = "true"
+    if cors.get("MaxAge") is not None:
+        cors_headers["Access-Control-Max-Age"] = str(cors["MaxAge"])
+    return cors_headers
+
+
+def _function_url_is_signed(headers: dict, query_params: dict) -> bool:
+    """Whether a request carries SigV4 material, header-signed or presigned."""
+    auth = headers.get("authorization", "")
+    if auth.startswith("AWS4-HMAC-SHA256"):
+        return True
+    return "X-Amz-Signature" in query_params or "x-amz-signature" in query_params
+
+
+def _split_stream_prelude(payload: bytes) -> tuple[dict | None, bytes]:
+    """Split a RESPONSE_STREAM payload into its prelude and body.
+
+    A handler that writes to the response stream without calling
+    ``HttpResponseStream.from()`` sends no prelude; the whole payload is then
+    the body and the caller falls back to ``200``.
+    """
+    index = payload.find(_STREAM_PRELUDE_SEPARATOR)
+    if index <= 0:
+        return None, payload
+    try:
+        prelude = json.loads(payload[:index])
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None, payload
+    if not isinstance(prelude, dict):
+        return None, payload
+    return prelude, payload[index + len(_STREAM_PRELUDE_SEPARATOR) :]
+
+
+def _build_function_url_event(
+    url_id: str,
+    account_id: str,
+    region: str,
+    method: str,
+    path: str,
+    headers: dict,
+    body: bytes,
+    query_params: dict,
+) -> dict:
+    """Build the payload-format-2.0 event a Function URL delivers.
+
+    Differs from the HTTP API v2 event in that ``routeKey`` and ``stage`` are
+    always ``$default`` and there are no ``pathParameters``.
+    """
+    raw_qs = "&".join(
+        f"{quote(k, safe='')}={quote(val, safe='')}" for k, vals in query_params.items() for val in vals
+    )
+    if body:
+        content_type = (headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+        if content_type.startswith("text/") or content_type in _FUNCTION_URL_TEXT_TYPES:
+            req_body, is_base64 = body.decode("utf-8", errors="replace"), False
+        else:
+            req_body, is_base64 = base64.b64encode(body).decode("ascii"), True
+    else:
+        req_body, is_base64 = None, False
+
+    domain_name = f"{url_id}.lambda-url.{region}.on.aws"
+    event = {
+        "version": "2.0",
+        "routeKey": "$default",
+        "rawPath": path,
+        "rawQueryString": raw_qs,
+        "headers": dict(headers),
+        "requestContext": {
+            "accountId": account_id,
+            "apiId": url_id,
+            "domainName": domain_name,
+            "domainPrefix": url_id,
+            "http": {
+                "method": method,
+                "path": path,
+                "protocol": "HTTP/1.1",
+                "sourceIp": "127.0.0.1",
+                "userAgent": headers.get("user-agent", ""),
+            },
+            "requestId": new_uuid(),
+            "routeKey": "$default",
+            "stage": "$default",
+            "time": time.strftime("%d/%b/%Y:%H:%M:%S +0000"),
+            "timeEpoch": int(time.time() * 1000),
+        },
+        "isBase64Encoded": is_base64,
+    }
+    # Real AWS omits these keys entirely rather than sending null; strict event
+    # validators reject a present-but-null value (same reason as apigateway.py).
+    if req_body is not None:
+        event["body"] = req_body
+    if query_params:
+        event["queryStringParameters"] = {k: ",".join(v) for k, v in query_params.items()}
+    return event
+
+
+async def handle_function_url_request(
+    url_id: str, method: str, path: str, headers: dict, body: bytes, query_params: dict
+) -> tuple:
+    """Serve a Lambda Function URL data-plane request."""
+    resolved = resolve_function_url(url_id)
+    if resolved is None:
+        return error_response_json("ResourceNotFoundException", "Not Found", 404)
+    account_id, region, func_name, qualifier, cfg = resolved
+
+    cors_headers = _function_url_cors_headers(cfg, headers)
+    if method == "OPTIONS" and cfg.get("Cors"):
+        return 200, cors_headers, b""
+
+    if cfg.get("AuthType") == "AWS_IAM" and not _function_url_is_signed(headers, query_params):
+        return 403, {"Content-Type": "application/json", **cors_headers}, json.dumps({"Message": "Forbidden"}).encode()
+
+    function_ref = f"{func_name}:{qualifier}" if qualifier else func_name
+    func_data, func_config, _ = _get_func_record_for_ref_in_scope(function_ref, account_id=account_id, region=region)
+    if func_data is None or func_config is None:
+        return error_response_json("ResourceNotFoundException", f"Function not found: {func_name}", 404)
+
+    event = _build_function_url_event(url_id, account_id, region, method, path, headers, body, query_params)
+    exec_record = _execution_record_for_config(func_data, func_config)
+    result = await asyncio.to_thread(_execute_function_with_config_scope, exec_record, event)
+
+    if cfg.get("InvokeMode") == "RESPONSE_STREAM" and not result.get("error") and not result.get("throttle"):
+        return _function_url_stream_response(result, cors_headers)
+
+    proxy_response, _ = lambda_execute_result_to_api_proxy_response(result)
+    return _function_url_proxy_response(proxy_response, cors_headers)
+
+
+def _apply_headers_case_insensitively(base: dict, overrides: dict) -> None:
+    """Merge ``overrides`` into ``base``, replacing any case-insensitive match.
+
+    HTTP field names are case-insensitive (RFC 9110 §5.1), so a lowercase
+    ``content-type`` returned by a handler must replace a seeded
+    ``Content-Type`` rather than ship alongside it — the same handling #750
+    applied to the API Gateway v1 multiValueHeaders merge.
+    """
+    for key, value in overrides.items():
+        lower_key = key.lower()
+        for existing in [header for header in base if header.lower() == lower_key]:
+            del base[existing]
+        base[key] = str(value)
+
+
+def _function_url_stream_response(result: dict, cors_headers: dict) -> tuple:
+    """Shape a RESPONSE_STREAM result by consuming its prelude framing."""
+    payload = result.get("body")
+    if payload is None:
+        payload = b""
+    elif isinstance(payload, str):
+        payload = payload.encode("utf-8")
+    elif not isinstance(payload, bytes):
+        payload = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    prelude, stream_body = _split_stream_prelude(payload)
+    status = int(prelude.get("statusCode", 200)) if prelude else 200
+    # Real Function URLs default a streamed response to application/octet-stream
+    # unless the prelude names a content type.
+    resp_headers = {"Content-Type": "application/octet-stream"}
+    if prelude:
+        _apply_headers_case_insensitively(resp_headers, prelude.get("headers") or {})
+    _apply_headers_case_insensitively(resp_headers, cors_headers)
+    return status, resp_headers, stream_body
+
+
+def _function_url_proxy_response(proxy_response: dict | None, cors_headers: dict) -> tuple:
+    """Shape a BUFFERED result from its AWS_PROXY-style return value."""
+    if proxy_response is None:
+        return 502, {"Content-Type": "application/json", **cors_headers}, b'{"message":"Internal Server Error"}'
+
+    status = int(proxy_response.get("statusCode", 200))
+    resp_headers = {"Content-Type": "application/json"}
+    _apply_headers_case_insensitively(resp_headers, proxy_response.get("headers") or {})
+    _apply_headers_case_insensitively(resp_headers, cors_headers)
+    # Payload format 2.0 delivers cookies via a top-level `cookies` array, which
+    # AWS emits as one Set-Cookie header per entry; _send_response expands a list.
+    cookies = proxy_response.get("cookies")
+    if cookies:
+        for existing in [header for header in resp_headers if header.lower() == "set-cookie"]:
+            del resp_headers[existing]
+        resp_headers["Set-Cookie"] = list(cookies)
+
+    payload = proxy_response.get("body", "")
+    if proxy_response.get("isBase64Encoded"):
+        try:
+            body_bytes = base64.b64decode(payload)
+        except (ValueError, TypeError):
+            body_bytes = b""
+    else:
+        body_bytes = payload.encode("utf-8") if isinstance(payload, str) else bytes(payload or b"")
+    return status, resp_headers, body_bytes
 
 
 def reset():
