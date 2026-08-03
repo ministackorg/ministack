@@ -59,6 +59,7 @@ SERVICE_STATE_FORMAT_VERSIONS = {
     "ecs": 3,
     "resource_groups": 3,
     "codebuild": 3,
+    "cloudwatch_logs": 3,
     "ec2": 3,
     "ecr": 3,
     "cloudtrail": 3,
