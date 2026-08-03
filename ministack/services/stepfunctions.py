@@ -4642,7 +4642,6 @@ _QUERY_PARAM_NAME_OVERRIDES = {
     },
     ("ec2", "CreateSecurityGroup"): {
         "Description": "GroupDescription",
-        "VpcId": "VpcId",
     },
 }
 
@@ -4669,19 +4668,24 @@ def _sfn_key_to_api_name(name):
     return "".join(t.upper() if t in _AWS_ACRONYMS else t for t in tokens)
 
 
-def _convert_params_to_api_names(data, name_overrides=None):
-    """Recursively convert SFN SDK-style param names to AWS wire-format names."""
+def _convert_params_to_api_names(data, name_overrides=None, expand_acronyms=True):
+    """Recursively convert SFN SDK-style param names to AWS wire-format names.
+
+    ``expand_acronyms=False`` for services like EC2 whose wire names carry no uppercase acronym.
+    """
     if isinstance(data, dict):
         converted = {}
         for key, value in data.items():
             if name_overrides and key in name_overrides:
                 wire_key = name_overrides[key]
-            else:
+            elif expand_acronyms:
                 wire_key = _sfn_key_to_api_name(key)
-            converted[wire_key] = _convert_params_to_api_names(value, name_overrides)
+            else:
+                wire_key = key
+            converted[wire_key] = _convert_params_to_api_names(value, name_overrides, expand_acronyms)
         return converted
     if isinstance(data, list):
-        return [_convert_params_to_api_names(item, name_overrides) for item in data]
+        return [_convert_params_to_api_names(item, name_overrides, expand_acronyms) for item in data]
     return data
 
 
@@ -4921,7 +4925,8 @@ def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
     # Convert SFN SDK-style param names (DbSubnetGroupName) to wire-format
     # names (DBSubnetGroupName) before flattening to query params.
     name_overrides = _QUERY_PARAM_NAME_OVERRIDES.get((service_key, pascal_action))
-    wire_data = _convert_params_to_api_names(input_data, name_overrides)
+    # EC2 is the exception: its serialiser only capitalises the first letter
+    wire_data = _convert_params_to_api_names(input_data, name_overrides, expand_acronyms=service_key != "ec2")
     form_params = {"Action": pascal_action}
     if service_key == "ec2":
         form_params.update(_flatten_ec2_query_params(wire_data, action=pascal_action))
