@@ -6194,8 +6194,10 @@ def _project_item(item, proj_expr, attr_names):
             result[root_name] = _merge_projection(result[root_name], sub)
         else:
             result[root_name] = sub
-    # Compact sparse lists: remove None placeholders and collapse to dense lists.
-    return _compact_projection(result)
+    # Compact sparse lists per attribute: `result` maps attribute names to
+    # AttributeValues, so compaction runs on each value (never on the outer
+    # map, whose keys are attribute names, not type tags).
+    return {name: _compact_projection(av) for name, av in result.items()}
 
 
 def _compact_projection(value):

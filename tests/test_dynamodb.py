@@ -4490,6 +4490,30 @@ def test_dynamodb_projection_multiple_sibling_paths(ddb):
         ddb.delete_table(TableName=name)
 
 
+def test_dynamodb_projection_list_index_with_sibling_attribute(ddb):
+    """A list-index projection alongside another attribute: the sparse-list
+    placeholders must still be compacted when the result has >1 attribute
+    (regression — compaction previously only ran, incorrectly, on a
+    single-key result and silently left None placeholders)."""
+    name = "pe-list-sib"
+    _proj_table(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={
+            "pk": {"S": "a"},
+            "items": {"L": [{"S": "first"}, {"S": "second"}, {"S": "third"}]},
+        })
+        r = ddb.get_item(
+            TableName=name, Key={"pk": {"S": "a"}},
+            ProjectionExpression="pk, items[2]",
+        )
+        assert r["Item"] == {
+            "pk": {"S": "a"},
+            "items": {"L": [{"S": "third"}]},
+        }
+    finally:
+        ddb.delete_table(TableName=name)
+
+
 # ---------------------------------------------------------------------------
 # ReturnValues + ReturnItemCollectionMetrics enum + shape validation.
 # ---------------------------------------------------------------------------
