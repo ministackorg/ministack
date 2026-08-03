@@ -3,12 +3,18 @@ CloudFormation stacks — async stack lifecycle (deploy, delete, update, diff).
 """
 
 import asyncio
+import contextvars
 import copy
 import json
 import logging
 import time
 from contextlib import contextmanager
 
+from ministack.core.concurrency import (
+    LoopLocal,
+    run_in_dedicated_thread_to_completion,
+    run_in_thread_to_completion,
+)
 from ministack.core.responses import get_account_id, get_region, new_uuid, now_iso, set_request_region
 
 from .engine import (
@@ -49,14 +55,147 @@ def _stack_region_context(stack: dict | None, stack_id: str | None = None):
         set_request_region(previous_region)
 
 
+class _StackTaskLifecycle:
+    """Track stack lifecycle tasks and close their admission during reset."""
+
+    def __init__(self):
+        self._accepting = True
+        self._tasks = set()
+
+    def create_task(self, coro):
+        # Check and insertion are synchronous on the server loop: reset cannot
+        # close admission between them.
+        if not self._accepting:
+            # The enclosing request may already have written stack metadata;
+            # reset's subsequent state wipe removes it after task quiescence.
+            coro.close()
+            return None
+        task = asyncio.get_running_loop().create_task(coro)
+        self._tasks.add(task)
+        # Keep this lifecycle alive for as long as one of its tasks exists;
+        # LoopLocal intentionally stores only weak values for loop collection.
+        task.add_done_callback(self._task_finished)
+        return task
+
+    def _task_finished(self, task):
+        self._tasks.discard(task)
+
+    async def begin_reset(self):
+        """Close admission, cancel active tasks, and await full unwinding."""
+        self._accepting = False
+        tasks = tuple(self._tasks)
+        for task in tasks:
+            task.cancel()
+        if not tasks:
+            return
+
+        waiter = asyncio.ensure_future(asyncio.gather(*tasks, return_exceptions=True))
+        try:
+            await asyncio.shield(waiter)
+        except asyncio.CancelledError as cancellation:
+            # Stack tasks may be inside an uncancellable worker. Repeated reset
+            # cancellation must not let the state wipe overtake that worker.
+            while not waiter.done():
+                try:
+                    await asyncio.shield(waiter)
+                except asyncio.CancelledError:
+                    continue
+            raise cancellation
+
+    def finish_reset(self):
+        self._accepting = True
+
+
+_stack_task_lifecycles = LoopLocal(_StackTaskLifecycle)
+
+
+def _get_stack_task_lifecycle() -> _StackTaskLifecycle:
+    return _stack_task_lifecycles.get()
+
+
 def _create_stack_task_in_region(coro, stack: dict | None, stack_id: str | None = None):
-    """Schedule a stack lifecycle coroutine in the stack's owning region."""
+    """Schedule a tracked stack lifecycle coroutine in its owning region."""
     with _stack_region_context(stack, stack_id):
-        asyncio.get_event_loop().create_task(coro)
+        return _get_stack_task_lifecycle().create_task(coro)
 
 
 def _is_custom_resource(resource_type: str) -> bool:
     return resource_type.startswith("Custom::") or resource_type == "AWS::CloudFormation::CustomResource"
+
+
+_STANDARD_PROVISIONER_SERVICES = {
+    "AWS::ECS::Cluster": "ecs",
+    "AWS::ECS::TaskDefinition": "ecs",
+    "AWS::ECS::Service": "ecs",
+    "AWS::RDS::DBCluster": "rds",
+    "AWS::RDS::DBInstance": "rds",
+    "AWS::EKS::Cluster": "eks",
+    "AWS::EKS::Nodegroup": "eks",
+    "AWS::OpenSearchService::Domain": "opensearch",
+}
+
+_NESTED_STACK_RESOURCE_TYPE = "AWS::CloudFormation::Stack"
+_nested_stack_server_loop = contextvars.ContextVar(
+    "cloudformation_nested_stack_server_loop",
+    default=None,
+)
+
+
+def _standard_provisioner_admission_lock(resource_type: str):
+    service_name = _STANDARD_PROVISIONER_SERVICES[resource_type]
+    if service_name == "ecs":
+        from ministack.services import ecs as service
+    elif service_name == "rds":
+        from ministack.services import rds as service
+    elif service_name == "eks":
+        from ministack.services import eks as service
+    else:
+        from ministack.services import opensearch as service
+    return service._get_request_dispatch_lock()
+
+
+async def _run_locked_standard_provisioner(resource_type, operation, *args):
+    """Run a Docker-backed standard provisioner under its service admission lock."""
+    async with _standard_provisioner_admission_lock(resource_type):
+        return await run_in_thread_to_completion(operation, *args)
+
+
+def _run_locked_standard_provisioner_sync(resource_type, operation, *args):
+    """Marshal one nested-stack child onto the server admission seam."""
+    server_loop = _nested_stack_server_loop.get()
+    if server_loop is None:
+        raise RuntimeError("nested CloudFormation provisioner has no server loop")
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+    if running_loop is server_loop:
+        raise RuntimeError("nested CloudFormation provisioner cannot marshal from the server loop")
+    if server_loop.is_closed():
+        raise RuntimeError("nested CloudFormation server loop is closed")
+
+    coro = _run_locked_standard_provisioner(resource_type, operation, *args)
+    try:
+        future = asyncio.run_coroutine_threadsafe(coro, server_loop)
+    except BaseException:
+        coro.close()
+        raise
+    return future.result()
+
+
+async def _run_nested_stack_provisioner(operation, *args):
+    """Run the top-level nested core off-loop; deeper recursion stays inline."""
+    server_loop = asyncio.get_running_loop()
+
+    def install_server_loop():
+        _nested_stack_server_loop.set(server_loop)
+
+    return await run_in_dedicated_thread_to_completion(
+        operation,
+        *args,
+        thread_name="ministack-cfn-nested-stack",
+        context_setup=install_server_loop,
+    )
 
 
 # ===========================================================================
@@ -161,9 +300,19 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 old_pid = prev_resource.get("PhysicalResourceId", logical_id)
                 old_props = prev_resource.get("Properties", {})
                 if _is_custom_resource(resource_type):
-                    physical_id, attrs = await asyncio.to_thread(
+                    physical_id, attrs = await run_in_thread_to_completion(
                         _update_resource, resource_type, old_pid, old_props,
                         resolved_props, stack_name, logical_id
+                    )
+                elif resource_type == _NESTED_STACK_RESOURCE_TYPE:
+                    physical_id, attrs = await _run_nested_stack_provisioner(
+                        _update_resource, resource_type, old_pid, old_props,
+                        resolved_props, stack_name, logical_id
+                    )
+                elif resource_type in _STANDARD_PROVISIONER_SERVICES:
+                    physical_id, attrs = await _run_locked_standard_provisioner(
+                        resource_type, _update_resource, resource_type, old_pid,
+                        old_props, resolved_props, stack_name, logical_id
                     )
                 else:
                     physical_id, attrs = _update_resource(
@@ -172,8 +321,18 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                     )
             else:
                 if _is_custom_resource(resource_type):
-                    physical_id, attrs = await asyncio.to_thread(
+                    physical_id, attrs = await run_in_thread_to_completion(
                         _provision_resource, resource_type, logical_id, resolved_props, stack_name
+                    )
+                elif resource_type == _NESTED_STACK_RESOURCE_TYPE:
+                    physical_id, attrs = await _run_nested_stack_provisioner(
+                        _provision_resource, resource_type, logical_id,
+                        resolved_props, stack_name
+                    )
+                elif resource_type in _STANDARD_PROVISIONER_SERVICES:
+                    physical_id, attrs = await _run_locked_standard_provisioner(
+                        resource_type, _provision_resource, resource_type,
+                        logical_id, resolved_props, stack_name
                     )
                 else:
                     physical_id, attrs = _provision_resource(
@@ -212,8 +371,18 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
             old_props = old_res.get("Properties", {})
             try:
                 if _is_custom_resource(rtype):
-                    await asyncio.to_thread(
+                    await run_in_thread_to_completion(
                         _delete_resource, rtype, pid, old_props,
+                        stack_name, logical_id
+                    )
+                elif rtype == _NESTED_STACK_RESOURCE_TYPE:
+                    await _run_nested_stack_provisioner(
+                        _delete_resource, rtype, pid, old_props,
+                        stack_name, logical_id
+                    )
+                elif rtype in _STANDARD_PROVISIONER_SERVICES:
+                    await _run_locked_standard_provisioner(
+                        rtype, _delete_resource, rtype, pid, old_props,
                         stack_name, logical_id
                     )
                 else:
@@ -246,8 +415,18 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 res_props = res.get("Properties", {})
                 try:
                     if _is_custom_resource(rtype):
-                        await asyncio.to_thread(
+                        await run_in_thread_to_completion(
                             _delete_resource, rtype, pid, res_props,
+                            stack_name, logical_id
+                        )
+                    elif rtype == _NESTED_STACK_RESOURCE_TYPE:
+                        await _run_nested_stack_provisioner(
+                            _delete_resource, rtype, pid, res_props,
+                            stack_name, logical_id
+                        )
+                    elif rtype in _STANDARD_PROVISIONER_SERVICES:
+                        await _run_locked_standard_provisioner(
+                            rtype, _delete_resource, rtype, pid, res_props,
                             stack_name, logical_id
                         )
                     else:
@@ -354,8 +533,18 @@ async def _delete_stack_async(stack_name: str, stack_id: str):
                    "DELETE_IN_PROGRESS", physical_id=pid)
         try:
             if _is_custom_resource(rtype):
-                await asyncio.to_thread(
+                await run_in_thread_to_completion(
                     _delete_resource, rtype, pid, res_props,
+                    stack_name, logical_id
+                )
+            elif rtype == _NESTED_STACK_RESOURCE_TYPE:
+                await _run_nested_stack_provisioner(
+                    _delete_resource, rtype, pid, res_props,
+                    stack_name, logical_id
+                )
+            elif rtype in _STANDARD_PROVISIONER_SERVICES:
+                await _run_locked_standard_provisioner(
+                    rtype, _delete_resource, rtype, pid, res_props,
                     stack_name, logical_id
                 )
             else:

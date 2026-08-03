@@ -22,6 +22,7 @@ import threading
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import run_in_thread_to_completion
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -657,7 +658,7 @@ async def _invoke_rest_api(method, path, headers, body, query_params):
         return req_lib.delete(url, headers=req_headers, timeout=30)
 
     try:
-        resp = await asyncio.to_thread(_do_call)
+        resp = await run_in_thread_to_completion(_do_call)
         ctype = resp.headers.get("content-type", "")
         payload = resp.json() if ctype.startswith("application/json") else {"body": resp.text}
         return json_response({

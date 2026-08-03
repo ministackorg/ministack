@@ -53,6 +53,15 @@ from ministack.core.responses import (
 
 logger = logging.getLogger("states")
 
+# The loop that owns the admission locks for the current execution.  The value
+# is captured in the request context before an execution thread is spawned, so
+# background and nested execution threads inherit the correct server loop
+# without retaining one globally across app/event-loop lifecycles.
+_execution_server_loop = contextvars.ContextVar(
+    "stepfunctions_execution_server_loop",
+    default=None,
+)
+
 # Scale factor for Wait state durations and retry intervals.
 # 0 = skip all waits, 0.01 = 1% of normal, 1 = normal (default).
 # Set via SFN_WAIT_SCALE environment variable.
@@ -286,7 +295,95 @@ async def handle_request(method, path, headers, body, query_params):
         return error_response_json("InvalidAction", f"Unknown action: {action}", 400)
     if action == "GetActivityTask":
         return _finalize_response(await _get_activity_task(data))
+
+    if action in {"StartExecution", "StartSyncExecution", "TestState"}:
+        try:
+            server_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Nested SDK integrations synchronously send-drive this router from
+            # an existing execution thread.  They inherit the outer execution's
+            # server-loop context and must remain inline (especially nested
+            # StartSyncExecution), rather than spawning another thread.
+            return _finalize_response(handler(data))
+
+        loop_token = _execution_server_loop.set(server_loop)
+        try:
+            if action in {"StartSyncExecution", "TestState"}:
+                return _finalize_response(
+                    await _run_sync_action_in_dedicated_thread(handler, data)
+                )
+            return _finalize_response(handler(data))
+        finally:
+            _execution_server_loop.reset(loop_token)
+
     return _finalize_response(handler(data))
+
+
+def _complete_thread_future(future, result=None, error=None):
+    if future.done():
+        return
+    if error is not None:
+        future.set_exception(error)
+    else:
+        future.set_result(result)
+
+
+async def _run_sync_action_in_dedicated_thread(handler, data):
+    """Run a synchronous execution action without consuming the shared pool.
+
+    Execution threads can block while a service integration is marshalled back
+    to the server loop, whose admission wrapper in turn needs a default-executor
+    slot.  A dedicated daemon thread prevents pool-size concurrent synchronous
+    executions from consuming every slot needed by those inner service calls.
+    """
+    loop = asyncio.get_running_loop()
+    result_future = loop.create_future()
+    ctx_snapshot = contextvars.copy_context()
+
+    def run():
+        try:
+            result = ctx_snapshot.run(handler, data)
+        except BaseException as exc:
+            loop.call_soon_threadsafe(
+                _complete_thread_future,
+                result_future,
+                None,
+                exc,
+            )
+        else:
+            loop.call_soon_threadsafe(
+                _complete_thread_future,
+                result_future,
+                result,
+                None,
+            )
+
+    threading.Thread(
+        target=run,
+        name=f"ministack-sfn-{handler.__name__}",
+        daemon=True,
+    ).start()
+
+    try:
+        return await asyncio.shield(result_future)
+    except asyncio.CancelledError as cancellation:
+        # The execution thread cannot be cancelled.  Keep the request task
+        # alive until it finishes so context and completion semantics are not
+        # released early; absorb repeated disconnect cancellations too.
+        while not result_future.done():
+            try:
+                await asyncio.shield(result_future)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+
+        if result_future.done() and not result_future.cancelled():
+            try:
+                result_future.result()
+            except Exception:
+                pass
+        raise cancellation
 
 
 # ---------------------------------------------------------------------------
@@ -587,6 +684,27 @@ def _start_execution(data):
 
     logger.info("Step Functions execution started: %s", exec_arn)
     return json_response({"executionArn": exec_arn, "startDate": start_date})
+
+
+def _start_execution_with_server_loop(data, server_loop):
+    """Start an execution from the sanctioned non-HTTP entry point.
+
+    Event sources run outside the Step Functions HTTP router, so seed the
+    server loop explicitly before ``_start_execution`` snapshots context for
+    its execution thread.  A missing or closed loop is intentionally retained
+    in that snapshot: locked-service integrations then fail with the defined
+    ``States.Runtime`` backstop instead of deadlocking or raising an unrelated
+    attribute error.
+    """
+    if server_loop is None:
+        # A nested non-HTTP source (for example aws-sdk:events PutEvents from
+        # an existing execution thread) inherits the outer execution context.
+        server_loop = _execution_server_loop.get()
+    loop_token = _execution_server_loop.set(server_loop)
+    try:
+        return _start_execution(data)
+    finally:
+        _execution_server_loop.reset(loop_token)
 
 
 def _stop_execution(data):
@@ -4159,7 +4277,11 @@ def _invoke_ecs_run_task(resource, input_data):
         logger.warning("ecs module unavailable; returning passthrough")
         return input_data
     ecs_data = _pascal_to_camel(input_data)
-    status, _, body = ecs._run_task(ecs_data)
+    status, _, body = _invoke_ecs_action_through_admission(
+        ecs,
+        "RunTask",
+        ecs_data,
+    )
     result = json.loads(body) if body else {}
     if status >= 400:
         raise _ExecutionError("ECS.RunTaskFailed", result.get("message", str(result)))
@@ -4168,22 +4290,44 @@ def _invoke_ecs_run_task(resource, input_data):
     if is_sync and result.get("tasks"):
         task_arns = [t["taskArn"] for t in result["tasks"]]
         cluster = ecs_data.get("cluster", "default")
-        result = _poll_ecs_tasks(cluster, task_arns)
+        result = _poll_ecs_tasks(ecs, cluster, task_arns)
 
     return result
 
 
-def _poll_ecs_tasks(cluster, task_arns):
+def _invoke_ecs_action_through_admission(ecs_module, action, data):
+    headers = {
+        "x-amz-target": f"AmazonEC2ContainerServiceV20141113.{action}",
+        "content-type": "application/x-amz-json-1.1",
+        "host": f"ecs.{get_region()}.amazonaws.com",
+        "authorization": (
+            f"AWS4-HMAC-SHA256 Credential=test/20260101/{get_region()}/ecs/aws4_request"
+        ),
+    }
+    return _drive_service_handler_sync(
+        "ecs",
+        ecs_module.handle_request,
+        "POST",
+        "/",
+        headers,
+        json.dumps(data),
+        {},
+    )
+
+
+def _poll_ecs_tasks(ecs_module, cluster, task_arns):
     """Poll DescribeTasks until all tasks are STOPPED (max 10 min).
 
     Returns the full DescribeTasks result including exit codes — the state
     machine definition decides how to handle success/failure via Choice or Catch.
     """
-    from ministack.services import ecs
-
     for _ in range(600):
         _scaled_sleep(1)
-        status, _, body = ecs._describe_tasks({"cluster": cluster, "tasks": task_arns})
+        status, _, body = _invoke_ecs_action_through_admission(
+            ecs_module,
+            "DescribeTasks",
+            {"cluster": cluster, "tasks": task_arns},
+        )
         result = json.loads(body) if body else {}
         tasks = result.get("tasks", [])
         if tasks and all(t.get("lastStatus") == "STOPPED" for t in tasks):
@@ -4318,6 +4462,82 @@ _REST_JSON_ACTION_PATHS = {
 }
 
 
+_SYNC_AWS_SDK_SERVICE_MODULES = {
+    "rds": "rds",
+    "ecs": "ecs",
+    "eks": "eks",
+    "elasticache": "elasticache",
+    "opensearch": "opensearch",
+    "rds-data": "rds_data",
+}
+
+
+def _drive_service_handler_sync(service_key, handler, *args, await_error=None):
+    """Drive one service entry from an SFN execution thread."""
+    module_name = _SYNC_AWS_SDK_SERVICE_MODULES.get(service_key)
+    if module_name is not None:
+        from ministack import app
+
+        module = app._get_module(module_name)
+        return _marshal_service_handler_to_execution_loop(
+            service_key,
+            module.handle_request,
+            *args,
+        )
+
+    coro = handler(*args)
+    try:
+        coro.send(None)
+    except StopIteration as stop:
+        return stop.value
+    else:
+        coro.close()
+        if await_error is not None:
+            raise await_error
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(handler(*args))
+        finally:
+            loop.close()
+
+
+def _marshal_service_handler_to_execution_loop(service_key, handler, *args):
+    """Run an admission-locked service handler on its execution's server loop."""
+    server_loop = _execution_server_loop.get()
+    if server_loop is None:
+        raise _ExecutionError(
+            "States.Runtime",
+            f"aws-sdk:{service_key} integration has no execution server loop",
+        )
+
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+    if running_loop is server_loop:
+        raise _ExecutionError(
+            "States.Runtime",
+            f"aws-sdk:{service_key} integration cannot synchronously marshal "
+            "from its target event loop",
+        )
+    if server_loop.is_closed():
+        raise _ExecutionError(
+            "States.Runtime",
+            f"aws-sdk:{service_key} integration server loop is closed",
+        )
+
+    try:
+        future = asyncio.run_coroutine_threadsafe(handler(*args), server_loop)
+        return future.result()
+    except _ExecutionError:
+        raise
+    except Exception as exc:
+        raise _ExecutionError(
+            "States.Runtime",
+            f"aws-sdk:{service_key} integration dispatch failed: {exc}",
+        ) from exc
+
+
 def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
     """Dispatch an aws-sdk integration call to a JSON-protocol MiniStack service."""
     from ministack import app
@@ -4350,25 +4570,9 @@ def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
         ),
     }
 
-    # Service handlers are async def but perform no real I/O, so we can
-    # drive the coroutine synchronously — this avoids conflicts with the
-    # already-running asyncio event loop.
-    coro = handler("POST", "/", headers, body, {})
-    try:
-        coro.send(None)
-    except StopIteration as stop:
-        status, resp_headers, resp_body = stop.value
-    else:
-        # If the coroutine didn't finish in one step it truly needs async;
-        # fall back to the event loop (only reachable if a handler awaits).
-        coro.close()
-        loop = asyncio.new_event_loop()
-        try:
-            status, resp_headers, resp_body = loop.run_until_complete(
-                handler("POST", "/", headers, body, {})
-            )
-        finally:
-            loop.close()
+    status, resp_headers, resp_body = _drive_service_handler_sync(
+        service_key, handler, "POST", "/", headers, body, {}
+    )
 
     decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else resp_body
     result = json.loads(decoded) if decoded else {}
@@ -4938,20 +5142,9 @@ def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
         ),
     }
 
-    coro = handler("POST", "/", headers, body, {})
-    try:
-        coro.send(None)
-    except StopIteration as stop:
-        status, resp_headers, resp_body = stop.value
-    else:
-        coro.close()
-        loop = asyncio.new_event_loop()
-        try:
-            status, resp_headers, resp_body = loop.run_until_complete(
-                handler("POST", "/", headers, body, {})
-            )
-        finally:
-            loop.close()
+    status, resp_headers, resp_body = _drive_service_handler_sync(
+        service_key, handler, "POST", "/", headers, body, {}
+    )
 
     decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else resp_body
 
@@ -5041,20 +5234,9 @@ def _dispatch_aws_sdk_rest_json(service_info, service_name, action, input_data):
         ),
     }
 
-    coro = handler("POST", path, headers, body, {})
-    try:
-        coro.send(None)
-    except StopIteration as stop:
-        status, resp_headers, resp_body = stop.value
-    else:
-        coro.close()
-        loop = asyncio.new_event_loop()
-        try:
-            status, resp_headers, resp_body = loop.run_until_complete(
-                handler("POST", path, headers, body, {})
-            )
-        finally:
-            loop.close()
+    status, resp_headers, resp_body = _drive_service_handler_sync(
+        service_key, handler, "POST", path, headers, body, {}
+    )
 
     decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else resp_body
 
@@ -5175,26 +5357,20 @@ def _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data
         ),
     }
 
-    # Drive the async handler synchronously. SFN state execution runs inside
-    # the request's event loop, so spawning a fresh loop here would raise
-    # "Cannot run the event loop while another loop is running". The Lambda
-    # REST handlers we dispatch to here only touch in-memory dicts and never
-    # await, so a single ``coro.send(None)`` completes via ``StopIteration``
-    # with the response tuple.
-    coro = handler(method, path, headers, body, query_params)
-    try:
-        coro.send(None)
-    except StopIteration as stop:
-        status, resp_headers, resp_body = stop.value
-    else:
-        # Fallback for an async handler that does await — extremely rare on
-        # this dispatch surface, but guard so we don't return None silently.
-        coro.close()
-        raise _ExecutionError(
+    status, resp_headers, resp_body = _drive_service_handler_sync(
+        service_key,
+        handler,
+        method,
+        path,
+        headers,
+        body,
+        query_params,
+        await_error=_ExecutionError(
             "States.Runtime",
             f"aws-sdk:{service_name}:{action} handler awaited unexpectedly; "
             "cannot drive from sync SFN executor",
-        )
+        ),
+    )
 
     decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else resp_body
     if status >= 400:
@@ -5482,20 +5658,9 @@ def _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data):
     # passing the raw path with "?..." would treat "?list-type=2" as part of
     # the bucket name. Send the query-less path; the dict is the source of
     # truth for query routing.
-    coro = handler(method, path, headers, body, query_dict)
-    try:
-        coro.send(None)
-    except StopIteration as stop:
-        status, resp_headers, resp_body = stop.value
-    else:
-        coro.close()
-        loop = asyncio.new_event_loop()
-        try:
-            status, resp_headers, resp_body = loop.run_until_complete(
-                handler(method, path, headers, body, query_dict)
-            )
-        finally:
-            loop.close()
+    status, resp_headers, resp_body = _drive_service_handler_sync(
+        service_key, handler, method, path, headers, body, query_dict
+    )
 
     decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else (resp_body or "")
     norm_resp_headers = {k.lower(): v for k, v in (resp_headers or {}).items()}
