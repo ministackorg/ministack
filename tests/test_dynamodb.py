@@ -4504,7 +4504,8 @@ def test_dynamodb_projection_list_index_with_sibling_attribute(ddb):
         })
         r = ddb.get_item(
             TableName=name, Key={"pk": {"S": "a"}},
-            ProjectionExpression="pk, items[2]",
+            ProjectionExpression="pk, #i[2]",
+            ExpressionAttributeNames={"#i": "items"},
         )
         assert r["Item"] == {
             "pk": {"S": "a"},

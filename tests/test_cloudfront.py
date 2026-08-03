@@ -1390,3 +1390,190 @@ def test_cloudfront_list_distributions_by_cache_policy(cloudfront):
     assert dil["IsTruncated"] is False
     assert dil.get("Items", []) == []
     cloudfront.delete_cache_policy(Id=pid, IfMatch=create["ETag"])
+
+
+# ---------------------------------------------------------------------------
+# Origin request policies (aws_cloudfront_origin_request_policy) — #1249
+# ---------------------------------------------------------------------------
+
+
+def _orp_config(name):
+    return {
+        "Name": name,
+        "Comment": "test orp",
+        "HeadersConfig": {"HeaderBehavior": "whitelist", "Headers": {"Quantity": 1, "Items": ["X-Custom"]}},
+        "CookiesConfig": {"CookieBehavior": "all"},
+        "QueryStringsConfig": {"QueryStringBehavior": "whitelist", "QueryStrings": {"Quantity": 2, "Items": ["a", "b"]}},
+    }
+
+
+def test_cloudfront_create_and_get_origin_request_policy(cloudfront):
+    name = f"orp-{_uuid_mod.uuid4().hex[:8]}"
+    create = cloudfront.create_origin_request_policy(OriginRequestPolicyConfig=_orp_config(name))
+    assert create["ETag"]
+    pid = create["OriginRequestPolicy"]["Id"]
+    assert "LastModifiedTime" in create["OriginRequestPolicy"]
+
+    got = cloudfront.get_origin_request_policy(Id=pid)
+    cfg = got["OriginRequestPolicy"]["OriginRequestPolicyConfig"]
+    assert got["ETag"] == create["ETag"]
+    assert cfg["Name"] == name
+    assert cfg["HeadersConfig"]["HeaderBehavior"] == "whitelist"
+    assert cfg["HeadersConfig"]["Headers"]["Items"] == ["X-Custom"]
+    assert cfg["CookiesConfig"]["CookieBehavior"] == "all"
+    assert cfg["QueryStringsConfig"]["QueryStringBehavior"] == "whitelist"
+    assert cfg["QueryStringsConfig"]["QueryStrings"]["Items"] == ["a", "b"]
+
+    cloudfront.delete_origin_request_policy(Id=pid, IfMatch=got["ETag"])
+
+
+def test_cloudfront_origin_request_policy_config_and_update(cloudfront):
+    name = f"orp-{_uuid_mod.uuid4().hex[:8]}"
+    create = cloudfront.create_origin_request_policy(OriginRequestPolicyConfig=_orp_config(name))
+    pid = create["OriginRequestPolicy"]["Id"]
+
+    resp = cloudfront.get_origin_request_policy_config(Id=pid)
+    assert resp["ETag"] == create["ETag"]
+    assert resp["OriginRequestPolicyConfig"]["Name"] == name
+
+    updated = _orp_config(name)
+    updated["CookiesConfig"] = {"CookieBehavior": "none"}
+    with pytest.raises(ClientError) as exc:
+        cloudfront.update_origin_request_policy(OriginRequestPolicyConfig=updated, Id=pid)
+    assert exc.value.response["Error"]["Code"] == "InvalidIfMatchVersion"
+
+    upd = cloudfront.update_origin_request_policy(OriginRequestPolicyConfig=updated, Id=pid, IfMatch=create["ETag"])
+    assert upd["ETag"] != create["ETag"]
+    assert upd["OriginRequestPolicy"]["OriginRequestPolicyConfig"]["CookiesConfig"]["CookieBehavior"] == "none"
+    cloudfront.delete_origin_request_policy(Id=pid, IfMatch=upd["ETag"])
+
+
+def test_cloudfront_origin_request_policy_delete_and_duplicate(cloudfront):
+    name = f"orp-{_uuid_mod.uuid4().hex[:8]}"
+    create = cloudfront.create_origin_request_policy(OriginRequestPolicyConfig=_orp_config(name))
+    pid = create["OriginRequestPolicy"]["Id"]
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_origin_request_policy(OriginRequestPolicyConfig=_orp_config(name))
+    assert exc.value.response["Error"]["Code"] == "OriginRequestPolicyAlreadyExists"
+
+    cloudfront.delete_origin_request_policy(Id=pid, IfMatch=create["ETag"])
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_origin_request_policy(Id=pid)
+    assert exc.value.response["Error"]["Code"] == "NoSuchOriginRequestPolicy"
+
+
+def test_cloudfront_list_distributions_by_origin_request_policy(cloudfront):
+    name = f"orp-{_uuid_mod.uuid4().hex[:8]}"
+    create = cloudfront.create_origin_request_policy(OriginRequestPolicyConfig=_orp_config(name))
+    pid = create["OriginRequestPolicy"]["Id"]
+    resp = cloudfront.list_distributions_by_origin_request_policy_id(OriginRequestPolicyId=pid)
+    assert resp["DistributionIdList"]["Quantity"] == 0
+    cloudfront.delete_origin_request_policy(Id=pid, IfMatch=create["ETag"])
+
+
+# ---------------------------------------------------------------------------
+# Response headers policies (aws_cloudfront_response_headers_policy) — #1249
+# ---------------------------------------------------------------------------
+
+
+def _rhp_config(name):
+    return {
+        "Name": name,
+        "Comment": "test rhp",
+        "CorsConfig": {
+            "AccessControlAllowOrigins": {"Quantity": 1, "Items": ["https://example.com"]},
+            "AccessControlAllowHeaders": {"Quantity": 1, "Items": ["X-Custom"]},
+            "AccessControlAllowMethods": {"Quantity": 2, "Items": ["GET", "POST"]},
+            "AccessControlAllowCredentials": False,
+            "AccessControlExposeHeaders": {"Quantity": 1, "Items": ["X-Expose"]},
+            "AccessControlMaxAgeSec": 600,
+            "OriginOverride": True,
+        },
+        "SecurityHeadersConfig": {
+            "FrameOptions": {"Override": True, "FrameOption": "DENY"},
+            "ContentTypeOptions": {"Override": True},
+            "ReferrerPolicy": {"Override": True, "ReferrerPolicy": "same-origin"},
+            "StrictTransportSecurity": {
+                "Override": True, "AccessControlMaxAgeSec": 31536000,
+                "IncludeSubdomains": True, "Preload": False,
+            },
+        },
+        "CustomHeadersConfig": {
+            "Quantity": 1,
+            "Items": [{"Header": "X-Extra", "Value": "yes", "Override": True}],
+        },
+        "RemoveHeadersConfig": {"Quantity": 1, "Items": [{"Header": "Server"}]},
+    }
+
+
+def test_cloudfront_create_and_get_response_headers_policy(cloudfront):
+    name = f"rhp-{_uuid_mod.uuid4().hex[:8]}"
+    create = cloudfront.create_response_headers_policy(ResponseHeadersPolicyConfig=_rhp_config(name))
+    assert create["ETag"]
+    pid = create["ResponseHeadersPolicy"]["Id"]
+
+    got = cloudfront.get_response_headers_policy(Id=pid)
+    cfg = got["ResponseHeadersPolicy"]["ResponseHeadersPolicyConfig"]
+    assert got["ETag"] == create["ETag"]
+    assert cfg["Name"] == name
+
+    cors = cfg["CorsConfig"]
+    assert cors["AccessControlAllowOrigins"]["Items"] == ["https://example.com"]
+    assert cors["AccessControlAllowMethods"]["Items"] == ["GET", "POST"]
+    assert cors["AccessControlAllowCredentials"] is False
+    assert cors["AccessControlExposeHeaders"]["Items"] == ["X-Expose"]
+    assert cors["AccessControlMaxAgeSec"] == 600
+    assert cors["OriginOverride"] is True
+
+    sec = cfg["SecurityHeadersConfig"]
+    assert sec["FrameOptions"]["FrameOption"] == "DENY"
+    assert sec["ContentTypeOptions"]["Override"] is True
+    assert sec["ReferrerPolicy"]["ReferrerPolicy"] == "same-origin"
+    assert sec["StrictTransportSecurity"]["AccessControlMaxAgeSec"] == 31536000
+    assert sec["StrictTransportSecurity"]["IncludeSubdomains"] is True
+    assert sec["StrictTransportSecurity"]["Preload"] is False
+
+    assert cfg["CustomHeadersConfig"]["Items"] == [{"Header": "X-Extra", "Value": "yes", "Override": True}]
+    assert cfg["RemoveHeadersConfig"]["Items"] == [{"Header": "Server"}]
+
+    cloudfront.delete_response_headers_policy(Id=pid, IfMatch=got["ETag"])
+
+
+def test_cloudfront_response_headers_policy_config_update_delete(cloudfront):
+    name = f"rhp-{_uuid_mod.uuid4().hex[:8]}"
+    create = cloudfront.create_response_headers_policy(ResponseHeadersPolicyConfig=_rhp_config(name))
+    pid = create["ResponseHeadersPolicy"]["Id"]
+
+    resp = cloudfront.get_response_headers_policy_config(Id=pid)
+    assert resp["ETag"] == create["ETag"]
+    assert resp["ResponseHeadersPolicyConfig"]["Name"] == name
+
+    updated = _rhp_config(name)
+    updated["CorsConfig"]["AccessControlMaxAgeSec"] = 1200
+    with pytest.raises(ClientError) as exc:
+        cloudfront.update_response_headers_policy(ResponseHeadersPolicyConfig=updated, Id=pid, IfMatch="stale")
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+
+    upd = cloudfront.update_response_headers_policy(
+        ResponseHeadersPolicyConfig=updated, Id=pid, IfMatch=create["ETag"]
+    )
+    assert upd["ResponseHeadersPolicy"]["ResponseHeadersPolicyConfig"]["CorsConfig"]["AccessControlMaxAgeSec"] == 1200
+
+    cloudfront.delete_response_headers_policy(Id=pid, IfMatch=upd["ETag"])
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_response_headers_policy(Id=pid)
+    assert exc.value.response["Error"]["Code"] == "NoSuchResponseHeadersPolicy"
+
+
+def test_cloudfront_response_headers_policy_duplicate_and_list(cloudfront):
+    name = f"rhp-{_uuid_mod.uuid4().hex[:8]}"
+    create = cloudfront.create_response_headers_policy(ResponseHeadersPolicyConfig=_rhp_config(name))
+    pid = create["ResponseHeadersPolicy"]["Id"]
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_response_headers_policy(ResponseHeadersPolicyConfig=_rhp_config(name))
+    assert exc.value.response["Error"]["Code"] == "ResponseHeadersPolicyAlreadyExists"
+
+    resp = cloudfront.list_distributions_by_response_headers_policy_id(ResponseHeadersPolicyId=pid)
+    assert resp["DistributionIdList"]["Quantity"] == 0
+    cloudfront.delete_response_headers_policy(Id=pid, IfMatch=create["ETag"])
