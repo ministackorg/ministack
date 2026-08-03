@@ -331,7 +331,7 @@ SERVICE_HANDLERS = {
 # in each service via its own `load_state()` call (see e.g. services/sqs.py);
 # a small allow-list is also restored centrally by `_load_persisted_state`
 # below. Symmetry between save and restore is enforced by
-# tests/test_persistence_symmetry.py.
+# tests/test_persistence.py.
 _state_map = {
     "apigateway": "apigateway", "apigateway_v1": "apigateway_v1",
     "sqs": "sqs", "sns": "sns", "ssm": "ssm",
@@ -357,6 +357,7 @@ _state_map = {
     "resource_groups": "resource_groups",
     "cloudtrail": "cloudtrail", "iot": "iot",
     "inspector2": "inspector2",
+    "mediaconnect": "mediaconnect",
     "mq": "mq",
     "opensearch": "opensearch",
     "s3tables": "s3tables",

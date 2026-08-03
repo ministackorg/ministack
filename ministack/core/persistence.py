@@ -26,6 +26,9 @@ STATE_DIR = os.environ.get("STATE_DIR", "/tmp/ministack-state")
 # incompatible snapshots. Legacy unwrapped files (implicit v1, account-scoped)
 # still load and migrate. (U4)
 STATE_FORMAT_VERSION = 2
+# SSM is intentionally omitted: it was regionalized in v1.4.0 (03ff785)
+# alongside the version machinery itself (98fdacc), so the v2 default already
+# covers it; stamping v3 would only add needless rollback refusal.
 SERVICE_STATE_FORMAT_VERSIONS = {
     "appsync": 3,
     "appsync_events": 3,
@@ -36,13 +39,22 @@ SERVICE_STATE_FORMAT_VERSIONS = {
     "acm": 3,
     "alb": 3,
     "athena": 3,
+    "elasticache": 3,
     "emr": 3,
     "eks": 3,
+    "eventbridge": 3,
+    "firehose": 3,
     "inspector2": 3,
     "iot": 3,
+    "kinesis": 3,
+    "kms": 3,
     "efs": 3,
     "glue": 3,
+    "mediaconnect": 3,
+    "pipes": 3,
     "s3files": 3,
+    "scheduler": 3,
+    "sns": 3,
     "batch": 3,
     "ecs": 3,
     "resource_groups": 3,
