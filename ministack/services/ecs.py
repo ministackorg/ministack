@@ -1147,6 +1147,107 @@ def _resolve_container_secrets(cdef):
     return resolved
 
 
+def _ecs_env_flag(name):
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _ecs_skip_spawn():
+    # Bookkeeping only, no real containers. CI parallel shards set this;
+    # spawning dozens of never-reaped containers exhausts the runner.
+    return _ecs_env_flag("ECS_SKIP_CONTAINER_SPAWN")
+
+
+def _spawn_task_containers(docker_client, task, td, container_overrides,
+                           launch_type, task_id, task_arn, cluster_arn):
+    # Pull images, start containers. Mutates `task` (ids, or STOPPED on secret
+    # failure). Errors logged, never raised.
+    try:
+        _ensure_ecs_reaper_thread()
+        # Detect the Docker network Ministack is running on,
+        # so ECS containers can reach sibling services (S3, etc.)
+        ecs_network = None
+        ministack_net_ip = None
+        try:
+            self_container = docker_client.containers.get(os.environ.get("HOSTNAME", ""))
+            nets = self_container.attrs["NetworkSettings"]["Networks"]
+            if nets:
+                ecs_network = next(iter(nets))
+                # IP that ECS containers should use to reach Ministack.
+                # Using ministack's own address on the shared network is
+                # the only thing that works reliably on Linux Docker —
+                # `host-gateway` magic resolves to 172.17.0.1 (docker0),
+                # which iptables typically blocks from a sibling bridge.
+                ministack_net_ip = nets[ecs_network].get("IPAddress") or None
+                logger.debug(
+                    "ECS: detected Ministack network=%s ip=%s",
+                    ecs_network, ministack_net_ip,
+                )
+        except Exception:
+            logger.debug("ECS: could not detect Ministack network, using default")
+
+        for i, cdef in enumerate(td.get("containerDefinitions", [])):
+            container_override = _container_override_for(
+                container_overrides, cdef["name"]
+            )
+            env_override = {}
+            for e in container_override.get("environment", []):
+                env_override[e["name"]] = e["value"]
+
+            env = {e["name"]: e["value"] for e in cdef.get("environment", [])}
+            try:
+                env.update(_resolve_container_secrets(cdef))
+            except _SecretResolutionError as exc:
+                # AWS fails the whole task to start (ResourceInitializationError)
+                # when a secret can't be retrieved — don't launch any container.
+                now = _iso()
+                task["lastStatus"] = "STOPPED"
+                task["desiredStatus"] = "STOPPED"
+                task["stoppingAt"] = now
+                task["stoppedAt"] = now
+                task["stopCode"] = "TaskFailedToStart"
+                task["stoppedReason"] = (
+                    "ResourceInitializationError: unable to pull secrets or "
+                    "registry auth: execution resource retrieval failed: "
+                    + str(exc))
+                for c in task.get("containers", []):
+                    c["lastStatus"] = "STOPPED"
+                break
+            env.update(env_override)
+            effective_cdef = dict(cdef)
+            if "command" in container_override:
+                effective_cdef["command"] = container_override["command"]
+
+            port_bindings = {}
+            for pm in cdef.get("portMappings", []):
+                host_port = pm.get("hostPort", pm.get("containerPort"))
+                port_bindings[f"{pm['containerPort']}/tcp"] = host_port
+
+            host_mode = td.get("networkMode") == "host"
+            metadata_token = _register_metadata(
+                task_arn, cluster_arn,
+                td, cdef, launch_type, env, host_mode, ministack_net_ip,
+            )
+            run_kwargs = _build_run_kwargs(
+                effective_cdef, td, env, port_bindings, ecs_network,
+                host_mode, task_id, task_arn, ministack_net_ip,
+                cluster_arn,
+            )
+
+            try:
+                container = docker_client.containers.run(cdef["image"], **run_kwargs)
+                task["_docker_ids"].append(container.id)
+                ecs_metadata.set_docker_id(metadata_token, container.id)
+                task.setdefault("_metadata_tokens", []).append(metadata_token)
+                if i < len(task["containers"]):
+                    task["containers"][i]["runtimeId"] = container.id[:12]
+                logger.info("ECS: started container %s for task %s", cdef['image'], task_id[:8])
+            except Exception as e:
+                ecs_metadata.unregister_token(metadata_token)
+                logger.warning("ECS: Docker run failed for %s: %s", cdef.get('image'), e)
+    except Exception as exc:
+        logger.warning("ECS: task container spawn failed for %s: %s", task_arn, exc)
+
+
 def _run_task(data):
     cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
     if cluster_name is None:
@@ -1172,6 +1273,9 @@ def _run_task(data):
 
     tasks = []
     failures = []
+
+    docker_client = _get_docker()
+    spawn_enabled = bool(docker_client) and not _ecs_skip_spawn()
 
     for _ in range(count):
         task_id = new_uuid()
@@ -1218,94 +1322,18 @@ def _run_task(data):
             "_docker_ids": [],
         }
 
-        docker_client = _get_docker()
-        if docker_client and td:
-            _ensure_ecs_reaper_thread()
-            # Detect the Docker network Ministack is running on,
-            # so ECS containers can reach sibling services (S3, etc.)
-            ecs_network = None
-            ministack_net_ip = None
-            try:
-                self_container = docker_client.containers.get(os.environ.get("HOSTNAME", ""))
-                nets = self_container.attrs["NetworkSettings"]["Networks"]
-                if nets:
-                    ecs_network = next(iter(nets))
-                    # IP that ECS containers should use to reach Ministack.
-                    # Using ministack's own address on the shared network is
-                    # the only thing that works reliably on Linux Docker —
-                    # `host-gateway` magic resolves to 172.17.0.1 (docker0),
-                    # which iptables typically blocks from a sibling bridge.
-                    ministack_net_ip = nets[ecs_network].get("IPAddress") or None
-                    logger.debug(
-                        "ECS: detected Ministack network=%s ip=%s",
-                        ecs_network, ministack_net_ip,
-                    )
-            except Exception:
-                logger.debug("ECS: could not detect Ministack network, using default")
-
-            for i, cdef in enumerate(td.get("containerDefinitions", [])):
-                container_override = _container_override_for(
-                    container_overrides, cdef["name"]
-                )
-                env_override = {}
-                for e in container_override.get("environment", []):
-                    env_override[e["name"]] = e["value"]
-
-                env = {e["name"]: e["value"] for e in cdef.get("environment", [])}
-                try:
-                    env.update(_resolve_container_secrets(cdef))
-                except _SecretResolutionError as exc:
-                    # AWS fails the whole task to start (ResourceInitializationError)
-                    # when a secret can't be retrieved — don't launch any container.
-                    now = _iso()
-                    task["lastStatus"] = "STOPPED"
-                    task["desiredStatus"] = "STOPPED"
-                    task["stoppingAt"] = now
-                    task["stoppedAt"] = now
-                    task["stopCode"] = "TaskFailedToStart"
-                    task["stoppedReason"] = (
-                        "ResourceInitializationError: unable to pull secrets or "
-                        "registry auth: execution resource retrieval failed: "
-                        + str(exc))
-                    for c in task.get("containers", []):
-                        c["lastStatus"] = "STOPPED"
-                    break
-                env.update(env_override)
-                effective_cdef = dict(cdef)
-                if "command" in container_override:
-                    effective_cdef["command"] = container_override["command"]
-
-                port_bindings = {}
-                for pm in cdef.get("portMappings", []):
-                    host_port = pm.get("hostPort", pm.get("containerPort"))
-                    port_bindings[f"{pm['containerPort']}/tcp"] = host_port
-
-                host_mode = td.get("networkMode") == "host"
-                metadata_token = _register_metadata(
-                    task_arn, _clusters[cluster_name]["clusterArn"],
-                    td, cdef, launch_type, env, host_mode, ministack_net_ip,
-                )
-                run_kwargs = _build_run_kwargs(
-                    effective_cdef, td, env, port_bindings, ecs_network,
-                    host_mode, task_id, task_arn, ministack_net_ip,
-                    _clusters[cluster_name]["clusterArn"],
-                )
-
-                try:
-                    container = docker_client.containers.run(cdef["image"], **run_kwargs)
-                    task["_docker_ids"].append(container.id)
-                    ecs_metadata.set_docker_id(metadata_token, container.id)
-                    task.setdefault("_metadata_tokens", []).append(metadata_token)
-                    if i < len(task["containers"]):
-                        task["containers"][i]["runtimeId"] = container.id[:12]
-                    logger.info("ECS: started container %s for task %s", cdef['image'], task_id[:8])
-                except Exception as e:
-                    ecs_metadata.unregister_token(metadata_token)
-                    logger.warning("ECS: Docker run failed for %s: %s", cdef.get('image'), e)
-
+        cluster_arn = _clusters[cluster_name]["clusterArn"]
+        # Record task synchronously so runningCount / describe are immediate.
         _tasks[task_arn] = task
         if req_tags:
             _tags[task_arn] = list(req_tags)
+
+        # Spawn before sanitize so response carries runtimeId / STOPPED state.
+        if spawn_enabled and td:
+            _spawn_task_containers(
+                docker_client, task, td, container_overrides,
+                launch_type, task_id, task_arn, cluster_arn)
+
         tasks.append(_sanitize(task))
 
     _recount_cluster(cluster_name)

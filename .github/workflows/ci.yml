@@ -62,6 +62,10 @@ jobs:
 
       - name: Start MiniStack
         run: |
+          # Don't spawn containers for parallel shards (exhausts runner), but spawn for serial (some tests need containers).
+          if [ "${{ matrix.mode }}" != "serial" ]; then
+            export ECS_SKIP_CONTAINER_SPAWN=1
+          fi
           REDIS_HOST=localhost python -m hypercorn ministack.app:app --bind 0.0.0.0:4566 --keep-alive 75 > ministack.log 2>&1 &
           for i in $(seq 1 15); do
             curl -sf http://localhost:4566/_ministack/health && break

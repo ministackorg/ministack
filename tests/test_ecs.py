@@ -13,6 +13,10 @@ from botocore.exceptions import ClientError
 
 from ministack.services import ecs as ecs_service
 
+# Needs a real container -> mark serial so it runs in the isolated single-worker
+# job (spawning on there); parallel shards are bookkeeping-only.
+requires_real_container = pytest.mark.serial
+
 
 def _replace_arn_section(arn, index, value):
     parts = arn.split(":", 5)
@@ -56,6 +60,7 @@ def test_ecs_list_task_defs(ecs):
     resp = ecs.list_task_definitions(familyPrefix="test-task")
     assert len(resp["taskDefinitionArns"]) >= 1
 
+@requires_real_container
 def test_ecs_run_task_stops_after_exit(ecs):
     """DescribeTasks transitions to STOPPED after Docker container exits."""
     ecs.create_cluster(clusterName="task-lifecycle")
@@ -90,6 +95,7 @@ def test_ecs_run_task_stops_after_exit(ecs):
     assert stopped, "Task should transition to STOPPED after container exits"
 
 
+@requires_real_container
 def test_ecs_list_tasks_reflects_natural_container_exit(ecs):
     """ListTasks must also reconcile lifecycle when a container has exited
     on its own. Previously only DescribeTasks ran the reconciler, so a user
@@ -131,6 +137,7 @@ def test_ecs_list_tasks_reflects_natural_container_exit(ecs):
     )
 
 
+@requires_real_container
 def test_ecs_run_task_network_connectivity(ecs):
     """ECS container can reach Ministack (proves network detection works)."""
     endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
@@ -180,6 +187,7 @@ def test_ecs_run_task_network_connectivity(ecs):
             break
     assert success, "Task should transition to STOPPED"
 
+@requires_real_container
 def test_ecs_run_task_metadata_v4(ecs):
     """Container can resolve and read its V4 task-metadata URI end-to-end.
 
@@ -251,6 +259,8 @@ def test_ecs_run_task_applies_container_command_overrides(monkeypatch):
     fake_docker = SimpleNamespace(containers=fake_containers)
 
     monkeypatch.setattr(_ecs, "_get_docker", lambda: fake_docker)
+    # Fake-docker unit test: ignore CI skip flag.
+    monkeypatch.setattr(_ecs, "_ecs_skip_spawn", lambda: False)
 
     _ecs._register_task_definition({
         "family": "cmd-override-td",
@@ -310,6 +320,8 @@ def test_ecs_run_task_command_override_allows_empty_command(monkeypatch):
     fake_docker = SimpleNamespace(containers=fake_containers)
 
     monkeypatch.setattr(_ecs, "_get_docker", lambda: fake_docker)
+    # Fake-docker unit test: ignore CI skip flag.
+    monkeypatch.setattr(_ecs, "_ecs_skip_spawn", lambda: False)
 
     _ecs._register_task_definition({
         "family": "empty-cmd-override-td",
@@ -364,6 +376,8 @@ def test_ecs_run_task_injects_secrets_manager_secrets(monkeypatch):
     fake_containers = FakeContainers()
     monkeypatch.setattr(_ecs, "_get_docker",
                         lambda: SimpleNamespace(containers=fake_containers))
+    # Fake-docker unit test: ignore CI skip flag.
+    monkeypatch.setattr(_ecs, "_ecs_skip_spawn", lambda: False)
 
     _ecs._register_task_definition({
         "family": "secrets-td",
