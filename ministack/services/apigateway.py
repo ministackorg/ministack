@@ -917,21 +917,24 @@ async def handle_execute(api_id, stage, path, method, headers, body, query_param
 def _route_specificity(method: str, route_path: str) -> tuple:
     """Rank a candidate route by how specifically it matches a request.
 
-    Real API Gateway always dispatches to the most specific matching route,
-    independent of the order in which routes were created. We approximate that
-    ordering with a tuple compared lexicographically (higher is more specific):
+    Real API Gateway selects the most specific match with this priority
+    (docs, "Routing API requests"): (1) a full match for route+method, then
+    (2) a match with a greedy ``{proxy+}`` path variable, then (3) ``$default``.
+    So the *primary* discriminator is full-match-beats-greedy — a full match
+    always outranks a greedy one, even one with more literal segments. The tuple
+    is compared lexicographically (higher is more specific):
 
-      1. Number of literal (non-parameter) path segments — an exact path beats
+      1. Non-greedy (full match) over greedy (``{proxy+}`` catch-all).
+      2. Number of literal (non-parameter) path segments — a static path beats
          one with placeholders.
-      2. Explicit method over ``ANY`` — ``POST /items`` beats ``ANY /items``.
-      3. Non-greedy over greedy — a route without ``{proxy+}`` beats a catch-all.
+      3. Explicit method over ``ANY`` — ``POST /items`` beats ``ANY /items``.
     """
     segments = route_path.strip("/").split("/")
     literal_segments = sum(
         1 for s in segments if not (s.startswith("{") and s.endswith("}"))
     )
     is_greedy = any(s == "{proxy+}" for s in segments)
-    return (literal_segments, 0 if method == "ANY" else 1, 0 if is_greedy else 1)
+    return (0 if is_greedy else 1, literal_segments, 0 if method == "ANY" else 1)
 
 
 def _match_route(api_id, method, path):

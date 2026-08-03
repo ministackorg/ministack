@@ -2429,3 +2429,15 @@ def test_rule_event_aliased_star_nests_the_message():
         "SELECT * AS payload FROM 'telemetry'", "telemetry", b'{"temp": 22}'
     )
     assert event == {"payload": {"temp": 22}}
+
+
+def test_rule_event_from_less_basic_ingest_projects():
+    """FROM is optional for Basic Ingest rules, so a FROM-less `SELECT` must
+    still project rather than fall through to `*` and deliver the whole message.
+    """
+    from ministack.services.iot import _rule_event
+
+    event = _rule_event(
+        "SELECT deviceId AS id, temp", "$aws/rules/myrule", b'{"deviceId": "d1", "temp": 22, "extra": "x"}'
+    )
+    assert event == {"id": "d1", "temp": 22}

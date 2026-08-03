@@ -1383,9 +1383,22 @@ _SELECT_ATTR_RE = re.compile(r"^[A-Za-z_][\w]*(\.[A-Za-z_][\w]*)*$")
 
 
 def _rule_select_clause(sql: str) -> str:
-    """Extract the SELECT clause of a rule SQL statement."""
-    m = _SELECT_CLAUSE_RE.search(sql or "")
-    return m.group(1).strip() if m else "*"
+    """Extract the SELECT clause of a rule SQL statement.
+
+    FROM is optional for Basic Ingest rules, so a rule may be just
+    ``SELECT <projection>`` with no ``FROM '<topic>'``. Try the FROM form first
+    (it stops at ``FROM '`` so inner subquery FROMs are preserved), then fall
+    back to everything after SELECT for the FROM-less form.
+    """
+    sql = sql or ""
+    m = _SELECT_CLAUSE_RE.search(sql)
+    if m:
+        return m.group(1).strip()
+    m = re.match(r"\s*SELECT\s+(.+)$", sql, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return "*"
+    proj = re.split(r"\s+WHERE\s+", m.group(1), maxsplit=1, flags=re.IGNORECASE)[0]
+    return proj.strip()
 
 
 def _split_select_items(clause: str) -> list[str]:

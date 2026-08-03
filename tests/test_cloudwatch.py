@@ -577,3 +577,50 @@ def test_cloudwatch_disable_alarm_actions(cw):
     alarm = cw.describe_alarms(AlarmNames=["heimdall-disable-actions"])["MetricAlarms"][0]
     assert alarm["ActionsEnabled"] is False
     cw.delete_alarms(AlarmNames=["heimdall-disable-actions"])
+
+
+def test_cloudwatch_describe_alarms_cbor_timestamps_are_tag1():
+    """DescribeAlarms over smithy-rpc-v2-cbor must encode Timestamp members as
+    CBOR tag 1 (epoch datetime), not a bare unsigned int, or the Terraform AWS
+    provider >= 6.50 fails with `unexpected value type cbor.Uint` (issue #1261).
+    Integer members (Period, EvaluationPeriods) stay CBOR integers, which the
+    Smithy Integer decoder accepts.
+    """
+    import datetime as _dt
+
+    import cbor2
+
+    from ministack.core import responses as _resp
+    from ministack.services import cloudwatch as _cw
+
+    acct_tok = _resp._request_account_id.set("000000000000")
+    region_tok = _resp._request_region.set("us-east-1")
+    name = f"cbor-alarm-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        _cw._put_metric_alarm({}, {
+            "AlarmName": name,
+            "ComparisonOperator": "GreaterThanThreshold",
+            "EvaluationPeriods": 1,
+            "MetricName": "Errors",
+            "Namespace": "AWS/Lambda",
+            "Period": 300,
+            "Statistic": "Sum",
+            "Threshold": 1,
+        }, is_cbor=True)
+
+        status, _headers, body = _cw._describe_alarms({}, {"AlarmNames": [name]}, is_cbor=True)
+        assert status == 200
+        decoded = cbor2.loads(body)
+        alarm = next(a for a in decoded["MetricAlarms"] if a["AlarmName"] == name)
+
+        # cbor2 decodes a CBOR tag-1 value back into a datetime — proof the wire
+        # bytes were tag 1, not a bare uint.
+        assert isinstance(alarm["StateUpdatedTimestamp"], _dt.datetime)
+        assert isinstance(alarm["AlarmConfigurationUpdatedTimestamp"], _dt.datetime)
+        # Integer members remain plain integers.
+        assert isinstance(alarm["Period"], int) and alarm["Period"] == 300
+        assert isinstance(alarm["EvaluationPeriods"], int)
+    finally:
+        _cw._alarms.pop_scoped("000000000000", "us-east-1", name, None)
+        _resp._request_region.reset(region_tok)
+        _resp._request_account_id.reset(acct_tok)

@@ -258,6 +258,25 @@ def test_apigw_match_route_default_fallback():
     assert route["routeKey"] == "$default"
 
 
+@pytest.mark.parametrize("greedy_first", [False, True])
+def test_apigw_match_route_full_match_beats_greedy_with_more_literals(greedy_first):
+    """AWS priority is full-match-beats-greedy, independent of literal count: a
+    fully-parameterized route (`GET /{x}/{y}/{z}`) is a full match and must win
+    over a greedy route with more literal segments (`GET /a/b/{proxy+}`), which
+    is only a tier-2 greedy match, for the request `/a/b/c`.
+    """
+    from ministack.services import apigateway as apigw_mod
+
+    full = "GET /{x}/{y}/{z}"
+    greedy = "GET /a/b/{proxy+}"
+    keys = [greedy, full] if greedy_first else [full, greedy]
+    api_id = _make_api_with_routes(apigw_mod, keys)
+
+    route = apigw_mod._match_route(api_id, "GET", "/a/b/c")
+    assert route is not None
+    assert route["routeKey"] == full
+
+
 def test_apigw_create_integration(apigw):
     api_id = apigw.create_api(Name="integ-api", ProtocolType="HTTP")["ApiId"]
     resp = apigw.create_integration(

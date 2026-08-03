@@ -1055,7 +1055,10 @@ def _describe_alarms(params, cbor_data, is_cbor, is_json=False):
 
     if is_cbor:
         return _cbor_ok(
-            {"MetricAlarms": metric_alarms, "CompositeAlarms": composite_results}
+            {
+                "MetricAlarms": [_cbor_alarm(a) for a in metric_alarms],
+                "CompositeAlarms": [_cbor_alarm(a) for a in composite_results],
+            }
         )
     if is_json:
         return _json_ok(
@@ -1110,7 +1113,7 @@ def _describe_alarms_for_metric(params, cbor_data, is_cbor, is_json=False):
     ]
 
     if is_cbor:
-        return _cbor_ok({"MetricAlarms": result})
+        return _cbor_ok({"MetricAlarms": [_cbor_alarm(a) for a in result]})
     if is_json:
         return _json_ok({"MetricAlarms": result})
 
@@ -1158,7 +1161,7 @@ def _describe_alarm_history(params, cbor_data, is_cbor, is_json=False):
     items = items[:max_records]
 
     if is_cbor:
-        return _cbor_ok({"AlarmHistoryItems": items})
+        return _cbor_ok({"AlarmHistoryItems": [_cbor_history_item(i) for i in items]})
     if is_json:
         return _json_ok({"AlarmHistoryItems": items})
 
@@ -1544,6 +1547,43 @@ def _dims_from_list(dimensions: list[dict]) -> dict:
 def _p(params, key, default=""):
     val = params.get(key, [default])
     return val[0] if isinstance(val, list) else val
+
+
+def _cbor_timestamp(value):
+    """Encode an epoch/ISO timestamp as CBOR tag 1 (epoch date-time).
+
+    smithy-rpc-v2-cbor (used by the Terraform AWS provider >= 6.50 for
+    CloudWatch) expects Timestamp members as CBOR tag 1. A bare Python ``int``
+    serializes as a CBOR unsigned integer, which the provider's typed decoder
+    rejects with ``unexpected value type cbor.Uint`` (issue #1261).
+    """
+    import cbor2
+
+    epoch = _parse_ts(value) if isinstance(value, str) else value
+    if epoch is None:
+        return value
+    return cbor2.CBORTag(1, float(epoch))
+
+
+def _cbor_alarm(alarm):
+    """Return a CBOR-safe copy of an alarm with Timestamp members tag-1 encoded."""
+    out = dict(alarm)
+    for field in (
+        "StateUpdatedTimestamp",
+        "AlarmConfigurationUpdatedTimestamp",
+        "StateTransitionedTimestamp",
+    ):
+        if out.get(field) is not None:
+            out[field] = _cbor_timestamp(out[field])
+    return out
+
+
+def _cbor_history_item(item):
+    """Return a CBOR-safe copy of an alarm-history item with a tag-1 Timestamp."""
+    out = dict(item)
+    if out.get("Timestamp") is not None:
+        out["Timestamp"] = _cbor_timestamp(out["Timestamp"])
+    return out
 
 
 def _cbor_ok(data: dict):
