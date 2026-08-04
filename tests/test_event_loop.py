@@ -40,6 +40,13 @@ from ministack.services.cloudformation import lifecycle as cfn_lifecycle
 from ministack.services.cloudformation import provisioners as cfn_provisioners
 from ministack.services.cloudformation import stacks as cfn_stacks
 
+try:
+    from ministack.services import stepfunctions_lifecycle
+except ImportError:
+    # Fail-before runs copy this test file onto the pre-v16 head, where the
+    # lifecycle intentionally does not exist yet.
+    stepfunctions_lifecycle = None
+
 
 class _SlowContainer:
     def stop(self, **_kwargs):
@@ -86,6 +93,26 @@ async def _call_cloudformation_action(action, data=None):
         json.dumps(data or {}).encode(),
         {},
     )
+
+
+def _reset_test_lifecycles(monkeypatch):
+    monkeypatch.setattr(
+        cfn_lifecycle,
+        "_stack_task_lifecycles",
+        LoopLocal(cfn_lifecycle._StackTaskLifecycle),
+    )
+    monkeypatch.setattr(
+        ministack_app,
+        "_ordinary_request_reset_barriers",
+        LoopLocal(ministack_app._RequestResetBarrier),
+    )
+    monkeypatch.setattr(ministack_app, "_RESET_SERIALIZED_SERVICE_MODULES", ())
+    if stepfunctions_lifecycle is not None:
+        monkeypatch.setattr(
+            stepfunctions_lifecycle,
+            "_sync_action_lifecycles",
+            LoopLocal(stepfunctions_lifecycle._SyncActionLifecycle),
+        )
 
 
 def _clear_cloudformation_state():
@@ -1819,6 +1846,7 @@ def test_cancelled_stepfunctions_sync_action_waits_for_dedicated_thread(
     action_started = threading.Event()
     release_action = threading.Event()
     action_finished = threading.Event()
+    wipe_called = threading.Event()
 
     def sync_execution(_data):
         action_started.set()
@@ -1827,6 +1855,10 @@ def test_cancelled_stepfunctions_sync_action_waits_for_dedicated_thread(
         return 200, {}, b"{}"
 
     monkeypatch.setattr(stepfunctions, "_start_sync_execution", sync_execution)
+    _reset_test_lifecycles(monkeypatch)
+    monkeypatch.setattr(
+        ministack_app, "_reset_all_state", lambda: wipe_called.set()
+    )
 
     async def exercise():
         request = asyncio.create_task(
@@ -1838,14 +1870,325 @@ def test_cancelled_stepfunctions_sync_action_waits_for_dedicated_thread(
         request.cancel()
         await asyncio.sleep(0.01)
         request.cancel()
+        reset = asyncio.create_task(
+            ministack_app._reset_all_state_after_service_dispatch_drains()
+        )
         await asyncio.sleep(0.05)
         assert not request.done()
         assert not action_finished.is_set()
+        assert not wipe_called.is_set()
 
         release_action.set()
         result = await asyncio.gather(request, return_exceptions=True)
+        await reset
         assert isinstance(result[0], asyncio.CancelledError)
         assert action_finished.is_set()
+        assert wipe_called.is_set()
+
+    fallback = threading.Timer(1, release_action.set)
+    fallback.start()
+    try:
+        asyncio.run(exercise())
+    finally:
+        release_action.set()
+        fallback.cancel()
+
+
+def test_reset_waits_for_start_sync_execution_thread(monkeypatch):
+    action_started = threading.Event()
+    release_action = threading.Event()
+    wipe_called = threading.Event()
+
+    def controlled_execution(exec_arn):
+        action_started.set()
+        release_action.wait(timeout=2)
+        execution = stepfunctions._executions[exec_arn]
+        execution["status"] = "SUCCEEDED"
+        execution["stopDate"] = "2026-01-01T00:00:00Z"
+        execution["output"] = "{}"
+
+    def reset_state():
+        stepfunctions.reset()
+        wipe_called.set()
+
+    _reset_test_lifecycles(monkeypatch)
+    monkeypatch.setattr(stepfunctions, "_run_execution", controlled_execution)
+    monkeypatch.setattr(ministack_app, "_reset_all_state", reset_state)
+    stepfunctions.reset()
+
+    async def exercise():
+        created = await _call_stepfunctions_action(
+            "CreateStateMachine",
+            {
+                "name": "sync-reset",
+                "definition": json.dumps(
+                    {"StartAt": "Done", "States": {"Done": {"Type": "Succeed"}}}
+                ),
+                "roleArn": "arn:aws:iam::000000000000:role/test",
+                "type": "EXPRESS",
+            },
+        )
+        state_machine_arn = json.loads(created[2])["stateMachineArn"]
+        request = asyncio.create_task(
+            _call_stepfunctions_action(
+                "StartSyncExecution", {"stateMachineArn": state_machine_arn}
+            )
+        )
+        while not action_started.is_set():
+            await asyncio.sleep(0.001)
+
+        reset = asyncio.create_task(
+            ministack_app._reset_all_state_after_service_dispatch_drains()
+        )
+        await asyncio.sleep(0.05)
+        wiped_before_completion = wipe_called.is_set()
+
+        release_action.set()
+        response, _ = await asyncio.gather(request, reset)
+        assert not wiped_before_completion
+        assert response[0] == 200
+        assert json.loads(response[2])["status"] == "SUCCEEDED"
+        assert wipe_called.is_set()
+        assert not stepfunctions._executions
+
+    fallback = threading.Timer(1, release_action.set)
+    fallback.start()
+    try:
+        asyncio.run(exercise())
+    finally:
+        release_action.set()
+        fallback.cancel()
+        stepfunctions.reset()
+
+
+def test_reset_waits_for_test_state_thread_and_wipes_its_mutation(monkeypatch):
+    action_started = threading.Event()
+    release_action = threading.Event()
+    wipe_called = threading.Event()
+    state = []
+
+    def test_state(_data):
+        action_started.set()
+        release_action.wait(timeout=2)
+        state.append("test-state-mutation")
+        return 200, {}, b'{"status":"SUCCEEDED"}'
+
+    def reset_state():
+        state.clear()
+        wipe_called.set()
+
+    _reset_test_lifecycles(monkeypatch)
+    monkeypatch.setattr(stepfunctions, "_test_state", test_state)
+    monkeypatch.setattr(ministack_app, "_reset_all_state", reset_state)
+
+    async def exercise():
+        request = asyncio.create_task(_call_stepfunctions_action("TestState"))
+        while not action_started.is_set():
+            await asyncio.sleep(0.001)
+
+        reset = asyncio.create_task(
+            ministack_app._reset_all_state_after_service_dispatch_drains()
+        )
+        await asyncio.sleep(0.05)
+        wiped_before_completion = wipe_called.is_set()
+
+        release_action.set()
+        response, _ = await asyncio.gather(request, reset)
+        assert not wiped_before_completion
+        assert response[0] == 200
+        assert wipe_called.is_set()
+        assert state == []
+
+    fallback = threading.Timer(1, release_action.set)
+    fallback.start()
+    try:
+        asyncio.run(exercise())
+    finally:
+        release_action.set()
+        fallback.cancel()
+
+
+def test_sync_action_started_during_reset_returns_503_without_residue(monkeypatch):
+    first_started = threading.Event()
+    release_first = threading.Event()
+    wipe_started = threading.Event()
+    release_wipe = threading.Event()
+    second_mutated = threading.Event()
+    call_count = 0
+    call_lock = threading.Lock()
+
+    def sync_execution(_data):
+        nonlocal call_count
+        with call_lock:
+            call_count += 1
+            this_call = call_count
+        if this_call == 1:
+            first_started.set()
+            release_first.wait(timeout=2)
+        else:
+            second_mutated.set()
+        return 200, {}, b"{}"
+
+    def reset_state():
+        wipe_started.set()
+        release_wipe.wait(timeout=2)
+
+    _reset_test_lifecycles(monkeypatch)
+    monkeypatch.setattr(stepfunctions, "_start_sync_execution", sync_execution)
+    monkeypatch.setattr(ministack_app, "_reset_all_state", reset_state)
+
+    async def exercise():
+        first = asyncio.create_task(
+            _call_stepfunctions_action("StartSyncExecution")
+        )
+        while not first_started.is_set():
+            await asyncio.sleep(0.001)
+
+        reset = asyncio.create_task(
+            ministack_app._reset_all_state_after_service_dispatch_drains()
+        )
+        if stepfunctions_lifecycle is None:
+            while not wipe_started.is_set():
+                await asyncio.sleep(0.001)
+        else:
+            lifecycle = stepfunctions_lifecycle._get_sync_action_lifecycle()
+            while lifecycle._accepting:
+                await asyncio.sleep(0.001)
+
+        second = await _call_stepfunctions_action("StartSyncExecution")
+        release_first.set()
+        while not wipe_started.is_set():
+            await asyncio.sleep(0.001)
+        release_wipe.set()
+        await asyncio.gather(first, reset)
+        return second
+
+    fallback = threading.Timer(1, release_first.set)
+    fallback.start()
+    try:
+        second = asyncio.run(exercise())
+        assert second[0] == 503
+        assert b"ServiceUnavailableException" in second[2]
+        assert call_count == 1
+        assert not second_mutated.is_set()
+    finally:
+        release_first.set()
+        release_wipe.set()
+        fallback.cancel()
+
+
+def test_nested_sync_action_is_covered_by_draining_parent(monkeypatch):
+    parent_started = threading.Event()
+    release_parent = threading.Event()
+    wipe_called = threading.Event()
+    state = []
+
+    def nested_test_state(_data):
+        state.append("nested")
+        return 200, {}, b'{"status":"SUCCEEDED"}'
+
+    def parent_sync_execution(_data):
+        nested = stepfunctions._drive_service_handler_sync(
+            "states",
+            stepfunctions.handle_request,
+            "POST",
+            "/",
+            {"x-amz-target": "AWSStepFunctions.TestState"},
+            b"{}",
+            {},
+        )
+        parent_started.set()
+        release_parent.wait(timeout=2)
+        state.append("parent")
+        return nested
+
+    def reset_state():
+        state.clear()
+        wipe_called.set()
+
+    _reset_test_lifecycles(monkeypatch)
+    monkeypatch.setattr(stepfunctions, "_test_state", nested_test_state)
+    monkeypatch.setattr(
+        stepfunctions, "_start_sync_execution", parent_sync_execution
+    )
+    monkeypatch.setattr(ministack_app, "_reset_all_state", reset_state)
+
+    async def exercise():
+        parent = asyncio.create_task(
+            _call_stepfunctions_action("StartSyncExecution")
+        )
+        while not parent_started.is_set():
+            await asyncio.sleep(0.001)
+        reset = asyncio.create_task(
+            ministack_app._reset_all_state_after_service_dispatch_drains()
+        )
+        await asyncio.sleep(0.05)
+        wiped_before_parent = wipe_called.is_set()
+
+        release_parent.set()
+        response, _ = await asyncio.gather(parent, reset)
+        assert not wiped_before_parent
+        assert response[0] == 200
+        assert wipe_called.is_set()
+        assert state == []
+
+    fallback = threading.Timer(1, release_parent.set)
+    fallback.start()
+    try:
+        asyncio.run(exercise())
+    finally:
+        release_parent.set()
+        fallback.cancel()
+
+
+def test_cancelled_reset_completes_sfn_drain_and_reopens_admission(monkeypatch):
+    action_started = threading.Event()
+    release_action = threading.Event()
+    wipe_called = threading.Event()
+    state = []
+
+    def test_state(_data):
+        action_started.set()
+        release_action.wait(timeout=2)
+        state.append("completed")
+        return 200, {}, b'{"status":"SUCCEEDED"}'
+
+    def reset_state():
+        state.clear()
+        wipe_called.set()
+
+    _reset_test_lifecycles(monkeypatch)
+    monkeypatch.setattr(stepfunctions, "_test_state", test_state)
+    monkeypatch.setattr(ministack_app, "_reset_all_state", reset_state)
+
+    async def exercise():
+        request = asyncio.create_task(_call_stepfunctions_action("TestState"))
+        while not action_started.is_set():
+            await asyncio.sleep(0.001)
+        reset = asyncio.create_task(
+            ministack_app._reset_all_state_after_service_dispatch_drains()
+        )
+        lifecycle = stepfunctions_lifecycle._get_sync_action_lifecycle()
+        while lifecycle._accepting:
+            await asyncio.sleep(0.001)
+
+        reset.cancel()
+        await asyncio.sleep(0.01)
+        reset.cancel()
+        await asyncio.sleep(0.05)
+        assert not reset.done()
+        assert not wipe_called.is_set()
+
+        release_action.set()
+        request_result = await request
+        reset_result = await asyncio.gather(reset, return_exceptions=True)
+        assert request_result[0] == 200
+        assert isinstance(reset_result[0], asyncio.CancelledError)
+        assert wipe_called.is_set()
+        assert state == []
+
+        reopened = await _call_stepfunctions_action("TestState")
+        assert reopened[0] == 200
 
     fallback = threading.Timer(1, release_action.set)
     fallback.start()
@@ -1883,7 +2226,7 @@ def test_stepfunctions_marshal_fails_fast_on_target_loop(monkeypatch):
     asyncio.run(exercise())
 
 
-def test_stepfunctions_marshaled_rds_waits_for_reset_and_sees_fresh_state(
+def test_stepfunctions_sync_request_during_wipe_returns_503(
     monkeypatch,
 ):
     reset_started = threading.Event()
@@ -1941,8 +2284,9 @@ def test_stepfunctions_marshaled_rds_waits_for_reset_and_sees_fresh_state(
 
         release_reset.set()
         _, result = await asyncio.gather(reset, integration)
-        assert integration_started.is_set()
-        assert json.loads(result[2]) == {"generation": "fresh"}
+        assert not integration_started.is_set()
+        assert result[0] == 503
+        assert b"ServiceUnavailableException" in result[2]
 
     fallback = threading.Timer(1, release_reset.set)
     fallback.start()

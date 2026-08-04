@@ -50,6 +50,7 @@ from ministack.core.responses import (
     new_uuid,
     now_iso,
 )
+from ministack.services import stepfunctions_lifecycle
 
 logger = logging.getLogger("states")
 
@@ -302,15 +303,29 @@ async def handle_request(method, path, headers, body, query_params):
         except RuntimeError:
             # Nested SDK integrations synchronously send-drive this router from
             # an existing execution thread.  They inherit the outer execution's
-            # server-loop context and must remain inline (especially nested
-            # StartSyncExecution), rather than spawning another thread.
+            # server-loop context and must remain inline rather than spawning
+            # another thread. Nested synchronous work is covered transitively by
+            # its registered dedicated-thread parent.
             return _finalize_response(handler(data))
 
         loop_token = _execution_server_loop.set(server_loop)
         try:
             if action in {"StartSyncExecution", "TestState"}:
+                lifecycle = stepfunctions_lifecycle._get_sync_action_lifecycle()
+                try:
+                    # Registration is synchronous on the server loop, with no
+                    # await before the dedicated thread starts below.
+                    lifecycle.enter_action()
+                except stepfunctions_lifecycle.SyncActionAdmissionClosed:
+                    return error_response_json(
+                        "ServiceUnavailableException",
+                        "Step Functions synchronous actions are unavailable during reset",
+                        503,
+                    )
                 return _finalize_response(
-                    await _run_sync_action_in_dedicated_thread(handler, data)
+                    await _run_sync_action_in_dedicated_thread(
+                        handler, data, lifecycle
+                    )
                 )
             return _finalize_response(handler(data))
         finally:
@@ -328,7 +343,7 @@ def _complete_thread_future(future, result=None, error=None):
         future.set_result(result)
 
 
-async def _run_sync_action_in_dedicated_thread(handler, data):
+async def _run_sync_action_in_dedicated_thread(handler, data, lifecycle):
     """Run a synchronous execution action without consuming the shared pool.
 
     Execution threads can block while a service integration is marshalled back
@@ -341,28 +356,43 @@ async def _run_sync_action_in_dedicated_thread(handler, data):
     ctx_snapshot = contextvars.copy_context()
 
     def run():
+        result = None
+        error = None
         try:
             result = ctx_snapshot.run(handler, data)
         except BaseException as exc:
-            loop.call_soon_threadsafe(
-                _complete_thread_future,
-                result_future,
-                None,
-                exc,
-            )
-        else:
+            error = exc
+        try:
             loop.call_soon_threadsafe(
                 _complete_thread_future,
                 result_future,
                 result,
-                None,
+                error,
+            )
+        except RuntimeError:
+            logger.debug(
+                "Step Functions action finished after its server loop closed"
+            )
+        try:
+            loop.call_soon_threadsafe(
+                lifecycle.leave_action,
+            )
+        except RuntimeError:
+            # LoopLocal state dies with the closing loop. The worker is already
+            # complete, so there is no live reset waiter left to notify.
+            logger.debug(
+                "Step Functions action lifecycle closed with its server loop"
             )
 
-    threading.Thread(
-        target=run,
-        name=f"ministack-sfn-{handler.__name__}",
-        daemon=True,
-    ).start()
+    try:
+        threading.Thread(
+            target=run,
+            name=f"ministack-sfn-{handler.__name__}",
+            daemon=True,
+        ).start()
+    except BaseException:
+        lifecycle.leave_action()
+        raise
 
     try:
         return await asyncio.shield(result_future)

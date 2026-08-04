@@ -508,7 +508,9 @@ def _get_ordinary_request_reset_barrier() -> _RequestResetBarrier:
     return _ordinary_request_reset_barriers.get()
 
 
-async def _complete_reset_after_stack_admission_closes(stack_tasks, barrier):
+async def _complete_reset_after_stack_admission_closes(
+    stack_tasks, sync_actions, barrier
+):
     """Run the committed reset sequence and always reopen its admission."""
     barrier_entered = False
     try:
@@ -516,6 +518,10 @@ async def _complete_reset_after_stack_admission_closes(stack_tasks, barrier):
         # unwinding provisioners may themselves need an admission lock or
         # callback request.
         await stack_tasks.begin_reset()
+        # CloudFormation drains first: unwinding custom resources may start a
+        # synchronous execution. Once that work is quiescent, close and drain
+        # the dedicated SFN actions before taking the request writer barrier.
+        await sync_actions.begin_reset()
         await barrier.enter_reset()
         barrier_entered = True
         async with AsyncExitStack() as stack:
@@ -533,21 +539,27 @@ async def _complete_reset_after_stack_admission_closes(stack_tasks, barrier):
                 await stack.enter_async_context(module._get_request_dispatch_lock())
             await run_in_thread_to_completion(_reset_all_state)
     finally:
-        # Re-open stack admission while ordinary CloudFormation requests are
-        # still held behind the writer barrier, then release readers.
-        stack_tasks.finish_reset()
+        # Locks have already been released by AsyncExitStack. Re-open all
+        # admission in one non-awaiting sequence so excluded states requests
+        # cannot start between the wipe and reset completion.
         if barrier_entered:
             barrier.leave_reset()
+        sync_actions.finish_reset()
+        stack_tasks.finish_reset()
 
 
 async def _reset_all_state_after_service_dispatch_drains():
     """Quiesce stack work and requests before wiping mutable service state."""
+    from ministack.services import stepfunctions_lifecycle
     from ministack.services.cloudformation import lifecycle as cfn_lifecycle
 
     stack_tasks = cfn_lifecycle._get_stack_task_lifecycle()
+    sync_actions = stepfunctions_lifecycle._get_sync_action_lifecycle()
     barrier = _get_ordinary_request_reset_barrier()
     reset = asyncio.create_task(
-        _complete_reset_after_stack_admission_closes(stack_tasks, barrier)
+        _complete_reset_after_stack_admission_closes(
+            stack_tasks, sync_actions, barrier
+        )
     )
     try:
         await asyncio.shield(reset)
@@ -572,7 +584,9 @@ _RESET_ADMISSION_SERVICE_KEYS = set(_RESET_ADMISSION_OWNER_MODULES)
 # reset-writer -> nested-reader deadlock. Their reset races match upstream main.
 _RESET_CALLBACK_SERVICE_KEYS = {
     "lambda",          # invoked function may use an AWS SDK against the gateway
-    "states",          # sync executions invoke Lambda and SDK integrations
+    # StartSyncExecution/TestState use a dedicated reset lifecycle; background
+    # StartExecution threads remain the documented main-equivalent residual.
+    "states",
     "cognito-idp",     # user-pool Lambda triggers
     "cognito-identity",
     "appsync",         # Lambda authorizers/resolvers
