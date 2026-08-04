@@ -7,12 +7,18 @@ Supports:
              UpdateProject, DeleteProject
   Builds:    StartBuild, BatchGetBuilds, StopBuild,
              ListBuilds, ListBuildsForProject, BatchDeleteBuilds
+
+Builds are metadata-only by default. Set MINISTACK_CODEBUILD_EXECUTE=1 to
+really run them (see "Build execution" below).
 """
 
+import contextvars
 import copy
 import json
 import logging
 import os
+import re
+import threading
 import time
 
 from ministack.core.arn import ArnParseError, is_arn, parse_arn
@@ -142,6 +148,176 @@ def _make_build_record(project, build_id, source_version=None):
         "initiator": f"{get_account_id()}/user",
         "encryptionKey": f"arn:aws:kms:{get_region()}:{get_account_id()}:alias/aws/codebuild",
     }
+
+
+# ---------------------------------------------------------------------------
+# Build execution (opt-in via MINISTACK_CODEBUILD_EXECUTE=1)
+#
+# The buildspec is handed to the official AWS CodeBuild local agent, which runs
+# the phases in the project's image the way CodeBuild does, instead of this
+# emulator reimplementing an executor.
+#
+# WORKSPACE must resolve to the same path on the host and in this container,
+# because the agent bind-mounts it into the build container:
+#   docker run -p 4566:4566 \
+#     -v /var/run/docker.sock:/var/run/docker.sock \
+#     -v /tmp/ministack-codebuild:/tmp/ministack-codebuild \
+#     -e MINISTACK_CODEBUILD_EXECUTE=1 ministackorg/ministack
+# ---------------------------------------------------------------------------
+
+EXECUTE_BUILDS = os.environ.get("MINISTACK_CODEBUILD_EXECUTE", "0").lower() in ("1", "true", "yes")
+AGENT_IMAGE = os.environ.get(
+    "MINISTACK_CODEBUILD_AGENT_IMAGE", "public.ecr.aws/codebuild/local-builds:latest"
+)
+WORKSPACE = os.environ.get("MINISTACK_CODEBUILD_WORKSPACE", "/tmp/ministack-codebuild")
+
+# Buildspecs that start nested containers bind-mounting CODEBUILD_SRC_DIR need
+# the source directory to have the same path on the host and in the build
+# container, i.e. the agent's own mount point:
+#   MINISTACK_CODEBUILD_SOURCE_PATH=/codebuild/output/srcDownload/src
+# Builds then share that directory, so they must not overlap.
+SOURCE_PATH = os.environ.get("MINISTACK_CODEBUILD_SOURCE_PATH", "")
+
+_PHASE_COMPLETE_RE = re.compile(r"Phase complete: ([A-Z_]+) State: ([A-Z_]+)")
+
+_docker = None
+
+
+def _get_docker():
+    global _docker
+    if _docker is None:
+        try:
+            import docker
+            _docker = docker.from_env()
+        except Exception:
+            logger.exception("Docker unavailable; builds stay metadata-only")
+            _docker = False
+    return _docker or None
+
+
+def _container_for_build(build_id):
+    client = _get_docker()
+    if not client:
+        return None
+    found = client.containers.list(
+        all=True, filters={"label": f"ministack.codebuild.build={build_id}"}
+    )
+    return found[0] if found else None
+
+
+def _write_env_file(path, project, build):
+    env = project.get("environment", {}) or {}
+    with open(path, "w", encoding="utf-8") as fh:
+        for var in env.get("environmentVariables") or []:
+            fh.write(f"{var.get('name', '')}={var.get('value', '')}\n")
+        fh.write(f"CODEBUILD_BUILD_ID={build['id']}\n")
+        fh.write(f"CODEBUILD_BUILD_ARN={build['arn']}\n")
+        fh.write(f"CODEBUILD_BUILD_NUMBER={build['buildNumber']}\n")
+        fh.write(f"CODEBUILD_INITIATOR={build['initiator']}\n")
+        fh.write(f"AWS_DEFAULT_REGION={get_region()}\n")
+
+
+def _record_phase(build, phase_type, status):
+    now = int(time.time())
+    for phase in build["phases"]:
+        if phase["phaseType"] == phase_type and "endTime" not in phase:
+            phase["phaseStatus"] = status
+            phase["endTime"] = now
+            break
+    else:
+        build["phases"].append(
+            {"phaseType": phase_type, "phaseStatus": status, "startTime": now, "endTime": now}
+        )
+    build["currentPhase"] = phase_type
+
+
+def _finish_build(build, status):
+    build["buildStatus"] = status
+    build["currentPhase"] = "COMPLETED"
+    build["endTime"] = int(time.time())
+    _record_phase(build, "COMPLETED", status)
+
+
+def _execute_build(build_id, project):
+    """Run a build through the CodeBuild local agent; update its record live."""
+    build = _builds.get(build_id)
+    client = _get_docker()
+    if build is None:
+        return
+    if not client:
+        _finish_build(build, "FAULT")
+        return
+
+    env = project.get("environment", {}) or {}
+    workdir = os.path.join(WORKSPACE, build_id.replace(":", "_"))
+    source_dir = SOURCE_PATH or os.path.join(workdir, "src")
+    artifacts_dir = os.path.join(workdir, "artifacts")
+    env_dir = os.path.join(workdir, "env")
+
+    try:
+        for path in (source_dir, artifacts_dir, env_dir):
+            os.makedirs(path, exist_ok=True)
+
+        buildspec = (project.get("source") or {}).get("buildspec") or ""
+        if not buildspec.strip():
+            logger.error("Build %s has no inline buildspec to execute", build_id)
+            _finish_build(build, "FAILED")
+            return
+
+        buildspec_path = os.path.join(source_dir, "buildspec.yml")
+        with open(buildspec_path, "w", encoding="utf-8") as fh:
+            fh.write(buildspec)
+        _write_env_file(os.path.join(env_dir, "env.list"), project, build)
+
+        _record_phase(build, "QUEUED", "SUCCEEDED")
+        build["buildStatus"] = "IN_PROGRESS"
+
+        container = client.containers.run(
+            AGENT_IMAGE,
+            detach=True,
+            environment={
+                "LOCAL_AGENT_IMAGE_NAME": AGENT_IMAGE,
+                "IMAGE_NAME": env.get("image", "aws/codebuild/standard:7.0"),
+                "SOURCE": source_dir,
+                "MOUNT_SOURCE_DIRECTORY": "TRUE",
+                "ARTIFACTS": artifacts_dir,
+                "BUILDSPEC": buildspec_path,
+                "ENV_VAR_FILE": "env.list",
+                "INITIATOR": "ministack",
+                "DOCKER_PRIVILEGED_MODE": "true" if env.get("privilegedMode") else "",
+            },
+            volumes={
+                "/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"},
+                env_dir: {"bind": "/LocalBuild/envFile", "mode": "ro"},
+            },
+            labels={"ministack": "codebuild", "ministack.codebuild.build": build_id},
+        )
+    except Exception:
+        logger.exception("Failed to start build %s", build_id)
+        _finish_build(build, "FAULT")
+        return
+
+    try:
+        for raw in container.logs(stream=True, follow=True):
+            line = raw.decode("utf-8", "replace").rstrip()
+            if not line:
+                continue
+            logger.info("[%s] %s", build_id, line)
+            match = _PHASE_COMPLETE_RE.search(line)
+            if match:
+                _record_phase(build, match.group(1), match.group(2))
+
+        exit_code = container.wait().get("StatusCode", 1)
+        _finish_build(build, "SUCCEEDED" if exit_code == 0 else "FAILED")
+        logger.info("Build %s finished: %s", build_id, build["buildStatus"])
+    except Exception:
+        logger.exception("Build %s failed while running", build_id)
+        _finish_build(build, "FAULT")
+    finally:
+        try:
+            container.remove(force=True)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -301,8 +477,30 @@ def _start_build(data):
     project = _projects[project_name]
     bid = _build_id(project_name)
     build = _make_build_record(project, bid, data.get("sourceVersion"))
+
+    if EXECUTE_BUILDS:
+        now = build["startTime"]
+        build.pop("endTime", None)
+        build["buildStatus"] = "IN_PROGRESS"
+        build["currentPhase"] = "SUBMITTED"
+        build["phases"] = [
+            {"phaseType": "SUBMITTED", "phaseStatus": "SUCCEEDED", "startTime": now, "endTime": now},
+            {"phaseType": "QUEUED", "startTime": now},
+        ]
+
     _builds[bid] = build
     logger.info("StartBuild: %s -> %s", project_name, bid)
+
+    if EXECUTE_BUILDS:
+        # The stores are scoped by the request's account/region contextvars, so
+        # the worker has to run inside a copy of this request's context.
+        context = contextvars.copy_context()
+        threading.Thread(
+            target=context.run,
+            args=(_execute_build, bid, copy.deepcopy(project)),
+            daemon=True,
+        ).start()
+
     return json_response({"build": copy.deepcopy(build)})
 
 
@@ -325,6 +523,13 @@ def _stop_build(data):
     if not build:
         return error_response_json("ResourceNotFoundException",
                                    f"Build not found: {bid}", 400)
+    container = _container_for_build(bid) if EXECUTE_BUILDS else None
+    if container:
+        try:
+            container.remove(force=True)
+        except Exception:
+            logger.exception("Could not stop the build container for %s", bid)
+
     build["buildStatus"] = "STOPPED"
     build["endTime"] = int(time.time())
     build["currentPhase"] = "COMPLETED"
