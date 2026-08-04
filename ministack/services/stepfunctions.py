@@ -1930,8 +1930,9 @@ def _execute_parallel(state_def, raw_input, execution, ctx):
 # ---------------------------------------------------------------------------
 
 def _execute_map(state_def, raw_input, execution, ctx):
+    # No _apply_parameters here: on a Map, Parameters is the deprecated ItemSelector spelling and
+    # is applied per item below -- and ItemsPath must resolve against the untransformed input
     effective = _apply_input_path(state_def, raw_input)
-    effective = _apply_parameters(state_def, effective, ctx)
 
     items_path = state_def.get("ItemsPath", "$")
     items = _resolve_path(items_path, effective)
