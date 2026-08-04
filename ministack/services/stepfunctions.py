@@ -5365,9 +5365,14 @@ _S3_OP_SPECS = {
     },
 }
 
+# Keyed by service, like _REST_JSON_ACTION_PATHS: the protocol is shared, the op specs are not.
+_REST_XML_OP_SPECS = {
+    "s3": _S3_OP_SPECS,
+}
 
-def _s3_substitute_path(template, input_data):
-    """Substitute {Bucket} and {Key+} placeholders. {Key+} preserves slashes."""
+
+def _rest_xml_substitute_path(template, input_data, spec=None):
+    """Substitute path placeholders: S3's {Bucket}/{Key+}, plus the spec's path_params."""
     out = template
     if "{Bucket}" in out:
         bucket = input_data.get("Bucket", "")
@@ -5375,10 +5380,12 @@ def _s3_substitute_path(template, input_data):
     if "{Key+}" in out:
         key = input_data.get("Key", "")
         out = out.replace("{Key+}", key)
+    for placeholder, field in ((spec or {}).get("path_params") or {}).items():
+        out = out.replace("{" + placeholder + "}", str(input_data.get(field, "")))
     return out
 
 
-def _s3_build_xml_body(root_name, payload):
+def _rest_xml_build_body(root_name, payload):
     """Build a minimal XML body for the small handful of ops that need one."""
     import xml.etree.ElementTree as ET
     root = ET.Element(root_name)
@@ -5433,7 +5440,7 @@ def _s3_normalize_lists(parsed, list_fields):
 
 
 def _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data):
-    """Dispatch an aws-sdk integration call to a REST-XML protocol service (S3)."""
+    """Dispatch an aws-sdk integration call to a REST-XML protocol service."""
     import xml.etree.ElementTree as ET
     from urllib.parse import quote, urlencode
 
@@ -5448,17 +5455,19 @@ def _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data):
         )
 
     pascal_action = action[0].upper() + action[1:] if action else action
-    spec = _S3_OP_SPECS.get(pascal_action)
+    op_specs = _REST_XML_OP_SPECS.get(service_key) or {}
+    spec = op_specs.get(pascal_action)
     if not spec:
+        covered = ", ".join(sorted(op_specs)) or "no operations"
         raise _ExecutionError(
             "States.Runtime",
             f"aws-sdk:{service_name}:{action} is not yet implemented in MiniStack "
-            "(rest-xml dispatcher Phase 1 covers list/head/copy/delete/tagging operations)",
+            f"(rest-xml dispatcher covers: {covered})",
         )
 
     input_data = input_data or {}
     method = spec["method"]
-    path = _s3_substitute_path(spec["path"], input_data)
+    path = _rest_xml_substitute_path(spec["path"], input_data, spec)
 
     # S3 handler routes by the query_params dict, not by parsing the path —
     # so build the dict and ALSO append a query string for handlers that
@@ -5490,7 +5499,7 @@ def _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data):
     body = b""
     body_field = spec.get("body_field")
     if body_field and body_field in input_data:
-        body = _s3_build_xml_body(spec.get("body_root", body_field), input_data[body_field])
+        body = _rest_xml_build_body(spec.get("body_root", body_field), input_data[body_field])
         headers["content-type"] = "application/xml"
         headers["content-length"] = str(len(body))
 
@@ -5517,8 +5526,11 @@ def _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data):
     norm_resp_headers = {k.lower(): v for k, v in (resp_headers or {}).items()}
 
     if status >= 400:
-        code = "S3Exception"
-        message = decoded or f"S3 returned status {status}"
+        # Same shape as before for S3 ("S3.S3Exception", "S3 returned status 404") without
+        # hardcoding it: the prefix map already knows what each service is called.
+        prefix = _AWS_SDK_ERROR_PREFIX.get(service_name, service_name.capitalize())
+        code = f"{prefix}Exception"
+        message = decoded or f"{prefix} returned status {status}"
         if decoded:
             try:
                 err_root = ET.fromstring(decoded)
@@ -5530,7 +5542,10 @@ def _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data):
                     message = msg_el.text
             except ET.ParseError:
                 pass
-        raise _ExecutionError(f"S3.{code}", message)
+        # Named after the SDK exception class: S3.NoSuchBucketException.
+        if not code.endswith("Exception"):
+            code += "Exception"
+        raise _ExecutionError(_prefix_sdk_error(service_name, code), message)
 
     result = {}
     if decoded.strip():
