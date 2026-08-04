@@ -76,6 +76,15 @@ def _account_region_from_function_config(config: dict) -> tuple[str, str]:
 _workers: dict = {}
 _lock = threading.Lock()
 
+# Warm workers are interpreter subprocesses, so the pool needs bounds: without
+# them one stays resident per function invoked until DeleteFunction or reset().
+# Releasing reclaims the subprocess only — the pooled Worker cold-starts again.
+# The idle TTL matches the container pool's default in lambda_svc.
+_WORKER_IDLE_TTL = 300.0
+_MAX_WARM_WORKERS = 16
+_REAP_INTERVAL = 15.0
+_reaper_thread: threading.Thread | None = None
+
 # ---------------------------------------------------------------------------
 # Python worker script (runs inside a persistent subprocess)
 # ---------------------------------------------------------------------------
@@ -842,6 +851,7 @@ class Worker:
         self._lock = threading.Lock()
         self._cold = True
         self._start_time = None
+        self.last_used = time.time()
         self._stderr_queue: queue.Queue = queue.Queue()
         self._stderr_thread: threading.Thread | None = None
 
@@ -1050,7 +1060,11 @@ class Worker:
             raise RuntimeError(f"Worker init failed: {response.get('error')}")
 
         self._start_time = time.time()
+        self.last_used = self._start_time
         logger.info("Lambda worker spawned for %s (%s, cold start)", self.func_name, runtime)
+        # Here as well as in the reaper, so a burst of cold starts can't pile up
+        # between reap passes.
+        _enforce_warm_cap(exclude=self)
 
     def _drain_stderr(self) -> str:
         """Collect all currently available stderr lines (non-blocking)."""
@@ -1102,83 +1116,181 @@ class Worker:
                 time.sleep(0.001)
         return "\n".join(lines)
 
+    @property
+    def is_warm(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def release_if_idle(self) -> bool:
+        """Reclaim the subprocess unless an invocation is in flight. Returns
+        whether a warm subprocess was killed. Never waits on a busy worker."""
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            if not self.is_warm:
+                return False
+            self.kill()
+            self._cold = True
+            logger.info("Lambda worker released for %s (idle)", self.func_name)
+            return True
+        finally:
+            self._lock.release()
+
     def invoke(self, event: dict, request_id: str) -> dict:
         with self._lock:
-            cold = self._cold
+            self.last_used = time.time()
+            try:
+                return self._invoke_locked(event, request_id)
+            finally:
+                # Idle age counts from the end of the invocation.
+                self.last_used = time.time()
 
-            if self._proc is None or self._proc.poll() is not None:
-                self._spawn()
-                cold = True
-                self._cold = False
-            else:
-                cold = False
+    def _invoke_locked(self, event: dict, request_id: str) -> dict:
+        cold = self._cold
 
-            timeout = self.config.get("Timeout", 30)
-            event["_request_id"] = request_id
-            result_box: list = []
+        if self._proc is None or self._proc.poll() is not None:
+            self._spawn()
+            cold = True
+            self._cold = False
+        else:
+            cold = False
 
-            def _read_response():
-                try:
-                    self._proc.stdin.write(json.dumps(event) + "\n")
-                    self._proc.stdin.flush()
-                    for _ in range(200):
-                        response_line = self._proc.stdout.readline()
-                        if not response_line:
-                            result_box.append({"status": "error", "error": "Worker process died"})
-                            return
-                        response_line = response_line.strip()
-                        if not response_line:
+        timeout = self.config.get("Timeout", 30)
+        event["_request_id"] = request_id
+        result_box: list = []
+
+        def _read_response():
+            try:
+                self._proc.stdin.write(json.dumps(event) + "\n")
+                self._proc.stdin.flush()
+                for _ in range(200):
+                    response_line = self._proc.stdout.readline()
+                    if not response_line:
+                        result_box.append({"status": "error", "error": "Worker process died"})
+                        return
+                    response_line = response_line.strip()
+                    if not response_line:
+                        continue
+                    if response_line.startswith("{"):
+                        try:
+                            response = json.loads(response_line)
+                            if response.get("status") in ("ok", "error"):
+                                result_box.append(response)
+                                return
+                        except json.JSONDecodeError:
                             continue
-                        if response_line.startswith("{"):
-                            try:
-                                response = json.loads(response_line)
-                                if response.get("status") in ("ok", "error"):
-                                    result_box.append(response)
-                                    return
-                            except json.JSONDecodeError:
-                                continue
-                    result_box.append({"status": "error", "error": "No JSON response from worker after 200 lines"})
-                except Exception as e:
-                    result_box.append({"status": "error", "error": str(e)})
+                result_box.append({"status": "error", "error": "No JSON response from worker after 200 lines"})
+            except Exception as e:
+                result_box.append({"status": "error", "error": str(e)})
 
-            reader = threading.Thread(target=_read_response, daemon=True)
-            reader.start()
-            reader.join(timeout=timeout)
+        reader = threading.Thread(target=_read_response, daemon=True)
+        reader.start()
+        reader.join(timeout=timeout)
 
-            if reader.is_alive():
-                # Timeout — kill the worker process
-                logger.warning("Lambda %s timed out after %ds — killing worker", self.func_name, timeout)
-                if self._proc:
-                    self._proc.kill()
-                self._proc = None
-                return {
-                    "status": "error",
-                    "error": f"Task timed out after {timeout}.00 seconds",
-                    "cold_start": cold,
-                    "log": self._drain_stderr(),
-                }
+        if reader.is_alive():
+            # Timeout — kill the worker process
+            logger.warning("Lambda %s timed out after %ds — killing worker", self.func_name, timeout)
+            self._discard_proc(force=True)
+            return {
+                "status": "error",
+                "error": f"Task timed out after {timeout}.00 seconds",
+                "cold_start": cold,
+                "log": self._drain_stderr(),
+            }
 
-            if not result_box:
-                self._proc = None
-                return {"status": "error", "error": "Worker returned no response", "cold_start": cold}
+        if not result_box:
+            self._discard_proc()
+            return {"status": "error", "error": "Worker returned no response", "cold_start": cold}
 
-            response = result_box[0]
-            if response.get("status") == "error":
-                if self._proc and self._proc.poll() is None:
-                    self._proc.terminate()
-                self._proc = None
-            response["cold_start"] = cold
-            # Bounded drain — replaces the fixed 50ms sleep that was paid
-            # by every warm invocation. Typical completion is 1–10ms.
-            response["log"] = self._drain_stderr_bounded()
-            return response
+        response = result_box[0]
+        if response.get("status") == "error":
+            self._discard_proc()
+        response["cold_start"] = cold
+        # Bounded drain — replaces the fixed 50ms sleep that was paid
+        # by every warm invocation. Typical completion is 1–10ms.
+        response["log"] = self._drain_stderr_bounded()
+        return response
+
+    def _discard_proc(self, force: bool = False):
+        """Stop the subprocess and wait for it, so it doesn't linger as a
+        zombie. Keeps the tmpdir — an in-flight caller re-spawns from it."""
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                if force:
+                    proc.kill()
+                else:
+                    proc.terminate()
+            proc.wait(timeout=1)
+        except Exception:
+            pass
 
     def kill(self):
-        if self._proc and self._proc.poll() is None:
-            self._proc.terminate()
-            self._proc = None
+        self._discard_proc()
         if self._tmpdir and os.path.exists(self._tmpdir):
             shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+
+def _pooled_workers() -> list:
+    with _lock:
+        return list(_workers.values())
+
+
+def release_idle_workers(now: float = None) -> int:
+    """Release warm workers untouched for longer than the idle TTL."""
+    if _WORKER_IDLE_TTL <= 0:
+        return 0
+    now = now if now is not None else time.time()
+    released = 0
+    for worker in _pooled_workers():
+        if now - worker.last_used < _WORKER_IDLE_TTL:
+            continue
+        if worker.release_if_idle():
+            released += 1
+    return released
+
+
+def _enforce_warm_cap(exclude: "Worker" = None) -> int:
+    """Release least-recently-used warm workers down to _MAX_WARM_WORKERS.
+    `exclude` is the freshly spawned worker: it uses a slot but is never a
+    victim, since it is about to serve an invocation."""
+    if _MAX_WARM_WORKERS <= 0:
+        return 0
+    warm = [w for w in _pooled_workers() if w is not exclude and w.is_warm]
+    budget = _MAX_WARM_WORKERS - (1 if exclude is not None else 0)
+    overflow = len(warm) - max(budget, 0)
+    if overflow <= 0:
+        return 0
+    released = 0
+    for worker in sorted(warm, key=lambda w: w.last_used):
+        if released >= overflow:
+            break
+        if worker.release_if_idle():
+            released += 1
+    return released
+
+
+def _reaper_loop():
+    while True:
+        time.sleep(_REAP_INTERVAL)
+        try:
+            release_idle_workers()
+        except Exception:
+            logger.debug("Lambda worker reaper pass failed", exc_info=True)
+
+
+def _ensure_reaper_thread():
+    global _reaper_thread
+    if _WORKER_IDLE_TTL <= 0:
+        return
+    with _lock:
+        if _reaper_thread is not None and _reaper_thread.is_alive():
+            return
+        _reaper_thread = threading.Thread(
+            target=_reaper_loop, daemon=True, name="lambda-worker-reaper"
+        )
+        _reaper_thread.start()
 
 
 def get_or_create_worker(func_name: str, config: dict, code_zip: bytes,
@@ -1186,6 +1298,7 @@ def get_or_create_worker(func_name: str, config: dict, code_zip: bytes,
     # Include account ID and region in the key to isolate workers across
     # accounts and regions. Two regions deploying the same function name must
     # not share a worker.
+    _ensure_reaper_thread()
     account, region = _account_region_from_function_config(config)
     key = f"{account}:{region}:{func_name}:{qualifier}"
     with _lock:
