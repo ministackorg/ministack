@@ -4824,6 +4824,9 @@ def _setup_pool(cognito_idp, pool_name, lambda_config=None):
         UserPoolId=pid,
         ClientName="app",
         ExplicitAuthFlows=["ALLOW_CUSTOM_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+        # A trigger Lambda cold start per round can outlast the 3-minute default
+        # and fail as NotAuthorizedException. Expiry has its own test.
+        AuthSessionValidity=15,
     )["UserPoolClient"]["ClientId"]
     cognito_idp.admin_create_user(
         UserPoolId=pid,
