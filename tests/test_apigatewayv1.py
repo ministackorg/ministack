@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 import os
@@ -71,6 +72,32 @@ def test_apigwv1_get_account_defaults_and_update_roundtrip(apigw_v1):
     assert resp["cloudwatchRoleArn"] == role_arn
     # Defaults still present after the patch
     assert resp["throttleSettings"] == {"burstLimit": 5000, "rateLimit": 10000}
+
+
+def test_apigwv1_account_settings_are_region_isolated():
+    west_role = "arn:aws:iam::000000000000:role/apigw-cloudwatch-west"
+    east_role = "arn:aws:iam::000000000000:role/apigw-cloudwatch-east"
+
+    set_request_region("us-west-2")
+    status, _headers, _body = apigateway_v1._update_account(
+        {"patchOperations": [{"op": "replace", "path": "/cloudwatchRoleArn", "value": west_role}]}
+    )
+    assert status == 200
+
+    set_request_region("us-east-1")
+    status, _headers, body = apigateway_v1._get_account()
+    assert status == 200
+    assert json.loads(body)["cloudwatchRoleArn"] is None
+
+    status, _headers, _body = apigateway_v1._update_account(
+        {"patchOperations": [{"op": "replace", "path": "/cloudwatchRoleArn", "value": east_role}]}
+    )
+    assert status == 200
+
+    set_request_region("us-west-2")
+    status, _headers, body = apigateway_v1._get_account()
+    assert status == 200
+    assert json.loads(body)["cloudwatchRoleArn"] == west_role
 
 
 def test_apigwv1_rest_api_policy_terraform_roundtrip(apigw_v1):
@@ -203,6 +230,104 @@ def test_apigwv1_gateway_response_state_survives_persistence_roundtrip():
         assert restored["responseTemplates"] == {"application/json": '{"persisted":true}'}
     finally:
         service.reset()
+
+
+def test_apigwv1_control_plane_resources_are_region_isolated():
+    set_request_region("us-west-2")
+    status, _headers, body = apigateway_v1._create_rest_api({"name": "regional-v1-api"})
+    assert status == 201
+    api_id = json.loads(body)["id"]
+    root_id = next(
+        resource["id"]
+        for resource in apigateway_v1._resources[api_id].values()
+        if resource["path"] == "/"
+    )
+    apigateway_v1._create_resource(api_id, root_id, {"pathPart": "west"})
+    apigateway_v1._create_api_key({"name": "west-key"})
+    apigateway_v1._create_usage_plan({"name": "west-plan"})
+    apigateway_v1._create_domain_name({"domainName": "shared.example.com"})
+
+    set_request_region("us-east-1")
+    status, _headers, _body = apigateway_v1._get_rest_api(api_id)
+    assert status == 404
+    status, _headers, body = apigateway_v1._get_rest_apis({})
+    assert status == 200
+    assert api_id not in {api["id"] for api in json.loads(body)["item"]}
+    status, _headers, _body = apigateway_v1._get_resources(api_id, {})
+    assert status == 404
+    assert json.loads(apigateway_v1._get_api_keys({})[2])["item"] == []
+    assert json.loads(apigateway_v1._get_usage_plans({})[2])["item"] == []
+    assert json.loads(apigateway_v1._get_domain_names({})[2])["item"] == []
+
+    status, _headers, body = apigateway_v1._create_domain_name(
+        {"domainName": "shared.example.com"}
+    )
+    assert status == 201
+    assert json.loads(body)["regionalDomainName"].endswith(
+        ".execute-api.us-east-1.amazonaws.com"
+    )
+
+    set_request_region("us-west-2")
+    status, _headers, body = apigateway_v1._get_domain_name("shared.example.com")
+    assert status == 200
+    assert json.loads(body)["regionalDomainName"].endswith(
+        ".execute-api.us-west-2.amazonaws.com"
+    )
+
+
+def test_apigwv1_execute_api_resolves_api_owner_region():
+    set_request_region("us-west-2")
+    status, _headers, body = apigateway_v1._create_rest_api({"name": "west-execute-api"})
+    assert status == 201
+    api_id = json.loads(body)["id"]
+    root_id = next(
+        resource["id"]
+        for resource in apigateway_v1._resources[api_id].values()
+        if resource["path"] == "/"
+    )
+    status, _headers, body = apigateway_v1._create_resource(
+        api_id, root_id, {"pathPart": "mock"}
+    )
+    assert status == 201
+    resource_id = json.loads(body)["id"]
+    apigateway_v1._put_method(
+        api_id, resource_id, "GET", {"authorizationType": "NONE"}
+    )
+    apigateway_v1._put_integration(
+        api_id,
+        resource_id,
+        "GET",
+        {
+            "type": "MOCK",
+            "requestTemplates": {"application/json": '{"statusCode": 200}'},
+        },
+    )
+    apigateway_v1._put_method_response(api_id, resource_id, "GET", "200", {})
+    apigateway_v1._put_integration_response(
+        api_id,
+        resource_id,
+        "GET",
+        "200",
+        {"responseTemplates": {"application/json": '{"region":"west"}'}},
+    )
+    status, _headers, body = apigateway_v1._create_deployment(api_id, {})
+    assert status == 201
+    deployment_id = json.loads(body)["id"]
+    apigateway_v1._create_stage(
+        api_id, {"stageName": "prod", "deploymentId": deployment_id}
+    )
+
+    set_request_region("us-east-1")
+    status, _headers, body = asyncio.run(
+        apigateway_v1.handle_execute(api_id, "prod", "GET", "/mock", {}, b"", {})
+    )
+    assert status == 200
+    assert json.loads(body)["region"] == "west"
+
+    status, _headers, _body = asyncio.run(
+        apigateway_v1.handle_execute("missing", "prod", "GET", "/mock", {}, b"", {})
+    )
+    assert status == 404
 
 
 def test_apigwv1_documentation_part_crud(apigw_v1):
@@ -2169,6 +2294,26 @@ def test_apigwv1_custom_id_duplicate_rejected(apigw_v1):
     assert exc_info.value.response["Error"]["Code"] == "ConflictException"
 
 
+def test_apigwv1_custom_id_duplicate_rejected_across_regions():
+    set_request_region("us-west-2")
+    status, _headers, body = apigateway_v1._create_rest_api(
+        {"name": "v1-dup-west", "tags": {"ms-custom-id": "v1regionaldup"}}
+    )
+    assert status == 201
+    assert json.loads(body)["id"] == "v1regionaldup"
+
+    set_request_region("us-east-1")
+    status, _headers, body = apigateway_v1._create_rest_api(
+        {"name": "v1-dup-east", "tags": {"ms-custom-id": "v1regionaldup"}}
+    )
+    assert status == 409
+    assert json.loads(body)["__type"] == "ConflictException"
+    assert apigateway_v1.find_api_scope("v1regionaldup") == (
+        "000000000000",
+        "us-west-2",
+    )
+
+
 def test_apigwv1_custom_id_absent_uses_random(apigw_v1):
     resp = apigw_v1.create_rest_api(name="v1-random")
     # _new_id() returns up to 10 hex chars; trimmed to [:8] in _create_rest_api.
@@ -2747,22 +2892,44 @@ def test_apigatewayv1_load_persisted_state_backfills_taggable_resource_regions()
             "rest_apis": {
                 "legacy-api": {"id": "legacy-api", "name": "legacy api"},
             },
+            "rest_api_regions": {
+                "legacy-api": "us-west-2",
+            },
             "stages_v1": {
                 "legacy-api": {"prod": {"stageName": "prod", "tags": {}}},
+            },
+            "resources": {
+                "legacy-api": {"root": {"id": "root", "path": "/"}},
             },
             "api_keys": {
                 "legacy-key": {"id": "legacy-key", "name": "legacy key", "tags": {}},
                 "legacy-key-west": {"id": "legacy-key-west", "name": "legacy key west", "tags": {}},
             },
+            "api_key_regions": {
+                "legacy-key-west": "us-west-2",
+            },
             "usage_plans": {
                 "legacy-plan": {"id": "legacy-plan", "name": "legacy plan", "tags": {}},
                 "legacy-plan-west": {"id": "legacy-plan-west", "name": "legacy plan west", "tags": {}},
+            },
+            "usage_plan_regions": {
+                "legacy-plan-west": "us-west-2",
+            },
+            "usage_plan_keys": {
+                "legacy-plan-west": {
+                    "legacy-key-west": {"id": "legacy-key-west", "type": "API_KEY"}
+                },
             },
             "domain_names": {
                 "legacy.example.com": {
                     "domainName": "legacy.example.com",
                     "regionalDomainName": "legacy.example.com.execute-api.us-west-2.amazonaws.com",
                     "tags": {},
+                },
+            },
+            "base_path_mappings": {
+                "legacy.example.com": {
+                    "v1": {"basePath": "v1", "restApiId": "legacy-api", "stage": "prod"}
                 },
             },
             "v1_tags": {
@@ -2772,6 +2939,22 @@ def test_apigatewayv1_load_persisted_state_backfills_taggable_resource_regions()
             },
         }
     )
+
+    account_id = "000000000000"
+    assert apigateway_v1._rest_apis.get_scoped(account_id, "us-west-2", "legacy-api")
+    assert apigateway_v1._resources.get_scoped(
+        account_id, "us-west-2", "legacy-api"
+    )["root"]["path"] == "/"
+    assert (
+        apigateway_v1._usage_plan_keys.get_scoped(
+            account_id, "us-west-2", "legacy-plan-west"
+        )["legacy-key-west"]["type"]
+        == "API_KEY"
+    )
+    assert apigateway_v1._base_path_mappings.get_scoped(
+        account_id, "us-west-2", "legacy.example.com"
+    )["v1"]["stage"] == "prod"
+    assert apigateway_v1._rest_apis.get_scoped(account_id, "us-east-1", "legacy-api") is None
 
     for resource_arn in (
         "arn:aws:apigateway:us-east-1::/apikeys/legacy-key",
