@@ -624,3 +624,145 @@ def test_cloudwatch_describe_alarms_cbor_timestamps_are_tag1():
         _cw._alarms.pop_scoped("000000000000", "us-east-1", name, None)
         _resp._request_region.reset(region_tok)
         _resp._request_account_id.reset(acct_tok)
+
+
+def _cbor_has_nil(value):
+    if value is None:
+        return True
+    if isinstance(value, dict):
+        return any(_cbor_has_nil(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_cbor_has_nil(v) for v in value)
+    return False
+
+
+def test_cloudwatch_describe_alarms_cbor_omits_absent_optional_fields():
+    """DescribeAlarms over smithy-rpc-v2-cbor must OMIT absent optional fields
+    (ExtendedStatistic, Unit) rather than serialize them as CBOR Nil, or the
+    Terraform AWS provider >= 6.50 fails the read-back with
+    `unexpected value type *cbor.Nil` (issue #1261). Real AWS omits absent
+    optional members entirely.
+    """
+    import cbor2
+
+    from ministack.core import responses as _resp
+    from ministack.services import cloudwatch as _cw
+
+    acct_tok = _resp._request_account_id.set("000000000000")
+    region_tok = _resp._request_region.set("us-east-1")
+    name = f"cbor-nil-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        # No ExtendedStatistic / Unit -> stored as None on the alarm record.
+        _cw._put_metric_alarm({}, {
+            "AlarmName": name,
+            "ComparisonOperator": "GreaterThanThreshold",
+            "EvaluationPeriods": 1,
+            "MetricName": "Errors",
+            "Namespace": "AWS/Lambda",
+            "Period": 300,
+            "Statistic": "Sum",
+            "Threshold": 1,
+        }, is_cbor=True)
+
+        status, _headers, body = _cw._describe_alarms({}, {"AlarmNames": [name]}, is_cbor=True)
+        assert status == 200
+        decoded = cbor2.loads(body)
+        alarm = next(a for a in decoded["MetricAlarms"] if a["AlarmName"] == name)
+
+        assert "ExtendedStatistic" not in alarm
+        assert "Unit" not in alarm
+        assert not _cbor_has_nil(decoded)
+    finally:
+        _cw._alarms.pop_scoped("000000000000", "us-east-1", name, None)
+        _resp._request_region.reset(region_tok)
+        _resp._request_account_id.reset(acct_tok)
+
+
+def test_cloudwatch_get_metric_statistics_cbor_timestamps_are_tag1():
+    """GetMetricStatistics over smithy-rpc-v2-cbor must encode
+    Datapoint.Timestamp as CBOR tag 1, not an ISO string, so the provider's
+    typed decoder accepts it (same class as issue #1261)."""
+    import datetime as _dt
+    import time as _time
+
+    import cbor2
+
+    from ministack.core import responses as _resp
+    from ministack.services import cloudwatch as _cw
+
+    acct_tok = _resp._request_account_id.set("000000000000")
+    region_tok = _resp._request_region.set("us-east-1")
+    namespace = f"MSTest/{_uuid_mod.uuid4().hex[:8]}"
+    now = int(_time.time())
+    try:
+        _cw._put_metric_data({}, {
+            "Namespace": namespace,
+            "MetricData": [{"MetricName": "M", "Value": 1.0, "Timestamp": now}],
+        }, is_cbor=True)
+
+        status, _headers, body = _cw._get_metric_statistics({}, {
+            "Namespace": namespace,
+            "MetricName": "M",
+            "Period": 60,
+            "StartTime": now - 3600,
+            "EndTime": now + 3600,
+            "Statistics": ["Sum"],
+        }, is_cbor=True)
+        assert status == 200
+        datapoints = cbor2.loads(body)["Datapoints"]
+        assert datapoints, "expected at least one datapoint"
+        assert isinstance(datapoints[0]["Timestamp"], _dt.datetime)
+    finally:
+        for key in list(_cw._metrics.keys()):
+            if key[0] == namespace:
+                _cw._metrics.pop_scoped("000000000000", "us-east-1", key, None)
+        _resp._request_region.reset(region_tok)
+        _resp._request_account_id.reset(acct_tok)
+
+
+def test_cloudwatch_get_metric_data_cbor_timestamps_are_tag1():
+    """GetMetricData over smithy-rpc-v2-cbor must encode
+    MetricDataResult.Timestamps as CBOR tag 1 values, not ISO strings (same
+    class as issue #1261)."""
+    import datetime as _dt
+    import time as _time
+
+    import cbor2
+
+    from ministack.core import responses as _resp
+    from ministack.services import cloudwatch as _cw
+
+    acct_tok = _resp._request_account_id.set("000000000000")
+    region_tok = _resp._request_region.set("us-east-1")
+    namespace = f"MSTest/{_uuid_mod.uuid4().hex[:8]}"
+    now = int(_time.time())
+    try:
+        _cw._put_metric_data({}, {
+            "Namespace": namespace,
+            "MetricData": [{"MetricName": "M", "Value": 2.0, "Timestamp": now}],
+        }, is_cbor=True)
+
+        status, _headers, body = _cw._get_metric_data({}, {
+            "StartTime": now - 3600,
+            "EndTime": now + 3600,
+            "MetricDataQueries": [{
+                "Id": "m1",
+                "ReturnData": True,
+                "MetricStat": {
+                    "Metric": {"Namespace": namespace, "MetricName": "M"},
+                    "Period": 60,
+                    "Stat": "Sum",
+                },
+            }],
+        }, is_cbor=True)
+        assert status == 200
+        results = cbor2.loads(body)["MetricDataResults"]
+        timestamps = results[0]["Timestamps"]
+        assert timestamps, "expected at least one timestamp"
+        assert all(isinstance(t, _dt.datetime) for t in timestamps)
+    finally:
+        for key in list(_cw._metrics.keys()):
+            if key[0] == namespace:
+                _cw._metrics.pop_scoped("000000000000", "us-east-1", key, None)
+        _resp._request_region.reset(region_tok)
+        _resp._request_account_id.reset(acct_tok)
