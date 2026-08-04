@@ -195,6 +195,50 @@ def _get_docker():
     return _docker or None
 
 
+def _log_sink(build):
+    """Return a callable that appends a line to the build's log stream.
+
+    The build record already advertises ``logs.groupName`` / ``logs.streamName``,
+    so an executed build writes its output there and `aws logs` reads it back.
+    """
+    from ministack.services import cloudwatch_logs as _cwl
+
+    group_name = build["logs"]["groupName"]
+    stream_name = build["logs"]["streamName"]
+    now_ms = int(time.time() * 1000)
+
+    if group_name not in _cwl._log_groups:
+        _cwl._log_groups[group_name] = {
+            "arn": _cwl._make_group_arn(group_name),
+            "creationTime": now_ms,
+            "retentionInDays": None,
+            "tags": {},
+            "subscriptionFilters": {},
+            "streams": {},
+        }
+    group = _cwl._log_groups[group_name]
+    if stream_name not in group["streams"]:
+        group["streams"][stream_name] = {
+            "events": [],
+            "uploadSequenceToken": "1",
+            "creationTime": now_ms,
+            "firstEventTimestamp": None,
+            "lastEventTimestamp": None,
+            "lastIngestionTime": None,
+        }
+    stream = group["streams"][stream_name]
+
+    def emit(line):
+        ts = int(time.time() * 1000)
+        stream["events"].append({"timestamp": ts, "message": line, "ingestionTime": ts})
+        if stream["firstEventTimestamp"] is None:
+            stream["firstEventTimestamp"] = ts
+        stream["lastEventTimestamp"] = ts
+        stream["lastIngestionTime"] = ts
+
+    return emit
+
+
 def _container_for_build(build_id):
     client = _get_docker()
     if not client:
@@ -298,11 +342,19 @@ def _execute_build(build_id, project):
         return
 
     try:
+        emit = _log_sink(build)
+    except Exception:
+        logger.exception("Could not open the log stream for %s", build_id)
+        emit = None
+
+    try:
         for raw in container.logs(stream=True, follow=True):
             line = raw.decode("utf-8", "replace").rstrip()
             if not line:
                 continue
             logger.info("[%s] %s", build_id, line)
+            if emit is not None:
+                emit(line)
             match = _PHASE_COMPLETE_RE.search(line)
             if match:
                 _record_phase(build, match.group(1), match.group(2))

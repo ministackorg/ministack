@@ -129,6 +129,31 @@ def test_execute_build_records_phases_from_agent_log(monkeypatch, tmp_path):
     assert "CODEBUILD_BUILD_ID=demo:0001" in env_lines
 
 
+def test_execute_build_writes_agent_output_to_cloudwatch_logs(monkeypatch, tmp_path):
+    from ministack.services import cloudwatch_logs as cwl
+
+    container = _FakeContainer([
+        "[Container] running command echo hi",
+        "Phase complete: BUILD State: SUCCEEDED",
+    ])
+    monkeypatch.setattr(codebuild, "_get_docker", lambda: _FakeDocker(container))
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+
+    project = _project()
+    build = _seed_build(project, "demo:0005")
+
+    codebuild._execute_build("demo:0005", project)
+
+    group = cwl._log_groups[build["logs"]["groupName"]]
+    stream = group["streams"][build["logs"]["streamName"]]
+    messages = [event["message"] for event in stream["events"]]
+
+    assert "[Container] running command echo hi" in messages
+    assert "Phase complete: BUILD State: SUCCEEDED" in messages
+    assert stream["firstEventTimestamp"] is not None
+    assert stream["lastEventTimestamp"] >= stream["firstEventTimestamp"]
+
+
 def test_execute_build_reports_failed_exit_code(monkeypatch, tmp_path):
     container = _FakeContainer(["Phase complete: BUILD State: FAILED"], exit_code=1)
     monkeypatch.setattr(codebuild, "_get_docker", lambda: _FakeDocker(container))
