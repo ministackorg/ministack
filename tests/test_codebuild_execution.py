@@ -280,6 +280,41 @@ def test_restored_in_flight_builds_are_not_left_running():
     assert "endTime" in restored
 
 
+def test_stopped_build_is_not_overwritten_by_the_worker(monkeypatch, tmp_path):
+    """StopBuild removes the container, which is not a build failure.
+
+    Without this the worker's `container.wait()` raises on the removed container
+    and reports FAULT over the user's STOPPED.
+    """
+    class _RemovedContainer(_FakeContainer):
+        def logs(self, **_kwargs):
+            yield b"Phase complete: BUILD State: SUCCEEDED"
+            raise RuntimeError("container was removed")
+
+        def wait(self):
+            raise RuntimeError("container was removed")
+
+    container = _RemovedContainer([])
+    monkeypatch.setattr(codebuild, "_get_docker", lambda: _FakeDocker(container))
+    monkeypatch.setattr(codebuild, "_container_for_build", lambda _bid: container)
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+    monkeypatch.setattr(codebuild, "EXECUTE_BUILDS", True)
+
+    project = _project()
+    codebuild._projects["demo"] = project
+    build = _seed_build(project, "demo:0011")
+
+    codebuild._stop_build({"id": "demo:0011"})
+    assert build["buildStatus"] == "STOPPED"
+
+    codebuild._execute_build("demo:0011", project)
+
+    assert build["buildStatus"] == "STOPPED"
+    assert build["currentPhase"] == "COMPLETED"
+    # The registry must not leak once the worker is done.
+    assert codebuild._stop_requested("demo:0011") is False
+
+
 def test_execute_build_without_docker_reports_fault(monkeypatch, tmp_path):
     monkeypatch.setattr(codebuild, "_get_docker", lambda: None)
     monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))

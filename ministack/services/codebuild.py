@@ -46,6 +46,8 @@ _builds = AccountRegionScopedDict()      # build_id -> build record
 def reset():
     _projects.clear()
     _builds.clear()
+    with _stopped_lock:
+        _stopped_builds.clear()
 
 
 def get_state():
@@ -195,6 +197,27 @@ MAX_LOG_EVENTS = int(os.environ.get("MINISTACK_CODEBUILD_MAX_LOG_EVENTS", "20000
 _PHASE_COMPLETE_RE = re.compile(r"Phase complete: ([A-Z_]+) State: ([A-Z_]+)")
 
 _docker = None
+
+# StopBuild removes the container, which ends the worker's log stream; without
+# recording the intent the worker would overwrite the requested STOPPED outcome
+# with FAULT or FAILED.
+_stopped_builds = set()
+_stopped_lock = threading.Lock()
+
+
+def _mark_stopped(build_id):
+    with _stopped_lock:
+        _stopped_builds.add(build_id)
+
+
+def _stop_requested(build_id):
+    with _stopped_lock:
+        return build_id in _stopped_builds
+
+
+def _clear_stopped(build_id):
+    with _stopped_lock:
+        _stopped_builds.discard(build_id)
 
 
 def _get_docker():
@@ -424,6 +447,8 @@ def _execute_build(build_id, project):
     saw_phase = False
     try:
         for raw in container.logs(stream=True, follow=True):
+            if _stop_requested(build_id):
+                break
             line = raw.decode("utf-8", "replace").rstrip()
             if not line:
                 continue
@@ -435,7 +460,10 @@ def _execute_build(build_id, project):
                 saw_phase = True
                 _record_phase(build, match.group(1), match.group(2))
 
-        if timed_out.is_set():
+        if _stop_requested(build_id):
+            logger.info("Build %s was stopped by request", build_id)
+            _finish_build(build, "STOPPED")
+        elif timed_out.is_set():
             _record_phase(build, build.get("currentPhase") or "BUILD", "TIMED_OUT")
             _finish_build(build, "FAILED")
         else:
@@ -443,7 +471,10 @@ def _execute_build(build_id, project):
             _finish_build(build, "SUCCEEDED" if exit_code == 0 else "FAILED")
         logger.info("Build %s finished: %s", build_id, build["buildStatus"])
     except Exception:
-        if timed_out.is_set():
+        if _stop_requested(build_id):
+            logger.info("Build %s was stopped by request", build_id)
+            _finish_build(build, "STOPPED")
+        elif timed_out.is_set():
             _record_phase(build, build.get("currentPhase") or "BUILD", "TIMED_OUT")
             _finish_build(build, "FAILED")
         else:
@@ -451,6 +482,7 @@ def _execute_build(build_id, project):
             _finish_build(build, "FAULT")
     finally:
         timeout.cancel()
+        _clear_stopped(build_id)
         if not saw_phase:
             logger.warning(
                 "Build %s produced no 'Phase complete' lines; %s may not report "
@@ -665,6 +697,9 @@ def _stop_build(data):
     if not build:
         return error_response_json("ResourceNotFoundException",
                                    f"Build not found: {bid}", 400)
+    if EXECUTE_BUILDS:
+        _mark_stopped(bid)
+
     container = _container_for_build(bid) if EXECUTE_BUILDS else None
     if container:
         try:
