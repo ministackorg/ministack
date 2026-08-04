@@ -6084,6 +6084,7 @@ def test_cfn_nested_stack_basic(cfn, s3):
     }
     s3.put_object(Bucket=templates_bucket, Key="child.json",
                   Body=json.dumps(child_template).encode())
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
     parent_template = {
         "AWSTemplateFormatVersion": "2010-09-09",
@@ -6091,7 +6092,7 @@ def test_cfn_nested_stack_basic(cfn, s3):
             "Nested": {
                 "Type": "AWS::CloudFormation::Stack",
                 "Properties": {
-                    "TemplateURL": f"{os.environ.get('MINISTACK_ENDPOINT', 'http://localhost:4566')}/{templates_bucket}/child.json",
+                    "TemplateURL": f"{endpoint}/{templates_bucket}/child.json",
                     "Parameters": {"BucketSuffix": suffix},
                 },
             },

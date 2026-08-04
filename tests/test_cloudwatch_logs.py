@@ -1056,6 +1056,89 @@ def test_queries_survive_warm_boot():
     mod.reset()
 
 
+def test_queries_are_region_scoped():
+    from ministack.core.responses import get_region, set_request_region
+
+    mod = _module()
+    mod.reset()
+    original_region = get_region()
+
+    try:
+        set_request_region("us-east-1")
+        east = mod._start_query({
+            "logGroupName": "/aws/lambda/query-east",
+            "startTime": 1,
+            "endTime": 2,
+            "queryString": "fields @message",
+        })
+        east_id = json.loads(east[2])["queryId"]
+
+        set_request_region("us-west-2")
+        west = mod._start_query({
+            "logGroupName": "/aws/lambda/query-west",
+            "startTime": 1,
+            "endTime": 2,
+            "queryString": "fields @message",
+        })
+        west_id = json.loads(west[2])["queryId"]
+
+        assert west_id in mod._queries
+        assert east_id not in mod._queries
+        missing = mod._get_query_results({"queryId": east_id})
+        assert missing[0] == 400
+
+        set_request_region("us-east-1")
+        assert east_id in mod._queries
+        assert west_id not in mod._queries
+        found = mod._get_query_results({"queryId": east_id})
+        assert json.loads(found[2])["status"] == "Complete"
+    finally:
+        set_request_region(original_region)
+        mod.reset()
+
+
+def test_legacy_queries_restore_to_log_group_region():
+    from ministack.core.responses import AccountScopedDict, get_region, set_request_region
+
+    mod = _module()
+    mod.reset()
+    original_region = get_region()
+    group = f"/aws/lambda/legacy-query-{_uuid_mod.uuid4().hex[:8]}"
+
+    legacy_queries = AccountScopedDict()
+    legacy_queries["q-legacy"] = {
+        "queryId": "q-legacy",
+        "logGroupName": group,
+        "startTime": 1700000000,
+        "endTime": 1700001000,
+        "queryString": "fields @message",
+        "status": "Complete",
+    }
+
+    try:
+        set_request_region("us-east-1")
+        mod.restore_state({
+            "log_groups": {
+                group: {
+                    "arn": f"arn:aws:logs:us-west-2:000000000000:log-group:{group}:*",
+                    "creationTime": 1700000000000,
+                    "retentionInDays": None,
+                    "tags": {},
+                    "subscriptionFilters": {},
+                    "streams": {},
+                },
+            },
+            "queries": legacy_queries,
+        })
+
+        assert "q-legacy" not in mod._queries
+        set_request_region("us-west-2")
+        assert "q-legacy" in mod._queries
+    finally:
+        set_request_region(original_region)
+        mod.reset()
+
+
 # ── subscription-filter ↔ destination consistency ──────────────────────
 
 def test_subscription_filter_destination_resolvable_after_warm_boot():
