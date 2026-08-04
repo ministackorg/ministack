@@ -5517,6 +5517,145 @@ def test_sfn_aws_sdk_s3_error_names_the_sdk_exception(sfn_sync):
 
 
 # ---------------------------------------------------------------------------
+# REST-XML aws-sdk dispatch (Route 53)
+# ---------------------------------------------------------------------------
+
+
+def _r53_change_task(sfn_sync, tag, params, action="changeResourceRecordSets"):
+    """Run one aws-sdk:route53 task to completion and return the sync-execution response."""
+    arn = sfn_sync.create_state_machine(
+        name=f"sdk-r53-{tag}-{_uuid_mod.uuid4().hex[:6]}",
+        definition=json.dumps({
+            "StartAt": "Change",
+            "States": {
+                "Change": {
+                    "Type": "Task",
+                    "Resource": f"arn:aws:states:::aws-sdk:route53:{action}",
+                    "Parameters": params,
+                    "End": True,
+                },
+            },
+        }),
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+    try:
+        return sfn_sync.start_sync_execution(stateMachineArn=arn, input=json.dumps({}))
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=arn)
+
+
+def test_sfn_aws_sdk_route53_change_resource_record_sets(sfn_sync, r53):
+    """aws-sdk:route53:changeResourceRecordSets writes the record, and deletes it again."""
+    tag = _uuid_mod.uuid4().hex[:8]
+    zone_name = f"sfn-r53-{tag}.example.com."
+    record = f"api.{zone_name}"
+    values = ["10.0.0.1", "10.0.0.2"]
+    zone_id = None
+
+    def batch(action):
+        return {"Comment": f"sfn {tag}",
+                "Changes": [{"Action": action,
+                             "ResourceRecordSet": {"Name": record, "Type": "A", "TTL": 60,
+                                                   "ResourceRecords": [{"Value": v}
+                                                                       for v in values]}}]}
+
+    def a_records(zone):
+        return [rs for rs in r53.list_resource_record_sets(HostedZoneId=zone)["ResourceRecordSets"]
+                if rs["Name"] == record and rs["Type"] == "A"]
+
+    try:
+        zone_id = r53.create_hosted_zone(
+            Name=zone_name, CallerReference=f"sfn-{tag}")["HostedZone"]["Id"]
+        bare_id = zone_id.rsplit("/", 1)[-1]
+
+        resp = _r53_change_task(sfn_sync, tag, {"HostedZoneId": bare_id,
+                                                "ChangeBatch": batch("UPSERT")})
+        assert resp["status"] == "SUCCEEDED", f"{resp.get('error')} — {resp.get('cause')}"
+        info = json.loads(resp["output"])["ChangeInfo"]
+        assert info["Id"].startswith("/change/")
+        assert info["Status"] in ("PENDING", "INSYNC")
+        assert info["SubmittedAt"]
+
+        # Task success is not the assertion: a flattened XML body loses values silently.
+        got = a_records(bare_id)
+        assert len(got) == 1, got
+        assert sorted(r["Value"] for r in got[0]["ResourceRecords"]) == values
+        assert str(got[0]["TTL"]) == "60"
+
+        # The bare id is the only form that works; AWS rejects "/hostedzone/Z..." unchanged.
+        resp = _r53_change_task(sfn_sync, tag, {"HostedZoneId": bare_id,
+                                               "ChangeBatch": batch("DELETE")})
+        assert resp["status"] == "SUCCEEDED", f"{resp.get('error')} — {resp.get('cause')}"
+        assert a_records(bare_id) == []
+    finally:
+        if zone_id:
+            try:
+                r53.delete_hosted_zone(Id=zone_id)
+            except ClientError:
+                pass
+
+
+def test_sfn_aws_sdk_route53_request_matches_botocore():
+    """The request this dispatcher builds must be the one boto3 would have sent."""
+    import botocore.session
+    from botocore.serialize import create_serializer
+
+    from ministack.services.stepfunctions import (
+        _ROUTE53_OP_SPECS,
+        _rest_xml_build_body,
+        _rest_xml_substitute_path,
+    )
+
+    change_batch = {
+        "Comment": "c",
+        "Changes": [{"Action": "UPSERT",
+                     "ResourceRecordSet": {"Name": "a.example.com", "Type": "A", "TTL": 60,
+                                           "ResourceRecords": [{"Value": "1.2.3.4"},
+                                                               {"Value": "5.6.7.8"}]}}],
+    }
+    params = {"HostedZoneId": "Z123ABC", "ChangeBatch": change_batch}
+
+    op = botocore.session.get_session().get_service_model("route53").operation_model(
+        "ChangeResourceRecordSets")
+    want = create_serializer("rest-xml").serialize_to_request(params, op)
+    want_body = want["body"].decode("utf-8") if isinstance(want["body"], bytes) else want["body"]
+
+    spec = _ROUTE53_OP_SPECS["ChangeResourceRecordSets"]
+    assert _rest_xml_substitute_path(spec["path"], params, spec) == want["url_path"]
+    assert _rest_xml_build_body(spec["body_wrapper"], {"ChangeBatch": change_batch},
+                                spec["list_members"],
+                                spec["body_xmlns"]).decode("utf-8") == want_body
+
+    # Verbatim: fix_route53_ids runs inside boto3, not Step Functions, and AWS rejects this form.
+    assert _rest_xml_substitute_path(
+        spec["path"], {"HostedZoneId": "/hostedzone/Z123ABC"}, spec) == (
+        "/2013-04-01/hostedzone//hostedzone/Z123ABC/rrset/")
+
+
+def test_sfn_aws_sdk_route53_errors_name_their_service(sfn_sync):
+    """A route53 failure is Route53.<Code>Exception, and an unmapped op names the covered ops."""
+    tag = _uuid_mod.uuid4().hex[:8]
+
+    resp = _r53_change_task(sfn_sync, tag, {
+        "HostedZoneId": "Z00000000000000000000",
+        "ChangeBatch": {"Changes": [{"Action": "UPSERT",
+                                     "ResourceRecordSet": {"Name": f"x.{tag}.example.com.",
+                                                           "Type": "A", "TTL": 60,
+                                                           "ResourceRecords": [
+                                                               {"Value": "10.0.0.9"}]}}]},
+    })
+    # Route 53 nests Code under <Error> with a default xmlns; both have to be seen through.
+    assert resp["status"] == "FAILED"
+    assert resp.get("error") == "Route53.NoSuchHostedZoneException", resp.get("cause")
+
+    # An operation with no spec names the ones that do have one, per service.
+    resp = _r53_change_task(sfn_sync, tag, {"MaxItems": "1"}, action="listHostedZones")
+    assert resp["status"] == "FAILED"
+    cause = resp.get("cause") or ""
+    assert "not yet implemented" in cause and "ChangeResourceRecordSets" in cause
+
+
+# ---------------------------------------------------------------------------
 # Terraform compatibility tests
 # ---------------------------------------------------------------------------
 

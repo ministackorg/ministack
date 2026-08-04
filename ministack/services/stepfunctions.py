@@ -4244,6 +4244,7 @@ _AWS_SDK_SERVICE_MAP = {
     "rdsdata": {"protocol": "rest-json", "service_key": "rds-data"},
     # REST-XML services: per-op path templates, header/querystring routing, XML responses
     "s3": {"protocol": "rest-xml", "service_key": "s3"},
+    "route53": {"protocol": "rest-xml", "service_key": "route53"},
     "lambda": {"protocol": "rest"},
 }
 
@@ -5365,9 +5366,25 @@ _S3_OP_SPECS = {
     },
 }
 
+# Route 53 wraps XML lists ("<Changes><Change/></Changes>") where S3 repeats the parent element,
+# hence list_members. The zone id is substituted verbatim: botocore's fix_route53_ids runs inside
+# boto3, not Step Functions, and AWS rejects the "/hostedzone/" form.
+_ROUTE53_OP_SPECS = {
+    "ChangeResourceRecordSets": {
+        "method": "POST", "path": "/2013-04-01/hostedzone/{Id}/rrset/",
+        "path_params": {"Id": "HostedZoneId"},
+        "body_field": "ChangeBatch",
+        # Unlike S3, the request element wraps the input field rather than being it.
+        "body_wrapper": "ChangeResourceRecordSetsRequest",
+        "body_xmlns": "https://route53.amazonaws.com/doc/2013-04-01/",
+        "list_members": {"Changes": "Change", "ResourceRecords": "ResourceRecord"},
+    },
+}
+
 # Keyed by service, like _REST_JSON_ACTION_PATHS: the protocol is shared, the op specs are not.
 _REST_XML_OP_SPECS = {
     "s3": _S3_OP_SPECS,
+    "route53": _ROUTE53_OP_SPECS,
 }
 
 
@@ -5385,10 +5402,17 @@ def _rest_xml_substitute_path(template, input_data, spec=None):
     return out
 
 
-def _rest_xml_build_body(root_name, payload):
-    """Build a minimal XML body for the small handful of ops that need one."""
+def _rest_xml_build_body(root_name, payload, list_members=None, xmlns=None):
+    """Build a minimal XML body for the small handful of ops that need one.
+
+    A list is emitted as a repeated parent element ("<Contents/><Contents/>", S3's shape) unless
+    list_members names its member element, in which case it is wrapped
+    ("<Changes><Change/></Changes>", Route 53's shape). Getting this wrong is silent: the handler
+    finds no members and reads the change batch as empty.
+    """
     import xml.etree.ElementTree as ET
-    root = ET.Element(root_name)
+    list_members = list_members or {}
+    root = ET.Element(root_name, {"xmlns": xmlns} if xmlns else {})
 
     def _emit(parent, name, value):
         if isinstance(value, dict):
@@ -5396,8 +5420,14 @@ def _rest_xml_build_body(root_name, payload):
             for k, v in value.items():
                 _emit(child, k, v)
         elif isinstance(value, list):
-            for item in value:
-                _emit(parent, name, item)
+            member = list_members.get(name)
+            if member:
+                wrapper = ET.SubElement(parent, name)
+                for item in value:
+                    _emit(wrapper, member, item)
+            else:
+                for item in value:
+                    _emit(parent, name, item)
         else:
             child = ET.SubElement(parent, name)
             child.text = "" if value is None else str(value)
@@ -5499,7 +5529,11 @@ def _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data):
     body = b""
     body_field = spec.get("body_field")
     if body_field and body_field in input_data:
-        body = _rest_xml_build_body(spec.get("body_root", body_field), input_data[body_field])
+        wrapper = spec.get("body_wrapper")
+        root_name = wrapper or spec.get("body_root", body_field)
+        payload = {body_field: input_data[body_field]} if wrapper else input_data[body_field]
+        body = _rest_xml_build_body(root_name, payload, spec.get("list_members"),
+                                    spec.get("body_xmlns"))
         headers["content-type"] = "application/xml"
         headers["content-length"] = str(len(body))
 
@@ -5534,12 +5568,15 @@ def _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data):
         if decoded:
             try:
                 err_root = ET.fromstring(decoded)
-                code_el = err_root.find("Code")
-                msg_el = err_root.find("Message")
-                if code_el is not None and code_el.text:
-                    code = code_el.text
-                if msg_el is not None and msg_el.text:
-                    message = msg_el.text
+                # Route 53 nests Code/Message under <Error> with a default xmlns, so match local
+                # names anywhere rather than find("Code").
+                found = {}
+                for el in err_root.iter():
+                    local = el.tag.split("}")[-1] if "}" in el.tag else el.tag
+                    if local in ("Code", "Message") and local not in found and el.text:
+                        found[local] = el.text
+                code = found.get("Code", code)
+                message = found.get("Message", message)
             except ET.ParseError:
                 pass
         # Named after the SDK exception class: S3.NoSuchBucketException.
