@@ -297,6 +297,55 @@ def test_rds_create_cluster_v2(rds):
     desc = rds.describe_db_clusters(DBClusterIdentifier="rds-cc-v2")
     assert desc["DBClusters"][0]["DBClusterIdentifier"] == "rds-cc-v2"
 
+def test_rds_cluster_serverlessv2_and_log_exports_round_trip(rds):
+    """CreateDBCluster persists ServerlessV2ScalingConfiguration and
+    EnabledCloudwatchLogsExports, DescribeDBClusters reads them back, and a
+    second identical describe is stable — so a warm Terraform re-apply sees no
+    drift and issues no needless ModifyDBCluster."""
+    rds.create_db_cluster(
+        DBClusterIdentifier="cluster-sv2",
+        Engine="aurora-postgresql",
+        MasterUsername="admin",
+        MasterUserPassword="password123",
+        ServerlessV2ScalingConfiguration={"MinCapacity": 0.5, "MaxCapacity": 4.0},
+        EnableCloudwatchLogsExports=["postgresql"],
+    )
+
+    cluster = rds.describe_db_clusters(DBClusterIdentifier="cluster-sv2")["DBClusters"][0]
+    assert cluster["ServerlessV2ScalingConfiguration"]["MinCapacity"] == 0.5
+    assert cluster["ServerlessV2ScalingConfiguration"]["MaxCapacity"] == 4.0
+    assert cluster["EnabledCloudwatchLogsExports"] == ["postgresql"]
+
+    # A second describe must return the identical configuration; the values are
+    # not lost after the create response, which is what avoids re-apply drift.
+    again = rds.describe_db_clusters(DBClusterIdentifier="cluster-sv2")["DBClusters"][0]
+    assert again["ServerlessV2ScalingConfiguration"] == cluster["ServerlessV2ScalingConfiguration"]
+    assert again["EnabledCloudwatchLogsExports"] == ["postgresql"]
+
+def test_rds_modify_cluster_serverlessv2_and_log_exports(rds):
+    """ModifyDBCluster updates ServerlessV2ScalingConfiguration and the enabled
+    CloudWatch Logs exports (sent under CloudwatchLogsExportConfiguration), and
+    the new values round-trip through DescribeDBClusters."""
+    rds.create_db_cluster(
+        DBClusterIdentifier="cluster-sv2-mod",
+        Engine="aurora-postgresql",
+        MasterUsername="admin",
+        MasterUserPassword="password123",
+        ServerlessV2ScalingConfiguration={"MinCapacity": 0.5, "MaxCapacity": 2.0},
+        EnableCloudwatchLogsExports=["postgresql"],
+    )
+
+    rds.modify_db_cluster(
+        DBClusterIdentifier="cluster-sv2-mod",
+        ServerlessV2ScalingConfiguration={"MinCapacity": 1.0, "MaxCapacity": 8.0},
+        CloudwatchLogsExportConfiguration={"EnableLogTypes": ["postgresql", "iam-db-auth-error"]},
+    )
+
+    cluster = rds.describe_db_clusters(DBClusterIdentifier="cluster-sv2-mod")["DBClusters"][0]
+    assert cluster["ServerlessV2ScalingConfiguration"]["MinCapacity"] == 1.0
+    assert cluster["ServerlessV2ScalingConfiguration"]["MaxCapacity"] == 8.0
+    assert cluster["EnabledCloudwatchLogsExports"] == ["postgresql", "iam-db-auth-error"]
+
 def test_rds_engine_versions_v2(rds):
     pg = rds.describe_db_engine_versions(Engine="postgres")
     assert len(pg["DBEngineVersions"]) > 0

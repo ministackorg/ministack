@@ -3281,6 +3281,40 @@ def _restore_from_snapshot(p):
 # DB Clusters
 # ---------------------------------------------------------------------------
 
+def _store_cluster_scaling_config(cluster, p):
+    """Persist a ServerlessV2ScalingConfiguration from request params.
+
+    CreateDBCluster and ModifyDBCluster share the
+    ``ServerlessV2ScalingConfiguration.MinCapacity`` / ``.MaxCapacity``
+    parameter names. Only the capacities actually supplied are updated so a
+    modify that changes a single bound leaves the other one intact, and a call
+    that omits the block entirely leaves any stored configuration unchanged.
+    """
+    min_capacity = _p(p, "ServerlessV2ScalingConfiguration.MinCapacity")
+    max_capacity = _p(p, "ServerlessV2ScalingConfiguration.MaxCapacity")
+    if min_capacity == "" and max_capacity == "":
+        return
+    config = dict(cluster.get("ServerlessV2ScalingConfiguration") or {})
+    if min_capacity != "":
+        config["MinCapacity"] = min_capacity
+    if max_capacity != "":
+        config["MaxCapacity"] = max_capacity
+    cluster["ServerlessV2ScalingConfiguration"] = config
+
+
+def _store_cluster_log_exports(cluster, p, prefix):
+    """Persist the enabled CloudWatch Logs exports from request params.
+
+    CreateDBCluster sends the list as ``EnableCloudwatchLogsExports.member.N``,
+    while ModifyDBCluster nests it under
+    ``CloudwatchLogsExportConfiguration.EnableLogTypes.member.N``; callers pass
+    the appropriate prefix. An absent list leaves the stored value unchanged.
+    """
+    log_exports = _parse_member_list(p, prefix)
+    if log_exports:
+        cluster["EnabledCloudwatchLogsExports"] = log_exports
+
+
 def _create_db_cluster(p):
     cluster_id = _p(p, "DBClusterIdentifier")
     if not cluster_id:
@@ -3461,6 +3495,8 @@ def _create_db_cluster(p):
         "_shared_container_epoch": 0,
         "_shared_storage_initialized": False,
     }
+    _store_cluster_scaling_config(cluster, p)
+    _store_cluster_log_exports(cluster, p, "EnableCloudwatchLogsExports")
     _prepare_mysql_gtid_history(cluster)
     _clusters[cluster_id] = cluster
     if global_cluster:
@@ -3734,6 +3770,9 @@ def _modify_db_cluster(p):
         cluster["VpcSecurityGroups"] = [
             {"VpcSecurityGroupId": sg, "Status": "active"} for sg in vpc_sgs
         ]
+
+    _store_cluster_scaling_config(cluster, p)
+    _store_cluster_log_exports(cluster, p, "CloudwatchLogsExportConfiguration.EnableLogTypes")
 
     return _xml(200, "ModifyDBClusterResponse",
         f"<ModifyDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></ModifyDBClusterResult>")
@@ -5168,6 +5207,29 @@ def _cluster_xml(c):
         if global_write_forwarding else ""
     )
 
+    # Serverless v2 scaling and enabled CloudWatch Logs exports must be echoed
+    # back exactly as configured. Without them DescribeDBClusters reports the
+    # fields as missing on every warm re-apply, so Terraform sees drift and
+    # issues a needless ModifyDBCluster. Emit each block only when configured,
+    # matching how AWS omits them for clusters that never set them.
+    scaling = c.get("ServerlessV2ScalingConfiguration")
+    scaling_xml = ""
+    if scaling:
+        scaling_parts = []
+        if scaling.get("MinCapacity") not in (None, ""):
+            scaling_parts.append(f"<MinCapacity>{scaling['MinCapacity']}</MinCapacity>")
+        if scaling.get("MaxCapacity") not in (None, ""):
+            scaling_parts.append(f"<MaxCapacity>{scaling['MaxCapacity']}</MaxCapacity>")
+        scaling_xml = (
+            f"<ServerlessV2ScalingConfiguration>{''.join(scaling_parts)}"
+            "</ServerlessV2ScalingConfiguration>"
+        )
+    log_exports = c.get("EnabledCloudwatchLogsExports") or []
+    log_exports_xml = ""
+    if log_exports:
+        log_members = "".join(f"<member>{_esc(str(log))}</member>" for log in log_exports)
+        log_exports_xml = f"<EnabledCloudwatchLogsExports>{log_members}</EnabledCloudwatchLogsExports>"
+
     return f"""<DBClusterIdentifier>{c['DBClusterIdentifier']}</DBClusterIdentifier>
         <DBClusterArn>{c['DBClusterArn']}</DBClusterArn>
         <Engine>{c['Engine']}</Engine>
@@ -5207,6 +5269,8 @@ def _cluster_xml(c):
         <NetworkType>{c.get('NetworkType','IPV4')}</NetworkType>
         {global_cluster_xml}
         {global_write_forwarding_xml}
+        {scaling_xml}
+        {log_exports_xml}
         <EngineLifecycleSupport>{c.get('EngineLifecycleSupport','open-source-rds-extended-support')}</EngineLifecycleSupport>"""
 
 
