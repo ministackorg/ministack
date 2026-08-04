@@ -19,6 +19,7 @@ from ministack.core.responses import (
     set_request_region,
 )
 from ministack.services import (
+    cloudformation,
     dynamodb,
     ecs,
     eks,
@@ -71,6 +72,26 @@ async def _call_stepfunctions_action(action, data=None):
         json.dumps(data or {}).encode(),
         {},
     )
+
+
+async def _call_cloudformation_action(action, data=None):
+    return await cloudformation.handle_request(
+        "POST",
+        "/",
+        {
+            "content-type": "application/x-amz-json-1.0",
+            "x-amz-target": f"CloudFormation_20100515.{action}",
+        },
+        json.dumps(data or {}).encode(),
+        {},
+    )
+
+
+def _clear_cloudformation_state():
+    cloudformation._stacks.clear()
+    cloudformation._stack_events.clear()
+    cloudformation._exports.clear()
+    cloudformation._change_sets.clear()
 
 
 async def _create_rds_integration_state_machine(name):
@@ -656,7 +677,7 @@ def test_first_touch_serialized_import_waits_for_reset_writer(monkeypatch):
             await asyncio.sleep(0.001)
 
         first_touch = asyncio.create_task(
-            ministack_app._gate_first_touch_reset_admission_module("rds")
+            ministack_app._ensure_reset_admission_owner_modules(("rds",))
         )
         await asyncio.sleep(0.05)
         assert order == ["wipe-start"]
@@ -697,9 +718,11 @@ def test_first_touch_gate_maps_every_serialized_service_key(monkeypatch, service
         LoopLocal(ministack_app._RequestResetBarrier),
     )
 
-    asyncio.run(ministack_app._gate_first_touch_reset_admission_module(service))
+    asyncio.run(
+        ministack_app._gate_first_touch_reset_admission_modules(service, {}, b"")
+    )
 
-    assert imported == [ministack_app.SERVICE_REGISTRY[service]["module"]]
+    assert imported == list(ministack_app._RESET_ADMISSION_OWNER_MODULES[service])
 
 
 @pytest.mark.parametrize(
@@ -719,9 +742,229 @@ def test_first_touch_gate_does_not_import_callback_services(monkeypatch, service
         lambda name: imported.append(name),
     )
 
-    asyncio.run(ministack_app._gate_first_touch_reset_admission_module(service))
+    asyncio.run(
+        ministack_app._gate_first_touch_reset_admission_modules(service, {}, b"")
+    )
 
     assert imported == []
+
+
+@pytest.mark.parametrize(
+    ("owner", "headers", "body", "preloaded"),
+    [
+        (
+            "rds",
+            {
+                "host": "rds-data.us-east-1.amazonaws.com",
+                "x-amz-target": "RDSDataService.ExecuteStatement",
+            },
+            b"{}",
+            {"rds_data": object()},
+        ),
+        (
+            "ecs",
+            {
+                "host": "tagging.us-east-1.amazonaws.com",
+                "x-amz-target": "ResourceGroupsTaggingAPI_20170126.TagResources",
+            },
+            json.dumps(
+                {
+                    "ResourceARNList": [
+                        "arn:aws:ecs:us-east-1:000000000000:cluster/first-touch"
+                    ],
+                    "Tags": {"owner": "reset"},
+                }
+            ).encode(),
+            {},
+        ),
+    ],
+    ids=["rds-data-rds-owner", "tagging-ecs-owner"],
+)
+def test_indirect_http_first_touch_waits_for_reset_writer(
+    monkeypatch, owner, headers, body, preloaded
+):
+    wipe_started = threading.Event()
+    release_wipe = threading.Event()
+    mutation_started = threading.Event()
+    loaded = dict(preloaded)
+    order = []
+
+    def resolve_loaded(name):
+        return loaded.get(name)
+
+    def import_module(name):
+        order.append(f"import-{name}")
+        loaded[name] = object()
+        return loaded[name]
+
+    def slow_reset():
+        order.append("wipe-start")
+        wipe_started.set()
+        release_wipe.wait(timeout=2)
+        order.append("wipe-finish")
+
+    async def late_owner_mutation(*_args, **_kwargs):
+        ministack_app._get_module(owner)
+        order.append(f"mutate-{owner}")
+        mutation_started.set()
+
+    monkeypatch.setattr(
+        ministack_app, "_resolve_loaded_service_module", resolve_loaded
+    )
+    monkeypatch.setattr(ministack_app, "_get_module", import_module)
+    monkeypatch.setattr(ministack_app, "_reset_all_state", slow_reset)
+    monkeypatch.setattr(
+        ministack_app, "_RESET_SERIALIZED_SERVICE_MODULES", (owner,)
+    )
+    monkeypatch.setattr(ministack_app, "_handle_http_request", late_owner_mutation)
+    monkeypatch.setattr(
+        ministack_app,
+        "_ordinary_request_reset_barriers",
+        LoopLocal(ministack_app._RequestResetBarrier),
+    )
+    monkeypatch.setattr(
+        cfn_lifecycle,
+        "_stack_task_lifecycles",
+        LoopLocal(cfn_lifecycle._StackTaskLifecycle),
+    )
+
+    encoded_headers = [
+        (name.encode("latin-1"), value.encode("utf-8"))
+        for name, value in headers.items()
+    ]
+    request_scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/",
+        "query_string": b"",
+        "headers": encoded_headers,
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(_message):
+        pass
+
+    async def exercise():
+        reset = asyncio.create_task(
+            ministack_app._reset_all_state_after_service_dispatch_drains()
+        )
+        while not wipe_started.is_set():
+            await asyncio.sleep(0.001)
+
+        request = asyncio.create_task(
+            ministack_app.app(request_scope, receive, send)
+        )
+        await asyncio.sleep(0.05)
+        assert not mutation_started.is_set()
+
+        release_wipe.set()
+        await asyncio.gather(reset, request)
+        assert order.index("wipe-finish") < order.index(f"mutate-{owner}")
+
+    fallback = threading.Timer(1, release_wipe.set)
+    fallback.start()
+    try:
+        asyncio.run(exercise())
+    finally:
+        release_wipe.set()
+        fallback.cancel()
+
+
+def test_sfn_indirect_first_touch_imports_owner_loop_side_after_reset(monkeypatch):
+    wipe_started = threading.Event()
+    release_wipe = threading.Event()
+    mutation_started = threading.Event()
+    loaded = {}
+    order = []
+    import_thread_ids = []
+
+    class FakeRds:
+        async def handle_request(self, *_args):
+            order.append("mutate-rds")
+            mutation_started.set()
+            return 200, {}, b"{}"
+
+    def resolve_loaded(name):
+        return loaded.get(name)
+
+    def import_module(name):
+        if name in loaded:
+            return loaded[name]
+        import_thread_ids.append(threading.get_ident())
+        order.append(f"import-{name}")
+        loaded[name] = FakeRds()
+        return loaded[name]
+
+    def slow_reset():
+        order.append("wipe-start")
+        wipe_started.set()
+        release_wipe.wait(timeout=2)
+        order.append("wipe-finish")
+
+    async def unused_handler(*_args):
+        raise AssertionError("serialized SFN dispatch must use the loop-side module")
+
+    monkeypatch.setattr(
+        ministack_app, "_resolve_loaded_service_module", resolve_loaded
+    )
+    monkeypatch.setattr(ministack_app, "_get_module", import_module)
+    monkeypatch.setattr(ministack_app, "_reset_all_state", slow_reset)
+    monkeypatch.setattr(
+        ministack_app, "_RESET_SERIALIZED_SERVICE_MODULES", ("rds",)
+    )
+    monkeypatch.setattr(
+        ministack_app,
+        "_ordinary_request_reset_barriers",
+        LoopLocal(ministack_app._RequestResetBarrier),
+    )
+    monkeypatch.setattr(
+        cfn_lifecycle,
+        "_stack_task_lifecycles",
+        LoopLocal(cfn_lifecycle._StackTaskLifecycle),
+    )
+
+    async def exercise():
+        loop_thread_id = threading.get_ident()
+        reset = asyncio.create_task(
+            ministack_app._reset_all_state_after_service_dispatch_drains()
+        )
+        while not wipe_started.is_set():
+            await asyncio.sleep(0.001)
+
+        token = stepfunctions._execution_server_loop.set(asyncio.get_running_loop())
+        try:
+            integration = asyncio.create_task(
+                asyncio.to_thread(
+                    stepfunctions._drive_service_handler_sync,
+                    "rds",
+                    unused_handler,
+                    "POST",
+                    "/",
+                    {},
+                    b"{}",
+                    {},
+                )
+            )
+            await asyncio.sleep(0.05)
+            assert not mutation_started.is_set()
+
+            release_wipe.set()
+            await asyncio.gather(reset, integration)
+        finally:
+            stepfunctions._execution_server_loop.reset(token)
+
+        assert import_thread_ids == [loop_thread_id]
+        assert order.index("wipe-finish") < order.index("mutate-rds")
+
+    fallback = threading.Timer(1, release_wipe.set)
+    fallback.start()
+    try:
+        asyncio.run(exercise())
+    finally:
+        release_wipe.set()
+        fallback.cancel()
 
 
 @pytest.mark.parametrize(
@@ -2095,6 +2338,260 @@ def test_admin_reset_quiesces_multi_resource_cloudformation_task(monkeypatch):
     finally:
         release_first.set()
         fallback.cancel()
+
+
+def test_cloudformation_mutations_return_503_while_task_admission_is_closed(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        cfn_lifecycle,
+        "_stack_task_lifecycles",
+        LoopLocal(cfn_lifecycle._StackTaskLifecycle),
+    )
+    _clear_cloudformation_state()
+
+    async def exercise():
+        lifecycle = cfn_lifecycle._get_stack_task_lifecycle()
+        await lifecycle.begin_reset()
+        try:
+            for action in (
+                "CreateStack",
+                "DeleteStack",
+                "UpdateStack",
+                "CreateChangeSet",
+                "ExecuteChangeSet",
+                "DeleteChangeSet",
+            ):
+                status, _, body = await _call_cloudformation_action(action)
+                assert status == 503, action
+                assert b"ServiceUnavailableException" in body
+
+            read_status, _, _ = await _call_cloudformation_action("DescribeStacks")
+            assert read_status == 200
+        finally:
+            lifecycle.finish_reset()
+
+        assert not cloudformation._stacks
+        assert not cloudformation._stack_events
+        assert not cloudformation._change_sets
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        _clear_cloudformation_state()
+
+
+def test_cloudformation_closed_task_admission_raises(monkeypatch):
+    monkeypatch.setattr(
+        cfn_lifecycle,
+        "_stack_task_lifecycles",
+        LoopLocal(cfn_lifecycle._StackTaskLifecycle),
+    )
+
+    async def no_op():
+        pass
+
+    async def exercise():
+        lifecycle = cfn_lifecycle._get_stack_task_lifecycle()
+        await lifecycle.begin_reset()
+        try:
+            with pytest.raises(cfn_lifecycle.StackTaskAdmissionClosed):
+                lifecycle.create_task(no_op())
+        finally:
+            lifecycle.finish_reset()
+
+    asyncio.run(exercise())
+
+
+def test_cancelled_reset_rejects_concurrent_create_then_reopens_admission(
+    monkeypatch,
+):
+    drain_started = asyncio.Event()
+    release_drain = asyncio.Event()
+    wipe_called = threading.Event()
+
+    monkeypatch.setattr(
+        cfn_lifecycle,
+        "_stack_task_lifecycles",
+        LoopLocal(cfn_lifecycle._StackTaskLifecycle),
+    )
+    monkeypatch.setattr(
+        ministack_app,
+        "_ordinary_request_reset_barriers",
+        LoopLocal(ministack_app._RequestResetBarrier),
+    )
+    monkeypatch.setattr(ministack_app, "_RESET_SERIALIZED_SERVICE_MODULES", ())
+
+    def reset_state():
+        _clear_cloudformation_state()
+        wipe_called.set()
+
+    monkeypatch.setattr(ministack_app, "_reset_all_state", reset_state)
+    _clear_cloudformation_state()
+
+    async def active_stack_task():
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            drain_started.set()
+            await release_drain.wait()
+            raise
+
+    async def exercise():
+        lifecycle = cfn_lifecycle._get_stack_task_lifecycle()
+        active = lifecycle.create_task(active_stack_task())
+        reset = asyncio.create_task(
+            ministack_app._reset_all_state_after_service_dispatch_drains()
+        )
+        await drain_started.wait()
+
+        status, _, _ = await _call_cloudformation_action(
+            "CreateStack",
+            {
+                "StackName": "rejected-during-reset",
+                "TemplateBody": json.dumps({"Resources": {}}),
+            },
+        )
+        assert status == 503
+        assert "rejected-during-reset" not in cloudformation._stacks
+
+        reset.cancel()
+        release_drain.set()
+        result = await asyncio.gather(reset, return_exceptions=True)
+        assert isinstance(result[0], asyncio.CancelledError)
+        assert wipe_called.is_set()
+        assert lifecycle.is_accepting()
+        assert isinstance(
+            (await asyncio.gather(active, return_exceptions=True))[0],
+            asyncio.CancelledError,
+        )
+
+        status, _, _ = await _call_cloudformation_action(
+            "CreateStack",
+            {
+                "StackName": "accepted-after-reset",
+                "TemplateBody": json.dumps({"Resources": {}}),
+            },
+        )
+        assert status == 200
+        await asyncio.sleep(0)
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        _clear_cloudformation_state()
+
+
+def test_cancelled_reset_still_wipes_existing_stack_metadata(monkeypatch):
+    drain_started = asyncio.Event()
+    release_drain = asyncio.Event()
+    wipe_called = threading.Event()
+
+    monkeypatch.setattr(
+        cfn_lifecycle,
+        "_stack_task_lifecycles",
+        LoopLocal(cfn_lifecycle._StackTaskLifecycle),
+    )
+    monkeypatch.setattr(
+        ministack_app,
+        "_ordinary_request_reset_barriers",
+        LoopLocal(ministack_app._RequestResetBarrier),
+    )
+    monkeypatch.setattr(ministack_app, "_RESET_SERIALIZED_SERVICE_MODULES", ())
+
+    def reset_state():
+        _clear_cloudformation_state()
+        wipe_called.set()
+
+    monkeypatch.setattr(ministack_app, "_reset_all_state", reset_state)
+    _clear_cloudformation_state()
+    cloudformation._stacks["existing"] = {"StackStatus": "CREATE_IN_PROGRESS"}
+
+    async def active_stack_task():
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            drain_started.set()
+            await release_drain.wait()
+            raise
+
+    async def exercise():
+        lifecycle = cfn_lifecycle._get_stack_task_lifecycle()
+        active = lifecycle.create_task(active_stack_task())
+        reset = asyncio.create_task(
+            ministack_app._reset_all_state_after_service_dispatch_drains()
+        )
+        await drain_started.wait()
+        reset.cancel()
+        release_drain.set()
+
+        result = await asyncio.gather(reset, return_exceptions=True)
+        assert isinstance(result[0], asyncio.CancelledError)
+        assert wipe_called.is_set()
+        assert not cloudformation._stacks
+        assert lifecycle.is_accepting()
+        assert isinstance(
+            (await asyncio.gather(active, return_exceptions=True))[0],
+            asyncio.CancelledError,
+        )
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        _clear_cloudformation_state()
+
+
+def test_reset_absorbs_repeated_cancellation_until_wipe_completes(monkeypatch):
+    drain_started = asyncio.Event()
+    release_drain = asyncio.Event()
+    wipe_called = threading.Event()
+
+    monkeypatch.setattr(
+        cfn_lifecycle,
+        "_stack_task_lifecycles",
+        LoopLocal(cfn_lifecycle._StackTaskLifecycle),
+    )
+    monkeypatch.setattr(
+        ministack_app,
+        "_ordinary_request_reset_barriers",
+        LoopLocal(ministack_app._RequestResetBarrier),
+    )
+    monkeypatch.setattr(ministack_app, "_RESET_SERIALIZED_SERVICE_MODULES", ())
+    monkeypatch.setattr(ministack_app, "_reset_all_state", wipe_called.set)
+
+    async def active_stack_task():
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            drain_started.set()
+            await release_drain.wait()
+            raise
+
+    async def exercise():
+        lifecycle = cfn_lifecycle._get_stack_task_lifecycle()
+        active = lifecycle.create_task(active_stack_task())
+        reset = asyncio.create_task(
+            ministack_app._reset_all_state_after_service_dispatch_drains()
+        )
+        await drain_started.wait()
+
+        reset.cancel()
+        await asyncio.sleep(0)
+        reset.cancel()
+        await asyncio.sleep(0.02)
+        assert not wipe_called.is_set()
+
+        release_drain.set()
+        result = await asyncio.gather(reset, return_exceptions=True)
+        assert isinstance(result[0], asyncio.CancelledError)
+        assert wipe_called.is_set()
+        assert lifecycle.is_accepting()
+        assert isinstance(
+            (await asyncio.gather(active, return_exceptions=True))[0],
+            asyncio.CancelledError,
+        )
+
+    asyncio.run(exercise())
 
 
 def test_cancelled_dispatch_holds_admission_and_reset_until_worker_finishes(

@@ -43,6 +43,19 @@ def _error(code, message, status=400):
     return status, {"Content-Type": "application/xml"}, body
 
 
+def _mutation_admission_error():
+    """Return a 503 while reset has closed stack-task admission."""
+    from .lifecycle import _get_stack_task_lifecycle
+
+    if _get_stack_task_lifecycle().is_accepting():
+        return None
+    return _error(
+        "ServiceUnavailableException",
+        "CloudFormation mutations are unavailable while MiniStack resets.",
+        503,
+    )
+
+
 def _extract_members(params, prefix):
     """Extract Parameters.member.N.Key/Value or Tags.member.N.Key/Value."""
     result = []

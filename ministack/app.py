@@ -238,6 +238,19 @@ def _resolve_loaded_service_module(name: str):
     return _loaded_modules.get(name) or sys.modules.get(f"ministack.services.{name}")
 
 
+# Serialized service keys and every module whose first import establishes the
+# admission lock protecting that request. Keep this as the single source of
+# truth for HTTP dispatch and non-HTTP Step Functions SDK integrations.
+_RESET_ADMISSION_OWNER_MODULES = {
+    "rds": ("rds",),
+    "ecs": ("ecs",),
+    "eks": ("eks",),
+    "elasticache": ("elasticache",),
+    "opensearch": ("opensearch",),
+    "rds-data": ("rds_data", "rds"),
+}
+
+
 def _lazy_handler(module_name: str):
     """Return a callable that lazily imports module_name and delegates to handle_request."""
 
@@ -495,22 +508,14 @@ def _get_ordinary_request_reset_barrier() -> _RequestResetBarrier:
     return _ordinary_request_reset_barriers.get()
 
 
-async def _reset_all_state_after_service_dispatch_drains():
-    """Quiesce stack work and requests before wiping mutable service state."""
-    from ministack.services.cloudformation import lifecycle as cfn_lifecycle
-
-    stack_tasks = cfn_lifecycle._get_stack_task_lifecycle()
-    barrier = _get_ordinary_request_reset_barrier()
-
-    # Hold no request or service lock while cancelling stack tasks: unwinding
-    # provisioners may themselves need an admission lock or callback request.
-    try:
-        await stack_tasks.begin_reset()
-    except BaseException:
-        stack_tasks.finish_reset()
-        raise
+async def _complete_reset_after_stack_admission_closes(stack_tasks, barrier):
+    """Run the committed reset sequence and always reopen its admission."""
     barrier_entered = False
     try:
+        # Hold no request or service lock while cancelling stack tasks:
+        # unwinding provisioners may themselves need an admission lock or
+        # callback request.
+        await stack_tasks.begin_reset()
         await barrier.enter_reset()
         barrier_entered = True
         async with AsyncExitStack() as stack:
@@ -535,14 +540,32 @@ async def _reset_all_state_after_service_dispatch_drains():
             barrier.leave_reset()
 
 
-_RESET_ADMISSION_SERVICE_KEYS = {
-    "rds",
-    "ecs",
-    "eks",
-    "elasticache",
-    "opensearch",
-    "rds-data",
-}
+async def _reset_all_state_after_service_dispatch_drains():
+    """Quiesce stack work and requests before wiping mutable service state."""
+    from ministack.services.cloudformation import lifecycle as cfn_lifecycle
+
+    stack_tasks = cfn_lifecycle._get_stack_task_lifecycle()
+    barrier = _get_ordinary_request_reset_barrier()
+    reset = asyncio.create_task(
+        _complete_reset_after_stack_admission_closes(stack_tasks, barrier)
+    )
+    try:
+        await asyncio.shield(reset)
+    except asyncio.CancelledError as cancellation:
+        # Once stack admission begins closing, cancellation must not reopen it
+        # before the drain, barrier, service locks, and wipe all complete.
+        while not reset.done():
+            try:
+                await asyncio.shield(reset)
+            except asyncio.CancelledError:
+                continue
+        # Propagate an internal reset failure instead of misreporting a clean
+        # cancelled reset; otherwise preserve the caller's first cancellation.
+        reset.result()
+        raise cancellation
+
+
+_RESET_ADMISSION_SERVICE_KEYS = set(_RESET_ADMISSION_OWNER_MODULES)
 
 # These request handlers can synchronously wait for code that calls back into
 # MiniStack. Holding them as reset readers would recreate a parent-reader ->
@@ -592,23 +615,55 @@ def _ordinary_request_uses_reset_barrier(method, path, headers, body, query_para
     return service not in _RESET_ADMISSION_SERVICE_KEYS | _RESET_CALLBACK_SERVICE_KEYS
 
 
-async def _gate_first_touch_reset_admission_module(service: str) -> None:
-    """Import a serialized service under reset-reader status on first touch."""
-    if service not in _RESET_ADMISSION_SERVICE_KEYS or service not in SERVICE_HANDLERS:
-        return
-    module_name = SERVICE_REGISTRY[service]["module"]
-    if _resolve_loaded_service_module(module_name) is not None:
+async def _ensure_reset_admission_owner_modules(module_names) -> None:
+    """Import absent serialized owners under reset-reader status."""
+    module_names = tuple(dict.fromkeys(module_names))
+    if not module_names or all(
+        _resolve_loaded_service_module(name) is not None for name in module_names
+    ):
         return
 
     barrier = _get_ordinary_request_reset_barrier()
     await barrier.enter_request()
     try:
         # Recheck after admission: another first-touch request may have loaded
-        # the module while this request waited.
-        if _resolve_loaded_service_module(module_name) is None:
-            _get_module(module_name)
+        # an owner while this request waited.
+        for module_name in module_names:
+            if _resolve_loaded_service_module(module_name) is None:
+                _get_module(module_name)
     finally:
         barrier.leave_request()
+
+
+def _reset_admission_owner_modules_for_request(service, headers, body):
+    """Return serialized owner modules first-touched by one HTTP request."""
+    if service == "tagging":
+        from ministack.services import tagging
+
+        try:
+            _, _, locked_services = tagging.classify_request_admission(headers, body)
+        except (json.JSONDecodeError, tagging.InvalidRequestBody):
+            return ()
+        return tuple(locked_services)
+    return _RESET_ADMISSION_OWNER_MODULES.get(service, ())
+
+
+async def _gate_first_touch_reset_admission_modules(
+    service: str, headers: dict, body: bytes
+) -> None:
+    """Gate every serialized owner a request can first-touch."""
+    await _ensure_reset_admission_owner_modules(
+        _reset_admission_owner_modules_for_request(service, headers, body)
+    )
+
+
+async def _dispatch_serialized_service_request(service: str, *args):
+    """Gate, import, and dispatch a serialized service on the gateway loop."""
+    await _ensure_reset_admission_owner_modules(
+        _RESET_ADMISSION_OWNER_MODULES[service]
+    )
+    module_name = SERVICE_REGISTRY[service]["module"]
+    return await _get_module(module_name).handle_request(*args)
 
 
 # ---------------------------------------------------------------------------
@@ -2064,7 +2119,7 @@ async def app(scope, receive, send):
 
     routing_params = _routing_params(method, path, headers, body, query_params)
     service = detect_service(method, path, headers, routing_params)
-    await _gate_first_touch_reset_admission_module(service)
+    await _gate_first_touch_reset_admission_modules(service, headers, body)
 
     if not _ordinary_request_uses_reset_barrier(method, path, headers, body, query_params):
         await _handle_http_request(

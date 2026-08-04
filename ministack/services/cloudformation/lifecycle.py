@@ -5,6 +5,10 @@ import asyncio
 from ministack.core.concurrency import LoopLocal
 
 
+class StackTaskAdmissionClosed(RuntimeError):
+    """Raised when code tries to spawn stack work during reset."""
+
+
 class _StackTaskLifecycle:
     """Track stack lifecycle tasks and close their admission during reset."""
 
@@ -16,16 +20,19 @@ class _StackTaskLifecycle:
         # Check and insertion are synchronous on the server loop: reset cannot
         # close admission between them.
         if not self._accepting:
-            # The enclosing request may already have written stack metadata;
-            # reset's subsequent state wipe removes it after task quiescence.
             coro.close()
-            return None
+            raise StackTaskAdmissionClosed(
+                "CloudFormation stack task admission is closed for reset"
+            )
         task = asyncio.get_running_loop().create_task(coro)
         self._tasks.add(task)
         # Keep this lifecycle alive for as long as one of its tasks exists;
         # LoopLocal intentionally stores only weak values for loop collection.
         task.add_done_callback(self._task_finished)
         return task
+
+    def is_accepting(self):
+        return self._accepting
 
     def _task_finished(self, task):
         self._tasks.discard(task)

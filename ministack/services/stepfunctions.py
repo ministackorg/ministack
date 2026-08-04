@@ -4271,14 +4271,8 @@ def _invoke_dynamodb(op_name, input_data):
 
 def _invoke_ecs_run_task(resource, input_data):
     """arn:aws:states:::ecs:runTask[.sync]"""
-    try:
-        from ministack.services import ecs
-    except ImportError:
-        logger.warning("ecs module unavailable; returning passthrough")
-        return input_data
     ecs_data = _pascal_to_camel(input_data)
     status, _, body = _invoke_ecs_action_through_admission(
-        ecs,
         "RunTask",
         ecs_data,
     )
@@ -4290,12 +4284,12 @@ def _invoke_ecs_run_task(resource, input_data):
     if is_sync and result.get("tasks"):
         task_arns = [t["taskArn"] for t in result["tasks"]]
         cluster = ecs_data.get("cluster", "default")
-        result = _poll_ecs_tasks(ecs, cluster, task_arns)
+        result = _poll_ecs_tasks(cluster, task_arns)
 
     return result
 
 
-def _invoke_ecs_action_through_admission(ecs_module, action, data):
+def _invoke_ecs_action_through_admission(action, data):
     headers = {
         "x-amz-target": f"AmazonEC2ContainerServiceV20141113.{action}",
         "content-type": "application/x-amz-json-1.1",
@@ -4306,7 +4300,7 @@ def _invoke_ecs_action_through_admission(ecs_module, action, data):
     }
     return _drive_service_handler_sync(
         "ecs",
-        ecs_module.handle_request,
+        None,
         "POST",
         "/",
         headers,
@@ -4315,7 +4309,7 @@ def _invoke_ecs_action_through_admission(ecs_module, action, data):
     )
 
 
-def _poll_ecs_tasks(ecs_module, cluster, task_arns):
+def _poll_ecs_tasks(cluster, task_arns):
     """Poll DescribeTasks until all tasks are STOPPED (max 10 min).
 
     Returns the full DescribeTasks result including exit codes — the state
@@ -4324,7 +4318,6 @@ def _poll_ecs_tasks(ecs_module, cluster, task_arns):
     for _ in range(600):
         _scaled_sleep(1)
         status, _, body = _invoke_ecs_action_through_admission(
-            ecs_module,
             "DescribeTasks",
             {"cluster": cluster, "tasks": task_arns},
         )
@@ -4462,26 +4455,13 @@ _REST_JSON_ACTION_PATHS = {
 }
 
 
-_SYNC_AWS_SDK_SERVICE_MODULES = {
-    "rds": "rds",
-    "ecs": "ecs",
-    "eks": "eks",
-    "elasticache": "elasticache",
-    "opensearch": "opensearch",
-    "rds-data": "rds_data",
-}
-
-
 def _drive_service_handler_sync(service_key, handler, *args, await_error=None):
     """Drive one service entry from an SFN execution thread."""
-    module_name = _SYNC_AWS_SDK_SERVICE_MODULES.get(service_key)
-    if module_name is not None:
-        from ministack import app
+    from ministack import app
 
-        module = app._get_module(module_name)
+    if service_key in app._RESET_ADMISSION_OWNER_MODULES:
         return _marshal_service_handler_to_execution_loop(
             service_key,
-            module.handle_request,
             *args,
         )
 
@@ -4501,7 +4481,7 @@ def _drive_service_handler_sync(service_key, handler, *args, await_error=None):
             loop.close()
 
 
-def _marshal_service_handler_to_execution_loop(service_key, handler, *args):
+def _marshal_service_handler_to_execution_loop(service_key, *args):
     """Run an admission-locked service handler on its execution's server loop."""
     server_loop = _execution_server_loop.get()
     if server_loop is None:
@@ -4527,7 +4507,15 @@ def _marshal_service_handler_to_execution_loop(service_key, handler, *args):
         )
 
     try:
-        future = asyncio.run_coroutine_threadsafe(handler(*args), server_loop)
+        from ministack import app
+
+        # One loop-side round trip owns the first-touch gate, module import,
+        # and handler dispatch. Serialized owners must never be imported on an
+        # execution thread where the reset writer cannot exclude them.
+        future = asyncio.run_coroutine_threadsafe(
+            app._dispatch_serialized_service_request(service_key, *args),
+            server_loop,
+        )
         return future.result()
     except _ExecutionError:
         raise
