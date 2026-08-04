@@ -5891,8 +5891,13 @@ def _list_state_machine_versions(data):
             "stateMachineVersionArn": version_arn,
             "creationDate": version["creationDate"],
         })
-    # AWS returns versions in descending creationDate order (newest first).
-    matching.sort(key=lambda v: v["creationDate"], reverse=True)
+    # AWS returns versions newest first. Version numbers are the monotonic
+    # publish order; creationDate alone is nondeterministic when back-to-back
+    # publishes share the same millisecond timestamp.
+    matching.sort(
+        key=lambda v: int(v["stateMachineVersionArn"].rsplit(":", 1)[1]),
+        reverse=True,
+    )
 
     max_results = data.get("maxResults") or len(matching)
     return json_response({
