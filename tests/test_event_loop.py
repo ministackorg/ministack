@@ -1,6 +1,8 @@
 import asyncio
 import gc
 import json
+import subprocess
+import sys
 import threading
 import time
 import weakref
@@ -29,6 +31,10 @@ from ministack.services import (
     stepfunctions,
     tagging,
 )
+from ministack.services import (
+    scheduler as scheduler_service,
+)
+from ministack.services.cloudformation import lifecycle as cfn_lifecycle
 from ministack.services.cloudformation import provisioners as cfn_provisioners
 from ministack.services.cloudformation import stacks as cfn_stacks
 
@@ -515,15 +521,19 @@ def test_nested_cfn_standard_children_share_service_admission(monkeypatch):
 
 def test_reset_skips_failed_serialized_lazy_module(monkeypatch):
     reset_called = threading.Event()
-    real_get_module = ministack_app._get_module
+    real_resolve = ministack_app._resolve_loaded_service_module
     failed_rds = ministack_app._ErrorModule("rds", "optional dependency missing")
 
-    def get_module(name):
+    def resolve_loaded(name):
         if name == "rds":
             return failed_rds
-        return real_get_module(name)
+        return real_resolve(name)
 
-    monkeypatch.setattr(ministack_app, "_get_module", get_module)
+    monkeypatch.setattr(
+        ministack_app,
+        "_resolve_loaded_service_module",
+        resolve_loaded,
+    )
     monkeypatch.setattr(ministack_app, "_reset_all_state", reset_called.set)
     monkeypatch.setattr(ministack_app, "_reset_locks", LoopLocal(asyncio.Lock))
     monkeypatch.setattr(
@@ -532,9 +542,9 @@ def test_reset_skips_failed_serialized_lazy_module(monkeypatch):
         LoopLocal(ministack_app._RequestResetBarrier),
     )
     monkeypatch.setattr(
-        cfn_stacks,
+        cfn_lifecycle,
         "_stack_task_lifecycles",
-        LoopLocal(cfn_stacks._StackTaskLifecycle),
+        LoopLocal(cfn_lifecycle._StackTaskLifecycle),
     )
 
     asyncio.run(ministack_app._reset_all_state_after_service_dispatch_drains())
@@ -542,14 +552,18 @@ def test_reset_skips_failed_serialized_lazy_module(monkeypatch):
 
 
 def test_reset_keeps_missing_healthy_admission_seam_loud(monkeypatch):
-    real_get_module = ministack_app._get_module
+    real_resolve = ministack_app._resolve_loaded_service_module
 
-    def get_module(name):
+    def resolve_loaded(name):
         if name == "rds":
             return object()
-        return real_get_module(name)
+        return real_resolve(name)
 
-    monkeypatch.setattr(ministack_app, "_get_module", get_module)
+    monkeypatch.setattr(
+        ministack_app,
+        "_resolve_loaded_service_module",
+        resolve_loaded,
+    )
     monkeypatch.setattr(ministack_app, "_reset_locks", LoopLocal(asyncio.Lock))
     monkeypatch.setattr(
         ministack_app,
@@ -557,13 +571,157 @@ def test_reset_keeps_missing_healthy_admission_seam_loud(monkeypatch):
         LoopLocal(ministack_app._RequestResetBarrier),
     )
     monkeypatch.setattr(
-        cfn_stacks,
+        cfn_lifecycle,
         "_stack_task_lifecycles",
-        LoopLocal(cfn_stacks._StackTaskLifecycle),
+        LoopLocal(cfn_lifecycle._StackTaskLifecycle),
     )
 
     with pytest.raises(AttributeError, match="_get_request_dispatch_lock"):
         asyncio.run(ministack_app._reset_all_state_after_service_dispatch_drains())
+
+
+def test_cfn_untouched_reset_preserves_lazy_service_imports():
+    script = """
+import asyncio
+import json
+import sys
+
+import ministack.app as app
+
+asyncio.run(app._reset_all_state_after_service_dispatch_drains())
+names = [
+    "ministack.services.cloudformation.provisioners",
+    "ministack.services.rds",
+    "ministack.services.ecs",
+    "ministack.services.eks",
+    "ministack.services.opensearch",
+]
+unexpected = [name for name in names if name in sys.modules]
+print(json.dumps(unexpected))
+raise SystemExit(bool(unexpected))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout.strip().splitlines()[-1]) == []
+
+
+def test_first_touch_serialized_import_waits_for_reset_writer(monkeypatch):
+    wipe_started = threading.Event()
+    release_wipe = threading.Event()
+    loaded = {}
+    order = []
+
+    def resolve_loaded(name):
+        return loaded.get(name)
+
+    def import_module(name):
+        order.append(f"import-{name}")
+        loaded[name] = object()
+        return loaded[name]
+
+    def slow_reset():
+        order.append("wipe-start")
+        wipe_started.set()
+        release_wipe.wait(timeout=2)
+        order.append("wipe-finish")
+
+    monkeypatch.setattr(
+        ministack_app,
+        "_resolve_loaded_service_module",
+        resolve_loaded,
+    )
+    monkeypatch.setattr(ministack_app, "_get_module", import_module)
+    monkeypatch.setattr(ministack_app, "_reset_all_state", slow_reset)
+    monkeypatch.setattr(
+        ministack_app,
+        "_ordinary_request_reset_barriers",
+        LoopLocal(ministack_app._RequestResetBarrier),
+    )
+    monkeypatch.setattr(
+        cfn_lifecycle,
+        "_stack_task_lifecycles",
+        LoopLocal(cfn_lifecycle._StackTaskLifecycle),
+    )
+
+    async def exercise():
+        reset = asyncio.create_task(
+            ministack_app._reset_all_state_after_service_dispatch_drains()
+        )
+        while not wipe_started.is_set():
+            await asyncio.sleep(0.001)
+
+        first_touch = asyncio.create_task(
+            ministack_app._gate_first_touch_reset_admission_module("rds")
+        )
+        await asyncio.sleep(0.05)
+        assert order == ["wipe-start"]
+
+        release_wipe.set()
+        await asyncio.gather(reset, first_touch)
+        assert order == ["wipe-start", "wipe-finish", "import-rds"]
+
+    fallback = threading.Timer(1, release_wipe.set)
+    fallback.start()
+    try:
+        asyncio.run(exercise())
+    finally:
+        release_wipe.set()
+        fallback.cancel()
+
+
+@pytest.mark.parametrize(
+    "service",
+    sorted(ministack_app._RESET_ADMISSION_SERVICE_KEYS),
+)
+def test_first_touch_gate_maps_every_serialized_service_key(monkeypatch, service):
+    imported = []
+
+    monkeypatch.setattr(
+        ministack_app,
+        "_resolve_loaded_service_module",
+        lambda _name: None,
+    )
+    monkeypatch.setattr(
+        ministack_app,
+        "_get_module",
+        lambda name: imported.append(name),
+    )
+    monkeypatch.setattr(
+        ministack_app,
+        "_ordinary_request_reset_barriers",
+        LoopLocal(ministack_app._RequestResetBarrier),
+    )
+
+    asyncio.run(ministack_app._gate_first_touch_reset_admission_module(service))
+
+    assert imported == [ministack_app.SERVICE_REGISTRY[service]["module"]]
+
+
+@pytest.mark.parametrize(
+    "service",
+    sorted(ministack_app._RESET_CALLBACK_SERVICE_KEYS),
+)
+def test_first_touch_gate_does_not_import_callback_services(monkeypatch, service):
+    imported = []
+    monkeypatch.setattr(
+        ministack_app,
+        "_resolve_loaded_service_module",
+        lambda _name: None,
+    )
+    monkeypatch.setattr(
+        ministack_app,
+        "_get_module",
+        lambda name: imported.append(name),
+    )
+
+    asyncio.run(ministack_app._gate_first_touch_reset_admission_module(service))
+
+    assert imported == []
 
 
 @pytest.mark.parametrize(
@@ -628,14 +786,14 @@ def test_reset_lock_is_recreated_for_each_event_loop(monkeypatch):
 
 def test_cloudformation_task_lifecycle_is_recreated_for_each_event_loop(monkeypatch):
     monkeypatch.setattr(
-        cfn_stacks,
+        cfn_lifecycle,
         "_stack_task_lifecycles",
-        LoopLocal(cfn_stacks._StackTaskLifecycle),
+        LoopLocal(cfn_lifecycle._StackTaskLifecycle),
     )
 
     def exercise_once():
         async def exercise():
-            lifecycle = cfn_stacks._get_stack_task_lifecycle()
+            lifecycle = cfn_lifecycle._get_stack_task_lifecycle()
 
             async def no_op():
                 return None
@@ -974,6 +1132,90 @@ def test_eventbridge_scheduler_uses_fresh_loop_after_lifecycle_restart(monkeypat
     assert captured_loops == [first_loop, second_loop]
 
 
+def test_scheduler_targeting_rds_state_machine_reaches_terminal_success(monkeypatch):
+    async def exercise():
+        scheduler_service.stop_scheduler()
+        scheduler_service.reset()
+        scheduler_service._schedule_last_fired.clear()
+        eventbridge.reset()
+        stepfunctions.reset()
+        previous_account = get_account_id()
+        previous_region = get_region()
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+        try:
+            state_machine_arn = await _create_rds_integration_state_machine(
+                "event-loop-scheduler-rds"
+            )
+            name = "event-loop-scheduler-rds"
+            key = f"default/{name}"
+            scheduler_service._schedules[key] = {
+                "Arn": (
+                    "arn:aws:scheduler:us-east-1:000000000000:"
+                    f"schedule/{key}"
+                ),
+                "Name": name,
+                "GroupName": "default",
+                "ScheduleExpression": "at(1970-01-01T00:00:01)",
+                "Target": {"Arn": state_machine_arn},
+                "State": "ENABLED",
+                "ActionAfterCompletion": "NONE",
+                "CreationDate": 1,
+            }
+            monkeypatch.setattr(
+                scheduler_service,
+                "_SCHEDULE_TICK_INTERVAL",
+                0.001,
+            )
+            scheduler_service.start_scheduler()
+            await _wait_for_state_machine_terminal_success(state_machine_arn)
+        finally:
+            await asyncio.to_thread(scheduler_service.stop_scheduler)
+            scheduler_service.reset()
+            scheduler_service._schedule_last_fired.clear()
+            eventbridge.reset()
+            stepfunctions.reset()
+            set_request_account_id(previous_account)
+            set_request_region(previous_region)
+
+    asyncio.run(exercise())
+
+
+def test_scheduler_uses_fresh_loop_after_lifecycle_restart(monkeypatch):
+    captured_loops = []
+
+    def capture_loop(server_loop, stop_event):
+        captured_loops.append(server_loop)
+        stop_event.wait(timeout=1)
+
+    scheduler_service.stop_scheduler()
+    monkeypatch.setattr(scheduler_service, "_ticker_loop", capture_loop)
+
+    def run_lifecycle():
+        async def exercise():
+            loop = asyncio.get_running_loop()
+            scheduler_service.start_scheduler()
+            deadline = loop.time() + 1
+            while len(captured_loops) < expected_count:
+                if loop.time() >= deadline:
+                    pytest.fail("scheduler thread did not capture its lifecycle loop")
+                await asyncio.sleep(0.001)
+            await asyncio.to_thread(scheduler_service.stop_scheduler)
+            return loop
+
+        return asyncio.run(exercise())
+
+    expected_count = 1
+    first_loop = run_lifecycle()
+    expected_count = 2
+    second_loop = run_lifecycle()
+
+    assert first_loop is not second_loop
+    assert first_loop.is_closed()
+    assert second_loop.is_closed()
+    assert captured_loops == [first_loop, second_loop]
+
+
 @pytest.mark.parametrize("loop_state", ["missing", "closed"])
 def test_stepfunctions_non_http_loop_backstop_is_states_runtime(loop_state):
     server_loop = None
@@ -1202,9 +1444,9 @@ def test_stepfunctions_marshaled_rds_waits_for_reset_and_sees_fresh_state(
         LoopLocal(ministack_app._RequestResetBarrier),
     )
     monkeypatch.setattr(
-        cfn_stacks,
+        cfn_lifecycle,
         "_stack_task_lifecycles",
-        LoopLocal(cfn_stacks._StackTaskLifecycle),
+        LoopLocal(cfn_lifecycle._StackTaskLifecycle),
     )
     monkeypatch.setattr(rds, "_handle_request_unlocked", read_state)
     monkeypatch.setattr(stepfunctions, "_start_sync_execution", sync_execution)
@@ -1390,9 +1632,9 @@ def test_admin_reset_waits_for_in_flight_request(monkeypatch):
         LoopLocal(ministack_app._RequestResetBarrier),
     )
     monkeypatch.setattr(
-        cfn_stacks,
+        cfn_lifecycle,
         "_stack_task_lifecycles",
-        LoopLocal(cfn_stacks._StackTaskLifecycle),
+        LoopLocal(cfn_lifecycle._StackTaskLifecycle),
     )
 
     async def receive():
@@ -1608,9 +1850,9 @@ def test_admin_reset_does_not_deadlock_nested_lambda_ministack_request(monkeypat
         LoopLocal(ministack_app._RequestResetBarrier),
     )
     monkeypatch.setattr(
-        cfn_stacks,
+        cfn_lifecycle,
         "_stack_task_lifecycles",
-        LoopLocal(cfn_stacks._StackTaskLifecycle),
+        LoopLocal(cfn_lifecycle._StackTaskLifecycle),
     )
 
     async def receive():
@@ -1667,6 +1909,119 @@ def test_admin_reset_does_not_deadlock_nested_lambda_ministack_request(monkeypat
         await asyncio.wait_for(asyncio.gather(outer, reset), timeout=1)
         assert nested_finished.is_set()
         assert dispatch_count == 2
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("host", "path"),
+    [
+        (
+            "12345678-1234-1234-1234-123456789012.lambda-url.us-east-1.localhost",
+            "/outer",
+        ),
+        ("localhost", "/_aws/lambda-url/12345678-1234-1234-1234-123456789012/outer"),
+    ],
+    ids=["host", "path"],
+)
+def test_admin_reset_does_not_deadlock_nested_function_url_request(
+    monkeypatch,
+    host,
+    path,
+):
+    reset_admitted = asyncio.Event()
+    nested_finished = asyncio.Event()
+    reset_lock = asyncio.Lock()
+    nested_dispatches = 0
+
+    class _SignalingResetLock:
+        async def __aenter__(self):
+            await reset_lock.acquire()
+            reset_admitted.set()
+
+        async def __aexit__(self, *_exc_info):
+            reset_lock.release()
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(_message):
+        pass
+
+    def scope(request_path, service=None, request_host="localhost"):
+        headers = [(b"host", request_host.encode())]
+        if service is not None:
+            headers.append(
+                (
+                    b"authorization",
+                    (
+                        "AWS4-HMAC-SHA256 Credential=test/20260101/"
+                        f"us-east-1/{service}/aws4_request"
+                    ).encode(),
+                )
+            )
+        return {
+            "type": "http",
+            "method": "POST" if request_path == "/_ministack/reset" else "GET",
+            "path": request_path,
+            "query_string": b"",
+            "headers": headers,
+        }
+
+    class _FunctionUrlModule:
+        async def handle_function_url_request(self, *_args):
+            await reset_admitted.wait()
+            await ministack_app.app(
+                scope("/nested", "dynamodb"),
+                receive,
+                send,
+            )
+            nested_finished.set()
+            return 200, {}, b"outer"
+
+    async def nested_dispatch(*_args):
+        nonlocal nested_dispatches
+        nested_dispatches += 1
+        return 200, {}, b"nested"
+
+    monkeypatch.setattr(
+        ministack_app,
+        "_get_reset_lock",
+        lambda: _SignalingResetLock(),
+    )
+    monkeypatch.setattr(ministack_app, "_reset_all_state", lambda: None)
+    monkeypatch.setattr(
+        ministack_app,
+        "_ordinary_request_reset_barriers",
+        LoopLocal(ministack_app._RequestResetBarrier),
+    )
+    monkeypatch.setattr(
+        cfn_lifecycle,
+        "_stack_task_lifecycles",
+        LoopLocal(cfn_lifecycle._StackTaskLifecycle),
+    )
+    monkeypatch.setitem(
+        ministack_app._loaded_modules,
+        "lambda_svc",
+        _FunctionUrlModule(),
+    )
+    monkeypatch.setattr(
+        ministack_app,
+        "_dispatch_service_request",
+        nested_dispatch,
+    )
+
+    async def exercise():
+        outer = asyncio.create_task(
+            ministack_app.app(scope(path, request_host=host), receive, send)
+        )
+        await asyncio.sleep(0)
+        reset = asyncio.create_task(
+            ministack_app.app(scope("/_ministack/reset"), receive, send)
+        )
+        await asyncio.wait_for(asyncio.gather(outer, reset), timeout=1)
+        assert nested_finished.is_set()
+        assert nested_dispatches == 1
 
     asyncio.run(exercise())
 

@@ -233,6 +233,11 @@ def _get_module(name: str):
     return mod
 
 
+def _resolve_loaded_service_module(name: str):
+    """Return an already-loaded service module without importing it."""
+    return _loaded_modules.get(name) or sys.modules.get(f"ministack.services.{name}")
+
+
 def _lazy_handler(module_name: str):
     """Return a callable that lazily imports module_name and delegates to handle_request."""
 
@@ -492,9 +497,9 @@ def _get_ordinary_request_reset_barrier() -> _RequestResetBarrier:
 
 async def _reset_all_state_after_service_dispatch_drains():
     """Quiesce stack work and requests before wiping mutable service state."""
-    from ministack.services.cloudformation import stacks as cfn_stacks
+    from ministack.services.cloudformation import lifecycle as cfn_lifecycle
 
-    stack_tasks = cfn_stacks._get_stack_task_lifecycle()
+    stack_tasks = cfn_lifecycle._get_stack_task_lifecycle()
     barrier = _get_ordinary_request_reset_barrier()
 
     # Hold no request or service lock while cancelling stack tasks: unwinding
@@ -510,7 +515,11 @@ async def _reset_all_state_after_service_dispatch_drains():
         barrier_entered = True
         async with AsyncExitStack() as stack:
             for module_name in _RESET_SERIALIZED_SERVICE_MODULES:
-                module = _get_module(module_name)
+                module = _resolve_loaded_service_module(module_name)
+                if module is None:
+                    # First-touch imports for these services hold reader status,
+                    # so none can appear after this writer-side absence check.
+                    continue
                 if isinstance(module, _ErrorModule):
                     # A failed import has no state or in-flight worker to
                     # serialize. Healthy modules missing this seam remain a
@@ -556,9 +565,13 @@ def _ordinary_request_uses_reset_barrier(method, path, headers, body, query_para
         return False
 
     host = headers.get("host", "")
-    # API Gateway and ALB data planes may synchronously invoke Lambda, whose
-    # function can issue a nested request back to this gateway.
-    if _parse_execute_api_url(host, path) is not None or _is_potential_alb_request(host, path):
+    # API Gateway, Lambda Function URL, and ALB data planes may synchronously
+    # invoke Lambda, whose function can issue a nested request back here.
+    if (
+        _parse_execute_api_url(host, path) is not None
+        or _parse_lambda_url(host, path) is not None
+        or _is_potential_alb_request(host, path)
+    ):
         return False
 
     routing_params = _routing_params(method, path, headers, body, query_params)
@@ -577,6 +590,25 @@ def _ordinary_request_uses_reset_barrier(method, path, headers, body, query_para
         # exclude because its synchronous body stays under the locked service.
         return not locked_services
     return service not in _RESET_ADMISSION_SERVICE_KEYS | _RESET_CALLBACK_SERVICE_KEYS
+
+
+async def _gate_first_touch_reset_admission_module(service: str) -> None:
+    """Import a serialized service under reset-reader status on first touch."""
+    if service not in _RESET_ADMISSION_SERVICE_KEYS or service not in SERVICE_HANDLERS:
+        return
+    module_name = SERVICE_REGISTRY[service]["module"]
+    if _resolve_loaded_service_module(module_name) is not None:
+        return
+
+    barrier = _get_ordinary_request_reset_barrier()
+    await barrier.enter_request()
+    try:
+        # Recheck after admission: another first-touch request may have loaded
+        # the module while this request waited.
+        if _resolve_loaded_service_module(module_name) is None:
+            _get_module(module_name)
+    finally:
+        barrier.leave_request()
 
 
 # ---------------------------------------------------------------------------
@@ -2030,6 +2062,10 @@ async def app(scope, receive, send):
     # is entered, then pass it through without a second receive.
     body = await _read_request_body(receive, method, headers)
 
+    routing_params = _routing_params(method, path, headers, body, query_params)
+    service = detect_service(method, path, headers, routing_params)
+    await _gate_first_touch_reset_admission_module(service)
+
     if not _ordinary_request_uses_reset_barrier(method, path, headers, body, query_params):
         await _handle_http_request(
             method, path, headers, query_params, request_id, receive, send, body
@@ -2130,6 +2166,12 @@ async def _handle_lifespan(scope, receive, send):
                 await asyncio.to_thread(_eb_mod.stop_scheduler)
             except Exception as e:
                 logger.debug("EventBridge scheduler shutdown error: %s", e)
+            try:
+                from ministack.services import scheduler as _sched_mod
+
+                await asyncio.to_thread(_sched_mod.stop_scheduler)
+            except Exception as e:
+                logger.debug("Scheduler shutdown error: %s", e)
             if PERSIST_STATE:
                 save_all(_build_persistence_save_dict())
             try:
@@ -2442,7 +2484,7 @@ def _reset_all_state():
         # Without the `sys.modules` fallback, those modules silently skip reset
         # — leaving state across `/_ministack/reset` calls and breaking test
         # isolation.
-        mod = _loaded_modules.get(mod_name) or sys.modules.get(f"ministack.services.{mod_name}")
+        mod = _resolve_loaded_service_module(mod_name)
         if mod is None or not hasattr(mod, "reset"):
             continue
         try:
