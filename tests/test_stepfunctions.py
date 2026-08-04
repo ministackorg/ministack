@@ -1894,6 +1894,262 @@ def test_sfn_aws_sdk_ec2_irregular_list_params_reach_the_service(sfn_sync, ec2):
         ec2.delete_volume(VolumeId=volume_id)
 
 
+def _run_sdk_task(sfn_sync, name, action, params, role="arn:aws:iam::000000000000:role/sfn-role"):
+    """Run a single aws-sdk Task and return its result, for shape assertions."""
+    definition = json.dumps({
+        "StartAt": "Task",
+        "States": {"Task": {
+            "Type": "Task",
+            "Resource": f"arn:aws:states:::aws-sdk:{action}",
+            "Parameters": params,
+            "End": True,
+        }},
+    })
+    sm_arn = sfn_sync.create_state_machine(name=name, definition=definition, roleArn=role)["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+        assert resp["status"] == "SUCCEEDED", f"{action} failed: {resp.get('error')} — {resp.get('cause')}"
+        return json.loads(resp["output"])
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_aws_sdk_ec2_describe_volumes_returns_sdk_shape(sfn_sync, ec2):
+    """aws-sdk:ec2:describeVolumes returns Volumes[0].State, not VolumeSet.Item.Status."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    az = ec2.describe_availability_zones()["AvailabilityZones"][0]["ZoneName"]
+    volume_ids = [
+        ec2.create_volume(
+            AvailabilityZone=az, Size=1, VolumeType="gp3",
+            TagSpecifications=[{"ResourceType": "volume",
+                                "Tags": [{"Key": "Name", "Value": f"sdk-shape-{suffix}"}]}],
+        )["VolumeId"]
+        for _ in range(2)
+    ]
+    try:
+        result = _run_sdk_task(sfn_sync, f"sdk-vol-{suffix}", "ec2:describeVolumes",
+                               {"VolumeIds": volume_ids})
+        # Wire-format leakage that an ASL written for AWS would trip over.
+        assert "VolumeSet" not in result
+        assert "RequestId" not in result
+        assert sorted(result) == ["Volumes"]
+        volumes = result["Volumes"]
+        assert isinstance(volumes, list)
+        assert {v["VolumeId"] for v in volumes} >= set(volume_ids)
+        volume = next(v for v in volumes if v["VolumeId"] == volume_ids[0])
+        assert volume["State"] == "available"
+        assert "Status" not in volume
+        assert volume["Size"] == 1                        # int, not "1"
+        assert volume["Iops"] == 3000
+        assert volume["Encrypted"] is False               # bool, not "false"
+        assert volume["MultiAttachEnabled"] is False
+        assert volume["Attachments"] == []                # empty list, not ""
+        assert volume["Tags"] == [{"Key": "Name", "Value": f"sdk-shape-{suffix}"}]
+        assert "TagSet" not in volume and "AttachmentSet" not in volume
+
+        # The empty result set is asserted directly: MiniStack's DescribeVolumes
+        # has no Filter.N support, so no request can return zero volumes here.
+        from ministack.services.stepfunctions import _normalize_query_response
+        assert _normalize_query_response(
+            "ec2", "DescribeVolumes", {"volumeSet": "", "requestId": "r"}
+        ) == {"Volumes": []}
+    finally:
+        for volume_id in volume_ids:
+            ec2.delete_volume(VolumeId=volume_id)
+
+
+def test_sfn_aws_sdk_ec2_instances_return_sdk_shape(sfn_sync, ec2):
+    """runInstances/describeInstances return Instances[0].State.Name, not InstanceState."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    run = _run_sdk_task(sfn_sync, f"sdk-run-{suffix}", "ec2:runInstances",
+                        {"ImageId": "ami-12345678", "MinCount": 1, "MaxCount": 1,
+                         "InstanceType": "t3.micro"})
+    instance_id = run["Instances"][0]["InstanceId"]
+    try:
+        assert "InstancesSet" not in run
+        assert run["Instances"][0]["State"]["Name"] == "running"
+        assert run["Instances"][0]["State"]["Code"] == 16          # int, not "16"
+        assert "InstanceState" not in run["Instances"][0]
+
+        described = _run_sdk_task(sfn_sync, f"sdk-desc-{suffix}", "ec2:describeInstances",
+                                  {"InstanceIds": [instance_id]})
+        assert sorted(described) == ["Reservations"]
+        assert "ReservationSet" not in described
+        reservation = next(r for r in described["Reservations"]
+                           if any(i["InstanceId"] == instance_id for i in r["Instances"]))
+        assert isinstance(reservation["Instances"], list)
+        instance = next(i for i in reservation["Instances"] if i["InstanceId"] == instance_id)
+        assert instance["State"]["Name"] == "running"
+        assert instance["AmiLaunchIndex"] == 0
+        assert instance["SourceDestCheck"] is True
+        assert isinstance(instance["SecurityGroups"], list)        # groupSet
+        assert "GroupSet" not in instance
+        mapping = instance["BlockDeviceMappings"][0]               # blockDeviceMapping
+        assert mapping["Ebs"]["VolumeId"].startswith("vol-")
+        assert mapping["Ebs"]["DeleteOnTermination"] is True
+    finally:
+        ec2.terminate_instances(InstanceIds=[instance_id])
+
+
+def test_sfn_aws_sdk_ec2_vpc_calls_shape_nested_sets(sfn_sync, ec2):
+    """VPC calls carry nested *Set structs, which the shaping has to descend without recursing."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    result = _run_sdk_task(sfn_sync, f"sdk-vpc-{suffix}", "ec2:createVpc",
+                           {"CidrBlock": "10.42.0.0/16"})
+    vpc_id = result["Vpc"]["VpcId"]
+    try:
+        assert vpc_id.startswith("vpc-")
+        assert result["Vpc"]["CidrBlock"] == "10.42.0.0/16"
+        assert result["Vpc"]["State"] == "available"
+        assert result["Vpc"]["IsDefault"] is False          # bool, not "false"
+        assert result["Vpc"]["Tags"] == []                  # <tagSet/> -> empty list
+        assert "vpcId" not in result["Vpc"] and "tagSet" not in result["Vpc"]
+
+        ec2.create_tags(Resources=[vpc_id],
+                        Tags=[{"Key": "Name", "Value": f"sdk-shape-{suffix}"}])
+        described = _run_sdk_task(sfn_sync, f"sdk-vpcs-{suffix}", "ec2:describeVpcs",
+                                  {"VpcIds": [vpc_id]})
+        assert "VpcSet" not in described
+        vpc = next(v for v in described["Vpcs"] if v["VpcId"] == vpc_id)
+        assert vpc["Tags"] == [{"Key": "Name", "Value": f"sdk-shape-{suffix}"}]
+
+        # The struct inside a *Set is shaped member by member, nested structs with it. This member
+        # is one whose SDK name keeps the Set suffix (see _EC2_GENERIC_NAME_OVERRIDES).
+        assoc = vpc["CidrBlockAssociationSet"]
+        assert "CidrBlockAssociations" not in vpc
+        assert assoc == [{"CidrBlock": "10.42.0.0/16",
+                          "AssociationId": assoc[0]["AssociationId"],
+                          "CidrBlockState": {"State": "associated"}}]
+
+        from ministack.services.stepfunctions import _apply_ec2_generic
+        assert _apply_ec2_generic("tagSet", {}) == []        # <tagSet/> read as {}, not ""
+    finally:
+        ec2.delete_vpc(VpcId=vpc_id)
+
+
+def test_sfn_aws_sdk_ec2_security_group_rules_shape_ports_and_empty_lists(sfn_sync, ec2):
+    """A rule's ports are numbers and its unused range lists are [], as the SDK returns them."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    group_id = ec2.create_security_group(
+        GroupName=f"sdk-rule-{suffix}", Description="rule shape", VpcId="vpc-00000001")["GroupId"]
+    try:
+        ec2.authorize_security_group_ingress(GroupId=group_id, IpPermissions=[{
+            "IpProtocol": "tcp", "FromPort": 443, "ToPort": 443,
+            "IpRanges": [{"CidrIp": "10.0.0.0/8"}]}])
+
+        result = _run_sdk_task(sfn_sync, f"sdk-rule-{suffix}", "ec2:describeSecurityGroups",
+                               {"GroupIds": [group_id]})
+        permission = result["SecurityGroups"][0]["IpPermissions"][0]
+        assert permission["FromPort"] == 443                  # int, not "443"
+        assert permission["ToPort"] == 443
+        assert permission["IpRanges"] == [{"CidrIp": "10.0.0.0/8"}]
+        assert permission["Ipv6Ranges"] == []                 # <ipv6Ranges/>, not a *Set name
+        assert permission["PrefixListIds"] == []
+        assert permission["UserIdGroupPairs"] == []           # groups, renamed and emptied
+        assert "ipPermissions" not in result["SecurityGroups"][0]
+    finally:
+        ec2.delete_security_group(GroupId=group_id)
+
+
+def test_sfn_aws_sdk_ec2_state_change_calls_use_per_action_member_names(sfn_sync, ec2):
+    """instancesSet is Instances after runInstances but Stopping/TerminatingInstances after these."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    instance_id = ec2.run_instances(ImageId="ami-0abcdef1234567890", MinCount=1, MaxCount=1,
+                                    InstanceType="t3.micro")["Instances"][0]["InstanceId"]
+    stopped = _run_sdk_task(sfn_sync, f"sdk-stop-{suffix}", "ec2:stopInstances",
+                            {"InstanceIds": [instance_id]})
+    assert sorted(stopped) == ["StoppingInstances"]
+    assert stopped["StoppingInstances"][0]["CurrentState"]["Code"] == 80      # int, not "80"
+    assert "Instances" not in stopped and "InstancesSet" not in stopped
+
+    terminated = _run_sdk_task(sfn_sync, f"sdk-term-{suffix}", "ec2:terminateInstances",
+                               {"InstanceIds": [instance_id]})
+    assert sorted(terminated) == ["TerminatingInstances"]
+    assert terminated["TerminatingInstances"][0]["InstanceId"] == instance_id
+
+
+def test_sfn_aws_sdk_ec2_context_scoped_names_stay_scoped():
+    """The names EC2 reuses resolve per context, so neither spelling can be made the flat rule."""
+    from ministack.services.stepfunctions import _ec2_generic_sdk_name
+
+    # status is the volume's State, but a block device's Status.
+    assert _ec2_generic_sdk_name("status", "DescribeVolumes", "volumeSet") == "State"
+    assert _ec2_generic_sdk_name("status", "DescribeVolumes", "attachmentSet") == "State"
+    assert _ec2_generic_sdk_name("status", "CreateVolume") == "State"
+    assert _ec2_generic_sdk_name("status", "DescribeInstances", "ebs") == "Status"
+    assert _ec2_generic_sdk_name("status", "DescribeInstanceStatus", "instanceStatus") == "Status"
+    # groupSet is the instance's SecurityGroups, but the reservation's Groups.
+    assert _ec2_generic_sdk_name("groupSet", "DescribeInstances", "instancesSet") == "SecurityGroups"
+    assert _ec2_generic_sdk_name("groupSet", "DescribeInstances", "reservationSet") == "Groups"
+    # instancesSet is per action, and groups only becomes UserIdGroupPairs inside a permission.
+    assert _ec2_generic_sdk_name("instancesSet", "RunInstances") == "Instances"
+    assert _ec2_generic_sdk_name("instancesSet", "StopInstances") == "StoppingInstances"
+    assert _ec2_generic_sdk_name("groups", "DescribeSecurityGroups", "ipPermissions") == "UserIdGroupPairs"
+    assert _ec2_generic_sdk_name("groups", "DescribeSecurityGroups") == "Groups"
+
+
+def test_sfn_aws_sdk_ec2_response_names_match_the_botocore_model():
+    """Every *Set element ec2.py emits carries the SDK member name botocore publishes for it."""
+    import pathlib
+    import re
+
+    import botocore.session
+
+    from ministack.services import ec2 as ec2_service
+    from ministack.services.stepfunctions import (
+        _EC2_FIELDS_BY_ACTION,
+        _EC2_FIELDS_BY_PARENT,
+        _EC2_GENERIC_NAME_OVERRIDES,
+        _ec2_generic_sdk_name,
+    )
+
+    shapes = botocore.session.get_session().get_component("data_loader").load_service_model(
+        "ec2", "service-2")["shapes"]
+    members = {name for shape in shapes.values() for name in (shape.get("members") or {})}
+    # locationName is the wire spelling; the member name is what the SDK returns.
+    by_wire = {}
+    for shape in shapes.values():
+        for name, member in (shape.get("members") or {}).items():
+            if member.get("locationName"):
+                by_wire.setdefault(member["locationName"], set()).add(name)
+
+    emitted = sorted(set(re.findall(r"<(\w+Set)/?>",
+                                    pathlib.Path(ec2_service.__file__).read_text())))
+    # Guard against the scan quietly matching nothing after a rewrite of the XML builders.
+    assert len(emitted) > 50
+    wrong = {wire: _ec2_generic_sdk_name(wire) for wire in emitted
+             if by_wire.get(wire) and _ec2_generic_sdk_name(wire) not in by_wire[wire]}
+    assert not wrong, f"not the SDK member name AWS publishes: {wrong}"
+
+    for table in (_EC2_GENERIC_NAME_OVERRIDES, _EC2_FIELDS_BY_PARENT, _EC2_FIELDS_BY_ACTION):
+        for key, sdk_name in table.items():
+            assert sdk_name in members, f"{key} -> {sdk_name} is not an EC2 member name"
+
+
+def test_sfn_aws_sdk_ec2_irregular_set_members_use_sdk_names(sfn_sync, ec2):
+    """A *Set element whose SDK member name the plural rule cannot produce is mapped by name."""
+    from ministack.services.stepfunctions import _ec2_generic_sdk_name
+
+    assert _ec2_generic_sdk_name("cidrBlockAssociationSet") == "CidrBlockAssociationSet"
+    assert _ec2_generic_sdk_name("keySet") == "KeyPairs"
+    assert _ec2_generic_sdk_name("volumeModificationSet") == "VolumesModifications"
+    assert _ec2_generic_sdk_name("fleetInstanceSet") == "Instances"
+    # The rest are the base pluralised, which is not always base + "s".
+    assert _ec2_generic_sdk_name("entrySet") == "Entries"
+    assert _ec2_generic_sdk_name("instanceStatusSet") == "InstanceStatuses"
+    assert _ec2_generic_sdk_name("addressSet") == "Addresses"
+    assert _ec2_generic_sdk_name("instancesSet") == "Instances"
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    ec2.create_key_pair(KeyName=f"sdk-key-{suffix}")
+    try:
+        result = _run_sdk_task(sfn_sync, f"sdk-keys-{suffix}", "ec2:describeKeyPairs", {})
+        assert sorted(result) == ["KeyPairs"]        # keySet -> KeyPairs, not "Keys"
+        assert any(k["KeyName"] == f"sdk-key-{suffix}" for k in result["KeyPairs"])
+    finally:
+        ec2.delete_key_pair(KeyName=f"sdk-key-{suffix}")
+
+
 def test_sfn_aws_sdk_rds_create_and_describe_instance(sfn, sfn_sync):
     """aws-sdk:rds CreateDBInstance + DescribeDBInstances via query-protocol dispatch."""
     import uuid as _uuid
