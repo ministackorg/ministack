@@ -48,6 +48,12 @@ def _wait_stack(cfn, name, timeout=30):
     raise TimeoutError(f"Stack {name} stuck at {status}")
 
 
+def _assert_apigwv2_api_not_found(call):
+    with pytest.raises(ClientError) as exc_info:
+        call()
+    assert exc_info.value.response["Error"]["Code"] == "NotFoundException"
+
+
 def _regional_cfn_test_client(service, region):
     import boto3
     from botocore.config import Config
@@ -4299,7 +4305,7 @@ def test_cfn_apigwv2_integration_basic(cfn, apigw):
     # Delete and verify cleanup
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
-    assert apigw.get_integrations(ApiId=api_id)["Items"] == []
+    _assert_apigwv2_api_not_found(lambda: apigw.get_integrations(ApiId=api_id))
 
 
 def test_cfn_apigwv2_ms_custom_id(cfn, apigw):
@@ -4383,7 +4389,7 @@ def test_cfn_apigwv2_route_basic(cfn, apigw):
     # Delete and verify cleanup
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
-    assert apigw.get_routes(ApiId=api_id)["Items"] == []
+    _assert_apigwv2_api_not_found(lambda: apigw.get_routes(ApiId=api_id))
 
 
 def test_cfn_apigwv2_authorizer_jwt(cfn, apigw):
@@ -4464,7 +4470,7 @@ def test_cfn_apigwv2_authorizer_jwt(cfn, apigw):
 
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
-    assert apigw.get_authorizers(ApiId=api_id)["Items"] == []
+    _assert_apigwv2_api_not_found(lambda: apigw.get_authorizers(ApiId=api_id))
 
 
 def test_cfn_apigwv2_integration_getatt(cfn, apigw):
@@ -4637,8 +4643,73 @@ def test_cfn_apigwv2_full_http_api_stack(cfn, apigw):
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
 
-    assert apigw.get_integrations(ApiId=api_id)["Items"] == []
-    assert apigw.get_routes(ApiId=api_id)["Items"] == []
+    _assert_apigwv2_api_not_found(lambda: apigw.get_integrations(ApiId=api_id))
+    _assert_apigwv2_api_not_found(lambda: apigw.get_routes(ApiId=api_id))
+
+
+def test_cfn_apigwv2_full_http_api_stack_in_non_boot_region():
+    """A region-B CloudFormation stack creates ApiGatewayV2 children in region B."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-apigwv2-west-{suffix}"
+    west_cfn = _regional_cfn_test_client("cloudformation", "us-west-2")
+    west_apigw = _regional_cfn_test_client("apigatewayv2", "us-west-2")
+    east_apigw = _regional_cfn_test_client("apigatewayv2", "us-east-1")
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "HttpApi": {
+                "Type": "AWS::ApiGatewayV2::Api",
+                "Properties": {
+                    "Name": f"{stack_name}-api",
+                    "ProtocolType": "HTTP",
+                },
+            },
+            "Stage": {
+                "Type": "AWS::ApiGatewayV2::Stage",
+                "Properties": {
+                    "ApiId": {"Ref": "HttpApi"},
+                    "StageName": "$default",
+                    "AutoDeploy": True,
+                },
+            },
+            "Integration": {
+                "Type": "AWS::ApiGatewayV2::Integration",
+                "Properties": {
+                    "ApiId": {"Ref": "HttpApi"},
+                    "IntegrationType": "AWS_PROXY",
+                    "IntegrationUri": "arn:aws:lambda:us-west-2:000000000000:function:my-handler",
+                    "PayloadFormatVersion": "2.0",
+                },
+            },
+            "ProxyRoute": {
+                "Type": "AWS::ApiGatewayV2::Route",
+                "Properties": {
+                    "ApiId": {"Ref": "HttpApi"},
+                    "RouteKey": "ANY /{proxy+}",
+                    "Target": {"Fn::Join": ["/", ["integrations", {"Ref": "Integration"}]]},
+                },
+            },
+        },
+    }
+    api_id = None
+    try:
+        west_cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(west_cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+        resources = west_cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+        api_res = [r for r in resources if r["ResourceType"] == "AWS::ApiGatewayV2::Api"][0]
+        api_id = api_res["PhysicalResourceId"]
+
+        assert len(west_apigw.get_integrations(ApiId=api_id)["Items"]) == 1
+        assert len(west_apigw.get_routes(ApiId=api_id)["Items"]) == 1
+        assert len(west_apigw.get_stages(ApiId=api_id)["Items"]) == 1
+        _assert_apigwv2_api_not_found(lambda: east_apigw.get_routes(ApiId=api_id))
+    finally:
+        _delete_cfn_test_stack(west_cfn, stack_name)
+
+    if api_id is not None:
+        _assert_apigwv2_api_not_found(lambda: west_apigw.get_routes(ApiId=api_id))
 
 
 def test_cfn_apigwv2_integration_ref_returns_integration_id_alone(cfn, apigw):

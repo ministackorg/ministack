@@ -18,6 +18,19 @@ _endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
 _EXECUTE_PORT = urlparse(_endpoint).port or 4566
 
+def _regional_client(service: str, region: str):
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client(
+        service,
+        endpoint_url=_endpoint,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region,
+        config=Config(region_name=region),
+    )
+
 def _make_zip(code: str) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
@@ -122,6 +135,166 @@ def test_apigw_apis_are_region_isolated():
     assert e.value.response["Error"]["Code"] == "NotFoundException"
 
 
+def test_apigw_control_plane_child_crud_is_region_isolated():
+    import boto3
+    from botocore.config import Config
+
+    def cli(r):
+        return boto3.client(
+            "apigatewayv2", endpoint_url=_endpoint,
+            aws_access_key_id="test", aws_secret_access_key="test",
+            region_name=r, config=Config(region_name=r),
+        )
+
+    east, west = cli("us-east-1"), cli("us-west-2")
+
+    http_api_id = east.create_api(
+        Name=f"child-iso-http-{_uuid_mod.uuid4().hex[:8]}",
+        ProtocolType="HTTP",
+    )["ApiId"]
+    route_id = east.create_route(ApiId=http_api_id, RouteKey="GET /items")["RouteId"]
+    integration_id = east.create_integration(
+        ApiId=http_api_id,
+        IntegrationType="HTTP_PROXY",
+        IntegrationUri="https://example.com",
+        IntegrationMethod="GET",
+    )["IntegrationId"]
+    east.create_stage(ApiId=http_api_id, StageName="prod")
+    deployment_id = east.create_deployment(ApiId=http_api_id)["DeploymentId"]
+    authorizer_id = east.create_authorizer(
+        ApiId=http_api_id,
+        AuthorizerType="JWT",
+        Name="jwt",
+        IdentitySource=["$request.header.Authorization"],
+        JwtConfiguration={
+            "Audience": ["client"],
+            "Issuer": "https://issuer.example.test",
+        },
+    )["AuthorizerId"]
+
+    ws_api_id = east.create_api(
+        Name=f"child-iso-ws-{_uuid_mod.uuid4().hex[:8]}",
+        ProtocolType="WEBSOCKET",
+    )["ApiId"]
+    ws_integration_id = east.create_integration(
+        ApiId=ws_api_id,
+        IntegrationType="MOCK",
+    )["IntegrationId"]
+    ws_route_id = east.create_route(
+        ApiId=ws_api_id,
+        RouteKey="sendMessage",
+        Target=f"integrations/{ws_integration_id}",
+    )["RouteId"]
+    route_response_id = east.create_route_response(
+        ApiId=ws_api_id,
+        RouteId=ws_route_id,
+        RouteResponseKey="$default",
+    )["RouteResponseId"]
+    integration_response_id = east.create_integration_response(
+        ApiId=ws_api_id,
+        IntegrationId=ws_integration_id,
+        IntegrationResponseKey="/200/",
+    )["IntegrationResponseId"]
+
+    calls = [
+        lambda: west.update_api(ApiId=http_api_id, Name="wrong-region"),
+        lambda: west.delete_api(ApiId=http_api_id),
+        lambda: west.get_routes(ApiId=http_api_id),
+        lambda: west.create_route(ApiId=http_api_id, RouteKey="GET /wrong"),
+        lambda: west.get_route(ApiId=http_api_id, RouteId=route_id),
+        lambda: west.update_route(ApiId=http_api_id, RouteId=route_id, RouteKey="GET /wrong"),
+        lambda: west.delete_route(ApiId=http_api_id, RouteId=route_id),
+        lambda: west.get_integrations(ApiId=http_api_id),
+        lambda: west.create_integration(
+            ApiId=http_api_id,
+            IntegrationType="HTTP_PROXY",
+            IntegrationUri="https://wrong.example",
+        ),
+        lambda: west.get_integration(ApiId=http_api_id, IntegrationId=integration_id),
+        lambda: west.update_integration(
+            ApiId=http_api_id,
+            IntegrationId=integration_id,
+            Description="wrong-region",
+        ),
+        lambda: west.delete_integration(ApiId=http_api_id, IntegrationId=integration_id),
+        lambda: west.get_stages(ApiId=http_api_id),
+        lambda: west.create_stage(ApiId=http_api_id, StageName="wrong"),
+        lambda: west.get_stage(ApiId=http_api_id, StageName="prod"),
+        lambda: west.update_stage(ApiId=http_api_id, StageName="prod", Description="wrong"),
+        lambda: west.delete_stage(ApiId=http_api_id, StageName="prod"),
+        lambda: west.get_deployments(ApiId=http_api_id),
+        lambda: west.create_deployment(ApiId=http_api_id),
+        lambda: west.get_deployment(ApiId=http_api_id, DeploymentId=deployment_id),
+        lambda: west.delete_deployment(ApiId=http_api_id, DeploymentId=deployment_id),
+        lambda: west.get_authorizers(ApiId=http_api_id),
+        lambda: west.create_authorizer(
+            ApiId=http_api_id,
+            AuthorizerType="JWT",
+            Name="wrong",
+            IdentitySource=["$request.header.Authorization"],
+        ),
+        lambda: west.get_authorizer(ApiId=http_api_id, AuthorizerId=authorizer_id),
+        lambda: west.update_authorizer(
+            ApiId=http_api_id,
+            AuthorizerId=authorizer_id,
+            Name="wrong",
+        ),
+        lambda: west.delete_authorizer(ApiId=http_api_id, AuthorizerId=authorizer_id),
+        lambda: west.get_route_responses(ApiId=ws_api_id, RouteId=ws_route_id),
+        lambda: west.create_route_response(
+            ApiId=ws_api_id,
+            RouteId=ws_route_id,
+            RouteResponseKey="$default",
+        ),
+        lambda: west.get_route_response(
+            ApiId=ws_api_id,
+            RouteId=ws_route_id,
+            RouteResponseId=route_response_id,
+        ),
+        lambda: west.update_route_response(
+            ApiId=ws_api_id,
+            RouteId=ws_route_id,
+            RouteResponseId=route_response_id,
+            RouteResponseKey="$default",
+        ),
+        lambda: west.delete_route_response(
+            ApiId=ws_api_id,
+            RouteId=ws_route_id,
+            RouteResponseId=route_response_id,
+        ),
+        lambda: west.get_integration_responses(
+            ApiId=ws_api_id,
+            IntegrationId=ws_integration_id,
+        ),
+        lambda: west.create_integration_response(
+            ApiId=ws_api_id,
+            IntegrationId=ws_integration_id,
+            IntegrationResponseKey="/200/",
+        ),
+        lambda: west.get_integration_response(
+            ApiId=ws_api_id,
+            IntegrationId=ws_integration_id,
+            IntegrationResponseId=integration_response_id,
+        ),
+        lambda: west.update_integration_response(
+            ApiId=ws_api_id,
+            IntegrationId=ws_integration_id,
+            IntegrationResponseId=integration_response_id,
+            IntegrationResponseKey="/200/",
+        ),
+        lambda: west.delete_integration_response(
+            ApiId=ws_api_id,
+            IntegrationId=ws_integration_id,
+            IntegrationResponseId=integration_response_id,
+        ),
+    ]
+
+    for call in calls:
+        with pytest.raises(ClientError) as exc_info:
+            call()
+        assert exc_info.value.response["Error"]["Code"] == "NotFoundException"
+
+
 def test_apigw_update_api(apigw):
     api_id = apigw.create_api(Name="update-api-before", ProtocolType="HTTP")["ApiId"]
     apigw.update_api(ApiId=api_id, Name="update-api-after")
@@ -138,10 +311,11 @@ def test_apigw_delete_api(apigw):
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
 
 def test_apigw_cfn_api_tracks_owner_region():
-    from ministack.core.responses import get_region, set_request_region
+    from ministack.core.responses import get_account_id, get_region, set_request_region
     from ministack.services import apigateway as _apigw
     from ministack.services.cloudformation import provisioners as _provisioners
 
+    account_id = get_account_id()
     original_region = get_region()
     api_id = None
     try:
@@ -152,10 +326,10 @@ def test_apigw_cfn_api_tracks_owner_region():
             "cfn-apigwv2-region",
         )
 
-        assert _apigw._api_regions[api_id] == "us-west-2"
+        assert _apigw._apis.get_scoped(account_id, "us-west-2", api_id)["apiId"] == api_id
 
         _provisioners._apigw_v2_api_delete(api_id, {})
-        assert api_id not in _apigw._api_regions
+        assert _apigw._apis.get_scoped(account_id, "us-west-2", api_id) is None
         api_id = None
     finally:
         if api_id is not None:
@@ -2065,7 +2239,7 @@ def handler(event, context):
 """
 
 
-def _make_fn(lam, name: str, code: str) -> str:
+def _make_fn(lam, name: str, code: str, *, region: str = "us-east-1") -> str:
     try:
         lam.delete_function(FunctionName=name)
     except Exception:
@@ -2093,13 +2267,14 @@ def _make_fn(lam, name: str, code: str) -> str:
         )
     except Exception:
         pass
-    return f"arn:aws:lambda:us-east-1:000000000000:function:{name}"
+    return f"arn:aws:lambda:{region}:000000000000:function:{name}"
 
 
 def _wire_ws_api(apigw, lam, *, name_suffix: str,
                  connect_code: str | None = None,
                  default_code: str = _ECHO_CODE,
-                 disconnect_code: str | None = None) -> tuple[str, dict]:
+                 disconnect_code: str | None = None,
+                 function_region: str = "us-east-1") -> tuple[str, dict]:
     """Create a WS API + routes + integrations and return (apiId, metadata)."""
     api = apigw.create_api(Name=f"ws-{name_suffix}", ProtocolType="WEBSOCKET")
     api_id = api["ApiId"]
@@ -2108,7 +2283,7 @@ def _wire_ws_api(apigw, lam, *, name_suffix: str,
 
     def _route(route_key: str, code: str):
         fn_name = f"ws-{name_suffix}-{route_key.lstrip('$')}-{uuid.uuid4().hex[:6]}"
-        arn = _make_fn(lam, fn_name, code)
+        arn = _make_fn(lam, fn_name, code, region=function_region)
         meta["created_functions"].append(fn_name)
         integ = apigw.create_integration(
             ApiId=api_id,
@@ -2250,6 +2425,50 @@ def test_ws_post_to_connection_from_management_api(apigw, lam):
 
         pushed = ws.recv(timeout=3)
         assert pushed == "server-push-payload"
+    finally:
+        ws.close()
+
+
+def test_ws_non_boot_region_routes_and_management_api():
+    """A WebSocket API owned by a non-boot region routes frames and @connections
+    operations through the API owner's region, not the server boot region."""
+    import urllib.request
+
+    apigw_west = _regional_client("apigatewayv2", "us-west-2")
+    apigw_east = _regional_client("apigatewayv2", "us-east-1")
+    lam_west = _regional_client("lambda", "us-west-2")
+    api_id, _ = _wire_ws_api(
+        apigw_west,
+        lam_west,
+        name_suffix=f"west-{_uuid_mod.uuid4().hex[:6]}",
+        function_region="us-west-2",
+    )
+    with pytest.raises(ClientError) as exc_info:
+        apigw_east.get_stages(ApiId=api_id)
+    assert exc_info.value.response["Error"]["Code"] == "NotFoundException"
+    ws = _WSClient(
+        "localhost",
+        _EXECUTE_PORT,
+        "/prod",
+        headers={"Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"},
+    )
+    try:
+        ws.send(json.dumps({"action": "sendMessage", "payload": "west"}))
+        reply = ws.recv()
+        parsed = json.loads(reply)
+        conn_id = parsed["connectionId"]
+        assert parsed["eventType"] == "MESSAGE"
+        assert parsed["body"]["payload"] == "west"
+
+        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/prod/@connections/{conn_id}"
+        req = urllib.request.Request(
+            url,
+            data=b"west-push",
+            method="POST",
+            headers={"Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"},
+        )
+        assert urllib.request.urlopen(req, timeout=30).status == 200
+        assert ws.recv(timeout=3) == "west-push"
     finally:
         ws.close()
 
@@ -2614,6 +2833,40 @@ def test_apigwv2_custom_id_duplicate_rejected(apigw):
     assert exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
 
 
+def test_apigwv2_custom_id_duplicate_rejected_across_regions():
+    """ms-custom-id values are account-wide unique, not region-local."""
+    from ministack.core.responses import get_region, set_request_region
+    from ministack.services import apigateway as apigw_mod
+
+    original_region = get_region()
+    api_id = f"v2regionaldup{_uuid_mod.uuid4().hex[:6]}"
+    try:
+        set_request_region("us-west-2")
+        status, _headers, body = apigw_mod._create_api(
+            {
+                "name": "dup-west",
+                "protocolType": "HTTP",
+                "tags": {"ms-custom-id": api_id},
+            }
+        )
+        assert status == 201
+        assert json.loads(body)["apiId"] == api_id
+
+        set_request_region("us-east-1")
+        status, _headers, body = apigw_mod._create_api(
+            {
+                "name": "dup-east",
+                "protocolType": "HTTP",
+                "tags": {"ms-custom-id": api_id},
+            }
+        )
+        assert status == 409
+        assert json.loads(body)["__type"] == "ConflictException"
+        assert apigw_mod.find_api_scope(api_id) == ("000000000000", "us-west-2")
+    finally:
+        set_request_region(original_region)
+
+
 def test_apigwv2_custom_id_absent_uses_random(apigw):
     """CreateApi without the tag continues to produce a random apiId."""
     resp = apigw.create_api(Name="random-id", ProtocolType="HTTP")
@@ -2865,6 +3118,70 @@ def test_apigwv2_lambda_integration_uses_function_arn_region(apigw, lam):
     body = resp.read().decode()
     assert body.startswith("west:")
     assert ":us-west-2:" in body
+
+
+def test_apigwv2_unsigned_execute_resolves_non_boot_region_api():
+    import urllib.error
+    import urllib.request
+
+    import boto3
+    from botocore.config import Config
+
+    west_apigw = boto3.client(
+        "apigatewayv2",
+        endpoint_url=_endpoint,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name="us-west-2",
+        config=Config(region_name="us-west-2"),
+    )
+    west_lam = _lambda_client("us-west-2")
+    fn_name = f"apigw-west-owner-{uuid.uuid4().hex[:6]}"
+    west_arn = _make_regional_fn(west_lam, fn_name, "west-owner")
+
+    api_id = west_apigw.create_api(
+        Name=f"west-owner-api-{uuid.uuid4().hex[:6]}",
+        ProtocolType="HTTP",
+    )["ApiId"]
+    integ = west_apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=_wrapped_uri(west_arn),
+        IntegrationMethod="POST",
+    )
+    west_apigw.create_route(
+        ApiId=api_id,
+        RouteKey="GET /hello",
+        Target=f"integrations/{integ['IntegrationId']}",
+    )
+    west_apigw.create_stage(ApiId=api_id, StageName="prod", AutoDeploy=True)
+
+    requests = [
+        (
+            f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/prod/hello",
+            f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}",
+        ),
+        (
+            f"http://localhost:{_EXECUTE_PORT}/_aws/execute-api/{api_id}/prod/hello",
+            f"localhost:{_EXECUTE_PORT}",
+        ),
+    ]
+    for url, host in requests:
+        req = urllib.request.Request(url)
+        req.add_header("Host", host)
+        resp = urllib.request.urlopen(req, timeout=30)
+        assert resp.status == 200
+        body = resp.read().decode()
+        assert body.startswith("west-owner:")
+        assert ":us-west-2:" in body
+
+    missing = urllib.request.Request(
+        f"http://missing-api.execute-api.localhost:{_EXECUTE_PORT}/prod/hello"
+    )
+    missing.add_header("Host", f"missing-api.execute-api.localhost:{_EXECUTE_PORT}")
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        urllib.request.urlopen(missing, timeout=30)
+    assert exc_info.value.code == 404
 
 
 def test_apigwv1_lambda_integration_uses_function_arn_region(apigw_v1, lam):
