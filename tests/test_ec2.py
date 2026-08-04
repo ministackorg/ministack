@@ -2472,6 +2472,38 @@ def test_ec2_describe_subnets_tags_filters(ec2):
     ec2.delete_vpc(VpcId=vpc_id)
 
 
+def test_ec2_describe_subnets_cidr_block_filter(ec2):
+    """cidr-block, and the cidr/cidrBlock spellings of it, match the CIDR exactly."""
+    vpc_id = ec2.create_vpc(CidrBlock="10.63.0.0/16")["Vpc"]["VpcId"]
+    first = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.63.0.0/20",
+                              AvailabilityZone="us-east-1a")["Subnet"]["SubnetId"]
+    second = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.63.16.0/20",
+                               AvailabilityZone="us-east-1b")["Subnet"]["SubnetId"]
+    in_vpc = {"Name": "vpc-id", "Values": [vpc_id]}
+
+    def subnets(*filters):
+        return sorted(s["SubnetId"] for s in ec2.describe_subnets(Filters=list(filters))["Subnets"])
+
+    # The per-AZ idempotency precheck: ignored, the filter returns the other AZ's subnet too, and a
+    # provisioner adopts it as this AZ's.
+    assert subnets(in_vpc, {"Name": "cidr-block", "Values": ["10.63.16.0/20"]}) == [second]
+    for alias in ("cidr", "cidrBlock"):
+        assert subnets(in_vpc, {"Name": alias, "Values": ["10.63.0.0/20"]}) == [first]
+    # Exact, not enclosing: the VPC's own /16 contains both subnets but is neither subnet's CIDR.
+    assert subnets(in_vpc, {"Name": "cidr-block", "Values": ["10.63.0.0/16"]}) == []
+    assert subnets(in_vpc, {"Name": "cidr-block", "Values": ["10.63.99.0/28"]}) == []
+    # Two values for one name is an OR, and the CIDRs are distinctive enough to filter account-wide.
+    assert subnets({"Name": "cidr-block",
+                    "Values": ["10.63.0.0/20", "10.63.16.0/20"]}) == sorted([first, second])
+    # Control: both subnets really are in the VPC, so the assertions above narrowed the result
+    # rather than emptying it for some unrelated reason.
+    assert subnets(in_vpc) == sorted([first, second])
+
+    ec2.delete_subnet(SubnetId=first)
+    ec2.delete_subnet(SubnetId=second)
+    ec2.delete_vpc(VpcId=vpc_id)
+
+
 def test_ec2_describe_tags_filters(ec2):
     """DescribeTags respects resource-id and key filters."""
     # Create two instances and tag them differently
