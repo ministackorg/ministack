@@ -22,6 +22,7 @@ Supports: CreateBucket, DeleteBucket, ListBuckets, HeadBucket,
 Storage: In-memory (optionally backed by S3_DATA_DIR).
 """
 
+import asyncio
 import base64
 import contextvars
 import copy
@@ -2085,6 +2086,7 @@ def _fire_s3_event(
     size: int = 0,
     etag: str = "",
     deletion_type: str | None = None,
+    server_loop=None,
 ) -> None:
     """Build and deliver an S3 event notification. Best-effort — errors are logged."""
     try:
@@ -2191,7 +2193,7 @@ def _fire_s3_event(
                 previous_region = get_region()
                 set_request_region(bucket_region)
                 try:
-                    _eb._dispatch_event(eb_event)
+                    _eb._dispatch_event(eb_event, server_loop=server_loop)
                 finally:
                     set_request_region(previous_region)
                 logger.debug("S3→EventBridge: %s (%s) for %s/%s", detail_type, event_name, bucket_name, key)
@@ -2301,6 +2303,12 @@ def _fire_s3_event_async(
     """Fire S3 event notification in a background thread (non-blocking)."""
     if bucket_name not in _bucket_notifications:
         return
+    try:
+        server_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # When S3 is invoked from a Step Functions execution worker, the
+        # copied execution ContextVar remains the downstream fallback.
+        server_loop = None
     # threading.Thread does not copy contextvars, so without this snapshot the
     # worker runs under the default account (000000000000): the account-scoped
     # _bucket_notifications lookup comes back empty and the event is silently
@@ -2310,7 +2318,16 @@ def _fire_s3_event_async(
     ctx = contextvars.copy_context()
     t = threading.Thread(
         target=ctx.run,
-        args=(_fire_s3_event, bucket_name, key, event_name, size, etag, deletion_type),
+        args=(
+            _fire_s3_event,
+            bucket_name,
+            key,
+            event_name,
+            size,
+            etag,
+            deletion_type,
+            server_loop,
+        ),
         daemon=True,
     )
     t.start()

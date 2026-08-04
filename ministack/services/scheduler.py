@@ -10,6 +10,7 @@ Supports:
   Tags:       TagResource, UntagResource, ListTagsForResource
 """
 
+import asyncio
 import copy
 import json
 import logging
@@ -525,7 +526,7 @@ def _at_time_epoch(expr: str):
     return dt.timestamp()
 
 
-def _tick_schedules():
+def _tick_schedules(server_loop=None):
     """Fire every ENABLED schedule that is due, honoring State, Start/EndDate,
     at()/rate()/cron() expressions and ActionAfterCompletion one-shot delete."""
     from ministack.services import eventbridge as _eb
@@ -599,7 +600,12 @@ def _tick_schedules():
                 "Region": get_region(),
             }
             try:
-                _eb._invoke_target(target, event, sched)
+                _eb._invoke_target(
+                    target,
+                    event,
+                    sched,
+                    server_loop=server_loop,
+                )
             except Exception:
                 logger.exception(
                     "Scheduler dispatch error for %s (account %s, region %s)",
@@ -619,22 +625,47 @@ def _tick_schedules():
         set_request_region(previous_region)
 
 
-def _ticker_loop():
-    while True:
-        time.sleep(_SCHEDULE_TICK_INTERVAL)
+def _ticker_loop(server_loop, stop_event):
+    while not stop_event.wait(_SCHEDULE_TICK_INTERVAL):
         try:
-            _tick_schedules()
+            _tick_schedules(server_loop)
         except Exception:
             logger.exception("Scheduler ticker error")
+
+
+_ticker_stop_event: "threading.Event | None" = None
 
 
 def start_scheduler() -> None:
     """Start the schedule-firing daemon (idempotent). Wired from the gateway
     lifespan.startup, mirroring ``eventbridge.start_scheduler``."""
-    global _ticker_thread
+    global _ticker_stop_event, _ticker_thread
     if _ticker_thread is not None and _ticker_thread.is_alive():
         return
+    try:
+        server_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # Direct unit callers may start the ticker without an ASGI lifecycle.
+        # Any SFN target then retains the defined States.Runtime backstop.
+        server_loop = None
+    _ticker_stop_event = threading.Event()
     _ticker_thread = threading.Thread(
-        target=_ticker_loop, daemon=True, name="evb-scheduler-ticker"
+        target=_ticker_loop,
+        args=(server_loop, _ticker_stop_event),
+        daemon=True,
+        name="evb-scheduler-ticker",
     )
     _ticker_thread.start()
+
+
+def stop_scheduler() -> None:
+    """Stop the lifecycle-owned scheduler so a new app gets a fresh loop."""
+    global _ticker_stop_event, _ticker_thread
+    thread = _ticker_thread
+    stop_event = _ticker_stop_event
+    if stop_event is not None:
+        stop_event.set()
+    if thread is not None and thread is not threading.current_thread():
+        thread.join()
+    _ticker_thread = None
+    _ticker_stop_event = None

@@ -23,6 +23,7 @@ Supports 47 operations:
 Container execution: if Docker socket is available, RunTask actually runs containers.
 """
 
+import asyncio
 import copy
 import json
 import logging
@@ -32,6 +33,7 @@ import threading
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import LoopLocal, run_in_thread_to_completion
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -68,6 +70,13 @@ _capacity_providers = AccountRegionScopedDict()
 _attributes = AccountRegionScopedDict()
 
 _docker = None
+# Requests previously ran synchronously on the shared event loop. Keep that
+# one-at-a-time state ordering without occupying worker threads while queued.
+_request_dispatch_locks = LoopLocal(asyncio.Lock)
+
+
+def _get_request_dispatch_lock():
+    return _request_dispatch_locks.get()
 
 # ECS exited-container reaper. Every ministack=ecs container we start via
 # RunTask lingers after its command exits (docker-py detach=True without
@@ -296,6 +305,18 @@ def _finalize_ecs_response(response):
 
 
 async def handle_request(method, path, headers, body, query_params):
+    async with _get_request_dispatch_lock():
+        return await run_in_thread_to_completion(
+            _handle_request_unlocked,
+            method,
+            path,
+            headers,
+            body,
+            query_params,
+        )
+
+
+def _handle_request_unlocked(method, path, headers, body, query_params):
     try:
         data = json.loads(body) if body else {}
     except json.JSONDecodeError:

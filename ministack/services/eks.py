@@ -13,6 +13,7 @@ Supports:
   Tags:       TagResource, UntagResource, ListTagsForResource
 """
 
+import asyncio
 import base64
 import copy
 import importlib
@@ -25,6 +26,7 @@ import time
 import urllib.parse
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import LoopLocal, run_in_thread_to_completion
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -68,6 +70,13 @@ _port_counter_lock = threading.Lock()
 _port_counter = [EKS_BASE_PORT]
 _oidc_keypair_lock = threading.Lock()
 _oidc_keypair = None                  # (private_key, jwk_dict, kid)
+# Requests previously ran synchronously on the shared event loop. Keep that
+# one-at-a-time state ordering without occupying worker threads while queued.
+_request_dispatch_locks = LoopLocal(asyncio.Lock)
+
+
+def _get_request_dispatch_lock():
+    return _request_dispatch_locks.get()
 
 
 def _ministack_issuer_base():
@@ -1455,6 +1464,18 @@ def _sanitize(cluster):
 # ---------------------------------------------------------------------------
 
 async def handle_request(method, path, headers, body_bytes, query_params):
+    async with _get_request_dispatch_lock():
+        return await run_in_thread_to_completion(
+            _handle_request_unlocked,
+            method,
+            path,
+            headers,
+            body_bytes,
+            query_params,
+        )
+
+
+def _handle_request_unlocked(method, path, headers, body_bytes, query_params):
     try:
         body = json.loads(body_bytes) if body_bytes else {}
     except json.JSONDecodeError:

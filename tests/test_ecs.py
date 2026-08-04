@@ -28,6 +28,23 @@ def _replace_arn_region(arn):
     return _replace_arn_section(arn, 3, _different_region(arn.split(":", 5)[3]))
 
 
+def _wait_stack_create_complete(cfn, stack_name, timeout=30):
+    """Poll until stack creation reaches a terminal status."""
+    deadline = time.time() + timeout
+    status = "UNKNOWN"
+    while time.time() < deadline:
+        stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+        status = stack["StackStatus"]
+        if not status.endswith("_IN_PROGRESS"):
+            assert status == "CREATE_COMPLETE", (
+                f"Stack {stack_name} ended at {status}: "
+                f"{stack.get('StackStatusReason', '')}"
+            )
+            return stack
+        time.sleep(0.5)
+    raise TimeoutError(f"Stack {stack_name} stuck at {status}")
+
+
 def test_ecs_cluster(ecs):
     ecs.create_cluster(clusterName="test-cluster")
     clusters = ecs.list_clusters()
@@ -1094,6 +1111,7 @@ def test_ecs_cfn_service_visible(ecs, cfn):
         },
     })
     cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    _wait_stack_create_complete(cfn, stack_name)
 
     # Verify service is visible
     svcs = ecs.list_services(cluster="cfn-ecs-c")
@@ -1129,6 +1147,7 @@ def test_ecs_cfn_taskdef_populates_registered_fields(ecs, cfn):
         },
     })
     cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    _wait_stack_create_complete(cfn, stack_name)
     try:
         td = ecs.describe_task_definition(taskDefinition="cfn-td-fields")["taskDefinition"]
         assert isinstance(td.get("registeredAt"), datetime), \

@@ -627,10 +627,12 @@ def _reset_scheduler():
     scheduler_mod.reset()
     scheduler_mod._schedule_last_fired.clear()
     scheduler_mod._ticker_thread = None
+    scheduler_mod._ticker_stop_event = None
     yield
     scheduler_mod.reset()
     scheduler_mod._schedule_last_fired.clear()
     scheduler_mod._ticker_thread = None
+    scheduler_mod._ticker_stop_event = None
 
 
 def _request(method, path, body=None, query=None):
@@ -757,8 +759,17 @@ def test_scheduler_ticker_dispatches_in_schedule_region_and_restores_context(mon
 
     calls = []
 
-    def _capture_target(target, event, schedule):
-        calls.append((get_account_id(), get_region(), target, event, schedule))
+    def _capture_target(target, event, schedule, *, server_loop=None):
+        calls.append(
+            (
+                get_account_id(),
+                get_region(),
+                target,
+                event,
+                schedule,
+                server_loop,
+            )
+        )
 
     monkeypatch.setattr(eventbridge, "_invoke_target", _capture_target)
     monkeypatch.setattr(scheduler_mod.time, "time", lambda: 2.0)
@@ -769,13 +780,16 @@ def test_scheduler_ticker_dispatches_in_schedule_region_and_restores_context(mon
     calls_by_region = {call[1]: call for call in calls}
     assert set(calls_by_region) == set(expected)
     for region, (schedule_arn, target_arn) in expected.items():
-        dispatch_account, dispatch_region, target, event, schedule = calls_by_region[region]
+        dispatch_account, dispatch_region, target, event, schedule, server_loop = (
+            calls_by_region[region]
+        )
         assert (dispatch_account, dispatch_region) == (account_id, region)
         assert target["Arn"] == target_arn
         assert event["Account"] == account_id
         assert event["Region"] == region
         assert event["Resources"] == [schedule_arn]
         assert schedule["Arn"] == schedule_arn
+        assert server_loop is None
     assert (get_account_id(), get_region()) == ("111111111111", "eu-west-1")
 
 
@@ -783,8 +797,9 @@ def test_scheduler_start_scheduler_starts_daemon_once(monkeypatch):
     created_threads = []
 
     class _FakeThread:
-        def __init__(self, *, target, daemon, name):
+        def __init__(self, *, target, args, daemon, name):
             self.target = target
+            self.args = args
             self.daemon = daemon
             self.name = name
             self.started = False
@@ -804,6 +819,8 @@ def test_scheduler_start_scheduler_starts_daemon_once(monkeypatch):
     assert len(created_threads) == 1
     thread = created_threads[0]
     assert thread.target is scheduler_mod._ticker_loop
+    assert thread.args[0] is None
+    assert thread.args[1] is scheduler_mod._ticker_stop_event
     assert thread.daemon is True
     assert thread.name == "evb-scheduler-ticker"
     assert thread.started is True

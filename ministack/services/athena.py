@@ -27,6 +27,7 @@ from datetime import date
 from urllib.parse import urlparse
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import run_in_thread_to_completion
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -466,7 +467,7 @@ async def _run_duckdb(query, database):
         finally:
             conn.close()
 
-    return await asyncio.to_thread(_execute_blocking)
+    return await run_in_thread_to_completion(_execute_blocking)
 
 
 async def _rewrite_data_paths(query, database):

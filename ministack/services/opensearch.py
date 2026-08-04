@@ -18,6 +18,7 @@ State is account- and region-scoped via AccountRegionScopedDict, except tags
 which stay account-scoped because their ARN keys embed region.
 """
 
+import asyncio
 import copy
 import json
 import logging
@@ -27,6 +28,7 @@ import threading
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import LoopLocal, run_in_thread_to_completion
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -115,6 +117,13 @@ _port_counter = [BASE_PORT]
 _dashboards_port_counter = [DASHBOARDS_BASE_PORT]
 _state_lock = threading.Lock()
 _docker_client = None
+# Requests previously ran synchronously on the shared event loop. Keep that
+# one-at-a-time state ordering without occupying worker threads while queued.
+_request_dispatch_locks = LoopLocal(asyncio.Lock)
+
+
+def _get_request_dispatch_lock():
+    return _request_dispatch_locks.get()
 
 
 class OpenSearchServiceError(ValueError):
@@ -1199,6 +1208,18 @@ def _list_packages_for_domain(domain_name, query_params):
 # ---------------------------------------------------------------------------
 
 async def handle_request(method, path, headers, body_bytes, query_params):
+    async with _get_request_dispatch_lock():
+        return await run_in_thread_to_completion(
+            _handle_request_unlocked,
+            method,
+            path,
+            headers,
+            body_bytes,
+            query_params,
+        )
+
+
+def _handle_request_unlocked(method, path, headers, body_bytes, query_params):
     body_text = body_bytes.decode("utf-8") if body_bytes else ""
     try:
         payload = json.loads(body_text) if body_text else {}

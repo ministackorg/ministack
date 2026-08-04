@@ -48,6 +48,7 @@ from datetime import datetime, timezone
 from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import run_in_thread_to_completion
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -1021,23 +1022,31 @@ async def handle_request(method, path, headers, body, query_params):
     if path == "/v1/chat/completions":
         if method != "POST":
             return _openai_error(f"Unsupported method {method}.", status=405)
-        return await asyncio.to_thread(_openai_chat_completion, headers, body)
+        return await run_in_thread_to_completion(_openai_chat_completion, headers, body)
 
     # Proxy-capable handlers run in a worker thread: a slow
     # MINISTACK_BEDROCK_PROXY_URL must never block the single-port event loop.
     if method == "POST":
         m = _CONVERSE_STREAM_RE.match(path)
         if m:
-            return await asyncio.to_thread(_converse_stream, unquote(m.group(1)), headers, body)
+            return await run_in_thread_to_completion(
+                _converse_stream, unquote(m.group(1)), headers, body
+            )
         m = _CONVERSE_RE.match(path)
         if m:
-            return await asyncio.to_thread(_converse, unquote(m.group(1)), headers, body)
+            return await run_in_thread_to_completion(
+                _converse, unquote(m.group(1)), headers, body
+            )
         m = _INVOKE_STREAM_RE.match(path)
         if m:
-            return await asyncio.to_thread(_invoke_model_with_response_stream, unquote(m.group(1)), headers, body)
+            return await run_in_thread_to_completion(
+                _invoke_model_with_response_stream, unquote(m.group(1)), headers, body
+            )
         m = _INVOKE_RE.match(path)
         if m:
-            return await asyncio.to_thread(_invoke_model, unquote(m.group(1)), headers, body)
+            return await run_in_thread_to_completion(
+                _invoke_model, unquote(m.group(1)), headers, body
+            )
         m = _APPLY_GUARDRAIL_RE.match(path)
         if m:
             return _apply_guardrail(unquote(m.group(1)), unquote(m.group(2)), body)

@@ -32,6 +32,7 @@ clients can call DescribeDBInstances and other operations without ``Action=`` qu
 parameters.
 """
 
+import asyncio
 import contextvars
 import copy
 import datetime
@@ -46,6 +47,7 @@ from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import LoopLocal, run_in_thread_to_completion
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -86,6 +88,13 @@ _port_counter = [BASE_PORT]
 _docker = None
 _ministack_network = None
 _shared_container_lock = threading.RLock()
+# Requests previously ran synchronously on the shared event loop. Keep that
+# one-at-a-time state ordering without occupying worker threads while queued.
+_request_dispatch_locks = LoopLocal(asyncio.Lock)
+
+
+def _get_request_dispatch_lock():
+    return _request_dispatch_locks.get()
 
 _MYSQL_REPLICATION_USER = "rdsrepladmin"
 _MYSQL_REPLICATION_PASSWORD = "ministack-rds-replication"
@@ -2030,6 +2039,18 @@ def _flatten_json_request_params(params, data):
 
 
 async def handle_request(method, path, headers, body, query_params):
+    async with _get_request_dispatch_lock():
+        return await run_in_thread_to_completion(
+            _handle_request_unlocked,
+            method,
+            path,
+            headers,
+            body,
+            query_params,
+        )
+
+
+def _handle_request_unlocked(method, path, headers, body, query_params):
     params = dict(query_params)
     if method == "POST" and body:
         raw = body if isinstance(body, str) else body.decode("utf-8-sig", errors="replace")
@@ -2467,8 +2488,8 @@ def _create_db_instance(p):
         pending_rotation = parent.get("_pending_master_password_rotation")
         if pending_rotation:
             readiness_master_pass = pending_rotation["old_password"]
-        # RDS action dispatch is synchronous and await-free, so this check and
-        # the shared metadata update cannot interleave with another create.
+        # The per-service async admission lock serializes API dispatch, keeping
+        # this check and update from interleaving with another API-driven create.
         resume_control_plane_only = (
             not docker_client
             and not parent.get("DBClusterMembers")
