@@ -4581,6 +4581,38 @@ def test_opensearch_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tm
     assert persistence.load_state("opensearch") is None
 
 
+def test_apigateway_v1_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject REST API regional state instead of
+    accepting it as v2 and silently dropping non-boot-region APIs."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    rest_apis = AccountRegionScopedDict()
+    rest_apis.set_scoped(
+        "123456789012",
+        "us-west-2",
+        "regionalapi",
+        {"id": "regionalapi", "name": "regional API"},
+    )
+    persistence.save_state("apigateway_v1", {"rest_apis": rest_apis})
+
+    raw = _json.loads((tmp_path / "apigateway_v1.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded = persistence.load_state("apigateway_v1")["rest_apis"]
+    assert loaded.get_scoped("123456789012", "us-west-2", "regionalapi")[
+        "name"
+    ] == "regional API"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("apigateway_v1") is None
+
+
 def test_opensearch_is_registered_for_persistence_save():
     from ministack.app import _build_persistence_save_dict, _state_map
     from ministack.services import opensearch
