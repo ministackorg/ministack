@@ -791,3 +791,111 @@ def test_cloudformation_ssm_parameter_is_region_scoped():
         ssm_service.reset()
         set_request_account_id(original_account)
         set_request_region(original_region)
+
+
+def test_ssm_run_command_health_probe(ssm, ec2):
+    """The Run Command shape a health probe needs: send, then poll to a terminal invocation."""
+    tag = _uuid_mod.uuid4().hex[:8]
+    instance_id = ec2.run_instances(ImageId="ami-12345678", MinCount=1, MaxCount=1,
+                                    TagSpecifications=[{"ResourceType": "instance",
+                                                        "Tags": [{"Key": f"ssm-{tag}",
+                                                                  "Value": tag}]}],
+                                    )["Instances"][0]["InstanceId"]
+    try:
+        command = ssm.send_command(InstanceIds=[instance_id], DocumentName="AWS-RunShellScript",
+                                   Comment=f"probe {tag}",
+                                   Parameters={"commands": ["echo ok"]})["Command"]
+        assert command["CommandId"]
+        assert command["DocumentName"] == "AWS-RunShellScript"
+        assert command["InstanceIds"] == [instance_id]
+        assert command["TargetCount"] == 1
+
+        # Nothing runs, so the output is empty; what a polling caller needs is a terminal Status.
+        inv = ssm.get_command_invocation(CommandId=command["CommandId"], InstanceId=instance_id)
+        assert inv["Status"] == "Success"
+        assert inv["StatusDetails"] == "Success"
+        assert inv["ResponseCode"] == 0
+        assert inv["StandardOutputContent"] == ""
+        assert inv["DocumentName"] == "AWS-RunShellScript"
+        # These are strings in the SSM model, not timestamps, so boto3 must not have parsed them.
+        assert isinstance(inv["ExecutionStartDateTime"], str)
+        assert isinstance(inv["ExecutionEndDateTime"], str)
+
+        # A caller that checks whether the instance is managed before sending must see it.
+        info = ssm.describe_instance_information()["InstanceInformationList"]
+        mine = [i for i in info if i["InstanceId"] == instance_id]
+        assert len(mine) == 1
+        assert mine[0]["PingStatus"] == "Online"
+        assert mine[0]["ResourceType"] == "EC2Instance"
+    finally:
+        ec2.terminate_instances(InstanceIds=[instance_id])
+
+
+def test_ssm_send_command_validates_the_instance(ssm, ec2):
+    """An instance that does not exist, is gone, or is stopped is rejected, a running one taken."""
+    with pytest.raises(ClientError) as exc:
+        ssm.send_command(InstanceIds=["i-00000000000000000"], DocumentName="AWS-RunShellScript")
+    assert exc.value.response["Error"]["Code"] == "InvalidInstanceId"
+
+    instance_id = ec2.run_instances(ImageId="ami-12345678", MinCount=1,
+                                    MaxCount=1)["Instances"][0]["InstanceId"]
+    ec2.terminate_instances(InstanceIds=[instance_id])
+    with pytest.raises(ClientError) as exc:
+        ssm.send_command(InstanceIds=[instance_id], DocumentName="AWS-RunShellScript")
+    assert exc.value.response["Error"]["Code"] == "InvalidInstanceId"
+
+    # A stopped box has no agent answering, so real SSM refuses it and stops listing it.
+    stopped = ec2.run_instances(ImageId="ami-12345678", MinCount=1,
+                                MaxCount=1)["Instances"][0]["InstanceId"]
+    try:
+        ec2.stop_instances(InstanceIds=[stopped])
+        with pytest.raises(ClientError) as exc:
+            ssm.send_command(InstanceIds=[stopped], DocumentName="AWS-RunShellScript")
+        assert exc.value.response["Error"]["Code"] == "InvalidInstanceId"
+        listed = [i["InstanceId"]
+                  for i in ssm.describe_instance_information()["InstanceInformationList"]]
+        assert stopped not in listed
+    finally:
+        ec2.terminate_instances(InstanceIds=[stopped])
+
+    # Rejecting everything would pass every assertion above, so prove a running one is taken.
+    live = ec2.run_instances(ImageId="ami-12345678", MinCount=1,
+                             MaxCount=1)["Instances"][0]["InstanceId"]
+    try:
+        assert ssm.send_command(InstanceIds=[live],
+                                DocumentName="AWS-RunShellScript")["Command"]["CommandId"]
+    finally:
+        ec2.terminate_instances(InstanceIds=[live])
+
+
+def test_ssm_command_lookup_filters_and_errors(ssm, ec2):
+    """listCommands narrows by command and instance; unknown ids get what AWS answers."""
+    instance_id = ec2.run_instances(ImageId="ami-12345678", MinCount=1,
+                                    MaxCount=1)["Instances"][0]["InstanceId"]
+    other_id = ec2.run_instances(ImageId="ami-12345678", MinCount=1,
+                                 MaxCount=1)["Instances"][0]["InstanceId"]
+    try:
+        mine = ssm.send_command(InstanceIds=[instance_id],
+                                DocumentName="AWS-RunShellScript")["Command"]["CommandId"]
+        theirs = ssm.send_command(InstanceIds=[other_id],
+                                  DocumentName="AWS-RunShellScript")["Command"]["CommandId"]
+
+        assert [c["CommandId"] for c in ssm.list_commands(CommandId=mine)["Commands"]] == [mine]
+        by_instance = [c["CommandId"] for c in ssm.list_commands(InstanceId=other_id)["Commands"]]
+        assert theirs in by_instance and mine not in by_instance
+
+        # A command id nobody knows narrows the list to nothing; AWS does not call it an error.
+        assert ssm.list_commands(CommandId="ffffffff-ffff-ffff-ffff-ffffffffffff")["Commands"] == []
+
+        # AWS resolves the invocation before the command, so this is not InvalidCommandId.
+        with pytest.raises(ClientError) as exc:
+            ssm.get_command_invocation(CommandId="ffffffff-ffff-ffff-ffff-ffffffffffff",
+                                       InstanceId=instance_id)
+        assert exc.value.response["Error"]["Code"] == "InvocationDoesNotExist"
+
+        # A real command, but not for that instance: the invocation does not exist.
+        with pytest.raises(ClientError) as exc:
+            ssm.get_command_invocation(CommandId=mine, InstanceId=other_id)
+        assert exc.value.response["Error"]["Code"] == "InvocationDoesNotExist"
+    finally:
+        ec2.terminate_instances(InstanceIds=[instance_id, other_id])

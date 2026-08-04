@@ -4895,6 +4895,56 @@ def test_sfn_aws_sdk_query_pascal_case(sfn, sfn_sync, ssm):
     ssm.delete_parameter(Name="sfn-pascal-test-param")
 
 
+def test_sfn_aws_sdk_ssm_run_command_probe(sfn, sfn_sync, ec2):
+    """The health-probe shape: sendCommand, then getCommandInvocation on the id it returned."""
+    tag = _uuid_mod.uuid4().hex[:8]
+    instance_id = ec2.run_instances(ImageId="ami-12345678", MinCount=1,
+                                    MaxCount=1)["Instances"][0]["InstanceId"]
+    sm_arn = None
+    try:
+        sm_arn = sfn.create_state_machine(
+            name=f"sfn-ssm-run-{tag}",
+            definition=json.dumps({
+                "StartAt": "Send",
+                "States": {
+                    "Send": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+                        "Parameters": {
+                            "InstanceIds": [instance_id],
+                            "DocumentName": "AWS-RunShellScript",
+                            "Parameters": {"commands": ["echo ok"]},
+                        },
+                        "ResultPath": "$.sent",
+                        "Next": "Poll",
+                    },
+                    "Poll": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+                        "Parameters": {
+                            "CommandId.$": "$.sent.Command.CommandId",
+                            "InstanceId": instance_id,
+                        },
+                        "End": True,
+                    },
+                },
+            }),
+            roleArn="arn:aws:iam::000000000000:role/R",
+        )["stateMachineArn"]
+
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input="{}")
+        assert resp["status"] == "SUCCEEDED", f"{resp.get('error')} — {resp.get('cause')}"
+        # The poll addressed the CommandId the send returned, which is the part a probe needs.
+        output = json.loads(resp["output"])
+        assert output["Status"] == "Success"
+        assert output["InstanceId"] == instance_id
+        assert output["ResponseCode"] == 0
+    finally:
+        ec2.terminate_instances(InstanceIds=[instance_id])
+        if sm_arn:
+            sfn.delete_state_machine(stateMachineArn=sm_arn)
+
+
 def test_sfn_aws_sdk_json_pascal_case(sfn, sfn_sync, sm):
     """SFN aws-sdk integration converts camelCase action to PascalCase for JSON-protocol services."""
     definition = json.dumps({
