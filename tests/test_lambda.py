@@ -3587,6 +3587,7 @@ def test_lambda_provided_runtime_parallel_invocations():
     per-sha extraction and spawns are serialized against extraction."""
     import concurrent.futures
     import hashlib
+
     from ministack.services import lambda_svc as lmod
 
     bootstrap_script = (
@@ -7606,6 +7607,7 @@ def test_lambda_legacy_inline_base64_persistence_still_loads(lambda_svc_isolated
     storage) stored code_zip as inline base64. restore_state must accept
     that shape so an in-place upgrade requires no migration step."""
     import base64 as _b64
+
     from ministack.core.responses import AccountScopedDict
     svc, _ = lambda_svc_isolated
 
@@ -7888,6 +7890,50 @@ def test_lambda_durable_get_execution_rejects_malformed_arn(lam):
 # restarts).
 # ---------------------------------------------------------------------------
 
+@contextlib.contextmanager
+def _preserved_lambda_durable_state(_ld):
+    from ministack.core.responses import AccountScopedDict
+
+    pre_index = (
+        _ld._callback_index.to_dict()
+        if hasattr(_ld._callback_index, "to_dict")
+        else dict(_ld._callback_index)
+    )
+    pre_execs = _ld._executions.to_dict()
+    pre_queue = list(_ld._resume_queue)
+    _ld._executions.clear()
+    _ld._callback_index.clear()
+    with _ld._resume_lock:
+        _ld._resume_queue.clear()
+    try:
+        yield
+    finally:
+        _ld._executions.clear()
+        _ld._executions.update(AccountScopedDict.from_dict(pre_execs))
+        _ld._callback_index.clear()
+        if hasattr(_ld._callback_index, "to_dict"):
+            _ld._callback_index.update(AccountScopedDict.from_dict(pre_index))
+        else:
+            _ld._callback_index.update(pre_index)
+        with _ld._resume_lock:
+            _ld._resume_queue.clear()
+            for e in pre_queue:
+                _ld._resume_queue.append(e)
+
+
+def _durable_restore_record(arn: str, operations: list[dict]) -> dict:
+    return {
+        "DurableExecutionArn": arn,
+        "FunctionArn": ":".join(arn.split(":")[:7]),
+        "Status": "RUNNING",
+        "Operations": operations,
+        "History": [],
+        "NextEventId": 1,
+        "CheckpointToken": "tok",
+        "InputPayload": "{}",
+    }
+
+
 def test_lambda_durable_heartbeat_extends_callback_timeout():
     """Pushing the HeartbeatDeadline forward must actually delay the
     CallbackTimedOut firing. Stale heap entries must be no-ops."""
@@ -7953,15 +7999,7 @@ def test_lambda_durable_restore_rebuilds_callback_index_and_rearms_timers():
         "History": [], "NextEventId": 1, "CheckpointToken": "tok",
         "InputPayload": "{}",
     }
-    # Wipe live state so the test is hermetic.
-    pre_index = dict(_ld._callback_index)
-    pre_execs = dict(_ld._executions)
-    pre_queue = list(_ld._resume_queue)
-    _ld._executions.clear()
-    _ld._callback_index.clear()
-    with _ld._resume_lock:
-        _ld._resume_queue.clear()
-    try:
+    with _preserved_lambda_durable_state(_ld):
         # Pretend ministack just booted and read this rec from disk.
         _ld.restore_state({"executions": {arn: rec}})
         # Index must contain the STARTED callback.
@@ -7970,21 +8008,133 @@ def test_lambda_durable_restore_rebuilds_callback_index_and_rearms_timers():
         # Heap must have at least one entry for this arn at or before the
         # earliest deadline (the WAIT at now+60).
         with _ld._resume_lock:
-            entries = [(t, a) for (t, a, _acct, _region) in _ld._resume_queue if a == arn]
+            entries = [e for e in _ld._resume_queue if e[1] == arn]
         assert entries, "no resume entry queued after restore"
-        assert min(t for t, _ in entries) <= now + 60 + 1
+        assert min(t for t, *_ in entries) <= now + 60 + 1
+        assert any(acct == "000000000000" and region == "us-east-1"
+                   for _t, _a, acct, region in entries)
         # And Send*Callback resolves the restored callback (no 404).
         target, op, err = _ld._resolve_callback(cb_op_id)
         assert err is None and target is rec and op["Id"] == cb_op_id
-    finally:
-        _ld._executions.clear()
-        _ld._executions.update(pre_execs)
-        _ld._callback_index.clear()
-        _ld._callback_index.update(pre_index)
+
+
+def test_lambda_durable_restore_rearms_non_boot_region_from_arn():
+    """Restored RUNNING executions must resume in their ARN's region, not
+    the boot/default region active during module import."""
+    from ministack.services import lambda_durable as _ld
+    arn = "arn:aws:lambda:us-west-2:000000000000:function:restore-west:$LATEST/durable-execution/" \
+          "11111111111111111111111111111111/22222222222222222222222222222222"
+    wait_op_id = "westwaitaaaaaaaaaaaaaaaaaaaaaaaa"
+    now = _ld._now()
+    rec = _durable_restore_record(arn, [{
+        "Id": wait_op_id, "Type": "WAIT", "Status": "STARTED",
+        "WaitDetails": {"ScheduledEndTimestamp": now + 3600, "Duration": 3600},
+    }])
+
+    with _preserved_lambda_durable_state(_ld):
+        _ld.restore_state({"executions": {arn: rec}})
         with _ld._resume_lock:
-            _ld._resume_queue.clear()
-            for e in pre_queue:
-                _ld._resume_queue.append(e)
+            entries = [e for e in _ld._resume_queue if e[1] == arn]
+        assert entries, "no resume entry queued after restore"
+        assert any(acct == "000000000000" and region == "us-west-2"
+                   for _t, _a, acct, region in entries)
+
+
+def test_lambda_durable_restore_rebuilds_non_default_account_records():
+    """Restore must rebuild callback indexes and timers for every persisted
+    account, not just the account in the import-time request context."""
+    from ministack.core.responses import AccountScopedDict
+    from ministack.services import lambda_durable as _ld
+
+    account_id = "111111111111"
+    region = "us-west-2"
+    arn = f"arn:aws:lambda:{region}:{account_id}:function:restore-cross:$LATEST/durable-execution/" \
+          "33333333333333333333333333333333/44444444444444444444444444444444"
+    cb_op_id = "crosscbaaaaaaaaaaaaaaaaaaaaaaaaa"
+    wait_op_id = "crosswaitaaaaaaaaaaaaaaaaaaaaaa"
+    now = _ld._now()
+    rec = _durable_restore_record(arn, [
+        {"Id": cb_op_id, "Type": "CALLBACK", "Status": "STARTED",
+         "CallbackDetails": {"CallbackId": cb_op_id,
+                             "TimeoutDeadline": now + 300}},
+        {"Id": wait_op_id, "Type": "WAIT", "Status": "STARTED",
+         "WaitDetails": {"ScheduledEndTimestamp": now + 3600, "Duration": 3600}},
+    ])
+    executions = AccountScopedDict.from_dict({(account_id, arn): rec})
+    original_account = get_account_id()
+    original_region = get_region()
+
+    with _preserved_lambda_durable_state(_ld):
+        try:
+            _ld.restore_state({"executions": executions})
+            set_request_account_id(account_id)
+            set_request_region(region)
+            assert _ld._callback_index[cb_op_id] == (arn, cb_op_id)
+            target, op, err = _ld._resolve_callback(cb_op_id)
+            assert err is None
+            assert target is rec
+            assert op["Id"] == cb_op_id
+            with _ld._resume_lock:
+                entries = [e for e in _ld._resume_queue if e[1] == arn]
+            assert entries, "no resume entry queued after restore"
+            assert any(acct == account_id and queued_region == region
+                       for _t, _a, acct, queued_region in entries)
+        finally:
+            set_request_account_id(original_account)
+            set_request_region(original_region)
+
+
+def test_lambda_durable_restore_callback_index_is_account_scoped():
+    """Same CallbackId in two accounts must remain resolvable after restore."""
+    from ministack.core.responses import AccountScopedDict
+    from ministack.services import lambda_durable as _ld
+
+    account_a = "111111111111"
+    account_b = "222222222222"
+    region = "us-west-2"
+    cb_op_id = "samecbaaaaaaaaaaaaaaaaaaaaaaaaa"
+    now = _ld._now()
+    arn_a = f"arn:aws:lambda:{region}:{account_a}:function:restore-a:$LATEST/durable-execution/" \
+            "55555555555555555555555555555555/66666666666666666666666666666666"
+    arn_b = f"arn:aws:lambda:{region}:{account_b}:function:restore-b:$LATEST/durable-execution/" \
+            "77777777777777777777777777777777/88888888888888888888888888888888"
+    rec_a = _durable_restore_record(arn_a, [{
+        "Id": cb_op_id, "Type": "CALLBACK", "Status": "STARTED",
+        "CallbackDetails": {"CallbackId": cb_op_id,
+                            "TimeoutDeadline": now + 300},
+    }])
+    rec_b = _durable_restore_record(arn_b, [{
+        "Id": cb_op_id, "Type": "CALLBACK", "Status": "STARTED",
+        "CallbackDetails": {"CallbackId": cb_op_id,
+                            "TimeoutDeadline": now + 300},
+    }])
+    executions = AccountScopedDict.from_dict({
+        (account_a, arn_a): rec_a,
+        (account_b, arn_b): rec_b,
+    })
+
+    original_account = get_account_id()
+    original_region = get_region()
+    with _preserved_lambda_durable_state(_ld):
+        try:
+            _ld.restore_state({"executions": executions})
+
+            set_request_account_id(account_a)
+            set_request_region(region)
+            target, op, err = _ld._resolve_callback(cb_op_id)
+            assert err is None
+            assert target is rec_a
+            assert op["Id"] == cb_op_id
+
+            set_request_account_id(account_b)
+            set_request_region(region)
+            target, op, err = _ld._resolve_callback(cb_op_id)
+            assert err is None
+            assert target is rec_b
+            assert op["Id"] == cb_op_id
+        finally:
+            set_request_account_id(original_account)
+            set_request_region(original_region)
 
 
 def test_lambda_durable_restore_skips_non_running_executions():
@@ -8006,19 +8156,37 @@ def test_lambda_durable_restore_skips_non_running_executions():
         "History": [], "NextEventId": 1, "CheckpointToken": "tok",
         "InputPayload": "{}",
     }
-    pre_index = dict(_ld._callback_index)
-    pre_execs = dict(_ld._executions)
-    _ld._executions.clear()
-    _ld._callback_index.clear()
-    try:
+    with _preserved_lambda_durable_state(_ld):
         _ld.restore_state({"executions": {arn_done: rec}})
         # SUCCEEDED callback must NOT be indexed (only STARTED ones).
         assert cb_op_id not in _ld._callback_index
-    finally:
-        _ld._executions.clear()
-        _ld._executions.update(pre_execs)
-        _ld._callback_index.clear()
-        _ld._callback_index.update(pre_index)
+
+
+def test_lambda_durable_restore_malformed_arn_falls_back_and_continues(caplog):
+    """One malformed restored ARN must not abort restore of the rest of the
+    durable state. It falls back to the persisted account and boot region."""
+    from ministack.core.responses import AccountScopedDict
+    from ministack.services import lambda_durable as _ld
+
+    account_id = "222222222222"
+    arn = "not-a-durable-execution-arn"
+    now = _ld._now()
+    rec = _durable_restore_record(arn, [{
+        "Id": "badwaitaaaaaaaaaaaaaaaaaaaaaaa",
+        "Type": "WAIT",
+        "Status": "STARTED",
+        "WaitDetails": {"ScheduledEndTimestamp": now + 3600, "Duration": 3600},
+    }])
+    executions = AccountScopedDict.from_dict({(account_id, arn): rec})
+
+    with _preserved_lambda_durable_state(_ld), caplog.at_level("WARNING"):
+        _ld.restore_state({"executions": executions})
+        assert "Malformed DurableExecutionArn during restore" in caplog.text
+        with _ld._resume_lock:
+            entries = [e for e in _ld._resume_queue if e[1] == arn]
+        assert entries, "no resume entry queued after malformed ARN restore"
+        assert any(acct == account_id and region == "us-east-1"
+                   for _t, _a, acct, region in entries)
 
 
 # ---------------------------------------------------------------------------
@@ -8231,14 +8399,17 @@ def test_lambda_xray_active_injects_trace_id(lam):
     """TracingConfig.Mode=Active → handler sees a properly-formatted
     _X_AMZN_TRACE_ID (`Root=1-<8hex>-<24hex>;Parent=<16hex>;Sampled=1`)."""
     import re as _re
+
     fname = f"xray-active-{_uuid_mod.uuid4().hex[:8]}"
     _create_xray_fn(lam, fname, "Active")
     try:
         trace_id = _invoke_trace_id(lam, fname)
         assert _re.match(_XRAY_TRACE_HEADER_RE, trace_id), trace_id
     finally:
-        try: lam.delete_function(FunctionName=fname)
-        except Exception: pass
+        try:
+            lam.delete_function(FunctionName=fname)
+        except Exception:
+            pass
 
 
 def test_lambda_xray_passthrough_does_not_set_trace_id(lam):
@@ -8250,8 +8421,10 @@ def test_lambda_xray_passthrough_does_not_set_trace_id(lam):
     try:
         assert _invoke_trace_id(lam, fname) == "<UNSET>"
     finally:
-        try: lam.delete_function(FunctionName=fname)
-        except Exception: pass
+        try:
+            lam.delete_function(FunctionName=fname)
+        except Exception:
+            pass
 
 
 def test_lambda_xray_active_fresh_id_per_invocation(lam):
@@ -8259,6 +8432,7 @@ def test_lambda_xray_active_fresh_id_per_invocation(lam):
     persistent subprocess must NOT cache the env var across invocations.
     AWS contract: every Lambda invocation is a new root segment."""
     import re as _re
+
     fname = f"xray-fresh-{_uuid_mod.uuid4().hex[:8]}"
     _create_xray_fn(lam, fname, "Active")
     try:
@@ -8268,8 +8442,10 @@ def test_lambda_xray_active_fresh_id_per_invocation(lam):
         assert _re.match(_XRAY_TRACE_HEADER_RE, t2), t2
         assert t1 != t2, f"Trace ID was reused: {t1}"
     finally:
-        try: lam.delete_function(FunctionName=fname)
-        except Exception: pass
+        try:
+            lam.delete_function(FunctionName=fname)
+        except Exception:
+            pass
 
 
 def test_lambda_xray_does_not_leak_across_functions(lam):
@@ -8287,14 +8463,18 @@ def test_lambda_xray_does_not_leak_across_functions(lam):
         assert _invoke_trace_id(lam, fb) == "<UNSET>"
     finally:
         for f in (fa, fb):
-            try: lam.delete_function(FunctionName=f)
-            except Exception: pass
+            try:
+                lam.delete_function(FunctionName=f)
+            except Exception:
+                pass
 
 
 def test_xray_trace_id_helper_unit():
     """Direct unit test of the helper used by all executors."""
     import re as _re
+
     from ministack.services.lambda_svc import _xray_trace_id_for_invocation
+
     # PassThrough / missing → None
     assert _xray_trace_id_for_invocation({}) is None
     assert _xray_trace_id_for_invocation({"TracingConfig": {"Mode": "PassThrough"}}) is None
@@ -8317,6 +8497,7 @@ def test_xray_trace_id_helper_unit():
 
 def test_extract_zip_preserves_executable_bit():
     import tempfile
+
     from ministack.services.lambda_svc import _extract_zip_preserving_mode
 
     buf = io.BytesIO()
@@ -8343,6 +8524,7 @@ def test_extract_zip_windows_zip_keeps_default_mode():
     (external_attr high bits = 0) — we must NOT chmod them to 0, which would
     make the extracted files unreadable."""
     import tempfile
+
     from ministack.services.lambda_svc import _extract_zip_preserving_mode
 
     buf = io.BytesIO()
@@ -8396,8 +8578,8 @@ def test_lambda_durable_resume_captures_region_and_account():
     resume queue so the background resume thread (which has no request
     contextvars) re-establishes the right tenant scope. Without it, durable
     executions in a non-default region/account never resume. In-process."""
-    from ministack.services import lambda_durable as d
     from ministack.core.responses import _request_account_id, _request_region
+    from ministack.services import lambda_durable as d
 
     tok_a = _request_account_id.set("111111111111")
     tok_r = _request_region.set("eu-west-1")
