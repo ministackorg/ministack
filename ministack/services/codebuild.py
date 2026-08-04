@@ -59,6 +59,15 @@ def restore_state(data):
     _projects.update(data.get("projects", {}))
     _builds.update(data.get("builds", {}))
 
+    # An executed build lives in a container and a worker thread, neither of
+    # which survives a restart, so a restored IN_PROGRESS build would poll as
+    # running forever.
+    for build in _builds.values():
+        if build.get("buildStatus") == "IN_PROGRESS":
+            build["buildStatus"] = "FAULT"
+            build["currentPhase"] = "COMPLETED"
+            build.setdefault("endTime", int(time.time()))
+
 
 try:
     _restored = load_state("codebuild")
@@ -118,7 +127,8 @@ def _make_build_record(project, build_id, source_version=None):
     return {
         "id": build_id,
         "arn": _build_arn(build_id),
-        "buildNumber": len([b for b in _builds.values() if b["projectName"] == project["name"]]) + 1,
+        "buildNumber": len([b for b in _builds.values()
+                            if b.get("projectName") == project["name"]]) + 1,
         "startTime": now,
         "endTime": now,
         "currentPhase": "COMPLETED",
@@ -178,6 +188,10 @@ WORKSPACE = os.environ.get("MINISTACK_CODEBUILD_WORKSPACE", "/tmp/ministack-code
 # Builds then share that directory, so they must not overlap.
 SOURCE_PATH = os.environ.get("MINISTACK_CODEBUILD_SOURCE_PATH", "")
 
+# A build's log stream is held in memory, so a chatty build is capped rather
+# than allowed to grow without bound. 0 keeps everything.
+MAX_LOG_EVENTS = int(os.environ.get("MINISTACK_CODEBUILD_MAX_LOG_EVENTS", "20000") or 0)
+
 _PHASE_COMPLETE_RE = re.compile(r"Phase complete: ([A-Z_]+) State: ([A-Z_]+)")
 
 _docker = None
@@ -230,7 +244,10 @@ def _log_sink(build):
 
     def emit(line):
         ts = int(time.time() * 1000)
-        stream["events"].append({"timestamp": ts, "message": line, "ingestionTime": ts})
+        events = stream["events"]
+        events.append({"timestamp": ts, "message": line, "ingestionTime": ts})
+        if MAX_LOG_EVENTS and len(events) > MAX_LOG_EVENTS:
+            del events[: len(events) - MAX_LOG_EVENTS]
         if stream["firstEventTimestamp"] is None:
             stream["firstEventTimestamp"] = ts
         stream["lastEventTimestamp"] = ts
@@ -249,8 +266,33 @@ def _container_for_build(build_id):
     return found[0] if found else None
 
 
+def _aws_endpoint():
+    """Address the build container can reach MiniStack on, or "" to inject none.
+
+    A build that calls the AWS CLI should reach this emulator rather than real
+    AWS. The build container is a sibling started by the agent, so it reaches
+    MiniStack over the default bridge gateway unless told otherwise.
+    """
+    explicit = os.environ.get("MINISTACK_CODEBUILD_AWS_ENDPOINT")
+    if explicit is not None:
+        return explicit.strip()
+
+    port = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
+    client = _get_docker()
+    if not client:
+        return ""
+    try:
+        config = client.networks.get("bridge").attrs["IPAM"]["Config"]
+        gateway = next(entry["Gateway"] for entry in config if entry.get("Gateway"))
+    except Exception:
+        logger.debug("Could not resolve the bridge gateway; builds get no AWS endpoint")
+        return ""
+    return f"http://{gateway}:{port}"
+
+
 def _write_env_file(path, project, build):
     env = project.get("environment", {}) or {}
+    declared = {var.get("name") for var in env.get("environmentVariables") or []}
     with open(path, "w", encoding="utf-8") as fh:
         for var in env.get("environmentVariables") or []:
             fh.write(f"{var.get('name', '')}={var.get('value', '')}\n")
@@ -259,6 +301,14 @@ def _write_env_file(path, project, build):
         fh.write(f"CODEBUILD_BUILD_NUMBER={build['buildNumber']}\n")
         fh.write(f"CODEBUILD_INITIATOR={build['initiator']}\n")
         fh.write(f"AWS_DEFAULT_REGION={get_region()}\n")
+
+        endpoint = _aws_endpoint()
+        if endpoint and "AWS_ENDPOINT_URL" not in declared:
+            fh.write(f"AWS_ENDPOINT_URL={endpoint}\n")
+            for name, value in (("AWS_ACCESS_KEY_ID", "test"),
+                                ("AWS_SECRET_ACCESS_KEY", "test")):
+                if name not in declared:
+                    fh.write(f"{name}={value}\n")
 
 
 def _record_phase(build, phase_type, status):
@@ -280,6 +330,14 @@ def _finish_build(build, status):
     build["currentPhase"] = "COMPLETED"
     build["endTime"] = int(time.time())
     _record_phase(build, "COMPLETED", status)
+
+
+def _timeout_seconds(project):
+    try:
+        minutes = int(project.get("timeoutInMinutes") or 60)
+    except (TypeError, ValueError):
+        minutes = 60
+    return max(1, minutes) * 60
 
 
 def _execute_build(build_id, project):
@@ -347,6 +405,23 @@ def _execute_build(build_id, project):
         logger.exception("Could not open the log stream for %s", build_id)
         emit = None
 
+    # The log stream blocks until the container ends, so the timeout is a timer
+    # that removes it; that ends the stream and is reported as TIMED_OUT.
+    timed_out = threading.Event()
+
+    def _on_timeout():
+        timed_out.set()
+        logger.error("Build %s exceeded timeoutInMinutes; stopping it", build_id)
+        try:
+            container.remove(force=True)
+        except Exception:
+            logger.exception("Could not stop the timed-out build %s", build_id)
+
+    timeout = threading.Timer(_timeout_seconds(project), _on_timeout)
+    timeout.daemon = True
+    timeout.start()
+
+    saw_phase = False
     try:
         for raw in container.logs(stream=True, follow=True):
             line = raw.decode("utf-8", "replace").rstrip()
@@ -357,15 +432,30 @@ def _execute_build(build_id, project):
                 emit(line)
             match = _PHASE_COMPLETE_RE.search(line)
             if match:
+                saw_phase = True
                 _record_phase(build, match.group(1), match.group(2))
 
-        exit_code = container.wait().get("StatusCode", 1)
-        _finish_build(build, "SUCCEEDED" if exit_code == 0 else "FAILED")
+        if timed_out.is_set():
+            _record_phase(build, build.get("currentPhase") or "BUILD", "TIMED_OUT")
+            _finish_build(build, "FAILED")
+        else:
+            exit_code = container.wait().get("StatusCode", 1)
+            _finish_build(build, "SUCCEEDED" if exit_code == 0 else "FAILED")
         logger.info("Build %s finished: %s", build_id, build["buildStatus"])
     except Exception:
-        logger.exception("Build %s failed while running", build_id)
-        _finish_build(build, "FAULT")
+        if timed_out.is_set():
+            _record_phase(build, build.get("currentPhase") or "BUILD", "TIMED_OUT")
+            _finish_build(build, "FAILED")
+        else:
+            logger.exception("Build %s failed while running", build_id)
+            _finish_build(build, "FAULT")
     finally:
+        timeout.cancel()
+        if not saw_phase:
+            logger.warning(
+                "Build %s produced no 'Phase complete' lines; %s may not report "
+                "phases in this format", build_id, AGENT_IMAGE
+            )
         try:
             container.remove(force=True)
         except Exception:

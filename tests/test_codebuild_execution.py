@@ -7,6 +7,7 @@ Docker client is faked here: these cover the build bookkeeping around the agent
 
 import json
 import os
+import time
 
 from ministack.services import codebuild
 
@@ -181,6 +182,102 @@ def test_execute_build_without_buildspec_never_starts_agent(monkeypatch, tmp_pat
 
     assert build["buildStatus"] == "FAILED"
     assert docker.containers.image is None
+
+
+def test_execute_build_times_out_per_project_timeout(monkeypatch, tmp_path):
+    """A build past timeoutInMinutes is stopped and reported, not left running."""
+    class _HangingContainer(_FakeContainer):
+        def logs(self, **_kwargs):
+            # Ends only once the timeout fired and "removed" the container.
+            while not self.removed:
+                time.sleep(0.01)
+            return iter(())
+
+    container = _HangingContainer([])
+    monkeypatch.setattr(codebuild, "_get_docker", lambda: _FakeDocker(container))
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+    monkeypatch.setattr(codebuild, "_timeout_seconds", lambda _project: 0.2)
+
+    project = _project()
+    build = _seed_build(project, "demo:0006")
+
+    codebuild._execute_build("demo:0006", project)
+
+    assert build["buildStatus"] == "FAILED"
+    assert "TIMED_OUT" in [p.get("phaseStatus") for p in build["phases"]]
+
+
+def test_timeout_seconds_uses_the_project_value(monkeypatch):
+    assert codebuild._timeout_seconds({"timeoutInMinutes": 5}) == 300
+    assert codebuild._timeout_seconds({}) == 3600
+    assert codebuild._timeout_seconds({"timeoutInMinutes": "bogus"}) == 3600
+
+
+def test_env_file_points_the_build_at_ministack(monkeypatch, tmp_path):
+    """A build's AWS calls should reach this emulator, not real AWS."""
+    monkeypatch.setattr(codebuild, "_aws_endpoint", lambda: "http://172.17.0.1:4566")
+
+    project = _project()
+    build = _seed_build(project, "demo:0007")
+    env_file = tmp_path / "env.list"
+
+    codebuild._write_env_file(str(env_file), project, build)
+
+    lines = env_file.read_text(encoding="utf-8").splitlines()
+    assert "AWS_ENDPOINT_URL=http://172.17.0.1:4566" in lines
+    assert "AWS_ACCESS_KEY_ID=test" in lines
+
+
+def test_env_file_keeps_an_endpoint_the_project_declared(monkeypatch, tmp_path):
+    monkeypatch.setattr(codebuild, "_aws_endpoint", lambda: "http://172.17.0.1:4566")
+
+    project = _project()
+    project["environment"]["environmentVariables"].append(
+        {"name": "AWS_ENDPOINT_URL", "value": "https://real.aws"}
+    )
+    build = _seed_build(project, "demo:0008")
+    env_file = tmp_path / "env.list"
+
+    codebuild._write_env_file(str(env_file), project, build)
+
+    lines = env_file.read_text(encoding="utf-8").splitlines()
+    assert "AWS_ENDPOINT_URL=https://real.aws" in lines
+    assert "AWS_ENDPOINT_URL=http://172.17.0.1:4566" not in lines
+
+
+def test_log_stream_is_capped(monkeypatch, tmp_path):
+    from ministack.services import cloudwatch_logs as cwl
+
+    monkeypatch.setattr(codebuild, "MAX_LOG_EVENTS", 5)
+
+    project = _project()
+    build = _seed_build(project, "demo:0009")
+    emit = codebuild._log_sink(build)
+    for i in range(20):
+        emit(f"line {i}")
+
+    stream = cwl._log_groups[build["logs"]["groupName"]]["streams"][build["logs"]["streamName"]]
+    messages = [event["message"] for event in stream["events"]]
+    assert len(messages) == 5
+    assert messages[-1] == "line 19"
+
+
+def test_restored_in_flight_builds_are_not_left_running():
+    """A build cannot survive a restart, so it must not restore as IN_PROGRESS."""
+    codebuild.restore_state({
+        "projects": {},
+        "builds": {"demo:0010": {
+            "id": "demo:0010",
+            "projectName": "demo",
+            "buildStatus": "IN_PROGRESS",
+            "currentPhase": "BUILD",
+        }},
+    })
+
+    restored = codebuild._builds["demo:0010"]
+    assert restored["buildStatus"] == "FAULT"
+    assert restored["currentPhase"] == "COMPLETED"
+    assert "endTime" in restored
 
 
 def test_execute_build_without_docker_reports_fault(monkeypatch, tmp_path):
