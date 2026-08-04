@@ -61,7 +61,7 @@ _destinations = AccountRegionScopedDict()
 _metric_filters = AccountRegionScopedDict()
 # (log_group_name, filter_name) -> {filterName, logGroupName, filterPattern, metricTransformations, creationTime}
 
-_queries = AccountScopedDict()
+_queries = AccountRegionScopedDict()
 # query_id -> {queryId, logGroupName, startTime, endTime, queryString, status}
 
 _delivery_sources = AccountRegionScopedDict()
@@ -116,6 +116,19 @@ def _metric_filter_restore_region(account_id: str, key, value) -> str:
     )
 
 
+def _query_restore_region(account_id: str, value) -> str:
+    if isinstance(value, dict):
+        group_names = []
+        if value.get("logGroupName"):
+            group_names.append(value["logGroupName"])
+        group_names.extend(value.get("logGroupNames") or [])
+        for group_name in group_names:
+            region = _region_for_log_group(account_id, group_name)
+            if region:
+                return region
+    return get_region()
+
+
 def _restore_metric_filters(metric_filters):
     if isinstance(metric_filters, AccountRegionScopedDict):
         _metric_filters.update(metric_filters)
@@ -132,12 +145,31 @@ def _restore_metric_filters(metric_filters):
             _metric_filters.set_scoped(account_id, region, key, value)
 
 
+def _restore_queries(queries):
+    if isinstance(queries, AccountRegionScopedDict):
+        _queries.update(queries)
+        return
+    if isinstance(queries, AccountScopedDict):
+        for (account_id, key), value in queries._data.items():
+            _queries.set_scoped(account_id, _query_restore_region(account_id, value), key, value)
+        return
+    if isinstance(queries, dict):
+        account_id = get_account_id()
+        for key, value in queries.items():
+            if isinstance(key, tuple) and len(key) == 3:
+                _queries.set_scoped(key[0], key[1], key[2], value)
+            elif isinstance(key, tuple) and len(key) == 2:
+                _queries.set_scoped(key[0], _query_restore_region(key[0], value), key[1], value)
+            else:
+                _queries.set_scoped(account_id, _query_restore_region(account_id, value), key, value)
+
+
 def restore_state(data):
     if data:
         _log_groups.update(data.get("log_groups", {}))
         _destinations.update(data.get("destinations", {}))
         _restore_metric_filters(data.get("metric_filters", {}))
-        _queries.update(data.get("queries", {}))
+        _restore_queries(data.get("queries", {}))
         _delivery_sources.update(data.get("delivery_sources", {}))
         _delivery_destinations.update(data.get("delivery_destinations", {}))
         _deliveries.update(data.get("deliveries", {}))

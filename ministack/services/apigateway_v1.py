@@ -74,7 +74,14 @@ Control plane endpoints implemented:
 
 Data plane:
   Requests to /{apiId}.execute-api.localhost/{stage}/{path} are dispatched
-  when api_id is found in _rest_apis.
+  when api_id is found in the ambient account. The mock host pattern has no
+  region segment, so unsigned execute-api requests resolve the REST API's
+  owning region by API id and run the invocation in that scope.
+
+Custom domains:
+  REGIONAL and EDGE records are both keyed per region in MiniStack. EDGE
+  global name uniqueness is not enforced because MiniStack does not route
+  data-plane requests by custom domain host today.
 """
 
 import asyncio
@@ -82,7 +89,6 @@ import base64
 import datetime
 import json
 import logging
-import os
 import re
 import time
 import urllib.error
@@ -92,7 +98,13 @@ import urllib.request
 import yaml
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    AccountScopedDict,
+    get_account_id,
+    get_region,
+    new_uuid,
+)
 from ministack.services.apigateway import _timeout_from_env, _urlopen_async
 
 
@@ -105,30 +117,24 @@ def _now_unix():
 logger = logging.getLogger("apigateway_v1")
 _PROXY_TIMEOUT_SECONDS = _timeout_from_env("MINISTACK_APIGW_PROXY_TIMEOUT_SECONDS", 30.0)
 
-REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
-
 # ---- Module-level state ----
-# All per-tenant state uses AccountScopedDict so the same REST API id in two
-# different accounts never collides and list operations don't leak cross-account.
-_rest_apis = AccountScopedDict()           # rest_api_id -> RestApi
-_rest_api_regions = AccountScopedDict()    # rest_api_id -> owning region
-_resources = AccountScopedDict()           # rest_api_id -> {resource_id -> Resource}
-_stages_v1 = AccountScopedDict()           # rest_api_id -> {stage_name -> Stage}
-_deployments_v1 = AccountScopedDict()      # rest_api_id -> {deployment_id -> Deployment}
-_authorizers_v1 = AccountScopedDict()      # rest_api_id -> {authorizer_id -> Authorizer}
-_models = AccountScopedDict()              # rest_api_id -> {model_id -> Model}
-_api_keys = AccountScopedDict()            # key_id -> ApiKey
-_api_key_regions = AccountScopedDict()     # key_id -> owning region
-_usage_plans = AccountScopedDict()         # plan_id -> UsagePlan
-_usage_plan_regions = AccountScopedDict()  # plan_id -> owning region
-_usage_plan_keys = AccountScopedDict()     # plan_id -> {key_id -> UsagePlanKey}
-_domain_names = AccountScopedDict()        # domain_name -> DomainName
-_domain_name_regions = AccountScopedDict()  # domain_name -> owning region
-_base_path_mappings = AccountScopedDict()  # domain_name -> {base_path -> BasePathMapping}
+# Per-resource state is scoped by account and region so same identifiers in
+# different regions do not collide or leak through control-plane list/get calls.
+_rest_apis = AccountRegionScopedDict()           # rest_api_id -> RestApi
+_resources = AccountRegionScopedDict()           # rest_api_id -> {resource_id -> Resource}
+_stages_v1 = AccountRegionScopedDict()           # rest_api_id -> {stage_name -> Stage}
+_deployments_v1 = AccountRegionScopedDict()      # rest_api_id -> {deployment_id -> Deployment}
+_authorizers_v1 = AccountRegionScopedDict()      # rest_api_id -> {authorizer_id -> Authorizer}
+_models = AccountRegionScopedDict()              # rest_api_id -> {model_id -> Model}
+_api_keys = AccountRegionScopedDict()            # key_id -> ApiKey
+_usage_plans = AccountRegionScopedDict()         # plan_id -> UsagePlan
+_usage_plan_keys = AccountRegionScopedDict()     # plan_id -> {key_id -> UsagePlanKey}
+_domain_names = AccountRegionScopedDict()        # domain_name -> DomainName
+_base_path_mappings = AccountRegionScopedDict()  # domain_name -> {base_path -> BasePathMapping}
 _v1_tags = AccountScopedDict()             # resource_arn -> {key -> value}
-_account_settings = AccountScopedDict()    # singleton per account: stores fields set via UpdateAccount
-_gateway_responses = AccountScopedDict()   # rest_api_id -> {response_type -> customized GatewayResponse}
-_documentation_parts = AccountScopedDict()  # rest_api_id -> {part_id -> DocumentationPart}
+_account_settings = AccountRegionScopedDict()    # singleton per account+region: stores fields set via UpdateAccount
+_gateway_responses = AccountRegionScopedDict()   # rest_api_id -> {response_type -> customized GatewayResponse}
+_documentation_parts = AccountRegionScopedDict()  # rest_api_id -> {part_id -> DocumentationPart}
 
 
 _GATEWAY_RESPONSE_TYPES = (
@@ -657,19 +663,15 @@ def get_state():
     import copy
     return {
         "rest_apis": copy.deepcopy(_rest_apis),
-        "rest_api_regions": copy.deepcopy(_rest_api_regions),
         "resources": copy.deepcopy(_resources),
         "stages_v1": copy.deepcopy(_stages_v1),
         "deployments_v1": copy.deepcopy(_deployments_v1),
         "authorizers_v1": copy.deepcopy(_authorizers_v1),
         "models": copy.deepcopy(_models),
         "api_keys": copy.deepcopy(_api_keys),
-        "api_key_regions": copy.deepcopy(_api_key_regions),
         "usage_plans": copy.deepcopy(_usage_plans),
-        "usage_plan_regions": copy.deepcopy(_usage_plan_regions),
         "usage_plan_keys": copy.deepcopy(_usage_plan_keys),
         "domain_names": copy.deepcopy(_domain_names),
-        "domain_name_regions": copy.deepcopy(_domain_name_regions),
         "base_path_mappings": copy.deepcopy(_base_path_mappings),
         "v1_tags": copy.deepcopy(_v1_tags),
         "account_settings": copy.deepcopy(_account_settings),
@@ -721,61 +723,139 @@ def _region_from_rest_api_record(api_id, _rest_api, account_id):
     return _region_from_existing_tag_arn(account_id, f"/restapis/{api_id}") or get_region()
 
 
-def _backfill_tag_region_map(resource_store, region_store, region_for_item):
-    # State files written before these side maps existed still need to resolve
-    # tag-resource ARNs for resources that already exist.
-    if isinstance(resource_store, AccountScopedDict) and isinstance(region_store, AccountScopedDict):
-        for scoped_key, value in resource_store._data.items():
-            account_id, key = scoped_key
-            region_store._data.setdefault(scoped_key, region_for_item(key, value, account_id))
+def _legacy_account_items(restored):
+    if isinstance(restored, AccountScopedDict):
+        return restored._data.items()
+    if isinstance(restored, dict):
+        account_id = get_account_id()
+        return [((account_id, key), value) for key, value in restored.items()]
+    return ()
+
+
+def _legacy_region(region_store, account_id, key):
+    if isinstance(region_store, AccountScopedDict):
+        return region_store.get_scoped(account_id, None, key)
+    if isinstance(region_store, dict):
+        return region_store.get(key)
+    return None
+
+
+def _restore_top_level_store(store, restored, region_store, region_for_item):
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return {}
+
+    regions = {}
+    for (account_id, key), value in _legacy_account_items(restored):
+        region = _legacy_region(region_store, account_id, key)
+        if not region:
+            region = region_for_item(key, value, account_id)
+        store.set_scoped(account_id, region, key, value)
+        regions[(account_id, key)] = region
+    return regions
+
+
+def _restore_child_store(store, restored, parent_regions, parent_name_from_key=lambda key: key):
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
         return
-    for key, value in resource_store.items():
-        region_store.setdefault(key, region_for_item(key, value, get_account_id()))
+
+    boot_region = get_region()
+    for (account_id, key), value in _legacy_account_items(restored):
+        parent_name = parent_name_from_key(key)
+        region = parent_regions.get((account_id, parent_name), boot_region)
+        store.set_scoped(account_id, region, key, value)
+
+
+def find_api_scope(api_id):
+    """Return (account_id, region) owning api_id within the ambient account."""
+    account_id = get_account_id()
+    for (stored_account, region, stored_api_id), _api in _rest_apis.all_items():
+        if stored_account == account_id and stored_api_id == api_id:
+            return stored_account, region
+    return None
+
+
+def stages_for_api(api_id):
+    """Return stages for api_id after resolving the v1 data-plane owner scope."""
+    scope = find_api_scope(api_id)
+    if scope is None:
+        return {}
+    account_id, region = scope
+    return _stages_v1.get_scoped(account_id, region, api_id, {})
 
 
 def load_persisted_state(data):
     """Restore module state from a previously persisted snapshot."""
-    _rest_apis.update(data.get("rest_apis", {}))
-    _rest_api_regions.update(data.get("rest_api_regions", {}))
-    _resources.update(data.get("resources", {}))
-    _stages_v1.update(data.get("stages_v1", {}))
-    _deployments_v1.update(data.get("deployments_v1", {}))
-    _authorizers_v1.update(data.get("authorizers_v1", {}))
-    _models.update(data.get("models", {}))
-    _api_keys.update(data.get("api_keys", {}))
-    _api_key_regions.update(data.get("api_key_regions", {}))
-    _usage_plans.update(data.get("usage_plans", {}))
-    _usage_plan_regions.update(data.get("usage_plan_regions", {}))
-    _usage_plan_keys.update(data.get("usage_plan_keys", {}))
-    _domain_names.update(data.get("domain_names", {}))
-    _domain_name_regions.update(data.get("domain_name_regions", {}))
-    _base_path_mappings.update(data.get("base_path_mappings", {}))
+    if not data:
+        return
+
     _v1_tags.update(data.get("v1_tags", {}))
-    _account_settings.update(data.get("account_settings", {}))
-    _gateway_responses.update(data.get("gateway_responses", {}))
-    _documentation_parts.update(data.get("documentation_parts", {}))
-    _backfill_tag_region_map(_rest_apis, _rest_api_regions, _region_from_rest_api_record)
-    _backfill_tag_region_map(_api_keys, _api_key_regions, _region_from_api_key_record)
-    _backfill_tag_region_map(_usage_plans, _usage_plan_regions, _region_from_usage_plan_record)
-    _backfill_tag_region_map(_domain_names, _domain_name_regions, _region_from_domain_name_record)
+    api_regions = _restore_top_level_store(
+        _rest_apis,
+        data.get("rest_apis", {}),
+        data.get("rest_api_regions", {}),
+        _region_from_rest_api_record,
+    )
+    plan_regions = _restore_top_level_store(
+        _usage_plans,
+        data.get("usage_plans", {}),
+        data.get("usage_plan_regions", {}),
+        _region_from_usage_plan_record,
+    )
+    _restore_top_level_store(
+        _api_keys,
+        data.get("api_keys", {}),
+        data.get("api_key_regions", {}),
+        _region_from_api_key_record,
+    )
+    domain_regions = _restore_top_level_store(
+        _domain_names,
+        data.get("domain_names", {}),
+        data.get("domain_name_regions", {}),
+        _region_from_domain_name_record,
+    )
+
+    if not api_regions:
+        api_regions = {
+            (account_id, api_id): region
+            for (account_id, region, api_id), _api in _rest_apis.all_items()
+        }
+    if not plan_regions:
+        plan_regions = {
+            (account_id, plan_id): region
+            for (account_id, region, plan_id), _plan in _usage_plans.all_items()
+        }
+    if not domain_regions:
+        domain_regions = {
+            (account_id, domain_name): region
+            for (account_id, region, domain_name), _domain in _domain_names.all_items()
+        }
+
+    _restore_child_store(_resources, data.get("resources", {}), api_regions)
+    _restore_child_store(_stages_v1, data.get("stages_v1", {}), api_regions)
+    _restore_child_store(_deployments_v1, data.get("deployments_v1", {}), api_regions)
+    _restore_child_store(_authorizers_v1, data.get("authorizers_v1", {}), api_regions)
+    _restore_child_store(_models, data.get("models", {}), api_regions)
+    _restore_child_store(_gateway_responses, data.get("gateway_responses", {}), api_regions)
+    _restore_child_store(_documentation_parts, data.get("documentation_parts", {}), api_regions)
+    _restore_child_store(_usage_plan_keys, data.get("usage_plan_keys", {}), plan_regions)
+    _restore_child_store(_base_path_mappings, data.get("base_path_mappings", {}), domain_regions)
+    _restore_child_store(_account_settings, data.get("account_settings", {}), {})
 
 
 def reset():
     """Clear all module state."""
     _rest_apis.clear()
-    _rest_api_regions.clear()
     _resources.clear()
     _stages_v1.clear()
     _deployments_v1.clear()
     _authorizers_v1.clear()
     _models.clear()
     _api_keys.clear()
-    _api_key_regions.clear()
     _usage_plans.clear()
-    _usage_plan_regions.clear()
     _usage_plan_keys.clear()
     _domain_names.clear()
-    _domain_name_regions.clear()
     _base_path_mappings.clear()
     _v1_tags.clear()
     _account_settings.clear()
@@ -1093,6 +1173,29 @@ async def handle_request(method, path, headers, body, query_params):
 
 async def handle_execute(api_id, stage_name, method, path, headers, body, query_params):
     """Execute a v1 REST API request through a deployed stage (data plane)."""
+    scope = find_api_scope(api_id)
+    if scope is None:
+        return 404, {"Content-Type": "application/json"}, json.dumps({"message": "Not Found"}).encode()
+    owner_account_id, owner_region = scope
+
+    from ministack.core.responses import _request_account_id, _request_region
+
+    account_token = _request_account_id.set(owner_account_id)
+    region_token = _request_region.set(owner_region)
+    try:
+        return await _handle_execute_in_scope(
+            api_id, stage_name, method, path, headers, body, query_params,
+            owner_account_id, owner_region,
+        )
+    finally:
+        _request_account_id.reset(account_token)
+        _request_region.reset(region_token)
+
+
+async def _handle_execute_in_scope(
+    api_id, stage_name, method, path, headers, body, query_params,
+    owner_account_id, owner_region,
+):
     api = _rest_apis.get(api_id)
     if not api:
         return 404, {"Content-Type": "application/json"}, json.dumps({"message": "Not Found"}).encode()
@@ -1124,8 +1227,8 @@ async def handle_execute(api_id, stage_name, method, path, headers, body, query_
         return await _invoke_lambda_proxy_v1(
             integration, api_id, stage_name, stage, resource, path, method,
             headers, body, query_params, path_params,
-            owner_account_id=get_account_id(),
-            owner_region=_rest_api_regions.get(api_id, get_region()),
+            owner_account_id=owner_account_id,
+            owner_region=owner_region,
             binary_media_types=api.get("binaryMediaTypes") or [],
         )
     elif int_type in ("HTTP_PROXY", "HTTP"):
@@ -1406,7 +1509,9 @@ def _resolve_custom_rest_api_id(tags: dict) -> tuple[str | None, tuple | None]:
     custom = tags.get("ms-custom-id")
     if not custom:
         return None, None
-    if custom in _rest_apis:
+    # Execute-api hosts identify REST APIs by id without a region segment, so
+    # caller-pinned ids must stay unique across every region in this account.
+    if find_api_scope(custom) is not None:
         return None, _v1_error(
             "ConflictException",
             f"REST API id '{custom}' (from ms-custom-id tag) is already in use",
@@ -1436,7 +1541,6 @@ def _create_rest_api(data):
         "disableExecuteApiEndpoint": data.get("disableExecuteApiEndpoint", False),
     }
     _rest_apis[api_id] = api
-    _rest_api_regions[api_id] = get_region()
     _resources[api_id] = {}
     _stages_v1[api_id] = {}
     _deployments_v1[api_id] = {}
@@ -1484,7 +1588,6 @@ def _delete_rest_api(api_id):
     if api_id not in _rest_apis:
         return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
     _rest_apis.pop(api_id, None)
-    _rest_api_regions.pop(api_id, None)
     _resources.pop(api_id, None)
     _stages_v1.pop(api_id, None)
     _deployments_v1.pop(api_id, None)
@@ -1759,7 +1862,7 @@ def _build_api_export(api_id, stage_name, export_type, include_integrations):
         if exported_methods:
             paths[resource.get("path", "/")] = exported_methods
 
-    region = _rest_api_regions.get(api_id) or get_region()
+    region = get_region()
     execute_url = f"https://{api_id}.execute-api.{region}.amazonaws.com/{stage_name}"
     if export_type == "oas30":
         components = {"schemas": schemas}
@@ -2553,7 +2656,6 @@ def _create_api_key(data):
         "tags": data.get("tags", {}),
     }
     _api_keys[key_id] = api_key
-    _api_key_regions[key_id] = get_region()
     return _v1_response(api_key, 201)
 
 
@@ -2582,7 +2684,6 @@ def _delete_api_key(key_id):
     if key_id not in _api_keys:
         return _v1_error("NotFoundException", "Invalid API Key identifier specified", 404)
     _api_keys.pop(key_id, None)
-    _api_key_regions.pop(key_id, None)
     return 202, {}, b""
 
 
@@ -2600,7 +2701,6 @@ def _create_usage_plan(data):
         "tags": data.get("tags", {}),
     }
     _usage_plans[plan_id] = plan
-    _usage_plan_regions[plan_id] = get_region()
     _usage_plan_keys[plan_id] = {}
     return _v1_response(plan, 201)
 
@@ -2629,7 +2729,6 @@ def _delete_usage_plan(plan_id):
     if plan_id not in _usage_plans:
         return _v1_error("NotFoundException", "Invalid Usage Plan identifier specified", 404)
     _usage_plans.pop(plan_id, None)
-    _usage_plan_regions.pop(plan_id, None)
     _usage_plan_keys.pop(plan_id, None)
     return 202, {}, b""
 
@@ -2699,7 +2798,6 @@ def _create_domain_name(data):
         "tags": data.get("tags", {}),
     }
     _domain_names[domain_name] = dn
-    _domain_name_regions[domain_name] = get_region()
     _base_path_mappings[domain_name] = {}
     return _v1_response(dn, 201)
 
@@ -2719,7 +2817,6 @@ def _delete_domain_name(domain_name):
     if domain_name not in _domain_names:
         return _v1_error("NotFoundException", "Invalid domain name identifier specified", 404)
     _domain_names.pop(domain_name, None)
-    _domain_name_regions.pop(domain_name, None)
     _base_path_mappings.pop(domain_name, None)
     return 202, {}, b""
 
@@ -2772,23 +2869,24 @@ def _resolve_v1_tag_resource_arn(resource_arn):
         return None, _v1_error("BadRequestException", "Invalid resource ARN specified", 400)
 
     parts = spec.resource.split("/")
+    account_id = get_account_id()
     if len(parts) == 3 and parts[0] == "" and parts[2]:
         resource_type = parts[1]
         resource_id = parts[2]
         if resource_type == "restapis":
-            if resource_id not in _rest_apis or _rest_api_regions.get(resource_id) != spec.region:
+            if not _rest_apis.contains_scoped(account_id, spec.region, resource_id):
                 return None, _v1_error("NotFoundException", "Invalid API identifier specified", 404)
             return _rest_api_arn(resource_id), None
         if resource_type == "apikeys":
-            if resource_id not in _api_keys or _api_key_regions.get(resource_id) != spec.region:
+            if not _api_keys.contains_scoped(account_id, spec.region, resource_id):
                 return None, _v1_error("NotFoundException", "Invalid resource identifier specified", 404)
             return f"arn:aws:apigateway:{spec.region}::/apikeys/{resource_id}", None
         if resource_type == "usageplans":
-            if resource_id not in _usage_plans or _usage_plan_regions.get(resource_id) != spec.region:
+            if not _usage_plans.contains_scoped(account_id, spec.region, resource_id):
                 return None, _v1_error("NotFoundException", "Invalid resource identifier specified", 404)
             return f"arn:aws:apigateway:{spec.region}::/usageplans/{resource_id}", None
         if resource_type == "domainnames":
-            if resource_id not in _domain_names or _domain_name_regions.get(resource_id) != spec.region:
+            if not _domain_names.contains_scoped(account_id, spec.region, resource_id):
                 return None, _v1_error("NotFoundException", "Invalid resource identifier specified", 404)
             return f"arn:aws:apigateway:{spec.region}::/domainnames/{resource_id}", None
         return None, _v1_error("BadRequestException", "Invalid resource ARN specified", 400)
@@ -2804,9 +2902,8 @@ def _resolve_v1_tag_resource_arn(resource_arn):
         api_id = parts[2]
         stage_name = parts[4]
         if (
-            api_id not in _rest_apis
-            or _rest_api_regions.get(api_id) != spec.region
-            or stage_name not in _stages_v1.get(api_id, {})
+            not _rest_apis.contains_scoped(account_id, spec.region, api_id)
+            or stage_name not in _stages_v1.get_scoped(account_id, spec.region, api_id, {})
         ):
             return None, _v1_error("NotFoundException", "Invalid Stage identifier specified", 404)
         return f"arn:aws:apigateway:{spec.region}::/restapis/{api_id}/stages/{stage_name}", None
