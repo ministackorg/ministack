@@ -1,6 +1,7 @@
 import asyncio
 import gc
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -631,6 +632,229 @@ raise SystemExit(bool(unexpected))
     assert json.loads(result.stdout.strip().splitlines()[-1]) == []
 
 
+def test_asgi_establishes_caller_context_before_first_touch_import(monkeypatch):
+    loaded = {}
+    observed = []
+    sent = []
+
+    class FakeEcs:
+        async def handle_request(self, *_args):
+            return 200, {}, b"{}"
+
+    def import_module(name):
+        if name not in loaded:
+            observed.append((name, get_account_id(), get_region()))
+            loaded[name] = FakeEcs()
+        return loaded[name]
+
+    monkeypatch.setattr(
+        ministack_app, "_resolve_loaded_service_module", loaded.get
+    )
+    monkeypatch.setattr(ministack_app, "_get_module", import_module)
+    monkeypatch.setattr(
+        ministack_app,
+        "_ordinary_request_reset_barriers",
+        LoopLocal(ministack_app._RequestResetBarrier),
+    )
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/",
+        "query_string": b"",
+        "headers": [
+            (b"host", b"ecs.us-west-2.amazonaws.com"),
+            (
+                b"authorization",
+                b"AWS4-HMAC-SHA256 Credential=123456789012/20260804/"
+                b"us-west-2/ecs/aws4_request, SignedHeaders=host;x-amz-target, "
+                b"Signature=test",
+            ),
+            (
+                b"x-amz-target",
+                b"AmazonEC2ContainerServiceV20141113.ListClusters",
+            ),
+            (b"content-type", b"application/x-amz-json-1.1"),
+            (b"content-length", b"2"),
+        ],
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    previous_scope = (get_account_id(), get_region())
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    try:
+        asyncio.run(ministack_app.app(scope, receive, send))
+    finally:
+        set_request_account_id(previous_scope[0])
+        set_request_region(previous_scope[1])
+
+    assert observed == [("ecs", "123456789012", "us-west-2")]
+    assert sent[0]["status"] == 200
+
+
+def test_first_touch_legacy_restore_uses_asgi_caller_context(tmp_path):
+    (tmp_path / "ecs.json").write_text(
+        json.dumps({"task_def_latest": {"legacy-family": 7}})
+    )
+    script = """
+import asyncio
+import json
+
+import ministack.app as app
+
+scope = {
+    "type": "http",
+    "method": "POST",
+    "path": "/",
+    "query_string": b"",
+    "headers": [
+        (b"host", b"ecs.us-west-2.amazonaws.com"),
+        (
+            b"authorization",
+            b"AWS4-HMAC-SHA256 Credential=123456789012/20260804/"
+            b"us-west-2/ecs/aws4_request, SignedHeaders=host;x-amz-target, "
+            b"Signature=test",
+        ),
+        (
+            b"x-amz-target",
+            b"AmazonEC2ContainerServiceV20141113.ListClusters",
+        ),
+        (b"content-type", b"application/x-amz-json-1.1"),
+        (b"content-length", b"2"),
+    ],
+}
+sent = []
+
+async def receive():
+    return {"type": "http.request", "body": b"{}", "more_body": False}
+
+async def send(message):
+    sent.append(message)
+
+asyncio.run(app.app(scope, receive, send))
+
+from ministack.services import ecs
+
+expected = ("123456789012", "us-west-2", "legacy-family")
+default = ("000000000000", "us-east-1", "legacy-family")
+result = {
+    "status": sent[0]["status"],
+    "expected": ecs._task_def_latest._data.get(expected),
+    "default_present": default in ecs._task_def_latest._data,
+}
+print(json.dumps(result))
+raise SystemExit(
+    result != {"status": 200, "expected": 7, "default_present": False}
+)
+"""
+    env = {
+        **os.environ,
+        "PERSIST_STATE": "1",
+        "STATE_DIR": str(tmp_path),
+        "SERVICES": "ecs",
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env=env,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout.strip().splitlines()[-1]) == {
+        "status": 200,
+        "expected": 7,
+        "default_present": False,
+    }
+
+
+def test_services_filter_rejects_without_first_touch_imports():
+    script = """
+import asyncio
+import json
+import sys
+
+import ministack.app as app
+
+async def request(host, target, body=b"{}"):
+    sent = []
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/",
+        "query_string": b"",
+        "headers": [
+            (b"host", host.encode()),
+            (b"x-amz-target", target.encode()),
+            (b"content-type", b"application/x-amz-json-1.1"),
+            (b"content-length", str(len(body)).encode()),
+        ],
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    await app.app(scope, receive, send)
+    return sent[0]["status"]
+
+async def exercise():
+    return [
+        await request("eks.us-east-1.amazonaws.com", "EKS.ListClusters"),
+        await request(
+            "tagging.us-east-1.amazonaws.com",
+            "ResourceGroupsTaggingAPI_20170126.TagResources",
+            json.dumps(
+                {
+                    "ResourceARNList": [
+                        "arn:aws:ecs:us-east-1:000000000000:cluster/disabled"
+                    ],
+                    "Tags": {"owner": "disabled"},
+                }
+            ).encode(),
+        ),
+        await request(
+            "rds-data.us-east-1.amazonaws.com",
+            "RDSDataService.ExecuteStatement",
+        ),
+    ]
+
+statuses = asyncio.run(exercise())
+names = [
+    "ministack.services.eks",
+    "ministack.services.tagging",
+    "ministack.services.ecs",
+    "ministack.services.elasticache",
+    "ministack.services.rds_data",
+    "ministack.services.rds",
+]
+unexpected = [name for name in names if name in sys.modules]
+print(json.dumps({"statuses": statuses, "unexpected": unexpected}))
+raise SystemExit(statuses != [400, 400, 400] or bool(unexpected))
+"""
+    env = {**os.environ, "SERVICES": "dynamodb"}
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env=env,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout.strip().splitlines()[-1]) == {
+        "statuses": [400, 400, 400],
+        "unexpected": [],
+    }
+
+
 def test_first_touch_serialized_import_waits_for_reset_writer(monkeypatch):
     wipe_started = threading.Event()
     release_wipe = threading.Event()
@@ -879,6 +1103,7 @@ def test_sfn_indirect_first_touch_imports_owner_loop_side_after_reset(monkeypatc
     loaded = {}
     order = []
     import_thread_ids = []
+    import_scopes = []
 
     class FakeRds:
         async def handle_request(self, *_args):
@@ -893,6 +1118,7 @@ def test_sfn_indirect_first_touch_imports_owner_loop_side_after_reset(monkeypatc
         if name in loaded:
             return loaded[name]
         import_thread_ids.append(threading.get_ident())
+        import_scopes.append((get_account_id(), get_region()))
         order.append(f"import-{name}")
         loaded[name] = FakeRds()
         return loaded[name]
@@ -927,6 +1153,9 @@ def test_sfn_indirect_first_touch_imports_owner_loop_side_after_reset(monkeypatc
 
     async def exercise():
         loop_thread_id = threading.get_ident()
+        previous_scope = (get_account_id(), get_region())
+        set_request_account_id("123456789012")
+        set_request_region("us-west-2")
         reset = asyncio.create_task(
             ministack_app._reset_all_state_after_service_dispatch_drains()
         )
@@ -954,8 +1183,11 @@ def test_sfn_indirect_first_touch_imports_owner_loop_side_after_reset(monkeypatc
             await asyncio.gather(reset, integration)
         finally:
             stepfunctions._execution_server_loop.reset(token)
+            set_request_account_id(previous_scope[0])
+            set_request_region(previous_scope[1])
 
         assert import_thread_ids == [loop_thread_id]
+        assert import_scopes == [("123456789012", "us-west-2")]
         assert order.index("wipe-finish") < order.index("mutate-rds")
 
     fallback = threading.Timer(1, release_wipe.set)

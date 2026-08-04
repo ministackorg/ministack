@@ -600,6 +600,8 @@ def _ordinary_request_uses_reset_barrier(method, path, headers, body, query_para
     routing_params = _routing_params(method, path, headers, body, query_params)
     service = detect_service(method, path, headers, routing_params)
     if service == "tagging":
+        if service not in SERVICE_HANDLERS:
+            return True
         from ministack.services import tagging
 
         try:
@@ -637,6 +639,8 @@ async def _ensure_reset_admission_owner_modules(module_names) -> None:
 
 def _reset_admission_owner_modules_for_request(service, headers, body):
     """Return serialized owner modules first-touched by one HTTP request."""
+    if service not in SERVICE_HANDLERS:
+        return ()
     if service == "tagging":
         from ministack.services import tagging
 
@@ -1964,17 +1968,8 @@ async def _dispatch_service_request(
     return status, resp_headers, resp_body
 
 
-async def _handle_http_request(
-    method: str,
-    path: str,
-    headers: dict,
-    query_params: dict,
-    request_id: str,
-    receive,
-    send,
-    body=None,
-):
-    """Process one HTTP request after reset admission is decided."""
+def _establish_http_request_context(headers: dict, query_params: dict) -> None:
+    """Establish account and region context before request-time imports."""
     # Set per-request account ID from credentials (multi-tenancy support).
     # If the access key is a 12-digit number, it becomes the account ID.
     access_key = extract_access_key_id(headers, query_params)
@@ -1987,6 +1982,18 @@ async def _handle_http_request(
     # requests carry the credential in query params, not the header.
     set_request_region(extract_region(headers, query_params))
 
+
+async def _handle_http_request(
+    method: str,
+    path: str,
+    headers: dict,
+    query_params: dict,
+    request_id: str,
+    receive,
+    send,
+    body=None,
+):
+    """Process one HTTP request after reset admission is decided."""
     if await _send_if_handled(
         send,
         await _handle_pre_body_request(method, path, headers, query_params, request_id),
@@ -2104,6 +2111,7 @@ async def app(scope, receive, send):
         except UnicodeDecodeError:
             headers[name.decode("latin-1").lower()] = value.decode("latin-1")
 
+    _establish_http_request_context(headers, query_params)
     request_id = str(uuid.uuid4())
 
     if path == "/_ministack/reset":
