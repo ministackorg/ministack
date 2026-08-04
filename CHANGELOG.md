@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **CodeBuild - builds can really run (`MINISTACK_CODEBUILD_EXECUTE=1`)** - `StartBuild` returned a build that was already `SUCCEEDED`, so a pipeline rehearsed against MiniStack reported a pass without a single phase having run, and a buildspec that fails on AWS still looked green locally. With the flag set, `StartBuild` returns `IN_PROGRESS` and the project's inline buildspec is handed to the official AWS CodeBuild local agent (`public.ecr.aws/codebuild/local-builds`), which runs the phases in the project's `environment.image` the way CodeBuild does - the phase semantics come from AWS's own agent instead of a reimplemented executor. `BatchGetBuilds` reflects progress while the build runs: the agent's `Phase complete: <PHASE> State: <STATUS>` lines become `phases` entries, and the container's exit status maps to `SUCCEEDED` / `FAILED`, with `FAULT` when Docker is unreachable. `environment.environmentVariables`, `privilegedMode`, and the `CODEBUILD_BUILD_ID` / `_ARN` / `_NUMBER` / `_INITIATOR` variables reach the build. Default behaviour is unchanged - without the flag builds stay metadata-only. Requires the Docker socket; `MINISTACK_CODEBUILD_AGENT_IMAGE`, `MINISTACK_CODEBUILD_WORKSPACE`, and `MINISTACK_CODEBUILD_SOURCE_PATH` tune the agent image, the workspace, and - for buildspecs that start nested containers bind-mounting `CODEBUILD_SRC_DIR` - the source path shared with the host.
+
 ## [1.4.13] — 2026-08-06
 
 ### Fixed
