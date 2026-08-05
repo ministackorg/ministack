@@ -94,6 +94,11 @@ _deliveries = AccountRegionScopedDict()
 # Populated while an ASGI stream is open; PutLogEvents fans matching events in.
 _live_tail_sessions: dict[str, dict] = {}
 
+# AWS Live Tail: one sessionUpdate per second (empty when idle), and at most
+# 10 buffered sessionUpdate events before the oldest is dropped.
+_LIVE_TAIL_IDLE_SECONDS = 1.0
+_LIVE_TAIL_QUEUE_MAX = 10
+
 
 # ── Persistence ────────────────────────────────────────────
 
@@ -734,12 +739,16 @@ def _fanout_to_live_tail_sessions(group_name: str, stream_name: str, events: lis
         if not matched:
             continue
         queue = session["queue"]
+        item = (matched, False)
         try:
-            queue.put_nowait((matched, False))
+            queue.put_nowait(item)
         except asyncio.QueueFull:
+            # AWS keeps at most 10 LiveTailSessionUpdate events; drop oldest.
             session["sampled"] = True
+            with contextlib.suppress(asyncio.QueueEmpty):
+                queue.get_nowait()
             with contextlib.suppress(asyncio.QueueFull):
-                queue.put_nowait(([], True))
+                queue.put_nowait((matched, True))
 
 
 async def _await_http_disconnect(receive) -> None:
@@ -755,8 +764,8 @@ def _start_live_tail(data):
     Holds the HTTP eventstream open until the client disconnects. Matching
     ``PutLogEvents`` calls fan into ``sessionUpdate`` frames via an asyncio
     queue (same pattern as API Gateway WebSocket outboxes). Idle empty
-    ``sessionUpdate`` frames are emitted on ``MINISTACK_LIVE_TAIL_IDLE_SECONDS``
-    (default 1s) so clients can exercise the idle path.
+    ``sessionUpdate`` frames are emitted once per second (AWS cadence). At most
+    10 updates are buffered; overflow drops the oldest and sets ``sampled``.
     """
     import asyncio
 
@@ -823,8 +832,6 @@ def _start_live_tail(data):
 
     account_id = get_account_id()
     region = get_region()
-    idle_seconds = float(os.environ.get("MINISTACK_LIVE_TAIL_IDLE_SECONDS", "1"))
-    queue_max = max(1, int(os.environ.get("MINISTACK_LIVE_TAIL_QUEUE_MAX", "1000")))
 
     initial_bytes = _es_encode_message(
         {
@@ -842,7 +849,7 @@ def _start_live_tail(data):
 
         # Register before the first await so concurrent PutLogEvents cannot race
         # past sessionStart into a missing session.
-        queue: asyncio.Queue = asyncio.Queue(maxsize=queue_max)
+        queue: asyncio.Queue = asyncio.Queue(maxsize=_LIVE_TAIL_QUEUE_MAX)
         session = {
             "session_id": session_id,
             "account_id": account_id,
@@ -866,7 +873,7 @@ def _start_live_tail(data):
                 get_task = asyncio.create_task(queue.get())
                 done, _pending = await asyncio.wait(
                     {get_task, disconnect_task},
-                    timeout=idle_seconds,
+                    timeout=_LIVE_TAIL_IDLE_SECONDS,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if disconnect_task in done:
