@@ -1945,7 +1945,12 @@ def _query(data):
     scan_forward = data.get("ScanIndexForward", True)
     esk = data.get("ExclusiveStartKey")
     index_name = data.get("IndexName")
-    select = data.get("Select", "ALL_ATTRIBUTES")
+    # A ProjectionExpression / AttributesToGet without an explicit Select is
+    # equivalent to Select=SPECIFIC_ATTRIBUTES (AWS Query docs); only default to
+    # ALL_ATTRIBUTES when no projection is requested.
+    select = data.get("Select")
+    if select is None:
+        select = "SPECIFIC_ATTRIBUTES" if (data.get("ProjectionExpression") or data.get("AttributesToGet")) else "ALL_ATTRIBUTES"
 
     if key_cond and key_conditions:
         return error_response_json("ValidationException", "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {KeyConditions} Expression parameters: {KeyConditionExpression}", 400)
@@ -2222,7 +2227,12 @@ def _scan(data):
     limit = data.get("Limit")
     esk = data.get("ExclusiveStartKey")
     index_name = data.get("IndexName")
-    select = data.get("Select", "ALL_ATTRIBUTES")
+    # A ProjectionExpression / AttributesToGet without an explicit Select is
+    # equivalent to Select=SPECIFIC_ATTRIBUTES (AWS Scan docs); only default to
+    # ALL_ATTRIBUTES when no projection is requested.
+    select = data.get("Select")
+    if select is None:
+        select = "SPECIFIC_ATTRIBUTES" if (data.get("ProjectionExpression") or data.get("AttributesToGet")) else "ALL_ATTRIBUTES"
 
     # Limit must be > 0 when provided (AWS rejects Limit=0).
     if limit is not None and int(limit) <= 0:

@@ -2561,6 +2561,27 @@ def test_lambda_function_concurrency(lam):
     resp2 = lam.get_function_concurrency(FunctionName="qa-lam-concurrency")
     assert resp2.get("ReservedConcurrentExecutions") is None
 
+
+def test_lambda_function_recursion_config(lam):
+    """PutFunctionRecursionConfig / GetFunctionRecursionConfig round-trip; the
+    default is Terminate and a missing function is a ResourceNotFoundException."""
+    code = _zip_lambda("def handler(e,c): return {}")
+    lam.create_function(
+        FunctionName="qa-lam-recursion",
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/r",
+        Handler="index.handler",
+        Code={"ZipFile": code},
+    )
+    assert lam.get_function_recursion_config(FunctionName="qa-lam-recursion")["RecursiveLoop"] == "Terminate"
+    assert lam.put_function_recursion_config(
+        FunctionName="qa-lam-recursion", RecursiveLoop="Allow"
+    )["RecursiveLoop"] == "Allow"
+    assert lam.get_function_recursion_config(FunctionName="qa-lam-recursion")["RecursiveLoop"] == "Allow"
+    with pytest.raises(ClientError) as exc:
+        lam.get_function_recursion_config(FunctionName="does-not-exist")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
 def test_lambda_add_remove_permission(lam):
     """AddPermission / RemovePermission / GetPolicy."""
     code = _zip_lambda("def handler(e,c): return {}")

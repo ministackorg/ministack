@@ -1718,6 +1718,13 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
             if method == "DELETE":
                 return _delete_function_concurrency(func_name)
 
+        # --- Recursion Config ---
+        if sub == "recursion-config":
+            if method == "GET":
+                return _get_function_recursion_config(func_name)
+            if method == "PUT":
+                return _put_function_recursion_config(func_name, data)
+
         # GetFunction
         if method == "GET" and not sub:
             qualifier = _qualifier_from_path_or_query(path_qualifier, query_params)
@@ -5262,6 +5269,40 @@ def _delete_function_concurrency(func_name: str):
         )
     _functions[func_name]["concurrency"] = None
     return 204, {}, b""
+
+
+# ---------------------------------------------------------------------------
+# Recursion Config
+# ---------------------------------------------------------------------------
+
+
+def _get_function_recursion_config(func_name: str):
+    if func_name not in _functions:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Function not found: {_func_arn(func_name)}",
+            404,
+        )
+    loop = _functions[func_name].get("recursive_loop", "Terminate")
+    return json_response({"RecursiveLoop": loop})
+
+
+def _put_function_recursion_config(func_name: str, data: dict):
+    if func_name not in _functions:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Function not found: {_func_arn(func_name)}",
+            404,
+        )
+    value = data.get("RecursiveLoop")
+    if value not in ("Allow", "Terminate"):
+        return error_response_json(
+            "InvalidParameterValueException",
+            "RecursiveLoop must be one of: Allow, Terminate",
+            400,
+        )
+    _functions[func_name]["recursive_loop"] = value
+    return json_response({"RecursiveLoop": value})
 
 
 # ---------------------------------------------------------------------------

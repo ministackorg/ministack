@@ -1194,6 +1194,39 @@ def test_dynamodb_scan_filter(ddb):
     for item in resp["Items"]:
         assert int(item["n"]["N"]) >= 5
 
+def test_dynamodb_scan_projection_expression_without_select(ddb):
+    """ProjectionExpression without Select is equivalent to
+    Select=SPECIFIC_ATTRIBUTES (AWS Scan/Query docs); it must NOT be rejected as
+    incompatible with the default ALL_ATTRIBUTES. Explicit ALL_ATTRIBUTES / COUNT
+    with a ProjectionExpression still errors with the AWS message."""
+    ddb.create_table(
+        TableName="t_pe_no_select",
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    ddb.put_item(TableName="t_pe_no_select", Item={"pk": {"S": "a"}, "keep": {"S": "y"}, "drop": {"S": "n"}})
+
+    # Scan: projection applied, no Select -> succeeds, only projected attr returned.
+    resp = ddb.scan(TableName="t_pe_no_select", ProjectionExpression="pk")
+    assert resp["Count"] == 1
+    assert resp["Items"][0] == {"pk": {"S": "a"}}
+
+    # Query: same rule.
+    q = ddb.query(
+        TableName="t_pe_no_select",
+        KeyConditionExpression="pk = :k",
+        ProjectionExpression="pk",
+        ExpressionAttributeValues={":k": {"S": "a"}},
+    )
+    assert q["Items"][0] == {"pk": {"S": "a"}}
+
+    # Explicit ALL_ATTRIBUTES + ProjectionExpression still rejected, exact AWS message.
+    with pytest.raises(ClientError) as exc:
+        ddb.scan(TableName="t_pe_no_select", ProjectionExpression="pk", Select="ALL_ATTRIBUTES")
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert "Select value ALL_ATTRIBUTES is not compatible with ProjectionExpression" in exc.value.response["Error"]["Message"]
+
 def test_dynamodb_batch_write(ddb):
     ddb.create_table(
         TableName="t_bw",
