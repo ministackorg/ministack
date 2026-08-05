@@ -1991,6 +1991,102 @@ def test_sfn_aws_sdk_ec2_instances_return_sdk_shape(sfn_sync, ec2):
         ec2.terminate_instances(InstanceIds=[instance_id])
 
 
+def test_sfn_aws_sdk_ec2_params_keep_their_sdk_names(sfn_sync, ec2):
+    """EC2 input params are passed through, never acronym-expanded."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    vpc_id = ec2.create_vpc(CidrBlock="10.43.0.0/16")["Vpc"]["VpcId"]
+    group_id = None
+    try:
+        # Effects are read back from EC2, never from the task output: the task reported SUCCEEDED
+        # while changing nothing. Each attribute is set to the opposite of its default, so an
+        # argument that never arrived cannot pass by accident.
+        for param, attribute, value in (("EnableDnsHostnames", "enableDnsHostnames", True),
+                                        ("EnableDnsSupport", "enableDnsSupport", False)):
+            _run_sdk_task(sfn_sync, f"sdk-{attribute.lower()}-{suffix}", "ec2:modifyVpcAttribute",
+                          {"VpcId": vpc_id, param: {"Value": value}})
+            assert ec2.describe_vpc_attribute(
+                VpcId=vpc_id, Attribute=attribute)[param]["Value"] is value
+
+        # Skipping expansion must not skip override table (Description -> GroupDescription)
+        created = _run_sdk_task(sfn_sync, f"sdk-sg-{suffix}", "ec2:createSecurityGroup",
+                                {"GroupName": f"sdk-sg-{suffix}", "Description": "param name check",
+                                 "VpcId": vpc_id})
+        group_id = created["GroupId"]
+        group = ec2.describe_security_groups(GroupIds=[group_id])["SecurityGroups"][0]
+        assert group["VpcId"] == vpc_id
+        assert group["Description"] == "param name check"
+
+        # A list param, whose wire name is the singular locationName (VpcIds -> VpcId.N). That
+        # rename comes from the list-naming path, so it has to survive the expansion being off.
+        described = _run_sdk_task(sfn_sync, f"sdk-vpcs-{suffix}", "ec2:describeVpcs",
+                                  {"VpcIds": [vpc_id]})
+        assert [v["VpcId"] for v in described["Vpcs"]] == [vpc_id]
+    finally:
+        if group_id:
+            ec2.delete_security_group(GroupId=group_id)
+        ec2.delete_vpc(VpcId=vpc_id)
+
+
+def test_sfn_aws_sdk_ec2_param_names_never_need_the_acronym_expansion():
+    """Every param name EC2 accepts, from botocore rather than the handful exercised above.
+
+    For each member the expansion would rename, the wire name is either the name already (so the
+    expansion breaks it) or a third spelling the list-naming path handles (VpcIds -> VpcId.N) --
+    never the expansion itself, so skipping it for EC2 cannot lose anything.
+    """
+    import botocore.session
+
+    from ministack.services.ec2 import _ACTION_MAP
+    from ministack.services.stepfunctions import _sfn_key_to_api_name
+
+    model = botocore.session.get_session().get_service_model("ec2")
+    operations = set(model.operation_names)
+    broken_by_expansion, needs_expansion = set(), set()
+
+    def walk(shape, seen):
+        if shape is None or id(shape) in seen:
+            return
+        seen.add(id(shape))
+        if shape.type_name == "structure":
+            for name, member in shape.members.items():
+                serialized = member.serialization.get("queryName") or member.serialization.get("name")
+                wire = serialized[0].upper() + serialized[1:] if serialized else name
+                expanded = _sfn_key_to_api_name(name)
+                if expanded != name:
+                    if wire == name:
+                        broken_by_expansion.add(name)
+                    elif wire == expanded:
+                        needs_expansion.add(name)
+                walk(member, seen)
+        elif shape.type_name == "list":
+            walk(shape.member, seen)
+        elif shape.type_name == "map":
+            walk(shape.value, seen)
+
+    for action in _ACTION_MAP:
+        if action in operations:
+            walk(model.operation_model(action).input_shape, set())
+    assert not needs_expansion, (
+        f"these EC2 members have the expansion for their wire name, so EC2 must not skip it: "
+        f"{sorted(needs_expansion)}")
+
+    # Make sure we found some: a walk that stops descending still finds 22
+    assert len(broken_by_expansion) >= 25
+
+    # Spot-checks with the expansion each one would have produced.
+    for name, would_become in (("VpcId", "VPCId"),
+                               ("EnableDnsHostnames", "EnableDNSHostnames"),
+                               ("KmsKeyId", "KMSKeyId"),
+                               ("EbsOptimized", "EBSOptimized"),
+                               ("IamInstanceProfile", "IAMInstanceProfile"),
+                               ("NetworkAclId", "NetworkACLId"),
+                               ("PeerVpcId", "PeerVPCId"),
+                               ("Iops", "IOPS"),
+                               ("DnsOptions", "DNSOptions")):
+        assert _sfn_key_to_api_name(name) == would_become     # what EC2 would have been sent
+        assert name in broken_by_expansion, f"{name} is a wire name EC2 accepts as written"
+
+
 def test_sfn_aws_sdk_ec2_vpc_calls_shape_nested_sets(sfn_sync, ec2):
     """VPC calls carry nested *Set structs, which the shaping has to descend without recursing."""
     suffix = _uuid_mod.uuid4().hex[:8]
@@ -6469,6 +6565,61 @@ def test_sfn_map_item_selector_context_path_resolves_array_index(sfn):
         }]
     finally:
         sfn.delete_state_machine(stateMachineArn=sm)
+
+
+def test_sfn_map_parameters_is_the_item_selector(sfn):
+    """A Map's `Parameters` is the legacy `ItemSelector`, applied per item and nothing else.
+
+    Applying it to the state input as well resolved $$.Map.Item.Value before any item existed and
+    left ItemsPath resolving against the item template, so a three-item plan ran once with every
+    field null -- and reported SUCCEEDED, which is how it reaches the next state as an empty id.
+    """
+    uid = _uuid_mod.uuid4().hex[:8]
+    template = {
+        "az_name.$": "$$.Map.Item.Value.az_name",
+        "cidr.$": "$$.Map.Item.Value.cidr",
+        "org_id.$": "$.org_id",              # a state-input path, gone once Parameters is applied
+        "vpc_id.$": "$.vpc.vpc_id",          # nested, so a flattened input cannot satisfy it
+    }
+    state_input = {
+        "org_id": "org-1",
+        "vpc": {"vpc_id": "vpc-123"},
+        "subnet_plan": [{"az_name": "eu-central-1a", "cidr": "10.0.1.0/24"},
+                        {"az_name": "eu-central-1b", "cidr": "10.0.2.0/24"},
+                        {"az_name": "eu-central-1c", "cidr": "10.0.3.0/24"}],
+    }
+    expected = [{"az_name": item["az_name"], "cidr": item["cidr"],
+                 "org_id": "org-1", "vpc_id": "vpc-123"}
+                for item in state_input["subnet_plan"]]
+
+    def run(selector_field):
+        sm = sfn.create_state_machine(
+            name=f"map-{selector_field.lower()}-{uid}",
+            definition=json.dumps({
+                "StartAt": "Fan",
+                "States": {"Fan": {
+                    "Type": "Map",
+                    "ItemsPath": "$.subnet_plan",
+                    selector_field: template,
+                    "Iterator": {"StartAt": "Echo",
+                                 "States": {"Echo": {"Type": "Pass", "End": True}}},
+                    "End": True,
+                }},
+            }),
+            roleArn="arn:aws:iam::000000000000:role/r",
+        )["stateMachineArn"]
+        try:
+            execution = sfn.start_execution(stateMachineArn=sm, name=f"e-{selector_field}-{uid}",
+                                            input=json.dumps(state_input))
+            desc = _wait_sfn(sfn, execution["executionArn"], timeout=10)
+            assert desc["status"] == "SUCCEEDED", f"{selector_field}: {desc.get('cause')}"
+            return json.loads(desc["output"])
+        finally:
+            sfn.delete_state_machine(stateMachineArn=sm)
+
+    # Both spellings are the same field, so they cannot diverge.
+    assert run("Parameters") == expected
+    assert run("ItemSelector") == expected
 
 
 # ---------------------------------------------------------------------------
