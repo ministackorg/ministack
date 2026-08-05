@@ -3358,6 +3358,81 @@ def test_s3_lifecycle_abort_multipart(s3):
     assert resp["Rules"][0]["AbortIncompleteMultipartUpload"]["DaysAfterInitiation"] == 7
 
 
+def test_s3_lifecycle_and_filter_echoes_object_size(s3):
+    """An And operator must echo ObjectSizeGreaterThan (default 0), and a
+    prefixless And must echo an empty Prefix. Real AWS injects both, and the
+    Terraform aws provider's GetBucketLifecycleConfiguration equality waiter
+    (reflect.DeepEqual against the expanded config, which carries
+    ObjectSizeGreaterThan=0 / Prefix="") never converges without them."""
+    bucket = "intg-s3-lc-and-size"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_lifecycle_configuration(
+        Bucket=bucket,
+        LifecycleConfiguration={
+            "Rules": [{
+                "ID": "prefix-tags",
+                "Status": "Enabled",
+                "Filter": {"And": {"Prefix": "logs/", "Tags": [{"Key": "tier", "Value": "ARCHIVE"}]}},
+                "Expiration": {"Days": 90},
+            }]
+        },
+    )
+    and_op = s3.get_bucket_lifecycle_configuration(Bucket=bucket)["Rules"][0]["Filter"]["And"]
+    assert and_op["Prefix"] == "logs/"
+    assert and_op["ObjectSizeGreaterThan"] == 0
+
+    # Prefixless (tags-only) And still echoes Prefix="" and ObjectSizeGreaterThan=0.
+    s3.put_bucket_lifecycle_configuration(
+        Bucket=bucket,
+        LifecycleConfiguration={
+            "Rules": [{
+                "ID": "tags-only",
+                "Status": "Enabled",
+                "Filter": {"And": {"Tags": [{"Key": "a", "Value": "1"}, {"Key": "b", "Value": "2"}]}},
+                "Expiration": {"Days": 10},
+            }]
+        },
+    )
+    and_op = s3.get_bucket_lifecycle_configuration(Bucket=bucket)["Rules"][0]["Filter"]["And"]
+    assert and_op["Prefix"] == ""
+    assert and_op["ObjectSizeGreaterThan"] == 0
+
+
+def test_s3_lifecycle_object_size_round_trip(s3):
+    """Explicit object-size filters round-trip, both inside an And and at the
+    top level of a Filter (previously the parser dropped them)."""
+    bucket = "intg-s3-lc-size-rt"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_lifecycle_configuration(
+        Bucket=bucket,
+        LifecycleConfiguration={
+            "Rules": [{
+                "ID": "and-sizes",
+                "Status": "Enabled",
+                "Filter": {"And": {"Prefix": "p/", "ObjectSizeGreaterThan": 100, "ObjectSizeLessThan": 200}},
+                "Expiration": {"Days": 20},
+            }]
+        },
+    )
+    and_op = s3.get_bucket_lifecycle_configuration(Bucket=bucket)["Rules"][0]["Filter"]["And"]
+    assert and_op["ObjectSizeGreaterThan"] == 100
+    assert and_op["ObjectSizeLessThan"] == 200
+
+    s3.put_bucket_lifecycle_configuration(
+        Bucket=bucket,
+        LifecycleConfiguration={
+            "Rules": [{
+                "ID": "filter-gt",
+                "Status": "Enabled",
+                "Filter": {"ObjectSizeGreaterThan": 500},
+                "Expiration": {"Days": 30},
+            }]
+        },
+    )
+    filt = s3.get_bucket_lifecycle_configuration(Bucket=bucket)["Rules"][0]["Filter"]
+    assert filt["ObjectSizeGreaterThan"] == 500
+
+
 # ============================================================================
 # Object ACL (GetObjectAcl / PutObjectAcl)
 # ============================================================================

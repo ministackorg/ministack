@@ -342,3 +342,73 @@ def test_pipes_restore_legacy_account_scoped_state_uses_pipe_arn_region():
         _pipes.reset()
         set_request_account_id(original_account)
         set_request_region(original_region)
+
+
+def test_pipes_position_is_absolute_across_record_expiry(monkeypatch):
+    """A pipe's read position is an absolute stream position: records aging off
+    the front of the stream must not shift where the pipe resumes."""
+    import time
+
+    from ministack.core.responses import set_request_account_id
+
+    _pipes.reset()
+    _ddb._stream_records.clear()
+    _ddb._stream_trimmed.clear()
+    region_token = _request_region.set("us-east-1")
+    try:
+        set_request_account_id("000000000000")
+        table_name = "PipeTable"
+        source_arn = _stream_arn("us-east-1")
+        target_arn = _topic_arn("us-east-1")
+        pipe_arn = "arn:aws:pipes:us-east-1:000000000000:pipe/PipeName"
+
+        now = time.time()
+        expired = now - _ddb._STREAM_RETENTION_SECONDS - 60
+
+        def _record(seq, created_at):
+            return {
+                "eventID": f"evt-{seq}",
+                "eventSource": "aws:dynamodb",
+                "dynamodb": {"ApproximateCreationDateTime": int(created_at)},
+            }
+
+        _ddb._stream_records[table_name] = [
+            _record(0, expired), _record(1, expired), _record(2, now),
+        ]
+        _pipes._pipes["PipeName"] = {
+            "Name": "PipeName",
+            "Arn": pipe_arn,
+            "Source": source_arn,
+            "Target": target_arn,
+            "CurrentState": "RUNNING",
+            "StartingPosition": "TRIM_HORIZON",
+        }
+        # The pipe had consumed the first record before the other two expired.
+        _pipes._positions[pipe_arn] = 1
+
+        delivered = []
+        monkeypatch.setattr(
+            _pipes, "_publish_record_to_sns",
+            lambda _topic, _pipe, record: delivered.append(record["eventID"]),
+        )
+
+        _pipes._poll_once()
+
+        # Resumes at the trim horizon; the surviving record is delivered once.
+        assert delivered == ["evt-2"]
+        assert _pipes._positions[pipe_arn] == 3
+        _pipes._poll_once()
+        assert delivered == ["evt-2"]
+
+        # A pipe starting now anchors past everything, trimmed records included.
+        assert _pipes._initial_position({
+            "Source": source_arn, "StartingPosition": "LATEST",
+        }) == 3
+        assert _pipes._initial_position({
+            "Source": source_arn, "StartingPosition": "TRIM_HORIZON",
+        }) == 2
+    finally:
+        _request_region.reset(region_token)
+        _pipes.reset()
+        _ddb._stream_records.clear()
+        _ddb._stream_trimmed.clear()

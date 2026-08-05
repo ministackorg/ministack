@@ -227,16 +227,16 @@ def _poll_once():
             if source_spec.account_id != pipe_account_id:
                 continue
 
-            records = stream_records.get_scoped(
-                pipe_account_id, source_spec.region, table_name, []
-            )
-            pos = int(_positions.get(pipe["Arn"], 0))
-            if pos < 0:
-                pos = 0
-            if pos >= len(records):
+            scope = {"account_id": pipe_account_id, "region": source_spec.region}
+            # Positions are absolute stream positions: records expiring off the
+            # front of the stream must not shift a pipe's read position.
+            horizon = _ddb.stream_start_position(table_name, **scope)
+            end = _ddb.stream_end_position(table_name, **scope)
+            pos = max(int(_positions.get(pipe["Arn"], 0)), horizon)
+            if pos >= end:
                 continue
 
-            batch = records[pos:]
+            batch = _ddb.stream_records_since(table_name, pos, end - pos, **scope)
             for rec in batch:
                 _publish_record_to_sns(target_arn, pipe, rec)
             _positions[pipe["Arn"]] = pos + len(batch)
@@ -326,9 +326,7 @@ def _initial_position(pipe: dict) -> int:
     stream_records = getattr(_ddb, "_stream_records", None)
     if stream_records is None:
         return 0
-    records = stream_records.get_scoped(
-        pipe_account_id, source_spec.region, table_name, []
-    )
+    scope = {"account_id": pipe_account_id, "region": source_spec.region}
     if pipe.get("StartingPosition") == "TRIM_HORIZON":
-        return 0
-    return len(records)
+        return _ddb.stream_start_position(table_name, **scope)
+    return _ddb.stream_end_position(table_name, **scope)

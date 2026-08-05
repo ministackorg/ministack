@@ -1833,6 +1833,9 @@ def _matches_subnet_filters(subnet, filters):
         elif name == "subnet-id":
             if subnet["SubnetId"] not in vals:
                 return False
+        elif name in ("cidr-block", "cidr", "cidrBlock"):
+            if subnet["CidrBlock"] not in vals:
+                return False
         elif name == "default-for-az":
             val = "true" if subnet.get("DefaultForAz") else "false"
             if val not in vals:
@@ -2652,8 +2655,38 @@ def _delete_volume(p):
     return _xml(200, "DeleteVolumeResponse", "<return>true</return>")
 
 
+def _volume_matches_filters(vol, filters):
+    """Apply the DescribeVolumes filters, except the tag ones the shared helper handles."""
+    scalars = {
+        "volume-id": vol["VolumeId"],
+        "size": str(vol["Size"]),
+        "status": vol["State"],
+        "volume-type": vol["VolumeType"],
+        "availability-zone": vol["AvailabilityZone"],
+        "snapshot-id": vol.get("SnapshotId") or "",
+        "create-time": vol.get("CreateTime") or "",
+        "encrypted": "true" if vol.get("Encrypted") else "false",
+        "multi-attach-enabled": "true" if vol.get("MultiAttachEnabled") else "false",
+    }
+    for name, value in scalars.items():
+        if filters.get(name) and value not in filters[name]:
+            return False
+    # attachment.* matches when any one attachment matches, like the gateway describes.
+    attachments = vol.get("Attachments", [])
+    for name, key in (("attachment.instance-id", "InstanceId"), ("attachment.device", "Device"),
+                      ("attachment.status", "State"), ("attachment.attach-time", "AttachTime")):
+        if filters.get(name) and not any(a.get(key) in filters[name] for a in attachments):
+            return False
+    if filters.get("attachment.delete-on-termination") and not any(
+            ("true" if a.get("DeleteOnTermination") else "false")
+            in filters["attachment.delete-on-termination"] for a in attachments):
+        return False
+    return True
+
+
 def _describe_volumes(p):
     filter_ids = _parse_member_list(p, "VolumeId")
+    filters = _parse_filters(p)
     if filter_ids:
         for vid in filter_ids:
             if vid not in _volumes:
@@ -2661,6 +2694,10 @@ def _describe_volumes(p):
     items = ""
     for vol in _volumes.values():
         if filter_ids and vol["VolumeId"] not in filter_ids:
+            continue
+        if not _resource_matches_tag_filters(vol["VolumeId"], filters):
+            continue
+        if not _volume_matches_filters(vol, filters):
             continue
         items += f"<item>{_volume_inner_xml(vol)}</item>"
     return _xml(200, "DescribeVolumesResponse", f"<volumeSet>{items}</volumeSet>")

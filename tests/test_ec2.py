@@ -2472,6 +2472,38 @@ def test_ec2_describe_subnets_tags_filters(ec2):
     ec2.delete_vpc(VpcId=vpc_id)
 
 
+def test_ec2_describe_subnets_cidr_block_filter(ec2):
+    """cidr-block, and the cidr/cidrBlock spellings of it, match the CIDR exactly."""
+    vpc_id = ec2.create_vpc(CidrBlock="10.63.0.0/16")["Vpc"]["VpcId"]
+    first = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.63.0.0/20",
+                              AvailabilityZone="us-east-1a")["Subnet"]["SubnetId"]
+    second = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.63.16.0/20",
+                               AvailabilityZone="us-east-1b")["Subnet"]["SubnetId"]
+    in_vpc = {"Name": "vpc-id", "Values": [vpc_id]}
+
+    def subnets(*filters):
+        return sorted(s["SubnetId"] for s in ec2.describe_subnets(Filters=list(filters))["Subnets"])
+
+    # The per-AZ idempotency precheck: ignored, the filter returns the other AZ's subnet too, and a
+    # provisioner adopts it as this AZ's.
+    assert subnets(in_vpc, {"Name": "cidr-block", "Values": ["10.63.16.0/20"]}) == [second]
+    for alias in ("cidr", "cidrBlock"):
+        assert subnets(in_vpc, {"Name": alias, "Values": ["10.63.0.0/20"]}) == [first]
+    # Exact, not enclosing: the VPC's own /16 contains both subnets but is neither subnet's CIDR.
+    assert subnets(in_vpc, {"Name": "cidr-block", "Values": ["10.63.0.0/16"]}) == []
+    assert subnets(in_vpc, {"Name": "cidr-block", "Values": ["10.63.99.0/28"]}) == []
+    # Two values for one name is an OR, and the CIDRs are distinctive enough to filter account-wide.
+    assert subnets({"Name": "cidr-block",
+                    "Values": ["10.63.0.0/20", "10.63.16.0/20"]}) == sorted([first, second])
+    # Control: both subnets really are in the VPC, so the assertions above narrowed the result
+    # rather than emptying it for some unrelated reason.
+    assert subnets(in_vpc) == sorted([first, second])
+
+    ec2.delete_subnet(SubnetId=first)
+    ec2.delete_subnet(SubnetId=second)
+    ec2.delete_vpc(VpcId=vpc_id)
+
+
 def test_ec2_describe_tags_filters(ec2):
     """DescribeTags respects resource-id and key filters."""
     # Create two instances and tag them differently
@@ -2714,6 +2746,68 @@ def test_ebs_attach_detach_volume(ec2):
     desc2 = ec2.describe_volumes(VolumeIds=[vol_id])
     assert desc2["Volumes"][0]["State"] == "available"
     assert desc2["Volumes"][0]["Attachments"] == []
+
+def test_ebs_describe_volumes_honors_filters(ec2):
+    """Filters must narrow the result. Ignoring them returns every volume in the account, so
+    "the volume I tagged for this run" resolves to somebody else's."""
+    tag = _uuid_mod.uuid4().hex[:8]
+    key = f"check-{tag}"          # unique, so other tests' volumes cannot match the tag filters
+    zone = ec2.describe_availability_zones()["AvailabilityZones"][0]["ZoneName"]
+    tagged = ec2.create_volume(
+        AvailabilityZone=zone, Size=77, VolumeType="gp3",
+        TagSpecifications=[{"ResourceType": "volume", "Tags": [{"Key": key, "Value": tag}]}],
+    )["VolumeId"]
+    # A second volume differing in size and type: with the filters ignored it comes back too.
+    spare = ec2.create_volume(AvailabilityZone=zone, Size=79, VolumeType="gp2")["VolumeId"]
+    instance_id = ec2.run_instances(ImageId="ami-00000001", MinCount=1, MaxCount=1,
+                                    )["Instances"][0]["InstanceId"]
+
+    def ids(**kwargs):
+        return sorted(v["VolumeId"] for v in ec2.describe_volumes(**kwargs)["Volumes"])
+
+    try:
+        assert ids(Filters=[{"Name": f"tag:{key}", "Values": [tag]}]) == [tagged]
+        assert ids(Filters=[{"Name": "tag-key", "Values": [key]}]) == [tagged]
+        assert ids(Filters=[{"Name": "size", "Values": ["77"]}]) == [tagged]
+        assert ids(Filters=[{"Name": "volume-id", "Values": [spare]}]) == [spare]
+        assert tagged in ids(Filters=[{"Name": "encrypted", "Values": ["false"]}])
+        # Other tests leave gp2 volumes behind, so this one asserts on membership.
+        by_type = ids(Filters=[{"Name": "volume-type", "Values": ["gp2"]}])
+        assert spare in by_type and tagged not in by_type
+        # Two filter names is an AND, two values for one name an OR.
+        assert ids(Filters=[{"Name": "size", "Values": ["77"]},
+                            {"Name": "volume-type", "Values": ["gp2"]}]) == []
+        assert ids(Filters=[{"Name": "volume-id", "Values": [tagged, spare]}]) == sorted(
+            [tagged, spare])
+        # A filter that matches nothing is an empty list, not "everything".
+        assert ids(Filters=[{"Name": "size", "Values": ["4096"]}]) == []
+
+        # attachment.* matches on any one attachment. The instance's own root volume is attached
+        # too, so these assert on membership rather than an exact list -- except the device, which
+        # only this attachment uses.
+        ec2.attach_volume(VolumeId=tagged, InstanceId=instance_id, Device="/dev/xvdz")
+        attached_here = ids(Filters=[{"Name": "attachment.instance-id", "Values": [instance_id]}])
+        assert tagged in attached_here and spare not in attached_here
+        assert ids(Filters=[{"Name": "attachment.device", "Values": ["/dev/xvdz"]}]) == [tagged]
+        in_use = ids(Filters=[{"Name": "status", "Values": ["in-use"]}])
+        assert tagged in in_use and spare not in in_use
+        assert spare in ids(Filters=[{"Name": "status", "Values": ["available"]}])
+    finally:
+        # Cleanup must not mask a failed assertion above: a volume still attached because an
+        # assertion raised first would fail to delete, and that error would be the one reported.
+        try:
+            ec2.detach_volume(VolumeId=tagged)
+        except ClientError:
+            pass
+        try:
+            ec2.terminate_instances(InstanceIds=[instance_id])
+        except ClientError:
+            pass
+        for volume_id in (tagged, spare):
+            try:
+                ec2.delete_volume(VolumeId=volume_id)
+            except ClientError:
+                pass
 
 def test_ebs_delete_volume(ec2):
     vol = ec2.create_volume(AvailabilityZone="us-east-1a", Size=5, VolumeType="gp2")

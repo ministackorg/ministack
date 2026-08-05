@@ -1718,6 +1718,13 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
             if method == "DELETE":
                 return _delete_function_concurrency(func_name)
 
+        # --- Recursion Config ---
+        if sub == "recursion-config":
+            if method == "GET":
+                return _get_function_recursion_config(func_name)
+            if method == "PUT":
+                return _put_function_recursion_config(func_name, data)
+
         # GetFunction
         if method == "GET" and not sub:
             qualifier = _qualifier_from_path_or_query(path_qualifier, query_params)
@@ -5265,6 +5272,40 @@ def _delete_function_concurrency(func_name: str):
 
 
 # ---------------------------------------------------------------------------
+# Recursion Config
+# ---------------------------------------------------------------------------
+
+
+def _get_function_recursion_config(func_name: str):
+    if func_name not in _functions:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Function not found: {_func_arn(func_name)}",
+            404,
+        )
+    loop = _functions[func_name].get("recursive_loop", "Terminate")
+    return json_response({"RecursiveLoop": loop})
+
+
+def _put_function_recursion_config(func_name: str, data: dict):
+    if func_name not in _functions:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Function not found: {_func_arn(func_name)}",
+            404,
+        )
+    value = data.get("RecursiveLoop")
+    if value not in ("Allow", "Terminate"):
+        return error_response_json(
+            "InvalidParameterValueException",
+            "RecursiveLoop must be one of: Allow, Terminate",
+            400,
+        )
+    _functions[func_name]["recursive_loop"] = value
+    return json_response({"RecursiveLoop": value})
+
+
+# ---------------------------------------------------------------------------
 # Provisioned Concurrency (stubs)
 # ---------------------------------------------------------------------------
 
@@ -5529,7 +5570,17 @@ def _delete_esm(esm_id: str):
             404,
         )
     esm["State"] = "Deleting"
+    _release_esm_poll_state(esm_id)
     return json_response(_esm_response(esm), 202)
+
+
+def _release_esm_poll_state(esm_id: str) -> None:
+    """Drop the poller bookkeeping a deleted ESM leaves behind, so a long-lived
+    container does not accumulate one entry per create/delete cycle."""
+    with _dynamodb_stream_positions_lock:
+        _dynamodb_stream_positions.pop(esm_id, None)
+    _kinesis_positions.pop(esm_id, None)
+    _esm_backoff_until.pop(esm_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -5565,9 +5616,9 @@ def _init_stream_position(esm_id, source_arn, starting):
         if esm_id in _dynamodb_stream_positions:
             return
         if starting == "TRIM_HORIZON":
-            _dynamodb_stream_positions[esm_id] = 0
+            _dynamodb_stream_positions[esm_id] = _ddb.stream_start_position(table_name)
         else:
-            _dynamodb_stream_positions[esm_id] = len(stream_records.get(table_name, []))
+            _dynamodb_stream_positions[esm_id] = _ddb.stream_end_position(table_name)
 
 
 def _ensure_poller():
@@ -5951,8 +6002,9 @@ def _poll_dynamodb_streams():
             table = _ddb._tables.get(table_name)
             if not table or table.get("LatestStreamArn") != source_arn:
                 continue
-            table_records = stream_records.get(table_name, [])
-            if not table_records:
+            horizon = _ddb.stream_start_position(table_name)
+            end = _ddb.stream_end_position(table_name)
+            if end == horizon:
                 continue
 
             esm_id = esm["UUID"]
@@ -5963,13 +6015,16 @@ def _poll_dynamodb_streams():
                 if esm_id not in _dynamodb_stream_positions:
                     starting = esm.get("StartingPosition", "LATEST")
                     if starting == "TRIM_HORIZON":
-                        _dynamodb_stream_positions[esm_id] = 0
+                        _dynamodb_stream_positions[esm_id] = horizon
                     else:
-                        _dynamodb_stream_positions[esm_id] = len(table_records)
-                pos = _dynamodb_stream_positions[esm_id]
+                        _dynamodb_stream_positions[esm_id] = end
+                # Records that expired since the last pass are gone; resume at
+                # the trim horizon rather than replaying from a stale offset.
+                pos = max(_dynamodb_stream_positions[esm_id], horizon)
+                _dynamodb_stream_positions[esm_id] = pos
 
             batch_size = esm.get("BatchSize", 100)
-            batch = table_records[pos:pos + batch_size]
+            batch = _ddb.stream_records_since(table_name, pos, batch_size)
             if not batch:
                 continue
 

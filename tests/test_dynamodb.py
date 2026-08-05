@@ -1194,6 +1194,39 @@ def test_dynamodb_scan_filter(ddb):
     for item in resp["Items"]:
         assert int(item["n"]["N"]) >= 5
 
+def test_dynamodb_scan_projection_expression_without_select(ddb):
+    """ProjectionExpression without Select is equivalent to
+    Select=SPECIFIC_ATTRIBUTES (AWS Scan/Query docs); it must NOT be rejected as
+    incompatible with the default ALL_ATTRIBUTES. Explicit ALL_ATTRIBUTES / COUNT
+    with a ProjectionExpression still errors with the AWS message."""
+    ddb.create_table(
+        TableName="t_pe_no_select",
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    ddb.put_item(TableName="t_pe_no_select", Item={"pk": {"S": "a"}, "keep": {"S": "y"}, "drop": {"S": "n"}})
+
+    # Scan: projection applied, no Select -> succeeds, only projected attr returned.
+    resp = ddb.scan(TableName="t_pe_no_select", ProjectionExpression="pk")
+    assert resp["Count"] == 1
+    assert resp["Items"][0] == {"pk": {"S": "a"}}
+
+    # Query: same rule.
+    q = ddb.query(
+        TableName="t_pe_no_select",
+        KeyConditionExpression="pk = :k",
+        ProjectionExpression="pk",
+        ExpressionAttributeValues={":k": {"S": "a"}},
+    )
+    assert q["Items"][0] == {"pk": {"S": "a"}}
+
+    # Explicit ALL_ATTRIBUTES + ProjectionExpression still rejected, exact AWS message.
+    with pytest.raises(ClientError) as exc:
+        ddb.scan(TableName="t_pe_no_select", ProjectionExpression="pk", Select="ALL_ATTRIBUTES")
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert "Select value ALL_ATTRIBUTES is not compatible with ProjectionExpression" in exc.value.response["Error"]["Message"]
+
 def test_dynamodb_batch_write(ddb):
     ddb.create_table(
         TableName="t_bw",
@@ -6741,3 +6774,101 @@ def test_dynamodb_update_list_append_missing_attr_rejected(ddb):
         assert item["lst"] == {"L": [{"S": "x"}]}
     finally:
         ddb.delete_table(TableName=name)
+
+
+# ---------------------------------------------------------------------------
+# Stream-record retention (white-box: the backlog lives in-process, so these
+# assert against the module rather than over the wire).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def ddb_stream_state():
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import dynamodb as ddb_service
+
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    records = dict(ddb_service._stream_records._data)
+    trimmed = dict(ddb_service._stream_trimmed._data)
+    ddb_service._stream_records._data.clear()
+    ddb_service._stream_trimmed._data.clear()
+    try:
+        yield ddb_service
+    finally:
+        ddb_service._stream_records._data.clear()
+        ddb_service._stream_trimmed._data.clear()
+        ddb_service._stream_records._data.update(records)
+        ddb_service._stream_trimmed._data.update(trimmed)
+
+
+def _stream_record(created_at):
+    return {"dynamodb": {"ApproximateCreationDateTime": int(created_at)}}
+
+
+def test_dynamodb_stream_records_expire_after_retention_window(ddb_stream_state):
+    ddb_service = ddb_stream_state
+    name = "retention-table"
+    now = time.time()
+    ddb_service._stream_records[name] = [
+        _stream_record(now - ddb_service._STREAM_RETENTION_SECONDS - 60),
+        _stream_record(now - ddb_service._STREAM_RETENTION_SECONDS - 30),
+        _stream_record(now),
+    ]
+
+    ddb_service._trim_stream_records(name)
+
+    assert len(ddb_service._stream_records[name]) == 1
+    assert ddb_service.stream_start_position(name) == 2
+    assert ddb_service.stream_end_position(name) == 3
+    # A consumer that was behind the horizon resumes at the oldest live record.
+    assert ddb_service.stream_records_since(name, 0, 10) == [_stream_record(now)]
+
+
+def test_dynamodb_delete_table_releases_stream_records(ddb, ddb_stream_state):
+    ddb_service = ddb_stream_state
+    name = f"stream-drop-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+        StreamSpecification={"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"},
+    )
+    ddb.put_item(TableName=name, Item={"pk": {"S": "k1"}})
+    ddb.delete_table(TableName=name)
+
+    # The emulator under test is the container, so assert through the API the
+    # backlog is gone with the table: recreating it starts from an empty stream.
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+        StreamSpecification={"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"},
+    )
+    try:
+        stream_arn = ddb.describe_table(TableName=name)["Table"]["LatestStreamArn"]
+        streams = _ddb_streams_client("us-east-1")
+        shard = streams.describe_stream(StreamArn=stream_arn)["StreamDescription"]["Shards"][0]
+        it = streams.get_shard_iterator(
+            StreamArn=stream_arn,
+            ShardId=shard["ShardId"],
+            ShardIteratorType="TRIM_HORIZON",
+        )["ShardIterator"]
+        assert streams.get_records(ShardIterator=it)["Records"] == []
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_delete_table_in_process_drops_backlog(ddb_stream_state):
+    ddb_service = ddb_stream_state
+    name = "in-process-drop"
+    ddb_service._stream_records[name] = [_stream_record(time.time())]
+    ddb_service._stream_trimmed[name] = 3
+
+    ddb_service.drop_stream_records(name)
+
+    assert name not in ddb_service._stream_records
+    assert ddb_service.stream_start_position(name) == 0
+    assert ddb_service.stream_end_position(name) == 0

@@ -1308,12 +1308,22 @@ def _get_bucket_lifecycle(name: str):
                 xml += f"<Prefix>{_esc(filt['Prefix'])}</Prefix>"
             if "Tag" in filt:
                 xml += f"<Tag><Key>{_esc(filt['Tag']['Key'])}</Key><Value>{_esc(filt['Tag']['Value'])}</Value></Tag>"
+            if "ObjectSizeGreaterThan" in filt:
+                xml += f"<ObjectSizeGreaterThan>{filt['ObjectSizeGreaterThan']}</ObjectSizeGreaterThan>"
+            if "ObjectSizeLessThan" in filt:
+                xml += f"<ObjectSizeLessThan>{filt['ObjectSizeLessThan']}</ObjectSizeLessThan>"
             if "And" in filt:
+                and_f = filt["And"]
                 xml += "<And>"
-                if "Prefix" in filt["And"]:
-                    xml += f"<Prefix>{_esc(filt['And']['Prefix'])}</Prefix>"
-                for tag in filt["And"].get("Tags", []):
+                # AWS always echoes Prefix (empty when unset) and ObjectSizeGreaterThan
+                # (0 when unset) inside an And operator; omitting either breaks the
+                # aws-sdk-go equality waiter (the provider expands them as "" / 0).
+                xml += f"<Prefix>{_esc(and_f.get('Prefix', ''))}</Prefix>"
+                for tag in and_f.get("Tags", []):
                     xml += f"<Tag><Key>{_esc(tag['Key'])}</Key><Value>{_esc(tag['Value'])}</Value></Tag>"
+                xml += f"<ObjectSizeGreaterThan>{and_f.get('ObjectSizeGreaterThan', 0)}</ObjectSizeGreaterThan>"
+                if and_f.get("ObjectSizeLessThan"):
+                    xml += f"<ObjectSizeLessThan>{and_f['ObjectSizeLessThan']}</ObjectSizeLessThan>"
                 xml += "</And>"
             xml += "</Filter>"
             xml += f"<Status>{rule.get('Status', 'Enabled')}</Status>"
@@ -1401,6 +1411,12 @@ def _put_bucket_lifecycle(name: str, body: bytes):
                 tag_el = _lc_find(filt_el, "Tag")
                 if tag_el is not None:
                     filt["Tag"] = {"Key": _lc_text(tag_el, "Key"), "Value": _lc_text(tag_el, "Value")}
+                f_gt = _lc_text(filt_el, "ObjectSizeGreaterThan")
+                if f_gt:
+                    filt["ObjectSizeGreaterThan"] = int(f_gt)
+                f_lt = _lc_text(filt_el, "ObjectSizeLessThan")
+                if f_lt:
+                    filt["ObjectSizeLessThan"] = int(f_lt)
                 and_el = _lc_find(filt_el, "And")
                 if and_el is not None:
                     and_data: dict = {}
@@ -1412,6 +1428,12 @@ def _put_bucket_lifecycle(name: str, body: bytes):
                         tags.append({"Key": _lc_text(t, "Key"), "Value": _lc_text(t, "Value")})
                     if tags:
                         and_data["Tags"] = tags
+                    gt = _lc_text(and_el, "ObjectSizeGreaterThan")
+                    if gt:
+                        and_data["ObjectSizeGreaterThan"] = int(gt)
+                    lt = _lc_text(and_el, "ObjectSizeLessThan")
+                    if lt:
+                        and_data["ObjectSizeLessThan"] = int(lt)
                     filt["And"] = and_data
             rule["Filter"] = filt
             # Transitions
