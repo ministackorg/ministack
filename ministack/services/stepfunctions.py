@@ -4632,6 +4632,15 @@ _AWS_ACRONYMS = frozenset({
 # Some global-cluster operations are AWS-shape exceptions: their members use
 # "DbClusterIdentifier", and sending "DBClusterIdentifier" is ignored.
 _QUERY_PARAM_NAME_OVERRIDES = {
+    # RDS spells this request member with mixed-case ``Vpc``. The shared
+    # acronym converter expands it to ``VPCSecurityGroupIds``, which the RDS
+    # handler correctly ignores as an unknown Query API parameter.
+    ("rds", "CreateDBCluster"): {
+        "VpcSecurityGroupIds": "VpcSecurityGroupIds",
+    },
+    ("rds", "ModifyDBCluster"): {
+        "VpcSecurityGroupIds": "VpcSecurityGroupIds",
+    },
     ("rds", "RemoveFromGlobalCluster"): {
         "DbClusterIdentifier": "DbClusterIdentifier",
     },

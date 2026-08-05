@@ -429,19 +429,223 @@ def test_rds_start_stop_cluster(rds):
     resp2 = rds.describe_db_clusters(DBClusterIdentifier="ss-cl")
     assert resp2["DBClusters"][0]["Status"] == "available"
 
-def test_rds_modify_subnet_group(rds):
+def test_rds_subnet_group_reflects_ec2_vpc_and_azs(rds, ec2):
+    vpc_id = ec2.create_vpc(CidrBlock="10.70.0.0/16")["Vpc"]["VpcId"]
+    subnet_a = ec2.create_subnet(
+        VpcId=vpc_id,
+        CidrBlock="10.70.1.0/24",
+        AvailabilityZone="us-east-1a",
+    )["Subnet"]["SubnetId"]
+    subnet_b = ec2.create_subnet(
+        VpcId=vpc_id,
+        CidrBlock="10.70.2.0/24",
+        AvailabilityZone="us-east-1b",
+    )["Subnet"]["SubnetId"]
+
+    response = rds.create_db_subnet_group(
+        DBSubnetGroupName="test-reflected-sg",
+        DBSubnetGroupDescription="Test reflected SG",
+        SubnetIds=[subnet_a, subnet_b],
+    )["DBSubnetGroup"]
+
+    assert response["VpcId"] == vpc_id
+    assert {
+        (subnet["SubnetIdentifier"], subnet["SubnetAvailabilityZone"]["Name"])
+        for subnet in response["Subnets"]
+    } == {(subnet_a, "us-east-1a"), (subnet_b, "us-east-1b")}
+
+
+def test_rds_subnet_group_initializes_default_subnets_in_request_scope():
+    scoped_rds = _regional_rds("ap-southeast-5", "333333333333")
+
+    group = scoped_rds.create_db_subnet_group(
+        DBSubnetGroupName="test-scoped-default-sg",
+        DBSubnetGroupDescription="Scoped default subnets",
+        SubnetIds=["subnet-00000001", "subnet-00000002"],
+    )["DBSubnetGroup"]
+
+    assert group["VpcId"] == "vpc-00000001"
+    assert {
+        (subnet["SubnetIdentifier"], subnet["SubnetAvailabilityZone"]["Name"])
+        for subnet in group["Subnets"]
+    } == {
+        ("subnet-00000001", "ap-southeast-5a"),
+        ("subnet-00000002", "ap-southeast-5b"),
+    }
+
+
+@pytest.mark.parametrize("failure", ["missing", "mixed-vpc"])
+def test_rds_create_subnet_group_rejects_invalid_subnets(rds, ec2, failure):
+    vpc_a = ec2.create_vpc(CidrBlock="10.71.0.0/16")["Vpc"]["VpcId"]
+    subnet_a = ec2.create_subnet(
+        VpcId=vpc_a,
+        CidrBlock="10.71.1.0/24",
+        AvailabilityZone="us-east-1a",
+    )["Subnet"]["SubnetId"]
+    subnet_ids = [subnet_a, "subnet-does-not-exist"]
+    if failure == "mixed-vpc":
+        vpc_b = ec2.create_vpc(CidrBlock="10.72.0.0/16")["Vpc"]["VpcId"]
+        subnet_b = ec2.create_subnet(
+            VpcId=vpc_b,
+            CidrBlock="10.72.1.0/24",
+            AvailabilityZone="us-east-1b",
+        )["Subnet"]["SubnetId"]
+        subnet_ids = [subnet_a, subnet_b]
+
+    with pytest.raises(ClientError) as exc_info:
+        rds.create_db_subnet_group(
+            DBSubnetGroupName=f"test-invalid-{failure}",
+            DBSubnetGroupDescription="Test invalid subnet group",
+            SubnetIds=subnet_ids,
+        )
+
+    assert exc_info.value.response["Error"]["Code"] == "InvalidSubnet"
+    assert exc_info.value.response["Error"]["Message"] == (
+        "The requested subnet is invalid, or multiple subnets were requested that "
+        "are not all in a common VPC."
+    )
+
+
+def test_rds_modify_subnet_group(rds, ec2):
+    vpc_id = ec2.create_vpc(CidrBlock="10.73.0.0/16")["Vpc"]["VpcId"]
+    subnets = [
+        ec2.create_subnet(
+            VpcId=vpc_id,
+            CidrBlock=f"10.73.{index}.0/24",
+            AvailabilityZone=f"us-east-1{az}",
+        )["Subnet"]["SubnetId"]
+        for index, az in ((1, "a"), (2, "b"), (3, "c"))
+    ]
     rds.create_db_subnet_group(
         DBSubnetGroupName="test-mod-sg",
         DBSubnetGroupDescription="Test SG",
-        SubnetIds=["subnet-111"],
+        SubnetIds=subnets[:2],
     )
     rds.modify_db_subnet_group(
         DBSubnetGroupName="test-mod-sg",
         DBSubnetGroupDescription="Updated SG",
-        SubnetIds=["subnet-222", "subnet-333"],
+        SubnetIds=subnets[1:],
     )
     resp = rds.describe_db_subnet_groups(DBSubnetGroupName="test-mod-sg")
-    assert resp["DBSubnetGroups"][0]["DBSubnetGroupDescription"] == "Updated SG"
+    group = resp["DBSubnetGroups"][0]
+    assert group["DBSubnetGroupDescription"] == "Updated SG"
+    assert group["VpcId"] == vpc_id
+    assert [subnet["SubnetIdentifier"] for subnet in group["Subnets"]] == subnets[1:]
+
+    with pytest.raises(ClientError) as exc_info:
+        rds.modify_db_subnet_group(
+            DBSubnetGroupName="test-mod-sg",
+            DBSubnetGroupDescription="Should not persist",
+            SubnetIds=[subnets[0], "subnet-does-not-exist"],
+        )
+    assert exc_info.value.response["Error"]["Code"] == "InvalidSubnet"
+
+    unchanged = rds.describe_db_subnet_groups(DBSubnetGroupName="test-mod-sg")
+    assert unchanged["DBSubnetGroups"][0]["DBSubnetGroupDescription"] == "Updated SG"
+
+    before_cross_vpc = unchanged["DBSubnetGroups"][0]
+    other_vpc_id = ec2.create_vpc(CidrBlock="10.74.0.0/16")["Vpc"]["VpcId"]
+    other_subnets = [
+        ec2.create_subnet(
+            VpcId=other_vpc_id,
+            CidrBlock=f"10.74.{index}.0/24",
+            AvailabilityZone=f"us-east-1{az}",
+        )["Subnet"]["SubnetId"]
+        for index, az in ((1, "a"), (2, "b"))
+    ]
+    with pytest.raises(ClientError) as exc_info:
+        rds.modify_db_subnet_group(
+            DBSubnetGroupName="test-mod-sg",
+            DBSubnetGroupDescription="Cross-VPC description must not persist",
+            SubnetIds=other_subnets,
+        )
+    assert exc_info.value.response["Error"]["Code"] == "InvalidSubnet"
+    assert exc_info.value.response["Error"]["Message"] == (
+        "The requested subnet is invalid, or multiple subnets were requested that "
+        "are not all in a common VPC."
+    )
+
+    after_cross_vpc = rds.describe_db_subnet_groups(
+        DBSubnetGroupName="test-mod-sg"
+    )["DBSubnetGroups"][0]
+    assert after_cross_vpc == before_cross_vpc
+
+
+def test_rds_modify_legacy_subnet_group_adopts_resolved_vpc():
+    from copy import deepcopy
+
+    from ministack.services import ec2 as ec2_service
+    from ministack.services import rds as rds_service
+
+    group_name = "test-legacy-mod-sg"
+    vpc_id = "vpc-test-legacy"
+    subnet_ids = [
+        "subnet-test-legacy-a",
+        "subnet-test-legacy-b",
+        "subnet-test-legacy-c",
+    ]
+    other_vpc_id = "vpc-test-legacy-other"
+    other_subnet_ids = [
+        "subnet-test-legacy-other-a",
+        "subnet-test-legacy-other-b",
+    ]
+    all_subnet_ids = subnet_ids + other_subnet_ids
+
+    for index, subnet_id in enumerate(subnet_ids):
+        ec2_service._subnets[subnet_id] = {
+            "SubnetId": subnet_id,
+            "VpcId": vpc_id,
+            "AvailabilityZone": f"us-east-1{chr(ord('a') + index)}",
+        }
+    for index, subnet_id in enumerate(other_subnet_ids):
+        ec2_service._subnets[subnet_id] = {
+            "SubnetId": subnet_id,
+            "VpcId": other_vpc_id,
+            "AvailabilityZone": f"us-east-1{chr(ord('a') + index)}",
+        }
+
+    try:
+        status, _, _ = rds_service._create_subnet_group({
+            "DBSubnetGroupName": group_name,
+            "DBSubnetGroupDescription": "Legacy SG",
+            "SubnetIds.member.1": subnet_ids[0],
+            "SubnetIds.member.2": subnet_ids[1],
+        })
+        assert status == 200
+
+        persisted_groups = rds_service.get_state()["subnet_groups"]
+        persisted_groups[group_name]["VpcId"] = "vpc-00000000"
+        rds_service._subnet_groups.clear()
+        rds_service.restore_state({"subnet_groups": persisted_groups})
+
+        status, _, _ = rds_service._modify_subnet_group({
+            "DBSubnetGroupName": group_name,
+            "DBSubnetGroupDescription": "Upgraded SG",
+            "SubnetIds.member.1": subnet_ids[1],
+            "SubnetIds.member.2": subnet_ids[2],
+        })
+        assert status == 200
+        upgraded = rds_service._subnet_groups[group_name]
+        assert upgraded["VpcId"] == vpc_id
+        assert [
+            subnet["SubnetIdentifier"] for subnet in upgraded["Subnets"]
+        ] == subnet_ids[1:]
+
+        before_cross_vpc = deepcopy(upgraded)
+        status, _, body = rds_service._modify_subnet_group({
+            "DBSubnetGroupName": group_name,
+            "DBSubnetGroupDescription": "Cross-VPC description must not persist",
+            "SubnetIds.member.1": other_subnet_ids[0],
+            "SubnetIds.member.2": other_subnet_ids[1],
+        })
+        assert status == 400
+        assert b"<Code>InvalidSubnet</Code>" in body
+        assert rds_service._subnet_groups[group_name] == before_cross_vpc
+    finally:
+        rds_service._subnet_groups.pop(group_name, None)
+        for subnet_id in all_subnet_ids:
+            ec2_service._subnets.pop(subnet_id, None)
+
 
 def test_rds_snapshot_crud(rds):
     """CreateDBSnapshot / DescribeDBSnapshots / DeleteDBSnapshot."""

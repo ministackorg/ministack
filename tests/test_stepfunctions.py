@@ -4783,11 +4783,30 @@ def test_sfn_aws_sdk_json_pascal_case(sfn, sfn_sync, sm):
     sm.delete_secret(SecretId="sfn-pascal-json-secret", ForceDeleteWithoutRecovery=True)
 
 
-def test_sfn_aws_sdk_query_acronym_param_mapping(sfn, sfn_sync, rds):
+def test_sfn_aws_sdk_query_acronym_param_mapping(sfn, sfn_sync, rds, ec2):
     """SFN aws-sdk query dispatch maps SDK-style param names to wire-format names."""
     import uuid as _uuid
+
+    def normalize_vpc_security_groups(value):
+        # The converter currently collapses singleton wrappers to a dict; keep
+        # this assertion compatible with a future list-fidelity fix.
+        if isinstance(value, list):
+            return value
+        return [value["VpcSecurityGroupMembership"]]
+
     cluster_id = f"acronym-test-{_uuid.uuid4().hex[:8]}"
     sm_name = f"sdk-acronym-{_uuid.uuid4().hex[:8]}"
+    vpc_id = ec2.create_vpc(CidrBlock="10.98.0.0/16")["Vpc"]["VpcId"]
+    create_sg_id = ec2.create_security_group(
+        GroupName=f"{sm_name}-create",
+        Description="SFN RDS create cluster security group",
+        VpcId=vpc_id,
+    )["GroupId"]
+    modify_sg_id = ec2.create_security_group(
+        GroupName=f"{sm_name}-modify",
+        Description="SFN RDS modify cluster security group",
+        VpcId=vpc_id,
+    )["GroupId"]
 
     definition = json.dumps({
         "StartAt": "CreateCluster",
@@ -4800,8 +4819,19 @@ def test_sfn_aws_sdk_query_acronym_param_mapping(sfn, sfn_sync, rds):
                     "Engine": "aurora-postgresql",
                     "MasterUsername": "admin",
                     "MasterUserPassword": "testpass123",
+                    "VpcSecurityGroupIds": [create_sg_id],
                 },
                 "ResultPath": "$.createResult",
+                "Next": "ModifyCluster",
+            },
+            "ModifyCluster": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:rds:modifyDBCluster",
+                "Parameters": {
+                    "DbClusterIdentifier": cluster_id,
+                    "VpcSecurityGroupIds": [modify_sg_id],
+                },
+                "ResultPath": "$.modifyResult",
                 "Next": "DescribeClusters",
             },
             "DescribeClusters": {
@@ -4822,15 +4852,42 @@ def test_sfn_aws_sdk_query_acronym_param_mapping(sfn, sfn_sync, rds):
         roleArn="arn:aws:iam::000000000000:role/sfn-role",
     )["stateMachineArn"]
 
-    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
-    assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
-    output = json.loads(resp["output"])
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+        assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+        output = json.loads(resp["output"])
 
-    create_cluster = output["createResult"]["DbCluster"]
-    assert create_cluster["DbClusterIdentifier"] == cluster_id
-    assert create_cluster["Engine"] == "aurora-postgresql"
-
-    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+        create_cluster = output["createResult"]["DbCluster"]
+        assert create_cluster["DbClusterIdentifier"] == cluster_id
+        assert create_cluster["Engine"] == "aurora-postgresql"
+        assert normalize_vpc_security_groups(create_cluster["VpcSecurityGroups"]) == [
+            {
+                "VpcSecurityGroupId": create_sg_id,
+                "Status": "active",
+            },
+        ]
+        assert normalize_vpc_security_groups(
+            output["modifyResult"]["DbCluster"]["VpcSecurityGroups"],
+        ) == [
+            {
+                "VpcSecurityGroupId": modify_sg_id,
+                "Status": "active",
+            },
+        ]
+        assert normalize_vpc_security_groups(
+            output["describeResult"]["DbClusters"][0]["VpcSecurityGroups"],
+        ) == [
+            {
+                "VpcSecurityGroupId": modify_sg_id,
+                "Status": "active",
+            },
+        ]
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+        rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+        ec2.delete_security_group(GroupId=create_sg_id)
+        ec2.delete_security_group(GroupId=modify_sg_id)
+        ec2.delete_vpc(VpcId=vpc_id)
 
 
 def test_sfn_key_to_api_name_must_convert():

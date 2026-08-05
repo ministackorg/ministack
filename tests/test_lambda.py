@@ -4659,6 +4659,7 @@ def esm_poll_state(tmp_path, monkeypatch):
     kinesis_state = _kin.get_state()
     dynamodb_state = _ddb.get_state()
     stream_records = dict(_ddb._stream_records._data)
+    trimmed = dict(_ddb._stream_trimmed._data)
 
     def _clear_all():
         lsvc._functions._data.clear()
@@ -4670,6 +4671,7 @@ def esm_poll_state(tmp_path, monkeypatch):
         _kin._streams._data.clear()
         _ddb._tables._data.clear()
         _ddb._stream_records._data.clear()
+        _ddb._stream_trimmed._data.clear()
 
     _clear_all()
     try:
@@ -4681,6 +4683,7 @@ def esm_poll_state(tmp_path, monkeypatch):
         _kin.restore_state(kinesis_state)
         _ddb.restore_state(dynamodb_state)
         _ddb._stream_records._data.update(stream_records)
+        _ddb._stream_trimmed._data.update(trimmed)
 
 
 def test_poll_sqs_returns_true_when_batch_processed(esm_poll_state, monkeypatch):
@@ -8668,6 +8671,112 @@ def test_invoke_rie_rewrites_custom_resource_response_url():
     assert event["ResponseURL"] == "http://localhost:4566/_ministack/cfn-response/tok"
 
 
+def _ddb_stream_record(seq, stream_arn, created_at=None):
+    return {
+        "eventID": str(seq),
+        "eventName": "INSERT",
+        "eventSource": "aws:dynamodb",
+        "dynamodb": {
+            "ApproximateCreationDateTime": int(created_at if created_at is not None else time.time()),
+            "Keys": {},
+            "SequenceNumber": str(seq),
+            "SizeBytes": 1,
+            "StreamViewType": "NEW_AND_OLD_IMAGES",
+        },
+        "eventSourceARN": stream_arn,
+    }
+
+
+def test_delete_esm_releases_poller_state(esm_poll_state):
+    """A deleted ESM's poller bookkeeping is dropped, so a container that
+    cycles ESMs doesn't accumulate one entry per create/delete."""
+    _lsvc, _sqs, _kin, _ddb = esm_poll_state
+
+    esm_id = "esm-release-poll-state"
+    _lsvc._esms[esm_id] = {
+        "UUID": esm_id,
+        "EventSourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/t/stream/2024-01-01T00:00:00.000",
+        "FunctionName": "fn",
+        "State": "Enabled",
+        "Enabled": True,
+    }
+    _lsvc._dynamodb_stream_positions[esm_id] = 7
+    _lsvc._kinesis_positions[esm_id] = {"shard-0": 3}
+    _lsvc._esm_backoff_until[esm_id] = time.time() + 60
+
+    _lsvc._delete_esm(esm_id)
+
+    assert esm_id not in _lsvc._dynamodb_stream_positions
+    assert esm_id not in _lsvc._kinesis_positions
+    assert esm_id not in _lsvc._esm_backoff_until
+
+
+def test_poll_dynamodb_streams_resumes_at_trim_horizon(esm_poll_state, monkeypatch):
+    """Records that expired since the last pass are gone; a consumer sitting
+    behind the trim horizon resumes at the horizon instead of replaying a
+    stale offset into the surviving slice."""
+    _lsvc, _sqs, _kin, _ddb = esm_poll_state
+
+    table_name = "esm-ddb-trim-horizon"
+    stream_arn = f"arn:aws:dynamodb:us-east-1:000000000000:table/{table_name}/stream/2024-01-01T00:00:00.000"
+    function_name = "esm-ddb-trim-horizon-fn"
+    esm_id = "esm-ddb-trim-horizon"
+
+    _lsvc._functions[function_name] = {
+        "config": {
+            "FunctionName": function_name,
+            "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{function_name}",
+        },
+        "versions": {},
+        "aliases": {},
+    }
+    _ddb._tables[table_name] = {"LatestStreamArn": stream_arn}
+    _ddb._stream_records[table_name] = [_ddb_stream_record(i, stream_arn) for i in range(3)]
+    # Ten records already aged out of this stream.
+    _ddb._stream_trimmed[table_name] = 10
+
+    _lsvc._esms[esm_id] = {
+        "UUID": esm_id,
+        "EventSourceArn": stream_arn,
+        "FunctionName": function_name,
+        "State": "Enabled",
+        "Enabled": True,
+        "BatchSize": 10,
+        "StartingPosition": "TRIM_HORIZON",
+    }
+    _lsvc._dynamodb_stream_positions[esm_id] = 2
+
+    seen = []
+    monkeypatch.setattr(
+        _lsvc, "_execute_function",
+        lambda _func, event: seen.append(event) or {"body": {}},
+    )
+
+    assert _lsvc._poll_dynamodb_streams() is True
+    assert [r["dynamodb"]["SequenceNumber"] for r in seen[0]["Records"]] == ["0", "1", "2"]
+    assert _lsvc._dynamodb_stream_positions[esm_id] == 13
+    assert _lsvc._poll_dynamodb_streams() is False
+
+
+def test_poll_dynamodb_streams_latest_anchors_past_trimmed_records(esm_poll_state):
+    """LATEST anchors past every record the stream still holds, counting the
+    ones already trimmed — otherwise a trimmed stream replays its backlog."""
+    _lsvc, _sqs, _kin, _ddb = esm_poll_state
+
+    table_name = "esm-ddb-latest-anchor"
+    stream_arn = f"arn:aws:dynamodb:us-east-1:000000000000:table/{table_name}/stream/2024-01-01T00:00:00.000"
+    esm_id = "esm-ddb-latest-anchor"
+
+    _ddb._tables[table_name] = {"LatestStreamArn": stream_arn}
+    _ddb._stream_records[table_name] = [_ddb_stream_record(i, stream_arn) for i in range(2)]
+    _ddb._stream_trimmed[table_name] = 5
+
+    _lsvc._init_stream_position(esm_id, stream_arn, "LATEST")
+    assert _lsvc._dynamodb_stream_positions[esm_id] == 7
+
+    _lsvc._dynamodb_stream_positions.pop(esm_id, None)
+    _lsvc._init_stream_position(esm_id, stream_arn, "TRIM_HORIZON")
+    assert _lsvc._dynamodb_stream_positions[esm_id] == 5
 # ---------------------------------------------------------------------------
 # Function URL data plane
 # ---------------------------------------------------------------------------

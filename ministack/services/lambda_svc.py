@@ -5529,7 +5529,17 @@ def _delete_esm(esm_id: str):
             404,
         )
     esm["State"] = "Deleting"
+    _release_esm_poll_state(esm_id)
     return json_response(_esm_response(esm), 202)
+
+
+def _release_esm_poll_state(esm_id: str) -> None:
+    """Drop the poller bookkeeping a deleted ESM leaves behind, so a long-lived
+    container does not accumulate one entry per create/delete cycle."""
+    with _dynamodb_stream_positions_lock:
+        _dynamodb_stream_positions.pop(esm_id, None)
+    _kinesis_positions.pop(esm_id, None)
+    _esm_backoff_until.pop(esm_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -5565,9 +5575,9 @@ def _init_stream_position(esm_id, source_arn, starting):
         if esm_id in _dynamodb_stream_positions:
             return
         if starting == "TRIM_HORIZON":
-            _dynamodb_stream_positions[esm_id] = 0
+            _dynamodb_stream_positions[esm_id] = _ddb.stream_start_position(table_name)
         else:
-            _dynamodb_stream_positions[esm_id] = len(stream_records.get(table_name, []))
+            _dynamodb_stream_positions[esm_id] = _ddb.stream_end_position(table_name)
 
 
 def _ensure_poller():
@@ -5951,8 +5961,9 @@ def _poll_dynamodb_streams():
             table = _ddb._tables.get(table_name)
             if not table or table.get("LatestStreamArn") != source_arn:
                 continue
-            table_records = stream_records.get(table_name, [])
-            if not table_records:
+            horizon = _ddb.stream_start_position(table_name)
+            end = _ddb.stream_end_position(table_name)
+            if end == horizon:
                 continue
 
             esm_id = esm["UUID"]
@@ -5963,13 +5974,16 @@ def _poll_dynamodb_streams():
                 if esm_id not in _dynamodb_stream_positions:
                     starting = esm.get("StartingPosition", "LATEST")
                     if starting == "TRIM_HORIZON":
-                        _dynamodb_stream_positions[esm_id] = 0
+                        _dynamodb_stream_positions[esm_id] = horizon
                     else:
-                        _dynamodb_stream_positions[esm_id] = len(table_records)
-                pos = _dynamodb_stream_positions[esm_id]
+                        _dynamodb_stream_positions[esm_id] = end
+                # Records that expired since the last pass are gone; resume at
+                # the trim horizon rather than replaying from a stale offset.
+                pos = max(_dynamodb_stream_positions[esm_id], horizon)
+                _dynamodb_stream_positions[esm_id] = pos
 
             batch_size = esm.get("BatchSize", 100)
-            batch = table_records[pos:pos + batch_size]
+            batch = _ddb.stream_records_since(table_name, pos, batch_size)
             if not batch:
                 continue
 
