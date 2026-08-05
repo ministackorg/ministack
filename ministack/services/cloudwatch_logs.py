@@ -3,7 +3,7 @@ CloudWatch Logs Service Emulator.
 JSON-based API via X-Amz-Target (Logs_20140328).
 Supports: CreateLogGroup, DeleteLogGroup, DescribeLogGroups,
           CreateLogStream, DeleteLogStream, DescribeLogStreams,
-          PutLogEvents, GetLogEvents, FilterLogEvents, GetLogRecord,
+          PutLogEvents, GetLogEvents, FilterLogEvents, GetLogRecord, StartLiveTail,
           PutRetentionPolicy, DeleteRetentionPolicy,
           PutSubscriptionFilter, DeleteSubscriptionFilter, DescribeSubscriptionFilters,
           TagLogGroup, UntagLogGroup, ListTagsLogGroup,
@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import time
+import zlib
 from datetime import datetime, timezone
 
 from ministack.core.arn import ArnParseError, parse_arn
@@ -207,6 +208,11 @@ def _make_group_arn(name):
     return f"arn:aws:logs:{get_region()}:{get_account_id()}:log-group:{name}:*"
 
 
+def _make_group_arn_no_star(name):
+    """ARN form accepted by StartLiveTail (no trailing ``:*``)."""
+    return f"arn:aws:logs:{get_region()}:{get_account_id()}:log-group:{name}"
+
+
 def _resolve_group_by_arn(arn):
     """Return the group name whose ARN matches, or None.
     Accepts both 'arn:...:log-group:name' and 'arn:...:log-group:name:*'
@@ -276,6 +282,7 @@ async def handle_request(method, path, headers, body, query_params):
         "GetLogEvents": _get_log_events,
         "FilterLogEvents": _filter_log_events,
         "GetLogRecord": _get_log_record,
+        "StartLiveTail": _start_live_tail,
         "PutRetentionPolicy": _put_retention_policy,
         "DeleteRetentionPolicy": _delete_retention_policy,
         "PutSubscriptionFilter": _put_subscription_filter,
@@ -381,6 +388,7 @@ def _describe_log_groups(data):
         entry = {
             "logGroupName": n,
             "arn": g["arn"],
+            "logGroupArn": _make_group_arn_no_star(n),
             "creationTime": g["creationTime"],
             "storedBytes": sum(
                 sum(len(e.get("message", "")) for e in s["events"])
@@ -622,6 +630,224 @@ def _get_log_record(data):
             400,
         )
     return json_response({"logRecord": _public_log_record(record)})
+
+
+# ---------------------------------------------------------------------------
+# Live Tail (StartLiveTail eventstream)
+# ---------------------------------------------------------------------------
+
+def _es_encode_message(headers: dict[str, str], payload: bytes) -> bytes:
+    """Encode one ``application/vnd.amazon.eventstream`` message (AWS wire format)."""
+    hdr_bytes = bytearray()
+    for name, value in headers.items():
+        name_b = name.encode("utf-8")
+        val_b = value.encode("utf-8")
+        hdr_bytes.append(len(name_b))
+        hdr_bytes.extend(name_b)
+        hdr_bytes.append(7)  # string
+        hdr_bytes.extend(len(val_b).to_bytes(2, "big"))
+        hdr_bytes.extend(val_b)
+
+    headers_length = len(hdr_bytes)
+    total_length = 12 + headers_length + len(payload) + 4
+    prelude = total_length.to_bytes(4, "big") + headers_length.to_bytes(4, "big")
+    prelude_crc = zlib.crc32(prelude).to_bytes(4, "big")
+    msg_head = prelude + prelude_crc + bytes(hdr_bytes) + payload
+    message_crc = zlib.crc32(msg_head).to_bytes(4, "big")
+    return msg_head + message_crc
+
+
+def _es_event(event_type: str, payload: dict) -> bytes:
+    return _es_encode_message(
+        {
+            ":message-type": "event",
+            ":event-type": event_type,
+            ":content-type": "application/json",
+        },
+        json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+    )
+
+
+def _resolve_live_tail_group_name(identifier: str) -> str | None:
+    """Resolve a StartLiveTail logGroupIdentifier (ARN without ``:*``, or bare name)."""
+    if not identifier:
+        return None
+    if identifier.startswith("arn:"):
+        if identifier.endswith(":*"):
+            return None  # AWS rejects trailing :* for Live Tail identifiers
+        return _log_group_name_from_identifier_arn(identifier) or _resolve_group_by_arn(identifier)
+    if identifier in _log_groups:
+        return identifier
+    return None
+
+
+def _live_tail_stream_allowed(stream_name: str, stream_names, stream_prefixes) -> bool:
+    if stream_names:
+        return stream_name in stream_names
+    if stream_prefixes:
+        return any(stream_name.startswith(prefix) for prefix in stream_prefixes)
+    return True
+
+
+def _collect_live_tail_events(
+    group_names: list[str],
+    identifiers_by_name: dict[str, str],
+    stream_names,
+    stream_prefixes,
+    filter_pattern: str,
+) -> list[dict]:
+    """Collect currently stored events matching the Live Tail filters (oldest first)."""
+    results = []
+    for group_name in group_names:
+        group = _log_groups.get(group_name) or {}
+        identifier = identifiers_by_name[group_name]
+        for stream_name, stream in group.get("streams", {}).items():
+            if not _live_tail_stream_allowed(stream_name, stream_names, stream_prefixes):
+                continue
+            for event in stream.get("events", []):
+                message = event.get("message", "")
+                if not _subscription_pattern_matches(filter_pattern, message):
+                    continue
+                results.append(
+                    {
+                        "logStreamName": stream_name,
+                        "logGroupIdentifier": identifier,
+                        "message": message,
+                        "timestamp": event.get("timestamp"),
+                        "ingestionTime": event.get("ingestionTime"),
+                    }
+                )
+    results.sort(key=lambda item: (item.get("timestamp") or 0, item.get("ingestionTime") or 0))
+    return results
+
+
+def _start_live_tail(data):
+    """Start a Live Tail session.
+
+    Real AWS keeps an HTTP eventstream open for up to three hours and pushes
+    ``sessionUpdate`` frames about once a second. MiniStack returns a finite,
+    wire-valid eventstream: an empty ``initial-response`` (required by
+    botocore), then ``sessionStart``, one ``sessionUpdate`` with matching
+    already-ingested events (capped/sampled at 500), then a few empty updates
+    so clients can exercise the idle path. Closing the body ends the session
+    (same as the client hanging up).
+    """
+    identifiers = data.get("logGroupIdentifiers") or []
+    if not identifiers:
+        return error_response_json(
+            "InvalidParameterException",
+            "1 validation error detected: Value null at 'logGroupIdentifiers' "
+            "failed to satisfy constraint: Member must not be null",
+            400,
+        )
+    if len(identifiers) > 10:
+        return error_response_json(
+            "InvalidParameterException",
+            "logGroupIdentifiers may contain at most 10 items",
+            400,
+        )
+
+    stream_names = data.get("logStreamNames") or None
+    stream_prefixes = data.get("logStreamNamePrefixes") or None
+    if stream_names and stream_prefixes:
+        return error_response_json(
+            "InvalidParameterException",
+            "logStreamNames and logStreamNamePrefixes are mutually exclusive",
+            400,
+        )
+    if (stream_names or stream_prefixes) and len(identifiers) != 1:
+        return error_response_json(
+            "InvalidParameterException",
+            "logStreamNames/logStreamNamePrefixes require exactly one log group",
+            400,
+        )
+
+    resolved_names: list[str] = []
+    identifiers_by_name: dict[str, str] = {}
+    for identifier in identifiers:
+        name = _resolve_live_tail_group_name(identifier)
+        if not name or name not in _log_groups:
+            return error_response_json(
+                "ResourceNotFoundException",
+                f"The specified log group does not exist: {identifier}",
+                400,
+            )
+        if name not in resolved_names:
+            resolved_names.append(name)
+            # Echo the caller-supplied identifier when it was an ARN; otherwise
+            # return the StartLiveTail-safe ARN form.
+            identifiers_by_name[name] = (
+                identifier if identifier.startswith("arn:") else _make_group_arn_no_star(name)
+            )
+
+    filter_pattern = data.get("logEventFilterPattern") or ""
+    matched = _collect_live_tail_events(
+        resolved_names,
+        identifiers_by_name,
+        stream_names,
+        stream_prefixes,
+        filter_pattern,
+    )
+    sampled = len(matched) > 500
+    session_results = matched[:500]
+
+    request_id = new_uuid()
+    session_id = new_uuid()
+    start_payload = {
+        "requestId": request_id,
+        "sessionId": session_id,
+        "logGroupIdentifiers": [identifiers_by_name[n] for n in resolved_names],
+    }
+    if stream_names:
+        start_payload["logStreamNames"] = list(stream_names)
+    if stream_prefixes:
+        start_payload["logStreamNamePrefixes"] = list(stream_prefixes)
+    if filter_pattern:
+        start_payload["logEventFilterPattern"] = filter_pattern
+
+    idle_updates = max(0, int(os.environ.get("MINISTACK_LIVE_TAIL_IDLE_UPDATES", "2")))
+    stream = bytearray()
+    # AWS JSON eventstream responses begin with an empty initial-response
+    # event; botocore refuses the stream otherwise (NoInitialResponseError).
+    stream.extend(
+        _es_encode_message(
+            {
+                ":message-type": "event",
+                ":event-type": "initial-response",
+                ":content-type": "application/json",
+            },
+            b"{}",
+        )
+    )
+    stream.extend(_es_event("sessionStart", start_payload))
+    stream.extend(
+        _es_event(
+            "sessionUpdate",
+            {
+                "sessionMetadata": {"sampled": sampled},
+                "sessionResults": session_results,
+            },
+        )
+    )
+    for _ in range(idle_updates):
+        stream.extend(
+            _es_event(
+                "sessionUpdate",
+                {
+                    "sessionMetadata": {"sampled": False},
+                    "sessionResults": [],
+                },
+            )
+        )
+
+    return (
+        200,
+        {
+            "Content-Type": "application/vnd.amazon.eventstream",
+            "x-amzn-RequestId": request_id,
+        },
+        bytes(stream),
+    )
 
 
 def _subscription_pattern_matches(pattern, message):

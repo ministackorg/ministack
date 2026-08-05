@@ -253,7 +253,10 @@ def sm():
 
 @pytest.fixture(scope="session")
 def logs():
-    return make_client("logs")
+    # StartLiveTail uses hostPrefix ``stream-``; with a custom endpoint that
+    # becomes ``stream-127.0.0.1`` which does not resolve. Disable injection so
+    # Live Tail hits the same MiniStack listener as every other Logs API.
+    return make_client("logs", additional_config_kwargs={"inject_host_prefix": False})
 
 
 @pytest.fixture(scope="session")

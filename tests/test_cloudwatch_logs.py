@@ -377,6 +377,70 @@ def test_logs_get_log_record_invalid_pointer(logs):
     assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
 
 
+def test_logs_describe_includes_log_group_arn_without_star(logs):
+    import uuid as _uuid
+
+    group = f"/intg/log-group-arn/{_uuid.uuid4().hex[:8]}"
+    logs.create_log_group(logGroupName=group)
+    described = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]
+    assert described["arn"].endswith(":*")
+    assert described["logGroupArn"] == described["arn"].removesuffix(":*")
+    assert ":*" not in described["logGroupArn"].split("log-group:")[-1]
+
+
+def test_logs_start_live_tail_streams_matching_events(logs):
+    """StartLiveTail returns sessionStart + sessionUpdate eventstream frames."""
+    import uuid as _uuid
+
+    group = f"/intg/live-tail/{_uuid.uuid4().hex[:8]}"
+    stream = "app/stream-1"
+    now_ms = int(time.time() * 1000)
+    logs.create_log_group(logGroupName=group)
+    logs.create_log_stream(logGroupName=group, logStreamName=stream)
+    logs.put_log_events(
+        logGroupName=group,
+        logStreamName=stream,
+        logEvents=[
+            {"timestamp": now_ms - 2000, "message": "INFO ok"},
+            {"timestamp": now_ms - 1000, "message": "ERROR boom"},
+            {"timestamp": now_ms, "message": "ERROR again"},
+        ],
+    )
+    arn = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]["logGroupArn"]
+
+    response = logs.start_live_tail(
+        logGroupIdentifiers=[arn],
+        logEventFilterPattern="ERROR",
+    )
+    events = list(response["responseStream"])
+    assert any("sessionStart" in event for event in events)
+    start = next(event["sessionStart"] for event in events if "sessionStart" in event)
+    assert start["sessionId"]
+    assert arn in start["logGroupIdentifiers"]
+
+    updates = [event["sessionUpdate"] for event in events if "sessionUpdate" in event]
+    assert updates
+    messages = [item["message"] for update in updates for item in update.get("sessionResults", [])]
+    assert messages == ["ERROR boom", "ERROR again"]
+    assert all(item["logStreamName"] == stream for update in updates for item in update.get("sessionResults", []))
+    assert all(
+        item["logGroupIdentifier"] == arn
+        for update in updates
+        for item in update.get("sessionResults", [])
+    )
+
+
+def test_logs_start_live_tail_rejects_star_arn(logs):
+    import uuid as _uuid
+
+    group = f"/intg/live-tail-star/{_uuid.uuid4().hex[:8]}"
+    logs.create_log_group(logGroupName=group)
+    starred = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]["arn"]
+    with pytest.raises(ClientError) as exc:
+        logs.start_live_tail(logGroupIdentifiers=[starred])
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 def test_logs_filter_with_wildcard(logs):
     """FilterLogEvents with wildcard pattern matches correctly."""
     logs.create_log_group(logGroupName="/qa/logs/wildcard")
