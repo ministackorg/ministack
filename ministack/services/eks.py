@@ -8,6 +8,8 @@ API server. DeleteCluster stops and removes it.
 Supports:
   Clusters:   CreateCluster, DescribeCluster, ListClusters, DeleteCluster
   Nodegroups: CreateNodegroup, DescribeNodegroup, ListNodegroups, DeleteNodegroup
+  IdP configs: AssociateIdentityProviderConfig, DescribeIdentityProviderConfig,
+              DisassociateIdentityProviderConfig, ListIdentityProviderConfigs
   Tags:       TagResource, UntagResource, ListTagsForResource
 """
 

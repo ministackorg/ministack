@@ -15,6 +15,14 @@ Supports:
                  ListFunctions, PublishFunction, UpdateFunction
   KeyValueStore: CreateKeyValueStore, DescribeKeyValueStore, ListKeyValueStores,
                  UpdateKeyValueStore, DeleteKeyValueStore
+  Cache policies: CreateCachePolicy, GetCachePolicy, GetCachePolicyConfig,
+                 UpdateCachePolicy, DeleteCachePolicy, ListDistributionsByCachePolicyId
+  Origin request policies: CreateOriginRequestPolicy, GetOriginRequestPolicy,
+                 GetOriginRequestPolicyConfig, UpdateOriginRequestPolicy,
+                 DeleteOriginRequestPolicy, ListDistributionsByOriginRequestPolicyId
+  Response headers policies: CreateResponseHeadersPolicy, GetResponseHeadersPolicy,
+                 GetResponseHeadersPolicyConfig, UpdateResponseHeadersPolicy,
+                 DeleteResponseHeadersPolicy, ListDistributionsByResponseHeadersPolicyId
   Tags: TagResource, UntagResource, ListTagsForResource
 """
 
