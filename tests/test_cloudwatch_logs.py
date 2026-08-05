@@ -321,6 +321,62 @@ def test_logs_insights_start_query(logs):
     results = logs.get_query_results(queryId=resp["queryId"])
     assert results["status"] in ("Complete", "Running", "Scheduled")
 
+
+def test_logs_get_log_record_round_trip(logs):
+    """PutLogEvents assigns opaque @ptr; Insights returns it; GetLogRecord resolves fields."""
+    import uuid as _uuid
+
+    group = f"/intg/get-log-record/{_uuid.uuid4().hex[:8]}"
+    stream = "stream-a"
+    now_ms = int(time.time() * 1000)
+    logs.create_log_group(logGroupName=group)
+    logs.create_log_stream(logGroupName=group, logStreamName=stream)
+    logs.put_log_events(
+        logGroupName=group,
+        logStreamName=stream,
+        logEvents=[
+            {"timestamp": now_ms - 1000, "message": "before"},
+            {"timestamp": now_ms, "message": '{"log":"anchor-row"}'},
+            {"timestamp": now_ms + 1000, "message": "after"},
+        ],
+    )
+
+    query = logs.start_query(
+        logGroupName=group,
+        startTime=(now_ms // 1000) - 60,
+        endTime=(now_ms // 1000) + 60,
+        queryString="fields @timestamp, @message, @logStream, @log | sort @timestamp asc | limit 10",
+        limit=10,
+    )
+    results = logs.get_query_results(queryId=query["queryId"])
+    assert results["status"] == "Complete"
+    assert len(results["results"]) == 3
+
+    def fields_map(row):
+        return {cell["field"]: cell["value"] for cell in row}
+
+    rows = [fields_map(row) for row in results["results"]]
+    assert rows[1]["@message"] == '{"log":"anchor-row"}'
+    assert rows[1]["@logStream"] == stream
+    assert rows[1]["@log"] == group
+    ptr = rows[1]["@ptr"]
+    assert ptr
+
+    record = logs.get_log_record(logRecordPointer=ptr, unmask=False)
+    assert record["logRecord"]["@message"] == '{"log":"anchor-row"}'
+    assert record["logRecord"]["@logStream"] == stream
+    assert record["logRecord"]["@log"] == group
+    assert record["logRecord"]["@ptr"] == ptr
+    assert "@timestamp" in record["logRecord"]
+    assert "_timestamp_ms" not in record["logRecord"]
+
+
+def test_logs_get_log_record_invalid_pointer(logs):
+    with pytest.raises(ClientError) as exc:
+        logs.get_log_record(logRecordPointer="does-not-exist", unmask=False)
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+
 def test_logs_filter_with_wildcard(logs):
     """FilterLogEvents with wildcard pattern matches correctly."""
     logs.create_log_group(logGroupName="/qa/logs/wildcard")
@@ -904,6 +960,67 @@ def _module():
     return importlib.import_module("ministack.services.cloudwatch_logs")
 
 
+def test_get_log_record_inprocess_round_trip():
+    """Handler-level coverage without a running gateway (CI-friendly)."""
+    import json as _json
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+
+    mod = _module()
+    mod.reset()
+    set_request_account_id("test")
+    set_request_region("us-east-1")
+
+    group = "/aws/lambda/get-log-record-unit"
+    stream = "stream-a"
+    now_ms = 1_700_000_000_000
+
+    assert mod._create_log_group({"logGroupName": group})[0] == 200
+    assert mod._create_log_stream({"logGroupName": group, "logStreamName": stream})[0] == 200
+    put = mod._put_log_events({
+        "logGroupName": group,
+        "logStreamName": stream,
+        "logEvents": [
+            {"timestamp": now_ms - 1000, "message": "before"},
+            {"timestamp": now_ms, "message": "anchor"},
+            {"timestamp": now_ms + 1000, "message": "after"},
+        ],
+    })
+    assert put[0] == 200
+
+    start = mod._start_query({
+        "logGroupName": group,
+        "startTime": (now_ms // 1000) - 10,
+        "endTime": (now_ms // 1000) + 10,
+        "queryString": "fields @timestamp, @message, @logStream, @log | limit 10",
+        "limit": 10,
+    })
+    assert start[0] == 200
+    query_id = _json.loads(start[2])["queryId"]
+
+    results = mod._get_query_results({"queryId": query_id})
+    assert results[0] == 200
+    body = _json.loads(results[2])
+    assert body["status"] == "Complete"
+    assert len(body["results"]) == 3
+    middle = {cell["field"]: cell["value"] for cell in body["results"][1]}
+    assert middle["@message"] == "anchor"
+    ptr = middle["@ptr"]
+
+    record_resp = mod._get_log_record({"logRecordPointer": ptr, "unmask": False})
+    assert record_resp[0] == 200
+    record = _json.loads(record_resp[2])["logRecord"]
+    assert record["@message"] == "anchor"
+    assert record["@logStream"] == stream
+    assert record["@log"] == group
+    assert "_timestamp_ms" not in record
+
+    bad = mod._get_log_record({"logRecordPointer": "missing"})
+    assert bad[0] == 400
+    assert _json.loads(bad[2])["__type"] == "InvalidParameterException"
+    mod.reset()
+
+
 @pytest.fixture(autouse=True)
 def _enable_persistence(monkeypatch, tmp_path):
     """Force PERSIST_STATE on and point STATE_DIR at a tmp dir for the
@@ -1065,6 +1182,7 @@ def test_queries_are_region_scoped():
 
     try:
         set_request_region("us-east-1")
+        assert mod._create_log_group({"logGroupName": "/aws/lambda/query-east"})[0] == 200
         east = mod._start_query({
             "logGroupName": "/aws/lambda/query-east",
             "startTime": 1,
@@ -1074,6 +1192,7 @@ def test_queries_are_region_scoped():
         east_id = json.loads(east[2])["queryId"]
 
         set_request_region("us-west-2")
+        assert mod._create_log_group({"logGroupName": "/aws/lambda/query-west"})[0] == 200
         west = mod._start_query({
             "logGroupName": "/aws/lambda/query-west",
             "startTime": 1,

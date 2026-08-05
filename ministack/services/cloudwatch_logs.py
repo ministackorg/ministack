@@ -3,7 +3,7 @@ CloudWatch Logs Service Emulator.
 JSON-based API via X-Amz-Target (Logs_20140328).
 Supports: CreateLogGroup, DeleteLogGroup, DescribeLogGroups,
           CreateLogStream, DeleteLogStream, DescribeLogStreams,
-          PutLogEvents, GetLogEvents, FilterLogEvents,
+          PutLogEvents, GetLogEvents, FilterLogEvents, GetLogRecord,
           PutRetentionPolicy, DeleteRetentionPolicy,
           PutSubscriptionFilter, DeleteSubscriptionFilter, DescribeSubscriptionFilters,
           TagLogGroup, UntagLogGroup, ListTagsLogGroup,
@@ -23,7 +23,9 @@ import fnmatch
 import json
 import logging
 import os
+import re
 import time
+from datetime import datetime, timezone
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
@@ -62,7 +64,16 @@ _metric_filters = AccountRegionScopedDict()
 # (log_group_name, filter_name) -> {filterName, logGroupName, filterPattern, metricTransformations, creationTime}
 
 _queries = AccountRegionScopedDict()
-# query_id -> {queryId, logGroupName, startTime, endTime, queryString, status}
+# query_id -> {queryId, logGroupName, startTime, endTime, queryString, status,
+#              results, statistics}
+
+# Opaque Insights/GetLogRecord pointers → full transformed log record fields.
+# Keys are UUID strings assigned at PutLogEvents time (AWS-shaped: opaque).
+_log_records = AccountRegionScopedDict()
+# ptr -> {
+#   "@ptr", "@timestamp", "@message", "@logStream", "@log",
+#   "_timestamp_ms" (internal; stripped from GetLogRecord responses)
+# }
 
 _delivery_sources = AccountRegionScopedDict()
 # source_name -> {name, arn, resourceArns: [str], logType, service, tags}
@@ -85,6 +96,7 @@ def get_state():
         "destinations": copy.deepcopy(_destinations),
         "metric_filters": copy.deepcopy(_metric_filters),
         "queries": copy.deepcopy(_queries),
+        "log_records": copy.deepcopy(_log_records),
         "delivery_sources": copy.deepcopy(_delivery_sources),
         "delivery_destinations": copy.deepcopy(_delivery_destinations),
         "deliveries": copy.deepcopy(_deliveries),
@@ -170,6 +182,7 @@ def restore_state(data):
         _destinations.update(data.get("destinations", {}))
         _restore_metric_filters(data.get("metric_filters", {}))
         _restore_queries(data.get("queries", {}))
+        _log_records.update(data.get("log_records", {}))
         _delivery_sources.update(data.get("delivery_sources", {}))
         _delivery_destinations.update(data.get("delivery_destinations", {}))
         _deliveries.update(data.get("deliveries", {}))
@@ -262,6 +275,7 @@ async def handle_request(method, path, headers, body, query_params):
         "PutLogEvents": _put_log_events,
         "GetLogEvents": _get_log_events,
         "FilterLogEvents": _filter_log_events,
+        "GetLogRecord": _get_log_record,
         "PutRetentionPolicy": _put_retention_policy,
         "DeleteRetentionPolicy": _delete_retention_policy,
         "PutSubscriptionFilter": _put_subscription_filter,
@@ -334,6 +348,7 @@ def _delete_log_group(data):
             "ResourceNotFoundException",
             f"The specified log group does not exist: {name}", 400,
         )
+    _forget_log_records_for_group(name)
     del _log_groups[name]
     return json_response({})
 
@@ -429,6 +444,7 @@ def _delete_log_stream(data):
             "ResourceNotFoundException",
             f"The specified log stream does not exist: {stream}", 400,
         )
+    _forget_log_records_for_stream(group, stream)
     del _log_groups[group]["streams"][stream]
     return json_response({})
 
@@ -512,7 +528,20 @@ def _put_log_events(data):
     for e in events:
         ts = e.get("timestamp", now_ms)
         msg = e.get("message", "")
-        s["events"].append({"timestamp": ts, "message": msg, "ingestionTime": now_ms})
+        ptr = new_uuid()
+        s["events"].append({
+            "timestamp": ts,
+            "message": msg,
+            "ingestionTime": now_ms,
+            "eventId": ptr,
+        })
+        _log_records[ptr] = _build_log_record(
+            ptr=ptr,
+            timestamp_ms=ts,
+            message=msg,
+            log_group=group,
+            log_stream=stream,
+        )
 
         if s["firstEventTimestamp"] is None or ts < s["firstEventTimestamp"]:
             s["firstEventTimestamp"] = ts
@@ -525,6 +554,74 @@ def _put_log_events(data):
 
     _fanout_to_subscription_filters(group, stream, events)
     return json_response({"nextSequenceToken": token})
+
+
+def _format_insights_timestamp(timestamp_ms: int) -> str:
+    """AWS Logs Insights @timestamp string (UTC, millisecond precision)."""
+    dt = datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M:%S.") + f"{dt.microsecond // 1000:03d}"
+
+
+def _build_log_record(*, ptr, timestamp_ms, message, log_group, log_stream):
+    return {
+        "@ptr": ptr,
+        "@timestamp": _format_insights_timestamp(timestamp_ms),
+        "@message": message,
+        "@logStream": log_stream,
+        "@log": log_group,
+        "_timestamp_ms": timestamp_ms,
+    }
+
+
+def _public_log_record(record: dict) -> dict:
+    """Strip MiniStack-internal fields before returning GetLogRecord payload."""
+    return {k: v for k, v in record.items() if not k.startswith("_")}
+
+
+def _forget_log_records_for_stream(group_name: str, stream_name: str) -> None:
+    to_delete = [
+        ptr
+        for ptr, record in list(_log_records.items())
+        if record.get("@log") == group_name and record.get("@logStream") == stream_name
+    ]
+    for ptr in to_delete:
+        del _log_records[ptr]
+
+
+def _forget_log_records_for_group(group_name: str) -> None:
+    to_delete = [
+        ptr for ptr, record in list(_log_records.items()) if record.get("@log") == group_name
+    ]
+    for ptr in to_delete:
+        del _log_records[ptr]
+
+
+def _get_log_record(data):
+    """Retrieve the full transformed field map for one Insights ``@ptr``.
+
+    AWS accepts ``unmask``; MiniStack does not implement field masking, so the
+    flag is accepted and ignored. Invalid/missing pointers raise
+    ``InvalidParameterException`` (AWS behavior).
+    """
+    ptr = data.get("logRecordPointer")
+    if not ptr:
+        return error_response_json(
+            "InvalidParameterException",
+            "1 validation error detected: Value null at 'logRecordPointer' "
+            "failed to satisfy constraint: Member must not be null",
+            400,
+        )
+    # Accepted for SDK/AWS parity; masking is not implemented.
+    _ = data.get("unmask", False)
+
+    record = _log_records.get(ptr)
+    if not record:
+        return error_response_json(
+            "InvalidParameterException",
+            "Invalid logRecordPointer provided",
+            400,
+        )
+    return json_response({"logRecord": _public_log_record(record)})
 
 
 def _subscription_pattern_matches(pattern, message):
@@ -1065,19 +1162,139 @@ def _describe_metric_filters(data):
 
 
 # ---------------------------------------------------------------------------
-# CloudWatch Logs Insights (stubs)
+# CloudWatch Logs Insights
 # ---------------------------------------------------------------------------
 
+def _parse_insights_fields(query_string: str) -> list[str]:
+    """Extract field names from a simple ``fields a, b | ...`` Insights query.
+
+    Falls back to the CWLT/default set when the query has no fields clause.
+    Full CWLI grammar is intentionally not implemented.
+    """
+    match = re.search(r"(?i)\bfields\s+([^|]+)", query_string or "")
+    if not match:
+        return ["@timestamp", "@message", "@logStream", "@log", "@ptr"]
+    fields = [part.strip() for part in match.group(1).split(",") if part.strip()]
+    # Always include @ptr so GetLogRecord can resolve later, even if omitted.
+    if "@ptr" not in fields:
+        fields.append("@ptr")
+    return fields
+
+
+def _parse_insights_limit(query_string: str, explicit_limit) -> int:
+    if explicit_limit is not None:
+        try:
+            return max(1, min(int(explicit_limit), 10000))
+        except (TypeError, ValueError):
+            pass
+    match = re.search(r"(?i)\blimit\s+(\d+)", query_string or "")
+    if match:
+        return max(1, min(int(match.group(1)), 10000))
+    return 10000
+
+
+def _resolve_query_log_groups(data) -> list[str]:
+    groups: list[str] = []
+    if data.get("logGroupName"):
+        groups.append(data["logGroupName"])
+    for name in data.get("logGroupNames") or []:
+        if name and name not in groups:
+            groups.append(name)
+    for identifier in data.get("logGroupIdentifiers") or []:
+        # Accept plain names or ARNs (...:log-group:NAME[:*]).
+        name = identifier
+        if ":log-group:" in identifier:
+            name = identifier.split(":log-group:", 1)[1]
+            if name.endswith(":*"):
+                name = name[:-2]
+            elif ":" in name:
+                name = name.split(":", 1)[0]
+        if name and name not in groups:
+            groups.append(name)
+    return groups
+
+
+def _collect_query_records(group_names, start_time_s, end_time_s):
+    """Collect stored log records in [start, end] (epoch seconds, AWS Insights)."""
+    start_ms = int(start_time_s) * 1000
+    end_ms = int(end_time_s) * 1000
+    collected = []
+    for group_name in group_names:
+        group = _log_groups.get(group_name)
+        if not group:
+            continue
+        for stream_name, stream in group.get("streams", {}).items():
+            for event in stream.get("events", []):
+                ts = event.get("timestamp", 0)
+                if ts < start_ms or ts > end_ms:
+                    continue
+                ptr = event.get("eventId")
+                record = _log_records.get(ptr) if ptr else None
+                if not record:
+                    # Rebuild for events ingested before ptr indexing existed.
+                    ptr = ptr or new_uuid()
+                    record = _build_log_record(
+                        ptr=ptr,
+                        timestamp_ms=ts,
+                        message=event.get("message", ""),
+                        log_group=group_name,
+                        log_stream=stream_name,
+                    )
+                    _log_records[ptr] = record
+                    event["eventId"] = ptr
+                collected.append(record)
+    collected.sort(key=lambda r: r.get("_timestamp_ms", 0))
+    return collected
+
+
+def _row_from_record(record: dict, fields: list[str]) -> list[dict]:
+    public = _public_log_record(record)
+    return [{"field": field, "value": str(public.get(field, ""))} for field in fields]
+
+
 def _start_query(data):
+    group_names = _resolve_query_log_groups(data)
+    if not group_names:
+        return error_response_json(
+            "InvalidParameterException",
+            "logGroupName, logGroupNames, or logGroupIdentifiers is required",
+            400,
+        )
+    for name in group_names:
+        if name not in _log_groups:
+            return error_response_json(
+                "ResourceNotFoundException",
+                f"The specified log group does not exist: {name}",
+                400,
+            )
+
+    query_string = data.get("queryString", "")
+    fields = _parse_insights_fields(query_string)
+    limit = _parse_insights_limit(query_string, data.get("limit"))
+    start_time = data.get("startTime", 0)
+    end_time = data.get("endTime", int(time.time()))
+
+    matched = _collect_query_records(group_names, start_time, end_time)
+    limited = matched[:limit]
+    results = [_row_from_record(record, fields) for record in limited]
+    bytes_scanned = float(sum(len(r.get("@message", "")) for r in matched))
+
     query_id = new_uuid()
     _queries[query_id] = {
         "queryId": query_id,
         "logGroupName": data.get("logGroupName", ""),
         "logGroupNames": data.get("logGroupNames", []),
-        "startTime": data.get("startTime", 0),
-        "endTime": data.get("endTime", 0),
-        "queryString": data.get("queryString", ""),
+        "logGroupIdentifiers": data.get("logGroupIdentifiers", []),
+        "startTime": start_time,
+        "endTime": end_time,
+        "queryString": query_string,
         "status": "Complete",
+        "results": results,
+        "statistics": {
+            "recordsMatched": float(len(matched)),
+            "recordsScanned": float(len(matched)),
+            "bytesScanned": bytes_scanned,
+        },
     }
     return json_response({"queryId": query_id})
 
@@ -1092,8 +1309,11 @@ def _get_query_results(data):
         )
     return json_response({
         "status": query["status"],
-        "results": [],
-        "statistics": {"recordsMatched": 0.0, "recordsScanned": 0.0, "bytesScanned": 0.0},
+        "results": query.get("results", []),
+        "statistics": query.get(
+            "statistics",
+            {"recordsMatched": 0.0, "recordsScanned": 0.0, "bytesScanned": 0.0},
+        ),
     })
 
 
@@ -1109,6 +1329,7 @@ def reset():
     _destinations.clear()
     _metric_filters.clear()
     _queries.clear()
+    _log_records.clear()
     _delivery_sources.clear()
     _delivery_destinations.clear()
     _deliveries.clear()
