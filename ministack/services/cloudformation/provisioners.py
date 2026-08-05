@@ -4473,7 +4473,6 @@ def _apigw_v2_api_create(logical_id, props, stack_name):
     if props.get("CorsConfiguration"):
         api["corsConfiguration"] = props["CorsConfiguration"]
     _apigw_v2._apis[api_id] = api
-    _apigw_v2._api_regions[api_id] = get_region()
     _apigw_v2._routes[api_id] = {}
     _apigw_v2._integrations[api_id] = {}
     _apigw_v2._stages[api_id] = {}
@@ -4483,7 +4482,6 @@ def _apigw_v2_api_create(logical_id, props, stack_name):
 
 def _apigw_v2_api_delete(physical_id, props):
     _apigw_v2._apis.pop(physical_id, None)
-    _apigw_v2._api_regions.pop(physical_id, None)
     _apigw_v2._routes.pop(physical_id, None)
     _apigw_v2._integrations.pop(physical_id, None)
     _apigw_v2._stages.pop(physical_id, None)
