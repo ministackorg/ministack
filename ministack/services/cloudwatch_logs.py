@@ -18,6 +18,7 @@ Supports: CreateLogGroup, DeleteLogGroup, DescribeLogGroups,
 """
 
 import base64
+import contextlib
 import copy
 import fnmatch
 import json
@@ -32,6 +33,7 @@ from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
+    StreamingResponse,
     error_response_json,
     get_account_id,
     get_region,
@@ -87,6 +89,10 @@ _deliveries = AccountRegionScopedDict()
 # delivery_id -> {id, arn, deliverySourceName, deliveryDestinationArn,
 #                 deliveryDestinationType, recordFields, fieldDelimiter,
 #                 s3DeliveryConfiguration, tags}
+
+# Active StartLiveTail sessions (not persisted). session_id -> session dict.
+# Populated while an ASGI stream is open; PutLogEvents fans matching events in.
+_live_tail_sessions: dict[str, dict] = {}
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -561,6 +567,9 @@ def _put_log_events(data):
     s["uploadSequenceToken"] = token
 
     _fanout_to_subscription_filters(group, stream, events)
+    # Fan out the stored shape (ingestionTime filled) to any Live Tail sessions.
+    stored = s["events"][-len(events) :] if events else []
+    _fanout_to_live_tail_sessions(group, stream, stored)
     return json_response({"nextSequenceToken": token})
 
 
@@ -689,49 +698,68 @@ def _live_tail_stream_allowed(stream_name: str, stream_names, stream_prefixes) -
     return True
 
 
-def _collect_live_tail_events(
-    group_names: list[str],
-    identifiers_by_name: dict[str, str],
-    stream_names,
-    stream_prefixes,
-    filter_pattern: str,
-) -> list[dict]:
-    """Collect currently stored events matching the Live Tail filters (oldest first)."""
-    results = []
-    for group_name in group_names:
-        group = _log_groups.get(group_name) or {}
-        identifier = identifiers_by_name[group_name]
-        for stream_name, stream in group.get("streams", {}).items():
-            if not _live_tail_stream_allowed(stream_name, stream_names, stream_prefixes):
+def _fanout_to_live_tail_sessions(group_name: str, stream_name: str, events: list[dict]) -> None:
+    """Push matching PutLogEvents into active Live Tail session queues."""
+    import asyncio
+
+    if not events or not _live_tail_sessions:
+        return
+    account_id = get_account_id()
+    region = get_region()
+    for session in list(_live_tail_sessions.values()):
+        if session.get("account_id") != account_id or session.get("region") != region:
+            continue
+        if group_name not in session["group_names"]:
+            continue
+        if not _live_tail_stream_allowed(
+            stream_name, session.get("stream_names"), session.get("stream_prefixes")
+        ):
+            continue
+        identifier = session["identifiers_by_name"][group_name]
+        filter_pattern = session.get("filter_pattern") or ""
+        matched = []
+        for event in events:
+            message = event.get("message", "")
+            if not _subscription_pattern_matches(filter_pattern, message):
                 continue
-            for event in stream.get("events", []):
-                message = event.get("message", "")
-                if not _subscription_pattern_matches(filter_pattern, message):
-                    continue
-                results.append(
-                    {
-                        "logStreamName": stream_name,
-                        "logGroupIdentifier": identifier,
-                        "message": message,
-                        "timestamp": event.get("timestamp"),
-                        "ingestionTime": event.get("ingestionTime"),
-                    }
-                )
-    results.sort(key=lambda item: (item.get("timestamp") or 0, item.get("ingestionTime") or 0))
-    return results
+            matched.append(
+                {
+                    "logStreamName": stream_name,
+                    "logGroupIdentifier": identifier,
+                    "message": message,
+                    "timestamp": event.get("timestamp"),
+                    "ingestionTime": event.get("ingestionTime"),
+                }
+            )
+        if not matched:
+            continue
+        queue = session["queue"]
+        try:
+            queue.put_nowait((matched, False))
+        except asyncio.QueueFull:
+            session["sampled"] = True
+            with contextlib.suppress(asyncio.QueueFull):
+                queue.put_nowait(([], True))
+
+
+async def _await_http_disconnect(receive) -> None:
+    while True:
+        message = await receive()
+        if message.get("type") == "http.disconnect":
+            return
 
 
 def _start_live_tail(data):
     """Start a Live Tail session.
 
-    Real AWS keeps an HTTP eventstream open for up to three hours and pushes
-    ``sessionUpdate`` frames about once a second. MiniStack returns a finite,
-    wire-valid eventstream: an empty ``initial-response`` (required by
-    botocore), then ``sessionStart``, one ``sessionUpdate`` with matching
-    already-ingested events (capped/sampled at 500), then a few empty updates
-    so clients can exercise the idle path. Closing the body ends the session
-    (same as the client hanging up).
+    Holds the HTTP eventstream open until the client disconnects. Matching
+    ``PutLogEvents`` calls fan into ``sessionUpdate`` frames via an asyncio
+    queue (same pattern as API Gateway WebSocket outboxes). Idle empty
+    ``sessionUpdate`` frames are emitted on ``MINISTACK_LIVE_TAIL_IDLE_SECONDS``
+    (default 1s) so clients can exercise the idle path.
     """
+    import asyncio
+
     identifiers = data.get("logGroupIdentifiers") or []
     if not identifiers:
         return error_response_json(
@@ -774,23 +802,11 @@ def _start_live_tail(data):
             )
         if name not in resolved_names:
             resolved_names.append(name)
-            # Echo the caller-supplied identifier when it was an ARN; otherwise
-            # return the StartLiveTail-safe ARN form.
             identifiers_by_name[name] = (
                 identifier if identifier.startswith("arn:") else _make_group_arn_no_star(name)
             )
 
     filter_pattern = data.get("logEventFilterPattern") or ""
-    matched = _collect_live_tail_events(
-        resolved_names,
-        identifiers_by_name,
-        stream_names,
-        stream_prefixes,
-        filter_pattern,
-    )
-    sampled = len(matched) > 500
-    session_results = matched[:500]
-
     request_id = new_uuid()
     session_id = new_uuid()
     start_payload = {
@@ -805,40 +821,95 @@ def _start_live_tail(data):
     if filter_pattern:
         start_payload["logEventFilterPattern"] = filter_pattern
 
-    idle_updates = max(0, int(os.environ.get("MINISTACK_LIVE_TAIL_IDLE_UPDATES", "2")))
-    stream = bytearray()
-    # AWS JSON eventstream responses begin with an empty initial-response
-    # event; botocore refuses the stream otherwise (NoInitialResponseError).
-    stream.extend(
-        _es_encode_message(
-            {
-                ":message-type": "event",
-                ":event-type": "initial-response",
-                ":content-type": "application/json",
-            },
-            b"{}",
-        )
+    account_id = get_account_id()
+    region = get_region()
+    idle_seconds = float(os.environ.get("MINISTACK_LIVE_TAIL_IDLE_SECONDS", "1"))
+    queue_max = max(1, int(os.environ.get("MINISTACK_LIVE_TAIL_QUEUE_MAX", "1000")))
+
+    initial_bytes = _es_encode_message(
+        {
+            ":message-type": "event",
+            ":event-type": "initial-response",
+            ":content-type": "application/json",
+        },
+        b"{}",
     )
-    stream.extend(_es_event("sessionStart", start_payload))
-    stream.extend(
-        _es_event(
-            "sessionUpdate",
-            {
-                "sessionMetadata": {"sampled": sampled},
-                "sessionResults": session_results,
-            },
-        )
-    )
-    for _ in range(idle_updates):
-        stream.extend(
-            _es_event(
-                "sessionUpdate",
-                {
-                    "sessionMetadata": {"sampled": False},
-                    "sessionResults": [],
-                },
-            )
-        )
+    start_bytes = _es_event("sessionStart", start_payload)
+
+    async def _run(send, receive):
+        async def _send_chunk(payload: bytes, *, more: bool = True) -> None:
+            await send({"type": "http.response.body", "body": payload, "more_body": more})
+
+        # Register before the first await so concurrent PutLogEvents cannot race
+        # past sessionStart into a missing session.
+        queue: asyncio.Queue = asyncio.Queue(maxsize=queue_max)
+        session = {
+            "session_id": session_id,
+            "account_id": account_id,
+            "region": region,
+            "group_names": set(resolved_names),
+            "identifiers_by_name": identifiers_by_name,
+            "stream_names": list(stream_names) if stream_names else None,
+            "stream_prefixes": list(stream_prefixes) if stream_prefixes else None,
+            "filter_pattern": filter_pattern,
+            "queue": queue,
+            "sampled": False,
+        }
+        _live_tail_sessions[session_id] = session
+
+        await _send_chunk(initial_bytes)
+        await _send_chunk(start_bytes)
+
+        disconnect_task = asyncio.create_task(_await_http_disconnect(receive))
+        try:
+            while not disconnect_task.done():
+                get_task = asyncio.create_task(queue.get())
+                done, _pending = await asyncio.wait(
+                    {get_task, disconnect_task},
+                    timeout=idle_seconds,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if disconnect_task in done:
+                    get_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await get_task
+                    break
+                if get_task in done:
+                    item = get_task.result()
+                    if item is None:
+                        break
+                    results, sampled_flag = item
+                    sampled = bool(sampled_flag or session.get("sampled"))
+                    session["sampled"] = False
+                    await _send_chunk(
+                        _es_event(
+                            "sessionUpdate",
+                            {
+                                "sessionMetadata": {"sampled": sampled},
+                                "sessionResults": results,
+                            },
+                        )
+                    )
+                else:
+                    get_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await get_task
+                    await _send_chunk(
+                        _es_event(
+                            "sessionUpdate",
+                            {
+                                "sessionMetadata": {"sampled": False},
+                                "sessionResults": [],
+                            },
+                        )
+                    )
+        finally:
+            _live_tail_sessions.pop(session_id, None)
+            disconnect_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await disconnect_task
+            with contextlib.suppress(Exception):
+                await _send_chunk(b"", more=False)
 
     return (
         200,
@@ -846,7 +917,7 @@ def _start_live_tail(data):
             "Content-Type": "application/vnd.amazon.eventstream",
             "x-amzn-RequestId": request_id,
         },
-        bytes(stream),
+        StreamingResponse(_run),
     )
 
 
@@ -1559,6 +1630,13 @@ def reset():
     _delivery_sources.clear()
     _delivery_destinations.clear()
     _deliveries.clear()
+    # Wake any held Live Tail streams so they exit on reset.
+    for session in list(_live_tail_sessions.values()):
+        queue = session.get("queue")
+        if queue is not None:
+            with contextlib.suppress(Exception):
+                queue.put_nowait(None)
+    _live_tail_sessions.clear()
 
 
 # ---------------------------------------------------------------------------

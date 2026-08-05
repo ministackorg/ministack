@@ -388,15 +388,57 @@ def test_logs_describe_includes_log_group_arn_without_star(logs):
     assert ":*" not in described["logGroupArn"].split("log-group:")[-1]
 
 
-def test_logs_start_live_tail_streams_matching_events(logs):
-    """StartLiveTail returns sessionStart + sessionUpdate eventstream frames."""
+def test_logs_start_live_tail_receives_put_events(logs):
+    """StartLiveTail stays open and receives matching PutLogEvents until disconnect."""
+    import threading
     import uuid as _uuid
 
     group = f"/intg/live-tail/{_uuid.uuid4().hex[:8]}"
     stream = "app/stream-1"
-    now_ms = int(time.time() * 1000)
     logs.create_log_group(logGroupName=group)
     logs.create_log_stream(logGroupName=group, logStreamName=stream)
+    arn = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]["logGroupArn"]
+
+    started = threading.Event()
+    got_events = threading.Event()
+    errors: list[BaseException] = []
+    seen: list[str] = []
+    stream_holder: dict = {}
+
+    def _tail():
+        try:
+            response = logs.start_live_tail(
+                logGroupIdentifiers=[arn],
+                logEventFilterPattern="ERROR",
+            )
+            event_stream = response["responseStream"]
+            stream_holder["stream"] = event_stream
+            started.set()
+            for event in event_stream:
+                if "sessionStart" in event:
+                    assert event["sessionStart"]["sessionId"]
+                    assert arn in event["sessionStart"]["logGroupIdentifiers"]
+                    continue
+                if "sessionUpdate" not in event:
+                    continue
+                for item in event["sessionUpdate"].get("sessionResults") or []:
+                    seen.append(item["message"])
+                    assert item["logStreamName"] == stream
+                    assert item["logGroupIdentifier"] == arn
+                if "ERROR boom" in seen and "ERROR again" in seen:
+                    got_events.set()
+                    break
+        except BaseException as exc:  # noqa: BLE001 — surface to main thread
+            errors.append(exc)
+            started.set()
+            got_events.set()
+
+    worker = threading.Thread(target=_tail, daemon=True)
+    worker.start()
+    assert started.wait(10), f"StartLiveTail did not start: {errors}"
+    time.sleep(0.3)  # allow session registration on the server
+
+    now_ms = int(time.time() * 1000)
     logs.put_log_events(
         logGroupName=group,
         logStreamName=stream,
@@ -406,28 +448,14 @@ def test_logs_start_live_tail_streams_matching_events(logs):
             {"timestamp": now_ms, "message": "ERROR again"},
         ],
     )
-    arn = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]["logGroupArn"]
+    assert got_events.wait(10), f"timed out waiting for Live Tail events; seen={seen} errors={errors}"
+    assert not errors, errors
+    assert seen == ["ERROR boom", "ERROR again"]
 
-    response = logs.start_live_tail(
-        logGroupIdentifiers=[arn],
-        logEventFilterPattern="ERROR",
-    )
-    events = list(response["responseStream"])
-    assert any("sessionStart" in event for event in events)
-    start = next(event["sessionStart"] for event in events if "sessionStart" in event)
-    assert start["sessionId"]
-    assert arn in start["logGroupIdentifiers"]
-
-    updates = [event["sessionUpdate"] for event in events if "sessionUpdate" in event]
-    assert updates
-    messages = [item["message"] for update in updates for item in update.get("sessionResults", [])]
-    assert messages == ["ERROR boom", "ERROR again"]
-    assert all(item["logStreamName"] == stream for update in updates for item in update.get("sessionResults", []))
-    assert all(
-        item["logGroupIdentifier"] == arn
-        for update in updates
-        for item in update.get("sessionResults", [])
-    )
+    event_stream = stream_holder.get("stream")
+    if event_stream is not None:
+        event_stream.close()
+    worker.join(timeout=5)
 
 
 def test_logs_start_live_tail_rejects_star_arn(logs):

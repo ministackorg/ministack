@@ -421,6 +421,21 @@ def error_response_json(code: str, message: str, status: int = 400) -> tuple:
     }, body
 
 
+class StreamingResponse:
+    """Marker body for long-lived HTTP responses (chunked ASGI ``more_body``).
+
+    Handlers return ``(status, headers, StreamingResponse(runner))``. The ASGI
+    app sends ``http.response.start`` without ``Content-Length``, then awaits
+    ``runner(send, receive)``. The runner should emit ``http.response.body``
+    frames with ``more_body=True`` and finish with ``more_body=False``.
+    """
+
+    __slots__ = ("runner",)
+
+    def __init__(self, runner):
+        self.runner = runner
+
+
 def now_iso() -> str:
     """Current time in AWS ISO format."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"

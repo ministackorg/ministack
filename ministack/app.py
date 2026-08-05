@@ -489,18 +489,14 @@ async def _read_request_body(receive, method: str, headers: dict) -> bytes:
     return _decode_aws_chunked_body(body, headers)
 
 
-async def _send_response(send, status, headers, body):
-    """Send ASGI HTTP response."""
+def _encode_header_value(v: str) -> bytes:
+    try:
+        return v.encode("latin-1")
+    except UnicodeEncodeError:
+        return v.encode("utf-8")
 
-    def _encode_header_value(v: str) -> bytes:
-        try:
-            return v.encode("latin-1")
-        except UnicodeEncodeError:
-            return v.encode("utf-8")
 
-    body_bytes = body if isinstance(body, bytes) else body.encode("utf-8")
-    if "content-length" not in {k.lower() for k in headers}:
-        headers["Content-Length"] = str(len(body_bytes))
+def _asgi_header_list(headers: dict) -> list:
     # A list/tuple header value expands to one header line per item. This is
     # required for Set-Cookie, which RFC 6265 §3 forbids folding into a single
     # comma-joined header; APIGW Lambda-proxy responses surface multiple
@@ -512,11 +508,24 @@ async def _send_response(send, status, headers, body):
                 header_list.append((k.encode("latin-1"), _encode_header_value(str(item))))
         else:
             header_list.append((k.encode("latin-1"), _encode_header_value(str(v))))
+    return header_list
+
+
+async def _send_response(send, status, headers, body):
+    """Send ASGI HTTP response."""
+    from ministack.core.responses import StreamingResponse
+
+    if isinstance(body, StreamingResponse):
+        raise TypeError("StreamingResponse requires _send_streaming_response(send, receive, ...)")
+
+    body_bytes = body if isinstance(body, bytes) else body.encode("utf-8")
+    if "content-length" not in {k.lower() for k in headers}:
+        headers["Content-Length"] = str(len(body_bytes))
     await send(
         {
             "type": "http.response.start",
             "status": status,
-            "headers": header_list,
+            "headers": _asgi_header_list(headers),
         }
     )
     await send(
@@ -528,11 +537,43 @@ async def _send_response(send, status, headers, body):
     )
 
 
-async def _send_if_handled(send, response) -> bool:
+async def _send_streaming_response(send, receive, status, headers, streaming):
+    """Hold an HTTP response open and stream body chunks until the runner ends.
+
+    Used by CloudWatch Logs ``StartLiveTail`` (and any future long-lived
+    eventstream). Omits ``Content-Length`` so the ASGI server can chunk.
+    """
+    headers = {k: v for k, v in headers.items() if k.lower() != "content-length"}
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status,
+            "headers": _asgi_header_list(headers),
+        }
+    )
+    try:
+        await streaming.runner(send, receive)
+    except Exception:
+        logger.exception("Streaming response failed")
+        try:
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+        except Exception:
+            pass
+
+
+async def _send_if_handled(send, response, receive=None) -> bool:
     """Send a response tuple and report whether the request was handled."""
     if response is None:
         return False
-    await _send_response(send, *response)
+    from ministack.core.responses import StreamingResponse
+
+    status, headers, body = response
+    if isinstance(body, StreamingResponse):
+        if receive is None:
+            raise TypeError("StreamingResponse requires the ASGI receive channel")
+        await _send_streaming_response(send, receive, status, headers, body)
+    else:
+        await _send_response(send, status, headers, body)
     return True
 
 
@@ -1840,20 +1881,34 @@ async def app(scope, receive, send):
     # requests carry the credential in query params, not the header.
     set_request_region(extract_region(headers, query_params))
 
-    if await _send_if_handled(send, await _handle_pre_body_request(method, path, headers, query_params, request_id)):
+    if await _send_if_handled(
+        send, await _handle_pre_body_request(method, path, headers, query_params, request_id), receive
+    ):
         return
 
     body = await _read_request_body(receive, method, headers)
 
-    if await _send_if_handled(send, await _handle_post_body_shortcuts(method, path, headers, body, query_params, request_id)):
-        return
-
     if await _send_if_handled(
-        send, await _handle_special_data_plane_request(method, path, headers, body, query_params, request_id)
+        send, await _handle_post_body_shortcuts(method, path, headers, body, query_params, request_id), receive
     ):
         return
 
-    await _send_response(send, *await _dispatch_service_request(method, path, headers, body, query_params, request_id))
+    if await _send_if_handled(
+        send,
+        await _handle_special_data_plane_request(method, path, headers, body, query_params, request_id),
+        receive,
+    ):
+        return
+
+    status, resp_headers, resp_body = await _dispatch_service_request(
+        method, path, headers, body, query_params, request_id
+    )
+    from ministack.core.responses import StreamingResponse
+
+    if isinstance(resp_body, StreamingResponse):
+        await _send_streaming_response(send, receive, status, resp_headers, resp_body)
+    else:
+        await _send_response(send, status, resp_headers, resp_body)
 
 
 # ---------------------------------------------------------------------------
