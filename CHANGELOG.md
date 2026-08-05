@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [1.4.13] — 2026-08-06
+
+### Fixed
+- **Docker image — restored to its prior size** — the unpinned `awscli` build dependency floated to 1.46.0, which vendors its own copy of `botocore` and `s3transfer` (~120 MB uncompressed) on top of the `botocore` already installed, inflating the 1.4.12 image by roughly 15 MB. `awscli` is now pinned to 1.45.63 — the last release before the vendored `botocore` — returning the image to its 1.4.11 size.
+
 ## [1.4.12] — 2026-08-06
 
 ### Added
