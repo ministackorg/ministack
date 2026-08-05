@@ -438,41 +438,41 @@ fs.write = function(fd, ...args) {
   // Most AWS SDK v3 packages use awsJson1.x: POST / with X-Amz-Target header.
   // Ministack's router maps target prefixes to service modules.
   const _JSON_RPC_TARGETS = {
-    // JSON-RPC (awsJson1.x) services — keyed by @aws-sdk/client-{key} suffix.
+    // JSON-RPC (awsJson1.x) services — keyed by full module specifier.
     // Target prefixes match Ministack's router.py SERVICE_PATTERNS target_prefixes.
-    "ssm":                         "AmazonSSM",
-    "sfn":                         "AWSStepFunctions",
+    "@aws-sdk/client-ssm":                         "AmazonSSM",
+    "@aws-sdk/client-sfn":                         "AWSStepFunctions",
     // sts, sns: query protocol — @aws-sdk/client-{sts,sns} sends Action= form-encoded POST
     // cloudwatch: smithy-rpc-v2-cbor — @aws-sdk/client-cloudwatch sends path-based requests
     // All three are handled by Ministack's native query/path routing when the real SDK is present
-    "cloudwatch-logs":             "Logs_20140328",
-    "logs":                        "Logs_20140328",
-    "secretsmanager":              "secretsmanager",
-    "events":                      "AmazonEventBridge",
-    "eventbridge":                 "AmazonEventBridge",
-    "kinesis":                     "Kinesis_20131202",
-    "ecs":                         "AmazonEC2ContainerServiceV20141113",
-    "dynamodb":                    "DynamoDB_20120810",
-    "dynamodb-streams":            "DynamoDBStreams_20120810",
-    "sqs":                         "AmazonSQS",
-    "glue":                        "AWSGlue",
-    "athena":                      "AmazonAthena",
-    "firehose":                    "Firehose_20150804",
-    "cognito-identity-provider":   "AWSCognitoIdentityProviderService",
-    "cognito-identity":            "AWSCognitoIdentityService",
-    "emr":                         "ElasticMapReduce",
-    "ecr":                         "AmazonEC2ContainerRegistry_V20150921",
-    "acm":                         "CertificateManager",
-    "wafv2":                       "AWSWAF_20190729",
-    "waf":                         "AWSWAF_20150824",
-    "waf-regional":                "AWSWAF_Regional_20161128",
-    "organizations":               "AWSOrganizationsV20161128",
-    "kms":                         "TrentService",
-    "codebuild":                   "CodeBuild_20161006",
-    "transfer":                    "TransferService",
-    "servicediscovery":            "Route53AutoNaming_v20170314",
-    "resource-groups-tagging-api": "ResourceGroupsTaggingAPI_20170126",
-    "cloudtrail":                  "com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101",
+    "@aws-sdk/client-cloudwatch-logs":             "Logs_20140328",
+    "@aws-sdk/client-logs":                        "Logs_20140328",
+    "@aws-sdk/client-secrets-manager":             "secretsmanager",
+    "@aws-sdk/client-events":                      "AmazonEventBridge",
+    "@aws-sdk/client-eventbridge":                 "AmazonEventBridge",
+    "@aws-sdk/client-kinesis":                     "Kinesis_20131202",
+    "@aws-sdk/client-ecs":                         "AmazonEC2ContainerServiceV20141113",
+    "@aws-sdk/client-dynamodb":                    "DynamoDB_20120810",
+    "@aws-sdk/client-dynamodb-streams":            "DynamoDBStreams_20120810",
+    "@aws-sdk/client-sqs":                         "AmazonSQS",
+    "@aws-sdk/client-glue":                        "AWSGlue",
+    "@aws-sdk/client-athena":                      "AmazonAthena",
+    "@aws-sdk/client-firehose":                    "Firehose_20150804",
+    "@aws-sdk/client-cognito-identity-provider":   "AWSCognitoIdentityProviderService",
+    "@aws-sdk/client-cognito-identity":            "AWSCognitoIdentityService",
+    "@aws-sdk/client-emr":                         "ElasticMapReduce",
+    "@aws-sdk/client-ecr":                         "AmazonEC2ContainerRegistry_V20150921",
+    "@aws-sdk/client-acm":                         "CertificateManager",
+    "@aws-sdk/client-wafv2":                       "AWSWAF_20190729",
+    "@aws-sdk/client-waf":                         "AWSWAF_20150824",
+    "@aws-sdk/client-waf-regional":                "AWSWAF_Regional_20161128",
+    "@aws-sdk/client-organizations":               "AWSOrganizationsV20161128",
+    "@aws-sdk/client-kms":                         "TrentService",
+    "@aws-sdk/client-codebuild":                   "CodeBuild_20161006",
+    "@aws-sdk/client-transfer":                    "TransferService",
+    "@aws-sdk/client-servicediscovery":            "Route53AutoNaming_v20170314",
+    "@aws-sdk/client-resource-groups-tagging-api": "ResourceGroupsTaggingAPI_20170126",
+    "@aws-sdk/client-cloudtrail":                  "com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101",
   };
 
   function _jsonRpcRequest(targetPrefix, opName, params) {
@@ -582,11 +582,25 @@ fs.write = function(fd, ...args) {
       return specific;
     }
     // 2. Generic JSON-RPC stubs for known @aws-sdk/client-* packages
-    const m = id.match(_SDK_CLIENT_RE);
-    if (m) {
-      try { return _origRequire.apply(this, arguments); } catch (_) {}
-      const prefix = _JSON_RPC_TARGETS[m[1]];
+    if (_SDK_CLIENT_RE.test(id)) {
+      let requireError;
+      try {
+        return _origRequire.apply(this, arguments);
+      } catch (err) {
+        requireError = err;
+      }
+      const prefix = _JSON_RPC_TARGETS[id];
       if (prefix) return _makeGenericJsonServiceModule(prefix);
+      if (
+        requireError.code !== "MODULE_NOT_FOUND"
+        || !requireError.message.includes("'" + id + "'")
+      ) {
+        throw requireError;
+      }
+      throw new Error(
+        "MiniStack local executor has no stub for '" + id
+        + "'; bundle the module with your function or use LAMBDA_EXECUTOR=docker."
+      );
     }
     return _origRequire.apply(this, arguments);
   };

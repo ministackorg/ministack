@@ -134,12 +134,20 @@ def _request_stream_source(stream_arn: str):
 
 
 def _records_for(account_id: str, region: str, table_name: str) -> list:
-    """Return the raw list of stream records for a table, or an empty list.
+    """Return the unexpired stream records for a table, oldest first.
 
     Reads directly from the dynamodb module so TransactWriteItems,
     BatchWriteItem, and the single-item ops all stay in sync automatically.
+    Index ``i`` here is absolute stream position ``_horizon(...) + i``: records
+    that age out are dropped off the front, so positions handed to clients in a
+    shard iterator are always absolute and never shift underneath them.
     """
-    return _ddb._stream_records.get_scoped(account_id, region, table_name, [])
+    return _ddb.stream_live_records(table_name, account_id=account_id, region=region)
+
+
+def _horizon(account_id: str, region: str, table_name: str) -> int:
+    """Absolute position of the oldest record still on the stream."""
+    return _ddb.stream_start_position(table_name, account_id=account_id, region=region)
 
 
 def _enabled_stream_info(
@@ -300,11 +308,12 @@ def _get_shard_iterator(data):
         )
 
     records = _records_for(spec.account_id, spec.region, table_name)
-    position = 0
+    horizon = _horizon(spec.account_id, spec.region, table_name)
+    position = horizon
     if iterator_type == "TRIM_HORIZON":
-        position = 0
+        position = horizon
     elif iterator_type == "LATEST":
-        position = len(records)
+        position = horizon + len(records)
     elif iterator_type in ("AT_SEQUENCE_NUMBER", "AFTER_SEQUENCE_NUMBER"):
         if not seq_number:
             return error_response_json(
@@ -323,7 +332,7 @@ def _get_shard_iterator(data):
                 f"Sequence number {seq_number} not found on stream",
                 400,
             )
-        position = idx if iterator_type == "AT_SEQUENCE_NUMBER" else idx + 1
+        position = horizon + (idx if iterator_type == "AT_SEQUENCE_NUMBER" else idx + 1)
 
     iterator = _encode_iterator(
         table_name,
@@ -372,8 +381,13 @@ def _get_records(data):
             400,
         )
 
-    records = _records_for(account_id, region, table_name)
-    page = records[position:position + limit]
+    # ``position`` is absolute, so an iterator minted before records expired
+    # still lands correctly; one that now points behind the trim horizon
+    # resumes at the horizon rather than skipping live records.
+    position = max(position, _horizon(account_id, region, table_name))
+    page = _ddb.stream_records_since(
+        table_name, position, limit, account_id=account_id, region=region
+    )
     next_position = position + len(page)
     next_iterator = _encode_iterator(
         table_name,

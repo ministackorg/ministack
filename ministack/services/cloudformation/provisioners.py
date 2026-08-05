@@ -557,6 +557,7 @@ def _ddb_create(logical_id, props, stack_name):
 
 def _ddb_delete(physical_id, props):
     _dynamodb._tables.pop(physical_id, None)
+    _dynamodb.drop_stream_records(physical_id)
 
 
 def _ddb_global_table_create(logical_id, props, stack_name):
@@ -2513,6 +2514,7 @@ def _lambda_esm_create(logical_id, props, stack_name):
 
 def _lambda_esm_delete(physical_id, props):
     _lambda_svc._esms.pop(physical_id, None)
+    _lambda_svc._release_esm_poll_state(physical_id)
 
 
 def _lambda_esm_update(physical_id, old_props, new_props, stack_name):
@@ -2527,6 +2529,7 @@ def _lambda_esm_update(physical_id, old_props, new_props, stack_name):
         if new_props.get(immutable) != old_props.get(immutable):
             new_id, attrs = _lambda_esm_create(physical_id, new_props, stack_name)
             _lambda_svc._esms.pop(physical_id, None)
+            _lambda_svc._release_esm_poll_state(physical_id)
             return new_id, attrs
     for key in (
         "BatchSize",

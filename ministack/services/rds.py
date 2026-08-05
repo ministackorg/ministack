@@ -3851,6 +3851,35 @@ def _describe_db_snapshots(p):
 # Subnet Groups
 # ---------------------------------------------------------------------------
 
+_INVALID_SUBNET_MESSAGE = (
+    "The requested subnet is invalid, or multiple subnets were requested that "
+    "are not all in a common VPC."
+)
+
+
+def _resolve_subnet_group_members(subnet_ids):
+    from ministack.services import ec2
+
+    ec2._ensure_defaults_initialized()
+    subnets = []
+    vpc_ids = set()
+    for subnet_id in subnet_ids:
+        subnet = ec2._subnets.get(subnet_id)
+        if not subnet:
+            return None
+        vpc_ids.add(subnet["VpcId"])
+        subnets.append({
+            "SubnetIdentifier": subnet_id,
+            "SubnetAvailabilityZone": {
+                "Name": subnet.get("AvailabilityZone", f"{get_region()}a")
+            },
+            "SubnetOutpost": {},
+            "SubnetStatus": "Active",
+        })
+    if len(vpc_ids) != 1:
+        return None
+    return subnets, vpc_ids.pop()
+
 def _create_subnet_group(p):
     name = _p(p, "DBSubnetGroupName")
     if not name:
@@ -3859,13 +3888,15 @@ def _create_subnet_group(p):
     subnet_ids = _parse_member_list(p, "SubnetIds")
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:subgrp:{name}"
 
-    subnets = [{"SubnetIdentifier": sid, "SubnetAvailabilityZone": {"Name": f"{get_region()}a"},
-                "SubnetOutpost": {}, "SubnetStatus": "Active"} for sid in subnet_ids]
+    resolved_subnets = _resolve_subnet_group_members(subnet_ids)
+    if resolved_subnets is None:
+        return _error("InvalidSubnet", _INVALID_SUBNET_MESSAGE, 400)
+    subnets, vpc_id = resolved_subnets
 
     _subnet_groups[name] = {
         "DBSubnetGroupName": name,
         "DBSubnetGroupDescription": desc,
-        "VpcId": "vpc-00000000",
+        "VpcId": vpc_id,
         "SubnetGroupStatus": "Complete",
         "Subnets": subnets,
         "DBSubnetGroupArn": arn,
@@ -4275,15 +4306,23 @@ def _modify_subnet_group(p):
     if not sg:
         return _error("DBSubnetGroupNotFoundFault", f"Subnet group {name} not found.", 404)
 
+    subnet_ids = _parse_member_list(p, "SubnetIds")
+    resolved_subnets = None
+    if subnet_ids:
+        resolved_subnets = _resolve_subnet_group_members(subnet_ids)
+        if resolved_subnets is None:
+            return _error("InvalidSubnet", _INVALID_SUBNET_MESSAGE, 400)
+        stored_vpc_id = sg.get("VpcId")
+        if (
+            stored_vpc_id not in (None, "", "vpc-00000000")
+            and resolved_subnets[1] != stored_vpc_id
+        ):
+            return _error("InvalidSubnet", _INVALID_SUBNET_MESSAGE, 400)
+
     if _p(p, "DBSubnetGroupDescription"):
         sg["DBSubnetGroupDescription"] = _p(p, "DBSubnetGroupDescription")
-
-    subnet_ids = _parse_member_list(p, "SubnetIds")
-    if subnet_ids:
-        sg["Subnets"] = [
-            {"SubnetIdentifier": sid, "SubnetAvailabilityZone": {"Name": f"{get_region()}a"},
-             "SubnetOutpost": {}, "SubnetStatus": "Active"} for sid in subnet_ids
-        ]
+    if resolved_subnets is not None:
+        sg["Subnets"], sg["VpcId"] = resolved_subnets
 
     return _xml(200, "ModifyDBSubnetGroupResponse",
         f"<ModifyDBSubnetGroupResult><DBSubnetGroup>{_subnet_group_xml(sg)}</DBSubnetGroup></ModifyDBSubnetGroupResult>")

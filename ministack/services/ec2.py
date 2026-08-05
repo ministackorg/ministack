@@ -1833,6 +1833,9 @@ def _matches_subnet_filters(subnet, filters):
         elif name == "subnet-id":
             if subnet["SubnetId"] not in vals:
                 return False
+        elif name in ("cidr-block", "cidr", "cidrBlock"):
+            if subnet["CidrBlock"] not in vals:
+                return False
         elif name == "default-for-az":
             val = "true" if subnet.get("DefaultForAz") else "false"
             if val not in vals:
