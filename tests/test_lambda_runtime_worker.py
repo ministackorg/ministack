@@ -13,8 +13,11 @@ Python worker. No Docker or running Ministack instance is required.
 
 import io
 import json
+import shutil
 import zipfile
 from unittest.mock import MagicMock, mock_open, patch
+
+import pytest
 
 from ministack.core.lambda_runtime import Worker
 
@@ -31,6 +34,17 @@ def _config():
         "FunctionArn": "arn:aws:lambda:us-east-1:123456789012:function:test-fn",
         "Timeout": 30,
     }
+
+
+def _node_worker(code, extra_files=None):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("index.js", code)
+        for path, contents in (extra_files or {}).items():
+            archive.writestr(path, contents)
+    config = _config()
+    config["Runtime"] = "nodejs20.x"
+    return Worker("test-fn", config, buf.getvalue())
 
 
 def _spawn_proc():
@@ -290,3 +304,104 @@ def test_invoke_gives_up_after_max_lines():
 
     assert result["status"] == "error"
     assert "No JSON response" in result["error"]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_node_worker_resolves_hyphenated_sdk_client_stub():
+    worker = _node_worker(
+        """
+const sdk = require("@aws-sdk/client-secrets-manager");
+exports.handler = async () => ({
+  client: typeof sdk.SecretsManagerClient,
+  command: typeof sdk.GetSecretValueCommand,
+});
+"""
+    )
+    try:
+        result = worker.invoke({}, request_id="sdk-stub")
+    finally:
+        worker.kill()
+
+    assert result["status"] == "ok"
+    assert result["result"] == {"client": "function", "command": "function"}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_node_worker_resolves_expected_sdk_client_stubs():
+    worker = _node_worker(
+        """
+const packages = [
+  "@aws-sdk/client-secrets-manager",
+  "@aws-sdk/client-dynamodb",
+  "@aws-sdk/client-sqs",
+  "@aws-sdk/client-cloudwatch-logs",
+  "@aws-sdk/client-eventbridge",
+  "@aws-sdk/client-cognito-identity-provider",
+  "@aws-sdk/client-dynamodb-streams",
+  "@aws-sdk/client-events",
+  "@aws-sdk/client-logs",
+];
+exports.handler = async () => Object.fromEntries(
+  packages.map((id) => [id, typeof require(id).ContractClient])
+);
+"""
+    )
+    try:
+        result = worker.invoke({}, request_id="sdk-stub-contract")
+    finally:
+        worker.kill()
+
+    assert result["status"] == "ok"
+    assert result["result"] == {
+        "@aws-sdk/client-secrets-manager": "function",
+        "@aws-sdk/client-dynamodb": "function",
+        "@aws-sdk/client-sqs": "function",
+        "@aws-sdk/client-cloudwatch-logs": "function",
+        "@aws-sdk/client-eventbridge": "function",
+        "@aws-sdk/client-cognito-identity-provider": "function",
+        "@aws-sdk/client-dynamodb-streams": "function",
+        "@aws-sdk/client-events": "function",
+        "@aws-sdk/client-logs": "function",
+    }
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_node_worker_prefers_bundled_sdk_client_module():
+    worker = _node_worker(
+        """
+const sdk = require("@aws-sdk/client-custom");
+exports.handler = async () => ({ source: sdk.source });
+""",
+        {
+            "node_modules/@aws-sdk/client-custom/index.js": (
+                'module.exports = { source: "bundle" };\n'
+            )
+        },
+    )
+    try:
+        result = worker.invoke({}, request_id="bundled-sdk")
+    finally:
+        worker.kill()
+
+    assert result["status"] == "ok"
+    assert result["result"] == {"source": "bundle"}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_node_worker_reports_missing_sdk_client_stub():
+    worker = _node_worker(
+        """
+require("@aws-sdk/client-no-local-stub");
+exports.handler = async () => ({ ok: true });
+"""
+    )
+    try:
+        with pytest.raises(RuntimeError) as exc:
+            worker.invoke({}, request_id="missing-sdk")
+    finally:
+        worker.kill()
+
+    message = str(exc.value)
+    assert "@aws-sdk/client-no-local-stub" in message
+    assert "LAMBDA_EXECUTOR=docker" in message
+    assert "Cannot find module" not in message
