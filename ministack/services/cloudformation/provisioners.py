@@ -1587,6 +1587,80 @@ def _cfn_wait_condition_handle_create(logical_id, props, stack_name):
 
 # --- CloudFormation Nested Stack (AWS::CloudFormation::Stack) ---
 
+def _nested_stack_provision_child(resource_type, logical_id, props, stack_name):
+    from ministack.services.cloudformation.stacks import (
+        _STANDARD_PROVISIONER_SERVICES,
+        _run_locked_standard_provisioner_sync,
+    )
+
+    if resource_type in _STANDARD_PROVISIONER_SERVICES:
+        return _run_locked_standard_provisioner_sync(
+            resource_type,
+            _provision_resource,
+            resource_type,
+            logical_id,
+            props,
+            stack_name,
+        )
+    return _provision_resource(resource_type, logical_id, props, stack_name)
+
+
+def _nested_stack_update_child(
+    resource_type, physical_id, old_props, new_props, stack_name, logical_id
+):
+    from ministack.services.cloudformation.stacks import (
+        _STANDARD_PROVISIONER_SERVICES,
+        _run_locked_standard_provisioner_sync,
+    )
+
+    if resource_type in _STANDARD_PROVISIONER_SERVICES:
+        return _run_locked_standard_provisioner_sync(
+            resource_type,
+            _update_resource,
+            resource_type,
+            physical_id,
+            old_props,
+            new_props,
+            stack_name,
+            logical_id,
+        )
+    return _update_resource(
+        resource_type,
+        physical_id,
+        old_props,
+        new_props,
+        stack_name,
+        logical_id,
+    )
+
+
+def _nested_stack_delete_child(
+    resource_type, physical_id, props, stack_name, logical_id
+):
+    from ministack.services.cloudformation.stacks import (
+        _STANDARD_PROVISIONER_SERVICES,
+        _run_locked_standard_provisioner_sync,
+    )
+
+    if resource_type in _STANDARD_PROVISIONER_SERVICES:
+        return _run_locked_standard_provisioner_sync(
+            resource_type,
+            _delete_resource,
+            resource_type,
+            physical_id,
+            props,
+            stack_name,
+            logical_id,
+        )
+    return _delete_resource(
+        resource_type,
+        physical_id,
+        props,
+        stack_name,
+        logical_id,
+    )
+
+
 def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
                              previous_physical_id=None, previous_props=None):
     """Provision an `AWS::CloudFormation::Stack` nested-stack resource.
@@ -1729,13 +1803,13 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
         try:
             prev = prev_resources.get(child_logical_id)
             if prev:
-                physical_id, attrs = _update_resource(
+                physical_id, attrs = _nested_stack_update_child(
                     resource_type, prev.get("PhysicalResourceId", child_logical_id),
                     prev.get("Properties", {}), resolved_props, child_name,
                     child_logical_id,
                 )
             else:
-                physical_id, attrs = _provision_resource(
+                physical_id, attrs = _nested_stack_provision_child(
                     resource_type, child_logical_id, resolved_props, child_name,
                 )
         except Exception as exc:
@@ -1763,10 +1837,13 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
         for stale_id in set(prev_resources) - set(provisioned):
             old = prev_resources[stale_id]
             try:
-                _delete_resource(old.get("ResourceType", ""),
-                                 old.get("PhysicalResourceId", ""),
-                                 old.get("Properties", {}),
-                                 child_name, stale_id)
+                _nested_stack_delete_child(
+                    old.get("ResourceType", ""),
+                    old.get("PhysicalResourceId", ""),
+                    old.get("Properties", {}),
+                    child_name,
+                    stale_id,
+                )
             except Exception as exc:
                 logger.warning("Nested-stack %s: failed to delete pruned %s: %s",
                                child_name, stale_id, exc)
@@ -1854,7 +1931,7 @@ def _cfn_nested_stack_delete(physical_id, props):
         if not res:
             continue
         try:
-            _delete_resource(
+            _nested_stack_delete_child(
                 res.get("ResourceType", ""),
                 res.get("PhysicalResourceId", ""),
                 res.get("Properties", {}),

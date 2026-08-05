@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 import uuid
+from contextlib import AsyncExitStack
 from urllib.parse import parse_qs, unquote
 
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
@@ -161,6 +162,7 @@ _NON_S3_VHOST_NAMES = frozenset({
     "inspector2",
 })
 
+from ministack.core.concurrency import LoopLocal, run_in_thread_to_completion
 from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
 from ministack.core.responses import _12_DIGIT_RE, set_request_account_id, set_request_region
@@ -229,6 +231,24 @@ def _get_module(name: str):
             mod = _ErrorModule(name, str(e))
         _loaded_modules[name] = mod
     return mod
+
+
+def _resolve_loaded_service_module(name: str):
+    """Return an already-loaded service module without importing it."""
+    return _loaded_modules.get(name) or sys.modules.get(f"ministack.services.{name}")
+
+
+# Serialized service keys and every module whose first import establishes the
+# admission lock protecting that request. Keep this as the single source of
+# truth for HTTP dispatch and non-HTTP Step Functions SDK integrations.
+_RESET_ADMISSION_OWNER_MODULES = {
+    "rds": ("rds",),
+    "ecs": ("ecs",),
+    "eks": ("eks",),
+    "elasticache": ("elasticache",),
+    "opensearch": ("opensearch",),
+    "rds-data": ("rds_data", "rds"),
+}
 
 
 def _lazy_handler(module_name: str):
@@ -423,14 +443,245 @@ BANNER = r"""
 """
 
 
-_reset_lock: "asyncio.Lock | None" = None
+class _RequestResetBarrier:
+    """Let ordinary requests run concurrently while giving reset priority."""
+
+    def __init__(self):
+        self._active_requests = 0
+        self._resetting = False
+        self._requests_drained = asyncio.Event()
+        self._requests_drained.set()
+        self._reset_finished = asyncio.Event()
+        self._reset_finished.set()
+
+    async def enter_request(self):
+        while self._resetting:
+            await self._reset_finished.wait()
+        self._active_requests += 1
+        if self._active_requests == 1:
+            self._requests_drained.clear()
+
+    def leave_request(self):
+        self._active_requests -= 1
+        if self._active_requests == 0:
+            self._requests_drained.set()
+
+    async def enter_reset(self):
+        self._resetting = True
+        self._reset_finished.clear()
+        try:
+            await self._requests_drained.wait()
+        except BaseException:
+            self.leave_reset()
+            raise
+
+    def leave_reset(self):
+        self._resetting = False
+        self._reset_finished.set()
+
+
+_reset_locks = LoopLocal(asyncio.Lock)
+_ordinary_request_reset_barriers = LoopLocal(_RequestResetBarrier)
+
+# These routers move synchronous Docker work to worker threads. Reset acquires
+# their admission locks before wiping state so it cannot overlap an in-flight
+# worker or mapped CloudFormation provisioner. Keeping the guard at the service
+# seam avoids a global HTTP reader barrier, which would deadlock an admitted
+# Lambda/custom-resource request that calls back into MiniStack while reset is
+# waiting for that outer request to finish.
+# Reset and Resource Groups Tagging are the only multi-admission-lock holders.
+# Tagging's ECS/ElastiCache pair is a subsequence of this fixed global order.
+_RESET_SERIALIZED_SERVICE_MODULES = (
+    "rds",
+    "ecs",
+    "eks",
+    "elasticache",
+    "opensearch",
+)
 
 
 def _get_reset_lock() -> asyncio.Lock:
-    global _reset_lock
-    if _reset_lock is None:
-        _reset_lock = asyncio.Lock()
-    return _reset_lock
+    return _reset_locks.get()
+
+
+def _get_ordinary_request_reset_barrier() -> _RequestResetBarrier:
+    return _ordinary_request_reset_barriers.get()
+
+
+async def _complete_reset_after_stack_admission_closes(
+    stack_tasks, sync_actions, barrier
+):
+    """Run the committed reset sequence and always reopen its admission."""
+    barrier_entered = False
+    try:
+        # Hold no request or service lock while cancelling stack tasks:
+        # unwinding provisioners may themselves need an admission lock or
+        # callback request.
+        await stack_tasks.begin_reset()
+        # CloudFormation drains first: unwinding custom resources may start a
+        # synchronous execution. Once that work is quiescent, close and drain
+        # the dedicated SFN actions before taking the request writer barrier.
+        await sync_actions.begin_reset()
+        await barrier.enter_reset()
+        barrier_entered = True
+        async with AsyncExitStack() as stack:
+            for module_name in _RESET_SERIALIZED_SERVICE_MODULES:
+                module = _resolve_loaded_service_module(module_name)
+                if module is None:
+                    # First-touch imports for these services hold reader status,
+                    # so none can appear after this writer-side absence check.
+                    continue
+                if isinstance(module, _ErrorModule):
+                    # A failed import has no state or in-flight worker to
+                    # serialize. Healthy modules missing this seam remain a
+                    # loud wiring error rather than being silently skipped.
+                    continue
+                await stack.enter_async_context(module._get_request_dispatch_lock())
+            await run_in_thread_to_completion(_reset_all_state)
+    finally:
+        # Locks have already been released by AsyncExitStack. Re-open all
+        # admission in one non-awaiting sequence so excluded states requests
+        # cannot start between the wipe and reset completion.
+        if barrier_entered:
+            barrier.leave_reset()
+        sync_actions.finish_reset()
+        stack_tasks.finish_reset()
+
+
+async def _reset_all_state_after_service_dispatch_drains():
+    """Quiesce stack work and requests before wiping mutable service state."""
+    from ministack.services import stepfunctions_lifecycle
+    from ministack.services.cloudformation import lifecycle as cfn_lifecycle
+
+    stack_tasks = cfn_lifecycle._get_stack_task_lifecycle()
+    sync_actions = stepfunctions_lifecycle._get_sync_action_lifecycle()
+    barrier = _get_ordinary_request_reset_barrier()
+    reset = asyncio.create_task(
+        _complete_reset_after_stack_admission_closes(
+            stack_tasks, sync_actions, barrier
+        )
+    )
+    try:
+        await asyncio.shield(reset)
+    except asyncio.CancelledError as cancellation:
+        # Once stack admission begins closing, cancellation must not reopen it
+        # before the drain, barrier, service locks, and wipe all complete.
+        while not reset.done():
+            try:
+                await asyncio.shield(reset)
+            except asyncio.CancelledError:
+                continue
+        # Propagate an internal reset failure instead of misreporting a clean
+        # cancelled reset; otherwise preserve the caller's first cancellation.
+        reset.result()
+        raise cancellation
+
+
+_RESET_ADMISSION_SERVICE_KEYS = set(_RESET_ADMISSION_OWNER_MODULES)
+
+# These request handlers can synchronously wait for code that calls back into
+# MiniStack. Holding them as reset readers would recreate a parent-reader ->
+# reset-writer -> nested-reader deadlock. Their reset races match upstream main.
+_RESET_CALLBACK_SERVICE_KEYS = {
+    "lambda",          # invoked function may use an AWS SDK against the gateway
+    # StartSyncExecution/TestState use a dedicated reset lifecycle; background
+    # StartExecution threads remain the documented main-equivalent residual.
+    "states",
+    "cognito-idp",     # user-pool Lambda triggers
+    "cognito-identity",
+    "appsync",         # Lambda authorizers/resolvers
+    "appsync-events",  # Lambda authorizers
+    "firehose",        # transforms/delivery call back through the gateway
+    "sns",             # HTTP subscriptions and Lambda delivery callbacks
+}
+
+
+def _ordinary_request_uses_reset_barrier(method, path, headers, body, query_params):
+    """Classify HTTP readers after body-backed Query routing is available."""
+    if path.startswith("/_ministack/cfn-response/"):
+        return False
+
+    host = headers.get("host", "")
+    # API Gateway, Lambda Function URL, and ALB data planes may synchronously
+    # invoke Lambda, whose function can issue a nested request back here.
+    if (
+        _parse_execute_api_url(host, path) is not None
+        or _parse_lambda_url(host, path) is not None
+        or _is_potential_alb_request(host, path)
+    ):
+        return False
+
+    routing_params = _routing_params(method, path, headers, body, query_params)
+    service = detect_service(method, path, headers, routing_params)
+    if service == "tagging":
+        if service not in SERVICE_HANDLERS:
+            return True
+        from ministack.services import tagging
+
+        try:
+            _, _, locked_services = tagging.classify_request_admission(headers, body)
+        except (json.JSONDecodeError, tagging.InvalidRequestBody):
+            # Invalid requests hold no admission lock, so keep them behind the
+            # reset reader barrier even though they will fail in the router.
+            return True
+        # Empty means this request holds no service lock and therefore needs the
+        # ordinary reader barrier. A mixed locked + lockless request is safe to
+        # exclude because its synchronous body stays under the locked service.
+        return not locked_services
+    return service not in _RESET_ADMISSION_SERVICE_KEYS | _RESET_CALLBACK_SERVICE_KEYS
+
+
+async def _ensure_reset_admission_owner_modules(module_names) -> None:
+    """Import absent serialized owners under reset-reader status."""
+    module_names = tuple(dict.fromkeys(module_names))
+    if not module_names or all(
+        _resolve_loaded_service_module(name) is not None for name in module_names
+    ):
+        return
+
+    barrier = _get_ordinary_request_reset_barrier()
+    await barrier.enter_request()
+    try:
+        # Recheck after admission: another first-touch request may have loaded
+        # an owner while this request waited.
+        for module_name in module_names:
+            if _resolve_loaded_service_module(module_name) is None:
+                _get_module(module_name)
+    finally:
+        barrier.leave_request()
+
+
+def _reset_admission_owner_modules_for_request(service, headers, body):
+    """Return serialized owner modules first-touched by one HTTP request."""
+    if service not in SERVICE_HANDLERS:
+        return ()
+    if service == "tagging":
+        from ministack.services import tagging
+
+        try:
+            _, _, locked_services = tagging.classify_request_admission(headers, body)
+        except (json.JSONDecodeError, tagging.InvalidRequestBody):
+            return ()
+        return tuple(locked_services)
+    return _RESET_ADMISSION_OWNER_MODULES.get(service, ())
+
+
+async def _gate_first_touch_reset_admission_modules(
+    service: str, headers: dict, body: bytes
+) -> None:
+    """Gate every serialized owner a request can first-touch."""
+    await _ensure_reset_admission_owner_modules(
+        _reset_admission_owner_modules_for_request(service, headers, body)
+    )
+
+
+async def _dispatch_serialized_service_request(service: str, *args):
+    """Gate, import, and dispatch a serialized service on the gateway loop."""
+    await _ensure_reset_admission_owner_modules(
+        _RESET_ADMISSION_OWNER_MODULES[service]
+    )
+    module_name = SERVICE_REGISTRY[service]["module"]
+    return await _get_module(module_name).handle_request(*args)
 
 
 # ---------------------------------------------------------------------------
@@ -688,7 +939,7 @@ async def _handle_admin_reset(path: str, method: str, query_params: dict):
         return None
 
     async with _get_reset_lock():
-        await asyncio.to_thread(_reset_all_state)
+        await _reset_all_state_after_service_dispatch_drains()
 
     run_init = query_params.get("init", [""])[0] == "1"
     if run_init:
@@ -1162,6 +1413,8 @@ async def _handle_s3_control_request(path: str, method: str, body: bytes, query_
 async def _handle_rds_data_request(method: str, path: str, headers: dict, body: bytes, query_params: dict):
     """Handle RDS Data API operations before generic routing."""
     if path not in _RDS_DATA_PATHS:
+        return None
+    if "rds-data" not in SERVICE_HANDLERS:
         return None
     return await _get_module("rds_data").handle_request(method, path, headers, body, query_params)
 
@@ -1734,6 +1987,65 @@ async def _dispatch_service_request(
     return status, resp_headers, resp_body
 
 
+def _establish_http_request_context(headers: dict, query_params: dict) -> None:
+    """Establish account and region context before request-time imports."""
+    # Set per-request account ID from credentials (multi-tenancy support).
+    # If the access key is a 12-digit number, it becomes the account ID.
+    access_key = extract_access_key_id(headers, query_params)
+    if access_key:
+        set_request_account_id(access_key)
+
+    # Set per-request region from SigV4 Credential scope so CFN's AWS::Region
+    # pseudo-param and ARN-building use the caller's region, not MINISTACK_REGION
+    # (issue #398). Falls back to MINISTACK_REGION env. Presigned (SigV4 query)
+    # requests carry the credential in query params, not the header.
+    set_request_region(extract_region(headers, query_params))
+
+
+async def _handle_http_request(
+    method: str,
+    path: str,
+    headers: dict,
+    query_params: dict,
+    request_id: str,
+    receive,
+    send,
+    body=None,
+):
+    """Process one HTTP request after reset admission is decided."""
+    if await _send_if_handled(
+        send,
+        await _handle_pre_body_request(method, path, headers, query_params, request_id),
+    ):
+        return
+
+    if body is None:
+        body = await _read_request_body(receive, method, headers)
+
+    if await _send_if_handled(
+        send,
+        await _handle_post_body_shortcuts(
+            method, path, headers, body, query_params, request_id
+        ),
+    ):
+        return
+
+    if await _send_if_handled(
+        send,
+        await _handle_special_data_plane_request(
+            method, path, headers, body, query_params, request_id
+        ),
+    ):
+        return
+
+    await _send_response(
+        send,
+        *await _dispatch_service_request(
+            method, path, headers, body, query_params, request_id
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # ASGI entry point
 # ---------------------------------------------------------------------------
@@ -1818,42 +2130,38 @@ async def app(scope, receive, send):
         except UnicodeDecodeError:
             headers[name.decode("latin-1").lower()] = value.decode("latin-1")
 
+    _establish_http_request_context(headers, query_params)
     request_id = str(uuid.uuid4())
 
-    # If a /_ministack/reset is in flight, wait for it to finish before
-    # serving this request. The lock is uncontended in steady state
-    # (acquire/release is near-free); during a reset, new requests block
-    # until state-wipe completes so no test can observe a half-reset server.
-    if path != "/_ministack/reset":
-        async with _get_reset_lock():
-            pass
-
-    # Set per-request account ID from credentials (multi-tenancy support).
-    # If the access key is a 12-digit number, it becomes the account ID.
-    _access_key = extract_access_key_id(headers, query_params)
-    if _access_key:
-        set_request_account_id(_access_key)
-
-    # Set per-request region from SigV4 Credential scope so CFN's AWS::Region
-    # pseudo-param and ARN-building use the caller's region, not MINISTACK_REGION
-    # (issue #398). Falls back to MINISTACK_REGION env. Presigned (SigV4 query)
-    # requests carry the credential in query params, not the header.
-    set_request_region(extract_region(headers, query_params))
-
-    if await _send_if_handled(send, await _handle_pre_body_request(method, path, headers, query_params, request_id)):
+    if path == "/_ministack/reset":
+        await _handle_http_request(
+            method, path, headers, query_params, request_id, receive, send
+        )
         return
 
+    # Reading the wire body touches no service state. Preload it so unsigned
+    # Query requests can be classified by Action before either ordering domain
+    # is entered, then pass it through without a second receive.
     body = await _read_request_body(receive, method, headers)
 
-    if await _send_if_handled(send, await _handle_post_body_shortcuts(method, path, headers, body, query_params, request_id)):
+    routing_params = _routing_params(method, path, headers, body, query_params)
+    service = detect_service(method, path, headers, routing_params)
+    await _gate_first_touch_reset_admission_modules(service, headers, body)
+
+    if not _ordinary_request_uses_reset_barrier(method, path, headers, body, query_params):
+        await _handle_http_request(
+            method, path, headers, query_params, request_id, receive, send, body
+        )
         return
 
-    if await _send_if_handled(
-        send, await _handle_special_data_plane_request(method, path, headers, body, query_params, request_id)
-    ):
-        return
-
-    await _send_response(send, *await _dispatch_service_request(method, path, headers, body, query_params, request_id))
+    barrier = _get_ordinary_request_reset_barrier()
+    await barrier.enter_request()
+    try:
+        await _handle_http_request(
+            method, path, headers, query_params, request_id, receive, send, body
+        )
+    finally:
+        barrier.leave_request()
 
 
 # ---------------------------------------------------------------------------
@@ -1934,6 +2242,18 @@ async def _handle_lifespan(scope, receive, send):
             asyncio.create_task(_run_ready_scripts())
         elif message["type"] == "lifespan.shutdown":
             logger.info("MiniStack shutting down...")
+            try:
+                from ministack.services import eventbridge as _eb_mod
+
+                await asyncio.to_thread(_eb_mod.stop_scheduler)
+            except Exception as e:
+                logger.debug("EventBridge scheduler shutdown error: %s", e)
+            try:
+                from ministack.services import scheduler as _sched_mod
+
+                await asyncio.to_thread(_sched_mod.stop_scheduler)
+            except Exception as e:
+                logger.debug("Scheduler shutdown error: %s", e)
             if PERSIST_STATE:
                 save_all(_build_persistence_save_dict())
             try:
@@ -2246,7 +2566,7 @@ def _reset_all_state():
         # Without the `sys.modules` fallback, those modules silently skip reset
         # — leaving state across `/_ministack/reset` calls and breaking test
         # isolation.
-        mod = _loaded_modules.get(mod_name) or sys.modules.get(f"ministack.services.{mod_name}")
+        mod = _resolve_loaded_service_module(mod_name)
         if mod is None or not hasattr(mod, "reset"):
             continue
         try:

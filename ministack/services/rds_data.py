@@ -11,6 +11,7 @@ import threading
 import uuid
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import run_in_thread_to_completion
 from ministack.core.responses import AccountRegionScopedDict, error_response_json, get_account_id, json_response
 
 logger = logging.getLogger("rds-data")
@@ -489,7 +490,26 @@ def _convert_parameters(parameters):
 
 
 async def handle_request(method, path, headers, body, query_params):
-    """Route RDS Data API requests by path."""
+    """Route RDS Data API requests under the RDS admission lock."""
+    # RDS control-plane dispatch now runs in a worker. RDS Data reads cluster
+    # and member records directly (and may fill a member endpoint from its
+    # cluster), so share the RDS admission lock to preserve the event loop's
+    # former serialization with those mutations.
+    from ministack.services import rds
+
+    async with rds._get_request_dispatch_lock():
+        return await run_in_thread_to_completion(
+            _handle_request_unlocked,
+            method,
+            path,
+            headers,
+            body,
+            query_params,
+        )
+
+
+def _handle_request_unlocked(method, path, headers, body, query_params):
+    """Synchronous RDS Data router for locked HTTP and Step Functions paths."""
     try:
         data = json.loads(body) if body else {}
     except (json.JSONDecodeError, TypeError):
@@ -506,6 +526,7 @@ async def handle_request(method, path, headers, body, query_params):
     handler = handlers.get(path)
     if not handler:
         return _error("BadRequestException", f"Unknown RDS Data API path: {path}")
+
     return handler(data)
 
 

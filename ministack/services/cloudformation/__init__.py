@@ -41,6 +41,11 @@ from .helpers import _p  # noqa: E402
 
 async def handle_request(method: str, path: str, headers: dict,
                          body: bytes, query_params: dict) -> tuple:
+    # Keep the provisioner graph lazy: reset imports only the lightweight
+    # stack-task lifecycle submodule, while real CloudFormation traffic loads
+    # the action registry on first dispatch.
+    from .handlers import _ACTION_HANDLERS
+
     params = dict(query_params)
     content_type = headers.get("content-type", "")
     target = headers.get("x-amz-target", "")
@@ -78,7 +83,8 @@ def reset():
     _cr.reset()
 
 
-# Must be last — handlers imports from this module
-from ministack.core.responses import get_account_id
+def _validate_template(params):
+    """Compatibility wrapper that preserves lazy action-handler loading."""
+    from .handlers import _validate_template as validate_template
 
-from .handlers import _ACTION_HANDLERS, _validate_template  # noqa: E402
+    return validate_template(params)

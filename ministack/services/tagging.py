@@ -23,6 +23,7 @@ denormalise on write.
 
 import json
 import logging
+from contextlib import AsyncExitStack
 
 from ministack.core.arn import Arn, ArnParseError, parse_arn
 from ministack.core.responses import get_region
@@ -31,6 +32,66 @@ logger = logging.getLogger("tagging")
 
 
 _GLOBAL_RESOURCE_SERVICES = {"cloudfront", "s3"}
+
+# Resource Groups Tagging reads and mutates tag state owned by these services.
+# Their API routers run in worker threads, so participate in the same admission
+# scheme to preserve the event loop's former serialization. Keep this order in
+# sync with app._RESET_SERIALIZED_SERVICE_MODULES to avoid lock-order cycles.
+_ADMISSION_LOCKED_SERVICE_MODULES = ("ecs", "elasticache")
+
+
+class InvalidRequestBody(ValueError):
+    """Raised when a tagging request body is valid JSON but not an object."""
+
+
+def _get_service_admission_lock(module_name):
+    if module_name == "ecs":
+        from ministack.services import ecs as service
+    else:
+        from ministack.services import elasticache as service
+    return service._get_request_dispatch_lock()
+
+
+def _admission_locked_services_for_request(action, data):
+    if action in {"TagResources", "UntagResources"} or data.get("ResourceARNList"):
+        services = set()
+        for arn in data.get("ResourceARNList", []):
+            try:
+                services.add(parse_arn(arn).service)
+            except ArnParseError:
+                continue
+    elif action == "GetResources" and data.get("ResourceTypeFilters"):
+        services = {value.split(":", 1)[0] for value in data["ResourceTypeFilters"]}
+    else:
+        # Unfiltered resource/key/value discovery visits every collector.
+        services = set(_ADMISSION_LOCKED_SERVICE_MODULES)
+
+    return tuple(
+        service for service in _ADMISSION_LOCKED_SERVICE_MODULES if service in services
+    )
+
+
+def classify_request_admission(headers, body):
+    """Parse one request and return its action, data, and admission locks.
+
+    This is the single classification seam shared by the HTTP reset barrier and
+    this router. A mixed request (for example ECS + S3 ARNs) is safe under the
+    ECS lock: reset acquires every service lock before wiping either service, so
+    the whole synchronous tagging operation completes before the wipe begins.
+    """
+    target = headers.get("x-amz-target", "")
+    action = target.split(".")[-1] if "." in target else ""
+    data = json.loads(body) if body else {}
+    if not isinstance(data, dict):
+        raise InvalidRequestBody("request body must be a JSON object")
+    return action, data, _admission_locked_services_for_request(action, data)
+
+
+async def _run_with_service_admission_locks(handler, data, module_names):
+    async with AsyncExitStack() as stack:
+        for module_name in module_names:
+            await stack.enter_async_context(_get_service_admission_lock(module_name))
+        return handler(data)
 
 
 class _ResourceNotFound(Exception):
@@ -1078,12 +1139,9 @@ _HANDLERS = {
 
 
 async def handle_request(method, path, headers, body, query_params):
-    target = headers.get("x-amz-target", "")
-    action = target.split(".")[-1] if "." in target else ""
-
     try:
-        data = json.loads(body) if body else {}
-    except json.JSONDecodeError:
+        action, data, locked_services = classify_request_admission(headers, body)
+    except (json.JSONDecodeError, InvalidRequestBody):
         return 400, {"Content-Type": "application/x-amz-json-1.1", "x-amzn-errortype": "SerializationException"}, json.dumps({
             "__type": "SerializationException",
             "message": "Invalid JSON",
@@ -1096,7 +1154,7 @@ async def handle_request(method, path, headers, body, query_params):
             "message": f"Unknown action: {action}",
         }).encode()
 
-    return handler(data)
+    return await _run_with_service_admission_locks(handler, data, locked_services)
 
 
 def reset():

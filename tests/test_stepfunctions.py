@@ -13,6 +13,8 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 from conftest import ENDPOINT
 
+from ministack.services import stepfunctions as stepfunctions_service
+
 
 def _make_zip(code: str) -> bytes:
     buf = io.BytesIO()
@@ -5932,6 +5934,45 @@ def test_sfn_wait_scale_zero_skips_wait(sfn):
 # ---------------------------------------------------------------------------
 # Step Functions versioning (PublishStateMachineVersion / List / Delete)
 # ---------------------------------------------------------------------------
+
+def test_sfn_list_versions_orders_equal_timestamps_by_numeric_publish_sequence(
+    monkeypatch,
+):
+    """Newest-first ordering uses numeric publish order, not timestamps or text."""
+    frozen_timestamp = "2026-08-04T00:00:00.000Z"
+    monkeypatch.setattr(stepfunctions_service, "now_iso", lambda: frozen_timestamp)
+
+    name = f"version-order-{_uuid_mod.uuid4().hex[:8]}"
+    create_response = stepfunctions_service._create_state_machine({
+        "name": name,
+        "definition": _pass_definition(),
+        "roleArn": "arn:aws:iam::000000000000:role/r",
+    })
+    sm_arn = json.loads(create_response[2])["stateMachineArn"]
+
+    version_arns = []
+    try:
+        for _ in range(10):
+            publish_response = stepfunctions_service._publish_state_machine_version({
+                "stateMachineArn": sm_arn,
+            })
+            version_arns.append(
+                json.loads(publish_response[2])["stateMachineVersionArn"]
+            )
+
+        listed_response = stepfunctions_service._list_state_machine_versions({
+            "stateMachineArn": sm_arn,
+        })
+        listed = json.loads(listed_response[2])["stateMachineVersions"]
+
+        assert {version["creationDate"] for version in listed} == {frozen_timestamp}
+        assert [version["stateMachineVersionArn"] for version in listed] == list(
+            reversed(version_arns)
+        )
+    finally:
+        for version_arn in version_arns:
+            stepfunctions_service._state_machine_versions.pop(version_arn, None)
+        stepfunctions_service._delete_state_machine({"stateMachineArn": sm_arn})
 
 def test_sfn_publish_state_machine_version(sfn):
     """Publish two versions, list them, delete one, re-list.

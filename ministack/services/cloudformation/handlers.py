@@ -23,7 +23,17 @@ from .engine import (
     _resolve_parameters,
     _resolve_refs,
 )
-from .helpers import CFN_NS, _error, _esc, _extract_members, _extract_stack_status_filters, _p, _resolve_template, _xml
+from .helpers import (
+    CFN_NS,
+    _error,
+    _esc,
+    _extract_members,
+    _extract_stack_status_filters,
+    _mutation_admission_error,
+    _p,
+    _resolve_template,
+    _xml,
+)
 from .provisioners import _provision_resource
 from .stacks import (
     _add_event,
@@ -40,6 +50,8 @@ logger = logging.getLogger("cloudformation")
 # --- CreateStack ---
 
 def _create_stack(params):
+    if admission_error := _mutation_admission_error():
+        return admission_error
     from ministack.services.cloudformation import _change_sets, _exports, _stack_events, _stacks
     stack_name = _p(params, "StackName")
     if not stack_name:
@@ -418,6 +430,8 @@ def _get_template(params):
 # --- DeleteStack ---
 
 def _delete_stack(params):
+    if admission_error := _mutation_admission_error():
+        return admission_error
     from ministack.services.cloudformation import _stacks
     stack_name = _p(params, "StackName")
     if not stack_name:
@@ -460,6 +474,8 @@ def _delete_stack(params):
 # --- UpdateStack ---
 
 def _update_stack(params):
+    if admission_error := _mutation_admission_error():
+        return admission_error
     from ministack.services.cloudformation import _stacks
     stack_name = _p(params, "StackName")
     if not stack_name:

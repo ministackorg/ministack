@@ -20,7 +20,9 @@ Supports: CreateEventBus, UpdateEventBus, DeleteEventBus, ListEventBuses, Descri
           ListEventSources, PutPartnerEvents.
 """
 
+import asyncio
 import calendar
+import contextvars
 import copy
 import fnmatch
 import hashlib
@@ -913,6 +915,10 @@ def _resolve_taggable_events_arn(arn):
 
 
 def _put_events(data):
+    try:
+        server_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        server_loop = None
     entries = data.get("Entries", [])
     # AWS spec: PutEvents.Entries list min=1 max=10. Real AWS rejects with
     # ValidationException; matching that here so SDKs see the same constraint.
@@ -953,7 +959,7 @@ def _put_events(data):
         results.append({"EventId": event_id})
         logger.debug("EventBridge event: %s / %s", entry.get('Source'), entry.get('DetailType'))
 
-        _dispatch_event(event_record)
+        _dispatch_event(event_record, server_loop=server_loop)
         _archive_event(event_record)
 
     return json_response({"FailedEntryCount": failed, "Entries": results})
@@ -972,7 +978,7 @@ def _archive_event(event):
         archive["EventCount"] = archive.get("EventCount", 0) + 1
 
 
-def _dispatch_event(event):
+def _dispatch_event(event, *, server_loop):
     bus_name = event.get("EventBusName", "default")
     event_path = set(event.get("_DispatchPath") or [])
 
@@ -990,7 +996,10 @@ def _dispatch_event(event):
         if _matches_pattern(rule["EventPattern"], event):
             rule_targets = _targets.get(key, [])
             for target in rule_targets:
-                _invoke_target(target, event, rule)
+                if server_loop is None:
+                    _invoke_target(target, event, rule)
+                else:
+                    _invoke_target(target, event, rule, server_loop=server_loop)
 
 
 def _matches_pattern(pattern_str, event):
@@ -1140,7 +1149,7 @@ def _matches_content_filter(value, filter_rule):
     return False
 
 
-def _invoke_target(target, event, rule):
+def _invoke_target(target, event, rule, *, server_loop=None):
     arn = target.get("Arn", "")
     event_path = set(event.get("_DispatchPath") or [])
 
@@ -1191,9 +1200,16 @@ def _invoke_target(target, event, rule):
             return
 
         if spec.service == "events":
-            _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload)
+            _dispatch_to_event_bus(
+                spec,
+                event,
+                rule,
+                event_path,
+                target_input_payload,
+                server_loop=server_loop,
+            )
         elif spec.service == "states":
-            _dispatch_to_stepfunctions(arn, event_payload)
+            _dispatch_to_stepfunctions(arn, event_payload, server_loop)
         elif not _target_matches_request_scope(spec):
             # AWS parity: EventBridge accepts cross-region SNS/SQS targets at PutTargets, then records a
             # FailedInvocations delivery failure without cross-region delivery. MiniStack does not model
@@ -1222,7 +1238,15 @@ def _target_matches_request_scope(spec) -> bool:
     return spec.account_id == get_account_id() and spec.region == get_region()
 
 
-def _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload=None):
+def _dispatch_to_event_bus(
+    spec,
+    event,
+    rule,
+    event_path,
+    target_input_payload=None,
+    *,
+    server_loop=None,
+):
     if spec.service != "events" or not spec.resource.startswith("event-bus/"):
         logger.warning("EventBridge -> Event bus: unsupported event target ARN %s", spec)
         return
@@ -1245,7 +1269,7 @@ def _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload=N
     forwarded["_DispatchPath"] = [*event_path, source_rule_key]
     if target_input_payload is not None:
         forwarded["Detail"] = target_input_payload
-    _dispatch_event(forwarded)
+    _dispatch_event(forwarded, server_loop=server_loop)
     archived = dict(forwarded)
     archived.pop("_DispatchPath", None)
     _archive_event(archived)
@@ -1407,7 +1431,7 @@ def _dispatch_to_sns(arn, payload):
     logger.info("EventBridge → SNS %s", arn)
 
 
-def _dispatch_to_stepfunctions(arn, payload):
+def _dispatch_to_stepfunctions(arn, payload, server_loop=None):
     from ministack.services import stepfunctions as _sfn
 
     # Accept all three SFN target ARN shapes EventBridge supports in real
@@ -1419,10 +1443,13 @@ def _dispatch_to_stepfunctions(arn, payload):
         return
 
     sm_name = arn.rsplit(":", 1)[-1]
-    _sfn._start_execution({
-        "stateMachineArn": arn,
-        "input": payload,
-    })
+    _sfn._start_execution_with_server_loop(
+        {
+            "stateMachineArn": arn,
+            "input": payload,
+        },
+        server_loop,
+    )
     logger.info("EventBridge → Step Functions %s: dispatched", sm_name)
 
 
@@ -1563,6 +1590,10 @@ def _list_archives(data):
 # ---------------------------------------------------------------------------
 
 def _start_replay(data):
+    try:
+        server_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        server_loop = None
     name = data.get("ReplayName")
     if not name:
         return error_response_json("ValidationException", "ReplayName is required", 400)
@@ -1635,14 +1666,15 @@ def _start_replay(data):
                     continue
                 replayed = dict(event)
                 replayed["EventBusName"] = dest_bus_name
-                _dispatch_event(replayed)
+                _dispatch_event(replayed, server_loop=server_loop)
             replay["State"] = "COMPLETED"
             replay["ReplayEndTime"] = _now_ts()
         finally:
             set_request_account_id(previous_account)
             set_request_region(previous_region)
 
-    t = threading.Thread(target=_run, daemon=True)
+    replay_context = contextvars.copy_context()
+    t = threading.Thread(target=replay_context.run, args=(_run,), daemon=True)
     t.start()
 
     # Real AWS StartReplay returns the initial state STARTING; the
@@ -2454,7 +2486,7 @@ def _cron_next_fire(fields, after_dt: datetime) -> datetime | None:
     return None
 
 
-def _tick_scheduled_rules():
+def _tick_scheduled_rules(server_loop=None):
     """Fire any enabled scheduled rule whose interval has elapsed."""
     now = _now_ts()
     now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
@@ -2535,7 +2567,15 @@ def _tick_scheduled_rules():
             }
             for target in targets:
                 try:
-                    _invoke_target(target, event, rule)
+                    if server_loop is None:
+                        _invoke_target(target, event, rule)
+                    else:
+                        _invoke_target(
+                            target,
+                            event,
+                            rule,
+                            server_loop=server_loop,
+                        )
                 except Exception:
                     logger.exception(
                         "EventBridge scheduler: dispatch error for rule %s account %s",
@@ -2546,29 +2586,55 @@ def _tick_scheduled_rules():
             set_request_region(previous_region)
 
 
-def _scheduler_loop():
-    while True:
-        time.sleep(_SCHEDULER_TICK_INTERVAL)
+def _scheduler_loop(server_loop, stop_event):
+    while not stop_event.wait(_SCHEDULER_TICK_INTERVAL):
         try:
-            _tick_scheduled_rules()
+            _tick_scheduled_rules(server_loop)
         except Exception:
             logger.exception("EventBridge scheduler tick error")
 
 
 _scheduler_thread: "threading.Thread | None" = None
+_scheduler_stop_event: "threading.Event | None" = None
 
 
 def start_scheduler() -> None:
     """Start the eb-scheduler daemon thread (idempotent). Called from the
     gateway lifespan.startup. Kept out of module-import scope so unit tests
     that patch ``_invoke_target`` don't race against a background tick."""
-    global _scheduler_thread
+    global _scheduler_stop_event, _scheduler_thread
     if _scheduler_thread is not None and _scheduler_thread.is_alive():
         return
+    try:
+        server_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # Direct unit callers may start the ticker without an ASGI lifecycle.
+        # Any SFN target then retains the defined States.Runtime backstop.
+        server_loop = None
+    _scheduler_stop_event = threading.Event()
     _scheduler_thread = threading.Thread(
-        target=_scheduler_loop, daemon=True, name="eb-scheduler"
+        target=_scheduler_loop,
+        args=(server_loop, _scheduler_stop_event),
+        daemon=True,
+        name="eb-scheduler",
     )
     _scheduler_thread.start()
+
+
+def stop_scheduler() -> None:
+    """Stop the lifecycle-owned scheduler so a new app gets a fresh loop."""
+    global _scheduler_stop_event, _scheduler_thread
+    thread = _scheduler_thread
+    stop_event = _scheduler_stop_event
+    if stop_event is not None:
+        stop_event.set()
+    if thread is not None and thread is not threading.current_thread():
+        # Lifespan shutdown runs this helper off the event loop.  Retain
+        # ownership until the prior scheduler has fully exited so a restarted
+        # app cannot overlap a stale thread carrying the closed loop.
+        thread.join()
+    _scheduler_thread = None
+    _scheduler_stop_event = None
 
 
 def reset():

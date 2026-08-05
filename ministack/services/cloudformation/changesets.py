@@ -16,7 +16,16 @@ from .engine import (
     _resolve_parameters,
     _resolve_refs,
 )
-from .helpers import CFN_NS, _error, _esc, _extract_members, _p, _resolve_template, _xml
+from .helpers import (
+    CFN_NS,
+    _error,
+    _esc,
+    _extract_members,
+    _mutation_admission_error,
+    _p,
+    _resolve_template,
+    _xml,
+)
 from .stacks import (
     _add_event,
     _create_stack_task_in_region,
@@ -75,6 +84,8 @@ def _resolve_props_for_diff(template, params, stack_name, stack_id):
 
 
 def _create_change_set(params):
+    if admission_error := _mutation_admission_error():
+        return admission_error
     from ministack.services.cloudformation import _change_sets, _stack_events, _stacks
     stack_name = _p(params, "StackName")
     cs_name = _p(params, "ChangeSetName")
@@ -259,6 +270,8 @@ def _describe_change_set(params):
 # --- ExecuteChangeSet ---
 
 def _execute_change_set(params):
+    if admission_error := _mutation_admission_error():
+        return admission_error
     from ministack.services.cloudformation import _stacks
     cs_name = _p(params, "ChangeSetName")
     stack_name = _p(params, "StackName")
@@ -333,6 +346,8 @@ def _execute_change_set(params):
 # --- DeleteChangeSet ---
 
 def _delete_change_set(params):
+    if admission_error := _mutation_admission_error():
+        return admission_error
     from ministack.services.cloudformation import _change_sets
     cs_name = _p(params, "ChangeSetName")
     stack_name = _p(params, "StackName")

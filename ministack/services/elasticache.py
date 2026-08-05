@@ -20,6 +20,7 @@ When Docker is available, CreateCacheCluster spins up a real Redis/Valkey/Memcac
 container. Otherwise returns localhost:6379 (assumes Redis sidecar in docker-compose).
 """
 
+import asyncio
 import copy
 import logging
 import os
@@ -27,6 +28,7 @@ import time
 from urllib.parse import parse_qs
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import LoopLocal, run_in_thread_to_completion
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -148,6 +150,13 @@ _pending_rg_respawn: set = set()
 import threading as _threading
 
 _respawn_lock = _threading.Lock()
+# Requests previously ran synchronously on the shared event loop. Keep that
+# one-at-a-time state ordering without occupying worker threads while queued.
+_request_dispatch_locks = LoopLocal(asyncio.Lock)
+
+
+def _get_request_dispatch_lock():
+    return _request_dispatch_locks.get()
 
 
 def _as_region_scoped(incoming):
@@ -811,6 +820,18 @@ def _record_event(source_id, source_type, message):
 
 
 async def handle_request(method, path, headers, body, query_params):
+    async with _get_request_dispatch_lock():
+        return await run_in_thread_to_completion(
+            _handle_request_unlocked,
+            method,
+            path,
+            headers,
+            body,
+            query_params,
+        )
+
+
+def _handle_request_unlocked(method, path, headers, body, query_params):
     # Lazy-respawn any clusters / replication groups that were restored
     # from disk (issue #853). Cheap fast-path when nothing's pending.
     _ensure_live_containers()
