@@ -1064,8 +1064,13 @@ def _get_log_events(data):
     forward_token = next_token if (next_token and len(page) < limit) else new_forward
     backward_token = next_token if (next_token and offset == 0 and next_token.startswith("b/")) else new_backward
 
+    # OutputLogEvent is only {timestamp, message, ingestionTime}; strip internal
+    # fields (e.g. the eventId used by FilterLogEvents / GetLogRecord).
     return json_response({
-        "events": page,
+        "events": [
+            {"timestamp": e["timestamp"], "message": e["message"], "ingestionTime": e["ingestionTime"]}
+            for e in page
+        ],
         "nextForwardToken": forward_token,
         "nextBackwardToken": backward_token,
     })
