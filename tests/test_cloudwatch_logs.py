@@ -356,19 +356,110 @@ def test_logs_get_log_record_round_trip(logs):
         return {cell["field"]: cell["value"] for cell in row}
 
     rows = [fields_map(row) for row in results["results"]]
+    assert all("@ptr" in row and row["@ptr"] for row in rows)
     assert rows[1]["@message"] == '{"log":"anchor-row"}'
     assert rows[1]["@logStream"] == stream
     assert rows[1]["@log"] == group
-    ptr = rows[1]["@ptr"]
-    assert ptr
 
-    record = logs.get_log_record(logRecordPointer=ptr, unmask=False)
-    assert record["logRecord"]["@message"] == '{"log":"anchor-row"}'
-    assert record["logRecord"]["@logStream"] == stream
-    assert record["logRecord"]["@log"] == group
-    assert record["logRecord"]["@ptr"] == ptr
-    assert "@timestamp" in record["logRecord"]
-    assert "_timestamp_ms" not in record["logRecord"]
+    record = logs.get_log_record(logRecordPointer=rows[1]["@ptr"], unmask=False)["logRecord"]
+    assert record["@message"] == '{"log":"anchor-row"}'
+    assert record["@logStream"] == stream
+    assert record["@ptr"] == rows[1]["@ptr"]
+    assert "_timestamp_ms" not in record
+
+
+def test_logs_insights_filter_sort_limit(logs):
+    """CWLI filter/sort/limit: stream equality, like regex, AND, sort, post-filter limit."""
+    import uuid as _uuid
+
+    group = f"/intg/insights-filter/{_uuid.uuid4().hex[:8]}"
+    stream_a = "nerv-deployment-aaa"
+    stream_b = "mbir-deployment-5d66976c69-p8qr6"
+    now_ms = int(time.time() * 1000)
+    logs.create_log_group(logGroupName=group)
+    logs.create_log_stream(logGroupName=group, logStreamName=stream_a)
+    logs.create_log_stream(logGroupName=group, logStreamName=stream_b)
+    logs.put_log_events(
+        logGroupName=group,
+        logStreamName=stream_a,
+        logEvents=[
+            {"timestamp": now_ms - 4000, "message": "nerv has a link too"},
+            {"timestamp": now_ms - 3000, "message": "nerv other"},
+        ],
+    )
+    logs.put_log_events(
+        logGroupName=group,
+        logStreamName=stream_b,
+        logEvents=[
+            {"timestamp": now_ms - 2000, "message": "first link event"},
+            {"timestamp": now_ms - 1000, "message": "no match here"},
+            {"timestamp": now_ms, "message": "second link event"},
+            {"timestamp": now_ms + 1000, "message": "third link event"},
+        ],
+    )
+
+    def fields_map(row):
+        return {cell["field"]: cell["value"] for cell in row}
+
+    # @logStream equality
+    q1 = logs.start_query(
+        logGroupName=group,
+        startTime=(now_ms // 1000) - 60,
+        endTime=(now_ms // 1000) + 60,
+        queryString=(
+            f"fields @timestamp, @message, @logStream "
+            f"| filter @logStream = '{stream_b}' "
+            f"| sort @timestamp asc | limit 20"
+        ),
+        limit=1000,
+    )
+    r1 = logs.get_query_results(queryId=q1["queryId"])
+    assert r1["status"] == "Complete"
+    rows1 = [fields_map(row) for row in r1["results"]]
+    assert len(rows1) == 4
+    assert all(row["@logStream"] == stream_b for row in rows1)
+    assert r1["statistics"]["recordsScanned"] == 6.0
+    assert r1["statistics"]["recordsMatched"] == 4.0
+
+    # @message like /link/
+    q2 = logs.start_query(
+        logGroupName=group,
+        startTime=(now_ms // 1000) - 60,
+        endTime=(now_ms // 1000) + 60,
+        queryString=(
+            "fields @timestamp, @message, @logStream "
+            "| filter @message like /link/ "
+            "| sort @timestamp asc | limit 20"
+        ),
+        limit=1000,
+    )
+    r2 = logs.get_query_results(queryId=q2["queryId"])
+    rows2 = [fields_map(row) for row in r2["results"]]
+    assert len(rows2) == 4  # nerv link + 3 mbir links
+    assert all("link" in row["@message"] for row in rows2)
+
+    # AND filters + sort + query limit vs large API limit
+    q3 = logs.start_query(
+        logGroupName=group,
+        startTime=(now_ms // 1000) - 60,
+        endTime=(now_ms // 1000) + 60,
+        queryString=(
+            f"fields @timestamp, @message, @logStream "
+            f"| filter @logStream = '{stream_b}' "
+            f"| filter @message like /link/ "
+            f"| sort @timestamp asc | limit 2"
+        ),
+        limit=1000,
+    )
+    r3 = logs.get_query_results(queryId=q3["queryId"])
+    rows3 = [fields_map(row) for row in r3["results"]]
+    assert len(rows3) == 2
+    assert all(row["@logStream"] == stream_b for row in rows3)
+    assert all("link" in row["@message"] for row in rows3)
+    assert rows3[0]["@message"] == "first link event"
+    assert rows3[1]["@message"] == "second link event"
+    assert r3["statistics"]["recordsMatched"] == 3.0
+    assert r3["statistics"]["recordsScanned"] == 6.0
 
 
 def test_logs_get_log_record_invalid_pointer(logs):

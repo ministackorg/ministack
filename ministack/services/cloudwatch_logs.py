@@ -1462,32 +1462,187 @@ def _describe_metric_filters(data):
 # CloudWatch Logs Insights
 # ---------------------------------------------------------------------------
 
+def _split_insights_pipes(query_string: str) -> list[str]:
+    """Split a CWLI query on ``|`` outside quotes and ``/regex/`` literals."""
+    text = query_string or ""
+    parts: list[str] = []
+    buf: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "|":
+            parts.append("".join(buf).strip())
+            buf = []
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            while i < n:
+                c = text[i]
+                buf.append(c)
+                if c == "\\" and i + 1 < n:
+                    buf.append(text[i + 1])
+                    i += 2
+                    continue
+                if c == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+        if ch == "/":
+            buf.append(ch)
+            i += 1
+            while i < n:
+                c = text[i]
+                buf.append(c)
+                if c == "\\" and i + 1 < n:
+                    buf.append(text[i + 1])
+                    i += 2
+                    continue
+                if c == "/":
+                    i += 1
+                    # optional flags (e.g. i)
+                    while i < n and text[i].isalpha():
+                        buf.append(text[i])
+                        i += 1
+                    break
+                i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    parts.append("".join(buf).strip())
+    return [p for p in parts if p]
+
+
 def _parse_insights_fields(query_string: str) -> list[str]:
     """Extract field names from a simple ``fields a, b | ...`` Insights query.
 
     Falls back to the CWLT/default set when the query has no fields clause.
-    Full CWLI grammar is intentionally not implemented.
+    Supports a CWLI subset: ``fields``, ``filter``, ``sort @timestamp``, ``limit``.
     """
-    match = re.search(r"(?i)\bfields\s+([^|]+)", query_string or "")
-    if not match:
-        return ["@timestamp", "@message", "@logStream", "@log", "@ptr"]
-    fields = [part.strip() for part in match.group(1).split(",") if part.strip()]
-    # Always include @ptr so GetLogRecord can resolve later, even if omitted.
-    if "@ptr" not in fields:
-        fields.append("@ptr")
-    return fields
+    for stage in _split_insights_pipes(query_string):
+        match = re.match(r"(?i)^fields\s+(.+)$", stage.strip())
+        if match:
+            fields = [part.strip() for part in match.group(1).split(",") if part.strip()]
+            if "@ptr" not in fields:
+                fields.append("@ptr")
+            return fields
+    return ["@timestamp", "@message", "@logStream", "@log", "@ptr"]
+
+
+def _clamp_insights_limit(value) -> int | None:
+    try:
+        return max(1, min(int(value), 10000))
+    except (TypeError, ValueError):
+        return None
 
 
 def _parse_insights_limit(query_string: str, explicit_limit) -> int:
-    if explicit_limit is not None:
+    """Effective Insights limit: ``min(query | limit, StartQuery limit)``.
+
+    Both sides default to 10000 when omitted. The query-string limit must apply
+    to the post-filter result set and must not be bypassed by a large API limit.
+    """
+    pipe_limit = None
+    for stage in _split_insights_pipes(query_string):
+        match = re.match(r"(?i)^limit\s+(\d+)\s*$", stage.strip())
+        if match:
+            pipe_limit = _clamp_insights_limit(match.group(1))
+    api_limit = _clamp_insights_limit(explicit_limit) if explicit_limit is not None else None
+    if pipe_limit is None and api_limit is None:
+        return 10000
+    if pipe_limit is None:
+        return api_limit
+    if api_limit is None:
+        return pipe_limit
+    return min(pipe_limit, api_limit)
+
+
+def _compile_insights_filter(stage: str):
+    """Compile one ``filter`` stage into a predicate ``record -> bool``.
+
+    Supported forms:
+    - ``filter @logStream = 'exact'``
+    - ``filter @message like /pattern/`` or ``/pattern/i``
+    """
+    text = stage.strip()
+    if not re.match(r"(?i)^filter\b", text):
+        return None
+    body = re.sub(r"(?i)^filter\s+", "", text, count=1).strip()
+
+    eq = re.match(r"^(@\w+)\s*=\s*'((?:\\'|[^'])*)'\s*$", body)
+    if eq:
+        field, raw = eq.group(1), eq.group(2).replace("\\'", "'")
+
+        def _eq_pred(record, _field=field, _raw=raw):
+            public = _public_log_record(record)
+            return str(public.get(_field, "")) == _raw
+
+        return _eq_pred
+
+    like = re.match(r"^(@\w+)\s+like\s+/((?:\\.|[^/])*)/([i]*)\s*$", body, re.IGNORECASE)
+    if like:
+        field, pattern, flags_s = like.group(1), like.group(2), like.group(3)
+        flags = re.IGNORECASE if "i" in (flags_s or "").lower() else 0
         try:
-            return max(1, min(int(explicit_limit), 10000))
-        except (TypeError, ValueError):
-            pass
-    match = re.search(r"(?i)\blimit\s+(\d+)", query_string or "")
-    if match:
-        return max(1, min(int(match.group(1)), 10000))
-    return 10000
+            compiled = re.compile(pattern, flags)
+        except re.error:
+            return lambda _record: False
+
+        def _like_pred(record, _field=field, _compiled=compiled):
+            public = _public_log_record(record)
+            return _compiled.search(str(public.get(_field, ""))) is not None
+
+        return _like_pred
+
+    # Unsupported filter form — ignore (subset emulator).
+    return None
+
+
+def _parse_insights_sort(query_string: str) -> tuple[str, bool] | None:
+    """Return ``(field, ascending)`` for ``sort @timestamp [asc|desc]``, else None."""
+    for stage in _split_insights_pipes(query_string):
+        match = re.match(
+            r"(?i)^sort\s+(@\w+)(?:\s+(asc|desc))?\s*$",
+            stage.strip(),
+        )
+        if match:
+            field = match.group(1)
+            direction = (match.group(2) or "asc").lower()
+            return field, direction != "desc"
+    return None
+
+
+def _insights_filter_predicates(query_string: str) -> list:
+    preds = []
+    for stage in _split_insights_pipes(query_string):
+        if not re.match(r"(?i)^filter\b", stage.strip()):
+            continue
+        pred = _compile_insights_filter(stage)
+        if pred is not None:
+            preds.append(pred)
+    return preds
+
+
+def _apply_insights_sort(records: list[dict], query_string: str) -> list[dict]:
+    sort_spec = _parse_insights_sort(query_string)
+    if not sort_spec:
+        return records
+    field, ascending = sort_spec
+    if field == "@timestamp":
+        return sorted(
+            records,
+            key=lambda r: r.get("_timestamp_ms", 0),
+            reverse=not ascending,
+        )
+    return sorted(
+        records,
+        key=lambda r: str(_public_log_record(r).get(field, "")),
+        reverse=not ascending,
+    )
 
 
 def _resolve_query_log_groups(data) -> list[str]:
@@ -1550,6 +1705,13 @@ def _row_from_record(record: dict, fields: list[str]) -> list[dict]:
 
 
 def _start_query(data):
+    """Run a CloudWatch Logs Insights query (CWLI subset).
+
+    Supported: ``fields``, chained ``filter`` (``@field = '…'``,
+    ``@field like /regex/[i]``), ``sort @timestamp asc|desc``, and ``limit``.
+    Filters are AND-ed; ``limit`` applies after filter+sort as
+    ``min(query limit, StartQuery limit)``.
+    """
     group_names = _resolve_query_log_groups(data)
     if not group_names:
         return error_response_json(
@@ -1571,10 +1733,16 @@ def _start_query(data):
     start_time = data.get("startTime", 0)
     end_time = data.get("endTime", int(time.time()))
 
-    matched = _collect_query_records(group_names, start_time, end_time)
-    limited = matched[:limit]
+    scanned = _collect_query_records(group_names, start_time, end_time)
+    predicates = _insights_filter_predicates(query_string)
+    if predicates:
+        filtered = [r for r in scanned if all(pred(r) for pred in predicates)]
+    else:
+        filtered = list(scanned)
+    ordered = _apply_insights_sort(filtered, query_string)
+    limited = ordered[:limit]
     results = [_row_from_record(record, fields) for record in limited]
-    bytes_scanned = float(sum(len(r.get("@message", "")) for r in matched))
+    bytes_scanned = float(sum(len(r.get("@message", "")) for r in scanned))
 
     query_id = new_uuid()
     _queries[query_id] = {
@@ -1588,8 +1756,8 @@ def _start_query(data):
         "status": "Complete",
         "results": results,
         "statistics": {
-            "recordsMatched": float(len(matched)),
-            "recordsScanned": float(len(matched)),
+            "recordsMatched": float(len(filtered)),
+            "recordsScanned": float(len(scanned)),
             "bytesScanned": bytes_scanned,
         },
     }
