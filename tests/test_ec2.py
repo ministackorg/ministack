@@ -896,6 +896,47 @@ def test_ec2_internet_gateway_crud(ec2):
     ec2.delete_internet_gateway(InternetGatewayId=igw_id)
     ec2.delete_vpc(VpcId=vpc_id)
 
+def test_ec2_describe_internet_gateways_honors_filters(ec2):
+    """Filters must narrow the result. Test filtering on different parameters"""
+    import uuid as _uuid
+
+    tag = _uuid.uuid4().hex[:8]
+    vpc_id = ec2.create_vpc(CidrBlock="10.39.0.0/16")["Vpc"]["VpcId"]
+    attached = ec2.create_internet_gateway(
+        TagSpecifications=[{"ResourceType": "internet-gateway",
+                            "Tags": [{"Key": "check", "Value": tag}]}],
+    )["InternetGateway"]["InternetGatewayId"]
+    # A second, unattached gateway: Should get ignored by the filters
+    spare = ec2.create_internet_gateway()["InternetGateway"]["InternetGatewayId"]
+    ec2.attach_internet_gateway(InternetGatewayId=attached, VpcId=vpc_id)
+
+    def ids(**kwargs):
+        return sorted(g["InternetGatewayId"]
+                      for g in ec2.describe_internet_gateways(**kwargs)["InternetGateways"])
+
+    try:
+        assert ids(Filters=[{"Name": "attachment.vpc-id", "Values": [vpc_id]}]) == [attached]
+        # Any other attached gateway in the account matches this one too; what it must exclude is
+        # the gateway attached to nothing.
+        state_matched = ids(Filters=[{"Name": "attachment.state", "Values": ["available"]}])
+        assert attached in state_matched and spare not in state_matched
+        assert ids(Filters=[{"Name": "internet-gateway-id", "Values": [spare]}]) == [spare]
+        assert ids(Filters=[{"Name": "tag:check", "Values": [tag]}]) == [attached]
+        # Read the owner off the gateway rather than hardcoding it, so this holds against AWS too.
+        owner = ec2.describe_internet_gateways(
+            InternetGatewayIds=[attached])["InternetGateways"][0]["OwnerId"]
+        assert attached in ids(Filters=[{"Name": "owner-id", "Values": [owner]}])
+        assert ids(Filters=[{"Name": "owner-id", "Values": ["999999999999"]}]) == []
+        # Two values for one name is an OR; no match is an empty list, not "everything".
+        assert ids(Filters=[{"Name": "internet-gateway-id",
+                             "Values": [attached, spare]}]) == sorted([attached, spare])
+        assert ids(Filters=[{"Name": "attachment.vpc-id", "Values": ["vpc-00000000"]}]) == []
+    finally:
+        ec2.detach_internet_gateway(InternetGatewayId=attached, VpcId=vpc_id)
+        ec2.delete_internet_gateway(InternetGatewayId=attached)
+        ec2.delete_internet_gateway(InternetGatewayId=spare)
+        ec2.delete_vpc(VpcId=vpc_id)
+
 def test_ec2_elastic_ip_crud(ec2):
     alloc = ec2.allocate_address(Domain="vpc")
     alloc_id = alloc["AllocationId"]

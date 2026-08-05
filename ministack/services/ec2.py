@@ -1896,6 +1896,7 @@ def _delete_internet_gateway(p):
 
 def _describe_internet_gateways(p):
     filter_ids = _parse_member_list(p, "InternetGatewayId")
+    filters = _parse_filters(p)
     if filter_ids:
         for gid in filter_ids:
             if gid not in _internet_gateways:
@@ -1903,6 +1904,17 @@ def _describe_internet_gateways(p):
     items = ""
     for igw in _internet_gateways.values():
         if filter_ids and igw["InternetGatewayId"] not in filter_ids:
+            continue
+        if not _resource_matches_tag_filters(igw["InternetGatewayId"], filters):
+            continue
+        if filters.get("internet-gateway-id") and igw["InternetGatewayId"] not in filters["internet-gateway-id"]:
+            continue
+        if filters.get("owner-id") and igw["OwnerId"] not in filters["owner-id"]:
+            continue
+        attachments = igw.get("Attachments", [])
+        if filters.get("attachment.vpc-id") and not any(a.get("VpcId") in filters["attachment.vpc-id"] for a in attachments):
+            continue
+        if filters.get("attachment.state") and not any(a.get("State") in filters["attachment.state"] for a in attachments):
             continue
         items += _igw_xml(igw)
     return _xml(200, "DescribeInternetGatewaysResponse",
