@@ -19,14 +19,13 @@ DurableExecution ARN format per the docs' Pattern field:
 from __future__ import annotations
 
 import base64
+import contextvars
 import copy
 import json
 import secrets
 import time
 import uuid
 from urllib.parse import unquote
-
-import contextvars
 
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
@@ -63,24 +62,25 @@ from ministack.core.responses import (
 #   }
 _executions = AccountScopedDict()
 
-# Resume scheduler — heapq of (resume_at_epoch, durable_arn, account_id).
+# Resume scheduler — heapq of
+# (resume_at_epoch, durable_arn, account_id, region).
 # When a durable invocation returns Status=PENDING with WAIT operations still
 # scheduled, ministack schedules a re-invocation at the earliest WAIT expiry.
 import heapq
 import threading as _threading
 
-_resume_queue: list[tuple[float, str, str]] = []
+_resume_queue: list[tuple[float, str, str, str]] = []
 _resume_lock = _threading.Lock()
 _resume_event = _threading.Event()
 _resume_thread_started = False
 
-# Maps CallbackId → (DurableExecutionArn, OperationId) so external
-# SendCallback{Success,Failure,Heartbeat} can find their target without
-# scanning every execution. Defined HERE (above restore_state) because
-# restore_state rebuilds this index from persisted executions at module
-# import time — if the name were defined later, restore_state would
-# NameError on cold start.
-_callback_index: dict[str, tuple[str, str]] = {}
+# Maps CallbackId → (DurableExecutionArn, OperationId), scoped by account, so
+# external SendCallback{Success,Failure,Heartbeat} can find their target
+# without scanning every execution. Defined HERE (above restore_state) because
+# restore_state rebuilds this index from persisted executions at module import
+# time — if the name were defined later, restore_state would NameError on cold
+# start.
+_callback_index = AccountScopedDict()
 
 # Function-level DurableConfig is stored on the function config in lambda_svc;
 # we expose helpers here for serialization parity.
@@ -89,6 +89,28 @@ _callback_index: dict[str, tuple[str, str]] = {}
 # ---------------------------------------------------------------------------
 # Persistence hooks
 # ---------------------------------------------------------------------------
+
+def _scope_from_execution_arn(arn: str, fallback_account_id: str) -> tuple[str, str]:
+    parts = arn.split(":", 5)
+    if (
+        len(parts) == 6
+        and parts[0] == "arn"
+        and parts[2] == "lambda"
+        and parts[3]
+        and parts[4]
+    ):
+        return parts[4], parts[3]
+
+    import logging
+    logging.getLogger(__name__).warning(
+        "Malformed DurableExecutionArn during restore; falling back to "
+        "account %s and region %s for %s",
+        fallback_account_id,
+        get_region(),
+        arn,
+    )
+    return fallback_account_id, get_region()
+
 
 def get_state():
     return {"executions": copy.deepcopy(_executions)}
@@ -102,30 +124,38 @@ def restore_state(data):
     # in-memory `_callback_index` and resume heap are NOT persisted (the
     # heap entries are wall-clock-relative, the index is derivable), so
     # rebuild both from the restored execution records.
-    # `_executions` is an AccountScopedDict; iterating yields composite
-    # (account, arn) keys, so always read the bare arn off the record itself.
-    for _key, rec in _executions.items():
+    # `_executions` is an AccountScopedDict; to_dict() is required here
+    # because items() filters to the current account, while restore must
+    # rebuild timers and callback indexes for every persisted account.
+    for key, rec in _executions.to_dict().items():
         if not isinstance(rec, dict):
             continue
         arn = rec.get("DurableExecutionArn")
         if not arn:
             continue
+        fallback_account = key[0] if isinstance(key, tuple) and key else get_account_id()
+        account_id, region = _scope_from_execution_arn(arn, fallback_account)
         for op in rec.get("Operations", []):
             if op.get("Type") == "CALLBACK" and op.get("Status") == "STARTED":
                 op_id = op.get("Id")
                 if op_id:
-                    _callback_index[op_id] = (arn, op_id)
+                    _callback_index.set_scoped(account_id, region, op_id, (arn, op_id))
         # Re-arm WAIT and CALLBACK timers for executions that were still
         # RUNNING when the process went down. Without this, restored
         # executions stall forever — timers never fire.
         if rec.get("Status") == "RUNNING":
+            tok_a = _request_account_id.set(account_id)
+            tok_r = _request_region.set(region)
             try:
-                schedule_resume(arn)
+                schedule_resume(arn, account_id, region)
             except Exception:
                 import logging
                 logging.getLogger(__name__).exception(
                     "Failed to re-arm timer on restore for %s", arn,
                 )
+            finally:
+                _request_account_id.reset(tok_a)
+                _request_region.reset(tok_r)
 
 
 try:
@@ -1310,4 +1340,3 @@ def _resume_execution(arn: str, account_id: str = "000000000000",
     except Exception:
         import logging
         logging.getLogger(__name__).exception("Resume invocation for %s failed", arn)
-

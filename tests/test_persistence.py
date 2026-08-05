@@ -4581,6 +4581,175 @@ def test_opensearch_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tm
     assert persistence.load_state("opensearch") is None
 
 
+def test_apigateway_v2_legacy_state_uses_api_region_sidecar_and_tag_arns(
+    monkeypatch, tmp_path
+):
+    import json as _json
+
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import apigateway as service
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    boot_region = "us-east-1"
+    api_region = "us-west-2"
+    api_id = "legacy-http-api"
+    fallback_api_id = "legacy-fallback-api"
+
+    def scoped(value_by_api):
+        store = AccountScopedDict()
+        for key, value in value_by_api.items():
+            store.set_scoped(account_id, None, key, value)
+        return store
+
+    payload = {
+        "apis": scoped(
+            {
+                api_id: {"apiId": api_id, "name": "west-api"},
+                fallback_api_id: {
+                    "apiId": fallback_api_id,
+                    "name": "fallback-api",
+                },
+            }
+        ),
+        "api_regions": scoped({api_id: api_region}),
+        "routes": scoped({api_id: {"route-1": {"routeId": "route-1"}}}),
+        "integrations": scoped(
+            {api_id: {"int-1": {"integrationId": "int-1"}}}
+        ),
+        "stages": scoped({api_id: {"prod": {"stageName": "prod"}}}),
+        "deployments": scoped({api_id: {"dep-1": {"deploymentId": "dep-1"}}}),
+        "authorizers": scoped(
+            {api_id: {"auth-1": {"authorizerId": "auth-1"}}}
+        ),
+        "route_responses": scoped(
+            {api_id: {"route-1": {"rr-1": {"routeResponseId": "rr-1"}}}}
+        ),
+        "integration_responses": scoped(
+            {
+                api_id: {
+                    "int-1": {
+                        "ir-1": {"integrationResponseId": "ir-1"}
+                    }
+                }
+            }
+        ),
+        "api_tags": scoped(
+            {
+                f"arn:aws:apigateway:{api_region}::/apis/{api_id}": {
+                    "env": "west"
+                }
+            }
+        ),
+    }
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+    (tmp_path / "apigateway.json").write_text(
+        _json.dumps(
+            {"__ministack_format__": 2, "payload": payload},
+            default=persistence._json_default,
+        )
+    )
+
+    loaded = persistence.load_state("apigateway")
+    service.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        service.load_persisted_state(loaded)
+
+        assert service._apis.get_scoped(account_id, api_region, api_id)[
+            "name"
+        ] == "west-api"
+        assert service._routes.get_scoped(account_id, api_region, api_id) == {
+            "route-1": {"routeId": "route-1"}
+        }
+        assert service._integrations.get_scoped(
+            account_id, api_region, api_id
+        ) == {"int-1": {"integrationId": "int-1"}}
+        assert service._stages.get_scoped(account_id, api_region, api_id) == {
+            "prod": {"stageName": "prod"}
+        }
+        assert service._deployments.get_scoped(
+            account_id, api_region, api_id
+        ) == {"dep-1": {"deploymentId": "dep-1"}}
+        assert service._authorizers.get_scoped(
+            account_id, api_region, api_id
+        ) == {"auth-1": {"authorizerId": "auth-1"}}
+        assert service._route_responses.get_scoped(
+            account_id, api_region, api_id
+        ) == {"route-1": {"rr-1": {"routeResponseId": "rr-1"}}}
+        assert service._integration_responses.get_scoped(
+            account_id, api_region, api_id
+        ) == {
+            "int-1": {"ir-1": {"integrationResponseId": "ir-1"}}
+        }
+        assert service._api_tags.get_scoped(
+            account_id,
+            api_region,
+            f"arn:aws:apigateway:{api_region}::/apis/{api_id}",
+        ) == {"env": "west"}
+        assert (
+            service._apis.get_scoped(account_id, boot_region, fallback_api_id)[
+                "name"
+            ]
+            == "fallback-api"
+        )
+        assert service._apis.get_scoped(account_id, boot_region, api_id) is None
+    finally:
+        service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_apigateway_v2_region_scoped_state_round_trips_and_rejects_v2_reader(
+    monkeypatch, tmp_path
+):
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+    from ministack.services import apigateway as service
+
+    account_id = "000000000000"
+    api_id = "regional-http-api"
+    api_region = "us-west-2"
+    apis = AccountRegionScopedDict()
+    apis.set_scoped(
+        account_id,
+        api_region,
+        api_id,
+        {"apiId": api_id, "name": "regional API"},
+    )
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    persistence.save_state("apigateway", {"apis": apis})
+    raw = _json.loads((tmp_path / "apigateway.json").read_text())
+    assert raw["__ministack_format__"] == 3
+
+    loaded = persistence.load_state("apigateway")
+    service.reset()
+    try:
+        service.load_persisted_state(loaded)
+        assert service._apis.get_scoped(account_id, api_region, api_id)[
+            "name"
+        ] == "regional API"
+    finally:
+        service.reset()
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("apigateway") is None
+
+
 def test_apigateway_v1_region_scoped_state_is_rejected_by_v2_reader(
     monkeypatch, tmp_path
 ):

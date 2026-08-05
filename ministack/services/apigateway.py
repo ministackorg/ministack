@@ -52,7 +52,14 @@ import urllib.parse
 import urllib.request
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.responses import AccountScopedDict, error_response_json, get_account_id, get_region, new_uuid
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    AccountScopedDict,
+    error_response_json,
+    get_account_id,
+    get_region,
+    new_uuid,
+)
 
 _HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _PORT = os.environ.get("GATEWAY_PORT", "4566")
@@ -85,21 +92,19 @@ async def _urlopen_async(request_or_url, timeout_seconds: float):
     return await asyncio.to_thread(_urlopen_sync, request_or_url, timeout_seconds)
 
 
-REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 _PROXY_TIMEOUT_SECONDS = _timeout_from_env("MINISTACK_APIGW_PROXY_TIMEOUT_SECONDS", 30.0)
 _JWKS_TIMEOUT_SECONDS = _timeout_from_env("MINISTACK_APIGW_JWKS_TIMEOUT_SECONDS", 5.0)
 
 # ---- Module-level state ----
-_apis = AccountScopedDict()          # api_id -> api object
-_api_regions = AccountScopedDict()   # api_id -> owning region
-_routes = AccountScopedDict()        # api_id -> {route_id -> route object}
-_integrations = AccountScopedDict()  # api_id -> {integration_id -> integration object}
-_stages = AccountScopedDict()        # api_id -> {stage_name -> stage object}
-_deployments = AccountScopedDict()   # api_id -> {deployment_id -> deployment object}
-_authorizers = AccountScopedDict()   # api_id -> {authorizer_id -> authorizer object}
-_api_tags = AccountScopedDict()      # resource_arn -> {key -> value}
-_route_responses = AccountScopedDict()         # api_id -> {route_id -> {rr_id -> route_response}}
-_integration_responses = AccountScopedDict()   # api_id -> {integration_id -> {ir_id -> int_response}}
+_apis = AccountRegionScopedDict()          # api_id -> api object
+_routes = AccountRegionScopedDict()        # api_id -> {route_id -> route object}
+_integrations = AccountRegionScopedDict()  # api_id -> {integration_id -> integration object}
+_stages = AccountRegionScopedDict()        # api_id -> {stage_name -> stage object}
+_deployments = AccountRegionScopedDict()   # api_id -> {deployment_id -> deployment object}
+_authorizers = AccountRegionScopedDict()   # api_id -> {authorizer_id -> authorizer object}
+_api_tags = AccountRegionScopedDict()      # resource_arn -> {key -> value}
+_route_responses = AccountRegionScopedDict()         # api_id -> {route_id -> {rr_id -> route_response}}
+_integration_responses = AccountRegionScopedDict()   # api_id -> {integration_id -> {ir_id -> int_response}}
 # JWKS cache is account-scoped because issuer URLs in MiniStack can resolve
 # to per-account local Cognito user pools — the same URL string may legitimately
 # serve different keys in different accounts.
@@ -214,7 +219,6 @@ def get_state() -> dict:
     import copy
     return {
         "apis": copy.deepcopy(_apis),
-        "api_regions": copy.deepcopy(_api_regions),
         "routes": copy.deepcopy(_routes),
         "integrations": copy.deepcopy(_integrations),
         "stages": copy.deepcopy(_stages),
@@ -226,18 +230,86 @@ def get_state() -> dict:
     }
 
 
+def _legacy_account_items(restored):
+    if isinstance(restored, AccountScopedDict):
+        return restored._data.items()
+    if isinstance(restored, dict):
+        account_id = get_account_id()
+        return [((account_id, key), value) for key, value in restored.items()]
+    return ()
+
+
+def _legacy_region(region_store, account_id, key):
+    if isinstance(region_store, AccountScopedDict):
+        return region_store.get_scoped(account_id, None, key)
+    if isinstance(region_store, dict):
+        return region_store.get(key)
+    return None
+
+
+def _restore_api_store(restored, region_store):
+    if isinstance(restored, AccountRegionScopedDict):
+        _apis.update(restored)
+        return {
+            (account_id, api_id): region
+            for (account_id, region, api_id), _api in _apis.all_items()
+        }
+
+    regions = {}
+    boot_region = get_region()
+    for (account_id, api_id), api in _legacy_account_items(restored):
+        region = _legacy_region(region_store, account_id, api_id) or boot_region
+        _apis.set_scoped(account_id, region, api_id, api)
+        regions[(account_id, api_id)] = region
+    return regions
+
+
+def _restore_child_store(store, restored, api_regions):
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+
+    boot_region = get_region()
+    for (account_id, api_id), value in _legacy_account_items(restored):
+        region = api_regions.get((account_id, api_id), boot_region)
+        store.set_scoped(account_id, region, api_id, value)
+
+
+def _region_from_apigateway_arn(resource_arn: str) -> str | None:
+    try:
+        parsed = parse_arn(resource_arn)
+    except (ArnParseError, TypeError):
+        return None
+    if parsed.service != "apigateway":
+        return None
+    return parsed.region or None
+
+
+def _restore_api_tags(restored):
+    if isinstance(restored, AccountRegionScopedDict):
+        _api_tags.update(restored)
+        return
+
+    boot_region = get_region()
+    for (account_id, resource_arn), tags in _legacy_account_items(restored):
+        region = _region_from_apigateway_arn(resource_arn) or boot_region
+        _api_tags.set_scoped(account_id, region, resource_arn, tags)
+
+
 def load_persisted_state(data: dict) -> None:
     """Restore module state from a previously persisted snapshot."""
-    _apis.update(data.get("apis", {}))
-    _api_regions.update(data.get("api_regions", {}))
-    _routes.update(data.get("routes", {}))
-    _integrations.update(data.get("integrations", {}))
-    _stages.update(data.get("stages", {}))
-    _deployments.update(data.get("deployments", {}))
-    _authorizers.update(data.get("authorizers", {}))
-    _api_tags.update(data.get("api_tags", {}))
-    _route_responses.update(data.get("route_responses", {}))
-    _integration_responses.update(data.get("integration_responses", {}))
+    if not data:
+        return
+
+    api_regions = _restore_api_store(data.get("apis", {}), data.get("api_regions", {}))
+    _restore_child_store(_routes, data.get("routes", {}), api_regions)
+    _restore_child_store(_integrations, data.get("integrations", {}), api_regions)
+    _restore_child_store(_stages, data.get("stages", {}), api_regions)
+    _restore_child_store(_deployments, data.get("deployments", {}), api_regions)
+    _restore_child_store(_authorizers, data.get("authorizers", {}), api_regions)
+    _restore_api_tags(data.get("api_tags", {}))
+    _restore_child_store(_route_responses, data.get("route_responses", {}), api_regions)
+    _restore_child_store(_integration_responses, data.get("integration_responses", {}), api_regions)
 
 
 # ---- Control plane router ----
@@ -803,6 +875,29 @@ def _apply_request_parameter_mappings(
 
 async def handle_execute(api_id, stage, path, method, headers, body, query_params):
     """Execute an API request through a deployed API (data plane)."""
+    scope = find_api_scope(api_id)
+    if scope is None:
+        return 404, {"Content-Type": "application/json"}, json.dumps({"message": "Not Found"}).encode()
+    owner_account_id, owner_region = scope
+
+    from ministack.core.responses import _request_account_id, _request_region
+
+    account_token = _request_account_id.set(owner_account_id)
+    region_token = _request_region.set(owner_region)
+    try:
+        return await _handle_execute_in_scope(
+            api_id, stage, path, method, headers, body, query_params,
+            owner_account_id, owner_region,
+        )
+    finally:
+        _request_account_id.reset(account_token)
+        _request_region.reset(region_token)
+
+
+async def _handle_execute_in_scope(
+    api_id, stage, path, method, headers, body, query_params,
+    owner_account_id, owner_region,
+):
     api = _apis.get(api_id)
     if not api:
         return 404, {"Content-Type": "application/json"}, json.dumps({"message": "Not Found"}).encode()
@@ -881,8 +976,8 @@ async def handle_execute(api_id, stage, path, method, headers, body, query_param
             (path_params or None),
             authorizer_claims=authorizer_claims,
             authorizer_scopes=authorizer_scopes,
-            owner_account_id=get_account_id(),
-            owner_region=_api_regions.get(api_id, get_region()),
+            owner_account_id=owner_account_id,
+            owner_region=owner_region,
         )
     elif integration_type == "HTTP_PROXY":
         mapped_headers, mapped_query, mapped_path = _apply_request_parameter_mappings(
@@ -1204,7 +1299,25 @@ async def _invoke_http_proxy(integration, path, method, headers, body, query_par
 
 # ---- Control plane: APIs ----
 
-def _resolve_custom_api_id(tags: dict, existing: "AccountScopedDict") -> str | None:
+def find_api_scope(api_id):
+    """Return (account_id, region) owning api_id within the ambient account."""
+    account_id = get_account_id()
+    for (stored_account, region, stored_api_id), _api in _apis.all_items():
+        if stored_account == account_id and stored_api_id == api_id:
+            return stored_account, region
+    return None
+
+
+def stages_for_api(api_id):
+    """Return stages for api_id after resolving the v2 data-plane owner scope."""
+    scope = find_api_scope(api_id)
+    if scope is None:
+        return {}
+    account_id, region = scope
+    return _stages.get_scoped(account_id, region, api_id, {})
+
+
+def _resolve_custom_api_id(tags: dict, existing: "AccountRegionScopedDict") -> str | None:
     """Return a caller-pinned API id from the ``ms-custom-id`` tag, or None
     if no tag is set (issue #400).
 
@@ -1224,7 +1337,11 @@ def _resolve_custom_api_id(tags: dict, existing: "AccountScopedDict") -> str | N
     custom = tags.get("ms-custom-id")
     if not custom:
         return None
-    if custom in existing:
+    if existing is _apis and find_api_scope(str(custom)) is not None:
+        raise ValueError(
+            f"API id '{custom}' (from ms-custom-id tag) is already in use"
+        )
+    if existing is not _apis and custom in existing:
         raise ValueError(
             f"API id '{custom}' (from ms-custom-id tag) is already in use"
         )
@@ -1260,7 +1377,6 @@ def _create_api(data):
     if data.get("corsConfiguration"):
         api["corsConfiguration"] = data["corsConfiguration"]
     _apis[api_id] = api
-    _api_regions[api_id] = get_region()
     _routes[api_id] = {}
     _integrations[api_id] = {}
     _stages[api_id] = {}
@@ -1271,26 +1387,30 @@ def _create_api(data):
 
 def _get_api(api_id):
     api = _apis.get(api_id)
-    # APIs are region-specific; an API owned by another region must not be
-    # visible from this one (the execute path already enforces this — keep the
-    # control plane consistent).
-    if not api or _api_regions.get(api_id, get_region()) != get_region():
+    if not api:
         return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
     return _apigw_response(api)
 
 
 def _get_apis():
-    items = [
-        api for api_id, api in _apis.items()
-        if _api_regions.get(api_id, get_region()) == get_region()
-    ]
-    return _apigw_response({"items": items})
+    return _apigw_response({"items": list(_apis.values())})
+
+
+def _api_not_found(api_id):
+    return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
+
+
+def _require_api(api_id):
+    if api_id not in _apis:
+        return _api_not_found(api_id)
+    return None
 
 
 def _delete_api(api_id):
+    if api_id not in _apis:
+        return _api_not_found(api_id)
     _delete_api_tag_resources(api_id)
     _apis.pop(api_id, None)
-    _api_regions.pop(api_id, None)
     _routes.pop(api_id, None)
     _integrations.pop(api_id, None)
     _stages.pop(api_id, None)
@@ -1313,7 +1433,7 @@ def _update_api(api_id, data):
 
 def _create_route(api_id, data):
     if api_id not in _apis:
-        return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
+        return _api_not_found(api_id)
     route_id = new_uuid()[:8]
     route = {
         "routeId": route_id,
@@ -1336,10 +1456,14 @@ def _create_route(api_id, data):
 
 
 def _get_routes(api_id):
+    if err := _require_api(api_id):
+        return err
     return _apigw_response({"items": list(_routes.get(api_id, {}).values())})
 
 
 def _get_route(api_id, route_id):
+    if err := _require_api(api_id):
+        return err
     route = _routes.get(api_id, {}).get(route_id)
     if not route:
         return _apigw_error("NotFoundException", f"Route {route_id} not found", 404)
@@ -1347,6 +1471,8 @@ def _get_route(api_id, route_id):
 
 
 def _update_route(api_id, route_id, data):
+    if err := _require_api(api_id):
+        return err
     route = _routes.get(api_id, {}).get(route_id)
     if not route:
         return _apigw_error("NotFoundException", f"Route {route_id} not found", 404)
@@ -1386,6 +1512,8 @@ def _update_route(api_id, route_id, data):
 
 
 def _delete_route(api_id, route_id):
+    if err := _require_api(api_id):
+        return err
     _routes.get(api_id, {}).pop(route_id, None)
     _api_tags.pop(_api_resource_arn(api_id, "routes", route_id), None)
     return 204, {}, b""
@@ -1395,7 +1523,7 @@ def _delete_route(api_id, route_id):
 
 def _create_integration(api_id, data):
     if api_id not in _apis:
-        return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
+        return _api_not_found(api_id)
     int_id = new_uuid()[:8]
     integration = {
         "integrationId": int_id,
@@ -1423,10 +1551,14 @@ def _create_integration(api_id, data):
 
 
 def _get_integrations(api_id):
+    if err := _require_api(api_id):
+        return err
     return _apigw_response({"items": list(_integrations.get(api_id, {}).values())})
 
 
 def _get_integration(api_id, int_id):
+    if err := _require_api(api_id):
+        return err
     integration = _integrations.get(api_id, {}).get(int_id)
     if not integration:
         return _apigw_error("NotFoundException", f"Integration {int_id} not found", 404)
@@ -1434,6 +1566,8 @@ def _get_integration(api_id, int_id):
 
 
 def _update_integration(api_id, int_id, data):
+    if err := _require_api(api_id):
+        return err
     integration = _integrations.get(api_id, {}).get(int_id)
     if not integration:
         return _apigw_error("NotFoundException", f"Integration {int_id} not found", 404)
@@ -1460,6 +1594,8 @@ def _update_integration(api_id, int_id, data):
 
 
 def _delete_integration(api_id, int_id):
+    if err := _require_api(api_id):
+        return err
     _integrations.get(api_id, {}).pop(int_id, None)
     _api_tags.pop(_api_resource_arn(api_id, "integrations", int_id), None)
     return 204, {}, b""
@@ -1469,7 +1605,7 @@ def _delete_integration(api_id, int_id):
 
 def _create_stage(api_id, data):
     if api_id not in _apis:
-        return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
+        return _api_not_found(api_id)
     stage_name = data.get("stageName", "$default")
     stage = {
         "stageName": stage_name,
@@ -1489,10 +1625,14 @@ def _create_stage(api_id, data):
 
 
 def _get_stages(api_id):
+    if err := _require_api(api_id):
+        return err
     return _apigw_response({"items": list(_stages.get(api_id, {}).values())})
 
 
 def _get_stage(api_id, stage_name):
+    if err := _require_api(api_id):
+        return err
     stage = _stages.get(api_id, {}).get(stage_name)
     if not stage:
         return _apigw_error("NotFoundException", f"Stage '{stage_name}' not found", 404)
@@ -1500,6 +1640,8 @@ def _get_stage(api_id, stage_name):
 
 
 def _update_stage(api_id, stage_name, data):
+    if err := _require_api(api_id):
+        return err
     stage = _stages.get(api_id, {}).get(stage_name)
     if not stage:
         return _apigw_error("NotFoundException", f"Stage '{stage_name}' not found", 404)
@@ -1512,6 +1654,8 @@ def _update_stage(api_id, stage_name, data):
 
 
 def _delete_stage(api_id, stage_name):
+    if err := _require_api(api_id):
+        return err
     _stages.get(api_id, {}).pop(stage_name, None)
     _api_tags.pop(_api_resource_arn(api_id, "stages", stage_name), None)
     return 204, {}, b""
@@ -1521,7 +1665,7 @@ def _delete_stage(api_id, stage_name):
 
 def _create_deployment(api_id, data):
     if api_id not in _apis:
-        return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
+        return _api_not_found(api_id)
     deployment_id = new_uuid()[:8]
     deployment = {
         "deploymentId": deployment_id,
@@ -1534,10 +1678,14 @@ def _create_deployment(api_id, data):
 
 
 def _get_deployments(api_id):
+    if err := _require_api(api_id):
+        return err
     return _apigw_response({"items": list(_deployments.get(api_id, {}).values())})
 
 
 def _get_deployment(api_id, deployment_id):
+    if err := _require_api(api_id):
+        return err
     deployment = _deployments.get(api_id, {}).get(deployment_id)
     if not deployment:
         return _apigw_error("NotFoundException", f"Deployment {deployment_id} not found", 404)
@@ -1545,6 +1693,8 @@ def _get_deployment(api_id, deployment_id):
 
 
 def _delete_deployment(api_id, deployment_id):
+    if err := _require_api(api_id):
+        return err
     _deployments.get(api_id, {}).pop(deployment_id, None)
     _api_tags.pop(_api_resource_arn(api_id, "deployments", deployment_id), None)
     return 204, {}, b""
@@ -1569,7 +1719,7 @@ def _tag_resource_not_found(resource_arn: str):
 
 
 def _api_exists_in_request_region(api_id: str) -> bool:
-    return api_id in _apis and _api_regions.get(api_id, get_region()) == get_region()
+    return api_id in _apis
 
 
 def _validate_tag_resource_arn(resource_arn: str) -> tuple[str | None, tuple | None]:
@@ -1647,7 +1797,7 @@ def _untag_resource(resource_arn: str, tag_keys: list):
 
 def _create_authorizer(api_id, data):
     if api_id not in _apis:
-        return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
+        return _api_not_found(api_id)
     auth_id = new_uuid()[:8]
     authorizer = {
         "authorizerId": auth_id,
@@ -1666,10 +1816,14 @@ def _create_authorizer(api_id, data):
 
 
 def _get_authorizers(api_id):
+    if err := _require_api(api_id):
+        return err
     return _apigw_response({"items": list(_authorizers.get(api_id, {}).values())})
 
 
 def _get_authorizer(api_id, auth_id):
+    if err := _require_api(api_id):
+        return err
     authorizer = _authorizers.get(api_id, {}).get(auth_id)
     if not authorizer:
         return _apigw_error("NotFoundException", f"Authorizer {auth_id} not found", 404)
@@ -1677,6 +1831,8 @@ def _get_authorizer(api_id, auth_id):
 
 
 def _update_authorizer(api_id, auth_id, data):
+    if err := _require_api(api_id):
+        return err
     authorizer = _authorizers.get(api_id, {}).get(auth_id)
     if not authorizer:
         return _apigw_error("NotFoundException", f"Authorizer {auth_id} not found", 404)
@@ -1689,6 +1845,8 @@ def _update_authorizer(api_id, auth_id, data):
 
 
 def _delete_authorizer(api_id, auth_id):
+    if err := _require_api(api_id):
+        return err
     _authorizers.get(api_id, {}).pop(auth_id, None)
     _api_tags.pop(_api_resource_arn(api_id, "authorizers", auth_id), None)
     return 204, {}, b""
@@ -1696,7 +1854,6 @@ def _delete_authorizer(api_id, auth_id):
 
 def reset():
     _apis.clear()
-    _api_regions.clear()
     _routes.clear()
     _integrations.clear()
     _stages.clear()
@@ -1721,6 +1878,8 @@ def reset():
 # ==========================================================================
 
 def _create_route_response(api_id, route_id, data):
+    if err := _require_api(api_id):
+        return err
     routes = _routes.get(api_id, {})
     if route_id not in routes:
         return _apigw_error("NotFoundException", f"Route {route_id} not found", 404)
@@ -1738,11 +1897,19 @@ def _create_route_response(api_id, route_id, data):
 
 
 def _get_route_responses(api_id, route_id):
+    if err := _require_api(api_id):
+        return err
+    if route_id not in _routes.get(api_id, {}):
+        return _apigw_error("NotFoundException", f"Route {route_id} not found", 404)
     items = list(_route_responses.get(api_id, {}).get(route_id, {}).values())
     return _apigw_response({"items": items})
 
 
 def _get_route_response(api_id, route_id, rr_id):
+    if err := _require_api(api_id):
+        return err
+    if route_id not in _routes.get(api_id, {}):
+        return _apigw_error("NotFoundException", f"Route {route_id} not found", 404)
     rr = _route_responses.get(api_id, {}).get(route_id, {}).get(rr_id)
     if not rr:
         return _apigw_error("NotFoundException", f"RouteResponse {rr_id} not found", 404)
@@ -1750,6 +1917,10 @@ def _get_route_response(api_id, route_id, rr_id):
 
 
 def _update_route_response(api_id, route_id, rr_id, data):
+    if err := _require_api(api_id):
+        return err
+    if route_id not in _routes.get(api_id, {}):
+        return _apigw_error("NotFoundException", f"Route {route_id} not found", 404)
     rr = _route_responses.get(api_id, {}).get(route_id, {}).get(rr_id)
     if not rr:
         return _apigw_error("NotFoundException", f"RouteResponse {rr_id} not found", 404)
@@ -1760,6 +1931,10 @@ def _update_route_response(api_id, route_id, rr_id, data):
 
 
 def _delete_route_response(api_id, route_id, rr_id):
+    if err := _require_api(api_id):
+        return err
+    if route_id not in _routes.get(api_id, {}):
+        return _apigw_error("NotFoundException", f"Route {route_id} not found", 404)
     _route_responses.get(api_id, {}).get(route_id, {}).pop(rr_id, None)
     return 204, {}, b""
 
@@ -1769,6 +1944,8 @@ def _delete_route_response(api_id, route_id, rr_id):
 # ==========================================================================
 
 def _create_integration_response(api_id, integration_id, data):
+    if err := _require_api(api_id):
+        return err
     integs = _integrations.get(api_id, {})
     if integration_id not in integs:
         return _apigw_error("NotFoundException", f"Integration {integration_id} not found", 404)
@@ -1787,11 +1964,19 @@ def _create_integration_response(api_id, integration_id, data):
 
 
 def _get_integration_responses(api_id, integration_id):
+    if err := _require_api(api_id):
+        return err
+    if integration_id not in _integrations.get(api_id, {}):
+        return _apigw_error("NotFoundException", f"Integration {integration_id} not found", 404)
     items = list(_integration_responses.get(api_id, {}).get(integration_id, {}).values())
     return _apigw_response({"items": items})
 
 
 def _get_integration_response(api_id, integration_id, ir_id):
+    if err := _require_api(api_id):
+        return err
+    if integration_id not in _integrations.get(api_id, {}):
+        return _apigw_error("NotFoundException", f"Integration {integration_id} not found", 404)
     ir = _integration_responses.get(api_id, {}).get(integration_id, {}).get(ir_id)
     if not ir:
         return _apigw_error("NotFoundException", f"IntegrationResponse {ir_id} not found", 404)
@@ -1799,6 +1984,10 @@ def _get_integration_response(api_id, integration_id, ir_id):
 
 
 def _update_integration_response(api_id, integration_id, ir_id, data):
+    if err := _require_api(api_id):
+        return err
+    if integration_id not in _integrations.get(api_id, {}):
+        return _apigw_error("NotFoundException", f"Integration {integration_id} not found", 404)
     ir = _integration_responses.get(api_id, {}).get(integration_id, {}).get(ir_id)
     if not ir:
         return _apigw_error("NotFoundException", f"IntegrationResponse {ir_id} not found", 404)
@@ -1810,6 +1999,10 @@ def _update_integration_response(api_id, integration_id, ir_id, data):
 
 
 def _delete_integration_response(api_id, integration_id, ir_id):
+    if err := _require_api(api_id):
+        return err
+    if integration_id not in _integrations.get(api_id, {}):
+        return _apigw_error("NotFoundException", f"Integration {integration_id} not found", 404)
     _integration_responses.get(api_id, {}).get(integration_id, {}).pop(ir_id, None)
     return 204, {}, b""
 
@@ -1831,14 +2024,14 @@ def _api_protocol(api_id: str) -> str | None:
 
 def _api_owner(api_id: str):
     """Return (protocolType, owner_account_id, owner_region) for an API or None."""
-    # AccountScopedDict stores keys as (account_id, original_key). Walk internals
-    # so we can find the owning account without knowing it up front.
-    for (acct, key), api in _apis._data.items():
+    # WebSocket dispatch arrives before we know the owning account or region, so
+    # scan every account+region slot directly.
+    for (acct, region, key), api in _apis.all_items():
         if key == api_id:
             return (
                 api.get("protocolType", "HTTP"),
                 acct,
-                _api_regions.get_scoped(acct, None, api_id, get_region()),
+                region,
             )
     return None
 
@@ -2061,7 +2254,7 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
     path = path_override if path_override is not None else scope.get("path", "")
     path_parts = path.lstrip("/").split("/", 1)
     tentative = path_parts[0] if path_parts and path_parts[0] else "$default"
-    configured_stages = _stages.get(api_id, {})
+    configured_stages = _stages.get_scoped(account_id, owner_region, api_id, {})
     if tentative in configured_stages:
         stage = tentative
     elif "$default" in configured_stages:
