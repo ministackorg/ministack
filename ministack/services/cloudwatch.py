@@ -672,7 +672,7 @@ def _get_metric_statistics(params, cbor_data, is_cbor, is_json=False):
         datapoints.append(dp)
 
     if is_cbor:
-        return _cbor_ok({"Datapoints": datapoints, "Label": metric_name})
+        return _cbor_ok({"Datapoints": [_cbor_datapoint(dp) for dp in datapoints], "Label": metric_name})
     if is_json:
         return _json_ok({"Datapoints": datapoints, "Label": metric_name})
 
@@ -810,7 +810,7 @@ def _get_metric_data(params, cbor_data, is_cbor, is_json=False):
             )
 
     if is_cbor:
-        return _cbor_ok({"MetricDataResults": results})
+        return _cbor_ok({"MetricDataResults": [_cbor_metric_data_result(r) for r in results]})
     if is_json:
         return _json_ok({"MetricDataResults": results})
 
@@ -1586,11 +1586,53 @@ def _cbor_history_item(item):
     return out
 
 
+def _cbor_datapoint(dp):
+    """Return a CBOR-safe copy of a GetMetricStatistics datapoint.
+
+    ``Datapoint.Timestamp`` is a smithy ``timestamp`` member, so over
+    rpc-v2-cbor it must be tag 1 (not the ISO string used by the XML path),
+    same class as the alarm timestamps in issue #1261.
+    """
+    out = dict(dp)
+    if out.get("Timestamp") is not None:
+        out["Timestamp"] = _cbor_timestamp(out["Timestamp"])
+    return out
+
+
+def _cbor_metric_data_result(result):
+    """Return a CBOR-safe copy of a GetMetricData result.
+
+    ``MetricDataResult.Timestamps`` is a list of smithy ``timestamp`` members,
+    so each element must be tag-1 encoded over rpc-v2-cbor.
+    """
+    out = dict(result)
+    if result.get("Timestamps"):
+        out["Timestamps"] = [_cbor_timestamp(t) for t in result["Timestamps"]]
+    return out
+
+
+def _cbor_strip_none(value):
+    """Recursively drop dict entries whose value is None.
+
+    smithy-rpc-v2-cbor decoders (Terraform AWS provider >= 6.50) reject a CBOR
+    Nil for a typed member with ``unexpected value type *cbor.Nil`` (issue
+    #1261): real AWS omits absent optional fields from the response rather than
+    encoding them as null, so a None must never reach cbor2.dumps(). Non-None
+    values — CBORTag timestamps, ints, empty strings, and empty lists — are
+    preserved unchanged.
+    """
+    if isinstance(value, dict):
+        return {k: _cbor_strip_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_cbor_strip_none(v) for v in value]
+    return value
+
+
 def _cbor_ok(data: dict):
     try:
         import cbor2
 
-        body = cbor2.dumps(data)
+        body = cbor2.dumps(_cbor_strip_none(data))
     except Exception:
         body = json.dumps(data).encode()
     return (
