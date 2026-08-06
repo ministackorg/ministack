@@ -176,6 +176,34 @@ def resolve_secret_string(secret_id, version_stage="AWSCURRENT"):
     return ver.get("SecretString")
 
 
+def _emit_secret_label_updated(secret, label, version_id):
+    """Native Secrets Manager → EventBridge ``Secret Label Updated`` event, fired
+    when a staging label moves to a new version — for every label except
+    ``AWSPENDING`` / ``AWSPREVIOUS`` (custom labels included). Metadata-only
+    changes (tags, description, rotation config, policy) do not emit. Delivered
+    to the default event bus; failures are swallowed so they never break the
+    mutation. (AWS: Secret event notifications.)"""
+    try:
+        from ministack.services import eventbridge as _eb
+        _eb._dispatch_event({
+            "EventId": new_uuid(),
+            "Source": "aws.secretsmanager",
+            "DetailType": "Secret Label Updated",
+            "Detail": json.dumps({
+                "name": secret["Name"],
+                "labelUpdated": label,
+                "versionId": version_id,
+            }),
+            "EventBusName": "default",
+            "Time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "Resources": [secret["ARN"]],
+            "Account": get_account_id(),
+            "Region": get_region(),
+        })
+    except Exception:
+        logger.exception("SecretsManager→EventBridge delivery failed for %s", secret.get("Name"))
+
+
 def _apply_current_promotion(secret, new_vid):
     """
     Promote *new_vid* to AWSCURRENT.
@@ -212,6 +240,7 @@ def _apply_current_promotion(secret, new_vid):
             ver["Stages"].append("AWSCURRENT")
         if "AWSPENDING" in ver["Stages"]:
             ver["Stages"].remove("AWSPENDING")
+        _emit_secret_label_updated(secret, "AWSCURRENT", new_vid)
 
 
 def _vid_to_stages(secret):
@@ -747,6 +776,9 @@ def _put_secret_value(data):
         _apply_current_promotion(secret, vid)
     else:
         secret["Versions"][vid]["Stages"] = list(stages)
+        for _lbl in stages:
+            if _lbl not in ("AWSCURRENT", "AWSPENDING", "AWSPREVIOUS"):
+                _emit_secret_label_updated(secret, _lbl, vid)
 
     secret["LastChangedDate"] = now
     _sync_replicas(secret)
@@ -835,6 +867,8 @@ def _update_secret_version_stage(data):
     if move_to_vid:
         _remove_stage_everywhere(secret, version_stage, except_version_id=move_to_vid)
         _add_stage(secret, move_to_vid, version_stage)
+        if version_stage not in ("AWSPENDING", "AWSPREVIOUS"):
+            _emit_secret_label_updated(secret, version_stage, move_to_vid)
 
         if old_current_vid and old_current_vid != move_to_vid:
             _remove_stage_everywhere(secret, "AWSPREVIOUS")
