@@ -3209,28 +3209,119 @@ def _iam_managed_policy_delete(physical_id, props):
 
 # --- KMS resource provisioners ---
 
-def _kms_key_create(logical_id, props, stack_name):
-    key_id = new_uuid()
-    arn = f"arn:aws:kms:{get_region()}:{get_account_id()}:key/{key_id}"
-    _kms._keys[key_id] = {
-        "KeyId": key_id,
-        "Arn": arn,
-        "KeyState": "Enabled",
-        "Enabled": True,
-        "KeySpec": "SYMMETRIC_DEFAULT",
+# AWS::KMS::Key refuses to update four properties in place: "If you change the
+# value of the KeySpec, KeyUsage, Origin, or MultiRegion properties of an
+# existing KMS key, the update request fails, regardless of the value of the
+# UpdateReplacePolicy attribute." Defaults matter here — omitting KeyUsage and
+# spelling out ENCRYPT_DECRYPT are the same key, not a change.
+_KMS_IMMUTABLE_PROPS = {
+    "KeySpec": "SYMMETRIC_DEFAULT",
+    "KeyUsage": "ENCRYPT_DECRYPT",
+    "Origin": "AWS_KMS",
+    "MultiRegion": False,
+}
+
+
+def _kms_tags(props):
+    """CloudFormation tags are {Key, Value}; the KMS API stores {TagKey, TagValue}."""
+    return [
+        {"TagKey": t.get("Key", ""), "TagValue": t.get("Value", "")}
+        for t in (props.get("Tags") or [])
+    ]
+
+
+def _kms_create_key_payload(props):
+    """Translate AWS::KMS::Key template properties into a CreateKey request.
+
+    CloudFormation spells the policy ``KeyPolicy`` and accepts it as a JSON
+    object; CreateKey takes a ``Policy`` string. The rest share their names.
+    """
+    payload = {
+        "KeySpec": props.get(
+            "KeySpec", props.get("CustomerMasterKeySpec", "SYMMETRIC_DEFAULT")
+        ),
         "KeyUsage": props.get("KeyUsage", "ENCRYPT_DECRYPT"),
         "Description": props.get("Description", ""),
-        "CreationDate": __import__("time").time(),
-        "Origin": "AWS_KMS",
-        "_symmetric_key": __import__("os").urandom(32),
-        "EncryptionAlgorithms": ["SYMMETRIC_DEFAULT"],
-        "SigningAlgorithms": [],
+        "Tags": _kms_tags(props),
     }
-    return key_id, {"Arn": arn, "KeyId": key_id}
+    policy = props.get("KeyPolicy")
+    if policy is not None:
+        payload["Policy"] = policy if isinstance(policy, str) else json.dumps(policy)
+    if props.get("Origin"):
+        payload["Origin"] = props["Origin"]
+    if props.get("MultiRegion"):
+        payload["MultiRegion"] = True
+    return payload
+
+
+def _kms_apply_key_props(rec, props):
+    """Apply the template properties CreateKey has no parameter for."""
+    # "When Enabled is true, the key state of the KMS key is Enabled. When
+    # Enabled is false, the key state of the KMS key is Disabled. The default
+    # value is true." A key already scheduled for deletion is left alone.
+    if rec.get("KeyState") != "PendingDeletion":
+        if props.get("Enabled") is False:
+            rec["Enabled"] = False
+            rec["KeyState"] = "Disabled"
+        else:
+            rec["Enabled"] = True
+            rec["KeyState"] = "Enabled"
+    # "By default, automatic key rotation is not enabled." The rotation period
+    # defaults to 365 days.
+    if props.get("EnableKeyRotation"):
+        rec["KeyRotationEnabled"] = True
+        rec["RotationPeriodInDays"] = props.get("RotationPeriodInDays", 365)
+    else:
+        rec["KeyRotationEnabled"] = False
+
+
+def _kms_key_create(logical_id, props, stack_name):
+    status, _headers, body = _kms._create_key(_kms_create_key_payload(props))
+    if status != 200:
+        # Fail the stack rather than provisioning a key of a different type than
+        # the template asked for — a silently symmetric key only surfaces later,
+        # as an UnsupportedOperationException from Sign.
+        raise Exception(
+            f"AWS::KMS::Key {logical_id}: {json.loads(body).get('message')}"
+        )
+    rec = _kms._resolve_key(json.loads(body)["KeyMetadata"]["KeyId"])
+    _kms_apply_key_props(rec, props)
+    return rec["KeyId"], {"Arn": rec["Arn"], "KeyId": rec["KeyId"]}
+
+
+def _kms_key_update(physical_id, old_props, new_props, stack_name):
+    rec = _kms._resolve_key(physical_id)
+    if not rec:
+        # The key went away outside CloudFormation; provision a replacement
+        # rather than failing the stack update.
+        return _kms_key_create(physical_id, new_props, stack_name)
+
+    for prop, default in _KMS_IMMUTABLE_PROPS.items():
+        if old_props.get(prop, default) != new_props.get(prop, default):
+            raise Exception(
+                f"AWS::KMS::Key {physical_id}: {prop} cannot be changed after "
+                "the KMS key is created"
+            )
+
+    rec["Description"] = new_props.get("Description", "")
+    policy = new_props.get("KeyPolicy")
+    if policy is not None:
+        rec["Policy"] = policy if isinstance(policy, str) else json.dumps(policy)
+    rec["Tags"] = _kms_tags(new_props)
+    _kms_apply_key_props(rec, new_props)
+    return physical_id, {"Arn": rec["Arn"], "KeyId": rec["KeyId"]}
 
 
 def _kms_key_delete(physical_id, props):
-    _kms._keys.pop(physical_id, None)
+    # "When you remove a KMS key from a CloudFormation stack, AWS KMS schedules
+    # the KMS key for deletion and starts the mandatory waiting period." The key
+    # stays resolvable in PendingDeletion state, where cryptographic operations
+    # correctly fail, instead of vanishing.
+    if _kms._resolve_key(physical_id):
+        _kms._schedule_key_deletion({
+            "KeyId": physical_id,
+            "PendingWindowInDays": props.get("PendingWindowInDays", 30),
+        })
 
 
 def _kms_alias_create(logical_id, props, stack_name):
@@ -5442,7 +5533,11 @@ _RESOURCE_HANDLERS = {
     "AWS::ElasticLoadBalancingV2::ListenerRule": {"create": _elbv2_listener_rule_create, "delete": _elbv2_listener_rule_delete},
     "AWS::CodeBuild::Project": {"create": _codebuild_project_create, "delete": _codebuild_project_delete},
     "AWS::IAM::ManagedPolicy": {"create": _iam_managed_policy_create, "delete": _iam_managed_policy_delete},
-    "AWS::KMS::Key": {"create": _kms_key_create, "delete": _kms_key_delete},
+    "AWS::KMS::Key": {
+        "create": _kms_key_create,
+        "update": _kms_key_update,
+        "delete": _kms_key_delete,
+    },
     "AWS::KMS::Alias": {"create": _kms_alias_create, "delete": _kms_alias_delete},
     "AWS::EC2::VPC": {"create": _ec2_vpc_create, "delete": _ec2_vpc_delete},
     "AWS::EC2::VPCEndpoint": {

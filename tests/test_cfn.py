@@ -7332,3 +7332,222 @@ def test_cfn_s3tables_table_schema_from_iceberg_metadata(cfn, s3tables):
 
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
+
+
+# ── AWS::KMS::Key ───────────────────────────────────────────────────────────
+# Property names, defaults and update behaviour follow the resource reference:
+# https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-kms-key.html
+
+# The Id is deliberately not "key-default-1" — that is what CreateKey generates
+# when no policy is supplied, so a default would satisfy the assertion below even
+# if the template's KeyPolicy were dropped on the floor.
+_KMS_KEY_POLICY = {
+    "Version": "2012-10-17",
+    "Id": "cfn-supplied-key-policy",
+    "Statement": [
+        {
+            "Sid": "Enable IAM User Permissions",
+            "Effect": "Allow",
+            "Principal": {"AWS": "arn:aws:iam::000000000000:root"},
+            "Action": "kms:*",
+            "Resource": "*",
+        }
+    ],
+}
+
+
+def _kms_key_template(props):
+    return json.dumps(
+        {
+            "Resources": {"Key": {"Type": "AWS::KMS::Key", "Properties": props}},
+            "Outputs": {
+                "KeyRef": {"Value": {"Ref": "Key"}},
+                "KeyArn": {"Value": {"Fn::GetAtt": ["Key", "Arn"]}},
+            },
+        }
+    )
+
+
+def _kms_stack_outputs(cfn, stack_name):
+    stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+    return {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+
+
+def test_cfn_kms_key_asymmetric_key_spec_is_honored(cfn, kms_client):
+    """An RSA_2048 SIGN_VERIFY key declared in a template must actually sign.
+
+    The provisioner used to hardcode SYMMETRIC_DEFAULT, so the stack reached
+    CREATE_COMPLETE and DescribeKey reported KeyUsage=SIGN_VERIFY while the key
+    underneath was symmetric — Sign then failed with UnsupportedOperationException.
+    """
+    stack_name = f"cfn-kms-rsa-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(
+        StackName=stack_name,
+        TemplateBody=_kms_key_template(
+            {
+                "KeySpec": "RSA_2048",
+                "KeyUsage": "SIGN_VERIFY",
+                "Description": "signing key",
+                "KeyPolicy": _KMS_KEY_POLICY,
+            }
+        ),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    out = _kms_stack_outputs(cfn, stack_name)
+    meta = kms_client.describe_key(KeyId=out["KeyArn"])["KeyMetadata"]
+    assert meta["KeySpec"] == "RSA_2048"
+    assert meta["KeyUsage"] == "SIGN_VERIFY"
+    assert "RSASSA_PSS_SHA_256" in meta["SigningAlgorithms"]
+    # Ref returns the key id; GetAtt exposes Arn and KeyId.
+    assert out["KeyRef"] == meta["KeyId"]
+    assert out["KeyArn"] == meta["Arn"]
+
+    message = b"cfn-kms-parity"
+    signature = kms_client.sign(
+        KeyId=out["KeyArn"],
+        Message=message,
+        MessageType="RAW",
+        SigningAlgorithm="RSASSA_PSS_SHA_256",
+    )["Signature"]
+    assert kms_client.verify(
+        KeyId=out["KeyArn"],
+        Message=message,
+        MessageType="RAW",
+        Signature=signature,
+        SigningAlgorithm="RSASSA_PSS_SHA_256",
+    )["SignatureValid"]
+    assert kms_client.get_public_key(KeyId=out["KeyArn"])["PublicKey"]
+
+    # The key policy is CFN's `KeyPolicy`, stored as the API's `Policy`.
+    policy = json.loads(
+        kms_client.get_key_policy(KeyId=out["KeyArn"], PolicyName="default")["Policy"]
+    )
+    assert policy["Id"] == "cfn-supplied-key-policy"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_kms_key_tags_rotation_and_enabled(cfn, kms_client):
+    """Tags, EnableKeyRotation and Enabled:false are applied at create time."""
+    stack_name = f"cfn-kms-props-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(
+        StackName=stack_name,
+        TemplateBody=_kms_key_template(
+            {
+                "KeyPolicy": _KMS_KEY_POLICY,
+                "Enabled": False,
+                "EnableKeyRotation": True,
+                "RotationPeriodInDays": 180,
+                # CloudFormation tags are Key/Value; KMS stores TagKey/TagValue.
+                "Tags": [{"Key": "env", "Value": "test"}],
+            }
+        ),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    arn = _kms_stack_outputs(cfn, stack_name)["KeyArn"]
+    meta = kms_client.describe_key(KeyId=arn)["KeyMetadata"]
+    assert meta["KeySpec"] == "SYMMETRIC_DEFAULT"
+    assert meta["KeyState"] == "Disabled"
+    assert meta["Enabled"] is False
+
+    rotation = kms_client.get_key_rotation_status(KeyId=arn)
+    assert rotation["KeyRotationEnabled"] is True
+    assert rotation["RotationPeriodInDays"] == 180
+
+    tags = kms_client.list_resource_tags(KeyId=arn)["Tags"]
+    assert tags == [{"TagKey": "env", "TagValue": "test"}]
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_kms_key_mutable_property_updates_in_place(cfn, kms_client):
+    """Description is 'Update requires: No interruption' — the key is not replaced."""
+    stack_name = f"cfn-kms-upd-{_uuid_mod.uuid4().hex[:8]}"
+    props = {"KeySpec": "RSA_2048", "KeyUsage": "SIGN_VERIFY", "Description": "v1"}
+    cfn.create_stack(StackName=stack_name, TemplateBody=_kms_key_template(props))
+    _wait_stack(cfn, stack_name)
+    original_id = _kms_stack_outputs(cfn, stack_name)["KeyRef"]
+
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=_kms_key_template({**props, "Description": "v2"}),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+
+    assert _kms_stack_outputs(cfn, stack_name)["KeyRef"] == original_id
+    meta = kms_client.describe_key(KeyId=original_id)["KeyMetadata"]
+    assert meta["Description"] == "v2"
+    # The key material survived the update — signatures stay verifiable.
+    assert meta["KeySpec"] == "RSA_2048"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_kms_key_immutable_property_change_is_rejected(cfn, kms_client):
+    """"If you change the value of the KeySpec ... the update request fails."
+
+    Without an update handler the engine falls back to `create`, minting a fresh
+    key pair and silently invalidating every signature made with the old one.
+    """
+    stack_name = f"cfn-kms-immut-{_uuid_mod.uuid4().hex[:8]}"
+    props = {"KeySpec": "RSA_2048", "KeyUsage": "SIGN_VERIFY"}
+    cfn.create_stack(StackName=stack_name, TemplateBody=_kms_key_template(props))
+    _wait_stack(cfn, stack_name)
+    original_id = _kms_stack_outputs(cfn, stack_name)["KeyRef"]
+
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=_kms_key_template({**props, "KeySpec": "RSA_4096"}),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] != "UPDATE_COMPLETE"
+
+    # The original key is untouched: same id, same spec, still usable.
+    meta = kms_client.describe_key(KeyId=original_id)["KeyMetadata"]
+    assert meta["KeySpec"] == "RSA_2048"
+    assert meta["KeyState"] == "Enabled"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_kms_key_unsupported_key_spec_fails_the_stack(cfn):
+    """An unimplemented spec must fail the stack, not quietly become symmetric."""
+    stack_name = f"cfn-kms-hmac-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(
+        StackName=stack_name,
+        TemplateBody=_kms_key_template(
+            {"KeySpec": "HMAC_256", "KeyUsage": "GENERATE_VERIFY_MAC"}
+        ),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] != "CREATE_COMPLETE"
+
+    cfn.delete_stack(StackName=stack_name)
+
+
+def test_cfn_kms_key_delete_schedules_deletion(cfn, kms_client):
+    """Removing a key from a stack schedules deletion; it does not vanish."""
+    stack_name = f"cfn-kms-del-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(
+        StackName=stack_name,
+        TemplateBody=_kms_key_template({"PendingWindowInDays": 7}),
+    )
+    _wait_stack(cfn, stack_name)
+    key_id = _kms_stack_outputs(cfn, stack_name)["KeyRef"]
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+    meta = kms_client.describe_key(KeyId=key_id)["KeyMetadata"]
+    assert meta["KeyState"] == "PendingDeletion"
+    assert meta["Enabled"] is False
+    assert "DeletionDate" in meta
