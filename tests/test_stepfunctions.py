@@ -5037,6 +5037,7 @@ def test_sfn_aws_sdk_rdsdata_execute_statement(sfn, sfn_sync, rds, sm):
         EngineMode="serverless",
         MasterUsername="admin",
         MasterUserPassword="testpass123",
+        EnableHttpEndpoint=True,
     )
     secret_arn = sm.create_secret(
         Name=f"rdsdata-secret-{_uuid.uuid4().hex[:8]}",
@@ -5053,7 +5054,7 @@ def test_sfn_aws_sdk_rdsdata_execute_statement(sfn, sfn_sync, rds, sm):
                 "Parameters": {
                     "resourceArn": cluster_arn,
                     "secretArn": secret_arn,
-                    "sql": "SELECT 1",
+                    "sql": "SHOW DATABASES",
                     "database": "testdb",
                 },
                 "End": True,
@@ -5119,6 +5120,7 @@ def test_sfn_aws_sdk_rdsdata_output_uses_sfn_key_convention(sfn, sfn_sync, rds, 
         EngineMode="serverless",
         MasterUsername="admin",
         MasterUserPassword="testpass123",
+        EnableHttpEndpoint=True,
     )
     secret_arn = sm.create_secret(
         Name=f"rdsdata-output-secret-{_uuid.uuid4().hex[:8]}",
@@ -5514,6 +5516,7 @@ def test_sfn_rest_json_pascal_to_camel_conversion(sfn, sfn_sync, rds, sm):
         EngineMode="serverless",
         MasterUsername="admin",
         MasterUserPassword="testpass123",
+        EnableHttpEndpoint=True,
     )
     secret_arn = sm.create_secret(
         Name=f"rdsdata-camel-secret-{_uuid.uuid4().hex[:8]}",
@@ -5531,7 +5534,7 @@ def test_sfn_rest_json_pascal_to_camel_conversion(sfn, sfn_sync, rds, sm):
                 "Parameters": {
                     "ResourceArn": cluster_arn,
                     "SecretArn": secret_arn,
-                    "Sql": "SELECT 1",
+                    "Sql": "SHOW DATABASES",
                     "Database": "testdb",
                 },
                 "End": True,

@@ -6870,6 +6870,11 @@ def test_aurora_delete_member_keeps_shared_data(rds, rds_data):
         _reader,
         cluster,
     ):
+        rds.modify_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            EnableHttpEndpoint=True,
+            ApplyImmediately=True,
+        )
         with _aurora_connect(writer["Endpoint"]) as conn:
             with conn.cursor() as cursor:
                 cursor.execute("CREATE TABLE durable_rows (id INT PRIMARY KEY)")
