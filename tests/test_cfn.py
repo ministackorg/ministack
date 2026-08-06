@@ -2161,7 +2161,7 @@ def test_cfn_stack_with_s3_lambda_dynamodb(cfn, s3, lam, ddb):
     assert item["Item"]["val"]["S"] == "works"
 
     # Verify Lambda function was created and is invocable
-    funcs = [f["FunctionName"] for f in lam.list_functions()["Functions"]]
+    funcs = [f["FunctionName"] for page in lam.get_paginator("list_functions").paginate() for f in page["Functions"]]
     assert fn_name in funcs
     resp = lam.invoke(FunctionName=fn_name, Payload=json.dumps({"test": "cfn"}))
     payload = json.loads(resp["Payload"].read())
