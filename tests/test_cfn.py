@@ -7521,11 +7521,11 @@ def test_cfn_kms_key_immutable_property_change_is_rejected(cfn, kms_client):
 
 def test_cfn_kms_key_unsupported_key_spec_fails_the_stack(cfn):
     """An unimplemented spec must fail the stack, not quietly become symmetric."""
-    stack_name = f"cfn-kms-hmac-{_uuid_mod.uuid4().hex[:8]}"
+    stack_name = f"cfn-kms-badspec-{_uuid_mod.uuid4().hex[:8]}"
     cfn.create_stack(
         StackName=stack_name,
         TemplateBody=_kms_key_template(
-            {"KeySpec": "HMAC_256", "KeyUsage": "GENERATE_VERIFY_MAC"}
+            {"KeySpec": "SM2", "KeyUsage": "ENCRYPT_DECRYPT"}
         ),
     )
     stack = _wait_stack(cfn, stack_name)
