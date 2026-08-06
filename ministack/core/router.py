@@ -361,6 +361,26 @@ SERVICE_PATTERNS = {
         "path_prefixes": ["/schedules", "/schedule-groups"],
         "credential_scope": "scheduler",
     },
+    "pipes": {
+        "host_patterns": [r"pipes\."],
+        "path_prefixes": ["/v1/pipes"],
+        "credential_scope": "pipes",
+    },
+    "cloudcontrol": {
+        "target_prefixes": ["CloudApiService"],
+        "host_patterns": [r"cloudcontrolapi\."],
+        "credential_scope": "cloudcontrolapi",
+    },
+    "config": {
+        "target_prefixes": ["StarlingDoveService"],
+        "host_patterns": [r"config\."],
+        "credential_scope": "config",
+    },
+    "memorydb": {
+        "target_prefixes": ["AmazonMemoryDB"],
+        "host_patterns": [r"memory-db\.", r"memorydb\."],
+        "credential_scope": "memorydb",
+    },
     "eks": {
         "host_patterns": [r"eks\."],
         "path_prefixes": ["/oidc/"],
@@ -1013,6 +1033,15 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         for hp in patterns.get("host_patterns", []):
             if re.search(hp, host):
                 return svc
+
+    # 6a. An x-www-form-urlencoded request that matched no service is a
+    # Query-protocol call to a service we don't implement (redshift,
+    # elasticbeanstalk, cloudsearch, sdb, importexport, ...). Real AWS answers
+    # with a Query <ErrorResponse> envelope at HTTP 400; falling through to S3
+    # returns a 405 <Error> root that botocore's query parser can't read
+    # (it raises a bare KeyError('Error')). S3 never uses form-urlencoded.
+    if "application/x-www-form-urlencoded" in headers.get("content-type", ""):
+        return "unknown_query"
 
     # 6. Default to S3 (same as real LocalStack behavior)
     return "s3"

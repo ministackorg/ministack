@@ -960,6 +960,167 @@ def _delete_filter(data, account_id):
     return json_response({})
 
 
+# ---------------------------------------------------------------------------
+# Read-only ops with no local state — return AWS-correct empty/default shapes.
+# Key names + shape categories verified against botocore inspector2 2020-06-08
+# service-2.json. These accounts are not org-enrolled and have no members,
+# delegated admins, CIS scans, code-security integrations, etc., so every list
+# is empty and singletons return their default/disabled shape.
+# ---------------------------------------------------------------------------
+
+
+def _batch_get_account_status(data, account_id):
+    account_ids = data.get("accountIds") or [account_id]
+    config = _get_config(account_id)
+
+    def _rt_status(key):
+        return {"status": config[key]["status"]}
+
+    accounts = []
+    for aid in account_ids:
+        cfg = _get_config(aid)
+        accounts.append(
+            {
+                "accountId": aid,
+                "state": {"status": "DISABLED", "errorCode": "SUCCESS", "errorMessage": ""},
+                "resourceState": {
+                    "ec2": {"status": cfg["ec2"]["status"], "errorCode": "SUCCESS", "errorMessage": ""},
+                    "ecr": {"status": cfg["ecr"]["status"], "errorCode": "SUCCESS", "errorMessage": ""},
+                    "lambda": {"status": cfg["lambda"]["status"], "errorCode": "SUCCESS", "errorMessage": ""},
+                    "lambdaCode": {"status": cfg["lambdaCode"]["status"], "errorCode": "SUCCESS", "errorMessage": ""},
+                },
+            }
+        )
+    return json_response({"accounts": accounts, "failedAccounts": []})
+
+
+def _batch_get_free_trial_info(data, account_id):
+    account_ids = data.get("accountIds") or [account_id]
+    accounts = []
+    for aid in account_ids:
+        accounts.append(
+            {
+                "accountId": aid,
+                "freeTrialInfo": [],
+            }
+        )
+    return json_response({"accounts": accounts, "failedAccounts": []})
+
+
+def _batch_get_member_ec2_deep_inspection_status(data, account_id):
+    return json_response({"accountIds": [], "failedAccountIds": []})
+
+
+def _batch_get_code_snippet(data, account_id):
+    return json_response({"codeSnippetResults": [], "errors": []})
+
+
+def _list_members(data, account_id):
+    return json_response({"members": []})
+
+
+def _get_member(data, account_id):
+    account_id_arg = data.get("accountId", "")
+    return _resource_not_found(
+        f"arn:aws:inspector2:{get_region()}:{account_id_arg or account_id}:member"
+    )
+
+
+def _list_delegated_admin_accounts(data, account_id):
+    return json_response({"delegatedAdminAccounts": []})
+
+
+def _get_delegated_admin_account(data, account_id):
+    return json_response({})
+
+
+def _describe_organization_configuration(data, account_id):
+    return json_response(
+        {
+            "autoEnable": {"ec2": False, "ecr": False, "lambda": False, "lambdaCode": False},
+            "maxAccountLimitReached": False,
+        }
+    )
+
+
+def _get_configuration(data, account_id):
+    # rescanDuration/scanMode are nested one level under *State per the AWS
+    # model; boto3 drops leaf values placed directly on ecrConfiguration.
+    return json_response(
+        {
+            "ecrConfiguration": {
+                "rescanDurationState": {
+                    "rescanDuration": "LIFETIME",
+                    "status": "SUCCESS",
+                }
+            },
+            "ec2Configuration": {
+                "scanModeState": {
+                    "scanMode": "EC2_HYBRID",
+                    "scanModeStatus": "SUCCESS",
+                }
+            },
+        }
+    )
+
+
+def _get_ec2_deep_inspection_configuration(data, account_id):
+    return json_response({"packagePaths": [], "orgPackagePaths": [], "status": "DISABLED"})
+
+
+def _list_account_permissions(data, account_id):
+    return json_response({"permissions": []})
+
+
+def _list_usage_totals(data, account_id):
+    account_ids = data.get("accountIds") or [account_id]
+    totals = [{"accountId": aid, "usage": []} for aid in account_ids]
+    return json_response({"totals": totals})
+
+
+def _get_findings_report_status(data, account_id):
+    return json_response({"status": "SUCCEEDED"})
+
+
+def _get_sbom_export(data, account_id):
+    return json_response({"status": "SUCCEEDED"})
+
+
+def _list_cis_scans(data, account_id):
+    return json_response({"scans": []})
+
+
+def _list_cis_scan_configurations(data, account_id):
+    return json_response({"scanConfigurations": []})
+
+
+def _list_cis_scan_results_by_checks(data, account_id):
+    return json_response({"checkAggregations": []})
+
+
+def _list_cis_scan_results_by_target(data, account_id):
+    return json_response({"targetResourceAggregations": []})
+
+
+def _get_cis_scan_report(data, account_id):
+    return json_response({"status": "SUCCEEDED"})
+
+
+def _get_cis_scan_result_details(data, account_id):
+    return json_response({"scanResultDetails": []})
+
+
+def _get_encryption_key(data, account_id):
+    # No customer-managed CMK is configured for scanning in this emulator.
+    # Real AWS returns ResourceNotFoundException when no key exists for the
+    # requested resourceType/scanType.
+    return error_response_json(
+        "ResourceNotFoundException",
+        "No encryption key found for the requested resource.",
+        400,
+    )
+
+
 _path_handlers = {
     "/enable": _enable,
     "/disable": _disable,
@@ -975,6 +1136,29 @@ _path_handlers = {
     "/filters/create": _create_filter,
     "/filters/list": _list_filters,
     "/filters/delete": _delete_filter,
+    # Read-only ops routed to AWS-correct empty/default shapes.
+    "/status/batch/get": _batch_get_account_status,
+    "/freetrialinfo/batchget": _batch_get_free_trial_info,
+    "/ec2deepinspectionstatus/member/batch/get": _batch_get_member_ec2_deep_inspection_status,
+    "/codesnippet/batchget": _batch_get_code_snippet,
+    "/members/list": _list_members,
+    "/members/get": _get_member,
+    "/delegatedadminaccounts/list": _list_delegated_admin_accounts,
+    "/delegatedadminaccounts/get": _get_delegated_admin_account,
+    "/organizationconfiguration/describe": _describe_organization_configuration,
+    "/configuration/get": _get_configuration,
+    "/ec2deepinspectionconfiguration/get": _get_ec2_deep_inspection_configuration,
+    "/accountpermissions/list": _list_account_permissions,
+    "/usage/list": _list_usage_totals,
+    "/reporting/status/get": _get_findings_report_status,
+    "/sbomexport/get": _get_sbom_export,
+    "/cis/scan/list": _list_cis_scans,
+    "/cis/scan-configuration/list": _list_cis_scan_configurations,
+    "/cis/scan-result/check/list": _list_cis_scan_results_by_checks,
+    "/cis/scan-result/resource/list": _list_cis_scan_results_by_target,
+    "/cis/scan/report/get": _get_cis_scan_report,
+    "/cis/scan-result/details/get": _get_cis_scan_result_details,
+    "/encryptionkey/get": _get_encryption_key,
 }
 
 _async_handlers = {}

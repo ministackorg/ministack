@@ -1214,10 +1214,10 @@ def test_sqs_messages_endpoint_basic(sqs):
         assert m["IsVisible"] is True
 
     # Subsequent ReceiveMessage still returns both — peek did not mutate.
-    received = []
-    for _ in range(2):
-        resp = sqs.receive_message(QueueUrl=qurl, MaxNumberOfMessages=1, VisibilityTimeout=0)
-        received.extend(resp.get("Messages", []))
+    # (Fetch both in one call: an explicit VisibilityTimeout=0 is now honored,
+    # so two single receives would re-return the same immediately-visible message.)
+    resp = sqs.receive_message(QueueUrl=qurl, MaxNumberOfMessages=2, WaitTimeSeconds=0)
+    received = resp.get("Messages", [])
     assert sorted(m["Body"] for m in received) == ["hello-peek-1", "hello-peek-2"]
     sqs.delete_queue(QueueUrl=qurl)
 

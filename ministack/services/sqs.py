@@ -619,10 +619,13 @@ async def _act_receive_message(data: dict, qurl: str) -> dict:
     q = _get_q(url)
 
     max_n = min(int(data.get("MaxNumberOfMessages", 1)), 10)
-    vis = int(data.get("VisibilityTimeout")
-              or q["attributes"].get("VisibilityTimeout", "30"))
-    wait = int(data.get("WaitTimeSeconds")
-               or q["attributes"].get("ReceiveMessageWaitTimeSeconds", "0"))
+    # An explicit request value wins even when it is 0 — a supplied
+    # VisibilityTimeout=0 / WaitTimeSeconds=0 must NOT fall back to the queue
+    # attribute (0 is falsy in Python; keying on presence is required).
+    _vis = data.get("VisibilityTimeout")
+    vis = int(_vis if _vis is not None else q["attributes"].get("VisibilityTimeout", "30"))
+    _wait = data.get("WaitTimeSeconds")
+    wait = int(_wait if _wait is not None else q["attributes"].get("ReceiveMessageWaitTimeSeconds", "0"))
 
     attr_names = (data.get("AttributeNames")
                   or data.get("MessageSystemAttributeNames") or [])

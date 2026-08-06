@@ -800,6 +800,99 @@ class TestIntegration:
         assert "AWS_EC2_INSTANCE" in resource_types
 
 
+class TestReadOnlyOps:
+    """Newly-routed read-only ops return AWS-correct empty/default shapes.
+
+    These are stub-empty in this emulator (no org enrollment, no members,
+    no CIS scans, no code-security integrations) so lists are empty and
+    singletons return their default/disabled shape. Wire keys verified
+    against botocore inspector2 2020-06-08.
+    """
+
+    def test_list_members_empty(self, inspector2):
+        resp = inspector2.list_members()
+        assert resp["members"] == []
+
+    def test_list_delegated_admin_accounts_empty(self, inspector2):
+        resp = inspector2.list_delegated_admin_accounts()
+        assert resp["delegatedAdminAccounts"] == []
+
+    def test_describe_organization_configuration(self, inspector2):
+        resp = inspector2.describe_organization_configuration()
+        assert resp["maxAccountLimitReached"] is False
+        assert set(resp["autoEnable"].keys()) >= {"ec2", "ecr", "lambda"}
+
+    def test_get_configuration_shape(self, inspector2):
+        resp = inspector2.get_configuration()
+        assert "ecrConfiguration" in resp
+        assert "ec2Configuration" in resp
+        assert resp["ecrConfiguration"]["rescanDurationState"]["rescanDuration"] == "LIFETIME"
+        assert resp["ec2Configuration"]["scanModeState"]["scanMode"] == "EC2_HYBRID"
+
+    def test_get_ec2_deep_inspection_configuration(self, inspector2):
+        resp = inspector2.get_ec2_deep_inspection_configuration()
+        assert resp["status"] == "DISABLED"
+        assert resp["packagePaths"] == []
+        assert resp["orgPackagePaths"] == []
+
+    def test_list_account_permissions_empty(self, inspector2):
+        resp = inspector2.list_account_permissions()
+        assert resp["permissions"] == []
+
+    def test_list_cis_scans_empty(self, inspector2):
+        resp = inspector2.list_cis_scans()
+        assert resp["scans"] == []
+
+    def test_list_cis_scan_configurations_empty(self, inspector2):
+        resp = inspector2.list_cis_scan_configurations()
+        assert resp["scanConfigurations"] == []
+
+    def test_list_usage_totals_default_account(self, inspector2):
+        resp = inspector2.list_usage_totals()
+        assert resp["totals"][0]["accountId"] == "000000000000"
+        assert resp["totals"][0]["usage"] == []
+
+    def test_batch_get_account_status_default_account(self, inspector2):
+        inspector2.enable(resourceTypes=["ECR"])
+        resp = inspector2.batch_get_account_status()
+        accounts = resp["accounts"]
+        assert len(accounts) == 1
+        acct = accounts[0]
+        assert acct["accountId"] == "000000000000"
+        assert acct["resourceState"]["ecr"]["status"] == "ENABLED"
+        assert resp["failedAccounts"] == []
+
+    def test_batch_get_free_trial_info_default_account(self, inspector2):
+        resp = inspector2.batch_get_free_trial_info(accountIds=["000000000000"])
+        assert resp["accounts"][0]["accountId"] == "000000000000"
+        assert resp["accounts"][0]["freeTrialInfo"] == []
+        assert resp["failedAccounts"] == []
+
+    def test_batch_get_member_ec2_deep_inspection_status_empty(self, inspector2):
+        resp = inspector2.batch_get_member_ec2_deep_inspection_status(
+            accountIds=["111111111111"]
+        )
+        assert resp["accountIds"] == []
+        assert resp["failedAccountIds"] == []
+
+    def test_batch_get_code_snippet_empty(self, inspector2):
+        resp = inspector2.batch_get_code_snippet(
+            findingArns=["arn:aws:inspector2:us-east-1:000000000000:finding/x"]
+        )
+        assert resp["codeSnippetResults"] == []
+        assert resp["errors"] == []
+
+    def test_get_encryption_key_not_found(self, inspector2):
+        with pytest.raises(ClientError) as exc:
+            inspector2.get_encryption_key(resourceType="AWS_EC2_INSTANCE", scanType="NETWORK")
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    def test_get_member_not_found(self, inspector2):
+        with pytest.raises(ClientError) as exc:
+            inspector2.get_member(accountId="111111111111")
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 class TestBatchGetFindingDetails:
     def test_batch_get_finding_details(self, inspector2):
         inspector2.enable(resourceTypes=["ECR"])
