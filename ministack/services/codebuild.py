@@ -178,21 +178,14 @@ def _make_build_record(project, build_id, source_version=None):
 # ---------------------------------------------------------------------------
 
 EXECUTE_BUILDS = os.environ.get("MINISTACK_CODEBUILD_EXECUTE", "0").lower() in ("1", "true", "yes")
-AGENT_IMAGE = os.environ.get(
-    "MINISTACK_CODEBUILD_AGENT_IMAGE", "public.ecr.aws/codebuild/local-builds:latest"
-)
-WORKSPACE = os.environ.get("MINISTACK_CODEBUILD_WORKSPACE", "/tmp/ministack-codebuild")
 
-# Buildspecs that start nested containers bind-mounting CODEBUILD_SRC_DIR need
-# the source directory to have the same path on the host and in the build
-# container, i.e. the agent's own mount point:
-#   MINISTACK_CODEBUILD_SOURCE_PATH=/codebuild/output/srcDownload/src
-# Builds then share that directory, so they must not overlap.
-SOURCE_PATH = os.environ.get("MINISTACK_CODEBUILD_SOURCE_PATH", "")
+# The fixed image AWS's own codebuild_build.sh uses to run a local build; not
+# a real choice, so it is not configurable.
+AGENT_IMAGE = "public.ecr.aws/codebuild/local-builds:latest"
 
-# A build's log stream is held in memory, so a chatty build is capped rather
-# than allowed to grow without bound. 0 keeps everything.
-MAX_LOG_EVENTS = int(os.environ.get("MINISTACK_CODEBUILD_MAX_LOG_EVENTS", "20000") or 0)
+# Internal scratch space for the source/artifacts/env files handed to the
+# agent container; not an AWS concept, so not configurable.
+WORKSPACE = "/tmp/ministack-codebuild"
 
 _PHASE_COMPLETE_RE = re.compile(r"Phase complete: ([A-Z_]+) State: ([A-Z_]+)")
 
@@ -269,8 +262,6 @@ def _log_sink(build):
         ts = int(time.time() * 1000)
         events = stream["events"]
         events.append({"timestamp": ts, "message": line, "ingestionTime": ts})
-        if MAX_LOG_EVENTS and len(events) > MAX_LOG_EVENTS:
-            del events[: len(events) - MAX_LOG_EVENTS]
         if stream["firstEventTimestamp"] is None:
             stream["firstEventTimestamp"] = ts
         stream["lastEventTimestamp"] = ts
@@ -290,16 +281,12 @@ def _container_for_build(build_id):
 
 
 def _aws_endpoint():
-    """Address the build container can reach MiniStack on, or "" to inject none.
+    """Address the build container can reach MiniStack on, or "" if it can't.
 
     A build that calls the AWS CLI should reach this emulator rather than real
     AWS. The build container is a sibling started by the agent, so it reaches
-    MiniStack over the default bridge gateway unless told otherwise.
+    MiniStack over the default bridge gateway.
     """
-    explicit = os.environ.get("MINISTACK_CODEBUILD_AWS_ENDPOINT")
-    if explicit is not None:
-        return explicit.strip()
-
     port = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
     client = _get_docker()
     if not client:
@@ -375,7 +362,7 @@ def _execute_build(build_id, project):
 
     env = project.get("environment", {}) or {}
     workdir = os.path.join(WORKSPACE, build_id.replace(":", "_"))
-    source_dir = SOURCE_PATH or os.path.join(workdir, "src")
+    source_dir = os.path.join(workdir, "src")
     artifacts_dir = os.path.join(workdir, "artifacts")
     env_dir = os.path.join(workdir, "env")
 
