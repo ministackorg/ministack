@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 import os
@@ -9,7 +10,7 @@ from urllib.parse import urlparse
 import boto3
 import pytest
 from botocore.config import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, ParamValidationError
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
@@ -1337,6 +1338,614 @@ def test_kms_disabled_key_blocks_encrypt(kms_client):
     kms_client.disable_key(KeyId=key_id)
     with pytest.raises(kms_client.exceptions.DisabledException):
         kms_client.encrypt(KeyId=key_id, Plaintext=b"test")
+
+HMAC_SPEC_ALGOS = [
+    ("HMAC_224", "HMAC_SHA_224", 28),
+    ("HMAC_256", "HMAC_SHA_256", 32),
+    ("HMAC_384", "HMAC_SHA_384", 48),
+    ("HMAC_512", "HMAC_SHA_512", 64),
+]
+
+
+def _hmac_key(kms_client, key_spec="HMAC_256"):
+    resp = kms_client.create_key(KeySpec=key_spec, KeyUsage="GENERATE_VERIFY_MAC")
+    return resp["KeyMetadata"]
+
+
+@pytest.mark.parametrize("key_spec,mac_algorithm,mac_len", HMAC_SPEC_ALGOS)
+def test_kms_create_hmac_key_metadata(kms_client, key_spec, mac_algorithm, mac_len):
+    meta = _hmac_key(kms_client, key_spec)
+    assert meta["KeySpec"] == key_spec
+    assert meta["CustomerMasterKeySpec"] == key_spec
+    assert meta["KeyUsage"] == "GENERATE_VERIFY_MAC"
+    assert meta["KeyState"] == "Enabled"
+    assert meta["Origin"] == "AWS_KMS"
+    assert meta["MacAlgorithms"] == [mac_algorithm]
+    # AWS omits these entirely for GENERATE_VERIFY_MAC keys.
+    assert "EncryptionAlgorithms" not in meta
+    assert "SigningAlgorithms" not in meta
+
+    described = kms_client.describe_key(KeyId=meta["KeyId"])["KeyMetadata"]
+    assert described["MacAlgorithms"] == [mac_algorithm]
+
+
+@pytest.mark.parametrize("key_spec,mac_algorithm,mac_len", HMAC_SPEC_ALGOS)
+def test_kms_generate_and_verify_mac_roundtrip(kms_client, key_spec, mac_algorithm, mac_len):
+    meta = _hmac_key(kms_client, key_spec)
+    message = b"ministack mac parity"
+
+    gen = kms_client.generate_mac(
+        KeyId=meta["KeyId"], Message=message, MacAlgorithm=mac_algorithm
+    )
+    assert gen["KeyId"] == meta["Arn"]
+    assert gen["MacAlgorithm"] == mac_algorithm
+    assert len(gen["Mac"]) == mac_len
+
+    verified = kms_client.verify_mac(
+        KeyId=meta["KeyId"],
+        Message=message,
+        MacAlgorithm=mac_algorithm,
+        Mac=gen["Mac"],
+    )
+    assert verified["MacValid"] is True
+    assert verified["KeyId"] == meta["Arn"]
+    assert verified["MacAlgorithm"] == mac_algorithm
+
+
+def test_kms_generate_mac_is_deterministic(kms_client):
+    meta = _hmac_key(kms_client)
+    message = b"same message"
+    first = kms_client.generate_mac(
+        KeyId=meta["KeyId"], Message=message, MacAlgorithm="HMAC_SHA_256"
+    )["Mac"]
+    second = kms_client.generate_mac(
+        KeyId=meta["KeyId"], Message=message, MacAlgorithm="HMAC_SHA_256"
+    )["Mac"]
+    assert first == second
+
+    other = kms_client.generate_mac(
+        KeyId=meta["KeyId"], Message=b"different message", MacAlgorithm="HMAC_SHA_256"
+    )["Mac"]
+    assert other != first
+
+
+def test_kms_generate_mac_accepts_key_arn_and_alias(kms_client):
+    meta = _hmac_key(kms_client)
+    alias = f"alias/mac-{_uuid_mod.uuid4().hex[:8]}"
+    kms_client.create_alias(AliasName=alias, TargetKeyId=meta["KeyId"])
+
+    by_arn = kms_client.generate_mac(
+        KeyId=meta["Arn"], Message=b"payload", MacAlgorithm="HMAC_SHA_256"
+    )
+    by_alias = kms_client.generate_mac(
+        KeyId=alias, Message=b"payload", MacAlgorithm="HMAC_SHA_256"
+    )
+    assert by_arn["Mac"] == by_alias["Mac"]
+    assert by_alias["KeyId"] == meta["Arn"]
+
+    assert kms_client.verify_mac(
+        KeyId=alias,
+        Message=b"payload",
+        MacAlgorithm="HMAC_SHA_256",
+        Mac=by_arn["Mac"],
+    )["MacValid"] is True
+
+
+def test_kms_verify_mac_tampered_message_raises_invalid_mac(kms_client):
+    meta = _hmac_key(kms_client)
+    mac = kms_client.generate_mac(
+        KeyId=meta["KeyId"], Message=b"original", MacAlgorithm="HMAC_SHA_256"
+    )["Mac"]
+    with pytest.raises(ClientError) as exc:
+        kms_client.verify_mac(
+            KeyId=meta["KeyId"],
+            Message=b"tampered",
+            MacAlgorithm="HMAC_SHA_256",
+            Mac=mac,
+        )
+    assert exc.value.response["Error"]["Code"] == "KMSInvalidMacException"
+
+
+def test_kms_verify_mac_tampered_mac_raises_invalid_mac(kms_client):
+    meta = _hmac_key(kms_client)
+    mac = bytearray(kms_client.generate_mac(
+        KeyId=meta["KeyId"], Message=b"original", MacAlgorithm="HMAC_SHA_256"
+    )["Mac"])
+    mac[0] ^= 0xFF
+    with pytest.raises(ClientError) as exc:
+        kms_client.verify_mac(
+            KeyId=meta["KeyId"],
+            Message=b"original",
+            MacAlgorithm="HMAC_SHA_256",
+            Mac=bytes(mac),
+        )
+    assert exc.value.response["Error"]["Code"] == "KMSInvalidMacException"
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda mac: mac[:16],
+    lambda mac: mac[:-1],
+    lambda mac: mac + b"\x00",
+    lambda mac: b"\x00" * len(mac),
+])
+def test_kms_verify_mac_rejects_truncated_or_extended_mac(kms_client, mutate):
+    meta = _hmac_key(kms_client)
+    mac = kms_client.generate_mac(
+        KeyId=meta["KeyId"], Message=b"original", MacAlgorithm="HMAC_SHA_256"
+    )["Mac"]
+    with pytest.raises(ClientError) as exc:
+        kms_client.verify_mac(
+            KeyId=meta["KeyId"],
+            Message=b"original",
+            MacAlgorithm="HMAC_SHA_256",
+            Mac=mutate(mac),
+        )
+    assert exc.value.response["Error"]["Code"] == "KMSInvalidMacException"
+
+
+def test_kms_verify_mac_wrong_key_raises_invalid_mac(kms_client):
+    signer = _hmac_key(kms_client)
+    other = _hmac_key(kms_client)
+    mac = kms_client.generate_mac(
+        KeyId=signer["KeyId"], Message=b"payload", MacAlgorithm="HMAC_SHA_256"
+    )["Mac"]
+    with pytest.raises(ClientError) as exc:
+        kms_client.verify_mac(
+            KeyId=other["KeyId"],
+            Message=b"payload",
+            MacAlgorithm="HMAC_SHA_256",
+            Mac=mac,
+        )
+    assert exc.value.response["Error"]["Code"] == "KMSInvalidMacException"
+
+
+def test_kms_mac_algorithm_must_match_key_spec(kms_client):
+    meta = _hmac_key(kms_client, "HMAC_256")
+    with pytest.raises(kms_client.exceptions.InvalidKeyUsageException):
+        kms_client.generate_mac(
+            KeyId=meta["KeyId"], Message=b"payload", MacAlgorithm="HMAC_SHA_512"
+        )
+
+
+def test_kms_mac_algorithm_enum_is_validated(kms_client):
+    meta = _hmac_key(kms_client)
+    with pytest.raises(ClientError) as exc:
+        kms_client.generate_mac(
+            KeyId=meta["KeyId"], Message=b"payload", MacAlgorithm="HMAC_SHA_1"
+        )
+    err = exc.value.response["Error"]
+    assert err["Code"] == "ValidationException"
+    assert "macAlgorithm" in err["Message"]
+
+
+def test_kms_generate_mac_message_size_limit(kms_client):
+    meta = _hmac_key(kms_client)
+    at_limit = kms_client.generate_mac(
+        KeyId=meta["KeyId"], Message=b"a" * 4096, MacAlgorithm="HMAC_SHA_256"
+    )
+    assert at_limit["Mac"]
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.generate_mac(
+            KeyId=meta["KeyId"], Message=b"a" * 4097, MacAlgorithm="HMAC_SHA_256"
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_kms_mac_dry_run_never_succeeds(kms_client):
+    meta = _hmac_key(kms_client)
+    mac = kms_client.generate_mac(
+        KeyId=meta["KeyId"], Message=b"payload", MacAlgorithm="HMAC_SHA_256"
+    )["Mac"]
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.generate_mac(
+            KeyId=meta["KeyId"],
+            Message=b"payload",
+            MacAlgorithm="HMAC_SHA_256",
+            DryRun=True,
+        )
+    assert exc.value.response["Error"]["Code"] == "DryRunOperationException"
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.verify_mac(
+            KeyId=meta["KeyId"],
+            Message=b"payload",
+            MacAlgorithm="HMAC_SHA_256",
+            Mac=mac,
+            DryRun=True,
+        )
+    assert exc.value.response["Error"]["Code"] == "DryRunOperationException"
+
+
+def test_kms_mac_key_state_precedes_dry_run(kms_client):
+    meta = _hmac_key(kms_client)
+    kms_client.disable_key(KeyId=meta["KeyId"])
+    with pytest.raises(ClientError) as exc:
+        kms_client.generate_mac(
+            KeyId=meta["KeyId"],
+            Message=b"payload",
+            MacAlgorithm="HMAC_SHA_256",
+            DryRun=True,
+        )
+    assert exc.value.response["Error"]["Code"] == "DisabledException"
+
+
+def test_kms_verify_mac_comparison_precedes_dry_run(kms_client):
+    meta = _hmac_key(kms_client)
+    with pytest.raises(ClientError) as exc:
+        kms_client.verify_mac(
+            KeyId=meta["KeyId"],
+            Message=b"payload",
+            MacAlgorithm="HMAC_SHA_256",
+            Mac=b"not-the-mac",
+            DryRun=True,
+        )
+    assert exc.value.response["Error"]["Code"] == "KMSInvalidMacException"
+
+
+def test_kms_verify_mac_bounds_the_mac_blob(kms_client):
+    meta = _hmac_key(kms_client)
+    with pytest.raises(ClientError) as exc:
+        kms_client.verify_mac(
+            KeyId=meta["KeyId"],
+            Message=b"payload",
+            MacAlgorithm="HMAC_SHA_256",
+            Mac=b"a" * 6145,
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_kms_generate_mac_requires_hmac_key(kms_client):
+    symmetric = kms_client.create_key()["KeyMetadata"]
+    with pytest.raises(kms_client.exceptions.InvalidKeyUsageException):
+        kms_client.generate_mac(
+            KeyId=symmetric["KeyId"], Message=b"payload", MacAlgorithm="HMAC_SHA_256"
+        )
+
+
+def test_kms_generate_mac_rejects_empty_message(kms_client):
+    meta = _hmac_key(kms_client)
+    with pytest.raises((ClientError, ParamValidationError)) as exc:
+        kms_client.generate_mac(
+            KeyId=meta["KeyId"], Message=b"", MacAlgorithm="HMAC_SHA_256"
+        )
+    if isinstance(exc.value, ClientError):
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_kms_hmac_key_material_never_leaves_the_server(kms_client):
+    meta = _hmac_key(kms_client)
+    described = kms_client.describe_key(KeyId=meta["KeyId"])["KeyMetadata"]
+    for payload in (meta, described):
+        assert not [k for k in payload if k.startswith("_")]
+
+
+def test_kms_generate_mac_unknown_key_raises_not_found(kms_client):
+    with pytest.raises(kms_client.exceptions.NotFoundException):
+        kms_client.generate_mac(
+            KeyId=str(_uuid_mod.uuid4()), Message=b"payload", MacAlgorithm="HMAC_SHA_256"
+        )
+
+
+@pytest.mark.parametrize("state", ["Disabled", "PendingDeletion"])
+def test_kms_mac_respects_key_state(kms_client, state):
+    meta = _hmac_key(kms_client)
+    key_id = meta["KeyId"]
+    mac = kms_client.generate_mac(
+        KeyId=key_id, Message=b"payload", MacAlgorithm="HMAC_SHA_256"
+    )["Mac"]
+
+    if state == "Disabled":
+        kms_client.disable_key(KeyId=key_id)
+        expected = kms_client.exceptions.DisabledException
+    else:
+        kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+        expected = kms_client.exceptions.KMSInvalidStateException
+
+    with pytest.raises(expected):
+        kms_client.generate_mac(
+            KeyId=key_id, Message=b"payload", MacAlgorithm="HMAC_SHA_256"
+        )
+    with pytest.raises(expected):
+        kms_client.verify_mac(
+            KeyId=key_id,
+            Message=b"payload",
+            MacAlgorithm="HMAC_SHA_256",
+            Mac=mac,
+        )
+
+
+def test_kms_create_hmac_key_rejects_wrong_key_usage(kms_client):
+    with pytest.raises(ClientError) as exc:
+        kms_client.create_key(KeySpec="HMAC_256", KeyUsage="ENCRYPT_DECRYPT")
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_kms_create_key_rejects_mac_usage_on_non_hmac_spec(kms_client):
+    with pytest.raises(ClientError) as exc:
+        kms_client.create_key(
+            KeySpec="SYMMETRIC_DEFAULT", KeyUsage="GENERATE_VERIFY_MAC"
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_kms_hmac_key_rejected_by_non_mac_crypto_operations(kms_client):
+    meta = _hmac_key(kms_client)
+    key_id = meta["KeyId"]
+
+    with pytest.raises(kms_client.exceptions.InvalidKeyUsageException):
+        kms_client.encrypt(KeyId=key_id, Plaintext=b"secret")
+    with pytest.raises(kms_client.exceptions.InvalidKeyUsageException):
+        kms_client.decrypt(KeyId=key_id, CiphertextBlob=b"x" * 100)
+    with pytest.raises(kms_client.exceptions.InvalidKeyUsageException):
+        kms_client.sign(
+            KeyId=key_id, Message=b"m", SigningAlgorithm="RSASSA_PKCS1_V1_5_SHA_256"
+        )
+    with pytest.raises(kms_client.exceptions.InvalidKeyUsageException):
+        kms_client.verify(
+            KeyId=key_id,
+            Message=b"m",
+            Signature=b"sig",
+            SigningAlgorithm="RSASSA_PKCS1_V1_5_SHA_256",
+        )
+    with pytest.raises(kms_client.exceptions.InvalidKeyUsageException):
+        kms_client.generate_data_key(KeyId=key_id, KeySpec="AES_256")
+    with pytest.raises(kms_client.exceptions.InvalidKeyUsageException):
+        kms_client.generate_data_key_pair(KeyId=key_id, KeyPairSpec="RSA_2048")
+
+
+def test_kms_encrypt_key_usage_precedes_key_state(kms_client):
+    meta = _hmac_key(kms_client)
+    kms_client.disable_key(KeyId=meta["KeyId"])
+    with pytest.raises(kms_client.exceptions.InvalidKeyUsageException):
+        kms_client.encrypt(KeyId=meta["KeyId"], Plaintext=b"secret")
+
+
+def test_kms_hmac_key_has_no_public_key(kms_client):
+    meta = _hmac_key(kms_client)
+    with pytest.raises(kms_client.exceptions.InvalidKeyUsageException):
+        kms_client.get_public_key(KeyId=meta["KeyId"])
+
+
+def test_kms_symmetric_key_get_public_key_still_unsupported(kms_client):
+    key_id = kms_client.create_key()["KeyMetadata"]["KeyId"]
+    with pytest.raises(kms_client.exceptions.UnsupportedOperationException):
+        kms_client.get_public_key(KeyId=key_id)
+
+
+def test_kms_hmac_key_cannot_enable_rotation(kms_client):
+    meta = _hmac_key(kms_client)
+    with pytest.raises(kms_client.exceptions.UnsupportedOperationException):
+        kms_client.enable_key_rotation(KeyId=meta["KeyId"])
+
+
+def test_kms_hmac_key_rotation_reads_and_disable_are_no_ops(kms_client):
+    meta = _hmac_key(kms_client)
+    assert kms_client.disable_key_rotation(KeyId=meta["KeyId"])
+    status = kms_client.get_key_rotation_status(KeyId=meta["KeyId"])
+    assert status["KeyRotationEnabled"] is False
+
+
+def test_kms_hmac_key_supports_lifecycle_and_tags(kms_client):
+    meta = kms_client.create_key(
+        KeySpec="HMAC_256",
+        KeyUsage="GENERATE_VERIFY_MAC",
+        Tags=[{"TagKey": "env", "TagValue": "mac"}],
+    )["KeyMetadata"]
+    key_id = meta["KeyId"]
+
+    assert {"TagKey": "env", "TagValue": "mac"} in kms_client.list_resource_tags(
+        KeyId=key_id
+    )["Tags"]
+
+    kms_client.disable_key(KeyId=key_id)
+    assert kms_client.describe_key(KeyId=key_id)["KeyMetadata"]["KeyState"] == "Disabled"
+    kms_client.enable_key(KeyId=key_id)
+    assert kms_client.describe_key(KeyId=key_id)["KeyMetadata"]["KeyState"] == "Enabled"
+
+    policy = json.loads(kms_client.get_key_policy(KeyId=key_id, PolicyName="default")["Policy"])
+    assert policy["Statement"][0]["Action"] == "kms:*"
+
+
+def test_kms_cloudformation_hmac_key_spec(cfn, kms_client):
+    template = {
+        "Resources": {
+            "MacKey": {
+                "Type": "AWS::KMS::Key",
+                "Properties": {
+                    "Description": "cfn hmac key",
+                    "KeySpec": "HMAC_256",
+                    "KeyUsage": "GENERATE_VERIFY_MAC",
+                },
+            },
+        },
+        "Outputs": {"KeyId": {"Value": {"Ref": "MacKey"}}},
+    }
+    stack_name = f"kms-cfn-hmac-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+
+    outputs = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["Outputs"]
+    key_id = next(o["OutputValue"] for o in outputs if o["OutputKey"] == "KeyId")
+
+    meta = kms_client.describe_key(KeyId=key_id)["KeyMetadata"]
+    assert meta["KeySpec"] == "HMAC_256"
+    assert meta["KeyUsage"] == "GENERATE_VERIFY_MAC"
+    assert meta["MacAlgorithms"] == ["HMAC_SHA_256"]
+
+    mac = kms_client.generate_mac(
+        KeyId=key_id, Message=b"cfn payload", MacAlgorithm="HMAC_SHA_256"
+    )["Mac"]
+    assert kms_client.verify_mac(
+        KeyId=key_id, Message=b"cfn payload", MacAlgorithm="HMAC_SHA_256", Mac=mac
+    )["MacValid"] is True
+
+
+def test_kms_cloudformation_honours_asymmetric_key_spec(cfn, kms_client):
+    template = {
+        "Resources": {
+            "SignKey": {
+                "Type": "AWS::KMS::Key",
+                "Properties": {
+                    "KeySpec": "RSA_2048",
+                    "KeyUsage": "SIGN_VERIFY",
+                },
+            },
+        },
+        "Outputs": {"KeyId": {"Value": {"Ref": "SignKey"}}},
+    }
+    stack_name = f"kms-cfn-rsa-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+
+    outputs = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["Outputs"]
+    key_id = next(o["OutputValue"] for o in outputs if o["OutputKey"] == "KeyId")
+
+    meta = kms_client.describe_key(KeyId=key_id)["KeyMetadata"]
+    assert meta["KeySpec"] == "RSA_2048"
+    assert meta["KeyUsage"] == "SIGN_VERIFY"
+    assert "RSASSA_PKCS1_V1_5_SHA_256" in meta["SigningAlgorithms"]
+
+    signature = kms_client.sign(
+        KeyId=key_id, Message=b"cfn signed", SigningAlgorithm="RSASSA_PKCS1_V1_5_SHA_256"
+    )["Signature"]
+    assert kms_client.verify(
+        KeyId=key_id, Message=b"cfn signed", Signature=signature,
+        SigningAlgorithm="RSASSA_PKCS1_V1_5_SHA_256",
+    )["SignatureValid"] is True
+
+
+@pytest.mark.parametrize("properties", [
+    {"KeySpec": "HMAC_256", "KeyUsage": "ENCRYPT_DECRYPT"},
+    {"KeyUsage": "GENERATE_VERIFY_MAC"},
+    {"KeySpec": "HMAC_256"},
+])
+def test_kms_cloudformation_rejects_mismatched_hmac_spec_and_usage(cfn, properties):
+    template = {
+        "Resources": {
+            "MacKey": {"Type": "AWS::KMS::Key", "Properties": properties},
+        },
+    }
+    stack_name = f"kms-cfn-hmac-bad-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template),
+        DisableRollback=True,
+    )
+    for _ in range(50):
+        stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+        if not stack["StackStatus"].endswith("_IN_PROGRESS"):
+            break
+        time.sleep(0.2)
+    assert stack["StackStatus"] in ("CREATE_FAILED", "ROLLBACK_COMPLETE")
+
+
+def test_kms_is_hmac_key_ignores_key_usage_alone():
+    from ministack.services import kms as _kms
+
+    legacy_symmetric = {
+        "KeySpec": "SYMMETRIC_DEFAULT",
+        "KeyUsage": "GENERATE_VERIFY_MAC",
+        "_symmetric_key": b"\x00" * 32,
+    }
+    assert not _kms._is_hmac_key(legacy_symmetric)
+    assert _kms._is_hmac_key({"KeySpec": "HMAC_256"})
+    assert _kms._is_hmac_key({"_hmac_key": b"\x00" * 32})
+
+
+def test_kms_generate_mac_matches_rfc2104_hmac():
+    import hmac as _hmac
+
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import kms as _kms
+
+    original_account = get_account_id()
+    original_region = get_region()
+    _kms.reset()
+    try:
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+        status, _headers, body = _kms._create_key(
+            {"KeySpec": "HMAC_384", "KeyUsage": "GENERATE_VERIFY_MAC"}
+        )
+        assert status == 200
+        key_id = json.loads(body)["KeyMetadata"]["KeyId"]
+        rec = _kms._keys[key_id]
+        assert len(rec["_hmac_key"]) == 48
+
+        message = b"rfc 2104 parity"
+        status, _headers, body = _kms._generate_mac({
+            "KeyId": key_id,
+            "Message": base64.b64encode(message).decode(),
+            "MacAlgorithm": "HMAC_SHA_384",
+        })
+        assert status == 200
+        expected = _hmac.new(rec["_hmac_key"], message, "sha384").digest()
+        assert base64.b64decode(json.loads(body)["Mac"]) == expected
+    finally:
+        _kms.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_kms_hmac_key_survives_state_roundtrip():
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import kms as _kms
+
+    original_account = get_account_id()
+    original_region = get_region()
+    _kms.reset()
+    try:
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+        status, _headers, body = _kms._create_key(
+            {"KeySpec": "HMAC_512", "KeyUsage": "GENERATE_VERIFY_MAC"}
+        )
+        assert status == 200
+        key_id = json.loads(body)["KeyMetadata"]["KeyId"]
+        message = base64.b64encode(b"persisted").decode()
+        _status, _headers, body = _kms._generate_mac({
+            "KeyId": key_id, "Message": message, "MacAlgorithm": "HMAC_SHA_512",
+        })
+        mac_before = json.loads(body)["Mac"]
+
+        state = _kms.get_state()
+        assert "_hmac_key_b64" in state["keys"][key_id]
+        assert "_hmac_key" not in state["keys"][key_id]
+        _kms.reset()
+        _kms.restore_state(state)
+
+        rec = _kms._keys[key_id]
+        assert isinstance(rec["_hmac_key"], bytes)
+        assert "_hmac_key_b64" not in rec
+        assert rec["MacAlgorithms"] == ["HMAC_SHA_512"]
+
+        _status, _headers, body = _kms._generate_mac({
+            "KeyId": key_id, "Message": message, "MacAlgorithm": "HMAC_SHA_512",
+        })
+        assert json.loads(body)["Mac"] == mac_before
+
+        status, _headers, body = _kms._verify_mac({
+            "KeyId": key_id,
+            "Message": message,
+            "MacAlgorithm": "HMAC_SHA_512",
+            "Mac": mac_before,
+        })
+        assert status == 200
+        assert json.loads(body)["MacValid"] is True
+    finally:
+        _kms.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
 
 
 def test_kms_create_key_rsa_3072_signs(kms_client):

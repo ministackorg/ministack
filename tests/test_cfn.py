@@ -2161,7 +2161,7 @@ def test_cfn_stack_with_s3_lambda_dynamodb(cfn, s3, lam, ddb):
     assert item["Item"]["val"]["S"] == "works"
 
     # Verify Lambda function was created and is invocable
-    funcs = [f["FunctionName"] for f in lam.list_functions()["Functions"]]
+    funcs = [f["FunctionName"] for page in lam.get_paginator("list_functions").paginate() for f in page["Functions"]]
     assert fn_name in funcs
     resp = lam.invoke(FunctionName=fn_name, Payload=json.dumps({"test": "cfn"}))
     payload = json.loads(resp["Payload"].read())
@@ -7521,11 +7521,11 @@ def test_cfn_kms_key_immutable_property_change_is_rejected(cfn, kms_client):
 
 def test_cfn_kms_key_unsupported_key_spec_fails_the_stack(cfn):
     """An unimplemented spec must fail the stack, not quietly become symmetric."""
-    stack_name = f"cfn-kms-hmac-{_uuid_mod.uuid4().hex[:8]}"
+    stack_name = f"cfn-kms-badspec-{_uuid_mod.uuid4().hex[:8]}"
     cfn.create_stack(
         StackName=stack_name,
         TemplateBody=_kms_key_template(
-            {"KeySpec": "HMAC_256", "KeyUsage": "GENERATE_VERIFY_MAC"}
+            {"KeySpec": "SM2", "KeyUsage": "ENCRYPT_DECRYPT"}
         ),
     )
     stack = _wait_stack(cfn, stack_name)
