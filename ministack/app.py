@@ -158,7 +158,7 @@ _NON_S3_VHOST_NAMES = frozenset({
     "apigateway", "cloudformation", "autoscaling", "codebuild", "transfer", "cur",
     "cloudfront-kvs",
     "appsync-api", "appsync-realtime-api",
-    "inspector2",
+    "inspector2", "dsql",
 })
 
 from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
@@ -272,6 +272,7 @@ SERVICE_REGISTRY = {
     "config": {"module": "config"},
     "dynamodb": {"module": "dynamodb"},
     "dynamodbstreams": {"module": "dynamodb_streams"},
+    "dsql": {"module": "dsql"},
     "ec2": {"module": "ec2"},
     "ecr": {"module": "ecr"},
     "ecs": {"module": "ecs"},
@@ -366,7 +367,7 @@ _state_map = {
     "cloudfront_keyvaluestore": "cloudfront_keyvaluestore",
     "resource_groups": "resource_groups",
     "cloudtrail": "cloudtrail", "iot": "iot",
-    "inspector2": "inspector2",
+    "inspector2": "inspector2", "dsql": "dsql",
     "mediaconnect": "mediaconnect",
     "mq": "mq",
     "opensearch": "opensearch",
@@ -422,7 +423,7 @@ BANNER = r"""
            ECS, RDS, ElastiCache, Glue, Athena, API Gateway, Firehose, Route53,
            Cognito, EC2, EMR, EBS, EFS, ALB/ELBv2, CloudFormation, KMS, ECR, CloudFront,
            AppSync, Cloud Map, S3 Files, RDS Data API, CodeBuild, AppConfig, Transfer, EKS,
-           Inspector2, IoT Core
+           Inspector2, IoT Core, Aurora DSQL
 """
 
 
@@ -1999,6 +2000,15 @@ async def _handle_lifespan(scope, receive, send):
                     await transfer.sftp_start()
                 except Exception as e:
                     logger.warning("Transfer SFTP startup failed: %s", e)
+            # Start DSQL wire proxies for clusters restored from persistence.
+            # Guarded on the module already being loaded (i.e. it had state
+            # or was used this boot) so we never import dsql just for this.
+            _dsql_mod = _loaded_modules.get("dsql")
+            if _dsql_mod is not None:
+                try:
+                    await _dsql_mod.start_restored_proxies()
+                except Exception as e:
+                    logger.warning("DSQL proxy startup failed: %s", e)
             # Start the EventBridge scheduler daemon explicitly. Module-import
             # autostart is gated by MINISTACK_TEST_NO_AUTOSTART so unit tests
             # don't race; lifespan.startup is the canonical place to spin it up.
@@ -2055,7 +2065,7 @@ def _stop_docker_containers():
         client = docker.from_env()
     except Exception:
         return
-    for label in ("ministack=rds", "ministack=ecs", "ministack=elasticache", "ministack=eks", "ministack=lambda"):
+    for label in ("ministack=rds", "ministack=ecs", "ministack=elasticache", "ministack=eks", "ministack=lambda", "ministack=dsql"):
         try:
             # all=True so exited-but-not-removed orphans get cleaned at boot.
             for c in client.containers.list(all=True, filters={"label": label}):
