@@ -1473,7 +1473,40 @@ def _matches_filter_policy(sub: dict, message_attributes: dict) -> bool:
     if scope == "MessageBody":
         return True
 
+    return _policy_matches(policy, message_attributes)
+
+
+_OR_RESERVED_MEMBER_KEYS = frozenset({
+    "anything-but", "prefix", "suffix", "equals-ignore-case",
+    "numeric", "exists", "cidr",
+})
+
+
+def _is_or_operator(value) -> bool:
+    """True when a ``$or`` value is SNS's OR operator rather than a literal
+    attribute name. AWS recognizes ``$or`` only when it holds an array of at
+    least two objects, none of whose field names are reserved rule keywords;
+    otherwise ``$or`` is treated as an ordinary attribute name."""
+    if not isinstance(value, list) or len(value) < 2:
+        return False
+    for member in value:
+        if not isinstance(member, dict):
+            return False
+        if any(key in _OR_RESERVED_MEMBER_KEYS for key in member):
+            return False
+    return True
+
+
+def _policy_matches(policy: dict, message_attributes: dict) -> bool:
+    """Match one filter-policy object against the message attributes. Sibling
+    keys are AND-ed; a recognized ``$or`` matches when any of its member
+    policies matches (evaluated recursively, so nested ``$or`` works)."""
     for key, allowed_values in policy.items():
+        if key == "$or" and _is_or_operator(allowed_values):
+            if not any(_policy_matches(member, message_attributes)
+                       for member in allowed_values):
+                return False
+            continue
         attr = message_attributes.get(key)
         if attr is None:
             return False

@@ -295,7 +295,6 @@ SERVICE_REGISTRY = {
     "lambda-microvms": {"module": "lambda_microvms"},
     "logs": {"module": "cloudwatch_logs", "aliases": ("cloudwatch-logs",)},
     "mediaconnect": {"module": "mediaconnect"},
-    "memorydb": {"module": "memorydb"},
     "opensearch": {"module": "opensearch", "aliases": ("es", "elasticsearch")},
     "organizations": {"module": "organizations"},
     "monitoring": {"module": "cloudwatch", "aliases": ("cloudwatch",)},

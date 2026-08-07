@@ -376,11 +376,6 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"config\."],
         "credential_scope": "config",
     },
-    "memorydb": {
-        "target_prefixes": ["AmazonMemoryDB"],
-        "host_patterns": [r"memory-db\.", r"memorydb\."],
-        "credential_scope": "memorydb",
-    },
     "eks": {
         "host_patterns": [r"eks\."],
         "path_prefixes": ["/oidc/"],
