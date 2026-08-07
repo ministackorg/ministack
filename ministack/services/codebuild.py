@@ -452,7 +452,7 @@ def _execute_build(build_id, project):
             _finish_build(build, "STOPPED")
         elif timed_out.is_set():
             _record_phase(build, build.get("currentPhase") or "BUILD", "TIMED_OUT")
-            _finish_build(build, "FAILED")
+            _finish_build(build, "TIMED_OUT")
         else:
             exit_code = container.wait().get("StatusCode", 1)
             _finish_build(build, "SUCCEEDED" if exit_code == 0 else "FAILED")
@@ -463,7 +463,7 @@ def _execute_build(build_id, project):
             _finish_build(build, "STOPPED")
         elif timed_out.is_set():
             _record_phase(build, build.get("currentPhase") or "BUILD", "TIMED_OUT")
-            _finish_build(build, "FAILED")
+            _finish_build(build, "TIMED_OUT")
         else:
             logger.exception("Build %s failed while running", build_id)
             _finish_build(build, "FAULT")
