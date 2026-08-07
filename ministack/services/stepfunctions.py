@@ -5532,6 +5532,8 @@ def _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data):
         wrapper = spec.get("body_wrapper")
         root_name = wrapper or spec.get("body_root", body_field)
         payload = {body_field: input_data[body_field]} if wrapper else input_data[body_field]
+        # SDK-convention names have to go out as wire names: route53 ignores <Ttl> and stores no TTL.
+        payload = _convert_params_to_api_names(payload)
         body = _rest_xml_build_body(root_name, payload, spec.get("list_members"),
                                     spec.get("body_xmlns"))
         headers["content-type"] = "application/xml"

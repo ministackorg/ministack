@@ -5632,6 +5632,28 @@ def test_sfn_aws_sdk_route53_request_matches_botocore():
         "/2013-04-01/hostedzone//hostedzone/Z123ABC/rrset/")
 
 
+def test_sfn_aws_sdk_route53_ttl_uses_the_sdk_spelling(sfn_sync, r53):
+    """"Ttl" in Parameters has to reach route53 as <TTL>, or the record loses its TTL silently."""
+    tag = _uuid_mod.uuid4().hex[:8]
+    zone = r53.create_hosted_zone(Name=f"ttl-{tag}.example.com.",
+                                  CallerReference=_uuid_mod.uuid4().hex)["HostedZone"]
+    zone_id = zone["Id"].rsplit("/", 1)[-1]
+    name = f"rec.ttl-{tag}.example.com."
+
+    resp = _r53_change_task(sfn_sync, tag, {
+        "HostedZoneId": zone_id,
+        "ChangeBatch": {"Changes": [{"Action": "UPSERT", "ResourceRecordSet": {
+            "Name": name, "Type": "A", "Ttl": 60,
+            "ResourceRecords": [{"Value": "10.0.0.1"}]}}]},
+    })
+    assert resp["status"] == "SUCCEEDED", resp.get("cause")
+
+    got = [r for r in r53.list_resource_record_sets(HostedZoneId=zone_id)["ResourceRecordSets"]
+           if r["Name"] == name]
+    assert len(got) == 1, got
+    assert got[0].get("TTL") == 60, f"TTL dropped, record stored as {got[0]}"
+
+
 def test_sfn_aws_sdk_route53_errors_name_their_service(sfn_sync):
     """A route53 failure is Route53.<Code>Exception, and an unmapped op names the covered ops."""
     tag = _uuid_mod.uuid4().hex[:8]
