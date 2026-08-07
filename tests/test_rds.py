@@ -496,9 +496,23 @@ def test_rds_start_stop_cluster(rds):
         MasterUsername="admin",
         MasterUserPassword="password123",
     )
+    with pytest.raises(ClientError) as exc_info:
+        rds.start_db_cluster(DBClusterIdentifier="ss-cl")
+    assert exc_info.value.response["Error"]["Code"] == "InvalidDBClusterStateFault"
+    assert exc_info.value.response["Error"]["Message"] == (
+        "DbCluster ss-cl is in available state but expected it to be one of "
+        "stopped,inaccessible-encryption-credentials-recoverable."
+    )
     rds.stop_db_cluster(DBClusterIdentifier="ss-cl")
     resp = rds.describe_db_clusters(DBClusterIdentifier="ss-cl")
     assert resp["DBClusters"][0]["Status"] == "stopped"
+    with pytest.raises(ClientError) as exc_info:
+        rds.stop_db_cluster(DBClusterIdentifier="ss-cl")
+    assert exc_info.value.response["Error"]["Code"] == "InvalidDBClusterStateFault"
+    assert exc_info.value.response["Error"]["Message"] == (
+        "DbCluster ss-cl is in stopped state but expected it to be one of "
+        "available."
+    )
     rds.start_db_cluster(DBClusterIdentifier="ss-cl")
     resp2 = rds.describe_db_clusters(DBClusterIdentifier="ss-cl")
     assert resp2["DBClusters"][0]["Status"] == "available"
@@ -2083,14 +2097,14 @@ def test_rds_last_member_delete_wins_after_readiness_epoch_check(monkeypatch):
             "SkipFinalSnapshot": "true",
         })
 
-        original_stop = m._stop_empty_cluster_shared_container
+        original_stop = m._stop_cluster_shared_container
 
         def _observed_stop(cluster_id, cluster):
             stop_entered.set()
             return original_stop(cluster_id, cluster)
 
         monkeypatch.setattr(
-            m, "_stop_empty_cluster_shared_container", _observed_stop,
+            m, "_stop_cluster_shared_container", _observed_stop,
         )
         m._create_db_instance({
             "DBInstanceIdentifier": "readiness-race-replacement",
@@ -2121,6 +2135,509 @@ def test_rds_last_member_delete_wins_after_readiness_epoch_check(monkeypatch):
         assert container.status == "exited"
     finally:
         release_grant.set()
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_stop_start_cluster_compute_lifecycle(monkeypatch):
+    """StopDBCluster stops the shared container; StartDBCluster restarts it."""
+    from ministack.services import rds as m
+
+    class FakeContainer:
+        id = "stopstart-shared-container"
+        attrs = {"NetworkSettings": {"Networks": {}}}
+
+        def __init__(self):
+            self.status = "running"
+
+        def reload(self):
+            pass
+
+        def start(self):
+            self.status = "running"
+
+        def stop(self, timeout=5):
+            self.status = "exited"
+
+    container = FakeContainer()
+
+    class FakeContainers:
+        def run(self, **_kwargs):
+            container.status = "running"
+            return container
+
+        def get(self, identifier):
+            if identifier in (
+                container.id,
+                m._rds_cluster_docker_name("stopstart-cluster"),
+            ):
+                return container
+            raise Exception("not found")
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: None)
+    monkeypatch.setattr(m, "_next_port", lambda: 16070)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    monkeypatch.setattr(m, "_wait_for_database_ready", lambda *_args: True)
+    monkeypatch.setattr(
+        m, "_grant_mysql_master_user_privileges", lambda *_args: None,
+    )
+
+    def _wait_for_member_status(db_id, expected, timeout=2):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if m._instances.get(db_id, {}).get("DBInstanceStatus") == expected:
+                return
+            time.sleep(0.01)
+        pytest.fail(
+            f"instance {db_id} never reached {expected}; last status: "
+            f"{m._instances.get(db_id, {}).get('DBInstanceStatus')}",
+        )
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "stopstart-cluster",
+            "Engine": "aurora-mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        m._create_db_instance({
+            "DBInstanceIdentifier": "stopstart-writer",
+            "DBClusterIdentifier": "stopstart-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+        _wait_for_member_status("stopstart-writer", "available")
+        cluster = m._clusters.get("stopstart-cluster")
+        assert cluster["Status"] == "available"
+
+        m._stop_db_cluster({"DBClusterIdentifier": "stopstart-cluster"})
+        assert container.status == "exited"
+        assert cluster["Status"] == "stopped"
+        assert cluster["_shared_container_ready"] is False
+        assert m._instances.get("stopstart-writer")[
+            "DBInstanceStatus"
+        ] == "stopped"
+
+        m._start_db_cluster({"DBClusterIdentifier": "stopstart-cluster"})
+        assert container.status == "running"
+        _wait_for_member_status("stopstart-writer", "available")
+        # The worker flips members available before its final
+        # _refresh_cluster_status, so poll the cluster status too.
+        deadline = time.time() + 2
+        while time.time() < deadline and cluster["Status"] != "available":
+            time.sleep(0.01)
+        assert cluster["Status"] == "available"
+        assert cluster["_shared_container_ready"] is True
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_restore_keeps_stopped_cluster_compute_stopped(monkeypatch):
+    """Warm boot must not revive compute for a cluster stopped via the API."""
+    from ministack.services import rds as m
+
+    started_calls = []
+
+    monkeypatch.setattr(m, "_get_docker", lambda: None)
+    monkeypatch.setattr(
+        m,
+        "_start_cluster_shared_container",
+        lambda *args, **kwargs: started_calls.append(args)
+        or {"started": False, "failed": False},
+    )
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "stopped-restore-cluster",
+            "Engine": "aurora-mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        m._create_db_instance({
+            "DBInstanceIdentifier": "stopped-restore-writer",
+            "DBClusterIdentifier": "stopped-restore-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+        m._stop_db_cluster({"DBClusterIdentifier": "stopped-restore-cluster"})
+
+        persisted = m.get_state()
+        m._instances.clear()
+        m._clusters.clear()
+        started_calls.clear()
+        m.restore_state(persisted)
+
+        # restore_state marks every instance ``creating`` before spawning the
+        # cluster runner; the runner's stopped branch flips members back to
+        # ``stopped``. Polling for that transition observes runner completion
+        # without a fixed sleep, and the runner sets statuses before any
+        # start call could happen, so the started_calls assertion below
+        # cannot race it.
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            inst = m._instances.get("stopped-restore-writer")
+            if inst and inst.get("DBInstanceStatus") == "stopped":
+                break
+            time.sleep(0.02)
+        cluster = m._clusters.get("stopped-restore-cluster")
+        assert cluster["Status"] == "stopped"
+        assert cluster["_shared_container_ready"] is False
+        assert m._instances.get("stopped-restore-writer")[
+            "DBInstanceStatus"
+        ] == "stopped"
+        assert started_calls == []
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def _stop_start_fake_docker(cluster_docker_name):
+    """Fake Docker client with switchable failures for stop/start tests."""
+    state = {"fail_start": False, "fail_run": False, "fail_stop": False}
+
+    class FakeContainer:
+        id = f"{cluster_docker_name}-container"
+        attrs = {"NetworkSettings": {"Networks": {}}}
+
+        def __init__(self):
+            self.status = "running"
+
+        def reload(self):
+            pass
+
+        def start(self):
+            if state["fail_start"]:
+                raise Exception("injected docker start failure")
+            self.status = "running"
+
+        def stop(self, timeout=5):
+            if state["fail_stop"]:
+                raise Exception("injected docker stop failure")
+            self.status = "exited"
+
+    container = FakeContainer()
+
+    class FakeContainers:
+        def run(self, **_kwargs):
+            if state["fail_run"]:
+                raise Exception("injected docker run failure")
+            container.status = "running"
+            return container
+
+        def get(self, identifier):
+            if identifier in (container.id, cluster_docker_name):
+                return container
+            raise Exception("not found")
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+
+    return FakeDocker(), container, state
+
+
+def _poll_until(predicate, timeout=5):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def test_rds_start_db_cluster_accepts_cluster_arn(monkeypatch):
+    """StartDBCluster by ARN must reach available, not wedge in starting."""
+    from ministack.services import rds as m
+
+    docker, container, _state = _stop_start_fake_docker(
+        m._rds_cluster_docker_name("arn-start-cluster"),
+    )
+    monkeypatch.setattr(m, "_get_docker", lambda: docker)
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: None)
+    monkeypatch.setattr(m, "_next_port", lambda: 16072)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    monkeypatch.setattr(m, "_wait_for_database_ready", lambda *_args: True)
+    monkeypatch.setattr(
+        m, "_grant_mysql_master_user_privileges", lambda *_args: None,
+    )
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "arn-start-cluster",
+            "Engine": "aurora-mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        m._create_db_instance({
+            "DBInstanceIdentifier": "arn-start-writer",
+            "DBClusterIdentifier": "arn-start-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+        cluster = m._clusters.get("arn-start-cluster")
+        assert _poll_until(lambda: cluster["Status"] == "available")
+
+        m._stop_db_cluster({"DBClusterIdentifier": "arn-start-cluster"})
+        assert cluster["Status"] == "stopped"
+
+        status, _, _body = m._start_db_cluster({
+            "DBClusterIdentifier": cluster["DBClusterArn"],
+        })
+        assert status == 200
+        assert _poll_until(lambda: cluster["Status"] == "available")
+        assert cluster["_shared_container_ready"] is True
+        assert container.status == "running"
+        assert m._instances.get("arn-start-writer")[
+            "DBInstanceStatus"
+        ] == "available"
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_start_db_cluster_failure_stays_stopped_and_retryable(monkeypatch):
+    """A failed restart AND recreate surfaces an error, not 'available'."""
+    from ministack.services import rds as m
+
+    docker, container, state = _stop_start_fake_docker(
+        m._rds_cluster_docker_name("failed-start-cluster"),
+    )
+    monkeypatch.setattr(m, "_get_docker", lambda: docker)
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: None)
+    monkeypatch.setattr(m, "_next_port", lambda: 16073)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    monkeypatch.setattr(m, "_wait_for_database_ready", lambda *_args: True)
+    monkeypatch.setattr(
+        m, "_grant_mysql_master_user_privileges", lambda *_args: None,
+    )
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "failed-start-cluster",
+            "Engine": "aurora-mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        m._create_db_instance({
+            "DBInstanceIdentifier": "failed-start-writer",
+            "DBClusterIdentifier": "failed-start-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+        cluster = m._clusters.get("failed-start-cluster")
+        assert _poll_until(lambda: cluster["Status"] == "available")
+        m._stop_db_cluster({"DBClusterIdentifier": "failed-start-cluster"})
+
+        # Both the restart and the recreate fallback genuinely fail.
+        state["fail_start"] = True
+        state["fail_run"] = True
+        status, _, body = m._start_db_cluster({
+            "DBClusterIdentifier": "failed-start-cluster",
+        })
+        assert status == 500
+        assert b"InternalFailure" in body
+        assert cluster["Status"] == "stopped"
+        assert cluster["_shared_container_ready"] is False
+        assert m._instances.get("failed-start-writer")[
+            "DBInstanceStatus"
+        ] == "stopped"
+
+        # The failure is transient: a retry must succeed.
+        state["fail_start"] = False
+        state["fail_run"] = False
+        status, _, _body = m._start_db_cluster({
+            "DBClusterIdentifier": "failed-start-cluster",
+        })
+        assert status == 200
+        assert _poll_until(lambda: cluster["Status"] == "available")
+        assert cluster["_shared_container_ready"] is True
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_start_readiness_failure_returns_cluster_to_stopped(monkeypatch):
+    """A container that never becomes reachable lands back on stopped."""
+    from ministack.services import rds as m
+
+    docker, container, _state = _stop_start_fake_docker(
+        m._rds_cluster_docker_name("unready-start-cluster"),
+    )
+    ready_ok = [True]
+    monkeypatch.setattr(m, "_get_docker", lambda: docker)
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: None)
+    monkeypatch.setattr(m, "_next_port", lambda: 16074)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    monkeypatch.setattr(
+        m, "_wait_for_database_ready", lambda *_args: ready_ok[0],
+    )
+    monkeypatch.setattr(
+        m, "_grant_mysql_master_user_privileges", lambda *_args: None,
+    )
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "unready-start-cluster",
+            "Engine": "aurora-mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        m._create_db_instance({
+            "DBInstanceIdentifier": "unready-start-writer",
+            "DBClusterIdentifier": "unready-start-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+        cluster = m._clusters.get("unready-start-cluster")
+        assert _poll_until(lambda: cluster["Status"] == "available")
+        m._stop_db_cluster({"DBClusterIdentifier": "unready-start-cluster"})
+
+        # The container starts but the database never answers.
+        ready_ok[0] = False
+        status, _, _body = m._start_db_cluster({
+            "DBClusterIdentifier": "unready-start-cluster",
+        })
+        assert status == 200
+        assert _poll_until(lambda: cluster["Status"] == "stopped")
+        assert cluster["_shared_container_ready"] is False
+        assert container.status == "exited"
+        assert m._instances.get("unready-start-writer")[
+            "DBInstanceStatus"
+        ] == "stopped"
+
+        # Once the database can answer, a retried start succeeds.
+        ready_ok[0] = True
+        status, _, _body = m._start_db_cluster({
+            "DBClusterIdentifier": "unready-start-cluster",
+        })
+        assert status == 200
+        assert _poll_until(lambda: cluster["Status"] == "available")
+        assert cluster["_shared_container_ready"] is True
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_instance_ops_rejected_while_cluster_stopped(monkeypatch):
+    """Create/DeleteDBInstance against a stopped cluster must be rejected."""
+    from ministack.services import rds as m
+
+    monkeypatch.setattr(m, "_get_docker", lambda: None)
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "stopped-guard-cluster",
+            "Engine": "aurora-mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        m._create_db_instance({
+            "DBInstanceIdentifier": "stopped-guard-writer",
+            "DBClusterIdentifier": "stopped-guard-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+        cluster = m._clusters.get("stopped-guard-cluster")
+        assert _poll_until(lambda: cluster["Status"] == "available")
+        m._stop_db_cluster({"DBClusterIdentifier": "stopped-guard-cluster"})
+        assert cluster["Status"] == "stopped"
+
+        status, _, body = m._create_db_instance({
+            "DBInstanceIdentifier": "stopped-guard-reader",
+            "DBClusterIdentifier": "stopped-guard-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+        assert status == 400
+        assert b"InvalidDBClusterStateFault" in body
+        assert m._instances.get("stopped-guard-reader") is None
+
+        status, _, body = m._delete_db_instance({
+            "DBInstanceIdentifier": "stopped-guard-writer",
+        })
+        assert status == 400
+        assert b"InvalidDBClusterStateFault" in body
+        assert m._instances.get("stopped-guard-writer") is not None
+        assert cluster.get("DBClusterMembers")
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_stop_db_cluster_docker_failure_surfaces_error(monkeypatch):
+    """A failed Docker stop must not report the cluster as stopped."""
+    from ministack.services import rds as m
+
+    docker, container, state = _stop_start_fake_docker(
+        m._rds_cluster_docker_name("failed-stop-cluster"),
+    )
+    monkeypatch.setattr(m, "_get_docker", lambda: docker)
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: None)
+    monkeypatch.setattr(m, "_next_port", lambda: 16075)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    monkeypatch.setattr(m, "_wait_for_database_ready", lambda *_args: True)
+    monkeypatch.setattr(
+        m, "_grant_mysql_master_user_privileges", lambda *_args: None,
+    )
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "failed-stop-cluster",
+            "Engine": "aurora-mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        m._create_db_instance({
+            "DBInstanceIdentifier": "failed-stop-writer",
+            "DBClusterIdentifier": "failed-stop-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+        })
+        cluster = m._clusters.get("failed-stop-cluster")
+        assert _poll_until(lambda: cluster["Status"] == "available")
+
+        state["fail_stop"] = True
+        status, _, body = m._stop_db_cluster({
+            "DBClusterIdentifier": "failed-stop-cluster",
+        })
+        assert status == 500
+        assert b"InternalFailure" in body
+        assert cluster["Status"] == "available"
+        assert cluster["_shared_container_ready"] is True
+        assert container.status == "running"
+        assert m._instances.get("failed-stop-writer")[
+            "DBInstanceStatus"
+        ] == "available"
+
+        # The failure is transient: a retried stop succeeds.
+        state["fail_stop"] = False
+        status, _, _body = m._stop_db_cluster({
+            "DBClusterIdentifier": "failed-stop-cluster",
+        })
+        assert status == 200
+        assert cluster["Status"] == "stopped"
+        assert container.status == "exited"
+    finally:
         m._instances.clear()
         m._clusters.clear()
 
@@ -3681,7 +4198,7 @@ def test_rds_restore_state_respawns_one_container_per_cluster(
                 del m._instances[db_id]
                 m._unregister_instance_from_clusters(db_id)
             restored_cluster = m._clusters["restored-shared-cluster"]
-            m._stop_empty_cluster_shared_container(
+            m._stop_cluster_shared_container(
                 "restored-shared-cluster", restored_cluster,
             )
         return database_ready
@@ -3813,7 +4330,7 @@ def test_rds_restore_state_respawns_one_container_per_cluster(
                 del m._instances[db_id]
                 m._unregister_instance_from_clusters(db_id)
             restored_cluster = m._clusters[cluster_id]
-            m._stop_empty_cluster_shared_container(
+            m._stop_cluster_shared_container(
                 cluster_id,
                 restored_cluster,
             )
@@ -6430,6 +6947,63 @@ def test_aurora_delete_member_keeps_shared_data(rds, rds_data):
     assert containers == []
 
 
+@pytest.mark.skipif(not os.environ.get("DOCKER_NETWORK"), reason="DOCKER_NETWORK not set -- live Aurora")
+def test_aurora_stop_start_cluster_preserves_data(rds):
+    import docker
+    import pymysql
+
+    with _live_cluster(rds) as (
+        cluster_id,
+        writer_id,
+        reader_id,
+        writer,
+        _reader,
+        _cluster,
+    ):
+        with _aurora_connect(writer["Endpoint"]) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("CREATE TABLE stop_start_rows (id INT PRIMARY KEY)")
+                cursor.execute("INSERT INTO stop_start_rows VALUES (42)")
+
+        containers = docker.from_env().containers.list(
+            all=True,
+            filters={"label": ["ministack=rds", f"cluster_id={cluster_id}"]},
+        )
+        assert len(containers) == 1
+        container = containers[0]
+        original_container_id = container.id
+
+        rds.stop_db_cluster(DBClusterIdentifier=cluster_id)
+        stopped = rds.describe_db_clusters(
+            DBClusterIdentifier=cluster_id,
+        )["DBClusters"][0]
+        assert stopped["Status"] == "stopped"
+        for db_id in (writer_id, reader_id):
+            instance = rds.describe_db_instances(
+                DBInstanceIdentifier=db_id,
+            )["DBInstances"][0]
+            assert instance["DBInstanceStatus"] == "stopped"
+        container.reload()
+        assert container.status == "exited"
+        with pytest.raises((pymysql.err.OperationalError, OSError)):
+            _aurora_connect(writer["Endpoint"])
+
+        rds.start_db_cluster(DBClusterIdentifier=cluster_id)
+        writer = _wait_for_instance(rds, writer_id)
+        _wait_for_instance(rds, reader_id)
+        started = rds.describe_db_clusters(
+            DBClusterIdentifier=cluster_id,
+        )["DBClusters"][0]
+        assert started["Status"] == "available"
+        container.reload()
+        assert container.status == "running"
+        assert container.id == original_container_id
+        with _aurora_connect(writer["Endpoint"]) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT id FROM stop_start_rows")
+                assert cursor.fetchone() == (42,)
+
+
 def test_rds_aurora_mysql_8_replication_command_is_stable_and_scoped(monkeypatch):
     from ministack.core.responses import (
         get_account_id,
@@ -7201,7 +7775,7 @@ def test_rds_deleting_last_global_secondary_instance_preserves_headless_applier(
         set_request_region("us-west-2")
         monkeypatch.setattr(
             m,
-            "_stop_empty_cluster_shared_container",
+            "_stop_cluster_shared_container",
             lambda cluster_id, cluster: stopped.append((cluster_id, cluster)),
         )
 
@@ -7661,7 +8235,7 @@ def test_rds_remove_headless_global_secondary_commits_detach_and_stops_applier(
         monkeypatch.setattr(m, "_detach_mysql_replication", lambda *_args: True)
         monkeypatch.setattr(
             m,
-            "_stop_empty_cluster_shared_container",
+            "_stop_cluster_shared_container",
             lambda cluster_id, cluster: stopped.append((cluster_id, cluster)),
         )
 
