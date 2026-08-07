@@ -2664,6 +2664,70 @@ def test_ec2_authorize_sg_egress_returns_rules(ec2):
     assert rules[0]["CidrIpv4"] == "0.0.0.0/0"
 
 
+def test_ec2_authorize_sg_egress_duplicate_of_default_returns_rule(ec2):
+    """Re-authorizing the default allow-all egress rule must still return it.
+
+    CreateSecurityGroup seeds the AWS default egress rule (-1, 0.0.0.0/0), and
+    Terraform's aws_vpc_security_group_egress_rule declares exactly that rule. The
+    authorize is idempotent, but the response must still carry the rule: the AWS
+    provider reads SecurityGroupRules[0].SecurityGroupRuleId with no length check and
+    panics on an empty securityGroupRuleSet.
+    """
+    vpc = ec2.create_vpc(CidrBlock="10.96.0.0/16")["Vpc"]
+    sg_id = ec2.create_security_group(
+        GroupName="sgr-egress-dup", Description="test", VpcId=vpc["VpcId"])["GroupId"]
+
+    seeded = ec2.describe_security_group_rules(
+        Filters=[{"Name": "group-id", "Values": [sg_id]}])["SecurityGroupRules"]
+    default_egress = [r for r in seeded if r["IsEgress"]]
+    assert len(default_egress) == 1
+
+    resp = ec2.authorize_security_group_egress(
+        GroupId=sg_id,
+        IpPermissions=[{
+            "IpProtocol": "-1",
+            "IpRanges": [{"CidrIp": "0.0.0.0/0", "Description": "managed by terraform"}],
+        }],
+        TagSpecifications=[{
+            "ResourceType": "security-group-rule",
+            "Tags": [{"Key": "crossplane-name", "Value": "pgdb"}],
+        }],
+    )
+
+    assert resp.get("Return") is True
+    rules = resp.get("SecurityGroupRules", [])
+    assert len(rules) == 1
+    assert rules[0]["SecurityGroupRuleId"] == default_egress[0]["SecurityGroupRuleId"]
+    assert rules[0]["IsEgress"] is True
+
+    # Idempotent: the duplicate must not add a second rule.
+    after = ec2.describe_security_group_rules(
+        Filters=[{"Name": "group-id", "Values": [sg_id]}])["SecurityGroupRules"]
+    assert len([r for r in after if r["IsEgress"]]) == 1
+
+
+def test_ec2_authorize_sg_ingress_duplicate_returns_rule(ec2):
+    """A duplicate ingress authorize returns the stored rule id, not an empty set."""
+    vpc = ec2.create_vpc(CidrBlock="10.95.0.0/16")["Vpc"]
+    sg_id = ec2.create_security_group(
+        GroupName="sgr-ingress-dup", Description="test", VpcId=vpc["VpcId"])["GroupId"]
+    perm = {
+        "IpProtocol": "tcp", "FromPort": 5432, "ToPort": 5432,
+        "IpRanges": [{"CidrIp": "10.0.0.0/8"}],
+    }
+
+    first = ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=[perm])
+    second = ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=[perm])
+
+    assert len(second["SecurityGroupRules"]) == 1
+    assert (second["SecurityGroupRules"][0]["SecurityGroupRuleId"]
+            == first["SecurityGroupRules"][0]["SecurityGroupRuleId"])
+
+    after = ec2.describe_security_group_rules(
+        Filters=[{"Name": "group-id", "Values": [sg_id]}])["SecurityGroupRules"]
+    assert len([r for r in after if not r["IsEgress"]]) == 1
+
+
 def test_ec2_authorize_sg_ingress_ipv6(ec2):
     """AuthorizeSecurityGroupIngress returns rules with CidrIpv6."""
     vpc = ec2.create_vpc(CidrBlock="10.97.0.0/16")["Vpc"]
