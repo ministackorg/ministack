@@ -1339,6 +1339,8 @@ def _get_bucket_lifecycle(name: str):
                 xml += "<NoncurrentVersionTransition>"
                 if "NoncurrentDays" in t:
                     xml += f"<NoncurrentDays>{t['NoncurrentDays']}</NoncurrentDays>"
+                if "NewerNoncurrentVersions" in t:
+                    xml += f"<NewerNoncurrentVersions>{t['NewerNoncurrentVersions']}</NewerNoncurrentVersions>"
                 xml += f"<StorageClass>{t.get('StorageClass', 'STANDARD_IA')}</StorageClass>"
                 xml += "</NoncurrentVersionTransition>"
             if "Expiration" in rule:
@@ -1356,6 +1358,8 @@ def _get_bucket_lifecycle(name: str):
                 xml += "<NoncurrentVersionExpiration>"
                 if "NoncurrentDays" in nve:
                     xml += f"<NoncurrentDays>{nve['NoncurrentDays']}</NoncurrentDays>"
+                if "NewerNoncurrentVersions" in nve:
+                    xml += f"<NewerNoncurrentVersions>{nve['NewerNoncurrentVersions']}</NewerNoncurrentVersions>"
                 xml += "</NoncurrentVersionExpiration>"
             if rule.get("AbortIncompleteMultipartUpload"):
                 aimu = rule["AbortIncompleteMultipartUpload"]
@@ -1457,6 +1461,9 @@ def _put_bucket_lifecycle(name: str, body: bytes):
                 days = _lc_text(t, "NoncurrentDays")
                 if days:
                     td["NoncurrentDays"] = int(days)
+                newer = _lc_text(t, "NewerNoncurrentVersions")
+                if newer:
+                    td["NewerNoncurrentVersions"] = int(newer)
                 td["StorageClass"] = _lc_text(t, "StorageClass") or "STANDARD_IA"
                 nv_transitions.append(td)
             if nv_transitions:
@@ -1482,6 +1489,9 @@ def _put_bucket_lifecycle(name: str, body: bytes):
                 days = _lc_text(nve_el, "NoncurrentDays")
                 if days:
                     nve["NoncurrentDays"] = int(days)
+                newer = _lc_text(nve_el, "NewerNoncurrentVersions")
+                if newer:
+                    nve["NewerNoncurrentVersions"] = int(newer)
                 rule["NoncurrentVersionExpiration"] = nve
             # AbortIncompleteMultipartUpload
             aimu_el = _lc_find(rule_el, "AbortIncompleteMultipartUpload")
