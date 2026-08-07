@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **CloudWatch Logs — ARN-based tag operations resolve vended-delivery resources** — `TagResource`, `UntagResource`, and `ListTagsForResource` only resolved log-group ARNs, so the AWS provider's read-after-create on `aws_cloudwatch_log_delivery_source` / `aws_cloudwatch_log_delivery_destination` / `aws_cloudwatch_log_delivery` failed with `ResourceNotFoundException` and broke `terraform apply` of any stack using EventBridge bus logging (the community EventBridge module ≥ v4.1 provisions the trio). All three operations now resolve the delivery records' tags.
+
 ## [1.4.14] — 2026-08-07
 
 ### Added
