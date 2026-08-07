@@ -3377,3 +3377,141 @@ def test_eventbridge_name_length_caps():
             HttpMethod="POST",
         )
     assert err.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_eventbridge_rule_pattern_partnerid_exists_null_counts_as_present(eb, sqs):
+    """The cloudevents-binding pattern: detail-type match + detail.partnerid
+    {exists: true}. AWS nuance verified against the live matcher: a JSON null
+    partnerid counts as PRESENT, only a truly absent key fails the match."""
+    bus_name = "qa-eb-exists-bus"
+    eb.create_event_bus(Name=bus_name)
+    q_url = sqs.create_queue(QueueName="qa-eb-exists-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name="qa-eb-exists-rule",
+        EventBusName=bus_name,
+        EventPattern=json.dumps({
+            "detail-type": ["com.withclutch.loan.application.submitted.v1"],
+            "detail": {"partnerid": [{"exists": True}]},
+        }),
+        State="ENABLED",
+    )
+    eb.put_targets(Rule="qa-eb-exists-rule", EventBusName=bus_name, Targets=[{"Id": "t1", "Arn": q_arn}])
+
+    entries = [
+        {"marker": "with", "partnerid": "8c2d4e61-9a03-4f7b-b1e8-6d5c3a9f2b14"},
+        {"marker": "absent"},
+        {"marker": "null", "partnerid": None},
+    ]
+    eb.put_events(Entries=[
+        {
+            "Source": "myapp.exists",
+            "DetailType": "com.withclutch.loan.application.submitted.v1",
+            "Detail": json.dumps(detail),
+            "EventBusName": bus_name,
+        }
+        for detail in entries
+    ])
+
+    markers = set()
+    deadline = time.time() + 5
+    while time.time() < deadline and len(markers) < 2:
+        for msg in sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=10, WaitTimeSeconds=1).get("Messages", []):
+            markers.add(json.loads(msg["Body"])["detail"]["marker"])
+    assert markers == {"with", "null"}
+
+
+def test_eventbridge_api_destination_bare_object_template_dead_letters_invalid_json(eb, sqs):
+    """A template placing an object variable outside a JSON value position
+    (bare <detail>) fails the invocation BEFORE any HTTP request and
+    dead-letters as INVALID_JSON — the wrapped form {"detail": <detail>}
+    still delivers."""
+    server, captured = _start_api_dest_capture_server()
+    try:
+        port = server.server_address[1]
+        q_url = sqs.create_queue(QueueName="qa-eb-invjson-dlq-q")["QueueUrl"]
+        q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+
+        bus_bare, source_bare = _api_dest_pipeline(
+            eb,
+            "invjson-bare",
+            f"http://127.0.0.1:{port}/bare",
+            "API_KEY",
+            {"ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "k"}},
+            target_extras={
+                "InputTransformer": {"InputPathsMap": {"detail": "$.detail"}, "InputTemplate": "<detail>"},
+                "DeadLetterConfig": {"Arn": q_arn},
+            },
+        )
+        bus_wrapped, source_wrapped = _api_dest_pipeline(
+            eb,
+            "invjson-wrapped",
+            f"http://127.0.0.1:{port}/wrapped",
+            "API_KEY",
+            {"ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "k"}},
+            target_extras={
+                "InputTransformer": {
+                    "InputPathsMap": {"detail": "$.detail"},
+                    "InputTemplate": '{"detail": <detail>}',
+                },
+            },
+        )
+
+        eb.put_events(Entries=[{
+            "Source": source_bare,
+            "DetailType": "Ping",
+            "Detail": json.dumps({"n": 1}),
+            "EventBusName": bus_bare,
+        }])
+        eb.put_events(Entries=[{
+            "Source": source_wrapped,
+            "DetailType": "Ping",
+            "Detail": json.dumps({"n": 2}),
+            "EventBusName": bus_wrapped,
+        }])
+
+        # The wrapped form delivers; the bare form never reaches the endpoint.
+        assert _wait_until(lambda: len(captured) >= 1)
+        assert len(captured) == 1
+        assert captured[0]["path"] == "/wrapped"
+        assert json.loads(captured[0]["body"]) == {"detail": {"n": 2}}
+
+        messages = []
+
+        def _drain():
+            resp = sqs.receive_message(
+                QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1, MessageAttributeNames=["All"]
+            )
+            messages.extend(resp.get("Messages", []))
+            return len(messages) >= 1
+
+        assert _wait_until(_drain)
+        attrs = messages[0]["MessageAttributes"]
+        assert attrs["ERROR_CODE"]["StringValue"] == "INVALID_JSON"
+        assert attrs["ERROR_MESSAGE"]["StringValue"] == "Invalid input for target."
+        # The DLQ body is the original envelope.
+        assert json.loads(messages[0]["Body"])["detail"] == {"n": 1}
+    finally:
+        server.shutdown()
+
+
+def test_eventbridge_put_targets_rejects_invalid_json_input(eb):
+    bus_name = "qa-eb-input-validation-bus"
+    eb.create_event_bus(Name=bus_name)
+    eb.put_rule(
+        Name="qa-eb-input-validation-rule",
+        EventBusName=bus_name,
+        EventPattern=json.dumps({"source": ["myapp.input-validation"]}),
+        State="ENABLED",
+    )
+    with pytest.raises(ClientError) as err:
+        eb.put_targets(
+            Rule="qa-eb-input-validation-rule",
+            EventBusName=bus_name,
+            Targets=[{
+                "Id": "t1",
+                "Arn": "arn:aws:sqs:us-east-1:000000000000:qa-eb-input-validation-q",
+                "Input": "not json {",
+            }],
+        )
+    assert err.value.response["Error"]["Code"] == "ValidationException"

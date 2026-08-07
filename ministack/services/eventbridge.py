@@ -668,6 +668,17 @@ def _put_targets(data):
         error = _validate_target_arn(target)
         if error:
             return error
+        if "Input" in target:
+            # AWS validates static Input at PutTargets time — it must be valid
+            # JSON text, not at delivery.
+            try:
+                json.loads(target["Input"])
+            except (TypeError, ValueError):
+                return error_response_json(
+                    "ValidationException",
+                    f"Input for target {target.get('Id', '')} is not valid JSON.",
+                    400,
+                )
 
     if key not in _targets:
         _targets[key] = []
@@ -1167,9 +1178,10 @@ def _invoke_target(target, event, rule):
     envelope_payload = event_payload
 
     target_input_payload = None
+    transformer_input_invalid = False
     input_transformer = target.get("InputTransformer")
     if input_transformer:
-        event_payload = _apply_input_transformer(input_transformer, event, rule)
+        event_payload, transformer_input_invalid = _apply_input_transformer(input_transformer, event, rule)
         target_input_payload = event_payload
     elif target.get("Input"):
         event_payload = target["Input"]
@@ -1195,7 +1207,9 @@ def _invoke_target(target, event, rule):
             return
 
         if spec.service == "events" and spec.resource.startswith("api-destination/"):
-            _dispatch_to_api_destination(spec, event_payload, target, rule, envelope_payload)
+            _dispatch_to_api_destination(
+                spec, event_payload, target, rule, envelope_payload, transformer_input_invalid
+            )
         elif spec.service == "events":
             _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload)
         elif spec.service == "states":
@@ -1260,7 +1274,29 @@ def _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload=N
     logger.info("EventBridge -> Event bus %s: dispatched", spec)
 
 
+def _object_variable_positions_valid(template: str, object_vars) -> bool:
+    """AWS constrains input-transformer variables that resolve to a JSON object
+    or array to JSON VALUE positions — "you must place it as a key", i.e.
+    ``{"detail": <detail>}``. A bare or quoted placement is not a documented
+    form and the invocation fails with INVALID_JSON before any request is made
+    (verified live against API destinations). Valid here = every occurrence is
+    preceded, ignoring whitespace, by ``:``, ``[`` or ``,``."""
+    for var in object_vars:
+        placeholder = f"<{var}>"
+        start = template.find(placeholder)
+        while start != -1:
+            before = template[:start].rstrip()
+            if not before or before[-1] not in ":[,":
+                return False
+            start = template.find(placeholder, start + len(placeholder))
+    return True
+
+
 def _apply_input_transformer(transformer, event, rule=None):
+    """Render the target's InputTemplate. Returns ``(rendered, input_invalid)``
+    — ``input_invalid`` marks an object/array variable placed outside a JSON
+    value position, which real EventBridge rejects at invocation time (see
+    :func:`_object_variable_positions_valid`)."""
     input_paths = transformer.get("InputPathsMap", {})
     template = transformer.get("InputTemplate", "")
 
@@ -1282,6 +1318,7 @@ def _apply_input_transformer(transformer, event, rule=None):
     }
 
     replacements = {}
+    object_vars = set()
     for var_name, jpath in input_paths.items():
         parts = jpath.strip("$.").split(".")
         val = event_envelope
@@ -1289,6 +1326,8 @@ def _apply_input_transformer(transformer, event, rule=None):
             for p in parts:
                 if p:
                     val = val[p]
+            if isinstance(val, (dict, list)):
+                object_vars.add(var_name)
             replacements[var_name] = val if isinstance(val, str) else json.dumps(val)
         except (KeyError, TypeError, IndexError):
             replacements[var_name] = ""
@@ -1310,11 +1349,15 @@ def _apply_input_transformer(transformer, event, rule=None):
     # ingestion-time is reserved and uneditable, even if InputPathsMap declares it.
     replacements["aws.events.event.ingestion-time"] = ingestion_time
 
+    # The reserved envelope variables resolve to JSON objects and carry the
+    # same value-position constraint as InputPathsMap object variables.
+    object_vars.update({"aws.events.event.json", "aws.events.event"})
+
     result = template
     for var_name, val in replacements.items():
         result = result.replace(f"<{var_name}>", str(val))
 
-    return result
+    return result, not _object_variable_positions_valid(template, object_vars)
 
 
 def _dispatch_to_lambda(arn, payload):
@@ -1767,7 +1810,7 @@ def _deliver_to_api_destination(name: str, request: dict, conn: dict, token_key,
             _send_to_target_dlq(dlq, "ERROR_FROM_TARGET", f"HTTP {status}")
 
 
-def _dispatch_to_api_destination(spec, payload, target, rule, envelope_payload):
+def _dispatch_to_api_destination(spec, payload, target, rule, envelope_payload, input_invalid=False):
     if spec.account_id != get_account_id() or spec.region != get_region():
         logger.warning(
             "EventBridge → API destination: %s is outside the current account/region scope", spec
@@ -1780,6 +1823,18 @@ def _dispatch_to_api_destination(spec, payload, target, rule, envelope_payload):
         logger.warning("EventBridge → API destination: %s not found", name)
         return
     dlq = _resolve_target_dlq(target, rule, envelope_payload)
+    if input_invalid:
+        # Live-verified AWS behavior: an InputTransformer placing an object
+        # variable outside a JSON value position fails the invocation BEFORE
+        # any HTTP request, dead-lettering as INVALID_JSON.
+        logger.warning(
+            "EventBridge → API destination %s: transformed input is not valid for the target "
+            "(object variable outside a JSON value position); not invoked",
+            name,
+        )
+        if dlq is not None:
+            _send_to_target_dlq(dlq, "INVALID_JSON", "Invalid input for target.")
+        return
     if dest.get("ApiDestinationState") != "ACTIVE":
         # Real EventBridge fails deliveries to a non-ACTIVE destination into
         # the retry pipeline; with a DLQ configured they surface there.
