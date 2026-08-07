@@ -1670,12 +1670,7 @@ def _configure_mysql_replication(cluster_id, cluster):
     if not _mysql_gtid_history_ready(cluster):
         cluster["_mysql_replication_blocked_reason"] = "legacy-non-gtid-volume"
         cluster["_shared_container_ready"] = False
-        for cluster_member in cluster.get("DBClusterMembers", []):
-            instance = _instances.get(
-                cluster_member.get("DBInstanceIdentifier"),
-            )
-            if instance is not None:
-                instance["DBInstanceStatus"] = "failed"
+        _set_cluster_members_status(cluster, "failed")
         logger.error(
             "RDS: refusing MySQL replication for %s because its initialized "
             "volume predates GTID-at-creation tracking",
@@ -2419,6 +2414,13 @@ def _resolve_instance(db_id):
     return None
 
 
+def _set_cluster_members_status(cluster, status):
+    for member in cluster.get("DBClusterMembers", []):
+        instance = _instances.get(member.get("DBInstanceIdentifier"))
+        if instance is not None:
+            instance["DBInstanceStatus"] = status
+
+
 def _attach_instance_to_shared_cluster(instance, cluster):
     endpoint = cluster.get("_shared_endpoint")
     if not endpoint:
@@ -2955,12 +2957,7 @@ def _create_db_instance_impl(p):
                             ready_host, ready_port,
                         )
                         cluster["_shared_container_ready"] = False
-                        for member in cluster.get("DBClusterMembers", []):
-                            inst = _instances.get(
-                                member.get("DBInstanceIdentifier"),
-                            )
-                            if inst is not None:
-                                inst["DBInstanceStatus"] = "failed"
+                        _set_cluster_members_status(cluster, "failed")
                         _refresh_cluster_status(cluster_id)
                         return
 
@@ -2974,12 +2971,7 @@ def _create_db_instance_impl(p):
                         pending_rotation["new_password"],
                     ):
                         cluster["_shared_container_ready"] = False
-                        for member in cluster.get("DBClusterMembers", []):
-                            inst = _instances.get(
-                                member.get("DBInstanceIdentifier"),
-                            )
-                            if inst is not None:
-                                inst["DBInstanceStatus"] = "failed"
+                        _set_cluster_members_status(cluster, "failed")
                         _refresh_cluster_status(cluster_id)
                         return
                     if pending_rotation:
