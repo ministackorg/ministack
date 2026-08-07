@@ -211,8 +211,22 @@ DEFAULT_AURORA_MYSQL_IMAGE = "mysql:8.4"
 # ── Persistence ────────────────────────────────────────────
 
 def get_state():
-    instances = copy.deepcopy(_instances)
-    clusters = copy.deepcopy(_clusters)
+    with _shared_container_lock:
+        instances = copy.deepcopy(_instances)
+        clusters = copy.deepcopy(_clusters)
+        state = {
+            "instances": instances,
+            "clusters": clusters,
+            "subnet_groups": copy.deepcopy(_subnet_groups),
+            "param_groups": copy.deepcopy(_param_groups),
+            "snapshots": copy.deepcopy(_snapshots),
+            "db_cluster_param_groups": copy.deepcopy(_db_cluster_param_groups),
+            "db_cluster_snapshots": copy.deepcopy(_db_cluster_snapshots),
+            "option_groups": copy.deepcopy(_option_groups),
+            "global_clusters": copy.deepcopy(_global_clusters),
+            "tags": copy.deepcopy(_tags),
+            "port_counter": _port_counter[0],
+        }
     # Strip Docker container IDs (not restorable across restarts)
     for key in list(instances._data):
         instances._data[key].pop("_docker_container_id", None)
@@ -226,19 +240,6 @@ def get_state():
             ),
         )
         cluster.pop("_shared_container_id", None)
-    state = {
-        "instances": instances,
-        "clusters": clusters,
-        "subnet_groups": copy.deepcopy(_subnet_groups),
-        "param_groups": copy.deepcopy(_param_groups),
-        "snapshots": copy.deepcopy(_snapshots),
-        "db_cluster_param_groups": copy.deepcopy(_db_cluster_param_groups),
-        "db_cluster_snapshots": copy.deepcopy(_db_cluster_snapshots),
-        "option_groups": copy.deepcopy(_option_groups),
-        "global_clusters": copy.deepcopy(_global_clusters),
-        "tags": copy.deepcopy(_tags),
-        "port_counter": _port_counter[0],
-    }
     return state
 
 
@@ -2452,6 +2453,10 @@ def _unregister_instance_from_clusters(db_id):
 # ---------------------------------------------------------------------------
 
 def _create_db_instance(p):
+    return _create_db_instance_impl(p)
+
+
+def _create_db_instance_impl(p):
     db_id = _p(p, "DBInstanceIdentifier")
     if not db_id:
         return _error("MissingParameter", "DBInstanceIdentifier is required", 400)
