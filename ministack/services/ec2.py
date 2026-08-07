@@ -1387,11 +1387,18 @@ def _authorize_sg_ingress(p):
         r.setdefault("SecurityGroupRuleId", _sg_rule_id(sg_id, False, r))
         # Idempotent: skip rules that already exist (matches egress behavior and avoids
         # Terraform InvalidPermission.Duplicate when the provider re-authorizes unchanged rules).
-        if not any(_rules_match(r, existing) for existing in sg["IpPermissions"]):
+        # An already-present rule is not re-appended, but it must still be echoed in
+        # securityGroupRuleSet: the AWS provider reads SecurityGroupRules[0] with no
+        # length check, so an empty set panics it. Echo the stored rule so the caller
+        # gets the id that DescribeSecurityGroupRules will report.
+        existing = next((e for e in sg["IpPermissions"] if _rules_match(r, e)), None)
+        if existing is None:
             sg["IpPermissions"].append(r)
             if rule_tags:
                 _tags[_sg_rule_id(sg_id, False, r)] = list(rule_tags)
             rule_items += _sg_rule_xml(sg_id, r, is_egress=False)
+        else:
+            rule_items += _sg_rule_xml(sg_id, existing, is_egress=False)
     return _xml(200, "AuthorizeSecurityGroupIngressResponse",
                 f"<return>true</return><securityGroupRuleSet>{rule_items}</securityGroupRuleSet>")
 
@@ -1420,11 +1427,17 @@ def _authorize_sg_egress(p):
     rule_items = ""
     for r in rules:
         r.setdefault("SecurityGroupRuleId", _sg_rule_id(sg_id, True, r))
-        if not any(_rules_match(r, existing) for existing in sg["IpPermissionsEgress"]):
+        # See _authorize_sg_ingress: an already-present rule is skipped but still echoed.
+        # This is the common case for egress, because CreateSecurityGroup seeds the AWS
+        # default allow-all rule that Terraform then re-declares.
+        existing = next((e for e in sg["IpPermissionsEgress"] if _rules_match(r, e)), None)
+        if existing is None:
             sg["IpPermissionsEgress"].append(r)
             if rule_tags:
                 _tags[_sg_rule_id(sg_id, True, r)] = list(rule_tags)
             rule_items += _sg_rule_xml(sg_id, r, is_egress=True)
+        else:
+            rule_items += _sg_rule_xml(sg_id, existing, is_egress=True)
     return _xml(200, "AuthorizeSecurityGroupEgressResponse",
                 f"<return>true</return><securityGroupRuleSet>{rule_items}</securityGroupRuleSet>")
 
