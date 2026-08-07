@@ -422,6 +422,10 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"inspector2\."],
         "credential_scope": "inspector2",
     },
+    "dsql": {
+        "host_patterns": [r"dsql\."],
+        "credential_scope": "dsql",
+    },
     "s3tables": {
         "host_patterns": [r"s3tables\."],
         "credential_scope": "s3tables",
@@ -602,6 +606,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "cloudtrail": "cloudtrail",
                 "cur": "cur",
                 "inspector2": "inspector2",
+                "dsql": "dsql",
                 "s3tables": "s3tables",
                 "kafka": "kafka",
             }
