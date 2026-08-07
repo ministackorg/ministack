@@ -1,6 +1,14 @@
+import asyncio
+import json
+from urllib.parse import quote
+
 import pytest
 
-from ministack.core.responses import _request_region
+from ministack.core.responses import (
+    _request_region,
+    set_request_account_id,
+    set_request_region,
+)
 from ministack.services import dynamodb as _ddb
 from ministack.services import pipes as _pipes
 
@@ -412,3 +420,211 @@ def test_pipes_position_is_absolute_across_record_expiry(monkeypatch):
         _pipes.reset()
         _ddb._stream_records.clear()
         _ddb._stream_trimmed.clear()
+
+
+# ---------------------------------------------------------------------------
+# REST/JSON handler (handle_request) — SDK surface
+# ---------------------------------------------------------------------------
+
+ROLE_ARN = "arn:aws:iam::000000000000:role/test-pipe-role"
+
+
+@pytest.fixture
+def handler_env(monkeypatch):
+    _pipes.reset()
+    monkeypatch.setattr(_pipes, "_ensure_poller", lambda: None)
+    # register_pipe computes an initial stream position from DynamoDB; keep it
+    # deterministic and decoupled from the DDB store for handler tests.
+    monkeypatch.setattr(_pipes, "_initial_position", lambda pipe: 0)
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    yield
+    _pipes.reset()
+
+
+def _req(method, path, body=None, query=None):
+    payload = json.dumps(body or {}).encode() if body is not None else b""
+    return asyncio.run(_pipes.handle_request(method, path, {}, payload, query or {}))
+
+
+def _body(resp):
+    return json.loads(resp[2].decode())
+
+
+def _create(name, desired="RUNNING", **extra):
+    body = {
+        "Source": _stream_arn("us-east-1"),
+        "Target": _topic_arn("us-east-1"),
+        "RoleArn": ROLE_ARN,
+        "DesiredState": desired,
+    }
+    body.update(extra)
+    return _req("POST", f"/v1/pipes/{name}", body)
+
+
+def test_create_pipe_returns_lifecycle_shape(handler_env):
+    status, _hdrs, _b = _create("p1")
+    body = _body((status, _hdrs, _b))
+    assert status == 200
+    assert body["Arn"] == "arn:aws:pipes:us-east-1:000000000000:pipe/p1"
+    assert body["Name"] == "p1"
+    assert body["DesiredState"] == "RUNNING"
+    assert body["CurrentState"] == "RUNNING"
+    assert isinstance(body["CreationTime"], int)
+    assert isinstance(body["LastModifiedTime"], int)
+    # CreatePipeResponse must NOT carry the full describe shape.
+    assert "Source" not in body and "Tags" not in body
+
+
+def test_create_pipe_reuses_register_pipe(handler_env):
+    _create("p1", Tags={"env": "test"}, Description="hi")
+    rec = _pipes._pipes.get("p1")
+    assert rec is not None
+    assert rec["Tags"] == {"env": "test"}
+    assert rec["Description"] == "hi"
+    assert rec["RoleArn"] == ROLE_ARN
+
+
+def test_create_pipe_conflict(handler_env):
+    _create("p1")
+    status, _hdrs, b = _create("p1")
+    assert status == 409
+    assert _body((status, _hdrs, b))["__type"] == "ConflictException"
+
+
+def test_list_pipes_summary_shape(handler_env):
+    _create("alpha")
+    _create("beta", desired="STOPPED")
+    status, _hdrs, b = _req("GET", "/v1/pipes")
+    assert status == 200
+    body = _body((status, _hdrs, b))
+    names = [p["Name"] for p in body["Pipes"]]
+    assert names == ["alpha", "beta"]
+    summary = body["Pipes"][0]
+    assert set(summary) >= {
+        "Name", "Arn", "DesiredState", "CurrentState", "StateReason",
+        "CreationTime", "LastModifiedTime", "Source", "Target",
+    }
+    assert isinstance(summary["CreationTime"], int)
+
+
+def test_list_pipes_filters(handler_env):
+    _create("alpha")
+    _create("beta", desired="STOPPED")
+    body = _body(_req("GET", "/v1/pipes", query={"NamePrefix": ["al"]}))
+    assert [p["Name"] for p in body["Pipes"]] == ["alpha"]
+    body = _body(_req("GET", "/v1/pipes", query={"DesiredState": ["STOPPED"]}))
+    assert [p["Name"] for p in body["Pipes"]] == ["beta"]
+    body = _body(_req("GET", "/v1/pipes", query={"CurrentState": ["RUNNING"]}))
+    assert [p["Name"] for p in body["Pipes"]] == ["alpha"]
+
+
+def test_list_pipes_limit_paginates(handler_env):
+    for n in ("a", "b", "c"):
+        _create(n)
+    body = _body(_req("GET", "/v1/pipes", query={"Limit": ["2"]}))
+    assert [p["Name"] for p in body["Pipes"]] == ["a", "b"]
+    assert body["NextToken"] == "c"
+
+
+def test_describe_pipe_full_shape(handler_env):
+    _create("p1", Description="desc", Tags={"k": "v"})
+    status, _hdrs, b = _req("GET", "/v1/pipes/p1")
+    assert status == 200
+    body = _body((status, _hdrs, b))
+    assert body["Name"] == "p1"
+    assert body["Description"] == "desc"
+    assert body["RoleArn"] == ROLE_ARN
+    assert body["Source"] == _stream_arn("us-east-1")
+    assert body["Target"] == _topic_arn("us-east-1")
+    assert body["Tags"] == {"k": "v"}
+    assert isinstance(body["CreationTime"], int)
+
+
+def test_describe_unknown_pipe_not_found(handler_env):
+    status, hdrs, b = _req("GET", "/v1/pipes/missing")
+    assert status == 404
+    body = _body((status, hdrs, b))
+    assert body["__type"] == "NotFoundException"
+    assert body["message"] == "Pipe missing does not exist."
+    assert hdrs["x-amzn-errortype"] == "NotFoundException"
+
+
+def test_start_stop_pipe(handler_env):
+    _create("p1", desired="STOPPED")
+    status, _hdrs, b = _req("POST", "/v1/pipes/p1/start")
+    assert status == 200
+    body = _body((status, _hdrs, b))
+    assert body["DesiredState"] == "RUNNING"
+    assert body["CurrentState"] == "RUNNING"
+    assert _pipes._pipes.get("p1")["CurrentState"] == "RUNNING"
+
+    body = _body(_req("POST", "/v1/pipes/p1/stop"))
+    assert body["DesiredState"] == "STOPPED"
+    assert _pipes._pipes.get("p1")["CurrentState"] == "STOPPED"
+
+
+def test_start_unknown_pipe_not_found(handler_env):
+    status, _hdrs, b = _req("POST", "/v1/pipes/nope/start")
+    assert status == 404
+    assert _body((status, _hdrs, b))["__type"] == "NotFoundException"
+
+
+def test_update_pipe(handler_env):
+    _create("p1")
+    status, _hdrs, b = _req(
+        "PUT", "/v1/pipes/p1", body={"RoleArn": ROLE_ARN, "Description": "new", "DesiredState": "STOPPED"}
+    )
+    assert status == 200
+    assert _body((status, _hdrs, b))["DesiredState"] == "STOPPED"
+    rec = _pipes._pipes.get("p1")
+    assert rec["Description"] == "new"
+    assert rec["CurrentState"] == "STOPPED"
+
+
+def test_delete_pipe(handler_env):
+    _create("p1")
+    status, _hdrs, b = _req("DELETE", "/v1/pipes/p1")
+    assert status == 200
+    body = _body((status, _hdrs, b))
+    assert body["DesiredState"] == "DELETED"
+    assert body["CurrentState"] == "DELETING"
+    assert _pipes._pipes.get("p1") is None
+
+
+def test_delete_unknown_pipe_not_found(handler_env):
+    status, _hdrs, b = _req("DELETE", "/v1/pipes/nope")
+    assert status == 404
+    assert _body((status, _hdrs, b))["__type"] == "NotFoundException"
+
+
+def test_lifecycle_create_list_describe_start_stop_delete(handler_env):
+    _create("flow", desired="STOPPED")
+    assert [p["Name"] for p in _body(_req("GET", "/v1/pipes"))["Pipes"]] == ["flow"]
+    assert _body(_req("GET", "/v1/pipes/flow"))["Name"] == "flow"
+    assert _body(_req("POST", "/v1/pipes/flow/start"))["CurrentState"] == "RUNNING"
+    assert _body(_req("POST", "/v1/pipes/flow/stop"))["CurrentState"] == "STOPPED"
+    assert _body(_req("DELETE", "/v1/pipes/flow"))["CurrentState"] == "DELETING"
+    assert _body(_req("GET", "/v1/pipes"))["Pipes"] == []
+
+
+def test_tag_untag_list_tags(handler_env):
+    _create("p1", Tags={"a": "1"})
+    arn = "arn:aws:pipes:us-east-1:000000000000:pipe/p1"
+    enc = quote(arn, safe="")
+    body = _body(_req("GET", f"/tags/{enc}"))
+    assert body["tags"] == {"a": "1"}
+
+    status, _hdrs, _b = _req("POST", f"/tags/{enc}", body={"tags": {"b": "2"}})
+    assert status == 200
+    assert _pipes._pipes.get("p1")["Tags"] == {"a": "1", "b": "2"}
+
+    _req("DELETE", f"/tags/{enc}", query={"tagKeys": ["a"]})
+    assert _pipes._pipes.get("p1")["Tags"] == {"b": "2"}
+
+
+def test_list_tags_unknown_arn_not_found(handler_env):
+    enc = quote("arn:aws:pipes:us-east-1:000000000000:pipe/ghost", safe="")
+    status, _hdrs, b = _req("GET", f"/tags/{enc}")
+    assert status == 404
+    assert _body((status, _hdrs, b))["__type"] == "NotFoundException"

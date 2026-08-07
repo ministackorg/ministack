@@ -9068,3 +9068,108 @@ def test_lambda_function_url_response_stream_consumes_prelude(lam):
             assert b"statusCode" not in body
         finally:
             lam.delete_function_url_config(FunctionName=fname)
+
+
+def _lambda_raw(method, path, body=None):
+    """Raw Lambda REST call — needed for params the installed (pre-July)
+    botocore rejects client-side, e.g. Code.S3ObjectStorageMode."""
+    headers = {
+        "Authorization": "AWS4-HMAC-SHA256 Credential=test/20260806/us-east-1/lambda/aws4_request",
+        "Content-Type": "application/json",
+    }
+    req = _urlreq.Request(
+        _endpoint + path,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers=headers, method=method,
+    )
+    try:
+        return _urlreq.urlopen(req).read()
+    except _urlerr.HTTPError as exc:
+        return b"ERR " + str(exc.code).encode() + b" " + exc.read()
+
+
+def test_lambda_s3_object_storage_mode_reference(lam):
+    """July 2026 self-managed code storage: Code.S3ObjectStorageMode=REFERENCE is
+    accepted and GetFunction echoes ResolvedS3Object; internal tracking must not
+    leak into GetFunctionConfiguration. Driven over raw HTTP because the pinned
+    botocore rejects the new field client-side."""
+    s3 = boto3.client(
+        "s3", endpoint_url=_endpoint, region_name="us-east-1",
+        aws_access_key_id="test", aws_secret_access_key="test",
+        config=Config(s3={"addressing_style": "path"}),
+    )
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bucket, key, fn = f"lam-ref-bkt-{suffix}", "fn.zip", f"lam-ref-{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key=key, Body=_make_zip(_LAMBDA_CODE))
+    try:
+        _lambda_raw("POST", "/2015-03-31/functions/", {
+            "FunctionName": fn, "Runtime": "python3.13", "Handler": "index.handler",
+            "Role": _LAMBDA_ROLE,
+            "Code": {"S3Bucket": bucket, "S3Key": key, "S3ObjectStorageMode": "REFERENCE"},
+        })
+        gf = json.loads(_lambda_raw("GET", f"/2015-03-31/functions/{fn}"))
+        code = gf["Code"]
+        assert code["RepositoryType"] == "S3"
+        assert code["ResolvedS3Object"] == {"S3Bucket": bucket, "S3Key": key}
+        cfg = gf["Configuration"]
+        assert not any("s3_object" in k.lower() or "storage_mode" in k.lower() for k in cfg)
+    finally:
+        lam.delete_function(FunctionName=fn)
+
+
+@pytest.mark.serial
+def test_lambda_esm_dynamodb_max_record_age_to_failure_destination(lam, ddb, sqs):
+    """July 2026: a DynamoDB-stream ESM enforces MaximumRecordAgeInSeconds — an
+    aged-out failing batch is discarded to the OnFailure destination with the
+    AWS DDBStreamBatchInfo record (condition=MaxRecordAgeExceeded), so a poison
+    batch cannot block the shard. Also asserts CreateEventSourceMapping now
+    persists MaximumRecordAgeInSeconds/DestinationConfig."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn, table = f"esm-age-fn-{suffix}", f"esm-age-tbl-{suffix}"
+    lam.create_function(
+        FunctionName=fn, Runtime="python3.13", Role=_LAMBDA_ROLE, Handler="index.handler",
+        Code={"ZipFile": _make_zip("def handler(e, c):\n raise Exception('always fail')")},
+    )
+    ddb.create_table(
+        TableName=table,
+        AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
+        KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+        BillingMode="PAY_PER_REQUEST",
+        StreamSpecification={"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"},
+    )
+    ddb.get_waiter("table_exists").wait(TableName=table)
+    stream_arn = ddb.describe_table(TableName=table)["Table"]["LatestStreamArn"]
+    q = sqs.create_queue(QueueName=f"esm-onfail-{suffix}")["QueueUrl"]
+    qarn = sqs.get_queue_attributes(QueueUrl=q, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    try:
+        m = lam.create_event_source_mapping(
+            FunctionName=fn, EventSourceArn=stream_arn, BatchSize=1,
+            StartingPosition="TRIM_HORIZON", MaximumRecordAgeInSeconds=2,
+            DestinationConfig={"OnFailure": {"Destination": qarn}},
+        )
+        # Create must persist these (previously only Update did).
+        got = lam.get_event_source_mapping(UUID=m["UUID"])
+        assert got["MaximumRecordAgeInSeconds"] == 2
+        assert got["DestinationConfig"]["OnFailure"]["Destination"] == qarn
+
+        ddb.put_item(TableName=table, Item={"id": {"S": "1"}})
+        rec = None
+        for _ in range(10):
+            time.sleep(2)
+            msgs = sqs.receive_message(QueueUrl=q, MaxNumberOfMessages=1, WaitTimeSeconds=1).get("Messages", [])
+            if msgs:
+                rec = json.loads(msgs[0]["Body"])
+                break
+        assert rec is not None, "no OnFailure record delivered within the age window"
+        assert rec["requestContext"]["condition"] == "MaxRecordAgeExceeded"
+        assert rec["version"] == "1.0"
+        info = rec["DDBStreamBatchInfo"]
+        assert info["streamArn"] == stream_arn
+        assert info["batchSize"] == 1
+        assert info["startSequenceNumber"] and info["endSequenceNumber"]
+    finally:
+        for esm in lam.list_event_source_mappings(FunctionName=fn).get("EventSourceMappings", []):
+            lam.delete_event_source_mapping(UUID=esm["UUID"])
+        lam.delete_function(FunctionName=fn)
+        ddb.delete_table(TableName=table)

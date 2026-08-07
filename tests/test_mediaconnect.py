@@ -171,6 +171,81 @@ def test_mediaconnect_list_tags_requires_local_flow_arn(mc, arn, code):
     assert e.value.response["Error"]["Code"] == code
 
 
+# ---------------------------------------------------------------------------
+# Read-only collections (empty — this stub owns no such resources)
+# ---------------------------------------------------------------------------
+
+def test_mediaconnect_list_bridges_empty(mc):
+    assert mc.list_bridges()["Bridges"] == []
+
+
+def test_mediaconnect_list_entitlements_empty(mc):
+    assert mc.list_entitlements()["Entitlements"] == []
+
+
+def test_mediaconnect_list_gateways_empty(mc):
+    assert mc.list_gateways()["Gateways"] == []
+
+
+def test_mediaconnect_list_gateway_instances_empty(mc):
+    assert mc.list_gateway_instances()["Instances"] == []
+
+
+def test_mediaconnect_list_offerings_empty(mc):
+    assert mc.list_offerings()["Offerings"] == []
+
+
+def test_mediaconnect_list_reservations_empty(mc):
+    assert mc.list_reservations()["Reservations"] == []
+
+
+# ---------------------------------------------------------------------------
+# Describe-by-ARN for never-owned resources -> NotFoundException
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    ("op", "kwarg", "resource"),
+    [
+        ("describe_bridge", "BridgeArn", "bridge"),
+        ("describe_gateway", "GatewayArn", "gateway"),
+        ("describe_gateway_instance", "GatewayInstanceArn", "gateway-instance"),
+        ("describe_reservation", "ReservationArn", "reservation"),
+        ("describe_offering", "OfferingArn", "offering"),
+    ],
+)
+def test_mediaconnect_describe_unknown_resource_404(mc, op, kwarg, resource):
+    bogus = f"arn:aws:mediaconnect:{REGION}:000000000000:{resource}:{uuid.uuid4()}"
+    with pytest.raises(ClientError) as e:
+        getattr(mc, op)(**{kwarg: bogus})
+    assert e.value.response["Error"]["Code"] == "NotFoundException"
+
+
+# ---------------------------------------------------------------------------
+# DescribeFlowSourceMetadata / DescribeFlowSourceThumbnail
+# ---------------------------------------------------------------------------
+
+def test_mediaconnect_describe_flow_source_metadata(mc):
+    name = f"flow-meta-{_uid()}"
+    flow = mc.create_flow(Name=name, Source=_basic_source())["Flow"]
+    resp = mc.describe_flow_source_metadata(FlowArn=flow["FlowArn"])
+    assert resp["FlowArn"] == flow["FlowArn"]
+    assert resp["Messages"] == []
+
+
+def test_mediaconnect_describe_flow_source_metadata_unknown_404(mc):
+    bogus = f"arn:aws:mediaconnect:{REGION}:000000000000:flow:{uuid.uuid4()}:nope"
+    with pytest.raises(ClientError) as e:
+        mc.describe_flow_source_metadata(FlowArn=bogus)
+    assert e.value.response["Error"]["Code"] == "NotFoundException"
+
+
+def test_mediaconnect_describe_flow_source_thumbnail(mc):
+    name = f"flow-thumb-{_uid()}"
+    flow = mc.create_flow(Name=name, Source=_basic_source())["Flow"]
+    resp = mc.describe_flow_source_thumbnail(FlowArn=flow["FlowArn"])
+    assert "ThumbnailDetails" in resp
+
+
 def test_mediaconnect_flows_are_region_isolated(mc):
     """A flow created in us-east-1 must not be visible from us-west-2."""
     mc_west = boto3.client(

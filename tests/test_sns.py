@@ -587,6 +587,45 @@ def test_sns_filter_policy_blocks_non_matching(sns, sqs):
     body = json.loads(msgs2["Messages"][0]["Body"])
     assert body["Message"] == "blue message"
 
+def test_sns_filter_policy_or_operator(sns, sqs):
+    """A top-level $or matches when any of its member policies matches; a
+    message satisfying neither is filtered out (AWS $or operator)."""
+    topic_arn = sns.create_topic(Name="qa-sns-or")["TopicArn"]
+    q_url = sqs.create_queue(QueueName="qa-sns-or-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    sub_arn = sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)["SubscriptionArn"]
+    sns.set_subscription_attributes(
+        SubscriptionArn=sub_arn,
+        AttributeName="FilterPolicy",
+        AttributeValue=json.dumps({
+            "$or": [
+                {"operation": ["event-broadcast"], "environment": ["ENV1"]},
+                {"operation": ["session-operation"], "environment": ["ENV1"],
+                 "session_id": ["abc-123"]},
+            ]
+        }),
+    )
+
+    def _attrs(**kv):
+        return {k: {"DataType": "String", "StringValue": v} for k, v in kv.items()}
+
+    # Matches the first $or member.
+    sns.publish(TopicArn=topic_arn, Message="first",
+                MessageAttributes=_attrs(operation="event-broadcast", environment="ENV1"))
+    # Matches the second $or member.
+    sns.publish(TopicArn=topic_arn, Message="second",
+                MessageAttributes=_attrs(operation="session-operation", environment="ENV1",
+                                         session_id="abc-123"))
+    # Matches neither (wrong environment).
+    sns.publish(TopicArn=topic_arn, Message="third",
+                MessageAttributes=_attrs(operation="event-broadcast", environment="ENV2"))
+
+    received = []
+    for _ in range(3):
+        resp = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
+        received.extend(json.loads(m["Body"])["Message"] for m in resp.get("Messages", []))
+    assert sorted(received) == ["first", "second"]
+
 def test_sns_raw_message_delivery(sns, sqs):
     """RawMessageDelivery=true delivers raw message body, not SNS envelope."""
     topic_arn = sns.create_topic(Name="qa-sns-raw")["TopicArn"]

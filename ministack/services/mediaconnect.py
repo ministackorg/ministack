@@ -11,7 +11,14 @@ Wire field names are camelCase per the AWS service model — the in-memory
 records also use camelCase so reads and writes round-trip without translation.
 
 Supports:
-  Flows: CreateFlow, DescribeFlow, ListFlows, UpdateFlow
+  Flows: CreateFlow, DescribeFlow, ListFlows, UpdateFlow,
+         DescribeFlowSourceMetadata, DescribeFlowSourceThumbnail
+  Read-only collections (empty — this stub owns no such resources):
+         ListBridges, ListEntitlements, ListGateways, ListGatewayInstances,
+         ListOfferings, ListReservations
+  Describe-by-ARN for the above (NotFoundException — never owned here):
+         DescribeBridge, DescribeGateway, DescribeGatewayInstance,
+         DescribeReservation, DescribeOffering
   Tags:  ListTagsForResource
 """
 
@@ -248,11 +255,91 @@ def _list_tags(arn):
 
 
 # ---------------------------------------------------------------------------
+# Read-only collection ops with no local state.
+#
+# This emulator is a Flow control-plane stub: it does not model bridges,
+# gateways, entitlements, reservations, or reserved-outputs offerings. Those
+# resources never exist here, so every List returns an empty collection and
+# every Describe-by-ARN returns NotFoundException — matching real AWS for an
+# account that owns none of them. Wire key names verified against botocore
+# mediaconnect 2018-11-14 service-2.json.
+# ---------------------------------------------------------------------------
+
+def _list_bridges(query):
+    return json_response({"bridges": []})
+
+
+def _list_entitlements(query):
+    return json_response({"entitlements": []})
+
+
+def _list_gateways(query):
+    return json_response({"gateways": []})
+
+
+def _list_gateway_instances(query):
+    return json_response({"instances": []})
+
+
+def _list_offerings(query):
+    return json_response({"offerings": []})
+
+
+def _list_reservations(query):
+    return json_response({"reservations": []})
+
+
+def _not_found_by_arn(kind, arn):
+    return _error(404, "NotFoundException", f"{kind} {arn} not found.")
+
+
+def _describe_flow_source_metadata(arn):
+    flow = _flows.get(arn)
+    if not flow:
+        return _error(404, "NotFoundException", f"Flow {arn} not found.")
+    return json_response({"flowArn": arn, "messages": []})
+
+
+def _describe_flow_source_thumbnail(arn):
+    flow = _flows.get(arn)
+    if not flow:
+        return _error(404, "NotFoundException", f"Flow {arn} not found.")
+    return json_response({"thumbnailDetails": {"flowArn": arn, "thumbnailMessages": []}})
+
+
+# ---------------------------------------------------------------------------
 # Request Router
 # ---------------------------------------------------------------------------
 
 _FLOW_ARN_RE = re.compile(r"^/v1/flows/(arn:aws:mediaconnect:[^/]+:[^/]+:flow:[^/]+:[^/]+)$")
+_FLOW_SOURCE_METADATA_RE = re.compile(
+    r"^/v1/flows/(arn:aws:mediaconnect:[^/]+:[^/]+:flow:[^/]+:[^/]+)/source-metadata$"
+)
+_FLOW_SOURCE_THUMBNAIL_RE = re.compile(
+    r"^/v1/flows/(arn:aws:mediaconnect:[^/]+:[^/]+:flow:[^/]+:[^/]+)/source-thumbnail$"
+)
 _TAGS_ARN_RE = re.compile(r"^/tags/(.+)$")
+
+# Read-only collection endpoints (all GET, no request body needed).
+_LIST_ROUTES = {
+    "/v1/bridges": _list_bridges,
+    "/v1/entitlements": _list_entitlements,
+    "/v1/gateways": _list_gateways,
+    "/v1/gateway-instances": _list_gateway_instances,
+    "/v1/offerings": _list_offerings,
+    "/v1/reservations": _list_reservations,
+}
+
+# Describe-by-ARN endpoints for resources this stub never owns: {prefix: (kind,)}.
+# Each returns NotFoundException for any ARN, matching an account with none of
+# these resources. Ordered longest-prefix-first at match time.
+_DESCRIBE_BY_ARN_ROUTES = (
+    ("/v1/gateway-instances/", "GatewayInstance"),
+    ("/v1/bridges/", "Bridge"),
+    ("/v1/gateways/", "Gateway"),
+    ("/v1/reservations/", "Reservation"),
+    ("/v1/offerings/", "Offering"),
+)
 
 
 async def handle_request(method, path, headers, body_bytes, query_params):
@@ -271,6 +358,20 @@ async def handle_request(method, path, headers, body_bytes, query_params):
     if path == "/v1/flows" and method == "GET":
         return _list_flows(query)
 
+    # GET /v1/{bridges,entitlements,gateways,gateway-instances,offerings,reservations}
+    if method == "GET" and path in _LIST_ROUTES:
+        return _LIST_ROUTES[path](query)
+
+    # GET /v1/flows/{FlowArn}/source-metadata -- DescribeFlowSourceMetadata
+    m = _FLOW_SOURCE_METADATA_RE.match(path)
+    if m and method == "GET":
+        return _describe_flow_source_metadata(urllib.parse.unquote(m.group(1)))
+
+    # GET /v1/flows/{FlowArn}/source-thumbnail -- DescribeFlowSourceThumbnail
+    m = _FLOW_SOURCE_THUMBNAIL_RE.match(path)
+    if m and method == "GET":
+        return _describe_flow_source_thumbnail(urllib.parse.unquote(m.group(1)))
+
     # /v1/flows/{FlowArn} -- DescribeFlow / UpdateFlow
     m = _FLOW_ARN_RE.match(path)
     if m:
@@ -279,6 +380,13 @@ async def handle_request(method, path, headers, body_bytes, query_params):
             return _describe_flow(arn)
         if method == "PUT":
             return _update_flow(arn, body)
+
+    # GET /v1/{bridges,gateways,gateway-instances,reservations,offerings}/{Arn}
+    if method == "GET":
+        for prefix, kind in _DESCRIBE_BY_ARN_ROUTES:
+            if path.startswith(prefix) and path[len(prefix):]:
+                arn = urllib.parse.unquote(path[len(prefix):])
+                return _not_found_by_arn(kind, arn)
 
     # GET /tags/{ResourceArn}
     m = _TAGS_ARN_RE.match(path)

@@ -594,6 +594,147 @@ def test_backup_tags_are_region_scoped(backup, backup_west):
     assert backup_west.list_tags(ResourceArn=west_arn)["Tags"] == {}
 
 
+# ---------------------------------------------------------------------------
+# Read-only surface (empty-list / default documents)
+# ---------------------------------------------------------------------------
+
+def test_backup_list_copy_jobs_empty(backup):
+    resp = backup.list_copy_jobs()
+    assert resp["CopyJobs"] == []
+
+
+def test_backup_list_restore_jobs_empty(backup):
+    resp = backup.list_restore_jobs()
+    assert resp["RestoreJobs"] == []
+
+
+def test_backup_list_report_jobs_empty(backup):
+    resp = backup.list_report_jobs()
+    assert resp["ReportJobs"] == []
+
+
+def test_backup_list_report_plans_empty(backup):
+    resp = backup.list_report_plans()
+    assert resp["ReportPlans"] == []
+
+
+def test_backup_list_frameworks_empty(backup):
+    resp = backup.list_frameworks()
+    assert resp["Frameworks"] == []
+
+
+def test_backup_list_protected_resources_empty(backup):
+    resp = backup.list_protected_resources()
+    assert resp["Results"] == []
+
+
+def test_backup_list_legal_holds_empty(backup):
+    resp = backup.list_legal_holds()
+    assert resp["LegalHolds"] == []
+
+
+def test_backup_list_backup_plan_templates_empty(backup):
+    resp = backup.list_backup_plan_templates()
+    assert resp["BackupPlanTemplatesList"] == []
+
+
+def test_backup_list_restore_testing_plans_empty(backup):
+    resp = backup.list_restore_testing_plans()
+    assert resp["RestoreTestingPlans"] == []
+
+
+def test_backup_list_recovery_points_by_vault_empty(backup):
+    name = f"rp-list-vault-{_uid()}"
+    backup.create_backup_vault(BackupVaultName=name)
+    resp = backup.list_recovery_points_by_backup_vault(BackupVaultName=name)
+    assert resp["RecoveryPoints"] == []
+
+
+def test_backup_list_recovery_points_by_vault_not_found(backup):
+    with pytest.raises(ClientError) as exc:
+        backup.list_recovery_points_by_backup_vault(BackupVaultName="no-such-vault-xyz")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_backup_list_recovery_points_by_resource_empty(backup):
+    resp = backup.list_recovery_points_by_resource(
+        ResourceArn="arn:aws:dynamodb:us-east-1:000000000000:table/MyTable"
+    )
+    assert resp["RecoveryPoints"] == []
+
+
+def test_backup_list_protected_resources_by_vault_empty(backup):
+    name = f"prv-vault-{_uid()}"
+    backup.create_backup_vault(BackupVaultName=name)
+    resp = backup.list_protected_resources_by_backup_vault(BackupVaultName=name)
+    assert resp["Results"] == []
+
+
+def test_backup_get_vault_access_policy_not_found(backup):
+    name = f"policy-vault-{_uid()}"
+    backup.create_backup_vault(BackupVaultName=name)
+    with pytest.raises(ClientError) as exc:
+        backup.get_backup_vault_access_policy(BackupVaultName=name)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_backup_get_vault_notifications_not_found(backup):
+    name = f"notif-vault-{_uid()}"
+    backup.create_backup_vault(BackupVaultName=name)
+    with pytest.raises(ClientError) as exc:
+        backup.get_backup_vault_notifications(BackupVaultName=name)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_backup_describe_copy_job_not_found(backup):
+    with pytest.raises(ClientError) as exc:
+        backup.describe_copy_job(CopyJobId="no-such-copy-job")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_backup_describe_framework_not_found(backup):
+    with pytest.raises(ClientError) as exc:
+        backup.describe_framework(FrameworkName="no-such-framework")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_backup_describe_region_settings(backup):
+    resp = backup.describe_region_settings()
+    assert resp["ResourceTypeOptInPreference"] == {}
+    assert resp["ResourceTypeManagementPreference"] == {}
+
+
+def test_backup_describe_global_settings(backup):
+    resp = backup.describe_global_settings()
+    assert resp["GlobalSettings"] == {}
+
+
+def test_backup_get_supported_resource_types(backup):
+    resp = backup.get_supported_resource_types()
+    assert "DynamoDB" in resp["ResourceTypes"]
+    assert "S3" in resp["ResourceTypes"]
+
+
+def test_backup_list_scan_jobs_empty(backup):
+    resp = backup.list_scan_jobs()
+    assert resp["ScanJobs"] == []
+
+
+def test_backup_list_tiering_configurations_empty(backup):
+    resp = backup.list_tiering_configurations()
+    assert resp["TieringConfigurations"] == []
+
+
+def test_backup_list_indexed_recovery_points_empty(backup):
+    resp = backup.list_indexed_recovery_points()
+    assert resp["IndexedRecoveryPoints"] == []
+
+
+def test_backup_list_backup_job_summaries_empty(backup):
+    resp = backup.list_backup_job_summaries()
+    assert resp["BackupJobSummaries"] == []
+
+
 def test_backup_reset_clears_all_regions():
     from ministack.core.responses import get_region, set_request_region
     from ministack.services import backup as backup_service

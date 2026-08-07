@@ -85,6 +85,26 @@ _RHP_ID_RE = re.compile(r"^/2020-05-31/response-headers-policy/([^/]+)/?$")
 _DIST_BY_RHP_RE = re.compile(r"^/2020-05-31/distributionsByResponseHeadersPolicyId/([^/]+)/?$")
 
 # ---------------------------------------------------------------------------
+# Read-only surface for resource families MiniStack does not yet persist.
+# These return AWS-shaped empty collections so the SDK gets a valid response
+# instead of a routing fall-through. Shapes verified against botocore
+# cloudfront service-2.json (2020-05-31): each list container's XML root is
+# the payload member's locationName, MaxItems defaults to 100, an empty list
+# omits Items, and NextMarker is omitted when there is no next page.
+# ---------------------------------------------------------------------------
+_KEY_GROUP_LIST_RE = re.compile(r"^/2020-05-31/key-group/?$")
+_PUBLIC_KEY_LIST_RE = re.compile(r"^/2020-05-31/public-key/?$")
+_FLE_LIST_RE = re.compile(r"^/2020-05-31/field-level-encryption/?$")
+_FLE_PROFILE_LIST_RE = re.compile(r"^/2020-05-31/field-level-encryption-profile/?$")
+_CDP_LIST_RE = re.compile(r"^/2020-05-31/continuous-deployment-policy/?$")
+_OAI_LIST_RE = re.compile(r"^/2020-05-31/origin-access-identity/cloudfront/?$")
+_STREAMING_DIST_LIST_RE = re.compile(r"^/2020-05-31/streaming-distribution/?$")
+_VPC_ORIGIN_LIST_RE = re.compile(r"^/2020-05-31/vpc-origin/?$")
+_REALTIME_LOG_LIST_RE = re.compile(r"^/2020-05-31/realtime-log-config/?$")
+_ANYCAST_IP_LIST_RE = re.compile(r"^/2020-05-31/anycast-ip-list/?$")
+_MONITORING_SUB_RE = re.compile(r"^/2020-05-31/distributions/([^/]+)/monitoring-subscription/?$")
+
+# ---------------------------------------------------------------------------
 # In-memory state
 # ---------------------------------------------------------------------------
 _distributions = AccountScopedDict()  # Id -> distribution record
@@ -1183,6 +1203,7 @@ def _build_orp_xml(parent, policy):
 _ORP_SPEC = {
     "label": "origin request policy", "resource_tag": "OriginRequestPolicy",
     "config_tag": "OriginRequestPolicyConfig", "path": "/2020-05-31/origin-request-policy",
+    "list_tag": "OriginRequestPolicyList", "summary_tag": "OriginRequestPolicySummary",
     "missing": "NoSuchOriginRequestPolicy", "dup": "OriginRequestPolicyAlreadyExists",
     "in_use": "OriginRequestPolicyInUse", "parse": _parse_orp_config,
     "build_resource": _build_orp_xml, "build_config": _build_orp_config_xml,
@@ -1382,10 +1403,125 @@ def _build_rhp_xml(parent, policy):
 _RHP_SPEC = {
     "label": "response headers policy", "resource_tag": "ResponseHeadersPolicy",
     "config_tag": "ResponseHeadersPolicyConfig", "path": "/2020-05-31/response-headers-policy",
+    "list_tag": "ResponseHeadersPolicyList", "summary_tag": "ResponseHeadersPolicySummary",
     "missing": "NoSuchResponseHeadersPolicy", "dup": "ResponseHeadersPolicyAlreadyExists",
     "in_use": "ResponseHeadersPolicyInUse", "parse": _parse_rhp_config,
     "build_resource": _build_rhp_xml, "build_config": _build_rhp_config_xml,
 }
+
+
+# ---------------------------------------------------------------------------
+# Read-only list handlers for resource families with no backing store.
+# Shapes verified against botocore cloudfront service-2.json (2020-05-31).
+# ---------------------------------------------------------------------------
+_DEFAULT_MAX_ITEMS = "100"
+
+
+def _empty_marker_list(query_params, root_tag, with_marker):
+    """Build an AWS-shaped empty collection.
+
+    ``with_marker=False`` matches the ``KeyGroupList`` family
+    (NextMarker/MaxItems/Quantity); ``with_marker=True`` matches the
+    ``CloudFrontOriginAccessIdentityList`` family, which additionally carries
+    Marker + IsTruncated. Both omit ``Items`` when empty and omit
+    ``NextMarker`` when there is no next page.
+    """
+    max_items = _qval(query_params, "MaxItems", _DEFAULT_MAX_ITEMS) or _DEFAULT_MAX_ITEMS
+    marker = _qval(query_params, "Marker", "")
+
+    def build(root):
+        if with_marker:
+            SubElement(root, "Marker").text = marker
+            SubElement(root, "MaxItems").text = max_items
+            SubElement(root, "IsTruncated").text = "false"
+            SubElement(root, "Quantity").text = "0"
+        else:
+            SubElement(root, "MaxItems").text = max_items
+            SubElement(root, "Quantity").text = "0"
+
+    return _xml_response(root_tag, build)
+
+
+def _list_realtime_log_configs(query_params):
+    """RealtimeLogConfigs has no Quantity; carries MaxItems/IsTruncated/Marker."""
+    max_items = _qval(query_params, "MaxItems", _DEFAULT_MAX_ITEMS) or _DEFAULT_MAX_ITEMS
+    marker = _qval(query_params, "Marker", "")
+
+    def build(root):
+        SubElement(root, "MaxItems").text = max_items
+        SubElement(root, "IsTruncated").text = "false"
+        SubElement(root, "Marker").text = marker
+
+    return _xml_response("RealtimeLogConfigs", build)
+
+
+def _list_anycast_ip_lists(query_params):
+    """AnycastIpListCollection: Marker/MaxItems/IsTruncated/Quantity, Items omitted when empty."""
+    max_items = _qval(query_params, "MaxItems", _DEFAULT_MAX_ITEMS) or _DEFAULT_MAX_ITEMS
+    marker = _qval(query_params, "Marker", "")
+
+    def build(root):
+        SubElement(root, "Marker").text = marker
+        SubElement(root, "MaxItems").text = max_items
+        SubElement(root, "IsTruncated").text = "false"
+        SubElement(root, "Quantity").text = "0"
+
+    return _xml_response("AnycastIpListCollection", build)
+
+
+def _list_cache_policies(query_params):
+    """CachePolicyList wrapping stored custom cache policies (Type=custom)."""
+    max_items = _qval(query_params, "MaxItems", _DEFAULT_MAX_ITEMS) or _DEFAULT_MAX_ITEMS
+    policies = list(_cache_policies.values())
+
+    def build(root):
+        SubElement(root, "MaxItems").text = max_items
+        SubElement(root, "Quantity").text = str(len(policies))
+        if policies:
+            items_el = SubElement(root, "Items")
+            for policy in policies:
+                summary = SubElement(items_el, "CachePolicySummary")
+                SubElement(summary, "Type").text = "custom"
+                cp = SubElement(summary, "CachePolicy")
+                _build_cache_policy_xml(cp, policy)
+
+    return _xml_response("CachePolicyList", build)
+
+
+def _list_policies(store, spec, query_params):
+    """Generic ``*PolicyList`` wrapping stored custom policies (Type=custom).
+
+    Shared by origin request policies and response headers policies; the
+    summary member and resource tag come from ``spec``.
+    """
+    max_items = _qval(query_params, "MaxItems", _DEFAULT_MAX_ITEMS) or _DEFAULT_MAX_ITEMS
+    policies = list(store.values())
+
+    def build(root):
+        SubElement(root, "MaxItems").text = max_items
+        SubElement(root, "Quantity").text = str(len(policies))
+        if policies:
+            items_el = SubElement(root, "Items")
+            for policy in policies:
+                summary = SubElement(items_el, spec["summary_tag"])
+                SubElement(summary, "Type").text = "custom"
+                res = SubElement(summary, spec["resource_tag"])
+                spec["build_resource"](res, policy)
+
+    return _xml_response(spec["list_tag"], build)
+
+
+def _get_monitoring_subscription(dist_id):
+    """MiniStack does not persist monitoring subscriptions. Real AWS returns
+    NoSuchDistribution (404) for an unknown distribution and
+    NoSuchMonitoringSubscription (404) when none is configured."""
+    if dist_id not in _distributions:
+        return _error("NoSuchDistribution", "The specified distribution does not exist.", 404)
+    return _error(
+        "NoSuchMonitoringSubscription",
+        "A monitoring subscription does not exist for the specified distribution.",
+        404,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1487,6 +1623,8 @@ async def handle_request(method, path, headers, body, query_params):
     if m:
         if method == "POST":
             return _create_cache_policy(body)
+        if method == "GET":
+            return _list_cache_policies(query_params)
 
     m = _CACHE_POLICY_ID_RE.match(path)
     if m:
@@ -1513,6 +1651,8 @@ async def handle_request(method, path, headers, body, query_params):
     if m:
         if method == "POST":
             return _policy_create(_origin_request_policies, _ORP_SPEC, body)
+        if method == "GET":
+            return _list_policies(_origin_request_policies, _ORP_SPEC, query_params)
 
     m = _ORP_ID_RE.match(path)
     if m:
@@ -1539,6 +1679,8 @@ async def handle_request(method, path, headers, body, query_params):
     if m:
         if method == "POST":
             return _policy_create(_response_headers_policies, _RHP_SPEC, body)
+        if method == "GET":
+            return _list_policies(_response_headers_policies, _RHP_SPEC, query_params)
 
     m = _RHP_ID_RE.match(path)
     if m:
@@ -1608,6 +1750,53 @@ async def handle_request(method, path, headers, body, query_params):
             return _create_kvs(headers, body)
         if method == "GET":
             return _list_kvstores(query_params)
+
+    # Read-only list surface for resource families with no backing store.
+    # Family split matches botocore: KeyGroupList-style carry no Marker/
+    # IsTruncated; the OAI/StreamingDistribution/VpcOrigin family does.
+    m = _KEY_GROUP_LIST_RE.match(path)
+    if m and method == "GET":
+        return _empty_marker_list(query_params, "KeyGroupList", with_marker=False)
+
+    m = _PUBLIC_KEY_LIST_RE.match(path)
+    if m and method == "GET":
+        return _empty_marker_list(query_params, "PublicKeyList", with_marker=False)
+
+    m = _FLE_LIST_RE.match(path)
+    if m and method == "GET":
+        return _empty_marker_list(query_params, "FieldLevelEncryptionList", with_marker=False)
+
+    m = _FLE_PROFILE_LIST_RE.match(path)
+    if m and method == "GET":
+        return _empty_marker_list(query_params, "FieldLevelEncryptionProfileList", with_marker=False)
+
+    m = _CDP_LIST_RE.match(path)
+    if m and method == "GET":
+        return _empty_marker_list(query_params, "ContinuousDeploymentPolicyList", with_marker=False)
+
+    m = _OAI_LIST_RE.match(path)
+    if m and method == "GET":
+        return _empty_marker_list(query_params, "CloudFrontOriginAccessIdentityList", with_marker=True)
+
+    m = _STREAMING_DIST_LIST_RE.match(path)
+    if m and method == "GET":
+        return _empty_marker_list(query_params, "StreamingDistributionList", with_marker=True)
+
+    m = _VPC_ORIGIN_LIST_RE.match(path)
+    if m and method == "GET":
+        return _empty_marker_list(query_params, "VpcOriginList", with_marker=True)
+
+    m = _REALTIME_LOG_LIST_RE.match(path)
+    if m and method == "GET":
+        return _list_realtime_log_configs(query_params)
+
+    m = _ANYCAST_IP_LIST_RE.match(path)
+    if m and method == "GET":
+        return _list_anycast_ip_lists(query_params)
+
+    m = _MONITORING_SUB_RE.match(path)
+    if m and method == "GET":
+        return _get_monitoring_subscription(m.group(1))
 
     return _error("NoSuchResource", f"No route for {method} {path}", 404)
 

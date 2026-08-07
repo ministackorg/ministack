@@ -263,11 +263,13 @@ SERVICE_REGISTRY = {
     "athena": {"module": "athena"},
     "autoscaling": {"module": "autoscaling"},
     "cloudformation": {"module": "cloudformation"},
+    "cloudcontrol": {"module": "cloudcontrol"},
     "cloudfront": {"module": "cloudfront"},
     "cloudfront-keyvaluestore": {"module": "cloudfront_keyvaluestore"},
     "codebuild": {"module": "codebuild"},
     "cognito-identity": {"module": "cognito"},
     "cognito-idp": {"module": "cognito"},
+    "config": {"module": "config"},
     "dynamodb": {"module": "dynamodb"},
     "dynamodbstreams": {"module": "dynamodb_streams"},
     "ec2": {"module": "ec2"},
@@ -296,6 +298,7 @@ SERVICE_REGISTRY = {
     "opensearch": {"module": "opensearch", "aliases": ("es", "elasticsearch")},
     "organizations": {"module": "organizations"},
     "monitoring": {"module": "cloudwatch", "aliases": ("cloudwatch",)},
+    "pipes": {"module": "pipes"},
     "rds-data": {"module": "rds_data"},
     "rds": {"module": "rds"},
     "resource-groups": {"module": "resource_groups"},
@@ -1731,6 +1734,34 @@ def _routing_params(method: str, path: str, headers: dict, body: bytes, query_pa
     return routing_params
 
 
+def _unknown_query_error(body: bytes, request_id: str):
+    """A form-encoded (Query-protocol) request reached the router for a service
+    MiniStack does not implement (redshift, elasticbeanstalk, cloudsearch, sdb,
+    importexport, ...). Real AWS answers with the Query ``<ErrorResponse>``
+    envelope at HTTP 400 (``<Type>Sender</Type>``, code ``InvalidAction``);
+    falling through to S3 returns a 405 ``<Error>`` root that botocore's query
+    parser can't read, raising a bare ``KeyError('Error')`` instead of a
+    ``ClientError``."""
+    action = ""
+    try:
+        from urllib.parse import parse_qs
+        action = (parse_qs(body.decode("utf-8", "replace")).get("Action") or [""])[0]
+    except Exception:
+        pass
+    msg = (
+        f"The action {action} is not valid for this web service."
+        if action else "The requested action is not valid for this web service."
+    )
+    msg = msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<ErrorResponse xmlns="http://webservices.amazon.com/doc/2010-05-08/">'
+        f"<Error><Type>Sender</Type><Code>InvalidAction</Code><Message>{msg}</Message></Error>"
+        f"<RequestId>{request_id}</RequestId></ErrorResponse>"
+    )
+    return 400, {"Content-Type": "text/xml"}, xml.encode()
+
+
 async def _dispatch_service_request(
     method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str
 ):
@@ -1740,6 +1771,9 @@ async def _dispatch_service_request(
     region = extract_region(headers)
 
     logger.debug("%s %s -> service=%s region=%s", method, path, service, region)
+
+    if service == "unknown_query":
+        return _unknown_query_error(body, request_id)
 
     handler = SERVICE_HANDLERS.get(service)
     if not handler:

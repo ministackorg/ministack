@@ -899,3 +899,39 @@ def test_secretsmanager_arn_shaped_secret_name_does_not_bypass_scope_guard():
         assert status == 400
         assert parsed["__type"] == "ResourceNotFoundException"
     sm.reset()
+
+
+@pytest.mark.serial
+def test_secret_label_updated_event_to_eventbridge(sm, eb, sqs):
+    """Native 'Secret Label Updated' notification: moving AWSCURRENT (create /
+    put / update-with-value) publishes an event to the default EventBridge bus;
+    a metadata-only update does not. detail = {name, labelUpdated, versionId}."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    name = f"evt-secret-{suffix}"
+    q = sqs.create_queue(QueueName=f"sm-evt-{suffix}")["QueueUrl"]
+    qarn = sqs.get_queue_attributes(QueueUrl=q, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name=f"sm-rule-{suffix}",
+        EventPattern=json.dumps({"source": ["aws.secretsmanager"],
+                                 "detail-type": ["Secret Label Updated"]}),
+    )
+    eb.put_targets(Rule=f"sm-rule-{suffix}", Targets=[{"Id": "1", "Arn": qarn}])
+
+    sm.create_secret(Name=name, SecretString="v1")
+    sm.put_secret_value(SecretId=name, SecretString="v2")  # AWSCURRENT moves
+    sm.update_secret(SecretId=name, Description="metadata only")  # must NOT emit
+
+    time.sleep(1)
+    msgs = sqs.receive_message(QueueUrl=q, MaxNumberOfMessages=10, WaitTimeSeconds=2).get("Messages", [])
+    events = [json.loads(m["Body"]) for m in msgs]
+    label_events = [e for e in events if e.get("detail-type") == "Secret Label Updated"]
+    assert label_events, "no Secret Label Updated event delivered"
+    for e in label_events:
+        assert e["source"] == "aws.secretsmanager"
+        d = e["detail"]
+        assert d["name"] == name
+        assert d["labelUpdated"] == "AWSCURRENT"
+        assert d["versionId"]
+    # Metadata-only update must not have emitted an extra event beyond the
+    # AWSCURRENT moves (create + put); AWSPENDING/AWSPREVIOUS never emit.
+    assert all(e["detail"]["labelUpdated"] == "AWSCURRENT" for e in label_events)

@@ -1824,9 +1824,22 @@ def _create_function(data: dict):
         if "ImageConfig" in data:
             config["ImageConfigResponse"] = {"ImageConfig": data["ImageConfig"]}
 
+    # Self-managed code storage (July 2026): S3ObjectStorageMode=REFERENCE keeps
+    # the code in the caller's bucket; GetFunction echoes the resolved S3 object
+    # and any SourceKMSKeyArn. Stored on the record (not the echoed config) so it
+    # does not leak into GetFunctionConfiguration.
+    _s3_object_ref = None
+    if code_data.get("S3Bucket") and code_data.get("S3Key"):
+        _s3_object_ref = {"S3Bucket": code_data["S3Bucket"], "S3Key": code_data["S3Key"]}
+        if code_data.get("S3ObjectVersion"):
+            _s3_object_ref["S3ObjectVersion"] = code_data["S3ObjectVersion"]
+
     _functions[name] = {
         "config": config,
         "code_zip": code_zip,
+        "s3_object_storage_mode": code_data.get("S3ObjectStorageMode"),
+        "source_kms_key_arn": code_data.get("SourceKMSKeyArn"),
+        "s3_object_ref": _s3_object_ref,
         "versions": {},
         "next_version": 1,
         "tags": data.get("Tags", {}),
@@ -1887,6 +1900,12 @@ def _get_function(name: str, qualifier: str | None = None):
             "RepositoryType": "S3",
             "Location": _presigned_code_url(name),
         }
+        # Self-managed code storage: echo the resolved S3 object (REFERENCE mode)
+        # and any customer key, matching real Lambda's GetFunction code location.
+        if func.get("source_kms_key_arn"):
+            code_info["SourceKMSKeyArn"] = func["source_kms_key_arn"]
+        if func.get("s3_object_storage_mode") == "REFERENCE" and func.get("s3_object_ref"):
+            code_info["ResolvedS3Object"] = func["s3_object_ref"]
     result: dict = {
         "Configuration": effective_config,
         "Code": code_info,
@@ -2201,6 +2220,16 @@ def _update_code(name: str, data: dict):
         func["config"]["CodeSha256"] = base64.b64encode(
             hashlib.sha256(code_zip).digest(),
         ).decode()
+    # Self-managed code storage (July 2026): track the resolved S3 object / mode.
+    if "S3ObjectStorageMode" in data:
+        func["s3_object_storage_mode"] = data.get("S3ObjectStorageMode")
+    if "SourceKMSKeyArn" in data:
+        func["source_kms_key_arn"] = data.get("SourceKMSKeyArn")
+    if data.get("S3Bucket") and data.get("S3Key"):
+        _ref = {"S3Bucket": data["S3Bucket"], "S3Key": data["S3Key"]}
+        if data.get("S3ObjectVersion"):
+            _ref["S3ObjectVersion"] = data["S3ObjectVersion"]
+        func["s3_object_ref"] = _ref
     func["config"]["LastModified"] = _now_iso()
     # AWS-match: UpdateFunctionCode marks status InProgress while the runtime
     # re-initialises, then flips to Successful. Terraform's FunctionUpdated
@@ -5468,6 +5497,14 @@ def _create_esm(data: dict):
         "Enabled": enabled,
         "FunctionResponseTypes": data.get("FunctionResponseTypes", []),
     }
+    # Optional stream/poll settings — stored on create (previously only picked
+    # up on UpdateEventSourceMapping), so GetEventSourceMapping echoes them and
+    # the poller can honor MaximumRecordAgeInSeconds + the OnFailure destination.
+    for _opt in ("MaximumRetryAttempts", "MaximumRecordAgeInSeconds",
+                 "BisectBatchOnFunctionError", "ParallelizationFactor",
+                 "DestinationConfig"):
+        if _opt in data:
+            esm[_opt] = data[_opt]
     if event_source_spec.service != "sqs":
         esm["StartingPosition"] = data.get("StartingPosition", "LATEST")
         _init_stream_position(esm_id, event_source_arn, esm["StartingPosition"])
@@ -5960,6 +5997,73 @@ def _poll_kinesis():
     return processed_any
 
 
+def _send_ddb_stream_failure_record(esm, func_rec, batch, stream_arn, result, condition):
+    """July 2026: send a DynamoDB-stream ESM on-failure invocation record to the
+    configured `DestinationConfig.OnFailure` target (SQS/SNS) when a batch ages
+    past `MaximumRecordAgeInSeconds` (`MaxRecordAgeExceeded`) or exhausts its
+    retries (`RetryAttemptsExhausted`). Matches the AWS `DDBStreamBatchInfo`
+    destination-record shape; the records themselves are not included."""
+    dest = ((esm.get("DestinationConfig") or {}).get("OnFailure") or {}).get("Destination")
+    if not dest:
+        return
+    config = func_rec.get("config") or func_rec
+    first = (batch[0] or {}).get("dynamodb", {}) if batch else {}
+    last = (batch[-1] or {}).get("dynamodb", {}) if batch else {}
+
+    def _iso(ts):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts)))
+
+    now = time.time()
+    envelope = {
+        "requestContext": {
+            "requestId": new_uuid(),
+            "functionArn": config.get("FunctionArn", ""),
+            "condition": condition,
+            "approximateInvokeCount": 1,
+        },
+        "responseContext": {
+            "statusCode": 200,
+            "executedVersion": "$LATEST",
+            "functionError": result.get("function_error") or "Unhandled",
+        },
+        "version": "1.0",
+        "timestamp": _iso(now),
+        "DDBStreamBatchInfo": {
+            "shardId": "shardId-00000000000000000000-00000000",
+            "startSequenceNumber": str(first.get("SequenceNumber", "")),
+            "endSequenceNumber": str(last.get("SequenceNumber", "")),
+            "approximateArrivalOfFirstRecord": _iso(first.get("ApproximateCreationDateTime", now)),
+            "approximateArrivalOfLastRecord": _iso(last.get("ApproximateCreationDateTime", now)),
+            "batchSize": len(batch),
+            "streamArn": stream_arn,
+        },
+    }
+    body = json.dumps(envelope)
+    try:
+        spec = parse_arn(dest)
+    except ArnParseError:
+        return
+    try:
+        if spec.service == "sqs":
+            import ministack.services.sqs as _sqs
+            target_q = _sqs._queue_by_arn(dest)
+            if target_q is not None:
+                target_q["messages"].append({
+                    "id": new_uuid(), "body": body,
+                    "md5_body": hashlib.md5(body.encode()).hexdigest(), "md5_attrs": "",
+                    "receipt_handle": None, "sent_at": now, "visible_at": now,
+                    "receive_count": 0, "first_receive_at": None, "message_attributes": {},
+                    "sys": {"SenderId": get_account_id(), "SentTimestamp": str(int(now * 1000))},
+                    "group_id": None, "dedup_id": None, "dedup_cache_key": None, "seq": None,
+                })
+        elif spec.service == "sns":
+            import ministack.services.sns as _sns
+            if dest in _sns._topics:
+                _sns._fanout(dest, new_uuid(), body, "Lambda ESM failure", "", {})
+    except Exception as exc:
+        logger.error("DynamoDB ESM on-failure dispatch failed: %s", exc)
+
+
 def _poll_dynamodb_streams():
     """Returns True if any table advanced past a batch this pass (successfully
     invoked, or filtered out entirely)."""
@@ -6049,6 +6153,24 @@ def _poll_dynamodb_streams():
                     "ESM: Lambda %s failed processing DynamoDB stream batch from %s (errorType=%s errorMessage=%s)\n%s",
                     func_name, table_name, err_type, err_msg, result.get("log", ""),
                 )
+                # July 2026: enforce MaximumRecordAgeInSeconds. If the oldest
+                # record in the failing batch has aged past the limit, discard
+                # the batch to the OnFailure destination (MaxRecordAgeExceeded)
+                # and advance the shard so a poison batch can't block it forever.
+                max_age = esm.get("MaximumRecordAgeInSeconds")
+                if max_age and int(max_age) > 0:
+                    oldest = min(
+                        (float((r.get("dynamodb") or {}).get("ApproximateCreationDateTime", time.time()))
+                         for r in batch),
+                        default=time.time(),
+                    )
+                    if (time.time() - oldest) > int(max_age):
+                        _send_ddb_stream_failure_record(
+                            esm, func_rec, batch, source_arn, result, "MaxRecordAgeExceeded")
+                        with _dynamodb_stream_positions_lock:
+                            _dynamodb_stream_positions[esm_id] = pos + raw_len
+                        processed_any = True
+                        continue
                 # Position doesn't advance on failure, so the next pass
                 # would refetch this exact batch — don't report it as
                 # processed.

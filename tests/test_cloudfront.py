@@ -1576,4 +1576,160 @@ def test_cloudfront_response_headers_policy_duplicate_and_list(cloudfront):
 
     resp = cloudfront.list_distributions_by_response_headers_policy_id(ResponseHeadersPolicyId=pid)
     assert resp["DistributionIdList"]["Quantity"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Read-only list surface — ops previously falling through the path dispatch.
+# Shapes verified against botocore cloudfront service-2.json (2020-05-31).
+# ---------------------------------------------------------------------------
+
+
+def test_cloudfront_list_key_groups_empty(cloudfront):
+    resp = cloudfront.list_key_groups()
+    lst = resp["KeyGroupList"]
+    assert lst["MaxItems"] == 100
+    assert lst["Quantity"] == 0
+    assert lst.get("Items", []) == []
+
+
+def test_cloudfront_list_public_keys_empty(cloudfront):
+    resp = cloudfront.list_public_keys()
+    lst = resp["PublicKeyList"]
+    assert lst["MaxItems"] == 100
+    assert lst["Quantity"] == 0
+    assert lst.get("Items", []) == []
+
+
+def test_cloudfront_list_field_level_encryption_configs_empty(cloudfront):
+    resp = cloudfront.list_field_level_encryption_configs()
+    lst = resp["FieldLevelEncryptionList"]
+    assert lst["MaxItems"] == 100
+    assert lst["Quantity"] == 0
+    assert lst.get("Items", []) == []
+
+
+def test_cloudfront_list_field_level_encryption_profiles_empty(cloudfront):
+    resp = cloudfront.list_field_level_encryption_profiles()
+    lst = resp["FieldLevelEncryptionProfileList"]
+    assert lst["MaxItems"] == 100
+    assert lst["Quantity"] == 0
+    assert lst.get("Items", []) == []
+
+
+def test_cloudfront_list_continuous_deployment_policies_empty(cloudfront):
+    resp = cloudfront.list_continuous_deployment_policies()
+    lst = resp["ContinuousDeploymentPolicyList"]
+    assert lst["MaxItems"] == 100
+    assert lst["Quantity"] == 0
+    assert lst.get("Items", []) == []
+
+
+def test_cloudfront_list_origin_access_identities_empty(cloudfront):
+    resp = cloudfront.list_cloud_front_origin_access_identities()
+    lst = resp["CloudFrontOriginAccessIdentityList"]
+    assert lst["MaxItems"] == 100
+    assert lst["IsTruncated"] is False
+    assert lst["Quantity"] == 0
+    assert lst.get("Items", []) == []
+
+
+def test_cloudfront_list_streaming_distributions_empty(cloudfront):
+    resp = cloudfront.list_streaming_distributions()
+    lst = resp["StreamingDistributionList"]
+    assert lst["MaxItems"] == 100
+    assert lst["IsTruncated"] is False
+    assert lst["Quantity"] == 0
+    assert lst.get("Items", []) == []
+
+
+def test_cloudfront_list_vpc_origins_empty(cloudfront):
+    resp = cloudfront.list_vpc_origins()
+    lst = resp["VpcOriginList"]
+    assert lst["MaxItems"] == 100
+    assert lst["IsTruncated"] is False
+    assert lst["Quantity"] == 0
+    assert lst.get("Items", []) == []
+
+
+def test_cloudfront_list_realtime_log_configs_empty(cloudfront):
+    resp = cloudfront.list_realtime_log_configs()
+    lst = resp["RealtimeLogConfigs"]
+    assert lst["MaxItems"] == 100
+    assert lst["IsTruncated"] is False
+    assert lst.get("Items", []) == []
+
+
+def test_cloudfront_list_anycast_ip_lists_empty(cloudfront):
+    resp = cloudfront.list_anycast_ip_lists()
+    coll = resp["AnycastIpLists"]
+    assert coll["MaxItems"] == 100
+    assert coll["IsTruncated"] is False
+    assert coll["Quantity"] == 0
+    assert coll.get("Items", []) == []
+
+
+def test_cloudfront_list_cache_policies_round_trip(cloudfront):
+    baseline = cloudfront.list_cache_policies()["CachePolicyList"]["Quantity"]
+
+    name = f"cp-{_uuid_mod.uuid4().hex[:8]}"
+    create = cloudfront.create_cache_policy(CachePolicyConfig=_cache_policy_config(name))
+    pid = create["CachePolicy"]["Id"]
+
+    listed = cloudfront.list_cache_policies()["CachePolicyList"]
+    assert listed["Quantity"] == baseline + 1
+    names = [s["CachePolicy"]["CachePolicyConfig"]["Name"] for s in listed["Items"]]
+    assert name in names
+    types = {s["Type"] for s in listed["Items"]}
+    assert types == {"custom"}
+
+    cloudfront.delete_cache_policy(Id=pid, IfMatch=create["ETag"])
+
+
+def test_cloudfront_list_origin_request_policies_round_trip(cloudfront):
+    baseline = cloudfront.list_origin_request_policies()["OriginRequestPolicyList"]["Quantity"]
+
+    name = f"orp-{_uuid_mod.uuid4().hex[:8]}"
+    create = cloudfront.create_origin_request_policy(OriginRequestPolicyConfig=_orp_config(name))
+    pid = create["OriginRequestPolicy"]["Id"]
+
+    listed = cloudfront.list_origin_request_policies()["OriginRequestPolicyList"]
+    assert listed["Quantity"] == baseline + 1
+    names = [s["OriginRequestPolicy"]["OriginRequestPolicyConfig"]["Name"] for s in listed["Items"]]
+    assert name in names
+    assert {s["Type"] for s in listed["Items"]} == {"custom"}
+
+    cloudfront.delete_origin_request_policy(Id=pid, IfMatch=create["ETag"])
+
+
+def test_cloudfront_list_response_headers_policies_round_trip(cloudfront):
+    baseline = cloudfront.list_response_headers_policies()["ResponseHeadersPolicyList"]["Quantity"]
+
+    name = f"rhp-{_uuid_mod.uuid4().hex[:8]}"
+    create = cloudfront.create_response_headers_policy(ResponseHeadersPolicyConfig=_rhp_config(name))
+    pid = create["ResponseHeadersPolicy"]["Id"]
+
+    listed = cloudfront.list_response_headers_policies()["ResponseHeadersPolicyList"]
+    assert listed["Quantity"] == baseline + 1
+    names = [s["ResponseHeadersPolicy"]["ResponseHeadersPolicyConfig"]["Name"] for s in listed["Items"]]
+    assert name in names
+    assert {s["Type"] for s in listed["Items"]} == {"custom"}
+
     cloudfront.delete_response_headers_policy(Id=pid, IfMatch=create["ETag"])
+
+
+def test_cloudfront_get_monitoring_subscription_errors(cloudfront):
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_monitoring_subscription(DistributionId="EDOESNOTEXIST0")
+    assert exc.value.response["Error"]["Code"] == "NoSuchDistribution"
+
+    cfg = _custom_origin_distribution_config(f"mon-{_uuid_mod.uuid4().hex[:8]}")
+    create = cloudfront.create_distribution(DistributionConfig=cfg)
+    dist_id = create["Distribution"]["Id"]
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_monitoring_subscription(DistributionId=dist_id)
+    assert exc.value.response["Error"]["Code"] == "NoSuchMonitoringSubscription"
+
+    etag = create["ETag"]
+    disabled = dict(cfg, Enabled=False)
+    upd = cloudfront.update_distribution(DistributionConfig=disabled, Id=dist_id, IfMatch=etag)
+    cloudfront.delete_distribution(Id=dist_id, IfMatch=upd["ETag"])

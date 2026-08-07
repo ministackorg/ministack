@@ -1,10 +1,15 @@
 """
-Minimal EventBridge Pipes runtime for local CloudFormation use.
+EventBridge Pipes service emulator.
 
-Scope intentionally limited to:
+REST/JSON protocol — /v1/pipes/* and /tags/* paths.
+
+SDK surface:
+  ListPipes, CreatePipe, DescribePipe, UpdatePipe, DeletePipe,
+  StartPipe, StopPipe, ListTagsForResource, TagResource, UntagResource
+
+Runtime (background poller + CloudFormation) scope is intentionally limited to:
 - Source: DynamoDB Streams
 - Target: SNS
-- Lifecycle: create/delete (via CloudFormation handlers)
 """
 
 import copy
@@ -13,6 +18,7 @@ import logging
 import os
 import threading
 import time
+from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.persistence import load_state
@@ -142,6 +148,7 @@ def register_pipe(
     desired_state: str = "RUNNING",
     starting_position: str = "LATEST",
     tags: dict | None = None,
+    description: str = "",
 ):
     pipe_region = get_region()
     # AWS rejects cross-region source/target ARNs before role validation.
@@ -159,17 +166,20 @@ def register_pipe(
     if start not in ("LATEST", "TRIM_HORIZON"):
         start = "LATEST"
 
+    now = int(time.time())
     _pipes[name] = {
         "Name": name,
         "Arn": arn,
         "RoleArn": role_arn,
+        "Description": description or "",
         "Source": source,
         "Target": target,
         "DesiredState": state,
         "CurrentState": state,
         "StartingPosition": start,
         "Tags": tags or {},
-        "CreationTime": int(time.time()),
+        "CreationTime": now,
+        "LastModifiedTime": now,
     }
     _positions[arn] = _initial_position(_pipes[name])
 
@@ -330,3 +340,296 @@ def _initial_position(pipe: dict) -> int:
     if pipe.get("StartingPosition") == "TRIM_HORIZON":
         return _ddb.stream_start_position(table_name, **scope)
     return _ddb.stream_end_position(table_name, **scope)
+
+
+# ---------------------------------------------------------------------------
+# REST/JSON request handler (endpointPrefix "pipes", protocol rest-json).
+#
+# Op / method / requestUri (botocore pipes/2015-10-07/service-2.json):
+#   ListPipes             GET    /v1/pipes
+#   CreatePipe            POST   /v1/pipes/{Name}
+#   DescribePipe          GET    /v1/pipes/{Name}
+#   UpdatePipe            PUT    /v1/pipes/{Name}
+#   DeletePipe            DELETE /v1/pipes/{Name}
+#   StartPipe             POST   /v1/pipes/{Name}/start
+#   StopPipe              POST   /v1/pipes/{Name}/stop
+#   ListTagsForResource   GET    /tags/{resourceArn}
+#   TagResource           POST   /tags/{resourceArn}
+#   UntagResource         DELETE /tags/{resourceArn}
+#
+# JSON-protocol timestamps are int epoch seconds (Timestamp shape).
+# ---------------------------------------------------------------------------
+
+_VALID_REQUESTED_STATE = ("RUNNING", "STOPPED")
+
+
+def _json_resp(status, body):
+    return status, {"Content-Type": "application/json"}, json.dumps(body).encode()
+
+
+def _error(status, code, message):
+    return (
+        status,
+        {"Content-Type": "application/json", "x-amzn-errortype": code},
+        json.dumps({"__type": code, "message": message}).encode(),
+    )
+
+
+def _not_found(name):
+    # Matches the real AWS NotFoundException message for DescribePipe/DeletePipe
+    # etc. (member: "message").
+    return _error(404, "NotFoundException", f"Pipe {name} does not exist.")
+
+
+def _single(v):
+    return v[0] if isinstance(v, list) else v
+
+
+def _lifecycle_response(pipe):
+    """Shape shared by CreatePipe/UpdatePipe/DeletePipe/StartPipe/StopPipe."""
+    return {
+        "Arn": pipe.get("Arn", ""),
+        "Name": pipe.get("Name", ""),
+        "DesiredState": pipe.get("DesiredState", "RUNNING"),
+        "CurrentState": pipe.get("CurrentState", "RUNNING"),
+        "CreationTime": int(pipe.get("CreationTime", 0)),
+        "LastModifiedTime": int(pipe.get("LastModifiedTime", pipe.get("CreationTime", 0))),
+    }
+
+
+def _summary(pipe):
+    """ListPipes Pipe summary member shape."""
+    out = {
+        "Name": pipe.get("Name", ""),
+        "Arn": pipe.get("Arn", ""),
+        "DesiredState": pipe.get("DesiredState", "RUNNING"),
+        "CurrentState": pipe.get("CurrentState", "RUNNING"),
+        "StateReason": pipe.get("StateReason", ""),
+        "CreationTime": int(pipe.get("CreationTime", 0)),
+        "LastModifiedTime": int(pipe.get("LastModifiedTime", pipe.get("CreationTime", 0))),
+        "Source": pipe.get("Source", ""),
+        "Target": pipe.get("Target", ""),
+    }
+    if pipe.get("Enrichment"):
+        out["Enrichment"] = pipe["Enrichment"]
+    return out
+
+
+def _describe_response(pipe):
+    return {
+        "Arn": pipe.get("Arn", ""),
+        "Name": pipe.get("Name", ""),
+        "Description": pipe.get("Description", ""),
+        "DesiredState": pipe.get("DesiredState", "RUNNING"),
+        "CurrentState": pipe.get("CurrentState", "RUNNING"),
+        "StateReason": pipe.get("StateReason", ""),
+        "Source": pipe.get("Source", ""),
+        "Target": pipe.get("Target", ""),
+        "RoleArn": pipe.get("RoleArn", ""),
+        "Tags": pipe.get("Tags", {}) or {},
+        "CreationTime": int(pipe.get("CreationTime", 0)),
+        "LastModifiedTime": int(pipe.get("LastModifiedTime", pipe.get("CreationTime", 0))),
+    }
+
+
+def _find_pipe_by_arn(arn):
+    for pipe in _pipes.values():
+        if pipe.get("Arn") == arn:
+            return pipe
+    return None
+
+
+def _create_pipe(name, body):
+    if name in _pipes:
+        return _error(409, "ConflictException", f"Pipe {name} already exists.")
+    source = body.get("Source", "")
+    target = body.get("Target", "")
+    role_arn = body.get("RoleArn", "")
+    desired = str(body.get("DesiredState", "RUNNING")).upper()
+    if desired not in _VALID_REQUESTED_STATE:
+        return _error(
+            400,
+            "ValidationException",
+            f"DesiredState must be one of {list(_VALID_REQUESTED_STATE)}.",
+        )
+    try:
+        pipe = register_pipe(
+            name=name,
+            source=source,
+            target=target,
+            role_arn=role_arn,
+            desired_state=desired,
+            tags=body.get("Tags") or {},
+            description=body.get("Description", "") or "",
+        )
+    except ValueError as e:
+        return _error(400, "ValidationException", str(e))
+    return _json_resp(200, _lifecycle_response(pipe))
+
+
+def _describe_pipe(name):
+    pipe = _pipes.get(name)
+    if pipe is None:
+        return _not_found(name)
+    return _json_resp(200, _describe_response(pipe))
+
+
+def _update_pipe(name, body):
+    pipe = _pipes.get(name)
+    if pipe is None:
+        return _not_found(name)
+    if "Description" in body:
+        pipe["Description"] = body.get("Description", "") or ""
+    if "RoleArn" in body:
+        pipe["RoleArn"] = body.get("RoleArn", "") or ""
+    if "Target" in body and body.get("Target"):
+        pipe["Target"] = body["Target"]
+    if "DesiredState" in body:
+        desired = str(body.get("DesiredState", "")).upper()
+        if desired not in _VALID_REQUESTED_STATE:
+            return _error(
+                400,
+                "ValidationException",
+                f"DesiredState must be one of {list(_VALID_REQUESTED_STATE)}.",
+            )
+        pipe["DesiredState"] = desired
+        pipe["CurrentState"] = desired
+    pipe["LastModifiedTime"] = int(time.time())
+    _pipes[name] = pipe
+    return _json_resp(200, _lifecycle_response(pipe))
+
+
+def _delete_pipe_op(name):
+    pipe = _pipes.get(name)
+    if pipe is None:
+        return _not_found(name)
+    resp = {
+        "Arn": pipe.get("Arn", ""),
+        "Name": pipe.get("Name", ""),
+        "DesiredState": "DELETED",
+        "CurrentState": "DELETING",
+        "CreationTime": int(pipe.get("CreationTime", 0)),
+        "LastModifiedTime": int(pipe.get("LastModifiedTime", pipe.get("CreationTime", 0))),
+    }
+    delete_pipe(name)
+    return _json_resp(200, resp)
+
+
+def _set_state(name, desired):
+    pipe = _pipes.get(name)
+    if pipe is None:
+        return _not_found(name)
+    pipe["DesiredState"] = desired
+    pipe["CurrentState"] = desired
+    pipe["LastModifiedTime"] = int(time.time())
+    _pipes[name] = pipe
+    return _json_resp(200, _lifecycle_response(pipe))
+
+
+def _list_pipes(query):
+    name_prefix = _single(query.get("NamePrefix"))
+    desired_state = _single(query.get("DesiredState"))
+    current_state = _single(query.get("CurrentState"))
+    source_prefix = _single(query.get("SourcePrefix"))
+    target_prefix = _single(query.get("TargetPrefix"))
+    limit = _single(query.get("Limit"))
+
+    pipes = sorted(_pipes.values(), key=lambda p: p.get("Name", ""))
+    result = []
+    for pipe in pipes:
+        if name_prefix and not pipe.get("Name", "").startswith(name_prefix):
+            continue
+        if desired_state and pipe.get("DesiredState") != desired_state:
+            continue
+        if current_state and pipe.get("CurrentState") != current_state:
+            continue
+        if source_prefix and not pipe.get("Source", "").startswith(source_prefix):
+            continue
+        if target_prefix and not pipe.get("Target", "").startswith(target_prefix):
+            continue
+        result.append(_summary(pipe))
+
+    next_token = None
+    if limit:
+        try:
+            n = int(limit)
+            if 0 < n < len(result):
+                next_token = result[n]["Name"]
+                result = result[:n]
+        except (TypeError, ValueError):
+            pass
+
+    body = {"Pipes": result}
+    if next_token is not None:
+        body["NextToken"] = next_token
+    return _json_resp(200, body)
+
+
+def _list_tags(arn):
+    pipe = _find_pipe_by_arn(arn)
+    if pipe is None:
+        return _not_found(arn)
+    return _json_resp(200, {"tags": pipe.get("Tags", {}) or {}})
+
+
+def _tag_resource(arn, body):
+    pipe = _find_pipe_by_arn(arn)
+    if pipe is None:
+        return _not_found(arn)
+    pipe.setdefault("Tags", {}).update(body.get("tags", {}) or {})
+    return _json_resp(200, {})
+
+
+def _untag_resource(arn, query):
+    pipe = _find_pipe_by_arn(arn)
+    if pipe is None:
+        return _not_found(arn)
+    keys = query.get("tagKeys", [])
+    if not isinstance(keys, list):
+        keys = [keys]
+    tags = pipe.setdefault("Tags", {})
+    for k in keys:
+        tags.pop(k, None)
+    return _json_resp(200, {})
+
+
+async def handle_request(method, path, headers, body_bytes, query_params):
+    try:
+        body = json.loads(body_bytes) if body_bytes else {}
+    except (json.JSONDecodeError, TypeError):
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    # Pipe lifecycle sub-actions: /v1/pipes/{Name}/start | /stop
+    if path.startswith("/v1/pipes/"):
+        rest = path[len("/v1/pipes/"):]
+        if rest.endswith("/start"):
+            return _set_state(unquote(rest[: -len("/start")]), "RUNNING")
+        if rest.endswith("/stop"):
+            return _set_state(unquote(rest[: -len("/stop")]), "STOPPED")
+        name = unquote(rest)
+        if name:
+            if method == "POST":
+                return _create_pipe(name, body)
+            if method == "GET":
+                return _describe_pipe(name)
+            if method == "PUT":
+                return _update_pipe(name, body)
+            if method == "DELETE":
+                return _delete_pipe_op(name)
+
+    if path == "/v1/pipes" and method == "GET":
+        return _list_pipes(query_params)
+
+    # Tag routes: /tags/{resourceArn+}
+    if path.startswith("/tags/"):
+        arn = unquote(path[len("/tags/"):])
+        if method == "GET":
+            return _list_tags(arn)
+        if method == "POST":
+            return _tag_resource(arn, body)
+        if method == "DELETE":
+            return _untag_resource(arn, query_params)
+
+    return _error(400, "ValidationException", f"No route for {method} {path}")
