@@ -1187,6 +1187,15 @@ def _disable_key(data):
     return json_response({})
 
 
+def _update_key_description(data):
+    rec = _resolve_key(data.get("KeyId", ""))
+    if not rec:
+        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+    # An explicit empty string clears the description, which is how AWS removes it.
+    rec["Description"] = data.get("Description", "")
+    return json_response({})
+
+
 def _schedule_key_deletion(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
@@ -1280,6 +1289,7 @@ async def handle_request(method, path, headers, body, query_params):
         "ListKeyPolicies": _list_key_policies,
         "EnableKey": _enable_key,
         "DisableKey": _disable_key,
+        "UpdateKeyDescription": _update_key_description,
         "ScheduleKeyDeletion": _schedule_key_deletion,
         "CancelKeyDeletion": _cancel_key_deletion,
         "TagResource": _tag_resource,

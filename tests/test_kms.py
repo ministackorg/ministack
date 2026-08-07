@@ -84,6 +84,35 @@ def test_kms_describe_key(kms_client):
     assert resp["KeyMetadata"]["Description"] == "describe me"
     assert resp["KeyMetadata"]["KeyId"] == key_id
 
+def test_kms_update_key_description(kms_client):
+    """UpdateKeyDescription changes the description DescribeKey reports.
+
+    terraform-provider-aws calls this on any aws_kms_key description drift, so a
+    missing action fails the whole update: 'InvalidAction: Unknown action'.
+    """
+    created = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT", Description="before")
+    key_id = created["KeyMetadata"]["KeyId"]
+
+    kms_client.update_key_description(KeyId=key_id, Description="after")
+    assert kms_client.describe_key(KeyId=key_id)["KeyMetadata"]["Description"] == "after"
+
+
+def test_kms_update_key_description_by_arn_and_cleared(kms_client):
+    """The key accepts an ARN, and an empty description clears it (AWS behavior)."""
+    created = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT", Description="before")
+    arn = created["KeyMetadata"]["Arn"]
+
+    kms_client.update_key_description(KeyId=arn, Description="")
+    assert kms_client.describe_key(KeyId=arn)["KeyMetadata"]["Description"] == ""
+
+
+def test_kms_update_key_description_unknown_key(kms_client):
+    with pytest.raises(ClientError) as exc:
+        kms_client.update_key_description(
+            KeyId="00000000-0000-0000-0000-000000000000", Description="x")
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+
 def test_kms_describe_key_by_arn(kms_client):
     created = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")
     arn = created["KeyMetadata"]["Arn"]
