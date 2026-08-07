@@ -221,6 +221,33 @@ def test_cloudwatch_get_metric_data_v2(cw):
     assert resp["MetricDataResults"][0]["StatusCode"] == "Complete"
     assert len(resp["MetricDataResults"][0]["Values"]) >= 1
 
+def test_cloudwatch_get_metric_data_honors_dimensions(cw):
+    """GetMetricData resolves by the query's dimension set, like GetMetricStatistics.
+
+    Same namespace + name, two dimension values published; a query for a third,
+    unpublished value must return no data rather than leaking another series'.
+    """
+    ns = "Test/GMDDims"
+    cw.put_metric_data(Namespace=ns, MetricData=[
+        {"MetricName": "Requests", "Dimensions": [{"Name": "Series", "Value": "A"}], "Value": 100.0},
+        {"MetricName": "Requests", "Dimensions": [{"Name": "Series", "Value": "B"}], "Value": 7.0},
+    ])
+
+    def _q(qid, series):
+        return {"Id": qid, "MetricStat": {"Metric": {
+            "Namespace": ns, "MetricName": "Requests",
+            "Dimensions": [{"Name": "Series", "Value": series}]},
+            "Period": 3600, "Stat": "Maximum"}}
+
+    resp = cw.get_metric_data(
+        MetricDataQueries=[_q("a", "A"), _q("b", "B"), _q("c", "C")],
+        StartTime=time.time() - 3600, EndTime=time.time() + 3600,
+    )
+    values = {r["Id"]: r["Values"] for r in resp["MetricDataResults"]}
+    assert values["a"] == [100.0]
+    assert values["b"] == [7.0]
+    assert values["c"] == []  # dimension value never published
+
 def test_cloudwatch_tags_v2(cw):
     cw.put_metric_alarm(
         AlarmName="cw-tag-v2",

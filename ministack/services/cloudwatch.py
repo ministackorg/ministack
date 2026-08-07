@@ -732,13 +732,22 @@ def _get_metric_data(params, cbor_data, is_cbor, is_json=False):
                 _p(params, f"MetricDataQueries.member.{qi}.MetricStat.Stat")
                 or "Average"
             )
+            dims = []
+            dj = 1
+            _dim_base = f"MetricDataQueries.member.{qi}.MetricStat.Metric.Dimensions.member"
+            while _p(params, f"{_dim_base}.{dj}.Name"):
+                dims.append({
+                    "Name": _p(params, f"{_dim_base}.{dj}.Name"),
+                    "Value": _p(params, f"{_dim_base}.{dj}.Value"),
+                })
+                dj += 1
             queries.append(
                 {
                     "Id": qid,
                     "Label": label,
                     "ReturnData": return_data,
                     "MetricStat": {
-                        "Metric": {"Namespace": ns, "MetricName": mn},
+                        "Metric": {"Namespace": ns, "MetricName": mn, "Dimensions": dims},
                         "Period": period,
                         "Stat": stat_name,
                     },
@@ -777,9 +786,17 @@ def _get_metric_data(params, cbor_data, is_cbor, is_json=False):
         period = int(ms.get("Period", 60))
         stat_name = ms.get("Stat", "Average")
 
+        # Each (namespace, name, dimension-set) is a distinct metric. Resolve by
+        # the query's dimensions exactly, like GetMetricStatistics — otherwise a
+        # value published under one dimension set leaks into queries for another.
+        req_dims = _dims_from_list(metric.get("Dimensions") or [])
+        req_dims_key = _dims_key(req_dims) if req_dims else None
+
         all_pts = []
-        for (k_ns, k_mn, _), pts in _metrics.items():
+        for (k_ns, k_mn, k_dk), pts in _metrics.items():
             if k_ns == ns and k_mn == mn:
+                if req_dims_key is not None and k_dk != req_dims_key:
+                    continue
                 all_pts.extend(pts)
 
         if start_time is not None:
