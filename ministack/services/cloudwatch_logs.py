@@ -1579,6 +1579,7 @@ def _compile_insights_filter(stage: str):
     Supported forms:
     - ``filter @logStream = 'exact'``
     - ``filter @message like /pattern/`` or ``/pattern/i``
+    - ``filter toMillis(@timestamp) <=|>=|<|>|=|!= <epoch_ms>``
     """
     text = stage.strip()
     if not re.match(r"(?i)^filter\b", text):
@@ -1609,6 +1610,30 @@ def _compile_insights_filter(stage: str):
             return _compiled.search(str(public.get(_field, ""))) is not None
 
         return _like_pred
+
+    # CWLT surround queries bound neighbors with toMillis(@timestamp).
+    # Silently ignoring this form made ``after`` return the earliest events
+    # in the stream (sort asc + limit) instead of events at/after the pivot.
+    tomillis = re.match(
+        r"^toMillis\(@timestamp\)\s*(<=|>=|<|>|!=|=)\s*(-?\d+)\s*$",
+        body,
+    )
+    if tomillis:
+        op, bound = tomillis.group(1), int(tomillis.group(2))
+        comparators = {
+            "<=": lambda ts, b: ts <= b,
+            ">=": lambda ts, b: ts >= b,
+            "<": lambda ts, b: ts < b,
+            ">": lambda ts, b: ts > b,
+            "=": lambda ts, b: ts == b,
+            "!=": lambda ts, b: ts != b,
+        }
+        compare = comparators[op]
+
+        def _tomillis_pred(record, _compare=compare, _bound=bound):
+            return _compare(int(record.get("_timestamp_ms", 0)), _bound)
+
+        return _tomillis_pred
 
     # Unsupported filter form — ignore (subset emulator).
     return None
@@ -1720,7 +1745,8 @@ def _start_query(data):
     """Run a CloudWatch Logs Insights query (CWLI subset).
 
     Supported: ``fields``, chained ``filter`` (``@field = '…'``,
-    ``@field like /regex/[i]``), ``sort @timestamp asc|desc``, and ``limit``.
+    ``@field like /regex/[i]``, ``toMillis(@timestamp)`` comparisons),
+    ``sort @timestamp asc|desc``, and ``limit``.
     Filters are AND-ed; ``limit`` applies after filter+sort as
     ``min(query limit, StartQuery limit)``.
     """
@@ -1784,14 +1810,35 @@ def _get_query_results(data):
             "ResourceNotFoundException",
             f"The specified query does not exist: {query_id}", 400,
         )
-    return json_response({
+    all_results = query.get("results", [])
+    statistics = query.get(
+        "statistics",
+        {"recordsMatched": 0.0, "recordsScanned": 0.0, "bytesScanned": 0.0},
+    )
+    start = _decode_token(data.get("nextToken"))
+    max_items = data.get("maxItems")
+    if max_items is None:
+        page = all_results[start:]
+        return json_response({
+            "status": query["status"],
+            "results": page,
+            "statistics": statistics,
+        })
+    try:
+        limit = max(1, int(max_items))
+    except (TypeError, ValueError):
+        limit = len(all_results) - start if start < len(all_results) else 0
+        limit = max(1, limit) if limit else 1
+    end = start + limit
+    page = all_results[start:end]
+    resp = {
         "status": query["status"],
-        "results": query.get("results", []),
-        "statistics": query.get(
-            "statistics",
-            {"recordsMatched": 0.0, "recordsScanned": 0.0, "bytesScanned": 0.0},
-        ),
-    })
+        "results": page,
+        "statistics": statistics,
+    }
+    if end < len(all_results):
+        resp["nextToken"] = _encode_token(end)
+    return json_response(resp)
 
 
 def _stop_query(data):

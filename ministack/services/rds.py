@@ -142,6 +142,63 @@ AURORA_MYSQL_ENGINE_VERSIONS = [
 ]
 AURORA_MYSQL_ENGINE_VERSION_SET = {version for version, _ in AURORA_MYSQL_ENGINE_VERSIONS}
 
+# Aurora PostgreSQL versions are the creatable set returned by AWS RDS as of
+# 2026-08-06 (single source of truth for both the catalog and create-time
+# validation). Refresh with:
+#   aws rds describe-db-engine-versions --engine aurora-postgresql \
+#     --query 'DBEngineVersions[].[EngineVersion,DBParameterGroupFamily]' \
+#     --output text | sort -V
+# The Docker image is derived from the major alone (16.14 -> postgres:16-alpine),
+# so new minors need no image work — but keep _default_engine_version aligned:
+# AWS's default (describe-db-engine-versions --default-only) can trail the
+# latest advertised version, so update it deliberately when refreshing.
+AURORA_POSTGRESQL_ENGINE_VERSIONS = [
+    ("11.9", "aurora-postgresql11"),
+    ("11.21", "aurora-postgresql11"),
+    ("12.9", "aurora-postgresql12"),
+    ("12.22", "aurora-postgresql12"),
+    ("13.9", "aurora-postgresql13"),
+    ("13.23", "aurora-postgresql13"),
+    ("14.6", "aurora-postgresql14"),
+    ("14.17", "aurora-postgresql14"),
+    ("14.18", "aurora-postgresql14"),
+    ("14.19", "aurora-postgresql14"),
+    ("14.20", "aurora-postgresql14"),
+    ("14.22", "aurora-postgresql14"),
+    ("14.23", "aurora-postgresql14"),
+    ("15.10", "aurora-postgresql15"),
+    ("15.12", "aurora-postgresql15"),
+    ("15.13", "aurora-postgresql15"),
+    ("15.14", "aurora-postgresql15"),
+    ("15.15", "aurora-postgresql15"),
+    ("15.17", "aurora-postgresql15"),
+    ("15.18", "aurora-postgresql15"),
+    ("16.4-limitless", "aurora-postgresql16"),
+    ("16.6-limitless", "aurora-postgresql16"),
+    ("16.8", "aurora-postgresql16"),
+    ("16.8-limitless", "aurora-postgresql16"),
+    ("16.9", "aurora-postgresql16"),
+    ("16.9-limitless", "aurora-postgresql16"),
+    ("16.10", "aurora-postgresql16"),
+    ("16.10-limitless", "aurora-postgresql16"),
+    ("16.11", "aurora-postgresql16"),
+    ("16.11-limitless", "aurora-postgresql16"),
+    ("16.13", "aurora-postgresql16"),
+    ("16.13-limitless", "aurora-postgresql16"),
+    ("16.14", "aurora-postgresql16"),
+    ("17.4", "aurora-postgresql17"),
+    ("17.5", "aurora-postgresql17"),
+    ("17.6", "aurora-postgresql17"),
+    ("17.7", "aurora-postgresql17"),
+    ("17.9", "aurora-postgresql17"),
+    ("17.10", "aurora-postgresql17"),
+    ("18.3", "aurora-postgresql18"),
+    ("18.4", "aurora-postgresql18"),
+]
+AURORA_POSTGRESQL_ENGINE_VERSION_SET = {
+    version for version, _ in AURORA_POSTGRESQL_ENGINE_VERSIONS
+}
+
 AURORA_MYSQL_IMAGE_MAP = {
     "5.6": "mysql:5.6",
     "5.7": "mysql:5.7",
@@ -351,6 +408,16 @@ def restore_state(data):
             if not cluster:
                 for member in members:
                     member["DBInstanceStatus"] = "failed"
+                return
+            if cluster.get("Status") == "stopped":
+                # A stopped cluster stays stopped across host restarts;
+                # StartDBCluster brings compute back. (Real AWS also
+                # auto-starts a cluster stopped for seven days — out of
+                # scope for an emulator.)
+                cluster.pop("_shared_legacy_migration_in_progress", None)
+                cluster["_shared_container_ready"] = False
+                for member in members:
+                    member["DBInstanceStatus"] = "stopped"
                 return
             restore_epoch = int(cluster.get("_shared_container_epoch", 0))
 
@@ -926,13 +993,19 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
     }
 
 
-def _stop_empty_cluster_shared_container(cluster_id, cluster):
-    """Stop, but do not remove, an empty Aurora cluster's database.
+def _stop_cluster_shared_container(cluster_id, cluster):
+    """Stop, but do not remove, an Aurora cluster's database compute.
 
-    Aurora keeps the cluster volume after its final DB instance is deleted,
-    but no SQL endpoint is reachable until another instance is attached.  A
-    stopped Docker container models that split: the cluster still owns the
-    container and its data, while only DeleteDBCluster removes either one.
+    Aurora keeps the cluster volume when compute goes away — after the final
+    DB instance is deleted, and while the cluster is stopped via
+    ``StopDBCluster`` — but no SQL endpoint is reachable until compute
+    returns. A stopped Docker container models that split: the cluster still
+    owns its data, and the cluster-owned volume is only removed by
+    DeleteDBCluster (the container itself may be replaced if a later
+    StartDBCluster has to fall back to recreating compute).
+
+    Returns True when compute is stopped — including when there was nothing
+    to stop — and False when a running container could not be stopped.
     """
     with _shared_container_lock:
         # Invalidate every readiness worker before the potentially slow Docker
@@ -945,19 +1018,26 @@ def _stop_empty_cluster_shared_container(cluster_id, cluster):
         container_id = cluster.get("_shared_container_id")
         docker_client = _get_docker()
         if not docker_client or not container_id:
-            return
+            return True
         try:
             container = docker_client.containers.get(container_id)
+        except Exception:
+            # A container that no longer exists is not running compute; the
+            # goal state is already met.
+            return True
+        try:
             container.reload()
             if container.status not in ("created", "exited", "dead", "removing"):
                 container.stop(timeout=5)
-                logger.info("RDS: stopped shared container for empty cluster %s", cluster_id)
+                logger.info("RDS: stopped shared container for cluster %s", cluster_id)
         except Exception as e:
             logger.warning(
-                "RDS: failed to stop shared container for empty cluster %s: %s",
+                "RDS: failed to stop shared container for cluster %s: %s",
                 cluster_id,
                 e,
             )
+            return False
+        return True
 
 
 def _remove_cluster_shared_resources(
@@ -2376,11 +2456,11 @@ def _create_db_instance(p):
     if not db_id:
         return _error("MissingParameter", "DBInstanceIdentifier is required", 400)
     if db_id in _instances:
-        return _error("DBInstanceAlreadyExistsFault", f"DB instance {db_id} already exists", 400)
+        return _error("DBInstanceAlreadyExists", f"DB instance {db_id} already exists", 400)
 
     engine = _p(p, "Engine") or "postgres"
     explicit_engine_version = _p(p, "EngineVersion")
-    engine_version_error = _unsupported_aurora_mysql_engine_version_error(engine, explicit_engine_version)
+    engine_version_error = _unsupported_aurora_engine_version_error(engine, explicit_engine_version)
     if engine_version_error:
         return engine_version_error
     engine_version = explicit_engine_version or _default_engine_version(engine)
@@ -2406,6 +2486,17 @@ def _create_db_instance(p):
                 "InvalidDBClusterStateFault",
                 "Cannot add a DB instance while legacy member storage "
                 "migration is blocked.",
+                400,
+            )
+        if parent.get("Status") == "stopped":
+            # Real AWS rejects instance additions to a stopped cluster; the
+            # cluster must be started first. Without this guard the new
+            # member would land as ``creating`` with no readiness worker to
+            # ever complete it.
+            return _error(
+                "InvalidDBClusterStateFault",
+                f"DbCluster {parent['DBClusterIdentifier']} is in stopped "
+                "state but expected it to be one of available.",
                 400,
             )
         cluster_id_param = parent["DBClusterIdentifier"]
@@ -2916,6 +3007,25 @@ def _delete_db_instance(p):
         return _error("InvalidParameterCombination",
             "Cannot delete a DB instance when DeletionProtection is enabled.", 400)
 
+    parent_cluster_id = (
+        instance.get("_shared_cluster_id")
+        or instance.get("DBClusterIdentifier")
+    )
+    if parent_cluster_id:
+        parent = _resolve_cluster_in_request_region(parent_cluster_id)
+        if parent and parent.get("Status") == "stopped":
+            # Real AWS rejects member deletion from a stopped cluster; the
+            # cluster must be started first. Without this guard, deleting
+            # the last member of a stopped cluster would let a later
+            # CreateDBInstance restart compute behind the ``stopped``
+            # status.
+            return _error(
+                "InvalidDBClusterStateFault",
+                f"DbCluster {parent['DBClusterIdentifier']} is in stopped "
+                "state but expected it to be one of available.",
+                400,
+            )
+
     _unregister_instance_from_clusters(instance_id)
 
     shared_cluster_id = (
@@ -2932,7 +3042,7 @@ def _delete_db_instance(p):
                 # secondary is detached, deleted, or gains compute again.
                 cluster["_mysql_headless_applier_required"] = True
             else:
-                _stop_empty_cluster_shared_container(shared_cluster_id, cluster)
+                _stop_cluster_shared_container(shared_cluster_id, cluster)
 
     docker_client = _get_docker()
     if (
@@ -3173,7 +3283,7 @@ def _create_read_replica(p):
         return _error("DBInstanceNotFound", f"DBInstance {source_id} not found.", 404)
     source_id = source["DBInstanceIdentifier"]
     if replica_id in _instances:
-        return _error("DBInstanceAlreadyExistsFault", f"DBInstance {replica_id} already exists.", 400)
+        return _error("DBInstanceAlreadyExists", f"DBInstance {replica_id} already exists.", 400)
 
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:db:{replica_id}"
     replica = dict(source)
@@ -3214,7 +3324,7 @@ def _restore_from_snapshot(p):
     snap_id = _p(p, "DBSnapshotIdentifier")
 
     if db_id in _instances:
-        return _error("DBInstanceAlreadyExistsFault", f"DBInstance {db_id} already exists.", 400)
+        return _error("DBInstanceAlreadyExists", f"DBInstance {db_id} already exists.", 400)
 
     snap = _snapshots.get(snap_id)
     if not snap:
@@ -3225,7 +3335,8 @@ def _restore_from_snapshot(p):
         "DBInstanceIdentifier": db_id,
         "DBInstanceClass": _p(p, "DBInstanceClass") or snap.get("DBInstanceClass", "db.t3.micro"),
         "Engine": snap.get("Engine", "postgres"),
-        "EngineVersion": snap.get("EngineVersion", "15.3"),
+        "EngineVersion": snap.get("EngineVersion")
+        or _default_engine_version(snap.get("Engine", "postgres")),
         "DBInstanceStatus": "available",
         "MasterUsername": snap.get("MasterUsername", "admin"),
         "DBName": snap.get("DBName", ""),
@@ -3322,7 +3433,7 @@ def _create_db_cluster(p):
             )
         engine = expected_engine or engine
     explicit_engine_version = _p(p, "EngineVersion")
-    engine_version_error = _unsupported_aurora_mysql_engine_version_error(engine, explicit_engine_version)
+    engine_version_error = _unsupported_aurora_engine_version_error(engine, explicit_engine_version)
     if engine_version_error:
         return engine_version_error
     engine_version = explicit_engine_version or _default_engine_version(engine)
@@ -4332,6 +4443,18 @@ def _modify_subnet_group(p):
 # StartDBCluster / StopDBCluster
 # ---------------------------------------------------------------------------
 
+def _cluster_member_instances(cluster):
+    """Resolve a cluster's member records to their instance dicts."""
+    return [
+        inst
+        for inst in (
+            _instances.get(member.get("DBInstanceIdentifier"))
+            for member in cluster.get("DBClusterMembers", [])
+        )
+        if inst is not None
+    ]
+
+
 def _start_db_cluster(p):
     cluster_id = _p(p, "DBClusterIdentifier")
     cluster = _resolve_cluster_in_request_region(cluster_id)
@@ -4340,7 +4463,215 @@ def _start_db_cluster(p):
         if wrong_region:
             return wrong_region
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
-    cluster["Status"] = "available"
+    # The request may identify the cluster by ARN; every downstream consumer
+    # (the readiness worker's re-lookup, Docker container naming) needs the
+    # canonical identifier.
+    cluster_id = cluster["DBClusterIdentifier"]
+    status = cluster.get("Status")
+    if status != "stopped":
+        # Real AWS message shape, verified against live transcripts:
+        # "DbCluster <id> is in <state> state but expected it to be one of
+        # stopped,inaccessible-encryption-credentials-recoverable."
+        return _error(
+            "InvalidDBClusterStateFault",
+            f"DbCluster {cluster_id} is "
+            f"in {status} state but expected it to be one of "
+            "stopped,inaccessible-encryption-credentials-recoverable.",
+            400,
+        )
+
+    member_instances = _cluster_member_instances(cluster)
+    docker_client = _get_docker()
+    had_compute = bool(cluster.get("_shared_container_id"))
+    if not docker_client or not (
+        had_compute or cluster.get("_shared_storage_initialized")
+    ):
+        # Control-plane only, or the cluster never had real compute:
+        # flipping the statuses is the entire start.
+        cluster["_shared_container_ready"] = True
+        cluster["Status"] = "available"
+        for inst in member_instances:
+            inst["DBInstanceStatus"] = "available"
+        return _xml(200, "StartDBClusterResponse",
+            f"<StartDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></StartDBClusterResult>")
+
+    if had_compute:
+        start_result = _restart_cluster_shared_container(cluster_id, cluster)
+        if start_result.get("failed"):
+            # A preserved container can become unrestartable (for example,
+            # its old host port may have been claimed). Recreate only the
+            # compute layer; the cluster-owned named volume retains data.
+            start_result = _start_cluster_shared_container(
+                cluster_id, cluster, remove_stale=True,
+            )
+    else:
+        # Initialized storage without a container id happens after a host
+        # restart: persistence drops the container id but the stable-named
+        # container and volume survive. Recreate compute from them.
+        start_result = _start_cluster_shared_container(
+            cluster_id, cluster, remove_stale=True,
+        )
+
+    if not start_result.get("started"):
+        if start_result.get("failed"):
+            # Both the restart and the recreate fallback genuinely failed
+            # (Docker error, missing image, port exhaustion). Compute did
+            # not come back: keep the cluster stopped so StartDBCluster can
+            # be retried, and surface the failure instead of reporting a
+            # dead endpoint as available. The cluster-owned volume is
+            # untouched, so data survives for the retry.
+            cluster["Status"] = "stopped"
+            for inst in member_instances:
+                inst["DBInstanceStatus"] = "stopped"
+            return _error(
+                "InternalFailure",
+                f"Failed to start compute for DB cluster {cluster_id}.",
+                500,
+            )
+        # Benign control-plane-only outcome: no Docker in this environment.
+        cluster["_shared_container_ready"] = True
+        cluster["Status"] = "available"
+        for inst in member_instances:
+            inst["DBInstanceStatus"] = "available"
+        return _xml(200, "StartDBClusterResponse",
+            f"<StartDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></StartDBClusterResult>")
+
+    cluster["Status"] = "starting"
+    for inst in member_instances:
+        inst["DBInstanceStatus"] = "starting"
+    _sync_cluster_endpoints(cluster)
+
+    # Real AWS StartDBCluster returns immediately with a transitional status
+    # and the caller polls until the cluster is available. Finalize readiness
+    # on a daemon thread, exactly like CreateDBInstance does for first-member
+    # compute. contextvars.copy_context() carries the request's account and
+    # region into the daemon.
+    ctx = contextvars.copy_context()
+
+    def _bg_start_ready(
+        cluster_id=cluster_id,
+        container_id=cluster.get("_shared_container_id"),
+        container_epoch=start_result.get("container_epoch"),
+        ready_host=start_result.get("readiness_host"),
+        ready_port=start_result.get("readiness_port"),
+    ):
+        cluster = _clusters.get(cluster_id)
+        if not cluster:
+            return
+
+        def _container_alive():
+            client = _get_docker()
+            if not client or not container_id:
+                return True
+            try:
+                container = client.containers.get(container_id)
+                container.reload()
+                return container.status not in ("exited", "dead", "removing")
+            except Exception:
+                return False
+
+        engine = cluster.get("Engine", "aurora-postgresql")
+        master_user = cluster.get("MasterUsername", "admin")
+        master_pass = cluster.get("_MasterUserPassword", "password")
+        readiness_user = master_user
+        readiness_pass = master_pass
+        readiness_db = cluster.get("DatabaseName") or "mydb"
+        pending_rotation = cluster.get("_pending_master_password_rotation")
+        if pending_rotation:
+            readiness_pass = pending_rotation["old_password"]
+        if _mysql_replication_secondary(cluster):
+            readiness_user = "root"
+            if cluster.get("_mysql_control_user_ready"):
+                readiness_user = _MYSQL_CONTROL_USER
+                readiness_pass = _MYSQL_CONTROL_PASSWORD
+            readiness_db = None
+        database_ready = _wait_for_database_ready(
+            ready_host, ready_port, engine, readiness_user,
+            readiness_pass, readiness_db, _container_alive,
+        )
+        with _shared_container_lock:
+            if (
+                cluster.get("_shared_container_epoch") != container_epoch
+                or cluster.get("_shared_container_id") != container_id
+            ):
+                logger.info(
+                    "RDS: ignoring stale start readiness result for cluster "
+                    "%s epoch %s container %s",
+                    cluster_id, container_epoch, container_id,
+                )
+                return
+
+            # Real AWS lands a failed start back on ``stopped`` — never on a
+            # transitional status — so StartDBCluster can simply be retried.
+            def _fail_start():
+                # Stop the failed container first (a failed password rotation
+                # leaves it running and reachable; for an already-exited
+                # container this is a no-op) so the ``stopped`` status is
+                # honest the moment it becomes visible and a retried
+                # StartDBCluster begins from cleanly stopped compute. Holding
+                # _shared_container_lock across the Docker stop matches
+                # _stop_cluster_shared_container and keeps a concurrent retry
+                # from racing the stop.
+                client = _get_docker()
+                if client and container_id:
+                    try:
+                        failed = client.containers.get(container_id)
+                        failed.reload()
+                        if failed.status not in (
+                            "created", "exited", "dead", "removing",
+                        ):
+                            failed.stop(timeout=5)
+                    except Exception:
+                        pass
+                cluster["_shared_container_ready"] = False
+                cluster["Status"] = "stopped"
+                for inst in _cluster_member_instances(cluster):
+                    inst["DBInstanceStatus"] = "stopped"
+
+            start_failed = False
+            pending_rotation = cluster.get("_pending_master_password_rotation")
+            if not database_ready:
+                logger.warning(
+                    "RDS: cluster %s container exited before becoming "
+                    "reachable after StartDBCluster", cluster_id,
+                )
+                _fail_start()
+                start_failed = True
+            elif pending_rotation and not _rotate_real_password(
+                cluster,
+                pending_rotation["old_password"],
+                pending_rotation["new_password"],
+            ):
+                _fail_start()
+                start_failed = True
+            if not start_failed:
+                if pending_rotation:
+                    cluster.pop("_pending_master_password_rotation", None)
+                    _sync_global_mysql_credentials(cluster)
+                if _is_mysql_engine(engine) and not _mysql_replication_secondary(
+                    cluster,
+                ):
+                    _grant_mysql_master_user_privileges(
+                        ready_host, ready_port, master_user,
+                        cluster.get("_MasterUserPassword", master_pass),
+                        cluster_id,
+                    )
+                cluster["_shared_container_ready"] = True
+                for inst in _cluster_member_instances(cluster):
+                    _attach_instance_to_shared_cluster(inst, cluster)
+                    inst["DBInstanceStatus"] = "available"
+                _sync_cluster_endpoints(cluster)
+                _refresh_cluster_status(cluster_id)
+        if start_failed:
+            logger.warning(
+                "RDS: cluster %s failed to start; returned to stopped",
+                cluster_id,
+            )
+            return
+        logger.info("RDS: cluster %s started and ready", cluster_id)
+
+    threading.Thread(target=ctx.run, args=(_bg_start_ready,), daemon=True).start()
+
     return _xml(200, "StartDBClusterResponse",
         f"<StartDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></StartDBClusterResult>")
 
@@ -4353,7 +4684,34 @@ def _stop_db_cluster(p):
         if wrong_region:
             return wrong_region
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
+    status = cluster.get("Status")
+    if status != "available":
+        # Real AWS message shape, verified against live transcripts:
+        # "DbCluster <id> is in <state> state but expected it to be one of
+        # available."
+        return _error(
+            "InvalidDBClusterStateFault",
+            f"DbCluster {cluster.get('DBClusterIdentifier', cluster_id)} is "
+            f"in {status} state but expected it to be one of available.",
+            400,
+        )
+    if not _stop_cluster_shared_container(
+        cluster.get("DBClusterIdentifier", cluster_id), cluster,
+    ):
+        # Compute is still running; publishing ``stopped`` here would be the
+        # reachable-endpoint lie this state machine exists to prevent.
+        # Restore readiness (the container is still serving) and surface the
+        # failure so StopDBCluster can be retried.
+        cluster["_shared_container_ready"] = True
+        return _error(
+            "InternalFailure",
+            "Failed to stop compute for DB cluster "
+            f"{cluster.get('DBClusterIdentifier', cluster_id)}.",
+            500,
+        )
     cluster["Status"] = "stopped"
+    for inst in _cluster_member_instances(cluster):
+        inst["DBInstanceStatus"] = "stopped"
     return _xml(200, "StopDBClusterResponse",
         f"<StopDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></StopDBClusterResult>")
 
@@ -4727,7 +5085,7 @@ def _remove_from_global_cluster(p):
             if not member.get("IsWriter"):
                 _clear_mysql_replication_metadata(cluster)
                 if not cluster.get("DBClusterMembers"):
-                    _stop_empty_cluster_shared_container(
+                    _stop_cluster_shared_container(
                         cluster.get("DBClusterIdentifier", db_cluster_id),
                         cluster,
                     )
@@ -4938,11 +5296,7 @@ def _describe_engine_versions(p):
         "mariadb": [
             ("10.6.14", "10.6"), ("10.5.21", "10.5"),
         ],
-        "aurora-postgresql": [
-            ("18.3", "aurora-postgresql18"), ("17.5", "aurora-postgresql17"),
-            ("16.4", "aurora-postgresql16"),
-            ("15.3", "aurora-postgresql15"), ("14.8", "aurora-postgresql14"),
-        ],
+        "aurora-postgresql": AURORA_POSTGRESQL_ENGINE_VERSIONS,
         "aurora-mysql": AURORA_MYSQL_ENGINE_VERSIONS,
     }
     versions = versions_map.get(engine, [("15.3", "15")])
@@ -4976,7 +5330,7 @@ def _describe_orderable_options(p):
     engine = _p(p, "Engine") or "postgres"
     engine_version = _p(p, "EngineVersion")
     db_class = _p(p, "DBInstanceClass")
-    engine_version_error = _unsupported_aurora_mysql_engine_version_error(engine, engine_version)
+    engine_version_error = _unsupported_aurora_engine_version_error(engine, engine_version)
     if engine_version_error:
         return engine_version_error
 
@@ -5548,23 +5902,30 @@ def _format_time(ts):
 def _default_engine_version(engine):
     defaults = {
         "postgres": "15.3", "mysql": "8.0.33", "mariadb": "10.6.14",
-        "aurora-postgresql": "15.3", "aurora-mysql": "8.0.mysql_aurora.3.10.3",
+        "aurora-postgresql": "17.7", "aurora-mysql": "8.0.mysql_aurora.3.10.3",
     }
     return defaults.get(engine, "15.3")
 
 
-def _unsupported_aurora_mysql_engine_version_error(engine, engine_version):
-    if (
-        engine == "aurora-mysql"
-        and engine_version
-        and engine_version not in AURORA_MYSQL_ENGINE_VERSION_SET
-    ):
-        return _error(
-            "InvalidParameterCombination",
-            f"Cannot find version {engine_version} for aurora-mysql",
-            400,
-        )
-    return None
+def _unsupported_aurora_engine_version_error(engine, engine_version):
+    supported = {
+        "aurora-mysql": AURORA_MYSQL_ENGINE_VERSION_SET,
+        "aurora-postgresql": AURORA_POSTGRESQL_ENGINE_VERSION_SET,
+    }.get(engine)
+    if supported is None or not engine_version or engine_version in supported:
+        return None
+    # Real AWS also accepts a dot-boundary prefix of a creatable version and
+    # resolves it to a concrete minor server-side: aurora-postgresql "16" and
+    # aurora-mysql "8.0" (or "8.0.mysql_aurora.3.04") are all valid inputs.
+    # Ministack stores the prefix as given; the Docker image is derived from
+    # the major, so the running database matches what the prefix requested.
+    if any(version.startswith(engine_version + ".") for version in supported):
+        return None
+    return _error(
+        "InvalidParameterCombination",
+        f"Cannot find version {engine_version} for {engine}",
+        400,
+    )
 
 
 def _mysql_community_major_minor(engine_version):

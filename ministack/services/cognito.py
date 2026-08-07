@@ -38,7 +38,12 @@ Identity Pools operations:
   TagResource, UntagResource, ListTagsForResource.
 
 Data-plane endpoints (path-based, form-encoded):
-  GET  /oauth2/authorize   — redirect to external SAML/OIDC IdP
+  GET  /oauth2/authorize   — redirect to external SAML/OIDC IdP, or serve the Hosted UI
+                             sign-in form (single-page, or multi-step choice-based
+                             sign-in when the client's ExplicitAuthFlows includes
+                             ALLOW_USER_AUTH)
+  POST /login              — process Hosted UI sign-in submissions (single-page or
+                             choice-based) and redirect with an authorization code
   POST /saml2/idpresponse  — receive SAML assertion, create user, issue auth code
   POST /oauth2/token       — exchange authorization_code or client_credentials for tokens
 
@@ -346,6 +351,13 @@ _pending_new_password = {}   # token -> {pool_id, client_id, username, redirect_
                               #           scope, state, response_type, nonce,
                               #           code_challenge, code_challenge_method, expires_at}
 _NEW_PASSWORD_SESSION_TTL = 300  # 5 minutes
+
+# Choice-based sign-in (Hosted UI, ALLOW_USER_AUTH) sessions. Plain dict for the
+# same reason as `_pending_new_password` above — no SigV4 on /login.
+_pending_user_auth = {}   # token -> {pool_id, client_id, username, redirect_uri, scope,
+                          #           state, response_type, nonce, code_challenge,
+                          #           code_challenge_method, available_challenges, expires_at}
+_USER_AUTH_SESSION_TTL = 300  # 5 minutes
 
 # ---------------------------------------------------------------------------
 # In-memory state — CUSTOM_AUTH Challenge Sessions
@@ -2320,6 +2332,8 @@ _DEFAULT_VERIFICATION_MESSAGE = "Your verification code is {####}."
 _DEFAULT_VERIFICATION_LINK_MESSAGE = (
     "Please click the link below to verify your email address. {##Verify Email##}"
 )
+_DEFAULT_EMAIL_OTP_SUBJECT = "Your sign-in code"
+_DEFAULT_EMAIL_OTP_MESSAGE = "Your sign-in code is {####}."
 
 
 def _cognito_email_enabled() -> bool:
@@ -2468,6 +2482,18 @@ def _send_verification_email(pool, username, attr_dict, code, attribute_name="em
         pool, email, subject, body,
         type_name="CognitoVerificationMessage",
         extra={"Username": username, "AttributeName": attribute_name},
+    )
+
+
+def _send_email_otp(pool, username, email, code):
+    """Send the EMAIL_OTP first-factor sign-in code. AWS has no template
+    configuration API for this message, so it always uses the built-in text."""
+    return _deliver_cognito_email(
+        pool, email,
+        _DEFAULT_EMAIL_OTP_SUBJECT,
+        _expand_template(_DEFAULT_EMAIL_OTP_MESSAGE, username, code),
+        type_name="CognitoEmailOtpMessage",
+        extra={"Username": username},
     )
 
 
@@ -4175,19 +4201,35 @@ def _oauth2_error(error: str, description: str, status: int = 400):
     return status, {"Content-Type": "application/json"}, body
 
 
-def _login_page_html(client_id, redirect_uri, scope, state, response_type,
-                     code_challenge="", code_challenge_method="", nonce="",
-                     error_message=""):
-    esc = html_mod.escape
-    err_block = ""
-    if error_message:
-        err_block = f'<div class="error">{esc(error_message)}</div>'
+def _use_choice_based_ui(client) -> bool:
+    """True when the client's ExplicitAuthFlows opts into USER_AUTH (choice-based
+    sign-in), which drives a multi-step Hosted UI instead of the single-page form."""
+    return "ALLOW_USER_AUTH" in client.get("ExplicitAuthFlows", [])
+
+
+_SUPPORTED_FIRST_AUTH_FACTORS = ("PASSWORD", "EMAIL_OTP")
+
+
+def _available_first_auth_factors(pool):
+    """Resolve the first-factor choices for choice-based sign-in from
+    Policies.SignInPolicy.AllowedFirstAuthFactors (default ["PASSWORD"])."""
+    factors = ((pool.get("Policies") or {}).get("SignInPolicy") or {}).get(
+        "AllowedFirstAuthFactors") or ["PASSWORD"]
+    factors = [f for f in factors if f in _SUPPORTED_FIRST_AUTH_FACTORS]
+    # AWS forbids OTP factors when MFA is required, restricting the choice to passwords.
+    if pool.get("MfaConfiguration") == "ON":
+        factors = [f for f in factors if f == "PASSWORD"]
+    return factors or ["PASSWORD"]
+
+
+def _page_shell(title, heading, body_html):
+    """Shared page chrome (CSS + card layout) for all Hosted UI login pages."""
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sign in</title>
+<title>{title}</title>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
@@ -4200,7 +4242,7 @@ input[type=text],input[type=password]{{width:100%;padding:10px 12px;border:1px s
   border-radius:4px;font-size:14px;margin-bottom:16px;outline:none;transition:border-color .15s}}
 input[type=text]:focus,input[type=password]:focus{{border-color:#0073bb;box-shadow:0 0 0 2px rgba(0,115,187,.2)}}
 button{{width:100%;padding:10px;background:#0073bb;color:#fff;border:none;border-radius:4px;
-  font-size:16px;font-weight:500;cursor:pointer;transition:background .15s}}
+  font-size:16px;font-weight:500;cursor:pointer;transition:background .15s;margin-bottom:12px}}
 button:hover{{background:#005a94}}
 .error{{background:#fce8e6;color:#d13212;border:1px solid #d13212;border-radius:4px;
   padding:10px;margin-bottom:16px;font-size:13px;text-align:center}}
@@ -4209,8 +4251,22 @@ button:hover{{background:#005a94}}
 </head>
 <body>
 <div class="card">
-<h1>Sign in</h1>
-{err_block}
+<h1>{heading}</h1>
+{body_html}
+<div class="footer">Powered by ministack</div>
+</div>
+</body>
+</html>"""
+
+
+def _login_page_html(client_id, redirect_uri, scope, state, response_type,
+                     code_challenge="", code_challenge_method="", nonce="",
+                     error_message=""):
+    esc = html_mod.escape
+    err_block = ""
+    if error_message:
+        err_block = f'<div class="error">{esc(error_message)}</div>'
+    body = f"""{err_block}
 <form method="POST" action="/login">
 <input type="hidden" name="client_id" value="{esc(client_id)}">
 <input type="hidden" name="redirect_uri" value="{esc(redirect_uri)}">
@@ -4225,11 +4281,8 @@ button:hover{{background:#005a94}}
 <label for="password">Password</label>
 <input type="password" id="password" name="password" autocomplete="current-password" required>
 <button type="submit">Sign in</button>
-</form>
-<div class="footer">Powered by ministack</div>
-</div>
-</body>
-</html>"""
+</form>"""
+    return _page_shell("Sign in", "Sign in", body)
 
 
 def _new_password_page_html(np_token, error_message=""):
@@ -4237,35 +4290,7 @@ def _new_password_page_html(np_token, error_message=""):
     err_block = ""
     if error_message:
         err_block = f'<div class="error">{esc(error_message)}</div>'
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Change password</title>
-<style>
-*{{margin:0;padding:0;box-sizing:border-box}}
-body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-  background:#f0f2f5;display:flex;justify-content:center;align-items:center;min-height:100vh}}
-.card{{background:#fff;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.1);
-  padding:40px;width:400px;max-width:90vw}}
-h1{{font-size:24px;font-weight:600;color:#232f3e;margin-bottom:24px;text-align:center}}
-label{{display:block;font-size:14px;font-weight:500;color:#545b64;margin-bottom:4px}}
-input[type=password]{{width:100%;padding:10px 12px;border:1px solid #aab7b8;
-  border-radius:4px;font-size:14px;margin-bottom:16px;outline:none;transition:border-color .15s}}
-input[type=password]:focus{{border-color:#0073bb;box-shadow:0 0 0 2px rgba(0,115,187,.2)}}
-button{{width:100%;padding:10px;background:#0073bb;color:#fff;border:none;border-radius:4px;
-  font-size:16px;font-weight:500;cursor:pointer;transition:background .15s}}
-button:hover{{background:#005a94}}
-.error{{background:#fce8e6;color:#d13212;border:1px solid #d13212;border-radius:4px;
-  padding:10px;margin-bottom:16px;font-size:13px;text-align:center}}
-.footer{{text-align:center;margin-top:20px;font-size:12px;color:#879596}}
-</style>
-</head>
-<body>
-<div class="card">
-<h1>Set a new password</h1>
-{err_block}
+    body = f"""{err_block}
 <form method="POST" action="/login">
 <input type="hidden" name="np_token" value="{esc(np_token)}">
 <label for="new_password">New password</label>
@@ -4273,11 +4298,92 @@ button:hover{{background:#005a94}}
 <label for="confirm_password">Confirm new password</label>
 <input type="password" id="confirm_password" name="confirm_password" autocomplete="new-password" required>
 <button type="submit">Update password</button>
-</form>
-<div class="footer">Powered by ministack</div>
-</div>
-</body>
-</html>"""
+</form>"""
+    return _page_shell("Change password", "Set a new password", body)
+
+
+def _username_page_html(client_id, redirect_uri, scope, state, response_type,
+                        code_challenge="", code_challenge_method="", nonce="",
+                        error_message=""):
+    """Step 1 of choice-based sign-in (ALLOW_USER_AUTH): username only."""
+    esc = html_mod.escape
+    err_block = ""
+    if error_message:
+        err_block = f'<div class="error">{esc(error_message)}</div>'
+    body = f"""{err_block}
+<form method="POST" action="/login">
+<input type="hidden" name="auth_flow" value="USER_AUTH">
+<input type="hidden" name="client_id" value="{esc(client_id)}">
+<input type="hidden" name="redirect_uri" value="{esc(redirect_uri)}">
+<input type="hidden" name="scope" value="{esc(scope)}">
+<input type="hidden" name="state" value="{esc(state)}">
+<input type="hidden" name="response_type" value="{esc(response_type)}">
+<input type="hidden" name="code_challenge" value="{esc(code_challenge)}">
+<input type="hidden" name="code_challenge_method" value="{esc(code_challenge_method)}">
+<input type="hidden" name="nonce" value="{esc(nonce)}">
+<label for="username">Username</label>
+<input type="text" id="username" name="username" autocomplete="username" required autofocus>
+<button type="submit">Next</button>
+</form>"""
+    return _page_shell("Sign in", "Sign in", body)
+
+
+_CHALLENGE_LABELS = {
+    "PASSWORD": "Password",
+    "EMAIL_OTP": "Email code",
+}
+
+
+def _select_challenge_page_html(ua_token, available_challenges, error_message=""):
+    """Step 2 of choice-based sign-in: pick an authentication method."""
+    esc = html_mod.escape
+    err_block = ""
+    if error_message:
+        err_block = f'<div class="error">{esc(error_message)}</div>'
+    buttons = "\n".join(
+        f'<button type="submit" name="challenge" value="{esc(c)}">'
+        f'{esc(_CHALLENGE_LABELS.get(c, c))}</button>'
+        for c in available_challenges
+    )
+    body = f"""{err_block}
+<form method="POST" action="/login">
+<input type="hidden" name="ua_token" value="{esc(ua_token)}">
+{buttons}
+</form>"""
+    return _page_shell("Sign in", "Choose how to sign in", body)
+
+
+def _password_page_html(ua_token, username, error_message=""):
+    """Step 3 of choice-based sign-in: password entry."""
+    esc = html_mod.escape
+    err_block = ""
+    if error_message:
+        err_block = f'<div class="error">{esc(error_message)}</div>'
+    body = f"""{err_block}
+<form method="POST" action="/login">
+<input type="hidden" name="ua_token" value="{esc(ua_token)}">
+<label for="password">Password for {esc(username)}</label>
+<input type="password" id="password" name="password" autocomplete="current-password" required autofocus>
+<button type="submit">Sign in</button>
+</form>"""
+    return _page_shell("Sign in", "Sign in", body)
+
+
+def _email_otp_page_html(ua_token, error_message=""):
+    """Step 3 of choice-based sign-in: EMAIL_OTP code entry. The destination
+    email address is intentionally not shown, to avoid user enumeration."""
+    esc = html_mod.escape
+    err_block = ""
+    if error_message:
+        err_block = f'<div class="error">{esc(error_message)}</div>'
+    body = f"""{err_block}
+<form method="POST" action="/login">
+<input type="hidden" name="ua_token" value="{esc(ua_token)}">
+<label for="code">Enter the code we emailed you</label>
+<input type="text" id="code" name="code" inputmode="numeric" autocomplete="one-time-code" required autofocus>
+<button type="submit">Sign in</button>
+</form>"""
+    return _page_shell("Sign in", "Enter verification code", body)
 
 
 # -- /oauth2/authorize (GET) ------------------------------------------------
@@ -4403,10 +4509,16 @@ def handle_oauth2_authorize(method, path, headers, query_params):
     if callback_urls and redirect_uri not in callback_urls:
         return _oauth2_error("invalid_request", f"redirect_uri is not allowed: {redirect_uri}")
 
-    html_body = _login_page_html(
-        client_id, redirect_uri, scope, state, response_type,
-        code_challenge, code_challenge_method, nonce,
-    )
+    if _use_choice_based_ui(client):
+        html_body = _username_page_html(
+            client_id, redirect_uri, scope, state, response_type,
+            code_challenge, code_challenge_method, nonce,
+        )
+    else:
+        html_body = _login_page_html(
+            client_id, redirect_uri, scope, state, response_type,
+            code_challenge, code_challenge_method, nonce,
+        )
     return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
 
 
@@ -4801,6 +4913,73 @@ def _issue_auth_code_redirect(client_id, pool_id, redirect_uri, scope, username,
     return 302, {"Location": location, "Cache-Control": "no-store"}, b""
 
 
+def _hosted_ui_user_status_error(user) -> str:
+    """Disabled/unconfirmed checks shared by every Hosted UI first-factor path
+    (PASSWORD and EMAIL_OTP alike), applied once a user has been resolved."""
+    if not user.get("Enabled", True):
+        return "User is disabled."
+    if user.get("UserStatus") not in ("CONFIRMED", "FORCE_CHANGE_PASSWORD"):
+        return "User is not confirmed."
+    return ""
+
+
+def _authenticate_hosted_ui_user(pool, username, password):
+    """Validate username/password for the Hosted UI login paths.
+
+    Returns (user, error_msg); error_msg is empty on success. "No such user"
+    and "wrong password" intentionally share the same error text so the
+    Hosted UI never reveals whether a username exists by that path alone;
+    the disabled/unconfirmed messages below do distinguish an existing
+    account from a nonexistent one, matching the pre-existing single-page
+    login behavior this helper was extracted from.
+    """
+    user, _err = _resolve_user(pool, username)
+    if _err:
+        return None, "Incorrect username or password."
+    status_error = _hosted_ui_user_status_error(user)
+    if status_error:
+        return None, status_error
+    if user.get("_password") != password:
+        return None, "Incorrect username or password."
+    return user, ""
+
+
+def _extract_oauth_form_params(form: dict) -> dict:
+    """Pull the OAuth2 authorize-request fields that the Hosted UI carries as hidden
+    form fields across its login/username/challenge steps, with their defaults."""
+    return {
+        "client_id": form.get("client_id", ""),
+        "redirect_uri": form.get("redirect_uri", ""),
+        "scope": form.get("scope", ""),
+        "state": form.get("state", ""),
+        "response_type": form.get("response_type", "code"),
+        "code_challenge": form.get("code_challenge", ""),
+        "code_challenge_method": form.get("code_challenge_method", ""),
+        "nonce": form.get("nonce", ""),
+    }
+
+
+def _start_new_password_session(pool_id, client_id, username, redirect_uri, scope, state,
+                                response_type, nonce, code_challenge, code_challenge_method) -> str:
+    """Create a `_pending_new_password` session for a FORCE_CHANGE_PASSWORD user reached
+    via either Hosted UI login path (single-page or choice-based), returning its token."""
+    np_token = secrets.token_urlsafe(24)
+    _pending_new_password[np_token] = {
+        "pool_id": pool_id,
+        "client_id": client_id,
+        "username": username,
+        "redirect_uri": redirect_uri,
+        "scope": scope,
+        "state": state,
+        "response_type": response_type,
+        "nonce": nonce,
+        "code_challenge": code_challenge,
+        "code_challenge_method": code_challenge_method,
+        "expires_at": time.time() + _NEW_PASSWORD_SESSION_TTL,
+    }
+    return np_token
+
+
 def handle_login_submit(method, path, headers, body, query_params):
     """POST /login — process the login form and redirect with auth code."""
     form: dict = {}
@@ -4815,33 +4994,30 @@ def handle_login_submit(method, path, headers, body, query_params):
     if np_token:
         return _handle_new_password_submit(np_token, form)
 
+    ua_token = form.get("ua_token", "")
+    if ua_token:
+        return _handle_user_auth_submit(ua_token, form)
+
+    if form.get("auth_flow") == "USER_AUTH":
+        return _handle_user_auth_start(form)
+
     username = form.get("username", "")
     password = form.get("password", "")
-    client_id = form.get("client_id", "")
-    redirect_uri = form.get("redirect_uri", "")
-    scope = form.get("scope", "")
-    state = form.get("state", "")
-    response_type = form.get("response_type", "code")
-    code_challenge = form.get("code_challenge", "")
-    code_challenge_method = form.get("code_challenge_method", "")
-    nonce = form.get("nonce", "")
+    oauth = _extract_oauth_form_params(form)
+    client_id = oauth["client_id"]
+    redirect_uri = oauth["redirect_uri"]
+    scope = oauth["scope"]
+    state = oauth["state"]
+    response_type = oauth["response_type"]
+    code_challenge = oauth["code_challenge"]
+    code_challenge_method = oauth["code_challenge_method"]
+    nonce = oauth["nonce"]
 
     pool_id, pool, client = _find_pool_by_client_id(client_id)
     if not pool:
         return _oauth2_error("invalid_client", f"Client {client_id} not found.")
 
-    # Authenticate user
-    error_msg = ""
-    user, _err = _resolve_user(pool, username)
-    if _err:
-        user = None
-        error_msg = "Incorrect username or password."
-    elif not user.get("Enabled", True):
-        error_msg = "User is disabled."
-    elif user.get("UserStatus") not in ("CONFIRMED", "FORCE_CHANGE_PASSWORD"):
-        error_msg = "User is not confirmed."
-    elif user.get("_password") != password:
-        error_msg = "Incorrect username or password."
+    user, error_msg = _authenticate_hosted_ui_user(pool, username, password)
 
     if error_msg:
         html_body = _login_page_html(
@@ -4852,26 +5028,137 @@ def handle_login_submit(method, path, headers, body, query_params):
         return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
 
     if user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
-        np_token = secrets.token_urlsafe(24)
-        _pending_new_password[np_token] = {
-            "pool_id": pool_id,
-            "client_id": client_id,
-            "username": user["Username"],
-            "redirect_uri": redirect_uri,
-            "scope": scope,
-            "state": state,
-            "response_type": response_type,
-            "nonce": nonce,
-            "code_challenge": code_challenge,
-            "code_challenge_method": code_challenge_method,
-            "expires_at": time.time() + _NEW_PASSWORD_SESSION_TTL,
-        }
+        np_token = _start_new_password_session(
+            pool_id, client_id, user["Username"], redirect_uri, scope, state,
+            response_type, nonce, code_challenge, code_challenge_method,
+        )
         html_body = _new_password_page_html(np_token)
         return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
 
     return _issue_auth_code_redirect(
         client_id, pool_id, redirect_uri, scope, user["Username"], nonce,
         code_challenge, code_challenge_method, state,
+    )
+
+
+_EMAIL_OTP_CODE = "123456"
+
+
+def _begin_user_auth_challenge(pool, ua_token, session, challenge):
+    """Confirm the chosen first factor for a pending choice-based sign-in
+    session and render its page. For EMAIL_OTP, this is also when the code
+    is generated and mailed; a missing user or email intentionally leaves
+    `otp_code` unset instead of erroring, so the page renders identically
+    either way and verification simply fails later (avoids user enumeration).
+    """
+    session["challenge"] = challenge
+    if challenge == "EMAIL_OTP":
+        user, _err = _resolve_user(pool, session["username"])
+        email = _attr_list_to_dict(user.get("Attributes", [])).get("email") if user else ""
+        if user and email:
+            session["otp_code"] = _EMAIL_OTP_CODE
+            _send_email_otp(pool, session["username"], email, _EMAIL_OTP_CODE)
+        return _email_otp_page_html(ua_token)
+    return _password_page_html(ua_token, session["username"])
+
+
+def _handle_user_auth_start(form):
+    """POST /login with `auth_flow=USER_AUTH` — step 1 of choice-based sign-in.
+
+    Only collects the username. Real Cognito's USER_AUTH flow returns
+    AvailableChallenges regardless of whether the username exists (to avoid
+    user enumeration), so no user lookup happens here.
+    """
+    username = form.get("username", "")
+    oauth = _extract_oauth_form_params(form)
+    client_id = oauth["client_id"]
+
+    pool_id, pool, client = _find_pool_by_client_id(client_id)
+    if not pool:
+        return _oauth2_error("invalid_client", f"Client {client_id} not found.")
+    if not _use_choice_based_ui(client):
+        return _oauth2_error("invalid_request", "USER_AUTH flow not allowed for this client.")
+
+    available_challenges = _available_first_auth_factors(pool)
+    ua_token = secrets.token_urlsafe(24)
+    session = {
+        "pool_id": pool_id,
+        "username": username,
+        "available_challenges": available_challenges,
+        "challenge": "",
+        "expires_at": time.time() + _USER_AUTH_SESSION_TTL,
+        **oauth,
+    }
+    _pending_user_auth[ua_token] = session
+
+    if len(available_challenges) == 1:
+        html_body = _begin_user_auth_challenge(pool, ua_token, session, available_challenges[0])
+    else:
+        html_body = _select_challenge_page_html(ua_token, available_challenges)
+    return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+
+
+def _handle_user_auth_submit(ua_token, form):
+    """POST /login with `ua_token` — steps 2/3 of choice-based sign-in: challenge
+    selection and challenge verification (PASSWORD or EMAIL_OTP)."""
+    session = _pending_user_auth.get(ua_token)
+    if not session or session["expires_at"] < time.time():
+        _pending_user_auth.pop(ua_token, None)
+        return _oauth2_error("invalid_request", "Session has expired. Please sign in again.")
+
+    pool = _get_pool_unscoped(session["pool_id"])
+    if not pool:
+        _pending_user_auth.pop(ua_token, None)
+        return error_response_json("ResourceNotFoundException",
+                                   f"User pool {session['pool_id']} not found.", 400)
+
+    challenge = session["challenge"]
+
+    if not challenge:
+        chosen = form.get("challenge", "")
+        if chosen not in session["available_challenges"]:
+            html_body = _select_challenge_page_html(
+                ua_token, session["available_challenges"],
+                error_message="Invalid authentication method.",
+            )
+            return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+        html_body = _begin_user_auth_challenge(pool, ua_token, session, chosen)
+        return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+
+    if challenge == "PASSWORD":
+        password = form.get("password", "")
+        user, error_msg = _authenticate_hosted_ui_user(pool, session["username"], password)
+        if error_msg:
+            html_body = _password_page_html(ua_token, session["username"], error_message=error_msg)
+            return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+    else:  # EMAIL_OTP
+        code = form.get("code", "")
+        otp_code = session.get("otp_code")
+        if not otp_code or code != otp_code:
+            html_body = _email_otp_page_html(ua_token, error_message="Incorrect code.")
+            return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+        user, _err = _resolve_user(pool, session["username"])
+        status_error = _hosted_ui_user_status_error(user) if user else "Incorrect code."
+        if status_error:
+            html_body = _email_otp_page_html(ua_token, error_message=status_error)
+            return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+
+    if user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
+        np_token = _start_new_password_session(
+            session["pool_id"], session["client_id"], user["Username"],
+            session["redirect_uri"], session["scope"], session["state"],
+            session["response_type"], session["nonce"],
+            session["code_challenge"], session["code_challenge_method"],
+        )
+        _pending_user_auth.pop(ua_token, None)
+        html_body = _new_password_page_html(np_token)
+        return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+
+    _pending_user_auth.pop(ua_token, None)
+    return _issue_auth_code_redirect(
+        session["client_id"], session["pool_id"], session["redirect_uri"], session["scope"],
+        user["Username"], session["nonce"], session["code_challenge"],
+        session["code_challenge_method"], session["state"],
     )
 
 
@@ -5504,3 +5791,4 @@ def reset():
     _refresh_tokens.clear()
     _challenge_sessions.clear()
     _pending_new_password.clear()
+    _pending_user_auth.clear()

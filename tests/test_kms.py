@@ -1308,3 +1308,26 @@ def test_kms_disabled_key_blocks_encrypt(kms_client):
     kms_client.disable_key(KeyId=key_id)
     with pytest.raises(kms_client.exceptions.DisabledException):
         kms_client.encrypt(KeyId=key_id, Plaintext=b"test")
+
+
+def test_kms_create_key_rsa_3072_signs(kms_client):
+    """RSA_3072 is in the CreateKey KeySpec enum and GenerateDataKeyPair already
+    produced RSA_3072 pairs; CreateKey used to reject it."""
+    meta = kms_client.create_key(KeySpec="RSA_3072", KeyUsage="SIGN_VERIFY")["KeyMetadata"]
+    assert meta["KeySpec"] == "RSA_3072"
+    assert "RSASSA_PSS_SHA_256" in meta["SigningAlgorithms"]
+
+    message = b"rsa-3072-message"
+    signature = kms_client.sign(
+        KeyId=meta["KeyId"],
+        Message=message,
+        MessageType="RAW",
+        SigningAlgorithm="RSASSA_PSS_SHA_256",
+    )["Signature"]
+    assert kms_client.verify(
+        KeyId=meta["KeyId"],
+        Message=message,
+        MessageType="RAW",
+        Signature=signature,
+        SigningAlgorithm="RSASSA_PSS_SHA_256",
+    )["SignatureValid"]

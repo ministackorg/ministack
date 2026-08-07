@@ -462,6 +462,77 @@ def test_logs_insights_filter_sort_limit(logs):
     assert r3["statistics"]["recordsScanned"] == 6.0
 
 
+def test_logs_insights_tomillis_bounds_and_max_items(logs):
+    """toMillis(@timestamp) must bound results; GetQueryResults respects maxItems."""
+    import uuid as _uuid
+
+    group = f"/intg/insights-tomillis/{_uuid.uuid4().hex[:8]}"
+    stream = "pod-a"
+    # Fixed epoch ms so query strings stay readable.
+    base_ms = 1_775_000_000_000
+    logs.create_log_group(logGroupName=group)
+    logs.create_log_stream(logGroupName=group, logStreamName=stream)
+    logs.put_log_events(
+        logGroupName=group,
+        logStreamName=stream,
+        logEvents=[
+            {"timestamp": base_ms + 0, "message": "t0"},
+            {"timestamp": base_ms + 1000, "message": "t1"},
+            {"timestamp": base_ms + 2000, "message": "t2"},
+            {"timestamp": base_ms + 3000, "message": "t3"},
+            {"timestamp": base_ms + 4000, "message": "t4"},
+        ],
+    )
+
+    def fields_map(row):
+        return {cell["field"]: cell["value"] for cell in row}
+
+    pivot = base_ms + 2000
+    start_s = (base_ms // 1000) - 60
+    end_s = (base_ms // 1000) + 60
+
+    # After-direction shape used by CWLT surround expand.
+    q_after = logs.start_query(
+        logGroupName=group,
+        startTime=start_s,
+        endTime=end_s,
+        queryString=(
+            f"fields @timestamp, @message, @logStream "
+            f"| filter @logStream = '{stream}' "
+            f"| filter toMillis(@timestamp) >= {pivot} "
+            f"| sort @timestamp asc | limit 10000"
+        ),
+        limit=10000,
+    )
+    page1 = logs.get_query_results(queryId=q_after["queryId"], maxItems=2)
+    rows1 = [fields_map(row) for row in page1["results"]]
+    assert [row["@message"] for row in rows1] == ["t2", "t3"]
+    assert "nextToken" in page1
+    page2 = logs.get_query_results(
+        queryId=q_after["queryId"], maxItems=2, nextToken=page1["nextToken"]
+    )
+    rows2 = [fields_map(row) for row in page2["results"]]
+    assert [row["@message"] for row in rows2] == ["t4"]
+    assert "nextToken" not in page2
+
+    # Before-direction shape: nearest earlier events, not the stream head.
+    q_before = logs.start_query(
+        logGroupName=group,
+        startTime=start_s,
+        endTime=end_s,
+        queryString=(
+            f"fields @timestamp, @message, @logStream "
+            f"| filter @logStream = '{stream}' "
+            f"| filter toMillis(@timestamp) <= {pivot} "
+            f"| sort @timestamp desc | limit 10000"
+        ),
+        limit=10000,
+    )
+    before = logs.get_query_results(queryId=q_before["queryId"], maxItems=2)
+    before_rows = [fields_map(row) for row in before["results"]]
+    assert [row["@message"] for row in before_rows] == ["t2", "t1"]
+
+
 def test_logs_get_log_record_invalid_pointer(logs):
     with pytest.raises(ClientError) as exc:
         logs.get_log_record(logRecordPointer="does-not-exist", unmask=False)

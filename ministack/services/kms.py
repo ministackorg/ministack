@@ -185,7 +185,7 @@ def _arn(key_id):
 
 
 def _key_metadata(rec):
-    return {
+    meta = {
         "KeyId": rec["KeyId"],
         "Arn": rec["Arn"],
         "CreationDate": rec["CreationDate"],
@@ -200,6 +200,11 @@ def _key_metadata(rec):
         "EncryptionAlgorithms": rec.get("EncryptionAlgorithms", []),
         "SigningAlgorithms": rec.get("SigningAlgorithms", []),
     }
+    # "This value is present only when the KMS key is scheduled for deletion,
+    # that is, when its KeyState is PendingDeletion."
+    if "DeletionDate" in rec:
+        meta["DeletionDate"] = rec["DeletionDate"]
+    return meta
 
 
 def _key_ref_from_arn(key_id_or_arn):
@@ -312,13 +317,12 @@ def _create_key(data):
         rec["_symmetric_key"] = os.urandom(32)
         rec["EncryptionAlgorithms"] = ["SYMMETRIC_DEFAULT"]
         rec["SigningAlgorithms"] = []
-    elif key_spec in ("RSA_2048", "RSA_4096"):
+    elif key_spec in ("RSA_2048", "RSA_3072", "RSA_4096"):
         err = _require_crypto("CreateKey")
         if err:
             return err
-        bits = 2048 if key_spec == "RSA_2048" else 4096
         private_key = rsa.generate_private_key(
-            public_exponent=65537, key_size=bits
+            public_exponent=65537, key_size=int(key_spec.split("_")[1])
         )
         rec["_private_key"] = private_key
         rec["_public_key_der"] = private_key.public_key().public_bytes(
@@ -898,8 +902,7 @@ def _generate_data_key_pair_common(data, action):
     and nothing else.
 
     KeyPairSpec follows the real AWS enum, minus SM2 (which _create_key does not
-    implement either). Note this is a superset of _create_key's asymmetric specs:
-    _create_key still lacks RSA_3072, a pre-existing gap not repeated here.
+    implement either). The asymmetric specs now match _create_key's exactly.
     """
     key_id = data.get("KeyId", "")
     rec = _resolve_key(key_id)
