@@ -5,6 +5,7 @@ Supports: CreateLogGroup, DeleteLogGroup, DescribeLogGroups,
           CreateLogStream, DeleteLogStream, DescribeLogStreams,
           PutLogEvents, GetLogEvents, FilterLogEvents, GetLogRecord, StartLiveTail,
           PutRetentionPolicy, DeleteRetentionPolicy,
+          PutResourcePolicy, DescribeResourcePolicies, DeleteResourcePolicy,
           PutSubscriptionFilter, DeleteSubscriptionFilter, DescribeSubscriptionFilters,
           TagLogGroup, UntagLogGroup, ListTagsLogGroup,
           TagResource, UntagResource, ListTagsForResource,
@@ -62,6 +63,9 @@ _log_groups = AccountRegionScopedDict()
 # carries an ARN, so legacy account-scoped state migrates to its ARN's region.
 _destinations = AccountRegionScopedDict()
 # dest_name -> {destinationName, targetArn, roleArn, accessPolicy, arn, creationTime}
+
+_resource_policies = AccountRegionScopedDict()
+# policy_name -> {policyName, policyDocument, lastUpdatedTime}
 
 _metric_filters = AccountRegionScopedDict()
 # (log_group_name, filter_name) -> {filterName, logGroupName, filterPattern, metricTransformations, creationTime}
@@ -296,6 +300,9 @@ async def handle_request(method, path, headers, body, query_params):
         "StartLiveTail": _start_live_tail,
         "PutRetentionPolicy": _put_retention_policy,
         "DeleteRetentionPolicy": _delete_retention_policy,
+        "PutResourcePolicy": _put_resource_policy,
+        "DescribeResourcePolicies": _describe_resource_policies,
+        "DeleteResourcePolicy": _delete_resource_policy,
         "PutSubscriptionFilter": _put_subscription_filter,
         "DeleteSubscriptionFilter": _delete_subscription_filter,
         "DescribeSubscriptionFilters": _describe_subscription_filters,
@@ -1402,6 +1409,57 @@ def _put_destination_policy(data):
 
 
 # ---------------------------------------------------------------------------
+# Resource Policies
+# ---------------------------------------------------------------------------
+
+# AWS allows 10 resource policies per account per region, and the limit is not
+# adjustable — the 11th PutResourcePolicy fails with LimitExceededException.
+# Enforced so fleet designs that consume one policy per resource hit the same
+# wall here they would hit in production.
+_MAX_RESOURCE_POLICIES = 10
+
+
+def _put_resource_policy(data):
+    name = data.get("policyName")
+    document = data.get("policyDocument")
+    if not name or not document:
+        return error_response_json(
+            "InvalidParameterException", "policyName and policyDocument are required.", 400,
+        )
+    try:
+        json.loads(document)
+    except (TypeError, json.JSONDecodeError):
+        return error_response_json(
+            "InvalidParameterException", "policyDocument is not valid JSON.", 400,
+        )
+    if name not in _resource_policies and len(_resource_policies) >= _MAX_RESOURCE_POLICIES:
+        return error_response_json("LimitExceededException", "Resource limit exceeded.", 400)
+    policy = {
+        "policyName": name,
+        "policyDocument": document,
+        "lastUpdatedTime": int(time.time() * 1000),
+    }
+    _resource_policies[name] = policy
+    return json_response({"resourcePolicy": policy})
+
+
+def _describe_resource_policies(data):
+    return json_response({
+        "resourcePolicies": [_resource_policies[n] for n in sorted(_resource_policies)],
+    })
+
+
+def _delete_resource_policy(data):
+    name = data.get("policyName")
+    if name not in _resource_policies:
+        return error_response_json(
+            "ResourceNotFoundException", f"Policy with name [{name}] does not exist", 400,
+        )
+    del _resource_policies[name]
+    return json_response({})
+
+
+# ---------------------------------------------------------------------------
 # Metric Filters
 # ---------------------------------------------------------------------------
 
@@ -1804,6 +1862,7 @@ def _stop_query(data):
 def reset():
     _log_groups.clear()
     _destinations.clear()
+    _resource_policies.clear()
     _metric_filters.clear()
     _queries.clear()
     _log_records.clear()

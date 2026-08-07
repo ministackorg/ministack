@@ -1162,6 +1162,10 @@ def _invoke_target(target, event, rule):
         "detail": json.loads(event["Detail"]) if isinstance(event["Detail"], str) else event["Detail"],
     })
 
+    # The pre-input-selection envelope. DLQ deliveries carry the ORIGINAL
+    # event, never the transformed target input.
+    envelope_payload = event_payload
+
     target_input_payload = None
     input_transformer = target.get("InputTransformer")
     if input_transformer:
@@ -1191,7 +1195,7 @@ def _invoke_target(target, event, rule):
             return
 
         if spec.service == "events" and spec.resource.startswith("api-destination/"):
-            _dispatch_to_api_destination(spec, event_payload, target)
+            _dispatch_to_api_destination(spec, event_payload, target, rule, envelope_payload)
         elif spec.service == "events":
             _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload)
         elif spec.service == "states":
@@ -1213,6 +1217,8 @@ def _invoke_target(target, event, rule):
             _dispatch_to_sqs(spec, event_payload, target.get("SqsParameters") or {})
         elif spec.service == "sns":
             _dispatch_to_sns(arn, event_payload)
+        elif spec.service == "logs":
+            _dispatch_to_logs(spec, event_payload)
         else:
             logger.warning("EventBridge: unsupported target type for ARN %s", arn)
     except Exception as e:
@@ -1524,12 +1530,13 @@ def _merge_body_parameters(payload: str, body_params: dict) -> str:
 
 def _fetch_oauth_token(oauth: dict) -> dict:
     """client_credentials exchange against the connection's authorization
-    endpoint: ClientID/ClientSecret ride the request body (query for GET),
-    OAuthHttpParameters contribute extra header/query/body parameters, and
-    ``access_token`` / ``token_type`` / ``expires_in`` are read from the JSON
-    response. ``grant_type`` defaults to ``client_credentials`` when
-    OAuthHttpParameters does not set one — AWS's own examples pass it
-    explicitly through body parameters."""
+    endpoint. Real EventBridge authenticates the token request with **HTTP
+    Basic auth** (``ClientID:ClientSecret``) and contributes nothing else —
+    ``grant_type``/``audience``/``scope`` reach the request only through the
+    connection's OAuthHttpParameters (header/query/body), exactly as
+    configured. ``access_token`` / ``token_type`` / ``expires_in`` are read
+    from the JSON response."""
+    import base64 as _b64
     import urllib.parse
     import urllib.request
 
@@ -1537,12 +1544,9 @@ def _fetch_oauth_token(oauth: dict) -> dict:
     client = oauth.get("ClientParameters") or {}
     http_params = oauth.get("OAuthHttpParameters") or {}
     headers = _connection_params_map(http_params.get("HeaderParameters"))
-    form = {
-        "grant_type": "client_credentials",
-        "client_id": client.get("ClientID", ""),
-        "client_secret": client.get("ClientSecret", ""),
-    }
-    form.update(_connection_params_map(http_params.get("BodyParameters")))
+    raw = f"{client.get('ClientID', '')}:{client.get('ClientSecret', '')}".encode("utf-8")
+    headers["Authorization"] = "Basic " + _b64.b64encode(raw).decode("ascii")
+    form = _connection_params_map(http_params.get("BodyParameters"))
     url = _merge_query(
         oauth.get("AuthorizationEndpoint", ""),
         _connection_params_map(http_params.get("QueryStringParameters")),
@@ -1550,7 +1554,7 @@ def _fetch_oauth_token(oauth: dict) -> dict:
     data = None
     if method == "GET":
         url = _merge_query(url, form)
-    else:
+    elif form:
         data = urllib.parse.urlencode(form).encode("utf-8")
         headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
@@ -1658,7 +1662,73 @@ def _api_destination_send_sync(request: dict, auth_headers: dict) -> int:
         return exc.code
 
 
-def _deliver_to_api_destination(name: str, request: dict, conn: dict, token_key):
+def _resolve_target_dlq(target, rule, envelope_payload):
+    """Resolve the target's DeadLetterConfig into a delivery context while the
+    request scope is still available (worker threads cannot read the
+    account/region-scoped stores). Returns None when no usable DLQ is
+    configured."""
+    arn = ((target.get("DeadLetterConfig") or {}).get("Arn") or "").strip()
+    if not arn:
+        return None
+    from ministack.services import sqs as _sqs
+
+    queue = _sqs._queue_by_arn(arn)
+    if queue is None:
+        logger.warning("EventBridge → DLQ: queue %s not found; failed deliveries will be dropped", arn)
+        return None
+    if queue.get("is_fifo"):
+        # AWS parity: EventBridge dead-letter queues must be standard queues.
+        logger.warning("EventBridge → DLQ: %s is a FIFO queue, which EventBridge does not support; ignored", arn)
+        return None
+    return {
+        "queue": queue,
+        "rule_arn": _rule_arn(rule.get("Name", ""), rule.get("EventBusName", "default")),
+        "target_arn": target.get("Arn", ""),
+        "event": envelope_payload,
+    }
+
+
+def _send_to_target_dlq(dlq, error_code: str, error_message: str, exhausted: str | None = None):
+    """Deliver one failed event to the target's dead-letter queue with the
+    message attributes real EventBridge stamps (RULE_ARN / TARGET_ARN /
+    ERROR_CODE / ERROR_MESSAGE / RETRY_ATTEMPTS, plus EXHAUSTED_RETRY_CONDITION
+    when the retry policy ran out). The body is the ORIGINAL event envelope.
+    Appends to the pre-resolved queue record — safe from the delivery worker
+    thread, the same cross-thread append the replay thread already performs."""
+    from ministack.services import sqs as _sqs
+
+    attrs = {
+        "RULE_ARN": {"DataType": "String", "StringValue": dlq["rule_arn"]},
+        "TARGET_ARN": {"DataType": "String", "StringValue": dlq["target_arn"]},
+        "ERROR_CODE": {"DataType": "String", "StringValue": error_code},
+        "ERROR_MESSAGE": {"DataType": "String", "StringValue": (error_message or "")[:1024]},
+        "RETRY_ATTEMPTS": {"DataType": "Number", "StringValue": "0"},
+    }
+    if exhausted:
+        attrs["EXHAUSTED_RETRY_CONDITION"] = {"DataType": "String", "StringValue": exhausted}
+    body = dlq["event"]
+    now = time.time()
+    msg = {
+        "id": new_uuid(),
+        "body": body,
+        "md5_body": hashlib.md5(body.encode()).hexdigest(),
+        "message_attributes": attrs,
+        "md5_attrs": _sqs._md5_msg_attrs(attrs),
+        "receipt_handle": None,
+        "sent_at": now,
+        "visible_at": now,
+        "receive_count": 0,
+        "attributes": {},
+        "sys": {"SenderId": "AROAEXAMPLE", "SentTimestamp": str(int(now * 1000))},
+    }
+    queue = dlq["queue"]
+    queue["messages"].append(msg)
+    if hasattr(_sqs, "_ensure_msg_fields"):
+        _sqs._ensure_msg_fields(queue["messages"][-1])
+    logger.info("EventBridge → DLQ: event sent (%s)", error_code)
+
+
+def _deliver_to_api_destination(name: str, request: dict, conn: dict, token_key, dlq=None):
     is_oauth = conn.get("AuthorizationType") == "OAUTH_CLIENT_CREDENTIALS"
     try:
         status = _api_destination_send_sync(request, _connection_auth_headers(conn, token_key))
@@ -1670,24 +1740,34 @@ def _deliver_to_api_destination(name: str, request: dict, conn: dict, token_key)
             )
     except Exception as exc:
         logger.warning("EventBridge → API destination %s delivery failed: %s", name, exc)
+        if dlq is not None:
+            code = "TIMEOUT" if isinstance(exc, TimeoutError) or "timed out" in str(exc) else "CONNECTION_FAILURE"
+            _send_to_target_dlq(dlq, code, str(exc), exhausted="MaximumRetryAttempts")
         return
     if 200 <= status < 300:
         logger.info("EventBridge → API destination %s: HTTP %s", name, status)
     elif status in (401, 407, 409, 429) or status >= 500:
         # AWS parity: these statuses re-enter the 24h/185-attempt retry pipeline
-        # (DLQ on exhaustion, Retry-After honored). MiniStack does not model
-        # that queue — the same policy as cross-region FailedInvocations — so
-        # the outcome is logged and the event dropped.
+        # (Retry-After honored). MiniStack does not model that queue — the same
+        # policy as cross-region FailedInvocations — so the delivery collapses
+        # to one attempt and, when a DLQ is configured, dead-letters immediately
+        # with the exhausted-retry condition it would eventually carry.
         logger.warning(
-            "EventBridge → API destination %s: retryable HTTP %s (retry pipeline not modeled; dropped)",
+            "EventBridge → API destination %s: retryable HTTP %s (retry pipeline not modeled)",
             name,
             status,
         )
+        if dlq is not None:
+            _send_to_target_dlq(dlq, "ERROR_FROM_TARGET", f"HTTP {status}", exhausted="MaximumRetryAttempts")
     else:
-        logger.warning("EventBridge → API destination %s: HTTP %s (not retryable; dropped)", name, status)
+        logger.warning("EventBridge → API destination %s: HTTP %s (not retryable)", name, status)
+        if dlq is not None:
+            # Real EventBridge sends non-retryable failures straight to the DLQ
+            # without retry attempts.
+            _send_to_target_dlq(dlq, "ERROR_FROM_TARGET", f"HTTP {status}")
 
 
-def _dispatch_to_api_destination(spec, payload, target):
+def _dispatch_to_api_destination(spec, payload, target, rule, envelope_payload):
     if spec.account_id != get_account_id() or spec.region != get_region():
         logger.warning(
             "EventBridge → API destination: %s is outside the current account/region scope", spec
@@ -1699,14 +1779,17 @@ def _dispatch_to_api_destination(spec, payload, target):
     if not dest:
         logger.warning("EventBridge → API destination: %s not found", name)
         return
+    dlq = _resolve_target_dlq(target, rule, envelope_payload)
     if dest.get("ApiDestinationState") != "ACTIVE":
-        # Real EventBridge does not invoke INACTIVE destinations; the delivery
-        # fails into the retry pipeline instead. Log-and-drop, as above.
+        # Real EventBridge fails deliveries to a non-ACTIVE destination into
+        # the retry pipeline; with a DLQ configured they surface there.
         logger.warning(
             "EventBridge → API destination %s: state %s; not invoked",
             name,
             dest.get("ApiDestinationState"),
         )
+        if dlq is not None:
+            _send_to_target_dlq(dlq, "NO_RESOURCE", f"API destination {name} is not ACTIVE")
         return
     conn_name = (dest.get("ConnectionArn") or "").rsplit("/", 1)[-1]
     conn = _connections.get(conn_name) if conn_name else None
@@ -1714,6 +1797,8 @@ def _dispatch_to_api_destination(spec, payload, target):
         logger.warning(
             "EventBridge → API destination %s: connection %s not found", name, conn_name or "<unset>"
         )
+        if dlq is not None:
+            _send_to_target_dlq(dlq, "NO_RESOURCE", f"Connection {conn_name or '<unset>'} not found")
         return
     # InvocationRateLimitPerSecond is accepted at CreateApiDestination but not
     # enforced here — MiniStack delivers immediately and does not model the
@@ -1725,9 +1810,36 @@ def _dispatch_to_api_destination(spec, payload, target):
     # the destination endpoint.
     threading.Thread(
         target=_deliver_to_api_destination,
-        args=(name, request, copy.deepcopy(conn), token_key),
+        args=(name, request, copy.deepcopy(conn), token_key, dlq),
         daemon=True,
     ).start()
+
+
+def _dispatch_to_logs(spec, payload):
+    """Deliver one matched event into a CloudWatch Logs log-group target. Real
+    EventBridge creates an opaque-named log stream and writes the (input-
+    selected) event as the log line; authorization via the logs resource
+    policy is not enforced here (MiniStack IAM is permissive)."""
+    from ministack.services import cloudwatch_logs as _logs
+
+    resource = spec.resource  # "log-group:<name>" or "log-group:<name>:*"
+    if not resource.startswith("log-group:"):
+        logger.warning("EventBridge → CloudWatch Logs: unsupported target ARN %s", spec)
+        return
+    group_name = resource[len("log-group:"):]
+    if group_name.endswith(":*"):
+        group_name = group_name[:-2]
+    if group_name not in _logs._log_groups:
+        logger.warning("EventBridge → CloudWatch Logs: log group %s not found", group_name)
+        return
+    stream_name = new_uuid()
+    _logs._create_log_stream({"logGroupName": group_name, "logStreamName": stream_name})
+    _logs._put_log_events({
+        "logGroupName": group_name,
+        "logStreamName": stream_name,
+        "logEvents": [{"timestamp": int(time.time() * 1000), "message": payload}],
+    })
+    logger.info("EventBridge → CloudWatch Logs %s: dispatched", group_name)
 
 
 # ---------------------------------------------------------------------------
@@ -1777,6 +1889,15 @@ def _create_archive(data):
     name = data.get("ArchiveName")
     if not name:
         return error_response_json("ValidationException", "ArchiveName is required", 400)
+    if len(name) > 48:
+        # AWS caps archive names at 48 chars (a 49-char name draws this
+        # ValidationException from the live API).
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{name}' at 'archiveName' failed to satisfy constraint: "
+            "Member must have length less than or equal to 48",
+            400,
+        )
     if name in _archives:
         return error_response_json("ResourceAlreadyExistsException", f"Archive {name} already exists", 400)
 
@@ -1794,6 +1915,8 @@ def _create_archive(data):
         "EventCount": 0,
         "SizeBytes": 0,
     }
+    if "KmsKeyIdentifier" in data:
+        _archives[name]["KmsKeyIdentifier"] = data["KmsKeyIdentifier"]
     return json_response({"ArchiveArn": arn, "State": "ENABLED", "CreationTime": _archives[name]["CreationTime"]})
 
 
@@ -1810,7 +1933,14 @@ def _describe_archive(data):
     archive = _archives.get(name)
     if not archive:
         return error_response_json("ResourceNotFoundException", f"Archive {name} does not exist.", 400)
-    return json_response(archive)
+    # Explicit response shape: the stored record also carries the captured
+    # events (replay's source of truth), which the API never returns.
+    fields = (
+        "ArchiveArn", "ArchiveName", "EventSourceArn", "Description", "EventPattern",
+        "State", "StateReason", "RetentionDays", "SizeBytes", "EventCount",
+        "CreationTime", "LastUpdatedTime", "KmsKeyIdentifier",
+    )
+    return json_response({k: archive[k] for k in fields if k in archive})
 
 
 def _update_archive(data):
@@ -1837,6 +1967,8 @@ def _update_archive(data):
         archive["EventPattern"] = ep
     if "RetentionDays" in data:
         archive["RetentionDays"] = int(data["RetentionDays"])
+    if "KmsKeyIdentifier" in data:
+        archive["KmsKeyIdentifier"] = data["KmsKeyIdentifier"]
 
     archive["LastUpdatedTime"] = _now_ts()
     return json_response({
@@ -2270,16 +2402,132 @@ def _remove_permission(data):
 # Connections
 # ---------------------------------------------------------------------------
 
+def _upsert_connection_secret(conn_name: str, auth_parameters: dict, existing: dict | None = None) -> dict:
+    """Create (or refresh) the Secrets Manager secret backing a connection,
+    mirroring real EventBridge: the authorization parameters are stored in a
+    service-owned secret named ``events!connection/<name>/<uuid>`` whose ARN
+    surfaces as ``SecretArn`` on Create/Describe/Update responses."""
+    from ministack.services import secretsmanager as _sm
+
+    now = int(time.time())
+    value = json.dumps(auth_parameters or {})
+    if existing and existing.get("SecretName") in _sm._secrets:
+        record = _sm._secrets[existing["SecretName"]]
+        for version in record["Versions"].values():
+            version["Stages"] = [s for s in version["Stages"] if s != "AWSCURRENT"]
+        record["Versions"][new_uuid()] = {
+            "SecretString": value,
+            "SecretBinary": None,
+            "CreatedDate": now,
+            "Stages": ["AWSCURRENT"],
+        }
+        record["LastChangedDate"] = now
+        return {"SecretArn": record["ARN"], "SecretName": record["Name"]}
+
+    secret_name = f"events!connection/{conn_name}/{new_uuid()}"
+    arn = f"arn:aws:secretsmanager:{get_region()}:{get_account_id()}:secret:{secret_name}-{new_uuid()[:6]}"
+    _sm._secrets[secret_name] = {
+        "ARN": arn,
+        "Name": secret_name,
+        "Description": f"Auth parameters for EventBridge connection {conn_name}",
+        "Tags": [],
+        "CreatedDate": now,
+        "LastChangedDate": now,
+        "LastAccessedDate": None,
+        "DeletedDate": None,
+        "RotationEnabled": False,
+        "RotationLambdaARN": None,
+        "RotationRules": None,
+        "KmsKeyId": None,
+        "ReplicationStatus": [],
+        "Versions": {
+            new_uuid(): {
+                "SecretString": value,
+                "SecretBinary": None,
+                "CreatedDate": now,
+                "Stages": ["AWSCURRENT"],
+            }
+        },
+    }
+    return {"SecretArn": arn, "SecretName": secret_name}
+
+
+def _delete_connection_secret(conn: dict):
+    from ministack.services import secretsmanager as _sm
+
+    secret_name = conn.get("SecretName")
+    if secret_name:
+        _sm._secrets.pop(secret_name, None)
+
+
+def _sanitized_connection_http_parameters(params) -> dict:
+    """Response-shape parity for ConnectionHttpParameters: values flagged
+    ``IsValueSecret`` are never returned by Describe."""
+    out = {}
+    for field in ("HeaderParameters", "QueryStringParameters", "BodyParameters"):
+        items = (params or {}).get(field)
+        if not items:
+            continue
+        sanitized = []
+        for item in items:
+            entry = {"Key": item.get("Key", ""), "IsValueSecret": bool(item.get("IsValueSecret"))}
+            if not entry["IsValueSecret"]:
+                entry["Value"] = item.get("Value", "")
+            sanitized.append(entry)
+        out[field] = sanitized
+    return out
+
+
+def _sanitized_auth_parameters(conn: dict) -> dict:
+    """DescribeConnection response parity: AWS returns the
+    ConnectionAuthResponseParameters shape, which carries NO secret material —
+    only Username / ApiKeyName / ClientID survive, and http-parameter values
+    marked secret are stripped. The raw request-shape parameters stay on the
+    stored record for dispatch."""
+    params = conn.get("AuthParameters") or {}
+    out = {}
+    basic = params.get("BasicAuthParameters")
+    if basic:
+        out["BasicAuthParameters"] = {"Username": basic.get("Username", "")}
+    api_key = params.get("ApiKeyAuthParameters")
+    if api_key:
+        out["ApiKeyAuthParameters"] = {"ApiKeyName": api_key.get("ApiKeyName", "")}
+    oauth = params.get("OAuthParameters")
+    if oauth:
+        entry = {
+            "AuthorizationEndpoint": oauth.get("AuthorizationEndpoint", ""),
+            "HttpMethod": oauth.get("HttpMethod", ""),
+            "ClientParameters": {"ClientID": (oauth.get("ClientParameters") or {}).get("ClientID", "")},
+        }
+        if oauth.get("OAuthHttpParameters"):
+            entry["OAuthHttpParameters"] = _sanitized_connection_http_parameters(oauth["OAuthHttpParameters"])
+        out["OAuthParameters"] = entry
+    if params.get("InvocationHttpParameters"):
+        out["InvocationHttpParameters"] = _sanitized_connection_http_parameters(params["InvocationHttpParameters"])
+    return out
+
+
 def _create_connection(data):
     name = data.get("Name")
     if not name:
         return error_response_json("ValidationException", "Name is required", 400)
+    if len(name) > 64:
+        # AWS caps connection names at 64 chars and rejects at the API, not in
+        # the SDK — mirrored here so plan-time guards built on that behavior
+        # stay honest.
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{name}' at 'name' failed to satisfy constraint: "
+            "Member must have length less than or equal to 64",
+            400,
+        )
     if name in _connections:
         return error_response_json("ResourceAlreadyExistsException",
                                    f"Connection {name} already exists", 400)
 
     arn = f"arn:aws:events:{get_region()}:{get_account_id()}:connection/{name}"
     now = _now_ts()
+    secret = _upsert_connection_secret(name, data.get("AuthParameters", {}))
     _connections[name] = {
         "Name": name,
         "ConnectionArn": arn,
@@ -2287,10 +2535,14 @@ def _create_connection(data):
         "AuthorizationType": data.get("AuthorizationType", ""),
         "AuthParameters": data.get("AuthParameters", {}),
         "Description": data.get("Description", ""),
+        "SecretArn": secret["SecretArn"],
+        "SecretName": secret["SecretName"],
         "CreationTime": now,
         "LastModifiedTime": now,
         "LastAuthorizedTime": now,
     }
+    if "KmsKeyIdentifier" in data:
+        _connections[name]["KmsKeyIdentifier"] = data["KmsKeyIdentifier"]
     return json_response({
         "ConnectionArn": arn,
         "ConnectionState": "AUTHORIZED",
@@ -2304,7 +2556,22 @@ def _describe_connection(data):
     if not conn:
         return error_response_json("ResourceNotFoundException",
                                    f"Connection {name} does not exist.", 400)
-    return json_response(conn)
+    out = {
+        "Name": conn["Name"],
+        "ConnectionArn": conn["ConnectionArn"],
+        "ConnectionState": conn["ConnectionState"],
+        "AuthorizationType": conn["AuthorizationType"],
+        "AuthParameters": _sanitized_auth_parameters(conn),
+        "Description": conn.get("Description", ""),
+        "CreationTime": conn["CreationTime"],
+        "LastModifiedTime": conn["LastModifiedTime"],
+        "LastAuthorizedTime": conn.get("LastAuthorizedTime", conn["CreationTime"]),
+    }
+    if conn.get("SecretArn"):
+        out["SecretArn"] = conn["SecretArn"]
+    if "KmsKeyIdentifier" in conn:
+        out["KmsKeyArn"] = conn["KmsKeyIdentifier"]
+    return json_response(out)
 
 
 def _delete_connection(data):
@@ -2313,6 +2580,7 @@ def _delete_connection(data):
     if not conn:
         return error_response_json("ResourceNotFoundException",
                                    f"Connection {name} does not exist.", 400)
+    _delete_connection_secret(conn)
     return json_response({
         "ConnectionArn": conn["ConnectionArn"],
         "ConnectionState": "DELETING",
@@ -2349,9 +2617,13 @@ def _update_connection(data):
                                    f"Connection {name} does not exist.", 400)
     conn = _connections[name]
     now = _now_ts()
-    for key in ("AuthorizationType", "AuthParameters", "Description"):
+    for key in ("AuthorizationType", "AuthParameters", "Description", "KmsKeyIdentifier"):
         if key in data:
             conn[key] = data[key]
+    if "AuthParameters" in data:
+        secret = _upsert_connection_secret(name, conn["AuthParameters"], existing=conn)
+        conn["SecretArn"] = secret["SecretArn"]
+        conn["SecretName"] = secret["SecretName"]
     conn["LastModifiedTime"] = now
     conn["ConnectionState"] = "AUTHORIZED"
     conn["LastAuthorizedTime"] = now
@@ -2390,6 +2662,15 @@ def _create_api_destination(data):
     name = data.get("Name")
     if not name:
         return error_response_json("ValidationException", "Name is required", 400)
+    if len(name) > 64:
+        # AWS caps API destination names at 64 chars and rejects at the API,
+        # not in the SDK — mirrored for plan-time guards built on it.
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{name}' at 'name' failed to satisfy constraint: "
+            "Member must have length less than or equal to 64",
+            400,
+        )
     if name in _api_destinations:
         return error_response_json("ResourceAlreadyExistsException",
                                    f"ApiDestination {name} already exists", 400)

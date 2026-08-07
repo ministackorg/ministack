@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 import os
@@ -3109,7 +3110,10 @@ def test_eventbridge_api_destination_oauth_client_credentials(eb):
                     "HttpMethod": "POST",
                     "ClientParameters": {"ClientID": "cid", "ClientSecret": "csec"},
                     "OAuthHttpParameters": {
-                        "BodyParameters": [{"Key": "audience", "Value": "https://api.example.test"}]
+                        "BodyParameters": [
+                            {"Key": "grant_type", "Value": "client_credentials"},
+                            {"Key": "audience", "Value": "https://api.example.test"},
+                        ]
                     },
                 }
             },
@@ -3129,11 +3133,15 @@ def test_eventbridge_api_destination_oauth_client_credentials(eb):
         assert len(token_requests) == 1
         token_req = token_requests[0]
         assert token_req["path"] == "/oauth/token"
+        # Real EventBridge authenticates the token request with HTTP Basic auth
+        # (ClientID:ClientSecret); the body carries only OAuthHttpParameters.
+        expected_basic = "Basic " + base64.b64encode(b"cid:csec").decode("ascii")
+        assert token_req["headers"]["authorization"] == expected_basic
         assert token_req["headers"]["content-type"] == "application/x-www-form-urlencoded"
-        assert token_req["form"]["grant_type"] == "client_credentials"
-        assert token_req["form"]["client_id"] == "cid"
-        assert token_req["form"]["client_secret"] == "csec"
-        assert token_req["form"]["audience"] == "https://api.example.test"
+        assert token_req["form"] == {
+            "grant_type": "client_credentials",
+            "audience": "https://api.example.test",
+        }
         assert captured[0]["headers"]["authorization"] == "Bearer tok-1"
         assert captured[1]["headers"]["authorization"] == "Bearer tok-1"
     finally:
@@ -3175,3 +3183,197 @@ def test_eventbridge_api_destination_oauth_refresh_on_401(eb):
     finally:
         issuer.shutdown()
         server.shutdown()
+
+
+def test_eventbridge_api_destination_failed_delivery_lands_in_dlq(eb, sqs):
+    """A failed delivery dead-letters the ORIGINAL event with the AWS message attributes."""
+    server, captured = _start_api_dest_capture_server(status_plan=[500])
+    try:
+        port = server.server_address[1]
+        q_url = sqs.create_queue(QueueName="qa-eb-apidest-dlq-q")["QueueUrl"]
+        q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "dlq",
+            f"http://127.0.0.1:{port}/webhook",
+            "API_KEY",
+            {"ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "k-1"}},
+            target_extras={
+                "InputPath": "$.detail",
+                "DeadLetterConfig": {"Arn": q_arn},
+                "RetryPolicy": {"MaximumRetryAttempts": 2, "MaximumEventAgeInSeconds": 3600},
+            },
+        )
+        eb.put_events(Entries=[{
+            "Source": source,
+            "DetailType": "Ping",
+            "Detail": json.dumps({"n": 1}),
+            "EventBusName": bus_name,
+        }])
+
+        assert _wait_until(lambda: len(captured) >= 1)
+        messages = []
+
+        def _drain():
+            resp = sqs.receive_message(
+                QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1, MessageAttributeNames=["All"]
+            )
+            messages.extend(resp.get("Messages", []))
+            return len(messages) >= 1
+
+        assert _wait_until(_drain)
+        msg = messages[0]
+        # The DLQ body is the ORIGINAL envelope, not the InputPath-selected input.
+        body = json.loads(msg["Body"])
+        assert body["source"] == source
+        assert body["detail"] == {"n": 1}
+        attrs = msg["MessageAttributes"]
+        assert attrs["ERROR_CODE"]["StringValue"] == "ERROR_FROM_TARGET"
+        assert attrs["EXHAUSTED_RETRY_CONDITION"]["StringValue"] == "MaximumRetryAttempts"
+        assert attrs["RULE_ARN"]["StringValue"].startswith("arn:aws:events:")
+        assert ":rule/" in attrs["RULE_ARN"]["StringValue"]
+        assert attrs["TARGET_ARN"]["StringValue"].startswith("arn:aws:events:")
+        assert ":api-destination/" in attrs["TARGET_ARN"]["StringValue"]
+        assert "ERROR_MESSAGE" in attrs
+    finally:
+        server.shutdown()
+
+
+def test_eventbridge_connection_secret_arn_and_sanitized_describe(eb, sm):
+    conn_name = "qa-eb-conn-secret"
+    eb.create_connection(
+        Name=conn_name,
+        AuthorizationType="OAUTH_CLIENT_CREDENTIALS",
+        AuthParameters={
+            "OAuthParameters": {
+                "AuthorizationEndpoint": "https://issuer.example.test/oauth/token",
+                "HttpMethod": "POST",
+                "ClientParameters": {"ClientID": "cid", "ClientSecret": "csec-hidden"},
+                "OAuthHttpParameters": {
+                    "BodyParameters": [
+                        {"Key": "grant_type", "Value": "client_credentials", "IsValueSecret": False},
+                        {"Key": "totp_seed", "Value": "seed-hidden", "IsValueSecret": True},
+                    ]
+                },
+            },
+            "InvocationHttpParameters": {
+                "HeaderParameters": [
+                    {"Key": "Content-Type", "Value": "application/cloudevents+json", "IsValueSecret": False}
+                ]
+            },
+        },
+    )
+    try:
+        desc = eb.describe_connection(Name=conn_name)
+        # Real EventBridge stores the auth parameters in a Secrets Manager
+        # secret named events!connection/<name>/<uuid> and returns its ARN.
+        secret_arn = desc["SecretArn"]
+        assert secret_arn.startswith("arn:aws:secretsmanager:")
+        assert "events!connection/" + conn_name in secret_arn
+        # The describe response carries NO secret material (response-shape parity).
+        serialized = json.dumps(desc, default=str)
+        assert "ClientSecret" not in serialized
+        assert "csec-hidden" not in serialized
+        assert "seed-hidden" not in serialized
+        oauth = desc["AuthParameters"]["OAuthParameters"]
+        assert oauth["ClientParameters"] == {"ClientID": "cid"}
+        body_params = {p["Key"]: p for p in oauth["OAuthHttpParameters"]["BodyParameters"]}
+        assert body_params["grant_type"]["Value"] == "client_credentials"
+        assert body_params["totp_seed"]["IsValueSecret"] is True
+        assert "Value" not in body_params["totp_seed"]
+
+        # The backing secret holds the full auth parameters for local debugging.
+        stored = json.loads(sm.get_secret_value(SecretId=secret_arn)["SecretString"])
+        assert stored["OAuthParameters"]["ClientParameters"]["ClientSecret"] == "csec-hidden"
+    finally:
+        eb.delete_connection(Name=conn_name)
+    # Deleting the connection deletes its backing secret, as on AWS.
+    with pytest.raises(ClientError) as err:
+        sm.get_secret_value(SecretId=secret_arn)
+    assert err.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_eventbridge_logs_target_delivery(eb, logs):
+    group_name = "qa-eb-logs-target-group"
+    logs.create_log_group(logGroupName=group_name)
+    group_arn = logs.describe_log_groups(logGroupNamePrefix=group_name)["logGroups"][0]["arn"]
+    bus_name = "qa-eb-logs-target-bus"
+    source = "myapp.apidest.logs"
+    eb.create_event_bus(Name=bus_name)
+    eb.put_rule(
+        Name="qa-eb-logs-target-rule",
+        EventBusName=bus_name,
+        EventPattern=json.dumps({"source": [source]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule="qa-eb-logs-target-rule",
+        EventBusName=bus_name,
+        Targets=[{"Id": "t1", "Arn": group_arn}],
+    )
+    eb.put_events(Entries=[{
+        "Source": source,
+        "DetailType": "Observed",
+        "Detail": json.dumps({"k": "v"}),
+        "EventBusName": bus_name,
+    }])
+
+    streams = logs.describe_log_streams(logGroupName=group_name)["logStreams"]
+    assert len(streams) == 1
+    events = logs.get_log_events(
+        logGroupName=group_name, logStreamName=streams[0]["logStreamName"]
+    )["events"]
+    assert len(events) == 1
+    envelope = json.loads(events[0]["message"])
+    assert envelope["source"] == source
+    assert envelope["detail-type"] == "Observed"
+    assert envelope["detail"] == {"k": "v"}
+
+
+def test_eventbridge_archive_kms_key_identifier_round_trip(eb):
+    bus_name = "qa-eb-archive-kms-bus"
+    resp = eb.create_event_bus(Name=bus_name)
+    key_arn = "arn:aws:kms:us-east-1:000000000000:key/qa-eb-archive-kms"
+    eb.create_archive(
+        ArchiveName="qa-eb-archive-kms",
+        EventSourceArn=resp["EventBusArn"],
+        RetentionDays=7,
+        KmsKeyIdentifier=key_arn,
+    )
+    desc = eb.describe_archive(ArchiveName="qa-eb-archive-kms")
+    assert desc["KmsKeyIdentifier"] == key_arn
+    assert desc["RetentionDays"] == 7
+
+
+def test_eventbridge_name_length_caps():
+    """Server-side name caps (archive 48, connection/API destination 64) — what
+    non-validating SDKs like the Terraform provider hit at apply time. botocore
+    enforces the same caps client-side, so validation is disabled here to reach
+    the API."""
+    from conftest import make_client
+
+    eb_raw = make_client("events", {"parameter_validation": False})
+
+    with pytest.raises(ClientError) as err:
+        eb_raw.create_archive(
+            ArchiveName="a" * 49,
+            EventSourceArn="arn:aws:events:us-east-1:000000000000:event-bus/default",
+        )
+    assert err.value.response["Error"]["Code"] == "ValidationException"
+
+    with pytest.raises(ClientError) as err:
+        eb_raw.create_connection(
+            Name="c" * 65,
+            AuthorizationType="API_KEY",
+            AuthParameters={"ApiKeyAuthParameters": {"ApiKeyName": "X-K", "ApiKeyValue": "v"}},
+        )
+    assert err.value.response["Error"]["Code"] == "ValidationException"
+
+    with pytest.raises(ClientError) as err:
+        eb_raw.create_api_destination(
+            Name="d" * 65,
+            ConnectionArn="arn:aws:events:us-east-1:000000000000:connection/qa-eb-cap-conn",
+            InvocationEndpoint="https://example.test/hook",
+            HttpMethod="POST",
+        )
+    assert err.value.response["Error"]["Code"] == "ValidationException"

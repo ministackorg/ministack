@@ -1505,3 +1505,76 @@ def test_logs_describe_streams_on_nonexistent_group_carries_errortype(logs):
         logs.describe_log_streams(logGroupName="missing-lg")
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
     assert exc.value.response["ResponseMetadata"]["HTTPHeaders"].get("x-amzn-errortype") == "ResourceNotFoundException"
+
+
+# ---------------------------------------------------------------------------
+# Resource policies
+# ---------------------------------------------------------------------------
+
+def _events_delivery_policy_doc(name):
+    import json as _json
+
+    return _json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "AllowEventBridgeLogDelivery",
+            "Effect": "Allow",
+            "Principal": {"Service": "events.amazonaws.com"},
+            "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+            "Resource": f"arn:aws:logs:us-east-1:000000000000:log-group:/qa/{name}:*",
+        }],
+    })
+
+
+def test_logs_resource_policy_round_trip(logs):
+    name = "qa-logs-respolicy-rt"
+    put = logs.put_resource_policy(policyName=name, policyDocument=_events_delivery_policy_doc(name))
+    try:
+        assert put["resourcePolicy"]["policyName"] == name
+        assert "lastUpdatedTime" in put["resourcePolicy"]
+
+        described = logs.describe_resource_policies()["resourcePolicies"]
+        match = [p for p in described if p["policyName"] == name]
+        assert len(match) == 1
+        assert "events.amazonaws.com" in match[0]["policyDocument"]
+    finally:
+        logs.delete_resource_policy(policyName=name)
+    remaining = logs.describe_resource_policies()["resourcePolicies"]
+    assert not [p for p in remaining if p["policyName"] == name]
+
+
+def test_logs_resource_policy_delete_unknown(logs):
+    import pytest as _pytest
+    from botocore.exceptions import ClientError as _ClientError
+
+    with _pytest.raises(_ClientError) as err:
+        logs.delete_resource_policy(policyName="qa-logs-respolicy-missing")
+    assert err.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_logs_resource_policy_limit_of_ten(logs):
+    """AWS allows 10 resource policies per account/region (not adjustable); the
+    11th draws LimitExceededException — the wall per-bus policy designs hit."""
+    import pytest as _pytest
+    from botocore.exceptions import ClientError as _ClientError
+
+    existing = {p["policyName"] for p in logs.describe_resource_policies()["resourcePolicies"]}
+    created = []
+    try:
+        for i in range(10 - len(existing)):
+            name = f"qa-logs-respolicy-limit-{i}"
+            logs.put_resource_policy(policyName=name, policyDocument=_events_delivery_policy_doc(name))
+            created.append(name)
+
+        with _pytest.raises(_ClientError) as err:
+            logs.put_resource_policy(
+                policyName="qa-logs-respolicy-limit-overflow",
+                policyDocument=_events_delivery_policy_doc("overflow"),
+            )
+        assert err.value.response["Error"]["Code"] == "LimitExceededException"
+
+        # Updating an EXISTING policy at the limit is still allowed.
+        logs.put_resource_policy(policyName=created[0], policyDocument=_events_delivery_policy_doc("updated"))
+    finally:
+        for name in created:
+            logs.delete_resource_policy(policyName=name)
