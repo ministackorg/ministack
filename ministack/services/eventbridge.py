@@ -153,6 +153,9 @@ def get_state():
         "event_bus_policies": copy.deepcopy(_event_bus_policies),
         "connections": copy.deepcopy(_connections),
         "api_destinations": copy.deepcopy(_api_destinations),
+        # _oauth_tokens is deliberately NOT persisted: it is a cache, and a
+        # restored process re-fetches tokens from the connection's
+        # authorization endpoint on the next delivery.
     }
 
 

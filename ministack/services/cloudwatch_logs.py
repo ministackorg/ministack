@@ -116,6 +116,7 @@ def get_state():
         "delivery_sources": copy.deepcopy(_delivery_sources),
         "delivery_destinations": copy.deepcopy(_delivery_destinations),
         "deliveries": copy.deepcopy(_deliveries),
+        "resource_policies": copy.deepcopy(_resource_policies),
     }
 
 
@@ -202,6 +203,7 @@ def restore_state(data):
         _delivery_sources.update(data.get("delivery_sources", {}))
         _delivery_destinations.update(data.get("delivery_destinations", {}))
         _deliveries.update(data.get("deliveries", {}))
+        _resource_policies.update(data.get("resource_policies", {}))
 
 
 try:
