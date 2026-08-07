@@ -1191,6 +1191,7 @@ def test_eventbridge_replay_lifecycle(eb):
     # Real AWS returns STARTING as the immediate state; the background
     # dispatch flips through RUNNING to COMPLETED.
     assert start["State"] == "STARTING"
+    assert "ReplayStartTime" in start
     desc = eb.describe_replay(ReplayName=rep_name)
     assert desc["ReplayName"] == rep_name
     assert desc["State"] in ("STARTING", "RUNNING", "COMPLETED")
@@ -1203,8 +1204,9 @@ def test_eventbridge_replay_lifecycle(eb):
         desc2 = eb.describe_replay(ReplayName=rep_name)
         assert desc2["State"] == "CANCELLED"
     except _CE as e:
-        # Replay may have already completed before the cancel call
-        assert e.response["Error"]["Code"] == "ValidationException"
+        # Replay may have already completed before the cancel call; AWS
+        # rejects cancels outside Running/Starting with IllegalStatusException.
+        assert e.response["Error"]["Code"] == "IllegalStatusException"
         assert "completed" in e.response["Error"]["Message"].lower()
     eb.delete_archive(ArchiveName=arch)
 
@@ -1796,6 +1798,242 @@ def test_eventbridge_replay_rejects_plain_name_source(eb):
 
     assert exc.value.response["Error"]["Code"] == "ValidationException"
     eb.delete_archive(ArchiveName=arch_name)
+
+
+def test_eventbridge_missing_target_resource_dead_letters_no_resource(eb, sqs):
+    """A rule target whose resource does not exist dead-letters the event as
+    NO_RESOURCE with no retry attempts (eb-rule-dlq: 'a target resource that
+    no longer exists' goes straight to the DLQ), for any target type."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bus = f"qa-eb-dlq-any-bus-{suffix}"
+    rule = f"qa-eb-dlq-any-rule-{suffix}"
+    source = f"dlq.any.{suffix}"
+    eb.create_event_bus(Name=bus)
+    dlq_url = sqs.create_queue(QueueName=f"qa-eb-dlq-any-q-{suffix}")["QueueUrl"]
+    dlq_arn = sqs.get_queue_attributes(
+        QueueUrl=dlq_url, AttributeNames=["QueueArn"]
+    )["Attributes"]["QueueArn"]
+    missing_queue_arn = f"arn:aws:sqs:us-east-1:000000000000:qa-eb-missing-q-{suffix}"
+    missing_func_arn = f"arn:aws:lambda:us-east-1:000000000000:function:qa-eb-missing-fn-{suffix}"
+    eb.put_rule(
+        Name=rule, EventBusName=bus, EventPattern=json.dumps({"source": [source]}), State="ENABLED"
+    )
+    eb.put_targets(
+        Rule=rule,
+        EventBusName=bus,
+        Targets=[
+            {"Id": "missing-queue", "Arn": missing_queue_arn, "DeadLetterConfig": {"Arn": dlq_arn}},
+            {"Id": "missing-func", "Arn": missing_func_arn, "DeadLetterConfig": {"Arn": dlq_arn}},
+        ],
+    )
+    eb.put_events(Entries=[{
+        "Source": source, "DetailType": "Ping", "Detail": json.dumps({"n": 1}), "EventBusName": bus,
+    }])
+
+    messages = []
+
+    def _drain():
+        resp = sqs.receive_message(
+            QueueUrl=dlq_url, MaxNumberOfMessages=10, WaitTimeSeconds=1, MessageAttributeNames=["All"]
+        )
+        messages.extend(resp.get("Messages", []))
+        return len(messages) >= 2
+
+    assert _wait_until(_drain)
+    target_arns = set()
+    for msg in messages:
+        attrs = msg["MessageAttributes"]
+        assert attrs["ERROR_CODE"]["StringValue"] == "NO_RESOURCE"
+        # A missing resource dead-letters directly — no retries ran out.
+        assert "EXHAUSTED_RETRY_CONDITION" not in attrs
+        assert ":rule/" in attrs["RULE_ARN"]["StringValue"]
+        assert json.loads(msg["Body"])["source"] == source
+        target_arns.add(attrs["TARGET_ARN"]["StringValue"])
+    assert target_arns == {missing_queue_arn, missing_func_arn}
+
+
+def test_eventbridge_put_targets_rejects_non_sqs_dlq_arn(eb):
+    """DeadLetterConfig.Arn must be an SQS queue ARN — validated at PutTargets."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    rule = f"qa-eb-dlq-bad-arn-rule-{suffix}"
+    eb.put_rule(
+        Name=rule, EventPattern=json.dumps({"source": ["dlq.bad"]}), State="ENABLED"
+    )
+    with pytest.raises(ClientError) as exc:
+        eb.put_targets(
+            Rule=rule,
+            Targets=[{
+                "Id": "t1",
+                "Arn": f"arn:aws:sqs:us-east-1:000000000000:qa-eb-dlq-bad-target-{suffix}",
+                "DeadLetterConfig": {"Arn": "arn:aws:sns:us-east-1:000000000000:not-a-queue"},
+            }],
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert "SQS" in exc.value.response["Error"]["Message"]
+    eb.delete_rule(Name=rule)
+
+
+def test_eventbridge_replay_filter_arns_and_replay_name(eb, sqs):
+    """Destination.FilterArns limits which rules process replayed events, the
+    replayed envelope carries replay-name, replayed events are never
+    re-archived, and DescribeReplay reports EventLastReplayedTime."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bus = f"qa-eb-rf-bus-{suffix}"
+    bus_arn = f"arn:aws:events:us-east-1:000000000000:event-bus/{bus}"
+    arch_name = f"replay-filter-{suffix}"
+    source = f"replay.filter.{suffix}"
+    eb.create_event_bus(Name=bus)
+    eb.create_archive(ArchiveName=arch_name, EventSourceArn=bus_arn)
+    archive_arn = eb.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
+
+    queues = {}
+    rule_arns = {}
+    for idx in ("1", "2"):
+        q_url = sqs.create_queue(QueueName=f"qa-eb-rf-q{idx}-{suffix}")["QueueUrl"]
+        q_arn = sqs.get_queue_attributes(
+            QueueUrl=q_url, AttributeNames=["QueueArn"]
+        )["Attributes"]["QueueArn"]
+        rule = f"qa-eb-rf-rule{idx}-{suffix}"
+        rule_arns[idx] = eb.put_rule(
+            Name=rule, EventBusName=bus, EventPattern=json.dumps({"source": [source]}),
+            State="ENABLED",
+        )["RuleArn"]
+        eb.put_targets(Rule=rule, EventBusName=bus, Targets=[{"Id": f"q{idx}", "Arn": q_arn}])
+        queues[idx] = q_url
+
+    eb.put_events(Entries=[{
+        "Source": source, "DetailType": "Ping", "Detail": json.dumps({"n": 1}), "EventBusName": bus,
+    }])
+
+    def _drain_one(q_url, box):
+        def _inner():
+            resp = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
+            box.extend(resp.get("Messages", []))
+            return len(box) >= 1
+        return _inner
+
+    live1, live2 = [], []
+    assert _wait_until(_drain_one(queues["1"], live1))
+    assert _wait_until(_drain_one(queues["2"], live2))
+    assert "replay-name" not in json.loads(live1[0]["Body"])
+    desc = eb.describe_archive(ArchiveName=arch_name)
+    assert desc["EventCount"] == 1
+    assert desc["SizeBytes"] > 0
+
+    rep_name = f"rep-filter-{suffix}"
+    eb.start_replay(
+        ReplayName=rep_name,
+        EventSourceArn=archive_arn,
+        EventStartTime=0,
+        EventEndTime=time.time() + 3600,
+        Destination={"Arn": bus_arn, "FilterArns": [rule_arns["1"]]},
+    )
+    assert _wait_until(lambda: eb.describe_replay(ReplayName=rep_name)["State"] == "COMPLETED")
+
+    replayed1 = []
+    assert _wait_until(_drain_one(queues["1"], replayed1))
+    body = json.loads(replayed1[0]["Body"])
+    assert body["replay-name"] == rep_name
+    assert body["source"] == source
+    # Rule 2 is outside FilterArns — its queue must stay empty.
+    resp2 = sqs.receive_message(QueueUrl=queues["2"], MaxNumberOfMessages=10, WaitTimeSeconds=1)
+    assert not resp2.get("Messages")
+    # Replayed events are not sent to an archive (CreateArchive API reference).
+    assert eb.describe_archive(ArchiveName=arch_name)["EventCount"] == 1
+    assert "EventLastReplayedTime" in eb.describe_replay(ReplayName=rep_name)
+    eb.delete_archive(ArchiveName=arch_name)
+
+
+def test_eventbridge_rule_replay_name_exists_false_skips_replays(eb, sqs):
+    """The documented anti-replay guard — "replay-name": [{"exists": false}]
+    in a rule pattern — matches live events but not replayed ones."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bus = f"qa-eb-noreplay-bus-{suffix}"
+    bus_arn = f"arn:aws:events:us-east-1:000000000000:event-bus/{bus}"
+    arch_name = f"noreplay-arch-{suffix}"
+    source = f"noreplay.{suffix}"
+    eb.create_event_bus(Name=bus)
+    eb.create_archive(ArchiveName=arch_name, EventSourceArn=bus_arn)
+    archive_arn = eb.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
+    q_url = sqs.create_queue(QueueName=f"qa-eb-noreplay-q-{suffix}")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url, AttributeNames=["QueueArn"]
+    )["Attributes"]["QueueArn"]
+    rule = f"qa-eb-noreplay-rule-{suffix}"
+    eb.put_rule(
+        Name=rule,
+        EventBusName=bus,
+        EventPattern=json.dumps({"source": [source], "replay-name": [{"exists": False}]}),
+        State="ENABLED",
+    )
+    eb.put_targets(Rule=rule, EventBusName=bus, Targets=[{"Id": "q", "Arn": q_arn}])
+
+    eb.put_events(Entries=[{
+        "Source": source, "DetailType": "Ping", "Detail": json.dumps({"n": 1}), "EventBusName": bus,
+    }])
+    live = []
+
+    def _drain():
+        resp = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
+        live.extend(resp.get("Messages", []))
+        return len(live) >= 1
+
+    assert _wait_until(_drain)
+
+    rep_name = f"rep-noreplay-{suffix}"
+    eb.start_replay(
+        ReplayName=rep_name,
+        EventSourceArn=archive_arn,
+        EventStartTime=0,
+        EventEndTime=time.time() + 3600,
+        Destination={"Arn": bus_arn},
+    )
+    assert _wait_until(lambda: eb.describe_replay(ReplayName=rep_name)["State"] == "COMPLETED")
+    resp = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
+    assert not resp.get("Messages")
+    eb.delete_archive(ArchiveName=arch_name)
+
+
+def test_eventbridge_start_replay_rejects_inverted_window(eb):
+    """EventEndTime must be after EventStartTime."""
+    arch_name = f"replay-window-{_uuid_mod.uuid4().hex[:8]}"
+    bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    eb.create_archive(ArchiveName=arch_name, EventSourceArn=bus_arn)
+    archive_arn = eb.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
+    with pytest.raises(ClientError) as exc:
+        eb.start_replay(
+            ReplayName=f"rep-window-{_uuid_mod.uuid4().hex[:8]}",
+            EventSourceArn=archive_arn,
+            EventStartTime=1000,
+            EventEndTime=500,
+            Destination={"Arn": bus_arn},
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert "EventEndTime" in exc.value.response["Error"]["Message"]
+    eb.delete_archive(ArchiveName=arch_name)
+
+
+def test_eventbridge_create_archive_validations(eb):
+    """CreateArchive rejects a missing source bus and an invalid event
+    pattern the way real AWS does. (Negative RetentionDays is also rejected
+    server-side, but botocore already blocks it client-side.)"""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    default_bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+
+    with pytest.raises(ClientError) as exc:
+        eb.create_archive(
+            ArchiveName=f"qa-arch-nobus-{suffix}",
+            EventSourceArn=f"arn:aws:events:us-east-1:000000000000:event-bus/qa-missing-{suffix}",
+        )
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    with pytest.raises(ClientError) as exc:
+        eb.create_archive(
+            ArchiveName=f"qa-arch-badpat-{suffix}",
+            EventSourceArn=default_bus_arn,
+            EventPattern="{not json",
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidEventPatternException"
 
 
 def test_eventbridge_archive_event_count_accumulation(eb):
