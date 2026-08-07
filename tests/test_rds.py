@@ -71,6 +71,35 @@ def test_rds_create(rds):
     assert instances[0]["Engine"] == "postgres"
     assert "Address" in instances[0]["Endpoint"]
 
+def test_rds_create_duplicate_instance(rds):
+    """Duplicate CreateDBInstance returns wire code DBInstanceAlreadyExists.
+
+    Real AWS omits the ``Fault`` suffix for instance-level codes (unlike the
+    cluster-level ``DBClusterAlreadyExistsFault``); SDKs match the exact string
+    to produce their typed error, so the suffix breaks typed error handling.
+    """
+    rds.create_db_instance(
+        DBInstanceIdentifier="dup-create-db",
+        DBInstanceClass="db.t3.micro",
+        Engine="postgres",
+        MasterUsername="admin",
+        MasterUserPassword="password123",
+        AllocatedStorage=20,
+    )
+    try:
+        with pytest.raises(ClientError) as exc:
+            rds.create_db_instance(
+                DBInstanceIdentifier="dup-create-db",
+                DBInstanceClass="db.t3.micro",
+                Engine="postgres",
+                MasterUsername="admin",
+                MasterUserPassword="password123",
+                AllocatedStorage=20,
+            )
+        assert exc.value.response["Error"]["Code"] == "DBInstanceAlreadyExists"
+    finally:
+        rds.delete_db_instance(DBInstanceIdentifier="dup-create-db", SkipFinalSnapshot=True)
+
 def test_rds_create_rejects_unknown_parameter_group(rds):
     """CreateDBInstance / CreateDBCluster reject a reference to a parameter group
     that doesn't exist; a created group (or a default.* group) is accepted (#1278)."""
@@ -2826,7 +2855,7 @@ def test_rds_create_read_replica(rds):
                 DBInstanceIdentifier="rr-replica",
                 SourceDBInstanceIdentifier="rr-source",
             )
-        assert exc.value.response["Error"]["Code"] == "DBInstanceAlreadyExistsFault"
+        assert exc.value.response["Error"]["Code"] == "DBInstanceAlreadyExists"
     finally:
         rds.delete_db_instance(DBInstanceIdentifier="rr-replica", SkipFinalSnapshot=True)
         rds.delete_db_instance(DBInstanceIdentifier="rr-source", SkipFinalSnapshot=True)
@@ -2905,7 +2934,7 @@ def test_rds_restore_from_snapshot(rds):
                 DBInstanceIdentifier="restored-db",
                 DBSnapshotIdentifier="restore-snap",
             )
-        assert exc.value.response["Error"]["Code"] == "DBInstanceAlreadyExistsFault"
+        assert exc.value.response["Error"]["Code"] == "DBInstanceAlreadyExists"
     finally:
         rds.delete_db_instance(DBInstanceIdentifier="restored-db", SkipFinalSnapshot=True)
         rds.delete_db_snapshot(DBSnapshotIdentifier="restore-snap")

@@ -2456,12 +2456,34 @@ def _setup_pool_with_user(
     generate_secret=True,
     force_change_password=False,
     lambda_config=None,
+    explicit_auth_flows=None,
+    mfa_configuration=None,
+    allowed_first_auth_factors=None,
+    user_email='test@example.com',
 ):
     """Create a user pool with a confirmed (or FORCE_CHANGE_PASSWORD) user and an
     OAuth-enabled client."""
+    policies = None
+    if allowed_first_auth_factors is not None:
+        # Passing Policies replaces it wholesale, so keep the default
+        # PasswordPolicy alongside the SignInPolicy override.
+        policies = {
+            "PasswordPolicy": {
+                "MinimumLength": 8,
+                "RequireUppercase": True,
+                "RequireLowercase": True,
+                "RequireNumbers": True,
+                "RequireSymbols": True,
+                "TemporaryPasswordValidityDays": 7,
+            },
+            "SignInPolicy": {"AllowedFirstAuthFactors": allowed_first_auth_factors},
+        }
+
     pool = cognito_idp.create_user_pool(
         PoolName='OAuth2TestPool',
         **({"LambdaConfig": lambda_config} if lambda_config else {}),
+        **({"MfaConfiguration": mfa_configuration} if mfa_configuration else {}),
+        **({"Policies": policies} if policies else {}),
     )
     pool_id = pool['UserPool']['Id']
 
@@ -2475,7 +2497,7 @@ def _setup_pool_with_user(
         'CallbackURLs': ['http://localhost:3000/callback'],
         'LogoutURLs': ['http://localhost:3000/logout'],
         'DefaultRedirectURI': 'http://localhost:3000/callback',
-        'ExplicitAuthFlows': ['ALLOW_USER_PASSWORD_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
+        'ExplicitAuthFlows': explicit_auth_flows or ['ALLOW_USER_PASSWORD_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
     }
     client_resp = cognito_idp.create_user_pool_client(**client_kwargs)
     client = client_resp['UserPoolClient']
@@ -2485,7 +2507,7 @@ def _setup_pool_with_user(
         Username='testuser',
         TemporaryPassword='TempPass1!',
         UserAttributes=[
-            {'Name': 'email', 'Value': 'test@example.com'},
+            {'Name': 'email', 'Value': user_email},
             {'Name': 'email_verified', 'Value': 'true'},
             {'Name': 'name', 'Value': 'Test User'},
         ],
@@ -2506,6 +2528,14 @@ def _lower_headers(h):
 def _extract_np_token(html):
     """Pull the `np_token` hidden-field value out of the new-password form HTML."""
     marker = 'name="np_token" value="'
+    start = html.index(marker) + len(marker)
+    end = html.index('"', start)
+    return html[start:end]
+
+
+def _extract_ua_token(html):
+    """Pull the `ua_token` hidden-field value out of a choice-based sign-in form HTML."""
+    marker = 'name="ua_token" value="'
     start = html.index(marker) + len(marker)
     end = html.index('"', start)
     return html[start:end]
@@ -2816,6 +2846,482 @@ def test_oauth2_new_password_submit_invalid_token():
 
     assert status == 400
     assert resp['error'] == 'invalid_request'
+
+
+# ---------------------------------------------------------------------------
+# Tests — /login (choice-based sign-in, ALLOW_USER_AUTH)
+# ---------------------------------------------------------------------------
+
+def _authorize_url(client_id):
+    return (f'{ENDPOINT}/oauth2/authorize?response_type=code'
+            f'&client_id={client_id}'
+            f'&redirect_uri=http://localhost:3000/callback'
+            f'&scope=openid+email'
+            f'&state=abc123')
+
+
+def test_oauth2_authorize_without_allow_user_auth_shows_single_page_form():
+    """Regression: clients that do NOT opt into ALLOW_USER_AUTH keep the
+    existing single-page username+password form."""
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(cognito_idp)
+    client_id = client['ClientId']
+
+    status, headers, body = _get(_authorize_url(client_id))
+    html = body.decode('utf-8')
+
+    assert status == 200
+    assert 'name="username"' in html
+    assert 'name="password"' in html
+    assert 'auth_flow' not in html
+
+
+def test_oauth2_authorize_with_allow_user_auth_shows_username_only_form():
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(
+        cognito_idp,
+        explicit_auth_flows=['ALLOW_USER_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
+    )
+    client_id = client['ClientId']
+
+    status, headers, body = _get(_authorize_url(client_id))
+    html = body.decode('utf-8')
+
+    assert status == 200
+    assert 'name="username"' in html
+    assert 'name="password"' not in html
+    assert 'value="USER_AUTH"' in html
+
+
+def test_user_auth_two_step_flow_with_mfa_off_redirects_with_code():
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(
+        cognito_idp,
+        explicit_auth_flows=['ALLOW_USER_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
+        mfa_configuration='OFF',
+    )
+    client_id = client['ClientId']
+    client_secret = client.get('ClientSecret', '')
+
+    # Step 1: username only.
+    status, headers, body = _post_form(f'{ENDPOINT}/login', {
+        'auth_flow': 'USER_AUTH',
+        'username': 'testuser',
+        'client_id': client_id,
+        'redirect_uri': 'http://localhost:3000/callback',
+        'scope': 'openid email',
+        'state': 'mystate',
+        'response_type': 'code',
+    })
+    assert status == 200
+    html = body.decode('utf-8')
+    # MfaConfiguration=OFF skips the challenge-selection step.
+    assert 'name="challenge"' not in html
+    assert 'name="password"' in html
+    ua_token = _extract_ua_token(html)
+
+    # Step 2: password.
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login',
+        {'ua_token': ua_token, 'password': 'TestPass1!'},
+        follow_redirects=False,
+    )
+    assert status == 302
+    location = headers.get('location', '')
+    assert location.startswith('http://localhost:3000/callback')
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(location).query)
+    assert 'code' in qs
+    assert qs['state'] == ['mystate']
+
+    status, headers, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+        'grant_type': 'authorization_code',
+        'code': qs['code'][0],
+        'redirect_uri': 'http://localhost:3000/callback',
+        'client_id': client_id,
+        'client_secret': client_secret,
+    })
+    assert status == 200
+    resp = json.loads(body)
+    assert 'access_token' in resp
+
+
+def test_user_auth_three_step_flow_with_multiple_factors_shows_challenge_selection():
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(
+        cognito_idp,
+        explicit_auth_flows=['ALLOW_USER_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
+        allowed_first_auth_factors=['PASSWORD', 'EMAIL_OTP'],
+    )
+    client_id = client['ClientId']
+
+    status, headers, body = _post_form(f'{ENDPOINT}/login', {
+        'auth_flow': 'USER_AUTH',
+        'username': 'testuser',
+        'client_id': client_id,
+        'redirect_uri': 'http://localhost:3000/callback',
+        'scope': 'openid email',
+        'state': 'mystate',
+        'response_type': 'code',
+    })
+    assert status == 200
+    html = body.decode('utf-8')
+    assert 'name="challenge"' in html
+    assert 'value="PASSWORD"' in html
+    ua_token = _extract_ua_token(html)
+
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login', {'ua_token': ua_token, 'challenge': 'PASSWORD'},
+    )
+    assert status == 200
+    html = body.decode('utf-8')
+    assert 'name="password"' in html
+
+
+def test_user_auth_unknown_username_does_not_reveal_at_step_one():
+    """Step 1 must succeed regardless of whether the username exists, to avoid
+    user enumeration (matches real Cognito USER_AUTH behavior)."""
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(
+        cognito_idp,
+        explicit_auth_flows=['ALLOW_USER_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
+        mfa_configuration='OFF',
+    )
+    client_id = client['ClientId']
+
+    status, headers, body = _post_form(f'{ENDPOINT}/login', {
+        'auth_flow': 'USER_AUTH',
+        'username': 'no-such-user',
+        'client_id': client_id,
+        'redirect_uri': 'http://localhost:3000/callback',
+        'scope': 'openid',
+        'state': 'xyz',
+        'response_type': 'code',
+    })
+    assert status == 200
+    ua_token = _extract_ua_token(body.decode('utf-8'))
+
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login', {'ua_token': ua_token, 'password': 'whatever'},
+    )
+    assert status == 200
+    html = body.decode('utf-8')
+    assert 'Incorrect username or password' in html
+
+
+def test_user_auth_wrong_password_shows_error_and_allows_retry():
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(
+        cognito_idp,
+        explicit_auth_flows=['ALLOW_USER_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
+        mfa_configuration='OFF',
+    )
+    client_id = client['ClientId']
+
+    status, headers, body = _post_form(f'{ENDPOINT}/login', {
+        'auth_flow': 'USER_AUTH',
+        'username': 'testuser',
+        'client_id': client_id,
+        'redirect_uri': 'http://localhost:3000/callback',
+        'scope': 'openid',
+        'state': 'xyz',
+        'response_type': 'code',
+    })
+    ua_token = _extract_ua_token(body.decode('utf-8'))
+
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login', {'ua_token': ua_token, 'password': 'WrongPass!'},
+    )
+    assert status == 200
+    html = body.decode('utf-8')
+    assert 'Incorrect username or password' in html
+    retry_ua_token = _extract_ua_token(html)
+    assert retry_ua_token == ua_token
+
+    # Same ua_token can be retried with the correct password.
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login',
+        {'ua_token': ua_token, 'password': 'TestPass1!'},
+        follow_redirects=False,
+    )
+    assert status == 302
+    assert 'code' in urllib.parse.parse_qs(
+        urllib.parse.urlparse(headers.get('location', '')).query)
+
+
+def test_user_auth_invalid_challenge_is_rejected():
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(
+        cognito_idp,
+        explicit_auth_flows=['ALLOW_USER_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
+        allowed_first_auth_factors=['PASSWORD', 'EMAIL_OTP'],
+    )
+    client_id = client['ClientId']
+
+    status, headers, body = _post_form(f'{ENDPOINT}/login', {
+        'auth_flow': 'USER_AUTH',
+        'username': 'testuser',
+        'client_id': client_id,
+        'redirect_uri': 'http://localhost:3000/callback',
+        'scope': 'openid',
+        'state': 'xyz',
+        'response_type': 'code',
+    })
+    ua_token = _extract_ua_token(body.decode('utf-8'))
+
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login', {'ua_token': ua_token, 'challenge': 'WEB_AUTHN'},
+    )
+    assert status == 200
+    html = body.decode('utf-8')
+    assert 'Invalid authentication method' in html
+    assert 'name="password"' not in html
+
+
+def test_user_auth_expired_session_returns_error():
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login', {'ua_token': 'nonexistent-token', 'password': 'x'},
+    )
+    resp = json.loads(body)
+
+    assert status == 400
+    assert resp['error'] == 'invalid_request'
+
+
+def test_user_auth_force_change_password_reaches_new_password_form():
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(
+        cognito_idp,
+        force_change_password=True,
+        explicit_auth_flows=['ALLOW_USER_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
+        mfa_configuration='OFF',
+    )
+    client_id = client['ClientId']
+
+    status, headers, body = _post_form(f'{ENDPOINT}/login', {
+        'auth_flow': 'USER_AUTH',
+        'username': 'testuser',
+        'client_id': client_id,
+        'redirect_uri': 'http://localhost:3000/callback',
+        'scope': 'openid',
+        'state': 'xyz',
+        'response_type': 'code',
+    })
+    ua_token = _extract_ua_token(body.decode('utf-8'))
+
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login', {'ua_token': ua_token, 'password': 'TempPass1!'},
+    )
+    assert status == 200
+    html = body.decode('utf-8')
+    assert 'name="new_password"' in html
+    assert 'name="confirm_password"' in html
+    assert 'np_token' in html
+
+
+def test_user_auth_single_email_otp_factor_skips_challenge_selection():
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(
+        cognito_idp,
+        explicit_auth_flows=['ALLOW_USER_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
+        allowed_first_auth_factors=['EMAIL_OTP'],
+    )
+    client_id = client['ClientId']
+
+    status, headers, body = _post_form(f'{ENDPOINT}/login', {
+        'auth_flow': 'USER_AUTH',
+        'username': 'testuser',
+        'client_id': client_id,
+        'redirect_uri': 'http://localhost:3000/callback',
+        'scope': 'openid',
+        'state': 'xyz',
+        'response_type': 'code',
+    })
+    assert status == 200
+    html = body.decode('utf-8')
+    assert 'name="challenge"' not in html
+    assert 'name="code"' in html
+    assert 'name="password"' not in html
+
+
+def test_user_auth_multiple_factors_shows_both_challenge_options():
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(
+        cognito_idp,
+        explicit_auth_flows=['ALLOW_USER_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
+        allowed_first_auth_factors=['PASSWORD', 'EMAIL_OTP'],
+    )
+    client_id = client['ClientId']
+
+    status, headers, body = _post_form(f'{ENDPOINT}/login', {
+        'auth_flow': 'USER_AUTH',
+        'username': 'testuser',
+        'client_id': client_id,
+        'redirect_uri': 'http://localhost:3000/callback',
+        'scope': 'openid',
+        'state': 'xyz',
+        'response_type': 'code',
+    })
+    assert status == 200
+    html = body.decode('utf-8')
+    assert 'value="PASSWORD"' in html
+    assert 'value="EMAIL_OTP"' in html
+
+
+def test_user_auth_email_otp_flow_sends_email_and_signs_in():
+    cognito_idp = make_client('cognito-idp')
+    email = f'otp-{_uuid_mod.uuid4().hex[:8]}@example.com'
+    pool_id, client = _setup_pool_with_user(
+        cognito_idp,
+        explicit_auth_flows=['ALLOW_USER_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
+        allowed_first_auth_factors=['PASSWORD', 'EMAIL_OTP'],
+        user_email=email,
+    )
+    client_id = client['ClientId']
+
+    status, headers, body = _post_form(f'{ENDPOINT}/login', {
+        'auth_flow': 'USER_AUTH',
+        'username': 'testuser',
+        'client_id': client_id,
+        'redirect_uri': 'http://localhost:3000/callback',
+        'scope': 'openid email',
+        'state': 'mystate',
+        'response_type': 'code',
+    })
+    ua_token = _extract_ua_token(body.decode('utf-8'))
+
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login', {'ua_token': ua_token, 'challenge': 'EMAIL_OTP'},
+    )
+    assert status == 200
+    html = body.decode('utf-8')
+    assert 'name="code"' in html
+    ua_token = _extract_ua_token(html)
+
+    msgs = _messages_to(email, 'CognitoEmailOtpMessage')
+    assert len(msgs) == 1, f'expected 1 OTP email, got {len(msgs)}'
+
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login',
+        {'ua_token': ua_token, 'code': '123456'},
+        follow_redirects=False,
+    )
+    assert status == 302
+    location = headers.get('location', '')
+    assert location.startswith('http://localhost:3000/callback')
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(location).query)
+    assert 'code' in qs
+    assert qs['state'] == ['mystate']
+
+
+def test_user_auth_email_otp_wrong_code_shows_error_and_allows_retry():
+    cognito_idp = make_client('cognito-idp')
+    email = f'otp-{_uuid_mod.uuid4().hex[:8]}@example.com'
+    pool_id, client = _setup_pool_with_user(
+        cognito_idp,
+        explicit_auth_flows=['ALLOW_USER_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
+        allowed_first_auth_factors=['PASSWORD', 'EMAIL_OTP'],
+        user_email=email,
+    )
+    client_id = client['ClientId']
+
+    status, headers, body = _post_form(f'{ENDPOINT}/login', {
+        'auth_flow': 'USER_AUTH',
+        'username': 'testuser',
+        'client_id': client_id,
+        'redirect_uri': 'http://localhost:3000/callback',
+        'scope': 'openid',
+        'state': 'xyz',
+        'response_type': 'code',
+    })
+    ua_token = _extract_ua_token(body.decode('utf-8'))
+
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login', {'ua_token': ua_token, 'challenge': 'EMAIL_OTP'},
+    )
+    ua_token = _extract_ua_token(body.decode('utf-8'))
+
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login', {'ua_token': ua_token, 'code': '000000'},
+    )
+    assert status == 200
+    html = body.decode('utf-8')
+    assert 'Incorrect code' in html
+    retry_ua_token = _extract_ua_token(html)
+    assert retry_ua_token == ua_token
+
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login',
+        {'ua_token': ua_token, 'code': '123456'},
+        follow_redirects=False,
+    )
+    assert status == 302
+    assert 'code' in urllib.parse.parse_qs(
+        urllib.parse.urlparse(headers.get('location', '')).query)
+
+
+def test_user_auth_email_otp_unknown_username_shows_same_page_but_never_succeeds():
+    """EMAIL_OTP must not reveal whether the username exists: the code-entry
+    page renders identically, but no code can ever succeed for it."""
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(
+        cognito_idp,
+        explicit_auth_flows=['ALLOW_USER_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
+        allowed_first_auth_factors=['PASSWORD', 'EMAIL_OTP'],
+    )
+    client_id = client['ClientId']
+
+    status, headers, body = _post_form(f'{ENDPOINT}/login', {
+        'auth_flow': 'USER_AUTH',
+        'username': 'no-such-user',
+        'client_id': client_id,
+        'redirect_uri': 'http://localhost:3000/callback',
+        'scope': 'openid',
+        'state': 'xyz',
+        'response_type': 'code',
+    })
+    ua_token = _extract_ua_token(body.decode('utf-8'))
+
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login', {'ua_token': ua_token, 'challenge': 'EMAIL_OTP'},
+    )
+    assert status == 200
+    html = body.decode('utf-8')
+    assert 'name="code"' in html
+    ua_token = _extract_ua_token(html)
+
+    status, headers, body = _post_form(
+        f'{ENDPOINT}/login', {'ua_token': ua_token, 'code': '123456'},
+    )
+    assert status == 200
+    assert 'Incorrect code' in body.decode('utf-8')
+
+
+def test_user_auth_mfa_on_excludes_email_otp_from_choices():
+    """MfaConfiguration is the second-factor setting and is independent of
+    AllowedFirstAuthFactors, except that AWS forbids OTP first factors when
+    MFA is required — so EMAIL_OTP drops out and only PASSWORD remains."""
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(
+        cognito_idp,
+        explicit_auth_flows=['ALLOW_USER_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
+        mfa_configuration='ON',
+        allowed_first_auth_factors=['PASSWORD', 'EMAIL_OTP'],
+    )
+    client_id = client['ClientId']
+
+    status, headers, body = _post_form(f'{ENDPOINT}/login', {
+        'auth_flow': 'USER_AUTH',
+        'username': 'testuser',
+        'client_id': client_id,
+        'redirect_uri': 'http://localhost:3000/callback',
+        'scope': 'openid',
+        'state': 'xyz',
+        'response_type': 'code',
+    })
+    assert status == 200
+    html = body.decode('utf-8')
+    assert 'name="challenge"' not in html
+    assert 'name="password"' in html
 
 
 # ---------------------------------------------------------------------------
