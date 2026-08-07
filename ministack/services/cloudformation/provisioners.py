@@ -4870,7 +4870,7 @@ def _cf_kvs_delete(physical_id, props):
 def _rds_db_cluster_create(logical_id, props, stack_name):
     cluster_id = props.get("DBClusterIdentifier") or _physical_name(stack_name, logical_id, lowercase=True, max_len=63)
     engine = props.get("Engine", "aurora-postgresql")
-    engine_version = props.get("EngineVersion", "15.4")
+    engine_version = props.get("EngineVersion") or _rds._default_engine_version(engine)
     master_user = props.get("MasterUsername", "admin")
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster:{cluster_id}"
     suffix = new_uuid()[:8]

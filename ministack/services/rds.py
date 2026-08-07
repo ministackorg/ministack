@@ -142,6 +142,63 @@ AURORA_MYSQL_ENGINE_VERSIONS = [
 ]
 AURORA_MYSQL_ENGINE_VERSION_SET = {version for version, _ in AURORA_MYSQL_ENGINE_VERSIONS}
 
+# Aurora PostgreSQL versions are the creatable set returned by AWS RDS as of
+# 2026-08-06 (single source of truth for both the catalog and create-time
+# validation). Refresh with:
+#   aws rds describe-db-engine-versions --engine aurora-postgresql \
+#     --query 'DBEngineVersions[].[EngineVersion,DBParameterGroupFamily]' \
+#     --output text | sort -V
+# The Docker image is derived from the major alone (16.14 -> postgres:16-alpine),
+# so new minors need no image work — but keep _default_engine_version aligned:
+# AWS's default (describe-db-engine-versions --default-only) can trail the
+# latest advertised version, so update it deliberately when refreshing.
+AURORA_POSTGRESQL_ENGINE_VERSIONS = [
+    ("11.9", "aurora-postgresql11"),
+    ("11.21", "aurora-postgresql11"),
+    ("12.9", "aurora-postgresql12"),
+    ("12.22", "aurora-postgresql12"),
+    ("13.9", "aurora-postgresql13"),
+    ("13.23", "aurora-postgresql13"),
+    ("14.6", "aurora-postgresql14"),
+    ("14.17", "aurora-postgresql14"),
+    ("14.18", "aurora-postgresql14"),
+    ("14.19", "aurora-postgresql14"),
+    ("14.20", "aurora-postgresql14"),
+    ("14.22", "aurora-postgresql14"),
+    ("14.23", "aurora-postgresql14"),
+    ("15.10", "aurora-postgresql15"),
+    ("15.12", "aurora-postgresql15"),
+    ("15.13", "aurora-postgresql15"),
+    ("15.14", "aurora-postgresql15"),
+    ("15.15", "aurora-postgresql15"),
+    ("15.17", "aurora-postgresql15"),
+    ("15.18", "aurora-postgresql15"),
+    ("16.4-limitless", "aurora-postgresql16"),
+    ("16.6-limitless", "aurora-postgresql16"),
+    ("16.8", "aurora-postgresql16"),
+    ("16.8-limitless", "aurora-postgresql16"),
+    ("16.9", "aurora-postgresql16"),
+    ("16.9-limitless", "aurora-postgresql16"),
+    ("16.10", "aurora-postgresql16"),
+    ("16.10-limitless", "aurora-postgresql16"),
+    ("16.11", "aurora-postgresql16"),
+    ("16.11-limitless", "aurora-postgresql16"),
+    ("16.13", "aurora-postgresql16"),
+    ("16.13-limitless", "aurora-postgresql16"),
+    ("16.14", "aurora-postgresql16"),
+    ("17.4", "aurora-postgresql17"),
+    ("17.5", "aurora-postgresql17"),
+    ("17.6", "aurora-postgresql17"),
+    ("17.7", "aurora-postgresql17"),
+    ("17.9", "aurora-postgresql17"),
+    ("17.10", "aurora-postgresql17"),
+    ("18.3", "aurora-postgresql18"),
+    ("18.4", "aurora-postgresql18"),
+]
+AURORA_POSTGRESQL_ENGINE_VERSION_SET = {
+    version for version, _ in AURORA_POSTGRESQL_ENGINE_VERSIONS
+}
+
 AURORA_MYSQL_IMAGE_MAP = {
     "5.6": "mysql:5.6",
     "5.7": "mysql:5.7",
@@ -2376,11 +2433,11 @@ def _create_db_instance(p):
     if not db_id:
         return _error("MissingParameter", "DBInstanceIdentifier is required", 400)
     if db_id in _instances:
-        return _error("DBInstanceAlreadyExistsFault", f"DB instance {db_id} already exists", 400)
+        return _error("DBInstanceAlreadyExists", f"DB instance {db_id} already exists", 400)
 
     engine = _p(p, "Engine") or "postgres"
     explicit_engine_version = _p(p, "EngineVersion")
-    engine_version_error = _unsupported_aurora_mysql_engine_version_error(engine, explicit_engine_version)
+    engine_version_error = _unsupported_aurora_engine_version_error(engine, explicit_engine_version)
     if engine_version_error:
         return engine_version_error
     engine_version = explicit_engine_version or _default_engine_version(engine)
@@ -3173,7 +3230,7 @@ def _create_read_replica(p):
         return _error("DBInstanceNotFound", f"DBInstance {source_id} not found.", 404)
     source_id = source["DBInstanceIdentifier"]
     if replica_id in _instances:
-        return _error("DBInstanceAlreadyExistsFault", f"DBInstance {replica_id} already exists.", 400)
+        return _error("DBInstanceAlreadyExists", f"DBInstance {replica_id} already exists.", 400)
 
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:db:{replica_id}"
     replica = dict(source)
@@ -3214,7 +3271,7 @@ def _restore_from_snapshot(p):
     snap_id = _p(p, "DBSnapshotIdentifier")
 
     if db_id in _instances:
-        return _error("DBInstanceAlreadyExistsFault", f"DBInstance {db_id} already exists.", 400)
+        return _error("DBInstanceAlreadyExists", f"DBInstance {db_id} already exists.", 400)
 
     snap = _snapshots.get(snap_id)
     if not snap:
@@ -3225,7 +3282,8 @@ def _restore_from_snapshot(p):
         "DBInstanceIdentifier": db_id,
         "DBInstanceClass": _p(p, "DBInstanceClass") or snap.get("DBInstanceClass", "db.t3.micro"),
         "Engine": snap.get("Engine", "postgres"),
-        "EngineVersion": snap.get("EngineVersion", "15.3"),
+        "EngineVersion": snap.get("EngineVersion")
+        or _default_engine_version(snap.get("Engine", "postgres")),
         "DBInstanceStatus": "available",
         "MasterUsername": snap.get("MasterUsername", "admin"),
         "DBName": snap.get("DBName", ""),
@@ -3322,7 +3380,7 @@ def _create_db_cluster(p):
             )
         engine = expected_engine or engine
     explicit_engine_version = _p(p, "EngineVersion")
-    engine_version_error = _unsupported_aurora_mysql_engine_version_error(engine, explicit_engine_version)
+    engine_version_error = _unsupported_aurora_engine_version_error(engine, explicit_engine_version)
     if engine_version_error:
         return engine_version_error
     engine_version = explicit_engine_version or _default_engine_version(engine)
@@ -4938,11 +4996,7 @@ def _describe_engine_versions(p):
         "mariadb": [
             ("10.6.14", "10.6"), ("10.5.21", "10.5"),
         ],
-        "aurora-postgresql": [
-            ("18.3", "aurora-postgresql18"), ("17.5", "aurora-postgresql17"),
-            ("16.4", "aurora-postgresql16"),
-            ("15.3", "aurora-postgresql15"), ("14.8", "aurora-postgresql14"),
-        ],
+        "aurora-postgresql": AURORA_POSTGRESQL_ENGINE_VERSIONS,
         "aurora-mysql": AURORA_MYSQL_ENGINE_VERSIONS,
     }
     versions = versions_map.get(engine, [("15.3", "15")])
@@ -4976,7 +5030,7 @@ def _describe_orderable_options(p):
     engine = _p(p, "Engine") or "postgres"
     engine_version = _p(p, "EngineVersion")
     db_class = _p(p, "DBInstanceClass")
-    engine_version_error = _unsupported_aurora_mysql_engine_version_error(engine, engine_version)
+    engine_version_error = _unsupported_aurora_engine_version_error(engine, engine_version)
     if engine_version_error:
         return engine_version_error
 
@@ -5548,23 +5602,30 @@ def _format_time(ts):
 def _default_engine_version(engine):
     defaults = {
         "postgres": "15.3", "mysql": "8.0.33", "mariadb": "10.6.14",
-        "aurora-postgresql": "15.3", "aurora-mysql": "8.0.mysql_aurora.3.10.3",
+        "aurora-postgresql": "17.7", "aurora-mysql": "8.0.mysql_aurora.3.10.3",
     }
     return defaults.get(engine, "15.3")
 
 
-def _unsupported_aurora_mysql_engine_version_error(engine, engine_version):
-    if (
-        engine == "aurora-mysql"
-        and engine_version
-        and engine_version not in AURORA_MYSQL_ENGINE_VERSION_SET
-    ):
-        return _error(
-            "InvalidParameterCombination",
-            f"Cannot find version {engine_version} for aurora-mysql",
-            400,
-        )
-    return None
+def _unsupported_aurora_engine_version_error(engine, engine_version):
+    supported = {
+        "aurora-mysql": AURORA_MYSQL_ENGINE_VERSION_SET,
+        "aurora-postgresql": AURORA_POSTGRESQL_ENGINE_VERSION_SET,
+    }.get(engine)
+    if supported is None or not engine_version or engine_version in supported:
+        return None
+    # Real AWS also accepts a dot-boundary prefix of a creatable version and
+    # resolves it to a concrete minor server-side: aurora-postgresql "16" and
+    # aurora-mysql "8.0" (or "8.0.mysql_aurora.3.04") are all valid inputs.
+    # Ministack stores the prefix as given; the Docker image is derived from
+    # the major, so the running database matches what the prefix requested.
+    if any(version.startswith(engine_version + ".") for version in supported):
+        return None
+    return _error(
+        "InvalidParameterCombination",
+        f"Cannot find version {engine_version} for {engine}",
+        400,
+    )
 
 
 def _mysql_community_major_minor(engine_version):
