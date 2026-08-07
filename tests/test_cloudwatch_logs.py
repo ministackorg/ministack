@@ -1578,3 +1578,24 @@ def test_logs_resource_policy_limit_of_ten(logs):
     finally:
         for name in created:
             logs.delete_resource_policy(policyName=name)
+
+
+def test_logs_delivery_source_tag_round_trip(logs):
+    """ARN-based tag operations resolve the vended-delivery records too — the
+    AWS provider reads tags back on every aws_cloudwatch_log_delivery_* after
+    create."""
+    src_name = "qa-logs-ds-tags"
+    put = logs.put_delivery_source(
+        name=src_name,
+        resourceArn="arn:aws:events:us-east-1:000000000000:event-bus/qa-ds-tags-bus",
+        logType="APPLICATION_LOGS",
+        tags={"env": "qa"},
+    )
+    arn = put["deliverySource"]["arn"]
+
+    assert logs.list_tags_for_resource(resourceArn=arn)["tags"] == {"env": "qa"}
+    logs.tag_resource(resourceArn=arn, tags={"team": "events"})
+    assert logs.list_tags_for_resource(resourceArn=arn)["tags"] == {"env": "qa", "team": "events"}
+    logs.untag_resource(resourceArn=arn, tagKeys=["env"])
+    assert logs.list_tags_for_resource(resourceArn=arn)["tags"] == {"team": "events"}
+    logs.delete_delivery_source(name=src_name)
