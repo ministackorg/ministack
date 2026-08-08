@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **EventBridge — API destination targets are now invoked over HTTP on `PutEvents`** — API destinations and connections were control-plane stubs: a matching rule with an api-destination target logged "unsupported event target ARN" and dropped the event, so webhook-style pipelines (EventBridge → HTTPS endpoint) could not be tested locally. Matching events now POST (or the destination's configured method) to the `InvocationEndpoint` with the input-selected payload (`Input` / `InputPath` / `InputTransformer` apply as for other targets). Connection authorization is honored: `BASIC` populates `Authorization: Basic …`, `API_KEY` sends the configured header, and `OAUTH_CLIENT_CREDENTIALS` exchanges the client ID/secret at the authorization endpoint (`OAuthHttpParameters` merged in, `grant_type=client_credentials` defaulted), caches the token per connection and invalidates it when the connection is deleted, re-authorized, or deauthorized (a connection recreated under a reused name never inherits its predecessor's token), refreshes proactively when it expires within 60 seconds, and refreshes + retries once on a `401`/`407` response — matching documented AWS behavior. Connection `InvocationHttpParameters` and target `HttpParameters` are merged with connection values taking precedence (per the `HttpParameters` API reference), `PathParameterValues` populate `*` path wildcards, and body parameters fold into JSON-object bodies. Requests carry the AWS default headers (`User-Agent: Amazon/EventBridge/ApiDestinations` and `Range` non-overridable, `Content-Type` defaulting to `application/json; charset=utf-8`), strip the headers real EventBridge removes, and time out after 5 seconds (the documented maximum client execution timeout). Delivery runs on a background thread mirroring the SNS HTTP(S) path. Not modeled, mirroring the cross-region FailedInvocations policy: the 24h/185-attempt retry pipeline, `Retry-After`, DLQs, and `InvocationRateLimitPerSecond` — retryable statuses (`401`, `407`, `409`, `429`, `5xx`) are logged and dropped.
+
 ## [1.4.14] — 2026-08-07
 
 ### Added
