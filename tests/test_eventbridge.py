@@ -3141,6 +3141,135 @@ def test_eventbridge_api_destination_oauth_client_credentials(eb):
         server.shutdown()
 
 
+def _oauth_params(issuer_port, client_secret="csec"):
+    return {
+        "OAuthParameters": {
+            "AuthorizationEndpoint": f"http://127.0.0.1:{issuer_port}/oauth/token",
+            "HttpMethod": "POST",
+            "ClientParameters": {"ClientID": "cid", "ClientSecret": client_secret},
+            "OAuthHttpParameters": {
+                "BodyParameters": [{"Key": "grant_type", "Value": "client_credentials"}]
+            },
+        }
+    }
+
+
+def _oauth_entry(bus_name, source):
+    return {
+        "Source": source,
+        "DetailType": "Ping",
+        "Detail": json.dumps({"n": 1}),
+        "EventBusName": bus_name,
+    }
+
+
+def test_eventbridge_api_destination_oauth_token_dies_with_the_connection(eb):
+    """A recreated connection re-authorizes: the token cache is keyed by name,
+    and names are reusable, so a delete must not leave a token behind for the
+    next connection to inherit. Terraform replacing a connection in place is
+    the everyday way to hit this."""
+    issuer, token_requests = _start_oauth_issuer(tokens=("tok-1", "tok-2"))
+    server, captured = _start_api_dest_capture_server()
+    try:
+        issuer_port = issuer.server_address[1]
+        port = server.server_address[1]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "oauthrecreate",
+            f"http://127.0.0.1:{port}/secured",
+            "OAUTH_CLIENT_CREDENTIALS",
+            _oauth_params(issuer_port),
+        )
+        entry = _oauth_entry(bus_name, source)
+        eb.put_events(Entries=[entry])
+        assert _wait_until(lambda: len(captured) >= 1)
+        assert len(token_requests) == 1
+
+        # Same name, so the API destination's ConnectionArn still resolves.
+        conn_name = "qa-eb-apidest-oauthrecreate-conn"
+        eb.delete_connection(Name=conn_name)
+        eb.create_connection(
+            Name=conn_name,
+            AuthorizationType="OAUTH_CLIENT_CREDENTIALS",
+            AuthParameters=_oauth_params(issuer_port, client_secret="rotated"),
+        )
+
+        eb.put_events(Entries=[entry])
+        assert _wait_until(lambda: len(captured) >= 2)
+        assert len(token_requests) == 2
+        assert token_requests[1]["form"]["client_secret"] == "rotated"
+        assert captured[1]["headers"]["authorization"] == "Bearer tok-2"
+    finally:
+        issuer.shutdown()
+        server.shutdown()
+
+
+def test_eventbridge_api_destination_oauth_token_evicted_on_reauthorization(eb):
+    """Rotating the client secret must take effect on the next invocation, not
+    whenever the old token happens to expire."""
+    issuer, token_requests = _start_oauth_issuer(tokens=("tok-1", "tok-2"))
+    server, captured = _start_api_dest_capture_server()
+    try:
+        issuer_port = issuer.server_address[1]
+        port = server.server_address[1]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "oauthrotate",
+            f"http://127.0.0.1:{port}/secured",
+            "OAUTH_CLIENT_CREDENTIALS",
+            _oauth_params(issuer_port),
+        )
+        entry = _oauth_entry(bus_name, source)
+        eb.put_events(Entries=[entry])
+        assert _wait_until(lambda: len(captured) >= 1)
+        assert len(token_requests) == 1
+
+        eb.update_connection(
+            Name="qa-eb-apidest-oauthrotate-conn",
+            AuthorizationType="OAUTH_CLIENT_CREDENTIALS",
+            AuthParameters=_oauth_params(issuer_port, client_secret="rotated"),
+        )
+
+        eb.put_events(Entries=[entry])
+        assert _wait_until(lambda: len(captured) >= 2)
+        assert len(token_requests) == 2
+        assert token_requests[1]["form"]["client_secret"] == "rotated"
+        assert captured[1]["headers"]["authorization"] == "Bearer tok-2"
+    finally:
+        issuer.shutdown()
+        server.shutdown()
+
+
+def test_eventbridge_api_destination_oauth_token_survives_metadata_update(eb):
+    """The mirror image: a description-only update does not re-authorize, so
+    the cached token stays and no needless exchange is made."""
+    issuer, token_requests = _start_oauth_issuer(tokens=("tok-1", "tok-2"))
+    server, captured = _start_api_dest_capture_server()
+    try:
+        issuer_port = issuer.server_address[1]
+        port = server.server_address[1]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "oauthdescr",
+            f"http://127.0.0.1:{port}/secured",
+            "OAUTH_CLIENT_CREDENTIALS",
+            _oauth_params(issuer_port),
+        )
+        entry = _oauth_entry(bus_name, source)
+        eb.put_events(Entries=[entry])
+        assert _wait_until(lambda: len(captured) >= 1)
+
+        eb.update_connection(Name="qa-eb-apidest-oauthdescr-conn", Description="renamed")
+
+        eb.put_events(Entries=[entry])
+        assert _wait_until(lambda: len(captured) >= 2)
+        assert len(token_requests) == 1
+        assert captured[1]["headers"]["authorization"] == "Bearer tok-1"
+    finally:
+        issuer.shutdown()
+        server.shutdown()
+
+
 def test_eventbridge_api_destination_oauth_refresh_on_401(eb):
     issuer, token_requests = _start_oauth_issuer(tokens=("tok-old", "tok-new"))
     server, captured = _start_api_dest_capture_server(status_plan=[401, 200])

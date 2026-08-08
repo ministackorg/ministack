@@ -1581,6 +1581,20 @@ def _oauth_authorization_header(conn: dict, token_key, force_refresh: bool = Fal
     return f"{cached['type']} {cached['token']}"
 
 
+def _evict_oauth_token(name: str):
+    """Drop a connection's cached access token.
+
+    The cache is keyed by connection NAME, and names are reusable: on real
+    EventBridge the token lives and dies with the connection, so a connection
+    that is deleted (and possibly recreated under the same name), has its auth
+    parameters replaced, or is deauthorized must perform a fresh
+    client_credentials exchange rather than keep serving a token minted from
+    credentials that no longer apply.
+    """
+    with _oauth_tokens_lock:
+        _oauth_tokens.pop((get_account_id(), get_region(), name), None)
+
+
 def _connection_auth_headers(conn: dict, token_key, force_refresh: bool = False) -> dict:
     """Authorization header(s) for one delivery, mirroring how real EventBridge
     populates them from the connection secret: BASIC → ``Authorization:
@@ -2313,6 +2327,7 @@ def _delete_connection(data):
     if not conn:
         return error_response_json("ResourceNotFoundException",
                                    f"Connection {name} does not exist.", 400)
+    _evict_oauth_token(name)
     return json_response({
         "ConnectionArn": conn["ConnectionArn"],
         "ConnectionState": "DELETING",
@@ -2352,6 +2367,11 @@ def _update_connection(data):
     for key in ("AuthorizationType", "AuthParameters", "Description"):
         if key in data:
             conn[key] = data[key]
+    if "AuthParameters" in data or "AuthorizationType" in data:
+        # Re-authorization: the new credentials, not the cached token, decide
+        # what the next invocation carries. A description-only update does not
+        # re-authorize, so it keeps the token.
+        _evict_oauth_token(name)
     conn["LastModifiedTime"] = now
     conn["ConnectionState"] = "AUTHORIZED"
     conn["LastAuthorizedTime"] = now
@@ -2375,6 +2395,7 @@ def _deauthorize_connection(data):
     conn["ConnectionState"] = "DEAUTHORIZED"
     conn["LastModifiedTime"] = now
     conn.pop("LastAuthorizedTime", None)
+    _evict_oauth_token(name)
     return json_response({
         "ConnectionArn": conn["ConnectionArn"],
         "ConnectionState": conn["ConnectionState"],
