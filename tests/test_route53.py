@@ -334,6 +334,125 @@ def test_route53_delete_record(r53):
     a_records = [rrs for rrs in list_resp["ResourceRecordSets"] if rrs["Type"] == "A"]
     assert len(a_records) == 0
 
+def _create_zone_with_a_record(r53, zone_name, values, ttl=300):
+    resp = r53.create_hosted_zone(Name=zone_name, CallerReference=f"ref-{zone_name}")
+    zone_id = resp["HostedZone"]["Id"].split("/")[-1]
+    r53.change_resource_record_sets(
+        HostedZoneId=zone_id,
+        ChangeBatch={
+            "Changes": [
+                {
+                    "Action": "CREATE",
+                    "ResourceRecordSet": {
+                        "Name": f"www.{zone_name}",
+                        "Type": "A",
+                        "TTL": ttl,
+                        "ResourceRecords": [{"Value": v} for v in values],
+                    },
+                }
+            ]
+        },
+    )
+    return zone_id
+
+def _a_records(r53, zone_id):
+    list_resp = r53.list_resource_record_sets(HostedZoneId=zone_id)
+    return [rrs for rrs in list_resp["ResourceRecordSets"] if rrs["Type"] == "A"]
+
+def test_route53_delete_record_rejects_value_mismatch(r53):
+    # Real Route 53 requires DELETE to specify the record's current values
+    # exactly and rejects the whole batch otherwise:
+    # https://docs.aws.amazon.com/Route53/latest/APIReference/API_ChangeResourceRecordSets.html
+    zone_id = _create_zone_with_a_record(r53, "delmismatch.com", ["5.5.5.5"])
+
+    with pytest.raises(ClientError) as exc:
+        r53.change_resource_record_sets(
+            HostedZoneId=zone_id,
+            ChangeBatch={
+                "Changes": [
+                    {
+                        "Action": "CREATE",
+                        "ResourceRecordSet": {
+                            "Name": "other.delmismatch.com",
+                            "Type": "A",
+                            "TTL": 300,
+                            "ResourceRecords": [{"Value": "7.7.7.7"}],
+                        },
+                    },
+                    {
+                        "Action": "DELETE",
+                        "ResourceRecordSet": {
+                            "Name": "www.delmismatch.com",
+                            "Type": "A",
+                            "TTL": 300,
+                            "ResourceRecords": [{"Value": "6.6.6.6"}],
+                        },
+                    },
+                ]
+            },
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidChangeBatch"
+    assert (
+        "Tried to delete resource record set [name='www.delmismatch.com.', type='A'] "
+        "but the values provided do not match the current values"
+    ) in exc.value.response["Error"]["Message"]
+
+    # The batch is atomic: the record survives and the CREATE was not applied.
+    remaining = _a_records(r53, zone_id)
+    assert len(remaining) == 1
+    assert remaining[0]["Name"] == "www.delmismatch.com."
+    assert remaining[0]["ResourceRecords"] == [{"Value": "5.5.5.5"}]
+
+def test_route53_delete_record_rejects_ttl_mismatch(r53):
+    zone_id = _create_zone_with_a_record(r53, "delttl.com", ["5.5.5.5"], ttl=300)
+
+    with pytest.raises(ClientError) as exc:
+        r53.change_resource_record_sets(
+            HostedZoneId=zone_id,
+            ChangeBatch={
+                "Changes": [
+                    {
+                        "Action": "DELETE",
+                        "ResourceRecordSet": {
+                            "Name": "www.delttl.com",
+                            "Type": "A",
+                            "TTL": 60,
+                            "ResourceRecords": [{"Value": "5.5.5.5"}],
+                        },
+                    }
+                ]
+            },
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidChangeBatch"
+    assert (
+        "Tried to delete resource record set [name='www.delttl.com.', type='A'] "
+        "but the values provided do not match the current values"
+    ) in exc.value.response["Error"]["Message"]
+    assert len(_a_records(r53, zone_id)) == 1
+
+def test_route53_delete_record_accepts_reordered_values(r53):
+    # Route 53 compares resource record values as a set, so a DELETE listing
+    # the same values in a different order must match.
+    zone_id = _create_zone_with_a_record(r53, "delorder.com", ["5.5.5.5", "6.6.6.6"])
+
+    r53.change_resource_record_sets(
+        HostedZoneId=zone_id,
+        ChangeBatch={
+            "Changes": [
+                {
+                    "Action": "DELETE",
+                    "ResourceRecordSet": {
+                        "Name": "www.delorder.com",
+                        "Type": "A",
+                        "TTL": 300,
+                        "ResourceRecords": [{"Value": "6.6.6.6"}, {"Value": "5.5.5.5"}],
+                    },
+                }
+            ]
+        },
+    )
+    assert len(_a_records(r53, zone_id)) == 0
+
 def test_route53_get_change(r53):
     resp = r53.create_hosted_zone(Name="change-status.com", CallerReference="ref-cs-1")
     zone_id = resp["HostedZone"]["Id"].split("/")[-1]

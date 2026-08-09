@@ -220,6 +220,16 @@ def _rs_key(rs: dict) -> tuple:
     return (rs["Name"], rs["Type"], rs.get("SetIdentifier", ""))
 
 
+def _rs_values(rs: dict) -> dict:
+    """The value-bearing fields of a record set — everything a DELETE must
+    match exactly, per the Route 53 API reference. Resource record values
+    are compared as an unordered set (order never matters to Route 53)."""
+    values = {k: v for k, v in rs.items() if k not in ("Name", "Type", "SetIdentifier")}
+    if "ResourceRecords" in values:
+        values["ResourceRecords"] = sorted(values["ResourceRecords"])
+    return values
+
+
 # ─── XML builders for common structures ───────────────────────────────────────
 
 def _build_hosted_zone_el(parent: Element, zone: dict):
@@ -629,6 +639,12 @@ def _change_resource_record_sets(zone_id: str, body: bytes):
                     return _error_response(
                         "InvalidChangeBatch",
                         f"Tried to delete resource record set {rs['Name']} type {rs['Type']} but it does not exist.",
+                    )
+                if _rs_values(existing) != _rs_values(rs):
+                    return _error_response(
+                        "InvalidChangeBatch",
+                        f"Tried to delete resource record set [name='{rs['Name']}', type='{rs['Type']}'] "
+                        "but the values provided do not match the current values",
                     )
                 current = [r for r in current if _rs_key(r) != key]
 
