@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **Route 53 — `ChangeResourceRecordSets` `DELETE` now requires the values provided to match the current values** — a `DELETE` matched only on name, type, and set identifier, so a delete carrying a stale TTL or stale record values silently removed the live record. Real Route 53 requires the values in a `DELETE` to match the current record exactly and rejects the whole batch with `InvalidChangeBatch` otherwise — the compare-and-swap semantics that guarded-delete workflows (delete only if the record still holds the values I last observed) rely on to detect concurrent modification, which the emulator's silent success defeated. A mismatched `DELETE` now fails the batch atomically with the AWS-shaped message (`Tried to delete resource record set [name='…', type='…'] but the values provided do not match the current values`); record values are compared as an unordered set, so the same values in a different order still match. Contributed by @jayjanssen.
+
 ## [1.4.14] — 2026-08-07
 
 ### Added
