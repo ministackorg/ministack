@@ -4,11 +4,13 @@ JSON-based API via X-Amz-Target (prefix: TrentService).
 Supports: CreateKey, ListKeys, DescribeKey, Sign, Verify,
           Encrypt, Decrypt, GenerateDataKey,
           GenerateDataKeyWithoutPlaintext, GenerateDataKeyPair,
-          GenerateDataKeyPairWithoutPlaintext.
+          GenerateDataKeyPairWithoutPlaintext, GenerateMac, VerifyMac.
 """
 
 import base64
+import binascii
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -52,8 +54,31 @@ _keys = AccountRegionScopedDict()
 #     _private_key (asymmetric private key object, RSA/ECC only),
 #     _public_key_der (bytes, RSA/ECC only),
 #     _symmetric_key (bytes, SYMMETRIC_DEFAULT only),
+#     _hmac_key (bytes, HMAC_* only),
 # }
 _aliases = AccountRegionScopedDict()  # alias ARN -> key_id
+
+_HMAC_KEY_SPECS = {
+    "HMAC_224": ("HMAC_SHA_224", 28),
+    "HMAC_256": ("HMAC_SHA_256", 32),
+    "HMAC_384": ("HMAC_SHA_384", 48),
+    "HMAC_512": ("HMAC_SHA_512", 64),
+}
+
+_MAC_ALGORITHM_DIGESTS = {
+    "HMAC_SHA_224": "sha224",
+    "HMAC_SHA_256": "sha256",
+    "HMAC_SHA_384": "sha384",
+    "HMAC_SHA_512": "sha512",
+}
+
+MAC_KEY_USAGE = "GENERATE_VERIFY_MAC"
+
+MAC_MESSAGE_MAX_BYTES = 4096
+
+MAC_MAX_BYTES = 6144
+
+_MAX_MESSAGE_B64_CHARS = 4 * ((MAC_MESSAGE_MAX_BYTES + 2) // 3)
 
 
 def _alias_arn(alias_name):
@@ -80,9 +105,12 @@ def get_state():
     # Iterate _data directly to capture ALL accounts
     for scoped_key, rec in _keys._data.items():
         entry = {k: v for k, v in rec.items()
-                 if k not in ("_private_key", "_public_key_der", "_symmetric_key")}
+                 if k not in ("_private_key", "_public_key_der", "_symmetric_key",
+                              "_hmac_key")}
         if "_symmetric_key" in rec:
             entry["_symmetric_key_b64"] = base64.b64encode(rec["_symmetric_key"]).decode()
+        if "_hmac_key" in rec:
+            entry["_hmac_key_b64"] = base64.b64encode(rec["_hmac_key"]).decode()
         if "_public_key_der" in rec:
             entry["_public_key_der_b64"] = base64.b64encode(rec["_public_key_der"]).decode()
         if "_private_key" in rec and HAS_CRYPTO:
@@ -115,6 +143,8 @@ def restore_state(data):
         def _restore_key_entry(entry):
             if "_symmetric_key_b64" in entry:
                 entry["_symmetric_key"] = base64.b64decode(entry.pop("_symmetric_key_b64"))
+            if "_hmac_key_b64" in entry:
+                entry["_hmac_key"] = base64.b64decode(entry.pop("_hmac_key_b64"))
             if "_public_key_der_b64" in entry:
                 entry["_public_key_der"] = base64.b64decode(entry.pop("_public_key_der_b64"))
             if "_private_key_pem" in entry and HAS_CRYPTO:
@@ -185,7 +215,7 @@ def _arn(key_id):
 
 
 def _key_metadata(rec):
-    meta = {
+    metadata = {
         "KeyId": rec["KeyId"],
         "Arn": rec["Arn"],
         "CreationDate": rec["CreationDate"],
@@ -197,14 +227,17 @@ def _key_metadata(rec):
         "KeyManager": "CUSTOMER",
         "CustomerMasterKeySpec": rec["KeySpec"],
         "KeySpec": rec["KeySpec"],
-        "EncryptionAlgorithms": rec.get("EncryptionAlgorithms", []),
-        "SigningAlgorithms": rec.get("SigningAlgorithms", []),
     }
+    if _is_hmac_key(rec):
+        metadata["MacAlgorithms"] = rec.get("MacAlgorithms", [])
+    else:
+        metadata["EncryptionAlgorithms"] = rec.get("EncryptionAlgorithms", [])
+        metadata["SigningAlgorithms"] = rec.get("SigningAlgorithms", [])
     # "This value is present only when the KMS key is scheduled for deletion,
     # that is, when its KeyState is PendingDeletion."
     if "DeletionDate" in rec:
-        meta["DeletionDate"] = rec["DeletionDate"]
-    return meta
+        metadata["DeletionDate"] = rec["DeletionDate"]
+    return metadata
 
 
 def _key_ref_from_arn(key_id_or_arn):
@@ -267,6 +300,21 @@ def _check_key_state(rec):
     return None
 
 
+def _is_hmac_key(rec):
+    return "_hmac_key" in rec or rec.get("KeySpec") in _HMAC_KEY_SPECS
+
+
+def _reject_hmac_key(rec, operation):
+    if _is_hmac_key(rec):
+        return error_response_json(
+            "InvalidKeyUsageException",
+            f"{rec['Arn']} key usage is {rec.get('KeyUsage', MAC_KEY_USAGE)} "
+            f"which is not valid for {operation}.",
+            400,
+        )
+    return None
+
+
 def _require_crypto(operation):
     if not HAS_CRYPTO:
         return error_response_json(
@@ -285,6 +333,21 @@ def _create_key(data):
     key_id = new_uuid()
     key_spec = data.get("KeySpec", data.get("CustomerMasterKeySpec", "SYMMETRIC_DEFAULT"))
     key_usage = data.get("KeyUsage", "ENCRYPT_DECRYPT")
+    if key_spec in _HMAC_KEY_SPECS and key_usage != MAC_KEY_USAGE:
+        return error_response_json(
+            "ValidationException",
+            f"KeyUsage {key_usage} is not compatible with KeySpec {key_spec}. "
+            f"HMAC KMS keys require KeyUsage {MAC_KEY_USAGE}.",
+            400,
+        )
+    if key_usage == MAC_KEY_USAGE and key_spec not in _HMAC_KEY_SPECS:
+        return error_response_json(
+            "ValidationException",
+            f"KeyUsage {MAC_KEY_USAGE} is not compatible with KeySpec {key_spec}. "
+            "It requires one of: "
+            f"[{', '.join(sorted(_HMAC_KEY_SPECS))}]",
+            400,
+        )
     description = data.get("Description", "")
     tags = data.get("Tags", [])
     policy = data.get("Policy", json.dumps({
@@ -317,6 +380,10 @@ def _create_key(data):
         rec["_symmetric_key"] = os.urandom(32)
         rec["EncryptionAlgorithms"] = ["SYMMETRIC_DEFAULT"]
         rec["SigningAlgorithms"] = []
+    elif key_spec in _HMAC_KEY_SPECS:
+        mac_algorithm, material_len = _HMAC_KEY_SPECS[key_spec]
+        rec["_hmac_key"] = os.urandom(material_len)
+        rec["MacAlgorithms"] = [mac_algorithm]
     elif key_spec in ("RSA_2048", "RSA_3072", "RSA_4096"):
         err = _require_crypto("CreateKey")
         if err:
@@ -419,6 +486,9 @@ def _get_public_key(data):
     rec = _resolve_key(key_id)
     if not rec:
         return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+    err = _reject_hmac_key(rec, "GetPublicKey")
+    if err:
+        return err
     if "_public_key_der" not in rec:
         return error_response_json(
             "UnsupportedOperationException",
@@ -436,15 +506,14 @@ def _get_public_key(data):
 
 
 def _sign(data):
-    err = _require_crypto("Sign")
-    if err:
-        return err
-
     key_id = data.get("KeyId", "")
     rec = _resolve_key(key_id)
     if not rec:
         return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
-    err = _check_key_state(rec)
+    err = _check_key_state(rec) or _reject_hmac_key(rec, "Sign")
+    if err:
+        return err
+    err = _require_crypto("Sign")
     if err:
         return err
     if "_private_key" not in rec:
@@ -532,15 +601,14 @@ def _sign(data):
 
 
 def _verify(data):
-    err = _require_crypto("Verify")
-    if err:
-        return err
-
     key_id = data.get("KeyId", "")
     rec = _resolve_key(key_id)
     if not rec:
         return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
-    err = _check_key_state(rec)
+    err = _check_key_state(rec) or _reject_hmac_key(rec, "Verify")
+    if err:
+        return err
+    err = _require_crypto("Verify")
     if err:
         return err
     if "_private_key" not in rec:
@@ -674,12 +742,177 @@ def _signing_params(algorithm, for_verify=False):
     return algo_map.get(algorithm, (None, None))
 
 
+def _blob_too_long_error(field_name, max_bytes):
+    return error_response_json(
+        "ValidationException",
+        f"1 validation error detected: Value at '{field_name}' failed to "
+        "satisfy constraint: Member must have length less than or equal to "
+        f"{max_bytes}",
+        400,
+    )
+
+
+def _decode_blob(value, field_name, max_bytes=None):
+    if max_bytes is not None and isinstance(value, str) and len(value) > 4 * ((max_bytes + 2) // 3):
+        return None, _blob_too_long_error(field_name, max_bytes)
+    if isinstance(value, (bytes, bytearray)):
+        decoded = bytes(value)
+    elif isinstance(value, str):
+        try:
+            decoded = base64.b64decode(value, validate=True)
+        except (binascii.Error, ValueError):
+            return None, error_response_json(
+                "SerializationException",
+                f"Invalid base64 encoding for '{field_name}'",
+                400,
+            )
+    else:
+        return None, error_response_json(
+            "SerializationException",
+            f"Expected a base64-encoded blob for '{field_name}'",
+            400,
+        )
+    if max_bytes is not None and len(decoded) > max_bytes:
+        return None, _blob_too_long_error(field_name, max_bytes)
+    return decoded, None
+
+
+def _message_too_long_error():
+    return error_response_json(
+        "ValidationException",
+        "1 validation error detected: Value at 'message' failed to satisfy "
+        "constraint: Member must have length less than or equal to "
+        f"{MAC_MESSAGE_MAX_BYTES}",
+        400,
+    )
+
+
+def _mac_params(data, operation):
+    algorithm = data.get("MacAlgorithm", "")
+    if algorithm not in _MAC_ALGORITHM_DIGESTS:
+        return None, None, None, error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{algorithm}' at 'macAlgorithm' "
+            "failed to satisfy constraint: Member must satisfy enum value set: "
+            f"[{', '.join(_MAC_ALGORITHM_DIGESTS)}]",
+            400,
+        )
+
+    raw_message = data.get("Message", "")
+    if isinstance(raw_message, str) and len(raw_message) > _MAX_MESSAGE_B64_CHARS:
+        return None, None, None, _message_too_long_error()
+
+    message, err = _decode_blob(raw_message, "message")
+    if err:
+        return None, None, None, err
+    if not message:
+        return None, None, None, error_response_json(
+            "ValidationException",
+            "1 validation error detected: Value at 'message' failed to satisfy "
+            "constraint: Member must have length greater than or equal to 1",
+            400,
+        )
+    if len(message) > MAC_MESSAGE_MAX_BYTES:
+        return None, None, None, _message_too_long_error()
+
+    key_id = data.get("KeyId", "")
+    rec = _resolve_key(key_id)
+    if not rec:
+        return None, None, None, error_response_json(
+            "NotFoundException", f"Key {key_id} not found", 400
+        )
+    err = _check_key_state(rec)
+    if err:
+        return None, None, None, err
+    if not _is_hmac_key(rec) or "_hmac_key" not in rec:
+        return None, None, None, error_response_json(
+            "InvalidKeyUsageException",
+            f"{rec['Arn']} key usage is {rec.get('KeyUsage', '')} which is not "
+            f"valid for {operation}. {operation} requires a key with key usage "
+            f"{MAC_KEY_USAGE}.",
+            400,
+        )
+    if algorithm not in rec.get("MacAlgorithms", []):
+        return None, None, None, error_response_json(
+            "InvalidKeyUsageException",
+            f"Algorithm {algorithm} is incompatible with key spec "
+            f"{rec.get('KeySpec', '')}.",
+            400,
+        )
+    return rec, algorithm, message, None
+
+
+def _compute_mac(rec, algorithm, message):
+    return hmac.new(
+        rec["_hmac_key"], message, _MAC_ALGORITHM_DIGESTS[algorithm]
+    ).digest()
+
+
+def _dry_run_error(operation):
+    return error_response_json(
+        "DryRunOperationException",
+        f"The {operation} request would have succeeded, but the DryRun option "
+        "is set.",
+        400,
+    )
+
+
+def _generate_mac(data):
+    rec, algorithm, message, err = _mac_params(data, "GenerateMac")
+    if err:
+        return err
+    if data.get("DryRun"):
+        return _dry_run_error("GenerateMac")
+
+    mac = _compute_mac(rec, algorithm, message)
+    logger.debug(
+        "Generated MAC over %d bytes with key %s (%s)",
+        len(message), rec["KeyId"], algorithm,
+    )
+    return json_response({
+        "KeyId": rec["Arn"],
+        "Mac": base64.b64encode(mac).decode(),
+        "MacAlgorithm": algorithm,
+    })
+
+
+def _verify_mac(data):
+    mac, err = _decode_blob(data.get("Mac", ""), "mac", MAC_MAX_BYTES)
+    if err:
+        return err
+    if not mac:
+        return error_response_json(
+            "ValidationException",
+            "1 validation error detected: Value at 'mac' failed to satisfy "
+            "constraint: Member must have length greater than or equal to 1",
+            400,
+        )
+
+    rec, algorithm, message, err = _mac_params(data, "VerifyMac")
+    if err:
+        return err
+    if not hmac.compare_digest(_compute_mac(rec, algorithm, message), mac):
+        return error_response_json(
+            "KMSInvalidMacException",
+            "The request was rejected because the HMAC verification failed.",
+            400,
+        )
+    if data.get("DryRun"):
+        return _dry_run_error("VerifyMac")
+
+    return json_response({
+        "KeyId": rec["Arn"],
+        "MacValid": True,
+        "MacAlgorithm": algorithm,
+    })
+
+
 def _encrypt(data):
     key_id = data.get("KeyId", "")
     rec = _resolve_key(key_id)
     if not rec:
         return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
-    err = _check_key_state(rec)
+    err = _reject_hmac_key(rec, "Encrypt") or _check_key_state(rec)
     if err:
         return err
 
@@ -769,7 +1002,7 @@ def _decrypt(data):
             "",
             400,
         )
-    err = _check_key_state(rec)
+    err = _check_key_state(rec) or _reject_hmac_key(rec, "Decrypt")
     if err:
         return err
 
@@ -834,7 +1067,7 @@ def _decrypt(data):
     })
 
 
-def _generate_data_key_common(data):
+def _generate_data_key_common(data, action="GenerateDataKey"):
     """Shared logic for GenerateDataKey and GenerateDataKeyWithoutPlaintext."""
     key_id = data.get("KeyId", "")
     rec = _resolve_key(key_id)
@@ -842,13 +1075,13 @@ def _generate_data_key_common(data):
         return None, None, error_response_json(
             "NotFoundException", f"Key {key_id} not found", 400
         )
-    err = _check_key_state(rec)
+    err = _check_key_state(rec) or _reject_hmac_key(rec, action)
     if err:
         return None, None, err
     if "_symmetric_key" not in rec:
         return None, None, error_response_json(
             "UnsupportedOperationException",
-            "GenerateDataKey requires a symmetric key",
+            f"{action} requires a symmetric key",
             400,
         )
 
@@ -910,7 +1143,7 @@ def _generate_data_key_pair_common(data, action):
         return None, None, error_response_json(
             "NotFoundException", f"Key {key_id} not found", 400
         )
-    err = _check_key_state(rec)
+    err = _check_key_state(rec) or _reject_hmac_key(rec, action)
     if err:
         return None, None, err
     # The CMK must be symmetric: it wraps the generated private key. Real AWS
@@ -1013,7 +1246,9 @@ def _generate_data_key_pair_without_plaintext(data):
 
 
 def _generate_data_key_without_plaintext(data):
-    rec, _data_key, result = _generate_data_key_common(data)
+    rec, _data_key, result = _generate_data_key_common(
+        data, "GenerateDataKeyWithoutPlaintext"
+    )
     if rec is None:
         return result
     return json_response({
@@ -1113,10 +1348,23 @@ def _update_alias(data):
 # ---- Key Rotation ----
 
 
+def _reject_rotation_for_hmac(rec, operation):
+    if _is_hmac_key(rec):
+        return error_response_json(
+            "UnsupportedOperationException",
+            f"{operation} is not supported for HMAC KMS keys ({rec['Arn']}).",
+            400,
+        )
+    return None
+
+
 def _enable_key_rotation(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
         return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+    err = _reject_rotation_for_hmac(rec, "EnableKeyRotation")
+    if err:
+        return err
     rec["KeyRotationEnabled"] = True
     rec["RotationPeriodInDays"] = data.get("RotationPeriodInDays", 365)
     return json_response({})
@@ -1273,6 +1521,8 @@ async def handle_request(method, path, headers, body, query_params):
         "Verify": _verify,
         "Encrypt": _encrypt,
         "Decrypt": _decrypt,
+        "GenerateMac": _generate_mac,
+        "VerifyMac": _verify_mac,
         "GenerateDataKey": _generate_data_key,
         "GenerateDataKeyWithoutPlaintext": _generate_data_key_without_plaintext,
         "GenerateDataKeyPair": _generate_data_key_pair,
