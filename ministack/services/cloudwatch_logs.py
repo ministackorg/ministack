@@ -1301,40 +1301,60 @@ def _list_tags_log_group(data):
 # Tags – modern ARN-based APIs
 # ---------------------------------------------------------------------------
 
+def _resolve_tag_record_by_arn(arn: str):
+    """Resolve a logs ARN to the mutable dict holding its ``tags``. The
+    ARN-based tag operations accept log groups AND the vended-delivery trio
+    (delivery sources, delivery destinations, deliveries) — the AWS provider
+    reads tags back on every one of them after create."""
+    group = _resolve_group_by_arn(arn)
+    if group:
+        return _log_groups[group].setdefault("tags", {})
+    for marker, store in (
+        (":delivery-source:", _delivery_sources),
+        (":delivery-destination:", _delivery_destinations),
+        (":delivery:", _deliveries),
+    ):
+        if marker in arn:
+            record = store.get(arn.rsplit(":", 1)[-1])
+            if record is not None:
+                return record.setdefault("tags", {})
+    return None
+
+
 def _tag_resource(data):
     arn = data.get("resourceArn", "")
-    group = _resolve_group_by_arn(arn)
-    if not group:
+    tags = _resolve_tag_record_by_arn(arn)
+    if tags is None:
         return error_response_json(
             "ResourceNotFoundException",
             f"The specified resource does not exist: {arn}", 400,
         )
-    _log_groups[group]["tags"].update(data.get("tags", {}))
+    tags.update(data.get("tags", {}))
     return json_response({})
 
 
 def _untag_resource(data):
     arn = data.get("resourceArn", "")
-    group = _resolve_group_by_arn(arn)
-    if not group:
+    tags = _resolve_tag_record_by_arn(arn)
+    if tags is None:
         return error_response_json(
             "ResourceNotFoundException",
             f"The specified resource does not exist: {arn}", 400,
         )
     for key in data.get("tagKeys", []):
-        _log_groups[group]["tags"].pop(key, None)
+        tags.pop(key, None)
     return json_response({})
 
 
 def _list_tags_for_resource(data):
     arn = data.get("resourceArn", "")
-    group = _resolve_group_by_arn(arn)
-    if not group:
+    tags = _resolve_tag_record_by_arn(arn)
+    if tags is None:
         return error_response_json(
             "ResourceNotFoundException",
             f"The specified resource does not exist: {arn}", 400,
         )
-    return json_response({"tags": dict(_log_groups[group]["tags"])})
+    return json_response({"tags": dict(tags)})
 
 
 # ---------------------------------------------------------------------------
