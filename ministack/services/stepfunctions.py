@@ -4514,12 +4514,13 @@ _XML_NUMERIC_FIELDS = frozenset({
     "MonitoringInterval", "PromotionTier", "DbInstancePort",
     "MaxAllocatedStorage", "StorageThroughput",
 })
-# Empty self-closing XML elements that should become [] not "".
+# Known AWS query-protocol list wrappers.  These remain lists for empty,
+# singleton, and multi-item responses, including irregular wrapper/item names.
 _XML_LIST_WRAPPER_TAGS = frozenset({
     "Parameters", "DBClusterMembers", "VpcSecurityGroups",
     "AvailabilityZones", "Subnets", "ReadReplicaDBInstanceIdentifiers",
     "ReadReplicaDBClusterIdentifiers", "DBSecurityGroups",
-    "OptionGroupMemberships", "StatusInfos", "DomainMemberships",
+    "OptionGroupMemberships", "OptionGroupsList", "StatusInfos", "DomainMemberships",
     "AssociatedRoles", "TagList", "ProcessorFeatures",
     "EnabledCloudwatchLogsExports", "GlobalClusterMembers",
     "DBParameterGroups", "DBInstances", "DBClusters", "Readers",
@@ -4582,11 +4583,11 @@ def _xml_element_to_dict(element):
         return tag, text
 
     # Detect list-wrapper elements: all children share the same tag name AND
-    # the parent looks like a plural wrapper (e.g. DBClusters→DBCluster,
-    # AvailabilityZones→AvailabilityZone) or children use the generic
-    # "member" tag.  We require either multiple children OR a plural naming
-    # pattern to avoid false positives on single-child result wrappers like
-    # <CreateDBClusterParameterGroupResult><DBClusterParameterGroup>...</>
+    # the parent is a known wrapper, looks like a plural wrapper (e.g.
+    # DBClusters→DBCluster, AvailabilityZones→AvailabilityZone), or children
+    # use the generic "member" tag.  Known wrappers cover AWS names whose item
+    # tag cannot be inferred from the wrapper name (e.g.
+    # VpcSecurityGroups→VpcSecurityGroupMembership).
     child_tags = {(c.tag.split("}")[-1] if "}" in c.tag else c.tag) for c in children}
     if len(child_tags) == 1:
         child_tag_name = next(iter(child_tags))
@@ -4597,7 +4598,7 @@ def _xml_element_to_dict(element):
             or (tag.endswith("Ids") and child_tag_name == "Id")
         )
         has_multiple = len(children) > 1
-        if is_member or is_plural or has_multiple:
+        if tag in _XML_LIST_WRAPPER_TAGS or is_member or is_plural or has_multiple:
             # Treat as a list.
             items = []
             for child in children:
