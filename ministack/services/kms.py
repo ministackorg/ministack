@@ -851,8 +851,7 @@ def _compute_mac(rec, algorithm, message):
 def _dry_run_error(operation):
     return error_response_json(
         "DryRunOperationException",
-        f"The {operation} request would have succeeded, but the DryRun option "
-        "is set.",
+        "The request was rejected because the DryRun parameter was specified.",
         400,
     )
 
@@ -1374,6 +1373,9 @@ def _disable_key_rotation(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
         return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+    err = _reject_rotation_for_hmac(rec, "DisableKeyRotation")
+    if err:
+        return err
     rec["KeyRotationEnabled"] = False
     return json_response({})
 
@@ -1382,6 +1384,9 @@ def _get_key_rotation_status(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
         return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+    err = _reject_rotation_for_hmac(rec, "GetKeyRotationStatus")
+    if err:
+        return err
     return json_response({
         "KeyRotationEnabled": rec.get("KeyRotationEnabled", False),
         "RotationPeriodInDays": rec.get("RotationPeriodInDays", 365),
