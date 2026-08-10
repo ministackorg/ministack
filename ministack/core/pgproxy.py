@@ -780,7 +780,9 @@ def _check_column_types(sql):
 # --- ALTER TABLE subset (AWS alter-table-syntax-support) ---------------------
 
 # DSQL supports only a subset of ALTER TABLE actions: ADD COLUMN (no inline
-# DEFAULT/NOT NULL — handled in _check_denylist), DROP COLUMN, SET/DROP
+# DEFAULT/NOT NULL — handled in _check_denylist), DROP COLUMN (one or more
+# columns, but not a primary key column — needs a catalog probe, so it lives in
+# _check_drop_column rather than here), SET/DROP
 # DEFAULT, DROP NOT NULL, DROP EXPRESSION, identity actions, SET STORAGE,
 # ADD CONSTRAINT ... CHECK ... NOT VALID, ADD CONSTRAINT ... UNIQUE USING
 # INDEX, DROP CONSTRAINT, RENAME, SET SCHEMA, OWNER TO, and the async
@@ -1278,6 +1280,82 @@ def _abort_gate(conn, sql):
     return None, sql
 
 
+async def _primary_key_columns(conn, b_writer, table):
+    """Primary key column names for ``table``; None if the probe failed."""
+    try:
+        frames = await _run_backend_capture(
+            conn,
+            b_writer,
+            "SELECT a.attname FROM pg_index i JOIN pg_attribute a "
+            "ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
+            f"WHERE i.indrelid = '{table}'::regclass AND i.indisprimary",
+        )
+    except Exception:
+        return None
+    cols = []
+    for type_byte, payload in frames:
+        if type_byte == b"E":
+            return None
+        if type_byte == b"D":
+            (nfields,) = struct.unpack("!H", payload[:2])
+            if nfields == 1:
+                (vlen,) = struct.unpack("!i", payload[2:6])
+                cols.append(payload[6 : 6 + vlen].decode("utf-8", "replace"))
+    return cols
+
+
+# ALTER TABLE ... DROP COLUMN is supported (multiple columns in one statement
+# are fine), but dropping a primary key column is not. The COLUMN keyword is
+# optional in Postgres, so the action keywords that merely start with DROP —
+# DROP CONSTRAINT / DEFAULT / NOT NULL / EXPRESSION / IDENTITY — have to be
+# told apart from a bare column name.
+_DROP_COLUMN_RE = re.compile(
+    r"\bDROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?([\w\".]+)", re.I
+)
+_DROP_NON_COLUMN_ACTIONS = frozenset(
+    ("constraint", "default", "not", "expression", "identity")
+)
+_ALTER_TABLE_TARGET_RE = re.compile(
+    r"\s*ALTER\s+TABLE\s+(?:ASYNC\s+)?(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?([\w\".]+)", re.I
+)
+
+
+def dropped_columns(sql):
+    """Column names an ALTER TABLE statement drops (may be several)."""
+    if not re.match(r"\s*ALTER\s+TABLE\b", sql, re.I):
+        return []
+    cols = []
+    for m in _DROP_COLUMN_RE.finditer(sql):
+        raw = m.group(1)
+        quoted = raw.startswith('"')
+        name = raw.strip('"')
+        if not quoted and name.lower() in _DROP_NON_COLUMN_ACTIONS:
+            continue
+        cols.append(name)
+    return cols
+
+
+async def _check_drop_column(conn, b_writer, sql):
+    """Refuse to drop a primary key column (AWS DSQL, 2026-08-03)."""
+    cols = dropped_columns(sql)
+    if not cols:
+        return None
+    m = _ALTER_TABLE_TARGET_RE.match(sql)
+    if not m:
+        return None
+    pk_cols = await _primary_key_columns(conn, b_writer, m.group(1).strip('"'))
+    if not pk_cols:
+        return None  # probe failed or no primary key — let the backend answer
+    lowered = {c.lower() for c in pk_cols}
+    for col in cols:
+        if col.lower() in lowered:
+            return DsqlError(
+                "0A000",
+                f'dropping primary key column "{col}" is not supported',
+            )
+    return None
+
+
 _FOR_UPDATE_MULTI = (
     "locking clause such as FOR UPDATE can be applied on a single table"
 )
@@ -1305,25 +1383,9 @@ async def _check_for_update(conn, b_writer, sql):
     if "," in from_part or re.search(r"\bJOIN\b", from_part, re.I):
         return DsqlError("0A000", _FOR_UPDATE_MULTI)
     table = from_part.strip().split()[0].strip('"')
-    try:
-        frames = await _run_backend_capture(
-            conn,
-            b_writer,
-            "SELECT a.attname FROM pg_index i JOIN pg_attribute a "
-            "ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
-            f"WHERE i.indrelid = '{table}'::regclass AND i.indisprimary",
-        )
-    except Exception:
+    pk_cols = await _primary_key_columns(conn, b_writer, table)
+    if pk_cols is None:
         return None  # probe failed — let the backend answer
-    pk_cols = []
-    for type_byte, payload in frames:
-        if type_byte == b"E":
-            return None
-        if type_byte == b"D":
-            (nfields,) = struct.unpack("!H", payload[:2])
-            if nfields == 1:
-                (vlen,) = struct.unpack("!i", payload[2:6])
-                pk_cols.append(payload[6 : 6 + vlen].decode("utf-8", "replace"))
     wm = re.search(r"\bWHERE\b(.+)$", body, re.I | re.S)
     if not pk_cols or not wm:
         return DsqlError("0A000", _FOR_UPDATE_EQ)
@@ -1414,6 +1476,11 @@ async def _plan_statement(conn, s, b_writer, allow_probe=True):
             if await _table_has_rows(conn, b_writer, table):
                 return "error", DsqlError("0A000", "use CREATE INDEX ASYNC instead")
         return "forward", None
+
+    if allow_probe:
+        err = await _check_drop_column(conn, b_writer, s)
+        if err:
+            return "error", err
 
     if _FOR_UPDATE_RE.search(s) and allow_probe:
         err = await _check_for_update(conn, b_writer, s)

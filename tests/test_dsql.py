@@ -796,6 +796,33 @@ class TestAlterTableSubset:
     def test_supported_actions_allowed(self, sql):
         assert pgproxy.validate(sql, pgproxy.TxnState()) is None, sql
 
+    @pytest.mark.parametrize(
+        "sql,expected",
+        [
+            ("ALTER TABLE t DROP COLUMN c", ["c"]),
+            ("ALTER TABLE t DROP c", ["c"]),
+            ("ALTER TABLE t DROP COLUMN IF EXISTS c CASCADE", ["c"]),
+            ("ALTER TABLE t DROP COLUMN a, DROP COLUMN b", ["a", "b"]),
+            ("ALTER TABLE t DROP a, DROP COLUMN b, DROP IF EXISTS c", ["a", "b", "c"]),
+            ('ALTER TABLE t DROP COLUMN "MixedCase"', ["MixedCase"]),
+            # Actions that merely start with DROP are not column drops.
+            ("ALTER TABLE t DROP CONSTRAINT c", []),
+            ("ALTER TABLE t ALTER COLUMN c DROP DEFAULT", []),
+            ("ALTER TABLE t ALTER COLUMN c DROP NOT NULL", []),
+            ("ALTER TABLE t ALTER COLUMN c DROP EXPRESSION", []),
+            ("ALTER TABLE t ALTER COLUMN c DROP IDENTITY", []),
+            ("ALTER TABLE t ADD COLUMN c int", []),
+            ("DROP TABLE t", []),
+        ],
+    )
+    def test_dropped_columns(self, sql, expected):
+        assert pgproxy.dropped_columns(sql) == expected
+
+    def test_drop_column_still_passes_text_only_validation(self):
+        # The primary-key restriction needs a catalog probe, so validate()
+        # stays clean and the rule lives in the proxy's statement planner.
+        assert pgproxy.validate("ALTER TABLE t DROP COLUMN c") is None
+
     def test_validate_constraint_async_rewrite(self):
         result = pgproxy.validate(
             "ALTER TABLE ASYNC t VALIDATE CONSTRAINT c", pgproxy.TxnState()
@@ -1402,6 +1429,77 @@ class TestExtendedProtocol:
             # Rejected by the proxy, but the block really is in a transaction.
             assert c.simple("TRUNCATE xp_base").txn_status == "E"
             assert c.simple("ROLLBACK").txn_status == "I"
+
+
+@requires_docker
+class TestDropColumn:
+    """Aurora DSQL gained ALTER TABLE ... DROP COLUMN on 2026-08-03, including
+    several columns in one statement, but dropping a primary key column is not
+    supported. The rule needs a catalog probe, so it runs in the proxy."""
+
+    def test_drop_non_pk_column(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            c.simple("CREATE TABLE dc_a (id int PRIMARY KEY, x int, y int)")
+            assert c.simple("ALTER TABLE dc_a DROP COLUMN x").ok
+            cols = c.simple(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'dc_a' ORDER BY column_name"
+            )
+            assert cols.rows == [("id",), ("y",)]
+
+    def test_drop_several_non_pk_columns_in_one_statement(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            c.simple("CREATE TABLE dc_b (id int PRIMARY KEY, x int, y int, z int)")
+            assert c.simple("ALTER TABLE dc_b DROP COLUMN x, DROP COLUMN y").ok
+            cols = c.simple(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'dc_b' ORDER BY column_name"
+            )
+            assert cols.rows == [("id",), ("z",)]
+
+    def test_drop_pk_column_rejected(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            c.simple("CREATE TABLE dc_c (id int PRIMARY KEY, x int)")
+            result = c.simple("ALTER TABLE dc_c DROP COLUMN id")
+            assert result.sqlstate == "0A000"
+            assert "primary key" in result.message
+            # The column must still be there.
+            assert c.simple("SELECT id FROM dc_c").ok
+
+    def test_drop_pk_column_rejected_over_extended_protocol(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            c.simple("CREATE TABLE dc_d (id int PRIMARY KEY, x int)")
+            result = c.extended("ALTER TABLE dc_d DROP COLUMN id")
+            assert result.sqlstate == "0A000"
+            assert "primary key" in result.message
+
+    def test_pk_column_in_a_multi_drop_rejects_the_whole_statement(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            c.simple("CREATE TABLE dc_e (id int PRIMARY KEY, x int)")
+            result = c.simple("ALTER TABLE dc_e DROP COLUMN x, DROP COLUMN id")
+            assert result.sqlstate == "0A000"
+            assert "primary key" in result.message
+            # Nothing was dropped — the statement never reached the backend.
+            assert c.simple("SELECT id, x FROM dc_e").ok
+
+    def test_composite_pk_columns_are_all_protected(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            c.simple("CREATE TABLE dc_f (a int, b int, x int, PRIMARY KEY (a, b))")
+            assert c.simple("ALTER TABLE dc_f DROP COLUMN b").sqlstate == "0A000"
+            assert c.simple("ALTER TABLE dc_f DROP COLUMN x").ok
+
+    def test_other_drop_actions_are_unaffected(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            c.simple(
+                "CREATE TABLE dc_g (id int PRIMARY KEY, x int DEFAULT 1 NOT NULL)"
+            )
+            assert c.simple("ALTER TABLE dc_g ALTER COLUMN x DROP DEFAULT").ok
+            assert c.simple("ALTER TABLE dc_g ALTER COLUMN x DROP NOT NULL").ok
+
+    def test_table_without_a_primary_key(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            c.simple("CREATE TABLE dc_h (x int, y int)")
+            assert c.simple("ALTER TABLE dc_h DROP COLUMN x").ok
 
 
 @requires_docker
