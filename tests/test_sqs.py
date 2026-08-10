@@ -435,6 +435,36 @@ def test_sqs_fifo_deduplication(sqs):
     )
     assert r1["MessageId"] == r2["MessageId"]
 
+def test_sqs_fifo_dedup_survives_consumption(sqs):
+    """A FIFO dedup id is honored for its full 5-minute window even after the
+    original message is received and deleted — the Lambda-ESM consume pattern
+    (#1326). A byte-identical duplicate sent after consumption is deduped, not
+    delivered again."""
+    url = sqs.create_queue(
+        QueueName="intg-sqs-dedup-consume.fifo",
+        Attributes={
+            "FifoQueue": "true",
+            "ContentBasedDeduplication": "true",
+        },
+    )["QueueUrl"]
+
+    r1 = sqs.send_message(QueueUrl=url, MessageBody="probe-1", MessageGroupId="g1")
+
+    # Consume the original: receive, then delete (as an ESM does after work).
+    recv = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=1)
+    assert len(recv.get("Messages", [])) == 1
+    sqs.delete_message(QueueUrl=url, ReceiptHandle=recv["Messages"][0]["ReceiptHandle"])
+
+    # Byte-identical duplicate after consumption must dedup to the same id and
+    # must NOT be re-enqueued.
+    r2 = sqs.send_message(QueueUrl=url, MessageBody="probe-1", MessageGroupId="g1")
+    assert r1["MessageId"] == r2["MessageId"]
+
+    recv2 = sqs.receive_message(
+        QueueUrl=url, MaxNumberOfMessages=1, WaitTimeSeconds=1
+    )
+    assert recv2.get("Messages", []) == []
+
 def test_sqs_fifo_dedup_scope_message_group(sqs):
     """DeduplicationScope=messageGroup: same body in different groups must both enqueue."""
     url = sqs.create_queue(

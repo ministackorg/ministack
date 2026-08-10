@@ -2611,6 +2611,14 @@ _WARM_CONTAINER_TTL = 300  # seconds idle before eviction. AWS doesn't publish
                            # observations. Can be overridden via env var.
 _WARM_CONTAINER_TTL = int(os.environ.get("LAMBDA_WARM_TTL_SECONDS", _WARM_CONTAINER_TTL))
 
+# LocalStack-compat (not an AWS behavior): LAMBDA_KEEPALIVE_MS=0 forces a cold
+# start after EVERY invocation by tearing the Docker RIE container down on
+# release instead of returning it to the warm pool. This is a test-isolation
+# lever for suites that must not let a prior invocation's warm container reuse
+# in-memory state (e.g. a cached auth token). Any non-zero/unset value keeps the
+# warm-pool behavior; idle eviction is still governed by LAMBDA_WARM_TTL_SECONDS.
+_KEEPALIVE_KILL_ON_RELEASE = os.environ.get("LAMBDA_KEEPALIVE_MS", "").strip() == "0"
+
 # Per-function concurrency: only applied when ReservedConcurrentExecutions is
 # explicitly set on the function. Otherwise the function can consume the
 # full account pool, matching AWS.
@@ -2708,6 +2716,11 @@ def _pool_register(key: str, container, tmpdir) -> dict:
 
 
 def _pool_release(entry: dict) -> None:
+    # LAMBDA_KEEPALIVE_MS=0: tear the container down instead of pooling it, so
+    # the next invocation is a guaranteed cold start (INIT re-runs).
+    if _KEEPALIVE_KILL_ON_RELEASE:
+        _pool_remove(entry)
+        return
     with _warm_pool_lock:
         entry["in_use"] = False
         entry["last_used"] = time.time()
