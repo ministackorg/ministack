@@ -1190,7 +1190,9 @@ def _invoke_target(target, event, rule):
             logger.warning("EventBridge: invalid target ARN %s", arn)
             return
 
-        if spec.service == "events":
+        if spec.service == "events" and spec.resource.startswith("api-destination/"):
+            _dispatch_to_api_destination(spec, event_payload, target)
+        elif spec.service == "events":
             _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload)
         elif spec.service == "states":
             _dispatch_to_stepfunctions(arn, event_payload)
@@ -1424,6 +1426,322 @@ def _dispatch_to_stepfunctions(arn, payload):
         "input": payload,
     })
     logger.info("EventBridge → Step Functions %s: dispatched", sm_name)
+
+
+# ---------------------------------------------------------------------------
+# API destination dispatch
+# ---------------------------------------------------------------------------
+
+# OAuth access tokens per connection: {(account, region, connection_name): entry}.
+# Plain dict (not AccountRegionScopedDict) because delivery worker threads read
+# it outside a request scope; guarded by _oauth_tokens_lock.
+_oauth_tokens: dict = {}
+_oauth_tokens_lock = threading.Lock()
+
+# Stamped on every API destination request. Real EventBridge documents
+# User-Agent and Range as non-overridable and sends Accept-Encoding /
+# Connection itself; Content-Type defaults below only when no custom value is
+# configured on the connection or target.
+_API_DEST_FIXED_HEADERS = {
+    "User-Agent": "Amazon/EventBridge/ApiDestinations",
+    "Range": "bytes=0-1048575",
+    "Accept-Encoding": "gzip,deflate",
+    "Connection": "close",
+}
+_API_DEST_DEFAULT_CONTENT_TYPE = "application/json; charset=utf-8"
+
+# Real EventBridge removes these headers from API destination requests, so
+# connection/target parameters cannot smuggle them in (transport-owned headers
+# such as Host and Content-Length are set by the HTTP client itself).
+_API_DEST_REMOVED_HEADERS = {
+    "a-im", "accept-charset", "accept-datetime", "accept-encoding",
+    "cache-control", "connection", "content-encoding", "content-length",
+    "content-md5", "date", "expect", "forwarded", "from", "host",
+    "http2-settings", "if-match", "if-modified-since", "if-none-match",
+    "if-range", "if-unmodified-since", "max-forwards", "origin", "pragma",
+    "proxy-authorization", "range", "referer", "te", "trailer",
+    "transfer-encoding", "user-agent", "upgrade", "via", "warning",
+}
+
+
+def _connection_params_map(params) -> dict:
+    """Flatten a ConnectionHttpParameters list (``[{Key, Value, IsValueSecret}]``)
+    into a plain map. Connection-side parameters use the list-of-objects shape,
+    unlike the string maps on target HttpParameters."""
+    out = {}
+    for item in params or []:
+        key = item.get("Key")
+        if key:
+            out[key] = item.get("Value", "")
+    return out
+
+
+def _apply_path_parameters(url: str, values) -> str:
+    """Populate ``*`` path wildcards in the invocation endpoint from the
+    target's PathParameterValues, in order — the same contract as real
+    EventBridge."""
+    if not values:
+        return url
+    import urllib.parse
+
+    parsed = urllib.parse.urlsplit(url)
+    path = parsed.path
+    for value in values:
+        if "*" not in path:
+            break
+        path = path.replace("*", urllib.parse.quote(str(value), safe=""), 1)
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
+
+
+def _merge_query(url: str, params: dict) -> str:
+    if not params:
+        return url
+    import urllib.parse
+
+    parsed = urllib.parse.urlsplit(url)
+    query = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
+    query.update(params)
+    encoded = urllib.parse.urlencode(query)
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, encoded, parsed.fragment))
+
+
+def _merge_body_parameters(payload: str, body_params: dict) -> str:
+    """Fold connection BodyParameters into a JSON-object body. Real EventBridge
+    documents body parameters as included in every invocation; how they combine
+    with a non-object body is undocumented there, so those bodies are left
+    untouched."""
+    if not body_params:
+        return payload
+    try:
+        parsed = json.loads(payload)
+    except (TypeError, ValueError):
+        return payload
+    if not isinstance(parsed, dict):
+        return payload
+    parsed.update(body_params)
+    return json.dumps(parsed)
+
+
+def _fetch_oauth_token(oauth: dict) -> dict:
+    """client_credentials exchange against the connection's authorization
+    endpoint: ClientID/ClientSecret ride the request body (query for GET),
+    OAuthHttpParameters contribute extra header/query/body parameters, and
+    ``access_token`` / ``token_type`` / ``expires_in`` are read from the JSON
+    response. ``grant_type`` defaults to ``client_credentials`` when
+    OAuthHttpParameters does not set one — AWS's own examples pass it
+    explicitly through body parameters."""
+    import urllib.parse
+    import urllib.request
+
+    method = (oauth.get("HttpMethod") or "POST").upper()
+    client = oauth.get("ClientParameters") or {}
+    http_params = oauth.get("OAuthHttpParameters") or {}
+    headers = _connection_params_map(http_params.get("HeaderParameters"))
+    form = {
+        "grant_type": "client_credentials",
+        "client_id": client.get("ClientID", ""),
+        "client_secret": client.get("ClientSecret", ""),
+    }
+    form.update(_connection_params_map(http_params.get("BodyParameters")))
+    url = _merge_query(
+        oauth.get("AuthorizationEndpoint", ""),
+        _connection_params_map(http_params.get("QueryStringParameters")),
+    )
+    data = None
+    if method == "GET":
+        url = _merge_query(url, form)
+    else:
+        data = urllib.parse.urlencode(form).encode("utf-8")
+        headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        token = json.loads(resp.read().decode("utf-8"))
+    token_type = token.get("token_type") or "Bearer"
+    if token_type.lower() == "bearer":
+        token_type = "Bearer"
+    expires_in = token.get("expires_in")
+    return {
+        "token": token.get("access_token", ""),
+        "type": token_type,
+        "expires_at": time.time() + float(expires_in) if expires_in else None,
+    }
+
+
+def _oauth_authorization_header(conn: dict, token_key, force_refresh: bool = False) -> str:
+    oauth = (conn.get("AuthParameters") or {}).get("OAuthParameters") or {}
+    with _oauth_tokens_lock:
+        cached = _oauth_tokens.get(token_key)
+    # Real EventBridge refreshes proactively when the token expires within 60
+    # seconds of an invocation — synchronously, on the event path.
+    fresh = cached and (cached["expires_at"] is None or cached["expires_at"] - time.time() > 60)
+    if force_refresh or not fresh:
+        cached = _fetch_oauth_token(oauth)
+        with _oauth_tokens_lock:
+            _oauth_tokens[token_key] = cached
+    return f"{cached['type']} {cached['token']}"
+
+
+def _evict_oauth_token(name: str):
+    """Drop a connection's cached access token.
+
+    The cache is keyed by connection NAME, and names are reusable: on real
+    EventBridge the token lives and dies with the connection, so a connection
+    that is deleted (and possibly recreated under the same name), has its auth
+    parameters replaced, or is deauthorized must perform a fresh
+    client_credentials exchange rather than keep serving a token minted from
+    credentials that no longer apply.
+    """
+    with _oauth_tokens_lock:
+        _oauth_tokens.pop((get_account_id(), get_region(), name), None)
+
+
+def _connection_auth_headers(conn: dict, token_key, force_refresh: bool = False) -> dict:
+    """Authorization header(s) for one delivery, mirroring how real EventBridge
+    populates them from the connection secret: BASIC → ``Authorization:
+    Basic``, API_KEY → the configured header, OAUTH_CLIENT_CREDENTIALS → a
+    managed Bearer token."""
+    import base64 as _b64
+
+    auth_type = conn.get("AuthorizationType", "")
+    params = conn.get("AuthParameters") or {}
+    if auth_type == "BASIC":
+        basic = params.get("BasicAuthParameters") or {}
+        raw = f"{basic.get('Username', '')}:{basic.get('Password', '')}".encode("utf-8")
+        return {"Authorization": "Basic " + _b64.b64encode(raw).decode("ascii")}
+    if auth_type == "API_KEY":
+        api_key = params.get("ApiKeyAuthParameters") or {}
+        name = api_key.get("ApiKeyName")
+        return {name: api_key.get("ApiKeyValue", "")} if name else {}
+    if auth_type == "OAUTH_CLIENT_CREDENTIALS":
+        return {"Authorization": _oauth_authorization_header(conn, token_key, force_refresh)}
+    return {}
+
+
+def _build_api_destination_request(dest: dict, conn: dict, target_http_params: dict, payload: str) -> dict:
+    invocation = (conn.get("AuthParameters") or {}).get("InvocationHttpParameters") or {}
+    conn_headers = _connection_params_map(invocation.get("HeaderParameters"))
+    conn_query = _connection_params_map(invocation.get("QueryStringParameters"))
+    conn_body = _connection_params_map(invocation.get("BodyParameters"))
+
+    # Target HttpParameters are merged with the connection's invocation
+    # parameters, "with any values from the Connection taking precedence"
+    # (EventBridge API reference, HttpParameters).
+    headers = {**(target_http_params.get("HeaderParameters") or {}), **conn_headers}
+    query = {**(target_http_params.get("QueryStringParameters") or {}), **conn_query}
+
+    url = _apply_path_parameters(
+        dest.get("InvocationEndpoint", ""), target_http_params.get("PathParameterValues")
+    )
+    url = _merge_query(url, query)
+    body = _merge_body_parameters(payload, conn_body)
+
+    headers = {k: v for k, v in headers.items() if k.lower() not in _API_DEST_REMOVED_HEADERS}
+    if not any(k.lower() == "content-type" for k in headers):
+        headers["Content-Type"] = _API_DEST_DEFAULT_CONTENT_TYPE
+    headers.update(_API_DEST_FIXED_HEADERS)
+
+    return {
+        "url": url,
+        "method": (dest.get("HttpMethod") or "POST").upper(),
+        "headers": headers,
+        "body": body,
+    }
+
+
+def _api_destination_send_sync(request: dict, auth_headers: dict) -> int:
+    """Blocking HTTP send for one API destination delivery. Runs on a worker
+    thread so the event loop stays unblocked; stdlib only (see the SNS HTTP
+    delivery note — aiohttp is not a declared dependency). The 5-second timeout
+    is AWS parity: API destination requests have a maximum client execution
+    timeout of 5 seconds."""
+    import urllib.error
+    import urllib.request
+
+    headers = {**request["headers"], **auth_headers}
+    body = request["body"]
+    req = urllib.request.Request(
+        request["url"],
+        data=body.encode("utf-8") if body is not None else None,
+        headers=headers,
+        method=request["method"],
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+
+
+def _deliver_to_api_destination(name: str, request: dict, conn: dict, token_key):
+    is_oauth = conn.get("AuthorizationType") == "OAUTH_CLIENT_CREDENTIALS"
+    try:
+        status = _api_destination_send_sync(request, _connection_auth_headers(conn, token_key))
+        if status in (401, 407) and is_oauth:
+            # Real EventBridge refreshes the OAuth token when a 401/407 comes
+            # back and retries the delivery.
+            status = _api_destination_send_sync(
+                request, _connection_auth_headers(conn, token_key, force_refresh=True)
+            )
+    except Exception as exc:
+        logger.warning("EventBridge → API destination %s delivery failed: %s", name, exc)
+        return
+    if 200 <= status < 300:
+        logger.info("EventBridge → API destination %s: HTTP %s", name, status)
+    elif status in (401, 407, 409, 429) or status >= 500:
+        # AWS parity: these statuses re-enter the 24h/185-attempt retry pipeline
+        # (DLQ on exhaustion, Retry-After honored). MiniStack does not model
+        # that queue — the same policy as cross-region FailedInvocations — so
+        # the outcome is logged and the event dropped.
+        logger.warning(
+            "EventBridge → API destination %s: retryable HTTP %s (retry pipeline not modeled; dropped)",
+            name,
+            status,
+        )
+    else:
+        logger.warning("EventBridge → API destination %s: HTTP %s (not retryable; dropped)", name, status)
+
+
+def _dispatch_to_api_destination(spec, payload, target):
+    if spec.account_id != get_account_id() or spec.region != get_region():
+        logger.warning(
+            "EventBridge → API destination: %s is outside the current account/region scope", spec
+        )
+        return
+    # Resource is "api-destination/<name>" (real AWS appends "/<uuid>"; tolerate both).
+    name = spec.resource.split("/", 2)[1]
+    dest = _api_destinations.get(name)
+    if not dest:
+        logger.warning("EventBridge → API destination: %s not found", name)
+        return
+    if dest.get("ApiDestinationState") != "ACTIVE":
+        # Real EventBridge does not invoke INACTIVE destinations; the delivery
+        # fails into the retry pipeline instead. Log-and-drop, as above.
+        logger.warning(
+            "EventBridge → API destination %s: state %s; not invoked",
+            name,
+            dest.get("ApiDestinationState"),
+        )
+        return
+    conn_name = (dest.get("ConnectionArn") or "").rsplit("/", 1)[-1]
+    conn = _connections.get(conn_name) if conn_name else None
+    if conn is None:
+        logger.warning(
+            "EventBridge → API destination %s: connection %s not found", name, conn_name or "<unset>"
+        )
+        return
+    # InvocationRateLimitPerSecond is accepted at CreateApiDestination but not
+    # enforced here — MiniStack delivers immediately and does not model the
+    # delivery queue that rate limiting implies.
+    request = _build_api_destination_request(dest, conn, target.get("HttpParameters") or {}, payload)
+    token_key = (get_account_id(), get_region(), conn_name)
+    # Deliver on a background daemon thread, mirroring the SNS HTTP(S) path:
+    # PutEvents returns as soon as the event is accepted and must not block on
+    # the destination endpoint.
+    threading.Thread(
+        target=_deliver_to_api_destination,
+        args=(name, request, copy.deepcopy(conn), token_key),
+        daemon=True,
+    ).start()
 
 
 # ---------------------------------------------------------------------------
@@ -2009,6 +2327,7 @@ def _delete_connection(data):
     if not conn:
         return error_response_json("ResourceNotFoundException",
                                    f"Connection {name} does not exist.", 400)
+    _evict_oauth_token(name)
     return json_response({
         "ConnectionArn": conn["ConnectionArn"],
         "ConnectionState": "DELETING",
@@ -2048,6 +2367,11 @@ def _update_connection(data):
     for key in ("AuthorizationType", "AuthParameters", "Description"):
         if key in data:
             conn[key] = data[key]
+    if "AuthParameters" in data or "AuthorizationType" in data:
+        # Re-authorization: the new credentials, not the cached token, decide
+        # what the next invocation carries. A description-only update does not
+        # re-authorize, so it keeps the token.
+        _evict_oauth_token(name)
     conn["LastModifiedTime"] = now
     conn["ConnectionState"] = "AUTHORIZED"
     conn["LastAuthorizedTime"] = now
@@ -2071,6 +2395,7 @@ def _deauthorize_connection(data):
     conn["ConnectionState"] = "DEAUTHORIZED"
     conn["LastModifiedTime"] = now
     conn.pop("LastAuthorizedTime", None)
+    _evict_oauth_token(name)
     return json_response({
         "ConnectionArn": conn["ConnectionArn"],
         "ConnectionState": conn["ConnectionState"],
@@ -2585,5 +2910,7 @@ def reset():
     _partner_event_sources.clear()
     _event_buses.clear()
     _rule_last_fired.clear()
+    with _oauth_tokens_lock:
+        _oauth_tokens.clear()
     # The "default" bus is lazily recreated per-account on next access via
     # _ensure_default_bus(), so nothing to re-seed here.

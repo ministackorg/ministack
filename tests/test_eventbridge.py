@@ -2851,3 +2851,456 @@ def test_eventbridge_input_transformer_ingestion_time(eb, sqs):
     # substituted (not the literal placeholder) and non-empty; time is the event's stored value
     assert body["it"] != "<aws.events.event.ingestion-time>"
     assert body["it"] != ""
+
+
+# ---------------------------------------------------------------------------
+# API destination dispatch
+# ---------------------------------------------------------------------------
+
+def _start_api_dest_capture_server(status_plan=None):
+    """Local HTTPS-endpoint stand-in for an API destination. Captures every
+    request and answers with the next status in ``status_plan`` (the last one
+    repeats). Returns (server, captured)."""
+    import threading as _threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    captured = []
+    plan = list(status_plan or [200])
+
+    class _Handler(BaseHTTPRequestHandler):
+        def _handle(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length).decode("utf-8") if length else ""
+            captured.append({
+                "method": self.command,
+                "path": self.path,
+                "headers": {k.lower(): v for k, v in self.headers.items()},
+                "body": body,
+            })
+            status = plan.pop(0) if len(plan) > 1 else plan[0]
+            payload = b"{}"
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        do_POST = _handle
+        do_PUT = _handle
+        do_GET = _handle
+        do_DELETE = _handle
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    _threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, captured
+
+
+def _start_oauth_issuer(tokens=("tok-1",), expires_in=3600):
+    """Minimal client-credentials issuer: captures every token request and
+    hands out tokens from ``tokens`` in order (the last one repeats)."""
+    import threading as _threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs
+
+    token_requests = []
+    remaining = list(tokens)
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length).decode("utf-8") if length else ""
+            token_requests.append({
+                "path": self.path,
+                "headers": {k.lower(): v for k, v in self.headers.items()},
+                "form": {k: v[0] for k, v in parse_qs(body, keep_blank_values=True).items()},
+            })
+            token = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+            payload = json.dumps(
+                {"access_token": token, "token_type": "bearer", "expires_in": expires_in}
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    _threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, token_requests
+
+
+def _wait_until(predicate, timeout=5.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return predicate()
+
+
+def _api_dest_pipeline(eb, slug, endpoint, auth_type, auth_params, target_extras=None, http_method="POST"):
+    """Create bus → rule → connection → API destination → target for one test."""
+    bus_name = f"qa-eb-apidest-{slug}-bus"
+    source = f"myapp.apidest.{slug}"
+    eb.create_event_bus(Name=bus_name)
+    conn = eb.create_connection(
+        Name=f"qa-eb-apidest-{slug}-conn",
+        AuthorizationType=auth_type,
+        AuthParameters=auth_params,
+    )
+    dest = eb.create_api_destination(
+        Name=f"qa-eb-apidest-{slug}-dest",
+        ConnectionArn=conn["ConnectionArn"],
+        InvocationEndpoint=endpoint,
+        HttpMethod=http_method,
+    )
+    eb.put_rule(
+        Name=f"qa-eb-apidest-{slug}-rule",
+        EventBusName=bus_name,
+        EventPattern=json.dumps({"source": [source]}),
+        State="ENABLED",
+    )
+    target = {"Id": "t1", "Arn": dest["ApiDestinationArn"]}
+    target.update(target_extras or {})
+    eb.put_targets(Rule=f"qa-eb-apidest-{slug}-rule", EventBusName=bus_name, Targets=[target])
+    return bus_name, source
+
+
+def test_eventbridge_api_destination_basic_auth_full_envelope(eb):
+    server, captured = _start_api_dest_capture_server()
+    try:
+        port = server.server_address[1]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "basic",
+            f"http://127.0.0.1:{port}/hooks/ingest",
+            "BASIC",
+            {"BasicAuthParameters": {"Username": "u", "Password": "p"}},
+        )
+        resp = eb.put_events(Entries=[{
+            "Source": source,
+            "DetailType": "UserSignup",
+            "Detail": json.dumps({"userId": "u-1"}),
+            "EventBusName": bus_name,
+        }])
+        assert resp["FailedEntryCount"] == 0
+
+        assert _wait_until(lambda: len(captured) >= 1)
+        req = captured[0]
+        assert req["method"] == "POST"
+        assert req["path"] == "/hooks/ingest"
+        # base64("u:p")
+        assert req["headers"]["authorization"] == "Basic dTpw"
+        assert req["headers"]["content-type"] == "application/json; charset=utf-8"
+        assert req["headers"]["user-agent"] == "Amazon/EventBridge/ApiDestinations"
+        assert req["headers"]["range"] == "bytes=0-1048575"
+        body = json.loads(req["body"])
+        assert body["version"] == "0"
+        assert body["source"] == source
+        assert body["detail-type"] == "UserSignup"
+        assert body["detail"] == {"userId": "u-1"}
+    finally:
+        server.shutdown()
+
+
+def test_eventbridge_api_destination_input_path_detail(eb):
+    """InputPath $.detail delivers exactly the event payload — the webhook body shape."""
+    server, captured = _start_api_dest_capture_server()
+    try:
+        port = server.server_address[1]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "inputpath",
+            f"http://127.0.0.1:{port}/webhook",
+            "API_KEY",
+            {"ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "k-123"}},
+            target_extras={"InputPath": "$.detail"},
+        )
+        detail = {"orderId": "o-1", "amount": 42}
+        eb.put_events(Entries=[{
+            "Source": source,
+            "DetailType": "OrderPlaced",
+            "Detail": json.dumps(detail),
+            "EventBusName": bus_name,
+        }])
+
+        assert _wait_until(lambda: len(captured) >= 1)
+        req = captured[0]
+        assert req["headers"]["x-api-key"] == "k-123"
+        assert json.loads(req["body"]) == detail
+    finally:
+        server.shutdown()
+
+
+def test_eventbridge_api_destination_parameter_merging_connection_precedence(eb):
+    server, captured = _start_api_dest_capture_server()
+    try:
+        port = server.server_address[1]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "params",
+            f"http://127.0.0.1:{port}/hooks/*/notify",
+            "API_KEY",
+            {
+                "ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "k-9"},
+                "InvocationHttpParameters": {
+                    "HeaderParameters": [
+                        {"Key": "X-Env", "Value": "conn"},
+                        # Non-overridable in real AWS — must be dropped, not honored.
+                        {"Key": "User-Agent", "Value": "evil"},
+                    ],
+                    "QueryStringParameters": [{"Key": "tenant", "Value": "conn-t"}],
+                    "BodyParameters": [{"Key": "injected", "Value": "yes"}],
+                },
+            },
+            target_extras={
+                "HttpParameters": {
+                    "HeaderParameters": {"X-Env": "target", "X-Target-Only": "t"},
+                    "QueryStringParameters": {"tenant": "target-t", "extra": "1"},
+                    "PathParameterValues": ["partner-1"],
+                }
+            },
+        )
+        eb.put_events(Entries=[{
+            "Source": source,
+            "DetailType": "Ping",
+            "Detail": json.dumps({"k": "v"}),
+            "EventBusName": bus_name,
+        }])
+
+        assert _wait_until(lambda: len(captured) >= 1)
+        req = captured[0]
+        path, _, query = req["path"].partition("?")
+        assert path == "/hooks/partner-1/notify"
+        from urllib.parse import parse_qs
+        params = {k: v[0] for k, v in parse_qs(query).items()}
+        # Connection values win over target values; target-only keys survive.
+        assert params == {"tenant": "conn-t", "extra": "1"}
+        assert req["headers"]["x-env"] == "conn"
+        assert req["headers"]["x-target-only"] == "t"
+        assert req["headers"]["user-agent"] == "Amazon/EventBridge/ApiDestinations"
+        body = json.loads(req["body"])
+        assert body["injected"] == "yes"
+        assert body["detail"] == {"k": "v"}
+    finally:
+        server.shutdown()
+
+
+def test_eventbridge_api_destination_oauth_client_credentials(eb):
+    issuer, token_requests = _start_oauth_issuer(tokens=("tok-1",))
+    server, captured = _start_api_dest_capture_server()
+    try:
+        issuer_port = issuer.server_address[1]
+        port = server.server_address[1]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "oauth",
+            f"http://127.0.0.1:{port}/secured",
+            "OAUTH_CLIENT_CREDENTIALS",
+            {
+                "OAuthParameters": {
+                    "AuthorizationEndpoint": f"http://127.0.0.1:{issuer_port}/oauth/token",
+                    "HttpMethod": "POST",
+                    "ClientParameters": {"ClientID": "cid", "ClientSecret": "csec"},
+                    "OAuthHttpParameters": {
+                        "BodyParameters": [{"Key": "audience", "Value": "https://api.example.test"}]
+                    },
+                }
+            },
+        )
+        entry = {
+            "Source": source,
+            "DetailType": "Ping",
+            "Detail": json.dumps({"n": 1}),
+            "EventBusName": bus_name,
+        }
+        eb.put_events(Entries=[entry])
+        assert _wait_until(lambda: len(captured) >= 1)
+        # Second event rides the cached token — the issuer is not called again.
+        eb.put_events(Entries=[entry])
+        assert _wait_until(lambda: len(captured) >= 2)
+
+        assert len(token_requests) == 1
+        token_req = token_requests[0]
+        assert token_req["path"] == "/oauth/token"
+        assert token_req["headers"]["content-type"] == "application/x-www-form-urlencoded"
+        assert token_req["form"]["grant_type"] == "client_credentials"
+        assert token_req["form"]["client_id"] == "cid"
+        assert token_req["form"]["client_secret"] == "csec"
+        assert token_req["form"]["audience"] == "https://api.example.test"
+        assert captured[0]["headers"]["authorization"] == "Bearer tok-1"
+        assert captured[1]["headers"]["authorization"] == "Bearer tok-1"
+    finally:
+        issuer.shutdown()
+        server.shutdown()
+
+
+def _oauth_params(issuer_port, client_secret="csec"):
+    return {
+        "OAuthParameters": {
+            "AuthorizationEndpoint": f"http://127.0.0.1:{issuer_port}/oauth/token",
+            "HttpMethod": "POST",
+            "ClientParameters": {"ClientID": "cid", "ClientSecret": client_secret},
+            "OAuthHttpParameters": {
+                "BodyParameters": [{"Key": "grant_type", "Value": "client_credentials"}]
+            },
+        }
+    }
+
+
+def _oauth_entry(bus_name, source):
+    return {
+        "Source": source,
+        "DetailType": "Ping",
+        "Detail": json.dumps({"n": 1}),
+        "EventBusName": bus_name,
+    }
+
+
+def test_eventbridge_api_destination_oauth_token_dies_with_the_connection(eb):
+    """A recreated connection re-authorizes: the token cache is keyed by name,
+    and names are reusable, so a delete must not leave a token behind for the
+    next connection to inherit. Terraform replacing a connection in place is
+    the everyday way to hit this."""
+    issuer, token_requests = _start_oauth_issuer(tokens=("tok-1", "tok-2"))
+    server, captured = _start_api_dest_capture_server()
+    try:
+        issuer_port = issuer.server_address[1]
+        port = server.server_address[1]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "oauthrecreate",
+            f"http://127.0.0.1:{port}/secured",
+            "OAUTH_CLIENT_CREDENTIALS",
+            _oauth_params(issuer_port),
+        )
+        entry = _oauth_entry(bus_name, source)
+        eb.put_events(Entries=[entry])
+        assert _wait_until(lambda: len(captured) >= 1)
+        assert len(token_requests) == 1
+
+        # Same name, so the API destination's ConnectionArn still resolves.
+        conn_name = "qa-eb-apidest-oauthrecreate-conn"
+        eb.delete_connection(Name=conn_name)
+        eb.create_connection(
+            Name=conn_name,
+            AuthorizationType="OAUTH_CLIENT_CREDENTIALS",
+            AuthParameters=_oauth_params(issuer_port, client_secret="rotated"),
+        )
+
+        eb.put_events(Entries=[entry])
+        assert _wait_until(lambda: len(captured) >= 2)
+        assert len(token_requests) == 2
+        assert token_requests[1]["form"]["client_secret"] == "rotated"
+        assert captured[1]["headers"]["authorization"] == "Bearer tok-2"
+    finally:
+        issuer.shutdown()
+        server.shutdown()
+
+
+def test_eventbridge_api_destination_oauth_token_evicted_on_reauthorization(eb):
+    """Rotating the client secret must take effect on the next invocation, not
+    whenever the old token happens to expire."""
+    issuer, token_requests = _start_oauth_issuer(tokens=("tok-1", "tok-2"))
+    server, captured = _start_api_dest_capture_server()
+    try:
+        issuer_port = issuer.server_address[1]
+        port = server.server_address[1]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "oauthrotate",
+            f"http://127.0.0.1:{port}/secured",
+            "OAUTH_CLIENT_CREDENTIALS",
+            _oauth_params(issuer_port),
+        )
+        entry = _oauth_entry(bus_name, source)
+        eb.put_events(Entries=[entry])
+        assert _wait_until(lambda: len(captured) >= 1)
+        assert len(token_requests) == 1
+
+        eb.update_connection(
+            Name="qa-eb-apidest-oauthrotate-conn",
+            AuthorizationType="OAUTH_CLIENT_CREDENTIALS",
+            AuthParameters=_oauth_params(issuer_port, client_secret="rotated"),
+        )
+
+        eb.put_events(Entries=[entry])
+        assert _wait_until(lambda: len(captured) >= 2)
+        assert len(token_requests) == 2
+        assert token_requests[1]["form"]["client_secret"] == "rotated"
+        assert captured[1]["headers"]["authorization"] == "Bearer tok-2"
+    finally:
+        issuer.shutdown()
+        server.shutdown()
+
+
+def test_eventbridge_api_destination_oauth_token_survives_metadata_update(eb):
+    """The mirror image: a description-only update does not re-authorize, so
+    the cached token stays and no needless exchange is made."""
+    issuer, token_requests = _start_oauth_issuer(tokens=("tok-1", "tok-2"))
+    server, captured = _start_api_dest_capture_server()
+    try:
+        issuer_port = issuer.server_address[1]
+        port = server.server_address[1]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "oauthdescr",
+            f"http://127.0.0.1:{port}/secured",
+            "OAUTH_CLIENT_CREDENTIALS",
+            _oauth_params(issuer_port),
+        )
+        entry = _oauth_entry(bus_name, source)
+        eb.put_events(Entries=[entry])
+        assert _wait_until(lambda: len(captured) >= 1)
+
+        eb.update_connection(Name="qa-eb-apidest-oauthdescr-conn", Description="renamed")
+
+        eb.put_events(Entries=[entry])
+        assert _wait_until(lambda: len(captured) >= 2)
+        assert len(token_requests) == 1
+        assert captured[1]["headers"]["authorization"] == "Bearer tok-1"
+    finally:
+        issuer.shutdown()
+        server.shutdown()
+
+
+def test_eventbridge_api_destination_oauth_refresh_on_401(eb):
+    issuer, token_requests = _start_oauth_issuer(tokens=("tok-old", "tok-new"))
+    server, captured = _start_api_dest_capture_server(status_plan=[401, 200])
+    try:
+        issuer_port = issuer.server_address[1]
+        port = server.server_address[1]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "oauth401",
+            f"http://127.0.0.1:{port}/secured",
+            "OAUTH_CLIENT_CREDENTIALS",
+            {
+                "OAuthParameters": {
+                    "AuthorizationEndpoint": f"http://127.0.0.1:{issuer_port}/oauth/token",
+                    "HttpMethod": "POST",
+                    "ClientParameters": {"ClientID": "cid", "ClientSecret": "csec"},
+                }
+            },
+        )
+        eb.put_events(Entries=[{
+            "Source": source,
+            "DetailType": "Ping",
+            "Detail": json.dumps({"n": 1}),
+            "EventBusName": bus_name,
+        }])
+
+        # 401 → token refresh → one retry with the new token.
+        assert _wait_until(lambda: len(captured) >= 2)
+        assert captured[0]["headers"]["authorization"] == "Bearer tok-old"
+        assert captured[1]["headers"]["authorization"] == "Bearer tok-new"
+        assert len(token_requests) == 2
+    finally:
+        issuer.shutdown()
+        server.shutdown()
