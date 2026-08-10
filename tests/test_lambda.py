@@ -9173,3 +9173,47 @@ def test_lambda_esm_dynamodb_max_record_age_to_failure_destination(lam, ddb, sqs
             lam.delete_event_source_mapping(UUID=esm["UUID"])
         lam.delete_function(FunctionName=fn)
         ddb.delete_table(TableName=table)
+
+
+@pytest.mark.serial
+def test_lambda_keepalive_zero_forces_cold_start(monkeypatch):
+    """LAMBDA_KEEPALIVE_MS=0 tears the Docker RIE container down on release, so
+    the next invocation is a cold start instead of reusing the warm container.
+    Regression for #1300 (LocalStack-compat cold-start isolation)."""
+    from ministack.services import lambda_svc as _svc
+
+    class _StubContainer:
+        status = "running"
+        def __init__(self):
+            self.stopped = False
+            self.removed = False
+        def reload(self):
+            pass
+        def stop(self, timeout=2):
+            self.stopped = True
+        def remove(self, force=False):
+            self.removed = True
+
+    stub = _StubContainer()
+    entry = {"container": stub, "tmpdir": None, "in_use": True,
+             "last_used": 0, "created": 0}
+    key = "111122223333:us-east-1:fn-keepalive:zip:sha-v1"
+    with _svc._warm_pool_lock:
+        _svc._warm_pool.setdefault(key, []).append(entry)
+    try:
+        # Default (keepalive off): release keeps the container warm in the pool.
+        monkeypatch.setattr(_svc, "_KEEPALIVE_KILL_ON_RELEASE", False)
+        _svc._pool_release(entry)
+        with _svc._warm_pool_lock:
+            assert entry in _svc._warm_pool.get(key, [])
+        assert not stub.stopped and entry["in_use"] is False
+
+        # LAMBDA_KEEPALIVE_MS=0: release tears the container down and drops it.
+        monkeypatch.setattr(_svc, "_KEEPALIVE_KILL_ON_RELEASE", True)
+        _svc._pool_release(entry)
+        with _svc._warm_pool_lock:
+            assert entry not in _svc._warm_pool.get(key, [])
+        assert stub.stopped and stub.removed
+    finally:
+        with _svc._warm_pool_lock:
+            _svc._warm_pool.pop(key, None)

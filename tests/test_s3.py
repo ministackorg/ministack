@@ -4006,13 +4006,23 @@ def test_s3_owner_id_consistent_between_listing_and_acl(s3):
     assert listed == acl_owner
 
 
-def test_s3_presigned_url_expires(s3):
-    """An expired presigned URL is rejected with 403. Regression for #1322 defect 10."""
+def test_s3_presigned_url_expires():
+    """An expired SigV4 presigned URL is rejected with 403. Regression for
+    #1322 defect 10. Uses an explicit s3v4 client (the expiry check lives in the
+    SigV4 verification path); the default fixture presigns with SigV2."""
+    import boto3
     import requests
+    from botocore.config import Config
+    ep = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+    v4 = boto3.client(
+        "s3", endpoint_url=ep, region_name="us-east-1",
+        aws_access_key_id="test", aws_secret_access_key="test",
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
     bucket = "intg-s3-presign-expiry"
-    s3.create_bucket(Bucket=bucket)
-    s3.put_object(Bucket=bucket, Key="k", Body=b"x")
-    url = s3.generate_presigned_url(
+    v4.create_bucket(Bucket=bucket)
+    v4.put_object(Bucket=bucket, Key="k", Body=b"x")
+    url = v4.generate_presigned_url(
         "get_object", Params={"Bucket": bucket, "Key": "k"}, ExpiresIn=1
     )
     time.sleep(2)
