@@ -39,6 +39,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets as stdlib_secrets
 import socket
 import threading
 import time
@@ -55,6 +56,7 @@ from ministack.core.responses import (
     get_region,
     new_uuid,
 )
+from ministack.services import secretsmanager
 
 logger = logging.getLogger("rds")
 
@@ -3455,11 +3457,26 @@ def _create_db_cluster(p):
     explicit_master_user = _p(p, "MasterUsername") or None
     explicit_master_pass = _p(p, "MasterUserPassword") or None
     explicit_database_name = _p(p, "DatabaseName") or None
+    manage_master_pass = _p(p, "ManageMasterUserPassword") == "true"
+    if manage_master_pass and explicit_master_pass:
+        return _error(
+            "InvalidParameterCombination",
+            "You can't specify MasterUserPassword when ManageMasterUserPassword "
+            "is enabled.",
+            400,
+        )
     global_writer = (
         _global_cluster_writer_cluster(global_cluster)
         if global_cluster
         else None
     )
+    if manage_master_pass and global_writer:
+        return _error(
+            "InvalidParameterCombination",
+            "You can't manage the master user password on an Aurora global "
+            "database secondary cluster.",
+            400,
+        )
     if global_writer:
         inherited_fields = (
             ("MasterUsername", explicit_master_user, global_writer.get("MasterUsername")),
@@ -3513,6 +3530,20 @@ def _create_db_cluster(p):
         if global_writer
         else explicit_master_pass or "password"
     )
+    master_user_secret = None
+    if manage_master_pass:
+        master_pass = _generate_master_user_password()
+        secret_arn = secretsmanager.create_secret_in_process(
+            f"rds!cluster-{new_uuid()}",
+            json.dumps({"username": master_user, "password": master_pass}),
+            description=f"Secret managed by RDS for DB cluster {cluster_id}",
+        )
+        master_user_secret = {
+            "SecretArn": secret_arn,
+            "SecretStatus": "active",
+            "KmsKeyId": _p(p, "MasterUserSecretKmsKeyId")
+            or f"arn:aws:kms:{get_region()}:{get_account_id()}:key/aws-secretsmanager-default",
+        }
     database_name = (
         global_writer.get("DatabaseName")
         if global_writer
@@ -3528,6 +3559,7 @@ def _create_db_cluster(p):
         "Status": "available",
         "MasterUsername": master_user,
         "_MasterUserPassword": master_pass,
+        "MasterUserSecret": master_user_secret,
         "DatabaseName": database_name,
         "NetworkType": _p(p, "NetworkType") or "IPV4",
         "EngineLifecycleSupport": _p(p, "EngineLifecycleSupport") or "open-source-rds-extended-support",
@@ -3648,6 +3680,10 @@ def _delete_db_cluster(p):
             )
         _tags.pop(cluster["DBClusterArn"], None)
         del _clusters[cluster["DBClusterIdentifier"]]
+        master_user_secret = cluster.get("MasterUserSecret")
+        if master_user_secret and master_user_secret.get("SecretArn"):
+            # RDS deletes its managed master user secret with the cluster.
+            secretsmanager.delete_secret_in_process(master_user_secret["SecretArn"])
     return _xml(200, "DeleteDBClusterResponse",
         f"<DeleteDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></DeleteDBClusterResult>")
 
@@ -3671,6 +3707,15 @@ def _describe_db_clusters(p):
     members = "".join(f"<DBCluster>{_cluster_xml(c)}</DBCluster>" for c in clusters)
     return _xml(200, "DescribeDBClustersResponse",
         f"<DescribeDBClustersResult><DBClusters>{members}</DBClusters></DescribeDBClustersResult>")
+
+
+def _generate_master_user_password():
+    """Generate a random master user password for a managed secret.
+
+    Stays within RDS's password rules (printable ASCII excluding '/', '@',
+    '"', and spaces) — token_urlsafe only emits letters, digits, '-' and '_'.
+    """
+    return stdlib_secrets.token_urlsafe(24)
 
 
 def _rotate_real_password(cluster, old_pass, new_pass):
@@ -3770,6 +3815,51 @@ def _rotate_real_password(cluster, old_pass, new_pass):
                 pass
 
 
+def _apply_cluster_master_password_change(cluster, new_pass):
+    """Publish *new_pass* as the cluster's master password and rotate the real
+    database login.
+
+    Shared by the explicit ``MasterUserPassword`` and the managed
+    ``RotateMasterUserPassword`` paths so the compute-availability and
+    pending-rotation semantics cannot drift between them. When compute is
+    down but storage survives, the rotation is parked as pending: the first
+    replacement member authenticates with the old password, applies the
+    pending rotation, then publishes readiness using the new one.
+    """
+    with _shared_container_lock:
+        old_pass = cluster.get("_MasterUserPassword", "password")
+        cluster["_MasterUserPassword"] = new_pass
+        pending_rotation = cluster.get(
+            "_pending_master_password_rotation",
+        )
+        rotation_old_pass = (
+            pending_rotation["old_password"]
+            if pending_rotation
+            else old_pass
+        )
+        has_available_compute = bool(
+            cluster.get("DBClusterMembers"),
+        ) and bool(
+            cluster.get("_shared_container_id"),
+        ) and cluster.get("_shared_container_ready", True)
+        if has_available_compute and _rotate_real_password(
+            cluster, rotation_old_pass, new_pass,
+        ):
+            cluster.pop("_pending_master_password_rotation", None)
+            _sync_global_mysql_credentials(cluster)
+        elif (
+            cluster.get("_shared_container_id")
+            or cluster.get("_shared_storage_initialized")
+        ):
+            # The stopped preserved container still has rotation_old_pass.
+            # The first replacement member authenticates with it, applies
+            # the pending rotation, then publishes readiness using new_pass.
+            cluster["_pending_master_password_rotation"] = {
+                "old_password": rotation_old_pass,
+                "new_password": new_pass,
+            }
+
+
 def _modify_db_cluster(p):
     cluster_id = _p(p, "DBClusterIdentifier")
     cluster = _resolve_cluster_in_request_region(cluster_id)
@@ -3779,48 +3869,67 @@ def _modify_db_cluster(p):
             return wrong_region
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
 
+    # Validate the password parameters together before mutating anything, so
+    # a rejected combination cannot leave a half-applied password change.
+    if _p(p, "MasterUserPassword") and _p(p, "RotateMasterUserPassword") == "true":
+        return _error(
+            "InvalidParameterCombination",
+            "You can't specify MasterUserPassword and RotateMasterUserPassword "
+            "in the same request.",
+            400,
+        )
     if _p(p, "EngineVersion"):
         cluster["EngineVersion"] = _p(p, "EngineVersion")
     if _p(p, "MasterUserPassword"):
+        if cluster.get("MasterUserSecret"):
+            return _error(
+                "InvalidParameterCombination",
+                "You can't specify MasterUserPassword for a cluster with "
+                "ManageMasterUserPassword enabled.",
+                400,
+            )
         if _mysql_replication_secondary(cluster):
             return _error(
                 "InvalidDBClusterStateFault",
                 "MasterUserPassword must be changed on the global writer.",
                 400,
             )
-        new_pass = _p(p, "MasterUserPassword")
-        with _shared_container_lock:
-            old_pass = cluster.get("_MasterUserPassword", "password")
-            cluster["_MasterUserPassword"] = new_pass
-            pending_rotation = cluster.get(
-                "_pending_master_password_rotation",
+        _apply_cluster_master_password_change(cluster, _p(p, "MasterUserPassword"))
+    if _p(p, "RotateMasterUserPassword") == "true":
+        master_user_secret = cluster.get("MasterUserSecret")
+        if not master_user_secret:
+            return _error(
+                "InvalidParameterCombination",
+                "You can only rotate the master user password when it's "
+                "managed by RDS in AWS Secrets Manager.",
+                400,
             )
-            rotation_old_pass = (
-                pending_rotation["old_password"]
-                if pending_rotation
-                else old_pass
+        if _p(p, "ApplyImmediately") != "true":
+            return _error(
+                "InvalidParameterCombination",
+                "You must specify apply immediately when rotating the master "
+                "user password.",
+                400,
             )
-            has_available_compute = bool(
-                cluster.get("DBClusterMembers"),
-            ) and bool(
-                cluster.get("_shared_container_id"),
-            ) and cluster.get("_shared_container_ready", True)
-            if has_available_compute and _rotate_real_password(
-                cluster, rotation_old_pass, new_pass,
-            ):
-                cluster.pop("_pending_master_password_rotation", None)
-                _sync_global_mysql_credentials(cluster)
-            elif (
-                cluster.get("_shared_container_id")
-                or cluster.get("_shared_storage_initialized")
-            ):
-                # The stopped preserved container still has rotation_old_pass.
-                # The first replacement member authenticates with it, applies
-                # the pending rotation, then publishes readiness using new_pass.
-                cluster["_pending_master_password_rotation"] = {
-                    "old_password": rotation_old_pass,
-                    "new_password": new_pass,
-                }
+        new_pass = _generate_master_user_password()
+        secret_updated = secretsmanager.put_secret_value_in_process(
+            master_user_secret["SecretArn"],
+            json.dumps({
+                "username": cluster.get("MasterUsername", "admin"),
+                "password": new_pass,
+            }),
+        )
+        if not secret_updated:
+            # The secret was deleted out from under RDS. AWS reports such a
+            # secret as impaired: usable state is gone and it can't be rotated.
+            master_user_secret["SecretStatus"] = "impaired"
+            return _error(
+                "InvalidDBClusterStateFault",
+                f"The master user secret for DB cluster {cluster_id} "
+                "can't be rotated.",
+                400,
+            )
+        _apply_cluster_master_password_change(cluster, new_pass)
     if _p(p, "Port"):
         cluster["Port"] = int(_p(p, "Port"))
     if _p(p, "BackupRetentionPeriod"):
@@ -5561,6 +5670,21 @@ def _cluster_xml(c):
         if global_write_forwarding else ""
     )
 
+    # AWS emits <MasterUserSecret> only for clusters with an RDS-managed
+    # master user password; KmsKeyId appears only when a key was specified.
+    master_user_secret = c.get("MasterUserSecret")
+    master_user_secret_xml = ""
+    if master_user_secret:
+        kms_key_id = master_user_secret.get("KmsKeyId")
+        kms_key_xml = f"<KmsKeyId>{kms_key_id}</KmsKeyId>" if kms_key_id else ""
+        master_user_secret_xml = (
+            "<MasterUserSecret>"
+            f"<SecretArn>{master_user_secret.get('SecretArn', '')}</SecretArn>"
+            f"<SecretStatus>{master_user_secret.get('SecretStatus', 'active')}</SecretStatus>"
+            f"{kms_key_xml}"
+            "</MasterUserSecret>"
+        )
+
     return f"""<DBClusterIdentifier>{c['DBClusterIdentifier']}</DBClusterIdentifier>
         <DBClusterArn>{c['DBClusterArn']}</DBClusterArn>
         <Engine>{c['Engine']}</Engine>
@@ -5600,6 +5724,7 @@ def _cluster_xml(c):
         <NetworkType>{c.get('NetworkType','IPV4')}</NetworkType>
         {global_cluster_xml}
         {global_write_forwarding_xml}
+        {master_user_secret_xml}
         <EngineLifecycleSupport>{c.get('EngineLifecycleSupport','open-source-rds-extended-support')}</EngineLifecycleSupport>"""
 
 
