@@ -3315,6 +3315,59 @@ def test_s3_lifecycle_noncurrent_version(s3):
     assert rule["NoncurrentVersionExpiration"]["NoncurrentDays"] == 30
 
 
+def test_s3_lifecycle_newer_noncurrent_versions_round_trip(s3):
+    """NewerNoncurrentVersions must survive the PUT/GET round-trip.
+
+    terraform-provider-aws waits after creating a lifecycle configuration until GET
+    returns rules equal to what it sent. A dropped field never converges, so the
+    create fails with 'timeout while waiting for state to become true' after 3m.
+    """
+    bucket = "intg-s3-lc-newer-noncurrent"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_lifecycle_configuration(
+        Bucket=bucket,
+        LifecycleConfiguration={
+            "Rules": [{
+                "ID": "noncurrent-cleanup",
+                "Status": "Enabled",
+                "Filter": {"Prefix": "integration-tests"},
+                "NoncurrentVersionExpiration": {
+                    "NoncurrentDays": 2,
+                    "NewerNoncurrentVersions": 5,
+                },
+            }]
+        },
+    )
+    rule = s3.get_bucket_lifecycle_configuration(Bucket=bucket)["Rules"][0]
+    assert rule["NoncurrentVersionExpiration"]["NoncurrentDays"] == 2
+    assert rule["NoncurrentVersionExpiration"]["NewerNoncurrentVersions"] == 5
+
+
+def test_s3_lifecycle_noncurrent_version_transition_newer_versions(s3):
+    """NewerNoncurrentVersions on a NoncurrentVersionTransition also round-trips."""
+    bucket = "intg-s3-lc-nvt-newer"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_lifecycle_configuration(
+        Bucket=bucket,
+        LifecycleConfiguration={
+            "Rules": [{
+                "ID": "noncurrent-archive",
+                "Status": "Enabled",
+                "Filter": {"Prefix": ""},
+                "NoncurrentVersionTransitions": [{
+                    "NoncurrentDays": 7,
+                    "NewerNoncurrentVersions": 3,
+                    "StorageClass": "GLACIER",
+                }],
+            }]
+        },
+    )
+    transition = s3.get_bucket_lifecycle_configuration(Bucket=bucket)["Rules"][0]["NoncurrentVersionTransitions"][0]
+    assert transition["NoncurrentDays"] == 7
+    assert transition["NewerNoncurrentVersions"] == 3
+    assert transition["StorageClass"] == "GLACIER"
+
+
 def test_s3_lifecycle_multiple_rules(s3):
     """Multiple lifecycle rules survive PUT/GET round-trip."""
     bucket = "intg-s3-lc-multi"
