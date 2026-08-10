@@ -579,7 +579,8 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
                  username: str = "", user_attrs: dict | None = None,
                  groups: list[str] | None = None,
                  nonce: str = "",
-                 trigger_source: str = "TokenGeneration_Authentication") -> str:
+                 trigger_source: str = "TokenGeneration_Authentication",
+                 client_metadata: dict | None = None) -> str:
     """Return a JWT signed with the RSA key when cryptography is available.
 
     For ``access`` and ``id`` tokens, runs the user pool's PreTokenGeneration
@@ -645,6 +646,7 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
             username=username,
             user_attrs=user_attrs or {},
             groups=groups or [],
+            client_metadata=client_metadata,
         )
 
     payload = base64.urlsafe_b64encode(
@@ -664,7 +666,8 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
 def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
                              trigger_source: str, client_id: str,
                              username: str, user_attrs: dict,
-                             groups: list[str]) -> dict:
+                             groups: list[str],
+                             client_metadata: dict | None = None) -> dict:
     """Invoke the user pool's PreTokenGeneration Lambda and apply its overrides.
 
     Honours both V1_0 (``LambdaConfig.PreTokenGeneration`` — id token only,
@@ -702,6 +705,7 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
         groups=groups,
         trigger_source=trigger_source,
         version=v2_version if use_v2 else "V1_0",
+        client_metadata=client_metadata,
     )
 
     strict = os.environ.get("MINISTACK_COGNITO_PRETOKEN_STRICT", "").lower() in ("1", "true", "yes")
@@ -768,7 +772,8 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
 
 def _build_pretoken_event(pool_id: str, client_id: str, username: str,
                            user_attrs: dict, groups: list[str],
-                           trigger_source: str, version: str) -> dict:
+                           trigger_source: str, version: str,
+                           client_metadata: dict | None = None) -> dict:
     """Construct the event payload AWS sends to a PreTokenGeneration Lambda.
 
     Shape from the Cognito Developer Guide
@@ -782,6 +787,7 @@ def _build_pretoken_event(pool_id: str, client_id: str, username: str,
             "iamRolesToOverride": [],
             "preferredRole": None,
         },
+        "clientMetadata": client_metadata or {},
     }
     if version.startswith("V2") or version.startswith("V3"):
         request_block["scopes"] = ["aws.cognito.signin.user.admin"]
@@ -2893,7 +2899,8 @@ def _mfa_challenge_for_user(pool: dict, user: dict, pid: str, username: str) -> 
 
 
 def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = "",
-                        trigger_source: str = "TokenGeneration_Authentication") -> dict:
+                        trigger_source: str = "TokenGeneration_Authentication",
+                        client_metadata: dict | None = None) -> dict:
     attrs = _attr_list_to_dict(user.get("Attributes", []))
     sub = attrs.get("sub", user["Username"])
     username = user.get("Username", "")
@@ -2901,10 +2908,12 @@ def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = ""
     return {
         "AccessToken": _fake_token(sub, pool_id, client_id, "access", username=username,
                                     user_attrs=attrs, groups=groups,
-                                    trigger_source=trigger_source),
+                                    trigger_source=trigger_source,
+                                    client_metadata=client_metadata),
         "IdToken": _fake_token(sub, pool_id, client_id, "id", username=username,
                                user_attrs=attrs, groups=groups, nonce=nonce,
-                               trigger_source=trigger_source),
+                               trigger_source=trigger_source,
+                               client_metadata=client_metadata),
         "RefreshToken": _fake_token(sub, pool_id, client_id, "refresh"),
         "TokenType": "Bearer",
         "ExpiresIn": 3600,
@@ -2922,6 +2931,8 @@ def _admin_initiate_auth(data):
 
     auth_flow = data.get("AuthFlow", "")
     auth_params = data.get("AuthParameters", {})
+    # Top-level field, NOT inside AuthParameters — same as the CUSTOM_AUTH branch below.
+    client_metadata = data.get("ClientMetadata", {})
 
     if auth_flow in ("ADMIN_USER_PASSWORD_AUTH", "ADMIN_NO_SRP_AUTH"):
         username = auth_params.get("USERNAME")
@@ -2947,7 +2958,8 @@ def _admin_initiate_auth(data):
         mfa_challenge = _mfa_challenge_for_user(pool, user, pid, username)
         if mfa_challenge:
             return json_response(mfa_challenge)
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+        return json_response({"AuthenticationResult":
+                             _build_auth_result(pid, cid, user, client_metadata=client_metadata)})
 
     if auth_flow in ("REFRESH_TOKEN_AUTH", "REFRESH_TOKEN"):
         refresh_token = auth_params.get("REFRESH_TOKEN", "")
@@ -2965,7 +2977,8 @@ def _admin_initiate_auth(data):
             return error_response_json("NotAuthorizedException",
                                        "Refresh Token has been revoked", 400)
         result = _build_auth_result(pid, cid, user,
-                                     trigger_source="TokenGeneration_RefreshTokens")
+                                     trigger_source="TokenGeneration_RefreshTokens",
+                                     client_metadata=client_metadata)
         result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
         return json_response({"AuthenticationResult": result})
 
@@ -2990,8 +3003,7 @@ def _admin_initiate_auth(data):
             return error_response_json("NotAuthorizedException",
                     "User is disabled.", 400)
 
-        # Extract ClientMetadata (top-level field, NOT inside AuthParameters)
-        client_metadata = data.get("ClientMetadata", {})
+        # client_metadata already extracted at the top of this function.
 
         # Build user_attrs dict
         user_attrs = _attr_list_to_dict(user.get("Attributes", []))
@@ -3167,7 +3179,7 @@ def _pool_for_client(cid):
     return None, None
 
 
-def _refresh_auth_result(pool, pid, cid, refresh_token):
+def _refresh_auth_result(pool, pid, cid, refresh_token, client_metadata: dict | None = None):
     """Shared REFRESH_TOKEN_AUTH core. Returns (auth_result_dict, error_response);
     exactly one is non-None. Used by InitiateAuth's REFRESH_TOKEN_AUTH branch and
     by GetTokensFromRefreshToken so both mint tokens identically."""
@@ -3183,7 +3195,8 @@ def _refresh_auth_result(pool, pid, cid, refresh_token):
     if _refresh_token_revoked(refresh_token, user):
         return None, error_response_json("NotAuthorizedException",
                                          "Refresh Token has been revoked", 400)
-    result = _build_auth_result(pid, cid, user, trigger_source="TokenGeneration_RefreshTokens")
+    result = _build_auth_result(pid, cid, user, trigger_source="TokenGeneration_RefreshTokens",
+                                 client_metadata=client_metadata)
     result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
     return result, None
 
@@ -3209,7 +3222,8 @@ def _get_tokens_from_refresh_token(data):
     pool, pid = _pool_for_client(cid)
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
-    result, err = _refresh_auth_result(pool, pid, cid, refresh_token)
+    client_metadata = data.get("ClientMetadata", {})
+    result, err = _refresh_auth_result(pool, pid, cid, refresh_token, client_metadata=client_metadata)
     if err:
         return err
     return json_response({"AuthenticationResult": result})
@@ -3220,6 +3234,8 @@ def _initiate_auth(data):
     cid = data.get("ClientId")
     auth_flow = data.get("AuthFlow", "")
     auth_params = data.get("AuthParameters", {})
+    # Top-level field, NOT inside AuthParameters — same as the CUSTOM_AUTH branch below.
+    client_metadata = data.get("ClientMetadata", {})
 
     # Find pool by client id
     pool = None
@@ -3256,10 +3272,12 @@ def _initiate_auth(data):
         mfa_challenge = _mfa_challenge_for_user(pool, user, pid, username)
         if mfa_challenge:
             return json_response(mfa_challenge)
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+        return json_response({"AuthenticationResult":
+                             _build_auth_result(pid, cid, user, client_metadata=client_metadata)})
 
     if auth_flow in ("REFRESH_TOKEN_AUTH", "REFRESH_TOKEN"):
-        result, err = _refresh_auth_result(pool, pid, cid, auth_params.get("REFRESH_TOKEN", ""))
+        result, err = _refresh_auth_result(pool, pid, cid, auth_params.get("REFRESH_TOKEN", ""),
+                                            client_metadata=client_metadata)
         if err:
             return err
         return json_response({"AuthenticationResult": result})
@@ -3299,8 +3317,7 @@ def _initiate_auth(data):
             return error_response_json("NotAuthorizedException",
                     "User is disabled.", 400)
 
-        # Extract ClientMetadata (top-level field, NOT inside AuthParameters)
-        client_metadata = data.get("ClientMetadata", {})
+        # client_metadata already extracted at the top of this function.
 
         # Build user_attrs dict
         user_attrs = _attr_list_to_dict(user.get("Attributes", []))

@@ -4320,6 +4320,80 @@ def test_cognito_pretoken_trigger_source_by_auth_flow(cognito_idp, lam):
     assert _decode_jwt_claims(resp2["access_token"])["seen_trigger_source"] == "TokenGeneration_RefreshTokens"
 
 
+def test_cognito_pretoken_receives_client_metadata(cognito_idp, lam):
+    """PreTokenGeneration's event.request.clientMetadata should carry whatever
+    ClientMetadata the caller passed to InitiateAuth/AdminInitiateAuth/
+    GetTokensFromRefreshToken, matching real AWS's documented request shape
+    (https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-lambda-pre-token-generation.html).
+    Before this fix, _build_pretoken_event never included the key at all, so
+    apps relying on ClientMetadata to pass e.g. an org id through to the
+    trigger (a common multi-tenant pattern) silently never saw it."""
+    handler = (
+        "def handler(event, ctx):\n"
+        "    cm = event['request'].get('clientMetadata') or {}\n"
+        "    event['response']['claimsAndScopeOverrideDetails'] = {\n"
+        "        'accessTokenGeneration': {'claimsToAddOrOverride': {'seen_org_id': cm.get('orgId', '')}},\n"
+        "    }\n"
+        "    return event\n"
+    )
+    fn_name = "ministack-pretoken-client-metadata"
+    lam.create_function(
+        FunctionName=fn_name, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": _make_pretoken_lambda_zip(handler)},
+    )
+    fn_arn = lam.get_function(FunctionName=fn_name)["Configuration"]["FunctionArn"]
+
+    pool_id, client = _setup_pool_with_user(cognito_idp)
+    cognito_idp.update_user_pool(
+        UserPoolId=pool_id,
+        LambdaConfig={"PreTokenGenerationConfig": {
+            "LambdaArn": fn_arn, "LambdaVersion": "V2_0",
+        }},
+    )
+    client_id = client["ClientId"]
+
+    # InitiateAuth(USER_PASSWORD_AUTH)
+    auth = cognito_idp.initiate_auth(
+        ClientId=client_id, AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "testuser", "PASSWORD": "TestPass1!"},
+        ClientMetadata={"orgId": "org-password"},
+    )["AuthenticationResult"]
+    assert _decode_jwt_claims(auth["AccessToken"])["seen_org_id"] == "org-password"
+
+    # InitiateAuth(REFRESH_TOKEN_AUTH)
+    refreshed = cognito_idp.initiate_auth(
+        ClientId=client_id, AuthFlow="REFRESH_TOKEN_AUTH",
+        AuthParameters={"REFRESH_TOKEN": auth["RefreshToken"]},
+        ClientMetadata={"orgId": "org-refresh"},
+    )["AuthenticationResult"]
+    assert _decode_jwt_claims(refreshed["AccessToken"])["seen_org_id"] == "org-refresh"
+
+    # AdminInitiateAuth(ADMIN_USER_PASSWORD_AUTH)
+    admin_auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pool_id, ClientId=client_id, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "testuser", "PASSWORD": "TestPass1!"},
+        ClientMetadata={"orgId": "org-admin-password"},
+    )["AuthenticationResult"]
+    assert _decode_jwt_claims(admin_auth["AccessToken"])["seen_org_id"] == "org-admin-password"
+
+    # AdminInitiateAuth(REFRESH_TOKEN_AUTH)
+    admin_refreshed = cognito_idp.admin_initiate_auth(
+        UserPoolId=pool_id, ClientId=client_id, AuthFlow="REFRESH_TOKEN_AUTH",
+        AuthParameters={"REFRESH_TOKEN": auth["RefreshToken"]},
+        ClientMetadata={"orgId": "org-admin-refresh"},
+    )["AuthenticationResult"]
+    assert _decode_jwt_claims(admin_refreshed["AccessToken"])["seen_org_id"] == "org-admin-refresh"
+
+    # GetTokensFromRefreshToken
+    gtfrt = cognito_idp.get_tokens_from_refresh_token(
+        ClientId=client_id, RefreshToken=auth["RefreshToken"],
+        ClientMetadata={"orgId": "org-gtfrt"},
+    )["AuthenticationResult"]
+    assert _decode_jwt_claims(gtfrt["AccessToken"])["seen_org_id"] == "org-gtfrt"
+
+
 @pytest.fixture
 def _enable_persistence(monkeypatch, tmp_path):
     """Force PERSIST_STATE on and point STATE_DIR at a tmp dir so
