@@ -4048,3 +4048,51 @@ def test_s3_conditional_delete_if_match(s3):
     assert resp.get("Errors") and resp["Errors"][0]["Code"] == "PreconditionFailed"
     assert not resp.get("Deleted")
     assert s3.get_object(Bucket=bucket, Key="cond")["Body"].read() == b"x"
+
+
+def test_s3_copy_object_specific_version(s3):
+    """CopyObject with a source ?versionId copies that exact version, not the
+    current object. Regression for #1328."""
+    bucket = "intg-s3-copy-version"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+    v1 = s3.put_object(Bucket=bucket, Key="k", Body=b"VERSION-ONE")["VersionId"]
+    s3.put_object(Bucket=bucket, Key="k", Body=b"VERSION-TWO")
+
+    r = s3.copy_object(
+        Bucket=bucket, Key="copy",
+        CopySource={"Bucket": bucket, "Key": "k", "VersionId": v1},
+    )
+    assert r["CopySourceVersionId"] == v1
+    assert s3.get_object(Bucket=bucket, Key="copy")["Body"].read() == b"VERSION-ONE"
+
+    # Copy without a versionId still takes the current version.
+    s3.copy_object(Bucket=bucket, Key="copy2", CopySource={"Bucket": bucket, "Key": "k"})
+    assert s3.get_object(Bucket=bucket, Key="copy2")["Body"].read() == b"VERSION-TWO"
+
+    # A non-existent source version is rejected.
+    with pytest.raises(ClientError) as exc:
+        s3.copy_object(
+            Bucket=bucket, Key="copy-bad",
+            CopySource={"Bucket": bucket, "Key": "k", "VersionId": "does-not-exist"},
+        )
+    assert exc.value.response["Error"]["Code"] == "NoSuchVersion"
+
+
+def test_s3_head_object_specific_version(s3):
+    """HeadObject with a versionId returns that version's metadata, not the
+    current object's (same versionId-dropping class as #1328)."""
+    bucket = "intg-s3-head-version"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+    v1 = s3.put_object(Bucket=bucket, Key="k", Body=b"AAAAA")["VersionId"]        # 5 bytes
+    s3.put_object(Bucket=bucket, Key="k", Body=b"BBBBBBBBBB")                     # 10 bytes
+
+    h = s3.head_object(Bucket=bucket, Key="k", VersionId=v1)
+    assert h["ContentLength"] == 5
+    assert h["VersionId"] == v1
+
+    # HEAD carries no body, so boto3 surfaces a bad version as a 404.
+    with pytest.raises(ClientError) as exc:
+        s3.head_object(Bucket=bucket, Key="k", VersionId="does-not-exist")
+    assert exc.value.response["Error"]["Code"] in ("NoSuchVersion", "404")

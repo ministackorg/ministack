@@ -951,7 +951,7 @@ def _dispatch(
             )
 
         if method == "HEAD":
-            return _head_object(bucket, key, headers)
+            return _head_object(bucket, key, headers, query_params)
 
         if method == "DELETE":
             if "uploadId" in query_params:
@@ -3006,23 +3006,47 @@ def _range_error_xml(bucket_name: str, key: str) -> Element:
     return root
 
 
-def _head_object(bucket_name: str, key: str, headers: dict | None = None):
+def _head_object(bucket_name: str, key: str, headers: dict | None = None,
+                 query_params: dict | None = None):
     headers = headers or {}
+    query_params = query_params or {}
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
-    if key not in bucket["objects"]:
-        return _error(
-            "NoSuchKey",
-            "The specified key does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
 
-    obj = bucket["objects"][key]
+    # A `?versionId=` selects a specific version's metadata, matching AWS
+    # HeadObject(VersionId); without it, the current object is used.
+    version_id = _qp(query_params, "versionId", "")
+    if version_id:
+        ventry = next(
+            (v for v in _object_versions.get((bucket_name, key), [])
+             if v["version_id"] == version_id),
+            None,
+        )
+        if ventry is None or ventry.get("is_delete_marker"):
+            return _error(
+                "NoSuchVersion",
+                "The specified version does not exist.",
+                404,
+                f"/{bucket_name}/{key}",
+            )
+        obj = _object_record_from_version(ventry)
+    else:
+        if key not in bucket["objects"]:
+            return _error(
+                "NoSuchKey",
+                "The specified key does not exist.",
+                404,
+                f"/{bucket_name}/{key}",
+            )
+        obj = bucket["objects"][key]
+
     include_checksums = (headers.get("x-amz-checksum-mode") or "").upper() == "ENABLED"
-    return 200, _object_response_headers(obj, bucket_name, key,
-                                         include_checksums=include_checksums), b""
+    resp_headers = _object_response_headers(obj, bucket_name, key,
+                                            include_checksums=include_checksums)
+    if version_id:
+        resp_headers["x-amz-version-id"] = version_id
+    return 200, resp_headers, b""
 
 
 def _purge_current_object(bucket_name: str, key: str, bucket: dict):
@@ -3227,7 +3251,8 @@ def _check_object_lock(bucket_name: str, key: str, headers: dict) -> tuple | Non
 
 def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     source = url_unquote(headers.get("x-amz-copy-source", "").lstrip("/"))
-    src_parts = source.split("?", 1)[0].split("/", 1)
+    src_path, _, src_query = source.partition("?")
+    src_parts = src_path.split("/", 1)
     if len(src_parts) < 2:
         return _error(
             "InvalidArgument",
@@ -3239,19 +3264,55 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     src_bucket = _ensure_bucket(src_bucket_name)
     if src_bucket is None:
         return _no_such_bucket(src_bucket_name)
-    if src_key not in src_bucket["objects"]:
-        return _error(
-            "NoSuchKey",
-            "The specified key does not exist.",
-            404,
-            f"/{src_bucket_name}/{src_key}",
-        )
+
+    # A `?versionId=` on the copy source selects a specific version to copy,
+    # rather than the current object (AWS copies that exact version).
+    src_version_id = None
+    if src_query:
+        src_version_id = _parse_qs(src_query, keep_blank_values=True).get(
+            "versionId", [None]
+        )[0]
 
     dest_bucket = _ensure_bucket(bucket_name)
     if dest_bucket is None:
         return _no_such_bucket(bucket_name)
 
-    src_obj = src_bucket["objects"][src_key]
+    if src_version_id:
+        ventry = next(
+            (v for v in _object_versions.get((src_bucket_name, src_key), [])
+             if v["version_id"] == src_version_id),
+            None,
+        )
+        if ventry is None or ventry.get("is_delete_marker"):
+            return _error(
+                "NoSuchVersion",
+                "The specified version does not exist.",
+                404,
+                f"/{src_bucket_name}/{src_key}",
+            )
+        # Synthesize a source object from the stored version. Per-version user
+        # metadata isn't retained, so a COPY metadata-directive carries none.
+        src_obj = {
+            "body": ventry.get("data", b""),
+            "etag": ventry["etag"],
+            "size": ventry["size"],
+            "content_type": ventry.get("content_type") or "application/octet-stream",
+            "storage_class": ventry.get("storage_class") or "STANDARD",
+            "checksums": ventry.get("checksums") or {},
+            "version_id": src_version_id,
+        }
+    else:
+        if src_key not in src_bucket["objects"]:
+            return _error(
+                "NoSuchKey",
+                "The specified key does not exist.",
+                404,
+                f"/{src_bucket_name}/{src_key}",
+            )
+        src_obj = src_bucket["objects"][src_key]
+
+    # AWS echoes the copied source version on a versioned source.
+    copy_src_vid = src_version_id or src_obj.get("version_id")
 
     # Precondition: x-amz-copy-source-if-match
     if_match = headers.get("x-amz-copy-source-if-match", "")
@@ -3363,6 +3424,8 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     )
 
     resp_headers = {"Content-Type": "application/xml"}
+    if copy_src_vid:
+        resp_headers["x-amz-copy-source-version-id"] = copy_src_vid
     if dest_sc != "STANDARD":
         resp_headers["x-amz-storage-class"] = dest_sc
     if _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
