@@ -158,6 +158,7 @@ def test_rds_data_resolves_cluster_arn_by_arn_region(rds, sm):
             DBClusterIdentifier=cluster_id,
             Engine="aurora-mysql",
             EngineMode="serverless",
+            EnableHttpEndpoint=True,
             MasterUsername="admin",
             MasterUserPassword="testpass123",
         )
@@ -165,6 +166,7 @@ def test_rds_data_resolves_cluster_arn_by_arn_region(rds, sm):
             DBClusterIdentifier=cluster_id,
             Engine="aurora-mysql",
             EngineMode="serverless",
+            EnableHttpEndpoint=True,
             MasterUsername="admin",
             MasterUserPassword="testpass123",
         )
@@ -375,16 +377,22 @@ def test_rollback_missing_transaction_id():
     assert "transactionId" in body.get("message", body.get("Message", ""))
 
 
-def test_commit_nonexistent_transaction():
+def test_commit_nonexistent_transaction(rds, sm):
+    resource_arn, secret_arn = _setup_stub_cluster(rds, sm)
     status, body = _raw_post("/CommitTransaction", {
+        "resourceArn": resource_arn,
+        "secretArn": secret_arn,
         "transactionId": "nonexistent-txn-id",
     })
     assert status == 404
     assert "not found" in body.get("message", body.get("Message", "")).lower()
 
 
-def test_rollback_nonexistent_transaction():
+def test_rollback_nonexistent_transaction(rds, sm):
+    resource_arn, secret_arn = _setup_stub_cluster(rds, sm)
     status, body = _raw_post("/RollbackTransaction", {
+        "resourceArn": resource_arn,
+        "secretArn": secret_arn,
         "transactionId": "nonexistent-txn-id",
     })
     assert status == 404
@@ -503,6 +511,7 @@ def _setup_stub_cluster(rds, sm):
         DBClusterIdentifier=cluster_id,
         Engine="aurora-mysql",
         EngineMode="serverless",
+        EnableHttpEndpoint=True,
         MasterUsername="admin",
         MasterUserPassword="testpass123",
     )
@@ -521,6 +530,74 @@ def _exec(cluster_arn, secret_arn, sql):
         "secretArn": secret_arn,
         "sql": sql,
     })
+
+
+def _setup_stub_cluster_state():
+    from ministack.services import rds, rds_data, secretsmanager
+
+    cluster_id = f"stub-state-{uuid.uuid4().hex[:8]}"
+    secret_name = f"stub-state-secret-{uuid.uuid4().hex[:8]}"
+    cluster_arn = f"arn:aws:rds:{REGION}:{ACCOUNT_ID}:cluster:{cluster_id}"
+    secret_arn = f"arn:aws:secretsmanager:{REGION}:{ACCOUNT_ID}:secret:{secret_name}"
+    rds_data.reset()
+    rds._clusters[cluster_id] = {
+        "DBClusterIdentifier": cluster_id,
+        "DBClusterArn": cluster_arn,
+        "Engine": "aurora-mysql",
+        "EngineMode": "serverless",
+        "HttpEndpointEnabled": True,
+    }
+    secretsmanager._secrets[secret_name] = {
+        "ARN": secret_arn,
+        "Name": secret_name,
+        "Versions": {
+            "v1": {
+                "Stages": ["AWSCURRENT"],
+                "SecretString": '{"username":"admin","password":"testpass123"}',
+            },
+        },
+    }
+    return cluster_id, cluster_arn, secret_name, secret_arn
+
+
+@pytest.mark.parametrize(
+    "stored_resource_arn",
+    (None, "other-resource"),
+    ids=("bogus", "cross-resource"),
+)
+def test_rds_data_stub_rejects_invalid_transaction_id(stored_resource_arn):
+    from ministack.services import rds, rds_data, secretsmanager
+
+    cluster_id, cluster_arn, secret_name, secret_arn = _setup_stub_cluster_state()
+    txn_id = f"stub-invalid-txn-{uuid.uuid4().hex}"
+    if stored_resource_arn is not None:
+        rds_data._transactions[txn_id] = {
+            "resourceArn": f"{cluster_arn}-{stored_resource_arn}",
+            "conn": object(),
+        }
+
+    try:
+        status, headers, body = rds_data._execute_statement({
+            "resourceArn": cluster_arn,
+            "secretArn": secret_arn,
+            "transactionId": txn_id,
+            "sql": "CREATE DATABASE should_not_write",
+        })
+        payload = json.loads(body)
+
+        assert status == 404
+        assert headers["x-amzn-errortype"] == "TransactionNotFoundException"
+        assert payload["__type"] == "TransactionNotFoundException"
+        assert payload["message"] == f"Transaction {txn_id} not found"
+        assert "should_not_write" not in rds_data._stub_databases.get(
+            rds_data._cluster_id_from_arn(cluster_arn), set()
+        )
+        if stored_resource_arn is not None:
+            assert txn_id in rds_data._transactions
+    finally:
+        rds_data.reset()
+        rds._clusters.pop(cluster_id, None)
+        secretsmanager._secrets.pop(secret_name, None)
 
 
 def test_rds_data_stub_create_and_query_databases(rds, sm):
@@ -572,6 +649,398 @@ def test_rds_data_stub_grant_and_show_grants(rds, sm):
     assert any("GRANT" in g and "grantee" in g for g in grants)
 
 
+def test_rds_data_stub_show_grants_accepts_host_qualified_user():
+    """The provider asks for SHOW GRANTS using the MySQL 'user'@'host' shape."""
+    from ministack.services import rds, rds_data, secretsmanager
+
+    cluster_id, cluster_arn, secret_name, secret_arn = _setup_stub_cluster_state()
+    try:
+        rds_data._execute_statement({
+            "resourceArn": cluster_arn,
+            "secretArn": secret_arn,
+            "sql": "CREATE USER 'grantee'@'%' IDENTIFIED BY 'pass'",
+        })
+        rds_data._execute_statement({
+            "resourceArn": cluster_arn,
+            "secretArn": secret_arn,
+            "sql": "GRANT SELECT ON appdb.* TO 'grantee'@'%'",
+        })
+
+        status, _headers, body = rds_data._execute_statement({
+            "resourceArn": cluster_arn,
+            "secretArn": secret_arn,
+            "sql": "SHOW GRANTS FOR 'grantee'@'%'",
+        })
+        payload = json.loads(body)
+
+        assert status == 200
+        grants = [r[0]["stringValue"] for r in payload.get("records", [])]
+        assert grants
+        assert any("GRANT" in g and "grantee" in g for g in grants)
+    finally:
+        rds._clusters.pop(cluster_id, None)
+        secretsmanager._secrets.pop(secret_name, None)
+
+
+def test_rds_data_rejects_disabled_http_endpoint_before_stub():
+    from ministack.services import rds, rds_data
+
+    cluster_id = f"disabled-endpoint-{uuid.uuid4().hex[:8]}"
+    resource_arn = f"arn:aws:rds:{REGION}:{ACCOUNT_ID}:cluster:{cluster_id}"
+    rds._clusters[cluster_id] = {
+        "DBClusterIdentifier": cluster_id,
+        "DBClusterArn": resource_arn,
+        "Engine": "aurora-mysql",
+        "EngineMode": "serverless",
+        "HttpEndpointEnabled": False,
+    }
+
+    try:
+        common = {
+            "resourceArn": resource_arn,
+            "secretArn": FAKE_SECRET_ARN,
+        }
+        cases = (
+            (rds_data._execute_statement, {"sql": "SELECT 1"}),
+            (rds_data._begin_transaction, {}),
+            (rds_data._batch_execute_statement, {"sql": "SELECT 1"}),
+        )
+        for handler, extra in cases:
+            status, headers, body = handler({**common, **extra})
+            payload = json.loads(body)
+            assert status == 400
+            assert headers["x-amzn-errortype"] == "HttpEndpointNotEnabledException"
+            assert payload["__type"] == "HttpEndpointNotEnabledException"
+    finally:
+        rds._clusters.pop(cluster_id, None)
+
+
+def test_rds_data_member_instance_arn_honors_parent_http_endpoint_gate():
+    from ministack.services import rds, rds_data, secretsmanager
+
+    cluster_id, _cluster_arn, secret_name, secret_arn = _setup_stub_cluster_state()
+    instance_id = f"disabled-member-{uuid.uuid4().hex[:8]}"
+    instance_arn = f"arn:aws:rds:{REGION}:{ACCOUNT_ID}:db:{instance_id}"
+    rds._clusters[cluster_id]["HttpEndpointEnabled"] = False
+    rds._instances[instance_id] = {
+        "DBInstanceIdentifier": instance_id,
+        "DBInstanceArn": instance_arn,
+        "DBClusterIdentifier": cluster_id,
+        "DBInstanceStatus": "available",
+        "Engine": "aurora-mysql",
+    }
+
+    try:
+        status, headers, body = rds_data._execute_statement({
+            "resourceArn": instance_arn,
+            "secretArn": secret_arn,
+            "sql": "SHOW DATABASES",
+        })
+        payload = json.loads(body)
+
+        assert status == 400
+        assert headers["x-amzn-errortype"] == "HttpEndpointNotEnabledException"
+        assert payload["__type"] == "HttpEndpointNotEnabledException"
+    finally:
+        rds._instances.pop(instance_id, None)
+        rds._clusters.pop(cluster_id, None)
+        secretsmanager._secrets.pop(secret_name, None)
+
+
+@pytest.mark.parametrize(
+    "handler_name",
+    ("_commit_transaction", "_rollback_transaction"),
+)
+def test_transaction_completion_requires_resource_and_secret_arns(handler_name):
+    from ministack.services import rds_data
+
+    class _Connection:
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    rds_data.reset()
+    txn_id = f"txn-required-arns-{uuid.uuid4().hex}"
+    rds_data._transactions[txn_id] = {"conn": _Connection()}
+    handler = getattr(rds_data, handler_name)
+
+    try:
+        status, _headers, body = handler({"transactionId": txn_id})
+        payload = json.loads(body)
+        assert status == 400
+        assert payload["__type"] == "BadRequestException"
+        assert "resourceArn" in payload["message"]
+        assert txn_id in rds_data._transactions
+
+        status, _headers, body = handler({
+            "transactionId": txn_id,
+            "resourceArn": FAKE_CLUSTER_ARN,
+        })
+        payload = json.loads(body)
+        assert status == 400
+        assert payload["__type"] == "BadRequestException"
+        assert "secretArn" in payload["message"]
+        assert txn_id in rds_data._transactions
+    finally:
+        rds_data._transactions.pop(txn_id, None)
+
+
+@pytest.mark.parametrize(
+    "handler_name",
+    ("_commit_transaction", "_rollback_transaction"),
+)
+def test_transaction_completion_honors_http_endpoint_gate(handler_name):
+    from ministack.services import rds, rds_data, secretsmanager
+
+    class _Connection:
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    cluster_id, cluster_arn, secret_name, secret_arn = _setup_stub_cluster_state()
+    rds._clusters[cluster_id]["HttpEndpointEnabled"] = False
+    txn_id = f"txn-disabled-endpoint-{uuid.uuid4().hex}"
+    rds_data._transactions[txn_id] = {"conn": _Connection()}
+    handler = getattr(rds_data, handler_name)
+
+    try:
+        status, headers, body = handler({
+            "transactionId": txn_id,
+            "resourceArn": cluster_arn,
+            "secretArn": secret_arn,
+        })
+        payload = json.loads(body)
+        assert status == 400
+        assert headers["x-amzn-errortype"] == "HttpEndpointNotEnabledException"
+        assert payload["__type"] == "HttpEndpointNotEnabledException"
+        assert txn_id in rds_data._transactions
+    finally:
+        rds_data._transactions.pop(txn_id, None)
+        rds._clusters.pop(cluster_id, None)
+        secretsmanager._secrets.pop(secret_name, None)
+
+
+@pytest.mark.parametrize(
+    ("handler_name", "extra", "expected_error"),
+    (
+        ("_commit_transaction", {}, "NotFoundException"),
+        ("_rollback_transaction", {}, "NotFoundException"),
+        (
+            "_execute_statement",
+            {"sql": "SHOW DATABASES"},
+            "TransactionNotFoundException",
+        ),
+        (
+            "_batch_execute_statement",
+            {"sql": "SHOW DATABASES"},
+            "TransactionNotFoundException",
+        ),
+    ),
+    ids=("commit", "rollback", "execute", "batch"),
+)
+def test_transaction_is_bound_to_resource_arn(
+    monkeypatch,
+    handler_name,
+    extra,
+    expected_error,
+):
+    from ministack.services import rds_data
+
+    class _Cursor:
+        rowcount = 0
+        description = None
+
+        def execute(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    class _Connection:
+        def __init__(self):
+            self.commits = 0
+            self.rollbacks = 0
+
+        def autocommit(self, _enabled):
+            pass
+
+        def cursor(self):
+            return _Cursor()
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            self.rollbacks += 1
+
+        def close(self):
+            pass
+
+    cluster_a_arn = f"arn:aws:rds:{REGION}:{ACCOUNT_ID}:cluster:txn-cluster-a"
+    cluster_b_arn = f"arn:aws:rds:{REGION}:{ACCOUNT_ID}:cluster:txn-cluster-b"
+    instance = {
+        "Endpoint": {"Address": "127.0.0.1", "Port": 3306},
+        "_docker_container_id": "txn-test-container",
+        "Engine": "aurora-mysql",
+    }
+    clusters = {
+        cluster_a_arn: {"DBClusterIdentifier": "txn-cluster-a", "HttpEndpointEnabled": True},
+        cluster_b_arn: {"DBClusterIdentifier": "txn-cluster-b", "HttpEndpointEnabled": True},
+    }
+    connection = _Connection()
+
+    monkeypatch.setattr(
+        rds_data,
+        "_resolve_target",
+        lambda resource_arn: (instance, "aurora-mysql", clusters[resource_arn]),
+    )
+    monkeypatch.setattr(
+        rds_data,
+        "_require_secret_credentials",
+        lambda _secret_arn: ("admin", "password", None),
+    )
+    monkeypatch.setattr(rds_data, "_connect", lambda *_args, **_kwargs: connection)
+    rds_data.reset()
+
+    try:
+        status, _headers, body = rds_data._begin_transaction({
+            "resourceArn": cluster_a_arn,
+            "secretArn": FAKE_SECRET_ARN,
+        })
+        assert status == 200
+        txn_id = json.loads(body)["transactionId"]
+
+        handler = getattr(rds_data, handler_name)
+        status, headers, body = handler({
+            "resourceArn": cluster_b_arn,
+            "secretArn": FAKE_SECRET_ARN,
+            "transactionId": txn_id,
+            **extra,
+        })
+        payload = json.loads(body)
+
+        assert status == 404
+        assert headers["x-amzn-errortype"] == expected_error
+        assert payload["__type"] == expected_error
+        assert payload["message"] == f"Transaction {txn_id} not found"
+        assert txn_id in rds_data._transactions
+        assert connection.commits == 0
+        assert connection.rollbacks == 0
+
+        if expected_error == "TransactionNotFoundException":
+            rds_data._transactions.pop(txn_id)
+            status, headers, body = handler({
+                "resourceArn": cluster_a_arn,
+                "secretArn": FAKE_SECRET_ARN,
+                "transactionId": txn_id,
+                **extra,
+            })
+            payload = json.loads(body)
+            assert status == 404
+            assert headers["x-amzn-errortype"] == "TransactionNotFoundException"
+            assert payload["__type"] == "TransactionNotFoundException"
+            assert payload["message"] == f"Transaction {txn_id} not found"
+    finally:
+        rds_data.reset()
+
+
+def test_rds_data_rejects_missing_secret_before_password_fallback():
+    from ministack.services import rds, rds_data
+
+    cluster_id, cluster_arn, secret_name, _secret_arn = _setup_stub_cluster_state()
+
+    try:
+        status, headers, body = rds_data._execute_statement({
+            "resourceArn": cluster_arn,
+            "secretArn": FAKE_SECRET_ARN,
+            "sql": "CREATE DATABASE should_not_write",
+        })
+        payload = json.loads(body)
+        assert status == 400
+        assert headers["x-amzn-errortype"] == "SecretsErrorException"
+        assert payload["__type"] == "SecretsErrorException"
+        assert "secret" in payload["message"].lower()
+    finally:
+        rds._clusters.pop(cluster_id, None)
+        from ministack.services import secretsmanager
+        secretsmanager._secrets.pop(secret_name, None)
+
+
+def test_rds_data_rejects_secret_without_password_before_password_fallback():
+    from ministack.services import rds, rds_data, secretsmanager
+
+    cluster_id, cluster_arn, secret_name, secret_arn = _setup_stub_cluster_state()
+    secretsmanager._secrets[secret_name]["Versions"]["v1"]["SecretString"] = '{"username":"admin"}'
+
+    try:
+        status, headers, body = rds_data._execute_statement({
+            "resourceArn": cluster_arn,
+            "secretArn": secret_arn,
+            "sql": "CREATE DATABASE should_not_write",
+        })
+        payload = json.loads(body)
+        assert status == 400
+        assert headers["x-amzn-errortype"] == "InvalidSecretException"
+        assert payload["__type"] == "InvalidSecretException"
+        assert "password" in payload["message"].lower()
+    finally:
+        rds._clusters.pop(cluster_id, None)
+        secretsmanager._secrets.pop(secret_name, None)
+
+
+def test_rds_data_rejects_secret_scheduled_for_deletion():
+    from ministack.services import rds, rds_data, secretsmanager
+
+    cluster_id, cluster_arn, secret_name, secret_arn = _setup_stub_cluster_state()
+    secretsmanager._secrets[secret_name]["DeletedDate"] = "2026-08-10T00:00:00Z"
+
+    try:
+        status, headers, body = rds_data._execute_statement({
+            "resourceArn": cluster_arn,
+            "secretArn": secret_arn,
+            "sql": "SHOW DATABASES",
+        })
+        payload = json.loads(body)
+
+        assert status == 400
+        assert headers["x-amzn-errortype"] == "SecretsErrorException"
+        assert payload["__type"] == "SecretsErrorException"
+        assert "scheduled for deletion" in payload["message"]
+    finally:
+        rds._clusters.pop(cluster_id, None)
+        secretsmanager._secrets.pop(secret_name, None)
+
+
+def test_rds_data_stub_rejects_unrecognized_sql():
+    from ministack.services import rds, rds_data, secretsmanager
+
+    cluster_id, cluster_arn, secret_name, secret_arn = _setup_stub_cluster_state()
+    try:
+        status, _headers, body = rds_data._execute_statement({
+            "resourceArn": cluster_arn,
+            "secretArn": secret_arn,
+            "sql": "SELECT definitely_unmodeled()",
+        })
+        payload = json.loads(body)
+
+        assert status == 400
+        assert payload["__type"] == "BadRequestException"
+        assert "unsupported" in payload["message"].lower()
+    finally:
+        rds._clusters.pop(cluster_id, None)
+        secretsmanager._secrets.pop(secret_name, None)
+
+
 def test_rds_data_stub_drop_database(rds, sm):
     """CREATE then DROP DATABASE, verify gone from queries."""
     cluster_arn, secret_arn = _setup_stub_cluster(rds, sm)
@@ -617,9 +1086,18 @@ def test_rds_data_real_endpoint_connection_failure_is_transient(monkeypatch):
         "_docker_container_id": "container-id",
         "Engine": "aurora-mysql",
     }
+    cluster = {
+        "DBClusterIdentifier": "real-cluster",
+        "DBClusterArn": resource_arn,
+        "HttpEndpointEnabled": True,
+    }
 
-    monkeypatch.setattr(rds_data, "_resolve_cluster", lambda _arn: (instance, "aurora-mysql"))
-    monkeypatch.setattr(rds_data, "_get_secret_credentials", lambda _arn: ("admin", "pw"))
+    monkeypatch.setattr(
+        rds_data,
+        "_resolve_target",
+        lambda _arn: (instance, "aurora-mysql", cluster),
+    )
+    monkeypatch.setattr(rds_data, "_require_secret_credentials", lambda _arn: ("admin", "pw", None))
 
     def _raise_connection_error(*_args, **_kwargs):
         raise OSError("Connection refused")
@@ -650,6 +1128,7 @@ def test_rds_data_provisioned_cluster_without_members_is_unavailable():
         "DBClusterArn": resource_arn,
         "Engine": "aurora-mysql",
         "EngineMode": "provisioned",
+        "HttpEndpointEnabled": True,
         "Status": "available",
         "DBClusterMembers": [],
         "_shared_container_ready": False,
@@ -677,6 +1156,46 @@ def test_rds_data_provisioned_cluster_without_members_is_unavailable():
         rds._clusters.pop(cluster_id, None)
 
 
+@pytest.mark.parametrize(
+    ("handler_name", "extra"),
+    (
+        ("_execute_statement", {"sql": "SHOW DATABASES"}),
+        ("_begin_transaction", {}),
+        ("_batch_execute_statement", {"sql": "SHOW DATABASES"}),
+    ),
+    ids=("execute", "begin", "batch"),
+)
+def test_rds_data_disabled_endpoint_precedes_missing_compute(handler_name, extra):
+    from ministack.services import rds, rds_data
+
+    cluster_id = f"disabled-empty-provisioned-{uuid.uuid4().hex[:8]}"
+    resource_arn = f"arn:aws:rds:{REGION}:{ACCOUNT_ID}:cluster:{cluster_id}"
+    rds._clusters[cluster_id] = {
+        "DBClusterIdentifier": cluster_id,
+        "DBClusterArn": resource_arn,
+        "Engine": "aurora-mysql",
+        "EngineMode": "provisioned",
+        "HttpEndpointEnabled": False,
+        "Status": "available",
+        "DBClusterMembers": [],
+        "_shared_container_ready": False,
+    }
+
+    try:
+        handler = getattr(rds_data, handler_name)
+        status, headers, body = handler({
+            "resourceArn": resource_arn,
+            "secretArn": FAKE_SECRET_ARN,
+            **extra,
+        })
+        payload = json.loads(body)
+        assert status == 400
+        assert headers["x-amzn-errortype"] == "HttpEndpointNotEnabledException"
+        assert payload["__type"] == "HttpEndpointNotEnabledException"
+    finally:
+        rds._clusters.pop(cluster_id, None)
+
+
 def test_rds_data_non_container_endpoint_keeps_stub_mode(monkeypatch):
     """Control-plane-only instances still use the lightweight SQL stub."""
     from ministack.services import rds_data
@@ -688,7 +1207,17 @@ def test_rds_data_non_container_endpoint_keeps_stub_mode(monkeypatch):
         "_docker_container_id": None,
         "Engine": "aurora-mysql",
     }
-    monkeypatch.setattr(rds_data, "_resolve_cluster", lambda _arn: (instance, "aurora-mysql"))
+    cluster = {
+        "DBClusterIdentifier": "stub-cluster",
+        "DBClusterArn": resource_arn,
+        "HttpEndpointEnabled": True,
+    }
+    monkeypatch.setattr(
+        rds_data,
+        "_resolve_target",
+        lambda _arn: (instance, "aurora-mysql", cluster),
+    )
+    monkeypatch.setattr(rds_data, "_require_secret_credentials", lambda _arn: ("admin", "pw", None))
 
     status, _headers, body = rds_data._execute_statement({
         "resourceArn": resource_arn,
@@ -709,9 +1238,16 @@ def test_rds_data_lock_wait_timeout_is_not_connection_error():
     """MySQL lock wait timeout is a SQL error, not endpoint unavailability."""
     from ministack.services import rds_data
 
-    assert not rds_data._is_connection_error(
-        Exception("(1205, 'Lock wait timeout exceeded; try restarting transaction')")
-    )
+    error = Exception("(1205, 'Lock wait timeout exceeded; try restarting transaction')")
+
+    assert not rds_data._is_connection_error(error)
+
+    status, headers, body = rds_data._sql_execution_error(error)
+    payload = json.loads(body)
+    assert status == 400
+    assert headers["x-amzn-errortype"] == "BadRequestException"
+    assert payload["__type"] == "BadRequestException"
+    assert payload["message"].startswith("Database error:")
 
 
 def test_rds_cluster_status_tracks_member_readiness():
