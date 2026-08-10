@@ -5,6 +5,18 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **S3 — POST Object no longer misreads form fields as the object body** — a multipart part was classified as the object content when its name was `file` **or** it carried a `filename` attribute, but browsers and HTTP libraries (Python `requests`' `files=`) set `filename` on ordinary form fields, so every field looked like the body, no `key` field survived, and the upload was rejected with `InvalidArgument`. Only the field literally named `file` is the body now, matching S3. Reported by @gaul.
+- **S3 — `GetObject` with `partNumber` returns the requested part** — the `partNumber` parameter was dropped, so a client fetching an N-part object in parallel received N full copies. A completed multipart object now returns the requested part as `206 Partial Content` with a `Content-Range` and `x-amz-mp-parts-count`, matching S3. Reported by @gaul.
+- **S3 — `ListObjectVersions` returns continuation markers when truncated** — a truncated response set `IsTruncated=true` but emitted neither `NextKeyMarker` nor `NextVersionIdMarker`, and the incoming `version-id-marker` was ignored, so a paginating client looped on page one or (as boto3 does) rejected `KeyMarker=None`. The markers are now emitted and `version-id-marker` resumes within `key-marker`. Reported by @gaul.
+- **S3 — `CompleteMultipartUpload` returns `400 MalformedXML` for an unparseable body** — an empty or malformed body raised an unguarded `ParseError` that escaped as a `500` with a JSON document no S3 SDK can parse, so clients treated it as a transient fault and retried. It now returns `400 MalformedXML`, as XML. Reported by @gaul.
+- **S3 — `CompleteMultipartUpload` is idempotent** — the upload record was dropped on the first call, so a retry (how a client recovers from a lost response) returned `NoSuchUpload`. The completed response is now retained and replayed for a repeat call with the same upload id, without minting a second object version, matching S3. Reported by @gaul.
+- **S3 — object owner id is consistent between listings and ACLs** — `ListBuckets` / `ListObjects` / `ListObjectVersions` / `ListParts` hard-coded the owner id `owner-id` while `GetObjectAcl` / `GetBucketAcl` used the account id, so a client matching an object's owner against an ACL grantee always got a mismatch. All of them now use the account id. Reported by @gaul.
+- **S3 — presigned URLs are rejected once expired** — `X-Amz-Date` + `X-Amz-Expires` were never compared against the current time, so a URL minted with a one-second lifetime served the object indefinitely. An expired presigned URL now returns `403 AccessDenied` (`Request has expired`), matching S3. Reported by @gaul.
+- **S3 — conditional deletes honour `If-Match`** — `DeleteObject` ignored the `If-Match` header and `DeleteObjects` ignored a per-object `ETag`, so a delete carrying a stale ETag removed the object anyway (and the batch reported it under `Deleted`). `DeleteObject` now returns `412 PreconditionFailed` on an ETag mismatch, and `DeleteObjects` reports the key under `Error` (`PreconditionFailed`) instead of deleting it, matching S3's compare-and-swap delete. Reported by @gaul.
+
 ## [1.4.14] — 2026-08-07
 
 ### Added
