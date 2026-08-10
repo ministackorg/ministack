@@ -176,6 +176,45 @@ def resolve_secret_string(secret_id, version_stage="AWSCURRENT"):
     return ver.get("SecretString")
 
 
+def create_secret_in_process(name, secret_string, description=""):
+    """Create a secret on behalf of another service (e.g. RDS managed master
+    user passwords) without going through the HTTP API.
+
+    The seam is one-directional: other services call into Secrets Manager,
+    never the reverse. Returns the new secret's ARN, or None when a secret
+    named *name* already exists.
+    """
+    if name in _secrets:
+        return None
+    arn, _ = _store_new_secret(name, secret_string=secret_string, description=description)
+    return arn
+
+
+def put_secret_value_in_process(secret_id, secret_string):
+    """Store a new AWSCURRENT version for *secret_id* on behalf of another
+    service, promoting stages the same way UpdateSecret does (old AWSCURRENT
+    becomes AWSPREVIOUS). Returns True on success, False when the secret does
+    not exist or is scheduled for deletion.
+    """
+    _, secret = _resolve(secret_id, use_arn_scope=True)
+    if not secret or secret.get("DeletedDate"):
+        return False
+    _publish_new_version(secret, secret_string=secret_string)
+    return True
+
+
+def delete_secret_in_process(secret_id):
+    """Force-delete *secret_id* on behalf of another service (no recovery
+    window — mirrors RDS deleting its managed master user secret when the
+    owning resource is deleted). Returns True when a secret was deleted.
+    """
+    key, secret = _resolve(secret_id, use_arn_scope=True)
+    if not secret:
+        return False
+    _purge_secret(key, secret)
+    return True
+
+
 def _emit_secret_label_updated(secret, label, version_id):
     """Native Secrets Manager → EventBridge ``Secret Label Updated`` event, fired
     when a staging label moves to a new version — for every label except
@@ -241,6 +280,34 @@ def _apply_current_promotion(secret, new_vid):
         if "AWSPENDING" in ver["Stages"]:
             ver["Stages"].remove("AWSPENDING")
         _emit_secret_label_updated(secret, "AWSCURRENT", new_vid)
+
+
+def _publish_new_version(secret, secret_string=None, secret_binary=None):
+    """Add a new version to *secret* and promote it to AWSCURRENT.
+
+    Shared by ``UpdateSecret`` and the in-process seam so stage promotion and
+    replica sync cannot drift between the two paths. Returns the version id.
+    """
+    vid = new_uuid()
+    now = int(time.time())
+    secret["Versions"][vid] = {
+        "SecretString": secret_string,
+        "SecretBinary": secret_binary,
+        "CreatedDate": now,
+        "Stages": [],
+    }
+    _apply_current_promotion(secret, vid)
+    secret["LastChangedDate"] = now
+    _sync_replicas(secret)
+    return vid
+
+
+def _purge_secret(key, secret):
+    """Remove *secret* (stored under *key*) and everything hanging off it:
+    replicas and any orphaned resource policy."""
+    _delete_replicas(secret)
+    del _secrets[key]
+    _resource_policies.pop(secret["ARN"], None)
 
 
 def _vid_to_stages(secret):
@@ -424,6 +491,43 @@ async def handle_request(method, path, headers, body, query_params):
 # Actions
 # ---------------------------------------------------------------------------
 
+def _store_new_secret(name, secret_string=None, secret_binary=None, description="",
+                      tags=None, kms_key_id=None, rotation_lambda_arn=None,
+                      rotation_rules=None):
+    """Store a brand-new secret; the caller must have checked *name* is free.
+
+    Returns ``(arn, version_id)`` of the created secret.
+    """
+    arn = f"arn:aws:secretsmanager:{get_region()}:{get_account_id()}:secret:{name}-{new_uuid()[:6]}"
+    vid = new_uuid()
+    now = int(time.time())
+
+    _secrets[name] = {
+        "ARN": arn,
+        "Name": name,
+        "Description": description,
+        "Tags": list(tags or []),
+        "CreatedDate": now,
+        "LastChangedDate": now,
+        "LastAccessedDate": None,
+        "DeletedDate": None,
+        "RotationEnabled": False,
+        "RotationLambdaARN": rotation_lambda_arn,
+        "RotationRules": rotation_rules,
+        "KmsKeyId": kms_key_id,
+        "ReplicationStatus": [],
+        "Versions": {
+            vid: {
+                "SecretString": secret_string,
+                "SecretBinary": secret_binary,
+                "CreatedDate": now,
+                "Stages": ["AWSCURRENT"],
+            }
+        },
+    }
+    return arn, vid
+
+
 def _create_secret(data):
     name = data.get("Name")
     if not name:
@@ -434,33 +538,16 @@ def _create_secret(data):
             f"The operation failed because the secret {name} already exists.", 400,
         )
 
-    arn = f"arn:aws:secretsmanager:{get_region()}:{get_account_id()}:secret:{name}-{new_uuid()[:6]}"
-    vid = new_uuid()
-    now = int(time.time())
-
-    _secrets[name] = {
-        "ARN": arn,
-        "Name": name,
-        "Description": data.get("Description", ""),
-        "Tags": list(data.get("Tags", [])),
-        "CreatedDate": now,
-        "LastChangedDate": now,
-        "LastAccessedDate": None,
-        "DeletedDate": None,
-        "RotationEnabled": False,
-        "RotationLambdaARN": data.get("RotationLambdaARN"),
-        "RotationRules": data.get("RotationRules"),
-        "KmsKeyId": data.get("KmsKeyId"),
-        "ReplicationStatus": [],
-        "Versions": {
-            vid: {
-                "SecretString": data.get("SecretString"),
-                "SecretBinary": data.get("SecretBinary"),
-                "CreatedDate": now,
-                "Stages": ["AWSCURRENT"],
-            }
-        },
-    }
+    arn, vid = _store_new_secret(
+        name,
+        secret_string=data.get("SecretString"),
+        secret_binary=data.get("SecretBinary"),
+        description=data.get("Description", ""),
+        tags=data.get("Tags"),
+        kms_key_id=data.get("KmsKeyId"),
+        rotation_lambda_arn=data.get("RotationLambdaARN"),
+        rotation_rules=data.get("RotationRules"),
+    )
     return json_response({"ARN": arn, "Name": name, "VersionId": vid})
 
 
@@ -635,13 +722,11 @@ def _delete_secret(data):
 
     if force:
         arn, sname = secret["ARN"], secret["Name"]
-        _delete_replicas(secret)
-        del _secrets[key]
-        # Clean up any associated resource policy too — otherwise it
-        # lingers as an orphan keyed by the now-deleted ARN, invisible
-        # to the API but still consuming memory and surviving warm
-        # boot via the persistence path.
-        _resource_policies.pop(arn, None)
+        # _purge_secret also cleans up any associated resource policy —
+        # otherwise it lingers as an orphan keyed by the now-deleted ARN,
+        # invisible to the API but still consuming memory and surviving
+        # warm boot via the persistence path.
+        _purge_secret(key, secret)
         return json_response({"ARN": arn, "Name": sname, "DeletionDate": deletion_date})
 
     secret["DeletedDate"] = deletion_date
@@ -696,17 +781,11 @@ def _update_secret(data):
         _sync_replicas(secret)
         return json_response({"ARN": secret["ARN"], "Name": secret["Name"]})
 
-    vid = new_uuid()
-    now = int(time.time())
-    secret["Versions"][vid] = {
-        "SecretString": data.get("SecretString"),
-        "SecretBinary": data.get("SecretBinary"),
-        "CreatedDate": now,
-        "Stages": [],
-    }
-    _apply_current_promotion(secret, vid)
-    secret["LastChangedDate"] = now
-    _sync_replicas(secret)
+    vid = _publish_new_version(
+        secret,
+        secret_string=data.get("SecretString"),
+        secret_binary=data.get("SecretBinary"),
+    )
     return json_response({"ARN": secret["ARN"], "Name": secret["Name"], "VersionId": vid})
 
 

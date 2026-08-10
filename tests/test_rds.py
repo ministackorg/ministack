@@ -8708,3 +8708,338 @@ def test_aurora_mysql_global_replication_replays_and_streams_rows():
         _delete_cluster(west, secondary_id)
         _delete_cluster(east, primary_id)
         _delete_global_cluster(east, global_id)
+
+
+# ---------------------------------------------------------------------------
+# ManageMasterUserPassword — RDS-managed master user secrets
+# ---------------------------------------------------------------------------
+
+def test_rds_manage_master_user_password_creates_secret(rds, sm):
+    """CreateDBCluster(ManageMasterUserPassword=True) returns MasterUserSecret
+    and stores real credentials in Secrets Manager as {username, password}."""
+    cluster_id = "managed-secret-cluster"
+    resp = rds.create_db_cluster(
+        DBClusterIdentifier=cluster_id,
+        Engine="aurora-postgresql",
+        MasterUsername="admin",
+        ManageMasterUserPassword=True,
+    )
+    try:
+        secret_meta = resp["DBCluster"]["MasterUserSecret"]
+        assert secret_meta["SecretStatus"] == "active"
+        arn = secret_meta["SecretArn"]
+        assert arn.startswith("arn:aws:secretsmanager:")
+        assert "rds!cluster-" in arn
+        assert secret_meta["KmsKeyId"]
+
+        # Round-trips through DescribeDBClusters.
+        described = rds.describe_db_clusters(DBClusterIdentifier=cluster_id)
+        assert described["DBClusters"][0]["MasterUserSecret"] == secret_meta
+
+        value = sm.get_secret_value(SecretId=arn)
+        creds = json.loads(value["SecretString"])
+        assert creds["username"] == "admin"
+        assert creds["password"]
+        described_secret = sm.describe_secret(SecretId=arn)
+        assert cluster_id in described_secret["Description"]
+    finally:
+        rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+
+
+def test_rds_manage_master_user_password_rejects_explicit_password(rds):
+    """ManageMasterUserPassword and MasterUserPassword are mutually exclusive."""
+    with pytest.raises(ClientError) as exc:
+        rds.create_db_cluster(
+            DBClusterIdentifier="managed-vs-explicit",
+            Engine="aurora-postgresql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+            ManageMasterUserPassword=True,
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+
+
+def test_rds_modify_rejects_explicit_password_on_managed_cluster(rds):
+    """A cluster with an RDS-managed secret can't take an explicit password."""
+    cluster_id = "managed-no-explicit-modify"
+    rds.create_db_cluster(
+        DBClusterIdentifier=cluster_id,
+        Engine="aurora-postgresql",
+        MasterUsername="admin",
+        ManageMasterUserPassword=True,
+    )
+    try:
+        with pytest.raises(ClientError) as exc:
+            rds.modify_db_cluster(
+                DBClusterIdentifier=cluster_id,
+                MasterUserPassword="explicit-password",
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+    finally:
+        rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+
+
+def test_rds_rotate_master_password_requires_managed_secret(rds):
+    """RotateMasterUserPassword on a cluster without a managed secret rejects."""
+    cluster_id = "unmanaged-rotate"
+    rds.create_db_cluster(
+        DBClusterIdentifier=cluster_id,
+        Engine="aurora-postgresql",
+        MasterUsername="admin",
+        MasterUserPassword="password123",
+    )
+    try:
+        with pytest.raises(ClientError) as exc:
+            rds.modify_db_cluster(
+                DBClusterIdentifier=cluster_id,
+                RotateMasterUserPassword=True,
+                ApplyImmediately=True,
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+    finally:
+        rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+
+
+def test_rds_rotate_master_password_requires_apply_immediately(rds):
+    """Rotation must be requested with ApplyImmediately, as on real AWS."""
+    cluster_id = "managed-rotate-no-apply"
+    rds.create_db_cluster(
+        DBClusterIdentifier=cluster_id,
+        Engine="aurora-postgresql",
+        MasterUsername="admin",
+        ManageMasterUserPassword=True,
+    )
+    try:
+        with pytest.raises(ClientError) as exc:
+            rds.modify_db_cluster(
+                DBClusterIdentifier=cluster_id,
+                RotateMasterUserPassword=True,
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+    finally:
+        rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+
+
+def test_rds_rotate_master_password_rejects_explicit_password_combo():
+    """MasterUserPassword and RotateMasterUserPassword can't share a request,
+    and the rejected request must not half-apply the explicit password."""
+    from ministack.services import rds as m
+
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "rotate-explicit-combo",
+            "Engine": "aurora-postgresql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        status, _headers, body = m._modify_db_cluster({
+            "DBClusterIdentifier": "rotate-explicit-combo",
+            "MasterUserPassword": "new-password",
+            "RotateMasterUserPassword": "true",
+            "ApplyImmediately": "true",
+        })
+        assert status == 400
+        assert b"InvalidParameterCombination" in body
+        cluster = m._clusters.get("rotate-explicit-combo")
+        assert cluster["_MasterUserPassword"] == "password123"
+    finally:
+        m._clusters.clear()
+
+
+def test_rds_rotate_master_password_promotes_new_secret_version(rds, sm):
+    """Managed rotation publishes a fresh AWSCURRENT and keeps the previous
+    credentials reachable as AWSPREVIOUS."""
+    cluster_id = "managed-rotate-cluster"
+    resp = rds.create_db_cluster(
+        DBClusterIdentifier=cluster_id,
+        Engine="aurora-postgresql",
+        MasterUsername="admin",
+        ManageMasterUserPassword=True,
+    )
+    arn = resp["DBCluster"]["MasterUserSecret"]["SecretArn"]
+    try:
+        before = json.loads(
+            sm.get_secret_value(SecretId=arn)["SecretString"])
+
+        rds.modify_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            RotateMasterUserPassword=True,
+            ApplyImmediately=True,
+        )
+
+        after = json.loads(
+            sm.get_secret_value(SecretId=arn)["SecretString"])
+        assert after["username"] == "admin"
+        assert after["password"] != before["password"]
+
+        previous = json.loads(sm.get_secret_value(
+            SecretId=arn, VersionStage="AWSPREVIOUS")["SecretString"])
+        assert previous == before
+    finally:
+        rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+
+
+def test_rds_rotate_master_password_rotates_real_login(monkeypatch):
+    """With live compute, managed rotation drives the real database password
+    change through the same path as an explicit MasterUserPassword change."""
+    from ministack.services import rds as m
+    from ministack.services import secretsmanager as sm
+
+    rotations = []
+
+    def _rotate(_cluster, old_password, new_password):
+        rotations.append((old_password, new_password))
+        return True
+
+    monkeypatch.setattr(m, "_rotate_real_password", _rotate)
+
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "managed-live-rotate",
+            "Engine": "aurora-postgresql",
+            "MasterUsername": "admin",
+            "ManageMasterUserPassword": "true",
+        })
+        cluster = m._clusters.get("managed-live-rotate")
+        old_pass = cluster["_MasterUserPassword"]
+        cluster.update({
+            "DBClusterMembers": [{
+                "DBInstanceIdentifier": "managed-live-writer",
+                "IsClusterWriter": True,
+            }],
+            "_shared_container_id": "managed-live-container",
+            "_shared_container_ready": True,
+        })
+
+        m._modify_db_cluster({
+            "DBClusterIdentifier": "managed-live-rotate",
+            "RotateMasterUserPassword": "true",
+            "ApplyImmediately": "true",
+        })
+
+        new_pass = cluster["_MasterUserPassword"]
+        assert rotations == [(old_pass, new_pass)]
+        assert new_pass != old_pass
+        assert "_pending_master_password_rotation" not in cluster
+
+        # The secret's AWSCURRENT matches what the database now accepts.
+        secret_string = sm.resolve_secret_string(
+            cluster["MasterUserSecret"]["SecretArn"])
+        assert json.loads(secret_string)["password"] == new_pass
+    finally:
+        arn = (m._clusters.get("managed-live-rotate") or {}).get(
+            "MasterUserSecret", {})
+        if arn and arn.get("SecretArn"):
+            sm.delete_secret_in_process(arn["SecretArn"])
+        m._clusters.clear()
+
+
+def test_rds_rotate_master_password_parks_pending_without_compute(monkeypatch):
+    """When compute is stopped but storage survives, managed rotation parks the
+    change as a pending rotation exactly like an explicit password change."""
+    from ministack.services import rds as m
+    from ministack.services import secretsmanager as sm
+
+    monkeypatch.setattr(m, "_rotate_real_password", lambda *_args: False)
+
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "managed-pending-rotate",
+            "Engine": "aurora-postgresql",
+            "MasterUsername": "admin",
+            "ManageMasterUserPassword": "true",
+        })
+        cluster = m._clusters.get("managed-pending-rotate")
+        old_pass = cluster["_MasterUserPassword"]
+        cluster["_shared_storage_initialized"] = True
+
+        m._modify_db_cluster({
+            "DBClusterIdentifier": "managed-pending-rotate",
+            "RotateMasterUserPassword": "true",
+            "ApplyImmediately": "true",
+        })
+
+        new_pass = cluster["_MasterUserPassword"]
+        assert new_pass != old_pass
+        assert cluster["_pending_master_password_rotation"] == {
+            "old_password": old_pass,
+            "new_password": new_pass,
+        }
+    finally:
+        arn = (m._clusters.get("managed-pending-rotate") or {}).get(
+            "MasterUserSecret", {})
+        if arn and arn.get("SecretArn"):
+            sm.delete_secret_in_process(arn["SecretArn"])
+        m._clusters.clear()
+
+
+def test_rds_rotate_master_password_deleted_secret_reports_impaired(rds, sm):
+    """Rotation after the managed secret was deleted out from under RDS fails
+    and flips SecretStatus to impaired, mirroring AWS's impaired state."""
+    cluster_id = "managed-impaired-cluster"
+    resp = rds.create_db_cluster(
+        DBClusterIdentifier=cluster_id,
+        Engine="aurora-postgresql",
+        MasterUsername="admin",
+        ManageMasterUserPassword=True,
+    )
+    arn = resp["DBCluster"]["MasterUserSecret"]["SecretArn"]
+    try:
+        sm.delete_secret(SecretId=arn, ForceDeleteWithoutRecovery=True)
+        with pytest.raises(ClientError) as exc:
+            rds.modify_db_cluster(
+                DBClusterIdentifier=cluster_id,
+                RotateMasterUserPassword=True,
+                ApplyImmediately=True,
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidDBClusterStateFault"
+        cluster = rds.describe_db_clusters(
+            DBClusterIdentifier=cluster_id)["DBClusters"][0]
+        assert cluster["MasterUserSecret"]["SecretStatus"] == "impaired"
+    finally:
+        rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+
+
+def test_rds_delete_cluster_removes_managed_secret(rds, sm):
+    """DeleteDBCluster deletes the RDS-managed secret with the cluster."""
+    cluster_id = "managed-delete-cluster"
+    resp = rds.create_db_cluster(
+        DBClusterIdentifier=cluster_id,
+        Engine="aurora-postgresql",
+        MasterUsername="admin",
+        ManageMasterUserPassword=True,
+    )
+    arn = resp["DBCluster"]["MasterUserSecret"]["SecretArn"]
+    sm.get_secret_value(SecretId=arn)  # exists before delete
+
+    rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+
+    with pytest.raises(ClientError) as exc:
+        sm.get_secret_value(SecretId=arn)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_rds_delete_protected_cluster_keeps_managed_secret(rds, sm):
+    """A rejected DeleteDBCluster must not delete the managed secret."""
+    cluster_id = "managed-protected-cluster"
+    resp = rds.create_db_cluster(
+        DBClusterIdentifier=cluster_id,
+        Engine="aurora-postgresql",
+        MasterUsername="admin",
+        ManageMasterUserPassword=True,
+        DeletionProtection=True,
+    )
+    arn = resp["DBCluster"]["MasterUserSecret"]["SecretArn"]
+    try:
+        with pytest.raises(ClientError):
+            rds.delete_db_cluster(
+                DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+        # Secret survives the rejected delete.
+        sm.get_secret_value(SecretId=arn)
+    finally:
+        rds.modify_db_cluster(
+            DBClusterIdentifier=cluster_id, DeletionProtection=False)
+        rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
