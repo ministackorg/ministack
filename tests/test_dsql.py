@@ -6,6 +6,7 @@ validator unit tests and live data-plane (wire proxy) tests.
 import asyncio
 import re
 import socket
+import struct
 import threading
 import time
 
@@ -507,10 +508,93 @@ class TestClassifyStatement:
             ("SHOW server_version", "other"),
             ("GRANT SELECT ON t TO r", "other"),
             ("REVOKE SELECT ON t FROM r", "other"),
+            # Leading comments must not hide the statement keyword.
+            ("-- migration 004\nCREATE TABLE t (a int)", "ddl"),
+            ("/* flyway */ INSERT INTO t VALUES (1)", "dml"),
+            ("/* a /* nested */ b */ COMMIT", "tcl_end"),
+            ("\n\n-- one\n-- two\nBEGIN", "tcl_begin"),
+            # CTE-leading writes are still writes.
+            ("WITH x AS (SELECT 1) INSERT INTO t SELECT 1", "dml"),
+            ("WITH x AS (SELECT 1) UPDATE t SET a = 1", "dml"),
+            ("WITH x AS (SELECT 1) DELETE FROM t", "dml"),
+            ("WITH RECURSIVE x AS (SELECT 1) INSERT INTO t SELECT 1", "dml"),
+            ("WITH x (a, b) AS (SELECT 1, 2) INSERT INTO t SELECT 1", "dml"),
+            ("WITH x AS MATERIALIZED (SELECT 1) INSERT INTO t SELECT 1", "dml"),
+            ("WITH a AS (SELECT 1), b AS (SELECT 2) INSERT INTO t SELECT 1", "dml"),
+            ("WITH x AS (SELECT 1) SELECT * FROM x", "other"),
+            # EXPLAIN ANALYZE executes; plain EXPLAIN only plans.
+            ("EXPLAIN ANALYZE INSERT INTO t VALUES (1)", "dml"),
+            ("EXPLAIN (ANALYZE, BUFFERS) DELETE FROM t", "dml"),
+            ("EXPLAIN INSERT INTO t VALUES (1)", "other"),
+            ("EXPLAIN SELECT 1", "other"),
         ],
     )
     def test_classify(self, sql, expected):
         assert pgproxy.classify_statement(sql) == expected
+
+
+class TestSqlLexing:
+    """Statement splitting and comment stripping must not be fooled by
+    literals — a ';' or ')' inside a string used to truncate the text a
+    validation rule saw, so the rule passed on the fragment."""
+
+    @pytest.mark.parametrize(
+        "sql,expected",
+        [
+            ("SELECT 1; SELECT 2", ["SELECT 1", "SELECT 2"]),
+            ("SELECT 'a;b'", ["SELECT 'a;b'"]),
+            ("SELECT 'it''s; fine'", ["SELECT 'it''s; fine'"]),
+            ("SELECT $$a;b$$", ["SELECT $$a;b$$"]),
+            ("SELECT $tag$a;b$tag$", ["SELECT $tag$a;b$tag$"]),
+            ('SELECT "we;ird"', ['SELECT "we;ird"']),
+            ("SELECT 1 -- c;omment\n; SELECT 2", ["SELECT 1 -- c;omment", "SELECT 2"]),
+            ("SELECT 1 /* c;omment */; SELECT 2", ["SELECT 1 /* c;omment */", "SELECT 2"]),
+            ("SELECT E'a\\';b'", ["SELECT E'a\\';b'"]),
+            ("SELECT 1;", ["SELECT 1"]),
+            ("  ;  ", []),
+        ],
+    )
+    def test_split_statements(self, sql, expected):
+        assert pgproxy.split_statements(sql) == expected
+
+    @pytest.mark.parametrize(
+        "sql,expected",
+        [
+            ("-- x\nSELECT 1", "SELECT 1"),
+            ("/* x */SELECT 1", "SELECT 1"),
+            ("/* a /* b */ c */ SELECT 1", "SELECT 1"),
+            ("  \n\t-- a\n  /* b */\nSELECT 1", "SELECT 1"),
+            ("SELECT 1 -- trailing", "SELECT 1 -- trailing"),
+            ("'-- not a comment'", "'-- not a comment'"),
+        ],
+    )
+    def test_strip_leading_comments(self, sql, expected):
+        assert pgproxy.strip_leading_comments(sql) == expected
+
+    def test_semicolon_in_literal_does_not_hide_a_bad_column(self):
+        # The fragment left by a naive ';' split had unbalanced parens, so the
+        # column-type rule silently passed and `serial` got through.
+        err = pgproxy.validate(
+            "CREATE TABLE t (a text DEFAULT 'x;y', b serial)"
+        )
+        assert isinstance(err, pgproxy.DsqlError)
+        assert "serial" in err.message
+
+    def test_paren_in_literal_does_not_hide_a_bad_column(self):
+        err = pgproxy.validate("CREATE TABLE t (a text DEFAULT ')(', b serial)")
+        assert isinstance(err, pgproxy.DsqlError)
+        assert "serial" in err.message
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "-- migration\nCREATE EXTENSION pgcrypto",
+            "/* tooling */ TRUNCATE t",
+            "\n-- a\n/* b */ CREATE TEMP TABLE t (a int)",
+        ],
+    )
+    def test_leading_comment_does_not_bypass_the_denylist(self, sql):
+        assert isinstance(pgproxy.validate(sql), pgproxy.DsqlError)
 
 
 class TestDenylist:
@@ -539,6 +623,24 @@ class TestDenylist:
             "CREATE MATERIALIZED VIEW mv AS SELECT 1",
             "CREATE TABLE t (a int) PARTITION BY RANGE (a)",
             "CREATE TABLE p (a int, EXCLUDE (a WITH =))",
+            "CREATE RULE r AS ON DELETE TO t DO INSTEAD NOTHING",
+            "CREATE AGGREGATE a (int) (sfunc = f, stype = int)",
+            "CREATE DOMAIN d AS int",
+            "CREATE CAST (int AS text) WITH FUNCTION f(int)",
+            "CREATE COLLATION c (locale = 'en_US')",
+            "CREATE OPERATOR + (leftarg = int, rightarg = int, function = f)",
+            "CREATE PUBLICATION p FOR ALL TABLES",
+            "CREATE SUBSCRIPTION s CONNECTION 'x' PUBLICATION p",
+            "CREATE FOREIGN TABLE ft (a int) SERVER s",
+            "CREATE SERVER s FOREIGN DATA WRAPPER w",
+            "VACUUM t",
+            "VACUUM FULL ANALYZE t",
+            "CLUSTER t USING idx",
+            "REINDEX TABLE t",
+            "ALTER SYSTEM SET work_mem = '4MB'",
+            "PREPARE TRANSACTION 'gid'",
+            "COMMIT PREPARED 'gid'",
+            "ROLLBACK PREPARED 'gid'",
         ],
     )
     def test_denied(self, sql):
@@ -693,6 +795,33 @@ class TestAlterTableSubset:
     )
     def test_supported_actions_allowed(self, sql):
         assert pgproxy.validate(sql, pgproxy.TxnState()) is None, sql
+
+    @pytest.mark.parametrize(
+        "sql,expected",
+        [
+            ("ALTER TABLE t DROP COLUMN c", ["c"]),
+            ("ALTER TABLE t DROP c", ["c"]),
+            ("ALTER TABLE t DROP COLUMN IF EXISTS c CASCADE", ["c"]),
+            ("ALTER TABLE t DROP COLUMN a, DROP COLUMN b", ["a", "b"]),
+            ("ALTER TABLE t DROP a, DROP COLUMN b, DROP IF EXISTS c", ["a", "b", "c"]),
+            ('ALTER TABLE t DROP COLUMN "MixedCase"', ["MixedCase"]),
+            # Actions that merely start with DROP are not column drops.
+            ("ALTER TABLE t DROP CONSTRAINT c", []),
+            ("ALTER TABLE t ALTER COLUMN c DROP DEFAULT", []),
+            ("ALTER TABLE t ALTER COLUMN c DROP NOT NULL", []),
+            ("ALTER TABLE t ALTER COLUMN c DROP EXPRESSION", []),
+            ("ALTER TABLE t ALTER COLUMN c DROP IDENTITY", []),
+            ("ALTER TABLE t ADD COLUMN c int", []),
+            ("DROP TABLE t", []),
+        ],
+    )
+    def test_dropped_columns(self, sql, expected):
+        assert pgproxy.dropped_columns(sql) == expected
+
+    def test_drop_column_still_passes_text_only_validation(self):
+        # The primary-key restriction needs a catalog probe, so validate()
+        # stays clean and the rule lives in the proxy's statement planner.
+        assert pgproxy.validate("ALTER TABLE t DROP COLUMN c") is None
 
     def test_validate_constraint_async_rewrite(self):
         result = pgproxy.validate(
@@ -1080,6 +1209,336 @@ def _pg_connect(port, autocommit=True):
     )
     conn.autocommit = autocommit
     return conn
+
+
+class _WireClient:
+    """Raw Postgres wire-protocol client.
+
+    psycopg2 interpolates parameters client-side and always sends the simple
+    'Q' protocol, so it cannot reach the extended (Parse/Bind/Execute) path
+    that pgjdbc, pgx, asyncpg and psycopg3 use. These tests speak the protocol
+    directly so both paths are covered.
+    """
+
+    def __init__(self, port, user="admin", database="postgres"):
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=15)
+        params = f"user\0{user}\0database\0{database}\0\0".encode()
+        payload = struct.pack("!I", 196608) + params
+        self.sock.sendall(struct.pack("!I", len(payload) + 4) + payload)
+        self._until_ready()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def _recv(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("proxy closed the connection")
+            buf += chunk
+        return buf
+
+    def _until_ready(self):
+        frames = []
+        while True:
+            type_byte = self._recv(1)
+            (length,) = struct.unpack("!I", self._recv(4))
+            payload = self._recv(length - 4)
+            frames.append((type_byte, payload))
+            if type_byte == b"Z":
+                return frames
+
+    @staticmethod
+    def _frame(type_byte, payload):
+        return type_byte + struct.pack("!I", len(payload) + 4) + payload
+
+    def simple(self, sql):
+        """Simple query protocol — what psql and psycopg2 send."""
+        self.sock.sendall(self._frame(b"Q", sql.encode() + b"\0"))
+        return _WireResult(self._until_ready())
+
+    def extended(self, sql):
+        """Parse/Bind/Describe/Execute/Sync — what prepared statements send."""
+        msg = self._frame(b"P", b"\0" + sql.encode() + b"\0" + struct.pack("!H", 0))
+        msg += self._frame(b"B", b"\0\0" + struct.pack("!HHH", 0, 0, 0))
+        msg += self._frame(b"D", b"P\0")
+        msg += self._frame(b"E", b"\0" + struct.pack("!I", 0))
+        msg += self._frame(b"S", b"")
+        self.sock.sendall(msg)
+        return _WireResult(self._until_ready())
+
+    def close(self):
+        try:
+            self.sock.sendall(self._frame(b"X", b""))
+        except OSError:
+            pass
+        self.sock.close()
+
+
+class _WireResult:
+    """Decoded response: error state, rows, command tag, txn status byte."""
+
+    def __init__(self, frames):
+        self.sqlstate = None
+        self.message = None
+        self.rows = []
+        self.tag = None
+        self.txn_status = None
+        for type_byte, payload in frames:
+            if type_byte == b"E":
+                for part in payload.split(b"\0"):
+                    if part[:1] == b"C":
+                        self.sqlstate = part[1:].decode()
+                    elif part[:1] == b"M":
+                        self.message = part[1:].decode("utf-8", "replace")
+            elif type_byte == b"C":
+                self.tag = payload[:-1].decode("utf-8", "replace")
+            elif type_byte == b"D":
+                (n,) = struct.unpack("!H", payload[:2])
+                values, off = [], 2
+                for _ in range(n):
+                    (vlen,) = struct.unpack("!i", payload[off:off + 4])
+                    off += 4
+                    if vlen < 0:
+                        values.append(None)
+                    else:
+                        values.append(payload[off:off + vlen].decode("utf-8", "replace"))
+                        off += vlen
+                self.rows.append(tuple(values))
+            elif type_byte == b"Z":
+                self.txn_status = payload.decode()
+
+    @property
+    def ok(self):
+        return self.sqlstate is None
+
+
+@requires_docker
+class TestExtendedProtocol:
+    """The extended protocol must enforce the same DSQL subset as 'Q'.
+
+    Relaying Parse unvalidated let every prepared-statement client — pgjdbc,
+    pgx, asyncpg, psycopg3, and the ORMs on top of them — past the validator.
+    """
+
+    @pytest.mark.parametrize(
+        "sql,expected",
+        [
+            ("CREATE TABLE xp_serial (id serial)", "serial"),
+            ("CREATE TABLE xp_fk (id int, p int REFERENCES xp_serial (id))",
+             "foreign key"),
+            ("CREATE EXTENSION pgcrypto", "CREATE EXTENSION"),
+            ("CREATE TEMP TABLE xp_tmp (id int)", "temporary"),
+            ("TRUNCATE xp_base", "TRUNCATE"),
+            ("CREATE MATERIALIZED VIEW xp_mv AS SELECT 1", "materialized view"),
+            ("CREATE TABLE xp_part (id int) PARTITION BY RANGE (id)",
+             "partitioning"),
+            ("CREATE TABLE xp_bad (id int, ts money)", "money"),
+        ],
+    )
+    def test_unsupported_sql_is_rejected_over_parse(self, dsql_proxy, sql, expected):
+        with _WireClient(dsql_proxy) as c:
+            result = c.extended(sql)
+            assert not result.ok, f"{sql} was accepted over the extended protocol"
+            assert result.sqlstate == "0A000"
+            assert expected in result.message
+
+    def test_rejected_parse_leaves_the_connection_usable(self, dsql_proxy):
+        """After an error the client must be able to keep working (the proxy
+        has to honour skip-until-Sync, then answer the Sync)."""
+        with _WireClient(dsql_proxy) as c:
+            assert not c.extended("CREATE TABLE xp_reuse (id serial)").ok
+            result = c.extended("SELECT 1")
+            assert result.ok and result.rows == [("1",)]
+
+    def test_valid_ddl_still_passes_over_parse(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            assert c.extended("CREATE TABLE xp_good (id bigint, name text)").ok
+            assert c.extended("INSERT INTO xp_good VALUES (1, 'a')").ok
+            result = c.extended("SELECT name FROM xp_good WHERE id = 1")
+            assert result.rows == [("a",)]
+
+    def test_transaction_limits_apply_over_parse(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            c.simple("CREATE TABLE xp_rows (id int)")
+            big = "INSERT INTO xp_rows VALUES " + ", ".join(
+                f"({i})" for i in range(3100)
+            )
+            result = c.extended(big)
+            assert result.sqlstate == "25006"
+            assert "3,000 row" in result.message
+
+    def test_for_update_rules_apply_over_parse(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            c.simple("CREATE TABLE xp_lock (id int PRIMARY KEY, v int)")
+            result = c.extended("SELECT * FROM xp_lock WHERE id > 1 FOR UPDATE")
+            assert result.sqlstate == "0A000"
+            assert "equality predicates" in result.message
+
+    def test_create_index_async_returns_a_job_over_parse(self, dsql_proxy):
+        """DSQL-only syntax has to be rewritten on this path too, or the
+        backend answers with a bare syntax error."""
+        with _WireClient(dsql_proxy) as c:
+            c.simple("CREATE TABLE xp_idx (id int, name text)")
+            result = c.extended("CREATE INDEX ASYNC xp_i ON xp_idx (name)")
+            assert result.ok, result.message
+            assert len(result.rows) == 1
+            job_id = result.rows[0][0]
+            assert ID_RE.match(job_id)
+            jobs = c.extended(
+                f"SELECT job_id, status FROM sys.jobs WHERE job_id = '{job_id}'"
+            )
+            assert jobs.rows == [(job_id, "completed")]
+
+    def test_sys_jobs_is_emulated_over_parse(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            result = c.extended("SELECT job_id FROM sys.jobs")
+            assert result.ok, result.message
+
+    def test_txn_state_survives_begin_and_commit_over_parse(self, dsql_proxy):
+        """Transaction state comes from the backend's ReadyForQuery byte, so a
+        BEGIN or COMMIT sent over either protocol keeps the validator honest."""
+        with _WireClient(dsql_proxy) as c:
+            c.simple("CREATE TABLE xp_txn (id int)")
+            assert c.extended("BEGIN").ok
+            assert c.simple("CREATE TABLE xp_txn_a (id int)").ok
+            # Second DDL in the same transaction: DSQL allows only one.
+            result = c.simple("CREATE TABLE xp_txn_b (id int)")
+            assert result.sqlstate == "25006"
+            c.simple("ROLLBACK")
+
+    def test_commit_over_parse_does_not_strand_txn_state(self, dsql_proxy):
+        """A stranded in_txn made the validator reject valid autocommit DDL —
+        a false rejection, worse than a missed one."""
+        with _WireClient(dsql_proxy) as c:
+            c.simple("CREATE TABLE xp_strand (id int)")
+            assert c.simple("BEGIN").ok
+            assert c.extended("INSERT INTO xp_strand VALUES (1)").ok
+            assert c.extended("COMMIT").ok
+            assert c.simple("CREATE TABLE xp_strand_a (id int)").ok
+            assert c.simple("CREATE TABLE xp_strand_b (id int)").ok
+            assert c.simple("INSERT INTO xp_strand VALUES (2)").ok
+
+    def test_ready_for_query_status_tracks_the_backend(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            assert c.extended("BEGIN").txn_status == "T"
+            # Rejected by the proxy, but the block really is in a transaction.
+            assert c.simple("TRUNCATE xp_base").txn_status == "E"
+            assert c.simple("ROLLBACK").txn_status == "I"
+
+
+@requires_docker
+class TestDropColumn:
+    """Aurora DSQL gained ALTER TABLE ... DROP COLUMN on 2026-08-03, including
+    several columns in one statement, but dropping a primary key column is not
+    supported. The rule needs a catalog probe, so it runs in the proxy."""
+
+    def test_drop_non_pk_column(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            c.simple("CREATE TABLE dc_a (id int PRIMARY KEY, x int, y int)")
+            assert c.simple("ALTER TABLE dc_a DROP COLUMN x").ok
+            cols = c.simple(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'dc_a' ORDER BY column_name"
+            )
+            assert cols.rows == [("id",), ("y",)]
+
+    def test_drop_several_non_pk_columns_in_one_statement(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            c.simple("CREATE TABLE dc_b (id int PRIMARY KEY, x int, y int, z int)")
+            assert c.simple("ALTER TABLE dc_b DROP COLUMN x, DROP COLUMN y").ok
+            cols = c.simple(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'dc_b' ORDER BY column_name"
+            )
+            assert cols.rows == [("id",), ("z",)]
+
+    def test_drop_pk_column_rejected(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            c.simple("CREATE TABLE dc_c (id int PRIMARY KEY, x int)")
+            result = c.simple("ALTER TABLE dc_c DROP COLUMN id")
+            assert result.sqlstate == "0A000"
+            assert "primary key" in result.message
+            # The column must still be there.
+            assert c.simple("SELECT id FROM dc_c").ok
+
+    def test_drop_pk_column_rejected_over_extended_protocol(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            c.simple("CREATE TABLE dc_d (id int PRIMARY KEY, x int)")
+            result = c.extended("ALTER TABLE dc_d DROP COLUMN id")
+            assert result.sqlstate == "0A000"
+            assert "primary key" in result.message
+
+    def test_pk_column_in_a_multi_drop_rejects_the_whole_statement(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            c.simple("CREATE TABLE dc_e (id int PRIMARY KEY, x int)")
+            result = c.simple("ALTER TABLE dc_e DROP COLUMN x, DROP COLUMN id")
+            assert result.sqlstate == "0A000"
+            assert "primary key" in result.message
+            # Nothing was dropped — the statement never reached the backend.
+            assert c.simple("SELECT id, x FROM dc_e").ok
+
+    def test_composite_pk_columns_are_all_protected(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            c.simple("CREATE TABLE dc_f (a int, b int, x int, PRIMARY KEY (a, b))")
+            assert c.simple("ALTER TABLE dc_f DROP COLUMN b").sqlstate == "0A000"
+            assert c.simple("ALTER TABLE dc_f DROP COLUMN x").ok
+
+    def test_other_drop_actions_are_unaffected(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            c.simple(
+                "CREATE TABLE dc_g (id int PRIMARY KEY, x int DEFAULT 1 NOT NULL)"
+            )
+            assert c.simple("ALTER TABLE dc_g ALTER COLUMN x DROP DEFAULT").ok
+            assert c.simple("ALTER TABLE dc_g ALTER COLUMN x DROP NOT NULL").ok
+
+    def test_table_without_a_primary_key(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            c.simple("CREATE TABLE dc_h (x int, y int)")
+            assert c.simple("ALTER TABLE dc_h DROP COLUMN x").ok
+
+
+@requires_docker
+class TestTransactionAbortSemantics:
+    """A statement the proxy rejects must poison the transaction block the way
+    a real error does — otherwise the following statements still commit."""
+
+    def test_rejection_aborts_the_block(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            c.simple("CREATE TABLE ab_t (id int)")
+            assert c.simple("BEGIN").ok
+            assert c.simple("INSERT INTO ab_t VALUES (1)").ok
+            assert c.simple("TRUNCATE ab_t").sqlstate == "0A000"
+
+            blocked = c.simple("INSERT INTO ab_t VALUES (2)")
+            assert blocked.sqlstate == "25P02"
+            assert blocked.txn_status == "E"
+
+            # Postgres reports ROLLBACK when a failed block is committed.
+            assert c.simple("COMMIT").tag == "ROLLBACK"
+            assert c.simple("SELECT count(*) FROM ab_t").rows == [("0",)]
+
+    def test_rollback_clears_the_abort(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            c.simple("CREATE TABLE ab_r (id int)")
+            c.simple("BEGIN")
+            assert c.simple("CREATE TEMP TABLE nope (id int)").sqlstate == "0A000"
+            assert c.simple("ROLLBACK").ok
+            assert c.simple("INSERT INTO ab_r VALUES (1)").ok
+            assert c.simple("SELECT count(*) FROM ab_r").rows == [("1",)]
+
+    def test_abort_applies_to_the_extended_protocol_too(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            c.simple("CREATE TABLE ab_x (id int)")
+            c.simple("BEGIN")
+            assert c.extended("TRUNCATE ab_x").sqlstate == "0A000"
+            assert c.extended("INSERT INTO ab_x VALUES (1)").sqlstate == "25P02"
+            assert c.simple("COMMIT").tag == "ROLLBACK"
+            assert c.simple("SELECT count(*) FROM ab_x").rows == [("0",)]
 
 
 @requires_docker

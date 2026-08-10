@@ -8,15 +8,27 @@ enforcing DSQL's PostgreSQL-compatibility subset.
 Validator behavior is gated by ``DSQL_STRICT`` (default "1"); "0" turns the
 proxy into a transparent passthrough.
 
-v1 documented limitations:
-- Extended-protocol ``Parse`` messages are relayed UNVALIDATED. psycopg2 sends
-  DDL via the simple ``Q`` protocol when no parameters are involved, and psql
-  always uses ``Q``, so the common paths are covered.
-- Multi-statement ``Q`` batches are split naively on ``;`` for validation
-  (a semicolon inside a string literal or dollar-quoted body can confuse the
-  splitter) and ``CREATE INDEX`` probing / ``ASYNC`` rewriting only apply to
-  single-statement queries.
-- Type/name parsing is heuristic regex work, not a real SQL parser.
+Both wire protocols are validated: the simple ``Q`` protocol (psql, psycopg2)
+and the extended ``Parse``/``Bind``/``Execute`` protocol (pgjdbc, pgx, asyncpg,
+psycopg3, and every ORM that uses prepared statements).
+
+Transaction state is taken from the backend's ``ReadyForQuery`` status byte
+rather than inferred from statement text, so it stays correct no matter which
+protocol a client uses to send ``BEGIN``/``COMMIT``.
+
+Documented limitations:
+- ``CREATE INDEX ASYNC`` / ``ALTER TABLE ASYNC`` executed over the extended
+  protocol run their rewritten DDL at ``Execute`` time on the proxy's own
+  backend connection; a client that ``Parse``s such a statement and never
+  ``Execute``s it registers no job.
+- Type/name parsing is heuristic regex work, not a real SQL parser. Statement
+  splitting, comment stripping and parenthesis matching are lexer-aware
+  (string literals, dollar quotes, quoted identifiers and nested comments),
+  but clause-level analysis is still pattern matching.
+- Transaction row counting is static (``VALUES`` tuples only); ``INSERT ...
+  SELECT`` / ``UPDATE`` / ``DELETE`` affected-row counts are not tracked.
+- OC001 emulation is optimistic: the catalog version bumps on forwarded DDL,
+  not on successful commit.
 """
 
 import asyncio
@@ -167,6 +179,130 @@ def _register_job(cluster_id, object_name, job_type="INDEX_BUILD"):
 
 
 # ---------------------------------------------------------------------------
+# SQL lexing primitives
+#
+# Everything that scans SQL text (statement splitting, comment stripping,
+# parenthesis matching) goes through _skip_noise so that string literals,
+# dollar-quoted bodies, quoted identifiers and comments can never be mistaken
+# for structure. Without this a ';' or ')' inside a literal silently truncates
+# the text a validation rule sees, and the rule passes on the fragment.
+# ---------------------------------------------------------------------------
+
+_DOLLAR_TAG_RE = re.compile(r"\$(?:[A-Za-z_]\w*)?\$")
+
+
+def _skip_noise(sql, i):
+    """If ``sql[i]`` opens a literal/identifier/comment, return the index just
+    past it; otherwise return ``i`` unchanged."""
+    n = len(sql)
+    ch = sql[i]
+    if ch == "'":
+        # E'...' uses backslash escapes; ordinary literals only double the quote
+        # (standard_conforming_strings is on).
+        escapes = i > 0 and sql[i - 1] in "Ee" and (
+            i == 1 or not (sql[i - 2].isalnum() or sql[i - 2] == "_")
+        )
+        j = i + 1
+        while j < n:
+            if escapes and sql[j] == "\\":
+                j += 2
+                continue
+            if sql[j] == "'":
+                if j + 1 < n and sql[j + 1] == "'":
+                    j += 2
+                    continue
+                return j + 1
+            j += 1
+        return n
+    if ch == '"':
+        j = i + 1
+        while j < n:
+            if sql[j] == '"':
+                if j + 1 < n and sql[j + 1] == '"':
+                    j += 2
+                    continue
+                return j + 1
+            j += 1
+        return n
+    if ch == "$":
+        m = _DOLLAR_TAG_RE.match(sql, i)
+        if m:
+            tag = m.group(0)
+            close = sql.find(tag, m.end())
+            return close + len(tag) if close >= 0 else n
+        return i
+    if sql.startswith("--", i):
+        nl = sql.find("\n", i)
+        return n if nl < 0 else nl + 1
+    if sql.startswith("/*", i):
+        depth, j = 0, i
+        while j < n:
+            if sql.startswith("/*", j):
+                depth += 1
+                j += 2
+            elif sql.startswith("*/", j):
+                depth -= 1
+                j += 2
+                if depth == 0:
+                    return j
+            else:
+                j += 1
+        return n
+    return i
+
+
+def strip_leading_comments(sql):
+    """Drop leading whitespace and comments.
+
+    Every validation rule anchors on the first keyword, so a leading ``--`` or
+    ``/* */`` comment would otherwise disable the validator wholesale. Migration
+    tools routinely prefix their SQL with comments.
+    """
+    i, n = 0, len(sql)
+    while i < n:
+        if sql[i].isspace():
+            i += 1
+            continue
+        j = _skip_noise(sql, i) if sql.startswith(("--", "/*"), i) else i
+        if j == i:
+            break
+        i = j
+    return sql[i:]
+
+
+def _match_paren(sql, start):
+    """Index of the ``)`` matching the ``(`` at ``start``, or -1."""
+    depth, i, n = 0, start, len(sql)
+    while i < n:
+        j = _skip_noise(sql, i)
+        if j != i:
+            i = j
+            continue
+        if sql[i] == "(":
+            depth += 1
+        elif sql[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _find_char(sql, i, chars):
+    """Index of the next character in ``chars`` outside literals/comments."""
+    n = len(sql)
+    while i < n:
+        j = _skip_noise(sql, i)
+        if j != i:
+            i = j
+            continue
+        if sql[i] in chars:
+            return i
+        i += 1
+    return -1
+
+
+# ---------------------------------------------------------------------------
 # DSQL validator (pure, unit-testable)
 # ---------------------------------------------------------------------------
 
@@ -197,7 +333,15 @@ class Rewrite:
 
 
 class TxnState:
-    """Per-connection transaction discipline tracking."""
+    """Per-connection transaction discipline tracking.
+
+    ``in_txn`` is authoritative from the backend's ReadyForQuery status byte
+    (see ``note_backend_status``) — inferring it from statement text alone goes
+    wrong the moment a client sends BEGIN or COMMIT over the extended protocol,
+    and a stranded ``in_txn`` makes the validator reject perfectly valid
+    autocommit statements. The per-transaction counters below still come from
+    statement text, since the wire protocol does not report them.
+    """
 
     def __init__(self):
         self.in_txn = False
@@ -206,6 +350,8 @@ class TxnState:
         self.started_at = None  # monotonic ts at BEGIN (duration limit)
         self.rows_est = 0  # static row estimate (VALUES tuples) in this txn
         self.bytes_est = 0  # cumulative DML payload bytes in this txn
+        self.aborted = False  # backend reported a failed transaction block
+        self.synthetic_abort = False  # *we* rejected a statement mid-transaction
 
     def copy(self):
         other = TxnState()
@@ -215,20 +361,42 @@ class TxnState:
         other.started_at = self.started_at
         other.rows_est = self.rows_est
         other.bytes_est = self.bytes_est
+        other.aborted = self.aborted
+        other.synthetic_abort = self.synthetic_abort
         return other
+
+    def begin(self):
+        self.in_txn = True
+        self.ddl_seen = self.dml_seen = False
+        self.started_at = time.monotonic()
+        self.rows_est = self.bytes_est = 0
+        self.aborted = self.synthetic_abort = False
+
+    def reset(self):
+        self.in_txn = False
+        self.ddl_seen = self.dml_seen = False
+        self.started_at = None
+        self.rows_est = self.bytes_est = 0
+        self.aborted = self.synthetic_abort = False
+
+    def note_backend_status(self, status):
+        """Reconcile with a backend ReadyForQuery status byte (I / T / E)."""
+        if status == b"I":
+            self.reset()
+        elif status == b"T":
+            if not self.in_txn:
+                self.begin()
+            self.aborted = False
+        elif status == b"E":
+            self.in_txn = True
+            self.aborted = True
 
     def apply(self, sql):
         cls = classify_statement(sql)
         if cls == "tcl_begin":
-            self.in_txn = True
-            self.ddl_seen = self.dml_seen = False
-            self.started_at = time.monotonic()
-            self.rows_est = self.bytes_est = 0
+            self.begin()
         elif cls == "tcl_end":
-            self.in_txn = False
-            self.ddl_seen = self.dml_seen = False
-            self.started_at = None
-            self.rows_est = self.bytes_est = 0
+            self.reset()
         elif cls == "ddl":
             self.ddl_seen = True
         elif cls == "dml":
@@ -244,12 +412,80 @@ _TCL_BEGIN = {"BEGIN", "START"}
 _TCL_END = {"COMMIT", "END", "ROLLBACK", "ABORT"}
 
 
+def _cte_main_keyword(sql):
+    """Leading keyword of the statement a ``WITH`` clause feeds.
+
+    ``WITH x AS (...) INSERT INTO ...`` is an INSERT, not an unclassified
+    statement — otherwise CTE-leading writes escape every DML rule.
+    """
+    m = re.match(r"\s*WITH\s+(?:RECURSIVE\s+)?", sql, re.I)
+    if not m:
+        return None
+    i = m.end()
+    while True:
+        opening = _find_char(sql, i, "(")
+        if opening < 0:
+            return None
+        close = _match_paren(sql, opening)
+        if close < 0:
+            return None
+        tail = sql[close + 1:].lstrip()
+        if tail.startswith(","):
+            i = close + 1
+            continue
+        km = re.match(r"([A-Za-z]+)", tail)
+        if not km:
+            return None
+        word = km.group(1).upper()
+        # Column list or AS [NOT] MATERIALIZED — the body is still ahead.
+        if word in ("AS", "NOT", "MATERIALIZED"):
+            i = close + 1
+            continue
+        return word
+
+
+def _explain_inner(sql):
+    """Statement executed by ``EXPLAIN ANALYZE``, or None.
+
+    Plain EXPLAIN only plans, so it stays unclassified; EXPLAIN ANALYZE really
+    does run the underlying DML.
+    """
+    m = re.match(r"\s*EXPLAIN\s*", sql, re.I)
+    if not m:
+        return None
+    i, analyze = m.end(), False
+    if i < len(sql) and sql[i] == "(":
+        close = _match_paren(sql, i)
+        if close < 0:
+            return None
+        opts = sql[i + 1:close]
+        analyze = bool(
+            re.search(r"\bANALYZ?[ES]E?\b(?!\s+(?:false|off|0))", opts, re.I)
+        )
+        i = close + 1
+    else:
+        while True:
+            wm = re.match(r"\s*(ANALYZE|ANALYSE|VERBOSE)\b", sql[i:], re.I)
+            if not wm:
+                break
+            if wm.group(1).upper() in ("ANALYZE", "ANALYSE"):
+                analyze = True
+            i += wm.end()
+    return sql[i:] if analyze else None
+
+
 def classify_statement(sql):
     """Classify one statement: ddl | dml | tcl_begin | tcl_end | other."""
-    m = re.match(r"\s*([A-Za-z]+)", sql)
+    s = strip_leading_comments(sql)
+    m = re.match(r"\s*([A-Za-z]+)", s)
     if not m:
         return "other"
     kw = m.group(1).upper()
+    if kw == "WITH":
+        kw = _cte_main_keyword(s) or kw
+    elif kw == "EXPLAIN":
+        inner = _explain_inner(s)
+        return classify_statement(inner) if inner is not None else "other"
     if kw in _DDL_KEYWORDS:
         return "ddl"
     if kw in _DML_KEYWORDS:
@@ -262,8 +498,19 @@ def classify_statement(sql):
 
 
 def split_statements(sql):
-    """Naive batch split on ';' (heuristic — strings are not parsed)."""
-    return [s.strip() for s in sql.split(";") if s.strip()]
+    """Split a ``Q`` batch on ';' outside literals, comments and quoted names."""
+    out, last, i, n = [], 0, 0, len(sql)
+    while i < n:
+        j = _skip_noise(sql, i)
+        if j != i:
+            i = j
+            continue
+        if sql[i] == ";":
+            out.append(sql[last:i])
+            last = i + 1
+        i += 1
+    out.append(sql[last:])
+    return [s.strip() for s in out if s.strip()]
 
 
 def _values_tuple_count(sql):
@@ -316,6 +563,22 @@ _DENYLIST = (
     (r"DO\b", "DO"),
     (r"SAVEPOINT\b", "SAVEPOINT"),
     (r"LOCK\b", "LOCK TABLE"),
+    (r"CREATE\s+RULE\b", "CREATE RULE"),
+    (r"CREATE\s+(OR\s+REPLACE\s+)?AGGREGATE\b", "CREATE AGGREGATE"),
+    (r"CREATE\s+DOMAIN\b", "CREATE DOMAIN"),
+    (r"CREATE\s+CAST\b", "CREATE CAST"),
+    (r"CREATE\s+COLLATION\b", "CREATE COLLATION"),
+    (r"CREATE\s+(OR\s+REPLACE\s+)?OPERATOR\b", "CREATE OPERATOR"),
+    (r"CREATE\s+PUBLICATION\b", "CREATE PUBLICATION"),
+    (r"CREATE\s+SUBSCRIPTION\b", "CREATE SUBSCRIPTION"),
+    (r"CREATE\s+(FOREIGN\s+TABLE|SERVER|FOREIGN\s+DATA\s+WRAPPER)\b",
+     "foreign data wrappers"),
+    (r"VACUUM\b", "VACUUM"),
+    (r"CLUSTER\b", "CLUSTER"),
+    (r"REINDEX\b", "REINDEX"),
+    (r"ALTER\s+SYSTEM\b", "ALTER SYSTEM"),
+    (r"PREPARE\s+TRANSACTION\b", "prepared transactions"),
+    (r"(COMMIT|ROLLBACK)\s+PREPARED\b", "prepared transactions"),
 )
 
 
@@ -396,19 +659,23 @@ _TABLE_CONSTRAINT_STARTERS = {
 
 def _split_top_level(body):
     """Split a parenthesised body on commas at paren depth 0."""
-    parts, depth, current = [], 0, []
-    for ch in body:
+    parts, depth, last, i, n = [], 0, 0, 0, len(body)
+    while i < n:
+        j = _skip_noise(body, i)
+        if j != i:
+            i = j
+            continue
+        ch = body[i]
         if ch == "(":
             depth += 1
         elif ch == ")":
             depth -= 1
-        if ch == "," and depth == 0:
-            parts.append("".join(current))
-            current = []
-        else:
-            current.append(ch)
-    if current:
-        parts.append("".join(current))
+        elif ch == "," and depth == 0:
+            parts.append(body[last:i])
+            last = i + 1
+        i += 1
+    if body[last:]:
+        parts.append(body[last:])
     return parts
 
 
@@ -477,15 +744,7 @@ def _check_column_types(sql):
         if not rest.lstrip().startswith("("):
             return None  # CREATE TABLE ... AS / PARTITION OF / LIKE-only
         start = sql.index("(", m.end())
-        depth, end = 0, -1
-        for i in range(start, len(sql)):
-            if sql[i] == "(":
-                depth += 1
-            elif sql[i] == ")":
-                depth -= 1
-                if depth == 0:
-                    end = i
-                    break
+        end = _match_paren(sql, start)
         if end < 0:
             return None
         for part in _split_top_level(sql[start + 1 : end]):
@@ -521,7 +780,9 @@ def _check_column_types(sql):
 # --- ALTER TABLE subset (AWS alter-table-syntax-support) ---------------------
 
 # DSQL supports only a subset of ALTER TABLE actions: ADD COLUMN (no inline
-# DEFAULT/NOT NULL — handled in _check_denylist), DROP COLUMN, SET/DROP
+# DEFAULT/NOT NULL — handled in _check_denylist), DROP COLUMN (one or more
+# columns, but not a primary key column — needs a catalog probe, so it lives in
+# _check_drop_column rather than here), SET/DROP
 # DEFAULT, DROP NOT NULL, DROP EXPRESSION, identity actions, SET STORAGE,
 # ADD CONSTRAINT ... CHECK ... NOT VALID, ADD CONSTRAINT ... UNIQUE USING
 # INDEX, DROP CONSTRAINT, RENAME, SET SCHEMA, OWNER TO, and the async
@@ -603,15 +864,7 @@ def _check_index_rules(sql):
     start = sql.find("(", m.end())
     if start < 0:
         return None
-    depth, end = 0, -1
-    for i in range(start, len(sql)):
-        if sql[i] == "(":
-            depth += 1
-        elif sql[i] == ")":
-            depth -= 1
-            if depth == 0:
-                end = i
-                break
+    end = _match_paren(sql, start)
     if end < 0:
         return None
     parts = _split_top_level(sql[start + 1 : end])
@@ -684,15 +937,7 @@ def _index_object_name(sql, on_end, index_name, table):
     cols = []
     start = sql.find("(", on_end)
     if start >= 0:
-        depth, end = 0, -1
-        for i in range(start, len(sql)):
-            if sql[i] == "(":
-                depth += 1
-            elif sql[i] == ")":
-                depth -= 1
-                if depth == 0:
-                    end = i
-                    break
+        end = _match_paren(sql, start)
         if end > 0:
             for part in _split_top_level(sql[start + 1 : end]):
                 tokens = part.strip().split()
@@ -752,7 +997,7 @@ def validate(sql, txn_state=None):
     """
     if not STRICT:
         return None
-    s = sql.strip()
+    s = strip_leading_comments(sql).strip()
     if not s:
         return None
 
@@ -848,6 +1093,11 @@ class _Conn:
         self.txn = TxnState()
         self.capture = None  # asyncio.Queue while swallowing backend frames
         self.catalog_version = None  # last catalog version this conn has seen
+        # Extended-protocol state, reset at each Sync.
+        self.ext_skip = False  # dropping messages until Sync after an error
+        self.ext_forwarded = False  # any message reached the backend this cycle
+        self.ext_stmts = {}  # prepared statement name -> {"sql", "synth"}
+        self.ext_portals = {}  # portal name -> the same entry
 
 
 async def _read_startup(reader):
@@ -907,9 +1157,16 @@ async def _connect_backend_once(host, port, database):
 
 
 async def _backend_relay(conn, b_reader, c_writer):
-    """Forward backend frames to the client (or to the capture queue)."""
+    """Forward backend frames to the client (or to the capture queue).
+
+    ReadyForQuery carries the backend's own view of the transaction block, so
+    it is the authoritative source for ``in_txn`` regardless of which protocol
+    the client used to open or close the transaction.
+    """
     while True:
         type_byte, payload = await _read_frame(b_reader)
+        if type_byte == b"Z" and payload:
+            conn.txn.note_backend_status(payload[:1])
         if conn.capture is not None:
             conn.capture.put_nowait((type_byte, payload))
         else:
@@ -979,9 +1236,124 @@ async def _index_count(conn, b_writer, table):
     return None
 
 
+def _status(conn):
+    """ReadyForQuery status byte for the client's current transaction block."""
+    if conn.txn.aborted or conn.txn.synthetic_abort:
+        return b"E"
+    return b"T" if conn.txn.in_txn else b"I"
+
+
 def _reject(conn, c_writer, err):
-    status = b"T" if conn.txn.in_txn else b"I"
-    c_writer.write(_error_response(err.sqlstate, err.message) + _ready(status))
+    """Send an ErrorResponse for a statement the backend never saw.
+
+    Inside an explicit transaction this has to poison the block the way a real
+    error would: Postgres (and DSQL) refuse every later statement with 25P02
+    until the transaction ends. The backend is still in a clean transaction, so
+    the proxy tracks the abort itself.
+    """
+    if conn.txn.in_txn:
+        conn.txn.synthetic_abort = True
+    c_writer.write(_error_response(err.sqlstate, err.message) + _ready(_status(conn)))
+
+
+_ABORTED_ERR = DsqlError(
+    "25P02",
+    "current transaction is aborted, commands ignored until end of "
+    "transaction block",
+)
+
+
+def _abort_gate(conn, sql):
+    """After a synthetic abort, only the statement that ends the block runs.
+
+    Returns (error, forward_sql). ``forward_sql`` replaces COMMIT with ROLLBACK
+    so the aborted work is discarded and the client sees the ``ROLLBACK``
+    command tag, exactly as Postgres reports a committed-but-failed block.
+    """
+    if not conn.txn.synthetic_abort:
+        return None, sql
+    if classify_statement(sql) != "tcl_end":
+        return _ABORTED_ERR, sql
+    conn.txn.synthetic_abort = False
+    if re.match(r"\s*(COMMIT|END)\b", strip_leading_comments(sql), re.I):
+        return None, "ROLLBACK"
+    return None, sql
+
+
+async def _primary_key_columns(conn, b_writer, table):
+    """Primary key column names for ``table``; None if the probe failed."""
+    try:
+        frames = await _run_backend_capture(
+            conn,
+            b_writer,
+            "SELECT a.attname FROM pg_index i JOIN pg_attribute a "
+            "ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
+            f"WHERE i.indrelid = '{table}'::regclass AND i.indisprimary",
+        )
+    except Exception:
+        return None
+    cols = []
+    for type_byte, payload in frames:
+        if type_byte == b"E":
+            return None
+        if type_byte == b"D":
+            (nfields,) = struct.unpack("!H", payload[:2])
+            if nfields == 1:
+                (vlen,) = struct.unpack("!i", payload[2:6])
+                cols.append(payload[6 : 6 + vlen].decode("utf-8", "replace"))
+    return cols
+
+
+# ALTER TABLE ... DROP COLUMN is supported (multiple columns in one statement
+# are fine), but dropping a primary key column is not. The COLUMN keyword is
+# optional in Postgres, so the action keywords that merely start with DROP —
+# DROP CONSTRAINT / DEFAULT / NOT NULL / EXPRESSION / IDENTITY — have to be
+# told apart from a bare column name.
+_DROP_COLUMN_RE = re.compile(
+    r"\bDROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?([\w\".]+)", re.I
+)
+_DROP_NON_COLUMN_ACTIONS = frozenset(
+    ("constraint", "default", "not", "expression", "identity")
+)
+_ALTER_TABLE_TARGET_RE = re.compile(
+    r"\s*ALTER\s+TABLE\s+(?:ASYNC\s+)?(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?([\w\".]+)", re.I
+)
+
+
+def dropped_columns(sql):
+    """Column names an ALTER TABLE statement drops (may be several)."""
+    if not re.match(r"\s*ALTER\s+TABLE\b", sql, re.I):
+        return []
+    cols = []
+    for m in _DROP_COLUMN_RE.finditer(sql):
+        raw = m.group(1)
+        quoted = raw.startswith('"')
+        name = raw.strip('"')
+        if not quoted and name.lower() in _DROP_NON_COLUMN_ACTIONS:
+            continue
+        cols.append(name)
+    return cols
+
+
+async def _check_drop_column(conn, b_writer, sql):
+    """Refuse to drop a primary key column (AWS DSQL, 2026-08-03)."""
+    cols = dropped_columns(sql)
+    if not cols:
+        return None
+    m = _ALTER_TABLE_TARGET_RE.match(sql)
+    if not m:
+        return None
+    pk_cols = await _primary_key_columns(conn, b_writer, m.group(1).strip('"'))
+    if not pk_cols:
+        return None  # probe failed or no primary key — let the backend answer
+    lowered = {c.lower() for c in pk_cols}
+    for col in cols:
+        if col.lower() in lowered:
+            return DsqlError(
+                "0A000",
+                f'dropping primary key column "{col}" is not supported',
+            )
+    return None
 
 
 _FOR_UPDATE_MULTI = (
@@ -1011,25 +1383,9 @@ async def _check_for_update(conn, b_writer, sql):
     if "," in from_part or re.search(r"\bJOIN\b", from_part, re.I):
         return DsqlError("0A000", _FOR_UPDATE_MULTI)
     table = from_part.strip().split()[0].strip('"')
-    try:
-        frames = await _run_backend_capture(
-            conn,
-            b_writer,
-            "SELECT a.attname FROM pg_index i JOIN pg_attribute a "
-            "ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
-            f"WHERE i.indrelid = '{table}'::regclass AND i.indisprimary",
-        )
-    except Exception:
+    pk_cols = await _primary_key_columns(conn, b_writer, table)
+    if pk_cols is None:
         return None  # probe failed — let the backend answer
-    pk_cols = []
-    for type_byte, payload in frames:
-        if type_byte == b"E":
-            return None
-        if type_byte == b"D":
-            (nfields,) = struct.unpack("!H", payload[:2])
-            if nfields == 1:
-                (vlen,) = struct.unpack("!i", payload[2:6])
-                pk_cols.append(payload[6 : 6 + vlen].decode("utf-8", "replace"))
     wm = re.search(r"\bWHERE\b(.+)$", body, re.I | re.S)
     if not pk_cols or not wm:
         return DsqlError("0A000", _FOR_UPDATE_EQ)
@@ -1047,157 +1403,193 @@ async def _check_for_update(conn, b_writer, sql):
     return None
 
 
+_ASYNC_BATCH_ERR = DsqlError(
+    "0A000", "asynchronous DDL is not supported in multi-statement queries"
+)
+
+
+async def _plan_statement(conn, s, b_writer, allow_probe=True):
+    """Decide what to do with one statement, for either wire protocol.
+
+    Returns ``(kind, payload)`` where kind is one of:
+      "error"    — payload is a DsqlError to report
+      "rows"     — payload describes a synthetic result set (sys.jobs etc.)
+      "rewrite"  — payload is a Rewrite to run on the backend as a job
+      "forward"  — payload is None; relay the statement untouched
+
+    ``allow_probe`` is False when the backend is mid extended-protocol
+    sequence, where injecting a probe query would break the protocol. The
+    text-only rules still apply; only the rules that need to look at backend
+    state are skipped.
+    """
+    matched = match_sys_jobs(s)
+    if matched is not False:
+        columns, job_filter = matched
+        cols = list(columns) if columns else list(_JOB_COLUMNS)
+        bad = [c for c in cols if c not in _JOB_COLUMNS]
+        if bad:
+            return "error", DsqlError("42703", f'column "{bad[0]}" does not exist')
+        jobs = get_jobs(conn.cluster_id)
+        if job_filter:
+            jobs = [j for j in jobs if j["job_id"] == job_filter]
+        return "rows", {
+            "cols": cols,
+            "rows": [[job[c] for c in cols] for job in jobs],
+            "tag": f"SELECT {len(jobs)}",
+        }
+
+    job_id = match_wait_for_job(s)
+    if job_id is not None:
+        known = any(
+            j["job_id"] == job_id and j["status"] == "completed"
+            for j in get_jobs(conn.cluster_id)
+        )
+        return "rows", {
+            "cols": [("wait_for_job", 16)],  # bool oid
+            "rows": [["t" if known else "f"]],
+            "tag": "SELECT 1",
+        }
+
+    result = validate(s, conn.txn)
+    if isinstance(result, DsqlError):
+        return "error", result
+    if isinstance(result, Rewrite) and result.kind == "index_async":
+        if not allow_probe:
+            return "error", _ASYNC_BATCH_ERR
+        if result.job_type == "INDEX_BUILD" and result.table:
+            count = await _index_count(conn, b_writer, result.table)
+            if count is not None and count >= 24:
+                return "error", DsqlError(
+                    "0A000",
+                    f"table {result.table} already has the maximum of 24 indexes",
+                )
+        return "rewrite", result
+
+    if is_plain_create_index(s):
+        table = create_index_table(s)
+        if table and allow_probe:
+            count = await _index_count(conn, b_writer, table)
+            if count is not None and count >= 24:
+                return "error", DsqlError(
+                    "0A000", f"table {table} already has the maximum of 24 indexes"
+                )
+            if await _table_has_rows(conn, b_writer, table):
+                return "error", DsqlError("0A000", "use CREATE INDEX ASYNC instead")
+        return "forward", None
+
+    if allow_probe:
+        err = await _check_drop_column(conn, b_writer, s)
+        if err:
+            return "error", err
+
+    if _FOR_UPDATE_RE.search(s) and allow_probe:
+        err = await _check_for_update(conn, b_writer, s)
+        if err:
+            return "error", err
+    return "forward", None
+
+
+def _note_catalog(conn, s):
+    if classify_statement(s) == "ddl":
+        conn.catalog_version = _bump_catalog(conn.cluster_id)
+    else:
+        conn.catalog_version = _catalog_versions.get(conn.cluster_id, 0)
+
+
+def _stale_catalog(conn):
+    """OC001: this connection's cached catalog is behind another session's DDL."""
+    return (
+        conn.txn.in_txn
+        and conn.catalog_version is not None
+        and conn.catalog_version < _catalog_versions.get(conn.cluster_id, 0)
+    )
+
+
+_OC001_ERR = DsqlError(
+    "40001", "schema has been updated by another transaction (OC001)"
+)
+
+
+async def _rollback_stale(conn, b_writer):
+    await _run_backend_capture(conn, b_writer, "ROLLBACK")
+    conn.txn.apply("ROLLBACK")
+    conn.catalog_version = _catalog_versions.get(conn.cluster_id, 0)
+
+
+def _synth_columns(kind, result):
+    return result["cols"] if kind == "rows" else ["job_id"]
+
+
+async def _run_rewrite(conn, b_writer, rewrite):
+    """Execute a rewritten ASYNC statement; return (job, backend_error)."""
+    frames = await _run_backend_capture(conn, b_writer, rewrite.sql)
+    backend_err = next((p for t, p in frames if t == b"E"), None)
+    if backend_err is not None:
+        return None, backend_err
+    conn.catalog_version = _bump_catalog(conn.cluster_id)
+    job = _register_job(conn.cluster_id, rewrite.object_name, rewrite.job_type)
+    return job, None
+
+
 async def _handle_query(conn, sql, b_writer, c_writer):
     txn = conn.txn
     stmts = split_statements(sql)
 
     if len(stmts) == 1 and STRICT:
-        s = stmts[0]
+        s = strip_leading_comments(stmts[0])
 
-        # OC001: this connection's cached catalog is behind a DDL change made
-        # by another session. Abort like real DSQL (40001); the next attempt
-        # sees the fresh catalog and succeeds.
-        if (
-            txn.in_txn
-            and conn.catalog_version is not None
-            and conn.catalog_version < _catalog_versions.get(conn.cluster_id, 0)
-        ):
-            await _run_backend_capture(conn, b_writer, "ROLLBACK")
-            txn.apply("ROLLBACK")
-            conn.catalog_version = _catalog_versions.get(conn.cluster_id, 0)
-            _reject(
-                conn,
-                c_writer,
-                DsqlError(
-                    "40001",
-                    "schema has been updated by another transaction (OC001)",
-                ),
+        # A statement rejected earlier in this transaction poisoned the block.
+        err, forward_sql = _abort_gate(conn, s)
+        if err:
+            c_writer.write(
+                _error_response(err.sqlstate, err.message) + _ready(_status(conn))
             )
             await c_writer.drain()
             return
-
-        matched = match_sys_jobs(s)
-        if matched is not False:
-            columns, job_filter = matched
-            cols = list(columns) if columns else list(_JOB_COLUMNS)
-            bad = [c for c in cols if c not in _JOB_COLUMNS]
-            if bad:
-                _reject(
-                    conn,
-                    c_writer,
-                    DsqlError("42703", f'column "{bad[0]}" does not exist'),
-                )
-                await c_writer.drain()
-                return
-            jobs = get_jobs(conn.cluster_id)
-            if job_filter:
-                jobs = [j for j in jobs if j["job_id"] == job_filter]
-            out = _row_description(cols)
-            for job in jobs:
-                out += _data_row([job[c] for c in cols])
-            out += _command_complete(f"SELECT {len(jobs)}")
-            out += _ready(b"T" if txn.in_txn else b"I")
-            c_writer.write(out)
-            await c_writer.drain()
-            return
-
-        job_id = match_wait_for_job(s)
-        if job_id is not None:
-            known = any(
-                j["job_id"] == job_id and j["status"] == "completed"
-                for j in get_jobs(conn.cluster_id)
-            )
-            out = _row_description([("wait_for_job", 16)])  # bool oid
-            out += _data_row(["t" if known else "f"])
-            out += _command_complete("SELECT 1")
-            out += _ready(b"T" if txn.in_txn else b"I")
-            c_writer.write(out)
-            await c_writer.drain()
-            return
-
-        result = validate(s, txn)
-        if isinstance(result, DsqlError):
-            _reject(conn, c_writer, result)
-            await c_writer.drain()
-            return
-        if isinstance(result, Rewrite) and result.kind == "index_async":
-            if result.job_type == "INDEX_BUILD" and result.table:
-                count = await _index_count(conn, b_writer, result.table)
-                if count is not None and count >= 24:
-                    _reject(
-                        conn,
-                        c_writer,
-                        DsqlError(
-                            "0A000",
-                            f"table {result.table} already has the maximum of 24 indexes",
-                        ),
-                    )
-                    await c_writer.drain()
-                    return
-            txn.apply(s)
-            # Run the rewritten statement on the backend, swallow its
-            # response, and synthesize the DSQL job_id result set.
-            frames = await _run_backend_capture(conn, b_writer, result.sql)
-            backend_err = next(
-                (p for t, p in frames if t == b"E"), None
-            )
-            if backend_err is not None:
-                c_writer.write(
-                    _frame(b"E", backend_err)
-                    + _ready(b"T" if txn.in_txn else b"I")
-                )
-                await c_writer.drain()
-                return
-            conn.catalog_version = _bump_catalog(conn.cluster_id)
-            job = _register_job(conn.cluster_id, result.object_name, result.job_type)
-            out = _row_description(["job_id"])
-            out += _data_row([job["job_id"]])
-            out += _command_complete("SELECT 1")
-            out += _ready(b"T" if txn.in_txn else b"I")
-            c_writer.write(out)
-            await c_writer.drain()
-            return
-
-        if is_plain_create_index(s):
-            table = create_index_table(s)
-            if table:
-                count = await _index_count(conn, b_writer, table)
-                if count is not None and count >= 24:
-                    _reject(
-                        conn,
-                        c_writer,
-                        DsqlError(
-                            "0A000",
-                            f"table {table} already has the maximum of 24 indexes",
-                        ),
-                    )
-                    await c_writer.drain()
-                    return
-            if table and await _table_has_rows(conn, b_writer, table):
-                _reject(
-                    conn,
-                    c_writer,
-                    DsqlError("0A000", "use CREATE INDEX ASYNC instead"),
-                )
-                await c_writer.drain()
-                return
-            txn.apply(s)
-            conn.catalog_version = _bump_catalog(conn.cluster_id)
-            b_writer.write(_frame(b"Q", sql.encode() + b"\0"))
+        if forward_sql != s:  # COMMIT of an aborted block -> ROLLBACK
+            txn.apply(forward_sql)
+            b_writer.write(_frame(b"Q", forward_sql.encode() + b"\0"))
             await b_writer.drain()
             return
 
-        if _FOR_UPDATE_RE.search(s):
-            err = await _check_for_update(conn, b_writer, s)
-            if err:
-                _reject(conn, c_writer, err)
+        # OC001: abort like real DSQL (40001); the next attempt sees the fresh
+        # catalog and succeeds.
+        if _stale_catalog(conn):
+            await _rollback_stale(conn, b_writer)
+            _reject(conn, c_writer, _OC001_ERR)
+            await c_writer.drain()
+            return
+
+        kind, result = await _plan_statement(conn, s, b_writer)
+        if kind == "error":
+            _reject(conn, c_writer, result)
+            await c_writer.drain()
+            return
+        if kind == "rows":
+            out = _row_description(result["cols"])
+            for row in result["rows"]:
+                out += _data_row(row)
+            out += _command_complete(result["tag"])
+            c_writer.write(out + _ready(_status(conn)))
+            await c_writer.drain()
+            return
+        if kind == "rewrite":
+            txn.apply(s)
+            # Run the rewritten statement on the backend, swallow its
+            # response, and synthesize the DSQL job_id result set.
+            job, backend_err = await _run_rewrite(conn, b_writer, result)
+            if backend_err is not None:
+                c_writer.write(_frame(b"E", backend_err) + _ready(_status(conn)))
                 await c_writer.drain()
                 return
+            out = _row_description(["job_id"])
+            out += _data_row([job["job_id"]])
+            out += _command_complete("SELECT 1")
+            c_writer.write(out + _ready(_status(conn)))
+            await c_writer.drain()
+            return
 
-        if classify_statement(s) == "ddl":
-            conn.catalog_version = _bump_catalog(conn.cluster_id)
-        else:
-            conn.catalog_version = _catalog_versions.get(conn.cluster_id, 0)
+        _note_catalog(conn, s)
         txn.apply(s)
         b_writer.write(_frame(b"Q", sql.encode() + b"\0"))
         await b_writer.drain()
@@ -1206,6 +1598,21 @@ async def _handle_query(conn, sql, b_writer, c_writer):
     # Multi-statement batch (implicit transaction) or non-strict mode:
     # validate every statement up front, then forward the batch verbatim.
     if STRICT and stmts:
+        # An aborted block only accepts an explicit rollback; forwarding a
+        # batch that opened with COMMIT would commit work the client was told
+        # had failed.
+        if conn.txn.synthetic_abort:
+            if re.match(
+                r"\s*(ROLLBACK|ABORT)\b", strip_leading_comments(stmts[0]), re.I
+            ):
+                conn.txn.synthetic_abort = False
+            else:
+                c_writer.write(
+                    _error_response(_ABORTED_ERR.sqlstate, _ABORTED_ERR.message)
+                    + _ready(_status(conn))
+                )
+                await c_writer.drain()
+                return
         sim = txn.copy()
         explicit = False
         if not sim.in_txn and len(stmts) > 1:
@@ -1246,6 +1653,208 @@ async def _handle_query(conn, sql, b_writer, c_writer):
     await b_writer.drain()
 
 
+# ---------------------------------------------------------------------------
+# Extended query protocol (Parse / Bind / Describe / Execute / Close / Sync)
+#
+# pgjdbc, pgx, asyncpg, psycopg3 and every ORM built on prepared statements
+# send SQL this way. Validating only the simple 'Q' protocol would let all of
+# them past the DSQL subset entirely.
+# ---------------------------------------------------------------------------
+
+
+def _two_strings(payload):
+    """The two leading NUL-terminated strings of a Parse or Bind payload."""
+    first = payload.index(b"\0")
+    second = payload.index(b"\0", first + 1)
+    return (
+        payload[:first].decode("utf-8", "replace"),
+        payload[first + 1 : second].decode("utf-8", "replace"),
+    )
+
+
+def _target_name(payload):
+    """('S'|'P', name) of a Describe or Close payload."""
+    return payload[:1], payload[1:].split(b"\0")[0].decode("utf-8", "replace")
+
+
+def _parse_payload(name, sql):
+    return name.encode() + b"\0" + sql.encode() + b"\0" + struct.pack("!H", 0)
+
+
+async def _ext_forward(conn, b_writer, type_byte, payload):
+    conn.ext_forwarded = True
+    b_writer.write(_frame(type_byte, payload))
+    await b_writer.drain()
+
+
+async def _ext_error(conn, c_writer, err):
+    """Report an error and enter skip-until-Sync, per the protocol spec."""
+    if conn.txn.in_txn:
+        conn.txn.synthetic_abort = True
+    conn.ext_skip = True
+    c_writer.write(_error_response(err.sqlstate, err.message))
+    await c_writer.drain()
+
+
+async def _ext_parse(conn, payload, b_writer, c_writer):
+    try:
+        name, sql = _two_strings(payload)
+    except ValueError:
+        await _ext_forward(conn, b_writer, b"P", payload)
+        return
+    s = strip_leading_comments(sql).strip()
+    entry = {"sql": s, "synth": None}
+    if not STRICT or not s:
+        conn.ext_stmts[name] = entry
+        await _ext_forward(conn, b_writer, b"P", payload)
+        return
+
+    err, forward_sql = _abort_gate(conn, s)
+    if err:
+        await _ext_error(conn, c_writer, err)
+        return
+    if forward_sql != s:  # COMMIT of an aborted block -> ROLLBACK
+        entry["sql"] = forward_sql
+        conn.ext_stmts[name] = entry
+        await _ext_forward(conn, b_writer, b"P", _parse_payload(name, forward_sql))
+        return
+
+    # Probes and rewrites need the backend to be idle; it is not once anything
+    # in this pipelined batch has been forwarded.
+    allow_probe = not conn.ext_forwarded
+    if allow_probe and _stale_catalog(conn):
+        await _rollback_stale(conn, b_writer)
+        await _ext_error(conn, c_writer, _OC001_ERR)
+        return
+
+    kind, result = await _plan_statement(conn, s, b_writer, allow_probe=allow_probe)
+    if kind == "error":
+        await _ext_error(conn, c_writer, result)
+        return
+    if kind in ("rows", "rewrite"):
+        entry["synth"] = (kind, result)
+        conn.ext_stmts[name] = entry
+        c_writer.write(_frame(b"1", b""))  # ParseComplete
+        await c_writer.drain()
+        return
+    conn.ext_stmts[name] = entry
+    await _ext_forward(conn, b_writer, b"P", payload)
+
+
+async def _ext_bind(conn, payload, b_writer, c_writer):
+    try:
+        portal, stmt = _two_strings(payload)
+    except ValueError:
+        await _ext_forward(conn, b_writer, b"B", payload)
+        return
+    entry = conn.ext_stmts.get(stmt)
+    if entry is None:
+        await _ext_forward(conn, b_writer, b"B", payload)
+        return
+    conn.ext_portals[portal] = entry
+    if entry["synth"] is None:
+        await _ext_forward(conn, b_writer, b"B", payload)
+        return
+    c_writer.write(_frame(b"2", b""))  # BindComplete
+    await c_writer.drain()
+
+
+async def _ext_describe(conn, payload, b_writer, c_writer):
+    target, name = _target_name(payload)
+    store = conn.ext_stmts if target == b"S" else conn.ext_portals
+    entry = store.get(name)
+    if entry is None or entry["synth"] is None:
+        await _ext_forward(conn, b_writer, b"D", payload)
+        return
+    out = b""
+    if target == b"S":
+        out += _frame(b"t", struct.pack("!H", 0))  # ParameterDescription
+    out += _row_description(_synth_columns(*entry["synth"]))
+    c_writer.write(out)
+    await c_writer.drain()
+
+
+async def _ext_execute(conn, payload, b_writer, c_writer):
+    name = payload.split(b"\0")[0].decode("utf-8", "replace")
+    entry = conn.ext_portals.get(name)
+    if entry is None or entry["synth"] is None:
+        if entry is not None and entry["sql"]:
+            _note_catalog(conn, entry["sql"])
+            conn.txn.apply(entry["sql"])
+        await _ext_forward(conn, b_writer, b"E", payload)
+        return
+
+    kind, result = entry["synth"]
+    if kind == "rows":
+        out = b""
+        for row in result["rows"]:
+            out += _data_row(row)
+        c_writer.write(out + _command_complete(result["tag"]))
+        await c_writer.drain()
+        return
+
+    conn.txn.apply(entry["sql"])
+    job, backend_err = await _run_rewrite(conn, b_writer, result)
+    if backend_err is not None:
+        conn.ext_skip = True
+        c_writer.write(_frame(b"E", backend_err))
+        await c_writer.drain()
+        return
+    c_writer.write(_data_row([job["job_id"]]) + _command_complete("SELECT 1"))
+    await c_writer.drain()
+
+
+async def _ext_close(conn, payload, b_writer, c_writer):
+    target, name = _target_name(payload)
+    store = conn.ext_stmts if target == b"S" else conn.ext_portals
+    entry = store.pop(name, None)
+    if entry is None or entry["synth"] is None:
+        await _ext_forward(conn, b_writer, b"C", payload)
+        return
+    c_writer.write(_frame(b"3", b""))  # CloseComplete
+    await c_writer.drain()
+
+
+async def _ext_sync(conn, b_writer, c_writer):
+    forwarded = conn.ext_forwarded
+    conn.ext_skip = False
+    conn.ext_forwarded = False
+    conn.ext_portals.pop("", None)  # the unnamed portal dies at Sync
+    if forwarded:
+        # The backend answers with its own ReadyForQuery, which also refreshes
+        # our transaction state via _backend_relay.
+        b_writer.write(_frame(b"S", b""))
+        await b_writer.drain()
+        return
+    c_writer.write(_ready(_status(conn)))
+    await c_writer.drain()
+
+
+async def _handle_extended(conn, type_byte, payload, b_writer, c_writer):
+    if conn.ext_skip and type_byte != b"S":
+        return  # after an error, everything is ignored until Sync
+    if type_byte == b"P":
+        await _ext_parse(conn, payload, b_writer, c_writer)
+    elif type_byte == b"B":
+        await _ext_bind(conn, payload, b_writer, c_writer)
+    elif type_byte == b"D":
+        await _ext_describe(conn, payload, b_writer, c_writer)
+    elif type_byte == b"E":
+        await _ext_execute(conn, payload, b_writer, c_writer)
+    elif type_byte == b"C":
+        await _ext_close(conn, payload, b_writer, c_writer)
+    elif type_byte == b"S":
+        await _ext_sync(conn, b_writer, c_writer)
+    elif type_byte == b"H":  # Flush
+        if conn.ext_forwarded:
+            await _ext_forward(conn, b_writer, b"H", payload)
+        else:
+            await c_writer.drain()
+
+
+_EXTENDED_TYPES = frozenset((b"P", b"B", b"D", b"E", b"C", b"S", b"H"))
+
+
 async def _handle_client(cluster_id, backend_host, backend_port, c_reader, c_writer):
     conn = _Conn(cluster_id)
     b_writer = None
@@ -1283,8 +1892,10 @@ async def _handle_client(cluster_id, backend_host, backend_port, c_reader, c_wri
             if type_byte == b"Q":
                 sql = payload[:-1].decode("utf-8", "replace") if payload.endswith(b"\0") else payload.decode("utf-8", "replace")
                 await _handle_query(conn, sql, b_writer, c_writer)
+            elif type_byte in _EXTENDED_TYPES:
+                await _handle_extended(conn, type_byte, payload, b_writer, c_writer)
             else:
-                # Everything else relays verbatim (P/B/E/C/d/c/f...).
+                # Everything else relays verbatim (d/c/f COPY frames, F...).
                 b_writer.write(_frame(type_byte, payload))
                 await b_writer.drain()
     except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError, OSError):
