@@ -3852,3 +3852,136 @@ def test_s3_get_object_attributes(s3):
     r = s3.get_object_attributes(Bucket=bkt, Key="kv", VersionId=pv["VersionId"],
                                  ObjectAttributes=["ObjectSize"])
     assert r["ObjectSize"] == 2 and r["VersionId"] == pv["VersionId"]
+
+
+# ---------------------------------------------------------------------------
+# ceph/s3-tests conformance fixes (#1322)
+# ---------------------------------------------------------------------------
+
+def test_s3_post_object_field_with_filename_is_not_body(s3):
+    """A form field carrying a filename (HTTP libraries set one on every field)
+    must NOT be treated as the object body — only the field named `file` is.
+    Regression for #1322 defect 1."""
+    import requests
+    from collections import OrderedDict
+    bucket = "intg-s3-post-filename-field"
+    s3.create_bucket(Bucket=bucket)
+    # `key` is an ordinary form field that carries a filename; `file` is the body.
+    r = requests.post(
+        f"{ENDPOINT}/{bucket}",
+        files=OrderedDict([
+            ("key", ("key.txt", "up.txt")),
+            ("file", ("f.txt", b"bar")),
+        ]),
+    )
+    assert r.status_code == 204
+    assert s3.get_object(Bucket=bucket, Key="up.txt")["Body"].read() == b"bar"
+
+
+def test_s3_get_object_part_number(s3):
+    """GetObject with partNumber returns that part as 206 with a parts count,
+    not the whole object. Regression for #1322 defect 2."""
+    bucket = "intg-s3-get-partnumber"
+    s3.create_bucket(Bucket=bucket)
+    uid = s3.create_multipart_upload(Bucket=bucket, Key="k")["UploadId"]
+    p1 = s3.upload_part(Bucket=bucket, Key="k", UploadId=uid, PartNumber=1, Body=b"A" * 100)
+    p2 = s3.upload_part(Bucket=bucket, Key="k", UploadId=uid, PartNumber=2, Body=b"B" * 50)
+    s3.complete_multipart_upload(
+        Bucket=bucket, Key="k", UploadId=uid,
+        MultipartUpload={"Parts": [
+            {"PartNumber": 1, "ETag": p1["ETag"]},
+            {"PartNumber": 2, "ETag": p2["ETag"]},
+        ]},
+    )
+    g = s3.get_object(Bucket=bucket, Key="k", PartNumber=1)
+    assert g["ResponseMetadata"]["HTTPStatusCode"] == 206
+    assert g["PartsCount"] == 2
+    assert g["ContentLength"] == 100
+    assert g["Body"].read() == b"A" * 100
+
+
+def test_s3_list_object_versions_pagination_markers(s3):
+    """A truncated ListObjectVersions returns NextKeyMarker and the marker
+    advances a second page without repeats. Regression for #1322 defect 3."""
+    bucket = "intg-s3-lov-markers"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+    for i in range(5):
+        s3.put_object(Bucket=bucket, Key=f"k{i}", Body=b"x")
+    r1 = s3.list_object_versions(Bucket=bucket, MaxKeys=2)
+    assert r1["IsTruncated"] is True
+    assert r1.get("NextKeyMarker")
+    r2 = s3.list_object_versions(Bucket=bucket, MaxKeys=2, KeyMarker=r1["NextKeyMarker"])
+    first = {v["Key"] for v in r1["Versions"]}
+    second = {v["Key"] for v in r2["Versions"]}
+    assert first and second and first.isdisjoint(second)
+
+
+def test_s3_complete_multipart_upload_empty_body_is_malformed_xml(s3):
+    """CompleteMultipartUpload with an empty body returns 400 MalformedXML,
+    not a 500 with a JSON document. Regression for #1322 defect 6."""
+    import requests
+    bucket = "intg-s3-cmu-emptybody"
+    s3.create_bucket(Bucket=bucket)
+    uid = s3.create_multipart_upload(Bucket=bucket, Key="k")["UploadId"]
+    r = requests.post(f"{ENDPOINT}/{bucket}/k?uploadId={uid}", data=b"")
+    assert r.status_code == 400
+    assert "MalformedXML" in r.text
+
+
+def test_s3_complete_multipart_upload_idempotent(s3):
+    """A repeated CompleteMultipartUpload with the same upload id replays the
+    original result instead of NoSuchUpload. Regression for #1322 defect 8."""
+    bucket = "intg-s3-cmu-idempotent"
+    s3.create_bucket(Bucket=bucket)
+    uid = s3.create_multipart_upload(Bucket=bucket, Key="k")["UploadId"]
+    part = s3.upload_part(Bucket=bucket, Key="k", UploadId=uid, PartNumber=1, Body=b"data")
+    mpu = {"Parts": [{"PartNumber": 1, "ETag": part["ETag"]}]}
+    r1 = s3.complete_multipart_upload(Bucket=bucket, Key="k", UploadId=uid, MultipartUpload=mpu)
+    r2 = s3.complete_multipart_upload(Bucket=bucket, Key="k", UploadId=uid, MultipartUpload=mpu)
+    assert r1["ETag"] == r2["ETag"]
+
+
+def test_s3_owner_id_consistent_between_listing_and_acl(s3):
+    """The owner id in a listing matches the owner id returned by the object ACL.
+    Regression for #1322 defect 9."""
+    bucket = "intg-s3-owner-consistency"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x")
+    listed = s3.list_objects(Bucket=bucket)["Contents"][0]["Owner"]["ID"]
+    acl_owner = s3.get_object_acl(Bucket=bucket, Key="k")["Owner"]["ID"]
+    assert listed == acl_owner
+
+
+def test_s3_presigned_url_expires(s3):
+    """An expired presigned URL is rejected with 403. Regression for #1322 defect 10."""
+    import requests
+    bucket = "intg-s3-presign-expiry"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x")
+    url = s3.generate_presigned_url(
+        "get_object", Params={"Bucket": bucket, "Key": "k"}, ExpiresIn=1
+    )
+    time.sleep(2)
+    assert requests.get(url).status_code == 403
+
+
+def test_s3_conditional_delete_if_match(s3):
+    """DeleteObject with a non-matching If-Match is rejected 412 (object
+    survives); DeleteObjects reports a stale ETag under Errors, not Deleted.
+    Regression for #1322 defect 7 (delete side)."""
+    bucket = "intg-s3-conditional-delete"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="cond", Body=b"x")
+
+    with pytest.raises(ClientError) as exc:
+        s3.delete_object(Bucket=bucket, Key="cond", IfMatch="badetag")
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+    assert s3.get_object(Bucket=bucket, Key="cond")["Body"].read() == b"x"
+
+    resp = s3.delete_objects(
+        Bucket=bucket, Delete={"Objects": [{"Key": "cond", "ETag": "badetag"}]}
+    )
+    assert resp.get("Errors") and resp["Errors"][0]["Code"] == "PreconditionFailed"
+    assert not resp.get("Deleted")
+    assert s3.get_object(Bucket=bucket, Key="cond")["Body"].read() == b"x"
