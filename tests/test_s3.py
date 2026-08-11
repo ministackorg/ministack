@@ -688,6 +688,48 @@ def test_s3_create_bucket_with_tags_and_location(s3):
     loc = s3.get_bucket_location(Bucket=bkt)
     assert loc["LocationConstraint"] == "us-west-2"
 
+def test_s3_get_bucket_location_explicit_constraint(s3):
+    """A bucket created with an explicit LocationConstraint must echo it back
+    from GetBucketLocation."""
+    bkt = f"intg-s3-loc-explicit-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(
+        Bucket=bkt,
+        CreateBucketConfiguration={"LocationConstraint": "eu-west-1"},
+    )
+    loc = s3.get_bucket_location(Bucket=bkt)
+    assert loc["LocationConstraint"] == "eu-west-1"
+
+def test_s3_get_bucket_location_us_east_1_is_none(s3):
+    """AWS returns an empty LocationConstraint for us-east-1 buckets, which
+    boto3 surfaces as None."""
+    bkt = f"intg-s3-loc-useast1-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    loc = s3.get_bucket_location(Bucket=bkt)
+    assert loc["LocationConstraint"] is None
+
+def test_s3_get_bucket_location_defaults_to_signing_region(s3):
+    """A bucket created WITHOUT CreateBucketConfiguration lands in the region
+    the request was signed for — GetBucketLocation must echo that region."""
+    import boto3
+    from botocore.config import Config
+
+    west_s3 = boto3.client(
+        "s3",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name="eu-west-1",
+        config=Config(
+            region_name="eu-west-1",
+            retries={"mode": "standard"},
+            max_pool_connections=50,
+        ),
+    )
+    bkt = f"intg-s3-loc-signing-{_uuid_mod.uuid4().hex[:8]}"
+    west_s3.create_bucket(Bucket=bkt)
+    loc = west_s3.get_bucket_location(Bucket=bkt)
+    assert loc["LocationConstraint"] == "eu-west-1"
+
 def test_s3_create_bucket_without_tags_has_no_tag_set(s3):
     """A CreateBucket with no tags must not create an empty tag set — a
     GetBucketTagging should still return NoSuchTagSet."""
