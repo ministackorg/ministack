@@ -642,7 +642,7 @@ only `DeleteDBCluster` removes the container and its storage.
 
 ## Aurora DSQL
 
-Each `CreateCluster` spins up a real `postgres:16-alpine` container behind an in-process Postgres wire-protocol proxy. Without Docker, clusters go `ACTIVE` metadata-only.
+Each `CreateCluster` returns an `ACTIVE` cluster with an endpoint. Set `DSQL_CONTAINERS=1` to additionally spin up a real `postgres:16-alpine` container per cluster (capped by `DSQL_MAX_CONTAINERS`, default 30) behind an in-process Postgres wire-protocol proxy.
 
 **The proxy fails like real DSQL**: SQL that DSQL rejects fails here too (`serial` columns, foreign keys, `CREATE EXTENSION`, `TRUNCATE`, temp tables, `ALTER COLUMN TYPE`, `SET NOT NULL`, materialized views, partitioned tables, non-btree/partial/expression indexes, ...), plain `CREATE INDEX` on a non-empty table is refused (`use CREATE INDEX ASYNC instead`), `CREATE INDEX ASYNC` and `ALTER TABLE ASYNC ... VALIDATE CONSTRAINT` return a `job_id`, `sys.jobs` / `sys.wait_for_job` are emulated, CHECK constraints via ALTER TABLE require `NOT VALID`, `ALTER TABLE ... DROP COLUMN` works (several columns in one statement included) except on a primary key column, identity columns are bigint-only (CACHE 1 or ≥ 65536), index limits are enforced (8 columns/index, 24/table), transactions allow only one DDL statement with no DDL+DML mixing, `SELECT ... FOR UPDATE` requires a single table with equality predicates on the key, a transaction that outlives another session's DDL fails once with `40001` (OC001) and succeeds on retry, and the transaction limits (3,000 rows / 10 MiB / 5 min) are enforced. `DSQL_STRICT=0` disables validation.
 
@@ -802,6 +802,8 @@ end-to-end without any client config.
 | `RDS_PERSIST` | `0` | Set `1` to use Docker named volumes for RDS containers instead of tmpfs. Storage grows dynamically with no fixed cap |
 | `MINISTACK_RDS_PUBLIC_ENDPOINT` | `0` | Set `1` when MiniStack itself runs in a Docker container but RDS clients connect from outside that network (remote MiniStack host, host-side clients, CI runners). `DescribeDBInstances` then returns `{MINISTACK_HOST, host_port}` — the externally-reachable host-published port — instead of the container-internal address. Set `MINISTACK_HOST` to the host clients will use |
 | `DSQL_BASE_PORT` | `25432` | Starting host port for Aurora DSQL cluster proxies (one port per cluster) |
+| `DSQL_CONTAINERS` | `0` | Set `1` to run a real Postgres container per DSQL cluster (requires Docker; capped by `DSQL_MAX_CONTAINERS` — further clusters are metadata-only stubs). Default `0` is control-plane-only |
+| `DSQL_MAX_CONTAINERS` | `30` | Maximum number of real DSQL backend containers |
 | `DSQL_PG_IMAGE` | `postgres:16-alpine` | Image used for per-cluster DSQL backend containers |
 | `DSQL_PERSIST` | `0` | Set `1` to use Docker named volumes for DSQL backend containers instead of tmpfs |
 | `DSQL_STRICT` | `1` | Set `0` to make the DSQL wire proxy a transparent passthrough (no SQL-subset validation) |

@@ -969,6 +969,37 @@ class TestReset:
             thread.join(timeout=5)
 
 
+class TestContainerCap:
+    def test_cap_exceeded_logs_and_degrades_to_stub(self, monkeypatch, caplog):
+        """When the backend container cap is reached, creating another cluster
+        logs a warning naming DSQL_MAX_CONTAINERS and goes metadata-only."""
+        import json
+        import logging
+
+        from ministack.services import dsql as dsql_mod
+
+        monkeypatch.setattr(dsql_mod, "_backends_enabled", lambda: True)
+        monkeypatch.setattr(dsql_mod, "MAX_CLUSTERS", 0)
+
+        with caplog.at_level(logging.WARNING, logger="dsql"):
+            status, _, body = dsql_mod._create_cluster({})
+
+        assert status == 200
+        cluster = json.loads(body)
+        identifier = cluster["identifier"]
+        try:
+            assert cluster["status"] == "ACTIVE"  # stub, not CREATING
+            assert dsql_mod._clusters[identifier]["_has_backend"] is False
+            assert any(
+                "DSQL_MAX_CONTAINERS" in r.message and "cap reached" in r.message
+                for r in caplog.records
+                if r.name == "dsql" and r.levelno == logging.WARNING
+            )
+        finally:
+            dsql_mod._clusters.clear()
+
+
+
 class TestIndexAsync:
     def test_rewrite_strips_async(self):
         assert pgproxy.rewrite_index_async(

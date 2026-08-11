@@ -4,9 +4,10 @@ Amazon Aurora DSQL Emulator (control plane + data plane wiring).
 REST-JSON API (no X-Amz-Target; routed on method + path). Covers cluster
 lifecycle, tags, and cluster policies.
 
-Data plane: when a Docker daemon is available, each cluster gets a real
-Postgres container (RDS idiom) fronted by an in-process wire-protocol proxy
-(`ministack.core.pgproxy`) that enforces DSQL's SQL subset. Without Docker
+Data plane: with ``DSQL_CONTAINERS=1`` and a Docker daemon available, each
+cluster gets a real Postgres container (RDS idiom, capped by
+``DSQL_MAX_CONTAINERS``, default 30) fronted by an in-process wire-protocol
+proxy (`ministack.core.pgproxy`) that enforces DSQL's SQL subset. Otherwise
 the cluster goes ACTIVE metadata-only — nothing listens on its port.
 """
 
@@ -32,8 +33,11 @@ from ministack.core.responses import (
 logger = logging.getLogger("dsql")
 
 BASE_PORT = int(os.environ.get("DSQL_BASE_PORT", "25432"))
+MAX_CLUSTERS = int(os.environ.get("DSQL_MAX_CONTAINERS", "30"))  # cap on real Postgres backend containers (one per cluster)
 PG_IMAGE = os.environ.get("DSQL_PG_IMAGE", "postgres:16-alpine")
 DSQL_PERSIST = os.environ.get("DSQL_PERSIST", "0").lower() in ("1", "true", "yes")
+# Backend containers are opt-in: default is control-plane-only (metadata stubs).
+DSQL_CONTAINERS = os.environ.get("DSQL_CONTAINERS", "0").lower() in ("1", "true", "yes")
 
 _clusters = AccountScopedDict()  # identifier -> cluster dict
 _client_tokens = AccountScopedDict()  # clientToken -> identifier (create idempotency)
@@ -181,6 +185,14 @@ def _docker_available():
     return True
 
 
+def _backends_enabled():
+    """Whether real Postgres backend containers should run for clusters.
+
+    Opt-in via ``DSQL_CONTAINERS=1``; default is control-plane-only stubs.
+    """
+    return DSQL_CONTAINERS and _docker_available()
+
+
 def _container_name(identifier):
     return f"ministack-dsql-{identifier}"
 
@@ -315,6 +327,7 @@ async def _start_backend(identifier, cluster):
             e,
         )
         cluster["status"] = "ACTIVE"
+        cluster["_has_backend"] = False
 
 
 async def _teardown_backend(identifier):
@@ -395,20 +408,33 @@ def _create_cluster(data):
     identifier = _new_identifier()
     arn = _cluster_arn(identifier, account_id, region)
     port = _next_port()
-    has_docker = _docker_available()
+    has_backend = _backends_enabled()
+    if has_backend:
+        backend_count = sum(
+            1 for c in _clusters._data.values() if c.get("_has_backend")
+        )
+        if backend_count >= MAX_CLUSTERS:
+            logger.warning(
+                "DSQL: backend container cap reached (%d) — cluster %s is "
+                "metadata-only. Raise DSQL_MAX_CONTAINERS to allow more.",
+                MAX_CLUSTERS,
+                identifier,
+            )
+            has_backend = False
 
     cluster = {
         "identifier": identifier,
         "arn": arn,
-        # With Docker the backend container + wire proxy spin up in the
-        # background; without it the cluster is metadata-only ACTIVE.
-        "status": "CREATING" if has_docker else "ACTIVE",
+        # With a backend the Postgres container + wire proxy spin up in the
+        # background; without one the cluster is metadata-only ACTIVE.
+        "status": "CREATING" if has_backend else "ACTIVE",
         "creationTime": time.time(),
         # AWS creates clusters with deletion protection ON by default.
         "deletionProtectionEnabled": bool(data.get("deletionProtectionEnabled", True)),
         "encryptionDetails": _encryption_details(data.get("kmsEncryptionKey"), account_id, region),
         "port": port,
         "endpoint": f"localhost:{port}",
+        "_has_backend": has_backend,
     }
     if data.get("multiRegionProperties"):
         cluster["multiRegionProperties"] = data["multiRegionProperties"]
@@ -422,12 +448,13 @@ def _create_cluster(data):
     if data.get("tags"):
         _tags[arn] = dict(data["tags"])
 
-    if has_docker:
+    if has_backend:
         try:
             asyncio.get_running_loop().create_task(_start_backend(identifier, cluster))
         except RuntimeError:
             # No event loop (direct/module-level call) — metadata-only.
             cluster["status"] = "ACTIVE"
+            cluster["_has_backend"] = False
 
     return json_response(_cluster_response(cluster))
 
@@ -818,7 +845,7 @@ def restore_state(data):
     for cluster in _clusters._data.values():
         if not isinstance(cluster, dict) or "identifier" not in cluster:
             continue
-        if not _docker_available():
+        if not _backends_enabled():
             cluster["status"] = "ACTIVE"
             continue
         cluster["status"] = "CREATING"
