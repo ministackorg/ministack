@@ -7,10 +7,12 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
   - ThingType: ``CreateThingType`` and friends
   - ThingGroup: ``CreateThingGroup`` and friends
   - Certificates: ``CreateKeysAndCertificate``, ``RegisterCertificate``,
-    ``UpdateCertificate``, ``DeleteCertificate``,
-    ``AttachThingPrincipal`` / ``DetachThingPrincipal``
+    ``RegisterCertificateWithoutCA``, ``UpdateCertificate``,
+    ``DeleteCertificate``, ``AttachThingPrincipal`` / ``DetachThingPrincipal``
   - Policies: ``CreatePolicy``, ``CreatePolicyVersion``, ``AttachPolicy``,
-    ``DetachPolicy``, etc.
+    ``DetachPolicy``, etc., plus the deprecated principal-policy family
+    (``AttachPrincipalPolicy`` / ``DetachPrincipalPolicy`` /
+    ``ListPrincipalPolicies`` / ``ListPolicyPrincipals``)
   - ``DescribeEndpoint`` returning a per-account hostname
 
 This is the control plane — pure HTTP/JSON, no MQTT broker
@@ -304,6 +306,22 @@ def _error_not_found(resource: str, name: str) -> tuple:
     )
 
 
+def _qp_bool(qp: dict, name: str, default: bool = False) -> bool:
+    """Read a modeled boolean query-string parameter.
+
+    SDKs serialize these as the strings ``true``/``false``; an absent
+    parameter — or a present-but-empty one, which ``parse_qs`` keeps — means
+    ``default``. The value is coerced through ``str`` so a repeated parameter
+    that reaches a handler as a list still yields a bool instead of raising.
+    """
+    raw = qp.get(name)
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    if raw is None or raw == "":
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes")
+
+
 # ---------------------------------------------------------------------------
 # Top-level dispatcher
 # ---------------------------------------------------------------------------
@@ -365,6 +383,8 @@ async def handle_request(
         return _create_keys_and_certificate(qp)
     if path == "/certificate/register" and method == "POST":
         return _register_certificate(_parse_body(body), qp)
+    if path == "/certificate/register-no-ca" and method == "POST":
+        return _register_certificate(_parse_body(body), qp, without_ca=True)
     if path == "/certificates" and method == "GET":
         return _list_certificates(qp)
     if path.startswith("/certificates/") and method in ("GET", "PUT", "DELETE"):
@@ -384,6 +404,13 @@ async def handle_request(
         return _list_targets_for_policy(path, qp)
     if path.startswith("/attached-policies/") and method in ("GET", "POST"):
         return _list_attached_policies(path, qp)
+    # Legacy principal-policy family (deprecated API, still shipped by SDKs).
+    if path == "/principal-policies" and method == "GET":
+        return _list_principal_policies(hdr, qp)
+    if path.startswith("/principal-policies/") and method in ("PUT", "DELETE"):
+        return _handle_principal_policy(method, path, hdr, qp)
+    if path == "/policy-principals" and method == "GET":
+        return _list_policy_principals(hdr, qp)
     if path.startswith("/policies/"):
         return _handle_policy(method, path, body, qp)
 
@@ -935,15 +962,40 @@ def _create_keys_and_certificate(qp: dict) -> tuple:
     })
 
 
-def _register_certificate(payload: dict, qp: dict) -> tuple:
-    """Register a certificate that was issued elsewhere (no re-signing)."""
+def _certificate_already_exists(cert_id: str) -> tuple:
+    """409 for a duplicate PEM, carrying ``resourceId``/``resourceArn`` the way
+    real AWS's ``ResourceAlreadyExistsException`` does — both register variants
+    answer identically."""
+    return error_response_json(
+        "ResourceAlreadyExistsException",
+        f"The certificate with id {cert_id} already exists.",
+        409,
+        extra={"resourceId": cert_id, "resourceArn": _cert_arn(cert_id)},
+    )
+
+
+def _register_certificate(payload: dict, qp: dict, *, without_ca: bool = False) -> tuple:
+    """Register a certificate that was issued elsewhere (no re-signing).
+
+    Serves both ``RegisterCertificate`` (``POST /certificate/register``) and
+    ``RegisterCertificateWithoutCA`` (``POST /certificate/register-no-ca``).
+    botocore models ``setAsActive`` as a *querystring* member (as in
+    ``CreateKeysAndCertificate``), so it is read from ``qp`` first, with the
+    JSON body kept as a fallback for raw callers. The no-CA variant carries no
+    CA reference and takes its status from the plain ``status`` body field
+    only — it has no deprecated ``setAsActive``.
+    """
     cert_pem = payload.get("certificatePem") or qp.get("certificatePem")
     if not cert_pem:
         return error_response_json(
             "InvalidRequestException", "certificatePem is required", 400
         )
-    set_active = bool(payload.get("setAsActive", False))
     status = payload.get("status")
+    if without_ca:
+        set_active = False
+    else:
+        set_active = _qp_bool(qp, "setAsActive", bool(payload.get("setAsActive", False)))
+    ca_pem = None if without_ca else payload.get("caCertificatePem")
     try:
         cert_id = get_certificate_id(cert_pem)
     except Exception as e:
@@ -953,11 +1005,7 @@ def _register_certificate(payload: dict, qp: dict) -> tuple:
             400,
         )
     if cert_id in _certificates:
-        return error_response_json(
-            "ResourceAlreadyExistsException",
-            "Certificate already registered",
-            409,
-        )
+        return _certificate_already_exists(cert_id)
     record = {
         "certificateId": cert_id,
         "certificateArn": _cert_arn(cert_id),
@@ -965,7 +1013,7 @@ def _register_certificate(payload: dict, qp: dict) -> tuple:
         "status": status or ("ACTIVE" if set_active else "INACTIVE"),
         "creationDate": _now_epoch(),
         "ownedBy": get_account_id(),
-        "caCertificateId": payload.get("caCertificatePem") and get_certificate_id(payload["caCertificatePem"]) or None,
+        "caCertificateId": get_certificate_id(ca_pem) if ca_pem else None,
         "attachedThings": [],
         "attachedPolicies": [],
     }
@@ -1332,47 +1380,70 @@ def _handle_target_policy(method: str, path: str, body: bytes, qp: dict) -> tupl
         return error_response_json(
             "InvalidRequestException", "Invalid target-policies path", 400
         )
+    if method not in ("PUT", "POST", "DELETE"):
+        return error_response_json(
+            "InvalidRequestException", f"Unsupported method: {method}", 400
+        )
+    return _change_policy_target(
+        name, _parse_body(body).get("target"), attach=method == "PUT"
+    )
+
+
+def _change_policy_target(name: str, target: str | None, *, attach: bool) -> tuple:
+    """``AttachPolicy`` / ``DetachPolicy`` over the policy and certificate stores.
+
+    The data core behind both the modern ``/target-policies/{policyName}``
+    route and the deprecated ``/principal-policies/{policyName}`` one, so
+    neither has to synthesize a request for the other.
+    """
     p = _policies.get(name)
     if p is None:
         return _error_not_found("Policy", name)
-    payload = _parse_body(body)
-    target = payload.get("target")
     if not target:
         return error_response_json(
             "InvalidRequestException", "target is required", 400
         )
-    if method == "PUT":
+    cert_id = target.rsplit("/", 1)[-1]
+    cert = _certificates.get(cert_id)
+    if attach:
         if target not in p.setdefault("targets", []):
             p["targets"].append(target)
             _policies[name] = p
-        cert_id = target.rsplit("/", 1)[-1]
-        cert = _certificates.get(cert_id)
         if cert is not None and name not in cert.setdefault("attachedPolicies", []):
             cert["attachedPolicies"].append(name)
             _certificates[cert_id] = cert
-        return json_response({})
-    if method in ("POST", "DELETE"):
+    else:
         if target in p.get("targets", []):
             p["targets"].remove(target)
             _policies[name] = p
-        cert_id = target.rsplit("/", 1)[-1]
-        cert = _certificates.get(cert_id)
         if cert is not None and name in cert.get("attachedPolicies", []):
             cert["attachedPolicies"].remove(name)
             _certificates[cert_id] = cert
-        return json_response({})
-    return error_response_json(
-        "InvalidRequestException", f"Unsupported method: {method}", 400
-    )
+    return json_response({})
+
+
+def _policy_targets(name: str) -> list | None:
+    """The targets attached to policy ``name``, or ``None`` if it does not exist."""
+    p = _policies.get(name)
+    return None if p is None else list(p.get("targets", []))
+
+
+def _policies_attached_to(target: str) -> list:
+    """The ``{policyName, policyArn}`` entries attached to ``target``."""
+    return [
+        {"policyName": p["policyName"], "policyArn": p["policyArn"]}
+        for p in _policies.values()
+        if target in p.get("targets", [])
+    ]
 
 
 def _list_targets_for_policy(path: str, qp: dict) -> tuple:
     """``GET|POST /policy-targets/{policyName}``."""
     name = path[len("/policy-targets/"):]
-    p = _policies.get(name)
-    if p is None:
+    targets = _policy_targets(name)
+    if targets is None:
         return _error_not_found("Policy", name)
-    return json_response({"targets": list(p.get("targets", []))})
+    return json_response({"targets": targets})
 
 
 def _list_attached_policies(path: str, qp: dict) -> tuple:
@@ -1381,12 +1452,61 @@ def _list_attached_policies(path: str, qp: dict) -> tuple:
     The target segment is URL-encoded by the SDK (the certificate ARN
     contains colons / slashes); the ASGI layer hands us the decoded value.
     """
-    target = path[len("/attached-policies/"):]
-    out = []
-    for p in _policies.values():
-        if target in p.get("targets", []):
-            out.append({"policyName": p["policyName"], "policyArn": p["policyArn"]})
-    return json_response({"policies": out})
+    return json_response(
+        {"policies": _policies_attached_to(path[len("/attached-policies/"):])}
+    )
+
+
+# ---------------------------------------------------------------------------
+# Legacy principal-policy family (deprecated, still shipped by every SDK).
+# The principal rides in the ``x-amzn-iot-principal`` header; semantics are
+# exactly the modern target-scoped operations with principal == target, so
+# each handler reads the same stores through the shared cores above.
+# ---------------------------------------------------------------------------
+
+
+def _handle_principal_policy(method: str, path: str, headers: dict, qp: dict) -> tuple:
+    """``PUT|DELETE /principal-policies/{policyName}`` —
+    ``AttachPrincipalPolicy`` / ``DetachPrincipalPolicy``, with the header
+    principal as the policy target (PUT attaches, DELETE detaches).
+    """
+    name = path[len("/principal-policies/"):]
+    if not name or "/" in name:
+        return error_response_json(
+            "InvalidRequestException", "Invalid principal-policies path", 400
+        )
+    principal = headers.get("x-amzn-iot-principal")
+    if not principal:
+        return error_response_json(
+            "InvalidRequestException", "x-amzn-iot-principal header is required", 400
+        )
+    return _change_policy_target(name, principal, attach=method == "PUT")
+
+
+def _list_principal_policies(headers: dict, qp: dict) -> tuple:
+    """``GET /principal-policies`` (``ListPrincipalPolicies``) — the same
+    result ``ListAttachedPolicies`` gives for the principal."""
+    principal = headers.get("x-amzn-iot-principal")
+    if not principal:
+        return error_response_json(
+            "InvalidRequestException", "x-amzn-iot-principal header is required", 400
+        )
+    return json_response({"policies": _policies_attached_to(principal)})
+
+
+def _list_policy_principals(headers: dict, qp: dict) -> tuple:
+    """``GET /policy-principals`` (``ListPolicyPrincipals``) — the policy name
+    rides in the ``x-amzn-iot-policy`` header; the principals are the modern
+    ``ListTargetsForPolicy`` targets under their legacy key."""
+    name = headers.get("x-amzn-iot-policy")
+    if not name:
+        return error_response_json(
+            "InvalidRequestException", "x-amzn-iot-policy header is required", 400
+        )
+    principals = _policy_targets(name)
+    if principals is None:
+        return _error_not_found("Policy", name)
+    return json_response({"principals": principals})
 
 
 # ---------------------------------------------------------------------------

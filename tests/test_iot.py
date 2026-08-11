@@ -351,6 +351,23 @@ def test_iot_register_certificate_preserves_pem_verbatim(iot_client):
     iot_client.delete_certificate(certificateId=cert_id)
 
 
+def test_iot_register_certificate_set_as_active_query_param(iot_client):
+    pytest.importorskip("cryptography")
+    # boto3 sends setAsActive as a querystring parameter (per the botocore
+    # model), not in the JSON body — the cert must still come out ACTIVE.
+    issued = iot_client.create_keys_and_certificate(setAsActive=False)
+    cert_pem = issued["certificatePem"]
+    iot_client.delete_certificate(certificateId=issued["certificateId"])
+
+    cert_id = iot_client.register_certificate(
+        certificatePem=cert_pem, setAsActive=True
+    )["certificateId"]
+    desc = iot_client.describe_certificate(certificateId=cert_id)
+    assert desc["certificateDescription"]["status"] == "ACTIVE"
+    iot_client.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
+    iot_client.delete_certificate(certificateId=cert_id)
+
+
 def test_iot_attach_detach_thing_principal(iot_client):
     pytest.importorskip("cryptography")
     name = _unique("thing")
@@ -486,6 +503,89 @@ def test_iot_attach_detach_policy(iot_client):
 
     iot_client.delete_policy(policyName=name)
     iot_client.delete_certificate(certificateId=cert["certificateId"])
+
+
+# ---------------------------------------------------------------------------
+# Certificates: register-no-CA + legacy principal-policy family
+# ---------------------------------------------------------------------------
+
+
+def test_iot_register_certificate_without_ca_roundtrip(iot_client):
+    pytest.importorskip("cryptography")
+    # Issue a cert, capture its PEM, delete it, then re-register the SAME PEM
+    # through the no-CA variant.
+    issued = iot_client.create_keys_and_certificate(setAsActive=False)
+    cert_pem = issued["certificatePem"]
+    iot_client.delete_certificate(certificateId=issued["certificateId"])
+
+    resp = iot_client.register_certificate_without_ca(
+        certificatePem=cert_pem, status="ACTIVE"
+    )
+    cert_id = resp["certificateId"]
+    assert resp["certificateArn"].endswith(":cert/" + cert_id)
+    # The no-CA output carries ids only — no certificatePem echo.
+    assert "certificatePem" not in resp
+
+    desc = iot_client.describe_certificate(certificateId=cert_id)
+    assert desc["certificateDescription"]["certificatePem"] == cert_pem
+    assert desc["certificateDescription"]["status"] == "ACTIVE"
+
+    iot_client.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
+    iot_client.delete_certificate(certificateId=cert_id)
+
+
+def test_iot_register_certificate_without_ca_duplicate_conflict(iot_client):
+    pytest.importorskip("cryptography")
+    issued = iot_client.create_keys_and_certificate(setAsActive=False)
+    cert_pem = issued["certificatePem"]
+    iot_client.delete_certificate(certificateId=issued["certificateId"])
+
+    cert_id = iot_client.register_certificate_without_ca(
+        certificatePem=cert_pem, status="INACTIVE"
+    )["certificateId"]
+    with pytest.raises(ClientError) as ei:
+        iot_client.register_certificate_without_ca(
+            certificatePem=cert_pem, status="INACTIVE"
+        )
+    err = ei.value.response
+    assert err["Error"]["Code"] == "ResourceAlreadyExistsException"
+    assert err["resourceId"] == cert_id
+    assert err["resourceArn"].endswith(":cert/" + cert_id)
+    iot_client.delete_certificate(certificateId=cert_id)
+
+
+def test_iot_legacy_principal_policy_family(iot_client):
+    pytest.importorskip("cryptography")
+    policy = _unique("policy")
+    iot_client.create_policy(policyName=policy, policyDocument=_POLICY_DOC)
+    cert = iot_client.create_keys_and_certificate(setAsActive=False)
+    principal = cert["certificateArn"]
+
+    iot_client.attach_principal_policy(policyName=policy, principal=principal)
+
+    legacy = iot_client.list_principal_policies(principal=principal)["policies"]
+    assert any(p["policyName"] == policy for p in legacy)
+    # 1:1 with the modern target-scoped view of the same attachment.
+    modern = iot_client.list_attached_policies(target=principal)["policies"]
+    assert legacy == modern
+    principals = iot_client.list_policy_principals(policyName=policy)["principals"]
+    assert principals == [principal]
+
+    iot_client.detach_principal_policy(policyName=policy, principal=principal)
+    assert iot_client.list_principal_policies(principal=principal)["policies"] == []
+    assert iot_client.list_policy_principals(policyName=policy)["principals"] == []
+    assert iot_client.list_attached_policies(target=principal)["policies"] == []
+
+    iot_client.delete_policy(policyName=policy)
+    iot_client.delete_certificate(certificateId=cert["certificateId"])
+
+
+def test_iot_legacy_principal_policy_unknown_policy_404(iot_client):
+    with pytest.raises(ClientError) as ei:
+        iot_client.attach_principal_policy(
+            policyName=_unique("nope"), principal="arn:aws:iot:cert/none"
+        )
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
 # ---------------------------------------------------------------------------
