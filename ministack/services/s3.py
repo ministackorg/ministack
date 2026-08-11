@@ -1145,6 +1145,9 @@ def _create_bucket(name: str, body: bytes, headers: dict = None):
     if err is not None:
         return err
 
+    # No explicit LocationConstraint: the bucket lands in the region the
+    # request was signed for, like real AWS.
+    region = region or get_region()
     _buckets[name] = {"created": now_iso(), "objects": {}, "region": region}
     if tags:
         _bucket_tags[name] = tags
@@ -1216,9 +1219,10 @@ def _get_bucket_location(name: str):
     if name not in _buckets:
         return _no_such_bucket(name)
     root = Element("LocationConstraint", xmlns=S3_NS)
-    region = _buckets[name].get("region")
-    # AWS returns empty LocationConstraint for us-east-1.
-    if region and region != os.environ.get("MINISTACK_REGION", "us-east-1"):
+    region = _buckets[name].get("region") or os.environ.get("MINISTACK_REGION", "us-east-1")
+    # AWS returns an empty LocationConstraint only for us-east-1 buckets;
+    # every other region is echoed back verbatim.
+    if region != "us-east-1":
         root.text = region
     return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
