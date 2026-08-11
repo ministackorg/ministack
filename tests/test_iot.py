@@ -7,6 +7,7 @@ iot-data Publish) is covered separately in ``test_iot_data.py``.
 
 import base64
 import json
+import logging
 import time
 import uuid
 
@@ -547,6 +548,76 @@ def test_iot_replace_topic_rule(iot_client):
     iot_client.delete_topic_rule(ruleName=name)
 
 
+def test_iot_create_topic_rule_garbage_sql_rejected(iot_client):
+    with pytest.raises(ClientError) as ei:
+        iot_client.create_topic_rule(
+            ruleName=_rule_name(),
+            topicRulePayload={"sql": "this is not sql", "actions": []},
+        )
+    assert ei.value.response["Error"]["Code"] == "SqlParseException"
+
+
+def test_iot_create_topic_rule_unsupported_where_rejected(iot_client):
+    """A WHERE the evaluator cannot parse is rejected at creation instead of
+    being stored and silently never firing.
+
+    Malformed SQL only: syntax AWS accepts has to be accepted here too, or the
+    rule that deploys on AWS fails to create locally.
+    """
+    with pytest.raises(ClientError) as ei:
+        iot_client.create_topic_rule(
+            ruleName=_rule_name(),
+            topicRulePayload={
+                "sql": "SELECT * FROM 'a' WHERE (state = 'on'",
+                "actions": [],
+            },
+        )
+    assert ei.value.response["Error"]["Code"] == "SqlParseException"
+
+
+def test_iot_create_topic_rule_accepts_or_and_parentheses(iot_client):
+    """`OR` and parenthesised groups are valid AWS rule SQL — rejecting them
+    would fail rules that deploy fine on AWS."""
+    name = _rule_name()
+    sql = "SELECT * FROM 'a' WHERE (state = 'on' OR state = 'standby') AND temp > 20"
+    iot_client.create_topic_rule(
+        ruleName=name, topicRulePayload={"sql": sql, "actions": []}
+    )
+    assert iot_client.get_topic_rule(ruleName=name)["rule"]["sql"] == sql
+    iot_client.delete_topic_rule(ruleName=name)
+
+
+def test_iot_create_topic_rule_accepts_full_where_grammar(iot_client):
+    """The rest of the WHERE syntax AWS accepts — over-strict validation here
+    turns a working setup into a hard 400 (or a failed CloudFormation stack)."""
+    name = _rule_name()
+    sql = (
+        "SELECT * FROM 'a' WHERE state IN ('on', 'idle') AND temp BETWEEN 1 AND 5 "
+        "AND serial LIKE 'dev-%' AND nickname IS NOT NULL AND enabled "
+        "AND isUndefined(site) AND note <> 'it''s off'"
+    )
+    iot_client.create_topic_rule(
+        ruleName=name, topicRulePayload={"sql": sql, "actions": []}
+    )
+    assert iot_client.get_topic_rule(ruleName=name)["rule"]["sql"] == sql
+    iot_client.delete_topic_rule(ruleName=name)
+
+
+def test_iot_replace_topic_rule_garbage_sql_rejected(iot_client):
+    name = _rule_name()
+    iot_client.create_topic_rule(
+        ruleName=name, topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": []}
+    )
+    with pytest.raises(ClientError) as ei:
+        iot_client.replace_topic_rule(
+            ruleName=name, topicRulePayload={"sql": "garbage", "actions": []}
+        )
+    assert ei.value.response["Error"]["Code"] == "SqlParseException"
+    # The stored rule is untouched.
+    assert iot_client.get_topic_rule(ruleName=name)["rule"]["sql"] == "SELECT * FROM 'a'"
+    iot_client.delete_topic_rule(ruleName=name)
+
+
 def test_iot_replace_missing_topic_rule_404(iot_client):
     with pytest.raises(ClientError) as ei:
         iot_client.replace_topic_rule(
@@ -597,6 +668,84 @@ def test_iot_topic_rule_cfn_deploy(cfn, iot_client):
     _wait_stack_gone_iot(cfn, stack)
     with pytest.raises(ClientError):
         iot_client.get_topic_rule(ruleName=rule)
+
+
+def test_iot_topic_rule_cfn_invalid_sql_fails_resource(cfn, iot_client):
+    """CloudFormation validates rule SQL too: a rule the engine cannot evaluate
+    must fail the resource, not reach CREATE_COMPLETE and silently never fire
+    (real CloudFormation fails on the underlying CreateTopicRule call).
+
+    No provisioner change is needed for that — `RuleSqlError` is a `ValueError`,
+    which is already what the stack runner turns into a CREATE_FAILED carrying
+    the reason.
+    """
+    stack = "iot-badsql-" + uuid.uuid4().hex[:8]
+    rule = _rule_name("badsql")
+    template = {
+        "Resources": {
+            "BadRule": {
+                "Type": "AWS::IoT::TopicRule",
+                "Properties": {
+                    "RuleName": rule,
+                    "TopicRulePayload": {
+                        "Sql": "this is not sql",
+                        "Actions": [],
+                    },
+                },
+            }
+        },
+    }
+    try:
+        cfn.create_stack(
+            StackName=stack, TemplateBody=json.dumps(template), DisableRollback=True
+        )
+        st = _wait_stack_iot(cfn, stack)
+        assert st["StackStatus"] == "CREATE_FAILED"
+        reason = st.get("StackStatusReason", "")
+        assert "BadRule" in reason and "Rule SQL" in reason
+
+        events = cfn.describe_stack_events(StackName=stack)["StackEvents"]
+        assert any(
+            event["LogicalResourceId"] == "BadRule"
+            and event["ResourceStatus"] == "CREATE_FAILED"
+            for event in events
+        )
+        # Nothing was stored: the invalid rule never entered the rule store.
+        with pytest.raises(ClientError) as ei:
+            iot_client.get_topic_rule(ruleName=rule)
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack)
+            _wait_stack_gone_iot(cfn, stack)
+        except ClientError:
+            pass
+
+
+def test_iot_topic_rule_cfn_where_with_or_deploys(cfn, iot_client):
+    """A WHERE using OR and parentheses deploys through CloudFormation — the
+    grammar the validator accepts is the same on both paths."""
+    stack = "iot-orsql-" + uuid.uuid4().hex[:8]
+    rule = _rule_name("orsql")
+    sql = "SELECT * FROM 'sensors/+/telemetry' WHERE (temp > 30 OR humidity > 80) AND state = 'on'"
+    template = {
+        "Resources": {
+            "OrRule": {
+                "Type": "AWS::IoT::TopicRule",
+                "Properties": {
+                    "RuleName": rule,
+                    "TopicRulePayload": {"Sql": sql, "Actions": []},
+                },
+            }
+        },
+    }
+    cfn.create_stack(StackName=stack, TemplateBody=json.dumps(template))
+    st = _wait_stack_iot(cfn, stack)
+    assert st["StackStatus"] == "CREATE_COMPLETE", st.get("StackStatusReason")
+    assert iot_client.get_topic_rule(ruleName=rule)["rule"]["sql"] == sql
+
+    cfn.delete_stack(StackName=stack)
+    _wait_stack_gone_iot(cfn, stack)
 
 
 def _wait_stack_iot(cfn, name, timeout=30):
@@ -2520,3 +2669,511 @@ def test_rule_event_from_less_basic_ingest_projects():
         "SELECT deviceId AS id, temp", "$aws/rules/myrule", b'{"deviceId": "d1", "temp": 22, "extra": "x"}'
     )
     assert event == {"id": "d1", "temp": 22}
+
+
+# ----------------------------------------------------------------------
+# Rule SQL WHERE clause (white-box tests for _rule_where_clause /
+# _eval_where / _validate_rule_sql).
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        ("SELECT * FROM 'a/b' WHERE state = 'on'", "state = 'on'"),
+        ("SELECT * FROM 'a/b'", ""),
+        ("SELECT temp WHERE temp > 20", "temp > 20"),  # FROM-less Basic Ingest form
+        ("SELECT temp", ""),
+        # A WHERE-ish string inside the topic filter is not a predicate.
+        ("SELECT * FROM 'a/WHERE x/b'", ""),
+    ],
+)
+def test_rule_where_clause_extraction(sql, expected):
+    from ministack.services.iot import _rule_where_clause
+
+    assert _rule_where_clause(sql) == expected
+
+
+@pytest.mark.parametrize(
+    ("pred", "payload", "expected"),
+    [
+        # equality (both spellings) on strings and numbers
+        ("state = 'on'", {"state": "on"}, True),
+        ("state == 'on'", {"state": "on"}, True),
+        ("state = 'on'", {"state": "off"}, False),
+        ("temp = 22", {"temp": 22}, True),
+        ("temp = 22", {"temp": 23}, False),
+        # inequality (both spellings)
+        ("state <> 'on'", {"state": "off"}, True),
+        ("state != 'on'", {"state": "on"}, False),
+        # a predicate over a missing attribute is Undefined → never matches,
+        # not even for <> (fail closed, as on AWS)
+        ("absent = 'x'", {"state": "on"}, False),
+        ("absent <> 'x'", {"state": "on"}, False),
+        ("absent > 1", {"state": "on"}, False),
+        # numeric comparisons
+        ("temp > 20", {"temp": 22}, True),
+        ("temp > 22", {"temp": 22}, False),
+        ("temp >= 22", {"temp": 22}, True),
+        ("temp < 30", {"temp": 22}, True),
+        ("temp <= 21", {"temp": 22}, False),
+        # ordering comparisons are numeric-only — a string operand is Undefined
+        ("temp > 20", {"temp": "hot"}, False),
+        # nested attribute paths
+        ("state.reported.power = 'on'", {"state": {"reported": {"power": "on"}}}, True),
+        ("state.reported.power = 'on'", {"state": {"reported": {"power": "off"}}}, False),
+        # AND conjunction: all clauses must hold
+        ("state = 'on' AND temp > 20", {"state": "on", "temp": 22}, True),
+        ("state = 'on' AND temp > 20", {"state": "on", "temp": 19}, False),
+        ("state = 'on' AND temp > 20", {"state": "off", "temp": 22}, False),
+        # AND inside a string literal is not a conjunction
+        ("mode = 'UP AND DOWN'", {"mode": "UP AND DOWN"}, True),
+        # OR disjunction: any clause may carry the predicate
+        ("state = 'on' OR state = 'off'", {"state": "off"}, True),
+        ("state = 'on' OR state = 'off'", {"state": "idle"}, False),
+        ("state = 'on' or temp > 20", {"state": "off", "temp": 22}, True),
+        # an Undefined leaf is false, but an OR sibling can still carry it
+        ("absent = 'x' OR state = 'on'", {"state": "on"}, True),
+        ("absent = 'x' OR state = 'on'", {"state": "off"}, False),
+        # precedence: OR binds loosest, so this reads (a AND b) OR c
+        ("state = 'on' AND temp > 20 OR mode = 'test'",
+         {"state": "off", "temp": 1, "mode": "test"}, True),
+        ("state = 'on' AND temp > 20 OR mode = 'test'",
+         {"state": "on", "temp": 22, "mode": "prod"}, True),
+        ("state = 'on' AND temp > 20 OR mode = 'test'",
+         {"state": "on", "temp": 1, "mode": "prod"}, False),
+        # ...and the same predicate the other way round: c OR (a AND b)
+        ("mode = 'test' OR state = 'on' AND temp > 20",
+         {"state": "on", "temp": 1, "mode": "prod"}, False),
+        ("mode = 'test' OR state = 'on' AND temp > 20",
+         {"state": "off", "temp": 1, "mode": "test"}, True),
+        # parentheses override that precedence: (a OR b) AND c
+        ("(state = 'on' OR mode = 'test') AND temp > 20",
+         {"state": "off", "mode": "test", "temp": 22}, True),
+        ("(state = 'on' OR mode = 'test') AND temp > 20",
+         {"state": "off", "mode": "test", "temp": 1}, False),
+        ("(state = 'on' OR mode = 'test') AND temp > 20",
+         {"state": "off", "mode": "prod", "temp": 22}, False),
+        # a group wrapping the whole predicate is a no-op
+        ("(state = 'on')", {"state": "on"}, True),
+        ("((state = 'on'))", {"state": "on"}, True),
+        # nested groups
+        ("((state = 'on' OR state = 'off') AND temp > 20) OR mode = 'test'",
+         {"state": "on", "temp": 22, "mode": "prod"}, True),
+        ("((state = 'on' OR state = 'off') AND temp > 20) OR mode = 'test'",
+         {"state": "idle", "temp": 22, "mode": "prod"}, False),
+        ("((state = 'on' OR state = 'off') AND temp > 20) OR mode = 'test'",
+         {"state": "idle", "temp": 1, "mode": "test"}, True),
+        # AND binds tighter inside an OR branch, groups or not
+        ("mode = 'test' OR (state = 'on' AND temp > 20)",
+         {"state": "on", "temp": 22, "mode": "prod"}, True),
+        # OR inside a string literal is not a disjunction
+        ("mode = 'ON OR OFF'", {"mode": "ON OR OFF"}, True),
+        ("mode = 'ON OR OFF'", {"mode": "ON"}, False),
+        ("mode = 'ON OR OFF' AND temp > 20", {"mode": "ON OR OFF", "temp": 22}, True),
+        # an attribute path may contain the keywords without being one
+        ("android = 'yes' OR orbit = 1", {"orbit": 1}, True),
+        # regexp_matches
+        ("regexp_matches(serial, '^dev-[0-9]+$')", {"serial": "dev-42"}, True),
+        ("regexp_matches(serial, '^dev-[0-9]+$')", {"serial": "gw-42"}, False),
+        ("regexp_matches(absent, '.*')", {"serial": "dev-42"}, False),
+        # booleans stay distinct from 0/1
+        ("armed = 1", {"armed": True}, False),
+        # IN / NOT IN over a value list
+        ("state IN ('on', 'idle')", {"state": "idle"}, True),
+        ("state IN ('on', 'idle')", {"state": "off"}, False),
+        ("state IN('on')", {"state": "on"}, True),  # no space before the list
+        ("code IN (1, 2, 3)", {"code": 2}, True),
+        ("code IN (1, 2, 3)", {"code": 4}, False),
+        ("state NOT IN ('on', 'idle')", {"state": "off"}, True),
+        ("state NOT IN ('on', 'idle')", {"state": "on"}, False),
+        ("absent IN ('on')", {"state": "on"}, False),
+        ("absent NOT IN ('on')", {"state": "on"}, False),  # Undefined fails closed
+        # LIKE / NOT LIKE — % matches a run, _ exactly one character
+        ("state LIKE 'on%'", {"state": "online"}, True),
+        ("state LIKE 'on%'", {"state": "gone"}, False),
+        ("state LIKE 'o_'", {"state": "on"}, True),
+        ("state LIKE 'o_'", {"state": "one"}, False),
+        ("state LIKE 'on'", {"state": "on"}, True),
+        # the pattern's own regex metacharacters stay literal
+        ("state LIKE 'a.c'", {"state": "abc"}, False),
+        ("state LIKE 'a.c'", {"state": "a.c"}, True),
+        ("state NOT LIKE 'on%'", {"state": "gone"}, True),
+        ("state NOT LIKE 'on%'", {"state": "online"}, False),
+        # LIKE wants a String, so AWS converts an Int or a Boolean to one
+        # first — the same conversion regexp_matches() gets, pinned together
+        # below so the two operators cannot drift apart again.
+        ("temp LIKE '2%'", {"temp": 22}, True),
+        ("flag LIKE 'tr%'", {"flag": True}, True),
+        ("absent LIKE '%'", {"state": "on"}, False),
+        ("nickname LIKE '%'", {"nickname": None}, False),  # Null does not convert
+        # BETWEEN, inclusive on both bounds — its AND is not a conjunction
+        ("temp BETWEEN 20 AND 30", {"temp": 22}, True),
+        ("temp BETWEEN 20 AND 30", {"temp": 20}, True),
+        ("temp BETWEEN 20 AND 30", {"temp": 30}, True),
+        ("temp BETWEEN 20 AND 30", {"temp": 31}, False),
+        ("temp BETWEEN 20 AND 30 AND state = 'on'", {"temp": 22, "state": "on"}, True),
+        ("temp BETWEEN 20 AND 30 AND state = 'on'", {"temp": 22, "state": "off"}, False),
+        ("state = 'on' AND temp BETWEEN 20 AND 30", {"state": "on", "temp": 22}, True),
+        ("temp BETWEEN 20 AND 30 OR state = 'on'", {"temp": 99, "state": "on"}, True),
+        ("absent BETWEEN 1 AND 5", {"temp": 3}, False),
+        ("temp BETWEEN 20 AND 30", {"temp": "hot"}, False),  # numeric-only
+        # IS NULL / IS NOT NULL over a JSON null
+        ("nickname IS NULL", {"nickname": None}, True),
+        ("nickname IS NULL", {"nickname": "gw"}, False),
+        ("nickname IS NOT NULL", {"nickname": "gw"}, True),
+        ("nickname IS NOT NULL", {"nickname": None}, False),
+        # Undefined is neither NULL nor NOT NULL — both fail closed
+        ("nickname IS NULL", {"state": "on"}, False),
+        ("nickname IS NOT NULL", {"state": "on"}, False),
+        # a bare boolean attribute is a predicate on its own
+        ("enabled", {"enabled": True}, True),
+        ("enabled", {"enabled": False}, False),
+        # AWS converts a value to Boolean only from "true"/"false" — a number
+        # needs an explicit cast(), so it stays Undefined here.
+        ("enabled", {"enabled": "true"}, True),
+        ("enabled", {"enabled": "FALSE"}, False),
+        ("enabled", {"enabled": 1}, False),
+        ("enabled", {"enabled": "yes"}, False),
+        ("enabled", {"state": "on"}, False),
+        ("enabled AND temp > 20", {"enabled": True, "temp": 22}, True),
+        ("enabled AND temp > 20", {"enabled": False, "temp": 22}, False),
+        ("state.reported.on", {"state": {"reported": {"on": True}}}, True),
+        # isUndefined() — the one predicate a missing attribute satisfies
+        ("isUndefined(absent)", {"state": "on"}, True),
+        ("isUndefined(state)", {"state": "on"}, False),
+        ("isUndefined(state.reported)", {"state": {"reported": {}}}, False),
+        ("isUndefined(absent) OR state = 'on'", {"state": "off"}, True),
+        # a quote inside a string literal is escaped by doubling it
+        ("note = 'it''s on'", {"note": "it's on"}, True),
+        ("note = 'it''s on'", {"note": "its on"}, False),
+        ("note <> 'it''s on'", {"note": "off"}, True),
+        ("note IN ('it''s on', 'off')", {"note": "it's on"}, True),
+        # an escaped quote does not end the literal, so this AND is not one
+        ("note = 'it''s AND then'", {"note": "it's AND then"}, True),
+        # NOT inverts a predicate, and binds tighter than AND
+        ("NOT enabled", {"enabled": False}, True),
+        ("NOT enabled", {"enabled": True}, False),
+        ("NOT state = 'on'", {"state": "off"}, True),
+        ("NOT state = 'on'", {"state": "on"}, False),
+        ("NOT state IN ('on', 'idle')", {"state": "off"}, True),
+        ("NOT temp BETWEEN 20 AND 30", {"temp": 31}, True),
+        ("NOT isUndefined(x)", {"x": 1}, True),
+        ("NOT isUndefined(x)", {"y": 1}, False),
+        ("NOT(a = 1)", {"a": 2}, True),  # abutting its operand's bracket
+        ("NOT (a = 1 OR b = 2)", {"a": 9, "b": 9}, True),
+        ("NOT (a = 1 OR b = 2)", {"a": 1, "b": 9}, False),
+        ("NOT NOT enabled", {"enabled": True}, True),
+        ("state = 'on' AND NOT temp > 20", {"state": "on", "temp": 5}, True),
+        ("state = 'on' AND NOT temp > 20", {"state": "on", "temp": 25}, False),
+        # NOT of Undefined is Undefined, not true: negating a clause over an
+        # absent attribute still fails closed, as on AWS.
+        ("NOT state = 'on'", {"other": 1}, False),
+        ("NOT enabled", {"state": "on"}, False),
+        ("state = 'on' AND NOT temp > 20", {"state": "on"}, False),
+        # arithmetic operands, multiplicative binding tighter and parentheses
+        # regrouping — all four of these deploy on AWS
+        ("(a + b) > 10", {"a": 6, "b": 5}, True),
+        ("(a + b) > 10", {"a": 6, "b": 3}, False),
+        ("temp * 2 > 10", {"temp": 6}, True),
+        ("temp * 2 > 10", {"temp": 4}, False),
+        ("temp - 2 > 10", {"temp": 13}, True),
+        ("temp / 2 > 10", {"temp": 30}, True),
+        ("temp % 3 = 1", {"temp": 7}, True),
+        ("temp % 3 = 1", {"temp": 6}, False),
+        ("a + b * c > 10", {"a": 1, "b": 3, "c": 4}, True),  # 1 + 12, not 4 * 4
+        ("(a + b) * c > 10", {"a": 1, "b": 3, "c": 2}, False),  # 8, not 1 + 6
+        ("a - b - c = 1", {"a": 5, "b": 3, "c": 1}, True),  # left-associative
+        # a sign is not a binary operator
+        ("temp > -5", {"temp": 1}, True),
+        ("temp * -2 < 0", {"temp": 3}, True),
+        # an Undefined or unconvertible operand makes the whole expression
+        # Undefined, so the comparison over it fails closed
+        ("absent + 1 > 0", {"temp": 1}, False),
+        ("temp + 1 > 0", {"temp": "hot"}, False),
+        # "+" is overloaded: a String operand makes it concatenation
+        ("name + '!' = 'gw!'", {"name": "gw"}, True),
+        # ordering converts a numeric-looking string, as AWS does
+        ("temp > 10", {"temp": "22"}, True),
+        ("temp > 10", {"temp": "hot"}, False),
+        # ...but equality does not: a mismatched pair is simply unequal
+        ("temp = 22", {"temp": "22"}, False),
+        # a keyword may abut a bracket instead of whitespace
+        ("(a = 1)AND(b = 2)", {"a": 1, "b": 2}, True),
+        ("(a = 1)AND(b = 2)", {"a": 1, "b": 3}, False),
+        ("(a = 1)OR(b = 2)", {"a": 9, "b": 2}, True),
+        ("(a = 1)OR(b = 2)", {"a": 9, "b": 9}, False),
+        ("((a = 1)AND(b = 2))OR(c = 3)", {"a": 9, "b": 9, "c": 3}, True),
+    ],
+)
+def test_eval_where_truth_table(pred, payload, expected):
+    from ministack.services.iot import _eval_where, _rule_message
+
+    raw = json.dumps(payload).encode()
+    assert _eval_where(pred, "sensors/a1/telemetry", raw, _rule_message(raw)) is expected
+
+
+def test_eval_where_topic_function():
+    from ministack.services.iot import _eval_where, _rule_message
+
+    raw = b'{"x": 1}'
+    message = _rule_message(raw)
+    assert _eval_where("topic(2) = 'a1'", "sensors/a1/telemetry", raw, message) is True
+    assert _eval_where("topic(2) = 'b7'", "sensors/a1/telemetry", raw, message) is False
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM 'a/b'",
+        "SELECT temp AS t FROM 'a/+/b' WHERE temp > 20",
+        "SELECT * FROM 'a' WHERE state = 'on' AND regexp_matches(serial, '^d')",
+        "SELECT deviceId, temp WHERE temp >= 1.5",  # FROM-less Basic Ingest form
+        "SELECT encode(*, 'base64') AS data FROM 'bin'",
+        # OR and parenthesised groups: real AWS accepts these, so a rule that
+        # deploys on AWS must not be rejected here.
+        "SELECT * FROM 'a' WHERE state = 'on' OR state = 'off'",
+        "SELECT * FROM 'a' WHERE (state = 'on')",
+        "SELECT * FROM 'a' WHERE (state = 'on' OR state = 'off') AND temp > 20",
+        "SELECT * FROM 'a' WHERE ((a = 1 OR b = 2) AND (c = 3 OR d = 4)) OR e = 5",
+        # ...and the rest of the WHERE grammar real AWS accepts. A working local
+        # setup must not turn into a hard CreateTopicRule 400 here.
+        "SELECT * FROM 'a' WHERE state IN ('on', 'idle')",
+        "SELECT * FROM 'a' WHERE state IN('on')",
+        "SELECT * FROM 'a' WHERE state NOT IN ('on')",
+        "SELECT * FROM 'a' WHERE state LIKE 'on%'",
+        "SELECT * FROM 'a' WHERE state NOT LIKE 'on%'",
+        "SELECT * FROM 'a' WHERE temp BETWEEN 1 AND 5",
+        "SELECT * FROM 'a' WHERE temp BETWEEN 1 AND 5 AND state = 'on'",
+        "SELECT * FROM 'a' WHERE nickname IS NULL",
+        "SELECT * FROM 'a' WHERE nickname IS NOT NULL",
+        "SELECT * FROM 'a' WHERE isUndefined(state)",
+        "SELECT * FROM 'a' WHERE enabled",  # a bare boolean attribute
+        "SELECT * FROM 'a' WHERE note = 'it''s on'",  # escaped quote
+        "SELECT * FROM 'a' WHERE (a = 1)AND(b = 2)",  # no space around the keyword
+        # NOT and arithmetic: all of these create a working rule on real AWS, so
+        # rejecting them here would fail a stack that deploys.
+        "SELECT * FROM 'a' WHERE NOT enabled",
+        "SELECT * FROM 'a' WHERE NOT state = 'on'",
+        "SELECT * FROM 'a' WHERE NOT(state = 'on')",
+        "SELECT * FROM 'a' WHERE state = 'on' AND NOT temp > 20",
+        "SELECT * FROM 'a' WHERE NOT state IN ('on', 'idle')",
+        "SELECT * FROM 'a' WHERE (a + b) > 10",
+        "SELECT * FROM 'a' WHERE temp * 2 > 10",
+        "SELECT * FROM 'a' WHERE temp - 2 > 10",
+        "SELECT * FROM 'a' WHERE temp / 2 > 10",
+        "SELECT * FROM 'a' WHERE id % 2 = 0",
+        "SELECT * FROM 'a' WHERE a + b * c > 10",
+        "SELECT * FROM 'a' WHERE temp > -5",
+        # A call this evaluator does not implement is still accepted: AWS's
+        # function library is larger, and rejecting it would fail a stack that
+        # deploys on AWS. put_topic_rule warns instead.
+        "SELECT * FROM 'a' WHERE bogus_fn(x) = 1",
+        "SELECT get_thing_shadow('t') AS s FROM 'a'",
+    ],
+)
+def test_validate_rule_sql_accepts_supported_grammar(sql):
+    from ministack.services.iot import _validate_rule_sql
+
+    assert _validate_rule_sql(sql) is None
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "this is not sql",
+        "",
+        "SELECT * FROM topic_without_quotes",
+        "SELECT * FROM 'a' WHERE regexp_matches(serial, '[unbalanced')",
+        "SELECT * FROM 'a' WHERE 42",  # a literal is not a predicate
+        "SELECT * FROM 'a' WHERE state LIKE on",  # LIKE needs a quoted pattern
+        "SELECT * FROM 'a' WHERE state IN 'on'",  # ...and IN a bracketed list
+        "SELECT * FROM 'a' WHERE state IN ()",
+        "SELECT * FROM 'a' WHERE temp BETWEEN 1",  # BETWEEN needs both bounds
+        "SELECT * FROM 'a' WHERE nickname IS EMPTY",
+        "SELECT * FROM 'a' WHERE note = 'unterminated",
+        # unbalanced parentheses stay a parse error rather than being guessed at
+        "SELECT * FROM 'a' WHERE (state = 'on'",
+        "SELECT * FROM 'a' WHERE state = 'on')",
+        "SELECT * FROM 'a' WHERE (state = 'on' AND (temp > 20)",
+        "SELECT * FROM 'a' WHERE ()",
+        # an empty operand around a keyword is not a predicate
+        "SELECT * FROM 'a' WHERE state = 'on' OR",
+        "SELECT * FROM 'a' WHERE OR state = 'on'",
+        "SELECT * FROM 'a' WHERE state = 'on' AND",
+        "SELECT * FROM 'a' WHERE NOT",  # NOT needs a predicate to invert
+        "SELECT * FROM 'a' WHERE temp * > 10",  # ...and an operator two operands
+        "SELECT * FROM 'a' WHERE temp * 2 +",
+    ],
+)
+def test_validate_rule_sql_rejects_unparseable(sql):
+    from ministack.services.iot import _validate_rule_sql
+
+    assert _validate_rule_sql(sql) is not None
+
+
+def test_put_topic_rule_rejects_unevaluable_sql():
+    """Enforcement lives in `put_topic_rule`, so every door into the store — the
+    IoT API and the CloudFormation provisioner alike — is covered by one check."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    try:
+        with pytest.raises(iot_module.RuleSqlError):
+            iot_module.put_topic_rule(
+                "bad_rule", {"sql": "SELECT * FROM 'a' WHERE (state = 'on'"}
+            )
+        assert iot_module._topic_rules.get("bad_rule") is None
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+def test_put_topic_rule_warns_for_unimplemented_sql_function(caplog):
+    """AWS's function library is larger than this evaluator's, so a call it does
+    not implement is stored rather than failing a stack that deploys on AWS —
+    but it warns, because the rule will silently never match on it."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    try:
+        with caplog.at_level(logging.WARNING, logger="iot"):
+            iot_module.put_topic_rule(
+                "fn_rule", {"sql": "SELECT * FROM 'a' WHERE bogus_fn(x) = 1"}
+            )
+        assert iot_module._topic_rules.get("fn_rule") is not None
+        assert any("bogus_fn()" in r.message for r in caplog.records)
+        # A function it does implement says nothing.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="iot"):
+            iot_module.put_topic_rule(
+                "ok_rule", {"sql": "SELECT * FROM 'a' WHERE topic(2) = 'x'"}
+            )
+        assert not caplog.records
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM 'a' WHERE (state = 'on')",
+        "SELECT * FROM 'a' WHERE (a = 1) AND (b = 2)",
+        "SELECT * FROM 'a' WHERE state IN ('on', 'idle')",
+        "SELECT * FROM 'a' WHERE state NOT IN ('on')",
+        "SELECT * FROM 'a' WHERE NOT (a = 1)",
+        "SELECT * FROM 'a' WHERE temp BETWEEN 1 AND (2 + 3)",
+    ],
+)
+def test_put_topic_rule_does_not_mistake_a_keyword_for_a_function(caplog, sql):
+    """A SQL keyword may sit in front of a bracket without opening a call.
+
+    Scanning for `<name>(` alone read `WHERE (`, `IN (` and `AND (` as calls and
+    warned about a missing where()/in()/and() — noise on perfectly ordinary
+    rules, and exactly the kind that trains people to ignore the warning that
+    matters.
+    """
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    try:
+        with caplog.at_level(logging.WARNING, logger="iot"):
+            iot_module.put_topic_rule("kw_rule", {"sql": sql})
+        assert not caplog.records
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+def test_reset_clears_the_sql_function_warning_ledger():
+    """`_warned_sql_funcs` makes the unimplemented-function warning fire once
+    per name, so it is module state the service reset has to clear — otherwise
+    the second test to store the same rule silently gets no warning."""
+    from ministack.services import iot as iot_module
+
+    try:
+        iot_module._warn_unimplemented_sql_function("get_thing_shadow")
+        assert iot_module._warned_sql_funcs
+        iot_module.reset()
+        assert not iot_module._warned_sql_funcs
+    finally:
+        iot_module.reset()
+
+
+def test_like_and_regexp_matches_convert_operands_alike():
+    """The two string operators take the same operand policy.
+
+    They used to disagree — `regexp_matches` coerced with str() while LIKE
+    demanded a Python string — so the same Int payload matched one and not the
+    other. Both now run AWS's documented "to String" conversion, which renders
+    an Int and a Boolean (lowercase, as JSON does) and leaves Null Undefined.
+    """
+    from ministack.services.iot import _eval_where, _rule_message
+
+    def both(attr, payload):
+        raw = json.dumps(payload).encode()
+        message = _rule_message(raw)
+        return (
+            _eval_where(f"{attr} LIKE '2%'", "a/b", raw, message),
+            _eval_where(f"regexp_matches({attr}, '^2')", "a/b", raw, message),
+        )
+
+    assert both("temp", {"temp": 22}) == (True, True)
+    assert both("temp", {"temp": "22"}) == (True, True)
+    assert both("temp", {"temp": 22.5}) == (True, True)
+    assert both("temp", {"temp": 31}) == (False, False)
+    assert both("temp", {"temp": None}) == (False, False)
+    assert both("temp", {"other": 1}) == (False, False)
+
+
+def test_eval_where_warns_when_a_stored_predicate_cannot_be_parsed(caplog):
+    """Validation keeps these out of the store, but state restored from an older
+    MiniStack can carry one — it must be loud, not a silent non-match."""
+    from ministack.services.iot import _eval_where, _rule_message
+
+    raw = b'{"state": "on"}'
+    with caplog.at_level(logging.WARNING, logger="iot_broker"):
+        assert _eval_where("(state = 'on'", "a/b", raw, _rule_message(raw)) is False
+    assert any("cannot be parsed" in r.message for r in caplog.records)
+
+
+def test_run_rule_actions_where_gates_dispatch(monkeypatch):
+    """A WHERE-carrying rule dispatches only the matching publishes."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    iot_module._topic_rules.set_scoped(
+        account_id,
+        _TEST_REGION,
+        "gated_rule",
+        {
+            "ruleName": "gated_rule",
+            "sql": "SELECT * FROM 'sensors/#' WHERE state = 'on'",
+            "ruleDisabled": False,
+            "actions": [{"lambda": {"functionArn": "arn:aws:lambda:us-east-1:123456789012:function:sink"}}],
+        },
+    )
+    dispatched = []
+    monkeypatch.setattr(
+        iot_module,
+        "_dispatch_rule_to_lambda",
+        lambda account, region, arn, event: dispatched.append(event),
+    )
+
+    async def _run():
+        await publish(account_id, "sensors/door", b'{"state": "on", "n": 1}')
+        await publish(account_id, "sensors/door", b'{"state": "off", "n": 2}')
+        await publish(account_id, "sensors/door", b'{"n": 3}')  # attribute missing
+
+    try:
+        asyncio.run(_run())
+        assert dispatched == [{"state": "on", "n": 1}]
+    finally:
+        iot_module._topic_rules.clear()
+        reset()

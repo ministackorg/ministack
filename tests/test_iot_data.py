@@ -794,4 +794,111 @@ def test_iot_rule_attribute_projection(iot_client, iot_data_client, lam, sqs):
     )
     assert _poll_sink(sqs, sink) == {"id": "d1", "device": "a1"}
 
+
+def test_iot_rule_where_clause_gates_dispatch(iot_client, iot_data_client, lam, sqs):
+    """Only publishes satisfying the WHERE predicate reach the rule's actions."""
+    sink = sqs.create_queue(QueueName=_unique("where-sink"))["QueueUrl"]
+    fn_arn = _make_sink_lambda(lam, sink)
+    rule = _unique("gated").replace("-", "_")
+    iot_client.create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": "SELECT * FROM 'alarms/+/state' WHERE severity = 'high' AND count > 1",
+            "actions": [{"lambda": {"functionArn": fn_arn}}],
+        },
+    )
+
+    # Non-matching: predicate false, then attribute missing entirely.
+    iot_data_client.publish(
+        topic="alarms/a1/state",
+        payload=json.dumps({"severity": "low", "count": 5}).encode(),
+    )
+    iot_data_client.publish(
+        topic="alarms/a1/state", payload=json.dumps({"count": 5}).encode()
+    )
+    # Matching.
+    iot_data_client.publish(
+        topic="alarms/a1/state",
+        payload=json.dumps({"severity": "high", "count": 2, "id": "x"}).encode(),
+    )
+
+    event = _poll_sink(sqs, sink)
+    assert event == {"severity": "high", "count": 2, "id": "x"}
+    # No further deliveries — the non-matching publishes never dispatched.
+    assert _poll_sink(sqs, sink, timeout=3) is None
+
+    iot_client.delete_topic_rule(ruleName=rule)
+
+
+def test_iot_rule_where_topic_function_under_basic_ingest(
+    iot_client, iot_data_client, lam, sqs
+):
+    """Under Basic Ingest a WHERE reading `topic(n)` sees the topic *after* the
+    `$aws/rules/<name>/` prefix, so the same predicate gates both publish paths."""
+    sink = sqs.create_queue(QueueName=_unique("bi-where-sink"))["QueueUrl"]
+    fn_arn = _make_sink_lambda(lam, sink)
+    rule = _unique("biwhere").replace("-", "_")
+    iot_client.create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            # The FROM filter is bypassed by Basic Ingest; the WHERE is not.
+            "sql": "SELECT * FROM 'unused' WHERE topic(2) = 'a1'",
+            "actions": [{"lambda": {"functionArn": fn_arn}}],
+        },
+    )
+
+    # topic() reports 'sensors/b7/telemetry' here — topic(2) is 'b7', so the
+    # predicate is false and nothing dispatches.
+    iot_data_client.publish(
+        topic=f"$aws/rules/{rule}/sensors/b7/telemetry",
+        payload=json.dumps({"temp": 1}).encode(),
+    )
+    # ...and 'a1' for this one, which matches. If the prefix were not stripped,
+    # topic(2) would be 'rules' for both and neither would dispatch.
+    iot_data_client.publish(
+        topic=f"$aws/rules/{rule}/sensors/a1/telemetry",
+        payload=json.dumps({"temp": 2}).encode(),
+    )
+
+    assert _poll_sink(sqs, sink) == {"temp": 2}
+    assert _poll_sink(sqs, sink, timeout=3) is None
+
+    iot_client.delete_topic_rule(ruleName=rule)
+
+
+def test_iot_rule_where_or_clause_dispatches_either_branch(
+    iot_client, iot_data_client, lam, sqs
+):
+    """An `OR` predicate fires for either branch and stays closed otherwise."""
+    sink = sqs.create_queue(QueueName=_unique("or-where-sink"))["QueueUrl"]
+    fn_arn = _make_sink_lambda(lam, sink)
+    rule = _unique("orwhere").replace("-", "_")
+    iot_client.create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": "SELECT * FROM 'alarms/+/state' "
+                   "WHERE (severity = 'high' OR severity = 'critical') AND count > 1",
+            "actions": [{"lambda": {"functionArn": fn_arn}}],
+        },
+    )
+
+    # Neither OR branch holds.
+    iot_data_client.publish(
+        topic="alarms/a1/state",
+        payload=json.dumps({"severity": "low", "count": 5}).encode(),
+    )
+    # A branch holds but the AND-ed clause does not.
+    iot_data_client.publish(
+        topic="alarms/a1/state",
+        payload=json.dumps({"severity": "critical", "count": 1}).encode(),
+    )
+    # Second OR branch + the AND-ed clause: dispatches.
+    iot_data_client.publish(
+        topic="alarms/a1/state",
+        payload=json.dumps({"severity": "critical", "count": 4, "id": "y"}).encode(),
+    )
+
+    assert _poll_sink(sqs, sink) == {"severity": "critical", "count": 4, "id": "y"}
+    assert _poll_sink(sqs, sink, timeout=3) is None
+
     iot_client.delete_topic_rule(ruleName=rule)
