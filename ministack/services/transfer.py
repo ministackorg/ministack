@@ -59,16 +59,18 @@ logger = logging.getLogger("transfer")
 # guarded so that a base install with the transfer service still works for
 # the control plane (CreateServer / DescribeServer / etc.) even when the
 # SFTP listener isn't available.
-try:
-    import asyncssh
-    from asyncssh.sftp import SFTPAttrs, SFTPName
+import importlib.util as _importlib_util
 
-    _ASYNCSSH_AVAILABLE = True
-except Exception:  # noqa: BLE001 — any import failure means no SFTP
-    asyncssh = None  # type: ignore[assignment]
-    SFTPAttrs = None  # type: ignore[assignment]
-    SFTPName = None  # type: ignore[assignment]
-    _ASYNCSSH_AVAILABLE = False
+# asyncssh (+ its cryptography/OpenSSL bindings) is imported lazily by
+# _ensure_sftp_runtime() the first time the SFTP listener actually starts, so
+# importing this module for the control plane / persistence does not pull it
+# into the boot path. `find_spec` checks availability without importing.
+asyncssh = None  # type: ignore[assignment]
+SFTPAttrs = None  # type: ignore[assignment]
+SFTPName = None  # type: ignore[assignment]
+_ASYNCSSH_AVAILABLE = _importlib_util.find_spec("asyncssh") is not None
+_MiniStackSSHServer = None  # type: ignore[assignment]  built by _ensure_sftp_runtime()
+_MiniStackSFTPServer = None  # type: ignore[assignment]
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
@@ -784,419 +786,433 @@ def _sftp_build_server_factory(restrict_to_server_id: Optional[str] = None):
     return _factory
 
 
-class _MiniStackSSHServer(asyncssh.SSHServer if _ASYNCSSH_AVAILABLE else object):
-    """SSH-side auth callback. Resolves the (account, region, server, user)
-    tuple from the presented public key and stashes it on the connection so
-    the SFTP layer can read it back.
+def _ensure_sftp_runtime() -> None:
+    """Import asyncssh and build the SSH/SFTP server classes on first use.
 
-    Subclassing :class:`asyncssh.SSHServer` (rather than just duck-typing
-    the relevant methods) is required because asyncssh probes a wide set
-    of optional auth methods (host-based, kbdint, GSSAPI) on the server
-    instance during userauth negotiation; the default base-class
-    implementations return ``False`` for everything we don't support.
+    Deferred so importing this module (control plane, persistence, get_state)
+    does not pull asyncssh + cryptography/OpenSSL at boot; only starting the
+    SFTP listener pays that cost.
     """
+    global asyncssh, SFTPAttrs, SFTPName, _MiniStackSSHServer, _MiniStackSFTPServer
+    if _MiniStackSFTPServer is not None:
+        return
+    import asyncssh as _mod
+    from asyncssh.sftp import SFTPAttrs as _A, SFTPName as _N
+    asyncssh, SFTPAttrs, SFTPName = _mod, _A, _N
 
-    def __init__(self, restrict_to_server_id: Optional[str] = None):
-        super().__init__() if _ASYNCSSH_AVAILABLE else None
-        self._restrict_to_server_id = restrict_to_server_id
-        self._resolved = None
-        self._username = None
-        self._conn = None
+    class _MiniStackSSHServer(asyncssh.SSHServer if _ASYNCSSH_AVAILABLE else object):
+        """SSH-side auth callback. Resolves the (account, region, server, user)
+        tuple from the presented public key and stashes it on the connection so
+        the SFTP layer can read it back.
 
-    def connection_made(self, conn):
-        self._conn = conn
-
-    def connection_lost(self, exc):
-        pass
-
-    def begin_auth(self, username):
-        # True → continue to public-key validation. False would mean "no
-        # auth needed", which we never want.
-        self._username = username
-        return True
-
-    def password_auth_supported(self):
-        return False
-
-    def public_key_auth_supported(self):
-        return True
-
-    def validate_public_key(self, username, key):
-        """Called by asyncssh for each presented public key. Returns True
-        if the key is registered for this username on some Transfer server.
-
-        We export the key in OpenSSH format and string-compare against the
-        body stored via `ImportSshPublicKey`. This is deliberately stricter
-        than fingerprint comparison — same key body, exact match.
+        Subclassing :class:`asyncssh.SSHServer` (rather than just duck-typing
+        the relevant methods) is required because asyncssh probes a wide set
+        of optional auth methods (host-based, kbdint, GSSAPI) on the server
+        instance during userauth negotiation; the default base-class
+        implementations return ``False`` for everything we don't support.
         """
-        try:
-            presented_body = key.export_public_key("openssh").decode("utf-8")
-        except Exception as e:
-            logger.debug("SFTP: failed to export presented key: %s", e)
+
+        def __init__(self, restrict_to_server_id: Optional[str] = None):
+            super().__init__() if _ASYNCSSH_AVAILABLE else None
+            self._restrict_to_server_id = restrict_to_server_id
+            self._resolved = None
+            self._username = None
+            self._conn = None
+
+        def connection_made(self, conn):
+            self._conn = conn
+
+        def connection_lost(self, exc):
+            pass
+
+        def begin_auth(self, username):
+            # True → continue to public-key validation. False would mean "no
+            # auth needed", which we never want.
+            self._username = username
+            return True
+
+        def password_auth_supported(self):
             return False
 
-        match = _sftp_resolve_user_by_key(username, presented_body)
-        if not match:
-            return False
+        def public_key_auth_supported(self):
+            return True
 
-        account_id, region, server_id, user = match
-        if self._restrict_to_server_id and server_id != self._restrict_to_server_id:
-            return False
-        if _sftp_server_state(account_id, region, server_id) != "ONLINE":
-            return False
+        def validate_public_key(self, username, key):
+            """Called by asyncssh for each presented public key. Returns True
+            if the key is registered for this username on some Transfer server.
 
-        self._resolved = (account_id, region, server_id, user)
-        if self._conn is not None:
-            self._conn.set_extra_info(ministack_user=user)
-            self._conn.set_extra_info(ministack_server_id=server_id)
-            self._conn.set_extra_info(ministack_account_id=account_id)
-            self._conn.set_extra_info(ministack_region=region)
-        return True
+            We export the key in OpenSSH format and string-compare against the
+            body stored via `ImportSshPublicKey`. This is deliberately stricter
+            than fingerprint comparison — same key body, exact match.
+            """
+            try:
+                presented_body = key.export_public_key("openssh").decode("utf-8")
+            except Exception as e:
+                logger.debug("SFTP: failed to export presented key: %s", e)
+                return False
+
+            match = _sftp_resolve_user_by_key(username, presented_body)
+            if not match:
+                return False
+
+            account_id, region, server_id, user = match
+            if self._restrict_to_server_id and server_id != self._restrict_to_server_id:
+                return False
+            if _sftp_server_state(account_id, region, server_id) != "ONLINE":
+                return False
+
+            self._resolved = (account_id, region, server_id, user)
+            if self._conn is not None:
+                self._conn.set_extra_info(ministack_user=user)
+                self._conn.set_extra_info(ministack_server_id=server_id)
+                self._conn.set_extra_info(ministack_account_id=account_id)
+                self._conn.set_extra_info(ministack_region=region)
+            return True
 
 
-class _MiniStackSFTPServer(asyncssh.SFTPServer if _ASYNCSSH_AVAILABLE else object):
-    """SFTP filesystem backed by MiniStack's in-memory S3 state.
+    class _MiniStackSFTPServer(asyncssh.SFTPServer if _ASYNCSSH_AVAILABLE else object):
+        """SFTP filesystem backed by MiniStack's in-memory S3 state.
 
-    asyncssh instantiates this per session, passing the SSH channel so we
-    can recover the auth metadata stashed by `_MiniStackSSHServer`.
+        asyncssh instantiates this per session, passing the SSH channel so we
+        can recover the auth metadata stashed by `_MiniStackSSHServer`.
 
-    Subclassing :class:`asyncssh.SFTPServer` (rather than duck-typing) is
-    required so unsupported file ops (statvfs, link, etc.) inherit the
-    base implementations that politely return SSH_FX_OP_UNSUPPORTED to
-    the client instead of crashing the session.
-    """
+        Subclassing :class:`asyncssh.SFTPServer` (rather than duck-typing) is
+        required so unsupported file ops (statvfs, link, etc.) inherit the
+        base implementations that politely return SSH_FX_OP_UNSUPPORTED to
+        the client instead of crashing the session.
+        """
 
-    def __init__(self, chan, restrict_to_server_id: Optional[str] = None):
-        if _ASYNCSSH_AVAILABLE:
-            super().__init__(chan)
-        self._chan = chan
-        self._restrict_to_server_id = restrict_to_server_id
-        # asyncssh's SSHServerChannel exposes the parent connection via
-        # ``get_connection``; older versions expose it as ``_conn``.
-        conn = None
-        if hasattr(chan, "get_connection"):
-            conn = chan.get_connection()
-        elif hasattr(chan, "_conn"):
-            conn = chan._conn
-        self._user = conn.get_extra_info("ministack_user") if conn else None
-        self._account_id = conn.get_extra_info("ministack_account_id") if conn else None
-        self._region = conn.get_extra_info("ministack_region") if conn else None
-        self._server_id = conn.get_extra_info("ministack_server_id") if conn else None
-        # Open-file map. Reads use BytesIO over the existing object body;
-        # writes accumulate into a BytesIO that we PUT on close.
-        self._open_files: dict = {}
-        self._next_handle = 1
+        def __init__(self, chan, restrict_to_server_id: Optional[str] = None):
+            if _ASYNCSSH_AVAILABLE:
+                super().__init__(chan)
+            self._chan = chan
+            self._restrict_to_server_id = restrict_to_server_id
+            # asyncssh's SSHServerChannel exposes the parent connection via
+            # ``get_connection``; older versions expose it as ``_conn``.
+            conn = None
+            if hasattr(chan, "get_connection"):
+                conn = chan.get_connection()
+            elif hasattr(chan, "_conn"):
+                conn = chan._conn
+            self._user = conn.get_extra_info("ministack_user") if conn else None
+            self._account_id = conn.get_extra_info("ministack_account_id") if conn else None
+            self._region = conn.get_extra_info("ministack_region") if conn else None
+            self._server_id = conn.get_extra_info("ministack_server_id") if conn else None
+            # Open-file map. Reads use BytesIO over the existing object body;
+            # writes accumulate into a BytesIO that we PUT on close.
+            self._open_files: dict = {}
+            self._next_handle = 1
 
-    def _resolve(self, path):
-        """bytes path → (bucket, key) for the currently authenticated user,
-        within their account context."""
-        from ministack.core.responses import set_request_account_id, set_request_region
+        def _resolve(self, path):
+            """bytes path → (bucket, key) for the currently authenticated user,
+            within their account context."""
+            from ministack.core.responses import set_request_account_id, set_request_region
 
-        if self._account_id:
-            set_request_account_id(self._account_id)
-        if self._region:
-            set_request_region(self._region)
-        virtual = path.decode("utf-8", errors="replace") if isinstance(path, bytes) else path
-        return _sftp_resolve_s3_target(self._user or {}, virtual)
-
-    @staticmethod
-    def _attrs_for_file(size, mtime):
-        a = SFTPAttrs()
-        a.type = 1  # SSH_FILEXFER_TYPE_REGULAR
-        a.size = size
-        a.uid = 0
-        a.gid = 0
-        a.permissions = 0o100644
-        a.atime = mtime
-        a.mtime = mtime
-        return a
-
-    @staticmethod
-    def _attrs_for_dir(mtime):
-        a = SFTPAttrs()
-        a.type = 2  # SSH_FILEXFER_TYPE_DIRECTORY
-        a.size = 0
-        a.uid = 0
-        a.gid = 0
-        a.permissions = 0o040755
-        a.atime = mtime
-        a.mtime = mtime
-        return a
-
-    # ---- path / metadata ops --------------------------------------------
-
-    def realpath(self, path):
-        virtual = path.decode("utf-8", errors="replace")
-        return _sftp_normalize_virtual_path(virtual).encode("utf-8")
-
-    def stat(self, path):
-        bucket, key = self._resolve(path)
-        if not bucket:
-            return self._attrs_for_dir(int(time.time()))
-        obj = _sftp_s3_get_object(self._account_id, bucket, key)
-        if obj:
-            return self._attrs_for_file(obj.get("size", 0), int(time.time()))
-        prefix = key.rstrip("/") + "/" if key else ""
-        for _ in _sftp_s3_list_keys(self._account_id, bucket, prefix):
-            return self._attrs_for_dir(int(time.time()))
-        if _sftp_s3_bucket(self._account_id, bucket) is None:
-            raise asyncssh.SFTPNoSuchFile(f"No such bucket: {bucket}")
-        raise asyncssh.SFTPNoSuchFile(f"No such file: {path!r}")
-
-    def lstat(self, path):
-        return self.stat(path)
-
-    def fstat(self, file_obj):
-        h = self._open_files.get(file_obj)
-        if not h:
-            raise asyncssh.SFTPFailure("Bad file handle")
-        size = h["size"] if h["mode"] == "read" else len(h["buf"].getvalue())
-        return self._attrs_for_file(size, h.get("mtime", int(time.time())))
-
-    def setstat(self, path, attrs):
-        # No-op so `sftp -p` and rsync don't fail on the mode/time copy.
-        return None
-
-    def fsetstat(self, file_obj, attrs):
-        return None
-
-    def lsetstat(self, path, attrs):
-        return None
-
-    # ---- directory ops ---------------------------------------------------
-
-    async def scandir(self, path):
-        bucket, key = self._resolve(path)
-        seen_names: set = set()
-
-        for special in (".", ".."):
-            attrs = self._attrs_for_dir(int(time.time()))
-            yield SFTPName(
-                filename=special.encode("utf-8"),
-                longname=self._format_longname(special, attrs).encode("utf-8"),
-                attrs=attrs,
-            )
-
-        if not bucket:
+            if self._account_id:
+                set_request_account_id(self._account_id)
+            if self._region:
+                set_request_region(self._region)
             virtual = path.decode("utf-8", errors="replace") if isinstance(path, bytes) else path
-            virtual = _sftp_normalize_virtual_path(virtual)
-            sub_entries: set = set()
-            for mapping in (self._user or {}).get("HomeDirectoryMappings", []) or []:
-                entry = _sftp_normalize_virtual_path(mapping.get("Entry", "/"))
-                if entry == virtual:
-                    continue
-                if entry.startswith(virtual.rstrip("/") + "/") or virtual == "/":
-                    suffix = entry[len(virtual.rstrip("/")) + 1:].split("/")[0]
-                    if suffix:
-                        sub_entries.add(suffix)
-            for name in sorted(sub_entries):
-                if name in seen_names:
-                    continue
-                seen_names.add(name)
-                attrs = self._attrs_for_dir(int(time.time()))
-                yield SFTPName(
-                    filename=name.encode("utf-8"),
-                    longname=self._format_longname(name, attrs).encode("utf-8"),
-                    attrs=attrs,
-                )
-            return
+            return _sftp_resolve_s3_target(self._user or {}, virtual)
 
-        prefix = key.rstrip("/") + "/" if key else ""
-        b = _sftp_s3_bucket(self._account_id, bucket)
-        if b is None:
-            return
+        @staticmethod
+        def _attrs_for_file(size, mtime):
+            a = SFTPAttrs()
+            a.type = 1  # SSH_FILEXFER_TYPE_REGULAR
+            a.size = size
+            a.uid = 0
+            a.gid = 0
+            a.permissions = 0o100644
+            a.atime = mtime
+            a.mtime = mtime
+            return a
 
-        for full_key in sorted(b.get("objects", {}).keys()):
-            if not full_key.startswith(prefix):
-                continue
-            remainder = full_key[len(prefix):]
-            if not remainder:
-                continue
-            head, sep, _ = remainder.partition("/")
-            if sep:
-                if head in seen_names:
-                    continue
-                seen_names.add(head)
-                attrs = self._attrs_for_dir(int(time.time()))
-                yield SFTPName(
-                    filename=head.encode("utf-8"),
-                    longname=self._format_longname(head, attrs).encode("utf-8"),
-                    attrs=attrs,
-                )
-            else:
-                if head in seen_names:
-                    continue
-                seen_names.add(head)
-                obj = b["objects"][full_key]
-                attrs = self._attrs_for_file(obj.get("size", 0), int(time.time()))
-                yield SFTPName(
-                    filename=head.encode("utf-8"),
-                    longname=self._format_longname(head, attrs).encode("utf-8"),
-                    attrs=attrs,
-                )
+        @staticmethod
+        def _attrs_for_dir(mtime):
+            a = SFTPAttrs()
+            a.type = 2  # SSH_FILEXFER_TYPE_DIRECTORY
+            a.size = 0
+            a.uid = 0
+            a.gid = 0
+            a.permissions = 0o040755
+            a.atime = mtime
+            a.mtime = mtime
+            return a
 
-    def _format_longname(self, name, attrs) -> str:
-        """ls-l-style line for asyncssh's longname field."""
-        is_dir = attrs.type == 2
-        mode_str = "drwxr-xr-x" if is_dir else "-rw-r--r--"
-        size = attrs.size or 0
-        mtime = attrs.mtime or int(time.time())
-        ts = time.strftime("%b %d %H:%M", time.localtime(mtime))
-        return f"{mode_str} 1 ministack ministack {size:>10d} {ts} {name}"
+        # ---- path / metadata ops --------------------------------------------
 
-    def mkdir(self, path, attrs):
-        bucket, key = self._resolve(path)
-        if not bucket:
-            raise asyncssh.SFTPFailure("Cannot create directory above bucket level")
-        if not key:
-            return None
-        placeholder_key = key.rstrip("/") + "/"
-        _sftp_s3_put_object(self._account_id, bucket, placeholder_key, b"")
-        return None
+        def realpath(self, path):
+            virtual = path.decode("utf-8", errors="replace")
+            return _sftp_normalize_virtual_path(virtual).encode("utf-8")
 
-    def rmdir(self, path):
-        bucket, key = self._resolve(path)
-        if not bucket or not key:
-            raise asyncssh.SFTPFailure("Cannot remove bucket root via SFTP")
-        prefix = key.rstrip("/") + "/"
-        children = [k for k in _sftp_s3_list_keys(self._account_id, bucket, prefix) if k != prefix]
-        if children:
-            raise asyncssh.SFTPFailure(f"Directory not empty: {path!r}")
-        _sftp_s3_delete_object(self._account_id, bucket, prefix)
-        return None
-
-    def remove(self, path):
-        bucket, key = self._resolve(path)
-        if not bucket or not key:
-            raise asyncssh.SFTPNoSuchFile(f"Cannot remove {path!r}")
-        if not _sftp_s3_delete_object(self._account_id, bucket, key):
+        def stat(self, path):
+            bucket, key = self._resolve(path)
+            if not bucket:
+                return self._attrs_for_dir(int(time.time()))
+            obj = _sftp_s3_get_object(self._account_id, bucket, key)
+            if obj:
+                return self._attrs_for_file(obj.get("size", 0), int(time.time()))
+            prefix = key.rstrip("/") + "/" if key else ""
+            for _ in _sftp_s3_list_keys(self._account_id, bucket, prefix):
+                return self._attrs_for_dir(int(time.time()))
+            if _sftp_s3_bucket(self._account_id, bucket) is None:
+                raise asyncssh.SFTPNoSuchFile(f"No such bucket: {bucket}")
             raise asyncssh.SFTPNoSuchFile(f"No such file: {path!r}")
-        return None
 
-    def rename(self, oldpath, newpath):
-        return self._do_rename(oldpath, newpath, allow_overwrite=False)
+        def lstat(self, path):
+            return self.stat(path)
 
-    def posix_rename(self, oldpath, newpath):
-        return self._do_rename(oldpath, newpath, allow_overwrite=True)
+        def fstat(self, file_obj):
+            h = self._open_files.get(file_obj)
+            if not h:
+                raise asyncssh.SFTPFailure("Bad file handle")
+            size = h["size"] if h["mode"] == "read" else len(h["buf"].getvalue())
+            return self._attrs_for_file(size, h.get("mtime", int(time.time())))
 
-    def _do_rename(self, oldpath, newpath, *, allow_overwrite: bool):
-        src_bucket, src_key = self._resolve(oldpath)
-        dst_bucket, dst_key = self._resolve(newpath)
-        if not src_bucket or not src_key:
-            raise asyncssh.SFTPNoSuchFile(f"No such file: {oldpath!r}")
-        src_obj = _sftp_s3_get_object(self._account_id, src_bucket, src_key)
-        if src_obj is None:
-            raise asyncssh.SFTPNoSuchFile(f"No such file: {oldpath!r}")
-        if not dst_bucket:
-            raise asyncssh.SFTPFailure("Cannot rename above bucket level")
-        if not allow_overwrite and _sftp_s3_get_object(self._account_id, dst_bucket, dst_key):
-            raise asyncssh.SFTPFailure(f"Destination exists: {newpath!r}")
-        # S3 has no atomic rename — copy + delete.
-        _sftp_s3_put_object(self._account_id, dst_bucket, dst_key, src_obj.get("body", b""))
-        _sftp_s3_delete_object(self._account_id, src_bucket, src_key)
-        return None
+        def setstat(self, path, attrs):
+            # No-op so `sftp -p` and rsync don't fail on the mode/time copy.
+            return None
 
-    # ---- file ops --------------------------------------------------------
+        def fsetstat(self, file_obj, attrs):
+            return None
 
-    def open(self, path, pflags, attrs):
-        # asyncssh masks: SSH_FXF_READ=0x01, SSH_FXF_WRITE=0x02,
-        # SSH_FXF_APPEND=0x04, SSH_FXF_CREAT=0x08, SSH_FXF_TRUNC=0x10,
-        # SSH_FXF_EXCL=0x20.
-        bucket, key = self._resolve(path)
-        if not bucket or not key:
-            raise asyncssh.SFTPFailure("Open requires bucket+key")
+        def lsetstat(self, path, attrs):
+            return None
 
-        wants_write = bool(pflags & 0x02)
-        wants_create = bool(pflags & 0x08)
-        wants_truncate = bool(pflags & 0x10)
-        wants_excl = bool(pflags & 0x20)
+        # ---- directory ops ---------------------------------------------------
 
-        existing = _sftp_s3_get_object(self._account_id, bucket, key)
+        async def scandir(self, path):
+            bucket, key = self._resolve(path)
+            seen_names: set = set()
 
-        if wants_write:
-            if existing and wants_excl:
-                raise asyncssh.SFTPFailure(f"File exists: {path!r}")
-            if not existing and not wants_create:
+            for special in (".", ".."):
+                attrs = self._attrs_for_dir(int(time.time()))
+                yield SFTPName(
+                    filename=special.encode("utf-8"),
+                    longname=self._format_longname(special, attrs).encode("utf-8"),
+                    attrs=attrs,
+                )
+
+            if not bucket:
+                virtual = path.decode("utf-8", errors="replace") if isinstance(path, bytes) else path
+                virtual = _sftp_normalize_virtual_path(virtual)
+                sub_entries: set = set()
+                for mapping in (self._user or {}).get("HomeDirectoryMappings", []) or []:
+                    entry = _sftp_normalize_virtual_path(mapping.get("Entry", "/"))
+                    if entry == virtual:
+                        continue
+                    if entry.startswith(virtual.rstrip("/") + "/") or virtual == "/":
+                        suffix = entry[len(virtual.rstrip("/")) + 1:].split("/")[0]
+                        if suffix:
+                            sub_entries.add(suffix)
+                for name in sorted(sub_entries):
+                    if name in seen_names:
+                        continue
+                    seen_names.add(name)
+                    attrs = self._attrs_for_dir(int(time.time()))
+                    yield SFTPName(
+                        filename=name.encode("utf-8"),
+                        longname=self._format_longname(name, attrs).encode("utf-8"),
+                        attrs=attrs,
+                    )
+                return
+
+            prefix = key.rstrip("/") + "/" if key else ""
+            b = _sftp_s3_bucket(self._account_id, bucket)
+            if b is None:
+                return
+
+            for full_key in sorted(b.get("objects", {}).keys()):
+                if not full_key.startswith(prefix):
+                    continue
+                remainder = full_key[len(prefix):]
+                if not remainder:
+                    continue
+                head, sep, _ = remainder.partition("/")
+                if sep:
+                    if head in seen_names:
+                        continue
+                    seen_names.add(head)
+                    attrs = self._attrs_for_dir(int(time.time()))
+                    yield SFTPName(
+                        filename=head.encode("utf-8"),
+                        longname=self._format_longname(head, attrs).encode("utf-8"),
+                        attrs=attrs,
+                    )
+                else:
+                    if head in seen_names:
+                        continue
+                    seen_names.add(head)
+                    obj = b["objects"][full_key]
+                    attrs = self._attrs_for_file(obj.get("size", 0), int(time.time()))
+                    yield SFTPName(
+                        filename=head.encode("utf-8"),
+                        longname=self._format_longname(head, attrs).encode("utf-8"),
+                        attrs=attrs,
+                    )
+
+        def _format_longname(self, name, attrs) -> str:
+            """ls-l-style line for asyncssh's longname field."""
+            is_dir = attrs.type == 2
+            mode_str = "drwxr-xr-x" if is_dir else "-rw-r--r--"
+            size = attrs.size or 0
+            mtime = attrs.mtime or int(time.time())
+            ts = time.strftime("%b %d %H:%M", time.localtime(mtime))
+            return f"{mode_str} 1 ministack ministack {size:>10d} {ts} {name}"
+
+        def mkdir(self, path, attrs):
+            bucket, key = self._resolve(path)
+            if not bucket:
+                raise asyncssh.SFTPFailure("Cannot create directory above bucket level")
+            if not key:
+                return None
+            placeholder_key = key.rstrip("/") + "/"
+            _sftp_s3_put_object(self._account_id, bucket, placeholder_key, b"")
+            return None
+
+        def rmdir(self, path):
+            bucket, key = self._resolve(path)
+            if not bucket or not key:
+                raise asyncssh.SFTPFailure("Cannot remove bucket root via SFTP")
+            prefix = key.rstrip("/") + "/"
+            children = [k for k in _sftp_s3_list_keys(self._account_id, bucket, prefix) if k != prefix]
+            if children:
+                raise asyncssh.SFTPFailure(f"Directory not empty: {path!r}")
+            _sftp_s3_delete_object(self._account_id, bucket, prefix)
+            return None
+
+        def remove(self, path):
+            bucket, key = self._resolve(path)
+            if not bucket or not key:
+                raise asyncssh.SFTPNoSuchFile(f"Cannot remove {path!r}")
+            if not _sftp_s3_delete_object(self._account_id, bucket, key):
                 raise asyncssh.SFTPNoSuchFile(f"No such file: {path!r}")
-            initial = b"" if (wants_truncate or not existing) else existing.get("body", b"")
+            return None
+
+        def rename(self, oldpath, newpath):
+            return self._do_rename(oldpath, newpath, allow_overwrite=False)
+
+        def posix_rename(self, oldpath, newpath):
+            return self._do_rename(oldpath, newpath, allow_overwrite=True)
+
+        def _do_rename(self, oldpath, newpath, *, allow_overwrite: bool):
+            src_bucket, src_key = self._resolve(oldpath)
+            dst_bucket, dst_key = self._resolve(newpath)
+            if not src_bucket or not src_key:
+                raise asyncssh.SFTPNoSuchFile(f"No such file: {oldpath!r}")
+            src_obj = _sftp_s3_get_object(self._account_id, src_bucket, src_key)
+            if src_obj is None:
+                raise asyncssh.SFTPNoSuchFile(f"No such file: {oldpath!r}")
+            if not dst_bucket:
+                raise asyncssh.SFTPFailure("Cannot rename above bucket level")
+            if not allow_overwrite and _sftp_s3_get_object(self._account_id, dst_bucket, dst_key):
+                raise asyncssh.SFTPFailure(f"Destination exists: {newpath!r}")
+            # S3 has no atomic rename — copy + delete.
+            _sftp_s3_put_object(self._account_id, dst_bucket, dst_key, src_obj.get("body", b""))
+            _sftp_s3_delete_object(self._account_id, src_bucket, src_key)
+            return None
+
+        # ---- file ops --------------------------------------------------------
+
+        def open(self, path, pflags, attrs):
+            # asyncssh masks: SSH_FXF_READ=0x01, SSH_FXF_WRITE=0x02,
+            # SSH_FXF_APPEND=0x04, SSH_FXF_CREAT=0x08, SSH_FXF_TRUNC=0x10,
+            # SSH_FXF_EXCL=0x20.
+            bucket, key = self._resolve(path)
+            if not bucket or not key:
+                raise asyncssh.SFTPFailure("Open requires bucket+key")
+
+            wants_write = bool(pflags & 0x02)
+            wants_create = bool(pflags & 0x08)
+            wants_truncate = bool(pflags & 0x10)
+            wants_excl = bool(pflags & 0x20)
+
+            existing = _sftp_s3_get_object(self._account_id, bucket, key)
+
+            if wants_write:
+                if existing and wants_excl:
+                    raise asyncssh.SFTPFailure(f"File exists: {path!r}")
+                if not existing and not wants_create:
+                    raise asyncssh.SFTPNoSuchFile(f"No such file: {path!r}")
+                initial = b"" if (wants_truncate or not existing) else existing.get("body", b"")
+                handle = self._next_handle
+                self._next_handle += 1
+                self._open_files[handle] = {
+                    "mode": "write",
+                    "bucket": bucket,
+                    "key": key,
+                    "buf": io.BytesIO(initial),
+                    "size": len(initial),
+                    "mtime": int(time.time()),
+                }
+                return handle
+
+            # Read mode
+            if not existing:
+                raise asyncssh.SFTPNoSuchFile(f"No such file: {path!r}")
             handle = self._next_handle
             self._next_handle += 1
+            body = existing.get("body", b"")
             self._open_files[handle] = {
-                "mode": "write",
+                "mode": "read",
                 "bucket": bucket,
                 "key": key,
-                "buf": io.BytesIO(initial),
-                "size": len(initial),
+                "buf": io.BytesIO(body),
+                "size": len(body),
                 "mtime": int(time.time()),
             }
             return handle
 
-        # Read mode
-        if not existing:
-            raise asyncssh.SFTPNoSuchFile(f"No such file: {path!r}")
-        handle = self._next_handle
-        self._next_handle += 1
-        body = existing.get("body", b"")
-        self._open_files[handle] = {
-            "mode": "read",
-            "bucket": bucket,
-            "key": key,
-            "buf": io.BytesIO(body),
-            "size": len(body),
-            "mtime": int(time.time()),
-        }
-        return handle
+        def read(self, file_obj, offset, size):
+            h = self._open_files.get(file_obj)
+            if not h:
+                raise asyncssh.SFTPFailure("Bad file handle")
+            h["buf"].seek(offset)
+            data = h["buf"].read(size)
+            return data if data else b""
 
-    def read(self, file_obj, offset, size):
-        h = self._open_files.get(file_obj)
-        if not h:
-            raise asyncssh.SFTPFailure("Bad file handle")
-        h["buf"].seek(offset)
-        data = h["buf"].read(size)
-        return data if data else b""
+        def write(self, file_obj, offset, data):
+            h = self._open_files.get(file_obj)
+            if not h:
+                raise asyncssh.SFTPFailure("Bad file handle")
+            if h["mode"] != "write":
+                raise asyncssh.SFTPFailure("File not open for writing")
+            h["buf"].seek(offset)
+            h["buf"].write(data)
+            return len(data)
 
-    def write(self, file_obj, offset, data):
-        h = self._open_files.get(file_obj)
-        if not h:
-            raise asyncssh.SFTPFailure("Bad file handle")
-        if h["mode"] != "write":
-            raise asyncssh.SFTPFailure("File not open for writing")
-        h["buf"].seek(offset)
-        h["buf"].write(data)
-        return len(data)
-
-    def close(self, file_obj):
-        h = self._open_files.pop(file_obj, None)
-        if not h:
+        def close(self, file_obj):
+            h = self._open_files.pop(file_obj, None)
+            if not h:
+                return None
+            if h["mode"] == "write":
+                _sftp_s3_put_object(self._account_id, h["bucket"], h["key"], h["buf"].getvalue())
             return None
-        if h["mode"] == "write":
-            _sftp_s3_put_object(self._account_id, h["bucket"], h["key"], h["buf"].getvalue())
-        return None
 
-    def fsync(self, file_obj):
-        return None
+        def fsync(self, file_obj):
+            return None
 
-    # ---- explicitly unsupported -----------------------------------------
+        # ---- explicitly unsupported -----------------------------------------
 
-    def link(self, oldpath, newpath):
-        raise asyncssh.SFTPOpUnsupported("S3-backed SFTP does not support hardlinks")
+        def link(self, oldpath, newpath):
+            raise asyncssh.SFTPOpUnsupported("S3-backed SFTP does not support hardlinks")
 
-    def symlink(self, oldpath, newpath):
-        raise asyncssh.SFTPOpUnsupported("S3-backed SFTP does not support symlinks")
+        def symlink(self, oldpath, newpath):
+            raise asyncssh.SFTPOpUnsupported("S3-backed SFTP does not support symlinks")
 
-    def readlink(self, path):
-        raise asyncssh.SFTPOpUnsupported("S3-backed SFTP does not support symlinks")
+        def readlink(self, path):
+            raise asyncssh.SFTPOpUnsupported("S3-backed SFTP does not support symlinks")
 
-    def lock(self, file_obj, offset, length, flags):
-        return None
+        def lock(self, file_obj, offset, length, flags):
+            return None
 
-    def unlock(self, file_obj, offset, length):
-        return None
+        def unlock(self, file_obj, offset, length):
+            return None
 
-    def exit(self):
-        # Flush handles the client forgot to close.
-        for handle in list(self._open_files):
-            self.close(handle)
+        def exit(self):
+            # Flush handles the client forgot to close.
+            for handle in list(self._open_files):
+                self.close(handle)
 
 
 # ── SFTP lifecycle — called from app.py lifespan + Create/Delete handlers ──
@@ -1207,6 +1223,7 @@ async def sftp_start() -> None:
     if not _sftp_enabled():
         logger.info("SFTP: disabled (asyncssh missing or SFTP_ENABLED=0)")
         return
+    _ensure_sftp_runtime()
 
     global _sftp_shared_acceptor, _sftp_next_per_server_port
     _sftp_next_per_server_port = _per_server_base_port()
@@ -1261,6 +1278,7 @@ async def sftp_start_server_listener(server_id: str) -> Optional[int]:
     """
     if not (_sftp_enabled() and _port_per_server()):
         return None
+    _ensure_sftp_runtime()
     global _sftp_next_per_server_port
     if _sftp_next_per_server_port is None:
         _sftp_next_per_server_port = _per_server_base_port()

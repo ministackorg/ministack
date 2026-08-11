@@ -679,15 +679,13 @@ def _act_delete_message(data: dict, qurl: str) -> dict:
     for m in q["messages"]:
         if m["receipt_handle"] is not None and m["receipt_handle"] == rh:
             found = True
-            # Clear the FIFO dedup cache entry so the same dedup ID can be
-            # reused immediately after deletion.  Real AWS keeps a strict
-            # 5-minute window, but clearing on delete is more practical for
-            # local development where tests re-run with fixed dedup IDs.
-            if q["is_fifo"] and m.get("dedup_id"):
-                # Use the stored cache key (which may be group-scoped) to
-                # clear the correct dedup entry.
-                cache_key = m.get("dedup_cache_key") or m["dedup_id"]
-                q["dedup_cache"].pop(cache_key, None)
+            # Do NOT clear the FIFO dedup entry here. Real SQS keeps a strict
+            # 5-minute dedup window measured from send time, independent of
+            # whether the message was ever received or deleted; clearing on
+            # delete let a duplicate through as soon as the original was
+            # consumed (e.g. by a Lambda ESM), which is #1326. The window is
+            # enforced by the entry's `expire` and _prune_dedup. Reset the
+            # queue (/_ministack/reset) to reuse a dedup id immediately in tests.
         else:
             kept.append(m)
     if not found:
@@ -940,8 +938,9 @@ def _act_delete_message_batch(data: dict, qurl: str) -> dict:
         kept = []
         for m in q["messages"]:
             if m["receipt_handle"] is not None and m["receipt_handle"] == rh:
-                if q["is_fifo"] and m.get("dedup_id"):
-                    q["dedup_cache"].pop(m["dedup_id"], None)
+                # Matched → dropped. The FIFO dedup entry is intentionally kept
+                # for its full 5-minute window (see DeleteMessage / #1326).
+                pass
             else:
                 kept.append(m)
         q["messages"] = kept
@@ -1792,8 +1791,11 @@ def _delete_messages_for_esm(queue_url: str, receipt_handles: set[str]) -> None:
         kept = []
         for m in q["messages"]:
             if m.get("receipt_handle") is not None and m.get("receipt_handle") in receipt_handles:
-                if q["is_fifo"] and m.get("dedup_id"):
-                    q["dedup_cache"].pop(m["dedup_id"], None)
+                # Matched → dropped. Keep the FIFO dedup entry for its full
+                # 5-minute window: this is the Lambda ESM delete path, and
+                # clearing it here was the primary cause of #1326 (a duplicate
+                # sent seconds after ESM consumption was delivered again).
+                pass
             else:
                 kept.append(m)
         q["messages"] = kept

@@ -1720,9 +1720,10 @@ def test_kms_hmac_key_cannot_enable_rotation(kms_client):
         kms_client.enable_key_rotation(KeyId=meta["KeyId"])
 
 
-def test_kms_hmac_key_rotation_reads_and_disable_are_no_ops(kms_client):
+def test_kms_hmac_key_disable_rotation_unsupported_but_status_reads_false(kms_client):
     meta = _hmac_key(kms_client)
-    assert kms_client.disable_key_rotation(KeyId=meta["KeyId"])
+    with pytest.raises(kms_client.exceptions.UnsupportedOperationException):
+        kms_client.disable_key_rotation(KeyId=meta["KeyId"])
     status = kms_client.get_key_rotation_status(KeyId=meta["KeyId"])
     assert status["KeyRotationEnabled"] is False
 
