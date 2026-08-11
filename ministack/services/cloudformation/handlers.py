@@ -131,6 +131,12 @@ def _describe_stacks(params):
 
     if stack_name:
         stack = _stacks.get(stack_name)
+        # A DELETE_COMPLETE stack is addressable only by its unique stack ID, not
+        # by name — real CloudFormation returns "does not exist" for a deleted
+        # stack's name. Drop the name match and fall through to the stack-ID
+        # lookup (which a plain name never satisfies).
+        if stack is not None and stack.get("StackStatus") == "DELETE_COMPLETE":
+            stack = None
         # Also try matching by stack ID
         if not stack:
             for s in _stacks.values():
@@ -466,7 +472,9 @@ def _update_stack(params):
         return _error("ValidationError", "StackName is required")
 
     stack = _stacks.get(stack_name)
-    if not stack:
+    # A deleted stack is not addressable by name — updating it is "does not
+    # exist", not "cannot be updated" (a deployed stack name is free to re-create).
+    if not stack or stack.get("StackStatus") == "DELETE_COMPLETE":
         return _error("ValidationError",
                       f"Stack [{stack_name}] does not exist")
 
