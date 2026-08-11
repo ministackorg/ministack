@@ -470,6 +470,59 @@ def test_cfn_stack_with_parameters(cfn, sqs):
     urls = sqs.list_queues(QueueNamePrefix="cfn-t02-custom").get("QueueUrls", [])
     assert any("cfn-t02-custom" in u for u in urls)
 
+
+def test_cfn_unnamed_dynamodb_table_survives_unrelated_update(cfn, ddb, ssm):
+    """A stack update must not touch an auto-named resource whose own
+    properties didn't change — DynamoDB::Table has no update handler, so it
+    falls back to calling create again on every update. That create wasn't
+    idempotent: with no explicit TableName, it derived a fresh name every
+    call, so any update of a stack containing an unnamed table silently
+    created a second, empty table under a new name — and an unrelated
+    resource referencing the table via Ref (real CloudFormation propagates
+    that Ref's resolved value on every update) picked up that new, wrong
+    identity the moment it was reprocessed."""
+    def template(param_value_source):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "Table": {
+                    "Type": "AWS::DynamoDB::Table",
+                    "Properties": {
+                        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                        "BillingMode": "PAY_PER_REQUEST",
+                    },
+                },
+                "Param": {
+                    "Type": "AWS::SSM::Parameter",
+                    "Properties": {
+                        "Name": "/cfn-t02f/table-name",
+                        "Type": "String",
+                        "Value": param_value_source,
+                        "Description": "unrelated change forces this resource to be reprocessed",
+                    },
+                },
+            },
+        })
+
+    cfn.create_stack(StackName="cfn-t02f", TemplateBody=template({"Ref": "Table"}))
+    _wait_stack(cfn, "cfn-t02f")
+    tables_before = set(ddb.list_tables()["TableNames"])
+    table_name_before = ssm.get_parameter(Name="/cfn-t02f/table-name")["Parameter"]["Value"]
+    assert table_name_before in tables_before
+
+    # Table itself is untouched; only Param's Description changes (forcing
+    # Param, not Table, to actually be reprocessed this update).
+    cfn.update_stack(StackName="cfn-t02f", TemplateBody=template({"Ref": "Table"}))
+    stack = _wait_stack(cfn, "cfn-t02f")
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+
+    tables_after = set(ddb.list_tables()["TableNames"])
+    table_name_after = ssm.get_parameter(Name="/cfn-t02f/table-name")["Parameter"]["Value"]
+    assert tables_after == tables_before
+    assert table_name_after == table_name_before
+
+
 def test_cfn_change_set_use_previous_value_updates_resource(cfn, ssm):
     """A change set created with UsePreviousValue (the `aws cloudformation deploy`
     no-`--parameter-overrides` path) must resolve the parameter to its stored
@@ -3779,6 +3832,50 @@ def test_cfn_eventbus_getatt_arn(cfn, eb):
 
     cfn.delete_stack(StackName="cfn-eb-t03")
     _wait_stack(cfn, "cfn-eb-t03")
+
+
+def test_cfn_eventbus_survives_unrelated_update(cfn, eb, sqs):
+    """A stack update must not fail an unchanged AWS::Events::EventBus.
+
+    EventBus has no update handler, so an update falls back to calling
+    create again — a name that already exists (its own, from the previous
+    deploy — e.g. a name computed client-side and baked into the template,
+    like CDK's EventBus construct default-names its bus) previously made
+    every update of a stack containing one fail with "already exists", even
+    when nothing about the bus itself changed. Fixed generically (see
+    _update_resource's no-op short-circuit), not with EventBus-specific
+    logic — this exercises that general fix against a real resource type
+    known to hit it."""
+    def template(queue_name):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "Bus": {
+                    "Type": "AWS::Events::EventBus",
+                    "Properties": {"Name": "cfn-eb-t10"},
+                },
+                "Queue": {
+                    "Type": "AWS::SQS::Queue",
+                    "Properties": {"QueueName": queue_name},
+                },
+            },
+        })
+
+    cfn.create_stack(StackName="cfn-eb-t10", TemplateBody=template("cfn-eb-t10-q1"))
+    stack = _wait_stack(cfn, "cfn-eb-t10")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    bus_before = eb.describe_event_bus(Name="cfn-eb-t10")
+
+    # Only the queue changes — the bus is untouched, exactly like a real
+    # redeploy that doesn't touch AuditTrail at all.
+    cfn.update_stack(StackName="cfn-eb-t10", TemplateBody=template("cfn-eb-t10-q2"))
+    stack = _wait_stack(cfn, "cfn-eb-t10")
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+
+    bus_after = eb.describe_event_bus(Name="cfn-eb-t10")
+    assert bus_after["Arn"] == bus_before["Arn"]
+    urls = sqs.list_queues(QueueNamePrefix="cfn-eb-t10-q2").get("QueueUrls", [])
+    assert any("cfn-eb-t10-q2" in u for u in urls)
 
 
 def test_cfn_eventbus_tags(cfn, eb):
