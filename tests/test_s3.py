@@ -596,6 +596,41 @@ def test_s3_object_metadata(s3):
     assert resp["Metadata"]["custom-key"] == "custom-value"
     assert resp["Metadata"]["another"] == "data"
 
+
+def test_s3_versioned_object_metadata(s3):
+    """User metadata must round-trip on a versioned GetObject(VersionId). (#1342)
+
+    Each version keeps its own metadata; addressing a version by id returns
+    that version's metadata, and the current-version read returns the latest.
+    """
+    bkt = "intg-s3-meta-versioned"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(
+        Bucket=bkt, VersioningConfiguration={"Status": "Enabled"}
+    )
+
+    v1 = s3.put_object(
+        Bucket=bkt, Key="k", Body=b"one",
+        Metadata={"gen": "one"}, ContentEncoding="gzip",
+    )["VersionId"]
+    v2 = s3.put_object(
+        Bucket=bkt, Key="k", Body=b"two", Metadata={"gen": "two"},
+    )["VersionId"]
+    assert v1 and v2 and v1 != v2
+
+    g1 = s3.get_object(Bucket=bkt, Key="k", VersionId=v1)
+    assert g1["Metadata"]["gen"] == "one"
+    assert g1["ContentEncoding"] == "gzip"
+    assert g1["Body"].read() == b"one"
+
+    g2 = s3.get_object(Bucket=bkt, Key="k", VersionId=v2)
+    assert g2["Metadata"]["gen"] == "two"
+
+    # Current-version read (no VersionId) targets the latest.
+    cur = s3.get_object(Bucket=bkt, Key="k")
+    assert cur["Metadata"]["gen"] == "two"
+
+
 def test_s3_bucket_tagging(s3):
     bkt = "intg-s3-bkttags"
     s3.create_bucket(Bucket=bkt)

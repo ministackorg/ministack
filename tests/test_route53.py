@@ -77,7 +77,8 @@ def test_route53_change_resource_record_sets_create(r53):
             ]
         },
     )
-    assert change_resp["ChangeInfo"]["Status"] == "INSYNC"
+    # ChangeResourceRecordSets returns PENDING on submission (real Route 53).
+    assert change_resp["ChangeInfo"]["Status"] == "PENDING"
 
 def test_route53_list_resource_record_sets(r53):
     resp = r53.create_hosted_zone(Name="listrrs.com", CallerReference="ref-lrrs-1")
@@ -473,9 +474,13 @@ def test_route53_get_change(r53):
             ]
         },
     )
+    # Route 53 is born PENDING and flips to INSYNC once propagated. We emulate
+    # that lazily: the first GetChange sees PENDING, subsequent reads INSYNC —
+    # so a poll loop / SDK waiter actually exercises its retry path.
+    assert change_resp["ChangeInfo"]["Status"] == "PENDING"
     change_id = change_resp["ChangeInfo"]["Id"].split("/")[-1]
-    get_change = r53.get_change(Id=change_id)
-    assert get_change["ChangeInfo"]["Status"] == "INSYNC"
+    assert r53.get_change(Id=change_id)["ChangeInfo"]["Status"] == "PENDING"
+    assert r53.get_change(Id=change_id)["ChangeInfo"]["Status"] == "INSYNC"
 
 def test_route53_create_health_check(r53):
     resp = r53.create_health_check(
