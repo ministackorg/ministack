@@ -624,6 +624,76 @@ def test_sfn_intrinsic_format_escapes(sfn, sfn_sync):
     assert output["backslash"] == "C:\\tmp"
     assert output["preserved"] == "path: C:\\tmp\\file"
 
+def test_sfn_intrinsic_base64(sfn, sfn_sync):
+    """States.Base64Encode / Decode round-trip, nest, and decode leniently."""
+    definition = json.dumps({
+        "StartAt": "B64",
+        "States": {
+            "B64": {
+                "Type": "Pass",
+                "Parameters": {
+                    "encoded.$": "States.Base64Encode($.text)",
+                    "decoded.$": "States.Base64Decode($.b64)",
+                    "unpadded.$": "States.Base64Decode('aGVsbG8')",
+                    "utf8.$": "States.Base64Encode($.accented)",
+                    "empty.$": "States.Base64Encode('')",
+                    # The common shape: build a string, then encode it for an API that takes
+                    # base64 only. Encode has to accept another intrinsic's result, not just a path.
+                    "nested.$": "States.Base64Encode(States.Format('run {} now', $.text))",
+                    "roundtrip.$": "States.Base64Decode(States.Base64Encode($.text))",
+                },
+                "End": True,
+            }
+        },
+    })
+    sm = sfn.create_state_machine(
+        name=f"sfn-intrinsic-b64-{_uuid_mod.uuid4().hex[:8]}",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    resp = sfn_sync.start_sync_execution(
+        stateMachineArn=sm["stateMachineArn"],
+        input=json.dumps({"text": "hello", "b64": "RGF0YSB0byBlbmNvZGU=", "accented": "héllo→"}),
+    )
+    assert resp["status"] == "SUCCEEDED", resp.get("cause")
+    output = json.loads(resp["output"])
+    assert output["encoded"] == "aGVsbG8="
+    assert output["decoded"] == "Data to encode"
+    assert output["unpadded"] == "hello"
+    # UTF-8, not latin-1: "héllo→" is nine bytes, so twelve base64 characters.
+    assert output["utf8"] == "aMOpbGxv4oaS"
+    assert output["empty"] == ""
+    assert output["nested"] == "cnVuIGhlbGxvIG5vdw=="
+    assert output["roundtrip"] == "hello"
+
+
+def test_sfn_intrinsic_base64_rejects_what_aws_rejects(sfn, sfn_sync):
+    """Both base64 intrinsics cap input at 10,000 characters and require a string."""
+    def run(params, payload):
+        sm = sfn.create_state_machine(
+            name=f"sfn-b64-bad-{_uuid_mod.uuid4().hex[:8]}",
+            definition=json.dumps({"StartAt": "B", "States": {
+                "B": {"Type": "Pass", "Parameters": params, "End": True}}}),
+            roleArn="arn:aws:iam::000000000000:role/R",
+        )
+        return sfn_sync.start_sync_execution(stateMachineArn=sm["stateMachineArn"],
+                                             input=json.dumps(payload))
+
+    ok = run({"out.$": "States.Base64Encode($.s)"}, {"s": "a" * 10_000})
+    assert ok["status"] == "SUCCEEDED", ok.get("cause")
+    assert len(json.loads(ok["output"])["out"]) == 13336
+
+    for params, payload, fn in (
+        ({"out.$": "States.Base64Encode($.s)"}, {"s": "a" * 10_001}, "States.Base64Encode"),
+        ({"out.$": "States.Base64Encode($.n)"}, {"n": 123}, "States.Base64Encode"),
+        ({"out.$": "States.Base64Decode($.s)"}, {"s": "YQ==" * 5_000}, "States.Base64Decode"),
+    ):
+        resp = run(params, payload)
+        assert resp["status"] == "FAILED", resp.get("output")
+        assert resp.get("error") == "States.Runtime", resp
+        assert f"Invalid arguments in {fn}" in (resp.get("cause") or ""), resp.get("cause")
+
+
 def test_sfn_intrinsic_nested(sfn, sfn_sync):
     """Nested intrinsic: States.StringToJson(States.Format(...))"""
     definition = json.dumps({
