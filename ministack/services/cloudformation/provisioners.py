@@ -4755,6 +4755,42 @@ def _apigw_v2_authorizer_create(logical_id, props, stack_name):
     return auth_id, {"AuthorizerId": auth_id}
 
 
+def _apigw_v2_authorizer_update(physical_id, old_props, new_props, stack_name):
+    """Mutates the existing authorizer record in place under its own
+    authorizerId — matching real API Gateway's UpdateAuthorizer, which
+    changes a property (e.g. jwtAudience, trusting an additional app
+    client) without reassigning the authorizer's id. Without this,
+    _update_resource's no-handler fallback landed on
+    _apigw_v2_authorizer_create, whose authorizerId is a fresh random
+    value on every call (there's no name to derive stability from, unlike
+    the resources _physical_name covers) — producing a second, orphaned
+    authorizer on every property change while every Route's own
+    AuthorizerId (unchanged, so Route itself was never reprocessed) kept
+    pointing at the original, now-stale one.
+    """
+    api_id = new_props.get("ApiId", "")
+    authorizers = _apigw_v2._authorizers.get(api_id, {})
+    authorizer = authorizers.get(physical_id)
+    if not authorizer:
+        return _apigw_v2_authorizer_create(physical_id, new_props, stack_name)
+    jwt_cfg = new_props.get("JwtConfiguration") or {}
+    authorizer.update({
+        "authorizerType": new_props.get("AuthorizerType", "JWT"),
+        "name": new_props.get("Name", authorizer["name"]),
+        "identitySource": new_props.get("IdentitySource", ["$request.header.Authorization"]),
+        "jwtConfiguration": {
+            "audience": jwt_cfg.get("Audience", []),
+            "issuer": jwt_cfg.get("Issuer", ""),
+        },
+        "authorizerUri": new_props.get("AuthorizerUri", ""),
+        "authorizerPayloadFormatVersion": new_props.get("AuthorizerPayloadFormatVersion", "2.0"),
+        "authorizerResultTtlInSeconds": new_props.get("AuthorizerResultTtlInSeconds", 300),
+        "enableSimpleResponses": new_props.get("EnableSimpleResponses", False),
+        "authorizerCredentialsArn": new_props.get("AuthorizerCredentialsArn", ""),
+    })
+    return physical_id, {"AuthorizerId": physical_id}
+
+
 def _apigw_v2_authorizer_delete(physical_id, props):
     api_id = props.get("ApiId", "")
     authorizers = _apigw_v2._authorizers.get(api_id, {})
@@ -5600,7 +5636,7 @@ _RESOURCE_HANDLERS = {
     "AWS::ApiGatewayV2::Stage": {"create": _apigw_v2_stage_create, "delete": _apigw_v2_stage_delete},
     "AWS::ApiGatewayV2::Integration": {"create": _apigw_v2_integration_create, "delete": _apigw_v2_integration_delete},
     "AWS::ApiGatewayV2::Route": {"create": _apigw_v2_route_create, "delete": _apigw_v2_route_delete},
-    "AWS::ApiGatewayV2::Authorizer": {"create": _apigw_v2_authorizer_create, "delete": _apigw_v2_authorizer_delete},
+    "AWS::ApiGatewayV2::Authorizer": {"create": _apigw_v2_authorizer_create, "update": _apigw_v2_authorizer_update, "delete": _apigw_v2_authorizer_delete},
     "AWS::SES::EmailIdentity": {"create": _ses_email_identity_create, "delete": _ses_email_identity_delete},
     "AWS::WAFv2::WebACL": {"create": _waf_web_acl_create, "delete": _waf_web_acl_delete},
     "AWS::CloudFront::CloudFrontOriginAccessIdentity": {

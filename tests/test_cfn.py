@@ -4570,6 +4570,58 @@ def test_cfn_apigwv2_authorizer_jwt(cfn, apigw):
     _assert_apigwv2_api_not_found(lambda: apigw.get_authorizers(ApiId=api_id))
 
 
+def test_cfn_apigwv2_authorizer_update_trusts_additional_audience(cfn, apigw):
+    """Updating an Authorizer's JwtConfiguration (e.g. trusting an
+    additional app client's audience — hotshot's multi-app-support Phase B)
+    must mutate the same authorizer in place, not mint a second one.
+
+    Regression test: AWS::ApiGatewayV2::Authorizer had no update handler,
+    so a property change fell back to create — whose authorizerId is a
+    fresh random value every call (unlike name-based resources, there's no
+    stable identity to derive) — leaving a second, orphaned authorizer
+    while the Route's own (unchanged) AuthorizerId kept pointing at the
+    original, now-stale one with the old audience list."""
+    def template(audience):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "HttpApi": {
+                    "Type": "AWS::ApiGatewayV2::Api",
+                    "Properties": {"Name": "cfn-apigwv2-authorizer-t02", "ProtocolType": "HTTP"},
+                },
+                "JwtAuthorizer": {
+                    "Type": "AWS::ApiGatewayV2::Authorizer",
+                    "Properties": {
+                        "ApiId": {"Ref": "HttpApi"},
+                        "Name": "cfn-apigwv2-authorizer-t02-jwt",
+                        "AuthorizerType": "JWT",
+                        "IdentitySource": ["$request.header.Authorization"],
+                        "JwtConfiguration": {
+                            "Audience": audience,
+                            "Issuer": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_example",
+                        },
+                    },
+                },
+            },
+        })
+
+    stack_name = "cfn-apigwv2-authorizer-t02"
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(["client-a"]))
+    _wait_stack(cfn, stack_name)
+    resources = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+    api_id = [r for r in resources if r["ResourceType"] == "AWS::ApiGatewayV2::Api"][0]["PhysicalResourceId"]
+    authorizer_id_before = [r for r in resources if r["ResourceType"] == "AWS::ApiGatewayV2::Authorizer"][0]["PhysicalResourceId"]
+
+    cfn.update_stack(StackName=stack_name, TemplateBody=template(["client-a", "client-b"]))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+
+    authorizers = apigw.get_authorizers(ApiId=api_id)["Items"]
+    assert len(authorizers) == 1
+    assert authorizers[0]["AuthorizerId"] == authorizer_id_before
+    assert authorizers[0]["JwtConfiguration"]["Audience"] == ["client-a", "client-b"]
+
+
 def test_cfn_apigwv2_integration_getatt(cfn, apigw):
     """Fn::GetAtt on IntegrationId resolves correctly."""
     template = {
