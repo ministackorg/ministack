@@ -563,5 +563,10 @@ def mq():
 
 
 @pytest.fixture(scope="session")
+def dsql():
+    return make_client("dsql")
+
+
+@pytest.fixture(scope="session")
 def s3tables():
     return make_client("s3tables")
