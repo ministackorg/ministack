@@ -3820,8 +3820,48 @@ def test_oauth2_userinfo():
 
     assert 'sub' in claims
     assert claims.get('email') == 'test@example.com'
+    assert claims.get('username') == 'testuser'
     assert claims.get('cognito:username') == 'testuser'
     assert claims.get('name') == 'Test User'
+
+
+def test_oauth2_userinfo_returns_custom_attributes():
+    """Custom attributes are part of the userInfo response, as on real Cognito."""
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(cognito_idp)
+    client_id = client['ClientId']
+    client_secret = client.get('ClientSecret', '')
+    cognito_idp.admin_update_user_attributes(
+        UserPoolId=pool_id,
+        Username='testuser',
+        UserAttributes=[
+            {'Name': 'custom:tenant_id', 'Value': 'tenant-42'},
+            {'Name': 'custom:employee_guid', 'Value': 'a1000033-0000-0000-0000-000000000033'},
+        ],
+    )
+    code = _do_login_and_get_code(cognito_idp, client_id)
+
+    _, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+        'grant_type': 'authorization_code',
+        'code': code,
+        'redirect_uri': 'http://localhost:3000/callback',
+        'client_id': client_id,
+        'client_secret': client_secret,
+    })
+    access_token = json.loads(body)['access_token']
+
+    req = urllib.request.Request(
+        f'{ENDPOINT}/oauth2/userInfo',
+        headers={'Authorization': f'Bearer {access_token}'},
+    )
+    resp = urllib.request.urlopen(req, timeout=10)
+    assert resp.status == 200
+    claims = json.loads(resp.read())
+
+    assert claims.get('custom:tenant_id') == 'tenant-42'
+    assert claims.get('custom:employee_guid') == 'a1000033-0000-0000-0000-000000000033'
+    # Standard claims still come back alongside them
+    assert claims.get('email') == 'test@example.com'
 
 
 def test_oauth2_userinfo_invalid_token():

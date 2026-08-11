@@ -5460,11 +5460,19 @@ def handle_oauth2_userinfo(method, path, headers, body, query_params):
     claims = {"sub": attrs.get("sub", user["Username"])}
     # Standard OIDC claims
     for key in ("email", "email_verified", "name", "family_name", "given_name",
-                "phone_number", "phone_number_verified", "preferred_username",
-                "nickname", "picture", "profile", "website", "gender",
-                "birthdate", "zoneinfo", "locale", "address", "updated_at"):
+                "middle_name", "phone_number", "phone_number_verified",
+                "preferred_username", "nickname", "picture", "profile", "website",
+                "gender", "birthdate", "zoneinfo", "locale", "address", "updated_at"):
         if key in attrs:
             claims[key] = attrs[key]
+    # Custom attributes. Real Cognito returns these for both `openid` and
+    # `openid profile`, bounded by the app client's read attributes.
+    for key, value in attrs.items():
+        if key.startswith("custom:") or key.startswith("dev:custom:"):
+            claims[key] = value
+    # AWS returns the plain `username` claim; `cognito:username` stays for
+    # callers already reading it here.
+    claims["username"] = user.get("Username", "")
     claims["cognito:username"] = user.get("Username", "")
     groups = user.get("_groups", [])
     if groups:
