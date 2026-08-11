@@ -1433,7 +1433,30 @@ def _eks_nodegroup_delete(physical_id, props):
 
 def _eb_event_bus_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=256)
-    if name in _eb._event_buses:
+    # CDK's EventBus construct computes its default name client-side (a
+    # deterministic hash of the construct path) and bakes it into the
+    # template as an explicit Name — unlike _physical_name's random suffix,
+    # that name is identical on every deploy of the same logical resource.
+    # _update_resource falls back to calling create on every stack update
+    # when a type has no explicit update handler (see its own doc comment:
+    # "provisioners are expected to implement idempotently"), passing the
+    # resource's *physical* id positionally where a fresh create passes the
+    # *logical* id — so `logical_id == name` here can only mean "this is
+    # that same fallback, re-presenting the bus's own prior name", since a
+    # real logical id (e.g. "Bus") essentially never collides with a bus's
+    # own Name. Treat that case as the expected no-op-update, matching real
+    # CloudFormation (which never recreates an EventBus whose properties
+    # haven't changed) — rules already registered against this bus
+    # reference it by name (see eventbridge.py's _rules), not by this
+    # record's identity, so returning the existing one rather than
+    # replacing it doesn't orphan them. Any other existing-name match is a
+    # genuine collision (a bus created outside this stack, or "default")
+    # and must still fail, same as a fresh create hitting an unrelated
+    # duplicate name.
+    existing = _eb._event_buses.get(name)
+    if existing and logical_id == name:
+        return name, {"Arn": existing["Arn"], "Name": name}
+    if existing:
         raise ValueError(f"EventBus already exists: {name}")
     data = {
         "Name": name,
