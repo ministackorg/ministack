@@ -1114,3 +1114,247 @@ def test_iot_rule_sns_action_publishes_to_topic(iot_client, iot_data_client, sns
     assert message == {"kind": "boom"}
 
     iot_client.delete_topic_rule(ruleName=rule)
+
+
+# ---------------------------------------------------------------------------
+# Device Shadow over MQTT (reserved $aws/things/.../shadow/... topics)
+# ---------------------------------------------------------------------------
+
+
+def _make_publish_frame(topic: str, payload: bytes) -> bytes:
+    body = _enc_str(topic) + payload  # QoS 0: no packet identifier
+    return bytes([0x30]) + _enc_remaining(len(body)) + body
+
+
+def _default_ws_url() -> str:
+    parsed = urlparse(ENDPOINT)
+    ws_host = parsed.hostname or "localhost"
+    ws_port = parsed.port or 4566
+    return f"ws://prefix-ats.iot.us-east-1.{ws_host}:{ws_port}/mqtt"
+
+
+def _collect_shadow_frames(sub_filter, publish_fn, want, timeout=5.0):
+    """Subscribe over WS, run ``publish_fn`` once ready, and return the
+    collected ``(topic, payload)`` PUBLISH frames."""
+    from conftest import patch_endpoint_dns
+
+    ready = threading.Event()
+    stop = threading.Event()
+    received: list = []
+
+    with patch_endpoint_dns():
+        t = threading.Thread(
+            target=lambda: asyncio.run(
+                _ws_subscribe_and_collect(
+                    _default_ws_url(), sub_filter, ready, received, stop
+                )
+            ),
+            daemon=True,
+        )
+        t.start()
+        assert ready.wait(timeout=5), "WebSocket subscriber did not become ready"
+
+        publish_fn()
+
+        deadline = time.time() + timeout
+        while time.time() < deadline and len(received) < want:
+            time.sleep(0.05)
+        stop.set()
+        t.join(timeout=2)
+    return received
+
+
+def test_shadow_update_over_mqtt_emits_accepted_delta_documents(iot_data_client):
+    """HTTP `Publish` onto the shadow update topic drives the bridge: a WS
+    subscriber sees accepted + delta + documents, and the HTTP data plane
+    reads back the same stored state."""
+    thing = _unique("shadow-thing")
+    base = f"$aws/things/{thing}/shadow"
+
+    received = _collect_shadow_frames(
+        f"{base}/update/+",
+        lambda: iot_data_client.publish(
+            topic=f"{base}/update",
+            payload=json.dumps(
+                {"state": {"desired": {"led": "on"}}, "clientToken": "tok-a"}
+            ).encode(),
+        ),
+        want=3,
+    )
+
+    frames = {topic: json.loads(payload) for topic, payload in received}
+    accepted = frames[f"{base}/update/accepted"]
+    assert accepted["state"] == {"desired": {"led": "on"}}
+    assert accepted["clientToken"] == "tok-a"
+    delta = frames[f"{base}/update/delta"]
+    assert delta["state"] == {"led": "on"}
+    assert delta["version"] == accepted["version"]
+    # AWS includes the triggering request's clientToken on the delta, and the
+    # metadata for the delta's attributes.
+    assert delta["clientToken"] == "tok-a"
+    assert set(delta["metadata"]) == {"led"}
+    docs = frames[f"{base}/update/documents"]
+    assert docs["previous"] is None
+    assert docs["current"]["state"]["desired"] == {"led": "on"}
+
+    shadow = _read_shadow(iot_data_client.get_thing_shadow(thingName=thing))
+    assert shadow["state"]["desired"] == {"led": "on"}
+    assert shadow["version"] == accepted["version"]
+
+
+def test_named_shadow_update_over_mqtt(iot_data_client):
+    thing = _unique("shadow-named")
+    base = f"$aws/things/{thing}/shadow/name/cfg"
+
+    received = _collect_shadow_frames(
+        f"{base}/update/+",
+        lambda: iot_data_client.publish(
+            topic=f"{base}/update",
+            payload=json.dumps({"state": {"desired": {"mode": "eco"}}}).encode(),
+        ),
+        want=3,
+    )
+
+    frames = {topic: json.loads(payload) for topic, payload in received}
+    accepted = frames[f"{base}/update/accepted"]
+    assert accepted["state"] == {"desired": {"mode": "eco"}}
+
+    named = _read_shadow(
+        iot_data_client.get_thing_shadow(thingName=thing, shadowName="cfg")
+    )
+    assert named["state"]["desired"] == {"mode": "eco"}
+    # Only the named shadow was written — the classic one must not exist.
+    with pytest.raises(ClientError) as ei:
+        iot_data_client.get_thing_shadow(thingName=thing)
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+def test_shadow_get_missing_over_mqtt_rejected_404(iot_data_client):
+    thing = _unique("shadow-miss")
+    base = f"$aws/things/{thing}/shadow"
+
+    received = _collect_shadow_frames(
+        f"{base}/get/+",
+        lambda: iot_data_client.publish(topic=f"{base}/get", payload=b""),
+        want=1,
+    )
+
+    assert received, "expected a get/rejected frame"
+    topic, payload = received[0]
+    assert topic == f"{base}/get/rejected"
+    doc = json.loads(payload)
+    assert doc["code"] == 404
+    assert thing in doc["message"]
+
+
+async def _ws_publish_shadow_and_collect(
+    ws_url, sub_filter, pub_topic, pub_payload, received, want
+):
+    """One WS session: subscribe, publish an MQTT PUBLISH frame on the same
+    connection, and collect the PUBLISH frames the broker sends back."""
+
+    def _record(msg) -> int | None:
+        buf = bytes(msg if isinstance(msg, (bytes, bytearray)) else msg.encode("latin-1"))
+        parsed = _parse_packet(buf)
+        if not parsed:
+            return None
+        ptype, _flags, body, _ = parsed
+        if ptype == 3:  # PUBLISH
+            topic_len = struct.unpack_from("!H", body, 0)[0]
+            received.append(
+                (body[2:2 + topic_len].decode("utf-8"), body[2 + topic_len:])
+            )
+        return ptype
+
+    async with websockets.connect(ws_url, subprotocols=["mqtt"]) as ws:
+        await ws.send(_make_connect(_unique("shadow-dev")))
+        await asyncio.wait_for(ws.recv(), timeout=2.0)  # CONNACK
+        await ws.send(_make_subscribe(packet_id=1, topic=sub_filter, qos=0))
+        while True:
+            msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
+            if _record(msg) == 9:  # SUBACK
+                break
+        await ws.send(_make_publish_frame(pub_topic, pub_payload))
+        end_at = time.time() + 5
+        while time.time() < end_at and len(received) < want:
+            try:
+                msg = await asyncio.wait_for(ws.recv(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            _record(msg)
+
+
+def test_shadow_update_via_ws_publish_emits_accepted(iot_data_client):
+    """The WS PUBLISH path (a device publishing over MQTT) triggers the
+    bridge too — the same session receives its update/accepted response."""
+    from conftest import patch_endpoint_dns
+
+    thing = _unique("shadow-wspub")
+    base = f"$aws/things/{thing}/shadow"
+    received: list = []
+
+    with patch_endpoint_dns():
+        asyncio.run(
+            _ws_publish_shadow_and_collect(
+                _default_ws_url(),
+                f"{base}/update/accepted",
+                f"{base}/update",
+                json.dumps({"state": {"reported": {"fw": "9"}}}).encode(),
+                received,
+                want=1,
+            )
+        )
+
+    assert received, "expected an update/accepted frame over the same WS session"
+    topic, payload = received[0]
+    assert topic == f"{base}/update/accepted"
+    doc = json.loads(payload)
+    assert doc["state"] == {"reported": {"fw": "9"}}
+
+    shadow = _read_shadow(iot_data_client.get_thing_shadow(thingName=thing))
+    assert shadow["state"]["reported"] == {"fw": "9"}
+
+
+def test_shadow_accepted_drives_topic_rule_republish(iot_client, iot_data_client):
+    """Rules-engine interplay: a rule on `$aws/things/+/shadow/update/accepted`
+    fires on the bridge's own response publish (datasync-style pipelines)."""
+    sink = _unique("shadow/sync")
+    rule = _unique("shadowsync").replace("-", "_")
+    thing = _unique("shadow-rule")
+    iot_client.create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": "SELECT * FROM '$aws/things/+/shadow/update/accepted'",
+            "actions": [
+                {
+                    "republish": {
+                        "topic": sink,
+                        "qos": 0,
+                        "roleArn": "arn:aws:iam::000000000000:role/rule",
+                    }
+                }
+            ],
+        },
+    )
+
+    try:
+        received = _collect_shadow_frames(
+            sink,
+            lambda: iot_data_client.publish(
+                topic=f"$aws/things/{thing}/shadow/update",
+                payload=json.dumps({"state": {"desired": {"sync": 1}}}).encode(),
+            ),
+            want=1,
+        )
+
+        assert received, "rule republish from update/accepted did not arrive"
+        # The `+` thing wildcard means concurrently running shadow tests may
+        # hit this rule too — find OUR update's projected event.
+        events = [
+            json.loads(payload) for topic, payload in received if topic == sink
+        ]
+        matching = [e for e in events if e.get("state") == {"desired": {"sync": 1}}]
+        assert matching, f"expected our accepted-doc projection, got {events}"
+        assert matching[0]["version"] >= 1
+    finally:
+        iot_client.delete_topic_rule(ruleName=rule)
