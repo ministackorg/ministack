@@ -1114,3 +1114,54 @@ def test_iot_rule_sns_action_publishes_to_topic(iot_client, iot_data_client, sns
     assert message == {"kind": "boom"}
 
     iot_client.delete_topic_rule(ruleName=rule)
+
+
+def test_iot_jitr_registration_event_drives_a_topic_rule(iot_client, lam, sqs):
+    """The JITR lifecycle event is a real broker publish, so a topic rule on
+    ``$aws/events/certificates/registered/{caId}`` hands it to a Lambda — the
+    shape a just-in-time-registration stack actually deploys.
+
+    The rule names this test's CA id rather than the ``+`` wildcard: the
+    account's registered-certificate topics are shared, so a wildcard rule
+    living for the length of this test also catches the registrations other
+    tests make on other xdist workers, and ``_poll_sink`` would return
+    whichever event landed first."""
+    pytest.importorskip("cryptography")
+    from ministack.core.x509_utils import generate_ca, sign_leaf_certificate
+
+    ca_pem, ca_key_pem = generate_ca(common_name=_unique("jitr-rule-ca"))
+    leaf_pem, _priv, _pub = sign_leaf_certificate(
+        ca_cert_pem=ca_pem,
+        ca_key_pem=ca_key_pem,
+        common_name=_unique("jitr-rule-device"),
+    )
+
+    sink = sqs.create_queue(QueueName=_unique("jitr-sink"))["QueueUrl"]
+    fn_arn = _make_sink_lambda(lam, sink)
+    rule = _unique("jitr").replace("-", "_")
+    ca_id = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, setAsActive=True, allowAutoRegistration=True
+    )["certificateId"]
+    iot_client.create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": f"SELECT * FROM '$aws/events/certificates/registered/{ca_id}'",
+            "actions": [{"lambda": {"functionArn": fn_arn}}],
+        },
+    )
+    try:
+        cert_id = iot_client.register_certificate(
+            certificatePem=leaf_pem,
+            caCertificatePem=ca_pem,
+            status="PENDING_ACTIVATION",
+        )["certificateId"]
+        event = _poll_sink(sqs, sink)
+        assert event is not None, "no JITR event reached the rule's Lambda"
+        assert event["certificateId"] == cert_id
+        assert event["caCertificateId"] == ca_id
+        assert event["certificateStatus"] == "PENDING_ACTIVATION"
+        iot_client.delete_certificate(certificateId=cert_id)
+    finally:
+        iot_client.delete_topic_rule(ruleName=rule)
+        iot_client.update_ca_certificate(certificateId=ca_id, newStatus="INACTIVE")
+        iot_client.delete_ca_certificate(certificateId=ca_id)

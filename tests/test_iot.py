@@ -331,6 +331,9 @@ def test_iot_delete_active_certificate_rejected(iot_client):
     with pytest.raises(ClientError) as ei:
         iot_client.delete_certificate(certificateId=cert_id)
     assert ei.value.response["Error"]["Code"] == "CertificateStateException"
+    # 406 per the service model — the same status the CA-certificate delete
+    # answers with for the same exception.
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 406
     iot_client.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
     iot_client.delete_certificate(certificateId=cert_id)
 
@@ -1433,6 +1436,8 @@ def test_iot_control_plane_identity_stores_are_region_scoped():
         iot_module._policies,
         iot_module._topic_rules,
         iot_module._shadows,
+        iot_module._ca_certificates,
+        iot_module._registration_codes,
     )
     assert all(isinstance(store, AccountRegionScopedDict) for store in stores)
 
@@ -4356,3 +4361,625 @@ def test_ddb_attribute_value_mapping():
     assert _ddb_attribute_value({"a": 1}) == {"S": '{"a": 1}'}
     assert _ddb_attribute_value([1, 2]) == {"S": "[1, 2]"}
     assert _ddb_attribute_value("x") == {"S": "x"}
+# ---------------------------------------------------------------------------
+# CA-certificate registry + JITR (registration code, RegisterCACertificate
+# and friends, and the $aws/events/certificates/registered/{caId} event)
+# ---------------------------------------------------------------------------
+
+
+def _generate_ca_and_leaves(count: int = 1) -> tuple[str, list[str]]:
+    """A fresh CA PEM and ``count`` leaf certificate PEMs signed by it.
+
+    Leaves have to be signed by the CA they are registered under —
+    ``RegisterCertificate`` verifies the ``caCertificatePem`` claim — so a test
+    that needs two device certificates under one CA must take them from the
+    same CA key, not from two independent ``_generate_ca_and_leaf`` calls.
+    """
+    pytest.importorskip("cryptography")
+    from ministack.core.x509_utils import generate_ca, sign_leaf_certificate
+
+    ca_pem, ca_key_pem = generate_ca(common_name=_unique("jitr-test-ca"))
+    leaves = [
+        sign_leaf_certificate(
+            ca_cert_pem=ca_pem,
+            ca_key_pem=ca_key_pem,
+            common_name=_unique("jitr-device"),
+        )[0]
+        for _ in range(count)
+    ]
+    return ca_pem, leaves
+
+
+def _generate_ca_and_leaf() -> tuple[str, str]:
+    """A fresh CA PEM and a leaf certificate PEM signed by it."""
+    ca_pem, leaves = _generate_ca_and_leaves()
+    return ca_pem, leaves[0]
+
+
+def test_iot_registration_code_stable_until_deleted(iot_client):
+    code = iot_client.get_registration_code()["registrationCode"]
+    assert len(code) == 64
+    int(code, 16)  # sha256 hex
+    # Stable across calls.
+    assert iot_client.get_registration_code()["registrationCode"] == code
+    # DELETE discards it; the next GET mints a fresh one.
+    iot_client.delete_registration_code()
+    fresh = iot_client.get_registration_code()["registrationCode"]
+    assert len(fresh) == 64
+    assert fresh != code
+
+
+def test_iot_ca_certificate_lifecycle(iot_client):
+    ca_pem, _leaf = _generate_ca_and_leaf()
+    resp = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, setAsActive=True, allowAutoRegistration=True
+    )
+    ca_id = resp["certificateId"]
+    assert resp["certificateArn"].endswith(":cacert/" + ca_id)
+
+    desc = iot_client.describe_ca_certificate(certificateId=ca_id)[
+        "certificateDescription"
+    ]
+    assert desc["certificatePem"] == ca_pem  # verbatim
+    assert desc["certificateId"] == ca_id
+    assert desc["status"] == "ACTIVE"
+    assert desc["autoRegistrationStatus"] == "ENABLE"
+    assert desc["creationDate"]
+
+    listing = iot_client.list_ca_certificates()["certificates"]
+    entry = next(c for c in listing if c["certificateId"] == ca_id)
+    assert entry["certificateArn"].endswith(":cacert/" + ca_id)
+    assert entry["status"] == "ACTIVE"
+
+    # ACTIVE CAs cannot be deleted — 406 per the service model.
+    with pytest.raises(ClientError) as ei:
+        iot_client.delete_ca_certificate(certificateId=ca_id)
+    assert ei.value.response["Error"]["Code"] == "CertificateStateException"
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 406
+
+    iot_client.update_ca_certificate(
+        certificateId=ca_id,
+        newStatus="INACTIVE",
+        newAutoRegistrationStatus="DISABLE",
+    )
+    desc = iot_client.describe_ca_certificate(certificateId=ca_id)[
+        "certificateDescription"
+    ]
+    assert desc["status"] == "INACTIVE"
+    assert desc["autoRegistrationStatus"] == "DISABLE"
+
+    iot_client.delete_ca_certificate(certificateId=ca_id)
+    with pytest.raises(ClientError) as ei:
+        iot_client.describe_ca_certificate(certificateId=ca_id)
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_iot_register_ca_certificate_duplicate_conflict(iot_client):
+    ca_pem, _leaf = _generate_ca_and_leaf()
+    ca_id = iot_client.register_ca_certificate(caCertificate=ca_pem)["certificateId"]
+    with pytest.raises(ClientError) as ei:
+        iot_client.register_ca_certificate(caCertificate=ca_pem)
+    err = ei.value.response
+    assert err["Error"]["Code"] == "ResourceAlreadyExistsException"
+    assert err["resourceId"] == ca_id
+    assert err["resourceArn"].endswith(":cacert/" + ca_id)
+    iot_client.delete_ca_certificate(certificateId=ca_id)
+
+
+def test_iot_jitr_registered_event_published_when_auto_registration_enabled():
+    """Register a CA with auto-registration ENABLE, subscribe on
+    ``$aws/events/certificates/registered/#``, register a device cert under
+    that CA — the JITR lifecycle event arrives with certificateId +
+    caCertificateId and DescribeCertificate resolves the signing CA.
+
+    Runs in-process against the module broker (the WS route to the live
+    server needs ``*.localhost`` DNS this environment lacks), following the
+    broker-helper pattern above.
+    """
+    from ministack.core.responses import (
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import iot as iot_module
+
+    ca_pem, leaf_pem = _generate_ca_and_leaf()
+    account_id = "123456789012"
+    received: list = []
+
+    async def _run():
+        set_request_account_id(account_id)
+        set_request_region(_TEST_REGION)
+
+        status, _, body = await iot_module.handle_request(
+            "POST",
+            "/cacertificate",
+            {},
+            json.dumps({"caCertificate": ca_pem}).encode(),
+            {"setAsActive": "true", "allowAutoRegistration": "true"},
+        )
+        assert status == 200
+        ca_id = json.loads(body)["certificateId"]
+
+        async def _collect(topic, payload, qos):
+            received.append((topic, payload, qos))
+
+        await iot_module.broker_subscribe(
+            account_id,
+            _TEST_REGION,
+            "$aws/events/certificates/registered/#",
+            _collect,
+        )
+
+        status, _, body = await iot_module.handle_request(
+            "POST",
+            "/certificate/register",
+            {},
+            json.dumps({
+                "certificatePem": leaf_pem,
+                "caCertificatePem": ca_pem,
+                "status": "PENDING_ACTIVATION",
+            }).encode(),
+            {},
+        )
+        assert status == 200
+        cert_id = json.loads(body)["certificateId"]
+
+        assert len(received) == 1
+        topic, payload, _qos = received[0]
+        assert topic == f"$aws/events/certificates/registered/{ca_id}"
+        event = json.loads(payload)
+        assert event["certificateId"] == cert_id
+        assert event["caCertificateId"] == ca_id
+        assert event["certificateStatus"] == "PENDING_ACTIVATION"
+        assert event["awsAccountId"] == account_id
+        assert isinstance(event["timestamp"], int)
+        assert event["certificateRegistrationTimestamp"] == str(event["timestamp"])
+
+        # A JITR Lambda resolves the signing CA via DescribeCertificate.
+        status, _, body = await iot_module.handle_request(
+            "GET", f"/certificates/{cert_id}", {}, b"", {}
+        )
+        assert status == 200
+        assert (
+            json.loads(body)["certificateDescription"]["caCertificateId"] == ca_id
+        )
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        iot_module.broker_reset()
+
+
+def test_iot_jitr_no_event_when_auto_registration_disabled():
+    """A CA registered without ``allowAutoRegistration`` links the device cert
+    (``caCertificateId``) but publishes no registered event."""
+    from ministack.core.responses import (
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import iot as iot_module
+
+    ca_pem, leaf_pem = _generate_ca_and_leaf()
+    account_id = "123456789012"
+    received: list = []
+
+    async def _run():
+        set_request_account_id(account_id)
+        set_request_region(_TEST_REGION)
+
+        status, _, body = await iot_module.handle_request(
+            "POST",
+            "/cacertificate",
+            {},
+            json.dumps({"caCertificate": ca_pem}).encode(),
+            {"setAsActive": "true"},
+        )
+        assert status == 200
+        ca_id = json.loads(body)["certificateId"]
+
+        async def _collect(topic, payload, qos):
+            received.append((topic, payload, qos))
+
+        await iot_module.broker_subscribe(
+            account_id,
+            _TEST_REGION,
+            "$aws/events/certificates/registered/#",
+            _collect,
+        )
+
+        status, _, body = await iot_module.handle_request(
+            "POST",
+            "/certificate/register",
+            {},
+            json.dumps({
+                "certificatePem": leaf_pem,
+                "caCertificatePem": ca_pem,
+            }).encode(),
+            {},
+        )
+        assert status == 200
+        cert_id = json.loads(body)["certificateId"]
+        assert received == []
+
+        status, _, body = await iot_module.handle_request(
+            "GET", f"/certificates/{cert_id}", {}, b"", {}
+        )
+        assert (
+            json.loads(body)["certificateDescription"]["caCertificateId"] == ca_id
+        )
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        iot_module.broker_reset()
+
+
+def test_iot_register_certificate_under_ca_links_ca_certificate_id(iot_client):
+    """The headline JITR flow over the wire: register a CA, register a device
+    certificate under it, and DescribeCertificate resolves the signing CA —
+    through the router, botocore serialization and all."""
+    ca_pem, leaf_pem = _generate_ca_and_leaf()
+    ca_id = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, setAsActive=True, allowAutoRegistration=True
+    )["certificateId"]
+    try:
+        cert_id = iot_client.register_certificate(
+            certificatePem=leaf_pem,
+            caCertificatePem=ca_pem,
+            status="PENDING_ACTIVATION",
+        )["certificateId"]
+        desc = iot_client.describe_certificate(certificateId=cert_id)[
+            "certificateDescription"
+        ]
+        assert desc["caCertificateId"] == ca_id
+        assert desc["status"] == "PENDING_ACTIVATION"
+        iot_client.delete_certificate(certificateId=cert_id)
+    finally:
+        iot_client.update_ca_certificate(certificateId=ca_id, newStatus="INACTIVE")
+        iot_client.delete_ca_certificate(certificateId=ca_id)
+
+
+def test_iot_register_certificate_rejects_an_unregistered_ca(iot_client):
+    """``caCertificatePem`` naming a CA that was never registered is a
+    ``CertificateValidationException``, and nothing is stored — otherwise the
+    CA id is whatever the caller sent and DescribeCertificate points at a CA
+    that does not exist."""
+    from ministack.core.x509_utils import get_certificate_id
+
+    ca_pem, leaf_pem = _generate_ca_and_leaf()
+    with pytest.raises(ClientError) as ei:
+        iot_client.register_certificate(
+            certificatePem=leaf_pem, caCertificatePem=ca_pem
+        )
+    assert ei.value.response["Error"]["Code"] == "CertificateValidationException"
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+    with pytest.raises(ClientError) as ei:
+        iot_client.describe_certificate(certificateId=get_certificate_id(leaf_pem))
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_iot_register_certificate_rejects_a_leaf_from_another_ca(iot_client):
+    """Both CAs are registered, so the only thing separating them is the
+    signature: a leaf signed by CA-X may not register under CA-Y. Without the
+    check the JITR event fires on CA-Y's topic and a JITR Lambda that picks
+    provisioning templates by ``caCertificateId`` provisions the wrong fleet.
+    The same leaf under its real CA still registers."""
+    from ministack.core.x509_utils import get_certificate_id
+
+    ca_x_pem, leaf_pem = _generate_ca_and_leaf()
+    ca_y_pem, _leaf_y = _generate_ca_and_leaf()
+    ca_x_id = iot_client.register_ca_certificate(
+        caCertificate=ca_x_pem, setAsActive=True, allowAutoRegistration=True
+    )["certificateId"]
+    ca_y_id = iot_client.register_ca_certificate(
+        caCertificate=ca_y_pem, setAsActive=True, allowAutoRegistration=True
+    )["certificateId"]
+    try:
+        with pytest.raises(ClientError) as ei:
+            iot_client.register_certificate(
+                certificatePem=leaf_pem, caCertificatePem=ca_y_pem
+            )
+        assert ei.value.response["Error"]["Code"] == "CertificateValidationException"
+        assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        with pytest.raises(ClientError):
+            iot_client.describe_certificate(certificateId=get_certificate_id(leaf_pem))
+
+        # Same leaf, its actual issuer — accepted, and linked to that CA.
+        cert_id = iot_client.register_certificate(
+            certificatePem=leaf_pem, caCertificatePem=ca_x_pem
+        )["certificateId"]
+        desc = iot_client.describe_certificate(certificateId=cert_id)[
+            "certificateDescription"
+        ]
+        assert desc["caCertificateId"] == ca_x_id
+        iot_client.delete_certificate(certificateId=cert_id)
+    finally:
+        for ca_id in (ca_x_id, ca_y_id):
+            iot_client.update_ca_certificate(certificateId=ca_id, newStatus="INACTIVE")
+            iot_client.delete_ca_certificate(certificateId=ca_id)
+
+
+def test_iot_jitr_no_event_for_a_certificate_from_another_ca():
+    """The rejection happens before anything is published, so no JITR consumer
+    ever sees an event attributing a foreign certificate to its CA."""
+    from ministack.core.responses import (
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import iot as iot_module
+
+    _ca_x_pem, leaf_pem = _generate_ca_and_leaf()
+    ca_y_pem, _leaf_y = _generate_ca_and_leaf()
+    account_id = "123456789012"
+    received: list = []
+
+    async def _run():
+        set_request_account_id(account_id)
+        set_request_region(_TEST_REGION)
+
+        status, _, _body = await iot_module.handle_request(
+            "POST",
+            "/cacertificate",
+            {},
+            json.dumps({"caCertificate": ca_y_pem}).encode(),
+            {"setAsActive": "true", "allowAutoRegistration": "true"},
+        )
+        assert status == 200
+
+        async def _collect(topic, payload, qos):
+            received.append((topic, payload, qos))
+
+        await iot_module.broker_subscribe(
+            account_id,
+            _TEST_REGION,
+            "$aws/events/certificates/registered/#",
+            _collect,
+        )
+
+        status, _, body = await iot_module.handle_request(
+            "POST",
+            "/certificate/register",
+            {},
+            json.dumps(
+                {"certificatePem": leaf_pem, "caCertificatePem": ca_y_pem}
+            ).encode(),
+            {},
+        )
+        assert status == 400
+        assert json.loads(body)["__type"] == "CertificateValidationException"
+        assert received == []
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        iot_module.broker_reset()
+
+
+def test_iot_update_ca_certificate_applies_a_body_only_status(iot_client):
+    """newStatus / newAutoRegistrationStatus are modeled in the query string,
+    but a raw caller that sends them in the JSON body must not get a 200 that
+    changed nothing — UpdateCertificate accepts either, and so does this."""
+    import os
+    import urllib.request
+
+    ca_pem, _leaf = _generate_ca_and_leaf()
+    ca_id = iot_client.register_ca_certificate(caCertificate=ca_pem)["certificateId"]
+    try:
+        assert (
+            iot_client.describe_ca_certificate(certificateId=ca_id)[
+                "certificateDescription"
+            ]["status"]
+            == "INACTIVE"
+        )
+        endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+        req = urllib.request.Request(
+            f"{endpoint}/cacertificate/{ca_id}",
+            data=json.dumps(
+                {"newStatus": "ACTIVE", "newAutoRegistrationStatus": "ENABLE"}
+            ).encode(),
+            method="PUT",
+            headers={
+                # The CA registry is account+region scoped, so the credential
+                # scope has to name the same region the boto3 client signs with.
+                "Authorization": (
+                    "AWS4-HMAC-SHA256 Credential=test/0/us-east-1/iot/aws4_request"
+                ),
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 200
+        desc = iot_client.describe_ca_certificate(certificateId=ca_id)[
+            "certificateDescription"
+        ]
+        assert desc["status"] == "ACTIVE"
+        assert desc["autoRegistrationStatus"] == "ENABLE"
+    finally:
+        iot_client.update_ca_certificate(certificateId=ca_id, newStatus="INACTIVE")
+        iot_client.delete_ca_certificate(certificateId=ca_id)
+
+
+def test_iot_jitr_event_requires_an_active_ca():
+    """Auto-registration is gated on the CA's own status: an INACTIVE CA with
+    allowAutoRegistration publishes nothing (AWS registers nothing under one),
+    and activating the same CA starts the events flowing."""
+    from ministack.core.responses import (
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import iot as iot_module
+
+    ca_pem, (leaf_pem, leaf_pem2) = _generate_ca_and_leaves(2)
+    account_id = "123456789012"
+    received: list = []
+
+    async def _run():
+        set_request_account_id(account_id)
+        set_request_region(_TEST_REGION)
+
+        # INACTIVE (no setAsActive) but auto-registration ENABLE.
+        status, _, body = await iot_module.handle_request(
+            "POST",
+            "/cacertificate",
+            {},
+            json.dumps({"caCertificate": ca_pem}).encode(),
+            {"allowAutoRegistration": "true"},
+        )
+        assert status == 200
+        ca_id = json.loads(body)["certificateId"]
+
+        async def _collect(topic, payload, qos):
+            received.append((topic, payload, qos))
+
+        await iot_module.broker_subscribe(
+            account_id,
+            _TEST_REGION,
+            "$aws/events/certificates/registered/#",
+            _collect,
+        )
+
+        status, _, _body = await iot_module.handle_request(
+            "POST",
+            "/certificate/register",
+            {},
+            json.dumps(
+                {"certificatePem": leaf_pem, "caCertificatePem": ca_pem}
+            ).encode(),
+            {},
+        )
+        assert status == 200
+        assert received == []
+
+        # Activate the CA — the very next registration fires.
+        status, _, _body = await iot_module.handle_request(
+            "PUT", f"/cacertificate/{ca_id}", {}, b"", {"newStatus": "ACTIVE"}
+        )
+        assert status == 200
+
+        status, _, body = await iot_module.handle_request(
+            "POST",
+            "/certificate/register",
+            {},
+            json.dumps(
+                {"certificatePem": leaf_pem2, "caCertificatePem": ca_pem}
+            ).encode(),
+            {},
+        )
+        assert status == 200
+        cert_id2 = json.loads(body)["certificateId"]
+
+        assert len(received) == 1
+        topic, payload, _qos = received[0]
+        assert topic == f"$aws/events/certificates/registered/{ca_id}"
+        assert json.loads(payload)["certificateId"] == cert_id2
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        iot_module.broker_reset()
+
+
+def test_iot_jitr_registration_survives_a_broker_failure(monkeypatch):
+    """The certificate is committed before the event is published, so a broker
+    that raises must not turn a successful registration into a 500."""
+    from ministack.core.responses import (
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import iot as iot_module
+
+    ca_pem, leaf_pem = _generate_ca_and_leaf()
+    account_id = "123456789012"
+
+    async def _boom(*_args, **_kwargs):
+        raise RuntimeError("broker down")
+
+    async def _run():
+        set_request_account_id(account_id)
+        set_request_region(_TEST_REGION)
+
+        status, _, _body = await iot_module.handle_request(
+            "POST",
+            "/cacertificate",
+            {},
+            json.dumps({"caCertificate": ca_pem}).encode(),
+            {"setAsActive": "true", "allowAutoRegistration": "true"},
+        )
+        assert status == 200
+
+        monkeypatch.setattr(iot_module, "broker_publish", _boom)
+        status, _, body = await iot_module.handle_request(
+            "POST",
+            "/certificate/register",
+            {},
+            json.dumps(
+                {"certificatePem": leaf_pem, "caCertificatePem": ca_pem}
+            ).encode(),
+            {},
+        )
+        assert status == 200
+        cert_id = json.loads(body)["certificateId"]
+
+        status, _, body = await iot_module.handle_request(
+            "GET", f"/certificates/{cert_id}", {}, b"", {}
+        )
+        assert status == 200
+        assert json.loads(body)["certificateDescription"]["certificateId"] == cert_id
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        iot_module.broker_reset()
+
+
+def test_iot_update_ca_certificate_rejects_invalid_enum_values(iot_client):
+    """The two update fields validate their enums with a 400.
+
+    boto3 already refuses bad values client-side, so the branch is only
+    reachable over raw HTTP - which is exactly how a non-SDK caller would
+    hit it.
+    """
+    import os
+    import urllib.error
+    import urllib.request
+
+    ca_pem, _leaf = _generate_ca_and_leaf()
+    ca_id = iot_client.register_ca_certificate(caCertificate=ca_pem)["certificateId"]
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    try:
+        for payload, wanted in (
+            ({"newStatus": "BOGUS"}, "newStatus"),
+            ({"newAutoRegistrationStatus": "MAYBE"}, "newAutoRegistrationStatus"),
+        ):
+            req = urllib.request.Request(
+                f"{endpoint}/cacertificate/{ca_id}",
+                data=json.dumps(payload).encode(),
+                method="PUT",
+                headers={
+                    "Authorization": (
+                        "AWS4-HMAC-SHA256 Credential=test/0/us-east-1/iot/aws4_request"
+                    ),
+                    "Content-Type": "application/json",
+                },
+            )
+            try:
+                urllib.request.urlopen(req, timeout=5)
+                pytest.fail(f"expected HTTP 400 for {payload}")
+            except urllib.error.HTTPError as e:
+                assert e.code == 400
+                assert wanted in e.read().decode()
+        # The invalid updates changed nothing: a freshly registered CA stays
+        # INACTIVE with auto-registration DISABLE.
+        desc = iot_client.describe_ca_certificate(certificateId=ca_id)[
+            "certificateDescription"
+        ]
+        assert desc["status"] == "INACTIVE"
+        assert desc["autoRegistrationStatus"] == "DISABLE"
+    finally:
+        iot_client.delete_ca_certificate(certificateId=ca_id)

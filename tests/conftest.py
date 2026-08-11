@@ -150,6 +150,11 @@ _SERIAL_TESTS = {
     "tests/test_lambda.py::test_lambda_recursive_loop_allow_lets_the_chain_through",
     "tests/test_lambda.py::test_lambda_recursive_loop_drop_is_recursive_invocation_exception",
     "tests/test_lambda.py::test_lambda_nested_invoke_below_limit_is_unaffected",
+    # DeleteRegistrationCode discards the one code the account/region holds, and
+    # the test asserts the next GetRegistrationCode mints a different one — a
+    # parallel worker calling GetRegistrationCode either side of the delete sees
+    # the code change under it. Same account-global mutation class as above.
+    "tests/test_iot.py::test_iot_registration_code_stable_until_deleted",
 }
 
 
