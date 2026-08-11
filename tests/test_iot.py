@@ -1188,7 +1188,7 @@ def test_iot_topic_rules_and_basic_ingest_use_publish_region(monkeypatch):
     dispatched = []
 
     def _capture_rule_action(
-        dispatched_account_id, dispatched_region, rule, payload, topic=""
+        dispatched_account_id, dispatched_region, rule, payload, topic="", client_id=None
     ):
         dispatched.append((dispatched_account_id, dispatched_region, rule, payload))
 
@@ -2669,6 +2669,163 @@ def test_rule_event_from_less_basic_ingest_projects():
         "SELECT deviceId AS id, temp", "$aws/rules/myrule", b'{"deviceId": "d1", "temp": 22, "extra": "x"}'
     )
     assert event == {"id": "d1", "temp": 22}
+
+
+# ----------------------------------------------------------------------
+# Rule SQL functions: newuuid(), replace(), clientid() (and the accepted
+# but unresolvable principal() / traceid()).
+# ----------------------------------------------------------------------
+
+
+def test_rule_event_newuuid_projects_a_fresh_uuid():
+    from ministack.services.iot import _rule_event
+
+    first = _rule_event("SELECT newuuid() AS id FROM 't'", "t", b"{}")
+    second = _rule_event("SELECT newuuid() AS id FROM 't'", "t", b"{}")
+    assert uuid.UUID(first["id"])  # well-formed
+    assert first["id"] != second["id"]
+
+
+def test_rule_event_replace_rewrites_strings():
+    from ministack.services.iot import _rule_event
+
+    event = _rule_event(
+        "SELECT replace(deviceId, 'dev-', 'unit-') AS id FROM 't'",
+        "t",
+        b'{"deviceId": "dev-42"}',
+    )
+    assert event == {"id": "unit-42"}
+
+
+def test_rule_event_replace_of_missing_or_nonstring_is_omitted():
+    from ministack.services.iot import _rule_event
+
+    # Missing source attribute → Undefined → omitted.
+    event = _rule_event(
+        "SELECT replace(absent, 'a', 'b') AS x, deviceId FROM 't'",
+        "t",
+        b'{"deviceId": "d1"}',
+    )
+    assert event == {"deviceId": "d1"}
+    # Non-string source → Undefined on AWS.
+    event = _rule_event(
+        "SELECT replace(count, 'a', 'b') AS x FROM 't'", "t", b'{"count": 3}'
+    )
+    assert event == {}
+
+
+def test_rule_event_clientid_resolves_for_mqtt_and_is_omitted_for_http():
+    from ministack.services.iot import _rule_event
+
+    sql = "SELECT clientid() AS cid, temp FROM 't'"
+    # MQTT publish: the broker threads the publishing client's id through.
+    event = _rule_event(sql, "t", b'{"temp": 22}', client_id="sensor-7")
+    assert event == {"cid": "sensor-7", "temp": 22}
+    # HTTP publish: no MQTT client exists — AWS resolves clientid() to
+    # Undefined, so the field is omitted from the projection.
+    event = _rule_event(sql, "t", b'{"temp": 22}')
+    assert event == {"temp": 22}
+
+
+def test_rule_event_replace_handles_escaped_quotes():
+    """`replace()` takes SQL string literals, so a quote in either argument is
+    written the SQL way — doubled."""
+    from ministack.services.iot import _rule_event
+
+    event = _rule_event(
+        "SELECT replace(note, 'it''s', 'it is') AS n FROM 't'",
+        "t",
+        b'{"note": "it\'s on"}',
+    )
+    assert event == {"n": "it is on"}
+
+
+def test_rule_event_principal_and_traceid_accepted_but_unresolved(caplog):
+    """Both are real AWS functions, so a rule using them is stored rather than
+    failing a stack that deploys on AWS — but this publish path carries no
+    certificate identity or trace id, so they warn like any other function the
+    evaluator does not implement."""
+    from ministack.services import iot as iot_module
+    from ministack.services.iot import _rule_event, _validate_rule_sql
+
+    sql = "SELECT principal() AS p, traceid() AS t, temp FROM 't'"
+    assert _validate_rule_sql(sql) is None
+    # The evaluator warns once per function name for the life of the process.
+    iot_module._warned_sql_funcs.clear()
+    with caplog.at_level(logging.WARNING, logger="iot"):
+        assert _rule_event(sql, "t", b'{"temp": 1}') == {"temp": 1}
+    warned = " ".join(r.message for r in caplog.records)
+    assert "principal()" in warned and "traceid()" in warned
+
+
+def test_eval_where_clientid_reaches_every_leaf_form():
+    """clientid() is an operand like any other, so it resolves inside the whole
+    WHERE grammar, not just a plain comparison."""
+    from ministack.services.iot import _eval_where, _rule_message
+
+    raw = b'{"temp": 1}'
+    message = _rule_message(raw)
+    for pred, expected in (
+        ("clientid() = 'sensor-7'", True),
+        ("clientid() IN ('sensor-7', 'sensor-8')", True),
+        ("clientid() IN ('sensor-8')", False),
+        ("clientid() LIKE 'sensor-%'", True),
+        ("isUndefined(clientid())", False),
+    ):
+        assert _eval_where(pred, "t", raw, message, "sensor-7") is expected
+    # An HTTP publish carries no client id, so every one of them fails closed.
+    for pred in (
+        "clientid() = 'sensor-7'",
+        "clientid() IN ('sensor-7')",
+        "clientid() LIKE 'sensor-%'",
+    ):
+        assert _eval_where(pred, "t", raw, message) is False
+    assert _eval_where("isUndefined(clientid())", "t", raw, message) is True
+
+
+def test_broker_publish_threads_client_id_into_rule_projection(monkeypatch):
+    """`clientid()` sees the WS client's id via broker_publish, end to end."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    iot_module._topic_rules.set_scoped(
+        account_id,
+        _TEST_REGION,
+        "cid_rule",
+        {
+            "ruleName": "cid_rule",
+            "sql": "SELECT clientid() AS cid FROM 'sensors/#'",
+            "ruleDisabled": False,
+            "actions": [{"lambda": {"functionArn": "arn:aws:lambda:us-east-1:123456789012:function:sink"}}],
+        },
+    )
+    dispatched = []
+    monkeypatch.setattr(
+        iot_module,
+        "_dispatch_rule_to_lambda",
+        lambda account, region, arn, event: dispatched.append(event),
+    )
+
+    async def _run():
+        # A WS PUBLISH passes the connected client's id...
+        send, _sent = _mock_send()
+        session = _WSSession(send, account_id)
+        await session.handle_packet(PKT_CONNECT, 0, _build_connect_body("sensor-7"))
+        await session.handle_packet(
+            PKT_PUBLISH, 0, _encode_string("sensors/door") + b'{"n": 1}'
+        )
+        await session.cleanup()
+        # ...while the HTTP publish path passes none.
+        await publish(account_id, "sensors/door", b'{"n": 2}')
+
+    try:
+        asyncio.run(_run())
+        assert dispatched == [{"cid": "sensor-7"}, {}]
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
 
 
 # ----------------------------------------------------------------------

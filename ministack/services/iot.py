@@ -1599,9 +1599,12 @@ def _encode_base64(value, payload: bytes):
 # satisfies a WHERE clause. Both ends therefore warn, so the misfire is visible
 # instead of looking like "the rule did not match".
 _IMPLEMENTED_SQL_FUNCS = frozenset({
+    "clientid",
     "encode",
     "isundefined",
+    "newuuid",
     "regexp_matches",
+    "replace",
     "timestamp",
     "topic",
 })
@@ -1622,7 +1625,9 @@ def _warn_unimplemented_sql_function(name: str) -> None:
     )
 
 
-def _eval_select_function(name: str, args: list[str], topic: str, payload: bytes, message):
+def _eval_select_function(
+    name: str, args: list[str], topic: str, payload: bytes, message, client_id: str | None = None
+):
     if name == "encode":
         if len(args) != 2:
             return _MISSING
@@ -1631,7 +1636,7 @@ def _eval_select_function(name: str, args: list[str], topic: str, payload: bytes
             return _MISSING
         # `encode(*, 'base64')` encodes the payload as published — the bytes
         # never round-trip through a text decode.
-        value = payload if source == "*" else _eval_select_expr(source, topic, payload, message)
+        value = payload if source == "*" else _eval_select_expr(source, topic, payload, message, client_id)
         return _encode_base64(value, payload)
     if name == "topic":
         if not args:
@@ -1649,12 +1654,32 @@ def _eval_select_function(name: str, args: list[str], topic: str, payload: bytes
     if name == "isundefined":
         if len(args) != 1:
             return _MISSING
-        return _eval_select_expr(args[0], topic, payload, message) is _MISSING
+        return _eval_select_expr(args[0], topic, payload, message, client_id) is _MISSING
+    if name == "newuuid" and not args:
+        return new_uuid()
+    if name == "replace":
+        if len(args) != 3:
+            return _MISSING
+        old, new = _sql_string_value(args[1].strip()), _sql_string_value(args[2].strip())
+        if old is None or new is None:
+            return _MISSING
+        value = _eval_select_expr(args[0], topic, payload, message, client_id)
+        if not isinstance(value, str):
+            # An Undefined (or non-string) source is Undefined on AWS.
+            return _MISSING
+        return value.replace(old, new)
+    if name == "clientid" and not args:
+        # HTTP publishes carry no MQTT client id — AWS resolves clientid() to
+        # Undefined there, so the field is omitted from the projection.
+        return client_id if client_id else _MISSING
+    # principal() and traceid() land here too: this publish path carries no
+    # certificate identity or trace id to report, so they warn like any other
+    # function the evaluator does not implement.
     _warn_unimplemented_sql_function(name)
     return _MISSING
 
 
-def _eval_select_expr(expr: str, topic: str, payload: bytes, message):
+def _eval_select_expr(expr: str, topic: str, payload: bytes, message, client_id: str | None = None):
     expr = expr.strip()
     if expr == "*":
         return message
@@ -1669,6 +1694,7 @@ def _eval_select_expr(expr: str, topic: str, payload: bytes, message):
             topic,
             payload,
             message,
+            client_id,
         )
     if _SELECT_ATTR_RE.match(expr):
         return _resolve_attribute(message, expr)
@@ -1684,7 +1710,7 @@ def _eval_select_expr(expr: str, topic: str, payload: bytes, message):
     # re-split: a parenthesised group or an arithmetic expression over them.
     # Its scanners live with the WHERE parser below, which splits on the same
     # quote/paren rules.
-    return _eval_sql_arithmetic(expr, topic, payload, message)
+    return _eval_sql_arithmetic(expr, topic, payload, message, client_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1893,21 +1919,22 @@ def _sql_arithmetic(op: str, left, right):
     return lnum / rnum
 
 
-def _eval_sql_arithmetic(expr: str, topic: str, payload: bytes, message):
+def _eval_sql_arithmetic(expr: str, topic: str, payload: bytes, message, client_id: str | None):
     """Evaluate a parenthesised group or an arithmetic expression, or return the
     missing-value sentinel when ``expr`` is neither."""
     inner = _strip_where_group(expr)
     if inner is not None:
-        return _eval_select_expr(inner, topic, payload, message)
+        return _eval_select_expr(inner, topic, payload, message, client_id)
     parts = _split_arithmetic(expr)
     if parts is None:
         return _MISSING
     left_expr, op, right_expr = parts
-    left = _eval_select_expr(left_expr, topic, payload, message)
-    right = _eval_select_expr(right_expr, topic, payload, message)
+    left = _eval_select_expr(left_expr, topic, payload, message, client_id)
+    right = _eval_select_expr(right_expr, topic, payload, message, client_id)
     if left is _MISSING or right is _MISSING:
         return _MISSING
     return _sql_arithmetic(op, left, right)
+
 
 def _split_comparison(clause: str) -> tuple[str, str, str] | None:
     """Split ``<left> <op> <right>`` at the first top-level comparison operator."""
@@ -2070,7 +2097,7 @@ def _where_values_equal(left, right) -> bool:
     return left == right
 
 
-def _eval_where_node(node: tuple, topic: str, payload: bytes, message):
+def _eval_where_node(node: tuple, topic: str, payload: bytes, message, client_id: str | None):
     """Evaluate one parsed WHERE node to true, false, or Undefined.
 
     Undefined is what each AWS operator answers for an operand it cannot use,
@@ -2083,7 +2110,7 @@ def _eval_where_node(node: tuple, topic: str, payload: bytes, message):
     if kind == "or":
         undefined = False
         for child in node[1]:
-            result = _eval_where_node(child, topic, payload, message)
+            result = _eval_where_node(child, topic, payload, message, client_id)
             if result is True:
                 return True
             undefined = undefined or result is _MISSING
@@ -2091,33 +2118,33 @@ def _eval_where_node(node: tuple, topic: str, payload: bytes, message):
     if kind == "and":
         undefined = False
         for child in node[1]:
-            result = _eval_where_node(child, topic, payload, message)
+            result = _eval_where_node(child, topic, payload, message, client_id)
             if result is False:
                 return False
             undefined = undefined or result is _MISSING
         return _MISSING if undefined else True
     if kind == "not":
-        inner = _eval_where_node(node[1], topic, payload, message)
+        inner = _eval_where_node(node[1], topic, payload, message, client_id)
         # NOT Undefined is Undefined, so a predicate over an absent attribute
         # still fails closed once negated.
         return _MISSING if inner is _MISSING else not inner
     if kind == "regexp":
-        text = _sql_as_string(_eval_select_expr(node[1], topic, payload, message))
+        text = _sql_as_string(_eval_select_expr(node[1], topic, payload, message, client_id))
         return _MISSING if text is None else re.search(node[2], text) is not None
     if kind == "truth":
         # A bare operand is a predicate only if it converts to a Boolean: true,
         # false, or the strings spelling them. A number does not, on AWS.
-        value = _sql_as_bool(_eval_select_expr(node[1], topic, payload, message))
+        value = _sql_as_bool(_eval_select_expr(node[1], topic, payload, message, client_id))
         return _MISSING if value is None else value
     if kind == "isnull":
-        value = _eval_select_expr(node[1], topic, payload, message)
+        value = _eval_select_expr(node[1], topic, payload, message, client_id)
         if value is _MISSING:
             # Undefined is not NULL, and it is not "not NULL" either.
             return _MISSING
         return value is not None if node[2] else value is None
     if kind == "between":
         bounds = [
-            _sql_as_number(_eval_select_expr(expr, topic, payload, message))
+            _sql_as_number(_eval_select_expr(expr, topic, payload, message, client_id))
             for expr in node[1:]
         ]
         if any(bound is None for bound in bounds):
@@ -2125,26 +2152,26 @@ def _eval_where_node(node: tuple, topic: str, payload: bytes, message):
         value, low, high = bounds
         return low <= value <= high
     if kind == "in":
-        value = _eval_select_expr(node[1], topic, payload, message)
+        value = _eval_select_expr(node[1], topic, payload, message, client_id)
         if value is _MISSING:
             return _MISSING
         hit = any(
-            _where_values_equal(value, _eval_select_expr(opt, topic, payload, message))
+            _where_values_equal(value, _eval_select_expr(opt, topic, payload, message, client_id))
             for opt in node[2]
         )
         return not hit if node[3] else hit
     if kind == "like":
         # LIKE wants a String, so a number or a boolean converts to one rather
         # than dropping out — the same conversion regexp_matches() applies.
-        text = _sql_as_string(_eval_select_expr(node[1], topic, payload, message))
+        text = _sql_as_string(_eval_select_expr(node[1], topic, payload, message, client_id))
         if text is None:
             return _MISSING
         hit = re.fullmatch(node[2], text) is not None
         return not hit if node[3] else hit
 
     _, left_expr, op, right_expr = node
-    left = _eval_select_expr(left_expr, topic, payload, message)
-    right = _eval_select_expr(right_expr, topic, payload, message)
+    left = _eval_select_expr(left_expr, topic, payload, message, client_id)
+    right = _eval_select_expr(right_expr, topic, payload, message, client_id)
     if left is _MISSING or right is _MISSING:
         return _MISSING
     if op in ("=", "=="):
@@ -2166,7 +2193,7 @@ def _eval_where_node(node: tuple, topic: str, payload: bytes, message):
     return lnum >= rnum
 
 
-def _eval_where(pred: str, topic: str, payload: bytes, message) -> bool:
+def _eval_where(pred: str, topic: str, payload: bytes, message, client_id: str | None = None) -> bool:
     """Evaluate a WHERE predicate against one publish.
 
     AWS-faithful failure mode: a clause referencing an attribute missing from
@@ -2183,7 +2210,7 @@ def _eval_where(pred: str, topic: str, payload: bytes, message) -> bool:
             pred,
         )
         return False
-    return _eval_where_node(node, topic, payload, message) is True
+    return _eval_where_node(node, topic, payload, message, client_id) is True
 
 
 class RuleSqlError(ValueError):
@@ -2714,7 +2741,7 @@ def _rule_message(payload: bytes):
         return text
 
 
-def _rule_event(sql: str, topic: str, payload: bytes):
+def _rule_event(sql: str, topic: str, payload: bytes, client_id: str | None = None):
     """Project a publish payload through a rule's SELECT clause."""
     payload = payload or b""
     message = _rule_message(payload)
@@ -2728,7 +2755,7 @@ def _rule_event(sql: str, topic: str, payload: bytes):
     event: dict = {}
     for item in items:
         expr, alias = _split_select_alias(item)
-        value = _eval_select_expr(expr, topic, payload, message)
+        value = _eval_select_expr(expr, topic, payload, message, client_id)
         if value is _MISSING:
             continue
         if expr == "*" and alias is None:
@@ -2759,11 +2786,16 @@ def _dispatch_rule_to_lambda(
 
 
 def _run_rule_actions(
-    account_id: str, region: str, rule: dict, payload: bytes, topic: str = ""
+    account_id: str,
+    region: str,
+    rule: dict,
+    payload: bytes,
+    topic: str = "",
+    client_id: str | None = None,
 ) -> None:
     if not rule or rule.get("ruleDisabled"):
         return
-    event = _rule_event(rule.get("sql", ""), topic, payload)
+    event = _rule_event(rule.get("sql", ""), topic, payload, client_id)
     if event is _MISSING:
         _broker_logger.warning(
             "IoT rule %s: payload is not valid UTF-8 and its SELECT clause "
@@ -2772,7 +2804,7 @@ def _run_rule_actions(
         )
         return
     where_pred = _rule_where_clause(rule.get("sql", ""))
-    if where_pred and not _eval_where(where_pred, topic, payload, _rule_message(payload)):
+    if where_pred and not _eval_where(where_pred, topic, payload, _rule_message(payload), client_id):
         _broker_logger.debug(
             "IoT rule %s: WHERE clause did not match on %r — no action dispatched",
             rule.get("ruleName"),
@@ -2786,12 +2818,12 @@ def _run_rule_actions(
 
 
 def _evaluate_topic_rules(
-    account_id: str, region: str, topic: str, payload: bytes
+    account_id: str, region: str, topic: str, payload: bytes, client_id: str | None = None
 ) -> None:
     for rule in _rules_for_account(account_id, region):
         filter_ = _rule_topic_filter(rule.get("sql", ""))
         if filter_ and _topic_matches(filter_, topic):
-            _run_rule_actions(account_id, region, rule, payload, topic)
+            _run_rule_actions(account_id, region, rule, payload, topic, client_id)
 
 
 async def broker_publish(
@@ -2801,6 +2833,7 @@ async def broker_publish(
     payload: bytes,
     qos: int = 0,
     retain: bool = False,
+    client_id: str | None = None,
 ) -> None:
     # Basic Ingest: a publish to `$aws/rules/<ruleName>` is delivered straight
     # to that rule's actions and bypasses pub/sub delivery entirely.
@@ -2815,6 +2848,7 @@ async def broker_publish(
             # Under Basic Ingest `topic()` reports the topic after the
             # `$aws/rules/<ruleName>/` prefix, as it does on AWS.
             remainder[1] if len(remainder) > 1 else "",
+            client_id,
         )
         return
 
@@ -2860,7 +2894,7 @@ async def broker_publish(
                         ps.queued_messages = ps.queued_messages[-_MAX_QUEUED_MESSAGES:]
                     break
 
-    _evaluate_topic_rules(account_id, region, topic, payload)
+    _evaluate_topic_rules(account_id, region, topic, payload, client_id)
 
 
 async def broker_subscribe(
@@ -3241,6 +3275,7 @@ class _WSSession:
                 payload,
                 qos=qos,
                 retain=retain,
+                client_id=self._client_id,
             )
             if qos == 1 and packet_id is not None:
                 await self.send_bytes(_make_puback(packet_id))
