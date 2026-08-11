@@ -1380,10 +1380,22 @@ def test_get_log_group_fields_inprocess():
     set_request_account_id("000000000000")
     set_request_region("us-east-1")
 
+    # Indexed array paths match AWS Insights discovery (items.0.id, not items.id).
+    assert mod._json_field_names('{"items":[{"id":1}],"tags":["a"]}') == {
+        "items",
+        "items.0",
+        "items.0.id",
+        "tags",
+        "tags.0",
+    }
+
     group = "/aws/lambda/get-log-group-fields-unit"
     stream = "stream-a"
-    now_s = int(time.time())
-    now_ms = now_s * 1000
+    # Mid-second ms timestamp: default window must not floor "now" away.
+    now_ms = int(time.time() * 1000)
+    if now_ms % 1000 == 0:
+        now_ms += 1
+    now_s = now_ms // 1000
 
     assert mod._create_log_group({"logGroupName": group})[0] == 200
     assert mod._create_log_stream({"logGroupName": group, "logStreamName": stream})[0] == 200
@@ -1393,7 +1405,11 @@ def test_get_log_group_fields_inprocess():
         "logEvents": [
             {
                 "timestamp": now_ms - 1000,
-                "message": _json.dumps({"type": "a", "nested": {"level": 1}}),
+                "message": _json.dumps({
+                    "type": "a",
+                    "nested": {"level": 1},
+                    "items": [{"id": 1}],
+                }),
             },
             {
                 "timestamp": now_ms,
@@ -1416,6 +1432,8 @@ def test_get_log_group_fields_inprocess():
     assert by_name["type"] == 100
     assert by_name["nested.level"] == 50
     assert by_name["duration"] == 50
+    assert by_name["items.0.id"] == 50
+    assert "items.id" not in by_name
     assert "old_only" not in by_name
 
     centered = mod._get_log_group_fields({"logGroupName": group, "time": now_s - 20 * 60})

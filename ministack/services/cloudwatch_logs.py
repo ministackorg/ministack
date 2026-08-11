@@ -677,9 +677,15 @@ def _json_field_names(message: str) -> set[str]:
             if isinstance(value, dict):
                 walk(value, name)
             elif isinstance(value, list):
-                for item in value:
+                # AWS Insights discovers array members with numeric index segments
+                # (e.g. items.0.id), not flattened under the bare parent key.
+                for idx, item in enumerate(value):
+                    indexed = f"{name}.{idx}"
                     if isinstance(item, dict):
-                        walk(item, name)
+                        names.add(indexed)
+                        walk(item, indexed)
+                    else:
+                        names.add(indexed)
 
     walk(parsed)
     return names
@@ -734,7 +740,10 @@ def _get_log_group_fields(data):
         start_s = center - 8 * 60
         end_s = center + 8 * 60
     else:
-        end_s = int(time.time())
+        # _collect_query_records takes epoch seconds and uses end_s*1000 as an
+        # inclusive ms bound. Flooring "now" to seconds would drop events in the
+        # current partial second (timestamp > end_s*1000), so extend end by 1s.
+        end_s = int(time.time()) + 1
         start_s = end_s - 15 * 60
 
     records = _collect_query_records([group_name], start_s, end_s)
