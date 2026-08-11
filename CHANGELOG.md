@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **EC2 — `RevokeSecurityGroupIngress` / `RevokeSecurityGroupEgress` honour `SecurityGroupRuleIds`** — both read only `IpPermissions`, so a revoke by rule id (as Terraform does) returned `Return=true` while removing nothing, leaving the rule in place forever. Ids now resolve against the group's `sgr-*` rules, which are removed with their tags and echoed in `revokedSecurityGroupRuleSet`; one unknown id rejects the whole call with `InvalidSecurityGroupRuleId.NotFound`. Contributed by @iot-rocket.
+
 ## [1.4.16] — 2026-08-12
 
 ### Added

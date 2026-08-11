@@ -1403,11 +1403,47 @@ def _authorize_sg_ingress(p):
                 f"<return>true</return><securityGroupRuleSet>{rule_items}</securityGroupRuleSet>")
 
 
+def _revoke_sg_rules_by_id(sg, sg_id, rule_ids, is_egress):
+    """Revoke rules addressed by ``SecurityGroupRuleId.N`` (how the AWS provider's
+    aws_vpc_security_group_ingress_rule revokes). AWS validates every id before
+    revoking anything: one unknown id rejects the whole call, so a partial revoke
+    never happens. Returns ``(revoked_rules, error_response)``."""
+    key = "IpPermissionsEgress" if is_egress else "IpPermissions"
+    known = {_sg_rule_id(sg_id, is_egress, r) for r in sg[key]}
+    for rule_id in rule_ids:
+        if rule_id not in known:
+            return None, _error(
+                "InvalidSecurityGroupRuleId.NotFound",
+                f"The security group rule '{rule_id}' does not exist",
+                400,
+            )
+    wanted = set(rule_ids)
+    revoked = []
+    remaining = []
+    for existing in sg[key]:
+        if _sg_rule_id(sg_id, is_egress, existing) in wanted:
+            revoked.append(existing)
+            _tags.pop(_sg_rule_id(sg_id, is_egress, existing), None)
+        else:
+            remaining.append(existing)
+    sg[key] = remaining
+    return revoked, None
+
+
 def _revoke_sg_ingress(p):
     sg_id = _p(p, "GroupId")
     sg = _security_groups.get(sg_id)
     if not sg:
         return _error("InvalidGroup.NotFound", f"Security group {sg_id} not found", 400)
+    rule_ids = _parse_member_list(p, "SecurityGroupRuleId")
+    if rule_ids:
+        revoked, err = _revoke_sg_rules_by_id(sg, sg_id, rule_ids, is_egress=False)
+        if err:
+            return err
+        revoked_items = "".join(
+            _revoked_sg_rule_xml(sg_id, r, is_egress=False) for r in revoked)
+        return _xml(200, "RevokeSecurityGroupIngressResponse",
+                    f"<return>true</return><revokedSecurityGroupRuleSet>{revoked_items}</revokedSecurityGroupRuleSet>")
     rules = _parse_ip_permissions(p, "IpPermissions")
     for r in rules:
         for existing in sg["IpPermissions"]:
@@ -1447,6 +1483,15 @@ def _revoke_sg_egress(p):
     sg = _security_groups.get(sg_id)
     if not sg:
         return _error("InvalidGroup.NotFound", f"Security group {sg_id} not found", 400)
+    rule_ids = _parse_member_list(p, "SecurityGroupRuleId")
+    if rule_ids:
+        revoked, err = _revoke_sg_rules_by_id(sg, sg_id, rule_ids, is_egress=True)
+        if err:
+            return err
+        revoked_items = "".join(
+            _revoked_sg_rule_xml(sg_id, r, is_egress=True) for r in revoked)
+        return _xml(200, "RevokeSecurityGroupEgressResponse",
+                    f"<return>true</return><revokedSecurityGroupRuleSet>{revoked_items}</revokedSecurityGroupRuleSet>")
     rules = _parse_ip_permissions(p, "IpPermissions")
     revoked_items = ""
     remaining = []
