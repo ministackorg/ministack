@@ -470,6 +470,67 @@ def test_cfn_stack_with_parameters(cfn, sqs):
     urls = sqs.list_queues(QueueNamePrefix="cfn-t02-custom").get("QueueUrls", [])
     assert any("cfn-t02-custom" in u for u in urls)
 
+
+def test_cfn_ssm_parameter_value_type_resolves_stored_value(cfn, ssm, sqs):
+    """A `AWS::SSM::Parameter::Value<String>` template parameter's Default/
+    provided value is an SSM parameter *name*, not the value itself — real
+    CloudFormation resolves it against SSM Parameter Store before `Ref` ever
+    sees it (the mechanism behind CDK's `StringParameter.valueForStringParameter`).
+    Ref must yield the stored value, not the parameter name."""
+    ssm.put_parameter(Name="/cfn-t02c/queue-name", Value="cfn-t02c-resolved", Type="String")
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Parameters": {
+            "QueueName": {
+                "Type": "AWS::SSM::Parameter::Value<String>",
+                "Default": "/cfn-t02c/queue-name",
+            }
+        },
+        "Resources": {
+            "Queue": {
+                "Type": "AWS::SQS::Queue",
+                "Properties": {"QueueName": {"Ref": "QueueName"}},
+            }
+        },
+    }
+    cfn.create_stack(StackName="cfn-t02c", TemplateBody=json.dumps(template))
+    _wait_stack(cfn, "cfn-t02c")
+
+    urls = sqs.list_queues(QueueNamePrefix="cfn-t02c-resolved").get("QueueUrls", [])
+    assert any("cfn-t02c-resolved" in u for u in urls)
+    # Never the literal parameter name — that would mean resolution silently
+    # fell back to treating the SSM path as the value itself.
+    urls_by_name = sqs.list_queues(QueueNamePrefix="cfn-t02c/queue-name").get("QueueUrls", [])
+    assert urls_by_name == []
+
+
+def test_cfn_ssm_parameter_value_type_missing_parameter_fails_stack(cfn):
+    """An `AWS::SSM::Parameter::Value<String>` naming a parameter that was
+    never put must fail the same way real CloudFormation does — a
+    synchronous ValidationError at CreateStack time (parameter resolution
+    happens before the stack is created), not a silent resolve to the
+    parameter's own name string."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Parameters": {
+            "QueueName": {
+                "Type": "AWS::SSM::Parameter::Value<String>",
+                "Default": "/cfn-t02d/does-not-exist",
+            }
+        },
+        "Resources": {
+            "Queue": {
+                "Type": "AWS::SQS::Queue",
+                "Properties": {"QueueName": {"Ref": "QueueName"}},
+            }
+        },
+    }
+    with pytest.raises(ClientError) as exc_info:
+        cfn.create_stack(StackName="cfn-t02d", TemplateBody=json.dumps(template))
+    assert exc_info.value.response["Error"]["Code"] == "ValidationError"
+
+
 def test_cfn_change_set_use_previous_value_updates_resource(cfn, ssm):
     """A change set created with UsePreviousValue (the `aws cloudformation deploy`
     no-`--parameter-overrides` path) must resolve the parameter to its stored

@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **CloudFormation — `AWS::SSM::Parameter::Value<...>` template parameters now resolve against SSM Parameter Store** — a template parameter typed `AWS::SSM::Parameter::Value<String>` (or `<List<String>>` / `<AWS::EC2::Image::Id>`) takes an SSM parameter *name* as its Default/provided value; real CloudFormation resolves that name against Parameter Store before `Ref` ever sees it — the mechanism behind, e.g., CDK's `StringParameter.valueForStringParameter`. MiniStack treated these like any other AWS-specific parameter type and passed the literal name straight through, so `Ref` returned the parameter's name instead of its stored value, and any resource property built from it (or a nested stack composing two independently-deployed stacks through a shared parameter) silently received the wrong string. Resolution now looks the name up in the SSM store at parameter-resolution time; a name that doesn't exist fails `CreateStack`/`UpdateStack` synchronously with a `ValidationError`, matching AWS. Contributed by @ryan-bennett.
+
 ## [1.4.15] — 2026-08-10
 
 ### Added
