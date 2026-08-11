@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **IoT — `CreateThingType` is idempotent for identical re-creates** — re-creating an existing thing type always returned `ResourceAlreadyExistsException`, so a retried request or a re-run provisioning script failed where AWS succeeds. The same `thingTypeProperties` now return the existing ids — absent, `null` and empty compare equal, `searchableAttributes` is unordered — and only a real mismatch keeps the `409`, as `CreateThing` already did. Contributed by @iot-rocket.
+
 ## [1.4.16] — 2026-08-12
 
 ### Added
