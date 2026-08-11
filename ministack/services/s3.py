@@ -2500,6 +2500,9 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
             "is_latest": True,
             "data": body,
             "content_type": obj.get("content_type") or "application/octet-stream",
+            "content_encoding": obj.get("content_encoding"),
+            "metadata": obj.get("metadata", {}),
+            "preserved_headers": obj.get("preserved_headers", {}),
             "storage_class": obj.get("storage_class") or "STANDARD",
             "checksums": obj.get("checksums") or {},
         })
@@ -2701,6 +2704,10 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
             "size": obj["size"],
             "is_latest": True,
             "data": file_value,
+            "content_type": obj.get("content_type") or "application/octet-stream",
+            "content_encoding": obj.get("content_encoding"),
+            "metadata": obj.get("metadata", {}),
+            "preserved_headers": obj.get("preserved_headers", {}),
             "storage_class": obj.get("storage_class") or "STANDARD",
         })
         for v in _object_versions[vkey][:-1]:
@@ -2806,24 +2813,19 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
         versions = _object_versions.get(vkey, [])
         for v in versions:
             if v["version_id"] == version_id:
-                resp_headers = {
-                    "Content-Type": v.get("content_type") or "application/octet-stream",
-                    "ETag": v["etag"],
-                    "Content-Length": str(v["size"]),
-                    "Last-Modified": iso_to_rfc7231(v["last_modified"]),
-                    "x-amz-version-id": v["version_id"],
-                }
-                # Versioned reads honor `x-amz-checksum-mode: ENABLED` the same
-                # way current-version reads do — the stored per-version
-                # checksums are looked up and surfaced as `x-amz-checksum-*`.
-                if (headers.get("x-amz-checksum-mode") or "").upper() == "ENABLED":
-                    stored = v.get("checksums") or {}
-                    for alg, val in stored.items():
-                        resp_headers[f"x-amz-checksum-{alg.lower()}"] = val
-                    if stored:
-                        resp_headers["x-amz-checksum-type"] = "FULL_OBJECT"
+                # Route through the shared header builder (same path as versioned
+                # HeadObject) so a version's user metadata (x-amz-meta-*),
+                # preserved headers and content-encoding are emitted — not just
+                # the five wire basics. Versioned reads honor
+                # `x-amz-checksum-mode: ENABLED` exactly as current-version reads do.
+                include_checksums = (headers.get("x-amz-checksum-mode") or "").upper() == "ENABLED"
+                vobj = _object_record_from_version(v)
+                resp_headers = _object_response_headers(
+                    vobj, bucket_name, key, include_checksums=include_checksums)
                 resp_headers.update(_object_tagging_count_header(bucket_name, key, version_id))
-                body = v["data"] if v["data"] is not None else _read_body(bucket_name, key, bucket["objects"].get(key, {}))
+                body = v.get("data")
+                if body is None:
+                    body = _read_body(bucket_name, key, bucket["objects"].get(key, {}))
                 return 200, resp_headers, body
         return _error("NoSuchVersion", "The specified version does not exist.", 404, f"/{bucket_name}/{key}")
 
@@ -3442,7 +3444,12 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
             "size": dest_obj["size"],
             "is_latest": True,
             "data": src_body,
+            "content_type": dest_obj.get("content_type") or "application/octet-stream",
+            "content_encoding": dest_obj.get("content_encoding"),
+            "metadata": dest_obj.get("metadata", {}),
+            "preserved_headers": dest_obj.get("preserved_headers", {}),
             "storage_class": dest_obj.get("storage_class") or "STANDARD",
+            "checksums": dest_obj.get("checksums") or {},
         })
         for v in _object_versions[vkey][:-1]:
             v["is_latest"] = False
@@ -4623,6 +4630,11 @@ def _complete_multipart_upload(
             "size": obj["size"],
             "is_latest": True,
             "data": combined,
+            "content_type": obj.get("content_type") or "application/octet-stream",
+            "content_encoding": obj.get("content_encoding"),
+            "metadata": obj.get("metadata", {}),
+            "preserved_headers": obj.get("preserved_headers", {}),
+            "storage_class": obj.get("storage_class") or "STANDARD",
         })
         for v in _object_versions[vkey][:-1]:
             v["is_latest"] = False
@@ -5034,6 +5046,10 @@ def _load_persisted_bucket(account_id, bucket_name, bucket_path):
                     "size": size,
                     "is_latest": True,
                     "data": None,
+                    "content_type": meta.get("content_type", "application/octet-stream"),
+                    "content_encoding": meta.get("content_encoding"),
+                    "metadata": meta.get("metadata", {}),
+                    "preserved_headers": meta.get("preserved_headers", {}),
                     "storage_class": meta.get("storage_class", "STANDARD"),
                     "checksums": meta.get("checksums", {}),
                 })

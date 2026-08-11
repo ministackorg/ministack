@@ -130,18 +130,14 @@ _AWS_SPECIFIC_TYPES = {
     "AWS::Route53::HostedZone::Id",
 }
 
-# Unlike the other _AWS_SPECIFIC_TYPES entries (an AZ name, an AMI id, ...),
-# whose given value already *is* the value CloudFormation hands to Ref, an
-# ``AWS::SSM::Parameter::Value<...>`` parameter's given value is an SSM
-# parameter *name* — real CloudFormation resolves it against SSM Parameter
-# Store before Ref ever sees it. Kept as its own set so
-# ``AWS::SSM::Parameter::Type`` (a template-side type constraint, not an
-# SSM lookup at all) isn't accidentally swept in here too.
-_SSM_PARAMETER_VALUE_TYPES = {
-    "AWS::SSM::Parameter::Value<String>",
-    "AWS::SSM::Parameter::Value<List<String>>",
-    "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>",
-}
+# Any ``AWS::SSM::Parameter::Value<...>`` type resolves its given value (an SSM
+# parameter *name*) against SSM Parameter Store before Ref ever sees it — this
+# is true for every inner type (String, List<String>, CommaDelimitedList, and
+# the AWS-specific and List<AWS-specific> forms), so match on the prefix rather
+# than an enumerated subset. The ``Value<`` in the prefix deliberately excludes
+# ``AWS::SSM::Parameter::Name`` (Ref returns the name) and
+# ``AWS::SSM::Parameter::Type`` (a template-side type constraint, not a lookup).
+_SSM_PARAMETER_VALUE_PREFIX = "AWS::SSM::Parameter::Value<"
 
 
 def _resolve_parameters(template: dict, provided_params: list[dict],
@@ -190,7 +186,7 @@ def _resolve_parameters(template: dict, provided_params: list[dict],
 
         value = str(value) if value is not None else ""
 
-        if ptype in _SSM_PARAMETER_VALUE_TYPES and not already_resolved:
+        if ptype.startswith(_SSM_PARAMETER_VALUE_PREFIX) and not already_resolved:
             # `value` up to here is the SSM parameter *name* (the template
             # parameter's Default, or a caller-supplied override) — resolve
             # it against the SSM store the same way real CloudFormation

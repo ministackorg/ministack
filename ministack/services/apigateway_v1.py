@@ -125,6 +125,10 @@ _resources = AccountRegionScopedDict()           # rest_api_id -> {resource_id -
 _stages_v1 = AccountRegionScopedDict()           # rest_api_id -> {stage_name -> Stage}
 _deployments_v1 = AccountRegionScopedDict()      # rest_api_id -> {deployment_id -> Deployment}
 _authorizers_v1 = AccountRegionScopedDict()      # rest_api_id -> {authorizer_id -> Authorizer}
+# Data-plane cache of evaluated Lambda-authorizer results, keyed by
+# (rest_api_id, authorizer_id, cache_key). Value: (expiry_epoch, decision, context).
+# Ephemeral (not persisted); honors authorizerResultTtlInSeconds.
+_authorizer_cache = {}
 _models = AccountRegionScopedDict()              # rest_api_id -> {model_id -> Model}
 _api_keys = AccountRegionScopedDict()            # key_id -> ApiKey
 _usage_plans = AccountRegionScopedDict()         # plan_id -> UsagePlan
@@ -851,6 +855,7 @@ def reset():
     _stages_v1.clear()
     _deployments_v1.clear()
     _authorizers_v1.clear()
+    _authorizer_cache.clear()
     _models.clear()
     _api_keys.clear()
     _usage_plans.clear()
@@ -1192,6 +1197,283 @@ async def handle_execute(api_id, stage_name, method, path, headers, body, query_
         _request_region.reset(region_token)
 
 
+# ---- Data plane: Lambda authorizers (custom authorizers) ----
+
+
+def _header_ci(headers, name):
+    """Case-insensitive single header lookup returning a str (or '')."""
+    target = name.lower()
+    for k, v in (headers or {}).items():
+        if k.lower() == target:
+            return v if isinstance(v, str) else (v[-1] if v else "")
+    return ""
+
+
+def _gw_error(status, message):
+    """A REST API gateway error response. Uses the lowercase `message` key that
+    API Gateway's default UNAUTHORIZED / MISSING_AUTHENTICATION_TOKEN / 5XX
+    gateway responses carry."""
+    return (
+        status,
+        {"Content-Type": "application/json"},
+        json.dumps({"message": message}).encode(),
+    )
+
+
+def _deny_error(explicit):
+    """The 403 an authorizer denial produces. The execute-api authorization
+    layer answers with a capitalised `Message` key (distinct from the lowercase
+    gateway-response bodies) — explicit Deny vs. no-matching-Allow differ only in
+    the trailing clause."""
+    msg = (
+        "User is not authorized to access this resource with an explicit deny"
+        if explicit
+        else "User is not authorized to access this resource"
+    )
+    return (
+        403,
+        {"Content-Type": "application/json"},
+        json.dumps({"Message": msg}).encode(),
+    )
+
+
+def _build_method_arn(region, account_id, api_id, stage_name, method, request_path):
+    return (
+        f"arn:aws:execute-api:{region}:{account_id}:"
+        f"{api_id}/{stage_name}/{method}/{request_path.lstrip('/')}"
+    )
+
+
+def _arn_matches(pattern, arn):
+    """Match an IAM policy Resource against a method ARN, honoring `*`/`?` globs."""
+    regex = "^" + re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".") + "$"
+    return re.match(regex, arn) is not None
+
+
+def _evaluate_policy(policy_doc, method_arn):
+    """Evaluate an authorizer IAM policy against the method ARN.
+
+    Returns "Deny" (explicit deny matched — always wins), "Allow" (an Allow
+    matched and no Deny did), or "NoMatch" (implicit deny — no statement matched).
+    """
+    if not isinstance(policy_doc, dict):
+        return "NoMatch"
+    statements = policy_doc.get("Statement") or []
+    if isinstance(statements, dict):
+        statements = [statements]
+    allow = False
+    for st in statements:
+        if not isinstance(st, dict):
+            continue
+        resources = st.get("Resource")
+        if isinstance(resources, str):
+            resources = [resources]
+        if not any(_arn_matches(r, method_arn) for r in (resources or [])):
+            continue
+        if st.get("Effect") == "Deny":
+            return "Deny"
+        if st.get("Effect") == "Allow":
+            allow = True
+    return "Allow" if allow else "NoMatch"
+
+
+def _stringify_context(context):
+    """Authorizer context reaches the backend with every value stringified;
+    booleans become JSON-style `true`/`false`."""
+    out = {}
+    for k, v in (context or {}).items():
+        if isinstance(v, bool):
+            out[k] = "true" if v else "false"
+        elif v is None:
+            continue
+        elif isinstance(v, (str, int, float)):
+            out[k] = str(v)
+        # nested dict/list values are not supported by API Gateway — dropped.
+    return out
+
+
+async def _invoke_authorizer_lambda(authorizer, event, account_id, region):
+    """Invoke the authorizer's Lambda and return its raw execution result dict."""
+    lambda_ref = _extract_lambda_ref_from_integration_uri(authorizer.get("authorizerUri", ""))
+    from ministack.services import lambda_svc
+
+    func_data, func_config, func_name = lambda_svc._get_func_record_for_ref_in_scope(
+        lambda_ref, account_id=account_id, region=region,
+    )
+    if func_data is None or func_config is None:
+        return None
+    exec_record = lambda_svc._execution_record_for_config(func_data, func_config)
+    return await asyncio.to_thread(
+        lambda_svc._execute_function_with_config_scope, exec_record, event
+    )
+
+
+def _request_identity_sources(identity_source, headers, query_params, stage):
+    """Resolve a REQUEST authorizer's identitySource list to (all_present, values).
+
+    identitySource is a comma-separated list of `method.request.*` / stage-variable
+    mappings. Returns whether every source is present+non-empty and the ordered
+    values (used as the cache-key parts)."""
+    present = True
+    values = []
+    for raw in (identity_source or "").split(","):
+        src = raw.strip()
+        if not src:
+            continue
+        val = ""
+        if src.startswith("method.request.header."):
+            val = _header_ci(headers, src[len("method.request.header."):])
+        elif src.startswith("method.request.querystring."):
+            qn = src[len("method.request.querystring."):]
+            qv = (query_params or {}).get(qn)
+            val = (qv[0] if isinstance(qv, list) else qv) or ""
+        elif src.startswith("stageVariables."):
+            val = ((stage.get("variables") or {}).get(src[len("stageVariables."):])) or ""
+        elif src.startswith("context."):
+            val = ""  # context identity sources not modeled; treated as absent
+        values.append(val)
+        if not val:
+            present = False
+    return present, values
+
+
+async def _authorize_request_v1(
+    api_id, stage_name, method_obj, method, request_path, resource,
+    headers, body, query_params, path_params, stage,
+    owner_account_id, owner_region,
+):
+    """Enforce a method's authorization before the integration runs.
+
+    Returns ``(error_response, authorizer_context)``: when ``error_response`` is
+    not None the caller must short-circuit with it; otherwise ``authorizer_context``
+    (possibly None) is injected into the integration's ``requestContext.authorizer``.
+    """
+    auth_type = (method_obj.get("authorizationType") or "NONE").upper()
+    if auth_type in ("", "NONE"):
+        return None, None
+    if auth_type == "AWS_IAM":
+        # We do not verify SigV4 signatures; match AWS only to the extent that a
+        # request with no Authorization header is rejected as unauthenticated.
+        if not _header_ci(headers, "authorization"):
+            return _gw_error(403, "Missing Authentication Token"), None
+        return None, None
+    if auth_type != "CUSTOM":
+        # COGNITO_USER_POOLS and any future type: not enforced here (pass through).
+        return None, None
+
+    authorizer_id = method_obj.get("authorizerId")
+    authorizer = _authorizers_v1.get(api_id, {}).get(authorizer_id) if authorizer_id else None
+    if not authorizer:
+        return _gw_error(500, "Internal server error"), None
+
+    method_arn = _build_method_arn(
+        owner_region, owner_account_id, api_id, stage_name, method, request_path
+    )
+    atype = (authorizer.get("type") or "TOKEN").upper()
+    ttl = int(authorizer.get("authorizerResultTtlInSeconds") or 0)
+
+    if atype == "TOKEN":
+        identity_source = authorizer.get("identitySource") or "method.request.header.Authorization"
+        header_name = (
+            identity_source[len("method.request.header."):]
+            if identity_source.startswith("method.request.header.")
+            else "Authorization"
+        )
+        token = _header_ci(headers, header_name)
+        if not token:
+            return _gw_error(401, "Unauthorized"), None
+        val_expr = authorizer.get("identityValidationExpression")
+        if val_expr and not re.fullmatch(val_expr, token):
+            return _gw_error(401, "Unauthorized"), None
+        cache_key = token
+        event = {"type": "TOKEN", "authorizationToken": token, "methodArn": method_arn}
+    else:  # REQUEST
+        identity_source = authorizer.get("identitySource") or ""
+        all_present, id_values = _request_identity_sources(
+            identity_source, headers, query_params, stage
+        )
+        # With caching on and identity sources declared, a missing source is a
+        # 401 without invoking the authorizer (matches AWS).
+        if ttl > 0 and identity_source and not all_present:
+            return _gw_error(401, "Unauthorized"), None
+        cache_key = "|".join(id_values)
+        single_headers = {k: (v if isinstance(v, str) else v[-1]) for k, v in headers.items()}
+        multi_headers = {k: ([v] if isinstance(v, str) else list(v)) for k, v in headers.items()}
+        qs_params = {k: v[0] for k, v in query_params.items()} if query_params else None
+        mv_qs_params = {k: list(v) for k, v in query_params.items()} if query_params else None
+        event = {
+            "type": "REQUEST",
+            "methodArn": method_arn,
+            "resource": resource["path"],
+            "path": request_path,
+            "httpMethod": method,
+            "headers": single_headers,
+            "multiValueHeaders": multi_headers,
+            "queryStringParameters": qs_params,
+            "multiValueQueryStringParameters": mv_qs_params,
+            "pathParameters": path_params or None,
+            "stageVariables": stage.get("variables") or None,
+            "requestContext": {
+                "resourceId": resource["id"],
+                "stage": stage_name,
+                "resourcePath": resource["path"],
+                "httpMethod": method,
+                "apiId": api_id,
+                "accountId": owner_account_id,
+            },
+        }
+
+    # TTL cache: a hit replays the prior decision without invoking the Lambda.
+    ckey = (api_id, authorizer_id, cache_key)
+    if ttl > 0:
+        hit = _authorizer_cache.get(ckey)
+        if hit and hit[0] > time.time():
+            _, decision, cached_ctx = hit
+            if decision == "Allow":
+                return None, cached_ctx
+            return _deny_error(decision == "Deny"), None
+
+    result = await _invoke_authorizer_lambda(
+        authorizer, event, owner_account_id, owner_region
+    )
+    if result is None:
+        # Authorizer Lambda unresolved / not found → connection failure.
+        return _gw_error(500, "Internal server error"), None
+    if result.get("error"):
+        err_body = result.get("body") or {}
+        msg = err_body.get("errorMessage", "") if isinstance(err_body, dict) else str(err_body)
+        # A function that raises exactly "Unauthorized" maps to 401; any other
+        # uncaught error is an authorizer failure → 500.
+        if isinstance(msg, str) and msg.strip().lower() == "unauthorized":
+            return _gw_error(401, "Unauthorized"), None
+        return _gw_error(500, "Internal server error"), None
+
+    policy = result.get("body")
+    if isinstance(policy, (str, bytes)):
+        if isinstance(policy, bytes):
+            policy = policy.decode("utf-8", errors="replace")
+        try:
+            policy = json.loads(policy)
+        except json.JSONDecodeError:
+            policy = None
+    if not isinstance(policy, dict):
+        return _gw_error(500, "Internal server error"), None
+
+    decision = _evaluate_policy(policy.get("policyDocument"), method_arn)
+    if decision != "Allow":
+        if ttl > 0:
+            _authorizer_cache[ckey] = (time.time() + ttl, decision, None)
+        return _deny_error(decision == "Deny"), None
+
+    auth_ctx = _stringify_context(policy.get("context"))
+    principal_id = policy.get("principalId")
+    if principal_id is not None:
+        auth_ctx["principalId"] = str(principal_id)
+    if ttl > 0:
+        _authorizer_cache[ckey] = (time.time() + ttl, "Allow", auth_ctx)
+    return None, auth_ctx
+
+
 async def _handle_execute_in_scope(
     api_id, stage_name, method, path, headers, body, query_params,
     owner_account_id, owner_region,
@@ -1221,6 +1503,16 @@ async def _handle_execute_in_scope(
     if not integration:
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": "No integration configured"}).encode()
 
+    # Authorize before dispatching to the integration (custom Lambda authorizers,
+    # plus an Authorization-header presence check for AWS_IAM methods).
+    auth_error, authorizer_context = await _authorize_request_v1(
+        api_id, stage_name, method_obj, method, path, resource,
+        headers, body, query_params, path_params, stage,
+        owner_account_id, owner_region,
+    )
+    if auth_error is not None:
+        return auth_error
+
     int_type = integration.get("type", "")
 
     if int_type in ("AWS_PROXY", "AWS"):
@@ -1230,6 +1522,7 @@ async def _handle_execute_in_scope(
             owner_account_id=owner_account_id,
             owner_region=owner_region,
             binary_media_types=api.get("binaryMediaTypes") or [],
+            authorizer_context=authorizer_context,
         )
     elif int_type in ("HTTP_PROXY", "HTTP"):
         return await _invoke_http_proxy_v1(
@@ -1276,6 +1569,7 @@ async def _invoke_lambda_proxy_v1(
     owner_account_id=None,
     owner_region=None,
     binary_media_types=None,
+    authorizer_context=None,
 ):
     """Invoke Lambda with API Gateway v1 payload format 1.0."""
     uri = integration.get("uri", "")
@@ -1341,6 +1635,11 @@ async def _invoke_lambda_proxy_v1(
         "body": req_body,
         "isBase64Encoded": req_is_base64,
     }
+
+    # A custom authorizer's returned context (values stringified) plus its
+    # principalId reach the integration under requestContext.authorizer.
+    if authorizer_context is not None:
+        event["requestContext"]["authorizer"] = authorizer_context
 
     lambda_response, err = await _call_lambda(
         lambda_ref,

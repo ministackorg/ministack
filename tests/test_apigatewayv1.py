@@ -1022,6 +1022,194 @@ def test_apigwv1_execute_lambda_proxy(apigw_v1, lam):
     lam.delete_function(FunctionName=fname)
 
 
+def test_apigwv1_execute_token_authorizer(apigw_v1, lam):
+    """A CUSTOM TOKEN authorizer is invoked on the data path and enforced. (#1345)
+
+    - No identity-source header  -> 401 without invoking the authorizer.
+    - Deny policy                -> 403.
+    - Authorizer raises Unauthorized -> 401.
+    - Allow policy               -> 200, with the returned context (values
+      stringified) plus principalId injected into requestContext.authorizer.
+    """
+    import urllib.request as _urlreq
+    import urllib.error as _urlerr
+    import uuid as _uuid
+
+    suffix = _uuid.uuid4().hex[:8]
+    auth_fn = f"intg-v1-authfn-{suffix}"
+    int_fn = f"intg-v1-intfn-{suffix}"
+
+    auth_code = (
+        b"def handler(event, context):\n"
+        b"    tok = event.get('authorizationToken')\n"
+        b"    arn = event['methodArn']\n"
+        b"    if tok == 'deny-me':\n"
+        b"        return _p('alice', 'Deny', arn, {})\n"
+        b"    if tok == 'unauth':\n"
+        b"        raise Exception('Unauthorized')\n"
+        b"    return _p('alice', 'Allow', arn, {'user': 'alice', 'admin': True, 'count': 3})\n"
+        b"def _p(pid, effect, arn, ctx):\n"
+        b"    return {'principalId': pid, 'context': ctx, 'policyDocument': {\n"
+        b"        'Version': '2012-10-17', 'Statement': [\n"
+        b"            {'Action': 'execute-api:Invoke', 'Effect': effect, 'Resource': arn}]}}\n"
+    )
+    int_code = (
+        b"import json\n"
+        b"def handler(event, context):\n"
+        b"    auth = event.get('requestContext', {}).get('authorizer')\n"
+        b"    return {'statusCode': 200, 'body': json.dumps(auth)}\n"
+    )
+
+    def _mkfn(name, code):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("index.py", code)
+        lam.create_function(
+            FunctionName=name, Runtime="python3.12",
+            Role="arn:aws:iam::000000000000:role/test-role",
+            Handler="index.handler", Code={"ZipFile": buf.getvalue()},
+        )
+
+    _mkfn(auth_fn, auth_code)
+    _mkfn(int_fn, int_code)
+
+    api_id = apigw_v1.create_rest_api(name=f"v1-authz-{suffix}")["id"]
+    try:
+        root = next(r for r in apigw_v1.get_resources(restApiId=api_id)["items"] if r["path"] == "/")
+        resource_id = apigw_v1.create_resource(
+            restApiId=api_id, parentId=root["id"], pathPart="private",
+        )["id"]
+
+        auth_uri = (
+            f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+            f"arn:aws:lambda:us-east-1:000000000000:function:{auth_fn}/invocations"
+        )
+        authorizer_id = apigw_v1.create_authorizer(
+            restApiId=api_id, name="tok-auth", type="TOKEN",
+            authorizerUri=auth_uri,
+            identitySource="method.request.header.Authorization",
+            authorizerResultTtlInSeconds=0,
+        )["id"]
+
+        apigw_v1.put_method(
+            restApiId=api_id, resourceId=resource_id, httpMethod="GET",
+            authorizationType="CUSTOM", authorizerId=authorizer_id,
+        )
+        apigw_v1.put_integration(
+            restApiId=api_id, resourceId=resource_id, httpMethod="GET",
+            type="AWS_PROXY", integrationHttpMethod="POST",
+            uri=(
+                f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+                f"arn:aws:lambda:us-east-1:000000000000:function:{int_fn}/invocations"
+            ),
+        )
+        dep_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
+        apigw_v1.create_stage(restApiId=api_id, stageName="dev", deploymentId=dep_id)
+
+        host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+        url = f"http://{host}/dev/private"
+
+        def _call(token):
+            req = _urlreq.Request(url, method="GET")
+            req.add_header("Host", host)
+            if token is not None:
+                req.add_header("Authorization", token)
+            try:
+                r = _urlreq.urlopen(req)
+                return r.status, r.read()
+            except _urlerr.HTTPError as e:
+                return e.code, e.read()
+
+        # No Authorization header -> 401, authorizer not invoked.
+        status, _ = _call(None)
+        assert status == 401
+
+        # Deny policy -> 403.
+        status, _ = _call("deny-me")
+        assert status == 403
+
+        # Authorizer raises "Unauthorized" -> 401.
+        status, _ = _call("unauth")
+        assert status == 401
+
+        # Allow policy -> 200; context stringified + principalId injected.
+        status, body = _call("allow-me")
+        assert status == 200
+        auth = json.loads(body)
+        assert auth is not None
+        assert auth["principalId"] == "alice"
+        assert auth["user"] == "alice"
+        assert auth["admin"] == "true"
+        assert auth["count"] == "3"
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        lam.delete_function(FunctionName=auth_fn)
+        lam.delete_function(FunctionName=int_fn)
+
+
+def test_apigwv1_execute_aws_iam_requires_auth_header(apigw_v1, lam):
+    """AWS_IAM methods reject requests without an Authorization header (403). (#1345)
+
+    We do not verify the SigV4 signature; only the presence check is enforced.
+    """
+    import urllib.request as _urlreq
+    import urllib.error as _urlerr
+    import uuid as _uuid
+
+    fname = f"intg-v1-iam-{_uuid.uuid4().hex[:8]}"
+    code = b"def handler(event, context):\n    return {'statusCode': 200, 'body': 'ok'}\n"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler", Code={"ZipFile": buf.getvalue()},
+    )
+
+    api_id = apigw_v1.create_rest_api(name=f"v1-iam-{fname}")["id"]
+    try:
+        root = next(r for r in apigw_v1.get_resources(restApiId=api_id)["items"] if r["path"] == "/")
+        resource_id = apigw_v1.create_resource(
+            restApiId=api_id, parentId=root["id"], pathPart="secure",
+        )["id"]
+        apigw_v1.put_method(
+            restApiId=api_id, resourceId=resource_id, httpMethod="GET",
+            authorizationType="AWS_IAM",
+        )
+        apigw_v1.put_integration(
+            restApiId=api_id, resourceId=resource_id, httpMethod="GET",
+            type="AWS_PROXY", integrationHttpMethod="POST",
+            uri=(
+                f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+                f"arn:aws:lambda:us-east-1:000000000000:function:{fname}/invocations"
+            ),
+        )
+        dep_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
+        apigw_v1.create_stage(restApiId=api_id, stageName="dev", deploymentId=dep_id)
+
+        host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+        url = f"http://{host}/dev/secure"
+
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", host)
+        try:
+            r = _urlreq.urlopen(req)
+            status = r.status
+        except _urlerr.HTTPError as e:
+            status = e.code
+        assert status == 403
+
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", host)
+        req.add_header("Authorization", "AWS4-HMAC-SHA256 Credential=...")
+        r = _urlreq.urlopen(req)
+        assert r.status == 200
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+
+
 def test_apigwv1_execute_lambda_proxy_multi_value_headers(apigw_v1, lam):
     """Payload format 1.0 `multiValueHeaders` yields one header line per value.
 
