@@ -1740,6 +1740,107 @@ def test_lambda_invoke_log_includes_user_output_and_traceback_on_error(lam):
         lam.delete_function(FunctionName=fname)
 
 
+def test_lambda_uncaught_exception_is_unhandled_function_error(lam):
+    """An uncaught exception in the handler must surface FunctionError=Unhandled
+    (real AWS reserves Handled for errors the runtime reports as handled), with
+    an error-shaped payload. This pins the default local executor, which already
+    behaved this way — it is the contract the docker/RIE classifier was corrected
+    to match, and the docker path is pinned by the LAMBDA_EXECUTOR=docker variant
+    below plus the _classify_function_error unit tests."""
+    fname = f"lam-unhandled-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        "def handler(event, context):\n"
+        "    raise TypeError('bad-type-from-handler')\n"
+    )
+
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+
+    try:
+        resp = lam.invoke(FunctionName=fname, Payload=json.dumps({}))
+        assert resp["StatusCode"] == 200
+        assert resp.get("FunctionError") == "Unhandled", resp.get("FunctionError")
+        payload = json.loads(resp["Payload"].read())
+        assert isinstance(payload, dict), payload
+        assert payload.get("errorType"), payload
+        assert "bad-type-from-handler" in payload.get("errorMessage", ""), payload
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+@pytest.mark.skipif(
+    os.environ.get("LAMBDA_EXECUTOR", "").lower() == "docker",
+    reason="docker/RIE path cannot distinguish a returned error-shaped dict "
+           "from a Go-style runtime error without the RIE header; it reports "
+           "Unhandled there, erring towards the 502-for-Unhandled contract",
+)
+def test_lambda_returned_error_shaped_dict_is_not_a_function_error(lam):
+    """A handler that *returns* an {errorType, errorMessage} dict without raising
+    produced a normal successful invocation on real AWS: the dict is just the
+    payload and NO X-Amz-Function-Error header is set."""
+    fname = f"lam-errshape-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        "def handler(event, context):\n"
+        "    return {'errorType': 'X', 'errorMessage': 'y'}\n"
+    )
+
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+
+    try:
+        resp = lam.invoke(FunctionName=fname, Payload=json.dumps({}))
+        assert resp["StatusCode"] == 200
+        assert "FunctionError" not in resp, resp.get("FunctionError")
+        payload = json.loads(resp["Payload"].read())
+        assert payload == {"errorType": "X", "errorMessage": "y"}
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+@pytest.mark.skipif(
+    os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
+    reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
+)
+def test_lambda_docker_uncaught_exception_is_unhandled_function_error(lam):
+    """Docker/RIE executor variant: the RIE does not set an error header in
+    practice, so the classifier must recognise the runtime's uncaught-exception
+    payload shape ({errorType, errorMessage, stackTrace}, no statusCode) as
+    Unhandled rather than defaulting to Handled."""
+    fname = f"lam-docker-unhandled-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        "def handler(event, context):\n"
+        "    raise TypeError('bad-type-from-docker-handler')\n"
+    )
+
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+
+    try:
+        resp = lam.invoke(FunctionName=fname, Payload=json.dumps({}))
+        assert resp["StatusCode"] == 200
+        assert resp.get("FunctionError") == "Unhandled", resp.get("FunctionError")
+        payload = json.loads(resp["Payload"].read())
+        assert payload.get("errorType") == "TypeError", payload
+        assert payload.get("stackTrace"), payload
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
 def test_lambda_warm_invoke_with_stderr_logging(lam):
     """Warm invoke should succeed repeatedly even when the worker writes to stderr."""
     fname = f"lam-warm-stderr-{_uuid_mod.uuid4().hex[:8]}"
@@ -6024,25 +6125,80 @@ def test_event_stream_encode_roundtrip():
     assert event.payload == b"hello-world"
 
 
-def test_invoke_rie_classifies_unhandled_vs_handled():
-    """If RIE returns X-Amz-Function-Error header the result carries
-    function_error='Unhandled'. A handler-returned errorType with no RIE
-    header should produce 'Handled'."""
-    # The classification logic lives inside _invoke_rie; unit-test by
-    # simulating what that branch does via a tiny inline replica.
-    parsed_error_payload = {"errorType": "E", "errorMessage": "m"}
+def test_classify_function_error_header_present_is_unhandled():
+    """An RIE error header always wins: Unhandled regardless of payload shape."""
+    assert lsvc._classify_function_error({"errorType": "E", "errorMessage": "m"}, "Unhandled") == "Unhandled"
+    # Even a non-dict body is Unhandled when the header says so.
+    assert lsvc._classify_function_error("boom", "Unhandled") == "Unhandled"
 
-    # Case 1: RIE header present → Unhandled
-    has_header = True
-    if has_header or (isinstance(parsed_error_payload, dict) and parsed_error_payload.get("errorType")):
-        classification = "Unhandled" if has_header else "Handled"
-    assert classification == "Unhandled"
 
-    # Case 2: No RIE header, but body has errorType → Handled
-    has_header = False
-    if has_header or (isinstance(parsed_error_payload, dict) and parsed_error_payload.get("errorType")):
-        classification = "Unhandled" if has_header else "Handled"
-    assert classification == "Handled"
+def test_classify_function_error_python_traceback_shape_is_unhandled():
+    """No header + the python3.12 runtime's uncaught-exception serialization
+    (errorType/errorMessage/stackTrace, no statusCode) → Unhandled."""
+    payload = {
+        "errorMessage": "bad-type-from-handler",
+        "errorType": "TypeError",
+        "requestId": "f5657518-62cc-48d1-826e-736c5e8bbeab",
+        "stackTrace": ["  File \"/var/task/index.py\", line 2, in handler\n"],
+    }
+    assert lsvc._classify_function_error(payload, "") == "Unhandled"
+
+
+def test_classify_function_error_python_import_error_is_unhandled():
+    """A broken zip or a wrong Handler makes the python runtime report
+    Runtime.ImportModuleError with an EMPTY stackTrace — classification keys on
+    the shape, not on the traceback being non-empty."""
+    payload = {
+        "errorMessage": "Unable to import module 'nosuchmodule': No module named 'nosuchmodule'",
+        "errorType": "Runtime.ImportModuleError",
+        "requestId": "",
+        "stackTrace": [],
+    }
+    assert lsvc._classify_function_error(payload, "") == "Unhandled"
+
+
+def test_classify_function_error_node_trace_shape_is_unhandled():
+    """The nodejs runtime names its traceback field "trace", not "stackTrace"
+    (as stepfunctions._call_lambda also documents), so keying on stackTrace
+    alone would misreport every raised Node error as Handled."""
+    payload = {
+        "errorType": "TypeError",
+        "errorMessage": "bad-type-from-node",
+        "trace": [
+            "TypeError: bad-type-from-node",
+            "    at Runtime.handler (file:///var/task/index.mjs:1:44)",
+        ],
+    }
+    assert lsvc._classify_function_error(payload, "") == "Unhandled"
+
+
+def test_classify_function_error_without_any_trace_field_is_unhandled():
+    """Go and the provided.* runtimes report errors with no traceback field at
+    all — including when the runtime POSTs its own error-type header to
+    /runtime/invocation/<id>/error, which the RIE does not forward."""
+    payload = {"errorMessage": "bad-from-custom-runtime", "errorType": "MyCustomError"}
+    assert lsvc._classify_function_error(payload, "") == "Unhandled"
+
+
+def test_classify_function_error_statuscode_payload_is_handled():
+    """No header + an HTTP-style dict carrying statusCode → Handled: an
+    envelope the handler returned itself, not the runtime's error shape."""
+    payload = {
+        "errorType": "E",
+        "errorMessage": "m",
+        "stackTrace": ["tb"],
+        "statusCode": 502,
+    }
+    assert lsvc._classify_function_error(payload, "") == "Handled"
+
+
+def test_classify_function_error_non_error_payloads_are_none():
+    """No header + a body without errorType (dict, non-dict, or unparsed
+    string) is not a function error at all."""
+    assert lsvc._classify_function_error({"statusCode": 200, "body": "ok"}, "") is None
+    assert lsvc._classify_function_error("plain text body", "") is None
+    assert lsvc._classify_function_error(None, "") is None
+    assert lsvc._classify_function_error({"errorType": ""}, "") is None
 
 
 def _invoke_with_log_output(monkeypatch, headers, log_output):

@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Lambda — uncaught handler exceptions report `X-Amz-Function-Error: Unhandled`** — the Docker/RIE executor read the error class off a response header the RIE never sets, so every failure was reported `Handled` and API Gateway consumers keying off the 502-for-Unhandled contract never took the error path. Headerless payloads are now classified by shape: the runtime's error serialization reports `Unhandled`, an HTTP-style envelope with `statusCode` stays `Handled`. Contributed by @iot-rocket.
+
 ## [1.4.16] — 2026-08-12
 
 ### Added
