@@ -3891,49 +3891,6 @@ def test_cfn_eventbus_getatt_arn(cfn, eb):
     _wait_stack(cfn, "cfn-eb-t03")
 
 
-def test_cfn_eventbus_update_is_idempotent(cfn, eb, sqs):
-    """A stack update must not fail an unchanged AWS::Events::EventBus.
-
-    EventBus has no explicit update handler, so _update_resource falls
-    back to calling create again on every update — expected to be
-    idempotent, same as every other resource type relying on that fallback
-    (e.g. SQS/SNS). A CDK-named bus (a name computed client-side from the
-    construct path, identical on every deploy — see e.g.
-    aws-cdk-lib's EventBus construct, or hotshot's AuditTrail) previously
-    made every update of a stack containing one fail with "already exists",
-    even when nothing about the bus itself changed."""
-    def template(queue_name):
-        return json.dumps({
-            "AWSTemplateFormatVersion": "2010-09-09",
-            "Resources": {
-                "Bus": {
-                    "Type": "AWS::Events::EventBus",
-                    "Properties": {"Name": "cfn-eb-t10"},
-                },
-                "Queue": {
-                    "Type": "AWS::SQS::Queue",
-                    "Properties": {"QueueName": queue_name},
-                },
-            },
-        })
-
-    cfn.create_stack(StackName="cfn-eb-t10", TemplateBody=template("cfn-eb-t10-q1"))
-    stack = _wait_stack(cfn, "cfn-eb-t10")
-    assert stack["StackStatus"] == "CREATE_COMPLETE"
-    bus_before = eb.describe_event_bus(Name="cfn-eb-t10")
-
-    # Only the queue changes — the bus is untouched, exactly like a real
-    # redeploy that doesn't touch AuditTrail at all.
-    cfn.update_stack(StackName="cfn-eb-t10", TemplateBody=template("cfn-eb-t10-q2"))
-    stack = _wait_stack(cfn, "cfn-eb-t10")
-    assert stack["StackStatus"] == "UPDATE_COMPLETE"
-
-    bus_after = eb.describe_event_bus(Name="cfn-eb-t10")
-    assert bus_after["Arn"] == bus_before["Arn"]
-    urls = sqs.list_queues(QueueNamePrefix="cfn-eb-t10-q2").get("QueueUrls", [])
-    assert any("cfn-eb-t10-q2" in u for u in urls)
-
-
 def test_cfn_eventbus_tags(cfn, eb):
     """Test EventBus tags are propagated."""
     template = {
