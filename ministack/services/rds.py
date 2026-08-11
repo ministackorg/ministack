@@ -995,6 +995,43 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
     }
 
 
+def _instance_owns_container(instance):
+    """True when the instance record owns its backing Docker container.
+
+    Standalone DB instances own their container: instance-level delete and
+    reset must remove it. Aurora cluster members do not — they alias the
+    cluster-owned shared container (marked by ``_shared_cluster_id``), whose
+    lifecycle belongs to the cluster helpers. Cluster members that own a
+    container of their own (per-instance reader containers, #1325) are
+    handled like standalone instances by ownership-based code paths.
+    """
+    return bool(
+        instance.get("_docker_container_id")
+        and not instance.get("_shared_cluster_id")
+    )
+
+
+def _cluster_owned_container_ids(cluster):
+    """All Docker container IDs backing an Aurora cluster's compute.
+
+    Today a cluster has at most one: the cluster-owned shared container.
+    Member instances that own a container of their own (per-instance reader
+    containers, #1325) are included so cluster-wide compute operations act
+    on every container the cluster is responsible for. IDs are deduplicated
+    (first occurrence wins) so a member aliasing an already-listed container
+    is not operated on twice.
+    """
+    ids = []
+    if cluster.get("_shared_container_id"):
+        ids.append(cluster["_shared_container_id"])
+    for member in _cluster_member_instances(cluster):
+        if _instance_owns_container(member):
+            container_id = member["_docker_container_id"]
+            if container_id not in ids:
+                ids.append(container_id)
+    return ids
+
+
 def _stop_cluster_shared_container(cluster_id, cluster):
     """Stop, but do not remove, an Aurora cluster's database compute.
 
@@ -1017,29 +1054,36 @@ def _stop_cluster_shared_container(cluster_id, cluster):
             cluster.get("_shared_container_epoch", 0),
         ) + 1
         cluster["_shared_container_ready"] = False
-        container_id = cluster.get("_shared_container_id")
+        container_ids = _cluster_owned_container_ids(cluster)
         docker_client = _get_docker()
-        if not docker_client or not container_id:
+        if not docker_client or not container_ids:
             return True
-        try:
-            container = docker_client.containers.get(container_id)
-        except Exception:
-            # A container that no longer exists is not running compute; the
-            # goal state is already met.
-            return True
-        try:
-            container.reload()
-            if container.status not in ("created", "exited", "dead", "removing"):
-                container.stop(timeout=5)
-                logger.info("RDS: stopped shared container for cluster %s", cluster_id)
-        except Exception as e:
-            logger.warning(
-                "RDS: failed to stop shared container for cluster %s: %s",
-                cluster_id,
-                e,
-            )
-            return False
-        return True
+        all_stopped = True
+        for container_id in container_ids:
+            try:
+                container = docker_client.containers.get(container_id)
+            except Exception:
+                # A container that no longer exists is not running compute;
+                # the goal state is already met.
+                continue
+            try:
+                container.reload()
+                if container.status not in ("created", "exited", "dead", "removing"):
+                    container.stop(timeout=5)
+                    logger.info(
+                        "RDS: stopped container %s for cluster %s",
+                        container_id,
+                        cluster_id,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "RDS: failed to stop container %s for cluster %s: %s",
+                    container_id,
+                    cluster_id,
+                    e,
+                )
+                all_stopped = False
+        return all_stopped
 
 
 def _remove_cluster_shared_resources(
@@ -2400,18 +2444,31 @@ def _attach_instance_to_shared_cluster(instance, cluster):
     )
 
 
-def _sync_cluster_endpoints(cluster):
-    """Point both Aurora endpoints at the cluster-owned shared container.
+def _cluster_reader_endpoint(cluster):
+    """The endpoint a cluster's ``ReaderEndpoint`` should resolve to.
 
-    The local reader endpoint is intentionally read/write because it resolves
-    to the same MySQL process as the writer. Genuine read-only behavior would
-    require a separate replicating process.
+    Today this is the writer's shared endpoint, so the local reader endpoint
+    is read/write: it resolves to the same database process as the writer.
+    Genuine read-only behavior requires a separate replicating process —
+    per-instance reader containers (#1325) will resolve here instead once a
+    cluster has one.
+    """
+    return cluster.get("_shared_endpoint")
+
+
+def _sync_cluster_endpoints(cluster):
+    """Point the Aurora writer and reader endpoints at cluster compute.
+
+    The writer endpoint resolves to the cluster-owned shared container; the
+    reader endpoint resolves to whatever ``_cluster_reader_endpoint``
+    selects (currently the same container — see its docstring).
     """
     endpoint = cluster.get("_shared_endpoint")
     if not endpoint:
         return
+    reader_endpoint = _cluster_reader_endpoint(cluster) or endpoint
     cluster["Endpoint"] = endpoint.get("Address", cluster.get("Endpoint", ""))
-    cluster["ReaderEndpoint"] = endpoint.get(
+    cluster["ReaderEndpoint"] = reader_endpoint.get(
         "Address", cluster.get("ReaderEndpoint", ""),
     )
     cluster["Port"] = int(endpoint.get("Port", cluster.get("Port", 0)))
@@ -3047,11 +3104,7 @@ def _delete_db_instance(p):
                 _stop_cluster_shared_container(shared_cluster_id, cluster)
 
     docker_client = _get_docker()
-    if (
-        docker_client
-        and instance.get("_docker_container_id")
-        and not instance.get("_shared_cluster_id")
-    ):
+    if docker_client and _instance_owns_container(instance):
         try:
             c = docker_client.containers.get(instance["_docker_container_id"])
             c.stop(timeout=5)
@@ -6286,7 +6339,7 @@ def reset():
                 if (
                     cid
                     and cid not in shared_container_ids
-                    and not instance.get("_shared_cluster_id")
+                    and _instance_owns_container(instance)
                 ):
                     try:
                         c = docker_client.containers.get(cid)
