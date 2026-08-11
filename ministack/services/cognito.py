@@ -1306,7 +1306,8 @@ def _continue_custom_auth_after_define(
     if define_resp.get("issueTokens"):
         del _challenge_sessions[token]
         return json_response({"AuthenticationResult": _build_auth_result(
-            session["pool_id"], session["client_id"], user
+            session["pool_id"], session["client_id"], user,
+            client_metadata=client_metadata,
         )})
 
     next_challenge = define_resp.get("challengeName")
@@ -2931,8 +2932,6 @@ def _admin_initiate_auth(data):
 
     auth_flow = data.get("AuthFlow", "")
     auth_params = data.get("AuthParameters", {})
-    # Top-level field, NOT inside AuthParameters — same as the CUSTOM_AUTH branch below.
-    client_metadata = data.get("ClientMetadata", {})
 
     if auth_flow in ("ADMIN_USER_PASSWORD_AUTH", "ADMIN_NO_SRP_AUTH"):
         username = auth_params.get("USERNAME")
@@ -2958,8 +2957,7 @@ def _admin_initiate_auth(data):
         mfa_challenge = _mfa_challenge_for_user(pool, user, pid, username)
         if mfa_challenge:
             return json_response(mfa_challenge)
-        return json_response({"AuthenticationResult":
-                             _build_auth_result(pid, cid, user, client_metadata=client_metadata)})
+        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
 
     if auth_flow in ("REFRESH_TOKEN_AUTH", "REFRESH_TOKEN"):
         refresh_token = auth_params.get("REFRESH_TOKEN", "")
@@ -2977,8 +2975,7 @@ def _admin_initiate_auth(data):
             return error_response_json("NotAuthorizedException",
                                        "Refresh Token has been revoked", 400)
         result = _build_auth_result(pid, cid, user,
-                                     trigger_source="TokenGeneration_RefreshTokens",
-                                     client_metadata=client_metadata)
+                                     trigger_source="TokenGeneration_RefreshTokens")
         result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
         return json_response({"AuthenticationResult": result})
 
@@ -3003,7 +3000,8 @@ def _admin_initiate_auth(data):
             return error_response_json("NotAuthorizedException",
                     "User is disabled.", 400)
 
-        # client_metadata already extracted at the top of this function.
+        # Extract ClientMetadata (top-level field, NOT inside AuthParameters)
+        client_metadata = data.get("ClientMetadata", {})
 
         # Build user_attrs dict
         user_attrs = _attr_list_to_dict(user.get("Attributes", []))
@@ -3136,6 +3134,7 @@ def _admin_respond_to_auth_challenge(data):
     if challenge_name == "NEW_PASSWORD_REQUIRED":
         username = responses.get("USERNAME")
         new_password = responses.get("NEW_PASSWORD")
+        client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
             return _err
@@ -3143,30 +3142,37 @@ def _admin_respond_to_auth_challenge(data):
             user["_password"] = new_password
         user["UserStatus"] = "CONFIRMED"
         user["UserLastModifiedDate"] = _now_epoch()
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+        return json_response({"AuthenticationResult": _build_auth_result(
+            pid, cid, user, client_metadata=client_metadata)})
 
     if challenge_name == "SMS_MFA":
         username = responses.get("USERNAME")
+        client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
             return _err
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+        return json_response({"AuthenticationResult": _build_auth_result(
+            pid, cid, user, client_metadata=client_metadata)})
 
     if challenge_name == "SOFTWARE_TOKEN_MFA":
         username = responses.get("USERNAME")
+        client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
             return _err
         # Accept any TOTP code in emulator — no real TOTP validation
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+        return json_response({"AuthenticationResult": _build_auth_result(
+            pid, cid, user, client_metadata=client_metadata)})
 
     if challenge_name == "MFA_SETUP":
         # Triggered when pool MFA=ON but user hasn't enrolled yet
         username = responses.get("USERNAME")
+        client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
             return _err
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+        return json_response({"AuthenticationResult": _build_auth_result(
+            pid, cid, user, client_metadata=client_metadata)})
 
     return error_response_json("InvalidParameterException", f"Unsupported challenge: {challenge_name}", 400)
 
@@ -3179,7 +3185,7 @@ def _pool_for_client(cid):
     return None, None
 
 
-def _refresh_auth_result(pool, pid, cid, refresh_token, client_metadata: dict | None = None):
+def _refresh_auth_result(pool, pid, cid, refresh_token):
     """Shared REFRESH_TOKEN_AUTH core. Returns (auth_result_dict, error_response);
     exactly one is non-None. Used by InitiateAuth's REFRESH_TOKEN_AUTH branch and
     by GetTokensFromRefreshToken so both mint tokens identically."""
@@ -3195,8 +3201,7 @@ def _refresh_auth_result(pool, pid, cid, refresh_token, client_metadata: dict | 
     if _refresh_token_revoked(refresh_token, user):
         return None, error_response_json("NotAuthorizedException",
                                          "Refresh Token has been revoked", 400)
-    result = _build_auth_result(pid, cid, user, trigger_source="TokenGeneration_RefreshTokens",
-                                 client_metadata=client_metadata)
+    result = _build_auth_result(pid, cid, user, trigger_source="TokenGeneration_RefreshTokens")
     result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
     return result, None
 
@@ -3222,8 +3227,7 @@ def _get_tokens_from_refresh_token(data):
     pool, pid = _pool_for_client(cid)
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
-    client_metadata = data.get("ClientMetadata", {})
-    result, err = _refresh_auth_result(pool, pid, cid, refresh_token, client_metadata=client_metadata)
+    result, err = _refresh_auth_result(pool, pid, cid, refresh_token)
     if err:
         return err
     return json_response({"AuthenticationResult": result})
@@ -3234,8 +3238,6 @@ def _initiate_auth(data):
     cid = data.get("ClientId")
     auth_flow = data.get("AuthFlow", "")
     auth_params = data.get("AuthParameters", {})
-    # Top-level field, NOT inside AuthParameters — same as the CUSTOM_AUTH branch below.
-    client_metadata = data.get("ClientMetadata", {})
 
     # Find pool by client id
     pool = None
@@ -3272,12 +3274,10 @@ def _initiate_auth(data):
         mfa_challenge = _mfa_challenge_for_user(pool, user, pid, username)
         if mfa_challenge:
             return json_response(mfa_challenge)
-        return json_response({"AuthenticationResult":
-                             _build_auth_result(pid, cid, user, client_metadata=client_metadata)})
+        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
 
     if auth_flow in ("REFRESH_TOKEN_AUTH", "REFRESH_TOKEN"):
-        result, err = _refresh_auth_result(pool, pid, cid, auth_params.get("REFRESH_TOKEN", ""),
-                                            client_metadata=client_metadata)
+        result, err = _refresh_auth_result(pool, pid, cid, auth_params.get("REFRESH_TOKEN", ""))
         if err:
             return err
         return json_response({"AuthenticationResult": result})
@@ -3317,7 +3317,8 @@ def _initiate_auth(data):
             return error_response_json("NotAuthorizedException",
                     "User is disabled.", 400)
 
-        # client_metadata already extracted at the top of this function.
+        # Extract ClientMetadata (top-level field, NOT inside AuthParameters)
+        client_metadata = data.get("ClientMetadata", {})
 
         # Build user_attrs dict
         user_attrs = _attr_list_to_dict(user.get("Attributes", []))
@@ -3455,6 +3456,7 @@ def _respond_to_auth_challenge(data):
 
         username = responses.get("USERNAME")
         new_password = responses.get("NEW_PASSWORD") or responses.get("PASSWORD")
+        client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
             return _err
@@ -3462,11 +3464,13 @@ def _respond_to_auth_challenge(data):
             user["_password"] = new_password
         user["UserStatus"] = "CONFIRMED"
         user["UserLastModifiedDate"] = _now_epoch()
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+        return json_response({"AuthenticationResult": _build_auth_result(
+            pid, cid, user, client_metadata=client_metadata)})
 
     if challenge_name == "NEW_PASSWORD_REQUIRED":
         username = responses.get("USERNAME")
         new_password = responses.get("NEW_PASSWORD") or responses.get("PASSWORD")
+        client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
             return _err
@@ -3474,15 +3478,18 @@ def _respond_to_auth_challenge(data):
             user["_password"] = new_password
         user["UserStatus"] = "CONFIRMED"
         user["UserLastModifiedDate"] = _now_epoch()
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+        return json_response({"AuthenticationResult": _build_auth_result(
+            pid, cid, user, client_metadata=client_metadata)})
 
     if challenge_name in ("SOFTWARE_TOKEN_MFA", "MFA_SETUP"):
         username = responses.get("USERNAME")
+        client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
             return _err
         # Accept any TOTP code in emulator
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+        return json_response({"AuthenticationResult": _build_auth_result(
+            pid, cid, user, client_metadata=client_metadata)})
 
     return error_response_json("InvalidParameterException", f"Unsupported challenge: {challenge_name}", 400)
 
@@ -5390,7 +5397,24 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         if csec != client["ClientSecret"]:
             return _oauth2_error("invalid_client", "Invalid client credentials.")
 
-        access_token = _fake_token(cid, pool_id, cid, "access")
+        # M2M's own client-metadata channel — a JSON object, urlencoded, in
+        # the aws_client_metadata POST field (there's no ClientMetadata
+        # request field on this grant the way there is on
+        # Initiate/RespondToAuthChallenge). parse_qs already url-decoded the
+        # form, so this is the raw JSON string.
+        client_metadata = {}
+        raw_metadata = form.get("aws_client_metadata", "")
+        if raw_metadata:
+            try:
+                parsed_metadata = json.loads(raw_metadata)
+                if isinstance(parsed_metadata, dict):
+                    client_metadata = parsed_metadata
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        access_token = _fake_token(cid, pool_id, cid, "access",
+                                    trigger_source="TokenGeneration_ClientCredentials",
+                                    client_metadata=client_metadata)
         resp = {
             "access_token": access_token,
             "token_type": "Bearer",
