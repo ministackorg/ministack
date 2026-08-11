@@ -68,6 +68,13 @@ def _stub_success():
     })
 
 
+def _stub_unsupported_sql_error(sql):
+    return _error(
+        "BadRequestException",
+        f"Unsupported SQL in RDS Data API stub mode: {sql}",
+    )
+
+
 def _cluster_id_from_arn(resource_arn):
     """Return a stable, region-qualified key for per-cluster stub state."""
     try:
@@ -218,33 +225,45 @@ def _stub_execute(resource_arn, sql):
             "records": records,
         })
 
-    # Default stub
-    return _stub_success()
+    return _stub_unsupported_sql_error(sql)
 
 
-def _resolve_cluster(resource_arn):
-    """Find RDS cluster and a member instance from a resourceArn."""
+def _resolve_target(resource_arn):
+    """Find RDS cluster metadata and a SQL target from a resourceArn.
+
+    Standalone DB instance ARNs remain a deliberate local-development
+    divergence from AWS's cluster-only Data API; they have no cluster
+    metadata to return or endpoint setting to enforce.
+    """
     from ministack.services import rds
 
     parsed = rds._parse_rds_arn(resource_arn)
     if not parsed:
-        return None, None
+        return None, None, None
 
     spec, resource_type, resource_id = parsed
     if resource_type == "db":
         if spec.account_id != get_account_id():
-            return None, None
+            return None, None, None
         instance = rds._instances.get_scoped(spec.account_id, spec.region, resource_id)
         if instance:
-            return instance, instance.get("Engine", "postgres")
-        return None, None
+            cluster = None
+            cluster_id = instance.get("DBClusterIdentifier")
+            if cluster_id:
+                cluster = rds._clusters.get_scoped(
+                    spec.account_id,
+                    spec.region,
+                    cluster_id,
+                )
+            return instance, instance.get("Engine", "postgres"), cluster
+        return None, None, None
 
     if resource_type != "cluster":
-        return None, None
+        return None, None, None
 
     cluster = rds._resolve_cluster(resource_arn)
     if not cluster:
-        return None, None
+        return None, None, None
 
     engine = cluster.get("Engine", "postgres")
     cluster_id = cluster["DBClusterIdentifier"]
@@ -253,7 +272,7 @@ def _resolve_cluster(resource_arn):
     # intentional in-memory Data API stub. Provisioned clusters, however, must
     # have an available member before SQL can run.
     if cluster.get("EngineMode") == "serverless":
-        return cluster, engine
+        return cluster, engine, cluster
 
     member_ids = {
         member.get("DBInstanceIdentifier")
@@ -261,7 +280,7 @@ def _resolve_cluster(resource_arn):
         if member.get("DBInstanceIdentifier")
     }
     if not member_ids or not cluster.get("_shared_container_ready", True):
-        return None, engine
+        return None, engine, cluster
 
     # Find an instance belonging to this cluster
     for inst in rds._instances.values_scoped(spec.account_id, spec.region):
@@ -278,10 +297,16 @@ def _resolve_cluster(resource_arn):
                 inst["_docker_container_id"] = cluster.get("_shared_container_id")
                 inst["_internal_address"] = cluster.get("_shared_internal_address")
                 inst["_internal_port"] = cluster.get("_shared_internal_port")
-            return inst, engine
+            return inst, engine, cluster
 
     # The cluster exists, but it has no available compute to accept SQL.
-    return None, engine
+    return None, engine, cluster
+
+
+def _resolve_cluster(resource_arn):
+    """Find RDS cluster and a member instance from a resourceArn."""
+    instance, engine, _cluster = _resolve_target(resource_arn)
+    return instance, engine
 
 
 def _cluster_resolution_error(resource_arn, engine):
@@ -295,6 +320,57 @@ def _cluster_resolution_error(resource_arn, engine):
     )
 
 
+def _http_endpoint_not_enabled_error(resource_arn):
+    return _error(
+        "HttpEndpointNotEnabledException",
+        f"HTTP endpoint is not enabled for cluster ARN: {resource_arn}",
+    )
+
+
+def _transaction_not_found_error(txn_id):
+    return _error(
+        "TransactionNotFoundException",
+        f"Transaction {txn_id} not found",
+        404,
+    )
+
+
+def _transaction_completion_not_found_error(txn_id):
+    return _error(
+        "NotFoundException",
+        f"Transaction {txn_id} not found",
+        404,
+    )
+
+
+def _validate_http_endpoint_enabled(cluster, resource_arn):
+    if cluster is not None and not cluster.get("HttpEndpointEnabled", False):
+        return _http_endpoint_not_enabled_error(resource_arn)
+    return None
+
+
+def _is_statement_timeout_error(exc):
+    err_str = str(exc).lower()
+    return any(
+        marker in err_str
+        for marker in (
+            "statement timeout",
+            "statement timed out",
+            "max_statement_time",
+            "maximum statement execution time",
+        )
+    )
+
+
+def _sql_execution_error(exc):
+    if _is_statement_timeout_error(exc):
+        return _error("StatementTimeoutException", f"Statement timed out: {exc}", 400)
+    if _is_connection_error(exc):
+        logger.warning("DB connection failed for real endpoint: %s", exc)
+        return _transient_database_error(f"Database endpoint is not available: {exc}")
+    return _error("BadRequestException", f"Database error: {exc}")
+
+
 def _get_secret_credentials(secret_arn):
     """Extract username and password from a Secrets Manager secret.
 
@@ -306,28 +382,54 @@ def _get_secret_credentials(secret_arn):
     _name, secret = secretsmanager._resolve(secret_arn, use_arn_scope=True)
     if not secret:
         return None, None
+    return _credentials_from_secret(secret)
 
+
+def _require_secret_credentials(secret_arn):
+    from ministack.services import secretsmanager
+
+    _name, secret = secretsmanager._resolve(secret_arn, use_arn_scope=True)
+    if not secret:
+        return None, None, _error(
+            "SecretsErrorException",
+            f"Secret not found for ARN: {secret_arn}",
+        )
+    if secret.get("DeletedDate"):
+        return None, None, _error(
+            "SecretsErrorException",
+            f"Secret is scheduled for deletion for ARN: {secret_arn}",
+        )
+    user, password = _credentials_from_secret(secret)
+    if not password:
+        return None, None, _error(
+            "InvalidSecretException",
+            f"Secret does not contain a password for ARN: {secret_arn}",
+        )
+    return user, password, None
+
+
+def _credentials_from_secret_string(secret_string):
+    try:
+        parsed = json.loads(secret_string)
+    except (json.JSONDecodeError, TypeError):
+        return None, secret_string
+    if isinstance(parsed, dict):
+        return parsed.get("username"), parsed.get("password")
+    return None, secret_string
+
+
+def _credentials_from_secret(secret):
     # Find the AWSCURRENT version
     for _vid, ver in secret.get("Versions", {}).items():
         if "AWSCURRENT" in ver.get("Stages", []):
             secret_string = ver.get("SecretString")
             if secret_string:
-                try:
-                    parsed = json.loads(secret_string)
-                    return (parsed.get("username"),
-                            parsed.get("password", secret_string))
-                except (json.JSONDecodeError, TypeError):
-                    return None, secret_string
+                return _credentials_from_secret_string(secret_string)
     # Fallback to any version
     for _vid, ver in secret.get("Versions", {}).items():
         secret_string = ver.get("SecretString")
         if secret_string:
-            try:
-                parsed = json.loads(secret_string)
-                return (parsed.get("username"),
-                        parsed.get("password", secret_string))
-            except (json.JSONDecodeError, TypeError):
-                return None, secret_string
+            return _credentials_from_secret_string(secret_string)
     return None, None
 
 
@@ -342,7 +444,7 @@ def _connect(instance, engine, database=None, password=None,
     port = (instance.get("_internal_port")
             or instance.get("Endpoint", {}).get("Port", 5432))
     db = database or ""
-    pw = password or "password"
+    pw = "password" if password is None else password
 
     if "mysql" in engine or "aurora-mysql" in engine or "mariadb" in engine:
         try:
@@ -525,30 +627,41 @@ def _execute_statement(data):
     if not sql:
         return _error("BadRequestException", "sql is required")
 
-    instance, engine = _resolve_cluster(resource_arn)
+    instance, engine, cluster = _resolve_target(resource_arn)
+    endpoint_error = _validate_http_endpoint_enabled(cluster, resource_arn)
+    if endpoint_error:
+        return endpoint_error
     if not instance:
         return _cluster_resolution_error(resource_arn, engine)
+    secret_user, password, secret_error = _require_secret_credentials(secret_arn)
+    if secret_error:
+        return secret_error
+
+    conn = None
+    if txn_id:
+        with _lock:
+            txn = _transactions.get(txn_id)
+            if not txn or txn.get("resourceArn") != resource_arn:
+                return _transaction_not_found_error(txn_id)
+            conn = txn["conn"]
 
     # Keep stub mode for intentional mock environments only. Once RDS has a
     # real container-backed endpoint, connection failures must surface as
     # transient errors instead of acknowledging writes that never reached MySQL.
-    if not _has_real_endpoint(instance):
+    # A supplied transactionId is validated first and always uses its bound
+    # connection; stub mode is only available to non-transactional requests.
+    if not txn_id and not _has_real_endpoint(instance):
         logger.info("No endpoint for %s, using stub mode", resource_arn)
         return _stub_execute(resource_arn, sql)
-
-    secret_user, password = _get_secret_credentials(secret_arn)
 
     # Convert :name placeholders to %(name)s for DB-API
     params = _convert_parameters(parameters)
     exec_sql = _substitute_named_params(sql, params)
 
     own_conn = False
-    conn = None
     try:
-        with _lock:
-            if txn_id and txn_id in _transactions:
-                conn = _transactions[txn_id]["conn"]
-            else:
+        if conn is None:
+            with _lock:
                 conn = _connect(instance, engine, database, password,
                                 username=secret_user)
                 own_conn = True
@@ -588,10 +701,7 @@ def _execute_statement(data):
     except Exception as e:
         if own_conn and conn:
             conn.close()
-        if _is_connection_error(e):
-            logger.warning("DB connection failed for real endpoint: %s", e)
-            return _transient_database_error(f"Database endpoint is not available: {e}")
-        return _error("BadRequestException", f"Database error: {e}")
+        return _sql_execution_error(e)
 
 
 def _begin_transaction(data):
@@ -604,11 +714,16 @@ def _begin_transaction(data):
     if not secret_arn:
         return _error("BadRequestException", "secretArn is required")
 
-    instance, engine = _resolve_cluster(resource_arn)
+    instance, engine, cluster = _resolve_target(resource_arn)
+    endpoint_error = _validate_http_endpoint_enabled(cluster, resource_arn)
+    if endpoint_error:
+        return endpoint_error
     if not instance:
         return _cluster_resolution_error(resource_arn, engine)
 
-    secret_user, password = _get_secret_credentials(secret_arn)
+    secret_user, password, secret_error = _require_secret_credentials(secret_arn)
+    if secret_error:
+        return secret_error
 
     try:
         conn = _connect(instance, engine, database, password,
@@ -620,7 +735,7 @@ def _begin_transaction(data):
     except ImportError as e:
         return _error("BadRequestException", str(e))
     except Exception as e:
-        return _error("BadRequestException", f"Database connection error: {e}")
+        return _sql_execution_error(e)
 
     txn_id = str(uuid.uuid4())
     with _lock:
@@ -638,12 +753,31 @@ def _commit_transaction(data):
     txn_id = data.get("transactionId")
     if not txn_id:
         return _error("BadRequestException", "transactionId is required")
+    resource_arn = data.get("resourceArn")
+    secret_arn = data.get("secretArn")
+    if not resource_arn:
+        return _error("BadRequestException", "resourceArn is required")
+    if not secret_arn:
+        return _error("BadRequestException", "secretArn is required")
+
+    instance, engine, cluster = _resolve_target(resource_arn)
+    endpoint_error = _validate_http_endpoint_enabled(cluster, resource_arn)
+    if endpoint_error:
+        return endpoint_error
+    if not instance:
+        return _cluster_resolution_error(resource_arn, engine)
+    _secret_user, _password, secret_error = _require_secret_credentials(secret_arn)
+    if secret_error:
+        return secret_error
 
     with _lock:
-        txn = _transactions.pop(txn_id, None)
+        txn = _transactions.get(txn_id)
+        if txn and txn.get("resourceArn") != resource_arn:
+            return _transaction_completion_not_found_error(txn_id)
+        if txn:
+            _transactions.pop(txn_id)
     if not txn:
-        return _error("NotFoundException",
-                       f"Transaction {txn_id} not found", 404)
+        return _transaction_completion_not_found_error(txn_id)
 
     try:
         txn["conn"].commit()
@@ -658,12 +792,31 @@ def _rollback_transaction(data):
     txn_id = data.get("transactionId")
     if not txn_id:
         return _error("BadRequestException", "transactionId is required")
+    resource_arn = data.get("resourceArn")
+    secret_arn = data.get("secretArn")
+    if not resource_arn:
+        return _error("BadRequestException", "resourceArn is required")
+    if not secret_arn:
+        return _error("BadRequestException", "secretArn is required")
+
+    instance, engine, cluster = _resolve_target(resource_arn)
+    endpoint_error = _validate_http_endpoint_enabled(cluster, resource_arn)
+    if endpoint_error:
+        return endpoint_error
+    if not instance:
+        return _cluster_resolution_error(resource_arn, engine)
+    _secret_user, _password, secret_error = _require_secret_credentials(secret_arn)
+    if secret_error:
+        return secret_error
 
     with _lock:
-        txn = _transactions.pop(txn_id, None)
+        txn = _transactions.get(txn_id)
+        if txn and txn.get("resourceArn") != resource_arn:
+            return _transaction_completion_not_found_error(txn_id)
+        if txn:
+            _transactions.pop(txn_id)
     if not txn:
-        return _error("NotFoundException",
-                       f"Transaction {txn_id} not found", 404)
+        return _transaction_completion_not_found_error(txn_id)
 
     try:
         txn["conn"].rollback()
@@ -689,18 +842,26 @@ def _batch_execute_statement(data):
     if not sql:
         return _error("BadRequestException", "sql is required")
 
-    instance, engine = _resolve_cluster(resource_arn)
+    instance, engine, cluster = _resolve_target(resource_arn)
+    endpoint_error = _validate_http_endpoint_enabled(cluster, resource_arn)
+    if endpoint_error:
+        return endpoint_error
     if not instance:
         return _cluster_resolution_error(resource_arn, engine)
 
-    secret_user, password = _get_secret_credentials(secret_arn)
+    secret_user, password, secret_error = _require_secret_credentials(secret_arn)
+    if secret_error:
+        return secret_error
 
     own_conn = False
     conn = None
     try:
         with _lock:
-            if txn_id and txn_id in _transactions:
-                conn = _transactions[txn_id]["conn"]
+            if txn_id:
+                txn = _transactions.get(txn_id)
+                if not txn or txn.get("resourceArn") != resource_arn:
+                    return _transaction_not_found_error(txn_id)
+                conn = txn["conn"]
             else:
                 conn = _connect(instance, engine, database, password,
                                 username=secret_user)
@@ -735,7 +896,7 @@ def _batch_execute_statement(data):
     except Exception as e:
         if own_conn and conn:
             conn.close()
-        return _error("BadRequestException", f"Database error: {e}")
+        return _sql_execution_error(e)
 
 
 def reset():
