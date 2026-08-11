@@ -33,7 +33,7 @@ from ministack.core.responses import (
 logger = logging.getLogger("dsql")
 
 BASE_PORT = int(os.environ.get("DSQL_BASE_PORT", "25432"))
-MAX_CLUSTERS = int(os.environ.get("DSQL_MAX_CONTAINERS", "30"))  # cap on real Postgres backend containers (one per cluster)
+MAX_CONTAINERS = int(os.environ.get("DSQL_MAX_CONTAINERS", "30"))  # cap on real Postgres backend containers (one per cluster)
 PG_IMAGE = os.environ.get("DSQL_PG_IMAGE", "postgres:16-alpine")
 DSQL_PERSIST = os.environ.get("DSQL_PERSIST", "0").lower() in ("1", "true", "yes")
 # Backend containers are opt-in: default is control-plane-only (metadata stubs).
@@ -352,6 +352,7 @@ def _respawn_backend(identifier, cluster):
             e,
         )
         cluster["status"] = "ACTIVE"
+        cluster["_has_backend"] = False
         return
     cluster["_backend_host"] = host
     cluster["_backend_port"] = port
@@ -413,11 +414,11 @@ def _create_cluster(data):
         backend_count = sum(
             1 for c in _clusters._data.values() if c.get("_has_backend")
         )
-        if backend_count >= MAX_CLUSTERS:
+        if backend_count >= MAX_CONTAINERS:
             logger.warning(
                 "DSQL: backend container cap reached (%d) — cluster %s is "
                 "metadata-only. Raise DSQL_MAX_CONTAINERS to allow more.",
-                MAX_CLUSTERS,
+                MAX_CONTAINERS,
                 identifier,
             )
             has_backend = False
@@ -841,12 +842,18 @@ def restore_state(data):
     # Respawn backend containers for restored clusters (blocking Docker work
     # in daemon threads, mirroring rds restore). Proxies start via
     # `_respawn_backend` once the loop is known, or via the lifespan hook
-    # `start_restored_proxies`.
+    # `start_restored_proxies`. The cap is deliberately not re-enforced here:
+    # clusters that had a backend get it back (best effort), so a restart can
+    # transiently exceed MAX_CONTAINERS.
     for cluster in _clusters._data.values():
         if not isinstance(cluster, dict) or "identifier" not in cluster:
             continue
-        if not _backends_enabled():
+        # Clusters persisted as stubs stay stubs. State saved before
+        # `_has_backend` existed defaults to respawning, matching the old
+        # always-container behavior.
+        if not _backends_enabled() or not cluster.get("_has_backend", True):
             cluster["status"] = "ACTIVE"
+            cluster["_has_backend"] = False
             continue
         cluster["status"] = "CREATING"
         threading.Thread(

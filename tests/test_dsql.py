@@ -979,7 +979,7 @@ class TestContainerCap:
         from ministack.services import dsql as dsql_mod
 
         monkeypatch.setattr(dsql_mod, "_backends_enabled", lambda: True)
-        monkeypatch.setattr(dsql_mod, "MAX_CLUSTERS", 0)
+        monkeypatch.setattr(dsql_mod, "MAX_CONTAINERS", 0)
 
         with caplog.at_level(logging.WARNING, logger="dsql"):
             status, _, body = dsql_mod._create_cluster({})
@@ -997,6 +997,38 @@ class TestContainerCap:
             )
         finally:
             dsql_mod._clusters.clear()
+
+    def test_containers_disabled_means_stub_even_with_docker(self, monkeypatch):
+        """Default posture: Docker available but DSQL_CONTAINERS unset/off —
+        clusters are metadata-only stubs and no backend is started."""
+        import json
+
+        from ministack.services import dsql as dsql_mod
+
+        monkeypatch.setattr(dsql_mod, "DSQL_CONTAINERS", False)
+        monkeypatch.setattr(dsql_mod, "_docker_available", lambda: True)
+        assert dsql_mod._backends_enabled() is False
+
+        status, _, body = dsql_mod._create_cluster({})
+        assert status == 200
+        cluster = json.loads(body)
+        identifier = cluster["identifier"]
+        try:
+            assert cluster["status"] == "ACTIVE"  # stub, not CREATING
+            assert dsql_mod._clusters[identifier]["_has_backend"] is False
+        finally:
+            dsql_mod._clusters.clear()
+
+    def test_backends_enabled_requires_flag_and_docker(self, monkeypatch):
+        from ministack.services import dsql as dsql_mod
+
+        monkeypatch.setattr(dsql_mod, "_docker_available", lambda: True)
+        monkeypatch.setattr(dsql_mod, "DSQL_CONTAINERS", False)
+        assert dsql_mod._backends_enabled() is False
+        monkeypatch.setattr(dsql_mod, "DSQL_CONTAINERS", True)
+        assert dsql_mod._backends_enabled() is True
+        monkeypatch.setattr(dsql_mod, "_docker_available", lambda: False)
+        assert dsql_mod._backends_enabled() is False
 
 
 
@@ -1240,6 +1272,68 @@ def _pg_connect(port, autocommit=True):
     )
     conn.autocommit = autocommit
     return conn
+
+
+@requires_docker
+class TestContainersE2E:
+    """End-to-end for DSQL_CONTAINERS=1: _create_cluster spins up a real
+    Postgres container behind the wire proxy, reachable over SQL. Runs
+    in-process (flag monkeypatched on) wherever a Docker daemon exists."""
+
+    def test_env_flag_spins_up_real_backend(self, monkeypatch):
+        import json
+
+        psycopg2 = pytest.importorskip("psycopg2")
+        pytest.importorskip("docker")
+
+        from ministack.services import dsql as dsql_mod
+
+        monkeypatch.setattr(dsql_mod, "DSQL_CONTAINERS", True)
+        # _start_backend stashes the test's ephemeral loop in this global;
+        # put the original back afterwards (all consumers guard is_running(),
+        # but don't leak a closed loop into other tests).
+        old_main_loop = dsql_mod._main_loop
+
+        async def _run():
+            status, _, body = dsql_mod._create_cluster({})
+            assert status == 200
+            cluster = json.loads(body)
+            identifier = cluster["identifier"]
+            try:
+                # Backend container + proxy spin up in the background.
+                assert cluster["status"] == "CREATING"
+                deadline = time.time() + 120
+                while dsql_mod._clusters[identifier]["status"] != "ACTIVE":
+                    assert time.time() < deadline, "backend did not start in time"
+                    await asyncio.sleep(0.5)
+                assert dsql_mod._clusters[identifier]["_has_backend"] is True
+
+                def _select_one():
+                    conn = psycopg2.connect(
+                        host="127.0.0.1",
+                        port=cluster["port"],
+                        user="admin",
+                        password="anything",
+                        dbname="postgres",
+                        connect_timeout=10,
+                    )
+                    try:
+                        conn.autocommit = True
+                        with conn.cursor() as cur:
+                            cur.execute("SELECT 1")
+                            return cur.fetchone()
+                    finally:
+                        conn.close()
+
+                assert await asyncio.to_thread(_select_one) == (1,)
+            finally:
+                await dsql_mod._teardown_backend(identifier)
+                dsql_mod._clusters.pop(identifier, None)
+
+        try:
+            asyncio.run(_run())
+        finally:
+            dsql_mod._main_loop = old_main_loop
 
 
 class _WireClient:
