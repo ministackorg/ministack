@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **CloudFormation — resources unchanged by a stack update are left alone** — every previously-provisioned resource was reprocessed on every stack update regardless of whether its properties changed, and any resource type with no dedicated update handler fell back to calling create again — a fallback whose own name-generation regenerated a fresh random suffix on every call, and whose caller passed the wrong id into it, on top of that. An auto-named resource's "idempotent" create (the type framework's own documented expectation) silently produced a brand new, empty resource under a new identity on every single update, orphaning the real one — and anything referencing it via `Ref`/`Fn::GetAtt` picked up that new, wrong identity the moment it was reprocessed later in the same update, since real CloudFormation does propagate a changed reference. Found via a DynamoDB table silently duplicating on an unrelated update to a real multi-stack deploy. A genuinely unchanged resource is no longer touched at all, matching real CloudFormation; auto-generated names are now a deterministic hash of (stack name, logical id) rather than random, so the remaining case — a resource's properties *did* change but its type still has no update handler — reproduces the same name it started with. Also fixes the same symptom for `AWS::Events::EventBus` (previously failed a stack update outright with "already exists" once created) and any other resource type with no update handler and no name-collision guard of its own. Contributed by @ryan-bennett.
+
 ## [1.4.15] — 2026-08-10
 
 ### Added
