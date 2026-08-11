@@ -902,3 +902,137 @@ def test_iot_rule_where_or_clause_dispatches_either_branch(
     assert _poll_sink(sqs, sink, timeout=3) is None
 
     iot_client.delete_topic_rule(ruleName=rule)
+
+
+def test_iot_rule_republish_where_gated_ws_subscriber(iot_client, iot_data_client):
+    """A WHERE-gated republish rule: a WebSocket subscriber on the republish
+    target observes only the matching publish."""
+    from conftest import patch_endpoint_dns
+
+    source = _unique("raw/alerts")
+    target = _unique("filtered/alerts")
+    rule = _unique("repub").replace("-", "_")
+    iot_client.create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": f"SELECT * FROM '{source}' WHERE severity = 'high'",
+            "actions": [
+                {"republish": {"topic": target, "qos": 0, "roleArn": "arn:aws:iam::000000000000:role/rule"}}
+            ],
+        },
+    )
+
+    parsed = urlparse(ENDPOINT)
+    ws_host = parsed.hostname or "localhost"
+    ws_port = parsed.port or 4566
+    ws_url = f"ws://prefix-ats.iot.us-east-1.{ws_host}:{ws_port}/mqtt"
+
+    ready = threading.Event()
+    stop = threading.Event()
+    received: list = []
+
+    with patch_endpoint_dns():
+        t = threading.Thread(
+            target=lambda: asyncio.run(
+                _ws_subscribe_and_collect(ws_url, target, ready, received, stop)
+            ),
+            daemon=True,
+        )
+        t.start()
+        assert ready.wait(timeout=5), "WebSocket subscriber did not become ready"
+
+        iot_data_client.publish(
+            topic=source, payload=json.dumps({"severity": "low", "n": 1}).encode()
+        )
+        iot_data_client.publish(
+            topic=source, payload=json.dumps({"severity": "high", "n": 2}).encode()
+        )
+
+        deadline = time.time() + 5
+        while time.time() < deadline and not received:
+            time.sleep(0.05)
+        time.sleep(0.5)  # allow a (wrong) second delivery to surface
+        stop.set()
+        t.join(timeout=2)
+
+    assert len(received) == 1, f"expected exactly the matching publish, got {received}"
+    delivered_topic, delivered_payload = received[0]
+    assert delivered_topic == target
+    assert json.loads(delivered_payload) == {"severity": "high", "n": 2}
+
+    iot_client.delete_topic_rule(ruleName=rule)
+
+
+def test_iot_rule_dynamodbv2_action_puts_item(iot_client, iot_data_client, ddb):
+    table = _unique("rule-sink").replace("-", "")
+    ddb.create_table(
+        TableName=table,
+        AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
+        KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    rule = _unique("ddbrule").replace("-", "_")
+    iot_client.create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": "SELECT deviceId AS id, temp, active FROM 'ddb/+/telemetry'",
+            "actions": [{"dynamoDBv2": {"putItem": {"tableName": table}, "roleArn": "arn:aws:iam::000000000000:role/rule"}}],
+        },
+    )
+
+    iot_data_client.publish(
+        topic="ddb/a1/telemetry",
+        payload=json.dumps({"deviceId": "d1", "temp": 22.5, "active": True}).encode(),
+    )
+
+    items = []
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        items = ddb.scan(TableName=table).get("Items", [])
+        if items:
+            break
+        time.sleep(0.2)
+    assert items == [
+        {"id": {"S": "d1"}, "temp": {"N": "22.5"}, "active": {"BOOL": True}}
+    ]
+
+    iot_client.delete_topic_rule(ruleName=rule)
+    ddb.delete_table(TableName=table)
+
+
+def test_iot_rule_sns_action_publishes_to_topic(iot_client, iot_data_client, sns, sqs):
+    topic_arn = sns.create_topic(Name=_unique("rule-sns"))["TopicArn"]
+    queue_url = sqs.create_queue(QueueName=_unique("sns-sink"))["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=queue_url, AttributeNames=["QueueArn"]
+    )["Attributes"]["QueueArn"]
+    sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=queue_arn)
+
+    rule = _unique("snsrule").replace("-", "_")
+    iot_client.create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": "SELECT * FROM 'notify/+/event'",
+            "actions": [{"sns": {"targetArn": topic_arn, "roleArn": "arn:aws:iam::000000000000:role/rule"}}],
+        },
+    )
+
+    iot_data_client.publish(
+        topic="notify/a1/event", payload=json.dumps({"kind": "boom"}).encode()
+    )
+
+    body = None
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        msgs = sqs.receive_message(
+            QueueUrl=queue_url, MaxNumberOfMessages=1, WaitTimeSeconds=1
+        )
+        if msgs.get("Messages"):
+            body = json.loads(msgs["Messages"][0]["Body"])
+            break
+    assert body is not None, "SNS → SQS delivery did not arrive"
+    # Default (non-raw) delivery wraps the message in the SNS envelope.
+    message = json.loads(body["Message"]) if "Message" in body else body
+    assert message == {"kind": "boom"}
+
+    iot_client.delete_topic_rule(ruleName=rule)

@@ -1187,7 +1187,7 @@ def test_iot_topic_rules_and_basic_ingest_use_publish_region(monkeypatch):
     )
     dispatched = []
 
-    def _capture_rule_action(
+    async def _capture_rule_action(
         dispatched_account_id, dispatched_region, rule, payload, topic="", client_id=None
     ):
         dispatched.append((dispatched_account_id, dispatched_region, rule, payload))
@@ -3334,3 +3334,331 @@ def test_run_rule_actions_where_gates_dispatch(monkeypatch):
     finally:
         iot_module._topic_rules.clear()
         reset()
+
+
+# ----------------------------------------------------------------------
+# Rule action dispatch: republish / dynamoDBv2 / sns (white-box).
+# ----------------------------------------------------------------------
+
+
+def _put_rule(account_id, name, sql, actions):
+    from ministack.services import iot as iot_module
+
+    iot_module._topic_rules.set_scoped(
+        account_id,
+        _TEST_REGION,
+        name,
+        {"ruleName": name, "sql": sql, "ruleDisabled": False, "actions": actions},
+    )
+
+
+def test_rule_republish_action_delivers_projected_event():
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    _put_rule(
+        account_id,
+        "repub_rule",
+        "SELECT temp AS t FROM 'sensors/+/telemetry' WHERE temp > 20",
+        [{"republish": {"topic": "filtered/telemetry", "qos": 1}}],
+    )
+    received = []
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            received.append((topic, payload, qos))
+
+        await subscribe(account_id, "filtered/telemetry", _collect, granted_qos=1)
+        await publish(account_id, "sensors/a1/telemetry", b'{"temp": 22}')
+        await publish(account_id, "sensors/a1/telemetry", b'{"temp": 19}')  # WHERE gates
+
+    try:
+        asyncio.run(_run())
+        assert len(received) == 1
+        topic, payload, _qos = received[0]
+        assert topic == "filtered/telemetry"
+        assert json.loads(payload) == {"t": 22}
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+def test_rule_republish_onto_own_topic_terminates():
+    """A rule republishing onto its own topic filter is user error, but the
+    broker must cut the chain instead of recursing forever."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    _put_rule(
+        account_id,
+        "loop_rule",
+        "SELECT * FROM 'loop/topic'",
+        [{"republish": {"topic": "loop/topic"}}],
+    )
+    received = []
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            received.append(payload)
+
+        await subscribe(account_id, "loop/topic", _collect)
+        await publish(account_id, "loop/topic", b'{"n": 1}')
+
+    try:
+        asyncio.run(_run())
+        # The original publish plus one republish per allowed depth.
+        assert len(received) == 1 + iot_module._MAX_REPUBLISH_DEPTH
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+def test_rule_action_failure_does_not_kill_the_loop(monkeypatch):
+    """A failing action is logged and the remaining actions still dispatch."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    _put_rule(
+        account_id,
+        "multi_rule",
+        "SELECT * FROM 'multi/topic'",
+        [
+            {"sns": {"targetArn": "arn:aws:sns:us-east-1:123456789012:absent-topic"}},
+            {"dynamoDBv2": {"putItem": {"tableName": "absent-table"}}},
+            {"lambda": {"functionArn": "arn:aws:lambda:us-east-1:123456789012:function:sink"}},
+        ],
+    )
+    dispatched = []
+    monkeypatch.setattr(
+        iot_module,
+        "_dispatch_rule_to_lambda",
+        lambda account, region, arn, event: dispatched.append(event),
+    )
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("dispatch blew up")
+
+    # First action targets a missing SNS topic (raises on its own), second one
+    # is made to raise outright — the lambda action after both must still
+    # dispatch.
+    monkeypatch.setattr(iot_module, "_dispatch_rule_dynamodb", _boom)
+
+    async def _run():
+        await publish(account_id, "multi/topic", b'{"ok": 1}')
+
+    try:
+        asyncio.run(_run())
+        assert dispatched == [{"ok": 1}]
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+def test_rule_sns_action_writes_a_full_sns_message_record():
+    """The dispatcher publishes through SNS's own internal path, so the stored
+    record carries every field an HTTP `Publish` writes — a hand-rolled append
+    here would quietly drop the ones a subscription filter policy reads."""
+    from ministack.services import iot as iot_module
+    from ministack.services import sns as sns_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    topic_arn = f"arn:aws:sns:{_TEST_REGION}:{account_id}:rule-sink"
+    sns_module._topics.set_scoped(
+        account_id,
+        _TEST_REGION,
+        topic_arn,
+        {"arn": topic_arn, "messages": [], "subscriptions": [], "attributes": {}},
+    )
+    _put_rule(
+        account_id,
+        "sns_rule",
+        "SELECT temp FROM 'sensors/+/telemetry'",
+        [{"sns": {"targetArn": topic_arn}}],
+    )
+
+    async def _run():
+        await publish(account_id, "sensors/a1/telemetry", b'{"temp": 22, "n": 1}')
+
+    try:
+        asyncio.run(_run())
+        stored = sns_module._topics.get_scoped(account_id, _TEST_REGION, topic_arn)
+        assert len(stored["messages"]) == 1
+        record = stored["messages"][0]
+        assert json.loads(record["message"]) == {"temp": 22}
+        assert set(record) == {
+            "id",
+            "message",
+            "subject",
+            "message_structure",
+            "message_attributes",
+            "timestamp",
+        }
+    finally:
+        sns_module._topics.clear()
+        iot_module._topic_rules.clear()
+        reset()
+
+
+def test_rule_error_action_runs_when_an_action_fails(monkeypatch):
+    """AWS invokes the rule's errorAction when an action fails, with the failure
+    document — without it the only trace of a broken pipeline is a local log
+    line nobody reads."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    iot_module._topic_rules.set_scoped(
+        account_id,
+        _TEST_REGION,
+        "err_rule",
+        {
+            "ruleName": "err_rule",
+            "sql": "SELECT * FROM 'err/topic'",
+            "ruleDisabled": False,
+            "actions": [{"dynamoDBv2": {"putItem": {"tableName": "absent"}}}],
+            "errorAction": {"republish": {"topic": "err/dlq"}},
+        },
+    )
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("dispatch blew up")
+
+    monkeypatch.setattr(iot_module, "_dispatch_rule_dynamodb", _boom)
+    received = []
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            received.append(json.loads(payload))
+
+        await subscribe(account_id, "err/dlq", _collect)
+        await publish(account_id, "err/topic", b'{"n": 1}')
+
+    try:
+        asyncio.run(_run())
+        assert len(received) == 1
+        doc = received[0]
+        assert doc["ruleName"] == "err_rule"
+        assert doc["topic"] == "err/topic"
+        assert base64.b64decode(doc["base64OriginalPayload"]) == b'{"n": 1}'
+        assert doc["failures"] == [
+            {"action": "dynamoDBv2", "errorMessage": "RuntimeError: dispatch blew up"}
+        ]
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+@pytest.mark.parametrize(
+    ("action", "action_type", "error_fragment"),
+    [
+        (
+            {"dynamoDBv2": {"putItem": {"tableName": "absent-table"}}},
+            "dynamoDBv2",
+            "absent-table",
+        ),
+        (
+            {"sns": {"targetArn": "arn:aws:sns:us-east-1:123456789012:absent-topic"}},
+            "sns",
+            "absent-topic",
+        ),
+    ],
+)
+def test_rule_error_action_runs_on_an_undeliverable_destination(
+    action, action_type, error_fragment
+):
+    """The failure that actually happens locally is a destination that is not
+    there, and it has to reach the errorAction.
+
+    Both dispatchers used to log-and-return for it, so the errorAction only ever
+    ran for a monkeypatched raise — the emulator reported a healthy pipeline
+    while dropping every message.
+    """
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    iot_module._topic_rules.set_scoped(
+        account_id,
+        _TEST_REGION,
+        "undeliverable_rule",
+        {
+            "ruleName": "undeliverable_rule",
+            "sql": "SELECT * FROM 'err/topic'",
+            "ruleDisabled": False,
+            "actions": [action],
+            "errorAction": {"republish": {"topic": "err/dlq"}},
+        },
+    )
+    received = []
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            received.append(json.loads(payload))
+
+        await subscribe(account_id, "err/dlq", _collect)
+        await publish(account_id, "err/topic", b'{"n": 1}')
+
+    try:
+        asyncio.run(_run())
+        assert len(received) == 1
+        doc = received[0]
+        assert doc["ruleName"] == "undeliverable_rule"
+        assert base64.b64decode(doc["base64OriginalPayload"]) == b'{"n": 1}'
+        assert len(doc["failures"]) == 1
+        failure = doc["failures"][0]
+        assert failure["action"] == action_type
+        assert error_fragment in failure["errorMessage"]
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+def test_rule_error_action_absent_is_a_no_op(monkeypatch):
+    """A rule without an errorAction still just logs the failure."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    _put_rule(
+        account_id,
+        "noerr_rule",
+        "SELECT * FROM 'noerr/topic'",
+        [{"dynamoDBv2": {"putItem": {"tableName": "absent"}}}],
+    )
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("dispatch blew up")
+
+    monkeypatch.setattr(iot_module, "_dispatch_rule_dynamodb", _boom)
+
+    async def _run():
+        await publish(account_id, "noerr/topic", b'{"n": 1}')
+
+    try:
+        asyncio.run(_run())  # no exception escapes
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+def test_ddb_attribute_value_mapping():
+    from ministack.services.iot import _ddb_attribute_value
+
+    assert _ddb_attribute_value(True) == {"BOOL": True}
+    assert _ddb_attribute_value(3) == {"N": "3"}
+    assert _ddb_attribute_value(2.5) == {"N": "2.5"}
+    assert _ddb_attribute_value(None) == {"NULL": True}
+    assert _ddb_attribute_value({"a": 1}) == {"S": '{"a": 1}'}
+    assert _ddb_attribute_value([1, 2]) == {"S": "[1, 2]"}
+    assert _ddb_attribute_value("x") == {"S": "x"}

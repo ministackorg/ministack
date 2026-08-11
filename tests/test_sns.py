@@ -1839,3 +1839,218 @@ def test_sns_restore_legacy_account_scoped_state_adopts_arn_regions():
         _sns._platform_endpoints._data.update(original_endpoints)
         set_request_account_id(original_account)
         set_request_region(original_region)
+
+
+# ---------------------------------------------------------------------------
+# publish_internal
+# ---------------------------------------------------------------------------
+#
+# The in-process seam cross-service producers (an IoT topic rule, an EventBridge
+# target) publish through. It is the only door that can see the FIFO duplicate
+# flag and the None a missing topic answers with — the HTTP `Publish` wrapper
+# folds both into its XML response — so it is exercised directly here.
+
+
+@pytest.fixture
+def sns_internal():
+    """An empty in-process SNS store pinned to one account and region."""
+    import ministack.services.sns as _sns
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    original_account, original_region = get_account_id(), get_region()
+    original_topics = dict(_sns._topics._data)
+    _sns._topics.clear()
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    try:
+        yield _sns
+    finally:
+        _sns._topics.clear()
+        _sns._topics._data.update(original_topics)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def _seed_internal_topic(_sns, name, *, attributes=None, subscriptions=()):
+    arn = f"arn:aws:sns:us-east-1:000000000000:{name}"
+    _sns._topics[arn] = {
+        "name": name,
+        "arn": arn,
+        "messages": [],
+        "subscriptions": list(subscriptions),
+        "attributes": attributes or {},
+    }
+    return arn
+
+
+def test_sns_publish_internal_stores_the_record_and_fans_out(sns_internal, monkeypatch):
+    """A publish through the seam gets everything an HTTP one gets.
+
+    The message_structure and message_attributes here are the two fields the
+    hand-rolled `topic["messages"].append(...)` this replaced used to drop, and
+    both are load-bearing: the first picks the per-protocol body, the second is
+    what a subscription filter policy reads.
+    """
+    delivered = []
+    monkeypatch.setattr(
+        sns_internal,
+        "_deliver_to_sqs",
+        lambda endpoint, envelope, raw, message, **kwargs: delivered.append(message),
+    )
+    arn = _seed_internal_topic(
+        sns_internal,
+        f"internal-{_uuid_mod.uuid4().hex[:8]}",
+        subscriptions=[{
+            "arn": f"sub-{_uuid_mod.uuid4()}",
+            "protocol": "sqs",
+            "endpoint": "arn:aws:sqs:us-east-1:000000000000:sink",
+            "confirmed": True,
+            "attributes": {},
+        }],
+    )
+    attrs = {"kind": {"DataType": "String", "StringValue": "telemetry"}}
+
+    result = sns_internal.publish_internal(
+        arn,
+        json.dumps({"default": "generic", "sqs": "for-sqs"}),
+        "a subject",
+        message_structure="json",
+        message_attributes=attrs,
+    )
+
+    assert result["duplicate"] is False
+    assert result["sequence_number"] is None
+    assert result["message_id"]
+
+    stored = sns_internal._topics[arn]["messages"]
+    assert len(stored) == 1
+    assert stored[0]["id"] == result["message_id"]
+    assert stored[0]["subject"] == "a subject"
+    assert stored[0]["message_structure"] == "json"
+    assert stored[0]["message_attributes"] == attrs
+    # message_structure picked the sqs body rather than the default one.
+    assert delivered == ["for-sqs"]
+
+
+def test_sns_publish_internal_applies_the_subscription_filter_policy(
+    sns_internal, monkeypatch
+):
+    """The message attributes reach the filter policy, so a non-matching
+    subscriber is skipped — the behaviour lost when the attributes were not
+    carried at all."""
+    delivered = []
+    monkeypatch.setattr(
+        sns_internal,
+        "_deliver_to_sqs",
+        lambda endpoint, envelope, raw, message, **kwargs: delivered.append(endpoint),
+    )
+
+    def _sub(endpoint, kind):
+        return {
+            "arn": f"sub-{_uuid_mod.uuid4()}",
+            "protocol": "sqs",
+            "endpoint": endpoint,
+            "confirmed": True,
+            "attributes": {"FilterPolicy": json.dumps({"kind": [kind]})},
+        }
+
+    arn = _seed_internal_topic(
+        sns_internal,
+        f"internal-{_uuid_mod.uuid4().hex[:8]}",
+        subscriptions=[_sub("queue-match", "telemetry"), _sub("queue-skip", "alarm")],
+    )
+
+    sns_internal.publish_internal(
+        arn,
+        "hello",
+        message_attributes={"kind": {"DataType": "String", "StringValue": "telemetry"}},
+    )
+
+    assert delivered == ["queue-match"]
+
+
+def test_sns_publish_internal_fifo_replays_a_duplicate_without_redelivering(
+    sns_internal, monkeypatch
+):
+    """The FIFO deduplication window is the one behaviour only this API can
+    observe: `Publish` returns the cached MessageId either way, so `duplicate`
+    is how a caller learns nothing was delivered the second time."""
+    delivered = []
+    monkeypatch.setattr(
+        sns_internal,
+        "_deliver_to_sqs",
+        lambda endpoint, envelope, raw, message, **kwargs: delivered.append(message),
+    )
+    arn = _seed_internal_topic(
+        sns_internal,
+        f"internal-{_uuid_mod.uuid4().hex[:8]}.fifo",
+        attributes={"FifoTopic": "true"},
+        subscriptions=[{
+            "arn": f"sub-{_uuid_mod.uuid4()}",
+            "protocol": "sqs",
+            "endpoint": "arn:aws:sqs:us-east-1:000000000000:sink.fifo",
+            "confirmed": True,
+            "attributes": {},
+        }],
+    )
+
+    first = sns_internal.publish_internal(
+        arn, "once", message_group_id="g1", message_deduplication_id="d1"
+    )
+    second = sns_internal.publish_internal(
+        arn, "once", message_group_id="g1", message_deduplication_id="d1"
+    )
+
+    assert first["duplicate"] is False
+    assert first["sequence_number"] == "1".zfill(20)
+    # The replay reports the original ids and sequence, as AWS does.
+    assert second["duplicate"] is True
+    assert second["message_id"] == first["message_id"]
+    assert second["sequence_number"] == first["sequence_number"]
+    # ...and neither the store nor the subscriber saw it twice.
+    assert len(sns_internal._topics[arn]["messages"]) == 1
+    assert delivered == ["once"]
+
+    # A different dedup id inside the same group is a new message.
+    third = sns_internal.publish_internal(
+        arn, "twice", message_group_id="g1", message_deduplication_id="d2"
+    )
+    assert third["duplicate"] is False
+    assert third["sequence_number"] == "2".zfill(20)
+    assert len(sns_internal._topics[arn]["messages"]) == 2
+
+
+def test_sns_publish_internal_rejections(sns_internal):
+    """The three answers a caller has to handle: no topic, a FIFO publish AWS
+    would reject, and a body over the size limit."""
+    assert (
+        sns_internal.publish_internal(
+            "arn:aws:sns:us-east-1:000000000000:absent", "hi"
+        )
+        is None
+    )
+
+    fifo = _seed_internal_topic(
+        sns_internal,
+        f"internal-{_uuid_mod.uuid4().hex[:8]}.fifo",
+        attributes={"FifoTopic": "true"},
+    )
+    with pytest.raises(sns_internal.SnsPublishError) as ei:
+        sns_internal.publish_internal(fifo, "hi", message_deduplication_id="d1")
+    assert ei.value.code == "InvalidParameterException"
+    assert "MessageGroupId" in str(ei.value)
+
+    # ...and with a group id but no way to derive a dedup id.
+    with pytest.raises(sns_internal.SnsPublishError) as ei:
+        sns_internal.publish_internal(fifo, "hi", message_group_id="g1")
+    assert "MessageDeduplicationId" in str(ei.value)
+
+    standard = _seed_internal_topic(sns_internal, f"internal-{_uuid_mod.uuid4().hex[:8]}")
+    with pytest.raises(sns_internal.SnsPublishError) as ei:
+        sns_internal.publish_internal(standard, "x" * (256 * 1024 + 1))
+    assert ei.value.code == "InvalidParameter"

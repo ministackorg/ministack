@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import copy
 import hashlib
 import json
@@ -51,6 +52,7 @@ from ministack.core.responses import (
     get_region,
     json_response,
     new_uuid,
+    request_scope,
 )
 from ministack.core.x509_utils import (
     generate_ca,
@@ -2741,10 +2743,27 @@ def _rule_message(payload: bytes):
         return text
 
 
-def _rule_event(sql: str, topic: str, payload: bytes, client_id: str | None = None):
-    """Project a publish payload through a rule's SELECT clause."""
+# Sentinel for "the caller has not decoded the payload yet" — distinct from
+# _MISSING, which is itself a legitimate decoded message (a non-UTF-8 payload).
+_UNDECODED = object()
+
+
+def _rule_event(
+    sql: str,
+    topic: str,
+    payload: bytes,
+    client_id: str | None = None,
+    message=_UNDECODED,
+):
+    """Project a publish payload through a rule's SELECT clause.
+
+    ``message`` lets a caller that already decoded the payload (the dispatch
+    path, which also needs it for the WHERE predicate) pass it in instead of
+    paying for a second JSON parse.
+    """
     payload = payload or b""
-    message = _rule_message(payload)
+    if message is _UNDECODED:
+        message = _rule_message(payload)
     items = _split_select_items(_rule_select_clause(sql)) or ["*"]
 
     if len(items) == 1:
@@ -2785,7 +2804,184 @@ def _dispatch_rule_to_lambda(
     ).start()
 
 
-def _run_rule_actions(
+# Depth guard for republish chains: rule A republishing onto a topic that rule
+# A (or a cycle of rules) matches again would recurse without bound. Real AWS
+# does not loop-protect either — such a rule is user error — but the emulator
+# must at least not crash, so the chain is cut and logged past this depth.
+_MAX_REPUBLISH_DEPTH = 8
+_republish_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "_iot_republish_depth", default=0
+)
+
+
+async def _dispatch_rule_republish(
+    account_id: str, region: str, rule_name: str, spec: dict, event
+) -> None:
+    target_topic = spec.get("topic") or ""
+    if not target_topic:
+        _broker_logger.warning(
+            "IoT rule %s: republish action has no topic — skipped", rule_name
+        )
+        return
+    depth = _republish_depth.get()
+    if depth >= _MAX_REPUBLISH_DEPTH:
+        _broker_logger.warning(
+            "IoT rule %s: republish depth limit (%d) reached — dropping republish to %r "
+            "(a rule republishing onto its own topic filter loops forever on AWS too)",
+            rule_name,
+            _MAX_REPUBLISH_DEPTH,
+            target_topic,
+        )
+        return
+    try:
+        qos = int(spec.get("qos") or 0)
+    except (TypeError, ValueError):
+        qos = 0
+    token = _republish_depth.set(depth + 1)
+    try:
+        await broker_publish(
+            account_id,
+            region,
+            target_topic,
+            json.dumps(event).encode("utf-8"),
+            qos=qos,
+        )
+    finally:
+        _republish_depth.reset(token)
+
+
+def _ddb_attribute_value(raw) -> dict:
+    """Map a projected value to a DynamoDB AttributeValue (dynamoDBv2 puts each
+    payload attribute in its own column)."""
+    if isinstance(raw, bool):
+        return {"BOOL": raw}
+    if isinstance(raw, (int, float)):
+        return {"N": str(raw)}
+    if raw is None:
+        return {"NULL": True}
+    if isinstance(raw, (dict, list)):
+        return {"S": json.dumps(raw)}
+    return {"S": str(raw)}
+
+
+def _dispatch_rule_dynamodb(account_id: str, region: str, rule_name: str, spec: dict, event) -> None:
+    from ministack.services import dynamodb as _dynamodb
+
+    table = (spec.get("putItem") or {}).get("tableName") or ""
+    if not table:
+        _broker_logger.warning(
+            "IoT rule %s: dynamoDBv2 action has no putItem.tableName — skipped", rule_name
+        )
+        return
+    if not isinstance(event, dict):
+        _broker_logger.warning(
+            "IoT rule %s: dynamoDBv2 action needs a JSON-object payload, got %s — skipped",
+            rule_name,
+            type(event).__name__,
+        )
+        return
+    item = {key: _ddb_attribute_value(value) for key, value in event.items()}
+    with request_scope(account_id, region):
+        status = _dynamodb._put_item({"TableName": table, "Item": item})[0]
+    if status >= 400:
+        # Raise rather than log: an undeliverable destination is precisely what
+        # the rule's errorAction exists to hear about, and a missing table is
+        # the failure that actually happens locally.
+        raise RuntimeError(
+            f"DynamoDB PutItem to {table} failed with status {status}"
+        )
+    _broker_logger.debug("IoT rule %s → DynamoDB %s", rule_name, table)
+
+
+def _dispatch_rule_sns(account_id: str, region: str, rule_name: str, spec: dict, event) -> None:
+    from ministack.services import sns as _sns
+
+    target = spec.get("targetArn") or ""
+    if not target:
+        _broker_logger.warning(
+            "IoT rule %s: sns action has no targetArn — skipped", rule_name
+        )
+        return
+    with request_scope(account_id, region):
+        # Through SNS's own internal publish, so the message record, the payload
+        # size limit and the FIFO rules are the ones every other producer gets.
+        result = _sns.publish_internal(target, json.dumps(event))
+    if result is None:
+        # As with DynamoDB above: a topic that is not there is an undeliverable
+        # destination, so it reaches the errorAction instead of a log line.
+        raise RuntimeError(f"SNS topic {target} not found")
+    _broker_logger.debug("IoT rule %s → SNS %s", rule_name, target)
+
+
+async def _dispatch_rule_action(
+    account_id: str, region: str, rule_name: str, action: dict, event
+) -> None:
+    """Dispatch one rule action, letting the target service's failure surface.
+
+    Rule actions and the rule's errorAction share the same shapes, so both go
+    through here.
+    """
+    lam = action.get("lambda")
+    if lam and lam.get("functionArn"):
+        _dispatch_rule_to_lambda(account_id, region, lam["functionArn"], event)
+    elif "republish" in action:
+        await _dispatch_rule_republish(
+            account_id, region, rule_name, action["republish"] or {}, event
+        )
+    elif "dynamoDBv2" in action:
+        _dispatch_rule_dynamodb(
+            account_id, region, rule_name, action["dynamoDBv2"] or {}, event
+        )
+    elif "sns" in action:
+        _dispatch_rule_sns(account_id, region, rule_name, action["sns"] or {}, event)
+    else:
+        _broker_logger.debug(
+            "IoT rule %s: unsupported action type %s — skipped",
+            rule_name,
+            next(iter(action), "?"),
+        )
+
+
+async def _dispatch_rule_error_action(
+    account_id: str,
+    region: str,
+    rule: dict,
+    topic: str,
+    payload: bytes,
+    client_id: str | None,
+    failures: list[dict],
+) -> None:
+    """Run the rule's errorAction, carrying AWS's error message document.
+
+    https://docs.aws.amazon.com/iot/latest/developerguide/rule-error-handling.html
+    """
+    error_action = rule.get("errorAction")
+    if not error_action:
+        return
+    rule_name = rule.get("ruleName", "")
+    error_event = {
+        "ruleName": rule_name,
+        "topic": topic,
+        # The emulator's publish path carries no CloudWatch trace id.
+        "cloudwatchTraceId": "",
+        "clientId": client_id or "",
+        "base64OriginalPayload": base64.b64encode(payload).decode("ascii"),
+        "failures": failures,
+    }
+    try:
+        await _dispatch_rule_action(
+            account_id, region, rule_name, error_action, error_event
+        )
+    except Exception as exc:
+        _broker_logger.warning(
+            "IoT rule %s: errorAction failed: %s: %s",
+            rule_name,
+            type(exc).__name__,
+            exc,
+        )
+
+
+async def _run_rule_actions(
     account_id: str,
     region: str,
     rule: dict,
@@ -2795,7 +2991,11 @@ def _run_rule_actions(
 ) -> None:
     if not rule or rule.get("ruleDisabled"):
         return
-    event = _rule_event(rule.get("sql", ""), topic, payload, client_id)
+    payload = payload or b""
+    # Decode once: both the SELECT projection and the WHERE predicate read the
+    # same message.
+    message = _rule_message(payload)
+    event = _rule_event(rule.get("sql", ""), topic, payload, client_id, message=message)
     if event is _MISSING:
         _broker_logger.warning(
             "IoT rule %s: payload is not valid UTF-8 and its SELECT clause "
@@ -2804,26 +3004,46 @@ def _run_rule_actions(
         )
         return
     where_pred = _rule_where_clause(rule.get("sql", ""))
-    if where_pred and not _eval_where(where_pred, topic, payload, _rule_message(payload), client_id):
+    if where_pred and not _eval_where(where_pred, topic, payload, message, client_id):
         _broker_logger.debug(
             "IoT rule %s: WHERE clause did not match on %r — no action dispatched",
             rule.get("ruleName"),
             topic,
         )
         return
+    rule_name = rule.get("ruleName", "")
+    failures: list[dict] = []
     for action in rule.get("actions", []) or []:
-        lam = action.get("lambda")
-        if lam and lam.get("functionArn"):
-            _dispatch_rule_to_lambda(account_id, region, lam["functionArn"], event)
+        action_type = next(iter(action), "?")
+        try:
+            await _dispatch_rule_action(account_id, region, rule_name, action, event)
+        except Exception as exc:
+            # Never silently, and never let one failing action kill the loop: a
+            # dropped dispatch is indistinguishable from "the rule did not
+            # match", the hardest kind of local failure to diagnose.
+            _broker_logger.warning(
+                "IoT rule %s: %s action failed: %s: %s",
+                rule_name,
+                action_type,
+                type(exc).__name__,
+                exc,
+            )
+            failures.append(
+                {"action": action_type, "errorMessage": f"{type(exc).__name__}: {exc}"}
+            )
+    if failures:
+        await _dispatch_rule_error_action(
+            account_id, region, rule, topic, payload, client_id, failures
+        )
 
 
-def _evaluate_topic_rules(
+async def _evaluate_topic_rules(
     account_id: str, region: str, topic: str, payload: bytes, client_id: str | None = None
 ) -> None:
     for rule in _rules_for_account(account_id, region):
         filter_ = _rule_topic_filter(rule.get("sql", ""))
         if filter_ and _topic_matches(filter_, topic):
-            _run_rule_actions(account_id, region, rule, payload, topic, client_id)
+            await _run_rule_actions(account_id, region, rule, payload, topic, client_id)
 
 
 async def broker_publish(
@@ -2840,7 +3060,7 @@ async def broker_publish(
     if topic.startswith(_BASIC_INGEST_PREFIX):
         remainder = topic[len(_BASIC_INGEST_PREFIX):].split("/", 1)
         rule_name = remainder[0]
-        _run_rule_actions(
+        await _run_rule_actions(
             account_id,
             region,
             _topic_rules.get_scoped(account_id, region, rule_name),
@@ -2894,7 +3114,7 @@ async def broker_publish(
                         ps.queued_messages = ps.queued_messages[-_MAX_QUEUED_MESSAGES:]
                     break
 
-    _evaluate_topic_rules(account_id, region, topic, payload, client_id)
+    await _evaluate_topic_rules(account_id, region, topic, payload, client_id)
 
 
 async def broker_subscribe(
