@@ -165,10 +165,17 @@ def _resolve_parameters(template: dict, provided_params: list[dict],
         no_echo = str(defn.get("NoEcho", "false")).lower() == "true"
 
         entry = provided_map.get(name)
+        # Whether `value` below still needs SSM-name resolution, or is
+        # already a final value — a `previous_params` hit is always the
+        # latter: it's this same parameter's *already-resolved* Value from
+        # the prior deployment (see the end of this loop, where `resolved`
+        # is built), not the SSM parameter name again.
+        already_resolved = False
         if entry is not None and entry.get("UsePreviousValue"):
             prev = previous_params.get(name)
             if prev is not None:
                 value = prev["Value"] if isinstance(prev, dict) else prev
+                already_resolved = True
             elif "Default" in defn:
                 value = defn["Default"]
             else:
@@ -183,7 +190,7 @@ def _resolve_parameters(template: dict, provided_params: list[dict],
 
         value = str(value) if value is not None else ""
 
-        if ptype in _SSM_PARAMETER_VALUE_TYPES:
+        if ptype in _SSM_PARAMETER_VALUE_TYPES and not already_resolved:
             # `value` up to here is the SSM parameter *name* (the template
             # parameter's Default, or a caller-supplied override) — resolve
             # it against the SSM store the same way real CloudFormation
