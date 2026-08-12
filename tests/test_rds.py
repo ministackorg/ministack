@@ -2160,6 +2160,7 @@ def test_rds_stop_start_cluster_compute_lifecycle(monkeypatch):
             self.status = "exited"
 
     container = FakeContainer()
+    readiness_actions = []
 
     class FakeContainers:
         def run(self, **_kwargs):
@@ -2184,7 +2185,14 @@ def test_rds_stop_start_cluster_compute_lifecycle(monkeypatch):
     monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
     monkeypatch.setattr(m, "_wait_for_database_ready", lambda *_args: True)
     monkeypatch.setattr(
-        m, "_grant_mysql_master_user_privileges", lambda *_args: None,
+        m,
+        "_ensure_mysql_iam_auth_plugin",
+        lambda *_args, **_kwargs: readiness_actions.append("plugin") or True,
+    )
+    monkeypatch.setattr(
+        m,
+        "_grant_mysql_master_user_privileges",
+        lambda *_args: readiness_actions.append("grant"),
     )
 
     def _wait_for_member_status(db_id, expected, timeout=2):
@@ -2216,6 +2224,7 @@ def test_rds_stop_start_cluster_compute_lifecycle(monkeypatch):
         _wait_for_member_status("stopstart-writer", "available")
         cluster = m._clusters.get("stopstart-cluster")
         assert cluster["Status"] == "available"
+        assert readiness_actions == ["plugin", "grant"]
 
         m._stop_db_cluster({"DBClusterIdentifier": "stopstart-cluster"})
         assert container.status == "exited"
@@ -2235,6 +2244,9 @@ def test_rds_stop_start_cluster_compute_lifecycle(monkeypatch):
             time.sleep(0.01)
         assert cluster["Status"] == "available"
         assert cluster["_shared_container_ready"] is True
+        assert readiness_actions == [
+            "plugin", "grant", "plugin", "grant",
+        ]
     finally:
         m._instances.clear()
         m._clusters.clear()
@@ -6766,19 +6778,22 @@ def _aurora_connect(endpoint, user="admin", password=PASSWORD, database=DATABASE
 
 
 @contextlib.contextmanager
-def _live_cluster(rds):
+def _live_cluster(rds, engine_version=None):
     suffix = uuid.uuid4().hex[:10]
     cluster_id = f"shared-{suffix}"
     writer_id = f"{cluster_id}-writer"
     reader_id = f"{cluster_id}-reader"
     try:
-        rds.create_db_cluster(
-            DBClusterIdentifier=cluster_id,
-            Engine="aurora-mysql",
-            MasterUsername="admin",
-            MasterUserPassword=PASSWORD,
-            DatabaseName=DATABASE,
-        )
+        create_cluster = {
+            "DBClusterIdentifier": cluster_id,
+            "Engine": "aurora-mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": PASSWORD,
+            "DatabaseName": DATABASE,
+        }
+        if engine_version:
+            create_cluster["EngineVersion"] = engine_version
+        rds.create_db_cluster(**create_cluster)
         for db_id in (writer_id, reader_id):
             rds.create_db_instance(
                 DBInstanceIdentifier=db_id,
@@ -6839,6 +6854,131 @@ def test_aurora_user_and_grant_are_visible_through_reader(rds):
             with conn.cursor() as cursor:
                 cursor.execute("SELECT COUNT(*) FROM granted_rows")
                 assert cursor.fetchone() == (0,)
+
+
+@pytest.mark.serial
+@pytest.mark.skipif(
+    not os.environ.get("DOCKER_NETWORK"),
+    reason="DOCKER_NETWORK not set -- live Aurora",
+)
+@pytest.mark.parametrize(
+    "engine_version",
+    [
+        "8.0.mysql_aurora.3.10.3",
+        "8.4.mysql_aurora.8.4.7",
+    ],
+)
+def test_aurora_mysql_iam_plugin_ddl_and_reject_all(rds, engine_version):
+    with _live_cluster(rds, engine_version=engine_version) as (
+        _cid, _wid, _rid, writer, _reader, _cluster,
+    ):
+        user = f"iam_{uuid.uuid4().hex[:8]}"
+        with _aurora_connect(writer["Endpoint"]) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.PLUGINS "
+                    "WHERE PLUGIN_NAME = 'AWSAuthenticationPlugin'"
+                )
+                if cursor.fetchone()[0] == 0:
+                    pytest.skip(
+                        "matching AWSAuthenticationPlugin artifact is absent"
+                    )
+                cursor.execute(
+                    f"CREATE USER IF NOT EXISTS '{user}'@'%' "
+                    "IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS' "
+                    "REQUIRE SSL WITH MAX_USER_CONNECTIONS 8 "
+                    "ATTRIBUTE '{\"k\":\"v\"}'"
+                )
+                cursor.execute(
+                    "SELECT plugin, authentication_string FROM mysql.user "
+                    "WHERE User = %s AND Host = '%'",
+                    (user,),
+                )
+                assert cursor.fetchone() == ("AWSAuthenticationPlugin", "RDS")
+                cursor.execute(f"GRANT SELECT ON `{DATABASE}`.* TO `{user}`@'%'")
+                cursor.execute(f"REVOKE SELECT ON `{DATABASE}`.* FROM `{user}`@'%'")
+                cursor.execute(
+                    f"ALTER USER `{user}`@'%' WITH MAX_USER_CONNECTIONS 9"
+                )
+
+        import pymysql
+
+        with pytest.raises(pymysql.err.OperationalError):
+            _aurora_connect(
+                writer["Endpoint"],
+                user=user,
+                password="not-a-token",
+            )
+
+        with _aurora_connect(writer["Endpoint"]) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(f"DROP USER `{user}`@'%'")
+
+
+@pytest.mark.serial
+@pytest.mark.skipif(
+    not os.environ.get("DOCKER_NETWORK"),
+    reason="DOCKER_NETWORK not set -- live Aurora",
+)
+def test_aurora_mysql_iam_plugin_survives_idempotent_cluster_restart(rds):
+    with _live_cluster(
+        rds,
+        engine_version="8.0.mysql_aurora.3.10.3",
+    ) as (cluster_id, writer_id, _rid, writer, _reader, _cluster):
+        with _aurora_connect(writer["Endpoint"]) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.PLUGINS "
+                    "WHERE PLUGIN_NAME = 'AWSAuthenticationPlugin'"
+                )
+                if cursor.fetchone()[0] == 0:
+                    pytest.skip(
+                        "matching AWSAuthenticationPlugin artifact is absent"
+                    )
+
+        rds.stop_db_cluster(DBClusterIdentifier=cluster_id)
+        rds.start_db_cluster(DBClusterIdentifier=cluster_id)
+        restarted_writer = _wait_for_instance(rds, writer_id)
+
+        with _aurora_connect(restarted_writer["Endpoint"]) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.PLUGINS "
+                    "WHERE PLUGIN_NAME = 'AWSAuthenticationPlugin'"
+                )
+                assert cursor.fetchone()[0] == 1
+
+
+@pytest.mark.serial
+@pytest.mark.skipif(
+    not os.environ.get("DOCKER_NETWORK"),
+    reason="DOCKER_NETWORK not set -- live Aurora",
+)
+@pytest.mark.skipif(
+    os.environ.get("MINISTACK_MYSQL_IAM_EXPECT_STOCK")
+    not in ("off", "absent"),
+    reason="dedicated off/artifact-absent server lane not requested",
+)
+def test_aurora_mysql_iam_plugin_stock_behavior_when_unavailable(rds):
+    import pymysql
+
+    with _live_cluster(
+        rds,
+        engine_version="8.0.mysql_aurora.3.10.3",
+    ) as (_cid, _wid, _rid, writer, _reader, _cluster):
+        with _aurora_connect(writer["Endpoint"]) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.PLUGINS "
+                    "WHERE PLUGIN_NAME = 'AWSAuthenticationPlugin'"
+                )
+                assert cursor.fetchone()[0] == 0
+                with pytest.raises(pymysql.err.OperationalError) as error:
+                    cursor.execute(
+                        "CREATE USER 'iam_unavailable'@'%' "
+                        "IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS'"
+                    )
+                assert getattr(error.value, "args", [None])[0] == 1524
 
 
 @pytest.mark.skipif(not os.environ.get("DOCKER_NETWORK"), reason="DOCKER_NETWORK not set -- live Aurora")
@@ -7854,6 +7994,7 @@ def test_rds_restore_respawns_persisted_headless_secondary_applier(monkeypatch):
     started = []
     readiness_credentials = []
     configured = threading.Event()
+    readiness_actions = []
 
     class FakeContainer:
         status = "running"
@@ -7893,6 +8034,7 @@ def test_rds_restore_respawns_persisted_headless_secondary_applier(monkeypatch):
     def configure(cluster_id, cluster):
         assert cluster_id == "secondary"
         assert cluster["_mysql_headless_applier_required"] is True
+        readiness_actions.append("replication")
         configured.set()
 
     m._instances.clear()
@@ -7902,6 +8044,11 @@ def test_rds_restore_respawns_persisted_headless_secondary_applier(monkeypatch):
         monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
         monkeypatch.setattr(m, "_start_cluster_shared_container", start_cluster)
         monkeypatch.setattr(m, "_wait_for_database_ready", wait_for_ready)
+        monkeypatch.setattr(
+            m,
+            "_ensure_mysql_iam_auth_plugin",
+            lambda *_args, **_kwargs: readiness_actions.append("plugin") or True,
+        )
         monkeypatch.setattr(m, "_configure_or_defer_mysql_replication", configure)
 
         m.restore_state({
@@ -7915,6 +8062,7 @@ def test_rds_restore_respawns_persisted_headless_secondary_applier(monkeypatch):
         assert readiness_credentials == [
             (m._MYSQL_CONTROL_USER, m._MYSQL_CONTROL_PASSWORD, None),
         ]
+        assert readiness_actions == ["plugin", "replication"]
         restored = m._clusters.get_scoped(
             account_id,
             "us-west-2",
@@ -8576,6 +8724,40 @@ def test_aurora_mysql_global_replication_replays_and_streams_rows():
         assert int(replica_status["Auto_Position"]) == 1
         assert replica_status["Last_IO_Error"] == ""
         assert replica_status["Last_SQL_Error"] == ""
+
+        plugin_counts = []
+        for endpoint in (
+            primary_instance["Endpoint"],
+            secondary_instance["Endpoint"],
+        ):
+            with _aurora_connect(endpoint) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.PLUGINS "
+                        "WHERE PLUGIN_NAME = 'AWSAuthenticationPlugin'"
+                    )
+                    plugin_counts.append(cursor.fetchone()[0])
+        if any(plugin_counts):
+            assert plugin_counts == [1, 1]
+            iam_user = f"iam_repl_{suffix}"
+            with _aurora_connect(primary_instance["Endpoint"]) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        f"CREATE USER '{iam_user}'@'%' "
+                        "IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS'"
+                    )
+            _wait_for_gtid(
+                primary_instance["Endpoint"],
+                secondary_instance["Endpoint"],
+            )
+            with _aurora_connect(secondary_instance["Endpoint"]) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT plugin FROM mysql.user "
+                        "WHERE User = %s AND Host = '%'",
+                        (iam_user,),
+                    )
+                    assert cursor.fetchone() == ("AWSAuthenticationPlugin",)
 
         _wait_for_gtid(
             primary_instance["Endpoint"],
