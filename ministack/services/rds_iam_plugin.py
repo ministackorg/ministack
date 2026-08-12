@@ -101,11 +101,17 @@ def ensure_iam_auth_plugin(
         cursor = connection.cursor()
         cursor.execute(
             "SELECT PLUGIN_NAME FROM INFORMATION_SCHEMA.PLUGINS "
-            "WHERE PLUGIN_NAME = %s",
+            "WHERE PLUGIN_NAME = %s AND PLUGIN_STATUS = 'ACTIVE'",
             (PLUGIN_NAME,),
         )
         if cursor.fetchone():
             return True
+
+        cursor.execute(
+            "SELECT name, dl FROM mysql.plugin WHERE name = %s",
+            (PLUGIN_NAME,),
+        )
+        stale_registration = cursor.fetchone()
 
         cursor.execute("SELECT @@plugin_dir")
         plugin_dir_row = cursor.fetchone()
@@ -114,9 +120,32 @@ def ensure_iam_auth_plugin(
         if not container.put_archive(plugin_dir_row[0], _archive(artifact)):
             raise RuntimeError("Docker rejected the plugin archive")
 
+        if stale_registration:
+            try:
+                cursor.execute(f"UNINSTALL PLUGIN {PLUGIN_NAME}")
+            except Exception as e:
+                logger.warning(
+                    "RDS: failed to uninstall stale %s registration for "
+                    "%s; removing mysql.plugin row: %s",
+                    PLUGIN_NAME,
+                    resource_id,
+                    e,
+                )
+                cursor.execute(
+                    "DELETE FROM mysql.plugin WHERE name = %s",
+                    (PLUGIN_NAME,),
+                )
+
         cursor.execute(
             f"INSTALL PLUGIN {PLUGIN_NAME} SONAME '{PLUGIN_FILE}'"
         )
+        cursor.execute(
+            "SELECT PLUGIN_NAME FROM INFORMATION_SCHEMA.PLUGINS "
+            "WHERE PLUGIN_NAME = %s AND PLUGIN_STATUS = 'ACTIVE'",
+            (PLUGIN_NAME,),
+        )
+        if not cursor.fetchone():
+            raise RuntimeError("plugin did not become ACTIVE after installation")
         logger.info(
             "RDS: installed %s for %s (MySQL %s, %s)",
             PLUGIN_NAME,

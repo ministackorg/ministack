@@ -65,7 +65,33 @@ END
 }
 
 
-def ensure_rds_compatibility_procedures(connection_factory, resource_id):
+def _execute_object(cursor, statement, object_name, resource_id):
+    try:
+        cursor.execute(statement)
+        return True
+    except Exception as e:
+        logger.warning(
+            "RDS: failed to ensure Aurora compatibility object %s for %s: %s",
+            object_name,
+            resource_id,
+            e,
+        )
+        return False
+
+
+def _supports_predefined_roles(engine_series):
+    try:
+        major = int(str(engine_series).split(".", 1)[0])
+    except (TypeError, ValueError):
+        return False
+    return major >= 8
+
+
+def ensure_rds_compatibility_procedures(
+    connection_factory,
+    resource_id,
+    engine_series,
+):
     """Create the Aurora procedures needed by provider user-set grants.
 
     The session disables binary logging so each MySQL compute node owns its
@@ -79,25 +105,58 @@ def ensure_rds_compatibility_procedures(connection_factory, resource_id):
             raise RuntimeError("admin connection is unavailable")
         cursor = connection.cursor()
         cursor.execute("SET SESSION sql_log_bin = 0")
-        cursor.execute(_CONFIG_TABLE_SQL)
-        cursor.execute(_CONFIG_DEFAULT_SQL)
-        for role in _PREDEFINED_ROLES:
-            cursor.execute(f"CREATE ROLE IF NOT EXISTS `{role}`@'%'")
-        cursor.execute(
-            "SELECT ROUTINE_NAME FROM INFORMATION_SCHEMA.ROUTINES "
-            "WHERE ROUTINE_SCHEMA = 'mysql' AND ROUTINE_TYPE = 'PROCEDURE' "
-            "AND ROUTINE_NAME IN (%s, %s, %s, %s)",
-            tuple(_PROCEDURES),
+        all_ready = _execute_object(
+            cursor,
+            _CONFIG_TABLE_SQL,
+            "mysql.ministack_rds_configuration table",
+            resource_id,
         )
-        existing = {row[0].lower() for row in cursor.fetchall()}
+        all_ready = _execute_object(
+            cursor,
+            _CONFIG_DEFAULT_SQL,
+            "binlog retention hours default",
+            resource_id,
+        ) and all_ready
+        if _supports_predefined_roles(engine_series):
+            for role in _PREDEFINED_ROLES:
+                all_ready = _execute_object(
+                    cursor,
+                    f"CREATE ROLE IF NOT EXISTS `{role}`@'%'",
+                    f"`{role}`@'%' role",
+                    resource_id,
+                ) and all_ready
+
+        existing = set()
+        try:
+            cursor.execute(
+                "SELECT ROUTINE_NAME FROM INFORMATION_SCHEMA.ROUTINES "
+                "WHERE ROUTINE_SCHEMA = 'mysql' "
+                "AND ROUTINE_TYPE = 'PROCEDURE' "
+                "AND ROUTINE_NAME IN (%s, %s, %s, %s)",
+                tuple(_PROCEDURES),
+            )
+            existing = {row[0].lower() for row in cursor.fetchall()}
+        except Exception as e:
+            logger.warning(
+                "RDS: failed to inspect Aurora compatibility procedures "
+                "for %s; attempting each procedure independently: %s",
+                resource_id,
+                e,
+            )
+            all_ready = False
         for name, statement in _PROCEDURES.items():
             if name not in existing:
-                cursor.execute(statement)
+                all_ready = _execute_object(
+                    cursor,
+                    statement,
+                    f"mysql.{name} procedure",
+                    resource_id,
+                ) and all_ready
         logger.info(
             "RDS: ensured Aurora compatibility objects for %s",
             resource_id,
         )
-        return True
+        return all_ready
     except Exception as e:
         logger.warning(
             "RDS: failed to ensure Aurora compatibility objects for %s: %s",

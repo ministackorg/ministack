@@ -80,7 +80,18 @@ carry no privileges because MiniStack does not model Aurora's S3 import/export
 data plane; their fidelity contract is existence so grants and reconciliation
 match Aurora. The deployed-ASL sweep found no `AWS_%` identifiers, so it adds
 no role beyond the two provider-source roles. Provider-created service roles
-are runtime resources and require no MiniStack fixture.
+are runtime resources and require no MiniStack fixture. MySQL 5.6 and 5.7 skip
+these roles because `CREATE ROLE` is not supported there; their configuration
+table and four procedures are still installed independently. An error creating
+one compatibility object is logged and does not suppress the remaining
+objects.
+
+When a stopped cluster is recreated on its retained data volume, `mysql.plugin`
+can contain the prior registration even though the fresh container failed to
+load the absent library at boot. The hook copies the artifact first, attempts
+`UNINSTALL PLUGIN`, removes only the stale `AWSAuthenticationPlugin` row when
+MySQL rejects that unload for a boot-failed plugin, reinstalls, and verifies the
+plugin is `ACTIVE` before reporting success.
 
 Residuals: the full image carries the artifacts; the slim image remains
 artifact-free and therefore auto-off. The existing global-replication live

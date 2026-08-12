@@ -103,7 +103,9 @@ def test_rds_iam_plugin_installs_matching_series_and_arch(monkeypatch, tmp_path)
     _write_artifact(tmp_path, series="8.4", arch="arm64")
     monkeypatch.setenv("MINISTACK_MYSQL_IAM_PLUGIN_DIR", str(tmp_path))
     container = FakeContainer(arch="aarch64")
-    connection = FakeConnection([None, ("/usr/lib64/mysql/plugin",)])
+    connection = FakeConnection(
+        [None, None, ("/usr/lib64/mysql/plugin",), (plugin.PLUGIN_NAME,)]
+    )
 
     installed = plugin.ensure_iam_auth_plugin(
         container,
@@ -118,7 +120,11 @@ def test_rds_iam_plugin_installs_matching_series_and_arch(monkeypatch, tmp_path)
     assert connection.cursor_value.executed == [
         (
             "SELECT PLUGIN_NAME FROM INFORMATION_SCHEMA.PLUGINS "
-            "WHERE PLUGIN_NAME = %s",
+            "WHERE PLUGIN_NAME = %s AND PLUGIN_STATUS = 'ACTIVE'",
+            (plugin.PLUGIN_NAME,),
+        ),
+        (
+            "SELECT name, dl FROM mysql.plugin WHERE name = %s",
             (plugin.PLUGIN_NAME,),
         ),
         ("SELECT @@plugin_dir", None),
@@ -126,6 +132,11 @@ def test_rds_iam_plugin_installs_matching_series_and_arch(monkeypatch, tmp_path)
             "INSTALL PLUGIN AWSAuthenticationPlugin "
             "SONAME 'aws_auth_plugin.so'",
             None,
+        ),
+        (
+            "SELECT PLUGIN_NAME FROM INFORMATION_SCHEMA.PLUGINS "
+            "WHERE PLUGIN_NAME = %s AND PLUGIN_STATUS = 'ACTIVE'",
+            (plugin.PLUGIN_NAME,),
         ),
     ]
     assert len(container.archives) == 1
@@ -155,13 +166,64 @@ def test_rds_iam_plugin_is_idempotent(monkeypatch, tmp_path):
     assert len(connection.cursor_value.executed) == 1
 
 
+def test_rds_iam_plugin_recovers_boot_failed_registration(
+    monkeypatch, tmp_path, caplog,
+):
+    _write_artifact(tmp_path)
+    monkeypatch.setenv("MINISTACK_MYSQL_IAM_PLUGIN_DIR", str(tmp_path))
+    container = FakeContainer()
+    connection = FakeConnection(
+        [
+            None,
+            (plugin.PLUGIN_NAME, plugin.PLUGIN_FILE),
+            ("/usr/lib64/mysql/plugin",),
+            (plugin.PLUGIN_NAME,),
+        ]
+    )
+    original_execute = connection.cursor_value.execute
+
+    def execute(statement, params=None):
+        original_execute(statement, params)
+        if statement == f"UNINSTALL PLUGIN {plugin.PLUGIN_NAME}":
+            raise RuntimeError("plugin is registered but not loaded")
+
+    connection.cursor_value.execute = execute
+
+    with caplog.at_level(logging.WARNING, logger="rds"):
+        assert plugin.ensure_iam_auth_plugin(
+            container,
+            lambda: connection,
+            "8.0",
+            "db-1",
+        ) is True
+
+    statements = connection.cursor_value.executed
+    assert statements.index(
+        (f"UNINSTALL PLUGIN {plugin.PLUGIN_NAME}", None)
+    ) < statements.index(
+        ("DELETE FROM mysql.plugin WHERE name = %s", (plugin.PLUGIN_NAME,))
+    )
+    assert statements.index(
+        ("DELETE FROM mysql.plugin WHERE name = %s", (plugin.PLUGIN_NAME,))
+    ) < statements.index(
+        (
+            "INSTALL PLUGIN AWSAuthenticationPlugin "
+            "SONAME 'aws_auth_plugin.so'",
+            None,
+        )
+    )
+    assert "removing mysql.plugin row" in caplog.text
+
+
 def test_rds_iam_plugin_failure_warns_once_and_does_not_escape(
     monkeypatch, tmp_path, caplog,
 ):
     _write_artifact(tmp_path)
     monkeypatch.setenv("MINISTACK_MYSQL_IAM_PLUGIN_DIR", str(tmp_path))
     container = FakeContainer(put_result=False)
-    connection = FakeConnection([None, ("/usr/lib64/mysql/plugin",)])
+    connection = FakeConnection(
+        [None, None, ("/usr/lib64/mysql/plugin",)]
+    )
 
     with caplog.at_level(logging.WARNING, logger="rds"):
         installed = plugin.ensure_iam_auth_plugin(
@@ -225,8 +287,9 @@ def test_mysql_compatibility_wait_resolves_container_before_procedures(
         assert args[-1]() is True
         return True
 
-    def ensure_procedures(connection_factory, resource_id):
+    def ensure_procedures(connection_factory, resource_id, engine_series):
         calls.append(("procedures", resource_id))
+        assert engine_series == "8.0"
         assert connection_factory() is connection
         return True
 

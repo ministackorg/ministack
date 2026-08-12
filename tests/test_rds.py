@@ -7025,7 +7025,9 @@ def test_aurora_mysql_rds_compatibility_procedures(rds):
     not os.environ.get("DOCKER_NETWORK"),
     reason="DOCKER_NETWORK not set -- live Aurora",
 )
-def test_aurora_mysql_iam_plugin_survives_idempotent_cluster_restart(rds):
+def test_aurora_mysql_iam_plugin_survives_compute_replacement(rds):
+    import docker
+
     with _live_cluster(
         rds,
         engine_version="8.0.mysql_aurora.3.10.3",
@@ -7042,6 +7044,14 @@ def test_aurora_mysql_iam_plugin_survives_idempotent_cluster_restart(rds):
                     )
 
         rds.stop_db_cluster(DBClusterIdentifier=cluster_id)
+        containers = docker.from_env().containers.list(
+            all=True,
+            filters={
+                "label": ["ministack=rds", f"cluster_id={cluster_id}"],
+            },
+        )
+        assert len(containers) == 1
+        containers[0].remove()
         rds.start_db_cluster(DBClusterIdentifier=cluster_id)
         restarted_writer = _wait_for_instance(rds, writer_id)
 
@@ -7052,6 +7062,18 @@ def test_aurora_mysql_iam_plugin_survives_idempotent_cluster_restart(rds):
                     "WHERE PLUGIN_NAME = 'AWSAuthenticationPlugin'"
                 )
                 assert cursor.fetchone()[0] == 1
+                user = f"iam_recycled_{uuid.uuid4().hex[:8]}"
+                cursor.execute(
+                    f"CREATE USER `{user}`@'%' "
+                    "IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS'"
+                )
+                cursor.execute(
+                    "SELECT plugin FROM mysql.user "
+                    "WHERE User = %s AND Host = '%'",
+                    (user,),
+                )
+                assert cursor.fetchone() == ("AWSAuthenticationPlugin",)
+                cursor.execute(f"DROP USER `{user}`@'%'")
 
 
 @pytest.mark.serial
