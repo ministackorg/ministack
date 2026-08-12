@@ -3,9 +3,12 @@ SES v2 Service Emulator.
 REST/JSON API via path /v2/email/...
 Supports: SendEmail, CreateEmailIdentity, GetEmailIdentity, DeleteEmailIdentity,
           ListEmailIdentities, CreateConfigurationSet, GetConfigurationSet,
-          DeleteConfigurationSet, ListConfigurationSets, GetAccount,
-          ListSuppressedDestinations, PutAccountSuppressionAttributes,
-          TagResource, UntagResource, ListTagsForResource.
+          DeleteConfigurationSet, ListConfigurationSets, CreateEmailTemplate,
+          GetEmailTemplate, UpdateEmailTemplate, DeleteEmailTemplate,
+          ListEmailTemplates, GetAccount, ListSuppressedDestinations,
+          PutAccountSuppressionAttributes, TagResource, UntagResource,
+          ListTagsForResource.
+Email templates live in the v1 store, so either API version sees the other's.
 """
 
 import copy
@@ -29,9 +32,11 @@ from ministack.core.responses import (
 from ministack.services.ses import (
     _build_mime_message,
     _parse_raw_mime,
+    _render_template,
     _restore_regional_store,
     _sent_emails_list,
     _smtp_relay,
+    _templates,
 )
 
 logger = logging.getLogger("ses-v2")
@@ -102,7 +107,8 @@ except Exception:
 
 def _json_err(code, message, status=400):
     body = json.dumps({"message": message, "name": code}).encode("utf-8")
-    return status, {"Content-Type": "application/json"}, body
+    headers = {"Content-Type": "application/json", "x-amzn-errortype": code}
+    return status, headers, body
 
 
 def _resource_arn(kind, name):
@@ -131,6 +137,66 @@ def _query_values(query_params, key):
     if value:
         return [value]
     return []
+
+
+def _template_parts(template_content):
+    """Map a v2 EmailTemplateContent onto the v1 template record fields."""
+    return {
+        "SubjectPart": template_content.get("Subject") or "",
+        "TextPart": template_content.get("Text") or "",
+        "HtmlPart": template_content.get("Html") or "",
+    }
+
+
+def _template_content(stored):
+    """Map a stored v1 template record back onto a v2 EmailTemplateContent."""
+    return {
+        "Subject": stored.get("SubjectPart", ""),
+        "Text": stored.get("TextPart", ""),
+        "Html": stored.get("HtmlPart", ""),
+    }
+
+
+def _template_name_from_arn(arn):
+    """Extract the template name from a `template/<name>` ARN, or None if it isn't one."""
+    try:
+        spec = parse_arn(arn)
+    except (ArnParseError, TypeError):
+        return None
+    kind, sep, name = spec.resource.partition("/")
+    if sep != "/" or kind != "template" or not name:
+        return None
+    return name
+
+
+def _resolve_send_template(tpl):
+    """Resolve a SendEmail Content.Template to (v1-shaped template record, name, error).
+
+    Inline TemplateContent renders without being stored, hence the empty name.
+    """
+    arn = tpl.get("TemplateArn") or ""
+    name = tpl.get("TemplateName") or ""
+    if not name and arn:
+        name = _template_name_from_arn(arn) or ""
+        if not name:
+            return None, "", _json_err("BadRequestException", f"Invalid TemplateArn: {arn}")
+
+    if name:
+        stored = _templates.get(name)
+        if stored is None:
+            return None, "", _json_err(
+                "NotFoundException", f"Template {name} does not exist", 404
+            )
+        return stored, name, None
+
+    inline = tpl.get("TemplateContent")
+    if isinstance(inline, dict):
+        return _template_parts(inline), "", None
+
+    return None, "", _json_err(
+        "BadRequestException",
+        "Content.Template requires one of TemplateName, TemplateArn, or TemplateContent",
+    )
 
 
 def _local_ses_v2_resource_arn(arn):
@@ -207,9 +273,11 @@ async def handle_request(method, path, headers, body, query_params):
         content = data.get("Content", {})
         simple = content.get("Simple", {})
         raw = content.get("Raw", {})
+        tpl = content.get("Template", {})
         subj = ""
         body_text = ""
         body_html = None
+        template_name = ""
         if simple:
             subj = simple.get("Subject", {}).get("Data", "")
             body_text = simple.get("Body", {}).get("Text", {}).get("Data", "")
@@ -231,6 +299,14 @@ async def handle_request(method, path, headers, body, query_params):
                 cc_addrs = [e.strip() for e in parsed.get("Cc", "").split(",") if e.strip()]
             if not bcc_addrs:
                 bcc_addrs = [e.strip() for e in parsed.get("Bcc", "").split(",") if e.strip()]
+        elif tpl:
+            stored, template_name, err = _resolve_send_template(tpl)
+            if err:
+                return err
+            rendered = _render_template(stored, tpl.get("TemplateData", ""))
+            subj = rendered.get("Subject", "")
+            body_text = rendered.get("Text", "")
+            body_html = rendered.get("Html", "")
 
         all_addrs = to_addrs + cc_addrs + bcc_addrs
         if source and all_addrs:
@@ -251,9 +327,14 @@ async def handle_request(method, path, headers, body, query_params):
             "Timestamp": time.time(),
             "Type": "v2.SendEmail",
         }
+        if tpl:
+            record["TemplateData"] = tpl.get("TemplateData", "")
+            if template_name:
+                record["Template"] = template_name
         _sent_emails_list().append(record)
 
-        logger.info("SESv2 SendEmail: MessageId=%s | %s -> %s", msg_id, source, to_addrs)
+        logger.info("SESv2 SendEmail: MessageId=%s | %s -> %s%s", msg_id, source, to_addrs,
+                    f" | template={template_name}" if template_name else "")
         return json_response({"MessageId": msg_id})
 
     # POST /v2/email/identities  (CreateEmailIdentity)
@@ -324,6 +405,59 @@ async def handle_request(method, path, headers, body, query_params):
             return json_response(rec)
         if method == "DELETE":
             _config_sets.pop(name, None)
+            return json_response({})
+
+    # POST /v2/email/templates  (CreateEmailTemplate)
+    if sub == "/templates" and method == "POST":
+        name = data.get("TemplateName", "")
+        template_content = data.get("TemplateContent")
+        if not name:
+            return _json_err("BadRequestException", "TemplateName is required")
+        if not isinstance(template_content, dict):
+            return _json_err("BadRequestException", "TemplateContent is required")
+        if name in _templates:
+            return _json_err("AlreadyExistsException", f"Template {name} already exists")
+        _templates[name] = {
+            "TemplateName": name,
+            **_template_parts(template_content),
+            "CreatedTimestamp": now_iso(),
+            # Not taggable via TagResource on AWS, so these surface via GetEmailTemplate only
+            "Tags": list(data.get("Tags", [])),
+        }
+        return json_response({})
+
+    # GET /v2/email/templates  (ListEmailTemplates)
+    if sub == "/templates" and method == "GET":
+        return json_response({
+            "TemplatesMetadata": [
+                {
+                    "TemplateName": t["TemplateName"],
+                    "CreatedTimestamp": t.get("CreatedTimestamp", ""),
+                }
+                for t in _templates.values()
+            ],
+        })
+
+    # GET/PUT/DELETE /v2/email/templates/{TemplateName}
+    m = re.match(r"^/templates/([^/]+)$", sub)
+    if m:
+        name = m.group(1)
+        stored = _templates.get(name)
+        if stored is None:
+            return _json_err("NotFoundException", f"Template {name} does not exist", 404)
+        if method == "GET":
+            body_out = {"TemplateName": name, "TemplateContent": _template_content(stored)}
+            if stored.get("Tags"):
+                body_out["Tags"] = stored["Tags"]
+            return json_response(body_out)
+        if method == "PUT":
+            template_content = data.get("TemplateContent")
+            if not isinstance(template_content, dict):
+                return _json_err("BadRequestException", "TemplateContent is required")
+            stored.update(_template_parts(template_content))
+            return json_response({})
+        if method == "DELETE":
+            _templates.pop(name, None)
             return json_response({})
 
     # GET/POST/DELETE /v2/email/tags  (ListTagsForResource / TagResource / UntagResource)

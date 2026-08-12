@@ -244,6 +244,40 @@ def test_ses_v2_get_account(sesv2):
     assert resp["SendingEnabled"] is True
     assert resp["ProductionAccessEnabled"] is True
 
+def test_ses_v2_send_email_with_v1_template(ses, sesv2):
+    """A template created with v1 CreateTemplate renders through v2 SendEmail."""
+    import urllib.request
+
+    ses.create_template(Template={
+        "TemplateName": "cross-version-tmpl",
+        "SubjectPart": "Hello {{name}}",
+        "TextPart": "Hi {{name}}, order #{{oid}}",
+    })
+
+    tpl = sesv2.get_email_template(TemplateName="cross-version-tmpl")
+    assert tpl["TemplateContent"]["Subject"] == "Hello {{name}}"
+
+    resp = sesv2.send_email(
+        FromEmailAddress="cross-version@example.com",
+        Destination={"ToAddresses": ['"Alice Example" <alice@example.com>']},
+        Content={"Template": {
+            "TemplateName": "cross-version-tmpl",
+            "TemplateData": json.dumps({"name": "Alice", "oid": "42"}),
+        }},
+    )
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    req = urllib.request.Request(f"{endpoint}/_ministack/ses/messages", method="GET")
+    with urllib.request.urlopen(req, timeout=5) as r:
+        data = json.loads(r.read().decode())
+
+    sent = [m for m in data["messages"]["000000000000"] if m["MessageId"] == resp["MessageId"]]
+    assert len(sent) == 1
+    assert sent[0]["Type"] == "v2.SendEmail"
+    assert sent[0]["To"] == ['"Alice Example" <alice@example.com>']
+    assert sent[0]["Subject"] == "Hello Alice"
+    assert sent[0]["BodyText"] == "Hi Alice, order #42"
+
 @pytest.fixture(autouse=True)
 def _clear_smtp_host():
     """Ensure SMTP_HOST is clean before/after each test."""

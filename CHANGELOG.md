@@ -7,6 +7,12 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **SES v2 — email template CRUD and `SendEmail` with `Content.Template`** — the v2 `SendEmail` handler read only `Content.Simple` and `Content.Raw`, so a templated send (the SESv2 equivalent of v1 `SendTemplatedEmail`) was accepted with a `200` and a `MessageId` while the template was silently dropped: the stored message — and the SMTP relay when `SMTP_HOST` is set — carried an empty subject and empty body. There was also no way to create a template through v2 at all (`CreateEmailTemplate` and friends returned `404 NotFoundException`), so an app migrating from `ses` to `sesv2` had no working template path in either direction. `Content.Template` is now rendered through the same `{{placeholder}}` substitution v1 uses, resolved from `TemplateName`, from a `…:template/<name>` `TemplateArn`, or from `TemplateContent` supplied inline (rendered without being stored, as on AWS); a named template that doesn't exist now fails the send with `NotFoundException` (404) instead of delivering an empty email, and a `Content.Template` carrying none of the three is rejected with `BadRequestException`. `CreateEmailTemplate`, `GetEmailTemplate`, `UpdateEmailTemplate`, `DeleteEmailTemplate`, and `ListEmailTemplates` are served at `/v2/email/templates[/{TemplateName}]` over the shared v1 template store, so a template provisioned with `aws ses create-template` is sendable through `aws sesv2 send-email` and vice versa; `CreateEmailTemplate` rejects a duplicate name with `AlreadyExistsException` and, since AWS does not tag email templates through `TagResource`, `Tags` given at create come back only through `GetEmailTemplate`. Stored records for templated sends keep the rendered subject and body plus the `Template` name and `TemplateData`, so `GET /_ministack/ses/messages` shows what the recipient would have received.
+
+### Fixed
+- **SES v2 — error responses carry `x-amzn-errortype`** — every SESv2 error returned only a JSON body, and the restJson1 protocol resolves the error shape from the `x-amzn-errortype` header, so SDKs surfaced a bare HTTP status instead of the modelled exception: boto3 reported `An error occurred (404)` rather than `NotFoundException`, and typed handling (`catch (NotFoundException)`) never matched on any SESv2 operation. The header is now set on all of them.
+
 ## [1.4.16] — 2026-08-12
 
 ### Added
