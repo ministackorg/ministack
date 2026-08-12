@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **API Gateway (HTTP API / v2) — custom Lambda (`REQUEST`) authorizers are now invoked and enforced** — `_handle_execute_in_scope` only branched on `auth_type == "JWT"`, so a route with a `CUSTOM` authorization type (the type a route gets when it references a `REQUEST` authorizer) fell through unauthenticated: the authorizer Lambda was never invoked at all, regardless of whether the request carried a valid, invalid, or missing token. Adds a REQUEST-authorizer data-plane path mirroring the REST (v1) fix from 1.4.16 (`_authorize_request_v1`) — honors `authorizerPayloadFormatVersion` (1.0 IAM-policy-shaped event vs. 2.0), `enableSimpleResponses` (`{isAuthorized, context}`) vs. IAM policy (`{principalId, policyDocument, context}`) response formats, and `authorizerResultTtlInSeconds` caching — and populates `requestContext.authorizer.lambda` for the downstream integration. Reported against real-world usage (see ministackorg/ministack#1345, item 1 — that fix covered REST only). Contributed by @ryan-bennett.
+
 ## [1.4.16] — 2026-08-12
 
 ### Added
