@@ -61,6 +61,9 @@ from ministack.services.rds_iam_plugin import (
     ensure_iam_auth_plugin,
     iam_auth_plugin_enabled,
 )
+from ministack.services.rds_mysql_compat import (
+    ensure_rds_compatibility_procedures,
+)
 
 logger = logging.getLogger("rds")
 
@@ -660,7 +663,7 @@ def restore_state(data):
                 if authenticated_ready and _is_mysql_engine(
                     cluster.get("Engine", ""),
                 ):
-                    _ensure_mysql_iam_auth_plugin(
+                    _ensure_mysql_compatibility(
                         container_id,
                         result.get("readiness_host")
                         or cluster["_shared_endpoint"]["Address"],
@@ -1363,7 +1366,7 @@ def _start_rds_container_for_instance(db_id, instance):
     instance["_internal_address"] = internal_host
     instance["_internal_port"] = internal_port
     if _is_mysql_engine(engine):
-        _ensure_mysql_iam_auth_plugin(
+        _ensure_mysql_compatibility(
             container.id,
             internal_host or "127.0.0.1",
             internal_port or host_port,
@@ -1615,7 +1618,7 @@ def _mysql_endpoint_admin_connection(host, port, password):
     )
 
 
-def _ensure_mysql_iam_auth_plugin(
+def _ensure_mysql_compatibility(
     container_id,
     host,
     port,
@@ -1626,22 +1629,8 @@ def _ensure_mysql_iam_auth_plugin(
     database_name=None,
     wait_for_ready=False,
 ):
-    """Best-effort IAM plugin hook shared by every MySQL-ready path."""
+    """Best-effort fidelity hook shared by every MySQL-ready path."""
     engine_series = _mysql_community_major_minor(engine_version)
-    if not iam_auth_plugin_enabled(engine_series):
-        return False
-    docker_client = _get_docker()
-    if not docker_client or not container_id:
-        return False
-    try:
-        container = docker_client.containers.get(container_id)
-    except Exception as e:
-        logger.warning(
-            "RDS: failed to inspect MySQL container for %s: %s",
-            resource_id,
-            e,
-        )
-        return False
 
     def _connection():
         if wait_for_ready:
@@ -1667,12 +1656,29 @@ def _ensure_mysql_iam_auth_plugin(
                 raise RuntimeError("container exited before plugin installation")
         return _mysql_endpoint_admin_connection(host, port, root_password)
 
-    return ensure_iam_auth_plugin(
-        container,
+    procedures_ready = ensure_rds_compatibility_procedures(
         _connection,
-        engine_series,
         resource_id,
     )
+    plugin_ready = False
+    if iam_auth_plugin_enabled(engine_series):
+        docker_client = _get_docker()
+        if docker_client and container_id:
+            try:
+                container = docker_client.containers.get(container_id)
+                plugin_ready = ensure_iam_auth_plugin(
+                    container,
+                    _connection,
+                    engine_series,
+                    resource_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "RDS: failed to inspect MySQL container for %s: %s",
+                    resource_id,
+                    e,
+                )
+    return procedures_ready, plugin_ready
 
 
 def _mysql_replication_connection(cluster):
@@ -3037,7 +3043,7 @@ def _create_db_instance(p):
                 readiness_master_pass, readiness_db_name, _container_alive,
             )
             if database_ready and _is_mysql_engine(engine):
-                _ensure_mysql_iam_auth_plugin(
+                _ensure_mysql_compatibility(
                     container_id,
                     ready_host,
                     ready_port,
@@ -4875,7 +4881,7 @@ def _start_db_cluster(p):
             readiness_pass, readiness_db, _container_alive,
         )
         if database_ready and _is_mysql_engine(engine):
-            _ensure_mysql_iam_auth_plugin(
+            _ensure_mysql_compatibility(
                 container_id,
                 ready_host,
                 ready_port,

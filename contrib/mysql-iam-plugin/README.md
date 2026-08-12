@@ -50,18 +50,37 @@ for later fidelity levels do not change the L0 reject-all behavior.
 
 The lifecycle hook runs after authenticated readiness and outside RDS store
 locks. Cluster paths revalidate their container ID/epoch after the hook before
-publishing readiness. This preserves the existing artifact-absent path and
-ensures replication cannot begin before the plugin installation attempt.
+publishing readiness. It installs the local Aurora compatibility procedures on
+every MySQL compute node, then installs the auth plugin when its artifact is
+available. Replication cannot begin before either installation attempt.
 
-| Compute path | Container transition | IAM plugin disposition |
+| Compute path | Container transition | Compatibility disposition |
 |---|---|---|
 | First Aurora member | `_start_cluster_shared_container` (`containers.run`) then `_create_db_instance` readiness worker | Hooked before `_configure_or_defer_mysql_replication`; applies to writers and secondaries. |
 | New standalone RDS instance | `_create_db_instance` (`containers.run`) readiness worker | Hooked after authenticated readiness. |
 | Persisted Aurora cluster | `restore_state` through `_start_cluster_shared_container` (`containers.run`) | Hooked after authenticated readiness and before replication reconfiguration. |
-| Persisted standalone instance | `restore_state` through `_start_rds_container_for_instance` (`containers.run`) | Hooked with an artifact-gated readiness wait; no wait or other behavior change when the artifact is absent or disabled. |
-| Stopped Aurora cluster | `_restart_cluster_shared_container` (`container.start`) or recreate fallback, then `_start_db_cluster` readiness worker | Hooked after authenticated readiness; the idempotence guard handles preserved installations. |
+| Persisted standalone instance | `restore_state` through `_start_rds_container_for_instance` (`containers.run`) | Hooked after an authenticated readiness wait. |
+| Stopped Aurora cluster | `_restart_cluster_shared_container` (`container.start`) or recreate fallback, then `_start_db_cluster` readiness worker | Hooked after authenticated readiness; object-existence guards preserve grants across restart. |
 | CloudFormation DBCluster/DBInstance | `cloudformation/provisioners.py` writes metadata only | No hook: this path explicitly does not create or adopt database compute. |
 | Read-replica and snapshot-restore stubs | Metadata-only records | No hook: no MySQL server transitions to ready. |
+
+The same hook creates `mysql.rds_kill`, `mysql.rds_kill_query`,
+`mysql.rds_show_configuration`, and `mysql.rds_set_configuration` with binary
+logging disabled for the session. The provider's Square and Cash user sets are
+the source of all four procedure grants. A validation-lane sweep of every
+deployed control-plane ASL definition in both regions found no `rds_%` routine
+reference; the only lexical match was the unrelated `rds_managed` identifier.
+The kill procedures use a root-privileged definer and real `KILL CONNECTION` /
+`KILL QUERY` statements. The configuration pair models only the
+binlog-retention-hours round-trip.
+
+The hook also creates the two Aurora predefined roles referenced by the Cash
+user set: `AWS_SELECT_S3_ACCESS` and `AWS_LOAD_S3_ACCESS`. They intentionally
+carry no privileges because MiniStack does not model Aurora's S3 import/export
+data plane; their fidelity contract is existence so grants and reconciliation
+match Aurora. The deployed-ASL sweep found no `AWS_%` identifiers, so it adds
+no role beyond the two provider-source roles. Provider-created service roles
+are runtime resources and require no MiniStack fixture.
 
 Residuals: the full image carries the artifacts; the slim image remains
 artifact-free and therefore auto-off. The existing global-replication live

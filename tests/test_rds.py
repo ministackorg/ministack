@@ -4,6 +4,7 @@ import io
 import json
 import os
 import sys
+import threading
 import time
 import types
 import uuid
@@ -2186,7 +2187,7 @@ def test_rds_stop_start_cluster_compute_lifecycle(monkeypatch):
     monkeypatch.setattr(m, "_wait_for_database_ready", lambda *_args: True)
     monkeypatch.setattr(
         m,
-        "_ensure_mysql_iam_auth_plugin",
+        "_ensure_mysql_compatibility",
         lambda *_args, **_kwargs: readiness_actions.append("plugin") or True,
     )
     monkeypatch.setattr(
@@ -6920,6 +6921,110 @@ def test_aurora_mysql_iam_plugin_ddl_and_reject_all(rds, engine_version):
     not os.environ.get("DOCKER_NETWORK"),
     reason="DOCKER_NETWORK not set -- live Aurora",
 )
+def test_aurora_mysql_rds_compatibility_procedures(rds):
+    import pymysql
+
+    with _live_cluster(
+        rds,
+        engine_version="8.0.mysql_aurora.3.10.3",
+    ) as (_cid, _wid, _rid, writer, _reader, _cluster):
+        user = f"proc_{uuid.uuid4().hex[:8]}"
+        user_password = "ProcedureTest123!"
+        procedure_names = (
+            "rds_kill",
+            "rds_kill_query",
+            "rds_show_configuration",
+            "rds_set_configuration",
+        )
+        predefined_roles = (
+            "AWS_SELECT_S3_ACCESS",
+            "AWS_LOAD_S3_ACCESS",
+        )
+        with _aurora_connect(writer["Endpoint"]) as admin:
+            with admin.cursor() as cursor:
+                cursor.execute(
+                    f"CREATE USER `{user}`@'%' IDENTIFIED BY %s",
+                    (user_password,),
+                )
+                for procedure_name in procedure_names:
+                    cursor.execute(
+                        "GRANT EXECUTE ON PROCEDURE "
+                        f"mysql.{procedure_name} TO `{user}`@'%'"
+                    )
+                for role in predefined_roles:
+                    cursor.execute(
+                        f"GRANT `{role}`@'%' TO `{user}`@'%'"
+                    )
+                cursor.execute(f"SHOW GRANTS FOR `{user}`@'%'")
+                grants = "\n".join(row[0] for row in cursor.fetchall())
+                for role in predefined_roles:
+                    assert f"`{role}`@`%`" in grants
+
+        def connect_user():
+            return _aurora_connect(
+                writer["Endpoint"],
+                user=user,
+                password=user_password,
+            )
+
+        with connect_user() as caller:
+            with caller.cursor() as cursor:
+                cursor.execute(
+                    "CALL mysql.rds_set_configuration(%s, %s)",
+                    ("binlog retention hours", 24),
+                )
+                cursor.execute("CALL mysql.rds_show_configuration()")
+                assert cursor.fetchone() == (
+                    "binlog retention hours",
+                    "24",
+                    "Number of hours that binary logs are retained",
+                )
+
+        with connect_user() as target, connect_user() as killer:
+            with target.cursor() as cursor:
+                cursor.execute("SELECT CONNECTION_ID()")
+                target_id = cursor.fetchone()[0]
+            query_result = {}
+
+            def run_sleep():
+                try:
+                    with target.cursor() as cursor:
+                        cursor.execute("SELECT SLEEP(30)")
+                        query_result["row"] = cursor.fetchone()
+                except Exception as e:
+                    query_result["error"] = e
+
+            sleeper = threading.Thread(target=run_sleep, daemon=True)
+            sleeper.start()
+            time.sleep(0.2)
+            with killer.cursor() as cursor:
+                cursor.execute("CALL mysql.rds_kill_query(%s)", (target_id,))
+            sleeper.join(timeout=5)
+            assert not sleeper.is_alive()
+            assert isinstance(query_result.get("error"), pymysql.MySQLError)
+            with target.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                assert cursor.fetchone() == (1,)
+
+        victim = connect_user()
+        try:
+            with victim.cursor() as cursor:
+                cursor.execute("SELECT CONNECTION_ID()")
+                victim_id = cursor.fetchone()[0]
+            with connect_user() as killer:
+                with killer.cursor() as cursor:
+                    cursor.execute("CALL mysql.rds_kill(%s)", (victim_id,))
+            with pytest.raises(pymysql.MySQLError):
+                victim.ping(reconnect=False)
+        finally:
+            victim.close()
+
+
+@pytest.mark.serial
+@pytest.mark.skipif(
+    not os.environ.get("DOCKER_NETWORK"),
+    reason="DOCKER_NETWORK not set -- live Aurora",
+)
 def test_aurora_mysql_iam_plugin_survives_idempotent_cluster_restart(rds):
     with _live_cluster(
         rds,
@@ -8046,7 +8151,7 @@ def test_rds_restore_respawns_persisted_headless_secondary_applier(monkeypatch):
         monkeypatch.setattr(m, "_wait_for_database_ready", wait_for_ready)
         monkeypatch.setattr(
             m,
-            "_ensure_mysql_iam_auth_plugin",
+            "_ensure_mysql_compatibility",
             lambda *_args, **_kwargs: readiness_actions.append("plugin") or True,
         )
         monkeypatch.setattr(m, "_configure_or_defer_mysql_replication", configure)
