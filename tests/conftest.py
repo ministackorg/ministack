@@ -83,6 +83,16 @@ _SERIAL_TESTS = {
     "tests/test_apigatewayv2.py::test_apigwv1_path_based_restapi_legacy_user_request",
     "tests/test_apigatewayv2.py::test_apigwv2_named_stage_still_requires_prefix",
     "tests/test_apigatewayv2.py::test_apigwv2_integration_wrapped_function_arn",
+    # v1 Lambda-authorizer cache tests. Same cold-start-burst sensitivity as the
+    # apigw tests above, doubled: every guarded request cold-starts TWO Lambdas
+    # (the authorizer and the backend), and the invocation-count assertions that
+    # prove a cache hit or miss leave no slack for a retry.
+    "tests/test_apigatewayv1.py::test_apigwv1_authorizer_cache_is_scoped_per_method_arn",
+    "tests/test_apigatewayv1.py::test_apigwv1_authorizer_cache_is_scoped_per_stage",
+    "tests/test_apigatewayv1.py::test_apigwv1_authorizer_invalid_validation_expression_is_500",
+    "tests/test_apigatewayv1.py::test_apigwv1_authorizer_without_principal_id_is_500_and_not_cached",
+    "tests/test_apigatewayv1.py::test_apigwv1_authorizer_without_policy_document_is_500_and_not_cached",
+    "tests/test_apigatewayv1.py::test_apigwv1_authorizer_unparsable_ttl_falls_back_to_the_default",
     # AppSync Lambda-resolver event-shape tests cold-start Lambdas under a 10s
     # urlopen timeout (Test 6 spawns two functions). Same cold-start-under-xdist
     # flakiness as the apigw Lambda tests above — run them in the serial phase.

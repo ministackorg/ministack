@@ -3194,3 +3194,423 @@ def test_apigatewayv1_load_persisted_state_backfills_taggable_resource_regions()
     )
     assert status == 204
     assert body == {}
+
+
+# ---- Data plane: Lambda-authorizer result caching ----
+
+_AUTH_ECHO_BACKEND = (
+    "import json\n"
+    "def handler(event, context):\n"
+    "    return {'statusCode': 200,\n"
+    "            'body': json.dumps(event['requestContext'].get('authorizer'))}\n"
+)
+
+# Prelude for authorizer sources: counts invocations by pushing one SQS message
+# per call. The counter has to live INSIDE the emulator — writing to a
+# ``tmp_path`` file only works while the server runs in-process, and silently
+# breaks (FileNotFoundError on every counted test) under the documented
+# ``docker compose up`` workflow where the Lambda runs in its own container.
+_AUTH_MARK_PRELUDE = (
+    "import os, boto3\n"
+    "def _mark(qname):\n"
+    "    sqs = boto3.client('sqs', endpoint_url=os.environ['AWS_ENDPOINT_URL'])\n"
+    "    url = sqs.get_queue_url(QueueName=qname)['QueueUrl']\n"
+    "    sqs.send_message(QueueUrl=url, MessageBody='1')\n"
+)
+
+
+def _auth_counter_queue(sqs):
+    """Create the SQS queue an authorizer marks on every invocation."""
+    qname = f"v1-auth-count-{_uuid_mod.uuid4().hex[:8]}"
+    sqs.create_queue(QueueName=qname)
+    return qname
+
+
+def _auth_count(sqs, qname):
+    """How many times the authorizer behind ``qname`` has run."""
+    url = sqs.get_queue_url(QueueName=qname)["QueueUrl"]
+    attrs = sqs.get_queue_attributes(
+        QueueUrl=url, AttributeNames=["ApproximateNumberOfMessages"]
+    )["Attributes"]
+    return int(attrs["ApproximateNumberOfMessages"])
+
+
+def _auth_delete_queue(sqs, qname):
+    try:
+        sqs.delete_queue(QueueUrl=sqs.get_queue_url(QueueName=qname)["QueueUrl"])
+    except ClientError:
+        pass
+
+
+def _auth_make_lambda(lam, label, code):
+    fname = f"v1-auth-{label}-{_uuid_mod.uuid4().hex[:8]}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Timeout=30,
+        Code={"ZipFile": buf.getvalue()},
+    )
+    return fname
+
+
+def _auth_drop_lambda(lam, fname):
+    try:
+        lam.delete_function(FunctionName=fname)
+    except ClientError:
+        pass
+
+
+def _auth_drop_api(apigw_v1, api_id):
+    try:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+    except ClientError:
+        pass
+
+
+def _auth_lambda_uri(fname):
+    return (
+        "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+        f"arn:aws:lambda:us-east-1:000000000000:function:{fname}/invocations"
+    )
+
+
+def _auth_token_authorizer_code(qname):
+    """TOKEN authorizer: Allow for `allow*` tokens, Deny otherwise.
+
+    The policy's ``Resource`` is the canonical ``event['methodArn']`` — the
+    shape every AWS sample emits, and the one whose per-request evaluation
+    keeps a cached policy from granting another method or stage. The methodArn
+    is echoed through ``context`` so a test can see which one was issued.
+    """
+    return (
+        _AUTH_MARK_PRELUDE
+        + "def handler(event, context):\n"
+        f"    _mark({qname!r})\n"
+        "    token = event.get('authorizationToken', '')\n"
+        "    effect = 'Allow' if token.startswith('allow') else 'Deny'\n"
+        "    return {\n"
+        "        'principalId': 'user|' + token,\n"
+        "        'policyDocument': {'Version': '2012-10-17', 'Statement': [\n"
+        "            {'Action': 'execute-api:Invoke', 'Effect': effect,\n"
+        "             'Resource': event['methodArn']}]},\n"
+        "        'context': {'arn': event['methodArn']},\n"
+        "    }\n"
+    )
+
+
+def _auth_http(url, method="GET", headers=None, timeout=30):
+    """(status, body_bytes) without raising on 4xx/5xx.
+
+    An explicit timeout keeps a wedged request from hanging the whole session.
+    """
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+
+    req = _urlreq.Request(url, method=method)
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        resp = _urlreq.urlopen(req, timeout=timeout)
+        return resp.status, resp.read()
+    except _urlerr.HTTPError as e:
+        return e.code, e.read()
+
+
+def _auth_root_id(apigw_v1, api_id):
+    return next(
+        r["id"] for r in apigw_v1.get_resources(restApiId=api_id)["items"] if r["path"] == "/"
+    )
+
+
+def _auth_execute_url(api_id, stage, path):
+    # Path-based execute form: no *.localhost DNS needed.
+    return f"http://localhost:{_EXECUTE_PORT}/_aws/execute-api/{api_id}/{stage}/{path}"
+
+
+def _auth_wire_lambda_method(apigw_v1, api_id, resource_id, backend_fname, authorizer_id):
+    apigw_v1.put_method(
+        restApiId=api_id,
+        resourceId=resource_id,
+        httpMethod="GET",
+        authorizationType="CUSTOM",
+        authorizerId=authorizer_id,
+    )
+    apigw_v1.put_integration(
+        restApiId=api_id,
+        resourceId=resource_id,
+        httpMethod="GET",
+        type="AWS_PROXY",
+        integrationHttpMethod="POST",
+        uri=_auth_lambda_uri(backend_fname),
+    )
+
+
+def _auth_build_api(apigw_v1, backend_fname, authorizer_kwargs, path_parts=("secure",)):
+    """API with a CUSTOM-guarded `GET /{part}` per entry in ``path_parts``."""
+    api_id = apigw_v1.create_rest_api(name=f"v1-auth-{_uuid_mod.uuid4().hex[:6]}")["id"]
+    root_id = _auth_root_id(apigw_v1, api_id)
+    authorizer_id = apigw_v1.create_authorizer(restApiId=api_id, **authorizer_kwargs)["id"]
+    for part in path_parts:
+        resource_id = apigw_v1.create_resource(
+            restApiId=api_id, parentId=root_id, pathPart=part
+        )["id"]
+        _auth_wire_lambda_method(apigw_v1, api_id, resource_id, backend_fname, authorizer_id)
+    dep_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
+    apigw_v1.create_stage(restApiId=api_id, stageName="test", deploymentId=dep_id)
+    return api_id, authorizer_id
+
+
+def test_apigwv1_authorizer_cache_is_scoped_per_method_arn(apigw_v1, lam, sqs):
+    """A cached Allow grants only the method it was issued for.
+
+    The canonical `Resource: event['methodArn']` policy covers exactly one
+    method. Caching the allow/deny *decision* under a key without the method ARN
+    replays that Allow on every other method the same token touches; caching the
+    *policy* and re-evaluating it per request does not.
+    """
+    qname = _auth_counter_queue(sqs)
+    backend = _auth_make_lambda(lam, "be", _AUTH_ECHO_BACKEND)
+    authz = _auth_make_lambda(lam, "tok", _auth_token_authorizer_code(qname))
+    api_id, _ = _auth_build_api(
+        apigw_v1, backend,
+        dict(name="tok", type="TOKEN", authorizerUri=_auth_lambda_uri(authz),
+             authorizerResultTtlInSeconds=300),
+        path_parts=("alpha", "beta"),
+    )
+    try:
+        status, _ = _auth_http(
+            _auth_execute_url(api_id, "test", "alpha"), headers={"Authorization": "allow-abc"}
+        )
+        assert status == 200
+        assert _auth_count(sqs, qname) == 1
+
+        status, body = _auth_http(
+            _auth_execute_url(api_id, "test", "beta"), headers={"Authorization": "allow-abc"}
+        )
+        assert status == 403, "an Allow issued for /alpha must not carry over to /beta"
+        assert json.loads(body) == {"Message": "User is not authorized to access this resource"}
+        assert _auth_count(sqs, qname) == 1, "the cached policy is what gets re-evaluated"
+    finally:
+        _auth_drop_api(apigw_v1, api_id)
+        _auth_drop_lambda(lam, backend)
+        _auth_drop_lambda(lam, authz)
+        _auth_delete_queue(sqs, qname)
+
+
+def test_apigwv1_authorizer_cache_is_scoped_per_stage(apigw_v1, lam, sqs):
+    """API Gateway caches authorizer results per stage: a verdict computed on
+    one stage never answers the same token on another."""
+    qname = _auth_counter_queue(sqs)
+    backend = _auth_make_lambda(lam, "be", _AUTH_ECHO_BACKEND)
+    authz = _auth_make_lambda(lam, "tok", _auth_token_authorizer_code(qname))
+    api_id, _ = _auth_build_api(
+        apigw_v1, backend,
+        dict(name="tok", type="TOKEN", authorizerUri=_auth_lambda_uri(authz),
+             authorizerResultTtlInSeconds=300),
+    )
+    try:
+        dep_id = apigw_v1.get_deployments(restApiId=api_id)["items"][0]["id"]
+        apigw_v1.create_stage(restApiId=api_id, stageName="prod", deploymentId=dep_id)
+
+        status, body = _auth_http(
+            _auth_execute_url(api_id, "test", "secure"), headers={"Authorization": "allow-abc"}
+        )
+        assert status == 200
+        assert "/test/GET/secure" in json.loads(body)["arn"]
+        assert _auth_count(sqs, qname) == 1
+
+        status, body = _auth_http(
+            _auth_execute_url(api_id, "prod", "secure"), headers={"Authorization": "allow-abc"}
+        )
+        assert status == 200, body
+        assert _auth_count(sqs, qname) == 2, "the test-stage entry must not serve prod"
+        assert "/prod/GET/secure" in json.loads(body)["arn"]
+
+        # The per-stage entries are independent: both now answer from cache.
+        for stage in ("test", "prod"):
+            status, _ = _auth_http(
+                _auth_execute_url(api_id, stage, "secure"), headers={"Authorization": "allow-abc"}
+            )
+            assert status == 200
+        assert _auth_count(sqs, qname) == 2
+    finally:
+        _auth_drop_api(apigw_v1, api_id)
+        _auth_drop_lambda(lam, backend)
+        _auth_drop_lambda(lam, authz)
+        _auth_delete_queue(sqs, qname)
+
+
+def test_apigwv1_authorizer_invalid_validation_expression_is_500(apigw_v1, lam):
+    """CreateAuthorizer stores identityValidationExpression verbatim, so an
+    uncompilable expression only fails on the data path — as a 500
+    AUTHORIZER_CONFIGURATION_ERROR, not an exception out of the handler."""
+    backend = _auth_make_lambda(lam, "be", _AUTH_ECHO_BACKEND)
+    authz = _auth_make_lambda(
+        lam, "tok",
+        "def handler(event, context):\n"
+        "    return {'principalId': 'p',\n"
+        "            'policyDocument': {'Version': '2012-10-17', 'Statement': [\n"
+        "                {'Action': 'execute-api:Invoke', 'Effect': 'Allow',\n"
+        "                 'Resource': event['methodArn']}]}}\n",
+    )
+    api_id, _ = _auth_build_api(
+        apigw_v1, backend,
+        dict(name="tok", type="TOKEN", authorizerUri=_auth_lambda_uri(authz),
+             identityValidationExpression="allow-[a-z",
+             authorizerResultTtlInSeconds=0),
+    )
+    try:
+        status, body = _auth_http(
+            _auth_execute_url(api_id, "test", "secure"), headers={"Authorization": "allow-abc"}
+        )
+        assert status == 500
+        assert json.loads(body) == {"message": "Internal server error"}
+    finally:
+        _auth_drop_api(apigw_v1, api_id)
+        _auth_drop_lambda(lam, backend)
+        _auth_drop_lambda(lam, authz)
+
+
+def test_apigwv1_authorizer_without_principal_id_is_500_and_not_cached(apigw_v1, lam, sqs):
+    """AWS requires a principal. An Allow policy with no principalId is an
+    AUTHORIZER_CONFIGURATION_ERROR, not an allow that reaches the backend with
+    an empty principalId — and a configuration error is never cached."""
+    qname = _auth_counter_queue(sqs)
+    backend = _auth_make_lambda(lam, "be", _AUTH_ECHO_BACKEND)
+    authz = _auth_make_lambda(
+        lam, "noprincipal",
+        _AUTH_MARK_PRELUDE
+        + "def handler(event, context):\n"
+        f"    _mark({qname!r})\n"
+        "    return {'policyDocument': {'Version': '2012-10-17', 'Statement': [\n"
+        "        {'Action': 'execute-api:Invoke', 'Effect': 'Allow',\n"
+        "         'Resource': event['methodArn']}]}}\n",
+    )
+    api_id, _ = _auth_build_api(
+        apigw_v1, backend,
+        dict(name="noprincipal", type="TOKEN", authorizerUri=_auth_lambda_uri(authz),
+             authorizerResultTtlInSeconds=300),
+    )
+    try:
+        url = _auth_execute_url(api_id, "test", "secure")
+        for _ in range(2):
+            status, body = _auth_http(url, headers={"Authorization": "allow-abc"})
+            assert status == 500
+            assert json.loads(body) == {"message": "Internal server error"}
+        assert _auth_count(sqs, qname) == 2, "a configuration error must not be cached"
+    finally:
+        _auth_drop_api(apigw_v1, api_id)
+        _auth_drop_lambda(lam, backend)
+        _auth_drop_lambda(lam, authz)
+        _auth_delete_queue(sqs, qname)
+
+
+def test_apigwv1_authorizer_without_policy_document_is_500_and_not_cached(apigw_v1, lam, sqs):
+    """A response with no policyDocument is a misconfigured authorizer: AWS
+    answers 500 AuthorizerConfigurationException, not an implicit deny — and
+    the malformed response is never cached."""
+    qname = _auth_counter_queue(sqs)
+    backend = _auth_make_lambda(lam, "be", _AUTH_ECHO_BACKEND)
+    authz = _auth_make_lambda(
+        lam, "nopolicy",
+        _AUTH_MARK_PRELUDE
+        + "def handler(event, context):\n"
+        f"    _mark({qname!r})\n"
+        "    return {'principalId': 'user|abc'}\n",
+    )
+    api_id, _ = _auth_build_api(
+        apigw_v1, backend,
+        dict(name="nopolicy", type="TOKEN", authorizerUri=_auth_lambda_uri(authz),
+             authorizerResultTtlInSeconds=300),
+    )
+    try:
+        url = _auth_execute_url(api_id, "test", "secure")
+        for _ in range(2):
+            status, body = _auth_http(url, headers={"Authorization": "allow-abc"})
+            assert status == 500
+            assert json.loads(body) == {"message": "Internal server error"}
+        assert _auth_count(sqs, qname) == 2, "a configuration error must not be cached"
+    finally:
+        _auth_drop_api(apigw_v1, api_id)
+        _auth_drop_lambda(lam, backend)
+        _auth_drop_lambda(lam, authz)
+        _auth_delete_queue(sqs, qname)
+
+
+def test_apigwv1_authorizer_unparsable_ttl_falls_back_to_the_default(apigw_v1, lam, sqs):
+    """UpdateAuthorizer applies JSON Patch without validating, so the TTL can be
+    any string by the time the data plane reads it. An unparsable value falls
+    back to the same default an absent one does (and does not raise).
+
+    The PATCH goes over raw HTTP: botocore models the field as an integer and
+    would raise while parsing the *response*, after the server already stored
+    the string — which is exactly how an authorizer ends up in this state.
+    """
+    import urllib.request as _urlreq
+
+    qname = _auth_counter_queue(sqs)
+    backend = _auth_make_lambda(lam, "be", _AUTH_ECHO_BACKEND)
+    authz = _auth_make_lambda(lam, "tok", _auth_token_authorizer_code(qname))
+    api_id, authorizer_id = _auth_build_api(
+        apigw_v1, backend,
+        dict(name="tok", type="TOKEN", authorizerUri=_auth_lambda_uri(authz),
+             authorizerResultTtlInSeconds=300),
+    )
+    try:
+        patch = _urlreq.Request(
+            f"{_endpoint}/restapis/{api_id}/authorizers/{authorizer_id}",
+            data=json.dumps({"patchOperations": [{
+                "op": "replace",
+                "path": "/authorizerResultTtlInSeconds",
+                "value": "not-a-number",
+            }]}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="PATCH",
+        )
+        patched = json.loads(_urlreq.urlopen(patch, timeout=30).read())
+        assert patched["authorizerResultTtlInSeconds"] == "not-a-number"
+
+        url = _auth_execute_url(api_id, "test", "secure")
+        for _ in range(2):
+            status, _ = _auth_http(url, headers={"Authorization": "allow-abc"})
+            assert status == 200
+        assert _auth_count(sqs, qname) == 1, "caching stays on at the default TTL"
+    finally:
+        _auth_drop_api(apigw_v1, api_id)
+        _auth_drop_lambda(lam, backend)
+        _auth_drop_lambda(lam, authz)
+        _auth_delete_queue(sqs, qname)
+
+
+def test_apigwv1_authorizer_cache_is_bounded():
+    """The result cache is keyed on caller-supplied tokens, so it is capped
+    rather than left to grow for the life of the process. Expired entries go
+    first; beyond that the oldest insertions are evicted."""
+    cache = apigateway_v1._authorizer_cache
+    cap = apigateway_v1._AUTHORIZER_CACHE_MAX
+    saved = dict(cache)
+    cache.clear()
+    try:
+        expired_at = time.time() - 1
+        for i in range(cap):
+            apigateway_v1._cache_authorizer_result(("stale", i), expired_at, {}, {})
+        assert len(cache) == cap
+
+        # The next write is over the cap and prunes the expired entries first.
+        apigateway_v1._cache_authorizer_result(("live", 0), time.time() + 300, {}, {})
+        assert len(cache) == 1
+        assert ("live", 0) in cache
+
+        # With nothing expired to reclaim, the oldest insertions are evicted.
+        for i in range(cap + 50):
+            apigateway_v1._cache_authorizer_result(("live", i), time.time() + 300, {}, {})
+        assert len(cache) <= cap
+        assert ("live", cap + 49) in cache
+    finally:
+        cache.clear()
+        cache.update(saved)
