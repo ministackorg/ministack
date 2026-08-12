@@ -3,6 +3,7 @@ import logging
 import tarfile
 import types
 
+from ministack.services import rds as rds_service
 from ministack.services import rds_iam_plugin as plugin
 
 
@@ -195,3 +196,65 @@ def test_rds_iam_plugin_unknown_mode_warns_once_and_uses_auto(
         if "unknown MINISTACK_MYSQL_IAM_AUTH" in record.message
     ]
     assert len(warnings) == 1
+
+
+def test_mysql_compatibility_wait_resolves_container_before_procedures(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("MINISTACK_MYSQL_IAM_PLUGIN_DIR", str(tmp_path))
+    connection = object()
+    calls = []
+
+    class ReadyContainer:
+        status = "running"
+
+        def reload(self):
+            calls.append("reload")
+
+    container = ReadyContainer()
+
+    class Containers:
+        def get(self, container_id):
+            calls.append(("get", container_id))
+            return container
+
+    docker_client = types.SimpleNamespace(containers=Containers())
+
+    def wait_for_ready(*args):
+        calls.append("wait")
+        assert args[-1]() is True
+        return True
+
+    def ensure_procedures(connection_factory, resource_id):
+        calls.append(("procedures", resource_id))
+        assert connection_factory() is connection
+        return True
+
+    monkeypatch.setattr(rds_service, "_get_docker", lambda: docker_client)
+    monkeypatch.setattr(rds_service, "_wait_for_database_ready", wait_for_ready)
+    monkeypatch.setattr(
+        rds_service,
+        "_mysql_endpoint_admin_connection",
+        lambda *_args: connection,
+    )
+    monkeypatch.setattr(
+        rds_service,
+        "ensure_rds_compatibility_procedures",
+        ensure_procedures,
+    )
+
+    assert rds_service._ensure_mysql_compatibility(
+        "container-1",
+        "127.0.0.1",
+        3306,
+        "password",
+        "8.0.mysql_aurora.3.10.3",
+        "db-1",
+        wait_for_ready=True,
+    ) == (True, False)
+    assert calls == [
+        ("get", "container-1"),
+        ("procedures", "db-1"),
+        "wait",
+        "reload",
+    ]

@@ -1631,9 +1631,24 @@ def _ensure_mysql_compatibility(
 ):
     """Best-effort fidelity hook shared by every MySQL-ready path."""
     engine_series = _mysql_community_major_minor(engine_version)
+    plugin_enabled = iam_auth_plugin_enabled(engine_series)
+    container = None
+    if wait_for_ready or plugin_enabled:
+        docker_client = _get_docker()
+        if docker_client and container_id:
+            try:
+                container = docker_client.containers.get(container_id)
+            except Exception as e:
+                logger.warning(
+                    "RDS: failed to inspect MySQL container for %s: %s",
+                    resource_id,
+                    e,
+                )
 
     def _connection():
         if wait_for_ready:
+            if container is None:
+                raise RuntimeError("MySQL container is unavailable")
 
             def _container_alive():
                 try:
@@ -1661,23 +1676,13 @@ def _ensure_mysql_compatibility(
         resource_id,
     )
     plugin_ready = False
-    if iam_auth_plugin_enabled(engine_series):
-        docker_client = _get_docker()
-        if docker_client and container_id:
-            try:
-                container = docker_client.containers.get(container_id)
-                plugin_ready = ensure_iam_auth_plugin(
-                    container,
-                    _connection,
-                    engine_series,
-                    resource_id,
-                )
-            except Exception as e:
-                logger.warning(
-                    "RDS: failed to inspect MySQL container for %s: %s",
-                    resource_id,
-                    e,
-                )
+    if plugin_enabled and container is not None:
+        plugin_ready = ensure_iam_auth_plugin(
+            container,
+            _connection,
+            engine_series,
+            resource_id,
+        )
     return procedures_ready, plugin_ready
 
 
