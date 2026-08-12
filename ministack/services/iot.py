@@ -52,6 +52,7 @@ import json
 import logging
 import os
 import re
+import ssl
 import struct
 import time
 import uuid
@@ -63,6 +64,7 @@ from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     _request_account_id,
+    _request_region,
     error_response_json,
     get_account_id,
     get_region,
@@ -134,6 +136,27 @@ def get_ca_cert_pem() -> str:
     """Return the CA certificate in PEM format. Generates the CA on first call."""
     cert_pem, _ = _ensure_ca()
     return cert_pem
+
+
+# Server certificate for the mTLS MQTT listener (the broker's TCP transport,
+# further down in this file). Persisted alongside the CA in the same snapshot:
+# a device that pinned the broker's chain keeps working across restarts,
+# exactly like the client certificates the CA signed.
+_mtls_server_cert_pem: str | None = None
+_mtls_server_key_pem: str | None = None
+
+
+def get_mtls_server_cert() -> tuple[str | None, str | None]:
+    """Return the persisted (cert_pem, key_pem) of the mTLS listener, if any."""
+    return _mtls_server_cert_pem, _mtls_server_key_pem
+
+
+def set_mtls_server_cert(cert_pem: str, key_pem: str) -> None:
+    """Record a freshly minted mTLS listener certificate for persistence."""
+    global _mtls_server_cert_pem, _mtls_server_key_pem
+    with _CA_LOCK:
+        _mtls_server_cert_pem = cert_pem
+        _mtls_server_key_pem = key_pem
 
 
 # ---------------------------------------------------------------------------
@@ -210,12 +233,19 @@ def get_state() -> dict:
         "ca": {"ca_cert_pem": _ca_cert_pem, "ca_key_pem": _ca_key_pem}
         if _ca_cert_pem and _ca_key_pem
         else {},
+        "mtls_server": {
+            "cert_pem": _mtls_server_cert_pem,
+            "key_pem": _mtls_server_key_pem,
+        }
+        if _mtls_server_cert_pem and _mtls_server_key_pem
+        else {},
         "mqtt_broker": _broker_get_state(),
     }
 
 
 def restore_state(data: dict | None) -> None:
     global _ca_cert_pem, _ca_key_pem
+    global _mtls_server_cert_pem, _mtls_server_key_pem
     if not data:
         return
     _things.update(data.get("things", {}))
@@ -239,11 +269,20 @@ def restore_state(data: dict | None) -> None:
                 _ca_cert_pem = cert
                 _ca_key_pem = key
             logger.info("Local CA: restored from persisted state")
+    mtls_data = data.get("mtls_server")
+    if mtls_data:
+        cert = mtls_data.get("cert_pem")
+        key = mtls_data.get("key_pem")
+        if cert and key:
+            with _CA_LOCK:
+                _mtls_server_cert_pem = cert
+                _mtls_server_key_pem = key
     _broker_restore_state(data.get("mqtt_broker"))
 
 
 def reset() -> None:
     global _ca_cert_pem, _ca_key_pem
+    global _mtls_server_cert_pem, _mtls_server_key_pem
     _things.clear()
     _thing_types.clear()
     _thing_groups.clear()
@@ -263,6 +302,16 @@ def reset() -> None:
     with _CA_LOCK:
         _ca_cert_pem = None
         _ca_key_pem = None
+        _mtls_server_cert_pem = None
+        _mtls_server_key_pem = None
+    # The mTLS listener's server certificate and trust anchors were minted from
+    # the CA we just dropped, so it has to re-bind with fresh material. Cheap
+    # when the listener never started: with no bound loop the call returns
+    # immediately.
+    try:
+        mtls_schedule_restart()
+    except Exception:
+        logger.debug("IoT mTLS: restart after reset failed", exc_info=True)
 
 
 try:
@@ -5324,6 +5373,7 @@ MQTT_5 = 5
 # MQTT 3.1.1 CONNACK return codes (§3.2.2.3).
 CONNACK_311_ACCEPTED = 0x00
 CONNACK_311_UNACCEPTABLE_PROTOCOL_VERSION = 0x01
+CONNACK_311_NOT_AUTHORIZED = 0x05
 
 # MQTT 5 reason codes, only the ones this broker produces (§2.4). Success and
 # Normal disconnection share the value 0x00.
@@ -5331,6 +5381,7 @@ RC5_SUCCESS = 0x00
 RC5_NO_MATCHING_SUBSCRIBERS = 0x10
 RC5_NO_SUBSCRIPTION_EXISTED = 0x11
 RC5_MALFORMED_PACKET = 0x81
+RC5_NOT_AUTHORIZED = 0x87
 RC5_SESSION_TAKEN_OVER = 0x8E
 RC5_TOPIC_NAME_INVALID = 0x90
 
@@ -6278,6 +6329,28 @@ class _WSSession:
             )
 
 
+async def _feed_session(session: _WSSession, data: bytes, max_buffer: int) -> bool:
+    """Push raw MQTT bytes into ``session`` and dispatch every complete packet.
+
+    Returns False when the connection must be dropped — either the accumulated
+    frame buffer blew past ``max_buffer`` or a packet handler asked to stop
+    (DISCONNECT, invalid publish topic). Shared by the WebSocket transport and
+    the optional mTLS TCP listener; ``_take_packet`` does the framing, so both
+    transports see identical semantics for partial and coalesced packets.
+    """
+    session._buffer.extend(data)
+    if len(session._buffer) > max_buffer:
+        _broker_logger.warning("IoT broker: frame buffer overflow, dropping connection")
+        return False
+    while True:
+        pkt = session._take_packet()
+        if pkt is None:
+            return True
+        pkt_type, flags, body = pkt
+        if not await session.handle_packet(pkt_type, flags, body):
+            return False
+
+
 async def handle_websocket(
     scope: dict, receive, send, account_id: str, region: str
 ) -> None:
@@ -6322,18 +6395,8 @@ async def handle_websocket(
                 if text is None:
                     continue
                 continue
-            session._buffer.extend(data)
-            if len(session._buffer) > max_buffer:
-                _broker_logger.warning("IoT broker: WS buffer overflow, dropping connection")
+            if not await _feed_session(session, data, max_buffer):
                 break
-            while True:
-                pkt = session._take_packet()
-                if pkt is None:
-                    break
-                pkt_type, flags, body = pkt
-                cont = await session.handle_packet(pkt_type, flags, body)
-                if not cont:
-                    return
     except Exception:
         _broker_logger.exception("IoT broker WebSocket session failed")
     finally:
@@ -6346,3 +6409,584 @@ async def handle_websocket(
             await send({"type": "websocket.close", "code": 1000})
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# mTLS MQTT listener — the broker's TCP transport
+# ---------------------------------------------------------------------------
+# The broker above speaks MQTT over WebSocket on the gateway port, which real
+# device binaries built on the AWS IoT Device SDK cannot use: they open a plain
+# TCP socket, present a client certificate, and speak MQTT directly. This
+# listener is that transport. Everything above the socket is the same broker —
+# ``_WSSession`` handles framing and packet semantics unchanged, fed through
+# ``_feed_session`` exactly like the WebSocket path.
+#
+# On by default at port 8883 (the MQTT-over-TLS port AWS uses), configured the
+# way the Transfer Family SFTP listener is: it starts when the optional
+# ``cryptography`` package is importable, ``IOT_MTLS_ENABLED=0`` turns it off,
+# and ``IOT_MTLS_PORT`` moves it. A port that cannot be bound (8883 is a
+# popular port, a local broker may already hold it) degrades to a log line
+# rather than failing the boot.
+#
+# The listener's server certificate is minted from the Local CA (the one that
+# signs ``CreateKeysAndCertificate`` leaves, served at
+# ``GET /_ministack/iot/ca.pem``), so a device trusting that one file verifies
+# the broker.
+#
+# The client certificate is OPTIONAL and the rule for it is the one S3 already
+# applies to a presigned URL: a request carrying no credential is served, and
+# a request carrying one that does not hold up is refused. Concretely:
+#
+# * no client certificate: the session runs under ``MINISTACK_ACCOUNT_ID``,
+#   exactly like an unsigned MQTT-over-WebSocket upgrade. Nothing is required
+#   of a caller that claims nothing.
+# * a certificate registered ACTIVE in exactly one account: that account and
+#   region serve the session, which is what gives a device fleet per-tenant
+#   isolation without any credential handling.
+# * a certificate that is unknown, not ACTIVE, or ACTIVE in several accounts:
+#   refused with a "not authorized" MQTT CONNACK. This reads the X.509
+#   identity lifecycle that the registry already keeps and that the control plane already
+#   enforces (deleting an ACTIVE certificate is CertificateStateException
+#   406), so it is not policy evaluation and not a credential check; a
+#   deactivated certificate stops working, which is what makes deactivation
+#   mean anything and what real AWS IoT does. The ambiguous case cannot be
+#   attributed at all: two registrations see byte-identical bytes, so any
+#   tie-break would award the session to whoever registered the copy.
+#
+# The TLS layer adds one constraint of its own: a presented chain is verified,
+# so a certificate from a CA the listener does not trust fails the handshake
+# before any of the above. The trusted set is the Local CA plus every ACTIVE
+# CA in the registry.
+
+_MTLS_DEFAULT_PORT = 8883
+_MTLS_READ_CHUNK = 65536
+# How long a client whose certificate was refused gets to send its CONNECT
+# before the connection is dropped without a CONNACK.
+_MTLS_REFUSE_READ_TIMEOUT = 5.0
+_MTLS_REFUSE_MAX_BYTES = 8192
+
+_mtls_logger = logging.getLogger("iot_mtls")
+_mtls_server: asyncio.AbstractServer | None = None
+_mtls_loop: asyncio.AbstractEventLoop | None = None
+_mtls_lock = asyncio.Lock()
+# Every live connection's writer, so that stopping the listener can close them
+# deliberately and in bounded time (see ``mtls_stop``).
+_mtls_sessions: set[asyncio.StreamWriter] = set()
+# Digests of the trust anchors already loaded into the live TLS context;
+# emptied whenever a context is built, since a fresh one starts with none.
+_mtls_loaded_anchors: set[str] = set()
+
+import importlib.util as _importlib_util
+
+_CRYPTOGRAPHY_AVAILABLE = _importlib_util.find_spec("cryptography") is not None
+
+
+def _mtls_is_truthy(value: str) -> bool:
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _mtls_port() -> int | None:
+    """The listener port, or None when the configured value is unusable."""
+    raw = os.environ.get("IOT_MTLS_PORT", "").strip()
+    if not raw:
+        return _MTLS_DEFAULT_PORT
+    try:
+        port = int(raw)
+    except ValueError:
+        _mtls_logger.warning(
+            "IoT mTLS: IOT_MTLS_PORT=%r is not a number; listener disabled", raw
+        )
+        return None
+    if not 0 < port < 65536:
+        _mtls_logger.warning(
+            "IoT mTLS: IOT_MTLS_PORT=%d is not a usable port; listener disabled", port
+        )
+        return None
+    return port
+
+
+def mtls_enabled() -> bool:
+    """True when the listener should run.
+
+    The same two conditions the SFTP listener uses, in the same order: the
+    optional dependency has to be importable (no ``cryptography`` means no CA
+    to mint a server certificate from, so the listener stays off rather than
+    failing the boot), and ``IOT_MTLS_ENABLED`` has to be unset or truthy.
+    """
+    if not _CRYPTOGRAPHY_AVAILABLE:
+        return False
+    raw = os.environ.get("IOT_MTLS_ENABLED")
+    if raw is not None and not _mtls_is_truthy(raw):
+        return False
+    return _mtls_port() is not None
+
+
+def _mtls_server_cert_sans() -> tuple[list[str], list[str]]:
+    """(dns_names, ip_addresses) for the listener's certificate.
+
+    Device SDKs verify the broker hostname, so the certificate carries every
+    name a device plausibly dials: the loopbacks, this machine's hostname (the
+    name compose networks resolve a container by), and ``MINISTACK_HOST``.
+    """
+    import ipaddress
+    import socket as _socket
+
+    dns_names = ["localhost"]
+    ip_addresses = ["127.0.0.1", "::1"]
+    candidates = [os.environ.get("MINISTACK_HOST", "localhost"), _socket.gethostname()]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError:
+            if candidate not in dns_names:
+                dns_names.append(candidate)
+        else:
+            if candidate not in ip_addresses:
+                ip_addresses.append(candidate)
+    return dns_names, ip_addresses
+
+
+def _mtls_cert_is_reusable(cert_pem: str, ca_cert_pem: str) -> bool:
+    """True when a persisted server certificate still matches the current CA
+    and still covers every configured name."""
+    from cryptography import x509
+
+    # The CA subject name is a constant, so issuer equality alone would also
+    # accept a leaf signed by a *previous* CA generation — which is exactly
+    # what a reset leaves behind. certificate_is_signed_by verifies the
+    # signature as well.
+    if not certificate_is_signed_by(cert_pem, ca_cert_pem):
+        return False
+    try:
+        leaf = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+        san = leaf.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        present = {str(v) for v in san.get_values_for_type(x509.DNSName)}
+        present |= {str(v) for v in san.get_values_for_type(x509.IPAddress)}
+        wanted_dns, wanted_ips = _mtls_server_cert_sans()
+        return set(wanted_dns) <= present and set(wanted_ips) <= present
+    except Exception:
+        return False
+
+
+def _mtls_ensure_server_cert() -> tuple[str, str]:
+    """Return the listener's (cert_pem, key_pem), minting one when needed.
+
+    A persisted certificate is reused as long as the current CA signed it and
+    it still carries every configured SAN, so devices keep their pinned chain
+    across restarts.
+    """
+    from ministack.core.x509_utils import sign_leaf_certificate
+
+    ca_cert_pem, ca_key_pem = _ensure_ca()
+    cert_pem, key_pem = get_mtls_server_cert()
+    if cert_pem and key_pem and _mtls_cert_is_reusable(cert_pem, ca_cert_pem):
+        return cert_pem, key_pem
+
+    dns_names, ip_addresses = _mtls_server_cert_sans()
+    cert_pem, key_pem, _public_pem = sign_leaf_certificate(
+        ca_cert_pem,
+        ca_key_pem,
+        common_name="Ministack IoT Broker",
+        san_dns=dns_names,
+        san_ips=ip_addresses,
+    )
+    set_mtls_server_cert(cert_pem, key_pem)
+    _mtls_logger.info(
+        "IoT mTLS: issued broker certificate for %s", ", ".join(dns_names + ip_addresses)
+    )
+    return cert_pem, key_pem
+
+
+def _mtls_registered_ca_pems() -> list[str]:
+    """ACTIVE CA certificates from the CA registry, across every scope.
+
+    The store is scoped by account and region; a single listener serves every
+    tenant, so it is read across all scopes. Only ACTIVE CAs qualify:
+    registering a CA without activating it is how AWS says "not yet", and
+    honouring that keeps ``UpdateCACertificate`` meaningful for connections
+    opened after it.
+    """
+    pems = []
+    for record in list(_ca_certificates._data.values()):
+        if not isinstance(record, dict) or record.get("status") != "ACTIVE":
+            continue
+        pem = record.get("certificatePem")
+        if isinstance(pem, str) and pem.strip():
+            pems.append(pem)
+    return pems
+
+
+def _mtls_trust_anchors() -> list[str]:
+    """CAs whose client certificates verify at the TLS layer: the Local CA plus
+    every ACTIVE registered CA. Presenting a certificate is optional, so this
+    set only decides which presented chains survive the handshake; who a
+    session belongs to is decided afterwards, in ``_mtls_serve_conn``."""
+    return [get_ca_cert_pem(), *_mtls_registered_ca_pems()]
+
+
+def _mtls_refresh_trust_anchors(ctx: ssl.SSLContext) -> None:
+    """Load every anchor the context does not already have.
+
+    Anchors are loaded one PEM at a time so that a single unparseable
+    registered certificate costs only itself, and each is remembered — by
+    digest, including the ones that failed — so a handshake never repeats the
+    work or the warning. ``load_verify_locations`` is additive and a live
+    context cannot forget an anchor, so a CA deactivated after loading stays
+    trusted at the TLS layer until ``reset()`` rebinds; the session-attribution
+    lookup still runs per connection.
+    """
+    for pem in _mtls_trust_anchors():
+        digest = hashlib.sha256(pem.encode("utf-8")).hexdigest()
+        if digest in _mtls_loaded_anchors:
+            continue
+        _mtls_loaded_anchors.add(digest)
+        try:
+            ctx.load_verify_locations(cadata=pem)
+        except Exception as e:
+            _mtls_logger.warning("IoT mTLS: ignoring an unusable trust anchor: %s", e)
+
+
+def _mtls_on_client_hello(
+    ssl_object: ssl.SSLObject, server_name: str | None, ctx: ssl.SSLContext
+) -> None:
+    """Pull newly registered CAs in mid-handshake, before the peer is verified.
+
+    A CA registered while the listener is bound has to be trusted without a
+    restart, and ``sni_callback`` is the only hook that runs late enough to see
+    the current registry yet early enough to matter. It runs on every
+    handshake, including those carrying no server name — which is what a
+    device dialling the broker by IP sends. An exception here aborts the
+    handshake with an internal-error alert, so nothing is allowed to escape.
+    """
+    try:
+        _mtls_refresh_trust_anchors(ctx)
+    except Exception:
+        _mtls_logger.warning("IoT mTLS: trust-anchor refresh failed", exc_info=True)
+
+
+def _mtls_build_ssl_context() -> ssl.SSLContext:
+    import tempfile
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    # Optional, not required: the WebSocket path accepts any client, and this
+    # transport keeps that default. A presented certificate is verified (that
+    # is the TLS layer's rule, not ours) and then used purely as a tenancy
+    # signal; absence of one falls back the same way an unsigned WS upgrade
+    # does.
+    ctx.verify_mode = ssl.CERT_OPTIONAL
+    cert_pem, key_pem = _mtls_ensure_server_cert()
+    # load_cert_chain only takes paths; a combined cert+key file is the least
+    # material to leave on disk, and it is unlinked before the handshake.
+    with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
+        fh.write(cert_pem)
+        fh.write(key_pem)
+        chain_path = fh.name
+    try:
+        ctx.load_cert_chain(chain_path)
+    finally:
+        try:
+            os.unlink(chain_path)
+        except OSError:
+            pass
+    _mtls_loaded_anchors.clear()
+    _mtls_refresh_trust_anchors(ctx)
+    ctx.sni_callback = _mtls_on_client_hello
+    return ctx
+
+
+async def mtls_start() -> None:
+    """Idempotent: bind the mTLS MQTT listener, unless disabled."""
+    if not mtls_enabled():
+        _mtls_logger.info("IoT mTLS: disabled (cryptography missing or IOT_MTLS_ENABLED=0)")
+        return
+    async with _mtls_lock:
+        await _mtls_start_locked()
+
+
+async def mtls_stop() -> None:
+    """Close the listener and, with it, the sessions running on it.
+
+    Bounded by construction, whatever is connected: the listening socket is
+    closed synchronously and each live connection is aborted, so nothing here
+    waits on a peer to acknowledge anything.
+
+    Note what is deliberately *not* here — ``await server.wait_closed()``.
+    Since Python 3.12.1 that waits for every established connection to finish
+    as well as for the acceptor, which for a broker means "until the last
+    device disconnects", i.e. indefinitely. Awaiting it while holding the lock
+    wedged both callers: ``lifespan.shutdown`` hung with a device attached, and
+    a ``reset()`` rebind never reached its start half.
+
+    Devices are disconnected rather than left running: on shutdown the process
+    is going away, and on ``reset()`` the CA that signed their certificates has
+    just been dropped. Device SDKs reconnect on their own.
+    """
+    async with _mtls_lock:
+        await _mtls_stop_locked()
+
+
+async def _mtls_start_locked() -> None:
+    global _mtls_server, _mtls_loop
+    if _mtls_server is not None:
+        return
+    port = _mtls_port()
+    if port is None:
+        return
+    try:
+        # Building the context can mint the server certificate — and, on first
+        # boot, the CA — which is RSA keygen, so keep it off the event loop.
+        ctx = await asyncio.to_thread(_mtls_build_ssl_context)
+    except Exception as e:
+        _mtls_logger.warning(
+            "IoT mTLS: could not build the TLS context (%s); listener unavailable", e
+        )
+        return
+    try:
+        _mtls_server = await asyncio.start_server(
+            _mtls_handle_conn, host="0.0.0.0", port=port, ssl=ctx
+        )
+    except OSError as e:
+        _mtls_logger.warning(
+            "IoT mTLS: failed to bind port %d (%s); listener unavailable", port, e
+        )
+        _mtls_server = None
+        return
+    _mtls_loop = asyncio.get_running_loop()
+    _mtls_logger.info(
+        "IoT mTLS: MQTT listening on port %d (client certificate optional)", port
+    )
+
+
+async def _mtls_stop_locked() -> None:
+    global _mtls_server
+    if _mtls_server is None and not _mtls_sessions:
+        return
+    if _mtls_server is not None:
+        try:
+            _mtls_server.close()
+        except Exception as e:
+            _mtls_logger.debug("IoT mTLS: error closing the listener: %s", e)
+        _mtls_server = None
+    for writer in list(_mtls_sessions):
+        try:
+            # abort(), not close(): closing a TLS transport sends close_notify
+            # and then waits for the peer's, which a device that has stopped
+            # reading never sends — the same unbounded wait this function
+            # exists to avoid, just one layer down.
+            writer.transport.abort()
+        except Exception as e:
+            _mtls_logger.debug("IoT mTLS: error closing a session: %s", e)
+    _mtls_sessions.clear()
+    _mtls_loaded_anchors.clear()
+    _mtls_logger.info("IoT mTLS: stopped")
+
+
+async def _mtls_restart() -> None:
+    """Rebind with fresh TLS material, under a single lock acquisition, so two
+    resets in flight cannot interleave and no connection is accepted against
+    half-replaced material."""
+    try:
+        async with _mtls_lock:
+            await _mtls_stop_locked()
+            if mtls_enabled():
+                await _mtls_start_locked()
+    except Exception:
+        _mtls_logger.warning("IoT mTLS: restart failed", exc_info=True)
+
+
+def mtls_schedule_restart() -> None:
+    """Rebind the listener with fresh TLS material, from any thread.
+
+    ``reset()`` runs in a worker thread, so it cannot await; it hands the
+    restart back to the event loop the listener was bound on. The rebind
+    disconnects whatever was attached: the CA those sessions were admitted on
+    no longer exists.
+    """
+    loop = _mtls_loop
+    if loop is None or loop.is_closed():
+        return
+    try:
+        loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_mtls_restart()))
+    except RuntimeError as e:
+        _mtls_logger.debug("IoT mTLS: could not schedule a restart: %s", e)
+
+
+def _mtls_active_registrations(cert_id: str) -> list[tuple[str, str, dict]]:
+    """Every (account_id, region, record) holding this certificate ACTIVE."""
+    return [
+        (account_id, region, record)
+        for (account_id, region, key), record in list(_certificates._data.items())
+        if key == cert_id and isinstance(record, dict) and record.get("status") == "ACTIVE"
+    ]
+
+
+def _mtls_refusal_reason(cert_id: str) -> str:
+    """Why a presented certificate was refused, for the log line, including the
+    ambiguous case, which is the one an operator needs spelled out."""
+    active = _mtls_active_registrations(cert_id)
+    if len(active) > 1:
+        scopes = ", ".join(f"{a}/{r}" for a, r, _record in sorted(active, key=lambda m: m[:2]))
+        return f"registered ACTIVE in {len(active)} scopes ({scopes}); owner is ambiguous"
+    for (_account_id, _region, key), record in list(_certificates._data.items()):
+        if key == cert_id and isinstance(record, dict):
+            return f"status {record.get('status')!r}"
+    return "not registered"
+
+
+def _mtls_resolve_identity(der: bytes | None) -> tuple[str, str] | None:
+    """Map a peer certificate (or none) to (account_id, region), or None.
+
+    None means "this connection is refused". Presenting no certificate is not
+    refused: that caller claims nothing and is served under the default
+    account, the same way ``_ws_resolve_iot_account_id`` treats an unsigned
+    WebSocket upgrade. A certificate that IS presented is read against the
+    registry, which is the identity lifecycle this service already keeps:
+    ACTIVE in exactly one account selects it, and unknown, not ACTIVE, or
+    ACTIVE in several accounts is refused by the caller with a "not
+    authorized" CONNACK.
+    """
+    if not der:
+        return (
+            os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000"),
+            os.environ.get("MINISTACK_REGION", "us-east-1"),
+        )
+    # Same derivation as x509_utils.get_certificate_id, without a PEM round-trip.
+    cert_id = hashlib.sha256(der).hexdigest()
+    active = _mtls_active_registrations(cert_id)
+    if len(active) == 1:
+        account_id, region, _record = active[0]
+        return account_id, region
+    return None
+
+
+async def _mtls_refuse(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, cert_id: str
+) -> None:
+    """Answer an unusable client certificate with a "not authorized" CONNACK
+    (0x05, or reason code 0x87 for an MQTT 5 client), then close.
+
+    AWS closes the socket without a CONNACK unless just-in-time registration
+    applies. Diverging here is deliberate: an emulator's job is
+    diagnosability, "not authorized" is reported cleanly by every device SDK,
+    and a TLS-layer rejection could not tell the user "unknown" from
+    "deactivated".
+    """
+    _mtls_logger.warning(
+        "IoT mTLS: refusing client certificate %s (%s)", cert_id, _mtls_refusal_reason(cert_id)
+    )
+    buffer = bytearray()
+    try:
+        while len(buffer) < _MTLS_REFUSE_MAX_BYTES:
+            data = await asyncio.wait_for(
+                reader.read(_MTLS_READ_CHUNK), timeout=_MTLS_REFUSE_READ_TIMEOUT
+            )
+            if not data:
+                return
+            buffer.extend(data)
+            if len(buffer) < 2:
+                continue
+            try:
+                remaining, header_end = _decode_remaining_length(bytes(buffer), 1)
+            except ValueError:
+                continue
+            if len(buffer) < header_end + remaining:
+                continue
+            if (buffer[0] >> 4) & 0x0F == PKT_CONNECT:
+                # The CONNACK has to match the client's protocol level: a v5
+                # client handed the two-byte 3.1.1 form dies in its decoder
+                # instead of reporting the refusal, and 0x05 is not a defined
+                # v5 reason code.
+                body = bytes(buffer[header_end:header_end + remaining])
+                try:
+                    _proto_name, level_at = _read_string(body, 0)
+                    protocol_level = body[level_at]
+                except (ValueError, IndexError):
+                    protocol_level = MQTT_311
+                if protocol_level == MQTT_5:
+                    connack = _make_connack(
+                        return_code=RC5_NOT_AUTHORIZED, protocol_version=MQTT_5
+                    )
+                else:
+                    connack = _make_connack(return_code=CONNACK_311_NOT_AUTHORIZED)
+                writer.write(connack)
+                await writer.drain()
+            return
+    except (asyncio.TimeoutError, OSError, ssl.SSLError):
+        return
+
+
+async def _mtls_close(writer: asyncio.StreamWriter) -> None:
+    try:
+        writer.close()
+        await writer.wait_closed()
+    except (OSError, ssl.SSLError):
+        pass
+
+
+async def _mtls_handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """Track the connection for as long as it lives, then serve it, so that
+    ``mtls_stop`` can close every peer in bounded time."""
+    _mtls_sessions.add(writer)
+    try:
+        await _mtls_serve_conn(reader, writer)
+    finally:
+        _mtls_sessions.discard(writer)
+
+
+async def _mtls_serve_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    ssl_object = writer.get_extra_info("ssl_object")
+    der = ssl_object.getpeercert(binary_form=True) if ssl_object is not None else None
+    owner = _mtls_resolve_identity(der)
+    if owner is None:
+        try:
+            await _mtls_refuse(reader, writer, hashlib.sha256(der).hexdigest())
+        finally:
+            await _mtls_close(writer)
+        return
+    account_id, region = owner
+
+    async def _tcp_send(message: dict) -> None:
+        """Adapter for the two ASGI messages a session ever sends."""
+        message_type = message.get("type")
+        if message_type == "websocket.send":
+            writer.write(message["bytes"])
+            await writer.drain()
+        elif message_type == "websocket.close":
+            writer.close()
+
+    account_token = _request_account_id.set(account_id)
+    region_token = _request_region.set(region)
+    session = _WSSession(_tcp_send, account_id, region)
+    max_buffer = _max_frame_buffer_bytes()
+    _mtls_logger.info(
+        "IoT mTLS: connection from %s serving %s/%s (%s)",
+        writer.get_extra_info("peername"),
+        account_id,
+        region,
+        "certificate presented" if der else "no client certificate",
+    )
+    try:
+        while True:
+            data = await reader.read(_MTLS_READ_CHUNK)
+            if not data:
+                break
+            if not await _feed_session(session, data, max_buffer):
+                break
+    except (OSError, ssl.SSLError) as e:
+        _mtls_logger.debug("IoT mTLS: connection dropped: %s", e)
+    except Exception:
+        _mtls_logger.exception("IoT mTLS session failed")
+    finally:
+        try:
+            await session.cleanup()
+        except Exception:
+            _mtls_logger.exception("IoT mTLS: session cleanup failed")
+        for var, token in ((_request_account_id, account_token), (_request_region, region_token)):
+            try:
+                var.reset(token)
+            except ValueError:
+                pass
+        await _mtls_close(writer)

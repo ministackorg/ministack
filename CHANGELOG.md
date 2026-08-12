@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **IoT Core — native mTLS MQTT listener on port 8883** — the embedded broker spoke MQTT only over WebSocket, so AWS IoT Device SDK binaries could not connect. The broker now also listens for MQTT over TLS on port 8883 (`IOT_MTLS_ENABLED=0` turns it off, `IOT_MTLS_PORT` moves it), on by default when `cryptography` is available, configured exactly like the Transfer Family SFTP listener. The broker certificate is minted from the local CA (`GET /_ministack/iot/ca.pem`). The client certificate is optional and follows the rule S3 applies to a presigned URL: a client that presents none is served under `MINISTACK_ACCOUNT_ID`, exactly like an unsigned MQTT-over-WebSocket upgrade, while one that presents a certificate has it read against the registry. Registered `ACTIVE` in exactly one account serves that account and region; unknown, not `ACTIVE`, or `ACTIVE` in several accounts is refused with a "not authorized" CONNACK (0x05, reason code 0x87 for MQTT 5 clients), so `UpdateCertificate` to `INACTIVE` cuts a device off the way it does on AWS. Contributed by @iot-rocket.
+
 ## [1.4.20] — 2026-08-19
 
 ### Added
