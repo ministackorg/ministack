@@ -617,6 +617,60 @@ def _match_recursive(resources, parent_id, segments, params):
     return None, params
 
 
+def _match_greedy_fallback(api_id, segments, http_method):
+    """Fallback for a path-matched resource that does not serve this verb.
+
+    API Gateway resolves on the resource+method pair. A resource only keeps the
+    request when it declares the verb being asked for; otherwise the request
+    falls through to a greedy `{proxy+}` elsewhere in the tree. Measured on real
+    AWS, all three of these fall through: a node with no methods at all (`/jobs`,
+    existing only as the parent of `/jobs/{operation_type}`), a node carrying
+    only a CORS `OPTIONS` preflight, and a node declaring some other verb.
+
+    That includes the case where the sibling's declared method is guarded: an
+    open root `{proxy+} ANY` does serve `GET /admin` while `/admin POST` is
+    `AWS_IAM`-protected, because routing happens before authorization. It reads
+    like an auth bypass and it is worth knowing about, but it is what the
+    service does, so it is what this emulates.
+
+    Finds the most specific `{proxy+}` resource whose parent path is a prefix
+    of the request path AND that defines the method (or ANY) — which may be a
+    sibling of the methodless node, not only an ancestor. Literal prefix
+    segments must match exactly; `{param}` prefix segments capture. Returns
+    ``(resource, path_params)`` or ``(None, None)`` — callers keep their
+    existing rejection when nothing can serve the method.
+    """
+    resources = _resources.get(api_id, {})
+    best = None
+    for res in resources.values():
+        part = res.get("pathPart", "")
+        if not (part.startswith("{") and part.endswith("+}")):
+            continue
+        methods = res.get("resourceMethods") or {}
+        if http_method not in methods and "ANY" not in methods:
+            continue
+        prefix = [s for s in res.get("path", "").strip("/").split("/")[:-1] if s]
+        # {proxy+} must consume at least one segment.
+        if len(prefix) >= len(segments):
+            continue
+        params = {}
+        matched = True
+        for want, got in zip(prefix, segments):
+            if want.startswith("{") and want.endswith("}") and not want.endswith("+}"):
+                params[want[1:-1]] = got
+            elif want != got:
+                matched = False
+                break
+        if not matched:
+            continue
+        params[part[1:-2]] = "/".join(segments[len(prefix):])
+        if best is None or len(prefix) > best[0]:
+            best = (len(prefix), res, params)
+    if best is None:
+        return None, None
+    return best[1], best[2]
+
+
 def _extract_lambda_ref_from_integration_uri(uri: str) -> str:
     """Pull the Lambda reference out of an integration URI.
 
@@ -1596,11 +1650,20 @@ async def _handle_execute_in_scope(
     resource_methods = resource.get("resourceMethods", {})
     method_obj = resource_methods.get(method) or resource_methods.get("ANY")
     if not method_obj:
-        # A matched resource with no method for this verb — including a
-        # methodless intermediate node (e.g. `/jobs` created only as the parent
-        # of `/jobs/{op}`) — is an "unsupported method" in API Gateway, which
-        # answers 403 MISSING_AUTHENTICATION_TOKEN (not 405, and it does not
-        # fall through to a {proxy+} sibling: the specific resource wins).
+        # The path matched a resource, but that resource does not serve this
+        # verb. API Gateway routes on the resource+method PAIR, so the request
+        # falls through to a `{proxy+}` elsewhere in the tree; only an exact
+        # match keeps the request on the specific resource. Measured against
+        # real AWS (see this commit's message): a node with no methods at all,
+        # a node carrying only an `OPTIONS` preflight, and a node declaring a
+        # different verb all fall through.
+        fb_resource, fb_params = _match_greedy_fallback(api_id, segments, method)
+        if fb_resource is not None:
+            resource, path_params = fb_resource, fb_params
+            resource_methods = resource.get("resourceMethods", {})
+            method_obj = resource_methods.get(method) or resource_methods.get("ANY")
+    if not method_obj:
+        # Nothing in the tree serves this verb for this path.
         return _gw_error(403, "Missing Authentication Token")
 
     integration = method_obj.get("methodIntegration")

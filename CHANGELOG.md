@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **API Gateway (REST) — a request the matched resource does not serve falls through to `{proxy+}`** — API Gateway resolves on the resource+method pair, but a path-matched resource kept the request whatever verb was asked for, answering `403 Missing Authentication Token` even when a `{proxy+}` elsewhere in the tree was wired for it. That hit three shapes in practice: an intermediate node created only as the parent of a deeper one (`/jobs` under `/jobs/{op}`), the same node once a CORS `OPTIONS` preflight is added to it (what CDK and Serverless generate), and any resource asked for a verb it does not declare. All three now fall through, and only an exact resource+method match keeps a request on the specific resource. Measured against real API Gateway before changing anything, including the consequence that a guarded sibling method does not hold the path: with `/admin POST` at `AWS_IAM` and an open `{proxy+} ANY`, an unsigned `GET /admin` is served by the proxy, because routing precedes authorization. This supersedes the 1.4.16 change that made a methodless resource answer `403`. Contributed by @iot-rocket.
+
 ## [1.4.19] — 2026-08-16
 
 ### Added
