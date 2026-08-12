@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **AWS IoT Jobs — control plane and device data plane** — `CreateJob` fell through to `Unsupported IoT path` and the `iot-jobs-data` endpoint did not exist, so device OTA loops could not be rehearsed locally. The `iot` service now serves the nine job operations and a new `iot-jobs-data` service the four device ones (incl. the `$next` sentinel), sharing one store and the AWS execution state machine. A `documentSource` job gets a placeholder, not the S3 object. Contributed by @iot-rocket.
+
 ## [1.4.19] — 2026-08-16
 
 ### Added
