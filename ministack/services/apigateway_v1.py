@@ -610,6 +610,13 @@ def _match_recursive(resources, parent_id, segments, params):
 
 
 def _extract_lambda_ref_from_integration_uri(uri: str) -> str:
+    """Pull the Lambda reference out of an integration URI.
+
+    Supported URI formats:
+      1. arn:aws:apigateway:{region}:lambda:path/2015-03-31/functions/arn:aws:lambda:{region}:{acct}:function:{name}[:{qualifier}]/invocations
+      2. arn:aws:lambda:{region}:{acct}:function:{name}[:{qualifier}]
+      3. plain function name: MyFunction[:{qualifier}]
+    """
     if not uri:
         return ""
     if "/functions/" in uri:
@@ -622,12 +629,22 @@ def _extract_lambda_ref_from_integration_uri(uri: str) -> str:
     return uri
 
 
-async def _call_lambda(function_ref, event, *, account_id=None, region=None):
-    """Invoke a Lambda function and return the parsed response dict.
+async def _call_lambda_raw(function_ref, event, *, account_id=None, region=None):
+    """Invoke a Lambda function and return its uninterpreted execution record.
 
-    ``function_ref`` may be a name, partial ARN, or full ARN. Full ARNs are
-    resolved through Lambda's scoped lookup so region-qualified integration URIs
-    invoke the function named in the ARN instead of the request/default region."""
+    Returns ``(result, error_msg)`` where ``result["body"]`` is the payload
+    exactly as the function returned it. ``function_ref`` may be a name, partial
+    ARN, or full ARN; full ARNs are resolved through Lambda's scoped lookup so
+    region-qualified integration URIs invoke the function named in the ARN
+    instead of the request/default region.
+
+    Routed through the central ``_execute_function`` dispatcher so CloudWatch
+    Logs emission and Docker log output work for API Gateway invocations.
+
+    Non-proxy (custom) integrations need the raw payload; :func:`_call_lambda`
+    is this plus the AWS_PROXY response shaper, which would rewrite a handler's
+    ``statusCode`` key into the HTTP status.
+    """
     from ministack.services import lambda_svc
 
     func_data, func_config, func_name = lambda_svc._get_func_record_for_ref_in_scope(
@@ -639,12 +656,25 @@ async def _call_lambda(function_ref, event, *, account_id=None, region=None):
         label = function_ref or func_name
         return None, f"Lambda function '{label}' not found"
 
-    # Route through the central _execute_function dispatcher so CloudWatch
-    # Logs emission and Docker log output work for API Gateway invocations.
-    # Response shaping (throttle→429, error→502, body→envelope) goes through
-    # the shared helper so v1/v2 stay consistent.
     exec_record = lambda_svc._execution_record_for_config(func_data, func_config)
     result = await asyncio.to_thread(lambda_svc._execute_function_with_config_scope, exec_record, event)
+    return result, None
+
+
+async def _call_lambda(function_ref, event, *, account_id=None, region=None):
+    """Invoke a Lambda function and return the parsed AWS_PROXY response dict.
+
+    :func:`_call_lambda_raw` plus the shared response shaper (throttle→429,
+    error→502, body→envelope), which is what keeps v1 and v2 consistent.
+    """
+    from ministack.services import lambda_svc
+
+    result, err = await _call_lambda_raw(
+        function_ref, event, account_id=account_id, region=region
+    )
+    if err:
+        return None, err
+
     lambda_response, _ = lambda_svc.lambda_execute_result_to_api_proxy_response(result)
     # On error the helper returns {statusCode: 502, body: <msg>}; preserve
     # the _call_lambda contract of (None, error_msg) so callers that check
@@ -1523,7 +1553,12 @@ async def _handle_execute_in_scope(
     int_type = integration.get("type", "")
 
     if int_type in ("AWS_PROXY", "AWS"):
-        return await _invoke_lambda_proxy_v1(
+        # AWS_PROXY hands the function a response envelope to interpret; the
+        # non-proxy `AWS` (custom / "lambda") integration returns the handler's
+        # output as the body verbatim. Same event in, different response
+        # contract out.
+        invoke = _invoke_lambda_proxy_v1 if int_type == "AWS_PROXY" else _invoke_lambda_custom_v1
+        return await invoke(
             integration, api_id, stage_name, stage, resource, path, method,
             headers, body, query_params, path_params,
             owner_account_id=owner_account_id,
@@ -1560,8 +1595,7 @@ def _media_type_matches(media_type, binary_media_types):
     return False
 
 
-async def _invoke_lambda_proxy_v1(
-    integration,
+def _build_lambda_event_v1(
     api_id,
     stage_name,
     stage,
@@ -1573,19 +1607,17 @@ async def _invoke_lambda_proxy_v1(
     query_params,
     path_params,
     *,
-    owner_account_id=None,
-    owner_region=None,
     binary_media_types=None,
     authorizer_context=None,
 ):
-    """Invoke Lambda with API Gateway v1 payload format 1.0."""
-    uri = integration.get("uri", "")
-    # Supported URI formats:
-    #   1. arn:aws:apigateway:{region}:lambda:path/2015-03-31/functions/arn:aws:lambda:{region}:{acct}:function:{name}[:{qualifier}]/invocations
-    #   2. arn:aws:lambda:{region}:{acct}:function:{name}[:{qualifier}]
-    #   3. plain function name: MyFunction[:{qualifier}]
-    lambda_ref = _extract_lambda_ref_from_integration_uri(uri)
+    """Build the API Gateway v1 payload format 1.0 event handed to Lambda.
 
+    Shared by the AWS_PROXY and the non-proxy (custom) AWS integration paths.
+    The two differ in how the *response* is interpreted, not in what the
+    function is invoked with: a non-proxy integration would normally reshape the
+    request through a `requestTemplates` mapping template, which is not modeled
+    here — the function receives the same synthesized event either way.
+    """
     qs_params = {k: v[0] for k, v in query_params.items()} if query_params else None
     mv_qs_params = {k: list(v) for k, v in query_params.items()} if query_params else None
 
@@ -1648,6 +1680,38 @@ async def _invoke_lambda_proxy_v1(
     if authorizer_context is not None:
         event["requestContext"]["authorizer"] = authorizer_context
 
+    return event
+
+
+async def _invoke_lambda_proxy_v1(
+    integration,
+    api_id,
+    stage_name,
+    stage,
+    resource,
+    request_path,
+    method,
+    headers,
+    body,
+    query_params,
+    path_params,
+    *,
+    owner_account_id=None,
+    owner_region=None,
+    binary_media_types=None,
+    authorizer_context=None,
+):
+    """Invoke Lambda through an AWS_PROXY integration and interpret its
+    `{statusCode, headers, body}` response envelope."""
+    lambda_ref = _extract_lambda_ref_from_integration_uri(integration.get("uri", ""))
+
+    event = _build_lambda_event_v1(
+        api_id, stage_name, stage, resource, request_path, method,
+        headers, body, query_params, path_params,
+        binary_media_types=binary_media_types,
+        authorizer_context=authorizer_context,
+    )
+
     lambda_response, err = await _call_lambda(
         lambda_ref,
         event,
@@ -1699,6 +1763,92 @@ async def _invoke_lambda_proxy_v1(
         resp_body = json.dumps(resp_body, ensure_ascii=False).encode("utf-8")
 
     return status, resp_headers, resp_body
+
+
+def _default_integration_response_status_v1(integration):
+    """The status code a successful non-proxy integration answers with.
+
+    AWS selects the integration response whose ``selectionPattern`` is empty —
+    the default mapping, which handles every invocation that did not fail — and
+    falls back to 200 when the method has no integration responses configured.
+    ``responseTemplates`` / ``responseParameters`` are not modeled; the payload
+    is passed through verbatim.
+    """
+    for code, resp in sorted((integration.get("integrationResponses") or {}).items()):
+        if not (resp or {}).get("selectionPattern"):
+            try:
+                return int((resp or {}).get("statusCode") or code)
+            except (TypeError, ValueError):
+                return 200
+    return 200
+
+
+async def _invoke_lambda_custom_v1(
+    integration,
+    api_id,
+    stage_name,
+    stage,
+    resource,
+    request_path,
+    method,
+    headers,
+    body,
+    query_params,
+    path_params,
+    *,
+    owner_account_id=None,
+    owner_region=None,
+    binary_media_types=None,
+    authorizer_context=None,
+):
+    """Invoke Lambda through a non-proxy (custom) ``AWS`` integration.
+
+    Unlike AWS_PROXY there is no ``{statusCode, headers, body}`` envelope: the
+    function's return value IS the response body, serialized as JSON and sent
+    with the integration response's status code (200 by default). A handler that
+    happens to return a ``statusCode`` key therefore ships that key to the client
+    inside the body instead of having it promoted to the HTTP status.
+
+    A function error answers 502 ``{"message": "Internal server error"}`` —
+    the error payload is never surfaced to the caller.
+    """
+    lambda_ref = _extract_lambda_ref_from_integration_uri(integration.get("uri", ""))
+
+    event = _build_lambda_event_v1(
+        api_id, stage_name, stage, resource, request_path, method,
+        headers, body, query_params, path_params,
+        binary_media_types=binary_media_types,
+        authorizer_context=authorizer_context,
+    )
+
+    result, err = await _call_lambda_raw(
+        lambda_ref,
+        event,
+        account_id=owner_account_id,
+        region=owner_region,
+    )
+    if err:
+        return 502, {"Content-Type": "application/json"}, json.dumps({"message": err}).encode()
+
+    resp_headers = {"Content-Type": "application/json"}
+    if result.get("throttle"):
+        throttle_body = result.get("body") or {}
+        payload = throttle_body if isinstance(throttle_body, dict) else {"message": str(throttle_body)}
+        return 429, resp_headers, json.dumps(payload).encode()
+    if result.get("error"):
+        return 502, resp_headers, json.dumps({"message": "Internal server error"}).encode()
+
+    payload = result.get("body")
+    if payload is None:
+        resp_body = b""
+    elif isinstance(payload, (bytes, bytearray)):
+        resp_body = bytes(payload)
+    else:
+        # The payload is a JSON document, so a bare string comes back quoted —
+        # matching what `lambda invoke` writes and what AWS passes through.
+        resp_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    return _default_integration_response_status_v1(integration), resp_headers, resp_body
 
 
 async def _invoke_http_proxy_v1(integration, path, method, headers, body, query_params, path_params=None):

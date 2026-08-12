@@ -1413,6 +1413,185 @@ def test_apigwv1_execute_lambda_proxy_header_case_override(apigw_v1, lam):
     lam.delete_function(FunctionName=fname)
 
 
+def _deploy_custom_integration_api(
+    apigw_v1, lam, fname, code, path_part,
+    *, integration_type="AWS", with_integration_response=True,
+):
+    """Deploy a REST API whose GET method integrates a freshly created Lambda.
+
+    Defaults to the non-proxy `AWS` integration with the default (empty
+    selectionPattern) integration response. `integration_type="AWS_PROXY"` and
+    `with_integration_response=False` cover the two contrasting cases.
+    Returns (api_id, url)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+
+    api_id = apigw_v1.create_rest_api(name=f"v1-custom-{fname}")["id"]
+    root = next(r for r in apigw_v1.get_resources(restApiId=api_id)["items"] if r["path"] == "/")
+    resource_id = apigw_v1.create_resource(
+        restApiId=api_id,
+        parentId=root["id"],
+        pathPart=path_part,
+    )["id"]
+    apigw_v1.put_method(
+        restApiId=api_id,
+        resourceId=resource_id,
+        httpMethod="GET",
+        authorizationType="NONE",
+    )
+    apigw_v1.put_integration(
+        restApiId=api_id,
+        resourceId=resource_id,
+        httpMethod="GET",
+        type=integration_type,
+        integrationHttpMethod="POST",
+        uri=f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:{fname}/invocations",
+    )
+    if with_integration_response:
+        apigw_v1.put_integration_response(
+            restApiId=api_id,
+            resourceId=resource_id,
+            httpMethod="GET",
+            statusCode="200",
+            selectionPattern="",
+        )
+    dep_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
+    apigw_v1.create_stage(restApiId=api_id, stageName="test", deploymentId=dep_id)
+
+    url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/test/{path_part}"
+    return api_id, url
+
+
+def test_apigwv1_execute_lambda_custom_returns_raw_output(apigw_v1, lam):
+    """A non-proxy (custom) `AWS` integration returns the handler output verbatim.
+
+    Unlike AWS_PROXY there is no `{statusCode, headers, body}` envelope to
+    interpret: the return value IS the response body, serialized as JSON, and
+    the status comes from the integration response (200). A handler that
+    happens to return a `statusCode` key ships that key to the client inside
+    the body — it must NOT be promoted to the HTTP status.
+    """
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-v1-custom-raw-{_uuid.uuid4().hex[:8]}"
+    code = (
+        b"def handler(event, context):\n"
+        b"    return {'statusCode': 418, 'body': 'x', 'nested': {'ok': True}}\n"
+    )
+    api_id, url = _deploy_custom_integration_api(apigw_v1, lam, fname, code, "custom")
+    try:
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        resp = _urlreq.urlopen(req)
+        # The handler's `statusCode` is data, not the HTTP status.
+        assert resp.status == 200
+        assert resp.headers.get("Content-Type") == "application/json"
+        assert json.loads(resp.read()) == {"statusCode": 418, "body": "x", "nested": {"ok": True}}
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+
+
+def test_apigwv1_execute_lambda_custom_function_error_is_502(apigw_v1, lam):
+    """A function error on a non-proxy integration is a 502 with the generic
+    gateway body — AWS never leaks the error payload to the caller."""
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-v1-custom-err-{_uuid.uuid4().hex[:8]}"
+    code = (
+        b"def handler(event, context):\n"
+        b"    raise RuntimeError('kaboom')\n"
+    )
+    api_id, url = _deploy_custom_integration_api(apigw_v1, lam, fname, code, "boom")
+    try:
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        with pytest.raises(_urlerr.HTTPError) as exc:
+            _urlreq.urlopen(req)
+        assert exc.value.code == 502
+        body = json.loads(exc.value.read())
+        assert body == {"message": "Internal server error"}
+        assert "kaboom" not in json.dumps(body)
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+
+
+def test_apigwv1_execute_lambda_custom_without_integration_responses_is_200(
+    apigw_v1, lam
+):
+    """A method with no integrationResponses at all still answers 200.
+
+    put_integration_response is optional, and a method that never called it has
+    nothing to select a status from. AWS answers 200; the status lookup must
+    fall back rather than fail or invent one from the payload.
+    """
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-v1-custom-noresp-{_uuid.uuid4().hex[:8]}"
+    code = (
+        b"def handler(event, context):\n"
+        b"    return {'statusCode': 418, 'body': 'x'}\n"
+    )
+    api_id, url = _deploy_custom_integration_api(
+        apigw_v1, lam, fname, code, "noresp", with_integration_response=False,
+    )
+    try:
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        resp = _urlreq.urlopen(req)
+        assert resp.status == 200
+        assert json.loads(resp.read()) == {"statusCode": 418, "body": "x"}
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+
+
+def test_apigwv1_execute_lambda_proxy_envelope_still_interpreted(apigw_v1, lam):
+    """The AWS_PROXY contract is untouched by the non-proxy split.
+
+    The same handler payload that a custom integration must return verbatim is
+    a response envelope here: `statusCode` becomes the HTTP status and `body`
+    becomes the body. Pinned against the identical handler so a future change
+    to the shared event builder or the type dispatch cannot quietly swap the
+    two contracts.
+    """
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-v1-proxy-pin-{_uuid.uuid4().hex[:8]}"
+    code = (
+        b"def handler(event, context):\n"
+        b"    return {'statusCode': 418, 'body': 'x'}\n"
+    )
+    api_id, url = _deploy_custom_integration_api(
+        apigw_v1, lam, fname, code, "proxypin", integration_type="AWS_PROXY",
+    )
+    try:
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        with pytest.raises(_urlerr.HTTPError) as exc:
+            _urlreq.urlopen(req)
+        assert exc.value.code == 418
+        assert exc.value.read() == b"x"
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+
+
 def test_apigwv1_execute_lambda_proxy_binary_media_types(apigw_v1, lam):
     """REST API (v1) binary support keyed off `binaryMediaTypes`.
 

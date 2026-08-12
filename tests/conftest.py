@@ -83,6 +83,12 @@ _SERIAL_TESTS = {
     "tests/test_apigatewayv2.py::test_apigwv1_path_based_restapi_legacy_user_request",
     "tests/test_apigatewayv2.py::test_apigwv2_named_stage_still_requires_prefix",
     "tests/test_apigatewayv2.py::test_apigwv2_integration_wrapped_function_arn",
+    # Non-proxy (custom) AWS integration tests: same execute-api → Lambda
+    # cold-start shape as the ones above, one function created per test.
+    "tests/test_apigatewayv1.py::test_apigwv1_execute_lambda_custom_returns_raw_output",
+    "tests/test_apigatewayv1.py::test_apigwv1_execute_lambda_custom_function_error_is_502",
+    "tests/test_apigatewayv1.py::test_apigwv1_execute_lambda_custom_without_integration_responses_is_200",
+    "tests/test_apigatewayv1.py::test_apigwv1_execute_lambda_proxy_envelope_still_interpreted",
     # AppSync Lambda-resolver event-shape tests cold-start Lambdas under a 10s
     # urlopen timeout (Test 6 spawns two functions). Same cold-start-under-xdist
     # flakiness as the apigw Lambda tests above — run them in the serial phase.
