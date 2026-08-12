@@ -126,12 +126,16 @@ _retained: dict[str, "_RetainedMessage"] = {}
 
 
 class _RetainedMessage:
-    __slots__ = ("payload", "qos", "topic", "ts")
+    __slots__ = ("payload", "properties", "qos", "topic", "ts")
 
-    def __init__(self, topic: str, payload: bytes, qos: int):
+    def __init__(self, topic: str, payload: bytes, qos: int, properties: bytes = b""):
         self.topic = topic
         self.payload = payload
         self.qos = qos
+        # Encoded MQTT 5 property block forwarded to v5 subscribers, empty for
+        # a message published by a 3.1.1 client. Runtime only: properties are
+        # not part of the persisted retained-message state.
+        self.properties = properties
         self.ts = time.time()
 
 
@@ -3120,12 +3124,12 @@ def delete_thing_shadow(thing_name: str, shadow_name: str) -> tuple:
 
 
 # ===========================================================================
-# MQTT Broker — embedded MQTT 3.1.1 broker logic over WebSocket
+# MQTT Broker — embedded MQTT 3.1.1 + 5.0 broker logic over WebSocket
 # ===========================================================================
 #
-# The broker owns a small in-process pub/sub registry plus an MQTT 3.1.1
-# framing layer used between the broker and WebSocket clients (per the AWS
-# WS-MQTT subprotocol).
+# The broker owns a small in-process pub/sub registry plus an MQTT framing
+# layer used between the broker and WebSocket clients (per the AWS WS-MQTT
+# subprotocol).
 #
 # Architecture (mirrors Transfer Family's shared SFTP listener):
 #   Client → WebSocket (gateway port) → Bridge → in-memory pub/sub
@@ -3134,6 +3138,37 @@ def delete_thing_shadow(thing_name: str, shadow_name: str) -> tuple:
 # PUBLISH/SUBSCRIBE topic seen on the wire is internally prefixed with the
 # caller's account_id and region before it hits the registry, and the prefix
 # is stripped on outbound delivery.
+#
+# Protocol version
+# ----------------
+# The CONNECT packet's protocol level picks the wire format for the rest of
+# the connection: 4 selects MQTT 3.1.1, 5 selects MQTT 5.0, anything else is
+# refused with a 3.1.1 CONNACK carrying return code 0x01 (unacceptable
+# protocol version) so the client sees a diagnosable answer instead of a
+# mis-framed one. The level is per connection and per session — a 3.1.1
+# publisher and a 5.0 subscriber talk to each other through the same
+# registry, each seeing its own framing.
+#
+# MQTT 5 support is deliberately partial: enough that a real SDK connects,
+# subscribes, publishes, receives and disconnects cleanly. Implemented are
+# property blocks on every packet that carries one, all four fields of the
+# subscription-options byte (QoS, No Local, Retain As Published, Retain
+# Handling), v5 reason codes on CONNACK/SUBACK/PUBACK/UNSUBACK/DISCONNECT, an
+# assigned client identifier, and pass-through of the PUBLISH properties a
+# subscriber may echo back. Out of scope, and advertised as unavailable in
+# CONNACK where the protocol has a flag for it: shared subscriptions, topic
+# aliases, message expiry, flow control (receive maximum), subscription
+# identifiers, and request/response semantics beyond forwarding the
+# properties untouched. Properties this broker does not model are parsed and
+# ignored, never echoed back.
+#
+# Two further limits are worth naming because the protocol has no flag to
+# advertise them. A stored session keeps its topic filters but not the
+# subscription options they arrived with, so a resumed subscription comes back
+# at the defaults. And Session Expiry Interval is honoured as an interval —
+# 0 means do not persist, 0xFFFFFFFF means never expire — but only when a
+# session is looked at, on reconnect or when a QoS 1 message hunts for offline
+# sessions to queue for; nothing reaps expired sessions on a timer.
 
 _broker_logger = logging.getLogger("iot_broker")
 
@@ -3147,34 +3182,78 @@ _persistent_sessions: dict[tuple[str, str, str], "_PersistentSessionState"] = {}
 _broker_lock = asyncio.Lock()
 
 _SESSION_EXPIRY_SECONDS: int = int(os.environ.get("IOT_SESSION_EXPIRY_SECONDS", "3600"))
+# MQTT 5 §3.1.2.11.2: 0xFFFFFFFF means the session never expires.
+_SESSION_EXPIRY_NEVER = 0xFFFFFFFF
 _MAX_QUEUED_MESSAGES = 1000
 
 
 class _PersistentSessionState:
-    __slots__ = ("subscriptions", "queued_messages", "created_at")
+    __slots__ = ("subscriptions", "queued_messages", "created_at", "expiry_interval")
 
-    def __init__(self, subscriptions: list[str], created_at: float):
+    def __init__(
+        self,
+        subscriptions: list[str],
+        created_at: float,
+        expiry_interval: int | None = None,
+    ):
         self.subscriptions: list[str] = subscriptions
         self.queued_messages: list[tuple[str, bytes, int]] = []
         self.created_at: float = created_at
+        # Seconds this session outlives its connection, as the client asked
+        # for it in the MQTT 5 Session Expiry Interval. None means the client
+        # named no interval (every 3.1.1 client, and a v5 client that omitted
+        # the property), so the module-wide default applies.
+        self.expiry_interval: int | None = expiry_interval
 
 
 def _is_session_expired(session_state: _PersistentSessionState) -> bool:
-    return (time.time() - session_state.created_at) > _SESSION_EXPIRY_SECONDS
+    """Whether a stored session has outlived its expiry interval.
+
+    Evaluated on access — when a client reconnects and when a QoS 1 message
+    looks for offline sessions to queue for — not by a timer. An expired
+    session is therefore never resumed and never queued for, but its entry
+    survives in ``_persistent_sessions`` until something touches that key or
+    the broker is reset. Reaping on a schedule would need a timer this broker
+    deliberately does not run.
+    """
+    interval = session_state.expiry_interval
+    if interval is None:
+        interval = _SESSION_EXPIRY_SECONDS
+    if interval >= _SESSION_EXPIRY_NEVER:
+        return False
+    return (time.time() - session_state.created_at) > interval
 
 
 class _InFlightMessage:
-    __slots__ = ("packet_id", "topic", "payload", "sent_at", "retransmit_count")
+    __slots__ = (
+        "packet_id", "topic", "payload", "properties", "retain", "sent_at",
+        "retransmit_count",
+    )
 
-    def __init__(self, packet_id: int, topic: str, payload: bytes):
+    def __init__(self, packet_id: int, topic: str, payload: bytes, properties: bytes = b"",
+                 retain: bool = False):
         self.packet_id = packet_id
         self.topic = topic
         self.payload = payload
+        # Encoded MQTT 5 property block and the RETAIN flag the first attempt
+        # went out with, so a retransmit repeats the original packet rather
+        # than a stripped or reflagged one.
+        self.properties = properties
+        self.retain = retain
         self.sent_at = asyncio.get_event_loop().time()
         self.retransmit_count = 0
 
 
 _RETRANSMIT_INTERVAL_SECONDS = int(os.environ.get("IOT_RETRANSMIT_SECONDS", "10"))
+
+
+# MQTT 5 Retain Handling (§3.8.3.1), the one subscription option that is spent
+# at subscribe time: send retained messages on every SUBSCRIBE, send them only
+# when this subscription is new, or never send them. 0 is also what a 3.1.1
+# SUBSCRIBE means, since it has no options byte.
+RETAIN_HANDLING_SEND_ALWAYS = 0
+RETAIN_HANDLING_SEND_IF_NEW = 1
+RETAIN_HANDLING_SEND_NEVER = 2
 
 
 class _Subscription:
@@ -3185,6 +3264,9 @@ class _Subscription:
         "region",
         "deliver",
         "granted_qos",
+        "client_id",
+        "no_local",
+        "retain_as_published",
     )
 
     def __init__(
@@ -3194,6 +3276,9 @@ class _Subscription:
         region: str,
         deliver: Callable[[str, bytes, int], Awaitable[None]],
         granted_qos: int = 0,
+        client_id: str | None = None,
+        no_local: bool = False,
+        retain_as_published: bool = False,
     ):
         self.subscription_id = uuid.uuid4().hex
         self.filter_prefixed = filter_prefixed
@@ -3201,6 +3286,15 @@ class _Subscription:
         self.region = region
         self.deliver = deliver
         self.granted_qos = granted_qos
+        # Owning MQTT client, when there is one. iot_data's HTTP publishes and
+        # in-process subscribers have no client identity, which is what No
+        # Local compares against — a subscriber with no identity can never be
+        # the publisher.
+        self.client_id = client_id
+        # MQTT 5 subscription options (§3.8.3.1). Retain Handling is consumed
+        # at subscribe time and so is not kept here.
+        self.no_local = no_local
+        self.retain_as_published = retain_as_published
 
     def __hash__(self) -> int:
         return hash(self.subscription_id)
@@ -3618,8 +3712,24 @@ async def broker_publish(
     payload: bytes,
     qos: int = 0,
     retain: bool = False,
+    properties: bytes = b"",
     client_id: str | None = None,
-) -> None:
+) -> int:
+    """Deliver a message to every matching subscriber.
+
+    ``properties`` is an encoded MQTT 5 property block forwarded verbatim to
+    v5 subscribers (empty for a 3.1.1 publisher or an HTTP publish). Returns
+    how many recipients the message reached — subscribers delivered to plus
+    offline persistent sessions it was queued for — which is what an MQTT 5
+    PUBACK reports as Success versus No matching subscribers.
+
+    ``client_id`` names the publishing MQTT client, which is what a No Local
+    subscription is defined against (§3.8.3.1): that subscriber does not want
+    its own messages back. A publish with no client identity — iot_data's HTTP
+    Publish, a rule, an in-process caller — matches no subscriber's identity
+    and so is delivered to all of them.
+    """
+    delivered = 0
     # Basic Ingest: a publish to `$aws/rules/<ruleName>` is delivered straight
     # to that rule's actions and bypasses pub/sub delivery entirely.
     if topic.startswith(_BASIC_INGEST_PREFIX):
@@ -3635,7 +3745,7 @@ async def broker_publish(
             remainder[1] if len(remainder) > 1 else "",
             client_id,
         )
-        return
+        return delivered
 
     scoped = _scoped_topic(account_id, region, topic)
 
@@ -3643,24 +3753,39 @@ async def broker_publish(
         if not payload:
             _retained.pop(scoped, None)
         else:
-            _retained[scoped] = _RetainedMessage(scoped, payload, qos)
+            _retained[scoped] = _RetainedMessage(scoped, payload, qos, properties)
 
     async with _broker_lock:
         subs = [s for sset in _subscriptions.values() for s in sset]
 
-    for sub in subs:
-        if sub.account_id != account_id or sub.region != region:
-            continue
-        if _topic_matches(sub.filter_prefixed, scoped):
-            try:
-                effective_qos = min(qos, sub.granted_qos)
-                await sub.deliver(
-                    _unscope_topic(sub.account_id, sub.region, scoped),
-                    payload,
-                    effective_qos,
+    token = _delivery_properties.set(properties)
+    try:
+        for sub in subs:
+            if sub.account_id != account_id or sub.region != region:
+                continue
+            if sub.no_local and client_id is not None and sub.client_id == client_id:
+                continue
+            if _topic_matches(sub.filter_prefixed, scoped):
+                # Retain As Published forwards the publisher's flag; without
+                # it the flag is cleared, so a subscriber can tell a live
+                # message from a retained one (§3.3.1.3).
+                retain_token = _delivery_retain.set(
+                    retain if sub.retain_as_published else False
                 )
-            except Exception:
-                _broker_logger.exception("IoT broker: subscriber %s delivery failed", sub.subscription_id)
+                try:
+                    effective_qos = min(qos, sub.granted_qos)
+                    await sub.deliver(
+                        _unscope_topic(sub.account_id, sub.region, scoped),
+                        payload,
+                        effective_qos,
+                    )
+                    delivered += 1
+                except Exception:
+                    _broker_logger.exception("IoT broker: subscriber %s delivery failed", sub.subscription_id)
+                finally:
+                    _delivery_retain.reset(retain_token)
+    finally:
+        _delivery_properties.reset(token)
 
     if qos >= 1:
         for key, ps in list(_persistent_sessions.items()):
@@ -3677,9 +3802,11 @@ async def broker_publish(
                     ps.queued_messages.append((topic, payload, qos))
                     if len(ps.queued_messages) > _MAX_QUEUED_MESSAGES:
                         ps.queued_messages = ps.queued_messages[-_MAX_QUEUED_MESSAGES:]
+                    delivered += 1
                     break
 
     await _evaluate_topic_rules(account_id, region, topic, payload, client_id)
+    return delivered
 
 
 async def broker_subscribe(
@@ -3688,15 +3815,40 @@ async def broker_subscribe(
     topic_filter: str,
     callback: Callable[[str, bytes, int], Awaitable[None]],
     granted_qos: int = 0,
+    client_id: str | None = None,
+    no_local: bool = False,
+    retain_as_published: bool = False,
+    retain_handling: int = RETAIN_HANDLING_SEND_ALWAYS,
 ) -> str:
+    """Register a subscriber and hand it any matching retained message.
+
+    The last four arguments are the MQTT 5 subscription options (§3.8.3.1);
+    their defaults are what an MQTT 3.1.1 SUBSCRIBE means, so an existing
+    caller keeps its behaviour. ``retain_handling`` is acted on here and
+    nowhere else — it only decides whether this call replays retained
+    messages — while No Local and Retain As Published are stored on the
+    subscription because they apply to every later delivery.
+    """
     filter_prefixed = _scoped_topic(account_id, region, topic_filter)
     sub = _Subscription(
-        filter_prefixed, account_id, region, callback, granted_qos
+        filter_prefixed, account_id, region, callback, granted_qos,
+        client_id=client_id, no_local=no_local,
+        retain_as_published=retain_as_published,
     )
     async with _broker_lock:
-        _subscriptions.setdefault(filter_prefixed, set()).add(sub)
+        existing_subscribers = _subscriptions.setdefault(filter_prefixed, set())
+        # "Existing" is per client: whether *this* client already held the
+        # filter, which is what Retain Handling 1 asks about. A subscriber
+        # with no client identity has no subscription to re-establish.
+        already_subscribed = client_id is not None and any(
+            s.client_id == client_id for s in existing_subscribers
+        )
+        existing_subscribers.add(sub)
+        send_retained = retain_handling == RETAIN_HANDLING_SEND_ALWAYS or (
+            retain_handling == RETAIN_HANDLING_SEND_IF_NEW and not already_subscribed
+        )
         has_wildcard = "+" in topic_filter or "#" in topic_filter
-        if not has_wildcard:
+        if send_retained and not has_wildcard:
             scope_prefix = f"{account_id}/{region}/"
             retained_to_send = [
                 r
@@ -3708,12 +3860,21 @@ async def broker_subscribe(
             retained_to_send = []
 
     for r in retained_to_send:
+        token = _delivery_properties.set(r.properties)
+        # §3.3.1.3: a message sent because a subscription was established
+        # carries RETAIN 1 whatever the subscription's Retain As Published
+        # says — that flag is how the client tells this apart from live
+        # traffic on the same topic.
+        retain_token = _delivery_retain.set(True)
         try:
             await sub.deliver(
                 _unscope_topic(account_id, region, r.topic), r.payload, r.qos
             )
         except Exception:
             _broker_logger.exception("IoT broker: retained-message delivery failed")
+        finally:
+            _delivery_retain.reset(retain_token)
+            _delivery_properties.reset(token)
 
     return sub.subscription_id
 
@@ -3757,6 +3918,13 @@ async def _force_disconnect_duplicate(
     existing = _connected_clients.get(key)
     if existing is not None:
         _broker_logger.info("IoT broker: duplicate client_id=%s, forcing old connection closed", client_id)
+        if existing.protocol_version == MQTT_5:
+            # An MQTT 5 client is told why it lost the connection; 3.1.1 has
+            # no server-initiated DISCONNECT, so it just sees the close.
+            try:
+                await existing.send_bytes(_make_disconnect(RC5_SESSION_TAKEN_OVER))
+            except Exception:
+                pass
         try:
             await existing._send({"type": "websocket.close", "code": 1000})
         except Exception:
@@ -3766,7 +3934,7 @@ async def _force_disconnect_duplicate(
 
 
 # ---------------------------------------------------------------------------
-# MQTT 3.1.1 frame codec
+# MQTT 3.1.1 / 5.0 frame codec
 # ---------------------------------------------------------------------------
 
 PKT_CONNECT = 1
@@ -3780,6 +3948,128 @@ PKT_UNSUBACK = 11
 PKT_PINGREQ = 12
 PKT_PINGRESP = 13
 PKT_DISCONNECT = 14
+
+# Protocol levels carried by the CONNECT variable header.
+MQTT_311 = 4
+MQTT_5 = 5
+
+# MQTT 3.1.1 CONNACK return codes (§3.2.2.3).
+CONNACK_311_ACCEPTED = 0x00
+CONNACK_311_UNACCEPTABLE_PROTOCOL_VERSION = 0x01
+
+# MQTT 5 reason codes, only the ones this broker produces (§2.4). Success and
+# Normal disconnection share the value 0x00.
+RC5_SUCCESS = 0x00
+RC5_NO_MATCHING_SUBSCRIBERS = 0x10
+RC5_NO_SUBSCRIPTION_EXISTED = 0x11
+RC5_MALFORMED_PACKET = 0x81
+RC5_SESSION_TAKEN_OVER = 0x8E
+RC5_TOPIC_NAME_INVALID = 0x90
+
+# Layout of the MQTT 5 SUBSCRIBE options byte (§3.8.3.1). MQTT 3.1.1 sends a
+# bare QoS byte with the upper bits reserved zero, so the same masks read both
+# and a 3.1.1 subscription comes out with every option off.
+SUB_OPT_QOS_MASK = 0x03
+SUB_OPT_NO_LOCAL = 0x04
+SUB_OPT_RETAIN_AS_PUBLISHED = 0x08
+SUB_OPT_RETAIN_HANDLING_SHIFT = 4
+SUB_OPT_RETAIN_HANDLING_MASK = 0x03
+
+# MQTT 5 property identifiers (§2.2.2.2).
+PROP_PAYLOAD_FORMAT_INDICATOR = 0x01
+PROP_MESSAGE_EXPIRY_INTERVAL = 0x02
+PROP_CONTENT_TYPE = 0x03
+PROP_RESPONSE_TOPIC = 0x08
+PROP_CORRELATION_DATA = 0x09
+PROP_SUBSCRIPTION_IDENTIFIER = 0x0B
+PROP_SESSION_EXPIRY_INTERVAL = 0x11
+PROP_ASSIGNED_CLIENT_IDENTIFIER = 0x12
+PROP_SERVER_KEEP_ALIVE = 0x13
+PROP_AUTHENTICATION_METHOD = 0x15
+PROP_AUTHENTICATION_DATA = 0x16
+PROP_REQUEST_PROBLEM_INFORMATION = 0x17
+PROP_WILL_DELAY_INTERVAL = 0x18
+PROP_REQUEST_RESPONSE_INFORMATION = 0x19
+PROP_RESPONSE_INFORMATION = 0x1A
+PROP_SERVER_REFERENCE = 0x1C
+PROP_REASON_STRING = 0x1F
+PROP_RECEIVE_MAXIMUM = 0x21
+PROP_TOPIC_ALIAS_MAXIMUM = 0x22
+PROP_TOPIC_ALIAS = 0x23
+PROP_MAXIMUM_QOS = 0x24
+PROP_RETAIN_AVAILABLE = 0x25
+PROP_USER_PROPERTY = 0x26
+PROP_MAXIMUM_PACKET_SIZE = 0x27
+PROP_WILDCARD_SUBSCRIPTION_AVAILABLE = 0x28
+PROP_SUBSCRIPTION_IDENTIFIER_AVAILABLE = 0x29
+PROP_SHARED_SUBSCRIPTION_AVAILABLE = 0x2A
+
+# Wire type of every property identifier the protocol defines: "byte",
+# "u16", "u32", "vbi" (variable byte integer), "str", "bin" and "pair" (a
+# UTF-8 string pair). The table is complete even for properties the broker
+# has no use for, because knowing a property's *width* is what lets the
+# parser step over it — see _decode_properties.
+_PROPERTY_TYPES: dict[int, str] = {
+    PROP_PAYLOAD_FORMAT_INDICATOR: "byte",
+    PROP_MESSAGE_EXPIRY_INTERVAL: "u32",
+    PROP_CONTENT_TYPE: "str",
+    PROP_RESPONSE_TOPIC: "str",
+    PROP_CORRELATION_DATA: "bin",
+    PROP_SUBSCRIPTION_IDENTIFIER: "vbi",
+    PROP_SESSION_EXPIRY_INTERVAL: "u32",
+    PROP_ASSIGNED_CLIENT_IDENTIFIER: "str",
+    PROP_SERVER_KEEP_ALIVE: "u16",
+    PROP_AUTHENTICATION_METHOD: "str",
+    PROP_AUTHENTICATION_DATA: "bin",
+    PROP_REQUEST_PROBLEM_INFORMATION: "byte",
+    PROP_WILL_DELAY_INTERVAL: "u32",
+    PROP_REQUEST_RESPONSE_INFORMATION: "byte",
+    PROP_RESPONSE_INFORMATION: "str",
+    PROP_SERVER_REFERENCE: "str",
+    PROP_REASON_STRING: "str",
+    PROP_RECEIVE_MAXIMUM: "u16",
+    PROP_TOPIC_ALIAS_MAXIMUM: "u16",
+    PROP_TOPIC_ALIAS: "u16",
+    PROP_MAXIMUM_QOS: "byte",
+    PROP_RETAIN_AVAILABLE: "byte",
+    PROP_USER_PROPERTY: "pair",
+    PROP_MAXIMUM_PACKET_SIZE: "u32",
+    PROP_WILDCARD_SUBSCRIPTION_AVAILABLE: "byte",
+    PROP_SUBSCRIPTION_IDENTIFIER_AVAILABLE: "byte",
+    PROP_SHARED_SUBSCRIPTION_AVAILABLE: "byte",
+}
+
+# PUBLISH properties handed on to subscribers unchanged. §3.3.2.3 requires a
+# server to forward these, and a request/response client depends on getting
+# its own response topic and correlation data back. Everything else a
+# publisher sends (topic alias, subscription identifier, anything this broker
+# does not model) is dropped rather than echoed.
+_FORWARDED_PUBLISH_PROPERTIES = frozenset({
+    PROP_PAYLOAD_FORMAT_INDICATOR,
+    PROP_MESSAGE_EXPIRY_INTERVAL,
+    PROP_CONTENT_TYPE,
+    PROP_RESPONSE_TOPIC,
+    PROP_CORRELATION_DATA,
+    PROP_USER_PROPERTY,
+})
+
+# MQTT 5 PUBLISH properties ride a contextvar rather than the subscriber
+# callback signature. ``deliver(topic, payload, qos)`` is the broker's
+# extension point — iot_data, persistent-session replay and tests all supply
+# their own three-argument callbacks — and only an MQTT 5 session has any use
+# for properties. broker_publish sets this around each delivery; every other
+# caller sees the empty default and sends an empty property block.
+_delivery_properties: contextvars.ContextVar[bytes] = contextvars.ContextVar(
+    "_iot_delivery_properties", default=b""
+)
+
+# The RETAIN flag one delivery goes out with, carried the same way and for the
+# same reason. It is resolved per subscriber rather than per message, because
+# Retain As Published makes it a property of the subscription: two subscribers
+# to one publish can legitimately see different flags.
+_delivery_retain: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_iot_delivery_retain", default=False
+)
 
 
 def _encode_remaining_length(n: int) -> bytes:
@@ -3827,35 +4117,187 @@ def _encode_string(s: str) -> bytes:
     return struct.pack("!H", len(raw)) + raw
 
 
-def _make_connack(return_code: int = 0, session_present: bool = False) -> bytes:
+def _read_binary(buf: bytes, offset: int) -> tuple[bytes, int]:
+    if offset + 2 > len(buf):
+        raise ValueError("Truncated binary length")
+    n = struct.unpack_from("!H", buf, offset)[0]
+    offset += 2
+    if offset + n > len(buf):
+        raise ValueError("Truncated binary body")
+    return buf[offset:offset + n], offset + n
+
+
+def _encode_binary(b: bytes) -> bytes:
+    return struct.pack("!H", len(b)) + b
+
+
+def _decode_properties(buf: bytes, offset: int) -> tuple[list[tuple[int, object]], int]:
+    """Read one MQTT 5 property block, returning (properties, new_offset).
+
+    Properties keep wire order and duplicates (User Property is allowed to
+    repeat), so the result is a list of ``(identifier, value)`` rather than a
+    dict. A property whose identifier is not in ``_PROPERTY_TYPES`` cannot be
+    stepped over — its width is unknown — so parsing stops there and the
+    remainder of the block is skipped wholesale. The block's own length is
+    always honoured, which keeps the packet parse in sync either way.
+
+    Values are read out of a slice that ends where the block's declared length
+    ends, never out of the whole packet. A property whose value runs past that
+    point raises ``ValueError`` like the sibling field readers, instead of
+    quietly consuming the field that follows the block (a PUBLISH payload, a
+    will topic) or walking off the end of the packet.
+    """
+    length, offset = _decode_remaining_length(buf, offset)
+    end = offset + length
+    if end > len(buf):
+        raise ValueError("Truncated property block")
+    block = buf[offset:end]
+    props: list[tuple[int, object]] = []
+    pos = 0
+    while pos < len(block):
+        identifier = block[pos]
+        pos += 1
+        kind = _PROPERTY_TYPES.get(identifier)
+        if kind is None:
+            _broker_logger.warning(
+                "IoT broker: unknown MQTT 5 property 0x%02X — skipping rest of block",
+                identifier,
+            )
+            break
+        if kind == "byte":
+            if pos + 1 > len(block):
+                raise ValueError("Truncated property value")
+            value: object = block[pos]
+            pos += 1
+        elif kind == "u16":
+            if pos + 2 > len(block):
+                raise ValueError("Truncated property value")
+            value = struct.unpack_from("!H", block, pos)[0]
+            pos += 2
+        elif kind == "u32":
+            if pos + 4 > len(block):
+                raise ValueError("Truncated property value")
+            value = struct.unpack_from("!I", block, pos)[0]
+            pos += 4
+        elif kind == "vbi":
+            value, pos = _decode_remaining_length(block, pos)
+        elif kind == "str":
+            value, pos = _read_string(block, pos)
+        elif kind == "bin":
+            value, pos = _read_binary(block, pos)
+        else:  # pair
+            name, pos = _read_string(block, pos)
+            pair_value, pos = _read_string(block, pos)
+            value = (name, pair_value)
+        props.append((identifier, value))
+    return props, end
+
+
+def _encode_properties(props: list[tuple[int, object]] | None) -> bytes:
+    """Encode a property list, length prefix included. Empty block is ``b'\\x00'``."""
+    body = bytearray()
+    for identifier, value in props or []:
+        kind = _PROPERTY_TYPES[identifier]
+        body.append(identifier)
+        if kind == "byte":
+            body.append(int(value))  # type: ignore[arg-type]
+        elif kind == "u16":
+            body += struct.pack("!H", int(value))  # type: ignore[arg-type]
+        elif kind == "u32":
+            body += struct.pack("!I", int(value))  # type: ignore[arg-type]
+        elif kind == "vbi":
+            body += _encode_remaining_length(int(value))  # type: ignore[arg-type]
+        elif kind == "str":
+            body += _encode_string(str(value))
+        elif kind == "bin":
+            body += _encode_binary(bytes(value))  # type: ignore[arg-type]
+        else:  # pair
+            name, pair_value = value  # type: ignore[misc]
+            body += _encode_string(name) + _encode_string(pair_value)
+    return _encode_remaining_length(len(body)) + bytes(body)
+
+
+def _property_value(props: list[tuple[int, object]], identifier: int, default: object) -> object:
+    for prop_id, value in props:
+        if prop_id == identifier:
+            return value
+    return default
+
+
+def _forwardable_publish_properties(props: list[tuple[int, object]]) -> bytes:
+    """Encoded property block a subscriber receives for an incoming PUBLISH."""
+    kept = [p for p in props if p[0] in _FORWARDED_PUBLISH_PROPERTIES]
+    if not kept:
+        return b""
+    return _encode_properties(kept)
+
+
+def _make_connack(
+    return_code: int = 0,
+    session_present: bool = False,
+    protocol_version: int = MQTT_311,
+    properties: list[tuple[int, object]] | None = None,
+) -> bytes:
     flags = 1 if session_present else 0
     body = bytes([flags, return_code])
+    if protocol_version == MQTT_5:
+        body += _encode_properties(properties)
     return bytes([PKT_CONNACK << 4]) + _encode_remaining_length(len(body)) + body
 
 
 def _make_publish(topic: str, payload: bytes, qos: int = 0, packet_id: int | None = None,
-                  retain: bool = False, dup: bool = False) -> bytes:
+                  retain: bool = False, dup: bool = False,
+                  properties: bytes | None = None) -> bytes:
+    """Build a PUBLISH. ``properties`` is an already-encoded MQTT 5 property
+    block; ``None`` means MQTT 3.1.1, which has no such field."""
     fixed = (PKT_PUBLISH << 4) | (qos << 1) | (0x08 if dup else 0) | (0x01 if retain else 0)
     body = _encode_string(topic)
     if qos > 0:
         if packet_id is None:
             packet_id = 1
         body += struct.pack("!H", packet_id)
+    if properties is not None:
+        body += properties or b"\x00"
     body += payload
     return bytes([fixed]) + _encode_remaining_length(len(body)) + body
 
 
-def _make_puback(packet_id: int) -> bytes:
-    return bytes([PKT_PUBACK << 4]) + bytes([2]) + struct.pack("!H", packet_id)
+def _make_puback(packet_id: int, reason_code: int | None = None,
+                 properties: list[tuple[int, object]] | None = None) -> bytes:
+    """Build a PUBACK. ``reason_code`` is MQTT 5 only; ``None`` yields the
+    bare 3.1.1 packet."""
+    body = struct.pack("!H", packet_id)
+    if reason_code is not None:
+        body += bytes([reason_code]) + _encode_properties(properties)
+    return bytes([PKT_PUBACK << 4]) + _encode_remaining_length(len(body)) + body
 
 
-def _make_suback(packet_id: int, granted_qos: list[int]) -> bytes:
-    body = struct.pack("!H", packet_id) + bytes(granted_qos)
+def _make_suback(packet_id: int, granted_qos: list[int],
+                 protocol_version: int = MQTT_311,
+                 properties: list[tuple[int, object]] | None = None) -> bytes:
+    body = struct.pack("!H", packet_id)
+    if protocol_version == MQTT_5:
+        body += _encode_properties(properties)
+    body += bytes(granted_qos)
     return bytes([PKT_SUBACK << 4]) + _encode_remaining_length(len(body)) + body
 
 
-def _make_unsuback(packet_id: int) -> bytes:
-    return bytes([PKT_UNSUBACK << 4]) + bytes([2]) + struct.pack("!H", packet_id)
+def _make_unsuback(packet_id: int, reason_codes: list[int] | None = None,
+                   properties: list[tuple[int, object]] | None = None) -> bytes:
+    """Build an UNSUBACK. ``reason_codes`` is MQTT 5 only — 3.1.1's UNSUBACK
+    carries the packet identifier and nothing else."""
+    body = struct.pack("!H", packet_id)
+    if reason_codes is not None:
+        body += _encode_properties(properties) + bytes(reason_codes)
+    return bytes([PKT_UNSUBACK << 4]) + _encode_remaining_length(len(body)) + body
+
+
+def _make_disconnect(reason_code: int,
+                     properties: list[tuple[int, object]] | None = None) -> bytes:
+    """Build a server-initiated MQTT 5 DISCONNECT. 3.1.1 has no such packet —
+    a 3.1.1 server just closes the transport."""
+    body = bytes([reason_code]) + _encode_properties(properties)
+    return bytes([PKT_DISCONNECT << 4]) + _encode_remaining_length(len(body)) + body
 
 
 def _make_pingresp() -> bytes:
@@ -3883,13 +4325,21 @@ class _WSSession:
         self._next_pid = 1
         self._send_lock = asyncio.Lock()
         self._client_id: str = ""
-        self._clean_session: bool = True
+        # Negotiated in CONNECT; every packet built for this session is framed
+        # for this version.
+        self.protocol_version: int = MQTT_311
+        # 3.1.1 derives both from one flag; MQTT 5 splits them into Clean
+        # Start (resume or not) and Session Expiry Interval (keep or not).
+        self._resume_session: bool = False
+        self._persist_session: bool = False
+        self._session_expiry_interval: int | None = None
         self._in_flight: dict[int, _InFlightMessage] = {}
         self._retransmit_task: asyncio.Task | None = None
         self._will_topic: str | None = None
         self._will_message: bytes | None = None
         self._will_qos: int = 0
         self._will_retain: bool = False
+        self._will_properties: bytes = b""
         self._graceful_disconnect: bool = False
 
     def _alloc_packet_id(self) -> int:
@@ -3911,7 +4361,11 @@ class _WSSession:
                         msg.retransmit_count += 1
                         msg.sent_at = now
                         await self.send_bytes(
-                            _make_publish(msg.topic, msg.payload, qos=1, packet_id=pid, dup=True)
+                            _make_publish(
+                                msg.topic, msg.payload, qos=1, packet_id=pid, dup=True,
+                                retain=msg.retain,
+                                properties=self._publish_properties(msg.properties),
+                            )
                         )
         except asyncio.CancelledError:
             pass
@@ -3920,13 +4374,32 @@ class _WSSession:
         async with self._send_lock:
             await self._send({"type": "websocket.send", "bytes": b})
 
+    def _publish_properties(self, properties: bytes) -> bytes | None:
+        """Property block for an outbound PUBLISH, or None on a 3.1.1 session.
+
+        This is where cross-version delivery is resolved: a 3.1.1 subscriber
+        never sees the field, and a v5 subscriber always gets one — empty when
+        the publisher was 3.1.1 or sent nothing forwardable.
+        """
+        if self.protocol_version != MQTT_5:
+            return None
+        return properties or b"\x00"
+
     async def deliver_to_client(self, topic: str, payload: bytes, qos: int) -> None:
+        properties = _delivery_properties.get()
+        retain = _delivery_retain.get()
         if qos == 0:
-            await self.send_bytes(_make_publish(topic, payload, qos=0))
+            await self.send_bytes(
+                _make_publish(topic, payload, qos=0, retain=retain,
+                              properties=self._publish_properties(properties))
+            )
         else:
             pid = self._alloc_packet_id()
-            self._in_flight[pid] = _InFlightMessage(pid, topic, payload)
-            await self.send_bytes(_make_publish(topic, payload, qos=1, packet_id=pid))
+            self._in_flight[pid] = _InFlightMessage(pid, topic, payload, properties, retain)
+            await self.send_bytes(
+                _make_publish(topic, payload, qos=1, packet_id=pid, retain=retain,
+                              properties=self._publish_properties(properties))
+            )
             self._ensure_retransmit_timer()
 
     def _take_packet(self) -> tuple[int, int, bytes] | None:
@@ -3948,13 +4421,124 @@ class _WSSession:
         flags = first & 0x0F
         return pkt_type, flags, body
 
+    def _connack_properties(self, assigned_client_id: str | None) -> list[tuple[int, object]]:
+        """CONNACK properties for an MQTT 5 session.
+
+        The three "available" flags set to 0 are the protocol's own way of
+        telling a client not to use a feature this broker does not implement,
+        which is why advertising them beats staying silent (their defaults all
+        mean "available"). Topic Alias Maximum 0 does the same for aliases.
+        """
+        props: list[tuple[int, object]] = []
+        if assigned_client_id:
+            props.append((PROP_ASSIGNED_CLIENT_IDENTIFIER, assigned_client_id))
+        props += [
+            (PROP_MAXIMUM_QOS, 1),
+            (PROP_RETAIN_AVAILABLE, 1),
+            (PROP_MAXIMUM_PACKET_SIZE, _max_frame_buffer_bytes()),
+            (PROP_TOPIC_ALIAS_MAXIMUM, 0),
+            (PROP_WILDCARD_SUBSCRIPTION_AVAILABLE, 1),
+            (PROP_SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0),
+            (PROP_SHARED_SUBSCRIPTION_AVAILABLE, 0),
+        ]
+        return props
+
+    async def _send_connack(
+        self, session_present: bool = False, assigned_client_id: str | None = None
+    ) -> None:
+        """Accept the connection, framed for the negotiated protocol version."""
+        if self.protocol_version == MQTT_5:
+            await self.send_bytes(
+                _make_connack(
+                    return_code=RC5_SUCCESS,
+                    session_present=session_present,
+                    protocol_version=MQTT_5,
+                    properties=self._connack_properties(assigned_client_id),
+                )
+            )
+        else:
+            await self.send_bytes(
+                _make_connack(
+                    return_code=CONNACK_311_ACCEPTED, session_present=session_present
+                )
+            )
+
+    async def _reject_malformed_packet(self, pkt_type: int, exc: Exception) -> None:
+        """Answer a packet this broker could not parse, then let the caller close.
+
+        MQTT 5 §4.13.1 requires a server that detects a Malformed Packet to
+        close the connection, and to say why first: in a CONNACK when the
+        CONNECT itself is what failed and no CONNACK has gone out yet, in a
+        DISCONNECT once the connection is established. Both carry reason code
+        0x81. MQTT 3.1.1 has no CONNACK return code for a malformed packet and
+        no server-sent DISCONNECT at all, so there the connection just closes,
+        which is what §4.8 prescribes.
+        """
+        _broker_logger.warning(
+            "IoT broker: malformed MQTT packet (type %d) — closing connection: %s",
+            pkt_type,
+            exc,
+        )
+        if self.protocol_version != MQTT_5:
+            return
+        packet = (
+            _make_connack(return_code=RC5_MALFORMED_PACKET, protocol_version=MQTT_5)
+            if pkt_type == PKT_CONNECT
+            else _make_disconnect(RC5_MALFORMED_PACKET)
+        )
+        try:
+            await self.send_bytes(packet)
+        except Exception:
+            # The transport is going away regardless; a client that already
+            # hung up must not turn into an unhandled error here.
+            _broker_logger.debug(
+                "IoT broker: malformed-packet reason code not delivered", exc_info=True
+            )
+
     async def handle_packet(self, pkt_type: int, flags: int, body: bytes) -> bool:
+        """Dispatch one packet. Returns False when the connection must close.
+
+        Every field reader in this codec raises on truncation rather than
+        reading past its own bounds, so a packet the client mis-framed lands
+        here as an exception instead of as silently wrong values. Catching it
+        at the one dispatch point is what turns it into the protocol's own
+        answer — a reason code and a close — for any transport driving this
+        session, rather than an exception the caller has to know about.
+        """
+        try:
+            return await self._dispatch_packet(pkt_type, flags, body)
+        except (ValueError, IndexError, struct.error) as exc:
+            await self._reject_malformed_packet(pkt_type, exc)
+            return False
+
+    async def _dispatch_packet(self, pkt_type: int, flags: int, body: bytes) -> bool:
         if pkt_type == PKT_CONNECT:
             off = 0
             _proto_name, off = _read_string(body, off)
-            off += 1  # Protocol Level
             if off >= len(body):
-                await self.send_bytes(_make_connack(return_code=0))
+                await self.send_bytes(_make_connack(return_code=CONNACK_311_ACCEPTED))
+                return True
+            protocol_level = body[off]
+            off += 1
+            if protocol_level not in (MQTT_311, MQTT_5):
+                # The client asked for a version this broker cannot frame, so
+                # the refusal goes out in the 3.1.1 shape: it is the one form
+                # whose second body byte every MQTT decoder reads as a return
+                # code, which turns an otherwise silent decode failure into a
+                # diagnosable "unacceptable protocol version".
+                _broker_logger.warning(
+                    "IoT broker: CONNECT with unsupported protocol level %d refused",
+                    protocol_level,
+                )
+                await self.send_bytes(
+                    _make_connack(return_code=CONNACK_311_UNACCEPTABLE_PROTOCOL_VERSION)
+                )
+                return False
+            self.protocol_version = protocol_level
+            is_v5 = protocol_level == MQTT_5
+
+            if off >= len(body):
+                await self._send_connack()
                 return True
             connect_flags = body[off]
             off += 1
@@ -3963,19 +4547,46 @@ class _WSSession:
             will_flag = bool(connect_flags & 0x04)
             will_qos = (connect_flags >> 3) & 0x03
             will_retain = bool(connect_flags & 0x20)
-            clean_session = bool(connect_flags & 0x02)
+            # Bit 1 is Clean Session in 3.1.1 and Clean Start in MQTT 5.
+            clean_start = bool(connect_flags & 0x02)
 
-            self._clean_session = clean_session
+            session_expiry = 0
+            if is_v5:
+                connect_props, off = _decode_properties(body, off)
+                session_expiry = int(
+                    _property_value(connect_props, PROP_SESSION_EXPIRY_INTERVAL, 0)
+                )
+
+            # 3.1.1 ties resumption and retention to the one flag. MQTT 5
+            # separates them: Clean Start decides whether an existing session
+            # is picked up, Session Expiry Interval whether this one outlives
+            # the connection and for how long.
+            self._resume_session = not clean_start
+            self._persist_session = session_expiry > 0 if is_v5 else not clean_start
+            # The interval the client asked for, kept so a stored session
+            # expires on the client's terms rather than on the module-wide
+            # default. A 3.1.1 client names no interval and gets the default.
+            self._session_expiry_interval = session_expiry if is_v5 else None
 
             if off < len(body):
                 client_id, off = _read_string(body, off)
             else:
                 client_id = ""
+            assigned_client_id = None
             if not client_id:
                 client_id = uuid.uuid4().hex
+                # MQTT 5 requires the server to hand back the identifier it
+                # made up; a 3.1.1 client is never told and cannot ask.
+                assigned_client_id = client_id
             self._client_id = client_id
 
             if will_flag:
+                will_props: list[tuple[int, object]] = []
+                if is_v5:
+                    # Will properties precede the will topic. Will Delay
+                    # Interval is parsed and ignored — the will goes out as
+                    # soon as the connection drops.
+                    will_props, off = _decode_properties(body, off)
                 if off < len(body):
                     will_topic, off = _read_string(body, off)
                 else:
@@ -3991,11 +4602,13 @@ class _WSSession:
                 self._will_message = will_message
                 self._will_qos = will_qos
                 self._will_retain = will_retain
+                self._will_properties = _forwardable_publish_properties(will_props)
             else:
                 self._will_topic = None
                 self._will_message = None
                 self._will_qos = 0
                 self._will_retain = False
+                self._will_properties = b""
 
             self._graceful_disconnect = False
             await _force_disconnect_duplicate(
@@ -4008,24 +4621,31 @@ class _WSSession:
             session_key = (self.account_id, self.region, self._client_id)
             session_present = False
 
-            if clean_session:
+            if not self._resume_session:
                 _persistent_sessions.pop(session_key, None)
             else:
                 existing_ps = _persistent_sessions.get(session_key)
                 if existing_ps is not None and not _is_session_expired(existing_ps):
                     session_present = True
                     for topic_filter in existing_ps.subscriptions:
+                        # A stored session keeps its topic filters, not the
+                        # subscription options they were made with: those live
+                        # on the connection that sent them, so a resumed
+                        # subscription comes back with the defaults.
                         sid = await broker_subscribe(
                             self.account_id,
                             self.region,
                             topic_filter,
                             self.deliver_to_client,
                             1,
+                            client_id=self._client_id or None,
                         )
                         self._sub_ids.append(sid)
                         self._sub_filters[sid] = topic_filter
                         self._sub_granted_qos[sid] = 1
-                    await self.send_bytes(_make_connack(return_code=0, session_present=True))
+                    await self._send_connack(
+                        session_present=True, assigned_client_id=assigned_client_id
+                    )
                     queued = existing_ps.queued_messages[:]
                     existing_ps.queued_messages.clear()
                     for q_topic, q_payload, q_qos in queued:
@@ -4033,10 +4653,14 @@ class _WSSession:
                     return True
                 else:
                     _persistent_sessions[session_key] = _PersistentSessionState(
-                        subscriptions=[], created_at=time.time()
+                        subscriptions=[],
+                        created_at=time.time(),
+                        expiry_interval=self._session_expiry_interval,
                     )
 
-            await self.send_bytes(_make_connack(return_code=0, session_present=session_present))
+            await self._send_connack(
+                session_present=session_present, assigned_client_id=assigned_client_id
+            )
             return True
 
         if pkt_type == PKT_PUBLISH:
@@ -4049,32 +4673,56 @@ class _WSSession:
                     return True
                 packet_id = struct.unpack_from("!H", body, off)[0]
                 off += 2
+            properties = b""
+            if self.protocol_version == MQTT_5:
+                publish_props, off = _decode_properties(body, off)
+                properties = _forwardable_publish_properties(publish_props)
             if not _validate_publish_topic(topic):
                 _broker_logger.warning("IoT broker: PUBLISH rejected — invalid topic: %r", topic)
+                if self.protocol_version == MQTT_5:
+                    await self.send_bytes(_make_disconnect(RC5_TOPIC_NAME_INVALID))
                 return False
             payload = body[off:]
-            await broker_publish(
+            delivered = await broker_publish(
                 self.account_id,
                 self.region,
                 topic,
                 payload,
                 qos=qos,
                 retain=retain,
-                client_id=self._client_id,
+                properties=properties,
+                client_id=self._client_id or None,
             )
             if qos == 1 and packet_id is not None:
-                await self.send_bytes(_make_puback(packet_id))
+                if self.protocol_version == MQTT_5:
+                    reason = RC5_SUCCESS if delivered else RC5_NO_MATCHING_SUBSCRIBERS
+                    await self.send_bytes(_make_puback(packet_id, reason_code=reason))
+                else:
+                    await self.send_bytes(_make_puback(packet_id))
             return True
 
         if pkt_type == PKT_SUBSCRIBE:
             packet_id = struct.unpack_from("!H", body, 0)[0]
             off = 2
+            if self.protocol_version == MQTT_5:
+                # Subscription Identifier lives here; the broker advertises it
+                # as unavailable in CONNACK and ignores it if sent anyway.
+                _subscribe_props, off = _decode_properties(body, off)
             granted = []
             while off < len(body):
                 topic, off = _read_string(body, off)
-                req_qos = body[off]
+                # MQTT 5 replaces 3.1.1's bare QoS byte with a subscription
+                # options byte: the low two bits are the QoS, the rest are No
+                # Local, Retain As Published and Retain Handling. In 3.1.1 the
+                # upper bits are reserved zero, so reading the same byte the
+                # same way leaves every option off.
+                if off >= len(body):
+                    raise ValueError("SUBSCRIBE topic filter without options byte")
+                subscription_options = body[off]
                 off += 1
-                granted_qos = min(req_qos, 1)
+                granted_qos = min(subscription_options & SUB_OPT_QOS_MASK, 1)
+                # A granted QoS doubles as an MQTT 5 SUBACK reason code: 0x00
+                # and 0x01 mean the same thing in both versions.
                 granted.append(granted_qos)
                 sid = await broker_subscribe(
                     self.account_id,
@@ -4082,14 +4730,26 @@ class _WSSession:
                     topic,
                     self.deliver_to_client,
                     granted_qos,
+                    client_id=self._client_id or None,
+                    no_local=bool(subscription_options & SUB_OPT_NO_LOCAL),
+                    retain_as_published=bool(
+                        subscription_options & SUB_OPT_RETAIN_AS_PUBLISHED
+                    ),
+                    retain_handling=(
+                        subscription_options >> SUB_OPT_RETAIN_HANDLING_SHIFT
+                    ) & SUB_OPT_RETAIN_HANDLING_MASK,
                 )
                 self._sub_ids.append(sid)
                 self._sub_filters[sid] = topic
                 self._sub_granted_qos[sid] = granted_qos
-            await self.send_bytes(_make_suback(packet_id, granted))
+            await self.send_bytes(
+                _make_suback(packet_id, granted, protocol_version=self.protocol_version)
+            )
             return True
 
         if pkt_type == PKT_PUBACK:
+            # MQTT 5 appends a reason code and properties after the packet
+            # identifier; nothing here acts on either.
             if len(body) >= 2:
                 packet_id = struct.unpack_from("!H", body, 0)[0]
                 self._in_flight.pop(packet_id, None)
@@ -4098,6 +4758,10 @@ class _WSSession:
         if pkt_type == PKT_UNSUBSCRIBE:
             packet_id = struct.unpack_from("!H", body, 0)[0]
             off = 2
+            if self.protocol_version == MQTT_5:
+                # 5.0 puts a property block between the packet identifier and
+                # the topic filters; none of the defined ones apply to a server.
+                _unsubscribe_props, off = _decode_properties(body, off)
             filters = []
             while off < len(body):
                 try:
@@ -4111,12 +4775,14 @@ class _WSSession:
                     break
                 filters.append(topic_filter)
 
-            # MQTT 3.1.1 §3.10.4: each filter is compared character-by-character
-            # with the session's subscriptions, and one that matches none of them
-            # is simply skipped — a wildcard filter goes only by its own text, not
-            # by the topics it happened to match. `_sub_filters` keeps the filter
-            # as it arrived on the wire, so the comparison happens before topic
-            # prefixing, in the same form SUBSCRIBE stored it.
+            # MQTT 3.1.1 §3.10.4 (5.0 §3.10.4 is the same rule): each filter is
+            # compared character-by-character with the session's subscriptions,
+            # and one that matches none of them is simply skipped — a wildcard
+            # filter goes only by its own text, not by the topics it happened to
+            # match. `_sub_filters` keeps the filter as it arrived on the wire,
+            # so the comparison happens before topic prefixing, in the same form
+            # SUBSCRIBE stored it.
+            reason_codes = []
             for topic_filter in filters:
                 removed = [
                     sid
@@ -4130,7 +4796,19 @@ class _WSSession:
                 self._sub_ids[:] = [
                     sid for sid in self._sub_ids if sid not in removed
                 ]
-            await self.send_bytes(_make_unsuback(packet_id))
+                # MQTT 5.0 §3.11.3: the reason code says what this filter's
+                # removal actually did, so it is read off the removal itself
+                # rather than off a snapshot taken before it. A filter repeated
+                # inside one packet is therefore Success once and then No
+                # subscription existed, which is what the session now holds.
+                reason_codes.append(
+                    RC5_SUCCESS if removed else RC5_NO_SUBSCRIPTION_EXISTED
+                )
+            if self.protocol_version == MQTT_5:
+                await self.send_bytes(_make_unsuback(packet_id, reason_codes))
+            else:
+                # 3.1.1's UNSUBACK is the packet identifier and nothing else.
+                await self.send_bytes(_make_unsuback(packet_id))
             return True
 
         if pkt_type == PKT_PINGREQ:
@@ -4139,6 +4817,11 @@ class _WSSession:
 
         if pkt_type == PKT_DISCONNECT:
             self._graceful_disconnect = True
+            if self.protocol_version == MQTT_5 and body:
+                # 0x04 "Disconnect with Will Message" is the one reason code
+                # that asks for the will to be published anyway.
+                if body[0] == 0x04:
+                    self._graceful_disconnect = False
             return False
 
         return True
@@ -4160,9 +4843,21 @@ class _WSSession:
                 self._will_message or b"",
                 qos=self._will_qos,
                 retain=self._will_retain,
+                properties=self._will_properties,
             )
-        if not self._clean_session and self._client_id:
-            self._preserve_session()
+        if self._client_id:
+            if self._persist_session:
+                self._preserve_session()
+            else:
+                # A connection can resume a stored session and still not
+                # persist one: MQTT 5 splits the two, so Clean Start 0 with no
+                # Session Expiry Interval picks the session up and then ends
+                # it. Without this the entry outlives every such connection,
+                # queueing QoS 1 messages nobody will collect and reporting
+                # session_present=1 to a client that asked for a clean one.
+                _persistent_sessions.pop(
+                    (self.account_id, self.region, self._client_id), None
+                )
         for sid in self._sub_ids:
             await broker_unsubscribe(sid)
         self._sub_ids.clear()
@@ -4178,9 +4873,12 @@ class _WSSession:
         if existing is not None:
             existing.subscriptions = unprefixed_filters
             existing.created_at = time.time()
+            existing.expiry_interval = self._session_expiry_interval
         else:
             _persistent_sessions[session_key] = _PersistentSessionState(
-                subscriptions=unprefixed_filters, created_at=time.time()
+                subscriptions=unprefixed_filters,
+                created_at=time.time(),
+                expiry_interval=self._session_expiry_interval,
             )
 
 

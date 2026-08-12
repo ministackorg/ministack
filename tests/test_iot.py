@@ -1360,15 +1360,20 @@ from ministack.services.iot import (
     PKT_DISCONNECT,
     PKT_PUBACK,
     PKT_PUBLISH,
+    PKT_SUBACK,
     PKT_SUBSCRIBE,
     PKT_UNSUBACK,
     PKT_UNSUBSCRIBE,
+    _decode_properties,
+    _decode_remaining_length,
     _encode_remaining_length,
     _encode_string,
     _InFlightMessage,
     _make_puback,
     _make_suback,
     _persistent_sessions,
+    _property_value,
+    _read_string,
     broker_publish,
     broker_subscribe,
 )
@@ -2597,6 +2602,233 @@ def test_different_accounts_sessions_isolated():
         assert session_present is False  # No prior session for account_B
 
         await session_b.cleanup()
+
+    asyncio.run(_run())
+    reset()
+
+
+# ----------------------------------------------------------------------
+# Broker — MQTT 5.0. These drive the session object directly, so they need
+# neither a running server nor the websockets package; the wire-level suite
+# that needs both lives in test_iot_mqtt5.py.
+# ----------------------------------------------------------------------
+
+PROP_SESSION_EXPIRY_INTERVAL = 0x11
+PROP_MAXIMUM_QOS = 0x24
+PROP_USER_PROPERTY = 0x26
+
+
+def _mqtt_packet(pkt_type, flags, body):
+    """Wrap a packet body in its fixed header."""
+    return bytes([(pkt_type << 4) | flags]) + _encode_remaining_length(len(body)) + body
+
+
+def _build_mqtt5_connect_body(client_id="v5-client", clean_start=True, session_expiry=None):
+    """Build an MQTT 5 CONNECT body: like the 3.1.1 one plus a property block."""
+    props = b""
+    if session_expiry is not None:
+        props = bytes([PROP_SESSION_EXPIRY_INTERVAL]) + struct.pack("!I", session_expiry)
+    body = bytearray()
+    body += _encode_string("MQTT")
+    body.append(5)                                    # Protocol Level
+    body.append(0x02 if clean_start else 0x00)        # Clean Start
+    body += struct.pack("!H", 60)                     # Keep Alive
+    body += _encode_remaining_length(len(props)) + props
+    body += _encode_string(client_id)
+    return bytes(body)
+
+
+def _build_mqtt5_subscribe_body(packet_id, topic, options):
+    """Build an MQTT 5 SUBSCRIBE body: property block, then filter + options."""
+    return (
+        struct.pack("!H", packet_id)
+        + b"\x00"
+        + _encode_string(topic)
+        + bytes([options])
+    )
+
+
+def _build_mqtt5_publish_body(topic, payload, qos=0, packet_id=None, properties=b"\x00"):
+    body = _encode_string(topic)
+    if qos:
+        body += struct.pack("!H", packet_id or 1)
+    return body + properties + payload
+
+
+def _mqtt5_user_property(name, value):
+    """An encoded property block holding one User Property."""
+    body = bytes([PROP_USER_PROPERTY]) + _encode_string(name) + _encode_string(value)
+    return _encode_remaining_length(len(body)) + body
+
+
+def _parse_mqtt5_publish(packet):
+    """Return (topic, payload, properties) from a PUBLISH the broker sent."""
+    qos = (packet[0] >> 1) & 0x03
+    _remaining, off = _decode_remaining_length(packet, 1)
+    topic, off = _read_string(packet, off)
+    if qos:
+        off += 2
+    props, off = _decode_properties(packet, off)
+    return topic, packet[off:], props
+
+
+def test_mqtt5_session_round_trips_over_a_plain_byte_stream():
+    """Version negotiation lives in the session, not in the WebSocket layer.
+
+    The session object is driven here the way a raw TCP listener drives it —
+    bytes appended to its buffer, packets taken off by its own framing — with
+    every packet split at an offset that lands inside the new property fields,
+    which is where a framing mistake would show up first.
+    """
+    reset()
+    topic = "stream/topic"
+
+    async def _run():
+        sent = []
+
+        async def _stream_send(message):
+            if message.get("type") == "websocket.send":
+                sent.append(message["bytes"])
+
+        session = _WSSession(_stream_send, "123456789012")
+
+        async def feed(packet, chunk):
+            for start in range(0, len(packet), chunk):
+                session._buffer.extend(packet[start:start + chunk])
+                while True:
+                    parsed = session._take_packet()
+                    if parsed is None:
+                        break
+                    await session.handle_packet(*parsed)
+
+        await feed(
+            _mqtt_packet(PKT_CONNECT, 0, _build_mqtt5_connect_body("stream-client")), 3
+        )
+        await feed(
+            _mqtt_packet(PKT_SUBSCRIBE, 0x02, _build_mqtt5_subscribe_body(1, topic, 0x01)),
+            5,
+        )
+        await feed(
+            _mqtt_packet(
+                PKT_PUBLISH,
+                0x02,
+                _build_mqtt5_publish_body(
+                    topic, b"over-tcp", qos=1, packet_id=9,
+                    properties=_mqtt5_user_property("via", "stream"),
+                ),
+            ),
+            4,
+        )
+        await session.cleanup()
+        return sent
+
+    sent = asyncio.run(_run())
+    assert len(sent) == 4, "CONNACK, SUBACK, the delivered PUBLISH, then PUBACK"
+    connack, suback, publish, puback = sent
+    assert connack[:2] == bytes([0x20, len(connack) - 2])
+    assert connack[3] == 0x00, "reason code Success"
+    connack_props, _end = _decode_properties(connack, 4)
+    assert _property_value(connack_props, PROP_MAXIMUM_QOS, None) == 1
+    assert suback[0] >> 4 == PKT_SUBACK
+    assert publish[0] >> 4 == PKT_PUBLISH
+    assert (publish[0] >> 1) & 0x03 == 1, "delivered at the granted QoS"
+    delivered_topic, payload, props = _parse_mqtt5_publish(publish)
+    assert (delivered_topic, payload) == (topic, b"over-tcp")
+    assert _property_value(props, PROP_USER_PROPERTY, None) == ("via", "stream")
+    assert puback == bytes([0x40, 0x04, 0x00, 0x09, 0x00, 0x00])
+    reset()
+
+
+def test_mqtt5_session_expiry_is_read_as_an_interval_not_a_flag():
+    """Session Expiry Interval says how long the session lives, not whether.
+
+    The session below asks for 60 seconds, so it is restored a second later
+    and gone a minute later. Treated as a yes/no flag it would instead have
+    fallen back to the module-wide hour and been restored both times.
+    """
+    reset()
+    key = ("123456789012", _TEST_REGION, "expiring")
+    connect = _build_mqtt5_connect_body(
+        "expiring", clean_start=False, session_expiry=60
+    )
+
+    async def _run():
+        send1, _sent1 = _mock_send()
+        session1 = _WSSession(send1, "123456789012")
+        await session1.handle_packet(PKT_CONNECT, 0, connect)
+        await session1.handle_packet(
+            PKT_SUBSCRIBE, 0x02, _build_mqtt5_subscribe_body(1, "temp/data", 0x01)
+        )
+        await session1.handle_packet(PKT_DISCONNECT, 0, b"")
+        await session1.cleanup()
+
+        assert _persistent_sessions[key].expiry_interval == 60
+
+        send2, sent2 = _mock_send()
+        session2 = _WSSession(send2, "123456789012")
+        await session2.handle_packet(PKT_CONNECT, 0, connect)
+        assert _parse_connack(sent2) == (True, 0), "still inside the interval"
+        await session2.handle_packet(PKT_DISCONNECT, 0, b"")
+        await session2.cleanup()
+
+        # Spend the interval the client asked for, which is still well inside
+        # the module-wide default.
+        _persistent_sessions[key].created_at = time.time() - 61
+
+        send3, sent3 = _mock_send()
+        session3 = _WSSession(send3, "123456789012")
+        await session3.handle_packet(PKT_CONNECT, 0, connect)
+        assert _parse_connack(sent3) == (False, 0), "the interval is spent"
+        await session3.cleanup()
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_mqtt5_resumed_session_without_an_expiry_interval_is_discarded():
+    """Clean Start 0 and no Session Expiry Interval: resume one, leave none.
+
+    MQTT 5 splits resumption from retention, so this connection legitimately
+    picks a stored session up and legitimately must not leave one behind.
+    Nothing used to remove it — the entry outlived every such connection,
+    queueing QoS 1 messages nobody would collect and answering the next
+    CONNECT with session_present=1.
+    """
+    reset()
+    key = ("123456789012", _TEST_REGION, "transient")
+
+    async def _run():
+        # A first connection that does persist, so there is one to resume.
+        send1, _sent1 = _mock_send()
+        session1 = _WSSession(send1, "123456789012")
+        await session1.handle_packet(
+            PKT_CONNECT,
+            0,
+            _build_mqtt5_connect_body(
+                "transient", clean_start=False, session_expiry=3600
+            ),
+        )
+        await session1.handle_packet(
+            PKT_SUBSCRIBE, 0x02, _build_mqtt5_subscribe_body(1, "temp/data", 0x01)
+        )
+        await session1.handle_packet(PKT_DISCONNECT, 0, b"")
+        await session1.cleanup()
+        assert key in _persistent_sessions
+
+        resume_only = _build_mqtt5_connect_body("transient", clean_start=False)
+        send2, sent2 = _mock_send()
+        session2 = _WSSession(send2, "123456789012")
+        await session2.handle_packet(PKT_CONNECT, 0, resume_only)
+        assert _parse_connack(sent2) == (True, 0), "Clean Start 0 still resumes"
+        await session2.handle_packet(PKT_DISCONNECT, 0, b"")
+        await session2.cleanup()
+        assert key not in _persistent_sessions
+
+        send3, sent3 = _mock_send()
+        session3 = _WSSession(send3, "123456789012")
+        await session3.handle_packet(PKT_CONNECT, 0, resume_only)
+        assert _parse_connack(sent3) == (False, 0), "and the next client is told so"
+        await session3.cleanup()
 
     asyncio.run(_run())
     reset()
