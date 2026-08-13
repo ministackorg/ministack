@@ -971,15 +971,15 @@ class TestReset:
 
 class TestContainerCap:
     def test_cap_exceeded_logs_and_degrades_to_stub(self, monkeypatch, caplog):
-        """When the backend container cap is reached, creating another cluster
-        logs a warning naming DSQL_MAX_CONTAINERS and goes metadata-only."""
+        """When the backend port window is exhausted, creating another cluster
+        logs a warning naming DSQL_BASE_PORT and goes metadata-only."""
         import json
         import logging
 
         from ministack.services import dsql as dsql_mod
 
         monkeypatch.setattr(dsql_mod, "_backends_enabled", lambda: True)
-        monkeypatch.setattr(dsql_mod, "MAX_CONTAINERS", 0)
+        monkeypatch.setattr(dsql_mod, "_BACKEND_PORT_WINDOW", 0)
 
         with caplog.at_level(logging.WARNING, logger="dsql"):
             status, _, body = dsql_mod._create_cluster({})
@@ -991,7 +991,7 @@ class TestContainerCap:
             assert cluster["status"] == "ACTIVE"  # stub, not CREATING
             assert dsql_mod._clusters[identifier]["_has_backend"] is False
             assert any(
-                "DSQL_MAX_CONTAINERS" in r.message and "cap reached" in r.message
+                "DSQL_BASE_PORT" in r.message and "metadata-only" in r.message
                 for r in caplog.records
                 if r.name == "dsql" and r.levelno == logging.WARNING
             )
@@ -999,13 +999,13 @@ class TestContainerCap:
             dsql_mod._clusters.clear()
 
     def test_containers_disabled_means_stub_even_with_docker(self, monkeypatch):
-        """Default posture: Docker available but DSQL_CONTAINERS unset/off —
+        """Default posture: Docker available but DSQL_STRICT unset/off —
         clusters are metadata-only stubs and no backend is started."""
         import json
 
         from ministack.services import dsql as dsql_mod
 
-        monkeypatch.setattr(dsql_mod, "DSQL_CONTAINERS", False)
+        monkeypatch.setattr(dsql_mod, "DSQL_STRICT", False)
         monkeypatch.setattr(dsql_mod, "_docker_available", lambda: True)
         assert dsql_mod._backends_enabled() is False
 
@@ -1023,9 +1023,9 @@ class TestContainerCap:
         from ministack.services import dsql as dsql_mod
 
         monkeypatch.setattr(dsql_mod, "_docker_available", lambda: True)
-        monkeypatch.setattr(dsql_mod, "DSQL_CONTAINERS", False)
+        monkeypatch.setattr(dsql_mod, "DSQL_STRICT", False)
         assert dsql_mod._backends_enabled() is False
-        monkeypatch.setattr(dsql_mod, "DSQL_CONTAINERS", True)
+        monkeypatch.setattr(dsql_mod, "DSQL_STRICT", True)
         assert dsql_mod._backends_enabled() is True
         monkeypatch.setattr(dsql_mod, "_docker_available", lambda: False)
         assert dsql_mod._backends_enabled() is False
@@ -1276,7 +1276,7 @@ def _pg_connect(port, autocommit=True):
 
 @requires_docker
 class TestContainersE2E:
-    """End-to-end for DSQL_CONTAINERS=1: _create_cluster spins up a real
+    """End-to-end for DSQL_STRICT=1: _create_cluster spins up a real
     Postgres container behind the wire proxy, reachable over SQL. Runs
     in-process (flag monkeypatched on) wherever a Docker daemon exists."""
 
@@ -1288,7 +1288,7 @@ class TestContainersE2E:
 
         from ministack.services import dsql as dsql_mod
 
-        monkeypatch.setattr(dsql_mod, "DSQL_CONTAINERS", True)
+        monkeypatch.setattr(dsql_mod, "DSQL_STRICT", True)
         # _start_backend stashes the test's ephemeral loop in this global;
         # put the original back afterwards (all consumers guard is_running(),
         # but don't leak a closed loop into other tests).
@@ -1311,7 +1311,7 @@ class TestContainersE2E:
                 def _select_one():
                     conn = psycopg2.connect(
                         host="127.0.0.1",
-                        port=cluster["port"],
+                        port=int(cluster["endpoint"].split(":")[1]),
                         user="admin",
                         password="anything",
                         dbname="postgres",

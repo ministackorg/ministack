@@ -37,10 +37,21 @@ def _cfn_iceberg_json(path):
 
 
 def _wait_stack(cfn, name, timeout=30):
-    """Poll until stack reaches terminal status."""
+    """Poll until stack reaches terminal status.
+
+    A deleted stack is addressable only by its stack ID, so once it reaches
+    DELETE_COMPLETE describe-by-name returns "does not exist" (real AWS); treat
+    that as the terminal deleted state.
+    """
     deadline = time.time() + timeout
+    status = "UNKNOWN"
     while time.time() < deadline:
-        stacks = cfn.describe_stacks(StackName=name)["Stacks"]
+        try:
+            stacks = cfn.describe_stacks(StackName=name)["Stacks"]
+        except ClientError as exc:
+            if "does not exist" in str(exc):
+                return {"StackStatus": "DELETE_COMPLETE", "StackName": name}
+            raise
         status = stacks[0]["StackStatus"]
         if not status.endswith("_IN_PROGRESS"):
             return stacks[0]
@@ -438,6 +449,46 @@ def test_cfn_create_describe_delete_stack(cfn, s3):
     with pytest.raises(ClientError):
         s3.head_bucket(Bucket="cfn-t01-bucket")
 
+
+def test_cfn_deleted_stack_name_is_reusable(cfn):
+    """A DELETE_COMPLETE stack is addressable only by stack ID; its name is free
+    to re-create, and an UpdateStack against the deleted name is "does not
+    exist" (which is what lets `aws cloudformation deploy` re-create it). (#1345)
+    """
+    tpl = json.dumps({
+        "Resources": {
+            "P": {"Type": "AWS::SSM::Parameter",
+                  "Properties": {"Type": "String", "Value": "v1"}},
+        },
+    })
+    name = "cfn-recreate-1345"
+    first_id = cfn.create_stack(StackName=name, TemplateBody=tpl)["StackId"]
+    assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+
+    cfn.delete_stack(StackName=name)
+    assert _wait_stack(cfn, name)["StackStatus"] == "DELETE_COMPLETE"
+
+    # By name: gone. By unique stack ID: still visible as DELETE_COMPLETE.
+    with pytest.raises(ClientError) as exc:
+        cfn.describe_stacks(StackName=name)
+    assert exc.value.response["Error"]["Code"] == "ValidationError"
+    assert "does not exist" in exc.value.response["Error"]["Message"]
+    by_id = cfn.describe_stacks(StackName=first_id)["Stacks"][0]
+    assert by_id["StackStatus"] == "DELETE_COMPLETE"
+
+    # UpdateStack against the deleted name is "does not exist", not "cannot be updated".
+    with pytest.raises(ClientError) as uexc:
+        cfn.update_stack(StackName=name, TemplateBody=tpl)
+    assert "does not exist" in uexc.value.response["Error"]["Message"]
+
+    # The name re-creates cleanly as a brand-new stack (new stack ID).
+    second_id = cfn.create_stack(StackName=name, TemplateBody=tpl)["StackId"]
+    assert second_id != first_id
+    assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+    cfn.delete_stack(StackName=name)
+    _wait_stack(cfn, name)
+
+
 def test_cfn_stack_with_parameters(cfn, sqs):
     template = {
         "AWSTemplateFormatVersion": "2010-09-09",
@@ -469,6 +520,167 @@ def test_cfn_stack_with_parameters(cfn, sqs):
 
     urls = sqs.list_queues(QueueNamePrefix="cfn-t02-custom").get("QueueUrls", [])
     assert any("cfn-t02-custom" in u for u in urls)
+
+
+def test_cfn_unnamed_dynamodb_table_survives_unrelated_update(cfn, ddb, ssm):
+    """A stack update must not touch an auto-named resource whose own
+    properties didn't change — DynamoDB::Table has no update handler, so it
+    falls back to calling create again on every update. That create wasn't
+    idempotent: with no explicit TableName, it derived a fresh name every
+    call, so any update of a stack containing an unnamed table silently
+    created a second, empty table under a new name — and an unrelated
+    resource referencing the table via Ref (real CloudFormation propagates
+    that Ref's resolved value on every update) picked up that new, wrong
+    identity the moment it was reprocessed."""
+    def template(param_value_source):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "Table": {
+                    "Type": "AWS::DynamoDB::Table",
+                    "Properties": {
+                        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                        "BillingMode": "PAY_PER_REQUEST",
+                    },
+                },
+                "Param": {
+                    "Type": "AWS::SSM::Parameter",
+                    "Properties": {
+                        "Name": "/cfn-t02f/table-name",
+                        "Type": "String",
+                        "Value": param_value_source,
+                        "Description": "unrelated change forces this resource to be reprocessed",
+                    },
+                },
+            },
+        })
+
+    cfn.create_stack(StackName="cfn-t02f", TemplateBody=template({"Ref": "Table"}))
+    _wait_stack(cfn, "cfn-t02f")
+    tables_before = set(ddb.list_tables()["TableNames"])
+    table_name_before = ssm.get_parameter(Name="/cfn-t02f/table-name")["Parameter"]["Value"]
+    assert table_name_before in tables_before
+
+    # Table itself is untouched; only Param's Description changes (forcing
+    # Param, not Table, to actually be reprocessed this update).
+    cfn.update_stack(StackName="cfn-t02f", TemplateBody=template({"Ref": "Table"}))
+    stack = _wait_stack(cfn, "cfn-t02f")
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+
+    tables_after = set(ddb.list_tables()["TableNames"])
+    table_name_after = ssm.get_parameter(Name="/cfn-t02f/table-name")["Parameter"]["Value"]
+    assert tables_after == tables_before
+    assert table_name_after == table_name_before
+    
+def test_cfn_ssm_parameter_value_type_resolves_stored_value(cfn, ssm, sqs):
+    """A `AWS::SSM::Parameter::Value<String>` template parameter's Default/
+    provided value is an SSM parameter *name*, not the value itself — real
+    CloudFormation resolves it against SSM Parameter Store before `Ref` ever
+    sees it (the mechanism behind CDK's `StringParameter.valueForStringParameter`).
+    Ref must yield the stored value, not the parameter name."""
+    ssm.put_parameter(Name="/cfn-t02c/queue-name", Value="cfn-t02c-resolved", Type="String")
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Parameters": {
+            "QueueName": {
+                "Type": "AWS::SSM::Parameter::Value<String>",
+                "Default": "/cfn-t02c/queue-name",
+            }
+        },
+        "Resources": {
+            "Queue": {
+                "Type": "AWS::SQS::Queue",
+                "Properties": {"QueueName": {"Ref": "QueueName"}},
+            }
+        },
+    }
+    cfn.create_stack(StackName="cfn-t02c", TemplateBody=json.dumps(template))
+    _wait_stack(cfn, "cfn-t02c")
+
+    urls = sqs.list_queues(QueueNamePrefix="cfn-t02c-resolved").get("QueueUrls", [])
+    assert any("cfn-t02c-resolved" in u for u in urls)
+    # Never the literal parameter name — that would mean resolution silently
+    # fell back to treating the SSM path as the value itself.
+    urls_by_name = sqs.list_queues(QueueNamePrefix="cfn-t02c/queue-name").get("QueueUrls", [])
+    assert urls_by_name == []
+
+
+def test_cfn_ssm_parameter_value_type_use_previous_value_on_update(cfn, ssm, sqs):
+    """A change set that re-sends an AWS::SSM::Parameter::Value<String>
+    parameter as UsePreviousValue (the `aws cloudformation deploy`
+    no-`--parameter-overrides` path, and what CDK sends for parameters it
+    isn't touching, e.g. its own BootstrapVersion) must reuse the
+    already-resolved value from the prior deployment as-is — not feed that
+    resolved value back into another SSM lookup, where it would almost
+    never itself be a valid parameter name and the update would fail."""
+    ssm.put_parameter(Name="/cfn-t02e/queue-name", Value="cfn-t02e-resolved", Type="String")
+
+    def template(bucket_tag):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Parameters": {
+                "QueueName": {
+                    "Type": "AWS::SSM::Parameter::Value<String>",
+                    "Default": "/cfn-t02e/queue-name",
+                },
+                "Tag": {"Type": "String", "Default": bucket_tag},
+            },
+            "Resources": {
+                "Queue": {
+                    "Type": "AWS::SQS::Queue",
+                    "Properties": {
+                        "QueueName": {"Ref": "QueueName"},
+                        "Tags": [{"Key": "build", "Value": {"Ref": "Tag"}}],
+                    },
+                }
+            },
+        })
+
+    cfn.create_stack(StackName="cfn-t02e", TemplateBody=template("v1"))
+    _wait_stack(cfn, "cfn-t02e")
+
+    # Second deploy changes an unrelated parameter (Tag) and re-sends
+    # QueueName as UsePreviousValue, exactly as CDK does for parameters it
+    # isn't updating this deploy.
+    cfn.create_change_set(
+        StackName="cfn-t02e", ChangeSetName="cs2", TemplateBody=template("v2"),
+        Parameters=[{"ParameterKey": "QueueName", "UsePreviousValue": True}],
+    )
+    cfn.execute_change_set(StackName="cfn-t02e", ChangeSetName="cs2")
+    stack = _wait_stack(cfn, "cfn-t02e")
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+
+    urls = sqs.list_queues(QueueNamePrefix="cfn-t02e-resolved").get("QueueUrls", [])
+    assert any("cfn-t02e-resolved" in u for u in urls)
+
+
+def test_cfn_ssm_parameter_value_type_missing_parameter_fails_stack(cfn):
+    """An `AWS::SSM::Parameter::Value<String>` naming a parameter that was
+    never put must fail the same way real CloudFormation does — a
+    synchronous ValidationError at CreateStack time (parameter resolution
+    happens before the stack is created), not a silent resolve to the
+    parameter's own name string."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Parameters": {
+            "QueueName": {
+                "Type": "AWS::SSM::Parameter::Value<String>",
+                "Default": "/cfn-t02d/does-not-exist",
+            }
+        },
+        "Resources": {
+            "Queue": {
+                "Type": "AWS::SQS::Queue",
+                "Properties": {"QueueName": {"Ref": "QueueName"}},
+            }
+        },
+    }
+    with pytest.raises(ClientError) as exc_info:
+        cfn.create_stack(StackName="cfn-t02d", TemplateBody=json.dumps(template))
+    assert exc_info.value.response["Error"]["Code"] == "ValidationError"
+
 
 def test_cfn_change_set_use_previous_value_updates_resource(cfn, ssm):
     """A change set created with UsePreviousValue (the `aws cloudformation deploy`
@@ -3781,6 +3993,50 @@ def test_cfn_eventbus_getatt_arn(cfn, eb):
     _wait_stack(cfn, "cfn-eb-t03")
 
 
+def test_cfn_eventbus_survives_unrelated_update(cfn, eb, sqs):
+    """A stack update must not fail an unchanged AWS::Events::EventBus.
+
+    EventBus has no update handler, so an update falls back to calling
+    create again — a name that already exists (its own, from the previous
+    deploy — e.g. a name computed client-side and baked into the template,
+    like CDK's EventBus construct default-names its bus) previously made
+    every update of a stack containing one fail with "already exists", even
+    when nothing about the bus itself changed. Fixed generically (see
+    _update_resource's no-op short-circuit), not with EventBus-specific
+    logic — this exercises that general fix against a real resource type
+    known to hit it."""
+    def template(queue_name):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "Bus": {
+                    "Type": "AWS::Events::EventBus",
+                    "Properties": {"Name": "cfn-eb-t10"},
+                },
+                "Queue": {
+                    "Type": "AWS::SQS::Queue",
+                    "Properties": {"QueueName": queue_name},
+                },
+            },
+        })
+
+    cfn.create_stack(StackName="cfn-eb-t10", TemplateBody=template("cfn-eb-t10-q1"))
+    stack = _wait_stack(cfn, "cfn-eb-t10")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    bus_before = eb.describe_event_bus(Name="cfn-eb-t10")
+
+    # Only the queue changes — the bus is untouched, exactly like a real
+    # redeploy that doesn't touch AuditTrail at all.
+    cfn.update_stack(StackName="cfn-eb-t10", TemplateBody=template("cfn-eb-t10-q2"))
+    stack = _wait_stack(cfn, "cfn-eb-t10")
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+
+    bus_after = eb.describe_event_bus(Name="cfn-eb-t10")
+    assert bus_after["Arn"] == bus_before["Arn"]
+    urls = sqs.list_queues(QueueNamePrefix="cfn-eb-t10-q2").get("QueueUrls", [])
+    assert any("cfn-eb-t10-q2" in u for u in urls)
+
+
 def test_cfn_eventbus_tags(cfn, eb):
     """Test EventBus tags are propagated."""
     template = {
@@ -4471,6 +4727,58 @@ def test_cfn_apigwv2_authorizer_jwt(cfn, apigw):
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
     _assert_apigwv2_api_not_found(lambda: apigw.get_authorizers(ApiId=api_id))
+
+
+def test_cfn_apigwv2_authorizer_update_trusts_additional_audience(cfn, apigw):
+    """Updating an Authorizer's JwtConfiguration (e.g. trusting an
+    additional app client's audience — hotshot's multi-app-support Phase B)
+    must mutate the same authorizer in place, not mint a second one.
+
+    Regression test: AWS::ApiGatewayV2::Authorizer had no update handler,
+    so a property change fell back to create — whose authorizerId is a
+    fresh random value every call (unlike name-based resources, there's no
+    stable identity to derive) — leaving a second, orphaned authorizer
+    while the Route's own (unchanged) AuthorizerId kept pointing at the
+    original, now-stale one with the old audience list."""
+    def template(audience):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "HttpApi": {
+                    "Type": "AWS::ApiGatewayV2::Api",
+                    "Properties": {"Name": "cfn-apigwv2-authorizer-t02", "ProtocolType": "HTTP"},
+                },
+                "JwtAuthorizer": {
+                    "Type": "AWS::ApiGatewayV2::Authorizer",
+                    "Properties": {
+                        "ApiId": {"Ref": "HttpApi"},
+                        "Name": "cfn-apigwv2-authorizer-t02-jwt",
+                        "AuthorizerType": "JWT",
+                        "IdentitySource": ["$request.header.Authorization"],
+                        "JwtConfiguration": {
+                            "Audience": audience,
+                            "Issuer": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_example",
+                        },
+                    },
+                },
+            },
+        })
+
+    stack_name = "cfn-apigwv2-authorizer-t02"
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(["client-a"]))
+    _wait_stack(cfn, stack_name)
+    resources = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+    api_id = [r for r in resources if r["ResourceType"] == "AWS::ApiGatewayV2::Api"][0]["PhysicalResourceId"]
+    authorizer_id_before = [r for r in resources if r["ResourceType"] == "AWS::ApiGatewayV2::Authorizer"][0]["PhysicalResourceId"]
+
+    cfn.update_stack(StackName=stack_name, TemplateBody=template(["client-a", "client-b"]))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+
+    authorizers = apigw.get_authorizers(ApiId=api_id)["Items"]
+    assert len(authorizers) == 1
+    assert authorizers[0]["AuthorizerId"] == authorizer_id_before
+    assert authorizers[0]["JwtConfiguration"]["Audience"] == ["client-a", "client-b"]
 
 
 def test_cfn_apigwv2_integration_getatt(cfn, apigw):
@@ -7551,3 +7859,603 @@ def test_cfn_kms_key_delete_schedules_deletion(cfn, kms_client):
     assert meta["KeyState"] == "PendingDeletion"
     assert meta["Enabled"] is False
     assert "DeletionDate" in meta
+
+
+# ===========================================================================
+# CloudFormation Custom Resource protocol tests
+# (merged from the former tests/test_cfn_custom_resource.py — #603)
+# Reuses this module's _wait_stack / _regional_cfn_test_client helpers.
+# ===========================================================================
+
+_CR_ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+_CR_LAMBDA_ROLE = "arn:aws:iam::000000000000:role/lambda-role"
+
+
+def _cr_make_zip(code: str) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    return buf.getvalue()
+
+
+def _cfn_custom_template(func_name, resource_type="Custom::Tester", extra_props=None, outputs=None):
+    """Build a CF template with a single custom resource."""
+    props = {"ServiceToken": f"arn:aws:lambda:us-east-1:000000000000:function:{func_name}"}
+    if extra_props:
+        props.update(extra_props)
+    tpl = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "CR": {
+                "Type": resource_type,
+                "Properties": props,
+            }
+        },
+    }
+    if outputs:
+        tpl["Outputs"] = outputs
+    return json.dumps(tpl)
+
+
+# -- token registry smoke test ----------------------------------------------
+
+def test_cfn_response_endpoint_accepts_put(cfn):
+    """PUT to /_ministack/cfn-response/{token} returns 200 even for unknown tokens."""
+    token = str(_uuid_mod.uuid4())
+    payload = json.dumps({"Status": "SUCCESS", "PhysicalResourceId": "x",
+                          "RequestId": "r", "StackId": "s", "LogicalResourceId": "l"}).encode()
+    req = urllib.request.Request(
+        f"{_CR_ENDPOINT}/_ministack/cfn-response/{token}",
+        data=payload,
+        method="PUT",
+        headers={"content-type": "", "content-length": str(len(payload))},
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        assert resp.status == 200
+
+
+# -- Create lifecycle -------------------------------------------------------
+
+_CR_HANDLER_SUCCESS = """\
+import json, urllib.request
+
+def handler(event, context):
+    payload = json.dumps({
+        "Status": "SUCCESS",
+        "RequestId": event["RequestId"],
+        "StackId": event["StackId"],
+        "LogicalResourceId": event["LogicalResourceId"],
+        "PhysicalResourceId": "my-custom-resource-123",
+        "Data": {"Endpoint": "https://example.com", "Region": "us-east-1"},
+    }).encode()
+    req = urllib.request.Request(
+        event["ResponseURL"],
+        data=payload,
+        method="PUT",
+        headers={"content-type": "", "content-length": str(len(payload))},
+    )
+    urllib.request.urlopen(req, timeout=10)
+"""
+
+
+_CR_HANDLER_CDK_COMPAT = """\
+import json, urllib.request
+
+def handler(event, context):
+    props = event["ResourceProperties"]
+    managed = props.get("Managed", "true").lower() == "true"
+    skip_validation = props.get("SkipDestinationValidation", "false").lower() == "true"
+    payload = json.dumps({
+        "Status": "SUCCESS",
+        "Reason": f"See the details in CloudWatch Log Stream: {context.log_stream_name}",
+        "RequestId": event["RequestId"],
+        "StackId": event["StackId"],
+        "LogicalResourceId": event["LogicalResourceId"],
+        "PhysicalResourceId": "cdk-compatible-resource",
+        "Data": {
+            "Managed": str(managed),
+            "SkipDestinationValidation": str(skip_validation),
+            "NestedEnabled": props["Nested"]["Enabled"],
+            "NestedCount": props["Nested"]["Count"],
+        },
+    }).encode()
+    req = urllib.request.Request(
+        event["ResponseURL"],
+        data=payload,
+        method="PUT",
+        headers={"content-type": "", "content-length": str(len(payload))},
+    )
+    urllib.request.urlopen(req, timeout=10)
+"""
+
+
+def test_custom_resource_create_success(cfn, lam):
+    lam.create_function(
+        FunctionName="cr-test-success",
+        Runtime="python3.12",
+        Role=_CR_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_SUCCESS)},
+    )
+    try:
+        cfn.create_stack(
+            StackName="cr-t01",
+            TemplateBody=_cfn_custom_template("cr-test-success"),
+        )
+        stack = _wait_stack(cfn, "cr-t01")
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        res = cfn.describe_stack_resource(StackName="cr-t01", LogicalResourceId="CR")
+        assert res["StackResourceDetail"]["PhysicalResourceId"] == "my-custom-resource-123"
+    finally:
+        cfn.delete_stack(StackName="cr-t01")
+        _wait_stack(cfn, "cr-t01")
+        lam.delete_function(FunctionName="cr-test-success")
+
+
+def test_custom_resource_cdk_boolean_properties_and_lambda_context(cfn, lam):
+    """CDK-style handlers receive string leaves and standard Lambda context."""
+    lam.create_function(
+        FunctionName="cr-test-cdk-compat",
+        Runtime="python3.12",
+        Role=_CR_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_CDK_COMPAT)},
+    )
+    props = {
+        "ServiceTimeout": "2",
+        "Managed": True,
+        "SkipDestinationValidation": False,
+        "Nested": {"Enabled": True, "Count": 2},
+    }
+    outputs = {
+        "Managed": {"Value": {"Fn::GetAtt": ["CR", "Managed"]}},
+        "SkipDestinationValidation": {
+            "Value": {"Fn::GetAtt": ["CR", "SkipDestinationValidation"]}
+        },
+        "NestedEnabled": {"Value": {"Fn::GetAtt": ["CR", "NestedEnabled"]}},
+        "NestedCount": {"Value": {"Fn::GetAtt": ["CR", "NestedCount"]}},
+    }
+    try:
+        cfn.create_stack(
+            StackName="cr-t01-cdk-compat",
+            TemplateBody=_cfn_custom_template("cr-test-cdk-compat", extra_props=props, outputs=outputs),
+        )
+        stack = _wait_stack(cfn, "cr-t01-cdk-compat")
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        values = {item["OutputKey"]: item["OutputValue"] for item in stack.get("Outputs", [])}
+        assert values == {
+            "Managed": "True",
+            "SkipDestinationValidation": "False",
+            "NestedEnabled": "true",
+            "NestedCount": "2",
+        }
+    finally:
+        cfn.delete_stack(StackName="cr-t01-cdk-compat")
+        _wait_stack(cfn, "cr-t01-cdk-compat")
+        lam.delete_function(FunctionName="cr-test-cdk-compat")
+
+
+def test_custom_resource_type_prefix(cfn, lam):
+    """Custom::Tester and AWS::CloudFormation::CustomResource both work."""
+    lam.create_function(
+        FunctionName="cr-test-prefix",
+        Runtime="python3.12",
+        Role=_CR_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_SUCCESS)},
+    )
+    try:
+        cfn.create_stack(
+            StackName="cr-t02a",
+            TemplateBody=_cfn_custom_template("cr-test-prefix", resource_type="Custom::MyTester"),
+        )
+        stack = _wait_stack(cfn, "cr-t02a")
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+        cfn.create_stack(
+            StackName="cr-t02b",
+            TemplateBody=_cfn_custom_template("cr-test-prefix", resource_type="AWS::CloudFormation::CustomResource"),
+        )
+        stack = _wait_stack(cfn, "cr-t02b")
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+    finally:
+        for name in ("cr-t02a", "cr-t02b"):
+            try:
+                cfn.delete_stack(StackName=name)
+                _wait_stack(cfn, name)
+            except Exception:
+                pass
+        lam.delete_function(FunctionName="cr-test-prefix")
+
+
+# -- FAILED status -> rollback ----------------------------------------------
+
+_CR_HANDLER_FAILED = """\
+import json, urllib.request
+
+def handler(event, context):
+    payload = json.dumps({
+        "Status": "FAILED",
+        "Reason": "Intentional test failure",
+        "RequestId": event["RequestId"],
+        "StackId": event["StackId"],
+        "LogicalResourceId": event["LogicalResourceId"],
+        "PhysicalResourceId": "failed-resource",
+    }).encode()
+    req = urllib.request.Request(
+        event["ResponseURL"],
+        data=payload,
+        method="PUT",
+        headers={"content-type": "", "content-length": str(len(payload))},
+    )
+    urllib.request.urlopen(req, timeout=10)
+"""
+
+
+def test_custom_resource_create_failed_triggers_rollback(cfn, lam):
+    lam.create_function(
+        FunctionName="cr-test-fail",
+        Runtime="python3.12",
+        Role=_CR_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_FAILED)},
+    )
+    try:
+        cfn.create_stack(StackName="cr-t03", TemplateBody=_cfn_custom_template("cr-test-fail"))
+        stack = _wait_stack(cfn, "cr-t03")
+        assert stack["StackStatus"] in ("ROLLBACK_COMPLETE", "CREATE_FAILED"), stack
+    finally:
+        try:
+            cfn.delete_stack(StackName="cr-t03")
+            _wait_stack(cfn, "cr-t03")
+        except Exception:
+            pass
+        lam.delete_function(FunctionName="cr-test-fail")
+
+
+# -- Update lifecycle -------------------------------------------------------
+
+_CR_HANDLER_RECORD = """\
+import json, urllib.request
+
+def handler(event, context):
+    # Echo what was received so tests can inspect it
+    data = {
+        "RequestType": event["RequestType"],
+        "PhysicalResourceId": event.get("PhysicalResourceId", ""),
+        "HasOldProps": str("OldResourceProperties" in event),
+        "OldFoo": str(event.get("OldResourceProperties", {}).get("Foo", "")),
+        "NewFoo": str(event.get("ResourceProperties", {}).get("Foo", "")),
+    }
+    pid = event.get("PhysicalResourceId") or "recorded-resource-id"
+    payload = json.dumps({
+        "Status": "SUCCESS",
+        "RequestId": event["RequestId"],
+        "StackId": event["StackId"],
+        "LogicalResourceId": event["LogicalResourceId"],
+        "PhysicalResourceId": pid,
+        "Data": data,
+    }).encode()
+    req = urllib.request.Request(
+        event["ResponseURL"],
+        data=payload,
+        method="PUT",
+        headers={"content-type": "", "content-length": str(len(payload))},
+    )
+    urllib.request.urlopen(req, timeout=10)
+"""
+
+
+def test_custom_resource_update_sends_old_properties(cfn, lam):
+    lam.create_function(
+        FunctionName="cr-test-record",
+        Runtime="python3.12",
+        Role=_CR_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_RECORD)},
+    )
+    try:
+        tpl_v1 = _cfn_custom_template("cr-test-record", extra_props={"Foo": "bar-v1"})
+        cfn.create_stack(StackName="cr-t04", TemplateBody=tpl_v1)
+        _wait_stack(cfn, "cr-t04")
+
+        tpl_v2 = _cfn_custom_template(
+            "cr-test-record",
+            extra_props={"Foo": "bar-v2"},
+            outputs={
+                "HasOldPropsOut": {"Value": {"Fn::GetAtt": ["CR", "HasOldProps"]}},
+                "OldFooOut":      {"Value": {"Fn::GetAtt": ["CR", "OldFoo"]}},
+                "NewFooOut":      {"Value": {"Fn::GetAtt": ["CR", "NewFoo"]}},
+            },
+        )
+        cfn.update_stack(StackName="cr-t04", TemplateBody=tpl_v2)
+        stack = _wait_stack(cfn, "cr-t04")
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+
+        res = cfn.describe_stack_resource(StackName="cr-t04", LogicalResourceId="CR")
+        assert res["StackResourceDetail"]["ResourceStatus"] == "UPDATE_COMPLETE"
+
+        # Verify OldResourceProperties were forwarded to the Lambda on Update
+        outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+        assert outputs.get("HasOldPropsOut") == "True", f"OldResourceProperties missing: {outputs}"
+        assert outputs.get("OldFooOut") == "bar-v1", f"OldFoo wrong: {outputs}"
+        assert outputs.get("NewFooOut") == "bar-v2", f"NewFoo wrong: {outputs}"
+    finally:
+        cfn.delete_stack(StackName="cr-t04")
+        _wait_stack(cfn, "cr-t04")
+        lam.delete_function(FunctionName="cr-test-record")
+
+
+def test_custom_resource_delete_sends_physical_id(cfn, lam):
+    """Stack delete must send the PhysicalResourceId from Create to the Lambda."""
+    _CR_DELETE_CHECK = """\
+import json, urllib.request
+
+def handler(event, context):
+    data = {
+        "RequestType": event["RequestType"],
+        "ReceivedPhysicalId": event.get("PhysicalResourceId", "MISSING"),
+    }
+    pid = event.get("PhysicalResourceId") or "delete-test-id"
+    payload = json.dumps({
+        "Status": "SUCCESS",
+        "RequestId": event["RequestId"],
+        "StackId": event["StackId"],
+        "LogicalResourceId": event["LogicalResourceId"],
+        "PhysicalResourceId": pid,
+        "Data": data,
+    }).encode()
+    req = urllib.request.Request(
+        event["ResponseURL"],
+        data=payload,
+        method="PUT",
+        headers={"content-type": "", "content-length": str(len(payload))},
+    )
+    urllib.request.urlopen(req, timeout=10)
+"""
+
+    lam.create_function(
+        FunctionName="cr-test-delete",
+        Runtime="python3.12",
+        Role=_CR_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_DELETE_CHECK)},
+    )
+    try:
+        cfn.create_stack(StackName="cr-t05", TemplateBody=_cfn_custom_template("cr-test-delete"))
+        _wait_stack(cfn, "cr-t05")
+
+        res = cfn.describe_stack_resource(StackName="cr-t05", LogicalResourceId="CR")
+        create_pid = res["StackResourceDetail"]["PhysicalResourceId"]
+        assert create_pid  # must be non-empty
+
+        cfn.delete_stack(StackName="cr-t05")
+        stack = _wait_stack(cfn, "cr-t05")
+        assert stack["StackStatus"] == "DELETE_COMPLETE", stack
+    finally:
+        try:
+            cfn.delete_stack(StackName="cr-t05")
+            _wait_stack(cfn, "cr-t05")
+        except Exception:
+            pass
+        lam.delete_function(FunctionName="cr-test-delete")
+
+
+# -- Data accessible via Fn::GetAtt -----------------------------------------
+
+def test_custom_resource_data_via_getatt(cfn, lam, ssm):
+    """Data keys returned by the Lambda are accessible via Fn::GetAtt in outputs."""
+    lam.create_function(
+        FunctionName="cr-test-getatt",
+        Runtime="python3.12",
+        Role=_CR_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_SUCCESS)},
+    )
+    tpl = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "CR": {
+                "Type": "Custom::GetAttTest",
+                "Properties": {
+                    "ServiceToken": "arn:aws:lambda:us-east-1:000000000000:function:cr-test-getatt",
+                },
+            },
+            "Param": {
+                "Type": "AWS::SSM::Parameter",
+                "Properties": {
+                    "Name": "cr-t06-endpoint",
+                    "Type": "String",
+                    "Value": {"Fn::GetAtt": ["CR", "Endpoint"]},
+                },
+            },
+        },
+    }
+    try:
+        cfn.create_stack(StackName="cr-t06", TemplateBody=json.dumps(tpl))
+        stack = _wait_stack(cfn, "cr-t06")
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        val = ssm.get_parameter(Name="cr-t06-endpoint")["Parameter"]["Value"]
+        assert val == "https://example.com"
+    finally:
+        cfn.delete_stack(StackName="cr-t06")
+        _wait_stack(cfn, "cr-t06")
+        lam.delete_function(FunctionName="cr-test-getatt")
+
+
+# -- PhysicalResourceId fallback --------------------------------------------
+
+_CR_HANDLER_NO_PID = """\
+import json, urllib.request
+
+def handler(event, context):
+    # Deliberately omit PhysicalResourceId - Ministack should use RequestId
+    payload = json.dumps({
+        "Status": "SUCCESS",
+        "RequestId": event["RequestId"],
+        "StackId": event["StackId"],
+        "LogicalResourceId": event["LogicalResourceId"],
+    }).encode()
+    req = urllib.request.Request(
+        event["ResponseURL"],
+        data=payload,
+        method="PUT",
+        headers={"content-type": "", "content-length": str(len(payload))},
+    )
+    urllib.request.urlopen(req, timeout=10)
+"""
+
+
+def test_custom_resource_physical_id_fallback(cfn, lam):
+    """When Lambda omits PhysicalResourceId on Create, Ministack falls back to RequestId."""
+    lam.create_function(
+        FunctionName="cr-test-nopid",
+        Runtime="python3.12",
+        Role=_CR_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_NO_PID)},
+    )
+    try:
+        cfn.create_stack(StackName="cr-t07", TemplateBody=_cfn_custom_template("cr-test-nopid"))
+        stack = _wait_stack(cfn, "cr-t07")
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+        res = cfn.describe_stack_resource(StackName="cr-t07", LogicalResourceId="CR")
+        pid = res["StackResourceDetail"]["PhysicalResourceId"]
+        # Must be a non-empty UUID (the RequestId fallback)
+        assert pid and len(pid) > 8
+    finally:
+        cfn.delete_stack(StackName="cr-t07")
+        _wait_stack(cfn, "cr-t07")
+        lam.delete_function(FunctionName="cr-test-nopid")
+
+
+# -- Async response (Lambda returns before PUTting ResponseURL) -------------
+
+_CR_HANDLER_ASYNC = """\
+import json, threading, time, urllib.request
+
+def handler(event, context):
+    # Return immediately; a background thread delivers the response after a delay.
+    captured = dict(event)
+
+    def respond():
+        time.sleep(0.5)
+        payload = json.dumps({
+            "Status": "SUCCESS",
+            "RequestId": captured["RequestId"],
+            "StackId": captured["StackId"],
+            "LogicalResourceId": captured["LogicalResourceId"],
+            "PhysicalResourceId": "async-resource-id",
+            "Data": {"AsyncResult": "done"},
+        }).encode()
+        req = urllib.request.Request(
+            captured["ResponseURL"],
+            data=payload,
+            method="PUT",
+            headers={"content-type": "", "content-length": str(len(payload))},
+        )
+        urllib.request.urlopen(req, timeout=10)
+
+    threading.Thread(target=respond, daemon=True).start()
+"""
+
+
+def test_custom_resource_async_response(cfn, lam):
+    """Lambda returns without responding; background thread PUTs to ResponseURL later."""
+    lam.create_function(
+        FunctionName="cr-test-async",
+        Runtime="python3.12",
+        Role=_CR_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_ASYNC)},
+    )
+    try:
+        cfn.create_stack(StackName="cr-t08", TemplateBody=_cfn_custom_template("cr-test-async"))
+        stack = _wait_stack(cfn, "cr-t08", timeout=30)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        res = cfn.describe_stack_resource(StackName="cr-t08", LogicalResourceId="CR")
+        assert res["StackResourceDetail"]["PhysicalResourceId"] == "async-resource-id"
+    finally:
+        cfn.delete_stack(StackName="cr-t08")
+        _wait_stack(cfn, "cr-t08")
+        lam.delete_function(FunctionName="cr-test-async")
+
+
+# -- Timeout ----------------------------------------------------------------
+
+_CR_HANDLER_SILENT = """\
+def handler(event, context):
+    # Never PUTs to ResponseURL - triggers timeout
+    pass
+"""
+
+
+def test_custom_resource_timeout_fails_stack(cfn, lam):
+    """ServiceTimeout=2 with a silent Lambda causes the stack to fail."""
+    lam.create_function(
+        FunctionName="cr-test-timeout",
+        Runtime="python3.12",
+        Role=_CR_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_SILENT)},
+    )
+    tpl = _cfn_custom_template("cr-test-timeout", extra_props={"ServiceTimeout": "2"})
+    try:
+        cfn.create_stack(StackName="cr-t09", TemplateBody=tpl)
+        stack = _wait_stack(cfn, "cr-t09", timeout=30)
+        assert stack["StackStatus"] in ("ROLLBACK_COMPLETE", "CREATE_FAILED"), stack
+    finally:
+        try:
+            cfn.delete_stack(StackName="cr-t09")
+            _wait_stack(cfn, "cr-t09")
+        except Exception:
+            pass
+        lam.delete_function(FunctionName="cr-test-timeout")
+
+
+# -- Lambda not found -------------------------------------------------------
+
+def test_custom_resource_lambda_not_found(cfn):
+    """ServiceToken pointing to a nonexistent Lambda fails the stack immediately."""
+    tpl = _cfn_custom_template("cr-does-not-exist-function")
+    try:
+        cfn.create_stack(StackName="cr-t10", TemplateBody=tpl)
+        stack = _wait_stack(cfn, "cr-t10")
+        assert stack["StackStatus"] in ("ROLLBACK_COMPLETE", "CREATE_FAILED"), stack
+    finally:
+        try:
+            cfn.delete_stack(StackName="cr-t10")
+            _wait_stack(cfn, "cr-t10")
+        except Exception:
+            pass
+
+
+def test_custom_resource_rejects_cross_region_lambda_token(cfn):
+    west_lam = _regional_cfn_test_client("lambda", "us-west-2")
+    fn_name = f"cr-cross-region-{_uuid_mod.uuid4().hex[:8]}"
+    stack_name = f"cr-cross-{_uuid_mod.uuid4().hex[:8]}"
+    west_arn = west_lam.create_function(
+        FunctionName=fn_name,
+        Runtime="python3.12",
+        Role=_CR_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_SUCCESS)},
+    )["FunctionArn"]
+
+    tpl = _cfn_custom_template(fn_name, extra_props={"ServiceToken": west_arn})
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=tpl)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] in ("ROLLBACK_COMPLETE", "CREATE_FAILED"), stack
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        except Exception:
+            pass
+        west_lam.delete_function(FunctionName=fn_name)

@@ -5,6 +5,24 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [1.4.16] — 2026-08-12
+
+### Added
+- **Aurora DSQL emulator** — control plane over the REST-JSON API (cluster lifecycle, tags, and cluster policies; `clientToken` idempotency, `deletionProtectionEnabled`, `expectedPolicyVersion` concurrency). With `DSQL_STRICT=1` and Docker, each cluster gets a real Postgres container fronted by an in-process wire-protocol proxy enforcing DSQL's SQL subset; otherwise it goes `ACTIVE` metadata-only. Tunable via `DSQL_BASE_PORT` / `DSQL_STRICT` / `DSQL_PERSIST` / `DSQL_PG_IMAGE`. Contributed by @ry-allan.
+
+### Fixed
+- **CloudFormation — resources unchanged by a stack update are left alone** — an unchanged resource was reprocessed on every update, and a type with no update handler fell back to create with a fresh random name, orphaning the real resource (and any `Ref`/`Fn::GetAtt` to it). Unchanged resources are now skipped, and auto-generated names are a deterministic hash of (stack name, logical id). Also fixes the `AWS::Events::EventBus` "already exists" update failure. Contributed by @ryan-bennett.
+- **CloudFormation — `AWS::ApiGatewayV2::Authorizer` survives a property update** — with no update handler, changing a property fell back to create and minted a second, orphaned authorizer; an update handler now mutates the existing record in place. Contributed by @ryan-bennett.
+- **CloudFormation — `AWS::SSM::Parameter::Value<...>` parameters resolve against SSM** — the SSM parameter *name* was passed straight through, so `Ref` returned the name instead of the stored value; it's now resolved against Parameter Store (a missing name fails the stack with `ValidationError`). Contributed by @ryan-bennett.
+- **CloudFormation — a `DELETE_COMPLETE` stack's name can be re-created** — a deleted stack stayed addressable by name, so `deploy` took the update path ("cannot be updated") instead of re-creating. A deleted stack is now addressable only by its stack ID; describe/update/change-set by name report "does not exist", so the name re-deploys as a fresh stack. Reported by @iot-rocket.
+- **S3 — versioned objects retain their custom metadata** — the per-version record dropped `x-amz-meta-*`, preserved headers, and content-encoding, and versioned `GetObject`/`HeadObject` bypassed the metadata emitter; each version now stores and returns its own metadata. Reported by @Kaphaalor.
+- **S3 — `GetBucketLocation` returns the bucket's stored region** — the location was compared against the configurable default region (so a non-`us-east-1` default blanked it) and buckets created without a `LocationConstraint` stored no region; a bucket now records its signing region and `GetBucketLocation` echoes it, returning empty only for `us-east-1`. Contributed by @iot-rocket.
+- **API Gateway (REST) — custom Lambda authorizers are invoked on the request path** — a `CUSTOM` method never called its authorizer. `TOKEN`/`REQUEST` authorizers now run on the data path: `401` on a missing identity source, `403` on `Deny`/no-match, `authorizerResultTtlInSeconds` caching, and `context` (stringified) plus `principalId` injected into `requestContext.authorizer`. `AWS_IAM` methods require an `Authorization` header (`403`); SigV4 is not verified. Reported by @iot-rocket.
+- **API Gateway (REST) — an unsupported resource or method returns `403`** — an unmatched path returned `404` and a matched resource with no method returned `405`; both now return `403 Missing Authentication Token` (a methodless resource does not fall through to a `{proxy+}` sibling). Reported by @iot-rocket.
+- **Route 53 — a change is born `PENDING` then flips to `INSYNC`** — every change was created `INSYNC`, so `GetChange` never returned `PENDING`; changes are now `PENDING` and flip to `INSYNC` on the first `GetChange` read. Reported by @jayjanssen.
+
 ## [1.4.15] — 2026-08-10
 
 ### Added

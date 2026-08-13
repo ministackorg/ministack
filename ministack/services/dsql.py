@@ -4,9 +4,9 @@ Amazon Aurora DSQL Emulator (control plane + data plane wiring).
 REST-JSON API (no X-Amz-Target; routed on method + path). Covers cluster
 lifecycle, tags, and cluster policies.
 
-Data plane: with ``DSQL_CONTAINERS=1`` and a Docker daemon available, each
-cluster gets a real Postgres container (RDS idiom, capped by
-``DSQL_MAX_CONTAINERS``, default 30) fronted by an in-process wire-protocol
+Data plane: with ``DSQL_STRICT=1`` and a Docker daemon available, each
+cluster gets a real Postgres container (RDS idiom, capped by a fixed port
+window off ``DSQL_BASE_PORT``, default 30 ports) fronted by an in-process wire-protocol
 proxy (`ministack.core.pgproxy`) that enforces DSQL's SQL subset. Otherwise
 the cluster goes ACTIVE metadata-only — nothing listens on its port.
 """
@@ -33,11 +33,15 @@ from ministack.core.responses import (
 logger = logging.getLogger("dsql")
 
 BASE_PORT = int(os.environ.get("DSQL_BASE_PORT", "25432"))
-MAX_CONTAINERS = int(os.environ.get("DSQL_MAX_CONTAINERS", "30"))  # cap on real Postgres backend containers (one per cluster)
+# Real Postgres backend containers are capped by a fixed port window off
+# DSQL_BASE_PORT (one port per cluster), not a separate knob: a cluster whose
+# allocated port falls outside [BASE_PORT, BASE_PORT + _BACKEND_PORT_WINDOW) is
+# served metadata-only.
+_BACKEND_PORT_WINDOW = 30
 PG_IMAGE = os.environ.get("DSQL_PG_IMAGE", "postgres:16-alpine")
 DSQL_PERSIST = os.environ.get("DSQL_PERSIST", "0").lower() in ("1", "true", "yes")
 # Backend containers are opt-in: default is control-plane-only (metadata stubs).
-DSQL_CONTAINERS = os.environ.get("DSQL_CONTAINERS", "0").lower() in ("1", "true", "yes")
+DSQL_STRICT = os.environ.get("DSQL_STRICT", "0").lower() in ("1", "true", "yes")
 
 _clusters = AccountScopedDict()  # identifier -> cluster dict
 _client_tokens = AccountScopedDict()  # clientToken -> identifier (create idempotency)
@@ -188,9 +192,9 @@ def _docker_available():
 def _backends_enabled():
     """Whether real Postgres backend containers should run for clusters.
 
-    Opt-in via ``DSQL_CONTAINERS=1``; default is control-plane-only stubs.
+    Opt-in via ``DSQL_STRICT=1``; default is control-plane-only stubs.
     """
-    return DSQL_CONTAINERS and _docker_available()
+    return DSQL_STRICT and _docker_available()
 
 
 def _container_name(identifier):
@@ -411,14 +415,17 @@ def _create_cluster(data):
     port = _next_port()
     has_backend = _backends_enabled()
     if has_backend:
+        # Cap concurrent backends to the port window off DSQL_BASE_PORT (one
+        # port per cluster). Counting live backends (not the raw port counter)
+        # so a deleted cluster frees capacity.
         backend_count = sum(
             1 for c in _clusters._data.values() if c.get("_has_backend")
         )
-        if backend_count >= MAX_CONTAINERS:
+        if backend_count >= _BACKEND_PORT_WINDOW:
             logger.warning(
-                "DSQL: backend container cap reached (%d) — cluster %s is "
-                "metadata-only. Raise DSQL_MAX_CONTAINERS to allow more.",
-                MAX_CONTAINERS,
+                "DSQL: backend port window off DSQL_BASE_PORT (%d ports) full "
+                "— cluster %s is metadata-only. Widen the range to allow more.",
+                _BACKEND_PORT_WINDOW,
                 identifier,
             )
             has_backend = False
@@ -429,7 +436,7 @@ def _create_cluster(data):
         # With a backend the Postgres container + wire proxy spin up in the
         # background; without one the cluster is metadata-only ACTIVE.
         "status": "CREATING" if has_backend else "ACTIVE",
-        "creationTime": time.time(),
+        "creationTime": int(time.time()),
         # AWS creates clusters with deletion protection ON by default.
         "deletionProtectionEnabled": bool(data.get("deletionProtectionEnabled", True)),
         "encryptionDetails": _encryption_details(data.get("kmsEncryptionKey"), account_id, region),
@@ -844,7 +851,7 @@ def restore_state(data):
     # `_respawn_backend` once the loop is known, or via the lifespan hook
     # `start_restored_proxies`. The cap is deliberately not re-enforced here:
     # clusters that had a backend get it back (best effort), so a restart can
-    # transiently exceed MAX_CONTAINERS.
+    # transiently exceed the backend port window.
     for cluster in _clusters._data.values():
         if not isinstance(cluster, dict) or "identifier" not in cluster:
             continue

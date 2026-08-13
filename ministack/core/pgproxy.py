@@ -5,9 +5,6 @@ One proxy per DSQL cluster: clients connect to the proxy on the cluster's
 localhost port; the proxy forwards frames to a real Postgres backend after
 enforcing DSQL's PostgreSQL-compatibility subset.
 
-Validator behavior is gated by ``DSQL_STRICT`` (default "1"); "0" turns the
-proxy into a transparent passthrough.
-
 Both wire protocols are validated: the simple ``Q`` protocol (psql, psycopg2)
 and the extended ``Parse``/``Bind``/``Execute`` protocol (pgjdbc, pgx, asyncpg,
 psycopg3, and every ORM that uses prepared statements).
@@ -33,7 +30,6 @@ Documented limitations:
 
 import asyncio
 import logging
-import os
 import re
 import secrets
 import string
@@ -43,7 +39,6 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger("pgproxy")
 
-STRICT = os.environ.get("DSQL_STRICT", "1").strip().lower() not in ("0", "false", "no", "off")
 
 # ---------------------------------------------------------------------------
 # Wire-protocol constants and frame helpers
@@ -995,8 +990,6 @@ def validate(sql, txn_state=None):
     Read-only with respect to ``txn_state`` — the caller applies state
     changes (``TxnState.apply``) once the statement is actually forwarded.
     """
-    if not STRICT:
-        return None
     s = strip_leading_comments(sql).strip()
     if not s:
         return None
@@ -1535,7 +1528,7 @@ async def _handle_query(conn, sql, b_writer, c_writer):
     txn = conn.txn
     stmts = split_statements(sql)
 
-    if len(stmts) == 1 and STRICT:
+    if len(stmts) == 1:
         s = strip_leading_comments(stmts[0])
 
         # A statement rejected earlier in this transaction poisoned the block.
@@ -1595,9 +1588,9 @@ async def _handle_query(conn, sql, b_writer, c_writer):
         await b_writer.drain()
         return
 
-    # Multi-statement batch (implicit transaction) or non-strict mode:
-    # validate every statement up front, then forward the batch verbatim.
-    if STRICT and stmts:
+    # Multi-statement batch (implicit transaction): validate every statement
+    # up front, then forward the batch verbatim.
+    if stmts:
         # An aborted block only accepts an explicit rollback; forwarding a
         # batch that opened with COMMIT would commit work the client was told
         # had failed.
@@ -1704,7 +1697,7 @@ async def _ext_parse(conn, payload, b_writer, c_writer):
         return
     s = strip_leading_comments(sql).strip()
     entry = {"sql": s, "synth": None}
-    if not STRICT or not s:
+    if not s:
         conn.ext_stmts[name] = entry
         await _ext_forward(conn, b_writer, b"P", payload)
         return

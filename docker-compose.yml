@@ -14,7 +14,7 @@ services:
       - REDIS_PORT=6379
       - RDS_BASE_PORT=15432
       # - DSQL_BASE_PORT=25432  # first host port for DSQL cluster proxies
-      # - DSQL_CONTAINERS=1  # run a real Postgres container per DSQL cluster (default: control-plane-only)
+      # - DSQL_STRICT=1  # run a real Postgres container per DSQL cluster (default: control-plane-only)
       # - DOCKER_NETWORK=ministack_default  # Docker network for RDS/DSQL/EKS/ElastiCache/Lambda containers
       - ELASTICACHE_BASE_PORT=16379
     volumes:

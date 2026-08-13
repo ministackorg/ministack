@@ -438,7 +438,7 @@ def _create_hosted_zone(body: bytes, query_params: dict):
         if caller_ref in _caller_refs:
             existing_id = _caller_refs[caller_ref]
             zone = _zones[existing_id]
-            change = {"id": _change_id(), "status": "INSYNC", "submitted_at": _now_iso(), "comment": ""}
+            change = {"id": _change_id(), "status": "PENDING", "submitted_at": _now_iso(), "comment": ""}
             def build(root):
                 _build_hosted_zone_el(root, zone)
                 _build_change_info_el(root, change)
@@ -458,7 +458,7 @@ def _create_hosted_zone(body: bytes, query_params: dict):
         _caller_refs[caller_ref] = zone_id
 
         change_id = _change_id()
-        change = {"id": change_id, "status": "INSYNC", "submitted_at": _now_iso(), "comment": ""}
+        change = {"id": change_id, "status": "PENDING", "submitted_at": _now_iso(), "comment": ""}
         _changes[change_id] = change
 
     def build(root):
@@ -498,7 +498,7 @@ def _delete_hosted_zone(zone_id: str):
         del _records[zone_id]
         _caller_refs.pop(zone.get("caller_reference", ""), None)
         change_id = _change_id()
-        change = {"id": change_id, "status": "INSYNC", "submitted_at": _now_iso(), "comment": ""}
+        change = {"id": change_id, "status": "PENDING", "submitted_at": _now_iso(), "comment": ""}
         _changes[change_id] = change
 
     def build(root):
@@ -659,7 +659,7 @@ def _change_resource_record_sets(zone_id: str, body: bytes):
 
         _records[zone_id] = current
         change_id = _change_id()
-        change = {"id": change_id, "status": "INSYNC", "submitted_at": _now_iso(), "comment": comment}
+        change = {"id": change_id, "status": "PENDING", "submitted_at": _now_iso(), "comment": comment}
         _changes[change_id] = change
 
     def build(root):
@@ -734,11 +734,19 @@ def _list_resource_record_sets(zone_id: str, query_params: dict):
 def _get_change(change_id: str):
     with _lock:
         change = _changes.get(change_id)
-    if not change:
-        return _error_response("NoSuchChange", f"A change with the ID {change_id} does not exist.", 404)
+        if not change:
+            return _error_response("NoSuchChange", f"A change with the ID {change_id} does not exist.", 404)
+        # Route 53 returns PENDING right after a submission and flips to INSYNC
+        # once the change has propagated (typically within 60s). Emulate that
+        # transition lazily: the first GetChange observes PENDING, and every
+        # read thereafter observes INSYNC. No background timer, no opt-out knob
+        # — the observable PENDING→INSYNC transition is what waiters poll on.
+        observed = dict(change)
+        if change["status"] == "PENDING":
+            change["status"] = "INSYNC"
 
     def build(root):
-        _build_change_info_el(root, change)
+        _build_change_info_el(root, observed)
 
     return _xml_response("GetChangeResponse", build)
 

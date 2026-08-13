@@ -596,6 +596,41 @@ def test_s3_object_metadata(s3):
     assert resp["Metadata"]["custom-key"] == "custom-value"
     assert resp["Metadata"]["another"] == "data"
 
+
+def test_s3_versioned_object_metadata(s3):
+    """User metadata must round-trip on a versioned GetObject(VersionId). (#1342)
+
+    Each version keeps its own metadata; addressing a version by id returns
+    that version's metadata, and the current-version read returns the latest.
+    """
+    bkt = "intg-s3-meta-versioned"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(
+        Bucket=bkt, VersioningConfiguration={"Status": "Enabled"}
+    )
+
+    v1 = s3.put_object(
+        Bucket=bkt, Key="k", Body=b"one",
+        Metadata={"gen": "one"}, ContentEncoding="gzip",
+    )["VersionId"]
+    v2 = s3.put_object(
+        Bucket=bkt, Key="k", Body=b"two", Metadata={"gen": "two"},
+    )["VersionId"]
+    assert v1 and v2 and v1 != v2
+
+    g1 = s3.get_object(Bucket=bkt, Key="k", VersionId=v1)
+    assert g1["Metadata"]["gen"] == "one"
+    assert g1["ContentEncoding"] == "gzip"
+    assert g1["Body"].read() == b"one"
+
+    g2 = s3.get_object(Bucket=bkt, Key="k", VersionId=v2)
+    assert g2["Metadata"]["gen"] == "two"
+
+    # Current-version read (no VersionId) targets the latest.
+    cur = s3.get_object(Bucket=bkt, Key="k")
+    assert cur["Metadata"]["gen"] == "two"
+
+
 def test_s3_bucket_tagging(s3):
     bkt = "intg-s3-bkttags"
     s3.create_bucket(Bucket=bkt)
@@ -652,6 +687,48 @@ def test_s3_create_bucket_with_tags_and_location(s3):
     assert tags == {"project": "Trinity"}
     loc = s3.get_bucket_location(Bucket=bkt)
     assert loc["LocationConstraint"] == "us-west-2"
+
+def test_s3_get_bucket_location_explicit_constraint(s3):
+    """A bucket created with an explicit LocationConstraint must echo it back
+    from GetBucketLocation."""
+    bkt = f"intg-s3-loc-explicit-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(
+        Bucket=bkt,
+        CreateBucketConfiguration={"LocationConstraint": "eu-west-1"},
+    )
+    loc = s3.get_bucket_location(Bucket=bkt)
+    assert loc["LocationConstraint"] == "eu-west-1"
+
+def test_s3_get_bucket_location_us_east_1_is_none(s3):
+    """AWS returns an empty LocationConstraint for us-east-1 buckets, which
+    boto3 surfaces as None."""
+    bkt = f"intg-s3-loc-useast1-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    loc = s3.get_bucket_location(Bucket=bkt)
+    assert loc["LocationConstraint"] is None
+
+def test_s3_get_bucket_location_defaults_to_signing_region(s3):
+    """A bucket created WITHOUT CreateBucketConfiguration lands in the region
+    the request was signed for — GetBucketLocation must echo that region."""
+    import boto3
+    from botocore.config import Config
+
+    west_s3 = boto3.client(
+        "s3",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name="eu-west-1",
+        config=Config(
+            region_name="eu-west-1",
+            retries={"mode": "standard"},
+            max_pool_connections=50,
+        ),
+    )
+    bkt = f"intg-s3-loc-signing-{_uuid_mod.uuid4().hex[:8]}"
+    west_s3.create_bucket(Bucket=bkt)
+    loc = west_s3.get_bucket_location(Bucket=bkt)
+    assert loc["LocationConstraint"] == "eu-west-1"
 
 def test_s3_create_bucket_without_tags_has_no_tag_set(s3):
     """A CreateBucket with no tags must not create an empty tag set — a
