@@ -368,6 +368,100 @@ def test_logs_get_log_record_round_trip(logs):
     assert "_timestamp_ms" not in record
 
 
+def test_logs_get_log_group_fields_json_and_system(logs):
+    """GetLogGroupFields discovers system @* fields and JSON keys with rough percent."""
+    group = f"/intg/get-log-group-fields/{_uuid_mod.uuid4().hex[:8]}"
+    stream = "stream-a"
+    now_ms = int(time.time() * 1000)
+    logs.create_log_group(logGroupName=group)
+    logs.create_log_stream(logGroupName=group, logStreamName=stream)
+    logs.put_log_events(
+        logGroupName=group,
+        logStreamName=stream,
+        logEvents=[
+            {
+                "timestamp": now_ms - 1000,
+                "message": json.dumps({"type": "a", "nested": {"level": 1}}),
+            },
+            {
+                "timestamp": now_ms,
+                "message": json.dumps({"type": "b", "duration": 13}),
+            },
+        ],
+    )
+
+    resp = logs.get_log_group_fields(logGroupName=group)
+    by_name = {f["name"]: f["percent"] for f in resp["logGroupFields"]}
+    assert by_name["@timestamp"] == 100
+    assert by_name["@message"] == 100
+    assert by_name["@logStream"] == 100
+    assert by_name["@ptr"] == 100
+    assert by_name["@log"] == 100
+    assert by_name["type"] == 100
+    assert by_name["nested"] == 50
+    assert by_name["nested.level"] == 50
+    assert by_name["duration"] == 50
+    # Sorted by percent desc, then name.
+    names = [f["name"] for f in resp["logGroupFields"]]
+    assert names == sorted(names, key=lambda n: (-by_name[n], n))
+
+
+def test_logs_get_log_group_fields_time_window(logs):
+    """Optional time searches ±8 minutes; default window is the last 15 minutes."""
+    group = f"/intg/glgf-window/{_uuid_mod.uuid4().hex[:8]}"
+    stream = "s1"
+    now_s = int(time.time())
+    now_ms = now_s * 1000
+    logs.create_log_group(logGroupName=group)
+    logs.create_log_stream(logGroupName=group, logStreamName=stream)
+    logs.put_log_events(
+        logGroupName=group,
+        logStreamName=stream,
+        logEvents=[
+            {"timestamp": now_ms, "message": json.dumps({"in_window": True})},
+            {
+                "timestamp": (now_s - 20 * 60) * 1000,
+                "message": json.dumps({"old_only": True}),
+            },
+        ],
+    )
+
+    default_resp = logs.get_log_group_fields(logGroupName=group)
+    default_names = {f["name"] for f in default_resp["logGroupFields"]}
+    assert "in_window" in default_names
+    assert "old_only" not in default_names
+
+    centered = logs.get_log_group_fields(logGroupName=group, time=now_s - 20 * 60)
+    centered_names = {f["name"] for f in centered["logGroupFields"]}
+    assert "old_only" in centered_names
+    assert "in_window" not in centered_names
+
+
+def test_logs_get_log_group_fields_identifier_and_validation(logs):
+    group = f"/intg/glgf-ident/{_uuid_mod.uuid4().hex[:8]}"
+    stream = "s1"
+    now_ms = int(time.time() * 1000)
+    logs.create_log_group(logGroupName=group)
+    logs.create_log_stream(logGroupName=group, logStreamName=stream)
+    logs.put_log_events(
+        logGroupName=group,
+        logStreamName=stream,
+        logEvents=[{"timestamp": now_ms, "message": json.dumps({"ok": 1})}],
+    )
+
+    arn = f"arn:aws:logs:us-east-1:000000000000:log-group:{group}"
+    by_arn = logs.get_log_group_fields(logGroupIdentifier=arn)
+    assert any(f["name"] == "ok" for f in by_arn["logGroupFields"])
+
+    with pytest.raises(ClientError) as both:
+        logs.get_log_group_fields(logGroupName=group, logGroupIdentifier=arn)
+    assert both.value.response["Error"]["Code"] == "InvalidParameterException"
+
+    with pytest.raises(ClientError) as missing:
+        logs.get_log_group_fields(logGroupName=f"/missing/{_uuid_mod.uuid4().hex[:8]}")
+    assert missing.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 def test_logs_insights_filter_sort_limit(logs):
     """CWLI filter/sort/limit: stream equality, like regex, AND, sort, post-filter limit."""
     import uuid as _uuid
@@ -1272,6 +1366,94 @@ def test_get_log_record_inprocess_round_trip():
     bad = mod._get_log_record({"logRecordPointer": "missing"})
     assert bad[0] == 400
     assert _json.loads(bad[2])["__type"] == "InvalidParameterException"
+    mod.reset()
+
+
+def test_get_log_group_fields_inprocess():
+    """Handler-level GetLogGroupFields coverage without a running gateway."""
+    import json as _json
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+
+    mod = _module()
+    mod.reset()
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+
+    # Indexed array paths match AWS Insights discovery (items.0.id, not items.id).
+    assert mod._json_field_names('{"items":[{"id":1}],"tags":["a"]}') == {
+        "items",
+        "items.0",
+        "items.0.id",
+        "tags",
+        "tags.0",
+    }
+
+    group = "/aws/lambda/get-log-group-fields-unit"
+    stream = "stream-a"
+    # Mid-second ms timestamp: default window must not floor "now" away.
+    now_ms = int(time.time() * 1000)
+    if now_ms % 1000 == 0:
+        now_ms += 1
+    now_s = now_ms // 1000
+
+    assert mod._create_log_group({"logGroupName": group})[0] == 200
+    assert mod._create_log_stream({"logGroupName": group, "logStreamName": stream})[0] == 200
+    put = mod._put_log_events({
+        "logGroupName": group,
+        "logStreamName": stream,
+        "logEvents": [
+            {
+                "timestamp": now_ms - 1000,
+                "message": _json.dumps({
+                    "type": "a",
+                    "nested": {"level": 1},
+                    "items": [{"id": 1}],
+                }),
+            },
+            {
+                "timestamp": now_ms,
+                "message": _json.dumps({"type": "b", "duration": 13}),
+            },
+            {
+                "timestamp": (now_s - 20 * 60) * 1000,
+                "message": _json.dumps({"old_only": True}),
+            },
+        ],
+    })
+    assert put[0] == 200
+
+    resp = mod._get_log_group_fields({"logGroupName": group})
+    assert resp[0] == 200
+    body = _json.loads(resp[2])
+    by_name = {f["name"]: f["percent"] for f in body["logGroupFields"]}
+    assert by_name["@timestamp"] == 100
+    assert by_name["@message"] == 100
+    assert by_name["type"] == 100
+    assert by_name["nested.level"] == 50
+    assert by_name["duration"] == 50
+    assert by_name["items.0.id"] == 50
+    assert "items.id" not in by_name
+    assert "old_only" not in by_name
+
+    centered = mod._get_log_group_fields({"logGroupName": group, "time": now_s - 20 * 60})
+    assert centered[0] == 200
+    centered_names = {f["name"] for f in _json.loads(centered[2])["logGroupFields"]}
+    assert "old_only" in centered_names
+    assert "type" not in centered_names
+
+    arn = f"arn:aws:logs:us-east-1:000000000000:log-group:{group}"
+    by_arn = mod._get_log_group_fields({"logGroupIdentifier": arn})
+    assert by_arn[0] == 200
+    assert any(f["name"] == "type" for f in _json.loads(by_arn[2])["logGroupFields"])
+
+    both = mod._get_log_group_fields({"logGroupName": group, "logGroupIdentifier": arn})
+    assert both[0] == 400
+    assert _json.loads(both[2])["__type"] == "InvalidParameterException"
+
+    missing = mod._get_log_group_fields({"logGroupName": "/missing/group"})
+    assert missing[0] == 400
+    assert _json.loads(missing[2])["__type"] == "ResourceNotFoundException"
     mod.reset()
 
 
