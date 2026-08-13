@@ -6830,6 +6830,178 @@ def test_cfn_lambda_layer_packages_importable(cfn, s3, lam):
         cfn.delete_stack(StackName=stack_name)
 
 
+def test_cfn_lambda_layer_version_permission(cfn, s3, lam):
+    """A layer plus the permission resource that grants another account access
+    to it — the shape serverless-python-requirements emits for a layer with
+    ``allowedAccounts``, and CDK's ``LayerVersion.addPermission``.
+
+    Regression: AWS::Lambda::LayerVersionPermission had no provisioner, so the
+    whole stack failed with "Unsupported resource type" and rolled back.
+    Reported by @iot-rocket."""
+    stack_name = "cfn-layer-permission"
+    bucket_name = "cfn-layer-permission-assets"
+    layer_name = "cfn-permission-layer"
+    account_id = "210987654321"
+
+    s3.create_bucket(Bucket=bucket_name)
+    layer_buf = io.BytesIO()
+    with zipfile.ZipFile(layer_buf, "w") as z:
+        z.writestr("python/cfn_permission_helper.py", "VALUE = 1\n")
+    s3.put_object(Bucket=bucket_name, Key="layer.zip", Body=layer_buf.getvalue())
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "PythonRequirementsLambdaLayer": {
+                "Type": "AWS::Lambda::LayerVersion",
+                "Properties": {
+                    "LayerName": layer_name,
+                    "CompatibleRuntimes": ["python3.12"],
+                    "Content": {"S3Bucket": bucket_name, "S3Key": "layer.zip"},
+                },
+            },
+            "PythonRequirementsLambdaLayerPermission": {
+                "Type": "AWS::Lambda::LayerVersionPermission",
+                "Properties": {
+                    "Action": "lambda:GetLayerVersion",
+                    "LayerVersionArn": {"Ref": "PythonRequirementsLambdaLayer"},
+                    "Principal": account_id,
+                },
+            },
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    try:
+        version = lam.list_layer_versions(LayerName=layer_name)["LayerVersions"][0]["Version"]
+        policy = json.loads(
+            lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)["Policy"]
+        )
+        assert len(policy["Statement"]) == 1
+        statement = policy["Statement"][0]
+        assert statement["Action"] == "lambda:GetLayerVersion"
+        assert statement["Principal"] == {"AWS": f"arn:aws:iam::{account_id}:root"}
+
+        # Ref/Id is "<layer version ARN>#<statement id>".
+        resource = cfn.describe_stack_resource(
+            StackName=stack_name,
+            LogicalResourceId="PythonRequirementsLambdaLayerPermission",
+        )["StackResourceDetail"]
+        version_arn, sep, statement_id = resource["PhysicalResourceId"].rpartition("#")
+        assert sep == "#"
+        assert version_arn.endswith(f":layer:{layer_name}:{version}")
+        assert statement_id == statement["Sid"]
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+    with pytest.raises(ClientError) as exc:
+        lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_cfn_lambda_layer_version_permission_delete_leaves_layer(cfn, lam):
+    """Deleting the stack revokes the grant it made and nothing else — the
+    layer version it pointed at (published outside the stack, as CDK's
+    ``LayerVersion.fromLayerVersionArn`` does) is still there afterwards."""
+    stack_name = "cfn-layer-permission-detached"
+    layer_name = "cfn-detached-perm-layer"
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("python/detached.py", "VALUE = 1\n")
+    published = lam.publish_layer_version(
+        LayerName=layer_name,
+        Content={"ZipFile": buf.getvalue()},
+    )
+    version = published["Version"]
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "LayerPermission": {
+                "Type": "AWS::Lambda::LayerVersionPermission",
+                "Properties": {
+                    "Action": "lambda:GetLayerVersion",
+                    "LayerVersionArn": published["LayerVersionArn"],
+                    "Principal": "*",
+                },
+            },
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    policy = json.loads(
+        lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)["Policy"]
+    )
+    assert policy["Statement"][0]["Principal"] == "*"
+
+    cfn.delete_stack(StackName=stack_name)
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+
+    with pytest.raises(ClientError) as exc:
+        lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert lam.get_layer_version(LayerName=layer_name, VersionNumber=version)["Version"] == version
+
+
+def test_cfn_lambda_layer_version_permission_property_change_replaces(cfn, lam):
+    """Every property of this type is create-only, so a changed Principal is a
+    replacement. With no update handler the framework re-runs create (#1340),
+    which must land on the same statement rather than leaving the old grant
+    behind next to the new one."""
+    stack_name = "cfn-layer-permission-update"
+    layer_name = "cfn-update-perm-layer"
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("python/updated.py", "VALUE = 1\n")
+    published = lam.publish_layer_version(
+        LayerName=layer_name,
+        Content={"ZipFile": buf.getvalue()},
+    )
+    version = published["Version"]
+
+    def template(principal):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "LayerPermission": {
+                    "Type": "AWS::Lambda::LayerVersionPermission",
+                    "Properties": {
+                        "Action": "lambda:GetLayerVersion",
+                        "LayerVersionArn": published["LayerVersionArn"],
+                        "Principal": principal,
+                    },
+                },
+            },
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("111111111111"))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+
+    cfn.update_stack(StackName=stack_name, TemplateBody=template("222222222222"))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+
+    policy = json.loads(
+        lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)["Policy"]
+    )
+    assert len(policy["Statement"]) == 1
+    assert policy["Statement"][0]["Principal"] == {"AWS": "arn:aws:iam::222222222222:root"}
+
+    cfn.delete_stack(StackName=stack_name)
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+    with pytest.raises(ClientError) as exc:
+        lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 def test_cfn_sam_transform_function_and_simple_table(cfn, lam, s3, ddb):
     pytest.importorskip("samtranslator")
     suffix = _uuid_mod.uuid4().hex[:8]
