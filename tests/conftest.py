@@ -110,6 +110,15 @@ _SERIAL_TESTS = {
     # Account-global mutations (password policy, alias); must run serially.
     "tests/test_iam.py::test_iam_password_policy_absent_then_set",
     "tests/test_iam.py::test_iam_account_alias_crud",
+    # Recursive-loop detection. The two chain tests cold-start 16+ Lambdas
+    # each and poll CloudWatch Logs until the chain stops changing; the other
+    # two assert on wall clock (a dropped invocation must come back long
+    # before the handler's timeout could have elapsed). Both shapes tip over
+    # under xdist load, so run them in the serial phase.
+    "tests/test_lambda.py::test_lambda_recursive_loop_terminates_self_invoking_chain",
+    "tests/test_lambda.py::test_lambda_recursive_loop_allow_lets_the_chain_through",
+    "tests/test_lambda.py::test_lambda_recursive_loop_drop_is_recursive_invocation_exception",
+    "tests/test_lambda.py::test_lambda_nested_invoke_below_limit_is_unaffected",
 }
 
 
