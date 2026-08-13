@@ -3145,6 +3145,38 @@ def _docker_cp_dir(container, src_dir: str, dest_dir: str, arcname: str = "."):
     container.put_archive(dest_dir, buf)
 
 
+def _classify_function_error(parsed, err_header: str) -> str | None:
+    """Classify an RIE response body/header as a function error.
+
+    Returns ``"Unhandled"``, ``"Handled"``, or ``None`` when the response is
+    not an error at all. If 'X-Amz-Function-Error' /
+    'Lambda-Runtime-Function-Error-Type' is set the error flag passes
+    through as Unhandled. Observed on the RIE bundled with the current
+    public.ecr.aws/lambda/{python:3.12,nodejs:22,provided:al2023} images, no
+    error header is returned on the invocation response — not for a raised
+    handler exception, and not even when a custom runtime POSTs to
+    /runtime/invocation/<id>/error with its own error-type header — so
+    classification falls back to the payload shape.
+
+    The runtime's own error serialization is {errorType, errorMessage} plus
+    a per-runtime traceback field whose key and presence vary: Python sends
+    "stackTrace", empty for init failures such as Runtime.ImportModuleError;
+    Node.js sends "trace"; Go and the provided.* runtimes send neither. So
+    any error-shaped payload counts as the runtime's (→ Unhandled, matching
+    real AWS) unless it also carries a statusCode, which marks an HTTP-style
+    envelope the handler returned itself (→ Handled). A handler that returns
+    a bare {errorType, errorMessage} dict is indistinguishable from a
+    Go-style runtime error over this wire and is reported Unhandled; the
+    misreport that actually breaks consumers is the other direction, since
+    API Gateway keys its 502 contract off Unhandled.
+    """
+    if err_header:
+        return "Unhandled"
+    if not (isinstance(parsed, dict) and parsed.get("errorType")):
+        return None
+    return "Handled" if "statusCode" in parsed else "Unhandled"
+
+
 def _invoke_rie(container, event: dict, timeout: int) -> dict:
     """POST event to a running RIE container's HTTP endpoint."""
     import urllib.request
@@ -3193,18 +3225,13 @@ def _invoke_rie(container, event: dict, timeout: int) -> dict:
             except json.JSONDecodeError:
                 parsed = body
             logs = container.logs(stdout=True, stderr=True, since=invoke_time).decode("utf-8", errors="replace").strip()
-            # RIE sets 'Lambda-Runtime-Function-Error-Type' (or bare
-            # 'X-Amz-Function-Error') when the handler raised an unhandled
-            # exception. If it's set we surface the error flag + propagate the
-            # exact AWS-style marker so _invoke can emit the right header.
             err_header = (resp.headers.get("X-Amz-Function-Error")
                           or resp.headers.get("Lambda-Runtime-Function-Error-Type") or "")
             result = {"body": parsed, "log": logs}
-            if err_header or (isinstance(parsed, dict) and parsed.get("errorType")):
-                # errorType without an X-Amz header means the handler returned
-                # an error-shaped payload itself — AWS signals this as Handled.
+            function_error = _classify_function_error(parsed, err_header)
+            if function_error is not None:
                 result["error"] = True
-                result["function_error"] = "Unhandled" if err_header else "Handled"
+                result["function_error"] = function_error
             return result
         except (urllib.error.URLError, ConnectionRefusedError, OSError):
             time.sleep(0.1)

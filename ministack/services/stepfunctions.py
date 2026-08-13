@@ -3724,6 +3724,17 @@ def _eval_intrinsic_arg(arg, data, ctx):
     return None
 
 
+# Real AWS caps both base64 intrinsics at 10,000 characters of input
+_BASE64_INTRINSIC_MAX = 10_000
+
+
+def _base64_intrinsic_arg(name, value):
+    """Validate single string argument of States.Base64Encode / States.Base64Decode."""
+    if not isinstance(value, str) or len(value) > _BASE64_INTRINSIC_MAX:
+        raise ValueError(f"Invalid arguments in {name}")
+    return value
+
+
 def _exec_intrinsic(node, data, ctx):
     """Execute a parsed intrinsic call node ('call', name, args)."""
     _, name, raw_args = node
@@ -3738,6 +3749,15 @@ def _exec_intrinsic(node, data, ctx):
         merged.update(args[0])
         merged.update(args[1])
         return merged
+    elif name == "States.Base64Encode":
+        import base64
+        text = _base64_intrinsic_arg(name, args[0])
+        return base64.b64encode(text.encode("utf-8")).decode("ascii")
+    elif name == "States.Base64Decode":
+        import base64
+        raw = _base64_intrinsic_arg(name, args[0])
+        # AWS decodes leniently, so pad rather than reject input that arrives without it.
+        return base64.b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", errors="replace")
     elif name == "States.Format":
         # AWS States.Format: \' → ', \{ → {, \} → }, \\ → \ in
         # template segments only.  Interpolated values are verbatim.
@@ -4244,6 +4264,7 @@ _AWS_SDK_SERVICE_MAP = {
     "rdsdata": {"protocol": "rest-json", "service_key": "rds-data"},
     # REST-XML services: per-op path templates, header/querystring routing, XML responses
     "s3": {"protocol": "rest-xml", "service_key": "s3"},
+    "route53": {"protocol": "rest-xml", "service_key": "route53"},
     "lambda": {"protocol": "rest"},
 }
 
@@ -5365,9 +5386,30 @@ _S3_OP_SPECS = {
     },
 }
 
+# Route 53 wraps XML lists ("<Changes><Change/></Changes>") where S3 repeats the parent element,
+# hence list_members. The zone id is substituted verbatim: botocore's fix_route53_ids runs inside
+# boto3, not Step Functions, and AWS rejects the "/hostedzone/" form.
+_ROUTE53_OP_SPECS = {
+    "ChangeResourceRecordSets": {
+        "method": "POST", "path": "/2013-04-01/hostedzone/{Id}/rrset/",
+        "path_params": {"Id": "HostedZoneId"},
+        "body_field": "ChangeBatch",
+        # Unlike S3, the request element wraps the input field rather than being it.
+        "body_wrapper": "ChangeResourceRecordSetsRequest",
+        "body_xmlns": "https://route53.amazonaws.com/doc/2013-04-01/",
+        "list_members": {"Changes": "Change", "ResourceRecords": "ResourceRecord"},
+    },
+}
 
-def _s3_substitute_path(template, input_data):
-    """Substitute {Bucket} and {Key+} placeholders. {Key+} preserves slashes."""
+# Keyed by service, like _REST_JSON_ACTION_PATHS: the protocol is shared, the op specs are not.
+_REST_XML_OP_SPECS = {
+    "s3": _S3_OP_SPECS,
+    "route53": _ROUTE53_OP_SPECS,
+}
+
+
+def _rest_xml_substitute_path(template, input_data, spec=None):
+    """Substitute path placeholders: S3's {Bucket}/{Key+}, plus the spec's path_params."""
     out = template
     if "{Bucket}" in out:
         bucket = input_data.get("Bucket", "")
@@ -5375,13 +5417,22 @@ def _s3_substitute_path(template, input_data):
     if "{Key+}" in out:
         key = input_data.get("Key", "")
         out = out.replace("{Key+}", key)
+    for placeholder, field in ((spec or {}).get("path_params") or {}).items():
+        out = out.replace("{" + placeholder + "}", str(input_data.get(field, "")))
     return out
 
 
-def _s3_build_xml_body(root_name, payload):
-    """Build a minimal XML body for the small handful of ops that need one."""
+def _rest_xml_build_body(root_name, payload, list_members=None, xmlns=None):
+    """Build a minimal XML body for the small handful of ops that need one.
+
+    A list is emitted as a repeated parent element ("<Contents/><Contents/>", S3's shape) unless
+    list_members names its member element, in which case it is wrapped
+    ("<Changes><Change/></Changes>", Route 53's shape). Getting this wrong is silent: the handler
+    finds no members and reads the change batch as empty.
+    """
     import xml.etree.ElementTree as ET
-    root = ET.Element(root_name)
+    list_members = list_members or {}
+    root = ET.Element(root_name, {"xmlns": xmlns} if xmlns else {})
 
     def _emit(parent, name, value):
         if isinstance(value, dict):
@@ -5389,8 +5440,14 @@ def _s3_build_xml_body(root_name, payload):
             for k, v in value.items():
                 _emit(child, k, v)
         elif isinstance(value, list):
-            for item in value:
-                _emit(parent, name, item)
+            member = list_members.get(name)
+            if member:
+                wrapper = ET.SubElement(parent, name)
+                for item in value:
+                    _emit(wrapper, member, item)
+            else:
+                for item in value:
+                    _emit(parent, name, item)
         else:
             child = ET.SubElement(parent, name)
             child.text = "" if value is None else str(value)
@@ -5433,7 +5490,7 @@ def _s3_normalize_lists(parsed, list_fields):
 
 
 def _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data):
-    """Dispatch an aws-sdk integration call to a REST-XML protocol service (S3)."""
+    """Dispatch an aws-sdk integration call to a REST-XML protocol service."""
     import xml.etree.ElementTree as ET
     from urllib.parse import quote, urlencode
 
@@ -5448,17 +5505,19 @@ def _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data):
         )
 
     pascal_action = action[0].upper() + action[1:] if action else action
-    spec = _S3_OP_SPECS.get(pascal_action)
+    op_specs = _REST_XML_OP_SPECS.get(service_key) or {}
+    spec = op_specs.get(pascal_action)
     if not spec:
+        covered = ", ".join(sorted(op_specs)) or "no operations"
         raise _ExecutionError(
             "States.Runtime",
             f"aws-sdk:{service_name}:{action} is not yet implemented in MiniStack "
-            "(rest-xml dispatcher Phase 1 covers list/head/copy/delete/tagging operations)",
+            f"(rest-xml dispatcher covers: {covered})",
         )
 
     input_data = input_data or {}
     method = spec["method"]
-    path = _s3_substitute_path(spec["path"], input_data)
+    path = _rest_xml_substitute_path(spec["path"], input_data, spec)
 
     # S3 handler routes by the query_params dict, not by parsing the path —
     # so build the dict and ALSO append a query string for handlers that
@@ -5490,7 +5549,13 @@ def _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data):
     body = b""
     body_field = spec.get("body_field")
     if body_field and body_field in input_data:
-        body = _s3_build_xml_body(spec.get("body_root", body_field), input_data[body_field])
+        wrapper = spec.get("body_wrapper")
+        root_name = wrapper or spec.get("body_root", body_field)
+        payload = {body_field: input_data[body_field]} if wrapper else input_data[body_field]
+        # SDK-convention names have to go out as wire names: route53 ignores <Ttl> and stores no TTL.
+        payload = _convert_params_to_api_names(payload)
+        body = _rest_xml_build_body(root_name, payload, spec.get("list_members"),
+                                    spec.get("body_xmlns"))
         headers["content-type"] = "application/xml"
         headers["content-length"] = str(len(body))
 
@@ -5517,20 +5582,29 @@ def _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data):
     norm_resp_headers = {k.lower(): v for k, v in (resp_headers or {}).items()}
 
     if status >= 400:
-        code = "S3Exception"
-        message = decoded or f"S3 returned status {status}"
+        # Same shape as before for S3 ("S3.S3Exception", "S3 returned status 404") without
+        # hardcoding it: the prefix map already knows what each service is called.
+        prefix = _AWS_SDK_ERROR_PREFIX.get(service_name, service_name.capitalize())
+        code = f"{prefix}Exception"
+        message = decoded or f"{prefix} returned status {status}"
         if decoded:
             try:
                 err_root = ET.fromstring(decoded)
-                code_el = err_root.find("Code")
-                msg_el = err_root.find("Message")
-                if code_el is not None and code_el.text:
-                    code = code_el.text
-                if msg_el is not None and msg_el.text:
-                    message = msg_el.text
+                # Route 53 nests Code/Message under <Error> with a default xmlns, so match local
+                # names anywhere rather than find("Code").
+                found = {}
+                for el in err_root.iter():
+                    local = el.tag.split("}")[-1] if "}" in el.tag else el.tag
+                    if local in ("Code", "Message") and local not in found and el.text:
+                        found[local] = el.text
+                code = found.get("Code", code)
+                message = found.get("Message", message)
             except ET.ParseError:
                 pass
-        raise _ExecutionError(f"S3.{code}", message)
+        # Named after the SDK exception class: S3.NoSuchBucketException.
+        if not code.endswith("Exception"):
+            code += "Exception"
+        raise _ExecutionError(_prefix_sdk_error(service_name, code), message)
 
     result = {}
     if decoded.strip():
