@@ -3478,6 +3478,56 @@ def _dispatch_rule_sns(account_id: str, region: str, rule_name: str, spec: dict,
     _broker_logger.debug("IoT rule %s → SNS %s", rule_name, target)
 
 
+def _dispatch_rule_sqs(account_id: str, region: str, rule_name: str, spec: dict, event) -> None:
+    from ministack.services import sqs as _sqs
+
+    queue_url = spec.get("queueUrl") or ""
+    if not queue_url:
+        _broker_logger.warning(
+            "IoT rule %s: sqs action has no queueUrl — skipped", rule_name
+        )
+        return
+    body = event if isinstance(event, str) else json.dumps(event)
+    if spec.get("useBase64"):
+        # useBase64 encodes the message *body*: the consumer receives Base64 text
+        # and has to decode it. It is not a transport hint.
+        body = base64.b64encode(body.encode("utf-8")).decode("ascii")
+    # roleArn is accepted and ignored, as everywhere else here — no IAM to fail.
+    with request_scope(account_id, region):
+        # _get_q matches the URL as stored and then by queue name, which is what
+        # lets a rule written against localhost reach a queue created through a
+        # different host alias, and refuses a URL naming another account rather
+        # than silently resolving to a same-account queue of that name.
+        try:
+            queue = _sqs._get_q(queue_url)
+            if queue["is_fifo"]:
+                # AWS documents FIFO queues as unsupported for this action: the
+                # rules engine is distributed, so it cannot promise the ordering
+                # a FIFO queue exists to provide, and enqueuing anyway would need
+                # a MessageGroupId we would have to invent.
+                _broker_logger.warning(
+                    "IoT rule %s: sqs target %s is a FIFO queue, which the AWS SQS "
+                    "rule action does not support — nothing delivered",
+                    rule_name,
+                    queue_url,
+                )
+                return
+            # Through SQS's own SendMessage body, so the queue's DelaySeconds and
+            # MaximumMessageSize apply and the MessageId is minted the way every
+            # other producer's is.
+            result = _sqs._act_send_message({"MessageBody": body}, queue_url)
+        except _sqs._Err as exc:
+            # SQS raises in its wire vocabulary; the action collector and the
+            # rule's errorAction want a plain exception, so translate at the
+            # boundary as stepfunctions does for the same call.
+            raise RuntimeError(
+                f"SQS SendMessage to {queue_url} failed: {exc.code}: {exc.message}"
+            ) from exc
+    _broker_logger.debug(
+        "IoT rule %s → SQS %s (%s)", rule_name, queue_url, result["MessageId"]
+    )
+
+
 async def _dispatch_rule_action(
     account_id: str, region: str, rule_name: str, action: dict, event
 ) -> None:
@@ -3499,6 +3549,8 @@ async def _dispatch_rule_action(
         )
     elif "sns" in action:
         _dispatch_rule_sns(account_id, region, rule_name, action["sns"] or {}, event)
+    elif "sqs" in action:
+        _dispatch_rule_sqs(account_id, region, rule_name, action["sqs"] or {}, event)
     else:
         _broker_logger.debug(
             "IoT rule %s: unsupported action type %s — skipped",

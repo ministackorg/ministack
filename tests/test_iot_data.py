@@ -728,12 +728,8 @@ def _make_sink_lambda(lam, sink_url):
 
 
 def _poll_sink(sqs, url, timeout=12):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        msgs = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
-        if msgs.get("Messages"):
-            return json.loads(msgs["Messages"][0]["Body"])
-    return None
+    body = _poll_body(sqs, url, timeout)
+    return json.loads(body) if body is not None else None
 
 
 def test_iot_topic_rule_routes_publish_to_lambda(iot_client, iot_data_client, lam, sqs):
@@ -1112,5 +1108,198 @@ def test_iot_rule_sns_action_publishes_to_topic(iot_client, iot_data_client, sns
     # Default (non-raw) delivery wraps the message in the SNS envelope.
     message = json.loads(body["Message"]) if "Message" in body else body
     assert message == {"kind": "boom"}
+
+    iot_client.delete_topic_rule(ruleName=rule)
+
+
+# ---------------------------------------------------------------------------
+# Topic-rule `sqs` action (publish → rule → SQS queue)
+# ---------------------------------------------------------------------------
+
+
+def _poll_message(sqs, url, timeout=10):
+    """The first message on the queue, or None."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        msgs = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+        if msgs.get("Messages"):
+            return msgs["Messages"][0]
+    return None
+
+
+def _poll_body(sqs, url, timeout=10):
+    """The raw body of the first message on the queue, or None."""
+    msg = _poll_message(sqs, url, timeout)
+    return msg["Body"] if msg else None
+
+
+def test_iot_rule_sqs_action_delivers_payload(iot_client, iot_data_client, sqs):
+    queue = sqs.create_queue(QueueName=_unique("rule-sqs"))["QueueUrl"]
+    rule = _unique("tosqs").replace("-", "_")
+    iot_client.create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": "SELECT * FROM 'sensors/+/telemetry'",
+            "actions": [{"sqs": {
+                "queueUrl": queue,
+                "roleArn": "arn:aws:iam::000000000000:role/aws_iot_sqs",
+            }}],
+        },
+    )
+
+    iot_data_client.publish(
+        topic="sensors/a1/telemetry",
+        payload=json.dumps({"temp": 22, "missedReadings": 3}).encode(),
+    )
+    assert json.loads(_poll_body(sqs, queue)) == {"temp": 22, "missedReadings": 3}
+
+    iot_client.delete_topic_rule(ruleName=rule)
+
+
+def test_iot_rule_sqs_action_use_base64_encodes_body(iot_client, iot_data_client, sqs):
+    """``useBase64`` means the *body* is Base64 text, not a transport hint."""
+    queue = sqs.create_queue(QueueName=_unique("rule-sqs-b64"))["QueueUrl"]
+    rule = _unique("sqsb64").replace("-", "_")
+    iot_client.create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": "SELECT * FROM 'sensors/+/telemetry'",
+            "actions": [{"sqs": {
+                "queueUrl": queue,
+                "useBase64": True,
+                "roleArn": "arn:aws:iam::000000000000:role/aws_iot_sqs",
+            }}],
+        },
+    )
+
+    iot_data_client.publish(
+        topic="sensors/a1/telemetry", payload=json.dumps({"temp": 7}).encode()
+    )
+    body = _poll_body(sqs, queue)
+    assert json.loads(base64.b64decode(body)) == {"temp": 7}
+
+    iot_client.delete_topic_rule(ruleName=rule)
+
+
+def test_iot_rule_sqs_action_applies_select_projection(iot_client, iot_data_client, sqs):
+    """The SELECT clause is evaluated once and applies to every action alike."""
+    queue = sqs.create_queue(QueueName=_unique("rule-sqs-proj"))["QueueUrl"]
+    rule = _unique("sqsproj").replace("-", "_")
+    iot_client.create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": "SELECT deviceId AS id, topic(2) AS device "
+                   "FROM 'sensors/+/telemetry'",
+            "actions": [{"sqs": {"queueUrl": queue, "roleArn": "arn:aws:iam::000000000000:role/aws_iot_sqs"}}],
+        },
+    )
+
+    iot_data_client.publish(
+        topic="sensors/a1/telemetry",
+        payload=json.dumps({"deviceId": "d1", "temp": 22}).encode(),
+    )
+    assert json.loads(_poll_body(sqs, queue)) == {"id": "d1", "device": "a1"}
+
+    iot_client.delete_topic_rule(ruleName=rule)
+
+
+def test_iot_rule_sqs_action_missing_queue_does_not_stop_the_rule(
+    iot_client, iot_data_client, sqs
+):
+    """The rule's other actions still run — and the failure is a failure like
+    any other, so it reaches the rule's errorAction rather than being swallowed
+    where only a log line would show it."""
+    queue = sqs.create_queue(QueueName=_unique("rule-sqs-live"))["QueueUrl"]
+    dlq = sqs.create_queue(QueueName=_unique("rule-sqs-dlq"))["QueueUrl"]
+    gone = queue.rsplit("/", 1)[0] + "/" + _unique("no-such-queue")
+    rule = _unique("sqsfail").replace("-", "_")
+    iot_client.create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": "SELECT * FROM 'sensors/+/telemetry'",
+            "actions": [
+                {"sqs": {"queueUrl": gone, "roleArn": "arn:aws:iam::000000000000:role/aws_iot_sqs"}},
+                {"sqs": {"queueUrl": queue, "roleArn": "arn:aws:iam::000000000000:role/aws_iot_sqs"}},
+            ],
+            "errorAction": {
+                "sqs": {"queueUrl": dlq, "roleArn": "arn:aws:iam::000000000000:role/aws_iot_sqs"}
+            },
+        },
+    )
+
+    iot_data_client.publish(
+        topic="sensors/a1/telemetry", payload=json.dumps({"temp": 1}).encode()
+    )
+    assert json.loads(_poll_body(sqs, queue)) == {"temp": 1}
+
+    doc = json.loads(_poll_body(sqs, dlq))
+    assert doc["ruleName"] == rule
+    assert doc["topic"] == "sensors/a1/telemetry"
+    assert [f["action"] for f in doc["failures"]] == ["sqs"]
+    assert "QueueDoesNotExist" in doc["failures"][0]["errorMessage"]
+
+    iot_client.delete_topic_rule(ruleName=rule)
+
+
+def test_iot_rule_sqs_action_message_is_an_ordinary_sqs_message(
+    iot_client, iot_data_client, sqs
+):
+    """Delivery goes through SQS's own SendMessage, so what lands on the queue is
+    indistinguishable from any other producer's message — starting with a
+    MessageId in the canonical dashed form a consumer may parse or key on."""
+    queue = sqs.create_queue(QueueName=_unique("rule-sqs-mid"))["QueueUrl"]
+    rule = _unique("sqsmid").replace("-", "_")
+    iot_client.create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": "SELECT * FROM 'sensors/+/telemetry'",
+            "actions": [{"sqs": {"queueUrl": queue, "roleArn": "arn:aws:iam::000000000000:role/aws_iot_sqs"}}],
+        },
+    )
+
+    iot_data_client.publish(
+        topic="sensors/a1/telemetry", payload=json.dumps({"temp": 11}).encode()
+    )
+    msg = _poll_message(sqs, queue)
+    assert msg is not None
+    # uuid.UUID() also accepts the 32-char undashed form, so parsing alone would
+    # not notice a hand-minted id; the round-trip is what pins the real shape.
+    assert msg["MessageId"] == str(uuid.UUID(msg["MessageId"]))
+
+    iot_client.delete_topic_rule(ruleName=rule)
+
+
+def test_iot_rule_sqs_action_refuses_fifo_queue(iot_client, iot_data_client, sqs):
+    """AWS does not support FIFO queues as an ``sqs`` action destination.
+
+    The refusal is a deliberate skip, not a delivery failure: nothing lands
+    on the FIFO queue AND the rule's ``errorAction`` stays quiet. Without the
+    DLQ assertion this test could not tell the skip apart from the
+    missing-queue case, which does fire the errorAction.
+    """
+    queue = sqs.create_queue(
+        QueueName=_unique("rule-sqs")[:70] + ".fifo",
+        Attributes={"FifoQueue": "true", "ContentBasedDeduplication": "true"},
+    )["QueueUrl"]
+    dlq = sqs.create_queue(QueueName=_unique("rule-fifo-dlq"))["QueueUrl"]
+    rule = _unique("sqsfifo").replace("-", "_")
+    iot_client.create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": "SELECT * FROM 'sensors/+/telemetry'",
+            "actions": [{"sqs": {"queueUrl": queue, "roleArn": "arn:aws:iam::000000000000:role/aws_iot_sqs"}}],
+            "errorAction": {
+                "sqs": {"queueUrl": dlq, "roleArn": "arn:aws:iam::000000000000:role/aws_iot_sqs"}
+            },
+        },
+    )
+
+    iot_data_client.publish(
+        topic="sensors/a1/telemetry", payload=json.dumps({"temp": 3}).encode()
+    )
+    assert _poll_body(sqs, queue, timeout=4) is None
+    assert _poll_body(sqs, dlq, timeout=2) is None, (
+        "a FIFO destination is skipped, not failed - the errorAction must not fire"
+    )
 
     iot_client.delete_topic_rule(ruleName=rule)
