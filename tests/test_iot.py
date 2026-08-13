@@ -179,6 +179,85 @@ def test_iot_thing_type_lifecycle(iot_client):
     assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
+def test_iot_create_thing_type_idempotent_recreate(iot_client):
+    name = _unique("type")
+    first = iot_client.create_thing_type(thingTypeName=name)
+
+    # Identical re-create (no properties) returns 200 with the existing ids.
+    again = iot_client.create_thing_type(thingTypeName=name)
+    assert again["thingTypeId"] == first["thingTypeId"]
+    assert again["thingTypeArn"] == first["thingTypeArn"]
+
+    # Explicit empty properties count as identical to absent ones.
+    empty = iot_client.create_thing_type(
+        thingTypeName=name,
+        thingTypeProperties={"searchableAttributes": []},
+    )
+    assert empty["thingTypeId"] == first["thingTypeId"]
+
+    iot_client.deprecate_thing_type(thingTypeName=name)
+    iot_client.delete_thing_type(thingTypeName=name)
+
+
+def test_iot_create_thing_type_conflicting_recreate_rejected(iot_client):
+    name = _unique("type")
+    iot_client.create_thing_type(thingTypeName=name)
+    with pytest.raises(ClientError) as ei:
+        iot_client.create_thing_type(
+            thingTypeName=name,
+            thingTypeProperties={"thingTypeDescription": "different"},
+        )
+    assert ei.value.response["Error"]["Code"] == "ResourceAlreadyExistsException"
+    iot_client.deprecate_thing_type(thingTypeName=name)
+    iot_client.delete_thing_type(thingTypeName=name)
+
+
+def test_iot_create_thing_type_idempotency_covers_all_properties(iot_client):
+    """The comparison spans every modelled property and treats
+    searchableAttributes as unordered: a re-create differing only in
+    mqtt5Configuration conflicts, while the same attributes in another order
+    are idempotent."""
+    name = _unique("type")
+    mqtt5 = {"propagatingAttributes": [
+        {"userPropertyKey": "region", "thingAttribute": "site"},
+    ]}
+    first = iot_client.create_thing_type(
+        thingTypeName=name,
+        thingTypeProperties={
+            "searchableAttributes": ["site", "region"],
+            "mqtt5Configuration": mqtt5,
+        },
+    )
+
+    same = iot_client.create_thing_type(
+        thingTypeName=name,
+        thingTypeProperties={
+            "searchableAttributes": ["region", "site"],
+            "mqtt5Configuration": mqtt5,
+        },
+    )
+    assert same["thingTypeId"] == first["thingTypeId"]
+
+    with pytest.raises(ClientError) as ei:
+        iot_client.create_thing_type(
+            thingTypeName=name,
+            thingTypeProperties={
+                "searchableAttributes": ["site", "region"],
+                "mqtt5Configuration": {"propagatingAttributes": [
+                    {"userPropertyKey": "region", "thingAttribute": "other"},
+                ]},
+            },
+        )
+    assert ei.value.response["Error"]["Code"] == "ResourceAlreadyExistsException"
+
+    # The first create's configuration is the one that stuck.
+    described = iot_client.describe_thing_type(thingTypeName=name)
+    assert described["thingTypeProperties"]["mqtt5Configuration"] == mqtt5
+
+    iot_client.deprecate_thing_type(thingTypeName=name)
+    iot_client.delete_thing_type(thingTypeName=name)
+
+
 def test_iot_delete_thing_type_active_rejected(iot_client):
     name = _unique("type")
     iot_client.create_thing_type(thingTypeName=name)

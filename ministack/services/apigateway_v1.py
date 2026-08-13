@@ -1491,13 +1491,20 @@ async def _handle_execute_in_scope(
     resource, path_params = _match_resource_tree(api_id, segments)
 
     if not resource:
-        return 404, {"Content-Type": "application/json"}, json.dumps({"message": "Missing Authentication Token"}).encode()
+        # AWS returns 403 MISSING_AUTHENTICATION_TOKEN for an unsupported
+        # resource (an unmatched path), not 404.
+        return _gw_error(403, "Missing Authentication Token")
 
     # Look up method
     resource_methods = resource.get("resourceMethods", {})
     method_obj = resource_methods.get(method) or resource_methods.get("ANY")
     if not method_obj:
-        return 405, {"Content-Type": "application/json"}, json.dumps({"message": "Method Not Allowed"}).encode()
+        # A matched resource with no method for this verb — including a
+        # methodless intermediate node (e.g. `/jobs` created only as the parent
+        # of `/jobs/{op}`) — is an "unsupported method" in API Gateway, which
+        # answers 403 MISSING_AUTHENTICATION_TOKEN (not 405, and it does not
+        # fall through to a {proxy+} sibling: the specific resource wins).
+        return _gw_error(403, "Missing Authentication Token")
 
     integration = method_obj.get("methodIntegration")
     if not integration:

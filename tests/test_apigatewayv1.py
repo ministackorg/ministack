@@ -1759,8 +1759,10 @@ def test_apigwv1_execute_mock_integration(apigw_v1):
 
     apigw_v1.delete_rest_api(restApiId=api_id)
 
-def test_apigwv1_execute_missing_resource_404(apigw_v1):
-    """Request to non-existent path returns 404 with AWS-style message."""
+def test_apigwv1_execute_missing_resource_403(apigw_v1):
+    """Request to a non-existent path returns 403 Missing Authentication Token —
+    real API Gateway (REST) treats an unsupported resource as
+    MISSING_AUTHENTICATION_TOKEN (403), not 404."""
     import urllib.error as _urlerr
     import urllib.request as _urlreq
 
@@ -1773,9 +1775,9 @@ def test_apigwv1_execute_missing_resource_404(apigw_v1):
     req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
     try:
         _urlreq.urlopen(req)
-        assert False, "Expected 404"
+        assert False, "Expected 403"
     except _urlerr.HTTPError as e:
-        assert e.code == 404
+        assert e.code == 403
 
     apigw_v1.delete_rest_api(restApiId=api_id)
 
@@ -2203,8 +2205,10 @@ def test_apigwv1_execute_missing_stage_404(apigw_v1):
     assert exc.value.code == 404
     apigw_v1.delete_rest_api(restApiId=api_id)
 
-def test_apigwv1_execute_missing_method_405(apigw_v1):
-    """execute-api returns 405 when resource exists but method is not configured."""
+def test_apigwv1_execute_missing_method_403(apigw_v1):
+    """execute-api returns 403 Missing Authentication Token when the resource
+    exists but the method is not configured — real API Gateway treats an
+    unsupported method as MISSING_AUTHENTICATION_TOKEN (403), not 405."""
     import urllib.error as _urlerr
     import urllib.request as _urlreq
 
@@ -2227,7 +2231,7 @@ def test_apigwv1_execute_missing_method_405(apigw_v1):
     req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
     with pytest.raises(_urlerr.HTTPError) as exc:
         _urlreq.urlopen(req)
-    assert exc.value.code == 405
+    assert exc.value.code == 403
     apigw_v1.delete_rest_api(restApiId=api_id)
 
 def test_apigwv1_execute_lambda_arn_uri(apigw_v1, lam):

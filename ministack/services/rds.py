@@ -213,8 +213,22 @@ DEFAULT_AURORA_MYSQL_IMAGE = "mysql:8.4"
 # ── Persistence ────────────────────────────────────────────
 
 def get_state():
-    instances = copy.deepcopy(_instances)
-    clusters = copy.deepcopy(_clusters)
+    with _shared_container_lock:
+        instances = copy.deepcopy(_instances)
+        clusters = copy.deepcopy(_clusters)
+        state = {
+            "instances": instances,
+            "clusters": clusters,
+            "subnet_groups": copy.deepcopy(_subnet_groups),
+            "param_groups": copy.deepcopy(_param_groups),
+            "snapshots": copy.deepcopy(_snapshots),
+            "db_cluster_param_groups": copy.deepcopy(_db_cluster_param_groups),
+            "db_cluster_snapshots": copy.deepcopy(_db_cluster_snapshots),
+            "option_groups": copy.deepcopy(_option_groups),
+            "global_clusters": copy.deepcopy(_global_clusters),
+            "tags": copy.deepcopy(_tags),
+            "port_counter": _port_counter[0],
+        }
     # Strip Docker container IDs (not restorable across restarts)
     for key in list(instances._data):
         instances._data[key].pop("_docker_container_id", None)
@@ -228,19 +242,6 @@ def get_state():
             ),
         )
         cluster.pop("_shared_container_id", None)
-    state = {
-        "instances": instances,
-        "clusters": clusters,
-        "subnet_groups": copy.deepcopy(_subnet_groups),
-        "param_groups": copy.deepcopy(_param_groups),
-        "snapshots": copy.deepcopy(_snapshots),
-        "db_cluster_param_groups": copy.deepcopy(_db_cluster_param_groups),
-        "db_cluster_snapshots": copy.deepcopy(_db_cluster_snapshots),
-        "option_groups": copy.deepcopy(_option_groups),
-        "global_clusters": copy.deepcopy(_global_clusters),
-        "tags": copy.deepcopy(_tags),
-        "port_counter": _port_counter[0],
-    }
     return state
 
 
@@ -1669,12 +1670,7 @@ def _configure_mysql_replication(cluster_id, cluster):
     if not _mysql_gtid_history_ready(cluster):
         cluster["_mysql_replication_blocked_reason"] = "legacy-non-gtid-volume"
         cluster["_shared_container_ready"] = False
-        for cluster_member in cluster.get("DBClusterMembers", []):
-            instance = _instances.get(
-                cluster_member.get("DBInstanceIdentifier"),
-            )
-            if instance is not None:
-                instance["DBInstanceStatus"] = "failed"
+        _set_cluster_members_status(cluster, "failed")
         logger.error(
             "RDS: refusing MySQL replication for %s because its initialized "
             "volume predates GTID-at-creation tracking",
@@ -2418,6 +2414,13 @@ def _resolve_instance(db_id):
     return None
 
 
+def _set_cluster_members_status(cluster, status):
+    for member in cluster.get("DBClusterMembers", []):
+        instance = _instances.get(member.get("DBInstanceIdentifier"))
+        if instance is not None:
+            instance["DBInstanceStatus"] = status
+
+
 def _attach_instance_to_shared_cluster(instance, cluster):
     endpoint = cluster.get("_shared_endpoint")
     if not endpoint:
@@ -2511,6 +2514,10 @@ def _unregister_instance_from_clusters(db_id):
 # ---------------------------------------------------------------------------
 
 def _create_db_instance(p):
+    return _create_db_instance_impl(p)
+
+
+def _create_db_instance_impl(p):
     db_id = _p(p, "DBInstanceIdentifier")
     if not db_id:
         return _error("MissingParameter", "DBInstanceIdentifier is required", 400)
@@ -2950,12 +2957,7 @@ def _create_db_instance(p):
                             ready_host, ready_port,
                         )
                         cluster["_shared_container_ready"] = False
-                        for member in cluster.get("DBClusterMembers", []):
-                            inst = _instances.get(
-                                member.get("DBInstanceIdentifier"),
-                            )
-                            if inst is not None:
-                                inst["DBInstanceStatus"] = "failed"
+                        _set_cluster_members_status(cluster, "failed")
                         _refresh_cluster_status(cluster_id)
                         return
 
@@ -2969,12 +2971,7 @@ def _create_db_instance(p):
                         pending_rotation["new_password"],
                     ):
                         cluster["_shared_container_ready"] = False
-                        for member in cluster.get("DBClusterMembers", []):
-                            inst = _instances.get(
-                                member.get("DBInstanceIdentifier"),
-                            )
-                            if inst is not None:
-                                inst["DBInstanceStatus"] = "failed"
+                        _set_cluster_members_status(cluster, "failed")
                         _refresh_cluster_status(cluster_id)
                         return
                     if pending_rotation:
