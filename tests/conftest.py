@@ -70,6 +70,10 @@ _SERIAL_TESTS = {
     "tests/test_stepfunctions.py::test_sfn_wait_scale_zero_does_not_timeout_lambda_tasks",
     "tests/test_stepfunctions.py::test_sfn_wait_scale_zero_skips_wait",
     "tests/test_rds.py::test_rds_lambda_network_connectivity",
+    # Docker-executor Lambda timeout (skipped unless LAMBDA_EXECUTOR=docker):
+    # cold-starts a container and asserts a wall-clock bound (< 9s for a
+    # Timeout=3 function), which parallel container churn breaks.
+    "tests/test_lambda.py::test_lambda_docker_timeout_returns_task_timed_out_promptly",
     "tests/test_elasticache.py::test_elasticache_lambda_network_connectivity",
     # API Gateway execute-api → Lambda invoke under tight urlopen / WS recv
     # timeouts. These pass cleanly when run serially but are sensitive to
