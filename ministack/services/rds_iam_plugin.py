@@ -99,6 +99,7 @@ def ensure_iam_auth_plugin(
         if connection is None:
             raise RuntimeError("admin connection is unavailable")
         cursor = connection.cursor()
+        cursor.execute("SET SESSION sql_log_bin = 0")
         cursor.execute(
             "SELECT PLUGIN_NAME FROM INFORMATION_SCHEMA.PLUGINS "
             "WHERE PLUGIN_NAME = %s AND PLUGIN_STATUS = 'ACTIVE'",

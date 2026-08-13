@@ -98,7 +98,9 @@ can contain the prior registration even though the fresh container failed to
 load the absent library at boot. The hook copies the artifact first, attempts
 `UNINSTALL PLUGIN`, removes only the stale `AWSAuthenticationPlugin` row when
 MySQL rejects that unload for a boot-failed plugin, reinstalls, and verifies the
-plugin is `ACTIVE` before reporting success.
+plugin is `ACTIVE` before reporting success. The maintenance session disables
+binary logging at entry so every current and future plugin-metadata statement
+remains compute-local and cannot alter a global-cluster secondary.
 
 Residuals: the full image carries the artifacts; the slim image remains
 artifact-free and therefore auto-off. The existing global-replication live

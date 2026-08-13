@@ -118,6 +118,7 @@ def test_rds_iam_plugin_installs_matching_series_and_arch(monkeypatch, tmp_path)
     assert connection.closed is True
     assert connection.cursor_value.closed is True
     assert connection.cursor_value.executed == [
+        ("SET SESSION sql_log_bin = 0", None),
         (
             "SELECT PLUGIN_NAME FROM INFORMATION_SCHEMA.PLUGINS "
             "WHERE PLUGIN_NAME = %s AND PLUGIN_STATUS = 'ACTIVE'",
@@ -163,7 +164,14 @@ def test_rds_iam_plugin_is_idempotent(monkeypatch, tmp_path):
 
     assert installed is True
     assert container.archives == []
-    assert len(connection.cursor_value.executed) == 1
+    assert connection.cursor_value.executed == [
+        ("SET SESSION sql_log_bin = 0", None),
+        (
+            "SELECT PLUGIN_NAME FROM INFORMATION_SCHEMA.PLUGINS "
+            "WHERE PLUGIN_NAME = %s AND PLUGIN_STATUS = 'ACTIVE'",
+            (plugin.PLUGIN_NAME,),
+        ),
+    ]
 
 
 def test_rds_iam_plugin_recovers_boot_failed_registration(
@@ -198,6 +206,7 @@ def test_rds_iam_plugin_recovers_boot_failed_registration(
         ) is True
 
     statements = connection.cursor_value.executed
+    assert statements[0] == ("SET SESSION sql_log_bin = 0", None)
     assert statements.index(
         (f"UNINSTALL PLUGIN {plugin.PLUGIN_NAME}", None)
     ) < statements.index(
