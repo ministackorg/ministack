@@ -4320,6 +4320,135 @@ def test_cognito_pretoken_trigger_source_by_auth_flow(cognito_idp, lam):
     assert _decode_jwt_claims(resp2["access_token"])["seen_trigger_source"] == "TokenGeneration_RefreshTokens"
 
 
+def test_cognito_pretoken_receives_client_metadata(cognito_idp, lam):
+    """PreTokenGeneration's event.request.clientMetadata should carry
+    ClientMetadata from RespondToAuthChallenge / AdminRespondToAuthChallenge,
+    and aws_client_metadata from the M2M client_credentials grant — matching
+    real AWS's documented behavior
+    (https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-lambda-pre-token-generation.html):
+    "Amazon Cognito doesn't include data from the ClientMetadata parameter in
+    AdminInitiateAuth and InitiateAuth API operations in the request that it
+    passes to the pre token generation function." That exclusion covers
+    REFRESH_TOKEN_AUTH (both InitiateAuth and AdminInitiateAuth) and
+    GetTokensFromRefreshToken too, since none of those are
+    RespondToAuthChallenge. Before this fix, _build_pretoken_event never
+    included the key for any operation; an earlier version of this fix
+    forwarded it from exactly the operations real AWS excludes, and dropped
+    it from the ones that actually carry it."""
+    handler = (
+        "def handler(event, ctx):\n"
+        "    cm = event['request'].get('clientMetadata') or {}\n"
+        "    event['response']['claimsAndScopeOverrideDetails'] = {\n"
+        "        'accessTokenGeneration': {'claimsToAddOrOverride': {'seen_org_id': cm.get('orgId', '')}},\n"
+        "    }\n"
+        "    return event\n"
+    )
+    fn_name = "ministack-pretoken-client-metadata"
+    lam.create_function(
+        FunctionName=fn_name, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": _make_pretoken_lambda_zip(handler)},
+    )
+    fn_arn = lam.get_function(FunctionName=fn_name)["Configuration"]["FunctionArn"]
+
+    pool_id, client = _setup_pool_with_user(cognito_idp, generate_secret=True)
+    cognito_idp.update_user_pool(
+        UserPoolId=pool_id,
+        LambdaConfig={"PreTokenGenerationConfig": {
+            "LambdaArn": fn_arn, "LambdaVersion": "V2_0",
+        }},
+    )
+    client_id = client["ClientId"]
+    client_secret = client["ClientSecret"]
+
+    # InitiateAuth(USER_PASSWORD_AUTH) — real AWS never forwards ClientMetadata
+    # here, so the trigger must see none, even though the caller passed one.
+    auth = cognito_idp.initiate_auth(
+        ClientId=client_id, AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "testuser", "PASSWORD": "TestPass1!"},
+        ClientMetadata={"orgId": "org-password"},
+    )["AuthenticationResult"]
+    assert _decode_jwt_claims(auth["AccessToken"])["seen_org_id"] == ""
+
+    # InitiateAuth(REFRESH_TOKEN_AUTH) — same exclusion.
+    refreshed = cognito_idp.initiate_auth(
+        ClientId=client_id, AuthFlow="REFRESH_TOKEN_AUTH",
+        AuthParameters={"REFRESH_TOKEN": auth["RefreshToken"]},
+        ClientMetadata={"orgId": "org-refresh"},
+    )["AuthenticationResult"]
+    assert _decode_jwt_claims(refreshed["AccessToken"])["seen_org_id"] == ""
+
+    # AdminInitiateAuth(ADMIN_USER_PASSWORD_AUTH) — same exclusion.
+    admin_auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pool_id, ClientId=client_id, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "testuser", "PASSWORD": "TestPass1!"},
+        ClientMetadata={"orgId": "org-admin-password"},
+    )["AuthenticationResult"]
+    assert _decode_jwt_claims(admin_auth["AccessToken"])["seen_org_id"] == ""
+
+    # AdminInitiateAuth(REFRESH_TOKEN_AUTH) — same exclusion.
+    admin_refreshed = cognito_idp.admin_initiate_auth(
+        UserPoolId=pool_id, ClientId=client_id, AuthFlow="REFRESH_TOKEN_AUTH",
+        AuthParameters={"REFRESH_TOKEN": auth["RefreshToken"]},
+        ClientMetadata={"orgId": "org-admin-refresh"},
+    )["AuthenticationResult"]
+    assert _decode_jwt_claims(admin_refreshed["AccessToken"])["seen_org_id"] == ""
+
+    # GetTokensFromRefreshToken — same exclusion.
+    gtfrt = cognito_idp.get_tokens_from_refresh_token(
+        ClientId=client_id, RefreshToken=auth["RefreshToken"],
+        ClientMetadata={"orgId": "org-gtfrt"},
+    )["AuthenticationResult"]
+    assert _decode_jwt_claims(gtfrt["AccessToken"])["seen_org_id"] == ""
+
+    # RespondToAuthChallenge(NEW_PASSWORD_REQUIRED) — one of the two operations
+    # real AWS's docs say actually carries ClientMetadata to this trigger.
+    cognito_idp.admin_create_user(UserPoolId=pool_id, Username="newpwduser")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pool_id, Username="newpwduser", Password="TempPass1!", Permanent=False)
+    challenge = cognito_idp.initiate_auth(
+        ClientId=client_id, AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "newpwduser", "PASSWORD": "TempPass1!"},
+    )
+    assert challenge["ChallengeName"] == "NEW_PASSWORD_REQUIRED"
+    respond_result = cognito_idp.respond_to_auth_challenge(
+        ClientId=client_id, ChallengeName="NEW_PASSWORD_REQUIRED", Session=challenge["Session"],
+        ChallengeResponses={"USERNAME": "newpwduser", "NEW_PASSWORD": "FinalPass1!"},
+        ClientMetadata={"orgId": "org-new-password"},
+    )["AuthenticationResult"]
+    assert _decode_jwt_claims(respond_result["AccessToken"])["seen_org_id"] == "org-new-password"
+
+    # AdminRespondToAuthChallenge(NEW_PASSWORD_REQUIRED) — the admin counterpart.
+    cognito_idp.admin_create_user(UserPoolId=pool_id, Username="adminnewpwduser")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pool_id, Username="adminnewpwduser", Password="TempPass1!", Permanent=False)
+    admin_challenge = cognito_idp.admin_initiate_auth(
+        UserPoolId=pool_id, ClientId=client_id, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "adminnewpwduser", "PASSWORD": "TempPass1!"},
+    )
+    assert admin_challenge["ChallengeName"] == "NEW_PASSWORD_REQUIRED"
+    admin_respond_result = cognito_idp.admin_respond_to_auth_challenge(
+        UserPoolId=pool_id, ClientId=client_id, ChallengeName="NEW_PASSWORD_REQUIRED",
+        Session=admin_challenge["Session"],
+        ChallengeResponses={"USERNAME": "adminnewpwduser", "NEW_PASSWORD": "FinalPass1!"},
+        ClientMetadata={"orgId": "org-admin-new-password"},
+    )["AuthenticationResult"]
+    assert _decode_jwt_claims(admin_respond_result["AccessToken"])["seen_org_id"] == "org-admin-new-password"
+
+    # M2M client_credentials — carries client metadata via the separate
+    # aws_client_metadata POST field, not a ClientMetadata request parameter.
+    status, _, body = _post_form(f"{ENDPOINT}/oauth2/token", {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "aws_client_metadata": json.dumps({"orgId": "org-m2m"}),
+    })
+    assert status == 200
+    m2m_token = json.loads(body)["access_token"]
+    assert _decode_jwt_claims(m2m_token)["seen_org_id"] == "org-m2m"
+
+
 @pytest.fixture
 def _enable_persistence(monkeypatch, tmp_path):
     """Force PERSIST_STATE on and point STATE_DIR at a tmp dir so
