@@ -330,3 +330,33 @@ def test_mysql_compatibility_wait_resolves_container_before_procedures(
         "wait",
         "reload",
     ]
+
+
+def test_mariadb_compatibility_skips_plugin_and_roles(monkeypatch):
+    calls = []
+
+    def enabled(engine_series):
+        calls.append(("plugin-enabled", engine_series))
+        return True
+
+    def ensure_procedures(_connection_factory, resource_id, engine_series):
+        calls.append(("procedures", resource_id, engine_series))
+        return True
+
+    monkeypatch.setattr(rds_service, "iam_auth_plugin_enabled", enabled)
+    monkeypatch.setattr(
+        rds_service,
+        "ensure_rds_compatibility_procedures",
+        ensure_procedures,
+    )
+
+    assert rds_service._ensure_mysql_compatibility(
+        None,
+        "127.0.0.1",
+        3306,
+        "password",
+        "10.6.14",
+        "db-1",
+        engine="mariadb",
+    ) == (True, False)
+    assert calls == [("procedures", "db-1", None)]

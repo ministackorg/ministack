@@ -1630,7 +1630,10 @@ def _ensure_mysql_compatibility(
     wait_for_ready=False,
 ):
     """Best-effort fidelity hook shared by every MySQL-ready path."""
-    _mysql_image, engine_series = _mysql_runtime_for_version(engine_version)
+    _mysql_image, engine_series = _mysql_runtime_for_engine(
+        engine,
+        engine_version,
+    )
     plugin_enabled = bool(engine_series) and iam_auth_plugin_enabled(
         engine_series,
     )
@@ -6265,6 +6268,13 @@ def _mysql_image_for_version(engine_version):
     return _mysql_runtime_for_version(engine_version)[0]
 
 
+def _mysql_runtime_for_engine(engine, engine_version):
+    """Return the actual MySQL-family image and plugin-compatible series."""
+    if engine == "mariadb":
+        return "mariadb:latest", None
+    return _mysql_runtime_for_version(engine_version)
+
+
 def _mysql_runtime_for_version(engine_version):
     """Return the selected image and the known series encoded in its tag."""
     major_minor = _mysql_community_major_minor(engine_version)
@@ -6320,18 +6330,10 @@ def _docker_image_for_engine(engine, engine_version, user, password, db_name):
             5432,
             data_path,
         )
-    if "mysql" in engine or "aurora-mysql" in engine:
+    if _is_mysql_engine(engine):
+        image, _series = _mysql_runtime_for_engine(engine, engine_version)
         return (
-            apply_image_prefix(_mysql_image_for_version(engine_version)),
-            {"MYSQL_ROOT_PASSWORD": password, "MYSQL_ROOT_HOST": "%",
-             "MYSQL_DATABASE": db_name,
-             "MYSQL_USER": user, "MYSQL_PASSWORD": password},
-            3306,
-            "/var/lib/mysql",
-        )
-    if "mariadb" in engine:
-        return (
-            apply_image_prefix("mariadb:latest"),
+            apply_image_prefix(image),
             {"MYSQL_ROOT_PASSWORD": password, "MYSQL_ROOT_HOST": "%",
              "MYSQL_DATABASE": db_name,
              "MYSQL_USER": user, "MYSQL_PASSWORD": password},

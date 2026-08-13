@@ -3891,6 +3891,7 @@ def test_docker_image_for_engine_aurora_postgres_18_uses_new_layout():
 def test_mysql_image_for_version_maps_aurora_tracks():
     from ministack.services.rds import (
         _mysql_image_for_version,
+        _mysql_runtime_for_engine,
         _mysql_runtime_for_version,
     )
 
@@ -3902,6 +3903,22 @@ def test_mysql_image_for_version_maps_aurora_tracks():
     assert _mysql_image_for_version("9.0.mysql_aurora.9.0.1") == "mysql:8.4"
     assert _mysql_image_for_version("not-a-version") == "mysql:8.4"
     assert _mysql_runtime_for_version("8") == ("mysql:8.4", "8.4")
+    assert _mysql_runtime_for_engine("aurora-mysql", "8") == (
+        "mysql:8.4",
+        "8.4",
+    )
+    assert _mysql_runtime_for_engine("mysql", "8.0.33") == (
+        "mysql:8.0",
+        "8.0",
+    )
+    assert _mysql_runtime_for_engine("mysql", "5.7.44") == (
+        "mysql:5.7",
+        "5.7",
+    )
+    assert _mysql_runtime_for_engine("mariadb", "10.6.14") == (
+        "mariadb:latest",
+        None,
+    )
 
 
 def test_mysql_runtime_unknown_image_tag_disables_plugin(monkeypatch, caplog):

@@ -53,6 +53,12 @@ If a custom resolved image has no recognized series tag, MiniStack warns and
 leaves the plugin artifact absent while still attempting the compatibility
 procedures independently.
 
+| Engine class | Launch image source | Compatibility series | Disposition |
+|---|---|---|---|
+| `aurora-mysql` | Aurora version map, then `DEFAULT_AURORA_MYSQL_IMAGE` | Parsed from the selected MySQL image tag | 8.0/8.4 plugin artifacts when present; roles on 8.x; procedures/config always attempted. |
+| `mysql` | Same MySQL version map and fallback as the launch path | Parsed from the selected MySQL image tag | Same ABI-matched artifact rule; 5.6/5.7 skip roles and have no v1 artifact; procedures/config always attempted. |
+| `mariadb` | The launch path's `mariadb:latest` selection | None | Plugin and Aurora roles skipped; RDS procedures/config still attempted independently. |
+
 ## MySQL-ready path design
 
 The lifecycle hook runs after authenticated readiness and outside RDS store
