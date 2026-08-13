@@ -3,7 +3,8 @@ CloudWatch Logs Service Emulator.
 JSON-based API via X-Amz-Target (Logs_20140328).
 Supports: CreateLogGroup, DeleteLogGroup, DescribeLogGroups,
           CreateLogStream, DeleteLogStream, DescribeLogStreams,
-          PutLogEvents, GetLogEvents, FilterLogEvents, GetLogRecord, StartLiveTail,
+          PutLogEvents, GetLogEvents, FilterLogEvents, GetLogRecord, GetLogGroupFields,
+          StartLiveTail,
           PutRetentionPolicy, DeleteRetentionPolicy,
           PutSubscriptionFilter, DeleteSubscriptionFilter, DescribeSubscriptionFilters,
           TagLogGroup, UntagLogGroup, ListTagsLogGroup,
@@ -293,6 +294,7 @@ async def handle_request(method, path, headers, body, query_params):
         "GetLogEvents": _get_log_events,
         "FilterLogEvents": _filter_log_events,
         "GetLogRecord": _get_log_record,
+        "GetLogGroupFields": _get_log_group_fields,
         "StartLiveTail": _start_live_tail,
         "PutRetentionPolicy": _put_retention_policy,
         "DeleteRetentionPolicy": _delete_retention_policy,
@@ -644,6 +646,128 @@ def _get_log_record(data):
             400,
         )
     return json_response({"logRecord": _public_log_record(record)})
+
+
+_SYSTEM_LOG_GROUP_FIELDS = (
+    "@timestamp",
+    "@message",
+    "@logStream",
+    "@ptr",
+    "@log",
+)
+
+
+def _json_field_names(message: str) -> set[str]:
+    """Discover dotted field names from a JSON object message (AWS-style flatten)."""
+    try:
+        parsed = json.loads(message)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return set()
+    if not isinstance(parsed, dict):
+        return set()
+
+    names: set[str] = set()
+
+    def walk(obj, prefix: str = "") -> None:
+        if not isinstance(obj, dict):
+            return
+        for key, value in obj.items():
+            name = f"{prefix}.{key}" if prefix else str(key)
+            names.add(name)
+            if isinstance(value, dict):
+                walk(value, name)
+            elif isinstance(value, list):
+                # AWS Insights discovers array members with numeric index segments
+                # (e.g. items.0.id), not flattened under the bare parent key.
+                for idx, item in enumerate(value):
+                    indexed = f"{name}.{idx}"
+                    if isinstance(item, dict):
+                        names.add(indexed)
+                        walk(item, indexed)
+                    else:
+                        names.add(indexed)
+
+    walk(parsed)
+    return names
+
+
+def _resolve_log_group_fields_target(data) -> tuple[str | None, object | None]:
+    """Return (group_name, error_response). Exactly one of name/identifier required."""
+    name = data.get("logGroupName")
+    identifier = data.get("logGroupIdentifier")
+    has_name = bool(name)
+    has_identifier = bool(identifier)
+    if has_name == has_identifier:
+        return None, error_response_json(
+            "InvalidParameterException",
+            "Exactly one of logGroupName or logGroupIdentifier must be specified",
+            400,
+        )
+    if has_name:
+        return name, None
+    if identifier.startswith("arn:") or ":log-group:" in identifier:
+        resolved = _log_group_name_from_identifier_arn(identifier)
+        if not resolved:
+            return None, error_response_json(
+                "ResourceNotFoundException",
+                f"The specified log group does not exist: {identifier}",
+                400,
+            )
+        return resolved, None
+    return identifier, None
+
+
+def _get_log_group_fields(data):
+    """Return field names present in recent events, with rough presence percent.
+
+    Time window matches AWS: optional ``time`` (epoch seconds) searches ±8 minutes
+    around that center; otherwise the most recent 15 minutes. JSON object messages
+    contribute flattened dotted keys; system ``@*`` fields are counted when present
+    on the stored Insights record.
+    """
+    group_name, err = _resolve_log_group_fields_target(data)
+    if err is not None:
+        return err
+    if group_name not in _log_groups:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"The specified log group does not exist: {group_name}",
+            400,
+        )
+
+    if data.get("time") is not None:
+        center = int(data["time"])
+        start_s = center - 8 * 60
+        end_s = center + 8 * 60
+    else:
+        # _collect_query_records takes epoch seconds and uses end_s*1000 as an
+        # inclusive ms bound. Flooring "now" to seconds would drop events in the
+        # current partial second (timestamp > end_s*1000), so extend end by 1s.
+        end_s = int(time.time()) + 1
+        start_s = end_s - 15 * 60
+
+    records = _collect_query_records([group_name], start_s, end_s)
+    total = len(records)
+    if total == 0:
+        return json_response({"logGroupFields": []})
+
+    counts: dict[str, int] = {}
+    for record in records:
+        present: set[str] = set()
+        for field in _SYSTEM_LOG_GROUP_FIELDS:
+            if field in record and record.get(field) is not None:
+                present.add(field)
+        present.update(_json_field_names(record.get("@message", "")))
+        for field in present:
+            counts[field] = counts.get(field, 0) + 1
+
+    fields = []
+    for name, count in counts.items():
+        percent = int(round(100.0 * count / total))
+        percent = max(0, min(100, percent))
+        fields.append({"name": name, "percent": percent})
+    fields.sort(key=lambda item: (-item["percent"], item["name"]))
+    return json_response({"logGroupFields": fields})
 
 
 # ---------------------------------------------------------------------------
