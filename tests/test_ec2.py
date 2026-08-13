@@ -648,6 +648,189 @@ def test_ec2_revoke_security_group_egress_returns_revoked_rules(ec2):
     ec2.delete_security_group(GroupId=sg_id)
 
 
+def test_ec2_revoke_sg_ingress_by_rule_id(ec2):
+    """RevokeSecurityGroupIngress(SecurityGroupRuleIds=[...]) must remove exactly
+    the addressed rules — previously the ids were ignored and the call returned
+    Return=true while revoking nothing."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    sg_id = ec2.create_security_group(
+        GroupName=f"qa-ec2-sg-revoke-by-id-{suffix}", Description="revoke by id")["GroupId"]
+
+    ec2.authorize_security_group_ingress(
+        GroupId=sg_id,
+        IpPermissions=[
+            {"IpProtocol": "tcp", "FromPort": 80, "ToPort": 80,
+             "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+            {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443,
+             "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+        ],
+    )
+    sgr = ec2.describe_security_group_rules(
+        Filters=[{"Name": "group-id", "Values": [sg_id]}])["SecurityGroupRules"]
+    rule_id = next(r["SecurityGroupRuleId"] for r in sgr
+                   if not r["IsEgress"] and r["FromPort"] == 80)
+
+    resp = ec2.revoke_security_group_ingress(GroupId=sg_id, SecurityGroupRuleIds=[rule_id])
+    assert resp["Return"] is True
+    revoked = resp["RevokedSecurityGroupRules"]
+    assert len(revoked) == 1
+    assert revoked[0]["SecurityGroupRuleId"] == rule_id
+    assert revoked[0]["GroupId"] == sg_id
+    assert revoked[0]["IsEgress"] is False
+    assert revoked[0]["CidrIpv4"] == "0.0.0.0/0"
+
+    perms = ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]["IpPermissions"]
+    assert not any(p.get("FromPort") == 80 for p in perms)
+    assert any(p.get("FromPort") == 443 for p in perms)
+
+    ec2.delete_security_group(GroupId=sg_id)
+
+
+def test_ec2_revoke_sg_ingress_unknown_rule_id_rejects_whole_call(ec2):
+    """One unknown SecurityGroupRuleId rejects the whole revoke with
+    InvalidSecurityGroupRuleId.NotFound — the valid ids in the same call must
+    not be revoked (AWS validates before mutating)."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    sg_id = ec2.create_security_group(
+        GroupName=f"qa-ec2-sg-revoke-bad-id-{suffix}", Description="bad rule id")["GroupId"]
+
+    ec2.authorize_security_group_ingress(
+        GroupId=sg_id,
+        IpPermissions=[
+            {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22,
+             "IpRanges": [{"CidrIp": "10.0.0.0/8"}]},
+        ],
+    )
+    sgr = ec2.describe_security_group_rules(
+        Filters=[{"Name": "group-id", "Values": [sg_id]}])["SecurityGroupRules"]
+    rule_id = next(r["SecurityGroupRuleId"] for r in sgr if not r["IsEgress"])
+
+    with pytest.raises(ClientError) as exc:
+        ec2.revoke_security_group_ingress(
+            GroupId=sg_id,
+            SecurityGroupRuleIds=[rule_id, "sgr-00000000000000000"])
+    assert exc.value.response["Error"]["Code"] == "InvalidSecurityGroupRuleId.NotFound"
+
+    perms = ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]["IpPermissions"]
+    assert any(p.get("FromPort") == 22 for p in perms)
+
+    ec2.delete_security_group(GroupId=sg_id)
+
+
+def test_ec2_revoke_sg_rules_by_id_derives_missing_stored_ids():
+    """A rule dict carrying no stored SecurityGroupRuleId is matched by the
+    content-derived id instead, and direction is part of that identity: an id
+    derived for egress never matches an ingress rule. Exercised over the
+    handlers' in-memory shape so both outcomes are asserted on the group state;
+    the seeded default egress rule takes the same derive path over the wire
+    (test_ec2_revoke_sg_default_egress_rule_by_id)."""
+    from ministack.services.ec2 import _revoke_sg_rules_by_id, _sg_rule_id
+
+    sg_id = "sg-0unit000000000000"
+    rule_80 = {"IpProtocol": "tcp", "FromPort": 80, "ToPort": 80,
+               "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}
+    rule_443 = {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443,
+                "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}
+    # Pre-fix persisted state: no stored SecurityGroupRuleId on either rule.
+    assert "SecurityGroupRuleId" not in rule_80
+    sg = {"IpPermissions": [rule_80, rule_443], "IpPermissionsEgress": []}
+
+    derived = _sg_rule_id(sg_id, False, rule_80)
+    assert derived.startswith("sgr-")
+
+    revoked, err = _revoke_sg_rules_by_id(sg, sg_id, [derived], is_egress=False)
+    assert err is None
+    assert revoked == [rule_80]
+    assert sg["IpPermissions"] == [rule_443]
+
+    # An id derived for the egress direction must NOT match the ingress rule.
+    revoked, err = _revoke_sg_rules_by_id(
+        sg, sg_id, [_sg_rule_id(sg_id, True, rule_443)], is_egress=False)
+    assert revoked is None
+    assert err is not None
+    assert sg["IpPermissions"] == [rule_443]
+
+
+def test_ec2_revoke_sg_default_egress_rule_by_id(ec2):
+    """The allow-all egress rule CreateSecurityGroup seeds is stored without a
+    SecurityGroupRuleId, so revoking it by the id DescribeSecurityGroupRules
+    reports drives the content-derived fallback over the wire. It is also the
+    rule an aws_vpc_security_group_egress_rule plan destroys first, and the
+    revoke used to be a no-op that left it in place forever."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    sg_id = ec2.create_security_group(
+        GroupName=f"qa-ec2-sg-default-egress-{suffix}", Description="default egress")["GroupId"]
+
+    def _rule_ids():
+        return [r["SecurityGroupRuleId"] for r in ec2.describe_security_group_rules(
+            Filters=[{"Name": "group-id", "Values": [sg_id]}])["SecurityGroupRules"]]
+
+    rules = ec2.describe_security_group_rules(
+        Filters=[{"Name": "group-id", "Values": [sg_id]}])["SecurityGroupRules"]
+    default_egress = next(r for r in rules if r["IsEgress"] and r["IpProtocol"] == "-1")
+    rule_id = default_egress["SecurityGroupRuleId"]
+    assert rule_id.startswith("sgr-")
+
+    resp = ec2.revoke_security_group_egress(GroupId=sg_id, SecurityGroupRuleIds=[rule_id])
+    assert resp["Return"] is True
+    assert [r["SecurityGroupRuleId"] for r in resp["RevokedSecurityGroupRules"]] == [rule_id]
+
+    assert rule_id not in _rule_ids()
+    assert ec2.describe_security_groups(
+        GroupIds=[sg_id])["SecurityGroups"][0]["IpPermissionsEgress"] == []
+
+    # Re-authorizing the rule brings it back under the same content-derived id,
+    # so a destroy-then-recreate cycle round-trips.
+    reauth = ec2.authorize_security_group_egress(
+        GroupId=sg_id,
+        IpPermissions=[{"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}],
+    )
+    assert [r["SecurityGroupRuleId"] for r in reauth["SecurityGroupRules"]] == [rule_id]
+    assert _rule_ids() == [rule_id]
+
+    ec2.delete_security_group(GroupId=sg_id)
+
+
+def test_ec2_revoke_sg_egress_by_rule_id(ec2):
+    """RevokeSecurityGroupEgress(SecurityGroupRuleIds=[...]) removes the addressed
+    rule and echoes it in RevokedSecurityGroupRules; an unknown id is rejected
+    with InvalidSecurityGroupRuleId.NotFound."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    sg_id = ec2.create_security_group(
+        GroupName=f"qa-ec2-sg-revoke-egress-id-{suffix}", Description="egress by id")["GroupId"]
+
+    ec2.authorize_security_group_egress(
+        GroupId=sg_id,
+        IpPermissions=[
+            {"IpProtocol": "tcp", "FromPort": 5432, "ToPort": 5432,
+             "IpRanges": [{"CidrIp": "10.2.0.0/16"}]},
+        ],
+    )
+    sgr = ec2.describe_security_group_rules(
+        Filters=[{"Name": "group-id", "Values": [sg_id]}])["SecurityGroupRules"]
+    rule_id = next(r["SecurityGroupRuleId"] for r in sgr
+                   if r["IsEgress"] and r.get("FromPort") == 5432)
+
+    resp = ec2.revoke_security_group_egress(GroupId=sg_id, SecurityGroupRuleIds=[rule_id])
+    assert resp["Return"] is True
+    revoked = resp["RevokedSecurityGroupRules"]
+    assert len(revoked) == 1
+    assert revoked[0]["SecurityGroupRuleId"] == rule_id
+    assert revoked[0]["GroupId"] == sg_id
+    assert revoked[0]["IsEgress"] is True
+    assert revoked[0]["CidrIpv4"] == "10.2.0.0/16"
+
+    egress = ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]["IpPermissionsEgress"]
+    assert not any(p.get("FromPort") == 5432 for p in egress)
+
+    with pytest.raises(ClientError) as exc:
+        ec2.revoke_security_group_egress(
+            GroupId=sg_id, SecurityGroupRuleIds=["sgr-00000000000000000"])
+    assert exc.value.response["Error"]["Code"] == "InvalidSecurityGroupRuleId.NotFound"
+
+    ec2.delete_security_group(GroupId=sg_id)
+
+
 def test_ec2_sg_authorize_ingress_idempotent_duplicate(ec2):
     """Re-authorizing the same ingress rule must succeed (Terraform may re-apply unchanged rules)."""
     sg_id = ec2.create_security_group(GroupName="qa-ec2-sg-dup-auth", Description="dup auth")["GroupId"]
