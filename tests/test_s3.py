@@ -596,6 +596,41 @@ def test_s3_object_metadata(s3):
     assert resp["Metadata"]["custom-key"] == "custom-value"
     assert resp["Metadata"]["another"] == "data"
 
+
+def test_s3_versioned_object_metadata(s3):
+    """User metadata must round-trip on a versioned GetObject(VersionId). (#1342)
+
+    Each version keeps its own metadata; addressing a version by id returns
+    that version's metadata, and the current-version read returns the latest.
+    """
+    bkt = "intg-s3-meta-versioned"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(
+        Bucket=bkt, VersioningConfiguration={"Status": "Enabled"}
+    )
+
+    v1 = s3.put_object(
+        Bucket=bkt, Key="k", Body=b"one",
+        Metadata={"gen": "one"}, ContentEncoding="gzip",
+    )["VersionId"]
+    v2 = s3.put_object(
+        Bucket=bkt, Key="k", Body=b"two", Metadata={"gen": "two"},
+    )["VersionId"]
+    assert v1 and v2 and v1 != v2
+
+    g1 = s3.get_object(Bucket=bkt, Key="k", VersionId=v1)
+    assert g1["Metadata"]["gen"] == "one"
+    assert g1["ContentEncoding"] == "gzip"
+    assert g1["Body"].read() == b"one"
+
+    g2 = s3.get_object(Bucket=bkt, Key="k", VersionId=v2)
+    assert g2["Metadata"]["gen"] == "two"
+
+    # Current-version read (no VersionId) targets the latest.
+    cur = s3.get_object(Bucket=bkt, Key="k")
+    assert cur["Metadata"]["gen"] == "two"
+
+
 def test_s3_bucket_tagging(s3):
     bkt = "intg-s3-bkttags"
     s3.create_bucket(Bucket=bkt)
@@ -652,6 +687,48 @@ def test_s3_create_bucket_with_tags_and_location(s3):
     assert tags == {"project": "Trinity"}
     loc = s3.get_bucket_location(Bucket=bkt)
     assert loc["LocationConstraint"] == "us-west-2"
+
+def test_s3_get_bucket_location_explicit_constraint(s3):
+    """A bucket created with an explicit LocationConstraint must echo it back
+    from GetBucketLocation."""
+    bkt = f"intg-s3-loc-explicit-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(
+        Bucket=bkt,
+        CreateBucketConfiguration={"LocationConstraint": "eu-west-1"},
+    )
+    loc = s3.get_bucket_location(Bucket=bkt)
+    assert loc["LocationConstraint"] == "eu-west-1"
+
+def test_s3_get_bucket_location_us_east_1_is_none(s3):
+    """AWS returns an empty LocationConstraint for us-east-1 buckets, which
+    boto3 surfaces as None."""
+    bkt = f"intg-s3-loc-useast1-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    loc = s3.get_bucket_location(Bucket=bkt)
+    assert loc["LocationConstraint"] is None
+
+def test_s3_get_bucket_location_defaults_to_signing_region(s3):
+    """A bucket created WITHOUT CreateBucketConfiguration lands in the region
+    the request was signed for — GetBucketLocation must echo that region."""
+    import boto3
+    from botocore.config import Config
+
+    west_s3 = boto3.client(
+        "s3",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name="eu-west-1",
+        config=Config(
+            region_name="eu-west-1",
+            retries={"mode": "standard"},
+            max_pool_connections=50,
+        ),
+    )
+    bkt = f"intg-s3-loc-signing-{_uuid_mod.uuid4().hex[:8]}"
+    west_s3.create_bucket(Bucket=bkt)
+    loc = west_s3.get_bucket_location(Bucket=bkt)
+    assert loc["LocationConstraint"] == "eu-west-1"
 
 def test_s3_create_bucket_without_tags_has_no_tag_set(s3):
     """A CreateBucket with no tags must not create an empty tag set — a
@@ -3315,6 +3392,59 @@ def test_s3_lifecycle_noncurrent_version(s3):
     assert rule["NoncurrentVersionExpiration"]["NoncurrentDays"] == 30
 
 
+def test_s3_lifecycle_newer_noncurrent_versions_round_trip(s3):
+    """NewerNoncurrentVersions must survive the PUT/GET round-trip.
+
+    terraform-provider-aws waits after creating a lifecycle configuration until GET
+    returns rules equal to what it sent. A dropped field never converges, so the
+    create fails with 'timeout while waiting for state to become true' after 3m.
+    """
+    bucket = "intg-s3-lc-newer-noncurrent"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_lifecycle_configuration(
+        Bucket=bucket,
+        LifecycleConfiguration={
+            "Rules": [{
+                "ID": "noncurrent-cleanup",
+                "Status": "Enabled",
+                "Filter": {"Prefix": "integration-tests"},
+                "NoncurrentVersionExpiration": {
+                    "NoncurrentDays": 2,
+                    "NewerNoncurrentVersions": 5,
+                },
+            }]
+        },
+    )
+    rule = s3.get_bucket_lifecycle_configuration(Bucket=bucket)["Rules"][0]
+    assert rule["NoncurrentVersionExpiration"]["NoncurrentDays"] == 2
+    assert rule["NoncurrentVersionExpiration"]["NewerNoncurrentVersions"] == 5
+
+
+def test_s3_lifecycle_noncurrent_version_transition_newer_versions(s3):
+    """NewerNoncurrentVersions on a NoncurrentVersionTransition also round-trips."""
+    bucket = "intg-s3-lc-nvt-newer"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_lifecycle_configuration(
+        Bucket=bucket,
+        LifecycleConfiguration={
+            "Rules": [{
+                "ID": "noncurrent-archive",
+                "Status": "Enabled",
+                "Filter": {"Prefix": ""},
+                "NoncurrentVersionTransitions": [{
+                    "NoncurrentDays": 7,
+                    "NewerNoncurrentVersions": 3,
+                    "StorageClass": "GLACIER",
+                }],
+            }]
+        },
+    )
+    transition = s3.get_bucket_lifecycle_configuration(Bucket=bucket)["Rules"][0]["NoncurrentVersionTransitions"][0]
+    assert transition["NoncurrentDays"] == 7
+    assert transition["NewerNoncurrentVersions"] == 3
+    assert transition["StorageClass"] == "GLACIER"
+
+
 def test_s3_lifecycle_multiple_rules(s3):
     """Multiple lifecycle rules survive PUT/GET round-trip."""
     bucket = "intg-s3-lc-multi"
@@ -3852,3 +3982,194 @@ def test_s3_get_object_attributes(s3):
     r = s3.get_object_attributes(Bucket=bkt, Key="kv", VersionId=pv["VersionId"],
                                  ObjectAttributes=["ObjectSize"])
     assert r["ObjectSize"] == 2 and r["VersionId"] == pv["VersionId"]
+
+
+# ---------------------------------------------------------------------------
+# ceph/s3-tests conformance fixes (#1322)
+# ---------------------------------------------------------------------------
+
+def test_s3_post_object_field_with_filename_is_not_body(s3):
+    """A form field carrying a filename (HTTP libraries set one on every field)
+    must NOT be treated as the object body — only the field named `file` is.
+    Regression for #1322 defect 1."""
+    import requests
+    from collections import OrderedDict
+    bucket = "intg-s3-post-filename-field"
+    s3.create_bucket(Bucket=bucket)
+    # `key` is an ordinary form field that carries a filename; `file` is the body.
+    r = requests.post(
+        f"{ENDPOINT}/{bucket}",
+        files=OrderedDict([
+            ("key", ("key.txt", "up.txt")),
+            ("file", ("f.txt", b"bar")),
+        ]),
+    )
+    assert r.status_code == 204
+    assert s3.get_object(Bucket=bucket, Key="up.txt")["Body"].read() == b"bar"
+
+
+def test_s3_get_object_part_number(s3):
+    """GetObject with partNumber returns that part as 206 with a parts count,
+    not the whole object. Regression for #1322 defect 2."""
+    bucket = "intg-s3-get-partnumber"
+    s3.create_bucket(Bucket=bucket)
+    uid = s3.create_multipart_upload(Bucket=bucket, Key="k")["UploadId"]
+    p1 = s3.upload_part(Bucket=bucket, Key="k", UploadId=uid, PartNumber=1, Body=b"A" * 100)
+    p2 = s3.upload_part(Bucket=bucket, Key="k", UploadId=uid, PartNumber=2, Body=b"B" * 50)
+    s3.complete_multipart_upload(
+        Bucket=bucket, Key="k", UploadId=uid,
+        MultipartUpload={"Parts": [
+            {"PartNumber": 1, "ETag": p1["ETag"]},
+            {"PartNumber": 2, "ETag": p2["ETag"]},
+        ]},
+    )
+    g = s3.get_object(Bucket=bucket, Key="k", PartNumber=1)
+    assert g["ResponseMetadata"]["HTTPStatusCode"] == 206
+    assert g["PartsCount"] == 2
+    assert g["ContentLength"] == 100
+    assert g["Body"].read() == b"A" * 100
+
+
+def test_s3_list_object_versions_pagination_markers(s3):
+    """A truncated ListObjectVersions returns NextKeyMarker and the marker
+    advances a second page without repeats. Regression for #1322 defect 3."""
+    bucket = "intg-s3-lov-markers"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+    for i in range(5):
+        s3.put_object(Bucket=bucket, Key=f"k{i}", Body=b"x")
+    r1 = s3.list_object_versions(Bucket=bucket, MaxKeys=2)
+    assert r1["IsTruncated"] is True
+    assert r1.get("NextKeyMarker")
+    r2 = s3.list_object_versions(Bucket=bucket, MaxKeys=2, KeyMarker=r1["NextKeyMarker"])
+    first = {v["Key"] for v in r1["Versions"]}
+    second = {v["Key"] for v in r2["Versions"]}
+    assert first and second and first.isdisjoint(second)
+
+
+def test_s3_complete_multipart_upload_empty_body_is_malformed_xml(s3):
+    """CompleteMultipartUpload with an empty body returns 400 MalformedXML,
+    not a 500 with a JSON document. Regression for #1322 defect 6."""
+    import requests
+    bucket = "intg-s3-cmu-emptybody"
+    s3.create_bucket(Bucket=bucket)
+    uid = s3.create_multipart_upload(Bucket=bucket, Key="k")["UploadId"]
+    r = requests.post(f"{ENDPOINT}/{bucket}/k?uploadId={uid}", data=b"")
+    assert r.status_code == 400
+    assert "MalformedXML" in r.text
+
+
+def test_s3_complete_multipart_upload_idempotent(s3):
+    """A repeated CompleteMultipartUpload with the same upload id replays the
+    original result instead of NoSuchUpload. Regression for #1322 defect 8."""
+    bucket = "intg-s3-cmu-idempotent"
+    s3.create_bucket(Bucket=bucket)
+    uid = s3.create_multipart_upload(Bucket=bucket, Key="k")["UploadId"]
+    part = s3.upload_part(Bucket=bucket, Key="k", UploadId=uid, PartNumber=1, Body=b"data")
+    mpu = {"Parts": [{"PartNumber": 1, "ETag": part["ETag"]}]}
+    r1 = s3.complete_multipart_upload(Bucket=bucket, Key="k", UploadId=uid, MultipartUpload=mpu)
+    r2 = s3.complete_multipart_upload(Bucket=bucket, Key="k", UploadId=uid, MultipartUpload=mpu)
+    assert r1["ETag"] == r2["ETag"]
+
+
+def test_s3_owner_id_consistent_between_listing_and_acl(s3):
+    """The owner id in a listing matches the owner id returned by the object ACL.
+    Regression for #1322 defect 9."""
+    bucket = "intg-s3-owner-consistency"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x")
+    listed = s3.list_objects(Bucket=bucket)["Contents"][0]["Owner"]["ID"]
+    acl_owner = s3.get_object_acl(Bucket=bucket, Key="k")["Owner"]["ID"]
+    assert listed == acl_owner
+
+
+def test_s3_presigned_url_expires():
+    """An expired SigV4 presigned URL is rejected with 403. Regression for
+    #1322 defect 10. Uses an explicit s3v4 client (the expiry check lives in the
+    SigV4 verification path); the default fixture presigns with SigV2."""
+    import boto3
+    import requests
+    from botocore.config import Config
+    ep = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+    v4 = boto3.client(
+        "s3", endpoint_url=ep, region_name="us-east-1",
+        aws_access_key_id="test", aws_secret_access_key="test",
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+    bucket = "intg-s3-presign-expiry"
+    v4.create_bucket(Bucket=bucket)
+    v4.put_object(Bucket=bucket, Key="k", Body=b"x")
+    url = v4.generate_presigned_url(
+        "get_object", Params={"Bucket": bucket, "Key": "k"}, ExpiresIn=1
+    )
+    time.sleep(2)
+    assert requests.get(url).status_code == 403
+
+
+def test_s3_conditional_delete_if_match(s3):
+    """DeleteObject with a non-matching If-Match is rejected 412 (object
+    survives); DeleteObjects reports a stale ETag under Errors, not Deleted.
+    Regression for #1322 defect 7 (delete side)."""
+    bucket = "intg-s3-conditional-delete"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="cond", Body=b"x")
+
+    with pytest.raises(ClientError) as exc:
+        s3.delete_object(Bucket=bucket, Key="cond", IfMatch="badetag")
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+    assert s3.get_object(Bucket=bucket, Key="cond")["Body"].read() == b"x"
+
+    resp = s3.delete_objects(
+        Bucket=bucket, Delete={"Objects": [{"Key": "cond", "ETag": "badetag"}]}
+    )
+    assert resp.get("Errors") and resp["Errors"][0]["Code"] == "PreconditionFailed"
+    assert not resp.get("Deleted")
+    assert s3.get_object(Bucket=bucket, Key="cond")["Body"].read() == b"x"
+
+
+def test_s3_copy_object_specific_version(s3):
+    """CopyObject with a source ?versionId copies that exact version, not the
+    current object. Regression for #1328."""
+    bucket = "intg-s3-copy-version"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+    v1 = s3.put_object(Bucket=bucket, Key="k", Body=b"VERSION-ONE")["VersionId"]
+    s3.put_object(Bucket=bucket, Key="k", Body=b"VERSION-TWO")
+
+    r = s3.copy_object(
+        Bucket=bucket, Key="copy",
+        CopySource={"Bucket": bucket, "Key": "k", "VersionId": v1},
+    )
+    assert r["CopySourceVersionId"] == v1
+    assert s3.get_object(Bucket=bucket, Key="copy")["Body"].read() == b"VERSION-ONE"
+
+    # Copy without a versionId still takes the current version.
+    s3.copy_object(Bucket=bucket, Key="copy2", CopySource={"Bucket": bucket, "Key": "k"})
+    assert s3.get_object(Bucket=bucket, Key="copy2")["Body"].read() == b"VERSION-TWO"
+
+    # A non-existent source version is rejected.
+    with pytest.raises(ClientError) as exc:
+        s3.copy_object(
+            Bucket=bucket, Key="copy-bad",
+            CopySource={"Bucket": bucket, "Key": "k", "VersionId": "does-not-exist"},
+        )
+    assert exc.value.response["Error"]["Code"] == "NoSuchVersion"
+
+
+def test_s3_head_object_specific_version(s3):
+    """HeadObject with a versionId returns that version's metadata, not the
+    current object's (same versionId-dropping class as #1328)."""
+    bucket = "intg-s3-head-version"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+    v1 = s3.put_object(Bucket=bucket, Key="k", Body=b"AAAAA")["VersionId"]        # 5 bytes
+    s3.put_object(Bucket=bucket, Key="k", Body=b"BBBBBBBBBB")                     # 10 bytes
+
+    h = s3.head_object(Bucket=bucket, Key="k", VersionId=v1)
+    assert h["ContentLength"] == 5
+    assert h["VersionId"] == v1
+
+    # HEAD carries no body, so boto3 surfaces a bad version as a 404.
+    with pytest.raises(ClientError) as exc:
+        s3.head_object(Bucket=bucket, Key="k", VersionId="does-not-exist")
+    assert exc.value.response["Error"]["Code"] in ("NoSuchVersion", "404")

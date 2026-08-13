@@ -469,7 +469,7 @@ def test_execute_build_times_out_per_project_timeout(monkeypatch, tmp_path):
 
     codebuild._execute_build("demo:0006", project)
 
-    assert build["buildStatus"] == "FAILED"
+    assert build["buildStatus"] == "TIMED_OUT"
     assert "TIMED_OUT" in [p.get("phaseStatus") for p in build["phases"]]
 
 

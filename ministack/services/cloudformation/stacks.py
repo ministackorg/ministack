@@ -160,15 +160,16 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
             if prev_resource:
                 old_pid = prev_resource.get("PhysicalResourceId", logical_id)
                 old_props = prev_resource.get("Properties", {})
+                old_attrs = prev_resource.get("Attributes", {})
                 if _is_custom_resource(resource_type):
                     physical_id, attrs = await asyncio.to_thread(
                         _update_resource, resource_type, old_pid, old_props,
-                        resolved_props, stack_name, logical_id
+                        resolved_props, stack_name, logical_id, old_attrs
                     )
                 else:
                     physical_id, attrs = _update_resource(
                         resource_type, old_pid, old_props, resolved_props,
-                        stack_name, logical_id
+                        stack_name, logical_id, old_attrs
                     )
             else:
                 if _is_custom_resource(resource_type):

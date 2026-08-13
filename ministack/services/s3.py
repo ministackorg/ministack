@@ -41,7 +41,7 @@ from urllib.parse import parse_qs as _parse_qs
 from urllib.parse import quote as url_quote
 from urllib.parse import unquote as url_unquote
 from urllib.parse import urlparse as _urlparse
-from xml.etree.ElementTree import Element, SubElement, tostring
+from xml.etree.ElementTree import Element, ParseError, SubElement, tostring
 from xml.sax.saxutils import escape as _esc
 
 from defusedxml.ElementTree import fromstring
@@ -93,6 +93,11 @@ _object_retention = AccountScopedDict()
 _object_legal_hold = AccountScopedDict()
 
 _multipart_uploads = AccountScopedDict()
+# Completed uploads, keyed by upload id -> the (status, headers, body) response.
+# CompleteMultipartUpload is idempotent: a retry with the same upload id and
+# parts returns the original 200 result rather than NoSuchUpload (which real S3
+# only returns later, once the upload id is garbage-collected).
+_completed_multipart_uploads = AccountScopedDict()
 
 # ── Persistence (metadata only — object bodies are NOT persisted here) ────
 
@@ -809,6 +814,22 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
         return _bad_signature()
     _akid, date_stamp, region, service, _terminator = cred_parts
 
+    # Expiry: a presigned URL past X-Amz-Date + X-Amz-Expires is rejected by S3
+    # with 403 AccessDenied "Request has expired", independent of the signature.
+    expires = (_qp(query_params, "X-Amz-Expires", "")
+               or _qp(query_params, "x-amz-expires", ""))
+    if expires:
+        try:
+            signed_at = _dt.datetime.strptime(
+                amz_date, "%Y%m%dT%H%M%SZ"
+            ).replace(tzinfo=_dt.timezone.utc)
+            if _dt.datetime.now(_dt.timezone.utc) > signed_at + _dt.timedelta(
+                seconds=int(expires)
+            ):
+                return _error("AccessDenied", "Request has expired", 403, path)
+        except (ValueError, TypeError):
+            pass
+
     # Canonical query string: every query param except X-Amz-Signature,
     # RFC3986-encoded, sorted by encoded key then value.
     pairs = []
@@ -930,7 +951,7 @@ def _dispatch(
             )
 
         if method == "HEAD":
-            return _head_object(bucket, key, headers)
+            return _head_object(bucket, key, headers, query_params)
 
         if method == "DELETE":
             if "uploadId" in query_params:
@@ -1081,7 +1102,7 @@ def _dispatch(
 def _list_buckets():
     root = Element("ListAllMyBucketsResult", xmlns=S3_NS)
     owner = SubElement(root, "Owner")
-    SubElement(owner, "ID").text = "owner-id"
+    SubElement(owner, "ID").text = get_account_id()
     SubElement(owner, "DisplayName").text = "ministack"
     buckets_el = SubElement(root, "Buckets")
     for name, data in sorted(_buckets.items()):
@@ -1124,6 +1145,9 @@ def _create_bucket(name: str, body: bytes, headers: dict = None):
     if err is not None:
         return err
 
+    # No explicit LocationConstraint: the bucket lands in the region the
+    # request was signed for, like real AWS.
+    region = region or get_region()
     _buckets[name] = {"created": now_iso(), "objects": {}, "region": region}
     if tags:
         _bucket_tags[name] = tags
@@ -1195,9 +1219,10 @@ def _get_bucket_location(name: str):
     if name not in _buckets:
         return _no_such_bucket(name)
     root = Element("LocationConstraint", xmlns=S3_NS)
-    region = _buckets[name].get("region")
-    # AWS returns empty LocationConstraint for us-east-1.
-    if region and region != os.environ.get("MINISTACK_REGION", "us-east-1"):
+    region = _buckets[name].get("region") or os.environ.get("MINISTACK_REGION", "us-east-1")
+    # AWS returns an empty LocationConstraint only for us-east-1 buckets;
+    # every other region is echoed back verbatim.
+    if region != "us-east-1":
         root.text = region
     return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
@@ -1339,6 +1364,8 @@ def _get_bucket_lifecycle(name: str):
                 xml += "<NoncurrentVersionTransition>"
                 if "NoncurrentDays" in t:
                     xml += f"<NoncurrentDays>{t['NoncurrentDays']}</NoncurrentDays>"
+                if "NewerNoncurrentVersions" in t:
+                    xml += f"<NewerNoncurrentVersions>{t['NewerNoncurrentVersions']}</NewerNoncurrentVersions>"
                 xml += f"<StorageClass>{t.get('StorageClass', 'STANDARD_IA')}</StorageClass>"
                 xml += "</NoncurrentVersionTransition>"
             if "Expiration" in rule:
@@ -1356,6 +1383,8 @@ def _get_bucket_lifecycle(name: str):
                 xml += "<NoncurrentVersionExpiration>"
                 if "NoncurrentDays" in nve:
                     xml += f"<NoncurrentDays>{nve['NoncurrentDays']}</NoncurrentDays>"
+                if "NewerNoncurrentVersions" in nve:
+                    xml += f"<NewerNoncurrentVersions>{nve['NewerNoncurrentVersions']}</NewerNoncurrentVersions>"
                 xml += "</NoncurrentVersionExpiration>"
             if rule.get("AbortIncompleteMultipartUpload"):
                 aimu = rule["AbortIncompleteMultipartUpload"]
@@ -1457,6 +1486,9 @@ def _put_bucket_lifecycle(name: str, body: bytes):
                 days = _lc_text(t, "NoncurrentDays")
                 if days:
                     td["NoncurrentDays"] = int(days)
+                newer = _lc_text(t, "NewerNoncurrentVersions")
+                if newer:
+                    td["NewerNoncurrentVersions"] = int(newer)
                 td["StorageClass"] = _lc_text(t, "StorageClass") or "STANDARD_IA"
                 nv_transitions.append(td)
             if nv_transitions:
@@ -1482,6 +1514,9 @@ def _put_bucket_lifecycle(name: str, body: bytes):
                 days = _lc_text(nve_el, "NoncurrentDays")
                 if days:
                     nve["NoncurrentDays"] = int(days)
+                newer = _lc_text(nve_el, "NewerNoncurrentVersions")
+                if newer:
+                    nve["NewerNoncurrentVersions"] = int(newer)
                 rule["NoncurrentVersionExpiration"] = nve
             # AbortIncompleteMultipartUpload
             aimu_el = _lc_find(rule_el, "AbortIncompleteMultipartUpload")
@@ -1791,17 +1826,57 @@ def _list_object_versions(bucket_name: str, query_params: dict):
     SubElement(root, "VersionIdMarker").text = version_id_marker
     SubElement(root, "MaxKeys").text = str(max_keys)
 
-    # Collect all keys: from objects AND from version history (deleted objects)
-    all_keys = set(k for k in bucket["objects"] if k.startswith(prefix) and k > key_marker)
+    owner_id = get_account_id()
+
+    # Collect all keys: from objects AND from version history (deleted objects).
+    # When a version-id-marker is supplied we must resume *within* key-marker,
+    # so that key is included; otherwise key-marker is exclusive.
+    def _in_page(k):
+        if not k.startswith(prefix):
+            return False
+        if version_id_marker:
+            return k >= key_marker
+        return k > key_marker
+
+    all_keys = set(k for k in bucket["objects"] if _in_page(k))
     for (bn, k) in _object_versions:
-        if bn == bucket_name and k.startswith(prefix) and k > key_marker:
+        if bn == bucket_name and _in_page(k):
             all_keys.add(k)
     keys = sorted(all_keys)
 
     is_truncated = False
-    SubElement(root, "IsTruncated").text = "false"
+    is_truncated_el = SubElement(root, "IsTruncated")
+    is_truncated_el.text = "false"
 
     count = 0
+    next_key_marker = None
+    next_version_id_marker = None
+
+    def _emit_version(k, v):
+        if v.get("is_delete_marker"):
+            dm = SubElement(root, "DeleteMarker")
+            SubElement(dm, "Key").text = k
+            SubElement(dm, "VersionId").text = v["version_id"]
+            SubElement(dm, "IsLatest").text = "true" if v["is_latest"] else "false"
+            SubElement(dm, "LastModified").text = v["last_modified"]
+            owner = SubElement(dm, "Owner")
+        else:
+            ver = SubElement(root, "Version")
+            SubElement(ver, "Key").text = k
+            SubElement(ver, "VersionId").text = v["version_id"]
+            SubElement(ver, "IsLatest").text = "true" if v["is_latest"] else "false"
+            SubElement(ver, "LastModified").text = v["last_modified"]
+            SubElement(ver, "ETag").text = v["etag"]
+            SubElement(ver, "Size").text = str(v["size"])
+            SubElement(ver, "StorageClass").text = (
+                v.get("storage_class")
+                or bucket["objects"].get(k, {}).get("storage_class")
+                or "STANDARD"
+            )
+            owner = SubElement(ver, "Owner")
+        SubElement(owner, "ID").text = owner_id
+        SubElement(owner, "DisplayName").text = "ministack"
+
     for k in keys:
         if count >= max_keys:
             is_truncated = True
@@ -1809,36 +1884,20 @@ def _list_object_versions(bucket_name: str, query_params: dict):
         vkey = (bucket_name, k)
         versions = _object_versions.get(vkey)
         if versions:
-            # Return all stored versions (newest first)
+            # Resume within key-marker: skip versions up to and including the
+            # supplied version-id-marker (versions are stored oldest-first, so
+            # newest-first iteration matches the S3 listing order).
+            skipping = bool(version_id_marker and k == key_marker)
             for v in reversed(versions):
+                if skipping:
+                    if v["version_id"] == version_id_marker:
+                        skipping = False
+                    continue
                 if count >= max_keys:
                     is_truncated = True
                     break
-                if v.get("is_delete_marker"):
-                    dm = SubElement(root, "DeleteMarker")
-                    SubElement(dm, "Key").text = k
-                    SubElement(dm, "VersionId").text = v["version_id"]
-                    SubElement(dm, "IsLatest").text = "true" if v["is_latest"] else "false"
-                    SubElement(dm, "LastModified").text = v["last_modified"]
-                    owner = SubElement(dm, "Owner")
-                    SubElement(owner, "ID").text = "owner-id"
-                    SubElement(owner, "DisplayName").text = "ministack"
-                else:
-                    ver = SubElement(root, "Version")
-                    SubElement(ver, "Key").text = k
-                    SubElement(ver, "VersionId").text = v["version_id"]
-                    SubElement(ver, "IsLatest").text = "true" if v["is_latest"] else "false"
-                    SubElement(ver, "LastModified").text = v["last_modified"]
-                    SubElement(ver, "ETag").text = v["etag"]
-                    SubElement(ver, "Size").text = str(v["size"])
-                    SubElement(ver, "StorageClass").text = (
-                        v.get("storage_class")
-                        or bucket["objects"].get(k, {}).get("storage_class")
-                        or "STANDARD"
-                    )
-                    owner = SubElement(ver, "Owner")
-                    SubElement(owner, "ID").text = "owner-id"
-                    SubElement(owner, "DisplayName").text = "ministack"
+                _emit_version(k, v)
+                next_key_marker, next_version_id_marker = k, v["version_id"]
                 count += 1
         else:
             # No version history — return current object with null version
@@ -1854,12 +1913,17 @@ def _list_object_versions(bucket_name: str, query_params: dict):
             SubElement(ver, "Size").text = str(obj["size"])
             SubElement(ver, "StorageClass").text = obj.get("storage_class") or "STANDARD"
             owner = SubElement(ver, "Owner")
-            SubElement(owner, "ID").text = "owner-id"
+            SubElement(owner, "ID").text = owner_id
             SubElement(owner, "DisplayName").text = "ministack"
+            next_key_marker, next_version_id_marker = k, obj.get("version_id", "null")
             count += 1
 
-    # Update IsTruncated after actual count
-    root.find("IsTruncated").text = "true" if is_truncated else "false"
+    is_truncated_el.text = "true" if is_truncated else "false"
+    # A truncated response must carry the continuation markers, or a paginating
+    # client loops on page one (or, as boto3 does, rejects KeyMarker=None).
+    if is_truncated and next_key_marker is not None:
+        SubElement(root, "NextKeyMarker").text = next_key_marker
+        SubElement(root, "NextVersionIdMarker").text = next_version_id_marker or "null"
 
     return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
@@ -2440,6 +2504,9 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
             "is_latest": True,
             "data": body,
             "content_type": obj.get("content_type") or "application/octet-stream",
+            "content_encoding": obj.get("content_encoding"),
+            "metadata": obj.get("metadata", {}),
+            "preserved_headers": obj.get("preserved_headers", {}),
             "storage_class": obj.get("storage_class") or "STANDARD",
             "checksums": obj.get("checksums") or {},
         })
@@ -2561,7 +2628,11 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
     file_filename: str | None = None
     file_headers: dict = {}
     for name, filename, ph, value in parts:
-        if name == "file" or filename is not None:
+        # Only the field literally named "file" is the object body. A filename
+        # attribute on any other field does NOT make it the body — browsers and
+        # HTTP libraries (e.g. Python requests' files=) set filename on ordinary
+        # form fields, and S3 treats those as form fields, not content.
+        if name == "file":
             file_value = value
             file_filename = filename or ""
             file_headers = ph
@@ -2637,6 +2708,10 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
             "size": obj["size"],
             "is_latest": True,
             "data": file_value,
+            "content_type": obj.get("content_type") or "application/octet-stream",
+            "content_encoding": obj.get("content_encoding"),
+            "metadata": obj.get("metadata", {}),
+            "preserved_headers": obj.get("preserved_headers", {}),
             "storage_class": obj.get("storage_class") or "STANDARD",
         })
         for v in _object_versions[vkey][:-1]:
@@ -2742,24 +2817,19 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
         versions = _object_versions.get(vkey, [])
         for v in versions:
             if v["version_id"] == version_id:
-                resp_headers = {
-                    "Content-Type": v.get("content_type") or "application/octet-stream",
-                    "ETag": v["etag"],
-                    "Content-Length": str(v["size"]),
-                    "Last-Modified": iso_to_rfc7231(v["last_modified"]),
-                    "x-amz-version-id": v["version_id"],
-                }
-                # Versioned reads honor `x-amz-checksum-mode: ENABLED` the same
-                # way current-version reads do — the stored per-version
-                # checksums are looked up and surfaced as `x-amz-checksum-*`.
-                if (headers.get("x-amz-checksum-mode") or "").upper() == "ENABLED":
-                    stored = v.get("checksums") or {}
-                    for alg, val in stored.items():
-                        resp_headers[f"x-amz-checksum-{alg.lower()}"] = val
-                    if stored:
-                        resp_headers["x-amz-checksum-type"] = "FULL_OBJECT"
+                # Route through the shared header builder (same path as versioned
+                # HeadObject) so a version's user metadata (x-amz-meta-*),
+                # preserved headers and content-encoding are emitted — not just
+                # the five wire basics. Versioned reads honor
+                # `x-amz-checksum-mode: ENABLED` exactly as current-version reads do.
+                include_checksums = (headers.get("x-amz-checksum-mode") or "").upper() == "ENABLED"
+                vobj = _object_record_from_version(v)
+                resp_headers = _object_response_headers(
+                    vobj, bucket_name, key, include_checksums=include_checksums)
                 resp_headers.update(_object_tagging_count_header(bucket_name, key, version_id))
-                body = v["data"] if v["data"] is not None else _read_body(bucket_name, key, bucket["objects"].get(key, {}))
+                body = v.get("data")
+                if body is None:
+                    body = _read_body(bucket_name, key, bucket["objects"].get(key, {}))
                 return 200, resp_headers, body
         return _error("NoSuchVersion", "The specified version does not exist.", 404, f"/{bucket_name}/{key}")
 
@@ -2784,6 +2854,29 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
     resp_headers.update(_object_tagging_count_header(bucket_name, key, obj.get("version_id")))
 
     body = _read_body(bucket_name, key, obj)
+
+    # partNumber: return a single part of a completed multipart object as 206
+    # Partial Content with a Content-Range and x-amz-mp-parts-count, rather than
+    # the whole object. Parts are matched by their part number (which may be
+    # non-contiguous), and their byte offset is the sum of the preceding sizes.
+    part_number = _qp(query_params, "partNumber") if query_params else None
+    if part_number and obj.get("parts"):
+        try:
+            pn = int(part_number)
+        except (TypeError, ValueError):
+            pn = None
+        parts = obj["parts"]
+        idx = next((i for i, p in enumerate(parts) if p["PartNumber"] == pn), None)
+        if idx is not None:
+            offset = sum(p["Size"] for p in parts[:idx])
+            length = parts[idx]["Size"]
+            slice_body = body[offset : offset + length]
+            resp_headers["Content-Length"] = str(len(slice_body))
+            resp_headers["Content-Range"] = f"bytes {offset}-{offset + length - 1}/{obj['size']}"
+            resp_headers["x-amz-mp-parts-count"] = str(len(parts))
+            _apply_response_overrides(resp_headers, query_params)
+            return 206, resp_headers, slice_body
+
     if range_header:
         rng = _parse_range(range_header, obj["size"])
         if rng is None:
@@ -2919,23 +3012,47 @@ def _range_error_xml(bucket_name: str, key: str) -> Element:
     return root
 
 
-def _head_object(bucket_name: str, key: str, headers: dict | None = None):
+def _head_object(bucket_name: str, key: str, headers: dict | None = None,
+                 query_params: dict | None = None):
     headers = headers or {}
+    query_params = query_params or {}
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
-    if key not in bucket["objects"]:
-        return _error(
-            "NoSuchKey",
-            "The specified key does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
 
-    obj = bucket["objects"][key]
+    # A `?versionId=` selects a specific version's metadata, matching AWS
+    # HeadObject(VersionId); without it, the current object is used.
+    version_id = _qp(query_params, "versionId", "")
+    if version_id:
+        ventry = next(
+            (v for v in _object_versions.get((bucket_name, key), [])
+             if v["version_id"] == version_id),
+            None,
+        )
+        if ventry is None or ventry.get("is_delete_marker"):
+            return _error(
+                "NoSuchVersion",
+                "The specified version does not exist.",
+                404,
+                f"/{bucket_name}/{key}",
+            )
+        obj = _object_record_from_version(ventry)
+    else:
+        if key not in bucket["objects"]:
+            return _error(
+                "NoSuchKey",
+                "The specified key does not exist.",
+                404,
+                f"/{bucket_name}/{key}",
+            )
+        obj = bucket["objects"][key]
+
     include_checksums = (headers.get("x-amz-checksum-mode") or "").upper() == "ENABLED"
-    return 200, _object_response_headers(obj, bucket_name, key,
-                                         include_checksums=include_checksums), b""
+    resp_headers = _object_response_headers(obj, bucket_name, key,
+                                            include_checksums=include_checksums)
+    if version_id:
+        resp_headers["x-amz-version-id"] = version_id
+    return 200, resp_headers, b""
 
 
 def _purge_current_object(bucket_name: str, key: str, bucket: dict):
@@ -3032,6 +3149,20 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None,
     if bucket is None:
         return _no_such_bucket(bucket_name)
 
+    # Conditional delete: If-Match against the current object's ETag. A
+    # non-matching (or absent) object fails the precondition with 412, so the
+    # object is not removed — S3's compare-and-swap delete.
+    if_match = (headers.get("if-match") or "").strip()
+    if if_match:
+        _cur = bucket["objects"].get(key)
+        if _cur is None or if_match.strip('"') != _cur["etag"].strip('"'):
+            return _error(
+                "PreconditionFailed",
+                "At least one of the preconditions you specified did not hold.",
+                412,
+                f"/{bucket_name}/{key}",
+            )
+
     if key in bucket["objects"]:
         lock_err = _check_object_lock(bucket_name, key, headers)
         if lock_err:
@@ -3126,7 +3257,8 @@ def _check_object_lock(bucket_name: str, key: str, headers: dict) -> tuple | Non
 
 def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     source = url_unquote(headers.get("x-amz-copy-source", "").lstrip("/"))
-    src_parts = source.split("?", 1)[0].split("/", 1)
+    src_path, _, src_query = source.partition("?")
+    src_parts = src_path.split("/", 1)
     if len(src_parts) < 2:
         return _error(
             "InvalidArgument",
@@ -3138,19 +3270,55 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     src_bucket = _ensure_bucket(src_bucket_name)
     if src_bucket is None:
         return _no_such_bucket(src_bucket_name)
-    if src_key not in src_bucket["objects"]:
-        return _error(
-            "NoSuchKey",
-            "The specified key does not exist.",
-            404,
-            f"/{src_bucket_name}/{src_key}",
-        )
+
+    # A `?versionId=` on the copy source selects a specific version to copy,
+    # rather than the current object (AWS copies that exact version).
+    src_version_id = None
+    if src_query:
+        src_version_id = _parse_qs(src_query, keep_blank_values=True).get(
+            "versionId", [None]
+        )[0]
 
     dest_bucket = _ensure_bucket(bucket_name)
     if dest_bucket is None:
         return _no_such_bucket(bucket_name)
 
-    src_obj = src_bucket["objects"][src_key]
+    if src_version_id:
+        ventry = next(
+            (v for v in _object_versions.get((src_bucket_name, src_key), [])
+             if v["version_id"] == src_version_id),
+            None,
+        )
+        if ventry is None or ventry.get("is_delete_marker"):
+            return _error(
+                "NoSuchVersion",
+                "The specified version does not exist.",
+                404,
+                f"/{src_bucket_name}/{src_key}",
+            )
+        # Synthesize a source object from the stored version. Per-version user
+        # metadata isn't retained, so a COPY metadata-directive carries none.
+        src_obj = {
+            "body": ventry.get("data", b""),
+            "etag": ventry["etag"],
+            "size": ventry["size"],
+            "content_type": ventry.get("content_type") or "application/octet-stream",
+            "storage_class": ventry.get("storage_class") or "STANDARD",
+            "checksums": ventry.get("checksums") or {},
+            "version_id": src_version_id,
+        }
+    else:
+        if src_key not in src_bucket["objects"]:
+            return _error(
+                "NoSuchKey",
+                "The specified key does not exist.",
+                404,
+                f"/{src_bucket_name}/{src_key}",
+            )
+        src_obj = src_bucket["objects"][src_key]
+
+    # AWS echoes the copied source version on a versioned source.
+    copy_src_vid = src_version_id or src_obj.get("version_id")
 
     # Precondition: x-amz-copy-source-if-match
     if_match = headers.get("x-amz-copy-source-if-match", "")
@@ -3262,6 +3430,8 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     )
 
     resp_headers = {"Content-Type": "application/xml"}
+    if copy_src_vid:
+        resp_headers["x-amz-copy-source-version-id"] = copy_src_vid
     if dest_sc != "STANDARD":
         resp_headers["x-amz-storage-class"] = dest_sc
     if _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
@@ -3278,7 +3448,12 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
             "size": dest_obj["size"],
             "is_latest": True,
             "data": src_body,
+            "content_type": dest_obj.get("content_type") or "application/octet-stream",
+            "content_encoding": dest_obj.get("content_encoding"),
+            "metadata": dest_obj.get("metadata", {}),
+            "preserved_headers": dest_obj.get("preserved_headers", {}),
             "storage_class": dest_obj.get("storage_class") or "STANDARD",
+            "checksums": dest_obj.get("checksums") or {},
         })
         for v in _object_versions[vkey][:-1]:
             v["is_latest"] = False
@@ -3983,7 +4158,7 @@ def _list_objects_v1(bucket_name: str, query_params: dict):
         SubElement(c, "Size").text = str(obj["size"])
         SubElement(c, "StorageClass").text = obj.get("storage_class") or "STANDARD"
         owner = SubElement(c, "Owner")
-        SubElement(owner, "ID").text = "owner-id"
+        SubElement(owner, "ID").text = get_account_id()
         SubElement(owner, "DisplayName").text = "ministack"
 
     for cp in sorted(common_prefixes):
@@ -4059,7 +4234,7 @@ def _list_objects_v2(bucket_name: str, query_params: dict):
         SubElement(c, "StorageClass").text = obj.get("storage_class") or "STANDARD"
         if fetch_owner:
             owner = SubElement(c, "Owner")
-            SubElement(owner, "ID").text = "owner-id"
+            SubElement(owner, "ID").text = get_account_id()
             SubElement(owner, "DisplayName").text = "ministack"
 
     for cp in sorted(common_prefixes):
@@ -4110,6 +4285,22 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
                     "version_id": version_id,
                     "code": "AccessDenied",
                     "msg": "Access Denied because object protected by object lock.",
+                })
+                continue
+
+        # Conditional delete: an ObjectIdentifier with an ETag deletes only if it
+        # matches the current object. On mismatch the key is reported under Error
+        # (PreconditionFailed), not Deleted, so the object survives.
+        etag_el = _find_xml_tag(obj_el, "ETag")
+        cond_etag = etag_el.text if (etag_el is not None and etag_el.text) else ""
+        if cond_etag:
+            _cur = bucket["objects"].get(k)
+            if _cur is None or cond_etag.strip('"') != _cur["etag"].strip('"'):
+                errors.append({
+                    "key": k,
+                    "version_id": version_id,
+                    "code": "PreconditionFailed",
+                    "msg": "At least one of the preconditions you specified did not hold.",
                 })
                 continue
 
@@ -4327,6 +4518,11 @@ def _complete_multipart_upload(
         return _no_such_bucket(bucket_name)
 
     upload_id = _qp(query_params, "uploadId")
+    # Idempotent retry: if the upload already completed, replay its response
+    # instead of returning NoSuchUpload (real S3 stays 200 until the id is GC'd).
+    cached = _completed_multipart_uploads.get(upload_id)
+    if cached is not None and cached.get("key") == key:
+        return cached["response"]
     if upload_id not in _multipart_uploads:
         return _error(
             "NoSuchUpload",
@@ -4344,7 +4540,16 @@ def _complete_multipart_upload(
             f"/{bucket_name}/{key}",
         )
 
-    xml_root = fromstring(body)
+    try:
+        xml_root = fromstring(body)
+    except ParseError:
+        return _error(
+            "MalformedXML",
+            "The XML you provided was not well-formed or did not validate "
+            "against our published schema.",
+            400,
+            f"/{bucket_name}/{key}",
+        )
     ordered_parts: list[tuple[int, str | None]] = []
     for part_el in xml_root.iter():
         local = part_el.tag.split("}")[-1] if "}" in part_el.tag else part_el.tag
@@ -4429,6 +4634,11 @@ def _complete_multipart_upload(
             "size": obj["size"],
             "is_latest": True,
             "data": combined,
+            "content_type": obj.get("content_type") or "application/octet-stream",
+            "content_encoding": obj.get("content_encoding"),
+            "metadata": obj.get("metadata", {}),
+            "preserved_headers": obj.get("preserved_headers", {}),
+            "storage_class": obj.get("storage_class") or "STANDARD",
         })
         for v in _object_versions[vkey][:-1]:
             v["is_latest"] = False
@@ -4444,7 +4654,12 @@ def _complete_multipart_upload(
     SubElement(root, "Bucket").text = bucket_name
     SubElement(root, "Key").text = key
     SubElement(root, "ETag").text = final_etag
-    return 200, resp_headers, _xml_body(root)
+    response = (200, resp_headers, _xml_body(root))
+    # Retain the response so an idempotent retry (same upload id) replays it
+    # rather than 404ing; the versioning block above is NOT re-run on replay,
+    # so a retry never mints a second object version.
+    _completed_multipart_uploads[upload_id] = {"key": key, "response": response}
+    return response
 
 
 def _abort_multipart_upload(bucket_name: str, key: str, query_params: dict):
@@ -4522,10 +4737,10 @@ def _list_multipart_uploads(bucket_name: str, query_params: dict):
         SubElement(u, "Key").text = upload["key"]
         SubElement(u, "UploadId").text = uid
         initiator = SubElement(u, "Initiator")
-        SubElement(initiator, "ID").text = "owner-id"
+        SubElement(initiator, "ID").text = get_account_id()
         SubElement(initiator, "DisplayName").text = "ministack"
         owner = SubElement(u, "Owner")
-        SubElement(owner, "ID").text = "owner-id"
+        SubElement(owner, "ID").text = get_account_id()
         SubElement(owner, "DisplayName").text = "ministack"
         SubElement(u, "StorageClass").text = upload.get("storage_class") or "STANDARD"
         SubElement(u, "Initiated").text = upload["created"]
@@ -4570,10 +4785,10 @@ def _list_parts(bucket_name: str, key: str, query_params: dict):
     SubElement(root, "UploadId").text = upload_id
 
     initiator = SubElement(root, "Initiator")
-    SubElement(initiator, "ID").text = "owner-id"
+    SubElement(initiator, "ID").text = get_account_id()
     SubElement(initiator, "DisplayName").text = "ministack"
     owner = SubElement(root, "Owner")
-    SubElement(owner, "ID").text = "owner-id"
+    SubElement(owner, "ID").text = get_account_id()
     SubElement(owner, "DisplayName").text = "ministack"
     SubElement(root, "StorageClass").text = upload.get("storage_class") or "STANDARD"
     SubElement(root, "PartNumberMarker").text = str(part_marker)
@@ -4835,6 +5050,10 @@ def _load_persisted_bucket(account_id, bucket_name, bucket_path):
                     "size": size,
                     "is_latest": True,
                     "data": None,
+                    "content_type": meta.get("content_type", "application/octet-stream"),
+                    "content_encoding": meta.get("content_encoding"),
+                    "metadata": meta.get("metadata", {}),
+                    "preserved_headers": meta.get("preserved_headers", {}),
                     "storage_class": meta.get("storage_class", "STANDARD"),
                     "checksums": meta.get("checksums", {}),
                 })
@@ -4872,6 +5091,7 @@ def reset():
         _object_tags,
         _object_acl,
         _multipart_uploads,
+        _completed_multipart_uploads,
         _bucket_object_lock,
         _bucket_replication,
         _object_retention,

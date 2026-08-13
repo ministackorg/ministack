@@ -39,6 +39,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets as stdlib_secrets
 import socket
 import threading
 import time
@@ -55,6 +56,7 @@ from ministack.core.responses import (
     get_region,
     new_uuid,
 )
+from ministack.services import secretsmanager
 
 logger = logging.getLogger("rds")
 
@@ -211,8 +213,22 @@ DEFAULT_AURORA_MYSQL_IMAGE = "mysql:8.4"
 # ── Persistence ────────────────────────────────────────────
 
 def get_state():
-    instances = copy.deepcopy(_instances)
-    clusters = copy.deepcopy(_clusters)
+    with _shared_container_lock:
+        instances = copy.deepcopy(_instances)
+        clusters = copy.deepcopy(_clusters)
+        state = {
+            "instances": instances,
+            "clusters": clusters,
+            "subnet_groups": copy.deepcopy(_subnet_groups),
+            "param_groups": copy.deepcopy(_param_groups),
+            "snapshots": copy.deepcopy(_snapshots),
+            "db_cluster_param_groups": copy.deepcopy(_db_cluster_param_groups),
+            "db_cluster_snapshots": copy.deepcopy(_db_cluster_snapshots),
+            "option_groups": copy.deepcopy(_option_groups),
+            "global_clusters": copy.deepcopy(_global_clusters),
+            "tags": copy.deepcopy(_tags),
+            "port_counter": _port_counter[0],
+        }
     # Strip Docker container IDs (not restorable across restarts)
     for key in list(instances._data):
         instances._data[key].pop("_docker_container_id", None)
@@ -226,19 +242,6 @@ def get_state():
             ),
         )
         cluster.pop("_shared_container_id", None)
-    state = {
-        "instances": instances,
-        "clusters": clusters,
-        "subnet_groups": copy.deepcopy(_subnet_groups),
-        "param_groups": copy.deepcopy(_param_groups),
-        "snapshots": copy.deepcopy(_snapshots),
-        "db_cluster_param_groups": copy.deepcopy(_db_cluster_param_groups),
-        "db_cluster_snapshots": copy.deepcopy(_db_cluster_snapshots),
-        "option_groups": copy.deepcopy(_option_groups),
-        "global_clusters": copy.deepcopy(_global_clusters),
-        "tags": copy.deepcopy(_tags),
-        "port_counter": _port_counter[0],
-    }
     return state
 
 
@@ -993,6 +996,43 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
     }
 
 
+def _instance_owns_container(instance):
+    """True when the instance record owns its backing Docker container.
+
+    Standalone DB instances own their container: instance-level delete and
+    reset must remove it. Aurora cluster members do not — they alias the
+    cluster-owned shared container (marked by ``_shared_cluster_id``), whose
+    lifecycle belongs to the cluster helpers. Cluster members that own a
+    container of their own (per-instance reader containers, #1325) are
+    handled like standalone instances by ownership-based code paths.
+    """
+    return bool(
+        instance.get("_docker_container_id")
+        and not instance.get("_shared_cluster_id")
+    )
+
+
+def _cluster_owned_container_ids(cluster):
+    """All Docker container IDs backing an Aurora cluster's compute.
+
+    Today a cluster has at most one: the cluster-owned shared container.
+    Member instances that own a container of their own (per-instance reader
+    containers, #1325) are included so cluster-wide compute operations act
+    on every container the cluster is responsible for. IDs are deduplicated
+    (first occurrence wins) so a member aliasing an already-listed container
+    is not operated on twice.
+    """
+    ids = []
+    if cluster.get("_shared_container_id"):
+        ids.append(cluster["_shared_container_id"])
+    for member in _cluster_member_instances(cluster):
+        if _instance_owns_container(member):
+            container_id = member["_docker_container_id"]
+            if container_id not in ids:
+                ids.append(container_id)
+    return ids
+
+
 def _stop_cluster_shared_container(cluster_id, cluster):
     """Stop, but do not remove, an Aurora cluster's database compute.
 
@@ -1015,29 +1055,36 @@ def _stop_cluster_shared_container(cluster_id, cluster):
             cluster.get("_shared_container_epoch", 0),
         ) + 1
         cluster["_shared_container_ready"] = False
-        container_id = cluster.get("_shared_container_id")
+        container_ids = _cluster_owned_container_ids(cluster)
         docker_client = _get_docker()
-        if not docker_client or not container_id:
+        if not docker_client or not container_ids:
             return True
-        try:
-            container = docker_client.containers.get(container_id)
-        except Exception:
-            # A container that no longer exists is not running compute; the
-            # goal state is already met.
-            return True
-        try:
-            container.reload()
-            if container.status not in ("created", "exited", "dead", "removing"):
-                container.stop(timeout=5)
-                logger.info("RDS: stopped shared container for cluster %s", cluster_id)
-        except Exception as e:
-            logger.warning(
-                "RDS: failed to stop shared container for cluster %s: %s",
-                cluster_id,
-                e,
-            )
-            return False
-        return True
+        all_stopped = True
+        for container_id in container_ids:
+            try:
+                container = docker_client.containers.get(container_id)
+            except Exception:
+                # A container that no longer exists is not running compute;
+                # the goal state is already met.
+                continue
+            try:
+                container.reload()
+                if container.status not in ("created", "exited", "dead", "removing"):
+                    container.stop(timeout=5)
+                    logger.info(
+                        "RDS: stopped container %s for cluster %s",
+                        container_id,
+                        cluster_id,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "RDS: failed to stop container %s for cluster %s: %s",
+                    container_id,
+                    cluster_id,
+                    e,
+                )
+                all_stopped = False
+        return all_stopped
 
 
 def _remove_cluster_shared_resources(
@@ -1623,12 +1670,7 @@ def _configure_mysql_replication(cluster_id, cluster):
     if not _mysql_gtid_history_ready(cluster):
         cluster["_mysql_replication_blocked_reason"] = "legacy-non-gtid-volume"
         cluster["_shared_container_ready"] = False
-        for cluster_member in cluster.get("DBClusterMembers", []):
-            instance = _instances.get(
-                cluster_member.get("DBInstanceIdentifier"),
-            )
-            if instance is not None:
-                instance["DBInstanceStatus"] = "failed"
+        _set_cluster_members_status(cluster, "failed")
         logger.error(
             "RDS: refusing MySQL replication for %s because its initialized "
             "volume predates GTID-at-creation tracking",
@@ -2372,6 +2414,13 @@ def _resolve_instance(db_id):
     return None
 
 
+def _set_cluster_members_status(cluster, status):
+    for member in cluster.get("DBClusterMembers", []):
+        instance = _instances.get(member.get("DBInstanceIdentifier"))
+        if instance is not None:
+            instance["DBInstanceStatus"] = status
+
+
 def _attach_instance_to_shared_cluster(instance, cluster):
     endpoint = cluster.get("_shared_endpoint")
     if not endpoint:
@@ -2398,18 +2447,31 @@ def _attach_instance_to_shared_cluster(instance, cluster):
     )
 
 
-def _sync_cluster_endpoints(cluster):
-    """Point both Aurora endpoints at the cluster-owned shared container.
+def _cluster_reader_endpoint(cluster):
+    """The endpoint a cluster's ``ReaderEndpoint`` should resolve to.
 
-    The local reader endpoint is intentionally read/write because it resolves
-    to the same MySQL process as the writer. Genuine read-only behavior would
-    require a separate replicating process.
+    Today this is the writer's shared endpoint, so the local reader endpoint
+    is read/write: it resolves to the same database process as the writer.
+    Genuine read-only behavior requires a separate replicating process —
+    per-instance reader containers (#1325) will resolve here instead once a
+    cluster has one.
+    """
+    return cluster.get("_shared_endpoint")
+
+
+def _sync_cluster_endpoints(cluster):
+    """Point the Aurora writer and reader endpoints at cluster compute.
+
+    The writer endpoint resolves to the cluster-owned shared container; the
+    reader endpoint resolves to whatever ``_cluster_reader_endpoint``
+    selects (currently the same container — see its docstring).
     """
     endpoint = cluster.get("_shared_endpoint")
     if not endpoint:
         return
+    reader_endpoint = _cluster_reader_endpoint(cluster) or endpoint
     cluster["Endpoint"] = endpoint.get("Address", cluster.get("Endpoint", ""))
-    cluster["ReaderEndpoint"] = endpoint.get(
+    cluster["ReaderEndpoint"] = reader_endpoint.get(
         "Address", cluster.get("ReaderEndpoint", ""),
     )
     cluster["Port"] = int(endpoint.get("Port", cluster.get("Port", 0)))
@@ -2452,6 +2514,10 @@ def _unregister_instance_from_clusters(db_id):
 # ---------------------------------------------------------------------------
 
 def _create_db_instance(p):
+    return _create_db_instance_impl(p)
+
+
+def _create_db_instance_impl(p):
     db_id = _p(p, "DBInstanceIdentifier")
     if not db_id:
         return _error("MissingParameter", "DBInstanceIdentifier is required", 400)
@@ -2891,12 +2957,7 @@ def _create_db_instance(p):
                             ready_host, ready_port,
                         )
                         cluster["_shared_container_ready"] = False
-                        for member in cluster.get("DBClusterMembers", []):
-                            inst = _instances.get(
-                                member.get("DBInstanceIdentifier"),
-                            )
-                            if inst is not None:
-                                inst["DBInstanceStatus"] = "failed"
+                        _set_cluster_members_status(cluster, "failed")
                         _refresh_cluster_status(cluster_id)
                         return
 
@@ -2910,12 +2971,7 @@ def _create_db_instance(p):
                         pending_rotation["new_password"],
                     ):
                         cluster["_shared_container_ready"] = False
-                        for member in cluster.get("DBClusterMembers", []):
-                            inst = _instances.get(
-                                member.get("DBInstanceIdentifier"),
-                            )
-                            if inst is not None:
-                                inst["DBInstanceStatus"] = "failed"
+                        _set_cluster_members_status(cluster, "failed")
                         _refresh_cluster_status(cluster_id)
                         return
                     if pending_rotation:
@@ -3045,11 +3101,7 @@ def _delete_db_instance(p):
                 _stop_cluster_shared_container(shared_cluster_id, cluster)
 
     docker_client = _get_docker()
-    if (
-        docker_client
-        and instance.get("_docker_container_id")
-        and not instance.get("_shared_cluster_id")
-    ):
+    if docker_client and _instance_owns_container(instance):
         try:
             c = docker_client.containers.get(instance["_docker_container_id"])
             c.stop(timeout=5)
@@ -3455,11 +3507,26 @@ def _create_db_cluster(p):
     explicit_master_user = _p(p, "MasterUsername") or None
     explicit_master_pass = _p(p, "MasterUserPassword") or None
     explicit_database_name = _p(p, "DatabaseName") or None
+    manage_master_pass = _p(p, "ManageMasterUserPassword") == "true"
+    if manage_master_pass and explicit_master_pass:
+        return _error(
+            "InvalidParameterCombination",
+            "You can't specify MasterUserPassword when ManageMasterUserPassword "
+            "is enabled.",
+            400,
+        )
     global_writer = (
         _global_cluster_writer_cluster(global_cluster)
         if global_cluster
         else None
     )
+    if manage_master_pass and global_writer:
+        return _error(
+            "InvalidParameterCombination",
+            "You can't manage the master user password on an Aurora global "
+            "database secondary cluster.",
+            400,
+        )
     if global_writer:
         inherited_fields = (
             ("MasterUsername", explicit_master_user, global_writer.get("MasterUsername")),
@@ -3513,6 +3580,20 @@ def _create_db_cluster(p):
         if global_writer
         else explicit_master_pass or "password"
     )
+    master_user_secret = None
+    if manage_master_pass:
+        master_pass = _generate_master_user_password()
+        secret_arn = secretsmanager.create_secret_in_process(
+            f"rds!cluster-{new_uuid()}",
+            json.dumps({"username": master_user, "password": master_pass}),
+            description=f"Secret managed by RDS for DB cluster {cluster_id}",
+        )
+        master_user_secret = {
+            "SecretArn": secret_arn,
+            "SecretStatus": "active",
+            "KmsKeyId": _p(p, "MasterUserSecretKmsKeyId")
+            or f"arn:aws:kms:{get_region()}:{get_account_id()}:key/aws-secretsmanager-default",
+        }
     database_name = (
         global_writer.get("DatabaseName")
         if global_writer
@@ -3528,6 +3609,7 @@ def _create_db_cluster(p):
         "Status": "available",
         "MasterUsername": master_user,
         "_MasterUserPassword": master_pass,
+        "MasterUserSecret": master_user_secret,
         "DatabaseName": database_name,
         "NetworkType": _p(p, "NetworkType") or "IPV4",
         "EngineLifecycleSupport": _p(p, "EngineLifecycleSupport") or "open-source-rds-extended-support",
@@ -3648,6 +3730,10 @@ def _delete_db_cluster(p):
             )
         _tags.pop(cluster["DBClusterArn"], None)
         del _clusters[cluster["DBClusterIdentifier"]]
+        master_user_secret = cluster.get("MasterUserSecret")
+        if master_user_secret and master_user_secret.get("SecretArn"):
+            # RDS deletes its managed master user secret with the cluster.
+            secretsmanager.delete_secret_in_process(master_user_secret["SecretArn"])
     return _xml(200, "DeleteDBClusterResponse",
         f"<DeleteDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></DeleteDBClusterResult>")
 
@@ -3671,6 +3757,15 @@ def _describe_db_clusters(p):
     members = "".join(f"<DBCluster>{_cluster_xml(c)}</DBCluster>" for c in clusters)
     return _xml(200, "DescribeDBClustersResponse",
         f"<DescribeDBClustersResult><DBClusters>{members}</DBClusters></DescribeDBClustersResult>")
+
+
+def _generate_master_user_password():
+    """Generate a random master user password for a managed secret.
+
+    Stays within RDS's password rules (printable ASCII excluding '/', '@',
+    '"', and spaces) — token_urlsafe only emits letters, digits, '-' and '_'.
+    """
+    return stdlib_secrets.token_urlsafe(24)
 
 
 def _rotate_real_password(cluster, old_pass, new_pass):
@@ -3770,6 +3865,51 @@ def _rotate_real_password(cluster, old_pass, new_pass):
                 pass
 
 
+def _apply_cluster_master_password_change(cluster, new_pass):
+    """Publish *new_pass* as the cluster's master password and rotate the real
+    database login.
+
+    Shared by the explicit ``MasterUserPassword`` and the managed
+    ``RotateMasterUserPassword`` paths so the compute-availability and
+    pending-rotation semantics cannot drift between them. When compute is
+    down but storage survives, the rotation is parked as pending: the first
+    replacement member authenticates with the old password, applies the
+    pending rotation, then publishes readiness using the new one.
+    """
+    with _shared_container_lock:
+        old_pass = cluster.get("_MasterUserPassword", "password")
+        cluster["_MasterUserPassword"] = new_pass
+        pending_rotation = cluster.get(
+            "_pending_master_password_rotation",
+        )
+        rotation_old_pass = (
+            pending_rotation["old_password"]
+            if pending_rotation
+            else old_pass
+        )
+        has_available_compute = bool(
+            cluster.get("DBClusterMembers"),
+        ) and bool(
+            cluster.get("_shared_container_id"),
+        ) and cluster.get("_shared_container_ready", True)
+        if has_available_compute and _rotate_real_password(
+            cluster, rotation_old_pass, new_pass,
+        ):
+            cluster.pop("_pending_master_password_rotation", None)
+            _sync_global_mysql_credentials(cluster)
+        elif (
+            cluster.get("_shared_container_id")
+            or cluster.get("_shared_storage_initialized")
+        ):
+            # The stopped preserved container still has rotation_old_pass.
+            # The first replacement member authenticates with it, applies
+            # the pending rotation, then publishes readiness using new_pass.
+            cluster["_pending_master_password_rotation"] = {
+                "old_password": rotation_old_pass,
+                "new_password": new_pass,
+            }
+
+
 def _modify_db_cluster(p):
     cluster_id = _p(p, "DBClusterIdentifier")
     cluster = _resolve_cluster_in_request_region(cluster_id)
@@ -3779,48 +3919,67 @@ def _modify_db_cluster(p):
             return wrong_region
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
 
+    # Validate the password parameters together before mutating anything, so
+    # a rejected combination cannot leave a half-applied password change.
+    if _p(p, "MasterUserPassword") and _p(p, "RotateMasterUserPassword") == "true":
+        return _error(
+            "InvalidParameterCombination",
+            "You can't specify MasterUserPassword and RotateMasterUserPassword "
+            "in the same request.",
+            400,
+        )
     if _p(p, "EngineVersion"):
         cluster["EngineVersion"] = _p(p, "EngineVersion")
     if _p(p, "MasterUserPassword"):
+        if cluster.get("MasterUserSecret"):
+            return _error(
+                "InvalidParameterCombination",
+                "You can't specify MasterUserPassword for a cluster with "
+                "ManageMasterUserPassword enabled.",
+                400,
+            )
         if _mysql_replication_secondary(cluster):
             return _error(
                 "InvalidDBClusterStateFault",
                 "MasterUserPassword must be changed on the global writer.",
                 400,
             )
-        new_pass = _p(p, "MasterUserPassword")
-        with _shared_container_lock:
-            old_pass = cluster.get("_MasterUserPassword", "password")
-            cluster["_MasterUserPassword"] = new_pass
-            pending_rotation = cluster.get(
-                "_pending_master_password_rotation",
+        _apply_cluster_master_password_change(cluster, _p(p, "MasterUserPassword"))
+    if _p(p, "RotateMasterUserPassword") == "true":
+        master_user_secret = cluster.get("MasterUserSecret")
+        if not master_user_secret:
+            return _error(
+                "InvalidParameterCombination",
+                "You can only rotate the master user password when it's "
+                "managed by RDS in AWS Secrets Manager.",
+                400,
             )
-            rotation_old_pass = (
-                pending_rotation["old_password"]
-                if pending_rotation
-                else old_pass
+        if _p(p, "ApplyImmediately") != "true":
+            return _error(
+                "InvalidParameterCombination",
+                "You must specify apply immediately when rotating the master "
+                "user password.",
+                400,
             )
-            has_available_compute = bool(
-                cluster.get("DBClusterMembers"),
-            ) and bool(
-                cluster.get("_shared_container_id"),
-            ) and cluster.get("_shared_container_ready", True)
-            if has_available_compute and _rotate_real_password(
-                cluster, rotation_old_pass, new_pass,
-            ):
-                cluster.pop("_pending_master_password_rotation", None)
-                _sync_global_mysql_credentials(cluster)
-            elif (
-                cluster.get("_shared_container_id")
-                or cluster.get("_shared_storage_initialized")
-            ):
-                # The stopped preserved container still has rotation_old_pass.
-                # The first replacement member authenticates with it, applies
-                # the pending rotation, then publishes readiness using new_pass.
-                cluster["_pending_master_password_rotation"] = {
-                    "old_password": rotation_old_pass,
-                    "new_password": new_pass,
-                }
+        new_pass = _generate_master_user_password()
+        secret_updated = secretsmanager.put_secret_value_in_process(
+            master_user_secret["SecretArn"],
+            json.dumps({
+                "username": cluster.get("MasterUsername", "admin"),
+                "password": new_pass,
+            }),
+        )
+        if not secret_updated:
+            # The secret was deleted out from under RDS. AWS reports such a
+            # secret as impaired: usable state is gone and it can't be rotated.
+            master_user_secret["SecretStatus"] = "impaired"
+            return _error(
+                "InvalidDBClusterStateFault",
+                f"The master user secret for DB cluster {cluster_id} "
+                "can't be rotated.",
+                400,
+            )
+        _apply_cluster_master_password_change(cluster, new_pass)
     if _p(p, "Port"):
         cluster["Port"] = int(_p(p, "Port"))
     if _p(p, "BackupRetentionPeriod"):
@@ -5561,6 +5720,21 @@ def _cluster_xml(c):
         if global_write_forwarding else ""
     )
 
+    # AWS emits <MasterUserSecret> only for clusters with an RDS-managed
+    # master user password; KmsKeyId appears only when a key was specified.
+    master_user_secret = c.get("MasterUserSecret")
+    master_user_secret_xml = ""
+    if master_user_secret:
+        kms_key_id = master_user_secret.get("KmsKeyId")
+        kms_key_xml = f"<KmsKeyId>{kms_key_id}</KmsKeyId>" if kms_key_id else ""
+        master_user_secret_xml = (
+            "<MasterUserSecret>"
+            f"<SecretArn>{master_user_secret.get('SecretArn', '')}</SecretArn>"
+            f"<SecretStatus>{master_user_secret.get('SecretStatus', 'active')}</SecretStatus>"
+            f"{kms_key_xml}"
+            "</MasterUserSecret>"
+        )
+
     return f"""<DBClusterIdentifier>{c['DBClusterIdentifier']}</DBClusterIdentifier>
         <DBClusterArn>{c['DBClusterArn']}</DBClusterArn>
         <Engine>{c['Engine']}</Engine>
@@ -5600,6 +5774,7 @@ def _cluster_xml(c):
         <NetworkType>{c.get('NetworkType','IPV4')}</NetworkType>
         {global_cluster_xml}
         {global_write_forwarding_xml}
+        {master_user_secret_xml}
         <EngineLifecycleSupport>{c.get('EngineLifecycleSupport','open-source-rds-extended-support')}</EngineLifecycleSupport>"""
 
 
@@ -6161,7 +6336,7 @@ def reset():
                 if (
                     cid
                     and cid not in shared_container_ids
-                    and not instance.get("_shared_cluster_id")
+                    and _instance_owns_container(instance)
                 ):
                     try:
                         c = docker_client.containers.get(cid)

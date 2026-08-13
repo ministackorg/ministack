@@ -4857,13 +4857,6 @@ def test_sfn_aws_sdk_query_acronym_param_mapping(sfn, sfn_sync, rds, ec2):
     """SFN aws-sdk query dispatch maps SDK-style param names to wire-format names."""
     import uuid as _uuid
 
-    def normalize_vpc_security_groups(value):
-        # The converter currently collapses singleton wrappers to a dict; keep
-        # this assertion compatible with a future list-fidelity fix.
-        if isinstance(value, list):
-            return value
-        return [value["VpcSecurityGroupMembership"]]
-
     cluster_id = f"acronym-test-{_uuid.uuid4().hex[:8]}"
     sm_name = f"sdk-acronym-{_uuid.uuid4().hex[:8]}"
     vpc_id = ec2.create_vpc(CidrBlock="10.98.0.0/16")["Vpc"]["VpcId"]
@@ -4930,23 +4923,19 @@ def test_sfn_aws_sdk_query_acronym_param_mapping(sfn, sfn_sync, rds, ec2):
         create_cluster = output["createResult"]["DbCluster"]
         assert create_cluster["DbClusterIdentifier"] == cluster_id
         assert create_cluster["Engine"] == "aurora-postgresql"
-        assert normalize_vpc_security_groups(create_cluster["VpcSecurityGroups"]) == [
+        assert create_cluster["VpcSecurityGroups"] == [
             {
                 "VpcSecurityGroupId": create_sg_id,
                 "Status": "active",
             },
         ]
-        assert normalize_vpc_security_groups(
-            output["modifyResult"]["DbCluster"]["VpcSecurityGroups"],
-        ) == [
+        assert output["modifyResult"]["DbCluster"]["VpcSecurityGroups"] == [
             {
                 "VpcSecurityGroupId": modify_sg_id,
                 "Status": "active",
             },
         ]
-        assert normalize_vpc_security_groups(
-            output["describeResult"]["DbClusters"][0]["VpcSecurityGroups"],
-        ) == [
+        assert output["describeResult"]["DbClusters"][0]["VpcSecurityGroups"] == [
             {
                 "VpcSecurityGroupId": modify_sg_id,
                 "Status": "active",
@@ -4958,6 +4947,37 @@ def test_sfn_aws_sdk_query_acronym_param_mapping(sfn, sfn_sync, rds, ec2):
         ec2.delete_security_group(GroupId=create_sg_id)
         ec2.delete_security_group(GroupId=modify_sg_id)
         ec2.delete_vpc(VpcId=vpc_id)
+
+
+@pytest.mark.parametrize(("wrapper_tag", "item_tag"), [
+    ("VpcSecurityGroups", "VpcSecurityGroupMembership"),
+    ("TagList", "Tag"),
+    ("StatusInfos", "DBInstanceStatusInfo"),
+    ("AssociatedRoles", "DBClusterRole"),
+    ("OptionGroupsList", "OptionGroup"),
+    ("ServerCertificateMetadataList", "ServerCertificateMetadata"),
+])
+@pytest.mark.parametrize("item_count", [0, 1, 2])
+def test_sfn_query_xml_known_list_wrappers_preserve_list_shape(
+    wrapper_tag,
+    item_tag,
+    item_count,
+):
+    """Known query-XML wrappers remain lists for empty, singleton, and multi values."""
+    from xml.etree import ElementTree as ET
+
+    from ministack.services.stepfunctions import _xml_element_to_dict
+
+    items = "".join(
+        f"<{item_tag}><Value>{index}</Value></{item_tag}>"
+        for index in range(item_count)
+    )
+    root = ET.fromstring(f"<{wrapper_tag}>{items}</{wrapper_tag}>")
+
+    tag, value = _xml_element_to_dict(root)
+
+    assert tag == wrapper_tag
+    assert value == [{"Value": str(index)} for index in range(item_count)]
 
 
 def test_sfn_key_to_api_name_must_convert():
@@ -5087,6 +5107,7 @@ def test_sfn_aws_sdk_rdsdata_execute_statement(sfn, sfn_sync, rds, sm):
         EngineMode="serverless",
         MasterUsername="admin",
         MasterUserPassword="testpass123",
+        EnableHttpEndpoint=True,
     )
     secret_arn = sm.create_secret(
         Name=f"rdsdata-secret-{_uuid.uuid4().hex[:8]}",
@@ -5103,7 +5124,7 @@ def test_sfn_aws_sdk_rdsdata_execute_statement(sfn, sfn_sync, rds, sm):
                 "Parameters": {
                     "resourceArn": cluster_arn,
                     "secretArn": secret_arn,
-                    "sql": "SELECT 1",
+                    "sql": "SHOW DATABASES",
                     "database": "testdb",
                 },
                 "End": True,
@@ -5169,6 +5190,7 @@ def test_sfn_aws_sdk_rdsdata_output_uses_sfn_key_convention(sfn, sfn_sync, rds, 
         EngineMode="serverless",
         MasterUsername="admin",
         MasterUserPassword="testpass123",
+        EnableHttpEndpoint=True,
     )
     secret_arn = sm.create_secret(
         Name=f"rdsdata-output-secret-{_uuid.uuid4().hex[:8]}",
@@ -5564,6 +5586,7 @@ def test_sfn_rest_json_pascal_to_camel_conversion(sfn, sfn_sync, rds, sm):
         EngineMode="serverless",
         MasterUsername="admin",
         MasterUserPassword="testpass123",
+        EnableHttpEndpoint=True,
     )
     secret_arn = sm.create_secret(
         Name=f"rdsdata-camel-secret-{_uuid.uuid4().hex[:8]}",
@@ -5581,7 +5604,7 @@ def test_sfn_rest_json_pascal_to_camel_conversion(sfn, sfn_sync, rds, sm):
                 "Parameters": {
                     "ResourceArn": cluster_arn,
                     "SecretArn": secret_arn,
-                    "Sql": "SELECT 1",
+                    "Sql": "SHOW DATABASES",
                     "Database": "testdb",
                 },
                 "End": True,

@@ -220,6 +220,16 @@ def _rs_key(rs: dict) -> tuple:
     return (rs["Name"], rs["Type"], rs.get("SetIdentifier", ""))
 
 
+def _rs_values(rs: dict) -> dict:
+    """The value-bearing fields of a record set — everything a DELETE must
+    match exactly, per the Route 53 API reference. Resource record values
+    are compared as an unordered set (order never matters to Route 53)."""
+    values = {k: v for k, v in rs.items() if k not in ("Name", "Type", "SetIdentifier")}
+    if "ResourceRecords" in values:
+        values["ResourceRecords"] = sorted(values["ResourceRecords"])
+    return values
+
+
 # ─── XML builders for common structures ───────────────────────────────────────
 
 def _build_hosted_zone_el(parent: Element, zone: dict):
@@ -428,7 +438,7 @@ def _create_hosted_zone(body: bytes, query_params: dict):
         if caller_ref in _caller_refs:
             existing_id = _caller_refs[caller_ref]
             zone = _zones[existing_id]
-            change = {"id": _change_id(), "status": "INSYNC", "submitted_at": _now_iso(), "comment": ""}
+            change = {"id": _change_id(), "status": "PENDING", "submitted_at": _now_iso(), "comment": ""}
             def build(root):
                 _build_hosted_zone_el(root, zone)
                 _build_change_info_el(root, change)
@@ -448,7 +458,7 @@ def _create_hosted_zone(body: bytes, query_params: dict):
         _caller_refs[caller_ref] = zone_id
 
         change_id = _change_id()
-        change = {"id": change_id, "status": "INSYNC", "submitted_at": _now_iso(), "comment": ""}
+        change = {"id": change_id, "status": "PENDING", "submitted_at": _now_iso(), "comment": ""}
         _changes[change_id] = change
 
     def build(root):
@@ -488,7 +498,7 @@ def _delete_hosted_zone(zone_id: str):
         del _records[zone_id]
         _caller_refs.pop(zone.get("caller_reference", ""), None)
         change_id = _change_id()
-        change = {"id": change_id, "status": "INSYNC", "submitted_at": _now_iso(), "comment": ""}
+        change = {"id": change_id, "status": "PENDING", "submitted_at": _now_iso(), "comment": ""}
         _changes[change_id] = change
 
     def build(root):
@@ -628,7 +638,14 @@ def _change_resource_record_sets(zone_id: str, body: bytes):
                 if not existing:
                     return _error_response(
                         "InvalidChangeBatch",
-                        f"Tried to delete resource record set {rs['Name']} type {rs['Type']} but it does not exist.",
+                        f"Tried to delete resource record set [name='{rs['Name']}', type='{rs['Type']}'] "
+                        "but it was not found",
+                    )
+                if _rs_values(existing) != _rs_values(rs):
+                    return _error_response(
+                        "InvalidChangeBatch",
+                        f"Tried to delete resource record set [name='{rs['Name']}', type='{rs['Type']}'] "
+                        "but the values provided do not match the current values",
                     )
                 current = [r for r in current if _rs_key(r) != key]
 
@@ -642,7 +659,7 @@ def _change_resource_record_sets(zone_id: str, body: bytes):
 
         _records[zone_id] = current
         change_id = _change_id()
-        change = {"id": change_id, "status": "INSYNC", "submitted_at": _now_iso(), "comment": comment}
+        change = {"id": change_id, "status": "PENDING", "submitted_at": _now_iso(), "comment": comment}
         _changes[change_id] = change
 
     def build(root):
@@ -717,11 +734,19 @@ def _list_resource_record_sets(zone_id: str, query_params: dict):
 def _get_change(change_id: str):
     with _lock:
         change = _changes.get(change_id)
-    if not change:
-        return _error_response("NoSuchChange", f"A change with the ID {change_id} does not exist.", 404)
+        if not change:
+            return _error_response("NoSuchChange", f"A change with the ID {change_id} does not exist.", 404)
+        # Route 53 returns PENDING right after a submission and flips to INSYNC
+        # once the change has propagated (typically within 60s). Emulate that
+        # transition lazily: the first GetChange observes PENDING, and every
+        # read thereafter observes INSYNC. No background timer, no opt-out knob
+        # — the observable PENDING→INSYNC transition is what waiters poll on.
+        observed = dict(change)
+        if change["status"] == "PENDING":
+            change["status"] = "INSYNC"
 
     def build(root):
-        _build_change_info_el(root, change)
+        _build_change_info_el(root, observed)
 
     return _xml_response("GetChangeResponse", build)
 
