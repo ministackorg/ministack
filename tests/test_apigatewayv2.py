@@ -3690,3 +3690,463 @@ def test_apigateway_get_state_returns_independent_copy(mod_name):
 
     if hasattr(mod, "reset"):
         mod.reset()
+
+
+# ---- Data plane: REQUEST (Lambda) authorizer result caching ----
+
+_V2_AUTH_ECHO_BACKEND = (
+    b"import json\n"
+    b"def handler(event, context):\n"
+    b"    return {'statusCode': 200,\n"
+    b"            'body': json.dumps(event['requestContext'].get('authorizer'))}\n"
+)
+
+# Prelude for authorizer sources: counts invocations by pushing one SQS message
+# per call. The counter has to live INSIDE the emulator — writing to a
+# ``tmp_path`` file only works while the server runs in-process, and silently
+# breaks (FileNotFoundError on every counted test) under the documented
+# ``docker compose up`` workflow where the Lambda runs in its own container.
+_V2_AUTH_MARK_PRELUDE = (
+    b"import os, boto3\n"
+    b"def _mark(qname):\n"
+    b"    sqs = boto3.client('sqs', endpoint_url=os.environ['AWS_ENDPOINT_URL'])\n"
+    b"    url = sqs.get_queue_url(QueueName=qname)['QueueUrl']\n"
+    b"    sqs.send_message(QueueUrl=url, MessageBody='1')\n"
+)
+
+
+def _v2_auth_counter_queue(sqs):
+    """Create the SQS queue an authorizer marks on every invocation."""
+    qname = f"v2-auth-count-{_uuid_mod.uuid4().hex[:8]}"
+    sqs.create_queue(QueueName=qname)
+    return qname
+
+
+def _v2_auth_count(sqs, qname):
+    """How many times the authorizer behind ``qname`` has run."""
+    url = sqs.get_queue_url(QueueName=qname)["QueueUrl"]
+    attrs = sqs.get_queue_attributes(
+        QueueUrl=url, AttributeNames=["ApproximateNumberOfMessages"]
+    )["Attributes"]
+    return int(attrs["ApproximateNumberOfMessages"])
+
+
+def _v2_auth_delete_queue(sqs, qname):
+    try:
+        sqs.delete_queue(QueueUrl=sqs.get_queue_url(QueueName=qname)["QueueUrl"])
+    except ClientError:
+        pass
+
+
+def _v2_auth_make_lambda(lam, label, code):
+    fname = f"v2-auth-{label}-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Timeout=30, Code={"ZipFile": _make_zip(code)},
+    )
+    return fname
+
+
+def _v2_auth_drop_lambda(lam, fname):
+    try:
+        lam.delete_function(FunctionName=fname)
+    except ClientError:
+        pass
+
+
+def _v2_auth_drop_api(apigw, api_id):
+    try:
+        apigw.delete_api(ApiId=api_id)
+    except ClientError:
+        pass
+
+
+def _v2_auth_policy_authorizer_code(qname):
+    """IAM-policy authorizer: Allow for `allow*` tokens, Deny otherwise.
+
+    The policy's ``Resource`` is the canonical ``event['routeArn']`` — the shape
+    every AWS sample emits, and the one whose per-request evaluation keeps a
+    cached policy from granting another route or stage. The routeArn is echoed
+    through ``context`` so a test can see which one was issued.
+    """
+    return (
+        _V2_AUTH_MARK_PRELUDE
+        + b"def handler(event, context):\n"
+        + f"    _mark({qname!r})\n".encode()
+        + b"    token = event['headers'].get('authorization', '')\n"
+        b"    effect = 'Allow' if token.startswith('allow') else 'Deny'\n"
+        b"    return {\n"
+        b"        'principalId': 'user|' + token,\n"
+        b"        'policyDocument': {'Version': '2012-10-17', 'Statement': [\n"
+        b"            {'Action': 'execute-api:Invoke', 'Effect': effect,\n"
+        b"             'Resource': event['routeArn']}]},\n"
+        b"        'context': {'arn': event['routeArn']},\n"
+        b"    }\n"
+    )
+
+
+def _v2_auth_http(url, method="GET", headers=None, timeout=30):
+    """(status, body_bytes) without raising on 4xx/5xx.
+
+    An explicit timeout keeps a wedged request from hanging the whole session.
+    """
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+
+    req = _urlreq.Request(url, method=method)
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        resp = _urlreq.urlopen(req, timeout=timeout)
+        return resp.status, resp.read()
+    except _urlerr.HTTPError as e:
+        return e.code, e.read()
+
+
+def _v2_auth_execute_url(api_id, stage, path):
+    # Path-based execute form: no *.execute-api.localhost DNS needed.
+    return f"http://localhost:{_EXECUTE_PORT}/_aws/execute-api/{api_id}/{stage}/{path}"
+
+
+def _v2_auth_build_api(apigw, auth_fn, int_fn, authorizer_kwargs,
+                       route_paths=("secure",), stages=("test",)):
+    """HTTP API with a CUSTOM-guarded `GET /{path}` per entry in ``route_paths``."""
+    api_id = apigw.create_api(
+        Name=f"v2-auth-{_uuid_mod.uuid4().hex[:6]}", ProtocolType="HTTP"
+    )["ApiId"]
+    auth_id = apigw.create_authorizer(
+        ApiId=api_id, AuthorizerType="REQUEST",
+        AuthorizerUri=f"arn:aws:lambda:us-east-1:000000000000:function:{auth_fn}",
+        **authorizer_kwargs,
+    )["AuthorizerId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{int_fn}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    for path in route_paths:
+        apigw.create_route(
+            ApiId=api_id, RouteKey=f"GET /{path}", Target=f"integrations/{int_id}",
+            AuthorizationType="CUSTOM", AuthorizerId=auth_id,
+        )
+    for stage in stages:
+        apigw.create_stage(ApiId=api_id, StageName=stage)
+    return api_id, auth_id
+
+
+def test_apigwv2_authorizer_cache_is_scoped_per_route_arn(apigw, lam, sqs):
+    """A cached Allow grants only the route it was issued for.
+
+    HTTP API caches the authorizer *response* — "By default, API Gateway uses
+    the cached authorizer response for all routes of an API that use the
+    authorizer" — and evaluates it per request. The canonical
+    `Resource: event['routeArn']` policy therefore still covers exactly one
+    route: reusing the *response* on /beta re-evaluates the /alpha policy and
+    denies. Caching the allow/deny *verdict* instead replays the Allow on every
+    other route the same token touches.
+    """
+    qname = _v2_auth_counter_queue(sqs)
+    backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
+    authz = _v2_auth_make_lambda(lam, "pol", _v2_auth_policy_authorizer_code(qname))
+    api_id, _ = _v2_auth_build_api(
+        apigw, authz, backend,
+        dict(Name="pol", AuthorizerPayloadFormatVersion="2.0",
+             IdentitySource=["$request.header.Authorization"],
+             AuthorizerResultTtlInSeconds=300),
+        route_paths=("alpha", "beta"),
+    )
+    try:
+        status, _ = _v2_auth_http(
+            _v2_auth_execute_url(api_id, "test", "alpha"),
+            headers={"Authorization": "allow-abc"},
+        )
+        assert status == 200
+        assert _v2_auth_count(sqs, qname) == 1
+
+        status, _ = _v2_auth_http(
+            _v2_auth_execute_url(api_id, "test", "beta"),
+            headers={"Authorization": "allow-abc"},
+        )
+        assert status == 403, "an Allow issued for /alpha must not carry over to /beta"
+        assert _v2_auth_count(sqs, qname) == 1, "the cached policy is what gets re-evaluated"
+    finally:
+        _v2_auth_drop_api(apigw, api_id)
+        _v2_auth_drop_lambda(lam, backend)
+        _v2_auth_drop_lambda(lam, authz)
+        _v2_auth_delete_queue(sqs, qname)
+
+
+def test_apigwv2_authorizer_cache_is_scoped_per_stage(apigw, lam, sqs):
+    """A result computed on one stage never answers the same token on another.
+
+    Stages are independent deployments of the API and the route ARN carries the
+    stage, so a cached entry shared across stages could only ever deny the
+    second one — the authorizer never gets to see the stage it was asked about.
+    """
+    qname = _v2_auth_counter_queue(sqs)
+    backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
+    authz = _v2_auth_make_lambda(lam, "pol", _v2_auth_policy_authorizer_code(qname))
+    api_id, _ = _v2_auth_build_api(
+        apigw, authz, backend,
+        dict(Name="pol", AuthorizerPayloadFormatVersion="2.0",
+             IdentitySource=["$request.header.Authorization"],
+             AuthorizerResultTtlInSeconds=300),
+        stages=("test", "prod"),
+    )
+    try:
+        status, body = _v2_auth_http(
+            _v2_auth_execute_url(api_id, "test", "secure"),
+            headers={"Authorization": "allow-abc"},
+        )
+        assert status == 200, body
+        assert "/test/GET/secure" in json.loads(body)["lambda"]["arn"]
+        assert _v2_auth_count(sqs, qname) == 1
+
+        status, body = _v2_auth_http(
+            _v2_auth_execute_url(api_id, "prod", "secure"),
+            headers={"Authorization": "allow-abc"},
+        )
+        assert status == 200, body
+        assert _v2_auth_count(sqs, qname) == 2, "the test-stage entry must not serve prod"
+        assert "/prod/GET/secure" in json.loads(body)["lambda"]["arn"]
+
+        # The per-stage entries are independent: both now answer from cache.
+        for stage in ("test", "prod"):
+            status, _ = _v2_auth_http(
+                _v2_auth_execute_url(api_id, stage, "secure"),
+                headers={"Authorization": "allow-abc"},
+            )
+            assert status == 200
+        assert _v2_auth_count(sqs, qname) == 2
+    finally:
+        _v2_auth_drop_api(apigw, api_id)
+        _v2_auth_drop_lambda(lam, backend)
+        _v2_auth_drop_lambda(lam, authz)
+        _v2_auth_delete_queue(sqs, qname)
+
+
+def test_apigwv2_authorizer_simple_response_cache_covers_routes(apigw, lam, sqs):
+    """A simple response has no resource dimension, so its cached verdict does
+    cover every route — "the authorizer's response fully allows or denies all
+    API requests that match the cached identity source values".
+
+    This is the deliberate asymmetry with the IAM policy format above: there the
+    cached *policy* is re-evaluated per route, here there is no policy to
+    re-evaluate and the verdict itself is what gets cached.
+    """
+    qname = _v2_auth_counter_queue(sqs)
+    backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
+    authz = _v2_auth_make_lambda(
+        lam, "simple",
+        _V2_AUTH_MARK_PRELUDE
+        + b"def handler(event, context):\n"
+        + f"    _mark({qname!r})\n".encode()
+        + b"    token = event['headers'].get('authorization', '')\n"
+        b"    return {'isAuthorized': token.startswith('allow'),\n"
+        b"            'context': {'user': token}}\n",
+    )
+    api_id, _ = _v2_auth_build_api(
+        apigw, authz, backend,
+        dict(Name="simple", AuthorizerPayloadFormatVersion="2.0",
+             EnableSimpleResponses=True,
+             IdentitySource=["$request.header.Authorization"],
+             AuthorizerResultTtlInSeconds=300),
+        route_paths=("alpha", "beta"),
+    )
+    try:
+        for path in ("alpha", "beta"):
+            status, body = _v2_auth_http(
+                _v2_auth_execute_url(api_id, "test", path),
+                headers={"Authorization": "allow-abc"},
+            )
+            assert status == 200, body
+            assert json.loads(body) == {"lambda": {"user": "allow-abc"}}
+        assert _v2_auth_count(sqs, qname) == 1
+
+        # A denied verdict is cached for the TTL too, exactly like an Allow.
+        for _ in range(2):
+            status, _ = _v2_auth_http(
+                _v2_auth_execute_url(api_id, "test", "alpha"),
+                headers={"Authorization": "nope"},
+            )
+            assert status == 403
+        assert _v2_auth_count(sqs, qname) == 2
+    finally:
+        _v2_auth_drop_api(apigw, api_id)
+        _v2_auth_drop_lambda(lam, backend)
+        _v2_auth_drop_lambda(lam, authz)
+        _v2_auth_delete_queue(sqs, qname)
+
+
+def test_apigwv2_authorizer_without_policy_document_is_500_and_not_cached(apigw, lam, sqs):
+    """A response with no policyDocument is an invalid response format: "clients
+    receive a 500 Internal Server Error", not an implicit deny — and an invalid
+    response is never cached."""
+    qname = _v2_auth_counter_queue(sqs)
+    backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
+    authz = _v2_auth_make_lambda(
+        lam, "nopolicy",
+        _V2_AUTH_MARK_PRELUDE
+        + b"def handler(event, context):\n"
+        + f"    _mark({qname!r})\n".encode()
+        + b"    return {'principalId': 'user|abc'}\n",
+    )
+    api_id, _ = _v2_auth_build_api(
+        apigw, authz, backend,
+        dict(Name="nopolicy", AuthorizerPayloadFormatVersion="2.0",
+             IdentitySource=["$request.header.Authorization"],
+             AuthorizerResultTtlInSeconds=300),
+    )
+    try:
+        url = _v2_auth_execute_url(api_id, "test", "secure")
+        for _ in range(2):
+            status, body = _v2_auth_http(url, headers={"Authorization": "allow-abc"})
+            assert status == 500
+            assert json.loads(body) == {"message": "Internal Server Error"}
+        assert _v2_auth_count(sqs, qname) == 2, "an invalid response must not be cached"
+    finally:
+        _v2_auth_drop_api(apigw, api_id)
+        _v2_auth_drop_lambda(lam, backend)
+        _v2_auth_drop_lambda(lam, authz)
+        _v2_auth_delete_queue(sqs, qname)
+
+
+def test_apigwv2_authorizer_simple_response_non_boolean_is_500(apigw, lam, sqs):
+    """The simple format is `{"isAuthorized": true/false}`; anything else is an
+    invalid response format -> 500, uncached.
+
+    Truthiness is not a safe stand-in: `"false"` is a truthy string, so an
+    authorizer that plainly denies would otherwise be read as an Allow.
+    """
+    qname = _v2_auth_counter_queue(sqs)
+    backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
+    authz = _v2_auth_make_lambda(
+        lam, "strbool",
+        _V2_AUTH_MARK_PRELUDE
+        + b"def handler(event, context):\n"
+        + f"    _mark({qname!r})\n".encode()
+        + b"    return {'isAuthorized': 'false', 'context': {'user': 'mallory'}}\n",
+    )
+    api_id, _ = _v2_auth_build_api(
+        apigw, authz, backend,
+        dict(Name="strbool", AuthorizerPayloadFormatVersion="2.0",
+             EnableSimpleResponses=True,
+             IdentitySource=["$request.header.Authorization"],
+             AuthorizerResultTtlInSeconds=300),
+    )
+    try:
+        url = _v2_auth_execute_url(api_id, "test", "secure")
+        for _ in range(2):
+            status, body = _v2_auth_http(url, headers={"Authorization": "allow-abc"})
+            assert status == 500, "a truthy 'false' string must not authorize the request"
+            assert json.loads(body) == {"message": "Internal Server Error"}
+        assert _v2_auth_count(sqs, qname) == 2, "an invalid response must not be cached"
+    finally:
+        _v2_auth_drop_api(apigw, api_id)
+        _v2_auth_drop_lambda(lam, backend)
+        _v2_auth_drop_lambda(lam, authz)
+        _v2_auth_delete_queue(sqs, qname)
+
+
+def test_apigwv2_authorizer_unparsable_ttl_falls_back_to_the_default(apigw, lam, sqs):
+    """UpdateAuthorizer copies the request body verbatim, so the TTL can be any
+    JSON value by the time the data plane reads it. An unparsable value falls
+    back to the same default an absent one does (and does not raise).
+
+    The update goes over raw HTTP: botocore models the field as an integer and
+    would reject the string client-side — which is exactly why the server has to
+    cope with what other clients can still store.
+    """
+    import urllib.request as _urlreq
+
+    qname = _v2_auth_counter_queue(sqs)
+    backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
+    authz = _v2_auth_make_lambda(lam, "pol", _v2_auth_policy_authorizer_code(qname))
+    api_id, auth_id = _v2_auth_build_api(
+        apigw, authz, backend,
+        dict(Name="pol", AuthorizerPayloadFormatVersion="2.0",
+             IdentitySource=["$request.header.Authorization"],
+             AuthorizerResultTtlInSeconds=300),
+    )
+    try:
+        patch = _urlreq.Request(
+            f"{_endpoint}/v2/apis/{api_id}/authorizers/{auth_id}",
+            data=json.dumps({"authorizerResultTtlInSeconds": "not-a-number"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="PATCH",
+        )
+        patched = json.loads(_urlreq.urlopen(patch, timeout=30).read())
+        assert patched["authorizerResultTtlInSeconds"] == "not-a-number"
+
+        url = _v2_auth_execute_url(api_id, "test", "secure")
+        for _ in range(2):
+            status, body = _v2_auth_http(url, headers={"Authorization": "allow-abc"})
+            assert status == 200, body
+        assert _v2_auth_count(sqs, qname) == 1, "caching stays on at the default TTL"
+    finally:
+        _v2_auth_drop_api(apigw, api_id)
+        _v2_auth_drop_lambda(lam, backend)
+        _v2_auth_drop_lambda(lam, authz)
+        _v2_auth_delete_queue(sqs, qname)
+
+
+def test_apigwv2_authorizer_without_identity_source_does_not_cache(apigw, lam, sqs):
+    """"To enable caching, your authorizer must have at least one identity
+    source" — the identity values are the cache key.
+
+    An authorizer that reads the header itself and declares no identity source
+    is a supported setup (it is how you return your own 401), and it is created
+    with the default 300s TTL. Keying that on the empty identity list would
+    serve the first caller's verdict to every other caller.
+    """
+    qname = _v2_auth_counter_queue(sqs)
+    backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
+    authz = _v2_auth_make_lambda(lam, "pol", _v2_auth_policy_authorizer_code(qname))
+    api_id, _ = _v2_auth_build_api(
+        apigw, authz, backend,
+        dict(Name="pol", AuthorizerPayloadFormatVersion="2.0", IdentitySource=[]),
+    )
+    try:
+        url = _v2_auth_execute_url(api_id, "test", "secure")
+        status, body = _v2_auth_http(url, headers={"Authorization": "allow-abc"})
+        assert status == 200, body
+
+        status, _ = _v2_auth_http(url, headers={"Authorization": "deny-me"})
+        assert status == 403, "the first caller's Allow must not answer a second token"
+        assert _v2_auth_count(sqs, qname) == 2
+    finally:
+        _v2_auth_drop_api(apigw, api_id)
+        _v2_auth_drop_lambda(lam, backend)
+        _v2_auth_drop_lambda(lam, authz)
+        _v2_auth_delete_queue(sqs, qname)
+
+
+def test_apigwv2_authorizer_cache_is_bounded():
+    """The result cache is keyed on caller-supplied identity values, so it is
+    capped rather than left to grow for the life of the process. Expired entries
+    go first; beyond that the oldest insertions are evicted."""
+    from ministack.services import apigateway as _apigw_svc
+
+    cache = _apigw_svc._authorizer_cache
+    cap = _apigw_svc._AUTHORIZER_CACHE_MAX
+    saved = dict(cache)
+    cache.clear()
+    try:
+        expired_at = time.time() - 1
+        for i in range(cap):
+            _apigw_svc._cache_authorizer_result(("stale", i), expired_at, {}, {})
+        assert len(cache) == cap
+
+        # The next write is over the cap and prunes the expired entries first.
+        _apigw_svc._cache_authorizer_result(("live", 0), time.time() + 300, {}, {})
+        assert len(cache) == 1
+        assert ("live", 0) in cache
+
+        # With nothing expired to reclaim, the oldest insertions are evicted.
+        for i in range(cap + 50):
+            _apigw_svc._cache_authorizer_result(("live", i), time.time() + 300, {}, {})
+        assert len(cache) <= cap
+        assert ("live", cap + 49) in cache
+    finally:
+        cache.clear()
+        cache.update(saved)
