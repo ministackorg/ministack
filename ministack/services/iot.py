@@ -2558,9 +2558,39 @@ class _WSSession:
 
         if pkt_type == PKT_UNSUBSCRIBE:
             packet_id = struct.unpack_from("!H", body, 0)[0]
-            for sid in list(self._sub_ids):
-                await broker_unsubscribe(sid)
-            self._sub_ids.clear()
+            off = 2
+            filters = []
+            while off < len(body):
+                try:
+                    topic_filter, off = _read_string(body, off)
+                except ValueError:
+                    _broker_logger.warning(
+                        "IoT broker: UNSUBSCRIBE payload truncated after %d "
+                        "topic filter(s), dropping the remainder",
+                        len(filters),
+                    )
+                    break
+                filters.append(topic_filter)
+
+            # MQTT 3.1.1 §3.10.4: each filter is compared character-by-character
+            # with the session's subscriptions, and one that matches none of them
+            # is simply skipped — a wildcard filter goes only by its own text, not
+            # by the topics it happened to match. `_sub_filters` keeps the filter
+            # as it arrived on the wire, so the comparison happens before topic
+            # prefixing, in the same form SUBSCRIBE stored it.
+            for topic_filter in filters:
+                removed = [
+                    sid
+                    for sid, stored in self._sub_filters.items()
+                    if stored == topic_filter
+                ]
+                for sid in removed:
+                    await broker_unsubscribe(sid)
+                    self._sub_filters.pop(sid, None)
+                    self._sub_granted_qos.pop(sid, None)
+                self._sub_ids[:] = [
+                    sid for sid in self._sub_ids if sid not in removed
+                ]
             await self.send_bytes(_make_unsuback(packet_id))
             return True
 

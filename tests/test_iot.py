@@ -690,6 +690,8 @@ from ministack.services.iot import (
     PKT_PUBACK,
     PKT_PUBLISH,
     PKT_SUBSCRIBE,
+    PKT_UNSUBACK,
+    PKT_UNSUBSCRIBE,
     _encode_remaining_length,
     _encode_string,
     _InFlightMessage,
@@ -1194,6 +1196,14 @@ def _build_subscribe_body(packet_id, topics_qos):
     return body
 
 
+def _build_unsubscribe_body(packet_id, topic_filters):
+    """Build an UNSUBSCRIBE packet body. topic_filters is a list of filters."""
+    body = struct.pack("!H", packet_id)
+    for topic_filter in topic_filters:
+        body += _encode_string(topic_filter)
+    return body
+
+
 def _mock_send():
     """Return (async send-callable, captured-message list)."""
     sent = []
@@ -1202,6 +1212,16 @@ def _mock_send():
         sent.append(msg)
 
     return send, sent
+
+
+def _unsuback_packet_ids(sent_messages):
+    """Return the packet ID of every UNSUBACK in sent messages."""
+    ids = []
+    for msg in sent_messages:
+        data = msg.get("bytes")
+        if data and len(data) >= 4 and (data[0] >> 4) & 0x0F == PKT_UNSUBACK:
+            ids.append(struct.unpack_from("!H", data, 2)[0])
+    return ids
 
 
 def _parse_connack(sent_messages):
@@ -1992,6 +2012,158 @@ def test_subscribe_stores_granted_qos_on_session():
         assert session._sub_granted_qos[sid] == 1
 
         await session.cleanup()
+
+    asyncio.run(_run())
+    reset()
+
+
+# ----------------------------------------------------------------------
+# Broker — UNSUBSCRIBE
+# ----------------------------------------------------------------------
+
+
+async def _connect_and_subscribe(client_id, topics, clean_session=True):
+    """CONNECT a session and SUBSCRIBE it at QoS 0 to every topic filter."""
+    send, sent = _mock_send()
+    session = _WSSession(send, "123456789012")
+    await session.handle_packet(
+        PKT_CONNECT, 0, _build_connect_body(client_id, clean_session=clean_session)
+    )
+    await session.handle_packet(
+        PKT_SUBSCRIBE, 0x02, _build_subscribe_body(1, [(t, 0) for t in topics])
+    )
+    sent.clear()
+    return session, sent
+
+
+def test_unsubscribe_removes_only_the_named_filters():
+    """The filters named in the packet go; every other subscription stays."""
+    reset()
+
+    async def _run():
+        session, sent = await _connect_and_subscribe(
+            "unsub-one", ["sensor/a", "sensor/b", "sensor/c"]
+        )
+
+        await session.handle_packet(
+            PKT_UNSUBSCRIBE, 0x02, _build_unsubscribe_body(7, ["sensor/b"])
+        )
+        assert _unsuback_packet_ids(sent) == [7]
+
+        sent.clear()
+        for topic in ("sensor/a", "sensor/b", "sensor/c"):
+            await publish("123456789012", topic, topic.encode())
+
+        delivered = [topic for topic, _payload, _qos, _pid, _dup in _extract_publish_frames(sent)]
+        assert delivered == ["sensor/a", "sensor/c"]
+
+        await session.cleanup()
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_unsubscribe_of_filter_never_subscribed_is_a_no_op():
+    """An unmatched filter changes nothing and is still acknowledged."""
+    reset()
+
+    async def _run():
+        session, sent = await _connect_and_subscribe("unsub-unknown", ["sensor/a"])
+
+        await session.handle_packet(
+            PKT_UNSUBSCRIBE, 0x02, _build_unsubscribe_body(11, ["sensor/never"])
+        )
+        # MQTT 3.1.1 UNSUBACK carries no reason codes, so the acknowledgement
+        # looks the same whether or not a subscription existed.
+        assert _unsuback_packet_ids(sent) == [11]
+
+        sent.clear()
+        await publish("123456789012", "sensor/a", b"still-here")
+
+        assert _extract_publish_frames(sent) == [("sensor/a", b"still-here", 0, None, False)]
+
+        await session.cleanup()
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_unsubscribe_of_every_filter_stops_delivery():
+    """Naming all the session's filters leaves it with no subscriptions."""
+    reset()
+
+    async def _run():
+        session, sent = await _connect_and_subscribe(
+            "unsub-all", ["sensor/a", "sensor/b"]
+        )
+
+        await session.handle_packet(
+            PKT_UNSUBSCRIBE, 0x02, _build_unsubscribe_body(3, ["sensor/a", "sensor/b"])
+        )
+        assert _unsuback_packet_ids(sent) == [3]
+        assert session._sub_ids == []
+        assert session._sub_filters == {}
+        assert session._sub_granted_qos == {}
+
+        sent.clear()
+        await publish("123456789012", "sensor/a", b"gone")
+        await publish("123456789012", "sensor/b", b"gone")
+
+        assert _extract_publish_frames(sent) == []
+
+        await session.cleanup()
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_unsubscribe_matches_a_wildcard_filter_by_its_own_text():
+    """A wildcard subscription goes by its filter string, not what it matched."""
+    reset()
+
+    async def _run():
+        session, sent = await _connect_and_subscribe("unsub-wildcard", ["sensor/#"])
+
+        # `sensor/temp` is a topic the wildcard delivers, not a filter the
+        # session holds — it must leave the subscription untouched.
+        await session.handle_packet(
+            PKT_UNSUBSCRIBE, 0x02, _build_unsubscribe_body(1, ["sensor/temp"])
+        )
+        sent.clear()
+        await publish("123456789012", "sensor/temp", b"matched")
+        assert len(_extract_publish_frames(sent)) == 1
+
+        await session.handle_packet(
+            PKT_UNSUBSCRIBE, 0x02, _build_unsubscribe_body(2, ["sensor/#"])
+        )
+        sent.clear()
+        await publish("123456789012", "sensor/temp", b"unmatched")
+        assert _extract_publish_frames(sent) == []
+
+        await session.cleanup()
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_unsubscribe_drops_the_filter_from_a_preserved_session():
+    """An unsubscribed filter must not come back with a cleanSession=0 resume."""
+    reset()
+
+    async def _run():
+        client_id = "unsub-persistent"
+        session, _sent = await _connect_and_subscribe(
+            client_id, ["sensor/a", "sensor/b"], clean_session=False
+        )
+
+        await session.handle_packet(
+            PKT_UNSUBSCRIBE, 0x02, _build_unsubscribe_body(1, ["sensor/a"])
+        )
+        await session.handle_packet(PKT_DISCONNECT, 0, b"")
+        await session.cleanup()
+
+        preserved = _persistent_sessions[("123456789012", _TEST_REGION, client_id)]
+        assert preserved.subscriptions == ["sensor/b"]
 
     asyncio.run(_run())
     reset()
