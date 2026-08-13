@@ -130,6 +130,15 @@ _AWS_SPECIFIC_TYPES = {
     "AWS::Route53::HostedZone::Id",
 }
 
+# Any ``AWS::SSM::Parameter::Value<...>`` type resolves its given value (an SSM
+# parameter *name*) against SSM Parameter Store before Ref ever sees it — this
+# is true for every inner type (String, List<String>, CommaDelimitedList, and
+# the AWS-specific and List<AWS-specific> forms), so match on the prefix rather
+# than an enumerated subset. The ``Value<`` in the prefix deliberately excludes
+# ``AWS::SSM::Parameter::Name`` (Ref returns the name) and
+# ``AWS::SSM::Parameter::Type`` (a template-side type constraint, not a lookup).
+_SSM_PARAMETER_VALUE_PREFIX = "AWS::SSM::Parameter::Value<"
+
 
 def _resolve_parameters(template: dict, provided_params: list[dict],
                         previous_params: dict | None = None) -> dict:
@@ -152,10 +161,17 @@ def _resolve_parameters(template: dict, provided_params: list[dict],
         no_echo = str(defn.get("NoEcho", "false")).lower() == "true"
 
         entry = provided_map.get(name)
+        # Whether `value` below still needs SSM-name resolution, or is
+        # already a final value — a `previous_params` hit is always the
+        # latter: it's this same parameter's *already-resolved* Value from
+        # the prior deployment (see the end of this loop, where `resolved`
+        # is built), not the SSM parameter name again.
+        already_resolved = False
         if entry is not None and entry.get("UsePreviousValue"):
             prev = previous_params.get(name)
             if prev is not None:
                 value = prev["Value"] if isinstance(prev, dict) else prev
+                already_resolved = True
             elif "Default" in defn:
                 value = defn["Default"]
             else:
@@ -169,6 +185,23 @@ def _resolve_parameters(template: dict, provided_params: list[dict],
             raise ValueError(f"Parameter '{name}' has no Default and was not provided")
 
         value = str(value) if value is not None else ""
+
+        if ptype.startswith(_SSM_PARAMETER_VALUE_PREFIX) and not already_resolved:
+            # `value` up to here is the SSM parameter *name* (the template
+            # parameter's Default, or a caller-supplied override) — resolve
+            # it against the SSM store the same way real CloudFormation
+            # does before Ref ever sees it. Local import to avoid a
+            # cloudformation/ssm circular import at module load time (see
+            # ecs.py's identical pattern for the same reason).
+            from ministack.services import ssm
+            param_name = value
+            resolved_value = ssm.resolve_parameter_value(param_name)
+            if resolved_value is None:
+                raise ValueError(
+                    f"Parameter '{name}' failed to resolve: SSM parameter "
+                    f"'{param_name}' does not exist"
+                )
+            value = resolved_value
 
         # Validate AllowedValues
         allowed = defn.get("AllowedValues")

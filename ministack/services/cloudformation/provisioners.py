@@ -70,8 +70,23 @@ def _physical_name(stack_name: str, logical_id: str, *,
     Matches the pattern AWS CloudFormation uses for auto-named resources so that
     local testing with CDK (which omits explicit names) produces names that are
     immediately traceable back to the stack and logical resource.
+
+    The suffix is a deterministic hash of (stack_name, logical_id), not a fresh
+    random value per call — matching real CloudFormation, where an auto-named
+    resource's physical name is stable across updates for the same logical
+    resource, only changing on a genuine replacement. Most resource types have
+    no explicit update handler here and fall back to calling create again on
+    every stack update (see _update_resource's own doc comment, "provisioners
+    are expected to implement idempotently") — a random suffix defeated that
+    for any type whose create doesn't separately guard against re-creating an
+    existing name (unlike e.g. SQS, which happens to just overwrite): every
+    update silently produced a brand new, empty resource under a new name,
+    orphaning the real one — and anything referencing it via Ref/Fn::GetAtt
+    picked up that new (wrong) identity the moment it was reprocessed later in
+    the same update. Resource *replacement* (a property change real AWS can't
+    apply in place) isn't specially detected here — same as before this fix.
     """
-    suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=13))
+    suffix = hashlib.sha256(f"{stack_name}:{logical_id}".encode()).hexdigest()[:13].upper()
     base = f"{stack_name}-{logical_id}-{suffix}"
     if lowercase:
         base = base.lower()
@@ -120,12 +135,27 @@ def _delete_resource(resource_type: str, physical_id: str, props: dict,
 
 def _update_resource(resource_type: str, physical_id: str, old_props: dict,
                      new_props: dict, stack_name: str,
-                     logical_id: str | None = None) -> tuple:
+                     logical_id: str | None = None,
+                     old_attrs: dict | None = None) -> tuple:
     """Update a provisioned resource in place when the type provides an ``update``
     handler. Falls back to ``create`` (which provisioners are expected to
     implement idempotently) when no explicit update handler is registered.
     Returns (physical_id, attributes).
     """
+    if old_props == new_props:
+        # Nothing about this resource actually changed — real CloudFormation
+        # doesn't touch a resource at all in this case. Matters most for
+        # types with no update handler (see the create-fallback below):
+        # without this, every such resource was re-provisioned on *every*
+        # stack update regardless of whether anything about it changed, and
+        # a create that isn't perfectly idempotent (most aren't, once a
+        # property actually needs a fresh value like DynamoDB's TableId, or
+        # simply forgets to guard against re-creating its own prior name,
+        # like EventBus once did) silently produced a new, empty resource
+        # under a new identity — orphaning the real one, which anything
+        # still referencing it via Ref/Fn::GetAtt would then pick up the
+        # instant it was reprocessed later in the same update.
+        return physical_id, old_attrs or {}
     handler = _RESOURCE_HANDLERS.get(resource_type)
     if handler and "update" in handler:
         if handler.get("update_with_logical_id"):
@@ -140,9 +170,13 @@ def _update_resource(resource_type: str, physical_id: str, old_props: dict,
             logical_id=logical_id,
             resource_type=resource_type,
         )
-    # No update handler — fall through to create. Most resource types make
-    # their create idempotent; CFN never sees a fresh physical id this way.
-    return _provision_resource(resource_type, physical_id, new_props, stack_name)
+    # No update handler — fall through to create, passing the *logical* id
+    # (not physical_id, unused here) so a name-less resource's create call
+    # derives the same _physical_name() it did originally: same
+    # (stack_name, logical_id) in, same deterministic name out. Most
+    # resource types make their create idempotent on that stable name;
+    # real CloudFormation never presents a fresh physical id this way.
+    return _provision_resource(resource_type, logical_id or physical_id, new_props, stack_name)
 
 
 # ===========================================================================
@@ -4721,6 +4755,42 @@ def _apigw_v2_authorizer_create(logical_id, props, stack_name):
     return auth_id, {"AuthorizerId": auth_id}
 
 
+def _apigw_v2_authorizer_update(physical_id, old_props, new_props, stack_name):
+    """Mutates the existing authorizer record in place under its own
+    authorizerId — matching real API Gateway's UpdateAuthorizer, which
+    changes a property (e.g. jwtAudience, trusting an additional app
+    client) without reassigning the authorizer's id. Without this,
+    _update_resource's no-handler fallback landed on
+    _apigw_v2_authorizer_create, whose authorizerId is a fresh random
+    value on every call (there's no name to derive stability from, unlike
+    the resources _physical_name covers) — producing a second, orphaned
+    authorizer on every property change while every Route's own
+    AuthorizerId (unchanged, so Route itself was never reprocessed) kept
+    pointing at the original, now-stale one.
+    """
+    api_id = new_props.get("ApiId", "")
+    authorizers = _apigw_v2._authorizers.get(api_id, {})
+    authorizer = authorizers.get(physical_id)
+    if not authorizer:
+        return _apigw_v2_authorizer_create(physical_id, new_props, stack_name)
+    jwt_cfg = new_props.get("JwtConfiguration") or {}
+    authorizer.update({
+        "authorizerType": new_props.get("AuthorizerType", "JWT"),
+        "name": new_props.get("Name", authorizer["name"]),
+        "identitySource": new_props.get("IdentitySource", ["$request.header.Authorization"]),
+        "jwtConfiguration": {
+            "audience": jwt_cfg.get("Audience", []),
+            "issuer": jwt_cfg.get("Issuer", ""),
+        },
+        "authorizerUri": new_props.get("AuthorizerUri", ""),
+        "authorizerPayloadFormatVersion": new_props.get("AuthorizerPayloadFormatVersion", "2.0"),
+        "authorizerResultTtlInSeconds": new_props.get("AuthorizerResultTtlInSeconds", 300),
+        "enableSimpleResponses": new_props.get("EnableSimpleResponses", False),
+        "authorizerCredentialsArn": new_props.get("AuthorizerCredentialsArn", ""),
+    })
+    return physical_id, {"AuthorizerId": physical_id}
+
+
 def _apigw_v2_authorizer_delete(physical_id, props):
     api_id = props.get("ApiId", "")
     authorizers = _apigw_v2._authorizers.get(api_id, {})
@@ -5566,7 +5636,7 @@ _RESOURCE_HANDLERS = {
     "AWS::ApiGatewayV2::Stage": {"create": _apigw_v2_stage_create, "delete": _apigw_v2_stage_delete},
     "AWS::ApiGatewayV2::Integration": {"create": _apigw_v2_integration_create, "delete": _apigw_v2_integration_delete},
     "AWS::ApiGatewayV2::Route": {"create": _apigw_v2_route_create, "delete": _apigw_v2_route_delete},
-    "AWS::ApiGatewayV2::Authorizer": {"create": _apigw_v2_authorizer_create, "delete": _apigw_v2_authorizer_delete},
+    "AWS::ApiGatewayV2::Authorizer": {"create": _apigw_v2_authorizer_create, "update": _apigw_v2_authorizer_update, "delete": _apigw_v2_authorizer_delete},
     "AWS::SES::EmailIdentity": {"create": _ses_email_identity_create, "delete": _ses_email_identity_delete},
     "AWS::WAFv2::WebACL": {"create": _waf_web_acl_create, "delete": _waf_web_acl_delete},
     "AWS::CloudFront::CloudFrontOriginAccessIdentity": {

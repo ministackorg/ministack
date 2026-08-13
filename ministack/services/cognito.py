@@ -579,7 +579,8 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
                  username: str = "", user_attrs: dict | None = None,
                  groups: list[str] | None = None,
                  nonce: str = "",
-                 trigger_source: str = "TokenGeneration_Authentication") -> str:
+                 trigger_source: str = "TokenGeneration_Authentication",
+                 client_metadata: dict | None = None) -> str:
     """Return a JWT signed with the RSA key when cryptography is available.
 
     For ``access`` and ``id`` tokens, runs the user pool's PreTokenGeneration
@@ -645,6 +646,7 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
             username=username,
             user_attrs=user_attrs or {},
             groups=groups or [],
+            client_metadata=client_metadata,
         )
 
     payload = base64.urlsafe_b64encode(
@@ -664,7 +666,8 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
 def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
                              trigger_source: str, client_id: str,
                              username: str, user_attrs: dict,
-                             groups: list[str]) -> dict:
+                             groups: list[str],
+                             client_metadata: dict | None = None) -> dict:
     """Invoke the user pool's PreTokenGeneration Lambda and apply its overrides.
 
     Honours both V1_0 (``LambdaConfig.PreTokenGeneration`` — id token only,
@@ -702,6 +705,7 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
         groups=groups,
         trigger_source=trigger_source,
         version=v2_version if use_v2 else "V1_0",
+        client_metadata=client_metadata,
     )
 
     strict = os.environ.get("MINISTACK_COGNITO_PRETOKEN_STRICT", "").lower() in ("1", "true", "yes")
@@ -768,7 +772,8 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
 
 def _build_pretoken_event(pool_id: str, client_id: str, username: str,
                            user_attrs: dict, groups: list[str],
-                           trigger_source: str, version: str) -> dict:
+                           trigger_source: str, version: str,
+                           client_metadata: dict | None = None) -> dict:
     """Construct the event payload AWS sends to a PreTokenGeneration Lambda.
 
     Shape from the Cognito Developer Guide
@@ -782,6 +787,7 @@ def _build_pretoken_event(pool_id: str, client_id: str, username: str,
             "iamRolesToOverride": [],
             "preferredRole": None,
         },
+        "clientMetadata": client_metadata or {},
     }
     if version.startswith("V2") or version.startswith("V3"):
         request_block["scopes"] = ["aws.cognito.signin.user.admin"]
@@ -1300,7 +1306,8 @@ def _continue_custom_auth_after_define(
     if define_resp.get("issueTokens"):
         del _challenge_sessions[token]
         return json_response({"AuthenticationResult": _build_auth_result(
-            session["pool_id"], session["client_id"], user
+            session["pool_id"], session["client_id"], user,
+            client_metadata=client_metadata,
         )})
 
     next_challenge = define_resp.get("challengeName")
@@ -2893,7 +2900,8 @@ def _mfa_challenge_for_user(pool: dict, user: dict, pid: str, username: str) -> 
 
 
 def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = "",
-                        trigger_source: str = "TokenGeneration_Authentication") -> dict:
+                        trigger_source: str = "TokenGeneration_Authentication",
+                        client_metadata: dict | None = None) -> dict:
     attrs = _attr_list_to_dict(user.get("Attributes", []))
     sub = attrs.get("sub", user["Username"])
     username = user.get("Username", "")
@@ -2901,10 +2909,12 @@ def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = ""
     return {
         "AccessToken": _fake_token(sub, pool_id, client_id, "access", username=username,
                                     user_attrs=attrs, groups=groups,
-                                    trigger_source=trigger_source),
+                                    trigger_source=trigger_source,
+                                    client_metadata=client_metadata),
         "IdToken": _fake_token(sub, pool_id, client_id, "id", username=username,
                                user_attrs=attrs, groups=groups, nonce=nonce,
-                               trigger_source=trigger_source),
+                               trigger_source=trigger_source,
+                               client_metadata=client_metadata),
         "RefreshToken": _fake_token(sub, pool_id, client_id, "refresh"),
         "TokenType": "Bearer",
         "ExpiresIn": 3600,
@@ -3124,6 +3134,7 @@ def _admin_respond_to_auth_challenge(data):
     if challenge_name == "NEW_PASSWORD_REQUIRED":
         username = responses.get("USERNAME")
         new_password = responses.get("NEW_PASSWORD")
+        client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
             return _err
@@ -3131,30 +3142,37 @@ def _admin_respond_to_auth_challenge(data):
             user["_password"] = new_password
         user["UserStatus"] = "CONFIRMED"
         user["UserLastModifiedDate"] = _now_epoch()
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+        return json_response({"AuthenticationResult": _build_auth_result(
+            pid, cid, user, client_metadata=client_metadata)})
 
     if challenge_name == "SMS_MFA":
         username = responses.get("USERNAME")
+        client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
             return _err
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+        return json_response({"AuthenticationResult": _build_auth_result(
+            pid, cid, user, client_metadata=client_metadata)})
 
     if challenge_name == "SOFTWARE_TOKEN_MFA":
         username = responses.get("USERNAME")
+        client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
             return _err
         # Accept any TOTP code in emulator — no real TOTP validation
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+        return json_response({"AuthenticationResult": _build_auth_result(
+            pid, cid, user, client_metadata=client_metadata)})
 
     if challenge_name == "MFA_SETUP":
         # Triggered when pool MFA=ON but user hasn't enrolled yet
         username = responses.get("USERNAME")
+        client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
             return _err
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+        return json_response({"AuthenticationResult": _build_auth_result(
+            pid, cid, user, client_metadata=client_metadata)})
 
     return error_response_json("InvalidParameterException", f"Unsupported challenge: {challenge_name}", 400)
 
@@ -3438,6 +3456,7 @@ def _respond_to_auth_challenge(data):
 
         username = responses.get("USERNAME")
         new_password = responses.get("NEW_PASSWORD") or responses.get("PASSWORD")
+        client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
             return _err
@@ -3445,11 +3464,13 @@ def _respond_to_auth_challenge(data):
             user["_password"] = new_password
         user["UserStatus"] = "CONFIRMED"
         user["UserLastModifiedDate"] = _now_epoch()
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+        return json_response({"AuthenticationResult": _build_auth_result(
+            pid, cid, user, client_metadata=client_metadata)})
 
     if challenge_name == "NEW_PASSWORD_REQUIRED":
         username = responses.get("USERNAME")
         new_password = responses.get("NEW_PASSWORD") or responses.get("PASSWORD")
+        client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
             return _err
@@ -3457,15 +3478,18 @@ def _respond_to_auth_challenge(data):
             user["_password"] = new_password
         user["UserStatus"] = "CONFIRMED"
         user["UserLastModifiedDate"] = _now_epoch()
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+        return json_response({"AuthenticationResult": _build_auth_result(
+            pid, cid, user, client_metadata=client_metadata)})
 
     if challenge_name in ("SOFTWARE_TOKEN_MFA", "MFA_SETUP"):
         username = responses.get("USERNAME")
+        client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
             return _err
         # Accept any TOTP code in emulator
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+        return json_response({"AuthenticationResult": _build_auth_result(
+            pid, cid, user, client_metadata=client_metadata)})
 
     return error_response_json("InvalidParameterException", f"Unsupported challenge: {challenge_name}", 400)
 
@@ -5373,7 +5397,24 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         if csec != client["ClientSecret"]:
             return _oauth2_error("invalid_client", "Invalid client credentials.")
 
-        access_token = _fake_token(cid, pool_id, cid, "access")
+        # M2M's own client-metadata channel — a JSON object, urlencoded, in
+        # the aws_client_metadata POST field (there's no ClientMetadata
+        # request field on this grant the way there is on
+        # Initiate/RespondToAuthChallenge). parse_qs already url-decoded the
+        # form, so this is the raw JSON string.
+        client_metadata = {}
+        raw_metadata = form.get("aws_client_metadata", "")
+        if raw_metadata:
+            try:
+                parsed_metadata = json.loads(raw_metadata)
+                if isinstance(parsed_metadata, dict):
+                    client_metadata = parsed_metadata
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        access_token = _fake_token(cid, pool_id, cid, "access",
+                                    trigger_source="TokenGeneration_ClientCredentials",
+                                    client_metadata=client_metadata)
         resp = {
             "access_token": access_token,
             "token_type": "Bearer",

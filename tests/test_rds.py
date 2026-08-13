@@ -9048,3 +9048,93 @@ def test_rds_delete_protected_cluster_keeps_managed_secret(rds, sm):
         rds.modify_db_cluster(
             DBClusterIdentifier=cluster_id, DeletionProtection=False)
         rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+
+
+def test_rds_instance_owns_container_predicate():
+    """Container ownership: standalone instances own theirs, cluster members alias.
+
+    A cluster member that owns a container of its own (per-instance reader
+    containers, #1325) is treated like a standalone instance.
+    """
+    from ministack.services import rds as m
+
+    # Standalone instance with a container: owns it.
+    assert m._instance_owns_container({"_docker_container_id": "c1"})
+    # Cluster member aliasing the shared container: does not own it.
+    assert not m._instance_owns_container({
+        "_docker_container_id": "c1",
+        "_shared_cluster_id": "my-cluster",
+    })
+    # No container at all: nothing to own.
+    assert not m._instance_owns_container({})
+    assert not m._instance_owns_container({"_docker_container_id": None})
+
+
+def test_rds_cluster_owned_container_ids():
+    """Cluster compute enumeration: shared container plus member-owned containers."""
+    from ministack.core.responses import get_account_id, set_request_account_id
+    from ministack.services import rds as m
+
+    original_account = get_account_id()
+    member_id = "enum-cluster-member-1"
+    try:
+        set_request_account_id("111111111111")
+
+        # No compute at all.
+        assert m._cluster_owned_container_ids({"DBClusterIdentifier": "empty"}) == []
+
+        # Shared container only (every cluster today).
+        cluster = {
+            "DBClusterIdentifier": "enum-cluster",
+            "_shared_container_id": "shared-c",
+            "DBClusterMembers": [
+                {"DBInstanceIdentifier": member_id},
+            ],
+        }
+        m._instances[member_id] = {
+            "DBInstanceIdentifier": member_id,
+            "_docker_container_id": "shared-c",
+            "_shared_cluster_id": "enum-cluster",
+        }
+        # Aliasing member contributes nothing beyond the shared container.
+        assert m._cluster_owned_container_ids(cluster) == ["shared-c"]
+
+        # A member owning its own container (reader containers, #1325) is
+        # enumerated as cluster compute.
+        m._instances[member_id] = {
+            "DBInstanceIdentifier": member_id,
+            "_docker_container_id": "reader-c",
+        }
+        assert m._cluster_owned_container_ids(cluster) == ["shared-c", "reader-c"]
+
+        # A member that owns a container whose id happens to alias an
+        # already-listed one is deduplicated, so cluster-wide compute
+        # operations never act on the same container twice.
+        m._instances[member_id] = {
+            "DBInstanceIdentifier": member_id,
+            "_docker_container_id": "shared-c",
+        }
+        assert m._cluster_owned_container_ids(cluster) == ["shared-c"]
+    finally:
+        set_request_account_id(original_account)
+        m._instances.pop(member_id, None)
+
+
+def test_rds_cluster_reader_endpoint_resolves_shared_endpoint():
+    """ReaderEndpoint resolves through _cluster_reader_endpoint (today: the writer's)."""
+    from ministack.services import rds as m
+
+    endpoint = {"Address": "10.0.0.5", "Port": 5432, "HostedZoneId": "Z2R2ITUGPM61AM"}
+    cluster = {"DBClusterIdentifier": "reader-ep", "_shared_endpoint": endpoint}
+    assert m._cluster_reader_endpoint(cluster) == endpoint
+
+    m._sync_cluster_endpoints(cluster)
+    assert cluster["Endpoint"] == "10.0.0.5"
+    assert cluster["ReaderEndpoint"] == "10.0.0.5"
+    assert cluster["Port"] == 5432
+
+    # No shared endpoint yet (cluster created, no instance): sync is a no-op.
+    bare = {"DBClusterIdentifier": "no-ep"}
+    assert m._cluster_reader_endpoint(bare) is None
+    m._sync_cluster_endpoints(bare)
+    assert "ReaderEndpoint" not in bare

@@ -133,7 +133,11 @@ def _create_change_set(params):
                    "AWS::CloudFormation::Stack", "REVIEW_IN_PROGRESS",
                    physical_id=stack_id)
     else:
-        if not stack:
+        # An UPDATE change set against a deleted stack: the name no longer
+        # resolves (deleted stacks are addressable only by stack ID), so this is
+        # "does not exist" — which steers `aws cloudformation deploy` back to a
+        # CREATE change set for the re-deployed name.
+        if not stack or stack.get("StackStatus") == "DELETE_COMPLETE":
             return _error("ValidationError",
                           f"Stack [{stack_name}] does not exist")
         stack_id = stack["StackId"]
