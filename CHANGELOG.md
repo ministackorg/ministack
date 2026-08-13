@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **CloudWatch Logs — `GetLogGroupFields`** — returns field names found in recent stored events with a rough presence percent (`logGroupFields: [{name, percent}]`). Honors `logGroupName` or `logGroupIdentifier`, optional `time` (±8 minutes) or the default last 15 minutes, system `@*` fields, and flattened JSON message keys.
+
 ### Fixed
 - **Lambda — uncaught handler exceptions report `X-Amz-Function-Error: Unhandled`** — the Docker/RIE executor read the error class off a response header the RIE never sets, so every failure was reported `Handled` and API Gateway consumers keying off the 502-for-Unhandled contract never took the error path. Headerless payloads are now classified by shape: the runtime's error serialization reports `Unhandled`, an HTTP-style envelope with `statusCode` stays `Handled`. Contributed by @iot-rocket.
 - **IoT — `CreateThingType` is idempotent for identical re-creates** — re-creating an existing thing type always returned `ResourceAlreadyExistsException`, so a retried request or a re-run provisioning script failed where AWS succeeds. The same `thingTypeProperties` now return the existing ids — absent, `null` and empty compare equal, `searchableAttributes` is unordered — and only a real mismatch keeps the `409`, as `CreateThing` already did. Contributed by @iot-rocket.

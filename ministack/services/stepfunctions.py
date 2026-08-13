@@ -3724,6 +3724,17 @@ def _eval_intrinsic_arg(arg, data, ctx):
     return None
 
 
+# Real AWS caps both base64 intrinsics at 10,000 characters of input
+_BASE64_INTRINSIC_MAX = 10_000
+
+
+def _base64_intrinsic_arg(name, value):
+    """Validate single string argument of States.Base64Encode / States.Base64Decode."""
+    if not isinstance(value, str) or len(value) > _BASE64_INTRINSIC_MAX:
+        raise ValueError(f"Invalid arguments in {name}")
+    return value
+
+
 def _exec_intrinsic(node, data, ctx):
     """Execute a parsed intrinsic call node ('call', name, args)."""
     _, name, raw_args = node
@@ -3738,6 +3749,15 @@ def _exec_intrinsic(node, data, ctx):
         merged.update(args[0])
         merged.update(args[1])
         return merged
+    elif name == "States.Base64Encode":
+        import base64
+        text = _base64_intrinsic_arg(name, args[0])
+        return base64.b64encode(text.encode("utf-8")).decode("ascii")
+    elif name == "States.Base64Decode":
+        import base64
+        raw = _base64_intrinsic_arg(name, args[0])
+        # AWS decodes leniently, so pad rather than reject input that arrives without it.
+        return base64.b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", errors="replace")
     elif name == "States.Format":
         # AWS States.Format: \' → ', \{ → {, \} → }, \\ → \ in
         # template segments only.  Interpolated values are verbatim.
