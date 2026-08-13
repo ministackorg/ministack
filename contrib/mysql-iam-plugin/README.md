@@ -46,6 +46,13 @@ default `auto` mode is silent when no matching artifact exists. Unknown mode
 values emit one warning per process and are treated as `auto`; names reserved
 for later fidelity levels do not change the L0 reject-all behavior.
 
+Artifact series selection uses the tag of the same resolved MySQL image that
+the RDS container launch uses. Accepted version prefixes such as Aurora MySQL
+`8` therefore follow the current fallback image (`mysql:8.4`) automatically.
+If a custom resolved image has no recognized series tag, MiniStack warns and
+leaves the plugin artifact absent while still attempting the compatibility
+procedures independently.
+
 ## MySQL-ready path design
 
 The lifecycle hook runs after authenticated readiness and outside RDS store

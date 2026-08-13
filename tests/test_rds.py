@@ -3889,7 +3889,10 @@ def test_docker_image_for_engine_aurora_postgres_18_uses_new_layout():
 
 
 def test_mysql_image_for_version_maps_aurora_tracks():
-    from ministack.services.rds import _mysql_image_for_version
+    from ministack.services.rds import (
+        _mysql_image_for_version,
+        _mysql_runtime_for_version,
+    )
 
     assert _mysql_image_for_version("8.4.mysql_aurora.8.4.7") == "mysql:8.4"
     assert _mysql_image_for_version("8.0.mysql_aurora.3.12.0") == "mysql:8.0"
@@ -3898,6 +3901,25 @@ def test_mysql_image_for_version_maps_aurora_tracks():
     assert _mysql_image_for_version("8.4.7") == "mysql:8.4"
     assert _mysql_image_for_version("9.0.mysql_aurora.9.0.1") == "mysql:8.4"
     assert _mysql_image_for_version("not-a-version") == "mysql:8.4"
+    assert _mysql_runtime_for_version("8") == ("mysql:8.4", "8.4")
+
+
+def test_mysql_runtime_unknown_image_tag_disables_plugin(monkeypatch, caplog):
+    from ministack.services import rds as rds_service
+
+    monkeypatch.setattr(
+        rds_service,
+        "DEFAULT_AURORA_MYSQL_IMAGE",
+        "registry.example/ministack-mysql:custom",
+    )
+
+    with caplog.at_level("WARNING", logger="rds"):
+        assert rds_service._mysql_runtime_for_version("8") == (
+            "registry.example/ministack-mysql:custom",
+            None,
+        )
+
+    assert "IAM auth plugin artifacts will remain disabled" in caplog.text
 
 
 def test_docker_image_for_engine_mysql_uses_versioned_images():
@@ -6867,6 +6889,7 @@ def test_aurora_user_and_grant_are_visible_through_reader(rds):
     [
         "8.0.mysql_aurora.3.10.3",
         "8.4.mysql_aurora.8.4.7",
+        "8",
     ],
 )
 def test_aurora_mysql_iam_plugin_ddl_and_reject_all(rds, engine_version):

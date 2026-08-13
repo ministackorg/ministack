@@ -1630,8 +1630,10 @@ def _ensure_mysql_compatibility(
     wait_for_ready=False,
 ):
     """Best-effort fidelity hook shared by every MySQL-ready path."""
-    engine_series = _mysql_community_major_minor(engine_version)
-    plugin_enabled = iam_auth_plugin_enabled(engine_series)
+    _mysql_image, engine_series = _mysql_runtime_for_version(engine_version)
+    plugin_enabled = bool(engine_series) and iam_auth_plugin_enabled(
+        engine_series,
+    )
     container = None
     if wait_for_ready or plugin_enabled:
         docker_client = _get_docker()
@@ -6260,8 +6262,25 @@ def _mysql_community_major_minor(engine_version):
 
 
 def _mysql_image_for_version(engine_version):
+    return _mysql_runtime_for_version(engine_version)[0]
+
+
+def _mysql_runtime_for_version(engine_version):
+    """Return the selected image and the known series encoded in its tag."""
     major_minor = _mysql_community_major_minor(engine_version)
-    return AURORA_MYSQL_IMAGE_MAP.get(major_minor, DEFAULT_AURORA_MYSQL_IMAGE)
+    image = AURORA_MYSQL_IMAGE_MAP.get(
+        major_minor,
+        DEFAULT_AURORA_MYSQL_IMAGE,
+    )
+    _repository, separator, tag = image.rpartition(":")
+    if not separator or tag not in AURORA_MYSQL_IMAGE_MAP:
+        logger.warning(
+            "RDS: cannot derive a supported MySQL series from selected image "
+            "%r; IAM auth plugin artifacts will remain disabled",
+            image,
+        )
+        return image, None
+    return image, tag
 
 
 def _default_port(engine):
