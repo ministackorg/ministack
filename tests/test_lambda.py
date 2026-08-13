@@ -6409,6 +6409,87 @@ def test_lambda_invoke_emits_cloudwatch_logs_nodejs(lam, logs):
         lam.delete_function(FunctionName=fname)
 
 
+# ──────────────────── host.docker.internal → host-gateway ────────────────────
+
+
+def _spawn_capture_run_kwargs(monkeypatch, *, endpoint, docker_flags=""):
+    """Spawn one Lambda container against fakes and return the docker kwargs.
+
+    Captures both entry points: the DinD path uses ``containers.create`` (code
+    is docker-cp'd rather than bind-mounted) and everything else uses
+    ``containers.run``, and which one a runner takes is not this test's point.
+    """
+    monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_FLAGS", docker_flags)
+    monkeypatch.setattr(lsvc, "_docker_available", True)
+    monkeypatch.setenv("AWS_ENDPOINT_URL", endpoint)
+
+    captured = {}
+    fake_container = _mk_container()
+    fake_container.ports = {"8080/tcp": [{"HostPort": "9999"}]}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return fake_container
+
+    fake_client = MagicMock()
+    fake_client.containers.run = _capture
+    fake_client.containers.create = _capture
+    fake_client.images.get = MagicMock()
+    monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)
+
+    lsvc._spawn_lambda_container(
+        {"FunctionName": "test-hg-fn", "Runtime": "python3.12",
+         "Handler": "index.handler", "PackageType": "Zip", "Timeout": 3,
+         "MemorySize": 128,
+         "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:test-hg-fn"},
+        _make_zip("def handler(e, c): pass"),
+    )
+    return captured
+
+
+def test_lambda_container_maps_host_docker_internal_to_host_gateway(monkeypatch):
+    """A container pointed at host.docker.internal gets the name mapped.
+
+    AWS_ENDPOINT_URL is rewritten from localhost to host.docker.internal for
+    the container, but that name only resolves out of the box on Docker
+    Desktop. On a native Linux engine it is undefined unless mapped to the
+    magic `host-gateway` address, so a handler's callback dies on DNS.
+    """
+    captured = _spawn_capture_run_kwargs(
+        monkeypatch, endpoint="http://localhost:4566"
+    )
+
+    assert captured["environment"]["AWS_ENDPOINT_URL"] == (
+        "http://host.docker.internal:4566"
+    )
+    assert captured["extra_hosts"] == {"host.docker.internal": "host-gateway"}
+
+
+def test_lambda_container_host_gateway_yields_to_an_explicit_add_host(monkeypatch):
+    """An explicit --add-host for the same name still wins."""
+    captured = _spawn_capture_run_kwargs(
+        monkeypatch,
+        endpoint="http://localhost:4566",
+        docker_flags="--add-host host.docker.internal:10.5.0.1",
+    )
+
+    assert captured["extra_hosts"] == {"host.docker.internal": "10.5.0.1"}
+
+
+def test_lambda_container_without_host_docker_internal_gets_no_mapping(monkeypatch):
+    """An endpoint that names something else is left alone.
+
+    A Docker-network deployment points AWS_ENDPOINT_URL at a container name,
+    which resolves on the network's own DNS; mapping host.docker.internal
+    there would be noise at best.
+    """
+    captured = _spawn_capture_run_kwargs(
+        monkeypatch, endpoint="http://ministack:4566"
+    )
+
+    assert "extra_hosts" not in captured
+
+
 # ──────────────────── LAMBDA_DOCKER_FLAGS ────────────────────
 
 def test_lambda_docker_flags_applied_to_run_kwargs(monkeypatch):
@@ -6431,6 +6512,9 @@ def test_lambda_docker_flags_applied_to_run_kwargs(monkeypatch):
 
     fake_client = MagicMock()
     fake_client.containers.run = _fake_run
+    # A runner that is itself containerised takes the docker-cp path, which
+    # calls containers.create; the flags land in the same kwargs either way.
+    fake_client.containers.create = _fake_run
     fake_client.images.get = MagicMock()
     monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)
 
@@ -6470,7 +6554,10 @@ def test_lambda_docker_flags_applied_to_run_kwargs(monkeypatch):
     assert captured["mem_limit"] == "512m"
     assert captured["shm_size"] == "256m"
     assert captured["cap_add"] == ["SYS_PTRACE"]
-    assert captured["extra_hosts"] == {"myhost": "10.0.0.1"}
+    # The host-gateway mapping is merged in alongside an explicit --add-host.
+    assert captured["extra_hosts"] == {
+        "myhost": "10.0.0.1", "host.docker.internal": "host-gateway",
+    }
     assert captured["tmpfs"] == {"/run": "size=100m"}
     assert captured["privileged"] is True
     assert captured["read_only"] is True

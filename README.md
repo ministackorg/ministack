@@ -940,6 +940,8 @@ Containers are named `lambda-<random-hex-16>` and pooled across invocations. Idl
 
 **Networking:** when MiniStack runs in Docker Compose, set `DOCKER_NETWORK` to the Compose network name. All container-backed services (Lambda, RDS, DSQL, EKS, ElastiCache) then attach to that network so Lambda code can reach MiniStack at `http://<ministack-service-name>:4566`. The legacy `LAMBDA_DOCKER_NETWORK` is still accepted (Lambda only) as a fallback.
 
+Without a shared network, `AWS_ENDPOINT_URL` inside the Lambda container is rewritten from `localhost` to `host.docker.internal`, which only resolves out of the box on Docker Desktop. Lambda containers are therefore started with `host.docker.internal` mapped to `host-gateway` (as ECS and EKS containers already are), so a handler that calls back into MiniStack during its own invocation works on native Linux engines too. Passing your own `--add-host host.docker.internal:...` through `LAMBDA_DOCKER_FLAGS` overrides the mapping.
+
 Example `docker-compose.yml`:
 
 ```yaml

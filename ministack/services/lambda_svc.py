@@ -3506,6 +3506,19 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
             run_kwargs.setdefault("mounts", []).extend(df_mounts)
         run_kwargs.update(df_kwargs)
 
+    # `host.docker.internal` only resolves out of the box on Docker Desktop
+    # (macOS/Windows). On a native Linux engine the name is undefined inside
+    # containers unless it is mapped to the special `host-gateway` address, so
+    # every nested SDK call a handler makes against AWS_ENDPOINT_URL dies on
+    # DNS before reaching this server. Map it whenever the container is pointed
+    # at that name, as the ECS and EKS container paths already do. After the
+    # flags merge, and setdefault twice over, so an explicit
+    # `--add-host host.docker.internal:...` in LAMBDA_DOCKER_FLAGS still wins.
+    if "host.docker.internal" in endpoint:
+        run_kwargs.setdefault("extra_hosts", {}).setdefault(
+            "host.docker.internal", "host-gateway"
+        )
+
     # Pull the image on first use (both Zip RIE images and user Image types)
     try:
         client.images.get(image)
