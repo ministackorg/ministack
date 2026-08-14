@@ -882,12 +882,6 @@ async def handle_request(method, path, headers, body, query_params):
     handler = handlers.get(action)
     if not handler:
         return _error("InvalidAction", f"Unknown ElastiCache action: {action}", 400)
-    # Docker-backed actions block on the daemon (an image pull is tens of
-    # seconds) and would hold the event loop for every other service. Shared
-    # pool, not a dedicated thread: a Redis/Valkey container never calls back
-    # into MiniStack, so this cannot re-enter.
-    if action in _DOCKER_BACKED_ACTIONS:
-        return await run_offloop(handler, params)
     return handler(params)
 
 

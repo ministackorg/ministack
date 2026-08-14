@@ -40,6 +40,11 @@ from ministack.core.responses import (
 
 logger = logging.getLogger("eks")
 
+# Cap any single Docker daemon call. docker-py defaults to 60s, which turns a
+# slow or wedged daemon into a minutes-long stall on a request path.
+_DOCKER_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
+
+
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 EKS_K3S_IMAGE = os.environ.get("EKS_K3S_IMAGE", "rancher/k3s:v1.31.4-k3s1")
@@ -298,7 +303,7 @@ def _get_docker():
     if not _docker_available:
         return None
     try:
-        return docker_lib.from_env()
+        return docker_lib.from_env(timeout=_DOCKER_TIMEOUT)
     except Exception:
         return None
 

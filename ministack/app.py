@@ -232,6 +232,48 @@ def _get_module(name: str):
     return mod
 
 
+# The loop serving HTTP requests, captured at lifespan startup. Worker threads
+# (Step Functions executions, CloudFormation provisioners) need it to call a
+# service handler, because a handler may genuinely await now.
+_MAIN_LOOP = None
+
+
+def call_service_handler_sync(handler, method, path, headers, body, query_params,
+                              timeout: float | None = None):
+    """Call an async service handler from a worker thread and return its result.
+
+    In-process callers used to drive handlers with ``coro.send(None)``, relying
+    on an unwritten invariant that service handlers never actually await. That
+    held only while every handler was synchronous underneath. The moment one
+    awaits — offloading Docker work, for instance — the first step runs with no
+    running event loop and raises ``RuntimeError: no running event loop``, which
+    escapes past the caller's ``except StopIteration``.
+
+    So the coroutine is scheduled on the loop that is actually running and this
+    thread waits for the result. Callers must be on a worker thread: waiting on
+    the loop from the loop itself would deadlock, so that is refused loudly
+    rather than hanging.
+    """
+    loop = _MAIN_LOOP
+    if loop is None or loop.is_closed():
+        # No server running (unit tests, CLI use): drive it on a private loop.
+        return asyncio.run(handler(method, path, headers, body, query_params))
+
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if running is loop:
+        raise RuntimeError(
+            "call_service_handler_sync must be called from a worker thread, "
+            "not from the event loop — await the handler directly instead"
+        )
+
+    future = asyncio.run_coroutine_threadsafe(
+        handler(method, path, headers, body, query_params), loop)
+    return future.result(timeout)
+
+
 def _lazy_handler(module_name: str):
     """Return a callable that lazily imports module_name and delegates to handle_request."""
 
@@ -1970,6 +2012,8 @@ async def _handle_lifespan(scope, receive, send):
             import concurrent.futures
 
             _max_workers = int(os.environ.get("MINISTACK_WORKER_THREADS", "64"))
+            global _MAIN_LOOP
+            _MAIN_LOOP = asyncio.get_running_loop()
             asyncio.get_running_loop().set_default_executor(
                 concurrent.futures.ThreadPoolExecutor(
                     max_workers=_max_workers,

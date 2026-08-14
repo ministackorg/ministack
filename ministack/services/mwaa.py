@@ -720,15 +720,13 @@ async def handle_request(method, path, headers, body, query_params):
     # CRUD on /environments/{Name}
     if clean_path.startswith("/environments/"):
         if method == "PUT":
-            # Spawns the Airflow container — a heavyweight image and a slow start.
-            # Off-loop; Airflow does not call back into MiniStack.
-            return await run_offloop(_create_environment, method, path, headers, body, query_params)
+            return _create_environment(method, path, headers, body, query_params)
         if method == "GET":
             return _get_environment(method, path, headers, body, query_params)
         if method == "PATCH":
-            return await run_offloop(_update_environment, method, path, headers, body, query_params)
+            return _update_environment(method, path, headers, body, query_params)
         if method == "DELETE":
-            return await run_offloop(_delete_environment, method, path, headers, body, query_params)
+            return _delete_environment(method, path, headers, body, query_params)
 
     return error_response_json("ValidationException",
                                f"Unknown MWAA path: {method} {path}", 400)

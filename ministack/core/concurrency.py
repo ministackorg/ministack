@@ -71,11 +71,16 @@ async def run_reentrant(fn, *args, thread_name: str = "ministack-reentrant"):
     the same pool, so a bound of any size only moves the deadlock edge rather
     than removing it.
 
-    ContextVars propagate as ``asyncio.to_thread`` would. A cancelled awaiter
-    (client disconnected mid-call) does not stop the thread — it runs to
-    completion so that resource release, warm-worker return and container
-    recycle still happen — but the awaiter unwinds immediately rather than
-    blocking on work whose result nobody wants.
+    ContextVars propagate as ``asyncio.to_thread`` would.
+
+    Cancellation defers to completion. A thread cannot be cancelled once it is
+    running, so if a disconnected client let the awaiter unwind immediately, the
+    caller would proceed — releasing a lease, taking a reset barrier, tearing
+    down request state — while the worker is still mutating that same state. So
+    the wait is shielded, repeated cancellation is absorbed until the worker
+    finishes, and the original ``CancelledError`` is re-raised afterwards. The
+    awaiting task is suspended, not the loop, so this costs nothing but the
+    task's own latency.
     """
     loop = asyncio.get_running_loop()
     future: asyncio.Future = loop.create_future()
@@ -118,7 +123,25 @@ async def run_reentrant(fn, *args, thread_name: str = "ministack-reentrant"):
         # OS thread limit. Fail the request loudly instead of awaiting a future
         # nothing will ever resolve.
         raise RuntimeError(f"cannot start {thread_name} thread: {exc}") from exc
-    return await future
+
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError as cancellation:
+        while not future.done():
+            try:
+                await asyncio.shield(future)
+            except asyncio.CancelledError:
+                continue  # absorb repeated cancellation; the worker is still live
+            except Exception:
+                break     # the worker failed; that is a completion too
+        # Consume a failed worker's exception so asyncio does not report it as
+        # never-retrieved after the awaiting request has already gone away.
+        if future.done() and not future.cancelled():
+            try:
+                future.result()
+            except Exception:
+                pass
+        raise cancellation
 
 
 def spawn_background(fn, *args, thread_name: str = "ministack-background", **kwargs):
