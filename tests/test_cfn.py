@@ -450,6 +450,133 @@ def test_cfn_create_describe_delete_stack(cfn, s3):
         s3.head_bucket(Bucket="cfn-t01-bucket")
 
 
+def test_cfn_s3_bucket_notification_configuration(cfn, s3, sqs):
+    """AWS::S3::Bucket NotificationConfiguration is applied, not silently dropped:
+    it round-trips through GetBucketNotificationConfiguration (with the
+    CloudFormation property names translated to the S3 API's), an upload matching
+    the event and key filter is delivered to the target, and removing the property
+    on a stack update clears the configuration. (#1359)
+    """
+    queue_url = sqs.create_queue(QueueName="cfn-notif-q")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=queue_url, AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+
+    def template(with_notif):
+        props = {"BucketName": "cfn-notif-bucket"}
+        if with_notif:
+            props["NotificationConfiguration"] = {
+                "QueueConfigurations": [{
+                    "Queue": queue_arn,
+                    "Event": "s3:ObjectCreated:*",
+                    "Filter": {"S3Key": {"Rules": [{"Name": "suffix", "Value": ".csv"}]}},
+                }],
+            }
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {"Bucket": {"Type": "AWS::S3::Bucket", "Properties": props}},
+        })
+
+    cfn.create_stack(StackName="cfn-notif", TemplateBody=template(True))
+    assert _wait_stack(cfn, "cfn-notif")["StackStatus"] == "CREATE_COMPLETE"
+
+    # The property survived: the config is readable back, with the CloudFormation
+    # names (Queue/Event/Rules) translated to the S3 API's (QueueArn/Events/Key).
+    qcfgs = s3.get_bucket_notification_configuration(
+        Bucket="cfn-notif-bucket")["QueueConfigurations"]
+    assert len(qcfgs) == 1
+    assert qcfgs[0]["QueueArn"] == queue_arn
+    assert qcfgs[0]["Events"] == ["s3:ObjectCreated:*"]
+    assert qcfgs[0]["Filter"]["Key"]["FilterRules"] == [{"Name": "suffix", "Value": ".csv"}]
+
+    # Delivery works end to end through the CloudFormation path, honouring the filter.
+    s3.put_object(Bucket="cfn-notif-bucket", Key="skip.txt", Body=b"no")
+    s3.put_object(Bucket="cfn-notif-bucket", Key="take.csv", Body=b"yes")
+    time.sleep(0.5)
+    msgs = sqs.receive_message(
+        QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=2)
+    keys = [
+        json.loads(m["Body"])["Records"][0]["s3"]["object"]["key"]
+        for m in msgs.get("Messages", []) if "Records" in json.loads(m["Body"])
+    ]
+    assert "take.csv" in keys
+    assert "skip.txt" not in keys
+
+    # Removing the property on an update clears the configuration.
+    cfn.update_stack(StackName="cfn-notif", TemplateBody=template(False))
+    assert _wait_stack(cfn, "cfn-notif")["StackStatus"] == "UPDATE_COMPLETE"
+    cleared = s3.get_bucket_notification_configuration(Bucket="cfn-notif-bucket")
+    assert not cleared.get("QueueConfigurations")
+
+    cfn.delete_stack(StackName="cfn-notif")
+    _wait_stack(cfn, "cfn-notif")
+
+
+def test_cfn_iot_and_cognito_role_attachment(cfn, iot_client, cognito_identity):
+    """AWS::IoT::ThingType, AWS::IoT::Policy, and
+    AWS::Cognito::IdentityPoolRoleAttachment provision onto their real services
+    instead of rolling the stack back — each is readable through its own API. (#1345, item 5)
+    """
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "TT": {"Type": "AWS::IoT::ThingType", "Properties": {
+                "ThingTypeName": "cfn-tt",
+                "ThingTypeProperties": {"ThingTypeDescription": "d", "SearchableAttributes": ["room"]}}},
+            "Pol": {"Type": "AWS::IoT::Policy", "Properties": {
+                "PolicyName": "cfn-pol",
+                "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+                    {"Effect": "Allow", "Action": "iot:Connect", "Resource": "*"}]}}},
+            "Pool": {"Type": "AWS::Cognito::IdentityPool", "Properties": {
+                "IdentityPoolName": "cfn-pool", "AllowUnauthenticatedIdentities": True}},
+            "Roles": {"Type": "AWS::Cognito::IdentityPoolRoleAttachment", "Properties": {
+                "IdentityPoolId": {"Ref": "Pool"},
+                "Roles": {"authenticated": "arn:aws:iam::000000000000:role/auth"}}},
+        },
+        "Outputs": {"PoolId": {"Value": {"Ref": "Pool"}}},
+    }
+    cfn.create_stack(StackName="cfn-iot-cog", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-iot-cog")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    tt = iot_client.describe_thing_type(thingTypeName="cfn-tt")
+    assert tt["thingTypeProperties"]["searchableAttributes"] == ["room"]
+    pol = iot_client.get_policy(policyName="cfn-pol")
+    assert pol["policyArn"].endswith("policy/cfn-pol")
+
+    pool_id = next(o["OutputValue"] for o in stack["Outputs"] if o["OutputKey"] == "PoolId")
+    roles = cognito_identity.get_identity_pool_roles(IdentityPoolId=pool_id)["Roles"]
+    assert roles["authenticated"] == "arn:aws:iam::000000000000:role/auth"
+
+    cfn.delete_stack(StackName="cfn-iot-cog")
+    _wait_stack(cfn, "cfn-iot-cog")
+
+
+def test_cfn_lambda_layer_version_permission(cfn, lam):
+    """AWS::Lambda::LayerVersionPermission attaches a statement to the real
+    layer version's policy, readable via GetLayerVersionPolicy. (#1345, item 5)"""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("lib.txt", "x")
+    layer = lam.publish_layer_version(
+        LayerName="cfn-perm-layer", Content={"ZipFile": buf.getvalue()})
+    arn = layer["LayerVersionArn"]
+
+    template = {"Resources": {"Perm": {
+        "Type": "AWS::Lambda::LayerVersionPermission", "Properties": {
+            "LayerVersionArn": arn, "Action": "lambda:GetLayerVersion",
+            "Principal": "123456789012", "StatementId": "cfn-sid"}}}}
+    cfn.create_stack(StackName="cfn-layer-perm", TemplateBody=json.dumps(template))
+    assert _wait_stack(cfn, "cfn-layer-perm")["StackStatus"] == "CREATE_COMPLETE"
+
+    pol = json.loads(lam.get_layer_version_policy(
+        LayerName="cfn-perm-layer", VersionNumber=1)["Policy"])
+    assert any(s["Sid"] == "cfn-sid" for s in pol["Statement"])
+
+    cfn.delete_stack(StackName="cfn-layer-perm")
+    _wait_stack(cfn, "cfn-layer-perm")
+
+
 def test_cfn_deleted_stack_name_is_reusable(cfn):
     """A DELETE_COMPLETE stack is addressable only by stack ID; its name is free
     to re-create, and an UpdateStack against the deleted name is "does not
