@@ -4173,3 +4173,201 @@ def test_s3_head_object_specific_version(s3):
     with pytest.raises(ClientError) as exc:
         s3.head_object(Bucket=bucket, Key="k", VersionId="does-not-exist")
     assert exc.value.response["Error"]["Code"] in ("NoSuchVersion", "404")
+
+
+def test_s3_list_encoding_type_url_preserves_slash(s3):
+    """`encoding-type=url` percent-encodes spaces and `+` but leaves `/` intact,
+    so delimiter-collapsed CommonPrefixes/Delimiter stay readable — matching real
+    S3 and RGW. (#1322, defect 4)"""
+    import urllib.request
+
+    bkt = f"enc-url-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="foo+1/bar", Body=b"x")
+    s3.put_object(Bucket=bkt, Key="quux ab/xyz", Body=b"x")
+    s3.put_object(Bucket=bkt, Key="asdf", Body=b"x")
+
+    # Raw GET (boto3 auto-decodes the response, hiding the wire form). A dummy
+    # Authorization header keeps the request off the anonymous path; the signature
+    # is not verified.
+    url = f"{ENDPOINT}/{bkt}?delimiter=/&encoding-type=url"
+    req = urllib.request.Request(url, headers={
+        "Authorization": "AWS4-HMAC-SHA256 Credential=test/20240101/us-east-1/s3/aws4_request, "
+                         "SignedHeaders=host, Signature=0",
+    })
+    body = urllib.request.urlopen(req, timeout=5).read().decode()
+
+    assert "<Delimiter>/</Delimiter>" in body, body
+    assert "<Prefix>foo%2B1/</Prefix>" in body, body
+    assert "<Prefix>quux%20ab/</Prefix>" in body, body
+    assert "%2F" not in body, f"forward slash was percent-encoded: {body}"
+
+
+def test_s3_complete_multipart_location_uses_request_host(s3):
+    """CompleteMultipartUpload's Location echoes the endpoint the client reached,
+    so it is correct on any port/host rather than a hard-coded localhost:4566.
+    (#1322, smaller wire omission)"""
+    from urllib.parse import urlparse
+
+    bkt = f"cmu-loc-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    u = s3.create_multipart_upload(Bucket=bkt, Key="k")["UploadId"]
+    etag = s3.upload_part(Bucket=bkt, Key="k", UploadId=u, PartNumber=1, Body=b"hello")["ETag"]
+    resp = s3.complete_multipart_upload(
+        Bucket=bkt, Key="k", UploadId=u,
+        MultipartUpload={"Parts": [{"ETag": etag, "PartNumber": 1}]})
+    loc = resp["Location"]
+    host = urlparse(ENDPOINT).netloc
+    assert host in loc, f"Location {loc!r} should reflect the request host {host!r}"
+    assert loc.endswith(f"/{bkt}/k"), loc
+
+
+def test_s3_content_md5_invalid_vs_bad_digest(s3):
+    """A malformed or wrong-length Content-MD5 is InvalidDigest; only a well-formed
+    16-byte digest that mismatches the body is BadDigest. (#1322, smaller wire omission)"""
+    import base64
+    import hashlib
+
+    bkt = f"md5-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+
+    # Wrong-length digest (valid base64, 3 bytes) -> InvalidDigest.
+    with pytest.raises(ClientError) as e1:
+        s3.put_object(Bucket=bkt, Key="k", Body=b"hello", ContentMD5="1234")
+    assert e1.value.response["Error"]["Code"] == "InvalidDigest", e1.value.response["Error"]
+
+    # Well-formed 16-byte digest that does not match the body -> BadDigest.
+    wrong = base64.b64encode(hashlib.md5(b"other").digest()).decode()
+    with pytest.raises(ClientError) as e2:
+        s3.put_object(Bucket=bkt, Key="k", Body=b"hello", ContentMD5=wrong)
+    assert e2.value.response["Error"]["Code"] == "BadDigest", e2.value.response["Error"]
+
+    # Correct digest succeeds.
+    good = base64.b64encode(hashlib.md5(b"hello").digest()).decode()
+    s3.put_object(Bucket=bkt, Key="k", Body=b"hello", ContentMD5=good)
+
+
+def test_s3_put_object_echoes_bucket_default_sse(s3):
+    """After PutBucketEncryption, PutObject echoes the applied SSE algorithm on the
+    reply (AES256, or aws:kms + key id). (#1322, smaller wire omission)"""
+    bkt = f"sse-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_encryption(Bucket=bkt, ServerSideEncryptionConfiguration={
+        "Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]})
+    r = s3.put_object(Bucket=bkt, Key="k", Body=b"x")
+    assert r.get("ServerSideEncryption") == "AES256", r
+
+    bkt2 = f"sse-kms-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt2)
+    s3.put_bucket_encryption(Bucket=bkt2, ServerSideEncryptionConfiguration={
+        "Rules": [{"ApplyServerSideEncryptionByDefault": {
+            "SSEAlgorithm": "aws:kms",
+            "KMSMasterKeyID": "arn:aws:kms:us-east-1:000000000000:key/abc"}}]})
+    r2 = s3.put_object(Bucket=bkt2, Key="k", Body=b"x")
+    assert r2.get("ServerSideEncryption") == "aws:kms", r2
+    assert r2.get("SSEKMSKeyId", "").endswith("key/abc"), r2
+
+    # A bucket without explicit encryption does not stamp the header here.
+    bkt3 = f"noenc-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt3)
+    r3 = s3.put_object(Bucket=bkt3, Key="k", Body=b"x")
+    assert "ServerSideEncryption" not in r3, r3
+
+
+def test_s3_copy_object_source_date_preconditions(s3):
+    """CopyObject honours the copy-source date preconditions with AWS precedence:
+    If-Match beats If-Unmodified-Since, If-None-Match beats If-Modified-Since.
+    (#1322, rest of defect 7)"""
+    from datetime import datetime, timedelta, timezone
+
+    bkt = f"copycond-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    src_etag = s3.put_object(Bucket=bkt, Key="src", Body=b"data")["ETag"]
+    past = datetime.now(timezone.utc) - timedelta(days=1)
+    future = datetime.now(timezone.utc) + timedelta(days=1)
+
+    def copy(**kw):
+        return s3.copy_object(Bucket=bkt, Key="dst",
+                              CopySource={"Bucket": bkt, "Key": "src"}, **kw)
+
+    # If-Unmodified-Since in the past -> source modified after -> 412.
+    with pytest.raises(ClientError) as e:
+        copy(CopySourceIfUnmodifiedSince=past)
+    assert e.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+    # In the future -> succeeds.
+    copy(CopySourceIfUnmodifiedSince=future)
+
+    # If-Modified-Since in the future -> not modified since -> 412.
+    with pytest.raises(ClientError) as e2:
+        copy(CopySourceIfModifiedSince=future)
+    assert e2.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+    # In the past -> succeeds.
+    copy(CopySourceIfModifiedSince=past)
+
+    # Precedence: If-Match true wins over a failing If-Unmodified-Since -> copies.
+    copy(CopySourceIfMatch=src_etag, CopySourceIfUnmodifiedSince=past)
+
+    # Precedence: If-None-Match matching (fails) wins over If-Modified-Since -> 412.
+    with pytest.raises(ClientError) as e3:
+        copy(CopySourceIfNoneMatch=src_etag, CopySourceIfModifiedSince=past)
+    assert e3.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+
+
+def test_s3_canned_acl_expands_to_group_grants(s3):
+    """A canned ACL (at PutObject or PutObjectAcl) expands to the group grants it
+    implies: public-read -> AllUsers READ; authenticated-read -> AuthenticatedUsers
+    READ; plus the owner's FULL_CONTROL. Invalid canned values are rejected. (#1322)"""
+    bkt = f"acl-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+
+    def grants(key):
+        acl = s3.get_object_acl(Bucket=bkt, Key=key)
+        return [(g["Grantee"].get("URI", g["Grantee"].get("ID")), g["Permission"])
+                for g in acl["Grants"]]
+
+    # Canned ACL at PutObject time.
+    s3.put_object(Bucket=bkt, Key="pub", Body=b"x", ACL="public-read")
+    g = grants("pub")
+    assert ("http://acs.amazonaws.com/groups/global/AllUsers", "READ") in g, g
+    assert any(perm == "FULL_CONTROL" for _, perm in g), g
+
+    # Canned ACL via PutObjectAcl subresource.
+    s3.put_object(Bucket=bkt, Key="auth", Body=b"x")
+    s3.put_object_acl(Bucket=bkt, Key="auth", ACL="authenticated-read")
+    assert ("http://acs.amazonaws.com/groups/global/AuthenticatedUsers", "READ") in grants("auth")
+
+    # public-read-write adds AllUsers WRITE too.
+    s3.put_object(Bucket=bkt, Key="rw", Body=b"x", ACL="public-read-write")
+    grw = grants("rw")
+    assert ("http://acs.amazonaws.com/groups/global/AllUsers", "WRITE") in grw, grw
+
+    # Invalid canned ACL is rejected.
+    with pytest.raises(ClientError) as e:
+        s3.put_object(Bucket=bkt, Key="bad", Body=b"x", ACL="nonsense-acl")
+    assert e.value.response["Error"]["Code"] == "InvalidArgument", e.value.response["Error"]
+
+
+def test_s3_list_delimiter_next_marker_is_common_prefix(s3):
+    """When a delimited page ends on a collapsed group, NextMarker is the common
+    prefix (boo/), not an underlying key, and resuming from it walks the rest of
+    the bucket without re-emitting the group. (#1322, defect 5)"""
+    bkt = f"delim-nm-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    for k in ("asdf", "boo/bar", "boo/baz/xyzzy", "cquux/thud", "cquux/bla"):
+        s3.put_object(Bucket=bkt, Key=k, Body=b"x")
+
+    # Page 1: marker=asdf, one row -> CommonPrefix boo/, NextMarker boo/.
+    p1 = s3.list_objects(Bucket=bkt, Delimiter="/", MaxKeys=1, Marker="asdf")
+    assert p1["IsTruncated"] is True
+    assert [c["Prefix"] for c in p1.get("CommonPrefixes", [])] == ["boo/"]
+    assert p1["NextMarker"] == "boo/"
+
+    # Page 2: resume from boo/ -> cquux/ only, no repeat of boo/, terminates.
+    p2 = s3.list_objects(Bucket=bkt, Delimiter="/", MaxKeys=1, Marker=p1["NextMarker"])
+    assert [c["Prefix"] for c in p2.get("CommonPrefixes", [])] == ["cquux/"]
+    assert p2.get("IsTruncated") is False
+
+    # Full unpaginated listing: the top-level view is asdf + boo/ + cquux/.
+    full = s3.list_objects(Bucket=bkt, Delimiter="/")
+    assert [c["Key"] for c in full.get("Contents", [])] == ["asdf"]
+    assert [c["Prefix"] for c in full.get("CommonPrefixes", [])] == ["boo/", "cquux/"]
