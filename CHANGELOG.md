@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **EC2 — opt-in Docker VM manager (`EC2_VM_MANAGER=docker`)** — `RunInstances` returned a well-formed "running" record and booted nothing, so any workload that needs a reachable box (an SSH jump host, an appliance image under test) silently got an instance no one can connect to. With the flag set, an AMI id that resolves to a locally tagged image (`<EC2_DOCKER_IMAGE_PREFIX>/<name>:<ami-id>`, default prefix `ministack-ec2`, settable to `localstack-ec2` for drop-in migration) boots that image as a container on `DOCKER_NETWORK`: the container IP becomes the instance's private/public address, stop/start/reboot/terminate map onto the container lifecycle, `--user-data` is delivered to `/var/lib/ec2/user-data` and executed when it has a shebang, and `--key-name` injects the key pair's public key into root's `authorized_keys` (`ImportKeyPair` now stores the material; `CreateKeyPair` generates real keys via the bundled openssl/ssh-keygen). Unknown AMI ids and missing Docker keep the historical metadata-only behaviour, so CFN/Terraform workloads are unaffected; a failed container boot fails the call and backs the records out instead of reporting a phantom instance. Containers carry the reaper's ownership labels (`ministack.instance` / `ministack.boot`), a live-ids provider keeps the periodic reaper off anything an instance record still owns, reset sweeps only this MiniStack's boxes, the docker-touching actions run off the event loop, and a container that dies out-of-band downgrades its instance to `stopped` on the next `DescribeInstances`. Requested in #1344. Contributed by @iot-rocket.
+
 ## [1.4.21] — 2026-08-20
 
 ### Added
