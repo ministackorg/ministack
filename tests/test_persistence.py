@@ -646,6 +646,36 @@ def test_backup_round_trip():
     _round_trip("backup", "backup", populate, observe)
 
 
+def test_cloudformation_round_trip():
+    """CloudFormation stack metadata (stacks, events, exports, change sets)
+    survives a PERSIST_STATE stop/restore cycle — otherwise ListStacks /
+    DescribeStacks / ListExports come back empty after a warm boot even though
+    the provisioned resources persist. (#1345, item 8)"""
+    def populate(mod):
+        mod._stacks["stk-rt"] = {
+            "StackName": "stk-rt",
+            "StackId": "arn:aws:cloudformation:us-east-1:000000000000:stack/stk-rt/rt",
+            "StackStatus": "CREATE_COMPLETE",
+            "Outputs": [{"OutputKey": "K", "OutputValue": "V"}],
+        }
+        mod._stack_events["arn:aws:cloudformation:us-east-1:000000000000:stack/stk-rt/rt"] = [
+            {"ResourceStatus": "CREATE_COMPLETE"},
+        ]
+        mod._exports["exp-rt"] = {"Name": "exp-rt", "Value": "V", "ExportingStackId": "stk-rt"}
+        mod._change_sets["cs-rt"] = {"ChangeSetName": "cs-rt", "Status": "CREATE_COMPLETE"}
+
+    def observe(mod):
+        stack = mod._stacks.get("stk-rt")
+        assert stack is not None and stack["StackStatus"] == "CREATE_COMPLETE"
+        assert stack["Outputs"] == [{"OutputKey": "K", "OutputValue": "V"}]
+        assert mod._stack_events.get(
+            "arn:aws:cloudformation:us-east-1:000000000000:stack/stk-rt/rt") is not None
+        assert mod._exports.get("exp-rt") is not None
+        assert mod._change_sets.get("cs-rt") is not None
+
+    _round_trip("cloudformation", "cloudformation", populate, observe)
+
+
 def test_backup_region_scoped_v3_state_is_idempotent(monkeypatch, tmp_path):
     import json as _json
 
