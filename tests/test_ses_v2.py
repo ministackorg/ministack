@@ -266,6 +266,72 @@ def test_ses_v2_email_template_crud(ses_v2):
     assert body["name"] == "NotFoundException"
 
 
+def _create_templates(ses_v2, count, prefix="tpl"):
+    names = [f"{prefix}-{i:02d}" for i in range(count)]
+    for name in names:
+        _call(
+            ses_v2,
+            "POST",
+            "/v2/email/templates",
+            body={"TemplateName": name, "TemplateContent": {"Subject": "S", "Text": "T"}},
+        )
+    return names
+
+
+def test_ses_v2_list_email_templates_pagination_walks_all_items(ses_v2):
+    names = _create_templates(ses_v2, 4)
+
+    seen = []
+    token = None
+    for _ in range(5):
+        query = {"PageSize": ["2"]}
+        if token:
+            query["NextToken"] = [token]
+        status, body = _call(ses_v2, "GET", "/v2/email/templates", query=query)
+        assert status == 200
+        assert len(body["TemplatesMetadata"]) <= 2
+        seen += [t["TemplateName"] for t in body["TemplatesMetadata"]]
+        token = body.get("NextToken")
+        if not token:
+            break
+    else:
+        raise AssertionError("pagination did not terminate")
+
+    assert seen == names
+
+
+def test_ses_v2_list_email_templates_defaults_to_ten_per_page(ses_v2):
+    names = _create_templates(ses_v2, 12)
+
+    status, body = _call(ses_v2, "GET", "/v2/email/templates")
+    assert status == 200
+    assert [t["TemplateName"] for t in body["TemplatesMetadata"]] == names[:10]
+
+    status, body = _call(
+        ses_v2, "GET", "/v2/email/templates", query={"NextToken": [body["NextToken"]]}
+    )
+    assert status == 200
+    assert [t["TemplateName"] for t in body["TemplatesMetadata"]] == names[10:]
+    assert "NextToken" not in body
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        {"PageSize": ["101"]},
+        {"PageSize": ["abc"]},
+        {"NextToken": ["not base64 at all"]},
+    ],
+)
+def test_ses_v2_list_email_templates_rejects_invalid_paging_parameters(ses_v2, query):
+    _create_templates(ses_v2, 2)
+
+    status, body = _call(ses_v2, "GET", "/v2/email/templates", query=query)
+
+    assert status == 400
+    assert body["name"] == "BadRequestException"
+
+
 def test_ses_v2_create_email_template_rejects_duplicates_and_incomplete_requests(ses_v2):
     valid = {"TemplateName": "dup", "TemplateContent": {"Subject": "s", "Text": "t"}}
 

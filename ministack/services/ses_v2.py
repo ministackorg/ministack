@@ -11,6 +11,7 @@ Supports: SendEmail, CreateEmailIdentity, GetEmailIdentity, DeleteEmailIdentity,
 Email templates live in the v1 store, so either API version sees the other's.
 """
 
+import base64
 import copy
 import json
 import logging
@@ -42,6 +43,7 @@ from ministack.services.ses import (
 logger = logging.getLogger("ses-v2")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+TEMPLATE_PAGE_SIZE = 10  # ListEmailTemplates default per the AWS API reference
 
 _identities = AccountRegionScopedDict()  # identity -> dict
 _config_sets = AccountRegionScopedDict()  # name -> dict
@@ -137,6 +139,50 @@ def _query_values(query_params, key):
     if value:
         return [value]
     return []
+
+
+def _encode_page_token(offset):
+    return base64.urlsafe_b64encode(str(offset).encode("ascii")).decode("ascii").rstrip("=")
+
+
+def _decode_page_token(token):
+    if not token:
+        return 0, None
+    try:
+        padded = token + "=" * (-len(token) % 4)
+        offset = int(base64.urlsafe_b64decode(padded.encode("ascii")).decode("ascii"))
+    except (ValueError, UnicodeDecodeError):
+        return 0, _json_err("BadRequestException", f"Invalid NextToken: {token}")
+    if offset < 0:
+        return 0, _json_err("BadRequestException", f"Invalid NextToken: {token}")
+    return offset, None
+
+
+def _page_size(query_params, default, maximum=100):
+    raw = _first_query_value(query_params, "PageSize")
+    if not raw:
+        return default, None
+    try:
+        size = int(raw)
+    except (TypeError, ValueError):
+        return default, _json_err("BadRequestException", f"Invalid PageSize: {raw}")
+    if size < 1 or size > maximum:
+        return default, _json_err(
+            "BadRequestException", f"PageSize must be between 1 and {maximum}"
+        )
+    return size, None
+
+
+def _paginate(items, query_params, default_size):
+    size, err = _page_size(query_params, default_size)
+    if err:
+        return [], None, err
+    start, err = _decode_page_token(_first_query_value(query_params, "NextToken"))
+    if err:
+        return [], None, err
+    end = start + size
+    nxt = _encode_page_token(end) if end < len(items) else None
+    return items[start:end], nxt, None
 
 
 def _template_parts(template_content):
@@ -428,15 +474,23 @@ async def handle_request(method, path, headers, body, query_params):
 
     # GET /v2/email/templates  (ListEmailTemplates)
     if sub == "/templates" and method == "GET":
-        return json_response({
+        page, next_token, err = _paginate(
+            list(_templates.values()), query_params, TEMPLATE_PAGE_SIZE
+        )
+        if err:
+            return err
+        body_out = {
             "TemplatesMetadata": [
                 {
                     "TemplateName": t["TemplateName"],
                     "CreatedTimestamp": t.get("CreatedTimestamp", ""),
                 }
-                for t in _templates.values()
+                for t in page
             ],
-        })
+        }
+        if next_token:
+            body_out["NextToken"] = next_token
+        return json_response(body_out)
 
     # GET/PUT/DELETE /v2/email/templates/{TemplateName}
     m = re.match(r"^/templates/([^/]+)$", sub)
