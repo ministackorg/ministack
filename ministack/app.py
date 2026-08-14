@@ -345,6 +345,7 @@ SERVICE_HANDLERS = {
 # tests/test_persistence.py.
 _state_map = {
     "apigateway": "apigateway", "apigateway_v1": "apigateway_v1",
+    "cloudformation": "cloudformation",
     "sqs": "sqs", "sns": "sns", "ssm": "ssm",
     "secretsmanager": "secretsmanager", "iam": "iam",
     "dynamodb": "dynamodb", "kms": "kms", "eventbridge": "eventbridge",
