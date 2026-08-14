@@ -838,24 +838,42 @@ def _check_cache_value(sql):
     return None
 
 
-# DSQL index rules: btree only (no USING gin/gist/brin/hash/spgist), no
-# CONCURRENTLY (use ASYNC), no partial (WHERE) or expression indexes, and at
-# most 8 columns per index (24 indexes per table is enforced at runtime).
+# DSQL index rules, verified against a live Aurora DSQL cluster (Aug 2026):
+# index creation is always asynchronous — plain CREATE INDEX fails with
+# "unsupported mode". No CONCURRENTLY, no USING (not even btree), no partial
+# (WHERE). IF NOT EXISTS requires a name (grammar). Expression index keys are
+# supported, but every function must be immutable (42P17) and INCLUDE columns
+# can't be expressions. At most 8 key columns per index (54011); 24 indexes
+# per table is enforced at runtime.
+#
+# Error precedence (observed on real DSQL): name-grammar → CONCURRENTLY →
+# USING → WHERE → mode → key-expression rules → key count.
+_VOLATILE_FUNCTIONS = frozenset({
+    "now", "random", "setseed", "nextval", "currval", "lastval", "setval",
+    "gen_random_uuid", "uuid_generate_v1", "uuid_generate_v4",
+    "txid_current", "pg_backend_pid", "pg_notification_queue_usage",
+    "current_setting", "set_config", "version", "clock_timestamp",
+    "statement_timestamp", "transaction_timestamp", "timeofday",
+})
+
+
 def _check_index_rules(sql):
     m = _INDEX_RE.match(sql) or _INDEX_ASYNC_RE.match(sql)
     if not m:
         return None
-    using = re.search(r"\bUSING\s+(\w+)", sql, re.I)
-    if using and using.group(1).lower() not in ("btree", "btree_index"):
-        return DsqlError(
-            "0A000", f"USING {using.group(1)} is not supported (btree only)"
-        )
+    # IF NOT EXISTS without a name is a grammar error on real DSQL.
+    if re.search(r"\bIF\s+NOT\s+EXISTS\b", sql, re.I) and not m.group(1):
+        return DsqlError("42601", 'syntax error at or near "ON"')
     if re.search(r"\bCONCURRENTLY\b", sql, re.I):
-        return DsqlError(
-            "0A000", "CREATE INDEX CONCURRENTLY is not supported — use CREATE INDEX ASYNC"
-        )
+        return DsqlError("0A000", "CONCURRENTLY not supported for CREATE INDEX")
+    if re.search(r"\bUSING\s+\w+", sql, re.I):
+        return DsqlError("0A000", "USING not supported for CREATE INDEX")
     if re.search(r"\bWHERE\b", sql, re.I):
-        return DsqlError("0A000", "partial indexes (WHERE) are not supported")
+        return DsqlError("0A000", "WHERE not supported for CREATE INDEX")
+    if not _INDEX_ASYNC_RE.match(sql):
+        return DsqlError(
+            "0A000", "unsupported mode. please use CREATE INDEX ASYNC."
+        )
     start = sql.find("(", m.end())
     if start < 0:
         return None
@@ -863,11 +881,30 @@ def _check_index_rules(sql):
     if end < 0:
         return None
     parts = _split_top_level(sql[start + 1 : end])
-    if any("(" in part for part in parts):
-        return DsqlError("0A000", "expression indexes are not supported")
+    for part in parts:
+        for fn in re.findall(r"(\w+)\s*\(", part):
+            if fn.lower() in _VOLATILE_FUNCTIONS:
+                # Same code/message the backend (and real DSQL) produce; the
+                # proxy fails fast so CREATE INDEX ASYNC rejects at submit
+                # time instead of returning a job_id.
+                return DsqlError(
+                    "42P17",
+                    "functions in index expression must be marked IMMUTABLE",
+                )
+    # INCLUDE columns are non-key: expressions are not supported there.
+    inc = re.search(r"\bINCLUDE\s*\(", sql[end:], re.I)
+    if inc:
+        istart = end + inc.end() - 1
+        iend = _match_paren(sql, istart)
+        if iend > 0 and any(
+            "(" in p for p in _split_top_level(sql[istart + 1 : iend])
+        ):
+            return DsqlError(
+                "0A000", "expressions are not supported in included columns"
+            )
     if len(parts) > 8:
         return DsqlError(
-            "0A000", f"indexes cannot have more than 8 columns ({len(parts)} given)"
+            "54011", "more than 8 column keys in an index are not supported"
         )
     return None
 
@@ -905,15 +942,6 @@ def rewrite_index_async(sql):
     return re.sub(
         r"(CREATE\s+(?:UNIQUE\s+)?INDEX)\s+ASYNC", r"\1", sql, count=1, flags=re.I
     )
-
-
-def is_plain_create_index(sql):
-    return bool(_INDEX_RE.match(sql)) and not _INDEX_ASYNC_RE.match(sql)
-
-
-def create_index_table(sql):
-    m = _INDEX_RE.match(sql) or _INDEX_ASYNC_RE.match(sql)
-    return m.group(2) if m else None
 
 
 def _index_object_name(sql, on_end, index_name, table):
@@ -1184,22 +1212,6 @@ async def _run_backend_capture(conn, b_writer, sql):
         conn.capture = None
 
 
-async def _table_has_rows(conn, b_writer, table):
-    """Probe SELECT 1 FROM <table> LIMIT 1 on the client's backend connection."""
-    try:
-        frames = await _run_backend_capture(
-            conn, b_writer, f"SELECT 1 FROM {table} LIMIT 1"
-        )
-    except Exception:
-        return False
-    for type_byte, _ in frames:
-        if type_byte == b"E":
-            return False  # probe failed — forward original; backend errors
-        if type_byte == b"D":
-            return True
-    return False
-
-
 async def _index_count(conn, b_writer, table):
     """Count the table's existing indexes via pg_indexes. None on probe error."""
     schema, _, bare = table.rpartition(".")
@@ -1342,10 +1354,8 @@ async def _check_drop_column(conn, b_writer, sql):
     lowered = {c.lower() for c in pk_cols}
     for col in cols:
         if col.lower() in lowered:
-            return DsqlError(
-                "0A000",
-                f'dropping primary key column "{col}" is not supported',
-            )
+            # Exact message from real DSQL (verified in eu-west-2, Aug 2026).
+            return DsqlError("0A000", f"cannot drop primary key column {col}")
     return None
 
 
@@ -1457,18 +1467,6 @@ async def _plan_statement(conn, s, b_writer, allow_probe=True):
                     f"table {result.table} already has the maximum of 24 indexes",
                 )
         return "rewrite", result
-
-    if is_plain_create_index(s):
-        table = create_index_table(s)
-        if table and allow_probe:
-            count = await _index_count(conn, b_writer, table)
-            if count is not None and count >= 24:
-                return "error", DsqlError(
-                    "0A000", f"table {table} already has the maximum of 24 indexes"
-                )
-            if await _table_has_rows(conn, b_writer, table):
-                return "error", DsqlError("0A000", "use CREATE INDEX ASYNC instead")
-        return "forward", None
 
     if allow_probe:
         err = await _check_drop_column(conn, b_writer, s)
