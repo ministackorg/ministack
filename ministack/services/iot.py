@@ -644,22 +644,49 @@ def _handle_thing_type(method: str, path: str, body: bytes, qp: dict) -> tuple:
     )
 
 
+def _thing_type_props_identity(props: dict) -> tuple:
+    """Comparable identity of a thingTypeProperties block.
+
+    Covers every member the API models, so a re-create differing only in
+    mqtt5Configuration is a genuine conflict rather than a silent no-op.
+    Absent, None and empty compare equal, and searchableAttributes is
+    compared as a set because AWS treats it as unordered.
+    """
+    return (
+        props.get("thingTypeDescription") or None,
+        frozenset(props.get("searchableAttributes") or ()),
+        json.dumps(props.get("mqtt5Configuration") or None, sort_keys=True),
+    )
+
+
 def _create_thing_type(name: str, payload: dict) -> tuple:
-    if name in _thing_types:
+    props = payload.get("thingTypeProperties") or {}
+    existing = _thing_types.get(name)
+    if existing is not None:
+        # Idempotent: same properties return success; different properties 409.
+        stored = existing.get("thingTypeProperties") or {}
+        if _thing_type_props_identity(stored) == _thing_type_props_identity(props):
+            return json_response({
+                "thingTypeName": existing["thingTypeName"],
+                "thingTypeArn": existing["thingTypeArn"],
+                "thingTypeId": existing["thingTypeId"],
+            })
         return error_response_json(
             "ResourceAlreadyExistsException",
-            f"ThingType {name!r} already exists",
+            f"ThingType {name!r} already exists with different properties",
             409,
         )
-    props = payload.get("thingTypeProperties") or {}
+    stored_props = {
+        "thingTypeDescription": props.get("thingTypeDescription"),
+        "searchableAttributes": list(props.get("searchableAttributes", []) or []),
+    }
+    if props.get("mqtt5Configuration"):
+        stored_props["mqtt5Configuration"] = props["mqtt5Configuration"]
     record = {
         "thingTypeName": name,
         "thingTypeId": new_uuid(),
         "thingTypeArn": _thing_type_arn(name),
-        "thingTypeProperties": {
-            "thingTypeDescription": props.get("thingTypeDescription"),
-            "searchableAttributes": list(props.get("searchableAttributes", []) or []),
-        },
+        "thingTypeProperties": stored_props,
         "thingTypeMetadata": {
             "deprecated": False,
             "deprecationDate": None,
@@ -667,6 +694,7 @@ def _create_thing_type(name: str, payload: dict) -> tuple:
         },
     }
     _thing_types[name] = record
+    logger.info("IoT Thing Type created: %s", name)
     return json_response({
         "thingTypeName": name,
         "thingTypeArn": record["thingTypeArn"],

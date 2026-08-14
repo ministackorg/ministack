@@ -624,6 +624,76 @@ def test_sfn_intrinsic_format_escapes(sfn, sfn_sync):
     assert output["backslash"] == "C:\\tmp"
     assert output["preserved"] == "path: C:\\tmp\\file"
 
+def test_sfn_intrinsic_base64(sfn, sfn_sync):
+    """States.Base64Encode / Decode round-trip, nest, and decode leniently."""
+    definition = json.dumps({
+        "StartAt": "B64",
+        "States": {
+            "B64": {
+                "Type": "Pass",
+                "Parameters": {
+                    "encoded.$": "States.Base64Encode($.text)",
+                    "decoded.$": "States.Base64Decode($.b64)",
+                    "unpadded.$": "States.Base64Decode('aGVsbG8')",
+                    "utf8.$": "States.Base64Encode($.accented)",
+                    "empty.$": "States.Base64Encode('')",
+                    # The common shape: build a string, then encode it for an API that takes
+                    # base64 only. Encode has to accept another intrinsic's result, not just a path.
+                    "nested.$": "States.Base64Encode(States.Format('run {} now', $.text))",
+                    "roundtrip.$": "States.Base64Decode(States.Base64Encode($.text))",
+                },
+                "End": True,
+            }
+        },
+    })
+    sm = sfn.create_state_machine(
+        name=f"sfn-intrinsic-b64-{_uuid_mod.uuid4().hex[:8]}",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    resp = sfn_sync.start_sync_execution(
+        stateMachineArn=sm["stateMachineArn"],
+        input=json.dumps({"text": "hello", "b64": "RGF0YSB0byBlbmNvZGU=", "accented": "héllo→"}),
+    )
+    assert resp["status"] == "SUCCEEDED", resp.get("cause")
+    output = json.loads(resp["output"])
+    assert output["encoded"] == "aGVsbG8="
+    assert output["decoded"] == "Data to encode"
+    assert output["unpadded"] == "hello"
+    # UTF-8, not latin-1: "héllo→" is nine bytes, so twelve base64 characters.
+    assert output["utf8"] == "aMOpbGxv4oaS"
+    assert output["empty"] == ""
+    assert output["nested"] == "cnVuIGhlbGxvIG5vdw=="
+    assert output["roundtrip"] == "hello"
+
+
+def test_sfn_intrinsic_base64_rejects_what_aws_rejects(sfn, sfn_sync):
+    """Both base64 intrinsics cap input at 10,000 characters and require a string."""
+    def run(params, payload):
+        sm = sfn.create_state_machine(
+            name=f"sfn-b64-bad-{_uuid_mod.uuid4().hex[:8]}",
+            definition=json.dumps({"StartAt": "B", "States": {
+                "B": {"Type": "Pass", "Parameters": params, "End": True}}}),
+            roleArn="arn:aws:iam::000000000000:role/R",
+        )
+        return sfn_sync.start_sync_execution(stateMachineArn=sm["stateMachineArn"],
+                                             input=json.dumps(payload))
+
+    ok = run({"out.$": "States.Base64Encode($.s)"}, {"s": "a" * 10_000})
+    assert ok["status"] == "SUCCEEDED", ok.get("cause")
+    assert len(json.loads(ok["output"])["out"]) == 13336
+
+    for params, payload, fn in (
+        ({"out.$": "States.Base64Encode($.s)"}, {"s": "a" * 10_001}, "States.Base64Encode"),
+        ({"out.$": "States.Base64Encode($.n)"}, {"n": 123}, "States.Base64Encode"),
+        ({"out.$": "States.Base64Decode($.s)"}, {"s": "YQ==" * 5_000}, "States.Base64Decode"),
+    ):
+        resp = run(params, payload)
+        assert resp["status"] == "FAILED", resp.get("output")
+        assert resp.get("error") == "States.Runtime", resp
+        assert f"Invalid arguments in {fn}" in (resp.get("cause") or ""), resp.get("cause")
+
+
 def test_sfn_intrinsic_nested(sfn, sfn_sync):
     """Nested intrinsic: States.StringToJson(States.Format(...))"""
     definition = json.dumps({
@@ -5487,6 +5557,196 @@ def test_sfn_aws_sdk_s3_op_specs_cover_issue_573_request():
 
     assert "ListObjectsV2" in _S3_OP_SPECS
     assert "CopyObject" in _S3_OP_SPECS
+
+
+def test_sfn_aws_sdk_s3_error_names_the_sdk_exception(sfn_sync):
+    """A failing S3 op is named after the SDK exception class, as real Step Functions names it."""
+    tag = _uuid_mod.uuid4().hex[:8]
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=f"sdk-s3-err-{tag}",
+        definition=json.dumps({
+            "StartAt": "Del",
+            "States": {
+                "Del": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:s3:deleteBucket",
+                    "Parameters": {"Bucket": f"absent-{tag}"},
+                    "End": True,
+                },
+            },
+        }),
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+        assert resp["status"] == "FAILED"
+        assert resp.get("error") == "S3.NoSuchBucketException", resp.get("error")
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+# ---------------------------------------------------------------------------
+# REST-XML aws-sdk dispatch (Route 53)
+# ---------------------------------------------------------------------------
+
+
+def _r53_change_task(sfn_sync, tag, params, action="changeResourceRecordSets"):
+    """Run one aws-sdk:route53 task to completion and return the sync-execution response."""
+    arn = sfn_sync.create_state_machine(
+        name=f"sdk-r53-{tag}-{_uuid_mod.uuid4().hex[:6]}",
+        definition=json.dumps({
+            "StartAt": "Change",
+            "States": {
+                "Change": {
+                    "Type": "Task",
+                    "Resource": f"arn:aws:states:::aws-sdk:route53:{action}",
+                    "Parameters": params,
+                    "End": True,
+                },
+            },
+        }),
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+    try:
+        return sfn_sync.start_sync_execution(stateMachineArn=arn, input=json.dumps({}))
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=arn)
+
+
+def test_sfn_aws_sdk_route53_change_resource_record_sets(sfn_sync, r53):
+    """aws-sdk:route53:changeResourceRecordSets writes the record, and deletes it again."""
+    tag = _uuid_mod.uuid4().hex[:8]
+    zone_name = f"sfn-r53-{tag}.example.com."
+    record = f"api.{zone_name}"
+    values = ["10.0.0.1", "10.0.0.2"]
+    zone_id = None
+
+    def batch(action):
+        return {"Comment": f"sfn {tag}",
+                "Changes": [{"Action": action,
+                             "ResourceRecordSet": {"Name": record, "Type": "A", "TTL": 60,
+                                                   "ResourceRecords": [{"Value": v}
+                                                                       for v in values]}}]}
+
+    def a_records(zone):
+        return [rs for rs in r53.list_resource_record_sets(HostedZoneId=zone)["ResourceRecordSets"]
+                if rs["Name"] == record and rs["Type"] == "A"]
+
+    try:
+        zone_id = r53.create_hosted_zone(
+            Name=zone_name, CallerReference=f"sfn-{tag}")["HostedZone"]["Id"]
+        bare_id = zone_id.rsplit("/", 1)[-1]
+
+        resp = _r53_change_task(sfn_sync, tag, {"HostedZoneId": bare_id,
+                                                "ChangeBatch": batch("UPSERT")})
+        assert resp["status"] == "SUCCEEDED", f"{resp.get('error')} — {resp.get('cause')}"
+        info = json.loads(resp["output"])["ChangeInfo"]
+        assert info["Id"].startswith("/change/")
+        assert info["Status"] in ("PENDING", "INSYNC")
+        assert info["SubmittedAt"]
+
+        # Task success is not the assertion: a flattened XML body loses values silently.
+        got = a_records(bare_id)
+        assert len(got) == 1, got
+        assert sorted(r["Value"] for r in got[0]["ResourceRecords"]) == values
+        assert str(got[0]["TTL"]) == "60"
+
+        # The bare id is the only form that works; AWS rejects "/hostedzone/Z..." unchanged.
+        resp = _r53_change_task(sfn_sync, tag, {"HostedZoneId": bare_id,
+                                               "ChangeBatch": batch("DELETE")})
+        assert resp["status"] == "SUCCEEDED", f"{resp.get('error')} — {resp.get('cause')}"
+        assert a_records(bare_id) == []
+    finally:
+        if zone_id:
+            try:
+                r53.delete_hosted_zone(Id=zone_id)
+            except ClientError:
+                pass
+
+
+def test_sfn_aws_sdk_route53_request_matches_botocore():
+    """The request this dispatcher builds must be the one boto3 would have sent."""
+    import botocore.session
+    from botocore.serialize import create_serializer
+
+    from ministack.services.stepfunctions import (
+        _ROUTE53_OP_SPECS,
+        _rest_xml_build_body,
+        _rest_xml_substitute_path,
+    )
+
+    change_batch = {
+        "Comment": "c",
+        "Changes": [{"Action": "UPSERT",
+                     "ResourceRecordSet": {"Name": "a.example.com", "Type": "A", "TTL": 60,
+                                           "ResourceRecords": [{"Value": "1.2.3.4"},
+                                                               {"Value": "5.6.7.8"}]}}],
+    }
+    params = {"HostedZoneId": "Z123ABC", "ChangeBatch": change_batch}
+
+    op = botocore.session.get_session().get_service_model("route53").operation_model(
+        "ChangeResourceRecordSets")
+    want = create_serializer("rest-xml").serialize_to_request(params, op)
+    want_body = want["body"].decode("utf-8") if isinstance(want["body"], bytes) else want["body"]
+
+    spec = _ROUTE53_OP_SPECS["ChangeResourceRecordSets"]
+    assert _rest_xml_substitute_path(spec["path"], params, spec) == want["url_path"]
+    assert _rest_xml_build_body(spec["body_wrapper"], {"ChangeBatch": change_batch},
+                                spec["list_members"],
+                                spec["body_xmlns"]).decode("utf-8") == want_body
+
+    # Verbatim: fix_route53_ids runs inside boto3, not Step Functions, and AWS rejects this form.
+    assert _rest_xml_substitute_path(
+        spec["path"], {"HostedZoneId": "/hostedzone/Z123ABC"}, spec) == (
+        "/2013-04-01/hostedzone//hostedzone/Z123ABC/rrset/")
+
+
+def test_sfn_aws_sdk_route53_ttl_uses_the_sdk_spelling(sfn_sync, r53):
+    """"Ttl" in Parameters has to reach route53 as <TTL>, or the record loses its TTL silently."""
+    tag = _uuid_mod.uuid4().hex[:8]
+    zone = r53.create_hosted_zone(Name=f"ttl-{tag}.example.com.",
+                                  CallerReference=_uuid_mod.uuid4().hex)["HostedZone"]
+    zone_id = zone["Id"].rsplit("/", 1)[-1]
+    name = f"rec.ttl-{tag}.example.com."
+
+    resp = _r53_change_task(sfn_sync, tag, {
+        "HostedZoneId": zone_id,
+        "ChangeBatch": {"Changes": [{"Action": "UPSERT", "ResourceRecordSet": {
+            "Name": name, "Type": "A", "Ttl": 60,
+            "ResourceRecords": [{"Value": "10.0.0.1"}]}}]},
+    })
+    assert resp["status"] == "SUCCEEDED", resp.get("cause")
+
+    got = [r for r in r53.list_resource_record_sets(HostedZoneId=zone_id)["ResourceRecordSets"]
+           if r["Name"] == name]
+    assert len(got) == 1, got
+    assert got[0].get("TTL") == 60, f"TTL dropped, record stored as {got[0]}"
+
+
+def test_sfn_aws_sdk_route53_errors_name_their_service(sfn_sync):
+    """A route53 failure is Route53.<Code>Exception, and an unmapped op names the covered ops."""
+    tag = _uuid_mod.uuid4().hex[:8]
+
+    resp = _r53_change_task(sfn_sync, tag, {
+        "HostedZoneId": "Z00000000000000000000",
+        "ChangeBatch": {"Changes": [{"Action": "UPSERT",
+                                     "ResourceRecordSet": {"Name": f"x.{tag}.example.com.",
+                                                           "Type": "A", "TTL": 60,
+                                                           "ResourceRecords": [
+                                                               {"Value": "10.0.0.9"}]}}]},
+    })
+    # Route 53 nests Code under <Error> with a default xmlns; both have to be seen through.
+    assert resp["status"] == "FAILED"
+    assert resp.get("error") == "Route53.NoSuchHostedZoneException", resp.get("cause")
+
+    # An operation with no spec names the ones that do have one, per service.
+    resp = _r53_change_task(sfn_sync, tag, {"MaxItems": "1"}, action="listHostedZones")
+    assert resp["status"] == "FAILED"
+    cause = resp.get("cause") or ""
+    assert "not yet implemented" in cause and "ChangeResourceRecordSets" in cause
+
+
 # ---------------------------------------------------------------------------
 # Terraform compatibility tests
 # ---------------------------------------------------------------------------

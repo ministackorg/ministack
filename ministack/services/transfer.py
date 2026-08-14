@@ -797,7 +797,8 @@ def _ensure_sftp_runtime() -> None:
     if _MiniStackSFTPServer is not None:
         return
     import asyncssh as _mod
-    from asyncssh.sftp import SFTPAttrs as _A, SFTPName as _N
+    from asyncssh.sftp import SFTPAttrs as _A
+    from asyncssh.sftp import SFTPName as _N
     asyncssh, SFTPAttrs, SFTPName = _mod, _A, _N
 
     class _MiniStackSSHServer(asyncssh.SSHServer if _ASYNCSSH_AVAILABLE else object):

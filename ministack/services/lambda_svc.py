@@ -1563,11 +1563,15 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
                 if policy_sub == "policy":
                     policy_sid = parts[7] if len(parts) > 7 else None
                     if method == "POST" and not policy_sid:
-                        return _add_layer_version_permission(layer_name, ver_num, data)
+                        return _add_layer_version_permission(
+                            layer_name, ver_num, data, query_params
+                        )
                     if method == "GET" and not policy_sid:
                         return _get_layer_version_policy(layer_name, ver_num)
                     if method == "DELETE" and policy_sid:
-                        return _remove_layer_version_permission(layer_name, ver_num, policy_sid)
+                        return _remove_layer_version_permission(
+                            layer_name, ver_num, policy_sid, query_params
+                        )
                 if method == "GET":
                     return _get_layer_version(layer_name, ver_num)
                 if method == "DELETE":
@@ -3145,6 +3149,38 @@ def _docker_cp_dir(container, src_dir: str, dest_dir: str, arcname: str = "."):
     container.put_archive(dest_dir, buf)
 
 
+def _classify_function_error(parsed, err_header: str) -> str | None:
+    """Classify an RIE response body/header as a function error.
+
+    Returns ``"Unhandled"``, ``"Handled"``, or ``None`` when the response is
+    not an error at all. If 'X-Amz-Function-Error' /
+    'Lambda-Runtime-Function-Error-Type' is set the error flag passes
+    through as Unhandled. Observed on the RIE bundled with the current
+    public.ecr.aws/lambda/{python:3.12,nodejs:22,provided:al2023} images, no
+    error header is returned on the invocation response — not for a raised
+    handler exception, and not even when a custom runtime POSTs to
+    /runtime/invocation/<id>/error with its own error-type header — so
+    classification falls back to the payload shape.
+
+    The runtime's own error serialization is {errorType, errorMessage} plus
+    a per-runtime traceback field whose key and presence vary: Python sends
+    "stackTrace", empty for init failures such as Runtime.ImportModuleError;
+    Node.js sends "trace"; Go and the provided.* runtimes send neither. So
+    any error-shaped payload counts as the runtime's (→ Unhandled, matching
+    real AWS) unless it also carries a statusCode, which marks an HTTP-style
+    envelope the handler returned itself (→ Handled). A handler that returns
+    a bare {errorType, errorMessage} dict is indistinguishable from a
+    Go-style runtime error over this wire and is reported Unhandled; the
+    misreport that actually breaks consumers is the other direction, since
+    API Gateway keys its 502 contract off Unhandled.
+    """
+    if err_header:
+        return "Unhandled"
+    if not (isinstance(parsed, dict) and parsed.get("errorType")):
+        return None
+    return "Handled" if "statusCode" in parsed else "Unhandled"
+
+
 def _invoke_rie(container, event: dict, timeout: int) -> dict:
     """POST event to a running RIE container's HTTP endpoint."""
     import urllib.request
@@ -3193,18 +3229,13 @@ def _invoke_rie(container, event: dict, timeout: int) -> dict:
             except json.JSONDecodeError:
                 parsed = body
             logs = container.logs(stdout=True, stderr=True, since=invoke_time).decode("utf-8", errors="replace").strip()
-            # RIE sets 'Lambda-Runtime-Function-Error-Type' (or bare
-            # 'X-Amz-Function-Error') when the handler raised an unhandled
-            # exception. If it's set we surface the error flag + propagate the
-            # exact AWS-style marker so _invoke can emit the right header.
             err_header = (resp.headers.get("X-Amz-Function-Error")
                           or resp.headers.get("Lambda-Runtime-Function-Error-Type") or "")
             result = {"body": parsed, "log": logs}
-            if err_header or (isinstance(parsed, dict) and parsed.get("errorType")):
-                # errorType without an X-Amz header means the handler returned
-                # an error-shaped payload itself — AWS signals this as Handled.
+            function_error = _classify_function_error(parsed, err_header)
+            if function_error is not None:
                 result["error"] = True
-                result["function_error"] = "Unhandled" if err_header else "Handled"
+                result["function_error"] = function_error
             return result
         except (urllib.error.URLError, ConnectionRefusedError, OSError):
             time.sleep(0.1)
@@ -4892,6 +4923,7 @@ def _publish_layer_version(layer_name: str, data: dict):
         },
         "_zip_data": zip_data,
         "_policy": {"Version": "2012-10-17", "Id": "default", "Statement": []},
+        "_policy_revision_id": new_uuid(),
     }
     layer["versions"].append(ver_config)
     out = {k: v for k, v in ver_config.items() if not k.startswith("_")}
@@ -5076,7 +5108,55 @@ def _find_layer_version(
     )
 
 
-def _add_layer_version_permission(layer_name: str, version: int, data: dict):
+# A layer version's permission policy carries its own revision id, bumped on
+# every successful mutation. Callers pass the one they last read back as the
+# ``RevisionId`` query parameter to get optimistic concurrency; a stale one is
+# rejected with PreconditionFailedException (412) rather than silently
+# clobbering a policy that changed underneath them.
+_LAYER_PRINCIPAL_RE = re.compile(r"^(\d{12}|\*|arn:aws[a-zA-Z-]*:iam::\d{12}:root)$")
+
+
+def _layer_policy_revision_id(vc: dict) -> str:
+    """Return the layer version policy's current revision id, minting one for
+    layer versions published before revision ids were tracked."""
+    revision_id = vc.get("_policy_revision_id")
+    if not revision_id:
+        revision_id = new_uuid()
+        vc["_policy_revision_id"] = revision_id
+    return revision_id
+
+
+def _layer_policy_revision_mismatch(vc: dict, query_params: dict | None):
+    """Return a 412 response when the caller's RevisionId is not the current one."""
+    requested = _qp_first(query_params or {}, "RevisionId")
+    if requested and requested != _layer_policy_revision_id(vc):
+        return error_response_json(
+            "PreconditionFailedException",
+            "The RevisionId provided does not match the latest RevisionId for the layer "
+            "version policy. Call the GetLayerVersionPolicy API to retrieve the latest "
+            "RevisionId for your resource.",
+            412,
+        )
+    return None
+
+
+def _layer_statement_principal(principal: str):
+    """Render an AddLayerVersionPermission principal the way the policy document
+    reports it: an account id becomes that account's root user ARN, ``*`` stays
+    the bare wildcard."""
+    if principal == "*":
+        return "*"
+    if principal.isdigit():
+        return {"AWS": f"arn:aws:iam::{principal}:root"}
+    return {"AWS": principal}
+
+
+def _add_layer_version_permission(
+    layer_name: str,
+    version: int,
+    data: dict,
+    query_params: dict | None = None,
+):
     vc, err = _find_layer_version(layer_name, version)
     if err:
         return err
@@ -5089,6 +5169,28 @@ def _add_layer_version_permission(layer_name: str, version: int, data: dict):
             "constraint: Member must satisfy regular expression pattern: lambda:GetLayerVersion",
             400,
         )
+
+    principal = data.get("Principal", "")
+    if not _LAYER_PRINCIPAL_RE.match(principal):
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{principal}' at 'principal' failed to "
+            "satisfy constraint: Member must satisfy regular expression pattern: "
+            r"\d{12}|\*|arn:(aws[a-zA-Z-]*):iam::\d{12}:root",
+            400,
+        )
+
+    org_id = data.get("OrganizationId")
+    if org_id and principal != "*":
+        return error_response_json(
+            "InvalidParameterValueException",
+            "The principal must be * when an organization id is provided.",
+            400,
+        )
+
+    err = _layer_policy_revision_mismatch(vc, query_params)
+    if err:
+        return err
 
     sid = data.get("StatementId", "")
     policy = vc.setdefault("_policy", {"Version": "2012-10-17", "Id": "default", "Statement": []})
@@ -5104,26 +5206,35 @@ def _add_layer_version_permission(layer_name: str, version: int, data: dict):
     statement = {
         "Sid": sid,
         "Effect": "Allow",
-        "Principal": data.get("Principal", "*"),
+        "Principal": _layer_statement_principal(principal),
         "Action": action,
         "Resource": vc["LayerVersionArn"],
     }
-    org_id = data.get("OrganizationId")
     if org_id:
         statement["Condition"] = {"StringEquals": {"aws:PrincipalOrgID": org_id}}
 
     policy["Statement"].append(statement)
+    vc["_policy_revision_id"] = new_uuid()
     return json_response(
         {
             "Statement": json.dumps(statement),
-            "RevisionId": new_uuid(),
+            "RevisionId": vc["_policy_revision_id"],
         },
         201,
     )
 
 
-def _remove_layer_version_permission(layer_name: str, version: int, sid: str):
+def _remove_layer_version_permission(
+    layer_name: str,
+    version: int,
+    sid: str,
+    query_params: dict | None = None,
+):
     vc, err = _find_layer_version(layer_name, version)
+    if err:
+        return err
+
+    err = _layer_policy_revision_mismatch(vc, query_params)
     if err:
         return err
 
@@ -5136,6 +5247,7 @@ def _remove_layer_version_permission(layer_name: str, version: int, sid: str):
             f"Statement {sid} is not found in resource policy.",
             404,
         )
+    vc["_policy_revision_id"] = new_uuid()
     return 204, {}, b""
 
 
@@ -5154,7 +5266,7 @@ def _get_layer_version_policy(layer_name: str, version: int):
     return json_response(
         {
             "Policy": json.dumps(policy),
-            "RevisionId": new_uuid(),
+            "RevisionId": _layer_policy_revision_id(vc),
         }
     )
 
