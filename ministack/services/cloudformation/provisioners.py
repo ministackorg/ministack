@@ -295,6 +295,74 @@ def _opensearch_domain_delete(physical_id, props):
 
 # --- S3 Bucket ---
 
+def _s3_notification_json_to_xml(notif: dict) -> bytes:
+    """Serialize an ``AWS::S3::Bucket`` ``NotificationConfiguration`` (CloudFormation
+    JSON) into the S3 REST XML that ``_put_bucket_notification`` parses. The property
+    names differ between the CloudFormation resource and the S3 API:
+    ``Function``→``LambdaFunctionArn``, ``Event`` (single string)→``Event``,
+    ``Filter.S3Key.Rules``→``Filter.S3Key.FilterRule``; ``Queue``/``Topic`` keep their
+    names. ``EventBridgeConfiguration.EventBridgeEnabled`` (bool) becomes the S3 API's
+    presence-only empty element."""
+    from xml.etree.ElementTree import Element, SubElement, tostring
+
+    root = Element("NotificationConfiguration", xmlns=_s3.S3_NS)
+
+    def _events(entry):
+        ev = entry.get("Event")
+        if isinstance(ev, list):
+            return [str(e) for e in ev if e]
+        return [str(ev)] if ev else []
+
+    def _add_common(cfg_el, entry):
+        if entry.get("Id"):
+            SubElement(cfg_el, "Id").text = str(entry["Id"])
+        for ev in _events(entry):
+            SubElement(cfg_el, "Event").text = ev
+        s3key = ((entry.get("Filter") or {}).get("S3Key") or {})
+        rules = s3key.get("Rules") or []
+        if rules:
+            s3key_el = SubElement(SubElement(cfg_el, "Filter"), "S3Key")
+            for rule in rules:
+                rule_el = SubElement(s3key_el, "FilterRule")
+                SubElement(rule_el, "Name").text = str(rule.get("Name", ""))
+                SubElement(rule_el, "Value").text = str(rule.get("Value", ""))
+
+    for entry in notif.get("LambdaConfigurations") or []:
+        cfg = SubElement(root, "LambdaFunctionConfiguration")
+        SubElement(cfg, "LambdaFunctionArn").text = str(entry.get("Function", ""))
+        _add_common(cfg, entry)
+    for entry in notif.get("QueueConfigurations") or []:
+        cfg = SubElement(root, "QueueConfiguration")
+        SubElement(cfg, "Queue").text = str(entry.get("Queue", ""))
+        _add_common(cfg, entry)
+    for entry in notif.get("TopicConfigurations") or []:
+        cfg = SubElement(root, "TopicConfiguration")
+        SubElement(cfg, "Topic").text = str(entry.get("Topic", ""))
+        _add_common(cfg, entry)
+
+    eb = notif.get("EventBridgeConfiguration")
+    if eb is not None:
+        enabled = eb.get("EventBridgeEnabled", True) if isinstance(eb, dict) else bool(eb)
+        if enabled:
+            SubElement(root, "EventBridgeConfiguration")
+
+    return tostring(root, encoding="utf-8")
+
+
+def _s3_apply_notification(name, notif):
+    """Route a CloudFormation ``NotificationConfiguration`` through the same S3 API
+    path a ``PutBucketNotificationConfiguration`` call takes — validation, the
+    ``s3:TestEvent``, storage, and the delivery wiring — so the two paths cannot
+    drift. An invalid destination fails the stack loudly instead of silently, which
+    is the whole point of the bug report."""
+    xml = _s3_notification_json_to_xml(notif or {})
+    result = _s3._put_bucket_notification(name, xml)
+    if result[0] >= 400:
+        raise ValueError(
+            f"AWS::S3::Bucket NotificationConfiguration rejected: {result[2]!r}"
+        )
+
+
 def _s3_create(logical_id, props, stack_name):
     name = props.get("BucketName") or _physical_name(stack_name, logical_id, lowercase=True, max_len=63)
     _s3._buckets.setdefault(name, {
@@ -305,6 +373,8 @@ def _s3_create(logical_id, props, stack_name):
     versioning = props.get("VersioningConfiguration", {})
     if versioning.get("Status") == "Enabled":
         _s3._bucket_versioning[name] = "Enabled"
+    if "NotificationConfiguration" in props:
+        _s3_apply_notification(name, props["NotificationConfiguration"])
     attrs = {
         "Arn": f"arn:aws:s3:::{name}",
         "DomainName": f"{name}.s3.amazonaws.com",
@@ -329,6 +399,11 @@ def _s3_update(physical_id, old_props, new_props, stack_name):
         versioning = new_props.get("VersioningConfiguration", {})
         if versioning.get("Status") == "Enabled":
             _s3._bucket_versioning[name] = "Enabled"
+        if "NotificationConfiguration" in new_props:
+            _s3_apply_notification(name, new_props["NotificationConfiguration"])
+        elif "NotificationConfiguration" in old_props:
+            # Property removed on update — clear the configuration, as AWS does.
+            _s3._bucket_notifications.pop(name, None)
     else:
         return _s3_create(name, new_props, stack_name)
     attrs = {
@@ -5443,6 +5518,84 @@ def _firehose_delivery_stream_delete(physical_id, props):
     _firehose._delete_delivery_stream({"DeliveryStreamName": physical_id})
 
 
+# --- IoT ThingType / Policy, Cognito IdentityPoolRoleAttachment,
+#     Lambda LayerVersionPermission (#1345, item 5) ---
+# Each maps onto the service's own control-plane create, so the resource is
+# readable back through its real API instead of the stack rolling back.
+
+
+def _iot_thing_type_create(logical_id, props, stack_name):
+    name = props.get("ThingTypeName") or _physical_name(stack_name, logical_id)
+    payload = {"thingTypeProperties": _pascal_to_camel(props.get("ThingTypeProperties") or {})}
+    resp = _iot._create_thing_type(name, payload)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::ThingType create failed: {resp[2]!r}")
+    rec = _iot._thing_types.get(name) or {}
+    return name, {"Arn": rec.get("thingTypeArn", _iot._thing_type_arn(name)),
+                  "Id": rec.get("thingTypeId", "")}
+
+
+def _iot_thing_type_delete(physical_id, props):
+    _iot._thing_types.pop(physical_id, None)
+
+
+def _iot_policy_create(logical_id, props, stack_name):
+    name = props.get("PolicyName") or _physical_name(stack_name, logical_id)
+    doc = props.get("PolicyDocument")
+    if isinstance(doc, (dict, list)):
+        doc = json.dumps(doc)
+    resp = _iot._create_policy(name, {"policyDocument": doc})
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::Policy create failed: {resp[2]!r}")
+    return name, {"Arn": _iot._policy_arn(name), "Id": name}
+
+
+def _iot_policy_delete(physical_id, props):
+    _iot._policies.pop(physical_id, None)
+
+
+def _cognito_identity_pool_role_attachment_create(logical_id, props, stack_name):
+    iid = props.get("IdentityPoolId")
+    if not iid:
+        raise ValueError("AWS::Cognito::IdentityPoolRoleAttachment requires IdentityPoolId")
+    resp = _cognito._set_identity_pool_roles({"IdentityPoolId": iid, "Roles": props.get("Roles", {})})
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Cognito::IdentityPoolRoleAttachment create failed: {resp[2]!r}")
+    return iid, {"Id": iid}
+
+
+def _cognito_identity_pool_role_attachment_delete(physical_id, props):
+    pool = _cognito._identity_pools.get(physical_id)
+    if pool is not None:
+        pool["_roles"] = {}
+
+
+def _lambda_layer_version_permission_create(logical_id, props, stack_name):
+    arn = props.get("LayerVersionArn", "")
+    m = re.search(r":layer:([^:]+):(\d+)$", arn)
+    if not m:
+        raise ValueError(
+            f"AWS::Lambda::LayerVersionPermission: unparseable LayerVersionArn {arn!r}")
+    layer_name, version = m.group(1), int(m.group(2))
+    sid = props.get("StatementId", "")
+    data = {"Action": props.get("Action", ""), "StatementId": sid,
+            "Principal": props.get("Principal", "*")}
+    if props.get("OrganizationId"):
+        data["OrganizationId"] = props["OrganizationId"]
+    resp = _lambda_svc._add_layer_version_permission(layer_name, version, data)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Lambda::LayerVersionPermission create failed: {resp[2]!r}")
+    # Ref is the layer-version ARN and statement id joined by '#', as AWS returns.
+    return f"{arn}#{sid}", {}
+
+
+def _lambda_layer_version_permission_delete(physical_id, props):
+    arn, _, sid = physical_id.partition("#")
+    m = re.search(r":layer:([^:]+):(\d+)$", arn)
+    if m:
+        _lambda_svc._remove_layer_version_permission(m.group(1), int(m.group(2)), sid)
+
+
 _RESOURCE_HANDLERS = {
     "AWS::OpenSearchService::Domain": {
         "create": _opensearch_domain_create,
@@ -5655,6 +5808,16 @@ _RESOURCE_HANDLERS = {
     "AWS::RDS::DBCluster": {"create": _rds_db_cluster_create, "delete": _rds_db_cluster_delete},
     "AWS::RDS::DBInstance": {"create": _rds_db_instance_create, "delete": _rds_db_instance_delete},
     "AWS::IoT::TopicRule": {"create": _iot_topic_rule_create, "delete": _iot_topic_rule_delete},
+    "AWS::IoT::ThingType": {"create": _iot_thing_type_create, "delete": _iot_thing_type_delete},
+    "AWS::IoT::Policy": {"create": _iot_policy_create, "delete": _iot_policy_delete},
+    "AWS::Cognito::IdentityPoolRoleAttachment": {
+        "create": _cognito_identity_pool_role_attachment_create,
+        "delete": _cognito_identity_pool_role_attachment_delete,
+    },
+    "AWS::Lambda::LayerVersionPermission": {
+        "create": _lambda_layer_version_permission_create,
+        "delete": _lambda_layer_version_permission_delete,
+    },
     # EventBridge Scheduler
     "AWS::Scheduler::Schedule": {"create": _scheduler_schedule_create, "delete": _scheduler_schedule_delete},
     "AWS::Scheduler::ScheduleGroup": {"create": _scheduler_group_create, "delete": _scheduler_group_delete},
