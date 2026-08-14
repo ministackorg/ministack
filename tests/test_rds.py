@@ -7122,9 +7122,8 @@ def test_aurora_mysql_iam_plugin_survives_compute_replacement(rds):
     reason="DOCKER_NETWORK not set -- live Aurora",
 )
 @pytest.mark.skipif(
-    os.environ.get("MINISTACK_MYSQL_IAM_EXPECT_STOCK")
-    not in ("off", "absent"),
-    reason="dedicated off/artifact-absent server lane not requested",
+    os.environ.get("MINISTACK_MYSQL_IAM_EXPECT_STOCK") != "absent",
+    reason="dedicated artifact-absent server lane not requested",
 )
 def test_aurora_mysql_iam_plugin_stock_behavior_when_unavailable(rds):
     import pymysql
