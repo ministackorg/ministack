@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **EC2 — instance public IP and DNS reach the SDKs, and generated addresses are addresses** — `DescribeInstances` and `RunInstances` emitted the public address under `publicIpAddress` / `publicDnsName`, which are not the tags the EC2 wire schema defines (`ipAddress` / `dnsName`, per botocore's `ec2-2016-11-15` model), so every SDK dropped both fields silently and `PublicIpAddress` came back absent on instances that had one. They now ride the real tags. Fixing that exposed a second one: `_random_ip` appended two octets whatever it was given, so a one-octet prefix produced `52.55.218` — `AllocateAddress` has been handing back that shape as `PublicIp` all along, and no address parser accepts it. The generator now completes any prefix to four octets. Contributed by @iot-rocket.
+
 ## [1.4.19] — 2026-08-16
 
 ### Added
