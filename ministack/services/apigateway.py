@@ -102,6 +102,11 @@ _integrations = AccountRegionScopedDict()  # api_id -> {integration_id -> integr
 _stages = AccountRegionScopedDict()        # api_id -> {stage_name -> stage object}
 _deployments = AccountRegionScopedDict()   # api_id -> {deployment_id -> deployment object}
 _authorizers = AccountRegionScopedDict()   # api_id -> {authorizer_id -> authorizer object}
+# Data-plane cache of evaluated REQUEST (Lambda) authorizer results, keyed by
+# (api_id, authorizer_id, cache_key). Value: (expiry_epoch, decision, context).
+# Ephemeral (not persisted); honors authorizerResultTtlInSeconds. Mirrors the
+# REST (v1) authorizer cache in apigateway_v1.py.
+_authorizer_cache = {}
 _api_tags = AccountRegionScopedDict()      # resource_arn -> {key -> value}
 _route_responses = AccountRegionScopedDict()         # api_id -> {route_id -> {rr_id -> route_response}}
 _integration_responses = AccountRegionScopedDict()   # api_id -> {integration_id -> {ir_id -> int_response}}
@@ -744,6 +749,269 @@ async def _validate_jwt_authorizer(route: dict, authorizer: dict, headers: dict,
     return claims, token_scopes, None
 
 
+# ---- Data plane: REQUEST (Lambda) authorizers ----
+#
+# HTTP APIs support two authorizer types: JWT (handled inline above via
+# _validate_jwt_authorizer) and REQUEST, which invokes a Lambda function. A
+# route referencing a REQUEST authorizer carries `authorizationType: CUSTOM`
+# (the authorizer resource's own `authorizerType` is REQUEST; the route's
+# AuthorizationType enum has no REQUEST value — same route/authorizer type
+# split as REST/v1). Unlike JWT, ministack never invoked the Lambda at all —
+# _handle_execute_in_scope only branched on `auth_type == "JWT"`, so a CUSTOM
+# route fell through exactly like an unauthenticated `NONE` route. This
+# mirrors the same gap AWS Gateway (REST, v1) had before it was closed for
+# TOKEN/REQUEST authorizers there (see apigateway_v1._authorize_request_v1) —
+# closing it here for HTTP API (v2) too.
+
+
+def _authorizer_arn_matches(pattern, arn):
+    """Match an authorizer IAM policy Resource against a route ARN, honoring
+    `*`/`?` globs. Mirrors apigateway_v1._arn_matches."""
+    regex = "^" + re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".") + "$"
+    return re.match(regex, arn) is not None
+
+
+def _evaluate_authorizer_policy(policy_doc, route_arn):
+    """Evaluate a REQUEST authorizer's IAM policy against the route ARN.
+
+    Returns "Deny" (explicit deny matched — always wins), "Allow" (an Allow
+    matched and no Deny did), or "NoMatch" (implicit deny — no statement
+    matched). Mirrors apigateway_v1._evaluate_policy.
+    """
+    if not isinstance(policy_doc, dict):
+        return "NoMatch"
+    statements = policy_doc.get("Statement") or []
+    if isinstance(statements, dict):
+        statements = [statements]
+    allow = False
+    for st in statements:
+        if not isinstance(st, dict):
+            continue
+        resources = st.get("Resource")
+        if isinstance(resources, str):
+            resources = [resources]
+        if not any(_authorizer_arn_matches(r, route_arn) for r in (resources or [])):
+            continue
+        if st.get("Effect") == "Deny":
+            return "Deny"
+        if st.get("Effect") == "Allow":
+            allow = True
+    return "Allow" if allow else "NoMatch"
+
+
+def _build_route_arn(region, account_id, api_id, stage, method, path):
+    return (
+        f"arn:aws:execute-api:{region}:{account_id}:"
+        f"{api_id}/{stage}/{method}/{path.lstrip('/')}"
+    )
+
+
+def _request_authorizer_identity_sources(identity_source, headers, query_params, stage_vars):
+    """Resolve a REQUEST authorizer's identitySource list to (all_present, values).
+
+    HTTP API identitySource entries use `$request.header.*` / `$request.querystring.*`
+    / `$stageVariables.*` (unlike REST's `method.request.*`). Returns whether
+    every declared source is present+non-empty and the ordered values (used
+    for the cache-key). Mirrors apigateway_v1._request_identity_sources.
+    """
+    present = True
+    values = []
+    for src in (identity_source or []):
+        if not isinstance(src, str):
+            continue
+        val = ""
+        if src.startswith("$request.header."):
+            val = headers.get(src[len("$request.header."):].lower()) or ""
+        elif src.startswith("$request.querystring."):
+            qn = src[len("$request.querystring."):]
+            qv = (query_params or {}).get(qn)
+            val = (qv[0] if isinstance(qv, list) else qv) or ""
+        elif src.startswith("$stageVariables."):
+            val = (stage_vars or {}).get(src[len("$stageVariables."):]) or ""
+        # $context.* identity sources are not modeled; treated as absent.
+        values.append(val)
+        if not val:
+            present = False
+    return present, values
+
+
+async def _invoke_request_authorizer_lambda(authorizer, event, account_id, region):
+    """Invoke a REQUEST authorizer's Lambda and return its raw execution result dict."""
+    from ministack.services import lambda_svc
+
+    lambda_ref = _extract_lambda_ref_from_integration_uri(authorizer.get("authorizerUri", ""))
+    func_data, func_config, func_name = lambda_svc._get_func_record_for_ref_in_scope(
+        lambda_ref, account_id=account_id, region=region,
+    )
+    if func_data is None or func_config is None:
+        return None
+    exec_record = lambda_svc._execution_record_for_config(func_data, func_config)
+    return await asyncio.to_thread(
+        lambda_svc._execute_function_with_config_scope, exec_record, event
+    )
+
+
+async def _authorize_request_v2(
+    api_id, stage, route, method, path, resource_path,
+    headers, query_params, path_params, stage_vars,
+    owner_account_id, owner_region,
+):
+    """Enforce a REQUEST-type Lambda authorizer before an HTTP API route's
+    integration runs.
+
+    Returns ``(error_response, authorizer_lambda_context)``: when
+    ``error_response`` is not None the caller must short-circuit with it;
+    otherwise ``authorizer_lambda_context`` (possibly None) is injected into
+    the integration event's ``requestContext.authorizer.lambda``, matching
+    real AWS's context-delivery key for HTTP API Lambda authorizers (JWT
+    authorizers deliver under `.jwt` instead — see _validate_jwt_authorizer).
+
+    Honors `authorizerPayloadFormatVersion` (1.0 -> REST-shaped event, IAM
+    policy response only; 2.0 -> the newer event shape, with either a simple
+    `{isAuthorized, context}` response when `enableSimpleResponses` is set,
+    or the same IAM policy response format as 1.0 otherwise) and
+    `authorizerResultTtlInSeconds` caching, mirroring
+    apigateway_v1._authorize_request_v1's REQUEST branch.
+    """
+    authorizer_id = route.get("authorizerId")
+    authorizer = _authorizers.get(api_id, {}).get(authorizer_id) if authorizer_id else None
+    if not authorizer:
+        return (500, {"Content-Type": "application/json"}, json.dumps({"message": "Internal Server Error"}).encode()), None
+
+    route_arn = _build_route_arn(owner_region, owner_account_id, api_id, stage, method, path)
+    payload_version = str(authorizer.get("authorizerPayloadFormatVersion") or "2.0")
+    simple_response = payload_version == "2.0" and bool(authorizer.get("enableSimpleResponses"))
+    ttl = int(authorizer.get("authorizerResultTtlInSeconds") or 0)
+
+    identity_source = authorizer.get("identitySource") or []
+    all_present, id_values = _request_authorizer_identity_sources(
+        identity_source, headers, query_params, stage_vars
+    )
+    # A missing declared identity source is a 401 without invoking the
+    # Lambda — same AWS-verified shortcut apigateway_v1 uses for REST
+    # REQUEST authorizers.
+    if ttl > 0 and identity_source and not all_present:
+        return _jwt_unauthorized(), None
+    cache_key = "|".join(id_values)
+
+    if payload_version == "1.0":
+        qs_params = {k: v[0] for k, v in query_params.items()} if query_params else None
+        mv_qs_params = {k: list(v) for k, v in query_params.items()} if query_params else None
+        event = {
+            "type": "REQUEST",
+            "methodArn": route_arn,
+            "resource": resource_path,
+            "path": path,
+            "httpMethod": method,
+            "headers": dict(headers),
+            "multiValueHeaders": {k: [v] for k, v in headers.items()},
+            "queryStringParameters": qs_params,
+            "multiValueQueryStringParameters": mv_qs_params,
+            "pathParameters": path_params or None,
+            "stageVariables": stage_vars or None,
+            "requestContext": {
+                "stage": stage,
+                "resourcePath": resource_path,
+                "httpMethod": method,
+                "apiId": api_id,
+                "accountId": owner_account_id,
+            },
+        }
+    else:
+        qs = {k: ",".join(v) for k, v in query_params.items()} if query_params else None
+        raw_qs = "&".join(
+            f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(val, safe='')}"
+            for k, vals in (query_params or {}).items() for val in vals
+        )
+        event = {
+            "version": "2.0",
+            "type": "REQUEST",
+            "routeArn": route_arn,
+            "identitySource": id_values,
+            "routeKey": route.get("routeKey", "$default"),
+            "rawPath": path,
+            "rawQueryString": raw_qs,
+            "headers": dict(headers),
+            "queryStringParameters": qs,
+            "pathParameters": path_params or None,
+            "stageVariables": stage_vars or None,
+            "requestContext": {
+                "accountId": owner_account_id,
+                "apiId": api_id,
+                "domainName": f"{api_id}.execute-api.{_HOST}",
+                "http": {
+                    "method": method,
+                    "path": path,
+                    "protocol": "HTTP/1.1",
+                    "sourceIp": "127.0.0.1",
+                    "userAgent": headers.get("user-agent", ""),
+                },
+                "requestId": new_uuid(),
+                "routeKey": route.get("routeKey", "$default"),
+                "stage": stage,
+            },
+        }
+
+    # TTL cache: a hit replays the prior decision without invoking the Lambda.
+    ckey = (api_id, authorizer_id, cache_key)
+    if ttl > 0:
+        hit = _authorizer_cache.get(ckey)
+        if hit and hit[0] > time.time():
+            _, decision, cached_ctx = hit
+            if decision == "Allow":
+                return None, cached_ctx
+            return _jwt_forbidden(), None
+
+    result = await _invoke_request_authorizer_lambda(authorizer, event, owner_account_id, owner_region)
+    if result is None:
+        # Authorizer Lambda unresolved / not found -> connection failure.
+        return (500, {"Content-Type": "application/json"}, json.dumps({"message": "Internal Server Error"}).encode()), None
+    if result.get("error"):
+        return (500, {"Content-Type": "application/json"}, json.dumps({"message": "Internal Server Error"}).encode()), None
+
+    payload = result.get("body")
+    if isinstance(payload, (str, bytes)):
+        if isinstance(payload, bytes):
+            payload = payload.decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            payload = None
+    if not isinstance(payload, dict):
+        return (500, {"Content-Type": "application/json"}, json.dumps({"message": "Internal Server Error"}).encode()), None
+
+    if simple_response:
+        if not payload.get("isAuthorized"):
+            if ttl > 0:
+                _authorizer_cache[ckey] = (time.time() + ttl, "Deny", None)
+            return _jwt_forbidden(), None
+        auth_ctx = dict(payload.get("context") or {})
+    else:
+        decision = _evaluate_authorizer_policy(payload.get("policyDocument"), route_arn)
+        if decision != "Allow":
+            if ttl > 0:
+                _authorizer_cache[ckey] = (time.time() + ttl, decision, None)
+            return _jwt_forbidden(), None
+        raw_ctx = payload.get("context") or {}
+        if payload_version == "1.0":
+            # Payload format 1.0 is wire-identical to REST: context values
+            # reach the backend stringified, matching
+            # apigateway_v1._stringify_context.
+            auth_ctx = {
+                k: ("true" if v is True else "false" if v is False else str(v))
+                for k, v in raw_ctx.items() if v is not None
+            }
+        else:
+            auth_ctx = dict(raw_ctx)
+        principal_id = payload.get("principalId")
+        if principal_id is not None:
+            auth_ctx["principalId"] = str(principal_id) if payload_version == "1.0" else principal_id
+
+    if ttl > 0:
+        _authorizer_cache[ckey] = (time.time() + ttl, "Allow", auth_ctx)
+    return None, auth_ctx
+
+
 def _is_reserved_header(name: str) -> bool:
     lc = (name or "").lower()
     if lc in _RESERVED_HEADER_EXACT:
@@ -784,6 +1052,9 @@ def _resolve_mapping_atom(expr: str, *, request_headers: dict, request_query: di
         if path.startswith("authorizer.claims."):
             claim_path = path[len("authorizer.claims.") :]
             return _get_claim(context_vars.get("authorizer.jwt.claims") or {}, claim_path)
+        if path.startswith("authorizer.lambda."):
+            claim_path = path[len("authorizer.lambda.") :]
+            return _get_claim(context_vars.get("authorizer.lambda") or {}, claim_path)
         return context_vars.get(path)
     return expr
 
@@ -925,9 +1196,11 @@ async def _handle_execute_in_scope(
         route_path = rk_parts[1]
     path_params = _extract_path_params(route_path, path) if route_path else {}
 
+    stage_vars = _get_stage_variables(api_id, stage)
     auth_type = (route.get("authorizationType") or "NONE").upper()
     authorizer_claims = None
     authorizer_scopes = []
+    authorizer_lambda_ctx = None
     if auth_type == "JWT":
         authorizer_id = route.get("authorizerId")
         if not authorizer_id:
@@ -940,6 +1213,19 @@ async def _handle_execute_in_scope(
             return auth_error
         authorizer_claims = claims or {}
         authorizer_scopes = scopes or []
+    elif auth_type == "CUSTOM":
+        # A route's AuthorizationType is CUSTOM when it references a Lambda
+        # (REQUEST-type) authorizer — same convention as REST (v1): the
+        # authorizer resource's own `authorizerType` is REQUEST, but the
+        # *route* is tagged CUSTOM, not REQUEST (confirmed against the
+        # apigatewayv2 CreateRoute/CreateAuthorizer service models).
+        auth_error, authorizer_lambda_ctx = await _authorize_request_v2(
+            api_id, stage, route, method, path, (route_path or path),
+            request_headers, query_params or {}, path_params, stage_vars,
+            owner_account_id, owner_region,
+        )
+        if auth_error is not None:
+            return auth_error
 
     raw_target = route.get("target", "").replace("integrations/", "")
     # Target is "{integrationId}" — the current Ref / CFN physical ID.
@@ -951,7 +1237,6 @@ async def _handle_execute_in_scope(
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": "No integration configured"}).encode()
 
     integration_type = integration.get("integrationType", "")
-    stage_vars = _get_stage_variables(api_id, stage)
     context_vars = {
         "requestId": new_uuid(),
         "httpMethod": method,
@@ -960,6 +1245,7 @@ async def _handle_execute_in_scope(
         "stage": stage,
         "authorizer.jwt.claims": authorizer_claims or {},
         "authorizer.jwt.scopes": authorizer_scopes,
+        "authorizer.lambda": authorizer_lambda_ctx or {},
     }
 
     if integration_type == "AWS_PROXY":
@@ -976,6 +1262,7 @@ async def _handle_execute_in_scope(
             (path_params or None),
             authorizer_claims=authorizer_claims,
             authorizer_scopes=authorizer_scopes,
+            authorizer_lambda_context=authorizer_lambda_ctx,
             owner_account_id=owner_account_id,
             owner_region=owner_region,
         )
@@ -1129,6 +1416,7 @@ async def _invoke_lambda_proxy(
     *,
     authorizer_claims=None,
     authorizer_scopes=None,
+    authorizer_lambda_context=None,
     owner_account_id=None,
     owner_region=None,
 ):
@@ -1216,6 +1504,8 @@ async def _invoke_lambda_proxy(
                 "scopes": authorizer_scopes or [],
             }
         }
+    elif authorizer_lambda_context is not None:
+        event["requestContext"]["authorizer"] = {"lambda": authorizer_lambda_context}
 
     # Route through the central _execute_function dispatcher so CloudWatch
     # Logs emission and Docker log output work for API Gateway invocations.
@@ -1859,6 +2149,7 @@ def reset():
     _stages.clear()
     _deployments.clear()
     _authorizers.clear()
+    _authorizer_cache.clear()
     _api_tags.clear()
     _route_responses.clear()
     _integration_responses.clear()

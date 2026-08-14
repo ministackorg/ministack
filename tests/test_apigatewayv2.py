@@ -1631,6 +1631,209 @@ def test_apigw_jwt_authorizer_enforced_in_data_plane(apigw, cognito_idp):
         cognito_idp.delete_user_pool(UserPoolId=pool_id)
 
 
+def test_apigw_request_authorizer_simple_response_enforced_in_data_plane(apigw, lam):
+    """A CUSTOM route backed by a REQUEST (Lambda) authorizer using the 2.0
+    simple response format (`enableSimpleResponses`) is actually invoked and
+    enforced on the data path. (#1345)
+
+    Before this fix, `_handle_execute_in_scope` only branched on
+    `auth_type == "JWT"`; a CUSTOM route (the AuthorizationType a route gets
+    when it references a REQUEST authorizer) fell through unauthenticated —
+    the authorizer Lambda was never invoked at all, regardless of whether the
+    request carried a valid, invalid, or missing token.
+
+    - isAuthorized: false -> 403.
+    - isAuthorized: true  -> 200, with the returned context surfaced to the
+      integration Lambda under requestContext.authorizer.lambda (mirrors
+      REST/v1's requestContext.authorizer for a CUSTOM authorizer, just keyed
+      under `.lambda` instead of flat, matching real HTTP API behavior).
+    """
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    auth_fn = f"intg-v2-authfn-simple-{suffix}"
+    int_fn = f"intg-v2-intfn-simple-{suffix}"
+
+    auth_code = (
+        b"def handler(event, context):\n"
+        b"    tok = event.get('headers', {}).get('authorization', '')\n"
+        b"    if tok == 'allow-me':\n"
+        b"        return {'isAuthorized': True, 'context': {'user': 'alice', 'admin': True}}\n"
+        b"    return {'isAuthorized': False}\n"
+    )
+    int_code = (
+        b"import json\n"
+        b"def handler(event, context):\n"
+        b"    auth = event.get('requestContext', {}).get('authorizer')\n"
+        b"    return {'statusCode': 200, 'body': json.dumps(auth)}\n"
+    )
+    lam.create_function(
+        FunctionName=auth_fn, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip(auth_code)},
+    )
+    lam.create_function(
+        FunctionName=int_fn, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip(int_code)},
+    )
+
+    api_id = apigw.create_api(Name=f"v2-authz-simple-{suffix}", ProtocolType="HTTP")["ApiId"]
+    try:
+        auth_id = apigw.create_authorizer(
+            ApiId=api_id,
+            AuthorizerType="REQUEST",
+            Name="req-auth-simple",
+            AuthorizerUri=f"arn:aws:lambda:us-east-1:000000000000:function:{auth_fn}",
+            AuthorizerPayloadFormatVersion="2.0",
+            EnableSimpleResponses=True,
+            IdentitySource=["$request.header.Authorization"],
+            AuthorizerResultTtlInSeconds=0,
+        )["AuthorizerId"]
+        int_id = apigw.create_integration(
+            ApiId=api_id,
+            IntegrationType="AWS_PROXY",
+            IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{int_fn}",
+            PayloadFormatVersion="2.0",
+        )["IntegrationId"]
+        apigw.create_route(
+            ApiId=api_id,
+            RouteKey="GET /private",
+            Target=f"integrations/{int_id}",
+            AuthorizationType="CUSTOM",
+            AuthorizerId=auth_id,
+        )
+        apigw.create_stage(ApiId=api_id, StageName="$default")
+
+        host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+        url = f"http://{host}/$default/private"
+
+        def _call(token):
+            req = _urlreq.Request(url, method="GET")
+            req.add_header("Host", host)
+            if token is not None:
+                req.add_header("Authorization", token)
+            try:
+                r = _urlreq.urlopen(req)
+                return r.status, r.read()
+            except _urlerr.HTTPError as e:
+                return e.code, e.read()
+
+        # No/invalid token -> isAuthorized: false -> 403, not a silent pass-through.
+        status, _ = _call("deny-me")
+        assert status == 403
+
+        # Valid token -> isAuthorized: true -> 200, context reaches the
+        # integration under requestContext.authorizer.lambda.
+        status, body = _call("allow-me")
+        assert status == 200
+        auth = json.loads(body)
+        assert auth == {"lambda": {"user": "alice", "admin": True}}
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=auth_fn)
+        lam.delete_function(FunctionName=int_fn)
+
+
+def test_apigw_request_authorizer_iam_policy_response_enforced_in_data_plane(apigw, lam):
+    """A CUSTOM route backed by a REQUEST (Lambda) authorizer using the IAM
+    policy response format (the default when `enableSimpleResponses` is not
+    set, and the only format for `authorizerPayloadFormatVersion: 1.0`) is
+    invoked and enforced, with the policy evaluated against the route ARN.
+    (#1345)
+    """
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    auth_fn = f"intg-v2-authfn-iam-{suffix}"
+    int_fn = f"intg-v2-intfn-iam-{suffix}"
+
+    auth_code = (
+        b"def handler(event, context):\n"
+        b"    tok = event.get('headers', {}).get('authorization', '')\n"
+        b"    arn = event['routeArn']\n"
+        b"    effect = 'Allow' if tok == 'allow-me' else 'Deny'\n"
+        b"    return {\n"
+        b"        'principalId': 'alice',\n"
+        b"        'context': {'user': 'alice'},\n"
+        b"        'policyDocument': {\n"
+        b"            'Version': '2012-10-17',\n"
+        b"            'Statement': [{'Action': 'execute-api:Invoke', 'Effect': effect, 'Resource': arn}],\n"
+        b"        },\n"
+        b"    }\n"
+    )
+    int_code = (
+        b"import json\n"
+        b"def handler(event, context):\n"
+        b"    auth = event.get('requestContext', {}).get('authorizer')\n"
+        b"    return {'statusCode': 200, 'body': json.dumps(auth)}\n"
+    )
+    lam.create_function(
+        FunctionName=auth_fn, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip(auth_code)},
+    )
+    lam.create_function(
+        FunctionName=int_fn, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip(int_code)},
+    )
+
+    api_id = apigw.create_api(Name=f"v2-authz-iam-{suffix}", ProtocolType="HTTP")["ApiId"]
+    try:
+        auth_id = apigw.create_authorizer(
+            ApiId=api_id,
+            AuthorizerType="REQUEST",
+            Name="req-auth-iam",
+            AuthorizerUri=f"arn:aws:lambda:us-east-1:000000000000:function:{auth_fn}",
+            AuthorizerPayloadFormatVersion="2.0",
+            EnableSimpleResponses=False,
+            IdentitySource=["$request.header.Authorization"],
+            AuthorizerResultTtlInSeconds=0,
+        )["AuthorizerId"]
+        int_id = apigw.create_integration(
+            ApiId=api_id,
+            IntegrationType="AWS_PROXY",
+            IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{int_fn}",
+            PayloadFormatVersion="2.0",
+        )["IntegrationId"]
+        apigw.create_route(
+            ApiId=api_id,
+            RouteKey="GET /private",
+            Target=f"integrations/{int_id}",
+            AuthorizationType="CUSTOM",
+            AuthorizerId=auth_id,
+        )
+        apigw.create_stage(ApiId=api_id, StageName="$default")
+
+        host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+        url = f"http://{host}/$default/private"
+
+        def _call(token):
+            req = _urlreq.Request(url, method="GET")
+            req.add_header("Host", host)
+            if token is not None:
+                req.add_header("Authorization", token)
+            try:
+                r = _urlreq.urlopen(req)
+                return r.status, r.read()
+            except _urlerr.HTTPError as e:
+                return e.code, e.read()
+
+        # Deny policy -> 403, not a silent pass-through.
+        status, _ = _call("deny-me")
+        assert status == 403
+
+        # Allow policy -> 200; context (incl. principalId) reaches the
+        # integration under requestContext.authorizer.lambda.
+        status, body = _call("allow-me")
+        assert status == 200
+        auth = json.loads(body)
+        assert auth == {"lambda": {"user": "alice", "principalId": "alice"}}
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=auth_fn)
+        lam.delete_function(FunctionName=int_fn)
+
+
 def test_apigw_request_mapping_claims_to_headers(apigw, cognito_idp):
     import urllib.request as _urlreq
 
