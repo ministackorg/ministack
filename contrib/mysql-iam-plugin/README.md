@@ -38,13 +38,10 @@ repository root:
 contrib/mysql-iam-plugin/build.sh
 ```
 
-This writes to `build/mysql-plugins` by default. Point source-mode MiniStack at
-that directory with `MINISTACK_MYSQL_IAM_PLUGIN_DIR`; the full Docker image
-places the same tree at `/opt/ministack/mysql-plugins`. Set
-`MINISTACK_MYSQL_IAM_AUTH=off` to disable delivery and installation. The
-default `auto` mode is silent when no matching artifact exists. Unknown mode
-values emit one warning per process and are treated as `auto`; names reserved
-for later fidelity levels do not change the L0 reject-all behavior.
+This writes to `build/mysql-plugins` by default. The full Docker image places
+the same tree at `/opt/ministack/mysql-plugins`, the fixed runtime lookup path.
+Delivery and installation happen automatically when a matching bundled
+artifact exists and are silent when it is absent.
 
 Artifact series selection uses the tag of the same resolved MySQL image that
 the RDS container launch uses. Accepted version prefixes such as Aurora MySQL
@@ -55,8 +52,8 @@ procedures independently.
 
 | Engine class | Launch image source | Compatibility series | Disposition |
 |---|---|---|---|
-| `aurora-mysql` | Aurora version map, then `DEFAULT_AURORA_MYSQL_IMAGE` | Parsed from the selected MySQL image tag | 8.0/8.4 plugin artifacts when present; roles on 8.x; procedures/config always attempted. |
-| `mysql` | Same MySQL version map and fallback as the launch path | Parsed from the selected MySQL image tag | Same ABI-matched artifact rule; 5.6/5.7 skip roles and have no v1 artifact; procedures/config always attempted. |
+| `aurora-mysql` | Aurora version map, then `DEFAULT_AURORA_MYSQL_IMAGE` | Parsed from the selected MySQL image tag | 8.0/8.4 plugin artifacts when present; predefined S3 roles on 8.x; procedures/config always attempted. |
+| `mysql` | Same MySQL version map and fallback as the launch path | Parsed from the selected MySQL image tag | Same ABI-matched artifact rule; predefined S3 roles skipped; procedures/config always attempted. |
 | `mariadb` | The launch path's `mariadb:latest` selection | None | Plugin and Aurora roles skipped; RDS procedures/config still attempted independently. |
 
 ## MySQL-ready path design
@@ -87,15 +84,17 @@ The kill procedures use a root-privileged definer and real `KILL CONNECTION` /
 `KILL QUERY` statements. The configuration pair models only the
 binlog-retention-hours round-trip.
 
-The hook also creates the two Aurora predefined roles referenced by the Cash
-user set: `AWS_SELECT_S3_ACCESS` and `AWS_LOAD_S3_ACCESS`. They intentionally
-carry no privileges because MiniStack does not model Aurora's S3 import/export
-data plane; their fidelity contract is existence so grants and reconciliation
-match Aurora. The deployed-ASL sweep found no `AWS_%` identifiers, so it adds
-no role beyond the two provider-source roles. Provider-created service roles
-are runtime resources and require no MiniStack fixture. MySQL 5.6 and 5.7 skip
-these roles because `CREATE ROLE` is not supported there; their configuration
-table and four procedures are still installed independently. An error creating
+For Aurora MySQL 8.x, the hook also creates the two predefined roles referenced
+by the Cash user set: `AWS_SELECT_S3_ACCESS` and `AWS_LOAD_S3_ACCESS`. They
+intentionally carry no privileges because MiniStack does not model Aurora's S3
+import/export data plane; their fidelity contract is existence so grants and
+reconciliation match Aurora. The deployed-ASL sweep found no `AWS_%`
+identifiers, so it adds no role beyond the two provider-source roles.
+Provider-created service roles
+are runtime resources and require no MiniStack fixture. Standalone MySQL never
+receives these Aurora-only roles, and Aurora MySQL 5.7 skips them because its S3
+integration uses privileges instead. Their configuration table and four
+procedures are still installed independently. An error creating
 one compatibility object is logged and does not suppress the remaining
 objects.
 

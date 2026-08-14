@@ -1679,6 +1679,7 @@ def _ensure_mysql_compatibility(
     procedures_ready = ensure_rds_compatibility_procedures(
         _connection,
         resource_id,
+        engine,
         engine_series,
     )
     plugin_ready = False

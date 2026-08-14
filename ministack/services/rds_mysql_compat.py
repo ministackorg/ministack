@@ -79,7 +79,9 @@ def _execute_object(cursor, statement, object_name, resource_id):
         return False
 
 
-def _supports_predefined_roles(engine_series):
+def _supports_predefined_roles(engine, engine_series):
+    if engine != "aurora-mysql":
+        return False
     try:
         major = int(str(engine_series).split(".", 1)[0])
     except (TypeError, ValueError):
@@ -90,6 +92,7 @@ def _supports_predefined_roles(engine_series):
 def ensure_rds_compatibility_procedures(
     connection_factory,
     resource_id,
+    engine,
     engine_series,
 ):
     """Create the Aurora procedures needed by provider user-set grants.
@@ -117,7 +120,7 @@ def ensure_rds_compatibility_procedures(
             "binlog retention hours default",
             resource_id,
         ) and all_ready
-        if _supports_predefined_roles(engine_series):
+        if _supports_predefined_roles(engine, engine_series):
             for role in _PREDEFINED_ROLES:
                 all_ready = _execute_object(
                     cursor,

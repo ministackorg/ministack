@@ -801,8 +801,6 @@ end-to-end without any client config.
 | `GLUE_DOCKER_IMAGE` | (auto by `GlueVersion`) | Override the `amazon/aws-glue-libs` PySpark image used for Spark Glue jobs. Defaults: `glue_libs_4.0.0_image_01` (GlueVersion 4.0), `glue_libs_3.0.0_image_01` (GlueVersion 3.0) |
 | `RDS_PERSIST` | `0` | Set `1` to use Docker named volumes for RDS containers instead of tmpfs. Storage grows dynamically with no fixed cap |
 | `MINISTACK_RDS_PUBLIC_ENDPOINT` | `0` | Set `1` when MiniStack itself runs in a Docker container but RDS clients connect from outside that network (remote MiniStack host, host-side clients, CI runners). `DescribeDBInstances` then returns `{MINISTACK_HOST, host_port}` — the externally-reachable host-published port — instead of the container-internal address. Set `MINISTACK_HOST` to the host clients will use |
-| `MINISTACK_MYSQL_IAM_AUTH` | `auto` | MySQL IAM-auth compatibility plugin mode. `auto` installs the matching bundled artifact when present; `off` preserves stock MySQL behavior. The initial plugin supports IAM-user DDL and rejects all logins |
-| `MINISTACK_MYSQL_IAM_PLUGIN_DIR` | `/opt/ministack/mysql-plugins` | Override the root containing `<series>/<arch>/aws_auth_plugin.so`, primarily for source-mode development |
 | `DSQL_BASE_PORT` | `25432` | Starting host port for Aurora DSQL cluster proxies (one port per cluster) |
 | `DSQL_STRICT` | `0` | Set `1` to run a real Postgres container per DSQL cluster (requires Docker; capped by a fixed port window off `DSQL_BASE_PORT`, default 30 — further clusters are metadata-only stubs). Default `0` is control-plane-only |
 | `DSQL_PG_IMAGE` | `postgres:16-alpine` | Image used for per-cluster DSQL backend containers |

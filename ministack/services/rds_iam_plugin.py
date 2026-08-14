@@ -2,7 +2,6 @@
 
 import io
 import logging
-import os
 import tarfile
 from pathlib import Path
 
@@ -11,29 +10,11 @@ logger = logging.getLogger("rds")
 PLUGIN_NAME = "AWSAuthenticationPlugin"
 PLUGIN_FILE = "aws_auth_plugin.so"
 DEFAULT_ARTIFACT_ROOT = "/opt/ministack/mysql-plugins"
-_WARNED_MODES = set()
-
-
-def _mode():
-    value = os.environ.get("MINISTACK_MYSQL_IAM_AUTH", "auto").strip().lower()
-    if value in ("auto", "off"):
-        return value
-    if value not in _WARNED_MODES:
-        logger.warning(
-            "RDS: unknown MINISTACK_MYSQL_IAM_AUTH value %r; treating it as auto",
-            value,
-        )
-        _WARNED_MODES.add(value)
-    return "auto"
 
 
 def iam_auth_plugin_enabled(engine_series=None):
-    """Return whether configuration and an artifact root merit Docker I/O."""
-    if _mode() == "off":
-        return False
-    root = Path(
-        os.environ.get("MINISTACK_MYSQL_IAM_PLUGIN_DIR", DEFAULT_ARTIFACT_ROOT)
-    )
+    """Return whether a bundled artifact root merits Docker I/O."""
+    root = Path(DEFAULT_ARTIFACT_ROOT)
     if engine_series:
         root = root / engine_series
     return root.is_dir()
@@ -52,9 +33,7 @@ def _container_arch(container):
 
 
 def _artifact_path(engine_series, container):
-    root = Path(
-        os.environ.get("MINISTACK_MYSQL_IAM_PLUGIN_DIR", DEFAULT_ARTIFACT_ROOT)
-    )
+    root = Path(DEFAULT_ARTIFACT_ROOT)
     arch = _container_arch(container)
     if not engine_series or not arch:
         return None
@@ -81,13 +60,10 @@ def ensure_iam_auth_plugin(
 ):
     """Install the matching artifact, returning True only when it is loaded.
 
-    Missing artifacts and explicit ``off`` preserve stock behavior silently.
+    Missing artifacts preserve stock behavior silently.
     Once an artifact is selected, every failure is reported once and swallowed
     so plugin fidelity can never fail RDS provisioning.
     """
-    if _mode() == "off":
-        return False
-
     artifact = _artifact_path(engine_series, container)
     if artifact is None:
         return False

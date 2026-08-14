@@ -56,7 +56,7 @@ def _write_artifact(tmp_path, series="8.0", arch="amd64"):
 def test_rds_iam_plugin_absent_is_silent_and_does_not_connect(
     monkeypatch, tmp_path, caplog,
 ):
-    monkeypatch.setenv("MINISTACK_MYSQL_IAM_PLUGIN_DIR", str(tmp_path))
+    monkeypatch.setattr(plugin, "DEFAULT_ARTIFACT_ROOT", str(tmp_path))
     connections = []
 
     with caplog.at_level(logging.WARNING, logger="rds"):
@@ -72,28 +72,11 @@ def test_rds_iam_plugin_absent_is_silent_and_does_not_connect(
     assert caplog.records == []
 
 
-def test_rds_iam_plugin_off_preserves_stock_behavior(monkeypatch, tmp_path):
-    _write_artifact(tmp_path)
-    monkeypatch.setenv("MINISTACK_MYSQL_IAM_PLUGIN_DIR", str(tmp_path))
-    monkeypatch.setenv("MINISTACK_MYSQL_IAM_AUTH", "off")
-    connections = []
-
-    installed = plugin.ensure_iam_auth_plugin(
-        FakeContainer(),
-        lambda: connections.append(True),
-        "8.0",
-        "db-1",
-    )
-
-    assert installed is False
-    assert connections == []
-
-
 def test_rds_iam_plugin_unsupported_series_avoids_docker_work(
     monkeypatch, tmp_path,
 ):
     _write_artifact(tmp_path, series="8.0")
-    monkeypatch.setenv("MINISTACK_MYSQL_IAM_PLUGIN_DIR", str(tmp_path))
+    monkeypatch.setattr(plugin, "DEFAULT_ARTIFACT_ROOT", str(tmp_path))
 
     assert plugin.iam_auth_plugin_enabled("8.0") is True
     assert plugin.iam_auth_plugin_enabled("5.7") is False
@@ -101,7 +84,7 @@ def test_rds_iam_plugin_unsupported_series_avoids_docker_work(
 
 def test_rds_iam_plugin_installs_matching_series_and_arch(monkeypatch, tmp_path):
     _write_artifact(tmp_path, series="8.4", arch="arm64")
-    monkeypatch.setenv("MINISTACK_MYSQL_IAM_PLUGIN_DIR", str(tmp_path))
+    monkeypatch.setattr(plugin, "DEFAULT_ARTIFACT_ROOT", str(tmp_path))
     container = FakeContainer(arch="aarch64")
     connection = FakeConnection(
         [None, None, ("/usr/lib64/mysql/plugin",), (plugin.PLUGIN_NAME,)]
@@ -151,7 +134,7 @@ def test_rds_iam_plugin_installs_matching_series_and_arch(monkeypatch, tmp_path)
 
 def test_rds_iam_plugin_is_idempotent(monkeypatch, tmp_path):
     _write_artifact(tmp_path)
-    monkeypatch.setenv("MINISTACK_MYSQL_IAM_PLUGIN_DIR", str(tmp_path))
+    monkeypatch.setattr(plugin, "DEFAULT_ARTIFACT_ROOT", str(tmp_path))
     container = FakeContainer()
     connection = FakeConnection([("AWSAuthenticationPlugin",)])
 
@@ -178,7 +161,7 @@ def test_rds_iam_plugin_recovers_boot_failed_registration(
     monkeypatch, tmp_path, caplog,
 ):
     _write_artifact(tmp_path)
-    monkeypatch.setenv("MINISTACK_MYSQL_IAM_PLUGIN_DIR", str(tmp_path))
+    monkeypatch.setattr(plugin, "DEFAULT_ARTIFACT_ROOT", str(tmp_path))
     container = FakeContainer()
     connection = FakeConnection(
         [
@@ -228,7 +211,7 @@ def test_rds_iam_plugin_failure_warns_once_and_does_not_escape(
     monkeypatch, tmp_path, caplog,
 ):
     _write_artifact(tmp_path)
-    monkeypatch.setenv("MINISTACK_MYSQL_IAM_PLUGIN_DIR", str(tmp_path))
+    monkeypatch.setattr(plugin, "DEFAULT_ARTIFACT_ROOT", str(tmp_path))
     container = FakeContainer(put_result=False)
     connection = FakeConnection(
         [None, None, ("/usr/lib64/mysql/plugin",)]
@@ -250,29 +233,10 @@ def test_rds_iam_plugin_failure_warns_once_and_does_not_escape(
     assert len(warnings) == 1
 
 
-def test_rds_iam_plugin_unknown_mode_warns_once_and_uses_auto(
-    monkeypatch, tmp_path, caplog,
-):
-    _write_artifact(tmp_path)
-    monkeypatch.setenv("MINISTACK_MYSQL_IAM_PLUGIN_DIR", str(tmp_path))
-    monkeypatch.setenv("MINISTACK_MYSQL_IAM_AUTH", "future-mode")
-    plugin._WARNED_MODES.clear()
-
-    with caplog.at_level(logging.WARNING, logger="rds"):
-        assert plugin.iam_auth_plugin_enabled() is True
-        assert plugin.iam_auth_plugin_enabled() is True
-
-    warnings = [
-        record for record in caplog.records
-        if "unknown MINISTACK_MYSQL_IAM_AUTH" in record.message
-    ]
-    assert len(warnings) == 1
-
-
 def test_mysql_compatibility_wait_resolves_container_before_procedures(
     monkeypatch, tmp_path,
 ):
-    monkeypatch.setenv("MINISTACK_MYSQL_IAM_PLUGIN_DIR", str(tmp_path))
+    monkeypatch.setattr(plugin, "DEFAULT_ARTIFACT_ROOT", str(tmp_path))
     connection = object()
     calls = []
 
@@ -296,8 +260,11 @@ def test_mysql_compatibility_wait_resolves_container_before_procedures(
         assert args[-1]() is True
         return True
 
-    def ensure_procedures(connection_factory, resource_id, engine_series):
+    def ensure_procedures(
+        connection_factory, resource_id, engine, engine_series,
+    ):
         calls.append(("procedures", resource_id))
+        assert engine == "aurora-mysql"
         assert engine_series == "8.0"
         assert connection_factory() is connection
         return True
@@ -339,8 +306,10 @@ def test_mariadb_compatibility_skips_plugin_and_roles(monkeypatch):
         calls.append(("plugin-enabled", engine_series))
         return True
 
-    def ensure_procedures(_connection_factory, resource_id, engine_series):
-        calls.append(("procedures", resource_id, engine_series))
+    def ensure_procedures(
+        _connection_factory, resource_id, engine, engine_series,
+    ):
+        calls.append(("procedures", resource_id, engine, engine_series))
         return True
 
     monkeypatch.setattr(rds_service, "iam_auth_plugin_enabled", enabled)
@@ -359,4 +328,4 @@ def test_mariadb_compatibility_skips_plugin_and_roles(monkeypatch):
         "db-1",
         engine="mariadb",
     ) == (True, False)
-    assert calls == [("procedures", "db-1", None)]
+    assert calls == [("procedures", "db-1", "mariadb", None)]

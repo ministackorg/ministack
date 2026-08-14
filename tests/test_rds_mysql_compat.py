@@ -44,6 +44,7 @@ def test_rds_compatibility_procedures_create_complete_family():
     assert compat.ensure_rds_compatibility_procedures(
         lambda: connection,
         "cluster-1",
+        "aurora-mysql",
         "8.0",
     ) is True
 
@@ -67,6 +68,7 @@ def test_rds_compatibility_procedures_are_idempotent():
     assert compat.ensure_rds_compatibility_procedures(
         lambda: connection,
         "cluster-1",
+        "aurora-mysql",
         "8.4",
     ) is True
 
@@ -92,6 +94,7 @@ def test_rds_compatibility_procedure_failure_warns_and_does_not_escape(caplog):
         assert compat.ensure_rds_compatibility_procedures(
             fail_connection,
             "cluster-1",
+            "aurora-mysql",
             "8.0",
         ) is False
 
@@ -105,7 +108,29 @@ def test_rds_compatibility_procedures_skip_roles_before_mysql_8():
     assert compat.ensure_rds_compatibility_procedures(
         lambda: connection,
         "cluster-1",
+        "aurora-mysql",
         "5.7",
+    ) is True
+
+    statements = [statement for statement, _params in connection.cursor_value.executed]
+    assert not any(statement.startswith("CREATE ROLE") for statement in statements)
+    assert statements[:3] == [
+        "SET SESSION sql_log_bin = 0",
+        compat._CONFIG_TABLE_SQL,
+        compat._CONFIG_DEFAULT_SQL,
+    ]
+    assert statements[3].startswith("SELECT ROUTINE_NAME")
+    assert statements[4:] == list(compat._PROCEDURES.values())
+
+
+def test_rds_compatibility_procedures_skip_roles_for_standalone_mysql_8():
+    connection = FakeConnection()
+
+    assert compat.ensure_rds_compatibility_procedures(
+        lambda: connection,
+        "instance-1",
+        "mysql",
+        "8.4",
     ) is True
 
     statements = [statement for statement, _params in connection.cursor_value.executed]
@@ -127,6 +152,7 @@ def test_rds_compatibility_object_failure_does_not_abort_later_objects(caplog):
         assert compat.ensure_rds_compatibility_procedures(
             lambda: connection,
             "cluster-1",
+            "aurora-mysql",
             "8.0",
         ) is False
 
