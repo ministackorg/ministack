@@ -3853,12 +3853,12 @@ def _acquire_execution_slot(func: dict, config: dict):
     key = _inflight_key(config)
     with _inflight_lock:
         if reserved and _inflight.get(key, 0) >= int(reserved):
-            return None
+            return None, "function"
         if _ACCOUNT_CONCURRENCY_CAP > 0 and _inflight_total >= _ACCOUNT_CONCURRENCY_CAP:
-            return None
+            return None, "account"
         _inflight[key] = _inflight.get(key, 0) + 1
         _inflight_total += 1
-    return key
+    return key, None
 
 
 def _release_execution_slot(key: str) -> None:
@@ -3906,13 +3906,24 @@ def _execute_function(func: dict, event: dict) -> dict:
     # through, so warm / docker / provided / proxy / one-off all draw on the
     # same denominator. Accounting inside an executor's own worker pool would
     # only ever see that executor's share.
-    slot = _acquire_execution_slot(func, config)
+    slot, limit = _acquire_execution_slot(func, config)
     if slot is None:
-        _emit_lambda_metrics(config.get("FunctionName", "unknown"),
-                             duration_ms=0.0, error=False, throttle=True)
-        return {"throttle": True, "body": {
-            "Message": "Rate Exceeded.", "Type": "User",
-            "__type": "ConcurrentInvocationLimitExceededException"}}
+        fn_name = config.get("FunctionName", "unknown")
+        _emit_lambda_metrics(fn_name, duration_ms=0.0, error=False, throttle=True)
+        # AWS models exactly one throttle shape for Invoke —
+        # TooManyRequestsException with a Reason distinguishing the function
+        # limit from the account limit. Anything else is a code string AWS does
+        # not use, which boto3 surfaces as a bare ClientError that
+        # `except lambda.exceptions.TooManyRequestsException` will not catch.
+        if limit == "function":
+            return _throttle_response(
+                reason_code="ReservedFunctionConcurrentInvocationLimitExceeded",
+                msg=f"Rate Exceeded: function {fn_name} at ReservedConcurrentExecutions",
+            )
+        return _throttle_response(
+            reason_code="ConcurrentInvocationLimitExceeded",
+            msg=f"Rate Exceeded: account concurrency cap {_ACCOUNT_CONCURRENCY_CAP} reached",
+        )
     try:
         return _execute_function_dispatch(func, config, event, request_id, started)
     finally:
@@ -4104,9 +4115,10 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
     _ensure_reaper_thread()
     worker, reason = acquire_worker(func_name, config, code_zip, qualifier=qualifier)
     if worker is None and reason == "func_cap":
-        return {"throttle": True, "body": {
-            "Message": "Rate Exceeded.", "Type": "User",
-            "__type": "ConcurrentInvocationLimitExceededException"}}
+        return _throttle_response(
+            reason_code="ReservedFunctionConcurrentInvocationLimitExceeded",
+            msg=f"Rate Exceeded: function {func_name} warm-worker ceiling reached",
+        )
     try:
         # Inject X-Ray trace header into the event so the worker bootstrap
         # can set ``_X_AMZN_TRACE_ID`` in os.environ before calling the

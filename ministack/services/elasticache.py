@@ -535,7 +535,7 @@ def _spawn_redis_cluster_node(name, engine, engine_version, labels):
         if not container_ip:
             try:
                 container.stop(timeout=2)
-                container.remove()
+                container.remove(v=True)
             except Exception:
                 pass
             logger.warning("ElastiCache: cluster node %s has no IP on network %s", name, DOCKER_NETWORK)
@@ -607,7 +607,7 @@ def _teardown_containers(docker_client, container_ids):
         try:
             c = docker_client.containers.get(cid)
             c.stop(timeout=2)
-            c.remove()
+            c.remove(v=True)
         except Exception as e:
             logger.warning("ElastiCache: cleanup failed for %s: %s", cid, e)
 
@@ -968,7 +968,7 @@ def _delete_cache_cluster(p):
         try:
             container = docker_client.containers.get(cluster["_docker_container_id"])
             container.stop(timeout=5)
-            container.remove()
+            container.remove(v=True)
         except Exception as e:
             logger.warning("ElastiCache: failed to remove container for %s: %s", cluster_id, e)
 
@@ -1274,7 +1274,7 @@ def _delete_replication_group(p):
             try:
                 container = docker_client.containers.get(cid)
                 container.stop(timeout=5)
-                container.remove()
+                container.remove(v=True)
             except Exception as e:
                 logger.warning("ElastiCache: failed to remove RG container %s for %s: %s", cid, rg_id, e)
 

@@ -76,16 +76,17 @@ def _account_region_from_function_config(config: dict) -> tuple[str, str]:
 _workers: dict = {}
 _lock = threading.Lock()
 
-# Resource ceiling on warm subprocesses per function. NOT a concurrency limit:
-# AWS lets an unreserved function scale into the account pool, and capping width
-# here would invent a throttle AWS never sends (and diverge from the docker
-# executor, which spawns freely). Concurrency is enforced once, in
-# lambda_svc._acquire_execution_slot. This exists only so a burst cannot
-# exhaust the OS process table; 0 disables it. The reaper trims the surplus.
-_LOCAL_MAX_WORKERS = int(os.environ.get("LAMBDA_LOCAL_MAX_WORKERS", "0"))
+# No per-function ceiling on warm subprocesses: AWS lets an unreserved function
+# scale into the account pool, and capping width here would invent a throttle
+# AWS never sends and diverge from the docker executor, which spawns freely.
+# Concurrency is bounded once, at lambda_svc._acquire_execution_slot, via
+# ReservedConcurrentExecutions and the existing LAMBDA_ACCOUNT_CONCURRENCY.
+# The reaper reclaims the surplus subprocesses a burst leaves behind.
+_LOCAL_MAX_WORKERS = 0
 # Seconds a surplus worker may sit idle before it is reaped (the first worker
-# per function is never reaped, so warm starts are unaffected).
-_LOCAL_WORKER_TTL = float(os.environ.get("LAMBDA_LOCAL_WORKER_TTL", "60"))
+# per function is never reaped, so warm starts are unaffected). Shares the knob
+# that already governs warm-container eviction rather than adding a second one.
+_LOCAL_WORKER_TTL = float(os.environ.get("LAMBDA_WARM_TTL_SECONDS", "300"))
 
 # ---------------------------------------------------------------------------
 # Python worker script (runs inside a persistent subprocess)

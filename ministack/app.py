@@ -2109,7 +2109,7 @@ async def _handle_lifespan(scope, receive, send):
 # the boot deadline caps how long startup will wait for the whole sweep before
 # letting the server bind and finishing the reap in the background.
 _DOCKER_REAP_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
-_DOCKER_REAP_BOOT_DEADLINE = float(os.environ.get("MINISTACK_BOOT_REAP_DEADLINE", "10"))
+_DOCKER_REAP_BOOT_DEADLINE = 10.0
 
 
 def _stop_docker_containers():

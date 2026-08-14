@@ -9709,20 +9709,31 @@ def test_lambda_reserved_concurrency_throttles_rather_than_queues(lam):
             try:
                 resp = lam.invoke(FunctionName=name, Payload=b"{}")
                 resp["Payload"].read()
-                return resp["StatusCode"], resp.get("FunctionError", "")
+                return resp["StatusCode"], "", ""
             except ClientError as exc:
-                return exc.response["ResponseMetadata"]["HTTPStatusCode"], "throttled"
+                return (exc.response["ResponseMetadata"]["HTTPStatusCode"],
+                        exc.response["Error"]["Code"],
+                        exc.response.get("Reason", ""))
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
             results = list(ex.map(_invoke, range(3)))
 
-        throttled = [r for r in results if r[0] == 429 or r[1] == "throttled"]
+        throttled = [r for r in results if r[0] == 429]
         succeeded = [r for r in results if r[0] == 200 and not r[1]]
         assert succeeded, f"reservation of 1 must still admit one invoke: {results}"
         assert throttled, (
             f"invocations beyond ReservedConcurrentExecutions=1 must throttle, "
             f"not queue or hang: {results}"
         )
+        # The code, not just the status. AWS models exactly one throttle shape
+        # for Invoke; anything else is a string AWS never sends, and
+        # ``except lambda.exceptions.TooManyRequestsException`` would not catch
+        # it — a 429 alone passes on the wrong shape.
+        for status, code, reason in throttled:
+            assert code == "TooManyRequestsException", (
+                f"expected TooManyRequestsException, got {code!r}")
+            assert reason == "ReservedFunctionConcurrentInvocationLimitExceeded", (
+                f"expected the function-limit Reason, got {reason!r}")
     finally:
         with contextlib.suppress(Exception):
             lam.delete_function(FunctionName=name)
