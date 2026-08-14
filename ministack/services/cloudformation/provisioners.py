@@ -5633,32 +5633,6 @@ def _cognito_identity_pool_role_attachment_delete(physical_id, props):
         pool["_roles"] = {}
 
 
-def _lambda_layer_version_permission_create(logical_id, props, stack_name):
-    arn = props.get("LayerVersionArn", "")
-    m = re.search(r":layer:([^:]+):(\d+)$", arn)
-    if not m:
-        raise ValueError(
-            f"AWS::Lambda::LayerVersionPermission: unparseable LayerVersionArn {arn!r}")
-    layer_name, version = m.group(1), int(m.group(2))
-    sid = props.get("StatementId", "")
-    data = {"Action": props.get("Action", ""), "StatementId": sid,
-            "Principal": props.get("Principal", "*")}
-    if props.get("OrganizationId"):
-        data["OrganizationId"] = props["OrganizationId"]
-    resp = _lambda_svc._add_layer_version_permission(layer_name, version, data)
-    if resp[0] >= 400:
-        raise ValueError(f"AWS::Lambda::LayerVersionPermission create failed: {resp[2]!r}")
-    # Ref is the layer-version ARN and statement id joined by '#', as AWS returns.
-    return f"{arn}#{sid}", {}
-
-
-def _lambda_layer_version_permission_delete(physical_id, props):
-    arn, _, sid = physical_id.partition("#")
-    m = re.search(r":layer:([^:]+):(\d+)$", arn)
-    if m:
-        _lambda_svc._remove_layer_version_permission(m.group(1), int(m.group(2)), sid)
-
-
 _RESOURCE_HANDLERS = {
     "AWS::OpenSearchService::Domain": {
         "create": _opensearch_domain_create,
@@ -5880,10 +5854,6 @@ _RESOURCE_HANDLERS = {
     "AWS::Cognito::IdentityPoolRoleAttachment": {
         "create": _cognito_identity_pool_role_attachment_create,
         "delete": _cognito_identity_pool_role_attachment_delete,
-    },
-    "AWS::Lambda::LayerVersionPermission": {
-        "create": _lambda_layer_version_permission_create,
-        "delete": _lambda_layer_version_permission_delete,
     },
     # EventBridge Scheduler
     "AWS::Scheduler::Schedule": {"create": _scheduler_schedule_create, "delete": _scheduler_schedule_delete},
