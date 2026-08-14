@@ -25,6 +25,7 @@ import time
 import urllib.parse
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import run_reentrant
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -1454,7 +1455,7 @@ def _sanitize(cluster):
 # Request Router
 # ---------------------------------------------------------------------------
 
-async def handle_request(method, path, headers, body_bytes, query_params):
+def _handle_request_sync(method, path, headers, body_bytes, query_params):
     try:
         body = json.loads(body_bytes) if body_bytes else {}
     except json.JSONDecodeError:
@@ -1628,3 +1629,20 @@ async def handle_request(method, path, headers, body_bytes, query_params):
             return _untag_resource(arn, query)
 
     return _error(400, "InvalidRequestException", f"No route for {method} {path}")
+
+
+async def handle_request(method, path, headers, body, query_params):
+    """Dispatch off the event loop.
+
+    Request paths here reach the Docker daemon (container create/start/stop/
+    inspect), which blocks for as long as the daemon takes. Measured on ECS: a
+    cached-image container start held the loop for 7.3s, during which the health
+    endpoint — the cheapest request in the process — could not be served.
+
+    Uses run_reentrant, not the shared pool: containers started here are handed
+    an endpoint pointing back at MiniStack, so one calls in while this
+    dispatch is still running. A bounded pool would queue that nested request
+    behind the call waiting on it.
+    """
+    return await run_reentrant(
+        _handle_request_sync, method, path, headers, body, query_params, thread_name="ministack-eks-dispatch")

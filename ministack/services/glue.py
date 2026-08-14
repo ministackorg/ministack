@@ -25,6 +25,7 @@ import time
 from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import run_reentrant
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -259,7 +260,7 @@ def _invalid_resource_arn(arn):
     return error_response_json("InvalidInputException", f"Invalid Glue resource ARN: {arn}", 400)
 
 
-async def handle_request(method, path, headers, body, query_params):
+def _handle_request_sync(method, path, headers, body, query_params):
     # Glue's Iceberg REST catalog data plane. On real AWS this is
     # `glue.<region>.amazonaws.com/iceberg` — same service, same SigV4
     # signing name (`glue`), different protocol (Iceberg REST OpenAPI
@@ -2094,3 +2095,20 @@ def reset():
     _user_defined_functions.clear()
     _table_column_statistics.clear()
     _partition_column_statistics.clear()
+
+
+async def handle_request(method, path, headers, body, query_params):
+    """Dispatch off the event loop.
+
+    Request paths here reach the Docker daemon (container create/start/stop/
+    inspect), which blocks for as long as the daemon takes. Measured on ECS: a
+    cached-image container start held the loop for 7.3s, during which the health
+    endpoint — the cheapest request in the process — could not be served.
+
+    Uses run_reentrant, not the shared pool: containers started here are handed
+    an endpoint pointing back at MiniStack, so one calls in while this
+    dispatch is still running. A bounded pool would queue that nested request
+    behind the call waiting on it.
+    """
+    return await run_reentrant(
+        _handle_request_sync, method, path, headers, body, query_params, thread_name="ministack-glue-dispatch")

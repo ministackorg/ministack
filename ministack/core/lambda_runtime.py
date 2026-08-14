@@ -76,11 +76,13 @@ def _account_region_from_function_config(config: dict) -> tuple[str, str]:
 _workers: dict = {}
 _lock = threading.Lock()
 
-# Local-executor pool bounds. Each worker is a subprocess, so the pool per
-# function must be capped or a concurrency burst exhausts the OS process table
-# and takes the whole server down. 16 covers AWS's ~16-hop recursive-loop limit,
-# which is the deepest legitimate self-invocation chain.
-_LOCAL_MAX_WORKERS = int(os.environ.get("LAMBDA_LOCAL_MAX_WORKERS", "16"))
+# Resource ceiling on warm subprocesses per function. NOT a concurrency limit:
+# AWS lets an unreserved function scale into the account pool, and capping width
+# here would invent a throttle AWS never sends (and diverge from the docker
+# executor, which spawns freely). Concurrency is enforced once, in
+# lambda_svc._acquire_execution_slot. This exists only so a burst cannot
+# exhaust the OS process table; 0 disables it. The reaper trims the surplus.
+_LOCAL_MAX_WORKERS = int(os.environ.get("LAMBDA_LOCAL_MAX_WORKERS", "0"))
 # Seconds a surplus worker may sit idle before it is reaped (the first worker
 # per function is never reaped, so warm starts are unaffected).
 _LOCAL_WORKER_TTL = float(os.environ.get("LAMBDA_LOCAL_WORKER_TTL", "60"))
@@ -1229,18 +1231,16 @@ def acquire_worker(func_name: str, config: dict, code_zip: bytes,
     deadlocked. The thread the invocation runs on is irrelevant to that; the
     lock is the bottleneck.
 
-    The pool is bounded. Each worker is an OS subprocess, so an unbounded pool
-    would trade the deadlock for process exhaustion — the whole server dies
-    instead of one call hanging. ``max_concurrency``
-    (ReservedConcurrentExecutions) caps it when set; otherwise
-    ``LAMBDA_LOCAL_MAX_WORKERS`` does, defaulting to 16 to cover AWS's ~16-hop
-    recursive-loop limit. At the cap the caller gets a throttle rather than a
+    ``max_concurrency`` is an optional *resource* ceiling on how many warm
+    subprocesses may exist for one function, not a concurrency limit — AWS
+    concurrency is enforced upstream in ``lambda_svc._acquire_execution_slot``,
+    once, for every executor. It defaults to unbounded, matching the docker
+    executor. At a ceiling the caller gets ``(None, "func_cap")`` rather than a
     blocking wait, because waiting for a worker held by your own caller is the
     deadlock this exists to remove.
 
-    Returns ``(worker, "reused"|"spawn")`` or ``(None, "func_cap")`` when the
-    cap is reached, which the caller reports as a throttle. Release with
-    :func:`release_worker`.
+    Returns ``(worker, "reused"|"spawn")`` or ``(None, "func_cap")``. Release
+    with :func:`release_worker`.
     """
     key = _worker_key(func_name, config, qualifier)
     cap = max_concurrency or _LOCAL_MAX_WORKERS

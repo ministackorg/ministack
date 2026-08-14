@@ -47,6 +47,7 @@ from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import run_offloop
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -2279,7 +2280,7 @@ def _flatten_json_request_params(params, data):
                     params[f"Filters.member.{i}.Values.member.{j}"] = [str(v)]
 
 
-async def handle_request(method, path, headers, body, query_params):
+def _handle_request_sync(method, path, headers, body, query_params):
     params = dict(query_params)
     if method == "POST" and body:
         raw = body if isinstance(body, str) else body.decode("utf-8-sig", errors="replace")
@@ -6543,3 +6544,18 @@ except Exception:
     logging.getLogger(__name__).exception(
         "Failed to restore persisted state; continuing with fresh store"
     )
+
+
+async def handle_request(method, path, headers, body, query_params):
+    """Dispatch off the event loop.
+
+    Request paths here reach the Docker daemon (container create/start/stop/
+    inspect), which blocks for as long as the daemon takes. Measured on ECS: a
+    cached-image container start held the loop for 7.3s, during which the health
+    endpoint — the cheapest request in the process — could not be served.
+
+    Uses the shared pool: the containers started here (database / cache / search
+    engines) never call back into MiniStack, so this cannot re-enter.
+    """
+    return await run_offloop(
+        _handle_request_sync, method, path, headers, body, query_params)

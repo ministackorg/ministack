@@ -22,6 +22,7 @@ import threading
 import time
 
 from ministack.core.arn import ArnParseError, is_arn, parse_arn
+from ministack.core.concurrency import run_reentrant
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -485,7 +486,7 @@ def _execute_build(build_id, project):
 # Request dispatcher
 # ---------------------------------------------------------------------------
 
-async def handle_request(method, path, headers, body, query_params):
+def _handle_request_sync(method, path, headers, body, query_params):
     target = headers.get("x-amz-target", "")
     action = target.split(".")[-1] if "." in target else ""
 
@@ -732,3 +733,20 @@ def _batch_delete_builds(data):
         else:
             not_deleted.append(bid)
     return json_response({"buildsDeleted": deleted, "buildsNotDeleted": not_deleted})
+
+
+async def handle_request(method, path, headers, body, query_params):
+    """Dispatch off the event loop.
+
+    Request paths here reach the Docker daemon (container create/start/stop/
+    inspect), which blocks for as long as the daemon takes. Measured on ECS: a
+    cached-image container start held the loop for 7.3s, during which the health
+    endpoint — the cheapest request in the process — could not be served.
+
+    Uses run_reentrant, not the shared pool: containers started here are handed
+    an endpoint pointing back at MiniStack, so one calls in while this
+    dispatch is still running. A bounded pool would queue that nested request
+    behind the call waiting on it.
+    """
+    return await run_reentrant(
+        _handle_request_sync, method, path, headers, body, query_params, thread_name="ministack-codebuild-dispatch")

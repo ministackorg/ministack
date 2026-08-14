@@ -308,12 +308,17 @@ def _now() -> int:
 # Docker container management
 # ---------------------------------------------------------------------------
 
+# Cap any single Docker daemon call. docker-py defaults to 60s, which turns a
+# slow or wedged daemon into a minutes-long stall on a request path.
+_DOCKER_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
+
+
 def _get_docker():
     global _docker_client
     if _docker_client is None:
         try:
             import docker
-            _docker_client = docker.from_env()
+            _docker_client = docker.from_env(timeout=_DOCKER_TIMEOUT)
         except Exception:
             pass
     return _docker_client
@@ -359,6 +364,9 @@ def _spawn_dataplane(domain_name: str, engine_version: str):
 
     image = apply_image_prefix(DEFAULT_IMAGE)
     labels = {
+        # Standard label so the boot/shutdown orphan reap finds these; the
+        # com.ministack.* keys below are what the service's own lookups use.
+        "ministack": "opensearch",
         "com.ministack.service": "opensearch",
         "com.ministack.domain": domain_name,
         "com.ministack.region": get_region(),
@@ -1264,8 +1272,8 @@ async def handle_request(method, path, headers, body_bytes, query_params):
 
     m = _DOMAIN_RE.match(path)
     if method == "POST" and m and m.group("name") is None:
-        # Spawns the OpenSearch (and Dashboards) container — seconds to
-        # minutes on a cold image pull. Off-loop; cannot re-enter. 
+        # Spawns the OpenSearch (and Dashboards) container: seconds on a warm
+        # image, minutes on a cold pull. Shared pool; it cannot re-enter.
         return await run_offloop(_create_domain, payload)
     if m and m.group("name"):
         name = m.group("name")

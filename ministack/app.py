@@ -161,6 +161,7 @@ _NON_S3_VHOST_NAMES = frozenset({
     "inspector2", "dsql",
 })
 
+from ministack.core.concurrency import spawn_background
 from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
 from ministack.core.responses import _12_DIGIT_RE, set_request_account_id, set_request_region
@@ -1981,7 +1982,20 @@ async def _handle_lifespan(scope, receive, send):
             # process. Persistence strips container ids from snapshots, so any
             # ministack-labelled container alive at boot is by definition an
             # orphan whose name will collide on next create.
-            _stop_docker_containers()
+            #
+            # Bounded: the sweep normally finishes in well under a second and we
+            # wait for it, so a create right after boot still sees a clean slate.
+            # But it talks to the Docker daemon, and a slow or wedged daemon must
+            # never stop MiniStack from binding its port — that presents as a
+            # silent hang with an empty log. Past the deadline it finishes in the
+            # background while the server comes up.
+            _reap = spawn_background(_stop_docker_containers,
+                                     thread_name="ministack-boot-reap")
+            _reap.join(timeout=_DOCKER_REAP_BOOT_DEADLINE)
+            if _reap.is_alive():
+                logger.warning(
+                    "Docker orphan reap still running after %ss; continuing "
+                    "startup without it", _DOCKER_REAP_BOOT_DEADLINE)
             if PERSIST_STATE:
                 _load_persisted_state()
             # Start the Transfer Family SFTP listener after persistence is
@@ -2047,6 +2061,13 @@ async def _handle_lifespan(scope, receive, send):
             return
 
 
+# Docker orphan reap bounds. The client timeout caps any single daemon call;
+# the boot deadline caps how long startup will wait for the whole sweep before
+# letting the server bind and finishing the reap in the background.
+_DOCKER_REAP_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
+_DOCKER_REAP_BOOT_DEADLINE = float(os.environ.get("MINISTACK_BOOT_REAP_DEADLINE", "10"))
+
+
 def _stop_docker_containers():
     """Stop all Docker containers managed by MiniStack (RDS, ECS, ElastiCache).
     Uses container labels to find them — does not touch service state.
@@ -2063,15 +2084,31 @@ def _stop_docker_containers():
     try:
         import docker
 
-        client = docker.from_env()
+        # docker-py defaults to a 60s per-request timeout. A daemon that is slow
+        # or wedged would then hold this sweep for minutes; with 39 orphans left
+        # by a killed test run it can block boot outright. The grace passed to
+        # stop() must stay below this or a normal stop would look like a timeout.
+        client = docker.from_env(timeout=_DOCKER_REAP_TIMEOUT)
     except Exception:
         return
-    for label in ("ministack=rds", "ministack=ecs", "ministack=elasticache", "ministack=eks", "ministack=lambda", "ministack=dsql"):
+    # Every label a service stamps on a container. A label missing here is a
+    # container that is never reclaimed — not at boot, not at shutdown, ever.
+    # mwaa/glue/codebuild/opensearch/msk were absent, and their Airflow, Spark
+    # and OpenSearch images are the heavyweight ones.
+    for label in ("ministack=rds", "ministack=ecs", "ministack=elasticache",
+                  "ministack=eks", "ministack=lambda", "ministack=dsql",
+                  "ministack=mwaa", "ministack=glue", "ministack=codebuild",
+                  "ministack=opensearch",
+                  # Backstop: match on the key alone, so a service that adds a
+                  # new value (or an older container predating its label) is
+                  # still reclaimed rather than accumulating forever.
+                  "ministack",
+                  "com.ministack.service"):
         try:
             # all=True so exited-but-not-removed orphans get cleaned at boot.
             for c in client.containers.list(all=True, filters={"label": label}):
                 try:
-                    c.stop(timeout=5)
+                    c.stop(timeout=2)
                     c.remove(v=True)
                 except Exception:
                     pass

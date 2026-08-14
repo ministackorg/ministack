@@ -22,6 +22,7 @@ import threading
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import run_offloop
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -134,12 +135,17 @@ def _validate_source_bucket_arn(bucket_arn: str):
     return None
 
 
+# Cap any single Docker daemon call. docker-py defaults to 60s, which turns a
+# slow or wedged daemon into a minutes-long stall on a request path.
+_DOCKER_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
+
+
 def _get_docker():
     global _docker
     if _docker is None:
         try:
             import docker
-            _docker = docker.from_env()
+            _docker = docker.from_env(timeout=_DOCKER_TIMEOUT)
         except Exception:
             pass
     return _docker
@@ -714,13 +720,15 @@ async def handle_request(method, path, headers, body, query_params):
     # CRUD on /environments/{Name}
     if clean_path.startswith("/environments/"):
         if method == "PUT":
-            return _create_environment(method, path, headers, body, query_params)
+            # Spawns the Airflow container — a heavyweight image and a slow start.
+            # Off-loop; Airflow does not call back into MiniStack.
+            return await run_offloop(_create_environment, method, path, headers, body, query_params)
         if method == "GET":
             return _get_environment(method, path, headers, body, query_params)
         if method == "PATCH":
-            return _update_environment(method, path, headers, body, query_params)
+            return await run_offloop(_update_environment, method, path, headers, body, query_params)
         if method == "DELETE":
-            return _delete_environment(method, path, headers, body, query_params)
+            return await run_offloop(_delete_environment, method, path, headers, body, query_params)
 
     return error_response_json("ValidationException",
                                f"Unknown MWAA path: {method} {path}", 400)

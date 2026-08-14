@@ -410,12 +410,17 @@ _DOCKER_BACKED_ACTIONS = {
 }
 
 
+# Cap any single Docker daemon call. docker-py defaults to 60s, which turns a
+# slow or wedged daemon into a minutes-long stall on a request path.
+_DOCKER_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
+
+
 def _get_docker():
     global _docker
     if _docker is None:
         try:
             import docker
-            _docker = docker.from_env()
+            _docker = docker.from_env(timeout=_DOCKER_TIMEOUT)
         except Exception:
             pass
     return _docker
@@ -877,11 +882,10 @@ async def handle_request(method, path, headers, body, query_params):
     handler = handlers.get(action)
     if not handler:
         return _error("InvalidAction", f"Unknown ElastiCache action: {action}", 400)
-    # Actions that start, stop or inspect real Docker containers block for as
-    # long as the daemon takes (an image pull can be tens of seconds). Run them
-    # off the event loop or they freeze every other service in the process.
-    # They cannot re-enter MiniStack — a Redis/Valkey container never calls back
-    # to 4566 — so the shared pool is the right home. See core/concurrency.
+    # Docker-backed actions block on the daemon (an image pull is tens of
+    # seconds) and would hold the event loop for every other service. Shared
+    # pool, not a dedicated thread: a Redis/Valkey container never calls back
+    # into MiniStack, so this cannot re-enter.
     if action in _DOCKER_BACKED_ACTIONS:
         return await run_offloop(handler, params)
     return handler(params)

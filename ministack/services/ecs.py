@@ -32,6 +32,7 @@ import threading
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import run_reentrant
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -309,13 +310,26 @@ async def handle_request(method, path, headers, body, query_params):
     target = headers.get("x-amz-target", "") or headers.get("X-Amz-Target", "")
     if target:
         action = target.split(".")[-1]
-        return _finalize_ecs_response(_dispatch_action(action, data))
+        # Docker work (RunTask/StopTask/service updates) blocks for as long as
+        # the daemon takes: a cached nginx start already holds the loop >7s,
+        # measured, during which no service in the process can be served.
+        #
+        # run_reentrant, not the shared pool: every task container is handed
+        # AWS_ENDPOINT_URL pointing back here (see _task_env), so a starting
+        # container calls into MiniStack while this call is still in flight. A
+        # bounded pool — or a per-service lock — would put that nested request
+        # behind the call waiting on it.
+        return _finalize_ecs_response(
+            await run_reentrant(_dispatch_action, action, data,
+                                thread_name="ministack-ecs-dispatch"))
 
     parts = [p for p in path.strip("/").split("/") if p]
     if not parts:
         return error_response_json("ClientException", "Missing path", 400)
 
-    return _finalize_ecs_response(_dispatch_path(method, parts, data))
+    return _finalize_ecs_response(
+        await run_reentrant(_dispatch_path, method, parts, data,
+                            thread_name="ministack-ecs-dispatch"))
 
 
 def _dispatch_action(action, data):

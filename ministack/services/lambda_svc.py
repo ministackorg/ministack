@@ -56,7 +56,6 @@ from ministack.core.lambda_runtime import (
     invalidate_worker,
     reap_idle_workers,
     release_worker,
-    workers_in_use,
 )
 from ministack.core.persistence import PERSIST_STATE, STATE_DIR, load_state
 from ministack.core.responses import (
@@ -74,6 +73,11 @@ from ministack.core.responses import (
 )
 
 logger = logging.getLogger("lambda")
+
+# Cap any single Docker daemon call. docker-py defaults to 60s, which turns a
+# slow or wedged daemon into a minutes-long stall on a request path.
+_DOCKER_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
+
 
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 
@@ -222,7 +226,7 @@ def _get_docker_client():
     if not _docker_available:
         return None
     try:
-        _cached_docker_client = docker_lib.from_env()
+        _cached_docker_client = docker_lib.from_env(timeout=_DOCKER_TIMEOUT)
         return _cached_docker_client
     except Exception:
         return None
@@ -3802,6 +3806,80 @@ def _emit_lambda_logs(func: dict, request_id: str, log_text: str,
         logger.debug("CW Logs emit failed for %s: %s", func.get("config", {}).get("FunctionName"), exc)
 
 
+# ---------------------------------------------------------------------------
+# Concurrency accounting — executor-agnostic
+# ---------------------------------------------------------------------------
+#
+# AWS model: concurrent invocations of a function each occupy one unit of
+# concurrency. ReservedConcurrentExecutions caps a single function; the account
+# limit caps every function together. Neither queues — at the limit AWS returns
+# ConcurrentInvocationLimitExceeded (429).
+#
+# This lives at _execute_function rather than in any executor's worker pool
+# because MiniStack has six executors (warm subprocess, docker RIE, provided
+# runtime, proxy, one-off subprocess, and the ESM/WebSocket path) and only some
+# of them own a pool. Counting per pool undercounts every other path, so a
+# mixed deployment would silently never hit the cap.
+_inflight: dict[str, int] = {}
+_inflight_total = 0
+_inflight_lock = threading.Lock()
+
+
+def _inflight_key(config: dict) -> str:
+    try:
+        account, region = _account_region_from_function_config(config)
+    except Exception:
+        account, region = get_account_id(), get_region()
+    return f"{account}:{region}:{config.get('FunctionName', '?')}:{config.get('Version', '$LATEST')}"
+
+
+def _acquire_execution_slot(func: dict, config: dict):
+    """Reserve one unit of concurrency, or None when a cap is reached.
+
+    Never blocks. Waiting for a unit held by your own caller is precisely the
+    deadlock this module exists to avoid: a handler that invokes itself would
+    wait forever on its own slot.
+
+    ``ReservedConcurrentExecutions`` is stored as a bare int on the *function
+    record* under "concurrency" (see _get_function_response), not on the config,
+    so both are consulted rather than assuming either shape.
+    """
+    global _inflight_total
+    reserved = (func or {}).get("concurrency")
+    if isinstance(reserved, dict):
+        reserved = reserved.get("ReservedConcurrentExecutions")
+    if reserved is None:
+        reserved = config.get("ReservedConcurrentExecutions")
+    key = _inflight_key(config)
+    with _inflight_lock:
+        if reserved and _inflight.get(key, 0) >= int(reserved):
+            return None
+        if _ACCOUNT_CONCURRENCY_CAP > 0 and _inflight_total >= _ACCOUNT_CONCURRENCY_CAP:
+            return None
+        _inflight[key] = _inflight.get(key, 0) + 1
+        _inflight_total += 1
+    return key
+
+
+def _release_execution_slot(key: str) -> None:
+    global _inflight_total
+    if key is None:
+        return
+    with _inflight_lock:
+        remaining = _inflight.get(key, 0) - 1
+        if remaining > 0:
+            _inflight[key] = remaining
+        else:
+            _inflight.pop(key, None)
+        _inflight_total = max(0, _inflight_total - 1)
+
+
+def executions_in_flight() -> tuple[int, dict]:
+    """(total, per-function) invocations currently executing, any executor."""
+    with _inflight_lock:
+        return _inflight_total, dict(_inflight)
+
+
 def _execute_function(func: dict, event: dict) -> dict:
     """Dispatch an invocation to the right executor and emit CloudWatch Logs.
 
@@ -3817,10 +3895,33 @@ def _execute_function(func: dict, event: dict) -> dict:
     """
     config = func.get("config") or func
     if _function_config_scope_mismatch(config):
+        # Re-entered below under the right scope; counting here would double-book
+        # the slot for a single invocation.
         return _run_with_function_config_scope(config, _execute_function, func, event)
 
     request_id = new_uuid()
     started = time.time()
+
+    # Concurrency is accounted here, the one point every executor passes
+    # through, so warm / docker / provided / proxy / one-off all draw on the
+    # same denominator. Accounting inside an executor's own worker pool would
+    # only ever see that executor's share.
+    slot = _acquire_execution_slot(func, config)
+    if slot is None:
+        _emit_lambda_metrics(config.get("FunctionName", "unknown"),
+                             duration_ms=0.0, error=False, throttle=True)
+        return {"throttle": True, "body": {
+            "Message": "Rate Exceeded.", "Type": "User",
+            "__type": "ConcurrentInvocationLimitExceededException"}}
+    try:
+        return _execute_function_dispatch(func, config, event, request_id, started)
+    finally:
+        _release_execution_slot(slot)
+
+
+def _execute_function_dispatch(func: dict, config: dict, event: dict,
+                               request_id: str, started: float) -> dict:
+    """Executor selection for a single accounted invocation."""
 
     # Proxy mode wins over every other executor: the function is bound to a
     # user-managed container, ministack only forwards the event.
@@ -3997,21 +4098,15 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
     # ReservedConcurrentExecutions caps the function; the account cap is checked
     # across every function. Both report a throttle rather than queueing —
     # blocking for a free worker would deadlock a handler that invokes itself.
-    # Read the reservation the same way the docker path does (#3620): it lives
-    # on the function record, not the config, and may be wrapped in a dict.
-    reserved = func.get("concurrency")
-    if isinstance(reserved, dict):
-        reserved = reserved.get("ReservedConcurrentExecutions")
-    max_conc = int(reserved) if reserved else None
+    # Concurrency (ReservedConcurrentExecutions / account cap) is already
+    # accounted upstream in _execute_function, for every executor. What is left
+    # here is purely the warm-subprocess resource ceiling.
     _ensure_reaper_thread()
-    if _ACCOUNT_CONCURRENCY_CAP > 0 and workers_in_use() >= _ACCOUNT_CONCURRENCY_CAP:
-        return {"throttle": True, "body": {
-            "Message": f"Rate Exceeded: account concurrency cap {_ACCOUNT_CONCURRENCY_CAP} reached"}}
-    worker, reason = acquire_worker(
-        func_name, config, code_zip, qualifier=qualifier, max_concurrency=max_conc)
+    worker, reason = acquire_worker(func_name, config, code_zip, qualifier=qualifier)
     if worker is None and reason == "func_cap":
         return {"throttle": True, "body": {
-            "Message": "Rate Exceeded: ReservedConcurrentExecutions reached"}}
+            "Message": "Rate Exceeded.", "Type": "User",
+            "__type": "ConcurrentInvocationLimitExceededException"}}
     try:
         # Inject X-Ray trace header into the event so the worker bootstrap
         # can set ``_X_AMZN_TRACE_ID`` in os.environ before calling the

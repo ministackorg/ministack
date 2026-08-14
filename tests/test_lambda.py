@@ -9612,3 +9612,117 @@ def test_lambda_keepalive_zero_forces_cold_start(monkeypatch):
     finally:
         with _svc._warm_pool_lock:
             _svc._warm_pool.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# Re-entrant invocation — a handler that calls back into the emulator during
+# its own invocation, including into its own function.
+#
+# Every synchronous execution used to hold one worker out of the event loop's
+# bounded default pool for the whole handler duration, so a handler's nested
+# call queued behind the invocations waiting on it and wedged at exactly the
+# pool size. Separately, the local executor kept a single Worker per function
+# whose lock was held for the whole handler, so a function invoking *itself*
+# deadlocked on the first hop regardless of threading.
+#
+# Executions now run on a dedicated thread each (core.concurrency.run_reentrant)
+# and draw a warm worker from a per-function pool, with AWS's concurrency model
+# enforced once, in lambda_svc._acquire_execution_slot.
+# ---------------------------------------------------------------------------
+
+_SELF_INVOKE_CODE = """
+import json, os, urllib.request
+
+def handler(event, context):
+    depth = int(event.get("depth", 0))
+    limit = int(event.get("limit", 3))
+    if depth >= limit:
+        return {"depth": depth, "leaf": True}
+    req = urllib.request.Request(
+        os.environ["AWS_ENDPOINT_URL"]
+        + "/2015-03-31/functions/" + context.function_name + "/invocations",
+        data=json.dumps({"depth": depth + 1, "limit": limit}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        return {"depth": depth, "child": json.loads(resp.read().decode())}
+"""
+
+
+@pytest.mark.skipif(
+    os.environ.get("LAMBDA_EXECUTOR", "").lower() == "docker",
+    reason="exercises the in-process warm worker pool; the docker executor "
+    "spawns a container per concurrent invocation and has no shared lock",
+)
+def test_lambda_self_invoking_handler_does_not_deadlock(lam):
+    """A handler that invokes its own function completes.
+
+    Real AWS allows this and only intervenes at the ~16-hop recursive-loop
+    limit. Before the per-function worker pool this deadlocked at the *first*
+    hop, with a single caller and no concurrency involved: the nested invoke
+    waited on the worker lock its own parent held, and the invocation burned
+    its whole timeout.
+    """
+    name = f"lam-self-invoke-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=name, Runtime="python3.12", Handler="index.handler",
+        Role=_LAMBDA_ROLE, Code={"ZipFile": _make_zip(_SELF_INVOKE_CODE)},
+        Timeout=30,
+    )
+    try:
+        resp = lam.invoke(
+            FunctionName=name,
+            Payload=json.dumps({"depth": 0, "limit": 4}).encode(),
+        )
+        assert resp.get("FunctionError", "") == "", resp.get("FunctionError")
+        payload = json.loads(resp["Payload"].read())
+        # Four nested levels, each reporting its own depth, innermost a leaf.
+        for expected in range(4):
+            assert payload["depth"] == expected
+            payload = payload["child"]
+        assert payload == {"depth": 4, "leaf": True}
+    finally:
+        with contextlib.suppress(Exception):
+            lam.delete_function(FunctionName=name)
+
+
+def test_lambda_reserved_concurrency_throttles_rather_than_queues(lam):
+    """At ReservedConcurrentExecutions the extra invocation is throttled.
+
+    AWS returns TooManyRequestsException rather than queueing. Queueing would
+    also reintroduce the deadlock: an invocation waiting for a unit its own
+    caller holds waits forever.
+    """
+    import concurrent.futures
+
+    name = f"lam-reserved-{_uuid_mod.uuid4().hex[:8]}"
+    code = "import time\ndef handler(event, context):\n    time.sleep(1.5)\n    return {'ok': True}\n"
+    lam.create_function(
+        FunctionName=name, Runtime="python3.12", Handler="index.handler",
+        Role=_LAMBDA_ROLE, Code={"ZipFile": _make_zip(code)}, Timeout=30,
+    )
+    try:
+        lam.put_function_concurrency(
+            FunctionName=name, ReservedConcurrentExecutions=1)
+
+        def _invoke(_i):
+            try:
+                resp = lam.invoke(FunctionName=name, Payload=b"{}")
+                resp["Payload"].read()
+                return resp["StatusCode"], resp.get("FunctionError", "")
+            except ClientError as exc:
+                return exc.response["ResponseMetadata"]["HTTPStatusCode"], "throttled"
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+            results = list(ex.map(_invoke, range(3)))
+
+        throttled = [r for r in results if r[0] == 429 or r[1] == "throttled"]
+        succeeded = [r for r in results if r[0] == 200 and not r[1]]
+        assert succeeded, f"reservation of 1 must still admit one invoke: {results}"
+        assert throttled, (
+            f"invocations beyond ReservedConcurrentExecutions=1 must throttle, "
+            f"not queue or hang: {results}"
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            lam.delete_function(FunctionName=name)
