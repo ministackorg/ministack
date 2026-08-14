@@ -76,6 +76,15 @@ def _account_region_from_function_config(config: dict) -> tuple[str, str]:
 _workers: dict = {}
 _lock = threading.Lock()
 
+# Local-executor pool bounds. Each worker is a subprocess, so the pool per
+# function must be capped or a concurrency burst exhausts the OS process table
+# and takes the whole server down. 16 covers AWS's ~16-hop recursive-loop limit,
+# which is the deepest legitimate self-invocation chain.
+_LOCAL_MAX_WORKERS = int(os.environ.get("LAMBDA_LOCAL_MAX_WORKERS", "16"))
+# Seconds a surplus worker may sit idle before it is reaped (the first worker
+# per function is never reaped, so warm starts are unaffected).
+_LOCAL_WORKER_TTL = float(os.environ.get("LAMBDA_LOCAL_WORKER_TTL", "60"))
+
 # ---------------------------------------------------------------------------
 # Python worker script (runs inside a persistent subprocess)
 # ---------------------------------------------------------------------------
@@ -854,6 +863,10 @@ class Worker:
         self._proc = None
         self._tmpdir = None
         self._lock = threading.Lock()
+        # Leased out to an in-flight invocation. Guarded by the module ``_lock``
+        # (see acquire_worker/release_worker), not by ``self._lock``.
+        self.in_use = False
+        self.last_used = time.time()
         self._cold = True
         self._start_time = None
         self._stderr_queue: queue.Queue = queue.Queue()
@@ -1195,20 +1208,115 @@ class Worker:
             shutil.rmtree(self._tmpdir, ignore_errors=True)
 
 
-def get_or_create_worker(func_name: str, config: dict, code_zip: bytes,
-                         qualifier: str = "$LATEST") -> Worker:
+def _worker_key(func_name: str, config: dict, qualifier: str) -> str:
     # Include account ID and region in the key to isolate workers across
     # accounts and regions. Two regions deploying the same function name must
     # not share a worker.
     account, region = _account_region_from_function_config(config)
-    key = f"{account}:{region}:{func_name}:{qualifier}"
+    return f"{account}:{region}:{func_name}:{qualifier}"
+
+
+def acquire_worker(func_name: str, config: dict, code_zip: bytes,
+                   qualifier: str = "$LATEST", max_concurrency: int | None = None):
+    """Lease a free execution environment for this function.
+
+    Each key holds a *pool* of workers, mirroring how AWS gives concurrent
+    invocations separate execution environments (and how the Docker executor's
+    ``_warm_pool`` already behaves). A single shared worker per function could
+    not: ``Worker.invoke`` holds the worker's lock for the whole handler, so a
+    handler that invokes its own function — which real AWS supports, up to the
+    ~16-hop recursive-loop limit — waited on the lock its own caller held and
+    deadlocked. The thread the invocation runs on is irrelevant to that; the
+    lock is the bottleneck.
+
+    The pool is bounded. Each worker is an OS subprocess, so an unbounded pool
+    would trade the deadlock for process exhaustion — the whole server dies
+    instead of one call hanging. ``max_concurrency``
+    (ReservedConcurrentExecutions) caps it when set; otherwise
+    ``LAMBDA_LOCAL_MAX_WORKERS`` does, defaulting to 16 to cover AWS's ~16-hop
+    recursive-loop limit. At the cap the caller gets a throttle rather than a
+    blocking wait, because waiting for a worker held by your own caller is the
+    deadlock this exists to remove.
+
+    Returns ``(worker, "reused"|"spawn")`` or ``(None, "func_cap")`` when the
+    cap is reached, which the caller reports as a throttle. Release with
+    :func:`release_worker`.
+    """
+    key = _worker_key(func_name, config, qualifier)
+    cap = max_concurrency or _LOCAL_MAX_WORKERS
     with _lock:
-        worker = _workers.get(key)
-        if worker is not None:
-            return worker
+        entries = _workers.setdefault(key, [])
+        for worker in entries:
+            if not worker.in_use:
+                worker.in_use = True
+                worker.last_used = time.time()
+                return worker, "reused"
+        if cap and len(entries) >= cap:
+            return None, "func_cap"
         worker = Worker(func_name, config, code_zip)
-        _workers[key] = worker
-        return worker
+        worker.in_use = True
+        worker.last_used = time.time()
+        entries.append(worker)
+        return worker, "spawn"
+
+
+def reap_idle_workers(ttl: float = None) -> int:
+    """Kill workers idle longer than ``ttl`` and drop them from their pool.
+
+    Without this the pools only ever grow: a burst of concurrency leaves its
+    extra subprocesses alive forever. The first worker of each key is kept so
+    the common warm-start path is unaffected.
+    """
+    ttl = _LOCAL_WORKER_TTL if ttl is None else ttl
+    now = time.time()
+    killed = []
+    with _lock:
+        for key, entries in list(_workers.items()):
+            keep = []
+            for i, worker in enumerate(entries):
+                idle = now - getattr(worker, "last_used", now)
+                if i == 0 or worker.in_use or idle < ttl:
+                    keep.append(worker)
+                else:
+                    killed.append(worker)
+            if keep:
+                _workers[key] = keep
+            else:
+                _workers.pop(key, None)
+    for worker in killed:
+        try:
+            worker.kill()
+        except Exception:
+            pass
+    return len(killed)
+
+
+def release_worker(worker: Worker) -> None:
+    """Return a leased worker to its pool."""
+    if worker is None:
+        return
+    with _lock:
+        worker.in_use = False
+
+
+def workers_in_use() -> int:
+    """Count of leased workers across every function, for concurrency limits."""
+    with _lock:
+        return sum(1 for lst in _workers.values() for w in lst if w.in_use)
+
+
+def get_or_create_worker(func_name: str, config: dict, code_zip: bytes,
+                         qualifier: str = "$LATEST") -> Worker:
+    """Back-compat lease that never reports a cap and is released immediately.
+
+    Retained for callers that hold a worker only for the duration of a single
+    ``invoke`` on the calling thread. The lease is dropped before returning, so
+    such callers still serialize on ``Worker._lock`` exactly as before rather
+    than silently retaining a pool slot they never release.
+    """
+    worker, _reason = acquire_worker(func_name, config, code_zip, qualifier=qualifier)
+    release_worker(worker)
+    return worker
 
 
 def invalidate_worker(func_name: str, qualifier: str = None,
@@ -1245,14 +1353,14 @@ def invalidate_worker(func_name: str, qualifier: str = None,
     with _lock:
         to_remove = [k for k in _workers if _matches(k)]
         for k in to_remove:
-            worker = _workers.pop(k, None)
-            if worker:
+            for worker in _workers.pop(k, []) or []:
                 worker.kill()
 
 
 def reset():
     """Terminate all warm workers, clean up temp dirs, and clear the pool."""
     with _lock:
-        for worker in list(_workers.values()):
-            worker.kill()
+        for entries in list(_workers.values()):
+            for worker in entries:
+                worker.kill()
         _workers.clear()

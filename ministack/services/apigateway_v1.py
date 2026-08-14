@@ -98,6 +98,7 @@ import urllib.request
 import yaml
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import run_reentrant
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -644,7 +645,8 @@ async def _call_lambda(function_ref, event, *, account_id=None, region=None):
     # Response shaping (throttle→429, error→502, body→envelope) goes through
     # the shared helper so v1/v2 stay consistent.
     exec_record = lambda_svc._execution_record_for_config(func_data, func_config)
-    result = await asyncio.to_thread(lambda_svc._execute_function_with_config_scope, exec_record, event)
+    result = await run_reentrant(lambda_svc._execute_function_with_config_scope, exec_record, event,
+                                 thread_name="ministack-apigw-invoke")
     lambda_response, _ = lambda_svc.lambda_execute_result_to_api_proxy_response(result)
     # On error the helper returns {statusCode: 502, body: <msg>}; preserve
     # the _call_lambda contract of (None, error_msg) so callers that check
@@ -1303,8 +1305,9 @@ async def _invoke_authorizer_lambda(authorizer, event, account_id, region):
     if func_data is None or func_config is None:
         return None
     exec_record = lambda_svc._execution_record_for_config(func_data, func_config)
-    return await asyncio.to_thread(
-        lambda_svc._execute_function_with_config_scope, exec_record, event
+    return await run_reentrant(
+        lambda_svc._execute_function_with_config_scope, exec_record, event,
+        thread_name="ministack-apigw-authorizer",
     )
 
 

@@ -49,7 +49,15 @@ from typing import Any
 from urllib.parse import quote, unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.lambda_runtime import get_or_create_worker, invalidate_worker
+from ministack.core.concurrency import run_reentrant
+from ministack.core.lambda_runtime import (
+    acquire_worker,
+    get_or_create_worker,
+    invalidate_worker,
+    reap_idle_workers,
+    release_worker,
+    workers_in_use,
+)
 from ministack.core.persistence import PERSIST_STATE, STATE_DIR, load_state
 from ministack.core.responses import (
     _12_DIGIT_RE,
@@ -2446,7 +2454,8 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
     # RequestResponse — execute in worker thread so nested SDK calls
     # from the Lambda process can still reach this ASGI server.
     _t_start = time.time()
-    result = await asyncio.to_thread(_execute_function_with_config_scope, exec_record, event)
+    result = await run_reentrant(_execute_function_with_config_scope, exec_record, event,
+                                 thread_name="ministack-lambda-invoke")
     _duration_ms = (time.time() - _t_start) * 1000.0
     _emit_lambda_metrics(
         name,
@@ -2810,6 +2819,13 @@ def _ensure_reaper_thread() -> None:
                     _pool_evict_idle()
                 except Exception as exc:
                     logger.debug("Lambda pool reaper iteration error: %s", exc)
+                try:
+                    # Local executor: surplus warm *subprocesses* left behind by
+                    # a concurrency burst. Without this the per-function pools
+                    # only grow.
+                    reap_idle_workers()
+                except Exception as exc:
+                    logger.debug("Lambda worker reaper iteration error: %s", exc)
         threading.Thread(target=_loop, daemon=True, name="ministack-lambda-reaper").start()
         _reaper_started = True
 
@@ -3977,8 +3993,26 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
 
     func_name = config.get("FunctionName", "unknown")
     qualifier = config.get("Version", "$LATEST")
+    # Concurrent invocations take separate execution environments, as on AWS.
+    # ReservedConcurrentExecutions caps the function; the account cap is checked
+    # across every function. Both report a throttle rather than queueing —
+    # blocking for a free worker would deadlock a handler that invokes itself.
+    # Read the reservation the same way the docker path does (#3620): it lives
+    # on the function record, not the config, and may be wrapped in a dict.
+    reserved = func.get("concurrency")
+    if isinstance(reserved, dict):
+        reserved = reserved.get("ReservedConcurrentExecutions")
+    max_conc = int(reserved) if reserved else None
+    _ensure_reaper_thread()
+    if _ACCOUNT_CONCURRENCY_CAP > 0 and workers_in_use() >= _ACCOUNT_CONCURRENCY_CAP:
+        return {"throttle": True, "body": {
+            "Message": f"Rate Exceeded: account concurrency cap {_ACCOUNT_CONCURRENCY_CAP} reached"}}
+    worker, reason = acquire_worker(
+        func_name, config, code_zip, qualifier=qualifier, max_concurrency=max_conc)
+    if worker is None and reason == "func_cap":
+        return {"throttle": True, "body": {
+            "Message": "Rate Exceeded: ReservedConcurrentExecutions reached"}}
     try:
-        worker = get_or_create_worker(func_name, config, code_zip, qualifier=qualifier)
         # Inject X-Ray trace header into the event so the worker bootstrap
         # can set ``_X_AMZN_TRACE_ID`` in os.environ before calling the
         # handler. Per-invocation, not bake-time, so it can't live in the
@@ -4005,11 +4039,14 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
     except Exception as e:
         logger.error("Warm worker execution error for %s: %s", func_name, e)
         invalidate_worker(func_name, qualifier=qualifier, account=get_account_id(), region=get_region())
+        worker = None  # invalidate_worker already dropped it from the pool
         return {
             "body": {"errorMessage": str(e), "errorType": type(e).__name__},
             "error": True,
             "log": "",
         }
+    finally:
+        release_worker(worker)
 
 
 def _execute_function_provided(func: dict, event: dict) -> dict:
@@ -6591,7 +6628,8 @@ async def handle_function_url_request(
 
     event = _build_function_url_event(url_id, account_id, region, method, path, headers, body, query_params)
     exec_record = _execution_record_for_config(func_data, func_config)
-    result = await asyncio.to_thread(_execute_function_with_config_scope, exec_record, event)
+    result = await run_reentrant(_execute_function_with_config_scope, exec_record, event,
+                                 thread_name="ministack-lambda-url")
 
     if cfg.get("InvokeMode") == "RESPONSE_STREAM" and not result.get("error") and not result.get("throttle"):
         return _function_url_stream_response(result, cors_headers)

@@ -27,6 +27,7 @@ import time
 from urllib.parse import parse_qs
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import run_offloop
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -397,6 +398,16 @@ def _validate_modify_replication_group_request(p):
             return _error("UserGroupNotFound",
                           "The user group was not found or does not exist", 404)
     return None
+
+
+# Actions whose implementation talks to the Docker daemon (container run/get/
+# stop). Kept explicit so a new action is off-loop by decision, not by accident.
+_DOCKER_BACKED_ACTIONS = {
+    "CreateCacheCluster", "DeleteCacheCluster", "ModifyCacheCluster",
+    "RebootCacheCluster", "CreateReplicationGroup", "DeleteReplicationGroup",
+    "ModifyReplicationGroup", "IncreaseReplicaCount", "DecreaseReplicaCount",
+    "DescribeCacheClusters", "DescribeReplicationGroups",
+}
 
 
 def _get_docker():
@@ -866,6 +877,13 @@ async def handle_request(method, path, headers, body, query_params):
     handler = handlers.get(action)
     if not handler:
         return _error("InvalidAction", f"Unknown ElastiCache action: {action}", 400)
+    # Actions that start, stop or inspect real Docker containers block for as
+    # long as the daemon takes (an image pull can be tens of seconds). Run them
+    # off the event loop or they freeze every other service in the process.
+    # They cannot re-enter MiniStack — a Redis/Valkey container never calls back
+    # to 4566 — so the shared pool is the right home. See core/concurrency.
+    if action in _DOCKER_BACKED_ACTIONS:
+        return await run_offloop(handler, params)
     return handler(params)
 
 

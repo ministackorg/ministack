@@ -25,6 +25,7 @@ import threading
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import spawn_background
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -530,8 +531,7 @@ def _deliver_to_iceberg(stream: dict, dest: dict, records: list):
                                name, db, table, exc)
 
     try:
-        loop = asyncio.get_running_loop()
-        loop.run_in_executor(None, _run)
+        spawn_background(_run, thread_name="ministack-firehose-iceberg")
     except RuntimeError:
         _run()
 
