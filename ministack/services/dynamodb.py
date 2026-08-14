@@ -537,8 +537,8 @@ def _validate_item(item: dict, pk_name: str | None = None, sk_name: str | None =
                 key_bytes = len(kval) if isinstance(kval, (str, bytes)) else 0
         if key_bytes > max_bytes:
             return error_response_json("ValidationException",
-                f"One or more parameter values were invalid: Aggregated size of all range keys has exceeded the size limit of 1024 bytes" if key_name == sk_name else
-                f"One or more parameter values were invalid: Aggregated size of all hash keys has exceeded the size limit of 2048 bytes", 400)
+                "One or more parameter values were invalid: Aggregated size of all range keys has exceeded the size limit of 1024 bytes" if key_name == sk_name else
+                "One or more parameter values were invalid: Aggregated size of all hash keys has exceeded the size limit of 2048 bytes", 400)
     size = _item_size_bytes(item)
     if size > _DDB_ITEM_MAX_BYTES:
         return error_response_json("ValidationException",
@@ -1146,10 +1146,10 @@ def _create_table(data):
                 f"One or more parameter values were invalid: Unknown ProjectionType: {ptype}", 400)
         if ptype == "INCLUDE" and not proj.get("NonKeyAttributes"):
             return error_response_json("ValidationException",
-                f"One or more parameter values were invalid: INCLUDE ProjectionType requires NonKeyAttributes to be specified", 400)
+                "One or more parameter values were invalid: INCLUDE ProjectionType requires NonKeyAttributes to be specified", 400)
         if ptype == "KEYS_ONLY" and proj.get("NonKeyAttributes"):
             return error_response_json("ValidationException",
-                f"One or more parameter values were invalid: KEYS_ONLY projection type is not compatible with NonKeyAttributes", 400)
+                "One or more parameter values were invalid: KEYS_ONLY projection type is not compatible with NonKeyAttributes", 400)
 
     # Validate StreamSpecification: StreamEnabled:false with StreamViewType is invalid.
     stream_spec = data.get("StreamSpecification")
@@ -2715,7 +2715,7 @@ def _batch_execute_statement(data):
             _is_delete = raw_stmt.strip().upper().startswith("DELETE")
             if _is_delete and _ret_clause not in ("ALL OLD *",):
                 responses.append({"Error": {"Code": "ValidationError",
-                    "Message": f"Only RETURNING ALL OLD * is allowed on DELETE statements"}})
+                    "Message": "Only RETURNING ALL OLD * is allowed on DELETE statements"}})
                 continue
             if _ret_clause not in _valid_ret:
                 responses.append({"Error": {"Code": "ValidationError",
@@ -5809,7 +5809,7 @@ def _validate_index_key_values(table: dict, item: dict) -> tuple | None:
             err = _empty_key_value_error(key_name, raw)
             if err:
                 return error_response_json("ValidationException",
-                    f"One or more parameter values were invalid: Condition parameter type does not match schema type", 400)
+                    "One or more parameter values were invalid: Condition parameter type does not match schema type", 400)
     return None
 
 
