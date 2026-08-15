@@ -1330,8 +1330,11 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
 
     # Stream the target response instead of reading it whole: a target that
     # streams (SSE, chunked audio) otherwise arrives only once it has finished
-    # generating. Only the status and headers are awaited here; StreamingResponse
-    # hands the body to the ASGI layer, which drops Content-Length and chunks it.
+    # generating. Only the status and headers are awaited here; the body goes to
+    # the ASGI layer, which keeps whichever framing the target chose.
+    #
+    # AWS relays the target's response as it arrives and preserves its framing:
+    # https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-troubleshooting.html#http-504-issues
     from ministack.core.responses import StreamingResponse
 
     def _open():
