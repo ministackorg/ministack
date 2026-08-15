@@ -852,6 +852,130 @@ def test_elbv2_dataplane_forward_ip_target(elbv2):
         _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
 
 
+def _start_chunked_server(chunks, delay):
+    """Serve `chunks` with `delay` seconds between them and no Content-Length."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            for i, chunk in enumerate(chunks):
+                if i:
+                    time.sleep(delay)
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+                self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
+def _start_fixed_body_server(body):
+    """Serve `body` in one shot with a Content-Length."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
+@pytest.mark.serial
+def test_elbv2_dataplane_streams_target_response(elbv2):
+    """A streaming target reaches the client as it produces, not at the end.
+
+    Four chunks 0.25s apart: buffering makes the first byte land with the last
+    one, so first-byte time would equal total time.
+    """
+    import urllib.request as _req
+
+    chunks = [b"chunk-%d" % i for i in range(4)]
+    delay = 0.25
+    server, thread = _start_chunked_server(chunks, delay)
+    port = server.server_address[1]
+
+    lb_name = "dp-alb-stream"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", port)
+    try:
+        started = time.monotonic()
+        resp = _req.urlopen(_req.Request(f"{_endpoint}/_alb/{lb_name}/", method="GET"))
+        first = resp.read(len(chunks[0]))
+        first_byte_at = time.monotonic() - started
+        rest = resp.read()
+        total_at = time.monotonic() - started
+
+        assert resp.status == 200
+        assert first + rest == b"".join(chunks)
+        # Three inter-chunk gaps, so the body spans ~0.75s. Half of that is a
+        # wide margin against scheduling noise while still failing outright if
+        # the response is buffered.
+        assert first_byte_at < total_at - (delay * 3) / 2, (
+            f"first byte at {first_byte_at:.3f}s, complete at {total_at:.3f}s — response was buffered"
+        )
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.serial
+def test_elbv2_dataplane_non_streaming_body_is_intact(elbv2):
+    """A plain Content-Length response survives the read loop unchanged.
+
+    The body is larger than one read so a truncating or mis-ordered loop shows
+    up as a length or content mismatch. The framing is asserted too: AWS ALB
+    passes the target's Content-Length through rather than re-chunking, so a
+    fixed-length target must not arrive chunked.
+    """
+    import urllib.request as _req
+
+    body = bytes(range(256)) * 1024  # 256 KiB, spans several reads
+    server, thread = _start_fixed_body_server(body)
+    port = server.server_address[1]
+
+    lb_name = "dp-alb-fixed"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", port)
+    try:
+        resp = _req.urlopen(_req.Request(f"{_endpoint}/_alb/{lb_name}/", method="GET"))
+        received = resp.read()
+        assert resp.status == 200
+        assert resp.headers.get("Content-Type") == "application/octet-stream"
+        assert resp.headers.get("Content-Length") == str(len(body))
+        assert resp.headers.get("Transfer-Encoding") is None
+        assert len(received) == len(body)
+        assert received == body
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 @pytest.mark.serial
 def test_elbv2_dataplane_forward_instance_target_hostname(elbv2):
     """Instance targets resolve the Id as a hostname (no EC2 metadata in an

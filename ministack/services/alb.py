@@ -1328,18 +1328,49 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
 
     data = body if isinstance(body, (bytes, bytearray)) else (body.encode() if body else None)
 
-    def _do():
+    # Stream the target response instead of reading it whole: a target that
+    # streams (SSE, chunked audio) otherwise arrives only once it has finished
+    # generating. Only the status and headers are awaited here; StreamingResponse
+    # hands the body to the ASGI layer, which drops Content-Length and chunks it.
+    from ministack.core.responses import StreamingResponse
+
+    def _open():
         req = urllib.request.Request(url, data=data, method=method.upper(), headers=fwd)
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                return resp.status, dict(resp.headers), resp.read()
+            return urllib.request.urlopen(req, timeout=15), None
         except urllib.error.HTTPError as e:
-            return e.code, dict(e.headers), e.read()
+            # HTTPError is readable, so error bodies take the same path.
+            return e, None
         except Exception as e:
-            return (502, {"Content-Type": "application/json"},
-                    json.dumps({"message": f"Target {host}:{port} connect error: {e}"}).encode())
+            return None, e
 
-    return await asyncio.to_thread(_do)
+    resp, err = await asyncio.to_thread(_open)
+    if resp is None:
+        return (502, {"Content-Type": "application/json"},
+                json.dumps({"message": f"Target {host}:{port} connect error: {err}"}).encode())
+
+    status, out_headers = resp.status, dict(resp.headers)
+
+    # read1 returns whatever has arrived rather than waiting for a full buffer,
+    # which is what keeps small-chunk streams (SSE) prompt. HTTPError bodies do
+    # not expose it, so fall back to read there.
+    read = getattr(resp, "read1", None) or resp.read
+
+    async def _stream(send, receive):
+        try:
+            while True:
+                chunk = await asyncio.to_thread(read, 65536)
+                if not chunk:
+                    break
+                await send({"type": "http.response.body", "body": chunk, "more_body": True})
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    return status, out_headers, StreamingResponse(_stream)
 
 
 # ---------------------------------------------------------------------------

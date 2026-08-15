@@ -545,10 +545,11 @@ async def _send_response(send, status, headers, body):
 async def _send_streaming_response(send, receive, status, headers, streaming):
     """Hold an HTTP response open and stream body chunks until the runner ends.
 
-    Used by CloudWatch Logs ``StartLiveTail`` (and any future long-lived
-    eventstream). Omits ``Content-Length`` so the ASGI server can chunk.
+    Used by CloudWatch Logs ``StartLiveTail`` and by the ALB data plane. A
+    handler that knows the length keeps ``Content-Length``, so a proxied
+    response keeps the framing its target chose; long-lived eventstreams set
+    none and the ASGI server chunks those.
     """
-    headers = {k: v for k, v in headers.items() if k.lower() != "content-length"}
     await send(
         {
             "type": "http.response.start",
