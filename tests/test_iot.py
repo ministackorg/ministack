@@ -7,6 +7,7 @@ iot-data Publish) is covered separately in ``test_iot_data.py``.
 
 import base64
 import json
+import logging
 import time
 import uuid
 
@@ -351,6 +352,23 @@ def test_iot_register_certificate_preserves_pem_verbatim(iot_client):
     iot_client.delete_certificate(certificateId=cert_id)
 
 
+def test_iot_register_certificate_set_as_active_query_param(iot_client):
+    pytest.importorskip("cryptography")
+    # boto3 sends setAsActive as a querystring parameter (per the botocore
+    # model), not in the JSON body — the cert must still come out ACTIVE.
+    issued = iot_client.create_keys_and_certificate(setAsActive=False)
+    cert_pem = issued["certificatePem"]
+    iot_client.delete_certificate(certificateId=issued["certificateId"])
+
+    cert_id = iot_client.register_certificate(
+        certificatePem=cert_pem, setAsActive=True
+    )["certificateId"]
+    desc = iot_client.describe_certificate(certificateId=cert_id)
+    assert desc["certificateDescription"]["status"] == "ACTIVE"
+    iot_client.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
+    iot_client.delete_certificate(certificateId=cert_id)
+
+
 def test_iot_attach_detach_thing_principal(iot_client):
     pytest.importorskip("cryptography")
     name = _unique("thing")
@@ -489,6 +507,511 @@ def test_iot_attach_detach_policy(iot_client):
 
 
 # ---------------------------------------------------------------------------
+# Certificates: register-no-CA + legacy principal-policy family
+# ---------------------------------------------------------------------------
+
+
+def test_iot_register_certificate_without_ca_roundtrip(iot_client):
+    pytest.importorskip("cryptography")
+    # Issue a cert, capture its PEM, delete it, then re-register the SAME PEM
+    # through the no-CA variant.
+    issued = iot_client.create_keys_and_certificate(setAsActive=False)
+    cert_pem = issued["certificatePem"]
+    iot_client.delete_certificate(certificateId=issued["certificateId"])
+
+    resp = iot_client.register_certificate_without_ca(
+        certificatePem=cert_pem, status="ACTIVE"
+    )
+    cert_id = resp["certificateId"]
+    assert resp["certificateArn"].endswith(":cert/" + cert_id)
+    # The no-CA output carries ids only — no certificatePem echo.
+    assert "certificatePem" not in resp
+
+    desc = iot_client.describe_certificate(certificateId=cert_id)
+    assert desc["certificateDescription"]["certificatePem"] == cert_pem
+    assert desc["certificateDescription"]["status"] == "ACTIVE"
+
+    iot_client.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
+    iot_client.delete_certificate(certificateId=cert_id)
+
+
+def test_iot_register_certificate_without_ca_duplicate_conflict(iot_client):
+    pytest.importorskip("cryptography")
+    issued = iot_client.create_keys_and_certificate(setAsActive=False)
+    cert_pem = issued["certificatePem"]
+    iot_client.delete_certificate(certificateId=issued["certificateId"])
+
+    cert_id = iot_client.register_certificate_without_ca(
+        certificatePem=cert_pem, status="INACTIVE"
+    )["certificateId"]
+    with pytest.raises(ClientError) as ei:
+        iot_client.register_certificate_without_ca(
+            certificatePem=cert_pem, status="INACTIVE"
+        )
+    err = ei.value.response
+    assert err["Error"]["Code"] == "ResourceAlreadyExistsException"
+    assert err["resourceId"] == cert_id
+    assert err["resourceArn"].endswith(":cert/" + cert_id)
+    iot_client.delete_certificate(certificateId=cert_id)
+
+
+def test_iot_legacy_principal_policy_family(iot_client):
+    pytest.importorskip("cryptography")
+    policy = _unique("policy")
+    iot_client.create_policy(policyName=policy, policyDocument=_POLICY_DOC)
+    cert = iot_client.create_keys_and_certificate(setAsActive=False)
+    principal = cert["certificateArn"]
+
+    iot_client.attach_principal_policy(policyName=policy, principal=principal)
+
+    legacy = iot_client.list_principal_policies(principal=principal)["policies"]
+    assert any(p["policyName"] == policy for p in legacy)
+    # 1:1 with the modern target-scoped view of the same attachment.
+    modern = iot_client.list_attached_policies(target=principal)["policies"]
+    assert legacy == modern
+    principals = iot_client.list_policy_principals(policyName=policy)["principals"]
+    assert principals == [principal]
+
+    iot_client.detach_principal_policy(policyName=policy, principal=principal)
+    assert iot_client.list_principal_policies(principal=principal)["policies"] == []
+    assert iot_client.list_policy_principals(policyName=policy)["principals"] == []
+    assert iot_client.list_attached_policies(target=principal)["policies"] == []
+
+    iot_client.delete_policy(policyName=policy)
+    iot_client.delete_certificate(certificateId=cert["certificateId"])
+
+
+def test_iot_legacy_principal_policy_unknown_policy_404(iot_client):
+    with pytest.raises(ClientError) as ei:
+        iot_client.attach_principal_policy(
+            policyName=_unique("nope"), principal="arn:aws:iot:cert/none"
+        )
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    
+    
+# ---------------------------------------------------------------------------
+# Fleet indexing (indexing configuration + SearchIndex)
+# ---------------------------------------------------------------------------
+
+
+def _enable_fleet_indexing(client, mode: str = "REGISTRY_AND_SHADOW") -> None:
+    """Turn the AWS_Things index on, as every fleet stack has to on AWS."""
+    client.update_indexing_configuration(
+        thingIndexingConfiguration={"thingIndexingMode": mode}
+    )
+
+
+def _iot_client_for_fresh_account():
+    """An IoT client on an account of its own, so its index starts OFF."""
+    import os
+
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client(
+        "iot",
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        aws_access_key_id=f"{uuid.uuid4().int % 10**12:012d}",
+        aws_secret_access_key="test",
+        region_name="us-east-1",
+        config=Config(retries={"mode": "standard"}),
+    )
+
+
+def test_iot_indexing_configuration_round_trip():
+    client = _iot_client_for_fresh_account()
+    # AWS's default for an account that never configured indexing.
+    default = client.get_indexing_configuration()
+    assert default["thingIndexingConfiguration"]["thingIndexingMode"] == "OFF"
+    assert client.list_indices()["indexNames"] == []
+    with pytest.raises(ClientError) as ei:
+        client.describe_index(indexName="AWS_Things")
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    client.update_indexing_configuration(
+        thingIndexingConfiguration={"thingIndexingMode": "REGISTRY_AND_SHADOW"},
+        thingGroupIndexingConfiguration={"thingGroupIndexingMode": "ON"},
+    )
+    stored = client.get_indexing_configuration()
+    assert stored["thingIndexingConfiguration"]["thingIndexingMode"] == (
+        "REGISTRY_AND_SHADOW"
+    )
+    assert stored["thingGroupIndexingConfiguration"]["thingGroupIndexingMode"] == "ON"
+    assert client.list_indices()["indexNames"] == ["AWS_Things"]
+    index = client.describe_index(indexName="AWS_Things")
+    # The registry *is* the index, so it is never BUILDING.
+    assert index["indexStatus"] == "ACTIVE"
+    assert index["schema"] == "REGISTRY_AND_SHADOW"
+
+    # Registry-only indexing narrows the schema back.
+    _enable_fleet_indexing(client, "REGISTRY")
+    assert client.describe_index(indexName="AWS_Things")["schema"] == "REGISTRY"
+
+    # ...and turning it off retires the index.
+    _enable_fleet_indexing(client, "OFF")
+    assert client.list_indices()["indexNames"] == []
+
+
+def test_iot_indexing_configuration_rejects_impossible_modes():
+    client = _iot_client_for_fresh_account()
+    for kwargs in (
+        {"thingIndexingConfiguration": {"thingIndexingMode": "REGISTRY_AND_LOGS"}},
+        # AWS: connectivity indexing requires thing indexing to be on.
+        {
+            "thingIndexingConfiguration": {
+                "thingIndexingMode": "OFF",
+                "thingConnectivityIndexingMode": "STATUS",
+            }
+        },
+        {"thingGroupIndexingConfiguration": {"thingGroupIndexingMode": "SOMETIMES"}},
+    ):
+        with pytest.raises(ClientError) as ei:
+            client.update_indexing_configuration(**kwargs)
+        assert ei.value.response["Error"]["Code"] == "InvalidRequestException", kwargs
+    # A rejected update leaves the configuration untouched.
+    assert client.get_indexing_configuration()["thingIndexingConfiguration"][
+        "thingIndexingMode"
+    ] == "OFF"
+
+
+def test_iot_search_index_requires_indexing_enabled():
+    """Searching an account that never enabled indexing is a 404 on AWS."""
+    client = _iot_client_for_fresh_account()
+    name = _unique("unindexed")
+    client.create_thing(thingName=name)
+    try:
+        with pytest.raises(ClientError) as ei:
+            client.search_index(queryString=f"thingName:{name}")
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        _enable_fleet_indexing(client)
+        assert [
+            t["thingName"]
+            for t in client.search_index(queryString=f"thingName:{name}")["things"]
+        ] == [name]
+
+        # An index this emulator does not have is the same 404.
+        with pytest.raises(ClientError) as ei:
+            client.search_index(indexName="AWS_Fleet", queryString="thingName:*")
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        client.delete_thing(thingName=name)
+
+
+def test_iot_search_index_shadow_terms_need_shadow_indexing():
+    """REGISTRY-only indexing does not project shadows, so shadow terms 400."""
+    client = _iot_client_for_fresh_account()
+    _enable_fleet_indexing(client, "REGISTRY")
+    with pytest.raises(ClientError) as ei:
+        client.search_index(queryString="shadow.reported.firmware:fw-1")
+    assert ei.value.response["Error"]["Code"] == "InvalidQueryException"
+    # Registry fields keep working in the narrower mode.
+    client.search_index(queryString="thingName:whatever")
+
+
+def test_iot_search_index_registry_and_shadow(iot_client, iot_data_client):
+    _enable_fleet_indexing(iot_client)
+    suffix = uuid.uuid4().hex[:8]
+    type_name = f"searchtype-{suffix}"
+    hit = f"searchthing-{suffix}-hit"
+    miss = f"searchthing-{suffix}-miss"
+    iot_client.create_thing_type(thingTypeName=type_name)
+    iot_client.create_thing(
+        thingName=hit,
+        thingTypeName=type_name,
+        attributePayload={"attributes": {"fleet": f"fleet-{suffix}"}},
+    )
+    iot_client.create_thing(
+        thingName=miss, attributePayload={"attributes": {"fleet": "other"}}
+    )
+    iot_data_client.update_thing_shadow(
+        thingName=hit,
+        payload=json.dumps(
+            {"state": {"reported": {"firmware": f"fw-{suffix}"}}}
+        ).encode(),
+    )
+    try:
+        by_name = iot_client.search_index(queryString=f"thingName:{hit}")["things"]
+        assert [t["thingName"] for t in by_name] == [hit]
+        doc = by_name[0]
+        assert doc["thingId"]
+        assert doc["thingTypeName"] == type_name
+        assert doc["attributes"] == {"fleet": f"fleet-{suffix}"}
+        shadow = json.loads(doc["shadow"])  # AWS returns a JSON *string*
+        assert shadow["reported"]["firmware"] == f"fw-{suffix}"
+
+        by_type = iot_client.search_index(queryString=f"thingTypeName:{type_name}")[
+            "things"
+        ]
+        assert [t["thingName"] for t in by_type] == [hit]
+
+        by_attr = iot_client.search_index(
+            queryString=f"attributes.fleet:fleet-{suffix}"
+        )["things"]
+        assert [t["thingName"] for t in by_attr] == [hit]
+
+        by_shadow = iot_client.search_index(
+            queryString=(
+                f"shadow.reported.firmware:fw-{suffix} AND thingTypeName:{type_name}"
+            ),
+            maxResults=10,
+        )["things"]
+        assert [t["thingName"] for t in by_shadow] == [hit]
+
+        empty = iot_client.search_index(queryString=f"thingName:absent-{suffix}")
+        assert empty["things"] == []
+    finally:
+        iot_data_client.delete_thing_shadow(thingName=hit)
+        iot_client.delete_thing(thingName=hit)
+        iot_client.delete_thing(thingName=miss)
+        iot_client.deprecate_thing_type(thingTypeName=type_name)
+        iot_client.delete_thing_type(thingTypeName=type_name)
+
+
+def test_iot_search_index_wildcards(iot_client):
+    _enable_fleet_indexing(iot_client)
+    # The single most common fleet query: every thing under a name prefix.
+    suffix = uuid.uuid4().hex[:8]
+    fleet = [f"fleet-{suffix}-a", f"fleet-{suffix}-b"]
+    outside = f"other-{suffix}"
+    for name in (*fleet, outside):
+        iot_client.create_thing(
+            thingName=name, attributePayload={"attributes": {"site": f"berlin-{suffix}"}}
+        )
+    try:
+        prefix = iot_client.search_index(queryString=f"thingName:fleet-{suffix}-*")
+        assert sorted(t["thingName"] for t in prefix["things"]) == fleet
+
+        suffix_hits = iot_client.search_index(queryString=f"thingName:*-{suffix}-a")
+        assert [t["thingName"] for t in suffix_hits["things"]] == [fleet[0]]
+
+        contains = iot_client.search_index(queryString=f"thingName:*{suffix}*")
+        assert sorted(t["thingName"] for t in contains["things"]) == sorted(
+            [*fleet, outside]
+        )
+
+        # ? matches exactly one character.
+        single = iot_client.search_index(queryString=f"thingName:fleet-{suffix}-?")
+        assert sorted(t["thingName"] for t in single["things"]) == fleet
+        assert (
+            iot_client.search_index(queryString=f"thingName:fleet-{suffix}-??")["things"]
+            == []
+        )
+
+        # Wildcards work on attributes too, and combine with AND.
+        combined = iot_client.search_index(
+            queryString=f"thingName:fleet-{suffix}-* AND attributes.site:berlin-*"
+        )
+        assert sorted(t["thingName"] for t in combined["things"]) == fleet
+    finally:
+        for name in (*fleet, outside):
+            iot_client.delete_thing(thingName=name)
+
+
+def test_iot_search_index_returns_desired_and_reported_shadow(
+    iot_client, iot_data_client
+):
+    _enable_fleet_indexing(iot_client)
+    # shadow.desired.<path> is queryable, so the returned document has to
+    # carry the desired half too — not reported only.
+    suffix = uuid.uuid4().hex[:8]
+    name = f"searchthing-{suffix}-desired"
+    iot_client.create_thing(thingName=name)
+    iot_data_client.update_thing_shadow(
+        thingName=name,
+        payload=json.dumps(
+            {
+                "state": {
+                    "desired": {"firmware": f"want-{suffix}"},
+                    "reported": {"firmware": f"have-{suffix}"},
+                }
+            }
+        ).encode(),
+    )
+    try:
+        hits = iot_client.search_index(
+            queryString=f"shadow.desired.firmware:want-{suffix}"
+        )["things"]
+        assert [t["thingName"] for t in hits] == [name]
+        shadow = json.loads(hits[0]["shadow"])
+        assert shadow["desired"]["firmware"] == f"want-{suffix}"
+        assert shadow["reported"]["firmware"] == f"have-{suffix}"
+    finally:
+        iot_data_client.delete_thing_shadow(thingName=name)
+        iot_client.delete_thing(thingName=name)
+
+
+def test_iot_search_index_unsupported_query_rejected(iot_client):
+    _enable_fleet_indexing(iot_client)
+    for query in (
+        "connectivity.connected:true",
+        "NOT thingName:foo",
+        "thingName:foo AND",  # a dangling AND is an error on AWS, not a no-op
+        "AND thingName:foo",
+        "thingName:foo AND AND thingTypeName:bar",
+        "thingName:foo OR thingTypeName:bar",
+    ):
+        with pytest.raises(ClientError) as ei:
+            iot_client.search_index(queryString=query)
+        assert ei.value.response["Error"]["Code"] == "InvalidQueryException", query
+
+
+def test_iot_search_index_missing_field_never_matches(iot_client):
+    _enable_fleet_indexing(iot_client)
+    # An untyped thing has no thingTypeName; str(None) == "none" must NOT
+    # make it match thingTypeName:none, and a bare * must not resurrect it.
+    name = f"searchthing-{uuid.uuid4().hex[:8]}-untyped"
+    iot_client.create_thing(thingName=name)
+    try:
+        for query in ("thingTypeName:none", "thingTypeName:*"):
+            hits = iot_client.search_index(queryString=query)["things"]
+            assert name not in [t["thingName"] for t in hits], query
+    finally:
+        iot_client.delete_thing(thingName=name)
+
+
+def test_iot_search_index_unknown_shadow_subfield_rejected(iot_client):
+    """A shadow field outside desired/reported is a typo, not an empty result."""
+    _enable_fleet_indexing(iot_client)
+    for query in (
+        "shadow.metadata.reported.firmware:1",  # AWS field, not projected here
+        "shadow.name.telemetry.reported.x:1",  # named shadows are not indexed
+        "shadow.reported:anything",  # a whole half is not a leaf
+        "shadow.version:2",
+    ):
+        with pytest.raises(ClientError) as ei:
+            iot_client.search_index(queryString=query)
+        assert ei.value.response["Error"]["Code"] == "InvalidQueryException", query
+
+
+def test_iot_search_index_thing_group_terms(iot_client):
+    """`thingGroupNames:<group>` is the membership query a fleet console runs."""
+    _enable_fleet_indexing(iot_client)
+    suffix = uuid.uuid4().hex[:8]
+    groups = [f"group-{suffix}-eu", f"group-{suffix}-canary"]
+    member = f"grouped-{suffix}"
+    outsider = f"ungrouped-{suffix}"
+    for group in groups:
+        iot_client.create_thing_group(thingGroupName=group)
+    iot_client.create_thing(thingName=member)
+    iot_client.create_thing(thingName=outsider)
+    for group in groups:
+        iot_client.add_thing_to_thing_group(thingGroupName=group, thingName=member)
+    try:
+        for group in groups:
+            hits = iot_client.search_index(queryString=f"thingGroupNames:{group}")[
+                "things"
+            ]
+            assert [t["thingName"] for t in hits] == [member], group
+            assert sorted(hits[0]["thingGroupNames"]) == sorted(groups)
+
+        # Both memberships are visible at once, and wildcards work on them.
+        both = iot_client.search_index(
+            queryString=f"thingGroupNames:{groups[0]} AND thingGroupNames:{groups[1]}"
+        )["things"]
+        assert [t["thingName"] for t in both] == [member]
+        assert [
+            t["thingName"]
+            for t in iot_client.search_index(
+                queryString=f"thingGroupNames:group-{suffix}-*"
+            )["things"]
+        ] == [member]
+
+        # A thing in no group carries the field as an empty list, and a group
+        # it does not belong to never matches it.
+        hit = iot_client.search_index(queryString=f"thingName:{outsider}")["things"][0]
+        assert hit["thingGroupNames"] == []
+    finally:
+        iot_client.delete_thing(thingName=member)
+        iot_client.delete_thing(thingName=outsider)
+        for group in groups:
+            iot_client.delete_thing_group(thingGroupName=group)
+
+
+def test_iot_search_index_paginates(iot_client):
+    _enable_fleet_indexing(iot_client)
+    suffix = uuid.uuid4().hex[:8]
+    names = sorted(f"paged-{suffix}-{i}" for i in range(3))
+    for name in names:
+        iot_client.create_thing(thingName=name)
+    try:
+        query = f"thingName:paged-{suffix}-*"
+        seen = []
+        token = None
+        for _ in range(len(names) + 1):
+            kwargs = {"nextToken": token} if token else {}
+            page = iot_client.search_index(queryString=query, maxResults=1, **kwargs)
+            seen.extend(t["thingName"] for t in page["things"])
+            token = page.get("nextToken")
+            if token is None:
+                break
+        assert token is None, "pagination did not terminate"
+        assert sorted(seen) == names
+
+        # The last page of an exact fit carries no token.
+        full = iot_client.search_index(queryString=query, maxResults=len(names))
+        assert "nextToken" not in full
+        assert len(full["things"]) == len(names)
+    finally:
+        for name in names:
+            iot_client.delete_thing(thingName=name)
+
+
+def test_iot_search_index_rejects_bad_paging_arguments(iot_client):
+    _enable_fleet_indexing(iot_client)
+    # (maxResults=0 never reaches the server: botocore enforces the model's
+    # min=1 client-side. The ceiling is not in the model, so it is ours.)
+    for kwargs in (
+        {"maxResults": 101},  # AWS's documented ceiling
+        {"nextToken": "not-a-real-cursor"},
+    ):
+        with pytest.raises(ClientError) as ei:
+            iot_client.search_index(queryString="thingName:*", **kwargs)
+        assert ei.value.response["Error"]["Code"] == "InvalidRequestException", kwargs
+
+
+def test_iot_search_index_numeric_shadow_values(iot_client, iot_data_client):
+    """A JSON number in a shadow compares as a number, not as its repr."""
+    _enable_fleet_indexing(iot_client)
+    suffix = uuid.uuid4().hex[:8]
+    name = f"numeric-{suffix}"
+    iot_client.create_thing(thingName=name)
+    iot_data_client.update_thing_shadow(
+        thingName=name,
+        payload=json.dumps(
+            {"state": {"reported": {"temp": 10.0, "errors": 0}}}
+        ).encode(),
+    )
+    try:
+        for query in (
+            f"thingName:{name} AND shadow.reported.temp:10",
+            f"thingName:{name} AND shadow.reported.temp:10.0",
+            f"thingName:{name} AND shadow.reported.errors:0",
+        ):
+            hits = iot_client.search_index(queryString=query)["things"]
+            assert [t["thingName"] for t in hits] == [name], query
+        for query in (
+            f"thingName:{name} AND shadow.reported.temp:11",
+            f"thingName:{name} AND shadow.reported.temp:1",
+        ):
+            assert iot_client.search_index(queryString=query)["things"] == [], query
+
+        # A registry string stays a string: 007 is not 7.
+        zeros = f"0007{suffix}"
+        iot_client.create_thing(thingName=zeros)
+        try:
+            assert (
+                iot_client.search_index(queryString=f"thingName:7{suffix}")["things"]
+                == []
+            )
+        finally:
+            iot_client.delete_thing(thingName=zeros)
+    finally:
+        iot_data_client.delete_thing_shadow(thingName=name)
+        iot_client.delete_thing(thingName=name)
+
+
+# ---------------------------------------------------------------------------
 # Topic rules
 # ---------------------------------------------------------------------------
 
@@ -547,6 +1070,76 @@ def test_iot_replace_topic_rule(iot_client):
     iot_client.delete_topic_rule(ruleName=name)
 
 
+def test_iot_create_topic_rule_garbage_sql_rejected(iot_client):
+    with pytest.raises(ClientError) as ei:
+        iot_client.create_topic_rule(
+            ruleName=_rule_name(),
+            topicRulePayload={"sql": "this is not sql", "actions": []},
+        )
+    assert ei.value.response["Error"]["Code"] == "SqlParseException"
+
+
+def test_iot_create_topic_rule_unsupported_where_rejected(iot_client):
+    """A WHERE the evaluator cannot parse is rejected at creation instead of
+    being stored and silently never firing.
+
+    Malformed SQL only: syntax AWS accepts has to be accepted here too, or the
+    rule that deploys on AWS fails to create locally.
+    """
+    with pytest.raises(ClientError) as ei:
+        iot_client.create_topic_rule(
+            ruleName=_rule_name(),
+            topicRulePayload={
+                "sql": "SELECT * FROM 'a' WHERE (state = 'on'",
+                "actions": [],
+            },
+        )
+    assert ei.value.response["Error"]["Code"] == "SqlParseException"
+
+
+def test_iot_create_topic_rule_accepts_or_and_parentheses(iot_client):
+    """`OR` and parenthesised groups are valid AWS rule SQL — rejecting them
+    would fail rules that deploy fine on AWS."""
+    name = _rule_name()
+    sql = "SELECT * FROM 'a' WHERE (state = 'on' OR state = 'standby') AND temp > 20"
+    iot_client.create_topic_rule(
+        ruleName=name, topicRulePayload={"sql": sql, "actions": []}
+    )
+    assert iot_client.get_topic_rule(ruleName=name)["rule"]["sql"] == sql
+    iot_client.delete_topic_rule(ruleName=name)
+
+
+def test_iot_create_topic_rule_accepts_full_where_grammar(iot_client):
+    """The rest of the WHERE syntax AWS accepts — over-strict validation here
+    turns a working setup into a hard 400 (or a failed CloudFormation stack)."""
+    name = _rule_name()
+    sql = (
+        "SELECT * FROM 'a' WHERE state IN ('on', 'idle') AND temp BETWEEN 1 AND 5 "
+        "AND serial LIKE 'dev-%' AND nickname IS NOT NULL AND enabled "
+        "AND isUndefined(site) AND note <> 'it''s off'"
+    )
+    iot_client.create_topic_rule(
+        ruleName=name, topicRulePayload={"sql": sql, "actions": []}
+    )
+    assert iot_client.get_topic_rule(ruleName=name)["rule"]["sql"] == sql
+    iot_client.delete_topic_rule(ruleName=name)
+
+
+def test_iot_replace_topic_rule_garbage_sql_rejected(iot_client):
+    name = _rule_name()
+    iot_client.create_topic_rule(
+        ruleName=name, topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": []}
+    )
+    with pytest.raises(ClientError) as ei:
+        iot_client.replace_topic_rule(
+            ruleName=name, topicRulePayload={"sql": "garbage", "actions": []}
+        )
+    assert ei.value.response["Error"]["Code"] == "SqlParseException"
+    # The stored rule is untouched.
+    assert iot_client.get_topic_rule(ruleName=name)["rule"]["sql"] == "SELECT * FROM 'a'"
+    iot_client.delete_topic_rule(ruleName=name)
+
+
 def test_iot_replace_missing_topic_rule_404(iot_client):
     with pytest.raises(ClientError) as ei:
         iot_client.replace_topic_rule(
@@ -597,6 +1190,84 @@ def test_iot_topic_rule_cfn_deploy(cfn, iot_client):
     _wait_stack_gone_iot(cfn, stack)
     with pytest.raises(ClientError):
         iot_client.get_topic_rule(ruleName=rule)
+
+
+def test_iot_topic_rule_cfn_invalid_sql_fails_resource(cfn, iot_client):
+    """CloudFormation validates rule SQL too: a rule the engine cannot evaluate
+    must fail the resource, not reach CREATE_COMPLETE and silently never fire
+    (real CloudFormation fails on the underlying CreateTopicRule call).
+
+    No provisioner change is needed for that — `RuleSqlError` is a `ValueError`,
+    which is already what the stack runner turns into a CREATE_FAILED carrying
+    the reason.
+    """
+    stack = "iot-badsql-" + uuid.uuid4().hex[:8]
+    rule = _rule_name("badsql")
+    template = {
+        "Resources": {
+            "BadRule": {
+                "Type": "AWS::IoT::TopicRule",
+                "Properties": {
+                    "RuleName": rule,
+                    "TopicRulePayload": {
+                        "Sql": "this is not sql",
+                        "Actions": [],
+                    },
+                },
+            }
+        },
+    }
+    try:
+        cfn.create_stack(
+            StackName=stack, TemplateBody=json.dumps(template), DisableRollback=True
+        )
+        st = _wait_stack_iot(cfn, stack)
+        assert st["StackStatus"] == "CREATE_FAILED"
+        reason = st.get("StackStatusReason", "")
+        assert "BadRule" in reason and "Rule SQL" in reason
+
+        events = cfn.describe_stack_events(StackName=stack)["StackEvents"]
+        assert any(
+            event["LogicalResourceId"] == "BadRule"
+            and event["ResourceStatus"] == "CREATE_FAILED"
+            for event in events
+        )
+        # Nothing was stored: the invalid rule never entered the rule store.
+        with pytest.raises(ClientError) as ei:
+            iot_client.get_topic_rule(ruleName=rule)
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack)
+            _wait_stack_gone_iot(cfn, stack)
+        except ClientError:
+            pass
+
+
+def test_iot_topic_rule_cfn_where_with_or_deploys(cfn, iot_client):
+    """A WHERE using OR and parentheses deploys through CloudFormation — the
+    grammar the validator accepts is the same on both paths."""
+    stack = "iot-orsql-" + uuid.uuid4().hex[:8]
+    rule = _rule_name("orsql")
+    sql = "SELECT * FROM 'sensors/+/telemetry' WHERE (temp > 30 OR humidity > 80) AND state = 'on'"
+    template = {
+        "Resources": {
+            "OrRule": {
+                "Type": "AWS::IoT::TopicRule",
+                "Properties": {
+                    "RuleName": rule,
+                    "TopicRulePayload": {"Sql": sql, "Actions": []},
+                },
+            }
+        },
+    }
+    cfn.create_stack(StackName=stack, TemplateBody=json.dumps(template))
+    st = _wait_stack_iot(cfn, stack)
+    assert st["StackStatus"] == "CREATE_COMPLETE", st.get("StackStatusReason")
+    assert iot_client.get_topic_rule(ruleName=rule)["rule"]["sql"] == sql
+
+    cfn.delete_stack(StackName=stack)
+    _wait_stack_gone_iot(cfn, stack)
 
 
 def _wait_stack_iot(cfn, name, timeout=30):
@@ -690,6 +1361,8 @@ from ministack.services.iot import (
     PKT_PUBACK,
     PKT_PUBLISH,
     PKT_SUBSCRIBE,
+    PKT_UNSUBACK,
+    PKT_UNSUBSCRIBE,
     _encode_remaining_length,
     _encode_string,
     _InFlightMessage,
@@ -1038,8 +1711,8 @@ def test_iot_topic_rules_and_basic_ingest_use_publish_region(monkeypatch):
     )
     dispatched = []
 
-    def _capture_rule_action(
-        dispatched_account_id, dispatched_region, rule, payload, topic=""
+    async def _capture_rule_action(
+        dispatched_account_id, dispatched_region, rule, payload, topic="", client_id=None
     ):
         dispatched.append((dispatched_account_id, dispatched_region, rule, payload))
 
@@ -1194,6 +1867,14 @@ def _build_subscribe_body(packet_id, topics_qos):
     return body
 
 
+def _build_unsubscribe_body(packet_id, topic_filters):
+    """Build an UNSUBSCRIBE packet body. topic_filters is a list of filters."""
+    body = struct.pack("!H", packet_id)
+    for topic_filter in topic_filters:
+        body += _encode_string(topic_filter)
+    return body
+
+
 def _mock_send():
     """Return (async send-callable, captured-message list)."""
     sent = []
@@ -1202,6 +1883,16 @@ def _mock_send():
         sent.append(msg)
 
     return send, sent
+
+
+def _unsuback_packet_ids(sent_messages):
+    """Return the packet ID of every UNSUBACK in sent messages."""
+    ids = []
+    for msg in sent_messages:
+        data = msg.get("bytes")
+        if data and len(data) >= 4 and (data[0] >> 4) & 0x0F == PKT_UNSUBACK:
+            ids.append(struct.unpack_from("!H", data, 2)[0])
+    return ids
 
 
 def _parse_connack(sent_messages):
@@ -1997,6 +2688,158 @@ def test_subscribe_stores_granted_qos_on_session():
     reset()
 
 
+# ----------------------------------------------------------------------
+# Broker — UNSUBSCRIBE
+# ----------------------------------------------------------------------
+
+
+async def _connect_and_subscribe(client_id, topics, clean_session=True):
+    """CONNECT a session and SUBSCRIBE it at QoS 0 to every topic filter."""
+    send, sent = _mock_send()
+    session = _WSSession(send, "123456789012")
+    await session.handle_packet(
+        PKT_CONNECT, 0, _build_connect_body(client_id, clean_session=clean_session)
+    )
+    await session.handle_packet(
+        PKT_SUBSCRIBE, 0x02, _build_subscribe_body(1, [(t, 0) for t in topics])
+    )
+    sent.clear()
+    return session, sent
+
+
+def test_unsubscribe_removes_only_the_named_filters():
+    """The filters named in the packet go; every other subscription stays."""
+    reset()
+
+    async def _run():
+        session, sent = await _connect_and_subscribe(
+            "unsub-one", ["sensor/a", "sensor/b", "sensor/c"]
+        )
+
+        await session.handle_packet(
+            PKT_UNSUBSCRIBE, 0x02, _build_unsubscribe_body(7, ["sensor/b"])
+        )
+        assert _unsuback_packet_ids(sent) == [7]
+
+        sent.clear()
+        for topic in ("sensor/a", "sensor/b", "sensor/c"):
+            await publish("123456789012", topic, topic.encode())
+
+        delivered = [topic for topic, _payload, _qos, _pid, _dup in _extract_publish_frames(sent)]
+        assert delivered == ["sensor/a", "sensor/c"]
+
+        await session.cleanup()
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_unsubscribe_of_filter_never_subscribed_is_a_no_op():
+    """An unmatched filter changes nothing and is still acknowledged."""
+    reset()
+
+    async def _run():
+        session, sent = await _connect_and_subscribe("unsub-unknown", ["sensor/a"])
+
+        await session.handle_packet(
+            PKT_UNSUBSCRIBE, 0x02, _build_unsubscribe_body(11, ["sensor/never"])
+        )
+        # MQTT 3.1.1 UNSUBACK carries no reason codes, so the acknowledgement
+        # looks the same whether or not a subscription existed.
+        assert _unsuback_packet_ids(sent) == [11]
+
+        sent.clear()
+        await publish("123456789012", "sensor/a", b"still-here")
+
+        assert _extract_publish_frames(sent) == [("sensor/a", b"still-here", 0, None, False)]
+
+        await session.cleanup()
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_unsubscribe_of_every_filter_stops_delivery():
+    """Naming all the session's filters leaves it with no subscriptions."""
+    reset()
+
+    async def _run():
+        session, sent = await _connect_and_subscribe(
+            "unsub-all", ["sensor/a", "sensor/b"]
+        )
+
+        await session.handle_packet(
+            PKT_UNSUBSCRIBE, 0x02, _build_unsubscribe_body(3, ["sensor/a", "sensor/b"])
+        )
+        assert _unsuback_packet_ids(sent) == [3]
+        assert session._sub_ids == []
+        assert session._sub_filters == {}
+        assert session._sub_granted_qos == {}
+
+        sent.clear()
+        await publish("123456789012", "sensor/a", b"gone")
+        await publish("123456789012", "sensor/b", b"gone")
+
+        assert _extract_publish_frames(sent) == []
+
+        await session.cleanup()
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_unsubscribe_matches_a_wildcard_filter_by_its_own_text():
+    """A wildcard subscription goes by its filter string, not what it matched."""
+    reset()
+
+    async def _run():
+        session, sent = await _connect_and_subscribe("unsub-wildcard", ["sensor/#"])
+
+        # `sensor/temp` is a topic the wildcard delivers, not a filter the
+        # session holds — it must leave the subscription untouched.
+        await session.handle_packet(
+            PKT_UNSUBSCRIBE, 0x02, _build_unsubscribe_body(1, ["sensor/temp"])
+        )
+        sent.clear()
+        await publish("123456789012", "sensor/temp", b"matched")
+        assert len(_extract_publish_frames(sent)) == 1
+
+        await session.handle_packet(
+            PKT_UNSUBSCRIBE, 0x02, _build_unsubscribe_body(2, ["sensor/#"])
+        )
+        sent.clear()
+        await publish("123456789012", "sensor/temp", b"unmatched")
+        assert _extract_publish_frames(sent) == []
+
+        await session.cleanup()
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_unsubscribe_drops_the_filter_from_a_preserved_session():
+    """An unsubscribed filter must not come back with a cleanSession=0 resume."""
+    reset()
+
+    async def _run():
+        client_id = "unsub-persistent"
+        session, _sent = await _connect_and_subscribe(
+            client_id, ["sensor/a", "sensor/b"], clean_session=False
+        )
+
+        await session.handle_packet(
+            PKT_UNSUBSCRIBE, 0x02, _build_unsubscribe_body(1, ["sensor/a"])
+        )
+        await session.handle_packet(PKT_DISCONNECT, 0, b"")
+        await session.cleanup()
+
+        preserved = _persistent_sessions[("123456789012", _TEST_REGION, client_id)]
+        assert preserved.subscriptions == ["sensor/b"]
+
+    asyncio.run(_run())
+    reset()
+
+
 # ---------------------------------------------------------------------------
 # Task 18.2: QoS 1 delivery with packet ID tracking
 # ---------------------------------------------------------------------------
@@ -2520,3 +3363,996 @@ def test_rule_event_from_less_basic_ingest_projects():
         "SELECT deviceId AS id, temp", "$aws/rules/myrule", b'{"deviceId": "d1", "temp": 22, "extra": "x"}'
     )
     assert event == {"id": "d1", "temp": 22}
+
+
+# ----------------------------------------------------------------------
+# Rule SQL functions: newuuid(), replace(), clientid() (and the accepted
+# but unresolvable principal() / traceid()).
+# ----------------------------------------------------------------------
+
+
+def test_rule_event_newuuid_projects_a_fresh_uuid():
+    from ministack.services.iot import _rule_event
+
+    first = _rule_event("SELECT newuuid() AS id FROM 't'", "t", b"{}")
+    second = _rule_event("SELECT newuuid() AS id FROM 't'", "t", b"{}")
+    assert uuid.UUID(first["id"])  # well-formed
+    assert first["id"] != second["id"]
+
+
+def test_rule_event_replace_rewrites_strings():
+    from ministack.services.iot import _rule_event
+
+    event = _rule_event(
+        "SELECT replace(deviceId, 'dev-', 'unit-') AS id FROM 't'",
+        "t",
+        b'{"deviceId": "dev-42"}',
+    )
+    assert event == {"id": "unit-42"}
+
+
+def test_rule_event_replace_of_missing_or_nonstring_is_omitted():
+    from ministack.services.iot import _rule_event
+
+    # Missing source attribute → Undefined → omitted.
+    event = _rule_event(
+        "SELECT replace(absent, 'a', 'b') AS x, deviceId FROM 't'",
+        "t",
+        b'{"deviceId": "d1"}',
+    )
+    assert event == {"deviceId": "d1"}
+    # Non-string source → Undefined on AWS.
+    event = _rule_event(
+        "SELECT replace(count, 'a', 'b') AS x FROM 't'", "t", b'{"count": 3}'
+    )
+    assert event == {}
+
+
+def test_rule_event_clientid_resolves_for_mqtt_and_is_omitted_for_http():
+    from ministack.services.iot import _rule_event
+
+    sql = "SELECT clientid() AS cid, temp FROM 't'"
+    # MQTT publish: the broker threads the publishing client's id through.
+    event = _rule_event(sql, "t", b'{"temp": 22}', client_id="sensor-7")
+    assert event == {"cid": "sensor-7", "temp": 22}
+    # HTTP publish: no MQTT client exists — AWS resolves clientid() to
+    # Undefined, so the field is omitted from the projection.
+    event = _rule_event(sql, "t", b'{"temp": 22}')
+    assert event == {"temp": 22}
+
+
+def test_rule_event_replace_handles_escaped_quotes():
+    """`replace()` takes SQL string literals, so a quote in either argument is
+    written the SQL way — doubled."""
+    from ministack.services.iot import _rule_event
+
+    event = _rule_event(
+        "SELECT replace(note, 'it''s', 'it is') AS n FROM 't'",
+        "t",
+        b'{"note": "it\'s on"}',
+    )
+    assert event == {"n": "it is on"}
+
+
+def test_rule_event_principal_and_traceid_accepted_but_unresolved(caplog):
+    """Both are real AWS functions, so a rule using them is stored rather than
+    failing a stack that deploys on AWS — but this publish path carries no
+    certificate identity or trace id, so they warn like any other function the
+    evaluator does not implement."""
+    from ministack.services import iot as iot_module
+    from ministack.services.iot import _rule_event, _validate_rule_sql
+
+    sql = "SELECT principal() AS p, traceid() AS t, temp FROM 't'"
+    assert _validate_rule_sql(sql) is None
+    # The evaluator warns once per function name for the life of the process.
+    iot_module._warned_sql_funcs.clear()
+    with caplog.at_level(logging.WARNING, logger="iot"):
+        assert _rule_event(sql, "t", b'{"temp": 1}') == {"temp": 1}
+    warned = " ".join(r.message for r in caplog.records)
+    assert "principal()" in warned and "traceid()" in warned
+
+
+def test_eval_where_clientid_reaches_every_leaf_form():
+    """clientid() is an operand like any other, so it resolves inside the whole
+    WHERE grammar, not just a plain comparison."""
+    from ministack.services.iot import _eval_where, _rule_message
+
+    raw = b'{"temp": 1}'
+    message = _rule_message(raw)
+    for pred, expected in (
+        ("clientid() = 'sensor-7'", True),
+        ("clientid() IN ('sensor-7', 'sensor-8')", True),
+        ("clientid() IN ('sensor-8')", False),
+        ("clientid() LIKE 'sensor-%'", True),
+        ("isUndefined(clientid())", False),
+    ):
+        assert _eval_where(pred, "t", raw, message, "sensor-7") is expected
+    # An HTTP publish carries no client id, so every one of them fails closed.
+    for pred in (
+        "clientid() = 'sensor-7'",
+        "clientid() IN ('sensor-7')",
+        "clientid() LIKE 'sensor-%'",
+    ):
+        assert _eval_where(pred, "t", raw, message) is False
+    assert _eval_where("isUndefined(clientid())", "t", raw, message) is True
+
+
+def test_broker_publish_threads_client_id_into_rule_projection(monkeypatch):
+    """`clientid()` sees the WS client's id via broker_publish, end to end."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    iot_module._topic_rules.set_scoped(
+        account_id,
+        _TEST_REGION,
+        "cid_rule",
+        {
+            "ruleName": "cid_rule",
+            "sql": "SELECT clientid() AS cid FROM 'sensors/#'",
+            "ruleDisabled": False,
+            "actions": [{"lambda": {"functionArn": "arn:aws:lambda:us-east-1:123456789012:function:sink"}}],
+        },
+    )
+    dispatched = []
+    monkeypatch.setattr(
+        iot_module,
+        "_dispatch_rule_to_lambda",
+        lambda account, region, arn, event: dispatched.append(event),
+    )
+
+    async def _run():
+        # A WS PUBLISH passes the connected client's id...
+        send, _sent = _mock_send()
+        session = _WSSession(send, account_id)
+        await session.handle_packet(PKT_CONNECT, 0, _build_connect_body("sensor-7"))
+        await session.handle_packet(
+            PKT_PUBLISH, 0, _encode_string("sensors/door") + b'{"n": 1}'
+        )
+        await session.cleanup()
+        # ...while the HTTP publish path passes none.
+        await publish(account_id, "sensors/door", b'{"n": 2}')
+
+    try:
+        asyncio.run(_run())
+        assert dispatched == [{"cid": "sensor-7"}, {}]
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+# ----------------------------------------------------------------------
+# Rule SQL WHERE clause (white-box tests for _rule_where_clause /
+# _eval_where / _validate_rule_sql).
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        ("SELECT * FROM 'a/b' WHERE state = 'on'", "state = 'on'"),
+        ("SELECT * FROM 'a/b'", ""),
+        ("SELECT temp WHERE temp > 20", "temp > 20"),  # FROM-less Basic Ingest form
+        ("SELECT temp", ""),
+        # A WHERE-ish string inside the topic filter is not a predicate.
+        ("SELECT * FROM 'a/WHERE x/b'", ""),
+    ],
+)
+def test_rule_where_clause_extraction(sql, expected):
+    from ministack.services.iot import _rule_where_clause
+
+    assert _rule_where_clause(sql) == expected
+
+
+@pytest.mark.parametrize(
+    ("pred", "payload", "expected"),
+    [
+        # equality (both spellings) on strings and numbers
+        ("state = 'on'", {"state": "on"}, True),
+        ("state == 'on'", {"state": "on"}, True),
+        ("state = 'on'", {"state": "off"}, False),
+        ("temp = 22", {"temp": 22}, True),
+        ("temp = 22", {"temp": 23}, False),
+        # inequality (both spellings)
+        ("state <> 'on'", {"state": "off"}, True),
+        ("state != 'on'", {"state": "on"}, False),
+        # a predicate over a missing attribute is Undefined → never matches,
+        # not even for <> (fail closed, as on AWS)
+        ("absent = 'x'", {"state": "on"}, False),
+        ("absent <> 'x'", {"state": "on"}, False),
+        ("absent > 1", {"state": "on"}, False),
+        # numeric comparisons
+        ("temp > 20", {"temp": 22}, True),
+        ("temp > 22", {"temp": 22}, False),
+        ("temp >= 22", {"temp": 22}, True),
+        ("temp < 30", {"temp": 22}, True),
+        ("temp <= 21", {"temp": 22}, False),
+        # ordering comparisons are numeric-only — a string operand is Undefined
+        ("temp > 20", {"temp": "hot"}, False),
+        # nested attribute paths
+        ("state.reported.power = 'on'", {"state": {"reported": {"power": "on"}}}, True),
+        ("state.reported.power = 'on'", {"state": {"reported": {"power": "off"}}}, False),
+        # AND conjunction: all clauses must hold
+        ("state = 'on' AND temp > 20", {"state": "on", "temp": 22}, True),
+        ("state = 'on' AND temp > 20", {"state": "on", "temp": 19}, False),
+        ("state = 'on' AND temp > 20", {"state": "off", "temp": 22}, False),
+        # AND inside a string literal is not a conjunction
+        ("mode = 'UP AND DOWN'", {"mode": "UP AND DOWN"}, True),
+        # OR disjunction: any clause may carry the predicate
+        ("state = 'on' OR state = 'off'", {"state": "off"}, True),
+        ("state = 'on' OR state = 'off'", {"state": "idle"}, False),
+        ("state = 'on' or temp > 20", {"state": "off", "temp": 22}, True),
+        # an Undefined leaf is false, but an OR sibling can still carry it
+        ("absent = 'x' OR state = 'on'", {"state": "on"}, True),
+        ("absent = 'x' OR state = 'on'", {"state": "off"}, False),
+        # precedence: OR binds loosest, so this reads (a AND b) OR c
+        ("state = 'on' AND temp > 20 OR mode = 'test'",
+         {"state": "off", "temp": 1, "mode": "test"}, True),
+        ("state = 'on' AND temp > 20 OR mode = 'test'",
+         {"state": "on", "temp": 22, "mode": "prod"}, True),
+        ("state = 'on' AND temp > 20 OR mode = 'test'",
+         {"state": "on", "temp": 1, "mode": "prod"}, False),
+        # ...and the same predicate the other way round: c OR (a AND b)
+        ("mode = 'test' OR state = 'on' AND temp > 20",
+         {"state": "on", "temp": 1, "mode": "prod"}, False),
+        ("mode = 'test' OR state = 'on' AND temp > 20",
+         {"state": "off", "temp": 1, "mode": "test"}, True),
+        # parentheses override that precedence: (a OR b) AND c
+        ("(state = 'on' OR mode = 'test') AND temp > 20",
+         {"state": "off", "mode": "test", "temp": 22}, True),
+        ("(state = 'on' OR mode = 'test') AND temp > 20",
+         {"state": "off", "mode": "test", "temp": 1}, False),
+        ("(state = 'on' OR mode = 'test') AND temp > 20",
+         {"state": "off", "mode": "prod", "temp": 22}, False),
+        # a group wrapping the whole predicate is a no-op
+        ("(state = 'on')", {"state": "on"}, True),
+        ("((state = 'on'))", {"state": "on"}, True),
+        # nested groups
+        ("((state = 'on' OR state = 'off') AND temp > 20) OR mode = 'test'",
+         {"state": "on", "temp": 22, "mode": "prod"}, True),
+        ("((state = 'on' OR state = 'off') AND temp > 20) OR mode = 'test'",
+         {"state": "idle", "temp": 22, "mode": "prod"}, False),
+        ("((state = 'on' OR state = 'off') AND temp > 20) OR mode = 'test'",
+         {"state": "idle", "temp": 1, "mode": "test"}, True),
+        # AND binds tighter inside an OR branch, groups or not
+        ("mode = 'test' OR (state = 'on' AND temp > 20)",
+         {"state": "on", "temp": 22, "mode": "prod"}, True),
+        # OR inside a string literal is not a disjunction
+        ("mode = 'ON OR OFF'", {"mode": "ON OR OFF"}, True),
+        ("mode = 'ON OR OFF'", {"mode": "ON"}, False),
+        ("mode = 'ON OR OFF' AND temp > 20", {"mode": "ON OR OFF", "temp": 22}, True),
+        # an attribute path may contain the keywords without being one
+        ("android = 'yes' OR orbit = 1", {"orbit": 1}, True),
+        # regexp_matches
+        ("regexp_matches(serial, '^dev-[0-9]+$')", {"serial": "dev-42"}, True),
+        ("regexp_matches(serial, '^dev-[0-9]+$')", {"serial": "gw-42"}, False),
+        ("regexp_matches(absent, '.*')", {"serial": "dev-42"}, False),
+        # booleans stay distinct from 0/1
+        ("armed = 1", {"armed": True}, False),
+        # IN / NOT IN over a value list
+        ("state IN ('on', 'idle')", {"state": "idle"}, True),
+        ("state IN ('on', 'idle')", {"state": "off"}, False),
+        ("state IN('on')", {"state": "on"}, True),  # no space before the list
+        ("code IN (1, 2, 3)", {"code": 2}, True),
+        ("code IN (1, 2, 3)", {"code": 4}, False),
+        ("state NOT IN ('on', 'idle')", {"state": "off"}, True),
+        ("state NOT IN ('on', 'idle')", {"state": "on"}, False),
+        ("absent IN ('on')", {"state": "on"}, False),
+        ("absent NOT IN ('on')", {"state": "on"}, False),  # Undefined fails closed
+        # LIKE / NOT LIKE — % matches a run, _ exactly one character
+        ("state LIKE 'on%'", {"state": "online"}, True),
+        ("state LIKE 'on%'", {"state": "gone"}, False),
+        ("state LIKE 'o_'", {"state": "on"}, True),
+        ("state LIKE 'o_'", {"state": "one"}, False),
+        ("state LIKE 'on'", {"state": "on"}, True),
+        # the pattern's own regex metacharacters stay literal
+        ("state LIKE 'a.c'", {"state": "abc"}, False),
+        ("state LIKE 'a.c'", {"state": "a.c"}, True),
+        ("state NOT LIKE 'on%'", {"state": "gone"}, True),
+        ("state NOT LIKE 'on%'", {"state": "online"}, False),
+        # LIKE wants a String, so AWS converts an Int or a Boolean to one
+        # first — the same conversion regexp_matches() gets, pinned together
+        # below so the two operators cannot drift apart again.
+        ("temp LIKE '2%'", {"temp": 22}, True),
+        ("flag LIKE 'tr%'", {"flag": True}, True),
+        ("absent LIKE '%'", {"state": "on"}, False),
+        ("nickname LIKE '%'", {"nickname": None}, False),  # Null does not convert
+        # BETWEEN, inclusive on both bounds — its AND is not a conjunction
+        ("temp BETWEEN 20 AND 30", {"temp": 22}, True),
+        ("temp BETWEEN 20 AND 30", {"temp": 20}, True),
+        ("temp BETWEEN 20 AND 30", {"temp": 30}, True),
+        ("temp BETWEEN 20 AND 30", {"temp": 31}, False),
+        ("temp BETWEEN 20 AND 30 AND state = 'on'", {"temp": 22, "state": "on"}, True),
+        ("temp BETWEEN 20 AND 30 AND state = 'on'", {"temp": 22, "state": "off"}, False),
+        ("state = 'on' AND temp BETWEEN 20 AND 30", {"state": "on", "temp": 22}, True),
+        ("temp BETWEEN 20 AND 30 OR state = 'on'", {"temp": 99, "state": "on"}, True),
+        ("absent BETWEEN 1 AND 5", {"temp": 3}, False),
+        ("temp BETWEEN 20 AND 30", {"temp": "hot"}, False),  # numeric-only
+        # IS NULL / IS NOT NULL over a JSON null
+        ("nickname IS NULL", {"nickname": None}, True),
+        ("nickname IS NULL", {"nickname": "gw"}, False),
+        ("nickname IS NOT NULL", {"nickname": "gw"}, True),
+        ("nickname IS NOT NULL", {"nickname": None}, False),
+        # Undefined is neither NULL nor NOT NULL — both fail closed
+        ("nickname IS NULL", {"state": "on"}, False),
+        ("nickname IS NOT NULL", {"state": "on"}, False),
+        # a bare boolean attribute is a predicate on its own
+        ("enabled", {"enabled": True}, True),
+        ("enabled", {"enabled": False}, False),
+        # AWS converts a value to Boolean only from "true"/"false" — a number
+        # needs an explicit cast(), so it stays Undefined here.
+        ("enabled", {"enabled": "true"}, True),
+        ("enabled", {"enabled": "FALSE"}, False),
+        ("enabled", {"enabled": 1}, False),
+        ("enabled", {"enabled": "yes"}, False),
+        ("enabled", {"state": "on"}, False),
+        ("enabled AND temp > 20", {"enabled": True, "temp": 22}, True),
+        ("enabled AND temp > 20", {"enabled": False, "temp": 22}, False),
+        ("state.reported.on", {"state": {"reported": {"on": True}}}, True),
+        # isUndefined() — the one predicate a missing attribute satisfies
+        ("isUndefined(absent)", {"state": "on"}, True),
+        ("isUndefined(state)", {"state": "on"}, False),
+        ("isUndefined(state.reported)", {"state": {"reported": {}}}, False),
+        ("isUndefined(absent) OR state = 'on'", {"state": "off"}, True),
+        # a quote inside a string literal is escaped by doubling it
+        ("note = 'it''s on'", {"note": "it's on"}, True),
+        ("note = 'it''s on'", {"note": "its on"}, False),
+        ("note <> 'it''s on'", {"note": "off"}, True),
+        ("note IN ('it''s on', 'off')", {"note": "it's on"}, True),
+        # an escaped quote does not end the literal, so this AND is not one
+        ("note = 'it''s AND then'", {"note": "it's AND then"}, True),
+        # NOT inverts a predicate, and binds tighter than AND
+        ("NOT enabled", {"enabled": False}, True),
+        ("NOT enabled", {"enabled": True}, False),
+        ("NOT state = 'on'", {"state": "off"}, True),
+        ("NOT state = 'on'", {"state": "on"}, False),
+        ("NOT state IN ('on', 'idle')", {"state": "off"}, True),
+        ("NOT temp BETWEEN 20 AND 30", {"temp": 31}, True),
+        ("NOT isUndefined(x)", {"x": 1}, True),
+        ("NOT isUndefined(x)", {"y": 1}, False),
+        ("NOT(a = 1)", {"a": 2}, True),  # abutting its operand's bracket
+        ("NOT (a = 1 OR b = 2)", {"a": 9, "b": 9}, True),
+        ("NOT (a = 1 OR b = 2)", {"a": 1, "b": 9}, False),
+        ("NOT NOT enabled", {"enabled": True}, True),
+        ("state = 'on' AND NOT temp > 20", {"state": "on", "temp": 5}, True),
+        ("state = 'on' AND NOT temp > 20", {"state": "on", "temp": 25}, False),
+        # NOT of Undefined is Undefined, not true: negating a clause over an
+        # absent attribute still fails closed, as on AWS.
+        ("NOT state = 'on'", {"other": 1}, False),
+        ("NOT enabled", {"state": "on"}, False),
+        ("state = 'on' AND NOT temp > 20", {"state": "on"}, False),
+        # arithmetic operands, multiplicative binding tighter and parentheses
+        # regrouping — all four of these deploy on AWS
+        ("(a + b) > 10", {"a": 6, "b": 5}, True),
+        ("(a + b) > 10", {"a": 6, "b": 3}, False),
+        ("temp * 2 > 10", {"temp": 6}, True),
+        ("temp * 2 > 10", {"temp": 4}, False),
+        ("temp - 2 > 10", {"temp": 13}, True),
+        ("temp / 2 > 10", {"temp": 30}, True),
+        ("temp % 3 = 1", {"temp": 7}, True),
+        ("temp % 3 = 1", {"temp": 6}, False),
+        ("a + b * c > 10", {"a": 1, "b": 3, "c": 4}, True),  # 1 + 12, not 4 * 4
+        ("(a + b) * c > 10", {"a": 1, "b": 3, "c": 2}, False),  # 8, not 1 + 6
+        ("a - b - c = 1", {"a": 5, "b": 3, "c": 1}, True),  # left-associative
+        # a sign is not a binary operator
+        ("temp > -5", {"temp": 1}, True),
+        ("temp * -2 < 0", {"temp": 3}, True),
+        # an Undefined or unconvertible operand makes the whole expression
+        # Undefined, so the comparison over it fails closed
+        ("absent + 1 > 0", {"temp": 1}, False),
+        ("temp + 1 > 0", {"temp": "hot"}, False),
+        # "+" is overloaded: a String operand makes it concatenation
+        ("name + '!' = 'gw!'", {"name": "gw"}, True),
+        # ordering converts a numeric-looking string, as AWS does
+        ("temp > 10", {"temp": "22"}, True),
+        ("temp > 10", {"temp": "hot"}, False),
+        # ...but equality does not: a mismatched pair is simply unequal
+        ("temp = 22", {"temp": "22"}, False),
+        # a keyword may abut a bracket instead of whitespace
+        ("(a = 1)AND(b = 2)", {"a": 1, "b": 2}, True),
+        ("(a = 1)AND(b = 2)", {"a": 1, "b": 3}, False),
+        ("(a = 1)OR(b = 2)", {"a": 9, "b": 2}, True),
+        ("(a = 1)OR(b = 2)", {"a": 9, "b": 9}, False),
+        ("((a = 1)AND(b = 2))OR(c = 3)", {"a": 9, "b": 9, "c": 3}, True),
+    ],
+)
+def test_eval_where_truth_table(pred, payload, expected):
+    from ministack.services.iot import _eval_where, _rule_message
+
+    raw = json.dumps(payload).encode()
+    assert _eval_where(pred, "sensors/a1/telemetry", raw, _rule_message(raw)) is expected
+
+
+def test_eval_where_topic_function():
+    from ministack.services.iot import _eval_where, _rule_message
+
+    raw = b'{"x": 1}'
+    message = _rule_message(raw)
+    assert _eval_where("topic(2) = 'a1'", "sensors/a1/telemetry", raw, message) is True
+    assert _eval_where("topic(2) = 'b7'", "sensors/a1/telemetry", raw, message) is False
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM 'a/b'",
+        "SELECT temp AS t FROM 'a/+/b' WHERE temp > 20",
+        "SELECT * FROM 'a' WHERE state = 'on' AND regexp_matches(serial, '^d')",
+        "SELECT deviceId, temp WHERE temp >= 1.5",  # FROM-less Basic Ingest form
+        "SELECT encode(*, 'base64') AS data FROM 'bin'",
+        # OR and parenthesised groups: real AWS accepts these, so a rule that
+        # deploys on AWS must not be rejected here.
+        "SELECT * FROM 'a' WHERE state = 'on' OR state = 'off'",
+        "SELECT * FROM 'a' WHERE (state = 'on')",
+        "SELECT * FROM 'a' WHERE (state = 'on' OR state = 'off') AND temp > 20",
+        "SELECT * FROM 'a' WHERE ((a = 1 OR b = 2) AND (c = 3 OR d = 4)) OR e = 5",
+        # ...and the rest of the WHERE grammar real AWS accepts. A working local
+        # setup must not turn into a hard CreateTopicRule 400 here.
+        "SELECT * FROM 'a' WHERE state IN ('on', 'idle')",
+        "SELECT * FROM 'a' WHERE state IN('on')",
+        "SELECT * FROM 'a' WHERE state NOT IN ('on')",
+        "SELECT * FROM 'a' WHERE state LIKE 'on%'",
+        "SELECT * FROM 'a' WHERE state NOT LIKE 'on%'",
+        "SELECT * FROM 'a' WHERE temp BETWEEN 1 AND 5",
+        "SELECT * FROM 'a' WHERE temp BETWEEN 1 AND 5 AND state = 'on'",
+        "SELECT * FROM 'a' WHERE nickname IS NULL",
+        "SELECT * FROM 'a' WHERE nickname IS NOT NULL",
+        "SELECT * FROM 'a' WHERE isUndefined(state)",
+        "SELECT * FROM 'a' WHERE enabled",  # a bare boolean attribute
+        "SELECT * FROM 'a' WHERE note = 'it''s on'",  # escaped quote
+        "SELECT * FROM 'a' WHERE (a = 1)AND(b = 2)",  # no space around the keyword
+        # NOT and arithmetic: all of these create a working rule on real AWS, so
+        # rejecting them here would fail a stack that deploys.
+        "SELECT * FROM 'a' WHERE NOT enabled",
+        "SELECT * FROM 'a' WHERE NOT state = 'on'",
+        "SELECT * FROM 'a' WHERE NOT(state = 'on')",
+        "SELECT * FROM 'a' WHERE state = 'on' AND NOT temp > 20",
+        "SELECT * FROM 'a' WHERE NOT state IN ('on', 'idle')",
+        "SELECT * FROM 'a' WHERE (a + b) > 10",
+        "SELECT * FROM 'a' WHERE temp * 2 > 10",
+        "SELECT * FROM 'a' WHERE temp - 2 > 10",
+        "SELECT * FROM 'a' WHERE temp / 2 > 10",
+        "SELECT * FROM 'a' WHERE id % 2 = 0",
+        "SELECT * FROM 'a' WHERE a + b * c > 10",
+        "SELECT * FROM 'a' WHERE temp > -5",
+        # A call this evaluator does not implement is still accepted: AWS's
+        # function library is larger, and rejecting it would fail a stack that
+        # deploys on AWS. put_topic_rule warns instead.
+        "SELECT * FROM 'a' WHERE bogus_fn(x) = 1",
+        "SELECT get_thing_shadow('t') AS s FROM 'a'",
+    ],
+)
+def test_validate_rule_sql_accepts_supported_grammar(sql):
+    from ministack.services.iot import _validate_rule_sql
+
+    assert _validate_rule_sql(sql) is None
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "this is not sql",
+        "",
+        "SELECT * FROM topic_without_quotes",
+        "SELECT * FROM 'a' WHERE regexp_matches(serial, '[unbalanced')",
+        "SELECT * FROM 'a' WHERE 42",  # a literal is not a predicate
+        "SELECT * FROM 'a' WHERE state LIKE on",  # LIKE needs a quoted pattern
+        "SELECT * FROM 'a' WHERE state IN 'on'",  # ...and IN a bracketed list
+        "SELECT * FROM 'a' WHERE state IN ()",
+        "SELECT * FROM 'a' WHERE temp BETWEEN 1",  # BETWEEN needs both bounds
+        "SELECT * FROM 'a' WHERE nickname IS EMPTY",
+        "SELECT * FROM 'a' WHERE note = 'unterminated",
+        # unbalanced parentheses stay a parse error rather than being guessed at
+        "SELECT * FROM 'a' WHERE (state = 'on'",
+        "SELECT * FROM 'a' WHERE state = 'on')",
+        "SELECT * FROM 'a' WHERE (state = 'on' AND (temp > 20)",
+        "SELECT * FROM 'a' WHERE ()",
+        # an empty operand around a keyword is not a predicate
+        "SELECT * FROM 'a' WHERE state = 'on' OR",
+        "SELECT * FROM 'a' WHERE OR state = 'on'",
+        "SELECT * FROM 'a' WHERE state = 'on' AND",
+        "SELECT * FROM 'a' WHERE NOT",  # NOT needs a predicate to invert
+        "SELECT * FROM 'a' WHERE temp * > 10",  # ...and an operator two operands
+        "SELECT * FROM 'a' WHERE temp * 2 +",
+    ],
+)
+def test_validate_rule_sql_rejects_unparseable(sql):
+    from ministack.services.iot import _validate_rule_sql
+
+    assert _validate_rule_sql(sql) is not None
+
+
+def test_put_topic_rule_rejects_unevaluable_sql():
+    """Enforcement lives in `put_topic_rule`, so every door into the store — the
+    IoT API and the CloudFormation provisioner alike — is covered by one check."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    try:
+        with pytest.raises(iot_module.RuleSqlError):
+            iot_module.put_topic_rule(
+                "bad_rule", {"sql": "SELECT * FROM 'a' WHERE (state = 'on'"}
+            )
+        assert iot_module._topic_rules.get("bad_rule") is None
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+def test_put_topic_rule_warns_for_unimplemented_sql_function(caplog):
+    """AWS's function library is larger than this evaluator's, so a call it does
+    not implement is stored rather than failing a stack that deploys on AWS —
+    but it warns, because the rule will silently never match on it."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    try:
+        with caplog.at_level(logging.WARNING, logger="iot"):
+            iot_module.put_topic_rule(
+                "fn_rule", {"sql": "SELECT * FROM 'a' WHERE bogus_fn(x) = 1"}
+            )
+        assert iot_module._topic_rules.get("fn_rule") is not None
+        assert any("bogus_fn()" in r.message for r in caplog.records)
+        # A function it does implement says nothing.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="iot"):
+            iot_module.put_topic_rule(
+                "ok_rule", {"sql": "SELECT * FROM 'a' WHERE topic(2) = 'x'"}
+            )
+        assert not caplog.records
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM 'a' WHERE (state = 'on')",
+        "SELECT * FROM 'a' WHERE (a = 1) AND (b = 2)",
+        "SELECT * FROM 'a' WHERE state IN ('on', 'idle')",
+        "SELECT * FROM 'a' WHERE state NOT IN ('on')",
+        "SELECT * FROM 'a' WHERE NOT (a = 1)",
+        "SELECT * FROM 'a' WHERE temp BETWEEN 1 AND (2 + 3)",
+    ],
+)
+def test_put_topic_rule_does_not_mistake_a_keyword_for_a_function(caplog, sql):
+    """A SQL keyword may sit in front of a bracket without opening a call.
+
+    Scanning for `<name>(` alone read `WHERE (`, `IN (` and `AND (` as calls and
+    warned about a missing where()/in()/and() — noise on perfectly ordinary
+    rules, and exactly the kind that trains people to ignore the warning that
+    matters.
+    """
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    try:
+        with caplog.at_level(logging.WARNING, logger="iot"):
+            iot_module.put_topic_rule("kw_rule", {"sql": sql})
+        assert not caplog.records
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+def test_reset_clears_the_sql_function_warning_ledger():
+    """`_warned_sql_funcs` makes the unimplemented-function warning fire once
+    per name, so it is module state the service reset has to clear — otherwise
+    the second test to store the same rule silently gets no warning."""
+    from ministack.services import iot as iot_module
+
+    try:
+        iot_module._warn_unimplemented_sql_function("get_thing_shadow")
+        assert iot_module._warned_sql_funcs
+        iot_module.reset()
+        assert not iot_module._warned_sql_funcs
+    finally:
+        iot_module.reset()
+
+
+def test_like_and_regexp_matches_convert_operands_alike():
+    """The two string operators take the same operand policy.
+
+    They used to disagree — `regexp_matches` coerced with str() while LIKE
+    demanded a Python string — so the same Int payload matched one and not the
+    other. Both now run AWS's documented "to String" conversion, which renders
+    an Int and a Boolean (lowercase, as JSON does) and leaves Null Undefined.
+    """
+    from ministack.services.iot import _eval_where, _rule_message
+
+    def both(attr, payload):
+        raw = json.dumps(payload).encode()
+        message = _rule_message(raw)
+        return (
+            _eval_where(f"{attr} LIKE '2%'", "a/b", raw, message),
+            _eval_where(f"regexp_matches({attr}, '^2')", "a/b", raw, message),
+        )
+
+    assert both("temp", {"temp": 22}) == (True, True)
+    assert both("temp", {"temp": "22"}) == (True, True)
+    assert both("temp", {"temp": 22.5}) == (True, True)
+    assert both("temp", {"temp": 31}) == (False, False)
+    assert both("temp", {"temp": None}) == (False, False)
+    assert both("temp", {"other": 1}) == (False, False)
+
+
+def test_eval_where_warns_when_a_stored_predicate_cannot_be_parsed(caplog):
+    """Validation keeps these out of the store, but state restored from an older
+    MiniStack can carry one — it must be loud, not a silent non-match."""
+    from ministack.services.iot import _eval_where, _rule_message
+
+    raw = b'{"state": "on"}'
+    with caplog.at_level(logging.WARNING, logger="iot_broker"):
+        assert _eval_where("(state = 'on'", "a/b", raw, _rule_message(raw)) is False
+    assert any("cannot be parsed" in r.message for r in caplog.records)
+
+
+def test_run_rule_actions_where_gates_dispatch(monkeypatch):
+    """A WHERE-carrying rule dispatches only the matching publishes."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    iot_module._topic_rules.set_scoped(
+        account_id,
+        _TEST_REGION,
+        "gated_rule",
+        {
+            "ruleName": "gated_rule",
+            "sql": "SELECT * FROM 'sensors/#' WHERE state = 'on'",
+            "ruleDisabled": False,
+            "actions": [{"lambda": {"functionArn": "arn:aws:lambda:us-east-1:123456789012:function:sink"}}],
+        },
+    )
+    dispatched = []
+    monkeypatch.setattr(
+        iot_module,
+        "_dispatch_rule_to_lambda",
+        lambda account, region, arn, event: dispatched.append(event),
+    )
+
+    async def _run():
+        await publish(account_id, "sensors/door", b'{"state": "on", "n": 1}')
+        await publish(account_id, "sensors/door", b'{"state": "off", "n": 2}')
+        await publish(account_id, "sensors/door", b'{"n": 3}')  # attribute missing
+
+    try:
+        asyncio.run(_run())
+        assert dispatched == [{"state": "on", "n": 1}]
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+# ----------------------------------------------------------------------
+# Rule action dispatch: republish / dynamoDBv2 / sns (white-box).
+# ----------------------------------------------------------------------
+
+
+def _put_rule(account_id, name, sql, actions):
+    from ministack.services import iot as iot_module
+
+    iot_module._topic_rules.set_scoped(
+        account_id,
+        _TEST_REGION,
+        name,
+        {"ruleName": name, "sql": sql, "ruleDisabled": False, "actions": actions},
+    )
+
+
+def test_rule_republish_action_delivers_projected_event():
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    _put_rule(
+        account_id,
+        "repub_rule",
+        "SELECT temp AS t FROM 'sensors/+/telemetry' WHERE temp > 20",
+        [{"republish": {"topic": "filtered/telemetry", "qos": 1}}],
+    )
+    received = []
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            received.append((topic, payload, qos))
+
+        await subscribe(account_id, "filtered/telemetry", _collect, granted_qos=1)
+        await publish(account_id, "sensors/a1/telemetry", b'{"temp": 22}')
+        await publish(account_id, "sensors/a1/telemetry", b'{"temp": 19}')  # WHERE gates
+
+    try:
+        asyncio.run(_run())
+        assert len(received) == 1
+        topic, payload, _qos = received[0]
+        assert topic == "filtered/telemetry"
+        assert json.loads(payload) == {"t": 22}
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+def test_rule_republish_onto_own_topic_terminates():
+    """A rule republishing onto its own topic filter is user error, but the
+    broker must cut the chain instead of recursing forever."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    _put_rule(
+        account_id,
+        "loop_rule",
+        "SELECT * FROM 'loop/topic'",
+        [{"republish": {"topic": "loop/topic"}}],
+    )
+    received = []
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            received.append(payload)
+
+        await subscribe(account_id, "loop/topic", _collect)
+        await publish(account_id, "loop/topic", b'{"n": 1}')
+
+    try:
+        asyncio.run(_run())
+        # The original publish plus one republish per allowed depth.
+        assert len(received) == 1 + iot_module._MAX_REPUBLISH_DEPTH
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+def test_rule_action_failure_does_not_kill_the_loop(monkeypatch):
+    """A failing action is logged and the remaining actions still dispatch."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    _put_rule(
+        account_id,
+        "multi_rule",
+        "SELECT * FROM 'multi/topic'",
+        [
+            {"sns": {"targetArn": "arn:aws:sns:us-east-1:123456789012:absent-topic"}},
+            {"dynamoDBv2": {"putItem": {"tableName": "absent-table"}}},
+            {"lambda": {"functionArn": "arn:aws:lambda:us-east-1:123456789012:function:sink"}},
+        ],
+    )
+    dispatched = []
+    monkeypatch.setattr(
+        iot_module,
+        "_dispatch_rule_to_lambda",
+        lambda account, region, arn, event: dispatched.append(event),
+    )
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("dispatch blew up")
+
+    # First action targets a missing SNS topic (raises on its own), second one
+    # is made to raise outright — the lambda action after both must still
+    # dispatch.
+    monkeypatch.setattr(iot_module, "_dispatch_rule_dynamodb", _boom)
+
+    async def _run():
+        await publish(account_id, "multi/topic", b'{"ok": 1}')
+
+    try:
+        asyncio.run(_run())
+        assert dispatched == [{"ok": 1}]
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+def test_rule_sns_action_writes_a_full_sns_message_record():
+    """The dispatcher publishes through SNS's own internal path, so the stored
+    record carries every field an HTTP `Publish` writes — a hand-rolled append
+    here would quietly drop the ones a subscription filter policy reads."""
+    from ministack.services import iot as iot_module
+    from ministack.services import sns as sns_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    topic_arn = f"arn:aws:sns:{_TEST_REGION}:{account_id}:rule-sink"
+    sns_module._topics.set_scoped(
+        account_id,
+        _TEST_REGION,
+        topic_arn,
+        {"arn": topic_arn, "messages": [], "subscriptions": [], "attributes": {}},
+    )
+    _put_rule(
+        account_id,
+        "sns_rule",
+        "SELECT temp FROM 'sensors/+/telemetry'",
+        [{"sns": {"targetArn": topic_arn}}],
+    )
+
+    async def _run():
+        await publish(account_id, "sensors/a1/telemetry", b'{"temp": 22, "n": 1}')
+
+    try:
+        asyncio.run(_run())
+        stored = sns_module._topics.get_scoped(account_id, _TEST_REGION, topic_arn)
+        assert len(stored["messages"]) == 1
+        record = stored["messages"][0]
+        assert json.loads(record["message"]) == {"temp": 22}
+        assert set(record) == {
+            "id",
+            "message",
+            "subject",
+            "message_structure",
+            "message_attributes",
+            "timestamp",
+        }
+    finally:
+        sns_module._topics.clear()
+        iot_module._topic_rules.clear()
+        reset()
+
+
+def test_rule_error_action_runs_when_an_action_fails(monkeypatch):
+    """AWS invokes the rule's errorAction when an action fails, with the failure
+    document — without it the only trace of a broken pipeline is a local log
+    line nobody reads."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    iot_module._topic_rules.set_scoped(
+        account_id,
+        _TEST_REGION,
+        "err_rule",
+        {
+            "ruleName": "err_rule",
+            "sql": "SELECT * FROM 'err/topic'",
+            "ruleDisabled": False,
+            "actions": [{"dynamoDBv2": {"putItem": {"tableName": "absent"}}}],
+            "errorAction": {"republish": {"topic": "err/dlq"}},
+        },
+    )
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("dispatch blew up")
+
+    monkeypatch.setattr(iot_module, "_dispatch_rule_dynamodb", _boom)
+    received = []
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            received.append(json.loads(payload))
+
+        await subscribe(account_id, "err/dlq", _collect)
+        await publish(account_id, "err/topic", b'{"n": 1}')
+
+    try:
+        asyncio.run(_run())
+        assert len(received) == 1
+        doc = received[0]
+        assert doc["ruleName"] == "err_rule"
+        assert doc["topic"] == "err/topic"
+        assert base64.b64decode(doc["base64OriginalPayload"]) == b'{"n": 1}'
+        assert doc["failures"] == [
+            {"action": "dynamoDBv2", "errorMessage": "RuntimeError: dispatch blew up"}
+        ]
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+@pytest.mark.parametrize(
+    ("action", "action_type", "error_fragment"),
+    [
+        (
+            {"dynamoDBv2": {"putItem": {"tableName": "absent-table"}}},
+            "dynamoDBv2",
+            "absent-table",
+        ),
+        (
+            {"sns": {"targetArn": "arn:aws:sns:us-east-1:123456789012:absent-topic"}},
+            "sns",
+            "absent-topic",
+        ),
+    ],
+)
+def test_rule_error_action_runs_on_an_undeliverable_destination(
+    action, action_type, error_fragment
+):
+    """The failure that actually happens locally is a destination that is not
+    there, and it has to reach the errorAction.
+
+    Both dispatchers used to log-and-return for it, so the errorAction only ever
+    ran for a monkeypatched raise — the emulator reported a healthy pipeline
+    while dropping every message.
+    """
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    iot_module._topic_rules.set_scoped(
+        account_id,
+        _TEST_REGION,
+        "undeliverable_rule",
+        {
+            "ruleName": "undeliverable_rule",
+            "sql": "SELECT * FROM 'err/topic'",
+            "ruleDisabled": False,
+            "actions": [action],
+            "errorAction": {"republish": {"topic": "err/dlq"}},
+        },
+    )
+    received = []
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            received.append(json.loads(payload))
+
+        await subscribe(account_id, "err/dlq", _collect)
+        await publish(account_id, "err/topic", b'{"n": 1}')
+
+    try:
+        asyncio.run(_run())
+        assert len(received) == 1
+        doc = received[0]
+        assert doc["ruleName"] == "undeliverable_rule"
+        assert base64.b64decode(doc["base64OriginalPayload"]) == b'{"n": 1}'
+        assert len(doc["failures"]) == 1
+        failure = doc["failures"][0]
+        assert failure["action"] == action_type
+        assert error_fragment in failure["errorMessage"]
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+def test_rule_error_action_absent_is_a_no_op(monkeypatch):
+    """A rule without an errorAction still just logs the failure."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    _put_rule(
+        account_id,
+        "noerr_rule",
+        "SELECT * FROM 'noerr/topic'",
+        [{"dynamoDBv2": {"putItem": {"tableName": "absent"}}}],
+    )
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("dispatch blew up")
+
+    monkeypatch.setattr(iot_module, "_dispatch_rule_dynamodb", _boom)
+
+    async def _run():
+        await publish(account_id, "noerr/topic", b'{"n": 1}')
+
+    try:
+        asyncio.run(_run())  # no exception escapes
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+
+
+def test_ddb_attribute_value_mapping():
+    from ministack.services.iot import _ddb_attribute_value
+
+    assert _ddb_attribute_value(True) == {"BOOL": True}
+    assert _ddb_attribute_value(3) == {"N": "3"}
+    assert _ddb_attribute_value(2.5) == {"N": "2.5"}
+    assert _ddb_attribute_value(None) == {"NULL": True}
+    assert _ddb_attribute_value({"a": 1}) == {"S": '{"a": 1}'}
+    assert _ddb_attribute_value([1, 2]) == {"S": "[1, 2]"}
+    assert _ddb_attribute_value("x") == {"S": "x"}
