@@ -6648,6 +6648,87 @@ def test_lambda_invoke_emits_cloudwatch_logs_nodejs(lam, logs):
         lam.delete_function(FunctionName=fname)
 
 
+# ──────────────────── host.docker.internal → host-gateway ────────────────────
+
+
+def _spawn_capture_run_kwargs(monkeypatch, *, endpoint, docker_flags=""):
+    """Spawn one Lambda container against fakes and return the docker kwargs.
+
+    Captures both entry points: the DinD path uses ``containers.create`` (code
+    is docker-cp'd rather than bind-mounted) and everything else uses
+    ``containers.run``, and which one a runner takes is not this test's point.
+    """
+    monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_FLAGS", docker_flags)
+    monkeypatch.setattr(lsvc, "_docker_available", True)
+    monkeypatch.setenv("AWS_ENDPOINT_URL", endpoint)
+
+    captured = {}
+    fake_container = _mk_container()
+    fake_container.ports = {"8080/tcp": [{"HostPort": "9999"}]}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return fake_container
+
+    fake_client = MagicMock()
+    fake_client.containers.run = _capture
+    fake_client.containers.create = _capture
+    fake_client.images.get = MagicMock()
+    monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)
+
+    lsvc._spawn_lambda_container(
+        {"FunctionName": "test-hg-fn", "Runtime": "python3.12",
+         "Handler": "index.handler", "PackageType": "Zip", "Timeout": 3,
+         "MemorySize": 128,
+         "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:test-hg-fn"},
+        _make_zip("def handler(e, c): pass"),
+    )
+    return captured
+
+
+def test_lambda_container_maps_host_docker_internal_to_host_gateway(monkeypatch):
+    """A container pointed at host.docker.internal gets the name mapped.
+
+    AWS_ENDPOINT_URL is rewritten from localhost to host.docker.internal for
+    the container, but that name only resolves out of the box on Docker
+    Desktop. On a native Linux engine it is undefined unless mapped to the
+    magic `host-gateway` address, so a handler's callback dies on DNS.
+    """
+    captured = _spawn_capture_run_kwargs(
+        monkeypatch, endpoint="http://localhost:4566"
+    )
+
+    assert captured["environment"]["AWS_ENDPOINT_URL"] == (
+        "http://host.docker.internal:4566"
+    )
+    assert captured["extra_hosts"] == {"host.docker.internal": "host-gateway"}
+
+
+def test_lambda_container_host_gateway_yields_to_an_explicit_add_host(monkeypatch):
+    """An explicit --add-host for the same name still wins."""
+    captured = _spawn_capture_run_kwargs(
+        monkeypatch,
+        endpoint="http://localhost:4566",
+        docker_flags="--add-host host.docker.internal:10.5.0.1",
+    )
+
+    assert captured["extra_hosts"] == {"host.docker.internal": "10.5.0.1"}
+
+
+def test_lambda_container_without_host_docker_internal_gets_no_mapping(monkeypatch):
+    """An endpoint that names something else is left alone.
+
+    A Docker-network deployment points AWS_ENDPOINT_URL at a container name,
+    which resolves on the network's own DNS; mapping host.docker.internal
+    there would be noise at best.
+    """
+    captured = _spawn_capture_run_kwargs(
+        monkeypatch, endpoint="http://ministack:4566"
+    )
+
+    assert "extra_hosts" not in captured
+
+
 # ──────────────────── LAMBDA_DOCKER_FLAGS ────────────────────
 
 def test_lambda_docker_flags_applied_to_run_kwargs(monkeypatch):
@@ -6670,6 +6751,9 @@ def test_lambda_docker_flags_applied_to_run_kwargs(monkeypatch):
 
     fake_client = MagicMock()
     fake_client.containers.run = _fake_run
+    # A runner that is itself containerised takes the docker-cp path, which
+    # calls containers.create; the flags land in the same kwargs either way.
+    fake_client.containers.create = _fake_run
     fake_client.images.get = MagicMock()
     monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)
 
@@ -6709,7 +6793,10 @@ def test_lambda_docker_flags_applied_to_run_kwargs(monkeypatch):
     assert captured["mem_limit"] == "512m"
     assert captured["shm_size"] == "256m"
     assert captured["cap_add"] == ["SYS_PTRACE"]
-    assert captured["extra_hosts"] == {"myhost": "10.0.0.1"}
+    # The host-gateway mapping is merged in alongside an explicit --add-host.
+    assert captured["extra_hosts"] == {
+        "myhost": "10.0.0.1", "host.docker.internal": "host-gateway",
+    }
     assert captured["tmpfs"] == {"/run": "size=100m"}
     assert captured["privileged"] is True
     assert captured["read_only"] is True
@@ -9087,6 +9174,397 @@ def test_invoke_rie_rewrites_custom_resource_response_url():
     assert event["ResponseURL"] == "http://localhost:4566/_ministack/cfn-response/tok"
 
 
+# ---------------------------------------------------------------------------
+# RIE invoke — an init failure is terminal, a cold start is not
+# ---------------------------------------------------------------------------
+
+
+class _RieFakeContainer:
+    """Minimal docker-py container stand-in for the RIE invoke path."""
+
+    status = "running"
+    attrs = {"NetworkSettings": {"Networks": {}}}
+    ports = {"8080/tcp": [{"HostPort": "12345"}]}
+
+    def reload(self):
+        pass
+
+    def logs(self, **_kw):
+        return b"[ERROR] Runtime.ImportModuleError"
+
+
+_INIT_ERROR_PAYLOAD = {
+    "errorMessage": "Unable to import module 'index': No module named 'missing_dep'",
+    "errorType": "Runtime.ImportModuleError",
+    "requestId": "",
+    "stackTrace": [],
+}
+
+
+def _rie_init_error(url):
+    """The 502 AWS RIE answers with when the handler module will not import."""
+    return _urlerr.HTTPError(
+        url,
+        502,
+        "Bad Gateway",
+        {"Lambda-Runtime-Function-Error-Type": "Runtime.ImportModuleError"},
+        io.BytesIO(json.dumps(_INIT_ERROR_PAYLOAD).encode()),
+    )
+
+
+@pytest.mark.parametrize(
+    "exc,retryable",
+    [
+        (_urlerr.HTTPError("http://x", 502, "Bad Gateway", {}, io.BytesIO(b"{}")), False),
+        (TimeoutError("timed out"), False),
+        (_urlerr.URLError(ConnectionRefusedError(111, "Connection refused")), True),
+        (_urlerr.URLError(TimeoutError("connect timed out")), True),
+        (ConnectionResetError(104, "Connection reset by peer"), True),
+        (OSError("no route to host"), True),
+    ],
+)
+def test_rie_failure_is_retryable_classification(exc, retryable):
+    """Only a connection-level failure means the container is still coming up."""
+    from ministack.services.lambda_svc import _rie_failure_is_retryable
+
+    assert _rie_failure_is_retryable(exc) is retryable
+
+
+def test_invoke_rie_reports_an_init_error_instead_of_retrying_it():
+    """A reported init error is terminal: one request, and the payload survives.
+
+    RIE answers a failed INIT with a 502 — an `HTTPError`, which is a subclass
+    of `URLError` and so used to land in the connection-refused retry arm. Every
+    retry re-ran INIT and failed identically, for `Timeout * 10 + 20` attempts.
+    """
+    from ministack.services.lambda_svc import _invoke_rie
+
+    calls = []
+
+    def _fake_urlopen(req, timeout=None):
+        calls.append(req.full_url)
+        raise _rie_init_error(req.full_url)
+
+    started = time.time()
+    with patch("urllib.request.urlopen", _fake_urlopen):
+        # Timeout=900 is legal on AWS, and used to buy 9020 retries at 0.1s.
+        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=900)
+    elapsed = time.time() - started
+
+    assert len(calls) == 1
+    assert elapsed < 5
+    assert result["error"] is True
+    assert result["function_error"] == "Unhandled"
+    assert result["body"] == _INIT_ERROR_PAYLOAD
+    assert "Runtime.ImportModuleError" in result["log"]
+
+
+def test_invoke_rie_still_retries_a_container_that_is_still_starting():
+    """The cold-start retry stays: a refused connection is not a function error."""
+    from ministack.services.lambda_svc import _invoke_rie
+
+    calls = []
+
+    class _FakeResp:
+        headers = {}
+
+        def read(self):
+            return json.dumps({"ok": True}).encode()
+
+    def _fake_urlopen(req, timeout=None):
+        calls.append(req.full_url)
+        if len(calls) < 3:
+            raise _urlerr.URLError(ConnectionRefusedError(111, "Connection refused"))
+        return _FakeResp()
+
+    with patch("urllib.request.urlopen", _fake_urlopen):
+        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=5)
+
+    assert len(calls) == 3
+    assert result["body"] == {"ok": True}
+    assert "error" not in result
+
+
+def test_invoke_rie_does_not_re_run_a_handler_that_timed_out():
+    """A read timeout means the handler ran; re-POSTing it just runs it again."""
+    from ministack.services.lambda_svc import _invoke_rie
+
+    calls = []
+
+    def _fake_urlopen(req, timeout=None):
+        calls.append(req.full_url)
+        raise TimeoutError("timed out")
+
+    with patch("urllib.request.urlopen", _fake_urlopen):
+        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=3)
+
+    assert len(calls) == 1
+    assert result["error"] is True
+    assert result["function_error"] == "Unhandled"
+    # The message and type the local and catch-all docker paths already emit.
+    assert result["body"] == {
+        "errorMessage": "Task timed out after 3.00 seconds",
+        "errorType": "Runtime.ExitError",
+    }
+    # Internal signal to _execute_function_docker: do not pool this container.
+    assert result["timeout"] is True
+
+
+def test_invoke_rie_reports_a_non_json_502_body():
+    """A 502 whose body is not the RIE error payload still reports a function error.
+
+    RIE answers a failed INIT with JSON, but a 502 can also come from something
+    else in front of the port (a proxy, a half-written body). The fallback keeps
+    the response shape and carries the header's error type when there is one.
+    """
+    from ministack.services.lambda_svc import _invoke_rie
+
+    def _fake_urlopen(req, timeout=None):
+        raise _urlerr.HTTPError(
+            req.full_url, 502, "Bad Gateway",
+            {"Lambda-Runtime-Function-Error-Type": "Runtime.InvalidEntrypoint"},
+            io.BytesIO(b"<html>502 Bad Gateway</html>"),
+        )
+
+    with patch("urllib.request.urlopen", _fake_urlopen):
+        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=3)
+
+    assert result["error"] is True
+    assert result["function_error"] == "Unhandled"
+    assert result["body"]["errorType"] == "Runtime.InvalidEntrypoint"
+    assert "502" in result["body"]["errorMessage"]
+    assert "<html>502 Bad Gateway</html>" in result["body"]["errorMessage"]
+    # Not a timeout — the container is answering, so it stays poolable.
+    assert "timeout" not in result
+
+
+def test_invoke_rie_non_json_502_without_an_error_type_header():
+    """No error-type header either: the shape holds, with the generic type."""
+    from ministack.services.lambda_svc import _invoke_rie
+
+    def _fake_urlopen(req, timeout=None):
+        raise _urlerr.HTTPError(
+            req.full_url, 502, "Bad Gateway", {}, io.BytesIO(b"not json"),
+        )
+
+    with patch("urllib.request.urlopen", _fake_urlopen):
+        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=3)
+
+    assert result["body"] == {
+        "errorMessage": "Lambda RIE returned HTTP 502: not json",
+        "errorType": "Runtime.ExitError",
+    }
+
+
+def test_lambda_docker_timeout_recycles_the_container(monkeypatch):
+    """A timed-out container is discarded, not handed to the next invocation.
+
+    Its handler is still running inside the RIE, so pooling it would queue the
+    next invocation behind a zombie. AWS terminates the execution environment
+    on a timeout; this is the same bargain — the next call cold-starts.
+    """
+    from ministack.services import lambda_svc as lsvc
+
+    name = f"lam-timeout-recycle-{_uuid_mod.uuid4().hex[:8]}"
+    config = {
+        "FunctionName": name,
+        "Runtime": "python3.12",
+        "Handler": "index.handler",
+        "Timeout": 3,
+        "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{name}",
+    }
+    spawned = []
+    removed = []
+
+    def _fake_spawn(*_a, **_kw):
+        container = _RieFakeContainer()
+        spawned.append(container)
+        return container, None
+
+    monkeypatch.setattr(lsvc, "LAMBDA_EXECUTOR", "docker")
+    monkeypatch.setattr(lsvc, "_docker_available", True)
+    monkeypatch.setattr(lsvc, "_get_docker_client", lambda: object())
+    monkeypatch.setattr(lsvc, "_ensure_reaper_thread", lambda: None)
+    monkeypatch.setattr(lsvc, "_spawn_lambda_container", _fake_spawn)
+    monkeypatch.setattr(lsvc, "_kill_pool_entry", lambda entry: removed.append(entry))
+
+    def _fake_urlopen(req, timeout=None):
+        raise TimeoutError("timed out")
+
+    try:
+        with patch("urllib.request.urlopen", _fake_urlopen):
+            first = lsvc._execute_function_docker(
+                {"config": config, "code_zip": b"zip"}, {}
+            )
+            second = lsvc._execute_function_docker(
+                {"config": config, "code_zip": b"zip"}, {}
+            )
+    finally:
+        lsvc._pool_kill_function("000000000000", name)
+
+    for result in (first, second):
+        assert result["error"] is True
+        assert result["body"]["errorType"] == "Runtime.ExitError"
+        assert result["body"]["errorMessage"] == "Task timed out after 3.00 seconds"
+        # The recycle signal is internal and must not reach the caller.
+        assert "timeout" not in result
+
+    # The reaper runs off the response path, so wait for it rather than racing.
+    deadline = time.time() + 5
+    while len(removed) < 2 and time.time() < deadline:
+        time.sleep(0.05)
+
+    assert len(spawned) == 2, "second invoke reused the timed-out container"
+    assert spawned[0] is not spawned[1]
+    assert len(removed) == 2, "timed-out containers were not torn down"
+
+
+def test_invoke_rie_gives_up_on_an_unreachable_container(monkeypatch):
+    """An endless refusal is bounded by the reconnect deadline, not by Timeout."""
+    from ministack.services import lambda_svc as lsvc
+
+    monkeypatch.setattr(lsvc, "_RIE_CONNECT_RETRY_SECONDS", 0.5)
+
+    def _fake_urlopen(req, timeout=None):
+        raise _urlerr.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+    started = time.time()
+    with patch("urllib.request.urlopen", _fake_urlopen):
+        result = lsvc._invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=900)
+    elapsed = time.time() - started
+
+    assert elapsed < 5
+    assert result["error"] is True
+    assert result["body"]["errorType"] == "Runtime.ExitError"
+
+
+def test_lambda_invoke_returns_a_rie_init_error_to_the_caller(monkeypatch):
+    """End to end: Invoke answers 200 + X-Amz-Function-Error, and answers now."""
+    from ministack.services import lambda_svc as lsvc
+
+    name = f"lam-init-error-{_uuid_mod.uuid4().hex[:8]}"
+    config = {
+        "FunctionName": name,
+        "Runtime": "python3.12",
+        "Handler": "index.handler",
+        "Timeout": 900,
+        "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{name}",
+    }
+    monkeypatch.setattr(lsvc, "LAMBDA_EXECUTOR", "docker")
+    # Pin the docker branch: _get_docker_client() returning None (no daemon on
+    # the runner) would silently fall back to the warm executor and test nothing.
+    monkeypatch.setattr(lsvc, "_docker_available", True)
+    monkeypatch.setattr(lsvc, "_get_docker_client", lambda: object())
+    monkeypatch.setattr(lsvc, "_ensure_reaper_thread", lambda: None)
+    monkeypatch.setattr(
+        lsvc, "_spawn_lambda_container", lambda *_a, **_kw: (_RieFakeContainer(), None)
+    )
+    monkeypatch.setattr(lsvc, "_emit_lambda_metrics", lambda *a, **kw: None)
+    monkeypatch.setitem(
+        lsvc._functions, name,
+        {"config": config, "code_zip": b"zip", "versions": {}},
+    )
+
+    def _fake_urlopen(req, timeout=None):
+        raise _rie_init_error(req.full_url)
+
+    started = time.time()
+    try:
+        with patch("urllib.request.urlopen", _fake_urlopen):
+            status, headers, body = asyncio.run(lsvc._invoke(name, {}, {}))
+    finally:
+        lsvc._pool_kill_function("000000000000", name)
+    elapsed = time.time() - started
+
+    assert elapsed < 5
+    assert status == 200
+    assert headers["X-Amz-Function-Error"] == "Unhandled"
+    assert json.loads(body)["errorType"] == "Runtime.ImportModuleError"
+
+
+@pytest.mark.skipif(
+    os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
+    reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
+)
+def test_lambda_docker_timeout_returns_task_timed_out_promptly(lam):
+    """The real RIE end of the timeout story: one AWS-style error, promptly.
+
+    The read timeout must not fall into the cold-start connection poll and
+    re-POST — which re-runs the handler — up to ``timeout * 10 + 20`` times.
+    """
+    fname = f"lam-docker-sleeper-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        "import time\n"
+        "def handler(event, context):\n"
+        "    time.sleep(event.get('sleep', 0))\n"
+        "    return {'slept': event.get('sleep', 0)}\n"
+    )
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Handler="index.handler",
+        Role=_LAMBDA_ROLE, Code={"ZipFile": _make_zip(code)}, Timeout=3,
+    )
+    try:
+        # Warm the container so the timing below excludes the cold start.
+        resp, payload = _invoke_lambda_payload(lam, fname, {"sleep": 0})
+        assert payload == {"slept": 0}
+
+        started = time.time()
+        resp, payload = _invoke_lambda_payload(lam, fname, {"sleep": 10})
+        elapsed = time.time() - started
+        assert resp.get("FunctionError") == "Unhandled"
+        assert payload["errorMessage"] == "Task timed out after 3.00 seconds"
+        assert payload["errorType"] == "Runtime.ExitError"
+        # One timeout, not a retry storm (broken code took 4x+ the Timeout and
+        # surfaced a raw "Lambda RIE failed" instead).
+        assert elapsed < 9, f"timeout took {elapsed:.1f}s — retry storm?"
+
+        # The timed-out container is recycled, and the function stays usable.
+        resp, payload = _invoke_lambda_payload(lam, fname, {"sleep": 0})
+        assert not resp.get("FunctionError"), payload
+        assert payload == {"slept": 0}
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+@pytest.mark.skipif(
+    os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
+    reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
+)
+def test_lambda_docker_init_error_is_reported_not_retried(lam):
+    """The real RIE end of the same story: a handler that cannot import.
+
+    RIE answers such an invocation with a 502 and re-runs INIT on every
+    retry, so this used to spin at ten invocations a second for the whole
+    of `Timeout` before answering.
+    """
+    fname = f"lam-init-err-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(
+            "import missing_dep_xyz\n\n"
+            "def handler(event, context):\n"
+            "    return {'ok': True}\n"
+        )},
+        Timeout=120,
+    )
+    try:
+        started = time.time()
+        resp = lam.invoke(FunctionName=fname, Payload=b"{}")
+        elapsed = time.time() - started
+
+        assert elapsed < 60, "invoke did not return promptly"
+        assert resp["StatusCode"] == 200
+        assert resp["FunctionError"] == "Unhandled"
+        payload = json.loads(resp["Payload"].read())
+        assert payload["errorType"] == "Runtime.ImportModuleError"
+        assert "missing_dep_xyz" in payload["errorMessage"]
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
 def _ddb_stream_record(seq, stream_arn, created_at=None):
     return {
         "eventID": str(seq),
@@ -9737,3 +10215,294 @@ def test_lambda_reserved_concurrency_throttles_rather_than_queues(lam):
     finally:
         with contextlib.suppress(Exception):
             lam.delete_function(FunctionName=name)
+# Recursive-loop detection — PutFunctionRecursionConfig made real.
+#
+# AWS drops an invocation once a request has gone around the same function
+# more than 16 times, unless RecursiveLoop is set to Allow, and surfaces the
+# drop as RecursiveInvocationException. It counts lineage carried on the
+# request rather than concurrent executions, which is what catches the loop
+# shape that has nothing to exhaust: an async self-invoke returns 202 and
+# releases the warm worker immediately, so it recurses forever with a single
+# execution in flight. These tests drive that through a real chain, so they
+# cover the whole path — depth into the child env, the botocore hook that
+# stamps it onto the nested call, and the counter check back on the gateway.
+#
+# Every test here is bounded in wall clock: a regression that reopens the
+# runaway must fail, not hang.
+# ---------------------------------------------------------------------------
+
+_RECURSION_LIMIT = 16
+
+# Logs its hop number, then invokes itself asynchronously with the next one.
+# `stop` is a backstop so a broken guard ends the chain instead of running
+# until the test session is killed.
+_LOOP_HANDLER = (
+    "import json, os, sys, boto3\n"
+    "def handler(event, context):\n"
+    "    n = int(event.get('n', 0))\n"
+    "    stop = int(event.get('stop', 40))\n"
+    "    print('LOOPHOP %d' % n, file=sys.stderr)\n"
+    "    if n >= stop:\n"
+    "        return {'done': n}\n"
+    "    c = boto3.client('lambda', endpoint_url=os.environ['AWS_ENDPOINT_URL'],\n"
+    "                     region_name=os.environ['AWS_REGION'])\n"
+    "    try:\n"
+    "        c.invoke(FunctionName=os.environ['AWS_LAMBDA_FUNCTION_NAME'],\n"
+    "                 InvocationType='Event',\n"
+    "                 Payload=json.dumps({'n': n + 1, 'stop': stop}))\n"
+    "    except Exception as exc:\n"
+    "        print('LOOPDROP %s' % type(exc).__name__, file=sys.stderr)\n"
+    "    return {'n': n}\n"
+)
+
+
+def _create_loop_fn(lam, name: str) -> None:
+    lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(_LOOP_HANDLER)},
+        Timeout=10,
+    )
+
+
+def _drain_loop(logs, name: str, budget_s: float = 60.0, settle_s: float = 4.0):
+    """Run the chain to a standstill; return (hops seen, drop markers seen).
+
+    Polls the function's log group until nothing new shows up for `settle_s`,
+    so the assertions describe a finished chain rather than a snapshot of one
+    still in flight. Gives up at `budget_s` — a chain that never settles is a
+    failed guard, and saying so beats hanging the suite.
+    """
+    hops: set = set()
+    drops: set = set()
+    started = time.time()
+    last_change = started
+    while time.time() - started < budget_s:
+        time.sleep(0.5)
+        try:
+            events = logs.filter_log_events(
+                logGroupName=f"/aws/lambda/{name}", limit=1000
+            ).get("events", [])
+        except ClientError:
+            continue  # log group not created until the first hop runs
+        seen_hops, seen_drops = set(), set()
+        for ev in events:
+            for line in ev["message"].splitlines():
+                if line.startswith("LOOPHOP"):
+                    seen_hops.add(int(line.split()[1]))
+                elif line.startswith("LOOPDROP"):
+                    seen_drops.add(line)
+        if (seen_hops, seen_drops) != (hops, drops):
+            hops, drops = seen_hops, seen_drops
+            last_change = time.time()
+        elif hops and time.time() - last_change >= settle_s:
+            return hops, drops
+    pytest.fail(
+        f"recursion chain for {name} never settled within {budget_s}s "
+        f"(hops seen: {sorted(hops)})"
+    )
+
+
+def test_lambda_recursive_loop_terminates_self_invoking_chain(lam, logs):
+    """A function that async-invokes itself forever stops at the AWS limit.
+
+    Terminate is the default, so this function never calls
+    PutFunctionRecursionConfig — the guard has to apply it on its own.
+    """
+    name = f"qa-loop-term-{_uuid_mod.uuid4().hex[:8]}"
+    _create_loop_fn(lam, name)
+    try:
+        lam.invoke(FunctionName=name, InvocationType="Event",
+                   Payload=json.dumps({"n": 0, "stop": 40}).encode())
+        hops, drops = _drain_loop(logs, name)
+        # Hops are 0-based, so the 16 permitted executions are 0..15 and the
+        # 17th request is dropped before the handler ever runs.
+        assert max(hops) == _RECURSION_LIMIT - 1, sorted(hops)
+        assert hops == set(range(_RECURSION_LIMIT)), sorted(hops)
+        # The caller of the dropped invoke sees the AWS error, not a silence.
+        assert drops, "no LOOPDROP marker — chain ended without an error"
+    finally:
+        lam.delete_function(FunctionName=name)
+
+
+def test_lambda_recursive_loop_allow_lets_the_chain_through(lam, logs):
+    """RecursiveLoop=Allow opts out — the same chain runs past the limit.
+
+    Pins that the limit is driven by the function's config rather than
+    hardcoded; the chain ends on its own `stop`, well beyond 16.
+    """
+    name = f"qa-loop-allow-{_uuid_mod.uuid4().hex[:8]}"
+    _create_loop_fn(lam, name)
+    try:
+        lam.put_function_recursion_config(FunctionName=name, RecursiveLoop="Allow")
+        stop = _RECURSION_LIMIT + 5
+        lam.invoke(FunctionName=name, InvocationType="Event",
+                   Payload=json.dumps({"n": 0, "stop": stop}).encode())
+        hops, drops = _drain_loop(logs, name)
+        assert max(hops) == stop, sorted(hops)
+        assert not drops, f"invocation dropped despite RecursiveLoop=Allow: {drops}"
+    finally:
+        lam.delete_function(FunctionName=name)
+
+
+def test_lambda_recursive_loop_drop_is_recursive_invocation_exception(lam):
+    """The dropped invocation fails fast with the AWS-modelled error.
+
+    Stamping the depth header directly starts the caller at the limit, so the
+    drop is reached in one hop — which also pins the wire contract the child
+    processes use to carry lineage back to the gateway.
+    """
+    name = f"qa-loop-shape-{_uuid_mod.uuid4().hex[:8]}"
+    client = _regional_client("lambda", "us-east-1")
+
+    def _stamp_depth(params, **kwargs):
+        params["headers"]["X-Ministack-Invoke-Depth"] = str(_RECURSION_LIMIT)
+
+    _create_loop_fn(lam, name)
+    try:
+        client.meta.events.register("before-call.lambda.Invoke", _stamp_depth)
+        started = time.time()
+        with pytest.raises(ClientError) as exc:
+            client.invoke(FunctionName=name, Payload=b'{"n": 0, "stop": 0}')
+        elapsed = time.time() - started
+        assert exc.value.response["Error"]["Code"] == "RecursiveInvocationException"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        # Dropped means never executed: the answer comes back immediately
+        # rather than after the handler's 10s timeout.
+        assert elapsed < 5, f"drop took {elapsed:.1f}s — did the handler run?"
+    finally:
+        lam.delete_function(FunctionName=name)
+
+
+def test_lambda_nested_invoke_below_limit_is_unaffected(lam):
+    """A → B stays legal. The guard counts hops, so ordinary nesting — the
+    re-entrancy the executor exists to support — must pass straight through."""
+    callee = f"qa-nest-callee-{_uuid_mod.uuid4().hex[:8]}"
+    caller = f"qa-nest-caller-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=callee,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip("def handler(event, context):\n"
+                                   "    return {'from': 'callee'}\n")},
+        Timeout=10,
+    )
+    lam.create_function(
+        FunctionName=caller,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(
+            "import json, os, boto3\n"
+            "def handler(event, context):\n"
+            "    c = boto3.client('lambda', endpoint_url=os.environ['AWS_ENDPOINT_URL'],\n"
+            "                     region_name=os.environ['AWS_REGION'])\n"
+            "    r = c.invoke(FunctionName=event['target'],\n"
+            "                 Payload=json.dumps({}))\n"
+            "    return json.loads(r['Payload'].read())\n"
+        )},
+        Timeout=10,
+    )
+    try:
+        started = time.time()
+        resp = lam.invoke(FunctionName=caller,
+                          Payload=json.dumps({"target": callee}).encode())
+        body = json.loads(resp["Payload"].read())
+        assert resp.get("FunctionError") is None, body
+        assert body == {"from": "callee"}
+        assert time.time() - started < 20
+    finally:
+        for fn in (caller, callee):
+            lam.delete_function(FunctionName=fn)
+
+
+def test_lambda_recursive_loop_counts_nodejs_hops(lam):
+    """A Node hop carries the counter too, and never sees it in its event.
+
+    The Node worker takes the depth off the event exactly like the Python one,
+    and its bundled Lambda client stamps it back onto the nested Invoke.
+    Starting the caller one hop below the limit trips the guard on that single
+    nested call, so the whole Node path is pinned without chaining 16 hops
+    (each of which would cost a cold start).
+    """
+    callee = f"qa-node-callee-{_uuid_mod.uuid4().hex[:8]}"
+    caller = f"qa-node-caller-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=callee,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip("def handler(event, context):\n"
+                                   "    return {'from': 'callee'}\n")},
+        Timeout=10,
+    )
+    lam.create_function(
+        FunctionName=caller,
+        Runtime="nodejs20.x",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip_js(
+            'const { Lambda } = require("@aws-sdk/client-lambda");\n'
+            "exports.handler = async (event) => {\n"
+            "  const keys = Object.keys(event);\n"
+            "  const r = await new Lambda({}).invoke({\n"
+            "    FunctionName: event.target, Payload: JSON.stringify({}),\n"
+            "  });\n"
+            "  return { keys: keys, status: r.StatusCode, body: String(r.Payload) };\n"
+            "};\n"
+        )},
+        Timeout=10,
+    )
+    client = _regional_client("lambda", "us-east-1")
+
+    def _stamp_depth(params, **kwargs):
+        params["headers"]["X-Ministack-Invoke-Depth"] = str(_RECURSION_LIMIT - 1)
+
+    try:
+        client.meta.events.register("before-call.lambda.Invoke", _stamp_depth)
+        resp = client.invoke(FunctionName=caller,
+                             Payload=json.dumps({"target": callee}).encode())
+        body = json.loads(resp["Payload"].read())
+        assert resp.get("FunctionError") is None, body
+        # The depth rides in the event, so the handler must never see the key.
+        assert body["keys"] == ["target"], body["keys"]
+        # The caller is at the limit, so its nested hop is the one over it.
+        assert body["status"] == 400, body
+        assert "RecursiveInvocationException" in body["body"], body
+    finally:
+        for fn in (caller, callee):
+            lam.delete_function(FunctionName=fn)
+
+
+@pytest.mark.parametrize(
+    "headers,expected",
+    [
+        pytest.param({}, 0, id="absent"),
+        pytest.param({"x-ministack-invoke-depth": "3"}, 3, id="normal"),
+        pytest.param({"x-ministack-invoke-depth": "16"}, 16, id="at-limit"),
+        # Nothing caps the inbound value: a request already past the limit is
+        # dropped rather than clamped, so the number has to survive intact.
+        pytest.param({"x-ministack-invoke-depth": "999"}, 999, id="over-limit"),
+        pytest.param({"x-ministack-invoke-depth": "-5"}, 0, id="negative"),
+        pytest.param({"x-ministack-invoke-depth": ""}, 0, id="empty"),
+        pytest.param({"x-ministack-invoke-depth": "not-a-number"}, 0, id="garbage"),
+        pytest.param({"x-ministack-invoke-depth": "1.5"}, 0, id="float"),
+        pytest.param({"x-ministack-invoke-depth": None}, 0, id="none"),
+        # ASGI lowercases request headers, and every other header read in
+        # ministack assumes it; a capitalised key is simply not there.
+        pytest.param({"X-Ministack-Invoke-Depth": "4"}, 0, id="wrong-case"),
+    ],
+)
+def test_lambda_inbound_invoke_depth_parsing(headers, expected):
+    """A forged or malformed depth header must never break the invoke path.
+
+    The header is client-supplied, so every shape has to land somewhere sane:
+    junk reads as "fresh lineage" (0) rather than raising, and a legitimate
+    count passes through unclamped so the limit check can see it.
+    """
+    from ministack.services.lambda_svc import _inbound_invoke_depth
+
+    assert _inbound_invoke_depth(headers) == expected

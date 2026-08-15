@@ -697,8 +697,13 @@ def test_cfn_unnamed_dynamodb_table_survives_unrelated_update(cfn, ddb, ssm):
 
     tables_after = set(ddb.list_tables()["TableNames"])
     table_name_after = ssm.get_parameter(Name="/cfn-t02f/table-name")["Parameter"]["Value"]
-    assert tables_after == tables_before
-    assert table_name_after == table_name_before
+    # Assert on this stack's table only. `list_tables()` is global and all xdist
+    # workers share one server, so any comparison of the whole set against a
+    # snapshot taken before the update is racy in both directions: a concurrent
+    # test creating a table breaks equality, and one deleting its own table
+    # breaks a subset check. Neither says anything about the behaviour here.
+    assert table_name_after == table_name_before, "the table was re-created under a new name"
+    assert table_name_after in tables_after, "the stack's table did not survive the update"
     
 def test_cfn_ssm_parameter_value_type_resolves_stored_value(cfn, ssm, sqs):
     """A `AWS::SSM::Parameter::Value<String>` template parameter's Default/
