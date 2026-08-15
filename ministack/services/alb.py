@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import random
+import socket
 import string
 import time
 from urllib.parse import parse_qs
@@ -35,10 +36,8 @@ from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict,
 
 logger = logging.getLogger("alb")
 
-# Two deadlines, not one. A single socket timeout covers the whole connection,
-# so it fires between SSE heartbeats and truncates the stream it was meant to
-# protect. ALB separates them: 10s to establish a connection to a target, then
-# an idle timeout (default 60s) on the established one.
+# ALB uses two deadlines: connecting to a target, then idling on an established
+# connection.
 # https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-troubleshooting.html#http-504-issues
 TARGET_CONNECT_TIMEOUT = float(os.environ.get("ALB_TARGET_CONNECT_TIMEOUT_SECONDS", "10"))
 TARGET_IDLE_TIMEOUT = float(os.environ.get("ALB_TARGET_IDLE_TIMEOUT_SECONDS", "60"))
@@ -1344,33 +1343,25 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
 
     data = body if isinstance(body, (bytes, bytearray)) else (body.encode() if body else None)
 
-    # Stream the target response instead of reading it whole: a target that
-    # streams (SSE, chunked audio) otherwise arrives only once it has finished
-    # generating. Only the status and headers are awaited here; the body goes to
-    # the ASGI layer, which keeps whichever framing the target chose.
-    #
-    # AWS relays the target's response as it arrives and preserves its framing:
+    # Relay the body as it arrives and keep the target's framing, as AWS does.
     # https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-troubleshooting.html#http-504-issues
     from ministack.core.responses import StreamingResponse
 
     def _open():
         conn = http.client.HTTPConnection(host, port, timeout=TARGET_CONNECT_TIMEOUT)
         try:
+            conn.connect()
+            sock = conn.sock
+            sock.settimeout(TARGET_IDLE_TIMEOUT)
             conn.request(method.upper(), target_path, body=data, headers=fwd)
             resp = conn.getresponse()
         except Exception as e:
             with contextlib.suppress(Exception):
                 conn.close()
-            return None, None, e
-        # Headers are in, so the connect deadline has been met; the body gets the
-        # idle budget instead. http.client keeps the socket reachable, which is
-        # why this uses it rather than urllib — and 4xx/5xx arrive as ordinary
-        # responses, so target errors need no special case.
-        if conn.sock is not None:
-            conn.sock.settimeout(TARGET_IDLE_TIMEOUT)
-        return conn, resp, None
+            return None, None, None, e
+        return conn, resp, sock, None
 
-    conn, resp, err = await asyncio.to_thread(_open)
+    conn, resp, sock, err = await asyncio.to_thread(_open)
     if resp is None:
         return (502, {"Content-Type": "application/json"},
                 json.dumps({"message": f"Target {host}:{port} connect error: {err}"}).encode())
@@ -1378,9 +1369,6 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
     status, out_headers = resp.status, dict(resp.headers)
 
     async def _stream(send, receive):
-        # A client that goes away must not leave the upstream socket and its
-        # worker thread pinned for the rest of the response. One pool thread is
-        # held per in-flight stream, so this is what bounds them.
         disconnected = asyncio.create_task(_await_http_disconnect(receive))
         complete = False
         try:
@@ -1394,10 +1382,7 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
                     break
                 chunk = reader.result()
                 if not chunk:
-                    # read1 returns b"" where read() would raise IncompleteRead,
-                    # so a Content-Length body is only complete once the promised
-                    # bytes have arrived. A short chunked body raises instead and
-                    # is caught below.
+                    # read1 returns b"" where read() would raise IncompleteRead.
                     complete = not resp.length
                     break
                 await send({"type": "http.response.body", "body": chunk, "more_body": True})
@@ -1405,14 +1390,20 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
             logger.exception("ALB target %s:%s stream failed", host, port)
         finally:
             disconnected.cancel()
+
             with contextlib.suppress(Exception):
-                resp.close()
-            with contextlib.suppress(Exception):
-                conn.close()
+                sock.shutdown(socket.SHUT_RDWR)
+
+            def _close():
+                with contextlib.suppress(Exception):
+                    resp.close()
+                with contextlib.suppress(Exception):
+                    conn.close()
+
+            with contextlib.suppress(RuntimeError):
+                asyncio.get_running_loop().run_in_executor(None, _close)
             if complete:
-                # Only a complete body gets a terminator. Withholding it on
-                # truncation is the signal: the client sees an unfinished
-                # response instead of a short but well-formed one.
+                # Withholding the terminator is what marks a truncated body.
                 with contextlib.suppress(Exception):
                     await send({"type": "http.response.body", "body": b"", "more_body": False})
 

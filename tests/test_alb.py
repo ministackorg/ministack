@@ -912,36 +912,6 @@ def _set_alb_config(**values):
     _req.urlopen(_req.Request(f"{_endpoint}/_ministack/config", data=payload, method="POST"))
 
 
-def _start_gapped_server(chunks, gap_before_index, gap):
-    """Chunked target that pauses `gap` seconds before one chunk."""
-    import threading
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-    class _Handler(BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
-
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Transfer-Encoding", "chunked")
-            self.end_headers()
-            for i, chunk in enumerate(chunks):
-                if i == gap_before_index:
-                    time.sleep(gap)
-                self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
-                self.wfile.flush()
-            self.wfile.write(b"0\r\n\r\n")
-            self.wfile.flush()
-
-        def log_message(self, _format, *_args):
-            return
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    return server, thread
-
-
 def _start_dying_chunked_server(chunk):
     """Chunked target that sends one chunk then dies without the 0-length end.
 
@@ -976,37 +946,6 @@ def _start_dying_chunked_server(chunk):
 
 
 @pytest.mark.serial
-def test_elbv2_dataplane_idle_gap_does_not_truncate_stream(elbv2):
-    """A quiet period longer than the connect timeout must not end the stream.
-
-    The connect deadline and the idle deadline are separate: one socket timeout
-    covering both fires between SSE heartbeats and silently truncates.
-    """
-    import urllib.request as _req
-
-    chunks = [b"data: a\n\n", b"data: b\n\n", b"data: c\n\n"]
-    _set_alb_config(TARGET_CONNECT_TIMEOUT=1.0, TARGET_IDLE_TIMEOUT=30.0)
-    server, thread = _start_gapped_server(chunks, gap_before_index=1, gap=2.0)
-    port = server.server_address[1]
-
-    lb_name = "dp-alb-gap"
-    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", port)
-    try:
-        resp = _req.urlopen(_req.Request(f"{_endpoint}/_alb/{lb_name}/", method="GET"))
-        body = resp.read()
-        assert resp.status == 200
-        assert body == b"".join(chunks), (
-            f"stream truncated across the idle gap: got {body!r}"
-        )
-    finally:
-        _set_alb_config(TARGET_CONNECT_TIMEOUT=10.0, TARGET_IDLE_TIMEOUT=60.0)
-        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
-
-
-@pytest.mark.serial
 def test_elbv2_dataplane_truncated_target_body_is_not_passed_off_as_complete(elbv2):
     """A target that dies mid-body must not read as a short but valid response.
 
@@ -1027,6 +966,96 @@ def test_elbv2_dataplane_truncated_target_body_is_not_passed_off_as_complete(elb
             resp.read()
         assert "IncompleteRead" in type(excinfo.value).__name__ or "Incomplete" in str(excinfo.value)
     finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        sock.close()
+        thread.join(timeout=5)
+
+
+def _start_raw_server(script):
+    """Serve one connection by running `script(conn)` on a raw socket."""
+    import socket as _socket
+    import threading
+
+    sock = _socket.socket()
+    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+
+    def _serve():
+        try:
+            conn, _ = sock.accept()
+            conn.recv(4096)
+            script(conn)
+            conn.close()
+        except OSError:
+            pass
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+    return sock, thread
+
+
+@pytest.mark.serial
+def test_elbv2_dataplane_connection_close_target_gets_the_idle_timeout(elbv2):
+    """A `Connection: close` target must be bounded by the idle timeout too.
+
+    http.client drops conn.sock for any will_close response, so a timeout set
+    after getresponse() silently never lands and the connect deadline governs
+    the whole stream.
+    """
+    import urllib.request as _req
+
+    def _script(conn):
+        conn.sendall(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+            b"Connection: close\r\n\r\ndata: a\n\n"
+        )
+        time.sleep(3.0)
+        conn.sendall(b"data: b\n\n")
+
+    sock, thread = _start_raw_server(_script)
+    port = sock.getsockname()[1]
+
+    lb_name = "dp-alb-close"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", port)
+    try:
+        _set_alb_config(TARGET_CONNECT_TIMEOUT=1.0, TARGET_IDLE_TIMEOUT=30.0)
+        body = _req.urlopen(_req.Request(f"{_endpoint}/_alb/{lb_name}/", method="GET")).read()
+        assert body.count(b"data:") == 2, f"stream cut short at the connect deadline: {body!r}"
+    finally:
+        _set_alb_config(TARGET_CONNECT_TIMEOUT=10.0, TARGET_IDLE_TIMEOUT=60.0)
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        sock.close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.serial
+def test_elbv2_dataplane_slow_target_headers_are_not_a_connect_failure(elbv2):
+    """A target slow to send headers is idle, not unreachable.
+
+    The connect deadline covers establishing the connection; waiting on the
+    response belongs to the idle budget.
+    """
+    import urllib.request as _req
+
+    def _script(conn):
+        time.sleep(3.0)
+        conn.sendall(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+        )
+
+    sock, thread = _start_raw_server(_script)
+    port = sock.getsockname()[1]
+
+    lb_name = "dp-alb-slowhdr"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", port)
+    try:
+        _set_alb_config(TARGET_CONNECT_TIMEOUT=1.0, TARGET_IDLE_TIMEOUT=30.0)
+        resp = _req.urlopen(_req.Request(f"{_endpoint}/_alb/{lb_name}/", method="GET"))
+        assert resp.status == 200
+        assert resp.read() == b"hello"
+    finally:
+        _set_alb_config(TARGET_CONNECT_TIMEOUT=10.0, TARGET_IDLE_TIMEOUT=60.0)
         _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
         sock.close()
         thread.join(timeout=5)
