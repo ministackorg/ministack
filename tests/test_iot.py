@@ -489,6 +489,428 @@ def test_iot_attach_detach_policy(iot_client):
 
 
 # ---------------------------------------------------------------------------
+# Fleet indexing (indexing configuration + SearchIndex)
+# ---------------------------------------------------------------------------
+
+
+def _enable_fleet_indexing(client, mode: str = "REGISTRY_AND_SHADOW") -> None:
+    """Turn the AWS_Things index on, as every fleet stack has to on AWS."""
+    client.update_indexing_configuration(
+        thingIndexingConfiguration={"thingIndexingMode": mode}
+    )
+
+
+def _iot_client_for_fresh_account():
+    """An IoT client on an account of its own, so its index starts OFF."""
+    import os
+
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client(
+        "iot",
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        aws_access_key_id=f"{uuid.uuid4().int % 10**12:012d}",
+        aws_secret_access_key="test",
+        region_name="us-east-1",
+        config=Config(retries={"mode": "standard"}),
+    )
+
+
+def test_iot_indexing_configuration_round_trip():
+    client = _iot_client_for_fresh_account()
+    # AWS's default for an account that never configured indexing.
+    default = client.get_indexing_configuration()
+    assert default["thingIndexingConfiguration"]["thingIndexingMode"] == "OFF"
+    assert client.list_indices()["indexNames"] == []
+    with pytest.raises(ClientError) as ei:
+        client.describe_index(indexName="AWS_Things")
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    client.update_indexing_configuration(
+        thingIndexingConfiguration={"thingIndexingMode": "REGISTRY_AND_SHADOW"},
+        thingGroupIndexingConfiguration={"thingGroupIndexingMode": "ON"},
+    )
+    stored = client.get_indexing_configuration()
+    assert stored["thingIndexingConfiguration"]["thingIndexingMode"] == (
+        "REGISTRY_AND_SHADOW"
+    )
+    assert stored["thingGroupIndexingConfiguration"]["thingGroupIndexingMode"] == "ON"
+    assert client.list_indices()["indexNames"] == ["AWS_Things"]
+    index = client.describe_index(indexName="AWS_Things")
+    # The registry *is* the index, so it is never BUILDING.
+    assert index["indexStatus"] == "ACTIVE"
+    assert index["schema"] == "REGISTRY_AND_SHADOW"
+
+    # Registry-only indexing narrows the schema back.
+    _enable_fleet_indexing(client, "REGISTRY")
+    assert client.describe_index(indexName="AWS_Things")["schema"] == "REGISTRY"
+
+    # ...and turning it off retires the index.
+    _enable_fleet_indexing(client, "OFF")
+    assert client.list_indices()["indexNames"] == []
+
+
+def test_iot_indexing_configuration_rejects_impossible_modes():
+    client = _iot_client_for_fresh_account()
+    for kwargs in (
+        {"thingIndexingConfiguration": {"thingIndexingMode": "REGISTRY_AND_LOGS"}},
+        # AWS: connectivity indexing requires thing indexing to be on.
+        {
+            "thingIndexingConfiguration": {
+                "thingIndexingMode": "OFF",
+                "thingConnectivityIndexingMode": "STATUS",
+            }
+        },
+        {"thingGroupIndexingConfiguration": {"thingGroupIndexingMode": "SOMETIMES"}},
+    ):
+        with pytest.raises(ClientError) as ei:
+            client.update_indexing_configuration(**kwargs)
+        assert ei.value.response["Error"]["Code"] == "InvalidRequestException", kwargs
+    # A rejected update leaves the configuration untouched.
+    assert client.get_indexing_configuration()["thingIndexingConfiguration"][
+        "thingIndexingMode"
+    ] == "OFF"
+
+
+def test_iot_search_index_requires_indexing_enabled():
+    """Searching an account that never enabled indexing is a 404 on AWS."""
+    client = _iot_client_for_fresh_account()
+    name = _unique("unindexed")
+    client.create_thing(thingName=name)
+    try:
+        with pytest.raises(ClientError) as ei:
+            client.search_index(queryString=f"thingName:{name}")
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        _enable_fleet_indexing(client)
+        assert [
+            t["thingName"]
+            for t in client.search_index(queryString=f"thingName:{name}")["things"]
+        ] == [name]
+
+        # An index this emulator does not have is the same 404.
+        with pytest.raises(ClientError) as ei:
+            client.search_index(indexName="AWS_Fleet", queryString="thingName:*")
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        client.delete_thing(thingName=name)
+
+
+def test_iot_search_index_shadow_terms_need_shadow_indexing():
+    """REGISTRY-only indexing does not project shadows, so shadow terms 400."""
+    client = _iot_client_for_fresh_account()
+    _enable_fleet_indexing(client, "REGISTRY")
+    with pytest.raises(ClientError) as ei:
+        client.search_index(queryString="shadow.reported.firmware:fw-1")
+    assert ei.value.response["Error"]["Code"] == "InvalidQueryException"
+    # Registry fields keep working in the narrower mode.
+    client.search_index(queryString="thingName:whatever")
+
+
+def test_iot_search_index_registry_and_shadow(iot_client, iot_data_client):
+    _enable_fleet_indexing(iot_client)
+    suffix = uuid.uuid4().hex[:8]
+    type_name = f"searchtype-{suffix}"
+    hit = f"searchthing-{suffix}-hit"
+    miss = f"searchthing-{suffix}-miss"
+    iot_client.create_thing_type(thingTypeName=type_name)
+    iot_client.create_thing(
+        thingName=hit,
+        thingTypeName=type_name,
+        attributePayload={"attributes": {"fleet": f"fleet-{suffix}"}},
+    )
+    iot_client.create_thing(
+        thingName=miss, attributePayload={"attributes": {"fleet": "other"}}
+    )
+    iot_data_client.update_thing_shadow(
+        thingName=hit,
+        payload=json.dumps(
+            {"state": {"reported": {"firmware": f"fw-{suffix}"}}}
+        ).encode(),
+    )
+    try:
+        by_name = iot_client.search_index(queryString=f"thingName:{hit}")["things"]
+        assert [t["thingName"] for t in by_name] == [hit]
+        doc = by_name[0]
+        assert doc["thingId"]
+        assert doc["thingTypeName"] == type_name
+        assert doc["attributes"] == {"fleet": f"fleet-{suffix}"}
+        shadow = json.loads(doc["shadow"])  # AWS returns a JSON *string*
+        assert shadow["reported"]["firmware"] == f"fw-{suffix}"
+
+        by_type = iot_client.search_index(queryString=f"thingTypeName:{type_name}")[
+            "things"
+        ]
+        assert [t["thingName"] for t in by_type] == [hit]
+
+        by_attr = iot_client.search_index(
+            queryString=f"attributes.fleet:fleet-{suffix}"
+        )["things"]
+        assert [t["thingName"] for t in by_attr] == [hit]
+
+        by_shadow = iot_client.search_index(
+            queryString=(
+                f"shadow.reported.firmware:fw-{suffix} AND thingTypeName:{type_name}"
+            ),
+            maxResults=10,
+        )["things"]
+        assert [t["thingName"] for t in by_shadow] == [hit]
+
+        empty = iot_client.search_index(queryString=f"thingName:absent-{suffix}")
+        assert empty["things"] == []
+    finally:
+        iot_data_client.delete_thing_shadow(thingName=hit)
+        iot_client.delete_thing(thingName=hit)
+        iot_client.delete_thing(thingName=miss)
+        iot_client.deprecate_thing_type(thingTypeName=type_name)
+        iot_client.delete_thing_type(thingTypeName=type_name)
+
+
+def test_iot_search_index_wildcards(iot_client):
+    _enable_fleet_indexing(iot_client)
+    # The single most common fleet query: every thing under a name prefix.
+    suffix = uuid.uuid4().hex[:8]
+    fleet = [f"fleet-{suffix}-a", f"fleet-{suffix}-b"]
+    outside = f"other-{suffix}"
+    for name in (*fleet, outside):
+        iot_client.create_thing(
+            thingName=name, attributePayload={"attributes": {"site": f"berlin-{suffix}"}}
+        )
+    try:
+        prefix = iot_client.search_index(queryString=f"thingName:fleet-{suffix}-*")
+        assert sorted(t["thingName"] for t in prefix["things"]) == fleet
+
+        suffix_hits = iot_client.search_index(queryString=f"thingName:*-{suffix}-a")
+        assert [t["thingName"] for t in suffix_hits["things"]] == [fleet[0]]
+
+        contains = iot_client.search_index(queryString=f"thingName:*{suffix}*")
+        assert sorted(t["thingName"] for t in contains["things"]) == sorted(
+            [*fleet, outside]
+        )
+
+        # ? matches exactly one character.
+        single = iot_client.search_index(queryString=f"thingName:fleet-{suffix}-?")
+        assert sorted(t["thingName"] for t in single["things"]) == fleet
+        assert (
+            iot_client.search_index(queryString=f"thingName:fleet-{suffix}-??")["things"]
+            == []
+        )
+
+        # Wildcards work on attributes too, and combine with AND.
+        combined = iot_client.search_index(
+            queryString=f"thingName:fleet-{suffix}-* AND attributes.site:berlin-*"
+        )
+        assert sorted(t["thingName"] for t in combined["things"]) == fleet
+    finally:
+        for name in (*fleet, outside):
+            iot_client.delete_thing(thingName=name)
+
+
+def test_iot_search_index_returns_desired_and_reported_shadow(
+    iot_client, iot_data_client
+):
+    _enable_fleet_indexing(iot_client)
+    # shadow.desired.<path> is queryable, so the returned document has to
+    # carry the desired half too — not reported only.
+    suffix = uuid.uuid4().hex[:8]
+    name = f"searchthing-{suffix}-desired"
+    iot_client.create_thing(thingName=name)
+    iot_data_client.update_thing_shadow(
+        thingName=name,
+        payload=json.dumps(
+            {
+                "state": {
+                    "desired": {"firmware": f"want-{suffix}"},
+                    "reported": {"firmware": f"have-{suffix}"},
+                }
+            }
+        ).encode(),
+    )
+    try:
+        hits = iot_client.search_index(
+            queryString=f"shadow.desired.firmware:want-{suffix}"
+        )["things"]
+        assert [t["thingName"] for t in hits] == [name]
+        shadow = json.loads(hits[0]["shadow"])
+        assert shadow["desired"]["firmware"] == f"want-{suffix}"
+        assert shadow["reported"]["firmware"] == f"have-{suffix}"
+    finally:
+        iot_data_client.delete_thing_shadow(thingName=name)
+        iot_client.delete_thing(thingName=name)
+
+
+def test_iot_search_index_unsupported_query_rejected(iot_client):
+    _enable_fleet_indexing(iot_client)
+    for query in (
+        "connectivity.connected:true",
+        "NOT thingName:foo",
+        "thingName:foo AND",  # a dangling AND is an error on AWS, not a no-op
+        "AND thingName:foo",
+        "thingName:foo AND AND thingTypeName:bar",
+        "thingName:foo OR thingTypeName:bar",
+    ):
+        with pytest.raises(ClientError) as ei:
+            iot_client.search_index(queryString=query)
+        assert ei.value.response["Error"]["Code"] == "InvalidQueryException", query
+
+
+def test_iot_search_index_missing_field_never_matches(iot_client):
+    _enable_fleet_indexing(iot_client)
+    # An untyped thing has no thingTypeName; str(None) == "none" must NOT
+    # make it match thingTypeName:none, and a bare * must not resurrect it.
+    name = f"searchthing-{uuid.uuid4().hex[:8]}-untyped"
+    iot_client.create_thing(thingName=name)
+    try:
+        for query in ("thingTypeName:none", "thingTypeName:*"):
+            hits = iot_client.search_index(queryString=query)["things"]
+            assert name not in [t["thingName"] for t in hits], query
+    finally:
+        iot_client.delete_thing(thingName=name)
+
+
+def test_iot_search_index_unknown_shadow_subfield_rejected(iot_client):
+    """A shadow field outside desired/reported is a typo, not an empty result."""
+    _enable_fleet_indexing(iot_client)
+    for query in (
+        "shadow.metadata.reported.firmware:1",  # AWS field, not projected here
+        "shadow.name.telemetry.reported.x:1",  # named shadows are not indexed
+        "shadow.reported:anything",  # a whole half is not a leaf
+        "shadow.version:2",
+    ):
+        with pytest.raises(ClientError) as ei:
+            iot_client.search_index(queryString=query)
+        assert ei.value.response["Error"]["Code"] == "InvalidQueryException", query
+
+
+def test_iot_search_index_thing_group_terms(iot_client):
+    """`thingGroupNames:<group>` is the membership query a fleet console runs."""
+    _enable_fleet_indexing(iot_client)
+    suffix = uuid.uuid4().hex[:8]
+    groups = [f"group-{suffix}-eu", f"group-{suffix}-canary"]
+    member = f"grouped-{suffix}"
+    outsider = f"ungrouped-{suffix}"
+    for group in groups:
+        iot_client.create_thing_group(thingGroupName=group)
+    iot_client.create_thing(thingName=member)
+    iot_client.create_thing(thingName=outsider)
+    for group in groups:
+        iot_client.add_thing_to_thing_group(thingGroupName=group, thingName=member)
+    try:
+        for group in groups:
+            hits = iot_client.search_index(queryString=f"thingGroupNames:{group}")[
+                "things"
+            ]
+            assert [t["thingName"] for t in hits] == [member], group
+            assert sorted(hits[0]["thingGroupNames"]) == sorted(groups)
+
+        # Both memberships are visible at once, and wildcards work on them.
+        both = iot_client.search_index(
+            queryString=f"thingGroupNames:{groups[0]} AND thingGroupNames:{groups[1]}"
+        )["things"]
+        assert [t["thingName"] for t in both] == [member]
+        assert [
+            t["thingName"]
+            for t in iot_client.search_index(
+                queryString=f"thingGroupNames:group-{suffix}-*"
+            )["things"]
+        ] == [member]
+
+        # A thing in no group carries the field as an empty list, and a group
+        # it does not belong to never matches it.
+        hit = iot_client.search_index(queryString=f"thingName:{outsider}")["things"][0]
+        assert hit["thingGroupNames"] == []
+    finally:
+        iot_client.delete_thing(thingName=member)
+        iot_client.delete_thing(thingName=outsider)
+        for group in groups:
+            iot_client.delete_thing_group(thingGroupName=group)
+
+
+def test_iot_search_index_paginates(iot_client):
+    _enable_fleet_indexing(iot_client)
+    suffix = uuid.uuid4().hex[:8]
+    names = sorted(f"paged-{suffix}-{i}" for i in range(3))
+    for name in names:
+        iot_client.create_thing(thingName=name)
+    try:
+        query = f"thingName:paged-{suffix}-*"
+        seen = []
+        token = None
+        for _ in range(len(names) + 1):
+            kwargs = {"nextToken": token} if token else {}
+            page = iot_client.search_index(queryString=query, maxResults=1, **kwargs)
+            seen.extend(t["thingName"] for t in page["things"])
+            token = page.get("nextToken")
+            if token is None:
+                break
+        assert token is None, "pagination did not terminate"
+        assert sorted(seen) == names
+
+        # The last page of an exact fit carries no token.
+        full = iot_client.search_index(queryString=query, maxResults=len(names))
+        assert "nextToken" not in full
+        assert len(full["things"]) == len(names)
+    finally:
+        for name in names:
+            iot_client.delete_thing(thingName=name)
+
+
+def test_iot_search_index_rejects_bad_paging_arguments(iot_client):
+    _enable_fleet_indexing(iot_client)
+    # (maxResults=0 never reaches the server: botocore enforces the model's
+    # min=1 client-side. The ceiling is not in the model, so it is ours.)
+    for kwargs in (
+        {"maxResults": 101},  # AWS's documented ceiling
+        {"nextToken": "not-a-real-cursor"},
+    ):
+        with pytest.raises(ClientError) as ei:
+            iot_client.search_index(queryString="thingName:*", **kwargs)
+        assert ei.value.response["Error"]["Code"] == "InvalidRequestException", kwargs
+
+
+def test_iot_search_index_numeric_shadow_values(iot_client, iot_data_client):
+    """A JSON number in a shadow compares as a number, not as its repr."""
+    _enable_fleet_indexing(iot_client)
+    suffix = uuid.uuid4().hex[:8]
+    name = f"numeric-{suffix}"
+    iot_client.create_thing(thingName=name)
+    iot_data_client.update_thing_shadow(
+        thingName=name,
+        payload=json.dumps(
+            {"state": {"reported": {"temp": 10.0, "errors": 0}}}
+        ).encode(),
+    )
+    try:
+        for query in (
+            f"thingName:{name} AND shadow.reported.temp:10",
+            f"thingName:{name} AND shadow.reported.temp:10.0",
+            f"thingName:{name} AND shadow.reported.errors:0",
+        ):
+            hits = iot_client.search_index(queryString=query)["things"]
+            assert [t["thingName"] for t in hits] == [name], query
+        for query in (
+            f"thingName:{name} AND shadow.reported.temp:11",
+            f"thingName:{name} AND shadow.reported.temp:1",
+        ):
+            assert iot_client.search_index(queryString=query)["things"] == [], query
+
+        # A registry string stays a string: 007 is not 7.
+        zeros = f"0007{suffix}"
+        iot_client.create_thing(thingName=zeros)
+        try:
+            assert (
+                iot_client.search_index(queryString=f"thingName:7{suffix}")["things"]
+                == []
+            )
+        finally:
+            iot_client.delete_thing(thingName=zeros)
+    finally:
+        iot_data_client.delete_thing_shadow(thingName=name)
+        iot_client.delete_thing(thingName=name)
+
+
+# ---------------------------------------------------------------------------
 # Topic rules
 # ---------------------------------------------------------------------------
 
