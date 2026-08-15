@@ -723,6 +723,12 @@ def _make_sink_lambda(lam, sink_url):
         Handler="index.handler",
         Code={"ZipFile": buf.getvalue()},
         Environment={"Variables": {"SINK_URL": sink_url}},
+        # Lambda's default timeout is 3 seconds, which a worker cold-start
+        # cannot reliably beat while a parallel shard is starting containers
+        # on the same machine - the invocation gets killed, the sink stays
+        # empty, and the test reads as a rules-engine failure. 30s matches
+        # the authorizer test helpers; a passing run is not one bit slower.
+        Timeout=30,
     )
     return lam.get_function(FunctionName=name)["Configuration"]["FunctionArn"]
 
