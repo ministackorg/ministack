@@ -24,6 +24,7 @@ import threading
 import time
 import urllib.parse
 
+from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
 from ministack.core.persistence import load_state
@@ -1651,3 +1652,21 @@ async def handle_request(method, path, headers, body, query_params):
     """
     return await run_reentrant(
         _handle_request_sync, method, path, headers, body, query_params, thread_name="ministack-eks-dispatch")
+
+
+def _live_container_ids():
+    """Container ids still owned by a live EKS cluster.
+
+    EKS records its k3s container under ``_docker_id`` (not the
+    ``_docker_container_id`` the other services use), which is why this was
+    missed first time round and its exited containers were never reclaimed.
+    """
+    ids = set()
+    for _key, cluster in _clusters.all_items():
+        cid = cluster.get("_docker_id")
+        if cid:
+            ids.add(cid)
+    return ids
+
+
+container_reaper.register_live_ids("eks", _live_container_ids)

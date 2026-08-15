@@ -2131,51 +2131,22 @@ def _reaper_docker_client():
 
 
 def _stop_docker_containers():
-    """Stop all Docker containers managed by MiniStack (RDS, ECS, ElastiCache).
-    Uses container labels to find them — does not touch service state.
+    """Remove every MiniStack container. Boot and shutdown only.
 
-    Skip entirely if no Docker socket is available: importing the docker
-    SDK (and its requests/urllib3/idna transitive deps) costs ~1 MiB of
-    Python heap before we even know whether there's anything to clean.
+    The reclamation rules live in ``core.container_reaper``: this is the
+    process-boundary phase (everything goes), while the periodic pass while the
+    server is live is ownership-aware and much more conservative. Keeping both
+    in one module means one label list and one place to reason about which
+    containers are ours.
+
+    Skips entirely when there is no Docker socket: importing the docker SDK
+    (and its requests/urllib3/idna transitive deps) costs ~1 MiB of Python heap
+    before we even know whether there is anything to clean.
     """
-    sock = os.environ.get("DOCKER_HOST") or "unix:///var/run/docker.sock"
-    if sock.startswith("unix://"):
-        sock_path = sock[len("unix://"):]
-        if not os.path.exists(sock_path):
-            return
-    try:
-        import docker
-
-        # docker-py defaults to a 60s per-request timeout. A daemon that is slow
-        # or wedged would then hold this sweep for minutes; with 39 orphans left
-        # by a killed test run it can block boot outright. The grace passed to
-        # stop() must stay below this or a normal stop would look like a timeout.
-        client = docker.from_env(timeout=_DOCKER_REAP_TIMEOUT)
-    except Exception:
+    client = _reaper_docker_client()
+    if client is None:
         return
-    # Every label a service stamps on a container. A label missing here is a
-    # container that is never reclaimed — not at boot, not at shutdown, ever.
-    # mwaa/glue/codebuild/opensearch/msk were absent, and their Airflow, Spark
-    # and OpenSearch images are the heavyweight ones.
-    for label in ("ministack=rds", "ministack=ecs", "ministack=elasticache",
-                  "ministack=eks", "ministack=lambda", "ministack=dsql",
-                  "ministack=mwaa", "ministack=glue", "ministack=codebuild",
-                  "ministack=opensearch",
-                  # Backstop: match on the key alone, so a service that adds a
-                  # new value (or an older container predating its label) is
-                  # still reclaimed rather than accumulating forever.
-                  "ministack",
-                  "com.ministack.service"):
-        try:
-            # all=True so exited-but-not-removed orphans get cleaned at boot.
-            for c in client.containers.list(all=True, filters={"label": label}):
-                try:
-                    c.stop(timeout=2)
-                    c.remove(v=True)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+    container_reaper.reap_all(client)
 
 
 def _build_persistence_save_dict():

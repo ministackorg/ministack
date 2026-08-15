@@ -33,6 +33,7 @@ import secrets
 import threading
 import time
 
+from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant, spawn_background
 from ministack.core.persistence import load_state
@@ -88,18 +89,29 @@ _ecs_reaper_started = False
 _ecs_reaper_lock = threading.Lock()
 
 
+def _live_container_ids():
+    """Container ids still owned by a live task.
+
+    Registered with ``core.container_reaper``, which reclaims ECS containers
+    that no task references any more. This replaces a service-local reaper that
+    removed every exited/dead/created ECS container regardless of ownership —
+    correct in practice, but a second implementation of the same rule, and one
+    that could race a task between `created` and `running`.
+    """
+    ids = set()
+    for _key, task in _tasks.all_items():
+        for cid in task.get("_docker_ids") or []:
+            if cid:
+                ids.add(cid)
+    return ids
+
+
+container_reaper.register_live_ids("ecs", _live_container_ids)
+
+
 def _reap_exited_containers():
-    docker_client = _get_docker()
-    if not docker_client:
-        return
-    # all=True includes exited containers; reset() uses list() (running only),
-    # so this complements — and overlaps harmlessly — with the reset path.
-    for c in docker_client.containers.list(all=True, filters={"label": "ministack=ecs"}):
-        if c.status in ("exited", "dead", "created"):
-            try:
-                c.remove(v=True, force=True)
-            except Exception:
-                pass
+    """Kept as a no-op shim: reclamation is owned by core.container_reaper."""
+    return
 
 
 def _ensure_ecs_reaper_thread():

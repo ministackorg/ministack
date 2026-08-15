@@ -454,7 +454,7 @@ def test_ecs_create_service_v2(ecs):
     ecs.create_cluster(clusterName="ecs-svc-v2c")
     ecs.register_task_definition(
         family="ecs-svc-v2td",
-        containerDefinitions=[{"name": "w", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "w", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     resp = ecs.create_service(
         cluster="ecs-svc-v2c",
@@ -471,7 +471,7 @@ def test_ecs_describe_services_v2(ecs):
     ecs.create_cluster(clusterName="ecs-ds-v2c")
     ecs.register_task_definition(
         family="ecs-ds-v2td",
-        containerDefinitions=[{"name": "w", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "w", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     ecs.create_service(
         cluster="ecs-ds-v2c",
@@ -495,7 +495,7 @@ def test_ecs_update_service_v2(ecs):
     ecs.create_cluster(clusterName="ecs-us-v2c")
     ecs.register_task_definition(
         family="ecs-us-v2td",
-        containerDefinitions=[{"name": "w", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "w", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     ecs.create_service(
         cluster="ecs-us-v2c",
@@ -567,7 +567,7 @@ def test_ecs_service_arn_parser_does_not_tail_resolve_invalid_arns(ecs):
     cluster_arn = ecs.create_cluster(clusterName=cluster)["cluster"]["clusterArn"]
     ecs.register_task_definition(
         family="ecs-arn-service-td",
-        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "app", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     created = ecs.create_service(
         cluster=cluster,
@@ -656,7 +656,7 @@ def test_ecs_service_arn_parser_does_not_tail_resolve_invalid_arns(ecs):
 def test_ecs_task_definition_arn_parser_does_not_tail_resolve_invalid_arns(ecs):
     resp = ecs.register_task_definition(
         family="ecs-arn-td",
-        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "app", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     task_definition_arn = resp["taskDefinition"]["taskDefinitionArn"]
     valid = ecs.describe_task_definition(taskDefinition=task_definition_arn)
@@ -828,7 +828,7 @@ def test_ecs_timestamps_are_epoch(ecs):
     # registeredAt might not be present on cluster, test on task def
     ecs.register_task_definition(
         family="ts-td-v44",
-        containerDefinitions=[{"name": "app", "image": "nginx", "memory": 256}],
+        containerDefinitions=[{"name": "app", "image": "alpine:latest", "command": ["sleep", "3600"], "memory": 256}],
     )
     td = ecs.describe_task_definition(taskDefinition="ts-td-v44")
     registered_at = td["taskDefinition"].get("registeredAt")
@@ -847,7 +847,7 @@ def test_ecs_service_spawns_tasks(ecs):
     ecs.create_cluster(clusterName=cluster)
     ecs.register_task_definition(
         family="svc-spawn-td",
-        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "app", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     ecs.create_service(
         cluster=cluster,
@@ -872,7 +872,7 @@ def test_ecs_list_services(ecs):
     ecs.create_cluster(clusterName=cluster)
     ecs.register_task_definition(
         family="ls-svc-td",
-        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "app", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     ecs.create_service(
         cluster=cluster, serviceName="ls-svc-a", taskDefinition="ls-svc-td", desiredCount=1,
@@ -893,7 +893,7 @@ def test_ecs_service_running_count(ecs):
     ecs.create_cluster(clusterName=cluster)
     ecs.register_task_definition(
         family="rc-td",
-        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "app", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     ecs.create_service(
         cluster=cluster, serviceName="rc-svc", taskDefinition="rc-td", desiredCount=3,
@@ -910,7 +910,7 @@ def test_ecs_service_scale_up(ecs):
     ecs.create_cluster(clusterName=cluster)
     ecs.register_task_definition(
         family="su-td",
-        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "app", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     ecs.create_service(
         cluster=cluster, serviceName="su-svc", taskDefinition="su-td", desiredCount=1,
@@ -932,7 +932,7 @@ def test_ecs_service_scale_down(ecs):
     ecs.create_cluster(clusterName=cluster)
     ecs.register_task_definition(
         family="sd-td",
-        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "app", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     ecs.create_service(
         cluster=cluster, serviceName="sd-svc", taskDefinition="sd-td", desiredCount=3,
@@ -997,7 +997,7 @@ def test_ecs_service_delete_stops_tasks(ecs):
     ecs.create_cluster(clusterName=cluster)
     ecs.register_task_definition(
         family="del-td",
-        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "app", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     ecs.create_service(
         cluster=cluster, serviceName="del-svc", taskDefinition="del-td", desiredCount=2,
@@ -1027,7 +1027,7 @@ def test_ecs_service_scale_to_zero(ecs):
     ecs.create_cluster(clusterName=cluster)
     ecs.register_task_definition(
         family="z-td",
-        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "app", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     ecs.create_service(
         cluster=cluster, serviceName="z-svc", taskDefinition="z-td", desiredCount=2,
@@ -1050,7 +1050,7 @@ def test_ecs_cluster_task_counts(ecs):
     ecs.create_cluster(clusterName=cluster)
     ecs.register_task_definition(
         family="ct-td",
-        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "app", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     ecs.create_service(
         cluster=cluster, serviceName="ct-svc", taskDefinition="ct-td", desiredCount=3,

@@ -4,16 +4,25 @@ validator unit tests and live data-plane (wire proxy) tests.
 """
 
 import asyncio
+import os
 import re
 import socket
 import struct
 import threading
 import time
+from urllib.parse import urlparse
 
 import pytest
 from botocore.exceptions import ClientError
 
 from ministack.core import pgproxy
+
+# Raw HTTP calls here must hit the same server the boto3 fixtures use. Hardcoding
+# 4566 silently fails everywhere except a default-port run (CI), which is exactly
+# the kind of test that looks green until someone runs the suite on another port.
+_ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+_ENDPOINT_HOST = urlparse(_ENDPOINT).hostname or "localhost"
+_ENDPOINT_PORT = urlparse(_ENDPOINT).port or 4566
 
 ID_RE = re.compile(r"^[a-z0-9]{26}$")
 
@@ -244,7 +253,7 @@ class TestClusterLifecycle:
 
         for bad in (0, 101):
             req = urllib.request.Request(
-                f"http://127.0.0.1:4566/cluster?max-results={bad}",
+                f"{_ENDPOINT}/cluster?max-results={bad}",
                 headers={"Host": "dsql.us-east-1.localhost"},
             )
             with pytest.raises(urllib.error.HTTPError) as exc:

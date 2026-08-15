@@ -62,7 +62,7 @@ def _live_ids() -> tuple[set, set]:
     return live, known
 
 
-def reap_once(docker_client) -> int:
+def reap_abandoned(docker_client) -> int:
     """Remove abandoned containers. Returns how many were reclaimed."""
     if docker_client is None:
         return 0
@@ -133,8 +133,51 @@ def start(get_docker) -> None:
         while True:
             time.sleep(REAP_INTERVAL)
             try:
-                reap_once(get_docker())
+                reap_abandoned(get_docker())
             except Exception as exc:
                 logger.debug("reaper iteration failed: %s", exc)
 
     threading.Thread(target=_loop, daemon=True, name="ministack-container-reaper").start()
+
+# Every label a service stamps on a container, plus the key-only backstops so a
+# new service (or an older container predating its label) is still reclaimed.
+# One list, one place: the boot/shutdown sweep and the periodic pass both use it.
+SERVICE_LABELS = (
+    "ministack=rds", "ministack=ecs", "ministack=elasticache", "ministack=eks",
+    "ministack=lambda", "ministack=dsql", "ministack=mwaa", "ministack=glue",
+    "ministack=codebuild", "ministack=opensearch",
+    "ministack", "com.ministack.service",
+)
+
+
+def reap_all(docker_client, stop_timeout: int = 2) -> int:
+    """Remove every MiniStack container, whatever its state.
+
+    For process boundaries only — boot and shutdown. At boot any surviving
+    container is by definition an orphan of a dead process (persistence strips
+    container ids from snapshots, so nothing can still own one). At shutdown
+    everything is going away regardless. Neither assumption holds while the
+    process is live, which is why :func:`reap_abandoned` exists separately and
+    is far more conservative.
+    """
+    if docker_client is None:
+        return 0
+    seen, removed = set(), 0
+    for label in SERVICE_LABELS:
+        try:
+            containers = docker_client.containers.list(all=True, filters={"label": label})
+        except Exception as exc:
+            logger.debug("reap_all: listing %s failed: %s", label, exc)
+            continue
+        for c in containers:
+            if c.id in seen:
+                continue
+            seen.add(c.id)
+            try:
+                c.stop(timeout=stop_timeout)
+                c.remove(v=True)      # v=True: reclaim the anonymous volume too
+                removed += 1
+            except Exception:
+                continue
+    return removed
+

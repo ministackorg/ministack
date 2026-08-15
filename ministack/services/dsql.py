@@ -307,6 +307,22 @@ def _remove_container(identifier):
         logger.debug("DSQL: container removal for %s: %s", identifier, e)
 
 
+def _serving_loop():
+    """The loop serving HTTP, or None outside a running server.
+
+    ``_main_loop`` is only populated by the ``start_restored_proxies`` lifespan
+    hook, which is skipped when the dsql module was not already loaded at boot —
+    i.e. on every fresh server whose first dsql call is CreateCluster. The app
+    captures the loop unconditionally, so fall back to that.
+    """
+    try:
+        from ministack import app
+
+        return app._MAIN_LOOP
+    except Exception:
+        return None
+
+
 async def _start_backend(identifier, cluster):
     """Background task: container + proxy, then flip the cluster ACTIVE.
 
@@ -458,10 +474,21 @@ def _create_cluster(data):
         _tags[arn] = dict(data["tags"])
 
     if has_backend:
+        # This handler runs on a worker thread (dispatch is off the event loop so
+        # Docker work cannot freeze the server), so there is no *running* loop
+        # here to create_task on. Schedule onto the serving loop instead — the
+        # same pattern _start_backend's respawn path already uses. Falling back
+        # to get_running_loop covers direct/in-process callers that do have one.
+        loop = _main_loop or _serving_loop()
         try:
-            asyncio.get_running_loop().create_task(_start_backend(identifier, cluster))
+            if loop is not None and loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    _start_backend(identifier, cluster), loop)
+            else:
+                asyncio.get_running_loop().create_task(
+                    _start_backend(identifier, cluster))
         except RuntimeError:
-            # No event loop (direct/module-level call) — metadata-only.
+            # No event loop at all (module-level call) — metadata-only.
             cluster["status"] = "ACTIVE"
             cluster["_has_backend"] = False
 
