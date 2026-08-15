@@ -3388,6 +3388,245 @@ def test_lambda_layer_delete_idempotent(lam):
     """Deleting a nonexistent version should not error."""
     lam.delete_layer_version(LayerName="no-such-layer-del", VersionNumber=999)
 
+
+def _publish_perm_layer(lam, layer_name):
+    """Publish a one-file layer and return its version number."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("perm.py", "")
+    return lam.publish_layer_version(
+        LayerName=layer_name,
+        Content={"ZipFile": buf.getvalue()},
+    )["Version"]
+
+
+def test_lambda_layer_version_permission_roundtrip(lam):
+    """Add → get → remove, with the policy document in AWS's shape.
+
+    An account principal is reported as that account's root user ARN, and the
+    statement's Resource is the layer version ARN.
+    """
+    layer_name = "perm-roundtrip-layer"
+    version = _publish_perm_layer(lam, layer_name)
+
+    added = lam.add_layer_version_permission(
+        LayerName=layer_name,
+        VersionNumber=version,
+        StatementId="xaccount",
+        Action="lambda:GetLayerVersion",
+        Principal="210987654321",
+    )
+    assert added["RevisionId"]
+
+    got = lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)
+    policy = json.loads(got["Policy"])
+    assert policy["Version"] == "2012-10-17"
+    assert len(policy["Statement"]) == 1
+    statement = policy["Statement"][0]
+    assert statement["Sid"] == "xaccount"
+    assert statement["Effect"] == "Allow"
+    assert statement["Action"] == "lambda:GetLayerVersion"
+    assert statement["Principal"] == {"AWS": "arn:aws:iam::210987654321:root"}
+    assert statement["Resource"].endswith(f":layer:{layer_name}:{version}")
+
+    # The revision id is the policy's, not a fresh value per read.
+    assert got["RevisionId"] == added["RevisionId"]
+    again = lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)
+    assert again["RevisionId"] == got["RevisionId"]
+
+    lam.remove_layer_version_permission(
+        LayerName=layer_name,
+        VersionNumber=version,
+        StatementId="xaccount",
+    )
+    with pytest.raises(ClientError) as exc:
+        lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_lambda_layer_version_permission_wildcard_principal(lam):
+    """A ``*`` principal stays the bare wildcard, and an OrganizationId
+    narrows it with an aws:PrincipalOrgID condition."""
+    layer_name = "perm-wildcard-layer"
+    version = _publish_perm_layer(lam, layer_name)
+
+    lam.add_layer_version_permission(
+        LayerName=layer_name,
+        VersionNumber=version,
+        StatementId="org-wide",
+        Action="lambda:GetLayerVersion",
+        Principal="*",
+        OrganizationId="o-a1b2c3d4e5",
+    )
+    policy = json.loads(
+        lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)["Policy"]
+    )
+    statement = policy["Statement"][0]
+    assert statement["Principal"] == "*"
+    assert statement["Condition"] == {"StringEquals": {"aws:PrincipalOrgID": "o-a1b2c3d4e5"}}
+
+
+def test_lambda_layer_version_permission_stale_revision_id(lam):
+    """A RevisionId that isn't the current one fails the call — on add and on
+    remove — leaving the policy untouched."""
+    layer_name = "perm-revision-layer"
+    version = _publish_perm_layer(lam, layer_name)
+
+    first = lam.add_layer_version_permission(
+        LayerName=layer_name,
+        VersionNumber=version,
+        StatementId="s1",
+        Action="lambda:GetLayerVersion",
+        Principal="*",
+    )
+    stale = first["RevisionId"]
+
+    second = lam.add_layer_version_permission(
+        LayerName=layer_name,
+        VersionNumber=version,
+        StatementId="s2",
+        Action="lambda:GetLayerVersion",
+        Principal="*",
+        RevisionId=stale,
+    )
+    assert second["RevisionId"] != stale
+
+    with pytest.raises(ClientError) as exc:
+        lam.add_layer_version_permission(
+            LayerName=layer_name,
+            VersionNumber=version,
+            StatementId="s3",
+            Action="lambda:GetLayerVersion",
+            Principal="*",
+            RevisionId=stale,
+        )
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailedException"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+
+    with pytest.raises(ClientError) as exc:
+        lam.remove_layer_version_permission(
+            LayerName=layer_name,
+            VersionNumber=version,
+            StatementId="s1",
+            RevisionId=stale,
+        )
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailedException"
+
+    policy = json.loads(
+        lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)["Policy"]
+    )
+    assert sorted(s["Sid"] for s in policy["Statement"]) == ["s1", "s2"]
+
+    # The current revision id is accepted.
+    current = lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)["RevisionId"]
+    lam.remove_layer_version_permission(
+        LayerName=layer_name,
+        VersionNumber=version,
+        StatementId="s1",
+        RevisionId=current,
+    )
+
+
+def test_lambda_layer_version_permission_not_found(lam):
+    """Unknown layer, unknown version, and unknown statement all 404."""
+    layer_name = "perm-404-layer"
+    version = _publish_perm_layer(lam, layer_name)
+
+    with pytest.raises(ClientError) as exc:
+        lam.get_layer_version_policy(LayerName="perm-404-no-such-layer", VersionNumber=1)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    with pytest.raises(ClientError) as exc:
+        lam.add_layer_version_permission(
+            LayerName=layer_name,
+            VersionNumber=version + 99,
+            StatementId="s1",
+            Action="lambda:GetLayerVersion",
+            Principal="*",
+        )
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    with pytest.raises(ClientError) as exc:
+        lam.remove_layer_version_permission(
+            LayerName=layer_name,
+            VersionNumber=version,
+            StatementId="never-added",
+        )
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_lambda_layer_version_permission_invalid_principal(lam):
+    """A principal that is neither an account id, ``*``, nor a root ARN is
+    rejected; an OrganizationId is only valid alongside ``*``."""
+    layer_name = "perm-bad-principal-layer"
+    version = _publish_perm_layer(lam, layer_name)
+
+    with pytest.raises(ClientError) as exc:
+        lam.add_layer_version_permission(
+            LayerName=layer_name,
+            VersionNumber=version,
+            StatementId="s1",
+            Action="lambda:GetLayerVersion",
+            Principal="not-an-account",
+        )
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+    with pytest.raises(ClientError) as exc:
+        lam.add_layer_version_permission(
+            LayerName=layer_name,
+            VersionNumber=version,
+            StatementId="s2",
+            Action="lambda:GetLayerVersion",
+            Principal="210987654321",
+            OrganizationId="o-a1b2c3d4e5",
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+
+    # The root-user ARN form the model allows is accepted.
+    lam.add_layer_version_permission(
+        LayerName=layer_name,
+        VersionNumber=version,
+        StatementId="s3",
+        Action="lambda:GetLayerVersion",
+        Principal="arn:aws:iam::210987654321:root",
+    )
+
+
+def test_lambda_layer_version_permission_survives_persistence_roundtrip(lambda_svc_isolated):
+    """A layer version's permission policy is part of the persisted state:
+    gone after the layers are cleared, back after restore_state."""
+    svc, _ = lambda_svc_isolated
+    original_layers = dict(svc._layers._data)
+    layer_name = "perm-persist-layer"
+
+    try:
+        svc._layers._data.clear()
+        status, _headers, _body = svc._publish_layer_version(layer_name, {"Content": {}})
+        assert status == 201
+
+        status, _headers, _body = svc._add_layer_version_permission(
+            layer_name,
+            1,
+            {"StatementId": "persisted", "Action": "lambda:GetLayerVersion", "Principal": "*"},
+        )
+        assert status == 201
+        revision_id = json.loads(_body)["RevisionId"]
+
+        state = svc.get_state()
+        svc._layers._data.clear()
+        status, _headers, _body = svc._get_layer_version_policy(layer_name, 1)
+        assert status == 404
+
+        svc.restore_state(state)
+        status, _headers, body = svc._get_layer_version_policy(layer_name, 1)
+        assert status == 200
+        restored = json.loads(body)
+        assert json.loads(restored["Policy"])["Statement"][0]["Sid"] == "persisted"
+        assert restored["RevisionId"] == revision_id
+    finally:
+        svc._layers._data.clear()
+        svc._layers._data.update(original_layers)
+
 def test_lambda_warm_worker_invalidation(lam):
     """Create function with code v1, invoke, update code to v2, invoke again — must see v2."""
     import io as _io
@@ -6409,6 +6648,87 @@ def test_lambda_invoke_emits_cloudwatch_logs_nodejs(lam, logs):
         lam.delete_function(FunctionName=fname)
 
 
+# ──────────────────── host.docker.internal → host-gateway ────────────────────
+
+
+def _spawn_capture_run_kwargs(monkeypatch, *, endpoint, docker_flags=""):
+    """Spawn one Lambda container against fakes and return the docker kwargs.
+
+    Captures both entry points: the DinD path uses ``containers.create`` (code
+    is docker-cp'd rather than bind-mounted) and everything else uses
+    ``containers.run``, and which one a runner takes is not this test's point.
+    """
+    monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_FLAGS", docker_flags)
+    monkeypatch.setattr(lsvc, "_docker_available", True)
+    monkeypatch.setenv("AWS_ENDPOINT_URL", endpoint)
+
+    captured = {}
+    fake_container = _mk_container()
+    fake_container.ports = {"8080/tcp": [{"HostPort": "9999"}]}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return fake_container
+
+    fake_client = MagicMock()
+    fake_client.containers.run = _capture
+    fake_client.containers.create = _capture
+    fake_client.images.get = MagicMock()
+    monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)
+
+    lsvc._spawn_lambda_container(
+        {"FunctionName": "test-hg-fn", "Runtime": "python3.12",
+         "Handler": "index.handler", "PackageType": "Zip", "Timeout": 3,
+         "MemorySize": 128,
+         "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:test-hg-fn"},
+        _make_zip("def handler(e, c): pass"),
+    )
+    return captured
+
+
+def test_lambda_container_maps_host_docker_internal_to_host_gateway(monkeypatch):
+    """A container pointed at host.docker.internal gets the name mapped.
+
+    AWS_ENDPOINT_URL is rewritten from localhost to host.docker.internal for
+    the container, but that name only resolves out of the box on Docker
+    Desktop. On a native Linux engine it is undefined unless mapped to the
+    magic `host-gateway` address, so a handler's callback dies on DNS.
+    """
+    captured = _spawn_capture_run_kwargs(
+        monkeypatch, endpoint="http://localhost:4566"
+    )
+
+    assert captured["environment"]["AWS_ENDPOINT_URL"] == (
+        "http://host.docker.internal:4566"
+    )
+    assert captured["extra_hosts"] == {"host.docker.internal": "host-gateway"}
+
+
+def test_lambda_container_host_gateway_yields_to_an_explicit_add_host(monkeypatch):
+    """An explicit --add-host for the same name still wins."""
+    captured = _spawn_capture_run_kwargs(
+        monkeypatch,
+        endpoint="http://localhost:4566",
+        docker_flags="--add-host host.docker.internal:10.5.0.1",
+    )
+
+    assert captured["extra_hosts"] == {"host.docker.internal": "10.5.0.1"}
+
+
+def test_lambda_container_without_host_docker_internal_gets_no_mapping(monkeypatch):
+    """An endpoint that names something else is left alone.
+
+    A Docker-network deployment points AWS_ENDPOINT_URL at a container name,
+    which resolves on the network's own DNS; mapping host.docker.internal
+    there would be noise at best.
+    """
+    captured = _spawn_capture_run_kwargs(
+        monkeypatch, endpoint="http://ministack:4566"
+    )
+
+    assert "extra_hosts" not in captured
+
+
 # ──────────────────── LAMBDA_DOCKER_FLAGS ────────────────────
 
 def test_lambda_docker_flags_applied_to_run_kwargs(monkeypatch):
@@ -6431,6 +6751,9 @@ def test_lambda_docker_flags_applied_to_run_kwargs(monkeypatch):
 
     fake_client = MagicMock()
     fake_client.containers.run = _fake_run
+    # A runner that is itself containerised takes the docker-cp path, which
+    # calls containers.create; the flags land in the same kwargs either way.
+    fake_client.containers.create = _fake_run
     fake_client.images.get = MagicMock()
     monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)
 
@@ -6470,7 +6793,10 @@ def test_lambda_docker_flags_applied_to_run_kwargs(monkeypatch):
     assert captured["mem_limit"] == "512m"
     assert captured["shm_size"] == "256m"
     assert captured["cap_add"] == ["SYS_PTRACE"]
-    assert captured["extra_hosts"] == {"myhost": "10.0.0.1"}
+    # The host-gateway mapping is merged in alongside an explicit --add-host.
+    assert captured["extra_hosts"] == {
+        "myhost": "10.0.0.1", "host.docker.internal": "host-gateway",
+    }
     assert captured["tmpfs"] == {"/run": "size=100m"}
     assert captured["privileged"] is True
     assert captured["read_only"] is True

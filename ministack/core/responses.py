@@ -403,17 +403,23 @@ def error_response_xml(code: str, message: str, status: int, namespace: str = "h
     return status, {"Content-Type": "application/xml"}, body
 
 
-def error_response_json(code: str, message: str, status: int = 400) -> tuple:
+def error_response_json(code: str, message: str, status: int = 400, extra: dict | None = None) -> tuple:
     """AWS-style JSON error response.
 
     Real AWS emits the error type in BOTH the body (`__type`) and the
     `x-amzn-errortype` response header. Java/Go SDK v2 prefer the header;
     boto3 reads the body. Send both.
+
+    `extra` carries the modeled members some exceptions add to the body (for
+    example `resourceId` / `resourceArn` on `ResourceAlreadyExistsException`),
+    so callers never have to rebuild the envelope themselves.
     """
     data = {
         "__type": code,
         "message": message,
     }
+    if extra:
+        data.update(extra)
     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
     return status, {
         "Content-Type": "application/x-amz-json-1.0",
