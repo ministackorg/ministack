@@ -9,11 +9,13 @@ Supports: CreateStack, UpdateStack, DeleteStack, DescribeStacks, ListStacks,
 Uses Query API (Action=...) with form-encoded body.
 """
 
+import copy
 import json
 import logging
 import os
 from urllib.parse import parse_qs
 
+from ministack.core.persistence import load_state
 from ministack.core.responses import AccountRegionScopedDict
 
 logger = logging.getLogger("cloudformation")
@@ -78,7 +80,52 @@ def reset():
     _cr.reset()
 
 
+# Stores that need to survive a PERSIST_STATE=1 stop/restore cycle. The actual
+# provisioned resources (buckets, functions, tables, …) are persisted by their
+# own services; only the CloudFormation metadata (stack records, events,
+# exports, and change sets) lived nowhere, so ListStacks/DescribeStacks/
+# ListExports came back empty after a warm boot. (#1345, item 8)
+_PERSISTED_STORES = (
+    (lambda: _stacks, "stacks"),
+    (lambda: _stack_events, "stack_events"),
+    (lambda: _exports, "exports"),
+    (lambda: _change_sets, "change_sets"),
+)
+
+
+def get_state():
+    return {key: copy.deepcopy(store()) for store, key in _PERSISTED_STORES}
+
+
+def restore_state(data):
+    if not data:
+        return
+    for store, key in _PERSISTED_STORES:
+        restored = data.get(key)
+        target = store()
+        if isinstance(restored, AccountRegionScopedDict):
+            # Merge the (account, region, key)-scoped entries directly. Restore
+            # runs at import time with no request scope, so re-scoping through
+            # the public dict interface would misattribute every entry.
+            target._data.update(restored._data)
+        elif isinstance(restored, dict):
+            for k, v in restored.items():
+                target[k] = v
+
+
 # Must be last — handlers imports from this module
 from ministack.core.responses import get_account_id
 
 from .handlers import _ACTION_HANDLERS, _validate_template  # noqa: E402
+
+# Restore persisted stack metadata on first import (a CloudFormation request, or
+# the eager boot import when a state file exists). Failure falls back to a fresh
+# store rather than blocking startup.
+try:
+    _restored = load_state("cloudformation")
+    if _restored:
+        restore_state(_restored)
+except Exception:
+    logger.exception(
+        "Failed to restore persisted CloudFormation state; continuing with a fresh store"
+    )

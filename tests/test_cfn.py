@@ -450,6 +450,133 @@ def test_cfn_create_describe_delete_stack(cfn, s3):
         s3.head_bucket(Bucket="cfn-t01-bucket")
 
 
+def test_cfn_s3_bucket_notification_configuration(cfn, s3, sqs):
+    """AWS::S3::Bucket NotificationConfiguration is applied, not silently dropped:
+    it round-trips through GetBucketNotificationConfiguration (with the
+    CloudFormation property names translated to the S3 API's), an upload matching
+    the event and key filter is delivered to the target, and removing the property
+    on a stack update clears the configuration. (#1359)
+    """
+    queue_url = sqs.create_queue(QueueName="cfn-notif-q")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=queue_url, AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+
+    def template(with_notif):
+        props = {"BucketName": "cfn-notif-bucket"}
+        if with_notif:
+            props["NotificationConfiguration"] = {
+                "QueueConfigurations": [{
+                    "Queue": queue_arn,
+                    "Event": "s3:ObjectCreated:*",
+                    "Filter": {"S3Key": {"Rules": [{"Name": "suffix", "Value": ".csv"}]}},
+                }],
+            }
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {"Bucket": {"Type": "AWS::S3::Bucket", "Properties": props}},
+        })
+
+    cfn.create_stack(StackName="cfn-notif", TemplateBody=template(True))
+    assert _wait_stack(cfn, "cfn-notif")["StackStatus"] == "CREATE_COMPLETE"
+
+    # The property survived: the config is readable back, with the CloudFormation
+    # names (Queue/Event/Rules) translated to the S3 API's (QueueArn/Events/Key).
+    qcfgs = s3.get_bucket_notification_configuration(
+        Bucket="cfn-notif-bucket")["QueueConfigurations"]
+    assert len(qcfgs) == 1
+    assert qcfgs[0]["QueueArn"] == queue_arn
+    assert qcfgs[0]["Events"] == ["s3:ObjectCreated:*"]
+    assert qcfgs[0]["Filter"]["Key"]["FilterRules"] == [{"Name": "suffix", "Value": ".csv"}]
+
+    # Delivery works end to end through the CloudFormation path, honouring the filter.
+    s3.put_object(Bucket="cfn-notif-bucket", Key="skip.txt", Body=b"no")
+    s3.put_object(Bucket="cfn-notif-bucket", Key="take.csv", Body=b"yes")
+    time.sleep(0.5)
+    msgs = sqs.receive_message(
+        QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=2)
+    keys = [
+        json.loads(m["Body"])["Records"][0]["s3"]["object"]["key"]
+        for m in msgs.get("Messages", []) if "Records" in json.loads(m["Body"])
+    ]
+    assert "take.csv" in keys
+    assert "skip.txt" not in keys
+
+    # Removing the property on an update clears the configuration.
+    cfn.update_stack(StackName="cfn-notif", TemplateBody=template(False))
+    assert _wait_stack(cfn, "cfn-notif")["StackStatus"] == "UPDATE_COMPLETE"
+    cleared = s3.get_bucket_notification_configuration(Bucket="cfn-notif-bucket")
+    assert not cleared.get("QueueConfigurations")
+
+    cfn.delete_stack(StackName="cfn-notif")
+    _wait_stack(cfn, "cfn-notif")
+
+
+def test_cfn_iot_and_cognito_role_attachment(cfn, iot_client, cognito_identity):
+    """AWS::IoT::ThingType, AWS::IoT::Policy, and
+    AWS::Cognito::IdentityPoolRoleAttachment provision onto their real services
+    instead of rolling the stack back — each is readable through its own API. (#1345, item 5)
+    """
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "TT": {"Type": "AWS::IoT::ThingType", "Properties": {
+                "ThingTypeName": "cfn-tt",
+                "ThingTypeProperties": {"ThingTypeDescription": "d", "SearchableAttributes": ["room"]}}},
+            "Pol": {"Type": "AWS::IoT::Policy", "Properties": {
+                "PolicyName": "cfn-pol",
+                "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+                    {"Effect": "Allow", "Action": "iot:Connect", "Resource": "*"}]}}},
+            "Pool": {"Type": "AWS::Cognito::IdentityPool", "Properties": {
+                "IdentityPoolName": "cfn-pool", "AllowUnauthenticatedIdentities": True}},
+            "Roles": {"Type": "AWS::Cognito::IdentityPoolRoleAttachment", "Properties": {
+                "IdentityPoolId": {"Ref": "Pool"},
+                "Roles": {"authenticated": "arn:aws:iam::000000000000:role/auth"}}},
+        },
+        "Outputs": {"PoolId": {"Value": {"Ref": "Pool"}}},
+    }
+    cfn.create_stack(StackName="cfn-iot-cog", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-iot-cog")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    tt = iot_client.describe_thing_type(thingTypeName="cfn-tt")
+    assert tt["thingTypeProperties"]["searchableAttributes"] == ["room"]
+    pol = iot_client.get_policy(policyName="cfn-pol")
+    assert pol["policyArn"].endswith("policy/cfn-pol")
+
+    pool_id = next(o["OutputValue"] for o in stack["Outputs"] if o["OutputKey"] == "PoolId")
+    roles = cognito_identity.get_identity_pool_roles(IdentityPoolId=pool_id)["Roles"]
+    assert roles["authenticated"] == "arn:aws:iam::000000000000:role/auth"
+
+    cfn.delete_stack(StackName="cfn-iot-cog")
+    _wait_stack(cfn, "cfn-iot-cog")
+
+
+def test_cfn_lambda_layer_version_permission(cfn, lam):
+    """AWS::Lambda::LayerVersionPermission attaches a statement to the real
+    layer version's policy, readable via GetLayerVersionPolicy. (#1345, item 5)"""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("lib.txt", "x")
+    layer = lam.publish_layer_version(
+        LayerName="cfn-perm-layer", Content={"ZipFile": buf.getvalue()})
+    arn = layer["LayerVersionArn"]
+
+    template = {"Resources": {"Perm": {
+        "Type": "AWS::Lambda::LayerVersionPermission", "Properties": {
+            "LayerVersionArn": arn, "Action": "lambda:GetLayerVersion",
+            "Principal": "123456789012", "StatementId": "cfn-sid"}}}}
+    cfn.create_stack(StackName="cfn-layer-perm", TemplateBody=json.dumps(template))
+    assert _wait_stack(cfn, "cfn-layer-perm")["StackStatus"] == "CREATE_COMPLETE"
+
+    pol = json.loads(lam.get_layer_version_policy(
+        LayerName="cfn-perm-layer", VersionNumber=1)["Policy"])
+    assert any(s["Sid"] == "cfn-sid" for s in pol["Statement"])
+
+    cfn.delete_stack(StackName="cfn-layer-perm")
+    _wait_stack(cfn, "cfn-layer-perm")
+
+
 def test_cfn_deleted_stack_name_is_reusable(cfn):
     """A DELETE_COMPLETE stack is addressable only by stack ID; its name is free
     to re-create, and an UpdateStack against the deleted name is "does not
@@ -570,8 +697,13 @@ def test_cfn_unnamed_dynamodb_table_survives_unrelated_update(cfn, ddb, ssm):
 
     tables_after = set(ddb.list_tables()["TableNames"])
     table_name_after = ssm.get_parameter(Name="/cfn-t02f/table-name")["Parameter"]["Value"]
-    assert tables_after == tables_before
-    assert table_name_after == table_name_before
+    # Assert on this stack's table only. `list_tables()` is global and all xdist
+    # workers share one server, so any comparison of the whole set against a
+    # snapshot taken before the update is racy in both directions: a concurrent
+    # test creating a table breaks equality, and one deleting its own table
+    # breaks a subset check. Neither says anything about the behaviour here.
+    assert table_name_after == table_name_before, "the table was re-created under a new name"
+    assert table_name_after in tables_after, "the stack's table did not survive the update"
     
 def test_cfn_ssm_parameter_value_type_resolves_stored_value(cfn, ssm, sqs):
     """A `AWS::SSM::Parameter::Value<String>` template parameter's Default/
@@ -6828,6 +6960,178 @@ def test_cfn_lambda_layer_packages_importable(cfn, s3, lam):
         assert payload["value"] == "from-cfn-layer"
     finally:
         cfn.delete_stack(StackName=stack_name)
+
+
+def test_cfn_lambda_layer_version_permission(cfn, s3, lam):
+    """A layer plus the permission resource that grants another account access
+    to it — the shape serverless-python-requirements emits for a layer with
+    ``allowedAccounts``, and CDK's ``LayerVersion.addPermission``.
+
+    Regression: AWS::Lambda::LayerVersionPermission had no provisioner, so the
+    whole stack failed with "Unsupported resource type" and rolled back.
+    Reported by @iot-rocket."""
+    stack_name = "cfn-layer-permission"
+    bucket_name = "cfn-layer-permission-assets"
+    layer_name = "cfn-permission-layer"
+    account_id = "210987654321"
+
+    s3.create_bucket(Bucket=bucket_name)
+    layer_buf = io.BytesIO()
+    with zipfile.ZipFile(layer_buf, "w") as z:
+        z.writestr("python/cfn_permission_helper.py", "VALUE = 1\n")
+    s3.put_object(Bucket=bucket_name, Key="layer.zip", Body=layer_buf.getvalue())
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "PythonRequirementsLambdaLayer": {
+                "Type": "AWS::Lambda::LayerVersion",
+                "Properties": {
+                    "LayerName": layer_name,
+                    "CompatibleRuntimes": ["python3.12"],
+                    "Content": {"S3Bucket": bucket_name, "S3Key": "layer.zip"},
+                },
+            },
+            "PythonRequirementsLambdaLayerPermission": {
+                "Type": "AWS::Lambda::LayerVersionPermission",
+                "Properties": {
+                    "Action": "lambda:GetLayerVersion",
+                    "LayerVersionArn": {"Ref": "PythonRequirementsLambdaLayer"},
+                    "Principal": account_id,
+                },
+            },
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    try:
+        version = lam.list_layer_versions(LayerName=layer_name)["LayerVersions"][0]["Version"]
+        policy = json.loads(
+            lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)["Policy"]
+        )
+        assert len(policy["Statement"]) == 1
+        statement = policy["Statement"][0]
+        assert statement["Action"] == "lambda:GetLayerVersion"
+        assert statement["Principal"] == {"AWS": f"arn:aws:iam::{account_id}:root"}
+
+        # Ref/Id is "<layer version ARN>#<statement id>".
+        resource = cfn.describe_stack_resource(
+            StackName=stack_name,
+            LogicalResourceId="PythonRequirementsLambdaLayerPermission",
+        )["StackResourceDetail"]
+        version_arn, sep, statement_id = resource["PhysicalResourceId"].rpartition("#")
+        assert sep == "#"
+        assert version_arn.endswith(f":layer:{layer_name}:{version}")
+        assert statement_id == statement["Sid"]
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+    with pytest.raises(ClientError) as exc:
+        lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_cfn_lambda_layer_version_permission_delete_leaves_layer(cfn, lam):
+    """Deleting the stack revokes the grant it made and nothing else — the
+    layer version it pointed at (published outside the stack, as CDK's
+    ``LayerVersion.fromLayerVersionArn`` does) is still there afterwards."""
+    stack_name = "cfn-layer-permission-detached"
+    layer_name = "cfn-detached-perm-layer"
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("python/detached.py", "VALUE = 1\n")
+    published = lam.publish_layer_version(
+        LayerName=layer_name,
+        Content={"ZipFile": buf.getvalue()},
+    )
+    version = published["Version"]
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "LayerPermission": {
+                "Type": "AWS::Lambda::LayerVersionPermission",
+                "Properties": {
+                    "Action": "lambda:GetLayerVersion",
+                    "LayerVersionArn": published["LayerVersionArn"],
+                    "Principal": "*",
+                },
+            },
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    policy = json.loads(
+        lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)["Policy"]
+    )
+    assert policy["Statement"][0]["Principal"] == "*"
+
+    cfn.delete_stack(StackName=stack_name)
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+
+    with pytest.raises(ClientError) as exc:
+        lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert lam.get_layer_version(LayerName=layer_name, VersionNumber=version)["Version"] == version
+
+
+def test_cfn_lambda_layer_version_permission_property_change_replaces(cfn, lam):
+    """Every property of this type is create-only, so a changed Principal is a
+    replacement. With no update handler the framework re-runs create (#1340),
+    which must land on the same statement rather than leaving the old grant
+    behind next to the new one."""
+    stack_name = "cfn-layer-permission-update"
+    layer_name = "cfn-update-perm-layer"
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("python/updated.py", "VALUE = 1\n")
+    published = lam.publish_layer_version(
+        LayerName=layer_name,
+        Content={"ZipFile": buf.getvalue()},
+    )
+    version = published["Version"]
+
+    def template(principal):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "LayerPermission": {
+                    "Type": "AWS::Lambda::LayerVersionPermission",
+                    "Properties": {
+                        "Action": "lambda:GetLayerVersion",
+                        "LayerVersionArn": published["LayerVersionArn"],
+                        "Principal": principal,
+                    },
+                },
+            },
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("111111111111"))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+
+    cfn.update_stack(StackName=stack_name, TemplateBody=template("222222222222"))
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+
+    policy = json.loads(
+        lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)["Policy"]
+    )
+    assert len(policy["Statement"]) == 1
+    assert policy["Statement"][0]["Principal"] == {"AWS": "arn:aws:iam::222222222222:root"}
+
+    cfn.delete_stack(StackName=stack_name)
+    assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+    with pytest.raises(ClientError) as exc:
+        lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
 def test_cfn_sam_transform_function_and_simple_table(cfn, lam, s3, ddb):

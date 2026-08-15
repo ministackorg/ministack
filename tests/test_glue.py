@@ -1108,8 +1108,22 @@ def test_glue_batch_stop_job_run(glue):
     )
     run1 = glue.start_job_run(JobName=name)["JobRunId"]
     run2 = glue.start_job_run(JobName=name)["JobRunId"]
-    # Ministack auto-completes runs (SUCCEEDED), so batch stop returns errors
-    # for completed runs + not-found run
+    # `StartJobRun` hands execution to a background thread and returns while the
+    # run is still STARTING, so the state BatchStopJobRun sees depends on when
+    # that thread is scheduled. Wait for both runs to settle: a run still
+    # STARTING/RUNNING is legitimately *stopped* (a successful submission), and
+    # this test is about the already-completed case.
+    for run_id in (run1, run2):
+        for _ in range(40):
+            state = glue.get_job_run(JobName=name, RunId=run_id)["JobRun"]["JobRunState"]
+            if state in ("SUCCEEDED", "FAILED", "STOPPED", "TIMEOUT"):
+                break
+            time.sleep(0.25)
+        else:
+            raise AssertionError(f"run {run_id} never reached a terminal state (last: {state})")
+
+    # Both runs are terminal now, so batch stop returns errors for the two
+    # completed runs plus the not-found one.
     resp = glue.batch_stop_job_run(JobName=name, JobRunIds=[run1, run2, "no-such-run"])
     assert "SuccessfulSubmissions" in resp
     assert "Errors" in resp
