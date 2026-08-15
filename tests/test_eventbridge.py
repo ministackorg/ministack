@@ -3304,3 +3304,471 @@ def test_eventbridge_api_destination_oauth_refresh_on_401(eb):
     finally:
         issuer.shutdown()
         server.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# API-destination outbound-HTTP hardening regression tests
+# ---------------------------------------------------------------------------
+
+def _start_redirecting_server(location):
+    """A stand-in endpoint that answers every request with 302 -> location."""
+    import threading as _threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    seen = []
+
+    class _Handler(BaseHTTPRequestHandler):
+        def _handle(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            if length:
+                self.rfile.read(length)
+            seen.append({"headers": {k.lower(): v for k, v in self.headers.items()}})
+            self.send_response(302)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        do_POST = _handle
+        do_PUT = _handle
+        do_GET = _handle
+
+        def log_message(self, _f, *_a):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    _threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, seen
+
+
+def test_eventbridge_api_destination_does_not_follow_redirect(eb):
+    """A 3xx must not be followed — urllib would carry the Authorization header
+    to the redirect target, leaking credentials. The secondary endpoint must
+    receive nothing."""
+    secondary, secondary_captured = _start_api_dest_capture_server()
+    try:
+        secondary_port = secondary.server_address[1]
+        primary, primary_seen = _start_redirecting_server(
+            f"http://127.0.0.1:{secondary_port}/stolen"
+        )
+        try:
+            primary_port = primary.server_address[1]
+            bus_name, source = _api_dest_pipeline(
+                eb,
+                "redirect",
+                f"http://127.0.0.1:{primary_port}/hook",
+                "BASIC",
+                {"BasicAuthParameters": {"Username": "svcuser", "Password": "hunter2"}},
+            )
+            eb.put_events(Entries=[{
+                "Source": source, "DetailType": "Ping",
+                "Detail": json.dumps({"n": 1}), "EventBusName": bus_name,
+            }])
+            # The primary must actually be hit, or "the secondary saw nothing"
+            # is vacuously true and this stops guarding anything.
+            assert _wait_until(lambda: len(primary_seen) >= 1)
+            # Then give the redirect time to be followed; it must not be.
+            _wait_until(lambda: len(secondary_captured) >= 1, timeout=2.0)
+            assert secondary_captured == []
+        finally:
+            primary.shutdown()
+    finally:
+        secondary.shutdown()
+
+
+def test_eventbridge_api_destination_rejects_non_http_endpoint(eb):
+    """file://, ftp://, gopher://, and non-URLs are rejected at create/update;
+    http(s) endpoints are accepted."""
+    conn = eb.create_connection(
+        Name=f"qa-eb-scheme-conn-{_uuid_mod.uuid4().hex[:8]}",
+        AuthorizationType="API_KEY",
+        AuthParameters={"ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "k"}},
+    )
+    conn_arn = conn["ConnectionArn"]
+    for bad in ("file:///etc/passwd", "ftp://127.0.0.1/x", "gopher://x/", "not a url at all"):
+        with pytest.raises(ClientError) as exc:
+            eb.create_api_destination(
+                Name=f"qa-eb-scheme-{_uuid_mod.uuid4().hex[:8]}",
+                ConnectionArn=conn_arn,
+                InvocationEndpoint=bad,
+                HttpMethod="POST",
+            )
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+        assert "InvocationEndpoint" in exc.value.response["Error"]["Message"]
+
+    good_name = f"qa-eb-scheme-ok-{_uuid_mod.uuid4().hex[:8]}"
+    eb.create_api_destination(
+        Name=good_name, ConnectionArn=conn_arn,
+        InvocationEndpoint="https://example.test/hook", HttpMethod="POST",
+    )
+    with pytest.raises(ClientError) as exc:
+        eb.update_api_destination(Name=good_name, InvocationEndpoint="file:///etc/shadow")
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_eventbridge_api_destination_api_key_cannot_override_reserved_header(eb):
+    """An ApiKeyName colliding with a reserved header (User-Agent) must not
+    override EventBridge's fixed value at delivery time."""
+    server, captured = _start_api_dest_capture_server()
+    try:
+        port = server.server_address[1]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "hdrinject",
+            f"http://127.0.0.1:{port}/hook",
+            "API_KEY",
+            {"ApiKeyAuthParameters": {"ApiKeyName": "User-Agent", "ApiKeyValue": "pwned-agent"}},
+        )
+        eb.put_events(Entries=[{
+            "Source": source, "DetailType": "Ping",
+            "Detail": json.dumps({"n": 1}), "EventBusName": bus_name,
+        }])
+        assert _wait_until(lambda: len(captured) >= 1)
+        assert captured[0]["headers"]["user-agent"] == "Amazon/EventBridge/ApiDestinations"
+    finally:
+        server.shutdown()
+
+
+def test_eventbridge_api_destination_endpoint_scheme_is_case_insensitive(eb):
+    """URL schemes are case-insensitive (RFC 3986) and the outbound opener
+    lowercases before comparing, so ``HTTPS://`` must be accepted at the API —
+    rejecting it would fail a destination the emulator can in fact deliver to."""
+    conn = eb.create_connection(
+        Name=f"qa-eb-scheme-case-conn-{_uuid_mod.uuid4().hex[:8]}",
+        AuthorizationType="API_KEY",
+        AuthParameters={"ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "k"}},
+    )
+    name = f"qa-eb-scheme-case-{_uuid_mod.uuid4().hex[:8]}"
+    eb.create_api_destination(
+        Name=name, ConnectionArn=conn["ConnectionArn"],
+        InvocationEndpoint="HTTPS://api.example.test/hook", HttpMethod="POST",
+    )
+    assert eb.describe_api_destination(Name=name)["InvocationEndpoint"] == \
+        "HTTPS://api.example.test/hook"
+    eb.update_api_destination(Name=name, InvocationEndpoint="Http://api.example.test/hook2")
+    assert eb.describe_api_destination(Name=name)["InvocationEndpoint"] == \
+        "Http://api.example.test/hook2"
+
+
+def test_eventbridge_api_destination_rejects_endpoint_without_host(eb):
+    """An endpoint with no host is not dialable. Storing it only moves the
+    failure to a background delivery thread, where the caller never sees it.
+    ``http://@`` and ``http://:80`` carry a non-empty authority but still no
+    host, so an authority check alone is not enough."""
+    conn = eb.create_connection(
+        Name=f"qa-eb-scheme-host-conn-{_uuid_mod.uuid4().hex[:8]}",
+        AuthorizationType="API_KEY",
+        AuthParameters={"ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "k"}},
+    )
+    conn_arn = conn["ConnectionArn"]
+    for bad in ("http://", "https://", "http:///hook", "https://?q=1",
+                "http://@", "http://:80", "http://[::1/hook",
+                # urlsplit strips CR/LF/TAB before reporting a hostname
+                # (bpo-43882), so these clear a host check but reach connect
+                # as something the caller never wrote — "http://ho\nst/hook"
+                # resolves to "host", and the CRLF form to "hostx-injected".
+                "http://ho\nst/hook", "http://host\t/hook",
+                "http://host\r\nX-Injected: 1/hook", "http://ho st/hook"):
+        with pytest.raises(ClientError) as exc:
+            eb.create_api_destination(
+                Name=f"qa-eb-scheme-host-{_uuid_mod.uuid4().hex[:8]}",
+                ConnectionArn=conn_arn,
+                InvocationEndpoint=bad,
+                HttpMethod="POST",
+            )
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+        assert "InvocationEndpoint" in exc.value.response["Error"]["Message"]
+
+    name = f"qa-eb-scheme-host-ok-{_uuid_mod.uuid4().hex[:8]}"
+    eb.create_api_destination(
+        Name=name, ConnectionArn=conn_arn,
+        InvocationEndpoint="https://api.example.test/hook", HttpMethod="POST",
+    )
+    with pytest.raises(ClientError) as exc:
+        eb.update_api_destination(Name=name, InvocationEndpoint="http://")
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert eb.describe_api_destination(Name=name)["InvocationEndpoint"] == \
+        "https://api.example.test/hook"
+
+
+def test_eventbridge_connection_rejects_non_http_oauth_endpoint(eb):
+    """CreateConnection POSTs the client_id/client_secret to the OAuth
+    AuthorizationEndpoint, so a non-http(s) one is rejected at the API instead
+    of surfacing much later as a log line on a delivery worker."""
+    for bad in ("file:///etc/passwd", "ftp://127.0.0.1/token", "https://", "nope"):
+        with pytest.raises(ClientError) as exc:
+            eb.create_connection(
+                Name=f"qa-eb-oauth-scheme-{_uuid_mod.uuid4().hex[:8]}",
+                AuthorizationType="OAUTH_CLIENT_CREDENTIALS",
+                AuthParameters={"OAuthParameters": {
+                    "AuthorizationEndpoint": bad,
+                    "HttpMethod": "POST",
+                    "ClientParameters": {"ClientID": "cid", "ClientSecret": "csecret"},
+                }},
+            )
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+        assert "AuthorizationEndpoint" in exc.value.response["Error"]["Message"]
+
+    # A connection with no OAuth parameters at all is not an endpoint carrier
+    # and must stay creatable.
+    api_key_name = f"qa-eb-oauth-scheme-apikey-{_uuid_mod.uuid4().hex[:8]}"
+    eb.create_connection(
+        Name=api_key_name,
+        AuthorizationType="API_KEY",
+        AuthParameters={"ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "k"}},
+    )
+    assert eb.describe_connection(Name=api_key_name)["ConnectionState"] == "AUTHORIZED"
+
+
+def test_eventbridge_connection_update_rejects_non_http_oauth_endpoint(eb):
+    """UpdateConnection can repoint the token request at a new URL, so it gets
+    the same check — and a rejected update must leave the stored endpoint
+    untouched. A description-only update carries no endpoint and is unaffected."""
+    name = f"qa-eb-oauth-update-{_uuid_mod.uuid4().hex[:8]}"
+    eb.create_connection(
+        Name=name,
+        AuthorizationType="OAUTH_CLIENT_CREDENTIALS",
+        AuthParameters={"OAuthParameters": {
+            "AuthorizationEndpoint": "https://idp.example.test/token",
+            "HttpMethod": "POST",
+            "ClientParameters": {"ClientID": "cid", "ClientSecret": "csecret"},
+        }},
+    )
+    with pytest.raises(ClientError) as exc:
+        eb.update_connection(
+            Name=name,
+            AuthParameters={"OAuthParameters": {
+                "AuthorizationEndpoint": "file:///etc/passwd",
+                "HttpMethod": "POST",
+                "ClientParameters": {"ClientID": "cid", "ClientSecret": "csecret"},
+            }},
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert "AuthorizationEndpoint" in exc.value.response["Error"]["Message"]
+
+    stored = eb.describe_connection(Name=name)["AuthParameters"]["OAuthParameters"]
+    assert stored["AuthorizationEndpoint"] == "https://idp.example.test/token"
+
+    eb.update_connection(Name=name, Description="still fine")
+    assert eb.describe_connection(Name=name)["Description"] == "still fine"
+
+
+def test_eventbridge_deauthorized_connection_stops_delivering_credentials(eb):
+    """DeauthorizeConnection "removes all authorization parameters from the
+    connection", so the credentials must stop going out. Deauthorizing used to
+    flip the state and evict the cached OAuth token while leaving
+    AuthParameters in place, so every later delivery still presented the same
+    Basic credentials to the endpoint."""
+    server, captured = _start_api_dest_capture_server()
+    try:
+        port = server.server_address[1]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "deauth",
+            f"http://127.0.0.1:{port}/hook",
+            "BASIC",
+            {"BasicAuthParameters": {"Username": "svcuser", "Password": "hunter2"}},
+        )
+        entry = {"Source": source, "DetailType": "Ping",
+                 "Detail": json.dumps({"n": 1}), "EventBusName": bus_name}
+
+        eb.put_events(Entries=[entry])
+        assert _wait_until(lambda: len(captured) >= 1)
+        assert captured[0]["headers"]["authorization"].startswith("Basic ")
+
+        conn_name = "qa-eb-apidest-deauth-conn"
+        assert eb.deauthorize_connection(
+            Name=conn_name)["ConnectionState"] == "DEAUTHORIZED"
+        assert eb.describe_connection(Name=conn_name).get("AuthParameters", {}) == {}
+
+        captured.clear()
+        eb.put_events(Entries=[entry])
+        # Give delivery time to run; nothing must arrive.
+        _wait_until(lambda: len(captured) >= 1, timeout=2.0)
+        assert captured == []
+    finally:
+        server.shutdown()
+
+
+def test_eventbridge_reauthorized_connection_delivers_again(eb):
+    """Deauthorizing is not a one-way door, and the not-AUTHORIZED delivery gate
+    must not be indistinguishable from breaking the connection for good.
+    UpdateConnection supplies fresh credentials and returns the connection to
+    AUTHORIZED, so the destination delivers again — presenting the *new*
+    credentials, not the ones cleared by the deauthorize."""
+    server, captured = _start_api_dest_capture_server()
+    try:
+        port = server.server_address[1]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "reauth",
+            f"http://127.0.0.1:{port}/hook",
+            "BASIC",
+            {"BasicAuthParameters": {"Username": "olduser", "Password": "oldpass"}},
+        )
+        entry = {"Source": source, "DetailType": "Ping",
+                 "Detail": json.dumps({"n": 1}), "EventBusName": bus_name}
+        conn_name = "qa-eb-apidest-reauth-conn"
+
+        eb.put_events(Entries=[entry])
+        assert _wait_until(lambda: len(captured) >= 1)
+        # base64("olduser:oldpass")
+        assert captured[0]["headers"]["authorization"] == "Basic b2xkdXNlcjpvbGRwYXNz"
+
+        eb.deauthorize_connection(Name=conn_name)
+        captured.clear()
+        eb.put_events(Entries=[entry])
+        _wait_until(lambda: len(captured) >= 1, timeout=2.0)
+        assert captured == []
+
+        eb.update_connection(
+            Name=conn_name,
+            AuthorizationType="BASIC",
+            AuthParameters={"BasicAuthParameters": {"Username": "newuser",
+                                                    "Password": "newpass"}},
+        )
+        assert eb.describe_connection(Name=conn_name)["ConnectionState"] == "AUTHORIZED"
+
+        captured.clear()
+        eb.put_events(Entries=[entry])
+        assert _wait_until(lambda: len(captured) >= 1)
+        # base64("newuser:newpass") — the re-authorized credentials, not the old ones
+        assert captured[0]["headers"]["authorization"] == "Basic bmV3dXNlcjpuZXdwYXNz"
+    finally:
+        server.shutdown()
+
+
+def test_eventbridge_api_destination_rejects_unknown_http_method(eb):
+    """HttpMethod rides the outbound request line, and AWS models it as an
+    enum. It was stored unvalidated and silently became POST at delivery."""
+    conn = eb.create_connection(
+        Name=f"qa-eb-method-conn-{_uuid_mod.uuid4().hex[:8]}",
+        AuthorizationType="API_KEY",
+        AuthParameters={"ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "k"}},
+    )
+    with pytest.raises(ClientError) as exc:
+        eb.create_api_destination(
+            Name=f"qa-eb-method-{_uuid_mod.uuid4().hex[:8]}",
+            ConnectionArn=conn["ConnectionArn"],
+            InvocationEndpoint="https://api.example.test/hook",
+            HttpMethod="TRACE",
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert "httpMethod" in exc.value.response["Error"]["Message"]
+
+    name = f"qa-eb-method-ok-{_uuid_mod.uuid4().hex[:8]}"
+    eb.create_api_destination(
+        Name=name, ConnectionArn=conn["ConnectionArn"],
+        InvocationEndpoint="https://api.example.test/hook", HttpMethod="PATCH",
+    )
+    with pytest.raises(ClientError):
+        eb.update_api_destination(Name=name, HttpMethod="TRACE")
+    assert eb.describe_api_destination(Name=name)["HttpMethod"] == "PATCH"
+
+
+def test_eventbridge_connection_rejects_unknown_authorization_type(eb):
+    """AuthorizationType decides which credentials are attached, and an
+    unrecognized one matched nothing — the connection was created and then
+    delivered with no credentials at all, silently."""
+    with pytest.raises(ClientError) as exc:
+        eb.create_connection(
+            Name=f"qa-eb-authtype-{_uuid_mod.uuid4().hex[:8]}",
+            AuthorizationType="basic",
+            AuthParameters={"BasicAuthParameters": {"Username": "u", "Password": "p"}},
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert "authorizationType" in exc.value.response["Error"]["Message"]
+
+    name = f"qa-eb-authtype-ok-{_uuid_mod.uuid4().hex[:8]}"
+    eb.create_connection(
+        Name=name, AuthorizationType="BASIC",
+        AuthParameters={"BasicAuthParameters": {"Username": "u", "Password": "p"}},
+    )
+    with pytest.raises(ClientError):
+        eb.update_connection(Name=name, AuthorizationType="Api_Key")
+    assert eb.describe_connection(Name=name)["AuthorizationType"] == "BASIC"
+
+
+def test_eventbridge_connection_non_object_auth_parameters_still_succeeds(eb):
+    """The endpoint check reaches into AuthParameters, which is raw caller
+    JSON. A non-object value was stored verbatim and answered 200 before this
+    validation existed, and it must still — the guard has to hold at the
+    handler, not only in the helper it calls. botocore strict-validates the
+    shape, so call via raw HTTP."""
+    import urllib.request as _r
+
+    name = f"qa-eb-authparams-wire-{_uuid_mod.uuid4().hex[:8]}"
+
+    def _post(target, payload):
+        req = _r.Request(
+            f"{_ENDPOINT}/",
+            data=json.dumps(payload).encode(),
+            headers={
+                "X-Amz-Target": f"AWSEvents.{target}",
+                "Content-Type": "application/x-amz-json-1.1",
+                "Authorization": ("AWS4-HMAC-SHA256 Credential=test/20260101/"
+                                  "us-east-1/events/aws4_request, SignedHeaders=, Signature=x"),
+            },
+        )
+        with _r.urlopen(req) as resp:
+            return resp.status
+
+    assert _post("CreateConnection", {
+        "Name": name, "AuthorizationType": "API_KEY", "AuthParameters": "oops",
+    }) == 200
+    assert _post("UpdateConnection", {"Name": name, "AuthParameters": ["oops"]}) == 200
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: _http_open / _finalize_api_dest_headers /
+#             _validate_oauth_authorization_endpoint
+# ---------------------------------------------------------------------------
+
+def test_eventbridge_api_dest_headers_match_reserved_names_trimmed():
+    """A padded spelling must not slip past the reserved-header filter.
+    ``"User-Agent "`` is not in the removed set, and http.client only rejects
+    whitespace as the FIRST character of a name, so an untrimmed comparison
+    puts an attacker-chosen User-Agent on the wire beside EventBridge's own."""
+    out = _eb._finalize_api_dest_headers({
+        "User-Agent ": "pwned-agent", "Host\t": "pwned-host", "X-Keep": "kept",
+    })
+    assert out["User-Agent"] == "Amazon/EventBridge/ApiDestinations"
+    assert out["X-Keep"] == "kept"
+    assert all(k == k.strip() for k in out)          # no padded spelling survives
+    assert "pwned-agent" not in out.values()
+    assert "pwned-host" not in out.values()
+
+
+def test_eventbridge_http_open_refuses_non_http_scheme():
+    """The opener-level scheme guard is the half of this that survives a state
+    restore: load_state repopulates api_destinations and connections verbatim,
+    so a record written before the API validation existed never revalidates.
+    Create/Update now reject these, which is exactly why no black-box test can
+    reach the guard — it is pinned in-process instead."""
+    import urllib.request
+
+    for bad in ("file:///etc/passwd", "ftp://127.0.0.1/token", "gopher://127.0.0.1/1"):
+        with pytest.raises(ValueError, match="unsupported URL scheme"):
+            _eb._http_open(urllib.request.Request(bad))
+
+
+def test_eventbridge_oauth_token_request_uses_the_guarded_opener():
+    """The token POST carries the client_id/client_secret, so it must ride the
+    same guarded opener as delivery rather than a bare urlopen — otherwise the
+    no-redirect handler and the scheme guard both fall off the one request
+    guaranteed to be carrying credentials. A non-http(s) AuthorizationEndpoint
+    is the cheap proof of routing: a bare urlopen would happily read the file
+    and fail later, in the JSON decode."""
+    with pytest.raises(ValueError, match="unsupported URL scheme"):
+        _eb._fetch_oauth_token({
+            "AuthorizationEndpoint": "file:///etc/passwd",
+            "ClientParameters": {"ClientID": "id", "ClientSecret": "secret"},
+        })
+
+
+def test_eventbridge_oauth_endpoint_check_tolerates_non_dict_auth_parameters():
+    """AuthParameters is raw caller JSON and botocore rejects a non-object
+    shape client-side, so only a hand-rolled request reaches this check. It
+    must stay a no-op there: v1.4.15 stored the value verbatim and answered
+    200, and adding validation must not turn that into a 500."""
+    for junk in (None, "oops", ["x"], 5, True, ""):
+        assert _eb._validate_oauth_authorization_endpoint(junk) is None

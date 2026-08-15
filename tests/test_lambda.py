@@ -3388,6 +3388,245 @@ def test_lambda_layer_delete_idempotent(lam):
     """Deleting a nonexistent version should not error."""
     lam.delete_layer_version(LayerName="no-such-layer-del", VersionNumber=999)
 
+
+def _publish_perm_layer(lam, layer_name):
+    """Publish a one-file layer and return its version number."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("perm.py", "")
+    return lam.publish_layer_version(
+        LayerName=layer_name,
+        Content={"ZipFile": buf.getvalue()},
+    )["Version"]
+
+
+def test_lambda_layer_version_permission_roundtrip(lam):
+    """Add → get → remove, with the policy document in AWS's shape.
+
+    An account principal is reported as that account's root user ARN, and the
+    statement's Resource is the layer version ARN.
+    """
+    layer_name = "perm-roundtrip-layer"
+    version = _publish_perm_layer(lam, layer_name)
+
+    added = lam.add_layer_version_permission(
+        LayerName=layer_name,
+        VersionNumber=version,
+        StatementId="xaccount",
+        Action="lambda:GetLayerVersion",
+        Principal="210987654321",
+    )
+    assert added["RevisionId"]
+
+    got = lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)
+    policy = json.loads(got["Policy"])
+    assert policy["Version"] == "2012-10-17"
+    assert len(policy["Statement"]) == 1
+    statement = policy["Statement"][0]
+    assert statement["Sid"] == "xaccount"
+    assert statement["Effect"] == "Allow"
+    assert statement["Action"] == "lambda:GetLayerVersion"
+    assert statement["Principal"] == {"AWS": "arn:aws:iam::210987654321:root"}
+    assert statement["Resource"].endswith(f":layer:{layer_name}:{version}")
+
+    # The revision id is the policy's, not a fresh value per read.
+    assert got["RevisionId"] == added["RevisionId"]
+    again = lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)
+    assert again["RevisionId"] == got["RevisionId"]
+
+    lam.remove_layer_version_permission(
+        LayerName=layer_name,
+        VersionNumber=version,
+        StatementId="xaccount",
+    )
+    with pytest.raises(ClientError) as exc:
+        lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_lambda_layer_version_permission_wildcard_principal(lam):
+    """A ``*`` principal stays the bare wildcard, and an OrganizationId
+    narrows it with an aws:PrincipalOrgID condition."""
+    layer_name = "perm-wildcard-layer"
+    version = _publish_perm_layer(lam, layer_name)
+
+    lam.add_layer_version_permission(
+        LayerName=layer_name,
+        VersionNumber=version,
+        StatementId="org-wide",
+        Action="lambda:GetLayerVersion",
+        Principal="*",
+        OrganizationId="o-a1b2c3d4e5",
+    )
+    policy = json.loads(
+        lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)["Policy"]
+    )
+    statement = policy["Statement"][0]
+    assert statement["Principal"] == "*"
+    assert statement["Condition"] == {"StringEquals": {"aws:PrincipalOrgID": "o-a1b2c3d4e5"}}
+
+
+def test_lambda_layer_version_permission_stale_revision_id(lam):
+    """A RevisionId that isn't the current one fails the call — on add and on
+    remove — leaving the policy untouched."""
+    layer_name = "perm-revision-layer"
+    version = _publish_perm_layer(lam, layer_name)
+
+    first = lam.add_layer_version_permission(
+        LayerName=layer_name,
+        VersionNumber=version,
+        StatementId="s1",
+        Action="lambda:GetLayerVersion",
+        Principal="*",
+    )
+    stale = first["RevisionId"]
+
+    second = lam.add_layer_version_permission(
+        LayerName=layer_name,
+        VersionNumber=version,
+        StatementId="s2",
+        Action="lambda:GetLayerVersion",
+        Principal="*",
+        RevisionId=stale,
+    )
+    assert second["RevisionId"] != stale
+
+    with pytest.raises(ClientError) as exc:
+        lam.add_layer_version_permission(
+            LayerName=layer_name,
+            VersionNumber=version,
+            StatementId="s3",
+            Action="lambda:GetLayerVersion",
+            Principal="*",
+            RevisionId=stale,
+        )
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailedException"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+
+    with pytest.raises(ClientError) as exc:
+        lam.remove_layer_version_permission(
+            LayerName=layer_name,
+            VersionNumber=version,
+            StatementId="s1",
+            RevisionId=stale,
+        )
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailedException"
+
+    policy = json.loads(
+        lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)["Policy"]
+    )
+    assert sorted(s["Sid"] for s in policy["Statement"]) == ["s1", "s2"]
+
+    # The current revision id is accepted.
+    current = lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)["RevisionId"]
+    lam.remove_layer_version_permission(
+        LayerName=layer_name,
+        VersionNumber=version,
+        StatementId="s1",
+        RevisionId=current,
+    )
+
+
+def test_lambda_layer_version_permission_not_found(lam):
+    """Unknown layer, unknown version, and unknown statement all 404."""
+    layer_name = "perm-404-layer"
+    version = _publish_perm_layer(lam, layer_name)
+
+    with pytest.raises(ClientError) as exc:
+        lam.get_layer_version_policy(LayerName="perm-404-no-such-layer", VersionNumber=1)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    with pytest.raises(ClientError) as exc:
+        lam.add_layer_version_permission(
+            LayerName=layer_name,
+            VersionNumber=version + 99,
+            StatementId="s1",
+            Action="lambda:GetLayerVersion",
+            Principal="*",
+        )
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    with pytest.raises(ClientError) as exc:
+        lam.remove_layer_version_permission(
+            LayerName=layer_name,
+            VersionNumber=version,
+            StatementId="never-added",
+        )
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_lambda_layer_version_permission_invalid_principal(lam):
+    """A principal that is neither an account id, ``*``, nor a root ARN is
+    rejected; an OrganizationId is only valid alongside ``*``."""
+    layer_name = "perm-bad-principal-layer"
+    version = _publish_perm_layer(lam, layer_name)
+
+    with pytest.raises(ClientError) as exc:
+        lam.add_layer_version_permission(
+            LayerName=layer_name,
+            VersionNumber=version,
+            StatementId="s1",
+            Action="lambda:GetLayerVersion",
+            Principal="not-an-account",
+        )
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+    with pytest.raises(ClientError) as exc:
+        lam.add_layer_version_permission(
+            LayerName=layer_name,
+            VersionNumber=version,
+            StatementId="s2",
+            Action="lambda:GetLayerVersion",
+            Principal="210987654321",
+            OrganizationId="o-a1b2c3d4e5",
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+
+    # The root-user ARN form the model allows is accepted.
+    lam.add_layer_version_permission(
+        LayerName=layer_name,
+        VersionNumber=version,
+        StatementId="s3",
+        Action="lambda:GetLayerVersion",
+        Principal="arn:aws:iam::210987654321:root",
+    )
+
+
+def test_lambda_layer_version_permission_survives_persistence_roundtrip(lambda_svc_isolated):
+    """A layer version's permission policy is part of the persisted state:
+    gone after the layers are cleared, back after restore_state."""
+    svc, _ = lambda_svc_isolated
+    original_layers = dict(svc._layers._data)
+    layer_name = "perm-persist-layer"
+
+    try:
+        svc._layers._data.clear()
+        status, _headers, _body = svc._publish_layer_version(layer_name, {"Content": {}})
+        assert status == 201
+
+        status, _headers, _body = svc._add_layer_version_permission(
+            layer_name,
+            1,
+            {"StatementId": "persisted", "Action": "lambda:GetLayerVersion", "Principal": "*"},
+        )
+        assert status == 201
+        revision_id = json.loads(_body)["RevisionId"]
+
+        state = svc.get_state()
+        svc._layers._data.clear()
+        status, _headers, _body = svc._get_layer_version_policy(layer_name, 1)
+        assert status == 404
+
+        svc.restore_state(state)
+        status, _headers, body = svc._get_layer_version_policy(layer_name, 1)
+        assert status == 200
+        restored = json.loads(body)
+        assert json.loads(restored["Policy"])["Statement"][0]["Sid"] == "persisted"
+        assert restored["RevisionId"] == revision_id
+    finally:
+        svc._layers._data.clear()
+        svc._layers._data.update(original_layers)
+
 def test_lambda_warm_worker_invalidation(lam):
     """Create function with code v1, invoke, update code to v2, invoke again — must see v2."""
     import io as _io
