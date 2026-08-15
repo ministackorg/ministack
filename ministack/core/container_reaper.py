@@ -19,6 +19,7 @@ that does not register is never reaped from here — silence means "unknown", no
 "garbage".
 """
 
+import concurrent.futures
 import logging
 import threading
 import time
@@ -162,7 +163,7 @@ def reap_all(docker_client, stop_timeout: int = 2) -> int:
     """
     if docker_client is None:
         return 0
-    seen, removed = set(), 0
+    seen, targets = set(), []
     for label in SERVICE_LABELS:
         try:
             containers = docker_client.containers.list(all=True, filters={"label": label})
@@ -170,14 +171,36 @@ def reap_all(docker_client, stop_timeout: int = 2) -> int:
             logger.debug("reap_all: listing %s failed: %s", label, exc)
             continue
         for c in containers:
-            if c.id in seen:
-                continue
-            seen.add(c.id)
-            try:
-                c.stop(timeout=stop_timeout)
-                c.remove(v=True)      # v=True: reclaim the anonymous volume too
-                removed += 1
-            except Exception:
-                continue
-    return removed
+            if c.id not in seen:
+                seen.add(c.id)
+                targets.append(c)
+    return drop_containers(targets, stop_timeout=stop_timeout)
+
+
+def drop_containers(containers, stop_timeout: int = 2, force: bool = False) -> int:
+    """Stop and remove containers concurrently. Returns how many went away.
+
+    Concurrent because ``stop`` is a per-container round trip that blocks until
+    the container actually dies — serially that is O(n) seconds of wall clock.
+    It matters because this runs on the ``/_ministack/reset`` path while the
+    reset lock is held, so every other request queues behind it. Measured: a
+    run that left 30 running ECS tasks took 54.4s serially, past the 45s the
+    caller was willing to wait. The daemon parallelises stops fine; the cap only
+    keeps a huge sweep from opening hundreds of sockets at once.
+    """
+    targets = [c for c in containers if c is not None]
+    if not targets:
+        return 0
+
+    def _drop(c):
+        try:
+            c.stop(timeout=stop_timeout)
+            c.remove(v=True, force=force)   # v=True: reclaim the anonymous volume too
+            return True
+        except Exception:
+            return False
+
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(16, len(targets)), thread_name_prefix="ministack-reap") as pool:
+        return sum(1 for ok in pool.map(_drop, targets) if ok)
 

@@ -1259,9 +1259,9 @@ class Worker:
             if reader.is_alive():
                 # Timeout — kill the worker process
                 logger.warning("Lambda %s timed out after %ds — killing worker", self.func_name, timeout)
-                if self._proc:
-                    self._proc.kill()
-                self._proc = None
+                proc, self._proc = self._proc, None
+                _signal(proc)
+                _collect(proc, time.monotonic() + _REAP_GRACE)
                 return {
                     "status": "error",
                     "error": f"Task timed out after {timeout}.00 seconds",
@@ -1275,21 +1275,90 @@ class Worker:
 
             response = result_box[0]
             if response.get("status") == "error":
-                if self._proc and self._proc.poll() is None:
-                    self._proc.terminate()
-                self._proc = None
+                proc, self._proc = self._proc, None
+                _signal(proc)
+                _collect(proc, time.monotonic() + _REAP_GRACE)
             response["cold_start"] = cold
             # Bounded drain — replaces the fixed 50ms sleep that was paid
             # by every warm invocation. Typical completion is 1–10ms.
             response["log"] = self._drain_stderr_bounded()
             return response
 
-    def kill(self):
-        if self._proc and self._proc.poll() is None:
-            self._proc.terminate()
-            self._proc = None
+    def _discard_tmpdir(self):
         if self._tmpdir and os.path.exists(self._tmpdir):
             shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def kill(self):
+        kill_workers([self])
+
+
+# Seconds a worker gets to exit on SIGTERM before it is SIGKILLed. Paid once per
+# *batch*, never once per worker — see kill_workers.
+_REAP_GRACE = 2.0
+
+
+def _signal(proc) -> None:
+    """Ask a worker subprocess to exit. Does not wait."""
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+    except Exception:
+        pass
+
+
+def _collect(proc, deadline: float) -> None:
+    """Wait for a signalled subprocess and reap it, escalating if it ignores SIGTERM.
+
+    Collecting is the point. Signalling alone leaves a zombie: ``subprocess``
+    only reaps an abandoned Popen lazily, when the *next* Popen is constructed,
+    so an **idle** server keeps every zombie it made. On a host that is invisible
+    — the count is small and something else is always spawning — but in a
+    container MiniStack is PID 1: the zombies are its own children, nothing else
+    will ever collect them, and they hold PID-table slots against the container's
+    pid limit. Measured: a 320-invocation burst left 244 zombies that survived
+    indefinitely while the server sat idle.
+
+    Warm-worker pooling is what made this reachable. One worker per function was
+    killed rarely; a pool of them is reaped by the hundred.
+    """
+    if proc is None:
+        return
+    try:
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except Exception:
+        try:
+            proc.kill()
+            proc.wait(timeout=0.5)
+        except Exception:
+            pass                # unkillable: leave it rather than block the caller
+
+
+def kill_workers(workers) -> None:
+    """Terminate and reap a batch of workers, paying the grace period once.
+
+    Two-phase on purpose. Signalling every worker first and only then waiting
+    makes a mass teardown cost ``_REAP_GRACE`` in total; doing it worker by
+    worker would cost ``n * _REAP_GRACE``, which on a pool built by a burst is
+    minutes — and ``reset()`` used to pay it holding the global worker lock.
+    """
+    workers = [w for w in workers if w is not None]
+    if not workers:
+        return
+    procs = []
+    for worker in workers:
+        proc, worker._proc = worker._proc, None
+        procs.append(proc)
+        _signal(proc)
+    deadline = time.monotonic() + _REAP_GRACE
+    for proc in procs:
+        _collect(proc, deadline)
+    for worker in workers:
+        try:
+            worker._discard_tmpdir()
+        except Exception:
+            pass
 
 
 def _worker_key(func_name: str, config: dict, qualifier: str) -> str:
@@ -1365,11 +1434,7 @@ def reap_idle_workers(ttl: float = None) -> int:
                 _workers[key] = keep
             else:
                 _workers.pop(key, None)
-    for worker in killed:
-        try:
-            worker.kill()
-        except Exception:
-            pass
+    kill_workers(killed)
     return len(killed)
 
 
@@ -1433,16 +1498,16 @@ def invalidate_worker(func_name: str, qualifier: str = None,
         return True
 
     with _lock:
-        to_remove = [k for k in _workers if _matches(k)]
-        for k in to_remove:
-            for worker in _workers.pop(k, []) or []:
-                worker.kill()
+        doomed = [w for k in [k for k in _workers if _matches(k)]
+                  for w in (_workers.pop(k, []) or [])]
+    # Outside the lock: terminating a batch takes as long as the slowest worker
+    # takes to exit, and holding the pool lock for that blocks every invocation.
+    kill_workers(doomed)
 
 
 def reset():
     """Terminate all warm workers, clean up temp dirs, and clear the pool."""
     with _lock:
-        for entries in list(_workers.values()):
-            for worker in entries:
-                worker.kill()
+        doomed = [w for entries in _workers.values() for w in entries]
         _workers.clear()
+    kill_workers(doomed)

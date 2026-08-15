@@ -2170,13 +2170,13 @@ def reset():
         # (echo, wget probes) leave Exited containers behind that otherwise
         # only the background reaper would remove.
         try:
-            for c in docker_client.containers.list(all=True, filters={"label": "ministack=ecs"}):
-                try:
-                    if c.status == "running":
-                        c.stop(timeout=2)
-                    c.remove(v=True, force=True)
-                except Exception:
-                    pass
+            from ministack.core import container_reaper
+            # Concurrently: reset holds the global reset lock, and stopping a
+            # run's worth of tasks one at a time is tens of seconds during which
+            # every other request is blocked.
+            container_reaper.drop_containers(
+                docker_client.containers.list(all=True, filters={"label": "ministack=ecs"}),
+                stop_timeout=2, force=True)
         except Exception:
             pass
     _clusters.clear()
