@@ -7,6 +7,12 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **SES v2 — email template CRUD and `SendEmail` with `Content.Template`** — the v2 `SendEmail` handler read only `Content.Simple` and `Content.Raw`, so a templated send was accepted with a `200` and a `MessageId` while the template was silently dropped, delivering an empty subject and body. `Content.Template` is now rendered through the same `{{placeholder}}` substitution v1 uses, from a stored template or from `TemplateContent` supplied inline, and a named template that doesn't exist fails the send with `NotFoundException` instead of delivering an empty email. `CreateEmailTemplate`, `GetEmailTemplate`, `UpdateEmailTemplate`, `DeleteEmailTemplate`, and `ListEmailTemplates` are served at `/v2/email/templates[/{TemplateName}]` over the shared v1 store, so a template created with `aws ses create-template` is sendable through `aws sesv2 send-email`. `ListEmailTemplates` paginates: `PageSize` accepts the documented 1–100 and defaults to 10, with an opaque `NextToken` returned only while further templates remain.
+
+### Fixed
+- **SES v2 — error responses carry `x-amzn-errortype`** — restJson1 resolves the error shape from that header, so without it SDKs surfaced a bare HTTP status instead of the modelled exception: boto3 reported `An error occurred (404)` rather than `NotFoundException`, and typed handling never matched on any SESv2 operation. The 1.3.24 sweep that added the header centrally in `error_response_json` reached `ses` but not `ses_v2`, which builds its error bodies itself; it is now set on all of them.
+
 ## [1.4.17] — 2026-08-14
 
 ### Added
