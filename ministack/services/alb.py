@@ -18,6 +18,7 @@ Supports:
 
 import asyncio
 import base64
+import contextlib
 import copy
 import fnmatch
 import json
@@ -33,6 +34,14 @@ from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("alb")
+
+# Two deadlines, not one. A single socket timeout covers the whole connection,
+# so it fires between SSE heartbeats and truncates the stream it was meant to
+# protect. ALB separates them: 10s to establish a connection to a target, then
+# an idle timeout (default 60s) on the established one.
+# https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-troubleshooting.html#http-504-issues
+TARGET_CONNECT_TIMEOUT = float(os.environ.get("ALB_TARGET_CONNECT_TIMEOUT_SECONDS", "10"))
+TARGET_IDLE_TIMEOUT = float(os.environ.get("ALB_TARGET_IDLE_TIMEOUT_SECONDS", "60"))
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 NS = "http://elasticloadbalancing.amazonaws.com/doc/2015-12-01/"
@@ -1295,6 +1304,14 @@ async def _invoke_lambda_target(function_ref, tg_arn, method, path, headers, bod
         return 200, {"Content-Type": "text/plain"}, raw
 
 
+async def _await_http_disconnect(receive) -> None:
+    """Resolve when the ASGI client goes away."""
+    while True:
+        message = await receive()
+        if message.get("type") == "http.disconnect":
+            return
+
+
 async def _proxy_http_target(target, tg, method, path, headers, body, query_params):
     """Forward a data-plane request to an instance/ip target over HTTP.
 
@@ -1306,14 +1323,13 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
     X-Amzn-Trace-Id are injected, target HTTP errors pass through, and
     connection failures surface as 502.
     """
-    import urllib.error
-    import urllib.request
+    import http.client
     from urllib.parse import urlencode
 
     host = str(target.get("Id", ""))
     port = int(target.get("Port") or tg.get("Port") or 80)
     qs = {k: (v[0] if isinstance(v, list) else v) for k, v in (query_params or {}).items()}
-    url = f"http://{host}:{port}{path}" + (f"?{urlencode(qs)}" if qs else "")
+    target_path = path + (f"?{urlencode(qs)}" if qs else "")
 
     hop_by_hop = {"host", "content-length", "connection", "transfer-encoding",
                   "accept-encoding"}
@@ -1338,40 +1354,67 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
     from ministack.core.responses import StreamingResponse
 
     def _open():
-        req = urllib.request.Request(url, data=data, method=method.upper(), headers=fwd)
+        conn = http.client.HTTPConnection(host, port, timeout=TARGET_CONNECT_TIMEOUT)
         try:
-            return urllib.request.urlopen(req, timeout=15), None
-        except urllib.error.HTTPError as e:
-            # HTTPError is readable, so error bodies take the same path.
-            return e, None
+            conn.request(method.upper(), target_path, body=data, headers=fwd)
+            resp = conn.getresponse()
         except Exception as e:
-            return None, e
+            with contextlib.suppress(Exception):
+                conn.close()
+            return None, None, e
+        # Headers are in, so the connect deadline has been met; the body gets the
+        # idle budget instead. http.client keeps the socket reachable, which is
+        # why this uses it rather than urllib — and 4xx/5xx arrive as ordinary
+        # responses, so target errors need no special case.
+        if conn.sock is not None:
+            conn.sock.settimeout(TARGET_IDLE_TIMEOUT)
+        return conn, resp, None
 
-    resp, err = await asyncio.to_thread(_open)
+    conn, resp, err = await asyncio.to_thread(_open)
     if resp is None:
         return (502, {"Content-Type": "application/json"},
                 json.dumps({"message": f"Target {host}:{port} connect error: {err}"}).encode())
 
     status, out_headers = resp.status, dict(resp.headers)
 
-    # read1 returns whatever has arrived rather than waiting for a full buffer,
-    # which is what keeps small-chunk streams (SSE) prompt. HTTPError bodies do
-    # not expose it, so fall back to read there.
-    read = getattr(resp, "read1", None) or resp.read
-
     async def _stream(send, receive):
+        # A client that goes away must not leave the upstream socket and its
+        # worker thread pinned for the rest of the response. One pool thread is
+        # held per in-flight stream, so this is what bounds them.
+        disconnected = asyncio.create_task(_await_http_disconnect(receive))
+        complete = False
         try:
             while True:
-                chunk = await asyncio.to_thread(read, 65536)
+                reader = asyncio.create_task(asyncio.to_thread(resp.read1, 65536))
+                done, _ = await asyncio.wait(
+                    {reader, disconnected}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if disconnected in done:
+                    reader.cancel()
+                    break
+                chunk = reader.result()
                 if not chunk:
+                    # read1 returns b"" where read() would raise IncompleteRead,
+                    # so a Content-Length body is only complete once the promised
+                    # bytes have arrived. A short chunked body raises instead and
+                    # is caught below.
+                    complete = not resp.length
                     break
                 await send({"type": "http.response.body", "body": chunk, "more_body": True})
+        except Exception:
+            logger.exception("ALB target %s:%s stream failed", host, port)
         finally:
-            try:
+            disconnected.cancel()
+            with contextlib.suppress(Exception):
                 resp.close()
-            except Exception:
-                pass
-            await send({"type": "http.response.body", "body": b"", "more_body": False})
+            with contextlib.suppress(Exception):
+                conn.close()
+            if complete:
+                # Only a complete body gets a terminator. Withholding it on
+                # truncation is the signal: the client sees an unfinished
+                # response instead of a short but well-formed one.
+                with contextlib.suppress(Exception):
+                    await send({"type": "http.response.body", "body": b"", "more_body": False})
 
     return status, out_headers, StreamingResponse(_stream)
 

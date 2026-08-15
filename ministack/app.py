@@ -1047,6 +1047,8 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
         "stepfunctions._SFN_WAIT_SCALE",
         "lambda_svc.LAMBDA_EXECUTOR",
         "cloudtrail._recording_enabled",
+        "alb.TARGET_CONNECT_TIMEOUT",
+        "alb.TARGET_IDLE_TIMEOUT",
     }
     try:
         config = json.loads(body) if body else {}

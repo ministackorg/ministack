@@ -904,6 +904,134 @@ def _start_fixed_body_server(body):
     return server, thread
 
 
+def _set_alb_config(**values):
+    """Set alb module config on the server via the runtime config endpoint."""
+    import urllib.request as _req
+
+    payload = json.dumps({f"alb.{k}": v for k, v in values.items()}).encode()
+    _req.urlopen(_req.Request(f"{_endpoint}/_ministack/config", data=payload, method="POST"))
+
+
+def _start_gapped_server(chunks, gap_before_index, gap):
+    """Chunked target that pauses `gap` seconds before one chunk."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            for i, chunk in enumerate(chunks):
+                if i == gap_before_index:
+                    time.sleep(gap)
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+                self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
+def _start_dying_chunked_server(chunk):
+    """Chunked target that sends one chunk then dies without the 0-length end.
+
+    Chunked is the framing where a premature close is invisible: there is no
+    declared length for the client to check, so a proxy that terminates the
+    body cleanly makes a truncated stream look finished.
+    """
+    import socket
+    import threading
+
+    sock = socket.socket()
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+
+    def _serve():
+        try:
+            conn, _ = sock.accept()
+            conn.recv(4096)
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                b"Transfer-Encoding: chunked\r\n\r\n"
+                b"%x\r\n%s\r\n" % (len(chunk), chunk)
+            )
+            conn.close()
+        except OSError:
+            pass
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+    return sock, thread
+
+
+@pytest.mark.serial
+def test_elbv2_dataplane_idle_gap_does_not_truncate_stream(elbv2):
+    """A quiet period longer than the connect timeout must not end the stream.
+
+    The connect deadline and the idle deadline are separate: one socket timeout
+    covering both fires between SSE heartbeats and silently truncates.
+    """
+    import urllib.request as _req
+
+    chunks = [b"data: a\n\n", b"data: b\n\n", b"data: c\n\n"]
+    _set_alb_config(TARGET_CONNECT_TIMEOUT=1.0, TARGET_IDLE_TIMEOUT=30.0)
+    server, thread = _start_gapped_server(chunks, gap_before_index=1, gap=2.0)
+    port = server.server_address[1]
+
+    lb_name = "dp-alb-gap"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", port)
+    try:
+        resp = _req.urlopen(_req.Request(f"{_endpoint}/_alb/{lb_name}/", method="GET"))
+        body = resp.read()
+        assert resp.status == 200
+        assert body == b"".join(chunks), (
+            f"stream truncated across the idle gap: got {body!r}"
+        )
+    finally:
+        _set_alb_config(TARGET_CONNECT_TIMEOUT=10.0, TARGET_IDLE_TIMEOUT=60.0)
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.serial
+def test_elbv2_dataplane_truncated_target_body_is_not_passed_off_as_complete(elbv2):
+    """A target that dies mid-body must not read as a short but valid response.
+
+    The proxy must withhold the terminating frame, otherwise a truncated
+    chunked stream reaches the client as a well-formed one and there is nothing
+    left for it to detect.
+    """
+    import urllib.request as _req
+
+    sock, thread = _start_dying_chunked_server(b"partial")
+    port = sock.getsockname()[1]
+
+    lb_name = "dp-alb-dying"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", port)
+    try:
+        resp = _req.urlopen(_req.Request(f"{_endpoint}/_alb/{lb_name}/", method="GET"))
+        with pytest.raises(Exception) as excinfo:
+            resp.read()
+        assert "IncompleteRead" in type(excinfo.value).__name__ or "Incomplete" in str(excinfo.value)
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        sock.close()
+        thread.join(timeout=5)
+
+
 @pytest.mark.serial
 def test_elbv2_dataplane_streams_target_response(elbv2):
     """A streaming target reaches the client as it produces, not at the end.
