@@ -296,6 +296,58 @@ def test_s3_put_zero_byte_chunked(s3):
     assert resp["Body"].read() == b""
     assert resp["ContentLength"] == 0
 
+def test_s3_put_repeated_content_encoding_header(s3):
+    """Repeated Content-Encoding lines mean one comma-joined value.
+
+    The AWS SDK for Java v2 puts the caller's encoding and the aws-chunked
+    marker on separate header lines, so reading only one of them strips the
+    caller's encoding along with the marker.
+    """
+    import http.client
+    from urllib.parse import urlparse
+    bucket = "intg-s3-repeated-ce"
+    s3.create_bucket(Bucket=bucket)
+
+    payload = b"body-bytes"
+    fake_sig = b"abc123"
+    chunked = (
+        f"{len(payload):x}".encode() + b";chunk-signature=" + fake_sig + b"\r\n" +
+        payload + b"\r\n" +
+        b"0;chunk-signature=" + fake_sig + b"\r\n\r\n"
+    )
+    parsed = urlparse(ENDPOINT)
+
+    # (key, the Content-Encoding lines sent, what must be stored)
+    cases = [
+        ("caller-first", ["gzip", "aws-chunked"], "gzip"),
+        ("marker-first", ["aws-chunked", "gzip"], "gzip"),
+        ("two-encodings", ["deflate", "gzip", "aws-chunked"], "deflate, gzip"),
+        ("marker-only", ["aws-chunked"], None),
+    ]
+    for key, lines, expected in cases:
+        conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 4566, timeout=10)
+        conn.putrequest("PUT", f"/{bucket}/{key}")
+        conn.putheader("Content-Length", str(len(chunked)))
+        conn.putheader("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+        conn.putheader(
+            "Authorization",
+            "AWS4-HMAC-SHA256 Credential=test/20240101/us-east-1/s3/aws4_request,"
+            " SignedHeaders=host, Signature=fake",
+        )
+        for line in lines:
+            conn.putheader("Content-Encoding", line)
+        conn.endheaders()
+        conn.send(chunked)
+        resp = conn.getresponse()
+        resp.read()
+        assert resp.status == 200, f"{key}: PUT returned {resp.status}"
+        conn.close()
+
+        head = s3.head_object(Bucket=bucket, Key=key)
+        assert head.get("ContentEncoding") == expected, key
+        # The chunk framing is still stripped from the body.
+        assert s3.get_object(Bucket=bucket, Key=key)["Body"].read() == payload, key
+
 def test_s3_head_object(s3):
     s3.create_bucket(Bucket="intg-s3-headobj")
     s3.put_object(

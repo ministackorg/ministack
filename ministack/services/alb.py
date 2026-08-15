@@ -18,12 +18,14 @@ Supports:
 
 import asyncio
 import base64
+import contextlib
 import copy
 import fnmatch
 import json
 import logging
 import os
 import random
+import socket
 import string
 import time
 from urllib.parse import parse_qs
@@ -33,6 +35,12 @@ from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("alb")
+
+# ALB uses two deadlines: connecting to a target, then idling on an established
+# connection.
+# https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-troubleshooting.html#http-504-issues
+TARGET_CONNECT_TIMEOUT = float(os.environ.get("ALB_TARGET_CONNECT_TIMEOUT_SECONDS", "10"))
+TARGET_IDLE_TIMEOUT = float(os.environ.get("ALB_TARGET_IDLE_TIMEOUT_SECONDS", "60"))
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 NS = "http://elasticloadbalancing.amazonaws.com/doc/2015-12-01/"
@@ -1295,6 +1303,14 @@ async def _invoke_lambda_target(function_ref, tg_arn, method, path, headers, bod
         return 200, {"Content-Type": "text/plain"}, raw
 
 
+async def _await_http_disconnect(receive) -> None:
+    """Resolve when the ASGI client goes away."""
+    while True:
+        message = await receive()
+        if message.get("type") == "http.disconnect":
+            return
+
+
 async def _proxy_http_target(target, tg, method, path, headers, body, query_params):
     """Forward a data-plane request to an instance/ip target over HTTP.
 
@@ -1306,14 +1322,13 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
     X-Amzn-Trace-Id are injected, target HTTP errors pass through, and
     connection failures surface as 502.
     """
-    import urllib.error
-    import urllib.request
+    import http.client
     from urllib.parse import urlencode
 
     host = str(target.get("Id", ""))
     port = int(target.get("Port") or tg.get("Port") or 80)
     qs = {k: (v[0] if isinstance(v, list) else v) for k, v in (query_params or {}).items()}
-    url = f"http://{host}:{port}{path}" + (f"?{urlencode(qs)}" if qs else "")
+    target_path = path + (f"?{urlencode(qs)}" if qs else "")
 
     hop_by_hop = {"host", "content-length", "connection", "transfer-encoding",
                   "accept-encoding"}
@@ -1328,18 +1343,71 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
 
     data = body if isinstance(body, (bytes, bytearray)) else (body.encode() if body else None)
 
-    def _do():
-        req = urllib.request.Request(url, data=data, method=method.upper(), headers=fwd)
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                return resp.status, dict(resp.headers), resp.read()
-        except urllib.error.HTTPError as e:
-            return e.code, dict(e.headers), e.read()
-        except Exception as e:
-            return (502, {"Content-Type": "application/json"},
-                    json.dumps({"message": f"Target {host}:{port} connect error: {e}"}).encode())
+    # Relay the body as it arrives and keep the target's framing, as AWS does.
+    # https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-troubleshooting.html#http-504-issues
+    from ministack.core.responses import StreamingResponse
 
-    return await asyncio.to_thread(_do)
+    def _open():
+        conn = http.client.HTTPConnection(host, port, timeout=TARGET_CONNECT_TIMEOUT)
+        try:
+            conn.connect()
+            sock = conn.sock
+            sock.settimeout(TARGET_IDLE_TIMEOUT)
+            conn.request(method.upper(), target_path, body=data, headers=fwd)
+            resp = conn.getresponse()
+        except Exception as e:
+            with contextlib.suppress(Exception):
+                conn.close()
+            return None, None, None, e
+        return conn, resp, sock, None
+
+    conn, resp, sock, err = await asyncio.to_thread(_open)
+    if resp is None:
+        return (502, {"Content-Type": "application/json"},
+                json.dumps({"message": f"Target {host}:{port} connect error: {err}"}).encode())
+
+    status, out_headers = resp.status, dict(resp.headers)
+
+    async def _stream(send, receive):
+        disconnected = asyncio.create_task(_await_http_disconnect(receive))
+        complete = False
+        try:
+            while True:
+                reader = asyncio.create_task(asyncio.to_thread(resp.read1, 65536))
+                done, _ = await asyncio.wait(
+                    {reader, disconnected}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if disconnected in done:
+                    reader.cancel()
+                    break
+                chunk = reader.result()
+                if not chunk:
+                    # read1 returns b"" where read() would raise IncompleteRead.
+                    complete = not resp.length
+                    break
+                await send({"type": "http.response.body", "body": chunk, "more_body": True})
+        except Exception:
+            logger.exception("ALB target %s:%s stream failed", host, port)
+        finally:
+            disconnected.cancel()
+
+            with contextlib.suppress(Exception):
+                sock.shutdown(socket.SHUT_RDWR)
+
+            def _close():
+                with contextlib.suppress(Exception):
+                    resp.close()
+                with contextlib.suppress(Exception):
+                    conn.close()
+
+            with contextlib.suppress(RuntimeError):
+                asyncio.get_running_loop().run_in_executor(None, _close)
+            if complete:
+                # Withholding the terminator is what marks a truncated body.
+                with contextlib.suppress(Exception):
+                    await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    return status, out_headers, StreamingResponse(_stream)
 
 
 # ---------------------------------------------------------------------------

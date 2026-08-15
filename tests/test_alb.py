@@ -852,6 +852,287 @@ def test_elbv2_dataplane_forward_ip_target(elbv2):
         _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
 
 
+def _start_chunked_server(chunks, delay):
+    """Serve `chunks` with `delay` seconds between them and no Content-Length."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            for i, chunk in enumerate(chunks):
+                if i:
+                    time.sleep(delay)
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+                self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
+def _start_fixed_body_server(body):
+    """Serve `body` in one shot with a Content-Length."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
+def _set_alb_config(**values):
+    """Set alb module config on the server via the runtime config endpoint."""
+    import urllib.request as _req
+
+    payload = json.dumps({f"alb.{k}": v for k, v in values.items()}).encode()
+    _req.urlopen(_req.Request(f"{_endpoint}/_ministack/config", data=payload, method="POST"))
+
+
+def _start_dying_chunked_server(chunk):
+    """Chunked target that sends one chunk then dies without the 0-length end.
+
+    Chunked is the framing where a premature close is invisible: there is no
+    declared length for the client to check, so a proxy that terminates the
+    body cleanly makes a truncated stream look finished.
+    """
+    import socket
+    import threading
+
+    sock = socket.socket()
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+
+    def _serve():
+        try:
+            conn, _ = sock.accept()
+            conn.recv(4096)
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                b"Transfer-Encoding: chunked\r\n\r\n"
+                b"%x\r\n%s\r\n" % (len(chunk), chunk)
+            )
+            conn.close()
+        except OSError:
+            pass
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+    return sock, thread
+
+
+@pytest.mark.serial
+def test_elbv2_dataplane_truncated_target_body_is_not_passed_off_as_complete(elbv2):
+    """A target that dies mid-body must not read as a short but valid response.
+
+    The proxy must withhold the terminating frame, otherwise a truncated
+    chunked stream reaches the client as a well-formed one and there is nothing
+    left for it to detect.
+    """
+    import urllib.request as _req
+
+    sock, thread = _start_dying_chunked_server(b"partial")
+    port = sock.getsockname()[1]
+
+    lb_name = "dp-alb-dying"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", port)
+    try:
+        resp = _req.urlopen(_req.Request(f"{_endpoint}/_alb/{lb_name}/", method="GET"))
+        with pytest.raises(Exception) as excinfo:
+            resp.read()
+        assert "IncompleteRead" in type(excinfo.value).__name__ or "Incomplete" in str(excinfo.value)
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        sock.close()
+        thread.join(timeout=5)
+
+
+def _start_raw_server(script):
+    """Serve one connection by running `script(conn)` on a raw socket."""
+    import socket as _socket
+    import threading
+
+    sock = _socket.socket()
+    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+
+    def _serve():
+        try:
+            conn, _ = sock.accept()
+            conn.recv(4096)
+            script(conn)
+            conn.close()
+        except OSError:
+            pass
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+    return sock, thread
+
+
+@pytest.mark.serial
+def test_elbv2_dataplane_connection_close_target_gets_the_idle_timeout(elbv2):
+    """A `Connection: close` target must be bounded by the idle timeout too.
+
+    http.client drops conn.sock for any will_close response, so a timeout set
+    after getresponse() silently never lands and the connect deadline governs
+    the whole stream.
+    """
+    import urllib.request as _req
+
+    def _script(conn):
+        conn.sendall(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+            b"Connection: close\r\n\r\ndata: a\n\n"
+        )
+        time.sleep(3.0)
+        conn.sendall(b"data: b\n\n")
+
+    sock, thread = _start_raw_server(_script)
+    port = sock.getsockname()[1]
+
+    lb_name = "dp-alb-close"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", port)
+    try:
+        _set_alb_config(TARGET_CONNECT_TIMEOUT=1.0, TARGET_IDLE_TIMEOUT=30.0)
+        body = _req.urlopen(_req.Request(f"{_endpoint}/_alb/{lb_name}/", method="GET")).read()
+        assert body.count(b"data:") == 2, f"stream cut short at the connect deadline: {body!r}"
+    finally:
+        _set_alb_config(TARGET_CONNECT_TIMEOUT=10.0, TARGET_IDLE_TIMEOUT=60.0)
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        sock.close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.serial
+def test_elbv2_dataplane_slow_target_headers_are_not_a_connect_failure(elbv2):
+    """A target slow to send headers is idle, not unreachable.
+
+    The connect deadline covers establishing the connection; waiting on the
+    response belongs to the idle budget.
+    """
+    import urllib.request as _req
+
+    def _script(conn):
+        time.sleep(3.0)
+        conn.sendall(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+        )
+
+    sock, thread = _start_raw_server(_script)
+    port = sock.getsockname()[1]
+
+    lb_name = "dp-alb-slowhdr"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", port)
+    try:
+        _set_alb_config(TARGET_CONNECT_TIMEOUT=1.0, TARGET_IDLE_TIMEOUT=30.0)
+        resp = _req.urlopen(_req.Request(f"{_endpoint}/_alb/{lb_name}/", method="GET"))
+        assert resp.status == 200
+        assert resp.read() == b"hello"
+    finally:
+        _set_alb_config(TARGET_CONNECT_TIMEOUT=10.0, TARGET_IDLE_TIMEOUT=60.0)
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        sock.close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.serial
+def test_elbv2_dataplane_streams_target_response(elbv2):
+    """A streaming target reaches the client as it produces, not at the end.
+
+    Four chunks 0.25s apart: buffering makes the first byte land with the last
+    one, so first-byte time would equal total time.
+    """
+    import urllib.request as _req
+
+    chunks = [b"chunk-%d" % i for i in range(4)]
+    delay = 0.25
+    server, thread = _start_chunked_server(chunks, delay)
+    port = server.server_address[1]
+
+    lb_name = "dp-alb-stream"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", port)
+    try:
+        started = time.monotonic()
+        resp = _req.urlopen(_req.Request(f"{_endpoint}/_alb/{lb_name}/", method="GET"))
+        first = resp.read(len(chunks[0]))
+        first_byte_at = time.monotonic() - started
+        rest = resp.read()
+        total_at = time.monotonic() - started
+
+        assert resp.status == 200
+        assert first + rest == b"".join(chunks)
+        # Three inter-chunk gaps, so the body spans ~0.75s. Half of that is a
+        # wide margin against scheduling noise while still failing outright if
+        # the response is buffered.
+        assert first_byte_at < total_at - (delay * 3) / 2, (
+            f"first byte at {first_byte_at:.3f}s, complete at {total_at:.3f}s — response was buffered"
+        )
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.serial
+def test_elbv2_dataplane_non_streaming_body_is_intact(elbv2):
+    """A plain Content-Length response survives the read loop unchanged.
+
+    The body is larger than one read so a truncating or mis-ordered loop shows
+    up as a length or content mismatch. The framing is asserted too: AWS ALB
+    passes the target's Content-Length through rather than re-chunking, so a
+    fixed-length target must not arrive chunked.
+    """
+    import urllib.request as _req
+
+    body = bytes(range(256)) * 1024  # 256 KiB, spans several reads
+    server, thread = _start_fixed_body_server(body)
+    port = server.server_address[1]
+
+    lb_name = "dp-alb-fixed"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", port)
+    try:
+        resp = _req.urlopen(_req.Request(f"{_endpoint}/_alb/{lb_name}/", method="GET"))
+        received = resp.read()
+        assert resp.status == 200
+        assert resp.headers.get("Content-Type") == "application/octet-stream"
+        assert resp.headers.get("Content-Length") == str(len(body))
+        assert resp.headers.get("Transfer-Encoding") is None
+        assert len(received) == len(body)
+        assert received == body
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 @pytest.mark.serial
 def test_elbv2_dataplane_forward_instance_target_hostname(elbv2):
     """Instance targets resolve the Id as a hostname (no EC2 metadata in an
