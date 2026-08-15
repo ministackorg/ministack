@@ -589,10 +589,11 @@ async def _send_response(send, status, headers, body):
 async def _send_streaming_response(send, receive, status, headers, streaming):
     """Hold an HTTP response open and stream body chunks until the runner ends.
 
-    Used by CloudWatch Logs ``StartLiveTail`` (and any future long-lived
-    eventstream). Omits ``Content-Length`` so the ASGI server can chunk.
+    Used by CloudWatch Logs ``StartLiveTail`` and by the ALB data plane. A
+    handler that knows the length keeps ``Content-Length``, so a proxied
+    response keeps the framing its target chose; long-lived eventstreams set
+    none and the ASGI server chunks those.
     """
-    headers = {k: v for k, v in headers.items() if k.lower() != "content-length"}
     await send(
         {
             "type": "http.response.start",
@@ -1090,6 +1091,8 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
         "stepfunctions._SFN_WAIT_SCALE",
         "lambda_svc.LAMBDA_EXECUTOR",
         "cloudtrail._recording_enabled",
+        "alb.TARGET_CONNECT_TIMEOUT",
+        "alb.TARGET_IDLE_TIMEOUT",
     }
     try:
         config = json.loads(body) if body else {}
@@ -1934,10 +1937,21 @@ async def app(scope, receive, send):
 
     headers = {}
     for name, value in scope.get("headers", []):
+        key = name.decode("latin-1").lower()
         try:
-            headers[name.decode("latin-1").lower()] = value.decode("utf-8")
+            decoded = value.decode("utf-8")
         except UnicodeDecodeError:
-            headers[name.decode("latin-1").lower()] = value.decode("latin-1")
+            decoded = value.decode("latin-1")
+        if key in headers:
+            # A field repeated across lines carries the same meaning as one
+            # comma-joined value (RFC 9110 5.2), and dropping either line
+            # loses data: the AWS SDK for Java v2 sends the caller's
+            # Content-Encoding and aws-chunked on separate lines, so keeping
+            # only the last one strips the caller's encoding along with the
+            # chunking marker. Cookie rejoins with "; " (RFC 9113 8.2.3).
+            headers[key] += ("; " if key == "cookie" else ", ") + decoded
+        else:
+            headers[key] = decoded
 
     request_id = str(uuid.uuid4())
 
