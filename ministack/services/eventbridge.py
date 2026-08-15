@@ -30,6 +30,9 @@ import os
 import re
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 
 from ministack.core.arn import ArnParseError, parse_arn
@@ -1449,6 +1452,9 @@ _API_DEST_FIXED_HEADERS = {
     "Connection": "close",
 }
 _API_DEST_DEFAULT_CONTENT_TYPE = "application/json; charset=utf-8"
+# Same 1 MiB ceiling the Range header above imposes on a delivery response,
+# applied to the OAuth token response — which this emulator does read.
+_MAX_OAUTH_RESPONSE_BYTES = 1048576
 
 # Real EventBridge removes these headers from API destination requests, so
 # connection/target parameters cannot smuggle them in (transport-owned headers
@@ -1462,6 +1468,35 @@ _API_DEST_REMOVED_HEADERS = {
     "proxy-authorization", "range", "referer", "te", "trailer",
     "transfer-encoding", "user-agent", "upgrade", "via", "warning",
 }
+
+
+class _NoFollowRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow HTTP redirects. urllib preserves the Authorization header
+    across a cross-host 3xx hop, which would leak a connection's credentials to
+    the redirect target. Real EventBridge does not follow redirects — a 3xx is
+    a (non-retryable) delivery failure — so declining to redirect lets urllib's
+    default error handler surface the 3xx as an ``HTTPError``, which the
+    delivery path reports as that (non-retryable) status code."""
+
+    def redirect_request(self, *_args, **_kwargs):
+        return None
+
+
+_api_dest_opener = urllib.request.build_opener(_NoFollowRedirect())
+
+
+def _http_open(req: urllib.request.Request, timeout: int = 5):
+    """Open one outbound API-destination / OAuth request without following
+    redirects and without honoring non-HTTP(S) schemes, so a caller-controlled
+    endpoint cannot turn a delivery into a ``file://`` read. A scheme guard, not
+    a network guard: delivering to ``127.0.0.1`` is the normal local case, so
+    private, loopback, and link-local hosts stay reachable over http(s). The
+    5-second default is AWS parity — API destination requests have a maximum
+    client execution timeout of 5 seconds."""
+    scheme = urllib.parse.urlsplit(req.full_url).scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(f"unsupported URL scheme for API destination request: {scheme or '(none)'}")
+    return _api_dest_opener.open(req, timeout=timeout)
 
 
 def _connection_params_map(params) -> dict:
@@ -1482,8 +1517,6 @@ def _apply_path_parameters(url: str, values) -> str:
     EventBridge."""
     if not values:
         return url
-    import urllib.parse
-
     parsed = urllib.parse.urlsplit(url)
     path = parsed.path
     for value in values:
@@ -1496,8 +1529,6 @@ def _apply_path_parameters(url: str, values) -> str:
 def _merge_query(url: str, params: dict) -> str:
     if not params:
         return url
-    import urllib.parse
-
     parsed = urllib.parse.urlsplit(url)
     query = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
     query.update(params)
@@ -1530,9 +1561,6 @@ def _fetch_oauth_token(oauth: dict) -> dict:
     response. ``grant_type`` defaults to ``client_credentials`` when
     OAuthHttpParameters does not set one — AWS's own examples pass it
     explicitly through body parameters."""
-    import urllib.parse
-    import urllib.request
-
     method = (oauth.get("HttpMethod") or "POST").upper()
     client = oauth.get("ClientParameters") or {}
     http_params = oauth.get("OAuthHttpParameters") or {}
@@ -1554,8 +1582,13 @@ def _fetch_oauth_token(oauth: dict) -> dict:
         data = urllib.parse.urlencode(form).encode("utf-8")
         headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=5) as resp:
-        token = json.loads(resp.read().decode("utf-8"))
+    with _http_open(req) as resp:
+        # Bounded read: the authorization endpoint is caller-supplied, and an
+        # unbounded read of whatever it returns is a memory hazard on a delivery
+        # thread. 1 MiB is EventBridge's own ceiling for an API destination
+        # response (the fixed "Range: bytes=0-1048575" header); a token document
+        # that large is not one.
+        token = json.loads(resp.read(_MAX_OAUTH_RESPONSE_BYTES).decode("utf-8"))
     token_type = token.get("token_type") or "Bearer"
     if token_type.lower() == "bearer":
         token_type = "Bearer"
@@ -1617,6 +1650,20 @@ def _connection_auth_headers(conn: dict, token_key, force_refresh: bool = False)
     return {}
 
 
+def _finalize_api_dest_headers(headers: dict) -> dict:
+    """Drop the headers real EventBridge strips from API destination requests
+    and stamp its non-overridable ones. Applied after *every* merge — target
+    and connection parameters first, then the connection auth headers — so no
+    configured name can win, e.g. an ApiKeyName of ``User-Agent``/``Host``.
+    Names are matched trimmed, because ``"User-Agent "`` is not in the removed
+    set but is a legal header name to http.client, which only rejects leading
+    whitespace — so the padded spelling would ride out alongside the real one."""
+    out = {k.strip(): v for k, v in headers.items()
+           if k.strip().lower() not in _API_DEST_REMOVED_HEADERS}
+    out.update(_API_DEST_FIXED_HEADERS)
+    return out
+
+
 def _build_api_destination_request(dest: dict, conn: dict, target_http_params: dict, payload: str) -> dict:
     invocation = (conn.get("AuthParameters") or {}).get("InvocationHttpParameters") or {}
     conn_headers = _connection_params_map(invocation.get("HeaderParameters"))
@@ -1635,10 +1682,9 @@ def _build_api_destination_request(dest: dict, conn: dict, target_http_params: d
     url = _merge_query(url, query)
     body = _merge_body_parameters(payload, conn_body)
 
-    headers = {k: v for k, v in headers.items() if k.lower() not in _API_DEST_REMOVED_HEADERS}
+    headers = _finalize_api_dest_headers(headers)
     if not any(k.lower() == "content-type" for k in headers):
         headers["Content-Type"] = _API_DEST_DEFAULT_CONTENT_TYPE
-    headers.update(_API_DEST_FIXED_HEADERS)
 
     return {
         "url": url,
@@ -1651,13 +1697,9 @@ def _build_api_destination_request(dest: dict, conn: dict, target_http_params: d
 def _api_destination_send_sync(request: dict, auth_headers: dict) -> int:
     """Blocking HTTP send for one API destination delivery. Runs on a worker
     thread so the event loop stays unblocked; stdlib only (see the SNS HTTP
-    delivery note — aiohttp is not a declared dependency). The 5-second timeout
-    is AWS parity: API destination requests have a maximum client execution
-    timeout of 5 seconds."""
-    import urllib.error
-    import urllib.request
-
-    headers = {**request["headers"], **auth_headers}
+    delivery note — aiohttp is not a declared dependency). ``_http_open``
+    carries the AWS-parity 5-second client execution timeout."""
+    headers = _finalize_api_dest_headers({**request["headers"], **auth_headers})
     body = request["body"]
     req = urllib.request.Request(
         request["url"],
@@ -1666,7 +1708,7 @@ def _api_destination_send_sync(request: dict, auth_headers: dict) -> int:
         method=request["method"],
     )
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with _http_open(req) as resp:
             return resp.status
     except urllib.error.HTTPError as exc:
         return exc.code
@@ -1727,6 +1769,16 @@ def _dispatch_to_api_destination(spec, payload, target):
     if conn is None:
         logger.warning(
             "EventBridge → API destination %s: connection %s not found", name, conn_name or "<unset>"
+        )
+        return
+    if conn.get("ConnectionState") != "AUTHORIZED":
+        # The mirror of the ApiDestinationState check above. DeauthorizeConnection
+        # already clears the stored credentials, but a connection restored from
+        # persisted state can be DEAUTHORIZED with parameters still attached — and
+        # delivering unauthenticated is not a better outcome than not delivering.
+        logger.warning(
+            "EventBridge → API destination %s: connection %s is %s; not invoked",
+            name, conn_name, conn.get("ConnectionState"),
         )
         return
     # InvocationRateLimitPerSecond is accepted at CreateApiDestination but not
@@ -2284,10 +2336,92 @@ def _remove_permission(data):
 # Connections
 # ---------------------------------------------------------------------------
 
+# An http(s) URL with a non-empty authority. Schemes are case-insensitive per
+# RFC 3986 — "HTTPS://host" is the same endpoint urllib would dial, so the API
+# must not reject what the outbound opener accepts. Control characters and
+# spaces are rejected separately: urlsplit strips CR/LF/TAB before it reports a
+# hostname (bpo-43882), so the pattern alone would pass them through.
+_HTTP_ENDPOINT_RE = re.compile(r"^https?://[^/?#\s]+", re.IGNORECASE)
+_ENDPOINT_CTL_RE = re.compile(r"[\x00-\x20\x7f]")
+
+# The other two caller-supplied values that ride the outbound request: the
+# method goes on the request line, and the authorization type decides which
+# credentials are attached. Both are enums on the API model, so an unrecognized
+# value is a 400 on AWS — here it used to be stored and then silently mean
+# "send no credentials" or "POST".
+_API_DEST_HTTP_METHODS = ("DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT")
+_CONNECTION_AUTH_TYPES = ("API_KEY", "BASIC", "OAUTH_CLIENT_CREDENTIALS")
+
+
+def _validate_enum(value, allowed, param: str):
+    """Reject a value outside an API-model enum, in the shape AWS's own
+    validator emits. Absent is not invalid — required-ness is checked by the
+    caller that needs it."""
+    if value is None or value in allowed:
+        return None
+    return error_response_json(
+        "ValidationException",
+        f"1 validation error detected: Value '{value}' at '{param}' failed to satisfy "
+        f"constraint: Member must satisfy enum value set: [{', '.join(allowed)}]",
+        400,
+    )
+
+
+def _validate_http_endpoint(endpoint, param: str):
+    """Reject a caller-supplied endpoint that is not a dialable http(s) URL, as
+    real AWS does at CreateApiDestination / CreateConnection. Keeping non-http
+    schemes out of stored state also keeps them off the outbound opener —
+    defense in depth with ``_http_open``'s scheme guard, which is the backstop
+    for records restored from persistence. "Dialable" is the whole point, so a
+    non-empty authority is not sufficient: ``http://@`` and ``http://:80`` carry
+    no host, and ``http://ho\\nst/x`` reaches the connect call as something the
+    caller never wrote."""
+    ok = (
+        isinstance(endpoint, str)
+        and _HTTP_ENDPOINT_RE.match(endpoint) is not None
+        and _ENDPOINT_CTL_RE.search(endpoint) is None
+    )
+    if ok:
+        try:
+            ok = bool(urllib.parse.urlsplit(endpoint).hostname)
+        except ValueError:
+            ok = False   # malformed authority, e.g. an unclosed IPv6 bracket
+    if not ok:
+        return error_response_json(
+            "ValidationException",
+            f"Parameter {param} is not valid. "
+            "Reason: Must be an http:// or https:// endpoint.",
+            400,
+        )
+    return None
+
+
+def _validate_oauth_authorization_endpoint(auth_params):
+    """The OAuth AuthorizationEndpoint is the second caller-controlled URL on
+    this path, and the one the client_id/client_secret are POSTed to — so it
+    gets the same http(s) check as an API destination's InvocationEndpoint
+    rather than only failing (silently, on a delivery thread) at token time.
+
+    ``auth_params`` is raw caller JSON, so it is type-checked rather than
+    dereferenced: CreateConnection stored a non-object AuthParameters verbatim
+    and answered 200, and a validation step must not turn that into a 500."""
+    oauth = auth_params.get("OAuthParameters") if isinstance(auth_params, dict) else None
+    if not isinstance(oauth, dict) or "AuthorizationEndpoint" not in oauth:
+        return None
+    return _validate_http_endpoint(oauth["AuthorizationEndpoint"], "AuthorizationEndpoint")
+
+
 def _create_connection(data):
     name = data.get("Name")
     if not name:
         return error_response_json("ValidationException", "Name is required", 400)
+    auth_type_error = _validate_enum(
+        data.get("AuthorizationType"), _CONNECTION_AUTH_TYPES, "authorizationType")
+    if auth_type_error:
+        return auth_type_error
+    endpoint_error = _validate_oauth_authorization_endpoint(data.get("AuthParameters"))
+    if endpoint_error:
+        return endpoint_error
     if name in _connections:
         return error_response_json("ResourceAlreadyExistsException",
                                    f"Connection {name} already exists", 400)
@@ -2362,6 +2496,15 @@ def _update_connection(data):
     if name not in _connections:
         return error_response_json("ResourceNotFoundException",
                                    f"Connection {name} does not exist.", 400)
+    if "AuthorizationType" in data:
+        auth_type_error = _validate_enum(
+            data["AuthorizationType"], _CONNECTION_AUTH_TYPES, "authorizationType")
+        if auth_type_error:
+            return auth_type_error
+    if "AuthParameters" in data:
+        endpoint_error = _validate_oauth_authorization_endpoint(data["AuthParameters"])
+        if endpoint_error:
+            return endpoint_error
     conn = _connections[name]
     now = _now_ts()
     for key in ("AuthorizationType", "AuthParameters", "Description"):
@@ -2384,6 +2527,12 @@ def _update_connection(data):
 
 
 def _deauthorize_connection(data):
+    """Per the API reference this "removes all authorization parameters from the
+    connection … so you can reuse it without having to create a new connection",
+    so the stored credentials go with the state flip. Keeping them meant a
+    deauthorized connection carried on presenting its Basic/API-key credentials
+    on every delivery, and evicting the OAuth token achieved nothing because the
+    next delivery simply fetched a fresh one."""
     name = data.get("Name")
     if not name:
         return error_response_json("ValidationException", "Name is required", 400)
@@ -2395,6 +2544,7 @@ def _deauthorize_connection(data):
     conn["ConnectionState"] = "DEAUTHORIZED"
     conn["LastModifiedTime"] = now
     conn.pop("LastAuthorizedTime", None)
+    conn["AuthParameters"] = {}
     _evict_oauth_token(name)
     return json_response({
         "ConnectionArn": conn["ConnectionArn"],
@@ -2411,6 +2561,12 @@ def _create_api_destination(data):
     name = data.get("Name")
     if not name:
         return error_response_json("ValidationException", "Name is required", 400)
+    endpoint_error = _validate_http_endpoint(data.get("InvocationEndpoint", ""), "InvocationEndpoint")
+    if endpoint_error:
+        return endpoint_error
+    method_error = _validate_enum(data.get("HttpMethod"), _API_DEST_HTTP_METHODS, "httpMethod")
+    if method_error:
+        return method_error
     if name in _api_destinations:
         return error_response_json("ResourceAlreadyExistsException",
                                    f"ApiDestination {name} already exists", 400)
@@ -2483,6 +2639,14 @@ def _update_api_destination(data):
     if name not in _api_destinations:
         return error_response_json("ResourceNotFoundException",
                                    f"ApiDestination {name} does not exist.", 400)
+    if "InvocationEndpoint" in data:
+        endpoint_error = _validate_http_endpoint(data["InvocationEndpoint"], "InvocationEndpoint")
+        if endpoint_error:
+            return endpoint_error
+    if "HttpMethod" in data:
+        method_error = _validate_enum(data["HttpMethod"], _API_DEST_HTTP_METHODS, "httpMethod")
+        if method_error:
+            return method_error
     dest = _api_destinations[name]
     now = _now_ts()
     for key in ("ConnectionArn", "InvocationEndpoint", "HttpMethod",
