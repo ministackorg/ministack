@@ -77,10 +77,65 @@ _workers: dict = {}
 _lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
+# Recursive-loop lineage (runs inside every ministack-owned Python child)
+# ---------------------------------------------------------------------------
+
+# Name of the env var each executor sets to the current invocation's loop
+# depth, and of the header the child stamps onto outgoing SDK calls so the
+# nested Invoke can be attributed to its caller. Kept here (not in lambda_svc)
+# because both the worker script and lambda_svc's one-shot wrappers embed it.
+INVOKE_DEPTH_ENV = "_MINISTACK_INVOKE_DEPTH"
+INVOKE_DEPTH_HEADER = "X-Ministack-Invoke-Depth"
+# The warm worker's env is fixed at spawn time, so its depth rides in the
+# event and is popped off before the handler sees it — same trick the X-Ray
+# trace header uses.
+INVOKE_DEPTH_EVENT_KEY = "_ministack_invoke_depth"
+
+
+def _sub_depth_tokens(script: str) -> str:
+    """Substitute the invoke-depth carrier names into a bootstrap script."""
+    return (
+        script.replace("__DEPTH_ENV__", INVOKE_DEPTH_ENV)
+        .replace("__DEPTH_HEADER__", INVOKE_DEPTH_HEADER)
+        .replace("__DEPTH_EVENT_KEY__", INVOKE_DEPTH_EVENT_KEY)
+    )
+
+
+# Prepended to the Python bootstraps we own (warm worker + one-shot wrappers),
+# which call `_ms_install_invoke_depth()` once sys.path is set up and before
+# they import the handler module — botocore copies BUILTIN_HANDLERS into every
+# Session it builds, and handlers routinely build their clients at import time.
+#
+# botocore forwards `_X_AMZN_TRACE_ID` as `X-Amzn-Trace-Id` on every outgoing
+# call through its own `add_recursion_detection_header`; this registers a
+# handler alongside it for ministack's depth counter.
+#
+# Importing botocore is what a cold start pays for the counter (~0.15s here),
+# once per worker — or once per invocation on the one-shot executor, which
+# only durable invocations use. A function whose environment has no botocore
+# is not instrumented: it would have to be calling Invoke over raw urllib,
+# which never carried lineage anyway.
+INVOKE_DEPTH_BOOTSTRAP = _sub_depth_tokens('''
+def _ms_install_invoke_depth():
+    import os
+    try:
+        import botocore.handlers
+    except ImportError:
+        return
+
+    def _ms_add_invoke_depth(params, **kwargs):
+        depth = os.environ.get("__DEPTH_ENV__")
+        if depth and "__DEPTH_HEADER__" not in params["headers"]:
+            params["headers"]["__DEPTH_HEADER__"] = depth
+
+    botocore.handlers.BUILTIN_HANDLERS.append(("before-call", _ms_add_invoke_depth))
+''')
+
+# ---------------------------------------------------------------------------
 # Python worker script (runs inside a persistent subprocess)
 # ---------------------------------------------------------------------------
 
-_PYTHON_WORKER_SCRIPT = '''
+_PYTHON_WORKER_SCRIPT = INVOKE_DEPTH_BOOTSTRAP + _sub_depth_tokens('''
 import sys, json, importlib, traceback, os, time
 
 def run():
@@ -110,6 +165,9 @@ def run():
                     if os.path.isdir(_sp):
                         _site.addsitedir(_sp)
         sys.path.insert(0, _ld)
+    # After sys.path is complete (so a function that bundles its own botocore
+    # gets that one) and before the handler module builds any client.
+    _ms_install_invoke_depth()
     try:
         mod = importlib.import_module(module_name)
         handler_fn = getattr(mod, handler_name)
@@ -133,6 +191,13 @@ def run():
             os.environ["_X_AMZN_TRACE_ID"] = _xray_tid
         elif "_X_AMZN_TRACE_ID" in os.environ:
             del os.environ["_X_AMZN_TRACE_ID"]
+        # Recursive-loop depth: same per-invocation channel as the trace
+        # header, read by the before-call handler when this function calls out.
+        _ms_depth = event.pop("__DEPTH_EVENT_KEY__", None)
+        if _ms_depth is not None:
+            os.environ["__DEPTH_ENV__"] = str(_ms_depth)
+        elif "__DEPTH_ENV__" in os.environ:
+            del os.environ["__DEPTH_ENV__"]
         _function_name = init.get("function_name", "")
         _deadline = time.time() + float(os.environ.get("_LAMBDA_TIMEOUT", "3"))
         context = type("Context", (), {
@@ -155,13 +220,13 @@ def run():
         _real_stdout.flush()
 
 run()
-'''
+''')
 
 # ---------------------------------------------------------------------------
 # Node.js worker script (runs inside a persistent subprocess)
 # ---------------------------------------------------------------------------
 
-_NODEJS_WORKER_SCRIPT = r'''
+_NODEJS_WORKER_SCRIPT = _sub_depth_tokens(r'''
 const readline = require("readline");
 const path = require("path");
 const http = require("http");
@@ -206,6 +271,13 @@ fs.write = function(fd, ...args) {
     const body = params.Payload instanceof Uint8Array
       ? Buffer.from(params.Payload)
       : (params.Payload || "");
+    const headers = { "Content-Type": "application/json" };
+    // Carry the caller's recursive-loop depth so ministack can attribute this
+    // nested Invoke to it (the counterpart of the botocore before-call handler
+    // on the Python side).
+    if (process.env.__DEPTH_ENV__) {
+      headers["__DEPTH_HEADER__"] = process.env.__DEPTH_ENV__;
+    }
     return new Promise((resolve, reject) => {
       const req = http.request(
         {
@@ -213,7 +285,7 @@ fs.write = function(fd, ...args) {
           port: parseInt(ep.port || "4566", 10),
           method: "POST",
           path: "/2015-03-31/functions/" + fn + "/invocations" + qs,
-          headers: { "Content-Type": "application/json" },
+          headers: headers,
         },
         (res) => {
           const chunks = [];
@@ -781,6 +853,15 @@ rl.on("line", async (line) => {
     } else if ("_X_AMZN_TRACE_ID" in process.env) {
       delete process.env._X_AMZN_TRACE_ID;
     }
+    // Recursive-loop depth rides the same per-invocation channel, and the
+    // bundled Lambda stub reads it back off process.env when the handler
+    // invokes another function.
+    if (event.__DEPTH_EVENT_KEY__ !== undefined) {
+      process.env.__DEPTH_ENV__ = String(event.__DEPTH_EVENT_KEY__);
+    } else if ("__DEPTH_ENV__" in process.env) {
+      delete process.env.__DEPTH_ENV__;
+    }
+    delete event.__DEPTH_EVENT_KEY__;
     delete event._x_amzn_trace_id;
     delete event._request_id;
     delete event._function_name;
@@ -826,7 +907,7 @@ rl.on("line", async (line) => {
     }) + "\n");
   }
 });
-'''
+''')
 
 
 def _detect_runtime_binary(runtime: str) -> tuple[str, str]:

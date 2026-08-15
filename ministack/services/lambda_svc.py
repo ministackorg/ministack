@@ -49,7 +49,14 @@ from typing import Any
 from urllib.parse import quote, unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.lambda_runtime import get_or_create_worker, invalidate_worker
+from ministack.core.lambda_runtime import (
+    INVOKE_DEPTH_BOOTSTRAP,
+    INVOKE_DEPTH_ENV,
+    INVOKE_DEPTH_EVENT_KEY,
+    INVOKE_DEPTH_HEADER,
+    get_or_create_worker,
+    invalidate_worker,
+)
 from ministack.core.persistence import PERSIST_STATE, STATE_DIR, load_state
 from ministack.core.responses import (
     _12_DIGIT_RE,
@@ -120,6 +127,86 @@ def _xray_trace_id_for_invocation(config: dict, inbound_trace_header: str | None
     root_random = secrets.token_hex(12)   # 24 hex chars
     parent = secrets.token_hex(8)          # 16 hex chars
     return f"Root=1-{epoch_hex}-{root_random};Parent={parent};Sampled=1"
+
+
+# ---------------------------------------------------------------------------
+# Recursive-loop detection
+# ---------------------------------------------------------------------------
+#
+# AWS drops an invocation once a request has gone around the same function
+# more than 16 times, unless PutFunctionRecursionConfig set RecursiveLoop to
+# Allow. It counts *lineage*, not concurrency: the counter rides along with
+# the request, so a loop is caught even when every hop finishes before the
+# next one starts. That distinction matters here — an async self-invoke
+# returns 202 and releases the warm worker immediately, so it loops forever
+# with only one execution in flight at a time and no resource ever runs out.
+#
+# 16 is the number of invocations that *run*: "If your function is invoked
+# approximately 16 times in the same chain of requests, then Lambda
+# automatically stops the next function invocation in that request chain"
+# (Lambda Developer Guide, "Use Lambda recursive loop detection to prevent
+# infinite loops"). So hop 17 is the first one dropped, and the depth check
+# below is `>`, not `>=`. AWS says "approximately"; ministack counts exactly.
+MAX_INVOKE_DEPTH = 16
+
+# Cross-process carrier. The executors put the current depth in the child's
+# environment; the bootstrap in ministack's Python children (and the Node
+# worker's bundled Lambda stub) stamps it onto outgoing calls, so a nested
+# Invoke arrives here carrying its caller's depth. It is a plain request
+# header, so a client can forge it: an emulator has no trust boundary to
+# defend here, and being able to set the depth by hand is what makes the
+# limit testable without running 16 real hops.
+_INVOKE_DEPTH_HEADER = INVOKE_DEPTH_HEADER.lower()
+
+# In-process carrier. Set on the request task in `_invoke`; inherited by the
+# execution thread and by async-invoke threads (both copy the context), which
+# is where the executors read it back to seed the child environment.
+_invoke_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "ministack_invoke_depth", default=0
+)
+
+
+def _inbound_invoke_depth(headers: dict) -> int:
+    """How many Lambda hops the incoming request has already been through."""
+    raw = headers.get(_INVOKE_DEPTH_HEADER)
+    if raw is None:
+        return 0
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _recursive_loop_drop(name: str, func: dict, depth: int):
+    """AWS-shaped drop response when `depth` busts the loop limit, else None.
+
+    `RecursiveLoop: Allow` opts the function out, exactly as on AWS — the
+    counter keeps climbing, nothing is dropped.
+    """
+    if depth <= MAX_INVOKE_DEPTH:
+        return None
+    if (func.get("recursive_loop") or "Terminate") == "Allow":
+        return None
+    try:
+        from ministack.services import cloudwatch as _cw
+        _cw.record_metric(
+            "AWS/Lambda", "RecursiveInvocationsDropped", 1, "Count",
+            {"FunctionName": name},
+        )
+    except Exception:
+        logger.debug("emit recursive-drop metric failed", exc_info=True)
+    logger.warning(
+        "Dropped invocation of %s: recursive loop detected at depth %d "
+        "(limit %d). Set RecursiveLoop=Allow to opt out.",
+        name, depth, MAX_INVOKE_DEPTH,
+    )
+    return error_response_json(
+        "RecursiveInvocationException",
+        "Lambda has detected your function being invoked in a recursive loop "
+        "with other Amazon Web Services resources and stopped your function's "
+        f"invocation: {_func_arn(name)}",
+        400,
+    )
 
 
 def _account_from_arn(arn: str) -> str:
@@ -558,7 +645,7 @@ def _restore_esm_positions(store: AccountRegionScopedDict, positions) -> None:
 # Wrapper script executed inside the subprocess.
 # All configuration is passed through env vars; event data arrives on stdin.
 # ---------------------------------------------------------------------------
-_WRAPPER_SCRIPT = """\
+_WRAPPER_SCRIPT = INVOKE_DEPTH_BOOTSTRAP + """\
 import sys, os, json
 
 sys.path.insert(0, os.environ["_LAMBDA_CODE_DIR"])
@@ -600,6 +687,10 @@ class LambdaContext:
     @staticmethod
     def get_remaining_time_in_millis():
         return int(float(os.environ.get("_LAMBDA_TIMEOUT", "3")) * 1000)
+
+# After sys.path is complete (so a function that bundles its own botocore gets
+# that one) and before the handler module builds any client.
+_ms_install_invoke_depth()
 
 _mod = __import__(_mod_path)
 for _part in _mod_path.split(".")[1:]:
@@ -2394,6 +2485,14 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
     if invocation_type == "DryRun":
         return 204, {"X-Amz-Executed-Version": executed_version}, b""
 
+    # Recursive-loop guard — one counter check before anything executes, and
+    # the only place the depth is established for everything downstream.
+    depth = _inbound_invoke_depth(headers) + 1
+    dropped = _recursive_loop_drop(name, func, depth)
+    if dropped is not None:
+        return dropped
+    _invoke_depth.set(depth)
+
     # If the function has DurableConfig.Enabled, spin up a durable execution
     # record so the SDK calls (Checkpoint / GetState) inside the function
     # have a target. The ARN is surfaced back via the X-Amz-Durable-Execution-
@@ -3181,6 +3280,78 @@ def _classify_function_error(parsed, err_header: str) -> str | None:
     return "Handled" if "statusCode" in parsed else "Unhandled"
 
 
+# A container that never answers is a failed cold start, not a slow one: RIE
+# starts listening within a second or two. Cap the reconnect phase so a
+# function with a long Timeout (900s is legal) cannot hold its caller for
+# fifteen minutes. A request that is actually in flight is bounded separately
+# by urlopen(timeout=timeout).
+_RIE_CONNECT_RETRY_SECONDS = 30.0
+
+
+def _rie_failure_is_retryable(exc: BaseException) -> bool:
+    """Is a failed RIE request worth retrying while the container comes up?
+
+    Only a connection-level failure means "not listening yet". The two
+    terminal cases both look like `OSError` and used to be retried:
+
+    * `HTTPError` — the runtime answered. RIE reports a failed INIT (a handler
+      module that will not import, a stale layer) as a 502 carrying the error
+      payload, and every retry runs INIT again and fails the same way.
+    * a bare `TimeoutError` — the request was accepted and the handler ran past
+      the function's timeout. `URLError` wrapping a timeout is the connect
+      phase, so that one stays retryable.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    if isinstance(exc, urllib.error.URLError):
+        return True
+    return not isinstance(exc, TimeoutError)
+
+
+def _rie_terminal_result(exc: BaseException, timeout: int, logs: str) -> dict:
+    """Shape a terminal RIE failure as AWS shapes it: a function error.
+
+    AWS answers `Invoke` with HTTP 200, `X-Amz-Function-Error: Unhandled` and
+    the error payload in the body; `function_error` here is what makes the
+    caller emit that header.
+
+    The timeout case carries an extra `timeout` key — an internal signal to
+    `_execute_function_docker` that this container must not go back in the warm
+    pool. It is popped there and never reaches a caller's result.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        raw = ""
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict) and parsed.get("errorMessage"):
+            body = parsed
+        else:
+            err_type = exc.headers.get("Lambda-Runtime-Function-Error-Type") if exc.headers else None
+            body = {
+                "errorMessage": f"Lambda RIE returned HTTP {exc.code}: {raw[:500]}",
+                "errorType": err_type or "Runtime.ExitError",
+            }
+        return {"body": body, "error": True, "function_error": "Unhandled", "log": logs}
+    # Read timeout on an accepted POST: the handler ran past its Timeout. The
+    # message and errorType are what the local (~`_execute_function_local`) and
+    # catch-all docker paths already emit for a timeout, so every executor
+    # agrees on one shape.
+    body = {
+        "errorMessage": f"Task timed out after {timeout}.00 seconds",
+        "errorType": "Runtime.ExitError",
+    }
+    return {
+        "body": body, "error": True, "function_error": "Unhandled",
+        "log": logs, "timeout": True,
+    }
+
+
 def _invoke_rie(container, event: dict, timeout: int) -> dict:
     """POST event to a running RIE container's HTTP endpoint."""
     import urllib.request
@@ -3192,10 +3363,14 @@ def _invoke_rie(container, event: dict, timeout: int) -> dict:
     if isinstance(event, dict) and event.get("ResponseURL"):
         event = {**event, "ResponseURL": _rewrite_host_for_container(event["ResponseURL"])}
     max_attempts = int(timeout * 10) + 20
+    connect_deadline = time.time() + min(timeout + 2.0, _RIE_CONNECT_RETRY_SECONDS)
     for _attempt in range(max_attempts):
+        if time.time() > connect_deadline:
+            break
         container.reload()
         if container.status != "running":
             break
+        attempt_start = time.time()
         try:
             networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
             # Try Docker network first (container-to-container)
@@ -3237,10 +3412,15 @@ def _invoke_rie(container, event: dict, timeout: int) -> dict:
                 result["error"] = True
                 result["function_error"] = function_error
             return result
-        except (urllib.error.URLError, ConnectionRefusedError, OSError):
+        except (urllib.error.URLError, ConnectionRefusedError, OSError) as exc:
+            if not _rie_failure_is_retryable(exc):
+                logs = container.logs(
+                    stdout=True, stderr=True, since=attempt_start
+                ).decode("utf-8", errors="replace").strip()
+                return _rie_terminal_result(exc, timeout, logs)
             time.sleep(0.1)
             continue
-    # Timed out
+    # Never became reachable
     stdout = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
     return {
         "body": {"errorMessage": f"Lambda RIE failed: {stdout[:500]}", "errorType": "Runtime.ExitError"},
@@ -3417,6 +3597,14 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
     # Per-invocation durable-execution overlay (no-op when the call isn't
     # inside a durable function).
     container_env.update(_durable_env_overlay())
+    # Recursive-loop depth of the invocation that cold-started this container.
+    # Same staleness-on-reuse caveat as the durable overlay above: the pool
+    # hands the container to later invocations without re-baking its env. And
+    # unlike the warm/local executors, nothing inside an RIE container stamps
+    # this onto outgoing calls — ministack owns no bootstrap in there — so a
+    # docker-executor function's nested Invoke arrives without lineage unless
+    # the function forwards the variable itself.
+    container_env[INVOKE_DEPTH_ENV] = str(_invoke_depth.get())
     # NOTE: X-Ray active tracing is NOT supported in the docker RIE
     # executor. AWS RIE explicitly does not implement X-Ray
     # (https://github.com/aws/aws-lambda-runtime-interface-emulator —
@@ -3660,7 +3848,21 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
 
     try:
         result = _invoke_rie(entry["container"], event, timeout)
-        if result.get("error") and not _is_container_running(entry["container"]):
+        # `timeout` is _invoke_rie's internal signal to this function; pop it so
+        # only the caller-facing keys survive into the invoke response.
+        if result.pop("timeout", False):
+            # Task timed out: AWS terminates the execution environment. Ours
+            # still has the handler running inside the RIE, so returning the
+            # container to the pool would queue the next invocation behind a
+            # zombie handler. Recycle it — off the response path, because the
+            # stop (SIGTERM grace + SIGKILL) takes seconds and the caller
+            # should see the timeout at the timeout mark, as on AWS.
+            threading.Thread(
+                target=_pool_remove, args=(entry,), daemon=True,
+                name="ministack-lambda-timeout-reaper",
+            ).start()
+            entry = None
+        elif result.get("error") and not _is_container_running(entry["container"]):
             # Container died during invocation — evict so next caller doesn't pick a corpse
             _pool_remove(entry)
             entry = None
@@ -3999,6 +4201,13 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
         _xray = _xray_trace_id_for_invocation(config)
         if _xray:
             event["_x_amzn_trace_id"] = _xray
+        # Same channel for the recursive-loop depth: the worker's env is
+        # fixed at spawn time, so it has to ride in the event. Both worker
+        # bootstraps move it to the environment and drop the key before the
+        # handler runs. Non-dict payloads have nowhere to carry it, and lose
+        # the counter.
+        if isinstance(event, dict):
+            event[INVOKE_DEPTH_EVENT_KEY] = _invoke_depth.get()
         result = worker.invoke(event, new_uuid())
         if result.get("status") == "ok":
             return {"body": result.get("result"), "log": result.get("log", "")}
@@ -4162,6 +4371,7 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
             _xray_trace_id = _xray_trace_id_for_invocation(config)
             if _xray_trace_id:
                 proc_env["_X_AMZN_TRACE_ID"] = _xray_trace_id
+            proc_env[INVOKE_DEPTH_ENV] = str(_invoke_depth.get())
             # Override AWS_ENDPOINT_URL *after* function env vars so
             # Lambda binaries always call back to this MiniStack
             # instance.  Function-level env vars may carry the
@@ -4331,6 +4541,7 @@ def _execute_function_local(func: dict, event: dict) -> dict:
             _xray_trace_id = _xray_trace_id_for_invocation(config)
             if _xray_trace_id:
                 env["_X_AMZN_TRACE_ID"] = _xray_trace_id
+            env[INVOKE_DEPTH_ENV] = str(_invoke_depth.get())
 
             cmd = ["node", wrapper_path] if is_node else ["python3", wrapper_path]
             proc = subprocess.run(

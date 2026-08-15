@@ -70,6 +70,10 @@ _SERIAL_TESTS = {
     "tests/test_stepfunctions.py::test_sfn_wait_scale_zero_does_not_timeout_lambda_tasks",
     "tests/test_stepfunctions.py::test_sfn_wait_scale_zero_skips_wait",
     "tests/test_rds.py::test_rds_lambda_network_connectivity",
+    # Docker-executor Lambda timeout (skipped unless LAMBDA_EXECUTOR=docker):
+    # cold-starts a container and asserts a wall-clock bound (< 9s for a
+    # Timeout=3 function), which parallel container churn breaks.
+    "tests/test_lambda.py::test_lambda_docker_timeout_returns_task_timed_out_promptly",
     "tests/test_elasticache.py::test_elasticache_lambda_network_connectivity",
     # API Gateway execute-api → Lambda invoke under tight urlopen / WS recv
     # timeouts. These pass cleanly when run serially but are sensitive to
@@ -137,6 +141,15 @@ _SERIAL_TESTS = {
     # Account-global mutations (password policy, alias); must run serially.
     "tests/test_iam.py::test_iam_password_policy_absent_then_set",
     "tests/test_iam.py::test_iam_account_alias_crud",
+    # Recursive-loop detection. The two chain tests cold-start 16+ Lambdas
+    # each and poll CloudWatch Logs until the chain stops changing; the other
+    # two assert on wall clock (a dropped invocation must come back long
+    # before the handler's timeout could have elapsed). Both shapes tip over
+    # under xdist load, so run them in the serial phase.
+    "tests/test_lambda.py::test_lambda_recursive_loop_terminates_self_invoking_chain",
+    "tests/test_lambda.py::test_lambda_recursive_loop_allow_lets_the_chain_through",
+    "tests/test_lambda.py::test_lambda_recursive_loop_drop_is_recursive_invocation_exception",
+    "tests/test_lambda.py::test_lambda_nested_invoke_below_limit_is_unaffected",
 }
 
 
