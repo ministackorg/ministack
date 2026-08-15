@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Request headers — a field repeated across lines is no longer reduced to its last line** — the ASGI header dict was built with plain assignment, so when a client sent the same field twice the earlier line was discarded. The AWS SDK for Java v2 uploads exactly that way, emitting `Content-Encoding: gzip` and `Content-Encoding: aws-chunked` as separate lines: MiniStack saw only `aws-chunked`, stripped it as the chunk-framing marker it is, and stored the object with no content encoding at all — silently losing `gzip` for every Java SDK v2 caller, S3Proxy's `aws-s3` backend among them. Repeated field lines now combine into one comma-joined value as RFC 9110 5.2 requires (`Cookie` rejoins with `"; "` per RFC 9113 8.2.3), so `aws-chunked` is stripped from the joined list and the caller's encoding survives. Sending the header once, in either order, was already correct and is unchanged.
+
 ## [1.4.17] — 2026-08-14
 
 ### Added
