@@ -51,15 +51,15 @@ from urllib.parse import quote, unquote
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
 from ministack.core.lambda_runtime import (
+    INVOKE_DEPTH_BOOTSTRAP,
+    INVOKE_DEPTH_ENV,
+    INVOKE_DEPTH_EVENT_KEY,
+    INVOKE_DEPTH_HEADER,
     acquire_worker,
     get_or_create_worker,
     invalidate_worker,
     reap_idle_workers,
     release_worker,
-    INVOKE_DEPTH_BOOTSTRAP,
-    INVOKE_DEPTH_ENV,
-    INVOKE_DEPTH_EVENT_KEY,
-    INVOKE_DEPTH_HEADER
 )
 from ministack.core.persistence import PERSIST_STATE, STATE_DIR, load_state
 from ministack.core.responses import (
