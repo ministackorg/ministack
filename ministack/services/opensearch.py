@@ -18,6 +18,7 @@ State is account- and region-scoped via AccountRegionScopedDict, except tags
 which stay account-scoped because their ARN keys embed region.
 """
 
+import contextvars
 import copy
 import json
 import logging
@@ -26,8 +27,9 @@ import re
 import threading
 import time
 
+from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.concurrency import run_offloop
+from ministack.core.concurrency import run_offloop, spawn_background
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -332,6 +334,33 @@ def _dashboards_container_name(domain_name: str) -> str:
     return f"ministack-opensearch-dashboards-{get_region()}-{domain_name}"
 
 
+def _image_is_local(docker_client, image: str) -> bool:
+    """True when the image is already pulled.
+
+    ``containers.run`` auto-pulls on ImageNotFound, so a cold cache would block
+    CreateDomain for the length of the pull — the OpenSearch image is ~1 GB.
+    AWS reports ``Processing`` and provisions asynchronously.
+    """
+    try:
+        docker_client.images.get(image)
+        return True
+    except Exception:
+        return False
+
+
+def _remove_container_by_id(cid: str) -> None:
+    """Best-effort teardown of a container we started but no longer own."""
+    docker = _get_docker()
+    if not docker or not cid:
+        return
+    try:
+        c = docker.containers.get(cid)
+        c.stop(timeout=2)
+        c.remove(force=True, v=True)
+    except Exception:
+        pass
+
+
 def _spawn_dataplane(domain_name: str, engine_version: str):
     """Spawn an OpenSearch container.
 
@@ -577,7 +606,15 @@ def _new_domain_record(name, payload):
     ebs_opts = _default_ebs_options(payload.get("EBSOptions"))
     access_policies = payload.get("AccessPolicies", "")
 
-    host, port, cid, dash_endpoint, dash_cid = _spawn_dataplane(name, engine_version)
+    _dc = _get_docker() if DATAPLANE_ENABLED else None
+    _deferred = bool(_dc) and not _image_is_local(_dc, apply_image_prefix(DEFAULT_IMAGE))
+    if _deferred:
+        # Cold image cache: the OpenSearch image is ~1 GB and pulling it inside
+        # CreateDomain would block the API for minutes. AWS reports
+        # Processing=True and provisions asynchronously; do the same.
+        host, port, cid, dash_endpoint, dash_cid = "localhost", BASE_PORT, None, None, None
+    else:
+        host, port, cid, dash_endpoint, dash_cid = _spawn_dataplane(name, engine_version)
     endpoint = f"{host}:{port}"
 
     rec = {
@@ -587,7 +624,7 @@ def _new_domain_record(name, payload):
         "Created": True,
         "Deleted": False,
         "Endpoint": endpoint,
-        "Processing": False,
+        "Processing": _deferred,
         "UpgradeProcessing": False,
         "EngineVersion": engine_version,
         "ClusterConfig": cluster_cfg,
@@ -639,6 +676,30 @@ def _new_domain_record(name, payload):
     _set_vpc_options(rec, payload.get("VPCOptions"))
     if dash_endpoint:
         rec["DashboardEndpoint"] = dash_endpoint
+    if _deferred:
+        # Pull + start off the request path. The domain reports Processing=True
+        # until this lands, exactly as AWS does.
+        def _finish_domain_start():
+            try:
+                h, pt, cid2, _dep, _dcid = _spawn_dataplane(name, engine_version)
+            except Exception:
+                logger.warning("OpenSearch: deferred dataplane start failed for %s", name)
+                h = pt = cid2 = None
+            live = _domains.get(name)
+            if not live:
+                # Deleted while the image was pulling: reclaim what we started,
+                # or it runs forever unowned (the reaper never touches a
+                # running container).
+                if cid2:
+                    _remove_container_by_id(cid2)
+                return
+            if h:
+                live["Endpoint"] = f"{h}:{pt}"
+                live["_container_id"] = cid2
+            live["Processing"] = False
+
+        spawn_background(contextvars.copy_context().run, _finish_domain_start,
+                         thread_name=f"ministack-opensearch-start-{name}")
     return rec
 
 
@@ -1286,3 +1347,16 @@ async def handle_request(method, path, headers, body_bytes, query_params):
 
     return _error(400, "InvalidAction",
                   f"OpenSearch operation not implemented: {method} {path}")
+
+
+def _live_container_ids():
+    ids = set()
+    for _key, rec in _domains.all_items():
+        for field in ("_container_id", "_dashboards_container_id"):
+            cid = rec.get(field)
+            if cid:
+                ids.add(cid)
+    return ids
+
+
+container_reaper.register_live_ids("opensearch", _live_container_ids)

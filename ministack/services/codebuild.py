@@ -429,7 +429,7 @@ def _execute_build(build_id, project):
         timed_out.set()
         logger.error("Build %s exceeded timeoutInMinutes; stopping it", build_id)
         try:
-            container.remove(force=True)
+            container.remove(force=True, v=True)
         except Exception:
             logger.exception("Could not stop the timed-out build %s", build_id)
 
@@ -482,7 +482,7 @@ def _execute_build(build_id, project):
                 "phases in this format", build_id, AGENT_IMAGE
             )
         try:
-            container.remove(force=True)
+            container.remove(force=True, v=True)
         except Exception:
             pass
 
@@ -696,7 +696,7 @@ def _stop_build(data):
     container = _container_for_build(bid) if EXECUTE_BUILDS else None
     if container:
         try:
-            container.remove(force=True)
+            container.remove(force=True, v=True)
         except Exception:
             logger.exception("Could not stop the build container for %s", bid)
 

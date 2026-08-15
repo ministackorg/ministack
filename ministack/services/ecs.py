@@ -23,7 +23,9 @@ Supports 47 operations:
 Container execution: if Docker socket is available, RunTask actually runs containers.
 """
 
+import contextvars
 import copy
+import functools
 import json
 import logging
 import os
@@ -32,7 +34,7 @@ import threading
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.concurrency import run_reentrant
+from ministack.core.concurrency import run_reentrant, spawn_background
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,

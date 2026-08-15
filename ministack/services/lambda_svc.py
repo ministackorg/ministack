@@ -2671,7 +2671,7 @@ def _kill_pool_entry(entry: dict) -> None:
         except Exception:
             pass
         try:
-            container.remove(force=True)
+            container.remove(force=True, v=True)
         except Exception:
             pass
     tmpdir = entry.get("tmpdir")

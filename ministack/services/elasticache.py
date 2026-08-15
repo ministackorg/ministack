@@ -20,14 +20,16 @@ When Docker is available, CreateCacheCluster spins up a real Redis/Valkey/Memcac
 container. Otherwise returns localhost:6379 (assumes Redis sidecar in docker-compose).
 """
 
+import contextvars
 import copy
 import logging
 import os
 import time
 from urllib.parse import parse_qs
 
+from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.concurrency import run_offloop
+from ministack.core.concurrency import run_offloop, spawn_background
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -443,6 +445,20 @@ def _engine_image_and_port(engine, engine_version):
     if engine == "redis":
         return apply_image_prefix(f"redis:{engine_version.split('.')[0]}-alpine"), 6379
     return apply_image_prefix(f"memcached:{engine_version}-alpine"), 11211
+
+
+def _image_is_local(docker_client, image: str) -> bool:
+    """True when the image is already pulled.
+
+    ``containers.run`` auto-pulls on ImageNotFound, so calling it with a cold
+    cache blocks the request for as long as the pull takes. AWS returns
+    ``creating`` in milliseconds and provisions asynchronously.
+    """
+    try:
+        docker_client.images.get(image)
+        return True
+    except Exception:
+        return False
 
 
 def _spawn_redis_container(name, engine, engine_version, labels):
@@ -882,6 +898,11 @@ async def handle_request(method, path, headers, body, query_params):
     handler = handlers.get(action)
     if not handler:
         return _error("InvalidAction", f"Unknown ElastiCache action: {action}", 400)
+    # Docker-backed actions block on the daemon — a cold image pull is minutes —
+    # and would hold the event loop for every other service. Shared pool, not a
+    # dedicated thread: a Redis/Valkey container never calls back into MiniStack.
+    if action in _DOCKER_BACKED_ACTIONS:
+        return await run_offloop(handler, params)
     return handler(params)
 
 
@@ -900,7 +921,7 @@ def _create_cache_cluster(p):
     arn = _arn_cluster(cluster_id)
     account_id = get_account_id()
     region = get_region()
-    endpoint_host, endpoint_port, docker_container_id = _spawn_redis_container(
+    _spawn_kwargs = dict(
         name=f"ministack-elasticache-{account_id}-{region}-{cluster_id}",
         engine=engine,
         engine_version=engine_version,
@@ -911,6 +932,16 @@ def _create_cache_cluster(p):
             "region": region,
         },
     )
+    _image, _port = _engine_image_and_port(engine, engine_version)
+    _dc = _get_docker()
+    _deferred = bool(_dc) and not _image_is_local(_dc, _image)
+    if _deferred:
+        # Cold image cache: pulling inside CreateCacheCluster would block the
+        # API for as long as the pull takes. AWS returns `creating` at once, so
+        # spawn in the background and flip to `available` when it lands.
+        endpoint_host, endpoint_port, docker_container_id = "localhost", _port, None
+    else:
+        endpoint_host, endpoint_port, docker_container_id = _spawn_redis_container(**_spawn_kwargs)
 
     subnet_group = _p(p, "CacheSubnetGroupName") or "default"
     param_group_name = _p(p, "CacheParameterGroupName") or _default_param_group_for_engine(engine, engine_version)
@@ -918,7 +949,7 @@ def _create_cache_cluster(p):
     _clusters[cluster_id] = {
         "CacheClusterId": cluster_id,
         "CacheClusterArn": arn,
-        "CacheClusterStatus": "available",
+        "CacheClusterStatus": "creating" if _deferred else "available",
         "Engine": engine,
         "EngineVersion": engine_version,
         "CacheNodeType": node_type,
@@ -950,6 +981,32 @@ def _create_cache_cluster(p):
         "_docker_container_id": docker_container_id,
         "_endpoint": {"Address": endpoint_host, "Port": endpoint_port},
     }
+
+    if _deferred:
+        # Pull + start off the request path; the cluster reports `creating`
+        # until this lands, exactly as AWS does.
+        def _finish_cluster_start():
+            try:
+                host, port, cid = _spawn_redis_container(**_spawn_kwargs)
+            except Exception:
+                _clusters[cluster_id]["CacheClusterStatus"] = "create-failed"
+                return
+            rec = _clusters.get(cluster_id)
+            if not rec:
+                # Deleted while the image was pulling. The container we just
+                # started has no owner and nothing else will ever reclaim it —
+                # the periodic reaper only touches created/dead/exited, never a
+                # running container. Tear it down here.
+                _teardown_containers(_get_docker(), [cid])
+                return
+            rec["_docker_container_id"] = cid
+            ep = rec.get("ConfigurationEndpoint") or {}
+            ep["Address"], ep["Port"] = host, port
+            rec["ConfigurationEndpoint"] = ep
+            rec["CacheClusterStatus"] = "available"
+
+        spawn_background(contextvars.copy_context().run, _finish_cluster_start,
+                         thread_name=f"ministack-elasticache-start-{cluster_id}")
 
     _tags[arn] = _extract_tags(p)
 
@@ -2432,3 +2489,20 @@ def reset():
     _pending_rg_respawn.clear()
     _port_counter[0] = BASE_PORT
     default_state()
+
+
+def _live_container_ids():
+    ids = set()
+    for _key, rec in _clusters.all_items():
+        cid = rec.get("_docker_container_id")
+        if cid:
+            ids.add(cid)
+        for cid2 in rec.get("_docker_container_ids") or []:
+            ids.add(cid2)
+    for _key, rg in _replication_groups.all_items():
+        for cid2 in rg.get("_docker_container_ids") or []:
+            ids.add(cid2)
+    return ids
+
+
+container_reaper.register_live_ids("elasticache", _live_container_ids)

@@ -319,7 +319,10 @@ def test_airflow_runtime_identity_and_background_scope_include_region(
 
         assert dag_sync_complete.wait(timeout=2)
         assert docker_client.containers.get_calls == [expected_name, legacy_name]
-        assert legacy_container.remove_calls == [{"force": True}]
+        # v=True reclaims the container's anonymous volume. Verified against
+        # docker: named volumes (MWAA's dags/db persistence) are untouched
+        # by remove(v=True), so this cannot lose persisted state.
+        assert legacy_container.remove_calls == [{"force": True, "v": True}]
         assert docker_client.containers.run_kwargs["name"] == expected_name
         assert docker_client.containers.run_kwargs["labels"] == {
             "ministack": "mwaa",
@@ -356,7 +359,7 @@ def test_reset_stops_containers_in_every_region(monkeypatch):
         def stop(self, timeout):
             self.stop_calls.append(timeout)
 
-        def remove(self, force):
+        def remove(self, force=False, v=False):
             self.remove_calls.append(force)
 
     class FakeContainers:

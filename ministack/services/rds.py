@@ -46,8 +46,9 @@ import time
 from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
+from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.concurrency import run_offloop
+from ministack.core.concurrency import run_offloop, spawn_background
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -1239,6 +1240,21 @@ def _restart_cluster_shared_container(cluster_id, cluster):
     }
 
 
+def _image_is_local(docker_client, image: str) -> bool:
+    """True when the image is already pulled.
+
+    ``containers.run`` auto-pulls on ImageNotFound, so calling it with a cold
+    cache blocks the request for as long as the pull takes — minutes for the
+    database and Airflow images. AWS returns ``creating`` in milliseconds and
+    provisions asynchronously, so a missing image must not be pulled inline.
+    """
+    try:
+        docker_client.images.get(image)
+        return True
+    except Exception:
+        return False
+
+
 def _start_rds_container_for_instance(db_id, instance):
     """Re-spin (or re-attach to) the Docker container for a restored instance.
 
@@ -1353,6 +1369,20 @@ def _start_rds_container_for_instance(db_id, instance):
         instance["DBInstanceStatus"] = "failed"
         return
 
+    if _instances.get(db_id) is not instance:
+        # Deleted (or replaced) while we were pulling and starting. Reclaim the
+        # container now: no record references it, and the periodic reaper never
+        # touches a *running* container, so nothing else ever would. This check
+        # has to be unconditional — the MySQL readiness path below has its own,
+        # but Postgres would otherwise leave the container running forever.
+        logger.info("RDS: instance %s vanished during start; reclaiming container", db_id)
+        try:
+            container.stop(timeout=2)
+            container.remove(force=True, v=True)
+        except Exception:
+            pass
+        return
+
     instance["_docker_container_id"] = container.id
 
     internal_host = None
@@ -1388,6 +1418,15 @@ def _start_rds_container_for_instance(db_id, instance):
             _instances.get(db_id) is not instance
             or instance.get("_docker_container_id") != container.id
         ):
+            # The instance was deleted (or replaced) while we were pulling and
+            # starting. Reclaim what we started: nothing else can, because the
+            # periodic reaper never touches a *running* container and no record
+            # references this id any more.
+            try:
+                container.stop(timeout=2)
+                container.remove(force=True, v=True)
+            except Exception:
+                pass
             return
     instance["DBInstanceStatus"] = "available"
     logger.info("RDS: respawned container %s for instance %s",
@@ -2753,6 +2792,7 @@ def _create_db_instance_impl(p):
     readiness_master_pass = master_pass
     ms_network = None
 
+    deferred_container_start = False
     docker_client = _get_docker()
     if parent:
         pending_rotation = parent.get("_pending_master_password_rotation")
@@ -2828,7 +2868,16 @@ def _create_db_instance_impl(p):
         image, env, container_port, data_path = _docker_image_for_engine(
             engine, engine_version, master_user, master_pass, db_name
         )
-        if image:
+        if image and not _image_is_local(docker_client, image):
+            # Cold image cache: pulling here would block CreateDBInstance for
+            # minutes (measured: 187s for postgres:15-alpine). AWS returns
+            # `creating` at once, so allocate the port, defer the whole start to
+            # the background finaliser below, and let DescribeDBInstances show
+            # `available` when it lands.
+            host_port = _next_port()
+            endpoint_port = host_port
+            deferred_container_start = True
+        elif image:
             try:
                 # Create path: the `instance` dict doesn't exist yet
                 # (it's built ~70 lines below). Allocate a fresh free port
@@ -2904,6 +2953,10 @@ def _create_db_instance_impl(p):
         "DBSubnetGroupArn": f"arn:aws:rds:{get_region()}:{get_account_id()}:subgrp:{subnet_group_name}",
     })
     instance_status = "creating" if real_container_started else "available"
+    if deferred_container_start:
+        # The container is being pulled and started in the background; AWS
+        # reports `creating` until provisioning completes.
+        instance_status = "creating"
     if parent and not parent.get("_shared_container_ready", True):
         instance_status = "creating"
     if parent and start_result.get("failed"):
@@ -3006,6 +3059,18 @@ def _create_db_instance_impl(p):
         _attach_instance_to_shared_cluster(instance, parent)
     _instances[db_id] = instance
     _register_instance_in_cluster(instance)
+
+    if deferred_container_start:
+        # Cold image cache. Pull and start on a background thread — the same
+        # finaliser persistence restore uses — so CreateDBInstance returns now
+        # with status="creating", as AWS does, instead of blocking on the pull.
+        ctx = contextvars.copy_context()
+
+        def _deferred_start():
+            _start_rds_container_for_instance(db_id, instance)
+
+        spawn_background(ctx.run, _deferred_start,
+                         thread_name=f"ministack-rds-start-{db_id}")
 
     if real_container_started:
         # Real AWS CreateDBInstance returns immediately with status="creating"
@@ -6564,3 +6629,24 @@ async def handle_request(method, path, headers, body, query_params):
     """
     return await run_offloop(
         _handle_request_sync, method, path, headers, body, query_params)
+
+
+def _live_container_ids():
+    """Container ids still owned by a live DB instance or cluster.
+
+    A stopped instance still owns its (exited) container — StartDBInstance must
+    be able to restart it — so it is reported here and never reaped.
+    """
+    ids = set()
+    for _key, inst in _instances.all_items():
+        cid = inst.get("_docker_container_id")
+        if cid:
+            ids.add(cid)
+    for _key, cl in _clusters.all_items():
+        cid = cl.get("_shared_container_id")
+        if cid:
+            ids.add(cid)
+    return ids
+
+
+container_reaper.register_live_ids("rds", _live_container_ids)

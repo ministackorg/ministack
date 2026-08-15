@@ -161,6 +161,7 @@ _NON_S3_VHOST_NAMES = frozenset({
     "inspector2", "dsql",
 })
 
+from ministack.core import container_reaper
 from ministack.core.concurrency import spawn_background
 from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
@@ -2033,6 +2034,10 @@ async def _handle_lifespan(scope, receive, send):
             # never stop MiniStack from binding its port — that presents as a
             # silent hang with an empty log. Past the deadline it finishes in the
             # background while the server comes up.
+            # Periodic reclamation for the whole process lifetime, not just at
+            # boot: without it, containers (and their anonymous volumes) pile up
+            # for as long as MiniStack runs.
+            container_reaper.start(_reaper_docker_client)
             _reap = spawn_background(_stop_docker_containers,
                                      thread_name="ministack-boot-reap")
             _reap.join(timeout=_DOCKER_REAP_BOOT_DEADLINE)
@@ -2110,6 +2115,19 @@ async def _handle_lifespan(scope, receive, send):
 # letting the server bind and finishing the reap in the background.
 _DOCKER_REAP_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
 _DOCKER_REAP_BOOT_DEADLINE = 10.0
+
+
+def _reaper_docker_client():
+    """Docker client for the periodic reaper, or None when there is no daemon."""
+    sock = os.environ.get("DOCKER_HOST") or "unix:///var/run/docker.sock"
+    if sock.startswith("unix://") and not os.path.exists(sock[len("unix://"):]):
+        return None
+    try:
+        import docker
+
+        return docker.from_env(timeout=_DOCKER_REAP_TIMEOUT)
+    except Exception:
+        return None
 
 
 def _stop_docker_containers():

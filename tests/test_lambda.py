@@ -3006,7 +3006,7 @@ def test_lambda_pool_kill_function_reaps_all_qualifiers():
             self.removed = False
         def stop(self, timeout=2):
             self.stopped = True
-        def remove(self, force=False):
+        def remove(self, force=False, v=False):
             self.removed = True
 
     stubs = [_StubContainer() for _ in range(3)]
@@ -9586,7 +9586,7 @@ def test_lambda_keepalive_zero_forces_cold_start(monkeypatch):
             pass
         def stop(self, timeout=2):
             self.stopped = True
-        def remove(self, force=False):
+        def remove(self, force=False, v=False):
             self.removed = True
 
     stub = _StubContainer()

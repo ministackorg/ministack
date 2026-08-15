@@ -1454,7 +1454,7 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
     # Remove stale container with same name
     try:
         existing = docker_client.containers.get(container_name)
-        existing.remove(force=True)
+        existing.remove(force=True, v=True)
     except Exception:
         pass
 
@@ -1567,7 +1567,7 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         run["JobRunState"] = "FAILED"
         run["ErrorMessage"] = f"Docker container start failed: {e}"[:2000]
         try:
-            container.remove(force=True)
+            container.remove(force=True, v=True)
         except Exception:
             pass
         return
@@ -1591,7 +1591,7 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         logger.warning("Glue: Spark container for %s error: %s", job_name, e)
     finally:
         try:
-            container.remove(force=True)
+            container.remove(force=True, v=True)
         except Exception:
             pass
 
