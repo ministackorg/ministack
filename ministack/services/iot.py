@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import copy
 import hashlib
 import json
@@ -57,6 +58,7 @@ from ministack.core.responses import (
     get_region,
     json_response,
     new_uuid,
+    request_scope,
 )
 from ministack.core.x509_utils import (
     generate_ca,
@@ -216,6 +218,10 @@ def reset() -> None:
     _policies.clear()
     _topic_rules.clear()
     _shadows.clear()
+    # The warn-once ledger is module state keyed on rule SQL that no longer
+    # exists, so a reset has to clear it or the next test to store the same rule
+    # gets no warning.
+    _warned_sql_funcs.clear()
     _indexing_config.clear()
     with _CA_LOCK:
         _ca_cert_pem = None
@@ -1973,6 +1979,83 @@ _SELECT_ALIAS_RE = re.compile(
 )
 _SELECT_FUNC_RE = re.compile(r"^(?P<name>[A-Za-z_]\w*)\s*\((?P<args>.*)\)$", re.DOTALL)
 _SELECT_ATTR_RE = re.compile(r"^[A-Za-z_][\w]*(\.[A-Za-z_][\w]*)*$")
+# A SQL string literal escapes an embedded quote by doubling it: 'it''s'.
+_SQL_STRING_RE = re.compile(r"^'(?:[^']|'')*'$")
+
+
+def _sql_string_value(expr: str) -> str | None:
+    """Return the value of a SQL string literal, or ``None`` when ``expr`` is not
+    one. A doubled ``''`` inside the literal is an escaped quote."""
+    if _SQL_STRING_RE.match(expr):
+        return expr[1:-1].replace("''", "'")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Rule SQL type conversions
+# ---------------------------------------------------------------------------
+#
+# AWS specifies one conversion table for the whole rule SQL dialect, applied
+# whenever an operator or a function is handed a value of a type it does not
+# want: https://docs.aws.amazon.com/iot/latest/developerguide/iot-sql-data-types.html
+# These three helpers are that table. Every operator below coerces through
+# them, so a value of the wrong type resolves the same way wherever it turns up
+# rather than each operator inventing its own policy — the trap this replaces
+# was `regexp_matches(temp, '^2')` matching {"temp": 22} while `temp LIKE '2%'`
+# did not. ``None`` is the "no conversion" answer, i.e. AWS's Undefined.
+
+# The pattern AWS parses a string with when it wants a number, verbatim from the
+# conversion table.
+_SQL_NUMERIC_STRING_RE = re.compile(r"^-?\d+(\.\d+)?([eE]-?\d+)?$")
+
+
+def _sql_as_number(value) -> int | float | None:
+    """Convert to Int/Decimal: numbers pass through, a numeric-looking string
+    converts, and anything else — Boolean included, which AWS converts only
+    through an explicit cast() — is Undefined."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str) and _SQL_NUMERIC_STRING_RE.match(value.strip()):
+        text = value.strip()
+        try:
+            return int(text)
+        except ValueError:
+            return float(text)
+    return None
+
+
+def _sql_as_string(value) -> str | None:
+    """Convert to String: an Int, Decimal, Boolean, Array or Object renders;
+    Null and Undefined do not, and stay Undefined."""
+    if value is _MISSING or value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        # AWS renders a Boolean lowercase, the way JSON does — not Python's
+        # "True"/"False".
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    # Array and Object render as their JSON serialization.
+    return json.dumps(value, separators=(",", ":"))
+
+
+def _sql_as_bool(value) -> bool | None:
+    """Convert to Boolean: a Boolean passes through and the strings "true" and
+    "false" convert (case insensitive). Every other value, a number included, is
+    Undefined."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+    return None
 
 
 def _rule_select_clause(sql: str) -> str:
@@ -1992,6 +2075,20 @@ def _rule_select_clause(sql: str) -> str:
         return "*"
     proj = re.split(r"\s+WHERE\s+", m.group(1), maxsplit=1, flags=re.IGNORECASE)[0]
     return proj.strip()
+
+
+def _rule_where_clause(sql: str) -> str:
+    """Extract the WHERE predicate of a rule SQL statement ("" when absent).
+
+    When a ``FROM '<topic>'`` clause is present the predicate is whatever
+    follows it; for the FROM-less Basic Ingest form the predicate follows the
+    projection directly.
+    """
+    sql = sql or ""
+    m = re.search(r"\bFROM\s+'[^']*'", sql, re.IGNORECASE)
+    tail = sql[m.end():] if m else sql
+    m = re.search(r"\bWHERE\s+(.+)$", tail, re.IGNORECASE | re.DOTALL)
+    return m.group(1).strip() if m else ""
 
 
 def _split_select_items(clause: str) -> list[str]:
@@ -2062,7 +2159,42 @@ def _encode_base64(value, payload: bytes):
     return base64.b64encode(raw).decode("ascii")
 
 
-def _eval_select_function(name: str, args: list[str], topic: str, payload: bytes, message):
+# Rule SQL functions this evaluator implements. AWS's function library is much
+# larger, and a rule using one of the others deploys on AWS, so the emulator
+# accepts them at rule creation rather than failing a working stack — but such a
+# call resolves to Undefined, which silently drops a SELECT field and never
+# satisfies a WHERE clause. Both ends therefore warn, so the misfire is visible
+# instead of looking like "the rule did not match".
+_IMPLEMENTED_SQL_FUNCS = frozenset({
+    "clientid",
+    "encode",
+    "isundefined",
+    "newuuid",
+    "regexp_matches",
+    "replace",
+    "timestamp",
+    "topic",
+})
+_warned_sql_funcs: set[str] = set()
+
+
+def _warn_unimplemented_sql_function(name: str) -> None:
+    """Warn once per function name — rule evaluation runs on every publish, so
+    an unconditional warning would flood the log for one broken rule."""
+    if name in _warned_sql_funcs:
+        return
+    _warned_sql_funcs.add(name)
+    logger.warning(
+        "Rule SQL function %s() is not implemented by MiniStack: it resolves to "
+        "Undefined, so its SELECT field is dropped and a WHERE clause over it "
+        "never matches",
+        name,
+    )
+
+
+def _eval_select_function(
+    name: str, args: list[str], topic: str, payload: bytes, message, client_id: str | None = None
+):
     if name == "encode":
         if len(args) != 2:
             return _MISSING
@@ -2071,7 +2203,7 @@ def _eval_select_function(name: str, args: list[str], topic: str, payload: bytes
             return _MISSING
         # `encode(*, 'base64')` encodes the payload as published — the bytes
         # never round-trip through a text decode.
-        value = payload if source == "*" else _eval_select_expr(source, topic, payload, message)
+        value = payload if source == "*" else _eval_select_expr(source, topic, payload, message, client_id)
         return _encode_base64(value, payload)
     if name == "topic":
         if not args:
@@ -2086,15 +2218,41 @@ def _eval_select_function(name: str, args: list[str], topic: str, payload: bytes
         return segments[index - 1]
     if name == "timestamp" and not args:
         return int(time.time() * 1000)
+    if name == "isundefined":
+        if len(args) != 1:
+            return _MISSING
+        return _eval_select_expr(args[0], topic, payload, message, client_id) is _MISSING
+    if name == "newuuid" and not args:
+        return new_uuid()
+    if name == "replace":
+        if len(args) != 3:
+            return _MISSING
+        old, new = _sql_string_value(args[1].strip()), _sql_string_value(args[2].strip())
+        if old is None or new is None:
+            return _MISSING
+        value = _eval_select_expr(args[0], topic, payload, message, client_id)
+        if not isinstance(value, str):
+            # An Undefined (or non-string) source is Undefined on AWS.
+            return _MISSING
+        return value.replace(old, new)
+    if name == "clientid" and not args:
+        # HTTP publishes carry no MQTT client id — AWS resolves clientid() to
+        # Undefined there, so the field is omitted from the projection.
+        return client_id if client_id else _MISSING
+    # principal() and traceid() land here too: this publish path carries no
+    # certificate identity or trace id to report, so they warn like any other
+    # function the evaluator does not implement.
+    _warn_unimplemented_sql_function(name)
     return _MISSING
 
 
-def _eval_select_expr(expr: str, topic: str, payload: bytes, message):
+def _eval_select_expr(expr: str, topic: str, payload: bytes, message, client_id: str | None = None):
     expr = expr.strip()
     if expr == "*":
         return message
-    if len(expr) >= 2 and expr[0] == "'" and expr[-1] == "'":
-        return expr[1:-1]
+    literal = _sql_string_value(expr)
+    if literal is not None:
+        return literal
     m = _SELECT_FUNC_RE.match(expr)
     if m:
         return _eval_select_function(
@@ -2103,6 +2261,7 @@ def _eval_select_expr(expr: str, topic: str, payload: bytes, message):
             topic,
             payload,
             message,
+            client_id,
         )
     if _SELECT_ATTR_RE.match(expr):
         return _resolve_attribute(message, expr)
@@ -2113,14 +2272,589 @@ def _eval_select_expr(expr: str, topic: str, payload: bytes, message):
     try:
         return float(expr)
     except ValueError:
+        pass
+    # Last, because every form above is a single token and would otherwise be
+    # re-split: a parenthesised group or an arithmetic expression over them.
+    # Its scanners live with the WHERE parser below, which splits on the same
+    # quote/paren rules.
+    return _eval_sql_arithmetic(expr, topic, payload, message, client_id)
+
+
+# ---------------------------------------------------------------------------
+# Rule SQL WHERE evaluation
+# ---------------------------------------------------------------------------
+#
+# Grammar (validated at rule creation, so anything a stored rule carries is
+# evaluable): a boolean expression over leaf clauses, with AWS's precedence —
+# OR binds loosest, then AND, then NOT, and a parenthesised group overrides all
+# three. A predicate is one of
+#   NOT <predicate>
+#   <operand> <op> <operand>     with op in  =  ==  <>  !=  <  >  <=  >=
+#   <operand> [NOT] IN (<operand>, ...)
+#   <operand> [NOT] LIKE '<pattern>'      % matches a run, _ a single character
+#   <operand> BETWEEN <operand> AND <operand>
+#   <operand> IS [NOT] NULL
+#   <operand>                             a boolean-valued attribute or call
+#   regexp_matches(<operand>, '<regex>')
+# where an operand is a quoted string, a numeric literal, a JSON payload
+# attribute path, a SQL function call, or an arithmetic expression over those
+# (+ - * / %, the multiplicative three binding tighter, parentheses regrouping).
+#
+# Evaluation is three-valued — true, false, or Undefined — because AWS's is:
+# every operator here answers Undefined for an operand it cannot use, and only
+# NOT can tell that apart from false. `_eval_where` then fires the rule on true
+# alone, so an Undefined predicate fails closed however it was reached.
+
+_WHERE_OPERATORS = ("<>", "!=", "==", "<=", ">=", "=", "<", ">")
+_REGEXP_MATCHES_RE = re.compile(
+    r"regexp_matches\s*\(\s*(?P<expr>.+?)\s*,\s*'(?P<regex>[^']*)'\s*\)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _top_level_indices(text: str) -> list[int] | None:
+    """Index every character of ``text`` that sits at parenthesis depth 0 and
+    outside a string literal — the only positions where a top-level token (a
+    boolean keyword, a comparison operator, a group delimiter) can start.
+
+    This is the single scanner the WHERE parser splits on; the helpers below
+    differ only in what they look for at those positions. Returns ``None`` when
+    the text is malformed — an unterminated literal or unbalanced parentheses —
+    so the caller rejects it rather than guessing at a grouping.
+    """
+    tops: list[int] = []
+    depth = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "'":
+            i += 1
+            # A doubled '' inside the literal is an escaped quote, not its end.
+            while i < n and not (text[i] == "'" and text[i + 1:i + 2] != "'"):
+                i += 2 if text[i] == "'" else 1
+            if i >= n:
+                return None
+            i += 1
+            continue
+        if ch == "(":
+            if depth == 0:
+                tops.append(i)
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                return None
+            if depth == 0:
+                tops.append(i)
+        elif depth == 0:
+            tops.append(i)
+        i += 1
+    return None if depth else tops
+
+
+def _is_keyword_at(text: str, index: int, keyword: str) -> bool:
+    """True when ``keyword`` starts at ``index`` as a standalone SQL word.
+
+    A keyword may abut a bracket instead of whitespace — ``(a = 1)AND(b = 2)``
+    and ``x IN('a')`` are both SQL AWS accepts — so a bracket counts as a word
+    boundary alongside whitespace.
+    """
+    end = index + len(keyword)
+    if text[index:end].upper() != keyword:
+        return False
+    before = text[index - 1] if index else " "
+    after = text[end] if end < len(text) else " "
+    return (before.isspace() or before == ")") and (after.isspace() or after == "(")
+
+
+def _split_where_terms(pred: str, keyword: str) -> list[str] | None:
+    """Split a WHERE predicate on its top-level ``AND`` / ``OR`` keywords.
+
+    A keyword inside a string literal or a parenthesised group is not a split
+    point, and neither is the ``AND`` belonging to a ``BETWEEN <lo> AND <hi>``.
+    Returns ``None`` when the predicate is malformed.
+    """
+    tops = _top_level_indices(pred)
+    if tops is None:
+        return None
+    parts: list[str] = []
+    start = 0
+    pending_between = 0
+    for i in tops:
+        if _is_keyword_at(pred, i, "BETWEEN"):
+            pending_between += 1
+        elif _is_keyword_at(pred, i, keyword):
+            if keyword == "AND" and pending_between:
+                pending_between -= 1
+                continue
+            parts.append(pred[start:i].strip())
+            start = i + len(keyword)
+    parts.append(pred[start:].strip())
+    return parts
+
+
+def _split_where_keyword(clause: str, keyword: str) -> tuple[str, str] | None:
+    """Split ``clause`` around its first top-level ``keyword``, or ``None`` when
+    the clause does not carry one (or is malformed)."""
+    tops = _top_level_indices(clause)
+    if tops is None:
+        return None
+    for i in tops:
+        if _is_keyword_at(clause, i, keyword):
+            return clause[:i].strip(), clause[i + len(keyword):].strip()
+    return None
+
+
+def _strip_where_group(pred: str) -> str | None:
+    """Return the body of ``pred`` when a single pair of parentheses wraps the
+    whole predicate, else ``None`` (``(a) AND (b)`` is not a wrapped group)."""
+    if not (pred.startswith("(") and pred.endswith(")")):
+        return None
+    # Everything a wrapping group encloses sits at depth 1 or deeper, so its own
+    # delimiters are the only characters left at top level.
+    if _top_level_indices(pred) != [0, len(pred) - 1]:
+        return None
+    return pred[1:-1].strip()
+
+
+# Arithmetic binds tighter than any comparison, so an operand is split on these
+# only after the comparison split has run. Multiplicative binds tighter than
+# additive; within a tier the split is left-associative.
+_ARITHMETIC_TIERS = (("+", "-"), ("*", "/", "%"))
+
+
+def _split_arithmetic(expr: str) -> tuple[str, str, str] | None:
+    """Split ``expr`` at its loosest-binding top-level arithmetic operator, or
+    ``None`` when it carries none (or is malformed).
+
+    Scanning each tier right to left makes the split left-associative: the last
+    top-level ``-`` in ``a - b - c`` is the root, so it groups as ``(a - b) - c``.
+    A ``+``/``-`` that opens the expression or follows another operator is a
+    sign rather than a binary operator — ``a * -5`` is a product, not a
+    difference — so it is not a split point.
+    """
+    tops = _top_level_indices(expr)
+    if tops is None:
+        return None
+    for tier in _ARITHMETIC_TIERS:
+        for i in reversed(tops):
+            if expr[i] not in tier:
+                continue
+            left = expr[:i].strip()
+            if not left or left[-1] in "+-*/%":
+                continue
+            return left, expr[i], expr[i + 1:].strip()
+    return None
+
+
+def _sql_arithmetic(op: str, left, right):
+    """Apply one arithmetic operator under AWS's operand rules.
+
+    https://docs.aws.amazon.com/iot/latest/developerguide/iot-sql-operators.html
+    ``+`` is overloaded: a String operand on either side makes it concatenation,
+    which is why it is settled before the numeric conversion. Everything else is
+    numeric, Int op Int stays Int, and an operand that will not convert leaves
+    the whole expression Undefined.
+    """
+    if op == "+" and (isinstance(left, str) or isinstance(right, str)):
+        parts = (_sql_as_string(left), _sql_as_string(right))
+        return _MISSING if None in parts else parts[0] + parts[1]
+    lnum, rnum = _sql_as_number(left), _sql_as_number(right)
+    if lnum is None or rnum is None:
         return _MISSING
+    if op == "+":
+        return lnum + rnum
+    if op == "-":
+        return lnum - rnum
+    if op == "*":
+        return lnum * rnum
+    if rnum == 0:
+        # AWS does not document division by zero; Undefined is the answer that
+        # keeps a rule from firing on a value the emulator had to invent.
+        return _MISSING
+    if op == "%":
+        # SQL's remainder takes the sign of the dividend; Python's % takes the
+        # divisor's, so it needs correcting rather than using directly.
+        remainder = abs(lnum) % abs(rnum)
+        return -remainder if lnum < 0 else remainder
+    if isinstance(lnum, int) and isinstance(rnum, int):
+        # Int / Int is an Int on AWS. Python's // floors, so negative quotients
+        # need nudging back to the truncation SQL divides with.
+        quotient = lnum // rnum
+        return quotient + 1 if quotient < 0 and quotient * rnum != lnum else quotient
+    return lnum / rnum
+
+
+def _eval_sql_arithmetic(expr: str, topic: str, payload: bytes, message, client_id: str | None):
+    """Evaluate a parenthesised group or an arithmetic expression, or return the
+    missing-value sentinel when ``expr`` is neither."""
+    inner = _strip_where_group(expr)
+    if inner is not None:
+        return _eval_select_expr(inner, topic, payload, message, client_id)
+    parts = _split_arithmetic(expr)
+    if parts is None:
+        return _MISSING
+    left_expr, op, right_expr = parts
+    left = _eval_select_expr(left_expr, topic, payload, message, client_id)
+    right = _eval_select_expr(right_expr, topic, payload, message, client_id)
+    if left is _MISSING or right is _MISSING:
+        return _MISSING
+    return _sql_arithmetic(op, left, right)
+
+
+def _split_comparison(clause: str) -> tuple[str, str, str] | None:
+    """Split ``<left> <op> <right>`` at the first top-level comparison operator."""
+    tops = _top_level_indices(clause)
+    if tops is None:
+        return None
+    for i in tops:
+        for op in _WHERE_OPERATORS:
+            if clause.startswith(op, i):
+                return clause[:i].strip(), op, clause[i + len(op):].strip()
+    return None
+
+
+def _strip_trailing_not(expr: str) -> tuple[str, bool]:
+    """Peel the ``NOT`` off the left operand of ``NOT IN`` / ``NOT LIKE``."""
+    m = re.fullmatch(r"(?P<expr>.*?)\s+NOT", expr.strip(), re.IGNORECASE | re.DOTALL)
+    if m:
+        return m.group("expr").strip(), True
+    return expr.strip(), False
+
+
+def _like_to_regex(pattern: str) -> str:
+    """Translate a SQL LIKE pattern to a regex: ``%`` matches any run of
+    characters, ``_`` exactly one, everything else is literal."""
+    return "".join(
+        ".*" if ch == "%" else "." if ch == "_" else re.escape(ch) for ch in pattern
+    )
+
+
+def _valid_where_operand(expr: str) -> bool:
+    """A WHERE operand `_eval_select_expr` can resolve: string literal, number,
+    payload attribute path, function call, or arithmetic over those.
+
+    The order mirrors the evaluator's, so validation accepts exactly what
+    evaluation resolves.
+    """
+    expr = expr.strip()
+    if not expr:
+        return False
+    if _sql_string_value(expr) is not None:
+        return True
+    if _SELECT_ATTR_RE.match(expr) or _SELECT_FUNC_RE.match(expr):
+        return True
+    try:
+        float(expr)
+        return True
+    except ValueError:
+        pass
+    inner = _strip_where_group(expr)
+    if inner is not None:
+        return _valid_where_operand(inner)
+    parts = _split_arithmetic(expr)
+    return parts is not None and _valid_where_operand(parts[0]) and _valid_where_operand(parts[2])
+
+
+def _parse_where_leaf(clause: str) -> tuple | None:
+    """Parse one leaf clause of the grammar above into a node, or ``None``."""
+    m = _REGEXP_MATCHES_RE.fullmatch(clause)
+    if m:
+        if not _valid_where_operand(m.group("expr")):
+            return None
+        try:
+            re.compile(m.group("regex"))
+        except re.error:
+            return None
+        return ("regexp", m.group("expr"), m.group("regex"))
+
+    parts = _split_where_keyword(clause, "IS")
+    if parts is not None:
+        left, rest = parts
+        negated = re.fullmatch(r"NOT\s+NULL", rest, re.IGNORECASE) is not None
+        if not negated and rest.upper() != "NULL":
+            return None
+        return ("isnull", left, negated) if _valid_where_operand(left) else None
+
+    parts = _split_where_keyword(clause, "BETWEEN")
+    if parts is not None:
+        left, rest = parts
+        bounds = _split_where_keyword(rest, "AND")
+        if bounds is None:
+            return None
+        low, high = bounds
+        if not all(_valid_where_operand(o) for o in (left, low, high)):
+            return None
+        return ("between", left, low, high)
+
+    parts = _split_where_keyword(clause, "IN")
+    if parts is not None:
+        left, negated = _strip_trailing_not(parts[0])
+        inner = _strip_where_group(parts[1])
+        if inner is None or not _valid_where_operand(left):
+            return None
+        options = _split_select_items(inner)
+        if not options or not all(_valid_where_operand(o) for o in options):
+            return None
+        return ("in", left, tuple(options), negated)
+
+    parts = _split_where_keyword(clause, "LIKE")
+    if parts is not None:
+        left, negated = _strip_trailing_not(parts[0])
+        pattern = _sql_string_value(parts[1])
+        if pattern is None or not _valid_where_operand(left):
+            return None
+        return ("like", left, _like_to_regex(pattern), negated)
+
+    cmp_parts = _split_comparison(clause)
+    if cmp_parts is not None:
+        left, op, right = cmp_parts
+        if not (_valid_where_operand(left) and _valid_where_operand(right)):
+            return None
+        return ("cmp", left, op, right)
+
+    # A bare operand is a leaf in its own right: AWS accepts `WHERE enabled` and
+    # `WHERE isUndefined(x)`, each holding only when it resolves to boolean true.
+    clause = clause.strip()
+    if _SELECT_ATTR_RE.match(clause) or _SELECT_FUNC_RE.match(clause):
+        return ("truth", clause)
+    return None
+
+
+def _parse_where(pred: str) -> tuple | None:
+    """Parse a WHERE predicate into an evaluable node tree, or ``None`` if
+    unparseable.
+
+    Nodes are ``("or", [...])`` / ``("and", [...])`` over leaves. OR is split
+    first, so it binds loosest — ``a = 1 AND b = 2 OR c = 3`` groups as
+    ``(a = 1 AND b = 2) OR c = 3``, as on AWS.
+    """
+    pred = (pred or "").strip()
+    if not pred:
+        return None
+    for keyword, kind in (("OR", "or"), ("AND", "and")):
+        terms = _split_where_terms(pred, keyword)
+        if terms is None:
+            return None
+        if len(terms) > 1:
+            nodes: list[tuple] = []
+            for term in terms:
+                node = _parse_where(term)
+                if node is None:
+                    return None
+                nodes.append(node)
+            return (kind, tuple(nodes))
+    # NOT binds tighter than AND and looser than any comparison, so it is peeled
+    # after the boolean splits and before the group and leaf forms. It may abut
+    # its operand's bracket — `NOT(a = 1)` is SQL AWS accepts.
+    if re.match(r"NOT\b", pred, re.IGNORECASE):
+        node = _parse_where(pred[3:].strip())
+        return ("not", node) if node is not None else None
+    inner = _strip_where_group(pred)
+    if inner is not None:
+        return _parse_where(inner)
+    return _parse_where_leaf(pred)
+
+
+def _where_values_equal(left, right) -> bool:
+    # Keep JSON booleans distinct from 0/1 (Python would conflate them).
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left is right
+    return left == right
+
+
+def _eval_where_node(node: tuple, topic: str, payload: bytes, message, client_id: str | None):
+    """Evaluate one parsed WHERE node to true, false, or Undefined.
+
+    Undefined is what each AWS operator answers for an operand it cannot use,
+    and it composes as SQL's three-valued logic: it loses to a true OR sibling
+    and to a false AND sibling, survives every other combination, and is the one
+    value NOT cannot flip. `_eval_where` turns whatever reaches the top into a
+    fire/do-not-fire decision.
+    """
+    kind = node[0]
+    if kind == "or":
+        undefined = False
+        for child in node[1]:
+            result = _eval_where_node(child, topic, payload, message, client_id)
+            if result is True:
+                return True
+            undefined = undefined or result is _MISSING
+        return _MISSING if undefined else False
+    if kind == "and":
+        undefined = False
+        for child in node[1]:
+            result = _eval_where_node(child, topic, payload, message, client_id)
+            if result is False:
+                return False
+            undefined = undefined or result is _MISSING
+        return _MISSING if undefined else True
+    if kind == "not":
+        inner = _eval_where_node(node[1], topic, payload, message, client_id)
+        # NOT Undefined is Undefined, so a predicate over an absent attribute
+        # still fails closed once negated.
+        return _MISSING if inner is _MISSING else not inner
+    if kind == "regexp":
+        text = _sql_as_string(_eval_select_expr(node[1], topic, payload, message, client_id))
+        return _MISSING if text is None else re.search(node[2], text) is not None
+    if kind == "truth":
+        # A bare operand is a predicate only if it converts to a Boolean: true,
+        # false, or the strings spelling them. A number does not, on AWS.
+        value = _sql_as_bool(_eval_select_expr(node[1], topic, payload, message, client_id))
+        return _MISSING if value is None else value
+    if kind == "isnull":
+        value = _eval_select_expr(node[1], topic, payload, message, client_id)
+        if value is _MISSING:
+            # Undefined is not NULL, and it is not "not NULL" either.
+            return _MISSING
+        return value is not None if node[2] else value is None
+    if kind == "between":
+        bounds = [
+            _sql_as_number(_eval_select_expr(expr, topic, payload, message, client_id))
+            for expr in node[1:]
+        ]
+        if any(bound is None for bound in bounds):
+            return _MISSING
+        value, low, high = bounds
+        return low <= value <= high
+    if kind == "in":
+        value = _eval_select_expr(node[1], topic, payload, message, client_id)
+        if value is _MISSING:
+            return _MISSING
+        hit = any(
+            _where_values_equal(value, _eval_select_expr(opt, topic, payload, message, client_id))
+            for opt in node[2]
+        )
+        return not hit if node[3] else hit
+    if kind == "like":
+        # LIKE wants a String, so a number or a boolean converts to one rather
+        # than dropping out — the same conversion regexp_matches() applies.
+        text = _sql_as_string(_eval_select_expr(node[1], topic, payload, message, client_id))
+        if text is None:
+            return _MISSING
+        hit = re.fullmatch(node[2], text) is not None
+        return not hit if node[3] else hit
+
+    _, left_expr, op, right_expr = node
+    left = _eval_select_expr(left_expr, topic, payload, message, client_id)
+    right = _eval_select_expr(right_expr, topic, payload, message, client_id)
+    if left is _MISSING or right is _MISSING:
+        return _MISSING
+    if op in ("=", "=="):
+        # Equality does not convert: on AWS a mismatched pair is simply unequal.
+        return _where_values_equal(left, right)
+    if op in ("<>", "!="):
+        return not _where_values_equal(left, right)
+    lnum, rnum = _sql_as_number(left), _sql_as_number(right)
+    if lnum is None or rnum is None:
+        # Ordering converts both sides to a number first, and is Undefined for
+        # an operand that will not convert.
+        return _MISSING
+    if op == "<":
+        return lnum < rnum
+    if op == ">":
+        return lnum > rnum
+    if op == "<=":
+        return lnum <= rnum
+    return lnum >= rnum
+
+
+def _eval_where(pred: str, topic: str, payload: bytes, message, client_id: str | None = None) -> bool:
+    """Evaluate a WHERE predicate against one publish.
+
+    AWS-faithful failure mode: a clause referencing an attribute missing from
+    the payload evaluates to Undefined, and only a predicate that comes out
+    *true* fires the rule — so Undefined does not fire, and neither does its
+    negation (fail closed). Unparseable predicates are rejected at rule
+    creation; one that slips through (legacy stored state) also fails closed.
+    """
+    node = _parse_where(pred)
+    if node is None:
+        _broker_logger.warning(
+            "IoT rule WHERE clause %r cannot be parsed — no publish will ever "
+            "match it (fail closed)",
+            pred,
+        )
+        return False
+    return _eval_where_node(node, topic, payload, message, client_id) is True
+
+
+class RuleSqlError(ValueError):
+    """Rule SQL the engine cannot evaluate, raised by `put_topic_rule`."""
+
+
+def _validate_rule_sql(sql: str) -> str | None:
+    """Return an error message when the rule SQL cannot be parsed, else None."""
+    sql = sql or ""
+    if not re.match(r"\s*SELECT\s+\S", sql, re.IGNORECASE):
+        return "Rule SQL must be of the form SELECT ... [FROM '<topic>'] [WHERE ...]"
+    if re.search(r"\bFROM\b", sql, re.IGNORECASE) and not re.search(
+        r"\bFROM\s+'[^']*'", sql, re.IGNORECASE
+    ):
+        return "FROM clause must name a topic filter in single quotes"
+    pred = _rule_where_clause(sql)
+    if pred and _parse_where(pred) is None:
+        return f"Unsupported WHERE clause: {pred}"
+    return None
+
+
+_SQL_LITERAL_RE = re.compile(r"'(?:[^']|'')*'")
+_SQL_CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+# Words that may precede a bracket without opening a call: `WHERE (a = 1)`,
+# `x IN ('a', 'b')` and `AND (b = 2)` all put a keyword where the pattern above
+# looks for a function name, and warning about a missing where()/in()/and() is
+# worse than saying nothing.
+_SQL_KEYWORDS = frozenset({
+    "and",
+    "as",
+    "between",
+    "from",
+    "in",
+    "is",
+    "like",
+    "not",
+    "null",
+    "or",
+    "select",
+    "where",
+})
+
+
+def _unimplemented_sql_functions(sql: str) -> list[str]:
+    """Names of the SQL functions ``sql`` calls that this evaluator does not
+    implement. String literals are blanked first so text inside them cannot look
+    like a call, and SQL's own keywords are discounted so a bracketed group or
+    value list is not read as one."""
+    stripped = _SQL_LITERAL_RE.sub("''", sql or "")
+    names = {m.group(1).lower() for m in _SQL_CALL_RE.finditer(stripped)}
+    return sorted(names - _IMPLEMENTED_SQL_FUNCS - _SQL_KEYWORDS)
 
 
 def put_topic_rule(name: str, payload: dict, *, created_at: float | None = None) -> dict:
-    """Store a topic rule from an API-shape (camelCase) ``TopicRulePayload``."""
+    """Store a topic rule from an API-shape (camelCase) ``TopicRulePayload``.
+
+    Raises `RuleSqlError` for SQL the engine cannot evaluate, so a rule that
+    would silently never fire cannot reach the store through any door — the IoT
+    API or the CloudFormation provisioner. SQL that only *calls* something the
+    evaluator lacks is stored (AWS accepts a larger function library than this
+    emulator implements, and rejecting it would fail a stack that deploys on
+    AWS) but warns, so the resulting misfire is visible.
+    """
+    sql = payload.get("sql", "")
+    error = _validate_rule_sql(sql)
+    if error:
+        raise RuleSqlError(error)
+    for func in _unimplemented_sql_functions(sql):
+        logger.warning(
+            "Topic rule %s calls %s(), which MiniStack does not implement: it "
+            "resolves to Undefined, so the rule will not match on it",
+            name,
+            func,
+        )
     rule = {
         "ruleName": name,
-        "sql": payload.get("sql", ""),
+        "sql": sql,
         "actions": payload.get("actions", []) or [],
         "ruleDisabled": bool(payload.get("ruleDisabled", False)),
         "awsIotSqlVersion": payload.get("awsIotSqlVersion", "2016-03-23"),
@@ -2164,14 +2898,20 @@ def _create_topic_rule(name: str, payload: dict) -> tuple:
         )
     if not payload.get("sql"):
         return error_response_json("SqlParseException", "sql is required", 400)
-    put_topic_rule(name, payload)
+    try:
+        put_topic_rule(name, payload)
+    except RuleSqlError as exc:
+        return error_response_json("SqlParseException", str(exc), 400)
     return json_response({})
 
 
 def _replace_topic_rule(name: str, payload: dict) -> tuple:
     if name not in _topic_rules:
         return _error_not_found("Rule", name)
-    put_topic_rule(name, payload)
+    try:
+        put_topic_rule(name, payload)
+    except RuleSqlError as exc:
+        return error_response_json("SqlParseException", str(exc), 400)
     return json_response({})
 
 
@@ -2568,10 +3308,27 @@ def _rule_message(payload: bytes):
         return text
 
 
-def _rule_event(sql: str, topic: str, payload: bytes):
-    """Project a publish payload through a rule's SELECT clause."""
+# Sentinel for "the caller has not decoded the payload yet" — distinct from
+# _MISSING, which is itself a legitimate decoded message (a non-UTF-8 payload).
+_UNDECODED = object()
+
+
+def _rule_event(
+    sql: str,
+    topic: str,
+    payload: bytes,
+    client_id: str | None = None,
+    message=_UNDECODED,
+):
+    """Project a publish payload through a rule's SELECT clause.
+
+    ``message`` lets a caller that already decoded the payload (the dispatch
+    path, which also needs it for the WHERE predicate) pass it in instead of
+    paying for a second JSON parse.
+    """
     payload = payload or b""
-    message = _rule_message(payload)
+    if message is _UNDECODED:
+        message = _rule_message(payload)
     items = _split_select_items(_rule_select_clause(sql)) or ["*"]
 
     if len(items) == 1:
@@ -2582,7 +3339,7 @@ def _rule_event(sql: str, topic: str, payload: bytes):
     event: dict = {}
     for item in items:
         expr, alias = _split_select_alias(item)
-        value = _eval_select_expr(expr, topic, payload, message)
+        value = _eval_select_expr(expr, topic, payload, message, client_id)
         if value is _MISSING:
             continue
         if expr == "*" and alias is None:
@@ -2612,12 +3369,198 @@ def _dispatch_rule_to_lambda(
     ).start()
 
 
-def _run_rule_actions(
-    account_id: str, region: str, rule: dict, payload: bytes, topic: str = ""
+# Depth guard for republish chains: rule A republishing onto a topic that rule
+# A (or a cycle of rules) matches again would recurse without bound. Real AWS
+# does not loop-protect either — such a rule is user error — but the emulator
+# must at least not crash, so the chain is cut and logged past this depth.
+_MAX_REPUBLISH_DEPTH = 8
+_republish_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "_iot_republish_depth", default=0
+)
+
+
+async def _dispatch_rule_republish(
+    account_id: str, region: str, rule_name: str, spec: dict, event
+) -> None:
+    target_topic = spec.get("topic") or ""
+    if not target_topic:
+        _broker_logger.warning(
+            "IoT rule %s: republish action has no topic — skipped", rule_name
+        )
+        return
+    depth = _republish_depth.get()
+    if depth >= _MAX_REPUBLISH_DEPTH:
+        _broker_logger.warning(
+            "IoT rule %s: republish depth limit (%d) reached — dropping republish to %r "
+            "(a rule republishing onto its own topic filter loops forever on AWS too)",
+            rule_name,
+            _MAX_REPUBLISH_DEPTH,
+            target_topic,
+        )
+        return
+    try:
+        qos = int(spec.get("qos") or 0)
+    except (TypeError, ValueError):
+        qos = 0
+    token = _republish_depth.set(depth + 1)
+    try:
+        await broker_publish(
+            account_id,
+            region,
+            target_topic,
+            json.dumps(event).encode("utf-8"),
+            qos=qos,
+        )
+    finally:
+        _republish_depth.reset(token)
+
+
+def _ddb_attribute_value(raw) -> dict:
+    """Map a projected value to a DynamoDB AttributeValue (dynamoDBv2 puts each
+    payload attribute in its own column)."""
+    if isinstance(raw, bool):
+        return {"BOOL": raw}
+    if isinstance(raw, (int, float)):
+        return {"N": str(raw)}
+    if raw is None:
+        return {"NULL": True}
+    if isinstance(raw, (dict, list)):
+        return {"S": json.dumps(raw)}
+    return {"S": str(raw)}
+
+
+def _dispatch_rule_dynamodb(account_id: str, region: str, rule_name: str, spec: dict, event) -> None:
+    from ministack.services import dynamodb as _dynamodb
+
+    table = (spec.get("putItem") or {}).get("tableName") or ""
+    if not table:
+        _broker_logger.warning(
+            "IoT rule %s: dynamoDBv2 action has no putItem.tableName — skipped", rule_name
+        )
+        return
+    if not isinstance(event, dict):
+        _broker_logger.warning(
+            "IoT rule %s: dynamoDBv2 action needs a JSON-object payload, got %s — skipped",
+            rule_name,
+            type(event).__name__,
+        )
+        return
+    item = {key: _ddb_attribute_value(value) for key, value in event.items()}
+    with request_scope(account_id, region):
+        status = _dynamodb._put_item({"TableName": table, "Item": item})[0]
+    if status >= 400:
+        # Raise rather than log: an undeliverable destination is precisely what
+        # the rule's errorAction exists to hear about, and a missing table is
+        # the failure that actually happens locally.
+        raise RuntimeError(
+            f"DynamoDB PutItem to {table} failed with status {status}"
+        )
+    _broker_logger.debug("IoT rule %s → DynamoDB %s", rule_name, table)
+
+
+def _dispatch_rule_sns(account_id: str, region: str, rule_name: str, spec: dict, event) -> None:
+    from ministack.services import sns as _sns
+
+    target = spec.get("targetArn") or ""
+    if not target:
+        _broker_logger.warning(
+            "IoT rule %s: sns action has no targetArn — skipped", rule_name
+        )
+        return
+    with request_scope(account_id, region):
+        # Through SNS's own internal publish, so the message record, the payload
+        # size limit and the FIFO rules are the ones every other producer gets.
+        result = _sns.publish_internal(target, json.dumps(event))
+    if result is None:
+        # As with DynamoDB above: a topic that is not there is an undeliverable
+        # destination, so it reaches the errorAction instead of a log line.
+        raise RuntimeError(f"SNS topic {target} not found")
+    _broker_logger.debug("IoT rule %s → SNS %s", rule_name, target)
+
+
+async def _dispatch_rule_action(
+    account_id: str, region: str, rule_name: str, action: dict, event
+) -> None:
+    """Dispatch one rule action, letting the target service's failure surface.
+
+    Rule actions and the rule's errorAction share the same shapes, so both go
+    through here.
+    """
+    lam = action.get("lambda")
+    if lam and lam.get("functionArn"):
+        _dispatch_rule_to_lambda(account_id, region, lam["functionArn"], event)
+    elif "republish" in action:
+        await _dispatch_rule_republish(
+            account_id, region, rule_name, action["republish"] or {}, event
+        )
+    elif "dynamoDBv2" in action:
+        _dispatch_rule_dynamodb(
+            account_id, region, rule_name, action["dynamoDBv2"] or {}, event
+        )
+    elif "sns" in action:
+        _dispatch_rule_sns(account_id, region, rule_name, action["sns"] or {}, event)
+    else:
+        _broker_logger.debug(
+            "IoT rule %s: unsupported action type %s — skipped",
+            rule_name,
+            next(iter(action), "?"),
+        )
+
+
+async def _dispatch_rule_error_action(
+    account_id: str,
+    region: str,
+    rule: dict,
+    topic: str,
+    payload: bytes,
+    client_id: str | None,
+    failures: list[dict],
+) -> None:
+    """Run the rule's errorAction, carrying AWS's error message document.
+
+    https://docs.aws.amazon.com/iot/latest/developerguide/rule-error-handling.html
+    """
+    error_action = rule.get("errorAction")
+    if not error_action:
+        return
+    rule_name = rule.get("ruleName", "")
+    error_event = {
+        "ruleName": rule_name,
+        "topic": topic,
+        # The emulator's publish path carries no CloudWatch trace id.
+        "cloudwatchTraceId": "",
+        "clientId": client_id or "",
+        "base64OriginalPayload": base64.b64encode(payload).decode("ascii"),
+        "failures": failures,
+    }
+    try:
+        await _dispatch_rule_action(
+            account_id, region, rule_name, error_action, error_event
+        )
+    except Exception as exc:
+        _broker_logger.warning(
+            "IoT rule %s: errorAction failed: %s: %s",
+            rule_name,
+            type(exc).__name__,
+            exc,
+        )
+
+
+async def _run_rule_actions(
+    account_id: str,
+    region: str,
+    rule: dict,
+    payload: bytes,
+    topic: str = "",
+    client_id: str | None = None,
 ) -> None:
     if not rule or rule.get("ruleDisabled"):
         return
-    event = _rule_event(rule.get("sql", ""), topic, payload)
+    payload = payload or b""
+    # Decode once: both the SELECT projection and the WHERE predicate read the
+    # same message.
+    message = _rule_message(payload)
+    event = _rule_event(rule.get("sql", ""), topic, payload, client_id, message=message)
     if event is _MISSING:
         _broker_logger.warning(
             "IoT rule %s: payload is not valid UTF-8 and its SELECT clause "
@@ -2625,19 +3568,47 @@ def _run_rule_actions(
             rule.get("ruleName"),
         )
         return
+    where_pred = _rule_where_clause(rule.get("sql", ""))
+    if where_pred and not _eval_where(where_pred, topic, payload, message, client_id):
+        _broker_logger.debug(
+            "IoT rule %s: WHERE clause did not match on %r — no action dispatched",
+            rule.get("ruleName"),
+            topic,
+        )
+        return
+    rule_name = rule.get("ruleName", "")
+    failures: list[dict] = []
     for action in rule.get("actions", []) or []:
-        lam = action.get("lambda")
-        if lam and lam.get("functionArn"):
-            _dispatch_rule_to_lambda(account_id, region, lam["functionArn"], event)
+        action_type = next(iter(action), "?")
+        try:
+            await _dispatch_rule_action(account_id, region, rule_name, action, event)
+        except Exception as exc:
+            # Never silently, and never let one failing action kill the loop: a
+            # dropped dispatch is indistinguishable from "the rule did not
+            # match", the hardest kind of local failure to diagnose.
+            _broker_logger.warning(
+                "IoT rule %s: %s action failed: %s: %s",
+                rule_name,
+                action_type,
+                type(exc).__name__,
+                exc,
+            )
+            failures.append(
+                {"action": action_type, "errorMessage": f"{type(exc).__name__}: {exc}"}
+            )
+    if failures:
+        await _dispatch_rule_error_action(
+            account_id, region, rule, topic, payload, client_id, failures
+        )
 
 
-def _evaluate_topic_rules(
-    account_id: str, region: str, topic: str, payload: bytes
+async def _evaluate_topic_rules(
+    account_id: str, region: str, topic: str, payload: bytes, client_id: str | None = None
 ) -> None:
     for rule in _rules_for_account(account_id, region):
         filter_ = _rule_topic_filter(rule.get("sql", ""))
         if filter_ and _topic_matches(filter_, topic):
-            _run_rule_actions(account_id, region, rule, payload, topic)
+            await _run_rule_actions(account_id, region, rule, payload, topic, client_id)
 
 
 async def broker_publish(
@@ -2647,13 +3618,14 @@ async def broker_publish(
     payload: bytes,
     qos: int = 0,
     retain: bool = False,
+    client_id: str | None = None,
 ) -> None:
     # Basic Ingest: a publish to `$aws/rules/<ruleName>` is delivered straight
     # to that rule's actions and bypasses pub/sub delivery entirely.
     if topic.startswith(_BASIC_INGEST_PREFIX):
         remainder = topic[len(_BASIC_INGEST_PREFIX):].split("/", 1)
         rule_name = remainder[0]
-        _run_rule_actions(
+        await _run_rule_actions(
             account_id,
             region,
             _topic_rules.get_scoped(account_id, region, rule_name),
@@ -2661,6 +3633,7 @@ async def broker_publish(
             # Under Basic Ingest `topic()` reports the topic after the
             # `$aws/rules/<ruleName>/` prefix, as it does on AWS.
             remainder[1] if len(remainder) > 1 else "",
+            client_id,
         )
         return
 
@@ -2706,7 +3679,7 @@ async def broker_publish(
                         ps.queued_messages = ps.queued_messages[-_MAX_QUEUED_MESSAGES:]
                     break
 
-    _evaluate_topic_rules(account_id, region, topic, payload)
+    await _evaluate_topic_rules(account_id, region, topic, payload, client_id)
 
 
 async def broker_subscribe(
@@ -3087,6 +4060,7 @@ class _WSSession:
                 payload,
                 qos=qos,
                 retain=retain,
+                client_id=self._client_id,
             )
             if qos == 1 and packet_id is not None:
                 await self.send_bytes(_make_puback(packet_id))
