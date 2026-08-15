@@ -2735,10 +2735,73 @@ _KEEPALIVE_KILL_ON_RELEASE = os.environ.get("LAMBDA_KEEPALIVE_MS", "").strip() =
 # Per-function concurrency: only applied when ReservedConcurrentExecutions is
 # explicitly set on the function. Otherwise the function can consume the
 # full account pool, matching AWS.
-# Account-level concurrency cap: AWS default is 1000. We default to unbounded
-# locally (a laptop can't actually run 1000 Lambda containers); users who
-# want AWS-exact throttling behaviour can set LAMBDA_ACCOUNT_CONCURRENCY.
-_ACCOUNT_CONCURRENCY_CAP = int(os.environ.get("LAMBDA_ACCOUNT_CONCURRENCY", "0"))  # 0 = unbounded
+# Per-invocation memory cost of an in-flight execution, measured: a chain of
+# depth 40 took the container to 871 MiB of cgroup memory, depth 20 to 464 MiB.
+_INFLIGHT_MIB = 21
+
+# Fraction of the memory budget concurrency may claim, leaving room for the
+# server itself, page cache, and whatever the handlers allocate.
+_INFLIGHT_BUDGET = 0.5
+
+# AWS's own default account concurrency. Never exceed it: a MiniStack that
+# throttled later than AWS would let code through that AWS rejects.
+_AWS_DEFAULT_ACCOUNT_CONCURRENCY = 1000
+
+
+def _memory_budget_bytes() -> int:
+    """Total memory this process may plan against — cgroup limit if capped."""
+    for path in ("/sys/fs/cgroup/memory.max",                    # cgroup v2
+                 "/sys/fs/cgroup/memory/memory.limit_in_bytes"):  # cgroup v1
+        try:
+            with open(path) as fh:
+                raw = fh.read().strip()
+            if raw and raw != "max":
+                value = int(raw)
+                # An uncapped cgroup reports a sentinel near 2**63; ignore it.
+                if 0 < value < (1 << 62):
+                    return value
+        except Exception:
+            pass
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except Exception:
+        return 2 * 1024 ** 3   # unknowable: assume a small box and stay safe
+
+
+def _default_account_concurrency() -> int:
+    """How many executions may be in flight before we throttle.
+
+    AWS defaults this to 1000 and throttles past it with
+    ``TooManyRequestsException``. MiniStack cannot run 1000 Lambda
+    subprocesses, and the previous default here was **unbounded** — the
+    reasoning being that a laptop can't do 1000 anyway. That is backwards: with
+    no bound, one self-recursing handler takes the process down. It is reachable
+    because ``MAX_INVOKE_DEPTH`` is enforced from a header that only botocore's
+    ``before-call`` hook sets, so a handler whose nested Invoke goes over raw
+    urllib or requests never increments the depth and never trips the limit.
+    Measured: such a handler OOM-killed a 2 GiB container in 8 seconds, 93
+    processes deep, where the depth check never fired once.
+
+    Depth therefore cannot be the safety bound — any transport that bypasses
+    botocore evades it. Concurrency has to be, because every executor passes
+    through ``_acquire_execution_slot`` regardless of how the caller got here.
+
+    Scales to the box so a big machine is not throttled at a small machine's
+    limit, and never exceeds AWS's own 1000. ``LAMBDA_ACCOUNT_CONCURRENCY``
+    still overrides, including ``0`` for genuinely unbounded.
+    """
+    raw = os.environ.get("LAMBDA_ACCOUNT_CONCURRENCY")
+    if raw is not None and raw.strip() != "":
+        try:
+            return int(raw)          # explicit wins, 0 still means unbounded
+        except ValueError:
+            logger.warning("LAMBDA_ACCOUNT_CONCURRENCY=%r is not an integer; using the default",
+                           raw)
+    budget_mib = (_memory_budget_bytes() * _INFLIGHT_BUDGET) / (1024 ** 2)
+    return max(16, min(_AWS_DEFAULT_ACCOUNT_CONCURRENCY, int(budget_mib // _INFLIGHT_MIB)))
+
+
+_ACCOUNT_CONCURRENCY_CAP = _default_account_concurrency()  # 0 = unbounded
 _reaper_started = False
 _reaper_lock = threading.Lock()
 
