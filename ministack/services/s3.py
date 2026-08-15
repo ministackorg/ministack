@@ -275,7 +275,11 @@ def _validate_bucket_name(name: str) -> bool:
 
 
 def _url_encode(value: str) -> str:
-    return url_quote(value, safe="")
+    # S3's `encoding-type=url` percent-encodes key names (spaces, `+`, unicode,
+    # control chars) but leaves the forward slash intact, so a delimiter-collapsed
+    # `CommonPrefixes`/`Delimiter`/`Key` keeps its `/` separators readable — matching
+    # real S3 and RGW. Encoding `/` as %2F broke folder-tree listings. (#1322)
+    return url_quote(value, safe="/")
 
 
 def _parse_bucket_key(path: str, headers: dict):
@@ -409,8 +413,15 @@ def _validate_content_md5(headers: dict, body: bytes):
     if not md5_header:
         return None
     try:
-        expected = base64.b64decode(md5_header)
+        expected = base64.b64decode(md5_header, validate=True)
     except Exception:
+        return _error(
+            "InvalidDigest", "The Content-MD5 you specified is not valid.", 400
+        )
+    # A valid MD5 digest is exactly 16 bytes. A wrong-length (e.g. truncated) value
+    # is malformed, so AWS answers InvalidDigest, not BadDigest (which is reserved
+    # for a well-formed digest that simply doesn't match the body). (#1322)
+    if len(expected) != 16:
         return _error(
             "InvalidDigest", "The Content-MD5 you specified is not valid.", 400
         )
@@ -943,7 +954,7 @@ def _dispatch(
             if "uploads" in query_params:
                 return _create_multipart_upload(bucket, key, headers)
             if "uploadId" in query_params:
-                return _complete_multipart_upload(bucket, key, body, query_params)
+                return _complete_multipart_upload(bucket, key, body, query_params, headers)
             return _error(
                 "MethodNotAllowed",
                 "The specified method is not allowed against this resource.",
@@ -1313,6 +1324,39 @@ def _delete_bucket_encryption(name: str):
         return _no_such_bucket(name)
     _bucket_encryption.pop(name, None)
     return 204, {}, b""
+
+
+def _bucket_default_sse_headers(bucket_name: str) -> dict:
+    """SSE headers a PutObject echoes when the bucket has explicit default
+    encryption (PutBucketEncryption). Real S3 stamps the applied algorithm on the
+    reply (`x-amz-server-side-encryption`, plus the KMS key id for `aws:kms`), which
+    lets a client confirm the object was encrypted as configured. (#1322)"""
+    raw = _bucket_encryption.get(bucket_name)
+    if not raw:
+        return {}
+    try:
+        root = fromstring(raw)
+    except Exception:
+        return {}
+
+    def _first_text(local_name):
+        # SSEAlgorithm / KMSMasterKeyID sit under Rule/ApplyServerSideEncryptionByDefault,
+        # so search descendants by local name (namespace-agnostic), not direct children.
+        for el in root.iter():
+            tag = el.tag.split("}")[-1] if "}" in el.tag else el.tag
+            if tag == local_name and el.text and el.text.strip():
+                return el.text.strip()
+        return None
+
+    algo = _first_text("SSEAlgorithm")
+    if not algo:
+        return {}
+    out = {"x-amz-server-side-encryption": algo}
+    if algo == "aws:kms":
+        kms = _first_text("KMSMasterKeyID")
+        if kms:
+            out["x-amz-server-side-encryption-aws-kms-key-id"] = kms
+    return out
 
 
 def _get_bucket_lifecycle(name: str):
@@ -2467,9 +2511,18 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     if csum_err:
         return csum_err
 
+    # A canned ACL supplied at PutObject time is validated up front (an invalid
+    # value rejects the whole request, as AWS does) and applied below, so
+    # GetObjectAcl reflects it instead of dropping it. (#1322, rest of defect 9)
+    canned_acl = headers.get("x-amz-acl")
+    if canned_acl and canned_acl not in _CANNED_OBJECT_ACLS:
+        return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
+
     etag = f'"{md5_hash(body)}"'
     obj = _build_object_record(body, headers, etag=etag, checksums=checksums)
     bucket["objects"][key] = obj
+    if canned_acl:
+        _object_acl[(bucket_name, key)] = _canned_acl_policy_xml(canned_acl, get_account_id())
 
     # --- Object Lock headers on PutObject ---
     _apply_object_lock_from_headers(bucket_name, key, headers)
@@ -2489,6 +2542,7 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     )
 
     resp_headers = {"ETag": obj["etag"], "Content-Length": "0"}
+    resp_headers.update(_bucket_default_sse_headers(bucket_name))
     if _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
         version_id = new_uuid()
         obj["version_id"] = version_id
@@ -3255,6 +3309,33 @@ def _check_object_lock(bucket_name: str, key: str, headers: dict) -> tuple | Non
     return None
 
 
+def _parse_http_date(value: str):
+    """Parse an RFC 7231 HTTP-date header into a tz-aware UTC datetime, or None."""
+    from email.utils import parsedate_to_datetime
+    try:
+        dt = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_dt.timezone.utc)
+    return dt
+
+
+def _object_mtime_dt(obj: dict):
+    """The object's Last-Modified as a tz-aware datetime at second granularity
+    (Last-Modified is second-precise, so preconditions must compare at that resolution)."""
+    iso = obj.get("last_modified")
+    if not iso:
+        return None
+    try:
+        dt = _dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt.replace(microsecond=0)
+
+
 def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     source = url_unquote(headers.get("x-amz-copy-source", "").lstrip("/"))
     src_path, _, src_query = source.partition("?")
@@ -3320,23 +3401,32 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     # AWS echoes the copied source version on a versioned source.
     copy_src_vid = src_version_id or src_obj.get("version_id")
 
-    # Precondition: x-amz-copy-source-if-match
-    if_match = headers.get("x-amz-copy-source-if-match", "")
-    if if_match and if_match.strip('"') != src_obj["etag"].strip('"'):
-        return _error(
-            "PreconditionFailed",
-            "At least one of the pre-conditions you specified did not hold",
-            412,
-        )
+    # Copy-source preconditions. Per the AWS CopyObject reference (RFC 7232
+    # precedence): x-amz-copy-source-if-match takes precedence over
+    # -if-unmodified-since, and -if-none-match over -if-modified-since, so the
+    # date header only applies when its ETag counterpart is absent.
+    _precond_msg = "At least one of the pre-conditions you specified did not hold"
+    src_mtime = _object_mtime_dt(src_obj)
 
-    # Precondition: x-amz-copy-source-if-none-match — 412 for PUT-like operations.
+    if_match = headers.get("x-amz-copy-source-if-match", "")
+    if if_match:
+        if if_match.strip('"') != src_obj["etag"].strip('"'):
+            return _error("PreconditionFailed", _precond_msg, 412)
+    else:
+        unmod = _parse_http_date(headers.get("x-amz-copy-source-if-unmodified-since", ""))
+        # "Unmodified since" fails when the source was modified after the given time.
+        if unmod and src_mtime and src_mtime > unmod:
+            return _error("PreconditionFailed", _precond_msg, 412)
+
     if_none_match = headers.get("x-amz-copy-source-if-none-match", "")
-    if if_none_match and if_none_match.strip('"') == src_obj["etag"].strip('"'):
-        return _error(
-            "PreconditionFailed",
-            "At least one of the pre-conditions you specified did not hold",
-            412,
-        )
+    if if_none_match:
+        if if_none_match.strip('"') == src_obj["etag"].strip('"'):
+            return _error("PreconditionFailed", _precond_msg, 412)
+    else:
+        mod = _parse_http_date(headers.get("x-amz-copy-source-if-modified-since", ""))
+        # "Modified since" fails when the source has NOT changed since the given time.
+        if mod and src_mtime and src_mtime <= mod:
+            return _error("PreconditionFailed", _precond_msg, 412)
 
     directive = headers.get("x-amz-metadata-directive", "COPY").upper()
     if directive == "REPLACE":
@@ -3839,6 +3929,48 @@ _CANNED_OBJECT_ACLS = {
 }
 
 
+_ACL_GROUP_ALL_USERS = "http://acs.amazonaws.com/groups/global/AllUsers"
+_ACL_GROUP_AUTH_USERS = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers"
+
+# Group grants each canned ACL adds on top of the owner's FULL_CONTROL, per the
+# AWS S3 "Canned ACL" reference. The bucket-owner-* / aws-exec-read variants add
+# only owner/bucket-owner grants, which collapse to the owner in MiniStack's
+# single-account model, so they carry no extra group grant here.
+_CANNED_ACL_GROUP_GRANTS = {
+    "public-read": [(_ACL_GROUP_ALL_USERS, "READ")],
+    "public-read-write": [(_ACL_GROUP_ALL_USERS, "READ"), (_ACL_GROUP_ALL_USERS, "WRITE")],
+    "authenticated-read": [(_ACL_GROUP_AUTH_USERS, "READ")],
+}
+
+
+def _canned_acl_policy_xml(canned: str, owner_id: str) -> str:
+    """AccessControlPolicy XML for a canned ACL: the owner's FULL_CONTROL plus the
+    group grants the canned value implies (e.g. public-read grants AllUsers READ),
+    so GetObjectAcl reflects what the canned ACL actually means rather than a bare
+    owner grant. (#1322, rest of defect 9)"""
+    grants = [
+        '<Grant>'
+        '<Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+        'xsi:type="CanonicalUser">'
+        f"<ID>{owner_id}</ID><DisplayName>ministack</DisplayName></Grantee>"
+        "<Permission>FULL_CONTROL</Permission></Grant>"
+    ]
+    for uri, perm in _CANNED_ACL_GROUP_GRANTS.get(canned, []):
+        grants.append(
+            '<Grant>'
+            '<Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+            f'xsi:type="Group"><URI>{uri}</URI></Grantee>'
+            f"<Permission>{perm}</Permission></Grant>"
+        )
+    return (
+        XML_DECL.decode() + "\n"
+        f'<AccessControlPolicy xmlns="{S3_NS}">'
+        f"<Owner><ID>{owner_id}</ID><DisplayName>ministack</DisplayName></Owner>"
+        f'<AccessControlList>{"".join(grants)}</AccessControlList>'
+        "</AccessControlPolicy>"
+    )
+
+
 def _default_object_acl_xml() -> bytes:
     """Default ACL real AWS returns when no ACL has been set on an object:
     a single Grant of FULL_CONTROL to the bucket owner (CanonicalUser).
@@ -3898,20 +4030,7 @@ def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict):
         if canned not in _CANNED_OBJECT_ACLS:
             return _error("InvalidArgument",
                           f"Invalid x-amz-acl value: {canned}", 400)
-        owner_id = get_account_id()
-        _object_acl[(bucket_name, key)] = (
-            XML_DECL.decode() + "\n"
-            f'<AccessControlPolicy xmlns="{S3_NS}">'
-            f"<Owner><ID>{owner_id}</ID>"
-            f"<DisplayName>ministack</DisplayName></Owner>"
-            f'<AccessControlList><!-- canned: {canned} --><Grant>'
-            f'<Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
-            f'xsi:type="CanonicalUser">'
-            f"<ID>{owner_id}</ID>"
-            f"<DisplayName>ministack</DisplayName></Grantee>"
-            f"<Permission>FULL_CONTROL</Permission></Grant></AccessControlList>"
-            f"</AccessControlPolicy>"
-        )
+        _object_acl[(bucket_name, key)] = _canned_acl_policy_xml(canned, get_account_id())
         return 200, {}, b""
 
     if not body:
@@ -4054,54 +4173,47 @@ def _delete_bucket_replication(bucket_name: str):
 def _collect_list_entries(
     bucket_objects: dict, prefix: str, delimiter: str, max_keys: int, start_after: str
 ):
-    """Walk sorted keys, collecting contents and common prefixes with correct
-    pagination.  When a key falls under a common-prefix group the iterator
-    advances past *all* remaining keys in that group so the next page's
-    marker cleanly skips the entire prefix.
+    """Collect contents and common prefixes with pagination as an ordered list of
+    "rows": a delimiter-collapsed key becomes a single common-prefix row (value =
+    the prefix), any other key is its own contents row (value = the key). Rows are
+    globally sorted, ``marker`` excludes rows at or before it, and ``next_marker``
+    is the value of the LAST row emitted — so when a page ends on a collapsed group
+    the continuation marker is the prefix (e.g. ``boo/``), not an underlying key
+    (``boo/baz/xyzzy``), and resuming from it skips the whole group instead of
+    re-walking it. (#1322, defect 5)
 
     Returns (contents, common_prefixes, is_truncated, next_marker).
     """
-    all_keys = sorted(
-        k for k in bucket_objects if k.startswith(prefix) and k > start_after
-    )
-    contents: list[str] = []
-    common_prefixes: set[str] = set()
-    is_truncated = False
-    count = 0
-    next_marker = ""
-
-    i = 0
-    while i < len(all_keys):
-        k = all_keys[i]
-
+    rows: list[tuple[str, bool]] = []  # (value, is_common_prefix)
+    seen_prefixes: set[str] = set()
+    for k in sorted(k for k in bucket_objects if k.startswith(prefix)):
         if delimiter:
-            suffix = k[len(prefix) :]
+            suffix = k[len(prefix):]
             delim_idx = suffix.find(delimiter)
             if delim_idx >= 0:
                 cp = prefix + suffix[: delim_idx + len(delimiter)]
-                is_new_prefix = cp not in common_prefixes
-                if is_new_prefix:
-                    if count >= max_keys:
-                        is_truncated = True
-                        break
-                    common_prefixes.add(cp)
-                    count += 1
-                # Advance past every remaining key belonging to this prefix
-                # group so the marker lands after the whole group.
-                next_marker = k
-                i += 1
-                while i < len(all_keys) and all_keys[i].startswith(cp):
-                    next_marker = all_keys[i]
-                    i += 1
+                if cp not in seen_prefixes:
+                    seen_prefixes.add(cp)
+                    rows.append((cp, True))
                 continue
+        rows.append((k, False))
 
-        if count >= max_keys:
+    if start_after:
+        rows = [row for row in rows if row[0] > start_after]
+
+    contents: list[str] = []
+    common_prefixes: list[str] = []
+    is_truncated = False
+    next_marker = ""
+    for i, (value, is_prefix) in enumerate(rows):
+        if i >= max_keys:
             is_truncated = True
             break
-        contents.append(k)
-        count += 1
-        next_marker = k
-        i += 1
+        if is_prefix:
+            common_prefixes.append(value)
+        else:
+            contents.append(value)
+        next_marker = value
 
     return contents, common_prefixes, is_truncated, next_marker
 
@@ -4511,7 +4623,7 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
 
 
 def _complete_multipart_upload(
-    bucket_name: str, key: str, body: bytes, query_params: dict
+    bucket_name: str, key: str, body: bytes, query_params: dict, headers: dict | None = None
 ):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
@@ -4649,7 +4761,15 @@ def _complete_multipart_upload(
         _persist_object(bucket_name, key, obj)
 
     root = Element("CompleteMultipartUploadResult", xmlns=S3_NS)
-    s3_host = os.environ.get("MINISTACK_HOST", os.environ.get("AWS_ENDPOINT_URL", "http://localhost:4566"))
+    # Location echoes the endpoint the client actually reached (real S3 returns the
+    # request host), so it is correct on any port/host — not a hard-coded 4566. Falls
+    # back to the configured host only when the request carried no Host header. (#1322)
+    request_host = (headers or {}).get("host")
+    if request_host:
+        scheme = (headers or {}).get("x-forwarded-proto") or "http"
+        s3_host = f"{scheme}://{request_host}"
+    else:
+        s3_host = os.environ.get("MINISTACK_HOST", os.environ.get("AWS_ENDPOINT_URL", "http://localhost:4566"))
     SubElement(root, "Location").text = f"{s3_host}/{bucket_name}/{key}"
     SubElement(root, "Bucket").text = bucket_name
     SubElement(root, "Key").text = key

@@ -57,6 +57,13 @@ from ministack.core.responses import (
     new_uuid,
 )
 from ministack.services import secretsmanager
+from ministack.services.rds_iam_plugin import (
+    ensure_iam_auth_plugin,
+    iam_auth_plugin_enabled,
+)
+from ministack.services.rds_mysql_compat import (
+    ensure_rds_compatibility_procedures,
+)
 
 logger = logging.getLogger("rds")
 
@@ -629,6 +636,7 @@ def restore_state(data):
                         if pending_rotation
                         else cluster.get("_MasterUserPassword", "password")
                     )
+                    root_password = readiness_password
                     readiness_user = cluster.get("MasterUsername", "admin")
                     if _mysql_replication_secondary(cluster):
                         # A fresh secondary volume has only the image's local
@@ -653,6 +661,21 @@ def restore_state(data):
                     else cluster.get("DatabaseName") or "mydb",
                     _container_alive,
                 )
+                if authenticated_ready and _is_mysql_engine(
+                    cluster.get("Engine", ""),
+                ):
+                    _ensure_mysql_compatibility(
+                        container_id,
+                        result.get("readiness_host")
+                        or cluster["_shared_endpoint"]["Address"],
+                        result.get("readiness_port")
+                        or cluster["_shared_endpoint"]["Port"],
+                        root_password,
+                        cluster.get("EngineVersion")
+                        or _default_engine_version(cluster.get("Engine", "")),
+                        cluster_id,
+                        engine=cluster.get("Engine", "aurora-mysql"),
+                    )
                 with _shared_container_lock:
                     current_cluster = _clusters.get(cluster_id)
                     if (
@@ -1343,6 +1366,23 @@ def _start_rds_container_for_instance(db_id, instance):
             pass
     instance["_internal_address"] = internal_host
     instance["_internal_port"] = internal_port
+    if _is_mysql_engine(engine):
+        _ensure_mysql_compatibility(
+            container.id,
+            internal_host or "127.0.0.1",
+            internal_port or host_port,
+            master_pass,
+            engine_version,
+            db_id,
+            engine=engine,
+            database_name=db_name,
+            wait_for_ready=True,
+        )
+        if (
+            _instances.get(db_id) is not instance
+            or instance.get("_docker_container_id") != container.id
+        ):
+            return
     instance["DBInstanceStatus"] = "available"
     logger.info("RDS: respawned container %s for instance %s",
                 container_name, db_id)
@@ -1564,6 +1604,94 @@ def _mysql_admin_connection(cluster):
         "root",
         cluster.get("_MasterUserPassword", "password"),
     )
+
+
+def _mysql_endpoint_admin_connection(host, port, password):
+    import pymysql
+
+    return pymysql.connect(
+        host=host,
+        port=int(port),
+        user="root",
+        password=password,
+        autocommit=True,
+        connect_timeout=3,
+    )
+
+
+def _ensure_mysql_compatibility(
+    container_id,
+    host,
+    port,
+    root_password,
+    engine_version,
+    resource_id,
+    engine="aurora-mysql",
+    database_name=None,
+    wait_for_ready=False,
+):
+    """Best-effort fidelity hook shared by every MySQL-ready path."""
+    _mysql_image, engine_series = _mysql_runtime_for_engine(
+        engine,
+        engine_version,
+    )
+    plugin_enabled = bool(engine_series) and iam_auth_plugin_enabled(
+        engine_series,
+    )
+    container = None
+    if wait_for_ready or plugin_enabled:
+        docker_client = _get_docker()
+        if docker_client and container_id:
+            try:
+                container = docker_client.containers.get(container_id)
+            except Exception as e:
+                logger.warning(
+                    "RDS: failed to inspect MySQL container for %s: %s",
+                    resource_id,
+                    e,
+                )
+
+    def _connection():
+        if wait_for_ready:
+            if container is None:
+                raise RuntimeError("MySQL container is unavailable")
+
+            def _container_alive():
+                try:
+                    container.reload()
+                    return container.status not in (
+                        "exited", "dead", "removing",
+                    )
+                except Exception:
+                    return False
+
+            if not _wait_for_database_ready(
+                host,
+                port,
+                engine,
+                "root",
+                root_password,
+                database_name,
+                _container_alive,
+            ):
+                raise RuntimeError("container exited before plugin installation")
+        return _mysql_endpoint_admin_connection(host, port, root_password)
+
+    procedures_ready = ensure_rds_compatibility_procedures(
+        _connection,
+        resource_id,
+        engine,
+        engine_series,
+    )
+    plugin_ready = False
+    if plugin_enabled and container is not None:
+        plugin_ready = ensure_iam_auth_plugin(
+            container,
+            _connection,
+            engine_series,
+            resource_id,
+        )
+    return procedures_ready, plugin_ready
 
 
 def _mysql_replication_connection(cluster):
@@ -2889,6 +3017,7 @@ def _create_db_instance_impl(p):
 
         def _bg_finalize_ready(
             db_id=db_id, cluster_id=cluster_id, engine=engine,
+            engine_version=engine_version,
             master_user=master_user, master_pass=master_pass,
             readiness_master_pass=readiness_master_pass,
             db_name=db_name, ready_host=ready_host, ready_port=ready_port,
@@ -2917,6 +3046,7 @@ def _create_db_instance_impl(p):
                     return False
             readiness_cluster = _clusters.get(cluster_id) if cluster_id else None
             readiness_user = master_user
+            root_password = readiness_master_pass
             if readiness_cluster and _mysql_replication_secondary(readiness_cluster):
                 readiness_user = "root"
                 if readiness_cluster.get("_mysql_control_user_ready"):
@@ -2931,6 +3061,16 @@ def _create_db_instance_impl(p):
                 ready_host, ready_port, engine, readiness_user,
                 readiness_master_pass, readiness_db_name, _container_alive,
             )
+            if database_ready and _is_mysql_engine(engine):
+                _ensure_mysql_compatibility(
+                    container_id,
+                    ready_host,
+                    ready_port,
+                    root_password,
+                    engine_version,
+                    cluster_id or db_id,
+                    engine=engine,
+                )
             cluster = readiness_cluster
             if cluster:
                 with _shared_container_lock:
@@ -4738,6 +4878,7 @@ def _start_db_cluster(p):
         pending_rotation = cluster.get("_pending_master_password_rotation")
         if pending_rotation:
             readiness_pass = pending_rotation["old_password"]
+        root_password = readiness_pass
         if _mysql_replication_secondary(cluster):
             readiness_user = "root"
             if cluster.get("_mysql_control_user_ready"):
@@ -4748,6 +4889,17 @@ def _start_db_cluster(p):
             ready_host, ready_port, engine, readiness_user,
             readiness_pass, readiness_db, _container_alive,
         )
+        if database_ready and _is_mysql_engine(engine):
+            _ensure_mysql_compatibility(
+                container_id,
+                ready_host,
+                ready_port,
+                root_password,
+                cluster.get("EngineVersion")
+                or _default_engine_version(engine),
+                cluster_id,
+                engine=engine,
+            )
         with _shared_container_lock:
             if (
                 cluster.get("_shared_container_epoch") != container_epoch
@@ -6111,8 +6263,32 @@ def _mysql_community_major_minor(engine_version):
 
 
 def _mysql_image_for_version(engine_version):
+    return _mysql_runtime_for_version(engine_version)[0]
+
+
+def _mysql_runtime_for_engine(engine, engine_version):
+    """Return the actual MySQL-family image and plugin-compatible series."""
+    if engine == "mariadb":
+        return "mariadb:latest", None
+    return _mysql_runtime_for_version(engine_version)
+
+
+def _mysql_runtime_for_version(engine_version):
+    """Return the selected image and the known series encoded in its tag."""
     major_minor = _mysql_community_major_minor(engine_version)
-    return AURORA_MYSQL_IMAGE_MAP.get(major_minor, DEFAULT_AURORA_MYSQL_IMAGE)
+    image = AURORA_MYSQL_IMAGE_MAP.get(
+        major_minor,
+        DEFAULT_AURORA_MYSQL_IMAGE,
+    )
+    _repository, separator, tag = image.rpartition(":")
+    if not separator or tag not in AURORA_MYSQL_IMAGE_MAP:
+        logger.warning(
+            "RDS: cannot derive a supported MySQL series from selected image "
+            "%r; IAM auth plugin artifacts will remain disabled",
+            image,
+        )
+        return image, None
+    return image, tag
 
 
 def _default_port(engine):
@@ -6152,18 +6328,10 @@ def _docker_image_for_engine(engine, engine_version, user, password, db_name):
             5432,
             data_path,
         )
-    if "mysql" in engine or "aurora-mysql" in engine:
+    if _is_mysql_engine(engine):
+        image, _series = _mysql_runtime_for_engine(engine, engine_version)
         return (
-            apply_image_prefix(_mysql_image_for_version(engine_version)),
-            {"MYSQL_ROOT_PASSWORD": password, "MYSQL_ROOT_HOST": "%",
-             "MYSQL_DATABASE": db_name,
-             "MYSQL_USER": user, "MYSQL_PASSWORD": password},
-            3306,
-            "/var/lib/mysql",
-        )
-    if "mariadb" in engine:
-        return (
-            apply_image_prefix("mariadb:latest"),
+            apply_image_prefix(image),
             {"MYSQL_ROOT_PASSWORD": password, "MYSQL_ROOT_HOST": "%",
              "MYSQL_DATABASE": db_name,
              "MYSQL_USER": user, "MYSQL_PASSWORD": password},

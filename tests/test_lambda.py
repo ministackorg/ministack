@@ -3388,6 +3388,245 @@ def test_lambda_layer_delete_idempotent(lam):
     """Deleting a nonexistent version should not error."""
     lam.delete_layer_version(LayerName="no-such-layer-del", VersionNumber=999)
 
+
+def _publish_perm_layer(lam, layer_name):
+    """Publish a one-file layer and return its version number."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("perm.py", "")
+    return lam.publish_layer_version(
+        LayerName=layer_name,
+        Content={"ZipFile": buf.getvalue()},
+    )["Version"]
+
+
+def test_lambda_layer_version_permission_roundtrip(lam):
+    """Add → get → remove, with the policy document in AWS's shape.
+
+    An account principal is reported as that account's root user ARN, and the
+    statement's Resource is the layer version ARN.
+    """
+    layer_name = "perm-roundtrip-layer"
+    version = _publish_perm_layer(lam, layer_name)
+
+    added = lam.add_layer_version_permission(
+        LayerName=layer_name,
+        VersionNumber=version,
+        StatementId="xaccount",
+        Action="lambda:GetLayerVersion",
+        Principal="210987654321",
+    )
+    assert added["RevisionId"]
+
+    got = lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)
+    policy = json.loads(got["Policy"])
+    assert policy["Version"] == "2012-10-17"
+    assert len(policy["Statement"]) == 1
+    statement = policy["Statement"][0]
+    assert statement["Sid"] == "xaccount"
+    assert statement["Effect"] == "Allow"
+    assert statement["Action"] == "lambda:GetLayerVersion"
+    assert statement["Principal"] == {"AWS": "arn:aws:iam::210987654321:root"}
+    assert statement["Resource"].endswith(f":layer:{layer_name}:{version}")
+
+    # The revision id is the policy's, not a fresh value per read.
+    assert got["RevisionId"] == added["RevisionId"]
+    again = lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)
+    assert again["RevisionId"] == got["RevisionId"]
+
+    lam.remove_layer_version_permission(
+        LayerName=layer_name,
+        VersionNumber=version,
+        StatementId="xaccount",
+    )
+    with pytest.raises(ClientError) as exc:
+        lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_lambda_layer_version_permission_wildcard_principal(lam):
+    """A ``*`` principal stays the bare wildcard, and an OrganizationId
+    narrows it with an aws:PrincipalOrgID condition."""
+    layer_name = "perm-wildcard-layer"
+    version = _publish_perm_layer(lam, layer_name)
+
+    lam.add_layer_version_permission(
+        LayerName=layer_name,
+        VersionNumber=version,
+        StatementId="org-wide",
+        Action="lambda:GetLayerVersion",
+        Principal="*",
+        OrganizationId="o-a1b2c3d4e5",
+    )
+    policy = json.loads(
+        lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)["Policy"]
+    )
+    statement = policy["Statement"][0]
+    assert statement["Principal"] == "*"
+    assert statement["Condition"] == {"StringEquals": {"aws:PrincipalOrgID": "o-a1b2c3d4e5"}}
+
+
+def test_lambda_layer_version_permission_stale_revision_id(lam):
+    """A RevisionId that isn't the current one fails the call — on add and on
+    remove — leaving the policy untouched."""
+    layer_name = "perm-revision-layer"
+    version = _publish_perm_layer(lam, layer_name)
+
+    first = lam.add_layer_version_permission(
+        LayerName=layer_name,
+        VersionNumber=version,
+        StatementId="s1",
+        Action="lambda:GetLayerVersion",
+        Principal="*",
+    )
+    stale = first["RevisionId"]
+
+    second = lam.add_layer_version_permission(
+        LayerName=layer_name,
+        VersionNumber=version,
+        StatementId="s2",
+        Action="lambda:GetLayerVersion",
+        Principal="*",
+        RevisionId=stale,
+    )
+    assert second["RevisionId"] != stale
+
+    with pytest.raises(ClientError) as exc:
+        lam.add_layer_version_permission(
+            LayerName=layer_name,
+            VersionNumber=version,
+            StatementId="s3",
+            Action="lambda:GetLayerVersion",
+            Principal="*",
+            RevisionId=stale,
+        )
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailedException"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+
+    with pytest.raises(ClientError) as exc:
+        lam.remove_layer_version_permission(
+            LayerName=layer_name,
+            VersionNumber=version,
+            StatementId="s1",
+            RevisionId=stale,
+        )
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailedException"
+
+    policy = json.loads(
+        lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)["Policy"]
+    )
+    assert sorted(s["Sid"] for s in policy["Statement"]) == ["s1", "s2"]
+
+    # The current revision id is accepted.
+    current = lam.get_layer_version_policy(LayerName=layer_name, VersionNumber=version)["RevisionId"]
+    lam.remove_layer_version_permission(
+        LayerName=layer_name,
+        VersionNumber=version,
+        StatementId="s1",
+        RevisionId=current,
+    )
+
+
+def test_lambda_layer_version_permission_not_found(lam):
+    """Unknown layer, unknown version, and unknown statement all 404."""
+    layer_name = "perm-404-layer"
+    version = _publish_perm_layer(lam, layer_name)
+
+    with pytest.raises(ClientError) as exc:
+        lam.get_layer_version_policy(LayerName="perm-404-no-such-layer", VersionNumber=1)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    with pytest.raises(ClientError) as exc:
+        lam.add_layer_version_permission(
+            LayerName=layer_name,
+            VersionNumber=version + 99,
+            StatementId="s1",
+            Action="lambda:GetLayerVersion",
+            Principal="*",
+        )
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    with pytest.raises(ClientError) as exc:
+        lam.remove_layer_version_permission(
+            LayerName=layer_name,
+            VersionNumber=version,
+            StatementId="never-added",
+        )
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_lambda_layer_version_permission_invalid_principal(lam):
+    """A principal that is neither an account id, ``*``, nor a root ARN is
+    rejected; an OrganizationId is only valid alongside ``*``."""
+    layer_name = "perm-bad-principal-layer"
+    version = _publish_perm_layer(lam, layer_name)
+
+    with pytest.raises(ClientError) as exc:
+        lam.add_layer_version_permission(
+            LayerName=layer_name,
+            VersionNumber=version,
+            StatementId="s1",
+            Action="lambda:GetLayerVersion",
+            Principal="not-an-account",
+        )
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+    with pytest.raises(ClientError) as exc:
+        lam.add_layer_version_permission(
+            LayerName=layer_name,
+            VersionNumber=version,
+            StatementId="s2",
+            Action="lambda:GetLayerVersion",
+            Principal="210987654321",
+            OrganizationId="o-a1b2c3d4e5",
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+
+    # The root-user ARN form the model allows is accepted.
+    lam.add_layer_version_permission(
+        LayerName=layer_name,
+        VersionNumber=version,
+        StatementId="s3",
+        Action="lambda:GetLayerVersion",
+        Principal="arn:aws:iam::210987654321:root",
+    )
+
+
+def test_lambda_layer_version_permission_survives_persistence_roundtrip(lambda_svc_isolated):
+    """A layer version's permission policy is part of the persisted state:
+    gone after the layers are cleared, back after restore_state."""
+    svc, _ = lambda_svc_isolated
+    original_layers = dict(svc._layers._data)
+    layer_name = "perm-persist-layer"
+
+    try:
+        svc._layers._data.clear()
+        status, _headers, _body = svc._publish_layer_version(layer_name, {"Content": {}})
+        assert status == 201
+
+        status, _headers, _body = svc._add_layer_version_permission(
+            layer_name,
+            1,
+            {"StatementId": "persisted", "Action": "lambda:GetLayerVersion", "Principal": "*"},
+        )
+        assert status == 201
+        revision_id = json.loads(_body)["RevisionId"]
+
+        state = svc.get_state()
+        svc._layers._data.clear()
+        status, _headers, _body = svc._get_layer_version_policy(layer_name, 1)
+        assert status == 404
+
+        svc.restore_state(state)
+        status, _headers, body = svc._get_layer_version_policy(layer_name, 1)
+        assert status == 200
+        restored = json.loads(body)
+        assert json.loads(restored["Policy"])["Statement"][0]["Sid"] == "persisted"
+        assert restored["RevisionId"] == revision_id
+    finally:
+        svc._layers._data.clear()
+        svc._layers._data.update(original_layers)
+
 def test_lambda_warm_worker_invalidation(lam):
     """Create function with code v1, invoke, update code to v2, invoke again — must see v2."""
     import io as _io
@@ -6409,6 +6648,87 @@ def test_lambda_invoke_emits_cloudwatch_logs_nodejs(lam, logs):
         lam.delete_function(FunctionName=fname)
 
 
+# ──────────────────── host.docker.internal → host-gateway ────────────────────
+
+
+def _spawn_capture_run_kwargs(monkeypatch, *, endpoint, docker_flags=""):
+    """Spawn one Lambda container against fakes and return the docker kwargs.
+
+    Captures both entry points: the DinD path uses ``containers.create`` (code
+    is docker-cp'd rather than bind-mounted) and everything else uses
+    ``containers.run``, and which one a runner takes is not this test's point.
+    """
+    monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_FLAGS", docker_flags)
+    monkeypatch.setattr(lsvc, "_docker_available", True)
+    monkeypatch.setenv("AWS_ENDPOINT_URL", endpoint)
+
+    captured = {}
+    fake_container = _mk_container()
+    fake_container.ports = {"8080/tcp": [{"HostPort": "9999"}]}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return fake_container
+
+    fake_client = MagicMock()
+    fake_client.containers.run = _capture
+    fake_client.containers.create = _capture
+    fake_client.images.get = MagicMock()
+    monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)
+
+    lsvc._spawn_lambda_container(
+        {"FunctionName": "test-hg-fn", "Runtime": "python3.12",
+         "Handler": "index.handler", "PackageType": "Zip", "Timeout": 3,
+         "MemorySize": 128,
+         "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:test-hg-fn"},
+        _make_zip("def handler(e, c): pass"),
+    )
+    return captured
+
+
+def test_lambda_container_maps_host_docker_internal_to_host_gateway(monkeypatch):
+    """A container pointed at host.docker.internal gets the name mapped.
+
+    AWS_ENDPOINT_URL is rewritten from localhost to host.docker.internal for
+    the container, but that name only resolves out of the box on Docker
+    Desktop. On a native Linux engine it is undefined unless mapped to the
+    magic `host-gateway` address, so a handler's callback dies on DNS.
+    """
+    captured = _spawn_capture_run_kwargs(
+        monkeypatch, endpoint="http://localhost:4566"
+    )
+
+    assert captured["environment"]["AWS_ENDPOINT_URL"] == (
+        "http://host.docker.internal:4566"
+    )
+    assert captured["extra_hosts"] == {"host.docker.internal": "host-gateway"}
+
+
+def test_lambda_container_host_gateway_yields_to_an_explicit_add_host(monkeypatch):
+    """An explicit --add-host for the same name still wins."""
+    captured = _spawn_capture_run_kwargs(
+        monkeypatch,
+        endpoint="http://localhost:4566",
+        docker_flags="--add-host host.docker.internal:10.5.0.1",
+    )
+
+    assert captured["extra_hosts"] == {"host.docker.internal": "10.5.0.1"}
+
+
+def test_lambda_container_without_host_docker_internal_gets_no_mapping(monkeypatch):
+    """An endpoint that names something else is left alone.
+
+    A Docker-network deployment points AWS_ENDPOINT_URL at a container name,
+    which resolves on the network's own DNS; mapping host.docker.internal
+    there would be noise at best.
+    """
+    captured = _spawn_capture_run_kwargs(
+        monkeypatch, endpoint="http://ministack:4566"
+    )
+
+    assert "extra_hosts" not in captured
+
+
 # ──────────────────── LAMBDA_DOCKER_FLAGS ────────────────────
 
 def test_lambda_docker_flags_applied_to_run_kwargs(monkeypatch):
@@ -6431,6 +6751,9 @@ def test_lambda_docker_flags_applied_to_run_kwargs(monkeypatch):
 
     fake_client = MagicMock()
     fake_client.containers.run = _fake_run
+    # A runner that is itself containerised takes the docker-cp path, which
+    # calls containers.create; the flags land in the same kwargs either way.
+    fake_client.containers.create = _fake_run
     fake_client.images.get = MagicMock()
     monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)
 
@@ -6470,7 +6793,10 @@ def test_lambda_docker_flags_applied_to_run_kwargs(monkeypatch):
     assert captured["mem_limit"] == "512m"
     assert captured["shm_size"] == "256m"
     assert captured["cap_add"] == ["SYS_PTRACE"]
-    assert captured["extra_hosts"] == {"myhost": "10.0.0.1"}
+    # The host-gateway mapping is merged in alongside an explicit --add-host.
+    assert captured["extra_hosts"] == {
+        "myhost": "10.0.0.1", "host.docker.internal": "host-gateway",
+    }
     assert captured["tmpfs"] == {"/run": "size=100m"}
     assert captured["privileged"] is True
     assert captured["read_only"] is True
@@ -8846,6 +9172,397 @@ def test_invoke_rie_rewrites_custom_resource_response_url():
         "http://host.docker.internal:4566/_ministack/cfn-response/tok"
     # The caller's event dict must not be mutated in place.
     assert event["ResponseURL"] == "http://localhost:4566/_ministack/cfn-response/tok"
+
+
+# ---------------------------------------------------------------------------
+# RIE invoke — an init failure is terminal, a cold start is not
+# ---------------------------------------------------------------------------
+
+
+class _RieFakeContainer:
+    """Minimal docker-py container stand-in for the RIE invoke path."""
+
+    status = "running"
+    attrs = {"NetworkSettings": {"Networks": {}}}
+    ports = {"8080/tcp": [{"HostPort": "12345"}]}
+
+    def reload(self):
+        pass
+
+    def logs(self, **_kw):
+        return b"[ERROR] Runtime.ImportModuleError"
+
+
+_INIT_ERROR_PAYLOAD = {
+    "errorMessage": "Unable to import module 'index': No module named 'missing_dep'",
+    "errorType": "Runtime.ImportModuleError",
+    "requestId": "",
+    "stackTrace": [],
+}
+
+
+def _rie_init_error(url):
+    """The 502 AWS RIE answers with when the handler module will not import."""
+    return _urlerr.HTTPError(
+        url,
+        502,
+        "Bad Gateway",
+        {"Lambda-Runtime-Function-Error-Type": "Runtime.ImportModuleError"},
+        io.BytesIO(json.dumps(_INIT_ERROR_PAYLOAD).encode()),
+    )
+
+
+@pytest.mark.parametrize(
+    "exc,retryable",
+    [
+        (_urlerr.HTTPError("http://x", 502, "Bad Gateway", {}, io.BytesIO(b"{}")), False),
+        (TimeoutError("timed out"), False),
+        (_urlerr.URLError(ConnectionRefusedError(111, "Connection refused")), True),
+        (_urlerr.URLError(TimeoutError("connect timed out")), True),
+        (ConnectionResetError(104, "Connection reset by peer"), True),
+        (OSError("no route to host"), True),
+    ],
+)
+def test_rie_failure_is_retryable_classification(exc, retryable):
+    """Only a connection-level failure means the container is still coming up."""
+    from ministack.services.lambda_svc import _rie_failure_is_retryable
+
+    assert _rie_failure_is_retryable(exc) is retryable
+
+
+def test_invoke_rie_reports_an_init_error_instead_of_retrying_it():
+    """A reported init error is terminal: one request, and the payload survives.
+
+    RIE answers a failed INIT with a 502 — an `HTTPError`, which is a subclass
+    of `URLError` and so used to land in the connection-refused retry arm. Every
+    retry re-ran INIT and failed identically, for `Timeout * 10 + 20` attempts.
+    """
+    from ministack.services.lambda_svc import _invoke_rie
+
+    calls = []
+
+    def _fake_urlopen(req, timeout=None):
+        calls.append(req.full_url)
+        raise _rie_init_error(req.full_url)
+
+    started = time.time()
+    with patch("urllib.request.urlopen", _fake_urlopen):
+        # Timeout=900 is legal on AWS, and used to buy 9020 retries at 0.1s.
+        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=900)
+    elapsed = time.time() - started
+
+    assert len(calls) == 1
+    assert elapsed < 5
+    assert result["error"] is True
+    assert result["function_error"] == "Unhandled"
+    assert result["body"] == _INIT_ERROR_PAYLOAD
+    assert "Runtime.ImportModuleError" in result["log"]
+
+
+def test_invoke_rie_still_retries_a_container_that_is_still_starting():
+    """The cold-start retry stays: a refused connection is not a function error."""
+    from ministack.services.lambda_svc import _invoke_rie
+
+    calls = []
+
+    class _FakeResp:
+        headers = {}
+
+        def read(self):
+            return json.dumps({"ok": True}).encode()
+
+    def _fake_urlopen(req, timeout=None):
+        calls.append(req.full_url)
+        if len(calls) < 3:
+            raise _urlerr.URLError(ConnectionRefusedError(111, "Connection refused"))
+        return _FakeResp()
+
+    with patch("urllib.request.urlopen", _fake_urlopen):
+        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=5)
+
+    assert len(calls) == 3
+    assert result["body"] == {"ok": True}
+    assert "error" not in result
+
+
+def test_invoke_rie_does_not_re_run_a_handler_that_timed_out():
+    """A read timeout means the handler ran; re-POSTing it just runs it again."""
+    from ministack.services.lambda_svc import _invoke_rie
+
+    calls = []
+
+    def _fake_urlopen(req, timeout=None):
+        calls.append(req.full_url)
+        raise TimeoutError("timed out")
+
+    with patch("urllib.request.urlopen", _fake_urlopen):
+        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=3)
+
+    assert len(calls) == 1
+    assert result["error"] is True
+    assert result["function_error"] == "Unhandled"
+    # The message and type the local and catch-all docker paths already emit.
+    assert result["body"] == {
+        "errorMessage": "Task timed out after 3.00 seconds",
+        "errorType": "Runtime.ExitError",
+    }
+    # Internal signal to _execute_function_docker: do not pool this container.
+    assert result["timeout"] is True
+
+
+def test_invoke_rie_reports_a_non_json_502_body():
+    """A 502 whose body is not the RIE error payload still reports a function error.
+
+    RIE answers a failed INIT with JSON, but a 502 can also come from something
+    else in front of the port (a proxy, a half-written body). The fallback keeps
+    the response shape and carries the header's error type when there is one.
+    """
+    from ministack.services.lambda_svc import _invoke_rie
+
+    def _fake_urlopen(req, timeout=None):
+        raise _urlerr.HTTPError(
+            req.full_url, 502, "Bad Gateway",
+            {"Lambda-Runtime-Function-Error-Type": "Runtime.InvalidEntrypoint"},
+            io.BytesIO(b"<html>502 Bad Gateway</html>"),
+        )
+
+    with patch("urllib.request.urlopen", _fake_urlopen):
+        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=3)
+
+    assert result["error"] is True
+    assert result["function_error"] == "Unhandled"
+    assert result["body"]["errorType"] == "Runtime.InvalidEntrypoint"
+    assert "502" in result["body"]["errorMessage"]
+    assert "<html>502 Bad Gateway</html>" in result["body"]["errorMessage"]
+    # Not a timeout — the container is answering, so it stays poolable.
+    assert "timeout" not in result
+
+
+def test_invoke_rie_non_json_502_without_an_error_type_header():
+    """No error-type header either: the shape holds, with the generic type."""
+    from ministack.services.lambda_svc import _invoke_rie
+
+    def _fake_urlopen(req, timeout=None):
+        raise _urlerr.HTTPError(
+            req.full_url, 502, "Bad Gateway", {}, io.BytesIO(b"not json"),
+        )
+
+    with patch("urllib.request.urlopen", _fake_urlopen):
+        result = _invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=3)
+
+    assert result["body"] == {
+        "errorMessage": "Lambda RIE returned HTTP 502: not json",
+        "errorType": "Runtime.ExitError",
+    }
+
+
+def test_lambda_docker_timeout_recycles_the_container(monkeypatch):
+    """A timed-out container is discarded, not handed to the next invocation.
+
+    Its handler is still running inside the RIE, so pooling it would queue the
+    next invocation behind a zombie. AWS terminates the execution environment
+    on a timeout; this is the same bargain — the next call cold-starts.
+    """
+    from ministack.services import lambda_svc as lsvc
+
+    name = f"lam-timeout-recycle-{_uuid_mod.uuid4().hex[:8]}"
+    config = {
+        "FunctionName": name,
+        "Runtime": "python3.12",
+        "Handler": "index.handler",
+        "Timeout": 3,
+        "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{name}",
+    }
+    spawned = []
+    removed = []
+
+    def _fake_spawn(*_a, **_kw):
+        container = _RieFakeContainer()
+        spawned.append(container)
+        return container, None
+
+    monkeypatch.setattr(lsvc, "LAMBDA_EXECUTOR", "docker")
+    monkeypatch.setattr(lsvc, "_docker_available", True)
+    monkeypatch.setattr(lsvc, "_get_docker_client", lambda: object())
+    monkeypatch.setattr(lsvc, "_ensure_reaper_thread", lambda: None)
+    monkeypatch.setattr(lsvc, "_spawn_lambda_container", _fake_spawn)
+    monkeypatch.setattr(lsvc, "_kill_pool_entry", lambda entry: removed.append(entry))
+
+    def _fake_urlopen(req, timeout=None):
+        raise TimeoutError("timed out")
+
+    try:
+        with patch("urllib.request.urlopen", _fake_urlopen):
+            first = lsvc._execute_function_docker(
+                {"config": config, "code_zip": b"zip"}, {}
+            )
+            second = lsvc._execute_function_docker(
+                {"config": config, "code_zip": b"zip"}, {}
+            )
+    finally:
+        lsvc._pool_kill_function("000000000000", name)
+
+    for result in (first, second):
+        assert result["error"] is True
+        assert result["body"]["errorType"] == "Runtime.ExitError"
+        assert result["body"]["errorMessage"] == "Task timed out after 3.00 seconds"
+        # The recycle signal is internal and must not reach the caller.
+        assert "timeout" not in result
+
+    # The reaper runs off the response path, so wait for it rather than racing.
+    deadline = time.time() + 5
+    while len(removed) < 2 and time.time() < deadline:
+        time.sleep(0.05)
+
+    assert len(spawned) == 2, "second invoke reused the timed-out container"
+    assert spawned[0] is not spawned[1]
+    assert len(removed) == 2, "timed-out containers were not torn down"
+
+
+def test_invoke_rie_gives_up_on_an_unreachable_container(monkeypatch):
+    """An endless refusal is bounded by the reconnect deadline, not by Timeout."""
+    from ministack.services import lambda_svc as lsvc
+
+    monkeypatch.setattr(lsvc, "_RIE_CONNECT_RETRY_SECONDS", 0.5)
+
+    def _fake_urlopen(req, timeout=None):
+        raise _urlerr.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+    started = time.time()
+    with patch("urllib.request.urlopen", _fake_urlopen):
+        result = lsvc._invoke_rie(_RieFakeContainer(), {"k": "v"}, timeout=900)
+    elapsed = time.time() - started
+
+    assert elapsed < 5
+    assert result["error"] is True
+    assert result["body"]["errorType"] == "Runtime.ExitError"
+
+
+def test_lambda_invoke_returns_a_rie_init_error_to_the_caller(monkeypatch):
+    """End to end: Invoke answers 200 + X-Amz-Function-Error, and answers now."""
+    from ministack.services import lambda_svc as lsvc
+
+    name = f"lam-init-error-{_uuid_mod.uuid4().hex[:8]}"
+    config = {
+        "FunctionName": name,
+        "Runtime": "python3.12",
+        "Handler": "index.handler",
+        "Timeout": 900,
+        "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{name}",
+    }
+    monkeypatch.setattr(lsvc, "LAMBDA_EXECUTOR", "docker")
+    # Pin the docker branch: _get_docker_client() returning None (no daemon on
+    # the runner) would silently fall back to the warm executor and test nothing.
+    monkeypatch.setattr(lsvc, "_docker_available", True)
+    monkeypatch.setattr(lsvc, "_get_docker_client", lambda: object())
+    monkeypatch.setattr(lsvc, "_ensure_reaper_thread", lambda: None)
+    monkeypatch.setattr(
+        lsvc, "_spawn_lambda_container", lambda *_a, **_kw: (_RieFakeContainer(), None)
+    )
+    monkeypatch.setattr(lsvc, "_emit_lambda_metrics", lambda *a, **kw: None)
+    monkeypatch.setitem(
+        lsvc._functions, name,
+        {"config": config, "code_zip": b"zip", "versions": {}},
+    )
+
+    def _fake_urlopen(req, timeout=None):
+        raise _rie_init_error(req.full_url)
+
+    started = time.time()
+    try:
+        with patch("urllib.request.urlopen", _fake_urlopen):
+            status, headers, body = asyncio.run(lsvc._invoke(name, {}, {}))
+    finally:
+        lsvc._pool_kill_function("000000000000", name)
+    elapsed = time.time() - started
+
+    assert elapsed < 5
+    assert status == 200
+    assert headers["X-Amz-Function-Error"] == "Unhandled"
+    assert json.loads(body)["errorType"] == "Runtime.ImportModuleError"
+
+
+@pytest.mark.skipif(
+    os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
+    reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
+)
+def test_lambda_docker_timeout_returns_task_timed_out_promptly(lam):
+    """The real RIE end of the timeout story: one AWS-style error, promptly.
+
+    The read timeout must not fall into the cold-start connection poll and
+    re-POST — which re-runs the handler — up to ``timeout * 10 + 20`` times.
+    """
+    fname = f"lam-docker-sleeper-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        "import time\n"
+        "def handler(event, context):\n"
+        "    time.sleep(event.get('sleep', 0))\n"
+        "    return {'slept': event.get('sleep', 0)}\n"
+    )
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Handler="index.handler",
+        Role=_LAMBDA_ROLE, Code={"ZipFile": _make_zip(code)}, Timeout=3,
+    )
+    try:
+        # Warm the container so the timing below excludes the cold start.
+        resp, payload = _invoke_lambda_payload(lam, fname, {"sleep": 0})
+        assert payload == {"slept": 0}
+
+        started = time.time()
+        resp, payload = _invoke_lambda_payload(lam, fname, {"sleep": 10})
+        elapsed = time.time() - started
+        assert resp.get("FunctionError") == "Unhandled"
+        assert payload["errorMessage"] == "Task timed out after 3.00 seconds"
+        assert payload["errorType"] == "Runtime.ExitError"
+        # One timeout, not a retry storm (broken code took 4x+ the Timeout and
+        # surfaced a raw "Lambda RIE failed" instead).
+        assert elapsed < 9, f"timeout took {elapsed:.1f}s — retry storm?"
+
+        # The timed-out container is recycled, and the function stays usable.
+        resp, payload = _invoke_lambda_payload(lam, fname, {"sleep": 0})
+        assert not resp.get("FunctionError"), payload
+        assert payload == {"slept": 0}
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+@pytest.mark.skipif(
+    os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
+    reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
+)
+def test_lambda_docker_init_error_is_reported_not_retried(lam):
+    """The real RIE end of the same story: a handler that cannot import.
+
+    RIE answers such an invocation with a 502 and re-runs INIT on every
+    retry, so this used to spin at ten invocations a second for the whole
+    of `Timeout` before answering.
+    """
+    fname = f"lam-init-err-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(
+            "import missing_dep_xyz\n\n"
+            "def handler(event, context):\n"
+            "    return {'ok': True}\n"
+        )},
+        Timeout=120,
+    )
+    try:
+        started = time.time()
+        resp = lam.invoke(FunctionName=fname, Payload=b"{}")
+        elapsed = time.time() - started
+
+        assert elapsed < 60, "invoke did not return promptly"
+        assert resp["StatusCode"] == 200
+        assert resp["FunctionError"] == "Unhandled"
+        payload = json.loads(resp["Payload"].read())
+        assert payload["errorType"] == "Runtime.ImportModuleError"
+        assert "missing_dep_xyz" in payload["errorMessage"]
+    finally:
+        lam.delete_function(FunctionName=fname)
 
 
 def _ddb_stream_record(seq, stream_arn, created_at=None):

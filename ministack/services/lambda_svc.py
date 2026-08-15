@@ -1654,11 +1654,15 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
                 if policy_sub == "policy":
                     policy_sid = parts[7] if len(parts) > 7 else None
                     if method == "POST" and not policy_sid:
-                        return _add_layer_version_permission(layer_name, ver_num, data)
+                        return _add_layer_version_permission(
+                            layer_name, ver_num, data, query_params
+                        )
                     if method == "GET" and not policy_sid:
                         return _get_layer_version_policy(layer_name, ver_num)
                     if method == "DELETE" and policy_sid:
-                        return _remove_layer_version_permission(layer_name, ver_num, policy_sid)
+                        return _remove_layer_version_permission(
+                            layer_name, ver_num, policy_sid, query_params
+                        )
                 if method == "GET":
                     return _get_layer_version(layer_name, ver_num)
                 if method == "DELETE":
@@ -3276,6 +3280,78 @@ def _classify_function_error(parsed, err_header: str) -> str | None:
     return "Handled" if "statusCode" in parsed else "Unhandled"
 
 
+# A container that never answers is a failed cold start, not a slow one: RIE
+# starts listening within a second or two. Cap the reconnect phase so a
+# function with a long Timeout (900s is legal) cannot hold its caller for
+# fifteen minutes. A request that is actually in flight is bounded separately
+# by urlopen(timeout=timeout).
+_RIE_CONNECT_RETRY_SECONDS = 30.0
+
+
+def _rie_failure_is_retryable(exc: BaseException) -> bool:
+    """Is a failed RIE request worth retrying while the container comes up?
+
+    Only a connection-level failure means "not listening yet". The two
+    terminal cases both look like `OSError` and used to be retried:
+
+    * `HTTPError` — the runtime answered. RIE reports a failed INIT (a handler
+      module that will not import, a stale layer) as a 502 carrying the error
+      payload, and every retry runs INIT again and fails the same way.
+    * a bare `TimeoutError` — the request was accepted and the handler ran past
+      the function's timeout. `URLError` wrapping a timeout is the connect
+      phase, so that one stays retryable.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    if isinstance(exc, urllib.error.URLError):
+        return True
+    return not isinstance(exc, TimeoutError)
+
+
+def _rie_terminal_result(exc: BaseException, timeout: int, logs: str) -> dict:
+    """Shape a terminal RIE failure as AWS shapes it: a function error.
+
+    AWS answers `Invoke` with HTTP 200, `X-Amz-Function-Error: Unhandled` and
+    the error payload in the body; `function_error` here is what makes the
+    caller emit that header.
+
+    The timeout case carries an extra `timeout` key — an internal signal to
+    `_execute_function_docker` that this container must not go back in the warm
+    pool. It is popped there and never reaches a caller's result.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        raw = ""
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict) and parsed.get("errorMessage"):
+            body = parsed
+        else:
+            err_type = exc.headers.get("Lambda-Runtime-Function-Error-Type") if exc.headers else None
+            body = {
+                "errorMessage": f"Lambda RIE returned HTTP {exc.code}: {raw[:500]}",
+                "errorType": err_type or "Runtime.ExitError",
+            }
+        return {"body": body, "error": True, "function_error": "Unhandled", "log": logs}
+    # Read timeout on an accepted POST: the handler ran past its Timeout. The
+    # message and errorType are what the local (~`_execute_function_local`) and
+    # catch-all docker paths already emit for a timeout, so every executor
+    # agrees on one shape.
+    body = {
+        "errorMessage": f"Task timed out after {timeout}.00 seconds",
+        "errorType": "Runtime.ExitError",
+    }
+    return {
+        "body": body, "error": True, "function_error": "Unhandled",
+        "log": logs, "timeout": True,
+    }
+
+
 def _invoke_rie(container, event: dict, timeout: int) -> dict:
     """POST event to a running RIE container's HTTP endpoint."""
     import urllib.request
@@ -3287,10 +3363,14 @@ def _invoke_rie(container, event: dict, timeout: int) -> dict:
     if isinstance(event, dict) and event.get("ResponseURL"):
         event = {**event, "ResponseURL": _rewrite_host_for_container(event["ResponseURL"])}
     max_attempts = int(timeout * 10) + 20
+    connect_deadline = time.time() + min(timeout + 2.0, _RIE_CONNECT_RETRY_SECONDS)
     for _attempt in range(max_attempts):
+        if time.time() > connect_deadline:
+            break
         container.reload()
         if container.status != "running":
             break
+        attempt_start = time.time()
         try:
             networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
             # Try Docker network first (container-to-container)
@@ -3332,10 +3412,15 @@ def _invoke_rie(container, event: dict, timeout: int) -> dict:
                 result["error"] = True
                 result["function_error"] = function_error
             return result
-        except (urllib.error.URLError, ConnectionRefusedError, OSError):
+        except (urllib.error.URLError, ConnectionRefusedError, OSError) as exc:
+            if not _rie_failure_is_retryable(exc):
+                logs = container.logs(
+                    stdout=True, stderr=True, since=attempt_start
+                ).decode("utf-8", errors="replace").strip()
+                return _rie_terminal_result(exc, timeout, logs)
             time.sleep(0.1)
             continue
-    # Timed out
+    # Never became reachable
     stdout = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
     return {
         "body": {"errorMessage": f"Lambda RIE failed: {stdout[:500]}", "errorType": "Runtime.ExitError"},
@@ -3613,6 +3698,19 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
             run_kwargs.setdefault("mounts", []).extend(df_mounts)
         run_kwargs.update(df_kwargs)
 
+    # `host.docker.internal` only resolves out of the box on Docker Desktop
+    # (macOS/Windows). On a native Linux engine the name is undefined inside
+    # containers unless it is mapped to the special `host-gateway` address, so
+    # every nested SDK call a handler makes against AWS_ENDPOINT_URL dies on
+    # DNS before reaching this server. Map it whenever the container is pointed
+    # at that name, as the ECS and EKS container paths already do. After the
+    # flags merge, and setdefault twice over, so an explicit
+    # `--add-host host.docker.internal:...` in LAMBDA_DOCKER_FLAGS still wins.
+    if "host.docker.internal" in endpoint:
+        run_kwargs.setdefault("extra_hosts", {}).setdefault(
+            "host.docker.internal", "host-gateway"
+        )
+
     # Pull the image on first use (both Zip RIE images and user Image types)
     try:
         client.images.get(image)
@@ -3750,7 +3848,21 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
 
     try:
         result = _invoke_rie(entry["container"], event, timeout)
-        if result.get("error") and not _is_container_running(entry["container"]):
+        # `timeout` is _invoke_rie's internal signal to this function; pop it so
+        # only the caller-facing keys survive into the invoke response.
+        if result.pop("timeout", False):
+            # Task timed out: AWS terminates the execution environment. Ours
+            # still has the handler running inside the RIE, so returning the
+            # container to the pool would queue the next invocation behind a
+            # zombie handler. Recycle it — off the response path, because the
+            # stop (SIGTERM grace + SIGKILL) takes seconds and the caller
+            # should see the timeout at the timeout mark, as on AWS.
+            threading.Thread(
+                target=_pool_remove, args=(entry,), daemon=True,
+                name="ministack-lambda-timeout-reaper",
+            ).start()
+            entry = None
+        elif result.get("error") and not _is_container_running(entry["container"]):
             # Container died during invocation — evict so next caller doesn't pick a corpse
             _pool_remove(entry)
             entry = None
@@ -5035,6 +5147,7 @@ def _publish_layer_version(layer_name: str, data: dict):
         },
         "_zip_data": zip_data,
         "_policy": {"Version": "2012-10-17", "Id": "default", "Statement": []},
+        "_policy_revision_id": new_uuid(),
     }
     layer["versions"].append(ver_config)
     out = {k: v for k, v in ver_config.items() if not k.startswith("_")}
@@ -5219,7 +5332,55 @@ def _find_layer_version(
     )
 
 
-def _add_layer_version_permission(layer_name: str, version: int, data: dict):
+# A layer version's permission policy carries its own revision id, bumped on
+# every successful mutation. Callers pass the one they last read back as the
+# ``RevisionId`` query parameter to get optimistic concurrency; a stale one is
+# rejected with PreconditionFailedException (412) rather than silently
+# clobbering a policy that changed underneath them.
+_LAYER_PRINCIPAL_RE = re.compile(r"^(\d{12}|\*|arn:aws[a-zA-Z-]*:iam::\d{12}:root)$")
+
+
+def _layer_policy_revision_id(vc: dict) -> str:
+    """Return the layer version policy's current revision id, minting one for
+    layer versions published before revision ids were tracked."""
+    revision_id = vc.get("_policy_revision_id")
+    if not revision_id:
+        revision_id = new_uuid()
+        vc["_policy_revision_id"] = revision_id
+    return revision_id
+
+
+def _layer_policy_revision_mismatch(vc: dict, query_params: dict | None):
+    """Return a 412 response when the caller's RevisionId is not the current one."""
+    requested = _qp_first(query_params or {}, "RevisionId")
+    if requested and requested != _layer_policy_revision_id(vc):
+        return error_response_json(
+            "PreconditionFailedException",
+            "The RevisionId provided does not match the latest RevisionId for the layer "
+            "version policy. Call the GetLayerVersionPolicy API to retrieve the latest "
+            "RevisionId for your resource.",
+            412,
+        )
+    return None
+
+
+def _layer_statement_principal(principal: str):
+    """Render an AddLayerVersionPermission principal the way the policy document
+    reports it: an account id becomes that account's root user ARN, ``*`` stays
+    the bare wildcard."""
+    if principal == "*":
+        return "*"
+    if principal.isdigit():
+        return {"AWS": f"arn:aws:iam::{principal}:root"}
+    return {"AWS": principal}
+
+
+def _add_layer_version_permission(
+    layer_name: str,
+    version: int,
+    data: dict,
+    query_params: dict | None = None,
+):
     vc, err = _find_layer_version(layer_name, version)
     if err:
         return err
@@ -5232,6 +5393,28 @@ def _add_layer_version_permission(layer_name: str, version: int, data: dict):
             "constraint: Member must satisfy regular expression pattern: lambda:GetLayerVersion",
             400,
         )
+
+    principal = data.get("Principal", "")
+    if not _LAYER_PRINCIPAL_RE.match(principal):
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{principal}' at 'principal' failed to "
+            "satisfy constraint: Member must satisfy regular expression pattern: "
+            r"\d{12}|\*|arn:(aws[a-zA-Z-]*):iam::\d{12}:root",
+            400,
+        )
+
+    org_id = data.get("OrganizationId")
+    if org_id and principal != "*":
+        return error_response_json(
+            "InvalidParameterValueException",
+            "The principal must be * when an organization id is provided.",
+            400,
+        )
+
+    err = _layer_policy_revision_mismatch(vc, query_params)
+    if err:
+        return err
 
     sid = data.get("StatementId", "")
     policy = vc.setdefault("_policy", {"Version": "2012-10-17", "Id": "default", "Statement": []})
@@ -5247,26 +5430,35 @@ def _add_layer_version_permission(layer_name: str, version: int, data: dict):
     statement = {
         "Sid": sid,
         "Effect": "Allow",
-        "Principal": data.get("Principal", "*"),
+        "Principal": _layer_statement_principal(principal),
         "Action": action,
         "Resource": vc["LayerVersionArn"],
     }
-    org_id = data.get("OrganizationId")
     if org_id:
         statement["Condition"] = {"StringEquals": {"aws:PrincipalOrgID": org_id}}
 
     policy["Statement"].append(statement)
+    vc["_policy_revision_id"] = new_uuid()
     return json_response(
         {
             "Statement": json.dumps(statement),
-            "RevisionId": new_uuid(),
+            "RevisionId": vc["_policy_revision_id"],
         },
         201,
     )
 
 
-def _remove_layer_version_permission(layer_name: str, version: int, sid: str):
+def _remove_layer_version_permission(
+    layer_name: str,
+    version: int,
+    sid: str,
+    query_params: dict | None = None,
+):
     vc, err = _find_layer_version(layer_name, version)
+    if err:
+        return err
+
+    err = _layer_policy_revision_mismatch(vc, query_params)
     if err:
         return err
 
@@ -5279,6 +5471,7 @@ def _remove_layer_version_permission(layer_name: str, version: int, sid: str):
             f"Statement {sid} is not found in resource policy.",
             404,
         )
+    vc["_policy_revision_id"] = new_uuid()
     return 204, {}, b""
 
 
@@ -5297,7 +5490,7 @@ def _get_layer_version_policy(layer_name: str, version: int):
     return json_response(
         {
             "Policy": json.dumps(policy),
-            "RevisionId": new_uuid(),
+            "RevisionId": _layer_policy_revision_id(vc),
         }
     )
 
