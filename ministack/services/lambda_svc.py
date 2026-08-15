@@ -1563,11 +1563,15 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
                 if policy_sub == "policy":
                     policy_sid = parts[7] if len(parts) > 7 else None
                     if method == "POST" and not policy_sid:
-                        return _add_layer_version_permission(layer_name, ver_num, data)
+                        return _add_layer_version_permission(
+                            layer_name, ver_num, data, query_params
+                        )
                     if method == "GET" and not policy_sid:
                         return _get_layer_version_policy(layer_name, ver_num)
                     if method == "DELETE" and policy_sid:
-                        return _remove_layer_version_permission(layer_name, ver_num, policy_sid)
+                        return _remove_layer_version_permission(
+                            layer_name, ver_num, policy_sid, query_params
+                        )
                 if method == "GET":
                     return _get_layer_version(layer_name, ver_num)
                 if method == "DELETE":
@@ -4919,6 +4923,7 @@ def _publish_layer_version(layer_name: str, data: dict):
         },
         "_zip_data": zip_data,
         "_policy": {"Version": "2012-10-17", "Id": "default", "Statement": []},
+        "_policy_revision_id": new_uuid(),
     }
     layer["versions"].append(ver_config)
     out = {k: v for k, v in ver_config.items() if not k.startswith("_")}
@@ -5103,7 +5108,55 @@ def _find_layer_version(
     )
 
 
-def _add_layer_version_permission(layer_name: str, version: int, data: dict):
+# A layer version's permission policy carries its own revision id, bumped on
+# every successful mutation. Callers pass the one they last read back as the
+# ``RevisionId`` query parameter to get optimistic concurrency; a stale one is
+# rejected with PreconditionFailedException (412) rather than silently
+# clobbering a policy that changed underneath them.
+_LAYER_PRINCIPAL_RE = re.compile(r"^(\d{12}|\*|arn:aws[a-zA-Z-]*:iam::\d{12}:root)$")
+
+
+def _layer_policy_revision_id(vc: dict) -> str:
+    """Return the layer version policy's current revision id, minting one for
+    layer versions published before revision ids were tracked."""
+    revision_id = vc.get("_policy_revision_id")
+    if not revision_id:
+        revision_id = new_uuid()
+        vc["_policy_revision_id"] = revision_id
+    return revision_id
+
+
+def _layer_policy_revision_mismatch(vc: dict, query_params: dict | None):
+    """Return a 412 response when the caller's RevisionId is not the current one."""
+    requested = _qp_first(query_params or {}, "RevisionId")
+    if requested and requested != _layer_policy_revision_id(vc):
+        return error_response_json(
+            "PreconditionFailedException",
+            "The RevisionId provided does not match the latest RevisionId for the layer "
+            "version policy. Call the GetLayerVersionPolicy API to retrieve the latest "
+            "RevisionId for your resource.",
+            412,
+        )
+    return None
+
+
+def _layer_statement_principal(principal: str):
+    """Render an AddLayerVersionPermission principal the way the policy document
+    reports it: an account id becomes that account's root user ARN, ``*`` stays
+    the bare wildcard."""
+    if principal == "*":
+        return "*"
+    if principal.isdigit():
+        return {"AWS": f"arn:aws:iam::{principal}:root"}
+    return {"AWS": principal}
+
+
+def _add_layer_version_permission(
+    layer_name: str,
+    version: int,
+    data: dict,
+    query_params: dict | None = None,
+):
     vc, err = _find_layer_version(layer_name, version)
     if err:
         return err
@@ -5116,6 +5169,28 @@ def _add_layer_version_permission(layer_name: str, version: int, data: dict):
             "constraint: Member must satisfy regular expression pattern: lambda:GetLayerVersion",
             400,
         )
+
+    principal = data.get("Principal", "")
+    if not _LAYER_PRINCIPAL_RE.match(principal):
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{principal}' at 'principal' failed to "
+            "satisfy constraint: Member must satisfy regular expression pattern: "
+            r"\d{12}|\*|arn:(aws[a-zA-Z-]*):iam::\d{12}:root",
+            400,
+        )
+
+    org_id = data.get("OrganizationId")
+    if org_id and principal != "*":
+        return error_response_json(
+            "InvalidParameterValueException",
+            "The principal must be * when an organization id is provided.",
+            400,
+        )
+
+    err = _layer_policy_revision_mismatch(vc, query_params)
+    if err:
+        return err
 
     sid = data.get("StatementId", "")
     policy = vc.setdefault("_policy", {"Version": "2012-10-17", "Id": "default", "Statement": []})
@@ -5131,26 +5206,35 @@ def _add_layer_version_permission(layer_name: str, version: int, data: dict):
     statement = {
         "Sid": sid,
         "Effect": "Allow",
-        "Principal": data.get("Principal", "*"),
+        "Principal": _layer_statement_principal(principal),
         "Action": action,
         "Resource": vc["LayerVersionArn"],
     }
-    org_id = data.get("OrganizationId")
     if org_id:
         statement["Condition"] = {"StringEquals": {"aws:PrincipalOrgID": org_id}}
 
     policy["Statement"].append(statement)
+    vc["_policy_revision_id"] = new_uuid()
     return json_response(
         {
             "Statement": json.dumps(statement),
-            "RevisionId": new_uuid(),
+            "RevisionId": vc["_policy_revision_id"],
         },
         201,
     )
 
 
-def _remove_layer_version_permission(layer_name: str, version: int, sid: str):
+def _remove_layer_version_permission(
+    layer_name: str,
+    version: int,
+    sid: str,
+    query_params: dict | None = None,
+):
     vc, err = _find_layer_version(layer_name, version)
+    if err:
+        return err
+
+    err = _layer_policy_revision_mismatch(vc, query_params)
     if err:
         return err
 
@@ -5163,6 +5247,7 @@ def _remove_layer_version_permission(layer_name: str, version: int, sid: str):
             f"Statement {sid} is not found in resource policy.",
             404,
         )
+    vc["_policy_revision_id"] = new_uuid()
     return 204, {}, b""
 
 
@@ -5181,7 +5266,7 @@ def _get_layer_version_policy(layer_name: str, version: int):
     return json_response(
         {
             "Policy": json.dumps(policy),
-            "RevisionId": new_uuid(),
+            "RevisionId": _layer_policy_revision_id(vc),
         }
     )
 

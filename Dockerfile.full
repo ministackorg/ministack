@@ -28,6 +28,63 @@ RUN rm -rf /usr/local/lib/python3.13/site-packages/awscli/examples \
     && rm -rf /usr/local/lib/python3.13/site-packages/_duckdb-stubs \
     && rm -rf /usr/local/lib/python3.13/site-packages/adbc_driver_duckdb
 
+# Compile the IAM-auth compatibility plugin against each supported MySQL
+# series. The compiler and headers remain isolated in these build stages.
+FROM mysql:8.0 AS plugin-build-80
+USER root
+RUN mysql_version="$(rpm -q --qf '%{VERSION}-%{RELEASE}' mysql-community-server-minimal)" \
+    && sed -i 's#/docker/#/#' /etc/yum.repos.d/mysql-community-minimal.repo \
+    && microdnf install -y gcc-c++ "mysql-community-debugsource-${mysql_version}" \
+    && microdnf clean all
+ARG TARGETARCH
+COPY contrib/mysql-iam-plugin/aws_auth_plugin.cc /tmp/aws_auth_plugin.cc
+RUN arch="${TARGETARCH}"; \
+    if [ -z "${arch}" ]; then \
+      case "$(uname -m)" in \
+        x86_64) arch=amd64 ;; \
+        aarch64) arch=arm64 ;; \
+        *) echo "unsupported build architecture: $(uname -m)" >&2; exit 1 ;; \
+      esac; \
+    fi; \
+    header="$(rpm -ql mysql-community-debugsource | grep '/include/mysql/plugin_auth.h$' | head -1)"; \
+    include_dir="$(dirname "$(dirname "${header}")")"; \
+    mkdir -p "/opt/ministack/mysql-plugins/8.0/${arch}"; \
+    g++ -O2 -Wall -Wextra -Werror -fPIC -shared \
+      -DMYSQL_ABI_CHECK -DMYSQL_DYNAMIC_PLUGIN \
+      -I"${include_dir}" \
+      -o "/opt/ministack/mysql-plugins/8.0/${arch}/aws_auth_plugin.so" \
+      /tmp/aws_auth_plugin.cc; \
+    nm -D "/opt/ministack/mysql-plugins/8.0/${arch}/aws_auth_plugin.so" \
+      | grep -q ' _mysql_plugin_interface_version_$'
+
+FROM mysql:8.4 AS plugin-build
+USER root
+RUN mysql_version="$(rpm -q --qf '%{VERSION}-%{RELEASE}' mysql-community-server-minimal)" \
+    && sed -i 's#/docker/#/#' /etc/yum.repos.d/mysql-community-minimal.repo \
+    && microdnf install -y gcc-c++ "mysql-community-debugsource-${mysql_version}" \
+    && microdnf clean all
+ARG TARGETARCH
+COPY contrib/mysql-iam-plugin/aws_auth_plugin.cc /tmp/aws_auth_plugin.cc
+RUN arch="${TARGETARCH}"; \
+    if [ -z "${arch}" ]; then \
+      case "$(uname -m)" in \
+        x86_64) arch=amd64 ;; \
+        aarch64) arch=arm64 ;; \
+        *) echo "unsupported build architecture: $(uname -m)" >&2; exit 1 ;; \
+      esac; \
+    fi; \
+    header="$(rpm -ql mysql-community-debugsource | grep '/include/mysql/plugin_auth.h$' | head -1)"; \
+    include_dir="$(dirname "$(dirname "${header}")")"; \
+    mkdir -p "/opt/ministack/mysql-plugins/8.4/${arch}"; \
+    g++ -O2 -Wall -Wextra -Werror -fPIC -shared \
+      -DMYSQL_ABI_CHECK -DMYSQL_DYNAMIC_PLUGIN \
+      -I"${include_dir}" \
+      -o "/opt/ministack/mysql-plugins/8.4/${arch}/aws_auth_plugin.so" \
+      /tmp/aws_auth_plugin.cc; \
+    nm -D "/opt/ministack/mysql-plugins/8.4/${arch}/aws_auth_plugin.so" \
+      | grep -q ' _mysql_plugin_interface_version_$'
+COPY --from=plugin-build-80 /opt/ministack/mysql-plugins/8.0 /opt/ministack/mysql-plugins/8.0
+
 FROM python:3.13-slim
 
 LABEL maintainer="MiniStack" \
@@ -56,6 +113,7 @@ COPY bin/awslocal /usr/local/bin/awslocal
 RUN chmod +x /usr/local/bin/awslocal
 
 COPY ministack/ ministack/
+COPY --from=plugin-build /opt/ministack/mysql-plugins /opt/ministack/mysql-plugins
 
 RUN groupadd -r ministack && useradd -r -g ministack ministack
 RUN mkdir -p /tmp/ministack-data/s3 && chown -R ministack:ministack /tmp/ministack-data
