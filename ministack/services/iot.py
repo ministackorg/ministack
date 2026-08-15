@@ -11,6 +11,9 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``AttachThingPrincipal`` / ``DetachThingPrincipal``
   - Policies: ``CreatePolicy``, ``CreatePolicyVersion``, ``AttachPolicy``,
     ``DetachPolicy``, etc.
+  - Fleet indexing: ``UpdateIndexingConfiguration`` /
+    ``GetIndexingConfiguration`` / ``DescribeIndex`` / ``ListIndices``, and
+    ``SearchIndex`` over the live registry + shadows
   - ``DescribeEndpoint`` returning a per-account hostname
 
 This is the control plane — pure HTTP/JSON, no MQTT broker
@@ -78,6 +81,8 @@ _certificates: AccountRegionScopedDict = AccountRegionScopedDict()
 _policies: AccountRegionScopedDict = AccountRegionScopedDict()
 _topic_rules: AccountRegionScopedDict = AccountRegionScopedDict()
 _shadows: AccountRegionScopedDict = AccountRegionScopedDict()
+# Fleet-indexing configuration, one entry per account+region.
+_indexing_config: AccountRegionScopedDict = AccountRegionScopedDict()
 
 # Local CA state — lazily generated on first use, persisted across restarts.
 import threading
@@ -167,6 +172,7 @@ def get_state() -> dict:
         "policies": copy.deepcopy(_policies),
         "topic_rules": copy.deepcopy(_topic_rules),
         "shadows": copy.deepcopy(_shadows),
+        "indexing_config": copy.deepcopy(_indexing_config),
         "ca": {"ca_cert_pem": _ca_cert_pem, "ca_key_pem": _ca_key_pem}
         if _ca_cert_pem and _ca_key_pem
         else {},
@@ -185,6 +191,7 @@ def restore_state(data: dict | None) -> None:
     _policies.update(data.get("policies", {}))
     _topic_rules.update(data.get("topic_rules", {}))
     _shadows.update(data.get("shadows", {}))
+    _indexing_config.update(data.get("indexing_config", {}))
     ca_data = data.get("ca")
     if ca_data:
         cert = ca_data.get("ca_cert_pem")
@@ -206,6 +213,7 @@ def reset() -> None:
     _policies.clear()
     _topic_rules.clear()
     _shadows.clear()
+    _indexing_config.clear()
     with _CA_LOCK:
         _ca_cert_pem = None
         _ca_key_pem = None
@@ -386,6 +394,18 @@ async def handle_request(
         return _list_attached_policies(path, qp)
     if path.startswith("/policies/"):
         return _handle_policy(method, path, body, qp)
+
+    # Fleet indexing — the search path must precede ``/indices/{indexName}``
+    if path == "/indices/search" and method == "POST":
+        return _search_index(_parse_body(body))
+    if path == "/indexing/config" and method == "POST":
+        return _update_indexing_configuration(_parse_body(body))
+    if path == "/indexing/config" and method == "GET":
+        return _get_indexing_configuration()
+    if path == "/indices" and method == "GET":
+        return _list_indices()
+    if path.startswith("/indices/") and method == "GET":
+        return _describe_index(path)
 
     # Topic rules
     if path == "/rules" and method == "GET":
@@ -1387,6 +1407,430 @@ def _list_attached_policies(path: str, qp: dict) -> tuple:
         if target in p.get("targets", []):
             out.append({"policyName": p["policyName"], "policyArn": p["policyArn"]})
     return json_response({"policies": out})
+
+
+# ---------------------------------------------------------------------------
+# Fleet indexing (indexing configuration + SearchIndex)
+# ---------------------------------------------------------------------------
+
+# One token: either a ``field:value`` term (quoted values may contain spaces)
+# or a bare word, which the grammar only accepts as the ``AND`` separator.
+_SEARCH_TOKEN_RE = re.compile(
+    r'(?P<field>[\w.]+)\s*:\s*(?P<value>"[^"]*"|\S+)|(?P<bare>"[^"]*"|\S+)'
+)
+_SEARCH_TOP_FIELDS = ("thingName", "thingTypeName", "thingGroupNames")
+# Only the classic shadow is indexed, and only its two state halves are
+# addressable: shadow.metadata / shadow.version / shadow.name.<name> (named
+# shadows) are AWS fields this emulator does not project.
+_SEARCH_SHADOW_HALVES = ("desired", "reported")
+
+# AWS names the single thing index ``AWS_Things``; it exists only while thing
+# indexing is enabled, which is why every fleet stack starts with an
+# ``UpdateIndexingConfiguration`` call (Terraform: aws_iot_indexing_configuration).
+_THING_INDEX_NAME = "AWS_Things"
+_INDEXING_CONFIG_KEY = "indexing"
+_THING_INDEXING_MODES = ("OFF", "REGISTRY", "REGISTRY_AND_SHADOW")
+_THING_CONNECTIVITY_INDEXING_MODES = ("OFF", "STATUS")
+_THING_GROUP_INDEXING_MODES = ("OFF", "ON")
+# AWS's defaults for an account that has never called
+# UpdateIndexingConfiguration: nothing is indexed.
+_DEFAULT_INDEXING_CONFIG = {
+    "thingIndexingConfiguration": {
+        "thingIndexingMode": "OFF",
+        "thingConnectivityIndexingMode": "OFF",
+    },
+    "thingGroupIndexingConfiguration": {"thingGroupIndexingMode": "OFF"},
+}
+# SearchIndex's documented ceiling ("this maximum number cannot exceed 100").
+_SEARCH_MAX_RESULTS_LIMIT = 100
+
+
+def _indexing_configuration() -> dict:
+    """The account+region's indexing configuration, defaulting to all-OFF."""
+    stored = _indexing_config.get(_INDEXING_CONFIG_KEY)
+    return copy.deepcopy(stored) if stored else copy.deepcopy(_DEFAULT_INDEXING_CONFIG)
+
+
+def _thing_indexing_mode() -> str:
+    return (
+        _indexing_configuration()
+        .get("thingIndexingConfiguration", {})
+        .get("thingIndexingMode", "OFF")
+    )
+
+
+def _update_indexing_configuration(payload: dict) -> tuple:
+    """``POST /indexing/config`` — enable or disable fleet indexing.
+
+    Each sub-configuration that the request carries replaces the stored one
+    wholesale (AWS's own semantics: the mode is required, so a partial update
+    of a sub-configuration is not expressible); an omitted sub-configuration is
+    left alone.
+
+    Only the modes this emulator can honor are interpreted —
+    ``thingIndexingMode`` gates ``SearchIndex`` and whether shadow fields are
+    queryable. ``deviceDefenderIndexingMode``, ``namedShadowIndexingMode``,
+    ``customFields`` and ``filter`` are stored and echoed back by
+    ``GetIndexingConfiguration`` so IaC round-trips cleanly, but nothing here
+    projects those fields; querying one is an out-of-grammar
+    ``InvalidQueryException`` rather than a silent miss.
+    """
+    config = _indexing_configuration()
+
+    thing_cfg = payload.get("thingIndexingConfiguration")
+    if thing_cfg is not None:
+        if not isinstance(thing_cfg, dict):
+            return error_response_json(
+                "InvalidRequestException",
+                "thingIndexingConfiguration must be an object",
+                400,
+            )
+        mode = thing_cfg.get("thingIndexingMode")
+        if mode not in _THING_INDEXING_MODES:
+            return error_response_json(
+                "InvalidRequestException",
+                f"thingIndexingMode must be one of {list(_THING_INDEXING_MODES)}",
+                400,
+            )
+        connectivity_mode = thing_cfg.get("thingConnectivityIndexingMode") or "OFF"
+        if connectivity_mode not in _THING_CONNECTIVITY_INDEXING_MODES:
+            return error_response_json(
+                "InvalidRequestException",
+                "thingConnectivityIndexingMode must be one of "
+                f"{list(_THING_CONNECTIVITY_INDEXING_MODES)}",
+                400,
+            )
+        if connectivity_mode == "STATUS" and mode == "OFF":
+            return error_response_json(
+                "InvalidRequestException",
+                "thingIndexingMode must not be OFF to enable thing connectivity "
+                "indexing",
+                400,
+            )
+        config["thingIndexingConfiguration"] = {
+            **thing_cfg,
+            "thingIndexingMode": mode,
+            "thingConnectivityIndexingMode": connectivity_mode,
+        }
+
+    group_cfg = payload.get("thingGroupIndexingConfiguration")
+    if group_cfg is not None:
+        if not isinstance(group_cfg, dict):
+            return error_response_json(
+                "InvalidRequestException",
+                "thingGroupIndexingConfiguration must be an object",
+                400,
+            )
+        group_mode = group_cfg.get("thingGroupIndexingMode")
+        if group_mode not in _THING_GROUP_INDEXING_MODES:
+            return error_response_json(
+                "InvalidRequestException",
+                f"thingGroupIndexingMode must be one of {list(_THING_GROUP_INDEXING_MODES)}",
+                400,
+            )
+        config["thingGroupIndexingConfiguration"] = {
+            **group_cfg,
+            "thingGroupIndexingMode": group_mode,
+        }
+
+    _indexing_config[_INDEXING_CONFIG_KEY] = config
+    logger.info(
+        "IoT fleet indexing configured: thingIndexingMode=%s",
+        config["thingIndexingConfiguration"]["thingIndexingMode"],
+    )
+    return json_response({})
+
+
+def _get_indexing_configuration() -> tuple:
+    """``GET /indexing/config`` — the stored configuration, all-OFF by default."""
+    return json_response(_indexing_configuration())
+
+
+def _index_schema(config: dict) -> str:
+    """``DescribeIndex``'s schema string for the configuration in force."""
+    thing_cfg = config.get("thingIndexingConfiguration", {})
+    return (
+        "REGISTRY_AND_SHADOW"
+        if thing_cfg.get("thingIndexingMode") == "REGISTRY_AND_SHADOW"
+        else "REGISTRY"
+    )
+
+
+def _describe_index(path: str) -> tuple:
+    """``GET /indices/{indexName}``.
+
+    The index is a consequence of the configuration, not a resource of its
+    own: while thing indexing is OFF there is nothing to describe, which is
+    the same ``ResourceNotFoundException`` AWS answers with. It is never
+    ``BUILDING`` here — the registry *is* the index, so it is ready the moment
+    it is enabled.
+    """
+    name = path[len("/indices/"):]
+    config = _indexing_configuration()
+    if (
+        name != _THING_INDEX_NAME
+        or config["thingIndexingConfiguration"]["thingIndexingMode"] == "OFF"
+    ):
+        return error_response_json(
+            "ResourceNotFoundException", f"Index {name!r} does not exist", 404
+        )
+    return json_response({
+        "indexName": _THING_INDEX_NAME,
+        "indexStatus": "ACTIVE",
+        "schema": _index_schema(config),
+    })
+
+
+def _list_indices() -> tuple:
+    """``GET /indices`` — ``AWS_Things`` once thing indexing is on, else empty.
+
+    ``maxResults`` / ``nextToken`` are not honored because a page can never
+    overflow: there is exactly one index, or none.
+    """
+    enabled = _thing_indexing_mode() != "OFF"
+    return json_response({"indexNames": [_THING_INDEX_NAME] if enabled else []})
+
+
+def _parse_search_query(query: str) -> list[tuple[str, str]] | None:
+    """Parse ``field:value`` terms separated by ``AND`` (or by a bare space).
+
+    Returns the terms, or ``None`` for anything outside that grammar — a bare
+    word that is not ``AND``, a leading or doubled ``AND``, and a *dangling*
+    ``AND`` with no term after it. AWS rejects a dangling ``AND``, so ignoring
+    it here would answer a malformed query with results.
+    """
+    terms: list[tuple[str, str]] = []
+    pending_and = False
+    for m in _SEARCH_TOKEN_RE.finditer(query):
+        bare = m.group("bare")
+        if bare is not None:
+            if bare.upper() != "AND" or pending_and or not terms:
+                return None
+            pending_and = True
+            continue
+        terms.append((m.group("field"), m.group("value").strip('"')))
+        pending_and = False
+    if pending_and or not terms:
+        return None
+    return terms
+
+
+def _classic_shadow_state(thing_name: str) -> dict | None:
+    """The classic (unnamed) shadow's ``state`` document, or None."""
+    rec = _shadows.get((thing_name, ""))
+    if rec is None or rec.get("deleted"):
+        return None
+    return rec.get("state") or {}
+
+
+def _search_field_error(field: str, thing_mode: str) -> str | None:
+    """Why ``field`` is not queryable, or None when it is.
+
+    Every rejection is a 400 rather than a query that matches nothing: a
+    mistyped field and a field that no thing happens to carry are
+    indistinguishable in the results, and only one of them is the caller's bug.
+    """
+    if field in _SEARCH_TOP_FIELDS:
+        return None
+    if field.startswith("attributes.") and field != "attributes.":
+        return None
+    if field.startswith("shadow."):
+        parts = field.split(".")
+        if len(parts) < 3 or parts[1] not in _SEARCH_SHADOW_HALVES or not parts[-1]:
+            return (
+                f"Unsupported query field: {field!r} — only "
+                "shadow.desired.<path> and shadow.reported.<path> of the classic "
+                "shadow are indexed"
+            )
+        if thing_mode != "REGISTRY_AND_SHADOW":
+            return (
+                f"Shadow field {field!r} is not indexed: thingIndexingMode is "
+                f"{thing_mode}, and shadow data needs REGISTRY_AND_SHADOW"
+            )
+        return None
+    return f"Unsupported query field: {field!r}"
+
+
+def _search_field_value(thing: dict, field: str, shadow_state: dict | None):
+    if field == "thingName":
+        return thing.get("thingName")
+    if field == "thingTypeName":
+        return thing.get("thingTypeName")
+    if field == "thingGroupNames":
+        return thing.get("thingGroupNames") or None
+    if field.startswith("attributes."):
+        return (thing.get("attributes") or {}).get(field.split(".", 1)[1])
+    if field.startswith("shadow.") and shadow_state is not None:
+        node = shadow_state
+        for part in field.split(".")[1:]:
+            if not isinstance(node, dict):
+                return None
+            node = node.get(part)
+        return node
+    return None
+
+
+def _as_number(value: str) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _search_value_matches(actual, expected: str) -> bool:
+    """Compare an indexed value against a term value, case-insensitively.
+
+    ``*`` (any run of characters) and ``?`` (exactly one) are honored — a
+    prefix query like ``thingName:my-fleet-*`` is what fleet dashboards
+    actually send. Every other character matches literally, so a ``[`` in a
+    thing name is not read as a character class the way ``fnmatch`` would.
+
+    A JSON *number* in a shadow compares numerically, so a reported
+    ``{"temp": 10.0}`` answers ``shadow.reported.temp:10`` — as an index that
+    knows the field's type does. Registry strings keep comparing as strings:
+    a thing named ``007`` is not a hit for ``thingName:7``.
+
+    A list field (``thingGroupNames``) matches when any of its members does,
+    which is what makes ``thingGroupNames:production`` a membership test.
+    """
+    if isinstance(actual, list):
+        return any(_search_value_matches(item, expected) for item in actual)
+    if actual is None:
+        # A missing field never matches — otherwise str(None) would compare as
+        # "none" and thingTypeName:none would match every untyped thing.
+        return False
+    if isinstance(actual, (int, float)) and not isinstance(actual, bool):
+        wanted = _as_number(expected)
+        if wanted is not None:
+            return float(actual) == wanted
+        # Not a number on the query side: fall through so wildcards still work.
+    actual = str(actual).lower()
+    expected = expected.lower()
+    if "*" not in expected and "?" not in expected:
+        return actual == expected
+    pattern = "".join(
+        "." if ch == "?" else ".*" if ch == "*" else re.escape(ch) for ch in expected
+    )
+    return re.fullmatch(pattern, actual, re.DOTALL) is not None
+
+
+def _search_next_token(offset: int) -> str:
+    """An opaque page cursor. It carries an offset, as AWS's own tokens do."""
+    raw = f"{_THING_INDEX_NAME}:{offset}".encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _search_token_offset(token: str) -> int | None:
+    """The offset a token stands for, or None if it was not one of ours."""
+    try:
+        raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)).decode()
+        prefix, sep, value = raw.partition(":")
+        if not sep or prefix != _THING_INDEX_NAME:
+            return None
+        offset = int(value)
+    except Exception:
+        return None
+    return offset if offset >= 0 else None
+
+
+def _search_index(payload: dict) -> tuple:
+    """``POST /indices/search`` — fleet indexing over the live registry.
+
+    Real AWS queries a fleet-index projection; here the thing registry and
+    shadow stores ARE the index, so results are always current and the index
+    is never ``BUILDING``. It still has to be *enabled*: while
+    ``thingIndexingMode`` is OFF the ``AWS_Things`` index does not exist, and
+    querying it answers ``ResourceNotFoundException`` exactly as AWS does —
+    otherwise fleet code would work here and fail in the cloud against the
+    account nobody ran ``UpdateIndexingConfiguration`` on.
+
+    Supported grammar (the subset device fleets actually use):
+    ``AND``-separated ``field:value`` terms over ``thingName``,
+    ``thingTypeName``, ``thingGroupNames``, ``attributes.<name>`` and — once
+    ``thingIndexingMode`` is REGISTRY_AND_SHADOW —
+    ``shadow.desired|reported.<path>``, compared case-insensitively, with
+    ``*`` / ``?`` wildcards in the value. Anything outside that grammar is
+    rejected with ``InvalidQueryException``.
+
+    Results page through ``maxResults`` + ``nextToken``; the token is an
+    offset into the live match list, so a thing created between pages can
+    shift a later page, the same way a live index does.
+    """
+    index_name = payload.get("indexName") or _THING_INDEX_NAME
+    config = _indexing_configuration()
+    thing_mode = config["thingIndexingConfiguration"]["thingIndexingMode"]
+    if index_name != _THING_INDEX_NAME or thing_mode == "OFF":
+        return error_response_json(
+            "ResourceNotFoundException", f"Index {index_name!r} does not exist", 404
+        )
+
+    query = (payload.get("queryString") or "").strip()
+    if not query:
+        return error_response_json(
+            "InvalidRequestException", "queryString is required", 400
+        )
+    terms = _parse_search_query(query)
+    if terms is None:
+        return error_response_json(
+            "InvalidQueryException",
+            f"Unsupported query syntax: {query!r}",
+            400,
+        )
+    for field, _ in terms:
+        problem = _search_field_error(field, thing_mode)
+        if problem is not None:
+            return error_response_json("InvalidQueryException", problem, 400)
+
+    max_results = payload.get("maxResults", _SEARCH_MAX_RESULTS_LIMIT)
+    if (
+        not isinstance(max_results, int)
+        or isinstance(max_results, bool)
+        or not 1 <= max_results <= _SEARCH_MAX_RESULTS_LIMIT
+    ):
+        return error_response_json(
+            "InvalidRequestException",
+            f"maxResults must be between 1 and {_SEARCH_MAX_RESULTS_LIMIT}",
+            400,
+        )
+    token = payload.get("nextToken")
+    start = 0 if token is None else _search_token_offset(token)
+    if start is None:
+        return error_response_json(
+            "InvalidRequestException", "nextToken is not a valid page token", 400
+        )
+
+    shadows_indexed = thing_mode == "REGISTRY_AND_SHADOW"
+    matched = []
+    for name, thing in _things.items():
+        shadow_state = _classic_shadow_state(name) if shadows_indexed else None
+        if not all(
+            _search_value_matches(_search_field_value(thing, f, shadow_state), v)
+            for f, v in terms
+        ):
+            continue
+        entry = {
+            "thingName": thing["thingName"],
+            "thingId": thing.get("thingId", name),
+            "attributes": thing.get("attributes") or {},
+            "thingGroupNames": list(thing.get("thingGroupNames") or []),
+        }
+        if thing.get("thingTypeName"):
+            entry["thingTypeName"] = thing["thingTypeName"]
+        if shadow_state:
+            # AWS returns the shadow as a JSON *string* document, and both
+            # halves of the state are searchable, so both are in the document.
+            entry["shadow"] = json.dumps({
+                half: shadow_state[half]
+                for half in ("desired", "reported")
+                if half in shadow_state
+            })
+        matched.append(entry)
+
+    end = start + max_results
+    body = {"things": matched[start:end]}
+    if end < len(matched):
+        body["nextToken"] = _search_next_token(end)
+    return json_response(body)
 
 
 # ---------------------------------------------------------------------------
