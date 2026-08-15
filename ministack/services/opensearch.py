@@ -142,7 +142,7 @@ def reset():
         ):
             try:
                 c.stop(timeout=2)
-                c.remove(force=True)
+                c.remove(force=True, v=True)
             except Exception:
                 pass
 
@@ -450,7 +450,7 @@ def _teardown_dataplane(rec: dict) -> None:
         try:
             c = docker.containers.get(cid)
             c.stop(timeout=2)
-            c.remove(force=True)
+            c.remove(force=True, v=True)
         except Exception:
             pass
 
@@ -464,7 +464,7 @@ def _teardown_named_dataplane(domain_name: str) -> None:
         try:
             c = docker.containers.get(name)
             c.stop(timeout=2)
-            c.remove(force=True)
+            c.remove(force=True, v=True)
         except Exception:
             pass
 
@@ -1264,7 +1264,7 @@ async def handle_request(method, path, headers, body_bytes, query_params):
         if method == "GET":
             return _describe_domain_config(name)
         if method == "POST":
-            return _update_domain_config(name, payload)
+            return await run_offloop(_update_domain_config, name, payload)
 
     m = _DOMAIN_PROGRESS_RE.match(path)
     if method == "GET" and m:
@@ -1272,13 +1272,17 @@ async def handle_request(method, path, headers, body_bytes, query_params):
 
     m = _DOMAIN_RE.match(path)
     if method == "POST" and m and m.group("name") is None:
-        return _create_domain(payload)
+        # Spawns the OpenSearch (and Dashboards) container: seconds warm,
+        # minutes on a cold pull, and it holds the loop for every other
+        # service meanwhile. Shared pool — an OpenSearch node never calls
+        # back into MiniStack, so this cannot re-enter.
+        return await run_offloop(_create_domain, payload)
     if m and m.group("name"):
         name = m.group("name")
         if method == "GET":
             return _describe_domain(name)
         if method == "DELETE":
-            return _delete_domain(name)
+            return await run_offloop(_delete_domain, name)
 
     return _error(400, "InvalidAction",
                   f"OpenSearch operation not implemented: {method} {path}")
