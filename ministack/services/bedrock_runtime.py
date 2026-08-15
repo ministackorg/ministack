@@ -25,6 +25,10 @@ Behavior:
     reachable, the prompt is translated to OpenAI shape, forwarded, and the
     response translated back to Converse shape. Falls back to mock silently
     on connection error.
+  Named OrcaRouter preset: set MINISTACK_ORCAROUTER_API_KEY to route the
+    Bedrock proxy through OrcaRouter (https://api.orcarouter.ai/v1) with
+    bearer auth and the orcarouter/auto model (override via
+    MINISTACK_ORCAROUTER_MODEL). See https://www.orcarouter.ai.
 
 Token counts are a heuristic (chars/4) — shape-correct, absolute counts are
 approximate. Documented in release notes; users asserting on exact counts
@@ -63,6 +67,15 @@ logger = logging.getLogger("bedrock-runtime")
 
 _PROXY_URL = os.environ.get("MINISTACK_BEDROCK_PROXY_URL", "").rstrip("/")
 _PROXY_TIMEOUT_S = float(os.environ.get("MINISTACK_BEDROCK_PROXY_TIMEOUT_SECONDS", "30"))
+# Named OrcaRouter preset: set MINISTACK_ORCAROUTER_API_KEY to route the
+# Bedrock proxy through OrcaRouter (https://api.orcarouter.ai/v1) with
+# bearer auth, instead of pointing MINISTACK_BEDROCK_PROXY_URL at a generic
+# OpenAI-compatible endpoint. The model defaults to orcarouter/auto and can
+# be overridden with MINISTACK_ORCAROUTER_MODEL.
+_ORCAROUTER_API_KEY = os.environ.get("MINISTACK_ORCAROUTER_API_KEY", "").strip()
+_ORCAROUTER_MODEL = os.environ.get("MINISTACK_ORCAROUTER_MODEL", "").strip()
+if _ORCAROUTER_API_KEY:
+    _PROXY_URL = "https://api.orcarouter.ai"
 
 # ---------------------------------------------------------------------------
 # Path regexes
@@ -254,8 +267,13 @@ def _proxy_to_openai_chat(model_id: str, messages, system, inference_config) -> 
                 parts.append(c["text"])
         if parts:
             openai_messages.append({"role": role, "content": "\n".join(parts)})
+    model = model_id
+    headers = {"Content-Type": "application/json"}
+    if _ORCAROUTER_API_KEY:
+        model = _ORCAROUTER_MODEL or "orcarouter/auto"
+        headers["Authorization"] = f"Bearer {_ORCAROUTER_API_KEY}"
     payload = {
-        "model": model_id,
+        "model": model,
         "messages": openai_messages,
         "stream": False,
     }
@@ -272,7 +290,7 @@ def _proxy_to_openai_chat(model_id: str, messages, system, inference_config) -> 
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:

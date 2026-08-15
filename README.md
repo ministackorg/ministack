@@ -739,6 +739,18 @@ resp = bedrock.converse(
 print(resp["output"]["message"]["content"][0]["text"])
 ```
 
+### Bedrock with OrcaRouter
+
+For a hosted, OpenAI-compatible backend, set `MINISTACK_ORCAROUTER_API_KEY` and MiniStack routes the Bedrock proxy through [OrcaRouter](https://www.orcarouter.ai) (`https://api.orcarouter.ai/v1`) with bearer auth — no `MINISTACK_BEDROCK_PROXY_URL` needed. Prompts are translated to OpenAI shape, forwarded, and translated back to Bedrock shape, exactly like the generic proxy. OrcaRouter also runs gateway-level, zero-trust security for AI agents on the same endpoint — screening every prompt/response and governing every tool call on a default-deny basis, with no application code changes.
+
+```bash
+docker run -p 4566:4566 \
+  -e MINISTACK_ORCAROUTER_API_KEY=sk-orca-... \
+  ministackorg/ministack
+```
+
+The model defaults to OrcaRouter's smart router `orcarouter/auto`; set `MINISTACK_ORCAROUTER_MODEL` to pin a specific model (full catalog: <https://www.orcarouter.ai/models>).
+
 Note: token counts are a chars/4 heuristic — shape-correct, but don't assert on exact counts against the mock.
 
 ---
@@ -836,6 +848,8 @@ end-to-end without any client config.
 | `MINISTACK_IMDS_V2_REQUIRED` | `0` | Reject token-less GETs on `/latest/meta-data/...`. When set, callers must first `PUT /latest/api/token` and pass the token as `X-aws-ec2-metadata-token`, matching real-AWS hop-limit-1 IMDSv2-only instances |
 | `MINISTACK_BEDROCK_PROXY_URL` | _(unset)_ | OpenAI-compatible `/chat/completions` endpoint (Ollama, llama.cpp, vLLM). When set, Bedrock `Converse`/`InvokeModel` prompts are translated to OpenAI shape, forwarded, and translated back to Bedrock shape — real completions through the Bedrock API. Falls back to the deterministic mock on connection error |
 | `MINISTACK_BEDROCK_PROXY_TIMEOUT_SECONDS` | `30` | Upstream request timeout for the Bedrock proxy |
+| `MINISTACK_ORCAROUTER_API_KEY` | _(unset)_ | Named OrcaRouter preset for the Bedrock proxy. When set, Bedrock `Converse`/`InvokeModel` are forwarded to `https://api.orcarouter.ai/v1/chat/completions` with bearer auth instead of `MINISTACK_BEDROCK_PROXY_URL`; falls back to the deterministic mock on connection error |
+| `MINISTACK_ORCAROUTER_MODEL` | `orcarouter/auto` | Model sent to OrcaRouter when `MINISTACK_ORCAROUTER_API_KEY` is set; defaults to OrcaRouter's smart router. Full catalog: https://www.orcarouter.ai/models |
 | `MINISTACK_MSK_BOOTSTRAP` | _(unset)_ | Plaintext bootstrap broker string returned by MSK `GetBootstrapBrokers` — point it at a real broker you bring (Redpanda, Kafka, KRaft). Unset → placeholder endpoint (control-plane only) |
 | `MINISTACK_MSK_BOOTSTRAP_TLS` | _(unset)_ | TLS bootstrap string (`BootstrapBrokerStringTls`) |
 | `MINISTACK_MSK_BOOTSTRAP_SASL_SCRAM` | _(unset)_ | SASL/SCRAM bootstrap string (`BootstrapBrokerStringSaslScram`) |

@@ -7,9 +7,11 @@ on presence and ordering, not absolute values.
 """
 
 import json
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import botocore.exceptions
 from conftest import ENDPOINT, make_client
@@ -1687,3 +1689,125 @@ def test_bedrock_list_tags_rejects_unknown_resource_arn():
         assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
     else:
         raise AssertionError("expected ResourceNotFoundException")
+
+
+# ===========================================================================
+# Bedrock proxy — named OrcaRouter preset (MINISTACK_ORCAROUTER_API_KEY)
+# Exercises the real _proxy_to_openai_chat path against a local mock upstream:
+# base URL, bearer auth header, and orcarouter/auto model default/override.
+# ===========================================================================
+
+
+class _MockUpstream:
+    """Minimal local OpenAI /chat/completions responder that records the request."""
+
+    def __init__(self):
+        captured = self.captured = {}
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length) or b"{}")
+                captured["path"] = self.path
+                captured["auth"] = self.headers.get("Authorization")
+                captured["body"] = body
+                payload = {
+                    "id": "chatcmpl-orca",
+                    "object": "chat.completion",
+                    "created": 123,
+                    "model": body.get("model"),
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "hello from orca"},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
+                }
+                data = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.server.server_port}"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def test_bedrock_proxy_orcarouter_preset_default_model(monkeypatch):
+    """OrcaRouter preset sends bearer auth + orcarouter/auto and hits /v1/chat/completions."""
+    import ministack.services.bedrock_runtime as br
+
+    upstream = _MockUpstream()
+    try:
+        monkeypatch.setattr(br, "_PROXY_URL", upstream.url)
+        monkeypatch.setattr(br, "_ORCAROUTER_API_KEY", "sk-orca-test")
+        monkeypatch.setattr(br, "_ORCAROUTER_MODEL", "")
+        text = br._proxy_to_openai_chat(
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            [{"role": "user", "content": [{"text": "hi"}]}],
+            None,
+            None,
+        )
+    finally:
+        upstream.close()
+    assert text == "hello from orca"
+    assert upstream.captured["path"] == "/v1/chat/completions"
+    assert upstream.captured["auth"] == "Bearer sk-orca-test"
+    assert upstream.captured["body"]["model"] == "orcarouter/auto"
+
+
+def test_bedrock_proxy_orcarouter_model_override(monkeypatch):
+    """MINISTACK_ORCAROUTER_MODEL overrides the default orcarouter/auto model."""
+    import ministack.services.bedrock_runtime as br
+
+    upstream = _MockUpstream()
+    try:
+        monkeypatch.setattr(br, "_PROXY_URL", upstream.url)
+        monkeypatch.setattr(br, "_ORCAROUTER_API_KEY", "sk-orca-test")
+        monkeypatch.setattr(br, "_ORCAROUTER_MODEL", "orcarouter/openai/gpt-4o")
+        text = br._proxy_to_openai_chat(
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            [{"role": "user", "content": [{"text": "hi"}]}],
+            None,
+            None,
+        )
+    finally:
+        upstream.close()
+    assert text == "hello from orca"
+    assert upstream.captured["auth"] == "Bearer sk-orca-test"
+    assert upstream.captured["body"]["model"] == "orcarouter/openai/gpt-4o"
+
+
+def test_bedrock_proxy_generic_does_not_send_auth(monkeypatch):
+    """Without the OrcaRouter preset, no Authorization header is sent."""
+    import ministack.services.bedrock_runtime as br
+
+    upstream = _MockUpstream()
+    try:
+        monkeypatch.setattr(br, "_PROXY_URL", upstream.url)
+        monkeypatch.setattr(br, "_ORCAROUTER_API_KEY", "")
+        monkeypatch.setattr(br, "_ORCAROUTER_MODEL", "")
+        text = br._proxy_to_openai_chat(
+            "meta.llama3-1-70b-instruct-v1:0",
+            [{"role": "user", "content": [{"text": "hi"}]}],
+            None,
+            None,
+        )
+    finally:
+        upstream.close()
+    assert text == "hello from orca"
+    assert upstream.captured["auth"] is None
+    assert upstream.captured["body"]["model"] == "meta.llama3-1-70b-instruct-v1:0"
