@@ -2054,14 +2054,21 @@ async def _handle_lifespan(scope, receive, send):
             # — its top-level `import asyncssh` pulls cryptography+OpenSSL
             # (~2–4 MiB of heap, plus C-level SSL contexts) which is pure
             # overhead for callers that aren't using Transfer Family.
+            # Only bind at boot for servers restored from persistence, which a
+            # client can connect to without calling CreateServer first. A fresh
+            # boot binds lazily on CreateServer instead — nobody can connect to
+            # a server that does not exist yet — which keeps asyncssh (and the
+            # cryptography + OpenSSL it drags in, ~26 MB of heap, measured
+            # 39.7 -> 27.9 MiB idle RSS) out of every MiniStack that never
+            # touches Transfer Family. Guarded on the module already being
+            # loaded, mirroring dsql below, so we never import it just to ask.
             _sftp_env = os.environ.get("SFTP_ENABLED", "").strip().lower()
+            _transfer_mod = _loaded_modules.get("transfer")
             if _sftp_env in ("0", "false", "no", "off"):
                 logger.debug("SFTP_ENABLED=%s — skipping transfer module import.", _sftp_env)
-            else:
+            elif _transfer_mod is not None and _transfer_mod.has_servers():
                 try:
-                    from ministack.services import transfer
-
-                    await transfer.sftp_start()
+                    await _transfer_mod.sftp_start()
                 except Exception as e:
                     logger.warning("Transfer SFTP startup failed: %s", e)
             # Start DSQL wire proxies for clusters restored from persistence.
