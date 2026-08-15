@@ -23,9 +23,7 @@ Supports 47 operations:
 Container execution: if Docker socket is available, RunTask actually runs containers.
 """
 
-import contextvars
 import copy
-import functools
 import json
 import logging
 import os
@@ -35,7 +33,7 @@ import time
 
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.concurrency import run_reentrant, spawn_background
+from ministack.core.concurrency import run_reentrant
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -285,7 +283,7 @@ def _ts_to_epoch(value):
     if not isinstance(value, str):
         return value
     try:
-        from datetime import datetime, timezone
+        from datetime import datetime
         return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
     except (ValueError, TypeError):
         return value

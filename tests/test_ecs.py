@@ -1,10 +1,8 @@
 import copy
-import io
 import json
 import os
 import time
 import uuid as _uuid_mod
-import zipfile
 from types import SimpleNamespace
 from urllib.parse import urlparse
 

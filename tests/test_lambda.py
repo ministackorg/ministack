@@ -1657,7 +1657,6 @@ def test_lambda_esm_sqs_report_batch_item_failures(lam, sqs):
 def test_lambda_warm_start(lam, apigw):
     """Warm worker via API Gateway execute-api: module-level state persists across invocations."""
     import urllib.request as _urlreq
-    import uuid as _uuid
 
     fname = f"intg-warm-{_uuid_mod.uuid4().hex[:8]}"
     code = (
@@ -2768,7 +2767,6 @@ def test_lambda_invoke_dry_run_returns_204(lam):
     assert resp["StatusCode"] == 204
 
 def test_lambda_layer_publish(lam):
-    import base64
     import io
     import zipfile
 
@@ -2827,7 +2825,6 @@ def test_lambda_layer_list_layers(lam):
     assert "my-test-layer" in names
 
 def test_lambda_layer_delete_version(lam):
-    import base64
     import io
     import zipfile
 
@@ -3996,7 +3993,6 @@ def test_lambda_provided_runtime_parallel_invocations():
 def test_apigwv2_nodejs_lambda_proxy(lam, apigw):
     """API Gateway v2 HTTP API should invoke Node.js Lambda via warm worker, not return mock."""
     import urllib.request as _urlreq
-    import uuid as _uuid
 
     from botocore.exceptions import ClientError
 
@@ -7541,7 +7537,6 @@ def test_nodejs_worker_aws_sdk_v3_stub_wire_roundtrip(lam, ssm):
     router.py undetected by the resolution-only tests).
     """
     import shutil
-    import uuid as _uuid
 
     if not shutil.which("node"):
         pytest.skip("node not found on PATH")
@@ -7650,7 +7645,6 @@ def _create_durable_execution_directly(lam):
     response header. Returns (function_name, function_arn, dict with
     DurableExecutionArn + CheckpointToken)."""
     import base64 as _b64
-    import json as _json
     fname = f"durable-fn-{_uuid_mod.uuid4().hex[:8]}"
     try:
         lam.delete_function(FunctionName=fname)
@@ -7692,7 +7686,6 @@ def test_lambda_durable_function_config_round_trip(lam):
     except Exception:
         pass
     import base64 as _b64
-    import json as _json
     zip_b64 = _b64.b64encode(_make_zip("def handler(e,c): return e")).decode()
     code, body = _raw_durable("POST", "/2015-03-31/functions", body={
         "FunctionName": fname,
@@ -7824,7 +7817,6 @@ def test_lambda_durable_stop(lam):
 def test_lambda_durable_list_by_function(lam):
     fname, fn_arn, rec = _create_durable_execution_directly(lam)
     try:
-        from urllib.parse import quote
         code, body = _raw_durable("GET", f"/2025-12-01/functions/{fname}/durable-executions")
         assert code == 200
         arns = [s["DurableExecutionArn"] for s in body["DurableExecutions"]]
@@ -7894,7 +7886,6 @@ def test_lambda_durable_chained_invoke_runs_child(lam):
     the child function and records the result back into the parent's
     operation log."""
     import base64 as _b64
-    import json as _json
     parent = f"durable-parent-{_uuid_mod.uuid4().hex[:8]}"
     child = f"durable-child-{_uuid_mod.uuid4().hex[:8]}"
     for n in (parent, child):
@@ -8835,7 +8826,6 @@ def test_lambda_durable_create_function_durable_config_round_trip_with_update(la
     """DurableConfig must survive UpdateFunctionConfiguration that touches
     unrelated fields (timeout, memory)."""
     import base64 as _b64
-    import json as _json
 
     fname = f"dur-upd-{_uuid_mod.uuid4().hex[:8]}"
     try:

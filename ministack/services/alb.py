@@ -32,7 +32,7 @@ from urllib.parse import parse_qs
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.persistence import load_state
 from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("alb")

@@ -323,7 +323,6 @@ def test_transfer_workos_sftp_workflow(transfer):
 import asyncio
 import os
 import socket
-import time
 import urllib.request
 import uuid
 

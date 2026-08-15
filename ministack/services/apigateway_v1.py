@@ -84,7 +84,6 @@ Custom domains:
   data-plane requests by custom domain host today.
 """
 
-import asyncio
 import base64
 import datetime
 import json

@@ -38,9 +38,8 @@ import io
 import json
 import logging
 import os
-import re
 import time
-from typing import AsyncIterator, Optional
+from typing import Optional
 
 from ministack.core.persistence import load_state
 from ministack.core.responses import (

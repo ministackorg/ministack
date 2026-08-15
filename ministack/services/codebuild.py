@@ -23,7 +23,7 @@ import time
 
 from ministack.core.arn import ArnParseError, is_arn, parse_arn
 from ministack.core.concurrency import run_reentrant
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     error_response_json,

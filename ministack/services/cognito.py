@@ -54,7 +54,6 @@ Wire protocol:
   Routing is handled in app.py via two separate SERVICE_HANDLERS entries.
 """
 
-import asyncio
 import base64
 import copy
 import hashlib
@@ -76,7 +75,7 @@ from defusedxml.ElementTree import fromstring as safe_xml_parse
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,

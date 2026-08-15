@@ -56,7 +56,6 @@ from ministack.core.concurrency import run_reentrant
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
-    error_response_json,
     get_account_id,
     get_region,
     new_uuid,

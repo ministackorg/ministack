@@ -24,7 +24,6 @@ with the event piped through stdin (safe from injection).
 SQS event source mappings poll the queue in a background thread.
 """
 
-import asyncio
 import base64
 import contextvars
 import copy
@@ -56,12 +55,11 @@ from ministack.core.lambda_runtime import (
     INVOKE_DEPTH_EVENT_KEY,
     INVOKE_DEPTH_HEADER,
     acquire_worker,
-    get_or_create_worker,
     invalidate_worker,
     reap_idle_workers,
     release_worker,
 )
-from ministack.core.persistence import PERSIST_STATE, STATE_DIR, load_state
+from ministack.core.persistence import STATE_DIR, load_state
 from ministack.core.responses import (
     _12_DIGIT_RE,
     AccountRegionScopedDict,
