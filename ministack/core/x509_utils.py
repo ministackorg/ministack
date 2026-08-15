@@ -6,6 +6,13 @@ service for its local CA and available for reuse by ACM, API Gateway
 custom domains, or any other service that needs local certificate
 operations.
 
+Certificates minted here are meant to be verified by ordinary clients, so
+they follow RFC 5280 rather than the minimum OpenSSL will tolerate: a leaf
+carries an Authority Key Identifier naming its issuer. Python 3.13 turns on
+``ssl.VERIFY_X509_STRICT`` in ``ssl.create_default_context()``, and a strict
+verifier rejects a leaf without one ("Missing Authority Key Identifier"). A
+self-signed CA is exempt and does not carry it.
+
 Requires the ``cryptography`` library (declared as part of ``[full]``
 optional deps). Functions raise ``RuntimeError`` with a clear message
 when it is not importable.
@@ -150,6 +157,12 @@ def sign_leaf_certificate(
         .not_valid_before(now - _dt.timedelta(minutes=1))
         .not_valid_after(now + _dt.timedelta(days=days_valid))
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        # RFC 5280 §4.2.1.1: a certificate that is not self-issued must name the
+        # key that signed it, and a strict verifier enforces it (see above).
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_cert.public_key()),
+            critical=False,
+        )
         .add_extension(
             x509.KeyUsage(
                 digital_signature=True,

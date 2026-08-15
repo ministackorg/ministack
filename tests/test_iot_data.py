@@ -182,22 +182,29 @@ def _parse_packet(buf: bytes) -> tuple[int, int, bytes, int] | None:
     return (first >> 4) & 0x0F, first & 0x0F, buf[header_end:total], total
 
 
+def _make_unsubscribe(packet_id: int, topics: list[str]) -> bytes:
+    body = struct.pack("!H", packet_id) + b"".join(_enc_str(t) for t in topics)
+    return bytes([0xA2]) + _enc_remaining(len(body)) + body
+
+
+def _record_publish(msg, received: list) -> int | None:
+    """Append any PUBLISH frame in ``msg`` to ``received``; return its packet type."""
+    buf = msg if isinstance(msg, (bytes, bytearray)) else msg.encode("latin-1")
+    parsed = _parse_packet(bytes(buf))
+    if not parsed:
+        return None
+    ptype, _flags, body, _ = parsed
+    if ptype == 3:  # PUBLISH
+        topic_len = struct.unpack_from("!H", body, 0)[0]
+        delivered_topic = body[2:2 + topic_len].decode("utf-8")
+        payload = body[2 + topic_len:]
+        received.append((delivered_topic, payload))
+    return ptype
+
+
 async def _ws_subscribe_and_collect(
     ws_url: str, topic: str, ready_event: threading.Event, received: list, stop: threading.Event
 ):
-    def _record_publish(msg) -> int | None:
-        buf = msg if isinstance(msg, (bytes, bytearray)) else msg.encode("latin-1")
-        parsed = _parse_packet(bytes(buf))
-        if not parsed:
-            return None
-        ptype, _flags, body, _ = parsed
-        if ptype == 3:  # PUBLISH
-            topic_len = struct.unpack_from("!H", body, 0)[0]
-            delivered_topic = body[2:2 + topic_len].decode("utf-8")
-            payload = body[2 + topic_len:]
-            received.append((delivered_topic, payload))
-        return ptype
-
     async with websockets.connect(ws_url, subprotocols=["mqtt"]) as ws:
         await ws.send(_make_connect("test-client"))
         # Wait for CONNACK
@@ -207,7 +214,7 @@ async def _ws_subscribe_and_collect(
         # Retained PUBLISH frames may precede SUBACK in the in-process broker.
         while True:
             msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
-            if _record_publish(msg) == 9:  # SUBACK
+            if _record_publish(msg, received) == 9:  # SUBACK
                 break
         ready_event.set()
 
@@ -218,7 +225,78 @@ async def _ws_subscribe_and_collect(
                 msg = await asyncio.wait_for(ws.recv(), timeout=0.5)
             except asyncio.TimeoutError:
                 continue
-            _record_publish(msg)
+            _record_publish(msg, received)
+
+
+async def _ws_unsubscribe_one_and_collect(
+    ws_url: str,
+    topics: list[str],
+    drop: str,
+    ready_event: threading.Event,
+    received: list,
+    stop: threading.Event,
+):
+    """Subscribe to every topic in ``topics``, then UNSUBSCRIBE from ``drop``."""
+    async with websockets.connect(ws_url, subprotocols=["mqtt"]) as ws:
+        await ws.send(_make_connect("unsub-client"))
+        await asyncio.wait_for(ws.recv(), timeout=2.0)
+        for packet_id, topic in enumerate(topics, start=1):
+            await ws.send(_make_subscribe(packet_id=packet_id, topic=topic, qos=0))
+            while True:
+                msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                if _record_publish(msg, received) == 9:  # SUBACK
+                    break
+
+        await ws.send(_make_unsubscribe(packet_id=len(topics) + 1, topics=[drop]))
+        while True:
+            msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
+            if _record_publish(msg, received) == 11:  # UNSUBACK
+                break
+        ready_event.set()
+
+        end_at = time.time() + 5
+        while not stop.is_set() and time.time() < end_at:
+            try:
+                msg = await asyncio.wait_for(ws.recv(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            _record_publish(msg, received)
+
+
+def test_iot_ws_unsubscribe_keeps_the_other_subscriptions(iot_data_client):
+    """UNSUBSCRIBE over the real WebSocket bridge drops only the named filter."""
+    kept = _unique("unsub/kept")
+    dropped = _unique("unsub/dropped")
+    parsed = urlparse(ENDPOINT)
+    ws_host = parsed.hostname or "localhost"
+    ws_port = parsed.port or 4566
+    ws_url = f"ws://prefix-ats.iot.us-east-1.{ws_host}:{ws_port}/mqtt"
+
+    ready = threading.Event()
+    stop = threading.Event()
+    received: list = []
+
+    t = threading.Thread(
+        target=lambda: asyncio.run(_ws_unsubscribe_one_and_collect(
+            ws_url, [kept, dropped], dropped, ready, received, stop
+        )),
+        daemon=True,
+    )
+    t.start()
+    assert ready.wait(timeout=5), "WebSocket subscriber did not become ready"
+
+    iot_data_client.publish(topic=dropped, payload=b"should-not-arrive")
+    iot_data_client.publish(topic=kept, payload=b"should-arrive")
+
+    deadline = time.time() + 5
+    while time.time() < deadline and not received:
+        time.sleep(0.05)
+    # Give a message on the unsubscribed topic every chance to show up late.
+    time.sleep(0.6)
+    stop.set()
+    t.join(timeout=2)
+
+    assert received == [(kept, b"should-arrive")]
 
 
 def test_iot_lambda_publishes_browser_subscribes_e2e(iot_data_client):

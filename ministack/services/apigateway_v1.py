@@ -125,10 +125,18 @@ _resources = AccountRegionScopedDict()           # rest_api_id -> {resource_id -
 _stages_v1 = AccountRegionScopedDict()           # rest_api_id -> {stage_name -> Stage}
 _deployments_v1 = AccountRegionScopedDict()      # rest_api_id -> {deployment_id -> Deployment}
 _authorizers_v1 = AccountRegionScopedDict()      # rest_api_id -> {authorizer_id -> Authorizer}
-# Data-plane cache of evaluated Lambda-authorizer results, keyed by
-# (rest_api_id, authorizer_id, cache_key). Value: (expiry_epoch, decision, context).
-# Ephemeral (not persisted); honors authorizerResultTtlInSeconds.
+# Data-plane cache of Lambda-authorizer OUTPUT — the policy document and the
+# context, not the allow/deny verdict — keyed by (account, region, rest_api_id,
+# authorizer_id, stage, identity values). Value: (expiry_epoch, policy, context).
+# The policy is re-evaluated against every request's own method ARN, so a cached
+# Allow issued for one method or one stage cannot answer another. Ephemeral (not
+# persisted); honors authorizerResultTtlInSeconds.
 _authorizer_cache = {}
+# Entries are keyed on caller-supplied tokens, so the cache is capped rather than
+# left to grow with every distinct token a long-lived instance ever sees.
+_AUTHORIZER_CACHE_MAX = 1024
+# AWS's default when CreateAuthorizer omits authorizerResultTtlInSeconds.
+_DEFAULT_AUTHORIZER_TTL = 300
 _models = AccountRegionScopedDict()              # rest_api_id -> {model_id -> Model}
 _api_keys = AccountRegionScopedDict()            # key_id -> ApiKey
 _usage_plans = AccountRegionScopedDict()         # plan_id -> UsagePlan
@@ -1337,6 +1345,40 @@ def _request_identity_sources(identity_source, headers, query_params, stage):
     return present, values
 
 
+def _authorizer_ttl(authorizer):
+    """``authorizerResultTtlInSeconds`` as a non-negative int.
+
+    CreateAuthorizer already defaults the field to ``_DEFAULT_AUTHORIZER_TTL``,
+    so a record reaching here without one was reshaped by UpdateAuthorizer —
+    which applies JSON Patch verbatim and never validates the value. Absent and
+    unparsable therefore mean the same thing and both fall back to the AWS
+    default, instead of silently disabling caching in one case and enabling it
+    in the other. An explicit 0 still disables it.
+    """
+    raw = authorizer.get("authorizerResultTtlInSeconds")
+    if raw is None or raw == "":
+        return _DEFAULT_AUTHORIZER_TTL
+    try:
+        return max(int(raw), 0)
+    except (TypeError, ValueError):
+        return _DEFAULT_AUTHORIZER_TTL
+
+
+def _cache_authorizer_result(key, expires_at, policy_doc, context):
+    """Store one authorizer result, keeping ``_authorizer_cache`` bounded.
+
+    Expired entries are dropped once the cap is reached; if that is not enough,
+    the oldest insertions are evicted.
+    """
+    if len(_authorizer_cache) >= _AUTHORIZER_CACHE_MAX:
+        now = time.time()
+        for stale in [k for k, v in _authorizer_cache.items() if v[0] <= now]:
+            del _authorizer_cache[stale]
+        while len(_authorizer_cache) >= _AUTHORIZER_CACHE_MAX:
+            del _authorizer_cache[next(iter(_authorizer_cache))]
+    _authorizer_cache[key] = (expires_at, policy_doc, context)
+
+
 async def _authorize_request_v1(
     api_id, stage_name, method_obj, method, request_path, resource,
     headers, body, query_params, path_params, stage,
@@ -1370,7 +1412,7 @@ async def _authorize_request_v1(
         owner_region, owner_account_id, api_id, stage_name, method, request_path
     )
     atype = (authorizer.get("type") or "TOKEN").upper()
-    ttl = int(authorizer.get("authorizerResultTtlInSeconds") or 0)
+    ttl = _authorizer_ttl(authorizer)
 
     if atype == "TOKEN":
         identity_source = authorizer.get("identitySource") or "method.request.header.Authorization"
@@ -1383,9 +1425,18 @@ async def _authorize_request_v1(
         if not token:
             return _gw_error(401, "Unauthorized"), None
         val_expr = authorizer.get("identityValidationExpression")
-        if val_expr and not re.fullmatch(val_expr, token):
-            return _gw_error(401, "Unauthorized"), None
-        cache_key = token
+        if val_expr:
+            try:
+                token_matches = re.fullmatch(val_expr, token) is not None
+            except re.error:
+                # CreateAuthorizer stores the expression verbatim, so an
+                # uncompilable one only surfaces here. That is a
+                # misconfiguration (AUTHORIZER_CONFIGURATION_ERROR), not an
+                # exception that should escape the request handler.
+                return _gw_error(500, "Internal server error"), None
+            if not token_matches:
+                return _gw_error(401, "Unauthorized"), None
+        identity_values = (token,)
         event = {"type": "TOKEN", "authorizationToken": token, "methodArn": method_arn}
     else:  # REQUEST
         identity_source = authorizer.get("identitySource") or ""
@@ -1396,7 +1447,7 @@ async def _authorize_request_v1(
         # 401 without invoking the authorizer (matches AWS).
         if ttl > 0 and identity_source and not all_present:
             return _gw_error(401, "Unauthorized"), None
-        cache_key = "|".join(id_values)
+        identity_values = tuple(id_values)
         single_headers = {k: (v if isinstance(v, str) else v[-1]) for k, v in headers.items()}
         multi_headers = {k: ([v] if isinstance(v, str) else list(v)) for k, v in headers.items()}
         qs_params = {k: v[0] for k, v in query_params.items()} if query_params else None
@@ -1423,54 +1474,70 @@ async def _authorize_request_v1(
             },
         }
 
-    # TTL cache: a hit replays the prior decision without invoking the Lambda.
-    ckey = (api_id, authorizer_id, cache_key)
+    # TTL cache: a hit replays the authorizer's OUTPUT without invoking the
+    # Lambda, but never its verdict — the policy is evaluated below against this
+    # request's own method ARN. The stage and the identity values are part of the
+    # key for the same reason: the canonical `Resource: event['methodArn']` policy
+    # is issued for exactly one method on one stage.
+    ckey = (owner_account_id, owner_region, api_id, authorizer_id, stage_name, identity_values)
+    cached = None
     if ttl > 0:
         hit = _authorizer_cache.get(ckey)
         if hit and hit[0] > time.time():
-            _, decision, cached_ctx = hit
-            if decision == "Allow":
-                return None, cached_ctx
-            return _deny_error(decision == "Deny"), None
+            cached = (hit[1], hit[2])
 
-    result = await _invoke_authorizer_lambda(
-        authorizer, event, owner_account_id, owner_region
-    )
-    if result is None:
-        # Authorizer Lambda unresolved / not found → connection failure.
-        return _gw_error(500, "Internal server error"), None
-    if result.get("error"):
-        err_body = result.get("body") or {}
-        msg = err_body.get("errorMessage", "") if isinstance(err_body, dict) else str(err_body)
-        # A function that raises exactly "Unauthorized" maps to 401; any other
-        # uncaught error is an authorizer failure → 500.
-        if isinstance(msg, str) and msg.strip().lower() == "unauthorized":
-            return _gw_error(401, "Unauthorized"), None
-        return _gw_error(500, "Internal server error"), None
+    if cached is None:
+        result = await _invoke_authorizer_lambda(
+            authorizer, event, owner_account_id, owner_region
+        )
+        if result is None:
+            # Authorizer Lambda unresolved / not found → connection failure.
+            return _gw_error(500, "Internal server error"), None
+        if result.get("error"):
+            err_body = result.get("body") or {}
+            msg = err_body.get("errorMessage", "") if isinstance(err_body, dict) else str(err_body)
+            # A function that raises exactly "Unauthorized" maps to 401; any other
+            # uncaught error is an authorizer failure → 500.
+            if isinstance(msg, str) and msg.strip().lower() == "unauthorized":
+                return _gw_error(401, "Unauthorized"), None
+            return _gw_error(500, "Internal server error"), None
 
-    policy = result.get("body")
-    if isinstance(policy, (str, bytes)):
-        if isinstance(policy, bytes):
-            policy = policy.decode("utf-8", errors="replace")
-        try:
-            policy = json.loads(policy)
-        except json.JSONDecodeError:
-            policy = None
-    if not isinstance(policy, dict):
-        return _gw_error(500, "Internal server error"), None
+        policy = result.get("body")
+        if isinstance(policy, (str, bytes)):
+            if isinstance(policy, bytes):
+                policy = policy.decode("utf-8", errors="replace")
+            try:
+                policy = json.loads(policy)
+            except json.JSONDecodeError:
+                policy = None
+        if not isinstance(policy, dict):
+            return _gw_error(500, "Internal server error"), None
 
-    decision = _evaluate_policy(policy.get("policyDocument"), method_arn)
-    if decision != "Allow":
-        if ttl > 0:
-            _authorizer_cache[ckey] = (time.time() + ttl, decision, None)
-        return _deny_error(decision == "Deny"), None
+        principal_id = policy.get("principalId")
+        if principal_id is None or str(principal_id) == "":
+            # AWS demands a principal. Without one the response is an
+            # AUTHORIZER_CONFIGURATION_ERROR, not an Allow that reaches the
+            # backend carrying an empty principalId.
+            return _gw_error(500, "Internal server error"), None
 
-    auth_ctx = _stringify_context(policy.get("context"))
-    principal_id = policy.get("principalId")
-    if principal_id is not None:
+        policy_doc = policy.get("policyDocument")
+        if not isinstance(policy_doc, dict):
+            # Same AUTHORIZER_CONFIGURATION_ERROR shape: a response without a
+            # policyDocument is a misconfigured authorizer, not an implicit
+            # deny — and it must not be cached.
+            return _gw_error(500, "Internal server error"), None
+
+        auth_ctx = _stringify_context(policy.get("context"))
         auth_ctx["principalId"] = str(principal_id)
-    if ttl > 0:
-        _authorizer_cache[ckey] = (time.time() + ttl, "Allow", auth_ctx)
+        # Only a well-formed response is cached; failures re-invoke next time.
+        cached = (policy_doc, auth_ctx)
+        if ttl > 0:
+            _cache_authorizer_result(ckey, time.time() + ttl, *cached)
+
+    policy_doc, auth_ctx = cached
+    decision = _evaluate_policy(policy_doc, method_arn)
+    if decision != "Allow":
+        return _deny_error(decision == "Deny"), None
     return None, auth_ctx
 
 
@@ -2673,7 +2740,9 @@ def _create_authorizer(api_id, data):
         "authorizerCredentials": data.get("authorizerCredentials"),
         "identitySource": data.get("identitySource", "method.request.header.Authorization"),
         "identityValidationExpression": data.get("identityValidationExpression", ""),
-        "authorizerResultTtlInSeconds": data.get("authorizerResultTtlInSeconds", 300),
+        "authorizerResultTtlInSeconds": data.get(
+            "authorizerResultTtlInSeconds", _DEFAULT_AUTHORIZER_TTL
+        ),
         "providerARNs": data.get("providerARNs", []),
     }
     _authorizers_v1.setdefault(api_id, {})[auth_id] = authorizer
