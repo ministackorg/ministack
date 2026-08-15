@@ -610,6 +610,114 @@ def _resolve_dedup_id(topic: dict, params: dict, message: str) -> str:
 # Publish
 # ---------------------------------------------------------------------------
 
+class SnsPublishError(ValueError):
+    """A publish AWS rejects, carrying the error code the API answers with."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def publish_internal(
+    topic_arn: str,
+    message,
+    subject: str = "",
+    *,
+    message_structure: str = "",
+    message_attributes: dict | None = None,
+    message_group_id: str = "",
+    message_deduplication_id: str = "",
+) -> dict | None:
+    """Publish to a topic from inside MiniStack, bypassing the HTTP action.
+
+    Cross-service producers (an IoT topic rule, an EventBridge target, a Pipes
+    enrichment) reach SNS in-process, and every site that hand-rolls the message
+    append plus fan-out loses whatever the Publish path does around them — the
+    payload size limit, FIFO grouping and deduplication, and the message_structure
+    / message_attributes fields a subscriber filter policy reads. This is that
+    path, and `_publish` itself is the HTTP wrapper over it.
+
+    Returns ``{"message_id", "sequence_number", "duplicate"}``, or ``None`` when
+    the topic does not exist. Raises `SnsPublishError` for a publish AWS would
+    reject — notably a FIFO topic addressed without a MessageGroupId.
+    """
+    topic = _topics.get(topic_arn)
+    if topic is None:
+        return None
+
+    if isinstance(message, (dict, list)):
+        message = json.dumps(message)
+    msg_attrs = message_attributes or {}
+
+    # AWS rejects Publish requests whose Message + MessageAttributes exceed
+    # 256 KiB. Real-AWS error code is InvalidParameter (400).
+    if _message_payload_size(message, msg_attrs) > _SNS_MAX_PAYLOAD_BYTES:
+        raise SnsPublishError(
+            "InvalidParameter",
+            f"Invalid parameter: Message too long. Maximum size is {_SNS_MAX_PAYLOAD_BYTES} bytes.",
+        )
+
+    seq_number = None
+    dedup_id = message_deduplication_id
+
+    # -- FIFO validation, deduplication, and sequencing --
+    if _is_fifo_topic(topic):
+        if not message_group_id:
+            raise SnsPublishError(
+                "InvalidParameterException",
+                "Invalid parameter: The MessageGroupId parameter is required for FIFO topics",
+            )
+        # Resolve dedup ID: explicit > CBD SHA-256 > error
+        try:
+            dedup_id = _resolve_dedup_id(
+                topic, {"MessageDeduplicationId": message_deduplication_id}, message
+            )
+        except ValueError as exc:
+            raise SnsPublishError("InvalidParameterException", str(exc)) from exc
+
+        # Prune expired cache entries, then check for duplicate
+        with _fifo_lock:
+            _prune_sns_dedup(topic)
+            cached = topic.get("dedup_cache", {}).get(dedup_id)
+            if cached:
+                # Duplicate within the 5-minute window — replay the original
+                # result without re-delivering to subscribers.
+                return {
+                    "message_id": cached["message_id"],
+                    "sequence_number": cached["sequence_number"],
+                    "duplicate": True,
+                }
+
+            # New message: increment sequence counter
+            topic["fifo_seq"] = topic.get("fifo_seq", 0) + 1
+            seq_number = str(topic["fifo_seq"]).zfill(20)
+            msg_id = new_uuid()
+
+            # Cache the entry for deduplication (300s window)
+            topic.setdefault("dedup_cache", {})[dedup_id] = {
+                "expire": time.time() + _DEDUP_WINDOW_S,
+                "message_id": msg_id,
+                "sequence_number": seq_number,
+            }
+    else:
+        msg_id = new_uuid()
+
+    topic["messages"].append({
+        "id": msg_id,
+        "message": message,
+        "subject": subject,
+        "message_structure": message_structure,
+        "message_attributes": msg_attrs,
+        "timestamp": int(time.time()),
+    })
+    _fanout(topic_arn, msg_id, message, subject, message_structure, msg_attrs,
+            message_group_id=message_group_id, message_dedup_id=dedup_id)
+    logger.info(
+        "SNS%s publish to %s: %s", " FIFO" if seq_number else "", topic_arn, message[:100]
+    )
+    return {"message_id": msg_id, "sequence_number": seq_number, "duplicate": False}
+
+
 def _publish(params):
     topic_arn = _normalize_arn(_p(params, "TopicArn") or _p(params, "TargetArn"))
     phone_number = _p(params, "PhoneNumber")
@@ -641,104 +749,23 @@ def _publish(params):
                         f"<PublishResult><MessageId>{msg_id}</MessageId></PublishResult>")
         return _error("NotFound", f"Topic does not exist: {topic_arn}", 404)
 
-    topic = _topics[topic_arn]
-    msg_attrs = _parse_message_attributes(params)
-
-    # AWS rejects Publish requests whose Message + MessageAttributes exceed
-    # 256 KiB. Real-AWS error code is InvalidParameter (400).
-    if _message_payload_size(message, msg_attrs) > _SNS_MAX_PAYLOAD_BYTES:
-        return _error(
-            "InvalidParameter",
-            f"Invalid parameter: Message too long. Maximum size is {_SNS_MAX_PAYLOAD_BYTES} bytes.",
-            400,
+    try:
+        result = publish_internal(
+            topic_arn,
+            message,
+            subject,
+            message_structure=message_structure,
+            message_attributes=_parse_message_attributes(params),
+            message_group_id=_p(params, "MessageGroupId") or "",
+            message_deduplication_id=_p(params, "MessageDeduplicationId") or "",
         )
+    except SnsPublishError as exc:
+        return _error(exc.code, str(exc), 400)
 
-    fifo = _is_fifo_topic(topic)
-
-    # ── FIFO validation, deduplication, and sequencing ──
-    if fifo:
-        group_id = _p(params, "MessageGroupId") or ""
-        if not group_id:
-            return _error(
-                "InvalidParameterException",
-                "Invalid parameter: The MessageGroupId parameter is required for FIFO topics",
-                400,
-            )
-
-        # Resolve dedup ID: explicit > CBD SHA-256 > error
-        try:
-            dedup_id = _resolve_dedup_id(topic, params, message)
-        except ValueError as exc:
-            return _error("InvalidParameterException", str(exc), 400)
-
-        # Prune expired cache entries, then check for duplicate
-        with _fifo_lock:
-            _prune_sns_dedup(topic)
-            cached = topic.get("dedup_cache", {}).get(dedup_id)
-            if cached:
-                # Duplicate within the 5-minute window — return cached result
-                return _xml(
-                    200,
-                    "PublishResponse",
-                    f"<PublishResult>"
-                    f"<MessageId>{cached['message_id']}</MessageId>"
-                    f"<SequenceNumber>{cached['sequence_number']}</SequenceNumber>"
-                    f"</PublishResult>",
-                )
-
-            # New message: increment sequence counter
-            topic["fifo_seq"] = topic.get("fifo_seq", 0) + 1
-            seq_number = str(topic["fifo_seq"]).zfill(20)
-            msg_id = new_uuid()
-
-            # Cache the entry for deduplication (300s window)
-            topic.setdefault("dedup_cache", {})[dedup_id] = {
-                "expire": time.time() + _DEDUP_WINDOW_S,
-                "message_id": msg_id,
-                "sequence_number": seq_number,
-            }
-
-        topic["messages"].append({
-            "id": msg_id,
-            "message": message,
-            "subject": subject,
-            "message_structure": message_structure,
-            "message_attributes": msg_attrs,
-            "timestamp": int(time.time()),
-        })
-
-        _fanout(topic_arn, msg_id, message, subject, message_structure, msg_attrs,
-                message_group_id=group_id, message_dedup_id=dedup_id)
-
-        logger.info("SNS FIFO publish to %s: %s", topic_arn, message[:100])
-        return _xml(
-            200,
-            "PublishResponse",
-            f"<PublishResult>"
-            f"<MessageId>{msg_id}</MessageId>"
-            f"<SequenceNumber>{seq_number}</SequenceNumber>"
-            f"</PublishResult>",
-        )
-
-    # ── Standard (non-FIFO) publish path ──
-    msg_id = new_uuid()
-    topic["messages"].append({
-        "id": msg_id,
-        "message": message,
-        "subject": subject,
-        "message_structure": message_structure,
-        "message_attributes": msg_attrs,
-        "timestamp": int(time.time()),
-    })
-
-    group_id = _p(params, "MessageGroupId") or ""
-    dedup_id = _p(params, "MessageDeduplicationId") or ""
-    _fanout(topic_arn, msg_id, message, subject, message_structure, msg_attrs,
-            message_group_id=group_id, message_dedup_id=dedup_id)
-    logger.info("SNS publish to %s: %s", topic_arn, message[:100])
-
-    return _xml(200, "PublishResponse",
-                f"<PublishResult><MessageId>{msg_id}</MessageId></PublishResult>")
+    inner = f"<MessageId>{result['message_id']}</MessageId>"
+    if result["sequence_number"] is not None:
+        inner += f"<SequenceNumber>{result['sequence_number']}</SequenceNumber>"
+    return _xml(200, "PublishResponse", f"<PublishResult>{inner}</PublishResult>")
 
 
 def _publish_batch(params):

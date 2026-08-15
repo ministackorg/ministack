@@ -4,6 +4,7 @@ Handles XML responses (S3, SQS, SNS, IAM, STS, CloudWatch) and
 JSON responses (DynamoDB, Lambda, SecretsManager, CloudWatch Logs).
 """
 
+import contextlib
 import contextvars
 import hashlib
 import json
@@ -63,6 +64,25 @@ def set_request_region(region: str | None) -> None:
 def get_region() -> str:
     """Return the region for the current request."""
     return _request_region.get()
+
+
+@contextlib.contextmanager
+def request_scope(account_id: str, region: str):
+    """Pin the request-scoped account and region around a block that reaches
+    into another service's store.
+
+    Cross-service work that starts outside an HTTP request — a background poller,
+    an MQTT broker session, an event dispatcher — has no request scope of its own,
+    but the stores it writes to are scoped by these contextvars. Such a caller
+    knows the account and region it is acting for and pins them here.
+    """
+    account_token = _request_account_id.set(account_id)
+    region_token = _request_region.set(region)
+    try:
+        yield
+    finally:
+        _request_region.reset(region_token)
+        _request_account_id.reset(account_token)
 
 
 class AccountScopedDict:
@@ -403,17 +423,23 @@ def error_response_xml(code: str, message: str, status: int, namespace: str = "h
     return status, {"Content-Type": "application/xml"}, body
 
 
-def error_response_json(code: str, message: str, status: int = 400) -> tuple:
+def error_response_json(code: str, message: str, status: int = 400, extra: dict | None = None) -> tuple:
     """AWS-style JSON error response.
 
     Real AWS emits the error type in BOTH the body (`__type`) and the
     `x-amzn-errortype` response header. Java/Go SDK v2 prefer the header;
     boto3 reads the body. Send both.
+
+    `extra` carries the modeled members some exceptions add to the body (for
+    example `resourceId` / `resourceArn` on `ResourceAlreadyExistsException`),
+    so callers never have to rebuild the envelope themselves.
     """
     data = {
         "__type": code,
         "message": message,
     }
+    if extra:
+        data.update(extra)
     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
     return status, {
         "Content-Type": "application/x-amz-json-1.0",
