@@ -125,10 +125,18 @@ _resources = AccountRegionScopedDict()           # rest_api_id -> {resource_id -
 _stages_v1 = AccountRegionScopedDict()           # rest_api_id -> {stage_name -> Stage}
 _deployments_v1 = AccountRegionScopedDict()      # rest_api_id -> {deployment_id -> Deployment}
 _authorizers_v1 = AccountRegionScopedDict()      # rest_api_id -> {authorizer_id -> Authorizer}
-# Data-plane cache of evaluated Lambda-authorizer results, keyed by
-# (rest_api_id, authorizer_id, cache_key). Value: (expiry_epoch, decision, context).
-# Ephemeral (not persisted); honors authorizerResultTtlInSeconds.
+# Data-plane cache of Lambda-authorizer OUTPUT — the policy document and the
+# context, not the allow/deny verdict — keyed by (account, region, rest_api_id,
+# authorizer_id, stage, identity values). Value: (expiry_epoch, policy, context).
+# The policy is re-evaluated against every request's own method ARN, so a cached
+# Allow issued for one method or one stage cannot answer another. Ephemeral (not
+# persisted); honors authorizerResultTtlInSeconds.
 _authorizer_cache = {}
+# Entries are keyed on caller-supplied tokens, so the cache is capped rather than
+# left to grow with every distinct token a long-lived instance ever sees.
+_AUTHORIZER_CACHE_MAX = 1024
+# AWS's default when CreateAuthorizer omits authorizerResultTtlInSeconds.
+_DEFAULT_AUTHORIZER_TTL = 300
 _models = AccountRegionScopedDict()              # rest_api_id -> {model_id -> Model}
 _api_keys = AccountRegionScopedDict()            # key_id -> ApiKey
 _usage_plans = AccountRegionScopedDict()         # plan_id -> UsagePlan
@@ -610,6 +618,13 @@ def _match_recursive(resources, parent_id, segments, params):
 
 
 def _extract_lambda_ref_from_integration_uri(uri: str) -> str:
+    """Pull the Lambda reference out of an integration URI.
+
+    Supported URI formats:
+      1. arn:aws:apigateway:{region}:lambda:path/2015-03-31/functions/arn:aws:lambda:{region}:{acct}:function:{name}[:{qualifier}]/invocations
+      2. arn:aws:lambda:{region}:{acct}:function:{name}[:{qualifier}]
+      3. plain function name: MyFunction[:{qualifier}]
+    """
     if not uri:
         return ""
     if "/functions/" in uri:
@@ -622,12 +637,22 @@ def _extract_lambda_ref_from_integration_uri(uri: str) -> str:
     return uri
 
 
-async def _call_lambda(function_ref, event, *, account_id=None, region=None):
-    """Invoke a Lambda function and return the parsed response dict.
+async def _call_lambda_raw(function_ref, event, *, account_id=None, region=None):
+    """Invoke a Lambda function and return its uninterpreted execution record.
 
-    ``function_ref`` may be a name, partial ARN, or full ARN. Full ARNs are
-    resolved through Lambda's scoped lookup so region-qualified integration URIs
-    invoke the function named in the ARN instead of the request/default region."""
+    Returns ``(result, error_msg)`` where ``result["body"]`` is the payload
+    exactly as the function returned it. ``function_ref`` may be a name, partial
+    ARN, or full ARN; full ARNs are resolved through Lambda's scoped lookup so
+    region-qualified integration URIs invoke the function named in the ARN
+    instead of the request/default region.
+
+    Routed through the central ``_execute_function`` dispatcher so CloudWatch
+    Logs emission and Docker log output work for API Gateway invocations.
+
+    Non-proxy (custom) integrations need the raw payload; :func:`_call_lambda`
+    is this plus the AWS_PROXY response shaper, which would rewrite a handler's
+    ``statusCode`` key into the HTTP status.
+    """
     from ministack.services import lambda_svc
 
     func_data, func_config, func_name = lambda_svc._get_func_record_for_ref_in_scope(
@@ -639,12 +664,25 @@ async def _call_lambda(function_ref, event, *, account_id=None, region=None):
         label = function_ref or func_name
         return None, f"Lambda function '{label}' not found"
 
-    # Route through the central _execute_function dispatcher so CloudWatch
-    # Logs emission and Docker log output work for API Gateway invocations.
-    # Response shaping (throttle→429, error→502, body→envelope) goes through
-    # the shared helper so v1/v2 stay consistent.
     exec_record = lambda_svc._execution_record_for_config(func_data, func_config)
     result = await asyncio.to_thread(lambda_svc._execute_function_with_config_scope, exec_record, event)
+    return result, None
+
+
+async def _call_lambda(function_ref, event, *, account_id=None, region=None):
+    """Invoke a Lambda function and return the parsed AWS_PROXY response dict.
+
+    :func:`_call_lambda_raw` plus the shared response shaper (throttle→429,
+    error→502, body→envelope), which is what keeps v1 and v2 consistent.
+    """
+    from ministack.services import lambda_svc
+
+    result, err = await _call_lambda_raw(
+        function_ref, event, account_id=account_id, region=region
+    )
+    if err:
+        return None, err
+
     lambda_response, _ = lambda_svc.lambda_execute_result_to_api_proxy_response(result)
     # On error the helper returns {statusCode: 502, body: <msg>}; preserve
     # the _call_lambda contract of (None, error_msg) so callers that check
@@ -1337,6 +1375,40 @@ def _request_identity_sources(identity_source, headers, query_params, stage):
     return present, values
 
 
+def _authorizer_ttl(authorizer):
+    """``authorizerResultTtlInSeconds`` as a non-negative int.
+
+    CreateAuthorizer already defaults the field to ``_DEFAULT_AUTHORIZER_TTL``,
+    so a record reaching here without one was reshaped by UpdateAuthorizer —
+    which applies JSON Patch verbatim and never validates the value. Absent and
+    unparsable therefore mean the same thing and both fall back to the AWS
+    default, instead of silently disabling caching in one case and enabling it
+    in the other. An explicit 0 still disables it.
+    """
+    raw = authorizer.get("authorizerResultTtlInSeconds")
+    if raw is None or raw == "":
+        return _DEFAULT_AUTHORIZER_TTL
+    try:
+        return max(int(raw), 0)
+    except (TypeError, ValueError):
+        return _DEFAULT_AUTHORIZER_TTL
+
+
+def _cache_authorizer_result(key, expires_at, policy_doc, context):
+    """Store one authorizer result, keeping ``_authorizer_cache`` bounded.
+
+    Expired entries are dropped once the cap is reached; if that is not enough,
+    the oldest insertions are evicted.
+    """
+    if len(_authorizer_cache) >= _AUTHORIZER_CACHE_MAX:
+        now = time.time()
+        for stale in [k for k, v in _authorizer_cache.items() if v[0] <= now]:
+            del _authorizer_cache[stale]
+        while len(_authorizer_cache) >= _AUTHORIZER_CACHE_MAX:
+            del _authorizer_cache[next(iter(_authorizer_cache))]
+    _authorizer_cache[key] = (expires_at, policy_doc, context)
+
+
 async def _authorize_request_v1(
     api_id, stage_name, method_obj, method, request_path, resource,
     headers, body, query_params, path_params, stage,
@@ -1370,7 +1442,7 @@ async def _authorize_request_v1(
         owner_region, owner_account_id, api_id, stage_name, method, request_path
     )
     atype = (authorizer.get("type") or "TOKEN").upper()
-    ttl = int(authorizer.get("authorizerResultTtlInSeconds") or 0)
+    ttl = _authorizer_ttl(authorizer)
 
     if atype == "TOKEN":
         identity_source = authorizer.get("identitySource") or "method.request.header.Authorization"
@@ -1383,9 +1455,18 @@ async def _authorize_request_v1(
         if not token:
             return _gw_error(401, "Unauthorized"), None
         val_expr = authorizer.get("identityValidationExpression")
-        if val_expr and not re.fullmatch(val_expr, token):
-            return _gw_error(401, "Unauthorized"), None
-        cache_key = token
+        if val_expr:
+            try:
+                token_matches = re.fullmatch(val_expr, token) is not None
+            except re.error:
+                # CreateAuthorizer stores the expression verbatim, so an
+                # uncompilable one only surfaces here. That is a
+                # misconfiguration (AUTHORIZER_CONFIGURATION_ERROR), not an
+                # exception that should escape the request handler.
+                return _gw_error(500, "Internal server error"), None
+            if not token_matches:
+                return _gw_error(401, "Unauthorized"), None
+        identity_values = (token,)
         event = {"type": "TOKEN", "authorizationToken": token, "methodArn": method_arn}
     else:  # REQUEST
         identity_source = authorizer.get("identitySource") or ""
@@ -1396,7 +1477,7 @@ async def _authorize_request_v1(
         # 401 without invoking the authorizer (matches AWS).
         if ttl > 0 and identity_source and not all_present:
             return _gw_error(401, "Unauthorized"), None
-        cache_key = "|".join(id_values)
+        identity_values = tuple(id_values)
         single_headers = {k: (v if isinstance(v, str) else v[-1]) for k, v in headers.items()}
         multi_headers = {k: ([v] if isinstance(v, str) else list(v)) for k, v in headers.items()}
         qs_params = {k: v[0] for k, v in query_params.items()} if query_params else None
@@ -1423,54 +1504,70 @@ async def _authorize_request_v1(
             },
         }
 
-    # TTL cache: a hit replays the prior decision without invoking the Lambda.
-    ckey = (api_id, authorizer_id, cache_key)
+    # TTL cache: a hit replays the authorizer's OUTPUT without invoking the
+    # Lambda, but never its verdict — the policy is evaluated below against this
+    # request's own method ARN. The stage and the identity values are part of the
+    # key for the same reason: the canonical `Resource: event['methodArn']` policy
+    # is issued for exactly one method on one stage.
+    ckey = (owner_account_id, owner_region, api_id, authorizer_id, stage_name, identity_values)
+    cached = None
     if ttl > 0:
         hit = _authorizer_cache.get(ckey)
         if hit and hit[0] > time.time():
-            _, decision, cached_ctx = hit
-            if decision == "Allow":
-                return None, cached_ctx
-            return _deny_error(decision == "Deny"), None
+            cached = (hit[1], hit[2])
 
-    result = await _invoke_authorizer_lambda(
-        authorizer, event, owner_account_id, owner_region
-    )
-    if result is None:
-        # Authorizer Lambda unresolved / not found → connection failure.
-        return _gw_error(500, "Internal server error"), None
-    if result.get("error"):
-        err_body = result.get("body") or {}
-        msg = err_body.get("errorMessage", "") if isinstance(err_body, dict) else str(err_body)
-        # A function that raises exactly "Unauthorized" maps to 401; any other
-        # uncaught error is an authorizer failure → 500.
-        if isinstance(msg, str) and msg.strip().lower() == "unauthorized":
-            return _gw_error(401, "Unauthorized"), None
-        return _gw_error(500, "Internal server error"), None
+    if cached is None:
+        result = await _invoke_authorizer_lambda(
+            authorizer, event, owner_account_id, owner_region
+        )
+        if result is None:
+            # Authorizer Lambda unresolved / not found → connection failure.
+            return _gw_error(500, "Internal server error"), None
+        if result.get("error"):
+            err_body = result.get("body") or {}
+            msg = err_body.get("errorMessage", "") if isinstance(err_body, dict) else str(err_body)
+            # A function that raises exactly "Unauthorized" maps to 401; any other
+            # uncaught error is an authorizer failure → 500.
+            if isinstance(msg, str) and msg.strip().lower() == "unauthorized":
+                return _gw_error(401, "Unauthorized"), None
+            return _gw_error(500, "Internal server error"), None
 
-    policy = result.get("body")
-    if isinstance(policy, (str, bytes)):
-        if isinstance(policy, bytes):
-            policy = policy.decode("utf-8", errors="replace")
-        try:
-            policy = json.loads(policy)
-        except json.JSONDecodeError:
-            policy = None
-    if not isinstance(policy, dict):
-        return _gw_error(500, "Internal server error"), None
+        policy = result.get("body")
+        if isinstance(policy, (str, bytes)):
+            if isinstance(policy, bytes):
+                policy = policy.decode("utf-8", errors="replace")
+            try:
+                policy = json.loads(policy)
+            except json.JSONDecodeError:
+                policy = None
+        if not isinstance(policy, dict):
+            return _gw_error(500, "Internal server error"), None
 
-    decision = _evaluate_policy(policy.get("policyDocument"), method_arn)
-    if decision != "Allow":
-        if ttl > 0:
-            _authorizer_cache[ckey] = (time.time() + ttl, decision, None)
-        return _deny_error(decision == "Deny"), None
+        principal_id = policy.get("principalId")
+        if principal_id is None or str(principal_id) == "":
+            # AWS demands a principal. Without one the response is an
+            # AUTHORIZER_CONFIGURATION_ERROR, not an Allow that reaches the
+            # backend carrying an empty principalId.
+            return _gw_error(500, "Internal server error"), None
 
-    auth_ctx = _stringify_context(policy.get("context"))
-    principal_id = policy.get("principalId")
-    if principal_id is not None:
+        policy_doc = policy.get("policyDocument")
+        if not isinstance(policy_doc, dict):
+            # Same AUTHORIZER_CONFIGURATION_ERROR shape: a response without a
+            # policyDocument is a misconfigured authorizer, not an implicit
+            # deny — and it must not be cached.
+            return _gw_error(500, "Internal server error"), None
+
+        auth_ctx = _stringify_context(policy.get("context"))
         auth_ctx["principalId"] = str(principal_id)
-    if ttl > 0:
-        _authorizer_cache[ckey] = (time.time() + ttl, "Allow", auth_ctx)
+        # Only a well-formed response is cached; failures re-invoke next time.
+        cached = (policy_doc, auth_ctx)
+        if ttl > 0:
+            _cache_authorizer_result(ckey, time.time() + ttl, *cached)
+
+    policy_doc, auth_ctx = cached
+    decision = _evaluate_policy(policy_doc, method_arn)
+    if decision != "Allow":
+        return _deny_error(decision == "Deny"), None
     return None, auth_ctx
 
 
@@ -1523,7 +1620,12 @@ async def _handle_execute_in_scope(
     int_type = integration.get("type", "")
 
     if int_type in ("AWS_PROXY", "AWS"):
-        return await _invoke_lambda_proxy_v1(
+        # AWS_PROXY hands the function a response envelope to interpret; the
+        # non-proxy `AWS` (custom / "lambda") integration returns the handler's
+        # output as the body verbatim. Same event in, different response
+        # contract out.
+        invoke = _invoke_lambda_proxy_v1 if int_type == "AWS_PROXY" else _invoke_lambda_custom_v1
+        return await invoke(
             integration, api_id, stage_name, stage, resource, path, method,
             headers, body, query_params, path_params,
             owner_account_id=owner_account_id,
@@ -1560,8 +1662,7 @@ def _media_type_matches(media_type, binary_media_types):
     return False
 
 
-async def _invoke_lambda_proxy_v1(
-    integration,
+def _build_lambda_event_v1(
     api_id,
     stage_name,
     stage,
@@ -1573,19 +1674,17 @@ async def _invoke_lambda_proxy_v1(
     query_params,
     path_params,
     *,
-    owner_account_id=None,
-    owner_region=None,
     binary_media_types=None,
     authorizer_context=None,
 ):
-    """Invoke Lambda with API Gateway v1 payload format 1.0."""
-    uri = integration.get("uri", "")
-    # Supported URI formats:
-    #   1. arn:aws:apigateway:{region}:lambda:path/2015-03-31/functions/arn:aws:lambda:{region}:{acct}:function:{name}[:{qualifier}]/invocations
-    #   2. arn:aws:lambda:{region}:{acct}:function:{name}[:{qualifier}]
-    #   3. plain function name: MyFunction[:{qualifier}]
-    lambda_ref = _extract_lambda_ref_from_integration_uri(uri)
+    """Build the API Gateway v1 payload format 1.0 event handed to Lambda.
 
+    Shared by the AWS_PROXY and the non-proxy (custom) AWS integration paths.
+    The two differ in how the *response* is interpreted, not in what the
+    function is invoked with: a non-proxy integration would normally reshape the
+    request through a `requestTemplates` mapping template, which is not modeled
+    here — the function receives the same synthesized event either way.
+    """
     qs_params = {k: v[0] for k, v in query_params.items()} if query_params else None
     mv_qs_params = {k: list(v) for k, v in query_params.items()} if query_params else None
 
@@ -1648,6 +1747,38 @@ async def _invoke_lambda_proxy_v1(
     if authorizer_context is not None:
         event["requestContext"]["authorizer"] = authorizer_context
 
+    return event
+
+
+async def _invoke_lambda_proxy_v1(
+    integration,
+    api_id,
+    stage_name,
+    stage,
+    resource,
+    request_path,
+    method,
+    headers,
+    body,
+    query_params,
+    path_params,
+    *,
+    owner_account_id=None,
+    owner_region=None,
+    binary_media_types=None,
+    authorizer_context=None,
+):
+    """Invoke Lambda through an AWS_PROXY integration and interpret its
+    `{statusCode, headers, body}` response envelope."""
+    lambda_ref = _extract_lambda_ref_from_integration_uri(integration.get("uri", ""))
+
+    event = _build_lambda_event_v1(
+        api_id, stage_name, stage, resource, request_path, method,
+        headers, body, query_params, path_params,
+        binary_media_types=binary_media_types,
+        authorizer_context=authorizer_context,
+    )
+
     lambda_response, err = await _call_lambda(
         lambda_ref,
         event,
@@ -1699,6 +1830,92 @@ async def _invoke_lambda_proxy_v1(
         resp_body = json.dumps(resp_body, ensure_ascii=False).encode("utf-8")
 
     return status, resp_headers, resp_body
+
+
+def _default_integration_response_status_v1(integration):
+    """The status code a successful non-proxy integration answers with.
+
+    AWS selects the integration response whose ``selectionPattern`` is empty —
+    the default mapping, which handles every invocation that did not fail — and
+    falls back to 200 when the method has no integration responses configured.
+    ``responseTemplates`` / ``responseParameters`` are not modeled; the payload
+    is passed through verbatim.
+    """
+    for code, resp in sorted((integration.get("integrationResponses") or {}).items()):
+        if not (resp or {}).get("selectionPattern"):
+            try:
+                return int((resp or {}).get("statusCode") or code)
+            except (TypeError, ValueError):
+                return 200
+    return 200
+
+
+async def _invoke_lambda_custom_v1(
+    integration,
+    api_id,
+    stage_name,
+    stage,
+    resource,
+    request_path,
+    method,
+    headers,
+    body,
+    query_params,
+    path_params,
+    *,
+    owner_account_id=None,
+    owner_region=None,
+    binary_media_types=None,
+    authorizer_context=None,
+):
+    """Invoke Lambda through a non-proxy (custom) ``AWS`` integration.
+
+    Unlike AWS_PROXY there is no ``{statusCode, headers, body}`` envelope: the
+    function's return value IS the response body, serialized as JSON and sent
+    with the integration response's status code (200 by default). A handler that
+    happens to return a ``statusCode`` key therefore ships that key to the client
+    inside the body instead of having it promoted to the HTTP status.
+
+    A function error answers 502 ``{"message": "Internal server error"}`` —
+    the error payload is never surfaced to the caller.
+    """
+    lambda_ref = _extract_lambda_ref_from_integration_uri(integration.get("uri", ""))
+
+    event = _build_lambda_event_v1(
+        api_id, stage_name, stage, resource, request_path, method,
+        headers, body, query_params, path_params,
+        binary_media_types=binary_media_types,
+        authorizer_context=authorizer_context,
+    )
+
+    result, err = await _call_lambda_raw(
+        lambda_ref,
+        event,
+        account_id=owner_account_id,
+        region=owner_region,
+    )
+    if err:
+        return 502, {"Content-Type": "application/json"}, json.dumps({"message": err}).encode()
+
+    resp_headers = {"Content-Type": "application/json"}
+    if result.get("throttle"):
+        throttle_body = result.get("body") or {}
+        payload = throttle_body if isinstance(throttle_body, dict) else {"message": str(throttle_body)}
+        return 429, resp_headers, json.dumps(payload).encode()
+    if result.get("error"):
+        return 502, resp_headers, json.dumps({"message": "Internal server error"}).encode()
+
+    payload = result.get("body")
+    if payload is None:
+        resp_body = b""
+    elif isinstance(payload, (bytes, bytearray)):
+        resp_body = bytes(payload)
+    else:
+        # The payload is a JSON document, so a bare string comes back quoted —
+        # matching what `lambda invoke` writes and what AWS passes through.
+        resp_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    return _default_integration_response_status_v1(integration), resp_headers, resp_body
 
 
 async def _invoke_http_proxy_v1(integration, path, method, headers, body, query_params, path_params=None):
@@ -2673,7 +2890,9 @@ def _create_authorizer(api_id, data):
         "authorizerCredentials": data.get("authorizerCredentials"),
         "identitySource": data.get("identitySource", "method.request.header.Authorization"),
         "identityValidationExpression": data.get("identityValidationExpression", ""),
-        "authorizerResultTtlInSeconds": data.get("authorizerResultTtlInSeconds", 300),
+        "authorizerResultTtlInSeconds": data.get(
+            "authorizerResultTtlInSeconds", _DEFAULT_AUTHORIZER_TTL
+        ),
         "providerARNs": data.get("providerARNs", []),
     }
     _authorizers_v1.setdefault(api_id, {})[auth_id] = authorizer
