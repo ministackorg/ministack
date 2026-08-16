@@ -4365,6 +4365,151 @@ def test_s3_copy_object_source_date_preconditions(s3):
     assert e3.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
 
 
+def _conditional_read_bucket(s3):
+    """A bucket holding one object, with its ETag and Last-Modified."""
+    bkt = f"cond-read-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    etag = s3.put_object(Bucket=bkt, Key="obj", Body=b"payload")["ETag"]
+    mtime = s3.head_object(Bucket=bkt, Key="obj")["LastModified"]
+    return bkt, etag, mtime
+
+
+def test_s3_get_object_etag_preconditions(s3):
+    """GetObject answers If-Match and If-None-Match instead of always returning
+    the body: a stale If-Match is 412, and a current If-None-Match is 304."""
+    bkt, etag, _ = _conditional_read_bucket(s3)
+
+    # The condition holds -> the read proceeds as normal.
+    assert s3.get_object(Bucket=bkt, Key="obj", IfMatch=etag)["Body"].read() == b"payload"
+    assert s3.get_object(Bucket=bkt, Key="obj", IfMatch="*")["Body"].read() == b"payload"
+    assert s3.get_object(Bucket=bkt, Key="obj", IfNoneMatch='"ABCORZ"')["Body"].read() == b"payload"
+
+    # If-Match against some other representation -> 412, nothing transferred.
+    with pytest.raises(ClientError) as e:
+        s3.get_object(Bucket=bkt, Key="obj", IfMatch='"ABCORZ"')
+    assert e.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+    assert e.value.response["Error"]["Code"] == "PreconditionFailed"
+
+    # If-None-Match naming the current representation -> the caller's copy is
+    # current, so 304 and no body. The ETag confirms which one they revalidated.
+    for value in (etag, "*", f'"nomatch", {etag}', f"W/{etag}"):
+        with pytest.raises(ClientError) as e2:
+            s3.get_object(Bucket=bkt, Key="obj", IfNoneMatch=value)
+        resp = e2.value.response
+        assert resp["ResponseMetadata"]["HTTPStatusCode"] == 304, value
+        assert resp["ResponseMetadata"]["HTTPHeaders"]["etag"] == etag, value
+
+
+def test_s3_get_object_date_preconditions(s3):
+    """GetObject answers If-Modified-Since and If-Unmodified-Since: unchanged
+    since the caller's timestamp is 304, changed after it is 412."""
+    from datetime import timedelta
+
+    bkt, etag, mtime = _conditional_read_bucket(s3)
+    before = mtime - timedelta(days=1)
+    after = mtime + timedelta(seconds=1)
+
+    # Modified since a day ago (true) and unmodified since a second from now
+    # (true) both leave the read alone.
+    assert s3.get_object(Bucket=bkt, Key="obj", IfModifiedSince=before)["Body"].read() == b"payload"
+    assert s3.get_object(Bucket=bkt, Key="obj", IfUnmodifiedSince=after)["Body"].read() == b"payload"
+
+    # Not modified since a second from now -> 304.
+    with pytest.raises(ClientError) as e:
+        s3.get_object(Bucket=bkt, Key="obj", IfModifiedSince=after)
+    assert e.value.response["ResponseMetadata"]["HTTPStatusCode"] == 304
+    assert e.value.response["ResponseMetadata"]["HTTPHeaders"]["etag"] == etag
+
+    # Modified since a day ago -> the If-Unmodified-Since condition fails -> 412.
+    with pytest.raises(ClientError) as e2:
+        s3.get_object(Bucket=bkt, Key="obj", IfUnmodifiedSince=before)
+    assert e2.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+    assert e2.value.response["Error"]["Code"] == "PreconditionFailed"
+
+
+def test_s3_read_precondition_precedence(s3):
+    """An entity tag beats its date counterpart, per RFC 9110 13.2.2 and the AWS
+    GetObject reference: the date header applies only when the tag is absent."""
+    from datetime import timedelta
+
+    bkt, etag, mtime = _conditional_read_bucket(s3)
+    before = mtime - timedelta(days=1)
+    after = mtime + timedelta(seconds=1)
+
+    # If-Match holds, so the failing If-Unmodified-Since is not consulted -> 200.
+    resp = s3.get_object(Bucket=bkt, Key="obj", IfMatch=etag, IfUnmodifiedSince=before)
+    assert resp["Body"].read() == b"payload"
+
+    # If-None-Match matches, so the satisfied If-Modified-Since is not
+    # consulted -> 304 rather than the body.
+    with pytest.raises(ClientError) as e:
+        s3.get_object(Bucket=bkt, Key="obj", IfNoneMatch=etag, IfModifiedSince=before)
+    assert e.value.response["ResponseMetadata"]["HTTPStatusCode"] == 304
+
+    # The tag is consulted even when it does not decide the read: a present
+    # If-None-Match that misses suppresses If-Modified-Since outright, so the
+    # body comes back although that date alone would have meant 304.
+    resp = s3.get_object(Bucket=bkt, Key="obj", IfNoneMatch='"ABCORZ"', IfModifiedSince=after)
+    assert resp["Body"].read() == b"payload"
+
+
+def test_s3_head_object_preconditions(s3):
+    """HeadObject evaluates the same four conditions as GetObject."""
+    from datetime import timedelta
+
+    bkt, etag, mtime = _conditional_read_bucket(s3)
+
+    assert s3.head_object(Bucket=bkt, Key="obj", IfMatch=etag)["ETag"] == etag
+
+    with pytest.raises(ClientError) as e:
+        s3.head_object(Bucket=bkt, Key="obj", IfMatch='"ABCORZ"')
+    assert e.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+
+    with pytest.raises(ClientError) as e2:
+        s3.head_object(Bucket=bkt, Key="obj", IfNoneMatch=etag)
+    assert e2.value.response["ResponseMetadata"]["HTTPStatusCode"] == 304
+
+    with pytest.raises(ClientError) as e3:
+        s3.head_object(Bucket=bkt, Key="obj", IfUnmodifiedSince=mtime - timedelta(days=1))
+    assert e3.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+
+
+def test_s3_not_modified_carries_no_payload(s3):
+    """Checked on the wire, not through boto3: a 304 ends at the header section
+    and can never carry a body (RFC 9110 15.4.5), so it must not describe one
+    either. A stray body would desynchronise the next request on the connection."""
+    import http.client
+
+    bkt, etag, _ = _conditional_read_bucket(s3)
+    parsed = urlparse(ENDPOINT)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 4566, timeout=10)
+    # Checksum mode is on, as boto3 turns it on by default, so the checksum
+    # headers below are ones the 200 really would have carried.
+    conn.request("GET", f"/{bkt}/obj",
+                 headers={"If-None-Match": etag, "x-amz-checksum-mode": "ENABLED"})
+    resp = conn.getresponse()
+    body = resp.read()
+
+    assert resp.status == 304
+    assert body == b""
+    assert resp.getheader("ETag") == etag
+    assert resp.getheader("Last-Modified")
+    for absent in ("Content-Type", "Content-Encoding", "Accept-Ranges"):
+        assert resp.getheader(absent) is None, absent
+    assert (resp.getheader("Content-Length") or "0") == "0"
+    # A checksum of bytes that were not sent belongs to no one: boto3 asks for
+    # these by default and chokes on the empty body if it gets one back.
+    assert not [h for h, _ in resp.getheaders() if h.lower().startswith("x-amz-checksum-")]
+
+    # The connection is still usable, which is the point of getting the framing
+    # right: a second request on it reads its own response.
+    conn.request("GET", f"/{bkt}/obj")
+    second = conn.getresponse()
+    assert second.status == 200
+    assert second.read() == b"payload"
+    conn.close()
+
+
 def test_s3_canned_acl_expands_to_group_grants(s3):
     """A canned ACL (at PutObject or PutObjectAcl) expands to the group grants it
     implies: public-read -> AllUsers READ; authenticated-read -> AuthenticatedUsers
