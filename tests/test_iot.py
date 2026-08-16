@@ -4356,3 +4356,606 @@ def test_ddb_attribute_value_mapping():
     assert _ddb_attribute_value({"a": 1}) == {"S": '{"a": 1}'}
     assert _ddb_attribute_value([1, 2]) == {"S": "[1, 2]"}
     assert _ddb_attribute_value("x") == {"S": "x"}
+
+
+# ----------------------------------------------------------------------
+# Shadow-over-MQTT bridge (white-box).
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("topic", "expected"),
+    [
+        # Request topics parse.
+        ("$aws/things/dev1/shadow/get", ("dev1", "get", None)),
+        ("$aws/things/dev1/shadow/update", ("dev1", "update", None)),
+        ("$aws/things/dev1/shadow/delete", ("dev1", "delete", None)),
+        ("$aws/things/dev1/shadow/name/cfg/get", ("dev1", "get", "cfg")),
+        ("$aws/things/dev1/shadow/name/cfg/update", ("dev1", "update", "cfg")),
+        ("$aws/things/dev1/shadow/name/cfg/delete", ("dev1", "delete", "cfg")),
+        # An empty shadow name parses (so the bridge can reject it on the
+        # requester's own reply topic) rather than collapsing onto classic.
+        ("$aws/things/dev1/shadow/name//update", ("dev1", "update", "")),
+        # Response suffixes never re-trigger the bridge.
+        ("$aws/things/dev1/shadow/update/accepted", None),
+        ("$aws/things/dev1/shadow/update/rejected", None),
+        ("$aws/things/dev1/shadow/update/delta", None),
+        ("$aws/things/dev1/shadow/update/documents", None),
+        ("$aws/things/dev1/shadow/get/accepted", None),
+        ("$aws/things/dev1/shadow/get/rejected", None),
+        ("$aws/things/dev1/shadow/delete/accepted", None),
+        ("$aws/things/dev1/shadow/name/cfg/update/accepted", None),
+        ("$aws/things/dev1/shadow/name/cfg/update/delta", None),
+        ("$aws/things/dev1/shadow/name/cfg/get/rejected", None),
+        # Malformed / unrelated.
+        ("$aws/things/dev1/shadow", None),
+        ("$aws/things/dev1/shadow/name", None),
+        ("$aws/things/dev1/shadow/name/cfg", None),
+        ("$aws/things/dev1/shadow/frobnicate", None),
+        ("$aws/things/dev1/notshadow/get", None),
+        ("$aws/things", None),
+        ("$aws/rules/rule1/some/topic", None),
+        ("plain/topic", None),
+        ("", None),
+    ],
+)
+def test_parse_shadow_topic_truth_table(topic, expected):
+    from ministack.services.iot import _parse_shadow_topic
+
+    assert _parse_shadow_topic(topic) == expected
+
+
+def test_shadow_mqtt_update_publishes_accepted_delta_documents():
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    account_id = "123456789012"
+    frames: dict[str, list] = {}
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            frames.setdefault(topic, []).append(json.loads(payload))
+
+        await subscribe(
+            account_id, "$aws/things/dev1/shadow/update/+", _collect, granted_qos=1
+        )
+        await publish(
+            account_id,
+            "$aws/things/dev1/shadow/update",
+            json.dumps(
+                {"state": {"desired": {"led": "on"}}, "clientToken": "tok-1"}
+            ).encode(),
+        )
+
+    try:
+        asyncio.run(_run())
+        accepted = frames["$aws/things/dev1/shadow/update/accepted"][0]
+        assert accepted["state"] == {"desired": {"led": "on"}}
+        assert accepted["version"] == 1
+        assert accepted["clientToken"] == "tok-1"
+
+        # desired != reported → a delta document, carrying the metadata AWS
+        # reports for the delta and the triggering request's clientToken.
+        delta = frames["$aws/things/dev1/shadow/update/delta"][0]
+        assert delta["state"] == {"led": "on"}
+        assert delta["version"] == 1
+        assert "timestamp" in delta
+        assert delta["clientToken"] == "tok-1"
+        assert set(delta["metadata"]) == {"led"}
+        assert delta["metadata"]["led"]["timestamp"] == accepted["metadata"]["desired"]["led"]["timestamp"]
+
+        docs = frames["$aws/things/dev1/shadow/update/documents"][0]
+        assert docs["previous"] is None
+        assert docs["current"]["version"] == 1
+        assert docs["current"]["state"]["desired"] == {"led": "on"}
+        assert "timestamp" in docs
+
+        # The MQTT update landed in the same store the HTTP data plane reads.
+        with iot_module.request_scope(account_id, _TEST_REGION):
+            status, doc = iot_module.get_thing_shadow("dev1", "")
+        assert status == 200
+        assert doc["state"]["desired"] == {"led": "on"}
+    finally:
+        iot_module._shadows.clear()
+        reset()
+
+
+def test_shadow_mqtt_update_reported_in_sync_emits_no_delta():
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    account_id = "123456789012"
+    frames: dict[str, list] = {}
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            frames.setdefault(topic, []).append(json.loads(payload))
+
+        await subscribe(
+            account_id, "$aws/things/dev2/shadow/update/+", _collect, granted_qos=1
+        )
+        await publish(
+            account_id,
+            "$aws/things/dev2/shadow/update",
+            json.dumps(
+                {"state": {"desired": {"led": "on"}, "reported": {"led": "on"}}}
+            ).encode(),
+        )
+
+    try:
+        asyncio.run(_run())
+        assert len(frames["$aws/things/dev2/shadow/update/accepted"]) == 1
+        assert "$aws/things/dev2/shadow/update/delta" not in frames
+        assert len(frames["$aws/things/dev2/shadow/update/documents"]) == 1
+    finally:
+        iot_module._shadows.clear()
+        reset()
+
+
+def test_shadow_mqtt_update_rejections():
+    """Invalid JSON → 400 (no token); version conflict → 409 with the token."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    account_id = "123456789012"
+    rejected: list = []
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            rejected.append(json.loads(payload))
+
+        await subscribe(
+            account_id, "$aws/things/dev3/shadow/update/rejected", _collect
+        )
+        await publish(
+            account_id, "$aws/things/dev3/shadow/update", b"{not json"
+        )
+        await publish(
+            account_id,
+            "$aws/things/dev3/shadow/update",
+            json.dumps({"state": {"desired": {"a": 1}}}).encode(),
+        )
+        await publish(
+            account_id,
+            "$aws/things/dev3/shadow/update",
+            json.dumps(
+                {"state": {"desired": {"a": 2}}, "version": 99, "clientToken": "t9"}
+            ).encode(),
+        )
+
+    try:
+        asyncio.run(_run())
+        assert len(rejected) == 2
+        assert rejected[0]["code"] == 400
+        assert "clientToken" not in rejected[0]
+        assert rejected[1]["code"] == 409
+        assert rejected[1]["clientToken"] == "t9"
+    finally:
+        iot_module._shadows.clear()
+        reset()
+
+
+def test_shadow_mqtt_get_delete_roundtrip():
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    account_id = "123456789012"
+    frames: dict[str, list] = {}
+
+    async def _collect(topic, payload, qos):
+        frames.setdefault(topic, []).append(json.loads(payload))
+
+    async def _run():
+        for filt in (
+            "$aws/things/dev4/shadow/get/+",
+            "$aws/things/dev4/shadow/delete/+",
+        ):
+            await subscribe(account_id, filt, _collect)
+        # get before any update → rejected 404
+        await publish(account_id, "$aws/things/dev4/shadow/get", b"")
+        await publish(
+            account_id,
+            "$aws/things/dev4/shadow/update",
+            json.dumps({"state": {"reported": {"fw": "1.2"}}}).encode(),
+        )
+        # get with a clientToken → accepted echoes it
+        await publish(
+            account_id,
+            "$aws/things/dev4/shadow/get",
+            json.dumps({"clientToken": "get-1"}).encode(),
+        )
+        await publish(account_id, "$aws/things/dev4/shadow/delete", b"")
+        # delete again → rejected 404
+        await publish(account_id, "$aws/things/dev4/shadow/delete", b"")
+
+    try:
+        asyncio.run(_run())
+        get_rejected = frames["$aws/things/dev4/shadow/get/rejected"]
+        assert get_rejected[0]["code"] == 404
+        get_accepted = frames["$aws/things/dev4/shadow/get/accepted"][0]
+        assert get_accepted["state"]["reported"] == {"fw": "1.2"}
+        assert get_accepted["clientToken"] == "get-1"
+        del_accepted = frames["$aws/things/dev4/shadow/delete/accepted"][0]
+        assert del_accepted["version"] == 1
+        del_rejected = frames["$aws/things/dev4/shadow/delete/rejected"][0]
+        assert del_rejected["code"] == 404
+    finally:
+        iot_module._shadows.clear()
+        reset()
+
+
+def test_shadow_mqtt_named_shadow_isolated_from_classic():
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    account_id = "123456789012"
+    frames: dict[str, list] = {}
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            frames.setdefault(topic, []).append(json.loads(payload))
+
+        await subscribe(
+            account_id, "$aws/things/dev5/shadow/name/cfg/update/+", _collect
+        )
+        await subscribe(account_id, "$aws/things/dev5/shadow/get/+", _collect)
+        await publish(
+            account_id,
+            "$aws/things/dev5/shadow/name/cfg/update",
+            json.dumps({"state": {"desired": {"mode": "eco"}}}).encode(),
+        )
+        # The classic shadow does not exist — only the named one was written.
+        await publish(account_id, "$aws/things/dev5/shadow/get", b"")
+
+    try:
+        asyncio.run(_run())
+        accepted = frames["$aws/things/dev5/shadow/name/cfg/update/accepted"][0]
+        assert accepted["state"] == {"desired": {"mode": "eco"}}
+        assert frames["$aws/things/dev5/shadow/get/rejected"][0]["code"] == 404
+        with iot_module.request_scope(account_id, _TEST_REGION):
+            status, doc = iot_module.get_thing_shadow("dev5", "cfg")
+        assert status == 200
+        assert doc["state"]["desired"] == {"mode": "eco"}
+    finally:
+        iot_module._shadows.clear()
+        reset()
+
+
+def test_shadow_mqtt_documents_previous_is_the_pre_update_state():
+    """`documents.previous` must be the state before the update. The shadow
+    store hands back its live dicts and updates merge into them in place, so an
+    un-snapshotted `previous` reports the post-update state and the two
+    documents come out identical from the second update on."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    account_id = "123456789012"
+    frames: dict[str, list] = {}
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            frames.setdefault(topic, []).append(json.loads(payload))
+
+        await subscribe(
+            account_id, "$aws/things/dev6/shadow/update/documents", _collect
+        )
+        for temp in (20, 21):
+            await publish(
+                account_id,
+                "$aws/things/dev6/shadow/update",
+                json.dumps({"state": {"reported": {"temp": temp}}}).encode(),
+            )
+
+    try:
+        asyncio.run(_run())
+        docs = frames["$aws/things/dev6/shadow/update/documents"]
+        assert len(docs) == 2
+        assert docs[0]["previous"] is None
+        assert docs[0]["current"]["state"]["reported"] == {"temp": 20}
+        second = docs[1]
+        assert second["previous"]["state"]["reported"] == {"temp": 20}
+        assert second["current"]["state"]["reported"] == {"temp": 21}
+        assert second["previous"]["state"] != second["current"]["state"]
+        assert second["previous"]["version"] == 1
+        assert second["current"]["version"] == 2
+    finally:
+        iot_module._shadows.clear()
+        reset()
+
+
+def test_shadow_mqtt_documents_carry_no_delta_section():
+    """A `documents` state reports `desired` and `reported` only.
+
+    Both snapshots come from `get_thing_shadow`, which injects `state.delta`
+    (and `metadata.delta`) because that is what a GET answers with. Publishing
+    them verbatim put a section on the documents topic that real devices never
+    receive — the delta has its own topic, published just above this one.
+    """
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    account_id = "123456789012"
+    frames: dict[str, list] = {}
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            frames.setdefault(topic, []).append(json.loads(payload))
+
+        for suffix in ("update/documents", "update/delta"):
+            await subscribe(account_id, f"$aws/things/dev7/shadow/{suffix}", _collect)
+        # A desired the reported state does not satisfy, so a delta exists on
+        # both the pre-update and the post-update document.
+        for reported in (10, 11):
+            await publish(
+                account_id,
+                "$aws/things/dev7/shadow/update",
+                json.dumps(
+                    {"state": {"desired": {"temp": 30}, "reported": {"temp": reported}}}
+                ).encode(),
+            )
+
+    try:
+        asyncio.run(_run())
+        docs = frames["$aws/things/dev7/shadow/update/documents"]
+        assert len(docs) == 2
+        second = docs[1]
+        for snapshot in ("previous", "current"):
+            state = second[snapshot]["state"]
+            assert set(state) == {"desired", "reported"}
+            assert "delta" not in second[snapshot].get("metadata", {})
+        assert second["previous"]["state"]["reported"] == {"temp": 10}
+        assert second["current"]["state"]["reported"] == {"temp": 11}
+        # The delta itself is still reported, on the topic that is meant for it.
+        deltas = frames["$aws/things/dev7/shadow/update/delta"]
+        assert deltas and deltas[-1]["state"] == {"temp": 30}
+    finally:
+        iot_module._shadows.clear()
+        reset()
+
+
+def test_shadow_mqtt_update_without_state_node_is_rejected():
+    """The most common device-side mistake: valid JSON, no `state` node."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    account_id = "123456789012"
+    frames: dict[str, list] = {}
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            frames.setdefault(topic, []).append(json.loads(payload))
+
+        await subscribe(account_id, "$aws/things/dev7/shadow/update/+", _collect)
+        await publish(
+            account_id,
+            "$aws/things/dev7/shadow/update",
+            json.dumps({"desired": {"led": "on"}, "clientToken": "tok-9"}).encode(),
+        )
+
+    try:
+        asyncio.run(_run())
+        rejected = frames["$aws/things/dev7/shadow/update/rejected"][0]
+        assert rejected["code"] == 400
+        assert "state" in rejected["message"]
+        assert rejected["clientToken"] == "tok-9"
+        assert "$aws/things/dev7/shadow/update/accepted" not in frames
+    finally:
+        iot_module._shadows.clear()
+        reset()
+
+
+def test_shadow_mqtt_empty_named_shadow_is_rejected_on_its_own_topic():
+    """`.../shadow/name//update` names no shadow. Treating it as the classic
+    shadow would write the wrong record and answer on a topic the requester is
+    not subscribed to, so it is rejected where the requester is listening."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    account_id = "123456789012"
+    frames: dict[str, list] = {}
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            frames.setdefault(topic, []).append(json.loads(payload))
+
+        await subscribe(account_id, "$aws/things/dev8/shadow/name//update/+", _collect)
+        await subscribe(account_id, "$aws/things/dev8/shadow/update/+", _collect)
+        await publish(
+            account_id,
+            "$aws/things/dev8/shadow/name//update",
+            json.dumps({"state": {"desired": {"led": "on"}}, "clientToken": "t"}).encode(),
+        )
+
+    try:
+        asyncio.run(_run())
+        rejected = frames["$aws/things/dev8/shadow/name//update/rejected"][0]
+        assert rejected["code"] == 400
+        assert rejected["clientToken"] == "t"
+        # Nothing landed on the classic shadow's topics or in its record.
+        assert not any(t.startswith("$aws/things/dev8/shadow/update/") for t in frames)
+        with iot_module.request_scope(account_id, _TEST_REGION):
+            assert iot_module.get_thing_shadow("dev8", "")[0] == 404
+    finally:
+        iot_module._shadows.clear()
+        reset()
+
+
+def test_shadow_mqtt_named_shadow_full_lifecycle():
+    """delta / documents / get / delete all answer on the named shadow's own
+    topics — only update/accepted was covered for named shadows."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    account_id = "123456789012"
+    frames: dict[str, list] = {}
+    base = "$aws/things/dev9/shadow/name/cfg"
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            frames.setdefault(topic, []).append(json.loads(payload))
+
+        for filt in (f"{base}/update/+", f"{base}/get/+", f"{base}/delete/+"):
+            await subscribe(account_id, filt, _collect, granted_qos=1)
+        await publish(
+            account_id,
+            f"{base}/update",
+            json.dumps(
+                {"state": {"desired": {"mode": "eco"}}, "clientToken": "tok-n"}
+            ).encode(),
+        )
+        await publish(account_id, f"{base}/get", b"")
+        await publish(account_id, f"{base}/delete", b"")
+        await publish(account_id, f"{base}/get", b"")
+
+    try:
+        asyncio.run(_run())
+        delta = frames[f"{base}/update/delta"][0]
+        assert delta["state"] == {"mode": "eco"}
+        assert delta["clientToken"] == "tok-n"
+        assert set(delta["metadata"]) == {"mode"}
+        docs = frames[f"{base}/update/documents"][0]
+        assert docs["previous"] is None
+        assert docs["current"]["state"]["desired"] == {"mode": "eco"}
+        assert frames[f"{base}/get/accepted"][0]["state"]["desired"] == {"mode": "eco"}
+        assert frames[f"{base}/delete/accepted"][0]["version"] == 1
+        assert frames[f"{base}/get/rejected"][0]["code"] == 404
+    finally:
+        iot_module._shadows.clear()
+        reset()
+
+
+def test_shadow_mqtt_bridge_failure_does_not_kill_the_publish(monkeypatch):
+    """The bridge is the last side effect in broker_publish and the only one
+    that used to run unguarded, so anything it raised propagated out and tore
+    down the caller's MQTT session."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    account_id = "123456789012"
+
+    async def _boom(*args, **kwargs):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(iot_module, "_handle_shadow_publish", _boom)
+    delivered = []
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            delivered.append(topic)
+
+        await subscribe(account_id, "$aws/things/dev10/shadow/update", _collect)
+        await publish(
+            account_id,
+            "$aws/things/dev10/shadow/update",
+            json.dumps({"state": {"desired": {"led": "on"}}}).encode(),
+        )
+
+    try:
+        asyncio.run(_run())  # no exception escapes
+        # ...and the subscriber still got the request publish.
+        assert delivered == ["$aws/things/dev10/shadow/update"]
+    finally:
+        iot_module._shadows.clear()
+        reset()
+
+
+def test_shadow_mqtt_bridge_drives_topic_rules_on_request_and_accepted():
+    """Rules fire on the request topic (before the bridge runs) AND on the
+    bridge's own `update/accepted` publish (which recursively re-enters
+    broker_publish and its now-async rule evaluation)."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    _put_rule(
+        account_id,
+        "shadow_req_rule",
+        "SELECT * FROM '$aws/things/+/shadow/update'",
+        [{"republish": {"topic": "seen/request", "qos": 0}}],
+    )
+    _put_rule(
+        account_id,
+        "shadow_acc_rule",
+        "SELECT * FROM '$aws/things/+/shadow/update/accepted'",
+        [{"republish": {"topic": "seen/accepted", "qos": 0}}],
+    )
+    seen: dict[str, list] = {}
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            seen.setdefault(topic, []).append(json.loads(payload))
+
+        await subscribe(account_id, "seen/#", _collect)
+        await publish(
+            account_id,
+            "$aws/things/dev6/shadow/update",
+            json.dumps({"state": {"desired": {"n": 1}}}).encode(),
+        )
+
+    try:
+        asyncio.run(_run())
+        assert len(seen.get("seen/request", [])) == 1
+        assert seen["seen/request"][0] == {"state": {"desired": {"n": 1}}}
+        accepted_events = seen.get("seen/accepted", [])
+        assert len(accepted_events) == 1
+        assert accepted_events[0]["version"] == 1
+        assert accepted_events[0]["state"] == {"desired": {"n": 1}}
+    finally:
+        iot_module._topic_rules.clear()
+        iot_module._shadows.clear()
+        reset()
+
+
+def test_shadow_mqtt_get_and_delete_reject_invalid_json():
+    """Malformed JSON rejects on every request verb, not only update.
+
+    A `get`/`delete` payload is optional, but garbage must not be silently
+    read as `{}` - as on AWS, the requester hears a 400 on its own
+    `rejected` topic.
+    """
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    account_id = "123456789012"
+    rejected: list = []
+    accepted: list = []
+
+    async def _run():
+        async def _collect_rejected(topic, payload, qos):
+            rejected.append((topic, json.loads(payload)))
+
+        async def _collect_accepted(topic, payload, qos):
+            accepted.append(topic)
+
+        for verb in ("get", "delete"):
+            await subscribe(
+                account_id, f"$aws/things/dev6/shadow/{verb}/rejected", _collect_rejected
+            )
+            await subscribe(
+                account_id, f"$aws/things/dev6/shadow/{verb}/accepted", _collect_accepted
+            )
+        await publish(account_id, "$aws/things/dev6/shadow/get", b"{not json")
+        await publish(account_id, "$aws/things/dev6/shadow/delete", b"\xff\xfe")
+
+    try:
+        asyncio.run(_run())
+        assert [t.rsplit("/", 2)[-2] for t, _doc in rejected] == ["get", "delete"]
+        assert all(doc["code"] == 400 for _t, doc in rejected)
+        assert accepted == [], "malformed JSON must not reach the shadow store"
+    finally:
+        iot_module._shadows.clear()
+        reset()
