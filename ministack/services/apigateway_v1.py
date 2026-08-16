@@ -1876,8 +1876,11 @@ async def _invoke_lambda_custom_v1(
     happens to return a ``statusCode`` key therefore ships that key to the client
     inside the body instead of having it promoted to the HTTP status.
 
-    A function error answers 502 ``{"message": "Internal server error"}`` —
-    the error payload is never surfaced to the caller.
+    A standard Lambda error (the function ran and threw) is returned through the
+    default integration response: 200 with the raw ``{errorMessage, errorType,
+    stackTrace}`` as the body, as AWS does when no ``selectionPattern`` is
+    configured (the only shape modeled here). A backend that cannot be invoked,
+    or a Lambda concurrency throttle, is an integration failure and answers 504.
     """
     lambda_ref = _extract_lambda_ref_from_integration_uri(integration.get("uri", ""))
 
@@ -1894,17 +1897,18 @@ async def _invoke_lambda_custom_v1(
         account_id=owner_account_id,
         region=owner_region,
     )
-    if err:
-        return 502, {"Content-Type": "application/json"}, json.dumps({"message": err}).encode()
-
     resp_headers = {"Content-Type": "application/json"}
-    if result.get("throttle"):
-        throttle_body = result.get("body") or {}
-        payload = throttle_body if isinstance(throttle_body, dict) else {"message": str(throttle_body)}
-        return 429, resp_headers, json.dumps(payload).encode()
-    if result.get("error"):
-        return 502, resp_headers, json.dumps({"message": "Internal server error"}).encode()
+    # A backend that cannot be invoked, or a Lambda concurrency throttle, is an
+    # integration failure — API Gateway answers 504 (INTEGRATION_FAILURE). Never
+    # 429: THROTTLED/429 is API Gateway's own usage-plan/stage/account throttling,
+    # not the function's.
+    if err or result.get("throttle"):
+        return 504, resp_headers, json.dumps({"message": "Internal server error"}).encode()
 
+    # A standard Lambda error (the function ran and threw) is NOT mapped to a 5xx
+    # here: with no integration-response selectionPattern configured — the only
+    # shape modeled — API Gateway returns it through the default (200) response
+    # with the raw {errorMessage, errorType, stackTrace} as the body.
     payload = result.get("body")
     if payload is None:
         resp_body = b""
