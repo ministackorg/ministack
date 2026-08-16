@@ -4542,6 +4542,7 @@ def test_iot_jitr_registered_event_published_when_auto_registration_enabled():
         assert status == 200
         assert (
             json.loads(body)["certificateDescription"]["caCertificateId"] == ca_id
+        )
 
 
 # ----------------------------------------------------------------------
@@ -4733,12 +4734,13 @@ def test_iot_jitr_no_event_when_auto_registration_disabled():
         )
         assert (
             json.loads(body)["certificateDescription"]["caCertificateId"] == ca_id
-        assert len(frames["$aws/things/dev2/shadow/update/accepted"]) == 1
-        assert "$aws/things/dev2/shadow/update/delta" not in frames
-        assert len(frames["$aws/things/dev2/shadow/update/documents"]) == 1
+        )
+
+    try:
+        asyncio.run(_run())
     finally:
-        iot_module._shadows.clear()
-        reset()
+        iot_module.reset()
+        iot_module.broker_reset()
 
 
 def test_shadow_mqtt_update_rejections():
@@ -5152,6 +5154,9 @@ def test_iot_update_ca_certificate_rejects_invalid_enum_values(iot_client):
         assert "clientToken" not in rejected[0]
         assert rejected[1]["code"] == 409
         assert rejected[1]["clientToken"] == "t9"
+
+    try:
+        asyncio.run(_run())
     finally:
         iot_module._shadows.clear()
         reset()

@@ -155,6 +155,23 @@ _SERIAL_TESTS = {
     # parallel worker calling GetRegistrationCode either side of the delete sees
     # the code change under it. Same account-global mutation class as above.
     "tests/test_iot.py::test_iot_registration_code_stable_until_deleted",
+    # IoT topic-rule Lambda-action tests: each creates one Lambda per test,
+    # cold-starts its container, and polls an SQS sink under a bounded timeout.
+    # Same cold-start-burst-under-xdist shape as the apigw Lambda tests above —
+    # they pass serially (~3.5s each) but the tail ones lose the cold start
+    # against _poll_sink's 12s window on the shared CI runner. Surfaced when the
+    # device-shadow work lengthened the test_iot_data.py shard; the tests
+    # themselves are correct, so run them in the serial phase.
+    "tests/test_iot_data.py::test_iot_topic_rule_routes_publish_to_lambda",
+    "tests/test_iot_data.py::test_iot_basic_ingest_routes_to_lambda",
+    "tests/test_iot_data.py::test_iot_disabled_rule_does_not_fire",
+    "tests/test_iot_data.py::test_iot_rule_encode_base64_projection_basic_ingest",
+    "tests/test_iot_data.py::test_iot_rule_encode_base64_projection_topic_filter",
+    "tests/test_iot_data.py::test_iot_rule_attribute_projection",
+    "tests/test_iot_data.py::test_iot_rule_where_clause_gates_dispatch",
+    "tests/test_iot_data.py::test_iot_rule_where_topic_function_under_basic_ingest",
+    "tests/test_iot_data.py::test_iot_rule_where_or_clause_dispatches_either_branch",
+    "tests/test_iot_data.py::test_iot_jitr_registration_event_drives_a_topic_rule",
 }
 
 
