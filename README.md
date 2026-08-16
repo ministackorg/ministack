@@ -726,7 +726,7 @@ Point `MINISTACK_BEDROCK_PROXY_URL` at any OpenAI-compatible `/chat/completions`
 ```bash
 # Ollama on the host
 docker run -p 4566:4566 \
-  -e MINISTACK_BEDROCK_PROXY_URL=http://host.docker.internal:11434/v1 \
+  -e MINISTACK_BEDROCK_PROXY_URL=http://host.docker.internal:11434/ \
   ministackorg/ministack
 ```
 
