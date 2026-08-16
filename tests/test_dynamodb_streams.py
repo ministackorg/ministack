@@ -349,6 +349,10 @@ def test_terraform_update_table_toggles_stream_specification(ddb, ddb_streams):
         after = ddb.describe_table(TableName=tname)["Table"]
         assert after["StreamSpecification"]["StreamEnabled"] is True
         assert after["StreamSpecification"]["StreamViewType"] == "KEYS_ONLY"
+        stream_arn = after["LatestStreamArn"]
+        assert after["LatestStreamLabel"] in stream_arn
+        stream = ddb_streams.describe_stream(StreamArn=stream_arn)["StreamDescription"]
+        assert stream["StreamArn"] == stream_arn
     finally:
         ddb.delete_table(TableName=tname)
 
