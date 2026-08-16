@@ -868,52 +868,76 @@ class TestIdentityAndSequences:
 
 
 class TestIndexLimits:
+    # Messages, sqlstates and precedence verified against a live Aurora DSQL
+    # cluster (eu-west-2, Aug 2026).
     @pytest.mark.parametrize(
-        "sql",
+        "sql,sqlstate,message",
         [
-            "CREATE INDEX i ON t USING gin (data)",
-            "CREATE INDEX i ON t USING gist (coords)",
-            "CREATE INDEX i ON t USING brin (created_at)",
-            "CREATE INDEX i ON t USING hash (a)",
-            "CREATE INDEX ASYNC i ON t USING gin (data)",
-            "CREATE INDEX CONCURRENTLY i ON t (a)",
-            "CREATE INDEX i ON t (a) WHERE a > 0",  # partial index
-            "CREATE INDEX ASYNC i ON t (a) WHERE a > 0",
-            "CREATE INDEX i ON t (lower(email))",  # expression index
-            "CREATE INDEX ASYNC i ON t ((data->>'city'))",
+            # IF NOT EXISTS requires a name (grammar-level)
+            ("CREATE INDEX ASYNC IF NOT EXISTS ON t (a)", "42601",
+             'syntax error at or near "ON"'),
+            ("CREATE INDEX CONCURRENTLY i ON t (a)", "0A000",
+             "CONCURRENTLY not supported for CREATE INDEX"),
+            ("CREATE INDEX i ON t USING gin (data)", "0A000",
+             "USING not supported for CREATE INDEX"),
+            ("CREATE INDEX ASYNC i ON t USING btree (a)", "0A000",
+             "USING not supported for CREATE INDEX"),
+            ("CREATE INDEX i ON t (a) WHERE a > 0", "0A000",
+             "WHERE not supported for CREATE INDEX"),
+            ("CREATE INDEX ASYNC i ON t (a) WHERE a > 0", "0A000",
+             "WHERE not supported for CREATE INDEX"),
+            # plain (synchronous) mode is rejected outright, empty table or not
+            ("CREATE INDEX i ON t (a)", "0A000",
+             "unsupported mode. please use CREATE INDEX ASYNC."),
+            ("CREATE UNIQUE INDEX i ON t (a NULLS LAST) INCLUDE (b)", "0A000",
+             "unsupported mode"),
+            # mode is reported before immutability
+            ("CREATE INDEX i ON t (now())", "0A000", "unsupported mode"),
+            # volatile functions in index expressions (must be immutable)
+            ("CREATE INDEX ASYNC i ON t (now())", "42P17",
+             "functions in index expression must be marked IMMUTABLE"),
+            ("CREATE INDEX ASYNC i ON t (random())", "42P17", "IMMUTABLE"),
+            ("CREATE INDEX ASYNC i ON t (gen_random_uuid())", "42P17", "IMMUTABLE"),
+            ("CREATE INDEX ASYNC i ON t (lower(email), nextval('s'))", "42P17",
+             "IMMUTABLE"),
+            # INCLUDE takes plain columns only (no expressions)
+            ("CREATE INDEX ASYNC i ON t (a) INCLUDE (lower(b))", "0A000",
+             "expressions are not supported in included columns"),
+            ("CREATE UNIQUE INDEX ASYNC i ON t (a) INCLUDE ((b + c))", "0A000",
+             "included columns"),
         ],
     )
-    def test_unsupported_index_forms_denied(self, sql):
+    def test_unsupported_index_forms_denied(self, sql, sqlstate, message):
         err = pgproxy.validate(sql, pgproxy.TxnState())
         assert isinstance(err, pgproxy.DsqlError), sql
-        assert err.sqlstate == "0A000"
+        assert err.sqlstate == sqlstate, sql
+        assert message in err.message, sql
 
     @pytest.mark.parametrize(
         "sql",
         [
-            "CREATE INDEX i ON t (a)",
-            "CREATE INDEX i ON t USING btree (a)",
-            "CREATE UNIQUE INDEX i ON t (a NULLS LAST) INCLUDE (b)",
+            "CREATE INDEX ASYNC i ON t (a)",
             "CREATE INDEX ASYNC i ON t (a, b DESC) INCLUDE (c)",
+            "CREATE UNIQUE INDEX ASYNC i ON t (a NULLS LAST) NULLS NOT DISTINCT",
+            # expression index keys (immutable functions/operators)
+            "CREATE INDEX ASYNC i ON t (lower(email))",
+            "CREATE INDEX ASYNC i ON t ((data->>'city'))",
+            "CREATE INDEX ASYNC ON t (upper(title), (a + b) NULLS LAST)",
         ],
     )
     def test_supported_index_forms_allowed(self, sql):
         result = pgproxy.validate(sql, pgproxy.TxnState())
-        assert not isinstance(result, pgproxy.DsqlError), sql
+        assert isinstance(result, pgproxy.Rewrite), sql
 
     def test_more_than_8_columns_denied(self):
-        for kw in ("", "ASYNC "):
-            err = pgproxy.validate(
-                f"CREATE INDEX {kw}i ON t (a,b,c,d,e,f,g,h,i)", pgproxy.TxnState()
-            )
-            assert isinstance(err, pgproxy.DsqlError), kw
-            assert err.sqlstate == "0A000"
-            assert "8 columns" in err.message
+        err = pgproxy.validate(
+            "CREATE INDEX ASYNC i ON t (a,b,c,d,e,f,g,h,i)", pgproxy.TxnState()
+        )
+        assert isinstance(err, pgproxy.DsqlError)
+        assert err.sqlstate == "54011"
+        assert err.message == "more than 8 column keys in an index are not supported"
 
     def test_exactly_8_columns_allowed(self):
-        assert pgproxy.validate(
-            "CREATE INDEX i ON t (a,b,c,d,e,f,g,h)", pgproxy.TxnState()
-        ) is None
         result = pgproxy.validate(
             "CREATE INDEX ASYNC i ON t (a,b,c,d,e,f,g,h)", pgproxy.TxnState()
         )
@@ -1076,13 +1100,13 @@ class TestIndexAsync:
         assert isinstance(result, pgproxy.Rewrite)
         assert result.object_name == "public.t_email_idx"
 
-    def test_plain_create_index_not_rewritten(self):
-        result = pgproxy.validate(
-            "CREATE INDEX idx ON t (a)", pgproxy.TxnState()
-        )
-        assert result is None
-        assert pgproxy.is_plain_create_index("CREATE INDEX idx ON t (a)")
-        assert not pgproxy.is_plain_create_index("CREATE INDEX ASYNC idx ON t (a)")
+    def test_plain_create_index_rejected(self):
+        # Real DSQL: index creation is always asynchronous; plain CREATE
+        # INDEX fails regardless of table contents.
+        err = pgproxy.validate("CREATE INDEX idx ON t (a)", pgproxy.TxnState())
+        assert isinstance(err, pgproxy.DsqlError)
+        assert err.sqlstate == "0A000"
+        assert "unsupported mode" in err.message
 
 
 class TestTxnDiscipline:
@@ -1587,7 +1611,8 @@ class TestDropColumn:
             c.simple("CREATE TABLE dc_c (id int PRIMARY KEY, x int)")
             result = c.simple("ALTER TABLE dc_c DROP COLUMN id")
             assert result.sqlstate == "0A000"
-            assert "primary key" in result.message
+            # exact message from real DSQL (verified in eu-west-2, Aug 2026)
+            assert result.message == "cannot drop primary key column id"
             # The column must still be there.
             assert c.simple("SELECT id FROM dc_c").ok
 
@@ -1725,29 +1750,18 @@ class TestLiveProxy:
         finally:
             conn.close()
 
-    def test_plain_create_index_empty_table_ok(self, dsql_proxy):
-        conn = _pg_connect(dsql_proxy)
-        try:
-            cur = conn.cursor()
-            cur.execute("CREATE TABLE ci_live (a int)")
-            cur.execute("CREATE INDEX ci_live_a ON ci_live (a)")
-            cur.execute("DROP TABLE ci_live")
-        finally:
-            conn.close()
-
-    def test_plain_create_index_nonempty_table_rejected(self, dsql_proxy):
+    def test_plain_create_index_rejected_even_on_empty_table(self, dsql_proxy):
         psycopg2 = pytest.importorskip("psycopg2")
         conn = _pg_connect(dsql_proxy)
         try:
             cur = conn.cursor()
-            cur.execute("CREATE TABLE cn_live (a int)")
-            cur.execute("INSERT INTO cn_live VALUES (1)")
+            cur.execute("CREATE TABLE ci_live (a int)")
             with pytest.raises(psycopg2.Error) as exc:
-                cur.execute("CREATE INDEX cn_live_a ON cn_live (a)")
+                cur.execute("CREATE INDEX ci_live_a ON ci_live (a)")
             assert exc.value.pgcode == "0A000"
-            # exact message published in the AWS DSQL troubleshooting docs
-            assert "use CREATE INDEX ASYNC instead" in str(exc.value)
-            cur.execute("DROP TABLE cn_live")
+            # exact message from real DSQL (verified in eu-west-2, Aug 2026)
+            assert "unsupported mode. please use CREATE INDEX ASYNC." in str(exc.value)
+            cur.execute("DROP TABLE ci_live")
         finally:
             conn.close()
 
@@ -1795,18 +1809,40 @@ class TestLiveProxy:
         try:
             cur = conn.cursor()
             cur.execute("CREATE TABLE form_live (a int, data jsonb)")
-            for sql, fragment in [
-                ("CREATE INDEX fi1 ON form_live USING gin (data)", "btree"),
-                ("CREATE INDEX fi2 ON form_live (a) WHERE a > 0", "partial"),
-                ("CREATE INDEX fi3 ON form_live (lower(data::text))", "expression"),
-                ("CREATE MATERIALIZED VIEW mv_live AS SELECT 1", "materialized"),
-                ("CREATE TABLE part_live (a int) PARTITION BY RANGE (a)", "partition"),
+            for sql, sqlstate, fragment in [
+                ("CREATE INDEX fi1 ON form_live USING gin (data)", "0A000",
+                 "USING not supported"),
+                ("CREATE INDEX fi2 ON form_live (a) WHERE a > 0", "0A000",
+                 "WHERE not supported"),
+                ("CREATE INDEX fi3 ON form_live (now())", "0A000",
+                 "unsupported mode"),
+                ("CREATE INDEX ASYNC fi4 ON form_live (now())", "42P17",
+                 "IMMUTABLE"),
+                ("CREATE MATERIALIZED VIEW mv_live AS SELECT 1", "0A000",
+                 "materialized"),
+                ("CREATE TABLE part_live (a int) PARTITION BY RANGE (a)", "0A000",
+                 "partition"),
             ]:
                 with pytest.raises(psycopg2.Error) as exc:
                     cur.execute(sql)
-                assert exc.value.pgcode == "0A000", sql
+                assert exc.value.pgcode == sqlstate, sql
                 assert fragment in str(exc.value), sql
             cur.execute("DROP TABLE form_live")
+        finally:
+            conn.close()
+
+    def test_expression_index_accepted(self, dsql_proxy):
+        """Expression index keys with immutable functions are supported."""
+        psycopg2 = pytest.importorskip("psycopg2")
+        conn = _pg_connect(dsql_proxy)
+        try:
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE expr_live (id int, title text)")
+            cur.execute("CREATE INDEX ASYNC ei_live ON expr_live (lower(title))")
+            job_id = cur.fetchone()[0]
+            cur.execute(f"SELECT sys.wait_for_job('{job_id}')")
+            assert cur.fetchone()[0] is True
+            cur.execute("DROP TABLE expr_live")
         finally:
             conn.close()
 
