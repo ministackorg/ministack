@@ -512,6 +512,95 @@ def _check_put_preconditions(headers: dict, existing_obj: dict | None):
     return None
 
 
+def _etag_condition_matches(field_value: str, etag: str) -> bool:
+    """Whether an `If-Match`/`If-None-Match` field value selects this object.
+
+    The value is a comma-separated list of entity tags, or `*` for "any
+    representation" — which is always satisfied here, since the caller has
+    already resolved the object. A weak tag compares equal to its strong form:
+    S3 only ever mints strong ETags, and If-None-Match uses the weak comparison
+    anyway (RFC 9110 13.1.2). `etag` is expected unquoted.
+    """
+    if field_value == "*":
+        return True
+    for candidate in field_value.split(","):
+        candidate = candidate.strip()
+        if candidate[:2].upper() == "W/":
+            candidate = candidate[2:]
+        if candidate.strip('"') == etag:
+            return True
+    return False
+
+
+def _not_modified(resp_headers: dict):
+    """A 304 for a read whose caller already holds the current representation.
+
+    Keeps the validators the 200 would have carried — the ETag above all, which
+    is how the client confirms which representation it just revalidated — and
+    drops the headers that describe a payload, since a 304 ends at the header
+    section and can never carry one (RFC 9110 15.4.5).
+    """
+    payload_headers = {
+        "content-length", "content-type", "content-encoding", "accept-ranges",
+    }
+
+    def describes_payload(name: str) -> bool:
+        lowered = name.lower()
+        # x-amz-checksum-* is a checksum of bytes this response does not carry.
+        # boto3 asks for them by default and, seeing one, wraps the body in a
+        # validating stream it then cannot parse — the same hazard that keeps
+        # them off a 206 partial response.
+        return lowered in payload_headers or lowered.startswith("x-amz-checksum-")
+
+    return (
+        304,
+        {k: v for k, v in resp_headers.items() if not describes_payload(k)},
+        b"",
+    )
+
+
+def _check_read_preconditions(headers: dict, obj: dict, resp_headers: dict):
+    """Evaluate the four conditional-read headers on GetObject/HeadObject.
+
+    Returns a finished response tuple — 412 PreconditionFailed when the request
+    asked for a representation this object no longer is, or 304 Not Modified
+    when the caller's copy is still current — otherwise None, and the read
+    proceeds normally. Answering conditional reads is what lets caches, `curl
+    -z`, and every "download only if it changed" client avoid refetching a body
+    they already have.
+
+    Precedence follows RFC 9110 13.2.2 and the AWS GetObject reference: the
+    entity-tag header wins over its date counterpart, so If-Unmodified-Since is
+    consulted only without If-Match, and If-Modified-Since only without
+    If-None-Match.
+    """
+    _precond_msg = "At least one of the pre-conditions you specified did not hold"
+    etag = (obj.get("etag") or "").strip('"')
+    mtime = _object_mtime_dt(obj)
+
+    if_match = (headers.get("if-match") or "").strip()
+    if if_match:
+        if not _etag_condition_matches(if_match, etag):
+            return _error("PreconditionFailed", _precond_msg, 412)
+    else:
+        unmod = _parse_http_date(headers.get("if-unmodified-since", ""))
+        # "Unmodified since" fails when the object was written after that time.
+        if unmod and mtime and mtime > unmod:
+            return _error("PreconditionFailed", _precond_msg, 412)
+
+    if_none_match = (headers.get("if-none-match") or "").strip()
+    if if_none_match:
+        if _etag_condition_matches(if_none_match, etag):
+            return _not_modified(resp_headers)
+    else:
+        mod = _parse_http_date(headers.get("if-modified-since", ""))
+        # Not modified since that time means the caller's copy is still current.
+        if mod and mtime and mtime <= mod:
+            return _not_modified(resp_headers)
+
+    return None
+
+
 def _find_xml_tag(parent, tag_name, ns=S3_NS):
     el = parent.find("{%s}%s" % (ns, tag_name))
     if el is None:
@@ -2881,6 +2970,9 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
                 resp_headers = _object_response_headers(
                     vobj, bucket_name, key, include_checksums=include_checksums)
                 resp_headers.update(_object_tagging_count_header(bucket_name, key, version_id))
+                precondition = _check_read_preconditions(headers, vobj, resp_headers)
+                if precondition is not None:
+                    return precondition
                 body = v.get("data")
                 if body is None:
                     body = _read_body(bucket_name, key, bucket["objects"].get(key, {}))
@@ -2906,6 +2998,13 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
     resp_headers = _object_response_headers(obj, bucket_name, key,
                                             include_checksums=include_checksums)
     resp_headers.update(_object_tagging_count_header(bucket_name, key, obj.get("version_id")))
+
+    # Evaluated before the range and partNumber slicing below: a failed
+    # precondition preempts the read entirely, and a 304 describes the whole
+    # representation the caller already has, not the slice they asked for.
+    precondition = _check_read_preconditions(headers, obj, resp_headers)
+    if precondition is not None:
+        return precondition
 
     body = _read_body(bucket_name, key, obj)
 
@@ -3106,6 +3205,9 @@ def _head_object(bucket_name: str, key: str, headers: dict | None = None,
                                             include_checksums=include_checksums)
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
+    precondition = _check_read_preconditions(headers, obj, resp_headers)
+    if precondition is not None:
+        return precondition
     return 200, resp_headers, b""
 
 

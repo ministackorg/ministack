@@ -1121,20 +1121,58 @@ def _fetch_code_from_s3(bucket: str, key: str, version_id: str | None = None) ->
 _UNZIPPED_LIMIT_BYTES = 262144000  # 250 MiB — AWS hard limit
 
 
-def _validate_unzipped_size(zip_data: bytes | None):
+def _unzipped_size(zip_data: bytes | None) -> int:
+    """Total uncompressed size of a zip's members. Empty or unreadable data
+    (an image function, or a layer whose bytes we don't hold) contributes 0."""
     if not zip_data:
-        return None
+        return 0
     try:
         with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
-            unzipped_size = sum(info.file_size for info in zf.infolist())
+            return sum(info.file_size for info in zf.infolist())
     except zipfile.BadZipFile:
-        return None
-    if unzipped_size > _UNZIPPED_LIMIT_BYTES:
+        return 0
+
+
+def _validate_unzipped_size(zip_data: bytes | None):
+    """A single deployment package's unzipped size against the 250 MB quota —
+    used when publishing a layer version, whose own content must fit on its own."""
+    if _unzipped_size(zip_data) > _UNZIPPED_LIMIT_BYTES:
         return error_response_json(
             "InvalidParameterValueException",
             f"Unzipped size must be smaller than {_UNZIPPED_LIMIT_BYTES} bytes",
             400,
         )
+    return None
+
+
+def _layer_unzipped_size(layer_arn: str) -> int:
+    """Unzipped size of an attached layer version's content. A layer we don't
+    hold the bytes for (an external ARN, or content that failed to fetch)
+    contributes 0 — it can't be measured, so it isn't counted rather than
+    guessed at (never over-rejecting a function that AWS would accept)."""
+    version_config, err = _resolve_layer_version_for_attachment(layer_arn)
+    if err or not version_config:
+        return 0
+    return _unzipped_size(version_config.get("_zip_data"))
+
+
+def _validate_total_unzipped_size(code_zip: bytes | None, layers):
+    """The 250 MB unzipped quota is the total of the function code plus every
+    attached layer, unzipped — not each package on its own. AWS: the limit is
+    "the maximum size of the contents of a deployment package, including
+    layers and custom runtimes" (unzipped)."""
+    total = _unzipped_size(code_zip)
+    for layer in layers or []:
+        arn = layer.get("Arn") if isinstance(layer, dict) else layer
+        if arn:
+            total += _layer_unzipped_size(arn)
+    if total > _UNZIPPED_LIMIT_BYTES:
+        return error_response_json(
+            "InvalidParameterValueException",
+            f"Unzipped size must be smaller than {_UNZIPPED_LIMIT_BYTES} bytes",
+            400,
+        )
+    return None
     return None
 
 
@@ -1887,7 +1925,7 @@ def _create_function(data: dict):
             version_id=code_data.get("S3ObjectVersion"),
         )
 
-    err = _validate_unzipped_size(code_zip)
+    err = _validate_total_unzipped_size(code_zip, data.get("Layers"))
     if err is not None:
         return err
 
@@ -2306,7 +2344,7 @@ def _update_code(name: str, data: dict):
                 f"Failed to fetch code from s3://{data['S3Bucket']}/{data['S3Key']}",
                 400,
             )
-    err = _validate_unzipped_size(code_zip)
+    err = _validate_total_unzipped_size(code_zip, func["config"].get("Layers"))
     if err is not None:
         return err
     if code_zip:

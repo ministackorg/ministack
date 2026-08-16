@@ -331,6 +331,9 @@ def test_iot_delete_active_certificate_rejected(iot_client):
     with pytest.raises(ClientError) as ei:
         iot_client.delete_certificate(certificateId=cert_id)
     assert ei.value.response["Error"]["Code"] == "CertificateStateException"
+    # 406 per the service model — the same status the CA-certificate delete
+    # answers with for the same exception.
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 406
     iot_client.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
     iot_client.delete_certificate(certificateId=cert_id)
 
@@ -1424,15 +1427,20 @@ from ministack.services.iot import (
     PKT_DISCONNECT,
     PKT_PUBACK,
     PKT_PUBLISH,
+    PKT_SUBACK,
     PKT_SUBSCRIBE,
     PKT_UNSUBACK,
     PKT_UNSUBSCRIBE,
+    _decode_properties,
+    _decode_remaining_length,
     _encode_remaining_length,
     _encode_string,
     _InFlightMessage,
     _make_puback,
     _make_suback,
     _persistent_sessions,
+    _property_value,
+    _read_string,
     broker_publish,
     broker_subscribe,
 )
@@ -1497,6 +1505,8 @@ def test_iot_control_plane_identity_stores_are_region_scoped():
         iot_module._policies,
         iot_module._topic_rules,
         iot_module._shadows,
+        iot_module._ca_certificates,
+        iot_module._registration_codes,
     )
     assert all(isinstance(store, AccountRegionScopedDict) for store in stores)
 
@@ -2661,6 +2671,233 @@ def test_different_accounts_sessions_isolated():
         assert session_present is False  # No prior session for account_B
 
         await session_b.cleanup()
+
+    asyncio.run(_run())
+    reset()
+
+
+# ----------------------------------------------------------------------
+# Broker — MQTT 5.0. These drive the session object directly, so they need
+# neither a running server nor the websockets package; the wire-level suite
+# that needs both lives in test_iot_mqtt5.py.
+# ----------------------------------------------------------------------
+
+PROP_SESSION_EXPIRY_INTERVAL = 0x11
+PROP_MAXIMUM_QOS = 0x24
+PROP_USER_PROPERTY = 0x26
+
+
+def _mqtt_packet(pkt_type, flags, body):
+    """Wrap a packet body in its fixed header."""
+    return bytes([(pkt_type << 4) | flags]) + _encode_remaining_length(len(body)) + body
+
+
+def _build_mqtt5_connect_body(client_id="v5-client", clean_start=True, session_expiry=None):
+    """Build an MQTT 5 CONNECT body: like the 3.1.1 one plus a property block."""
+    props = b""
+    if session_expiry is not None:
+        props = bytes([PROP_SESSION_EXPIRY_INTERVAL]) + struct.pack("!I", session_expiry)
+    body = bytearray()
+    body += _encode_string("MQTT")
+    body.append(5)                                    # Protocol Level
+    body.append(0x02 if clean_start else 0x00)        # Clean Start
+    body += struct.pack("!H", 60)                     # Keep Alive
+    body += _encode_remaining_length(len(props)) + props
+    body += _encode_string(client_id)
+    return bytes(body)
+
+
+def _build_mqtt5_subscribe_body(packet_id, topic, options):
+    """Build an MQTT 5 SUBSCRIBE body: property block, then filter + options."""
+    return (
+        struct.pack("!H", packet_id)
+        + b"\x00"
+        + _encode_string(topic)
+        + bytes([options])
+    )
+
+
+def _build_mqtt5_publish_body(topic, payload, qos=0, packet_id=None, properties=b"\x00"):
+    body = _encode_string(topic)
+    if qos:
+        body += struct.pack("!H", packet_id or 1)
+    return body + properties + payload
+
+
+def _mqtt5_user_property(name, value):
+    """An encoded property block holding one User Property."""
+    body = bytes([PROP_USER_PROPERTY]) + _encode_string(name) + _encode_string(value)
+    return _encode_remaining_length(len(body)) + body
+
+
+def _parse_mqtt5_publish(packet):
+    """Return (topic, payload, properties) from a PUBLISH the broker sent."""
+    qos = (packet[0] >> 1) & 0x03
+    _remaining, off = _decode_remaining_length(packet, 1)
+    topic, off = _read_string(packet, off)
+    if qos:
+        off += 2
+    props, off = _decode_properties(packet, off)
+    return topic, packet[off:], props
+
+
+def test_mqtt5_session_round_trips_over_a_plain_byte_stream():
+    """Version negotiation lives in the session, not in the WebSocket layer.
+
+    The session object is driven here the way a raw TCP listener drives it —
+    bytes appended to its buffer, packets taken off by its own framing — with
+    every packet split at an offset that lands inside the new property fields,
+    which is where a framing mistake would show up first.
+    """
+    reset()
+    topic = "stream/topic"
+
+    async def _run():
+        sent = []
+
+        async def _stream_send(message):
+            if message.get("type") == "websocket.send":
+                sent.append(message["bytes"])
+
+        session = _WSSession(_stream_send, "123456789012")
+
+        async def feed(packet, chunk):
+            for start in range(0, len(packet), chunk):
+                session._buffer.extend(packet[start:start + chunk])
+                while True:
+                    parsed = session._take_packet()
+                    if parsed is None:
+                        break
+                    await session.handle_packet(*parsed)
+
+        await feed(
+            _mqtt_packet(PKT_CONNECT, 0, _build_mqtt5_connect_body("stream-client")), 3
+        )
+        await feed(
+            _mqtt_packet(PKT_SUBSCRIBE, 0x02, _build_mqtt5_subscribe_body(1, topic, 0x01)),
+            5,
+        )
+        await feed(
+            _mqtt_packet(
+                PKT_PUBLISH,
+                0x02,
+                _build_mqtt5_publish_body(
+                    topic, b"over-tcp", qos=1, packet_id=9,
+                    properties=_mqtt5_user_property("via", "stream"),
+                ),
+            ),
+            4,
+        )
+        await session.cleanup()
+        return sent
+
+    sent = asyncio.run(_run())
+    assert len(sent) == 4, "CONNACK, SUBACK, the delivered PUBLISH, then PUBACK"
+    connack, suback, publish, puback = sent
+    assert connack[:2] == bytes([0x20, len(connack) - 2])
+    assert connack[3] == 0x00, "reason code Success"
+    connack_props, _end = _decode_properties(connack, 4)
+    assert _property_value(connack_props, PROP_MAXIMUM_QOS, None) == 1
+    assert suback[0] >> 4 == PKT_SUBACK
+    assert publish[0] >> 4 == PKT_PUBLISH
+    assert (publish[0] >> 1) & 0x03 == 1, "delivered at the granted QoS"
+    delivered_topic, payload, props = _parse_mqtt5_publish(publish)
+    assert (delivered_topic, payload) == (topic, b"over-tcp")
+    assert _property_value(props, PROP_USER_PROPERTY, None) == ("via", "stream")
+    assert puback == bytes([0x40, 0x04, 0x00, 0x09, 0x00, 0x00])
+    reset()
+
+
+def test_mqtt5_session_expiry_is_read_as_an_interval_not_a_flag():
+    """Session Expiry Interval says how long the session lives, not whether.
+
+    The session below asks for 60 seconds, so it is restored a second later
+    and gone a minute later. Treated as a yes/no flag it would instead have
+    fallen back to the module-wide hour and been restored both times.
+    """
+    reset()
+    key = ("123456789012", _TEST_REGION, "expiring")
+    connect = _build_mqtt5_connect_body(
+        "expiring", clean_start=False, session_expiry=60
+    )
+
+    async def _run():
+        send1, _sent1 = _mock_send()
+        session1 = _WSSession(send1, "123456789012")
+        await session1.handle_packet(PKT_CONNECT, 0, connect)
+        await session1.handle_packet(
+            PKT_SUBSCRIBE, 0x02, _build_mqtt5_subscribe_body(1, "temp/data", 0x01)
+        )
+        await session1.handle_packet(PKT_DISCONNECT, 0, b"")
+        await session1.cleanup()
+
+        assert _persistent_sessions[key].expiry_interval == 60
+
+        send2, sent2 = _mock_send()
+        session2 = _WSSession(send2, "123456789012")
+        await session2.handle_packet(PKT_CONNECT, 0, connect)
+        assert _parse_connack(sent2) == (True, 0), "still inside the interval"
+        await session2.handle_packet(PKT_DISCONNECT, 0, b"")
+        await session2.cleanup()
+
+        # Spend the interval the client asked for, which is still well inside
+        # the module-wide default.
+        _persistent_sessions[key].created_at = time.time() - 61
+
+        send3, sent3 = _mock_send()
+        session3 = _WSSession(send3, "123456789012")
+        await session3.handle_packet(PKT_CONNECT, 0, connect)
+        assert _parse_connack(sent3) == (False, 0), "the interval is spent"
+        await session3.cleanup()
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_mqtt5_resumed_session_without_an_expiry_interval_is_discarded():
+    """Clean Start 0 and no Session Expiry Interval: resume one, leave none.
+
+    MQTT 5 splits resumption from retention, so this connection legitimately
+    picks a stored session up and legitimately must not leave one behind.
+    Nothing used to remove it — the entry outlived every such connection,
+    queueing QoS 1 messages nobody would collect and answering the next
+    CONNECT with session_present=1.
+    """
+    reset()
+    key = ("123456789012", _TEST_REGION, "transient")
+
+    async def _run():
+        # A first connection that does persist, so there is one to resume.
+        send1, _sent1 = _mock_send()
+        session1 = _WSSession(send1, "123456789012")
+        await session1.handle_packet(
+            PKT_CONNECT,
+            0,
+            _build_mqtt5_connect_body(
+                "transient", clean_start=False, session_expiry=3600
+            ),
+        )
+        await session1.handle_packet(
+            PKT_SUBSCRIBE, 0x02, _build_mqtt5_subscribe_body(1, "temp/data", 0x01)
+        )
+        await session1.handle_packet(PKT_DISCONNECT, 0, b"")
+        await session1.cleanup()
+        assert key in _persistent_sessions
+
+        resume_only = _build_mqtt5_connect_body("transient", clean_start=False)
+        send2, sent2 = _mock_send()
+        session2 = _WSSession(send2, "123456789012")
+        await session2.handle_packet(PKT_CONNECT, 0, resume_only)
+        assert _parse_connack(sent2) == (True, 0), "Clean Start 0 still resumes"
+        await session2.handle_packet(PKT_DISCONNECT, 0, b"")
+        await session2.cleanup()
+        assert key not in _persistent_sessions
+
+        send3, sent3 = _mock_send()
+        session3 = _WSSession(send3, "123456789012")
+        await session3.handle_packet(PKT_CONNECT, 0, resume_only)
+        assert _parse_connack(sent3) == (False, 0), "and the next client is told so"
+        await session3.cleanup()
 
     asyncio.run(_run())
     reset()
@@ -4589,3 +4826,1225 @@ def test_connectivity_is_not_persisted_and_cannot_restore_as_connected():
 
     asyncio.run(_run())
     reset()
+# ---------------------------------------------------------------------------
+# CA-certificate registry + JITR (registration code, RegisterCACertificate
+# and friends, and the $aws/events/certificates/registered/{caId} event)
+# ---------------------------------------------------------------------------
+
+
+def _generate_ca_and_leaves(count: int = 1) -> tuple[str, list[str]]:
+    """A fresh CA PEM and ``count`` leaf certificate PEMs signed by it.
+
+    Leaves have to be signed by the CA they are registered under —
+    ``RegisterCertificate`` verifies the ``caCertificatePem`` claim — so a test
+    that needs two device certificates under one CA must take them from the
+    same CA key, not from two independent ``_generate_ca_and_leaf`` calls.
+    """
+    pytest.importorskip("cryptography")
+    from ministack.core.x509_utils import generate_ca, sign_leaf_certificate
+
+    ca_pem, ca_key_pem = generate_ca(common_name=_unique("jitr-test-ca"))
+    leaves = [
+        sign_leaf_certificate(
+            ca_cert_pem=ca_pem,
+            ca_key_pem=ca_key_pem,
+            common_name=_unique("jitr-device"),
+        )[0]
+        for _ in range(count)
+    ]
+    return ca_pem, leaves
+
+
+def _generate_ca_and_leaf() -> tuple[str, str]:
+    """A fresh CA PEM and a leaf certificate PEM signed by it."""
+    ca_pem, leaves = _generate_ca_and_leaves()
+    return ca_pem, leaves[0]
+
+
+def test_iot_registration_code_stable_until_deleted(iot_client):
+    code = iot_client.get_registration_code()["registrationCode"]
+    assert len(code) == 64
+    int(code, 16)  # sha256 hex
+    # Stable across calls.
+    assert iot_client.get_registration_code()["registrationCode"] == code
+    # DELETE discards it; the next GET mints a fresh one.
+    iot_client.delete_registration_code()
+    fresh = iot_client.get_registration_code()["registrationCode"]
+    assert len(fresh) == 64
+    assert fresh != code
+
+
+def test_iot_ca_certificate_lifecycle(iot_client):
+    ca_pem, _leaf = _generate_ca_and_leaf()
+    resp = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, setAsActive=True, allowAutoRegistration=True
+    )
+    ca_id = resp["certificateId"]
+    assert resp["certificateArn"].endswith(":cacert/" + ca_id)
+
+    desc = iot_client.describe_ca_certificate(certificateId=ca_id)[
+        "certificateDescription"
+    ]
+    assert desc["certificatePem"] == ca_pem  # verbatim
+    assert desc["certificateId"] == ca_id
+    assert desc["status"] == "ACTIVE"
+    assert desc["autoRegistrationStatus"] == "ENABLE"
+    assert desc["creationDate"]
+
+    listing = iot_client.list_ca_certificates()["certificates"]
+    entry = next(c for c in listing if c["certificateId"] == ca_id)
+    assert entry["certificateArn"].endswith(":cacert/" + ca_id)
+    assert entry["status"] == "ACTIVE"
+
+    # ACTIVE CAs cannot be deleted — 406 per the service model.
+    with pytest.raises(ClientError) as ei:
+        iot_client.delete_ca_certificate(certificateId=ca_id)
+    assert ei.value.response["Error"]["Code"] == "CertificateStateException"
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 406
+
+    iot_client.update_ca_certificate(
+        certificateId=ca_id,
+        newStatus="INACTIVE",
+        newAutoRegistrationStatus="DISABLE",
+    )
+    desc = iot_client.describe_ca_certificate(certificateId=ca_id)[
+        "certificateDescription"
+    ]
+    assert desc["status"] == "INACTIVE"
+    assert desc["autoRegistrationStatus"] == "DISABLE"
+
+    iot_client.delete_ca_certificate(certificateId=ca_id)
+    with pytest.raises(ClientError) as ei:
+        iot_client.describe_ca_certificate(certificateId=ca_id)
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_iot_register_ca_certificate_duplicate_conflict(iot_client):
+    ca_pem, _leaf = _generate_ca_and_leaf()
+    ca_id = iot_client.register_ca_certificate(caCertificate=ca_pem)["certificateId"]
+    with pytest.raises(ClientError) as ei:
+        iot_client.register_ca_certificate(caCertificate=ca_pem)
+    err = ei.value.response
+    assert err["Error"]["Code"] == "ResourceAlreadyExistsException"
+    assert err["resourceId"] == ca_id
+    assert err["resourceArn"].endswith(":cacert/" + ca_id)
+    iot_client.delete_ca_certificate(certificateId=ca_id)
+
+
+def test_iot_jitr_registered_event_published_when_auto_registration_enabled():
+    """Register a CA with auto-registration ENABLE, subscribe on
+    ``$aws/events/certificates/registered/#``, register a device cert under
+    that CA — the JITR lifecycle event arrives with certificateId +
+    caCertificateId and DescribeCertificate resolves the signing CA.
+
+    Runs in-process against the module broker (the WS route to the live
+    server needs ``*.localhost`` DNS this environment lacks), following the
+    broker-helper pattern above.
+    """
+    from ministack.core.responses import (
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import iot as iot_module
+
+    ca_pem, leaf_pem = _generate_ca_and_leaf()
+    account_id = "123456789012"
+    received: list = []
+
+    async def _run():
+        set_request_account_id(account_id)
+        set_request_region(_TEST_REGION)
+
+        status, _, body = await iot_module.handle_request(
+            "POST",
+            "/cacertificate",
+            {},
+            json.dumps({"caCertificate": ca_pem}).encode(),
+            {"setAsActive": "true", "allowAutoRegistration": "true"},
+        )
+        assert status == 200
+        ca_id = json.loads(body)["certificateId"]
+
+        async def _collect(topic, payload, qos):
+            received.append((topic, payload, qos))
+
+        await iot_module.broker_subscribe(
+            account_id,
+            _TEST_REGION,
+            "$aws/events/certificates/registered/#",
+            _collect,
+        )
+
+        status, _, body = await iot_module.handle_request(
+            "POST",
+            "/certificate/register",
+            {},
+            json.dumps({
+                "certificatePem": leaf_pem,
+                "caCertificatePem": ca_pem,
+                "status": "PENDING_ACTIVATION",
+            }).encode(),
+            {},
+        )
+        assert status == 200
+        cert_id = json.loads(body)["certificateId"]
+
+        assert len(received) == 1
+        topic, payload, _qos = received[0]
+        assert topic == f"$aws/events/certificates/registered/{ca_id}"
+        event = json.loads(payload)
+        assert event["certificateId"] == cert_id
+        assert event["caCertificateId"] == ca_id
+        assert event["certificateStatus"] == "PENDING_ACTIVATION"
+        assert event["awsAccountId"] == account_id
+        assert isinstance(event["timestamp"], int)
+        assert event["certificateRegistrationTimestamp"] == str(event["timestamp"])
+
+        # A JITR Lambda resolves the signing CA via DescribeCertificate.
+        status, _, body = await iot_module.handle_request(
+            "GET", f"/certificates/{cert_id}", {}, b"", {}
+        )
+        assert status == 200
+        assert (
+            json.loads(body)["certificateDescription"]["caCertificateId"] == ca_id
+        )
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        iot_module.broker_reset()
+
+
+# ----------------------------------------------------------------------
+# Shadow-over-MQTT bridge (white-box).
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("topic", "expected"),
+    [
+        # Request topics parse.
+        ("$aws/things/dev1/shadow/get", ("dev1", "get", None)),
+        ("$aws/things/dev1/shadow/update", ("dev1", "update", None)),
+        ("$aws/things/dev1/shadow/delete", ("dev1", "delete", None)),
+        ("$aws/things/dev1/shadow/name/cfg/get", ("dev1", "get", "cfg")),
+        ("$aws/things/dev1/shadow/name/cfg/update", ("dev1", "update", "cfg")),
+        ("$aws/things/dev1/shadow/name/cfg/delete", ("dev1", "delete", "cfg")),
+        # An empty shadow name parses (so the bridge can reject it on the
+        # requester's own reply topic) rather than collapsing onto classic.
+        ("$aws/things/dev1/shadow/name//update", ("dev1", "update", "")),
+        # Response suffixes never re-trigger the bridge.
+        ("$aws/things/dev1/shadow/update/accepted", None),
+        ("$aws/things/dev1/shadow/update/rejected", None),
+        ("$aws/things/dev1/shadow/update/delta", None),
+        ("$aws/things/dev1/shadow/update/documents", None),
+        ("$aws/things/dev1/shadow/get/accepted", None),
+        ("$aws/things/dev1/shadow/get/rejected", None),
+        ("$aws/things/dev1/shadow/delete/accepted", None),
+        ("$aws/things/dev1/shadow/name/cfg/update/accepted", None),
+        ("$aws/things/dev1/shadow/name/cfg/update/delta", None),
+        ("$aws/things/dev1/shadow/name/cfg/get/rejected", None),
+        # Malformed / unrelated.
+        ("$aws/things/dev1/shadow", None),
+        ("$aws/things/dev1/shadow/name", None),
+        ("$aws/things/dev1/shadow/name/cfg", None),
+        ("$aws/things/dev1/shadow/frobnicate", None),
+        ("$aws/things/dev1/notshadow/get", None),
+        ("$aws/things", None),
+        ("$aws/rules/rule1/some/topic", None),
+        ("plain/topic", None),
+        ("", None),
+    ],
+)
+def test_parse_shadow_topic_truth_table(topic, expected):
+    from ministack.services.iot import _parse_shadow_topic
+
+    assert _parse_shadow_topic(topic) == expected
+
+
+def test_shadow_mqtt_update_publishes_accepted_delta_documents():
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    account_id = "123456789012"
+    frames: dict[str, list] = {}
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            frames.setdefault(topic, []).append(json.loads(payload))
+
+        await subscribe(
+            account_id, "$aws/things/dev1/shadow/update/+", _collect, granted_qos=1
+        )
+        await publish(
+            account_id,
+            "$aws/things/dev1/shadow/update",
+            json.dumps(
+                {"state": {"desired": {"led": "on"}}, "clientToken": "tok-1"}
+            ).encode(),
+        )
+
+    try:
+        asyncio.run(_run())
+        accepted = frames["$aws/things/dev1/shadow/update/accepted"][0]
+        assert accepted["state"] == {"desired": {"led": "on"}}
+        assert accepted["version"] == 1
+        assert accepted["clientToken"] == "tok-1"
+
+        # desired != reported → a delta document, carrying the metadata AWS
+        # reports for the delta and the triggering request's clientToken.
+        delta = frames["$aws/things/dev1/shadow/update/delta"][0]
+        assert delta["state"] == {"led": "on"}
+        assert delta["version"] == 1
+        assert "timestamp" in delta
+        assert delta["clientToken"] == "tok-1"
+        assert set(delta["metadata"]) == {"led"}
+        assert delta["metadata"]["led"]["timestamp"] == accepted["metadata"]["desired"]["led"]["timestamp"]
+
+        docs = frames["$aws/things/dev1/shadow/update/documents"][0]
+        assert docs["previous"] is None
+        assert docs["current"]["version"] == 1
+        assert docs["current"]["state"]["desired"] == {"led": "on"}
+        assert "timestamp" in docs
+
+        # The MQTT update landed in the same store the HTTP data plane reads.
+        with iot_module.request_scope(account_id, _TEST_REGION):
+            status, doc = iot_module.get_thing_shadow("dev1", "")
+        assert status == 200
+        assert doc["state"]["desired"] == {"led": "on"}
+    finally:
+        iot_module._shadows.clear()
+        reset()
+
+
+def test_shadow_mqtt_update_reported_in_sync_emits_no_delta():
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    account_id = "123456789012"
+    frames: dict[str, list] = {}
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            frames.setdefault(topic, []).append(json.loads(payload))
+
+        await subscribe(
+            account_id, "$aws/things/dev2/shadow/update/+", _collect, granted_qos=1
+        )
+        await publish(
+            account_id,
+            "$aws/things/dev2/shadow/update",
+            json.dumps(
+                {"state": {"desired": {"led": "on"}, "reported": {"led": "on"}}}
+            ).encode(),
+        )
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        iot_module.broker_reset()
+
+
+def test_iot_jitr_no_event_when_auto_registration_disabled():
+    """A CA registered without ``allowAutoRegistration`` links the device cert
+    (``caCertificateId``) but publishes no registered event."""
+    from ministack.core.responses import (
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import iot as iot_module
+
+    ca_pem, leaf_pem = _generate_ca_and_leaf()
+    account_id = "123456789012"
+    received: list = []
+
+    async def _run():
+        set_request_account_id(account_id)
+        set_request_region(_TEST_REGION)
+
+        status, _, body = await iot_module.handle_request(
+            "POST",
+            "/cacertificate",
+            {},
+            json.dumps({"caCertificate": ca_pem}).encode(),
+            {"setAsActive": "true"},
+        )
+        assert status == 200
+        ca_id = json.loads(body)["certificateId"]
+
+        async def _collect(topic, payload, qos):
+            received.append((topic, payload, qos))
+
+        await iot_module.broker_subscribe(
+            account_id,
+            _TEST_REGION,
+            "$aws/events/certificates/registered/#",
+            _collect,
+        )
+
+        status, _, body = await iot_module.handle_request(
+            "POST",
+            "/certificate/register",
+            {},
+            json.dumps({
+                "certificatePem": leaf_pem,
+                "caCertificatePem": ca_pem,
+            }).encode(),
+            {},
+        )
+        assert status == 200
+        cert_id = json.loads(body)["certificateId"]
+        assert received == []
+
+        status, _, body = await iot_module.handle_request(
+            "GET", f"/certificates/{cert_id}", {}, b"", {}
+        )
+        assert (
+            json.loads(body)["certificateDescription"]["caCertificateId"] == ca_id
+        )
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        iot_module.broker_reset()
+
+
+def test_shadow_mqtt_update_rejections():
+    """Invalid JSON → 400 (no token); version conflict → 409 with the token."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    account_id = "123456789012"
+    rejected: list = []
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            rejected.append(json.loads(payload))
+
+        await subscribe(
+            account_id, "$aws/things/dev3/shadow/update/rejected", _collect
+        )
+        await publish(
+            account_id, "$aws/things/dev3/shadow/update", b"{not json"
+        )
+        await publish(
+            account_id,
+            "$aws/things/dev3/shadow/update",
+            json.dumps({"state": {"desired": {"a": 1}}}).encode(),
+        )
+        await publish(
+            account_id,
+            "$aws/things/dev3/shadow/update",
+            json.dumps(
+                {"state": {"desired": {"a": 2}}, "version": 99, "clientToken": "t9"}
+            ).encode(),
+        )
+
+    try:
+        asyncio.run(_run())
+        assert len(rejected) == 2
+        assert rejected[0]["code"] == 400
+        assert "clientToken" not in rejected[0]
+        assert rejected[1]["code"] == 409
+        assert rejected[1]["clientToken"] == "t9"
+    finally:
+        iot_module.reset()
+        iot_module.broker_reset()
+
+
+def test_iot_register_certificate_under_ca_links_ca_certificate_id(iot_client):
+    """The headline JITR flow over the wire: register a CA, register a device
+    certificate under it, and DescribeCertificate resolves the signing CA —
+    through the router, botocore serialization and all."""
+    ca_pem, leaf_pem = _generate_ca_and_leaf()
+    ca_id = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, setAsActive=True, allowAutoRegistration=True
+    )["certificateId"]
+    try:
+        cert_id = iot_client.register_certificate(
+            certificatePem=leaf_pem,
+            caCertificatePem=ca_pem,
+            status="PENDING_ACTIVATION",
+        )["certificateId"]
+        desc = iot_client.describe_certificate(certificateId=cert_id)[
+            "certificateDescription"
+        ]
+        assert desc["caCertificateId"] == ca_id
+        assert desc["status"] == "PENDING_ACTIVATION"
+        iot_client.delete_certificate(certificateId=cert_id)
+    finally:
+        iot_client.update_ca_certificate(certificateId=ca_id, newStatus="INACTIVE")
+        iot_client.delete_ca_certificate(certificateId=ca_id)
+
+
+def test_iot_register_certificate_rejects_an_unregistered_ca(iot_client):
+    """``caCertificatePem`` naming a CA that was never registered is a
+    ``CertificateValidationException``, and nothing is stored — otherwise the
+    CA id is whatever the caller sent and DescribeCertificate points at a CA
+    that does not exist."""
+    from ministack.core.x509_utils import get_certificate_id
+
+    ca_pem, leaf_pem = _generate_ca_and_leaf()
+    with pytest.raises(ClientError) as ei:
+        iot_client.register_certificate(
+            certificatePem=leaf_pem, caCertificatePem=ca_pem
+        )
+    assert ei.value.response["Error"]["Code"] == "CertificateValidationException"
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+    with pytest.raises(ClientError) as ei:
+        iot_client.describe_certificate(certificateId=get_certificate_id(leaf_pem))
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_iot_register_certificate_rejects_a_leaf_from_another_ca(iot_client):
+    """Both CAs are registered, so the only thing separating them is the
+    signature: a leaf signed by CA-X may not register under CA-Y. Without the
+    check the JITR event fires on CA-Y's topic and a JITR Lambda that picks
+    provisioning templates by ``caCertificateId`` provisions the wrong fleet.
+    The same leaf under its real CA still registers."""
+    from ministack.core.x509_utils import get_certificate_id
+
+    ca_x_pem, leaf_pem = _generate_ca_and_leaf()
+    ca_y_pem, _leaf_y = _generate_ca_and_leaf()
+    ca_x_id = iot_client.register_ca_certificate(
+        caCertificate=ca_x_pem, setAsActive=True, allowAutoRegistration=True
+    )["certificateId"]
+    ca_y_id = iot_client.register_ca_certificate(
+        caCertificate=ca_y_pem, setAsActive=True, allowAutoRegistration=True
+    )["certificateId"]
+    try:
+        with pytest.raises(ClientError) as ei:
+            iot_client.register_certificate(
+                certificatePem=leaf_pem, caCertificatePem=ca_y_pem
+            )
+        assert ei.value.response["Error"]["Code"] == "CertificateValidationException"
+        assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        with pytest.raises(ClientError):
+            iot_client.describe_certificate(certificateId=get_certificate_id(leaf_pem))
+
+        # Same leaf, its actual issuer — accepted, and linked to that CA.
+        cert_id = iot_client.register_certificate(
+            certificatePem=leaf_pem, caCertificatePem=ca_x_pem
+        )["certificateId"]
+        desc = iot_client.describe_certificate(certificateId=cert_id)[
+            "certificateDescription"
+        ]
+        assert desc["caCertificateId"] == ca_x_id
+        iot_client.delete_certificate(certificateId=cert_id)
+    finally:
+        for ca_id in (ca_x_id, ca_y_id):
+            iot_client.update_ca_certificate(certificateId=ca_id, newStatus="INACTIVE")
+            iot_client.delete_ca_certificate(certificateId=ca_id)
+
+
+def test_iot_jitr_no_event_for_a_certificate_from_another_ca():
+    """The rejection happens before anything is published, so no JITR consumer
+    ever sees an event attributing a foreign certificate to its CA."""
+    from ministack.core.responses import (
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import iot as iot_module
+
+    _ca_x_pem, leaf_pem = _generate_ca_and_leaf()
+    ca_y_pem, _leaf_y = _generate_ca_and_leaf()
+    account_id = "123456789012"
+    received: list = []
+
+    async def _run():
+        set_request_account_id(account_id)
+        set_request_region(_TEST_REGION)
+
+        status, _, _body = await iot_module.handle_request(
+            "POST",
+            "/cacertificate",
+            {},
+            json.dumps({"caCertificate": ca_y_pem}).encode(),
+            {"setAsActive": "true", "allowAutoRegistration": "true"},
+        )
+        assert status == 200
+
+        async def _collect(topic, payload, qos):
+            received.append((topic, payload, qos))
+
+        await iot_module.broker_subscribe(
+            account_id,
+            _TEST_REGION,
+            "$aws/events/certificates/registered/#",
+            _collect,
+        )
+
+        status, _, body = await iot_module.handle_request(
+            "POST",
+            "/certificate/register",
+            {},
+            json.dumps(
+                {"certificatePem": leaf_pem, "caCertificatePem": ca_y_pem}
+            ).encode(),
+            {},
+        )
+        assert status == 400
+        assert json.loads(body)["__type"] == "CertificateValidationException"
+        assert received == []
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        iot_module.broker_reset()
+
+
+def test_iot_update_ca_certificate_applies_a_body_only_status(iot_client):
+    """newStatus / newAutoRegistrationStatus are modeled in the query string,
+    but a raw caller that sends them in the JSON body must not get a 200 that
+    changed nothing — UpdateCertificate accepts either, and so does this."""
+    import os
+    import urllib.request
+
+    ca_pem, _leaf = _generate_ca_and_leaf()
+    ca_id = iot_client.register_ca_certificate(caCertificate=ca_pem)["certificateId"]
+    try:
+        assert (
+            iot_client.describe_ca_certificate(certificateId=ca_id)[
+                "certificateDescription"
+            ]["status"]
+            == "INACTIVE"
+        )
+        endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+        req = urllib.request.Request(
+            f"{endpoint}/cacertificate/{ca_id}",
+            data=json.dumps(
+                {"newStatus": "ACTIVE", "newAutoRegistrationStatus": "ENABLE"}
+            ).encode(),
+            method="PUT",
+            headers={
+                # The CA registry is account+region scoped, so the credential
+                # scope has to name the same region the boto3 client signs with.
+                "Authorization": (
+                    "AWS4-HMAC-SHA256 Credential=test/0/us-east-1/iot/aws4_request"
+                ),
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 200
+        desc = iot_client.describe_ca_certificate(certificateId=ca_id)[
+            "certificateDescription"
+        ]
+        assert desc["status"] == "ACTIVE"
+        assert desc["autoRegistrationStatus"] == "ENABLE"
+    finally:
+        iot_client.update_ca_certificate(certificateId=ca_id, newStatus="INACTIVE")
+        iot_client.delete_ca_certificate(certificateId=ca_id)
+
+
+def test_iot_jitr_event_requires_an_active_ca():
+    """Auto-registration is gated on the CA's own status: an INACTIVE CA with
+    allowAutoRegistration publishes nothing (AWS registers nothing under one),
+    and activating the same CA starts the events flowing."""
+    from ministack.core.responses import (
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import iot as iot_module
+
+    ca_pem, (leaf_pem, leaf_pem2) = _generate_ca_and_leaves(2)
+    account_id = "123456789012"
+    received: list = []
+
+    async def _run():
+        set_request_account_id(account_id)
+        set_request_region(_TEST_REGION)
+
+        # INACTIVE (no setAsActive) but auto-registration ENABLE.
+        status, _, body = await iot_module.handle_request(
+            "POST",
+            "/cacertificate",
+            {},
+            json.dumps({"caCertificate": ca_pem}).encode(),
+            {"allowAutoRegistration": "true"},
+        )
+        assert status == 200
+        ca_id = json.loads(body)["certificateId"]
+
+        async def _collect(topic, payload, qos):
+            received.append((topic, payload, qos))
+
+        await iot_module.broker_subscribe(
+            account_id,
+            _TEST_REGION,
+            "$aws/events/certificates/registered/#",
+            _collect,
+        )
+
+        status, _, _body = await iot_module.handle_request(
+            "POST",
+            "/certificate/register",
+            {},
+            json.dumps(
+                {"certificatePem": leaf_pem, "caCertificatePem": ca_pem}
+            ).encode(),
+            {},
+        )
+        assert status == 200
+        assert received == []
+
+        # Activate the CA — the very next registration fires.
+        status, _, _body = await iot_module.handle_request(
+            "PUT", f"/cacertificate/{ca_id}", {}, b"", {"newStatus": "ACTIVE"}
+        )
+        assert status == 200
+
+        status, _, body = await iot_module.handle_request(
+            "POST",
+            "/certificate/register",
+            {},
+            json.dumps(
+                {"certificatePem": leaf_pem2, "caCertificatePem": ca_pem}
+            ).encode(),
+            {},
+        )
+        assert status == 200
+        cert_id2 = json.loads(body)["certificateId"]
+
+        assert len(received) == 1
+        topic, payload, _qos = received[0]
+        assert topic == f"$aws/events/certificates/registered/{ca_id}"
+        assert json.loads(payload)["certificateId"] == cert_id2
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        iot_module.broker_reset()
+
+
+def test_iot_jitr_registration_survives_a_broker_failure(monkeypatch):
+    """The certificate is committed before the event is published, so a broker
+    that raises must not turn a successful registration into a 500."""
+    from ministack.core.responses import (
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import iot as iot_module
+
+    ca_pem, leaf_pem = _generate_ca_and_leaf()
+    account_id = "123456789012"
+
+    async def _boom(*_args, **_kwargs):
+        raise RuntimeError("broker down")
+
+    async def _run():
+        set_request_account_id(account_id)
+        set_request_region(_TEST_REGION)
+
+        status, _, _body = await iot_module.handle_request(
+            "POST",
+            "/cacertificate",
+            {},
+            json.dumps({"caCertificate": ca_pem}).encode(),
+            {"setAsActive": "true", "allowAutoRegistration": "true"},
+        )
+        assert status == 200
+
+        monkeypatch.setattr(iot_module, "broker_publish", _boom)
+        status, _, body = await iot_module.handle_request(
+            "POST",
+            "/certificate/register",
+            {},
+            json.dumps(
+                {"certificatePem": leaf_pem, "caCertificatePem": ca_pem}
+            ).encode(),
+            {},
+        )
+        assert status == 200
+        cert_id = json.loads(body)["certificateId"]
+
+        status, _, body = await iot_module.handle_request(
+            "GET", f"/certificates/{cert_id}", {}, b"", {}
+        )
+        assert status == 200
+        assert json.loads(body)["certificateDescription"]["certificateId"] == cert_id
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        iot_module.broker_reset()
+
+
+def test_iot_update_ca_certificate_rejects_invalid_enum_values(iot_client):
+    """The two update fields validate their enums with a 400.
+
+    boto3 already refuses bad values client-side, so the branch is only
+    reachable over raw HTTP - which is exactly how a non-SDK caller would
+    hit it.
+    """
+    import os
+    import urllib.error
+    import urllib.request
+
+    ca_pem, _leaf = _generate_ca_and_leaf()
+    ca_id = iot_client.register_ca_certificate(caCertificate=ca_pem)["certificateId"]
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    try:
+        for payload, wanted in (
+            ({"newStatus": "BOGUS"}, "newStatus"),
+            ({"newAutoRegistrationStatus": "MAYBE"}, "newAutoRegistrationStatus"),
+        ):
+            req = urllib.request.Request(
+                f"{endpoint}/cacertificate/{ca_id}",
+                data=json.dumps(payload).encode(),
+                method="PUT",
+                headers={
+                    "Authorization": (
+                        "AWS4-HMAC-SHA256 Credential=test/0/us-east-1/iot/aws4_request"
+                    ),
+                    "Content-Type": "application/json",
+                },
+            )
+            try:
+                urllib.request.urlopen(req, timeout=5)
+                pytest.fail(f"expected HTTP 400 for {payload}")
+            except urllib.error.HTTPError as e:
+                assert e.code == 400
+                assert wanted in e.read().decode()
+        # The invalid updates changed nothing: a freshly registered CA stays
+        # INACTIVE with auto-registration DISABLE.
+        desc = iot_client.describe_ca_certificate(certificateId=ca_id)[
+            "certificateDescription"
+        ]
+        assert desc["status"] == "INACTIVE"
+        assert desc["autoRegistrationStatus"] == "DISABLE"
+    finally:
+        iot_client.delete_ca_certificate(certificateId=ca_id)
+
+
+def test_shadow_mqtt_get_delete_roundtrip():
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    account_id = "123456789012"
+    frames: dict[str, list] = {}
+
+    async def _collect(topic, payload, qos):
+        frames.setdefault(topic, []).append(json.loads(payload))
+
+    async def _run():
+        for filt in (
+            "$aws/things/dev4/shadow/get/+",
+            "$aws/things/dev4/shadow/delete/+",
+        ):
+            await subscribe(account_id, filt, _collect)
+        # get before any update → rejected 404
+        await publish(account_id, "$aws/things/dev4/shadow/get", b"")
+        await publish(
+            account_id,
+            "$aws/things/dev4/shadow/update",
+            json.dumps({"state": {"reported": {"fw": "1.2"}}}).encode(),
+        )
+        # get with a clientToken → accepted echoes it
+        await publish(
+            account_id,
+            "$aws/things/dev4/shadow/get",
+            json.dumps({"clientToken": "get-1"}).encode(),
+        )
+        await publish(account_id, "$aws/things/dev4/shadow/delete", b"")
+        # delete again → rejected 404
+        await publish(account_id, "$aws/things/dev4/shadow/delete", b"")
+
+    try:
+        asyncio.run(_run())
+        get_rejected = frames["$aws/things/dev4/shadow/get/rejected"]
+        assert get_rejected[0]["code"] == 404
+        get_accepted = frames["$aws/things/dev4/shadow/get/accepted"][0]
+        assert get_accepted["state"]["reported"] == {"fw": "1.2"}
+        assert get_accepted["clientToken"] == "get-1"
+        del_accepted = frames["$aws/things/dev4/shadow/delete/accepted"][0]
+        assert del_accepted["version"] == 1
+        del_rejected = frames["$aws/things/dev4/shadow/delete/rejected"][0]
+        assert del_rejected["code"] == 404
+    finally:
+        iot_module._shadows.clear()
+        reset()
+
+
+def test_shadow_mqtt_named_shadow_isolated_from_classic():
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    account_id = "123456789012"
+    frames: dict[str, list] = {}
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            frames.setdefault(topic, []).append(json.loads(payload))
+
+        await subscribe(
+            account_id, "$aws/things/dev5/shadow/name/cfg/update/+", _collect
+        )
+        await subscribe(account_id, "$aws/things/dev5/shadow/get/+", _collect)
+        await publish(
+            account_id,
+            "$aws/things/dev5/shadow/name/cfg/update",
+            json.dumps({"state": {"desired": {"mode": "eco"}}}).encode(),
+        )
+        # The classic shadow does not exist — only the named one was written.
+        await publish(account_id, "$aws/things/dev5/shadow/get", b"")
+
+    try:
+        asyncio.run(_run())
+        accepted = frames["$aws/things/dev5/shadow/name/cfg/update/accepted"][0]
+        assert accepted["state"] == {"desired": {"mode": "eco"}}
+        assert frames["$aws/things/dev5/shadow/get/rejected"][0]["code"] == 404
+        with iot_module.request_scope(account_id, _TEST_REGION):
+            status, doc = iot_module.get_thing_shadow("dev5", "cfg")
+        assert status == 200
+        assert doc["state"]["desired"] == {"mode": "eco"}
+    finally:
+        iot_module._shadows.clear()
+        reset()
+
+
+def test_shadow_mqtt_documents_previous_is_the_pre_update_state():
+    """`documents.previous` must be the state before the update. The shadow
+    store hands back its live dicts and updates merge into them in place, so an
+    un-snapshotted `previous` reports the post-update state and the two
+    documents come out identical from the second update on."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    account_id = "123456789012"
+    frames: dict[str, list] = {}
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            frames.setdefault(topic, []).append(json.loads(payload))
+
+        await subscribe(
+            account_id, "$aws/things/dev6/shadow/update/documents", _collect
+        )
+        for temp in (20, 21):
+            await publish(
+                account_id,
+                "$aws/things/dev6/shadow/update",
+                json.dumps({"state": {"reported": {"temp": temp}}}).encode(),
+            )
+
+    try:
+        asyncio.run(_run())
+        docs = frames["$aws/things/dev6/shadow/update/documents"]
+        assert len(docs) == 2
+        assert docs[0]["previous"] is None
+        assert docs[0]["current"]["state"]["reported"] == {"temp": 20}
+        second = docs[1]
+        assert second["previous"]["state"]["reported"] == {"temp": 20}
+        assert second["current"]["state"]["reported"] == {"temp": 21}
+        assert second["previous"]["state"] != second["current"]["state"]
+        assert second["previous"]["version"] == 1
+        assert second["current"]["version"] == 2
+    finally:
+        iot_module._shadows.clear()
+        reset()
+
+
+def test_shadow_mqtt_documents_carry_no_delta_section():
+    """A `documents` state reports `desired` and `reported` only.
+
+    Both snapshots come from `get_thing_shadow`, which injects `state.delta`
+    (and `metadata.delta`) because that is what a GET answers with. Publishing
+    them verbatim put a section on the documents topic that real devices never
+    receive — the delta has its own topic, published just above this one.
+    """
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    account_id = "123456789012"
+    frames: dict[str, list] = {}
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            frames.setdefault(topic, []).append(json.loads(payload))
+
+        for suffix in ("update/documents", "update/delta"):
+            await subscribe(account_id, f"$aws/things/dev7/shadow/{suffix}", _collect)
+        # A desired the reported state does not satisfy, so a delta exists on
+        # both the pre-update and the post-update document.
+        for reported in (10, 11):
+            await publish(
+                account_id,
+                "$aws/things/dev7/shadow/update",
+                json.dumps(
+                    {"state": {"desired": {"temp": 30}, "reported": {"temp": reported}}}
+                ).encode(),
+            )
+
+    try:
+        asyncio.run(_run())
+        docs = frames["$aws/things/dev7/shadow/update/documents"]
+        assert len(docs) == 2
+        second = docs[1]
+        for snapshot in ("previous", "current"):
+            state = second[snapshot]["state"]
+            assert set(state) == {"desired", "reported"}
+            assert "delta" not in second[snapshot].get("metadata", {})
+        assert second["previous"]["state"]["reported"] == {"temp": 10}
+        assert second["current"]["state"]["reported"] == {"temp": 11}
+        # The delta itself is still reported, on the topic that is meant for it.
+        deltas = frames["$aws/things/dev7/shadow/update/delta"]
+        assert deltas and deltas[-1]["state"] == {"temp": 30}
+    finally:
+        iot_module._shadows.clear()
+        reset()
+
+
+def test_shadow_mqtt_update_without_state_node_is_rejected():
+    """The most common device-side mistake: valid JSON, no `state` node."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    account_id = "123456789012"
+    frames: dict[str, list] = {}
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            frames.setdefault(topic, []).append(json.loads(payload))
+
+        await subscribe(account_id, "$aws/things/dev7/shadow/update/+", _collect)
+        await publish(
+            account_id,
+            "$aws/things/dev7/shadow/update",
+            json.dumps({"desired": {"led": "on"}, "clientToken": "tok-9"}).encode(),
+        )
+
+    try:
+        asyncio.run(_run())
+        rejected = frames["$aws/things/dev7/shadow/update/rejected"][0]
+        assert rejected["code"] == 400
+        assert "state" in rejected["message"]
+        assert rejected["clientToken"] == "tok-9"
+        assert "$aws/things/dev7/shadow/update/accepted" not in frames
+    finally:
+        iot_module._shadows.clear()
+        reset()
+
+
+def test_shadow_mqtt_empty_named_shadow_is_rejected_on_its_own_topic():
+    """`.../shadow/name//update` names no shadow. Treating it as the classic
+    shadow would write the wrong record and answer on a topic the requester is
+    not subscribed to, so it is rejected where the requester is listening."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    account_id = "123456789012"
+    frames: dict[str, list] = {}
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            frames.setdefault(topic, []).append(json.loads(payload))
+
+        await subscribe(account_id, "$aws/things/dev8/shadow/name//update/+", _collect)
+        await subscribe(account_id, "$aws/things/dev8/shadow/update/+", _collect)
+        await publish(
+            account_id,
+            "$aws/things/dev8/shadow/name//update",
+            json.dumps({"state": {"desired": {"led": "on"}}, "clientToken": "t"}).encode(),
+        )
+
+    try:
+        asyncio.run(_run())
+        rejected = frames["$aws/things/dev8/shadow/name//update/rejected"][0]
+        assert rejected["code"] == 400
+        assert rejected["clientToken"] == "t"
+        # Nothing landed on the classic shadow's topics or in its record.
+        assert not any(t.startswith("$aws/things/dev8/shadow/update/") for t in frames)
+        with iot_module.request_scope(account_id, _TEST_REGION):
+            assert iot_module.get_thing_shadow("dev8", "")[0] == 404
+    finally:
+        iot_module._shadows.clear()
+        reset()
+
+
+def test_shadow_mqtt_named_shadow_full_lifecycle():
+    """delta / documents / get / delete all answer on the named shadow's own
+    topics — only update/accepted was covered for named shadows."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    account_id = "123456789012"
+    frames: dict[str, list] = {}
+    base = "$aws/things/dev9/shadow/name/cfg"
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            frames.setdefault(topic, []).append(json.loads(payload))
+
+        for filt in (f"{base}/update/+", f"{base}/get/+", f"{base}/delete/+"):
+            await subscribe(account_id, filt, _collect, granted_qos=1)
+        await publish(
+            account_id,
+            f"{base}/update",
+            json.dumps(
+                {"state": {"desired": {"mode": "eco"}}, "clientToken": "tok-n"}
+            ).encode(),
+        )
+        await publish(account_id, f"{base}/get", b"")
+        await publish(account_id, f"{base}/delete", b"")
+        await publish(account_id, f"{base}/get", b"")
+
+    try:
+        asyncio.run(_run())
+        delta = frames[f"{base}/update/delta"][0]
+        assert delta["state"] == {"mode": "eco"}
+        assert delta["clientToken"] == "tok-n"
+        assert set(delta["metadata"]) == {"mode"}
+        docs = frames[f"{base}/update/documents"][0]
+        assert docs["previous"] is None
+        assert docs["current"]["state"]["desired"] == {"mode": "eco"}
+        assert frames[f"{base}/get/accepted"][0]["state"]["desired"] == {"mode": "eco"}
+        assert frames[f"{base}/delete/accepted"][0]["version"] == 1
+        assert frames[f"{base}/get/rejected"][0]["code"] == 404
+    finally:
+        iot_module._shadows.clear()
+        reset()
+
+
+def test_shadow_mqtt_bridge_failure_does_not_kill_the_publish(monkeypatch):
+    """The bridge is the last side effect in broker_publish and the only one
+    that used to run unguarded, so anything it raised propagated out and tore
+    down the caller's MQTT session."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    account_id = "123456789012"
+
+    async def _boom(*args, **kwargs):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(iot_module, "_handle_shadow_publish", _boom)
+    delivered = []
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            delivered.append(topic)
+
+        await subscribe(account_id, "$aws/things/dev10/shadow/update", _collect)
+        await publish(
+            account_id,
+            "$aws/things/dev10/shadow/update",
+            json.dumps({"state": {"desired": {"led": "on"}}}).encode(),
+        )
+
+    try:
+        asyncio.run(_run())  # no exception escapes
+        # ...and the subscriber still got the request publish.
+        assert delivered == ["$aws/things/dev10/shadow/update"]
+    finally:
+        iot_module._shadows.clear()
+        reset()
+
+
+def test_shadow_mqtt_bridge_drives_topic_rules_on_request_and_accepted():
+    """Rules fire on the request topic (before the bridge runs) AND on the
+    bridge's own `update/accepted` publish (which recursively re-enters
+    broker_publish and its now-async rule evaluation)."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    _put_rule(
+        account_id,
+        "shadow_req_rule",
+        "SELECT * FROM '$aws/things/+/shadow/update'",
+        [{"republish": {"topic": "seen/request", "qos": 0}}],
+    )
+    _put_rule(
+        account_id,
+        "shadow_acc_rule",
+        "SELECT * FROM '$aws/things/+/shadow/update/accepted'",
+        [{"republish": {"topic": "seen/accepted", "qos": 0}}],
+    )
+    seen: dict[str, list] = {}
+
+    async def _run():
+        async def _collect(topic, payload, qos):
+            seen.setdefault(topic, []).append(json.loads(payload))
+
+        await subscribe(account_id, "seen/#", _collect)
+        await publish(
+            account_id,
+            "$aws/things/dev6/shadow/update",
+            json.dumps({"state": {"desired": {"n": 1}}}).encode(),
+        )
+
+    try:
+        asyncio.run(_run())
+        assert len(seen.get("seen/request", [])) == 1
+        assert seen["seen/request"][0] == {"state": {"desired": {"n": 1}}}
+        accepted_events = seen.get("seen/accepted", [])
+        assert len(accepted_events) == 1
+        assert accepted_events[0]["version"] == 1
+        assert accepted_events[0]["state"] == {"desired": {"n": 1}}
+    finally:
+        iot_module._topic_rules.clear()
+        iot_module._shadows.clear()
+        reset()
+
+
+def test_shadow_mqtt_get_and_delete_reject_invalid_json():
+    """Malformed JSON rejects on every request verb, not only update.
+
+    A `get`/`delete` payload is optional, but garbage must not be silently
+    read as `{}` - as on AWS, the requester hears a 400 on its own
+    `rejected` topic.
+    """
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._shadows.clear()
+    account_id = "123456789012"
+    rejected: list = []
+    accepted: list = []
+
+    async def _run():
+        async def _collect_rejected(topic, payload, qos):
+            rejected.append((topic, json.loads(payload)))
+
+        async def _collect_accepted(topic, payload, qos):
+            accepted.append(topic)
+
+        for verb in ("get", "delete"):
+            await subscribe(
+                account_id, f"$aws/things/dev6/shadow/{verb}/rejected", _collect_rejected
+            )
+            await subscribe(
+                account_id, f"$aws/things/dev6/shadow/{verb}/accepted", _collect_accepted
+            )
+        await publish(account_id, "$aws/things/dev6/shadow/get", b"{not json")
+        await publish(account_id, "$aws/things/dev6/shadow/delete", b"\xff\xfe")
+
+    try:
+        asyncio.run(_run())
+        assert [t.rsplit("/", 2)[-2] for t, _doc in rejected] == ["get", "delete"]
+        assert all(doc["code"] == 400 for _t, doc in rejected)
+        assert accepted == [], "malformed JSON must not reach the shadow store"
+    finally:
+        iot_module._shadows.clear()
+        reset()

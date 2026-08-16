@@ -451,9 +451,11 @@ class StreamingResponse:
     """Marker body for long-lived HTTP responses (chunked ASGI ``more_body``).
 
     Handlers return ``(status, headers, StreamingResponse(runner))``. The ASGI
-    app sends ``http.response.start`` without ``Content-Length``, then awaits
-    ``runner(send, receive)``. The runner should emit ``http.response.body``
-    frames with ``more_body=True`` and finish with ``more_body=False``.
+    app sends ``http.response.start`` with whatever headers the handler set,
+    then awaits ``runner(send, receive)``. The runner should emit
+    ``http.response.body`` frames with ``more_body=True`` and finish with
+    ``more_body=False``; a runner that cannot finish the body should leave the
+    final frame unsent so the client sees a truncated response.
     """
 
     __slots__ = ("runner",)

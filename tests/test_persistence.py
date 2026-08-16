@@ -2471,6 +2471,67 @@ def test_eventbridge_legacy_account_scoped_targets_restore_to_rule_region():
         set_request_region(original_region)
 
 
+# ── iot._ca_certificates + iot._registration_codes ────────────────────
+
+def test_iot_ca_registry_and_registration_code_survive_warm_boot():
+    """`RegisterCACertificate` writes `_ca_certificates` and
+    `GetRegistrationCode` writes `_registration_codes`. If either dict is
+    dropped from get_state()/restore_state(), registered JITR CAs and the
+    account registration code silently vanish on restart.
+
+    The warm boot is spelled out rather than taken from `_round_trip_dict` so
+    the state is also checked *between* reset() and restore_state(): a dict
+    missing from reset() survives the round trip untouched, which would satisfy
+    an after-restore assertion alone while restore_state never restored
+    anything."""
+    mod = _get_module("iot")
+    mod.reset()
+    ca_id = "c" * 64
+    ca_arn = f"arn:aws:iot:us-east-1:000000000000:cacert/{ca_id}"
+    try:
+        mod._ca_certificates[ca_id] = {
+            "certificateId": ca_id,
+            "certificateArn": ca_arn,
+            "certificatePem": (
+                "-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n"
+            ),
+            "status": "ACTIVE",
+            "autoRegistrationStatus": "ENABLE",
+            "creationDate": 1700000000,
+        }
+        mod._registration_codes["code"] = "d" * 64
+
+        persistence.save_state("iot", mod.get_state())
+        mod.reset()
+        assert mod._ca_certificates.get(ca_id) is None, (
+            "_ca_certificates survived reset() — the CA registry must be "
+            "cleared there, or a restart leaks the previous run's CAs."
+        )
+        assert mod._registration_codes.get("code") is None, (
+            "_registration_codes survived reset() — the registration code must "
+            "be cleared there."
+        )
+        loaded = persistence.load_state("iot")
+        assert loaded is not None, (
+            "persistence.load_state('iot') returned None — state file was not "
+            "written by save_state()."
+        )
+        mod.restore_state(loaded)
+
+        restored = mod._ca_certificates.get(ca_id)
+        assert restored is not None, (
+            "_ca_certificates lost across save_state → load_state — the CA "
+            "registry must be in both get_state and restore_state."
+        )
+        assert restored["certificateArn"] == ca_arn
+        assert restored["autoRegistrationStatus"] == "ENABLE"
+        assert mod._registration_codes.get("code") == "d" * 64, (
+            "_registration_codes lost across save_state → load_state."
+        )
+    finally:
+        mod.reset()
+
+
 # ── Import-order regression for the ECS NameError trap ───────────────
 
 def test_ecs_module_reload_with_persisted_attributes_does_not_namerror():
