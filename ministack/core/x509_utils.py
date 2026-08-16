@@ -28,6 +28,7 @@ logger = logging.getLogger("x509_utils")
 
 try:
     from cryptography import x509
+    from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec, rsa
     from cryptography.x509.oid import NameOID
@@ -211,6 +212,41 @@ def sign_leaf_certificate(
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
     ).decode("utf-8")
     return cert_pem, private_pem, public_pem
+
+
+def certificate_is_signed_by(cert_pem: str, ca_cert_pem: str) -> bool:
+    """Return True when ``cert_pem`` carries a valid signature from ``ca_cert_pem``.
+
+    The issuer/subject distinguished names are compared first — cheap, and the
+    only discriminator when several CAs share a subject — and then the
+    signature itself is verified against the CA's public key.
+
+    This answers "did this CA issue this certificate", not "is this chain
+    trusted right now": validity dates, basic constraints and revocation are
+    deliberately not considered, matching what AWS IoT's ``RegisterCertificate``
+    needs to know about ``caCertificatePem``.
+
+    Args:
+        cert_pem: The leaf certificate in PEM format.
+        ca_cert_pem: The claimed issuing CA certificate in PEM format.
+
+    Returns:
+        True if the CA's key signed the leaf, False otherwise (including
+        unparseable input and unsupported signature algorithms).
+    """
+    _require_crypto()
+    try:
+        cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+        ca_cert = x509.load_pem_x509_certificate(ca_cert_pem.encode("utf-8"))
+    except Exception:
+        return False
+    if cert.issuer != ca_cert.subject:
+        return False
+    try:
+        cert.verify_directly_issued_by(ca_cert)
+    except (InvalidSignature, ValueError, TypeError):
+        return False
+    return True
 
 
 def get_certificate_id(cert_pem: str) -> str:
