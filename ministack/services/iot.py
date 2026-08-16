@@ -3542,6 +3542,7 @@ async def broker_stop() -> None:
 
 
 _BASIC_INGEST_PREFIX = "$aws/rules/"
+_SHADOW_TOPIC_PREFIX = "$aws/things/"
 
 
 def _rules_for_account(account_id: str, region: str) -> list[dict]:
@@ -3739,6 +3740,56 @@ def _dispatch_rule_sns(account_id: str, region: str, rule_name: str, spec: dict,
     _broker_logger.debug("IoT rule %s → SNS %s", rule_name, target)
 
 
+def _dispatch_rule_sqs(account_id: str, region: str, rule_name: str, spec: dict, event) -> None:
+    from ministack.services import sqs as _sqs
+
+    queue_url = spec.get("queueUrl") or ""
+    if not queue_url:
+        _broker_logger.warning(
+            "IoT rule %s: sqs action has no queueUrl — skipped", rule_name
+        )
+        return
+    body = event if isinstance(event, str) else json.dumps(event)
+    if spec.get("useBase64"):
+        # useBase64 encodes the message *body*: the consumer receives Base64 text
+        # and has to decode it. It is not a transport hint.
+        body = base64.b64encode(body.encode("utf-8")).decode("ascii")
+    # roleArn is accepted and ignored, as everywhere else here — no IAM to fail.
+    with request_scope(account_id, region):
+        # _get_q matches the URL as stored and then by queue name, which is what
+        # lets a rule written against localhost reach a queue created through a
+        # different host alias, and refuses a URL naming another account rather
+        # than silently resolving to a same-account queue of that name.
+        try:
+            queue = _sqs._get_q(queue_url)
+            if queue["is_fifo"]:
+                # AWS documents FIFO queues as unsupported for this action: the
+                # rules engine is distributed, so it cannot promise the ordering
+                # a FIFO queue exists to provide, and enqueuing anyway would need
+                # a MessageGroupId we would have to invent.
+                _broker_logger.warning(
+                    "IoT rule %s: sqs target %s is a FIFO queue, which the AWS SQS "
+                    "rule action does not support — nothing delivered",
+                    rule_name,
+                    queue_url,
+                )
+                return
+            # Through SQS's own SendMessage body, so the queue's DelaySeconds and
+            # MaximumMessageSize apply and the MessageId is minted the way every
+            # other producer's is.
+            result = _sqs._act_send_message({"MessageBody": body}, queue_url)
+        except _sqs._Err as exc:
+            # SQS raises in its wire vocabulary; the action collector and the
+            # rule's errorAction want a plain exception, so translate at the
+            # boundary as stepfunctions does for the same call.
+            raise RuntimeError(
+                f"SQS SendMessage to {queue_url} failed: {exc.code}: {exc.message}"
+            ) from exc
+    _broker_logger.debug(
+        "IoT rule %s → SQS %s (%s)", rule_name, queue_url, result["MessageId"]
+    )
+
+
 async def _dispatch_rule_action(
     account_id: str, region: str, rule_name: str, action: dict, event
 ) -> None:
@@ -3760,6 +3811,8 @@ async def _dispatch_rule_action(
         )
     elif "sns" in action:
         _dispatch_rule_sns(account_id, region, rule_name, action["sns"] or {}, event)
+    elif "sqs" in action:
+        _dispatch_rule_sqs(account_id, region, rule_name, action["sqs"] or {}, event)
     else:
         _broker_logger.debug(
             "IoT rule %s: unsupported action type %s — skipped",
@@ -3872,6 +3925,169 @@ async def _evaluate_topic_rules(
             await _run_rule_actions(account_id, region, rule, payload, topic, client_id)
 
 
+def _parse_shadow_topic(topic: str) -> tuple[str, str, str | None] | None:
+    """``$aws/things/<thing>/shadow[/name/<n>]/<verb>`` → (thing, verb, name).
+
+    Anything longer — the ``accepted`` / ``rejected`` / ``delta`` /
+    ``documents`` response suffixes — parses as ``None``, so the bridge's own
+    response publishes can never re-trigger it (no recursion)."""
+    if not topic.startswith(_SHADOW_TOPIC_PREFIX):
+        return None
+    rest = topic[len(_SHADOW_TOPIC_PREFIX):]
+    parts = rest.split("/")
+    if len(parts) < 3 or parts[1] != "shadow":
+        return None
+    thing = parts[0]
+    tail = parts[2:]
+    name = None
+    if tail and tail[0] == "name" and len(tail) >= 2:
+        name, tail = tail[1], tail[2:]
+    if not tail:
+        return None
+    verb = tail[0]
+    # Responses (accepted/rejected/delta/documents) are ours, never inputs.
+    if len(tail) > 1 or verb not in ("update", "get", "delete"):
+        return None
+    return thing, verb, name
+
+
+def _shadow_rejected(status: int, message: str, client_token: str | None = None) -> dict:
+    """AWS's shadow error response document."""
+    doc = {"code": status, "message": message}
+    if client_token is not None:
+        doc["clientToken"] = client_token
+    return doc
+
+
+def _shadow_document(doc: dict) -> dict:
+    """Strip the computed ``delta`` sections out of a shadow snapshot.
+
+    `get_thing_shadow` injects ``state.delta`` (and its ``metadata.delta``) by
+    design, because that is what the GET response carries. The documents topic
+    is not a GET: on AWS the ``previous``/``current`` documents report only
+    ``desired`` and ``reported``, and the delta has its own topic. Publishing
+    the snapshot verbatim invented a section real devices never see.
+    """
+    stripped = dict(doc)
+    for section in ("state", "metadata"):
+        block = stripped.get(section)
+        if isinstance(block, dict) and "delta" in block:
+            stripped[section] = {k: v for k, v in block.items() if k != "delta"}
+    return stripped
+
+
+async def _handle_shadow_publish(
+    account_id: str,
+    region: str,
+    thing: str,
+    verb: str,
+    name: str | None,
+    payload: bytes,
+) -> None:
+    """Shadow-over-MQTT bridge: feed a request-topic publish into the shadow
+    store and publish the AWS reserved-topic responses back through the broker
+    (``accepted`` / ``rejected``, plus ``delta`` and ``documents`` on update)."""
+    # `name is not None` rather than a truthiness test: an empty named shadow
+    # (`.../shadow/name//update`) must answer on the topic the requester is
+    # listening on, not collapse onto the classic shadow's.
+    base = f"{_SHADOW_TOPIC_PREFIX}{thing}/shadow" + (f"/name/{name}" if name is not None else "")
+    shadow_name = name or ""
+
+    async def _respond(suffix: str, doc: dict) -> None:
+        await broker_publish(
+            account_id,
+            region,
+            f"{base}/{suffix}",
+            json.dumps(doc).encode("utf-8"),
+            qos=1,
+        )
+
+    try:
+        request = json.loads(payload) if payload else {}
+    except (ValueError, UnicodeDecodeError):
+        # All three request verbs reject malformed JSON, as on AWS — a `get`
+        # or `delete` payload is optional but must parse when present.
+        await _respond(f"{verb}/rejected", _shadow_rejected(400, "invalid json"))
+        return
+    if not isinstance(request, dict):
+        request = {}
+    client_token = request.get("clientToken")
+
+    if name is not None and not name:
+        await _respond(
+            f"{verb}/rejected",
+            _shadow_rejected(400, "Invalid shadow name: must not be empty", client_token),
+        )
+        return
+
+    if verb == "update":
+        # The broker's WS path sets only the account contextvar, so pin both
+        # around every shadow-store access.
+        with request_scope(account_id, region):
+            # get_thing_shadow hands back the stored state dicts themselves and
+            # update_thing_shadow merges into them in place, so `previous` has
+            # to be snapshotted before the update runs — otherwise it reports
+            # the state *after* it, and from the second update on `previous`
+            # and `current` are the same document. `current` is snapshotted for
+            # the same reason: a concurrent update would otherwise edit it out
+            # from under the publish below.
+            pre_status, pre_doc = get_thing_shadow(thing, shadow_name)
+            pre_doc = copy.deepcopy(pre_doc)
+            status, doc = update_thing_shadow(thing, shadow_name, request)
+            post_status, post_doc = (
+                get_thing_shadow(thing, shadow_name) if status == 200 else (0, {})
+            )
+            post_doc = copy.deepcopy(post_doc)
+        if status != 200:
+            await _respond(
+                "update/rejected",
+                _shadow_rejected(status, doc.get("message", ""), client_token),
+            )
+            return
+        # The core update response already echoes clientToken when present.
+        await _respond("update/accepted", doc)
+        if post_status == 200:
+            delta = (post_doc.get("state") or {}).get("delta")
+            if delta:
+                # The delta section of the GET document, with the metadata AWS
+                # reports alongside it and the triggering request's clientToken.
+                delta_doc = {
+                    "state": delta,
+                    "metadata": (post_doc.get("metadata") or {}).get("delta", {}),
+                    "version": post_doc["version"],
+                    "timestamp": post_doc["timestamp"],
+                }
+                if client_token is not None:
+                    delta_doc["clientToken"] = client_token
+                await _respond("update/delta", delta_doc)
+        await _respond(
+            "update/documents",
+            {
+                "previous": _shadow_document(pre_doc) if pre_status == 200 else None,
+                "current": _shadow_document(post_doc) if post_status == 200 else None,
+                "timestamp": _shadow_now(),
+            },
+        )
+        return
+
+    with request_scope(account_id, region):
+        status, doc = (
+            get_thing_shadow(thing, shadow_name)
+            if verb == "get"
+            else delete_thing_shadow(thing, shadow_name)
+        )
+    if status == 200:
+        doc = copy.deepcopy(doc)
+        if client_token is not None:
+            doc["clientToken"] = client_token
+        await _respond(f"{verb}/accepted", doc)
+    else:
+        await _respond(
+            f"{verb}/rejected",
+            _shadow_rejected(status, doc.get("message", ""), client_token),
+        )
+
+
 async def broker_publish(
     account_id: str,
     region: str,
@@ -3941,6 +4157,27 @@ async def broker_publish(
                     break
 
     await _evaluate_topic_rules(account_id, region, topic, payload, client_id)
+
+    # Shadow-over-MQTT bridge — AFTER delivery and rule evaluation, so rules
+    # matching `$aws/things/+/shadow/update` fire on the request, and the
+    # recursive `accepted`/`delta`/`documents` publishes then flow back
+    # through this function to drive their own subscribers and rules. The
+    # response suffixes parse as None, so the bridge never re-triggers itself.
+    # NOTE known divergence: `_topic_matches` lets a bare `#` subscription
+    # match `$aws/...` topics, unlike real AWS where `#` excludes the
+    # reserved topic space.
+    shadow = _parse_shadow_topic(topic)
+    if shadow is not None:
+        try:
+            await _handle_shadow_publish(account_id, region, *shadow, payload)
+        except Exception:
+            # Guarded like subscriber delivery and rule dispatch above: a
+            # payload the bridge chokes on (a deeply nested document raises
+            # RecursionError out of json.loads, which the ValueError handler
+            # inside does not catch) must not tear down the MQTT session.
+            _broker_logger.warning(
+                "IoT shadow bridge failed for %r", topic, exc_info=True
+            )
 
 
 async def broker_subscribe(
