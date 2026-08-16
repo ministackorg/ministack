@@ -48,6 +48,7 @@ body:
         - Glue
         - IAM
         - IMDS
+        - IoT Core
         - Kinesis
         - KMS
         - Lambda

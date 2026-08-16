@@ -731,15 +731,20 @@ def _zip_inline(source: str | None, handler: str, runtime: str = "python3.12") -
 def _lambda_create(logical_id, props, stack_name):
     name = props.get("FunctionName") or _physical_name(stack_name, logical_id, max_len=64)
     arn = f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{name}"
-    runtime = props.get("Runtime", "python3.12")
-    handler = props.get("Handler", "index.handler")
+    code = props.get("Code", {})
+    image_uri = code.get("ImageUri")
+    # An Image-package function carries no Runtime/Handler on AWS — both are
+    # empty, exactly as the Lambda API's _build_config sets them. Only a Zip
+    # package gets the python3.12/index.handler defaults.
+    is_image = props.get("PackageType") == "Image" or bool(image_uri)
+    runtime = props.get("Runtime", "" if is_image else "python3.12")
+    handler = props.get("Handler", "" if is_image else "index.handler")
     role = props.get("Role", f"arn:aws:iam::{get_account_id()}:role/dummy-role")
     timeout = int(props.get("Timeout", 3))
     memory = int(props.get("MemorySize", 128))
     env_vars = props.get("Environment", {}).get("Variables", {})
     description = props.get("Description", "")
     layers = props.get("Layers", [])
-    code = props.get("Code", {})
 
     # Resolve the actual code bytes:
     #  - inline ZipFile is wrapped to a real zip archive
@@ -779,7 +784,7 @@ def _lambda_create(logical_id, props, stack_name):
             "Layers": [{"Arn": l} if isinstance(l, str) else l for l in layers],
             "State": "Active",
             "LastUpdateStatus": "Successful",
-            "PackageType": "Zip",
+            "PackageType": "Image" if is_image else "Zip",
             "Architectures": props.get("Architectures", ["x86_64"]),
             "EphemeralStorage": {"Size": props.get("EphemeralStorage", {}).get("Size", 512)},
             "TracingConfig": props.get("TracingConfig", {"Mode": "PassThrough"}),
@@ -800,6 +805,13 @@ def _lambda_create(logical_id, props, stack_name):
         "concurrency": None,
         "provisioned_concurrency": {},
     }
+    if is_image:
+        # Mirror the Lambda API's image response: ImageUri echoed on the config,
+        # plus ImageConfigResponse when an ImageConfig (Command/EntryPoint/
+        # WorkingDirectory) is supplied. GetFunction reads these back.
+        func["config"]["ImageUri"] = image_uri
+        if props.get("ImageConfig"):
+            func["config"]["ImageConfigResponse"] = {"ImageConfig": props["ImageConfig"]}
     _lambda_svc._functions[name] = func
     # On a stack UPDATE this re-provisions over an existing function; recycle the
     # warm worker + docker pool so the new code/config load on the next invoke

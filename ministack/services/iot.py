@@ -21,7 +21,7 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``DetachPolicy``, etc.
   - Fleet indexing: ``UpdateIndexingConfiguration`` /
     ``GetIndexingConfiguration`` / ``DescribeIndex`` / ``ListIndices``, and
-    ``SearchIndex`` over the live registry + shadows
+    ``SearchIndex`` over the live registry, shadows and MQTT connectivity
   - ``DescribeEndpoint`` returning a per-account hostname
 
 This is the control plane — pure HTTP/JSON, no MQTT broker
@@ -150,6 +150,9 @@ class _RetainedMessage:
 
 
 def _broker_get_state() -> dict:
+    # Retained messages only. Connectivity is deliberately not persisted: no
+    # session survives a restart, so restoring a thing as connected would put a
+    # claim in the fleet index that the broker cannot back with a live session.
     retained_list = []
     for topic, msg in _retained.items():
         retained_list.append({
@@ -1815,6 +1818,10 @@ _SEARCH_TOP_FIELDS = ("thingName", "thingTypeName", "thingGroupNames")
 # addressable: shadow.metadata / shadow.version / shadow.name.<name> (named
 # shadows) are AWS fields this emulator does not project.
 _SEARCH_SHADOW_HALVES = ("desired", "reported")
+# Unlike attributes.* and shadow.*, the connectivity group is closed — AWS
+# defines exactly these three — so an unknown leaf is a typo worth reporting
+# rather than a field that happens to be absent from this thing.
+_SEARCH_CONNECTIVITY_FIELDS = ("connected", "timestamp", "disconnectReason")
 
 # AWS names the single thing index ``AWS_Things``; it exists only while thing
 # indexing is enabled, which is why every fleet stack starts with an
@@ -1851,6 +1858,12 @@ def _thing_indexing_mode() -> str:
     )
 
 
+def _thing_connectivity_indexing_mode(config: dict) -> str:
+    return config.get("thingIndexingConfiguration", {}).get(
+        "thingConnectivityIndexingMode", "OFF"
+    )
+
+
 def _update_indexing_configuration(payload: dict) -> tuple:
     """``POST /indexing/config`` — enable or disable fleet indexing.
 
@@ -1861,10 +1874,11 @@ def _update_indexing_configuration(payload: dict) -> tuple:
 
     Only the modes this emulator can honor are interpreted —
     ``thingIndexingMode`` gates ``SearchIndex`` and whether shadow fields are
-    queryable. ``deviceDefenderIndexingMode``, ``namedShadowIndexingMode``,
-    ``customFields`` and ``filter`` are stored and echoed back by
-    ``GetIndexingConfiguration`` so IaC round-trips cleanly, but nothing here
-    projects those fields; querying one is an out-of-grammar
+    queryable, and ``thingConnectivityIndexingMode`` gates the
+    ``connectivity`` group. ``deviceDefenderIndexingMode``,
+    ``namedShadowIndexingMode``, ``customFields`` and ``filter`` are stored and
+    echoed back by ``GetIndexingConfiguration`` so IaC round-trips cleanly, but
+    nothing here projects those fields; querying one is an out-of-grammar
     ``InvalidQueryException`` rather than a silent miss.
     """
     config = _indexing_configuration()
@@ -1941,11 +1955,14 @@ def _get_indexing_configuration() -> tuple:
 def _index_schema(config: dict) -> str:
     """``DescribeIndex``'s schema string for the configuration in force."""
     thing_cfg = config.get("thingIndexingConfiguration", {})
-    return (
+    schema = (
         "REGISTRY_AND_SHADOW"
         if thing_cfg.get("thingIndexingMode") == "REGISTRY_AND_SHADOW"
         else "REGISTRY"
     )
+    if _thing_connectivity_indexing_mode(config) == "STATUS":
+        schema += "_AND_CONNECTIVITY_STATUS"
+    return schema
 
 
 def _describe_index(path: str) -> tuple:
@@ -2015,7 +2032,42 @@ def _classic_shadow_state(thing_name: str) -> dict | None:
     return rec.get("state") or {}
 
 
-def _search_field_error(field: str, thing_mode: str) -> str | None:
+def _thing_connectivity(account_id: str, region: str, thing_name: str) -> dict:
+    """The ``connectivity`` group for a thing, as fleet indexing reports it.
+
+    A thing counts as connected when a live MQTT session's *client id* equals
+    the thing name. That is the association AWS makes, and it is the only one
+    available: the broker knows client ids, and a device that connects under
+    some other client id is legitimately not this thing's connectivity, even
+    if the same hardware is behind it.
+
+    ``connected`` is read from the session registry on every call rather than
+    stored, so it cannot drift; only the transition timestamp and the reason
+    the last session ended are remembered. A thing that has never connected
+    reports ``connected: false`` with no timestamp — the honest answer, rather
+    than an epoch that implies a disconnect that never happened.
+
+    ``disconnectReason`` is reported whenever one is on record, including
+    while the thing is connected: after a takeover that reason is
+    DUPLICATE_CLIENTID, and the takeover is precisely the transition that
+    produced the session now reporting itself online. An ordinary reconnect
+    clears it (see ``_register_client``), so a reason that is present always
+    describes how the *current* state came about.
+    """
+    key = (account_id, region, thing_name)
+    doc: dict = {"connected": key in _connected_clients}
+    record = _connectivity.get(key)
+    if record is None:
+        return doc
+    doc["timestamp"] = record["timestamp"]
+    if record.get("disconnectReason"):
+        doc["disconnectReason"] = record["disconnectReason"]
+    return doc
+
+
+def _search_field_error(
+    field: str, thing_mode: str, connectivity_mode: str
+) -> str | None:
     """Why ``field`` is not queryable, or None when it is.
 
     Every rejection is a 400 rather than a query that matches nothing: a
@@ -2025,6 +2077,16 @@ def _search_field_error(field: str, thing_mode: str) -> str | None:
     if field in _SEARCH_TOP_FIELDS:
         return None
     if field.startswith("attributes.") and field != "attributes.":
+        return None
+    if field.startswith("connectivity."):
+        leaf = field.split(".", 1)[1]
+        if leaf not in _SEARCH_CONNECTIVITY_FIELDS:
+            return f"Unsupported query field: {field!r}"
+        if connectivity_mode != "STATUS":
+            return (
+                f"Connectivity field {field!r} is not indexed: "
+                "thingConnectivityIndexingMode is OFF"
+            )
         return None
     if field.startswith("shadow."):
         parts = field.split(".")
@@ -2043,13 +2105,19 @@ def _search_field_error(field: str, thing_mode: str) -> str | None:
     return f"Unsupported query field: {field!r}"
 
 
-def _search_field_value(thing: dict, field: str, shadow_state: dict | None):
+def _search_field_value(
+    thing: dict, field: str, shadow_state: dict | None, connectivity: dict
+):
     if field == "thingName":
         return thing.get("thingName")
     if field == "thingTypeName":
         return thing.get("thingTypeName")
     if field == "thingGroupNames":
         return thing.get("thingGroupNames") or None
+    if field.startswith("connectivity."):
+        # A missing key answers None, which never matches — so a thing that is
+        # currently connected does not match connectivity.disconnectReason:*.
+        return connectivity.get(field.split(".", 1)[1])
     if field.startswith("attributes."):
         return (thing.get("attributes") or {}).get(field.split(".", 1)[1])
     if field.startswith("shadow.") and shadow_state is not None:
@@ -2138,11 +2206,12 @@ def _search_index(payload: dict) -> tuple:
 
     Supported grammar (the subset device fleets actually use):
     ``AND``-separated ``field:value`` terms over ``thingName``,
-    ``thingTypeName``, ``thingGroupNames``, ``attributes.<name>`` and — once
-    ``thingIndexingMode`` is REGISTRY_AND_SHADOW —
-    ``shadow.desired|reported.<path>``, compared case-insensitively, with
-    ``*`` / ``?`` wildcards in the value. Anything outside that grammar is
-    rejected with ``InvalidQueryException``.
+    ``thingTypeName``, ``thingGroupNames`` and ``attributes.<name>``; over
+    ``shadow.desired|reported.<path>`` once ``thingIndexingMode`` is
+    REGISTRY_AND_SHADOW; and over ``connectivity.connected`` / ``.timestamp``
+    / ``.disconnectReason`` once ``thingConnectivityIndexingMode`` is STATUS.
+    Values compare case-insensitively, with ``*`` / ``?`` wildcards.
+    Anything outside that grammar is rejected with ``InvalidQueryException``.
 
     Results page through ``maxResults`` + ``nextToken``; the token is an
     offset into the live match list, so a thing created between pages can
@@ -2168,8 +2237,9 @@ def _search_index(payload: dict) -> tuple:
             f"Unsupported query syntax: {query!r}",
             400,
         )
+    connectivity_mode = _thing_connectivity_indexing_mode(config)
     for field, _ in terms:
-        problem = _search_field_error(field, thing_mode)
+        problem = _search_field_error(field, thing_mode, connectivity_mode)
         if problem is not None:
             return error_response_json("InvalidQueryException", problem, 400)
 
@@ -2192,11 +2262,20 @@ def _search_index(payload: dict) -> tuple:
         )
 
     shadows_indexed = thing_mode == "REGISTRY_AND_SHADOW"
+    connectivity_indexed = connectivity_mode == "STATUS"
+    account_id, region = get_account_id(), get_region()
     matched = []
     for name, thing in _things.items():
         shadow_state = _classic_shadow_state(name) if shadows_indexed else None
+        connectivity = (
+            _thing_connectivity(account_id, region, name)
+            if connectivity_indexed
+            else {}
+        )
         if not all(
-            _search_value_matches(_search_field_value(thing, f, shadow_state), v)
+            _search_value_matches(
+                _search_field_value(thing, f, shadow_state, connectivity), v
+            )
             for f, v in terms
         ):
             continue
@@ -2206,6 +2285,8 @@ def _search_index(payload: dict) -> tuple:
             "attributes": thing.get("attributes") or {},
             "thingGroupNames": list(thing.get("thingGroupNames") or []),
         }
+        if connectivity_indexed:
+            entry["connectivity"] = connectivity
         if thing.get("thingTypeName"):
             entry["thingTypeName"] = thing["thingTypeName"]
         if shadow_state:
@@ -3440,6 +3521,12 @@ _broker_logger = logging.getLogger("iot_broker")
 _subscriptions: dict[str, set["_Subscription"]] = {}
 _connected_clients: dict[tuple[str, str, str], "_WSSession"] = {}
 _persistent_sessions: dict[tuple[str, str, str], "_PersistentSessionState"] = {}
+# Last connect/disconnect transition per (account, region, client id), as
+# ``{"timestamp": <epoch ms>, "disconnectReason": <str|None>}``. Deliberately
+# NOT a connected flag: liveness is read from ``_connected_clients``, which is
+# the broker's own session registry, so the two can never disagree and a
+# restart cannot leave a thing stuck reporting itself online.
+_connectivity: dict[tuple[str, str, str], dict] = {}
 _broker_lock = asyncio.Lock()
 
 _SESSION_EXPIRY_SECONDS: int = int(os.environ.get("IOT_SESSION_EXPIRY_SECONDS", "3600"))
@@ -3633,6 +3720,7 @@ async def broker_stop() -> None:
         _retained.clear()
         _connected_clients.clear()
         _persistent_sessions.clear()
+        _connectivity.clear()
 
 
 _BASIC_INGEST_PREFIX = "$aws/rules/"
@@ -4393,6 +4481,7 @@ def broker_reset() -> None:
     _retained.clear()
     _connected_clients.clear()
     _persistent_sessions.clear()
+    _connectivity.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -4400,36 +4489,87 @@ def broker_reset() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _now_epoch_millis() -> int:
+    return int(time.time() * 1000)
+
+
 def _register_client(
-    account_id: str, region: str, client_id: str, session: "_WSSession"
+    account_id: str,
+    region: str,
+    client_id: str,
+    session: "_WSSession",
+    superseded_reason: str | None = None,
 ) -> None:
-    _connected_clients[(account_id, region, client_id)] = session
+    """Record a live session, and with it the transition that started it.
+
+    ``superseded_reason`` is the reason the connect itself ended a previous
+    session — only a takeover can do that, and only DUPLICATE_CLIENTID names
+    it. Carrying it onto the new record is what makes the reason observable
+    at all: the eviction and this registration are the same transition, so
+    overwriting it here (as this did) left a value no caller could ever read.
+    An ordinary reconnect passes None and clears the older reason, because
+    that disconnect was a transition of its own that this connect supersedes.
+    """
+    key = (account_id, region, client_id)
+    _connected_clients[key] = session
+    _connectivity[key] = {
+        "timestamp": _now_epoch_millis(),
+        "disconnectReason": superseded_reason,
+    }
 
 
-def _deregister_client(account_id: str, region: str, client_id: str) -> None:
-    _connected_clients.pop((account_id, region, client_id), None)
+def _deregister_client(
+    account_id: str, region: str, client_id: str, session: "_WSSession | None" = None
+) -> None:
+    """Drop a session from the registry and record its disconnect.
+
+    ``session`` identifies the caller so a session that has already been
+    replaced cannot deregister its successor. A client that reconnects under
+    the same client id is taken over: the old session is cleaned up first, and
+    its socket close then drives its own handler through cleanup a second time.
+    Without this guard that late second pass would evict the live session from
+    the registry and backdate its connectivity to the moment the loser died.
+    """
+    key = (account_id, region, client_id)
+    if session is not None and _connected_clients.get(key) is not session:
+        return
+    _connected_clients.pop(key, None)
+    _connectivity[key] = {
+        "timestamp": _now_epoch_millis(),
+        "disconnectReason": (
+            session.disconnect_reason() if session is not None else "CONNECTION_LOST"
+        ),
+    }
 
 
 async def _force_disconnect_duplicate(
     account_id: str, region: str, client_id: str
-) -> None:
+) -> str | None:
+    """Evict a session that the incoming one is taking over.
+
+    Returns DUPLICATE_CLIENTID when there was one to evict, so the caller can
+    carry that reason onto the record it is about to write; otherwise None.
+    """
     key = (account_id, region, client_id)
     existing = _connected_clients.get(key)
-    if existing is not None:
-        _broker_logger.info("IoT broker: duplicate client_id=%s, forcing old connection closed", client_id)
-        if existing.protocol_version == MQTT_5:
-            # An MQTT 5 client is told why it lost the connection; 3.1.1 has
-            # no server-initiated DISCONNECT, so it just sees the close.
-            try:
-                await existing.send_bytes(_make_disconnect(RC5_SESSION_TAKEN_OVER))
-            except Exception:
-                pass
+    if existing is None:
+        return None
+    _broker_logger.info("IoT broker: duplicate client_id=%s, forcing old connection closed", client_id)
+    existing._forced_disconnect_reason = "DUPLICATE_CLIENTID"
+    if existing.protocol_version == MQTT_5:
+        # An MQTT 5 client is told why it lost the connection; 3.1.1 has
+        # no server-initiated DISCONNECT, so it just sees the close.
         try:
-            await existing._send({"type": "websocket.close", "code": 1000})
+            await existing.send_bytes(_make_disconnect(RC5_SESSION_TAKEN_OVER))
         except Exception:
             pass
-        await existing.cleanup()
-        _connected_clients.pop(key, None)
+    try:
+        await existing._send({"type": "websocket.close", "code": 1000})
+    except Exception:
+        pass
+    await existing.cleanup()
+    _connected_clients.pop(key, None)
+    return "DUPLICATE_CLIENTID"
 
 
 # ---------------------------------------------------------------------------
@@ -4840,6 +4980,28 @@ class _WSSession:
         self._will_retain: bool = False
         self._will_properties: bytes = b""
         self._graceful_disconnect: bool = False
+        # Set when the broker itself ends the session, overriding whatever the
+        # socket then looks like from the client's side.
+        self._forced_disconnect_reason: str | None = None
+
+    def disconnect_reason(self) -> str:
+        """Why this session ended, in AWS's disconnect-reason vocabulary.
+
+        Only the three the broker can actually tell apart are ever reported: a
+        DISCONNECT packet (``CLIENT_INITIATED_DISCONNECT``), a takeover by a
+        second connection using the same client id (``DUPLICATE_CLIENTID``),
+        and everything else — a transport that went away (``CONNECTION_LOST``).
+        AWS's remaining reasons name machinery this broker does not have
+        (throttling, credential expiry, keep-alive enforcement), so reporting
+        one would be a guess dressed up as a fact.
+        """
+        if self._forced_disconnect_reason:
+            return self._forced_disconnect_reason
+        return (
+            "CLIENT_INITIATED_DISCONNECT"
+            if self._graceful_disconnect
+            else "CONNECTION_LOST"
+        )
 
     def _alloc_packet_id(self) -> int:
         pid = self._next_pid
@@ -5113,11 +5275,12 @@ class _WSSession:
                 self._will_properties = b""
 
             self._graceful_disconnect = False
-            await _force_disconnect_duplicate(
+            self._forced_disconnect_reason = None
+            takeover_reason = await _force_disconnect_duplicate(
                 self.account_id, self.region, self._client_id
             )
             _register_client(
-                self.account_id, self.region, self._client_id, self
+                self.account_id, self.region, self._client_id, self, takeover_reason
             )
 
             session_key = (self.account_id, self.region, self._client_id)
@@ -5366,7 +5529,9 @@ class _WSSession:
         self._sub_filters.clear()
         self._sub_granted_qos.clear()
         if self._client_id:
-            _deregister_client(self.account_id, self.region, self._client_id)
+            _deregister_client(
+                self.account_id, self.region, self._client_id, self
+            )
 
     def _preserve_session(self) -> None:
         session_key = (self.account_id, self.region, self._client_id)

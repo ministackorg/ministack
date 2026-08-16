@@ -597,11 +597,14 @@ def test_iot_legacy_principal_policy_unknown_policy_404(iot_client):
 # ---------------------------------------------------------------------------
 
 
-def _enable_fleet_indexing(client, mode: str = "REGISTRY_AND_SHADOW") -> None:
+def _enable_fleet_indexing(
+    client, mode: str = "REGISTRY_AND_SHADOW", connectivity: str = "STATUS"
+) -> None:
     """Turn the AWS_Things index on, as every fleet stack has to on AWS."""
-    client.update_indexing_configuration(
-        thingIndexingConfiguration={"thingIndexingMode": mode}
-    )
+    thing_cfg = {"thingIndexingMode": mode}
+    if mode != "OFF":
+        thing_cfg["thingConnectivityIndexingMode"] = connectivity
+    client.update_indexing_configuration(thingIndexingConfiguration=thing_cfg)
 
 
 def _iot_client_for_fresh_account():
@@ -647,8 +650,15 @@ def test_iot_indexing_configuration_round_trip():
     assert index["schema"] == "REGISTRY_AND_SHADOW"
 
     # Registry-only indexing narrows the schema back.
-    _enable_fleet_indexing(client, "REGISTRY")
+    _enable_fleet_indexing(client, "REGISTRY", connectivity="OFF")
     assert client.describe_index(indexName="AWS_Things")["schema"] == "REGISTRY"
+
+    # Connectivity status widens it again, the way AWS's schema strings do.
+    _enable_fleet_indexing(client, "REGISTRY")
+    assert (
+        client.describe_index(indexName="AWS_Things")["schema"]
+        == "REGISTRY_AND_CONNECTIVITY_STATUS"
+    )
 
     # ...and turning it off retires the index.
     _enable_fleet_indexing(client, "OFF")
@@ -710,6 +720,36 @@ def test_iot_search_index_shadow_terms_need_shadow_indexing():
     assert ei.value.response["Error"]["Code"] == "InvalidQueryException"
     # Registry fields keep working in the narrower mode.
     client.search_index(queryString="thingName:whatever")
+
+
+def test_iot_search_index_connectivity_needs_connectivity_indexing():
+    """The connectivity group appears only under THING_CONNECTIVITY_INDEXING.
+
+    That is the switch AWS puts it behind, so a fleet dashboard that forgets
+    it has to find out here rather than in the cloud.
+    """
+    client = _iot_client_for_fresh_account()
+    _enable_fleet_indexing(client, connectivity="OFF")
+    name = _unique("connoff")
+    client.create_thing(thingName=name)
+    try:
+        hit = client.search_index(queryString=f"thingName:{name}")["things"][0]
+        assert "connectivity" not in hit
+        with pytest.raises(ClientError) as ei:
+            client.search_index(queryString="connectivity.connected:true")
+        assert ei.value.response["Error"]["Code"] == "InvalidQueryException"
+
+        _enable_fleet_indexing(client)
+        hit = client.search_index(queryString=f"thingName:{name}")["things"][0]
+        assert hit["connectivity"] == {"connected": False}
+        assert [
+            t["thingName"]
+            for t in client.search_index(
+                queryString=f"thingName:{name} AND connectivity.connected:false"
+            )["things"]
+        ] == [name]
+    finally:
+        client.delete_thing(thingName=name)
 
 
 def test_iot_search_index_registry_and_shadow(iot_client, iot_data_client):
@@ -847,7 +887,7 @@ def test_iot_search_index_returns_desired_and_reported_shadow(
 def test_iot_search_index_unsupported_query_rejected(iot_client):
     _enable_fleet_indexing(iot_client)
     for query in (
-        "connectivity.connected:true",
+        "connectivity.online:true",  # the group is closed; this leaf is a typo
         "NOT thingName:foo",
         "thingName:foo AND",  # a dangling AND is an error on AWS, not a no-op
         "AND thingName:foo",
@@ -1011,6 +1051,30 @@ def test_iot_search_index_numeric_shadow_values(iot_client, iot_data_client):
             iot_client.delete_thing(thingName=zeros)
     finally:
         iot_data_client.delete_thing_shadow(thingName=name)
+        iot_client.delete_thing(thingName=name)
+
+
+def test_iot_search_index_thing_that_never_connected_is_disconnected(iot_client):
+    _enable_fleet_indexing(iot_client)
+    name = f"searchthing-{uuid.uuid4().hex[:8]}-offline"
+    iot_client.create_thing(thingName=name)
+    try:
+        doc = iot_client.search_index(queryString=f"thingName:{name}")["things"][0]
+        assert doc["connectivity"] == {"connected": False}
+
+        found = iot_client.search_index(
+            queryString=f"thingName:{name} AND connectivity.connected:false"
+        )["things"]
+        assert [t["thingName"] for t in found] == [name]
+
+        # It has never disconnected either, so it matches no reason at all.
+        assert (
+            iot_client.search_index(
+                queryString=f"thingName:{name} AND connectivity.disconnectReason:*"
+            )["things"]
+            == []
+        )
+    finally:
         iot_client.delete_thing(thingName=name)
 
 
@@ -4593,6 +4657,175 @@ def test_ddb_attribute_value_mapping():
     assert _ddb_attribute_value({"a": 1}) == {"S": '{"a": 1}'}
     assert _ddb_attribute_value([1, 2]) == {"S": "[1, 2]"}
     assert _ddb_attribute_value("x") == {"S": "x"}
+# Fleet-index connectivity (white-box: transitions and persistence)
+# ----------------------------------------------------------------------
+
+from ministack.services.iot import (  # noqa: E402
+    _thing_connectivity,
+)
+from ministack.services.iot import (  # noqa: E402
+    get_state as _iot_get_state,
+)
+from ministack.services.iot import (  # noqa: E402
+    restore_state as _iot_restore_state,
+)
+
+_ACCT = "123456789012"
+
+
+def _connectivity_of(client_id):
+    return _thing_connectivity(_ACCT, _TEST_REGION, client_id)
+
+
+def test_connectivity_reports_connected_while_session_is_live():
+    reset()
+
+    async def _run():
+        send, _sent = _mock_send()
+        session = _WSSession(send, _ACCT)
+        await session.handle_packet(PKT_CONNECT, 0, _build_connect_body("dev-live"))
+        doc = _connectivity_of("dev-live")
+        assert doc["connected"] is True
+        assert doc["timestamp"] > 0
+        # A live session has no disconnect reason to report.
+        assert "disconnectReason" not in doc
+        await session.cleanup()
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_connectivity_disconnect_reason_distinguishes_clean_from_dropped():
+    reset()
+
+    async def _run():
+        send, _sent = _mock_send()
+        clean = _WSSession(send, _ACCT)
+        await clean.handle_packet(PKT_CONNECT, 0, _build_connect_body("dev-clean"))
+        await clean.handle_packet(PKT_DISCONNECT, 0, b"")
+        await clean.cleanup()
+        doc = _connectivity_of("dev-clean")
+        assert doc["connected"] is False
+        assert doc["disconnectReason"] == "CLIENT_INITIATED_DISCONNECT"
+
+        send2, _sent2 = _mock_send()
+        dropped = _WSSession(send2, _ACCT)
+        await dropped.handle_packet(PKT_CONNECT, 0, _build_connect_body("dev-dropped"))
+        # No DISCONNECT packet: the transport simply went away.
+        await dropped.cleanup()
+        assert _connectivity_of("dev-dropped")["disconnectReason"] == "CONNECTION_LOST"
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_connectivity_timestamp_advances_across_transitions():
+    reset()
+
+    async def _run():
+        send, _sent = _mock_send()
+        session = _WSSession(send, _ACCT)
+        await session.handle_packet(PKT_CONNECT, 0, _build_connect_body("dev-clock"))
+        connected_at = _connectivity_of("dev-clock")["timestamp"]
+        time.sleep(0.01)
+        await session.cleanup()
+        assert _connectivity_of("dev-clock")["timestamp"] > connected_at
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_connectivity_survives_takeover_by_a_duplicate_client_id():
+    """The loser's late second cleanup must not disconnect the live session.
+
+    Taking over a client id cleans the old session up once from the CONNECT
+    path; its socket close then drives the same session through cleanup again.
+    That second pass has to be a no-op, or the thing reads as offline while a
+    session is sitting there connected.
+    """
+    reset()
+
+    async def _run():
+        send1, _s1 = _mock_send()
+        first = _WSSession(send1, _ACCT)
+        await first.handle_packet(PKT_CONNECT, 0, _build_connect_body("dev-dup"))
+
+        send2, _s2 = _mock_send()
+        second = _WSSession(send2, _ACCT)
+        await second.handle_packet(PKT_CONNECT, 0, _build_connect_body("dev-dup"))
+        assert _connectivity_of("dev-dup")["connected"] is True
+
+        # The evicted session's own handler finally notices and cleans up.
+        await first.cleanup()
+        doc = _connectivity_of("dev-dup")
+        assert doc["connected"] is True
+        # The takeover is the transition that produced this live session, so
+        # the reason it ended the previous one survives the registration.
+        assert doc["disconnectReason"] == "DUPLICATE_CLIENTID"
+
+        await second.cleanup()
+        assert _connectivity_of("dev-dup")["connected"] is False
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_connectivity_reconnect_clears_the_previous_disconnect_reason():
+    """An ordinary reconnect is a transition of its own, so nothing lingers.
+
+    Only a takeover carries a reason onto the new session, because there the
+    eviction *is* the connect. A device that dropped and dialled back in gets
+    a clean record, not the ghost of how the last session died.
+    """
+    reset()
+
+    async def _run():
+        send1, _s1 = _mock_send()
+        first = _WSSession(send1, _ACCT)
+        await first.handle_packet(PKT_CONNECT, 0, _build_connect_body("dev-again"))
+        await first.cleanup()  # dropped: CONNECTION_LOST
+        assert _connectivity_of("dev-again")["disconnectReason"] == "CONNECTION_LOST"
+
+        send2, _s2 = _mock_send()
+        second = _WSSession(send2, _ACCT)
+        await second.handle_packet(PKT_CONNECT, 0, _build_connect_body("dev-again"))
+        doc = _connectivity_of("dev-again")
+        assert doc["connected"] is True
+        assert "disconnectReason" not in doc
+        await second.cleanup()
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_connectivity_is_not_persisted_and_cannot_restore_as_connected():
+    """A snapshot must not be able to claim a thing is online after a restart.
+
+    Nothing reconnects when the process comes back, so a restored ``connected:
+    true`` would be a claim with no session behind it.
+    """
+    reset()
+
+    async def _run():
+        send, _sent = _mock_send()
+        session = _WSSession(send, _ACCT)
+        await session.handle_packet(PKT_CONNECT, 0, _build_connect_body("dev-snap"))
+        assert _connectivity_of("dev-snap")["connected"] is True
+
+        snapshot = _iot_get_state()
+        assert "connectivity" not in json.dumps(snapshot["mqtt_broker"])
+
+        # Restart: state comes back, sessions do not.
+        await session.cleanup()
+        reset()
+        _iot_restore_state(snapshot)
+        doc = _connectivity_of("dev-snap")
+        assert doc["connected"] is False
+        # And nothing was invented to fill the gap.
+        assert "timestamp" not in doc
+
+    asyncio.run(_run())
+    reset()
 # ---------------------------------------------------------------------------
 # CA-certificate registry + JITR (registration code, RegisterCACertificate
 # and friends, and the $aws/events/certificates/registered/{caId} event)

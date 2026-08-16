@@ -548,6 +548,13 @@ def _validate_item(item: dict, pk_name: str | None = None, sk_name: str | None =
 # DynamoDB Streams: table_name -> list of stream records
 # Each record follows the DynamoDB Streams event format consumed by Lambda ESMs.
 _stream_records = AccountRegionScopedDict()
+
+
+def _stream_label() -> str:
+    """A DynamoDB stream label: ISO 8601 with millisecond precision and NO
+    trailing ``Z``, matching the form AWS puts in a stream ARN — e.g.
+    ``2015-05-11T21:21:33.291`` (not ``now_iso()``'s ``...291Z``)."""
+    return now_iso()[:-1]
 # Records dropped off the front of each table's stream, so a consumer's read
 # position stays an absolute index into the stream rather than an offset into
 # the surviving slice.
@@ -671,7 +678,7 @@ def _build_change_record(table: dict, event_name: str, old_item: dict | None, ne
             "SizeBytes": 0,
             "StreamViewType": view_type,
         },
-        "eventSourceARN": f"{table['TableArn']}/stream/{now_iso()}",
+        "eventSourceARN": f"{table['TableArn']}/stream/{_stream_label()}",
     }
 
     ref_item = new_item or old_item or {}
@@ -1229,7 +1236,7 @@ def _create_table(data):
             "MaxWriteRequestUnits": int(on_demand.get("MaxWriteRequestUnits", -1)),
         }
     if data.get("StreamSpecification"):
-        stream_label = now_iso()
+        stream_label = _stream_label()
         _tables[name]["LatestStreamLabel"] = stream_label
         _tables[name]["LatestStreamArn"] = f"{_tables[name]['TableArn']}/stream/{stream_label}"
     if data.get("Tags"):
@@ -1327,7 +1334,7 @@ def _update_table(data):
         stream_was_enabled = bool((table.get("StreamSpecification") or {}).get("StreamEnabled"))
         table["StreamSpecification"] = stream_spec
         if stream_spec.get("StreamEnabled") and not stream_was_enabled:
-            stream_label = now_iso()
+            stream_label = _stream_label()
             table["LatestStreamLabel"] = stream_label
             table["LatestStreamArn"] = f"{table['TableArn']}/stream/{stream_label}"
     if "SSESpecification" in data:

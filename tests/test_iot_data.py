@@ -1098,6 +1098,264 @@ def test_iot_rule_sns_action_publishes_to_topic(iot_client, iot_data_client, sns
     iot_client.delete_topic_rule(ruleName=rule)
 
 
+# ---------------------------------------------------------------------------
+# Fleet-index connectivity (a live MQTT session drives connectivity.*)
+# ---------------------------------------------------------------------------
+
+
+def _broker_ws_url() -> str:
+    parsed = urlparse(ENDPOINT)
+    return (
+        f"ws://prefix-ats.iot.us-east-1.{parsed.hostname or 'localhost'}"
+        f":{parsed.port or 4566}/mqtt"
+    )
+
+
+def _broker_ws_url_for(account: str, region: str = "us-east-1") -> str:
+    """A broker URL whose SigV4 credential scope picks account and region."""
+    parsed = urlparse(ENDPOINT)
+    cred = quote(f"{account}/20240101/{region}/iotdevicegateway/aws4_request")
+    return (
+        f"ws://prefix-ats.iot.{region}.{parsed.hostname or 'localhost'}"
+        f":{parsed.port or 4566}/mqtt"
+        f"?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={cred}"
+    )
+
+
+async def _mqtt_connect(client_id: str, url: str | None = None):
+    """Open an MQTT session and hold it. The caller closes the socket."""
+    ws = await websockets.connect(url or _broker_ws_url(), subprotocols=["mqtt"])
+    await ws.send(_make_connect(client_id))
+    await asyncio.wait_for(ws.recv(), timeout=2.0)  # CONNACK
+    return ws
+
+
+async def _mqtt_disconnect(ws, graceful: bool = True):
+    if graceful:
+        await ws.send(bytes([0xE0, 0x00]))  # DISCONNECT
+    await ws.close()
+
+
+def _enable_fleet_indexing(client) -> None:
+    """Fleet indexing with connectivity status on — the dashboard's config."""
+    client.update_indexing_configuration(
+        thingIndexingConfiguration={
+            "thingIndexingMode": "REGISTRY_AND_SHADOW",
+            "thingConnectivityIndexingMode": "STATUS",
+        }
+    )
+
+
+def _connectivity_for(iot_client, thing: str) -> dict:
+    hits = iot_client.search_index(queryString=f"thingName:{thing}")["things"]
+    assert len(hits) == 1, hits
+    return hits[0]["connectivity"]
+
+
+def _await_connected(iot_client, thing: str, want: bool, timeout: float = 5.0):
+    """Wait for the index to report the wanted state, then return the group."""
+    deadline = time.time() + timeout
+    doc = _connectivity_for(iot_client, thing)
+    while doc["connected"] is not want and time.time() < deadline:
+        time.sleep(0.05)
+        doc = _connectivity_for(iot_client, thing)
+    assert doc["connected"] is want, doc
+    return doc
+
+
+def test_search_index_finds_connected_thing_and_loses_it_on_disconnect(iot_client):
+    """`connectivity.connected:true` is the "which of my things are online" query."""
+    _enable_fleet_indexing(iot_client)
+    thing = _unique("conn").replace("-", "")
+    iot_client.create_thing(thingName=thing)
+
+    async def _run():
+        ws = await _mqtt_connect(thing)
+        try:
+            connected = _await_connected(iot_client, thing, True)
+            assert connected["timestamp"] > 0
+            online = iot_client.search_index(
+                queryString=f"thingName:{thing} AND connectivity.connected:true"
+            )["things"]
+            assert [t["thingName"] for t in online] == [thing]
+        finally:
+            await _mqtt_disconnect(ws)
+
+        offline = _await_connected(iot_client, thing, False)
+        assert offline["disconnectReason"] == "CLIENT_INITIATED_DISCONNECT"
+        assert (
+            iot_client.search_index(
+                queryString=f"thingName:{thing} AND connectivity.connected:true"
+            )["things"]
+            == []
+        )
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_client.delete_thing(thingName=thing)
+
+
+def test_search_index_connectivity_timestamp_moves_on_disconnect(iot_client):
+    _enable_fleet_indexing(iot_client)
+    thing = _unique("clock").replace("-", "")
+    iot_client.create_thing(thingName=thing)
+
+    async def _run():
+        ws = await _mqtt_connect(thing)
+        connected_at = _await_connected(iot_client, thing, True)["timestamp"]
+        time.sleep(0.05)
+        await _mqtt_disconnect(ws)
+        assert _await_connected(iot_client, thing, False)["timestamp"] > connected_at
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_client.delete_thing(thingName=thing)
+
+
+def test_search_index_connectivity_is_tied_to_the_client_id(iot_client):
+    """A session under another client id is not this thing's connectivity.
+
+    AWS keys connectivity on the MQTT client id, so a device that connects as
+    something other than the thing name leaves the thing offline — which is the
+    honest answer, since nothing links the two.
+    """
+    _enable_fleet_indexing(iot_client)
+    thing = _unique("assoc").replace("-", "")
+    iot_client.create_thing(thingName=thing)
+
+    async def _run():
+        ws = await _mqtt_connect(thing + "other")
+        try:
+            assert _connectivity_for(iot_client, thing)["connected"] is False
+        finally:
+            await _mqtt_disconnect(ws)
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_client.delete_thing(thingName=thing)
+
+
+def test_search_index_connectivity_reports_a_dropped_transport(iot_client):
+    _enable_fleet_indexing(iot_client)
+    thing = _unique("drop").replace("-", "")
+    iot_client.create_thing(thingName=thing)
+
+    async def _run():
+        ws = await _mqtt_connect(thing)
+        _await_connected(iot_client, thing, True)
+        # Close without sending DISCONNECT: the broker only sees the socket go.
+        await _mqtt_disconnect(ws, graceful=False)
+        assert _await_connected(iot_client, thing, False)[
+            "disconnectReason"
+        ] == "CONNECTION_LOST"
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_client.delete_thing(thingName=thing)
+
+
+def test_search_index_reports_duplicate_client_id_after_a_takeover(iot_client):
+    """A takeover is visible in the index: the thing stays online, with the
+    reason the session it replaced was evicted.
+
+    This is the only surface DUPLICATE_CLIENTID has here, and it is the whole
+    point of recording it: the eviction and the winning session's connect are
+    one transition, so the reason describes how the current state came about.
+    """
+    _enable_fleet_indexing(iot_client)
+    thing = _unique("takeover").replace("-", "")
+    iot_client.create_thing(thingName=thing)
+
+    async def _run():
+        first = await _mqtt_connect(thing)
+        _await_connected(iot_client, thing, True)
+        second = await _mqtt_connect(thing)  # same client id: a takeover
+        try:
+            deadline = time.time() + 5
+            doc = _connectivity_for(iot_client, thing)
+            while doc.get("disconnectReason") is None and time.time() < deadline:
+                time.sleep(0.05)
+                doc = _connectivity_for(iot_client, thing)
+            assert doc["connected"] is True, doc
+            assert doc["disconnectReason"] == "DUPLICATE_CLIENTID", doc
+
+            found = iot_client.search_index(
+                queryString=(
+                    f"thingName:{thing} AND "
+                    "connectivity.disconnectReason:DUPLICATE_CLIENTID"
+                )
+            )["things"]
+            assert [t["thingName"] for t in found] == [thing]
+        finally:
+            try:
+                await first.close()  # the broker already closed it
+            except Exception:
+                pass
+            await _mqtt_disconnect(second)
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_client.delete_thing(thingName=thing)
+
+
+def test_search_index_connectivity_is_isolated_across_accounts_and_regions():
+    """A session in another account or region is not this thing's connectivity.
+
+    The broker keys sessions by (account, region, client id); the index has to
+    read the same key, or a device connecting in eu-west-1 would light up a
+    same-named thing in us-east-1.
+    """
+    import boto3
+    from botocore.config import Config
+
+    account = f"{uuid.uuid4().int % 10**12:012d}"
+    other_account = f"{uuid.uuid4().int % 10**12:012d}"
+
+    def _client(account_id, region="us-east-1"):
+        return boto3.client(
+            "iot",
+            endpoint_url=ENDPOINT,
+            aws_access_key_id=account_id,
+            aws_secret_access_key="test",
+            region_name=region,
+            config=Config(retries={"mode": "standard"}),
+        )
+
+    owner = _client(account)
+    owner_eu = _client(account, "eu-west-1")
+    for client in (owner, owner_eu):
+        _enable_fleet_indexing(client)
+
+    thing = _unique("iso").replace("-", "")
+    owner.create_thing(thingName=thing)
+    owner_eu.create_thing(thingName=thing)
+
+    async def _run():
+        # Same client id, different account: the owner's thing stays offline.
+        ws = await _mqtt_connect(thing, _broker_ws_url_for(other_account))
+        try:
+            assert _connectivity_for(owner, thing)["connected"] is False
+        finally:
+            await _mqtt_disconnect(ws)
+
+        # Same account, different region: still not this thing.
+        ws = await _mqtt_connect(thing, _broker_ws_url_for(account, "eu-west-1"))
+        try:
+            assert _await_connected(owner_eu, thing, True)["connected"] is True
+            assert _connectivity_for(owner, thing)["connected"] is False
+        finally:
+            await _mqtt_disconnect(ws)
+
+    try:
+        asyncio.run(_run())
+    finally:
+        owner.delete_thing(thingName=thing)
+        owner_eu.delete_thing(thingName=thing)
 def test_iot_jitr_registration_event_drives_a_topic_rule(iot_client, lam, sqs):
     """The JITR lifecycle event is a real broker publish, so a topic rule on
     ``$aws/events/certificates/registered/{caId}`` hands it to a Lambda — the
