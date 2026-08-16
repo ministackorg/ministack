@@ -10,6 +10,7 @@ import urllib.error
 import urllib.request
 import uuid as _uuid_mod
 import zipfile
+import zlib
 from urllib.parse import parse_qs as _parse_qs
 from urllib.parse import urlencode as _urlencode
 from urllib.parse import urlparse
@@ -7076,3 +7077,195 @@ def test_custom_auth_admin_first_create_receives_empty_session(cognito_idp, lam)
         ChallengeResponses={"ANSWER": "123456", "USERNAME": "user@example.com"},
     )
     assert "AuthenticationResult" in step3
+
+
+# ===========================================================================
+# CUSTOM USER POOL DOMAINS
+#
+# The SAML ACS URL and the OIDC federation callback are built from the pool's
+# configured domain, the way AWS does it — not from an env var and not from the
+# request's Host header. A custom domain is `https://` because TLS for it is
+# terminated externally (nginx, an ALB, CloudFront) and proxied to the gateway;
+# MiniStack records the certificate but never serves it.
+# ===========================================================================
+
+_CUSTOM_CERT_ARN = (
+    "arn:aws:acm:us-east-1:000000000000:certificate/"
+    "11111111-2222-3333-4444-555555555555"
+)
+
+
+def _pool_unique_domain(pid, label="auth"):
+    """A domain unique to this pool — _pool_domain_map outlives a single test."""
+    return f"{label}.{pid.split('_', 1)[1].lower()}.example.com"
+
+
+def test_cognito_custom_domain_create_and_describe(cognito_idp):
+    """CustomDomainConfig marks the domain custom: served as-is, fronted by CloudFront."""
+    pid = cognito_idp.create_user_pool(PoolName="CustomDomainPool")["UserPool"]["Id"]
+    domain = _pool_unique_domain(pid)
+    resp = cognito_idp.create_user_pool_domain(
+        UserPoolId=pid, Domain=domain,
+        CustomDomainConfig={"CertificateArn": _CUSTOM_CERT_ARN},
+    )
+    # A custom domain gets a CloudFront distribution, never the regional prefix host.
+    assert resp["CloudFrontDomain"].endswith(".cloudfront.net"), resp["CloudFrontDomain"]
+    assert ".amazoncognito.com" not in resp["CloudFrontDomain"]
+
+    dd = cognito_idp.describe_user_pool_domain(Domain=domain)["DomainDescription"]
+    assert dd["UserPoolId"] == pid
+    assert dd["Status"] == "ACTIVE"
+    assert dd["CustomDomainConfig"] == {"CertificateArn": _CUSTOM_CERT_ARN}
+    assert dd["CloudFrontDistribution"] == resp["CloudFrontDomain"]
+
+    # AWS surfaces a custom domain as `CustomDomain`; `Domain` stays the prefix slot.
+    pool = cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]
+    assert pool.get("CustomDomain") == domain
+    assert not pool.get("Domain")
+
+
+def test_cognito_prefix_domain_unchanged_by_custom_domain_support(cognito_idp):
+    """Regression: no CustomDomainConfig still means a prefix domain that expands."""
+    pid = cognito_idp.create_user_pool(PoolName="PrefixDomainPool")["UserPool"]["Id"]
+    domain = f"prefix-{pid.split('_', 1)[1].lower()}"
+    resp = cognito_idp.create_user_pool_domain(UserPoolId=pid, Domain=domain)
+    assert resp["CloudFrontDomain"] == f"{domain}.auth.us-east-1.amazoncognito.com"
+
+    dd = cognito_idp.describe_user_pool_domain(Domain=domain)["DomainDescription"]
+    assert dd["CloudFrontDistribution"] == f"{domain}.auth.us-east-1.amazoncognito.com"
+    assert dd["CustomDomainConfig"] == {}
+
+    pool = cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]
+    assert pool.get("Domain") == domain
+    assert not pool.get("CustomDomain")
+
+
+def test_cognito_custom_domain_requires_certificate_arn(cognito_idp):
+    """A CustomDomainConfig carrying no CertificateArn is rejected, as on AWS.
+
+    Sent raw: botocore enforces the member's 20-char minimum client-side, so this
+    only reaches the server from a hand-rolled caller or another SDK. Rejecting it
+    keeps a malformed body from being stored as a usable custom domain.
+    """
+    pid = cognito_idp.create_user_pool(PoolName="NoCertPool")["UserPool"]["Id"]
+    for bad_config in ({}, {"CertificateArn": ""}, "not-a-struct"):
+        request = urllib.request.Request(
+            ENDPOINT,
+            data=json.dumps({
+                "UserPoolId": pid,
+                "Domain": _pool_unique_domain(pid, "nocert"),
+                "CustomDomainConfig": bad_config,
+            }).encode(),
+            headers={
+                "Content-Type": "application/x-amz-json-1.1",
+                "X-Amz-Target": "AWSCognitoIdentityProviderService.CreateUserPoolDomain",
+            },
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(request, timeout=10)
+        assert exc.value.code == 400
+        assert json.loads(exc.value.read())["__type"].endswith("InvalidParameterException")
+
+    # Nothing was registered, so the domain is still free.
+    assert cognito_idp.describe_user_pool_domain(
+        Domain=_pool_unique_domain(pid, "nocert"))["DomainDescription"] == {}
+
+
+def test_cognito_pool_holds_prefix_and_custom_domain_independently(cognito_idp):
+    """A pool may have both; deleting one must not clear the other."""
+    pid = cognito_idp.create_user_pool(PoolName="BothDomainsPool")["UserPool"]["Id"]
+    prefix = f"both-{pid.split('_', 1)[1].lower()}"
+    custom = _pool_unique_domain(pid, "both")
+    cognito_idp.create_user_pool_domain(UserPoolId=pid, Domain=prefix)
+    cognito_idp.create_user_pool_domain(
+        UserPoolId=pid, Domain=custom,
+        CustomDomainConfig={"CertificateArn": _CUSTOM_CERT_ARN},
+    )
+
+    cognito_idp.delete_user_pool_domain(UserPoolId=pid, Domain=custom)
+    pool = cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]
+    assert not pool.get("CustomDomain")
+    assert pool.get("Domain") == prefix, "deleting the custom domain dropped the prefix one"
+    assert cognito_idp.describe_user_pool_domain(Domain=custom)["DomainDescription"] == {}
+    assert cognito_idp.describe_user_pool_domain(
+        Domain=prefix)["DomainDescription"]["UserPoolId"] == pid
+
+
+def test_cognito_federation_urls_follow_pool_domain():
+    """The ACS / OIDC-callback base is the pool's domain, with the gateway as fallback."""
+    mod = _cognito_module()
+
+    # No domain configured — unchanged behaviour, the local gateway.
+    bare = {"Id": "us-east-1_abc123"}
+    assert mod._acs_url(bare) == f"{_advertised_endpoint()}/saml2/idpresponse"
+    assert mod._oidc_callback_url(bare) == f"{_advertised_endpoint()}/oauth2/idpresponse"
+
+    # Prefix domain — expands to the regional host, region read from the pool id.
+    prefix = {"Id": "eu-central-1_abc123", "Domain": "my-prefix"}
+    assert mod._oidc_callback_url(prefix) == (
+        "https://my-prefix.auth.eu-central-1.amazoncognito.com/oauth2/idpresponse")
+
+    # Custom domain wins over the prefix, and carries no port.
+    custom = {"Id": "us-east-1_abc123", "Domain": "my-prefix",
+              "CustomDomain": "auth.example.com"}
+    assert mod._acs_url(custom) == "https://auth.example.com/saml2/idpresponse"
+    assert mod._oidc_callback_url(custom) == "https://auth.example.com/oauth2/idpresponse"
+
+
+def test_cognito_oidc_authorize_redirect_uri_uses_custom_domain(cognito_idp):
+    """The redirect_uri handed to an external IdP is the pool's custom domain.
+
+    This is the flow that fails behind an external TLS terminator when the URL is
+    built from the internal host: a public IdP rejects `http://localhost:4566/...`.
+    """
+    token_url, _recorded, stop = _start_fake_oidc_idp({"sub": "ignored"})
+    try:
+        pid, cid = _setup_oidc_pool(cognito_idp, token_url)
+        domain = _pool_unique_domain(pid, "oidc")
+        cognito_idp.create_user_pool_domain(
+            UserPoolId=pid, Domain=domain,
+            CustomDomainConfig={"CertificateArn": _CUSTOM_CERT_ARN},
+        )
+        url = (
+            f"{ENDPOINT}/oauth2/authorize?"
+            f"response_type=code&client_id={cid}"
+            f"&redirect_uri=http://localhost:3000/callback"
+            f"&identity_provider=TestOIDC&state=mystate&scope=openid"
+        )
+        try:
+            _no_redirect_opener.open(url)
+            assert False, "Expected 302"
+        except urllib.error.HTTPError as e:
+            assert e.code == 302
+            location = e.headers.get("Location", "")
+        qs = _parse_qs(urlparse(location).query)
+        assert qs["redirect_uri"] == [f"https://{domain}/oauth2/idpresponse"]
+    finally:
+        stop()
+
+
+def test_cognito_saml_authn_request_acs_uses_custom_domain(cognito_idp):
+    """The AuthnRequest's AssertionConsumerServiceURL follows the custom domain."""
+    pid, cid = _setup_saml_pool(cognito_idp)
+    domain = _pool_unique_domain(pid, "saml")
+    cognito_idp.create_user_pool_domain(
+        UserPoolId=pid, Domain=domain,
+        CustomDomainConfig={"CertificateArn": _CUSTOM_CERT_ARN},
+    )
+    url = (
+        f"{ENDPOINT}/oauth2/authorize?"
+        f"response_type=code&client_id={cid}"
+        f"&redirect_uri=http://localhost:3000/callback"
+        f"&identity_provider=TestSAML&state=mystate&scope=openid"
+    )
+    try:
+        _no_redirect_opener.open(url)
+        assert False, "Expected 302"
+    except urllib.error.HTTPError as e:
+        location = e.headers.get("Location", "")
+    saml_request = _parse_qs(urlparse(location).query)["SAMLRequest"][0]
+    # Raw deflate per the SAML HTTP-Redirect binding.
+    xml = zlib.decompress(base64.b64decode(saml_request), -15).decode()
+    assert f'AssertionConsumerServiceURL="https://{domain}/saml2/idpresponse"' in xml
+    assert f'urn:amazon:cognito:sp:{pid}' in xml

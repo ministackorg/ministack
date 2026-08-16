@@ -1529,27 +1529,55 @@ def _invoke_verify_auth_challenge_trigger(pool_id: str, client_id: str, username
 # SAML / OAuth2 helpers
 # ---------------------------------------------------------------------------
 
-def _acs_url() -> str:
-    """Assertion Consumer Service URL for SAML responses."""
-    return f"http://{_MINISTACK_HOST}:{_MINISTACK_PORT}/saml2/idpresponse"
+def _pool_domain_base_url(pool: dict) -> str:
+    """Public base URL of the user pool's Cognito domain, or "" when it has none.
+
+    A custom domain (one created with `CustomDomainConfig`) is served on its own
+    FQDN; a prefix domain expands to the regional Cognito host. This is how AWS
+    builds the federation endpoints — from the configured domain, not from the
+    request headers.
+
+    Both forms are `https://`, as on AWS. MiniStack does not itself terminate TLS
+    for them: a custom domain is expected to be fronted by whatever terminates it
+    externally (nginx, an ALB, CloudFront) and proxied back to the gateway, which
+    is exactly the topology the domain exists to describe. The certificate named
+    in `CustomDomainConfig.CertificateArn` is recorded, never served.
+    """
+    if pool.get("CustomDomain"):
+        return f"https://{pool['CustomDomain']}"
+    if pool.get("Domain"):
+        return f"https://{pool['Domain']}.auth.{_pool_region(pool.get('Id', ''))}.amazoncognito.com"
+    return ""
 
 
-def _oidc_callback_url() -> str:
+def _acs_url(pool: dict) -> str:
+    """Assertion Consumer Service URL for SAML responses.
+
+    AWS serves this at `https://{user pool domain}/saml2/idpresponse`. A pool with
+    no domain configured falls back to the local gateway, which is all a
+    non-federated setup ever needs.
+    """
+    base = _pool_domain_base_url(pool) or f"http://{_MINISTACK_HOST}:{_MINISTACK_PORT}"
+    return f"{base}/saml2/idpresponse"
+
+
+def _oidc_callback_url(pool: dict) -> str:
     """OIDC callback URL — external OIDC IdPs redirect back here with `code`+`state`."""
-    return f"http://{_MINISTACK_HOST}:{_MINISTACK_PORT}/oauth2/idpresponse"
+    base = _pool_domain_base_url(pool) or f"http://{_MINISTACK_HOST}:{_MINISTACK_PORT}"
+    return f"{base}/oauth2/idpresponse"
 
 
-def _build_saml_authn_request(pool_id: str, destination: str) -> str:
+def _build_saml_authn_request(pool: dict, destination: str) -> str:
     """Build a minimal SAML AuthnRequest, deflate + base64-encode for HTTP-Redirect binding."""
     req = Element("{urn:oasis:names:tc:SAML:2.0:protocol}AuthnRequest")
     req.set("ID", "_" + new_uuid())
     req.set("Version", "2.0")
     req.set("IssueInstant", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
-    req.set("AssertionConsumerServiceURL", _acs_url())
+    req.set("AssertionConsumerServiceURL", _acs_url(pool))
     req.set("Destination", destination)
     req.set("ProtocolBinding", "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST")
     issuer = SubElement(req, "{urn:oasis:names:tc:SAML:2.0:assertion}Issuer")
-    issuer.text = f"urn:amazon:cognito:sp:{pool_id}"
+    issuer.text = f"urn:amazon:cognito:sp:{pool.get('Id', '')}"
     xml_bytes = xml_tostring(req, encoding="unicode").encode("utf-8")
     # Raw deflate (strip zlib header/checksum) per SAML HTTP-Redirect binding
     deflated = zlib.compress(xml_bytes)[2:-4]
@@ -1973,6 +2001,7 @@ def _create_user_pool(data):
         "DeletionProtection": data.get("DeletionProtection", "INACTIVE"),
         "LambdaConfig": data.get("LambdaConfig", {}),
         "Domain": None,
+        "CustomDomain": None,
         "_clients": {},
         "_users": {},
         "_groups": {},
@@ -1997,8 +2026,9 @@ def _delete_user_pool(data):
     pool, err = _resolve_pool(pid)
     if err:
         return err
-    if pool.get("Domain"):
-        _pool_domain_map.pop(pool["Domain"], None)
+    for configured in (pool.get("Domain"), pool.get("CustomDomain")):
+        if configured:
+            _pool_domain_map.pop(configured, None)
     del _user_pools[pid]
     return json_response({})
 
@@ -3859,6 +3889,16 @@ def _list_users_in_group(data):
 # DOMAIN
 # ===========================================================================
 
+def _cloudfront_domain(domain: str) -> str:
+    """Deterministic CloudFront distribution domain fronting a custom domain."""
+    return f"d{hashlib.sha256(domain.encode()).hexdigest()[:13]}.cloudfront.net"
+
+
+def _prefix_domain_host(domain: str, pid: str) -> str:
+    """Regional Cognito host a prefix domain expands to."""
+    return f"{domain}.auth.{_pool_region(pid)}.amazoncognito.com"
+
+
 def _create_user_pool_domain(data):
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
@@ -3869,9 +3909,24 @@ def _create_user_pool_domain(data):
         return error_response_json("InvalidParameterException", "Domain is required.", 400)
     if domain in _pool_domain_map:
         return error_response_json("InvalidParameterException", f"Domain {domain} already exists.", 400)
-    pool["Domain"] = domain
+    # CustomDomainConfig is what separates the two kinds of domain: supplied means
+    # `Domain` is a full FQDN served as-is, omitted means it is a bare prefix AWS
+    # expands to {prefix}.auth.{region}.amazoncognito.com. A pool may hold one of
+    # each, so they are stored in separate fields.
+    custom_config = data.get("CustomDomainConfig")
+    if custom_config is not None:
+        if not isinstance(custom_config, dict) or not custom_config.get("CertificateArn"):
+            return error_response_json(
+                "InvalidParameterException",
+                "CustomDomainConfig must specify a CertificateArn.", 400)
+        pool["CustomDomain"] = domain
+        pool["_custom_domain_config"] = custom_config
+        cloudfront = _cloudfront_domain(domain)
+    else:
+        pool["Domain"] = domain
+        cloudfront = _prefix_domain_host(domain, pid)
     _pool_domain_map[domain] = pid
-    return json_response({"CloudFrontDomain": f"{domain}.auth.{_pool_region(pid)}.amazoncognito.com"})
+    return json_response({"CloudFrontDomain": cloudfront})
 
 
 def _delete_user_pool_domain(data):
@@ -3881,7 +3936,11 @@ def _delete_user_pool_domain(data):
         return err
     domain = data.get("Domain")
     _pool_domain_map.pop(domain, None)
-    pool["Domain"] = None
+    if domain and pool.get("CustomDomain") == domain:
+        pool["CustomDomain"] = None
+        pool.pop("_custom_domain_config", None)
+    else:
+        pool["Domain"] = None
     return json_response({})
 
 
@@ -3891,16 +3950,18 @@ def _describe_user_pool_domain(data):
     if not pid:
         return json_response({"DomainDescription": {}})
     pool = _user_pools.get(pid, {})
+    is_custom = pool.get("CustomDomain") == domain
     return json_response({
         "DomainDescription": {
             "UserPoolId": pid,
             "AWSAccountId": get_account_id(),
             "Domain": domain,
             "S3Bucket": "",
-            "CloudFrontDistribution": f"{domain}.auth.{_pool_region(pid)}.amazoncognito.com",
+            "CloudFrontDistribution": (_cloudfront_domain(domain) if is_custom
+                                       else _prefix_domain_host(domain, pid)),
             "Version": "1",
             "Status": "ACTIVE",
-            "CustomDomainConfig": {},
+            "CustomDomainConfig": pool.get("_custom_domain_config", {}) if is_custom else {},
         }
     })
 
@@ -4465,7 +4526,7 @@ def _oauth2_authorize_federation(query_params):
         if not sso_url:
             return error_response_json("InvalidParameterException",
                                        "SAML provider has no IDPSSOEndpoint or MetadataURL.", 400)
-        saml_request = _build_saml_authn_request(pool_id, sso_url)
+        saml_request = _build_saml_authn_request(pool, sso_url)
         redirect_url = sso_url + ("&" if "?" in sso_url else "?") + urlencode({
             "SAMLRequest": saml_request,
             "RelayState": relay_key,
@@ -4481,7 +4542,7 @@ def _oauth2_authorize_federation(query_params):
         redirect_url = authorize_url + ("&" if "?" in authorize_url else "?") + urlencode({
             "response_type": response_type or "code",
             "client_id": oidc_client_id,
-            "redirect_uri": _oidc_callback_url(),
+            "redirect_uri": _oidc_callback_url(pool),
             "scope": details.get("authorize_scopes", scope),
             "state": relay_key,
         })
@@ -4783,7 +4844,7 @@ def _oauth2_idp_response(method, body, query_params):
     token_body = urlencode({
         "grant_type": "authorization_code",
         "code": code,
-        "redirect_uri": _oidc_callback_url(),
+        "redirect_uri": _oidc_callback_url(pool),
         "client_id": oidc_client_id,
         "client_secret": oidc_client_secret,
     }).encode("ascii")
