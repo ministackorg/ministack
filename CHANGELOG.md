@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Cognito — federation endpoints are built from the user pool's domain, and `CustomDomainConfig` is honored** — `CreateUserPoolDomain` accepted `CustomDomainConfig` and discarded it, always expanding `Domain` to `{Domain}.auth.{region}.amazoncognito.com`, while the SAML ACS URL and the OIDC federation callback ignored the domain entirely and were built from `MINISTACK_HOST`/`GATEWAY_PORT`. Federated sign-in therefore handed external identity providers `redirect_uri=http://localhost:4566/oauth2/idpresponse` — an address the browser cannot reach and that Google and other public IdPs reject outright for the scheme alone — so the flow died at the hop to the IdP with no way to correct it. `CustomDomainConfig` now distinguishes a custom domain (a full FQDN, served as-is and reported as `CustomDomain` on `DescribeUserPool`, fronted by a CloudFront distribution) from a prefix domain (a bare label, still expanded to the regional host), and `/saml2/idpresponse` and `/oauth2/idpresponse` — including the `AssertionConsumerServiceURL` in the generated SAML `AuthnRequest` and the `redirect_uri` replayed on the back-channel token exchange — are derived from whichever the pool has, exactly as AWS derives them. Configuring a custom domain is the same `create-user-pool-domain --custom-domain-config CertificateArn=...` call you would make against AWS; the certificate is recorded, not served, since TLS for a custom domain is terminated by whatever fronts it (nginx, an ALB, CloudFront) and proxied to the gateway. A pool holds one domain of each kind independently, a `CustomDomainConfig` without a `CertificateArn` is a `InvalidParameterException`, and a pool with no domain still falls back to the local gateway, so existing setups are unchanged.
+
 ## [1.4.18] — 2026-08-16
 
 ### Added

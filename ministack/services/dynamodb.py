@@ -1323,7 +1323,13 @@ def _update_table(data):
             existing_ad[ad["AttributeName"]] = ad
         table["AttributeDefinitions"] = list(existing_ad.values())
     if "StreamSpecification" in data:
-        table["StreamSpecification"] = data["StreamSpecification"]
+        stream_spec = data["StreamSpecification"]
+        stream_was_enabled = bool((table.get("StreamSpecification") or {}).get("StreamEnabled"))
+        table["StreamSpecification"] = stream_spec
+        if stream_spec.get("StreamEnabled") and not stream_was_enabled:
+            stream_label = now_iso()
+            table["LatestStreamLabel"] = stream_label
+            table["LatestStreamArn"] = f"{table['TableArn']}/stream/{stream_label}"
     if "SSESpecification" in data:
         # Terraform v6 calls UpdateTable(SSESpecification=...) on warm boots
         # when it sees the legacy shape in state (#411). Convert to the
