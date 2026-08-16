@@ -4283,7 +4283,6 @@ async def broker_publish(
                     break
 
     await _evaluate_topic_rules(account_id, region, topic, payload, client_id)
-    return delivered
 
     # Shadow-over-MQTT bridge — AFTER delivery and rule evaluation, so rules
     # matching `$aws/things/+/shadow/update` fire on the request, and the
@@ -4305,6 +4304,8 @@ async def broker_publish(
             _broker_logger.warning(
                 "IoT shadow bridge failed for %r", topic, exc_info=True
             )
+
+    return delivered
 
 
 async def broker_subscribe(
@@ -4933,7 +4934,10 @@ class _WSSession:
         props += [
             (PROP_MAXIMUM_QOS, 1),
             (PROP_RETAIN_AVAILABLE, 1),
-            (PROP_MAXIMUM_PACKET_SIZE, _max_frame_buffer_bytes()),
+            # AWS IoT caps Maximum Packet Size at 128 KB and never advertises
+            # more; clamp the WS transport frame buffer down to it so a client
+            # sized off this CONNACK never sends a packet real AWS would reject.
+            (PROP_MAXIMUM_PACKET_SIZE, min(_max_frame_buffer_bytes(), 128 * 1024)),
             (PROP_TOPIC_ALIAS_MAXIMUM, 0),
             (PROP_WILDCARD_SUBSCRIPTION_AVAILABLE, 1),
             (PROP_SUBSCRIPTION_IDENTIFIER_AVAILABLE, 0),
