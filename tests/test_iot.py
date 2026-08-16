@@ -4776,6 +4776,12 @@ def test_iot_jitr_registered_event_published_when_auto_registration_enabled():
             json.loads(body)["certificateDescription"]["caCertificateId"] == ca_id
         )
 
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        iot_module.broker_reset()
+
 
 # ----------------------------------------------------------------------
 # Shadow-over-MQTT bridge (white-box).
@@ -5009,6 +5015,11 @@ def test_shadow_mqtt_update_rejections():
 
     try:
         asyncio.run(_run())
+        assert len(rejected) == 2
+        assert rejected[0]["code"] == 400
+        assert "clientToken" not in rejected[0]
+        assert rejected[1]["code"] == 409
+        assert rejected[1]["clientToken"] == "t9"
     finally:
         iot_module.reset()
         iot_module.broker_reset()
@@ -5381,17 +5392,6 @@ def test_iot_update_ca_certificate_rejects_invalid_enum_values(iot_client):
         assert desc["autoRegistrationStatus"] == "DISABLE"
     finally:
         iot_client.delete_ca_certificate(certificateId=ca_id)
-        assert len(rejected) == 2
-        assert rejected[0]["code"] == 400
-        assert "clientToken" not in rejected[0]
-        assert rejected[1]["code"] == 409
-        assert rejected[1]["clientToken"] == "t9"
-
-    try:
-        asyncio.run(_run())
-    finally:
-        iot_module._shadows.clear()
-        reset()
 
 
 def test_shadow_mqtt_get_delete_roundtrip():
