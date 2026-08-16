@@ -415,7 +415,8 @@ def test_cognito_admin_add_remove_user_from_group(cognito_idp):
 def test_cognito_domain_crud(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="DomainPool")["UserPool"]["Id"]
     resp = cognito_idp.create_user_pool_domain(UserPoolId=pid, Domain="my-test-domain")
-    assert "CloudFrontDomain" in resp
+    # Prefix domain: AWS returns a null CloudFrontDomain (no alias target).
+    assert "CloudFrontDomain" not in resp
 
     desc = cognito_idp.describe_user_pool_domain(Domain="my-test-domain")
     assert desc["DomainDescription"]["UserPoolId"] == pid
@@ -5432,13 +5433,13 @@ def test_cognito_user_pool_domain_cloudfront_uses_pool_region():
 
     domain = f"domain-region-{pid.split('_', 1)[1].lower()}"
     create_resp = client.create_user_pool_domain(Domain=domain, UserPoolId=pid)
-    assert create_resp["CloudFrontDomain"].endswith(".auth.eu-central-1.amazoncognito.com"), (
-        create_resp["CloudFrontDomain"]
-    )
+    # A prefix domain has no CloudFront alias target — AWS returns a null
+    # CloudFrontDomain (and an empty CloudFrontDistribution on describe).
+    assert not create_resp.get("CloudFrontDomain"), create_resp.get("CloudFrontDomain")
     desc_resp = client.describe_user_pool_domain(Domain=domain)
-    assert desc_resp["DomainDescription"]["CloudFrontDistribution"].endswith(
-        ".auth.eu-central-1.amazoncognito.com"
-    ), desc_resp["DomainDescription"]["CloudFrontDistribution"]
+    assert desc_resp["DomainDescription"]["CloudFrontDistribution"] == "", (
+        desc_resp["DomainDescription"]["CloudFrontDistribution"]
+    )
 
 
 def test_cognito_email_disabled_env_skips_send(cognito_idp, monkeypatch):
@@ -7129,10 +7130,11 @@ def test_cognito_prefix_domain_unchanged_by_custom_domain_support(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="PrefixDomainPool")["UserPool"]["Id"]
     domain = f"prefix-{pid.split('_', 1)[1].lower()}"
     resp = cognito_idp.create_user_pool_domain(UserPoolId=pid, Domain=domain)
-    assert resp["CloudFrontDomain"] == f"{domain}.auth.us-east-1.amazoncognito.com"
+    # Prefix domain: AWS returns a null CloudFrontDomain (no alias target).
+    assert not resp.get("CloudFrontDomain")
 
     dd = cognito_idp.describe_user_pool_domain(Domain=domain)["DomainDescription"]
-    assert dd["CloudFrontDistribution"] == f"{domain}.auth.us-east-1.amazoncognito.com"
+    assert dd["CloudFrontDistribution"] == ""
     assert dd["CustomDomainConfig"] == {}
 
     pool = cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]

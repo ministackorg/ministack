@@ -1819,6 +1819,43 @@ def test_cfn_lambda_url_uses_function_url_state(cfn, lam):
     )["FunctionUrlConfigs"] == []
 
 
+def test_cfn_lambda_image_package_type(cfn, lam):
+    """AWS::Lambda::Function with PackageType=Image is created as an image, not a Zip."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-lambda-image-{suffix}"
+    function_name = f"cfn-image-{suffix}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Function": {
+                "Type": "AWS::Lambda::Function",
+                "Properties": {
+                    "FunctionName": function_name,
+                    "PackageType": "Image",
+                    "Role": "arn:aws:iam::000000000000:role/lambda-role",
+                    "Code": {"ImageUri": "public.ecr.aws/lambda/python:3.12"},
+                    "ImageConfig": {"Command": ["app.handler"]},
+                },
+            },
+        },
+    }
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    got = lam.get_function(FunctionName=function_name)
+    config = got["Configuration"]
+    assert config["PackageType"] == "Image"
+    assert got["Code"]["ImageUri"] == "public.ecr.aws/lambda/python:3.12"
+    # An image package carries no Runtime/Handler on AWS.
+    assert not config.get("Runtime")
+    assert not config.get("Handler")
+    assert config["ImageConfigResponse"] == {"ImageConfig": {"Command": ["app.handler"]}}
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
 def test_cfn_lambda_permission_qualified_arn_uses_base_function_policy(cfn, lam):
     """Qualified FunctionName refs should add permission to the base function policy."""
     suffix = _uuid_mod.uuid4().hex[:8]

@@ -3894,11 +3894,6 @@ def _cloudfront_domain(domain: str) -> str:
     return f"d{hashlib.sha256(domain.encode()).hexdigest()[:13]}.cloudfront.net"
 
 
-def _prefix_domain_host(domain: str, pid: str) -> str:
-    """Regional Cognito host a prefix domain expands to."""
-    return f"{domain}.auth.{_pool_region(pid)}.amazoncognito.com"
-
-
 def _create_user_pool_domain(data):
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
@@ -3924,9 +3919,11 @@ def _create_user_pool_domain(data):
         cloudfront = _cloudfront_domain(domain)
     else:
         pool["Domain"] = domain
-        cloudfront = _prefix_domain_host(domain, pid)
+        # A prefix (Amazon Cognito) domain has no CloudFront alias target to
+        # CNAME to, so AWS returns a null CloudFrontDomain for it — omit it.
+        cloudfront = None
     _pool_domain_map[domain] = pid
-    return json_response({"CloudFrontDomain": cloudfront})
+    return json_response({"CloudFrontDomain": cloudfront} if cloudfront else {})
 
 
 def _delete_user_pool_domain(data):
@@ -3939,7 +3936,7 @@ def _delete_user_pool_domain(data):
     if domain and pool.get("CustomDomain") == domain:
         pool["CustomDomain"] = None
         pool.pop("_custom_domain_config", None)
-    else:
+    elif domain and pool.get("Domain") == domain:
         pool["Domain"] = None
     return json_response({})
 
@@ -3957,8 +3954,10 @@ def _describe_user_pool_domain(data):
             "AWSAccountId": get_account_id(),
             "Domain": domain,
             "S3Bucket": "",
+            # Only a custom domain has a CloudFront alias target; a prefix
+            # domain has none (same as its null CloudFrontDomain on create).
             "CloudFrontDistribution": (_cloudfront_domain(domain) if is_custom
-                                       else _prefix_domain_host(domain, pid)),
+                                       else ""),
             "Version": "1",
             "Status": "ACTIVE",
             "CustomDomainConfig": pool.get("_custom_domain_config", {}) if is_custom else {},
