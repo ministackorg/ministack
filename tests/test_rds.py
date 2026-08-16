@@ -4402,13 +4402,22 @@ def test_rds_restore_state_respawns_one_container_per_cluster(
             assert runs == []
             release_migration_remove.set()
 
-        deadline = time.time() + 2
+        # restore_state provisions on a background thread, so everything below
+        # depends on that thread having finished. The wait used to be a bare 2 s
+        # budget that fell through silently when it expired, and the test then
+        # failed on whichever later assertion happened to notice — an empty
+        # `removed_volumes` diff, with no hint that the cause was a timeout. It
+        # now waits long enough for a loaded CI runner and says so when it gives
+        # up, so a slow box reads as slow rather than as a behaviour change.
+        deadline = time.time() + 20
+        settled = False
         while time.time() < deadline:
             if scenario in (
                 "last-member-deleted-during-readiness",
                 "last-members-deleted-before-start",
             ):
                 if m._clusters.get(cluster_id, {}).get("DBClusterMembers") == []:
+                    settled = True
                     break
                 time.sleep(0.01)
                 continue
@@ -4417,8 +4426,14 @@ def test_rds_restore_state_respawns_one_container_per_cluster(
                 for db_id in ("restored-writer", "restored-reader")
             }
             if statuses <= {"available", "failed"}:
+                settled = True
                 break
             time.sleep(0.01)
+        assert settled, (
+            f"{scenario}: restore did not settle within 20s — the background "
+            f"provisioning thread is still running, so the assertions below "
+            f"would report a timeout as a behaviour change"
+        )
 
         if not writer_removal_succeeds or not reader_removal_succeeds or (
             scenario == "ownership-mismatch"

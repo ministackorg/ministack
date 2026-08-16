@@ -30,6 +30,15 @@ import zipfile
 
 import pytest
 
+# Serial on purpose. These tests deliberately saturate the server — 70 warm
+# Lambda workers, a burst that fills the account concurrency budget — and CI
+# runs the parallel phase with three xdist workers per shard on a 2-core
+# runner. Sharing a shard with other files starved them: `test_rds.py` polls a
+# background restore with a fixed 2 s budget, and under this load it silently
+# ran out and failed on a later assertion. Measuring scheduling means owning
+# the box while we measure.
+pytestmark = pytest.mark.serial
+
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 ROLE = "arn:aws:iam::000000000000:role/lambda-role"
 
