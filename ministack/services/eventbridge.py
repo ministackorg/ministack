@@ -22,10 +22,12 @@ Supports: CreateEventBus, UpdateEventBus, DeleteEventBus, ListEventBuses, Descri
 
 import calendar
 import copy
-import fnmatch
+import functools
 import hashlib
+import ipaddress
 import json
 import logging
+import operator
 import os
 import re
 import threading
@@ -515,15 +517,9 @@ def _put_rule(data):
         )
 
     event_pattern = data.get("EventPattern", "")
-    if event_pattern and isinstance(event_pattern, str):
-        try:
-            json.loads(event_pattern)
-        except json.JSONDecodeError:
-            return error_response_json(
-                "InvalidEventPatternException",
-                "Event pattern is not valid JSON",
-                400,
-            )
+    pattern_error = _event_pattern_error(event_pattern)
+    if pattern_error:
+        return _invalid_event_pattern(pattern_error)
 
     arn = _rule_arn(name, bus)
     key = _rule_key(name, bus)
@@ -760,23 +756,88 @@ def _list_rule_names_by_target(data):
     return json_response(resp)
 
 
+
+def _event_pattern_error(pattern_str):
+    """The reason AWS would refuse this event pattern, or ``None`` if it accepts
+    it. Shared by every API that takes one, so they cannot disagree."""
+    if not pattern_str:
+        return None
+    if not isinstance(pattern_str, str):
+        return "Invalid JSON"
+    return _parse_pattern_text(pattern_str)[1]
+
+
+def _invalid_event_pattern(reason: str):
+    return error_response_json(
+        "InvalidEventPatternException", f"Event pattern is not valid. Reason: {reason}", 400)
+
+
+@functools.lru_cache(maxsize=1024)
+def _iso_time(epoch_seconds) -> str:
+    """The ISO-8601 rendering of an epoch second, or ``""`` when the number is
+    not a time at all. Memoized: every event in the same second renders alike.
+
+    The guard is not decoration — a ``time`` no platform clock can represent
+    (``1e30``) makes ``fromtimestamp`` raise, and this runs while building the
+    view every pattern is matched against, so it would surface as a 500 out of
+    the enclosing PutEvents."""
+    try:
+        return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+def _event_time_string(event) -> str:
+    """The event's ``time`` in the form the envelope carries it. ``Time`` is
+    stored as int epoch seconds while a pattern filters on the ISO-8601 string
+    the target receives, so matcher and delivery share this one rendering."""
+    raw = event.get("Time", "")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return _iso_time(raw)
+    return raw if isinstance(raw, str) else ""
+
+
+# The envelope names ``_event_from_test_payload`` models. Anything else a
+# caller puts at the top level of a ``TestEventPattern`` event is carried
+# through as an extra path rather than dropped: AWS compiles a pattern to a set
+# of paths and has no envelope allow-list, so a pattern naming an unmodelled key
+# must be able to match an event that actually carries it. ``PutEvents`` cannot
+# produce one — its entries are a fixed shape — so this only ever fires here.
+_TEST_PAYLOAD_MODELLED_KEYS = frozenset({
+    "detail", "Detail", "source", "Source", "detail-type", "DetailType",
+    "account", "Account", "region", "Region", "resources", "Resources",
+    "id", "EventId", "time", "Time", "version", "Version",
+    "replay-name", "ReplayName",
+})
+
+
 def _event_from_test_payload(event_obj: dict) -> dict:
     """Map CloudWatch Events-shaped JSON to internal fields used by _matches_pattern."""
     detail = event_obj.get("detail", event_obj.get("Detail", {}))
-    if isinstance(detail, dict):
+    if not isinstance(detail, str):
+        # Re-encoded, not ``str()``: repr would render a null as ``None`` and a
+        # list in Python syntax, and a pattern can ask about either.
         detail = json.dumps(detail)
-    elif detail is None:
-        detail = "{}"
-    else:
-        detail = str(detail)
-    return {
+    synthetic = {
         "Source": event_obj.get("source", event_obj.get("Source", "")),
         "DetailType": event_obj.get("detail-type", event_obj.get("DetailType", "")),
         "Detail": detail,
         "Account": event_obj.get("account", event_obj.get("Account", get_account_id())),
         "Region": event_obj.get("region", event_obj.get("Region", get_region())),
         "Resources": event_obj.get("resources", event_obj.get("Resources", [])),
+        "EventId": event_obj.get("id", event_obj.get("EventId", "")),
+        "Time": event_obj.get("time", event_obj.get("Time", "")),
+        "Version": event_obj.get("version", event_obj.get("Version", "0")),
     }
+    # Absent rather than empty on a normal event; see ``_pattern_event_view``.
+    replay_name = event_obj.get("replay-name", event_obj.get("ReplayName"))
+    if replay_name is not None:
+        synthetic["ReplayName"] = replay_name
+    extra = {key: value for key, value in event_obj.items()
+             if key not in _TEST_PAYLOAD_MODELLED_KEYS}
+    if extra:
+        synthetic["_ExtraEnvelope"] = extra
+    return synthetic
 
 
 def _test_event_pattern(data):
@@ -792,6 +853,10 @@ def _test_event_pattern(data):
         return error_response_json("InvalidEventPatternException", "Event is not valid JSON", 400)
     if not isinstance(event_obj, dict):
         return error_response_json("InvalidEventPatternException", "Event must be a JSON object", 400)
+
+    pattern_error = _event_pattern_error(pattern_str)
+    if pattern_error:
+        return _invalid_event_pattern(pattern_error)
 
     synthetic = _event_from_test_payload(event_obj)
     matched = _matches_pattern(pattern_str, synthetic)
@@ -956,28 +1021,34 @@ def _put_events(data):
         results.append({"EventId": event_id})
         logger.debug("EventBridge event: %s / %s", entry.get('Source'), entry.get('DetailType'))
 
-        _dispatch_event(event_record)
-        _archive_event(event_record)
+        # One view for both walks; rebuilding it re-parses ``Detail``.
+        view = _pattern_event_view(event_record)
+        _dispatch_event(event_record, view)
+        _archive_event(event_record, view)
 
     return json_response({"FailedEntryCount": failed, "Entries": results})
 
 
-def _archive_event(event):
+def _archive_event(event, view=None):
     bus_name = event.get("EventBusName", "default")
     bus_arn = f"arn:aws:events:{get_region()}:{get_account_id()}:event-bus/{bus_name}"
     for archive in _archives.values():
         if archive.get("EventSourceArn") != bus_arn:
             continue
         pattern = archive.get("EventPattern", "")
-        if pattern and not _matches_pattern(pattern, event):
-            continue
+        if pattern:
+            view = view or _pattern_event_view(event)
+            if not _matches_pattern_view(
+                    pattern, view, f"archive {archive.get('ArchiveName', '?')}"):
+                continue
         archive.setdefault("Events", []).append(event)
         archive["EventCount"] = archive.get("EventCount", 0) + 1
 
 
-def _dispatch_event(event):
+def _dispatch_event(event, view=None):
     bus_name = event.get("EventBusName", "default")
     event_path = set(event.get("_DispatchPath") or [])
+    view = view or _pattern_event_view(event)
 
     for key, rule in _rules.items():
         if rule.get("EventBusName", "default") != bus_name:
@@ -990,201 +1061,1195 @@ def _dispatch_event(event):
         if not rule.get("EventPattern"):
             continue
 
-        if _matches_pattern(rule["EventPattern"], event):
+        if _matches_pattern_view(rule["EventPattern"], view, f"rule {key}"):
             rule_targets = _targets.get(key, [])
             for target in rule_targets:
-                _invoke_target(target, event, rule)
+                _invoke_target(target, event, rule, view)
+
+
+def _reject_json_constant(literal: str):
+    """``json.loads(parse_constant=...)`` hook. Raising here is what turns
+    ``NaN``/``Infinity``/``-Infinity`` — extensions Python's decoder allows and
+    JSON does not define — back into the ``Invalid JSON`` refusal AWS gives."""
+    raise ValueError(f"Invalid JSON literal: {literal}")
+
+
+def _parse_pattern_text(pattern_str: str):
+    """``(alternatives, None)`` for a pattern AWS accepts, ``(None, reason)`` for
+    one it refuses. One parse answers both the validator's question and the
+    matcher's, so the two cannot come to disagree on what counts as a refusal.
+    See ``_reject_json_constant`` for the one place this is stricter than
+    Python's decoder.
+
+    ``ValueError``, not ``JSONDecodeError``: an integer literal of more digits
+    than Python will convert raises the plain parent class. A ``RecursionError``
+    is the same refusal, and it happens before any depth bound of ours applies.
+
+    ``parse_constant`` refuses ``NaN``/``Infinity``/``-Infinity``, which Python's
+    decoder accepts by default and JSON does not define. AWS parses a pattern
+    with Jackson, which rejects them unless it is asked not to, so accepting one
+    here would take a pattern that is a `400` in production and leave it matching
+    nothing locally — the silence this whole entry exists to remove."""
+    if isinstance(pattern_str, str) and not pattern_str.strip():
+        return None, "Filter is not an object"
+    try:
+        pattern = json.loads(pattern_str, parse_constant=_reject_json_constant)
+    except (ValueError, TypeError, RecursionError):
+        return None, "Invalid JSON"
+    try:
+        return _compile_pattern(pattern), None
+    except _InvalidPattern as exc:
+        return None, str(exc)
+    except RecursionError:
+        return None, "Event pattern is nested too deeply"
+
+
+@functools.lru_cache(maxsize=1024)
+def _compiled_pattern(pattern_str: str):
+    """The alternatives a pattern string compiles to, or ``None`` when AWS would
+    refuse it. Cached because rule patterns are stable while events are not, and
+    this runs per rule per event on the dispatch path. The returned lists are
+    shared with every later caller: read them, never mutate them.
+
+    A refusal is cached rather than raised. A pattern only reaches here from a
+    rule restored from persisted state, which is loaded verbatim and never
+    revalidated — and one AWS would have refused matches nothing. So does a
+    pattern whose parse exhausted the stack."""
+    return _parse_pattern_text(pattern_str)[0]
 
 
 def _matches_pattern(pattern_str, event):
-    try:
-        if isinstance(pattern_str, str):
-            pattern = json.loads(pattern_str)
-        else:
-            pattern = pattern_str
-    except (json.JSONDecodeError, TypeError):
+    """Whether ``event`` matches ``pattern_str`` — the single-shot form; dispatch
+    builds the view once and calls ``_matches_pattern_view`` directly."""
+    return _matches_pattern_view(pattern_str, _pattern_event_view(event))
+
+
+def _matches_pattern_view(pattern_str, view, owner="rule"):
+    """Whether ``view`` matches ``pattern_str``, the pattern as the JSON text the
+    API takes it in and the rule and archive stores keep across a restart.
+
+    A stored pattern that is not text belongs to a record this build's validation
+    never saw; it matches nothing, and is logged rather than dropped in silence.
+    ``owner`` names the record in that log line, so the operator can go and fix
+    the one that is skipping. Handing the pattern to the memoized compiler would
+    be worse than skipping it: ``lru_cache`` answers an unhashable key with
+    ``TypeError``, and dispatch runs inside ``PutEvents``, so that is a 500 on the
+    whole batch instead of one skipped rule."""
+    if not isinstance(pattern_str, str):
+        logger.warning("EventBridge: %s has a pattern that is not JSON text (%s); skipped",
+                       owner, type(pattern_str).__name__)
         return False
+    alternatives = _compiled_pattern(pattern_str)
+    if alternatives is None:
+        return False
+    return any(_matches_alternative(view, alternative) for alternative in alternatives)
 
-    if "source" in pattern:
-        if not _matches_field(event.get("Source", ""), pattern["source"]):
-            return False
 
-    if "detail-type" in pattern:
-        if not _matches_field(event.get("DetailType", ""), pattern["detail-type"]):
-            return False
+def _matches_alternative(view, alternative) -> bool:
+    """One compiled alternative against one event, envelope keys before ``detail``,
+    so a rule that fails on ``source`` never decodes the payload. The split is
+    exact because a pattern's top-level keys are independent: ``_matches_detail``
+    ANDs them against the same tree, so asking in two batches asks the same
+    question."""
+    if "detail" not in alternative:
+        return _matches_detail(view.envelope(), alternative)
+    if len(alternative) == 1:
+        return _matches_detail(view.event_with_detail(), alternative)
+    envelope = {key: value for key, value in alternative.items() if key != "detail"}
+    return (_matches_detail(view.envelope(), envelope) and
+            _matches_detail(view.event_with_detail(), {"detail": alternative["detail"]}))
 
-    if "detail" in pattern:
+
+def _decoded_detail(raw):
+    """An event's ``Detail`` as a JSON value. One that is not JSON is the leaf it
+    is: an empty object would answer a question about a field the event does not
+    have. Shared by the matcher's view and the delivered envelope, so the two
+    agree on one reading."""
+    if isinstance(raw, str):
         try:
-            detail = json.loads(event.get("Detail", "{}")) if isinstance(event.get("Detail"), str) else event.get("Detail", {})
-        except (json.JSONDecodeError, TypeError):
-            detail = {}
-        if not _matches_detail(detail, pattern["detail"]):
-            return False
-
-    if "account" in pattern:
-        if not _matches_field(event.get("Account", get_account_id()), pattern["account"]):
-            return False
-
-    if "region" in pattern:
-        if not _matches_field(event.get("Region", get_region()), pattern["region"]):
-            return False
-
-    if "resources" in pattern:
-        event_resources = event.get("Resources", [])
-        for required in pattern["resources"]:
-            if required not in event_resources:
-                return False
-
-    return True
+            return json.loads(raw)
+        except (ValueError, TypeError, RecursionError):
+            return raw
+    return raw
 
 
-def _matches_field(value, pattern_values):
-    if isinstance(pattern_values, list):
-        for item in pattern_values:
-            if isinstance(item, dict):
-                # Content-based filter (wildcard, prefix, suffix, etc.)
-                if _matches_content_filter(value, item):
-                    return True
-            elif value == item:
-                return True
+class _EventView:
+    """The event a pattern is matched against and a target is delivered, with
+    ``detail`` decoded only once, and only for the alternatives that ask about it.
+
+    One object serves both because they are the same tree: a rule must not match
+    on a field whose delivered value differs, and the surest way to guarantee
+    that is to have nothing to keep in step.
+
+    The deferral costs nothing because ``_matches_detail`` reads a key only when
+    the pattern names it — and AWS prunes the same way: Event Ruler skips a field
+    no rule uses rather than parsing into it, so a field nothing asks about is
+    absent from the tree a pattern sees, never present as a null.
+
+    Not a ``dict`` subclass holding a placeholder until first read: CPython reads
+    a subclass's own storage for ``dict(view)``, ``{**view}`` and ``items()``, so
+    the placeholder would reach consumers as a ``detail`` of ``null`` — a leaf a
+    pattern can match on."""
+
+    __slots__ = ("_envelope", "_raw_detail", "_with_detail")
+
+    def __init__(self, envelope, raw_detail):
+        self._envelope = envelope
+        self._raw_detail = raw_detail
+        self._with_detail = None
+
+    def envelope(self) -> dict:
+        """The event without ``detail`` — what a pattern naming no ``detail`` is
+        matched against, and what ``<aws.events.event>`` renders."""
+        return self._envelope
+
+    def event_with_detail(self) -> dict:
+        """The whole event: the tree a target is delivered, and the one an
+        alternative naming ``detail`` is matched against."""
+        if self._with_detail is None:
+            self._with_detail = dict(self._envelope, detail=_decoded_detail(self._raw_detail))
+        return self._with_detail
+
+
+def _pattern_event_view(event):
+    """The event as a pattern sees it, which is exactly the envelope a target is
+    delivered — one builder, because two hand-kept copies drift.
+
+    A pattern is matched against one whole tree rather than field by field
+    because that is what AWS does — it compiles a pattern to a set of *paths* and
+    has no notion of which top-level names are legal. Two consequences fall out
+    of that and out of nothing else: an unrecognized top-level key is simply a
+    path the event does not have, so ``{"nonesuch": ["x"]}`` matches nothing while
+    ``{"nonesuch": [{"exists": false}]}`` matches *everything*; and an envelope
+    field may be written as an object path (``{"source": {"x": ["y"]}}`` is the
+    path ``source.x``) without that being an error."""
+    fields = {
+        "version": str(event.get("Version", "0")),
+        "id": event.get("EventId", ""),
+        "source": event.get("Source", ""),
+        "account": event.get("Account", get_account_id()),
+        "time": _event_time_string(event),
+        "region": event.get("Region", get_region()),
+        "resources": event.get("Resources", []),
+        "detail-type": event.get("DetailType", ""),
+    }
+    if event.get("ReplayName") is not None:
+        # Present only on a replayed event, which is what makes AWS's own
+        # ``{"replay-name": [{"exists": false}]}`` mean "live traffic only".
+        fields["replay-name"] = event["ReplayName"]
+    extra = event.get("_ExtraEnvelope")
+    if extra:
+        # Unmodelled top-level keys, which only ``TestEventPattern`` can supply.
+        # Written under the modelled names so a caller cannot shadow one.
+        fields = dict(extra, **fields)
+    return _EventView(fields, event.get("Detail", "{}"))
+
+# Field names AWS reserves inside a ``$or`` branch: a ``$or`` holding any of them
+# is not the OR operator. Wider than SNS's equivalent — it also reserves the bare
+# comparison symbols and the names of operators AWS has not shipped yet, so
+# adding one later cannot change what an existing pattern means.
+_OR_RESERVED_MEMBER_KEYS = frozenset({
+    "anything-but", "prefix", "suffix", "equals-ignore-case", "numeric",
+    "exists", "cidr", "wildcard", "exactly", "=", "<", "<=", ">", ">=",
+    "regex", "not-wildcard", "not-equals-ignore-case", "date-after",
+    "date-on-or-after", "date-before", "date-on-or-before", "in-date-range",
+    "ip-address-in-range", "ip-address-not-in-range",
+})
+
+
+class _InvalidPattern(Exception):
+    """An event pattern AWS refuses at rule creation.
+
+    The message is the one EventBridge reports, which is the underlying
+    Event Ruler text verbatim — a real service response reads
+    ``Event pattern is not valid. Reason: exists match pattern must be either
+    true or false.`` — so the strings here are deliberately AWS's wording
+    rather than our own."""
+
+
+class _PatternTooComplex(_InvalidPattern):
+    """A limit was reached rather than the pattern being malformed: the ``$or``
+    combination cap, or the nesting guard. Kept distinct because neither is
+    retried against the fallback compiler — re-reading ``$or`` as a field name
+    cannot answer a product over the ``$or`` arrays, and for a depth failure it
+    re-descends the same hundred levels the guard exists to bound."""
+
+
+# AWS's cap on the sub-patterns a ``$or`` may expand to. Its own wording is
+# "over 1000 rule combinations".
+_MAX_OR_COMBINATIONS = 1000
+# A guard on pattern nesting, not an AWS rule — AWS documents no depth limit.
+# Compilation and matching both recurse per level, on a pooled worker thread
+# whose remaining stack is nothing like the interpreter's nominal limit, and a
+# RecursionError there does not stay inside its own request. Set above any real
+# pattern and below where the handler's own JSON parse gives out.
+_MAX_PATTERN_DEPTH = 100
+
+
+# ---------------------------------------------------------------------------
+# Event pattern compilation — $or expansion into flat alternatives
+# ---------------------------------------------------------------------------
+
+
+def _compile_pattern(pattern):
+    """Expand an event pattern into the list of flat alternatives AWS compiles
+    it to, raising ``_InvalidPattern`` for anything it would reject.
+
+    ``$or`` is not evaluated at match time on AWS — it is expanded here, into
+    one alternative per branch, and the rule matches if *any* alternative does.
+    That is not merely a different route to the same answer. Because each branch
+    is built by writing leaves into the alternatives accumulated so far, a leaf
+    constrained both inside and outside a ``$or`` keeps only the LAST value
+    written, in document order. So ``{"a":["1"],"$or":[{"a":["2"]},{"b":["3"]}]}``
+    matches ``{"a":"2"}`` and does not match ``{"a":"1"}`` — and writing the two
+    keys the other way round reverses both answers. A recursive evaluator
+    answers order-independently and gets those cases wrong.
+
+    A ``$or`` that is not the operator falls back to being read as an ordinary
+    field name, which is what EventBridge does: it compiles with its ``$or``-aware
+    compiler and on failure retries with its pre-``$or`` one."""
+    # Outside the retry deliberately: AWS counts the product over the ``$or``
+    # arrays the pattern text holds, so a ``$or`` that turns out not to be the
+    # operator still counts toward the cap.
+    product = _or_combination_product(pattern)
+    if product > _MAX_OR_COMBINATIONS:
+        raise _PatternTooComplex(
+            f"Event pattern contains more than {_MAX_OR_COMBINATIONS} rule combinations")
+    try:
+        return _compile_alternatives(pattern, expand_or=True)
+    except _PatternTooComplex:
+        raise
+    except _InvalidPattern:
+        return _compile_alternatives(pattern, expand_or=False)
+
+
+def _or_combination_product(node, depth: int = 0):
+    """AWS's documented rule-combination count: the product of the lengths of
+    every ``$or`` array. It over-counts what the expansion actually produces for
+    a nested ``$or``, deliberately — counting only the alternatives would accept
+    a pattern AWS refuses, so both are checked."""
+    if not isinstance(node, dict) or depth > _MAX_PATTERN_DEPTH:
+        return 1
+    product = 1
+    for key, value in node.items():
+        if key == "$or" and isinstance(value, list):
+            product *= max(len(value), 1)
+            for member in value:
+                product *= _or_combination_product(member, depth + 1)
+        elif isinstance(value, dict):
+            product *= _or_combination_product(value, depth + 1)
+        if product > _MAX_OR_COMBINATIONS:
+            return product
+    return product
+
+
+def _compile_alternatives(pattern, expand_or: bool):
+    alternatives = []
+    _compile_object(alternatives, [], pattern, expand_or, inside_or=False, depth=0)
+    return alternatives or [{}]
+
+
+def _copy_alternative(alternative):
+    """A copy deep enough to fork on. The value lists are never mutated — a
+    leaf write replaces one wholesale — so only the object spine is copied."""
+    return {key: _copy_alternative(value) if isinstance(value, dict) else value
+            for key, value in alternative.items()}
+
+
+def _compile_object(alternatives, path, obj, expand_or, inside_or, depth):
+    if depth > _MAX_PATTERN_DEPTH:
+        raise _PatternTooComplex("Event pattern is nested too deeply")
+    if not isinstance(obj, dict):
+        raise _InvalidPattern("Filter is not an object")
+    if not obj:
+        raise _InvalidPattern("Empty objects are not allowed")
+    # Document order decides which of two writes to the same leaf survives, so
+    # the keys are walked in the order the JSON carried them and never sorted.
+    for key, value in obj.items():
+        if key == "$or" and expand_or:
+            _compile_or(alternatives, path, value, depth)
+            continue
+        if inside_or and key in _OR_RESERVED_MEMBER_KEYS:
+            raise _InvalidPattern(
+                f"{key} is Ruler reserved fieldName which cannot be used inside $or.")
+        if isinstance(value, dict):
+            _compile_object(alternatives, [*path, key], value, expand_or, inside_or, depth + 1)
+        elif isinstance(value, list):
+            _validate_value_list(value)
+            _write_leaf(alternatives, [*path, key], value)
+        else:
+            raise _InvalidPattern(f'"{key}" must be an object or an array')
+
+
+def _compile_or(alternatives, path, members, depth):
+    prefix = [_copy_alternative(a) for a in alternatives]
+    alternatives.clear()
+    if not isinstance(members, list):
+        raise _InvalidPattern("It must be an Array followed with $or.")
+    for member in members:
+        if not isinstance(member, dict):
+            raise _InvalidPattern("Only JSON object is allowed in array of $or relationship.")
+        forked = [_copy_alternative(a) for a in prefix] or [{}]
+        _compile_object(forked, path, member, True, True, depth + 1)
+        alternatives.extend(forked)
+        if len(alternatives) > _MAX_OR_COMBINATIONS:
+            raise _PatternTooComplex(
+                f"Event pattern contains more than {_MAX_OR_COMBINATIONS} rule combinations")
+    if len(members) < 2:
+        raise _InvalidPattern("There must have at least 2 Objects in $or relationship.")
+
+
+# Marks an alternative no event can satisfy. AWS keys its sub-rules by the full
+# dotted path, so a path constrained both as a leaf and as an object keeps BOTH
+# constraints and matches nothing. Alternatives here are trees, which cannot
+# hold the two at once, so the collision is recorded rather than one side
+# dropped; an ``object()`` key cannot collide with a pattern key.
+_UNSATISFIABLE = object()
+
+
+def _write_leaf(alternatives, path, values):
+    """Record one leaf constraint in every alternative built so far. A leaf
+    already constrained at this path is overwritten, which is where
+    last-write-wins comes from — but only when both writes are leaves."""
+    if not alternatives:
+        alternatives.append({})
+    for alternative in alternatives:
+        node = alternative
+        for part in path[:-1]:
+            child = node.get(part)
+            if child is None:
+                child = {}
+                node[part] = child
+            elif not isinstance(child, dict):
+                # An ancestor is already a leaf; see ``_UNSATISFIABLE``.
+                alternative[_UNSATISFIABLE] = True
+                break
+            node = child
+        else:
+            if isinstance(node.get(path[-1]), dict):
+                alternative[_UNSATISFIABLE] = True
+            else:
+                node[path[-1]] = values
+
+
+# The operators ``anything-but`` may negate, and the ones a ``prefix``/``suffix``
+# operand may itself be written as.
+_ANYTHING_BUT_NESTABLE = frozenset({"prefix", "suffix", "equals-ignore-case", "wildcard"})
+_AFFIX_NESTABLE = frozenset({"equals-ignore-case"})
+# The numeric comparison spelled out, for the operand error messages.
+_NUMERIC_OP_NAMES = {"=": "equals", ">": ">", ">=": ">=", "<": "<", "<=": "<="}
+# A range's lower bound may be followed by an upper bound; every other operator
+# terminates the expression.
+_NUMERIC_RANGE_OPENERS = frozenset({">", ">="})
+_NUMERIC_RANGE_CLOSERS = frozenset({"<", "<="})
+
+
+def _require_type(operand, kind, message: str):
+    """The whole of what several operators ask of their operand: that it is one
+    JSON type, refused with AWS's own wording for that operator when it is not."""
+    if not isinstance(operand, kind):
+        raise _InvalidPattern(message)
+
+
+# ---------------------------------------------------------------------------
+# Event pattern validation — AWS's operand grammar, and its wording
+# ---------------------------------------------------------------------------
+
+
+def _validate_value_list(values: list):
+    """Validate one field's list of alternatives. AWS rejects the whole pattern
+    for any of these, so this raises rather than returning a verdict."""
+    if not values:
+        raise _InvalidPattern("Empty arrays are not allowed")
+    for item in values:
+        if isinstance(item, dict):
+            _validate_match_expression(item)
+        elif isinstance(item, list):
+            raise _InvalidPattern("Match value must be String, number, true, false, or null")
+
+
+def _validate_match_expression(expression: dict):
+    if not expression:
+        raise _InvalidPattern("Match expression name not found")
+    operator_name = next(iter(expression))
+    if operator_name not in _MATCH_OPERATORS:
+        raise _InvalidPattern(f"Unrecognized match type {operator_name}")
+    # Operand before arity: AWS's parser dispatches on the first key and consumes
+    # its operand before it sees a second, so a two-key expression whose first
+    # operand is also wrong reports the operand, not the arity.
+    _OPERAND_VALIDATORS[operator_name](expression[operator_name])
+    if len(expression) > 1:
+        # These two reach a different guard on AWS, which reports the arity of
+        # the operand it was already reading.
+        if operator_name in ("numeric", "anything-but"):
+            raise _InvalidPattern("Too many elements in numeric expression")
+        raise _InvalidPattern("Only one key allowed in match expression")
+
+
+def _validate_affix(operator_name: str, operand):
+    """``prefix``/``suffix`` take a string, or a nested ``equals-ignore-case``
+    for a case-insensitive affix.
+
+    An empty operand is accepted in both forms and is not the do-nothing rule it
+    looks like: AWS matches an affix against the *quoted* form of the value, so
+    an empty ``prefix`` compiles to the opening quote alone — which every JSON
+    string carries and no number, boolean or null does. It reads "this field has
+    a string value", and ``_matches_affix`` answers it that way.
+    ``Null prefix/suffix not allowed`` is AWS's rule for ``anything-but``'s
+    nested affix alone, so refusing an empty operand here would reject a pattern
+    real AWS compiles.
+
+    The type complaint names the one operator it read where the nested form says
+    ``prefix/suffix``; both are AWS's own wording."""
+    if isinstance(operand, dict):
+        if not operand:
+            raise _InvalidPattern(f"{operator_name.capitalize()} expression name not found")
+        inner = next(iter(operand))
+        if len(operand) > 1:
+            raise _InvalidPattern("Only one key allowed in match expression")
+        if inner not in _AFFIX_NESTABLE:
+            raise _InvalidPattern(f"Unsupported {operator_name} pattern: {inner}")
+        _require_type(operand[inner], str, "equals-ignore-case match pattern must be a string")
+        return
+    _require_type(operand, str, f"{operator_name} match pattern must be a string")
+
+
+def _wildcard_position(pattern: str, index: int) -> int:
+    """AWS reports a wildcard fault as a 1-based offset into the *quoted* form of
+    the operand, counted in UTF-8 bytes — so the opening quote is position 0 and
+    a multi-byte character before the fault shifts it by its encoded length.
+
+    ``errors="replace"`` is load-bearing: a lone surrogate out of a JSON escape
+    cannot be UTF-8 encoded at all, so encoding strictly raises — and this is
+    reached from the matcher as well as the validator. It is also what AWS
+    counts, its encoder substituting one ``?`` for an unpaired surrogate."""
+    return len(pattern[:index].encode("utf-8", errors="replace")) + 1
+
+
+def _validate_wildcard(operand):
+    _require_type(operand, str, "wildcard match pattern must be a string")
+    index = 0
+    while index < len(operand):
+        char = operand[index]
+        if char == "\\":
+            # A trailing backslash escapes the closing quote AWS appends, which
+            # is why it is an invalid escape rather than a dangling one.
+            if index + 1 >= len(operand) or operand[index + 1] not in ("*", "\\"):
+                raise _InvalidPattern(
+                    f"Invalid escape character at pos {_wildcard_position(operand, index)}")
+            index += 2
+            continue
+        if char == "*" and index + 1 < len(operand) and operand[index + 1] == "*":
+            raise _InvalidPattern(
+                f"Consecutive wildcard characters at pos {_wildcard_position(operand, index)}")
+        index += 1
+
+
+# A pre-filter for ``ipaddress``, on both the operand and the value side: its
+# job is to reject what ``ipaddress`` accepts and AWS does not — a zone id, a
+# dotted IPv4-mapped IPv6 address, anything not plainly one family. The IPv6
+# form is one character class plus a separate colon test, not the two
+# overlapping classes the shape suggests: those go quadratic on a long
+# colon-only string, on the dispatch path ``_wildcard_to_regex`` protects.
+_CIDR_IPV4_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\Z")
+_CIDR_IPV6_RE = re.compile(r"[0-9a-fA-F:]+\Z")
+# What AWS's integer parse of the mask accepts, which is not what Python's
+# ``int()`` accepts: no surrounding space, no underscore separators, no
+# non-ASCII digits, but a leading sign is fine (``/+24`` and ``/-0`` are real).
+_CIDR_MASK_RE = re.compile(r"[+-]?[0-9]+\Z")
+
+
+def _validate_cidr(operand):
+    # The wrong operator in this message is AWS's own copy-paste, kept so the
+    # text a caller sees is the text the service sends.
+    _require_type(operand, str, "prefix match pattern must be a string")
+    address, separator, mask = operand.partition("/")
+    # A trailing slash leaves no mask field at all for AWS's split, so it is the
+    # missing-slash complaint rather than a bad-integer one.
+    if not separator or "/" in mask or not mask:
+        raise _InvalidPattern("Malformed CIDR, one '/' required")
+    if not _CIDR_MASK_RE.match(mask):
+        raise _InvalidPattern("Malformed CIDR, mask bits must be an integer")
+    try:
+        bits = int(mask)
+    except ValueError:
+        raise _InvalidPattern("Malformed CIDR, mask bits must be an integer") from None
+    if not -2 ** 31 <= bits < 2 ** 31:
+        # Outside the width AWS's integer parse accepts, so it never reaches the
+        # mask-width check.
+        raise _InvalidPattern("Malformed CIDR, mask bits must be an integer")
+    if bits < 0:
+        raise _InvalidPattern("Malformed CIDR, mask bits must not be negative")
+    looks_v4 = _CIDR_IPV4_RE.match(address) is not None
+    looks_v6 = ":" in address and _CIDR_IPV6_RE.match(address) is not None
+    if not (looks_v4 or looks_v6):
+        raise _InvalidPattern(f"Nonstandard IP address: {address}")
+    try:
+        parsed = ipaddress.ip_address(_normalized_ipv4(address) if looks_v4 else address)
+    except ValueError:
+        raise _InvalidPattern(f"Invalid IP address: {address}") from None
+    if parsed.version == 4 and bits > 31:
+        raise _InvalidPattern("IPv4 mask bits must be < 32")
+    if parsed.version == 6 and bits > 127:
+        raise _InvalidPattern("IPv6 mask bits must be < 128")
+
+
+def _normalized_ipv4(address: str) -> str:
+    """A dotted quad with its octets read as decimal, which is how AWS reads
+    them: ``0177.0.0.1`` is ``177.0.0.1``, not octal. Python's parser refuses a
+    leading zero outright, so an operand AWS accepts would otherwise be refused."""
+    octets = []
+    for octet in address.split("."):
+        try:
+            value = int(octet)
+        except ValueError:
+            # Only an octet of more digits than Python will convert; not an
+            # address either way.
+            return address
+        if not 0 <= value <= 255:
+            return address
+        octets.append(str(value))
+    return ".".join(octets)
+
+
+def _numeric_token(value) -> str:
+    """How AWS names an offending token in a numeric operand — the raw JSON
+    text, which is what its streaming parser has to hand."""
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if value is None:
+        return "null"
+    if isinstance(value, list):
+        return "["
+    if isinstance(value, dict):
+        return "{"
+    return str(value)
+
+
+def _validate_numeric_threshold(operand_name: str, value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _InvalidPattern(f"Value of {operand_name} must be numeric")
+    try:
+        as_double = float(value)
+    except (OverflowError, ValueError):
+        raise _InvalidPattern(f"Cannot compare number : {value}") from None
+    if as_double in (float("inf"), float("-inf")) or as_double != as_double:
+        raise _InvalidPattern(f"Cannot compare number : {value}")
+    if isinstance(value, int) and int(as_double) != value:
+        # AWS refuses a threshold the double conversion would silently move.
+        # Only checkable for an integer: a fractional literal was already
+        # rounded by the JSON parse, so its original text is gone.
+        raise _InvalidPattern(f"Cannot compare number : {value}")
+    return as_double
+
+
+def _validate_numeric(operand):
+    """``numeric`` is a small grammar, not a list of pairs: a single comparison,
+    or a lower bound followed by an upper bound. ``=``, ``<`` and ``<=``
+    terminate the expression, so a range has to be written lower bound first."""
+    _require_type(operand, list, "Value of numeric must be an array.")
+    if not operand:
+        raise _InvalidPattern("Invalid member in numeric match: ]")
+    first = operand[0]
+    _require_type(first, str, f"Invalid member in numeric match: {_numeric_token(first)}")
+    if first not in _NUMERIC_OP_NAMES:
+        raise _InvalidPattern(f"Unrecognized numeric range operator: {first}")
+    if len(operand) < 2:
+        raise _InvalidPattern(f"Value of {_NUMERIC_OP_NAMES[first]} must be numeric")
+    bottom = _validate_numeric_threshold(_NUMERIC_OP_NAMES[first], operand[1])
+    if len(operand) == 2:
+        return
+    if first not in _NUMERIC_RANGE_OPENERS:
+        raise _InvalidPattern("Too many elements in numeric expression")
+    if len(operand) > 4:
+        raise _InvalidPattern("Too many terms in numeric range expression")
+    second = operand[2]
+    _require_type(second, str, f"Bad value in numeric range: {_numeric_token(second)}")
+    if second not in _NUMERIC_RANGE_CLOSERS:
+        raise _InvalidPattern(f"Bad numeric range operator: {second}")
+    if len(operand) < 4:
+        raise _InvalidPattern(f"Value of {_NUMERIC_OP_NAMES[second]} must be numeric")
+    top = _validate_numeric_threshold(_NUMERIC_OP_NAMES[second], operand[3])
+    if not bottom < top:
+        raise _InvalidPattern("Bottom must be less than top")
+
+
+def _validate_anything_but(operand):
+    if isinstance(operand, dict):
+        if not operand:
+            raise _InvalidPattern("Anything-But expression name not found")
+        inner = next(iter(operand))
+        if len(operand) > 1:
+            raise _InvalidPattern("Only one key allowed in match expression")
+        if inner not in _ANYTHING_BUT_NESTABLE:
+            raise _InvalidPattern(f"Unsupported anything-but pattern: {inner}")
+        _validate_anything_but_nested(inner, operand[inner])
+        return
+    if isinstance(operand, list):
+        # The list is walked in order, as AWS's streaming parser walks it, so an
+        # unsupported element is reported before the type-homogeneity check.
+        for value in operand:
+            if isinstance(value, bool) or value is None or isinstance(value, (list, dict)):
+                raise _InvalidPattern(
+                    "Inside anything but list, start|null|boolean is not supported.")
+        has_number = any(isinstance(v, (int, float)) for v in operand)
+        has_string = any(isinstance(v, str) for v in operand)
+        if not operand or (has_number and has_string):
+            raise _InvalidPattern(
+                "Inside anything but list, either all values are number or string, "
+                "mixed type is not supported")
+        for value in operand:
+            if isinstance(value, (int, float)):
+                _validate_numeric_threshold("anything-but", value)
+        return
+    if isinstance(operand, bool) or operand is None:
+        raise _InvalidPattern(
+            "Value of anything-but must be an array or single string/number value.")
+    if isinstance(operand, (int, float)):
+        _validate_numeric_threshold("anything-but", operand)
+
+
+def _validate_anything_but_nested(inner: str, operand):
+    """The nested form takes one value or a list of them. AWS's outer type guard
+    fires first, so a boolean or null operand is reported against
+    ``anything-but`` rather than against the nested operator."""
+    candidates = operand if isinstance(operand, list) else [operand]
+    if not candidates:
+        # A deliberate divergence: AWS accepts an empty nested list and then
+        # fails evaluating the rule, so there is no behaviour to copy — and an
+        # ``anything-but`` with nothing to exclude inverts into "every event".
+        raise _InvalidPattern("Empty arrays are not allowed")
+    for candidate in candidates:
+        if isinstance(candidate, bool) or candidate is None:
+            raise _InvalidPattern(
+                "Value of anything-but must be an array or single string/number value.")
+    if inner in ("prefix", "suffix"):
+        for candidate in candidates:
+            _require_type(candidate, str, "prefix/suffix match pattern must be a string")
+            if not candidate:
+                # This position only — ``{"prefix": ""}`` is a pattern AWS
+                # compiles, so do not hoist this into ``_validate_affix``.
+                raise _InvalidPattern("Null prefix/suffix not allowed")
+    elif inner == "equals-ignore-case":
+        for candidate in candidates:
+            _require_type(candidate, str, "Inside anything-but/equals-ignore-case list, "
+                                          "number|start|null|boolean is not supported.")
+    elif inner == "wildcard":
+        for candidate in candidates:
+            _validate_wildcard(candidate)
+
+
+# Every operator a match expression may name, with the check its operand has to
+# pass. ``exactly`` is Event Ruler's explicit spelling of a plain equality value;
+# the rest are the documented ones.
+_OPERAND_VALIDATORS = {
+    "exactly": functools.partial(
+        _require_type, kind=str, message="exact match pattern must be a string"),
+    "prefix": functools.partial(_validate_affix, "prefix"),
+    "suffix": functools.partial(_validate_affix, "suffix"),
+    "equals-ignore-case": functools.partial(
+        _require_type, kind=str, message="equals-ignore-case match pattern must be a string"),
+    "wildcard": _validate_wildcard,
+    "cidr": _validate_cidr,
+    "numeric": _validate_numeric,
+    "exists": functools.partial(
+        _require_type, kind=bool, message="exists match pattern must be either true or false."),
+    "anything-but": _validate_anything_but,
+}
+_MATCH_OPERATORS = frozenset(_OPERAND_VALIDATORS)
+
+
+# How deep an event value's arrays are followed when flattening. Generous next to
+# any real event, and small next to the stack a handler has left.
+_MAX_VALUE_DEPTH = 50
+
+
+# ---------------------------------------------------------------------------
+# Event pattern matching — value-level operators
+# ---------------------------------------------------------------------------
+
+
+def _flatten(value, objects: bool, depth: int = 0) -> list:
+    """What a pattern is matched against for this event value: the scalars it
+    offers, or — one level of the tree up, for a nested pattern object — the
+    objects. AWS flattens an array value and offers each element to the matcher
+    on its own, recursively, so the field matches when *any* element does.
+
+    Whatever is not the wanted leaf yields nothing and so matches nothing: an
+    object has no scalar to offer, a scalar has no object, and an empty array
+    has neither — including under ``anything-but``, which needs at least one
+    surviving element rather than the absence of a failing one.
+
+    The depth bound is for the event side: an event may nest arrays as deep as
+    its author likes, and past the bound the nesting yields nothing rather than
+    exhausting the stack."""
+    if isinstance(value, list):
+        if depth >= _MAX_VALUE_DEPTH:
+            return []
+        flat = []
+        for element in value:
+            flat.extend(_flatten(element, objects, depth + 1))
+        return flat
+    return [value] if isinstance(value, dict) == objects else []
+
+
+def _json_equal(left, right) -> bool:
+    """JSON equality, which Python's ``==`` is not. AWS compares as JSON, so a
+    string never equals a number and ``true`` never equals ``1`` — where Python
+    holds ``True == 1``. Numbers of different width do still compare equal."""
+    if isinstance(left, bool) != isinstance(right, bool):
         return False
-    return value == pattern_values
+    return left == right
+
+
+def _matches_alternatives(value, alternatives) -> bool:
+    """Whether one scalar satisfies any alternative in a pattern's value list.
+    ``exists`` is skipped: it is answered from the key's presence, not from the
+    value, and its caller has already dealt with it."""
+    for item in alternatives:
+        if isinstance(item, dict):
+            if "exists" in item:
+                continue
+            if _matches_content_filter(value, item):
+                return True
+        elif _json_equal(value, item):
+            return True
+    return False
 
 
 def _matches_detail(detail, pattern):
-    if not isinstance(pattern, dict):
-        return True
+    """Match one ``$or``-free alternative against an object. Every ``$or`` is
+    gone by the time this runs — ``_compile_pattern`` expanded it — so this is a
+    plain AND over the pattern's keys."""
+    if isinstance(pattern, dict) and _UNSATISFIABLE in pattern:
+        return False
+    if not isinstance(pattern, dict) or not pattern:
+        # Both are refused at rule creation; an empty pattern object constrains
+        # nothing, so matching it would be the fail-open answer.
+        return False
     for key, expected in pattern.items():
         present = isinstance(detail, dict) and key in detail
         actual = detail.get(key) if isinstance(detail, dict) else None
         if isinstance(expected, list):
-            # AWS content-filter: ``[{"exists": true|false}]`` is evaluated
-            # against key presence/absence, NOT against the value, so an
-            # absent key must NOT short-circuit to False before that check.
-            exists_filters = [
-                item for item in expected
-                if isinstance(item, dict) and "exists" in item
-            ]
+            # ``exists`` asks whether the path reaches a LEAF, not whether the
+            # key is there: AWS's operators "only work on leaf nodes", so an
+            # object-valued field, an empty array and an empty object are all
+            # indistinguishable from a missing key, while a null exists — it is
+            # a leaf. ``_flatten`` answers exactly that question. Evaluated
+            # before the value filters, because an absent key must not
+            # short-circuit past it.
+            scalars = _flatten(actual, False) if present else []
+            has_leaf = bool(scalars)
+            exists_filters = [item for item in expected
+                              if isinstance(item, dict) and "exists" in item]
             if exists_filters:
-                if any(item.get("exists") is True for item in exists_filters) and present:
+                # ``is``, not ``==``: a non-bool operand — reachable only from
+                # unrevalidated state — settles nothing and must not be coerced.
+                if any(item["exists"] is has_leaf for item in exists_filters):
                     continue
-                if any(item.get("exists") is False for item in exists_filters) and not present:
-                    continue
-                # No exists branch matched and there are no value-level filters
-                # left to try — treat as no match.
-                if all(isinstance(item, dict) and "exists" in item for item in expected):
+                if len(exists_filters) == len(expected):
                     return False
             if not present:
                 return False
-            if isinstance(actual, (str, int, float, bool)):
-                matched = False
-                for item in expected:
-                    if isinstance(item, dict) and "exists" in item:
-                        continue  # already handled above
-                    if isinstance(item, dict):
-                        matched = matched or _matches_content_filter(actual, item)
-                    elif actual == item or str(actual) == str(item):
-                        matched = True
-                if not matched:
-                    return False
-            elif isinstance(actual, list):
-                if not any(a in expected for a in actual):
-                    return False
+            # Every value shape must be judged: an unjudged key is a matched
+            # key, and a null or object detail used to reach no arm at all, so
+            # a rule guarding on an operator fired on what it excluded.
+            if not any(_matches_alternatives(scalar, expected)
+                       for scalar in scalars):
+                return False
         elif isinstance(expected, dict):
-            if not isinstance(actual, dict):
+            # Two pattern fields must come from the SAME array element: each
+            # element is offered the whole nested pattern.
+            #
+            # A non-object value still gets the pattern evaluated, against
+            # nothing — so ``{"detail": {"state": [{"exists": false}]}}`` is
+            # satisfied by an event whose ``detail`` is a string, as on AWS.
+            candidates = _flatten(actual, True) or [{}]
+            if not any(_matches_detail(candidate, expected)
+                       for candidate in candidates):
                 return False
-            if not _matches_detail(actual, expected):
-                return False
+        else:
+            # A pattern value must be an array of alternatives or a nested
+            # object; a bare scalar is neither, and leaving it unjudged is how a
+            # ``$or`` read as an ordinary field could match every event.
+            return False
     return True
 
 
-def _matches_content_filter(value, filter_rule):
-    if "wildcard" in filter_rule:
-        return isinstance(value, str) and fnmatch.fnmatch(value, filter_rule["wildcard"])
-    if "prefix" in filter_rule:
-        return isinstance(value, str) and value.startswith(filter_rule["prefix"])
-    if "suffix" in filter_rule:
-        return isinstance(value, str) and value.endswith(filter_rule["suffix"])
-    if "anything-but" in filter_rule:
-        excluded = filter_rule["anything-but"]
-        # Per AWS EventBridge docs, anything-but supports either a literal
-        # / list-of-literals OR a single nested content matcher (prefix,
-        # suffix, wildcard, equals-ignore-case). Mixing literals and nested
-        # matchers in a list is explicitly rejected by AWS at rule
-        # creation, so we match the strict form only.
-        if isinstance(excluded, dict):
-            return not _matches_content_filter(value, excluded)
-        if isinstance(excluded, list):
-            return value not in excluded
-        return value != excluded
-    if "numeric" in filter_rule:
-        ops = filter_rule["numeric"]
-        try:
-            num = float(value)
-        except (ValueError, TypeError):
+def _wildcard_to_regex(pattern: str) -> str:
+    """Translate an AWS EventBridge wildcard pattern to an anchored regex. Only
+    ``*`` is special (any sequence); ``\\`` escapes the next character, so
+    ``\\*`` is a literal asterisk and ``\\\\`` a literal backslash. Unlike
+    fnmatch, ``?`` and ``[seq]`` are literal — matching AWS exactly.
+
+    The literal run after each interior ``*`` is emitted as fnmatch's
+    ``(?=(?P<gN>.*?lit))(?P=gN)`` rather than a plain ``.*lit``. The lookahead
+    plus backreference commits to the leftmost match — glob semantics anyway —
+    and stops the engine backtracking. A naive ``.*a.*a.*b`` chain is
+    exponential against a long non-matching value: ``*/*/*/*/*.json`` over a
+    70-character key that just misses takes seconds, per rule per event.
+
+    Anchoring is ``^``/``\\Z``, not ``$``, which would also match just before a
+    trailing newline."""
+    # One token is an escape pair, a bare ``*``, or a run of ordinary characters.
+    # A trailing lone backslash matches nothing after it, so ``\\[\s\S]?`` leaves
+    # it as the escape of an empty string — the same literal backslash the
+    # character walk produced.
+    segments = [""]
+    for token in re.findall(r"\\[\s\S]?|\*|[^\\*]+", pattern):
+        if token == "*":
+            segments.append("")
+        elif token[0] == "\\":
+            segments[-1] += re.escape(token[1:]) if len(token) > 1 else "\\\\"
+        else:
+            segments[-1] += re.escape(token)
+
+    out = ["^", segments[0]]
+    interior = [s for s in segments[1:-1] if s]
+    for n, seg in enumerate(interior):
+        out.append(f"(?=(?P<g{n}>.*?{seg}))(?P=g{n})")
+    if len(segments) > 1:
+        out.append(".*")
+        out.append(segments[-1])
+    out.append(r"\Z")
+    return "".join(out)
+
+
+@functools.lru_cache(maxsize=1024)
+def _wildcard_regex(pattern: str):
+    """Compiled form of ``pattern``, cached like ``_compiled_pattern``."""
+    return re.compile(_wildcard_to_regex(pattern), re.DOTALL)
+
+
+def _string_operands(operand):
+    """The pattern strings an operand denotes — one, or a list of them, any of
+    which may match — or ``None`` when it is malformed. A malformed operand
+    never matches rather than raising: the matcher runs inside ``PutEvents``, so
+    a raise is a 500 that fails the whole batch, not one skipped rule. An empty
+    list is malformed for this purpose — it has no pattern to match, and
+    answering true would make ``anything-but`` invert it into a rule that fires
+    on every event. The list form is accepted at any depth, where AWS accepts it
+    only under ``anything-but``."""
+    candidates = operand if isinstance(operand, list) else [operand]
+    if not candidates or not all(isinstance(c, str) for c in candidates):
+        return None
+    return candidates
+
+
+def _matches_wildcard(value, pattern) -> bool:
+    """Match ``value`` against an AWS wildcard operand."""
+    if not isinstance(value, str):
+        return False
+    patterns = _string_operands(pattern)
+    return patterns is not None and any(_wildcard_regex(p).match(value) is not None for p in patterns)
+
+
+def _ignore_case_alternatives(char: str) -> tuple:
+    """The forms AWS accepts at one operand position: the character's lower
+    and upper case, deduplicated. Each is taken on the character alone, so a
+    mapping that changes length counts — ``ß`` uppercases to ``SS``."""
+    lower, upper = char.lower(), char.upper()
+    return (lower,) if lower == upper else (lower, upper)
+
+
+def _ignore_case_reach(value: str, operand: str, backwards: bool = False) -> set:
+    """The offsets in ``value`` the operand's alternation can reach — consuming
+    forwards from the start, or backwards from the end when ``backwards``.
+
+    Three questions are the one walk with different anchoring: ``prefix`` asks
+    whether the forward walk reaches anywhere, ``suffix`` whether the backward
+    one does, and ``equals-ignore-case`` whether the forward one reaches the end.
+
+    Carrying the whole reachable set is what keeps it linear: the alternatives at
+    a position differ in length (``ß`` uppercases to ``SS``), so a greedy scan
+    gives the wrong answer and a regex alternation reintroduces the backtracking
+    ``_wildcard_to_regex`` goes out of its way to avoid. The backward walk exists
+    for the same reason — running the forward one from every start offset would
+    be quadratic in the two lengths, on the same dispatch path."""
+    reachable = {len(value) if backwards else 0}
+    for char in reversed(operand) if backwards else operand:
+        moved = set()
+        for alternative in _ignore_case_alternatives(char):
+            width = len(alternative)
+            for offset in reachable:
+                start = offset - width if backwards else offset
+                if start >= 0 and value.startswith(alternative, start):
+                    moved.add(start if backwards else offset + width)
+        if not moved:
+            return set()
+        reachable = moved
+    return reachable
+
+
+def _matches_affix(value, operand, at_start: bool) -> bool:
+    """``prefix`` when ``at_start``, ``suffix`` otherwise. Only a string can
+    match: AWS matches an affix against the quoted form of the value, so
+    ``{"prefix": "5"}`` never reaches the number ``5`` (see ``_validate_affix``
+    for what that makes an empty operand mean). A nested ``equals-ignore-case``
+    is AWS's spelling of a case-insensitive affix."""
+    if not isinstance(value, str):
+        return False
+    ignore_case = isinstance(operand, dict)
+    if ignore_case:
+        if len(operand) != 1 or "equals-ignore-case" not in operand:
             return False
-        i = 0
-        while i < len(ops) - 1:
-            op, threshold = ops[i], float(ops[i + 1])
-            if op == ">" and not (num > threshold):
-                return False
-            if op == ">=" and not (num >= threshold):
-                return False
-            if op == "<" and not (num < threshold):
-                return False
-            if op == "<=" and not (num <= threshold):
-                return False
-            if op == "=" and not (num == threshold):
-                return False
-            i += 2
-        return True
-    if "exists" in filter_rule:
-        return filter_rule["exists"] == (value is not None)
+        operand = operand["equals-ignore-case"]
+    candidates = _string_operands(operand)
+    if candidates is None:
+        return False
+    if ignore_case:
+        return any(_ignore_case_reach(value, c, not at_start) for c in candidates)
+    return any(value.startswith(c) if at_start else value.endswith(c) for c in candidates)
+
+
+def _matches_equals_ignore_case(value, operand) -> bool:
+    """Match an ``equals-ignore-case`` operand against the whole value.
+
+    AWS accepts either case of each operand character independently, which is
+    neither ``value.lower() == operand.lower()`` nor ``casefold`` — the two are
+    wrong in opposite directions. ``lower()`` under-matches where the cases
+    differ in length (it rejects ``straße`` against ``STRASSE``) and
+    over-matches by making the relation symmetric, which AWS's is not: the
+    operand ``ẞ`` matches the value ``ß``, the reverse does not.
+    ``casefold()`` over-matches outright, accepting ``strasse`` for that same
+    operand. So the alternation is walked character by character.
+
+    Only a string value can match. One deliberate divergence: an operand
+    character outside the Basic Multilingual Plane matches itself, where AWS
+    mangles it to ``?`` and so fails to match the very value it was written
+    for."""
+    if not isinstance(value, str):
+        return False
+    operands = _string_operands(operand)
+    # Anchored at both ends: the walk must consume the operand AND land exactly on
+    # the end of the value, which is what makes this equality rather than a prefix.
+    return operands is not None and any(
+        len(value) in _ignore_case_reach(value, o) for o in operands)
+
+
+
+def _cidr_address(text: str):
+    """``text`` as an address, or ``None`` if it is not one AWS would read. The
+    same admission test gates the operand and the value, since two sides spelled
+    alike have to agree."""
+    if _CIDR_IPV4_RE.match(text):
+        text = _normalized_ipv4(text)
+    elif not (":" in text and _CIDR_IPV6_RE.match(text)):
+        return None
+    try:
+        return ipaddress.ip_address(text)
+    except ValueError:
+        return None
+
+
+@functools.lru_cache(maxsize=1024)
+def _cidr_network(operand: str):
+    """The network a ``cidr`` operand denotes, or ``None`` where AWS rejects the
+    operand at rule creation. Cached like ``_compiled_pattern``.
+
+    The grammar is read from ``_validate_cidr`` rather than spelled a second
+    time — the two drifting apart is a rule that fails creation and still
+    matches, or the reverse. ``ipaddress`` cannot stand in for it, being both
+    too permissive (a bare ``10.0.0.1`` read as a ``/32``, a dotted netmask, a
+    zone id) and too strict (it raises on host bits set, which AWS silently
+    floors, so ``10.0.0.5/24`` is the ``10.0.0.0/24`` block)."""
+    try:
+        _validate_cidr(operand)
+    except _InvalidPattern:
+        return None
+    address, _, mask = operand.partition("/")
+    if _CIDR_IPV4_RE.match(address):
+        # Decimal octets, as AWS reads them; see ``_normalized_ipv4``.
+        address = _normalized_ipv4(address)
+    try:
+        return ipaddress.ip_network(f"{address}/{int(mask)}", strict=False)
+    except ValueError:
+        # Unreachable through the validated grammar; a raising matcher fails
+        # the whole batch.
+        return None
+
+
+def _matches_cidr(value, operand) -> bool:
+    """Whether ``value`` is an address inside the ``cidr`` operand's block.
+
+    Both sides must be strings. ``ipaddress`` reads an integer as an address —
+    ``167772161`` is ``10.0.0.1``, and ``True`` is ``0.0.0.1`` — so an
+    unguarded numeric detail value would match a block AWS never matches it
+    against. Only one operand string is read: AWS takes one block per ``cidr``
+    object, several being written as sibling objects in the field's value list.
+
+    An address of the other family does not match. The version is compared
+    before the containment test rather than leaning on ``in`` to answer it,
+    since that behaviour is a property of the stdlib rather than of this
+    matcher's contract."""
+    if not isinstance(value, str) or not isinstance(operand, str):
+        return False
+    network = _cidr_network(operand)
+    if network is None:
+        return False
+    address = _cidr_address(value)
+    if address is None:
+        return False
+    return address.version == network.version and address in network
+
+
+# ``numeric`` comparison operators, in the [op, threshold, ...] operand order.
+_NUMERIC_OPS = {
+    ">": operator.gt,
+    ">=": operator.ge,
+    "<": operator.lt,
+    "<=": operator.le,
+    "=": operator.eq,
+}
+
+
+def _numeric_conditions(ops):
+    """Normalize a ``numeric`` operand into ``[(op, threshold), ...]``, or
+    ``None`` when it is malformed. ``{"numeric": 5}`` and
+    ``{"numeric": [">", "abc"]}`` both used to escape as a 500 InternalError.
+    The operator is type-checked before the lookup because an unhashable one
+    raises from the ``in`` test itself, and the threshold conversion catches
+    OverflowError because that, not ValueError, is what ``float()`` raises for
+    an integer literal too large for a double."""
+    if not isinstance(ops, list) or not ops or len(ops) % 2:
+        return None
+    conditions = []
+    for i in range(0, len(ops), 2):
+        op = ops[i]
+        if not isinstance(op, str) or op not in _NUMERIC_OPS:
+            return None
+        try:
+            conditions.append((op, float(ops[i + 1])))
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return conditions
+
+
+def _matches_numeric(value, operand) -> bool:
+    conditions = _numeric_conditions(operand)
+    if conditions is None:
+        return False
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        # A JSON number and nothing else: the text "50" and ``True`` both
+        # convert happily in Python, so without this the rule over-matched.
+        return False
+    try:
+        num = float(value)
+    except (ValueError, TypeError, OverflowError):
+        # OverflowError: an integer too large for a double. Non-match, not 500.
+        return False
+    return all(_NUMERIC_OPS[op](num, threshold) for op, threshold in conditions)
+
+
+def _matches_exactly(value, operand) -> bool:
+    """``exactly``'s operand is a string and nothing else — AWS refuses any other
+    at rule creation — so a stored ``{"exactly": 5}`` matches nothing rather than
+    standing in for the numeric equality it was not written as."""
+    return isinstance(operand, str) and _json_equal(value, operand)
+
+
+def _matches_anything_but(value, operand) -> bool:
+    """``anything-but`` takes a literal or list of literals, OR one nested
+    content matcher (not ``cidr``; see ``_nested_matcher_ok``). AWS rejects a
+    list mixing literals and nested matchers at rule creation, so only the
+    strict form is matched."""
+    if isinstance(operand, dict):
+        return _nested_matcher_ok(operand) and not _matches_content_filter(value, operand)
+    if isinstance(operand, list):
+        return not any(_json_equal(value, item) for item in operand)
+    return not _json_equal(value, operand)
+
+
+# Every operator answered from the *value*, mapped to its matcher. Dict order is
+# the try order, but only ever consulted for one key: AWS refuses a two-operator
+# expression at rule creation, and a pattern is validated before it is matched.
+#
+# ``exists`` has no entry — it asks about the key, not the value, so
+# ``_matches_detail`` settles it before any value gets here.
+_CONTENT_MATCHERS = {
+    "wildcard": _matches_wildcard,
+    "prefix": functools.partial(_matches_affix, at_start=True),
+    "suffix": functools.partial(_matches_affix, at_start=False),
+    "exactly": _matches_exactly,
+    "equals-ignore-case": _matches_equals_ignore_case,
+    "cidr": _matches_cidr,
+    "anything-but": _matches_anything_but,
+    "numeric": _matches_numeric,
+}
+_CONTENT_MATCHER_KEYS = tuple(_CONTENT_MATCHERS)
+# The invertible subset, derived rather than spelled a second time: a gate
+# approving a key the validator refuses is what reopens the inversion.
+_NESTED_MATCHER_KEYS = tuple(k for k in _CONTENT_MATCHER_KEYS if k in _ANYTHING_BUT_NESTABLE)
+
+
+def _nested_matcher_ok(filter_rule) -> bool:
+    """Whether ``anything-but``'s nested operand is one AWS lets it invert and
+    this emulator can evaluate.
+
+    ``cidr`` and ``numeric`` are the interesting exclusions: both are supported
+    as matchers, but AWS nests only ``prefix``, ``suffix``, ``wildcard`` and
+    ``equals-ignore-case``. Inverting an operand that can only answer "no
+    match" — malformed, or not invertible — would turn a bad rule into one that
+    matches *every* event and fans it out to its targets, so ``anything-but``
+    declines instead. Validation refuses these outright now; this is the
+    backstop for a rule restored from persisted state, which is never
+    revalidated.
+
+    Anything other than exactly one invertible key is declined, so the answer
+    cannot depend on which key the dispatch reaches first. The scan is over
+    ``_matches_content_filter``'s own keys, so the key approved here is the key
+    that answers there — and ``exists``, having no registry entry, is invisible
+    to it: ``{"exists": true, "prefix": "a"}`` is approved on the prefix.
+    Validation is what refuses that, reporting "Only one key allowed in match
+    expression" for any operand dict with more than one key, so the gate never
+    sees one."""
+    if not isinstance(filter_rule, dict):
+        return False
+    present = [k for k in _CONTENT_MATCHER_KEYS if k in filter_rule]
+    if len(present) != 1 or present[0] not in _NESTED_MATCHER_KEYS:
+        return False
+    # All four nestable operators take a pattern string or a list of them, so
+    # one arm covers them.
+    return _string_operands(filter_rule[present[0]]) is not None
+
+
+def _matches_content_filter(value, filter_rule):
+    """Whether one scalar satisfies one match expression — the first operator it
+    names in registry order, since AWS allows it only one."""
+    for key, matcher in _CONTENT_MATCHERS.items():
+        if key in filter_rule:
+            return matcher(value, filter_rule[key])
     return False
 
 
-def _invoke_target(target, event, rule):
+def _invoke_target(target, event, rule, view=None):
     arn = target.get("Arn", "")
     event_path = set(event.get("_DispatchPath") or [])
 
-    raw_time = event["Time"]
-    if isinstance(raw_time, (int, float)):
-        iso_time = datetime.fromtimestamp(raw_time, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    else:
-        iso_time = raw_time
+    # The tree the rule matched on, so a rule cannot fire on a field whose
+    # delivered value differs. Decoded once for the whole event.
+    view = view or _pattern_event_view(event)
+    event_payload = json.dumps(view.event_with_detail())
 
-    event_payload = json.dumps({
-        "version": "0",
-        "id": event["EventId"],
-        "source": event["Source"],
-        "account": get_account_id(),
-        "time": iso_time,
-        "region": get_region(),
-        "resources": event.get("Resources", []),
-        "detail-type": event["DetailType"],
-        "detail": json.loads(event["Detail"]) if isinstance(event["Detail"], str) else event["Detail"],
-    })
-
+    # An ``InputPath`` that does not resolve leaves the whole event in place.
     target_input_payload = None
-    input_transformer = target.get("InputTransformer")
-    if input_transformer:
-        event_payload = _apply_input_transformer(input_transformer, event, rule)
-        target_input_payload = event_payload
+    if target.get("InputTransformer"):
+        target_input_payload = _apply_input_transformer(target["InputTransformer"], rule, view)
     elif target.get("Input"):
-        event_payload = target["Input"]
-        target_input_payload = event_payload
+        target_input_payload = target["Input"]
     elif target.get("InputPath"):
         try:
-            full = json.loads(event_payload)
-            parts = target["InputPath"].strip("$.").split(".")
-            val = full
-            for p in parts:
-                if p:
-                    val = val[p]
-            event_payload = json.dumps(val)
-            target_input_payload = event_payload
+            val = json.loads(event_payload)
+            for part in target["InputPath"].strip("$.").split("."):
+                if part:
+                    val = val[part]
+            target_input_payload = json.dumps(val)
         except Exception:
             pass
+    if target_input_payload is not None:
+        event_payload = target_input_payload
 
     try:
         try:
@@ -1257,26 +2322,14 @@ def _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload=N
     logger.info("EventBridge -> Event bus %s: dispatched", spec)
 
 
-def _apply_input_transformer(transformer, event, rule=None):
+def _apply_input_transformer(transformer, rule, view):
     input_paths = transformer.get("InputPathsMap", {})
     template = transformer.get("InputTemplate", "")
 
-    try:
-        full = json.loads(event.get("Detail", "{}")) if isinstance(event.get("Detail"), str) else event.get("Detail", {})
-    except Exception:
-        full = {}
-
-    event_envelope = {
-        "version": "0",
-        "source": event.get("Source", ""),
-        "detail-type": event.get("DetailType", ""),
-        "detail": full,
-        "account": get_account_id(),
-        "region": get_region(),
-        "time": event.get("Time", ""),
-        "id": event.get("EventId", ""),
-        "resources": event.get("Resources", []),
-    }
+    # The same tree the rule matched on and the target is delivered:
+    # hand-building a third copy here is how ``time`` came to render as a raw
+    # epoch second while the payload alongside it carried the ISO-8601 string.
+    event_envelope = view.event_with_detail()
 
     replacements = {}
     for var_name, jpath in input_paths.items():
@@ -1296,7 +2349,7 @@ def _apply_input_transformer(transformer, event, rule=None):
     ingestion_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     reserved = {
         "aws.events.event.json": json.dumps(event_envelope),
-        "aws.events.event": json.dumps({k: v for k, v in event_envelope.items() if k != "detail"}),
+        "aws.events.event": json.dumps(view.envelope()),
         "aws.events.event.ingestion-time": ingestion_time,
     }
     if rule:
@@ -1846,6 +2899,10 @@ def _create_archive(data):
     if name in _archives:
         return error_response_json("ResourceAlreadyExistsException", f"Archive {name} already exists", 400)
 
+    pattern_error = _event_pattern_error(data.get("EventPattern", ""))
+    if pattern_error:
+        return _invalid_event_pattern(pattern_error)
+
     source_arn = data.get("EventSourceArn", "")
     arn = f"arn:aws:events:{get_region()}:{get_account_id()}:archive/{name}"
     _archives[name] = {
@@ -1891,15 +2948,9 @@ def _update_archive(data):
         archive["Description"] = data["Description"]
     if "EventPattern" in data:
         ep = data["EventPattern"]
-        if isinstance(ep, str) and ep:
-            try:
-                json.loads(ep)
-            except json.JSONDecodeError:
-                return error_response_json(
-                    "InvalidEventPatternException",
-                    "Event pattern is not valid JSON",
-                    400,
-                )
+        pattern_error = _event_pattern_error(ep)
+        if pattern_error:
+            return _invalid_event_pattern(pattern_error)
         archive["EventPattern"] = ep
     if "RetentionDays" in data:
         archive["RetentionDays"] = int(data["RetentionDays"])
@@ -2005,6 +3056,10 @@ def _start_replay(data):
                     continue
                 replayed = dict(event)
                 replayed["EventBusName"] = dest_bus_name
+                # AWS stamps a replayed event with the replay's name, which is
+                # how a rule tells replayed traffic from live traffic — either
+                # to act on it or, more often, to filter it out.
+                replayed["ReplayName"] = name
                 _dispatch_event(replayed)
             replay["State"] = "COMPLETED"
             replay["ReplayEndTime"] = _now_ts()
@@ -3022,9 +4077,10 @@ def _tick_scheduled_rules():
                 "Account": account_id,
                 "Region": get_region(),
             }
+            view = _pattern_event_view(event)
             for target in targets:
                 try:
-                    _invoke_target(target, event, rule)
+                    _invoke_target(target, event, rule, view)
                 except Exception:
                     logger.exception(
                         "EventBridge scheduler: dispatch error for rule %s account %s",
@@ -3076,5 +4132,15 @@ def reset():
     _rule_last_fired.clear()
     with _oauth_tokens_lock:
         _oauth_tokens.clear()
+    # These memoize on text a caller sent — a pattern, a wildcard operand, a cidr
+    # block — and on the epoch second an event carries, and nothing else evicts an
+    # entry below the 1024-entry cap, so a reset that skipped them would keep
+    # hundreds of megabytes of compiled regexes and expanded ``$or``s for rules it
+    # just deleted. Clearing cannot change an answer: each is a pure function of
+    # its key.
+    _compiled_pattern.cache_clear()
+    _wildcard_regex.cache_clear()
+    _cidr_network.cache_clear()
+    _iso_time.cache_clear()
     # The "default" bus is lazily recreated per-account on next access via
     # _ensure_default_bus(), so nothing to re-seed here.

@@ -306,13 +306,30 @@ def _open_subscriber(api_id, *, auth_header: dict | None = None):
 
 
 def _subscribe(ws, sub_id, channel):
+    """Subscribe and wait for the subscription *outcome* frame.
+
+    The first frame after a subscribe is not guaranteed to be the ack — a
+    server keep-alive can interleave — so this drains to the outcome instead
+    of returning whatever arrives first.
+    """
     ws.send_json({"type": "subscribe", "id": sub_id, "channel": channel})
-    resp = ws.recv_json()
-    return resp
+    return _drain_until(
+        ws,
+        lambda f: f.get("type") in ("subscribe_success", "subscribe_error"),
+    )
 
 
-def _drain_until(ws, predicate, *, timeout=3.0):
-    """Read frames until ``predicate(frame)`` returns True, ignoring 'ka' noise."""
+def _drain_until(ws, predicate, *, timeout=15.0):
+    """Read frames until ``predicate(frame)`` returns True, ignoring 'ka' noise.
+
+    The default budget is deliberately generous: this is a condition wait, so
+    a passing run returns the moment the frame arrives and never sleeps it
+    out. The deadline only bounds the *failure* case — and under a loaded
+    parallel shard (xdist neighbors cold-starting containers on the same
+    server) an ack can legitimately take longer than a lightly-loaded run
+    would suggest. Absence assertions must NOT use this default; they run to
+    their deadline every time and stay on short explicit budgets.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         remaining = max(0.1, deadline - time.time())
@@ -767,7 +784,7 @@ def test_websocket_subscribe_receives_published_event(api):
         status, _ = _publish_http(api, "/default/room1", [json.dumps({"text": "hi"})])
         assert status == 200
 
-        data = _drain_until(ws, lambda f: f.get("type") == "data", timeout=3.0)
+        data = _drain_until(ws, lambda f: f.get("type") == "data")
         assert data is not None
         assert data["id"] == "sub-1"
         # Per spec, the `event` field is an ARRAY of JSON-encoded strings.
@@ -784,7 +801,7 @@ def test_websocket_single_level_wildcard(api):
         time.sleep(0.05)
 
         _publish_http(api, "/default/room1", [json.dumps("a")])
-        first = _drain_until(ws, lambda f: f.get("type") == "data", timeout=3.0)
+        first = _drain_until(ws, lambda f: f.get("type") == "data")
         assert first is not None
         assert first["id"] == "sub-1"
         assert json.loads(first["event"][0]) == "a"
@@ -804,12 +821,12 @@ def test_websocket_unsubscribe_stops_delivery(api):
         time.sleep(0.05)
 
         _publish_http(api, "/default/room1", [json.dumps("first")])
-        first = _drain_until(ws, lambda f: f.get("type") == "data", timeout=3.0)
+        first = _drain_until(ws, lambda f: f.get("type") == "data")
         assert first is not None
         assert json.loads(first["event"][0]) == "first"
 
         ws.send_json({"type": "unsubscribe", "id": "sub-x"})
-        unsub_ack = _drain_until(ws, lambda f: f.get("type") == "unsubscribe_success", timeout=2.0)
+        unsub_ack = _drain_until(ws, lambda f: f.get("type") == "unsubscribe_success")
         assert unsub_ack == {"type": "unsubscribe_success", "id": "sub-x"}
 
         _publish_http(api, "/default/room1", [json.dumps("after")])
@@ -1222,13 +1239,13 @@ def test_websocket_publish_frame_acks_and_fans_out(api):
             "channel": "/default/room1",
             "events": [json.dumps("over-ws")],
         })
-        ack = _drain_until(publisher, lambda f: f.get("type") == "publish_success", timeout=3.0)
+        ack = _drain_until(publisher, lambda f: f.get("type") == "publish_success")
         assert ack is not None
         assert ack["id"] == "pub-1"
         assert len(ack["successful"]) == 1
         assert ack["failed"] == []
 
-        data = _drain_until(listener, lambda f: f.get("type") == "data", timeout=3.0)
+        data = _drain_until(listener, lambda f: f.get("type") == "data")
         assert data is not None
         assert data["id"] == "sub-listener"
         assert json.loads(data["event"][0]) == "over-ws"
@@ -1266,7 +1283,7 @@ def test_websocket_server_sends_keepalive():
         client.create_channel_namespace(apiId=api_id, name="default")
         ws = _open_subscriber(api_id)
         try:
-            ka = _drain_until(ws, lambda f: f.get("type") == "ka", timeout=float(ka_interval) + 2.0)
+            ka = _drain_until(ws, lambda f: f.get("type") == "ka", timeout=float(ka_interval) + 10.0)
             assert ka == {"type": "ka"}
         finally:
             ws.close()
@@ -1354,7 +1371,7 @@ def test_subscribe_rejects_invalid_channel_path(api):
     ws = _open_subscriber(api)
     try:
         ws.send_json({"type": "subscribe", "id": "sub-bad", "channel": "/default/bad_seg"})
-        err = _drain_until(ws, lambda f: f.get("type") == "subscribe_error", timeout=2.0)
+        err = _drain_until(ws, lambda f: f.get("type") == "subscribe_error")
         assert err is not None
         assert err["id"] == "sub-bad"
     finally:
