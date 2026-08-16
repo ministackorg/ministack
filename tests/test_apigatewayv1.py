@@ -1501,10 +1501,14 @@ def test_apigwv1_execute_lambda_custom_returns_raw_output(apigw_v1, lam):
         lam.delete_function(FunctionName=fname)
 
 
-def test_apigwv1_execute_lambda_custom_function_error_is_502(apigw_v1, lam):
-    """A function error on a non-proxy integration is a 502 with the generic
-    gateway body — AWS never leaks the error payload to the caller."""
-    import urllib.error as _urlerr
+def test_apigwv1_execute_lambda_custom_function_error_passes_through_200(apigw_v1, lam):
+    """A standard Lambda error on a non-proxy integration is returned through the
+    default (200) integration response with the raw error document as the body.
+
+    AWS only maps a Lambda error to a 5xx when an integration-response
+    selectionPattern matches it; with none configured — the only shape modeled —
+    the error is "returned as 200 OK by default"
+    (https://docs.aws.amazon.com/apigateway/latest/developerguide/handle-errors-in-lambda-integration.html)."""
     import urllib.request as _urlreq
     import uuid as _uuid
 
@@ -1517,12 +1521,13 @@ def test_apigwv1_execute_lambda_custom_function_error_is_502(apigw_v1, lam):
     try:
         req = _urlreq.Request(url, method="GET")
         req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
-        with pytest.raises(_urlerr.HTTPError) as exc:
-            _urlreq.urlopen(req)
-        assert exc.value.code == 502
-        body = json.loads(exc.value.read())
-        assert body == {"message": "Internal server error"}
-        assert "kaboom" not in json.dumps(body)
+        resp = _urlreq.urlopen(req)
+        assert resp.status == 200
+        body = json.loads(resp.read())
+        # The standard Lambda error document is passed through as the body,
+        # rather than being hidden behind a generic gateway message.
+        assert body.get("errorMessage") == "kaboom"
+        assert "errorType" in body
     finally:
         apigw_v1.delete_rest_api(restApiId=api_id)
         lam.delete_function(FunctionName=fname)

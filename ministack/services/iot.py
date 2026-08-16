@@ -9,6 +9,11 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
   - Certificates: ``CreateKeysAndCertificate``, ``RegisterCertificate``,
     ``RegisterCertificateWithoutCA``, ``UpdateCertificate``,
     ``DeleteCertificate``, ``AttachThingPrincipal`` / ``DetachThingPrincipal``
+  - CA certificates + JITR: ``GetRegistrationCode`` / ``DeleteRegistrationCode``,
+    ``RegisterCACertificate``, ``DescribeCACertificate``, ``UpdateCACertificate``,
+    ``ListCACertificates``, ``DeleteCACertificate``; registering a device
+    certificate under a CA with auto-registration enabled publishes the AWS
+    JITR event to ``$aws/events/certificates/registered/{caCertificateId}``
   - Policies: ``CreatePolicy``, ``CreatePolicyVersion``, ``AttachPolicy``,
     ``DetachPolicy``, etc., plus the deprecated principal-policy family
     (``AttachPrincipalPolicy`` / ``DetachPrincipalPolicy`` /
@@ -61,6 +66,7 @@ from ministack.core.responses import (
     request_scope,
 )
 from ministack.core.x509_utils import (
+    certificate_is_signed_by,
     generate_ca,
     get_certificate_id,
     sign_leaf_certificate,
@@ -88,6 +94,10 @@ _topic_rules: AccountRegionScopedDict = AccountRegionScopedDict()
 _shadows: AccountRegionScopedDict = AccountRegionScopedDict()
 # Fleet-indexing configuration, one entry per account+region.
 _indexing_config: AccountRegionScopedDict = AccountRegionScopedDict()
+# CA-certificate registry (RegisterCACertificate & friends): caCertificateId -> record
+_ca_certificates: AccountRegionScopedDict = AccountRegionScopedDict()
+# JITR registration code — a single "code" key per account/region
+_registration_codes: AccountRegionScopedDict = AccountRegionScopedDict()
 
 # Local CA state — lazily generated on first use, persisted across restarts.
 import threading
@@ -182,6 +192,8 @@ def get_state() -> dict:
         "topic_rules": copy.deepcopy(_topic_rules),
         "shadows": copy.deepcopy(_shadows),
         "indexing_config": copy.deepcopy(_indexing_config),
+        "ca_certificates": copy.deepcopy(_ca_certificates),
+        "registration_codes": copy.deepcopy(_registration_codes),
         "ca": {"ca_cert_pem": _ca_cert_pem, "ca_key_pem": _ca_key_pem}
         if _ca_cert_pem and _ca_key_pem
         else {},
@@ -201,6 +213,8 @@ def restore_state(data: dict | None) -> None:
     _topic_rules.update(data.get("topic_rules", {}))
     _shadows.update(data.get("shadows", {}))
     _indexing_config.update(data.get("indexing_config", {}))
+    _ca_certificates.update(data.get("ca_certificates", {}))
+    _registration_codes.update(data.get("registration_codes", {}))
     ca_data = data.get("ca")
     if ca_data:
         cert = ca_data.get("ca_cert_pem")
@@ -227,6 +241,8 @@ def reset() -> None:
     # gets no warning.
     _warned_sql_funcs.clear()
     _indexing_config.clear()
+    _ca_certificates.clear()
+    _registration_codes.clear()
     with _CA_LOCK:
         _ca_cert_pem = None
         _ca_key_pem = None
@@ -286,6 +302,10 @@ def _thing_group_arn(name: str) -> str:
 
 def _cert_arn(certificate_id: str) -> str:
     return f"arn:aws:iot:{get_region()}:{get_account_id()}:cert/{certificate_id}"
+
+
+def _ca_cert_arn(certificate_id: str) -> str:
+    return f"arn:aws:iot:{get_region()}:{get_account_id()}:cacert/{certificate_id}"
 
 
 def _policy_arn(name: str) -> str:
@@ -401,9 +421,20 @@ async def handle_request(
     if path == "/keys-and-certificate" and method == "POST":
         return _create_keys_and_certificate(qp)
     if path == "/certificate/register" and method == "POST":
-        return _register_certificate(_parse_body(body), qp)
+        return await _register_certificate(_parse_body(body), qp)
     if path == "/certificate/register-no-ca" and method == "POST":
-        return _register_certificate(_parse_body(body), qp, without_ca=True)
+        return await _register_certificate(_parse_body(body), qp, without_ca=True)
+
+    # CA certificates + JITR registration code
+    if path == "/registrationcode" and method in ("GET", "DELETE"):
+        return _handle_registration_code(method)
+    if path == "/cacertificate" and method == "POST":
+        return _register_ca_certificate(_parse_body(body), qp)
+    if path == "/cacertificates" and method == "GET":
+        return _list_ca_certificates(qp)
+    if path.startswith("/cacertificate/") and method in ("GET", "PUT", "DELETE"):
+        return _handle_ca_certificate(method, path, body, qp)
+
     if path == "/certificates" and method == "GET":
         return _list_certificates(qp)
     if path.startswith("/certificates/") and method in ("GET", "PUT", "DELETE"):
@@ -993,19 +1024,21 @@ def _create_keys_and_certificate(qp: dict) -> tuple:
     })
 
 
-def _certificate_already_exists(cert_id: str) -> tuple:
+def _certificate_already_exists(cert_id: str, arn: str | None = None) -> tuple:
     """409 for a duplicate PEM, carrying ``resourceId``/``resourceArn`` the way
-    real AWS's ``ResourceAlreadyExistsException`` does — both register variants
-    answer identically."""
+    real AWS's ``ResourceAlreadyExistsException`` does — all register variants
+    (device certs and CA certs) answer identically."""
     return error_response_json(
         "ResourceAlreadyExistsException",
         f"The certificate with id {cert_id} already exists.",
         409,
-        extra={"resourceId": cert_id, "resourceArn": _cert_arn(cert_id)},
+        extra={"resourceId": cert_id, "resourceArn": arn or _cert_arn(cert_id)},
     )
 
 
-def _register_certificate(payload: dict, qp: dict, *, without_ca: bool = False) -> tuple:
+async def _register_certificate(
+    payload: dict, qp: dict, *, without_ca: bool = False
+) -> tuple:
     """Register a certificate that was issued elsewhere (no re-signing).
 
     Serves both ``RegisterCertificate`` (``POST /certificate/register``) and
@@ -1015,6 +1048,14 @@ def _register_certificate(payload: dict, qp: dict, *, without_ca: bool = False) 
     JSON body kept as a fallback for raw callers. The no-CA variant carries no
     CA reference and takes its status from the plain ``status`` body field
     only — it has no deprecated ``setAsActive``.
+
+    ``caCertificatePem`` must name a CA registered via
+    ``RegisterCACertificate`` in this account/region that really signed the
+    leaf; anything else is a ``CertificateValidationException``. When that CA's
+    ``autoRegistrationStatus`` is ``ENABLE``, the AWS JITR lifecycle event is
+    published to ``$aws/events/certificates/registered/{caCertificateId}`` so
+    just-in-time-registration Lambdas subscribed via topic rules fire exactly
+    as on AWS.
     """
     cert_pem = payload.get("certificatePem") or qp.get("certificatePem")
     if not cert_pem:
@@ -1029,12 +1070,43 @@ def _register_certificate(payload: dict, qp: dict, *, without_ca: bool = False) 
     ca_pem = None if without_ca else payload.get("caCertificatePem")
     try:
         cert_id = get_certificate_id(cert_pem)
+        ca_id = get_certificate_id(ca_pem) if ca_pem else None
     except Exception as e:
         return error_response_json(
             "CertificateValidationException",
             f"Invalid certificate PEM: {e}",
             400,
         )
+    # caCertificatePem is a claim about who signed the leaf, and the whole JITR
+    # flow keys off it: the event topic, and with it the provisioning template a
+    # JITR Lambda picks, is chosen by caCertificateId. An unchecked claim lets a
+    # certificate signed by CA-X register as CA-Y's and provision the wrong
+    # fleet, so the claim is verified the way AWS does before anything is
+    # stored — the CA has to be registered in this account/region, and it has to
+    # be the certificate that actually signed the leaf.
+    ca = None
+    if ca_id is not None:
+        ca = _ca_certificates.get(ca_id)
+        if ca is None:
+            return error_response_json(
+                "CertificateValidationException",
+                (
+                    f"The CA certificate {ca_id} is not registered in this "
+                    "account and region. Register it with RegisterCACertificate, "
+                    "or use RegisterCertificateWithoutCA."
+                ),
+                400,
+            )
+        if not certificate_is_signed_by(cert_pem, ca_pem):
+            return error_response_json(
+                "CertificateValidationException",
+                (
+                    f"The certificate was not signed by CA {ca_id}. "
+                    "caCertificatePem must be the CA certificate that issued "
+                    "certificatePem."
+                ),
+                400,
+            )
     if cert_id in _certificates:
         return _certificate_already_exists(cert_id)
     record = {
@@ -1044,11 +1116,48 @@ def _register_certificate(payload: dict, qp: dict, *, without_ca: bool = False) 
         "status": status or ("ACTIVE" if set_active else "INACTIVE"),
         "creationDate": _now_epoch(),
         "ownedBy": get_account_id(),
-        "caCertificateId": get_certificate_id(ca_pem) if ca_pem else None,
+        "caCertificateId": ca_id,
         "attachedThings": [],
         "attachedPolicies": [],
     }
     _certificates[cert_id] = record
+
+    # JITR: the registered-certificate lifecycle event, fired when the
+    # referenced CA is ACTIVE and has auto-registration enabled — AWS
+    # auto-registers nothing under an INACTIVE CA. certificateStatus echoes
+    # the requested register status; real connect-triggered auto-registration
+    # carries PENDING_ACTIVATION, but here registration is always explicit —
+    # there is no mTLS first-connect path to auto-register from.
+    if (
+        ca
+        and ca.get("status") == "ACTIVE"
+        and ca.get("autoRegistrationStatus") == "ENABLE"
+    ):
+        now_ms = int(time.time() * 1000)
+        event = {
+            "certificateId": cert_id,
+            "caCertificateId": ca_id,
+            "timestamp": now_ms,
+            "certificateStatus": record["status"],
+            "awsAccountId": get_account_id(),
+            "certificateRegistrationTimestamp": str(now_ms),
+        }
+        try:
+            await broker_publish(
+                get_account_id(),
+                get_region(),
+                f"$aws/events/certificates/registered/{ca_id}",
+                json.dumps(event).encode("utf-8"),
+                qos=0,
+            )
+        except Exception:
+            # The certificate is already registered at this point, so a broker
+            # failure must not turn a successful registration into a 500 — the
+            # iot-data publish path guards the same call the same way.
+            logger.warning(
+                "JITR registered-event publish failed for CA %s", ca_id, exc_info=True
+            )
+
     return json_response({
         "certificateArn": record["certificateArn"],
         "certificateId": cert_id,
@@ -1079,16 +1188,19 @@ def _handle_certificate(method: str, path: str, body: bytes, qp: dict) -> tuple:
     if record is None:
         return _error_not_found("Certificate", cert_id)
     if method == "GET":
-        return json_response({
-            "certificateDescription": {
-                "certificateArn": record["certificateArn"],
-                "certificateId": record["certificateId"],
-                "status": record["status"],
-                "certificatePem": record["certificatePem"],
-                "ownedBy": record["ownedBy"],
-                "creationDate": record.get("creationDate"),
-            }
-        })
+        description = {
+            "certificateArn": record["certificateArn"],
+            "certificateId": record["certificateId"],
+            "status": record["status"],
+            "certificatePem": record["certificatePem"],
+            "ownedBy": record["ownedBy"],
+            "creationDate": record.get("creationDate"),
+        }
+        # Present only for CA-signed registrations, so JITR consumers can
+        # resolve the signing CA (per the CertificateDescription model).
+        if record.get("caCertificateId"):
+            description["caCertificateId"] = record["caCertificateId"]
+        return json_response({"certificateDescription": description})
     if method == "PUT":
         payload = _parse_body(body)
         new_status = payload.get("newStatus") or qp.get("newStatus")
@@ -1107,9 +1219,158 @@ def _handle_certificate(method: str, path: str, body: bytes, qp: dict) -> tuple:
             return error_response_json(
                 "CertificateStateException",
                 "Certificate is ACTIVE; deactivate before deletion",
-                409,
+                406,
             )
         del _certificates[cert_id]
+        return json_response({})
+    return error_response_json(
+        "InvalidRequestException", f"Unsupported method: {method}", 400
+    )
+
+
+# ---------------------------------------------------------------------------
+# CA-certificate registry + JITR registration code
+# ---------------------------------------------------------------------------
+
+
+def _handle_registration_code(method: str) -> tuple:
+    """``GET|DELETE /registrationcode`` — ``GetRegistrationCode`` /
+    ``DeleteRegistrationCode``.
+
+    The code is minted once per account/region (a random SHA-256 hex string,
+    AWS-shaped), persisted, and returned unchanged on every subsequent GET.
+    DELETE discards it; the next GET mints a fresh one.
+    """
+    if method == "GET":
+        code = _registration_codes.get("code")
+        if not code:
+            code = hashlib.sha256(os.urandom(32)).hexdigest()
+            _registration_codes["code"] = code
+        return json_response({"registrationCode": code})
+    # DELETE
+    _registration_codes.pop("code", None)
+    return json_response({})
+
+
+def _register_ca_certificate(payload: dict, qp: dict) -> tuple:
+    """``POST /cacertificate`` (``RegisterCACertificate``).
+
+    Body members per the botocore model: ``caCertificate`` (required) and
+    ``verificationCertificate`` (accepted; the registration-code CN handshake
+    is not enforced locally). ``setAsActive`` / ``allowAutoRegistration`` ride
+    as query-string booleans, as on AWS.
+    """
+    ca_pem = payload.get("caCertificate")
+    if not ca_pem:
+        return error_response_json(
+            "InvalidRequestException", "caCertificate is required", 400
+        )
+    try:
+        ca_id = get_certificate_id(ca_pem)
+    except Exception as e:
+        return error_response_json(
+            "CertificateValidationException",
+            f"Invalid CA certificate PEM: {e}",
+            400,
+        )
+    if ca_id in _ca_certificates:
+        return _certificate_already_exists(ca_id, _ca_cert_arn(ca_id))
+    set_active = _qp_bool(qp, "setAsActive")
+    allow_auto = _qp_bool(qp, "allowAutoRegistration")
+    record = {
+        "certificateId": ca_id,
+        "certificateArn": _ca_cert_arn(ca_id),
+        "certificatePem": ca_pem,  # verbatim
+        "status": "ACTIVE" if set_active else "INACTIVE",
+        "autoRegistrationStatus": "ENABLE" if allow_auto else "DISABLE",
+        "creationDate": _now_epoch(),
+        "ownedBy": get_account_id(),
+    }
+    _ca_certificates[ca_id] = record
+    return json_response({
+        "certificateArn": record["certificateArn"],
+        "certificateId": ca_id,
+    })
+
+
+def _list_ca_certificates(qp: dict) -> tuple:
+    """``GET /cacertificates`` (``ListCACertificates``)."""
+    return json_response({
+        "certificates": [
+            {
+                "certificateArn": c["certificateArn"],
+                "certificateId": c["certificateId"],
+                "status": c["status"],
+                "creationDate": c.get("creationDate"),
+            }
+            for c in _ca_certificates.values()
+        ]
+    })
+
+
+def _handle_ca_certificate(method: str, path: str, body: bytes, qp: dict) -> tuple:
+    """``GET|PUT|DELETE /cacertificate/{caCertificateId}`` —
+    ``DescribeCACertificate`` / ``UpdateCACertificate`` /
+    ``DeleteCACertificate``.
+    """
+    ca_id = path[len("/cacertificate/"):]
+    if not ca_id or "/" in ca_id:
+        return error_response_json(
+            "InvalidRequestException", "Invalid CA certificate path", 400
+        )
+    record = _ca_certificates.get(ca_id)
+    if record is None:
+        return _error_not_found("CACertificate", ca_id)
+    if method == "GET":
+        return json_response({
+            "certificateDescription": {
+                "certificateArn": record["certificateArn"],
+                "certificateId": record["certificateId"],
+                "status": record["status"],
+                "certificatePem": record["certificatePem"],
+                "autoRegistrationStatus": record["autoRegistrationStatus"],
+                "ownedBy": record["ownedBy"],
+                "creationDate": record.get("creationDate"),
+            }
+        })
+    if method == "PUT":
+        # newStatus / newAutoRegistrationStatus are query-string params per the
+        # botocore model; both are optional and independently applied. The body
+        # is read as a fallback, as UpdateCertificate does — otherwise a raw
+        # caller that puts them in the JSON body gets a 200 that applied
+        # nothing.
+        payload = _parse_body(body)
+        new_status = payload.get("newStatus") or qp.get("newStatus")
+        new_auto = (
+            payload.get("newAutoRegistrationStatus")
+            or qp.get("newAutoRegistrationStatus")
+        )
+        if new_status is not None and new_status not in ("ACTIVE", "INACTIVE"):
+            return error_response_json(
+                "InvalidRequestException",
+                "newStatus must be one of ['ACTIVE', 'INACTIVE']",
+                400,
+            )
+        if new_auto is not None and new_auto not in ("ENABLE", "DISABLE"):
+            return error_response_json(
+                "InvalidRequestException",
+                "newAutoRegistrationStatus must be one of ['DISABLE', 'ENABLE']",
+                400,
+            )
+        if new_status is not None:
+            record["status"] = new_status
+        if new_auto is not None:
+            record["autoRegistrationStatus"] = new_auto
+        _ca_certificates[ca_id] = record
+        return json_response({})
+    if method == "DELETE":
+        if record["status"] == "ACTIVE":
+            return error_response_json(
+                "CertificateStateException",
+                "CA certificate is ACTIVE; deactivate before deletion",
+                406,
+            )
+        del _ca_certificates[ca_id]
         return json_response({})
     return error_response_json(
         "InvalidRequestException", f"Unsupported method: {method}", 400
@@ -3375,6 +3636,7 @@ async def broker_stop() -> None:
 
 
 _BASIC_INGEST_PREFIX = "$aws/rules/"
+_SHADOW_TOPIC_PREFIX = "$aws/things/"
 
 
 def _rules_for_account(account_id: str, region: str) -> list[dict]:
@@ -3572,6 +3834,56 @@ def _dispatch_rule_sns(account_id: str, region: str, rule_name: str, spec: dict,
     _broker_logger.debug("IoT rule %s → SNS %s", rule_name, target)
 
 
+def _dispatch_rule_sqs(account_id: str, region: str, rule_name: str, spec: dict, event) -> None:
+    from ministack.services import sqs as _sqs
+
+    queue_url = spec.get("queueUrl") or ""
+    if not queue_url:
+        _broker_logger.warning(
+            "IoT rule %s: sqs action has no queueUrl — skipped", rule_name
+        )
+        return
+    body = event if isinstance(event, str) else json.dumps(event)
+    if spec.get("useBase64"):
+        # useBase64 encodes the message *body*: the consumer receives Base64 text
+        # and has to decode it. It is not a transport hint.
+        body = base64.b64encode(body.encode("utf-8")).decode("ascii")
+    # roleArn is accepted and ignored, as everywhere else here — no IAM to fail.
+    with request_scope(account_id, region):
+        # _get_q matches the URL as stored and then by queue name, which is what
+        # lets a rule written against localhost reach a queue created through a
+        # different host alias, and refuses a URL naming another account rather
+        # than silently resolving to a same-account queue of that name.
+        try:
+            queue = _sqs._get_q(queue_url)
+            if queue["is_fifo"]:
+                # AWS documents FIFO queues as unsupported for this action: the
+                # rules engine is distributed, so it cannot promise the ordering
+                # a FIFO queue exists to provide, and enqueuing anyway would need
+                # a MessageGroupId we would have to invent.
+                _broker_logger.warning(
+                    "IoT rule %s: sqs target %s is a FIFO queue, which the AWS SQS "
+                    "rule action does not support — nothing delivered",
+                    rule_name,
+                    queue_url,
+                )
+                return
+            # Through SQS's own SendMessage body, so the queue's DelaySeconds and
+            # MaximumMessageSize apply and the MessageId is minted the way every
+            # other producer's is.
+            result = _sqs._act_send_message({"MessageBody": body}, queue_url)
+        except _sqs._Err as exc:
+            # SQS raises in its wire vocabulary; the action collector and the
+            # rule's errorAction want a plain exception, so translate at the
+            # boundary as stepfunctions does for the same call.
+            raise RuntimeError(
+                f"SQS SendMessage to {queue_url} failed: {exc.code}: {exc.message}"
+            ) from exc
+    _broker_logger.debug(
+        "IoT rule %s → SQS %s (%s)", rule_name, queue_url, result["MessageId"]
+    )
+
+
 async def _dispatch_rule_action(
     account_id: str, region: str, rule_name: str, action: dict, event
 ) -> None:
@@ -3593,6 +3905,8 @@ async def _dispatch_rule_action(
         )
     elif "sns" in action:
         _dispatch_rule_sns(account_id, region, rule_name, action["sns"] or {}, event)
+    elif "sqs" in action:
+        _dispatch_rule_sqs(account_id, region, rule_name, action["sqs"] or {}, event)
     else:
         _broker_logger.debug(
             "IoT rule %s: unsupported action type %s — skipped",
@@ -3705,6 +4019,169 @@ async def _evaluate_topic_rules(
             await _run_rule_actions(account_id, region, rule, payload, topic, client_id)
 
 
+def _parse_shadow_topic(topic: str) -> tuple[str, str, str | None] | None:
+    """``$aws/things/<thing>/shadow[/name/<n>]/<verb>`` → (thing, verb, name).
+
+    Anything longer — the ``accepted`` / ``rejected`` / ``delta`` /
+    ``documents`` response suffixes — parses as ``None``, so the bridge's own
+    response publishes can never re-trigger it (no recursion)."""
+    if not topic.startswith(_SHADOW_TOPIC_PREFIX):
+        return None
+    rest = topic[len(_SHADOW_TOPIC_PREFIX):]
+    parts = rest.split("/")
+    if len(parts) < 3 or parts[1] != "shadow":
+        return None
+    thing = parts[0]
+    tail = parts[2:]
+    name = None
+    if tail and tail[0] == "name" and len(tail) >= 2:
+        name, tail = tail[1], tail[2:]
+    if not tail:
+        return None
+    verb = tail[0]
+    # Responses (accepted/rejected/delta/documents) are ours, never inputs.
+    if len(tail) > 1 or verb not in ("update", "get", "delete"):
+        return None
+    return thing, verb, name
+
+
+def _shadow_rejected(status: int, message: str, client_token: str | None = None) -> dict:
+    """AWS's shadow error response document."""
+    doc = {"code": status, "message": message}
+    if client_token is not None:
+        doc["clientToken"] = client_token
+    return doc
+
+
+def _shadow_document(doc: dict) -> dict:
+    """Strip the computed ``delta`` sections out of a shadow snapshot.
+
+    `get_thing_shadow` injects ``state.delta`` (and its ``metadata.delta``) by
+    design, because that is what the GET response carries. The documents topic
+    is not a GET: on AWS the ``previous``/``current`` documents report only
+    ``desired`` and ``reported``, and the delta has its own topic. Publishing
+    the snapshot verbatim invented a section real devices never see.
+    """
+    stripped = dict(doc)
+    for section in ("state", "metadata"):
+        block = stripped.get(section)
+        if isinstance(block, dict) and "delta" in block:
+            stripped[section] = {k: v for k, v in block.items() if k != "delta"}
+    return stripped
+
+
+async def _handle_shadow_publish(
+    account_id: str,
+    region: str,
+    thing: str,
+    verb: str,
+    name: str | None,
+    payload: bytes,
+) -> None:
+    """Shadow-over-MQTT bridge: feed a request-topic publish into the shadow
+    store and publish the AWS reserved-topic responses back through the broker
+    (``accepted`` / ``rejected``, plus ``delta`` and ``documents`` on update)."""
+    # `name is not None` rather than a truthiness test: an empty named shadow
+    # (`.../shadow/name//update`) must answer on the topic the requester is
+    # listening on, not collapse onto the classic shadow's.
+    base = f"{_SHADOW_TOPIC_PREFIX}{thing}/shadow" + (f"/name/{name}" if name is not None else "")
+    shadow_name = name or ""
+
+    async def _respond(suffix: str, doc: dict) -> None:
+        await broker_publish(
+            account_id,
+            region,
+            f"{base}/{suffix}",
+            json.dumps(doc).encode("utf-8"),
+            qos=1,
+        )
+
+    try:
+        request = json.loads(payload) if payload else {}
+    except (ValueError, UnicodeDecodeError):
+        # All three request verbs reject malformed JSON, as on AWS — a `get`
+        # or `delete` payload is optional but must parse when present.
+        await _respond(f"{verb}/rejected", _shadow_rejected(400, "invalid json"))
+        return
+    if not isinstance(request, dict):
+        request = {}
+    client_token = request.get("clientToken")
+
+    if name is not None and not name:
+        await _respond(
+            f"{verb}/rejected",
+            _shadow_rejected(400, "Invalid shadow name: must not be empty", client_token),
+        )
+        return
+
+    if verb == "update":
+        # The broker's WS path sets only the account contextvar, so pin both
+        # around every shadow-store access.
+        with request_scope(account_id, region):
+            # get_thing_shadow hands back the stored state dicts themselves and
+            # update_thing_shadow merges into them in place, so `previous` has
+            # to be snapshotted before the update runs — otherwise it reports
+            # the state *after* it, and from the second update on `previous`
+            # and `current` are the same document. `current` is snapshotted for
+            # the same reason: a concurrent update would otherwise edit it out
+            # from under the publish below.
+            pre_status, pre_doc = get_thing_shadow(thing, shadow_name)
+            pre_doc = copy.deepcopy(pre_doc)
+            status, doc = update_thing_shadow(thing, shadow_name, request)
+            post_status, post_doc = (
+                get_thing_shadow(thing, shadow_name) if status == 200 else (0, {})
+            )
+            post_doc = copy.deepcopy(post_doc)
+        if status != 200:
+            await _respond(
+                "update/rejected",
+                _shadow_rejected(status, doc.get("message", ""), client_token),
+            )
+            return
+        # The core update response already echoes clientToken when present.
+        await _respond("update/accepted", doc)
+        if post_status == 200:
+            delta = (post_doc.get("state") or {}).get("delta")
+            if delta:
+                # The delta section of the GET document, with the metadata AWS
+                # reports alongside it and the triggering request's clientToken.
+                delta_doc = {
+                    "state": delta,
+                    "metadata": (post_doc.get("metadata") or {}).get("delta", {}),
+                    "version": post_doc["version"],
+                    "timestamp": post_doc["timestamp"],
+                }
+                if client_token is not None:
+                    delta_doc["clientToken"] = client_token
+                await _respond("update/delta", delta_doc)
+        await _respond(
+            "update/documents",
+            {
+                "previous": _shadow_document(pre_doc) if pre_status == 200 else None,
+                "current": _shadow_document(post_doc) if post_status == 200 else None,
+                "timestamp": _shadow_now(),
+            },
+        )
+        return
+
+    with request_scope(account_id, region):
+        status, doc = (
+            get_thing_shadow(thing, shadow_name)
+            if verb == "get"
+            else delete_thing_shadow(thing, shadow_name)
+        )
+    if status == 200:
+        doc = copy.deepcopy(doc)
+        if client_token is not None:
+            doc["clientToken"] = client_token
+        await _respond(f"{verb}/accepted", doc)
+    else:
+        await _respond(
+            f"{verb}/rejected",
+            _shadow_rejected(status, doc.get("message", ""), client_token),
+        )
+
+
 async def broker_publish(
     account_id: str,
     region: str,
@@ -3807,6 +4284,27 @@ async def broker_publish(
 
     await _evaluate_topic_rules(account_id, region, topic, payload, client_id)
     return delivered
+
+    # Shadow-over-MQTT bridge — AFTER delivery and rule evaluation, so rules
+    # matching `$aws/things/+/shadow/update` fire on the request, and the
+    # recursive `accepted`/`delta`/`documents` publishes then flow back
+    # through this function to drive their own subscribers and rules. The
+    # response suffixes parse as None, so the bridge never re-triggers itself.
+    # NOTE known divergence: `_topic_matches` lets a bare `#` subscription
+    # match `$aws/...` topics, unlike real AWS where `#` excludes the
+    # reserved topic space.
+    shadow = _parse_shadow_topic(topic)
+    if shadow is not None:
+        try:
+            await _handle_shadow_publish(account_id, region, *shadow, payload)
+        except Exception:
+            # Guarded like subscriber delivery and rule dispatch above: a
+            # payload the bridge chokes on (a deeply nested document raises
+            # RecursionError out of json.loads, which the ValueError handler
+            # inside does not catch) must not tear down the MQTT session.
+            _broker_logger.warning(
+                "IoT shadow bridge failed for %r", topic, exc_info=True
+            )
 
 
 async def broker_subscribe(
