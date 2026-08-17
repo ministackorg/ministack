@@ -2455,6 +2455,75 @@ def test_s3_bucket_acl(s3):
     assert "Owner" in resp
     assert "Grants" in resp
 
+def test_s3_bucket_acl_canned(s3):
+    """Canned x-amz-acl on CreateBucket and PutBucketAcl round-trips as the
+    grants it implies. SDKs send the canned value as a header with an empty
+    body, which used to be dropped, so `--acl public-read` read back as
+    owner-only."""
+    import uuid as _u
+    bucket = f"acl-bkt-canned-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket, ACL="public-read")
+    grants = s3.get_bucket_acl(Bucket=bucket)["Grants"]
+    assert len(grants) == 2
+    group = [g for g in grants if g["Grantee"]["Type"] == "Group"]
+    assert group[0]["Grantee"]["URI"].endswith("global/AllUsers")
+    assert group[0]["Permission"] == "READ"
+
+    s3.put_bucket_acl(Bucket=bucket, ACL="public-read-write")
+    grants = s3.get_bucket_acl(Bucket=bucket)["Grants"]
+    perms = {g["Permission"] for g in grants if g["Grantee"]["Type"] == "Group"}
+    assert perms == {"READ", "WRITE"}
+
+    s3.put_bucket_acl(Bucket=bucket, ACL="private")
+    grants = s3.get_bucket_acl(Bucket=bucket)["Grants"]
+    assert len(grants) == 1
+    assert grants[0]["Permission"] == "FULL_CONTROL"
+    s3.delete_bucket(Bucket=bucket)
+
+def test_s3_put_bucket_acl_invalid_canned(s3):
+    """Invalid x-amz-acl values are rejected with InvalidArgument (400)."""
+    import uuid as _u
+    bucket = f"acl-bkt-bad-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    with pytest.raises(ClientError) as exc:
+        s3.put_bucket_acl(Bucket=bucket, ACL="not-a-real-canned-acl")
+    assert exc.value.response["Error"]["Code"] == "InvalidArgument"
+    s3.delete_bucket(Bucket=bucket)
+
+def test_s3_put_bucket_acl_xml_body(s3):
+    """A well-formed AccessControlPolicy XML body is accepted and round-trips."""
+    import uuid as _u
+    bucket = f"acl-bkt-xml-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_acl(
+        Bucket=bucket,
+        AccessControlPolicy={
+            "Owner": {"ID": "test-owner-id", "DisplayName": "tester"},
+            "Grants": [
+                {
+                    "Grantee": {
+                        "Type": "CanonicalUser",
+                        "ID": "test-owner-id",
+                        "DisplayName": "tester",
+                    },
+                    "Permission": "FULL_CONTROL",
+                },
+                {
+                    "Grantee": {
+                        "Type": "Group",
+                        "URI": "http://acs.amazonaws.com/groups/global/AllUsers",
+                    },
+                    "Permission": "READ",
+                },
+            ],
+        },
+    )
+    acl = s3.get_bucket_acl(Bucket=bucket)
+    assert acl["Owner"]["ID"] == "test-owner-id"
+    perms = sorted(g["Permission"] for g in acl["Grants"])
+    assert perms == ["FULL_CONTROL", "READ"]
+    s3.delete_bucket(Bucket=bucket)
+
 def test_s3_range_suffix(s3):
     """Range: bytes=-N returns last N bytes."""
     s3.create_bucket(Bucket="qa-s3-range-suffix")
@@ -3714,6 +3783,81 @@ def test_s3_put_object_acl_xml_body(s3):
     assert acl["Owner"]["ID"] == "test-owner-id"
     perms = sorted(g["Permission"] for g in acl["Grants"])
     assert perms == ["FULL_CONTROL", "READ"]
+    s3.delete_object(Bucket=bucket, Key="k")
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_object_acl_per_version(s3):
+    """Object ACLs are per-version, like tags: `?versionId=` targets that
+    version, and a later version is a separate object that starts from the
+    default ACL while the addressed version keeps what was set."""
+    import uuid as _u
+    bucket = f"acl-ver-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(
+        Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+    v1 = s3.put_object(Bucket=bucket, Key="k", Body=b"one")["VersionId"]
+    s3.put_object(Bucket=bucket, Key="k", Body=b"two")
+
+    s3.put_object_acl(Bucket=bucket, Key="k", VersionId=v1, ACL="public-read")
+
+    acl = s3.get_object_acl(Bucket=bucket, Key="k", VersionId=v1)
+    assert any(g["Grantee"].get("URI", "").endswith("global/AllUsers")
+               for g in acl["Grants"])
+    # The current version is a different object and keeps its default.
+    assert len(s3.get_object_acl(Bucket=bucket, Key="k")["Grants"]) == 1
+
+    # A fresh version starts from the default; v1 keeps what was set.
+    s3.put_object(Bucket=bucket, Key="k", Body=b"three")
+    assert len(s3.get_object_acl(Bucket=bucket, Key="k")["Grants"]) == 1
+    acl = s3.get_object_acl(Bucket=bucket, Key="k", VersionId=v1)
+    assert any(g["Grantee"].get("URI", "").endswith("global/AllUsers")
+               for g in acl["Grants"])
+
+    for v in s3.list_object_versions(Bucket=bucket).get("Versions", []):
+        s3.delete_object(Bucket=bucket, Key=v["Key"], VersionId=v["VersionId"])
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_put_object_canned_acl_versioned(s3):
+    """x-amz-acl on PutObject sticks to the version that PUT created."""
+    import uuid as _u
+    bucket = f"acl-put-ver-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(
+        Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+    v1 = s3.put_object(
+        Bucket=bucket, Key="k", Body=b"one", ACL="public-read")["VersionId"]
+    assert len(s3.get_object_acl(Bucket=bucket, Key="k")["Grants"]) == 2
+
+    s3.put_object(Bucket=bucket, Key="k", Body=b"two")
+    assert len(s3.get_object_acl(Bucket=bucket, Key="k")["Grants"]) == 1
+    acl = s3.get_object_acl(Bucket=bucket, Key="k", VersionId=v1)
+    assert len(acl["Grants"]) == 2
+
+    for v in s3.list_object_versions(Bucket=bucket).get("Versions", []):
+        s3.delete_object(Bucket=bucket, Key=v["Key"], VersionId=v["VersionId"])
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_post_object_acl_field(s3):
+    """The POST form names its canned-ACL field `acl`; it applies to the
+    uploaded object like x-amz-acl does on PutObject."""
+    import uuid as _u
+
+    import requests
+    bucket = f"acl-post-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    post = s3.generate_presigned_post(
+        Bucket=bucket, Key="k",
+        Fields={"acl": "public-read"},
+        Conditions=[{"acl": "public-read"}],
+    )
+    r = requests.post(post["url"], data=post["fields"], files={"file": ("k", b"x")})
+    assert r.status_code == 204
+    grants = s3.get_object_acl(Bucket=bucket, Key="k")["Grants"]
+    assert any(g["Grantee"].get("URI", "").endswith("global/AllUsers")
+               for g in grants)
     s3.delete_object(Bucket=bucket, Key="k")
     s3.delete_bucket(Bucket=bucket)
 
