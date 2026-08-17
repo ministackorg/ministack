@@ -201,6 +201,201 @@ def _resolve_storage_class(headers: dict, default: str = "STANDARD"):
         )
     return sc, None
 
+
+# ---------------------------------------------------------------------------
+# Server-side encryption (SSE-S3 / SSE-KMS / SSE-C)
+#
+# MiniStack does not encrypt at rest — like the ACL plane, SSE is contract
+# state: validated on write, persisted with the object, echoed on every
+# response, and enforced on reads for SSE-C (whose whole point is that the
+# object is unreadable without the key).  The state rides the object record's
+# `preserved_headers`, so it follows versions, copies and multipart completes
+# through the existing plumbing.  The customer key itself is NEVER stored —
+# only its MD5, which is all AWS keeps visible too.
+# ---------------------------------------------------------------------------
+
+# The SSE headers persisted on an object (the customer KEY is deliberately
+# not among them).
+_SSE_STORED_HEADERS = (
+    "x-amz-server-side-encryption",
+    "x-amz-server-side-encryption-aws-kms-key-id",
+    "x-amz-server-side-encryption-customer-algorithm",
+    "x-amz-server-side-encryption-customer-key-md5",
+)
+
+
+def _validate_sse_c_headers(c_alg: str, c_key: str, c_md5: str):
+    """Validate an SSE-C header trio; None when coherent, an error otherwise.
+
+    AWS requires all three headers together: the algorithm (AES256 only), a
+    base64 256-bit key, and the base64 MD5 of the raw key bytes, which it
+    checks to catch corruption in transit."""
+    if not c_alg:
+        return _error(
+            "InvalidArgument",
+            "Requests specifying Server Side Encryption with Customer provided keys "
+            "must provide a valid encryption algorithm.", 400)
+    if c_alg != "AES256":
+        return _error(
+            "InvalidArgument",
+            f"Invalid x-amz-server-side-encryption-customer-algorithm value: {c_alg}", 400)
+    if not c_key:
+        return _error(
+            "InvalidArgument",
+            "Requests specifying Server Side Encryption with Customer provided keys "
+            "must provide an appropriate secret key.", 400)
+    try:
+        raw_key = base64.b64decode(c_key, validate=True)
+    except Exception:
+        raw_key = b""
+    if len(raw_key) != 32:
+        return _error(
+            "InvalidArgument",
+            "The secret key was invalid for the specified algorithm.", 400)
+    if not c_md5:
+        return _error(
+            "InvalidArgument",
+            "Requests specifying Server Side Encryption with Customer provided keys "
+            "must provide the object encryption key MD5.", 400)
+    if base64.b64encode(hashlib.md5(raw_key).digest()).decode() != c_md5:
+        return _error(
+            "InvalidArgument",
+            "The calculated MD5 hash of the key did not match the hash that was provided.", 400)
+    return None
+
+
+def _resolve_sse_write_headers(headers: dict, bucket_name: str):
+    """Validate a write's SSE headers and return (headers_to_persist, error).
+
+    SSE-S3/KMS and SSE-C are mutually exclusive (InvalidArgument together, as
+    AWS answers).  `aws:kms` must name a key: MiniStack has no implicit
+    account `aws/s3` KMS key to fall back to, and ceph/s3-tests pins the
+    refusal.  A write with no SSE headers takes the bucket's explicit default
+    encryption configuration, so the applied algorithm is visible on later
+    reads and not only stamped on the PUT reply."""
+    sse = headers.get("x-amz-server-side-encryption", "")
+    c_alg = headers.get("x-amz-server-side-encryption-customer-algorithm", "")
+    c_key = headers.get("x-amz-server-side-encryption-customer-key", "")
+    c_md5 = headers.get("x-amz-server-side-encryption-customer-key-md5", "")
+
+    if sse and (c_alg or c_key or c_md5):
+        return None, _error(
+            "InvalidArgument",
+            "Server Side Encryption with Customer provided key is incompatible "
+            "with the encryption method specified.", 400)
+    if sse:
+        if sse not in ("AES256", "aws:kms"):
+            return None, _error(
+                "InvalidArgument",
+                f"Invalid x-amz-server-side-encryption value: {sse}", 400)
+        out = {"x-amz-server-side-encryption": sse}
+        if sse == "aws:kms":
+            kms = headers.get("x-amz-server-side-encryption-aws-kms-key-id", "")
+            if not kms:
+                return None, _error(
+                    "InvalidArgument",
+                    "Server-side encryption with aws:kms requires a key id in "
+                    "x-amz-server-side-encryption-aws-kms-key-id.", 400)
+            out["x-amz-server-side-encryption-aws-kms-key-id"] = kms
+        return out, None
+    if c_alg or c_key or c_md5:
+        err = _validate_sse_c_headers(c_alg, c_key, c_md5)
+        if err is not None:
+            return None, err
+        return {
+            "x-amz-server-side-encryption-customer-algorithm": "AES256",
+            "x-amz-server-side-encryption-customer-key-md5": c_md5,
+        }, None
+    return dict(_bucket_default_sse_headers(bucket_name)), None
+
+
+def _stored_sse_headers(obj: dict) -> dict:
+    return {k: v for k, v in obj.get("preserved_headers", {}).items()
+            if k in _SSE_STORED_HEADERS}
+
+
+def _check_sse_c_against(stored_md5, c_alg: str, c_key: str, c_md5: str,
+                         part: bool = False):
+    """The SSE-C access rule shared by reads, copy sources and upload parts.
+
+    An SSE-C object (or upload) is inaccessible without its key: the request
+    must carry a coherent trio whose key MD5 matches the stored one.  Keyless
+    and incoherent requests are 400s, but AWS splits the wrong key: a read
+    answers 403 AccessDenied, a part request answers 400.  And a request
+    offering SSE-C parameters for something not stored that way is refused
+    too."""
+    if stored_md5:
+        if not (c_alg or c_key or c_md5):
+            if part:
+                return _error(
+                    "InvalidRequest",
+                    "The multipart upload initiate requested encryption. "
+                    "Subsequent part requests must include the appropriate "
+                    "encryption parameters.", 400)
+            return _error(
+                "InvalidRequest",
+                "The object was stored using a form of Server Side Encryption. "
+                "The correct parameters must be provided to retrieve the object.", 400)
+        err = _validate_sse_c_headers(c_alg, c_key, c_md5)
+        if err is not None:
+            return err
+        if c_md5 != stored_md5:
+            if part:
+                return _error(
+                    "InvalidRequest",
+                    "The provided encryption parameters did not match the ones "
+                    "used originally.", 400)
+            return _error(
+                "AccessDenied",
+                "Requests specifying Server Side Encryption with Customer "
+                "provided keys must provide the correct secret key.", 403)
+    elif c_alg or c_key or c_md5:
+        return _error(
+            "InvalidRequest",
+            "The encryption parameters are not applicable to this object.", 400)
+    return None
+
+
+def _check_sse_read_headers(headers: dict, obj: dict):
+    """Gate a GET/HEAD on the object's SSE state; None to proceed.
+
+    x-amz-server-side-encryption is a write-request header — AWS rejects it
+    on reads."""
+    if headers.get("x-amz-server-side-encryption"):
+        return _error(
+            "InvalidArgument",
+            "x-amz-server-side-encryption is not valid on a read request.", 400)
+    return _check_sse_c_against(
+        obj.get("preserved_headers", {}).get(
+            "x-amz-server-side-encryption-customer-key-md5"),
+        headers.get("x-amz-server-side-encryption-customer-algorithm", ""),
+        headers.get("x-amz-server-side-encryption-customer-key", ""),
+        headers.get("x-amz-server-side-encryption-customer-key-md5", ""))
+
+
+def _check_sse_c_copy_source(headers: dict, src_obj: dict):
+    """Gate reading a copy source, using the x-amz-copy-source-server-side-
+    encryption-customer-* trio the way _check_sse_read_headers gates GET."""
+    return _check_sse_c_against(
+        src_obj.get("preserved_headers", {}).get(
+            "x-amz-server-side-encryption-customer-key-md5"),
+        headers.get("x-amz-copy-source-server-side-encryption-customer-algorithm", ""),
+        headers.get("x-amz-copy-source-server-side-encryption-customer-key", ""),
+        headers.get("x-amz-copy-source-server-side-encryption-customer-key-md5", ""))
+
+
+def _check_sse_c_part(headers: dict, upload: dict):
+    """Each part of an SSE-C multipart upload — and its completion — must
+    carry the key the upload was initiated with; a part of a non-SSE-C
+    upload must carry none."""
+    return _check_sse_c_against(
+        upload.get("preserved_headers", {}).get(
+            "x-amz-server-side-encryption-customer-key-md5"),
+        headers.get("x-amz-server-side-encryption-customer-algorithm", ""),
+        headers.get("x-amz-server-side-encryption-customer-key", ""),
+        headers.get("x-amz-server-side-encryption-customer-key-md5", ""),
+        part=True)
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -2633,6 +2828,10 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     if csum_err:
         return csum_err
 
+    sse_headers, sse_err = _resolve_sse_write_headers(headers, bucket_name)
+    if sse_err:
+        return sse_err
+
     # A canned ACL supplied at PutObject time is validated up front (an invalid
     # value rejects the whole request, as AWS does) and applied below, so
     # GetObjectAcl reflects it instead of dropping it. (#1322, rest of defect 9)
@@ -2642,6 +2841,7 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
 
     etag = f'"{md5_hash(body)}"'
     obj = _build_object_record(body, headers, etag=etag, checksums=checksums)
+    obj["preserved_headers"].update(sse_headers)
     bucket["objects"][key] = obj
     if canned_acl:
         _object_acl[(bucket_name, key)] = _canned_acl_policy_xml(canned_acl, get_account_id())
@@ -2664,7 +2864,7 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     )
 
     resp_headers = {"ETag": obj["etag"], "Content-Length": "0"}
-    resp_headers.update(_bucket_default_sse_headers(bucket_name))
+    resp_headers.update(sse_headers)
     if _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
         version_id = new_uuid()
         obj["version_id"] = version_id
@@ -2853,8 +3053,20 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
     if sc_err:
         return sc_err
 
+    # The POST form names its SSE fields exactly like the request headers.
+    sse_fields = {h: fields[h] for h in (
+        "x-amz-server-side-encryption",
+        "x-amz-server-side-encryption-aws-kms-key-id",
+        "x-amz-server-side-encryption-customer-algorithm",
+        "x-amz-server-side-encryption-customer-key",
+        "x-amz-server-side-encryption-customer-key-md5") if h in fields}
+    sse_headers, sse_err = _resolve_sse_write_headers(sse_fields, bucket_name)
+    if sse_err:
+        return sse_err
+
     etag = f'"{md5_hash(file_value)}"'
     obj = _build_object_record(file_value, synth, etag=etag)
+    obj["preserved_headers"].update(sse_headers)
     bucket["objects"][key] = obj
     _apply_object_lock_from_headers(bucket_name, key, synth)
 
@@ -3000,6 +3212,9 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
                 # `x-amz-checksum-mode: ENABLED` exactly as current-version reads do.
                 include_checksums = (headers.get("x-amz-checksum-mode") or "").upper() == "ENABLED"
                 vobj = _object_record_from_version(v)
+                sse_gate = _check_sse_read_headers(headers, vobj)
+                if sse_gate is not None:
+                    return sse_gate
                 resp_headers = _object_response_headers(
                     vobj, bucket_name, key, include_checksums=include_checksums)
                 resp_headers.update(_object_tagging_count_header(bucket_name, key, version_id))
@@ -3021,6 +3236,9 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
         )
 
     obj = bucket["objects"][key]
+    sse_gate = _check_sse_read_headers(headers, obj)
+    if sse_gate is not None:
+        return sse_gate
     range_header = headers.get("range", "")
     # AWS returns whole-object checksums only on full-object responses (HTTP
     # 200). On a 206 Partial Content reply the bytes are a slice, and a
@@ -3233,6 +3451,9 @@ def _head_object(bucket_name: str, key: str, headers: dict | None = None,
             )
         obj = bucket["objects"][key]
 
+    sse_gate = _check_sse_read_headers(headers, obj)
+    if sse_gate is not None:
+        return sse_gate
     include_checksums = (headers.get("x-amz-checksum-mode") or "").upper() == "ENABLED"
     resp_headers = _object_response_headers(obj, bucket_name, key,
                                             include_checksums=include_checksums)
@@ -3533,6 +3754,10 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
             )
         src_obj = src_bucket["objects"][src_key]
 
+    sse_src_err = _check_sse_c_copy_source(headers, src_obj)
+    if sse_src_err is not None:
+        return sse_src_err
+
     # AWS echoes the copied source version on a versioned source.
     copy_src_vid = src_version_id or src_obj.get("version_id")
 
@@ -3580,6 +3805,16 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         content_type = src_obj["content_type"]
         content_encoding = src_obj.get("content_encoding")
         preserved = dict(src_obj.get("preserved_headers", {}))
+
+    # The destination's encryption always comes from THIS request (or the
+    # destination bucket's default), never from the source — a COPY metadata
+    # directive must not smuggle the source's SSE state across.
+    dest_sse, dest_sse_err = _resolve_sse_write_headers(headers, bucket_name)
+    if dest_sse_err is not None:
+        return dest_sse_err
+    for h in _SSE_STORED_HEADERS:
+        preserved.pop(h, None)
+    preserved.update(dest_sse)
 
     dest_sc, sc_err = _resolve_storage_class(
         headers, default=src_obj.get("storage_class") or "STANDARD"
@@ -3655,6 +3890,7 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     )
 
     resp_headers = {"Content-Type": "application/xml"}
+    resp_headers.update(dest_sse)
     if copy_src_vid:
         resp_headers["x-amz-copy-source-version-id"] = copy_src_vid
     if dest_sc != "STANDARD":
@@ -4604,6 +4840,10 @@ def _create_multipart_upload(bucket_name: str, key: str, headers: dict):
     if sc_err:
         return sc_err
 
+    sse_headers, sse_err = _resolve_sse_write_headers(headers, bucket_name)
+    if sse_err:
+        return sse_err
+
     upload_id = new_uuid()
     content_type = headers.get("content-type", "application/octet-stream")
     content_encoding = headers.get("content-encoding")
@@ -4613,6 +4853,7 @@ def _create_multipart_upload(bucket_name: str, key: str, headers: dict):
         val = headers.get(h)
         if val is not None:
             preserved[h] = val
+    preserved.update(sse_headers)
 
     _multipart_uploads[upload_id] = {
         "bucket": bucket_name,
@@ -4630,7 +4871,8 @@ def _create_multipart_upload(bucket_name: str, key: str, headers: dict):
     SubElement(root, "Bucket").text = bucket_name
     SubElement(root, "Key").text = key
     SubElement(root, "UploadId").text = upload_id
-    return 200, {"Content-Type": "application/xml"}, _xml_body(root)
+    # AWS echoes the upload's encryption on the initiate response.
+    return 200, {"Content-Type": "application/xml", **sse_headers}, _xml_body(root)
 
 
 def _upload_part(
@@ -4660,6 +4902,10 @@ def _upload_part(
             f"/{bucket_name}/{key}",
         )
 
+    sse_part_err = _check_sse_c_part(headers, upload)
+    if sse_part_err is not None:
+        return sse_part_err
+
     try:
         pn = int(part_number)
     except (ValueError, TypeError):
@@ -4686,7 +4932,7 @@ def _upload_part(
         "size": len(body),
         "last_modified": now_iso(),
     }
-    return 200, {"ETag": etag}, b""
+    return 200, {"ETag": etag, **_stored_sse_headers(upload)}, b""
 
 
 def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, headers: dict):
@@ -4696,6 +4942,11 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
 
     if upload_id not in _multipart_uploads:
         return _error("NoSuchUpload", "The specified multipart upload does not exist.", 404)
+
+    upload = _multipart_uploads[upload_id]
+    sse_part_err = _check_sse_c_part(headers, upload)
+    if sse_part_err is not None:
+        return sse_part_err
 
     source = url_unquote(headers.get("x-amz-copy-source", "").lstrip("/"))
     src_parts = source.split("?", 1)[0].split("/", 1)
@@ -4710,6 +4961,9 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
         return _error("NoSuchKey", "The specified key does not exist.", 404)
 
     src_obj = src_bucket["objects"][src_key]
+    sse_src_err = _check_sse_c_copy_source(headers, src_obj)
+    if sse_src_err is not None:
+        return sse_src_err
     src_body = _read_body(src_bucket_name, src_key, src_obj)
 
     # Handle x-amz-copy-source-range
@@ -4754,7 +5008,8 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
     root = Element("CopyPartResult", xmlns=S3_NS)
     SubElement(root, "ETag").text = etag
     SubElement(root, "LastModified").text = now_iso()
-    return 200, {"Content-Type": "application/xml"}, _xml_body(root)
+    return 200, {"Content-Type": "application/xml",
+                 **_stored_sse_headers(upload)}, _xml_body(root)
 
 
 def _complete_multipart_upload(
@@ -4786,6 +5041,14 @@ def _complete_multipart_upload(
             404,
             f"/{bucket_name}/{key}",
         )
+
+    # An SSE-C upload's completion must present the create-time key again,
+    # exactly as every part did; a plain upload's completion must present
+    # none.  (The idempotent replay above deliberately skips this — the
+    # original request already presented the key when it committed.)
+    sse_part_err = _check_sse_c_part(headers or {}, upload)
+    if sse_part_err:
+        return sse_part_err
 
     try:
         xml_root = fromstring(body)
@@ -4867,6 +5130,7 @@ def _complete_multipart_upload(
     )
 
     resp_headers = {"Content-Type": "application/xml"}
+    resp_headers.update(_stored_sse_headers(obj))
     if _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
         version_id = new_uuid()
         obj["version_id"] = version_id
