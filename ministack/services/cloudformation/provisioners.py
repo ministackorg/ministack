@@ -85,9 +85,26 @@ def _physical_name(stack_name: str, logical_id: str, *,
     picked up that new (wrong) identity the moment it was reprocessed later in
     the same update. Resource *replacement* (a property change real AWS can't
     apply in place) isn't specially detected here — same as before this fix.
+
+    Truncates the `{stack}-{logicalId}-` prefix, never the suffix: a naive
+    `base[:max_len]` on the full concatenated string drops whatever falls past
+    max_len, and for a deeply-nested CDK stack the auto-generated stack_name
+    alone (parent-nested-name plus a CloudFormation-assigned resource-id
+    segment) can already exceed max_len on its own — e.g. a 64-char Lambda
+    FunctionName limit against a >100-char nested-stack name. When that
+    happens, every resource in that stack truncates to an identical string
+    regardless of logical_id, since the part that would have disambiguated
+    them (logical_id, then the hash) never survives the slice — collapsing
+    every Lambda in the nested stack onto one physical function, so only one
+    of them ever actually runs regardless of which the caller invokes.
+    Reserving room for the suffix keeps it intact even when the prefix must be
+    cut, since the suffix alone (hashed from stack_name *and* logical_id) is
+    what actually guarantees uniqueness here.
     """
     suffix = hashlib.sha256(f"{stack_name}:{logical_id}".encode()).hexdigest()[:13].upper()
-    base = f"{stack_name}-{logical_id}-{suffix}"
+    prefix = f"{stack_name}-{logical_id}-"
+    available = max(max_len - len(suffix), 0)
+    base = prefix[:available] + suffix
     if lowercase:
         base = base.lower()
     return base[:max_len]
