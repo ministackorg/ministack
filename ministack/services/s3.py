@@ -2642,6 +2642,7 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
 
     etag = f'"{md5_hash(body)}"'
     obj = _build_object_record(body, headers, etag=etag, checksums=checksums)
+    prior_obj = bucket["objects"].get(key)
     bucket["objects"][key] = obj
     if canned_acl:
         _object_acl[(bucket_name, key)] = _canned_acl_policy_xml(canned_acl, get_account_id())
@@ -2665,30 +2666,9 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
 
     resp_headers = {"ETag": obj["etag"], "Content-Length": "0"}
     resp_headers.update(_bucket_default_sse_headers(bucket_name))
-    if _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
-        version_id = new_uuid()
-        obj["version_id"] = version_id
+    version_id = _record_object_version(bucket_name, key, prior_obj, obj, body)
+    if version_id:
         resp_headers["x-amz-version-id"] = version_id
-        vkey = (bucket_name, key)
-        if vkey not in _object_versions:
-            _object_versions[vkey] = []
-        _object_versions[vkey].append({
-            "version_id": version_id,
-            "last_modified": obj["last_modified"],
-            "etag": obj["etag"],
-            "size": obj["size"],
-            "is_latest": True,
-            "data": body,
-            "content_type": obj.get("content_type") or "application/octet-stream",
-            "content_encoding": obj.get("content_encoding"),
-            "metadata": obj.get("metadata", {}),
-            "preserved_headers": obj.get("preserved_headers", {}),
-            "storage_class": obj.get("storage_class") or "STANDARD",
-            "checksums": obj.get("checksums") or {},
-        })
-        # Mark all previous versions as not latest
-        for v in _object_versions[vkey][:-1]:
-            v["is_latest"] = False
 
     # Persist only after the versioning block: the .meta.json sidecar must
     # carry the version_id assigned above (#1058).
@@ -2855,6 +2835,7 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
 
     etag = f'"{md5_hash(file_value)}"'
     obj = _build_object_record(file_value, synth, etag=etag)
+    prior_obj = bucket["objects"].get(key)
     bucket["objects"][key] = obj
     _apply_object_lock_from_headers(bucket_name, key, synth)
 
@@ -2870,28 +2851,7 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
         bucket_name, key, "s3:ObjectCreated:Post", size=obj["size"], etag=etag
     )
 
-    version_id = None
-    if _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
-        version_id = new_uuid()
-        obj["version_id"] = version_id
-        vkey = (bucket_name, key)
-        if vkey not in _object_versions:
-            _object_versions[vkey] = []
-        _object_versions[vkey].append({
-            "version_id": version_id,
-            "last_modified": obj["last_modified"],
-            "etag": etag,
-            "size": obj["size"],
-            "is_latest": True,
-            "data": file_value,
-            "content_type": obj.get("content_type") or "application/octet-stream",
-            "content_encoding": obj.get("content_encoding"),
-            "metadata": obj.get("metadata", {}),
-            "preserved_headers": obj.get("preserved_headers", {}),
-            "storage_class": obj.get("storage_class") or "STANDARD",
-        })
-        for v in _object_versions[vkey][:-1]:
-            v["is_latest"] = False
+    version_id = _record_object_version(bucket_name, key, prior_obj, obj, file_value)
 
     # Persist only after the versioning block: the .meta.json sidecar must
     # carry the version_id assigned above (#1058).
@@ -2988,6 +2948,14 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
         return err
 
     version_id = _qp(query_params, "versionId", "")
+    if version_id == "null" and not any(
+            v["version_id"] == "null"
+            for v in _object_versions.get((bucket_name, key), [])):
+        # The literal "null" addresses the pre-versioning object; before any
+        # versioned write records it in the index, that is the current object.
+        obj = bucket["objects"].get(key)
+        if obj is not None and not obj.get("version_id"):
+            version_id = ""
     if version_id:
         vkey = (bucket_name, key)
         versions = _object_versions.get(vkey, [])
@@ -3013,12 +2981,15 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
         return _error("NoSuchVersion", "The specified version does not exist.", 404, f"/{bucket_name}/{key}")
 
     if key not in bucket["objects"]:
-        return _error(
+        status, err_headers, err_body = _error(
             "NoSuchKey",
             "The specified key does not exist.",
             404,
             f"/{bucket_name}/{key}",
         )
+        # A key hidden by a delete marker announces the marker on its 404.
+        err_headers.update(_delete_marker_404_headers(bucket_name, key))
+        return status, err_headers, err_body
 
     obj = bucket["objects"][key]
     range_header = headers.get("range", "")
@@ -3209,6 +3180,14 @@ def _head_object(bucket_name: str, key: str, headers: dict | None = None,
     # A `?versionId=` selects a specific version's metadata, matching AWS
     # HeadObject(VersionId); without it, the current object is used.
     version_id = _qp(query_params, "versionId", "")
+    if version_id == "null" and not any(
+            v["version_id"] == "null"
+            for v in _object_versions.get((bucket_name, key), [])):
+        # The literal "null" addresses the pre-versioning object; before any
+        # versioned write records it in the index, that is the current object.
+        obj = bucket["objects"].get(key)
+        if obj is not None and not obj.get("version_id"):
+            version_id = ""
     if version_id:
         ventry = next(
             (v for v in _object_versions.get((bucket_name, key), [])
@@ -3225,12 +3204,15 @@ def _head_object(bucket_name: str, key: str, headers: dict | None = None,
         obj = _object_record_from_version(ventry)
     else:
         if key not in bucket["objects"]:
-            return _error(
+            status, err_headers, err_body = _error(
                 "NoSuchKey",
                 "The specified key does not exist.",
                 404,
                 f"/{bucket_name}/{key}",
             )
+            # A key hidden by a delete marker announces the marker on its 404.
+            err_headers.update(_delete_marker_404_headers(bucket_name, key))
+            return status, err_headers, err_body
         obj = bucket["objects"][key]
 
     include_checksums = (headers.get("x-amz-checksum-mode") or "").upper() == "ENABLED"
@@ -3272,8 +3254,114 @@ def _object_record_from_version(v: dict) -> dict:
         "preserved_headers": v.get("preserved_headers", {}),
         "storage_class": v.get("storage_class") or "STANDARD",
         "checksums": v.get("checksums") or {},
-        "version_id": v["version_id"],
+        # The "null" version promotes to a current object WITHOUT a version
+        # id, the same shape a pre-versioning object has — per-version tags
+        # and subresources key it as None, and the literal "null" is only a
+        # wire-level name for it.
+        "version_id": None if v["version_id"] == "null" else v["version_id"],
     }
+
+
+def _version_entry_from_record(obj: dict, version_id: str, data) -> dict:
+    """A version-index entry projected from a current-object record."""
+    return {
+        "version_id": version_id,
+        "last_modified": obj["last_modified"],
+        "etag": obj["etag"],
+        "size": obj["size"],
+        "is_latest": False,
+        "data": data,
+        "content_type": obj.get("content_type") or "application/octet-stream",
+        "content_encoding": obj.get("content_encoding"),
+        "metadata": obj.get("metadata", {}),
+        "preserved_headers": obj.get("preserved_headers", {}),
+        "storage_class": obj.get("storage_class") or "STANDARD",
+        "checksums": obj.get("checksums") or {},
+        "parts": obj.get("parts"),
+    }
+
+
+def _preserve_null_version(bucket_name: str, key: str, versions: list,
+                           prior_obj: dict | None):
+    """Keep the pre-versioning object addressable as the "null" version.
+
+    An object written before versioning was enabled has no version id; the
+    first versioned write (or delete marker) that lands on top of it must
+    leave it in the version index under VersionId "null" rather than silently
+    discarding it — AWS keeps the null version in the stack."""
+    if prior_obj is None or prior_obj.get("version_id"):
+        return
+    if any(v["version_id"] == "null" for v in versions):
+        return
+    versions.append(_version_entry_from_record(
+        prior_obj, "null", _read_body(bucket_name, key, prior_obj)))
+
+
+def _record_object_version(bucket_name: str, key: str, prior_obj: dict | None,
+                           obj: dict, data) -> str | None:
+    """Version bookkeeping for a write landing at `key`.
+
+    An Enabled bucket mints a new version id; a Suspended bucket stores the
+    write as the "null" version, REPLACING any previous null version, and
+    answers without x-amz-version-id — so this returns the id to put on the
+    response, or None for unversioned and suspended writes.  `prior_obj` is
+    the current-object record the write displaced (captured before the
+    overwrite), preserved as the null version when it predates versioning."""
+    versioning = _bucket_versioning.get(bucket_name)
+    if versioning not in ("Enabled", "Suspended"):
+        return None
+    vkey = (bucket_name, key)
+    versions = _object_versions.setdefault(vkey, [])
+    if versioning == "Enabled":
+        _preserve_null_version(bucket_name, key, versions, prior_obj)
+        version_id = new_uuid()
+        obj["version_id"] = version_id
+    else:
+        version_id = "null"
+        versions[:] = [v for v in versions if v["version_id"] != "null"]
+    entry = _version_entry_from_record(obj, version_id, data)
+    entry["is_latest"] = True
+    for v in versions:
+        v["is_latest"] = False
+    versions.append(entry)
+    return version_id if versioning == "Enabled" else None
+
+
+def _record_delete_marker(bucket_name: str, key: str,
+                          prior_obj: dict | None) -> str:
+    """Append a delete marker per the bucket's versioning state and return its
+    version id: a fresh id on Enabled, the literal "null" on Suspended — where
+    the marker REPLACES any existing null version, as AWS does."""
+    vkey = (bucket_name, key)
+    versions = _object_versions.setdefault(vkey, [])
+    if _bucket_versioning.get(bucket_name) == "Enabled":
+        _preserve_null_version(bucket_name, key, versions, prior_obj)
+        marker_id = new_uuid()
+    else:
+        marker_id = "null"
+        versions[:] = [v for v in versions if v["version_id"] != "null"]
+    for v in versions:
+        v["is_latest"] = False
+    versions.append({
+        "version_id": marker_id,
+        "last_modified": now_iso(),
+        "etag": "",
+        "size": 0,
+        "is_latest": True,
+        "is_delete_marker": True,
+    })
+    return marker_id
+
+
+def _delete_marker_404_headers(bucket_name: str, key: str) -> dict:
+    """Headers a 404 for `key` must carry when its current version is a delete
+    marker: AWS marks the miss with x-amz-delete-marker and the marker's id."""
+    versions = _object_versions.get((bucket_name, key)) or []
+    latest = versions[-1] if versions else None
+    if latest is not None and latest.get("is_delete_marker") and latest.get("is_latest"):
+        return {"x-amz-delete-marker": "true",
+                "x-amz-version-id": latest["version_id"]}
+    return {}
 
 
 def _delete_object_version(bucket: dict, bucket_name: str, key: str,
@@ -3289,8 +3377,11 @@ def _delete_object_version(bucket: dict, bucket_name: str, key: str,
 
     # No tracked history: the only addressable version is the current object,
     # exposed under the "null" id (objects put before versioning was enabled).
+    # The guard on version_id matters: "null" only addresses a current object
+    # that actually IS the null version — one without a version id of its own.
     if not versions:
-        if version_id == "null" and key in bucket["objects"]:
+        if (version_id == "null" and key in bucket["objects"]
+                and not bucket["objects"][key].get("version_id")):
             _purge_current_object(bucket_name, key, bucket)
             return True, False
         return False, False
@@ -3299,7 +3390,8 @@ def _delete_object_version(bucket: dict, bucket_name: str, key: str,
         (i for i, v in enumerate(versions) if v["version_id"] == version_id), None
     )
     if idx is None:
-        if version_id == "null" and key in bucket["objects"]:
+        if (version_id == "null" and key in bucket["objects"]
+                and not bucket["objects"][key].get("version_id")):
             _purge_current_object(bucket_name, key, bucket)
             return True, False
         return False, False
@@ -3377,21 +3469,8 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None,
     versioning = _bucket_versioning.get(bucket_name, "")
     if versioning in ("Enabled", "Suspended"):
         # Add a delete marker instead of removing version history
-        delete_marker_id = new_uuid()
-        vkey = (bucket_name, key)
-        if vkey not in _object_versions:
-            _object_versions[vkey] = []
-        # Mark all previous versions as not latest
-        for v in _object_versions[vkey]:
-            v["is_latest"] = False
-        _object_versions[vkey].append({
-            "version_id": delete_marker_id,
-            "last_modified": now_iso(),
-            "etag": "",
-            "size": 0,
-            "is_latest": True,
-            "is_delete_marker": True,
-        })
+        delete_marker_id = _record_delete_marker(
+            bucket_name, key, bucket["objects"].get(key))
         existed = key in bucket["objects"]
         bucket["objects"].pop(key, None)
         if existed:
@@ -3472,8 +3551,12 @@ def _object_mtime_dt(obj: dict):
 
 
 def _copy_object(bucket_name: str, dest_key: str, headers: dict):
-    source = url_unquote(headers.get("x-amz-copy-source", "").lstrip("/"))
-    src_path, _, src_query = source.partition("?")
+    # Split the raw header at "?" before percent-decoding: a key legitimately
+    # containing "?versionId" arrives encoded (%3FversionId) and must stay
+    # part of the key, while a real versionId qualifier arrives as a bare "?".
+    raw_source = headers.get("x-amz-copy-source", "").lstrip("/")
+    raw_path, _, src_query = raw_source.partition("?")
+    src_path = url_unquote(raw_path)
     src_parts = src_path.split("/", 1)
     if len(src_parts) < 2:
         return _error(
@@ -3512,13 +3595,18 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
                 404,
                 f"/{src_bucket_name}/{src_key}",
             )
-        # Synthesize a source object from the stored version. Per-version user
-        # metadata isn't retained, so a COPY metadata-directive carries none.
+        # Synthesize a source object from the stored version — the index keeps
+        # the body plus the wire metadata, so a COPY metadata-directive carries
+        # the version's user metadata and headers like a current-object copy.
         src_obj = {
             "body": ventry.get("data", b""),
             "etag": ventry["etag"],
             "size": ventry["size"],
+            "last_modified": ventry["last_modified"],
             "content_type": ventry.get("content_type") or "application/octet-stream",
+            "content_encoding": ventry.get("content_encoding"),
+            "metadata": ventry.get("metadata", {}),
+            "preserved_headers": ventry.get("preserved_headers", {}),
             "storage_class": ventry.get("storage_class") or "STANDARD",
             "checksums": ventry.get("checksums") or {},
             "version_id": src_version_id,
@@ -3614,6 +3702,7 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         "storage_class": dest_sc,
         "checksums": dest_checksums,
     }
+    dest_prior_obj = dest_bucket["objects"].get(dest_key)
     dest_bucket["objects"][dest_key] = dest_obj
 
     # --- Resolve tag payload now; commit after dest version_id is assigned
@@ -3659,29 +3748,10 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         resp_headers["x-amz-copy-source-version-id"] = copy_src_vid
     if dest_sc != "STANDARD":
         resp_headers["x-amz-storage-class"] = dest_sc
-    if _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
-        version_id = new_uuid()
-        dest_obj["version_id"] = version_id
+    version_id = _record_object_version(
+        bucket_name, dest_key, dest_prior_obj, dest_obj, src_body)
+    if version_id:
         resp_headers["x-amz-version-id"] = version_id
-        vkey = (bucket_name, dest_key)
-        if vkey not in _object_versions:
-            _object_versions[vkey] = []
-        _object_versions[vkey].append({
-            "version_id": version_id,
-            "last_modified": dest_obj["last_modified"],
-            "etag": dest_obj["etag"],
-            "size": dest_obj["size"],
-            "is_latest": True,
-            "data": src_body,
-            "content_type": dest_obj.get("content_type") or "application/octet-stream",
-            "content_encoding": dest_obj.get("content_encoding"),
-            "metadata": dest_obj.get("metadata", {}),
-            "preserved_headers": dest_obj.get("preserved_headers", {}),
-            "storage_class": dest_obj.get("storage_class") or "STANDARD",
-            "checksums": dest_obj.get("checksums") or {},
-        })
-        for v in _object_versions[vkey][:-1]:
-            v["is_latest"] = False
 
     # Persist only after the versioning block: the .meta.json sidecar must
     # carry the version_id assigned above (#1058).
@@ -4558,6 +4628,14 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
                 bucket, bucket_name, k, version_id
             )
             deleted.append({"key": k, "version_id": version_id, "was_marker": was_marker})
+        elif _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
+            # No VersionId on a versioned bucket: create a delete marker —
+            # even for a key that never existed — exactly as the single-object
+            # DELETE does, and report it on the Deleted entry.
+            marker_id = _record_delete_marker(bucket_name, k, bucket["objects"].get(k))
+            bucket["objects"].pop(k, None)
+            deleted.append({"key": k, "version_id": "", "was_marker": False,
+                            "marker_created": marker_id})
         else:
             # No VersionId → plain delete of the current object.
             bucket["objects"].pop(k, None)
@@ -4579,6 +4657,10 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
                 if d["was_marker"]:
                     SubElement(el, "DeleteMarker").text = "true"
                     SubElement(el, "DeleteMarkerVersionId").text = d["version_id"]
+            elif d.get("marker_created"):
+                # A versionless delete on a versioned bucket minted a marker.
+                SubElement(el, "DeleteMarker").text = "true"
+                SubElement(el, "DeleteMarkerVersionId").text = d["marker_created"]
     for e in errors:
         el = SubElement(resp, "Error")
         SubElement(el, "Key").text = e["key"]
@@ -4697,8 +4779,12 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
     if upload_id not in _multipart_uploads:
         return _error("NoSuchUpload", "The specified multipart upload does not exist.", 404)
 
-    source = url_unquote(headers.get("x-amz-copy-source", "").lstrip("/"))
-    src_parts = source.split("?", 1)[0].split("/", 1)
+    # Split the raw header at "?" before percent-decoding, exactly as
+    # CopyObject does: a key containing "?versionId" arrives encoded and must
+    # stay part of the key, while a real versionId qualifier is a bare "?".
+    raw_source = headers.get("x-amz-copy-source", "").lstrip("/")
+    raw_path, _, src_query = raw_source.partition("?")
+    src_parts = url_unquote(raw_path).split("/", 1)
     if len(src_parts) < 2:
         return _error("InvalidArgument", "Copy Source must mention the source bucket and key", 400)
 
@@ -4706,11 +4792,35 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
     src_bucket = _ensure_bucket(src_bucket_name)
     if src_bucket is None:
         return _no_such_bucket(src_bucket_name)
-    if src_key not in src_bucket["objects"]:
-        return _error("NoSuchKey", "The specified key does not exist.", 404)
 
-    src_obj = src_bucket["objects"][src_key]
-    src_body = _read_body(src_bucket_name, src_key, src_obj)
+    # A `?versionId=` on the copy source selects the exact version to copy the
+    # range from, not the current object.
+    src_version_id = None
+    if src_query:
+        src_version_id = _parse_qs(src_query, keep_blank_values=True).get(
+            "versionId", [None]
+        )[0]
+
+    if src_version_id:
+        ventry = next(
+            (v for v in _object_versions.get((src_bucket_name, src_key), [])
+             if v["version_id"] == src_version_id),
+            None,
+        )
+        if ventry is None or ventry.get("is_delete_marker"):
+            return _error(
+                "NoSuchVersion",
+                "The specified version does not exist.",
+                404,
+                f"/{src_bucket_name}/{src_key}",
+            )
+        src_body = ventry.get("data") or b""
+    else:
+        if src_key not in src_bucket["objects"]:
+            return _error("NoSuchKey", "The specified key does not exist.", 404)
+        src_obj = src_bucket["objects"][src_key]
+        src_version_id = src_obj.get("version_id")
+        src_body = _read_body(src_bucket_name, src_key, src_obj)
 
     # Handle x-amz-copy-source-range
     copy_range = headers.get("x-amz-copy-source-range", "")
@@ -4754,7 +4864,11 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
     root = Element("CopyPartResult", xmlns=S3_NS)
     SubElement(root, "ETag").text = etag
     SubElement(root, "LastModified").text = now_iso()
-    return 200, {"Content-Type": "application/xml"}, _xml_body(root)
+    resp_headers = {"Content-Type": "application/xml"}
+    if src_version_id:
+        # AWS echoes the copied source version on a versioned source.
+        resp_headers["x-amz-copy-source-version-id"] = src_version_id
+    return 200, resp_headers, _xml_body(root)
 
 
 def _complete_multipart_upload(
@@ -4854,6 +4968,7 @@ def _complete_multipart_upload(
         "storage_class": upload.get("storage_class") or "STANDARD",
         "parts": part_records,
     }
+    prior_obj = bucket["objects"].get(key)
     bucket["objects"][key] = obj
 
     del _multipart_uploads[upload_id]
@@ -4867,28 +4982,9 @@ def _complete_multipart_upload(
     )
 
     resp_headers = {"Content-Type": "application/xml"}
-    if _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
-        version_id = new_uuid()
-        obj["version_id"] = version_id
+    version_id = _record_object_version(bucket_name, key, prior_obj, obj, combined)
+    if version_id:
         resp_headers["x-amz-version-id"] = version_id
-        vkey = (bucket_name, key)
-        if vkey not in _object_versions:
-            _object_versions[vkey] = []
-        _object_versions[vkey].append({
-            "version_id": version_id,
-            "last_modified": obj["last_modified"],
-            "etag": obj["etag"],
-            "size": obj["size"],
-            "is_latest": True,
-            "data": combined,
-            "content_type": obj.get("content_type") or "application/octet-stream",
-            "content_encoding": obj.get("content_encoding"),
-            "metadata": obj.get("metadata", {}),
-            "preserved_headers": obj.get("preserved_headers", {}),
-            "storage_class": obj.get("storage_class") or "STANDARD",
-        })
-        for v in _object_versions[vkey][:-1]:
-            v["is_latest"] = False
 
     # Persist only after the versioning block: the .meta.json sidecar must
     # carry the version_id assigned above (#1058).

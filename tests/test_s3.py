@@ -2301,6 +2301,152 @@ def test_s3_multipart_upload_returns_version_id(s3):
     assert latest[0]["VersionId"] == resp2["VersionId"]
 
 
+def test_s3_versioning_suspended_null_version(s3):
+    """A PUT on a Suspended bucket is the "null" version: the response carries
+    no VersionId, an overwrite replaces the null version rather than stacking
+    a new one, and DeleteObject(VersionId='null') removes it."""
+    bkt = "s3-ver-susp"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Suspended"})
+
+    resp = s3.put_object(Bucket=bkt, Key="k", Body=b"one")
+    assert "VersionId" not in resp
+    s3.put_object(Bucket=bkt, Key="k", Body=b"two")
+
+    versions = s3.list_object_versions(Bucket=bkt).get("Versions", [])
+    assert [(v["VersionId"], v["IsLatest"]) for v in versions] == [("null", True)]
+    assert s3.get_object(Bucket=bkt, Key="k", VersionId="null")["Body"].read() == b"two"
+
+    s3.delete_object(Bucket=bkt, Key="k", VersionId="null")
+    assert "Versions" not in s3.list_object_versions(Bucket=bkt)
+    s3.delete_bucket(Bucket=bkt)
+
+
+def test_s3_versioning_preserves_pre_versioning_null(s3):
+    """An object written before versioning was enabled stays addressable as
+    the "null" version once versioned writes land on top, and becomes current
+    again when the newer version is deleted."""
+    bkt = "s3-ver-null-keep"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="k", Body=b"fooz")
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+
+    v2 = s3.put_object(Bucket=bkt, Key="k", Body=b"zzz")["VersionId"]
+    assert s3.get_object(Bucket=bkt, Key="k")["Body"].read() == b"zzz"
+    assert s3.get_object(Bucket=bkt, Key="k", VersionId="null")["Body"].read() == b"fooz"
+
+    s3.delete_object(Bucket=bkt, Key="k", VersionId=v2)
+    assert s3.get_object(Bucket=bkt, Key="k")["Body"].read() == b"fooz"
+
+    s3.delete_object(Bucket=bkt, Key="k", VersionId="null")
+    with pytest.raises(ClientError) as exc:
+        s3.get_object(Bucket=bkt, Key="k")
+    assert exc.value.response["Error"]["Code"] == "NoSuchKey"
+    assert "Versions" not in s3.list_object_versions(Bucket=bkt)
+    s3.delete_bucket(Bucket=bkt)
+
+
+def test_s3_delete_marker_signals(s3):
+    """A delete on a versioned bucket reports its marker: DeleteMarker on the
+    DELETE response, x-amz-delete-marker on the subsequent 404, and the
+    literal "null" marker id when versioning is Suspended."""
+    bkt = "s3-ver-marker"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+    s3.put_object(Bucket=bkt, Key="k", Body=b"x")
+
+    resp = s3.delete_object(Bucket=bkt, Key="k")
+    assert resp["DeleteMarker"] is True
+    assert resp["VersionId"]
+
+    with pytest.raises(ClientError) as exc:
+        s3.head_object(Bucket=bkt, Key="k")
+    headers = exc.value.response["ResponseMetadata"]["HTTPHeaders"]
+    assert headers.get("x-amz-delete-marker") == "true"
+
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Suspended"})
+    s3.put_object(Bucket=bkt, Key="k2", Body=b"x")
+    resp = s3.delete_object(Bucket=bkt, Key="k2")
+    assert resp["DeleteMarker"] is True
+    assert resp["VersionId"] == "null"
+
+
+def test_s3_batch_delete_creates_marker(s3):
+    """DeleteObjects without a VersionId on a versioned bucket creates a
+    delete marker — for a key that never existed too — and reports it under
+    DeleteMarker / DeleteMarkerVersionId, as AWS does."""
+    bkt = "s3-ver-batch-marker"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+
+    resp = s3.delete_objects(Bucket=bkt, Delete={"Objects": [{"Key": "never"}]})
+    deleted = resp["Deleted"][0]
+    assert deleted["DeleteMarker"] is True
+    marker_id = deleted["DeleteMarkerVersionId"]
+
+    markers = s3.list_object_versions(Bucket=bkt)["DeleteMarkers"]
+    assert [m["VersionId"] for m in markers] == [marker_id]
+
+
+def test_s3_upload_part_copy_versioned_source(s3):
+    """UploadPartCopy with a source VersionId copies that version's bytes,
+    not the current object's, and echoes x-amz-copy-source-version-id."""
+    bkt = "s3-ver-partcopy"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+    v1 = s3.put_object(Bucket=bkt, Key="src", Body=b"a" * 1024)["VersionId"]
+    s3.put_object(Bucket=bkt, Key="src", Body=b"b" * 1024)
+
+    mpu = s3.create_multipart_upload(Bucket=bkt, Key="dst")
+    part = s3.upload_part_copy(
+        Bucket=bkt, Key="dst", UploadId=mpu["UploadId"], PartNumber=1,
+        CopySource={"Bucket": bkt, "Key": "src", "VersionId": v1})
+    assert part["CopySourceVersionId"] == v1
+    s3.complete_multipart_upload(
+        Bucket=bkt, Key="dst", UploadId=mpu["UploadId"],
+        MultipartUpload={"Parts": [
+            {"ETag": part["CopyPartResult"]["ETag"], "PartNumber": 1}]})
+    assert s3.get_object(Bucket=bkt, Key="dst")["Body"].read() == b"a" * 1024
+
+
+def test_s3_copy_versioned_source_keeps_metadata(s3):
+    """CopyObject with a source VersionId carries that version's user
+    metadata, like a current-object copy does."""
+    bkt = "s3-ver-copy-meta"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+    v1 = s3.put_object(Bucket=bkt, Key="src", Body=b"m",
+                       Metadata={"foo": "bar"})["VersionId"]
+    s3.put_object(Bucket=bkt, Key="src", Body=b"n")
+
+    s3.copy_object(Bucket=bkt, Key="dst",
+                   CopySource={"Bucket": bkt, "Key": "src", "VersionId": v1})
+    assert s3.head_object(Bucket=bkt, Key="dst")["Metadata"] == {"foo": "bar"}
+
+
+def test_s3_copy_source_key_containing_question_mark(s3):
+    """A source key literally containing "?versionId" arrives percent-encoded
+    and must not be mistaken for a versionId qualifier by CopyObject or
+    UploadPartCopy."""
+    bkt = "s3-ver-qmark"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="?versionId", Body=b"question")
+
+    s3.copy_object(Bucket=bkt, Key="copied", CopySource={"Bucket": bkt, "Key": "?versionId"})
+    assert s3.get_object(Bucket=bkt, Key="copied")["Body"].read() == b"question"
+
+    mpu = s3.create_multipart_upload(Bucket=bkt, Key="dst")
+    part = s3.upload_part_copy(
+        Bucket=bkt, Key="dst", UploadId=mpu["UploadId"], PartNumber=1,
+        CopySource={"Bucket": bkt, "Key": "?versionId"})
+    s3.complete_multipart_upload(
+        Bucket=bkt, Key="dst", UploadId=mpu["UploadId"],
+        MultipartUpload={"Parts": [
+            {"ETag": part["CopyPartResult"]["ETag"], "PartNumber": 1}]})
+    assert s3.get_object(Bucket=bkt, Key="dst")["Body"].read() == b"question"
+
+
 def test_s3_copy_object_returns_version_id(s3):
     """CopyObject should return VersionId and track versions when versioning is enabled."""
     bkt = "s3-ver-copy"
