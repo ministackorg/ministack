@@ -536,6 +536,8 @@ subnet = ec2.create_subnet(
 | `AWS::ApiGatewayV2::Integration` | Integration ID | IntegrationId |
 | `AWS::ApiGatewayV2::Route` | Route ID | RouteId |
 | `AWS::SES::EmailIdentity` | Identity | EmailIdentity |
+| `AWS::SES::ConfigurationSet` | Configuration set name | Id |
+| `AWS::SES::ConfigurationSetEventDestination` | Event destination ID | Id |
 | `AWS::WAFv2::WebACL` | WebACL ID | Arn, Id |
 | `AWS::CloudFront::Distribution` | Distribution ID | Arn, DomainName, Id |
 | `AWS::CloudWatch::Alarm` | Alarm name | Arn |

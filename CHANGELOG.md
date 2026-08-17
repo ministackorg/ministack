@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **CloudFormation — `AWS::SES::ConfigurationSet` and `AWS::SES::ConfigurationSetEventDestination`** — a template carrying an SES configuration set failed to provision with "Unsupported resource type", so any stack wiring SES delivery tracking (a configuration set plus its CloudWatch/SNS event destination, as the CDK `ConfigurationSet` construct emits) could not deploy. Both resource types are now provisioned: the configuration set is registered with the classic (v1) and v2 SES stores so `DescribeConfigurationSet` and `GetConfigurationSet` both resolve it, `Ref` returns its name, and delete removes it from both stores; the event destination is recorded against its configuration set for round-tripping. Emails are still stored in-memory and SES events are not delivered — this is CloudFormation provisioning fidelity only. Contributed by @ryan-bennett.
+
 ## [1.4.19] — 2026-08-16
 
 ### Added
