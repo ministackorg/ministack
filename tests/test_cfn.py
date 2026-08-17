@@ -6519,6 +6519,162 @@ def test_cfn_apigateway_documentation_version_lifecycle(cfn, apigw_v1):
         apigw_v1.delete_rest_api(restApiId=api_id)
 
 
+def test_cfn_apigateway_api_key_lifecycle(cfn, apigw_v1):
+    """ApiKey supports create, a pinned Value, Ref/GetAtt, in-place update, delete.
+
+    Regression: the resource type previously failed stack creation with
+    ``Unsupported resource type: AWS::ApiGateway::ApiKey``.
+    """
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-api-key-{suffix}"
+    pinned_value = f"pinnedkeyvalue{suffix}0000000000"
+    stack_deleted = False
+
+    def template(description, enabled):
+        return {
+            "Resources": {
+                "ApiKey": {
+                    "Type": "AWS::ApiGateway::ApiKey",
+                    "Properties": {
+                        "Name": f"key-{suffix}",
+                        "Description": description,
+                        "Enabled": enabled,
+                        "Value": pinned_value,
+                    },
+                },
+            },
+            "Outputs": {
+                "RefId": {"Value": {"Ref": "ApiKey"}},
+                "GetAttId": {"Value": {"Fn::GetAtt": ["ApiKey", "APIKeyId"]}},
+            },
+        }
+
+    def physical_id():
+        detail = cfn.describe_stack_resource(
+            StackName=stack_name,
+            LogicalResourceId="ApiKey",
+        )["StackResourceDetail"]
+        return detail["PhysicalResourceId"]
+
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("Created", True)),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        created_id = physical_id()
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+        assert outputs == {"RefId": created_id, "GetAttId": created_id}
+
+        created = apigw_v1.get_api_key(apiKey=created_id, includeValue=True)
+        assert created["name"] == f"key-{suffix}"
+        assert created["description"] == "Created"
+        assert created["enabled"] is True
+        assert created["value"] == pinned_value
+
+        # Description and Enabled update in place without replacing the key.
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("Updated", False)),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() == created_id
+        updated = apigw_v1.get_api_key(apiKey=created_id)
+        assert updated["description"] == "Updated"
+        assert updated["enabled"] is False
+
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        stack_deleted = True
+        with pytest.raises(ClientError):
+            apigw_v1.get_api_key(apiKey=created_id)
+    finally:
+        if not stack_deleted:
+            try:
+                cfn.delete_stack(StackName=stack_name)
+                _wait_stack(cfn, stack_name)
+            except ClientError:
+                pass
+
+
+def test_cfn_apigateway_usage_plan_and_key_lifecycle(cfn, apigw_v1):
+    """UsagePlan and UsagePlanKey provision, expose ids, associate a key, and delete.
+
+    Regression: both resource types previously failed stack creation with
+    ``Unsupported resource type``.
+    """
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-usage-plan-{suffix}"
+    stack_deleted = False
+
+    template = {
+        "Resources": {
+            "ApiKey": {
+                "Type": "AWS::ApiGateway::ApiKey",
+                "Properties": {"Name": f"plan-key-{suffix}", "Enabled": True},
+            },
+            "UsagePlan": {
+                "Type": "AWS::ApiGateway::UsagePlan",
+                "Properties": {
+                    "UsagePlanName": f"plan-{suffix}",
+                    "Description": "integration plan",
+                    "Throttle": {"BurstLimit": 20, "RateLimit": 10},
+                    "Quota": {"Limit": 1000, "Period": "MONTH"},
+                },
+            },
+            "UsagePlanKey": {
+                "Type": "AWS::ApiGateway::UsagePlanKey",
+                "Properties": {
+                    "KeyId": {"Ref": "ApiKey"},
+                    "KeyType": "API_KEY",
+                    "UsagePlanId": {"Ref": "UsagePlan"},
+                },
+            },
+        },
+        "Outputs": {
+            "PlanRef": {"Value": {"Ref": "UsagePlan"}},
+            "PlanGetAtt": {"Value": {"Fn::GetAtt": ["UsagePlan", "Id"]}},
+            "KeyRef": {"Value": {"Ref": "ApiKey"}},
+            "PlanKeyRef": {"Value": {"Ref": "UsagePlanKey"}},
+        },
+    }
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+
+        plan_id = outputs["PlanRef"]
+        assert outputs["PlanGetAtt"] == plan_id
+        # UsagePlanKey Ref is the associated API key id.
+        assert outputs["PlanKeyRef"] == outputs["KeyRef"]
+
+        plan = apigw_v1.get_usage_plan(usagePlanId=plan_id)
+        assert plan["name"] == f"plan-{suffix}"
+        assert plan["throttle"] == {"burstLimit": 20, "rateLimit": 10}
+        assert plan["quota"]["limit"] == 1000 and plan["quota"]["period"] == "MONTH"
+
+        keys = apigw_v1.get_usage_plan_keys(usagePlanId=plan_id)["items"]
+        assert [k["id"] for k in keys] == [outputs["KeyRef"]]
+
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        stack_deleted = True
+        with pytest.raises(ClientError):
+            apigw_v1.get_usage_plan(usagePlanId=plan_id)
+    finally:
+        if not stack_deleted:
+            try:
+                cfn.delete_stack(StackName=stack_name)
+                _wait_stack(cfn, stack_name)
+            except ClientError:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # ApiGatewayV1 Integration with OpenAPI spec parsing
 # ---------------------------------------------------------------------------

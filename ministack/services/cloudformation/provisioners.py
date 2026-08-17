@@ -2296,6 +2296,163 @@ def _apigw_stage_delete(physical_id, props):
     _apigw_v1._delete_stage(api_id, stage_name)
 
 
+# --- API Gateway ApiKey / UsagePlan (v1) ---
+
+def _apigw_tag_map(raw):
+    """Normalize CFN ``Tags`` (a map, or a list of {Key, Value}) to a dict."""
+    if isinstance(raw, dict):
+        return dict(raw)
+    return {t["Key"]: t["Value"] for t in raw or []}
+
+
+def _apigw_throttle(raw):
+    """Map a CFN ThrottleSettings block to the API Gateway wire shape."""
+    if not raw:
+        return {}
+    out = {}
+    if "BurstLimit" in raw:
+        out["burstLimit"] = raw["BurstLimit"]
+    if "RateLimit" in raw:
+        out["rateLimit"] = raw["RateLimit"]
+    return out
+
+
+def _apigw_quota(raw):
+    """Map a CFN QuotaSettings block to the API Gateway wire shape."""
+    if not raw:
+        return {}
+    out = {}
+    for cfn_key, api_key in (("Limit", "limit"), ("Offset", "offset"), ("Period", "period")):
+        if cfn_key in raw:
+            out[api_key] = raw[cfn_key]
+    return out
+
+
+def _apigw_api_key_create(logical_id, props, stack_name):
+    """Provision an ``AWS::ApiGateway::ApiKey``.
+
+    Ref returns the generated key id; ``Fn::GetAtt APIKeyId`` returns the same
+    id, matching the AWS CloudFormation resource contract. The runtime create
+    always mints a fresh value, so an explicit ``Value`` is applied afterwards
+    to honor a caller-pinned key.
+    """
+    data = {
+        "name": props.get("Name") or _physical_name(stack_name, logical_id),
+        "description": props.get("Description", ""),
+        "enabled": props.get("Enabled", True),
+        "stageKeys": [
+            {"restApiId": sk.get("RestApiId", ""), "stageName": sk.get("StageName", "")}
+            for sk in props.get("StageKeys", [])
+        ],
+        "tags": _apigw_tag_map(props.get("Tags")),
+    }
+    status, _headers, body = _apigw_v1._create_api_key(data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::ApiKey create failed: {body!r}")
+    api_key = json.loads(body)
+    key_id = api_key.get("id", "")
+    value = props.get("Value")
+    if value:
+        stored = _apigw_v1._api_keys.get(key_id)
+        if stored is not None:
+            stored["value"] = value
+    customer_id = props.get("CustomerId")
+    if customer_id:
+        stored = _apigw_v1._api_keys.get(key_id)
+        if stored is not None:
+            stored["customerId"] = customer_id
+    return key_id, {"APIKeyId": key_id}
+
+
+def _apigw_api_key_update(physical_id, old_props, new_props, stack_name):
+    # Value is immutable in CloudFormation; changing it replaces the key.
+    # Everything else updates the existing record in place.
+    if old_props.get("Value") != new_props.get("Value"):
+        _apigw_v1._delete_api_key(physical_id)
+        return _apigw_api_key_create(physical_id, new_props, stack_name)
+    key = _apigw_v1._api_keys.get(physical_id)
+    if key is None:
+        return _apigw_api_key_create(physical_id, new_props, stack_name)
+    if new_props.get("Name"):
+        key["name"] = new_props["Name"]
+    key["description"] = new_props.get("Description", "")
+    key["enabled"] = new_props.get("Enabled", True)
+    key["customerId"] = new_props.get("CustomerId", key.get("customerId", ""))
+    key["lastUpdatedDate"] = _apigw_v1._now_unix()
+    return physical_id, {"APIKeyId": physical_id}
+
+
+def _apigw_api_key_delete(physical_id, props):
+    # _delete_api_key is idempotent — a missing key returns a 404 tuple that we
+    # ignore, so repeated or post-reset deletes converge cleanly.
+    _apigw_v1._delete_api_key(physical_id)
+
+
+def _apigw_usage_plan_body(props):
+    return {
+        "description": props.get("Description", ""),
+        "apiStages": [
+            {
+                "apiId": stage.get("ApiId", ""),
+                "stage": stage.get("Stage", ""),
+                "throttle": stage.get("Throttle", {}),
+            }
+            for stage in props.get("ApiStages", [])
+        ],
+        "throttle": _apigw_throttle(props.get("Throttle")),
+        "quota": _apigw_quota(props.get("Quota")),
+        "tags": _apigw_tag_map(props.get("Tags")),
+    }
+
+
+def _apigw_usage_plan_create(logical_id, props, stack_name):
+    """Provision an ``AWS::ApiGateway::UsagePlan``.
+
+    Ref and ``Fn::GetAtt Id`` both return the generated usage plan id.
+    """
+    data = {"name": props.get("UsagePlanName") or _physical_name(stack_name, logical_id)}
+    data.update(_apigw_usage_plan_body(props))
+    status, _headers, body = _apigw_v1._create_usage_plan(data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::UsagePlan create failed: {body!r}")
+    plan = json.loads(body)
+    plan_id = plan.get("id", "")
+    return plan_id, {"Id": plan_id}
+
+
+def _apigw_usage_plan_update(physical_id, old_props, new_props, stack_name):
+    plan = _apigw_v1._usage_plans.get(physical_id)
+    if plan is None:
+        return _apigw_usage_plan_create(physical_id, new_props, stack_name)
+    if new_props.get("UsagePlanName"):
+        plan["name"] = new_props["UsagePlanName"]
+    plan.update(_apigw_usage_plan_body(new_props))
+    return physical_id, {"Id": physical_id}
+
+
+def _apigw_usage_plan_delete(physical_id, props):
+    _apigw_v1._delete_usage_plan(physical_id)
+
+
+def _apigw_usage_plan_key_create(logical_id, props, stack_name):
+    """Provision an ``AWS::ApiGateway::UsagePlanKey`` (associate a key with a plan).
+
+    Ref returns the API key id; the delete handler reads the usage plan id back
+    from the resource's own properties, so the physical id need not encode it.
+    """
+    plan_id = props.get("UsagePlanId", "")
+    key_id = props.get("KeyId", "")
+    data = {"keyId": key_id, "keyType": props.get("KeyType", "API_KEY")}
+    status, _headers, body = _apigw_v1._create_usage_plan_key(plan_id, data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::UsagePlanKey create failed: {body!r}")
+    return key_id, {}
+
+
+def _apigw_usage_plan_key_delete(physical_id, props):
+    _apigw_v1._delete_usage_plan_key(props.get("UsagePlanId", ""), props.get("KeyId", ""))
+
+
 # --- API Gateway BasePathMapping ---
 
 def _apigw_base_path_mapping_identity(props):
@@ -5741,6 +5898,20 @@ _RESOURCE_HANDLERS = {
     "AWS::ApiGateway::Authorizer": {"create": _apigw_authorizer_create, "delete": _apigw_authorizer_delete},
     "AWS::ApiGateway::Deployment": {"create": _apigw_deployment_create, "delete": _apigw_deployment_delete},
     "AWS::ApiGateway::Stage": {"create": _apigw_stage_create, "delete": _apigw_stage_delete},
+    "AWS::ApiGateway::ApiKey": {
+        "create": _apigw_api_key_create,
+        "update": _apigw_api_key_update,
+        "delete": _apigw_api_key_delete,
+    },
+    "AWS::ApiGateway::UsagePlan": {
+        "create": _apigw_usage_plan_create,
+        "update": _apigw_usage_plan_update,
+        "delete": _apigw_usage_plan_delete,
+    },
+    "AWS::ApiGateway::UsagePlanKey": {
+        "create": _apigw_usage_plan_key_create,
+        "delete": _apigw_usage_plan_key_delete,
+    },
     "AWS::ApiGateway::BasePathMapping": {
         "create": _apigw_base_path_mapping_create,
         "update": _apigw_base_path_mapping_update,

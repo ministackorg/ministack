@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **CloudFormation — API Gateway (v1) API keys and usage plans** — `AWS::ApiGateway::ApiKey`, `AWS::ApiGateway::UsagePlan`, and `AWS::ApiGateway::UsagePlanKey` failed stack creation with `Unsupported resource type`, even though the runtime `CreateApiKey` / `CreateUsagePlan` APIs were already served. The three resource types now provision through those same stores: an `ApiKey` supports a pinned `Value`, `Enabled`, and `StageKeys`, updates `Name` / `Description` / `Enabled` in place, and exposes both `Ref` and `Fn::GetAtt APIKeyId` as the key id; a `UsagePlan` maps `Throttle` / `Quota` / `ApiStages` and returns its id via `Ref` and `Fn::GetAtt Id`; a `UsagePlanKey` associates a key with a plan and is torn down from the plan on delete. This unblocks CDK `RestApi` / `ApiKey` constructs and Terraform `aws_api_gateway_api_key` deployed through CloudFormation. Contributed by @ryan-bennett.
+
 ## [1.4.19] — 2026-08-16
 
 ### Added
