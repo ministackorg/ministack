@@ -48,7 +48,7 @@ from xml.sax.saxutils import escape as _esc
 
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.concurrency import run_offloop, spawn_background
+from ministack.core.concurrency import resource_lock, run_offloop, spawn_background
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -939,7 +939,7 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
         ports={f"{container_port}/tcp": host_port},
         name=container_name,
         labels={
-            "ministack": "rds",
+            **container_reaper.own_labels("rds"),
             "cluster_id": cluster_id,
             "account_id": get_account_id(),
             "region": get_region(),
@@ -1343,7 +1343,7 @@ def _start_rds_container_for_instance(db_id, instance):
         ports={f"{container_port}/tcp": host_port},
         name=container_name,
         labels={
-            "ministack": "rds",
+            **container_reaper.own_labels("rds"),
             "db_id": db_id,
             "account_id": get_account_id(),
             "region": get_region(),
@@ -1369,12 +1369,20 @@ def _start_rds_container_for_instance(db_id, instance):
         instance["DBInstanceStatus"] = "failed"
         return
 
-    if _instances.get(db_id) is not instance:
+    # Check-and-publish under the lock, so a DeleteDBInstance cannot land in the
+    # gap between them and leave this container referenced by nothing. The check
+    # has to be unconditional — the MySQL readiness path below has its own, but
+    # Postgres would otherwise leave the container running forever.
+    with resource_lock("rds", db_id):
+        current = _instances.get(db_id)
+        orphaned = current is not instance or instance.get("_deleting")
+        if not orphaned:
+            instance["_docker_container_id"] = container.id
+    if orphaned:
         # Deleted (or replaced) while we were pulling and starting. Reclaim the
-        # container now: no record references it, and the periodic reaper never
-        # touches a *running* container, so nothing else ever would. This check
-        # has to be unconditional — the MySQL readiness path below has its own,
-        # but Postgres would otherwise leave the container running forever.
+        # container: no record references it, and the periodic reaper never
+        # touches a *running* container, so nothing else ever would. Outside the
+        # lock — Docker calls never hold it.
         logger.info("RDS: instance %s vanished during start; reclaiming container", db_id)
         try:
             container.stop(timeout=2)
@@ -1382,8 +1390,6 @@ def _start_rds_container_for_instance(db_id, instance):
         except Exception:
             pass
         return
-
-    instance["_docker_container_id"] = container.id
 
     internal_host = None
     internal_port = None
@@ -2891,7 +2897,7 @@ def _create_db_instance_impl(p):
                     ports={f"{container_port}/tcp": host_port},
                     name=_rds_docker_name(db_id),
                     labels={
-                        "ministack": "rds",
+                        **container_reaper.own_labels("rds"),
                         "db_id": db_id,
                         "account_id": get_account_id(),
                         "region": get_region(),
@@ -3311,15 +3317,35 @@ def _delete_db_instance(p):
             else:
                 _stop_cluster_shared_container(shared_cluster_id, cluster)
 
+    # Tombstone first, under the lock: a deferred start still pulling would
+    # otherwise publish its container id after we read it here, and the record
+    # is gone by the time it lands — leaving a running container nothing
+    # references. With the tombstone that finisher reclaims what it started.
+    with resource_lock("rds", instance_id):
+        instance["_deleting"] = True
+        owned_id = instance.get("_docker_container_id") if _instance_owns_container(instance) else None
+
     docker_client = _get_docker()
-    if docker_client and _instance_owns_container(instance):
-        try:
-            c = docker_client.containers.get(instance["_docker_container_id"])
-            c.stop(timeout=5)
-            c.remove(v=True)
-            logger.info("RDS: removed container for %s", instance_id)
-        except Exception as e:
-            logger.warning("RDS: failed to remove container for %s: %s", instance_id, e)
+    if docker_client:
+        # By id, else by the deterministic name — the id may never have been
+        # published if the delete beat the deferred start.
+        for locate in (
+            (lambda: docker_client.containers.get(owned_id)) if owned_id else None,
+            lambda: docker_client.containers.get(_rds_docker_name(instance_id)),
+        ):
+            if locate is None:
+                continue
+            try:
+                c = locate()
+            except Exception:
+                continue
+            try:
+                c.stop(timeout=5)
+                c.remove(v=True)
+                logger.info("RDS: removed container for %s", instance_id)
+            except Exception as e:
+                logger.warning("RDS: failed to remove container for %s: %s", instance_id, e)
+            break
 
     skip_snapshot = _p(p, "SkipFinalSnapshot") == "true"
     final_snap_id = _p(p, "FinalDBSnapshotIdentifier")

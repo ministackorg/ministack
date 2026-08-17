@@ -24,6 +24,14 @@ freezes every service at once, which is strictly worse than exhausting a pool.
 Bounding in-flight re-entrant work is a *policy* question that belongs to the
 caller (Lambda enforces AWS's concurrency model and throttles), not to this
 module: a blocking gate here would re-create the deadlock it exists to remove.
+
+Moving handlers off the loop also removed the serialisation they were silently
+relying on. Under the loop, read-modify-write on a service record could not
+interleave; off it, every ``if record still exists: publish into it`` became a
+race, and a delete landing in the gap leaves a container nothing references. Use
+:func:`resource_lock` for those, under one rule: **hold it across a record
+mutation, never across a Docker call or a re-entrant dispatch.** A lock held
+across either is how #1277's per-service locking deadlocked.
 """
 
 import asyncio
@@ -43,6 +51,42 @@ def active_counts() -> dict:
     """Snapshot of threads this module currently has running."""
     with _counts_lock:
         return {"reentrant": _reentrant_threads, "background": _background_threads}
+
+
+_resource_locks: dict = {}
+_resource_locks_guard = threading.Lock()
+
+
+def resource_lock(scope: str, key: str) -> threading.Lock:
+    """A lock for one resource — e.g. ``resource_lock("elasticache", cluster_id)``.
+
+    For making a read-modify-write on a service record atomic now that handlers
+    no longer run serialised on the event loop. Typical use is a deferred
+    provisioner publishing what it started, versus a delete removing the record:
+
+        with resource_lock("elasticache", cluster_id):     # short, no I/O
+            rec = _clusters.get(cluster_id)
+            stale = rec is not record or rec.get("_deleting")
+            if not stale:
+                rec["_docker_container_id"] = container_id
+        if stale:
+            tear_down(container_id)                        # outside the lock
+
+    Two rules keep this safe:
+
+    - **Never hold it across a Docker call or anything that can re-enter
+      MiniStack.** That is what makes per-service locking deadlock: a container
+      MiniStack starts is handed ``AWS_ENDPOINT_URL`` pointing back at MiniStack,
+      so it calls in while the starter still holds the lock.
+    - **Compare record identity, not truthiness.** ``if rec:`` cannot tell a
+      surviving record from a same-named one created after a delete; ``rec is
+      record`` can.
+
+    Locks are kept for the process lifetime. They are one mutex per resource id
+    ever seen, which is far cheaper than the bookkeeping to reclaim them safely.
+    """
+    with _resource_locks_guard:
+        return _resource_locks.setdefault((scope, key), threading.Lock())
 
 
 def _bump(kind: str, delta: int) -> None:

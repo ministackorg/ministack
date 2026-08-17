@@ -21,6 +21,7 @@ import re
 import threading
 import time
 
+from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, is_arn, parse_arn
 from ministack.core.concurrency import run_reentrant
 from ministack.core.persistence import load_state
@@ -408,7 +409,7 @@ def _execute_build(build_id, project):
                 "/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"},
                 env_dir: {"bind": "/LocalBuild/envFile", "mode": "ro"},
             },
-            labels={"ministack": "codebuild", "ministack.codebuild.build": build_id},
+            labels=container_reaper.own_labels("codebuild", **{"ministack.codebuild.build": build_id}),
         )
     except Exception:
         logger.exception("Failed to start build %s", build_id)

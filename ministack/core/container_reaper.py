@@ -17,12 +17,25 @@ when it is unambiguously garbage:
 Services publish the ids they still own via ``register_live_ids``. A service
 that does not register is never reaped from here — silence means "unknown", not
 "garbage".
+
+Reaping is also scoped to *this* MiniStack. Several instances can share a Docker
+daemon, and "not in my records" says nothing about another instance's containers:
+a ``StopDBCluster``-ed database is exited by design and expected to restart, so a
+second gateway would delete it after the grace period. Every container carries
+``ministack.instance`` — the gateway address, which only one process can hold, so
+it is an identity rather than a guess — and ``ministack.boot``, a per-process
+nonce. The periodic pass matches both, so it cannot see another instance's
+containers at all; the boot sweep matches the address only, since holding the
+port proves the previous owner is gone.
 """
 
 import concurrent.futures
 import logging
+import os
+import socket
 import threading
 import time
+import uuid
 
 logger = logging.getLogger("container_reaper")
 
@@ -31,9 +44,40 @@ REAP_INTERVAL = 60.0
 # service that is mid-restart is not raced.
 EXITED_GRACE = 120.0
 
+# Label carrying which MiniStack owns a container, and which run of it.
+INSTANCE_LABEL = "ministack.instance"
+BOOT_LABEL = "ministack.boot"
+
 _providers: dict = {}
 _lock = threading.Lock()
 _started = False
+_boot_nonce = uuid.uuid4().hex[:12]
+
+
+def instance_id() -> str:
+    """Identity of this MiniStack: the address it serves on.
+
+    The gateway port is the one thing that is provably exclusive — two instances
+    cannot bind it — so it identifies an instance without any coordination.
+    """
+    host = os.environ.get("MINISTACK_HOSTNAME") or socket.gethostname()
+    port = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
+    return f"{host}:{port}"
+
+
+def own_labels(service: str, **extra) -> dict:
+    """Labels every MiniStack-created container must carry.
+
+    ``service`` is the value of the ``ministack`` label (e.g. "rds"). Anything in
+    ``extra`` is merged, so callers keep their own labels.
+    """
+    labels = {
+        "ministack": service,
+        INSTANCE_LABEL: instance_id(),
+        BOOT_LABEL: _boot_nonce,
+    }
+    labels.update({k: v for k, v in extra.items() if v is not None})
+    return labels
 
 
 def register_live_ids(label: str, provider) -> None:
@@ -71,7 +115,14 @@ def reap_abandoned(docker_client) -> int:
     now = time.time()
     removed = 0
     try:
-        containers = docker_client.containers.list(all=True, filters={"label": "ministack"})
+        # Scoped to this instance *and* this run of it. Another MiniStack's
+        # containers are not merely skipped later — they are never listed, so no
+        # amount of downstream logic can reclaim them. Containers predating the
+        # labels are likewise invisible here; the boot sweep still gets them.
+        containers = docker_client.containers.list(all=True, filters={"label": [
+            f"{INSTANCE_LABEL}={instance_id()}",
+            f"{BOOT_LABEL}={_boot_nonce}",
+        ]})
     except Exception as exc:
         logger.debug("reaper: listing containers failed: %s", exc)
         return 0
@@ -151,29 +202,53 @@ SERVICE_LABELS = (
 )
 
 
-def reap_all(docker_client, stop_timeout: int = 2) -> int:
+def reap_all(docker_client, stop_timeout: int = 2, include_unlabelled: bool = False) -> int:
     """Remove every MiniStack container, whatever its state.
 
     For process boundaries only — boot and shutdown. At boot any surviving
-    container is by definition an orphan of a dead process (persistence strips
-    container ids from snapshots, so nothing can still own one). At shutdown
-    everything is going away regardless. Neither assumption holds while the
-    process is live, which is why :func:`reap_abandoned` exists separately and
-    is far more conservative.
+    container **of ours** is by definition an orphan of a dead process: we hold
+    the gateway port now, so whichever process created them is gone (persistence
+    strips container ids from snapshots, so nothing can still own one). At
+    shutdown everything is going away regardless. Neither assumption holds while
+    the process is live, which is why :func:`reap_abandoned` exists separately
+    and is far more conservative.
+
+    Scoped by ``ministack.instance`` but *not* by boot nonce — the whole point is
+    to reclaim a previous run's containers, which carry a different nonce.
+
+    A container owned by a *different* instance is never reclaimed here, at boot
+    or at shutdown. Shutdown is not a licence to sweep broadly: another MiniStack
+    may be running on the same daemon, and taking its containers down as we exit
+    is the very failure this scoping exists to prevent.
+
+    ``include_unlabelled`` additionally matches containers that carry a MiniStack
+    service label but *no* instance label — those predate this scheme and cannot
+    be attributed to anyone. Boot uses it, because holding the gateway port means
+    any such leftover is ours to clean; shutdown does not.
     """
     if docker_client is None:
         return 0
+    mine = instance_id()
     seen, targets = set(), []
-    for label in SERVICE_LABELS:
+
+    def _collect(selector, accept):
         try:
-            containers = docker_client.containers.list(all=True, filters={"label": label})
+            found = docker_client.containers.list(all=True, filters={"label": selector})
         except Exception as exc:
-            logger.debug("reap_all: listing %s failed: %s", label, exc)
-            continue
-        for c in containers:
-            if c.id not in seen:
-                seen.add(c.id)
-                targets.append(c)
+            logger.debug("reap_all: listing %s failed: %s", selector, exc)
+            return
+        for c in found:
+            if c.id in seen or not accept(c):
+                continue
+            seen.add(c.id)
+            targets.append(c)
+
+    _collect([f"{INSTANCE_LABEL}={mine}"], lambda c: True)
+    if include_unlabelled:
+        for service_label in SERVICE_LABELS:
+            # Only ownerless leftovers. A container carrying someone else's
+            # instance label is off limits however it was found.
+            _collect([service_label], lambda c: not (c.labels or {}).get(INSTANCE_LABEL))
     return drop_containers(targets, stop_timeout=stop_timeout)
 
 

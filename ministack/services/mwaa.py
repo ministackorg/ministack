@@ -365,7 +365,7 @@ def _start_airflow_container_in_scope(account_id, region, env_name, env):
             environment=container_env,
             ports={f"{container_port}/tcp": host_port},
             name=container_name,
-            labels={"ministack": "mwaa", "region": region, "env_name": env_name},
+            labels=container_reaper.own_labels("mwaa", region=region, env_name=env_name),
         )
 
         if ms_network:

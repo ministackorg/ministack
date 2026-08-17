@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 
 import pytest
 from botocore.exceptions import ClientError
+from conftest import LoopProbe
 
 from ministack.services import ecs as ecs_service
 
@@ -1362,3 +1363,37 @@ def test_ecs_container_secret_arn_selects_the_requested_region():
         sm_service.reset()
         set_request_account_id(original_account)
         set_request_region(original_region)
+
+
+# ---------------------------------------------------------------------------
+# Re-entrancy under concurrency — the rest of the suite issues one request at
+# a time, so a service whose blocking work is misclassified passes serially
+# and only wedges under load. These fire N callers at once and assert both
+# that every caller completes and that the event loop keeps serving.
+# ---------------------------------------------------------------------------
+@pytest.mark.serial
+def test_ecs_run_task_does_not_block_the_loop(ecs):
+    """RunTask talks to the Docker daemon; that must never happen on the loop."""
+    cluster = f"conc-{_uuid_mod.uuid4().hex[:8]}"
+    ecs.create_cluster(clusterName=cluster)
+    ecs.register_task_definition(
+        family=f"{cluster}-td",
+        containerDefinitions=[{"name": "app", "image": "alpine:latest",
+                               "command": ["sleep", "3600"], "memory": 64, "essential": True}],
+    )
+    with LoopProbe() as probe:
+        try:
+            ecs.run_task(cluster=cluster, taskDefinition=f"{cluster}-td", count=1)
+        except Exception as exc:                      # no daemon / image pull refused
+            pytest.skip(f"ECS RunTask unavailable in this environment: {exc}")
+        finally:
+            for arn in ecs.list_tasks(cluster=cluster).get("taskArns", []):
+                try:
+                    ecs.stop_task(cluster=cluster, task=arn)
+                except Exception:
+                    pass
+            try:
+                ecs.delete_cluster(cluster=cluster)
+            except Exception:
+                pass
+    probe.assert_responsive("ECS RunTask")

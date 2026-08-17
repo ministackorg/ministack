@@ -645,11 +645,14 @@ def test_eks_k3s_run_kwargs_container_name_and_labels_are_region_scoped():
 
     assert east["name"] == "ministack-eks-us-east-1-my-cluster"
     assert west["name"] == "ministack-eks-us-west-2-my-cluster"
-    assert east["labels"] == {
+    # Subset, not equality: containers also carry the ownership labels
+    # (`ministack.instance` / `ministack.boot`) that scope reaping to this
+    # MiniStack. This test is about region scoping, so it asserts only that.
+    assert {
         "ministack": "eks",
         "cluster_name": "my-cluster",
         "region": "us-east-1",
-    }
+    }.items() <= east["labels"].items()
     assert west["labels"]["region"] == "us-west-2"
 
 

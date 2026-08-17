@@ -6,6 +6,8 @@ import json
 import os
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid as _uuid_mod
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,6 +15,13 @@ from urllib.parse import urlparse
 
 import pytest
 from botocore.exceptions import ClientError
+from conftest import (
+    CONCURRENCY_N,
+    ENDPOINT,
+    LoopProbe,
+    concurrent_burst,
+    make_probe_lambda,
+)
 
 _endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
@@ -4150,3 +4159,43 @@ def test_apigwv2_authorizer_cache_is_bounded():
     finally:
         cache.clear()
         cache.update(saved)
+
+
+# ---------------------------------------------------------------------------
+# Re-entrancy under concurrency — the rest of the suite issues one request at
+# a time, so a service whose blocking work is misclassified passes serially
+# and only wedges under load. These fire N callers at once and assert both
+# that every caller completes and that the event loop keeps serving.
+# ---------------------------------------------------------------------------
+@pytest.mark.serial
+def test_concurrent_apigw_lambda_proxy_requests(apigw, lam):
+    """N simultaneous HTTP-API requests, each executing a Lambda, must all serve."""
+    fn = make_probe_lambda(lam, (
+        "import time\n"
+        "def handler(event, context):\n"
+        "    time.sleep(0.4)\n"
+        "    return {'statusCode': 200, 'body': 'ok'}\n"
+    ))
+    api = apigw.create_api(Name=f"conc-{uuid.uuid4().hex[:8]}", ProtocolType="HTTP",
+                           Target=f"arn:aws:lambda:us-east-1:000000000000:function:{fn}")
+    api_id = api["ApiId"]
+
+    def call(_):
+        try:
+            r = urllib.request.urlopen(f"{ENDPOINT}/_apigw/{api_id}/", timeout=30)
+            return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+        except Exception:
+            return None
+
+    with LoopProbe() as probe:
+        codes = concurrent_burst(call)
+    probe.assert_responsive("apigw proxy burst")
+
+    # The route wiring differs by MiniStack version; what this test guards is
+    # that the server answered every caller rather than wedging.
+    assert all(c is not None for c in codes), (
+        f"{codes.count(None)}/{CONCURRENCY_N} API Gateway requests got no response at all — "
+        f"the Lambda dispatch wedged"
+    )

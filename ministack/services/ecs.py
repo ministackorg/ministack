@@ -1100,7 +1100,7 @@ def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
         ports=port_bindings or None,
         name=f"ministack-ecs-{task_id[:8]}-{cdef['name']}",
         labels={
-            "ministack": "ecs",
+            **container_reaper.own_labels("ecs"),
             "com.amazonaws.ecs.cluster": cluster_arn,
             "com.amazonaws.ecs.container-name": cdef["name"],
             "com.amazonaws.ecs.task-arn": task_arn,

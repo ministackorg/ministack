@@ -24,6 +24,7 @@ import threading
 import time
 from urllib.parse import unquote
 
+from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
 from ministack.core.persistence import load_state
@@ -1537,7 +1538,7 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         "command": cmd,
         "environment": container_env,
         "detach": True,
-        "labels": {"ministack": "glue", "job_name": job_name},
+        "labels": container_reaper.own_labels("glue", job_name=job_name),
     }
 
     if ms_network:

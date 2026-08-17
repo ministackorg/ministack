@@ -29,7 +29,7 @@ import time
 
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.concurrency import run_offloop, spawn_background
+from ministack.core.concurrency import resource_lock, run_offloop, spawn_background
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -395,7 +395,7 @@ def _spawn_dataplane(domain_name: str, engine_version: str):
     labels = {
         # Standard label so the boot/shutdown orphan reap finds these; the
         # com.ministack.* keys below are what the service's own lookups use.
-        "ministack": "opensearch",
+        **container_reaper.own_labels("opensearch"),
         "com.ministack.service": "opensearch",
         "com.ministack.domain": domain_name,
         "com.ministack.region": get_region(),
@@ -679,27 +679,44 @@ def _new_domain_record(name, payload):
     if _deferred:
         # Pull + start off the request path. The domain reports Processing=True
         # until this lands, exactly as AWS does.
+        created_record = rec
+
         def _finish_domain_start():
             try:
                 h, pt, cid2, _dep, _dcid = _spawn_dataplane(name, engine_version)
             except Exception:
                 logger.warning("OpenSearch: deferred dataplane start failed for %s", name)
                 h = pt = cid2 = None
-            live = _domains.get(name)
-            if not live:
-                # Deleted while the image was pulling: reclaim what we started,
-                # or it runs forever unowned (the reaper never touches a
-                # running container).
-                if cid2:
-                    _remove_container_by_id(cid2)
-                return
-            if h:
-                live["Endpoint"] = f"{h}:{pt}"
-                live["_container_id"] = cid2
-            live["Processing"] = False
+            # Publish under the lock: a DeleteDomain must not land between the
+            # existence check and the write. Identity, not truthiness — a domain
+            # recreated under the same name is a different resource.
+            with resource_lock("opensearch", name):
+                live = _domains.get(name)
+                orphaned = live is not created_record or live.get("_deleting")
+                if not orphaned:
+                    if h:
+                        # Both keys. Readers prefer `_Endpoint`, and create left
+                        # it at the `localhost:BASE_PORT` placeholder, so
+                        # writing only `Endpoint` left Describe reporting an
+                        # address nothing listens on — the same defect reported
+                        # against ElastiCache.
+                        endpoint = f"{h}:{pt}"
+                        live["Endpoint"] = endpoint
+                        live["_Endpoint"] = endpoint
+                        live["_container_id"] = cid2
+                        live["_ContainerId"] = cid2
+                    live["Processing"] = False
+            if orphaned and cid2:
+                # Nothing references it and the reaper never touches a running
+                # container. Outside the lock: Docker calls never hold it.
+                _remove_container_by_id(cid2)
 
-        spawn_background(contextvars.copy_context().run, _finish_domain_start,
-                         thread_name=f"ministack-opensearch-start-{name}")
+        # Handed to the caller rather than started here: this function builds
+        # the record, and `_domains[name]` is not assigned until afterwards. A
+        # finisher started now can win that race, find no record, and tear down
+        # the container it just created — the domain then never becomes
+        # available. Started once the record is registered.
+        rec["_deferred_start"] = _finish_domain_start
     return rec
 
 
@@ -829,6 +846,12 @@ def create_domain_record(payload, compatibility_properties=None):
             _tags[rec["ARN"]] = tags
         else:
             _tags.pop(rec["ARN"], None)
+        # Only now — the finisher looks the record up by name and reclaims what
+        # it started if it is not there, so it must not run before this.
+        deferred_start = rec.pop("_deferred_start", None)
+        if deferred_start is not None:
+            spawn_background(contextvars.copy_context().run, deferred_start,
+                             thread_name=f"ministack-opensearch-start-{name}")
         return rec
     except Exception:
         if rec is not None:
@@ -895,7 +918,12 @@ def update_domain_from_cloudformation(name, payload, compatibility_properties):
 
 def delete_domain_record(name, missing_ok=False):
     """Delete all domain-owned state and containers, optionally idempotently."""
-    rec = _domains.pop(name, None)
+    # Claim under the lock so a deferred start cannot publish into a record we
+    # are removing. Teardown itself stays outside — it calls Docker.
+    with resource_lock("opensearch", name):
+        rec = _domains.pop(name, None)
+        if rec:
+            rec["_deleting"] = True
     if not rec and not missing_ok:
         raise OpenSearchServiceError(
             404, "ResourceNotFoundException", f"Domain not found: {name}"

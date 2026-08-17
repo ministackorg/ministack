@@ -324,11 +324,13 @@ def test_airflow_runtime_identity_and_background_scope_include_region(
         # by remove(v=True), so this cannot lose persisted state.
         assert legacy_container.remove_calls == [{"force": True, "v": True}]
         assert docker_client.containers.run_kwargs["name"] == expected_name
-        assert docker_client.containers.run_kwargs["labels"] == {
+        # Subset: ownership labels (`ministack.instance` / `ministack.boot`)
+        # are also present and are not what this test is about.
+        assert {
             "ministack": "mwaa",
             "region": region,
             "env_name": env_name,
-        }
+        }.items() <= docker_client.containers.run_kwargs["labels"].items()
         expected_volume_prefix = legacy_name if legacy_volumes else expected_name
         assert set(docker_client.containers.run_kwargs["volumes"]) == {
             f"{expected_volume_prefix}-dags",

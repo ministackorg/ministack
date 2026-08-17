@@ -2052,7 +2052,11 @@ async def _handle_lifespan(scope, receive, send):
             # boot: without it, containers (and their anonymous volumes) pile up
             # for as long as MiniStack runs.
             container_reaper.start(_reaper_docker_client)
-            _reap = spawn_background(_stop_docker_containers,
+            # Boot only: also reclaim ownerless leftovers from a MiniStack that
+            # predates the instance labels. Holding the gateway port means any
+            # such container is ours. Shutdown deliberately does not do this —
+            # another instance may be live on this daemon.
+            _reap = spawn_background(_stop_docker_containers, True,
                                      thread_name="ministack-boot-reap")
             _reap.join(timeout=_DOCKER_REAP_BOOT_DEADLINE)
             if _reap.is_alive():
@@ -2151,7 +2155,7 @@ def _reaper_docker_client():
         return None
 
 
-def _stop_docker_containers():
+def _stop_docker_containers(include_unlabelled: bool = False):
     """Remove every MiniStack container. Boot and shutdown only.
 
     The reclamation rules live in ``core.container_reaper``: this is the
@@ -2167,7 +2171,7 @@ def _stop_docker_containers():
     client = _reaper_docker_client()
     if client is None:
         return
-    container_reaper.reap_all(client)
+    container_reaper.reap_all(client, include_unlabelled=include_unlabelled)
 
 
 def _build_persistence_save_dict():

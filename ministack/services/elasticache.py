@@ -29,7 +29,7 @@ from urllib.parse import parse_qs
 
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.concurrency import run_offloop, spawn_background
+from ministack.core.concurrency import resource_lock, run_offloop, spawn_background
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -260,7 +260,7 @@ def _ensure_live_containers_locked():
                 name=f"ministack-elasticache-{account_id}-{region}-{name}",
                 engine=engine, engine_version=version,
                 labels={
-                    "ministack": "elasticache",
+                    **container_reaper.own_labels("elasticache"),
                     "cluster_id": name,
                     "account_id": account_id,
                     "region": region,
@@ -292,7 +292,7 @@ def _ensure_live_containers_locked():
                     name=f"ministack-elasticache-rg-{account_id}-{region}-{rg_id}-{ng_id}",
                     engine=engine, engine_version=engine_version,
                     labels={
-                        "ministack": "elasticache", "rg_id": rg_id,
+                        **container_reaper.own_labels("elasticache"), "rg_id": rg_id,
                         "node_group": ng_id, "account_id": account_id,
                         "region": region,
                     },
@@ -653,7 +653,7 @@ def _build_real_cluster_rg(rg_id, engine, engine_version, num_node_groups, repli
     container_ids = []
 
     common_labels = {
-        "ministack": "elasticache",
+        **container_reaper.own_labels("elasticache"),
         "rg_id": rg_id,
         "account_id": account_id,
         "region": region,
@@ -926,7 +926,7 @@ def _create_cache_cluster(p):
         engine=engine,
         engine_version=engine_version,
         labels={
-            "ministack": "elasticache",
+            **container_reaper.own_labels("elasticache"),
             "cluster_id": cluster_id,
             "account_id": account_id,
             "region": region,
@@ -985,25 +985,34 @@ def _create_cache_cluster(p):
     if _deferred:
         # Pull + start off the request path; the cluster reports `creating`
         # until this lands, exactly as AWS does.
+        created_record = _clusters[cluster_id]
+
         def _finish_cluster_start():
             try:
                 host, port, cid = _spawn_redis_container(**_spawn_kwargs)
             except Exception:
-                _clusters[cluster_id]["CacheClusterStatus"] = "create-failed"
+                with resource_lock("elasticache", cluster_id):
+                    rec = _clusters.get(cluster_id)
+                    if rec is created_record:
+                        rec["CacheClusterStatus"] = "create-failed"
                 return
-            rec = _clusters.get(cluster_id)
-            if not rec:
-                # Deleted while the image was pulling. The container we just
-                # started has no owner and nothing else will ever reclaim it —
-                # the periodic reaper only touches created/dead/exited, never a
-                # running container. Tear it down here.
+            # Publish under the lock so a DeleteCacheCluster cannot land between
+            # the "is it still there" check and the write. Identity, not
+            # truthiness: a same-named cluster created after a delete is a
+            # different resource and must not adopt this container.
+            with resource_lock("elasticache", cluster_id):
+                rec = _clusters.get(cluster_id)
+                orphaned = rec is not created_record or rec.get("_deleting")
+                if not orphaned:
+                    rec["_docker_container_id"] = cid
+                    _publish_endpoint(rec, host, port)
+                    rec["CacheClusterStatus"] = "available"
+            if orphaned:
+                # Deleted while the image was pulling. Nothing references this
+                # container and the periodic reaper only touches created / dead
+                # / exited, never a *running* one — so it would run forever.
+                # Torn down outside the lock: Docker calls never hold it.
                 _teardown_containers(_get_docker(), [cid])
-                return
-            rec["_docker_container_id"] = cid
-            ep = rec.get("ConfigurationEndpoint") or {}
-            ep["Address"], ep["Port"] = host, port
-            rec["ConfigurationEndpoint"] = ep
-            rec["CacheClusterStatus"] = "available"
 
         spawn_background(contextvars.copy_context().run, _finish_cluster_start,
                          thread_name=f"ministack-elasticache-start-{cluster_id}")
@@ -1014,23 +1023,62 @@ def _create_cache_cluster(p):
     return _xml_cluster_response("CreateCacheClusterResponse", "CreateCacheClusterResult", _clusters[cluster_id])
 
 
+def _publish_endpoint(rec: dict, host: str, port: int) -> None:
+    """Write the cluster's endpoint everywhere a reader looks for it.
+
+    The deferred-start bug was two writers disagreeing about the key: create
+    recorded ``_endpoint`` and ``CacheNodes[].Endpoint`` (with the *engine
+    default* port, since no container existed yet), while the finisher updated
+    only ``ConfigurationEndpoint``. Every Describe path reads the first two, so a
+    cold-image create reported ``localhost:6379`` for the rest of its life while
+    the container was on the allocated host port. One writer, so they cannot
+    drift apart again.
+    """
+    endpoint = {"Address": host, "Port": port}
+    rec["_endpoint"] = dict(endpoint)
+    for node in rec.get("CacheNodes") or []:
+        node["Endpoint"] = dict(endpoint)
+    if rec.get("ConfigurationEndpoint") is not None or "ConfigurationEndpoint" in rec:
+        rec["ConfigurationEndpoint"] = dict(endpoint)
+
+
 def _delete_cache_cluster(p):
     cluster_id = _p(p, "CacheClusterId")
-    cluster = _clusters.get(cluster_id)
-    if not cluster:
-        return _error("CacheClusterNotFound", f"Cluster {cluster_id} not found", 404)
+    # Claim the record under the lock and leave a tombstone, so a deferred
+    # start still in flight sees the delete and reclaims what it started
+    # instead of publishing a container nobody references.
+    with resource_lock("elasticache", cluster_id):
+        cluster = _clusters.get(cluster_id)
+        if not cluster:
+            return _error("CacheClusterNotFound", f"Cluster {cluster_id} not found", 404)
+        cluster["_deleting"] = True
+        cluster["CacheClusterStatus"] = "deleting"
+        container_id = cluster.get("_docker_container_id")
+        del _clusters[cluster_id]
 
     docker_client = _get_docker()
-    if docker_client and cluster.get("_docker_container_id"):
-        try:
-            container = docker_client.containers.get(cluster["_docker_container_id"])
-            container.stop(timeout=5)
-            container.remove(v=True)
-        except Exception as e:
-            logger.warning("ElastiCache: failed to remove container for %s: %s", cluster_id, e)
-
-    cluster["CacheClusterStatus"] = "deleting"
-    del _clusters[cluster_id]
+    if docker_client:
+        # By id *or* by the deterministic name. The id alone is not enough: a
+        # delete can arrive before the deferred start has published one, and
+        # then nothing would ever reclaim the container. Two independent
+        # handles, so a leak needs both to miss.
+        for locate in (
+            (lambda: docker_client.containers.get(container_id)) if container_id else None,
+            lambda: docker_client.containers.get(
+                f"ministack-elasticache-{get_account_id()}-{get_region()}-{cluster_id}"),
+        ):
+            if locate is None:
+                continue
+            try:
+                container = locate()
+            except Exception:
+                continue
+            try:
+                container.stop(timeout=5)
+                container.remove(v=True)
+            except Exception as e:
+                logger.warning("ElastiCache: failed to remove container for %s: %s", cluster_id, e)
+            break
     _tags.pop(cluster.get("CacheClusterArn", ""), None)
     _record_event(cluster_id, "cache-cluster", "Cache cluster deleted")
     return _xml_cluster_response("DeleteCacheClusterResponse", "DeleteCacheClusterResult", cluster)
@@ -1181,7 +1229,7 @@ def _create_replication_group(p):
                 engine=engine,
                 engine_version=engine_version,
                 labels={
-                    "ministack": "elasticache",
+                    **container_reaper.own_labels("elasticache"),
                     "rg_id": rg_id,
                     "node_group": ng_id,
                     "account_id": account_id,

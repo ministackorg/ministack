@@ -423,7 +423,7 @@ def _k3s_run_kwargs(
         devices=["/dev/fuse"],
         ports={"6443/tcp": port},
         name=f"ministack-eks-{region}-{name}",
-        labels={"ministack": "eks", "cluster_name": name, "region": region},
+        labels=container_reaper.own_labels("eks", cluster_name=name, region=region),
         environment={"K3S_KUBECONFIG_MODE": "644"},
         volumes={"/lib/modules": {"bind": "/lib/modules", "mode": "ro"}},
         tmpfs={"/run": "", "/var/run": "", "/tmp": ""},

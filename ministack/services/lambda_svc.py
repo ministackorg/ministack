@@ -47,6 +47,7 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote, unquote
 
+from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
 from ministack.core.lambda_runtime import (
@@ -3784,7 +3785,7 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
         "ports": {"8080/tcp": None},
         "detach": True,
         "stdin_open": False,
-        "labels": {"ministack": "lambda"},
+        "labels": container_reaper.own_labels("lambda"),
     }
     if package_type == "Image":
         # User image brings its own entrypoint. ImageConfig can override.

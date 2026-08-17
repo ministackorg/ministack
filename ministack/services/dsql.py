@@ -21,7 +21,7 @@ import string
 import threading
 import time
 
-from ministack.core import pgproxy
+from ministack.core import container_reaper, pgproxy
 from ministack.core.concurrency import run_offloop
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
@@ -246,7 +246,7 @@ def _run_backend_container(identifier):
         },
         ports={"5432/tcp": None},  # docker-assigned host port
         name=name,
-        labels={"ministack": "dsql", "cluster_id": identifier},
+        labels=container_reaper.own_labels("dsql", cluster_id=identifier),
     )
     if ms_network:
         container_kwargs["network"] = ms_network

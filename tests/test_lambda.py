@@ -15,6 +15,13 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from conftest import (
+    CONCURRENCY_N_NESTED,
+    ENDPOINT,
+    LoopProbe,
+    concurrent_burst,
+    make_probe_lambda,
+)
 
 _endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
@@ -10542,3 +10549,90 @@ def test_lambda_inbound_invoke_depth_parsing(headers, expected):
     from ministack.services.lambda_svc import _inbound_invoke_depth
 
     assert _inbound_invoke_depth(headers) == expected
+
+
+# ---------------------------------------------------------------------------
+# Re-entrancy under concurrency — the rest of the suite issues one request at
+# a time, so a service whose blocking work is misclassified passes serially
+# and only wedges under load. These fire N callers at once and assert both
+# that every caller completes and that the event loop keeps serving.
+# ---------------------------------------------------------------------------
+@pytest.mark.serial
+def test_concurrent_nested_lambda_invocations_do_not_starve(lam):
+    """Callers that each invoke another function must never wedge.
+
+    Three details make this discriminate; without any one of them a build with
+    the bug still passes:
+
+    - **distinct caller functions.** One function invoked N times serialises on
+      its own worker lock and never reaches the shared pool.
+    - **a hold before the nested call**, so every caller is in flight at once
+      rather than completing before the next starts.
+    - **N above the pool size**, since starvation begins at exactly the pool
+      bound.
+
+    A throttle is a correct answer and is allowed — the account concurrency cap
+    is deliberately below N on small hosts. What must never happen is a caller
+    getting no answer at all, which is what starvation looks like.
+    """
+    callee = make_probe_lambda(lam, "def handler(event, context):\n    return {'pong': True}\n")
+    caller_src = f"""
+import json, os, time, urllib.request
+
+def handler(event, context):
+    time.sleep(float(event.get("hold", 1.5)))
+    ep = os.environ["AWS_ENDPOINT_URL"]
+    req = urllib.request.Request(
+        ep + "/2015-03-31/functions/{callee}/invocations",
+        data=json.dumps({{}}).encode(),
+        headers={{"Content-Type": "application/json"}},
+    )
+    return {{"nested": json.loads(urllib.request.urlopen(req, timeout=25).read().decode())}}
+"""
+    callers = [make_probe_lambda(lam, caller_src, timeout=40) for _ in range(CONCURRENCY_N_NESTED)]
+
+    # A client sized for the burst. The shared fixture client pools far fewer
+    # connections than we fire, and the resulting client-side queueing shows up
+    # as latency that looks like server stall but is not.
+    import boto3
+    from botocore.config import Config as _Config
+
+    burst_client = boto3.client(
+        "lambda", endpoint_url=ENDPOINT, aws_access_key_id="test",
+        aws_secret_access_key="test", region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+        config=_Config(retries={"max_attempts": 0}, read_timeout=120,
+                       max_pool_connections=CONCURRENCY_N_NESTED + 8),
+    )
+
+    def invoke(name, hold=1.5):
+        try:
+            payload = burst_client.invoke(
+                FunctionName=name, Payload=json.dumps({"hold": hold}).encode())
+            body = payload["Payload"].read().decode() or "{}"
+            if payload.get("FunctionError"):
+                # A timeout is the starvation signature: the nested call never
+                # got a slot. Anything else is the handler's own failure.
+                return "wedged" if "timed out" in body.lower() else "error"
+            return "ok"
+        except Exception as exc:
+            return "throttled" if "TooManyRequests" in str(exc) else "wedged"
+
+    # Warm every caller first, in small batches. Otherwise the measured burst
+    # pays 70 simultaneous cold starts, which a 2-core CI runner cannot finish
+    # inside the function timeout — 16 of 70 timed out that way, which reads as
+    # starvation but is only the box running out of CPU. Warm workers make the
+    # burst measure scheduling, which is what this test is about.
+    for i in range(0, len(callers), 10):
+        concurrent_burst(lambda n: invoke(n, hold=0.0), items=callers[i:i + 10])
+
+    with LoopProbe() as probe:
+        results = concurrent_burst(invoke, items=callers)
+    probe.assert_responsive("nested lambda burst")
+
+    wedged = results.count("wedged")
+    assert wedged == 0, (
+        f"{wedged}/{CONCURRENCY_N_NESTED} nested invocations never completed — re-entrant work is "
+        f"queueing behind itself (ok={results.count('ok')}, "
+        f"throttled={results.count('throttled')}, error={results.count('error')})"
+    )
+    assert results.count("ok") > 0, "no invocation succeeded at all"

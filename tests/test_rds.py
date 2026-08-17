@@ -4082,12 +4082,14 @@ def test_rds_restore_state_respawns_docker_container(monkeypatch):
     assert runs[0]["environment"]["POSTGRES_USER"] == "admin"
     assert runs[0]["environment"]["POSTGRES_PASSWORD"] == "password123"
     assert runs[0]["environment"]["POSTGRES_DB"] == "mydb"
-    assert runs[0]["labels"] == {
+    # Subset: ownership labels (`ministack.instance` / `ministack.boot`) are
+    # also stamped so the reaper cannot cross instance boundaries.
+    assert {
         "ministack": "rds",
         "db_id": db_id,
         "account_id": get_account_id(),
         "region": get_region(),
-    }
+    }.items() <= runs[0]["labels"].items()
 
     restored = m._instances.get(db_id)
     assert restored is not None

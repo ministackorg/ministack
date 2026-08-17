@@ -1732,3 +1732,103 @@ def test_valkey_no_docker_fallback_uses_redis_port(monkeypatch):
     )
     assert (host, port) == (elasticache.REDIS_DEFAULT_HOST, elasticache.REDIS_DEFAULT_PORT)
     assert cid is None
+
+
+# ---------------------------------------------------------------------------
+# Deferred (cold-image) provisioning — state, not liveness
+# ---------------------------------------------------------------------------
+
+@pytest.mark.serial
+def test_elasticache_cold_image_publishes_the_real_endpoint(fake_docker, monkeypatch):
+    """Describe must report the port the container actually listens on.
+
+    When the engine image is not cached, CreateCacheCluster returns at once and
+    a background finisher starts the container. The finisher wrote
+    `ConfigurationEndpoint` while every Describe path reads `_endpoint` and
+    `CacheNodes[].Endpoint` — which create had filled with the *engine default*
+    port, no container existing yet. So a cold-image create reported
+    `localhost:6379` for the rest of its life while the container was on the
+    allocated host port, and never self-corrected. Reported by @Areson.
+    """
+    import threading
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import elasticache as ec
+
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    monkeypatch.setattr(ec, "_get_docker", lambda: fake_docker)
+    monkeypatch.setattr(ec, "_image_is_local", lambda *_a: False)
+    monkeypatch.setattr(ec, "_spawn_redis_container",
+                        lambda **kw: ("localhost", 16379, "cid-real"))
+
+    done = threading.Event()
+    orig = ec.spawn_background
+
+    def tracked(fn, *a, **kw):
+        t = orig(fn, *a, **kw)
+        threading.Thread(target=lambda: (t.join(), done.set()), daemon=True).start()
+        return t
+    monkeypatch.setattr(ec, "spawn_background", tracked)
+
+    ec._create_cache_cluster({"CacheClusterId": ["cold-1"], "Engine": ["redis"],
+                              "CacheNodeType": ["cache.t3.micro"], "NumCacheNodes": ["1"]})
+    assert done.wait(timeout=10), "deferred finisher never completed"
+
+    rec = ec._clusters["cold-1"]
+    assert rec["CacheClusterStatus"] == "available"
+    assert rec["_endpoint"] == {"Address": "localhost", "Port": 16379}, (
+        f"Describe would report {rec['_endpoint']} — nothing is listening there"
+    )
+    assert rec["CacheNodes"][0]["Endpoint"]["Port"] == 16379
+
+
+@pytest.mark.serial
+def test_elasticache_delete_during_deferred_start_leaves_no_container(fake_docker, monkeypatch):
+    """A delete while the container is being started must not strand it.
+
+    The finisher checked the record existed and then published the container id
+    into it. A delete in that gap removed the record, found no id to tear down,
+    and the container ran on referenced by nothing — unreachable by any API
+    call. Reported by @Areson.
+    """
+    import threading
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import elasticache as ec
+
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    monkeypatch.setattr(ec, "_get_docker", lambda: fake_docker)
+    monkeypatch.setattr(ec, "_image_is_local", lambda *_a: False)
+
+    spawned, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def fake_spawn(**kw):
+        name = kw.get("name")
+        fake_docker.containers.run(name=name, labels=kw.get("labels"))
+        spawned.set()
+        release.wait(timeout=10)          # hold inside the provisioning window
+        return "localhost", 16380, f"cid-{name}"
+    monkeypatch.setattr(ec, "_spawn_redis_container", fake_spawn)
+
+    orig = ec.spawn_background
+
+    def tracked(fn, *a, **kw):
+        t = orig(fn, *a, **kw)
+        threading.Thread(target=lambda: (t.join(), finished.set()), daemon=True).start()
+        return t
+    monkeypatch.setattr(ec, "spawn_background", tracked)
+
+    ec._create_cache_cluster({"CacheClusterId": ["race-1"], "Engine": ["redis"],
+                              "CacheNodeType": ["cache.t3.micro"], "NumCacheNodes": ["1"]})
+    assert spawned.wait(timeout=10), "container was never started"
+
+    ec._delete_cache_cluster({"CacheClusterId": ["race-1"]})
+    release.set()
+    assert finished.wait(timeout=10), "finisher never completed"
+
+    assert "race-1" not in ec._clusters
+    assert fake_docker.live() == [], (
+        f"leaked container(s) {fake_docker.live()} — running, and no API call can reach them"
+    )
