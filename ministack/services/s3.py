@@ -436,9 +436,10 @@ def _validate_content_md5(headers: dict, body: bytes):
 
 
 def _check_put_preconditions(headers: dict, existing_obj: dict | None):
-    """Evaluate `If-Match` and `If-None-Match` on PUT.
+    """Evaluate `If-Match` and `If-None-Match` on a conditional write.
 
-    AWS S3 added native conditional writes on PutObject in November 2024:
+    AWS S3 added native conditional writes — on PutObject and
+    CompleteMultipartUpload alike — in November 2024:
       - `If-None-Match: "*"` — succeed only when no object exists at the key.
         Used to implement create-once semantics (idempotent writes, distributed
         leader election via S3, two-file pair serialization).
@@ -448,8 +449,9 @@ def _check_put_preconditions(headers: dict, existing_obj: dict | None):
       - `If-Match: "<etag>"` — succeed only when the existing object's ETag
         matches.
 
-    Returns a 412 PreconditionFailed tuple when a condition is violated;
-    otherwise returns None and the caller proceeds with the PUT.
+    Returns an error tuple when a condition is violated — 412
+    PreconditionFailed, except that If-Match against a missing key is 404
+    NoSuchKey — otherwise returns None and the caller proceeds with the write.
 
     ETag comparison strips surrounding quotes on both sides — S3 stores ETags
     with quotes but client code is inconsistent about including them.
@@ -482,27 +484,19 @@ def _check_put_preconditions(headers: dict, existing_obj: dict | None):
             )
 
     if if_match:
-        # "*" form: any existing object satisfies the condition; missing → 412 per RFC 7232.
-        # (AWS docs don't explicitly document If-Match:* for PutObject, but the inverse case
-        # is well-defined by RFC and real S3 follows it.)
-        if if_match == "*":
-            if existing_obj is None:
-                return _error(
-                    "PreconditionFailed",
-                    "At least one of the pre-conditions you specified did not hold",
-                    412,
-                )
-        elif existing_obj is None:
-            # AWS S3 specifically returns 404 (NoSuchKey) — not 412 — when If-Match: <etag>
-            # targets a key that doesn't exist (or whose current version is a delete marker).
-            # Documented under "Conditional write behavior" in the user guide:
+        if existing_obj is None:
+            # AWS S3 specifically returns 404 (NoSuchKey) — not the RFC 7232
+            # 412 — when If-Match targets a key that doesn't exist (or whose
+            # current version is a delete marker), for the "*" form as well as
+            # the ETag form.  Documented under "Conditional write behavior" in
+            # the user guide:
             # https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html#conditional-error-response
             return _error(
                 "NoSuchKey",
                 "The specified key does not exist.",
                 404,
             )
-        elif if_match.strip('"') != existing_etag:
+        if if_match != "*" and if_match.strip('"') != existing_etag:
             return _error(
                 "PreconditionFailed",
                 "At least one of the pre-conditions you specified did not hold",
@@ -4786,6 +4780,15 @@ def _complete_multipart_upload(
             404,
             f"/{bucket_name}/{key}",
         )
+
+    # CompleteMultipartUpload takes the same If-Match / If-None-Match
+    # preconditions PutObject does, evaluated against the current object at
+    # complete time.  (The idempotent replay above deliberately skips them —
+    # the original request already passed its conditions when it committed.)
+    precondition_err = _check_put_preconditions(
+        headers or {}, bucket.get("objects", {}).get(key))
+    if precondition_err:
+        return precondition_err
 
     try:
         xml_root = fromstring(body)

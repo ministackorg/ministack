@@ -164,21 +164,28 @@ def test_s3_put_object_if_none_match_etag(s3):
 
 
 def test_s3_put_object_if_match_star_requires_existing(s3):
-    """If-Match: * succeeds when an object exists, fails when none does."""
+    """If-Match: * succeeds when an object exists, 404s when none does.
+
+    The missing-key answer is NoSuchKey — not the RFC 7232 412 — for the "*"
+    form just like the ETag form: AWS documents one If-Match error row for a
+    key that doesn't exist, and ceph/s3-tests pins 404 for both forms.
+    https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html#conditional-error-response
+    """
     bucket = "intg-s3-ifm-star"
     s3.create_bucket(Bucket=bucket)
 
     def _add_ifm_star(request, **_kwargs):
         request.headers["If-Match"] = "*"
 
-    # No existing object → 412.
+    # No existing object → 404 NoSuchKey.
     s3.meta.events.register_first("before-send.s3.PutObject", _add_ifm_star)
     try:
         with pytest.raises(ClientError) as exc:
             s3.put_object(Bucket=bucket, Key="missing.txt", Body=b"x")
     finally:
         s3.meta.events.unregister("before-send.s3.PutObject", _add_ifm_star)
-    assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+    assert exc.value.response["Error"]["Code"] == "NoSuchKey"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
 
     # Now create it, then If-Match: * succeeds.
     s3.put_object(Bucket=bucket, Key="present.txt", Body=b"a")
@@ -241,6 +248,65 @@ def test_s3_put_object_if_match_etag_missing_object_returns_404(s3):
 
     assert exc.value.response["Error"]["Code"] == "NoSuchKey"
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+# ─── Conditional CompleteMultipartUpload (If-Match / If-None-Match) ──────────
+# Unlike PutObject, botocore models IfMatch/IfNoneMatch on
+# CompleteMultipartUpload directly, so no header-injection hack is needed.
+
+def _mpu_complete(s3, bucket, key, body=b"part-data", **conditions):
+    """Run a full multipart upload for `key`, completing with `conditions`."""
+    mp = s3.create_multipart_upload(Bucket=bucket, Key=key)
+    part = s3.upload_part(Bucket=bucket, Key=key, UploadId=mp["UploadId"],
+                          PartNumber=1, Body=body)
+    return s3.complete_multipart_upload(
+        Bucket=bucket, Key=key, UploadId=mp["UploadId"],
+        MultipartUpload={"Parts": [{"ETag": part["ETag"], "PartNumber": 1}]},
+        **conditions)
+
+
+def test_s3_complete_multipart_if_none_match_star(s3):
+    """If-None-Match: * on CompleteMultipartUpload is create-once: the first
+    complete lands, a second over the existing key fails 412 and must not
+    overwrite the object."""
+    bucket = "intg-s3-mpu-ifnm-star"
+    s3.create_bucket(Bucket=bucket)
+
+    _mpu_complete(s3, bucket, "obj", body=b"first", IfNoneMatch="*")
+    with pytest.raises(ClientError) as exc:
+        _mpu_complete(s3, bucket, "obj", body=b"second", IfNoneMatch="*")
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+    assert s3.get_object(Bucket=bucket, Key="obj")["Body"].read() == b"first"
+
+
+def test_s3_complete_multipart_if_match_etag(s3):
+    """If-Match on CompleteMultipartUpload succeeds against the current ETag
+    and fails 412 against a stale one."""
+    bucket = "intg-s3-mpu-ifm-etag"
+    s3.create_bucket(Bucket=bucket)
+    etag = s3.put_object(Bucket=bucket, Key="obj", Body=b"v1")["ETag"]
+
+    _mpu_complete(s3, bucket, "obj", body=b"v2", IfMatch=etag)
+    assert s3.get_object(Bucket=bucket, Key="obj")["Body"].read() == b"v2"
+
+    with pytest.raises(ClientError) as exc:
+        _mpu_complete(s3, bucket, "obj", body=b"v3", IfMatch=etag)  # now stale
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+    assert s3.get_object(Bucket=bucket, Key="obj")["Body"].read() == b"v2"
+
+
+def test_s3_complete_multipart_if_match_missing_key_404(s3):
+    """If-Match on CompleteMultipartUpload against a missing key is 404
+    NoSuchKey — for the "*" form as well as the ETag form, like PutObject."""
+    bucket = "intg-s3-mpu-ifm-missing"
+    s3.create_bucket(Bucket=bucket)
+
+    for cond in ("*", '"00000000000000000000000000000000"'):
+        with pytest.raises(ClientError) as exc:
+            _mpu_complete(s3, bucket, "absent", IfMatch=cond)
+        assert exc.value.response["Error"]["Code"] == "NoSuchKey"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
 
 def test_s3_put_get_json_chunked(s3):
     """AWS SDK v2 sends PutObject with chunked Transfer-Encoding — body must be decoded cleanly."""
