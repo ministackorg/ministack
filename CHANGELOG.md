@@ -7,8 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Added
+### Fixed
 - **EC2 — instance public IP and DNS reach the SDKs, and generated addresses are addresses** — `DescribeInstances` and `RunInstances` emitted the public address under `publicIpAddress` / `publicDnsName`, which are not the tags the EC2 wire schema defines (`ipAddress` / `dnsName`, per botocore's `ec2-2016-11-15` model), so every SDK dropped both fields silently and `PublicIpAddress` came back absent on instances that had one. They now ride the real tags. Fixing that exposed a second one: `_random_ip` appended two octets whatever it was given, so a one-octet prefix produced `52.55.218` — `AllocateAddress` has been handing back that shape as `PublicIp` all along, and no address parser accepts it. The generator now completes any prefix to four octets. Contributed by @iot-rocket.
+- **S3 — `CRC64NVME` checksums are computed instead of refused** — CRC-64/NVME is the algorithm current AWS SDKs and the CLI checksum uploads with by default, and MiniStack answered it with `InvalidRequest` ("requires optional native dependencies"), so a stock `aws s3 cp` or `aws s3api put-object` failed before it began unless the caller knew to set `AWS_REQUEST_CHECKSUM_CALCULATION=when_required`. The algorithm is plain arithmetic — the reflected form of polynomial `0xAD93D23594C93659` with all-ones init and xorout — so it is now computed from a byte-at-a-time table in the stdlib, adding no dependency: `PutObject` and `CopyObject` validate a client-supplied `x-amz-checksum-crc64nvme` (`BadDigest` on mismatch) and `GetObject` / `HeadObject` return it under `x-amz-checksum-mode: ENABLED`, typed `FULL_OBJECT`. The tests pin the implementation to the algorithm's published check value (`b"123456789"` → `0xAE8B14860A799888`) and to a bit-at-a-time reference rather than to itself. `CRC32C` still requires the native `google-crc32c` and is still refused.
 
 ## [1.4.19] — 2026-08-16
 
