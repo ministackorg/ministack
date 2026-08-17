@@ -3879,6 +3879,126 @@ def test_s3_put_object_with_crc32_checksum_roundtrips(s3):
     s3.delete_bucket(Bucket=bucket)
 
 
+# CRC-64/NVME's published check value: the checksum of b"123456789". The tests
+# below assert against it so the server is pinned to the specification rather
+# than to its own implementation.
+_CRC64NVME_CHECK = 0xAE8B14860A799888
+
+
+def _crc64nvme_bitwise(data: bytes) -> int:
+    """Bit-at-a-time CRC-64/NVME, independent of the server's table."""
+    crc = 0xFFFFFFFFFFFFFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0x9A6C9329AC4BC9B5 if crc & 1 else crc >> 1
+    return crc ^ 0xFFFFFFFFFFFFFFFF
+
+
+def _put_with_checksum(bucket: str, key: str, body: bytes, headers: dict):
+    """PUT over raw HTTP, the way the CLI sends a checksummed upload.
+
+    boto3 can only compute CRC-64/NVME when the optional `awscrt` package is
+    installed, so these tests build the headers themselves rather than making
+    the suite depend on it.
+    """
+    import urllib.request
+    req = urllib.request.Request(
+        f"{ENDPOINT}/{bucket}/{key}", data=body, method="PUT", headers=headers)
+    return urllib.request.urlopen(req)
+
+
+def _head_checksum(bucket: str, key: str, algorithm: str):
+    import urllib.request
+    req = urllib.request.Request(
+        f"{ENDPOINT}/{bucket}/{key}", method="HEAD",
+        headers={"x-amz-checksum-mode": "ENABLED"})
+    with urllib.request.urlopen(req) as r:
+        return r.headers.get(f"x-amz-checksum-{algorithm}"), r.headers.get("x-amz-checksum-type")
+
+
+def test_s3_put_object_with_crc64nvme_checksum_roundtrips(s3):
+    """CRC-64/NVME is the algorithm current SDKs and the CLI checksum uploads
+    with by default, so a stock `aws s3 cp` fails outright unless the server
+    computes it. It is plain arithmetic and needs no native library."""
+    import base64
+    import struct
+
+    bucket = "checksum-crc64nvme-bucket"
+    s3.create_bucket(Bucket=bucket)
+    body = b"123456789"
+    expected = base64.b64encode(struct.pack(">Q", _CRC64NVME_CHECK)).decode()
+
+    with _put_with_checksum(bucket, "k", body,
+                            {"x-amz-sdk-checksum-algorithm": "CRC64NVME"}) as r:
+        assert r.status == 200
+
+    value, csum_type = _head_checksum(bucket, "k", "crc64nvme")
+    assert value == expected
+    assert csum_type == "FULL_OBJECT"
+    assert s3.get_object(Bucket=bucket, Key="k")["Body"].read() == body
+
+    s3.delete_object(Bucket=bucket, Key="k")
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_crc64nvme_matches_bitwise_reference_over_long_body(s3):
+    """The server's table-driven CRC must agree with a bit-at-a-time reference
+    over a body long enough to reach every table entry."""
+    import base64
+    import struct
+
+    # A wrong reference must not be able to rubber-stamp a wrong server.
+    assert _crc64nvme_bitwise(b"123456789") == _CRC64NVME_CHECK
+
+    bucket = "checksum-crc64nvme-long-bucket"
+    s3.create_bucket(Bucket=bucket)
+    body = bytes(range(256)) * 40 + b"tail"
+    expected = base64.b64encode(struct.pack(">Q", _crc64nvme_bitwise(body))).decode()
+
+    with _put_with_checksum(bucket, "k", body,
+                            {"x-amz-sdk-checksum-algorithm": "CRC64NVME"}) as r:
+        assert r.status == 200
+
+    value, _ = _head_checksum(bucket, "k", "crc64nvme")
+    assert value == expected
+
+    s3.delete_object(Bucket=bucket, Key="k")
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_put_object_with_explicit_crc64nvme_value_validated(s3):
+    """A client-supplied CRC-64/NVME must match the server-computed one, so the
+    algorithm is verified rather than echoed back unchecked."""
+    import base64
+    import struct
+    import urllib.error
+
+    bucket = "checksum-crc64nvme-validate-bucket"
+    s3.create_bucket(Bucket=bucket)
+    body = b"123456789"
+    good = base64.b64encode(struct.pack(">Q", _CRC64NVME_CHECK)).decode()
+    bad = base64.b64encode(struct.pack(">Q", _CRC64NVME_CHECK ^ 0xFF)).decode()
+
+    with _put_with_checksum(bucket, "ok", body, {
+        "x-amz-sdk-checksum-algorithm": "CRC64NVME",
+        "x-amz-checksum-crc64nvme": good,
+    }) as r:
+        assert r.status == 200
+    assert _head_checksum(bucket, "ok", "crc64nvme")[0] == good
+
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _put_with_checksum(bucket, "bad", body, {
+            "x-amz-sdk-checksum-algorithm": "CRC64NVME",
+            "x-amz-checksum-crc64nvme": bad,
+        })
+    assert exc.value.code == 400
+    assert b"BadDigest" in exc.value.read()
+
+    s3.delete_object(Bucket=bucket, Key="ok")
+    s3.delete_bucket(Bucket=bucket)
+
+
 def test_s3_delete_object_by_version_id_purges_version(s3):
     """DeleteObject with an explicit VersionId must physically remove exactly
     that version (not add a delete marker). Repro for the versioned-delete bug:
