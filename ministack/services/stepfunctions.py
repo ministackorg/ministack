@@ -5687,9 +5687,33 @@ def _invoke_aws_sdk_integration(resource, input_data):
         )
 
 
+def _invoke_events_put_events(resource, input_data):
+    """arn:aws:states:::events:putEvents — actually publish to EventBridge.
+
+    Without this the task fell through to the passthrough at the end of
+    _invoke_resource: it reported SUCCEEDED but never delivered the event, so a
+    state machine that emits notifications completed green while the target
+    never fired.
+    """
+    try:
+        from ministack.services import eventbridge
+    except ImportError:
+        logger.warning("eventbridge module unavailable; returning passthrough")
+        return input_data
+    status, _, body = eventbridge._put_events(input_data)
+    result = json.loads(body) if body else {}
+    if status >= 400:
+        raise _ExecutionError(
+            result.get("__type", "EventBridge.EventBridgeException"),
+            result.get("message", ""),
+        )
+    return result
+
+
 _SERVICE_DISPATCH = {
     "arn:aws:states:::sqs:sendMessage": _invoke_sqs_send_message,
     "arn:aws:states:::sns:publish": _invoke_sns_publish,
+    "arn:aws:states:::events:putEvents": _invoke_events_put_events,
     "arn:aws:states:::dynamodb:putItem": lambda r, d: _invoke_dynamodb("putItem", d),
     "arn:aws:states:::dynamodb:getItem": lambda r, d: _invoke_dynamodb("getItem", d),
     "arn:aws:states:::dynamodb:deleteItem": lambda r, d: _invoke_dynamodb(
