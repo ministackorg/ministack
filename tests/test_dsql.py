@@ -1198,6 +1198,104 @@ class TestTxnLimits:
         assert pgproxy._values_tuple_count("UPDATE t SET a = 1") == 0
 
 
+class TestIdentifierNormalization:
+    """``"id"``, ``id`` and ``ID`` all name the same column; ``"ID"`` does not.
+    Rules that compare a statement's identifiers against catalog names have to
+    normalize the same way the server does, or quoted SQL stops matching."""
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("id", ("id", False)),
+            ("ID", ("id", False)),
+            ("  id  ", ("id", False)),
+            ('"id"', ("id", True)),
+            ('"ID"', ("ID", True)),
+            ('"we ird"', ("we ird", True)),
+            ('"quo""ted"', ('quo"ted', True)),
+        ],
+    )
+    def test_fold_identifier(self, raw, expected):
+        assert pgproxy.fold_identifier(raw) == expected
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("id", ["id"]),
+            ("t.id", ["t", "id"]),
+            ('"T".id', ["T", "id"]),
+            ('t."ID"', ["t", "ID"]),
+            ('"my schema"."My Table"', ["my schema", "My Table"]),
+            ("Schema.Tbl.Col", ["schema", "tbl", "col"]),
+        ],
+    )
+    def test_identifier_path(self, raw, expected):
+        assert pgproxy.identifier_path(raw) == expected
+
+
+class TestLockingClauses:
+    """What Aurora DSQL restricts about a locking read is the lock *strength*,
+    not the predicate. Measured against a live cluster (eu-central-1,
+    2026-08-18, server_version 16.15): FOR UPDATE locks whatever the query
+    selects — no WHERE clause, a non-key column, an inequality, IN/OR, a join,
+    a table with no primary key — while FOR NO KEY UPDATE, FOR SHARE and
+    FOR KEY SHARE are all refused with 0A000."""
+
+    MESSAGE = "locking clauses other than FOR UPDATE/FOR KEY SHARE are not supported"
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT s FROM t WHERE id = '1' FOR UPDATE",
+            'SELECT "id", "s" FROM "t" WHERE "t"."id" = $1 FOR UPDATE',
+            "SELECT s FROM t FOR UPDATE",
+            "SELECT s FROM t WHERE s = 'a' FOR UPDATE",
+            "SELECT s FROM t WHERE id > '1' FOR UPDATE",
+            "SELECT s FROM t WHERE id IN (1, 2) FOR UPDATE",
+            "SELECT s FROM t WHERE id = 1 OR s = 'a' FOR UPDATE",
+            "SELECT a.s FROM t a JOIN t b ON a.id = b.id FOR UPDATE",
+            "SELECT s FROM t, u WHERE t.id = u.id FOR UPDATE",
+            "SELECT 1 FOR UPDATE",
+            "SELECT s FROM t WHERE id = 1 FOR UPDATE NOWAIT",
+            "SELECT s FROM t WHERE id = 1 FOR UPDATE SKIP LOCKED",
+            "SELECT s FROM t WHERE id = 1 FOR UPDATE OF t NOWAIT",
+            "SELECT * FROM (SELECT 1 FOR UPDATE) x FOR UPDATE",
+            # The words only as text — not a locking clause at all.
+            "SELECT s FROM t WHERE s = 'FOR SHARE'",
+            "SELECT 'FOR NO KEY UPDATE' AS lit",
+            # FOR introducing something else entirely.
+            "DECLARE c CURSOR FOR SELECT 1",
+            "CREATE POLICY p ON t FOR UPDATE TO someone",
+        ],
+    )
+    def test_supported_locking_reads_pass(self, sql):
+        assert pgproxy.validate(sql, pgproxy.TxnState()) is None, sql
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT s FROM t WHERE id = 1 FOR SHARE",
+            "SELECT s FROM t WHERE id = 1 FOR KEY SHARE",
+            "SELECT s FROM t WHERE id = 1 FOR NO KEY UPDATE",
+            "SELECT s FROM t for share",
+            "SELECT s FROM t FOR SHARE NOWAIT",
+            # Any nesting depth: DSQL refuses it inside a CTE or a subquery.
+            "WITH x AS (SELECT s FROM t WHERE id = 1 FOR SHARE) SELECT * FROM x",
+            "SELECT * FROM (SELECT s FROM t FOR KEY SHARE) y",
+            # A supported clause earlier in the statement must not hide one
+            # that still reaches a relation (both verified rejected by DSQL).
+            "SELECT x.id FROM (SELECT id FROM t FOR UPDATE) x, "
+            "(SELECT a FROM two) y FOR SHARE",
+            "WITH c AS (SELECT id FROM t FOR UPDATE) SELECT * FROM two FOR SHARE",
+        ],
+    )
+    def test_unsupported_lock_strength_rejected(self, sql):
+        err = pgproxy.validate(sql, pgproxy.TxnState())
+        assert isinstance(err, pgproxy.DsqlError), sql
+        assert err.sqlstate == "0A000", sql
+        assert err.message == self.MESSAGE, sql
+
+
 # ---------------------------------------------------------------------------
 # Live proxy tests (need Docker — the backend is a real postgres container)
 # ---------------------------------------------------------------------------
@@ -1410,10 +1508,21 @@ class _WireClient:
         self.sock.sendall(self._frame(b"Q", sql.encode() + b"\0"))
         return _WireResult(self._until_ready())
 
-    def extended(self, sql):
-        """Parse/Bind/Describe/Execute/Sync — what prepared statements send."""
+    def extended(self, sql, params=()):
+        """Parse/Bind/Describe/Execute/Sync — what prepared statements send.
+
+        ``params`` are bound as text, so a ``$1`` placeholder reaches the proxy
+        as one, the way an ORM sends it."""
+        bind = b"\0\0" + struct.pack("!HH", 0, len(params))
+        for value in params:
+            if value is None:
+                bind += struct.pack("!i", -1)
+            else:
+                raw = str(value).encode()
+                bind += struct.pack("!i", len(raw)) + raw
+        bind += struct.pack("!H", 0)  # result format codes
         msg = self._frame(b"P", b"\0" + sql.encode() + b"\0" + struct.pack("!H", 0))
-        msg += self._frame(b"B", b"\0\0" + struct.pack("!HHH", 0, 0, 0))
+        msg += self._frame(b"B", bind)
         msg += self._frame(b"D", b"P\0")
         msg += self._frame(b"E", b"\0" + struct.pack("!I", 0))
         msg += self._frame(b"S", b"")
@@ -1521,12 +1630,15 @@ class TestExtendedProtocol:
             assert result.sqlstate == "25006"
             assert "3,000 row" in result.message
 
-    def test_for_update_rules_apply_over_parse(self, dsql_proxy):
+    def test_locking_clause_rules_apply_over_parse(self, dsql_proxy):
         with _WireClient(dsql_proxy) as c:
             c.simple("CREATE TABLE xp_lock (id int PRIMARY KEY, v int)")
-            result = c.extended("SELECT * FROM xp_lock WHERE id > 1 FOR UPDATE")
+            # An unsupported lock strength is refused ...
+            result = c.extended("SELECT * FROM xp_lock WHERE id = 1 FOR SHARE")
             assert result.sqlstate == "0A000"
-            assert "equality predicates" in result.message
+            assert "locking clauses other than FOR UPDATE" in result.message
+            # ... while FOR UPDATE reaches the backend whatever the predicate.
+            assert c.extended("SELECT * FROM xp_lock WHERE v > 1 FOR UPDATE").ok
 
     def test_create_index_async_returns_a_job_over_parse(self, dsql_proxy):
         """DSQL-only syntax has to be rewritten on this path too, or the
@@ -1650,6 +1762,153 @@ class TestDropColumn:
         with _WireClient(dsql_proxy) as c:
             c.simple("CREATE TABLE dc_h (x int, y int)")
             assert c.simple("ALTER TABLE dc_h DROP COLUMN x").ok
+
+
+@requires_docker
+class TestLockingReads:
+    """A locking read has to reach the backend whatever its predicate looks
+    like — an ORM quotes every identifier, and DSQL itself places no
+    restriction on the predicate (measured, eu-central-1, 2026-08-18). What it
+    does refuse is a lock strength other than FOR UPDATE."""
+
+    UUID = "11111111-1111-1111-1111-111111111111"
+    MESSAGE = "locking clauses other than FOR UPDATE/FOR KEY SHARE are not supported"
+
+    @staticmethod
+    def _predicates(table, value):
+        """The same key equality in every quoting and qualification form."""
+        return [
+            f"id = {value}",
+            f'"id" = {value}',
+            f"{table}.id = {value}",
+            f'"{table}".id = {value}',
+            f'{table}."id" = {value}',
+            f'"{table}"."id" = {value}',
+        ]
+
+    def _setup(self, client, name, schema=None):
+        relation = f"{schema}.{name}" if schema else name
+        if schema:
+            client.simple(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+        client.simple(f"DROP TABLE IF EXISTS {relation}")
+        assert client.simple(
+            f"CREATE TABLE {relation} (id uuid PRIMARY KEY, s text)"
+        ).ok
+        assert client.simple(
+            f"INSERT INTO {relation} VALUES ('{self.UUID}', 'a')"
+        ).ok
+
+    def test_quoted_and_qualified_keys_accepted(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            self._setup(c, "fu_q")
+            for relation in ("fu_q", '"fu_q"', "public.fu_q", '"public"."fu_q"'):
+                for predicate in self._predicates("fu_q", f"'{self.UUID}'"):
+                    sql = f"SELECT s FROM {relation} WHERE {predicate} FOR UPDATE"
+                    result = c.simple(sql)
+                    assert result.ok, f"{sql} -> {result.sqlstate} {result.message}"
+                    assert result.rows == [("a",)], sql
+
+    def test_schema_qualified_relation_accepted(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            self._setup(c, "fu_s", schema="myschema")
+            for relation in ("myschema.fu_s", '"myschema".fu_s',
+                             'myschema."fu_s"', '"myschema"."fu_s"'):
+                for predicate in self._predicates("fu_s", f"'{self.UUID}'"):
+                    sql = f"SELECT s FROM {relation} WHERE {predicate} FOR UPDATE"
+                    result = c.simple(sql)
+                    assert result.ok, f"{sql} -> {result.sqlstate} {result.message}"
+                    assert result.rows == [("a",)], sql
+
+    def test_bound_parameter_key_accepted_over_extended_protocol(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            self._setup(c, "fu_b")
+            for predicate in self._predicates("fu_b", "$1"):
+                sql = f"SELECT s FROM fu_b WHERE {predicate} FOR UPDATE"
+                result = c.extended(sql, params=(self.UUID,))
+                assert result.ok, f"{sql} -> {result.sqlstate} {result.message}"
+                assert result.rows == [("a",)], sql
+
+    def test_orm_generated_locking_read(self, dsql_proxy):
+        """Verbatim shape of a Drizzle ``eq(orders.id, id)`` locking read."""
+        with _WireClient(dsql_proxy) as c:
+            c.simple("DROP TABLE IF EXISTS orders")
+            c.simple(
+                'CREATE TABLE "orders" ('
+                '"id" uuid PRIMARY KEY, "order_status" text, "total" int)'
+            )
+            c.simple(f"INSERT INTO orders VALUES ('{self.UUID}', 'new', 7)")
+            sql = (
+                'SELECT "id", "order_status", "total" FROM "orders" '
+                'WHERE "orders"."id" = $1 FOR UPDATE'
+            )
+            result = c.extended(sql, params=(self.UUID,))
+            assert result.ok, f"{result.sqlstate} {result.message}"
+            assert result.rows == [(self.UUID, "new", "7")]
+
+    def test_locking_read_inside_a_transaction(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            self._setup(c, "fu_t")
+            assert c.simple("BEGIN").ok
+            result = c.simple(
+                f'SELECT s FROM "fu_t" WHERE "fu_t"."id" = \'{self.UUID}\' FOR UPDATE'
+            )
+            assert result.ok, f"{result.sqlstate} {result.message}"
+            assert c.simple("COMMIT").ok
+
+    @pytest.mark.parametrize(
+        "tail",
+        [
+            "FOR UPDATE",  # no predicate at all
+            "WHERE s = 'a' FOR UPDATE",  # a non-key column
+            "WHERE id > '{uuid}' FOR UPDATE",  # not an equality
+            "WHERE id IN ('{uuid}') FOR UPDATE",
+            "WHERE id = '{uuid}' OR s = 'a' FOR UPDATE",
+            "WHERE id = '{uuid}' FOR UPDATE NOWAIT",
+            "WHERE id = '{uuid}' FOR UPDATE SKIP LOCKED",
+            "WHERE id = '{uuid}' FOR UPDATE OF fu_p",
+        ],
+    )
+    def test_predicate_is_not_restricted(self, dsql_proxy, tail):
+        """DSQL locks whatever the query selects — the emulator must not be
+        stricter than the service it stands in for."""
+        with _WireClient(dsql_proxy) as c:
+            self._setup(c, "fu_p")
+            sql = f"SELECT s FROM fu_p {tail.format(uuid=self.UUID)}"
+            for send in (c.simple, c.extended):
+                result = send(sql)
+                assert result.ok, f"{sql} -> {result.sqlstate} {result.message}"
+
+    def test_join_and_missing_primary_key_accepted(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            self._setup(c, "fu_j")
+            c.simple("DROP TABLE IF EXISTS fu_nokey")
+            c.simple("CREATE TABLE fu_nokey (a int, s text)")
+            c.simple("INSERT INTO fu_nokey VALUES (1, 'a')")
+            for sql in (
+                "SELECT a.s FROM fu_j a JOIN fu_j b ON a.id = b.id FOR UPDATE",
+                "SELECT s FROM fu_nokey WHERE a = 1 FOR UPDATE",
+                "SELECT s FROM fu_nokey FOR UPDATE",
+            ):
+                result = c.simple(sql)
+                assert result.ok, f"{sql} -> {result.sqlstate} {result.message}"
+
+    @pytest.mark.parametrize(
+        "clause", ["FOR SHARE", "FOR KEY SHARE", "FOR NO KEY UPDATE"]
+    )
+    def test_other_lock_strengths_rejected(self, dsql_proxy, clause):
+        with _WireClient(dsql_proxy) as c:
+            self._setup(c, "fu_l")
+            sql = f"SELECT s FROM fu_l WHERE id = '{self.UUID}' {clause}"
+            for send in (c.simple, c.extended):
+                result = send(sql)
+                assert result.sqlstate == "0A000", sql
+                assert result.message == self.MESSAGE, sql
+
+    def test_lock_strength_in_a_literal_is_not_a_clause(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            self._setup(c, "fu_lit")
+            result = c.simple("SELECT s FROM fu_lit WHERE s = 'FOR SHARE'")
+            assert result.ok, f"{result.sqlstate} {result.message}"
 
 
 @requires_docker
@@ -1927,30 +2186,33 @@ class TestLiveProxy:
             stale.close()
             other.close()
 
-    def test_for_update_rules(self, dsql_proxy):
+    def test_locking_clause_rules(self, dsql_proxy):
         psycopg2 = pytest.importorskip("psycopg2")
         conn = _pg_connect(dsql_proxy)
         try:
             cur = conn.cursor()
             cur.execute("CREATE TABLE fu_live (id int primary key, v text)")
             cur.execute("INSERT INTO fu_live VALUES (1, 'x')")
-            # equality on the PK: fine
-            cur.execute("SELECT * FROM fu_live WHERE id = 1 FOR UPDATE")
-            cur.fetchall()
-            for sql, fragment in [
-                ("SELECT * FROM fu_live FOR UPDATE", "equality predicates"),
-                ("SELECT * FROM fu_live WHERE id > 1 FOR UPDATE", "equality predicates"),
-                ("SELECT * FROM fu_live WHERE v = 'x' FOR UPDATE", "equality predicates"),
-                (
-                    "SELECT * FROM fu_live a JOIN fu_live b ON a.id = b.id "
-                    "WHERE a.id = 1 FOR UPDATE",
-                    "single table",
-                ),
-            ]:
+            # FOR UPDATE locks whatever the query selects, as on DSQL.
+            for sql in (
+                "SELECT * FROM fu_live WHERE id = 1 FOR UPDATE",
+                'SELECT * FROM "fu_live" WHERE "fu_live"."id" = 1 FOR UPDATE',
+                "SELECT * FROM fu_live FOR UPDATE",
+                "SELECT * FROM fu_live WHERE v = 'x' FOR UPDATE",
+                "SELECT * FROM fu_live a JOIN fu_live b ON a.id = b.id FOR UPDATE",
+            ):
+                cur.execute(sql)
+                cur.fetchall()
+            # Any other lock strength is not supported.
+            for sql in (
+                "SELECT * FROM fu_live WHERE id = 1 FOR SHARE",
+                "SELECT * FROM fu_live WHERE id = 1 FOR NO KEY UPDATE",
+                "SELECT * FROM fu_live WHERE id = 1 FOR KEY SHARE",
+            ):
                 with pytest.raises(psycopg2.Error) as exc:
                     cur.execute(sql)
                 assert exc.value.pgcode == "0A000", sql
-                assert fragment in str(exc.value), sql
+                assert "locking clauses other than FOR UPDATE" in str(exc.value), sql
             cur.execute("DROP TABLE fu_live")
         finally:
             conn.close()
