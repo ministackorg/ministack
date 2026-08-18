@@ -172,6 +172,10 @@ _SERIAL_TESTS = {
     "tests/test_iot_data.py::test_iot_rule_where_topic_function_under_basic_ingest",
     "tests/test_iot_data.py::test_iot_rule_where_or_clause_dispatches_either_branch",
     "tests/test_iot_data.py::test_iot_jitr_registration_event_drives_a_topic_rule",
+    # IoT Jobs data-plane routing test: a raw urllib GET with the advertised
+    # `{prefix}.jobs.iot.{region}` Host and a tight 5s timeout, so cross-file
+    # xdist pressure on the shared event loop makes it time out at random.
+    "tests/test_iot_jobs.py::test_iot_jobs_advertised_endpoint_host_reaches_the_data_plane",
     # WS/MQTT-broker tests (MQTT-over-WebSocket connect/publish/subscribe,
     # device shadows over MQTT, fleet-index connectivity). They drive the
     # single-event-loop broker over real WebSocket connections with tight
