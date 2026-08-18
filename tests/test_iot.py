@@ -1507,6 +1507,8 @@ def test_iot_control_plane_identity_stores_are_region_scoped():
         iot_module._shadows,
         iot_module._ca_certificates,
         iot_module._registration_codes,
+        iot_module._jobs,
+        iot_module._job_executions,
     )
     assert all(isinstance(store, AccountRegionScopedDict) for store in stores)
 
@@ -6048,3 +6050,73 @@ def test_shadow_mqtt_get_and_delete_reject_invalid_json():
     finally:
         iot_module._shadows.clear()
         reset()
+
+
+def test_jobs_restored_timed_out_and_removed_executions_are_terminal():
+    """The two service-side statuses nothing here sets must still behave.
+
+    A record restored from persistence (written by a fuller implementation)
+    can carry TIMED_OUT or REMOVED. The promise in the jobs header is that
+    such a record is terminal: it is counted in ``jobProcessDetails`` and
+    does not stop the job from completing. White-box, because only a restore
+    can produce these statuses locally.
+    """
+    from ministack.core.responses import (
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import iot as iot_module
+
+    account_id = "123456789012"
+
+    async def _request(method, path, payload=None):
+        set_request_account_id(account_id)
+        set_request_region("us-east-1")
+        body = json.dumps(payload or {}).encode()
+        return await iot_module.handle_request(method, path, {}, body, {})
+
+    async def _scenario():
+        set_request_account_id(account_id)
+        set_request_region("us-east-1")
+        job_id = f"restored-terminal-{uuid.uuid4().hex[:8]}"
+        things = [f"jt-{job_id}-a", f"jt-{job_id}-b"]
+        try:
+            for thing in things:
+                status, _headers, _body = await _request("POST", f"/things/{thing}")
+                assert status == 200
+            status, _headers, _body = await _request(
+                "PUT",
+                f"/jobs/{job_id}",
+                {
+                    "targets": [
+                        f"arn:aws:iot:us-east-1:{account_id}:thing/{t}"
+                        for t in things
+                    ],
+                    "document": json.dumps({"op": "noop"}),
+                },
+            )
+            assert status == 200
+
+            iot_module._jobs_materialize_executions(job_id)
+            iot_module._job_executions[(things[0], job_id)]["status"] = "TIMED_OUT"
+            iot_module._job_executions[(things[1], job_id)]["status"] = "REMOVED"
+            iot_module._jobs_maybe_complete(job_id)
+
+            status, _headers, body = await _request("GET", f"/jobs/{job_id}")
+            assert status == 200
+            job = json.loads(body)["job"]
+            details = job["jobProcessDetails"]
+            assert details["numberOfTimedOutThings"] == 1
+            assert details["numberOfRemovedThings"] == 1
+            assert job["status"] == "COMPLETED", (
+                "a job whose remaining executions are all TIMED_OUT/REMOVED "
+                "must complete - the statuses are terminal even though "
+                "nothing local sets them"
+            )
+        finally:
+            iot_module._jobs.pop(job_id, None)
+            for thing in things:
+                iot_module._job_executions.pop((thing, job_id), None)
+                await _request("DELETE", f"/things/{thing}")
+
+    asyncio.run(_scenario())
