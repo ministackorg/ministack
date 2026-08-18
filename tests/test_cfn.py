@@ -552,6 +552,104 @@ def test_cfn_iot_and_cognito_role_attachment(cfn, iot_client, cognito_identity):
     _wait_stack(cfn, "cfn-iot-cog")
 
 
+def test_cfn_iot_policy_document_update_applies_in_place(cfn, iot_client):
+    """A changed PolicyDocument updates the policy instead of rolling the stack
+    back: IoT stores a new default version and Ref keeps the same name."""
+    def template(actions):
+        return json.dumps({
+            "Resources": {"Pol": {"Type": "AWS::IoT::Policy", "Properties": {
+                "PolicyName": "cfn-pol-upd",
+                "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+                    {"Effect": "Allow", "Action": actions, "Resource": "*"}]}}}},
+            "Outputs": {"Name": {"Value": {"Ref": "Pol"}}},
+        })
+
+    cfn.create_stack(StackName="cfn-iot-pol-upd", TemplateBody=template(["iot:Connect"]))
+    assert _wait_stack(cfn, "cfn-iot-pol-upd")["StackStatus"] == "CREATE_COMPLETE"
+
+    cfn.update_stack(
+        StackName="cfn-iot-pol-upd",
+        TemplateBody=template(["iot:Connect", "iot:Publish"]),
+    )
+    stack = _wait_stack(cfn, "cfn-iot-pol-upd")
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+    assert next(
+        o["OutputValue"] for o in stack["Outputs"] if o["OutputKey"] == "Name"
+    ) == "cfn-pol-upd"
+
+    policy = iot_client.get_policy(policyName="cfn-pol-upd")
+    assert json.loads(policy["policyDocument"])["Statement"][0]["Action"] == [
+        "iot:Connect", "iot:Publish",
+    ]
+    assert policy["defaultVersionId"] == "2"
+    versions = iot_client.list_policy_versions(policyName="cfn-pol-upd")["policyVersions"]
+    assert {v["versionId"] for v in versions} == {"1", "2"}
+
+    cfn.delete_stack(StackName="cfn-iot-pol-upd")
+    _wait_stack(cfn, "cfn-iot-pol-upd")
+
+
+def test_cfn_iot_policy_updates_stay_under_the_version_cap(cfn, iot_client):
+    """IoT keeps at most five versions of a policy, so repeated updates prune the
+    oldest non-default version rather than growing the list without bound."""
+    def template(count):
+        return json.dumps({
+            "Resources": {"Pol": {"Type": "AWS::IoT::Policy", "Properties": {
+                "PolicyName": "cfn-pol-cap",
+                "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+                    {"Effect": "Allow", "Action": "iot:Connect",
+                     "Resource": [f"arn:aws:iot:*:*:client/c{i}" for i in range(count)]}]}}}},
+        })
+
+    cfn.create_stack(StackName="cfn-iot-pol-cap", TemplateBody=template(1))
+    assert _wait_stack(cfn, "cfn-iot-pol-cap")["StackStatus"] == "CREATE_COMPLETE"
+
+    for count in range(2, 9):
+        cfn.update_stack(StackName="cfn-iot-pol-cap", TemplateBody=template(count))
+        assert _wait_stack(cfn, "cfn-iot-pol-cap")["StackStatus"] == "UPDATE_COMPLETE"
+
+    versions = iot_client.list_policy_versions(policyName="cfn-pol-cap")["policyVersions"]
+    assert len(versions) == 5
+    assert {v["versionId"] for v in versions} == {"4", "5", "6", "7", "8"}
+
+    policy = iot_client.get_policy(policyName="cfn-pol-cap")
+    assert policy["defaultVersionId"] == "8"
+    assert len(json.loads(policy["policyDocument"])["Statement"][0]["Resource"]) == 8
+
+    cfn.delete_stack(StackName="cfn-iot-pol-cap")
+    _wait_stack(cfn, "cfn-iot-pol-cap")
+
+
+def test_cfn_iot_policy_rename_replaces_the_policy(cfn, iot_client):
+    """Renaming is a replacement — the new policy exists under the new name and
+    the old one does not survive the update."""
+    def template(name):
+        return json.dumps({
+            "Resources": {"Pol": {"Type": "AWS::IoT::Policy", "Properties": {
+                "PolicyName": name,
+                "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+                    {"Effect": "Allow", "Action": "iot:Connect", "Resource": "*"}]}}}},
+            "Outputs": {"Name": {"Value": {"Ref": "Pol"}}},
+        })
+
+    cfn.create_stack(StackName="cfn-iot-pol-ren", TemplateBody=template("cfn-pol-before"))
+    assert _wait_stack(cfn, "cfn-iot-pol-ren")["StackStatus"] == "CREATE_COMPLETE"
+
+    cfn.update_stack(StackName="cfn-iot-pol-ren", TemplateBody=template("cfn-pol-after"))
+    stack = _wait_stack(cfn, "cfn-iot-pol-ren")
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+    assert next(
+        o["OutputValue"] for o in stack["Outputs"] if o["OutputKey"] == "Name"
+    ) == "cfn-pol-after"
+
+    assert iot_client.get_policy(policyName="cfn-pol-after")["policyName"] == "cfn-pol-after"
+    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        iot_client.get_policy(policyName="cfn-pol-before")
+
+    cfn.delete_stack(StackName="cfn-iot-pol-ren")
+    _wait_stack(cfn, "cfn-iot-pol-ren")
+
+
 def test_cfn_lambda_layer_version_permission(cfn, lam):
     """AWS::Lambda::LayerVersionPermission attaches a statement to the real
     layer version's policy, readable via GetLayerVersionPolicy. (#1345, item 5)"""
@@ -6519,6 +6617,162 @@ def test_cfn_apigateway_documentation_version_lifecycle(cfn, apigw_v1):
         apigw_v1.delete_rest_api(restApiId=api_id)
 
 
+def test_cfn_apigateway_api_key_lifecycle(cfn, apigw_v1):
+    """ApiKey supports create, a pinned Value, Ref/GetAtt, in-place update, delete.
+
+    Regression: the resource type previously failed stack creation with
+    ``Unsupported resource type: AWS::ApiGateway::ApiKey``.
+    """
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-api-key-{suffix}"
+    pinned_value = f"pinnedkeyvalue{suffix}0000000000"
+    stack_deleted = False
+
+    def template(description, enabled):
+        return {
+            "Resources": {
+                "ApiKey": {
+                    "Type": "AWS::ApiGateway::ApiKey",
+                    "Properties": {
+                        "Name": f"key-{suffix}",
+                        "Description": description,
+                        "Enabled": enabled,
+                        "Value": pinned_value,
+                    },
+                },
+            },
+            "Outputs": {
+                "RefId": {"Value": {"Ref": "ApiKey"}},
+                "GetAttId": {"Value": {"Fn::GetAtt": ["ApiKey", "APIKeyId"]}},
+            },
+        }
+
+    def physical_id():
+        detail = cfn.describe_stack_resource(
+            StackName=stack_name,
+            LogicalResourceId="ApiKey",
+        )["StackResourceDetail"]
+        return detail["PhysicalResourceId"]
+
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("Created", True)),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        created_id = physical_id()
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+        assert outputs == {"RefId": created_id, "GetAttId": created_id}
+
+        created = apigw_v1.get_api_key(apiKey=created_id, includeValue=True)
+        assert created["name"] == f"key-{suffix}"
+        assert created["description"] == "Created"
+        assert created["enabled"] is True
+        assert created["value"] == pinned_value
+
+        # Description and Enabled update in place without replacing the key.
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("Updated", False)),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() == created_id
+        updated = apigw_v1.get_api_key(apiKey=created_id)
+        assert updated["description"] == "Updated"
+        assert updated["enabled"] is False
+
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        stack_deleted = True
+        with pytest.raises(ClientError):
+            apigw_v1.get_api_key(apiKey=created_id)
+    finally:
+        if not stack_deleted:
+            try:
+                cfn.delete_stack(StackName=stack_name)
+                _wait_stack(cfn, stack_name)
+            except ClientError:
+                pass
+
+
+def test_cfn_apigateway_usage_plan_and_key_lifecycle(cfn, apigw_v1):
+    """UsagePlan and UsagePlanKey provision, expose ids, associate a key, and delete.
+
+    Regression: both resource types previously failed stack creation with
+    ``Unsupported resource type``.
+    """
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-usage-plan-{suffix}"
+    stack_deleted = False
+
+    template = {
+        "Resources": {
+            "ApiKey": {
+                "Type": "AWS::ApiGateway::ApiKey",
+                "Properties": {"Name": f"plan-key-{suffix}", "Enabled": True},
+            },
+            "UsagePlan": {
+                "Type": "AWS::ApiGateway::UsagePlan",
+                "Properties": {
+                    "UsagePlanName": f"plan-{suffix}",
+                    "Description": "integration plan",
+                    "Throttle": {"BurstLimit": 20, "RateLimit": 10},
+                    "Quota": {"Limit": 1000, "Period": "MONTH"},
+                },
+            },
+            "UsagePlanKey": {
+                "Type": "AWS::ApiGateway::UsagePlanKey",
+                "Properties": {
+                    "KeyId": {"Ref": "ApiKey"},
+                    "KeyType": "API_KEY",
+                    "UsagePlanId": {"Ref": "UsagePlan"},
+                },
+            },
+        },
+        "Outputs": {
+            "PlanRef": {"Value": {"Ref": "UsagePlan"}},
+            "PlanGetAtt": {"Value": {"Fn::GetAtt": ["UsagePlan", "Id"]}},
+            "KeyRef": {"Value": {"Ref": "ApiKey"}},
+            "PlanKeyRef": {"Value": {"Ref": "UsagePlanKey"}},
+        },
+    }
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+
+        plan_id = outputs["PlanRef"]
+        assert outputs["PlanGetAtt"] == plan_id
+        # UsagePlanKey Ref is the associated API key id.
+        assert outputs["PlanKeyRef"] == outputs["KeyRef"]
+
+        plan = apigw_v1.get_usage_plan(usagePlanId=plan_id)
+        assert plan["name"] == f"plan-{suffix}"
+        assert plan["throttle"] == {"burstLimit": 20, "rateLimit": 10}
+        assert plan["quota"]["limit"] == 1000 and plan["quota"]["period"] == "MONTH"
+
+        keys = apigw_v1.get_usage_plan_keys(usagePlanId=plan_id)["items"]
+        assert [k["id"] for k in keys] == [outputs["KeyRef"]]
+
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        stack_deleted = True
+        with pytest.raises(ClientError):
+            apigw_v1.get_usage_plan(usagePlanId=plan_id)
+    finally:
+        if not stack_deleted:
+            try:
+                cfn.delete_stack(StackName=stack_name)
+                _wait_stack(cfn, stack_name)
+            except ClientError:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # ApiGatewayV1 Integration with OpenAPI spec parsing
 # ---------------------------------------------------------------------------
@@ -6680,6 +6934,105 @@ def test_cfn_nested_stack_basic(cfn, s3):
     buckets_after = [b["Name"] for b in s3.list_buckets()["Buckets"]]
     assert expected_bucket not in buckets_after, \
         "Nested stack delete did not propagate to child resources"
+
+    s3.delete_object(Bucket=templates_bucket, Key="child.json")
+    s3.delete_bucket(Bucket=templates_bucket)
+
+
+def test_cfn_nested_stack_long_name_lambda_functions_get_distinct_physical_names(cfn, s3, lam):
+    """Regression test: a nested stack's own auto-generated name (parent name
+    + nested-stack logical id + a CloudFormation-assigned suffix — exactly
+    what CDK's NestedStack construct produces) can itself already exceed a
+    downstream resource's own name-length limit, e.g. Lambda's 64-char
+    FunctionName cap. Before this fix, _physical_name() built the full
+    "{stack}-{logicalId}-{suffix}" string and only then truncated it to
+    max_len from the end — so once stack_name alone was >= max_len, every
+    resource in that nested stack (regardless of logical_id) collapsed onto
+    the exact same truncated physical name. Two real Lambda functions used to
+    become one physical function; only whichever was provisioned last ever
+    actually ran, regardless of which one a caller invoked."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    templates_bucket = f"cfn-nested-templates-{suffix}"
+    s3.create_bucket(Bucket=templates_bucket)
+
+    def _lambda_resource(marker):
+        return {
+            "Type": "AWS::Lambda::Function",
+            "Properties": {
+                "Runtime": "python3.12",
+                "Handler": "index.handler",
+                "Role": "arn:aws:iam::000000000000:role/lambda-role",
+                "Code": {"ZipFile": f"def handler(event, context):\n    return {{'marker': '{marker}'}}\n"},
+            },
+        }
+
+    child_template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "FirstFunction": _lambda_resource("first"),
+            "SecondFunction": _lambda_resource("second"),
+        },
+        "Outputs": {
+            "FirstArn": {"Value": {"Fn::GetAtt": ["FirstFunction", "Arn"]}},
+            "SecondArn": {"Value": {"Fn::GetAtt": ["SecondFunction", "Arn"]}},
+        },
+    }
+    s3.put_object(Bucket=templates_bucket, Key="child.json",
+                  Body=json.dumps(child_template).encode())
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+
+    # Deliberately verbose, mirroring the shape CDK actually generates for a
+    # NestedStack construct's own logical id (ParentId + "NestedStack" +
+    # ParentId + "NestedStackResource" + a CloudFormation-assigned hash) —
+    # long enough that ministack's generated child stack name
+    # ("{parent_name}-{nested_logical_id}-{uuid[:12]}") already meets or
+    # exceeds 64 characters on its own, before any Lambda logical_id is even
+    # appended.
+    parent_name = f"cfn-nested-longname-parent-{suffix}"
+    nested_logical_id = "ApiStackNestedStackApiStackNestedStackResourceABCDEFG1234"
+
+    parent_template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            nested_logical_id: {
+                "Type": "AWS::CloudFormation::Stack",
+                "Properties": {
+                    "TemplateURL": f"{endpoint}/{templates_bucket}/child.json",
+                },
+            },
+        },
+        "Outputs": {
+            "FirstArn": {"Value": {"Fn::GetAtt": [nested_logical_id, "Outputs.FirstArn"]}},
+            "SecondArn": {"Value": {"Fn::GetAtt": [nested_logical_id, "Outputs.SecondArn"]}},
+        },
+    }
+
+    cfn.create_stack(StackName=parent_name, TemplateBody=json.dumps(parent_template))
+    stack = _wait_stack(cfn, parent_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    first_arn = outputs["FirstArn"]
+    second_arn = outputs["SecondArn"]
+
+    assert first_arn != second_arn, (
+        f"FirstFunction and SecondFunction collapsed onto the same physical Lambda: {first_arn}"
+    )
+
+    first_name = first_arn.rsplit(":", 1)[-1]
+    second_name = second_arn.rsplit(":", 1)[-1]
+    assert len(first_name) <= 64
+    assert len(second_name) <= 64
+
+    # Each is independently invocable and runs its own code — not just
+    # distinctly named, but genuinely distinct resources.
+    first_result = json.loads(lam.invoke(FunctionName=first_name)["Payload"].read())
+    second_result = json.loads(lam.invoke(FunctionName=second_name)["Payload"].read())
+    assert first_result["marker"] == "first"
+    assert second_result["marker"] == "second"
+
+    cfn.delete_stack(StackName=parent_name)
+    _wait_stack(cfn, parent_name)
 
     s3.delete_object(Bucket=templates_bucket, Key="child.json")
     s3.delete_bucket(Bucket=templates_bucket)
