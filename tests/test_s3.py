@@ -2617,6 +2617,247 @@ def test_s3_bucket_encryption(s3):
     default_rules = default["ServerSideEncryptionConfiguration"]["Rules"]
     assert default_rules[0]["ApplyServerSideEncryptionByDefault"]["SSEAlgorithm"] == "AES256"
 
+
+# ─── Server-side encryption (SSE-S3 / SSE-KMS / SSE-C) ──────────────────────
+# MiniStack does not encrypt at rest; SSE is contract state — validated on
+# write, persisted with the object, echoed on responses, and enforced on
+# reads for SSE-C.  The customer key is never stored, only its MD5.
+
+_SSE_C_KEY = "pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs="
+_SSE_C_MD5 = "DWygnHRtgiJ77HCm+1rvHw=="
+_SSE_C_KEY2 = "6b+WOZ1T3cqZMxgThRcXAQBrS5mXKdDUphvpxptl9/4="
+_SSE_C_MD5_2 = "arxBvwY2V4SiOne6yppVPQ=="
+_SSE_C = {"SSECustomerAlgorithm": "AES256", "SSECustomerKey": _SSE_C_KEY,
+          "SSECustomerKeyMD5": _SSE_C_MD5}
+_SSE_C_2 = {"SSECustomerAlgorithm": "AES256", "SSECustomerKey": _SSE_C_KEY2,
+            "SSECustomerKeyMD5": _SSE_C_MD5_2}
+
+
+def test_s3_sse_s3_round_trip(s3):
+    """x-amz-server-side-encryption: AES256 is echoed on the PUT response and
+    persists to HEAD and GET."""
+    import uuid as _u
+    bucket = f"sse-s3-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    resp = s3.put_object(Bucket=bucket, Key="k", Body=b"x",
+                         ServerSideEncryption="AES256")
+    assert resp["ServerSideEncryption"] == "AES256"
+    assert s3.head_object(Bucket=bucket, Key="k")["ServerSideEncryption"] == "AES256"
+    got = s3.get_object(Bucket=bucket, Key="k")
+    assert got["ServerSideEncryption"] == "AES256"
+    assert got["Body"].read() == b"x"
+
+
+def test_s3_sse_kms_round_trip_and_key_required(s3):
+    """aws:kms echoes the key id everywhere; aws:kms without a key id is
+    refused — MiniStack has no implicit account aws/s3 key to fall back to."""
+    import uuid as _u
+    bucket = f"sse-kms-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    resp = s3.put_object(Bucket=bucket, Key="k", Body=b"x",
+                         ServerSideEncryption="aws:kms", SSEKMSKeyId="my-key-id")
+    assert resp["ServerSideEncryption"] == "aws:kms"
+    assert resp["SSEKMSKeyId"] == "my-key-id"
+    head = s3.head_object(Bucket=bucket, Key="k")
+    assert head["ServerSideEncryption"] == "aws:kms"
+    assert head["SSEKMSKeyId"] == "my-key-id"
+
+    with pytest.raises(ClientError) as exc:
+        s3.put_object(Bucket=bucket, Key="k2", Body=b"x",
+                      ServerSideEncryption="aws:kms")
+    assert exc.value.response["Error"]["Code"] == "InvalidArgument"
+
+
+def test_s3_sse_kms_and_sse_c_conflict(s3):
+    """SSE-KMS and SSE-C on the same write are mutually exclusive (400)."""
+    import uuid as _u
+    bucket = f"sse-conflict-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    with pytest.raises(ClientError) as exc:
+        s3.put_object(Bucket=bucket, Key="k", Body=b"x",
+                      ServerSideEncryption="aws:kms", SSEKMSKeyId="kid", **_SSE_C)
+    assert exc.value.response["Error"]["Code"] == "InvalidArgument"
+
+
+def test_s3_sse_c_round_trip_and_read_gating(s3):
+    """An SSE-C object echoes algorithm and key MD5, reads back only with its
+    key, and answers 400 to a keyless read (GET or HEAD) but 403 AccessDenied
+    to a wrong-key read, as AWS does."""
+    import uuid as _u
+    bucket = f"sse-c-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    resp = s3.put_object(Bucket=bucket, Key="k", Body=b"secret", **_SSE_C)
+    assert resp["SSECustomerAlgorithm"] == "AES256"
+    assert resp["SSECustomerKeyMD5"] == _SSE_C_MD5
+
+    got = s3.get_object(Bucket=bucket, Key="k", **_SSE_C)
+    assert got["Body"].read() == b"secret"
+    assert got["SSECustomerKeyMD5"] == _SSE_C_MD5
+
+    with pytest.raises(ClientError) as exc:
+        s3.get_object(Bucket=bucket, Key="k")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    with pytest.raises(ClientError) as exc:
+        s3.get_object(Bucket=bucket, Key="k", **_SSE_C_2)
+    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+    with pytest.raises(ClientError) as exc:
+        s3.head_object(Bucket=bucket, Key="k")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
+def test_s3_sse_c_write_validation(s3):
+    """Incoherent SSE-C write headers are refused: a wrong key MD5, a missing
+    MD5, a missing key, and key material without the algorithm are each 400.
+    (Injected as raw headers — boto3 would compute the MD5 itself.)"""
+    import uuid as _u
+    bucket = f"sse-c-bad-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+
+    cases = [
+        {  # wrong MD5 for the key
+            "x-amz-server-side-encryption-customer-algorithm": "AES256",
+            "x-amz-server-side-encryption-customer-key": _SSE_C_KEY,
+            "x-amz-server-side-encryption-customer-key-md5": "AAAAAAAAAAAAAAAAAAAAAA==",
+        },
+        {  # no MD5
+            "x-amz-server-side-encryption-customer-algorithm": "AES256",
+            "x-amz-server-side-encryption-customer-key": _SSE_C_KEY,
+        },
+        {  # no key
+            "x-amz-server-side-encryption-customer-algorithm": "AES256",
+        },
+        {  # key material without the algorithm
+            "x-amz-server-side-encryption-customer-key": _SSE_C_KEY,
+            "x-amz-server-side-encryption-customer-key-md5": _SSE_C_MD5,
+        },
+    ]
+    for raw_headers in cases:
+        def _inject(request, _h=raw_headers, **_kwargs):
+            request.headers.update(_h)
+        s3.meta.events.register_first("before-send.s3.PutObject", _inject)
+        try:
+            with pytest.raises(ClientError) as exc:
+                s3.put_object(Bucket=bucket, Key="k", Body=b"x")
+        finally:
+            s3.meta.events.unregister("before-send.s3.PutObject", _inject)
+        assert exc.value.response["Error"]["Code"] == "InvalidArgument", raw_headers
+
+
+def test_s3_sse_bucket_default_persists_to_reads(s3):
+    """A bucket's default encryption applies to the object, not only to the
+    PUT reply: HEAD and GET of a plain upload report the configured SSE."""
+    import uuid as _u
+    bucket = f"sse-default-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={
+        "Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]})
+    resp = s3.put_object(Bucket=bucket, Key="k", Body=b"x")
+    assert resp["ServerSideEncryption"] == "AES256"
+    assert s3.head_object(Bucket=bucket, Key="k")["ServerSideEncryption"] == "AES256"
+    assert s3.get_object(Bucket=bucket, Key="k")["ServerSideEncryption"] == "AES256"
+
+
+def test_s3_sse_c_multipart(s3):
+    """An SSE-C multipart upload echoes on initiate, requires the same key on
+    every part and on the completion, and completes into an object readable
+    only with the key."""
+    import uuid as _u
+    bucket = f"sse-c-mpu-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    mpu = s3.create_multipart_upload(Bucket=bucket, Key="m", **_SSE_C)
+    assert mpu["SSECustomerKeyMD5"] == _SSE_C_MD5
+
+    with pytest.raises(ClientError) as exc:
+        s3.upload_part(Bucket=bucket, Key="m", UploadId=mpu["UploadId"],
+                       PartNumber=1, Body=b"z", **_SSE_C_2)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    with pytest.raises(ClientError) as exc:
+        s3.upload_part(Bucket=bucket, Key="m", UploadId=mpu["UploadId"],
+                       PartNumber=1, Body=b"z")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+    part = s3.upload_part(Bucket=bucket, Key="m", UploadId=mpu["UploadId"],
+                          PartNumber=1, Body=b"part-bytes", **_SSE_C)
+    parts = {"Parts": [{"ETag": part["ETag"], "PartNumber": 1}]}
+    # The completion must present the create-time key again, as every part
+    # did: keyless and wrong-key completions are refused.
+    with pytest.raises(ClientError) as exc:
+        s3.complete_multipart_upload(Bucket=bucket, Key="m",
+                                     UploadId=mpu["UploadId"],
+                                     MultipartUpload=parts)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    with pytest.raises(ClientError) as exc:
+        s3.complete_multipart_upload(Bucket=bucket, Key="m",
+                                     UploadId=mpu["UploadId"],
+                                     MultipartUpload=parts, **_SSE_C_2)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    s3.complete_multipart_upload(Bucket=bucket, Key="m",
+                                 UploadId=mpu["UploadId"],
+                                 MultipartUpload=parts, **_SSE_C)
+    assert s3.get_object(Bucket=bucket, Key="m", **_SSE_C)["Body"].read() == b"part-bytes"
+    with pytest.raises(ClientError):
+        s3.get_object(Bucket=bucket, Key="m")
+
+
+def test_s3_sse_copy_semantics(s3):
+    """The destination's encryption comes from the copy request, never the
+    source: an SSE-C source needs its key as copy-source parameters (400
+    without, 403 AccessDenied with the wrong one), and the copy lands
+    unencrypted unless the request re-encrypts."""
+    import uuid as _u
+    bucket = f"sse-copy-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="src", Body=b"secret", **_SSE_C)
+
+    with pytest.raises(ClientError) as exc:
+        s3.copy_object(Bucket=bucket, Key="dst",
+                       CopySource={"Bucket": bucket, "Key": "src"})
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    with pytest.raises(ClientError) as exc:
+        s3.copy_object(Bucket=bucket, Key="dst",
+                       CopySource={"Bucket": bucket, "Key": "src"},
+                       CopySourceSSECustomerAlgorithm="AES256",
+                       CopySourceSSECustomerKey=_SSE_C_KEY2,
+                       CopySourceSSECustomerKeyMD5=_SSE_C_MD5_2)
+    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+
+    src_args = {"CopySourceSSECustomerAlgorithm": "AES256",
+                "CopySourceSSECustomerKey": _SSE_C_KEY,
+                "CopySourceSSECustomerKeyMD5": _SSE_C_MD5}
+    s3.copy_object(Bucket=bucket, Key="dst",
+                   CopySource={"Bucket": bucket, "Key": "src"}, **src_args)
+    got = s3.get_object(Bucket=bucket, Key="dst")  # readable without a key
+    assert got["Body"].read() == b"secret"
+    assert "SSECustomerAlgorithm" not in got
+
+    resp = s3.copy_object(Bucket=bucket, Key="dst2",
+                          CopySource={"Bucket": bucket, "Key": "src"},
+                          **src_args, **_SSE_C_2)
+    assert resp["SSECustomerKeyMD5"] == _SSE_C_MD5_2
+    assert s3.get_object(Bucket=bucket, Key="dst2",
+                         **_SSE_C_2)["Body"].read() == b"secret"
+
+
+def test_s3_post_object_sse_field(s3):
+    """The POST form's x-amz-server-side-encryption field applies to the
+    uploaded object like the header does on PutObject."""
+    import uuid as _u
+
+    import requests
+    bucket = f"sse-post-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    post = s3.generate_presigned_post(
+        Bucket=bucket, Key="k",
+        Fields={"x-amz-server-side-encryption": "AES256"},
+        Conditions=[{"x-amz-server-side-encryption": "AES256"}],
+    )
+    r = requests.post(post["url"], data=post["fields"], files={"file": ("k", b"x")})
+    assert r.status_code == 204
+    assert s3.head_object(Bucket=bucket, Key="k")["ServerSideEncryption"] == "AES256"
+
+
 def test_s3_bucket_lifecycle(s3):
     s3.create_bucket(Bucket="intg-s3-lifecycle")
     s3.put_bucket_lifecycle_configuration(
