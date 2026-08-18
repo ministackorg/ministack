@@ -2800,6 +2800,56 @@ def test_s3_sse_c_multipart(s3):
         s3.get_object(Bucket=bucket, Key="m")
 
 
+def test_s3_sse_c_upload_part_copy_checks_both_keys_and_echoes(s3):
+    """UploadPartCopy on an SSE-C upload must present the create-time key, and
+    an SSE-C copy source must be addressed with its own key; the response
+    echoes the stored algorithm, as the wire shape models."""
+    import uuid as _u
+    bucket = f"sse-c-upc-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="src", Body=b"source-bytes", **_SSE_C_2)
+    mpu = s3.create_multipart_upload(Bucket=bucket, Key="m", **_SSE_C)
+    src = {"Bucket": bucket, "Key": "src"}
+    src_key = {"CopySourceSSECustomerAlgorithm": "AES256",
+               "CopySourceSSECustomerKey": _SSE_C_KEY2,
+               "CopySourceSSECustomerKeyMD5": _SSE_C_MD5_2}
+    # No part key: refused before the copy source is even read.
+    with pytest.raises(ClientError) as exc:
+        s3.upload_part_copy(Bucket=bucket, Key="m", UploadId=mpu["UploadId"],
+                            PartNumber=1, CopySource=src, **src_key)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    # Part key present, source key missing: the SSE-C source is unreadable.
+    with pytest.raises(ClientError) as exc:
+        s3.upload_part_copy(Bucket=bucket, Key="m", UploadId=mpu["UploadId"],
+                            PartNumber=1, CopySource=src, **_SSE_C)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    # Both keys: the copy succeeds and the response echoes the algorithm.
+    resp = s3.upload_part_copy(Bucket=bucket, Key="m", UploadId=mpu["UploadId"],
+                               PartNumber=1, CopySource=src, **_SSE_C, **src_key)
+    assert resp["SSECustomerAlgorithm"] == "AES256"
+    assert resp["SSECustomerKeyMD5"] == _SSE_C_MD5
+    parts = {"Parts": [{"ETag": resp["CopyPartResult"]["ETag"], "PartNumber": 1}]}
+    s3.complete_multipart_upload(Bucket=bucket, Key="m", UploadId=mpu["UploadId"],
+                                 MultipartUpload=parts, **_SSE_C)
+    assert s3.get_object(Bucket=bucket, Key="m", **_SSE_C)["Body"].read() == b"source-bytes"
+
+
+def test_s3_sse_multipart_complete_echoes_the_algorithm(s3):
+    """CompleteMultipartUpload echoes the stored SSE algorithm on its
+    response, not only on later GET/HEAD."""
+    import uuid as _u
+    bucket = f"sse-mpu-echo-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    mpu = s3.create_multipart_upload(Bucket=bucket, Key="m",
+                                     ServerSideEncryption="AES256")
+    part = s3.upload_part(Bucket=bucket, Key="m", UploadId=mpu["UploadId"],
+                          PartNumber=1, Body=b"bytes")
+    resp = s3.complete_multipart_upload(
+        Bucket=bucket, Key="m", UploadId=mpu["UploadId"],
+        MultipartUpload={"Parts": [{"ETag": part["ETag"], "PartNumber": 1}]})
+    assert resp["ServerSideEncryption"] == "AES256"
+
+
 def test_s3_sse_copy_semantics(s3):
     """The destination's encryption comes from the copy request, never the
     source: an SSE-C source needs its key as copy-source parameters (400

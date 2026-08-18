@@ -5119,6 +5119,10 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
     if upload_id not in _multipart_uploads:
         return _error("NoSuchUpload", "The specified multipart upload does not exist.", 404)
 
+    sse_part_err = _check_sse_c_part(headers, _multipart_uploads[upload_id])
+    if sse_part_err is not None:
+        return sse_part_err
+
     # Split the raw header at "?" before percent-decoding, exactly as
     # CopyObject does: a key containing "?versionId" arrives encoded and must
     # stay part of the key, while a real versionId qualifier is a bare "?".
@@ -5161,6 +5165,13 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
         src_obj = src_bucket["objects"][src_key]
         src_version_id = src_obj.get("version_id")
         src_body = _read_body(src_bucket_name, src_key, src_obj)
+        ventry = src_obj
+
+    # An SSE-C source must be addressed with its create-time key, whichever
+    # version the range is copied from.
+    sse_src_err = _check_sse_c_copy_source(headers, ventry)
+    if sse_src_err is not None:
+        return sse_src_err
 
     # Handle x-amz-copy-source-range
     copy_range = headers.get("x-amz-copy-source-range", "")
@@ -5204,7 +5215,8 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
     root = Element("CopyPartResult", xmlns=S3_NS)
     SubElement(root, "ETag").text = etag
     SubElement(root, "LastModified").text = now_iso()
-    resp_headers = {"Content-Type": "application/xml"}
+    resp_headers = {"Content-Type": "application/xml",
+                    **_stored_sse_headers(_multipart_uploads[upload_id])}
     if src_version_id:
         # AWS echoes the copied source version on a versioned source.
         resp_headers["x-amz-copy-source-version-id"] = src_version_id
@@ -5339,6 +5351,7 @@ def _complete_multipart_upload(
     )
 
     resp_headers = {"Content-Type": "application/xml"}
+    resp_headers.update(_stored_sse_headers(obj))
     version_id = _record_object_version(bucket_name, key, prior_obj, obj, combined)
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
