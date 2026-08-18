@@ -2595,6 +2595,265 @@ def test_rds_instance_ops_rejected_while_cluster_stopped(monkeypatch):
         m._clusters.clear()
 
 
+def _build_failover_cluster(m, cluster_id, members):
+    """Create a cluster and member instances (Docker-free) for failover tests.
+
+    ``members`` is an iterable of ``(db_instance_id, promotion_tier)``; the
+    first member becomes the writer, matching ``_register_instance_in_cluster``.
+    """
+    m._create_db_cluster({
+        "DBClusterIdentifier": cluster_id,
+        "Engine": "aurora-mysql",
+        "MasterUsername": "admin",
+        "MasterUserPassword": "password123",
+    })
+    for db_id, tier in members:
+        m._create_db_instance({
+            "DBInstanceIdentifier": db_id,
+            "DBClusterIdentifier": cluster_id,
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+            "PromotionTier": str(tier),
+        })
+
+
+def _cluster_writer_flags(cluster):
+    return {
+        m["DBInstanceIdentifier"]: m["IsClusterWriter"]
+        for m in cluster["DBClusterMembers"]
+    }
+
+
+def test_rds_failover_db_cluster_promotes_lowest_tier_reader(monkeypatch):
+    """Automatic failover promotes the available reader with the lowest tier."""
+    from ministack.services import rds as m
+
+    monkeypatch.setattr(m, "_get_docker", lambda: None)
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        _build_failover_cluster(m, "failover-auto-cluster", [
+            ("failover-auto-writer", 1),
+            ("failover-auto-tier2", 2),
+            ("failover-auto-tier0", 0),
+        ])
+        cluster = m._clusters.get("failover-auto-cluster")
+        assert _poll_until(lambda: cluster["Status"] == "available")
+
+        status, _, body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-auto-cluster",
+        })
+        assert status == 200
+        assert b"FailoverDBClusterResponse" in body
+        # The response reports the transitional state; the stored cluster is
+        # already through it, as a follow-up DescribeDBClusters observes.
+        assert b"<Status>failing-over</Status>" in body
+        assert cluster["Status"] == "available"
+
+        flags = _cluster_writer_flags(cluster)
+        assert flags == {
+            "failover-auto-writer": False,
+            "failover-auto-tier2": False,
+            "failover-auto-tier0": True,
+        }
+
+        # An unavailable reader must never be promoted: with tier-1 stopped,
+        # the next failover picks the remaining available reader.
+        m._instances.get("failover-auto-writer")["DBInstanceStatus"] = "stopped"
+        status, _, _body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-auto-cluster",
+        })
+        assert status == 200
+        flags = _cluster_writer_flags(cluster)
+        assert flags == {
+            "failover-auto-writer": False,
+            "failover-auto-tier2": True,
+            "failover-auto-tier0": False,
+        }
+        assert sum(flags.values()) == 1
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_failover_db_cluster_tier_tie_keeps_member_order(monkeypatch):
+    """A same-tier tie promotes the earlier member, as documented.
+
+    The automatic path relies on ``sorted()`` stability for the "within a
+    tier Ministack keeps member order" contract; this pins it so a refactor
+    to an unstable ordering (or a reordered candidates build) is caught.
+    """
+    from ministack.services import rds as m
+
+    monkeypatch.setattr(m, "_get_docker", lambda: None)
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        _build_failover_cluster(m, "failover-tie-cluster", [
+            ("failover-tie-writer", 0),
+            ("failover-tie-reader-a", 1),
+            ("failover-tie-reader-b", 1),
+        ])
+        cluster = m._clusters.get("failover-tie-cluster")
+        assert _poll_until(lambda: cluster["Status"] == "available")
+
+        status, _, _body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-tie-cluster",
+        })
+        assert status == 200
+        flags = _cluster_writer_flags(cluster)
+        assert flags == {
+            "failover-tie-writer": False,
+            "failover-tie-reader-a": True,
+            "failover-tie-reader-b": False,
+        }
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_failover_db_cluster_explicit_target_validation(monkeypatch):
+    """Explicit targets are validated: member, non-writer, and available."""
+    from ministack.services import rds as m
+
+    monkeypatch.setattr(m, "_get_docker", lambda: None)
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        _build_failover_cluster(m, "failover-target-cluster", [
+            ("failover-target-writer", 1),
+            ("failover-target-reader", 1),
+        ])
+        m._create_db_instance({
+            "DBInstanceIdentifier": "failover-target-standalone",
+            "DBInstanceClass": "db.t3.micro",
+            "Engine": "mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        cluster = m._clusters.get("failover-target-cluster")
+        assert _poll_until(lambda: cluster["Status"] == "available")
+
+        status, _, body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-target-cluster",
+            "TargetDBInstanceIdentifier": "failover-target-reader",
+        })
+        assert status == 200
+        assert _cluster_writer_flags(cluster) == {
+            "failover-target-writer": False,
+            "failover-target-reader": True,
+        }
+
+        # The freshly promoted writer is not a valid target.
+        status, _, body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-target-cluster",
+            "TargetDBInstanceIdentifier": "failover-target-reader",
+        })
+        assert status == 400
+        assert b"InvalidDBInstanceState" in body
+
+        # An instance that exists but belongs to no cluster is not a target.
+        status, _, body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-target-cluster",
+            "TargetDBInstanceIdentifier": "failover-target-standalone",
+        })
+        assert status == 400
+        assert b"InvalidDBInstanceState" in body
+
+        # A target that exists nowhere is DBInstanceNotFound (404).
+        status, _, body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-target-cluster",
+            "TargetDBInstanceIdentifier": "failover-target-missing",
+        })
+        assert status == 404
+        assert b"DBInstanceNotFound" in body
+
+        # A member reader that is not available cannot be promoted.
+        m._instances.get("failover-target-writer")["DBInstanceStatus"] = "rebooting"
+        status, _, body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-target-cluster",
+            "TargetDBInstanceIdentifier": "failover-target-writer",
+        })
+        assert status == 400
+        assert b"InvalidDBInstanceState" in body
+        # The failed attempts left the writer flags untouched.
+        assert _cluster_writer_flags(cluster) == {
+            "failover-target-writer": False,
+            "failover-target-reader": True,
+        }
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_failover_db_cluster_cluster_state_errors(monkeypatch):
+    """Missing, non-available, and reader-less clusters are rejected."""
+    from ministack.services import rds as m
+
+    monkeypatch.setattr(m, "_get_docker", lambda: None)
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        status, _, body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-missing-cluster",
+        })
+        assert status == 404
+        assert b"DBClusterNotFoundFault" in body
+
+        # A writer-only cluster has nothing to promote.
+        _build_failover_cluster(m, "failover-solo-cluster", [
+            ("failover-solo-writer", 1),
+        ])
+        cluster = m._clusters.get("failover-solo-cluster")
+        assert _poll_until(lambda: cluster["Status"] == "available")
+        status, _, body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-solo-cluster",
+        })
+        assert status == 400
+        assert b"InvalidDBClusterStateFault" in body
+
+        # All readers unavailable is the same fault.
+        _build_failover_cluster(m, "failover-downed-cluster", [
+            ("failover-downed-writer", 1),
+            ("failover-downed-reader", 1),
+        ])
+        downed = m._clusters.get("failover-downed-cluster")
+        assert _poll_until(lambda: downed["Status"] == "available")
+        m._instances.get("failover-downed-reader")["DBInstanceStatus"] = "stopped"
+        status, _, body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-downed-cluster",
+        })
+        assert status == 400
+        assert b"InvalidDBClusterStateFault" in body
+
+        # An in-flight legacy-storage migration is rejected: restore_state
+        # reads IsClusterWriter to pick the adopted volume, so the flag must
+        # not flip mid-migration.
+        downed["_shared_legacy_migration_in_progress"] = True
+        m._instances.get("failover-downed-reader")["DBInstanceStatus"] = (
+            "available"
+        )
+        status, _, body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-downed-cluster",
+        })
+        assert status == 400
+        assert b"InvalidDBClusterStateFault" in body
+        assert b"legacy shared-storage migration" in body
+        downed.pop("_shared_legacy_migration_in_progress", None)
+
+        # A stopped cluster is rejected before member checks.
+        m._stop_db_cluster({"DBClusterIdentifier": "failover-solo-cluster"})
+        assert cluster["Status"] == "stopped"
+        status, _, body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-solo-cluster",
+        })
+        assert status == 400
+        assert b"InvalidDBClusterStateFault" in body
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
 def test_rds_stop_db_cluster_docker_failure_surfaces_error(monkeypatch):
     """A failed Docker stop must not report the cluster as stopped."""
     from ministack.services import rds as m
@@ -6266,6 +6525,62 @@ def test_failover_global_cluster_missing_global_validated_before_parameter_combo
     assert exc.value.response["Error"]["Code"] == "GlobalClusterNotFoundFault"
 
 
+def test_failover_db_cluster_promotes_reader_over_the_wire():
+    """FailoverDBCluster is routable end to end and flips the writer flags."""
+    east = _regional_rds("us-east-1")
+    suffix = uuid.uuid4().hex[:8]
+    cluster_id = f"failover-wire-{suffix}"
+    writer_id = f"failover-wire-writer-{suffix}"
+    reader_id = f"failover-wire-reader-{suffix}"
+
+    try:
+        east.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )
+        for db_id in (writer_id, reader_id):
+            east.create_db_instance(
+                DBInstanceIdentifier=db_id,
+                DBClusterIdentifier=cluster_id,
+                DBInstanceClass="db.t3.micro",
+                Engine="aurora-mysql",
+            )
+            _wait_for_rds(east, db_id)
+
+        response = east.failover_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            TargetDBInstanceIdentifier=reader_id,
+        )["DBCluster"]
+        assert response["Status"] == "failing-over"
+        members = {
+            m["DBInstanceIdentifier"]: m["IsClusterWriter"]
+            for m in response["DBClusterMembers"]
+        }
+        assert members == {writer_id: False, reader_id: True}
+
+        cluster = east.describe_db_clusters(
+            DBClusterIdentifier=cluster_id,
+        )["DBClusters"][0]
+        assert cluster["Status"] == "available"
+        members = {
+            m["DBInstanceIdentifier"]: m["IsClusterWriter"]
+            for m in cluster["DBClusterMembers"]
+        }
+        assert members == {writer_id: False, reader_id: True}
+
+        with pytest.raises(ClientError) as exc:
+            east.failover_db_cluster(
+                DBClusterIdentifier=f"failover-wire-missing-{suffix}",
+            )
+        assert exc.value.response["Error"]["Code"] == "DBClusterNotFoundFault"
+    finally:
+        _delete_instance(east, reader_id)
+        _delete_instance(east, writer_id)
+        _delete_cluster(east, cluster_id)
+
+
 def test_create_global_cluster_rejects_already_attached_source_cluster():
     east = _regional_rds("us-east-1")
     suffix = uuid.uuid4().hex[:8]
@@ -9486,3 +9801,732 @@ def test_rds_cluster_reader_endpoint_resolves_shared_endpoint():
     assert m._cluster_reader_endpoint(bare) is None
     m._sync_cluster_endpoints(bare)
     assert "ReaderEndpoint" not in bare
+
+
+# ---------------------------------------------------------------------------
+# Aurora PostgreSQL per-instance replicating readers (#1325 slice 2)
+# ---------------------------------------------------------------------------
+
+
+def test_rds_pg_cluster_replication_gate(monkeypatch):
+    """Replicating readers are opt-in and scoped to Aurora PostgreSQL."""
+    from ministack.services import rds as m
+
+    pg_cluster = {"Engine": "aurora-postgresql"}
+    mysql_cluster = {"Engine": "aurora-mysql"}
+
+    # Flag off (the default): no cluster qualifies.
+    monkeypatch.setattr(m, "RDS_PG_CLUSTER_REPLICATION", False)
+    assert not m._pg_cluster_replication_enabled(pg_cluster)
+    assert not m._pg_cluster_replication_enabled(mysql_cluster)
+
+    # Flag on: Aurora PostgreSQL only. Aurora MySQL members keep aliasing
+    # the shared container even with the flag set.
+    monkeypatch.setattr(m, "RDS_PG_CLUSTER_REPLICATION", True)
+    assert m._pg_cluster_replication_enabled(pg_cluster)
+    assert not m._pg_cluster_replication_enabled(mysql_cluster)
+
+
+def test_rds_cluster_reader_endpoint_prefers_available_standby():
+    """ReaderEndpoint resolves to an available replicating reader (#1325)."""
+    from ministack.core.responses import get_account_id, set_request_account_id
+    from ministack.services import rds as m
+
+    shared = {"Address": "10.0.0.5", "Port": 5432, "HostedZoneId": "Z2R2ITUGPM61AM"}
+    reader_ep = {"Address": "10.0.0.7", "Port": 5432, "HostedZoneId": "Z2R2ITUGPM61AM"}
+    original_account = get_account_id()
+    reader_id = "standby-ep-reader-1"
+    try:
+        set_request_account_id("111111111111")
+        cluster = {
+            "DBClusterIdentifier": "standby-ep",
+            "_shared_endpoint": shared,
+            "DBClusterMembers": [
+                {"DBInstanceIdentifier": "standby-ep-writer", "IsClusterWriter": True},
+                {"DBInstanceIdentifier": reader_id},
+            ],
+        }
+        # Reader still bootstrapping: fall back to the writer's endpoint.
+        m._instances[reader_id] = {
+            "DBInstanceIdentifier": reader_id,
+            "_pg_standby": True,
+            "DBInstanceStatus": "creating",
+            "Endpoint": reader_ep,
+        }
+        assert m._cluster_reader_endpoint(cluster) == shared
+
+        # Reader available: the cluster ReaderEndpoint follows the standby
+        # while the writer endpoint stays on the shared container.
+        m._instances[reader_id]["DBInstanceStatus"] = "available"
+        assert m._cluster_reader_endpoint(cluster) == reader_ep
+        m._sync_cluster_endpoints(cluster)
+        assert cluster["Endpoint"] == "10.0.0.5"
+        assert cluster["ReaderEndpoint"] == "10.0.0.7"
+    finally:
+        m._instances.pop(reader_id, None)
+        set_request_account_id(original_account)
+
+
+def test_rds_attach_instance_skips_pg_standby():
+    """Shared-cluster aliasing must not clobber a replicating reader (#1325)."""
+    from ministack.services import rds as m
+
+    cluster = {
+        "DBClusterIdentifier": "attach-guard",
+        "_shared_endpoint": {"Address": "10.0.0.5", "Port": 5432},
+        "_shared_container_id": "shared-c",
+    }
+    standby_endpoint = {"Address": "10.0.0.7", "Port": 5432}
+    standby = {
+        "DBInstanceIdentifier": "attach-guard-reader",
+        "_pg_standby": True,
+        "Endpoint": standby_endpoint,
+        "_docker_container_id": "reader-c",
+    }
+    m._attach_instance_to_shared_cluster(standby, cluster)
+    assert standby["Endpoint"] == standby_endpoint
+    assert standby["_docker_container_id"] == "reader-c"
+    assert "_shared_cluster_id" not in standby
+    # The reader keeps owning its container (delete removes it, #1339).
+    assert m._instance_owns_container(standby)
+
+
+def _pg_reader_fake_docker():
+    """Fake Docker client for _start_pg_reader_container unit tests."""
+    class FakeContainer:
+        id = "reader-container-1"
+        status = "running"
+        attrs = {
+            "NetworkSettings": {
+                "Networks": {"ms_net": {"IPAddress": "10.0.0.7"}},
+            },
+        }
+
+        def reload(self):
+            pass
+
+    container = FakeContainer()
+    calls = {}
+
+    class FakeContainers:
+        def run(self, **kwargs):
+            calls["run"] = kwargs
+            return container
+
+        def get(self, identifier):
+            if identifier == container.id:
+                return container
+            raise Exception("not found")
+
+    class FakeDocker:
+        containers = FakeContainers()
+
+    return FakeDocker(), container, calls
+
+
+def test_rds_start_pg_reader_container_requires_internal_network(monkeypatch):
+    """No shared Docker network: no reader container, caller falls back."""
+    from ministack.services import rds as m
+
+    docker, _container, calls = _pg_reader_fake_docker()
+    monkeypatch.setattr(m, "_get_docker", lambda: docker)
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: None)
+    cluster = {
+        "DBClusterIdentifier": "no-net",
+        "Engine": "aurora-postgresql",
+        "_shared_internal_address": None,
+    }
+    assert m._start_pg_reader_container("no-net-1", cluster) is None
+    assert "run" not in calls
+
+
+def test_rds_start_pg_reader_container_launches_owned_container(monkeypatch):
+    """A reader container bootstraps as a hot standby cloned from the writer."""
+    from ministack.services import rds as m
+
+    docker, container, calls = _pg_reader_fake_docker()
+    monkeypatch.setattr(m, "_get_docker", lambda: docker)
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: "ms_net")
+    monkeypatch.setattr(m, "_next_port", lambda: 16091)
+    cluster = {
+        "DBClusterIdentifier": "reader-launch",
+        "Engine": "aurora-postgresql",
+        "EngineVersion": "17.7",
+        "MasterUsername": "admin",
+        "_MasterUserPassword": "pw",
+        "DatabaseName": "appdb",
+        "_shared_internal_address": "10.0.0.5",
+        "_shared_internal_port": 5432,
+    }
+    result = m._start_pg_reader_container("reader-launch-1", cluster)
+    assert result["started"] is True
+    assert result["container_id"] == container.id
+    # Container-internal address on the shared network, like other
+    # in-network RDS endpoints.
+    assert result["endpoint_host"] == "10.0.0.7"
+    assert result["endpoint_port"] == 5432
+
+    kwargs = calls["run"]
+    assert kwargs["name"] == m._rds_docker_name("reader-launch-1")
+    assert kwargs["network"] == "ms_net"
+    assert kwargs["labels"]["db_id"] == "reader-launch-1"
+    assert kwargs["labels"]["cluster_id"] == "reader-launch"
+    # The image entrypoint (which would initdb an independent database) is
+    # bypassed: the reader clones the writer with pg_basebackup and starts
+    # as a hot standby.
+    assert kwargs["command"][:2] == ["sh", "-c"]
+    script = kwargs["command"][2]
+    assert "pg_basebackup" in script
+    assert "--write-recovery-conf" in script
+    env = kwargs["environment"]
+    assert env["MINISTACK_PG_PRIMARY_HOST"] == "10.0.0.5"
+    assert env["MINISTACK_PG_PRIMARY_PORT"] == "5432"
+    # The launched reader is member-owned compute (#1339 semantics).
+    assert m._instance_owns_container(
+        {"_docker_container_id": result["container_id"]},
+    )
+
+
+def test_rds_pg_replicating_reader_lifecycle(monkeypatch):
+    """Flag on: the second member owns a standby container end to end.
+
+    Fake-Docker walk of the control plane: the writer aliases the shared
+    cluster container, the reader launches its own, the cluster
+    ReaderEndpoint follows the reader once available, StopDBCluster is
+    refused while a replicating reader exists (slice 3), and deleting the
+    reader removes only reader-owned compute and falls the ReaderEndpoint
+    back to the writer.
+    """
+    from ministack.services import rds as m
+
+    containers = {}
+    removed = []
+
+    class FakeContainer:
+        def __init__(self, name, kwargs):
+            self.id = f"{name}-container"
+            self.name = name
+            self.kwargs = kwargs
+            self.status = "running"
+            net = kwargs.get("network", "ms_net")
+            is_member = "db_id" in kwargs.get("labels", {})
+            ip = "10.0.0.7" if is_member else "10.0.0.5"
+            self.attrs = {
+                "NetworkSettings": {"Networks": {net: {"IPAddress": ip}}},
+            }
+
+        def reload(self):
+            pass
+
+        def exec_run(self, _cmd):
+            return 0, b""
+
+        def stop(self, timeout=5):
+            self.status = "exited"
+
+        def remove(self, force=False, v=False):
+            removed.append(self.id)
+            containers.pop(self.name, None)
+
+    class FakeContainers:
+        def run(self, **kwargs):
+            container = FakeContainer(kwargs["name"], kwargs)
+            containers[kwargs["name"]] = container
+            return container
+
+        def get(self, identifier):
+            for container in containers.values():
+                if identifier in (container.id, container.name):
+                    return container
+            raise Exception("not found")
+
+    class FakeDocker:
+        containers = FakeContainers()
+
+    monkeypatch.setattr(m, "RDS_PG_CLUSTER_REPLICATION", True)
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: "ms_net")
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    monkeypatch.setattr(m, "_wait_for_database_ready", lambda *_args: True)
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "pgrepl-cluster",
+            "Engine": "aurora-postgresql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        m._create_db_instance({
+            "DBInstanceIdentifier": "pgrepl-writer",
+            "DBClusterIdentifier": "pgrepl-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-postgresql",
+        })
+        cluster = m._clusters.get("pgrepl-cluster")
+        writer = m._instances.get("pgrepl-writer")
+        assert _poll_until(
+            lambda: writer["DBInstanceStatus"] == "available",
+        )
+        # Single-member cluster: ReaderEndpoint follows the writer.
+        assert cluster["ReaderEndpoint"] == "10.0.0.5"
+
+        m._create_db_instance({
+            "DBInstanceIdentifier": "pgrepl-reader",
+            "DBClusterIdentifier": "pgrepl-cluster",
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-postgresql",
+        })
+        reader = m._instances.get("pgrepl-reader")
+        assert reader["_pg_standby"] is True
+        assert _poll_until(
+            lambda: reader["DBInstanceStatus"] == "available",
+        )
+        # The reader owns a container distinct from the shared one.
+        assert reader["_docker_container_id"] != cluster["_shared_container_id"]
+        assert m._instance_owns_container(reader)
+        # Replication access was provisioned on the writer.
+        assert cluster["_pg_replication_source_ready"] is True
+        # ReaderEndpoint now resolves to the standby; the writer endpoint
+        # stays on the shared container; the writer stays the only writer.
+        assert cluster["ReaderEndpoint"] == "10.0.0.7"
+        assert cluster["Endpoint"] == "10.0.0.5"
+        writers = [
+            member for member in cluster["DBClusterMembers"]
+            if member.get("IsClusterWriter")
+        ]
+        assert [w["DBInstanceIdentifier"] for w in writers] == ["pgrepl-writer"]
+        assert _poll_until(lambda: cluster["Status"] == "available")
+
+        # Stop/start with a replicating reader is slice 3: refused, not
+        # published wrongly.
+        status, _, body = m._stop_db_cluster({
+            "DBClusterIdentifier": "pgrepl-cluster",
+        })
+        assert status == 400
+        assert "InvalidDBClusterStateFault" in str(body)
+
+        # Deleting the reader removes only its own compute; the
+        # ReaderEndpoint falls back to the writer.
+        reader_container_id = reader["_docker_container_id"]
+        m._delete_db_instance({
+            "DBInstanceIdentifier": "pgrepl-reader",
+            "SkipFinalSnapshot": "true",
+        })
+        assert reader_container_id in removed
+        assert cluster["_shared_container_id"] not in removed
+        assert cluster["ReaderEndpoint"] == "10.0.0.5"
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def _pg_repl_fake_docker(m, monkeypatch, member_ips, exec_calls, removed):
+    """Fake Docker for replicating-reader tests.
+
+    ``member_ips`` maps a member ``db_id`` label to the container IP the
+    fake reports; containers without a ``db_id`` label (the cluster-owned
+    shared container) get 10.0.0.5. ``exec_calls`` collects the names of
+    containers that received ``exec_run``; ``removed`` collects removed
+    container ids.
+    """
+    containers = {}
+
+    class FakeContainer:
+        def __init__(self, name, kwargs):
+            self.id = f"{name}-container"
+            self.name = name
+            self.kwargs = kwargs
+            self.status = "running"
+            net = kwargs.get("network", "ms_net")
+            db_id = kwargs.get("labels", {}).get("db_id")
+            ip = member_ips.get(db_id, "10.0.0.5")
+            self.attrs = {
+                "NetworkSettings": {"Networks": {net: {"IPAddress": ip}}},
+            }
+
+        def reload(self):
+            pass
+
+        def exec_run(self, _cmd):
+            exec_calls.append(self.name)
+            return 0, b""
+
+        def stop(self, timeout=5):
+            self.status = "exited"
+
+        def remove(self, force=False, v=False):
+            removed.append(self.id)
+            containers.pop(self.name, None)
+
+    class FakeContainers:
+        def run(self, **kwargs):
+            container = FakeContainer(kwargs["name"], kwargs)
+            containers[kwargs["name"]] = container
+            return container
+
+        def get(self, identifier):
+            for container in containers.values():
+                if identifier in (container.id, container.name):
+                    return container
+            raise Exception("not found")
+
+    class FakeDocker:
+        containers = FakeContainers()
+
+    monkeypatch.setattr(m, "RDS_PG_CLUSTER_REPLICATION", True)
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: "ms_net")
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+
+
+def test_rds_pg_two_replicating_readers_provision_source_once(monkeypatch):
+    """Two readers on one cluster: the writer is provisioned exactly once,
+    ReaderEndpoint selection is deterministic (member order), and a standby
+    whose port cannot pair with the cluster Port never wins the address.
+    """
+    from ministack.services import rds as m
+
+    exec_calls = []
+    removed = []
+    _pg_repl_fake_docker(
+        m, monkeypatch,
+        {"pgrepl2-reader1": "10.0.0.7", "pgrepl2-reader2": "10.0.0.8"},
+        exec_calls, removed,
+    )
+    monkeypatch.setattr(m, "_wait_for_database_ready", lambda *_args: True)
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "pgrepl2-cluster",
+            "Engine": "aurora-postgresql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        for db_id in ("pgrepl2-writer", "pgrepl2-reader1", "pgrepl2-reader2"):
+            m._create_db_instance({
+                "DBInstanceIdentifier": db_id,
+                "DBClusterIdentifier": "pgrepl2-cluster",
+                "DBInstanceClass": "db.r6g.large",
+                "Engine": "aurora-postgresql",
+            })
+        cluster = m._clusters.get("pgrepl2-cluster")
+        reader1 = m._instances.get("pgrepl2-reader1")
+        reader2 = m._instances.get("pgrepl2-reader2")
+        assert _poll_until(
+            lambda: reader1["DBInstanceStatus"] == "available"
+            and reader2["DBInstanceStatus"] == "available",
+        )
+        assert cluster["_pg_replication_source_ready"] is True
+        # Replication provisioning ran exactly once on the shared (writer)
+        # container even with two reader workers racing the flag.
+        shared_execs = [
+            name for name in exec_calls
+            if name == m._rds_cluster_docker_name("pgrepl2-cluster")
+        ]
+        assert len(shared_execs) == 1
+        assert exec_calls == shared_execs  # nothing exec'd on the readers
+
+        # Member order (reader1 first) decides the ReaderEndpoint.
+        assert cluster["ReaderEndpoint"] == "10.0.0.7"
+
+        # Deleting the first reader moves the endpoint to the second.
+        m._delete_db_instance({
+            "DBInstanceIdentifier": "pgrepl2-reader1",
+            "SkipFinalSnapshot": "true",
+        })
+        assert cluster["ReaderEndpoint"] == "10.0.0.8"
+
+        # A standby only reachable on a different port than the cluster
+        # Port must not win the address: fall back to the writer.
+        reader2["Endpoint"]["Port"] = 5999
+        m._sync_cluster_endpoints(cluster)
+        assert cluster["ReaderEndpoint"] == "10.0.0.5"
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_pg_reader_bootstrap_failure_removes_reader_compute(monkeypatch):
+    """A standby that never becomes reachable is failed AND its container
+    is removed — no leaked compute waiting for a manual DeleteDBInstance.
+    """
+    from ministack.services import rds as m
+
+    exec_calls = []
+    removed = []
+    _pg_repl_fake_docker(
+        m, monkeypatch, {"pgreplf-reader": "10.0.0.7"}, exec_calls, removed,
+    )
+    # The writer (10.0.0.5) becomes ready; the standby never does.
+    monkeypatch.setattr(
+        m, "_wait_for_database_ready",
+        lambda host, *_args: host != "10.0.0.7",
+    )
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "pgreplf-cluster",
+            "Engine": "aurora-postgresql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        for db_id in ("pgreplf-writer", "pgreplf-reader"):
+            m._create_db_instance({
+                "DBInstanceIdentifier": db_id,
+                "DBClusterIdentifier": "pgreplf-cluster",
+                "DBInstanceClass": "db.r6g.large",
+                "Engine": "aurora-postgresql",
+            })
+        cluster = m._clusters.get("pgreplf-cluster")
+        reader = m._instances.get("pgreplf-reader")
+        reader_container_id = reader["_docker_container_id"]
+        assert _poll_until(
+            lambda: reader["DBInstanceStatus"] == "failed",
+        )
+        assert reader_container_id in removed
+        assert cluster["_shared_container_id"] not in removed
+        # The ReaderEndpoint never advertises the failed standby.
+        assert cluster["ReaderEndpoint"] == "10.0.0.5"
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_pg_stale_reader_worker_is_inert(monkeypatch):
+    """A superseded reader worker (captured container id no longer the
+    instance's) must not touch the recreated instance's status or compute.
+    """
+    from ministack.services import rds as m
+
+    exec_calls = []
+    removed = []
+    _pg_repl_fake_docker(
+        m, monkeypatch, {"pgrepls-reader": "10.0.0.7"}, exec_calls, removed,
+    )
+    monkeypatch.setattr(m, "_wait_for_database_ready", lambda *_args: True)
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "pgrepls-cluster",
+            "Engine": "aurora-postgresql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        for db_id in ("pgrepls-writer", "pgrepls-reader"):
+            m._create_db_instance({
+                "DBInstanceIdentifier": db_id,
+                "DBClusterIdentifier": "pgrepls-cluster",
+                "DBInstanceClass": "db.r6g.large",
+                "Engine": "aurora-postgresql",
+            })
+        reader = m._instances.get("pgrepls-reader")
+        assert _poll_until(
+            lambda: reader["DBInstanceStatus"] == "available",
+        )
+
+        # A worker whose captured container id was superseded (delete +
+        # recreate under the same identifier) returns without mutating.
+        m._bg_finalize_pg_reader(
+            "pgrepls-reader", "pgrepls-cluster", "aurora-postgresql",
+            "admin", "password123", "mydb", "10.0.0.7", 5432,
+            "stale-container-id",
+        )
+        assert reader["DBInstanceStatus"] == "available"
+        assert removed == []
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_restore_state_demotes_pg_standby(monkeypatch):
+    """Warm boot demotes a persisted replicating reader to an alias member.
+
+    Restarting reader containers across host restarts is #1325 slice 3;
+    until then a restored reader must not stay marked ``_pg_standby``
+    pointing at a container the restart killed, and the cluster must
+    re-verify replication provisioning against the respawned writer.
+    """
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        get_account_id,
+        get_region,
+    )
+    from ministack.services import rds as m
+
+    monkeypatch.setattr(m, "_get_docker", lambda: None)
+    key_scope = (get_account_id(), get_region())
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        clusters = AccountRegionScopedDict()
+        instances = AccountRegionScopedDict()
+        clusters._data[(*key_scope, "warm-pg")] = {
+            "DBClusterIdentifier": "warm-pg",
+            "Engine": "aurora-postgresql",
+            "Status": "available",
+            "_pg_replication_source_ready": True,
+            "DBClusterMembers": [
+                {"DBInstanceIdentifier": "warm-pg-writer", "IsClusterWriter": True},
+                {"DBInstanceIdentifier": "warm-pg-reader", "IsClusterWriter": False},
+            ],
+        }
+        instances._data[(*key_scope, "warm-pg-writer")] = {
+            "DBInstanceIdentifier": "warm-pg-writer",
+            "DBClusterIdentifier": "warm-pg",
+            "_shared_cluster_id": "warm-pg",
+        }
+        instances._data[(*key_scope, "warm-pg-reader")] = {
+            "DBInstanceIdentifier": "warm-pg-reader",
+            "DBClusterIdentifier": "warm-pg",
+            "_pg_standby": True,
+            "_docker_container_id": "dead-reader-container",
+        }
+        m.restore_state({"clusters": clusters, "instances": instances})
+
+        reader = m._instances.get("warm-pg-reader")
+        assert reader is not None
+        assert "_pg_standby" not in reader
+        cluster = m._clusters.get("warm-pg")
+        assert "_pg_replication_source_ready" not in cluster
+        # The demoted reader re-attaches to the shared cluster endpoint like
+        # any alias member (no Docker in this test: restore publishes the
+        # endpoint without real compute).
+        assert _poll_until(
+            lambda: reader.get("DBInstanceStatus") == "available",
+        )
+        assert reader.get("_shared_cluster_id") == "warm-pg"
+        assert m._cluster_reader_endpoint(cluster) == cluster["_shared_endpoint"]
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+_PG_REPLICATION_LIVE = (
+    os.environ.get("DOCKER_NETWORK")
+    and os.environ.get(
+        "MINISTACK_RDS_PG_CLUSTER_REPLICATION", "0",
+    ).lower() in ("1", "true", "yes")
+)
+
+
+def _pg_connect(endpoint, user="admin", password=PASSWORD, database=DATABASE):
+    import psycopg2
+
+    return psycopg2.connect(
+        host=endpoint["Address"],
+        port=int(endpoint["Port"]),
+        user=user,
+        password=password,
+        dbname=database,
+        connect_timeout=5,
+    )
+
+
+@contextlib.contextmanager
+def _live_pg_cluster(rds):
+    suffix = uuid.uuid4().hex[:10]
+    cluster_id = f"pgrepl-{suffix}"
+    writer_id = f"{cluster_id}-writer"
+    reader_id = f"{cluster_id}-reader"
+    try:
+        rds.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-postgresql",
+            MasterUsername="admin",
+            MasterUserPassword=PASSWORD,
+            DatabaseName=DATABASE,
+        )
+        for db_id in (writer_id, reader_id):
+            rds.create_db_instance(
+                DBInstanceIdentifier=db_id,
+                DBClusterIdentifier=cluster_id,
+                DBInstanceClass="db.r6g.large",
+                Engine="aurora-postgresql",
+            )
+        writer = _wait_for_instance(rds, writer_id, timeout=180)
+        reader = _wait_for_instance(rds, reader_id, timeout=180)
+        cluster = rds.describe_db_clusters(
+            DBClusterIdentifier=cluster_id,
+        )["DBClusters"][0]
+        yield cluster_id, writer_id, reader_id, writer, reader, cluster
+    finally:
+        for db_id in (reader_id, writer_id):
+            try:
+                rds.delete_db_instance(
+                    DBInstanceIdentifier=db_id,
+                    SkipFinalSnapshot=True,
+                )
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "DBInstanceNotFound":
+                    raise
+        try:
+            rds.delete_db_cluster(
+                DBClusterIdentifier=cluster_id,
+                SkipFinalSnapshot=True,
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "DBClusterNotFoundFault":
+                raise
+
+
+@pytest.mark.skipif(
+    not _PG_REPLICATION_LIVE,
+    reason="DOCKER_NETWORK and MINISTACK_RDS_PG_CLUSTER_REPLICATION not set "
+    "-- live Aurora PostgreSQL replication",
+)
+def test_aurora_pg_replicating_reader_live(rds):
+    """A flag-enabled reader is a genuine hot standby streaming from the writer."""
+    with _live_pg_cluster(rds) as (_cid, _wid, _rid, writer, reader, cluster):
+        # Distinct endpoints: the reader is not an alias of the writer.
+        assert (
+            (reader["Endpoint"]["Address"], reader["Endpoint"]["Port"])
+            != (writer["Endpoint"]["Address"], writer["Endpoint"]["Port"])
+        )
+        # The cluster reader endpoint resolves to the reader.
+        assert cluster["ReaderEndpoint"] == reader["Endpoint"]["Address"]
+
+        with _pg_connect(reader["Endpoint"]) as conn, conn.cursor() as cursor:
+            cursor.execute("SELECT pg_is_in_recovery()")
+            assert cursor.fetchone() == (True,)
+
+        with _pg_connect(writer["Endpoint"]) as conn:
+            conn.autocommit = True
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT pg_is_in_recovery()")
+                assert cursor.fetchone() == (False,)
+                cursor.execute(
+                    "CREATE TABLE repl_rows (id INT PRIMARY KEY, value TEXT)",
+                )
+                cursor.execute("INSERT INTO repl_rows VALUES (1, 'writer-data')")
+
+        # The write streams to the standby (bounded poll for replica lag).
+        def _reader_sees_row():
+            with _pg_connect(reader["Endpoint"]) as conn, conn.cursor() as cursor:
+                try:
+                    cursor.execute("SELECT id, value FROM repl_rows")
+                except Exception:
+                    return False
+                return cursor.fetchall() == [(1, "writer-data")]
+
+        deadline = time.time() + 60
+        while time.time() < deadline and not _reader_sees_row():
+            time.sleep(1)
+        assert _reader_sees_row()
+
+        # Writes against the standby fail read-only (SQLSTATE 25006).
+        import psycopg2
+
+        with _pg_connect(reader["Endpoint"]) as conn:
+            conn.autocommit = True
+            with conn.cursor() as cursor:
+                with pytest.raises(psycopg2.Error) as excinfo:
+                    cursor.execute("INSERT INTO repl_rows VALUES (2, 'nope')")
+        assert excinfo.value.pgcode == "25006"
