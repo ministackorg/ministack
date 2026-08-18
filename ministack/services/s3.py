@@ -1096,6 +1096,25 @@ def _sigv4_signing_key(secret: str, date_stamp: str, region: str, service: str) 
     return _h(k_service, "aws4_request")
 
 
+def _resolve_presign_secret(access_key_id):
+    """The secret a presigned URL was signed with.
+
+    STS temporary credentials are signed with the unique secret STS issued (not
+    the server's static one), so a presigned URL from an AssumeRole / session
+    token would never recompute against ``AWS_SECRET_ACCESS_KEY``. STS records
+    each issued secret by access key id; resolve it here, falling back to the
+    static server secret for a long-term (non-session) credential.
+    """
+    try:
+        from ministack.services import sts
+        session = sts._sessions.get(access_key_id)
+        if session and session.get("SecretAccessKey"):
+            return session["SecretAccessKey"]
+    except Exception:
+        pass
+    return os.environ.get("AWS_SECRET_ACCESS_KEY", "test")
+
+
 def _verify_presigned_sigv4(method, path, headers, query_params):
     """Verify a SigV4 presigned S3 URL. Returns an error tuple for a bad
     signature, or None when the request is not a SigV4 presigned URL (header-
@@ -1186,7 +1205,7 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
         hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
     ])
 
-    secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "test")
+    secret = _resolve_presign_secret(_akid)
     signing_key = _sigv4_signing_key(secret, date_stamp, region, service)
     computed = hmac.new(signing_key, string_to_sign.encode("utf-8"),
                         hashlib.sha256).hexdigest()
@@ -1197,11 +1216,18 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
 
 
 async def handle_request(
-    method: str, path: str, headers: dict, body: bytes, query_params: dict
+    method: str, path: str, headers: dict, body: bytes, query_params: dict,
+    signed_path: str | None = None,
 ) -> tuple:
     bucket, key = _parse_bucket_key(path, headers)
 
-    sig_error = _verify_presigned_sigv4(method, path, headers, query_params)
+    # A virtual-hosted request is rewritten to path-style before it reaches here
+    # (``/{bucket}{path}``), but the client signed the canonical URI it actually
+    # sent (``{path}``, no bucket) against the vhost Host header. ``signed_path``
+    # carries that original URI so the presigned signature recomputes correctly;
+    # path-style requests pass None and verify against ``path`` as before.
+    sig_error = _verify_presigned_sigv4(
+        method, signed_path if signed_path is not None else path, headers, query_params)
     if sig_error is not None:
         status, resp_headers, resp_body = sig_error
         resp_headers.setdefault("x-amz-request-id", new_uuid())

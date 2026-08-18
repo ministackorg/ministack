@@ -112,6 +112,7 @@ async def handle_request(method, path, headers, body, query_params):
         session_token = _gen_session_token()
         role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
         _sessions[access_key] = {"Arn": assumed_arn, "UserId": f"{role_id}:{session_name}"}
+        _sessions[access_key]["SecretAccessKey"] = secret_key
         if use_json:
             return json_response({
                 "Credentials": {"AccessKeyId": access_key, "SecretAccessKey": secret_key, "SessionToken": session_token, "Expiration": int(time.time() + duration)},
@@ -146,6 +147,7 @@ async def handle_request(method, path, headers, body, query_params):
         session_token = _gen_session_token()
         role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
         _sessions[access_key] = {"Arn": assumed_arn, "UserId": f"{role_id}:{session}"}
+        _sessions[access_key]["SecretAccessKey"] = secret_key
         provider = _p(params, "ProviderId") or "sts.amazonaws.com"
         if use_json:
             return json_response({
@@ -179,6 +181,9 @@ async def handle_request(method, path, headers, body, query_params):
         access_key = _gen_session_access_key()
         secret_key = _gen_secret()
         session_token = _gen_session_token()
+        # Record the secret so a presigned URL signed with these temporary
+        # credentials can be verified against the key it was actually signed with.
+        _sessions[access_key] = {"SecretAccessKey": secret_key}
         if use_json:
             return json_response({
                 "Credentials": {"AccessKeyId": access_key, "SecretAccessKey": secret_key, "SessionToken": session_token, "Expiration": int(time.time() + duration)},

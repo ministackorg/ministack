@@ -3710,6 +3710,42 @@ def test_s3_presigned_url_signature_is_verified():
     assert status(urllib.request.Request(u, method="GET")) == 200
 
 
+def test_s3_presigned_url_virtual_hosted_style_is_verified():
+    """A virtual-hosted-style presigned URL signs the bucket-less canonical URI
+    against the `{bucket}.host` Host header. MiniStack rewrites vhost → path-style
+    internally, but verification must run against the URI the client actually
+    signed, not the rewritten one (#1441)."""
+    import urllib.error
+    import urllib.request
+    from urllib.parse import urlparse
+
+    import boto3
+    from botocore.config import Config
+
+    ep = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+    cli = boto3.client(
+        "s3", endpoint_url=ep, region_name="us-east-1",
+        aws_access_key_id="test", aws_secret_access_key="test",
+        config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+    )
+    bucket = "presign-vhost-bkt"
+    cli.create_bucket(Bucket=bucket)
+
+    u = cli.generate_presigned_url(
+        "put_object", Params={"Bucket": bucket, "Key": "up.txt"}, ExpiresIn=300)
+    parsed = urlparse(u)
+    # The vhost host won't resolve; send to the endpoint with the bucket-less
+    # path and the signed Host header, exactly as a fronting proxy would.
+    target = ep + parsed.path + "?" + parsed.query
+    req = urllib.request.Request(
+        target, data=b"x", method="PUT", headers={"Host": parsed.netloc})
+    try:
+        code = urllib.request.urlopen(req).status
+    except urllib.error.HTTPError as exc:
+        code = exc.code
+    assert code in (200, 204), f"vhost presigned PUT rejected with {code}"
+
+
 def test_s3_eventbridge_notification_on_delete(s3, sqs, eb):
     """S3 delete_object should send EventBridge event when EventBridgeConfiguration is enabled."""
     bucket = "s3-eb-del-bkt"

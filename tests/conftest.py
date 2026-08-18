@@ -176,6 +176,11 @@ _SERIAL_TESTS = {
     # `{prefix}.jobs.iot.{region}` Host and a tight 5s timeout, so cross-file
     # xdist pressure on the shared event loop makes it time out at random.
     "tests/test_iot_jobs.py::test_iot_jobs_advertised_endpoint_host_reaches_the_data_plane",
+    # ECS service task-spawn: with a Docker daemon present (CI has one) a task
+    # whose container fails to start/exits under parallel container churn is set
+    # STOPPED, so list_tasks (RUNNING-only) sees fewer than desiredCount. Passes
+    # serially; run it in the serial phase.
+    "tests/test_ecs.py::test_ecs_service_spawns_tasks",
     # WS/MQTT-broker tests (MQTT-over-WebSocket connect/publish/subscribe,
     # device shadows over MQTT, fleet-index connectivity). They drive the
     # single-event-loop broker over real WebSocket connections with tight
