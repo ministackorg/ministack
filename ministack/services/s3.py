@@ -2873,6 +2873,7 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
 
     etag = f'"{md5_hash(body)}"'
     obj = _build_object_record(body, headers, etag=etag, checksums=checksums)
+    obj["preserved_headers"].update(sse_headers)
     prior_obj = bucket["objects"].get(key)
     bucket["objects"][key] = obj
 
@@ -2894,7 +2895,7 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     )
 
     resp_headers = {"ETag": obj["etag"], "Content-Length": "0"}
-    resp_headers.update(_bucket_default_sse_headers(bucket_name))
+    resp_headers.update(sse_headers)
     version_id = _record_object_version(bucket_name, key, prior_obj, obj, body)
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
@@ -3072,8 +3073,20 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
     if canned_acl and canned_acl not in _CANNED_OBJECT_ACLS:
         return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
 
+    # The POST form names its SSE fields exactly like the request headers.
+    sse_fields = {h: fields[h] for h in (
+        "x-amz-server-side-encryption",
+        "x-amz-server-side-encryption-aws-kms-key-id",
+        "x-amz-server-side-encryption-customer-algorithm",
+        "x-amz-server-side-encryption-customer-key",
+        "x-amz-server-side-encryption-customer-key-md5") if h in fields}
+    sse_headers, sse_err = _resolve_sse_write_headers(sse_fields, bucket_name)
+    if sse_err:
+        return sse_err
+
     etag = f'"{md5_hash(file_value)}"'
     obj = _build_object_record(file_value, synth, etag=etag)
+    obj["preserved_headers"].update(sse_headers)
     prior_obj = bucket["objects"].get(key)
     bucket["objects"][key] = obj
     _apply_object_lock_from_headers(bucket_name, key, synth)
@@ -5201,6 +5214,14 @@ def _complete_multipart_upload(
             404,
             f"/{bucket_name}/{key}",
         )
+
+    # An SSE-C upload's completion must present the create-time key again, as
+    # every part did; a plain upload's completion must present none. (The
+    # idempotent replay above deliberately skips this — the original request
+    # already presented the key when it committed.)
+    sse_part_err = _check_sse_c_part(headers or {}, upload)
+    if sse_part_err is not None:
+        return sse_part_err
 
     # CompleteMultipartUpload takes the same If-Match / If-None-Match
     # preconditions PutObject does, evaluated against the current object at

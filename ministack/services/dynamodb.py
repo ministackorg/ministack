@@ -1289,6 +1289,20 @@ def _update_table(data):
         return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
     table = _tables[name]
 
+    # UpdateTable must carry at least one actionable change. AttributeDefinitions
+    # on its own is rejected by AWS (and no API can change a key attribute's
+    # type — MiniStack used to merge it in and silently mutate the key). #1432
+    _ACTIONABLE_UPDATE_PARAMS = (
+        "ProvisionedThroughput", "BillingMode", "GlobalSecondaryIndexUpdates",
+        "StreamSpecification", "SSESpecification", "ReplicaUpdates", "TableClass",
+        "OnDemandThroughput", "DeletionProtectionEnabled", "WarmThroughput",
+    )
+    if not any(k in data for k in _ACTIONABLE_UPDATE_PARAMS):
+        return error_response_json("ValidationException",
+            "At least one of ProvisionedThroughput, BillingMode, UpdateStreamEnabled, "
+            "GlobalSecondaryIndexUpdates, SSESpecification, ReplicaUpdates or TableClass "
+            "is required", 400)
+
     current_billing = table.get("BillingModeSummary", {}).get("BillingMode", "PROVISIONED")
     new_billing = data.get("BillingMode")
     # ProvisionedThroughput validation when supplied.
@@ -1636,6 +1650,12 @@ def _put_item(data):
     if table.get("sk_name") and table["sk_name"] not in item:
         return error_response_json("ValidationException",
             f"One or more parameter values were invalid: Missing the key {table['sk_name']} in the item", 400)
+    # A key attribute present with the wrong type is a ValidationException on
+    # PutItem, as on UpdateItem/GetItem/TransactWrite (real AWS: "Type mismatch
+    # for key <name> expected: <S> actual: <N>").
+    type_msg = _key_type_mismatch_reason(table, item)
+    if type_msg:
+        return error_response_json("ValidationException", type_msg, 400)
     pk_val = _extract_key_val(item.get(table["pk_name"]))
     sk_val = _extract_key_val(item.get(table["sk_name"])) if table["sk_name"] else "__no_sort__"
     old_item = table["items"].get(pk_val, {}).get(sk_val)
@@ -2040,6 +2060,19 @@ def _query(data):
     if pk_val is None:
         return error_response_json("ValidationException",
             f"Query condition missed key schema element: {pk_name}", 400)
+    # A key-condition value whose type does not match the key's schema type is
+    # rejected, as on real AWS ("Condition parameter type does not match schema
+    # type") — MiniStack used to accept N for an S key and return the row.
+    for _kn in (pk_name, sk_name):
+        if not _kn:
+            continue
+        _av = _key_condition_av(key_cond, key_conditions, eav, ean, _kn)
+        if isinstance(_av, dict) and len(_av) == 1:
+            _expected = _get_attr_type(table, _kn)
+            if _expected and next(iter(_av)) != _expected:
+                return error_response_json("ValidationException",
+                    "One or more parameter values were invalid: Condition "
+                    "parameter type does not match schema type", 400)
     # Reject non-key attributes in KeyConditionExpression: every bare identifier
     # in the expression must be either the hash key or the sort key (resolved
     # via ExpressionAttributeNames if aliased).
@@ -5978,6 +6011,32 @@ def _extract_pk_from_condition(condition, attr_values, attr_names, pk_name):
         m = re.search(rf'(:\w+)\s*=\s*{re.escape(ref)}(?:$|[\s)])', condition)
         if m and m.group(1) in attr_values:
             return _extract_key_val(attr_values[m.group(1)])
+    return None
+
+
+def _key_condition_av(condition, key_conditions, eav, attr_names, key_name):
+    """The typed AttributeValue bound to ``key_name`` in a Query key condition,
+    for the type-vs-schema check. Covers legacy KeyConditions and the
+    KeyConditionExpression forms (``key <op> :v`` / ``:v = key``,
+    ``begins_with(key, :v)``, ``key BETWEEN :lo AND :hi``); returns the first
+    bound value, which is enough to catch a type mismatch."""
+    if key_conditions:
+        cond = key_conditions.get(key_name)
+        if isinstance(cond, dict):
+            avl = cond.get("AttributeValueList") or []
+            return avl[0] if avl else None
+        return None
+    if not condition:
+        return None
+    refs = [key_name] + [a for a, r in attr_names.items() if r == key_name]
+    for ref in refs:
+        for pat in (rf'(?:^|[\s(]){re.escape(ref)}\s*(?:<=|>=|=|<|>)\s*(:\w+)',
+                    rf'(:\w+)\s*(?:<=|>=|=|<|>)\s*{re.escape(ref)}(?:$|[\s)])',
+                    rf'begins_with\s*\(\s*{re.escape(ref)}\s*,\s*(:\w+)\s*\)',
+                    rf'{re.escape(ref)}\s+BETWEEN\s+(:\w+)'):
+            m = re.search(pat, condition, re.I)
+            if m and m.group(1) in eav:
+                return eav[m.group(1)]
     return None
 
 

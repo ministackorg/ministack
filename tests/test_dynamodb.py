@@ -1040,6 +1040,71 @@ def test_dynamodb_get_item_wrong_key_type_fails_validation(ddb):
     assert exc.value.response["Error"]["Code"] == "ValidationException"
     assert exc.value.response["Error"]["Message"] == "The provided key element does not match the schema"
 
+def test_dynamodb_put_item_wrong_key_type_fails_validation(ddb):
+    """PutItem with a key attribute typed against its schema is rejected (#1432)."""
+    try:
+        ddb.delete_table(TableName="t_put_wrong_type")
+    except Exception:
+        pass
+    ddb.create_table(
+        TableName="t_put_wrong_type",
+        KeySchema=[{"AttributeName": "device", "KeyType": "HASH"},
+                   {"AttributeName": "ts", "KeyType": "RANGE"}],
+        AttributeDefinitions=[{"AttributeName": "device", "AttributeType": "S"},
+                              {"AttributeName": "ts", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    with pytest.raises(ClientError) as exc:
+        ddb.put_item(TableName="t_put_wrong_type",
+                     Item={"device": {"S": "d1"}, "ts": {"N": "123"}})
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert exc.value.response["Error"]["Message"] == (
+        "One or more parameter values were invalid: "
+        "Type mismatch for key ts expected: S actual: N")
+
+def test_dynamodb_query_wrong_key_condition_type_fails_validation(ddb):
+    """Query whose key-condition value type mismatches the schema is rejected (#1432)."""
+    try:
+        ddb.delete_table(TableName="t_query_wrong_type")
+    except Exception:
+        pass
+    ddb.create_table(
+        TableName="t_query_wrong_type",
+        KeySchema=[{"AttributeName": "device", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "device", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    ddb.put_item(TableName="t_query_wrong_type", Item={"device": {"S": "d1"}})
+    with pytest.raises(ClientError) as exc:
+        ddb.query(TableName="t_query_wrong_type",
+                  KeyConditionExpression="device = :v",
+                  ExpressionAttributeValues={":v": {"N": "1"}})
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert "Condition parameter type does not match schema type" in \
+        exc.value.response["Error"]["Message"]
+
+def test_dynamodb_update_table_attribute_definitions_only_is_rejected(ddb):
+    """UpdateTable with only AttributeDefinitions (no actionable change, and no
+    API can alter a key's type) is rejected (#1432)."""
+    try:
+        ddb.delete_table(TableName="t_upd_attrdefs")
+    except Exception:
+        pass
+    ddb.create_table(
+        TableName="t_upd_attrdefs",
+        KeySchema=[{"AttributeName": "ts", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "ts", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    with pytest.raises(ClientError) as exc:
+        ddb.update_table(TableName="t_upd_attrdefs",
+                         AttributeDefinitions=[{"AttributeName": "ts", "AttributeType": "N"}])
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert "At least one of" in exc.value.response["Error"]["Message"]
+    # The key type must be unchanged.
+    desc = ddb.describe_table(TableName="t_upd_attrdefs")["Table"]
+    assert {a["AttributeName"]: a["AttributeType"] for a in desc["AttributeDefinitions"]}["ts"] == "S"
+
 def test_dynamodb_update_item_extra_key_attribute_fails_validation(ddb):
     try:
         ddb.delete_table(TableName="t_update_extra_key")
