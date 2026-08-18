@@ -6939,6 +6939,105 @@ def test_cfn_nested_stack_basic(cfn, s3):
     s3.delete_bucket(Bucket=templates_bucket)
 
 
+def test_cfn_nested_stack_long_name_lambda_functions_get_distinct_physical_names(cfn, s3, lam):
+    """Regression test: a nested stack's own auto-generated name (parent name
+    + nested-stack logical id + a CloudFormation-assigned suffix — exactly
+    what CDK's NestedStack construct produces) can itself already exceed a
+    downstream resource's own name-length limit, e.g. Lambda's 64-char
+    FunctionName cap. Before this fix, _physical_name() built the full
+    "{stack}-{logicalId}-{suffix}" string and only then truncated it to
+    max_len from the end — so once stack_name alone was >= max_len, every
+    resource in that nested stack (regardless of logical_id) collapsed onto
+    the exact same truncated physical name. Two real Lambda functions used to
+    become one physical function; only whichever was provisioned last ever
+    actually ran, regardless of which one a caller invoked."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    templates_bucket = f"cfn-nested-templates-{suffix}"
+    s3.create_bucket(Bucket=templates_bucket)
+
+    def _lambda_resource(marker):
+        return {
+            "Type": "AWS::Lambda::Function",
+            "Properties": {
+                "Runtime": "python3.12",
+                "Handler": "index.handler",
+                "Role": "arn:aws:iam::000000000000:role/lambda-role",
+                "Code": {"ZipFile": f"def handler(event, context):\n    return {{'marker': '{marker}'}}\n"},
+            },
+        }
+
+    child_template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "FirstFunction": _lambda_resource("first"),
+            "SecondFunction": _lambda_resource("second"),
+        },
+        "Outputs": {
+            "FirstArn": {"Value": {"Fn::GetAtt": ["FirstFunction", "Arn"]}},
+            "SecondArn": {"Value": {"Fn::GetAtt": ["SecondFunction", "Arn"]}},
+        },
+    }
+    s3.put_object(Bucket=templates_bucket, Key="child.json",
+                  Body=json.dumps(child_template).encode())
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+
+    # Deliberately verbose, mirroring the shape CDK actually generates for a
+    # NestedStack construct's own logical id (ParentId + "NestedStack" +
+    # ParentId + "NestedStackResource" + a CloudFormation-assigned hash) —
+    # long enough that ministack's generated child stack name
+    # ("{parent_name}-{nested_logical_id}-{uuid[:12]}") already meets or
+    # exceeds 64 characters on its own, before any Lambda logical_id is even
+    # appended.
+    parent_name = f"cfn-nested-longname-parent-{suffix}"
+    nested_logical_id = "ApiStackNestedStackApiStackNestedStackResourceABCDEFG1234"
+
+    parent_template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            nested_logical_id: {
+                "Type": "AWS::CloudFormation::Stack",
+                "Properties": {
+                    "TemplateURL": f"{endpoint}/{templates_bucket}/child.json",
+                },
+            },
+        },
+        "Outputs": {
+            "FirstArn": {"Value": {"Fn::GetAtt": [nested_logical_id, "Outputs.FirstArn"]}},
+            "SecondArn": {"Value": {"Fn::GetAtt": [nested_logical_id, "Outputs.SecondArn"]}},
+        },
+    }
+
+    cfn.create_stack(StackName=parent_name, TemplateBody=json.dumps(parent_template))
+    stack = _wait_stack(cfn, parent_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    first_arn = outputs["FirstArn"]
+    second_arn = outputs["SecondArn"]
+
+    assert first_arn != second_arn, (
+        f"FirstFunction and SecondFunction collapsed onto the same physical Lambda: {first_arn}"
+    )
+
+    first_name = first_arn.rsplit(":", 1)[-1]
+    second_name = second_arn.rsplit(":", 1)[-1]
+    assert len(first_name) <= 64
+    assert len(second_name) <= 64
+
+    # Each is independently invocable and runs its own code — not just
+    # distinctly named, but genuinely distinct resources.
+    first_result = json.loads(lam.invoke(FunctionName=first_name)["Payload"].read())
+    second_result = json.loads(lam.invoke(FunctionName=second_name)["Payload"].read())
+    assert first_result["marker"] == "first"
+    assert second_result["marker"] == "second"
+
+    cfn.delete_stack(StackName=parent_name)
+    _wait_stack(cfn, parent_name)
+
+    s3.delete_object(Bucket=templates_bucket, Key="child.json")
+    s3.delete_bucket(Bucket=templates_bucket)
+
+
 def test_cfn_logs_subscription_filter_provisions(cfn, logs):
     """AWS::Logs::SubscriptionFilter provisions via CFN and is removed on stack
     delete (#896). The filter Refs the in-stack log group so it is created
