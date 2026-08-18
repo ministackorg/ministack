@@ -22,6 +22,11 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
   - Fleet indexing: ``UpdateIndexingConfiguration`` /
     ``GetIndexingConfiguration`` / ``DescribeIndex`` / ``ListIndices``, and
     ``SearchIndex`` over the live registry, shadows and MQTT connectivity
+  - Jobs (control plane): ``CreateJob``, ``DescribeJob``, ``ListJobs``,
+    ``GetJobDocument``, ``CancelJob``, ``DeleteJob``,
+    ``ListJobExecutionsForThing``, ``DescribeJobExecution``,
+    ``CancelJobExecution`` — execution state shared with the
+    ``iot-jobs-data`` device data plane (``iot_jobs_data.py``)
   - ``DescribeEndpoint`` returning a per-account hostname
 
 This is the control plane — pure HTTP/JSON, no MQTT broker
@@ -98,6 +103,9 @@ _indexing_config: AccountRegionScopedDict = AccountRegionScopedDict()
 _ca_certificates: AccountRegionScopedDict = AccountRegionScopedDict()
 # JITR registration code — a single "code" key per account/region
 _registration_codes: AccountRegionScopedDict = AccountRegionScopedDict()
+_jobs: AccountRegionScopedDict = AccountRegionScopedDict()  # jobId -> Job dict
+# (thingName, jobId) -> JobExecution dict — tuple keys, same pattern as _shadows
+_job_executions: AccountRegionScopedDict = AccountRegionScopedDict()
 
 # Local CA state — lazily generated on first use, persisted across restarts.
 import threading
@@ -197,6 +205,8 @@ def get_state() -> dict:
         "indexing_config": copy.deepcopy(_indexing_config),
         "ca_certificates": copy.deepcopy(_ca_certificates),
         "registration_codes": copy.deepcopy(_registration_codes),
+        "jobs": copy.deepcopy(_jobs),
+        "job_executions": copy.deepcopy(_job_executions),
         "ca": {"ca_cert_pem": _ca_cert_pem, "ca_key_pem": _ca_key_pem}
         if _ca_cert_pem and _ca_key_pem
         else {},
@@ -218,6 +228,8 @@ def restore_state(data: dict | None) -> None:
     _indexing_config.update(data.get("indexing_config", {}))
     _ca_certificates.update(data.get("ca_certificates", {}))
     _registration_codes.update(data.get("registration_codes", {}))
+    _jobs.update(data.get("jobs", {}))
+    _job_executions.update(data.get("job_executions", {}))
     ca_data = data.get("ca")
     if ca_data:
         cert = ca_data.get("ca_cert_pem")
@@ -246,6 +258,8 @@ def reset() -> None:
     _indexing_config.clear()
     _ca_certificates.clear()
     _registration_codes.clear()
+    _jobs.clear()
+    _job_executions.clear()
     with _CA_LOCK:
         _ca_cert_pem = None
         _ca_key_pem = None
@@ -334,12 +348,16 @@ def _validate_name(name: str | None, field: str) -> tuple | None:
 
 
 def _parse_body(body: bytes) -> dict:
+    """Decode a JSON request body. Anything but a JSON object yields ``{}`` —
+    every caller treats the result as a dict, so a bare array or string body
+    must not reach them as one."""
     if not body:
         return {}
     try:
-        return json.loads(body.decode("utf-8"))
+        parsed = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _error_not_found(resource: str, name: str) -> tuple:
@@ -398,6 +416,14 @@ async def handle_request(
     # Principal lives at /things/{name}/principals — must come BEFORE generic /things/{name}
     if path.startswith("/things/") and path.endswith("/principals"):
         return _handle_thing_principals(method, path, hdr, body, qp)
+    # Job executions live at /things/{name}/jobs[/{jobId}[/cancel]] — like
+    # /principals, must come BEFORE the generic /things/{name} branch. The
+    # `jobs` segment only counts when a thing name precedes it: `/things/jobs`
+    # is thing CRUD for a thing that happens to be named `jobs`.
+    if path.startswith("/things/"):
+        _thing, _, _sub = path[len("/things/"):].partition("/")
+        if _thing and (_sub == "jobs" or _sub.startswith("jobs/")):
+            return _handle_thing_jobs(method, path, body, qp)
     if path.startswith("/things/") and method in ("POST", "GET", "PATCH", "DELETE"):
         return _handle_thing(method, path, body, qp)
 
@@ -478,6 +504,13 @@ async def handle_request(
         return _list_indices()
     if path.startswith("/indices/") and method == "GET":
         return _describe_index(path)
+    # Jobs (control plane) — CreateJob is PUT /jobs/{jobId} per the botocore
+    # `iot` service model; sub-resources (/cancel, /job-document) are
+    # dispatched inside _handle_job.
+    if path == "/jobs" and method == "GET":
+        return _list_jobs(qp)
+    if path.startswith("/jobs/"):
+        return _handle_job(method, path, body, qp)
 
     # Topic rules
     if path == "/rules" and method == "GET":
@@ -691,7 +724,15 @@ def _delete_thing(name: str) -> tuple:
         if group and name in group.get("things", []):
             group["things"].remove(name)
             _thing_groups[gname] = group
+    # Drop the thing's job executions with it. Left behind, a live execution
+    # for a thing that no longer exists holds its job out of COMPLETED forever,
+    # and a later thing of the same name would inherit that stale history.
+    orphaned_jobs = [key[1] for key in _job_executions.keys() if key[0] == name]
+    for job_id in orphaned_jobs:
+        del _job_executions[(name, job_id)]
     del _things[name]
+    for job_id in orphaned_jobs:
+        _jobs_maybe_complete(job_id)
     logger.info("IoT Thing deleted: %s", name)
     return json_response({})
 
@@ -3287,13 +3328,701 @@ def _list_topic_rules(qp: dict) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# Helper exports for iot_data
+# IoT Jobs (control plane; execution state shared with iot_jobs_data.py)
+# ---------------------------------------------------------------------------
+#
+# The job store and per-thing execution store live here so that the `iot`
+# control plane and the `iot-jobs-data` data plane (iot_jobs_data.py, which
+# imports this module directly — same pattern as iot_data.py and the shadow
+# store) operate on the same records. Every rule of the state machine lives in
+# this file; the data-plane module is a wire adapter over the `jobs_*` seam
+# below. Transitions MiniStack can actually make:
+#
+#   QUEUED → IN_PROGRESS → {SUCCEEDED, FAILED, REJECTED, CANCELED}
+#
+# `versionNumber` gives optimistic concurrency: every transition bumps it, and
+# a stale `expectedVersion` is rejected with a 409. `executionNumber` is NOT a
+# concurrency token here — an execution is created once at 1 and nothing
+# re-queues it, so it never changes (AWS increments it when a job execution is
+# retried, which MiniStack does not model).
+#
+# TIMED_OUT and REMOVED are recognized as terminal (so a restored record in
+# either state behaves, and `jobProcessDetails` counts them) but nothing sets
+# them: there are no execution timeouts, and deleting a thing DELETES its
+# executions (see `_delete_thing`) rather than marking them REMOVED.
+
+# Job ids are stricter than thing names, and identically so in both service
+# models (`iot` and `iot-jobs-data` declare JobId as [a-zA-Z0-9_-], max 64).
+# The generic thing-name pattern would let a `:` through control-side, and the
+# device that has to fetch that job by id could then never reach it.
+_JOB_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+_JOB_TARGET_SELECTIONS = {"SNAPSHOT", "CONTINUOUS"}
+
+_JOB_EXECUTION_TERMINAL = {
+    "SUCCEEDED", "FAILED", "TIMED_OUT", "CANCELED", "REJECTED", "REMOVED",
+}
+_JOB_EXECUTION_STATUSES = _JOB_EXECUTION_TERMINAL | {"QUEUED", "IN_PROGRESS"}
+
+# The statuses a device may report through UpdateJobExecution, per the AWS API
+# reference. The service-side statuses (CANCELED, TIMED_OUT, REMOVED) are only
+# ever set by the control plane; a device sending one is rejected with
+# InvalidRequestException, as on AWS.
+_DEVICE_SETTABLE_STATUSES = {"IN_PROGRESS", "SUCCEEDED", "FAILED", "REJECTED"}
+
+
+def _jobs_now_ms() -> int:
+    """Epoch MILLISECONDS — the unit job/execution records store internally.
+
+    The two planes emit different units for these same instants: the `iot`
+    control plane models them as `timestamp` shapes, which botocore parses
+    as epoch SECONDS (so control-plane responses divide by 1000 via
+    :func:`_jobs_ms_to_s`), while `iot-jobs-data` models them as raw `long`
+    shapes carrying epoch MILLISECONDS (emitted as-is). Mixing the units up
+    makes botocore explode while parsing ("year 58580 is out of range"), so
+    every response path converts explicitly at the edge.
+    """
+    return int(time.time() * 1000)
+
+
+def _jobs_ms_to_s(millis: int | None) -> float | None:
+    """Millisecond record stamp → epoch-seconds float for `timestamp` shapes."""
+    return None if millis is None else millis / 1000.0
+
+
+def _job_arn(job_id: str) -> str:
+    return f"arn:aws:iot:{get_region()}:{get_account_id()}:job/{job_id}"
+
+
+def _job_target_resolve(arn: str) -> list[str] | None:
+    """Thing names one job target ARN resolves to, under the caller's scope.
+
+    ``None`` means the ARN targets nothing this caller can reach: another
+    service, another account, another region, or a thing / thing group that
+    does not exist here. A thing group that exists but is empty resolves to an
+    empty list — a real target with no members today.
+
+    Group membership is read natively from `_thing_groups` — no HTTP hop.
+    :func:`_create_job` gates on exactly this function, so a target it accepts
+    is a target the materializer can resolve; validating creation any more
+    loosely (e.g. on the ARN's resource segment alone) admits a cross-region
+    target that silently resolves to zero executions, leaving a job that can
+    never complete and can only be deleted with `force`.
+    """
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None
+    if (
+        spec.service != "iot"
+        or spec.account_id != get_account_id()
+        or spec.region != get_region()
+    ):
+        return None
+    if spec.resource.startswith("thing/"):
+        thing = spec.resource[len("thing/"):]
+        return [thing] if thing in _things else None
+    if spec.resource.startswith("thinggroup/"):
+        group = _thing_groups.get(spec.resource[len("thinggroup/"):])
+        return None if group is None else list(group.get("things", []))
+    return None
+
+
+def _job_target_things(targets: list) -> list:
+    """Resolve job targets (thing / thing-group ARNs) to thing names."""
+    things: list[str] = []
+    for arn in targets or []:
+        things.extend(_job_target_resolve(arn) or [])
+    return list(dict.fromkeys(things))
+
+
+def _jobs_materialize_executions(job_id: str) -> None:
+    """Materialize QUEUED executions for a job's current targets.
+
+    SNAPSHOT jobs resolve group membership exactly once (at creation) — the
+    `snapshotted` flag latches that. CONTINUOUS jobs re-resolve lazily on
+    every read, which is exactly when new membership matters and avoids
+    watching group mutations.
+    """
+    job = _jobs.get(job_id)
+    if not job or job.get("status") == "CANCELED":
+        return
+    if job.get("targetSelection") == "SNAPSHOT" and job.get("snapshotted"):
+        return
+    now = _jobs_now_ms()
+    for thing in _job_target_things(job.get("targets")):
+        key = (thing, job_id)
+        if key in _job_executions:
+            continue
+        _job_executions[key] = {
+            "jobId": job_id,
+            "thingName": thing,
+            "status": "QUEUED",
+            "statusDetails": {},
+            "queuedAt": now,
+            "startedAt": None,
+            "lastUpdatedAt": now,
+            "executionNumber": 1,
+            "versionNumber": 1,
+        }
+    if job.get("targetSelection") == "SNAPSHOT":
+        job["snapshotted"] = True
+
+
+def _jobs_materialize_all() -> None:
+    for job_id in list(_jobs.keys()):
+        _jobs_materialize_executions(job_id)
+
+
+def _jobs_maybe_complete(job_id: str) -> None:
+    """A non-CONTINUOUS job whose executions are all terminal is COMPLETED.
+
+    "All" includes none left: every caller reaches here through a path that
+    materialized the job's executions first, so an empty list means the last
+    one just went away (its thing was deleted), not that the job has yet to
+    start. Waiting for a non-empty list there would strand the job.
+    """
+    job = _jobs.get(job_id)
+    if (
+        not job
+        or job.get("targetSelection") == "CONTINUOUS"
+        or job.get("status") != "IN_PROGRESS"
+    ):
+        return
+    executions = [e for e in _job_executions.values() if e["jobId"] == job_id]
+    if all(e["status"] in _JOB_EXECUTION_TERMINAL for e in executions):
+        now = _jobs_now_ms()
+        job["status"] = "COMPLETED"
+        job["completedAt"] = now
+        job["lastUpdatedAt"] = now
+
+
+def _jobs_check_expected_version(
+    execution: dict, expected, conflict_code: str
+) -> tuple | None:
+    """Optimistic-concurrency gate, shared by the two update paths.
+
+    The rejection message carries the current version so a device can resync
+    without a separate describe. `conflict_code` differs by plane and is NOT
+    cosmetic: the `iot` model declares VersionConflictException for
+    CancelJobExecution, while the `iot-jobs-data` model declares only
+    InvalidStateTransitionException for UpdateJobExecution — returning the
+    unmodeled code there makes a device's
+    `except client.exceptions.VersionConflictException` raise AttributeError
+    instead of catching, because botocore only synthesizes exception classes
+    for the errors its model lists.
+    """
+    if expected is None:
+        return None
+    try:
+        expected = int(expected)
+    except (TypeError, ValueError):
+        return error_response_json(
+            "InvalidRequestException", f"Invalid expectedVersion: {expected!r}", 400
+        )
+    if expected != execution["versionNumber"]:
+        return error_response_json(
+            conflict_code,
+            f"Expected version {expected} does not match current version "
+            f"{execution['versionNumber']} of the job execution",
+            409,
+        )
+    return None
+
+
+def _jobs_reject_if_terminal(execution: dict, verb: str) -> tuple | None:
+    """Terminal executions are frozen — no update, no cancel."""
+    if execution["status"] not in _JOB_EXECUTION_TERMINAL:
+        return None
+    return error_response_json(
+        "InvalidStateTransitionException",
+        f"Job execution is in terminal status {execution['status']} and "
+        f"cannot be {verb}",
+        409,
+    )
+
+
+def _handle_job(method: str, path: str, body: bytes, qp: dict) -> tuple:
+    """Dispatch /jobs/{jobId}[...] control-plane routes."""
+    suffix = path[len("/jobs/"):]
+    if suffix.endswith("/cancel") and method == "PUT":
+        return _cancel_job(suffix[:-len("/cancel")], _parse_body(body), qp)
+    if suffix.endswith("/job-document") and method == "GET":
+        return _get_job_document(suffix[:-len("/job-document")])
+    if "/" in suffix:
+        return error_response_json(
+            "InvalidRequestException", f"Unsupported IoT path: {method} {path}", 400
+        )
+    job_id = suffix
+    if method == "PUT":
+        return _create_job(job_id, _parse_body(body))
+    if method == "GET":
+        return _describe_job(job_id)
+    if method == "DELETE":
+        return _delete_job(job_id, qp)
+    return error_response_json(
+        "InvalidRequestException", f"Unsupported method: {method}", 400
+    )
+
+
+def _create_job(job_id: str, payload: dict) -> tuple:
+    if not job_id or not _JOB_ID_RE.match(job_id):
+        return error_response_json(
+            "InvalidRequestException",
+            "Invalid jobId: must match [a-zA-Z0-9_-]{1,64}",
+            400,
+        )
+    if job_id in _jobs:
+        return error_response_json(
+            "ResourceAlreadyExistsException", f"Job {job_id} already exists", 409
+        )
+    # Absent means SNAPSHOT (the AWS default); present means it has to be one
+    # of the two modeled values — including the empty string, which would
+    # otherwise default its way to a SNAPSHOT job the caller never asked for.
+    target_selection = payload.get("targetSelection")
+    if target_selection is None:
+        target_selection = "SNAPSHOT"
+    if target_selection not in _JOB_TARGET_SELECTIONS:
+        return error_response_json(
+            "InvalidRequestException",
+            f"Invalid targetSelection: {target_selection!r}; must be one of "
+            + ", ".join(sorted(_JOB_TARGET_SELECTIONS)),
+            400,
+        )
+    targets = payload.get("targets")
+    if not targets:
+        return error_response_json(
+            "InvalidRequestException", "targets must not be empty", 400
+        )
+    # Every target must name a thing or thing group this caller can reach, as
+    # on AWS — and reach means under the SAME account and region, which is what
+    # the materializer resolves against.
+    for arn in targets:
+        try:
+            parse_arn(arn)
+        except ArnParseError:
+            return error_response_json(
+                "InvalidRequestException", f"Invalid target arn: {arn}", 400
+            )
+        if _job_target_resolve(arn) is None:
+            return error_response_json(
+                "ResourceNotFoundException", f"Job target {arn} not found", 404
+            )
+    document = payload.get("document")
+    if not document and payload.get("documentSource"):
+        # DELIBERATE DIVERGENCE: AWS fetches the document from the S3 URL and
+        # serves its CONTENT to devices. MiniStack does not fetch it — it
+        # stands in a placeholder naming the source, so a `documentSource` job
+        # still creates, describes, and runs its whole execution lifecycle.
+        # A device that parses the document therefore sees the URL, not the
+        # payload; pass `document` when the content matters.
+        document = json.dumps({"documentSource": payload["documentSource"]})
+    now = _jobs_now_ms()
+    _jobs[job_id] = {
+        "jobId": job_id,
+        "jobArn": _job_arn(job_id),
+        "description": payload.get("description"),
+        "targets": list(targets),
+        "targetSelection": target_selection,
+        "document": document or "{}",
+        "documentSource": payload.get("documentSource"),
+        "status": "IN_PROGRESS",
+        "createdAt": now,
+        "lastUpdatedAt": now,
+        "completedAt": None,
+        "presignedUrlConfig": payload.get("presignedUrlConfig") or {},
+        "jobExecutionsRolloutConfig": payload.get("jobExecutionsRolloutConfig")
+        or {},
+        "snapshotted": False,
+    }
+    _jobs_materialize_executions(job_id)
+    response = {"jobArn": _job_arn(job_id), "jobId": job_id}
+    if payload.get("description") is not None:
+        response["description"] = payload["description"]
+    return json_response(response)
+
+
+def _job_summary(job: dict) -> dict:
+    summary = {
+        "jobArn": job["jobArn"],
+        "jobId": job["jobId"],
+        "targetSelection": job["targetSelection"],
+        "status": job["status"],
+        "createdAt": _jobs_ms_to_s(job["createdAt"]),
+        "lastUpdatedAt": _jobs_ms_to_s(job["lastUpdatedAt"]),
+    }
+    if job.get("completedAt") is not None:
+        summary["completedAt"] = _jobs_ms_to_s(job["completedAt"])
+    return summary
+
+
+def _describe_job(job_id: str) -> tuple:
+    job = _jobs.get(job_id)
+    if job is None:
+        return _error_not_found("Job", job_id)
+    _jobs_materialize_executions(job_id)
+    counts = {status: 0 for status in _JOB_EXECUTION_STATUSES}
+    for execution in _job_executions.values():
+        if execution["jobId"] == job_id:
+            counts[execution["status"]] += 1
+    job_doc = {
+        **_job_summary(job),
+        "targets": list(job.get("targets") or []),
+        "presignedUrlConfig": job.get("presignedUrlConfig") or {},
+        "jobExecutionsRolloutConfig": job.get("jobExecutionsRolloutConfig") or {},
+        "jobProcessDetails": {
+            "numberOfQueuedThings": counts["QUEUED"],
+            "numberOfInProgressThings": counts["IN_PROGRESS"],
+            "numberOfSucceededThings": counts["SUCCEEDED"],
+            "numberOfFailedThings": counts["FAILED"],
+            "numberOfCanceledThings": counts["CANCELED"],
+            "numberOfRejectedThings": counts["REJECTED"],
+            "numberOfRemovedThings": counts["REMOVED"],
+            "numberOfTimedOutThings": counts["TIMED_OUT"],
+        },
+    }
+    if job.get("description") is not None:
+        job_doc["description"] = job["description"]
+    if job.get("comment") is not None:
+        job_doc["comment"] = job["comment"]
+    if job.get("reasonCode") is not None:
+        job_doc["reasonCode"] = job["reasonCode"]
+    response = {"job": job_doc}
+    if job.get("documentSource") is not None:
+        response["documentSource"] = job["documentSource"]
+    return json_response(response)
+
+
+def _delete_job(job_id: str, qp: dict) -> tuple:
+    job = _jobs.get(job_id)
+    if job is None:
+        return _error_not_found("Job", job_id)
+    force = _qp_bool(qp, "force")
+    if job["status"] == "IN_PROGRESS" and not force:
+        return error_response_json(
+            "InvalidStateTransitionException",
+            f"Job {job_id} is in status IN_PROGRESS and cannot be deleted "
+            "without force",
+            409,
+        )
+    del _jobs[job_id]
+    for key in [k for k in _job_executions.keys() if k[1] == job_id]:
+        del _job_executions[key]
+    return json_response({})
+
+
+def _list_jobs(qp: dict) -> tuple:
+    """``GET /jobs`` with ``status`` / ``targetSelection`` filters.
+
+    ``maxResults`` / ``nextToken`` are not honored: the full list comes back
+    as one page and no token is ever returned, so a paginator terminates
+    after its first call (same stance as ``_list_indices``).
+    """
+    wanted_status = qp.get("status")
+    wanted_selection = qp.get("targetSelection")
+    jobs = [
+        _job_summary(job)
+        for job in _jobs.values()
+        if (not wanted_status or job["status"] == wanted_status)
+        and (not wanted_selection or job["targetSelection"] == wanted_selection)
+    ]
+    return json_response({"jobs": jobs})
+
+
+def _get_job_document(job_id: str) -> tuple:
+    job = _jobs.get(job_id)
+    if job is None:
+        return _error_not_found("Job", job_id)
+    return json_response({"document": job.get("document") or "{}"})
+
+
+def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:
+    job = _jobs.get(job_id)
+    if job is None:
+        return _error_not_found("Job", job_id)
+    if job["status"] != "IN_PROGRESS":
+        return error_response_json(
+            "InvalidRequestException",
+            f"Job {job_id} is in status {job['status']} and cannot be canceled",
+            400,
+        )
+    force = _qp_bool(qp, "force")
+    now = _jobs_now_ms()
+    job["status"] = "CANCELED"
+    job["lastUpdatedAt"] = now
+    job["completedAt"] = now
+    if payload.get("comment") is not None:
+        job["comment"] = payload["comment"]
+    if payload.get("reasonCode") is not None:
+        job["reasonCode"] = payload["reasonCode"]
+    # QUEUED executions are always canceled with the job; IN_PROGRESS ones
+    # only when force is set — as on AWS.
+    for execution in _job_executions.values():
+        if execution["jobId"] != job_id:
+            continue
+        if execution["status"] == "QUEUED" or (
+            force and execution["status"] == "IN_PROGRESS"
+        ):
+            execution["status"] = "CANCELED"
+            execution["lastUpdatedAt"] = now
+            execution["versionNumber"] += 1
+    response = {"jobArn": job["jobArn"], "jobId": job_id}
+    if job.get("description") is not None:
+        response["description"] = job["description"]
+    return json_response(response)
+
+
+def _handle_thing_jobs(method: str, path: str, body: bytes, qp: dict) -> tuple:
+    """Dispatch /things/{name}/jobs[...] control-plane routes."""
+    rest = path[len("/things/"):]
+    thing, _, sub = rest.partition("/")
+    err = _validate_name(thing, "thingName")
+    if err:
+        return err
+    if sub == "jobs":
+        if method == "GET":
+            return _list_job_executions_for_thing(thing, qp)
+        return error_response_json(
+            "InvalidRequestException", f"Unsupported method: {method}", 400
+        )
+    if not sub.startswith("jobs/"):
+        return error_response_json(
+            "InvalidRequestException", f"Unsupported IoT path: {method} {path}", 400
+        )
+    tail = sub[len("jobs/"):]
+    if tail.endswith("/cancel") and method == "PUT":
+        return _cancel_job_execution(
+            thing, tail[:-len("/cancel")], _parse_body(body), qp
+        )
+    if "/" not in tail and method == "GET":
+        return _describe_job_execution(thing, tail)
+    return error_response_json(
+        "InvalidRequestException", f"Unsupported IoT path: {method} {path}", 400
+    )
+
+
+def _list_job_executions_for_thing(thing: str, qp: dict) -> tuple:
+    """``GET /things/{thing}/jobs`` — one unbounded page, like ``_list_jobs``."""
+    _jobs_materialize_all()
+    wanted_status = qp.get("status")
+    wanted_job = qp.get("jobId")
+    # The wire shape nests the detail under `jobExecutionSummary`, with only
+    # the jobId beside it (JobExecutionSummaryForThing).
+    summaries = []
+    for execution in _job_executions.values():
+        if execution["thingName"] != thing:
+            continue
+        if wanted_status and execution["status"] != wanted_status:
+            continue
+        if wanted_job and execution["jobId"] != wanted_job:
+            continue
+        summary = {
+            "status": execution["status"],
+            "queuedAt": _jobs_ms_to_s(execution["queuedAt"]),
+            "lastUpdatedAt": _jobs_ms_to_s(execution["lastUpdatedAt"]),
+            "executionNumber": execution["executionNumber"],
+        }
+        if execution.get("startedAt") is not None:
+            summary["startedAt"] = _jobs_ms_to_s(execution["startedAt"])
+        summaries.append(
+            {"jobId": execution["jobId"], "jobExecutionSummary": summary}
+        )
+    return json_response({"executionSummaries": summaries})
+
+
+def _describe_job_execution(thing: str, job_id: str) -> tuple:
+    _jobs_materialize_executions(job_id)
+    execution = _job_executions.get((thing, job_id))
+    if execution is None:
+        return _error_not_found("Job execution", f"{thing}/{job_id}")
+    view = {
+        "jobId": execution["jobId"],
+        "status": execution["status"],
+        # Control-plane JobExecution nests the map under `detailsMap`
+        # (JobExecutionStatusDetails); the data plane returns it flat.
+        "statusDetails": {"detailsMap": execution.get("statusDetails") or {}},
+        "thingArn": _thing_arn(thing),
+        "queuedAt": _jobs_ms_to_s(execution["queuedAt"]),
+        "lastUpdatedAt": _jobs_ms_to_s(execution["lastUpdatedAt"]),
+        "executionNumber": execution["executionNumber"],
+        "versionNumber": execution["versionNumber"],
+    }
+    if execution.get("startedAt") is not None:
+        view["startedAt"] = _jobs_ms_to_s(execution["startedAt"])
+    return json_response({"execution": view})
+
+
+def _cancel_job_execution(
+    thing: str, job_id: str, payload: dict, qp: dict
+) -> tuple:
+    _jobs_materialize_executions(job_id)
+    execution = _job_executions.get((thing, job_id))
+    if execution is None:
+        return _error_not_found("Job execution", f"{thing}/{job_id}")
+    error = _jobs_check_expected_version(
+        execution, payload.get("expectedVersion"), "VersionConflictException"
+    )
+    if error:
+        return error
+    error = _jobs_reject_if_terminal(execution, "canceled")
+    if error:
+        return error
+    force = _qp_bool(qp, "force")
+    if execution["status"] == "IN_PROGRESS" and not force:
+        return error_response_json(
+            "InvalidStateTransitionException",
+            "Job execution is IN_PROGRESS and cannot be canceled without force",
+            409,
+        )
+    execution["status"] = "CANCELED"
+    if payload.get("statusDetails"):
+        execution["statusDetails"] = dict(payload["statusDetails"])
+    execution["lastUpdatedAt"] = _jobs_now_ms()
+    execution["versionNumber"] += 1
+    _jobs_maybe_complete(job_id)
+    return json_response({})
+
+
+# ---------------------------------------------------------------------------
+# Helper exports for the data planes (iot_data, iot_jobs_data)
 # ---------------------------------------------------------------------------
 
 
 def lookup_certificate_by_id(cert_id: str, region: str) -> dict | None:
     """Return a certificate in the current account and explicit region."""
     return _certificates.get_scoped(get_account_id(), region, cert_id)
+
+
+# The data planes share the control plane's body decoding instead of
+# re-implementing it (empty, undecodable, or non-object body → {}).
+parse_json_body = _parse_body
+
+
+# --- IoT Jobs seam (consumed by iot_jobs_data.py) --------------------------
+#
+# The device plane is a wire adapter: it parses requests, shapes responses,
+# and logs — it never touches _jobs / _job_executions, so the state machine
+# has exactly one home. The mutating calls return `(execution, error)`, where
+# `execution` is a COPY (a caller cannot corrupt the store through it) and
+# `error` is a ready-to-return response tuple.
+
+
+def jobs_pending_for_thing(thing_name: str) -> list[dict]:
+    """Every non-terminal execution for a thing, oldest queued first (copies).
+
+    Materializes first: a thing added to a CONTINUOUS job's target group after
+    creation gets its execution here, on the read that first needs it.
+    """
+    _jobs_materialize_all()
+    pending = [
+        dict(execution)
+        for execution in _job_executions.values()
+        if execution["thingName"] == thing_name
+        and execution["status"] in ("QUEUED", "IN_PROGRESS")
+    ]
+    pending.sort(key=lambda execution: execution["queuedAt"])
+    return pending
+
+
+def jobs_start_next_execution(
+    thing_name: str, *, status_details: dict | None = None, peek: bool = False
+) -> dict | None:
+    """Hand a thing its next pending execution, or None when it is idle.
+
+    A QUEUED execution moves to IN_PROGRESS (stamping `startedAt`, bumping
+    `versionNumber`); with `peek=True` — GET of the `$next` sentinel — the
+    execution is read without being started. An already IN_PROGRESS execution
+    is re-handed unchanged, so a device that restarts mid-job resumes it.
+    """
+    pending = jobs_pending_for_thing(thing_name)
+    if not pending:
+        return None
+    execution = _job_executions[(thing_name, pending[0]["jobId"])]
+    if not peek and execution["status"] == "QUEUED":
+        now = _jobs_now_ms()
+        execution["status"] = "IN_PROGRESS"
+        execution["startedAt"] = now
+        execution["lastUpdatedAt"] = now
+        execution["versionNumber"] += 1
+        if status_details:
+            execution["statusDetails"] = dict(status_details)
+    return dict(execution)
+
+
+def jobs_describe_execution(thing_name: str, job_id: str) -> dict | None:
+    """One execution (a copy), materializing the job's targets first."""
+    _jobs_materialize_executions(job_id)
+    execution = _job_executions.get((thing_name, job_id))
+    return None if execution is None else dict(execution)
+
+
+def jobs_job_document(job_id: str) -> str:
+    """The document a device should run for a job — ``{}`` if there is none."""
+    job = _jobs.get(job_id)
+    return (job or {}).get("document") or "{}"
+
+
+def jobs_update_execution(
+    thing_name: str,
+    job_id: str,
+    *,
+    status,
+    expected_version=None,
+    status_details: dict | None = None,
+) -> tuple:
+    """Apply a device-reported status to an execution.
+
+    Returns ``(execution copy, None)``, or ``(None, error)`` for every
+    rejection: unknown execution (404), stale or non-numeric
+    `expectedVersion`, an already-terminal execution, an unknown status, the
+    illegal walk back to QUEUED, and the service-side statuses a device may
+    not set. A successful update may complete the job.
+    """
+    _jobs_materialize_executions(job_id)
+    execution = _job_executions.get((thing_name, job_id))
+    if execution is None:
+        return None, error_response_json(
+            "ResourceNotFoundException",
+            f"No job execution found for thing {thing_name} and job {job_id}",
+            404,
+        )
+    error = _jobs_check_expected_version(
+        execution, expected_version, "InvalidStateTransitionException"
+    )
+    if error:
+        return None, error
+    error = _jobs_reject_if_terminal(execution, "updated")
+    if error:
+        return None, error
+    if not status or status not in _JOB_EXECUTION_STATUSES:
+        return None, error_response_json(
+            "InvalidRequestException",
+            f"Invalid job execution status: {status!r}",
+            400,
+        )
+    if status == "QUEUED":
+        return None, error_response_json(
+            "InvalidStateTransitionException",
+            "A device cannot move a job execution back to QUEUED",
+            409,
+        )
+    if status not in _DEVICE_SETTABLE_STATUSES:
+        return None, error_response_json(
+            "InvalidRequestException",
+            f"A device cannot set status {status} via UpdateJobExecution; "
+            "allowed statuses are IN_PROGRESS, SUCCEEDED, FAILED, and REJECTED",
+            400,
+        )
+    now = _jobs_now_ms()
+    execution["status"] = status
+    if status_details:
+        execution["statusDetails"] = dict(status_details)
+    if status == "IN_PROGRESS" and execution.get("startedAt") is None:
+        execution["startedAt"] = now
+    execution["lastUpdatedAt"] = now
+    execution["versionNumber"] += 1
+    _jobs_maybe_complete(job_id)
+    return dict(execution), None
 
 
 # ---------------------------------------------------------------------------

@@ -84,7 +84,7 @@ _bucket_accelerate_config = AccountScopedDict()
 _bucket_request_payment_config = AccountScopedDict()
 
 _object_tags = AccountScopedDict()
-_object_acl = AccountScopedDict()  # (bucket, key) -> stored ACL XML string
+_object_acl = AccountScopedDict()  # (bucket, key, version_id) -> stored ACL XML string
 _object_versions = AccountScopedDict()  # (bucket, key) -> [{version_id, obj_record}, ...]
 
 _bucket_object_lock = AccountScopedDict()
@@ -436,9 +436,10 @@ def _validate_content_md5(headers: dict, body: bytes):
 
 
 def _check_put_preconditions(headers: dict, existing_obj: dict | None):
-    """Evaluate `If-Match` and `If-None-Match` on PUT.
+    """Evaluate `If-Match` and `If-None-Match` on a conditional write.
 
-    AWS S3 added native conditional writes on PutObject in November 2024:
+    AWS S3 added native conditional writes — on PutObject and
+    CompleteMultipartUpload alike — in November 2024:
       - `If-None-Match: "*"` — succeed only when no object exists at the key.
         Used to implement create-once semantics (idempotent writes, distributed
         leader election via S3, two-file pair serialization).
@@ -448,8 +449,9 @@ def _check_put_preconditions(headers: dict, existing_obj: dict | None):
       - `If-Match: "<etag>"` — succeed only when the existing object's ETag
         matches.
 
-    Returns a 412 PreconditionFailed tuple when a condition is violated;
-    otherwise returns None and the caller proceeds with the PUT.
+    Returns an error tuple when a condition is violated — 412
+    PreconditionFailed, except that If-Match against a missing key is 404
+    NoSuchKey — otherwise returns None and the caller proceeds with the write.
 
     ETag comparison strips surrounding quotes on both sides — S3 stores ETags
     with quotes but client code is inconsistent about including them.
@@ -482,27 +484,19 @@ def _check_put_preconditions(headers: dict, existing_obj: dict | None):
             )
 
     if if_match:
-        # "*" form: any existing object satisfies the condition; missing → 412 per RFC 7232.
-        # (AWS docs don't explicitly document If-Match:* for PutObject, but the inverse case
-        # is well-defined by RFC and real S3 follows it.)
-        if if_match == "*":
-            if existing_obj is None:
-                return _error(
-                    "PreconditionFailed",
-                    "At least one of the pre-conditions you specified did not hold",
-                    412,
-                )
-        elif existing_obj is None:
-            # AWS S3 specifically returns 404 (NoSuchKey) — not 412 — when If-Match: <etag>
-            # targets a key that doesn't exist (or whose current version is a delete marker).
-            # Documented under "Conditional write behavior" in the user guide:
+        if existing_obj is None:
+            # AWS S3 specifically returns 404 (NoSuchKey) — not the RFC 7232
+            # 412 — when If-Match targets a key that doesn't exist (or whose
+            # current version is a delete marker), for the "*" form as well as
+            # the ETag form.  Documented under "Conditional write behavior" in
+            # the user guide:
             # https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html#conditional-error-response
             return _error(
                 "NoSuchKey",
                 "The specified key does not exist.",
                 404,
             )
-        elif if_match.strip('"') != existing_etag:
+        if if_match != "*" and if_match.strip('"') != existing_etag:
             return _error(
                 "PreconditionFailed",
                 "At least one of the pre-conditions you specified did not hold",
@@ -1050,7 +1044,7 @@ def _dispatch(
             if "legal-hold" in query_params:
                 return _get_object_legal_hold(bucket, key)
             if "acl" in query_params:
-                return _get_object_acl(bucket, key)
+                return _get_object_acl(bucket, key, query_params)
             if "attributes" in query_params:
                 return _get_object_attributes(bucket, key, headers, query_params)
             return _get_object(bucket, key, headers, query_params)
@@ -1067,7 +1061,7 @@ def _dispatch(
             if "legal-hold" in query_params:
                 return _put_object_legal_hold(bucket, key, body)
             if "acl" in query_params:
-                return _put_object_acl(bucket, key, body, headers)
+                return _put_object_acl(bucket, key, body, headers, query_params)
             if "x-amz-copy-source" in headers:
                 return _copy_object(bucket, key, headers)
             return _put_object(bucket, key, body, headers)
@@ -1166,7 +1160,7 @@ def _dispatch(
         if "cors" in query_params:
             return _put_bucket_cors(bucket, body)
         if "acl" in query_params:
-            return _put_bucket_acl(bucket, body)
+            return _put_bucket_acl(bucket, body, headers)
         if "website" in query_params:
             return _put_bucket_website(bucket, body)
         if "logging" in query_params:
@@ -1253,6 +1247,11 @@ def _create_bucket(name: str, body: bytes, headers: dict = None):
         return _error(
             "InvalidBucketName", "The specified bucket is not valid.", 400, f"/{name}"
         )
+    # A canned ACL supplied at CreateBucket time is validated up front and
+    # stored below, so GetBucketAcl reflects it instead of dropping it.
+    canned_acl = headers.get("x-amz-acl")
+    if canned_acl and canned_acl not in _CANNED_BUCKET_ACLS:
+        return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
     if name in _buckets:
         # Idempotent: same account already owns it — return 200 like real AWS
         return 200, {"Location": f"/{name}"}, b""
@@ -1284,6 +1283,8 @@ def _create_bucket(name: str, body: bytes, headers: dict = None):
     _buckets[name] = {"created": now_iso(), "objects": {}, "region": region}
     if tags:
         _bucket_tags[name] = tags
+    if canned_acl:
+        _bucket_acl[name] = _canned_acl_policy_xml(canned_acl, get_account_id())
 
     if headers.get("x-amz-bucket-object-lock-enabled", "").lower() == "true":
         _bucket_object_lock[name] = {"enabled": True, "default_retention": None}
@@ -1326,6 +1327,8 @@ def _delete_bucket(name: str):
     _bucket_replication.pop(name, None)
     for k in [k for k in _object_tags if k[0] == name]:
         del _object_tags[k]
+    for k in [k for k in _object_acl if k[0] == name]:
+        del _object_acl[k]
     for k in [k for k in _object_retention if k[0] == name]:
         del _object_retention[k]
     for k in [k for k in _object_legal_hold if k[0] == name]:
@@ -1754,11 +1757,39 @@ def _get_bucket_acl(name: str):
     return 200, {"Content-Type": "application/xml"}, body
 
 
-def _put_bucket_acl(name: str, body: bytes):
+def _put_bucket_acl(name: str, body: bytes, headers: dict | None = None):
+    headers = headers or {}
     if name not in _buckets:
         return _no_such_bucket(name)
-    if body:
-        _bucket_acl[name] = body.decode("utf-8", errors="replace")
+
+    # Canned ACL from x-amz-acl header takes precedence and is mutually
+    # exclusive with an XML body per the AWS API reference. SDK callers send
+    # the canned value as a header with an EMPTY body, so ignoring the header
+    # silently dropped every `put-bucket-acl --acl public-read`. Either path
+    # stores the resulting policy XML so GetBucketAcl round-trips the value
+    # the caller set, matching what real AWS would return.
+    canned = headers.get("x-amz-acl")
+    if canned:
+        if canned not in _CANNED_BUCKET_ACLS:
+            return _error("InvalidArgument",
+                          f"Invalid x-amz-acl value: {canned}", 400)
+        _bucket_acl[name] = _canned_acl_policy_xml(canned, get_account_id())
+        return 200, {}, b""
+
+    if not body:
+        return _error("MissingSecurityHeader",
+                      "Your request was missing a required header.", 400)
+    try:
+        # Validate XML well-formedness — real AWS rejects malformed bodies
+        # with MalformedACLError. We don't enforce grantee/permission
+        # semantics on the data plane, so any well-formed AccessControlPolicy
+        # is accepted and round-tripped verbatim.
+        fromstring(body)
+    except Exception:
+        return _error("MalformedACLError",
+                      "The XML you provided was not well-formed or did not validate "
+                      "against our published schema.", 400)
+    _bucket_acl[name] = body.decode("utf-8", errors="replace")
     return 200, {}, b""
 
 
@@ -2634,8 +2665,9 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
         return csum_err
 
     # A canned ACL supplied at PutObject time is validated up front (an invalid
-    # value rejects the whole request, as AWS does) and applied below, so
-    # GetObjectAcl reflects it instead of dropping it. (#1322, rest of defect 9)
+    # value rejects the whole request, as AWS does) and applied below once the
+    # version id is assigned, so GetObjectAcl reflects it instead of dropping
+    # it. (#1322, rest of defect 9)
     canned_acl = headers.get("x-amz-acl")
     if canned_acl and canned_acl not in _CANNED_OBJECT_ACLS:
         return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
@@ -2644,8 +2676,6 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     obj = _build_object_record(body, headers, etag=etag, checksums=checksums)
     prior_obj = bucket["objects"].get(key)
     bucket["objects"][key] = obj
-    if canned_acl:
-        _object_acl[(bucket_name, key)] = _canned_acl_policy_xml(canned_acl, get_account_id())
 
     # --- Object Lock headers on PutObject ---
     _apply_object_lock_from_headers(bucket_name, key, headers)
@@ -2677,6 +2707,9 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
 
     if pending_tags is not None:
         _object_tags[(bucket_name, key, obj.get("version_id"))] = pending_tags
+    if canned_acl:
+        _object_acl[(bucket_name, key, obj.get("version_id"))] = (
+            _canned_acl_policy_xml(canned_acl, get_account_id()))
     return 200, resp_headers, b""
 
 
@@ -2828,10 +2861,17 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
               "x-amz-object-lock-legal-hold"):
         if h in fields:
             synth[h] = fields[h]
+    # The POST form names its canned-ACL field `acl` (not `x-amz-acl`).
+    if "acl" in fields:
+        synth["x-amz-acl"] = fields["acl"]
 
     _, sc_err = _resolve_storage_class(synth)
     if sc_err:
         return sc_err
+
+    canned_acl = synth.get("x-amz-acl")
+    if canned_acl and canned_acl not in _CANNED_OBJECT_ACLS:
+        return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
 
     etag = f'"{md5_hash(file_value)}"'
     obj = _build_object_record(file_value, synth, etag=etag)
@@ -2860,6 +2900,9 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
 
     if pending_tags is not None:
         _object_tags[(bucket_name, key, version_id)] = pending_tags
+    if canned_acl:
+        _object_acl[(bucket_name, key, version_id)] = (
+            _canned_acl_policy_xml(canned_acl, get_account_id()))
 
     location = f"http://{bucket_name}.s3.amazonaws.com/{url_quote(key, safe='/')}"
     base_resp = {"ETag": etag, "Location": location}
@@ -3232,7 +3275,7 @@ def _purge_current_object(bucket_name: str, key: str, bucket: dict):
     _object_tags.pop((bucket_name, key, None), None)
     _object_retention.pop((bucket_name, key), None)
     _object_legal_hold.pop((bucket_name, key), None)
-    _object_acl.pop((bucket_name, key), None)
+    _object_acl.pop((bucket_name, key, None), None)
     _delete_persisted_object(bucket_name, key)
 
 
@@ -3398,8 +3441,9 @@ def _delete_object_version(bucket: dict, bucket_name: str, key: str,
 
     removed = versions.pop(idx)
     was_delete_marker = bool(removed.get("is_delete_marker"))
-    # Per-version tags travel with the version being removed.
+    # Per-version tags and ACLs travel with the version being removed.
     _object_tags.pop((bucket_name, key, version_id), None)
+    _object_acl.pop((bucket_name, key, version_id), None)
 
     if not versions:
         # History is now empty — drop the index entry and the current object.
@@ -3484,7 +3528,7 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None,
     _object_tags.pop((bucket_name, key, None), None)
     _object_retention.pop((bucket_name, key), None)
     _object_legal_hold.pop((bucket_name, key), None)
-    _object_acl.pop((bucket_name, key), None)
+    _object_acl.pop((bucket_name, key, None), None)
     _delete_persisted_object(bucket_name, key)
 
     if existed:
@@ -3775,13 +3819,13 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
 # ---------------------------------------------------------------------------
 
 
-def _resolve_tagging_version(query_params: dict, bucket: dict, key: str):
-    """Resolve the (key, version_id) pair an Object Tagging op should act on.
+def _resolve_subresource_version(query_params: dict, bucket: dict, key: str):
+    """Resolve the (key, version_id) pair an object subresource op acts on.
 
-    Per AWS, object tags are per-version: when ``?versionId=`` is present the
-    op targets that specific version; otherwise it targets the current object.
-    The literal ``versionId=null`` means the pre-versioning object (stored as
-    ``None`` in our key tuple)."""
+    Per AWS, object tags and ACLs are per-version: when ``?versionId=`` is
+    present the op targets that specific version; otherwise it targets the
+    current object. The literal ``versionId=null`` means the pre-versioning
+    object (stored as ``None`` in our key tuple)."""
     vid = _qp(query_params or {}, "versionId", "")
     if vid:
         return None if vid == "null" else vid
@@ -3801,7 +3845,7 @@ def _get_object_tagging(bucket_name: str, key: str, query_params: dict | None = 
             f"/{bucket_name}/{key}",
         )
 
-    version_id = _resolve_tagging_version(query_params, bucket, key)
+    version_id = _resolve_subresource_version(query_params, bucket, key)
     tags = _object_tags.get((bucket_name, key, version_id), {})
     root = Element("Tagging", xmlns=S3_NS)
     tag_set = SubElement(root, "TagSet")
@@ -3834,7 +3878,7 @@ def _put_object_tagging(
         return _error("MalformedXML", "The XML you provided was not well-formed", 400)
     if len(tags) > 10:
         return _error("BadRequest", "Object tags cannot be greater than 10", 400)
-    version_id = _resolve_tagging_version(query_params, bucket, key)
+    version_id = _resolve_subresource_version(query_params, bucket, key)
     _object_tags[(bucket_name, key, version_id)] = tags
     resp_headers = {"Content-Type": "application/xml"}
     if version_id:
@@ -3855,7 +3899,7 @@ def _delete_object_tagging(
             404,
             f"/{bucket_name}/{key}",
         )
-    version_id = _resolve_tagging_version(query_params, bucket, key)
+    version_id = _resolve_subresource_version(query_params, bucket, key)
     _object_tags.pop((bucket_name, key, version_id), None)
     resp_headers = {}
     if version_id:
@@ -4133,9 +4177,20 @@ _CANNED_OBJECT_ACLS = {
     "bucket-owner-full-control",
 }
 
+# Canned ACLs accepted by CreateBucket / PutBucketAcl `x-amz-acl`: the object
+# set minus the object-only variants, plus log-delivery-write (bucket-only).
+_CANNED_BUCKET_ACLS = {
+    "private",
+    "public-read",
+    "public-read-write",
+    "authenticated-read",
+    "log-delivery-write",
+}
+
 
 _ACL_GROUP_ALL_USERS = "http://acs.amazonaws.com/groups/global/AllUsers"
 _ACL_GROUP_AUTH_USERS = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers"
+_ACL_GROUP_LOG_DELIVERY = "http://acs.amazonaws.com/groups/s3/LogDelivery"
 
 # Group grants each canned ACL adds on top of the owner's FULL_CONTROL, per the
 # AWS S3 "Canned ACL" reference. The bucket-owner-* / aws-exec-read variants add
@@ -4145,6 +4200,7 @@ _CANNED_ACL_GROUP_GRANTS = {
     "public-read": [(_ACL_GROUP_ALL_USERS, "READ")],
     "public-read-write": [(_ACL_GROUP_ALL_USERS, "READ"), (_ACL_GROUP_ALL_USERS, "WRITE")],
     "authenticated-read": [(_ACL_GROUP_AUTH_USERS, "READ")],
+    "log-delivery-write": [(_ACL_GROUP_LOG_DELIVERY, "WRITE"), (_ACL_GROUP_LOG_DELIVERY, "READ_ACP")],
 }
 
 
@@ -4197,7 +4253,7 @@ def _default_object_acl_xml() -> bytes:
     )
 
 
-def _get_object_acl(bucket_name: str, key: str):
+def _get_object_acl(bucket_name: str, key: str, query_params: dict | None = None):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
@@ -4209,12 +4265,19 @@ def _get_object_acl(bucket_name: str, key: str):
             f"/{bucket_name}/{key}",
         )
 
-    stored = _object_acl.get((bucket_name, key))
+    # ACLs are per-version, like tags: a `?versionId=` reads that version's
+    # ACL, and a version that never had one set reads as the default policy.
+    version_id = _resolve_subresource_version(query_params, bucket, key)
+    stored = _object_acl.get((bucket_name, key, version_id))
     body = stored.encode("utf-8") if stored else _default_object_acl_xml()
-    return 200, {"Content-Type": "application/xml"}, body
+    resp_headers = {"Content-Type": "application/xml"}
+    if version_id:
+        resp_headers["x-amz-version-id"] = version_id
+    return 200, resp_headers, body
 
 
-def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict):
+def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict,
+                    query_params: dict | None = None):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
@@ -4225,6 +4288,10 @@ def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict):
             404,
             f"/{bucket_name}/{key}",
         )
+
+    # A `?versionId=` sets that specific version's ACL; without it the current
+    # version's. Later versions are separate objects and keep their defaults.
+    version_id = _resolve_subresource_version(query_params, bucket, key)
 
     # Canned ACL from x-amz-acl header takes precedence and is mutually
     # exclusive with an XML body per the AWS API reference. Either path
@@ -4235,7 +4302,8 @@ def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict):
         if canned not in _CANNED_OBJECT_ACLS:
             return _error("InvalidArgument",
                           f"Invalid x-amz-acl value: {canned}", 400)
-        _object_acl[(bucket_name, key)] = _canned_acl_policy_xml(canned, get_account_id())
+        _object_acl[(bucket_name, key, version_id)] = (
+            _canned_acl_policy_xml(canned, get_account_id()))
         return 200, {}, b""
 
     if not body:
@@ -4251,7 +4319,7 @@ def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict):
         return _error("MalformedACLError",
                       "The XML you provided was not well-formed or did not validate "
                       "against our published schema.", 400)
-    _object_acl[(bucket_name, key)] = body.decode("utf-8", errors="replace")
+    _object_acl[(bucket_name, key, version_id)] = body.decode("utf-8", errors="replace")
     return 200, {}, b""
 
 
@@ -4642,7 +4710,7 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
             _object_tags.pop((bucket_name, k, None), None)
             _object_retention.pop((bucket_name, k), None)
             _object_legal_hold.pop((bucket_name, k), None)
-            _object_acl.pop((bucket_name, k), None)
+            _object_acl.pop((bucket_name, k, None), None)
             _delete_persisted_object(bucket_name, k)
             deleted.append({"key": k, "version_id": "", "was_marker": False})
 
@@ -4900,6 +4968,15 @@ def _complete_multipart_upload(
             404,
             f"/{bucket_name}/{key}",
         )
+
+    # CompleteMultipartUpload takes the same If-Match / If-None-Match
+    # preconditions PutObject does, evaluated against the current object at
+    # complete time.  (The idempotent replay above deliberately skips them —
+    # the original request already passed its conditions when it committed.)
+    precondition_err = _check_put_preconditions(
+        headers or {}, bucket.get("objects", {}).get(key))
+    if precondition_err:
+        return precondition_err
 
     try:
         xml_root = fromstring(body)

@@ -292,6 +292,20 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"transfer\."],
         "credential_scope": "transfer",
     },
+    # IoT Jobs data plane (iot-jobs-data API) MUST come before "iot-data" and
+    # "iot": its host also matches the `iot\.` regex, so first-match-wins
+    # routing would otherwise swallow it — and on the `iot` control plane
+    # `GET /things/{t}/jobs` is a DIFFERENT operation (ListJobExecutionsForThing)
+    # that answers with a different envelope. The pattern must cover both host
+    # spellings: `DescribeEndpoint(endpointType='iot:Jobs')` hands out
+    # `{prefix}.jobs.iot.{region}.{host}`, while the AWS Device SDK's jobs
+    # topics document `{prefix}.data.jobs.iot.{region}.{host}`. The SDK also
+    # signs with credential scope `iot-jobs-data` (botocore signingName), which
+    # the scope early-return resolves via this key.
+    "iot-jobs-data": {
+        "host_patterns": [r"jobs\.iot\."],
+        "credential_scope": "iot-jobs-data",
+    },
     # IoT data plane (iot-data API) MUST come before "iot" because the host
     # `data-ats.iot.{region}.{host}` matches both `iot\.` and the more
     # specific `data-ats\.iot\.` regexes — first-match-wins routing in
