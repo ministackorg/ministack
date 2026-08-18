@@ -722,14 +722,45 @@ def _build_object_record(body: bytes, headers: dict, etag: str = None,
 
 _S3_CHECKSUM_HEADERS = ("crc32", "crc32c", "crc64nvme", "sha1", "sha256")
 
+# CRC-64/NVME is the algorithm current AWS SDKs and the CLI checksum uploads
+# with by default, so refusing it fails a stock `aws s3 cp` before it starts.
+# It is plain arithmetic — the reflected form of polynomial 0xAD93D23594C93659
+# with all-ones init and xorout — so a byte-at-a-time table keeps it in the
+# stdlib instead of pulling in a native CRC library. Checked against the
+# algorithm's published check value in tests: b"123456789" hashes to
+# 0xAE8B14860A799888.
+_CRC64NVME_POLY = 0x9A6C9329AC4BC9B5
+_CRC64NVME_INIT = 0xFFFFFFFFFFFFFFFF
+
+
+def _build_crc64nvme_table() -> tuple:
+    table = []
+    for byte in range(256):
+        crc = byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ _CRC64NVME_POLY if crc & 1 else crc >> 1
+        table.append(crc)
+    return tuple(table)
+
+
+_CRC64NVME_TABLE = _build_crc64nvme_table()
+
+
+def _crc64nvme(body: bytes) -> int:
+    crc = _CRC64NVME_INIT
+    table = _CRC64NVME_TABLE
+    for byte in body:
+        crc = table[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+    return crc ^ _CRC64NVME_INIT
+
 
 def _compute_s3_checksum(algorithm: str, body: bytes) -> str | None:
     """Return base64-encoded checksum for the given AWS S3 algorithm name.
 
-    Supports SHA256 / SHA1 / CRC32 via stdlib. CRC32C / CRC64NVME require
-    optional native libs (`google-crc32c` / `crc64nvme-py`) that aren't part of
-    the stdlib; we return None for those, and the caller falls back to the
-    client-supplied value (if any) instead of failing the put.
+    SHA256 / SHA1 / CRC32 come from the stdlib and CRC64NVME from the table
+    above. CRC32C is the one left: it needs the optional native `google-crc32c`
+    that isn't bundled, so we return None for it and the caller refuses the
+    request rather than storing a value it could never verify.
     """
     algo = (algorithm or "").upper().replace("_", "")
     if algo == "SHA256":
@@ -739,6 +770,8 @@ def _compute_s3_checksum(algorithm: str, body: bytes) -> str | None:
     if algo == "CRC32":
         crc = zlib.crc32(body) & 0xFFFFFFFF
         return base64.b64encode(struct.pack(">I", crc)).decode()
+    if algo == "CRC64NVME":
+        return base64.b64encode(struct.pack(">Q", _crc64nvme(body))).decode()
     return None
 
 
@@ -753,12 +786,12 @@ def _resolve_object_checksums(body: bytes, headers: dict):
         server-computed value MUST match the supplied one or the request is
         rejected with `BadDigest` (HTTP 400).
 
-    Ministack-specific: CRC32C / CRC64NVME require optional native libraries
-    that the "no new dependencies" rule forbids us from adding. Rather than
-    silently accept an unverifiable checksum (which would round-trip on Get
-    without ever being validated against the body — a worse failure mode than
-    refusing the request), we reject the put with a clear error. SHA256 / SHA1
-    / CRC32 work end-to-end.
+    Ministack-specific: CRC32C requires an optional native library that the
+    "no new dependencies" rule forbids us from adding. Rather than silently
+    accept an unverifiable checksum (which would round-trip on Get without ever
+    being validated against the body — a worse failure mode than refusing the
+    request), we reject the put with a clear error. SHA256 / SHA1 / CRC32 /
+    CRC64NVME work end-to-end.
 
     Returns ``(checksums_dict, error_response_or_None)``.
     """
@@ -782,10 +815,10 @@ def _resolve_object_checksums(body: bytes, headers: dict):
             "InvalidRequest",
             (
                 f"Checksum algorithm not supported in this ministack build: "
-                f"{', '.join(sorted(unverifiable))}. Supported: SHA256, SHA1, CRC32. "
-                f"CRC32C and CRC64NVME require optional native dependencies that "
-                f"ministack does not bundle; use SHA256 instead, or omit the "
-                f"checksum header."
+                f"{', '.join(sorted(unverifiable))}. Supported: SHA256, SHA1, "
+                f"CRC32, CRC64NVME. CRC32C requires an optional native "
+                f"dependency that ministack does not bundle; use CRC64NVME "
+                f"instead, or omit the checksum header."
             ),
             400,
         )

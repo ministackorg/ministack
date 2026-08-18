@@ -3064,8 +3064,10 @@ def _instance_xml(inst):
         </placement>
         <privateDnsName>{inst['PrivateDnsName']}</privateDnsName>
         <privateIpAddress>{inst['PrivateIpAddress']}</privateIpAddress>
-        <publicDnsName>{inst['PublicDnsName']}</publicDnsName>
-        <publicIpAddress>{inst['PublicIpAddress']}</publicIpAddress>
+        <!-- public address wire tags are dnsName/ipAddress (not publicDnsName/
+             publicIpAddress) - the SDKs map those to PublicDnsName/PublicIpAddress -->
+        <dnsName>{inst['PublicDnsName']}</dnsName>
+        <ipAddress>{inst['PublicIpAddress']}</ipAddress>
         <sourceDestCheck>{'true' if inst.get('SourceDestCheck', True) else 'false'}</sourceDestCheck>
         <subnetId>{inst['SubnetId']}</subnetId>
         <vpcId>{inst['VpcId']}</vpcId>
@@ -3600,8 +3602,17 @@ def _new_igw_id():
 
 
 def _random_ip(prefix):
-    sep = "" if prefix.endswith(".") else "."
-    return f"{prefix}{sep}{random.randint(1,254)}.{random.randint(1,254)}"
+    """Random address completing ``prefix`` to four octets.
+
+    Two octets were appended unconditionally, which is right for a two-octet
+    prefix like ``10.0.`` and wrong for a one-octet one: ``_random_ip("52.")``
+    produced ``52.55.218``, which is not an address. Callers hand this straight
+    to ``PublicIp`` on AllocateAddress, so anything parsing the response with
+    ``ipaddress`` or an SDK validator sees a malformed value.
+    """
+    head = [octet for octet in prefix.split(".") if octet]
+    octets = head + [str(random.randint(1, 254)) for _ in range(4 - len(head))]
+    return ".".join(octets)
 
 
 def _now_ts():
