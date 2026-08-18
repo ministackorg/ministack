@@ -6748,8 +6748,8 @@ def test_cfn_apigateway_usage_plan_and_key_lifecycle(cfn, apigw_v1):
 
         plan_id = outputs["PlanRef"]
         assert outputs["PlanGetAtt"] == plan_id
-        # UsagePlanKey Ref is the associated API key id.
-        assert outputs["PlanKeyRef"] == outputs["KeyRef"]
+        # UsagePlanKey Ref is "{keyId}:{usagePlanId}" (the AWS-documented physical id).
+        assert outputs["PlanKeyRef"] == f"{outputs['KeyRef']}:{outputs['PlanRef']}"
 
         plan = apigw_v1.get_usage_plan(usagePlanId=plan_id)
         assert plan["name"] == f"plan-{suffix}"
