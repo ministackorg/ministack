@@ -150,6 +150,28 @@ _SERIAL_TESTS = {
     "tests/test_lambda.py::test_lambda_recursive_loop_allow_lets_the_chain_through",
     "tests/test_lambda.py::test_lambda_recursive_loop_drop_is_recursive_invocation_exception",
     "tests/test_lambda.py::test_lambda_nested_invoke_below_limit_is_unaffected",
+    # DeleteRegistrationCode discards the one code the account/region holds, and
+    # the test asserts the next GetRegistrationCode mints a different one — a
+    # parallel worker calling GetRegistrationCode either side of the delete sees
+    # the code change under it. Same account-global mutation class as above.
+    "tests/test_iot.py::test_iot_registration_code_stable_until_deleted",
+    # IoT topic-rule Lambda-action tests: each creates one Lambda per test,
+    # cold-starts its container, and polls an SQS sink under a bounded timeout.
+    # Same cold-start-burst-under-xdist shape as the apigw Lambda tests above —
+    # they pass serially (~3.5s each) but the tail ones lose the cold start
+    # against _poll_sink's 12s window on the shared CI runner. Surfaced when the
+    # device-shadow work lengthened the test_iot_data.py shard; the tests
+    # themselves are correct, so run them in the serial phase.
+    "tests/test_iot_data.py::test_iot_topic_rule_routes_publish_to_lambda",
+    "tests/test_iot_data.py::test_iot_basic_ingest_routes_to_lambda",
+    "tests/test_iot_data.py::test_iot_disabled_rule_does_not_fire",
+    "tests/test_iot_data.py::test_iot_rule_encode_base64_projection_basic_ingest",
+    "tests/test_iot_data.py::test_iot_rule_encode_base64_projection_topic_filter",
+    "tests/test_iot_data.py::test_iot_rule_attribute_projection",
+    "tests/test_iot_data.py::test_iot_rule_where_clause_gates_dispatch",
+    "tests/test_iot_data.py::test_iot_rule_where_topic_function_under_basic_ingest",
+    "tests/test_iot_data.py::test_iot_rule_where_or_clause_dispatches_either_branch",
+    "tests/test_iot_data.py::test_iot_jitr_registration_event_drives_a_topic_rule",
 }
 
 
@@ -445,6 +467,11 @@ def iot_client():
 @pytest.fixture(scope="session")
 def iot_data_client():
     return make_client("iot-data")
+
+
+@pytest.fixture(scope="session")
+def iot_jobs_data():
+    return make_client("iot-jobs-data")
 
 
 @pytest.fixture(scope="session")

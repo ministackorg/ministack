@@ -164,21 +164,28 @@ def test_s3_put_object_if_none_match_etag(s3):
 
 
 def test_s3_put_object_if_match_star_requires_existing(s3):
-    """If-Match: * succeeds when an object exists, fails when none does."""
+    """If-Match: * succeeds when an object exists, 404s when none does.
+
+    The missing-key answer is NoSuchKey — not the RFC 7232 412 — for the "*"
+    form just like the ETag form: AWS documents one If-Match error row for a
+    key that doesn't exist, and ceph/s3-tests pins 404 for both forms.
+    https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html#conditional-error-response
+    """
     bucket = "intg-s3-ifm-star"
     s3.create_bucket(Bucket=bucket)
 
     def _add_ifm_star(request, **_kwargs):
         request.headers["If-Match"] = "*"
 
-    # No existing object → 412.
+    # No existing object → 404 NoSuchKey.
     s3.meta.events.register_first("before-send.s3.PutObject", _add_ifm_star)
     try:
         with pytest.raises(ClientError) as exc:
             s3.put_object(Bucket=bucket, Key="missing.txt", Body=b"x")
     finally:
         s3.meta.events.unregister("before-send.s3.PutObject", _add_ifm_star)
-    assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+    assert exc.value.response["Error"]["Code"] == "NoSuchKey"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
 
     # Now create it, then If-Match: * succeeds.
     s3.put_object(Bucket=bucket, Key="present.txt", Body=b"a")
@@ -241,6 +248,65 @@ def test_s3_put_object_if_match_etag_missing_object_returns_404(s3):
 
     assert exc.value.response["Error"]["Code"] == "NoSuchKey"
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+# ─── Conditional CompleteMultipartUpload (If-Match / If-None-Match) ──────────
+# Unlike PutObject, botocore models IfMatch/IfNoneMatch on
+# CompleteMultipartUpload directly, so no header-injection hack is needed.
+
+def _mpu_complete(s3, bucket, key, body=b"part-data", **conditions):
+    """Run a full multipart upload for `key`, completing with `conditions`."""
+    mp = s3.create_multipart_upload(Bucket=bucket, Key=key)
+    part = s3.upload_part(Bucket=bucket, Key=key, UploadId=mp["UploadId"],
+                          PartNumber=1, Body=body)
+    return s3.complete_multipart_upload(
+        Bucket=bucket, Key=key, UploadId=mp["UploadId"],
+        MultipartUpload={"Parts": [{"ETag": part["ETag"], "PartNumber": 1}]},
+        **conditions)
+
+
+def test_s3_complete_multipart_if_none_match_star(s3):
+    """If-None-Match: * on CompleteMultipartUpload is create-once: the first
+    complete lands, a second over the existing key fails 412 and must not
+    overwrite the object."""
+    bucket = "intg-s3-mpu-ifnm-star"
+    s3.create_bucket(Bucket=bucket)
+
+    _mpu_complete(s3, bucket, "obj", body=b"first", IfNoneMatch="*")
+    with pytest.raises(ClientError) as exc:
+        _mpu_complete(s3, bucket, "obj", body=b"second", IfNoneMatch="*")
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+    assert s3.get_object(Bucket=bucket, Key="obj")["Body"].read() == b"first"
+
+
+def test_s3_complete_multipart_if_match_etag(s3):
+    """If-Match on CompleteMultipartUpload succeeds against the current ETag
+    and fails 412 against a stale one."""
+    bucket = "intg-s3-mpu-ifm-etag"
+    s3.create_bucket(Bucket=bucket)
+    etag = s3.put_object(Bucket=bucket, Key="obj", Body=b"v1")["ETag"]
+
+    _mpu_complete(s3, bucket, "obj", body=b"v2", IfMatch=etag)
+    assert s3.get_object(Bucket=bucket, Key="obj")["Body"].read() == b"v2"
+
+    with pytest.raises(ClientError) as exc:
+        _mpu_complete(s3, bucket, "obj", body=b"v3", IfMatch=etag)  # now stale
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+    assert s3.get_object(Bucket=bucket, Key="obj")["Body"].read() == b"v2"
+
+
+def test_s3_complete_multipart_if_match_missing_key_404(s3):
+    """If-Match on CompleteMultipartUpload against a missing key is 404
+    NoSuchKey — for the "*" form as well as the ETag form, like PutObject."""
+    bucket = "intg-s3-mpu-ifm-missing"
+    s3.create_bucket(Bucket=bucket)
+
+    for cond in ("*", '"00000000000000000000000000000000"'):
+        with pytest.raises(ClientError) as exc:
+            _mpu_complete(s3, bucket, "absent", IfMatch=cond)
+        assert exc.value.response["Error"]["Code"] == "NoSuchKey"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
 
 def test_s3_put_get_json_chunked(s3):
     """AWS SDK v2 sends PutObject with chunked Transfer-Encoding — body must be decoded cleanly."""
@@ -2301,6 +2367,152 @@ def test_s3_multipart_upload_returns_version_id(s3):
     assert latest[0]["VersionId"] == resp2["VersionId"]
 
 
+def test_s3_versioning_suspended_null_version(s3):
+    """A PUT on a Suspended bucket is the "null" version: the response carries
+    no VersionId, an overwrite replaces the null version rather than stacking
+    a new one, and DeleteObject(VersionId='null') removes it."""
+    bkt = "s3-ver-susp"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Suspended"})
+
+    resp = s3.put_object(Bucket=bkt, Key="k", Body=b"one")
+    assert "VersionId" not in resp
+    s3.put_object(Bucket=bkt, Key="k", Body=b"two")
+
+    versions = s3.list_object_versions(Bucket=bkt).get("Versions", [])
+    assert [(v["VersionId"], v["IsLatest"]) for v in versions] == [("null", True)]
+    assert s3.get_object(Bucket=bkt, Key="k", VersionId="null")["Body"].read() == b"two"
+
+    s3.delete_object(Bucket=bkt, Key="k", VersionId="null")
+    assert "Versions" not in s3.list_object_versions(Bucket=bkt)
+    s3.delete_bucket(Bucket=bkt)
+
+
+def test_s3_versioning_preserves_pre_versioning_null(s3):
+    """An object written before versioning was enabled stays addressable as
+    the "null" version once versioned writes land on top, and becomes current
+    again when the newer version is deleted."""
+    bkt = "s3-ver-null-keep"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="k", Body=b"fooz")
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+
+    v2 = s3.put_object(Bucket=bkt, Key="k", Body=b"zzz")["VersionId"]
+    assert s3.get_object(Bucket=bkt, Key="k")["Body"].read() == b"zzz"
+    assert s3.get_object(Bucket=bkt, Key="k", VersionId="null")["Body"].read() == b"fooz"
+
+    s3.delete_object(Bucket=bkt, Key="k", VersionId=v2)
+    assert s3.get_object(Bucket=bkt, Key="k")["Body"].read() == b"fooz"
+
+    s3.delete_object(Bucket=bkt, Key="k", VersionId="null")
+    with pytest.raises(ClientError) as exc:
+        s3.get_object(Bucket=bkt, Key="k")
+    assert exc.value.response["Error"]["Code"] == "NoSuchKey"
+    assert "Versions" not in s3.list_object_versions(Bucket=bkt)
+    s3.delete_bucket(Bucket=bkt)
+
+
+def test_s3_delete_marker_signals(s3):
+    """A delete on a versioned bucket reports its marker: DeleteMarker on the
+    DELETE response, x-amz-delete-marker on the subsequent 404, and the
+    literal "null" marker id when versioning is Suspended."""
+    bkt = "s3-ver-marker"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+    s3.put_object(Bucket=bkt, Key="k", Body=b"x")
+
+    resp = s3.delete_object(Bucket=bkt, Key="k")
+    assert resp["DeleteMarker"] is True
+    assert resp["VersionId"]
+
+    with pytest.raises(ClientError) as exc:
+        s3.head_object(Bucket=bkt, Key="k")
+    headers = exc.value.response["ResponseMetadata"]["HTTPHeaders"]
+    assert headers.get("x-amz-delete-marker") == "true"
+
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Suspended"})
+    s3.put_object(Bucket=bkt, Key="k2", Body=b"x")
+    resp = s3.delete_object(Bucket=bkt, Key="k2")
+    assert resp["DeleteMarker"] is True
+    assert resp["VersionId"] == "null"
+
+
+def test_s3_batch_delete_creates_marker(s3):
+    """DeleteObjects without a VersionId on a versioned bucket creates a
+    delete marker — for a key that never existed too — and reports it under
+    DeleteMarker / DeleteMarkerVersionId, as AWS does."""
+    bkt = "s3-ver-batch-marker"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+
+    resp = s3.delete_objects(Bucket=bkt, Delete={"Objects": [{"Key": "never"}]})
+    deleted = resp["Deleted"][0]
+    assert deleted["DeleteMarker"] is True
+    marker_id = deleted["DeleteMarkerVersionId"]
+
+    markers = s3.list_object_versions(Bucket=bkt)["DeleteMarkers"]
+    assert [m["VersionId"] for m in markers] == [marker_id]
+
+
+def test_s3_upload_part_copy_versioned_source(s3):
+    """UploadPartCopy with a source VersionId copies that version's bytes,
+    not the current object's, and echoes x-amz-copy-source-version-id."""
+    bkt = "s3-ver-partcopy"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+    v1 = s3.put_object(Bucket=bkt, Key="src", Body=b"a" * 1024)["VersionId"]
+    s3.put_object(Bucket=bkt, Key="src", Body=b"b" * 1024)
+
+    mpu = s3.create_multipart_upload(Bucket=bkt, Key="dst")
+    part = s3.upload_part_copy(
+        Bucket=bkt, Key="dst", UploadId=mpu["UploadId"], PartNumber=1,
+        CopySource={"Bucket": bkt, "Key": "src", "VersionId": v1})
+    assert part["CopySourceVersionId"] == v1
+    s3.complete_multipart_upload(
+        Bucket=bkt, Key="dst", UploadId=mpu["UploadId"],
+        MultipartUpload={"Parts": [
+            {"ETag": part["CopyPartResult"]["ETag"], "PartNumber": 1}]})
+    assert s3.get_object(Bucket=bkt, Key="dst")["Body"].read() == b"a" * 1024
+
+
+def test_s3_copy_versioned_source_keeps_metadata(s3):
+    """CopyObject with a source VersionId carries that version's user
+    metadata, like a current-object copy does."""
+    bkt = "s3-ver-copy-meta"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+    v1 = s3.put_object(Bucket=bkt, Key="src", Body=b"m",
+                       Metadata={"foo": "bar"})["VersionId"]
+    s3.put_object(Bucket=bkt, Key="src", Body=b"n")
+
+    s3.copy_object(Bucket=bkt, Key="dst",
+                   CopySource={"Bucket": bkt, "Key": "src", "VersionId": v1})
+    assert s3.head_object(Bucket=bkt, Key="dst")["Metadata"] == {"foo": "bar"}
+
+
+def test_s3_copy_source_key_containing_question_mark(s3):
+    """A source key literally containing "?versionId" arrives percent-encoded
+    and must not be mistaken for a versionId qualifier by CopyObject or
+    UploadPartCopy."""
+    bkt = "s3-ver-qmark"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="?versionId", Body=b"question")
+
+    s3.copy_object(Bucket=bkt, Key="copied", CopySource={"Bucket": bkt, "Key": "?versionId"})
+    assert s3.get_object(Bucket=bkt, Key="copied")["Body"].read() == b"question"
+
+    mpu = s3.create_multipart_upload(Bucket=bkt, Key="dst")
+    part = s3.upload_part_copy(
+        Bucket=bkt, Key="dst", UploadId=mpu["UploadId"], PartNumber=1,
+        CopySource={"Bucket": bkt, "Key": "?versionId"})
+    s3.complete_multipart_upload(
+        Bucket=bkt, Key="dst", UploadId=mpu["UploadId"],
+        MultipartUpload={"Parts": [
+            {"ETag": part["CopyPartResult"]["ETag"], "PartNumber": 1}]})
+    assert s3.get_object(Bucket=bkt, Key="dst")["Body"].read() == b"question"
+
+
 def test_s3_copy_object_returns_version_id(s3):
     """CopyObject should return VersionId and track versions when versioning is enabled."""
     bkt = "s3-ver-copy"
@@ -2454,6 +2666,75 @@ def test_s3_bucket_acl(s3):
     resp = s3.get_bucket_acl(Bucket="intg-s3-acl")
     assert "Owner" in resp
     assert "Grants" in resp
+
+def test_s3_bucket_acl_canned(s3):
+    """Canned x-amz-acl on CreateBucket and PutBucketAcl round-trips as the
+    grants it implies. SDKs send the canned value as a header with an empty
+    body, which used to be dropped, so `--acl public-read` read back as
+    owner-only."""
+    import uuid as _u
+    bucket = f"acl-bkt-canned-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket, ACL="public-read")
+    grants = s3.get_bucket_acl(Bucket=bucket)["Grants"]
+    assert len(grants) == 2
+    group = [g for g in grants if g["Grantee"]["Type"] == "Group"]
+    assert group[0]["Grantee"]["URI"].endswith("global/AllUsers")
+    assert group[0]["Permission"] == "READ"
+
+    s3.put_bucket_acl(Bucket=bucket, ACL="public-read-write")
+    grants = s3.get_bucket_acl(Bucket=bucket)["Grants"]
+    perms = {g["Permission"] for g in grants if g["Grantee"]["Type"] == "Group"}
+    assert perms == {"READ", "WRITE"}
+
+    s3.put_bucket_acl(Bucket=bucket, ACL="private")
+    grants = s3.get_bucket_acl(Bucket=bucket)["Grants"]
+    assert len(grants) == 1
+    assert grants[0]["Permission"] == "FULL_CONTROL"
+    s3.delete_bucket(Bucket=bucket)
+
+def test_s3_put_bucket_acl_invalid_canned(s3):
+    """Invalid x-amz-acl values are rejected with InvalidArgument (400)."""
+    import uuid as _u
+    bucket = f"acl-bkt-bad-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    with pytest.raises(ClientError) as exc:
+        s3.put_bucket_acl(Bucket=bucket, ACL="not-a-real-canned-acl")
+    assert exc.value.response["Error"]["Code"] == "InvalidArgument"
+    s3.delete_bucket(Bucket=bucket)
+
+def test_s3_put_bucket_acl_xml_body(s3):
+    """A well-formed AccessControlPolicy XML body is accepted and round-trips."""
+    import uuid as _u
+    bucket = f"acl-bkt-xml-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_acl(
+        Bucket=bucket,
+        AccessControlPolicy={
+            "Owner": {"ID": "test-owner-id", "DisplayName": "tester"},
+            "Grants": [
+                {
+                    "Grantee": {
+                        "Type": "CanonicalUser",
+                        "ID": "test-owner-id",
+                        "DisplayName": "tester",
+                    },
+                    "Permission": "FULL_CONTROL",
+                },
+                {
+                    "Grantee": {
+                        "Type": "Group",
+                        "URI": "http://acs.amazonaws.com/groups/global/AllUsers",
+                    },
+                    "Permission": "READ",
+                },
+            ],
+        },
+    )
+    acl = s3.get_bucket_acl(Bucket=bucket)
+    assert acl["Owner"]["ID"] == "test-owner-id"
+    perms = sorted(g["Permission"] for g in acl["Grants"])
+    assert perms == ["FULL_CONTROL", "READ"]
+    s3.delete_bucket(Bucket=bucket)
 
 def test_s3_range_suffix(s3):
     """Range: bytes=-N returns last N bytes."""
@@ -3718,6 +3999,81 @@ def test_s3_put_object_acl_xml_body(s3):
     s3.delete_bucket(Bucket=bucket)
 
 
+def test_s3_object_acl_per_version(s3):
+    """Object ACLs are per-version, like tags: `?versionId=` targets that
+    version, and a later version is a separate object that starts from the
+    default ACL while the addressed version keeps what was set."""
+    import uuid as _u
+    bucket = f"acl-ver-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(
+        Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+    v1 = s3.put_object(Bucket=bucket, Key="k", Body=b"one")["VersionId"]
+    s3.put_object(Bucket=bucket, Key="k", Body=b"two")
+
+    s3.put_object_acl(Bucket=bucket, Key="k", VersionId=v1, ACL="public-read")
+
+    acl = s3.get_object_acl(Bucket=bucket, Key="k", VersionId=v1)
+    assert any(g["Grantee"].get("URI", "").endswith("global/AllUsers")
+               for g in acl["Grants"])
+    # The current version is a different object and keeps its default.
+    assert len(s3.get_object_acl(Bucket=bucket, Key="k")["Grants"]) == 1
+
+    # A fresh version starts from the default; v1 keeps what was set.
+    s3.put_object(Bucket=bucket, Key="k", Body=b"three")
+    assert len(s3.get_object_acl(Bucket=bucket, Key="k")["Grants"]) == 1
+    acl = s3.get_object_acl(Bucket=bucket, Key="k", VersionId=v1)
+    assert any(g["Grantee"].get("URI", "").endswith("global/AllUsers")
+               for g in acl["Grants"])
+
+    for v in s3.list_object_versions(Bucket=bucket).get("Versions", []):
+        s3.delete_object(Bucket=bucket, Key=v["Key"], VersionId=v["VersionId"])
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_put_object_canned_acl_versioned(s3):
+    """x-amz-acl on PutObject sticks to the version that PUT created."""
+    import uuid as _u
+    bucket = f"acl-put-ver-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(
+        Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+    v1 = s3.put_object(
+        Bucket=bucket, Key="k", Body=b"one", ACL="public-read")["VersionId"]
+    assert len(s3.get_object_acl(Bucket=bucket, Key="k")["Grants"]) == 2
+
+    s3.put_object(Bucket=bucket, Key="k", Body=b"two")
+    assert len(s3.get_object_acl(Bucket=bucket, Key="k")["Grants"]) == 1
+    acl = s3.get_object_acl(Bucket=bucket, Key="k", VersionId=v1)
+    assert len(acl["Grants"]) == 2
+
+    for v in s3.list_object_versions(Bucket=bucket).get("Versions", []):
+        s3.delete_object(Bucket=bucket, Key=v["Key"], VersionId=v["VersionId"])
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_post_object_acl_field(s3):
+    """The POST form names its canned-ACL field `acl`; it applies to the
+    uploaded object like x-amz-acl does on PutObject."""
+    import uuid as _u
+
+    import requests
+    bucket = f"acl-post-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    post = s3.generate_presigned_post(
+        Bucket=bucket, Key="k",
+        Fields={"acl": "public-read"},
+        Conditions=[{"acl": "public-read"}],
+    )
+    r = requests.post(post["url"], data=post["fields"], files={"file": ("k", b"x")})
+    assert r.status_code == 204
+    grants = s3.get_object_acl(Bucket=bucket, Key="k")["Grants"]
+    assert any(g["Grantee"].get("URI", "").endswith("global/AllUsers")
+               for g in grants)
+    s3.delete_object(Bucket=bucket, Key="k")
+    s3.delete_bucket(Bucket=bucket)
+
+
 def test_s3_put_object_with_sha256_checksum_roundtrips(s3):
     """PutObject + ChecksumAlgorithm=SHA256 must be retrievable via
     GetObject(ChecksumMode='ENABLED'). Issue #831."""
@@ -3876,6 +4232,126 @@ def test_s3_put_object_with_crc32_checksum_roundtrips(s3):
     assert got["ChecksumCRC32"] == expected
 
     s3.delete_object(Bucket=bucket, Key="k")
+    s3.delete_bucket(Bucket=bucket)
+
+
+# CRC-64/NVME's published check value: the checksum of b"123456789". The tests
+# below assert against it so the server is pinned to the specification rather
+# than to its own implementation.
+_CRC64NVME_CHECK = 0xAE8B14860A799888
+
+
+def _crc64nvme_bitwise(data: bytes) -> int:
+    """Bit-at-a-time CRC-64/NVME, independent of the server's table."""
+    crc = 0xFFFFFFFFFFFFFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0x9A6C9329AC4BC9B5 if crc & 1 else crc >> 1
+    return crc ^ 0xFFFFFFFFFFFFFFFF
+
+
+def _put_with_checksum(bucket: str, key: str, body: bytes, headers: dict):
+    """PUT over raw HTTP, the way the CLI sends a checksummed upload.
+
+    boto3 can only compute CRC-64/NVME when the optional `awscrt` package is
+    installed, so these tests build the headers themselves rather than making
+    the suite depend on it.
+    """
+    import urllib.request
+    req = urllib.request.Request(
+        f"{ENDPOINT}/{bucket}/{key}", data=body, method="PUT", headers=headers)
+    return urllib.request.urlopen(req)
+
+
+def _head_checksum(bucket: str, key: str, algorithm: str):
+    import urllib.request
+    req = urllib.request.Request(
+        f"{ENDPOINT}/{bucket}/{key}", method="HEAD",
+        headers={"x-amz-checksum-mode": "ENABLED"})
+    with urllib.request.urlopen(req) as r:
+        return r.headers.get(f"x-amz-checksum-{algorithm}"), r.headers.get("x-amz-checksum-type")
+
+
+def test_s3_put_object_with_crc64nvme_checksum_roundtrips(s3):
+    """CRC-64/NVME is the algorithm current SDKs and the CLI checksum uploads
+    with by default, so a stock `aws s3 cp` fails outright unless the server
+    computes it. It is plain arithmetic and needs no native library."""
+    import base64
+    import struct
+
+    bucket = "checksum-crc64nvme-bucket"
+    s3.create_bucket(Bucket=bucket)
+    body = b"123456789"
+    expected = base64.b64encode(struct.pack(">Q", _CRC64NVME_CHECK)).decode()
+
+    with _put_with_checksum(bucket, "k", body,
+                            {"x-amz-sdk-checksum-algorithm": "CRC64NVME"}) as r:
+        assert r.status == 200
+
+    value, csum_type = _head_checksum(bucket, "k", "crc64nvme")
+    assert value == expected
+    assert csum_type == "FULL_OBJECT"
+    assert s3.get_object(Bucket=bucket, Key="k")["Body"].read() == body
+
+    s3.delete_object(Bucket=bucket, Key="k")
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_crc64nvme_matches_bitwise_reference_over_long_body(s3):
+    """The server's table-driven CRC must agree with a bit-at-a-time reference
+    over a body long enough to reach every table entry."""
+    import base64
+    import struct
+
+    # A wrong reference must not be able to rubber-stamp a wrong server.
+    assert _crc64nvme_bitwise(b"123456789") == _CRC64NVME_CHECK
+
+    bucket = "checksum-crc64nvme-long-bucket"
+    s3.create_bucket(Bucket=bucket)
+    body = bytes(range(256)) * 40 + b"tail"
+    expected = base64.b64encode(struct.pack(">Q", _crc64nvme_bitwise(body))).decode()
+
+    with _put_with_checksum(bucket, "k", body,
+                            {"x-amz-sdk-checksum-algorithm": "CRC64NVME"}) as r:
+        assert r.status == 200
+
+    value, _ = _head_checksum(bucket, "k", "crc64nvme")
+    assert value == expected
+
+    s3.delete_object(Bucket=bucket, Key="k")
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_put_object_with_explicit_crc64nvme_value_validated(s3):
+    """A client-supplied CRC-64/NVME must match the server-computed one, so the
+    algorithm is verified rather than echoed back unchecked."""
+    import base64
+    import struct
+    import urllib.error
+
+    bucket = "checksum-crc64nvme-validate-bucket"
+    s3.create_bucket(Bucket=bucket)
+    body = b"123456789"
+    good = base64.b64encode(struct.pack(">Q", _CRC64NVME_CHECK)).decode()
+    bad = base64.b64encode(struct.pack(">Q", _CRC64NVME_CHECK ^ 0xFF)).decode()
+
+    with _put_with_checksum(bucket, "ok", body, {
+        "x-amz-sdk-checksum-algorithm": "CRC64NVME",
+        "x-amz-checksum-crc64nvme": good,
+    }) as r:
+        assert r.status == 200
+    assert _head_checksum(bucket, "ok", "crc64nvme")[0] == good
+
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _put_with_checksum(bucket, "bad", body, {
+            "x-amz-sdk-checksum-algorithm": "CRC64NVME",
+            "x-amz-checksum-crc64nvme": bad,
+        })
+    assert exc.value.code == 400
+    assert b"BadDigest" in exc.value.read()
+
+    s3.delete_object(Bucket=bucket, Key="ok")
     s3.delete_bucket(Bucket=bucket)
 
 
@@ -4363,6 +4839,151 @@ def test_s3_copy_object_source_date_preconditions(s3):
     with pytest.raises(ClientError) as e3:
         copy(CopySourceIfNoneMatch=src_etag, CopySourceIfModifiedSince=past)
     assert e3.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+
+
+def _conditional_read_bucket(s3):
+    """A bucket holding one object, with its ETag and Last-Modified."""
+    bkt = f"cond-read-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    etag = s3.put_object(Bucket=bkt, Key="obj", Body=b"payload")["ETag"]
+    mtime = s3.head_object(Bucket=bkt, Key="obj")["LastModified"]
+    return bkt, etag, mtime
+
+
+def test_s3_get_object_etag_preconditions(s3):
+    """GetObject answers If-Match and If-None-Match instead of always returning
+    the body: a stale If-Match is 412, and a current If-None-Match is 304."""
+    bkt, etag, _ = _conditional_read_bucket(s3)
+
+    # The condition holds -> the read proceeds as normal.
+    assert s3.get_object(Bucket=bkt, Key="obj", IfMatch=etag)["Body"].read() == b"payload"
+    assert s3.get_object(Bucket=bkt, Key="obj", IfMatch="*")["Body"].read() == b"payload"
+    assert s3.get_object(Bucket=bkt, Key="obj", IfNoneMatch='"ABCORZ"')["Body"].read() == b"payload"
+
+    # If-Match against some other representation -> 412, nothing transferred.
+    with pytest.raises(ClientError) as e:
+        s3.get_object(Bucket=bkt, Key="obj", IfMatch='"ABCORZ"')
+    assert e.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+    assert e.value.response["Error"]["Code"] == "PreconditionFailed"
+
+    # If-None-Match naming the current representation -> the caller's copy is
+    # current, so 304 and no body. The ETag confirms which one they revalidated.
+    for value in (etag, "*", f'"nomatch", {etag}', f"W/{etag}"):
+        with pytest.raises(ClientError) as e2:
+            s3.get_object(Bucket=bkt, Key="obj", IfNoneMatch=value)
+        resp = e2.value.response
+        assert resp["ResponseMetadata"]["HTTPStatusCode"] == 304, value
+        assert resp["ResponseMetadata"]["HTTPHeaders"]["etag"] == etag, value
+
+
+def test_s3_get_object_date_preconditions(s3):
+    """GetObject answers If-Modified-Since and If-Unmodified-Since: unchanged
+    since the caller's timestamp is 304, changed after it is 412."""
+    from datetime import timedelta
+
+    bkt, etag, mtime = _conditional_read_bucket(s3)
+    before = mtime - timedelta(days=1)
+    after = mtime + timedelta(seconds=1)
+
+    # Modified since a day ago (true) and unmodified since a second from now
+    # (true) both leave the read alone.
+    assert s3.get_object(Bucket=bkt, Key="obj", IfModifiedSince=before)["Body"].read() == b"payload"
+    assert s3.get_object(Bucket=bkt, Key="obj", IfUnmodifiedSince=after)["Body"].read() == b"payload"
+
+    # Not modified since a second from now -> 304.
+    with pytest.raises(ClientError) as e:
+        s3.get_object(Bucket=bkt, Key="obj", IfModifiedSince=after)
+    assert e.value.response["ResponseMetadata"]["HTTPStatusCode"] == 304
+    assert e.value.response["ResponseMetadata"]["HTTPHeaders"]["etag"] == etag
+
+    # Modified since a day ago -> the If-Unmodified-Since condition fails -> 412.
+    with pytest.raises(ClientError) as e2:
+        s3.get_object(Bucket=bkt, Key="obj", IfUnmodifiedSince=before)
+    assert e2.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+    assert e2.value.response["Error"]["Code"] == "PreconditionFailed"
+
+
+def test_s3_read_precondition_precedence(s3):
+    """An entity tag beats its date counterpart, per RFC 9110 13.2.2 and the AWS
+    GetObject reference: the date header applies only when the tag is absent."""
+    from datetime import timedelta
+
+    bkt, etag, mtime = _conditional_read_bucket(s3)
+    before = mtime - timedelta(days=1)
+    after = mtime + timedelta(seconds=1)
+
+    # If-Match holds, so the failing If-Unmodified-Since is not consulted -> 200.
+    resp = s3.get_object(Bucket=bkt, Key="obj", IfMatch=etag, IfUnmodifiedSince=before)
+    assert resp["Body"].read() == b"payload"
+
+    # If-None-Match matches, so the satisfied If-Modified-Since is not
+    # consulted -> 304 rather than the body.
+    with pytest.raises(ClientError) as e:
+        s3.get_object(Bucket=bkt, Key="obj", IfNoneMatch=etag, IfModifiedSince=before)
+    assert e.value.response["ResponseMetadata"]["HTTPStatusCode"] == 304
+
+    # The tag is consulted even when it does not decide the read: a present
+    # If-None-Match that misses suppresses If-Modified-Since outright, so the
+    # body comes back although that date alone would have meant 304.
+    resp = s3.get_object(Bucket=bkt, Key="obj", IfNoneMatch='"ABCORZ"', IfModifiedSince=after)
+    assert resp["Body"].read() == b"payload"
+
+
+def test_s3_head_object_preconditions(s3):
+    """HeadObject evaluates the same four conditions as GetObject."""
+    from datetime import timedelta
+
+    bkt, etag, mtime = _conditional_read_bucket(s3)
+
+    assert s3.head_object(Bucket=bkt, Key="obj", IfMatch=etag)["ETag"] == etag
+
+    with pytest.raises(ClientError) as e:
+        s3.head_object(Bucket=bkt, Key="obj", IfMatch='"ABCORZ"')
+    assert e.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+
+    with pytest.raises(ClientError) as e2:
+        s3.head_object(Bucket=bkt, Key="obj", IfNoneMatch=etag)
+    assert e2.value.response["ResponseMetadata"]["HTTPStatusCode"] == 304
+
+    with pytest.raises(ClientError) as e3:
+        s3.head_object(Bucket=bkt, Key="obj", IfUnmodifiedSince=mtime - timedelta(days=1))
+    assert e3.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+
+
+def test_s3_not_modified_carries_no_payload(s3):
+    """Checked on the wire, not through boto3: a 304 ends at the header section
+    and can never carry a body (RFC 9110 15.4.5), so it must not describe one
+    either. A stray body would desynchronise the next request on the connection."""
+    import http.client
+
+    bkt, etag, _ = _conditional_read_bucket(s3)
+    parsed = urlparse(ENDPOINT)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 4566, timeout=10)
+    # Checksum mode is on, as boto3 turns it on by default, so the checksum
+    # headers below are ones the 200 really would have carried.
+    conn.request("GET", f"/{bkt}/obj",
+                 headers={"If-None-Match": etag, "x-amz-checksum-mode": "ENABLED"})
+    resp = conn.getresponse()
+    body = resp.read()
+
+    assert resp.status == 304
+    assert body == b""
+    assert resp.getheader("ETag") == etag
+    assert resp.getheader("Last-Modified")
+    for absent in ("Content-Type", "Content-Encoding", "Accept-Ranges"):
+        assert resp.getheader(absent) is None, absent
+    assert (resp.getheader("Content-Length") or "0") == "0"
+    # A checksum of bytes that were not sent belongs to no one: boto3 asks for
+    # these by default and chokes on the empty body if it gets one back.
+    assert not [h for h, _ in resp.getheaders() if h.lower().startswith("x-amz-checksum-")]
+
+    # The connection is still usable, which is the point of getting the framing
+    # right: a second request on it reads its own response.
+    conn.request("GET", f"/{bkt}/obj")
+    second = conn.getresponse()
+    assert second.status == 200
+    assert second.read() == b"payload"
+    conn.close()
 
 
 def test_s3_canned_acl_expands_to_group_grants(s3):

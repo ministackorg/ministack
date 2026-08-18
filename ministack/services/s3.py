@@ -84,7 +84,7 @@ _bucket_accelerate_config = AccountScopedDict()
 _bucket_request_payment_config = AccountScopedDict()
 
 _object_tags = AccountScopedDict()
-_object_acl = AccountScopedDict()  # (bucket, key) -> stored ACL XML string
+_object_acl = AccountScopedDict()  # (bucket, key, version_id) -> stored ACL XML string
 _object_versions = AccountScopedDict()  # (bucket, key) -> [{version_id, obj_record}, ...]
 
 _bucket_object_lock = AccountScopedDict()
@@ -436,9 +436,10 @@ def _validate_content_md5(headers: dict, body: bytes):
 
 
 def _check_put_preconditions(headers: dict, existing_obj: dict | None):
-    """Evaluate `If-Match` and `If-None-Match` on PUT.
+    """Evaluate `If-Match` and `If-None-Match` on a conditional write.
 
-    AWS S3 added native conditional writes on PutObject in November 2024:
+    AWS S3 added native conditional writes — on PutObject and
+    CompleteMultipartUpload alike — in November 2024:
       - `If-None-Match: "*"` — succeed only when no object exists at the key.
         Used to implement create-once semantics (idempotent writes, distributed
         leader election via S3, two-file pair serialization).
@@ -448,8 +449,9 @@ def _check_put_preconditions(headers: dict, existing_obj: dict | None):
       - `If-Match: "<etag>"` — succeed only when the existing object's ETag
         matches.
 
-    Returns a 412 PreconditionFailed tuple when a condition is violated;
-    otherwise returns None and the caller proceeds with the PUT.
+    Returns an error tuple when a condition is violated — 412
+    PreconditionFailed, except that If-Match against a missing key is 404
+    NoSuchKey — otherwise returns None and the caller proceeds with the write.
 
     ETag comparison strips surrounding quotes on both sides — S3 stores ETags
     with quotes but client code is inconsistent about including them.
@@ -482,32 +484,113 @@ def _check_put_preconditions(headers: dict, existing_obj: dict | None):
             )
 
     if if_match:
-        # "*" form: any existing object satisfies the condition; missing → 412 per RFC 7232.
-        # (AWS docs don't explicitly document If-Match:* for PutObject, but the inverse case
-        # is well-defined by RFC and real S3 follows it.)
-        if if_match == "*":
-            if existing_obj is None:
-                return _error(
-                    "PreconditionFailed",
-                    "At least one of the pre-conditions you specified did not hold",
-                    412,
-                )
-        elif existing_obj is None:
-            # AWS S3 specifically returns 404 (NoSuchKey) — not 412 — when If-Match: <etag>
-            # targets a key that doesn't exist (or whose current version is a delete marker).
-            # Documented under "Conditional write behavior" in the user guide:
+        if existing_obj is None:
+            # AWS S3 specifically returns 404 (NoSuchKey) — not the RFC 7232
+            # 412 — when If-Match targets a key that doesn't exist (or whose
+            # current version is a delete marker), for the "*" form as well as
+            # the ETag form.  Documented under "Conditional write behavior" in
+            # the user guide:
             # https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html#conditional-error-response
             return _error(
                 "NoSuchKey",
                 "The specified key does not exist.",
                 404,
             )
-        elif if_match.strip('"') != existing_etag:
+        if if_match != "*" and if_match.strip('"') != existing_etag:
             return _error(
                 "PreconditionFailed",
                 "At least one of the pre-conditions you specified did not hold",
                 412,
             )
+
+    return None
+
+
+def _etag_condition_matches(field_value: str, etag: str) -> bool:
+    """Whether an `If-Match`/`If-None-Match` field value selects this object.
+
+    The value is a comma-separated list of entity tags, or `*` for "any
+    representation" — which is always satisfied here, since the caller has
+    already resolved the object. A weak tag compares equal to its strong form:
+    S3 only ever mints strong ETags, and If-None-Match uses the weak comparison
+    anyway (RFC 9110 13.1.2). `etag` is expected unquoted.
+    """
+    if field_value == "*":
+        return True
+    for candidate in field_value.split(","):
+        candidate = candidate.strip()
+        if candidate[:2].upper() == "W/":
+            candidate = candidate[2:]
+        if candidate.strip('"') == etag:
+            return True
+    return False
+
+
+def _not_modified(resp_headers: dict):
+    """A 304 for a read whose caller already holds the current representation.
+
+    Keeps the validators the 200 would have carried — the ETag above all, which
+    is how the client confirms which representation it just revalidated — and
+    drops the headers that describe a payload, since a 304 ends at the header
+    section and can never carry one (RFC 9110 15.4.5).
+    """
+    payload_headers = {
+        "content-length", "content-type", "content-encoding", "accept-ranges",
+    }
+
+    def describes_payload(name: str) -> bool:
+        lowered = name.lower()
+        # x-amz-checksum-* is a checksum of bytes this response does not carry.
+        # boto3 asks for them by default and, seeing one, wraps the body in a
+        # validating stream it then cannot parse — the same hazard that keeps
+        # them off a 206 partial response.
+        return lowered in payload_headers or lowered.startswith("x-amz-checksum-")
+
+    return (
+        304,
+        {k: v for k, v in resp_headers.items() if not describes_payload(k)},
+        b"",
+    )
+
+
+def _check_read_preconditions(headers: dict, obj: dict, resp_headers: dict):
+    """Evaluate the four conditional-read headers on GetObject/HeadObject.
+
+    Returns a finished response tuple — 412 PreconditionFailed when the request
+    asked for a representation this object no longer is, or 304 Not Modified
+    when the caller's copy is still current — otherwise None, and the read
+    proceeds normally. Answering conditional reads is what lets caches, `curl
+    -z`, and every "download only if it changed" client avoid refetching a body
+    they already have.
+
+    Precedence follows RFC 9110 13.2.2 and the AWS GetObject reference: the
+    entity-tag header wins over its date counterpart, so If-Unmodified-Since is
+    consulted only without If-Match, and If-Modified-Since only without
+    If-None-Match.
+    """
+    _precond_msg = "At least one of the pre-conditions you specified did not hold"
+    etag = (obj.get("etag") or "").strip('"')
+    mtime = _object_mtime_dt(obj)
+
+    if_match = (headers.get("if-match") or "").strip()
+    if if_match:
+        if not _etag_condition_matches(if_match, etag):
+            return _error("PreconditionFailed", _precond_msg, 412)
+    else:
+        unmod = _parse_http_date(headers.get("if-unmodified-since", ""))
+        # "Unmodified since" fails when the object was written after that time.
+        if unmod and mtime and mtime > unmod:
+            return _error("PreconditionFailed", _precond_msg, 412)
+
+    if_none_match = (headers.get("if-none-match") or "").strip()
+    if if_none_match:
+        if _etag_condition_matches(if_none_match, etag):
+            return _not_modified(resp_headers)
+    else:
+        mod = _parse_http_date(headers.get("if-modified-since", ""))
+        # Not modified since that time means the caller's copy is still current.
+        if mod and mtime and mtime <= mod:
+            return _not_modified(resp_headers)
 
     return None
 
@@ -633,14 +716,45 @@ def _build_object_record(body: bytes, headers: dict, etag: str = None,
 
 _S3_CHECKSUM_HEADERS = ("crc32", "crc32c", "crc64nvme", "sha1", "sha256")
 
+# CRC-64/NVME is the algorithm current AWS SDKs and the CLI checksum uploads
+# with by default, so refusing it fails a stock `aws s3 cp` before it starts.
+# It is plain arithmetic — the reflected form of polynomial 0xAD93D23594C93659
+# with all-ones init and xorout — so a byte-at-a-time table keeps it in the
+# stdlib instead of pulling in a native CRC library. Checked against the
+# algorithm's published check value in tests: b"123456789" hashes to
+# 0xAE8B14860A799888.
+_CRC64NVME_POLY = 0x9A6C9329AC4BC9B5
+_CRC64NVME_INIT = 0xFFFFFFFFFFFFFFFF
+
+
+def _build_crc64nvme_table() -> tuple:
+    table = []
+    for byte in range(256):
+        crc = byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ _CRC64NVME_POLY if crc & 1 else crc >> 1
+        table.append(crc)
+    return tuple(table)
+
+
+_CRC64NVME_TABLE = _build_crc64nvme_table()
+
+
+def _crc64nvme(body: bytes) -> int:
+    crc = _CRC64NVME_INIT
+    table = _CRC64NVME_TABLE
+    for byte in body:
+        crc = table[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+    return crc ^ _CRC64NVME_INIT
+
 
 def _compute_s3_checksum(algorithm: str, body: bytes) -> str | None:
     """Return base64-encoded checksum for the given AWS S3 algorithm name.
 
-    Supports SHA256 / SHA1 / CRC32 via stdlib. CRC32C / CRC64NVME require
-    optional native libs (`google-crc32c` / `crc64nvme-py`) that aren't part of
-    the stdlib; we return None for those, and the caller falls back to the
-    client-supplied value (if any) instead of failing the put.
+    SHA256 / SHA1 / CRC32 come from the stdlib and CRC64NVME from the table
+    above. CRC32C is the one left: it needs the optional native `google-crc32c`
+    that isn't bundled, so we return None for it and the caller refuses the
+    request rather than storing a value it could never verify.
     """
     algo = (algorithm or "").upper().replace("_", "")
     if algo == "SHA256":
@@ -650,6 +764,8 @@ def _compute_s3_checksum(algorithm: str, body: bytes) -> str | None:
     if algo == "CRC32":
         crc = zlib.crc32(body) & 0xFFFFFFFF
         return base64.b64encode(struct.pack(">I", crc)).decode()
+    if algo == "CRC64NVME":
+        return base64.b64encode(struct.pack(">Q", _crc64nvme(body))).decode()
     return None
 
 
@@ -664,12 +780,12 @@ def _resolve_object_checksums(body: bytes, headers: dict):
         server-computed value MUST match the supplied one or the request is
         rejected with `BadDigest` (HTTP 400).
 
-    Ministack-specific: CRC32C / CRC64NVME require optional native libraries
-    that the "no new dependencies" rule forbids us from adding. Rather than
-    silently accept an unverifiable checksum (which would round-trip on Get
-    without ever being validated against the body — a worse failure mode than
-    refusing the request), we reject the put with a clear error. SHA256 / SHA1
-    / CRC32 work end-to-end.
+    Ministack-specific: CRC32C requires an optional native library that the
+    "no new dependencies" rule forbids us from adding. Rather than silently
+    accept an unverifiable checksum (which would round-trip on Get without ever
+    being validated against the body — a worse failure mode than refusing the
+    request), we reject the put with a clear error. SHA256 / SHA1 / CRC32 /
+    CRC64NVME work end-to-end.
 
     Returns ``(checksums_dict, error_response_or_None)``.
     """
@@ -693,10 +809,10 @@ def _resolve_object_checksums(body: bytes, headers: dict):
             "InvalidRequest",
             (
                 f"Checksum algorithm not supported in this ministack build: "
-                f"{', '.join(sorted(unverifiable))}. Supported: SHA256, SHA1, CRC32. "
-                f"CRC32C and CRC64NVME require optional native dependencies that "
-                f"ministack does not bundle; use SHA256 instead, or omit the "
-                f"checksum header."
+                f"{', '.join(sorted(unverifiable))}. Supported: SHA256, SHA1, "
+                f"CRC32, CRC64NVME. CRC32C requires an optional native "
+                f"dependency that ministack does not bundle; use CRC64NVME "
+                f"instead, or omit the checksum header."
             ),
             400,
         )
@@ -928,7 +1044,7 @@ def _dispatch(
             if "legal-hold" in query_params:
                 return _get_object_legal_hold(bucket, key)
             if "acl" in query_params:
-                return _get_object_acl(bucket, key)
+                return _get_object_acl(bucket, key, query_params)
             if "attributes" in query_params:
                 return _get_object_attributes(bucket, key, headers, query_params)
             return _get_object(bucket, key, headers, query_params)
@@ -945,7 +1061,7 @@ def _dispatch(
             if "legal-hold" in query_params:
                 return _put_object_legal_hold(bucket, key, body)
             if "acl" in query_params:
-                return _put_object_acl(bucket, key, body, headers)
+                return _put_object_acl(bucket, key, body, headers, query_params)
             if "x-amz-copy-source" in headers:
                 return _copy_object(bucket, key, headers)
             return _put_object(bucket, key, body, headers)
@@ -1044,7 +1160,7 @@ def _dispatch(
         if "cors" in query_params:
             return _put_bucket_cors(bucket, body)
         if "acl" in query_params:
-            return _put_bucket_acl(bucket, body)
+            return _put_bucket_acl(bucket, body, headers)
         if "website" in query_params:
             return _put_bucket_website(bucket, body)
         if "logging" in query_params:
@@ -1131,6 +1247,11 @@ def _create_bucket(name: str, body: bytes, headers: dict = None):
         return _error(
             "InvalidBucketName", "The specified bucket is not valid.", 400, f"/{name}"
         )
+    # A canned ACL supplied at CreateBucket time is validated up front and
+    # stored below, so GetBucketAcl reflects it instead of dropping it.
+    canned_acl = headers.get("x-amz-acl")
+    if canned_acl and canned_acl not in _CANNED_BUCKET_ACLS:
+        return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
     if name in _buckets:
         # Idempotent: same account already owns it — return 200 like real AWS
         return 200, {"Location": f"/{name}"}, b""
@@ -1162,6 +1283,8 @@ def _create_bucket(name: str, body: bytes, headers: dict = None):
     _buckets[name] = {"created": now_iso(), "objects": {}, "region": region}
     if tags:
         _bucket_tags[name] = tags
+    if canned_acl:
+        _bucket_acl[name] = _canned_acl_policy_xml(canned_acl, get_account_id())
 
     if headers.get("x-amz-bucket-object-lock-enabled", "").lower() == "true":
         _bucket_object_lock[name] = {"enabled": True, "default_retention": None}
@@ -1204,6 +1327,8 @@ def _delete_bucket(name: str):
     _bucket_replication.pop(name, None)
     for k in [k for k in _object_tags if k[0] == name]:
         del _object_tags[k]
+    for k in [k for k in _object_acl if k[0] == name]:
+        del _object_acl[k]
     for k in [k for k in _object_retention if k[0] == name]:
         del _object_retention[k]
     for k in [k for k in _object_legal_hold if k[0] == name]:
@@ -1632,11 +1757,39 @@ def _get_bucket_acl(name: str):
     return 200, {"Content-Type": "application/xml"}, body
 
 
-def _put_bucket_acl(name: str, body: bytes):
+def _put_bucket_acl(name: str, body: bytes, headers: dict | None = None):
+    headers = headers or {}
     if name not in _buckets:
         return _no_such_bucket(name)
-    if body:
-        _bucket_acl[name] = body.decode("utf-8", errors="replace")
+
+    # Canned ACL from x-amz-acl header takes precedence and is mutually
+    # exclusive with an XML body per the AWS API reference. SDK callers send
+    # the canned value as a header with an EMPTY body, so ignoring the header
+    # silently dropped every `put-bucket-acl --acl public-read`. Either path
+    # stores the resulting policy XML so GetBucketAcl round-trips the value
+    # the caller set, matching what real AWS would return.
+    canned = headers.get("x-amz-acl")
+    if canned:
+        if canned not in _CANNED_BUCKET_ACLS:
+            return _error("InvalidArgument",
+                          f"Invalid x-amz-acl value: {canned}", 400)
+        _bucket_acl[name] = _canned_acl_policy_xml(canned, get_account_id())
+        return 200, {}, b""
+
+    if not body:
+        return _error("MissingSecurityHeader",
+                      "Your request was missing a required header.", 400)
+    try:
+        # Validate XML well-formedness — real AWS rejects malformed bodies
+        # with MalformedACLError. We don't enforce grantee/permission
+        # semantics on the data plane, so any well-formed AccessControlPolicy
+        # is accepted and round-tripped verbatim.
+        fromstring(body)
+    except Exception:
+        return _error("MalformedACLError",
+                      "The XML you provided was not well-formed or did not validate "
+                      "against our published schema.", 400)
+    _bucket_acl[name] = body.decode("utf-8", errors="replace")
     return 200, {}, b""
 
 
@@ -2512,17 +2665,17 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
         return csum_err
 
     # A canned ACL supplied at PutObject time is validated up front (an invalid
-    # value rejects the whole request, as AWS does) and applied below, so
-    # GetObjectAcl reflects it instead of dropping it. (#1322, rest of defect 9)
+    # value rejects the whole request, as AWS does) and applied below once the
+    # version id is assigned, so GetObjectAcl reflects it instead of dropping
+    # it. (#1322, rest of defect 9)
     canned_acl = headers.get("x-amz-acl")
     if canned_acl and canned_acl not in _CANNED_OBJECT_ACLS:
         return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
 
     etag = f'"{md5_hash(body)}"'
     obj = _build_object_record(body, headers, etag=etag, checksums=checksums)
+    prior_obj = bucket["objects"].get(key)
     bucket["objects"][key] = obj
-    if canned_acl:
-        _object_acl[(bucket_name, key)] = _canned_acl_policy_xml(canned_acl, get_account_id())
 
     # --- Object Lock headers on PutObject ---
     _apply_object_lock_from_headers(bucket_name, key, headers)
@@ -2543,30 +2696,9 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
 
     resp_headers = {"ETag": obj["etag"], "Content-Length": "0"}
     resp_headers.update(_bucket_default_sse_headers(bucket_name))
-    if _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
-        version_id = new_uuid()
-        obj["version_id"] = version_id
+    version_id = _record_object_version(bucket_name, key, prior_obj, obj, body)
+    if version_id:
         resp_headers["x-amz-version-id"] = version_id
-        vkey = (bucket_name, key)
-        if vkey not in _object_versions:
-            _object_versions[vkey] = []
-        _object_versions[vkey].append({
-            "version_id": version_id,
-            "last_modified": obj["last_modified"],
-            "etag": obj["etag"],
-            "size": obj["size"],
-            "is_latest": True,
-            "data": body,
-            "content_type": obj.get("content_type") or "application/octet-stream",
-            "content_encoding": obj.get("content_encoding"),
-            "metadata": obj.get("metadata", {}),
-            "preserved_headers": obj.get("preserved_headers", {}),
-            "storage_class": obj.get("storage_class") or "STANDARD",
-            "checksums": obj.get("checksums") or {},
-        })
-        # Mark all previous versions as not latest
-        for v in _object_versions[vkey][:-1]:
-            v["is_latest"] = False
 
     # Persist only after the versioning block: the .meta.json sidecar must
     # carry the version_id assigned above (#1058).
@@ -2575,6 +2707,9 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
 
     if pending_tags is not None:
         _object_tags[(bucket_name, key, obj.get("version_id"))] = pending_tags
+    if canned_acl:
+        _object_acl[(bucket_name, key, obj.get("version_id"))] = (
+            _canned_acl_policy_xml(canned_acl, get_account_id()))
     return 200, resp_headers, b""
 
 
@@ -2726,13 +2861,21 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
               "x-amz-object-lock-legal-hold"):
         if h in fields:
             synth[h] = fields[h]
+    # The POST form names its canned-ACL field `acl` (not `x-amz-acl`).
+    if "acl" in fields:
+        synth["x-amz-acl"] = fields["acl"]
 
     _, sc_err = _resolve_storage_class(synth)
     if sc_err:
         return sc_err
 
+    canned_acl = synth.get("x-amz-acl")
+    if canned_acl and canned_acl not in _CANNED_OBJECT_ACLS:
+        return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
+
     etag = f'"{md5_hash(file_value)}"'
     obj = _build_object_record(file_value, synth, etag=etag)
+    prior_obj = bucket["objects"].get(key)
     bucket["objects"][key] = obj
     _apply_object_lock_from_headers(bucket_name, key, synth)
 
@@ -2748,28 +2891,7 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
         bucket_name, key, "s3:ObjectCreated:Post", size=obj["size"], etag=etag
     )
 
-    version_id = None
-    if _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
-        version_id = new_uuid()
-        obj["version_id"] = version_id
-        vkey = (bucket_name, key)
-        if vkey not in _object_versions:
-            _object_versions[vkey] = []
-        _object_versions[vkey].append({
-            "version_id": version_id,
-            "last_modified": obj["last_modified"],
-            "etag": etag,
-            "size": obj["size"],
-            "is_latest": True,
-            "data": file_value,
-            "content_type": obj.get("content_type") or "application/octet-stream",
-            "content_encoding": obj.get("content_encoding"),
-            "metadata": obj.get("metadata", {}),
-            "preserved_headers": obj.get("preserved_headers", {}),
-            "storage_class": obj.get("storage_class") or "STANDARD",
-        })
-        for v in _object_versions[vkey][:-1]:
-            v["is_latest"] = False
+    version_id = _record_object_version(bucket_name, key, prior_obj, obj, file_value)
 
     # Persist only after the versioning block: the .meta.json sidecar must
     # carry the version_id assigned above (#1058).
@@ -2778,6 +2900,9 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
 
     if pending_tags is not None:
         _object_tags[(bucket_name, key, version_id)] = pending_tags
+    if canned_acl:
+        _object_acl[(bucket_name, key, version_id)] = (
+            _canned_acl_policy_xml(canned_acl, get_account_id()))
 
     location = f"http://{bucket_name}.s3.amazonaws.com/{url_quote(key, safe='/')}"
     base_resp = {"ETag": etag, "Location": location}
@@ -2866,6 +2991,14 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
         return err
 
     version_id = _qp(query_params, "versionId", "")
+    if version_id == "null" and not any(
+            v["version_id"] == "null"
+            for v in _object_versions.get((bucket_name, key), [])):
+        # The literal "null" addresses the pre-versioning object; before any
+        # versioned write records it in the index, that is the current object.
+        obj = bucket["objects"].get(key)
+        if obj is not None and not obj.get("version_id"):
+            version_id = ""
     if version_id:
         vkey = (bucket_name, key)
         versions = _object_versions.get(vkey, [])
@@ -2881,6 +3014,9 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
                 resp_headers = _object_response_headers(
                     vobj, bucket_name, key, include_checksums=include_checksums)
                 resp_headers.update(_object_tagging_count_header(bucket_name, key, version_id))
+                precondition = _check_read_preconditions(headers, vobj, resp_headers)
+                if precondition is not None:
+                    return precondition
                 body = v.get("data")
                 if body is None:
                     body = _read_body(bucket_name, key, bucket["objects"].get(key, {}))
@@ -2888,12 +3024,15 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
         return _error("NoSuchVersion", "The specified version does not exist.", 404, f"/{bucket_name}/{key}")
 
     if key not in bucket["objects"]:
-        return _error(
+        status, err_headers, err_body = _error(
             "NoSuchKey",
             "The specified key does not exist.",
             404,
             f"/{bucket_name}/{key}",
         )
+        # A key hidden by a delete marker announces the marker on its 404.
+        err_headers.update(_delete_marker_404_headers(bucket_name, key))
+        return status, err_headers, err_body
 
     obj = bucket["objects"][key]
     range_header = headers.get("range", "")
@@ -2906,6 +3045,13 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
     resp_headers = _object_response_headers(obj, bucket_name, key,
                                             include_checksums=include_checksums)
     resp_headers.update(_object_tagging_count_header(bucket_name, key, obj.get("version_id")))
+
+    # Evaluated before the range and partNumber slicing below: a failed
+    # precondition preempts the read entirely, and a 304 describes the whole
+    # representation the caller already has, not the slice they asked for.
+    precondition = _check_read_preconditions(headers, obj, resp_headers)
+    if precondition is not None:
+        return precondition
 
     body = _read_body(bucket_name, key, obj)
 
@@ -3077,6 +3223,14 @@ def _head_object(bucket_name: str, key: str, headers: dict | None = None,
     # A `?versionId=` selects a specific version's metadata, matching AWS
     # HeadObject(VersionId); without it, the current object is used.
     version_id = _qp(query_params, "versionId", "")
+    if version_id == "null" and not any(
+            v["version_id"] == "null"
+            for v in _object_versions.get((bucket_name, key), [])):
+        # The literal "null" addresses the pre-versioning object; before any
+        # versioned write records it in the index, that is the current object.
+        obj = bucket["objects"].get(key)
+        if obj is not None and not obj.get("version_id"):
+            version_id = ""
     if version_id:
         ventry = next(
             (v for v in _object_versions.get((bucket_name, key), [])
@@ -3093,12 +3247,15 @@ def _head_object(bucket_name: str, key: str, headers: dict | None = None,
         obj = _object_record_from_version(ventry)
     else:
         if key not in bucket["objects"]:
-            return _error(
+            status, err_headers, err_body = _error(
                 "NoSuchKey",
                 "The specified key does not exist.",
                 404,
                 f"/{bucket_name}/{key}",
             )
+            # A key hidden by a delete marker announces the marker on its 404.
+            err_headers.update(_delete_marker_404_headers(bucket_name, key))
+            return status, err_headers, err_body
         obj = bucket["objects"][key]
 
     include_checksums = (headers.get("x-amz-checksum-mode") or "").upper() == "ENABLED"
@@ -3106,6 +3263,9 @@ def _head_object(bucket_name: str, key: str, headers: dict | None = None,
                                             include_checksums=include_checksums)
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
+    precondition = _check_read_preconditions(headers, obj, resp_headers)
+    if precondition is not None:
+        return precondition
     return 200, resp_headers, b""
 
 
@@ -3115,7 +3275,7 @@ def _purge_current_object(bucket_name: str, key: str, bucket: dict):
     _object_tags.pop((bucket_name, key, None), None)
     _object_retention.pop((bucket_name, key), None)
     _object_legal_hold.pop((bucket_name, key), None)
-    _object_acl.pop((bucket_name, key), None)
+    _object_acl.pop((bucket_name, key, None), None)
     _delete_persisted_object(bucket_name, key)
 
 
@@ -3137,8 +3297,114 @@ def _object_record_from_version(v: dict) -> dict:
         "preserved_headers": v.get("preserved_headers", {}),
         "storage_class": v.get("storage_class") or "STANDARD",
         "checksums": v.get("checksums") or {},
-        "version_id": v["version_id"],
+        # The "null" version promotes to a current object WITHOUT a version
+        # id, the same shape a pre-versioning object has — per-version tags
+        # and subresources key it as None, and the literal "null" is only a
+        # wire-level name for it.
+        "version_id": None if v["version_id"] == "null" else v["version_id"],
     }
+
+
+def _version_entry_from_record(obj: dict, version_id: str, data) -> dict:
+    """A version-index entry projected from a current-object record."""
+    return {
+        "version_id": version_id,
+        "last_modified": obj["last_modified"],
+        "etag": obj["etag"],
+        "size": obj["size"],
+        "is_latest": False,
+        "data": data,
+        "content_type": obj.get("content_type") or "application/octet-stream",
+        "content_encoding": obj.get("content_encoding"),
+        "metadata": obj.get("metadata", {}),
+        "preserved_headers": obj.get("preserved_headers", {}),
+        "storage_class": obj.get("storage_class") or "STANDARD",
+        "checksums": obj.get("checksums") or {},
+        "parts": obj.get("parts"),
+    }
+
+
+def _preserve_null_version(bucket_name: str, key: str, versions: list,
+                           prior_obj: dict | None):
+    """Keep the pre-versioning object addressable as the "null" version.
+
+    An object written before versioning was enabled has no version id; the
+    first versioned write (or delete marker) that lands on top of it must
+    leave it in the version index under VersionId "null" rather than silently
+    discarding it — AWS keeps the null version in the stack."""
+    if prior_obj is None or prior_obj.get("version_id"):
+        return
+    if any(v["version_id"] == "null" for v in versions):
+        return
+    versions.append(_version_entry_from_record(
+        prior_obj, "null", _read_body(bucket_name, key, prior_obj)))
+
+
+def _record_object_version(bucket_name: str, key: str, prior_obj: dict | None,
+                           obj: dict, data) -> str | None:
+    """Version bookkeeping for a write landing at `key`.
+
+    An Enabled bucket mints a new version id; a Suspended bucket stores the
+    write as the "null" version, REPLACING any previous null version, and
+    answers without x-amz-version-id — so this returns the id to put on the
+    response, or None for unversioned and suspended writes.  `prior_obj` is
+    the current-object record the write displaced (captured before the
+    overwrite), preserved as the null version when it predates versioning."""
+    versioning = _bucket_versioning.get(bucket_name)
+    if versioning not in ("Enabled", "Suspended"):
+        return None
+    vkey = (bucket_name, key)
+    versions = _object_versions.setdefault(vkey, [])
+    if versioning == "Enabled":
+        _preserve_null_version(bucket_name, key, versions, prior_obj)
+        version_id = new_uuid()
+        obj["version_id"] = version_id
+    else:
+        version_id = "null"
+        versions[:] = [v for v in versions if v["version_id"] != "null"]
+    entry = _version_entry_from_record(obj, version_id, data)
+    entry["is_latest"] = True
+    for v in versions:
+        v["is_latest"] = False
+    versions.append(entry)
+    return version_id if versioning == "Enabled" else None
+
+
+def _record_delete_marker(bucket_name: str, key: str,
+                          prior_obj: dict | None) -> str:
+    """Append a delete marker per the bucket's versioning state and return its
+    version id: a fresh id on Enabled, the literal "null" on Suspended — where
+    the marker REPLACES any existing null version, as AWS does."""
+    vkey = (bucket_name, key)
+    versions = _object_versions.setdefault(vkey, [])
+    if _bucket_versioning.get(bucket_name) == "Enabled":
+        _preserve_null_version(bucket_name, key, versions, prior_obj)
+        marker_id = new_uuid()
+    else:
+        marker_id = "null"
+        versions[:] = [v for v in versions if v["version_id"] != "null"]
+    for v in versions:
+        v["is_latest"] = False
+    versions.append({
+        "version_id": marker_id,
+        "last_modified": now_iso(),
+        "etag": "",
+        "size": 0,
+        "is_latest": True,
+        "is_delete_marker": True,
+    })
+    return marker_id
+
+
+def _delete_marker_404_headers(bucket_name: str, key: str) -> dict:
+    """Headers a 404 for `key` must carry when its current version is a delete
+    marker: AWS marks the miss with x-amz-delete-marker and the marker's id."""
+    versions = _object_versions.get((bucket_name, key)) or []
+    latest = versions[-1] if versions else None
+    if latest is not None and latest.get("is_delete_marker") and latest.get("is_latest"):
+        return {"x-amz-delete-marker": "true",
+                "x-amz-version-id": latest["version_id"]}
+    return {}
 
 
 def _delete_object_version(bucket: dict, bucket_name: str, key: str,
@@ -3154,8 +3420,11 @@ def _delete_object_version(bucket: dict, bucket_name: str, key: str,
 
     # No tracked history: the only addressable version is the current object,
     # exposed under the "null" id (objects put before versioning was enabled).
+    # The guard on version_id matters: "null" only addresses a current object
+    # that actually IS the null version — one without a version id of its own.
     if not versions:
-        if version_id == "null" and key in bucket["objects"]:
+        if (version_id == "null" and key in bucket["objects"]
+                and not bucket["objects"][key].get("version_id")):
             _purge_current_object(bucket_name, key, bucket)
             return True, False
         return False, False
@@ -3164,15 +3433,17 @@ def _delete_object_version(bucket: dict, bucket_name: str, key: str,
         (i for i, v in enumerate(versions) if v["version_id"] == version_id), None
     )
     if idx is None:
-        if version_id == "null" and key in bucket["objects"]:
+        if (version_id == "null" and key in bucket["objects"]
+                and not bucket["objects"][key].get("version_id")):
             _purge_current_object(bucket_name, key, bucket)
             return True, False
         return False, False
 
     removed = versions.pop(idx)
     was_delete_marker = bool(removed.get("is_delete_marker"))
-    # Per-version tags travel with the version being removed.
+    # Per-version tags and ACLs travel with the version being removed.
     _object_tags.pop((bucket_name, key, version_id), None)
+    _object_acl.pop((bucket_name, key, version_id), None)
 
     if not versions:
         # History is now empty — drop the index entry and the current object.
@@ -3242,21 +3513,8 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None,
     versioning = _bucket_versioning.get(bucket_name, "")
     if versioning in ("Enabled", "Suspended"):
         # Add a delete marker instead of removing version history
-        delete_marker_id = new_uuid()
-        vkey = (bucket_name, key)
-        if vkey not in _object_versions:
-            _object_versions[vkey] = []
-        # Mark all previous versions as not latest
-        for v in _object_versions[vkey]:
-            v["is_latest"] = False
-        _object_versions[vkey].append({
-            "version_id": delete_marker_id,
-            "last_modified": now_iso(),
-            "etag": "",
-            "size": 0,
-            "is_latest": True,
-            "is_delete_marker": True,
-        })
+        delete_marker_id = _record_delete_marker(
+            bucket_name, key, bucket["objects"].get(key))
         existed = key in bucket["objects"]
         bucket["objects"].pop(key, None)
         if existed:
@@ -3270,7 +3528,7 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None,
     _object_tags.pop((bucket_name, key, None), None)
     _object_retention.pop((bucket_name, key), None)
     _object_legal_hold.pop((bucket_name, key), None)
-    _object_acl.pop((bucket_name, key), None)
+    _object_acl.pop((bucket_name, key, None), None)
     _delete_persisted_object(bucket_name, key)
 
     if existed:
@@ -3337,8 +3595,12 @@ def _object_mtime_dt(obj: dict):
 
 
 def _copy_object(bucket_name: str, dest_key: str, headers: dict):
-    source = url_unquote(headers.get("x-amz-copy-source", "").lstrip("/"))
-    src_path, _, src_query = source.partition("?")
+    # Split the raw header at "?" before percent-decoding: a key legitimately
+    # containing "?versionId" arrives encoded (%3FversionId) and must stay
+    # part of the key, while a real versionId qualifier arrives as a bare "?".
+    raw_source = headers.get("x-amz-copy-source", "").lstrip("/")
+    raw_path, _, src_query = raw_source.partition("?")
+    src_path = url_unquote(raw_path)
     src_parts = src_path.split("/", 1)
     if len(src_parts) < 2:
         return _error(
@@ -3377,13 +3639,18 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
                 404,
                 f"/{src_bucket_name}/{src_key}",
             )
-        # Synthesize a source object from the stored version. Per-version user
-        # metadata isn't retained, so a COPY metadata-directive carries none.
+        # Synthesize a source object from the stored version — the index keeps
+        # the body plus the wire metadata, so a COPY metadata-directive carries
+        # the version's user metadata and headers like a current-object copy.
         src_obj = {
             "body": ventry.get("data", b""),
             "etag": ventry["etag"],
             "size": ventry["size"],
+            "last_modified": ventry["last_modified"],
             "content_type": ventry.get("content_type") or "application/octet-stream",
+            "content_encoding": ventry.get("content_encoding"),
+            "metadata": ventry.get("metadata", {}),
+            "preserved_headers": ventry.get("preserved_headers", {}),
             "storage_class": ventry.get("storage_class") or "STANDARD",
             "checksums": ventry.get("checksums") or {},
             "version_id": src_version_id,
@@ -3479,6 +3746,7 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         "storage_class": dest_sc,
         "checksums": dest_checksums,
     }
+    dest_prior_obj = dest_bucket["objects"].get(dest_key)
     dest_bucket["objects"][dest_key] = dest_obj
 
     # --- Resolve tag payload now; commit after dest version_id is assigned
@@ -3524,29 +3792,10 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         resp_headers["x-amz-copy-source-version-id"] = copy_src_vid
     if dest_sc != "STANDARD":
         resp_headers["x-amz-storage-class"] = dest_sc
-    if _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
-        version_id = new_uuid()
-        dest_obj["version_id"] = version_id
+    version_id = _record_object_version(
+        bucket_name, dest_key, dest_prior_obj, dest_obj, src_body)
+    if version_id:
         resp_headers["x-amz-version-id"] = version_id
-        vkey = (bucket_name, dest_key)
-        if vkey not in _object_versions:
-            _object_versions[vkey] = []
-        _object_versions[vkey].append({
-            "version_id": version_id,
-            "last_modified": dest_obj["last_modified"],
-            "etag": dest_obj["etag"],
-            "size": dest_obj["size"],
-            "is_latest": True,
-            "data": src_body,
-            "content_type": dest_obj.get("content_type") or "application/octet-stream",
-            "content_encoding": dest_obj.get("content_encoding"),
-            "metadata": dest_obj.get("metadata", {}),
-            "preserved_headers": dest_obj.get("preserved_headers", {}),
-            "storage_class": dest_obj.get("storage_class") or "STANDARD",
-            "checksums": dest_obj.get("checksums") or {},
-        })
-        for v in _object_versions[vkey][:-1]:
-            v["is_latest"] = False
 
     # Persist only after the versioning block: the .meta.json sidecar must
     # carry the version_id assigned above (#1058).
@@ -3570,13 +3819,13 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
 # ---------------------------------------------------------------------------
 
 
-def _resolve_tagging_version(query_params: dict, bucket: dict, key: str):
-    """Resolve the (key, version_id) pair an Object Tagging op should act on.
+def _resolve_subresource_version(query_params: dict, bucket: dict, key: str):
+    """Resolve the (key, version_id) pair an object subresource op acts on.
 
-    Per AWS, object tags are per-version: when ``?versionId=`` is present the
-    op targets that specific version; otherwise it targets the current object.
-    The literal ``versionId=null`` means the pre-versioning object (stored as
-    ``None`` in our key tuple)."""
+    Per AWS, object tags and ACLs are per-version: when ``?versionId=`` is
+    present the op targets that specific version; otherwise it targets the
+    current object. The literal ``versionId=null`` means the pre-versioning
+    object (stored as ``None`` in our key tuple)."""
     vid = _qp(query_params or {}, "versionId", "")
     if vid:
         return None if vid == "null" else vid
@@ -3596,7 +3845,7 @@ def _get_object_tagging(bucket_name: str, key: str, query_params: dict | None = 
             f"/{bucket_name}/{key}",
         )
 
-    version_id = _resolve_tagging_version(query_params, bucket, key)
+    version_id = _resolve_subresource_version(query_params, bucket, key)
     tags = _object_tags.get((bucket_name, key, version_id), {})
     root = Element("Tagging", xmlns=S3_NS)
     tag_set = SubElement(root, "TagSet")
@@ -3629,7 +3878,7 @@ def _put_object_tagging(
         return _error("MalformedXML", "The XML you provided was not well-formed", 400)
     if len(tags) > 10:
         return _error("BadRequest", "Object tags cannot be greater than 10", 400)
-    version_id = _resolve_tagging_version(query_params, bucket, key)
+    version_id = _resolve_subresource_version(query_params, bucket, key)
     _object_tags[(bucket_name, key, version_id)] = tags
     resp_headers = {"Content-Type": "application/xml"}
     if version_id:
@@ -3650,7 +3899,7 @@ def _delete_object_tagging(
             404,
             f"/{bucket_name}/{key}",
         )
-    version_id = _resolve_tagging_version(query_params, bucket, key)
+    version_id = _resolve_subresource_version(query_params, bucket, key)
     _object_tags.pop((bucket_name, key, version_id), None)
     resp_headers = {}
     if version_id:
@@ -3928,9 +4177,20 @@ _CANNED_OBJECT_ACLS = {
     "bucket-owner-full-control",
 }
 
+# Canned ACLs accepted by CreateBucket / PutBucketAcl `x-amz-acl`: the object
+# set minus the object-only variants, plus log-delivery-write (bucket-only).
+_CANNED_BUCKET_ACLS = {
+    "private",
+    "public-read",
+    "public-read-write",
+    "authenticated-read",
+    "log-delivery-write",
+}
+
 
 _ACL_GROUP_ALL_USERS = "http://acs.amazonaws.com/groups/global/AllUsers"
 _ACL_GROUP_AUTH_USERS = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers"
+_ACL_GROUP_LOG_DELIVERY = "http://acs.amazonaws.com/groups/s3/LogDelivery"
 
 # Group grants each canned ACL adds on top of the owner's FULL_CONTROL, per the
 # AWS S3 "Canned ACL" reference. The bucket-owner-* / aws-exec-read variants add
@@ -3940,6 +4200,7 @@ _CANNED_ACL_GROUP_GRANTS = {
     "public-read": [(_ACL_GROUP_ALL_USERS, "READ")],
     "public-read-write": [(_ACL_GROUP_ALL_USERS, "READ"), (_ACL_GROUP_ALL_USERS, "WRITE")],
     "authenticated-read": [(_ACL_GROUP_AUTH_USERS, "READ")],
+    "log-delivery-write": [(_ACL_GROUP_LOG_DELIVERY, "WRITE"), (_ACL_GROUP_LOG_DELIVERY, "READ_ACP")],
 }
 
 
@@ -3992,7 +4253,7 @@ def _default_object_acl_xml() -> bytes:
     )
 
 
-def _get_object_acl(bucket_name: str, key: str):
+def _get_object_acl(bucket_name: str, key: str, query_params: dict | None = None):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
@@ -4004,12 +4265,19 @@ def _get_object_acl(bucket_name: str, key: str):
             f"/{bucket_name}/{key}",
         )
 
-    stored = _object_acl.get((bucket_name, key))
+    # ACLs are per-version, like tags: a `?versionId=` reads that version's
+    # ACL, and a version that never had one set reads as the default policy.
+    version_id = _resolve_subresource_version(query_params, bucket, key)
+    stored = _object_acl.get((bucket_name, key, version_id))
     body = stored.encode("utf-8") if stored else _default_object_acl_xml()
-    return 200, {"Content-Type": "application/xml"}, body
+    resp_headers = {"Content-Type": "application/xml"}
+    if version_id:
+        resp_headers["x-amz-version-id"] = version_id
+    return 200, resp_headers, body
 
 
-def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict):
+def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict,
+                    query_params: dict | None = None):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
@@ -4020,6 +4288,10 @@ def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict):
             404,
             f"/{bucket_name}/{key}",
         )
+
+    # A `?versionId=` sets that specific version's ACL; without it the current
+    # version's. Later versions are separate objects and keep their defaults.
+    version_id = _resolve_subresource_version(query_params, bucket, key)
 
     # Canned ACL from x-amz-acl header takes precedence and is mutually
     # exclusive with an XML body per the AWS API reference. Either path
@@ -4030,7 +4302,8 @@ def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict):
         if canned not in _CANNED_OBJECT_ACLS:
             return _error("InvalidArgument",
                           f"Invalid x-amz-acl value: {canned}", 400)
-        _object_acl[(bucket_name, key)] = _canned_acl_policy_xml(canned, get_account_id())
+        _object_acl[(bucket_name, key, version_id)] = (
+            _canned_acl_policy_xml(canned, get_account_id()))
         return 200, {}, b""
 
     if not body:
@@ -4046,7 +4319,7 @@ def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict):
         return _error("MalformedACLError",
                       "The XML you provided was not well-formed or did not validate "
                       "against our published schema.", 400)
-    _object_acl[(bucket_name, key)] = body.decode("utf-8", errors="replace")
+    _object_acl[(bucket_name, key, version_id)] = body.decode("utf-8", errors="replace")
     return 200, {}, b""
 
 
@@ -4423,13 +4696,21 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
                 bucket, bucket_name, k, version_id
             )
             deleted.append({"key": k, "version_id": version_id, "was_marker": was_marker})
+        elif _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
+            # No VersionId on a versioned bucket: create a delete marker —
+            # even for a key that never existed — exactly as the single-object
+            # DELETE does, and report it on the Deleted entry.
+            marker_id = _record_delete_marker(bucket_name, k, bucket["objects"].get(k))
+            bucket["objects"].pop(k, None)
+            deleted.append({"key": k, "version_id": "", "was_marker": False,
+                            "marker_created": marker_id})
         else:
             # No VersionId → plain delete of the current object.
             bucket["objects"].pop(k, None)
             _object_tags.pop((bucket_name, k, None), None)
             _object_retention.pop((bucket_name, k), None)
             _object_legal_hold.pop((bucket_name, k), None)
-            _object_acl.pop((bucket_name, k), None)
+            _object_acl.pop((bucket_name, k, None), None)
             _delete_persisted_object(bucket_name, k)
             deleted.append({"key": k, "version_id": "", "was_marker": False})
 
@@ -4444,6 +4725,10 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
                 if d["was_marker"]:
                     SubElement(el, "DeleteMarker").text = "true"
                     SubElement(el, "DeleteMarkerVersionId").text = d["version_id"]
+            elif d.get("marker_created"):
+                # A versionless delete on a versioned bucket minted a marker.
+                SubElement(el, "DeleteMarker").text = "true"
+                SubElement(el, "DeleteMarkerVersionId").text = d["marker_created"]
     for e in errors:
         el = SubElement(resp, "Error")
         SubElement(el, "Key").text = e["key"]
@@ -4562,8 +4847,12 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
     if upload_id not in _multipart_uploads:
         return _error("NoSuchUpload", "The specified multipart upload does not exist.", 404)
 
-    source = url_unquote(headers.get("x-amz-copy-source", "").lstrip("/"))
-    src_parts = source.split("?", 1)[0].split("/", 1)
+    # Split the raw header at "?" before percent-decoding, exactly as
+    # CopyObject does: a key containing "?versionId" arrives encoded and must
+    # stay part of the key, while a real versionId qualifier is a bare "?".
+    raw_source = headers.get("x-amz-copy-source", "").lstrip("/")
+    raw_path, _, src_query = raw_source.partition("?")
+    src_parts = url_unquote(raw_path).split("/", 1)
     if len(src_parts) < 2:
         return _error("InvalidArgument", "Copy Source must mention the source bucket and key", 400)
 
@@ -4571,11 +4860,35 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
     src_bucket = _ensure_bucket(src_bucket_name)
     if src_bucket is None:
         return _no_such_bucket(src_bucket_name)
-    if src_key not in src_bucket["objects"]:
-        return _error("NoSuchKey", "The specified key does not exist.", 404)
 
-    src_obj = src_bucket["objects"][src_key]
-    src_body = _read_body(src_bucket_name, src_key, src_obj)
+    # A `?versionId=` on the copy source selects the exact version to copy the
+    # range from, not the current object.
+    src_version_id = None
+    if src_query:
+        src_version_id = _parse_qs(src_query, keep_blank_values=True).get(
+            "versionId", [None]
+        )[0]
+
+    if src_version_id:
+        ventry = next(
+            (v for v in _object_versions.get((src_bucket_name, src_key), [])
+             if v["version_id"] == src_version_id),
+            None,
+        )
+        if ventry is None or ventry.get("is_delete_marker"):
+            return _error(
+                "NoSuchVersion",
+                "The specified version does not exist.",
+                404,
+                f"/{src_bucket_name}/{src_key}",
+            )
+        src_body = ventry.get("data") or b""
+    else:
+        if src_key not in src_bucket["objects"]:
+            return _error("NoSuchKey", "The specified key does not exist.", 404)
+        src_obj = src_bucket["objects"][src_key]
+        src_version_id = src_obj.get("version_id")
+        src_body = _read_body(src_bucket_name, src_key, src_obj)
 
     # Handle x-amz-copy-source-range
     copy_range = headers.get("x-amz-copy-source-range", "")
@@ -4619,7 +4932,11 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
     root = Element("CopyPartResult", xmlns=S3_NS)
     SubElement(root, "ETag").text = etag
     SubElement(root, "LastModified").text = now_iso()
-    return 200, {"Content-Type": "application/xml"}, _xml_body(root)
+    resp_headers = {"Content-Type": "application/xml"}
+    if src_version_id:
+        # AWS echoes the copied source version on a versioned source.
+        resp_headers["x-amz-copy-source-version-id"] = src_version_id
+    return 200, resp_headers, _xml_body(root)
 
 
 def _complete_multipart_upload(
@@ -4651,6 +4968,15 @@ def _complete_multipart_upload(
             404,
             f"/{bucket_name}/{key}",
         )
+
+    # CompleteMultipartUpload takes the same If-Match / If-None-Match
+    # preconditions PutObject does, evaluated against the current object at
+    # complete time.  (The idempotent replay above deliberately skips them —
+    # the original request already passed its conditions when it committed.)
+    precondition_err = _check_put_preconditions(
+        headers or {}, bucket.get("objects", {}).get(key))
+    if precondition_err:
+        return precondition_err
 
     try:
         xml_root = fromstring(body)
@@ -4719,6 +5045,7 @@ def _complete_multipart_upload(
         "storage_class": upload.get("storage_class") or "STANDARD",
         "parts": part_records,
     }
+    prior_obj = bucket["objects"].get(key)
     bucket["objects"][key] = obj
 
     del _multipart_uploads[upload_id]
@@ -4732,28 +5059,9 @@ def _complete_multipart_upload(
     )
 
     resp_headers = {"Content-Type": "application/xml"}
-    if _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
-        version_id = new_uuid()
-        obj["version_id"] = version_id
+    version_id = _record_object_version(bucket_name, key, prior_obj, obj, combined)
+    if version_id:
         resp_headers["x-amz-version-id"] = version_id
-        vkey = (bucket_name, key)
-        if vkey not in _object_versions:
-            _object_versions[vkey] = []
-        _object_versions[vkey].append({
-            "version_id": version_id,
-            "last_modified": obj["last_modified"],
-            "etag": obj["etag"],
-            "size": obj["size"],
-            "is_latest": True,
-            "data": combined,
-            "content_type": obj.get("content_type") or "application/octet-stream",
-            "content_encoding": obj.get("content_encoding"),
-            "metadata": obj.get("metadata", {}),
-            "preserved_headers": obj.get("preserved_headers", {}),
-            "storage_class": obj.get("storage_class") or "STANDARD",
-        })
-        for v in _object_versions[vkey][:-1]:
-            v["is_latest"] = False
 
     # Persist only after the versioning block: the .meta.json sidecar must
     # carry the version_id assigned above (#1058).

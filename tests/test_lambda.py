@@ -2862,6 +2862,52 @@ def test_lambda_function_with_layer(lam):
     assert layer_arn in fn["Configuration"]["Layers"][0]["Arn"]
 
 
+def test_lambda_unzipped_limit_counts_code_plus_layers(lam):
+    """The 250 MB unzipped quota is the total of function code + all attached
+    layers, not each package on its own (#1414)."""
+    MB = 1024 * 1024
+
+    def _zip_reporting(nbytes):
+        # Zeros compress away, so the archive stays tiny while its single member
+        # reports nbytes uncompressed — enough to exercise the quota without
+        # materializing hundreds of MB (the check reads the zip header, not the
+        # decompressed bytes).
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("index.py", b"\0" * nbytes)
+        return buf.getvalue()
+
+    role = "arn:aws:iam::000000000000:role/test"
+    big = _zip_reporting(150 * MB)  # 150 MB unzipped — under 250 on its own
+
+    # A 150 MB layer and 150 MB of code each pass the per-package limit.
+    layer = lam.publish_layer_version(
+        LayerName="big-1414-layer", Content={"ZipFile": big}
+    )["LayerVersionArn"]
+    lam.create_function(
+        FunctionName="fn-1414-code-only", Runtime="python3.12", Role=role,
+        Handler="index.handler", Code={"ZipFile": big},
+    )
+
+    # But 150 MB code + the 150 MB layer = 300 MB unzipped, which AWS rejects.
+    with pytest.raises(ClientError) as ei:
+        lam.create_function(
+            FunctionName="fn-1414-over", Runtime="python3.12", Role=role,
+            Handler="index.handler", Code={"ZipFile": big}, Layers=[layer],
+        )
+    assert ei.value.response["Error"]["Code"] == "InvalidParameterValueException"
+
+    # 150 MB code + a 1 MB layer (151 MB total) stays under the limit — no
+    # false positive now that code and layers are summed.
+    small_layer = lam.publish_layer_version(
+        LayerName="small-1414-layer", Content={"ZipFile": _zip_reporting(1 * MB)}
+    )["LayerVersionArn"]
+    lam.create_function(
+        FunctionName="fn-1414-under", Runtime="python3.12", Role=role,
+        Handler="index.handler", Code={"ZipFile": big}, Layers=[small_layer],
+    )
+
+
 def test_lambda_rejects_cross_region_layers_on_create_and_update():
     east = _regional_client("lambda", "us-east-1")
     west = _regional_client("lambda", "us-west-2")

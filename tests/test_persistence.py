@@ -2422,6 +2422,61 @@ def test_eventbridge_region_scoped_stores_survive_warm_boot_in_original_scope():
         set_request_region(original_region)
 
 
+# ── iot._jobs / iot._job_executions (tuple execution keys) ─────────────
+
+def test_iot_jobs_and_executions_survive_warm_boot():
+    """Jobs are keyed by jobId but executions by a (thingName, jobId) TUPLE —
+    the on-disk JSON path must round-trip both (tuple keys ride the
+    repr()/literal_eval leg of the scoped-dict encoder). A drop here would
+    silently orphan every in-flight OTA rollout on restart."""
+    mod = _get_module("iot")
+    mod.reset()
+    job_id = "persisted-job"
+    thing = "persisted-thing"
+    now_ms = 1700000000000
+    mod._jobs[job_id] = {
+        "jobId": job_id,
+        "jobArn": f"arn:aws:iot:us-east-1:000000000000:job/{job_id}",
+        "description": None,
+        "targets": [f"arn:aws:iot:us-east-1:000000000000:thing/{thing}"],
+        "targetSelection": "SNAPSHOT",
+        "document": "{\"operation\": \"reboot\"}",
+        "documentSource": None,
+        "status": "IN_PROGRESS",
+        "createdAt": now_ms,
+        "lastUpdatedAt": now_ms,
+        "completedAt": None,
+        "presignedUrlConfig": {},
+        "jobExecutionsRolloutConfig": {},
+        "snapshotted": True,
+    }
+    mod._job_executions[(thing, job_id)] = {
+        "jobId": job_id,
+        "thingName": thing,
+        "status": "IN_PROGRESS",
+        "statusDetails": {"progress": "42"},
+        "queuedAt": now_ms,
+        "startedAt": now_ms,
+        "lastUpdatedAt": now_ms,
+        "executionNumber": 1,
+        "versionNumber": 2,
+    }
+
+    _round_trip_dict(mod, "iot")
+
+    job = mod._jobs.get(job_id)
+    assert job is not None, "_jobs lost across save_state -> load_state"
+    assert job["status"] == "IN_PROGRESS"
+    execution = mod._job_executions.get((thing, job_id))
+    assert execution is not None, (
+        "_job_executions lost across save_state -> load_state — the "
+        "(thingName, jobId) tuple key must survive JSON persistence."
+    )
+    assert execution["versionNumber"] == 2
+    assert execution["statusDetails"] == {"progress": "42"}
+    mod.reset()
+
+
 def test_eventbridge_legacy_account_scoped_targets_restore_to_rule_region():
     """Legacy target stores are scoped to the EventBridge rule region, not the
     target ARN region, when migrating from account-only persistence."""
@@ -2469,6 +2524,67 @@ def test_eventbridge_legacy_account_scoped_targets_restore_to_rule_region():
         mod.reset()
         set_request_account_id(original_account)
         set_request_region(original_region)
+
+
+# ── iot._ca_certificates + iot._registration_codes ────────────────────
+
+def test_iot_ca_registry_and_registration_code_survive_warm_boot():
+    """`RegisterCACertificate` writes `_ca_certificates` and
+    `GetRegistrationCode` writes `_registration_codes`. If either dict is
+    dropped from get_state()/restore_state(), registered JITR CAs and the
+    account registration code silently vanish on restart.
+
+    The warm boot is spelled out rather than taken from `_round_trip_dict` so
+    the state is also checked *between* reset() and restore_state(): a dict
+    missing from reset() survives the round trip untouched, which would satisfy
+    an after-restore assertion alone while restore_state never restored
+    anything."""
+    mod = _get_module("iot")
+    mod.reset()
+    ca_id = "c" * 64
+    ca_arn = f"arn:aws:iot:us-east-1:000000000000:cacert/{ca_id}"
+    try:
+        mod._ca_certificates[ca_id] = {
+            "certificateId": ca_id,
+            "certificateArn": ca_arn,
+            "certificatePem": (
+                "-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n"
+            ),
+            "status": "ACTIVE",
+            "autoRegistrationStatus": "ENABLE",
+            "creationDate": 1700000000,
+        }
+        mod._registration_codes["code"] = "d" * 64
+
+        persistence.save_state("iot", mod.get_state())
+        mod.reset()
+        assert mod._ca_certificates.get(ca_id) is None, (
+            "_ca_certificates survived reset() — the CA registry must be "
+            "cleared there, or a restart leaks the previous run's CAs."
+        )
+        assert mod._registration_codes.get("code") is None, (
+            "_registration_codes survived reset() — the registration code must "
+            "be cleared there."
+        )
+        loaded = persistence.load_state("iot")
+        assert loaded is not None, (
+            "persistence.load_state('iot') returned None — state file was not "
+            "written by save_state()."
+        )
+        mod.restore_state(loaded)
+
+        restored = mod._ca_certificates.get(ca_id)
+        assert restored is not None, (
+            "_ca_certificates lost across save_state → load_state — the CA "
+            "registry must be in both get_state and restore_state."
+        )
+        assert restored["certificateArn"] == ca_arn
+        assert restored["autoRegistrationStatus"] == "ENABLE"
+        assert mod._registration_codes.get("code") == "d" * 64, (
+            "_registration_codes lost across save_state → load_state."
+        )
+    finally:
+        mod.reset()
 
 
 # ── Import-order regression for the ECS NameError trap ───────────────
