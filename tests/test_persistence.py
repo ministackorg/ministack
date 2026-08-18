@@ -2422,6 +2422,61 @@ def test_eventbridge_region_scoped_stores_survive_warm_boot_in_original_scope():
         set_request_region(original_region)
 
 
+# ── iot._jobs / iot._job_executions (tuple execution keys) ─────────────
+
+def test_iot_jobs_and_executions_survive_warm_boot():
+    """Jobs are keyed by jobId but executions by a (thingName, jobId) TUPLE —
+    the on-disk JSON path must round-trip both (tuple keys ride the
+    repr()/literal_eval leg of the scoped-dict encoder). A drop here would
+    silently orphan every in-flight OTA rollout on restart."""
+    mod = _get_module("iot")
+    mod.reset()
+    job_id = "persisted-job"
+    thing = "persisted-thing"
+    now_ms = 1700000000000
+    mod._jobs[job_id] = {
+        "jobId": job_id,
+        "jobArn": f"arn:aws:iot:us-east-1:000000000000:job/{job_id}",
+        "description": None,
+        "targets": [f"arn:aws:iot:us-east-1:000000000000:thing/{thing}"],
+        "targetSelection": "SNAPSHOT",
+        "document": "{\"operation\": \"reboot\"}",
+        "documentSource": None,
+        "status": "IN_PROGRESS",
+        "createdAt": now_ms,
+        "lastUpdatedAt": now_ms,
+        "completedAt": None,
+        "presignedUrlConfig": {},
+        "jobExecutionsRolloutConfig": {},
+        "snapshotted": True,
+    }
+    mod._job_executions[(thing, job_id)] = {
+        "jobId": job_id,
+        "thingName": thing,
+        "status": "IN_PROGRESS",
+        "statusDetails": {"progress": "42"},
+        "queuedAt": now_ms,
+        "startedAt": now_ms,
+        "lastUpdatedAt": now_ms,
+        "executionNumber": 1,
+        "versionNumber": 2,
+    }
+
+    _round_trip_dict(mod, "iot")
+
+    job = mod._jobs.get(job_id)
+    assert job is not None, "_jobs lost across save_state -> load_state"
+    assert job["status"] == "IN_PROGRESS"
+    execution = mod._job_executions.get((thing, job_id))
+    assert execution is not None, (
+        "_job_executions lost across save_state -> load_state — the "
+        "(thingName, jobId) tuple key must survive JSON persistence."
+    )
+    assert execution["versionNumber"] == 2
+    assert execution["statusDetails"] == {"progress": "42"}
+    mod.reset()
+
+
 def test_eventbridge_legacy_account_scoped_targets_restore_to_rule_region():
     """Legacy target stores are scoped to the EventBridge rule region, not the
     target ARN region, when migrating from account-only persistence."""

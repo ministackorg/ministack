@@ -210,11 +210,44 @@ def _calc_stats(values):
     }
 
 
-def _stat_value(stats, stat_name):
-    """Extract a single statistic from a stats dict. Handles pNN percentiles as Average."""
+def _percentile(values, pct):
+    """Extended-statistic percentile of values (0-100), computes the way
+    that CloudWatch documents it: sort ascending and linearly interpolate
+    between the two nearest ranks.
+
+    Matches e.g. numpy's default ("linear") interpolation method."""
+    if not values:
+        return 0
+    ordered = sorted(values)
+    n = len(ordered)
+    if n == 1:
+        return ordered[0]
+    rank = (pct / 100.0) * (n - 1)
+    lower = int(rank)
+    upper = min(lower + 1, n - 1)
+    frac = rank - lower
+    return ordered[lower] + frac * (ordered[upper] - ordered[lower])
+
+
+def _is_percentile_stat(stat_name):
+    return bool(stat_name) and stat_name[0] in ("p", "P") and stat_name[1:].replace(".", "", 1).isdigit()
+
+
+def _stat_value(stats, stat_name, values=None):
+    """Extract a single statistic. stat_name is either a basic statistic name
+    already present in stats (Average/Sum/Minimum/Maximum/SampleCount) or an
+    extended-statistic percentile (e.g. "p95", "p99.9"), computed from the raw
+    sample values for this period via _percentile.
+
+    Falls back to Average if values are not available (e.g. callers that only
+    have pre-aggregated stats, not the raw samples) so behavior degrades
+    gracefully rather than raising.
+    """
     if stat_name in stats:
         return stats[stat_name]
-    if stat_name.startswith("p") and stat_name[1:].replace(".", "").isdigit():
+    if _is_percentile_stat(stat_name):
+        if values:
+            return _percentile(values, float(stat_name[1:]))
         return stats.get("Average", 0)
     return stats.get("Average", 0)
 
@@ -244,8 +277,12 @@ def _evaluate_alarm(alarm):
     if not recent:
         return
 
-    stats = _calc_stats([p["Value"] for p in recent])
-    val = _stat_value(stats, alarm.get("Statistic", "Average"))
+    recent_values = [p["Value"] for p in recent]
+    stats = _calc_stats(recent_values)
+    # an alarm is configured with either Statistic (basic) or ExtendedStatistic (percentile),
+    # never both thus prefer whichever is set.
+    stat_name = alarm.get("ExtendedStatistic") or alarm.get("Statistic", "Average")
+    val = _stat_value(stats, stat_name, recent_values)
     threshold = alarm.get("Threshold", 0)
     op = alarm.get("ComparisonOperator", "")
 
@@ -811,9 +848,10 @@ def _get_metric_data(params, cbor_data, is_cbor, is_json=False):
         timestamps = []
         values = []
         for ts in sorted(buckets):
-            stats = _calc_stats(buckets[ts])
+            bucket_values = buckets[ts]
+            stats = _calc_stats(bucket_values)
             timestamps.append(_ts_iso(ts))
-            values.append(_stat_value(stats, stat_name))
+            values.append(_stat_value(stats, stat_name, bucket_values))
 
         if return_data:
             results.append(

@@ -103,3 +103,44 @@ def test_unknown_opensearch_version_path_still_falls_back_to_s3():
     assert detect_service(
         "POST", "/2021-01-01/not-opensearch/domain/example/config", _HEADERS, {}
     ) == "s3"
+
+
+def _sigv4_headers(service):
+    return {
+        "host": "localhost:4566",
+        "authorization": (
+            "AWS4-HMAC-SHA256 "
+            f"Credential=test/20260811/us-east-1/{service}/aws4_request, "
+            "SignedHeaders=host, Signature=fake"
+        ),
+    }
+
+
+def test_iot_jobs_data_credential_scope_routes():
+    """The SDK signs iot-jobs-data requests with the `iot-jobs-data` scope
+    (botocore signingName); the same path signed with `iot` must stay on the
+    control plane — GET /things/{t}/jobs is GetPendingJobExecutions on one
+    client and ListJobExecutionsForThing on the other."""
+    assert detect_service(
+        "GET", "/things/t1/jobs", _sigv4_headers("iot-jobs-data"), {}
+    ) == "iot-jobs-data"
+    assert detect_service("GET", "/things/t1/jobs", _sigv4_headers("iot"), {}) == "iot"
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        # What DescribeEndpoint(endpointType="iot:Jobs") actually hands out —
+        # a device following the documented flow signs against exactly this.
+        "a1b2c3.jobs.iot.us-east-1.localhost:4566",
+        # The spelling the AWS Device SDK's jobs documentation uses.
+        "a1b2c3.data.jobs.iot.us-east-1.localhost:4566",
+    ],
+)
+def test_iot_jobs_data_host_routes_before_iot(host):
+    """Both jobs-endpoint spellings also match the `iot\\.` regex — the
+    iot-jobs-data entry must win via pattern ordering, or the request lands on
+    the control plane where GET /things/{t}/jobs is a different operation."""
+    assert detect_service(
+        "GET", "/things/t1/jobs/$next", {"host": host}, {}
+    ) == "iot-jobs-data"

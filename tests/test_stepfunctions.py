@@ -3041,6 +3041,59 @@ def test_sfn_integration_sqs_send_message(sfn, sqs):
     assert len(msgs.get("Messages", [])) == 1
     assert msgs["Messages"][0]["Body"] == "hello from sfn"
 
+def test_sfn_integration_events_put_events(sfn, eb, sqs):
+    """Task state publishes to EventBridge via arn:aws:states:::events:putEvents,
+    and the event is actually delivered to a rule target — not a silent no-op
+    that reports SUCCEEDED while nothing fires (#1443)."""
+    import time as _time
+    queue_url = sqs.create_queue(QueueName="sfn-events-target")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=queue_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(Name="sfn-events-rule",
+                EventPattern=json.dumps({"source": ["sfn.pipeline"]}))
+    eb.put_targets(Rule="sfn-events-rule", Targets=[{"Id": "1", "Arn": queue_arn}])
+
+    definition = json.dumps({
+        "StartAt": "Emit",
+        "States": {
+            "Emit": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::events:putEvents",
+                "Parameters": {
+                    "Entries": [{
+                        "Source": "sfn.pipeline",
+                        "DetailType": "test",
+                        "Detail": "{\"k\": \"v\"}",
+                    }]
+                },
+                "End": True,
+            },
+        },
+    })
+    sm = sfn.create_state_machine(
+        name="sfn-events-integ", definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R")
+    ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input="{}")
+    desc = _wait_sfn(sfn, ex["executionArn"])
+    assert desc["status"] == "SUCCEEDED"
+    output = json.loads(desc["output"])
+    # A passthrough no-op would echo the input {"Entries": [...]}; the real
+    # integration returns the PutEvents response.
+    assert output["FailedEntryCount"] == 0
+    assert output["Entries"][0]["EventId"]
+
+    # The event must actually reach the rule's target.
+    got = None
+    for _ in range(20):
+        msgs = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=1,
+                                   WaitTimeSeconds=1)
+        if msgs.get("Messages"):
+            got = msgs["Messages"][0]["Body"]
+            break
+        _time.sleep(0.2)
+    assert got is not None, "event was not delivered to the EventBridge target"
+    assert "sfn.pipeline" in got
+
 def test_sfn_integration_sqs_send_message_wait_for_task_token(sfn, sqs):
     """sqs:sendMessage.waitForTaskToken must actually deliver the message
     (carrying the task token, serialised to JSON) and resume on

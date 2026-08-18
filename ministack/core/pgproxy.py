@@ -19,9 +19,16 @@ Documented limitations:
   backend connection; a client that ``Parse``s such a statement and never
   ``Execute``s it registers no job.
 - Type/name parsing is heuristic regex work, not a real SQL parser. Statement
-  splitting, comment stripping and parenthesis matching are lexer-aware
-  (string literals, dollar quotes, quoted identifiers and nested comments),
-  but clause-level analysis is still pattern matching.
+  splitting, comment stripping, parenthesis matching and the locking-clause
+  rule are lexer-aware (string literals, dollar quotes, quoted identifiers and
+  nested comments), but the remaining clause-level analysis is still pattern
+  matching.
+- The locking-clause rule is syntactic: DSQL refuses a share-mode clause when
+  the plan would actually take a share lock, so it accepts one that cannot
+  reach a relation (``SELECT 1 FOR SHARE``) or that a stronger clause on the
+  same relation supersedes (``SELECT * FROM (SELECT id FROM t FOR UPDATE) x
+  FOR SHARE``). Both are no-ops; the proxy refuses them anyway rather than
+  model the planner's strongest-lock-wins merge.
 - Transaction row counting is static (``VALUES`` tuples only); ``INSERT ...
   SELECT`` / ``UPDATE`` / ``DELETE`` affected-row counts are not tracked.
 - OC001 emulation is optimistic: the catalog version bumps on forwarded DDL,
@@ -177,7 +184,7 @@ def _register_job(cluster_id, object_name, job_type="INDEX_BUILD"):
 # SQL lexing primitives
 #
 # Everything that scans SQL text (statement splitting, comment stripping,
-# parenthesis matching) goes through _skip_noise so that string literals,
+# parenthesis matching, tokenizing) goes through _skip_noise so that literals,
 # dollar-quoted bodies, quoted identifiers and comments can never be mistaken
 # for structure. Without this a ';' or ')' inside a literal silently truncates
 # the text a validation rule sees, and the rule passes on the fragment.
@@ -295,6 +302,77 @@ def _find_char(sql, i, chars):
             return i
         i += 1
     return -1
+
+
+# One SQL identifier: double-quoted (case kept, "" escapes a quote) or bare
+# (folded to lower case by the server). ``_IDENT_PATH`` covers a dotted name
+# in any mix of the two, so schema."Tbl".col is one match.
+_IDENT = r'(?:"(?:[^"]|"")*"|[^\W\d][\w$]*)'
+_IDENT_PATH = rf"{_IDENT}(?:\s*\.\s*{_IDENT})*"
+_IDENT_RE = re.compile(_IDENT)
+_NAME_RE = re.compile(r"[^\W\d][\w$]*")
+
+
+def fold_identifier(raw):
+    """Normalize one identifier to the name the server actually stores.
+
+    A quoted identifier keeps its case verbatim (with ``""`` collapsed to a
+    single quote); a bare one folds to lower case. So ``id``, ``ID`` and
+    ``"id"`` all name the same column, while ``"ID"`` names a different one.
+    Returns ``(name, was_quoted)``.
+    """
+    raw = raw.strip()
+    if len(raw) >= 2 and raw.startswith('"') and raw.endswith('"'):
+        return raw[1:-1].replace('""', '"'), True
+    return raw.lower(), False
+
+
+def identifier_path(raw):
+    """Normalized parts of a dotted identifier: ``s."T".c`` -> ``[s, T, c]``."""
+    return [fold_identifier(m.group(0))[0] for m in _IDENT_RE.finditer(raw)]
+
+
+_OP_CHARS = "+-*/<>=~!@#%^&|?"
+_PUNCT_CHARS = "().,;[]:"
+
+
+def _sql_tokens(sql):
+    """Lex SQL into ``(kind, text)`` pairs, dropping whitespace and comments.
+
+    Kinds: ``name`` (bare identifier or keyword, folded to lower case),
+    ``qname`` (quoted identifier, verbatim), ``str`` (string or dollar-quoted
+    literal), ``op`` (a maximal run of operator characters, the way the server
+    lexes one), ``punct`` (a single ``().,;[]:`` character) and ``other``
+    (numbers, ``$1`` placeholders, anything else).
+    """
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch.isspace():
+            i += 1
+            continue
+        j = _skip_noise(sql, i)
+        if j != i:  # literal, quoted identifier or comment
+            if ch == '"':
+                yield "qname", sql[i + 1 : j - 1].replace('""', '"')
+            elif ch in "'$":
+                yield "str", sql[i:j]
+            i = j
+            continue
+        m = _NAME_RE.match(sql, i)
+        if m:
+            yield "name", m.group(0).lower()
+            i = m.end()
+            continue
+        if ch in _OP_CHARS:
+            k = i + 1
+            while k < n and sql[k] in _OP_CHARS:
+                k += 1
+            yield "op", sql[i:k]
+            i = k
+            continue
+        yield ("punct" if ch in _PUNCT_CHARS else "other"), ch
+        i += 1
 
 
 # ---------------------------------------------------------------------------
@@ -1009,6 +1087,45 @@ def match_wait_for_job(sql):
     return m.group(1) or m.group(2)
 
 
+# --- Locking clauses (measured against Aurora DSQL, 2026-08-18) -------------
+
+# DSQL supports one locking clause, FOR UPDATE, with its optional
+# OF / NOWAIT / SKIP LOCKED tail. It places no restriction on the query the
+# clause locks — no WHERE clause, a non-key column, an inequality, IN/OR, a
+# join and a table without a primary key all lock fine.
+_UNSUPPORTED_LOCKS = (("no", "key", "update"), ("key", "share"), ("share",))
+# Cheap gate: only tokenize a statement that could carry one of those.
+_LOCK_CLAUSE_RE = re.compile(
+    r"\bFOR\s+(?:NO\s+KEY\s+UPDATE|(?:KEY\s+)?SHARE)\b", re.I
+)
+
+
+def _check_locking_clause(sql):
+    """Refuse every locking clause but FOR UPDATE.
+
+    The check reads the statement's tokens, so ``FOR SHARE`` inside a string
+    literal is text rather than a clause. A clause nested in a CTE or subquery
+    still counts, and an earlier FOR UPDATE does not excuse a later share
+    clause — both measured against a live cluster.
+    """
+    if not _LOCK_CLAUSE_RE.search(sql):
+        return None
+    toks = list(_sql_tokens(sql))
+    for i, (kind, text) in enumerate(toks):
+        if kind != "name" or text != "for":
+            continue
+        words = tuple(t for k, t in toks[i + 1 : i + 4] if k == "name")
+        if any(words[: len(lock)] == lock for lock in _UNSUPPORTED_LOCKS):
+            # Verbatim from the service, which names FOR KEY SHARE as
+            # supported and then refuses it too.
+            return DsqlError(
+                "0A000",
+                "locking clauses other than FOR UPDATE/FOR KEY SHARE "
+                "are not supported",
+            )
+    return None
+
+
 # --- Top-level validator -----------------------------------------------------
 
 
@@ -1075,6 +1192,9 @@ def validate(sql, txn_state=None):
     if err:
         return err
     err = _check_index_rules(s)
+    if err:
+        return err
+    err = _check_locking_clause(s)
     if err:
         return err
 
@@ -1285,15 +1405,33 @@ def _abort_gate(conn, sql):
     return None, sql
 
 
-async def _primary_key_columns(conn, b_writer, table):
-    """Primary key column names for ``table``; None if the probe failed."""
+def _relation_literal(parts):
+    """Quote a normalized name path back into SQL: ``[s, T] -> "s"."T"``.
+
+    Quoting every part keeps the exact case the catalog holds, so a relation
+    created as ``"MyTable"`` resolves as itself instead of case-folding away.
+    """
+    return ".".join('"' + part.replace('"', '""') + '"' for part in parts)
+
+
+async def _primary_key_columns(conn, b_writer, relation):
+    """Primary key columns of ``relation`` (a normalized name path).
+
+    None when the probe failed or the relation could not be resolved, so the
+    caller forwards and lets the backend answer. An unqualified name resolves
+    through the backend's search_path, exactly as the client's own statement
+    would; a schema-qualified one is looked up in that schema.
+    """
+    if not relation:
+        return None
+    literal = _relation_literal(relation).replace("'", "''")
     try:
         frames = await _run_backend_capture(
             conn,
             b_writer,
             "SELECT a.attname FROM pg_index i JOIN pg_attribute a "
             "ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
-            f"WHERE i.indrelid = '{table}'::regclass AND i.indisprimary",
+            f"WHERE i.indrelid = '{literal}'::regclass AND i.indisprimary",
         )
     except Exception:
         return None
@@ -1315,26 +1453,30 @@ async def _primary_key_columns(conn, b_writer, table):
 # DROP CONSTRAINT / DEFAULT / NOT NULL / EXPRESSION / IDENTITY — have to be
 # told apart from a bare column name.
 _DROP_COLUMN_RE = re.compile(
-    r"\bDROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?([\w\".]+)", re.I
+    rf"\bDROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?({_IDENT})", re.I
 )
 _DROP_NON_COLUMN_ACTIONS = frozenset(
     ("constraint", "default", "not", "expression", "identity")
 )
 _ALTER_TABLE_TARGET_RE = re.compile(
-    r"\s*ALTER\s+TABLE\s+(?:ASYNC\s+)?(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?([\w\".]+)", re.I
+    rf"\s*ALTER\s+TABLE\s+(?:ASYNC\s+)?(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?"
+    rf"({_IDENT_PATH})",
+    re.I,
 )
 
 
 def dropped_columns(sql):
-    """Column names an ALTER TABLE statement drops (may be several)."""
+    """Column names an ALTER TABLE statement drops (may be several).
+
+    Names come back normalized the way the server stores them, so they can be
+    compared against catalog names directly.
+    """
     if not re.match(r"\s*ALTER\s+TABLE\b", sql, re.I):
         return []
     cols = []
     for m in _DROP_COLUMN_RE.finditer(sql):
-        raw = m.group(1)
-        quoted = raw.startswith('"')
-        name = raw.strip('"')
-        if not quoted and name.lower() in _DROP_NON_COLUMN_ACTIONS:
+        name, quoted = fold_identifier(m.group(1))
+        if not quoted and name in _DROP_NON_COLUMN_ACTIONS:
             continue
         cols.append(name)
     return cols
@@ -1348,61 +1490,16 @@ async def _check_drop_column(conn, b_writer, sql):
     m = _ALTER_TABLE_TARGET_RE.match(sql)
     if not m:
         return None
-    pk_cols = await _primary_key_columns(conn, b_writer, m.group(1).strip('"'))
+    pk_cols = await _primary_key_columns(
+        conn, b_writer, identifier_path(m.group(1))
+    )
     if not pk_cols:
         return None  # probe failed or no primary key — let the backend answer
-    lowered = {c.lower() for c in pk_cols}
+    keys = set(pk_cols)
     for col in cols:
-        if col.lower() in lowered:
+        if col in keys:
             # Exact message from real DSQL (verified in eu-west-2, Aug 2026).
             return DsqlError("0A000", f"cannot drop primary key column {col}")
-    return None
-
-
-_FOR_UPDATE_MULTI = (
-    "locking clause such as FOR UPDATE can be applied on a single table"
-)
-_FOR_UPDATE_EQ = (
-    "locking clause such as FOR UPDATE can be applied only on tables "
-    "with equality predicates on the key"
-)
-_FOR_UPDATE_RE = re.compile(r"\bFOR\s+(?:NO\s+KEY\s+)?UPDATE\b", re.I)
-
-
-async def _check_for_update(conn, b_writer, sql):
-    """DSQL locking-clause rules (exact messages from the AWS features doc).
-
-    FOR UPDATE needs a single table and equality predicates on all primary
-    key columns. Returns a DsqlError, or None to forward.
-    """
-    body = _FOR_UPDATE_RE.split(sql)[0]
-    m = re.search(
-        r"\bFROM\b(.+?)(?:\bWHERE\b|\bGROUP\b|\bORDER\b|\bLIMIT\b|$)",
-        body, re.I | re.S,
-    )
-    if not m:
-        return DsqlError("0A000", _FOR_UPDATE_EQ)
-    from_part = m.group(1)
-    if "," in from_part or re.search(r"\bJOIN\b", from_part, re.I):
-        return DsqlError("0A000", _FOR_UPDATE_MULTI)
-    table = from_part.strip().split()[0].strip('"')
-    pk_cols = await _primary_key_columns(conn, b_writer, table)
-    if pk_cols is None:
-        return None  # probe failed — let the backend answer
-    wm = re.search(r"\bWHERE\b(.+)$", body, re.I | re.S)
-    if not pk_cols or not wm:
-        return DsqlError("0A000", _FOR_UPDATE_EQ)
-    where = wm.group(1)
-    if re.search(
-        r"<>|!=|<=|>=|<|>|\bOR\b|\bIN\s*\(|\bBETWEEN\b|\bLIKE\b", where, re.I
-    ):
-        return DsqlError("0A000", _FOR_UPDATE_EQ)
-    for col in pk_cols:
-        if not (
-            re.search(rf"\b{re.escape(col)}\b\s*=[^=]", where, re.I)
-            or re.search(rf"=[^=][^;]*\b{re.escape(col)}\b", where, re.I)
-        ):
-            return DsqlError("0A000", _FOR_UPDATE_EQ)
     return None
 
 
@@ -1473,10 +1570,6 @@ async def _plan_statement(conn, s, b_writer, allow_probe=True):
         if err:
             return "error", err
 
-    if _FOR_UPDATE_RE.search(s) and allow_probe:
-        err = await _check_for_update(conn, b_writer, s)
-        if err:
-            return "error", err
     return "forward", None
 
 
