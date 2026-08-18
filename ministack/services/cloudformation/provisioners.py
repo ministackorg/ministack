@@ -2296,6 +2296,163 @@ def _apigw_stage_delete(physical_id, props):
     _apigw_v1._delete_stage(api_id, stage_name)
 
 
+# --- API Gateway ApiKey / UsagePlan (v1) ---
+
+def _apigw_tag_map(raw):
+    """Normalize CFN ``Tags`` (a map, or a list of {Key, Value}) to a dict."""
+    if isinstance(raw, dict):
+        return dict(raw)
+    return {t["Key"]: t["Value"] for t in raw or []}
+
+
+def _apigw_throttle(raw):
+    """Map a CFN ThrottleSettings block to the API Gateway wire shape."""
+    if not raw:
+        return {}
+    out = {}
+    if "BurstLimit" in raw:
+        out["burstLimit"] = raw["BurstLimit"]
+    if "RateLimit" in raw:
+        out["rateLimit"] = raw["RateLimit"]
+    return out
+
+
+def _apigw_quota(raw):
+    """Map a CFN QuotaSettings block to the API Gateway wire shape."""
+    if not raw:
+        return {}
+    out = {}
+    for cfn_key, api_key in (("Limit", "limit"), ("Offset", "offset"), ("Period", "period")):
+        if cfn_key in raw:
+            out[api_key] = raw[cfn_key]
+    return out
+
+
+def _apigw_api_key_create(logical_id, props, stack_name):
+    """Provision an ``AWS::ApiGateway::ApiKey``.
+
+    Ref returns the generated key id; ``Fn::GetAtt APIKeyId`` returns the same
+    id, matching the AWS CloudFormation resource contract. The runtime create
+    always mints a fresh value, so an explicit ``Value`` is applied afterwards
+    to honor a caller-pinned key.
+    """
+    data = {
+        "name": props.get("Name") or _physical_name(stack_name, logical_id),
+        "description": props.get("Description", ""),
+        "enabled": props.get("Enabled", True),
+        "stageKeys": [
+            {"restApiId": sk.get("RestApiId", ""), "stageName": sk.get("StageName", "")}
+            for sk in props.get("StageKeys", [])
+        ],
+        "tags": _apigw_tag_map(props.get("Tags")),
+    }
+    status, _headers, body = _apigw_v1._create_api_key(data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::ApiKey create failed: {body!r}")
+    api_key = json.loads(body)
+    key_id = api_key.get("id", "")
+    value = props.get("Value")
+    if value:
+        stored = _apigw_v1._api_keys.get(key_id)
+        if stored is not None:
+            stored["value"] = value
+    customer_id = props.get("CustomerId")
+    if customer_id:
+        stored = _apigw_v1._api_keys.get(key_id)
+        if stored is not None:
+            stored["customerId"] = customer_id
+    return key_id, {"APIKeyId": key_id}
+
+
+def _apigw_api_key_update(physical_id, old_props, new_props, stack_name):
+    # Value is immutable in CloudFormation; changing it replaces the key.
+    # Everything else updates the existing record in place.
+    if old_props.get("Value") != new_props.get("Value"):
+        _apigw_v1._delete_api_key(physical_id)
+        return _apigw_api_key_create(physical_id, new_props, stack_name)
+    key = _apigw_v1._api_keys.get(physical_id)
+    if key is None:
+        return _apigw_api_key_create(physical_id, new_props, stack_name)
+    if new_props.get("Name"):
+        key["name"] = new_props["Name"]
+    key["description"] = new_props.get("Description", "")
+    key["enabled"] = new_props.get("Enabled", True)
+    key["customerId"] = new_props.get("CustomerId", key.get("customerId", ""))
+    key["lastUpdatedDate"] = _apigw_v1._now_unix()
+    return physical_id, {"APIKeyId": physical_id}
+
+
+def _apigw_api_key_delete(physical_id, props):
+    # _delete_api_key is idempotent — a missing key returns a 404 tuple that we
+    # ignore, so repeated or post-reset deletes converge cleanly.
+    _apigw_v1._delete_api_key(physical_id)
+
+
+def _apigw_usage_plan_body(props):
+    return {
+        "description": props.get("Description", ""),
+        "apiStages": [
+            {
+                "apiId": stage.get("ApiId", ""),
+                "stage": stage.get("Stage", ""),
+                "throttle": stage.get("Throttle", {}),
+            }
+            for stage in props.get("ApiStages", [])
+        ],
+        "throttle": _apigw_throttle(props.get("Throttle")),
+        "quota": _apigw_quota(props.get("Quota")),
+        "tags": _apigw_tag_map(props.get("Tags")),
+    }
+
+
+def _apigw_usage_plan_create(logical_id, props, stack_name):
+    """Provision an ``AWS::ApiGateway::UsagePlan``.
+
+    Ref and ``Fn::GetAtt Id`` both return the generated usage plan id.
+    """
+    data = {"name": props.get("UsagePlanName") or _physical_name(stack_name, logical_id)}
+    data.update(_apigw_usage_plan_body(props))
+    status, _headers, body = _apigw_v1._create_usage_plan(data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::UsagePlan create failed: {body!r}")
+    plan = json.loads(body)
+    plan_id = plan.get("id", "")
+    return plan_id, {"Id": plan_id}
+
+
+def _apigw_usage_plan_update(physical_id, old_props, new_props, stack_name):
+    plan = _apigw_v1._usage_plans.get(physical_id)
+    if plan is None:
+        return _apigw_usage_plan_create(physical_id, new_props, stack_name)
+    if new_props.get("UsagePlanName"):
+        plan["name"] = new_props["UsagePlanName"]
+    plan.update(_apigw_usage_plan_body(new_props))
+    return physical_id, {"Id": physical_id}
+
+
+def _apigw_usage_plan_delete(physical_id, props):
+    _apigw_v1._delete_usage_plan(physical_id)
+
+
+def _apigw_usage_plan_key_create(logical_id, props, stack_name):
+    """Provision an ``AWS::ApiGateway::UsagePlanKey`` (associate a key with a plan).
+
+    Ref returns the API key id; the delete handler reads the usage plan id back
+    from the resource's own properties, so the physical id need not encode it.
+    """
+    plan_id = props.get("UsagePlanId", "")
+    key_id = props.get("KeyId", "")
+    data = {"keyId": key_id, "keyType": props.get("KeyType", "API_KEY")}
+    status, _headers, body = _apigw_v1._create_usage_plan_key(plan_id, data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::UsagePlanKey create failed: {body!r}")
+    return key_id, {}
+
+
+def _apigw_usage_plan_key_delete(physical_id, props):
+    _apigw_v1._delete_usage_plan_key(props.get("UsagePlanId", ""), props.get("KeyId", ""))
+
+
 # --- API Gateway BasePathMapping ---
 
 def _apigw_base_path_mapping_identity(props):
@@ -5614,14 +5771,66 @@ def _iot_thing_type_delete(physical_id, props):
     _iot._thing_types.pop(physical_id, None)
 
 
+def _iot_policy_document(props):
+    doc = props.get("PolicyDocument")
+    return json.dumps(doc) if isinstance(doc, (dict, list)) else doc
+
+
+_IOT_POLICY_VERSION_LIMIT = 5
+
+
+def _iot_policy_prune_versions(name):
+    """Make room for one more version, the way the CloudFormation handler does.
+
+    IoT caps a policy at five versions and ``CreatePolicyVersion`` answers
+    ``VersionsLimitExceeded`` once that is reached, so CloudFormation deletes
+    the oldest non-default versions before storing a new document. MiniStack
+    does not enforce the cap today; pruning here keeps the version list the
+    same shape it has on AWS either way.
+    """
+    resp = _iot._list_policy_versions(name)
+    if resp[0] >= 400:
+        return
+    versions = json.loads(resp[2])["policyVersions"]
+    surplus = len(versions) - _IOT_POLICY_VERSION_LIMIT + 1
+    if surplus <= 0:
+        return
+    prunable = sorted(
+        (v["versionId"] for v in versions if not v["isDefaultVersion"]), key=int
+    )
+    for version_id in prunable[:surplus]:
+        _iot._delete_policy_version(name, version_id)
+
+
 def _iot_policy_create(logical_id, props, stack_name):
     name = props.get("PolicyName") or _physical_name(stack_name, logical_id)
-    doc = props.get("PolicyDocument")
-    if isinstance(doc, (dict, list)):
-        doc = json.dumps(doc)
-    resp = _iot._create_policy(name, {"policyDocument": doc})
+    resp = _iot._create_policy(name, {"policyDocument": _iot_policy_document(props)})
     if resp[0] >= 400:
         raise ValueError(f"AWS::IoT::Policy create failed: {resp[2]!r}")
+    return name, {"Arn": _iot._policy_arn(name), "Id": name}
+
+
+def _iot_policy_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Apply a policy change in place, the way CloudFormation does.
+
+    A new ``PolicyDocument`` is a no-interruption update: IoT stores it as a new
+    version and makes it the default, so ``Ref`` keeps naming the same policy.
+    Renaming is a replacement — the new policy is created and the old one
+    removed, since a policy no template still declares is not left behind.
+    """
+    name = new_props.get("PolicyName") or _physical_name(
+        stack_name, logical_id or physical_id
+    )
+    if name != physical_id:
+        created = _iot_policy_create(logical_id or physical_id, new_props, stack_name)
+        _iot_policy_delete(physical_id, old_props)
+        return created
+    _iot_policy_prune_versions(name)
+    resp = _iot._create_policy_version(
+        name, {"policyDocument": _iot_policy_document(new_props)}, {"setAsDefault": "true"}
+    )
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::Policy update failed: {resp[2]!r}")
     return name, {"Arn": _iot._policy_arn(name), "Id": name}
 
 
@@ -5741,6 +5950,20 @@ _RESOURCE_HANDLERS = {
     "AWS::ApiGateway::Authorizer": {"create": _apigw_authorizer_create, "delete": _apigw_authorizer_delete},
     "AWS::ApiGateway::Deployment": {"create": _apigw_deployment_create, "delete": _apigw_deployment_delete},
     "AWS::ApiGateway::Stage": {"create": _apigw_stage_create, "delete": _apigw_stage_delete},
+    "AWS::ApiGateway::ApiKey": {
+        "create": _apigw_api_key_create,
+        "update": _apigw_api_key_update,
+        "delete": _apigw_api_key_delete,
+    },
+    "AWS::ApiGateway::UsagePlan": {
+        "create": _apigw_usage_plan_create,
+        "update": _apigw_usage_plan_update,
+        "delete": _apigw_usage_plan_delete,
+    },
+    "AWS::ApiGateway::UsagePlanKey": {
+        "create": _apigw_usage_plan_key_create,
+        "delete": _apigw_usage_plan_key_delete,
+    },
     "AWS::ApiGateway::BasePathMapping": {
         "create": _apigw_base_path_mapping_create,
         "update": _apigw_base_path_mapping_update,
@@ -5862,7 +6085,12 @@ _RESOURCE_HANDLERS = {
     "AWS::RDS::DBInstance": {"create": _rds_db_instance_create, "delete": _rds_db_instance_delete},
     "AWS::IoT::TopicRule": {"create": _iot_topic_rule_create, "delete": _iot_topic_rule_delete},
     "AWS::IoT::ThingType": {"create": _iot_thing_type_create, "delete": _iot_thing_type_delete},
-    "AWS::IoT::Policy": {"create": _iot_policy_create, "delete": _iot_policy_delete},
+    "AWS::IoT::Policy": {
+        "create": _iot_policy_create,
+        "update": _iot_policy_update,
+        "update_with_logical_id": True,
+        "delete": _iot_policy_delete,
+    },
     "AWS::Cognito::IdentityPoolRoleAttachment": {
         "create": _cognito_identity_pool_role_attachment_create,
         "delete": _cognito_identity_pool_role_attachment_delete,
