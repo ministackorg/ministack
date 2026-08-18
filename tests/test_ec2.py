@@ -1,4 +1,5 @@
 import io
+import ipaddress
 import json
 import os
 import time
@@ -3558,3 +3559,37 @@ def test_modify_security_group_rules_updates_description(ec2):
     ec2.delete_security_group(GroupId=sg)
     ec2.delete_vpc(VpcId=vpc)
 
+
+
+def test_ec2_public_ip_and_dns_surface_via_sdk(ec2):
+    """The public address must ride the real wire tags (ipAddress/dnsName) —
+    the previous publicIpAddress/publicDnsName tags are not in the EC2 schema,
+    so boto3 silently dropped both fields and PublicIpAddress was always None."""
+    iid = ec2.run_instances(ImageId="ami-0abcdef1234567890", MinCount=1,
+                            MaxCount=1)["Instances"][0]["InstanceId"]
+    try:
+        inst = ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]
+        assert inst.get("PublicIpAddress"), "PublicIpAddress missing from the wire"
+        assert inst.get("PublicDnsName"), "PublicDnsName missing from the wire"
+        assert inst["PrivateIpAddress"]
+        # The value has to be an address, not just present. Fixing the tags is
+        # what made this reachable: while the field never left the server, a
+        # malformed one could not be noticed.
+        ipaddress.ip_address(inst["PublicIpAddress"])
+        ipaddress.ip_address(inst["PrivateIpAddress"])
+    finally:
+        ec2.terminate_instances(InstanceIds=[iid])
+
+
+def test_ec2_allocated_address_is_a_valid_ipv4(ec2):
+    """AllocateAddress hands back `PublicIp` verbatim, so a generator that
+    completes a one-octet prefix with only two octets produces `52.55.218`,
+    which no address parser accepts."""
+    alloc = ec2.allocate_address(Domain="vpc")
+    try:
+        ipaddress.ip_address(alloc["PublicIp"])
+        described = ec2.describe_addresses(
+            AllocationIds=[alloc["AllocationId"]])["Addresses"][0]
+        ipaddress.ip_address(described["PublicIp"])
+    finally:
+        ec2.release_address(AllocationId=alloc["AllocationId"])
