@@ -114,6 +114,11 @@ _SERIAL_TESTS = {
     "tests/test_apigatewayv2.py::test_apigwv2_authorizer_simple_response_non_boolean_is_500",
     "tests/test_apigatewayv2.py::test_apigwv2_authorizer_unparsable_ttl_falls_back_to_the_default",
     "tests/test_apigatewayv2.py::test_apigwv2_authorizer_without_identity_source_does_not_cache",
+    # {proxy+} fallthrough tests: each request cold-starts a Lambda (the bypass
+    # test wires three), with the same cold-start-under-xdist flakiness as the
+    # apigw tests above.
+    "tests/test_apigatewayv1.py::test_apigwv1_methodless_resource_falls_through_to_proxy",
+    "tests/test_apigatewayv1.py::test_apigwv1_proxy_fallthrough_cannot_bypass_a_guarded_sibling",
     # AppSync Lambda-resolver event-shape tests cold-start Lambdas under a 10s
     # urlopen timeout (Test 6 spawns two functions). Same cold-start-under-xdist
     # flakiness as the apigw Lambda tests above — run them in the serial phase.

@@ -9153,3 +9153,56 @@ def test_custom_resource_rejects_cross_region_lambda_token(cfn):
         except Exception:
             pass
         west_lam.delete_function(FunctionName=fn_name)
+
+
+def test_cfn_ses_configuration_set_and_event_destination(cfn, ses, sesv2):
+    cs_name = f"cfn-ses-cs-{_uuid_mod.uuid4().hex[:8]}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "AlarmTopic": {
+                "Type": "AWS::SNS::Topic",
+                "Properties": {"TopicName": f"{cs_name}-events"},
+            },
+            "ConfigSet": {
+                "Type": "AWS::SES::ConfigurationSet",
+                "Properties": {"Name": cs_name},
+            },
+            "EventDest": {
+                "Type": "AWS::SES::ConfigurationSetEventDestination",
+                "Properties": {
+                    "ConfigurationSetName": {"Ref": "ConfigSet"},
+                    "EventDestination": {
+                        "Name": "to-sns",
+                        "Enabled": True,
+                        "MatchingEventTypes": ["send", "bounce", "complaint"],
+                        "SnsDestination": {"TopicARN": {"Ref": "AlarmTopic"}},
+                    },
+                },
+            },
+        },
+        "Outputs": {
+            "ConfigSetName": {"Value": {"Ref": "ConfigSet"}},
+        },
+    }
+    cfn.create_stack(StackName="cfn-ses-cs", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-ses-cs")
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    # Ref on the configuration set resolves to its name.
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    assert outputs["ConfigSetName"] == cs_name
+
+    # The set is visible through both the classic and v2 SES APIs.
+    described = ses.describe_configuration_set(ConfigurationSetName=cs_name)
+    assert described["ConfigurationSet"]["Name"] == cs_name
+    listed = ses.list_configuration_sets()["ConfigurationSets"]
+    assert any(cs.get("Name") == cs_name for cs in listed)
+    assert sesv2.get_configuration_set(
+        ConfigurationSetName=cs_name)["ConfigurationSetName"] == cs_name
+
+    cfn.delete_stack(StackName="cfn-ses-cs")
+    _wait_stack(cfn, "cfn-ses-cs")
+
+    with pytest.raises(ClientError):
+        ses.describe_configuration_set(ConfigurationSetName=cs_name)

@@ -48,6 +48,7 @@ import ministack.services.s3 as _s3
 import ministack.services.s3tables as _s3tables
 import ministack.services.secretsmanager as _sm
 import ministack.services.ses as _ses
+import ministack.services.ses_v2 as _ses_v2
 import ministack.services.sns as _sns
 import ministack.services.sqs as _sqs
 import ministack.services.ssm as _ssm
@@ -5196,6 +5197,55 @@ def _ses_email_identity_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
+# SES ConfigurationSet
+# ---------------------------------------------------------------------------
+
+def _ses_configuration_set_create(logical_id, props, stack_name):
+    # AWS::SES::ConfigurationSet Ref returns the configuration set name; when the
+    # template omits Name, CloudFormation generates one from the stack/logical id.
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
+    # Register with both the classic (v1) and v2 SES stores so DescribeConfigurationSet
+    # (Query API) and GetConfigurationSet (v2 REST API) both see the set.
+    _ses._configuration_sets[name] = {
+        "Name": name,
+        "CreatedTimestamp": _ses._iso_now(),
+    }
+    _ses_v2._config_sets[name] = {"ConfigurationSetName": name, "Tags": []}
+    return name, {"Id": name}
+
+
+def _ses_configuration_set_delete(physical_id, props):
+    _ses._configuration_sets.pop(physical_id, None)
+    _ses_v2._config_sets.pop(physical_id, None)
+
+
+# ---------------------------------------------------------------------------
+# SES ConfigurationSetEventDestination
+# ---------------------------------------------------------------------------
+
+def _ses_configuration_set_event_destination_create(logical_id, props, stack_name):
+    config_set = props.get("ConfigurationSetName", "")
+    destination = props.get("EventDestination", {}) or {}
+    dest_name = destination.get("Name") or _physical_name(
+        stack_name, logical_id, max_len=64)
+    # Record the event destination against its configuration set (if present) so
+    # the set round-trips with its destinations; the emulator does not deliver
+    # SES events, this is CFN provisioning fidelity only.
+    record = _ses._configuration_sets.get(config_set)
+    if record is not None:
+        record.setdefault("EventDestinations", {})[dest_name] = destination
+    # The physical id encodes both names so delete can locate the destination.
+    return f"{config_set}|{dest_name}", {"Id": dest_name}
+
+
+def _ses_configuration_set_event_destination_delete(physical_id, props):
+    config_set, _, dest_name = physical_id.partition("|")
+    record = _ses._configuration_sets.get(config_set)
+    if record is not None:
+        record.get("EventDestinations", {}).pop(dest_name, None)
+
+
+# ---------------------------------------------------------------------------
 # WAFv2 WebACL
 # ---------------------------------------------------------------------------
 
@@ -6143,6 +6193,8 @@ _RESOURCE_HANDLERS = {
     "AWS::ApiGatewayV2::Route": {"create": _apigw_v2_route_create, "delete": _apigw_v2_route_delete},
     "AWS::ApiGatewayV2::Authorizer": {"create": _apigw_v2_authorizer_create, "update": _apigw_v2_authorizer_update, "delete": _apigw_v2_authorizer_delete},
     "AWS::SES::EmailIdentity": {"create": _ses_email_identity_create, "delete": _ses_email_identity_delete},
+    "AWS::SES::ConfigurationSet": {"create": _ses_configuration_set_create, "delete": _ses_configuration_set_delete},
+    "AWS::SES::ConfigurationSetEventDestination": {"create": _ses_configuration_set_event_destination_create, "delete": _ses_configuration_set_event_destination_delete},
     "AWS::WAFv2::WebACL": {"create": _waf_web_acl_create, "delete": _waf_web_acl_delete},
     "AWS::CloudFront::CloudFrontOriginAccessIdentity": {
         "create": _cf_oai_create,
