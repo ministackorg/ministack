@@ -1474,7 +1474,11 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
 
     vhost_path = "/" + bucket + path if path != "/" else "/" + bucket + "/"
     try:
-        return await _get_module("s3").handle_request(method, vhost_path, headers, body, query_params)
+        # Pass the original (pre-rewrite) URI as signed_path so a presigned
+        # virtual-hosted URL, which signed the canonical URI without the bucket,
+        # verifies against what the client actually signed.
+        return await _get_module("s3").handle_request(
+            method, vhost_path, headers, body, query_params, signed_path=path)
     except Exception as e:
         logger.exception("Error handling virtual-hosted S3 request: %s", e)
         from xml.sax.saxutils import escape as _xml_esc

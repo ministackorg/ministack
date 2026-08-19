@@ -36,6 +36,7 @@ import copy
 import json
 import logging
 import os
+import re
 import time
 from urllib.parse import parse_qs
 from urllib.parse import quote as _url_quote
@@ -457,8 +458,41 @@ def _delete_user(p):
 
 # -------------------- Role management --------------------
 
+# IAM restricts a role's Description to tab / CR / LF plus printable ASCII and
+# the Latin-1 supplement (botocore `roleDescriptionType`), max 1000 chars. A
+# character outside that set — an em dash, say — is a 400 ValidationError on
+# real AWS; without this check MiniStack stored it verbatim, so an invalid
+# template deployed fine locally and only failed once it reached a real account.
+_ROLE_DESCRIPTION_RE = re.compile("[\u0009\u000A\u000D\u0020-\u007E\u00A1-\u00FF]*")
+
+
+
+def _validate_role_description(description):
+    """None when the description is absent or valid; a 400 ValidationError otherwise."""
+    if description is None:
+        return None
+    if len(description) > 1000:
+        return _error(
+            400, "ValidationError",
+            "1 validation error detected: Value at 'description' failed to satisfy "
+            "constraint: Member must have length less than or equal to 1000",
+            ns="iam")
+    if _ROLE_DESCRIPTION_RE.fullmatch(description) is None:
+        return _error(
+            400, "ValidationError",
+            "1 validation error detected: Value at 'description' failed to satisfy "
+            "constraint: Member must satisfy regular expression pattern: "
+            "[\\u0009\\u000A\\u000D\\u0020-\\u007E\\u00A1-\\u00FF]*",
+            ns="iam")
+    return None
+
+
 def _create_role(p):
     name = _p(p, "RoleName")
+    description = _p(p, "Description")
+    desc_err = _validate_role_description(description)
+    if desc_err:
+        return desc_err
     if name in _roles:
         return _error(409, "EntityAlreadyExists",
                       f"Role with name {name} already exists.", ns="iam")
@@ -470,7 +504,7 @@ def _create_role(p):
         "CreateDate": _now(),
         "Path": path,
         "AssumeRolePolicyDocument": _p(p, "AssumeRolePolicyDocument"),
-        "Description": _p(p, "Description"),
+        "Description": description,
         "MaxSessionDuration": int(_p(p, "MaxSessionDuration") or 3600),
         "PermissionsBoundary": _p(p, "PermissionsBoundary"),
         "AttachedPolicies": [],
@@ -531,7 +565,11 @@ def _update_role(p):
     if not role:
         return _error(404, "NoSuchEntity", f"Role {name} not found.", ns="iam")
     if "Description" in p:
-        role["Description"] = _p(p, "Description")
+        description = _p(p, "Description")
+        desc_err = _validate_role_description(description)
+        if desc_err:
+            return desc_err
+        role["Description"] = description
     if "MaxSessionDuration" in p:
         role["MaxSessionDuration"] = int(_p(p, "MaxSessionDuration", "3600"))
     return _xml(200, "UpdateRoleResponse", "<UpdateRoleResult></UpdateRoleResult>", ns="iam")
@@ -552,7 +590,11 @@ def _update_role_description(p):
     if not role:
         return _error(404, "NoSuchEntity",
                       f"Role {name} not found.", ns="iam")
-    role["Description"] = _p(p, "Description")
+    description = _p(p, "Description")
+    desc_err = _validate_role_description(description)
+    if desc_err:
+        return desc_err
+    role["Description"] = description
     return _xml(200, "UpdateRoleDescriptionResponse",
                 f"<UpdateRoleDescriptionResult><Role>{_role_xml(name)}</Role></UpdateRoleDescriptionResult>",
                 ns="iam")

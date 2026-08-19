@@ -170,8 +170,21 @@ def _resolve_parameters(template: dict, provided_params: list[dict],
         if entry is not None and entry.get("UsePreviousValue"):
             prev = previous_params.get(name)
             if prev is not None:
-                value = prev["Value"] if isinstance(prev, dict) else prev
-                already_resolved = True
+                if (ptype.startswith(_SSM_PARAMETER_VALUE_PREFIX)
+                        and isinstance(prev, dict) and "SsmName" in prev):
+                    # An `AWS::SSM::Parameter::Value<...>` type is re-resolved on
+                    # every stack operation, as real CloudFormation does: the
+                    # prior deployment stored the SSM parameter NAME (`SsmName`)
+                    # for exactly this, so `UsePreviousValue=true` (what `cdk
+                    # deploy` sends for every non-overridden parameter) picks up
+                    # a value that changed in Parameter Store since the last
+                    # deploy. Leaving `already_resolved` False re-runs the SSM
+                    # lookup below. Stacks persisted before `SsmName` was tracked
+                    # fall through to the last resolved value (the old behavior).
+                    value = prev["SsmName"]
+                else:
+                    value = prev["Value"] if isinstance(prev, dict) else prev
+                    already_resolved = True
             elif "Default" in defn:
                 value = defn["Default"]
             else:
@@ -186,15 +199,18 @@ def _resolve_parameters(template: dict, provided_params: list[dict],
 
         value = str(value) if value is not None else ""
 
+        ssm_name = None
         if ptype.startswith(_SSM_PARAMETER_VALUE_PREFIX) and not already_resolved:
             # `value` up to here is the SSM parameter *name* (the template
-            # parameter's Default, or a caller-supplied override) — resolve
-            # it against the SSM store the same way real CloudFormation
-            # does before Ref ever sees it. Local import to avoid a
-            # cloudformation/ssm circular import at module load time (see
-            # ecs.py's identical pattern for the same reason).
+            # parameter's Default, a caller-supplied override, or the previous
+            # deployment's stored `SsmName`) — resolve it against the SSM store
+            # the same way real CloudFormation does before Ref ever sees it, and
+            # remember the name so the next update can re-resolve it. Local
+            # import to avoid a cloudformation/ssm circular import at module load
+            # time (see ecs.py's identical pattern for the same reason).
             from ministack.services import ssm
             param_name = value
+            ssm_name = value
             resolved_value = ssm.resolve_parameter_value(param_name)
             if resolved_value is None:
                 raise ValueError(
@@ -222,7 +238,12 @@ def _resolve_parameters(template: dict, provided_params: list[dict],
             pass
         # AWS-specific types treated as String -- no extra validation
 
-        resolved[name] = {"Value": value, "NoEcho": no_echo}
+        out = {"Value": value, "NoEcho": no_echo}
+        if ssm_name is not None:
+            # Persisted so a later UpdateStack with UsePreviousValue re-resolves
+            # the SSM name instead of reusing this now-stale resolved value.
+            out["SsmName"] = ssm_name
+        resolved[name] = out
 
     return resolved
 

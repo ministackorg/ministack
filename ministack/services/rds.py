@@ -79,6 +79,14 @@ DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
 # clients of a containerised ministack). Off by default: existing in-network
 # behavior unchanged.
 RDS_PUBLIC_ENDPOINT = os.environ.get("MINISTACK_RDS_PUBLIC_ENDPOINT", "0").lower() in ("1", "true", "yes")
+# Opt-in: per-instance Aurora PostgreSQL reader containers backed by real
+# streaming replication (#1325). Scoped to aurora-postgresql by name and by
+# gate: Aurora MySQL readers keep aliasing the single shared container, and
+# the physical-replication bootstrap below is PostgreSQL-specific
+# (pg_basebackup + hot standby). Off by default: existing behavior unchanged.
+RDS_PG_CLUSTER_REPLICATION = os.environ.get(
+    "MINISTACK_RDS_PG_CLUSTER_REPLICATION", "0",
+).lower() in ("1", "true", "yes")
 
 _instances = AccountRegionScopedDict()
 _clusters = AccountRegionScopedDict()
@@ -107,6 +115,66 @@ _MYSQL_REPLICATION_RETRY_INTERVAL = 1
 # cluster through the mysql.rds_set_configuration stored procedure (hours),
 # not an environment variable.
 _MYSQL_BINLOG_RETENTION_SECONDS = 604800  # 7 days
+
+# Streaming-replication credentials for per-instance Aurora PostgreSQL reader
+# containers (#1325). ``rdsrepladmin`` mirrors the reserved role name real RDS
+# PostgreSQL provisions for replication. Fixed local-only credentials, same
+# convention as the MySQL replication user above.
+_PG_REPLICATION_USER = "rdsrepladmin"
+_PG_REPLICATION_PASSWORD = "rdsrepladmin-local-password"
+
+# Runs on the writer container (docker exec). Idempotently creates the
+# replication role and opens pg_hba.conf for remote replication connections:
+# the stock postgres image only allows replication from localhost, so
+# without the extra rule a reader's pg_basebackup is rejected. The role is
+# created with an explicit scram-sha-256 verifier so the pg_hba method below
+# authenticates it on every supported major (password_encryption defaulted
+# to md5 before PostgreSQL 14).
+_PG_REPLICATION_SOURCE_SCRIPT = f"""set -eu
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'SQL'
+SET password_encryption = 'scram-sha-256';
+DO $do$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{_PG_REPLICATION_USER}') THEN
+        CREATE ROLE {_PG_REPLICATION_USER} WITH REPLICATION LOGIN
+            PASSWORD '{_PG_REPLICATION_PASSWORD}';
+    END IF;
+END
+$do$;
+SQL
+if ! grep -q "host replication {_PG_REPLICATION_USER}" "$PGDATA/pg_hba.conf"; then
+    printf 'host replication {_PG_REPLICATION_USER} all scram-sha-256\\n' \\
+        >> "$PGDATA/pg_hba.conf"
+fi
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \\
+    -c "SELECT pg_reload_conf()" >/dev/null
+"""
+
+# Container command for a reader: bypass the image entrypoint (which would
+# initdb a brand-new independent database) and instead clone the writer with
+# pg_basebackup, then start PostgreSQL as a hot standby. The base backup is
+# retried until the writer is ready and the replication role exists, so
+# reader creation may safely overlap writer creation. --write-recovery-conf
+# records the primary connection (including the password, because it is
+# passed inside --dbname) so the standby streams WAL from the writer.
+_PG_READER_BOOTSTRAP_SCRIPT = """set -eu
+until pg_isready -h "$MINISTACK_PG_PRIMARY_HOST" \\
+        -p "$MINISTACK_PG_PRIMARY_PORT" >/dev/null 2>&1; do
+    sleep 1
+done
+mkdir -p "$PGDATA"
+chown -R postgres:postgres "$PGDATA"
+chmod 700 "$PGDATA"
+until gosu postgres pg_basebackup \\
+        --dbname="host=$MINISTACK_PG_PRIMARY_HOST port=$MINISTACK_PG_PRIMARY_PORT \\
+user=$MINISTACK_PG_REPLICATION_USER password=$MINISTACK_PG_REPLICATION_PASSWORD" \\
+        --pgdata="$PGDATA" --write-recovery-conf --wal-method=stream \\
+        --checkpoint=fast; do
+    find "$PGDATA" -mindepth 1 -delete
+    sleep 1
+done
+exec gosu postgres postgres
+"""
 
 # Aurora MySQL versions are the creatable set returned by AWS RDS as of
 # 2026-07-09. Refresh with:
@@ -260,6 +328,11 @@ def restore_state(data):
         cluster = _clusters._data[key]
         cluster["_shared_container_id"] = None
         cluster.pop("_mysql_replication_retry_marker", None)
+        # Re-verify replication provisioning against the respawned writer
+        # (#1325): the role and pg_hba rule live in the cluster volume and
+        # normally survive, but the flag must not outlive a volume that
+        # did not.
+        cluster.pop("_pg_replication_source_ready", None)
         if cluster.get("_mysql_replication_source_arn"):
             # A respawned MySQL container gets a new hostname, while the
             # persisted replica repository and relay-log names belong to the
@@ -293,6 +366,12 @@ def restore_state(data):
             account_id, region, instance_id = key
             inst["_docker_container_id"] = None
             inst["DBInstanceStatus"] = "creating"
+            # Warm boot of per-instance reader containers is not implemented
+            # yet (#1325 slice 3). Demote a persisted replicating reader to a
+            # shared-container alias member so the restored cluster is fully
+            # usable instead of leaving a reader that points at a container
+            # the restart killed.
+            inst.pop("_pg_standby", None)
             if RDS_PERSIST:
                 inst.setdefault(
                     "_docker_volume_name",
@@ -1054,6 +1133,303 @@ def _cluster_owned_container_ids(cluster):
             if container_id not in ids:
                 ids.append(container_id)
     return ids
+
+
+def _pg_cluster_replication_enabled(cluster):
+    """Whether this cluster launches per-instance reader containers (#1325).
+
+    Requires the ``MINISTACK_RDS_PG_CLUSTER_REPLICATION`` opt-in and an
+    Aurora PostgreSQL cluster: the reader bootstrap is physical streaming
+    replication (pg_basebackup + hot standby), which has no MySQL analog
+    here — Aurora MySQL members keep aliasing the shared container.
+    """
+    return (
+        RDS_PG_CLUSTER_REPLICATION
+        and cluster.get("Engine") == "aurora-postgresql"
+    )
+
+
+def _ensure_pg_replication_source(cluster_id, cluster):
+    """Provision streaming-replication access on the writer's container.
+
+    Idempotent: creates the replication role and appends the pg_hba.conf
+    rule that allows remote replication connections, then reloads
+    configuration. Returns True once the writer can serve pg_basebackup
+    for reader containers; False when provisioning could not run (no
+    Docker, no writer container, or the exec failed) — callers retry.
+
+    The check-then-provision runs under ``_shared_container_lock`` so
+    concurrent reader workers on the same cluster provision once instead
+    of racing the flag (the script tolerates a rerun, but two interleaved
+    executions against the same writer are pointless work).
+    """
+    with _shared_container_lock:
+        if cluster.get("_pg_replication_source_ready"):
+            return True
+        docker_client = _get_docker()
+        container_id = cluster.get("_shared_container_id")
+        if not docker_client or not container_id:
+            return False
+        try:
+            container = docker_client.containers.get(container_id)
+            exit_code, output = container.exec_run(
+                ["sh", "-c", _PG_REPLICATION_SOURCE_SCRIPT],
+            )
+        except Exception as e:
+            logger.warning(
+                "RDS: failed to provision replication source for cluster %s: %s",
+                cluster_id, e,
+            )
+            return False
+        if exit_code != 0:
+            logger.warning(
+                "RDS: replication source provisioning for cluster %s exited %s: %s",
+                cluster_id,
+                exit_code,
+                output.decode(errors="replace") if isinstance(output, bytes) else output,
+            )
+            return False
+        cluster["_pg_replication_source_ready"] = True
+        return True
+
+
+def _start_pg_reader_container(db_id, cluster):
+    """Launch a member-owned hot-standby container for an Aurora PostgreSQL
+    cluster (#1325).
+
+    Returns a start-result dict ({"started", "failed", endpoint fields}),
+    or None when per-instance replication cannot run here — no Docker, no
+    shared internal Docker network, or no known writer address — in which
+    case the caller falls back to shared-container aliasing, the flag-off
+    behavior.
+    """
+    docker_client = _get_docker()
+    if not docker_client:
+        return None
+    cluster_id = cluster["DBClusterIdentifier"]
+    ms_network = _get_ministack_network(docker_client)
+    writer_host = cluster.get("_shared_internal_address")
+    writer_port = cluster.get("_shared_internal_port")
+    if not ms_network or not writer_host:
+        # pg_basebackup runs inside the reader container and must reach the
+        # writer container; without a shared Docker network there is no
+        # address that works from both the host and the reader.
+        logger.warning(
+            "RDS: MINISTACK_RDS_PG_CLUSTER_REPLICATION is on but cluster %s "
+            "has no internal Docker network address; reader %s falls back "
+            "to the shared container",
+            cluster_id, db_id,
+        )
+        return None
+    engine = cluster.get("Engine", "aurora-postgresql")
+    engine_version = cluster.get("EngineVersion") or _default_engine_version(engine)
+    master_user = cluster.get("MasterUsername", "admin")
+    master_pass = cluster.get("_MasterUserPassword", "password")
+    db_name = cluster.get("DatabaseName") or "mydb"
+    image, env, container_port, data_path = _docker_image_for_engine(
+        engine, engine_version, master_user, master_pass, db_name,
+    )
+    if not image:
+        return None
+    env = dict(env)
+    env.update({
+        "MINISTACK_PG_PRIMARY_HOST": str(writer_host),
+        "MINISTACK_PG_PRIMARY_PORT": str(writer_port or container_port),
+        "MINISTACK_PG_REPLICATION_USER": _PG_REPLICATION_USER,
+        "MINISTACK_PG_REPLICATION_PASSWORD": _PG_REPLICATION_PASSWORD,
+    })
+    host_port = _next_port()
+    container_kwargs = dict(
+        image=image,
+        detach=True,
+        environment=env,
+        command=["sh", "-c", _PG_READER_BOOTSTRAP_SCRIPT],
+        ports={f"{container_port}/tcp": host_port},
+        name=_rds_docker_name(db_id),
+        network=ms_network,
+        labels={
+            "ministack": "rds",
+            "db_id": db_id,
+            "cluster_id": cluster_id,
+            "account_id": get_account_id(),
+            "region": get_region(),
+        },
+    )
+    volume_name = None
+    if RDS_PERSIST:
+        volume_name = _rds_docker_volume_name(db_id)
+        container_kwargs["volumes"] = {
+            volume_name: {"bind": data_path, "mode": "rw"},
+        }
+    else:
+        container_kwargs["tmpfs"] = {
+            data_path: f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}",
+        }
+    try:
+        container = docker_client.containers.run(**container_kwargs)
+    except Exception as e:
+        logger.warning(
+            "RDS: failed to start reader container for %s: %s", db_id, e,
+        )
+        if volume_name:
+            # Docker may have auto-created the named volume before the run
+            # failed; a leftover (possibly partially written) volume would
+            # poison a retried CreateDBInstance under the same identifier.
+            try:
+                docker_client.volumes.get(volume_name).remove()
+            except Exception:
+                pass
+        return {"started": False, "failed": True}
+    endpoint_host = _MINISTACK_HOST
+    endpoint_port = host_port
+    internal_host = None
+    internal_port = None
+    try:
+        container.reload()
+        networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+        container_ip = networks.get(ms_network, {}).get("IPAddress", "")
+        if container_ip:
+            endpoint_host = container_ip
+            endpoint_port = container_port
+            internal_host = container_ip
+            internal_port = container_port
+    except Exception:
+        pass
+    return {
+        "started": True,
+        "failed": False,
+        "container_id": container.id,
+        "volume_name": volume_name,
+        "host_port": host_port,
+        "endpoint_host": endpoint_host,
+        "endpoint_port": endpoint_port,
+        "internal_host": internal_host,
+        "internal_port": internal_port,
+        "readiness_host": internal_host or "127.0.0.1",
+        "readiness_port": internal_port or host_port,
+    }
+
+
+def _remove_failed_pg_reader_compute(db_id, container_id, volume_name):
+    """Remove a failed replicating reader's container and named volume.
+
+    A standby that never became reachable leaves nothing worth keeping:
+    its data directory holds at most a partial base backup, and the volume
+    name is derived from the instance identifier, so leaving either behind
+    would leak a host port and poison a retried CreateDBInstance under the
+    same identifier. Cleanup for healthy readers stays in
+    ``_delete_db_instance``; this runs only for bootstrap failures.
+    """
+    docker_client = _get_docker()
+    if not docker_client:
+        return
+    try:
+        container = docker_client.containers.get(container_id)
+        container.stop(timeout=5)
+        container.remove(v=True)
+    except Exception as e:
+        logger.warning(
+            "RDS: failed to remove container of failed reader %s: %s",
+            db_id, e,
+        )
+    if volume_name:
+        try:
+            docker_client.volumes.get(volume_name).remove()
+        except Exception as e:
+            logger.warning(
+                "RDS: failed to remove volume of failed reader %s: %s",
+                db_id, e,
+            )
+
+
+def _bg_finalize_pg_reader(
+    db_id, cluster_id, engine, master_user, master_pass, db_name,
+    ready_host, ready_port, container_id,
+):
+    """Readiness worker for a member-owned replicating reader (#1325).
+
+    Waits for the writer to become ready, provisions the replication
+    source on it, then waits for the standby to accept authenticated
+    connections (the reader container retries pg_basebackup internally
+    until the source is provisioned). Same liveness contract as the
+    generic worker: no wall clock — the instance stays ``creating`` while
+    its container is up and booting, and flips to ``failed`` if the
+    container dies first. Same staleness contract as the shared-container
+    worker: if the instance record no longer points at this worker's
+    container (deleted and recreated under the same identifier), the
+    worker is superseded and must not touch the new record. A bootstrap
+    failure removes the reader's own container and volume.
+    """
+    def _container_alive():
+        client = _get_docker()
+        if not client:
+            return True
+        try:
+            c = client.containers.get(container_id)
+            c.reload()
+            return c.status not in ("exited", "dead", "removing")
+        except Exception:
+            return False
+
+    def _stale(instance):
+        return instance.get("_docker_container_id") != container_id
+
+    while True:
+        instance = _instances.get(db_id)
+        cluster = _clusters.get(cluster_id)
+        if instance is None or cluster is None:
+            return  # deleted while bootstrapping
+        if _stale(instance):
+            return  # superseded: the recreated instance has its own worker
+        if instance.get("DBInstanceStatus") == "failed":
+            # Writer compute failed during creation; its readiness worker
+            # already published the failure for every member. The standby
+            # container would retry pg_basebackup against the dead writer
+            # forever, so remove it.
+            _remove_failed_pg_reader_compute(
+                db_id, container_id, instance.get("_docker_volume_name"),
+            )
+            return
+        if not _container_alive():
+            instance["DBInstanceStatus"] = "failed"
+            _remove_failed_pg_reader_compute(
+                db_id, container_id, instance.get("_docker_volume_name"),
+            )
+            _refresh_cluster_status(cluster_id)
+            return
+        if cluster.get(
+            "_shared_container_ready",
+        ) and _ensure_pg_replication_source(cluster_id, cluster):
+            break
+        time.sleep(1)
+
+    database_ready = _wait_for_database_ready(
+        ready_host, ready_port, engine, master_user, master_pass, db_name,
+        _container_alive,
+    )
+    instance = _instances.get(db_id)
+    cluster = _clusters.get(cluster_id)
+    if instance is None or _stale(instance):
+        return
+    if not database_ready:
+        logger.warning(
+            "RDS: reader container for %s at %s:%s exited before becoming "
+            "reachable", db_id, ready_host, ready_port,
+        )
+        instance["DBInstanceStatus"] = "failed"
+        _remove_failed_pg_reader_compute(
+            db_id, container_id, instance.get("_docker_volume_name"),
+        )
+        _refresh_cluster_status(cluster_id)
+        return
+    instance["DBInstanceStatus"] = "available"
+    if cluster:
+        _sync_cluster_endpoints(cluster)
+    _refresh_cluster_status(cluster_id)
+    logger.info(
+        "RDS: replicating reader %s ready at %s:%s", db_id,
+        ready_host, ready_port,
+    )
 
 
 def _stop_cluster_shared_container(cluster_id, cluster):
@@ -2550,6 +2926,10 @@ def _set_cluster_members_status(cluster, status):
 
 
 def _attach_instance_to_shared_cluster(instance, cluster):
+    if instance.get("_pg_standby"):
+        # A replicating reader owns its container and endpoint (#1325);
+        # aliasing would clobber them with the writer's.
+        return
     endpoint = cluster.get("_shared_endpoint")
     if not endpoint:
         return
@@ -2578,13 +2958,31 @@ def _attach_instance_to_shared_cluster(instance, cluster):
 def _cluster_reader_endpoint(cluster):
     """The endpoint a cluster's ``ReaderEndpoint`` should resolve to.
 
-    Today this is the writer's shared endpoint, so the local reader endpoint
-    is read/write: it resolves to the same database process as the writer.
-    Genuine read-only behavior requires a separate replicating process —
-    per-instance reader containers (#1325) will resolve here instead once a
-    cluster has one.
+    When a member owns a replicating reader container (#1325) and it is
+    available, the reader endpoint resolves there and is genuinely
+    read-only. Otherwise it falls back to the writer's shared endpoint —
+    matching real Aurora, where the reader endpoint follows the writer in
+    a single-instance cluster, but read/write because it resolves to the
+    same database process as the writer.
+
+    A DBCluster advertises a single ``Port`` (the writer's, applied by
+    ``_sync_cluster_endpoints``), so a standby only reachable on a
+    different port — the host-port fallback when its network IP lookup
+    failed — must not win the ReaderEndpoint address: pairing its Address
+    with the writer's Port would be unreachable.
     """
-    return cluster.get("_shared_endpoint")
+    shared = cluster.get("_shared_endpoint")
+    for member in _cluster_member_instances(cluster):
+        if (
+            member.get("_pg_standby")
+            and member.get("DBInstanceStatus") == "available"
+            and member.get("Endpoint")
+        ):
+            endpoint = member["Endpoint"]
+            if shared and endpoint.get("Port") != shared.get("Port"):
+                continue
+            return endpoint
+    return shared
 
 
 def _sync_cluster_endpoints(cluster):
@@ -2748,7 +3146,31 @@ def _create_db_instance_impl(p):
     ms_network = None
 
     docker_client = _get_docker()
-    if parent:
+    reader_launch = None
+    if (
+        parent
+        and parent.get("DBClusterMembers")
+        and _pg_cluster_replication_enabled(parent)
+    ):
+        # Second and later members of a flag-enabled Aurora PostgreSQL
+        # cluster get their own hot-standby container instead of aliasing
+        # the writer's (#1325). Returns None when that cannot run here,
+        # falling back to the aliasing branch below.
+        reader_launch = _start_pg_reader_container(db_id, parent)
+    if parent and reader_launch:
+        start_result = reader_launch
+        endpoint_host = reader_launch.get("endpoint_host", endpoint_host)
+        endpoint_port = int(reader_launch.get("endpoint_port", endpoint_port))
+        host_port = reader_launch.get("host_port")
+        docker_container_id = reader_launch.get("container_id")
+        docker_volume_name = reader_launch.get("volume_name")
+        internal_host = reader_launch.get("internal_host")
+        internal_port = reader_launch.get("internal_port")
+        real_container_started = bool(reader_launch.get("started"))
+        readiness_host = reader_launch.get("readiness_host")
+        readiness_port = reader_launch.get("readiness_port")
+        ms_network = _get_ministack_network(docker_client)
+    elif parent:
         pending_rotation = parent.get("_pending_master_password_rotation")
         if pending_rotation:
             readiness_master_pass = pending_rotation["old_password"]
@@ -2996,12 +3418,33 @@ def _create_db_instance_impl(p):
         "_internal_port": internal_port,
         "_MasterUserPassword": master_pass,
     }
-    if parent:
+    if parent and reader_launch:
+        # A replicating reader keeps its own endpoint and container fields;
+        # the marker excludes it from shared-container aliasing and makes
+        # the cluster ReaderEndpoint resolve to it once available.
+        instance["_pg_standby"] = True
+    elif parent:
         _attach_instance_to_shared_cluster(instance, parent)
     _instances[db_id] = instance
     _register_instance_in_cluster(instance)
 
-    if real_container_started:
+    if real_container_started and reader_launch:
+        # Replicating readers have their own readiness contract (wait for
+        # the writer, provision replication, wait for the standby), so they
+        # get a dedicated worker instead of the generic one below.
+        reader_ctx = contextvars.copy_context()
+        threading.Thread(
+            target=reader_ctx.run,
+            args=(
+                _bg_finalize_pg_reader, db_id, cluster_id, engine,
+                master_user, master_pass, db_name,
+                readiness_host or endpoint_host,
+                readiness_port or endpoint_port,
+                docker_container_id,
+            ),
+            daemon=True,
+        ).start()
+    elif real_container_started:
         # Real AWS CreateDBInstance returns immediately with status="creating"
         # and the caller polls (or uses get_waiter('db_instance_available'))
         # until the database becomes reachable. Do the same: run the readiness
@@ -3131,9 +3574,14 @@ def _create_db_instance_impl(p):
                         _configure_or_defer_mysql_replication(cluster_id, cluster)
                     for member in cluster.get("DBClusterMembers", []):
                         inst = _instances.get(member.get("DBInstanceIdentifier"))
-                        if inst is not None:
-                            _attach_instance_to_shared_cluster(inst, cluster)
-                            inst["DBInstanceStatus"] = "available"
+                        if inst is None or inst.get("_pg_standby"):
+                            # Replicating readers publish their own
+                            # readiness (#1325); the writer becoming ready
+                            # does not make a still-bootstrapping standby
+                            # available.
+                            continue
+                        _attach_instance_to_shared_cluster(inst, cluster)
+                        inst["DBInstanceStatus"] = "available"
                     _sync_cluster_endpoints(cluster)
                     _refresh_cluster_status(cluster_id)
                 if ms_network and internal_host:
@@ -5006,6 +5454,22 @@ def _stop_db_cluster(p):
             f"in {status} state but expected it to be one of available.",
             400,
         )
+    if any(
+        inst.get("_pg_standby") for inst in _cluster_member_instances(cluster)
+    ):
+        # Restarting per-instance reader containers after a stop is not
+        # implemented yet (#1325 slice 3). Refusing here beats the two bad
+        # alternatives: an ``available`` reader whose container is exited,
+        # or a cluster wedged in ``creating`` because a member never
+        # becomes available again.
+        return _error(
+            "InvalidDBClusterStateFault",
+            "StopDBCluster is not supported for clusters with replicating "
+            "reader instances yet; delete the reader instances first "
+            "(MINISTACK_RDS_PG_CLUSTER_REPLICATION, "
+            "https://github.com/ministackorg/ministack/issues/1325).",
+            400,
+        )
     if not _stop_cluster_shared_container(
         cluster.get("DBClusterIdentifier", cluster_id), cluster,
     ):
@@ -5025,6 +5489,129 @@ def _stop_db_cluster(p):
         inst["DBInstanceStatus"] = "stopped"
     return _xml(200, "StopDBClusterResponse",
         f"<StopDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></StopDBClusterResult>")
+
+
+def _failover_db_cluster(p):
+    """Force an intra-cluster failover: promote a reader member to writer.
+
+    Metadata-only for now, mirroring ``_failover_global_cluster``: the member
+    ``IsClusterWriter`` flags flip and the response reports the transitional
+    ``failing-over`` cluster status (the stored status stays ``available``,
+    as a follow-up DescribeDBClusters observes on AWS once the failover
+    completes). Data-plane promotion of a replicating reader container is a
+    follow-up (#1325); with today's shared-container clusters every member
+    already points at the same process, so there is nothing to re-point.
+
+    Error fidelity notes (wire codes from the RDS service model):
+    - unknown cluster: ``DBClusterNotFoundFault`` (404)
+    - cluster not ``available`` / no reader to promote:
+      ``InvalidDBClusterStateFault`` (400)
+    - target problems: ``InvalidDBInstanceState`` (400) — the instance-level
+      code omits the ``Fault`` suffix, like ``DBInstanceAlreadyExists``
+      (#1297); a target that exists nowhere is ``DBInstanceNotFound`` (404).
+    """
+    cluster_id = _p(p, "DBClusterIdentifier")
+    cluster = _resolve_cluster_in_request_region(cluster_id)
+    if not cluster:
+        wrong_region = _invalid_cluster_identifier_error(cluster_id)
+        if wrong_region:
+            return wrong_region
+        return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
+    cluster_id = cluster.get("DBClusterIdentifier", cluster_id)
+    status = cluster.get("Status")
+    if status != "available":
+        return _error(
+            "InvalidDBClusterStateFault",
+            f"DbCluster {cluster_id} is in {status} state but expected it to "
+            "be one of available.",
+            400,
+        )
+    if cluster.get("_shared_legacy_migration_in_progress") or cluster.get(
+        "_shared_legacy_migration_blocked",
+    ):
+        # restore_state's one-time legacy-storage migration reads
+        # IsClusterWriter to pick which member's volume becomes the
+        # cluster's adopted shared state; flipping the flag mid-migration
+        # could make it adopt a reader's volume. Same gate as
+        # CreateDBInstance's cluster-member path.
+        return _error(
+            "InvalidDBClusterStateFault",
+            f"Cannot failover DB cluster {cluster_id} while legacy shared-"
+            "storage migration is in progress.",
+            400,
+        )
+
+    members = cluster.get("DBClusterMembers", [])
+    readers = [m for m in members if not m.get("IsClusterWriter")]
+
+    target_id = _p(p, "TargetDBInstanceIdentifier")
+    if target_id:
+        target = next(
+            (m for m in members if m.get("DBInstanceIdentifier") == target_id),
+            None,
+        )
+        if not target:
+            if not _resolve_instance(target_id):
+                return _error(
+                    "DBInstanceNotFound", f"DBInstance {target_id} not found.", 404)
+            return _error(
+                "InvalidDBInstanceState",
+                f"DBInstance {target_id} is not a member of DB cluster "
+                f"{cluster_id}.",
+                400,
+            )
+        if target.get("IsClusterWriter"):
+            return _error(
+                "InvalidDBInstanceState",
+                f"DBInstance {target_id} is already the writer of DB cluster "
+                f"{cluster_id}; specify a reader instance to promote.",
+                400,
+            )
+        target_instance = _resolve_instance(target_id)
+        if target_instance is None:
+            # A member with no backing instance record cannot happen today
+            # (deletion unregisters the member synchronously), but promoting
+            # a phantom would strand the cluster; refuse defensively.
+            return _error(
+                "DBInstanceNotFound", f"DBInstance {target_id} not found.", 404)
+        if target_instance.get("DBInstanceStatus") != "available":
+            return _error(
+                "InvalidDBInstanceState",
+                f"DBInstance {target_id} is in "
+                f"{target_instance.get('DBInstanceStatus')} state but expected "
+                "it to be one of available.",
+                400,
+            )
+    else:
+        # AWS promotes the best candidate from the lowest promotion tier;
+        # within a tier Ministack keeps member order (no instance sizing).
+        def _promotable(member):
+            inst = _resolve_instance(member.get("DBInstanceIdentifier", ""))
+            return inst is not None and inst.get("DBInstanceStatus") == "available"
+
+        candidates = sorted(
+            (m for m in readers if _promotable(m)),
+            key=lambda m: int(m.get("PromotionTier", 1)),
+        )
+        if not candidates:
+            return _error(
+                "InvalidDBClusterStateFault",
+                f"Cannot failover DB cluster {cluster_id} because it has no "
+                "available reader instance to promote.",
+                400,
+            )
+        target = candidates[0]
+        target_id = target["DBInstanceIdentifier"]
+
+    for member in members:
+        member["IsClusterWriter"] = (
+            member.get("DBInstanceIdentifier") == target_id
+        )
+
+    response_cluster = copy.deepcopy(cluster)
+    response_cluster["Status"] = "failing-over"
+    return _xml(200, "FailoverDBClusterResponse",
+        f"<FailoverDBClusterResult><DBCluster>{_cluster_xml(response_cluster)}</DBCluster></FailoverDBClusterResult>")
 
 
 # ---------------------------------------------------------------------------
@@ -6423,6 +7010,7 @@ _ACTION_MAP = {
     "ModifyDBCluster": _modify_db_cluster,
     "StartDBCluster": _start_db_cluster,
     "StopDBCluster": _stop_db_cluster,
+    "FailoverDBCluster": _failover_db_cluster,
     "CreateDBSnapshot": _create_db_snapshot,
     "DeleteDBSnapshot": _delete_db_snapshot,
     "DescribeDBSnapshots": _describe_db_snapshots,

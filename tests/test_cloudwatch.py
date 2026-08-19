@@ -221,6 +221,51 @@ def test_cloudwatch_get_metric_data_v2(cw):
     assert resp["MetricDataResults"][0]["StatusCode"] == "Complete"
     assert len(resp["MetricDataResults"][0]["Values"]) >= 1
 
+def test_cloudwatch_get_metric_data_extended_percentile(cw):
+    """Extended-statistic percentiles (pNN) must be computed from the raw sample
+    values via linear interpolation between the two nearest ranks, not silently
+    aliased to Average regardless of which percentile is requested.
+    Expected values below are hand-computed for the dataset
+    [1, 2, 3, 4, 90, 95, 98, 99] (n=8):
+      p50: rank=3.5  -> 4 + 0.5*(90-4) = 47.0
+      p95: rank=6.65 -> 98 + 0.65*(99-98) = 98.65
+      p5:  rank=0.35 -> 1 + 0.35*(2-1) = 1.35
+    """
+    ns = "Test/GMDPercentile"
+    now = time.time()
+    for i, v in enumerate([1, 2, 3, 4, 90, 95, 98, 99]):
+        cw.put_metric_data(Namespace=ns, MetricData=[{
+            "MetricName": "Latency",
+            "Dimensions": [{"Name": "Host", "Value": "h1"}],
+            "Timestamp": now - i,
+            "Value": float(v),
+        }])
+
+    def _value(stat):
+        resp = cw.get_metric_data(
+            MetricDataQueries=[{
+                "Id": "q1",
+                "MetricStat": {
+                    "Metric": {
+                        "Namespace": ns, "MetricName": "Latency",
+                        "Dimensions": [{"Name": "Host", "Value": "h1"}],
+                    },
+                    "Period": 3600,
+                    "Stat": stat,
+                },
+                "ReturnData": True,
+            }],
+            StartTime=now - 3600,
+            EndTime=now + 3600,
+        )
+        return resp["MetricDataResults"][0]["Values"][0]
+
+    assert _value("Average") == pytest.approx(49.0)
+    assert _value("p50") == pytest.approx(47.0)
+    assert _value("p95") == pytest.approx(98.65)
+    assert _value("p5") == pytest.approx(1.35)
+    assert _value("p95") != _value("p5")
+
 def test_cloudwatch_get_metric_data_honors_dimensions(cw):
     """GetMetricData resolves by the query's dimension set, like GetMetricStatistics.
 
@@ -793,3 +838,32 @@ def test_cloudwatch_get_metric_data_cbor_timestamps_are_tag1():
                 _cw._metrics.pop_scoped("000000000000", "us-east-1", key, None)
         _resp._request_region.reset(region_tok)
         _resp._request_account_id.reset(acct_tok)
+
+
+def test_cloudwatch_percentile_alarm_reason_reports_statistic(cw):
+    """A percentile alarm's StateReason must name the actual extended statistic
+    (e.g. p90), not fall back to Average. Regression for the label that stayed
+    'Average' after the percentile value itself was fixed."""
+    ns = "Test/PctAlarmReason"
+    now = time.time()
+    for i, v in enumerate([1, 2, 3, 4, 90, 95, 98, 99]):
+        cw.put_metric_data(Namespace=ns, MetricData=[{
+            "MetricName": "Latency",
+            "Timestamp": now - i,
+            "Value": float(v),
+        }])
+    # p90 of the set is 98.3; threshold 50 -> breaches -> ALARM.
+    cw.put_metric_alarm(
+        AlarmName="pct-reason",
+        MetricName="Latency",
+        Namespace=ns,
+        ExtendedStatistic="p90",
+        Period=3600,
+        EvaluationPeriods=1,
+        Threshold=50.0,
+        ComparisonOperator="GreaterThanThreshold",
+    )
+    alarm = cw.describe_alarms(AlarmNames=["pct-reason"])["MetricAlarms"][0]
+    assert alarm["StateValue"] == "ALARM"
+    assert "p90" in alarm["StateReason"]
+    assert "Average" not in alarm["StateReason"]
