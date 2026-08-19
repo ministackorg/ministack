@@ -86,9 +86,26 @@ def _physical_name(stack_name: str, logical_id: str, *,
     picked up that new (wrong) identity the moment it was reprocessed later in
     the same update. Resource *replacement* (a property change real AWS can't
     apply in place) isn't specially detected here — same as before this fix.
+
+    Truncates the `{stack}-{logicalId}-` prefix, never the suffix: a naive
+    `base[:max_len]` on the full concatenated string drops whatever falls past
+    max_len, and for a deeply-nested CDK stack the auto-generated stack_name
+    alone (parent-nested-name plus a CloudFormation-assigned resource-id
+    segment) can already exceed max_len on its own — e.g. a 64-char Lambda
+    FunctionName limit against a >100-char nested-stack name. When that
+    happens, every resource in that stack truncates to an identical string
+    regardless of logical_id, since the part that would have disambiguated
+    them (logical_id, then the hash) never survives the slice — collapsing
+    every Lambda in the nested stack onto one physical function, so only one
+    of them ever actually runs regardless of which the caller invokes.
+    Reserving room for the suffix keeps it intact even when the prefix must be
+    cut, since the suffix alone (hashed from stack_name *and* logical_id) is
+    what actually guarantees uniqueness here.
     """
     suffix = hashlib.sha256(f"{stack_name}:{logical_id}".encode()).hexdigest()[:13].upper()
-    base = f"{stack_name}-{logical_id}-{suffix}"
+    prefix = f"{stack_name}-{logical_id}-"
+    available = max(max_len - len(suffix), 0)
+    base = prefix[:available] + suffix
     if lowercase:
         base = base.lower()
     return base[:max_len]
@@ -1030,31 +1047,90 @@ def _iam_ip_delete(physical_id, props):
 
 # --- SSM Parameter ---
 
-def _ssm_create(logical_id, props, stack_name):
-    name = props.get("Name") or f"/{stack_name}/{logical_id}"
-    ptype = props.get("Type", "String")
-    value = props.get("Value", "")
-    description = props.get("Description", "")
-    param_arn = _ssm._param_arn(name)
+# CloudFormation supports only these two parameter types; `SecureString` in
+# particular is not supported (aws-resource-ssm-parameter reference).
+_SSM_CFN_PARAMETER_TYPES = ("String", "StringList")
 
-    _ssm._parameters[name] = {
+
+def _ssm_check_type(props):
+    ptype = props.get("Type", "String")
+    if ptype not in _SSM_CFN_PARAMETER_TYPES:
+        raise ValueError(
+            f"AWS::SSM::Parameter Type '{ptype}' is not supported by "
+            "CloudFormation (allowed values: String, StringList)")
+
+
+def _ssm_put_data(name, props):
+    """PutParameter payload for an ``AWS::SSM::Parameter`` resource.
+
+    CloudFormation ``Tags`` is a map; the SSM API wants a ``[{Key, Value}]`` list.
+    """
+    data = {
         "Name": name,
-        "Type": ptype,
-        "Value": value,
-        "Version": 1,
-        "LastModifiedDate": _ssm._now_epoch(),
-        "ARN": param_arn,
-        "DataType": "text",
-        "Description": description,
+        "Type": props.get("Type", "String"),
+        "Value": props.get("Value", ""),
+        "Description": props.get("Description", ""),
         "Tier": props.get("Tier", "Standard"),
         "AllowedPattern": props.get("AllowedPattern", ""),
-        "Tags": [],
+        "DataType": props.get("DataType", "text"),
     }
-    return name, {"Type": ptype, "Value": value}
+    if props.get("Policies"):
+        data["Policies"] = props["Policies"]
+    tags = props.get("Tags")
+    if isinstance(tags, dict):
+        data["Tags"] = [{"Key": k, "Value": v} for k, v in tags.items()]
+    return data
+
+
+def _ssm_attrs(name, data):
+    # Ref returns the parameter name; Fn::GetAtt exposes Arn / Type / Value.
+    return {"Arn": _ssm._param_arn(name), "Type": data["Type"], "Value": data["Value"]}
+
+
+def _ssm_create(logical_id, props, stack_name):
+    # Go through PutParameter rather than writing the SSM store directly, so the
+    # two doors into the same store behave alike: a create over an existing
+    # parameter fails as real CloudFormation does (`ParameterAlreadyExists`), and
+    # Version/history stay consistent with the API path.
+    _ssm_check_type(props)
+    name = props.get("Name") or f"/{stack_name}/{logical_id}"
+    data = _ssm_put_data(name, props)
+    status, _headers, body = _ssm._put_parameter(data)
+    if status >= 400:
+        raise ValueError(f"AWS::SSM::Parameter create failed: {body!r}")
+    return name, _ssm_attrs(name, data)
+
+
+def _ssm_update(physical_id, old_props, new_props, stack_name):
+    _ssm_check_type(new_props)
+    new_name = new_props.get("Name")
+    if new_name and new_name != physical_id:
+        # Name is Update requires: Replacement — create the new parameter and
+        # drop the old one, returning the new physical id.
+        data = _ssm_put_data(new_name, new_props)
+        status, _headers, body = _ssm._put_parameter(data)
+        if status >= 400:
+            raise ValueError(f"AWS::SSM::Parameter replace failed: {body!r}")
+        # Drop the old parameter through the SSM path so its history and tags go
+        # with it (a bare store pop orphaned both).
+        _ssm._delete_parameter({"Name": physical_id})
+        return new_name, _ssm_attrs(new_name, data)
+    # Every other property is No interruption: overwrite in place through
+    # PutParameter, so Version increments and history grows (a bare store write
+    # pinned Version at 1 forever).
+    data = _ssm_put_data(physical_id, new_props)
+    data["Overwrite"] = True
+    status, _headers, body = _ssm._put_parameter(data)
+    if status >= 400:
+        raise ValueError(f"AWS::SSM::Parameter update failed: {body!r}")
+    return physical_id, _ssm_attrs(physical_id, data)
 
 
 def _ssm_delete(physical_id, props):
-    _ssm._parameters.pop(physical_id, None)
+    # Delete through the SSM path (not a bare store pop) so history and tags are
+    # cleaned too; a missing parameter is a no-op, so repeated/post-reset deletes
+    # converge.
+    _ssm._delete_parameter({"Name": physical_id})
 
 
 # --- AppConfig Application ---
@@ -2366,16 +2442,15 @@ def _apigw_api_key_create(logical_id, props, stack_name):
 
 
 def _apigw_api_key_update(physical_id, old_props, new_props, stack_name):
-    # Value is immutable in CloudFormation; changing it replaces the key.
-    # Everything else updates the existing record in place.
-    if old_props.get("Value") != new_props.get("Value"):
+    # Value and Name are both Replacement in CloudFormation; changing either
+    # replaces the key. Everything else updates the existing record in place.
+    if (old_props.get("Value") != new_props.get("Value")
+            or old_props.get("Name") != new_props.get("Name")):
         _apigw_v1._delete_api_key(physical_id)
         return _apigw_api_key_create(physical_id, new_props, stack_name)
     key = _apigw_v1._api_keys.get(physical_id)
     if key is None:
         return _apigw_api_key_create(physical_id, new_props, stack_name)
-    if new_props.get("Name"):
-        key["name"] = new_props["Name"]
     key["description"] = new_props.get("Description", "")
     key["enabled"] = new_props.get("Enabled", True)
     key["customerId"] = new_props.get("CustomerId", key.get("customerId", ""))
@@ -2438,8 +2513,9 @@ def _apigw_usage_plan_delete(physical_id, props):
 def _apigw_usage_plan_key_create(logical_id, props, stack_name):
     """Provision an ``AWS::ApiGateway::UsagePlanKey`` (associate a key with a plan).
 
-    Ref returns the API key id; the delete handler reads the usage plan id back
-    from the resource's own properties, so the physical id need not encode it.
+    Ref returns ``{keyId}:{usagePlanId}`` — the physical id AWS assigns this
+    resource — and the delete handler reads both ids back from the resource's
+    own properties.
     """
     plan_id = props.get("UsagePlanId", "")
     key_id = props.get("KeyId", "")
@@ -2447,7 +2523,7 @@ def _apigw_usage_plan_key_create(logical_id, props, stack_name):
     status, _headers, body = _apigw_v1._create_usage_plan_key(plan_id, data)
     if status >= 400:
         raise ValueError(f"AWS::ApiGateway::UsagePlanKey create failed: {body!r}")
-    return key_id, {}
+    return f"{key_id}:{plan_id}", {}
 
 
 def _apigw_usage_plan_key_delete(physical_id, props):
@@ -5935,7 +6011,7 @@ _RESOURCE_HANDLERS = {
     "AWS::IAM::Role": {"create": _iam_role_create, "delete": _iam_role_delete},
     "AWS::IAM::Policy": {"create": _iam_policy_create, "delete": _iam_policy_delete},
     "AWS::IAM::InstanceProfile": {"create": _iam_ip_create, "delete": _iam_ip_delete},
-    "AWS::SSM::Parameter": {"create": _ssm_create, "delete": _ssm_delete},
+    "AWS::SSM::Parameter": {"create": _ssm_create, "update": _ssm_update, "delete": _ssm_delete},
     "AWS::AppConfig::Application": {
         "create": _appconfig_application_create,
         "delete": _appconfig_application_delete,
