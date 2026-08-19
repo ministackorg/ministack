@@ -454,6 +454,14 @@ def _delete_stack(params):
                                   f"Export {export_name} is imported by stack {other_name}")
 
     stack_id = stack["StackId"]
+
+    # Deleting a stack removes its change sets; they must not outlive it and
+    # shadow a later same-named change set on a re-created stack. #1418
+    from ministack.services.cloudformation import _change_sets
+    for _cid in [c for c, v in _change_sets.items()
+                 if v.get("StackId") == stack_id]:
+        _change_sets.pop(_cid, None)
+
     _create_stack_task_in_region(
         _delete_stack_async(stack_name, stack_id),
         stack,

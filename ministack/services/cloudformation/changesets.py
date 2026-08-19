@@ -85,6 +85,15 @@ def _create_change_set(params):
     if not cs_name:
         return _error("ValidationError", "ChangeSetName is required")
 
+    # A change set name is unique per stack while it exists; real CloudFormation
+    # answers AlreadyExistsException for a duplicate name (modeled on
+    # CreateChangeSet). #1418
+    for _existing in _change_sets.values():
+        if (_existing["ChangeSetName"] == cs_name
+                and _existing["StackName"] == stack_name):
+            return _error("AlreadyExistsException",
+                          f"ChangeSet [{cs_name}] already exists")
+
     template_body, resolve_err = _resolve_template(params)
     if resolve_err:
         return resolve_err
@@ -262,6 +271,24 @@ def _describe_change_set(params):
 
 # --- ExecuteChangeSet ---
 
+async def _track_change_set_execution(change_set, stack, deploy_coro):
+    """Await the change set's stack deployment, then record its ExecutionStatus.
+
+    Real CloudFormation moves a change set from EXECUTE_IN_PROGRESS to
+    EXECUTE_COMPLETE only when the stack operation succeeds, and to
+    EXECUTE_FAILED when it fails or rolls back. The ChangeSetStatus (``Status``)
+    stays CREATE_COMPLETE throughout. #1418
+    """
+    try:
+        await deploy_coro
+    finally:
+        status = stack.get("StackStatus", "")
+        if status.endswith("_COMPLETE") and "ROLLBACK" not in status:
+            change_set["ExecutionStatus"] = "EXECUTE_COMPLETE"
+        else:
+            change_set["ExecutionStatus"] = "EXECUTE_FAILED"
+
+
 def _execute_change_set(params):
     from ministack.services.cloudformation import _stacks
     cs_name = _p(params, "ChangeSetName")
@@ -319,17 +346,23 @@ def _execute_change_set(params):
                    physical_id=stack_id)
 
         _create_stack_task_in_region(
-            _deploy_stack_async(real_stack_name, stack_id, template,
-                                param_values, False, tags,
-                                is_update=is_update,
-                                previous_stack=previous_stack),
+            _track_change_set_execution(
+                cs,
+                stack,
+                _deploy_stack_async(real_stack_name, stack_id, template,
+                                    param_values, False, tags,
+                                    is_update=is_update,
+                                    previous_stack=previous_stack),
+            ),
             stack,
             stack_id,
         )
 
-    cs["ExecutionStatus"] = "EXECUTE_COMPLETE"
-    cs["Status"] = "EXECUTE_COMPLETE"
-
+    # ExecutionStatus stays EXECUTE_IN_PROGRESS until the deploy finishes, when
+    # _track_change_set_execution sets EXECUTE_COMPLETE or EXECUTE_FAILED. Status
+    # is the ChangeSetStatus and stays CREATE_COMPLETE: EXECUTE_COMPLETE is not a
+    # ChangeSetStatus value, and writing it here made the CDK reject the change
+    # set as "not ready" (it gates on Status == CREATE_COMPLETE). #1418
     return _xml(200, "ExecuteChangeSetResponse",
                 "<ExecuteChangeSetResult></ExecuteChangeSetResult>")
 

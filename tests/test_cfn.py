@@ -862,6 +862,58 @@ def test_cfn_custom_named_table_replacement_refused_data_survives(cfn, ddb):
         cfn.delete_stack(StackName="cfn-1433")
 
 
+def test_cfn_change_set_status_execution_and_lifecycle(cfn):
+    """Change set Status stays CREATE_COMPLETE after execution (not
+    EXECUTE_COMPLETE, which broke the CDK), a failed execution reports
+    EXECUTE_FAILED, a duplicate name is AlreadyExistsException, and a change set
+    does not outlive its stack (#1418)."""
+    S = "cfn-1418"
+    CS = "cdk-deploy-change-set"
+    bad = json.dumps({"Resources": {"X": {
+        "Type": "AWS::FakeService::Thing", "Properties": {}}}})
+    ok = json.dumps({"Resources": {"P": {"Type": "AWS::SSM::Parameter",
+        "Properties": {"Name": "/cfn-1418/p", "Type": "String",
+                       "Value": "v"}}}})
+
+    cfn.create_change_set(StackName=S, ChangeSetName=CS,
+                          ChangeSetType="CREATE", TemplateBody=bad)
+    d = cfn.describe_change_set(ChangeSetName=CS, StackName=S)
+    assert d["Status"] == "CREATE_COMPLETE"
+    assert d["ExecutionStatus"] == "AVAILABLE"
+
+    # A duplicate name while the change set exists -> AlreadyExistsException.
+    with pytest.raises(ClientError) as exc:
+        cfn.create_change_set(StackName=S, ChangeSetName=CS,
+                              ChangeSetType="CREATE", TemplateBody=ok)
+    assert exc.value.response["Error"]["Code"] == "AlreadyExistsException"
+
+    # Execute: the bad template fails and rolls back.
+    cfn.execute_change_set(StackName=S, ChangeSetName=CS)
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        d = cfn.describe_change_set(ChangeSetName=CS, StackName=S)
+        if d["ExecutionStatus"] in ("EXECUTE_COMPLETE", "EXECUTE_FAILED"):
+            break
+        time.sleep(0.2)
+    assert d["Status"] == "CREATE_COMPLETE"          # not EXECUTE_COMPLETE
+    assert d["ExecutionStatus"] == "EXECUTE_FAILED"  # execution actually failed
+
+    # Delete the failed stack -> its change set goes with it.
+    cfn.delete_stack(StackName=S)
+    with pytest.raises(ClientError) as exc:
+        cfn.describe_change_set(ChangeSetName=CS, StackName=S)
+    assert "ChangeSetNotFound" in exc.value.response["Error"]["Code"]
+
+    # Once the stack is gone, the same name resolves to a fresh change set.
+    _wait_stack(cfn, S)
+    cfn.create_change_set(StackName=S, ChangeSetName=CS,
+                          ChangeSetType="CREATE", TemplateBody=ok)
+    d = cfn.describe_change_set(ChangeSetName=CS, StackName=S)
+    assert d["Status"] == "CREATE_COMPLETE"
+    assert d["ExecutionStatus"] == "AVAILABLE"
+    cfn.delete_stack(StackName=S)
+
+
 def test_cfn_ssm_parameter_value_type_resolves_stored_value(cfn, ssm, sqs):
     """A `AWS::SSM::Parameter::Value<String>` template parameter's Default/
     provided value is an SSM parameter *name*, not the value itself — real
