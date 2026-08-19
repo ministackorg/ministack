@@ -803,6 +803,65 @@ def test_cfn_unnamed_dynamodb_table_survives_unrelated_update(cfn, ddb, ssm):
     assert table_name_after == table_name_before, "the table was re-created under a new name"
     assert table_name_after in tables_after, "the stack's table did not survive the update"
     
+def test_cfn_custom_named_table_replacement_refused_data_survives(cfn, ddb):
+    """A stack update that requires replacing a custom-named DynamoDB table
+    (changing a key attribute's type S->N) is refused exactly as real
+    CloudFormation refuses it: the stack rolls back to UPDATE_ROLLBACK_COMPLETE
+    with the "custom-named resource requires replacing" message, and the table
+    and its data survive untouched instead of being silently replaced (#1433)."""
+    def template(sk_type):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "T": {
+                    "Type": "AWS::DynamoDB::Table",
+                    "Properties": {
+                        "TableName": "cfn_named_probe_1433",
+                        "BillingMode": "PAY_PER_REQUEST",
+                        "AttributeDefinitions": [
+                            {"AttributeName": "pk", "AttributeType": "S"},
+                            {"AttributeName": "sk", "AttributeType": sk_type},
+                        ],
+                        "KeySchema": [
+                            {"AttributeName": "pk", "KeyType": "HASH"},
+                            {"AttributeName": "sk", "KeyType": "RANGE"},
+                        ],
+                    },
+                },
+            },
+        })
+
+    cfn.create_stack(StackName="cfn-1433", TemplateBody=template("S"))
+    _wait_stack(cfn, "cfn-1433")
+    try:
+        ddb.put_item(TableName="cfn_named_probe_1433",
+                     Item={"pk": {"S": "row"}, "sk": {"S": "keep-me"}})
+
+        # sk type S->N requires replacing the table; AWS refuses because the
+        # table carries a custom name.
+        cfn.update_stack(StackName="cfn-1433", TemplateBody=template("N"))
+        stack = _wait_stack(cfn, "cfn-1433")
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+
+        # Schema unchanged: sk is still S.
+        attrs = ddb.describe_table(
+            TableName="cfn_named_probe_1433")["Table"]["AttributeDefinitions"]
+        sk = next(a for a in attrs if a["AttributeName"] == "sk")
+        assert sk["AttributeType"] == "S"
+
+        # The seeded row is intact.
+        assert ddb.scan(TableName="cfn_named_probe_1433")["Count"] == 1
+
+        # The refusal names the real AWS reason.
+        events = cfn.describe_stack_events(
+            StackName="cfn-1433")["StackEvents"]
+        reasons = " ".join(
+            e.get("ResourceStatusReason", "") for e in events)
+        assert "custom-named resource requires replacing" in reasons
+    finally:
+        cfn.delete_stack(StackName="cfn-1433")
+
+
 def test_cfn_ssm_parameter_value_type_resolves_stored_value(cfn, ssm, sqs):
     """A `AWS::SSM::Parameter::Value<String>` template parameter's Default/
     provided value is an SSM parameter *name*, not the value itself — real

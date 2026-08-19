@@ -1567,6 +1567,20 @@ def _invoke_resource(resource, input_data):
     if "aws-sdk:" in resource:
         return _invoke_aws_sdk_integration(resource, input_data)
 
+    # An optimized service integration (arn:aws:states:::<service>:<action>)
+    # that reaches here is one MiniStack does not implement. Real AWS supports
+    # every documented optimized integration, so echoing the input back as a
+    # SUCCEEDED result hides a genuine gap (a state machine "passes" locally
+    # while its side effect never happens). Fail loudly instead, mirroring the
+    # aws-sdk dispatcher's "not yet implemented" failure.
+    if resource.startswith("arn:aws:states:::"):
+        raise _ExecutionError(
+            "States.Runtime",
+            f"{resource} is not yet implemented in MiniStack. Use the generic "
+            "arn:aws:states:::aws-sdk:<service>:<action> form, or open an issue "
+            "for this optimized integration.",
+        )
+
     return input_data
 
 

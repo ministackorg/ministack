@@ -4389,9 +4389,11 @@ def _create_db_cluster(p):
         expected_engine = global_cluster.get("Engine")
         if _p(p, "Engine") and expected_engine and engine != expected_engine:
             return _error(
+                # Real AWS message shape (InvalidParameterValue, Sender, 400),
+                # verbatim template from a captured CreateDBCluster transcript.
                 "InvalidParameterValue",
-                f"Engine {engine} is incompatible with global cluster "
-                f"{global_cluster_id} engine {expected_engine}.",
+                "Value for engine should match setting for global cluster "
+                f"{global_cluster_id}",
                 400,
             )
         engine = expected_engine or engine
@@ -4413,9 +4415,11 @@ def _create_db_cluster(p):
             and engine_version != expected_engine_version
         ):
             return _error(
+                # Verbatim real-AWS message (InvalidParameterValue, Sender, 400)
+                # from a captured CreateDBCluster-into-global transcript.
                 "InvalidParameterValue",
-                f"EngineVersion {engine_version} is incompatible with global "
-                f"cluster {global_cluster_id} engine version {expected_engine_version}.",
+                "Value for engineVersion should match setting for global "
+                f"cluster {global_cluster_id}",
                 400,
             )
         engine_version = expected_engine_version or engine_version
@@ -7344,9 +7348,9 @@ def _global_member_engine_version_conflict_error(cluster, engine_version):
     if not requested_major or not global_major or requested_major == global_major:
         return None
     return _error(
-        "InvalidParameterValue",
-        f"EngineVersion {engine_version} is incompatible with global "
-        f"cluster {gc_id} engine version {gc_version}.",
+        "InvalidParameterCombination",
+        "Major Version Upgrade isn't supported in a single member of a "
+        "global cluster. Use ModifyGlobalCluster to upgrade all the members.",
         400,
     )
 

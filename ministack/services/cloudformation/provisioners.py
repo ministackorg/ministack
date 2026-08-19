@@ -151,6 +151,60 @@ def _delete_resource(resource_type: str, physical_id: str, props: dict,
                    resource_type, physical_id)
 
 
+def _requires_replacement_dynamodb(old_props, new_props):
+    """AWS::DynamoDB::Table requires replacement when an existing attribute's
+    type changes (AWS docs: "Changing the type of an existing
+    AttributeDefinition requires replacement of the table")."""
+    old_types = {
+        a.get("AttributeName"): a.get("AttributeType")
+        for a in old_props.get("AttributeDefinitions", [])
+        if isinstance(a, dict) and a.get("AttributeName")
+    }
+    for a in new_props.get("AttributeDefinitions", []):
+        if not isinstance(a, dict):
+            continue
+        name = a.get("AttributeName")
+        if name in old_types and old_types[name] != a.get("AttributeType"):
+            return True
+    return False
+
+
+# Resource types that carry a user-supplied physical name AND can require
+# replacement. Real CloudFormation refuses an update that would replace a
+# custom-named resource (you must rename it first), so MiniStack must fail the
+# update instead of silently executing the replacement and destroying data
+# (issue #1433).
+_CUSTOM_NAME_REPLACEMENT = {
+    "AWS::DynamoDB::Table": {
+        "name": "TableName",
+        "requires_replacement": _requires_replacement_dynamodb,
+    },
+}
+
+
+def _custom_named_replacement_error(resource_type, old_props, new_props):
+    """Return the real-AWS error when a stack update would replace a
+    custom-named resource, else None.
+
+    Only an explicit, unchanged physical name is blocked: renaming is AWS's
+    sanctioned escape hatch (the replacement proceeds under the new name), and
+    an auto-generated name can always be replaced.
+    """
+    spec = _CUSTOM_NAME_REPLACEMENT.get(resource_type)
+    if not spec:
+        return None
+    old_name = old_props.get(spec["name"])
+    new_name = new_props.get(spec["name"])
+    if not old_name or old_name != new_name:
+        return None
+    if spec["requires_replacement"](old_props, new_props):
+        return (
+            "CloudFormation cannot update a stack when a custom-named resource "
+            f"requires replacing. Rename {old_name} and update the stack again."
+        )
+    return None
+
+
 def _update_resource(resource_type: str, physical_id: str, old_props: dict,
                      new_props: dict, stack_name: str,
                      logical_id: str | None = None,
@@ -174,6 +228,11 @@ def _update_resource(resource_type: str, physical_id: str, old_props: dict,
         # still referencing it via Ref/Fn::GetAtt would then pick up the
         # instant it was reprocessed later in the same update.
         return physical_id, old_attrs or {}
+    replacement_error = _custom_named_replacement_error(
+        resource_type, old_props, new_props
+    )
+    if replacement_error:
+        raise ValueError(replacement_error)
     handler = _RESOURCE_HANDLERS.get(resource_type)
     if handler and "update" in handler:
         if handler.get("update_with_logical_id"):
@@ -5211,7 +5270,9 @@ def _ses_configuration_set_create(logical_id, props, stack_name):
         "CreatedTimestamp": _ses._iso_now(),
     }
     _ses_v2._config_sets[name] = {"ConfigurationSetName": name, "Tags": []}
-    return name, {"Id": name}
+    # Real AWS AWS::SES::ConfigurationSet supports Ref (the set name) only; it
+    # exposes no Fn::GetAtt attributes, so return none.
+    return name, {}
 
 
 def _ses_configuration_set_delete(physical_id, props):

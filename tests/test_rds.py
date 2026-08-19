@@ -1487,11 +1487,10 @@ def test_rds_modify_global_cluster_applies_version_to_members(rds):
                 DBClusterIdentifier=member_id,
                 EngineVersion="15.13",
             )
-        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
-        assert (
-            exc.value.response["Error"]["Message"]
-            == "EngineVersion 15.13 is incompatible with global cluster "
-            f"{global_id} engine version 16.9."
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+        assert exc.value.response["Error"]["Message"] == (
+            "Major Version Upgrade isn't supported in a single member of a "
+            "global cluster. Use ModifyGlobalCluster to upgrade all the members."
         )
 
         # Minor upgrades within the same major stay allowed per member.
@@ -1509,6 +1508,38 @@ def test_rds_modify_global_cluster_applies_version_to_members(rds):
             rds.delete_db_cluster(
                 DBClusterIdentifier=member_id, SkipFinalSnapshot=True
             )
+        rds.delete_global_cluster(GlobalClusterIdentifier=global_id)
+
+
+def test_rds_create_db_cluster_global_member_version_mismatch(rds):
+    """CreateDBCluster into a global cluster with a different EngineVersion is
+    rejected with the real-AWS shape: InvalidParameterValue / "Value for
+    engineVersion should match setting for global cluster <name>" (captured
+    verbatim from a live CreateDBCluster transcript)."""
+    import uuid as _uuid
+    global_id = f"create-mismatch-{_uuid.uuid4().hex[:8]}"
+    member_id = f"{global_id}-member"
+    rds.create_global_cluster(
+        GlobalClusterIdentifier=global_id,
+        Engine="aurora-postgresql",
+        EngineVersion="16.8",
+    )
+    try:
+        with pytest.raises(ClientError) as exc:
+            rds.create_db_cluster(
+                DBClusterIdentifier=member_id,
+                Engine="aurora-postgresql",
+                EngineVersion="15.13",
+                GlobalClusterIdentifier=global_id,
+                MasterUsername="admin",
+                MasterUserPassword="password123",
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+        assert exc.value.response["Error"]["Message"] == (
+            "Value for engineVersion should match setting for global "
+            f"cluster {global_id}"
+        )
+    finally:
         rds.delete_global_cluster(GlobalClusterIdentifier=global_id)
 
 
