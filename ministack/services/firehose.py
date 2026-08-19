@@ -522,7 +522,7 @@ def _deliver_to_iceberg(stream: dict, dest: dict, records: list):
     if not groups:
         return
 
-    def _run():
+    def _deliver_iceberg_groups():
         for (wh, db, table, keys), group in groups.items():
             try:
                 _iceberg_write_group(wh, db, table, list(keys), group)
@@ -530,10 +530,14 @@ def _deliver_to_iceberg(stream: dict, dest: dict, records: list):
                 logger.warning("Firehose %s: Iceberg delivery to %s.%s failed: %s",
                                name, db, table, exc)
 
+    # Inline if no thread can be started: losing delivery records silently is
+    # worse than blocking this caller. (Before this ran on `spawn_background`,
+    # the fallback existed for a different reason — `get_running_loop()` raising
+    # off the event loop — which can no longer happen.)
     try:
-        spawn_background(_run, thread_name="ministack-firehose-iceberg")
+        spawn_background(_deliver_iceberg_groups, thread_name="ministack-firehose-iceberg")
     except RuntimeError:
-        _run()
+        _deliver_iceberg_groups()
 
 
 def _record_id() -> str:

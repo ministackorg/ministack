@@ -207,5 +207,14 @@ def spawn_background(fn, *args, thread_name: str = "ministack-background", **kwa
 
     _bump("background", 1)
     thread = threading.Thread(target=_run, daemon=True, name=thread_name)
-    thread.start()
+    try:
+        thread.start()
+    except RuntimeError:
+        # OS thread limit. `_run` never executes, so its `finally` never runs
+        # and the counter would leak — permanently, and precisely when someone
+        # is reading it to diagnose thread exhaustion. Callers that can fall
+        # back to running inline (firehose's Iceberg delivery) catch this, so
+        # it must still propagate. `run_reentrant` does the same.
+        _bump("background", -1)
+        raise
     return thread
