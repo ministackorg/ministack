@@ -4455,6 +4455,59 @@ def test_s3_put_object_with_explicit_sha256_value_validated(s3):
     s3.delete_bucket(Bucket=bucket)
 
 
+def test_s3_multipart_checksum_sha256_composite(s3):
+    """A checksummed multipart upload carries its parts' checksums through to
+    a composite on the completed object: the part echoes its own, the
+    completion answers the digest-of-digests suffixed with the part count, and
+    a read asks for it with ChecksumMode."""
+    import base64
+    import hashlib
+
+    from botocore.exceptions import ClientError
+
+    bucket = "checksum-multipart-bucket"
+    s3.create_bucket(Bucket=bucket)
+    body = b"A" * 1024
+    part_sum = base64.b64encode(hashlib.sha256(body).digest()).decode()
+    composite = base64.b64encode(
+        hashlib.sha256(hashlib.sha256(body).digest()).digest()).decode() + "-1"
+
+    mpu = s3.create_multipart_upload(Bucket=bucket, Key="k",
+                                     ChecksumAlgorithm="SHA256")
+    assert mpu["ChecksumAlgorithm"] == "SHA256"
+    uid = mpu["UploadId"]
+    part = s3.upload_part(Bucket=bucket, Key="k", UploadId=uid, PartNumber=1,
+                          Body=body, ChecksumAlgorithm="SHA256",
+                          ChecksumSHA256=part_sum)
+    assert part["ChecksumSHA256"] == part_sum
+    assert s3.list_parts(Bucket=bucket, Key="k",
+                         UploadId=uid)["Parts"][0]["ChecksumSHA256"] == part_sum
+
+    parts = {"Parts": [{"PartNumber": 1, "ETag": part["ETag"],
+                        "ChecksumSHA256": part_sum}]}
+
+    # A composite the caller names must be the one the parts add up to.
+    with pytest.raises(ClientError) as exc:
+        s3.complete_multipart_upload(Bucket=bucket, Key="k", UploadId=uid,
+                                     ChecksumSHA256="bad",
+                                     MultipartUpload=parts)
+    assert exc.value.response["Error"]["Code"] == "BadDigest"
+
+    done = s3.complete_multipart_upload(Bucket=bucket, Key="k", UploadId=uid,
+                                        ChecksumSHA256=composite,
+                                        MultipartUpload=parts)
+    assert done["ChecksumSHA256"] == composite
+
+    # Silent unless the read opts in, as with any other stored checksum.
+    assert "ChecksumSHA256" not in s3.head_object(Bucket=bucket, Key="k")
+    head = s3.head_object(Bucket=bucket, Key="k", ChecksumMode="ENABLED")
+    assert head["ChecksumSHA256"] == composite
+    assert head["ChecksumType"] == "COMPOSITE"
+
+    s3.delete_object(Bucket=bucket, Key="k")
+    s3.delete_bucket(Bucket=bucket)
+
+
 def test_s3_versioned_get_returns_stored_checksum(s3):
     """A versioned GetObject(?versionId=X) with ChecksumMode=ENABLED must
     return the per-version checksum that was stored at put time. Issue #831
