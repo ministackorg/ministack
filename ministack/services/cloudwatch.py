@@ -299,7 +299,7 @@ def _evaluate_alarm(alarm):
     old_state = alarm["StateValue"]
     new_state = "ALARM" if breaching else "OK"
     if old_state != new_state:
-        reason = f"Threshold Crossed: {alarm.get('Statistic','Average')} {val} {op} {threshold}"
+        reason = f"Threshold Crossed: {stat_name} {val} {op} {threshold}"
         alarm["StateValue"] = new_state
         alarm["StateReason"] = reason
         alarm["StateUpdatedTimestamp"] = int(time.time())
