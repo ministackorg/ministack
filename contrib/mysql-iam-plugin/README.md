@@ -38,8 +38,8 @@ repository root:
 contrib/mysql-iam-plugin/build.sh
 ```
 
-This writes to `build/mysql-plugins` by default. The full Docker image places
-the same tree at `/opt/ministack/mysql-plugins`, the fixed runtime lookup path.
+This writes to `build/mysql-plugins` by default. The slim and full Docker images
+place the same tree at `/opt/ministack/mysql-plugins`, the fixed runtime lookup path.
 Delivery and installation happen automatically when a matching bundled
 artifact exists and are silent when it is absent.
 
@@ -107,8 +107,7 @@ plugin is `ACTIVE` before reporting success. The maintenance session disables
 binary logging at entry so every current and future plugin-metadata statement
 remains compute-local and cannot alter a global-cluster secondary.
 
-Residuals: the full image carries the artifacts; the slim image remains
-artifact-free and therefore auto-off. The existing global-replication live
-fixture now asserts that an IAM user created on the primary reaches the
-secondary without breaking replication whenever artifacts are present. Each
+The existing global-replication live fixture asserts that an IAM user created
+on the primary reaches the secondary without breaking replication whenever
+artifacts are present. Each
 MySQL image-tag update must rebuild and reload-test its series artifact.
