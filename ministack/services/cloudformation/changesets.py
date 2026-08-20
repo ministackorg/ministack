@@ -181,13 +181,24 @@ def _create_change_set(params):
         f"changeSet/{cs_name}/{new_uuid()}"
     )
 
+    if changes:
+        _cs_status, _cs_exec, _cs_reason = "CREATE_COMPLETE", "AVAILABLE", ""
+    else:
+        # Real AWS: a change set with no changes ends FAILED and cannot be
+        # executed (ExecutionStatus UNAVAILABLE), with this exact reason.
+        _cs_status, _cs_exec = "FAILED", "UNAVAILABLE"
+        _cs_reason = (
+            "The submitted information didn't contain changes. "
+            "Submit different information to create a change set."
+        )
     change_set = {
         "ChangeSetId": cs_id,
         "ChangeSetName": cs_name,
         "StackId": stack_id,
         "StackName": stack_name,
-        "Status": "CREATE_COMPLETE",
-        "ExecutionStatus": "AVAILABLE",
+        "Status": _cs_status,
+        "ExecutionStatus": _cs_exec,
+        "StatusReason": _cs_reason,
         "CreationTime": now_iso(),
         "Description": _p(params, "Description", ""),
         "ChangeSetType": cs_type,
@@ -217,8 +228,8 @@ def _describe_change_set(params):
     stack_name = _p(params, "StackName")
     _, cs = _find_change_set(cs_name, stack_name)
     if not cs:
-        return _error("ChangeSetNotFoundException",
-                      f"ChangeSet [{cs_name}] does not exist")
+        return _error("ChangeSetNotFound",
+                      f"ChangeSet [{cs_name}] does not exist", 404)
 
     params_xml = ""
     for p in cs.get("Parameters", []):
@@ -256,6 +267,7 @@ def _describe_change_set(params):
         f"<StackId>{_esc(cs['StackId'])}</StackId>"
         f"<StackName>{_esc(cs['StackName'])}</StackName>"
         f"<Status>{cs['Status']}</Status>"
+        f"<StatusReason>{_esc(cs.get('StatusReason', ''))}</StatusReason>"
         f"<ExecutionStatus>{cs['ExecutionStatus']}</ExecutionStatus>"
         f"<CreationTime>{cs['CreationTime']}</CreationTime>"
         f"<Description>{_esc(cs.get('Description', ''))}</Description>"
@@ -293,10 +305,10 @@ def _execute_change_set(params):
     from ministack.services.cloudformation import _stacks
     cs_name = _p(params, "ChangeSetName")
     stack_name = _p(params, "StackName")
-    _, cs = _find_change_set(cs_name, stack_name)
+    _executed_cs_id, cs = _find_change_set(cs_name, stack_name)
     if not cs:
-        return _error("ChangeSetNotFoundException",
-                      f"ChangeSet [{cs_name}] does not exist")
+        return _error("ChangeSetNotFound",
+                      f"ChangeSet [{cs_name}] does not exist", 404)
 
     if cs["ExecutionStatus"] != "AVAILABLE":
         return _error("InvalidChangeSetStatusException",
@@ -358,6 +370,13 @@ def _execute_change_set(params):
             stack_id,
         )
 
+    # Real AWS deletes the stack's other change sets on execute — they are no
+    # longer valid for the updated stack. #1418
+    from ministack.services.cloudformation import _change_sets as _cs_store
+    for _cid in [c for c, v in _cs_store.items()
+                 if v.get("StackId") == stack_id and c != _executed_cs_id]:
+        _cs_store.pop(_cid, None)
+
     # ExecutionStatus stays EXECUTE_IN_PROGRESS until the deploy finishes, when
     # _track_change_set_execution sets EXECUTE_COMPLETE or EXECUTE_FAILED. Status
     # is the ChangeSetStatus and stays CREATE_COMPLETE: EXECUTE_COMPLETE is not a
@@ -375,8 +394,8 @@ def _delete_change_set(params):
     stack_name = _p(params, "StackName")
     cs_id, cs = _find_change_set(cs_name, stack_name)
     if not cs_id:
-        return _error("ChangeSetNotFoundException",
-                      f"ChangeSet [{cs_name}] does not exist")
+        return _error("ChangeSetNotFound",
+                      f"ChangeSet [{cs_name}] does not exist", 404)
     _change_sets.pop(cs_id, None)
     return _xml(200, "DeleteChangeSetResponse", "")
 
@@ -400,6 +419,7 @@ def _list_change_sets(params):
             f"<StackId>{_esc(cs['StackId'])}</StackId>"
             f"<StackName>{_esc(cs['StackName'])}</StackName>"
             f"<Status>{cs['Status']}</Status>"
+            f"<StatusReason>{_esc(cs.get('StatusReason', ''))}</StatusReason>"
             f"<ExecutionStatus>{cs['ExecutionStatus']}</ExecutionStatus>"
             f"<CreationTime>{cs['CreationTime']}</CreationTime>"
             f"<Description>{_esc(cs.get('Description', ''))}</Description>"

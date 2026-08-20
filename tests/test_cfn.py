@@ -169,7 +169,7 @@ def test_cfn_region_scopes_stacks_change_sets_and_events():
         assert west.list_change_sets(StackName=stack_name)["Summaries"] == []
         with pytest.raises(ClientError) as exc:
             west.describe_change_set(ChangeSetName=change_set_id)
-        assert exc.value.response["Error"]["Code"] == "ChangeSetNotFoundException"
+        assert exc.value.response["Error"]["Code"] == "ChangeSetNotFound"
 
         east.delete_stack(StackName=stack_name)
         assert _wait_stack(east, stack_name)["StackStatus"] == "DELETE_COMPLETE"
@@ -912,6 +912,74 @@ def test_cfn_change_set_status_execution_and_lifecycle(cfn):
     assert d["Status"] == "CREATE_COMPLETE"
     assert d["ExecutionStatus"] == "AVAILABLE"
     cfn.delete_stack(StackName=S)
+
+
+def test_cfn_change_set_no_changes_is_failed(cfn, ssm):
+    """A change set with no changes ends FAILED with the real-AWS reason, not
+    CREATE_COMPLETE/AVAILABLE (#1418)."""
+    S = "cfn-1418-nochg"
+    tpl = json.dumps({"Resources": {"P": {"Type": "AWS::SSM::Parameter",
+        "Properties": {"Name": "/cfn-1418-nochg/p", "Type": "String",
+                       "Value": "v"}}}})
+    cfn.create_stack(StackName=S, TemplateBody=tpl)
+    _wait_stack(cfn, S)
+    try:
+        cfn.create_change_set(StackName=S, ChangeSetName="noop",
+                              ChangeSetType="UPDATE", TemplateBody=tpl)
+        d = cfn.describe_change_set(ChangeSetName="noop", StackName=S)
+        assert d["Status"] == "FAILED"
+        assert d["ExecutionStatus"] == "UNAVAILABLE"
+        assert "didn't contain changes" in d["StatusReason"]
+    finally:
+        cfn.delete_stack(StackName=S)
+
+
+def test_cfn_execute_change_set_deletes_sibling_change_sets(cfn, ssm):
+    """Executing a change set deletes the stack's other change sets — they are
+    no longer valid for the updated stack (#1418)."""
+    S = "cfn-1418-sib"
+    def tpl(v):
+        return json.dumps({"Resources": {"P": {"Type": "AWS::SSM::Parameter",
+            "Properties": {"Name": "/cfn-1418-sib/p", "Type": "String",
+                           "Value": v}}}})
+    cfn.create_stack(StackName=S, TemplateBody=tpl("v0"))
+    _wait_stack(cfn, S)
+    try:
+        cfn.create_change_set(StackName=S, ChangeSetName="cs-a",
+                              ChangeSetType="UPDATE", TemplateBody=tpl("v1"))
+        cfn.create_change_set(StackName=S, ChangeSetName="cs-b",
+                              ChangeSetType="UPDATE", TemplateBody=tpl("v2"))
+        cfn.execute_change_set(StackName=S, ChangeSetName="cs-a")
+        with pytest.raises(ClientError) as exc:
+            cfn.describe_change_set(ChangeSetName="cs-b", StackName=S)
+        assert "ChangeSetNotFound" in exc.value.response["Error"]["Code"]
+        _wait_stack(cfn, S)
+    finally:
+        cfn.delete_stack(StackName=S)
+
+
+def test_cfn_direct_update_marks_pending_change_sets_obsolete(cfn, ssm):
+    """A direct UpdateStack supersedes any pending change set — it becomes
+    OBSOLETE, not left AVAILABLE (#1418)."""
+    S = "cfn-1418-obs"
+    def tpl(v):
+        return json.dumps({"Resources": {"P": {"Type": "AWS::SSM::Parameter",
+            "Properties": {"Name": "/cfn-1418-obs/p", "Type": "String",
+                           "Value": v}}}})
+    cfn.create_stack(StackName=S, TemplateBody=tpl("v0"))
+    _wait_stack(cfn, S)
+    try:
+        cfn.create_change_set(StackName=S, ChangeSetName="pending",
+                              ChangeSetType="UPDATE", TemplateBody=tpl("v1"))
+        assert cfn.describe_change_set(
+            ChangeSetName="pending", StackName=S)["ExecutionStatus"] == "AVAILABLE"
+        # A direct update (not via the change set) supersedes it.
+        cfn.update_stack(StackName=S, TemplateBody=tpl("v2"))
+        d = cfn.describe_change_set(ChangeSetName="pending", StackName=S)
+        assert d["ExecutionStatus"] == "OBSOLETE"
+        _wait_stack(cfn, S)
+    finally:
+        cfn.delete_stack(StackName=S)
 
 
 def test_cfn_ssm_parameter_value_type_resolves_stored_value(cfn, ssm, sqs):

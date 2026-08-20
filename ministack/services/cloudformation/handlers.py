@@ -528,6 +528,15 @@ def _update_stack(params):
     }
 
     stack_id = stack["StackId"]
+
+    # A direct stack update supersedes any pending change set on the stack —
+    # real AWS marks them OBSOLETE (they no longer reflect the stack). #1418
+    from ministack.services.cloudformation import _change_sets
+    for _cs in _change_sets.values():
+        if (_cs.get("StackId") == stack_id
+                and _cs.get("ExecutionStatus") == "AVAILABLE"):
+            _cs["ExecutionStatus"] = "OBSOLETE"
+
     stack["StackStatus"] = "UPDATE_IN_PROGRESS"
     stack["LastUpdatedTime"] = now_iso()
     stack["_template_body"] = template_body
