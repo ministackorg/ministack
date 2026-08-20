@@ -3094,6 +3094,36 @@ def test_sfn_integration_events_put_events(sfn, eb, sqs):
     assert got is not None, "event was not delivered to the EventBridge target"
     assert "sfn.pipeline" in got
 
+
+def test_sfn_unimplemented_optimized_integration_fails_loudly(sfn_sync):
+    """An optimized service integration MiniStack does not implement must FAIL
+    the execution, not silently echo the input back as SUCCEEDED (#1443
+    follow-up: the dispatch fall-through used to `return input_data`)."""
+    import uuid as _uuid
+    sm_name = f"sfn-unimpl-opt-{_uuid.uuid4().hex[:8]}"
+    definition = json.dumps({
+        "StartAt": "Unimplemented",
+        "States": {
+            "Unimplemented": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::glue:startJobRun",
+                "Parameters": {"JobName": "etl"},
+                "End": True,
+            },
+        },
+    })
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name, definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+    resp = sfn_sync.start_sync_execution(
+        stateMachineArn=sm_arn, input=json.dumps({}))
+    # Must not be the silent-success echo of the input.
+    assert resp["status"] == "FAILED"
+    blob = (resp.get("cause", "") + resp.get("error", "")).lower()
+    assert "not yet implemented" in blob or "glue:startjobrun" in blob
+    sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
 def test_sfn_integration_sqs_send_message_wait_for_task_token(sfn, sqs):
     """sqs:sendMessage.waitForTaskToken must actually deliver the message
     (carrying the task token, serialised to JSON) and resume on

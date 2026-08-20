@@ -2800,6 +2800,56 @@ def test_s3_sse_c_multipart(s3):
         s3.get_object(Bucket=bucket, Key="m")
 
 
+def test_s3_sse_c_upload_part_copy_checks_both_keys_and_echoes(s3):
+    """UploadPartCopy on an SSE-C upload must present the create-time key, and
+    an SSE-C copy source must be addressed with its own key; the response
+    echoes the stored algorithm, as the wire shape models."""
+    import uuid as _u
+    bucket = f"sse-c-upc-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="src", Body=b"source-bytes", **_SSE_C_2)
+    mpu = s3.create_multipart_upload(Bucket=bucket, Key="m", **_SSE_C)
+    src = {"Bucket": bucket, "Key": "src"}
+    src_key = {"CopySourceSSECustomerAlgorithm": "AES256",
+               "CopySourceSSECustomerKey": _SSE_C_KEY2,
+               "CopySourceSSECustomerKeyMD5": _SSE_C_MD5_2}
+    # No part key: refused before the copy source is even read.
+    with pytest.raises(ClientError) as exc:
+        s3.upload_part_copy(Bucket=bucket, Key="m", UploadId=mpu["UploadId"],
+                            PartNumber=1, CopySource=src, **src_key)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    # Part key present, source key missing: the SSE-C source is unreadable.
+    with pytest.raises(ClientError) as exc:
+        s3.upload_part_copy(Bucket=bucket, Key="m", UploadId=mpu["UploadId"],
+                            PartNumber=1, CopySource=src, **_SSE_C)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    # Both keys: the copy succeeds and the response echoes the algorithm.
+    resp = s3.upload_part_copy(Bucket=bucket, Key="m", UploadId=mpu["UploadId"],
+                               PartNumber=1, CopySource=src, **_SSE_C, **src_key)
+    assert resp["SSECustomerAlgorithm"] == "AES256"
+    assert resp["SSECustomerKeyMD5"] == _SSE_C_MD5
+    parts = {"Parts": [{"ETag": resp["CopyPartResult"]["ETag"], "PartNumber": 1}]}
+    s3.complete_multipart_upload(Bucket=bucket, Key="m", UploadId=mpu["UploadId"],
+                                 MultipartUpload=parts, **_SSE_C)
+    assert s3.get_object(Bucket=bucket, Key="m", **_SSE_C)["Body"].read() == b"source-bytes"
+
+
+def test_s3_sse_multipart_complete_echoes_the_algorithm(s3):
+    """CompleteMultipartUpload echoes the stored SSE algorithm on its
+    response, not only on later GET/HEAD."""
+    import uuid as _u
+    bucket = f"sse-mpu-echo-{_u.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    mpu = s3.create_multipart_upload(Bucket=bucket, Key="m",
+                                     ServerSideEncryption="AES256")
+    part = s3.upload_part(Bucket=bucket, Key="m", UploadId=mpu["UploadId"],
+                          PartNumber=1, Body=b"bytes")
+    resp = s3.complete_multipart_upload(
+        Bucket=bucket, Key="m", UploadId=mpu["UploadId"],
+        MultipartUpload={"Parts": [{"ETag": part["ETag"], "PartNumber": 1}]})
+    assert resp["ServerSideEncryption"] == "AES256"
+
+
 def test_s3_sse_copy_semantics(s3):
     """The destination's encryption comes from the copy request, never the
     source: an SSE-C source needs its key as copy-source parameters (400
@@ -3710,6 +3760,42 @@ def test_s3_presigned_url_signature_is_verified():
     assert status(urllib.request.Request(u, method="GET")) == 200
 
 
+def test_s3_presigned_url_virtual_hosted_style_is_verified():
+    """A virtual-hosted-style presigned URL signs the bucket-less canonical URI
+    against the `{bucket}.host` Host header. MiniStack rewrites vhost → path-style
+    internally, but verification must run against the URI the client actually
+    signed, not the rewritten one (#1441)."""
+    import urllib.error
+    import urllib.request
+    from urllib.parse import urlparse
+
+    import boto3
+    from botocore.config import Config
+
+    ep = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+    cli = boto3.client(
+        "s3", endpoint_url=ep, region_name="us-east-1",
+        aws_access_key_id="test", aws_secret_access_key="test",
+        config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+    )
+    bucket = "presign-vhost-bkt"
+    cli.create_bucket(Bucket=bucket)
+
+    u = cli.generate_presigned_url(
+        "put_object", Params={"Bucket": bucket, "Key": "up.txt"}, ExpiresIn=300)
+    parsed = urlparse(u)
+    # The vhost host won't resolve; send to the endpoint with the bucket-less
+    # path and the signed Host header, exactly as a fronting proxy would.
+    target = ep + parsed.path + "?" + parsed.query
+    req = urllib.request.Request(
+        target, data=b"x", method="PUT", headers={"Host": parsed.netloc})
+    try:
+        code = urllib.request.urlopen(req).status
+    except urllib.error.HTTPError as exc:
+        code = exc.code
+    assert code in (200, 204), f"vhost presigned PUT rejected with {code}"
+
+
 def test_s3_eventbridge_notification_on_delete(s3, sqs, eb):
     """S3 delete_object should send EventBridge event when EventBridgeConfiguration is enabled."""
     bucket = "s3-eb-del-bkt"
@@ -4369,6 +4455,59 @@ def test_s3_put_object_with_explicit_sha256_value_validated(s3):
     s3.delete_bucket(Bucket=bucket)
 
 
+def test_s3_multipart_checksum_sha256_composite(s3):
+    """A checksummed multipart upload carries its parts' checksums through to
+    a composite on the completed object: the part echoes its own, the
+    completion answers the digest-of-digests suffixed with the part count, and
+    a read asks for it with ChecksumMode."""
+    import base64
+    import hashlib
+
+    from botocore.exceptions import ClientError
+
+    bucket = "checksum-multipart-bucket"
+    s3.create_bucket(Bucket=bucket)
+    body = b"A" * 1024
+    part_sum = base64.b64encode(hashlib.sha256(body).digest()).decode()
+    composite = base64.b64encode(
+        hashlib.sha256(hashlib.sha256(body).digest()).digest()).decode() + "-1"
+
+    mpu = s3.create_multipart_upload(Bucket=bucket, Key="k",
+                                     ChecksumAlgorithm="SHA256")
+    assert mpu["ChecksumAlgorithm"] == "SHA256"
+    uid = mpu["UploadId"]
+    part = s3.upload_part(Bucket=bucket, Key="k", UploadId=uid, PartNumber=1,
+                          Body=body, ChecksumAlgorithm="SHA256",
+                          ChecksumSHA256=part_sum)
+    assert part["ChecksumSHA256"] == part_sum
+    assert s3.list_parts(Bucket=bucket, Key="k",
+                         UploadId=uid)["Parts"][0]["ChecksumSHA256"] == part_sum
+
+    parts = {"Parts": [{"PartNumber": 1, "ETag": part["ETag"],
+                        "ChecksumSHA256": part_sum}]}
+
+    # A composite the caller names must be the one the parts add up to.
+    with pytest.raises(ClientError) as exc:
+        s3.complete_multipart_upload(Bucket=bucket, Key="k", UploadId=uid,
+                                     ChecksumSHA256="bad",
+                                     MultipartUpload=parts)
+    assert exc.value.response["Error"]["Code"] == "BadDigest"
+
+    done = s3.complete_multipart_upload(Bucket=bucket, Key="k", UploadId=uid,
+                                        ChecksumSHA256=composite,
+                                        MultipartUpload=parts)
+    assert done["ChecksumSHA256"] == composite
+
+    # Silent unless the read opts in, as with any other stored checksum.
+    assert "ChecksumSHA256" not in s3.head_object(Bucket=bucket, Key="k")
+    head = s3.head_object(Bucket=bucket, Key="k", ChecksumMode="ENABLED")
+    assert head["ChecksumSHA256"] == composite
+    assert head["ChecksumType"] == "COMPOSITE"
+
+    s3.delete_object(Bucket=bucket, Key="k")
+    s3.delete_bucket(Bucket=bucket)
+
+
 def test_s3_versioned_get_returns_stored_checksum(s3):
     """A versioned GetObject(?versionId=X) with ChecksumMode=ENABLED must
     return the per-version checksum that was stored at put time. Issue #831
@@ -4894,6 +5033,28 @@ def test_s3_conditional_delete_if_match(s3):
     assert resp.get("Errors") and resp["Errors"][0]["Code"] == "PreconditionFailed"
     assert not resp.get("Deleted")
     assert s3.get_object(Bucket=bucket, Key="cond")["Body"].read() == b"x"
+
+
+def test_s3_conditional_delete_of_absent_key_succeeds(s3):
+    """A conditional delete of a key that is not there is a success, not a
+    failed precondition: S3 counts deleting an absent key as done whatever
+    condition the request carries.  If-Match: * means "whatever is there",
+    so it holds against an object of any ETag."""
+    bucket = "intg-s3-conditional-delete-absent"
+    s3.create_bucket(Bucket=bucket)
+
+    for condition in ("*", "badetag"):
+        resp = s3.delete_object(Bucket=bucket, Key="gone", IfMatch=condition)
+        assert resp["ResponseMetadata"]["HTTPStatusCode"] == 204
+
+    s3.put_object(Bucket=bucket, Key="here", Body=b"x")
+    resp = s3.delete_object(Bucket=bucket, Key="here", IfMatch="*")
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 204
+    with pytest.raises(ClientError) as exc:
+        s3.head_object(Bucket=bucket, Key="here")
+    assert exc.value.response["Error"]["Code"] == "404"
+
+    s3.delete_bucket(Bucket=bucket)
 
 
 def test_s3_copy_object_specific_version(s3):

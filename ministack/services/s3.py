@@ -1028,6 +1028,78 @@ def _resolve_object_checksums(body: bytes, headers: dict):
     return checksums, None
 
 
+def _resolve_multipart_checksum_algorithm(headers: dict):
+    """Read the algorithm CreateMultipartUpload names for its parts.
+
+    Returns ``(algorithm_or_None, error_response_or_None)``.  An algorithm
+    ministack cannot compute is refused here rather than at completion, where
+    the caller has already uploaded every part.
+    """
+    raw = (headers.get("x-amz-checksum-algorithm")
+           or headers.get("x-amz-sdk-checksum-algorithm"))
+    if not raw:
+        return None, None
+    algorithm = raw.upper().replace("_", "")
+    if _compute_s3_checksum(algorithm, b"") is None:
+        return None, _error(
+            "InvalidRequest",
+            (
+                f"Checksum algorithm not supported in this ministack build: "
+                f"{algorithm}. Supported: SHA256, SHA1, CRC32, CRC64NVME."
+            ),
+            400,
+        )
+    return algorithm, None
+
+
+def _resolve_part_checksums(body: bytes, headers: dict, upload: dict):
+    """Build a part's checksum dict, validating whatever the caller supplied.
+
+    A part carrying its own ``x-amz-checksum-*`` header is validated against
+    the bytes the same way PutObject validates one.  A part that carries none
+    still gets the upload's algorithm computed for it, since the completion
+    builds the composite out of every part's digest and AWS asks the caller
+    for one part checksum at a time rather than for all of them.
+
+    Returns ``(checksums_dict, error_response_or_None)``.
+    """
+    checksums, err = _resolve_object_checksums(body, headers)
+    if err:
+        return {}, err
+
+    algorithm = upload.get("checksum_algorithm")
+    if algorithm and algorithm not in checksums:
+        computed = _compute_s3_checksum(algorithm, body)
+        if computed is not None:
+            checksums[algorithm] = computed
+    return checksums, None
+
+
+def _composite_checksum(algorithm: str, part_checksums: list) -> str | None:
+    """Build the multipart composite: the digest of the parts' digests.
+
+    AWS hashes the raw part digests end to end, base64s the result and suffixes
+    the part count -- so a composite reads as ``<digest>-<parts>`` and cannot be
+    confused with the whole-object checksum of a single PUT.  Returns None when
+    a part is missing its checksum, since a composite over some of the parts
+    would be a value no caller could reproduce.
+    """
+    if not algorithm or not part_checksums:
+        return None
+    digests = b""
+    for value in part_checksums:
+        if not value:
+            return None
+        try:
+            digests += base64.b64decode(value)
+        except ValueError:  # binascii.Error subclasses it
+            return None
+    combined = _compute_s3_checksum(algorithm, digests)
+    if combined is None:
+        return None
+    return f"{combined}-{len(part_checksums)}"
+
+
 def _object_response_headers(obj: dict, bucket_name: str = "", key: str = "",
                              include_checksums: bool = False) -> dict:
     h = {
@@ -1065,9 +1137,10 @@ def _object_response_headers(obj: dict, bucket_name: str = "", key: str = "",
         for alg, val in stored.items():
             h[f"x-amz-checksum-{alg.lower()}"] = val
         if stored:
-            # Single PutObject = FULL_OBJECT; multipart-uploaded objects would
-            # be COMPOSITE — out of scope here.
-            h["x-amz-checksum-type"] = "FULL_OBJECT"
+            # A single PutObject hashes the whole body; a completed multipart
+            # object hashes its parts' digests, which AWS names COMPOSITE.
+            h["x-amz-checksum-type"] = (obj.get("checksum_type")
+                                        or "FULL_OBJECT")
     return h
 
 
@@ -1094,6 +1167,25 @@ def _sigv4_signing_key(secret: str, date_stamp: str, region: str, service: str) 
     k_region = _h(k_date, region)
     k_service = _h(k_region, service)
     return _h(k_service, "aws4_request")
+
+
+def _resolve_presign_secret(access_key_id):
+    """The secret a presigned URL was signed with.
+
+    STS temporary credentials are signed with the unique secret STS issued (not
+    the server's static one), so a presigned URL from an AssumeRole / session
+    token would never recompute against ``AWS_SECRET_ACCESS_KEY``. STS records
+    each issued secret by access key id; resolve it here, falling back to the
+    static server secret for a long-term (non-session) credential.
+    """
+    try:
+        from ministack.services import sts
+        session = sts._sessions.get(access_key_id)
+        if session and session.get("SecretAccessKey"):
+            return session["SecretAccessKey"]
+    except Exception:
+        pass
+    return os.environ.get("AWS_SECRET_ACCESS_KEY", "test")
 
 
 def _verify_presigned_sigv4(method, path, headers, query_params):
@@ -1186,7 +1278,7 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
         hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
     ])
 
-    secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "test")
+    secret = _resolve_presign_secret(_akid)
     signing_key = _sigv4_signing_key(secret, date_stamp, region, service)
     computed = hmac.new(signing_key, string_to_sign.encode("utf-8"),
                         hashlib.sha256).hexdigest()
@@ -1197,11 +1289,18 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
 
 
 async def handle_request(
-    method: str, path: str, headers: dict, body: bytes, query_params: dict
+    method: str, path: str, headers: dict, body: bytes, query_params: dict,
+    signed_path: str | None = None,
 ) -> tuple:
     bucket, key = _parse_bucket_key(path, headers)
 
-    sig_error = _verify_presigned_sigv4(method, path, headers, query_params)
+    # A virtual-hosted request is rewritten to path-style before it reaches here
+    # (``/{bucket}{path}``), but the client signed the canonical URI it actually
+    # sent (``{path}``, no bucket) against the vhost Host header. ``signed_path``
+    # carries that original URI so the presigned signature recomputes correctly;
+    # path-style requests pass None and verify against ``path`` as before.
+    sig_error = _verify_presigned_sigv4(
+        method, signed_path if signed_path is not None else path, headers, query_params)
     if sig_error is not None:
         status, resp_headers, resp_body = sig_error
         resp_headers.setdefault("x-amz-request-id", new_uuid())
@@ -3695,13 +3794,16 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None,
     if bucket is None:
         return _no_such_bucket(bucket_name)
 
-    # Conditional delete: If-Match against the current object's ETag. A
-    # non-matching (or absent) object fails the precondition with 412, so the
-    # object is not removed — S3's compare-and-swap delete.
+    # Conditional delete: If-Match against the current object's ETag. An
+    # object whose ETag differs fails the precondition with 412 and stays —
+    # S3's compare-and-swap delete.  A key that is not there at all is not a
+    # failed precondition: deleting one is a success either way, and S3
+    # answers the conditional delete of an absent key 204 like any other.
     if_match = (headers.get("if-match") or "").strip()
     if if_match:
         _cur = bucket["objects"].get(key)
-        if _cur is None or if_match.strip('"') != _cur["etag"].strip('"'):
+        if _cur is not None and if_match != "*" and (
+                if_match.strip('"') != _cur["etag"].strip('"')):
             return _error(
                 "PreconditionFailed",
                 "At least one of the preconditions you specified did not hold.",
@@ -4994,6 +5096,10 @@ def _create_multipart_upload(bucket_name: str, key: str, headers: dict):
     if sse_err:
         return sse_err
 
+    checksum_algorithm, csum_err = _resolve_multipart_checksum_algorithm(headers)
+    if csum_err:
+        return csum_err
+
     upload_id = new_uuid()
     content_type = headers.get("content-type", "application/octet-stream")
     content_encoding = headers.get("content-encoding")
@@ -5014,6 +5120,7 @@ def _create_multipart_upload(bucket_name: str, key: str, headers: dict):
         "content_encoding": content_encoding,
         "preserved_headers": preserved,
         "storage_class": storage_class,
+        "checksum_algorithm": checksum_algorithm,
         "created": now_iso(),
     }
 
@@ -5021,8 +5128,14 @@ def _create_multipart_upload(bucket_name: str, key: str, headers: dict):
     SubElement(root, "Bucket").text = bucket_name
     SubElement(root, "Key").text = key
     SubElement(root, "UploadId").text = upload_id
-    # AWS echoes the upload's encryption on the initiate response.
-    return 200, {"Content-Type": "application/xml", **sse_headers}, _xml_body(root)
+    # AWS echoes the upload's encryption on the initiate response, and the
+    # checksum algorithm the parts are expected to carry.
+    csum_headers = {}
+    if checksum_algorithm:
+        csum_headers["x-amz-checksum-algorithm"] = checksum_algorithm
+        csum_headers["x-amz-checksum-type"] = "COMPOSITE"
+    return (200, {"Content-Type": "application/xml", **sse_headers,
+                  **csum_headers}, _xml_body(root))
 
 
 def _upload_part(
@@ -5075,14 +5188,24 @@ def _upload_part(
     if md5_err:
         return md5_err
 
+    part_checksums, csum_err = _resolve_part_checksums(body, headers, upload)
+    if csum_err:
+        return csum_err
+
     etag = f'"{md5_hash(body)}"'
     upload["parts"][pn] = {
         "body": body,
         "etag": etag,
         "size": len(body),
         "last_modified": now_iso(),
+        "checksums": part_checksums,
     }
-    return 200, {"ETag": etag, **_stored_sse_headers(upload)}, b""
+    # AWS returns the part's checksum so the caller can name it again on the
+    # completion, which is where the composite is built from.
+    csum_headers = {f"x-amz-checksum-{alg.lower()}": val
+                    for alg, val in part_checksums.items()}
+    return (200, {"ETag": etag, **_stored_sse_headers(upload), **csum_headers},
+            b"")
 
 
 def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, headers: dict):
@@ -5092,6 +5215,10 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
 
     if upload_id not in _multipart_uploads:
         return _error("NoSuchUpload", "The specified multipart upload does not exist.", 404)
+
+    sse_part_err = _check_sse_c_part(headers, _multipart_uploads[upload_id])
+    if sse_part_err is not None:
+        return sse_part_err
 
     # Split the raw header at "?" before percent-decoding, exactly as
     # CopyObject does: a key containing "?versionId" arrives encoded and must
@@ -5135,6 +5262,13 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
         src_obj = src_bucket["objects"][src_key]
         src_version_id = src_obj.get("version_id")
         src_body = _read_body(src_bucket_name, src_key, src_obj)
+        ventry = src_obj
+
+    # An SSE-C source must be addressed with its create-time key, whichever
+    # version the range is copied from.
+    sse_src_err = _check_sse_c_copy_source(headers, ventry)
+    if sse_src_err is not None:
+        return sse_src_err
 
     # Handle x-amz-copy-source-range
     copy_range = headers.get("x-amz-copy-source-range", "")
@@ -5178,7 +5312,8 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
     root = Element("CopyPartResult", xmlns=S3_NS)
     SubElement(root, "ETag").text = etag
     SubElement(root, "LastModified").text = now_iso()
-    resp_headers = {"Content-Type": "application/xml"}
+    resp_headers = {"Content-Type": "application/xml",
+                    **_stored_sse_headers(_multipart_uploads[upload_id])}
     if src_version_id:
         # AWS echoes the copied source version on a versioned source.
         resp_headers["x-amz-copy-source-version-id"] = src_version_id
@@ -5242,11 +5377,12 @@ def _complete_multipart_upload(
             400,
             f"/{bucket_name}/{key}",
         )
-    ordered_parts: list[tuple[int, str | None]] = []
+    ordered_parts: list[tuple[int, str | None, dict]] = []
     for part_el in xml_root.iter():
         local = part_el.tag.split("}")[-1] if "}" in part_el.tag else part_el.tag
         if local == "Part":
             pn_text = etag_text = None
+            part_checksums = {}
             for child in part_el:
                 child_local = (
                     child.tag.split("}")[-1] if "}" in child.tag else child.tag
@@ -5255,15 +5391,20 @@ def _complete_multipart_upload(
                     pn_text = child.text
                 elif child_local == "ETag":
                     etag_text = child.text
+                elif child_local.startswith("Checksum"):
+                    part_checksums[child_local[len("Checksum"):].upper()] = (
+                        child.text)
             if pn_text is not None:
-                ordered_parts.append((int(pn_text), etag_text))
+                ordered_parts.append((int(pn_text), etag_text, part_checksums))
 
     ordered_parts.sort(key=lambda x: x[0])
 
     md5_digests = b""
     combined = b""
     part_records = []
-    for pn, req_etag in ordered_parts:
+    checksum_algorithm = upload.get("checksum_algorithm")
+    part_digests = []
+    for pn, req_etag, req_checksums in ordered_parts:
         if pn not in upload["parts"]:
             return _error(
                 "InvalidPart",
@@ -5278,11 +5419,38 @@ def _complete_multipart_upload(
                 "The following part numbers are invalid: " + str(pn),
                 400,
             )
+        # A part checksum named here must be the one the part was stored
+        # with: the composite is built from what ministack holds, so a caller
+        # naming a different value would get a composite it cannot reproduce.
+        stored_checksums = stored.get("checksums") or {}
+        for alg, value in req_checksums.items():
+            if value and stored_checksums.get(alg) != value:
+                return _error(
+                    "InvalidPart",
+                    "One or more of the specified parts could not be found. "
+                    "The following part numbers are invalid: " + str(pn),
+                    400,
+                )
+        if checksum_algorithm:
+            part_digests.append(stored_checksums.get(checksum_algorithm))
         md5_digests += hashlib.md5(stored["body"]).digest()
         combined += stored["body"]
         # Retained so GetObjectAttributes can report ObjectParts (ListParts
         # functionality) for the completed multipart object.
         part_records.append({"PartNumber": pn, "Size": len(stored["body"])})
+
+    composite = _composite_checksum(checksum_algorithm, part_digests)
+    if checksum_algorithm:
+        requested = (headers or {}).get(
+            f"x-amz-checksum-{checksum_algorithm.lower()}")
+        if requested and requested != composite:
+            return _error(
+                "BadDigest",
+                f"The {checksum_algorithm} you specified did not match the "
+                f"calculated checksum.",
+                400,
+                f"/{bucket_name}/{key}",
+            )
 
     final_md5 = hashlib.md5(md5_digests).hexdigest()
     final_etag = f'"{final_md5}-{len(ordered_parts)}"'
@@ -5298,6 +5466,8 @@ def _complete_multipart_upload(
         "preserved_headers": upload.get("preserved_headers", {}),
         "storage_class": upload.get("storage_class") or "STANDARD",
         "parts": part_records,
+        "checksums": {checksum_algorithm: composite} if composite else {},
+        "checksum_type": "COMPOSITE" if composite else None,
     }
     prior_obj = bucket["objects"].get(key)
     bucket["objects"][key] = obj
@@ -5313,6 +5483,7 @@ def _complete_multipart_upload(
     )
 
     resp_headers = {"Content-Type": "application/xml"}
+    resp_headers.update(_stored_sse_headers(obj))
     version_id = _record_object_version(bucket_name, key, prior_obj, obj, combined)
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
@@ -5336,6 +5507,10 @@ def _complete_multipart_upload(
     SubElement(root, "Bucket").text = bucket_name
     SubElement(root, "Key").text = key
     SubElement(root, "ETag").text = final_etag
+    if composite:
+        SubElement(
+            root, f"Checksum{checksum_algorithm}").text = composite
+        SubElement(root, "ChecksumType").text = "COMPOSITE"
     response = (200, resp_headers, _xml_body(root))
     # Retain the response so an idempotent retry (same upload id) replays it
     # rather than 404ing; the versioning block above is NOT re-run on replay,
@@ -5487,6 +5662,8 @@ def _list_parts(bucket_name: str, key: str, query_params: dict):
         SubElement(p, "LastModified").text = part.get("last_modified", now_iso())
         SubElement(p, "ETag").text = part["etag"]
         SubElement(p, "Size").text = str(part["size"])
+        for alg, value in (part.get("checksums") or {}).items():
+            SubElement(p, f"Checksum{alg}").text = value
 
     if is_truncated and sorted_parts:
         SubElement(root, "NextPartNumberMarker").text = str(sorted_parts[max_parts - 1])

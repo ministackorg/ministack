@@ -1518,7 +1518,11 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
 
     vhost_path = "/" + bucket + path if path != "/" else "/" + bucket + "/"
     try:
-        return await _get_module("s3").handle_request(method, vhost_path, headers, body, query_params)
+        # Pass the original (pre-rewrite) URI as signed_path so a presigned
+        # virtual-hosted URL, which signed the canonical URI without the bucket,
+        # verifies against what the client actually signed.
+        return await _get_module("s3").handle_request(
+            method, vhost_path, headers, body, query_params, signed_path=path)
     except Exception as e:
         logger.exception("Error handling virtual-hosted S3 request: %s", e)
         from xml.sax.saxutils import escape as _xml_esc
@@ -2090,6 +2094,27 @@ async def _handle_lifespan(scope, receive, send):
                     await _transfer_mod.sftp_start()
                 except Exception as e:
                     logger.warning("Transfer SFTP startup failed: %s", e)
+            # Start the IoT mTLS MQTT listener, for the same reason and in the
+            # same place: it mints its server certificate from the Local CA and
+            # attributes devices via the certificate registry, both of which
+            # come out of persistence. On by default (port 8883) when
+            # cryptography is available, like the SFTP listener;
+            # IOT_MTLS_ENABLED=0 turns it off and IOT_MTLS_PORT moves it. The
+            # opt-out skips the iot import for the same reason SFTP's does:
+            # nothing else this boot may need the module, and importing it
+            # costs heap.
+            _iot_mtls_env = os.environ.get("IOT_MTLS_ENABLED", "").strip().lower()
+            if _iot_mtls_env in ("0", "false", "no", "off"):
+                logger.debug(
+                    "IOT_MTLS_ENABLED=%s — skipping iot module import.", _iot_mtls_env
+                )
+            else:
+                try:
+                    from ministack.services import iot as _iot_svc
+
+                    await _iot_svc.mtls_start()
+                except Exception as e:
+                    logger.warning("IoT mTLS listener startup failed: %s", e)
             # Start DSQL wire proxies for clusters restored from persistence.
             # Guarded on the module already being loaded (i.e. it had state
             # or was used this boot) so we never import dsql just for this.
@@ -2131,6 +2156,12 @@ async def _handle_lifespan(scope, receive, send):
                 await transfer.sftp_stop()
             except Exception as e:
                 logger.debug("Transfer SFTP shutdown error: %s", e)
+            _iot_mod = sys.modules.get("ministack.services.iot")
+            if _iot_mod is not None:
+                try:
+                    await _iot_mod.mtls_stop()
+                except Exception as e:
+                    logger.debug("IoT mTLS shutdown error: %s", e)
             _stop_docker_containers()
             await send({"type": "lifespan.shutdown.complete"})
             return

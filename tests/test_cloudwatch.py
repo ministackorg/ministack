@@ -838,3 +838,32 @@ def test_cloudwatch_get_metric_data_cbor_timestamps_are_tag1():
                 _cw._metrics.pop_scoped("000000000000", "us-east-1", key, None)
         _resp._request_region.reset(region_tok)
         _resp._request_account_id.reset(acct_tok)
+
+
+def test_cloudwatch_percentile_alarm_reason_reports_statistic(cw):
+    """A percentile alarm's StateReason must name the actual extended statistic
+    (e.g. p90), not fall back to Average. Regression for the label that stayed
+    'Average' after the percentile value itself was fixed."""
+    ns = "Test/PctAlarmReason"
+    now = time.time()
+    for i, v in enumerate([1, 2, 3, 4, 90, 95, 98, 99]):
+        cw.put_metric_data(Namespace=ns, MetricData=[{
+            "MetricName": "Latency",
+            "Timestamp": now - i,
+            "Value": float(v),
+        }])
+    # p90 of the set is 98.3; threshold 50 -> breaches -> ALARM.
+    cw.put_metric_alarm(
+        AlarmName="pct-reason",
+        MetricName="Latency",
+        Namespace=ns,
+        ExtendedStatistic="p90",
+        Period=3600,
+        EvaluationPeriods=1,
+        Threshold=50.0,
+        ComparisonOperator="GreaterThanThreshold",
+    )
+    alarm = cw.describe_alarms(AlarmNames=["pct-reason"])["MetricAlarms"][0]
+    assert alarm["StateValue"] == "ALARM"
+    assert "p90" in alarm["StateReason"]
+    assert "Average" not in alarm["StateReason"]

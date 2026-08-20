@@ -15,15 +15,22 @@ import base64
 import io as _io
 import json
 import os
+import socket
+import ssl
 import struct
+import subprocess
+import sys
 import threading
 import time
+import urllib.request
 import uuid
 import zipfile as _zipfile
 from urllib.parse import quote, urlparse
 from conftest import patch_endpoint_dns
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
@@ -2833,3 +2840,732 @@ def test_mqtt5_malformed_will_properties_answer_connack_0x81():
     pkt_type, body = _run(scenario())
     assert pkt_type == PKT_CONNACK
     assert body[1] == RC5_MALFORMED_PACKET
+
+
+# ---------------------------------------------------------------------------
+# MQTT over TLS (the broker's TCP transport, port 8883)
+# ---------------------------------------------------------------------------
+# The tests below drive private MiniStack processes on free ports (the shape
+# test_tls.py uses) rather than the suite-wide server on 4566: the listener is
+# a process-level socket, and half of what these pin is how it behaves at
+# startup, on reset and at shutdown. They reuse the MQTT codec above, so only
+# the TLS plumbing is new. IOT_MTLS_PORT is pinned per instance because the
+# listener is on by default at 8883 and parallel servers would contend for it.
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HYPERCORN_CONF = "file:ministack/core/hypercorn_conf.py"
+MTLS_REGION = "us-east-1"
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _spawn(env_extra: dict, port: int, log_path=None) -> subprocess.Popen:
+    """Start a private MiniStack. With `log_path`, its output is captured there
+    (combined stdout/stderr) so a test can assert on what it did or did not log.
+
+    The listener is off here by default: it is on by default at 8883, and a
+    fleet of private test servers all reaching for that one port would leave
+    every instance but the first degraded. Tests that want it pass
+    ``IOT_MTLS_ENABLED=1`` plus their own free port; the default-on test
+    removes the key instead.
+    """
+    env = {
+        **os.environ,
+        "LOG_LEVEL": "WARNING",
+        "PERSIST_STATE": "0",
+        "IOT_MTLS_ENABLED": "0",
+        # These private servers must not touch (or reap) Docker containers
+        # belonging to the host or to the shared test server.
+        "DOCKER_HOST": "unix:///nonexistent-skip-reap",
+        **env_extra,
+    }
+    env = {k: v for k, v in env.items() if v is not None}
+    sink = subprocess.DEVNULL if log_path is None else open(log_path, "wb")
+    try:
+        return subprocess.Popen(
+            [sys.executable, "-m", "hypercorn", "ministack.app:app",
+             "-c", HYPERCORN_CONF,
+             "--bind", f"127.0.0.1:{port}",
+             "--log-level", "warning"],
+            env=env,
+            stdout=sink,
+            stderr=subprocess.STDOUT,
+            cwd=REPO_ROOT,
+        )
+    finally:
+        if sink is not subprocess.DEVNULL:
+            sink.close()
+
+
+def _wait_health(url: str, timeout: float = 30.0) -> None:
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(url, timeout=2)
+            return
+        except Exception as e:
+            last = e
+            time.sleep(0.3)
+    raise AssertionError(f"{url} did not come up within {timeout}s: {last!r}")
+
+
+def _terminate(proc: subprocess.Popen) -> None:
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+class _Broker:
+    """A private MiniStack instance with the mTLS listener bound."""
+
+    def __init__(self, http_port: int, mqtt_port: int, log_path=None):
+        self.http_port = http_port
+        self.mqtt_port = mqtt_port
+        self.log_path = log_path
+        self.url = f"http://127.0.0.1:{http_port}"
+
+    def log(self) -> str:
+        """This instance's captured output. Why the listener refused a
+        certificate is only visible here, and it is part of what it promises.
+        """
+        assert self.log_path is not None, "this instance was spawned without capture"
+        return self.log_path.read_text(errors="replace")
+
+    def client(self, service: str, access_key: str = "test"):
+        return boto3.client(
+            service,
+            endpoint_url=self.url,
+            aws_access_key_id=access_key,
+            aws_secret_access_key="test",
+            region_name=MTLS_REGION,
+            config=Config(region_name=MTLS_REGION, retries={"max_attempts": 0}),
+        )
+
+    def ca_pem(self) -> str:
+        with urllib.request.urlopen(f"{self.url}/_ministack/iot/ca.pem", timeout=5) as resp:
+            return resp.read().decode("utf-8")
+
+
+@pytest.fixture(scope="module")
+def broker(tmp_path_factory):
+    # The importorskip sits in the fixture rather than at module scope: the
+    # rest of this file needs no X.509 machinery.
+    pytest.importorskip("cryptography")
+    http_port = _free_port()
+    mqtt_port = _free_port()
+    log_path = tmp_path_factory.mktemp("mtls-broker") / "server.log"
+    proc = _spawn(
+        {"IOT_MTLS_ENABLED": "1", "IOT_MTLS_PORT": str(mqtt_port)}, http_port, log_path=log_path
+    )
+    try:
+        _wait_health(f"http://127.0.0.1:{http_port}/_ministack/health")
+        yield _Broker(http_port, mqtt_port, log_path)
+    finally:
+        _terminate(proc)
+
+
+# ---------------------------------------------------------------------------
+# Certificates and TLS client
+# ---------------------------------------------------------------------------
+
+
+def _new_cert(broker: _Broker, access_key: str = "test", set_active: bool = True):
+    """CreateKeysAndCertificate under `access_key`'s account."""
+    resp = broker.client("iot", access_key).create_keys_and_certificate(setAsActive=set_active)
+    return resp["certificateId"], resp["certificatePem"], resp["keyPair"]["PrivateKey"]
+
+
+def _client_context(broker: _Broker, cert_pem: str | None, key_pem: str | None, tmp_path):
+    ctx = ssl.create_default_context(cadata=broker.ca_pem())
+    if cert_pem is not None:
+        chain = tmp_path / f"{uuid.uuid4().hex}.pem"
+        chain.write_text(cert_pem + key_pem)
+        ctx.load_cert_chain(str(chain))
+    return ctx
+
+
+def _mtls_connect(broker: _Broker, cert_pem, key_pem, tmp_path, timeout: float = 10.0):
+    """Open a TLS socket to the listener, verifying the broker's chain."""
+    ctx = _client_context(broker, cert_pem, key_pem, tmp_path)
+    raw = socket.create_connection(("127.0.0.1", broker.mqtt_port), timeout=timeout)
+    # `server_hostname` is checked against the certificate's SANs, so this also
+    # pins that the broker certificate carries a usable `localhost` name.
+    return ctx.wrap_socket(raw, server_hostname="localhost")
+
+
+def _split_publish(body: bytes) -> tuple[str, bytes]:
+    topic_len = struct.unpack_from("!H", body, 0)[0]
+    return body[2:2 + topic_len].decode("utf-8"), body[2 + topic_len:]
+
+
+class _Peer:
+    """A connected MQTT client over the TLS socket."""
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.buf = bytearray()
+        # Retained messages are delivered from inside broker_subscribe, i.e.
+        # *before* the SUBACK — park any PUBLISH seen while waiting for an ack.
+        self.publishes: list[tuple[str, bytes]] = []
+
+    def send(self, data: bytes) -> None:
+        self.sock.sendall(data)
+
+    def next_packet(self, timeout: float = 5.0):
+        """Return the next (type, flags, body), or None on EOF/timeout."""
+        deadline = time.time() + timeout
+        while True:
+            parsed = _parse_packet(bytes(self.buf))
+            if parsed is not None:
+                ptype, flags, body, consumed = parsed
+                del self.buf[:consumed]
+                return ptype, flags, body
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return None
+            self.sock.settimeout(remaining)
+            try:
+                chunk = self.sock.recv(4096)
+            except (socket.timeout, ssl.SSLError):
+                return None
+            if not chunk:
+                return None
+            self.buf.extend(chunk)
+
+    def connect(self, client_id: str, timeout: float = 5.0):
+        self.send(_make_connect(client_id))
+        return self.next_packet(timeout=timeout)
+
+    def subscribe(self, topic: str, packet_id: int = 1, timeout: float = 5.0):
+        """Send SUBSCRIBE and return the SUBACK packet."""
+        self.send(_make_subscribe(packet_id, topic))
+        deadline = time.time() + timeout
+        while True:
+            pkt = self.next_packet(timeout=max(0.0, deadline - time.time()))
+            if pkt is None:
+                return None
+            ptype, _flags, body = pkt
+            if ptype == PKT_PUBLISH:
+                self.publishes.append(_split_publish(body))
+                continue
+            return pkt
+
+    def next_publish(self, timeout: float = 5.0):
+        """Return (topic, payload) of the next PUBLISH, or None."""
+        if self.publishes:
+            return self.publishes.pop(0)
+        deadline = time.time() + timeout
+        while True:
+            pkt = self.next_packet(timeout=max(0.0, deadline - time.time()))
+            if pkt is None:
+                return None
+            ptype, _flags, body = pkt
+            if ptype != PKT_PUBLISH:
+                continue
+            return _split_publish(body)
+
+    def wait_disconnected(self, timeout: float = 5.0) -> bool:
+        """True once the broker has hung up. Distinct from `next_packet`
+        returning None, which is also what a quiet-but-live session looks like.
+        """
+        deadline = time.time() + timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False
+            self.sock.settimeout(remaining)
+            try:
+                if not self.sock.recv(4096):
+                    return True
+            except (socket.timeout, TimeoutError):
+                return False
+            except OSError:
+                # A TLS alert or a reset instead of a clean close: still a hangup.
+                return True
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def _refused_below_mqtt(broker, cert_pem, key_pem, tmp_path, client_id: str) -> bool:
+    """True when the listener refuses this certificate before MQTT begins.
+
+    TLS 1.3 lets the server finish its half of the handshake before it has
+    verified the client's certificate, so a refusal reaches the client only
+    after it already believes it is connected — as an alert, as a broken pipe,
+    or as a silent EOF, depending on timing. Asserting on any one of those
+    shapes pins the platform rather than the behaviour; what the listener
+    actually promises is that no CONNACK comes back.
+    """
+    try:
+        peer = _Peer(_mtls_connect(broker, cert_pem, key_pem, tmp_path))
+    except OSError:
+        return True
+    try:
+        return peer.connect(client_id) is None
+    except OSError:
+        return True
+    finally:
+        peer.close()
+
+
+def _assert_connack(pkt, return_code: int = 0) -> None:
+    assert pkt is not None, "no CONNACK received"
+    ptype, _flags, body = pkt
+    assert ptype == PKT_CONNACK, f"expected CONNACK, got packet type {ptype}"
+    assert body[1] == return_code, f"CONNACK return code {body[1]}, expected {return_code}"
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+def test_mtls_on_by_default(tmp_path):
+    """Without IOT_MTLS_PORT the listener reaches for 8883 on its own.
+
+    The default port may legitimately be taken (another instance on the same
+    machine, this very suite's shared server), and a busy port degrades to a
+    log line by design — so the assertion is on the attempt: the log names
+    port 8883, either listening or failing to bind, without anyone setting a
+    variable. When the bind did succeed, a TCP probe pins that it is real.
+    """
+    pytest.importorskip("cryptography")
+    log = tmp_path / "default-on.log"
+    http_port = _free_port()
+    proc = _spawn({"LOG_LEVEL": "INFO", "IOT_MTLS_ENABLED": None}, http_port, log_path=log)
+    try:
+        _wait_health(f"http://127.0.0.1:{http_port}/_ministack/health")
+        text = log.read_text(errors="replace")
+        listening = "MQTT listening on port 8883" in text
+        degraded = "failed to bind port 8883" in text
+        assert listening or degraded, f"no default-on attempt in the log:\n{text}"
+        if listening:
+            with socket.create_connection(("127.0.0.1", 8883), timeout=5):
+                pass
+    finally:
+        _terminate(proc)
+
+
+def test_mtls_disabled_by_env(tmp_path):
+    """IOT_MTLS_ENABLED=0 switches the listener off entirely, the way
+    SFTP_ENABLED does for the Transfer Family listener — down to the lifespan
+    skipping the iot module import, which is the line asserted on."""
+    log = tmp_path / "disabled.log"
+    http_port = _free_port()
+    proc = _spawn({"LOG_LEVEL": "DEBUG"}, http_port, log_path=log)
+    try:
+        _wait_health(f"http://127.0.0.1:{http_port}/_ministack/health")
+        text = log.read_text(errors="replace")
+        assert "skipping iot module import" in text, f"no opt-out line in the log:\n{text}"
+        assert "MQTT listening on port" not in text
+    finally:
+        _terminate(proc)
+
+
+def test_mtls_connect_and_connack(broker, tmp_path):
+    """A CA-signed, ACTIVE certificate connects and gets CONNACK 0."""
+    _cert_id, cert_pem, key_pem = _new_cert(broker)
+    peer = _Peer(_mtls_connect(broker, cert_pem, key_pem, tmp_path))
+    try:
+        _assert_connack(peer.connect(_unique("device")))
+    finally:
+        peer.close()
+
+
+def test_mtls_subscribe_receives_http_publish(broker, tmp_path):
+    """An HTTP `iot-data publish` reaches a subscriber on the TLS transport."""
+    _cert_id, cert_pem, key_pem = _new_cert(broker)
+    topic = _unique("mtls/http")
+    peer = _Peer(_mtls_connect(broker, cert_pem, key_pem, tmp_path))
+    try:
+        _assert_connack(peer.connect(_unique("device")))
+        ptype, _flags, _body = peer.subscribe(topic)
+        assert ptype == PKT_SUBACK
+
+        broker.client("iot-data").publish(topic=topic, payload=b"from-http")
+        assert peer.next_publish() == (topic, b"from-http")
+    finally:
+        peer.close()
+
+
+def test_mtls_publish_is_brokered(broker, tmp_path):
+    """A PUBLISH over TLS goes through the broker: retained, then replayed to a
+    second TLS subscriber."""
+    _cert_id, cert_pem, key_pem = _new_cert(broker)
+    topic = _unique("mtls/retained")
+
+    publisher = _Peer(_mtls_connect(broker, cert_pem, key_pem, tmp_path))
+    try:
+        _assert_connack(publisher.connect(_unique("publisher")))
+        publisher.send(_make_publish(topic, b"sticky", retain=True))
+        # PUBLISH has no ack at QoS 0; give the broker a moment to store it.
+        time.sleep(0.5)
+    finally:
+        publisher.close()
+
+    subscriber = _Peer(_mtls_connect(broker, cert_pem, key_pem, tmp_path))
+    try:
+        _assert_connack(subscriber.connect(_unique("subscriber")))
+        subscriber.subscribe(topic)
+        assert subscriber.next_publish() == (topic, b"sticky")
+    finally:
+        subscriber.close()
+
+
+def test_mtls_no_client_cert_uses_default_account(broker, tmp_path):
+    """No client certificate connects fine, exactly like the WebSocket path,
+    and the session runs under the default account."""
+    topic = _unique("mtls/anonymous")
+    peer = _Peer(_mtls_connect(broker, None, None, tmp_path))
+    try:
+        _assert_connack(peer.connect(_unique("anonymous")))
+        peer.subscribe(topic)
+
+        broker.client("iot-data", access_key="111111111111").publish(
+            topic=topic, payload=b"someone-else"
+        )
+        assert peer.next_publish(timeout=2.0) is None, "leaked across accounts"
+
+        broker.client("iot-data", access_key="000000000000").publish(
+            topic=topic, payload=b"default-account"
+        )
+        assert peer.next_publish() == (topic, b"default-account")
+    finally:
+        peer.close()
+
+
+def test_mtls_unregistered_cert_gets_connack_5(broker, tmp_path):
+    """A certificate the registry does not know is refused, not served.
+
+    Presenting a certificate is a claim of identity, so it is read against the
+    registry; the no-certificate case above is the one that gets the default
+    account.
+    """
+    cert_id, cert_pem, key_pem = _new_cert(broker)
+    iot = broker.client("iot")
+    iot.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
+    iot.delete_certificate(certificateId=cert_id)
+
+    peer = _Peer(_mtls_connect(broker, cert_pem, key_pem, tmp_path))
+    try:
+        _assert_connack(peer.connect(_unique("ghost")), return_code=5)
+        assert peer.next_packet(timeout=3.0) is None, "expected the broker to close"
+    finally:
+        peer.close()
+    refusals = [line for line in broker.log().splitlines() if cert_id in line]
+    assert refusals and "not registered" in refusals[-1], refusals
+
+
+def test_mtls_mqtt5_refusal_is_v5_connack(broker, tmp_path):
+    """An MQTT 5 client refused over TLS gets a *v5* CONNACK.
+
+    Reason code 0x87 ("Not authorized") plus a property block — not the
+    two-byte 3.1.1 form, which a v5 SDK's decoder would die on instead of
+    reporting the refusal.
+    """
+    cert_id, cert_pem, key_pem = _new_cert(broker)
+    iot = broker.client("iot")
+    iot.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
+    iot.delete_certificate(certificateId=cert_id)
+
+    peer = _Peer(_mtls_connect(broker, cert_pem, key_pem, tmp_path))
+    try:
+        peer.send(_make_connect(_unique("ghost-v5"), protocol_level=MQTT_5))
+        pkt = peer.next_packet(timeout=5.0)
+        assert pkt is not None, "no CONNACK received"
+        ptype, _flags, body = pkt
+        assert ptype == PKT_CONNACK, f"expected CONNACK, got packet type {ptype}"
+        assert body[1] == 0x87, f"reason code {body[1]:#x}, expected 0x87 (not authorized)"
+        assert len(body) >= 3 and body[2] == 0x00, "v5 CONNACK property block missing"
+    finally:
+        peer.close()
+
+
+def test_mtls_inactive_cert_refused(broker, tmp_path):
+    """Deactivating a certificate cuts the device off.
+
+    This is the lifecycle the control plane already enforces (an ACTIVE
+    certificate cannot be deleted, `CertificateStateException` 406), read at
+    connect time: without it, `UpdateCertificate` to INACTIVE would mean
+    nothing on the wire.
+    """
+    cert_id, cert_pem, key_pem = _new_cert(broker, access_key="111111111111")
+    iot = broker.client("iot", access_key="111111111111")
+
+    peer = _Peer(_mtls_connect(broker, cert_pem, key_pem, tmp_path))
+    try:
+        _assert_connack(peer.connect(_unique("before-deactivation")))
+    finally:
+        peer.close()
+
+    iot.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
+
+    peer = _Peer(_mtls_connect(broker, cert_pem, key_pem, tmp_path))
+    try:
+        _assert_connack(peer.connect(_unique("deactivated")), return_code=5)
+    finally:
+        peer.close()
+
+    iot.update_certificate(certificateId=cert_id, newStatus="ACTIVE")
+
+    peer = _Peer(_mtls_connect(broker, cert_pem, key_pem, tmp_path))
+    try:
+        _assert_connack(peer.connect(_unique("reactivated")))
+    finally:
+        peer.close()
+
+
+def test_mtls_ambiguous_cert_is_refused(broker, tmp_path):
+    """A certificate two accounts hold ACTIVE is refused, not awarded.
+
+    `RegisterCertificate` accepts any PEM from any caller, so 222222222222 can
+    register a copy of 111111111111's device certificate. Both registrations
+    see byte-identical bytes, so a tie-break would decide the tenancy by
+    something like account-id order, handing the device's session to whoever
+    registered the copy. The connection is refused instead, the log names both
+    scopes, and the device is back on its own account once only one
+    registration is left ACTIVE.
+    """
+    cert_id, cert_pem, key_pem = _new_cert(broker, access_key="111111111111")
+
+    peer = _Peer(_mtls_connect(broker, cert_pem, key_pem, tmp_path))
+    try:
+        _assert_connack(peer.connect(_unique("before-the-copy")))
+    finally:
+        peer.close()
+
+    hijacker = broker.client("iot", access_key="222222222222")
+    hijacker.register_certificate(certificatePem=cert_pem, setAsActive=True)
+
+    peer = _Peer(_mtls_connect(broker, cert_pem, key_pem, tmp_path))
+    try:
+        _assert_connack(peer.connect(_unique("contested")), return_code=5)
+    finally:
+        peer.close()
+
+    # A refusal an operator cannot explain is the failure mode this listener
+    # exists to avoid, and "your certificate is registered twice" is not a
+    # guess anyone makes unaided, so the log names the reason and both scopes.
+    refusals = [line for line in broker.log().splitlines() if cert_id in line]
+    assert refusals, "the refusal was not logged"
+    assert "ambiguous" in refusals[-1], refusals[-1]
+    assert "111111111111/us-east-1" in refusals[-1], refusals[-1]
+    assert "222222222222/us-east-1" in refusals[-1], refusals[-1]
+
+    hijacker.update_certificate(certificateId=cert_id, newStatus="INACTIVE")
+
+    peer = _Peer(_mtls_connect(broker, cert_pem, key_pem, tmp_path))
+    try:
+        _assert_connack(peer.connect(_unique("uncontested-again")))
+    finally:
+        peer.close()
+
+
+def test_mtls_registered_ca_chain_connects(broker, tmp_path):
+    """A leaf signed by a CA registered through the API connects.
+
+    The listener reads its trust anchors out of the IoT CA registry on every
+    handshake, so this pins both properties that follow from that: a CA
+    registered long after the listener bound is trusted without a restart, and
+    only an ACTIVE one is.
+    """
+    from ministack.core.x509_utils import generate_ca, sign_leaf_certificate
+
+    iot = broker.client("iot")
+    ca_pem, ca_key = generate_ca(common_name="Registered Device CA")
+    ca_id = iot.register_ca_certificate(caCertificate=ca_pem, setAsActive=False)[
+        "certificateId"
+    ]
+    leaf_pem, leaf_key, _public = sign_leaf_certificate(
+        ca_pem, ca_key, common_name="registered-ca-device"
+    )
+    iot.register_certificate(
+        certificatePem=leaf_pem, caCertificatePem=ca_pem, setAsActive=True
+    )
+
+    # The leaf itself is registered ACTIVE, so its CA's status is the only thing
+    # left that can refuse it — and an untrusted anchor is refused by TLS,
+    # below MQTT.
+    assert _refused_below_mqtt(
+        broker, leaf_pem, leaf_key, tmp_path, _unique("too-early")
+    ), "a leaf signed by an INACTIVE CA reached the broker"
+
+    iot.update_ca_certificate(certificateId=ca_id, newStatus="ACTIVE")
+
+    peer = _Peer(_mtls_connect(broker, leaf_pem, leaf_key, tmp_path))
+    try:
+        _assert_connack(peer.connect(_unique("registered-ca-device")))
+    finally:
+        peer.close()
+
+
+def test_mtls_account_scoped_delivery(broker, tmp_path):
+    """The client certificate decides the tenant: a device whose certificate is
+    owned by 111111111111 sees that account's traffic and nobody else's."""
+    _cert_id, cert_pem, key_pem = _new_cert(broker, access_key="111111111111")
+    topic = _unique("mtls/tenant")
+
+    peer = _Peer(_mtls_connect(broker, cert_pem, key_pem, tmp_path))
+    try:
+        _assert_connack(peer.connect(_unique("tenant-device")))
+        peer.subscribe(topic)
+
+        broker.client("iot-data", access_key="000000000000").publish(
+            topic=topic, payload=b"other-tenant"
+        )
+        assert peer.next_publish(timeout=2.0) is None, "leaked across accounts"
+
+        broker.client("iot-data", access_key="111111111111").publish(
+            topic=topic, payload=b"own-tenant"
+        )
+        assert peer.next_publish() == (topic, b"own-tenant")
+    finally:
+        peer.close()
+
+
+def test_mtls_garbage_bytes_dropped(broker, tmp_path):
+    """Junk after the handshake kills that connection only."""
+    _cert_id, cert_pem, key_pem = _new_cert(broker)
+    junk = _Peer(_mtls_connect(broker, cert_pem, key_pem, tmp_path))
+    try:
+        junk.send(bytes([0xFF]) * 64)
+        junk.send(os.urandom(256))
+        junk.next_packet(timeout=2.0)
+    finally:
+        junk.close()
+
+    peer = _Peer(_mtls_connect(broker, cert_pem, key_pem, tmp_path))
+    try:
+        _assert_connack(peer.connect(_unique("after-junk")))
+    finally:
+        peer.close()
+
+
+def test_mtls_duplicate_client_id_evicts_first_connection(broker, tmp_path):
+    """A second CONNECT with the same client id closes the first socket — the
+    session adapter's `websocket.close` translation."""
+    _cert_id, cert_pem, key_pem = _new_cert(broker)
+    client_id = _unique("twin")
+
+    first = _Peer(_mtls_connect(broker, cert_pem, key_pem, tmp_path))
+    second = None
+    try:
+        _assert_connack(first.connect(client_id))
+        second = _Peer(_mtls_connect(broker, cert_pem, key_pem, tmp_path))
+        _assert_connack(second.connect(client_id))
+        assert first.next_packet(timeout=5.0) is None, "first connection should be closed"
+    finally:
+        first.close()
+        if second is not None:
+            second.close()
+
+
+def _await_rebind(broker, tmp_path, client_id: str, timeout: float = 15.0) -> None:
+    """Block until a certificate minted from the current CA gets CONNACK 0.
+
+    The rebind after a reset is scheduled on the event loop from reset's worker
+    thread, so it lands some time after the HTTP call returns; until it does,
+    the listener is either down or still serving the previous CA's certificate.
+    Failing this is what "the listener did not come back" looks like.
+    """
+    deadline = time.time() + timeout
+    last_error: Exception | None = None
+    while time.time() < deadline:
+        try:
+            _cert_id, cert_pem, key_pem = _new_cert(broker)
+            peer = _Peer(_mtls_connect(broker, cert_pem, key_pem, tmp_path))
+            try:
+                _assert_connack(peer.connect(_unique(client_id)))
+                return
+            finally:
+                peer.close()
+        except (ssl.SSLError, OSError, AssertionError) as e:
+            last_error = e
+            time.sleep(0.5)
+    raise AssertionError(
+        f"listener did not come back within {timeout}s after reset: {last_error!r}"
+    )
+
+
+def _reset(broker, timeout: float = 10.0) -> None:
+    urllib.request.urlopen(
+        urllib.request.Request(f"{broker.url}/_ministack/reset", data=b"", method="POST"),
+        timeout=timeout,
+    )
+
+
+def test_mtls_listener_survives_reset(broker, tmp_path):
+    """`/_ministack/reset` regenerates the CA; the listener rebinds with fresh
+    material instead of serving a certificate nobody can verify."""
+    _reset(broker)
+    _await_rebind(broker, tmp_path, "post-reset")
+
+
+def test_mtls_reset_rebinds_with_a_device_connected(broker, tmp_path):
+    """A live session does not hold the rebind hostage.
+
+    `asyncio.Server.wait_closed()` waits for established connections as well as
+    for the acceptor since Python 3.12.1, so a stop that awaited it never
+    returned while a device was attached — and since the restart awaited the
+    stop while both shared a lock, the listener stayed down for the life of the
+    process. The connected device is disconnected instead of outliving the CA
+    that admitted it, which is also what makes the rebind bounded.
+    """
+    _cert_id, cert_pem, key_pem = _new_cert(broker)
+    peer = _Peer(_mtls_connect(broker, cert_pem, key_pem, tmp_path))
+    try:
+        _assert_connack(peer.connect(_unique("attached")))
+        _reset(broker)
+        # Asserted before the socket is closed, and with it still open: closing
+        # it first is what un-wedged the old code, so the whole point is that
+        # nothing on the client's side has to happen for the rebind to land.
+        assert peer.wait_disconnected(timeout=10.0), (
+            "the session outlived the CA and the registry entry that admitted it"
+        )
+        _await_rebind(broker, tmp_path, "post-reset-with-device")
+    finally:
+        peer.close()
+
+
+def test_mtls_shutdown_completes_with_a_device_connected(tmp_path):
+    """A connected device does not stop the process from shutting down.
+
+    Same defect as the reset above, on the other caller: `lifespan.shutdown`
+    awaits `mtls_stop`, so an unbounded stop hangs the shutdown and the server
+    only ever dies by SIGKILL. A private instance, because the assertion is
+    about how this one terminates.
+    """
+    pytest.importorskip("cryptography")
+    http_port, mqtt_port = _free_port(), _free_port()
+    proc = _spawn({"IOT_MTLS_ENABLED": "1", "IOT_MTLS_PORT": str(mqtt_port)}, http_port)
+    peer = None
+    try:
+        _wait_health(f"http://127.0.0.1:{http_port}/_ministack/health")
+        private = _Broker(http_port, mqtt_port)
+        _cert_id, cert_pem, key_pem = _new_cert(private)
+        peer = _Peer(_mtls_connect(private, cert_pem, key_pem, tmp_path))
+        _assert_connack(peer.connect(_unique("still-here")))
+
+        proc.terminate()
+        try:
+            proc.wait(timeout=25)
+        except subprocess.TimeoutExpired:
+            raise AssertionError(
+                "the server did not shut down within 25s with a device connected"
+            ) from None
+    finally:
+        if peer is not None:
+            peer.close()
+        _terminate(proc)

@@ -85,6 +85,15 @@ def _create_change_set(params):
     if not cs_name:
         return _error("ValidationError", "ChangeSetName is required")
 
+    # A change set name is unique per stack while it exists; real CloudFormation
+    # answers AlreadyExistsException for a duplicate name (modeled on
+    # CreateChangeSet). #1418
+    for _existing in _change_sets.values():
+        if (_existing["ChangeSetName"] == cs_name
+                and _existing["StackName"] == stack_name):
+            return _error("AlreadyExistsException",
+                          f"ChangeSet [{cs_name}] already exists")
+
     template_body, resolve_err = _resolve_template(params)
     if resolve_err:
         return resolve_err
@@ -172,13 +181,24 @@ def _create_change_set(params):
         f"changeSet/{cs_name}/{new_uuid()}"
     )
 
+    if changes:
+        _cs_status, _cs_exec, _cs_reason = "CREATE_COMPLETE", "AVAILABLE", ""
+    else:
+        # Real AWS: a change set with no changes ends FAILED and cannot be
+        # executed (ExecutionStatus UNAVAILABLE), with this exact reason.
+        _cs_status, _cs_exec = "FAILED", "UNAVAILABLE"
+        _cs_reason = (
+            "The submitted information didn't contain changes. "
+            "Submit different information to create a change set."
+        )
     change_set = {
         "ChangeSetId": cs_id,
         "ChangeSetName": cs_name,
         "StackId": stack_id,
         "StackName": stack_name,
-        "Status": "CREATE_COMPLETE",
-        "ExecutionStatus": "AVAILABLE",
+        "Status": _cs_status,
+        "ExecutionStatus": _cs_exec,
+        "StatusReason": _cs_reason,
         "CreationTime": now_iso(),
         "Description": _p(params, "Description", ""),
         "ChangeSetType": cs_type,
@@ -208,8 +228,8 @@ def _describe_change_set(params):
     stack_name = _p(params, "StackName")
     _, cs = _find_change_set(cs_name, stack_name)
     if not cs:
-        return _error("ChangeSetNotFoundException",
-                      f"ChangeSet [{cs_name}] does not exist")
+        return _error("ChangeSetNotFound",
+                      f"ChangeSet [{cs_name}] does not exist", 404)
 
     params_xml = ""
     for p in cs.get("Parameters", []):
@@ -247,6 +267,7 @@ def _describe_change_set(params):
         f"<StackId>{_esc(cs['StackId'])}</StackId>"
         f"<StackName>{_esc(cs['StackName'])}</StackName>"
         f"<Status>{cs['Status']}</Status>"
+        f"<StatusReason>{_esc(cs.get('StatusReason', ''))}</StatusReason>"
         f"<ExecutionStatus>{cs['ExecutionStatus']}</ExecutionStatus>"
         f"<CreationTime>{cs['CreationTime']}</CreationTime>"
         f"<Description>{_esc(cs.get('Description', ''))}</Description>"
@@ -262,14 +283,32 @@ def _describe_change_set(params):
 
 # --- ExecuteChangeSet ---
 
+async def _track_change_set_execution(change_set, stack, deploy_coro):
+    """Await the change set's stack deployment, then record its ExecutionStatus.
+
+    Real CloudFormation moves a change set from EXECUTE_IN_PROGRESS to
+    EXECUTE_COMPLETE only when the stack operation succeeds, and to
+    EXECUTE_FAILED when it fails or rolls back. The ChangeSetStatus (``Status``)
+    stays CREATE_COMPLETE throughout. #1418
+    """
+    try:
+        await deploy_coro
+    finally:
+        status = stack.get("StackStatus", "")
+        if status.endswith("_COMPLETE") and "ROLLBACK" not in status:
+            change_set["ExecutionStatus"] = "EXECUTE_COMPLETE"
+        else:
+            change_set["ExecutionStatus"] = "EXECUTE_FAILED"
+
+
 def _execute_change_set(params):
     from ministack.services.cloudformation import _stacks
     cs_name = _p(params, "ChangeSetName")
     stack_name = _p(params, "StackName")
-    _, cs = _find_change_set(cs_name, stack_name)
+    _executed_cs_id, cs = _find_change_set(cs_name, stack_name)
     if not cs:
-        return _error("ChangeSetNotFoundException",
-                      f"ChangeSet [{cs_name}] does not exist")
+        return _error("ChangeSetNotFound",
+                      f"ChangeSet [{cs_name}] does not exist", 404)
 
     if cs["ExecutionStatus"] != "AVAILABLE":
         return _error("InvalidChangeSetStatusException",
@@ -319,17 +358,30 @@ def _execute_change_set(params):
                    physical_id=stack_id)
 
         _create_stack_task_in_region(
-            _deploy_stack_async(real_stack_name, stack_id, template,
-                                param_values, False, tags,
-                                is_update=is_update,
-                                previous_stack=previous_stack),
+            _track_change_set_execution(
+                cs,
+                stack,
+                _deploy_stack_async(real_stack_name, stack_id, template,
+                                    param_values, False, tags,
+                                    is_update=is_update,
+                                    previous_stack=previous_stack),
+            ),
             stack,
             stack_id,
         )
 
-    cs["ExecutionStatus"] = "EXECUTE_COMPLETE"
-    cs["Status"] = "EXECUTE_COMPLETE"
+    # Real AWS deletes the stack's other change sets on execute — they are no
+    # longer valid for the updated stack. #1418
+    from ministack.services.cloudformation import _change_sets as _cs_store
+    for _cid in [c for c, v in _cs_store.items()
+                 if v.get("StackId") == stack_id and c != _executed_cs_id]:
+        _cs_store.pop(_cid, None)
 
+    # ExecutionStatus stays EXECUTE_IN_PROGRESS until the deploy finishes, when
+    # _track_change_set_execution sets EXECUTE_COMPLETE or EXECUTE_FAILED. Status
+    # is the ChangeSetStatus and stays CREATE_COMPLETE: EXECUTE_COMPLETE is not a
+    # ChangeSetStatus value, and writing it here made the CDK reject the change
+    # set as "not ready" (it gates on Status == CREATE_COMPLETE). #1418
     return _xml(200, "ExecuteChangeSetResponse",
                 "<ExecuteChangeSetResult></ExecuteChangeSetResult>")
 
@@ -342,8 +394,8 @@ def _delete_change_set(params):
     stack_name = _p(params, "StackName")
     cs_id, cs = _find_change_set(cs_name, stack_name)
     if not cs_id:
-        return _error("ChangeSetNotFoundException",
-                      f"ChangeSet [{cs_name}] does not exist")
+        return _error("ChangeSetNotFound",
+                      f"ChangeSet [{cs_name}] does not exist", 404)
     _change_sets.pop(cs_id, None)
     return _xml(200, "DeleteChangeSetResponse", "")
 
@@ -367,6 +419,7 @@ def _list_change_sets(params):
             f"<StackId>{_esc(cs['StackId'])}</StackId>"
             f"<StackName>{_esc(cs['StackName'])}</StackName>"
             f"<Status>{cs['Status']}</Status>"
+            f"<StatusReason>{_esc(cs.get('StatusReason', ''))}</StatusReason>"
             f"<ExecutionStatus>{cs['ExecutionStatus']}</ExecutionStatus>"
             f"<CreationTime>{cs['CreationTime']}</CreationTime>"
             f"<Description>{_esc(cs.get('Description', ''))}</Description>"
