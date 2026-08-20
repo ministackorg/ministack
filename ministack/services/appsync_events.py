@@ -522,6 +522,17 @@ def _events_authorizer_invoke(
     return _parse_lambda_authorizer_body(res.get("body"))
 
 
+async def _run_authorizer_in_thread(fn, *args):
+    """Run the blocking authorizer invoke on its own thread.
+
+    Thin wrapper so the Lambda-execution threading policy lives in one place;
+    see ``lambda_svc.run_invocation_in_thread``.
+    """
+    from ministack.services import lambda_svc
+
+    return await lambda_svc.run_invocation_in_thread(fn, *args)
+
+
 # AWS operation enum — sent verbatim in the Lambda authorizer ``operation`` field.
 EVENT_CONNECT = "EVENT_CONNECT"
 EVENT_SUBSCRIBE = "EVENT_SUBSCRIBE"
@@ -545,7 +556,11 @@ async def _authorize_event_op(
         if not token:
             return False, f"{operation} rejected: no Authorization token"
         namespace = _channel_namespace_for(channel) if channel else None
-        ok, _ctx = await asyncio.to_thread(
+        # Dedicated per-invocation thread, not the bounded default executor:
+        # this runs the authorizer Lambda inline and an authorizer that calls
+        # back into MiniStack would queue behind the invocations waiting on it.
+        # See lambda_svc.run_invocation_in_thread.
+        ok, _ctx = await _run_authorizer_in_thread(
             _events_authorizer_invoke,
             lambda_arn,
             api_id,
@@ -1145,7 +1160,8 @@ async def _handle_websocket_in_api_scope(
             ):
                 return
         else:
-            ok, connect_rctx = await asyncio.to_thread(
+            # Dedicated per-invocation thread — see _authorize_event_op.
+            ok, connect_rctx = await _run_authorizer_in_thread(
                 _events_authorizer_invoke,
                 lambda_auth_arn,
                 api_id,

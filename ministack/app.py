@@ -1978,13 +1978,14 @@ async def _handle_lifespan(scope, receive, send):
         if message["type"] == "lifespan.startup":
             port = _resolve_port()
             logger.info(BANNER.format(port=port))
-            # Install a larger default thread-pool executor. Lambda invocations
-            # (warm pool subprocess spawn, RIE HTTP, provided-runtime) all ride
-            # on asyncio.to_thread; Python's default is min(32, cpu+4) which
-            # is only 6 on a 2-core CI runner. Under xdist that queues cold
-            # starts behind other blocking work and test urlopen timeouts fire
-            # before the handler ever runs. 64 is plenty — threads are cheap
-            # and idle. Override with MINISTACK_WORKER_THREADS.
+            # Install a larger default thread-pool executor. Python's default
+            # is min(32, cpu+4), only 6 on a 2-core CI runner, which queues
+            # blocking work behind other blocking work until client timeouts
+            # fire. Lambda executions no longer ride this pool — they get a
+            # thread each (lambda_svc.run_invocation_in_thread), because a
+            # handler calling back into MiniStack deadlocks against a bounded
+            # one — but everything else here still does. 64 is plenty; threads
+            # are cheap and idle. Override with MINISTACK_WORKER_THREADS.
             import concurrent.futures
 
             _max_workers = int(os.environ.get("MINISTACK_WORKER_THREADS", "64"))

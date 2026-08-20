@@ -146,6 +146,12 @@ _SERIAL_TESTS = {
     # Account-global mutations (password policy, alias); must run serially.
     "tests/test_iam.py::test_iam_password_policy_absent_then_set",
     "tests/test_iam.py::test_iam_account_alias_crud",
+    # Lambda worker-pool starvation regression: spawns its own 8-worker server
+    # and puts 16 concurrent invokes of distinct functions through it, each
+    # calling back in, so ~17 warm-worker subprocesses are alive at peak under
+    # a 20s function timeout. That is the whole point of the test, but it fails
+    # on time rather than on behaviour if it shares a runner. Serial phase.
+    "tests/test_lambda.py::test_lambda_reentrant_callback_not_starved_under_concurrency",
     # Recursive-loop detection. The two chain tests cold-start 16+ Lambdas
     # each and poll CloudWatch Logs until the chain stops changing; the other
     # two assert on wall clock (a dropped invocation must come back long

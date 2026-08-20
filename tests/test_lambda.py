@@ -10139,6 +10139,352 @@ def test_lambda_keepalive_zero_forces_cold_start(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Re-entrant invocations — a handler that calls back into the emulator during
+# its own invocation must never starve the invoke path.
+#
+# Synchronous invocations used to ride on the event loop's *default* thread
+# pool, so each in-flight invoke held one worker out of a fixed pool for the
+# whole handler duration. Lambdas get AWS_ENDPOINT_URL pointed at this server,
+# and when a handler's nested call lands on a route that itself needs a worker
+# (another Invoke, an API Gateway / ALB / Function URL execute path, a Cognito
+# trigger) it queues behind the very invocations waiting on it. The deadlock
+# threshold is exactly the pool size. Invocations now run on dedicated
+# per-invocation threads.
+#
+# NOTE for the concurrency test below: the callers must all be *in flight* at
+# once for the pool to fill, so the handler sleeps before making its nested
+# call. Without that ramp-in the invokes trickle through under the pool size
+# and the test passes even on the broken code.
+# ---------------------------------------------------------------------------
+
+# The pool size is a property of the *server* process, and the concurrency
+# below has to exceed it, so the test starts its own server with a small one
+# rather than mirroring the 64-thread default of the shared session server
+# (which would make this a 72-invocation storm to prove the same thing).
+_STARVATION_POOL = 8
+
+
+@contextlib.contextmanager
+def _private_server(**env_extra):
+    """Run a throwaway MiniStack on a free port, the way the Docker image does.
+
+    AWS_ENDPOINT_URL is pinned at this server so a handler's nested call comes
+    back here and not to the shared session server.
+    """
+    import socket
+    import subprocess
+    import sys
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    endpoint = f"http://127.0.0.1:{port}"
+    env = {
+        **os.environ,
+        "GATEWAY_PORT": str(port),
+        "MINISTACK_HOST": "127.0.0.1",
+        "AWS_ENDPOINT_URL": endpoint,
+        "PERSIST_STATE": "0",
+        "LOG_LEVEL": "WARNING",
+        **{k: str(v) for k, v in env_extra.items()},
+    }
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "hypercorn", "ministack.app:app",
+         "-c", "file:ministack/core/hypercorn_conf.py",
+         "--bind", f"127.0.0.1:{port}", "--log-level", "warning"],
+        env=env, cwd=repo_root,
+        stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
+    )
+    try:
+        deadline = time.time() + 60
+        while True:
+            if proc.poll() is not None:
+                raise AssertionError(
+                    f"private server exited early (rc={proc.returncode})"
+                )
+            try:
+                _urlreq.urlopen(f"{endpoint}/_ministack/health", timeout=2).read()
+                break
+            except Exception:
+                if time.time() > deadline:
+                    raise AssertionError("private server did not come up in 60s")
+                time.sleep(0.3)
+        yield endpoint
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+
+_REENTRANT_CALLEE_CODE = """
+def handler(event, context):
+    return {"pong": True, "n": event.get("n")}
+"""
+
+_REENTRANT_CALLER_CODE_TMPL = """
+import json, os, time, urllib.request
+
+def handler(event, context):
+    # Hold the invocation open long enough for every concurrent caller to be
+    # in flight before any of them issues its nested request.
+    time.sleep(float(event.get("hold", 0)))
+    endpoint = os.environ["AWS_ENDPOINT_URL"]
+    req = urllib.request.Request(
+        endpoint + "/2015-03-31/functions/{callee}/invocations",
+        data=json.dumps({{"n": event.get("n")}}).encode(),
+        headers={{"Content-Type": "application/json"}},
+    )
+    resp = urllib.request.urlopen(req, timeout=30)
+    return {{"nested": json.loads(resp.read().decode()), "n": event.get("n")}}
+"""
+
+
+@contextlib.contextmanager
+def _reentrant_callers(lam, *, count=1, timeout=15):
+    """Create one callee and `count` distinct callers that invoke it.
+
+    The callers are separate functions on purpose: the warm executor keys its
+    worker subprocess by function name and serializes invocations of the same
+    function, so N concurrent invokes of one function would not put N
+    executions in flight at once.
+    """
+    suffix = _uuid_mod.uuid4().hex[:8]
+    callee = f"lam-reentrant-callee-{suffix}"
+    lam.create_function(
+        FunctionName=callee, Runtime="python3.12", Handler="index.handler",
+        Role=_LAMBDA_ROLE, Code={"ZipFile": _make_zip(_REENTRANT_CALLEE_CODE)},
+        Timeout=10,
+    )
+    code = _make_zip(_REENTRANT_CALLER_CODE_TMPL.format(callee=callee))
+    callers = []
+    try:
+        for i in range(count):
+            name = f"lam-reentrant-caller-{suffix}-{i}"
+            lam.create_function(
+                FunctionName=name, Runtime="python3.12", Handler="index.handler",
+                Role=_LAMBDA_ROLE, Code={"ZipFile": code}, Timeout=timeout,
+            )
+            callers.append(name)
+        yield callers, callee
+    finally:
+        for name in callers:
+            with contextlib.suppress(Exception):
+                lam.delete_function(FunctionName=name)
+        with contextlib.suppress(Exception):
+            lam.delete_function(FunctionName=callee)
+
+
+@pytest.mark.skipif(
+    os.environ.get("LAMBDA_EXECUTOR", "").lower() == "docker",
+    reason="pool-starvation regression exercises the in-process executors; "
+    "under the docker executor the same N would cold-start N containers and "
+    "measure spawn load rather than the wedge this guards",
+)
+def test_lambda_reentrant_callback_not_starved_under_concurrency(lam):
+    """N concurrent invokes of handlers that invoke another function *through
+    the emulator*, with N above the server's worker-thread pool size, must ALL
+    complete.
+
+    Each handler holds its execution open briefly so that all N are in flight
+    before any nested request is issued — that ramp-in is what fills the pool,
+    and without it the invokes trickle through under the pool size and pass
+    even on the broken code.
+
+    On the broken code every invocation above the pool size wedges: at
+    MINISTACK_WORKER_THREADS=8 all 16 fail with "Task timed out", and the same
+    shape holds at the 64-thread default (measured: exactly 64 of 80 timed out,
+    and the 16 that never got a worker went through once the wedge cleared)."""
+    import concurrent.futures
+
+    n_concurrent = _STARVATION_POOL + 8
+    hold_s = 1.5  # ramp-in: every caller in flight before the first nested call
+    fn_timeout = 20  # > hold_s; a starved invoke burns this before failing
+    with _private_server(MINISTACK_WORKER_THREADS=_STARVATION_POOL) as endpoint:
+        client = boto3.client(
+            "lambda",
+            endpoint_url=endpoint,
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+            region_name="us-east-1",
+            config=Config(
+                retries={"max_attempts": 0},
+                read_timeout=fn_timeout + 60,
+                connect_timeout=10,
+                max_pool_connections=n_concurrent + 10,
+            ),
+        )
+        with _reentrant_callers(
+            client, count=n_concurrent, timeout=fn_timeout
+        ) as (callers, _callee):
+
+            def _invoke(n):
+                resp = client.invoke(
+                    FunctionName=callers[n],
+                    Payload=json.dumps({"n": n, "hold": hold_s}).encode(),
+                )
+                payload = json.loads(resp["Payload"].read())
+                return n, resp.get("FunctionError", ""), payload
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=n_concurrent
+            ) as ex:
+                results = list(ex.map(_invoke, range(n_concurrent)))
+
+    failures = [(n, err, p) for n, err, p in results if err]
+    assert not failures, (
+        f"{len(failures)}/{n_concurrent} re-entrant invocations failed "
+        f"(starved worker pool?): first: {failures[0]}"
+    )
+    for n, _err, payload in results:
+        assert payload["nested"]["pong"] is True
+        assert payload["nested"]["n"] == n
+
+
+# The primitives that actually run a handler. Anything that reaches one of
+# these blocks for the whole handler duration, so handing it to
+# ``asyncio.to_thread`` puts that duration on the event loop's bounded default
+# executor — the starvation ``run_invocation_in_thread`` exists to remove.
+#
+# Kept as a source scan because the failure it guards is invisible until
+# something deadlocks under concurrency: a new synchronous invoke path reads
+# fine and only wedges in production-shaped load, so it is cheaper to pin the
+# call shape than to spin up another concurrency test per path.
+_BLOCKING_INVOKE_PRIMITIVES = {
+    "_execute_function",
+    "_execute_function_with_config_scope",
+    "_run_with_function_config_scope",
+}
+
+# Files that must keep routing their Lambda executions through the helper.
+_INVOKE_THREAD_CALLERS = (
+    "services/lambda_svc.py",
+    "services/alb.py",
+    "services/apigateway.py",
+    "services/apigateway_v1.py",
+    "services/cognito.py",
+    "services/appsync_events.py",
+    "services/cloudformation/stacks.py",
+)
+
+
+def _functions_reaching_a_lambda_execution(root):
+    """Every function in the package that can end up running a handler.
+
+    Derived, not listed: the first version of this guard hardcoded the five
+    call targets it knew about, which is exactly the shape of the bug it
+    guards — it could not see ``asyncio.to_thread(_provision_resource, ...)``
+    reaching a Lambda four calls later through a custom resource. So the scan
+    starts from the primitives that run a handler and closes over intra-package
+    calls by name until it stops growing. Name-based resolution is coarse in
+    both directions; it errs towards flagging, and the fix for a false positive
+    is the same one-line change as for a true one.
+    """
+    import ast
+
+    calls: dict[str, set[str]] = {}
+    for path in sorted(root.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            called = calls.setdefault(node.name, set())
+            for sub in ast.walk(node):
+                if not isinstance(sub, ast.Call):
+                    continue
+                if isinstance(sub.func, ast.Attribute):
+                    called.add(sub.func.attr)
+                elif isinstance(sub.func, ast.Name):
+                    called.add(sub.func.id)
+
+    reaching = set(_BLOCKING_INVOKE_PRIMITIVES)
+    growing = True
+    while growing:
+        growing = False
+        for name, called in calls.items():
+            if name not in reaching and (called & reaching):
+                reaching.add(name)
+                growing = True
+    return reaching
+
+
+def test_no_lambda_execution_rides_the_default_thread_pool():
+    """No ``asyncio.to_thread`` or ``run_in_executor`` call anywhere in the
+    package takes a blocking Lambda execution as its target — directly or
+    several calls down — because they all go through
+    ``lambda_svc.run_invocation_in_thread``."""
+    import ast
+    import pathlib
+
+    import ministack
+
+    root = pathlib.Path(ministack.__file__).parent
+    reaching = _functions_reaching_a_lambda_execution(root)
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            func = node.func
+            func_name = (
+                func.attr
+                if isinstance(func, ast.Attribute)
+                else getattr(func, "id", None)
+            )
+            if func_name == "to_thread":
+                # Matches ``asyncio.to_thread(f, ...)`` AND a bare
+                # ``to_thread(f, ...)`` from ``from asyncio import to_thread``.
+                target = node.args[0]
+            elif func_name == "run_in_executor" and len(node.args) >= 2:
+                # ``loop.run_in_executor(executor, f, ...)``: with executor
+                # None this is the very same shared default pool that
+                # ``to_thread`` uses, and a private bounded executor is no
+                # better a home for a re-entrant invoke — either way the
+                # execution must go through run_invocation_in_thread.
+                target = node.args[1]
+            else:
+                continue
+            name = (
+                target.attr
+                if isinstance(target, ast.Attribute)
+                else getattr(target, "id", None)
+            )
+            if name in reaching:
+                offenders.append(
+                    f"{path.relative_to(root.parent)}:{node.lineno} -> {name}"
+                )
+
+    assert not offenders, (
+        "Lambda executions must run on lambda_svc.run_invocation_in_thread, not "
+        "the event loop's shared default executor: " + ", ".join(offenders)
+    )
+
+    # Guard the guard. A renamed primitive would make the closure collapse to
+    # nothing and the scan above pass vacuously, and a caller that reverted to
+    # to_thread under a new name would not be seen either.
+    from ministack.services import lambda_svc
+
+    assert callable(lambda_svc.run_invocation_in_thread)
+    for name in _BLOCKING_INVOKE_PRIMITIVES:
+        assert hasattr(lambda_svc, name), (
+            f"{name} no longer exists — update _BLOCKING_INVOKE_PRIMITIVES"
+        )
+    # The closure must still reach the indirect callers it was widened for:
+    # the custom-resource provisioners and the AppSync Events authorizer, none
+    # of which name a Lambda entry point anywhere near their own call site.
+    for name in (
+        "_run_idp_handler", "_run_identity_handler", "invoke_custom_resource",
+        "_provision_resource", "_update_resource", "_delete_resource",
+        "_events_authorizer_invoke",
+    ):
+        assert name in reaching, f"{name} dropped out of the reachability scan"
+    for rel in _INVOKE_THREAD_CALLERS:
+        src = (root / rel).read_text(encoding="utf-8")
+        assert "run_invocation_in_thread" in src, (
+            f"{rel} no longer routes its Lambda executions through "
+            "run_invocation_in_thread"
+        )
 # Recursive-loop detection — PutFunctionRecursionConfig made real.
 #
 # AWS drops an invocation once a request has gone around the same function

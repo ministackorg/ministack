@@ -1915,11 +1915,13 @@ async def _dispatch_idp(action: str, data: dict):
     handler = handlers.get(action)
     if not handler:
         return error_response_json("InvalidAction", f"Unknown Cognito IDP action: {action}", 400)
-    # Run the sync handler in a worker thread so trigger Lambdas (which call
-    # back into ministack over HTTP) don't deadlock against a blocked event
-    # loop. The Lambda response path needs the loop free to accept new
-    # requests while _execute_function is running.
-    return await asyncio.to_thread(_run_idp_handler, handler, action, data)
+    # Run the sync handler on a dedicated per-invocation thread, not the event
+    # loop's bounded default executor: these handlers run trigger Lambdas
+    # inline, and a trigger that calls back into MiniStack over HTTP queues
+    # behind the very invocations waiting on it once enough are in flight.
+    # See lambda_svc.run_invocation_in_thread.
+    from ministack.services import lambda_svc  # lazy: circular import
+    return await lambda_svc.run_invocation_in_thread(_run_idp_handler, handler, action, data)
 
 
 # ---------------------------------------------------------------------------
@@ -1950,7 +1952,9 @@ async def _dispatch_identity(action: str, data: dict):
     handler = handlers.get(action)
     if not handler:
         return error_response_json("InvalidAction", f"Unknown Cognito Identity action: {action}", 400)
-    return await asyncio.to_thread(_run_identity_handler, handler, action, data)
+    # Dedicated per-invocation thread — see _dispatch_idp above.
+    from ministack.services import lambda_svc  # lazy: circular import
+    return await lambda_svc.run_invocation_in_thread(_run_identity_handler, handler, action, data)
 
 
 # ===========================================================================

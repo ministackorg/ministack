@@ -521,7 +521,10 @@ def _deliver_to_iceberg(stream: dict, dest: dict, records: list):
     if not groups:
         return
 
-    def _run():
+    # Named specifically (not `_run`): the reentrant-invoke AST guard resolves
+    # thread-target reachability by function name, and a generic local would
+    # collide with lambda_svc's invoke wrapper across modules.
+    def _deliver_iceberg_groups():
         for (wh, db, table, keys), group in groups.items():
             try:
                 _iceberg_write_group(wh, db, table, list(keys), group)
@@ -531,9 +534,9 @@ def _deliver_to_iceberg(stream: dict, dest: dict, records: list):
 
     try:
         loop = asyncio.get_running_loop()
-        loop.run_in_executor(None, _run)
+        loop.run_in_executor(None, _deliver_iceberg_groups)
     except RuntimeError:
-        _run()
+        _deliver_iceberg_groups()
 
 
 def _record_id() -> str:

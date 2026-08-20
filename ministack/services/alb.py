@@ -1268,7 +1268,7 @@ async def _invoke_lambda_target(function_ref, tg_arn, method, path, headers, bod
         )
         return invocation_result
 
-    exec_result = await asyncio.to_thread(_invoke_and_record_metrics)
+    exec_result = await lambda_svc.run_invocation_in_thread(_invoke_and_record_metrics)
     lambda_response, _err = lambda_svc.lambda_execute_result_to_api_proxy_response(exec_result)
 
     if exec_result.get("error"):

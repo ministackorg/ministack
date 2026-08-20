@@ -1608,6 +1608,64 @@ def _execute_function_with_config_scope(func: dict, event: dict) -> dict:
     return _run_with_function_config_scope(func, _execute_function, func, event)
 
 
+async def run_invocation_in_thread(fn, *args):
+    """Run a blocking Lambda execution on a dedicated, per-invocation thread.
+
+    Not ``asyncio.to_thread``: an execution holds its worker for the whole
+    handler duration, and Lambdas get ``AWS_ENDPOINT_URL`` pointed back here, so
+    a handler's nested call can land on a route that itself needs a worker and
+    queue behind the very invocations waiting on it — a deadlock at exactly the
+    default executor's pool size. A bounded pool of any size only moves that
+    edge, since nested invokes draw from the same pool; a thread per in-flight
+    invocation removes it, on the bound the warm executor's subprocesses and the
+    docker executor's containers already live with.
+
+    ContextVars propagate as ``to_thread`` would. A cancelled awaiter (client
+    disconnected mid-invoke) does not stop the thread: it runs to completion so
+    warm-pool release and container recycle still happen.
+    """
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future = loop.create_future()
+    ctx = contextvars.copy_context()
+
+    def _deliver(result, exc):
+        if not future.done():
+            if exc is not None:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+
+    def _post(result, exc):
+        try:
+            loop.call_soon_threadsafe(_deliver, result, exc)
+        except RuntimeError:
+            pass  # loop already closed (server shutdown) — nobody to deliver to
+
+    def _run():
+        result, exc = None, None
+        try:
+            result = ctx.run(fn, *args)
+        except Exception as e:
+            exc = e
+        except BaseException as e:
+            # SystemExit / KeyboardInterrupt: hand it to the awaiter so the
+            # request fails instead of hanging on a future nothing resolves,
+            # then let it unwind this thread rather than swallowing it.
+            _post(None, e)
+            raise
+        _post(result, exc)
+
+    try:
+        threading.Thread(
+            target=_run, daemon=True, name="ministack-lambda-invoke"
+        ).start()
+    except RuntimeError as exc:
+        # OS thread limit. Fail the request loudly instead of awaiting a future
+        # that nothing will ever resolve.
+        raise RuntimeError(f"cannot start Lambda invocation thread: {exc}") from exc
+    return await future
+
+
 def _function_config_scope_mismatch(config: dict) -> bool:
     try:
         account_id, region = _account_region_from_function_config(config)
@@ -2580,10 +2638,11 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
         _emit_lambda_metrics(name, duration_ms=0.0, error=False, throttle=False)
         return 202, {"X-Amz-Executed-Version": executed_version}, b""
 
-    # RequestResponse — execute in worker thread so nested SDK calls
-    # from the Lambda process can still reach this ASGI server.
+    # RequestResponse — execute on a dedicated per-invocation thread (NOT the
+    # bounded default executor) so nested SDK calls from the Lambda process
+    # can still reach this ASGI server even when many invokes are in flight.
     _t_start = time.time()
-    result = await asyncio.to_thread(_execute_function_with_config_scope, exec_record, event)
+    result = await run_invocation_in_thread(_execute_function_with_config_scope, exec_record, event)
     _duration_ms = (time.time() - _t_start) * 1000.0
     _emit_lambda_metrics(
         name,
@@ -6853,7 +6912,7 @@ async def handle_function_url_request(
 
     event = _build_function_url_event(url_id, account_id, region, method, path, headers, body, query_params)
     exec_record = _execution_record_for_config(func_data, func_config)
-    result = await asyncio.to_thread(_execute_function_with_config_scope, exec_record, event)
+    result = await run_invocation_in_thread(_execute_function_with_config_scope, exec_record, event)
 
     if cfg.get("InvokeMode") == "RESPONSE_STREAM" and not result.get("error") and not result.get("throttle"):
         return _function_url_stream_response(result, cors_headers)
