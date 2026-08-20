@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **CloudFront — SaaS Manager (multi-tenant distributions)** — connection groups (`CreateConnectionGroup`, `GetConnectionGroup`, `GetConnectionGroupByRoutingEndpoint`, `UpdateConnectionGroup`, `DeleteConnectionGroup`, `ListConnectionGroups`) and distribution tenants (`CreateDistributionTenant`, `GetDistributionTenant`, `GetDistributionTenantByDomain`, `UpdateDistributionTenant`, `DeleteDistributionTenant`, `ListDistributionTenants`, `ListDistributionTenantsByCustomization`) with ETag / `If-Match` optimistic concurrency, plus per-tenant WAF association (`AssociateDistributionTenantWebACL`, `DisassociateDistributionTenantWebACL`), tenant invalidations (`CreateInvalidationForDistributionTenant`, `GetInvalidationForDistributionTenant`, `ListInvalidationsForDistributionTenant`), domain tooling (`VerifyDnsConfiguration`, `GetManagedCertificateDetails`, `ListDomainConflicts`, `UpdateDomainAssociation`), and `ListDistributionsByConnectionMode`. `DistributionConfig` round-trips `ConnectionMode` / `TenantConfig` and `DistributionSummary` carries `ConnectionMode`; tenants require a `tenant-only` distribution (`InvalidAssociation`), CNAMEs are unique across tenants and distribution aliases (`CNAMEAlreadyExists`), a tenant created without a connection group lazily gets the account default group, deleting a distribution or connection group that still has tenants is refused (`ResourceInUse` / `CannotDeleteEntityWhileInUse`), and both new resource families are taggable (native CloudFront tagging and the Resource Groups Tagging API). MiniStack collapses async workflows: tenants and connection groups deploy, domains activate, DNS verifies, and managed certificates issue immediately.
+
 ## [1.4.21] — 2026-08-20
 
 ### Added
