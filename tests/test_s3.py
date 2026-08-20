@@ -5035,6 +5035,28 @@ def test_s3_conditional_delete_if_match(s3):
     assert s3.get_object(Bucket=bucket, Key="cond")["Body"].read() == b"x"
 
 
+def test_s3_conditional_delete_of_absent_key_succeeds(s3):
+    """A conditional delete of a key that is not there is a success, not a
+    failed precondition: S3 counts deleting an absent key as done whatever
+    condition the request carries.  If-Match: * means "whatever is there",
+    so it holds against an object of any ETag."""
+    bucket = "intg-s3-conditional-delete-absent"
+    s3.create_bucket(Bucket=bucket)
+
+    for condition in ("*", "badetag"):
+        resp = s3.delete_object(Bucket=bucket, Key="gone", IfMatch=condition)
+        assert resp["ResponseMetadata"]["HTTPStatusCode"] == 204
+
+    s3.put_object(Bucket=bucket, Key="here", Body=b"x")
+    resp = s3.delete_object(Bucket=bucket, Key="here", IfMatch="*")
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 204
+    with pytest.raises(ClientError) as exc:
+        s3.head_object(Bucket=bucket, Key="here")
+    assert exc.value.response["Error"]["Code"] == "404"
+
+    s3.delete_bucket(Bucket=bucket)
+
+
 def test_s3_copy_object_specific_version(s3):
     """CopyObject with a source ?versionId copies that exact version, not the
     current object. Regression for #1328."""

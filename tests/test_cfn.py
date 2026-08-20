@@ -169,7 +169,7 @@ def test_cfn_region_scopes_stacks_change_sets_and_events():
         assert west.list_change_sets(StackName=stack_name)["Summaries"] == []
         with pytest.raises(ClientError) as exc:
             west.describe_change_set(ChangeSetName=change_set_id)
-        assert exc.value.response["Error"]["Code"] == "ChangeSetNotFoundException"
+        assert exc.value.response["Error"]["Code"] == "ChangeSetNotFound"
 
         east.delete_stack(StackName=stack_name)
         assert _wait_stack(east, stack_name)["StackStatus"] == "DELETE_COMPLETE"
@@ -803,6 +803,185 @@ def test_cfn_unnamed_dynamodb_table_survives_unrelated_update(cfn, ddb, ssm):
     assert table_name_after == table_name_before, "the table was re-created under a new name"
     assert table_name_after in tables_after, "the stack's table did not survive the update"
     
+def test_cfn_custom_named_table_replacement_refused_data_survives(cfn, ddb):
+    """A stack update that requires replacing a custom-named DynamoDB table
+    (changing a key attribute's type S->N) is refused exactly as real
+    CloudFormation refuses it: the stack rolls back to UPDATE_ROLLBACK_COMPLETE
+    with the "custom-named resource requires replacing" message, and the table
+    and its data survive untouched instead of being silently replaced (#1433)."""
+    def template(sk_type):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "T": {
+                    "Type": "AWS::DynamoDB::Table",
+                    "Properties": {
+                        "TableName": "cfn_named_probe_1433",
+                        "BillingMode": "PAY_PER_REQUEST",
+                        "AttributeDefinitions": [
+                            {"AttributeName": "pk", "AttributeType": "S"},
+                            {"AttributeName": "sk", "AttributeType": sk_type},
+                        ],
+                        "KeySchema": [
+                            {"AttributeName": "pk", "KeyType": "HASH"},
+                            {"AttributeName": "sk", "KeyType": "RANGE"},
+                        ],
+                    },
+                },
+            },
+        })
+
+    cfn.create_stack(StackName="cfn-1433", TemplateBody=template("S"))
+    _wait_stack(cfn, "cfn-1433")
+    try:
+        ddb.put_item(TableName="cfn_named_probe_1433",
+                     Item={"pk": {"S": "row"}, "sk": {"S": "keep-me"}})
+
+        # sk type S->N requires replacing the table; AWS refuses because the
+        # table carries a custom name.
+        cfn.update_stack(StackName="cfn-1433", TemplateBody=template("N"))
+        stack = _wait_stack(cfn, "cfn-1433")
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+
+        # Schema unchanged: sk is still S.
+        attrs = ddb.describe_table(
+            TableName="cfn_named_probe_1433")["Table"]["AttributeDefinitions"]
+        sk = next(a for a in attrs if a["AttributeName"] == "sk")
+        assert sk["AttributeType"] == "S"
+
+        # The seeded row is intact.
+        assert ddb.scan(TableName="cfn_named_probe_1433")["Count"] == 1
+
+        # The refusal names the real AWS reason.
+        events = cfn.describe_stack_events(
+            StackName="cfn-1433")["StackEvents"]
+        reasons = " ".join(
+            e.get("ResourceStatusReason", "") for e in events)
+        assert "custom-named resource requires replacing" in reasons
+    finally:
+        cfn.delete_stack(StackName="cfn-1433")
+
+
+def test_cfn_change_set_status_execution_and_lifecycle(cfn):
+    """Change set Status stays CREATE_COMPLETE after execution (not
+    EXECUTE_COMPLETE, which broke the CDK), a failed execution reports
+    EXECUTE_FAILED, a duplicate name is AlreadyExistsException, and a change set
+    does not outlive its stack (#1418)."""
+    S = "cfn-1418"
+    CS = "cdk-deploy-change-set"
+    bad = json.dumps({"Resources": {"X": {
+        "Type": "AWS::FakeService::Thing", "Properties": {}}}})
+    ok = json.dumps({"Resources": {"P": {"Type": "AWS::SSM::Parameter",
+        "Properties": {"Name": "/cfn-1418/p", "Type": "String",
+                       "Value": "v"}}}})
+
+    cfn.create_change_set(StackName=S, ChangeSetName=CS,
+                          ChangeSetType="CREATE", TemplateBody=bad)
+    d = cfn.describe_change_set(ChangeSetName=CS, StackName=S)
+    assert d["Status"] == "CREATE_COMPLETE"
+    assert d["ExecutionStatus"] == "AVAILABLE"
+
+    # A duplicate name while the change set exists -> AlreadyExistsException.
+    with pytest.raises(ClientError) as exc:
+        cfn.create_change_set(StackName=S, ChangeSetName=CS,
+                              ChangeSetType="CREATE", TemplateBody=ok)
+    assert exc.value.response["Error"]["Code"] == "AlreadyExistsException"
+
+    # Execute: the bad template fails and rolls back.
+    cfn.execute_change_set(StackName=S, ChangeSetName=CS)
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        d = cfn.describe_change_set(ChangeSetName=CS, StackName=S)
+        if d["ExecutionStatus"] in ("EXECUTE_COMPLETE", "EXECUTE_FAILED"):
+            break
+        time.sleep(0.2)
+    assert d["Status"] == "CREATE_COMPLETE"          # not EXECUTE_COMPLETE
+    assert d["ExecutionStatus"] == "EXECUTE_FAILED"  # execution actually failed
+
+    # Delete the failed stack -> its change set goes with it.
+    cfn.delete_stack(StackName=S)
+    with pytest.raises(ClientError) as exc:
+        cfn.describe_change_set(ChangeSetName=CS, StackName=S)
+    assert "ChangeSetNotFound" in exc.value.response["Error"]["Code"]
+
+    # Once the stack is gone, the same name resolves to a fresh change set.
+    _wait_stack(cfn, S)
+    cfn.create_change_set(StackName=S, ChangeSetName=CS,
+                          ChangeSetType="CREATE", TemplateBody=ok)
+    d = cfn.describe_change_set(ChangeSetName=CS, StackName=S)
+    assert d["Status"] == "CREATE_COMPLETE"
+    assert d["ExecutionStatus"] == "AVAILABLE"
+    cfn.delete_stack(StackName=S)
+
+
+def test_cfn_change_set_no_changes_is_failed(cfn, ssm):
+    """A change set with no changes ends FAILED with the real-AWS reason, not
+    CREATE_COMPLETE/AVAILABLE (#1418)."""
+    S = "cfn-1418-nochg"
+    tpl = json.dumps({"Resources": {"P": {"Type": "AWS::SSM::Parameter",
+        "Properties": {"Name": "/cfn-1418-nochg/p", "Type": "String",
+                       "Value": "v"}}}})
+    cfn.create_stack(StackName=S, TemplateBody=tpl)
+    _wait_stack(cfn, S)
+    try:
+        cfn.create_change_set(StackName=S, ChangeSetName="noop",
+                              ChangeSetType="UPDATE", TemplateBody=tpl)
+        d = cfn.describe_change_set(ChangeSetName="noop", StackName=S)
+        assert d["Status"] == "FAILED"
+        assert d["ExecutionStatus"] == "UNAVAILABLE"
+        assert "didn't contain changes" in d["StatusReason"]
+    finally:
+        cfn.delete_stack(StackName=S)
+
+
+def test_cfn_execute_change_set_deletes_sibling_change_sets(cfn, ssm):
+    """Executing a change set deletes the stack's other change sets — they are
+    no longer valid for the updated stack (#1418)."""
+    S = "cfn-1418-sib"
+    def tpl(v):
+        return json.dumps({"Resources": {"P": {"Type": "AWS::SSM::Parameter",
+            "Properties": {"Name": "/cfn-1418-sib/p", "Type": "String",
+                           "Value": v}}}})
+    cfn.create_stack(StackName=S, TemplateBody=tpl("v0"))
+    _wait_stack(cfn, S)
+    try:
+        cfn.create_change_set(StackName=S, ChangeSetName="cs-a",
+                              ChangeSetType="UPDATE", TemplateBody=tpl("v1"))
+        cfn.create_change_set(StackName=S, ChangeSetName="cs-b",
+                              ChangeSetType="UPDATE", TemplateBody=tpl("v2"))
+        cfn.execute_change_set(StackName=S, ChangeSetName="cs-a")
+        with pytest.raises(ClientError) as exc:
+            cfn.describe_change_set(ChangeSetName="cs-b", StackName=S)
+        assert "ChangeSetNotFound" in exc.value.response["Error"]["Code"]
+        _wait_stack(cfn, S)
+    finally:
+        cfn.delete_stack(StackName=S)
+
+
+def test_cfn_direct_update_marks_pending_change_sets_obsolete(cfn, ssm):
+    """A direct UpdateStack supersedes any pending change set — it becomes
+    OBSOLETE, not left AVAILABLE (#1418)."""
+    S = "cfn-1418-obs"
+    def tpl(v):
+        return json.dumps({"Resources": {"P": {"Type": "AWS::SSM::Parameter",
+            "Properties": {"Name": "/cfn-1418-obs/p", "Type": "String",
+                           "Value": v}}}})
+    cfn.create_stack(StackName=S, TemplateBody=tpl("v0"))
+    _wait_stack(cfn, S)
+    try:
+        cfn.create_change_set(StackName=S, ChangeSetName="pending",
+                              ChangeSetType="UPDATE", TemplateBody=tpl("v1"))
+        assert cfn.describe_change_set(
+            ChangeSetName="pending", StackName=S)["ExecutionStatus"] == "AVAILABLE"
+        # A direct update (not via the change set) supersedes it.
+        cfn.update_stack(StackName=S, TemplateBody=tpl("v2"))
+        d = cfn.describe_change_set(ChangeSetName="pending", StackName=S)
+        assert d["ExecutionStatus"] == "OBSOLETE"
+        _wait_stack(cfn, S)
+    finally:
+        cfn.delete_stack(StackName=S)
+
+
 def test_cfn_ssm_parameter_value_type_resolves_stored_value(cfn, ssm, sqs):
     """A `AWS::SSM::Parameter::Value<String>` template parameter's Default/
     provided value is an SSM parameter *name*, not the value itself — real
@@ -9153,3 +9332,56 @@ def test_custom_resource_rejects_cross_region_lambda_token(cfn):
         except Exception:
             pass
         west_lam.delete_function(FunctionName=fn_name)
+
+
+def test_cfn_ses_configuration_set_and_event_destination(cfn, ses, sesv2):
+    cs_name = f"cfn-ses-cs-{_uuid_mod.uuid4().hex[:8]}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "AlarmTopic": {
+                "Type": "AWS::SNS::Topic",
+                "Properties": {"TopicName": f"{cs_name}-events"},
+            },
+            "ConfigSet": {
+                "Type": "AWS::SES::ConfigurationSet",
+                "Properties": {"Name": cs_name},
+            },
+            "EventDest": {
+                "Type": "AWS::SES::ConfigurationSetEventDestination",
+                "Properties": {
+                    "ConfigurationSetName": {"Ref": "ConfigSet"},
+                    "EventDestination": {
+                        "Name": "to-sns",
+                        "Enabled": True,
+                        "MatchingEventTypes": ["send", "bounce", "complaint"],
+                        "SnsDestination": {"TopicARN": {"Ref": "AlarmTopic"}},
+                    },
+                },
+            },
+        },
+        "Outputs": {
+            "ConfigSetName": {"Value": {"Ref": "ConfigSet"}},
+        },
+    }
+    cfn.create_stack(StackName="cfn-ses-cs", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-ses-cs")
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    # Ref on the configuration set resolves to its name.
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    assert outputs["ConfigSetName"] == cs_name
+
+    # The set is visible through both the classic and v2 SES APIs.
+    described = ses.describe_configuration_set(ConfigurationSetName=cs_name)
+    assert described["ConfigurationSet"]["Name"] == cs_name
+    listed = ses.list_configuration_sets()["ConfigurationSets"]
+    assert any(cs.get("Name") == cs_name for cs in listed)
+    assert sesv2.get_configuration_set(
+        ConfigurationSetName=cs_name)["ConfigurationSetName"] == cs_name
+
+    cfn.delete_stack(StackName="cfn-ses-cs")
+    _wait_stack(cfn, "cfn-ses-cs")
+
+    with pytest.raises(ClientError):
+        ses.describe_configuration_set(ConfigurationSetName=cs_name)

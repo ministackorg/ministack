@@ -114,6 +114,11 @@ _SERIAL_TESTS = {
     "tests/test_apigatewayv2.py::test_apigwv2_authorizer_simple_response_non_boolean_is_500",
     "tests/test_apigatewayv2.py::test_apigwv2_authorizer_unparsable_ttl_falls_back_to_the_default",
     "tests/test_apigatewayv2.py::test_apigwv2_authorizer_without_identity_source_does_not_cache",
+    # {proxy+} fallthrough tests: each request cold-starts a Lambda (the bypass
+    # test wires three), with the same cold-start-under-xdist flakiness as the
+    # apigw tests above.
+    "tests/test_apigatewayv1.py::test_apigwv1_methodless_resource_falls_through_to_proxy",
+    "tests/test_apigatewayv1.py::test_apigwv1_proxy_fallthrough_cannot_bypass_a_guarded_sibling",
     # AppSync Lambda-resolver event-shape tests cold-start Lambdas under a 10s
     # urlopen timeout (Test 6 spawns two functions). Same cold-start-under-xdist
     # flakiness as the apigw Lambda tests above — run them in the serial phase.
@@ -227,6 +232,28 @@ _SERIAL_TESTS = {
     "tests/test_iot_data.py::test_mqtt5_retain_handling_1_replays_only_for_a_new_subscription",
     "tests/test_iot_data.py::test_mqtt5_will_with_properties_fires_on_transport_drop",
     "tests/test_iot_data.py::test_mqtt5_malformed_will_properties_answer_connack_0x81",
+    # The mTLS MQTT listener tests (in test_iot_data.py, with the rest of the
+    # broker) drive private MiniStack subprocesses on their own ports rather
+    # than the shared server — the same reason test_tls.py runs its subprocess
+    # tests serially. Several of them time a process's startup, rebind or
+    # shutdown, which is exactly what xdist load makes unreliable.
+    "tests/test_iot_data.py::test_mtls_on_by_default",
+    "tests/test_iot_data.py::test_mtls_disabled_by_env",
+    "tests/test_iot_data.py::test_mtls_connect_and_connack",
+    "tests/test_iot_data.py::test_mtls_subscribe_receives_http_publish",
+    "tests/test_iot_data.py::test_mtls_publish_is_brokered",
+    "tests/test_iot_data.py::test_mtls_no_client_cert_uses_default_account",
+    "tests/test_iot_data.py::test_mtls_unregistered_cert_gets_connack_5",
+    "tests/test_iot_data.py::test_mtls_mqtt5_refusal_is_v5_connack",
+    "tests/test_iot_data.py::test_mtls_inactive_cert_refused",
+    "tests/test_iot_data.py::test_mtls_ambiguous_cert_is_refused",
+    "tests/test_iot_data.py::test_mtls_registered_ca_chain_connects",
+    "tests/test_iot_data.py::test_mtls_account_scoped_delivery",
+    "tests/test_iot_data.py::test_mtls_garbage_bytes_dropped",
+    "tests/test_iot_data.py::test_mtls_duplicate_client_id_evicts_first_connection",
+    "tests/test_iot_data.py::test_mtls_listener_survives_reset",
+    "tests/test_iot_data.py::test_mtls_reset_rebinds_with_a_device_connected",
+    "tests/test_iot_data.py::test_mtls_shutdown_completes_with_a_device_connected",
 }
 
 

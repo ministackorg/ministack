@@ -3442,6 +3442,25 @@ def _auth_make_lambda(lam, label, code):
     return fname
 
 
+# ---- Data plane: {proxy+} fallthrough from a methodless intermediate node ----
+
+
+def _proxy_fb_make_lambda(lam, label, code):
+    fname = f"v1-proxyfb-{label}-{_uuid_mod.uuid4().hex[:8]}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Timeout=30,
+        Code={"ZipFile": buf.getvalue()},
+    )
+    return fname
+
+
 def _auth_drop_lambda(lam, fname):
     try:
         lam.delete_function(FunctionName=fname)
@@ -3457,6 +3476,13 @@ def _auth_drop_api(apigw_v1, api_id):
 
 
 def _auth_lambda_uri(fname):
+    return (
+        "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+        f"arn:aws:lambda:us-east-1:000000000000:function:{fname}/invocations"
+    )
+
+
+def _proxy_fb_uri(fname):
     return (
         "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
         f"arn:aws:lambda:us-east-1:000000000000:function:{fname}/invocations"
@@ -3492,6 +3518,19 @@ def _auth_http(url, method="GET", headers=None, timeout=30):
 
     An explicit timeout keeps a wedged request from hanging the whole session.
     """
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+
+    req = _urlreq.Request(url, method=method)
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        resp = _urlreq.urlopen(req, timeout=timeout)
+        return resp.status, resp.read()
+    except _urlerr.HTTPError as e:
+        return e.code, e.read()
+def _proxy_fb_http(url, method="GET", headers=None, timeout=30):
+    """(status, body_bytes) without raising on 4xx/5xx."""
     import urllib.error as _urlerr
     import urllib.request as _urlreq
 
@@ -3798,3 +3837,219 @@ def test_apigwv1_authorizer_cache_is_bounded():
     finally:
         cache.clear()
         cache.update(saved)
+def _proxy_fb_wire(apigw_v1, api_id, resource_id, http_method, backend, **method_kwargs):
+    apigw_v1.put_method(
+        restApiId=api_id, resourceId=resource_id, httpMethod=http_method,
+        **method_kwargs,
+    )
+    apigw_v1.put_integration(
+        restApiId=api_id, resourceId=resource_id, httpMethod=http_method,
+        type="AWS_PROXY", integrationHttpMethod="POST", uri=_proxy_fb_uri(backend),
+    )
+
+
+def _proxy_fb_drop_lambda(lam, fname):
+    try:
+        lam.delete_function(FunctionName=fname)
+    except ClientError:
+        pass
+
+
+def _proxy_fb_drop_api(apigw_v1, api_id):
+    try:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+    except ClientError:
+        pass
+
+
+def test_apigwv1_methodless_resource_falls_through_to_proxy(apigw_v1, lam):
+    """A path-matched resource that does not serve the requested verb falls
+    through to a `{proxy+}` elsewhere in the tree instead of failing the
+    request. That covers an implicit intermediate node like `/jobs`, which
+    exists only as the parent of `/jobs/{operation_type}`.
+
+    Measured against real API Gateway (eu-central-1, MOCK integrations): only an
+    exact resource+method match keeps a request on the specific resource."""
+    proxy_backend = _proxy_fb_make_lambda(
+        lam, "prx",
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200,\n"
+        "            'body': 'via-proxy:' + event['pathParameters']['proxy']}\n",
+    )
+    jobs_backend = _proxy_fb_make_lambda(
+        lam, "job",
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200,\n"
+        "            'body': 'job:' + event['pathParameters']['operation_type']}\n",
+    )
+    api_id = apigw_v1.create_rest_api(name=f"v1-proxyfb-{_uuid_mod.uuid4().hex[:6]}")["id"]
+    try:
+        root_id = next(
+            r["id"] for r in apigw_v1.get_resources(restApiId=api_id)["items"]
+            if r["path"] == "/"
+        )
+        proxy_id = apigw_v1.create_resource(
+            restApiId=api_id, parentId=root_id, pathPart="{proxy+}"
+        )["id"]
+        _proxy_fb_wire(apigw_v1, api_id, proxy_id, "ANY", proxy_backend,
+                       authorizationType="NONE")
+        jobs_id = apigw_v1.create_resource(
+            restApiId=api_id, parentId=root_id, pathPart="jobs"
+        )["id"]
+        op_id = apigw_v1.create_resource(
+            restApiId=api_id, parentId=jobs_id, pathPart="{operation_type}"
+        )["id"]
+        _proxy_fb_wire(apigw_v1, api_id, op_id, "GET", jobs_backend,
+                       authorizationType="NONE")
+        dep_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
+        apigw_v1.create_stage(restApiId=api_id, stageName="test", deploymentId=dep_id)
+
+        base = f"http://localhost:{_EXECUTE_PORT}/_aws/execute-api/{api_id}/test"
+
+        # The specific resource still wins where it serves the verb.
+        assert _proxy_fb_http(f"{base}/jobs/reboot") == (200, b"job:reboot")
+
+        # /jobs itself declares no methods -> the sibling {proxy+} serves it.
+        assert _proxy_fb_http(f"{base}/jobs", method="POST") == (200, b"via-proxy:jobs")
+        assert _proxy_fb_http(f"{base}/jobs") == (200, b"via-proxy:jobs")
+
+        # /jobs/{operation_type} declares GET only, so POST does not match it
+        # either and lands on the proxy as well. Measured on real AWS: routing
+        # is on the resource+method pair, not on the resource alone.
+        assert _proxy_fb_http(f"{base}/jobs/reboot", method="POST") == (
+            200, b"via-proxy:jobs/reboot")
+    finally:
+        _proxy_fb_drop_api(apigw_v1, api_id)
+        _proxy_fb_drop_lambda(lam, proxy_backend)
+        _proxy_fb_drop_lambda(lam, jobs_backend)
+
+
+def test_apigwv1_proxy_fallthrough_reaches_past_a_guarded_sibling(apigw_v1, lam):
+    """A guarded sibling method does not stop the fallthrough, because routing
+    happens before authorization: an open root `{proxy+} ANY` alongside a
+    protected `/admin POST` serves `GET /admin` from the unauthenticated proxy.
+
+    This reads like an auth bypass, so it was measured rather than assumed. On
+    real API Gateway (eu-central-1), with `/admin POST` at `AWS_IAM` and an open
+    `{proxy+} ANY`, an unsigned `GET /admin` answered 200 from the proxy. The
+    guarded verb itself stays guarded; it is the verbs the resource does not
+    declare that leave it. Protecting a path therefore means protecting every
+    method on it, or not putting an open `{proxy+}` above it."""
+    proxy_backend = _proxy_fb_make_lambda(
+        lam, "openprx",
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200,\n"
+        "            'body': 'via-proxy:' + event['pathParameters']['proxy']}\n",
+    )
+    admin_backend = _proxy_fb_make_lambda(
+        lam, "admin",
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200, 'body': 'admin-secret'}\n",
+    )
+    authz = _proxy_fb_make_lambda(
+        lam, "denyall",
+        "def handler(event, context):\n"
+        "    return {'principalId': 'p',\n"
+        "            'policyDocument': {'Version': '2012-10-17', 'Statement': [\n"
+        "                {'Action': 'execute-api:Invoke', 'Effect': 'Deny',\n"
+        "                 'Resource': event['methodArn']}]}}\n",
+    )
+    api_id = apigw_v1.create_rest_api(name=f"v1-proxyfb-{_uuid_mod.uuid4().hex[:6]}")["id"]
+    try:
+        root_id = next(
+            r["id"] for r in apigw_v1.get_resources(restApiId=api_id)["items"]
+            if r["path"] == "/"
+        )
+        proxy_id = apigw_v1.create_resource(
+            restApiId=api_id, parentId=root_id, pathPart="{proxy+}"
+        )["id"]
+        _proxy_fb_wire(apigw_v1, api_id, proxy_id, "ANY", proxy_backend,
+                       authorizationType="NONE")
+        admin_id = apigw_v1.create_resource(
+            restApiId=api_id, parentId=root_id, pathPart="admin"
+        )["id"]
+        auth_id = apigw_v1.create_authorizer(
+            restApiId=api_id, name="denyall", type="TOKEN",
+            authorizerUri=_proxy_fb_uri(authz), authorizerResultTtlInSeconds=0,
+        )["id"]
+        _proxy_fb_wire(apigw_v1, api_id, admin_id, "POST", admin_backend,
+                       authorizationType="CUSTOM", authorizerId=auth_id)
+        dep_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
+        apigw_v1.create_stage(restApiId=api_id, stageName="test", deploymentId=dep_id)
+
+        base = f"http://localhost:{_EXECUTE_PORT}/_aws/execute-api/{api_id}/test"
+
+        # The guarded verb is enforced by the authorizer.
+        status, body = _proxy_fb_http(f"{base}/admin", method="POST",
+                                      headers={"Authorization": "t"})
+        assert status == 403
+        assert b"admin-secret" not in body
+
+        # /admin declares POST only, so every other verb leaves the resource and
+        # lands on the open proxy — authorization on the sibling method does not
+        # hold the path. Verified against real AWS before pinning it here.
+        for verb in ("GET", "DELETE"):
+            assert _proxy_fb_http(f"{base}/admin", method=verb) == (
+                200, b"via-proxy:admin"), f"{verb} /admin did not reach the proxy"
+
+        # The proxy still serves paths that are genuinely its own.
+        assert _proxy_fb_http(f"{base}/public/thing") == (200, b"via-proxy:public/thing")
+    finally:
+        _proxy_fb_drop_api(apigw_v1, api_id)
+        _proxy_fb_drop_lambda(lam, proxy_backend)
+        _proxy_fb_drop_lambda(lam, admin_backend)
+        _proxy_fb_drop_lambda(lam, authz)
+
+
+def test_apigwv1_cors_preflight_only_resource_falls_through(apigw_v1, lam):
+    """The shape real deployments actually have: an intermediate that carries a
+    CORS `OPTIONS` preflight and nothing else.
+
+    CDK and Serverless both add that preflight, so the intermediate is never
+    method-less in practice — it simply does not serve the verb being asked
+    for. Real AWS falls through here too (measured, eu-central-1), which is why
+    the fallthrough triggers on "does not serve this verb" rather than on "has
+    no methods": the narrower rule would miss every API we deploy."""
+    proxy_backend = _proxy_fb_make_lambda(
+        lam, "corsprx",
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200,\n"
+        "            'body': 'via-proxy:' + event['pathParameters']['proxy']}\n",
+    )
+    preflight_backend = _proxy_fb_make_lambda(
+        lam, "corspre",
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200, 'body': 'preflight'}\n",
+    )
+    api_id = apigw_v1.create_rest_api(name=f"v1-proxyfb-{_uuid_mod.uuid4().hex[:6]}")["id"]
+    try:
+        root_id = next(
+            r["id"] for r in apigw_v1.get_resources(restApiId=api_id)["items"]
+            if r["path"] == "/"
+        )
+        proxy_id = apigw_v1.create_resource(
+            restApiId=api_id, parentId=root_id, pathPart="{proxy+}"
+        )["id"]
+        _proxy_fb_wire(apigw_v1, api_id, proxy_id, "ANY", proxy_backend,
+                       authorizationType="NONE")
+        cors_id = apigw_v1.create_resource(
+            restApiId=api_id, parentId=root_id, pathPart="remote_connection"
+        )["id"]
+        _proxy_fb_wire(apigw_v1, api_id, cors_id, "OPTIONS", preflight_backend,
+                       authorizationType="NONE")
+        dep_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
+        apigw_v1.create_stage(restApiId=api_id, stageName="test", deploymentId=dep_id)
+
+        base = f"http://localhost:{_EXECUTE_PORT}/_aws/execute-api/{api_id}/test"
+
+        # OPTIONS is declared, so it stays on the resource.
+        assert _proxy_fb_http(f"{base}/remote_connection", method="OPTIONS") == (
+            200, b"preflight")
+
+        # GET is not, so it falls through to the sibling proxy.
+        assert _proxy_fb_http(f"{base}/remote_connection") == (
+            200, b"via-proxy:remote_connection")
+    finally:
+        _proxy_fb_drop_api(apigw_v1, api_id)
+        _proxy_fb_drop_lambda(lam, proxy_backend)
+        _proxy_fb_drop_lambda(lam, preflight_backend)
