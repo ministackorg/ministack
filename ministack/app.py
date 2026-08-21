@@ -1788,13 +1788,17 @@ async def _dispatch_service_request(
 
     if AUTH:
         from ministack.core.iam_actions import extract_iam_action, access_denied_response
-        from ministack.core.iam_evaluator import enforce
+        from ministack.core.iam_evaluator import AuthError, enforce
         iam_action = extract_iam_action(
             service, method, path, headers, body, routing_params)
         if iam_action is not None:
             access_key = extract_access_key_id(headers, query_params)
             denied = enforce(access_key, iam_action, service, region)
             if denied:
+                if isinstance(denied, AuthError):
+                    return access_denied_response(
+                        service, iam_action, "", request_id,
+                        error_code=denied.code, message=denied.message)
                 return access_denied_response(
                     service, iam_action, denied.principal_arn, request_id)
 

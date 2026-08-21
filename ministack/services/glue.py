@@ -1091,11 +1091,18 @@ def _create_crawler(data):
     name = data.get("Name")
     if name in _crawlers:
         return error_response_json("AlreadyExistsException", f"Crawler {name} already exists", 400)
+    _glue_role = data.get("Role", "")
+    if _glue_role:
+        from ministack.core.iam_evaluator import validate_role_arn
+        _glue_role_err = validate_role_arn(_glue_role)
+        if _glue_role_err:
+            return error_response_json("InvalidInputException", _glue_role_err, 400)
+
     schedule = data.get("Schedule", "")
     schedule_struct = {"ScheduleExpression": schedule} if schedule else {}
     _crawlers[name] = {
         "Name": name,
-        "Role": data.get("Role", ""),
+        "Role": _glue_role,
         "DatabaseName": data.get("DatabaseName", ""),
         "Description": data.get("Description", ""),
         "Targets": data.get("Targets", {}),

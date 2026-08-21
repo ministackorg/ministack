@@ -15,6 +15,7 @@ from urllib.parse import parse_qs
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import get_account_id, json_response, new_uuid
+from ministack.core.router import extract_access_key_id
 
 # Shared helpers — IAM and STS are a natural pair; STS is stateless
 # and reuses IAM's XML builders and credential generators.
@@ -105,14 +106,45 @@ async def handle_request(method, path, headers, body, query_params):
         assumed_arn, validation_error = _assumed_role_arn(role_arn, session_name)
         if validation_error:
             return validation_error
+
+        # When AUTH=true, validate role exists and trust policy permits the caller
+        from ministack.app import AUTH
+        if AUTH:
+            from ministack.services import iam as iam_svc
+            from ministack.core.iam_evaluator import evaluate_trust_policy
+            # Extract role name from ARN
+            role_name = role_arn.split("/")[-1] if "/" in role_arn else ""
+            role = iam_svc._roles.get(role_name)
+            if role is None:
+                return _error(404, "NoSuchEntity",
+                              f"Role not found: {role_arn}", ns="sts")
+            # Evaluate trust policy
+            trust_doc = role.get("AssumeRolePolicyDocument", "{}")
+            caller_key = extract_access_key_id(headers)
+            caller_arn = f"arn:aws:iam::{get_account_id()}:root"
+            if caller_key in _sessions:
+                caller_arn = _sessions[caller_key].get("Arn", caller_arn)
+            else:
+                key_record = iam_svc._access_keys.get(caller_key)
+                if key_record:
+                    caller_arn = f"arn:aws:iam::{get_account_id()}:user/{key_record['UserName']}"
+            if not evaluate_trust_policy(trust_doc, caller_arn):
+                return _error(403, "AccessDenied",
+                              f"User: {caller_arn} is not authorized to perform: "
+                              f"sts:AssumeRole on resource: {role_arn}", ns="sts")
+
         duration = int(_p(params, "DurationSeconds") or 3600)
         expiration = _future(duration)
         access_key = _gen_session_access_key()
         secret_key = _gen_secret()
         session_token = _gen_session_token()
         role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
-        _sessions[access_key] = {"Arn": assumed_arn, "UserId": f"{role_id}:{session_name}"}
-        _sessions[access_key]["SecretAccessKey"] = secret_key
+        _sessions[access_key] = {
+            "Arn": assumed_arn,
+            "UserId": f"{role_id}:{session_name}",
+            "SecretAccessKey": secret_key,
+            "Expiration": time.time() + duration,
+        }
         if use_json:
             return json_response({
                 "Credentials": {"AccessKeyId": access_key, "SecretAccessKey": secret_key, "SessionToken": session_token, "Expiration": int(time.time() + duration)},

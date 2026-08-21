@@ -7,6 +7,7 @@ and formats per-protocol AccessDenied error responses.
 
 import json
 import logging
+import os
 import re
 
 logger = logging.getLogger("ministack")
@@ -230,6 +231,211 @@ def _lambda_action(method: str, path: str) -> str | None:
     }.get(method)
 
 
+# ---------------------------------------------------------------------------
+# Generic botocore route matcher
+# ---------------------------------------------------------------------------
+
+# MiniStack service name → botocore data directory name(s)
+_BOTOCORE_SERVICE_MAP: dict[str, list[str]] = {
+    "apigateway": ["apigateway", "apigatewayv2"],
+    "appconfig": ["appconfig"],
+    "appconfigdata": ["appconfigdata"],
+    "appsync": ["appsync"],
+    "appsync-events": ["appsync"],
+    "backup": ["backup"],
+    "batch": ["batch"],
+    "bedrock": ["bedrock"],
+    "bedrock-runtime": ["bedrock-runtime"],
+    "bedrock-agent": ["bedrock-agent"],
+    "bedrock-agent-runtime": ["bedrock-agent-runtime"],
+    "bedrock-agentcore": [],  # no botocore model yet
+    "cloudfront": ["cloudfront"],
+    "cloudfront-keyvaluestore": ["cloudfront-keyvaluestore"],
+    "dsql": ["dsql"],
+    "eks": ["eks"],
+    "elasticfilesystem": ["efs"],
+    "inspector2": ["inspector2"],
+    "iot": ["iot"],
+    "iot-data": ["iot-data"],
+    "iot-jobs-data": ["iot-jobs-data"],
+    "kafka": ["kafka"],
+    "mediaconnect": ["mediaconnect"],
+    "mq": ["mq"],
+    "airflow": ["mwaa"],
+    "opensearch": ["opensearch"],
+    "pipes": ["pipes"],
+    "resource-groups": ["resource-groups"],
+    "route53": ["route53"],
+    "s3files": [],  # uses S3 namespace but different paths
+    "s3tables": ["s3tables"],
+    "scheduler": ["scheduler"],
+}
+
+# Compiled route: (http_method, compiled_regex, operation_name, specificity)
+# Compiled route: (http_method, compiled_regex, operation_name, specificity, required_query)
+_REST_ROUTE_CACHE: dict[str, list[tuple[str, re.Pattern, str, int, dict[str, str]]]] = {}
+
+
+def _compile_uri(uri_pattern: str) -> tuple[re.Pattern, int, dict[str, str]]:
+    """Compile a botocore URI pattern into a regex + specificity score +
+    required query params.
+
+    ``/clusters/{name}/addons/{addonName}`` becomes
+    ``^/clusters/[^/]+/addons/[^/]+(?:/)?$`` with specificity 2
+    (2 literal segments).
+
+    Query params from the pattern (e.g., ``?mode=import``) are returned
+    separately for disambiguation.
+    """
+    required_query: dict[str, str] = {}
+    if "?" in uri_pattern:
+        uri_path, qs = uri_pattern.split("?", 1)
+        for part in qs.split("&"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                if not v.startswith("{"):
+                    required_query[k] = v
+            else:
+                required_query[part] = ""
+    else:
+        uri_path = uri_pattern
+
+    uri_path = uri_path.rstrip("/") or "/"
+
+    specificity = 0
+    segments = uri_path.split("/")
+    regex_parts = []
+    for seg in segments:
+        if not seg:
+            regex_parts.append("")
+            continue
+        if seg.startswith("{") and seg.endswith("+}"):
+            regex_parts.append(".+")
+        elif seg.startswith("{") and seg.endswith("}"):
+            regex_parts.append("[^/]+")
+        else:
+            regex_parts.append(re.escape(seg))
+            specificity += 1
+
+    pattern = "/".join(regex_parts) or "/"
+    compiled = re.compile(f"^{pattern}(?:/)?$", re.IGNORECASE)
+    return compiled, specificity, required_query
+
+
+def _load_botocore_routes(botocore_service: str) -> list[tuple[str, re.Pattern, str, int, dict[str, str]]]:
+    """Load a botocore service model and compile its URI routes."""
+    try:
+        import gzip
+        import botocore as _bc
+        data_dir = os.path.join(os.path.dirname(_bc.__file__), "data")
+    except ImportError:
+        logger.debug("AUTH: botocore not installed — no generic route matching")
+        return []
+
+    svc_dir = os.path.join(data_dir, botocore_service)
+    if not os.path.isdir(svc_dir):
+        return []
+
+    versions = sorted(os.listdir(svc_dir))
+    if not versions:
+        return []
+
+    model_path = os.path.join(svc_dir, versions[-1], "service-2.json.gz")
+    if not os.path.exists(model_path):
+        model_path = os.path.join(svc_dir, versions[-1], "service-2.json")
+        if not os.path.exists(model_path):
+            return []
+
+    try:
+        if model_path.endswith(".gz"):
+            import gzip
+            with gzip.open(model_path, "rt") as f:
+                model = json.load(f)
+        else:
+            with open(model_path) as f:
+                model = json.load(f)
+    except Exception:
+        logger.debug("AUTH: failed to load botocore model for %s", botocore_service)
+        return []
+
+    routes = []
+    for op_name, op_def in model.get("operations", {}).items():
+        http = op_def.get("http", {})
+        method = http.get("method", "").upper()
+        uri = http.get("requestUri", "")
+        if not method or not uri:
+            continue
+        compiled, specificity, required_query = _compile_uri(uri)
+        # Operations with required query params get a specificity boost
+        if required_query:
+            specificity += len(required_query)
+        routes.append((method, compiled, op_name, specificity, required_query))
+
+    # Sort by specificity descending so more specific routes match first
+    routes.sort(key=lambda r: -r[3])
+    return routes
+
+
+def _get_routes_for_service(service: str) -> list[tuple[str, re.Pattern, str, int, dict[str, str]]]:
+    """Get compiled routes for a MiniStack service, with lazy loading."""
+    if service in _REST_ROUTE_CACHE:
+        return _REST_ROUTE_CACHE[service]
+
+    botocore_names = _BOTOCORE_SERVICE_MAP.get(service, [])
+    all_routes = []
+    for bc_name in botocore_names:
+        all_routes.extend(_load_botocore_routes(bc_name))
+
+    all_routes.sort(key=lambda r: -r[3])
+    _REST_ROUTE_CACHE[service] = all_routes
+    return all_routes
+
+
+def _match_rest_action(service: str, method: str, path: str,
+                       query_params: dict | None = None) -> str | None:
+    """Match a REST request against botocore route patterns."""
+    if service not in _BOTOCORE_SERVICE_MAP:
+        return None
+
+    routes = _get_routes_for_service(service)
+    if not routes:
+        return None
+
+    norm_path = path.rstrip("/") or "/"
+    qp = query_params or {}
+
+    best_match = None
+    best_specificity = -1
+
+    for route_method, route_re, op_name, specificity, required_query in routes:
+        if route_method != method:
+            continue
+        if not route_re.match(norm_path):
+            continue
+        # Check required query params for disambiguation
+        if required_query:
+            match_qp = True
+            for k, v in required_query.items():
+                if k not in qp:
+                    match_qp = False
+                    break
+                if v:
+                    # Check value match (e.g., Operation=Untag)
+                    actual = qp[k]
+                    if isinstance(actual, list):
+                        actual = actual[0] if actual else ""
+                    if actual != v:
+                        match_qp = False
+                        break
+            if not match_qp:
+                continue
+        if specificity > best_specificity:
+            best_match = op_name
+            best_specificity = specificity
+
+    return best_match
+
+
 def extract_iam_action(service: str, method: str, path: str,
                        headers: dict, body: bytes,
                        query_params: dict) -> str | None:
@@ -260,6 +466,11 @@ def extract_iam_action(service: str, method: str, path: str,
         action_name = _lambda_action(method, path)
         if action_name:
             return f"lambda:{action_name}"
+
+    # Tier 4: Generic botocore route matcher (all other REST services)
+    action_name = _match_rest_action(service, method, path, query_params)
+    if action_name:
+        return f"{namespace}:{action_name}"
 
     logger.debug("AUTH: could not extract action for %s %s %s — allowing",
                  service, method, path)
@@ -294,29 +505,32 @@ def _xml_escape(s: str) -> str:
 
 
 def access_denied_response(service: str, action: str, principal_arn: str,
-                           request_id: str) -> tuple:
-    """Format a 403 AccessDenied response matching the service's protocol."""
-    message = (
-        f"User: {principal_arn} is not authorized to perform: {action} "
-        f"because no identity-based policy allows the {action} action"
-    )
+                           request_id: str, *, error_code: str = "",
+                           message: str = "") -> tuple:
+    """Format a 403 error response matching the service's protocol."""
+    if not message:
+        message = (
+            f"User: {principal_arn} is not authorized to perform: {action} "
+            f"because no identity-based policy allows the {action} action"
+        )
+    code = error_code or "AccessDenied"
     protocol = _SERVICE_PROTOCOL.get(service, "json")
 
     if protocol == "rest-xml":
-        # S3/Route53 style: bare <Error> root
         body = (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
-            f"<Error><Code>AccessDenied</Code>"
+            f"<Error><Code>{code}</Code>"
             f"<Message>{_xml_escape(message)}</Message>"
             f"<RequestId>{request_id}</RequestId></Error>"
         )
         return 403, {"Content-Type": "application/xml"}, body.encode()
 
     if protocol == "ec2-xml":
+        ec2_code = "UnauthorizedOperation" if code == "AccessDenied" else code
         body = (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             f"<Response><Errors><Error>"
-            f"<Code>UnauthorizedOperation</Code>"
+            f"<Code>{ec2_code}</Code>"
             f"<Message>{_xml_escape(message)}</Message>"
             f"</Error></Errors>"
             f"<RequestID>{request_id}</RequestID></Response>"
@@ -327,22 +541,23 @@ def access_denied_response(service: str, action: str, principal_arn: str,
         body = (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             '<ErrorResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/">'
-            f"<Error><Type>Sender</Type><Code>AccessDenied</Code>"
+            f"<Error><Type>Sender</Type><Code>{code}</Code>"
             f"<Message>{_xml_escape(message)}</Message></Error>"
             f"<RequestId>{request_id}</RequestId></ErrorResponse>"
         )
         return 403, {"Content-Type": "text/xml"}, body.encode()
 
     # JSON protocol (DynamoDB, Lambda, KMS, Logs, Glue, etc.)
+    json_type = code if code != "AccessDenied" else "AccessDeniedException"
     body = json.dumps({
-        "__type": "AccessDeniedException",
+        "__type": json_type,
         "message": message,
     })
     return (
         403,
         {
             "Content-Type": "application/x-amz-json-1.0",
-            "x-amzn-errortype": "AccessDeniedException",
+            "x-amzn-errortype": json_type,
         },
         body.encode(),
     )

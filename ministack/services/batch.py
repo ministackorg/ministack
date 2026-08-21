@@ -173,6 +173,12 @@ def _create_compute_environment(p):
     if name in _compute_envs:
         return error_response_json("ClientException",
                                    f"Object already exists: {name}", 400)
+    _batch_role = p.get("serviceRole", "")
+    if _batch_role:
+        from ministack.core.iam_evaluator import validate_role_arn
+        _batch_role_err = validate_role_arn(_batch_role)
+        if _batch_role_err:
+            return error_response_json("ClientException", _batch_role_err, 400)
     rec = {
         "computeEnvironmentName": name,
         "computeEnvironmentArn": _ce_arn(name),

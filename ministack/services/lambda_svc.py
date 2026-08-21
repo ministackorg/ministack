@@ -1289,11 +1289,17 @@ def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
     if env is not None and "Variables" not in env:
         env["Variables"] = {}
 
+    role_arn = data.get("Role", f"arn:aws:iam::{get_account_id()}:role/lambda-role")
+    from ministack.core.iam_evaluator import validate_role_arn
+    role_err = validate_role_arn(role_arn)
+    if role_err:
+        return error_response_json("InvalidParameterValueException", role_err, 400)
+
     config = {
         "FunctionName": name,
         "FunctionArn": _func_arn(name),
         "Runtime": data.get("Runtime", "" if is_image else "python3.12"),
-        "Role": data.get("Role", f"arn:aws:iam::{get_account_id()}:role/lambda-role"),
+        "Role": role_arn,
         "Handler": data.get("Handler", "" if is_image else "index.handler"),
         "CodeSize": code_size,
         "CodeSha256": code_sha,

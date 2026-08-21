@@ -3800,12 +3800,19 @@ def _create_group(data):
         return error_response_json("InvalidParameterException", "GroupName is required.", 400)
     if name in pool["_groups"]:
         return error_response_json("GroupExistsException", f"Group {name} already exists.", 400)
+    _cog_role_arn = data.get("RoleArn", "")
+    if _cog_role_arn:
+        from ministack.core.iam_evaluator import validate_role_arn
+        _cog_role_err = validate_role_arn(_cog_role_arn)
+        if _cog_role_err:
+            return error_response_json("InvalidParameterException", _cog_role_err, 400)
+
     now = _now_epoch()
     group = {
         "GroupName": name,
         "UserPoolId": pid,
         "Description": data.get("Description", ""),
-        "RoleArn": data.get("RoleArn", ""),
+        "RoleArn": _cog_role_arn,
         "Precedence": data.get("Precedence", 0),
         "CreationDate": now,
         "LastModifiedDate": now,

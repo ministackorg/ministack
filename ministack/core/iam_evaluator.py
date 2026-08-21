@@ -65,6 +65,17 @@ class PrincipalInfo:
     policies: list[list[ParsedStatement]] | None  # None = root (allow-all)
 
 
+@dataclass
+class AuthError:
+    """Authentication failure (before policy evaluation)."""
+    code: str  # "InvalidClientTokenId", "ExpiredTokenException", etc.
+    message: str
+
+
+# Default access keys that are always treated as root (backwards compat)
+_ROOT_ACCESS_KEYS = frozenset({"test", ""})
+
+
 # ---------------------------------------------------------------------------
 # Wildcard matching (IAM-style)
 # ---------------------------------------------------------------------------
@@ -591,15 +602,45 @@ def _resolve_managed_policy_document(policy_arn: str,
     return None
 
 
+def _is_root_key(access_key_id: str) -> bool:
+    """Keys that are always treated as root: empty, 'test', 12-digit account IDs."""
+    if not access_key_id or access_key_id in _ROOT_ACCESS_KEYS:
+        return True
+    if re.match(r"^\d{12}$", access_key_id):
+        return True
+    return False
+
+
 def resolve_principal(access_key_id: str,
-                      account_id: str) -> PrincipalInfo:
-    """Resolve an access key to a principal and their policies."""
+                      account_id: str) -> PrincipalInfo | AuthError:
+    """Resolve an access key to a principal and their policies.
+
+    Returns a ``PrincipalInfo`` on success or an ``AuthError`` when
+    authentication fails (unknown key, inactive key, expired session).
+    """
+    import time
     from ministack.services import sts as sts_svc
     from ministack.services import iam as iam_svc
+
+    # Root / default keys — allow-all, no checks
+    if _is_root_key(access_key_id):
+        return PrincipalInfo(
+            arn=f"arn:aws:iam::{account_id}:root",
+            type="Root",
+            account=account_id,
+            policies=None,
+        )
 
     # Session credentials (AssumeRole) — ASIA prefix
     if access_key_id in sts_svc._sessions:
         session = sts_svc._sessions[access_key_id]
+        # Check expiry
+        expiration = session.get("Expiration")
+        if expiration is not None and time.time() > expiration:
+            return AuthError(
+                "ExpiredTokenException",
+                "The security token included in the request is expired",
+            )
         assumed_arn = session.get("Arn", "")
         role_name = _role_name_from_assumed_arn(assumed_arn)
         policies = _gather_role_policies(role_name, account_id)
@@ -613,6 +654,12 @@ def resolve_principal(access_key_id: str,
     # IAM user access key — AKIA prefix
     key_record = iam_svc._access_keys.get_scoped(account_id, None, access_key_id)
     if key_record is not None:
+        # Check key status
+        if key_record.get("Status") == "Inactive":
+            return AuthError(
+                "InvalidClientTokenId",
+                "The security token included in the request is invalid.",
+            )
         user_name = key_record.get("UserName", "")
         policies = _gather_user_policies(user_name, account_id)
         return PrincipalInfo(
@@ -622,12 +669,10 @@ def resolve_principal(access_key_id: str,
             policies=policies,
         )
 
-    # Root / default — allow-all
-    return PrincipalInfo(
-        arn=f"arn:aws:iam::{account_id}:root",
-        type="Root",
-        account=account_id,
-        policies=None,
+    # Unknown access key — reject
+    return AuthError(
+        "InvalidClientTokenId",
+        "The security token included in the request is invalid.",
     )
 
 
@@ -636,15 +681,20 @@ def resolve_principal(access_key_id: str,
 # ---------------------------------------------------------------------------
 
 def enforce(access_key_id: str, iam_action: str, service: str,
-            region: str, resource_arn: str = "*") -> EvalResult | None:
+            region: str, resource_arn: str = "*") -> EvalResult | AuthError | None:
     """Check whether the request should be allowed.
 
-    Returns ``None`` if allowed, or an ``EvalResult`` with the deny reason.
+    Returns ``None`` if allowed, an ``AuthError`` for authentication failures,
+    or an ``EvalResult`` for authorization denials.
     """
     from ministack.core.responses import get_account_id
 
     account_id = get_account_id()
     principal = resolve_principal(access_key_id or "", account_id)
+
+    # Authentication failure
+    if isinstance(principal, AuthError):
+        return principal
 
     # Root principal: allow everything
     if principal.policies is None:
@@ -667,3 +717,122 @@ def enforce(access_key_id: str, iam_action: str, service: str,
     # Deny or ImplicitDeny
     result.principal_arn = principal.arn
     return result
+
+
+# ---------------------------------------------------------------------------
+# Role ARN existence validation (cross-service)
+# ---------------------------------------------------------------------------
+
+def validate_role_arn(role_arn: str) -> str | None:
+    """Validate that a role ARN points to an existing IAM role.
+
+    Returns an error message if the role doesn't exist, or None if it does.
+    Only validates when AUTH=true; returns None (no error) otherwise.
+    """
+    from ministack.app import AUTH
+    if not AUTH:
+        return None
+
+    if not role_arn:
+        return None
+
+    from ministack.services import iam as iam_svc
+
+    # Extract role name from ARN: arn:aws:iam::ACCT:role[/path]/NAME
+    parts = role_arn.split(":")
+    if len(parts) < 6:
+        return f"Invalid role ARN: {role_arn}"
+    resource = parts[5]
+    if not resource.startswith("role/"):
+        return f"Invalid role ARN: {role_arn}"
+    # The role name is everything after "role/" (may include a path like /path/name)
+    role_path_name = resource[5:]  # strip "role/"
+    # The actual role name is the last segment
+    role_name = role_path_name.rsplit("/", 1)[-1]
+
+    if iam_svc._roles.get(role_name) is None:
+        return (f"The role with name {role_name} cannot be found. "
+                f"(Service: IAM, Status Code: 404)")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Trust policy evaluation
+# ---------------------------------------------------------------------------
+
+def evaluate_trust_policy(trust_doc: str | dict,
+                          caller_arn: str) -> bool:
+    """Check if a role's trust policy allows the given caller to assume it.
+
+    Supports Principal forms:
+      - ``"*"`` — anyone
+      - ``{"AWS": "arn:aws:iam::ACCT:root"}`` — account root
+      - ``{"AWS": "arn:aws:iam::ACCT:user/NAME"}`` — specific user
+      - ``{"AWS": "ACCT"}`` — account ID shorthand
+      - ``{"Service": "lambda.amazonaws.com"}`` — service principal
+      - ``{"AWS": ["arn1", "arn2"]}`` — list of principals
+    """
+    if isinstance(trust_doc, str):
+        try:
+            trust_doc = json.loads(trust_doc)
+        except (json.JSONDecodeError, TypeError):
+            return False
+    if not isinstance(trust_doc, dict):
+        return False
+
+    statements = trust_doc.get("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+
+    for stmt in statements:
+        if not isinstance(stmt, dict):
+            continue
+        if stmt.get("Effect") != "Allow":
+            continue
+        # Check Action includes sts:AssumeRole (or *)
+        actions = stmt.get("Action", [])
+        if isinstance(actions, str):
+            actions = [actions]
+        if not any(fnmatch_iam("sts:AssumeRole", a) for a in actions):
+            continue
+        # Check Principal
+        principal = stmt.get("Principal", {})
+        if _principal_matches(principal, caller_arn):
+            return True
+
+    return False
+
+
+def _principal_matches(principal: Any, caller_arn: str) -> bool:
+    """Check if a trust policy Principal matches the caller."""
+    if principal == "*":
+        return True
+    if isinstance(principal, str):
+        return fnmatch_iam(caller_arn, principal)
+    if isinstance(principal, dict):
+        # Check AWS principals
+        aws_principals = principal.get("AWS", [])
+        if isinstance(aws_principals, str):
+            aws_principals = [aws_principals]
+        for p in aws_principals:
+            if p == "*":
+                return True
+            # Account ID shorthand
+            if re.match(r"^\d{12}$", p):
+                if f":{p}:" in caller_arn:
+                    return True
+                continue
+            if fnmatch_iam(caller_arn, p):
+                return True
+            # Also match account root against any principal in that account
+            if p.endswith(":root") and f":{p.split(':')[4]}:" in caller_arn:
+                return True
+        # Service principals — always allow (Lambda, ECS, etc. assume roles)
+        svc_principals = principal.get("Service", [])
+        if isinstance(svc_principals, str):
+            svc_principals = [svc_principals]
+        if svc_principals:
+            # Service principals are validated at a different layer;
+            # for local dev, if a trust policy lists any service, allow it
+            return True
+    return False
