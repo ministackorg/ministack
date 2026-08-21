@@ -268,6 +268,36 @@ def test_rds_describe_instances_v2(rds):
     assert len(resp2["DBInstances"]) == 1
     assert resp2["DBInstances"][0]["Engine"] == "mysql"
 
+
+def test_rds_describe_instances_filters_by_cluster(rds):
+    """The AWS Query wire form scopes instances to the requested clusters."""
+    cluster_ids = ["rds-filter-cluster-a", "rds-filter-cluster-b"]
+    instance_ids = ["rds-filter-instance-a", "rds-filter-instance-b"]
+    for cluster_id, instance_id in zip(cluster_ids, instance_ids):
+        rds.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-postgresql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )
+        rds.create_db_instance(
+            DBInstanceIdentifier=instance_id,
+            DBInstanceClass="db.t3.micro",
+            Engine="aurora-postgresql",
+            DBClusterIdentifier=cluster_id,
+        )
+
+    filtered = rds.describe_db_instances(
+        Filters=[{"Name": "db-cluster-id", "Values": [cluster_ids[0]]}],
+    )["DBInstances"]
+    assert [instance["DBInstanceIdentifier"] for instance in filtered] == [instance_ids[0]]
+
+    filtered = rds.describe_db_instances(
+        Filters=[{"Name": "db-cluster-id", "Values": cluster_ids}],
+    )["DBInstances"]
+    assert {instance["DBInstanceIdentifier"] for instance in filtered} == set(instance_ids)
+
+
 def test_rds_delete_instance_v2(rds):
     rds.create_db_instance(
         DBInstanceIdentifier="rds-del-v2",

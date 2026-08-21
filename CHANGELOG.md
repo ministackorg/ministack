@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **RDS — `DescribeDBInstances` honors SDK `Filters`** — AWS Query clients serialize filters as `Filters.Filter.N` with `Values.Value.N`, but MiniStack only parsed its internal `Filters.member.N` form, so filters such as `db-cluster-id` were ignored and unrelated instances were returned. Both wire forms are now parsed with the existing AND-across-filters and OR-across-values semantics.
+
 ## [1.4.21] — 2026-08-20
 
 ### Added
