@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **DynamoDB — an `UpdateExpression` alias is resolved before the key-attribute check** — `set #pk = :pk` with `#pk` mapped to a non-key attribute was refused with `Cannot update attribute pk. This attribute is part of the key`, because the check matched the key name as raw text inside the `#pk` alias and the `:pk` value reference. It now reads the alias-resolved attribute roots the update evaluator already reports, so only a path that resolves to the partition or sort key is rejected. Reported by @ppettitau.
+
 ## [1.4.21] — 2026-08-20
 
 ### Added
