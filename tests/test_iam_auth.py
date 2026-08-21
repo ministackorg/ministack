@@ -833,6 +833,61 @@ class TestResourceArn:
         body = json.dumps({"UserPoolId": "us-east-1_abc123"}).encode()
         assert extract_resource_arn("cognito-idp", "POST", "/", {}, body, {}, "us-east-1", "123") == "arn:aws:cognito-idp:us-east-1:123:userpool/us-east-1_abc123"
 
+    def test_scheduler(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("scheduler", "GET", "/schedules/my-sched", {}, b"", {}, "us-east-1", "123") == "arn:aws:scheduler:us-east-1:123:schedule/default/my-sched"
+
+    def test_pipes(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("pipes", "GET", "/v1/pipes/my-pipe", {}, b"", {}, "us-east-1", "123") == "arn:aws:pipes:us-east-1:123:pipe/my-pipe"
+
+    def test_mq_broker(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert "mq" in extract_resource_arn("mq", "GET", "/v1/brokers/my-broker", {}, b"", {}, "us-east-1", "123")
+        assert "my-broker" in extract_resource_arn("mq", "GET", "/v1/brokers/my-broker", {}, b"", {}, "us-east-1", "123")
+
+    def test_kafka_cluster(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert "kafka" in extract_resource_arn("kafka", "GET", "/v1/clusters/my-cluster", {}, b"", {}, "us-east-1", "123")
+
+    def test_dsql_cluster(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("dsql", "GET", "/clusters/cl-123", {}, b"", {}, "us-east-1", "123") == "arn:aws:dsql:us-east-1:123:cluster/cl-123"
+
+    def test_efs_filesystem(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("elasticfilesystem", "GET", "/2015-02-01/file-systems/fs-123", {}, b"", {}, "us-east-1", "123") == "arn:aws:elasticfilesystem:us-east-1:123:file-system/fs-123"
+
+    def test_cloudtrail(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        body = json.dumps({"Name": "my-trail"}).encode()
+        assert extract_resource_arn("cloudtrail", "POST", "/", {}, body, {}, "us-east-1", "123") == "arn:aws:cloudtrail:us-east-1:123:trail/my-trail"
+
+    def test_appconfig_application(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("appconfig", "GET", "/applications/app-123", {}, b"", {}, "us-east-1", "123") == "arn:aws:appconfig:us-east-1:123:application/app-123"
+
+    def test_appconfig_environment(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("appconfig", "GET", "/applications/app-1/environments/env-1", {}, b"", {}, "us-east-1", "123") == "arn:aws:appconfig:us-east-1:123:application/app-1/environment/env-1"
+
+    def test_resource_groups(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("resource-groups", "GET", "/groups/my-group", {}, b"", {}, "us-east-1", "123") == "arn:aws:resource-groups:us-east-1:123:group/my-group"
+
+    def test_rds_data_passthrough(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        body = json.dumps({"resourceArn": "arn:aws:rds:us-east-1:123:cluster:my-db"}).encode()
+        assert extract_resource_arn("rds-data", "POST", "/", {}, body, {}, "us-east-1", "123") == "arn:aws:rds:us-east-1:123:cluster:my-db"
+
+    def test_s3tables(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("s3tables", "GET", "/buckets/my-tb", {}, b"", {}, "us-east-1", "123") == "arn:aws:s3tables:us-east-1:123:bucket/my-tb"
+
+    def test_mediaconnect(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert "mediaconnect" in extract_resource_arn("mediaconnect", "GET", "/v1/flows/flow-123", {}, b"", {}, "us-east-1", "123")
+
     def test_resource_scoped_policy_enforcement(self):
         """A policy allowing s3:GetObject only on mybucket/* should deny access to otherbucket."""
         stmts = parse_policy_document({"Statement": [{

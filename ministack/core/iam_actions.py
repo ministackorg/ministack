@@ -920,6 +920,146 @@ def extract_resource_arn(service: str, method: str, path: str,
             return f"arn:aws:cognito-identity:{region}:{account_id}:identitypool/{pool_id}"
         return "*"
 
+    # --- Simple REST path services ---
+
+    if service == "scheduler":
+        parts = [p for p in path.split("/") if p]
+        if "schedules" in parts:
+            si = parts.index("schedules")
+            if si + 1 < len(parts):
+                return f"arn:aws:scheduler:{region}:{account_id}:schedule/default/{parts[si + 1]}"
+        if "schedule-groups" in parts:
+            gi = parts.index("schedule-groups")
+            if gi + 1 < len(parts):
+                return f"arn:aws:scheduler:{region}:{account_id}:schedule-group/{parts[gi + 1]}"
+        return "*"
+
+    if service == "pipes":
+        parts = [p for p in path.split("/") if p]
+        if "pipes" in parts:
+            pi = parts.index("pipes")
+            if pi + 1 < len(parts):
+                return f"arn:aws:pipes:{region}:{account_id}:pipe/{parts[pi + 1]}"
+        return "*"
+
+    if service == "mq":
+        parts = [p for p in path.split("/") if p]
+        if "brokers" in parts:
+            bi = parts.index("brokers")
+            if bi + 1 < len(parts):
+                return f"arn:aws:mq:{region}:{account_id}:broker:{parts[bi + 1]}:*"
+        return "*"
+
+    if service == "kafka":
+        parts = [p for p in path.split("/") if p]
+        if "clusters" in parts:
+            ci = parts.index("clusters")
+            if ci + 1 < len(parts):
+                return f"arn:aws:kafka:{region}:{account_id}:cluster/{parts[ci + 1]}/*"
+        return "*"
+
+    if service == "dsql":
+        parts = [p for p in path.split("/") if p]
+        if "clusters" in parts:
+            ci = parts.index("clusters")
+            if ci + 1 < len(parts):
+                return f"arn:aws:dsql:{region}:{account_id}:cluster/{parts[ci + 1]}"
+        return "*"
+
+    if service == "mediaconnect":
+        parts = [p for p in path.split("/") if p]
+        if "flows" in parts:
+            fi = parts.index("flows")
+            if fi + 1 < len(parts):
+                return f"arn:aws:mediaconnect:{region}:{account_id}:flow:{parts[fi + 1]}:*"
+        return "*"
+
+    if service == "inspector2":
+        return "*"  # Mostly account-level operations, no per-resource ARNs
+
+    if service == "elasticfilesystem":
+        parts = [p for p in path.split("/") if p]
+        if "file-systems" in parts:
+            fi = parts.index("file-systems")
+            if fi + 1 < len(parts):
+                return f"arn:aws:elasticfilesystem:{region}:{account_id}:file-system/{parts[fi + 1]}"
+        if "mount-targets" in parts:
+            mi = parts.index("mount-targets")
+            if mi + 1 < len(parts):
+                return f"arn:aws:elasticfilesystem:{region}:{account_id}:file-system/*"
+        if "access-points" in parts:
+            ai = parts.index("access-points")
+            if ai + 1 < len(parts):
+                return f"arn:aws:elasticfilesystem:{region}:{account_id}:access-point/{parts[ai + 1]}"
+        return "*"
+
+    if service == "cloudtrail":
+        name = _safe_json_field(body, "Name") or _safe_json_field(body, "TrailName")
+        if name:
+            if name.startswith("arn:"):
+                return name
+            return f"arn:aws:cloudtrail:{region}:{account_id}:trail/{name}"
+        return "*"
+
+    if service == "s3tables":
+        parts = [p for p in path.split("/") if p]
+        if "buckets" in parts:
+            bi = parts.index("buckets")
+            if bi + 1 < len(parts):
+                bucket = parts[bi + 1]
+                if "tables" in parts:
+                    ti = parts.index("tables")
+                    if ti + 1 < len(parts):
+                        return f"arn:aws:s3tables:{region}:{account_id}:bucket/{bucket}/table/{parts[ti + 1]}"
+                return f"arn:aws:s3tables:{region}:{account_id}:bucket/{bucket}"
+        return "*"
+
+    if service == "s3files":
+        parts = [p for p in path.split("/") if p]
+        if "file-systems" in parts:
+            fi = parts.index("file-systems")
+            if fi + 1 < len(parts):
+                return f"arn:aws:s3:{region}:{account_id}:file-system/{parts[fi + 1]}"
+        return "*"
+
+    if service == "resource-groups":
+        parts = [p for p in path.split("/") if p]
+        if "groups" in parts:
+            gi = parts.index("groups")
+            if gi + 1 < len(parts):
+                return f"arn:aws:resource-groups:{region}:{account_id}:group/{parts[gi + 1]}"
+        return "*"
+
+    if service == "rds-data":
+        arn = _safe_json_field(body, "resourceArn")
+        if arn:
+            return arn
+        return "*"
+
+    if service == "appconfig":
+        parts = [p for p in path.split("/") if p]
+        if "applications" in parts:
+            ai = parts.index("applications")
+            if ai + 1 < len(parts):
+                app_id = parts[ai + 1]
+                if "environments" in parts:
+                    ei = parts.index("environments")
+                    if ei + 1 < len(parts):
+                        return f"arn:aws:appconfig:{region}:{account_id}:application/{app_id}/environment/{parts[ei + 1]}"
+                if "configurationprofiles" in parts:
+                    ci = parts.index("configurationprofiles")
+                    if ci + 1 < len(parts):
+                        return f"arn:aws:appconfig:{region}:{account_id}:application/{app_id}/configurationprofile/{parts[ci + 1]}"
+                return f"arn:aws:appconfig:{region}:{account_id}:application/{app_id}"
+        if "deploymentstrategies" in parts:
+            di = parts.index("deploymentstrategies")
+            if di + 1 < len(parts):
+                return f"arn:aws:appconfig:{region}:{account_id}:deploymentstrategy/{parts[di + 1]}"
+        return "*"
+
+    if service == "appconfigdata":
+        return "*"  # Session-based, no per-resource ARN
+
     return "*"
 
 
