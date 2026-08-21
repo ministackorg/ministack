@@ -634,6 +634,10 @@ def _create_policy(p):
         return _error(409, "EntityAlreadyExists",
                       f"A policy called {name} already exists.", ns="iam")
     doc = _p(p, "PolicyDocument")
+    from ministack.core.iam_evaluator import validate_policy_document
+    validation_err = validate_policy_document(doc)
+    if validation_err:
+        return _error(400, "MalformedPolicyDocument", validation_err, ns="iam")
     description = _p(p, "Description", "")
     # #445 (follow-up): CreatePolicy accepts Tags — honour them on create.
     create_tags = _extract_tags(p)
@@ -727,6 +731,10 @@ def _create_policy_version(p):
         return _error(409, "LimitExceeded",
                       "A managed policy can have at most 5 versions.", ns="iam")
     doc = _p(p, "PolicyDocument")
+    from ministack.core.iam_evaluator import validate_policy_document
+    validation_err = validate_policy_document(doc)
+    if validation_err:
+        return _error(400, "MalformedPolicyDocument", validation_err, ns="iam")
     set_default = _p(p, "SetAsDefault").lower() in ("true", "1") if _p(p, "SetAsDefault") else False
     next_v = max((int(v.lstrip("v")) for v in pol["Versions"]), default=0) + 1
     vid = f"v{next_v}"
@@ -919,6 +927,10 @@ def _put_role_policy(p):
     role_name = _p(p, "RoleName")
     policy_name = _p(p, "PolicyName")
     policy_doc = _p(p, "PolicyDocument")
+    from ministack.core.iam_evaluator import validate_policy_document
+    validation_err = validate_policy_document(policy_doc)
+    if validation_err:
+        return _error(400, "MalformedPolicyDocument", validation_err, ns="iam")
     role = _roles.get(role_name)
     if not role:
         return _error(404, "NoSuchEntity",
@@ -1399,10 +1411,33 @@ def _list_user_tags(p):
                 ns="iam")
 
 
-# -------------------- Simulate (stubs) --------------------
+# -------------------- Simulate --------------------
 
 def _simulate_principal_policy(p):
-    results = _build_simulate_results(p)
+    from ministack.core.iam_evaluator import (
+        EvalContext, evaluate, resolve_principal, parse_policy_document,
+    )
+    from ministack.core.responses import get_account_id
+    principal_arn = _p(p, "PolicySourceArn")
+    if not principal_arn:
+        return _error(400, "ValidationError",
+                      "PolicySourceArn is required.", ns="iam")
+    actions, resource_arn = _extract_simulate_params(p)
+    account_id = get_account_id()
+    # Resolve the principal's policies
+    # Extract entity type and name from ARN
+    parts = principal_arn.split(":")
+    policies = []
+    if len(parts) >= 6:
+        resource = parts[5]
+        if resource.startswith("user/"):
+            from ministack.core.iam_evaluator import _gather_user_policies
+            policies = _gather_user_policies(resource.split("/", 1)[1], account_id)
+        elif resource.startswith("role/"):
+            from ministack.core.iam_evaluator import _gather_role_policies
+            policies = _gather_role_policies(resource.split("/", 1)[1], account_id)
+    results = _build_simulate_results_real(actions, resource_arn, principal_arn,
+                                           account_id, policies)
     return _xml(200, "SimulatePrincipalPolicyResponse",
                 f"<SimulatePrincipalPolicyResult>"
                 f"<EvaluationResults>{results}</EvaluationResults>"
@@ -1412,7 +1447,24 @@ def _simulate_principal_policy(p):
 
 
 def _simulate_custom_policy(p):
-    results = _build_simulate_results(p)
+    from ministack.core.iam_evaluator import parse_policy_document
+    from ministack.core.responses import get_account_id
+    actions, resource_arn = _extract_simulate_params(p)
+    account_id = get_account_id()
+    # Parse the caller-supplied policy documents
+    policies = []
+    idx = 1
+    while True:
+        doc = _p(p, f"PolicyInputList.member.{idx}")
+        if not doc:
+            break
+        stmts = parse_policy_document(doc)
+        if stmts:
+            policies.append(stmts)
+        idx += 1
+    results = _build_simulate_results_real(
+        actions, resource_arn,
+        f"arn:aws:iam::{account_id}:root", account_id, policies)
     return _xml(200, "SimulateCustomPolicyResponse",
                 f"<SimulateCustomPolicyResult>"
                 f"<EvaluationResults>{results}</EvaluationResults>"
@@ -1421,7 +1473,7 @@ def _simulate_custom_policy(p):
                 ns="iam")
 
 
-def _build_simulate_results(p):
+def _extract_simulate_params(p):
     actions = []
     idx = 1
     while True:
@@ -1433,12 +1485,33 @@ def _build_simulate_results(p):
     if not actions:
         actions = ["sts:AssumeRole"]
     resource_arn = _p(p, "ResourceArns.member.1") or "*"
+    return actions, resource_arn
+
+
+def _build_simulate_results_real(actions, resource_arn, principal_arn,
+                                 account_id, policies):
+    from ministack.core.iam_evaluator import EvalContext, evaluate
     members = ""
     for action in actions:
+        if policies:
+            ctx = EvalContext(
+                principal_arn=principal_arn,
+                principal_type="User",
+                principal_account=account_id,
+                action=action,
+                resource_arn=resource_arn,
+                region=get_region(),
+            )
+            result = evaluate(ctx, policies)
+            decision = result.decision.lower()
+            if decision == "implicitdeny":
+                decision = "implicitDeny"
+        else:
+            decision = "implicitDeny"
         members += (f"<member>"
                     f"<EvalActionName>{action}</EvalActionName>"
                     f"<EvalResourceName>{resource_arn}</EvalResourceName>"
-                    f"<EvalDecision>allowed</EvalDecision>"
+                    f"<EvalDecision>{decision}</EvalDecision>"
                     f"<MatchedStatements></MatchedStatements>"
                     f"<MissingContextValues></MissingContextValues>"
                     f"</member>")
@@ -1692,6 +1765,10 @@ def _put_user_policy(p):
     user_name = _p(p, "UserName")
     policy_name = _p(p, "PolicyName")
     policy_doc = _p(p, "PolicyDocument")
+    from ministack.core.iam_evaluator import validate_policy_document
+    validation_err = validate_policy_document(policy_doc)
+    if validation_err:
+        return _error(400, "MalformedPolicyDocument", validation_err, ns="iam")
     if user_name not in _users:
         return _error(404, "NoSuchEntity",
                       f"The user with name {user_name} cannot be found.", ns="iam")

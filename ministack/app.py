@@ -25,6 +25,7 @@ from urllib.parse import parse_qs, unquote
 
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _MINISTACK_PORT = os.environ.get("GATEWAY_PORT", "4566")
+AUTH = os.environ.get("AUTH", "false").lower() == "true"
 
 _VERSION = os.environ.get("MINISTACK_VERSION") or "dev"
 if _VERSION == "dev":
@@ -1784,6 +1785,18 @@ async def _dispatch_service_request(
 
     if service == "unknown_query":
         return _unknown_query_error(body, request_id)
+
+    if AUTH:
+        from ministack.core.iam_actions import extract_iam_action, access_denied_response
+        from ministack.core.iam_evaluator import enforce
+        iam_action = extract_iam_action(
+            service, method, path, headers, body, routing_params)
+        if iam_action is not None:
+            access_key = extract_access_key_id(headers, query_params)
+            denied = enforce(access_key, iam_action, service, region)
+            if denied:
+                return access_denied_response(
+                    service, iam_action, denied.principal_arn, request_id)
 
     handler = SERVICE_HANDLERS.get(service)
     if not handler:
