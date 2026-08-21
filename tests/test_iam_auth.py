@@ -582,9 +582,12 @@ class TestEnforce:
             "Arn": "arn:aws:iam::000000000000:user/enforce-user",
             "UserId": "AIDA123", "CreateDate": "2024-01-01", "Path": "/",
             "AttachedPolicies": [], "Tags": [],
-            "InlinePolicies": {"p": json.dumps({
+        }
+        # User inline policies live in the separate _user_inline_policies dict
+        iam_svc._user_inline_policies["enforce-user"] = {
+            "p": json.dumps({
                 "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]
-            })},
+            })
         }
         try:
             assert enforce(fake_key, "s3:PutObject", "s3", "us-east-1") is None
@@ -594,6 +597,7 @@ class TestEnforce:
         finally:
             iam_svc._access_keys.pop(fake_key, None)
             iam_svc._users.pop("enforce-user", None)
+            iam_svc._user_inline_policies.pop("enforce-user", None)
 
     def test_explicit_deny_in_policy_blocks(self):
         from ministack.services import iam as iam_svc
@@ -607,10 +611,12 @@ class TestEnforce:
             "Arn": "arn:aws:iam::000000000000:user/deny-user",
             "UserId": "AIDA456", "CreateDate": "2024-01-01", "Path": "/",
             "AttachedPolicies": [], "Tags": [],
-            "InlinePolicies": {"p": json.dumps({"Statement": [
+        }
+        iam_svc._user_inline_policies["deny-user"] = {
+            "p": json.dumps({"Statement": [
                 {"Effect": "Allow", "Action": "*", "Resource": "*"},
                 {"Effect": "Deny", "Action": "s3:DeleteBucket", "Resource": "*"},
-            ]})},
+            ]})
         }
         try:
             assert enforce(fake_key, "s3:PutObject", "s3", "us-east-1") is None
@@ -620,6 +626,73 @@ class TestEnforce:
         finally:
             iam_svc._access_keys.pop(fake_key, None)
             iam_svc._users.pop("deny-user", None)
+            iam_svc._user_inline_policies.pop("deny-user", None)
+
+    def test_user_inherits_group_inline_policy(self):
+        """User policies include inline policies from their groups."""
+        from ministack.services import iam as iam_svc
+        fake_key = "AKIATESTGROUP00001"
+        iam_svc._access_keys[fake_key] = {
+            "UserName": "group-user", "AccessKeyId": fake_key,
+            "SecretAccessKey": "s", "Status": "Active", "CreateDate": "2024-01-01",
+        }
+        iam_svc._users["group-user"] = {
+            "UserName": "group-user",
+            "Arn": "arn:aws:iam::000000000000:user/group-user",
+            "UserId": "AIDA789", "CreateDate": "2024-01-01", "Path": "/",
+            "AttachedPolicies": [], "Tags": [],
+        }
+        iam_svc._groups["dev-team"] = {
+            "GroupName": "dev-team", "GroupId": "AGPA123",
+            "Arn": "arn:aws:iam::000000000000:group/dev-team",
+            "Users": ["group-user"], "AttachedPolicies": [],
+        }
+        iam_svc._group_inline_policies["dev-team"] = {
+            "s3-access": json.dumps({
+                "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]
+            })
+        }
+        try:
+            # s3 allowed via group policy
+            assert enforce(fake_key, "s3:PutObject", "s3", "us-east-1") is None
+            # ec2 not in any policy
+            result = enforce(fake_key, "ec2:RunInstances", "ec2", "us-east-1")
+            assert isinstance(result, EvalResult)
+            assert result.decision == "ImplicitDeny"
+        finally:
+            iam_svc._access_keys.pop(fake_key, None)
+            iam_svc._users.pop("group-user", None)
+            iam_svc._groups.pop("dev-team", None)
+            iam_svc._group_inline_policies.pop("dev-team", None)
+
+    def test_user_inherits_user_inline_policy(self):
+        """User inline policies are stored in _user_inline_policies, not on the user object."""
+        from ministack.services import iam as iam_svc
+        fake_key = "AKIATESTUSRPOL0001"
+        iam_svc._access_keys[fake_key] = {
+            "UserName": "inline-user", "AccessKeyId": fake_key,
+            "SecretAccessKey": "s", "Status": "Active", "CreateDate": "2024-01-01",
+        }
+        iam_svc._users["inline-user"] = {
+            "UserName": "inline-user",
+            "Arn": "arn:aws:iam::000000000000:user/inline-user",
+            "UserId": "AIDA012", "CreateDate": "2024-01-01", "Path": "/",
+            "AttachedPolicies": [], "Tags": [],
+        }
+        iam_svc._user_inline_policies["inline-user"] = {
+            "my-policy": json.dumps({
+                "Statement": [{"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"}]
+            })
+        }
+        try:
+            assert enforce(fake_key, "dynamodb:PutItem", "dynamodb", "us-east-1") is None
+            result = enforce(fake_key, "s3:GetObject", "s3", "us-east-1")
+            assert isinstance(result, EvalResult)
+            assert result.decision == "ImplicitDeny"
+        finally:
+            iam_svc._access_keys.pop(fake_key, None)
+            iam_svc._users.pop("inline-user", None)
+            iam_svc._user_inline_policies.pop("inline-user", None)
 
 
 # ---------------------------------------------------------------------------

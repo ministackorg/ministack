@@ -550,7 +550,8 @@ def _gather_user_policies(user_name: str, account_id: str) -> list[list[ParsedSt
     if user is None:
         return []
     policies = []
-    for doc in (user.get("InlinePolicies") or {}).values():
+    # User inline policies live in a separate AccountScopedDict, not on the user object
+    for doc in (iam_svc._user_inline_policies.get(user_name) or {}).values():
         stmts = parse_policy_document(doc)
         if stmts:
             policies.append(stmts)
@@ -561,9 +562,10 @@ def _gather_user_policies(user_name: str, account_id: str) -> list[list[ParsedSt
             if stmts:
                 policies.append(stmts)
     # Group policies — iterate all groups in this account, check if user is a member
-    for _group_name, group in iam_svc._groups.items():
+    for group_name, group in iam_svc._groups.items():
         if user_name in group.get("Users", []):
-            for doc in (group.get("InlinePolicies") or {}).values():
+            # Group inline policies live in a separate AccountScopedDict
+            for doc in (iam_svc._group_inline_policies.get(group_name) or {}).values():
                 stmts = parse_policy_document(doc)
                 if stmts:
                     policies.append(stmts)
