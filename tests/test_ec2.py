@@ -110,6 +110,16 @@ def test_ec2_availability_zone_ids_are_region_coded(ec2):
     assert _az_id_prefix("cn-northwest-1") == "cnnw1"
 
 
+def test_ec2_availability_zones_carry_group_and_opt_in(ec2):
+    """GroupName / NetworkBorderGroup / OptInStatus are optional members, so leaving
+    them out reads to an SDK as "no value" rather than as an error: a caller filtering
+    on opt_in_status or grouping by group_names gets a wrong answer, not a failure."""
+    zones = ec2.describe_availability_zones()["AvailabilityZones"]
+    assert all(z["GroupName"] == "us-east-1-zg-1" for z in zones)
+    assert all(z["NetworkBorderGroup"] == "us-east-1" for z in zones)
+    assert all(z["OptInStatus"] == "opt-in-not-required" for z in zones)
+
+
 def test_ec2_describe_regions_returns_commercial_regions(ec2):
     """DescribeRegions must list at least the four legacy us-* regions
     with opt-in-not-required, and emit the shape AWS returns."""

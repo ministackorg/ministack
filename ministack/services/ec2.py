@@ -2439,11 +2439,21 @@ def _describe_availability_zones(p):
     prefix = _az_id_prefix(region)
     # 3 AZs with a=1, b=2, c=3 for ministack
     zones = [(f"{region}{letter}", f"{prefix}-az{n}") for n, letter in enumerate("abc", start=1)]
+    # groupName / networkBorderGroup / optInStatus are optional members, so an
+    # SDK silently returns a zone with those keys absent rather than erroring —
+    # a consumer that reads them (Terraform's aws_availability_zones exposes
+    # group_names and opt_in_status) gets an empty answer instead of a failure.
+    # Standard Availability Zones sit in the region's single zone group and
+    # never require an opt-in.
+    group_name = f"{region}-zg-1"
     items = "".join(f"""<item>
         <zoneName>{name}</zoneName>
         <zoneState>available</zoneState>
         <regionName>{region}</regionName>
         <zoneId>{zone_id}</zoneId>
+        <groupName>{group_name}</groupName>
+        <networkBorderGroup>{region}</networkBorderGroup>
+        <optInStatus>opt-in-not-required</optInStatus>
     </item>""" for name, zone_id in zones)
     return _xml(200, "DescribeAvailabilityZonesResponse",
                 f"<availabilityZoneInfo>{items}</availabilityZoneInfo>")

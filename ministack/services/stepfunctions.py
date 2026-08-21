@@ -1656,6 +1656,23 @@ def _invoke_with_callback(resource, input_data, token, state_def):
             else:
                 if "aws-sdk:" in clean_resource:
                     _invoke_aws_sdk_integration(clean_resource, input_data)
+                elif clean_resource.startswith(
+                        "arn:aws:states:::states:startExecution"):
+                    # The child execution carries the task token in its input,
+                    # so it has to be started before we block on the callback.
+                    _invoke_nested_start_execution(clean_resource, input_data)
+                elif clean_resource.startswith("arn:aws:states:::"):
+                    # An optimized integration MiniStack does not implement.
+                    # Falling through here sends nothing and then blocks on the
+                    # callback until TimeoutSeconds (default 99999), so the
+                    # execution hangs instead of reporting the gap. Fail loudly,
+                    # matching the synchronous dispatcher in _invoke_resource.
+                    raise _ExecutionError(
+                        "States.Runtime",
+                        f"{resource} is not yet implemented in MiniStack. Use "
+                        "the generic arn:aws:states:::aws-sdk:<service>:<action> "
+                        "form, or open an issue for this optimized integration.",
+                    )
         except _ExecutionError:
             _task_tokens.pop(token, None)
             raise
