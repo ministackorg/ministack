@@ -1503,8 +1503,12 @@ def _build_simulate_results_real(actions, resource_arn, principal_arn,
                 region=get_region(),
             )
             result = evaluate(ctx, policies)
-            decision = result.decision.lower()
-            if decision == "implicitdeny":
+            raw = result.decision
+            if raw == "Allow":
+                decision = "allowed"
+            elif raw == "Deny":
+                decision = "explicitDeny"
+            else:
                 decision = "implicitDeny"
         else:
             decision = "implicitDeny"

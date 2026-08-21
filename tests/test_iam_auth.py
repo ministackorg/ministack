@@ -422,11 +422,26 @@ class TestTrustPolicy:
         assert evaluate_trust_policy(trust, "arn:aws:iam::123456789012:user/alice")
         assert not evaluate_trust_policy(trust, "arn:aws:iam::123456789012:user/bob")
 
-    def test_service_principal(self):
+    def test_service_principal_allows_root(self):
+        """Service principals allow root (MiniStack's internal service calls use root)."""
         trust = {"Statement": [{"Effect": "Allow",
                                 "Principal": {"Service": "lambda.amazonaws.com"},
                                 "Action": "sts:AssumeRole"}]}
-        assert evaluate_trust_policy(trust, "arn:aws:iam::123:user/anyone")
+        assert evaluate_trust_policy(trust, "arn:aws:iam::123456789012:root")
+
+    def test_service_principal_allows_matching_service(self):
+        """Service principal matches callers containing the service name."""
+        trust = {"Statement": [{"Effect": "Allow",
+                                "Principal": {"Service": "lambda.amazonaws.com"},
+                                "Action": "sts:AssumeRole"}]}
+        assert evaluate_trust_policy(trust, "arn:aws:lambda:us-east-1:123:function:test")
+
+    def test_service_principal_denies_unrelated_user(self):
+        """A service principal does NOT allow arbitrary IAM users."""
+        trust = {"Statement": [{"Effect": "Allow",
+                                "Principal": {"Service": "lambda.amazonaws.com"},
+                                "Action": "sts:AssumeRole"}]}
+        assert not evaluate_trust_policy(trust, "arn:aws:iam::123:user/anyone")
 
     def test_account_id_shorthand(self):
         """AWS: account ID alone = arn:aws:iam::ACCT:root."""
@@ -1072,7 +1087,7 @@ def test_simulate_custom_policy_explicit_deny(iam):
                                       ActionNames=["s3:PutObject", "s3:DeleteBucket"])
     results = {r["EvalActionName"]: r["EvalDecision"] for r in resp["EvaluationResults"]}
     assert results["s3:PutObject"] == "allowed"
-    assert results["s3:DeleteBucket"] == "deny"
+    assert results["s3:DeleteBucket"] == "explicitDeny"
 
 
 # ---------------------------------------------------------------------------

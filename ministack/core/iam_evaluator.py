@@ -682,6 +682,15 @@ def resolve_principal(access_key_id: str,
 # Top-level enforcement entry point
 # ---------------------------------------------------------------------------
 
+# Actions that AWS always allows regardless of IAM policies.
+# https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic.html
+_ALWAYS_ALLOWED_ACTIONS = frozenset({
+    "sts:GetCallerIdentity",
+    "sts:GetSessionToken",
+    "sts:GetAccessKeyInfo",
+})
+
+
 def enforce(access_key_id: str, iam_action: str, service: str,
             region: str, resource_arn: str = "*") -> EvalResult | AuthError | None:
     """Check whether the request should be allowed.
@@ -689,6 +698,10 @@ def enforce(access_key_id: str, iam_action: str, service: str,
     Returns ``None`` if allowed, an ``AuthError`` for authentication failures,
     or an ``EvalResult`` for authorization denials.
     """
+    # Actions that AWS never denies, regardless of policies
+    if iam_action in _ALWAYS_ALLOWED_ACTIONS:
+        return None
+
     from ministack.core.responses import get_account_id
 
     account_id = get_account_id()
@@ -829,12 +842,20 @@ def _principal_matches(principal: Any, caller_arn: str) -> bool:
             # Also match account root against any principal in that account
             if p.endswith(":root") and f":{p.split(':')[4]}:" in caller_arn:
                 return True
-        # Service principals — always allow (Lambda, ECS, etc. assume roles)
+        # Service principals — match if the caller ARN looks like it came from
+        # that service (e.g., lambda.amazonaws.com allows Lambda-invoked assumes).
+        # In local dev, service principals are typically used by MiniStack's own
+        # service dispatch (Lambda, ECS, etc.), so we also allow if the caller
+        # is root (service-to-service calls use root credentials internally).
         svc_principals = principal.get("Service", [])
         if isinstance(svc_principals, str):
             svc_principals = [svc_principals]
         if svc_principals:
-            # Service principals are validated at a different layer;
-            # for local dev, if a trust policy lists any service, allow it
-            return True
+            if ":root" in caller_arn:
+                return True
+            for svc in svc_principals:
+                # Extract service prefix: "lambda.amazonaws.com" → "lambda"
+                svc_prefix = svc.split(".")[0] if "." in svc else svc
+                if svc_prefix in caller_arn:
+                    return True
     return False

@@ -179,8 +179,12 @@ async def handle_request(method, path, headers, body, query_params):
         secret_key = _gen_secret()
         session_token = _gen_session_token()
         role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
-        _sessions[access_key] = {"Arn": assumed_arn, "UserId": f"{role_id}:{session}"}
-        _sessions[access_key]["SecretAccessKey"] = secret_key
+        _sessions[access_key] = {
+            "Arn": assumed_arn,
+            "UserId": f"{role_id}:{session}",
+            "SecretAccessKey": secret_key,
+            "Expiration": time.time() + duration,
+        }
         provider = _p(params, "ProviderId") or "sts.amazonaws.com"
         if use_json:
             return json_response({

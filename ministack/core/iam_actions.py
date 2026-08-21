@@ -1228,24 +1228,28 @@ def access_denied_response(service: str, action: str, principal_arn: str,
     code = error_code or "AccessDenied"
     protocol = _SERVICE_PROTOCOL.get(service, "json")
 
+    _esc_code = _xml_escape(code)
+    _esc_rid = _xml_escape(request_id)
+    _esc_msg = _xml_escape(message)
+
     if protocol == "rest-xml":
         body = (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
-            f"<Error><Code>{code}</Code>"
-            f"<Message>{_xml_escape(message)}</Message>"
-            f"<RequestId>{request_id}</RequestId></Error>"
+            f"<Error><Code>{_esc_code}</Code>"
+            f"<Message>{_esc_msg}</Message>"
+            f"<RequestId>{_esc_rid}</RequestId></Error>"
         )
         return 403, {"Content-Type": "application/xml"}, body.encode()
 
     if protocol == "ec2-xml":
-        ec2_code = "UnauthorizedOperation" if code == "AccessDenied" else code
+        ec2_code = "UnauthorizedOperation" if code == "AccessDenied" else _esc_code
         body = (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             f"<Response><Errors><Error>"
             f"<Code>{ec2_code}</Code>"
-            f"<Message>{_xml_escape(message)}</Message>"
+            f"<Message>{_esc_msg}</Message>"
             f"</Error></Errors>"
-            f"<RequestID>{request_id}</RequestID></Response>"
+            f"<RequestID>{_esc_rid}</RequestID></Response>"
         )
         return 403, {"Content-Type": "application/xml"}, body.encode()
 
@@ -1253,9 +1257,9 @@ def access_denied_response(service: str, action: str, principal_arn: str,
         body = (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             '<ErrorResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/">'
-            f"<Error><Type>Sender</Type><Code>{code}</Code>"
-            f"<Message>{_xml_escape(message)}</Message></Error>"
-            f"<RequestId>{request_id}</RequestId></ErrorResponse>"
+            f"<Error><Type>Sender</Type><Code>{_esc_code}</Code>"
+            f"<Message>{_esc_msg}</Message></Error>"
+            f"<RequestId>{_esc_rid}</RequestId></ErrorResponse>"
         )
         return 403, {"Content-Type": "text/xml"}, body.encode()
 
