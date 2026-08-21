@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Lambda — Node.js ESM handlers using top-level `await` load correctly** — the warm-worker and one-shot Node bootstraps `require()` the handler module and fall back to dynamic `import()` only on `ERR_REQUIRE_ESM`; a module whose graph contains a top-level `await` instead throws Node's `ERR_REQUIRE_ASYNC_MODULE` (since a synchronous `require()` can never wait on an async operation), which fell through to an uncaught `RuntimeError`. Both bootstraps now treat `ERR_REQUIRE_ASYNC_MODULE` the same as `ERR_REQUIRE_ESM`. This is AWS's own documented Lambda cold-start pattern (a module-scope `await` to force a client connection during Init, before the first invocation) and works unmodified on real Lambda already. Contributed by @ryan-bennett.
+
 ## [1.4.21] — 2026-08-20
 
 ### Added
