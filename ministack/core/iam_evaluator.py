@@ -671,7 +671,7 @@ def resolve_principal(access_key_id: str,
 
     # Unknown access key — reject
     return AuthError(
-        "InvalidClientTokenId",
+        "UnrecognizedClientException",
         "The security token included in the request is invalid.",
     )
 

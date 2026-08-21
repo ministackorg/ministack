@@ -116,8 +116,9 @@ async def handle_request(method, path, headers, body, query_params):
             role_name = role_arn.split("/")[-1] if "/" in role_arn else ""
             role = iam_svc._roles.get(role_name)
             if role is None:
-                return _error(404, "NoSuchEntity",
-                              f"Role not found: {role_arn}", ns="sts")
+                return _error(403, "AccessDenied",
+                              f"User: is not authorized to perform: sts:AssumeRole on resource: {role_arn}",
+                              ns="sts")
             # Evaluate trust policy
             trust_doc = role.get("AssumeRolePolicyDocument", "{}")
             caller_key = extract_access_key_id(headers)
