@@ -1060,6 +1060,159 @@ def extract_resource_arn(service: str, method: str, path: str,
     if service == "appconfigdata":
         return "*"  # Session-based, no per-resource ARN
 
+    # --- EC2 (query-based, many resource types) ---
+
+    if service == "ec2":
+        # EC2 uses query params. Try resource ID fields in priority order.
+        _EC2_RESOURCE_FIELDS = [
+            ("InstanceId.1", "instance"),
+            ("InstanceId", "instance"),
+            ("VpcId", "vpc"),
+            ("SubnetId", "subnet"),
+            ("SecurityGroupId.1", "security-group"),
+            ("GroupId", "security-group"),
+            ("GroupName", "security-group"),
+            ("VolumeId", "volume"),
+            ("KeyName", "key-pair"),
+            ("ImageId", "image"),
+            ("InternetGatewayId", "internet-gateway"),
+            ("RouteTableId", "route-table"),
+            ("NetworkInterfaceId", "network-interface"),
+            ("AllocationId", "elastic-ip"),
+            ("SnapshotId", "snapshot"),
+            ("VpcEndpointId.1", "vpc-endpoint"),
+        ]
+        for field, rtype in _EC2_RESOURCE_FIELDS:
+            val = _query_param(query_params, field)
+            if val:
+                return f"arn:aws:ec2:{region}:{account_id}:{rtype}/{val}"
+        return "*"
+
+    # --- IoT (REST path-based, multiple resource types) ---
+
+    if service == "iot":
+        parts = [p for p in path.split("/") if p]
+        _IOT_RESOURCES = {
+            "things": "thing",
+            "thing-types": "thingtype",
+            "thing-groups": "thinggroup",
+            "policies": "policy",
+            "certificates": "cert",
+            "rules": "rule",
+        }
+        for segment, rtype in _IOT_RESOURCES.items():
+            if segment in parts:
+                si = parts.index(segment)
+                if si + 1 < len(parts):
+                    name = parts[si + 1]
+                    if rtype == "cert":
+                        return f"arn:aws:iot:{region}:{account_id}:{rtype}/{name}"
+                    return f"arn:aws:iot:{region}:{account_id}:{rtype}/{name}"
+        return "*"
+
+    # --- API Gateway (REST path-based) ---
+
+    if service == "apigateway":
+        parts = [p for p in path.split("/") if p]
+        # v2: /v2/apis/{apiId}
+        if "apis" in parts:
+            ai = parts.index("apis")
+            if ai + 1 < len(parts):
+                api_id = parts[ai + 1]
+                return f"arn:aws:apigateway:{region}::/apis/{api_id}"
+            return f"arn:aws:apigateway:{region}::/apis/*"
+        # v1: /restapis/{restApiId}
+        if "restapis" in parts:
+            ri = parts.index("restapis")
+            if ri + 1 < len(parts):
+                api_id = parts[ri + 1]
+                return f"arn:aws:apigateway:{region}::/restapis/{api_id}"
+            return f"arn:aws:apigateway:{region}::/restapis/*"
+        return "*"
+
+    # --- Bedrock (REST path-based, multiple sub-services) ---
+
+    if service == "bedrock":
+        parts = [p for p in path.split("/") if p]
+        if "foundation-models" in parts:
+            fi = parts.index("foundation-models")
+            if fi + 1 < len(parts):
+                return f"arn:aws:bedrock:{region}::foundation-model/{parts[fi + 1]}"
+        if "custom-models" in parts:
+            ci = parts.index("custom-models")
+            if ci + 1 < len(parts):
+                return f"arn:aws:bedrock:{region}:{account_id}:custom-model/{parts[ci + 1]}"
+        if "guardrails" in parts:
+            gi = parts.index("guardrails")
+            if gi + 1 < len(parts):
+                return f"arn:aws:bedrock:{region}:{account_id}:guardrail/{parts[gi + 1]}"
+        if "inference-profiles" in parts:
+            ii = parts.index("inference-profiles")
+            if ii + 1 < len(parts):
+                return f"arn:aws:bedrock:{region}:{account_id}:inference-profile/{parts[ii + 1]}"
+        return "*"
+
+    if service == "bedrock-runtime":
+        parts = [p for p in path.split("/") if p]
+        if "model" in parts:
+            mi = parts.index("model")
+            if mi + 1 < len(parts):
+                model_id = parts[mi + 1]
+                return f"arn:aws:bedrock:{region}::foundation-model/{model_id}"
+        return "*"
+
+    if service == "bedrock-agent":
+        parts = [p for p in path.split("/") if p]
+        if "agents" in parts:
+            ai = parts.index("agents")
+            if ai + 1 < len(parts):
+                return f"arn:aws:bedrock:{region}:{account_id}:agent/{parts[ai + 1]}"
+        if "knowledgebases" in parts:
+            ki = parts.index("knowledgebases")
+            if ki + 1 < len(parts):
+                return f"arn:aws:bedrock:{region}:{account_id}:knowledge-base/{parts[ki + 1]}"
+        if "flows" in parts:
+            fi = parts.index("flows")
+            if fi + 1 < len(parts):
+                return f"arn:aws:bedrock:{region}:{account_id}:flow/{parts[fi + 1]}"
+        if "prompts" in parts:
+            pi = parts.index("prompts")
+            if pi + 1 < len(parts):
+                return f"arn:aws:bedrock:{region}:{account_id}:prompt/{parts[pi + 1]}"
+        return "*"
+
+    if service == "bedrock-agent-runtime":
+        parts = [p for p in path.split("/") if p]
+        if "knowledgebases" in parts:
+            ki = parts.index("knowledgebases")
+            if ki + 1 < len(parts):
+                return f"arn:aws:bedrock:{region}:{account_id}:knowledge-base/{parts[ki + 1]}"
+        if "agents" in parts:
+            ai = parts.index("agents")
+            if ai + 1 < len(parts):
+                return f"arn:aws:bedrock:{region}:{account_id}:agent/{parts[ai + 1]}"
+        return "*"
+
+    # --- AppSync (REST path-based) ---
+
+    if service == "appsync":
+        parts = [p for p in path.split("/") if p]
+        if "apis" in parts:
+            ai = parts.index("apis")
+            if ai + 1 < len(parts):
+                api_id = parts[ai + 1]
+                # Sub-resources
+                if "datasources" in parts:
+                    di = parts.index("datasources")
+                    if di + 1 < len(parts):
+                        return f"arn:aws:appsync:{region}:{account_id}:apis/{api_id}/datasources/{parts[di + 1]}"
+                if "types" in parts:
+                    ti = parts.index("types")
+                    if ti + 1 < len(parts):
+                        return f"arn:aws:appsync:{region}:{account_id}:apis/{api_id}/types/{parts[ti + 1]}"
+                return f"arn:aws:appsync:{region}:{account_id}:apis/{api_id}"
+        return "*"
+
     return "*"
 
 

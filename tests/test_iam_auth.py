@@ -888,6 +888,67 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         assert "mediaconnect" in extract_resource_arn("mediaconnect", "GET", "/v1/flows/flow-123", {}, b"", {}, "us-east-1", "123")
 
+    # --- EC2 ---
+    def test_ec2_instance(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("ec2", "POST", "/", {}, b"", {"InstanceId.1": ["i-abc123"]}, "us-east-1", "123") == "arn:aws:ec2:us-east-1:123:instance/i-abc123"
+
+    def test_ec2_vpc(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("ec2", "POST", "/", {}, b"", {"VpcId": ["vpc-123"]}, "us-east-1", "123") == "arn:aws:ec2:us-east-1:123:vpc/vpc-123"
+
+    def test_ec2_security_group(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("ec2", "POST", "/", {}, b"", {"GroupId": ["sg-123"]}, "us-east-1", "123") == "arn:aws:ec2:us-east-1:123:security-group/sg-123"
+
+    def test_ec2_no_resource(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("ec2", "POST", "/", {}, b"", {"Action": ["DescribeInstances"]}, "us-east-1", "123") == "*"
+
+    # --- IoT ---
+    def test_iot_thing(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("iot", "GET", "/things/my-thing", {}, b"", {}, "us-east-1", "123") == "arn:aws:iot:us-east-1:123:thing/my-thing"
+
+    def test_iot_policy(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("iot", "GET", "/policies/my-policy", {}, b"", {}, "us-east-1", "123") == "arn:aws:iot:us-east-1:123:policy/my-policy"
+
+    def test_iot_rule(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("iot", "GET", "/rules/my-rule", {}, b"", {}, "us-east-1", "123") == "arn:aws:iot:us-east-1:123:rule/my-rule"
+
+    # --- API Gateway ---
+    def test_apigateway_v2(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("apigateway", "GET", "/v2/apis/abc123", {}, b"", {}, "us-east-1", "123") == "arn:aws:apigateway:us-east-1::/apis/abc123"
+
+    def test_apigateway_v1(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("apigateway", "GET", "/restapis/xyz789", {}, b"", {}, "us-east-1", "123") == "arn:aws:apigateway:us-east-1::/restapis/xyz789"
+
+    # --- Bedrock ---
+    def test_bedrock_model(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("bedrock-runtime", "POST", "/model/anthropic.claude-v2/invoke", {}, b"", {}, "us-east-1", "123") == "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-v2"
+
+    def test_bedrock_agent(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("bedrock-agent", "GET", "/agents/AGENT123", {}, b"", {}, "us-east-1", "123") == "arn:aws:bedrock:us-east-1:123:agent/AGENT123"
+
+    def test_bedrock_knowledge_base(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("bedrock-agent", "GET", "/knowledgebases/KB123", {}, b"", {}, "us-east-1", "123") == "arn:aws:bedrock:us-east-1:123:knowledge-base/KB123"
+
+    # --- AppSync ---
+    def test_appsync_api(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("appsync", "GET", "/v1/apis/abc123", {}, b"", {}, "us-east-1", "123") == "arn:aws:appsync:us-east-1:123:apis/abc123"
+
+    def test_appsync_datasource(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("appsync", "GET", "/v1/apis/abc/datasources/myds", {}, b"", {}, "us-east-1", "123") == "arn:aws:appsync:us-east-1:123:apis/abc/datasources/myds"
+
     def test_resource_scoped_policy_enforcement(self):
         """A policy allowing s3:GetObject only on mybucket/* should deny access to otherbucket."""
         stmts = parse_policy_document({"Statement": [{
