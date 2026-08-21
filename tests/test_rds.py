@@ -1155,6 +1155,29 @@ def test_rds_describe_aurora_postgresql_engine_versions_by_family(rds):
     assert filtered == []
 
 
+def test_rds_describe_aurora_postgresql_engine_version_status(rds):
+    """SDK selection parameters must not drop DBEngineVersion.Status."""
+    family = "aurora-postgresql16"
+    family_response = rds.describe_db_engine_versions(
+        Engine="aurora-postgresql",
+        DBParameterGroupFamily=family,
+    )
+    family_versions = [
+        version
+        for version in family_response["DBEngineVersions"]
+        if version["DBParameterGroupFamily"] == family
+    ]
+    default_versions = rds.describe_db_engine_versions(
+        Engine="aurora-postgresql",
+        DefaultOnly=True,
+    )["DBEngineVersions"]
+
+    assert family_versions
+    assert default_versions
+    assert all(version["Status"] == "available" for version in family_versions)
+    assert all(version["Status"] == "available" for version in default_versions)
+
+
 def test_rds_aurora_mysql_create_rejects_unsupported_explicit_engine_version(rds):
     with pytest.raises(ClientError) as cluster_exc:
         rds.create_db_cluster(
