@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Cognito — `ListUsers` `Filter` matches values case-insensitively, except where AWS documents otherwise** — every filter comparison was an exact string match, so `email = "user@example.com"` missed a profile stored as `User@Example.com` and a `^=` prefix search was equally literal. Values are now matched case-insensitively for `email`, `phone_number`, `name`, `given_name`, `family_name`, `preferred_username` and `sub`, while `username` and `status` stay case-sensitive as the `ListUsers` API reference specifies. Contributed by @ppettitau.
+
 ## [1.4.21] — 2026-08-20
 
 ### Added

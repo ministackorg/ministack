@@ -228,6 +228,40 @@ def test_cognito_list_users_filter_quoted_attribute_name(cognito_idp):
     resp = cognito_idp.list_users(UserPoolId=pid, Filter='"email" = "nonexistent@example.com"')
     assert resp["Users"] == []
 
+def test_cognito_list_users_filter_case_sensitivity(cognito_idp):
+    """The ListUsers API reference documents "username" and "status" as
+    case-sensitive; other searchable attributes match case-insensitively."""
+    pid = cognito_idp.create_user_pool(PoolName="CaseFilterUsersPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="Alpha",
+        UserAttributes=[
+            {"Name": "email", "Value": "Alpha@Example.com"},
+            {"Name": "family_name", "Value": "Reddy"},
+        ],
+    )
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="beta",
+        UserAttributes=[{"Name": "email", "Value": "beta@example.com"}],
+    )
+
+    resp = cognito_idp.list_users(UserPoolId=pid, Filter='username = "alpha"')
+    assert resp["Users"] == []
+    resp = cognito_idp.list_users(UserPoolId=pid, Filter='username = "Alpha"')
+    assert [u["Username"] for u in resp["Users"]] == ["Alpha"]
+
+    resp = cognito_idp.list_users(UserPoolId=pid, Filter='"email" = "alpha@example.com"')
+    assert [u["Username"] for u in resp["Users"]] == ["Alpha"]
+
+    resp = cognito_idp.list_users(UserPoolId=pid, Filter='family_name ^= "redd"')
+    assert [u["Username"] for u in resp["Users"]] == ["Alpha"]
+
+    resp = cognito_idp.list_users(UserPoolId=pid, Filter='status = "enabled"')
+    assert resp["Users"] == []
+    resp = cognito_idp.list_users(UserPoolId=pid, Filter='status = "Enabled"')
+    assert sorted(u["Username"] for u in resp["Users"]) == ["Alpha", "beta"]
+
 def test_cognito_list_users_filter_status(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="StatusFilterUsersPool")["UserPool"]["Id"]
     cognito_idp.admin_create_user(UserPoolId=pid, Username="active-user")
