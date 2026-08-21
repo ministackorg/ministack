@@ -1489,11 +1489,14 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
 
     # IAM enforcement for S3 virtual-hosted requests
     if AUTH:
-        from ministack.core.iam_actions import _s3_action
+        from ministack.core.iam_actions import _s3_action, extract_resource_arn
         s3_action = _s3_action(method, vhost_path, query_params)
         if s3_action:
+            s3_resource = extract_resource_arn(
+                "s3", method, vhost_path, headers, body, query_params, "", "")
             denied = _enforce_data_plane("s3", f"s3:{s3_action}", headers,
-                                         query_params, "")
+                                         query_params, "",
+                                         resource_arn=s3_resource)
             if denied:
                 return denied
 
@@ -1535,14 +1538,17 @@ def _with_data_plane_headers(response, request_id: str, include_s3_id: bool = Fa
 
 
 def _enforce_data_plane(service: str, iam_action: str, headers: dict,
-                        query_params: dict, request_id: str):
+                        query_params: dict, request_id: str,
+                        resource_arn: str = "*"):
     """Enforce IAM auth on a data-plane path. Returns error tuple or None."""
     if not AUTH:
         return None
     from ministack.core.iam_actions import access_denied_response
     from ministack.core.iam_evaluator import AuthError, enforce
     access_key = extract_access_key_id(headers, query_params)
-    denied = enforce(access_key, iam_action, service, extract_region(headers, query_params))
+    denied = enforce(access_key, iam_action, service,
+                     extract_region(headers, query_params),
+                     resource_arn=resource_arn)
     if denied:
         if isinstance(denied, AuthError):
             return access_denied_response(
@@ -1829,13 +1835,20 @@ async def _dispatch_service_request(
         return _unknown_query_error(body, request_id)
 
     if AUTH:
-        from ministack.core.iam_actions import extract_iam_action, access_denied_response
+        from ministack.core.iam_actions import (
+            extract_iam_action, extract_resource_arn, access_denied_response,
+        )
         from ministack.core.iam_evaluator import AuthError, enforce
+        from ministack.core.responses import get_account_id
         iam_action = extract_iam_action(
             service, method, path, headers, body, routing_params)
         if iam_action is not None:
             access_key = extract_access_key_id(headers, query_params)
-            denied = enforce(access_key, iam_action, service, region)
+            resource_arn = extract_resource_arn(
+                service, method, path, headers, body,
+                routing_params, region, get_account_id())
+            denied = enforce(access_key, iam_action, service, region,
+                             resource_arn=resource_arn)
             if denied:
                 if isinstance(denied, AuthError):
                     return access_denied_response(

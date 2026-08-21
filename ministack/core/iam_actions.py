@@ -504,6 +504,425 @@ def _xml_escape(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+# ---------------------------------------------------------------------------
+# Resource ARN construction
+# ---------------------------------------------------------------------------
+
+def _safe_json_field(body: bytes, field: str) -> str:
+    """Extract a field from a JSON body, returning '' on any failure."""
+    if not body:
+        return ""
+    try:
+        return json.loads(body).get(field, "") or ""
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return ""
+
+
+def _query_param(query_params: dict, key: str) -> str:
+    """Extract a single query parameter value."""
+    val = query_params.get(key, "")
+    if isinstance(val, list):
+        return val[0] if val else ""
+    return val or ""
+
+
+def extract_resource_arn(service: str, method: str, path: str,
+                         headers: dict, body: bytes,
+                         query_params: dict, region: str,
+                         account_id: str) -> str:
+    """Construct the resource ARN for the request, or '*' if unknown."""
+
+    if service == "s3":
+        parts = [p for p in path.split("/") if p]
+        if not parts:
+            return "*"  # ListBuckets — no specific resource
+        bucket = parts[0]
+        if len(parts) >= 2:
+            key = "/".join(parts[1:])
+            return f"arn:aws:s3:::{bucket}/{key}"
+        return f"arn:aws:s3:::{bucket}"
+
+    if service == "dynamodb":
+        table = _safe_json_field(body, "TableName")
+        if table:
+            return f"arn:aws:dynamodb:{region}:{account_id}:table/{table}"
+        return "*"
+
+    if service == "lambda":
+        # Path: /2015-03-31/functions/{name}/...
+        path_parts = [p for p in path.split("/") if p]
+        if "functions" in path_parts:
+            fi = path_parts.index("functions")
+            if fi + 1 < len(path_parts):
+                func_name = path_parts[fi + 1]
+                return f"arn:aws:lambda:{region}:{account_id}:function:{func_name}"
+        if "layers" in path_parts:
+            li = path_parts.index("layers")
+            if li + 1 < len(path_parts):
+                layer_name = path_parts[li + 1]
+                return f"arn:aws:lambda:{region}:{account_id}:layer:{layer_name}"
+        if "event-source-mappings" in path_parts:
+            ei = path_parts.index("event-source-mappings")
+            if ei + 1 < len(path_parts):
+                uuid = path_parts[ei + 1]
+                return f"arn:aws:lambda:{region}:{account_id}:event-source-mapping:{uuid}"
+        return "*"
+
+    if service == "sqs":
+        # Queue URL is in the path or QueueUrl param
+        queue_url = _query_param(query_params, "QueueUrl")
+        if queue_url:
+            # Extract queue name from URL
+            q_parts = queue_url.rstrip("/").split("/")
+            queue_name = q_parts[-1] if q_parts else ""
+            if queue_name:
+                return f"arn:aws:sqs:{region}:{account_id}:{queue_name}"
+        # QueueName param (CreateQueue)
+        queue_name = _query_param(query_params, "QueueName")
+        if queue_name:
+            return f"arn:aws:sqs:{region}:{account_id}:{queue_name}"
+        return "*"
+
+    if service == "sns":
+        topic_arn = _query_param(query_params, "TopicArn")
+        if topic_arn:
+            return topic_arn
+        target_arn = _query_param(query_params, "TargetArn")
+        if target_arn:
+            return target_arn
+        # CreateTopic — name in params
+        topic_name = _query_param(query_params, "Name")
+        if topic_name:
+            return f"arn:aws:sns:{region}:{account_id}:{topic_name}"
+        return "*"
+
+    if service == "kms":
+        key_id = _safe_json_field(body, "KeyId")
+        if key_id:
+            # KeyId can be an ARN, alias, or key ID
+            if key_id.startswith("arn:"):
+                return key_id
+            if key_id.startswith("alias/"):
+                return f"arn:aws:kms:{region}:{account_id}:{key_id}"
+            return f"arn:aws:kms:{region}:{account_id}:key/{key_id}"
+        return "*"
+
+    if service == "secretsmanager":
+        secret_id = _safe_json_field(body, "SecretId")
+        if not secret_id:
+            secret_id = _safe_json_field(body, "Name")
+        if secret_id:
+            if secret_id.startswith("arn:"):
+                return secret_id
+            return f"arn:aws:secretsmanager:{region}:{account_id}:secret:{secret_id}"
+        return "*"
+
+    if service == "iam":
+        # IAM actions target users, roles, policies — extract from params
+        role_name = _query_param(query_params, "RoleName")
+        if role_name:
+            return f"arn:aws:iam::{account_id}:role/{role_name}"
+        user_name = _query_param(query_params, "UserName")
+        if user_name:
+            return f"arn:aws:iam::{account_id}:user/{user_name}"
+        policy_arn = _query_param(query_params, "PolicyArn")
+        if policy_arn:
+            return policy_arn
+        group_name = _query_param(query_params, "GroupName")
+        if group_name:
+            return f"arn:aws:iam::{account_id}:group/{group_name}"
+        return "*"
+
+    if service == "sts":
+        role_arn = _query_param(query_params, "RoleArn")
+        if role_arn:
+            return role_arn
+        return "*"
+
+    # --- Target-based (JSON body) services ---
+
+    if service == "events":
+        name = _safe_json_field(body, "Name") or _safe_json_field(body, "RuleName")
+        bus = _safe_json_field(body, "EventBusName") or "default"
+        if name:
+            return f"arn:aws:events:{region}:{account_id}:rule/{bus}/{name}"
+        bus_only = _safe_json_field(body, "EventBusName")
+        if bus_only:
+            if bus_only.startswith("arn:"):
+                return bus_only
+            return f"arn:aws:events:{region}:{account_id}:event-bus/{bus_only}"
+        return "*"
+
+    if service == "states":
+        arn = _safe_json_field(body, "stateMachineArn")
+        if arn:
+            return arn
+        arn = _safe_json_field(body, "executionArn")
+        if arn:
+            return arn
+        arn = _safe_json_field(body, "activityArn")
+        if arn:
+            return arn
+        name = _safe_json_field(body, "name")
+        if name:
+            return f"arn:aws:states:{region}:{account_id}:stateMachine:{name}"
+        return "*"
+
+    if service == "kinesis":
+        arn = _safe_json_field(body, "StreamARN")
+        if arn:
+            return arn
+        name = _safe_json_field(body, "StreamName")
+        if name:
+            return f"arn:aws:kinesis:{region}:{account_id}:stream/{name}"
+        return "*"
+
+    if service == "logs":
+        name = _safe_json_field(body, "logGroupName")
+        if name:
+            return f"arn:aws:logs:{region}:{account_id}:log-group:{name}"
+        return "*"
+
+    if service == "glue":
+        db = _safe_json_field(body, "DatabaseName")
+        if db:
+            return f"arn:aws:glue:{region}:{account_id}:database/{db}"
+        name = _safe_json_field(body, "Name")
+        if name:
+            return f"arn:aws:glue:{region}:{account_id}:table/{name}"
+        crawler = _safe_json_field(body, "CrawlerName")
+        if crawler:
+            return f"arn:aws:glue:{region}:{account_id}:crawler/{crawler}"
+        job = _safe_json_field(body, "JobName")
+        if job:
+            return f"arn:aws:glue:{region}:{account_id}:job/{job}"
+        return f"arn:aws:glue:{region}:{account_id}:catalog"
+
+    if service == "codebuild":
+        name = _safe_json_field(body, "projectName") or _safe_json_field(body, "name")
+        if name:
+            return f"arn:aws:codebuild:{region}:{account_id}:project/{name}"
+        return "*"
+
+    if service == "ecr":
+        name = _safe_json_field(body, "repositoryName")
+        if name:
+            return f"arn:aws:ecr:{region}:{account_id}:repository/{name}"
+        return "*"
+
+    if service == "config":
+        name = _safe_json_field(body, "ConfigRuleName")
+        if name:
+            return f"arn:aws:config:{region}:{account_id}:config-rule/{name}"
+        return "*"
+
+    if service == "athena":
+        wg = _safe_json_field(body, "WorkGroup")
+        if wg:
+            return f"arn:aws:athena:{region}:{account_id}:workgroup/{wg}"
+        return "*"
+
+    if service == "servicediscovery":
+        sid = _safe_json_field(body, "ServiceId") or _safe_json_field(body, "Id")
+        if sid:
+            return f"arn:aws:servicediscovery:{region}:{account_id}:service/{sid}"
+        nid = _safe_json_field(body, "NamespaceId")
+        if nid:
+            return f"arn:aws:servicediscovery:{region}:{account_id}:namespace/{nid}"
+        name = _safe_json_field(body, "Name")
+        if name:
+            return f"arn:aws:servicediscovery:{region}:{account_id}:namespace/{name}"
+        return "*"
+
+    if service == "opensearch":
+        name = _safe_json_field(body, "DomainName")
+        if name:
+            return f"arn:aws:es:{region}:{account_id}:domain/{name}"
+        return "*"
+
+    if service == "organizations":
+        return f"arn:aws:organizations::{account_id}:organization/*"
+
+    if service == "wafv2":
+        arn = _safe_json_field(body, "ARN")
+        if arn:
+            return arn
+        name = _safe_json_field(body, "Name")
+        if name:
+            scope = _safe_json_field(body, "Scope") or "REGIONAL"
+            prefix = "regional" if scope == "REGIONAL" else "global"
+            return f"arn:aws:wafv2:{region}:{account_id}:{prefix}/webacl/{name}/*"
+        return "*"
+
+    if service in ("elasticmapreduce", "emr"):
+        cid = _safe_json_field(body, "ClusterId") or _safe_json_field(body, "JobFlowId")
+        if cid:
+            return f"arn:aws:elasticmapreduce:{region}:{account_id}:cluster/{cid}"
+        name = _safe_json_field(body, "Name")
+        if name:
+            return f"arn:aws:elasticmapreduce:{region}:{account_id}:cluster/*"
+        return "*"
+
+    if service == "transfer":
+        sid = _safe_json_field(body, "ServerId")
+        if sid:
+            return f"arn:aws:transfer:{region}:{account_id}:server/{sid}"
+        return "*"
+
+    if service == "firehose":
+        name = _safe_json_field(body, "DeliveryStreamName")
+        if name:
+            return f"arn:aws:firehose:{region}:{account_id}:deliverystream/{name}"
+        return "*"
+
+    if service == "backup":
+        vault = _safe_json_field(body, "BackupVaultName")
+        if vault:
+            return f"arn:aws:backup:{region}:{account_id}:backup-vault:{vault}"
+        return "*"
+
+    # --- Target-based services using JSON body for ECS/EKS ---
+
+    if service == "ecs":
+        cluster = _safe_json_field(body, "cluster")
+        if cluster:
+            if cluster.startswith("arn:"):
+                return cluster
+            return f"arn:aws:ecs:{region}:{account_id}:cluster/{cluster}"
+        task_def = _safe_json_field(body, "taskDefinition")
+        if task_def:
+            if task_def.startswith("arn:"):
+                return task_def
+            return f"arn:aws:ecs:{region}:{account_id}:task-definition/{task_def}"
+        service_name = _safe_json_field(body, "serviceName")
+        if service_name:
+            return f"arn:aws:ecs:{region}:{account_id}:service/*/{service_name}"
+        return "*"
+
+    if service == "eks":
+        name = _safe_json_field(body, "name")
+        if not name:
+            # EKS REST: /clusters/{name}
+            parts = [p for p in path.split("/") if p]
+            if "clusters" in parts:
+                ci = parts.index("clusters")
+                if ci + 1 < len(parts):
+                    name = parts[ci + 1]
+        if name:
+            return f"arn:aws:eks:{region}:{account_id}:cluster/{name}"
+        return "*"
+
+    # --- Query-based services ---
+
+    if service == "acm":
+        arn = _query_param(query_params, "CertificateArn")
+        if arn:
+            return arn
+        return "*"
+
+    if service == "cloudformation":
+        name = _query_param(query_params, "StackName")
+        if name:
+            if name.startswith("arn:"):
+                return name
+            return f"arn:aws:cloudformation:{region}:{account_id}:stack/{name}/*"
+        return "*"
+
+    if service == "monitoring":
+        # CloudWatch alarms
+        name = _query_param(query_params, "AlarmName")
+        if name:
+            return f"arn:aws:cloudwatch:{region}:{account_id}:alarm:{name}"
+        ns = _query_param(query_params, "Namespace")
+        if ns:
+            return "*"  # Metrics don't have individual ARNs
+        return "*"
+
+    if service == "autoscaling":
+        name = _query_param(query_params, "AutoScalingGroupName")
+        if name:
+            return f"arn:aws:autoscaling:{region}:{account_id}:autoScalingGroup:*:autoScalingGroupName/{name}"
+        return "*"
+
+    if service == "elasticache":
+        cid = _query_param(query_params, "CacheClusterId")
+        if cid:
+            return f"arn:aws:elasticache:{region}:{account_id}:cluster:{cid}"
+        rgid = _query_param(query_params, "ReplicationGroupId")
+        if rgid:
+            return f"arn:aws:elasticache:{region}:{account_id}:replicationgroup:{rgid}"
+        return "*"
+
+    if service == "elasticloadbalancing":
+        arn = _query_param(query_params, "LoadBalancerArn")
+        if arn:
+            return arn
+        arn = _query_param(query_params, "TargetGroupArn")
+        if arn:
+            return arn
+        arn = _query_param(query_params, "ListenerArn")
+        if arn:
+            return arn
+        return "*"
+
+    if service == "rds":
+        name = _query_param(query_params, "DBInstanceIdentifier")
+        if name:
+            return f"arn:aws:rds:{region}:{account_id}:db:{name}"
+        name = _query_param(query_params, "DBClusterIdentifier")
+        if name:
+            return f"arn:aws:rds:{region}:{account_id}:cluster:{name}"
+        return "*"
+
+    if service == "ses":
+        identity = _query_param(query_params, "Identity")
+        if identity:
+            return f"arn:aws:ses:{region}:{account_id}:identity/{identity}"
+        return "*"
+
+    if service == "ssm":
+        name = _query_param(query_params, "Name")
+        if name:
+            return f"arn:aws:ssm:{region}:{account_id}:parameter{name if name.startswith('/') else '/' + name}"
+        return "*"
+
+    if service == "route53":
+        zone_id = _query_param(query_params, "HostedZoneId")
+        if not zone_id:
+            # REST: /2013-04-01/hostedzone/{id}
+            parts = [p for p in path.split("/") if p]
+            if "hostedzone" in parts:
+                hi = parts.index("hostedzone")
+                if hi + 1 < len(parts):
+                    zone_id = parts[hi + 1]
+        if zone_id:
+            return f"arn:aws:route53:::hostedzone/{zone_id}"
+        return "*"
+
+    if service == "cloudfront":
+        # REST: /2020-05-31/distribution/{id}
+        parts = [p for p in path.split("/") if p]
+        if "distribution" in parts:
+            di = parts.index("distribution")
+            if di + 1 < len(parts):
+                return f"arn:aws:cloudfront::{account_id}:distribution/{parts[di + 1]}"
+        return "*"
+
+    if service in ("cognito-idp", "cognito_idp"):
+        pool_id = _safe_json_field(body, "UserPoolId")
+        if pool_id:
+            return f"arn:aws:cognito-idp:{region}:{account_id}:userpool/{pool_id}"
+        return "*"
+
+    if service in ("cognito-identity", "cognito_identity"):
+        pool_id = _safe_json_field(body, "IdentityPoolId")
+        if pool_id:
+            return f"arn:aws:cognito-identity:{region}:{account_id}:identitypool/{pool_id}"
+        return "*"
+
+    return "*"
+
+
 def access_denied_response(service: str, action: str, principal_arn: str,
                            request_id: str, *, error_code: str = "",
                            message: str = "") -> tuple:

@@ -699,6 +699,165 @@ class TestEnforce:
 # Action extraction
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Resource ARN construction
+# ---------------------------------------------------------------------------
+
+class TestResourceArn:
+    def test_s3_bucket(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("s3", "PUT", "/mybucket", {}, b"", {}, "us-east-1", "123") == "arn:aws:s3:::mybucket"
+
+    def test_s3_object(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("s3", "GET", "/mybucket/path/to/key", {}, b"", {}, "us-east-1", "123") == "arn:aws:s3:::mybucket/path/to/key"
+
+    def test_s3_list_buckets(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("s3", "GET", "/", {}, b"", {}, "us-east-1", "123") == "*"
+
+    def test_dynamodb_table(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        body = json.dumps({"TableName": "users"}).encode()
+        assert extract_resource_arn("dynamodb", "POST", "/", {}, body, {}, "us-east-1", "123") == "arn:aws:dynamodb:us-east-1:123:table/users"
+
+    def test_dynamodb_no_table(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("dynamodb", "POST", "/", {}, b"{}", {}, "us-east-1", "123") == "*"
+
+    def test_lambda_function(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("lambda", "GET", "/2015-03-31/functions/my-func", {}, b"", {}, "us-east-1", "123") == "arn:aws:lambda:us-east-1:123:function:my-func"
+
+    def test_lambda_invoke(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("lambda", "POST", "/2015-03-31/functions/my-func/invocations", {}, b"", {}, "us-east-1", "123") == "arn:aws:lambda:us-east-1:123:function:my-func"
+
+    def test_sqs_queue_url(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("sqs", "POST", "/", {}, b"", {"QueueUrl": ["http://localhost:4566/000000000000/my-queue"]}, "us-east-1", "123") == "arn:aws:sqs:us-east-1:123:my-queue"
+
+    def test_sqs_create_queue(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("sqs", "POST", "/", {}, b"", {"QueueName": ["my-queue"]}, "us-east-1", "123") == "arn:aws:sqs:us-east-1:123:my-queue"
+
+    def test_sns_topic_arn(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        topic = "arn:aws:sns:us-east-1:123:my-topic"
+        assert extract_resource_arn("sns", "POST", "/", {}, b"", {"TopicArn": [topic]}, "us-east-1", "123") == topic
+
+    def test_kms_key_id(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        body = json.dumps({"KeyId": "abc-123"}).encode()
+        assert extract_resource_arn("kms", "POST", "/", {}, body, {}, "us-east-1", "123") == "arn:aws:kms:us-east-1:123:key/abc-123"
+
+    def test_kms_alias(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        body = json.dumps({"KeyId": "alias/my-key"}).encode()
+        assert extract_resource_arn("kms", "POST", "/", {}, body, {}, "us-east-1", "123") == "arn:aws:kms:us-east-1:123:alias/my-key"
+
+    def test_secretsmanager(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        body = json.dumps({"SecretId": "my-secret"}).encode()
+        assert extract_resource_arn("secretsmanager", "POST", "/", {}, body, {}, "us-east-1", "123") == "arn:aws:secretsmanager:us-east-1:123:secret:my-secret"
+
+    def test_iam_role(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("iam", "POST", "/", {}, b"", {"RoleName": ["my-role"]}, "us-east-1", "123") == "arn:aws:iam::123:role/my-role"
+
+    def test_iam_user(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("iam", "POST", "/", {}, b"", {"UserName": ["alice"]}, "us-east-1", "123") == "arn:aws:iam::123:user/alice"
+
+    def test_unknown_service(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("unknown", "GET", "/", {}, b"", {}, "us-east-1", "123") == "*"
+
+    def test_events_rule(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        body = json.dumps({"Name": "my-rule"}).encode()
+        arn = extract_resource_arn("events", "POST", "/", {}, body, {}, "us-east-1", "123")
+        assert "events" in arn and "my-rule" in arn
+
+    def test_kinesis_stream(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        body = json.dumps({"StreamName": "my-stream"}).encode()
+        assert extract_resource_arn("kinesis", "POST", "/", {}, body, {}, "us-east-1", "123") == "arn:aws:kinesis:us-east-1:123:stream/my-stream"
+
+    def test_logs_group(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        body = json.dumps({"logGroupName": "/app/logs"}).encode()
+        assert extract_resource_arn("logs", "POST", "/", {}, body, {}, "us-east-1", "123") == "arn:aws:logs:us-east-1:123:log-group:/app/logs"
+
+    def test_states_machine(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        body = json.dumps({"stateMachineArn": "arn:aws:states:us-east-1:123:stateMachine:my-sm"}).encode()
+        assert extract_resource_arn("states", "POST", "/", {}, body, {}, "us-east-1", "123") == "arn:aws:states:us-east-1:123:stateMachine:my-sm"
+
+    def test_ecs_cluster(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        body = json.dumps({"cluster": "my-cluster"}).encode()
+        assert extract_resource_arn("ecs", "POST", "/", {}, body, {}, "us-east-1", "123") == "arn:aws:ecs:us-east-1:123:cluster/my-cluster"
+
+    def test_eks_cluster_from_path(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("eks", "GET", "/clusters/prod", {}, b"", {}, "us-east-1", "123") == "arn:aws:eks:us-east-1:123:cluster/prod"
+
+    def test_rds_instance(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("rds", "POST", "/", {}, b"", {"DBInstanceIdentifier": ["mydb"]}, "us-east-1", "123") == "arn:aws:rds:us-east-1:123:db:mydb"
+
+    def test_cloudformation_stack(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("cloudformation", "POST", "/", {}, b"", {"StackName": ["my-stack"]}, "us-east-1", "123") == "arn:aws:cloudformation:us-east-1:123:stack/my-stack/*"
+
+    def test_ssm_parameter(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("ssm", "POST", "/", {}, b"", {"Name": ["/app/config"]}, "us-east-1", "123") == "arn:aws:ssm:us-east-1:123:parameter/app/config"
+
+    def test_elb_passthrough_arn(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        lb_arn = "arn:aws:elasticloadbalancing:us-east-1:123:loadbalancer/app/my-lb/abc"
+        assert extract_resource_arn("elasticloadbalancing", "POST", "/", {}, b"", {"LoadBalancerArn": [lb_arn]}, "us-east-1", "123") == lb_arn
+
+    def test_cloudfront_distribution(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("cloudfront", "GET", "/2020-05-31/distribution/E123ABC", {}, b"", {}, "us-east-1", "123") == "arn:aws:cloudfront::123:distribution/E123ABC"
+
+    def test_route53_hostedzone(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("route53", "GET", "/2013-04-01/hostedzone/Z123", {}, b"", {}, "us-east-1", "123") == "arn:aws:route53:::hostedzone/Z123"
+
+    def test_cognito_userpool(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        body = json.dumps({"UserPoolId": "us-east-1_abc123"}).encode()
+        assert extract_resource_arn("cognito-idp", "POST", "/", {}, body, {}, "us-east-1", "123") == "arn:aws:cognito-idp:us-east-1:123:userpool/us-east-1_abc123"
+
+    def test_resource_scoped_policy_enforcement(self):
+        """A policy allowing s3:GetObject only on mybucket/* should deny access to otherbucket."""
+        stmts = parse_policy_document({"Statement": [{
+            "Effect": "Allow", "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::mybucket/*"
+        }]})
+        ctx_allowed = _ctx(action="s3:GetObject", resource="arn:aws:s3:::mybucket/key")
+        assert evaluate(ctx_allowed, [stmts]).decision == "Allow"
+        ctx_denied = _ctx(action="s3:GetObject", resource="arn:aws:s3:::otherbucket/key")
+        assert evaluate(ctx_denied, [stmts]).decision == "ImplicitDeny"
+
+    def test_resource_wildcard_in_arn(self):
+        """Wildcards in resource ARNs work."""
+        stmts = parse_policy_document({"Statement": [{
+            "Effect": "Allow", "Action": "dynamodb:*",
+            "Resource": "arn:aws:dynamodb:*:*:table/users*"
+        }]})
+        ctx = _ctx(action="dynamodb:PutItem",
+                   resource="arn:aws:dynamodb:us-east-1:123:table/users")
+        assert evaluate(ctx, [stmts]).decision == "Allow"
+        ctx2 = _ctx(action="dynamodb:PutItem",
+                    resource="arn:aws:dynamodb:us-east-1:123:table/orders")
+        assert evaluate(ctx2, [stmts]).decision == "ImplicitDeny"
+
+
 class TestActionExtraction:
     def test_query_protocol(self):
         from ministack.core.iam_actions import extract_iam_action
