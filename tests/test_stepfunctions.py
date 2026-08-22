@@ -11,7 +11,7 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from conftest import ENDPOINT
+from conftest import ENDPOINT, LoopProbe, concurrent_burst
 
 
 def _make_zip(code: str) -> bytes:
@@ -7523,3 +7523,33 @@ def test_sfn_jsonata_format_number(sfn_sync):
         "neg_sub": "(1,234.50)",
         "plain": "1,234",
     }
+
+
+# ---------------------------------------------------------------------------
+# Re-entrancy under concurrency — the rest of the suite issues one request at
+# a time, so a service whose blocking work is misclassified passes serially
+# and only wedges under load. These fire N callers at once and assert both
+# that every caller completes and that the event loop keeps serving.
+# ---------------------------------------------------------------------------
+@pytest.mark.serial
+def test_concurrent_sync_executions_do_not_block_the_loop(sfn, sfn_sync):
+    """StartSyncExecution runs off the loop; N at once must not stall the server."""
+    definition = json.dumps({
+        "StartAt": "Wait",
+        "States": {"Wait": {"Type": "Wait", "Seconds": 1, "Next": "Done"},
+                   "Done": {"Type": "Pass", "End": True}},
+    })
+    arn = sfn.create_state_machine(
+        name=f"conc-sync-{_uuid_mod.uuid4().hex[:8]}", definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )["stateMachineArn"]
+
+    def run(i):
+        return sfn_sync.start_sync_execution(
+            stateMachineArn=arn, input=json.dumps({"i": i}))["status"]
+
+    with LoopProbe() as probe:
+        statuses = concurrent_burst(run)
+    probe.assert_responsive("sync execution burst")
+
+    assert all(s == "SUCCEEDED" for s in statuses), f"sync executions returned {set(statuses)}"

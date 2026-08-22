@@ -31,7 +31,8 @@ import time
 from urllib.parse import parse_qs
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.concurrency import run_reentrant
+from ministack.core.persistence import load_state
 from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("alb")
@@ -1268,7 +1269,8 @@ async def _invoke_lambda_target(function_ref, tg_arn, method, path, headers, bod
         )
         return invocation_result
 
-    exec_result = await asyncio.to_thread(_invoke_and_record_metrics)
+    exec_result = await run_reentrant(_invoke_and_record_metrics,
+                                      thread_name="ministack-alb-invoke")
     lambda_response, _err = lambda_svc.lambda_execute_result_to_api_proxy_response(exec_result)
 
     if exec_result.get("error"):

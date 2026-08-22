@@ -18,6 +18,7 @@ State is account- and region-scoped via AccountRegionScopedDict, except tags
 which stay account-scoped because their ARN keys embed region.
 """
 
+import contextvars
 import copy
 import json
 import logging
@@ -26,7 +27,9 @@ import re
 import threading
 import time
 
+from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import resource_lock, run_offloop, spawn_background
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -141,7 +144,7 @@ def reset():
         ):
             try:
                 c.stop(timeout=2)
-                c.remove(force=True)
+                c.remove(force=True, v=True)
             except Exception:
                 pass
 
@@ -307,12 +310,17 @@ def _now() -> int:
 # Docker container management
 # ---------------------------------------------------------------------------
 
+# Cap any single Docker daemon call. docker-py defaults to 60s, which turns a
+# slow or wedged daemon into a minutes-long stall on a request path.
+_DOCKER_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
+
+
 def _get_docker():
     global _docker_client
     if _docker_client is None:
         try:
             import docker
-            _docker_client = docker.from_env()
+            _docker_client = docker.from_env(timeout=_DOCKER_TIMEOUT)
         except Exception:
             pass
     return _docker_client
@@ -324,6 +332,33 @@ def _container_name(domain_name: str) -> str:
 
 def _dashboards_container_name(domain_name: str) -> str:
     return f"ministack-opensearch-dashboards-{get_region()}-{domain_name}"
+
+
+def _image_is_local(docker_client, image: str) -> bool:
+    """True when the image is already pulled.
+
+    ``containers.run`` auto-pulls on ImageNotFound, so a cold cache would block
+    CreateDomain for the length of the pull — the OpenSearch image is ~1 GB.
+    AWS reports ``Processing`` and provisions asynchronously.
+    """
+    try:
+        docker_client.images.get(image)
+        return True
+    except Exception:
+        return False
+
+
+def _remove_container_by_id(cid: str) -> None:
+    """Best-effort teardown of a container we started but no longer own."""
+    docker = _get_docker()
+    if not docker or not cid:
+        return
+    try:
+        c = docker.containers.get(cid)
+        c.stop(timeout=2)
+        c.remove(force=True, v=True)
+    except Exception:
+        pass
 
 
 def _spawn_dataplane(domain_name: str, engine_version: str):
@@ -358,6 +393,9 @@ def _spawn_dataplane(domain_name: str, engine_version: str):
 
     image = apply_image_prefix(DEFAULT_IMAGE)
     labels = {
+        # Standard label so the boot/shutdown orphan reap finds these; the
+        # com.ministack.* keys below are what the service's own lookups use.
+        **container_reaper.own_labels("opensearch"),
         "com.ministack.service": "opensearch",
         "com.ministack.domain": domain_name,
         "com.ministack.region": get_region(),
@@ -441,7 +479,7 @@ def _teardown_dataplane(rec: dict) -> None:
         try:
             c = docker.containers.get(cid)
             c.stop(timeout=2)
-            c.remove(force=True)
+            c.remove(force=True, v=True)
         except Exception:
             pass
 
@@ -455,7 +493,7 @@ def _teardown_named_dataplane(domain_name: str) -> None:
         try:
             c = docker.containers.get(name)
             c.stop(timeout=2)
-            c.remove(force=True)
+            c.remove(force=True, v=True)
         except Exception:
             pass
 
@@ -568,7 +606,15 @@ def _new_domain_record(name, payload):
     ebs_opts = _default_ebs_options(payload.get("EBSOptions"))
     access_policies = payload.get("AccessPolicies", "")
 
-    host, port, cid, dash_endpoint, dash_cid = _spawn_dataplane(name, engine_version)
+    _dc = _get_docker() if DATAPLANE_ENABLED else None
+    _deferred = bool(_dc) and not _image_is_local(_dc, apply_image_prefix(DEFAULT_IMAGE))
+    if _deferred:
+        # Cold image cache: the OpenSearch image is ~1 GB and pulling it inside
+        # CreateDomain would block the API for minutes. AWS reports
+        # Processing=True and provisions asynchronously; do the same.
+        host, port, cid, dash_endpoint, dash_cid = "localhost", BASE_PORT, None, None, None
+    else:
+        host, port, cid, dash_endpoint, dash_cid = _spawn_dataplane(name, engine_version)
     endpoint = f"{host}:{port}"
 
     rec = {
@@ -578,7 +624,7 @@ def _new_domain_record(name, payload):
         "Created": True,
         "Deleted": False,
         "Endpoint": endpoint,
-        "Processing": False,
+        "Processing": _deferred,
         "UpgradeProcessing": False,
         "EngineVersion": engine_version,
         "ClusterConfig": cluster_cfg,
@@ -630,6 +676,47 @@ def _new_domain_record(name, payload):
     _set_vpc_options(rec, payload.get("VPCOptions"))
     if dash_endpoint:
         rec["DashboardEndpoint"] = dash_endpoint
+    if _deferred:
+        # Pull + start off the request path. The domain reports Processing=True
+        # until this lands, exactly as AWS does.
+        created_record = rec
+
+        def _finish_domain_start():
+            try:
+                h, pt, cid2, _dep, _dcid = _spawn_dataplane(name, engine_version)
+            except Exception:
+                logger.warning("OpenSearch: deferred dataplane start failed for %s", name)
+                h = pt = cid2 = None
+            # Publish under the lock: a DeleteDomain must not land between the
+            # existence check and the write. Identity, not truthiness — a domain
+            # recreated under the same name is a different resource.
+            with resource_lock("opensearch", name):
+                live = _domains.get(name)
+                orphaned = live is not created_record or live.get("_deleting")
+                if not orphaned:
+                    if h:
+                        # Both keys. Readers prefer `_Endpoint`, and create left
+                        # it at the `localhost:BASE_PORT` placeholder, so
+                        # writing only `Endpoint` left Describe reporting an
+                        # address nothing listens on — the same defect reported
+                        # against ElastiCache.
+                        endpoint = f"{h}:{pt}"
+                        live["Endpoint"] = endpoint
+                        live["_Endpoint"] = endpoint
+                        live["_container_id"] = cid2
+                        live["_ContainerId"] = cid2
+                    live["Processing"] = False
+            if orphaned and cid2:
+                # Nothing references it and the reaper never touches a running
+                # container. Outside the lock: Docker calls never hold it.
+                _remove_container_by_id(cid2)
+
+        # Handed to the caller rather than started here: this function builds
+        # the record, and `_domains[name]` is not assigned until afterwards. A
+        # finisher started now can win that race, find no record, and tear down
+        # the container it just created — the domain then never becomes
+        # available. Started once the record is registered.
+        rec["_deferred_start"] = _finish_domain_start
     return rec
 
 
@@ -759,6 +846,12 @@ def create_domain_record(payload, compatibility_properties=None):
             _tags[rec["ARN"]] = tags
         else:
             _tags.pop(rec["ARN"], None)
+        # Only now — the finisher looks the record up by name and reclaims what
+        # it started if it is not there, so it must not run before this.
+        deferred_start = rec.pop("_deferred_start", None)
+        if deferred_start is not None:
+            spawn_background(contextvars.copy_context().run, deferred_start,
+                             thread_name=f"ministack-opensearch-start-{name}")
         return rec
     except Exception:
         if rec is not None:
@@ -825,7 +918,12 @@ def update_domain_from_cloudformation(name, payload, compatibility_properties):
 
 def delete_domain_record(name, missing_ok=False):
     """Delete all domain-owned state and containers, optionally idempotently."""
-    rec = _domains.pop(name, None)
+    # Claim under the lock so a deferred start cannot publish into a record we
+    # are removing. Teardown itself stays outside — it calls Docker.
+    with resource_lock("opensearch", name):
+        rec = _domains.pop(name, None)
+        if rec:
+            rec["_deleting"] = True
     if not rec and not missing_ok:
         raise OpenSearchServiceError(
             404, "ResourceNotFoundException", f"Domain not found: {name}"
@@ -1255,7 +1353,7 @@ async def handle_request(method, path, headers, body_bytes, query_params):
         if method == "GET":
             return _describe_domain_config(name)
         if method == "POST":
-            return _update_domain_config(name, payload)
+            return await run_offloop(_update_domain_config, name, payload)
 
     m = _DOMAIN_PROGRESS_RE.match(path)
     if method == "GET" and m:
@@ -1263,13 +1361,30 @@ async def handle_request(method, path, headers, body_bytes, query_params):
 
     m = _DOMAIN_RE.match(path)
     if method == "POST" and m and m.group("name") is None:
-        return _create_domain(payload)
+        # Spawns the OpenSearch (and Dashboards) container: seconds warm,
+        # minutes on a cold pull, and it holds the loop for every other
+        # service meanwhile. Shared pool — an OpenSearch node never calls
+        # back into MiniStack, so this cannot re-enter.
+        return await run_offloop(_create_domain, payload)
     if m and m.group("name"):
         name = m.group("name")
         if method == "GET":
             return _describe_domain(name)
         if method == "DELETE":
-            return _delete_domain(name)
+            return await run_offloop(_delete_domain, name)
 
     return _error(400, "InvalidAction",
                   f"OpenSearch operation not implemented: {method} {path}")
+
+
+def _live_container_ids():
+    ids = set()
+    for _key, rec in _domains.all_items():
+        for field in ("_container_id", "_dashboards_container_id"):
+            cid = rec.get(field)
+            if cid:
+                ids.add(cid)
+    return ids
+
+
+container_reaper.register_live_ids("opensearch", _live_container_ids)
