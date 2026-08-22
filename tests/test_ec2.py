@@ -3673,8 +3673,18 @@ class _FakeContainer:
         self._registry.pop(self.name, None)
 
 
-def _fake_docker(run_error=None, shell=True):
+def _fake_docker(run_error=None, shell=True, entrypoint=None):
     registry, runs = {}, []
+
+    class _FakeImage:
+        attrs = {"Config": {"Entrypoint": entrypoint}}
+
+    class _Images:
+        def get(self, ref):
+            return _FakeImage()
+
+        def pull(self, ref):
+            return _FakeImage()
 
     class _Containers:
         def run(self, image, **kwargs):
@@ -3704,6 +3714,7 @@ def _fake_docker(run_error=None, shell=True):
     class _Docker:
         def __init__(self):
             self.containers = _Containers()
+            self.images = _Images()
 
         def ping(self):
             return True
@@ -4130,3 +4141,55 @@ def test_ec2_deregister_does_not_orphan_a_running_box(vm):
     fake._registry[inst["_container_id"]].status = "exited"
     ec2mod._vm_reconcile_running([inst])
     assert inst["State"]["Name"] == "terminated"
+
+
+def test_ec2_base_image_gets_a_keepalive(vm):
+    """A base image's command is a shell that exits at once, so the box needs keeping alive."""
+    fake, created = vm
+    ami = _register("example/base:1")
+    iids, _ = _launch(ami)
+    created.extend(iids)
+    assert fake._runs[0]["command"] == ["sleep", "infinity"]
+
+
+def test_ec2_image_with_an_entrypoint_is_left_alone(monkeypatch):
+    """Overriding the command of an image built to run a service would stop it ever starting."""
+    fake = _fake_docker(entrypoint=["/docker-entrypoint.sh"])
+    monkeypatch.setattr(ec2mod, "_get_docker", lambda: fake)
+    monkeypatch.setattr(ec2mod, "_get_ministack_network", lambda _c: "testnet")
+    ami = _register("example/service:1")
+    iids, _ = _launch(ami)
+    try:
+        assert "command" not in fake._runs[0]
+        assert fake._runs[0]["init"] is True
+    finally:
+        for iid in iids:
+            ec2mod._instances.pop(iid, None)
+        ec2mod._images.pop(ami, None)
+
+
+def test_ec2_describe_images_scopes_by_owner(ec2):
+    """Owner.N: account ids and `self` select ours; an alias or another account selects nothing."""
+    ami = ec2.register_image(Name=f"owned-{_uuid_mod.uuid4().hex[:8]}",
+                             ImageLocation="alpine:3")["ImageId"]
+    try:
+        assert ami in [i["ImageId"] for i in ec2.describe_images(Owners=["self"])["Images"]]
+        assert ami in [i["ImageId"] for i in
+                       ec2.describe_images(Owners=["000000000000"])["Images"]]
+        for scope in (["amazon"], ["aws-marketplace"], ["123456789012"]):
+            assert ec2.describe_images(Owners=scope)["Images"] == [], scope
+    finally:
+        ec2.deregister_image(ImageId=ami)
+
+
+def test_ec2_describe_images_scopes_by_executable_by(ec2):
+    """ExecutableBy.N: `all` is the public images; nothing is shared with anyone here."""
+    ami = ec2.register_image(Name=f"exec-{_uuid_mod.uuid4().hex[:8]}",
+                             ImageLocation="alpine:3")["ImageId"]
+    try:
+        public = [i["ImageId"] for i in ec2.describe_images(ExecutableUsers=["all"])["Images"]]
+        assert "ami-0abcdef1234567890" in public
+        assert ami not in public
+        assert ec2.describe_images(ExecutableUsers=["self"])["Images"] == []
+    finally:
+        ec2.deregister_image(ImageId=ami)

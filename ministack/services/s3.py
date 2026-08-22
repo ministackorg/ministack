@@ -3805,16 +3805,26 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None,
     if bucket is None:
         return _no_such_bucket(bucket_name)
 
-    # Conditional delete: If-Match against the current object's ETag. An
-    # object whose ETag differs fails the precondition with 412 and stays —
-    # S3's compare-and-swap delete.  A key that is not there at all is not a
-    # failed precondition: deleting one is a success either way, and S3
-    # answers the conditional delete of an absent key 204 like any other.
+    # Conditional delete. Measured against S3 in eu-west-1: the condition is
+    # evaluated against the current object and nothing else, matching the
+    # guide's "Conditional delete evaluations only apply to the current
+    # version of the object."
+    #
+    #   no current object (absent, or a delete marker on top)  -> 404 NoSuchKey
+    #   current object, ETag differs                           -> 412
+    #   current object, matching ETag or If-Match: *           -> 204
+    #
+    # S3 does not look under a delete marker, so a key whose history still
+    # holds a real version is as gone as one that was never written. An
+    # absent key is not an already-completed delete either: the request is
+    # conditional, and there is nothing for the condition to hold against.
     if_match = (headers.get("if-match") or "").strip()
     if if_match:
         _cur = bucket["objects"].get(key)
-        if _cur is not None and if_match != "*" and (
-                if_match.strip('"') != _cur["etag"].strip('"')):
+        if _cur is None:
+            return _error("NoSuchKey", "The specified key does not exist.",
+                          404, f"/{bucket_name}/{key}")
+        if if_match != "*" and if_match.strip('"') != _cur["etag"].strip('"'):
             return _error(
                 "PreconditionFailed",
                 "At least one of the preconditions you specified did not hold.",
@@ -5022,14 +5032,28 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
                 })
                 continue
 
-        # Conditional delete: an ObjectIdentifier with an ETag deletes only if it
-        # matches the current object. On mismatch the key is reported under Error
-        # (PreconditionFailed), not Deleted, so the object survives.
+        # Conditional delete: an ObjectIdentifier carrying an ETag deletes only if it
+        # matches the current object, and `*` asks only that a current object exist.
+        # The condition is evaluated against the current version alone, so a key
+        # hidden by a delete marker does not exist for this purpose. A failed
+        # condition is reported under Error, not Deleted, and the object survives:
+        # "If the precondition fails then the response for that object will be
+        # captured in the <Error> element", and "If the object doesn't exist when
+        # evaluating either of the preconditions, S3 rejects the request and returns
+        # a Not Found error response."
         etag_el = _find_xml_tag(obj_el, "ETag")
         cond_etag = etag_el.text if (etag_el is not None and etag_el.text) else ""
         if cond_etag:
             _cur = bucket["objects"].get(k)
-            if _cur is None or cond_etag.strip('"') != _cur["etag"].strip('"'):
+            if _cur is None:
+                errors.append({
+                    "key": k,
+                    "version_id": version_id,
+                    "code": "NoSuchKey",
+                    "msg": "The specified key does not exist.",
+                })
+                continue
+            if cond_etag != "*" and cond_etag.strip('"') != _cur["etag"].strip('"'):
                 errors.append({
                     "key": k,
                     "version_id": version_id,

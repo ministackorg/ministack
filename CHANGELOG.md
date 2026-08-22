@@ -7,12 +7,14 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Fixed
-- **RDS — `DescribeDBInstances` honors SDK `Filters`** — AWS Query clients serialize filters as `Filters.Filter.N` with `Values.Value.N`, but MiniStack only parsed its internal `Filters.member.N` form, so filters such as `db-cluster-id` were ignored and unrelated instances were returned. Both wire forms are now parsed with the existing AND-across-filters and OR-across-values semantics.
 ### Added
 - **EC2 — instances can have a real box behind them (`RegisterImage`)** — `RunInstances` returned a `running` record and booted nothing. `RegisterImage` now takes a container reference in `ImageLocation` and returns an `ami-` id; launching that id boots the image as a container whose IP becomes the instance's address, so `ssm:SendCommand` can report a real exit code. Such an AMI is `instance-store` backed: no EBS root volume, `StopInstances` / `StartInstances` answer `UnsupportedOperation`, and a container that dies reports `terminated`. Snapshot-backed registration is accepted as AWS accepts it and fails at `RunInstances` with `InvalidAMIID.Unavailable`, as does a reference that cannot be pulled. Registering is the only opt-in — with nothing registered EC2 never reaches for Docker. Reported by @iot-rocket.
 - **SSM — Run Command** — `SendCommand`, `GetCommandInvocation`, `ListCommands` and `DescribeInstanceInformation` returned `InvalidAction`, so the standard instance health probe could not run. Invocations are asynchronous as on AWS: `SendCommand` answers `Pending` and the caller polls to a terminal state. `AWS-RunShellScript` runs in the instance's container, so `Status` is `Success` or `Failed` on the real exit code, with the script's output. An instance with no agent answering is refused with `InvalidInstanceId`. Contributed by @bandle.
 - **EC2 — `RebootInstances` rejects unknown instance ids** — it returned `true` for any id. It now answers `InvalidInstanceID.NotFound`, matching AWS.
+
+### Fixed
+- **RDS — `DescribeDBInstances` honors SDK `Filters`** — AWS Query clients serialize filters as `Filters.Filter.N` with `Values.Value.N`, but MiniStack only parsed its internal `Filters.member.N` form, so filters such as `db-cluster-id` were ignored and unrelated instances were returned. Both wire forms are now parsed with the existing AND-across-filters and OR-across-values semantics.
+- **S3 — a conditional delete of a key with no current object answers 404** — `DeleteObject` carrying `If-Match` returned 204 for a key that was absent, hidden by a delete marker, or held only delete markers, so a compare-and-swap delete reported success for work it never did. The condition is now evaluated against the current version and nothing else: no current object answers `NoSuchKey`, a differing ETag answers `PreconditionFailed`, and a matching ETag or `If-Match: *` deletes. `DeleteObjects` reports the same absent key under `<Error>` as `NoSuchKey` rather than `PreconditionFailed`, and honours `*` in the `ETag` element instead of comparing it literally.
 
 ## [1.4.21] — 2026-08-20
 

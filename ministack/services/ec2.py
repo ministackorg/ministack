@@ -1313,8 +1313,25 @@ def _image_bdm_xml(view):
     return f"<blockDeviceMapping>{items}</blockDeviceMapping>"
 
 
+def _image_owner_matches(view, owners):
+    """Owner.N: "a combination of AWS account IDs, self, amazon, aws-backup-vault, and
+    aws-marketplace". Every image here belongs to the calling account, so an alias or another
+    account's id matches nothing."""
+    account = get_account_id()
+    return view["OwnerId"] == account and any(o in ("self", account) for o in owners)
+
+
+def _image_executable_by_matches(view, users):
+    """ExecutableBy.N: "Specify an AWS account ID, self (the sender of the request), or all
+    (public AMIs)." Nothing here is shared by explicit launch permission, so only `all`
+    selects anything and it selects the public images."""
+    return "all" in users and view["IsPublic"] == "true"
+
+
 def _describe_images(p):
     filter_ids = _parse_member_list(p, "ImageId")
+    owners = _parse_member_list(p, "Owner")
+    executable_by = _parse_member_list(p, "ExecutableBy")
     filters = _parse_filters(p)
     # Registered images first: those are the ones that actually boot. The stubs
     # stay so a workload naming one keeps launching a metadata-only instance.
@@ -1325,6 +1342,10 @@ def _describe_images(p):
     items = ""
     for view in views:
         if filter_ids and view["ImageId"] not in filter_ids:
+            continue
+        if owners and not _image_owner_matches(view, owners):
+            continue
+        if executable_by and not _image_executable_by_matches(view, executable_by):
             continue
         if filters and not _image_matches_filters(view, filters):
             continue
@@ -1974,7 +1995,6 @@ def _register_image(p):
                       "'-', '_', '.', '/', '(', and ')'", 400)
     location = _p(p, "ImageLocation")
     mappings = _parse_register_block_device_mappings(p)
-    snapshot_backed = any(m.get("Ebs", {}).get("SnapshotId") for m in mappings)
     # Only Name is required on AWS: ImageLocation and BlockDeviceMapping.N are both optional, and
     # registration never checks that the result can boot. Refusing here would make MiniStack
     # stricter than AWS, so a registration with neither is accepted and fails at RunInstances.
@@ -2076,6 +2096,21 @@ def _is_image_unavailable(exc):
                               "no such image", "repository does not exist")))
 
 
+def _image_has_entrypoint(client, ref):
+    """Whether the image declares its own ENTRYPOINT, pulling it first if it is not local.
+
+    docker-py's ``containers.run`` would pull implicitly, but the decision needs the image
+    config before the container is created.
+    """
+    try:
+        image = client.images.get(ref)
+    except Exception:
+        image = client.images.pull(ref)
+        if isinstance(image, list):  # a tagless pull returns every tag
+            image = image[0]
+    return bool((image.attrs.get("Config") or {}).get("Entrypoint"))
+
+
 def _vm_launch(inst, image_ref):
     """Boot one instance record as a container. Raises on create/start failure;
     the caller backs the records out and surfaces the error."""
@@ -2088,6 +2123,7 @@ def _vm_launch(inst, image_ref):
         client.containers.get(name).remove(force=True)
     except Exception:
         pass  # no stale container by that name, which is the normal case
+    ref = apply_image_prefix(image_ref)
     kwargs = {
         "name": name,
         "detach": True,
@@ -2097,15 +2133,18 @@ def _vm_launch(inst, image_ref):
             "account_id": get_account_id(),
             "region": get_region(),
         },
-        # A real instance does not exit the moment it boots, so keep the
-        # container alive. An image with its own ENTRYPOINT receives this as
-        # argv and is free to ignore it; init reaps the keepalive.
+        # init reaps whatever PID 1 leaves behind, as an instance's own init would.
         "init": True,
-        "command": ["sleep", "infinity"],
     }
+    if not _image_has_entrypoint(client, ref):
+        # A base image's command is usually a shell, which exits at once and would take the
+        # instance down with it, so keep the box alive. An image that declares an ENTRYPOINT
+        # is left exactly as it was built: overriding its command would stop its service
+        # from ever starting.
+        kwargs["command"] = ["sleep", "infinity"]
     if network:
         kwargs["network"] = network
-    container = client.containers.run(apply_image_prefix(image_ref), **kwargs)
+    container = client.containers.run(ref, **kwargs)
     global _docker_in_use
     _docker_in_use = True
     inst["_container_id"] = container.id
