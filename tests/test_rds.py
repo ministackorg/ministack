@@ -268,6 +268,36 @@ def test_rds_describe_instances_v2(rds):
     assert len(resp2["DBInstances"]) == 1
     assert resp2["DBInstances"][0]["Engine"] == "mysql"
 
+
+def test_rds_describe_instances_filters_by_cluster(rds):
+    """The AWS Query wire form scopes instances to the requested clusters."""
+    cluster_ids = ["rds-filter-cluster-a", "rds-filter-cluster-b"]
+    instance_ids = ["rds-filter-instance-a", "rds-filter-instance-b"]
+    for cluster_id, instance_id in zip(cluster_ids, instance_ids):
+        rds.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-postgresql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )
+        rds.create_db_instance(
+            DBInstanceIdentifier=instance_id,
+            DBInstanceClass="db.t3.micro",
+            Engine="aurora-postgresql",
+            DBClusterIdentifier=cluster_id,
+        )
+
+    filtered = rds.describe_db_instances(
+        Filters=[{"Name": "db-cluster-id", "Values": [cluster_ids[0]]}],
+    )["DBInstances"]
+    assert [instance["DBInstanceIdentifier"] for instance in filtered] == [instance_ids[0]]
+
+    filtered = rds.describe_db_instances(
+        Filters=[{"Name": "db-cluster-id", "Values": cluster_ids}],
+    )["DBInstances"]
+    assert {instance["DBInstanceIdentifier"] for instance in filtered} == set(instance_ids)
+
+
 def test_rds_delete_instance_v2(rds):
     rds.create_db_instance(
         DBInstanceIdentifier="rds-del-v2",
@@ -1153,6 +1183,29 @@ def test_rds_describe_aurora_postgresql_engine_versions_by_family(rds):
         EngineVersion=UNSUPPORTED_AURORA_POSTGRESQL_ENGINE_VERSION,
     )["DBEngineVersions"]
     assert filtered == []
+
+
+def test_rds_describe_aurora_postgresql_engine_version_status(rds):
+    """SDK selection parameters must not drop DBEngineVersion.Status."""
+    family = "aurora-postgresql16"
+    family_response = rds.describe_db_engine_versions(
+        Engine="aurora-postgresql",
+        DBParameterGroupFamily=family,
+    )
+    family_versions = [
+        version
+        for version in family_response["DBEngineVersions"]
+        if version["DBParameterGroupFamily"] == family
+    ]
+    default_versions = rds.describe_db_engine_versions(
+        Engine="aurora-postgresql",
+        DefaultOnly=True,
+    )["DBEngineVersions"]
+
+    assert family_versions
+    assert default_versions
+    assert all(version["Status"] == "available" for version in family_versions)
+    assert all(version["Status"] == "available" for version in default_versions)
 
 
 def test_rds_aurora_mysql_create_rejects_unsupported_explicit_engine_version(rds):

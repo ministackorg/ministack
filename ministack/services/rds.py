@@ -7309,17 +7309,23 @@ def _parameter_group_parameters_xml(pg, source_filter):
 
 
 def _parse_filters(params):
-    """Parse Filters.member.N.Name / Filters.member.N.Values.member.M."""
+    """Parse AWS Query filters and the internal JSON-flattened member form."""
+    prefix = "Filters.Filter"
+    value_member = "Value"
+    if not _p(params, f"{prefix}.1.Name"):
+        prefix = "Filters.member"
+        value_member = "member"
+
     filters = {}
     i = 1
     while True:
-        name = _p(params, f"Filters.member.{i}.Name")
+        name = _p(params, f"{prefix}.{i}.Name")
         if not name:
             break
         values = []
         j = 1
         while True:
-            v = _p(params, f"Filters.member.{i}.Values.member.{j}")
+            v = _p(params, f"{prefix}.{i}.Values.{value_member}.{j}")
             if not v:
                 break
             values.append(v)
