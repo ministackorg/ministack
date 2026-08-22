@@ -26,6 +26,7 @@ import os
 import re
 import time
 
+from ministack.core.concurrency import run_reentrant
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -545,7 +546,7 @@ async def _authorize_event_op(
         if not token:
             return False, f"{operation} rejected: no Authorization token"
         namespace = _channel_namespace_for(channel) if channel else None
-        ok, _ctx = await asyncio.to_thread(
+        ok, _ctx = await run_reentrant(
             _events_authorizer_invoke,
             lambda_arn,
             api_id,
@@ -1145,7 +1146,7 @@ async def _handle_websocket_in_api_scope(
             ):
                 return
         else:
-            ok, connect_rctx = await asyncio.to_thread(
+            ok, connect_rctx = await run_reentrant(
                 _events_authorizer_invoke,
                 lambda_auth_arn,
                 api_id,

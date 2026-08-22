@@ -131,13 +131,15 @@ class AccountScopedDict:
         return self._scoped(key) in self._data
 
     def __len__(self):
-        return sum(1 for k in self._data if self._is_mine(k))
+        # Snapshot: a concurrent insert during a live walk raises
+        # RuntimeError("dictionary changed size during iteration").
+        return sum(1 for k in list(self._data) if self._is_mine(k))
 
     def __bool__(self):
-        return any(self._is_mine(k) for k in self._data)
+        return any(self._is_mine(k) for k in list(self._data))
 
     def __iter__(self):
-        for k in self._data:
+        for k in list(self._data):
             if self._is_mine(k):
                 yield self._unscope(k)
 
@@ -163,13 +165,13 @@ class AccountScopedDict:
         return self._data.setdefault(self._scoped(key), default)
 
     def keys(self):
-        return [self._unscope(k) for k in self._data if self._is_mine(k)]
+        return [self._unscope(k) for k in list(self._data) if self._is_mine(k)]
 
     def values(self):
-        return [v for k, v in self._data.items() if self._is_mine(k)]
+        return [v for k, v in list(self._data.items()) if self._is_mine(k)]
 
     def items(self):
-        return [(self._unscope(k), v) for k, v in self._data.items() if self._is_mine(k)]
+        return [(self._unscope(k), v) for k, v in list(self._data.items()) if self._is_mine(k)]
 
     def update(self, other):
         if isinstance(other, AccountScopedDict):
@@ -241,13 +243,15 @@ class AccountRegionScopedDict:
         return self._scoped(key) in self._data
 
     def __len__(self):
-        return sum(1 for k in self._data if self._is_mine(k))
+        # Snapshot: a concurrent insert during a live walk raises
+        # RuntimeError("dictionary changed size during iteration").
+        return sum(1 for k in list(self._data) if self._is_mine(k))
 
     def __bool__(self):
-        return any(self._is_mine(k) for k in self._data)
+        return any(self._is_mine(k) for k in list(self._data))
 
     def __iter__(self):
-        for k in self._data:
+        for k in list(self._data):
             if self._is_mine(k):
                 yield self._unscope(k)
 
@@ -273,19 +277,19 @@ class AccountRegionScopedDict:
         return self._data.setdefault(self._scoped(key), default)
 
     def keys(self):
-        return [self._unscope(k) for k in self._data if self._is_mine(k)]
+        return [self._unscope(k) for k in list(self._data) if self._is_mine(k)]
 
     def values(self):
-        return [v for k, v in self._data.items() if self._is_mine(k)]
+        return [v for k, v in list(self._data.items()) if self._is_mine(k)]
 
     def items(self):
-        return [(self._unscope(k), v) for k, v in self._data.items() if self._is_mine(k)]
+        return [(self._unscope(k), v) for k, v in list(self._data.items()) if self._is_mine(k)]
 
     def values_scoped(self, account_id, region):
-        return [v for k, v in self._data.items() if k[:2] == (account_id, region)]
+        return [v for k, v in list(self._data.items()) if k[:2] == (account_id, region)]
 
     def items_scoped(self, account_id, region):
-        return [(self._unscope(k), v) for k, v in self._data.items() if k[:2] == (account_id, region)]
+        return [(self._unscope(k), v) for k, v in list(self._data.items()) if k[:2] == (account_id, region)]
 
     def all_values(self):
         return list(self._data.values())
