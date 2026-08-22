@@ -71,10 +71,13 @@ import time
 from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
+from ministack.core import container_reaper
+from ministack.core.concurrency import resource_lock, run_offloop
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
+    apply_image_prefix,
     get_account_id,
     get_region,
     new_uuid,
@@ -83,6 +86,11 @@ from ministack.core.responses import (
 logger = logging.getLogger("ec2")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
+
+# Docker client, created on first use. Only registered images reach for it, so
+# an emulator nobody registered an AMI with never imports docker-py at all.
+_docker = None
 
 # ---------------------------------------------------------------------------
 # State
@@ -115,6 +123,7 @@ _vpn_connections = AccountRegionScopedDict()    # vpn_id -> VPN connection recor
 _launch_templates = AccountRegionScopedDict()   # lt_id -> launch template record (includes versions list)
 _fleets = AccountRegionScopedDict()             # fleet_id -> fleet record
 _iam_instance_profile_associations = AccountRegionScopedDict()  # assoc_id -> association record
+_images = AccountRegionScopedDict()             # ami_id -> registered image record
 # Seed defaults once per account/region; do not recreate user-deleted defaults
 # on every later EC2 request in a scope.
 _default_initialized_scopes = set()
@@ -124,12 +133,22 @@ _default_initialized_scopes = set()
 # ── Persistence ────────────────────────────────────────────
 
 def get_state():
+    instances = copy.deepcopy(_instances)
+    # Container ids would dangle across a restart — the boot sweep reclaims this
+    # MiniStack's containers (core/container_reaper.reap_all) long before anyone
+    # reads them back. Keep ImageId so restore can relaunch from the registered
+    # image; drop the handles.
+    for inst in instances.all_values():
+        inst.pop("_container_id", None)
+        inst.pop("_container_name", None)
+        inst.pop("_ssm_managed", None)
     return {
         "default_initialized_scopes": [
             {"AccountId": account_id, "Region": region}
             for account_id, region in sorted(_default_initialized_scopes)
         ],
-        "instances": copy.deepcopy(_instances),
+        "images": copy.deepcopy(_images),
+        "instances": instances,
         "security_groups": copy.deepcopy(_security_groups),
         "key_pairs": copy.deepcopy(_key_pairs),
         "placement_groups": copy.deepcopy(_placement_groups),
@@ -187,6 +206,7 @@ def _clear_state():
     _launch_templates.clear()
     _fleets.clear()
     _iam_instance_profile_associations.clear()
+    _images.clear()
     _default_initialized_scopes.clear()
 
 
@@ -295,8 +315,26 @@ def restore_state(data):
         _iam_instance_profile_associations,
         data.get("iam_instance_profile_associations", {})
     )
+    _restore_regional_store(_images, data.get("images", {}))
     if "default_initialized_scopes" not in data:
         _infer_default_initialized_scopes_from_restored_stores()
+    _reconcile_backed_instances_after_restore()
+
+
+def _reconcile_backed_instances_after_restore():
+    """A restored container-backed instance has no container behind it: the boot
+    sweep removed it. These are instance-store backed, so the lost root disk is
+    a lost instance — report it terminated rather than claim a box that is gone
+    or offer a start that could only ever produce a different machine."""
+    for inst in _instances.all_values():
+        if inst.get("VmManager") != "docker":
+            continue
+        if inst.get("State", {}).get("Name") in ("running", "stopped"):
+            inst["State"] = {"Code": 48, "Name": "terminated"}
+            inst["_terminated_at"] = time.time()
+            inst.pop("_container_id", None)
+            inst.pop("_container_name", None)
+            inst.pop("_ssm_managed", None)
 
 
 def _restore_regional_store(store, restored):
@@ -431,6 +469,15 @@ _ensure_defaults_initialized()
 # Request routing
 # ---------------------------------------------------------------------------
 
+_DOCKER_ACTIONS = {
+    "RunInstances", "StartInstances", "StopInstances", "RebootInstances",
+    "TerminateInstances", "DescribeInstances",
+    # Reaches Docker indirectly: its _cleanup_terminated() removes the
+    # containers of terminated instances whose terminate-time removal failed.
+    "DescribeIamInstanceProfileAssociations",
+}
+
+
 async def handle_request(method, path, headers, body, query_params):
     _ensure_defaults_initialized()
     params = dict(query_params)
@@ -443,6 +490,15 @@ async def handle_request(method, path, headers, body, query_params):
     handler = _ACTION_MAP.get(action)
     if not handler:
         return _error("InvalidAction", f"Unknown EC2 action: {action}", 400)
+    # Actions that reach the Docker daemon once an image is registered. They
+    # block for as long as the daemon takes, so they go off the loop. The
+    # containers run the registered image's own workload and nothing is wired
+    # back to 4566, so this cannot re-enter: the shared pool is right, not
+    # run_reentrant. (Running a command inside a box can re-enter — a health
+    # probe calling back into MiniStack is the point — so SSM runs
+    # exec_in_instance_blocking on a thread of its own, not on this pool.)
+    if _docker_touched() and action in _DOCKER_ACTIONS:
+        return await run_offloop(handler, params)
     return handler(params)
 
 
@@ -717,6 +773,65 @@ def _run_instances(p):
         iam_profile=iam_profile
     )
 
+    # A registered AMI boots each record as a real container. Unregistered ids
+    # — including every invented ami- a CFN or Terraform stack carries — stay
+    # metadata-only, so existing workloads are untouched.
+    image = _registered_image(image_id)
+    if image is not None and not image.get("ImageLocation"):
+        # Registered from a snapshot, or from nothing at all.
+        # Registered from a snapshot: AWS would boot the volume, and we have
+        # nothing to run. The divergence belongs here rather than at
+        # RegisterImage, which is metadata-only on AWS as well.
+        for inst in created:
+            _discard_instance_records(inst)
+        return _error("InvalidAMIID.Unavailable",
+                      f"The image id '[{image_id}]' is not in a state from which "
+                      "you can launch an instance", 400)
+    if image is not None:
+        # A container has no persistent root disk, which is instance-store
+        # semantics: no EBS root volume, and StopInstances is refused.
+        for inst in created:
+            for bdm in inst.get("BlockDeviceMappings", []):
+                vol_id = bdm.get("Ebs", {}).get("VolumeId")
+                if vol_id:
+                    _volumes.pop(vol_id, None)
+            inst["BlockDeviceMappings"] = []
+            inst["RootDeviceType"] = "instance-store"
+            inst["RootDeviceName"] = image.get("RootDeviceName") or "/dev/sda1"
+        try:
+            for inst in created:
+                container = _vm_launch(inst, image["ImageLocation"])
+                # Publish the handle under the record's lock: handlers no longer
+                # serialise on the event loop, so a TerminateInstances can land
+                # between the launch and the write. Identity, not truthiness —
+                # a same-id record cannot exist, but a popped one must not be
+                # resurrected by this write.
+                with resource_lock("ec2", inst["InstanceId"]):
+                    live = _instances.get(inst["InstanceId"])
+                    orphaned = live is not inst
+                if orphaned:
+                    _drop_container(container)
+        except Exception as e:
+            # A running record with nothing behind it is the failure this
+            # backend exists to remove: back everything out and surface it.
+            logger.warning("EC2: could not boot %s: %s", image["ImageLocation"], e)
+            for inst in created:
+                _vm_remove_container(inst)
+                _discard_instance_records(inst)
+            if _is_image_unavailable(e):
+                # The reference cannot be pulled, so this AMI cannot launch an
+                # instance — a caller condition, not a server one. Retrying an
+                # InternalError here would fail identically forever.
+                return _error(
+                    "InvalidAMIID.Unavailable",
+                    f"The image id '[{image_id}]' is not in a state from which you "
+                    f"can launch an instance: {_esc(image['ImageLocation'])} could "
+                    f"not be pulled ({_esc(str(e))})", 400)
+            return _error(
+                "InternalError",
+                f"failed to start instance from {_esc(image['ImageLocation'])}: "
+                f"{_esc(str(e))}", 500)
+
     # Process TagSpecifications
     i = 1
     while _p(p, f"TagSpecification.{i}.ResourceType"):
@@ -755,7 +870,9 @@ def _cleanup_terminated():
              if v["State"]["Name"] == "terminated"
              and now - v.get("_terminated_at", 0) > 60]
     for k in stale:
-        _instances.pop(k, None)
+        inst = _instances.pop(k, None)
+        if inst and inst.get("VmManager") == "docker":
+            _vm_remove_container(inst)
 
 
 def _describe_instances(p):
@@ -768,6 +885,13 @@ def _describe_instances(p):
         for iid in filter_ids:
             if iid not in _instances:
                 return _error("InvalidInstanceID.NotFound", f"The instance ID '{iid}' does not exist", 400)
+
+    if _docker_touched():
+        # Before the filters run, so an instance-state-name filter sees the
+        # reconciled state. DescribeInstances is dispatched off the loop
+        # whenever an image is registered, so the container inspects cannot
+        # stall the server.
+        _vm_reconcile_running(list(_instances.values()))
 
     results = []
     for inst in _instances.values():
@@ -973,6 +1097,8 @@ def _terminate_instances(p):
             prev = inst["State"].copy()
             inst["State"] = {"Code": 48, "Name": "terminated"}
             inst["_terminated_at"] = time.time()
+            if inst.get("VmManager") == "docker":
+                _vm_remove_container(inst)
             assoc = _find_active_iam_instance_profile_association(iid)
             if assoc:
                 _mark_iam_instance_profile_association_disassociated(assoc)
@@ -989,6 +1115,14 @@ def _stop_instances(p):
     for iid in ids:
         if iid not in _instances:
             return _error("InvalidInstanceID.NotFound", f"The instance ID '{iid}' does not exist", 400)
+    for iid in ids:
+        # AWS: "you can't stop an instance that's instance store-backed". A
+        # container-backed instance has no persistent root disk, so there is
+        # nothing a stop could preserve.
+        if _instances[iid].get("RootDeviceType") == "instance-store":
+            return _error("UnsupportedOperation",
+                          f"You can't stop the instance '{iid}' because it is an "
+                          "instance store-backed instance", 400)
     items = ""
     for iid in ids:
         inst = _instances.get(iid)
@@ -1008,6 +1142,13 @@ def _start_instances(p):
     for iid in ids:
         if iid not in _instances:
             return _error("InvalidInstanceID.NotFound", f"The instance ID '{iid}' does not exist", 400)
+    for iid in ids:
+        # The counterpart of the stop refusal: an instance-store backed instance
+        # has no root disk to bring back, so AWS has no start for it either.
+        if _instances[iid].get("RootDeviceType") == "instance-store":
+            return _error("UnsupportedOperation",
+                          f"You can't start the instance '{iid}' because it is an "
+                          "instance store-backed instance", 400)
     items = ""
     for iid in ids:
         inst = _instances.get(iid)
@@ -1023,6 +1164,24 @@ def _start_instances(p):
 
 
 def _reboot_instances(p):
+    ids = _parse_member_list(p, "InstanceId")
+    for iid in ids:
+        if iid not in _instances:
+            return _error("InvalidInstanceID.NotFound",
+                          f"The instance ID '{iid}' does not exist", 400)
+    for iid in ids:
+        inst = _instances.get(iid)
+        if inst and inst.get("VmManager") == "docker":
+            container = _vm_get_container(inst)
+            if container is not None:
+                try:
+                    container.restart(timeout=10)
+                    # A container's IP can change across a restart.
+                    _vm_apply_container_ip(inst, container,
+                                           _get_ministack_network(_get_docker()))
+                    inst["_ssm_managed"] = _probe_shell(container)
+                except Exception as e:
+                    logger.warning("EC2: could not restart container for %s: %s", iid, e)
     return _xml(200, "RebootInstancesResponse", "<return>true</return>")
 
 
@@ -1040,41 +1199,160 @@ _STUB_AMIS = [
 ]
 
 
+def _image_view(image):
+    """Registered image as the flat shape the filter and renderer share."""
+    root_type = image.get("RootDeviceType") or ("instance-store" if image.get("ImageLocation") else "ebs")
+    default_desc = (f"Container-backed AMI ({image['ImageLocation']})"
+                    if image.get("ImageLocation") else "Snapshot-backed AMI")
+    return {
+        "ImageId": image["ImageId"],
+        "Name": image["Name"],
+        "Description": image["Description"] or default_desc,
+        "Platform": "",
+        "RootDeviceType": root_type,
+        "RootDeviceName": image["RootDeviceName"],
+        "BlockDeviceMappings": image.get("BlockDeviceMappings") or [],
+        "Architecture": image["Architecture"],
+        "VirtualizationType": image["VirtualizationType"],
+        "OwnerId": image.get("OwnerId") or get_account_id(),
+        "IsPublic": "false",
+        "Backed": True,
+    }
+
+
+def _stub_image_view(ami_id, name, desc, platform, root_device):
+    return {
+        "ImageId": ami_id,
+        "Name": name,
+        "Description": desc,
+        "Platform": platform,
+        "RootDeviceType": "ebs",
+        "RootDeviceName": root_device,
+        "BlockDeviceMappings": [],
+        "Architecture": "x86_64",
+        "VirtualizationType": "hvm",
+        "OwnerId": get_account_id(),
+        "IsPublic": "true",
+        "Backed": False,
+    }
+
+
+def _image_matches_filters(view, filters):
+    for name, values in filters.items():
+        if name == "image-id":
+            actual = [view["ImageId"]]
+        elif name == "name":
+            actual = [view["Name"]]
+        elif name == "description":
+            actual = [view["Description"]]
+        elif name == "owner-id":
+            actual = [view["OwnerId"]]
+        elif name == "architecture":
+            actual = [view["Architecture"]]
+        elif name == "virtualization-type":
+            actual = [view["VirtualizationType"]]
+        elif name == "root-device-name":
+            actual = [view["RootDeviceName"]]
+        elif name == "root-device-type":
+            actual = [view["RootDeviceType"]]
+        elif name == "state":
+            actual = ["available"]
+        elif name == "is-public":
+            actual = [view["IsPublic"]]
+        elif name == "platform":
+            actual = [view["Platform"]]
+        elif name == "tag-key":
+            actual = [t["Key"] for t in _tags.get(view["ImageId"], [])]
+        elif name.startswith("tag:"):
+            key = name[4:]
+            actual = [t["Value"] for t in _tags.get(view["ImageId"], []) if t["Key"] == key]
+        else:
+            continue  # unknown filter names are ignored, as elsewhere in EC2
+        if not any(_filter_value_matches(a, values) for a in actual):
+            return False
+    return True
+
+
+def _filter_value_matches(actual, values):
+    for v in values:
+        if "*" in v or "?" in v:
+            if re.fullmatch(re.escape(v).replace(r"\*", ".*").replace(r"\?", "."), actual or ""):
+                return True
+        elif actual == v:
+            return True
+    return False
+
+
+def _image_bdm_xml(view):
+    """An instance-store AMI has no EBS root volume, so it emits no mapping —
+    which is also what tells Terraform not to resolve a root device from it."""
+    if view["RootDeviceType"] != "ebs":
+        return ""
+    mappings = view["BlockDeviceMappings"]
+    if not mappings:
+        # RootDeviceName + BlockDeviceMappings are required by Terraform's AWS
+        # provider on aws_instance — it resolves them from DescribeImages before
+        # RunInstances and fails with "finding Root Device Name for AMI" if absent.
+        mappings = [{"DeviceName": view["RootDeviceName"],
+                     "Ebs": {"VolumeSize": "8", "VolumeType": "gp2",
+                             "DeleteOnTermination": "true"}}]
+    items = ""
+    for m in mappings:
+        ebs = m.get("Ebs") or {}
+        snapshot = (f"<snapshotId>{_esc(ebs['SnapshotId'])}</snapshotId>"
+                    if ebs.get("SnapshotId") else "")
+        items += f"""<item>
+                    <deviceName>{_esc(m['DeviceName'])}</deviceName>
+                    <ebs>
+                        {snapshot}
+                        <volumeSize>{ebs.get('VolumeSize', '8')}</volumeSize>
+                        <volumeType>{ebs.get('VolumeType', 'gp2')}</volumeType>
+                        <deleteOnTermination>{ebs.get('DeleteOnTermination', 'true')}</deleteOnTermination>
+                    </ebs>
+                </item>"""
+    return f"<blockDeviceMapping>{items}</blockDeviceMapping>"
+
+
 def _describe_images(p):
     filter_ids = _parse_member_list(p, "ImageId")
+    filters = _parse_filters(p)
+    # Registered images first: those are the ones that actually boot. The stubs
+    # stay so a workload naming one keeps launching a metadata-only instance.
+    views = [_image_view(img) for img in _images.values()]
+    seen = {v["ImageId"] for v in views}
+    views += [_stub_image_view(*stub) for stub in _STUB_AMIS if stub[0] not in seen]
+
     items = ""
-    for ami_id, name, desc, platform, root_device in _STUB_AMIS:
-        if filter_ids and ami_id not in filter_ids:
+    for view in views:
+        if filter_ids and view["ImageId"] not in filter_ids:
+            continue
+        if filters and not _image_matches_filters(view, filters):
             continue
         # RootDeviceName + BlockDeviceMappings are required by Terraform's AWS
         # provider on aws_instance — it resolves them from DescribeImages before
         # RunInstances and fails with "finding Root Device Name for AMI" if absent.
-        platform_xml = f"<platform>{platform}</platform>" if platform else ""
+        platform_xml = f"<platform>{view['Platform']}</platform>" if view["Platform"] else ""
+        tag_items = "".join(
+            f"<item><key>{_esc(t['Key'])}</key><value>{_esc(t.get('Value', ''))}</value></item>"
+            for t in _tags.get(view["ImageId"], []))
+        tag_xml = f"<tagSet>{tag_items}</tagSet>" if tag_items else ""
         items += f"""<item>
-            <imageId>{ami_id}</imageId>
-            <imageLocation>{name}</imageLocation>
+            <imageId>{view['ImageId']}</imageId>
+            <imageLocation>{_esc(view['Name'])}</imageLocation>
             <imageState>available</imageState>
-            <imageOwnerId>{get_account_id()}</imageOwnerId>
-            <isPublic>true</isPublic>
-            <architecture>x86_64</architecture>
+            <imageOwnerId>{view['OwnerId']}</imageOwnerId>
+            <isPublic>{view['IsPublic']}</isPublic>
+            <architecture>{view['Architecture']}</architecture>
             <imageType>machine</imageType>
-            <name>{name}</name>
-            <description>{desc}</description>
+            <name>{_esc(view['Name'])}</name>
+            <description>{_esc(view['Description'])}</description>
             {platform_xml}
-            <rootDeviceType>ebs</rootDeviceType>
-            <rootDeviceName>{root_device}</rootDeviceName>
-            <blockDeviceMapping>
-                <item>
-                    <deviceName>{root_device}</deviceName>
-                    <ebs>
-                        <volumeSize>8</volumeSize>
-                        <volumeType>gp2</volumeType>
-                        <deleteOnTermination>true</deleteOnTermination>
-                    </ebs>
-                </item>
-            </blockDeviceMapping>
-            <virtualizationType>hvm</virtualizationType>
+            <rootDeviceType>{view['RootDeviceType']}</rootDeviceType>
+            <rootDeviceName>{view['RootDeviceName']}</rootDeviceName>
+            {_image_bdm_xml(view)}
+            <virtualizationType>{view['VirtualizationType']}</virtualizationType>
             <hypervisor>xen</hypervisor>
+            {tag_xml}
         </item>"""
     return _xml(200, "DescribeImagesResponse", f"<imagesSet>{items}</imagesSet>")
 
@@ -1570,6 +1848,450 @@ def _import_key_pair(p):
         <keyName>{name}</keyName>
         <keyFingerprint>{fingerprint}</keyFingerprint>
         <keyPairId>{_key_pairs[name]['KeyPairId']}</keyPairId>""")
+
+
+# ---------------------------------------------------------------------------
+# Registered AMIs and container-backed instances
+# ---------------------------------------------------------------------------
+# RunInstances against a registered AMI boots that image as a container, so an
+# instance has a real box behind it and ssm:SendCommand can return a real exit
+# code instead of always reporting success. RegisterImage is the opt-in: with
+# no image registered, EC2 never reaches for Docker and every instance is the
+# metadata-only record it has always been.
+#
+# The container is not the emulated thing — it is what makes the emulated API
+# behave correctly, the same role Postgres plays for RDS and k3s for EKS. It is
+# private to this module: nothing schedules ECS tasks or EKS pods into it.
+#
+# Divergences, deliberately: ImageLocation carries a container reference rather
+# than an S3 manifest path; there is no IMDS, no console output, no
+# security-group enforcement or port publishing, no EBS-to-block-device
+# mapping, and a container filesystem does not survive a restart.
+
+# Same bound the reaper's client uses (app.py), so a hung daemon cannot pin a request for
+# docker-py's 60s default. Not a new knob: MINISTACK_DOCKER_TIMEOUT already exists.
+_DOCKER_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
+
+
+def _new_image_id():
+    return "ami-" + "".join(random.choices(string.hexdigits[:16], k=17))
+
+
+def _get_docker():
+    """Docker client, or None. Imported lazily: an emulator with no registered
+    image never pays for docker-py at all."""
+    global _docker
+    if _docker is None:
+        try:
+            import docker
+            _docker = docker.from_env(timeout=_DOCKER_TIMEOUT)
+        except Exception as e:
+            logger.debug("EC2: no Docker client available: %s", e)
+    return _docker
+
+
+def _get_ministack_network(client):
+    """The Docker network MiniStack is on, so instances are reachable from it."""
+    if DOCKER_NETWORK:
+        return DOCKER_NETWORK
+    try:
+        hostname = os.environ.get("HOSTNAME", "")
+        if not hostname:
+            return None
+        # Docker names the container's hostname after its id, Podman after its
+        # name. containers.get() resolves either.
+        self_container = client.containers.get(hostname)
+        nets = list(self_container.attrs["NetworkSettings"]["Networks"].keys())
+        return nets[0] if nets else None
+    except Exception:
+        return None
+
+
+def _registered_image(image_id):
+    """The registered image record for an AMI id, or None."""
+    return _images.get(image_id) if image_id else None
+
+
+# Set the first time a container is launched. A registration can be withdrawn while its
+# instances are still running, so "an image is registered" is not the same question as
+# "is there a container of ours out there".
+_docker_in_use = False
+
+
+def _any_image_registered():
+    """Whether an AMI backed by a container reference exists in any scope."""
+    return bool(_images.all_values())
+
+
+def _docker_touched():
+    """Whether anything here could need the daemon. Gates every Docker touch, including the
+    describe-time reconcile and the reset sweep, so an emulator nobody registered an image
+    with never imports docker-py at all."""
+    return _docker_in_use or _any_image_registered()
+
+
+def _ec2_container_name(instance_id):
+    return f"ministack-ec2-{get_account_id()}-{get_region()}-{instance_id}"
+
+
+# ── RegisterImage / DeregisterImage ────────────────────────
+
+def _parse_register_block_device_mappings(p):
+    """BlockDeviceMapping.N off a RegisterImage request."""
+    mappings = []
+    i = 1
+    while _p(p, f"BlockDeviceMapping.{i}.DeviceName"):
+        ebs = {}
+        for field in ("SnapshotId", "VolumeSize", "VolumeType", "DeleteOnTermination",
+                      "Encrypted", "Iops", "Throughput"):
+            value = _p(p, f"BlockDeviceMapping.{i}.Ebs.{field}")
+            if value:
+                ebs[field] = value
+        mapping = {"DeviceName": _p(p, f"BlockDeviceMapping.{i}.DeviceName")}
+        virtual_name = _p(p, f"BlockDeviceMapping.{i}.VirtualName")
+        if virtual_name:
+            mapping["VirtualName"] = virtual_name
+        if ebs:
+            mapping["Ebs"] = ebs
+        mappings.append(mapping)
+        i += 1
+    return mappings
+
+
+# "3-128 alphanumeric characters, parentheses (()), square brackets ([]), spaces ( ),
+# periods (.), slashes (/), dashes (-), single quotes ('), at-signs (@), or underscores(_)"
+_AMI_NAME_RE = re.compile(r"^[A-Za-z0-9()\[\] ./\-'@_]{3,128}$")
+
+
+def _register_image(p):
+    name = _p(p, "Name")
+    if not name:
+        return _error("MissingParameter", "The request must contain the parameter Name", 400)
+    if not _AMI_NAME_RE.match(name):
+        return _error("InvalidAMIName.Malformed",
+                      "AMI names must be between 3 and 128 characters long, and may only "
+                      "contain letters, numbers, and the following special characters: "
+                      "'-', '_', '.', '/', '(', and ')'", 400)
+    location = _p(p, "ImageLocation")
+    mappings = _parse_register_block_device_mappings(p)
+    snapshot_backed = any(m.get("Ebs", {}).get("SnapshotId") for m in mappings)
+    # Only Name is required on AWS: ImageLocation and BlockDeviceMapping.N are both optional, and
+    # registration never checks that the result can boot. Refusing here would make MiniStack
+    # stricter than AWS, so a registration with neither is accepted and fails at RunInstances.
+    for existing in _images.values():
+        if existing["Name"] == name:
+            return _error("InvalidAMIName.Duplicate",
+                          f"AMI name {name} is already in use by another AMI", 400)
+    image_id = _new_image_id()
+    # Registration is metadata-only on AWS too: it neither touches the disk nor
+    # checks that the image can boot. So a snapshot-backed registration is
+    # accepted exactly as AWS accepts it (import-snapshot then register-image is
+    # the ordinary Packer/Terraform flow) and the divergence lands where it
+    # belongs — on RunInstances, the call that genuinely cannot do the thing.
+    #
+    # The two root device types stay honest. A container has no persistent root
+    # disk, which is instance-store semantics: no EBS root volume and no stop.
+    # A snapshot-backed AMI is `ebs`, and would keep its disk across a stop —
+    # it just has nothing here to run.
+    root_device_type = "instance-store" if location else "ebs"
+    _images[image_id] = {
+        "ImageId": image_id,
+        "Name": name,
+        "ImageLocation": location,
+        "Description": _p(p, "Description") or "",
+        # AWS documents these defaults for RegisterImage: Architecture "For Amazon EBS-backed
+        # AMIs, i386", VirtualizationType "Default: paravirtual". A caller that cares passes them.
+        "Architecture": _p(p, "Architecture") or "i386",
+        "RootDeviceType": root_device_type,
+        "RootDeviceName": (_p(p, "RootDeviceName")
+                           or ("/dev/sda1" if root_device_type == "instance-store"
+                               else "/dev/xvda")),
+        "BlockDeviceMappings": mappings,
+        "VirtualizationType": _p(p, "VirtualizationType") or "paravirtual",
+        "CreationDate": _now_ts(),
+        "OwnerId": get_account_id(),
+    }
+    _parse_tag_specs(p, "image", image_id)
+    return _xml(200, "RegisterImageResponse", f"<imageId>{image_id}</imageId>")
+
+
+def _deregister_image(p):
+    image_id = _p(p, "ImageId")
+    if not image_id:
+        return _error("MissingParameter", "The request must contain the parameter ImageId", 400)
+    if image_id not in _images:
+        return _error("InvalidAMIID.NotFound",
+                      f"The image id '[{image_id}]' does not exist", 400)
+    _images.pop(image_id, None)
+    _tags.pop(image_id, None)
+    return _xml(200, "DeregisterImageResponse", "<return>true</return>")
+
+
+# ── Container lifecycle ────────────────────────────────────
+
+def _vm_apply_container_ip(inst, container, network):
+    """Replace the synthetic addresses with the container's real IP."""
+    try:
+        container.reload()
+        nets = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+        if network and network in nets:
+            ip = nets[network].get("IPAddress", "")
+        else:
+            ip = next(iter(nets.values())).get("IPAddress", "") if nets else ""
+        if not ip:
+            logger.warning("EC2: no container IP for %s; keeping synthetic addresses",
+                           inst["InstanceId"])
+            return
+        inst["PrivateIpAddress"] = ip
+        inst["PublicIpAddress"] = ip
+        inst["PrivateDnsName"] = f"ip-{ip.replace('.', '-')}.ec2.internal"
+        inst["PublicDnsName"] = f"ec2-{ip.replace('.', '-')}.compute-1.amazonaws.com"
+    except Exception as e:
+        logger.warning("EC2: could not read container IP for %s: %s", inst["InstanceId"], e)
+
+
+def _probe_shell(container):
+    """Whether the guest has a shell. No shell is our analogue of no SSM agent:
+    the instance is unmanaged and SendCommand refuses it, as on AWS."""
+    try:
+        result = container.exec_run(["/bin/sh", "-c", "true"])
+        return getattr(result, "exit_code", 1) == 0
+    except Exception:
+        return False
+
+
+def _is_image_unavailable(exc):
+    """Whether a boot failure is "that reference cannot be pulled" rather than
+    a daemon or runtime problem."""
+    try:
+        from docker import errors as docker_errors
+    except Exception:
+        return False
+    if isinstance(exc, (docker_errors.ImageNotFound, docker_errors.NotFound)):
+        return True
+    # A registry that refuses or does not resolve surfaces as APIError.
+    return (isinstance(exc, docker_errors.APIError)
+            and any(t in str(exc).lower()
+                    for t in ("not found", "pull access denied", "manifest unknown",
+                              "no such image", "repository does not exist")))
+
+
+def _vm_launch(inst, image_ref):
+    """Boot one instance record as a container. Raises on create/start failure;
+    the caller backs the records out and surfaces the error."""
+    client = _get_docker()
+    if client is None:
+        raise RuntimeError("no Docker daemon available")
+    network = _get_ministack_network(client)
+    name = _ec2_container_name(inst["InstanceId"])
+    try:
+        client.containers.get(name).remove(force=True)
+    except Exception:
+        pass  # no stale container by that name, which is the normal case
+    kwargs = {
+        "name": name,
+        "detach": True,
+        "labels": {
+            **container_reaper.own_labels("ec2"),
+            "instance_id": inst["InstanceId"],
+            "account_id": get_account_id(),
+            "region": get_region(),
+        },
+        # A real instance does not exit the moment it boots, so keep the
+        # container alive. An image with its own ENTRYPOINT receives this as
+        # argv and is free to ignore it; init reaps the keepalive.
+        "init": True,
+        "command": ["sleep", "infinity"],
+    }
+    if network:
+        kwargs["network"] = network
+    container = client.containers.run(apply_image_prefix(image_ref), **kwargs)
+    global _docker_in_use
+    _docker_in_use = True
+    inst["_container_id"] = container.id
+    inst["_container_name"] = name
+    inst["VmManager"] = "docker"
+    _vm_apply_container_ip(inst, container, network)
+    inst["_ssm_managed"] = _probe_shell(container)
+    logger.info("EC2: instance %s running in container %s (image %s)",
+                inst["InstanceId"], name, image_ref)
+    return container
+
+
+def _vm_get_container(inst):
+    client = _get_docker()
+    if client is None:
+        return None
+    for ref in (inst.get("_container_id"), inst.get("_container_name"),
+                _ec2_container_name(inst["InstanceId"])):
+        if not ref:
+            continue
+        try:
+            return client.containers.get(ref)
+        except Exception:
+            continue
+    return None
+
+
+def _drop_container(container):
+    """Tear down a container nothing references. Never called under a lock —
+    Docker calls must not be held across resource_lock."""
+    try:
+        container.remove(force=True)
+    except Exception as e:
+        logger.warning("EC2: could not remove orphaned container: %s", e)
+
+
+def _vm_remove_container(inst):
+    container = _vm_get_container(inst)
+    if container is not None:
+        try:
+            container.remove(force=True)
+        except Exception as e:
+            logger.warning("EC2: could not remove container for %s: %s",
+                           inst["InstanceId"], e)
+    inst.pop("_container_id", None)
+    inst.pop("_container_name", None)
+    inst.pop("_ssm_managed", None)
+
+
+def _discard_instance_records(inst):
+    """Back out a failed launch: instance, its synthetic root volume, and its
+    IAM instance profile association — exactly what _launch_instances_internal
+    creates."""
+    iid = inst["InstanceId"]
+    for bdm in inst.get("BlockDeviceMappings", []):
+        vol_id = bdm.get("Ebs", {}).get("VolumeId")
+        if vol_id:
+            _volumes.pop(vol_id, None)
+    for key in [k for k, a in _iam_instance_profile_associations.items()
+                if a.get("InstanceId") == iid]:
+        _iam_instance_profile_associations.pop(key, None)
+    _instances.pop(iid, None)
+
+
+def _vm_reconcile_running(instances):
+    """Downgrade a "running" record whose container is gone or has exited.
+
+    A box can die underneath its record — the workload exits, the daemon kills
+    it, someone removes the container by hand. Reconciled lazily here rather
+    than by a poller: the record is only wrong for as long as nobody looks.
+    Downgrade only; StartInstances is the one path back to running.
+    """
+    client = _get_docker()
+    if client is None:
+        return
+    try:
+        client.ping()
+    except Exception:
+        return  # an unreachable daemon says nothing about the containers
+    from docker import errors as docker_errors
+    for inst in instances:
+        if inst.get("VmManager") != "docker":
+            continue
+        if inst.get("State", {}).get("Name") != "running":
+            continue
+        refs = [r for r in (inst.get("_container_id"), inst.get("_container_name")) if r]
+        if not refs:
+            continue  # mid-launch: no container claim to judge yet
+        container, verdict = None, "gone"
+        for ref in refs:
+            try:
+                container = client.containers.get(ref)
+                break
+            except docker_errors.NotFound:
+                continue
+            except Exception as e:
+                # Transient daemon trouble is not evidence the box died.
+                logger.debug("EC2: container lookup for %s failed: %s", inst["InstanceId"], e)
+                verdict = "unknown"
+                break
+        if verdict == "unknown":
+            continue
+        status = getattr(container, "status", "")
+        if container is not None and status not in ("exited", "dead"):
+            continue
+        # Instance-store backed: losing the root disk is losing the instance.
+        # AWS terminates such an instance rather than stopping it, and there is
+        # nothing here a start could recover — the container filesystem is gone.
+        inst["State"] = {"Code": 48, "Name": "terminated"}
+        inst["_terminated_at"] = time.time()
+        inst.pop("_ssm_managed", None)
+        inst.pop("_container_id", None)
+        inst.pop("_container_name", None)
+        logger.info("EC2: instance %s container %s — reporting terminated",
+                    inst["InstanceId"], "gone" if container is None else status)
+
+
+def _vm_live_container_ids():
+    """Container ids an instance record still owns, for the periodic reaper.
+
+    A stopped instance keeps its exited container so StartInstances can restart
+    it, so every recorded id is reported whatever the instance state.
+    Terminated instances leave the store within a minute (_cleanup_terminated),
+    after which a container a failed terminate left behind stops being vouched
+    for and the reaper may reclaim it.
+    """
+    return {inst.get("_container_id")
+            for inst in _instances.all_values() if inst.get("_container_id")}
+
+
+container_reaper.register_live_ids("ec2", _vm_live_container_ids)
+
+
+def _vm_sweep_containers():
+    """Remove this MiniStack's instance containers. Used by reset.
+
+    Scoped by ministack.instance like the rest of the reaping machinery:
+    several MiniStacks can share a daemon and a reset of this one must not take
+    down another's boxes.
+    """
+    if not _docker_touched():
+        return
+    client = _get_docker()
+    if client is None:
+        return
+    try:
+        containers = client.containers.list(all=True, filters={"label": [
+            "ministack=ec2",
+            f"{container_reaper.INSTANCE_LABEL}={container_reaper.instance_id()}",
+        ]})
+    except Exception as e:
+        logger.warning("EC2: reset container sweep failed: %s", e)
+        return
+    container_reaper.drop_containers(containers, force=True)
+
+
+# ── Exec seam (SSM Run Command) ────────────────────────────
+
+def instance_is_managed(instance_id):
+    """Whether SSM can run a command on this instance.
+
+    An instance is managed when it has a box with a shell behind it, which is
+    this emulator's analogue of a running SSM agent. AWS refuses commands for
+    an unmanaged instance and so do we.
+    """
+    inst = _instances.get(instance_id)
+    if not inst or inst.get("State", {}).get("Name") != "running":
+        return False
+    return bool(inst.get("_ssm_managed"))
+
+
+def exec_in_instance_blocking(instance_id, argv):
+    inst = _instances.get(instance_id)
+    if not inst:
+        return 255, "", "instance does not exist"
+    container = _vm_get_container(inst)
+    if container is None:
+        return 255, "", "instance has no backing container"
+    try:
+        result = container.exec_run(argv, demux=True)
+    except Exception as e:
+        return 255, "", str(e)
+    stdout, stderr = (result.output if isinstance(result.output, tuple) else (result.output, None))
+    return (result.exit_code,
+            (stdout or b"").decode("utf-8", "replace"),
+            (stderr or b"").decode("utf-8", "replace"))
 
 
 # ---------------------------------------------------------------------------
@@ -4836,6 +5558,9 @@ def _delete_vpn_connection_route(p):
 # ---------------------------------------------------------------------------
 
 def reset():
+    _vm_sweep_containers()
+    global _docker_in_use
+    _docker_in_use = False
     _clear_state()
     _init_defaults()
 
@@ -6030,6 +6755,8 @@ _ACTION_MAP = {
     "DisassociateIamInstanceProfile": _disassociate_iam_instance_profile,
     "ReplaceIamInstanceProfileAssociation": _replace_iam_instance_profile_association,
     "DescribeImages": _describe_images,
+    "RegisterImage": _register_image,
+    "DeregisterImage": _deregister_image,
     "CreateSecurityGroup": _create_security_group,
     "DeleteSecurityGroup": _delete_security_group,
     "DescribeSecurityGroups": _describe_security_groups,

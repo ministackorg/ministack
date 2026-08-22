@@ -18,6 +18,7 @@ import time
 from datetime import datetime, timezone
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import spawn_background
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -700,24 +701,93 @@ def _param_out(param, with_decryption=False):
 
 # ── Run Command ────────────────────────────────────────────
 #
-# Nothing here runs a script, so an invocation completes as Success with empty output rather than
-# never converging. Only an unreachable instance fails, which is how a caller reaches its error path.
+# An invocation is asynchronous, as on AWS: SendCommand answers Pending and the caller polls
+# GetCommandInvocation until it reaches a terminal state. For AWS-RunShellScript against an
+# instance with a box behind it, the script runs in that box and the invocation carries its real
+# exit code and output, so a health probe can genuinely fail. A document we cannot run completes
+# as Success with empty output rather than never converging.
 
 _RUN_COMMAND_PLUGIN = "aws:runShellScript"
+# GetCommandInvocation: "The first 24,000 characters written by the plugin to stdout" and
+# "The first 8,000 characters written by the plugin to stderr".
+_STDOUT_LIMIT = 24000
+_STDERR_LIMIT = 8000
+_SHELL_DOCUMENTS = {"AWS-RunShellScript"}
 
 
 def _managed_instance_ids() -> set:
-    """Instances Run Command can reach: the ones EC2 has running in this account and region.
+    """Instances Run Command can reach.
 
-    Anything else has no agent answering, so real SSM neither lists it nor takes a command for it.
+    An agent has to be answering, which AWS folds into InvalidInstanceId along with the node's
+    state ("SSM Agent isn't running" is one of the causes it lists). A metadata-only instance has
+    nothing running on it, so real SSM would refuse it too. `instance_is_managed` covers both:
+    it requires the instance to be running and to have a box with a shell behind it.
     """
     from ministack.services import ec2 as ec2_svc
 
     return {
         instance_id
-        for instance_id, inst in ec2_svc._instances.items()
-        if (inst.get("State") or {}).get("Name") == "running"
+        for instance_id in ec2_svc._instances
+        if ec2_svc.instance_is_managed(instance_id)
     }
+
+
+def _shell_argv(data) -> list:
+    """The argv for an AWS-RunShellScript invocation, from its `commands` parameter."""
+    commands = (data.get("Parameters") or {}).get("commands") or []
+    if isinstance(commands, str):
+        commands = [commands]
+    script = "\n".join(str(c) for c in commands)
+    return ["/bin/sh", "-c", script]
+
+
+def _finish_invocation(command_id, instance_id, argv):
+    """Run one invocation to completion and publish its result.
+
+    On its own thread: the script is the caller's, and a readiness probe calling back into
+    MiniStack is the point of the feature, so it must not take a slot from the shared pool.
+    """
+    from ministack.services import ec2 as ec2_svc
+
+    record = _commands.get(command_id)
+    if not record:
+        return
+    invocation = (record.get("Invocations") or {}).get(instance_id)
+    if invocation is None:
+        return
+    invocation["Status"] = "InProgress"
+    invocation["StatusDetails"] = "In Progress"
+    invocation["ExecutionStartDateTime"] = _now_iso()
+    exit_code, stdout, stderr = ec2_svc.exec_in_instance_blocking(instance_id, argv)
+    invocation["ResponseCode"] = exit_code
+    invocation["StandardOutputContent"] = stdout[:_STDOUT_LIMIT]
+    invocation["StandardErrorContent"] = stderr[:_STDERR_LIMIT]
+    invocation["ExecutionEndDateTime"] = _now_iso()
+    # Status flips last: a poller that sees a terminal state must already see the exit code,
+    # the output and the end time.
+    # "For a plugin, this indicates that the result code wasn't zero."
+    invocation["StatusDetails"] = "Success" if exit_code == 0 else "Failed"
+    invocation["Status"] = invocation["StatusDetails"]
+    _refresh_command_status(record)
+
+
+def _refresh_command_status(record) -> None:
+    """Roll the invocations up into the parent command."""
+    invocations = list((record.get("Invocations") or {}).values())
+    terminal = [i for i in invocations
+                if i["Status"] in ("Success", "Failed", "Cancelled", "TimedOut")]
+    failed = [i for i in invocations if i["Status"] == "Failed"]
+    record["CompletedCount"] = len(terminal)
+    record["ErrorCount"] = len(failed)
+    if len(terminal) < len(invocations):
+        record["Status"] = "InProgress"
+        record["StatusDetails"] = "In Progress"
+    elif failed:
+        record["Status"] = "Failed"
+        record["StatusDetails"] = "Failed"
+    else:
+        record["Status"] = "Success"
+        record["StatusDetails"] = "Success"
 
 
 def _command_target_ids(data) -> list:
@@ -767,15 +837,17 @@ def _send_command(data):
         "InstanceIds": instance_ids,
         "Targets": data.get("Targets", []),
         "RequestedDateTime": now,
-        "Status": "Success",
-        "StatusDetails": "Success",
+        # SendCommand answers before the command has been delivered — the doc's own sample
+        # response is Pending. The caller polls GetCommandInvocation from here.
+        "Status": "Pending",
+        "StatusDetails": "Pending",
         "OutputS3Region": get_region(),
         "OutputS3BucketName": data.get("OutputS3BucketName", ""),
         "OutputS3KeyPrefix": data.get("OutputS3KeyPrefix", ""),
         "MaxConcurrency": data.get("MaxConcurrency", "50"),
         "MaxErrors": data.get("MaxErrors", "0"),
         "TargetCount": len(instance_ids),
-        "CompletedCount": len(instance_ids),
+        "CompletedCount": 0,
         "ErrorCount": 0,
         "DeliveryTimedOutCount": 0,
         "ServiceRole": data.get("ServiceRoleArn", ""),
@@ -788,13 +860,16 @@ def _send_command(data):
                 "DocumentName": document,
                 "DocumentVersion": data.get("DocumentVersion", "$DEFAULT"),
                 "PluginName": _RUN_COMMAND_PLUGIN,
-                "ResponseCode": 0,
-                # These three are strings in the SSM model, not timestamps.
-                "ExecutionStartDateTime": started,
+                # "If the response code is -1, then the command hasn't started running on the
+                # managed node, or it wasn't received by the node."
+                "ResponseCode": -1,
+                # These three are strings in the SSM model, not timestamps, and are empty until
+                # the plugin starts.
+                "ExecutionStartDateTime": "",
                 "ExecutionElapsedTime": "PT0.001S",
-                "ExecutionEndDateTime": started,
-                "Status": "Success",
-                "StatusDetails": "Success",
+                "ExecutionEndDateTime": "",
+                "Status": "Pending",
+                "StatusDetails": "Pending",
                 "StandardOutputContent": "",
                 "StandardOutputUrl": "",
                 "StandardErrorContent": "",
@@ -804,6 +879,21 @@ def _send_command(data):
         },
     }
     _commands[command_id] = record
+    if document in _SHELL_DOCUMENTS:
+        argv = _shell_argv(data)
+        for instance_id in instance_ids:
+            spawn_background(_finish_invocation, command_id, instance_id, argv,
+                             thread_name=f"ministack-ssm-{command_id[:8]}")
+    else:
+        # A document we cannot run still has to converge, or a caller polling for a terminal
+        # state never returns.
+        for instance_id in instance_ids:
+            invocation = record["Invocations"][instance_id]
+            invocation.update({"ResponseCode": 0, "Status": "Success",
+                               "StatusDetails": "Success",
+                               "ExecutionStartDateTime": started,
+                               "ExecutionEndDateTime": started})
+        _refresh_command_status(record)
     return json_response({"Command": _public_command(record)})
 
 

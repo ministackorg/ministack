@@ -7,6 +7,11 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **EC2 — instances can have a real box behind them (`RegisterImage`)** — `RunInstances` returned a `running` record and booted nothing. `RegisterImage` now takes a container reference in `ImageLocation` and returns an `ami-` id; launching that id boots the image as a container whose IP becomes the instance's address, so `ssm:SendCommand` can report a real exit code. Such an AMI is `instance-store` backed: no EBS root volume, `StopInstances` / `StartInstances` answer `UnsupportedOperation`, and a container that dies reports `terminated`. Snapshot-backed registration is accepted as AWS accepts it and fails at `RunInstances` with `InvalidAMIID.Unavailable`, as does a reference that cannot be pulled. Registering is the only opt-in — with nothing registered EC2 never reaches for Docker. Reported by @iot-rocket.
+- **SSM — Run Command** — `SendCommand`, `GetCommandInvocation`, `ListCommands` and `DescribeInstanceInformation` returned `InvalidAction`, so the standard instance health probe could not run. Invocations are asynchronous as on AWS: `SendCommand` answers `Pending` and the caller polls to a terminal state. `AWS-RunShellScript` runs in the instance's container, so `Status` is `Success` or `Failed` on the real exit code, with the script's output. An instance with no agent answering is refused with `InvalidInstanceId`. Contributed by @bandle.
+- **EC2 — `RebootInstances` rejects unknown instance ids** — it returned `true` for any id. It now answers `InvalidInstanceID.NotFound`, matching AWS.
+
 ## [1.4.21] — 2026-08-20
 
 ### Added

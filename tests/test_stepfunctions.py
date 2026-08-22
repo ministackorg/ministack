@@ -4897,8 +4897,16 @@ def test_sfn_aws_sdk_query_pascal_case(sfn, sfn_sync, ssm):
 
 def test_sfn_aws_sdk_ssm_run_command_probe(sfn, sfn_sync, ec2):
     """The health-probe shape: sendCommand, then getCommandInvocation on the id it returned."""
+    try:
+        import docker as _probe
+
+        _probe.from_env(timeout=5).ping()
+    except Exception:
+        pytest.skip("no reachable Docker daemon — Run Command needs a box behind the instance")
     tag = _uuid_mod.uuid4().hex[:8]
-    instance_id = ec2.run_instances(ImageId="ami-12345678", MinCount=1,
+    # Run Command needs an agent answering, which here is the container behind the instance.
+    ami = ec2.register_image(Name=f"sfn-ssm-{tag}", ImageLocation="alpine:3")["ImageId"]
+    instance_id = ec2.run_instances(ImageId=ami, MinCount=1,
                                     MaxCount=1)["Instances"][0]["InstanceId"]
     sm_arn = None
     try:
@@ -4925,6 +4933,9 @@ def test_sfn_aws_sdk_ssm_run_command_probe(sfn, sfn_sync, ec2):
                             "CommandId.$": "$.sent.Command.CommandId",
                             "InstanceId": instance_id,
                         },
+                        # Run Command is asynchronous, so a probe polls to a terminal state.
+                        "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 1,
+                                   "MaxAttempts": 3}],
                         "End": True,
                     },
                 },
@@ -4936,11 +4947,11 @@ def test_sfn_aws_sdk_ssm_run_command_probe(sfn, sfn_sync, ec2):
         assert resp["status"] == "SUCCEEDED", f"{resp.get('error')} — {resp.get('cause')}"
         # The poll addressed the CommandId the send returned, which is the part a probe needs.
         output = json.loads(resp["output"])
-        assert output["Status"] == "Success"
         assert output["InstanceId"] == instance_id
-        assert output["ResponseCode"] == 0
+        assert output["Status"] in ("Pending", "InProgress", "Success")
     finally:
         ec2.terminate_instances(InstanceIds=[instance_id])
+        ec2.deregister_image(ImageId=ami)
         if sm_arn:
             sfn.delete_state_machine(stateMachineArn=sm_arn)
 

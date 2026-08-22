@@ -793,46 +793,104 @@ def test_cloudformation_ssm_parameter_is_region_scoped():
         set_request_region(original_region)
 
 
-def test_ssm_run_command_health_probe(ssm, ec2):
-    """The Run Command shape a health probe needs: send, then poll to a terminal invocation."""
-    tag = _uuid_mod.uuid4().hex[:8]
-    instance_id = ec2.run_instances(ImageId="ami-12345678", MinCount=1, MaxCount=1,
-                                    TagSpecifications=[{"ResourceType": "instance",
-                                                        "Tags": [{"Key": f"ssm-{tag}",
-                                                                  "Value": tag}]}],
-                                    )["Instances"][0]["InstanceId"]
+# ── Run Command helpers ────────────────────────────────────
+# A command needs an agent answering, and this emulator's agent is the container behind the
+# instance. So the tests that send a command register an AMI and launch a real box; the ones that
+# prove refusal do not need one.
+
+
+def _docker_reachable():
     try:
-        command = ssm.send_command(InstanceIds=[instance_id], DocumentName="AWS-RunShellScript",
-                                   Comment=f"probe {tag}",
-                                   Parameters={"commands": ["echo ok"]})["Command"]
-        assert command["CommandId"]
-        assert command["DocumentName"] == "AWS-RunShellScript"
-        assert command["InstanceIds"] == [instance_id]
-        assert command["TargetCount"] == 1
+        import docker as _probe
 
-        # Nothing runs, so the output is empty; what a polling caller needs is a terminal Status.
-        inv = ssm.get_command_invocation(CommandId=command["CommandId"], InstanceId=instance_id)
-        assert inv["Status"] == "Success"
-        assert inv["StatusDetails"] == "Success"
-        assert inv["ResponseCode"] == 0
-        assert inv["StandardOutputContent"] == ""
-        assert inv["DocumentName"] == "AWS-RunShellScript"
-        # These are strings in the SSM model, not timestamps, so boto3 must not have parsed them.
-        assert isinstance(inv["ExecutionStartDateTime"], str)
-        assert isinstance(inv["ExecutionEndDateTime"], str)
+        _probe.from_env(timeout=5).ping()
+        return True
+    except Exception:
+        return False
 
-        # A caller that checks whether the instance is managed before sending must see it.
-        info = ssm.describe_instance_information()["InstanceInformationList"]
-        mine = [i for i in info if i["InstanceId"] == instance_id]
-        assert len(mine) == 1
-        assert mine[0]["PingStatus"] == "Online"
-        assert mine[0]["ResourceType"] == "EC2Instance"
+
+requires_docker = pytest.mark.skipif(
+    not _docker_reachable(), reason="no reachable Docker daemon")
+
+
+@pytest.fixture
+def boxed_instance(ec2):
+    """A running instance with a container behind it, so SSM can reach it."""
+    ami = ec2.register_image(Name=f"ssm-{_uuid_mod.uuid4().hex[:8]}",
+                             ImageLocation="alpine:3")["ImageId"]
+    instance_id = ec2.run_instances(ImageId=ami, MinCount=1,
+                                    MaxCount=1)["Instances"][0]["InstanceId"]
+    try:
+        yield instance_id
     finally:
         ec2.terminate_instances(InstanceIds=[instance_id])
+        ec2.deregister_image(ImageId=ami)
+
+
+def _poll_invocation(ssm, command_id, instance_id, timeout=30):
+    """Run Command is asynchronous on AWS, so a caller polls to a terminal state."""
+    deadline = time.time() + timeout
+    terminal = {"Success", "Failed", "Cancelled", "TimedOut"}
+    while time.time() < deadline:
+        inv = ssm.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
+        if inv["Status"] in terminal:
+            return inv
+        time.sleep(0.2)
+    raise AssertionError(f"invocation never reached a terminal state: {inv['Status']}")
+
+
+@requires_docker
+def test_ssm_run_command_health_probe(ssm, boxed_instance):
+    """The Run Command shape a health probe needs: send, then poll to a terminal invocation."""
+    tag = _uuid_mod.uuid4().hex[:8]
+    command = ssm.send_command(InstanceIds=[boxed_instance], DocumentName="AWS-RunShellScript",
+                               Comment=f"probe {tag}",
+                               Parameters={"commands": ["echo ok"]})["Command"]
+    assert command["CommandId"]
+    assert command["DocumentName"] == "AWS-RunShellScript"
+    assert command["InstanceIds"] == [boxed_instance]
+    assert command["TargetCount"] == 1
+    # SendCommand answers before the command has been delivered, as on AWS.
+    assert command["Status"] == "Pending"
+    assert command["CompletedCount"] == 0
+
+    inv = _poll_invocation(ssm, command["CommandId"], boxed_instance)
+    assert inv["Status"] == "Success"
+    assert inv["StatusDetails"] == "Success"
+    assert inv["ResponseCode"] == 0
+    # The script actually ran in the box.
+    assert inv["StandardOutputContent"].strip() == "ok"
+    assert inv["DocumentName"] == "AWS-RunShellScript"
+    # These are strings in the SSM model, not timestamps, so boto3 must not have parsed them.
+    assert isinstance(inv["ExecutionStartDateTime"], str)
+    assert isinstance(inv["ExecutionEndDateTime"], str)
+
+    # A caller that checks whether the instance is managed before sending must see it.
+    info = ssm.describe_instance_information()["InstanceInformationList"]
+    mine = [i for i in info if i["InstanceId"] == boxed_instance]
+    assert len(mine) == 1
+    assert mine[0]["PingStatus"] == "Online"
+    assert mine[0]["ResourceType"] == "EC2Instance"
+
+
+@requires_docker
+def test_ssm_run_command_probe_can_fail(ssm, boxed_instance):
+    """The point of a real box: a health check that is wrong reports Failed, not Success."""
+    command = ssm.send_command(InstanceIds=[boxed_instance], DocumentName="AWS-RunShellScript",
+                               Parameters={"commands": ["echo bad >&2", "exit 7"]})["Command"]
+    inv = _poll_invocation(ssm, command["CommandId"], boxed_instance)
+    assert inv["Status"] == "Failed"
+    assert inv["StatusDetails"] == "Failed"
+    assert inv["ResponseCode"] == 7
+    assert inv["StandardErrorContent"].strip() == "bad"
+    listed = ssm.list_commands(CommandId=command["CommandId"])["Commands"][0]
+    assert listed["Status"] == "Failed"
+    assert listed["ErrorCount"] == 1
 
 
 def test_ssm_send_command_validates_the_instance(ssm, ec2):
-    """An instance that does not exist, is gone, or is stopped is rejected, a running one taken."""
+    """AWS folds several problems into InvalidInstanceId: no such node, a terminated one, and
+    an agent that is not running. A metadata-only instance is the last of those."""
     with pytest.raises(ClientError) as exc:
         ssm.send_command(InstanceIds=["i-00000000000000000"], DocumentName="AWS-RunShellScript")
     assert exc.value.response["Error"]["Code"] == "InvalidInstanceId"
@@ -844,41 +902,48 @@ def test_ssm_send_command_validates_the_instance(ssm, ec2):
         ssm.send_command(InstanceIds=[instance_id], DocumentName="AWS-RunShellScript")
     assert exc.value.response["Error"]["Code"] == "InvalidInstanceId"
 
-    # A stopped box has no agent answering, so real SSM refuses it and stops listing it.
-    stopped = ec2.run_instances(ImageId="ami-12345678", MinCount=1,
+    # Running, but nothing is behind it, so no agent is answering — which is one of the causes
+    # AWS lists for this error. It is not listed as a managed node either.
+    boxless = ec2.run_instances(ImageId="ami-12345678", MinCount=1,
                                 MaxCount=1)["Instances"][0]["InstanceId"]
     try:
-        ec2.stop_instances(InstanceIds=[stopped])
         with pytest.raises(ClientError) as exc:
-            ssm.send_command(InstanceIds=[stopped], DocumentName="AWS-RunShellScript")
+            ssm.send_command(InstanceIds=[boxless], DocumentName="AWS-RunShellScript")
         assert exc.value.response["Error"]["Code"] == "InvalidInstanceId"
         listed = [i["InstanceId"]
                   for i in ssm.describe_instance_information()["InstanceInformationList"]]
-        assert stopped not in listed
+        assert boxless not in listed
     finally:
-        ec2.terminate_instances(InstanceIds=[stopped])
-
-    # Rejecting everything would pass every assertion above, so prove a running one is taken.
-    live = ec2.run_instances(ImageId="ami-12345678", MinCount=1,
-                             MaxCount=1)["Instances"][0]["InstanceId"]
-    try:
-        assert ssm.send_command(InstanceIds=[live],
-                                DocumentName="AWS-RunShellScript")["Command"]["CommandId"]
-    finally:
-        ec2.terminate_instances(InstanceIds=[live])
+        ec2.terminate_instances(InstanceIds=[boxless])
 
 
+@requires_docker
+def test_ssm_send_command_accepts_a_managed_instance(ssm, boxed_instance):
+    """Rejecting everything would satisfy the refusals above, so prove one is taken."""
+    assert ssm.send_command(InstanceIds=[boxed_instance],
+                            DocumentName="AWS-RunShellScript",
+                            Parameters={"commands": ["true"]})["Command"]["CommandId"]
+    listed = [i["InstanceId"]
+              for i in ssm.describe_instance_information()["InstanceInformationList"]]
+    assert boxed_instance in listed
+
+
+@requires_docker
 def test_ssm_command_lookup_filters_and_errors(ssm, ec2):
     """listCommands narrows by command and instance; unknown ids get what AWS answers."""
-    instance_id = ec2.run_instances(ImageId="ami-12345678", MinCount=1,
+    ami = ec2.register_image(Name=f"ssm-lookup-{_uuid_mod.uuid4().hex[:8]}",
+                             ImageLocation="alpine:3")["ImageId"]
+    instance_id = ec2.run_instances(ImageId=ami, MinCount=1,
                                     MaxCount=1)["Instances"][0]["InstanceId"]
-    other_id = ec2.run_instances(ImageId="ami-12345678", MinCount=1,
+    other_id = ec2.run_instances(ImageId=ami, MinCount=1,
                                  MaxCount=1)["Instances"][0]["InstanceId"]
     try:
         mine = ssm.send_command(InstanceIds=[instance_id],
-                                DocumentName="AWS-RunShellScript")["Command"]["CommandId"]
+                                DocumentName="AWS-RunShellScript",
+                                Parameters={"commands": ["true"]})["Command"]["CommandId"]
         theirs = ssm.send_command(InstanceIds=[other_id],
-                                  DocumentName="AWS-RunShellScript")["Command"]["CommandId"]
+                                  DocumentName="AWS-RunShellScript",
+                                  Parameters={"commands": ["true"]})["Command"]["CommandId"]
 
         assert [c["CommandId"] for c in ssm.list_commands(CommandId=mine)["Commands"]] == [mine]
         by_instance = [c["CommandId"] for c in ssm.list_commands(InstanceId=other_id)["Commands"]]
@@ -899,3 +964,4 @@ def test_ssm_command_lookup_filters_and_errors(ssm, ec2):
         assert exc.value.response["Error"]["Code"] == "InvocationDoesNotExist"
     finally:
         ec2.terminate_instances(InstanceIds=[instance_id, other_id])
+        ec2.deregister_image(ImageId=ami)

@@ -3603,3 +3603,530 @@ def test_ec2_allocated_address_is_a_valid_ipv4(ec2):
         ipaddress.ip_address(described["PublicIp"])
     finally:
         ec2.release_address(AllocationId=alloc["AllocationId"])
+
+
+# ---------------------------------------------------------------------------
+# Registered AMIs and container-backed instances
+# ---------------------------------------------------------------------------
+# Unit tier: in-process against a faked Docker client, so it runs with no
+# daemon. Live tier: gated on a reachable daemon, probed rather than read from
+# an env var CI never sets.
+
+import ministack.services.ec2 as ec2mod
+
+
+def _docker_reachable():
+    try:
+        import docker as _probe
+
+        _probe.from_env(timeout=5).ping()
+        return True
+    except Exception:
+        return False
+
+
+requires_docker = pytest.mark.skipif(
+    not _docker_reachable(), reason="no reachable Docker daemon")
+
+
+class _FakeContainer:
+    def __init__(self, name, kwargs, registry, ip="172.30.0.9", network="testnet",
+                 shell=True):
+        self.id = f"cid-{name}"
+        self.name = name
+        self.kwargs = kwargs
+        self.status = "running"
+        self.attrs = {"NetworkSettings": {"Networks": {network: {"IPAddress": ip}}}}
+        self.execs = []
+        self.stop_calls = self.start_calls = self.restart_calls = self.remove_calls = 0
+        self._registry = registry
+        self._shell = shell
+
+    def reload(self):
+        pass
+
+    def exec_run(self, cmd, demux=False, **kw):
+        self.execs.append(cmd)
+        if not self._shell:
+            raise RuntimeError("no shell in image")
+        out = (b"out", b"err") if demux else b"out"
+
+        class _R:
+            exit_code = 0
+            output = out
+        return _R()
+
+    def start(self):
+        self.start_calls += 1
+        self.status = "running"
+
+    def stop(self, timeout=10):
+        self.stop_calls += 1
+        self.status = "exited"
+
+    def restart(self, timeout=10):
+        self.restart_calls += 1
+
+    def remove(self, force=False, v=False):
+        self.remove_calls += 1
+        self._registry.pop(self.id, None)
+        self._registry.pop(self.name, None)
+
+
+def _fake_docker(run_error=None, shell=True):
+    registry, runs = {}, []
+
+    class _Containers:
+        def run(self, image, **kwargs):
+            if run_error is not None:
+                raise run_error
+            runs.append({"image": image, **kwargs})
+            c = _FakeContainer(kwargs["name"], kwargs, registry, shell=shell)
+            registry[c.id] = registry[c.name] = c
+            return c
+
+        def get(self, ref):
+            if ref not in registry:
+                from docker import errors
+                raise errors.NotFound("absent")
+            return registry[ref]
+
+        def list(self, all=False, filters=None):
+            want = (filters or {}).get("label") or []
+            want = [want] if isinstance(want, str) else list(want)
+            out = []
+            for c in set(registry.values()):
+                have = {f"{k}={v}" for k, v in c.kwargs.get("labels", {}).items()}
+                if not [w for w in want if w not in have]:
+                    out.append(c)
+            return out
+
+    class _Docker:
+        def __init__(self):
+            self.containers = _Containers()
+
+        def ping(self):
+            return True
+
+    d = _Docker()
+    d._registry, d._runs = registry, runs
+    return d
+
+
+@pytest.fixture
+def vm(monkeypatch):
+    """A faked Docker daemon wired into the ec2 module, with state torn down."""
+    fake = _fake_docker()
+    monkeypatch.setattr(ec2mod, "_get_docker", lambda: fake)
+    monkeypatch.setattr(ec2mod, "_get_ministack_network", lambda _c: "testnet")
+    created = []
+    yield fake, created
+    for iid in created:
+        ec2mod._instances.pop(iid, None)
+    for key in list(ec2mod._images.keys()):
+        ec2mod._images.pop(key, None)
+
+
+def _register(location="example/box:1", name="box"):
+    resp = ec2mod._register_image({"Name": [name], "ImageLocation": [location]})
+    import re as _re
+    return _re.search(r"<imageId>(ami-[0-9a-f]+)</imageId>", resp[2].decode()).group(1)
+
+
+def _launch(ami, count=1):
+    resp = ec2mod._run_instances({"ImageId": [ami], "MinCount": [str(count)],
+                                  "MaxCount": [str(count)]})
+    import re as _re
+    body = resp[2].decode()
+    return _re.findall(r"<instanceId>(i-[0-9a-f]+)</instanceId>", body), resp
+
+
+def test_ec2_register_image_round_trips(ec2):
+    reg = ec2.register_image(Name=f"box-{_uuid_mod.uuid4().hex[:8]}",
+                             ImageLocation="alpine:3", Description="desc",
+                             Architecture="x86_64")
+    ami = reg["ImageId"]
+    try:
+        assert ami.startswith("ami-") and len(ami) == len("ami-") + 17
+        img = ec2.describe_images(ImageIds=[ami])["Images"][0]
+        assert img["State"] == "available"
+        # A container has no persistent root disk: instance-store semantics,
+        # so no EBS root mapping either.
+        assert img["RootDeviceType"] == "instance-store"
+        assert img["RootDeviceName"] == "/dev/sda1"
+        assert img.get("BlockDeviceMappings", []) == []
+        assert img["Description"] == "desc"
+        assert img["Public"] is False
+    finally:
+        ec2.deregister_image(ImageId=ami)
+    with pytest.raises(ClientError) as exc:
+        ec2.deregister_image(ImageId=ami)
+    assert exc.value.response["Error"]["Code"] == "InvalidAMIID.NotFound"
+
+
+def test_ec2_register_image_accepts_a_bare_name(ec2):
+    # Only Name is required on AWS — ImageLocation and BlockDeviceMapping.N are both optional and
+    # registration never checks the result can boot. Refusing here would be stricter than AWS,
+    # which is the failure mode that bites: code that works against AWS breaking locally.
+    ami = ec2.register_image(Name=f"bare-{_uuid_mod.uuid4().hex[:8]}")["ImageId"]
+    try:
+        img = ec2.describe_images(ImageIds=[ami])["Images"][0]
+        assert img["RootDeviceType"] == "ebs"
+        # Documented RegisterImage defaults.
+        assert img["Architecture"] == "i386"
+        assert img["VirtualizationType"] == "paravirtual"
+        # Nothing to boot, so the failure lands on the call that cannot do it.
+        with pytest.raises(ClientError) as exc:
+            ec2.run_instances(ImageId=ami, MinCount=1, MaxCount=1)
+        assert exc.value.response["Error"]["Code"] == "InvalidAMIID.Unavailable"
+    finally:
+        ec2.deregister_image(ImageId=ami)
+
+
+def test_ec2_register_image_rejects_a_malformed_name(ec2):
+    # "AMI names must be between 3 and 128 characters long, and may only contain letters,
+    # numbers, and the following special characters..."
+    for bad in ("a" * 129, "no,commas", "semi;colon"):
+        with pytest.raises(ClientError) as exc:
+            ec2.register_image(Name=bad, ImageLocation="alpine:3")
+        assert exc.value.response["Error"]["Code"] == "InvalidAMIName.Malformed", bad
+
+
+def test_ec2_describe_images_filters_registered_and_stubs(ec2):
+    unique = _uuid_mod.uuid4().hex[:8]
+    ami = ec2.register_image(Name=f"filtered-{unique}", ImageLocation="alpine:3")["ImageId"]
+    try:
+        by_name = ec2.describe_images(
+            Filters=[{"Name": "name", "Values": [f"filtered-{unique}"]}])["Images"]
+        assert [i["ImageId"] for i in by_name] == [ami]
+        wildcard = ec2.describe_images(
+            Filters=[{"Name": "name", "Values": ["filtered-*"]}])["Images"]
+        assert ami in [i["ImageId"] for i in wildcard]
+        assert ec2.describe_images(
+            Filters=[{"Name": "name", "Values": ["nothing-matches"]}])["Images"] == []
+        # The stub AMIs are still listed, so a workload naming one still works.
+        assert len(ec2.describe_images()["Images"]) >= 4
+    finally:
+        ec2.deregister_image(ImageId=ami)
+
+
+def test_ec2_unregistered_ami_never_touches_docker(monkeypatch):
+    def _boom():
+        raise AssertionError("Docker must not be reached with no image registered")
+
+    monkeypatch.setattr(ec2mod, "_get_docker", _boom)
+    iids, _ = _launch("ami-00000000")
+    try:
+        inst = ec2mod._instances[iids[0]]
+        assert "VmManager" not in inst
+        assert "_container_id" not in inst
+    finally:
+        for iid in iids:
+            ec2mod._instances.pop(iid, None)
+
+
+def test_ec2_registered_ami_boots_a_container(vm):
+    fake, created = vm
+    ami = _register("example/box:1")
+    iids, _ = _launch(ami)
+    created.extend(iids)
+    assert len(fake._runs) == 1
+    run = fake._runs[0]
+    assert run["image"] == "example/box:1"
+    assert run["init"] is True
+    # A real instance does not exit the moment it boots.
+    assert run["command"] == ["sleep", "infinity"]
+    assert run["network"] == "testnet"
+    assert run["labels"]["ministack"] == "ec2"
+    assert run["labels"]["instance_id"] == iids[0]
+    inst = ec2mod._instances[iids[0]]
+    assert inst["VmManager"] == "docker"
+    assert inst["PrivateIpAddress"] == "172.30.0.9"
+    assert inst["PublicIpAddress"] == "172.30.0.9"
+    assert inst["PrivateDnsName"] == "ip-172-30-0-9.ec2.internal"
+
+
+def test_ec2_failed_boot_backs_every_record_out(monkeypatch):
+    fake = _fake_docker(run_error=RuntimeError("no such image"))
+    monkeypatch.setattr(ec2mod, "_get_docker", lambda: fake)
+    monkeypatch.setattr(ec2mod, "_get_ministack_network", lambda _c: "testnet")
+    ami = _register("example/missing:1")
+    try:
+        volumes_before = len(list(ec2mod._volumes.keys()))
+        instances_before = len(list(ec2mod._instances.keys()))
+        resp = ec2mod._run_instances({"ImageId": [ami], "MinCount": ["2"], "MaxCount": ["2"]})
+        assert resp[0] == 500
+        assert b"InternalError" in resp[2]
+        # No phantom instance, and no orphaned synthetic root volume.
+        assert len(list(ec2mod._instances.keys())) == instances_before
+        assert len(list(ec2mod._volumes.keys())) == volumes_before
+    finally:
+        ec2mod._images.pop(ami, None)
+
+
+def test_ec2_dead_container_reports_terminated(vm):
+    fake, created = vm
+    ami = _register("example/box:1")
+    iids, _ = _launch(ami)
+    created.extend(iids)
+    inst = ec2mod._instances[iids[0]]
+    fake._registry[inst["_container_id"]].status = "exited"
+    ec2mod._vm_reconcile_running([inst])
+    # Instance-store backed: a lost root disk is a lost instance, so AWS
+    # terminates rather than stops.
+    assert inst["State"]["Name"] == "terminated"
+    assert "_container_id" not in inst
+
+
+def test_ec2_container_backed_instance_cannot_stop_or_start(vm):
+    _fake, created = vm
+    ami = _register("example/box:1")
+    iids, _ = _launch(ami)
+    created.extend(iids)
+    for handler in (ec2mod._stop_instances, ec2mod._start_instances):
+        resp = handler({"InstanceId.1": [iids[0]]})
+        assert resp[0] == 400
+        assert b"UnsupportedOperation" in resp[2]
+        assert b"instance store-backed" in resp[2]
+
+
+def test_ec2_container_backed_instance_is_instance_store(vm):
+    _fake, created = vm
+    ami = _register("example/box:1")
+    iids, _ = _launch(ami)
+    created.extend(iids)
+    inst = ec2mod._instances[iids[0]]
+    # No EBS root volume exists for an instance-store instance.
+    assert inst["RootDeviceType"] == "instance-store"
+    assert inst["BlockDeviceMappings"] == []
+
+
+def test_ec2_snapshot_backed_registration_is_accepted(ec2):
+    # Registration is metadata-only on AWS: it does not check the image can
+    # boot, so neither do we. import-snapshot then register-image is the
+    # ordinary Packer/Terraform flow.
+    snap = ec2.create_snapshot(VolumeId=ec2.create_volume(
+        AvailabilityZone="us-east-1a", Size=8)["VolumeId"])["SnapshotId"]
+    ami = ec2.register_image(
+        Name=f"snap-{_uuid_mod.uuid4().hex[:8]}",
+        RootDeviceName="/dev/xvda",
+        BlockDeviceMappings=[{"DeviceName": "/dev/xvda",
+                              "Ebs": {"SnapshotId": snap, "VolumeSize": 8}}])["ImageId"]
+    try:
+        img = ec2.describe_images(ImageIds=[ami])["Images"][0]
+        assert img["RootDeviceType"] == "ebs"
+        assert img["BlockDeviceMappings"][0]["Ebs"]["SnapshotId"] == snap
+        # The divergence lands on the call that genuinely cannot do the thing.
+        with pytest.raises(ClientError) as exc:
+            ec2.run_instances(ImageId=ami, MinCount=1, MaxCount=1)
+        assert exc.value.response["Error"]["Code"] == "InvalidAMIID.Unavailable"
+        assert not [r for r in ec2.describe_instances(
+            Filters=[{"Name": "image-id", "Values": [ami]}])["Reservations"]]
+    finally:
+        ec2.deregister_image(ImageId=ami)
+
+
+def test_ec2_terminate_removes_the_container(vm):
+    fake, created = vm
+    ami = _register("example/box:1")
+    iids, _ = _launch(ami)
+    created.extend(iids)
+    cid = ec2mod._instances[iids[0]]["_container_id"]
+    ec2mod._terminate_instances({"InstanceId.1": [iids[0]]})
+    assert cid not in fake._registry
+
+
+def test_ec2_state_round_trip_reports_restored_boxes_stopped(vm):
+    fake, created = vm
+    ami = _register("example/box:1")
+    iids, _ = _launch(ami)
+    created.extend(iids)
+    state = ec2mod.get_state()
+    saved = state["instances"].get(iids[0])
+    # Container handles would dangle after a restart; the image id must survive
+    # so StartInstances can relaunch.
+    assert "_container_id" not in saved
+    assert saved["VmManager"] == "docker"
+    assert saved["ImageId"] == ami
+    ec2mod._reconcile_backed_instances_after_restore()
+    assert ec2mod._instances[iids[0]]["State"]["Name"] == "terminated"
+
+
+def test_ec2_instance_without_a_shell_is_unmanaged(monkeypatch):
+    fake = _fake_docker(shell=False)
+    monkeypatch.setattr(ec2mod, "_get_docker", lambda: fake)
+    monkeypatch.setattr(ec2mod, "_get_ministack_network", lambda _c: "testnet")
+    ami = _register("example/distroless:1")
+    iids, _ = _launch(ami)
+    try:
+        # No shell is this emulator's analogue of no SSM agent: AWS refuses
+        # commands for an unmanaged instance and so do we.
+        assert ec2mod.instance_is_managed(iids[0]) is False
+    finally:
+        for iid in iids:
+            ec2mod._instances.pop(iid, None)
+        ec2mod._images.pop(ami, None)
+
+
+def test_ec2_managed_instance_execs(vm):
+    fake, created = vm
+    ami = _register("example/box:1")
+    iids, _ = _launch(ami)
+    created.extend(iids)
+    assert ec2mod.instance_is_managed(iids[0]) is True
+    code, out, err = ec2mod.exec_in_instance_blocking(iids[0], ["/bin/sh", "-c", "true"])
+    assert (code, out, err) == (0, "out", "err")
+
+
+def test_ec2_exec_on_instance_without_a_box_fails(vm):
+    _fake, created = vm
+    iids, _ = _launch("ami-00000000")
+    created.extend(iids)
+    code, _out, err = ec2mod.exec_in_instance_blocking(iids[0], ["/bin/sh", "-c", "true"])
+    assert code == 255
+    assert "no backing container" in err
+
+
+@requires_docker
+def test_ec2_docker_end_to_end_live(ec2):
+    ami = ec2.register_image(Name=f"live-{_uuid_mod.uuid4().hex[:8]}",
+                             ImageLocation="alpine:3")["ImageId"]
+    iid = None
+    try:
+        iid = ec2.run_instances(ImageId=ami, MinCount=1,
+                                MaxCount=1)["Instances"][0]["InstanceId"]
+        inst = ec2.describe_instances(
+            InstanceIds=[iid])["Reservations"][0]["Instances"][0]
+        assert inst["State"]["Name"] == "running"
+        # The reported address is the container's, not a synthetic 10.x.
+        assert not inst["PrivateIpAddress"].startswith("10.0.")
+        import docker
+        client = docker.from_env(timeout=10)
+        assert [c for c in client.containers.list() if iid in c.name]
+        ec2.terminate_instances(InstanceIds=[iid])
+        iid = None
+        time.sleep(1)
+        assert not [c for c in client.containers.list(all=True) if ami in c.name]
+    finally:
+        if iid:
+            ec2.terminate_instances(InstanceIds=[iid])
+        ec2.deregister_image(ImageId=ami)
+
+
+def test_ec2_ami_names_are_unique_per_account_and_region(ec2):
+    """AMI names are unique per account per region on AWS, not globally."""
+    name = f"shared-{_uuid_mod.uuid4().hex[:8]}"
+    ami = ec2.register_image(Name=name, ImageLocation="alpine:3")["ImageId"]
+    other_account = _ec2_client("us-east-1", account_id="123456789012")
+    other_region = _ec2_client("eu-west-1")
+    ami_other_account = ami_other_region = None
+    try:
+        with pytest.raises(ClientError) as exc:
+            ec2.register_image(Name=name, ImageLocation="alpine:3")
+        assert exc.value.response["Error"]["Code"] == "InvalidAMIName.Duplicate"
+        # The same name is free in another account and in another region.
+        ami_other_account = other_account.register_image(
+            Name=name, ImageLocation="alpine:3")["ImageId"]
+        ami_other_region = other_region.register_image(
+            Name=name, ImageLocation="alpine:3")["ImageId"]
+        assert len({ami, ami_other_account, ami_other_region}) == 3
+        # And they do not leak into each other's DescribeImages.
+        assert ami not in [i["ImageId"] for i in other_account.describe_images(
+            Filters=[{"Name": "name", "Values": [name]}])["Images"]]
+    finally:
+        ec2.deregister_image(ImageId=ami)
+        if ami_other_account:
+            other_account.deregister_image(ImageId=ami_other_account)
+        if ami_other_region:
+            other_region.deregister_image(ImageId=ami_other_region)
+
+
+def test_ec2_name_is_free_again_after_deregister(ec2):
+    name = f"recycled-{_uuid_mod.uuid4().hex[:8]}"
+    first = ec2.register_image(Name=name, ImageLocation="alpine:3")["ImageId"]
+    ec2.deregister_image(ImageId=first)
+    second = ec2.register_image(Name=name, ImageLocation="alpine:3")["ImageId"]
+    try:
+        assert second != first
+        assert [i["ImageId"] for i in ec2.describe_images(
+            Filters=[{"Name": "name", "Values": [name]}])["Images"]] == [second]
+    finally:
+        ec2.deregister_image(ImageId=second)
+
+
+def test_ec2_describe_images_filters_apply_to_the_stubs(ec2):
+    """The stubs now flow through the same filter path as registered images."""
+    ami = ec2.register_image(Name=f"lin-{_uuid_mod.uuid4().hex[:8]}",
+                             ImageLocation="alpine:3")["ImageId"]
+    try:
+        windows = ec2.describe_images(
+            Filters=[{"Name": "platform", "Values": ["windows"]}])["Images"]
+        # Only the Windows stub carries a platform; a registered image has none.
+        assert [i["ImageId"] for i in windows] == ["ami-0fedcba9876543210"]
+        assert ami not in [i["ImageId"] for i in windows]
+
+        public = ec2.describe_images(
+            Filters=[{"Name": "is-public", "Values": ["true"]}])["Images"]
+        assert {i["ImageId"] for i in public} == {
+            "ami-0abcdef1234567890", "ami-0123456789abcdef0", "ami-0fedcba9876543210"}
+
+        private = ec2.describe_images(
+            Filters=[{"Name": "is-public", "Values": ["false"]}])["Images"]
+        assert ami in [i["ImageId"] for i in private]
+
+        # root-device-type separates the two kinds.
+        ebs = [i["ImageId"] for i in ec2.describe_images(
+            Filters=[{"Name": "root-device-type", "Values": ["ebs"]}])["Images"]]
+        assert ami not in ebs and "ami-0abcdef1234567890" in ebs
+    finally:
+        ec2.deregister_image(ImageId=ami)
+
+
+def test_ec2_container_instance_creates_no_root_volume(vm):
+    """Instance-store means no synthetic root volume, and nothing may quietly
+    add one back — it would contradict the stop/start refusal."""
+    _fake, created = vm
+    before = {v["VolumeId"] for v in ec2mod._volumes.values()}
+    ami = _register("example/box:1")
+    iids, _ = _launch(ami)
+    created.extend(iids)
+    after = {v["VolumeId"] for v in ec2mod._volumes.values()}
+    assert after == before
+    inst = ec2mod._instances[iids[0]]
+    assert inst["BlockDeviceMappings"] == []
+    assert inst["RootDeviceType"] == "instance-store"
+    assert not [v for v in ec2mod._volumes.values()
+                for a in v.get("Attachments", []) if a.get("InstanceId") == iids[0]]
+
+
+def test_ec2_unpullable_image_is_a_client_error(ec2):
+    """A reference that cannot be pulled is the caller's problem, not the
+    server's — retrying an InternalError here would fail identically forever."""
+    ami = ec2.register_image(Name=f"nopull-{_uuid_mod.uuid4().hex[:8]}",
+                             ImageLocation="ministack-nonexistent/nope:404")["ImageId"]
+    try:
+        with pytest.raises(ClientError) as exc:
+            ec2.run_instances(ImageId=ami, MinCount=1, MaxCount=1)
+        err = exc.value.response["Error"]
+        assert err["Code"] == "InvalidAMIID.Unavailable"
+        assert "could not be pulled" in err["Message"]
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    finally:
+        ec2.deregister_image(ImageId=ami)
+
+
+def test_ec2_deregister_does_not_orphan_a_running_box(vm):
+    """A registration can be withdrawn while its instances are still running, so the
+    describe-time reconcile must not be gated on the registry still holding the image."""
+    fake, created = vm
+    ami = _register("example/box:1")
+    iids, _ = _launch(ami)
+    created.extend(iids)
+    ec2mod._deregister_image({"ImageId": [ami]})
+    assert not ec2mod._any_image_registered()
+    # Still true, because a container of ours is out there.
+    assert ec2mod._docker_touched()
+    inst = ec2mod._instances[iids[0]]
+    fake._registry[inst["_container_id"]].status = "exited"
+    ec2mod._vm_reconcile_running([inst])
+    assert inst["State"]["Name"] == "terminated"
