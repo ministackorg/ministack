@@ -24,7 +24,6 @@ with the event piped through stdin (safe from injection).
 SQS event source mappings poll the queue in a background thread.
 """
 
-import asyncio
 import base64
 import contextvars
 import copy
@@ -48,16 +47,20 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote, unquote
 
+from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import run_reentrant
 from ministack.core.lambda_runtime import (
     INVOKE_DEPTH_BOOTSTRAP,
     INVOKE_DEPTH_ENV,
     INVOKE_DEPTH_EVENT_KEY,
     INVOKE_DEPTH_HEADER,
-    get_or_create_worker,
+    acquire_worker,
     invalidate_worker,
+    reap_idle_workers,
+    release_worker,
 )
-from ministack.core.persistence import PERSIST_STATE, STATE_DIR, load_state
+from ministack.core.persistence import STATE_DIR, load_state
 from ministack.core.responses import (
     _12_DIGIT_RE,
     AccountRegionScopedDict,
@@ -73,6 +76,11 @@ from ministack.core.responses import (
 )
 
 logger = logging.getLogger("lambda")
+
+# Cap any single Docker daemon call. docker-py defaults to 60s, which turns a
+# slow or wedged daemon into a minutes-long stall on a request path.
+_DOCKER_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
+
 
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 
@@ -301,7 +309,7 @@ def _get_docker_client():
     if not _docker_available:
         return None
     try:
-        _cached_docker_client = docker_lib.from_env()
+        _cached_docker_client = docker_lib.from_env(timeout=_DOCKER_TIMEOUT)
         return _cached_docker_client
     except Exception:
         return None
@@ -2583,7 +2591,8 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
     # RequestResponse — execute in worker thread so nested SDK calls
     # from the Lambda process can still reach this ASGI server.
     _t_start = time.time()
-    result = await asyncio.to_thread(_execute_function_with_config_scope, exec_record, event)
+    result = await run_reentrant(_execute_function_with_config_scope, exec_record, event,
+                                 thread_name="ministack-lambda-invoke")
     _duration_ms = (time.time() - _t_start) * 1000.0
     _emit_lambda_metrics(
         name,
@@ -2763,10 +2772,73 @@ _KEEPALIVE_KILL_ON_RELEASE = os.environ.get("LAMBDA_KEEPALIVE_MS", "").strip() =
 # Per-function concurrency: only applied when ReservedConcurrentExecutions is
 # explicitly set on the function. Otherwise the function can consume the
 # full account pool, matching AWS.
-# Account-level concurrency cap: AWS default is 1000. We default to unbounded
-# locally (a laptop can't actually run 1000 Lambda containers); users who
-# want AWS-exact throttling behaviour can set LAMBDA_ACCOUNT_CONCURRENCY.
-_ACCOUNT_CONCURRENCY_CAP = int(os.environ.get("LAMBDA_ACCOUNT_CONCURRENCY", "0"))  # 0 = unbounded
+# Per-invocation memory cost of an in-flight execution, measured: a chain of
+# depth 40 took the container to 871 MiB of cgroup memory, depth 20 to 464 MiB.
+_INFLIGHT_MIB = 21
+
+# Fraction of the memory budget concurrency may claim, leaving room for the
+# server itself, page cache, and whatever the handlers allocate.
+_INFLIGHT_BUDGET = 0.5
+
+# AWS's own default account concurrency. Never exceed it: a MiniStack that
+# throttled later than AWS would let code through that AWS rejects.
+_AWS_DEFAULT_ACCOUNT_CONCURRENCY = 1000
+
+
+def _memory_budget_bytes() -> int:
+    """Total memory this process may plan against — cgroup limit if capped."""
+    for path in ("/sys/fs/cgroup/memory.max",                    # cgroup v2
+                 "/sys/fs/cgroup/memory/memory.limit_in_bytes"):  # cgroup v1
+        try:
+            with open(path) as fh:
+                raw = fh.read().strip()
+            if raw and raw != "max":
+                value = int(raw)
+                # An uncapped cgroup reports a sentinel near 2**63; ignore it.
+                if 0 < value < (1 << 62):
+                    return value
+        except Exception:
+            pass
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except Exception:
+        return 2 * 1024 ** 3   # unknowable: assume a small box and stay safe
+
+
+def _default_account_concurrency() -> int:
+    """How many executions may be in flight before we throttle.
+
+    AWS defaults this to 1000 and throttles past it with
+    ``TooManyRequestsException``. MiniStack cannot run 1000 Lambda
+    subprocesses, and the previous default here was **unbounded** — the
+    reasoning being that a laptop can't do 1000 anyway. That is backwards: with
+    no bound, one self-recursing handler takes the process down. It is reachable
+    because ``MAX_INVOKE_DEPTH`` is enforced from a header that only botocore's
+    ``before-call`` hook sets, so a handler whose nested Invoke goes over raw
+    urllib or requests never increments the depth and never trips the limit.
+    Measured: such a handler OOM-killed a 2 GiB container in 8 seconds, 93
+    processes deep, where the depth check never fired once.
+
+    Depth therefore cannot be the safety bound — any transport that bypasses
+    botocore evades it. Concurrency has to be, because every executor passes
+    through ``_acquire_execution_slot`` regardless of how the caller got here.
+
+    Scales to the box so a big machine is not throttled at a small machine's
+    limit, and never exceeds AWS's own 1000. ``LAMBDA_ACCOUNT_CONCURRENCY``
+    still overrides, including ``0`` for genuinely unbounded.
+    """
+    raw = os.environ.get("LAMBDA_ACCOUNT_CONCURRENCY")
+    if raw is not None and raw.strip() != "":
+        try:
+            return int(raw)          # explicit wins, 0 still means unbounded
+        except ValueError:
+            logger.warning("LAMBDA_ACCOUNT_CONCURRENCY=%r is not an integer; using the default",
+                           raw)
+    budget_mib = (_memory_budget_bytes() * _INFLIGHT_BUDGET) / (1024 ** 2)
+    return max(16, min(_AWS_DEFAULT_ACCOUNT_CONCURRENCY, int(budget_mib // _INFLIGHT_MIB)))
+
+
+_ACCOUNT_CONCURRENCY_CAP = _default_account_concurrency()  # 0 = unbounded
 _reaper_started = False
 _reaper_lock = threading.Lock()
 
@@ -2795,7 +2867,7 @@ def _kill_pool_entry(entry: dict) -> None:
         except Exception:
             pass
         try:
-            container.remove(force=True)
+            container.remove(force=True, v=True)
         except Exception:
             pass
     tmpdir = entry.get("tmpdir")
@@ -2947,6 +3019,13 @@ def _ensure_reaper_thread() -> None:
                     _pool_evict_idle()
                 except Exception as exc:
                     logger.debug("Lambda pool reaper iteration error: %s", exc)
+                try:
+                    # Local executor: surplus warm *subprocesses* left behind by
+                    # a concurrency burst. Without this the per-function pools
+                    # only grow.
+                    reap_idle_workers()
+                except Exception as exc:
+                    logger.debug("Lambda worker reaper iteration error: %s", exc)
         threading.Thread(target=_loop, daemon=True, name="ministack-lambda-reaper").start()
         _reaper_started = True
 
@@ -3706,7 +3785,7 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
         "ports": {"8080/tcp": None},
         "detach": True,
         "stdin_open": False,
-        "labels": {"ministack": "lambda"},
+        "labels": container_reaper.own_labels("lambda"),
     }
     if package_type == "Image":
         # User image brings its own entrypoint. ImageConfig can override.
@@ -4039,6 +4118,80 @@ def _emit_lambda_logs(func: dict, request_id: str, log_text: str,
         logger.debug("CW Logs emit failed for %s: %s", func.get("config", {}).get("FunctionName"), exc)
 
 
+# ---------------------------------------------------------------------------
+# Concurrency accounting — executor-agnostic
+# ---------------------------------------------------------------------------
+#
+# AWS model: concurrent invocations of a function each occupy one unit of
+# concurrency. ReservedConcurrentExecutions caps a single function; the account
+# limit caps every function together. Neither queues — at the limit AWS returns
+# ConcurrentInvocationLimitExceeded (429).
+#
+# This lives at _execute_function rather than in any executor's worker pool
+# because MiniStack has six executors (warm subprocess, docker RIE, provided
+# runtime, proxy, one-off subprocess, and the ESM/WebSocket path) and only some
+# of them own a pool. Counting per pool undercounts every other path, so a
+# mixed deployment would silently never hit the cap.
+_inflight: dict[str, int] = {}
+_inflight_total = 0
+_inflight_lock = threading.Lock()
+
+
+def _inflight_key(config: dict) -> str:
+    try:
+        account, region = _account_region_from_function_config(config)
+    except Exception:
+        account, region = get_account_id(), get_region()
+    return f"{account}:{region}:{config.get('FunctionName', '?')}:{config.get('Version', '$LATEST')}"
+
+
+def _acquire_execution_slot(func: dict, config: dict):
+    """Reserve one unit of concurrency, or None when a cap is reached.
+
+    Never blocks. Waiting for a unit held by your own caller is precisely the
+    deadlock this module exists to avoid: a handler that invokes itself would
+    wait forever on its own slot.
+
+    ``ReservedConcurrentExecutions`` is stored as a bare int on the *function
+    record* under "concurrency" (see _get_function_response), not on the config,
+    so both are consulted rather than assuming either shape.
+    """
+    global _inflight_total
+    reserved = (func or {}).get("concurrency")
+    if isinstance(reserved, dict):
+        reserved = reserved.get("ReservedConcurrentExecutions")
+    if reserved is None:
+        reserved = config.get("ReservedConcurrentExecutions")
+    key = _inflight_key(config)
+    with _inflight_lock:
+        if reserved and _inflight.get(key, 0) >= int(reserved):
+            return None, "function"
+        if _ACCOUNT_CONCURRENCY_CAP > 0 and _inflight_total >= _ACCOUNT_CONCURRENCY_CAP:
+            return None, "account"
+        _inflight[key] = _inflight.get(key, 0) + 1
+        _inflight_total += 1
+    return key, None
+
+
+def _release_execution_slot(key: str) -> None:
+    global _inflight_total
+    if key is None:
+        return
+    with _inflight_lock:
+        remaining = _inflight.get(key, 0) - 1
+        if remaining > 0:
+            _inflight[key] = remaining
+        else:
+            _inflight.pop(key, None)
+        _inflight_total = max(0, _inflight_total - 1)
+
+
+def executions_in_flight() -> tuple[int, dict]:
+    """(total, per-function) invocations currently executing, any executor."""
+    with _inflight_lock:
+        return _inflight_total, dict(_inflight)
+
+
 def _execute_function(func: dict, event: dict) -> dict:
     """Dispatch an invocation to the right executor and emit CloudWatch Logs.
 
@@ -4054,10 +4207,44 @@ def _execute_function(func: dict, event: dict) -> dict:
     """
     config = func.get("config") or func
     if _function_config_scope_mismatch(config):
+        # Re-entered below under the right scope; counting here would double-book
+        # the slot for a single invocation.
         return _run_with_function_config_scope(config, _execute_function, func, event)
 
     request_id = new_uuid()
     started = time.time()
+
+    # Concurrency is accounted here, the one point every executor passes
+    # through, so warm / docker / provided / proxy / one-off all draw on the
+    # same denominator. Accounting inside an executor's own worker pool would
+    # only ever see that executor's share.
+    slot, limit = _acquire_execution_slot(func, config)
+    if slot is None:
+        fn_name = config.get("FunctionName", "unknown")
+        _emit_lambda_metrics(fn_name, duration_ms=0.0, error=False, throttle=True)
+        # AWS models exactly one throttle shape for Invoke —
+        # TooManyRequestsException with a Reason distinguishing the function
+        # limit from the account limit. Anything else is a code string AWS does
+        # not use, which boto3 surfaces as a bare ClientError that
+        # `except lambda.exceptions.TooManyRequestsException` will not catch.
+        if limit == "function":
+            return _throttle_response(
+                reason_code="ReservedFunctionConcurrentInvocationLimitExceeded",
+                msg=f"Rate Exceeded: function {fn_name} at ReservedConcurrentExecutions",
+            )
+        return _throttle_response(
+            reason_code="ConcurrentInvocationLimitExceeded",
+            msg=f"Rate Exceeded: account concurrency cap {_ACCOUNT_CONCURRENCY_CAP} reached",
+        )
+    try:
+        return _execute_function_dispatch(func, config, event, request_id, started)
+    finally:
+        _release_execution_slot(slot)
+
+
+def _execute_function_dispatch(func: dict, config: dict, event: dict,
+                               request_id: str, started: float) -> dict:
+    """Executor selection for a single accounted invocation."""
 
     # Proxy mode wins over every other executor: the function is bound to a
     # user-managed container, ministack only forwards the event.
@@ -4230,8 +4417,21 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
 
     func_name = config.get("FunctionName", "unknown")
     qualifier = config.get("Version", "$LATEST")
+    # Concurrent invocations take separate execution environments, as on AWS.
+    # ReservedConcurrentExecutions caps the function; the account cap is checked
+    # across every function. Both report a throttle rather than queueing —
+    # blocking for a free worker would deadlock a handler that invokes itself.
+    # Concurrency (ReservedConcurrentExecutions / account cap) is already
+    # accounted upstream in _execute_function, for every executor. What is left
+    # here is purely the warm-subprocess resource ceiling.
+    _ensure_reaper_thread()
+    worker, reason = acquire_worker(func_name, config, code_zip, qualifier=qualifier)
+    if worker is None and reason == "func_cap":
+        return _throttle_response(
+            reason_code="ReservedFunctionConcurrentInvocationLimitExceeded",
+            msg=f"Rate Exceeded: function {func_name} warm-worker ceiling reached",
+        )
     try:
-        worker = get_or_create_worker(func_name, config, code_zip, qualifier=qualifier)
         # Inject X-Ray trace header into the event so the worker bootstrap
         # can set ``_X_AMZN_TRACE_ID`` in os.environ before calling the
         # handler. Per-invocation, not bake-time, so it can't live in the
@@ -4265,11 +4465,14 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
     except Exception as e:
         logger.error("Warm worker execution error for %s: %s", func_name, e)
         invalidate_worker(func_name, qualifier=qualifier, account=get_account_id(), region=get_region())
+        worker = None  # invalidate_worker already dropped it from the pool
         return {
             "body": {"errorMessage": str(e), "errorType": type(e).__name__},
             "error": True,
             "log": "",
         }
+    finally:
+        release_worker(worker)
 
 
 def _execute_function_provided(func: dict, event: dict) -> dict:
@@ -6853,7 +7056,8 @@ async def handle_function_url_request(
 
     event = _build_function_url_event(url_id, account_id, region, method, path, headers, body, query_params)
     exec_record = _execution_record_for_config(func_data, func_config)
-    result = await asyncio.to_thread(_execute_function_with_config_scope, exec_record, event)
+    result = await run_reentrant(_execute_function_with_config_scope, exec_record, event,
+                                 thread_name="ministack-lambda-url")
 
     if cfg.get("InvokeMode") == "RESPONSE_STREAM" and not result.get("error") and not result.get("throttle"):
         return _function_url_stream_response(result, cors_headers)

@@ -21,7 +21,8 @@ import string
 import threading
 import time
 
-from ministack.core import pgproxy
+from ministack.core import container_reaper, pgproxy
+from ministack.core.concurrency import run_offloop
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -245,7 +246,7 @@ def _run_backend_container(identifier):
         },
         ports={"5432/tcp": None},  # docker-assigned host port
         name=name,
-        labels={"ministack": "dsql", "cluster_id": identifier},
+        labels=container_reaper.own_labels("dsql", cluster_id=identifier),
     )
     if ms_network:
         container_kwargs["network"] = ms_network
@@ -304,6 +305,22 @@ def _remove_container(identifier):
         container.remove(v=True, force=True)
     except Exception as e:
         logger.debug("DSQL: container removal for %s: %s", identifier, e)
+
+
+def _serving_loop():
+    """The loop serving HTTP, or None outside a running server.
+
+    ``_main_loop`` is only populated by the ``start_restored_proxies`` lifespan
+    hook, which is skipped when the dsql module was not already loaded at boot —
+    i.e. on every fresh server whose first dsql call is CreateCluster. The app
+    captures the loop unconditionally, so fall back to that.
+    """
+    try:
+        from ministack import app
+
+        return app._MAIN_LOOP
+    except Exception:
+        return None
 
 
 async def _start_backend(identifier, cluster):
@@ -457,10 +474,21 @@ def _create_cluster(data):
         _tags[arn] = dict(data["tags"])
 
     if has_backend:
+        # This handler runs on a worker thread (dispatch is off the event loop so
+        # Docker work cannot freeze the server), so there is no *running* loop
+        # here to create_task on. Schedule onto the serving loop instead — the
+        # same pattern _start_backend's respawn path already uses. Falling back
+        # to get_running_loop covers direct/in-process callers that do have one.
+        loop = _main_loop or _serving_loop()
         try:
-            asyncio.get_running_loop().create_task(_start_backend(identifier, cluster))
+            if loop is not None and loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    _start_backend(identifier, cluster), loop)
+            else:
+                asyncio.get_running_loop().create_task(
+                    _start_backend(identifier, cluster))
         except RuntimeError:
-            # No event loop (direct/module-level call) — metadata-only.
+            # No event loop at all (module-level call) — metadata-only.
             cluster["status"] = "ACTIVE"
             cluster["_has_backend"] = False
 
@@ -742,7 +770,7 @@ def _list_tags_for_resource(arn):
 # ---------------------------------------------------------------------------
 
 
-async def handle_request(method, path, headers, body, query_params):
+def _handle_request_sync(method, path, headers, body, query_params):
     try:
         data = json.loads(body) if body else {}
         if not isinstance(data, dict):
@@ -905,3 +933,18 @@ try:
         restore_state(_restored)
 except Exception:
     logging.getLogger(__name__).exception("Failed to restore persisted state; continuing with fresh store")
+
+
+async def handle_request(method, path, headers, body, query_params):
+    """Dispatch off the event loop.
+
+    Request paths here reach the Docker daemon (container create/start/stop/
+    inspect), which blocks for as long as the daemon takes. Measured on ECS: a
+    cached-image container start held the loop for 7.3s, during which the health
+    endpoint — the cheapest request in the process — could not be served.
+
+    Uses the shared pool: the containers started here (database / cache / search
+    engines) never call back into MiniStack, so this cannot re-enter.
+    """
+    return await run_offloop(
+        _handle_request_sync, method, path, headers, body, query_params)
