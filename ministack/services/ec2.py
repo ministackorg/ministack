@@ -73,7 +73,7 @@ from xml.sax.saxutils import escape as _esc
 
 from ministack.core import container_reaper
 from ministack.core.concurrency import resource_lock, run_offloop
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,

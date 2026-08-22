@@ -1880,7 +1880,9 @@ async def _dispatch_service_request(
 
     if AUTH:
         from ministack.core.iam_actions import (
-            extract_iam_action, extract_resource_arn, access_denied_response,
+            access_denied_response,
+            extract_iam_action,
+            extract_resource_arn,
         )
         from ministack.core.iam_evaluator import AuthError, enforce
         from ministack.core.responses import get_account_id

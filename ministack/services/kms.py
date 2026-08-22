@@ -45,7 +45,7 @@ except ImportError:
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.persistence import load_state
 
 _keys = AccountRegionScopedDict()
 # key_id -> {

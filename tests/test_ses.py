@@ -1,14 +1,9 @@
 """SES tests — API operations + SMTP relay integration."""
 
-import base64
-import io
 import json
 import os
-import time
 import uuid as _uuid_mod
-import zipfile
 from unittest.mock import MagicMock, patch
-from urllib.parse import urlparse
 
 import pytest
 from botocore.exceptions import ClientError

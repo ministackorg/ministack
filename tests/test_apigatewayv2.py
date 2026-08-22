@@ -607,7 +607,6 @@ def test_apigw_http_protocol_type(apigw):
 
 def test_apigw_execute_lambda_proxy(apigw, lam):
     """API Gateway execute-api routes a request through Lambda proxy integration."""
-    import urllib.error as _urlerr
     import urllib.request as _urlreq
     import uuid as _uuid
 
@@ -2935,7 +2934,6 @@ def test_apigwv2_path_based_websocket(apigw, lam):
 
 def test_ws_connect_jwt_authorizer_rejects_missing_token(apigw, lam, cognito_idp):
     """$connect with a JWT authorizer rejects connections that lack a valid token (#1074)."""
-    from ministack.services import cognito as _cognito
 
     pool_id = cognito_idp.create_user_pool(PoolName=f"ws-jwt-{_uuid_mod.uuid4().hex[:8]}")["UserPool"]["Id"]
     issuer = f"https://cognito-idp.us-east-1.amazonaws.com/{pool_id}"

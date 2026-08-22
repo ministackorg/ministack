@@ -16,21 +16,17 @@ from .changesets import (
     _list_change_sets,
 )
 from .engine import (
-    _NO_VALUE,
     _apply_sam_transform_if_applicable,
     _evaluate_conditions,
     _parse_template,
     _resolve_parameters,
-    _resolve_refs,
 )
-from .helpers import CFN_NS, _error, _esc, _extract_members, _extract_stack_status_filters, _p, _resolve_template, _xml
-from .provisioners import _provision_resource
+from .helpers import _error, _esc, _extract_members, _extract_stack_status_filters, _p, _resolve_template, _xml
 from .stacks import (
     _add_event,
     _create_stack_task_in_region,
     _delete_stack_async,
     _deploy_stack_async,
-    _diff_resources,
     _stack_region_context,
 )
 
@@ -40,7 +36,7 @@ logger = logging.getLogger("cloudformation")
 # --- CreateStack ---
 
 def _create_stack(params):
-    from ministack.services.cloudformation import _change_sets, _exports, _stack_events, _stacks
+    from ministack.services.cloudformation import _stack_events, _stacks
     stack_name = _p(params, "StackName")
     if not stack_name:
         return _error("ValidationError", "StackName is required")

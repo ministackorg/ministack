@@ -69,7 +69,7 @@ _DDB_ACCOUNT_RE = re.compile(r"^[0-9]{12}$")
 _EXPORT_COMPLETE_AFTER_SEC = float(os.environ.get("MINISTACK_DDB_EXPORT_COMPLETE_AFTER_SEC", "1"))
 _IMPORT_COMPLETE_AFTER_SEC = float(os.environ.get("MINISTACK_DDB_IMPORT_COMPLETE_AFTER_SEC", "1"))
 
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.persistence import load_state
 
 # Region-scoped: DynamoDB tables are region-specific in AWS. Account-only
 # keying made name lookups find cross-region tables while ARN ops (which
@@ -3168,7 +3168,6 @@ def _parse_partiql_conditions(where_str, parameters, param_idx):
 
 def _split_top_level_by_and(s):
     """Split a WHERE string on AND at the top level (respecting parens/quotes)."""
-    import re
     # Use the existing _split_top_level approach but with AND as delimiter
     parts = []
     depth = 0

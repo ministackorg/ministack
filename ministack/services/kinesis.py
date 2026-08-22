@@ -38,7 +38,7 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 MAX_HASH_KEY = (2**128) - 1
 ITERATOR_EXPIRY_SECONDS = 300
 
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.persistence import load_state
 
 _streams = AccountRegionScopedDict()
 _shard_iterators = AccountRegionScopedDict()

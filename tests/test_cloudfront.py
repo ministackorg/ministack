@@ -1,5 +1,4 @@
 import copy
-import io
 import json
 import os
 import time
@@ -7,8 +6,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid as _uuid_mod
-import zipfile
-from urllib.parse import urlparse
 
 import pytest
 from botocore.exceptions import ClientError

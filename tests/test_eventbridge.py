@@ -4,7 +4,6 @@ import os
 import time
 import uuid as _uuid_mod
 import zipfile
-from urllib.parse import urlparse
 
 import boto3
 import pytest
@@ -2255,7 +2254,6 @@ def _seed_rule(schedule="rate(1 minute)", state="ENABLED", region=_REGION):
     return state_key
 
 
-from unittest.mock import patch as _patch
 
 
 def test_scheduler_first_sight_initializes_countdown(isolated_scheduler):

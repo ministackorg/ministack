@@ -14,7 +14,6 @@ import copy
 import json
 import logging
 import os
-import time
 from datetime import datetime, timezone
 
 from ministack.core.arn import ArnParseError, parse_arn
@@ -34,7 +33,7 @@ logger = logging.getLogger("ssm")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 DEFAULT_PAGE_SIZE = 10
 
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.persistence import load_state
 
 _parameters = AccountRegionScopedDict()
 _parameter_history = AccountRegionScopedDict()

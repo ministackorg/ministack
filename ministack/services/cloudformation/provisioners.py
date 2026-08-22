@@ -3869,8 +3869,6 @@ def _ec2_vpc_endpoint_delete(physical_id, props):
 
 
 def _ec2_subnet_create(logical_id, props, stack_name):
-    import random
-    import string
     vpc_id = props.get("VpcId", "")
     cidr = props.get("CidrBlock", "10.0.1.0/24")
     az = props.get("AvailabilityZone", f"{get_region()}a")

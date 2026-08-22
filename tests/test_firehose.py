@@ -380,7 +380,6 @@ def test_firehose_update_destination_rejects_invalid_s3_bucket_arn(fh):
 
 def test_firehose_s3_destination_writes(s3, fh):
     """PutRecord with S3 destination actually writes data to the S3 bucket."""
-    import base64
     import time as _time
     bucket = "fh-s3-dest-v39"
     s3.create_bucket(Bucket=bucket)
@@ -543,7 +542,6 @@ def _create_firehose_with_processor(fh, name: str, bucket: str, lambda_arn: str,
 def test_firehose_lambda_processor_transforms_record(fh, s3, lam):
     """Lambda processor returns transformed data → S3 object contains the
     transform output, not the original record."""
-    import base64 as _b64
     suffix = _uuid_mod.uuid4().hex[:8]
     bucket = f"fh-proc-{suffix}"
     fn = f"fh-proc-fn-{suffix}"

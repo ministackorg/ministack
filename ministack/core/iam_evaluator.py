@@ -621,8 +621,9 @@ def resolve_principal(access_key_id: str,
     authentication fails (unknown key, inactive key, expired session).
     """
     import time
-    from ministack.services import sts as sts_svc
+
     from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_svc
 
     # Root / default keys — allow-all, no checks
     if _is_root_key(access_key_id):

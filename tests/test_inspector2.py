@@ -2,7 +2,6 @@
 Integration tests for the Inspector2 emulator.
 """
 
-import json
 
 import boto3
 import pytest

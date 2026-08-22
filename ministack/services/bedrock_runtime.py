@@ -38,7 +38,6 @@ import json
 import logging
 import os
 import re
-import struct
 import time
 import urllib.error
 import urllib.request

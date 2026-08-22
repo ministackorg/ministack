@@ -6,11 +6,8 @@ Covers cluster CRUD, configuration CRUD with revisions, SCRAM, tags, and
 GetBootstrapBrokers including the MINISTACK_MSK_BOOTSTRAP proxy passthrough.
 """
 
-import base64
-import os
 
 import botocore.exceptions
-import pytest
 from conftest import make_client
 
 # ---------------------------------------------------------------------------

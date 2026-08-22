@@ -19,8 +19,6 @@ Supports:
 import copy
 import logging
 import os
-import time
-from collections import defaultdict
 
 from ministack.core.persistence import load_state
 from ministack.core.responses import (

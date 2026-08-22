@@ -1,4 +1,3 @@
-import io
 import ipaddress
 import json
 import os
@@ -6,8 +5,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid as _uuid_mod
-import zipfile
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode
 
 import boto3
 import pytest

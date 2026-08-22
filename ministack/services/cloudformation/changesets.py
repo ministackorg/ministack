@@ -3,20 +3,18 @@ CloudFormation change set handlers — Create, Describe, Execute, Delete, List c
 """
 
 import copy
-import json
 import logging
 
 from ministack.core.responses import get_account_id, get_region, new_uuid, now_iso
 
 from .engine import (
-    _NO_VALUE,
     _apply_sam_transform_if_applicable,
     _evaluate_conditions,
     _parse_template,
     _resolve_parameters,
     _resolve_refs,
 )
-from .helpers import CFN_NS, _error, _esc, _extract_members, _p, _resolve_template, _xml
+from .helpers import _error, _esc, _extract_members, _p, _resolve_template, _xml
 from .stacks import (
     _add_event,
     _create_stack_task_in_region,
@@ -403,7 +401,7 @@ def _delete_change_set(params):
 # --- ListChangeSets ---
 
 def _list_change_sets(params):
-    from ministack.services.cloudformation import _change_sets, _stacks
+    from ministack.services.cloudformation import _change_sets
     stack_name = _p(params, "StackName")
     if not stack_name:
         return _error("ValidationError", "StackName is required")

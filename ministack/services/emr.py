@@ -22,7 +22,7 @@ import random
 import string
 import time
 
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -30,7 +30,6 @@ from ministack.core.responses import (
     get_account_id,
     get_region,
     json_response,
-    new_uuid,
 )
 
 logger = logging.getLogger("emr")

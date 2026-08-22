@@ -1,13 +1,5 @@
-import io
-import json
-import os
-import time
-import uuid as _uuid_mod
-import zipfile
-from urllib.parse import urlparse
 
 import pytest
-from botocore.exceptions import ClientError
 
 _ministack_installed = True
 
@@ -20,9 +12,8 @@ _requires_package = pytest.mark.skipif(
 def test_package_core_importable():
     """ministack.core modules must all be importable."""
     from ministack.core.lambda_runtime import get_or_create_worker
-    from ministack.core.lambda_runtime import reset as lr_reset
-    from ministack.core.persistence import load_state, save_all
-    from ministack.core.responses import error_response_json, json_response, new_uuid
+    from ministack.core.persistence import save_all
+    from ministack.core.responses import json_response
     from ministack.core.router import detect_service
 
     assert callable(json_response)
@@ -35,7 +26,6 @@ def test_package_services_importable():
     """All 25 ministack.services modules must be importable and expose handle_request."""
     from ministack.services import (
         apigateway,
-        apigateway_v1,
         athena,
         cloudwatch,
         cloudwatch_logs,

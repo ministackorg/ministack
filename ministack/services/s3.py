@@ -47,7 +47,7 @@ from xml.sax.saxutils import escape as _esc
 from defusedxml.ElementTree import fromstring
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
     get_account_id,
@@ -57,7 +57,6 @@ from ministack.core.responses import (
     new_uuid,
     now_iso,
     set_request_region,
-    sha256_hash,
 )
 
 logger = logging.getLogger("s3")

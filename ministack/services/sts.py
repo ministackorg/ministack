@@ -110,8 +110,8 @@ async def handle_request(method, path, headers, body, query_params):
         # When AUTH=true, validate role exists and trust policy permits the caller
         from ministack.app import AUTH
         if AUTH:
-            from ministack.services import iam as iam_svc
             from ministack.core.iam_evaluator import evaluate_trust_policy
+            from ministack.services import iam as iam_svc
             # Extract role name from ARN
             role_name = role_arn.split("/")[-1] if "/" in role_arn else ""
             role = iam_svc._roles.get(role_name)

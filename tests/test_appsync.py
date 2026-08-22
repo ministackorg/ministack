@@ -1,7 +1,6 @@
 import io
 import json
 import os
-import time
 import urllib.request
 import uuid as _uuid_mod
 import zipfile

@@ -15,7 +15,7 @@ import logging
 import os
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -24,7 +24,6 @@ from ministack.core.responses import (
     get_region,
     json_response,
     new_uuid,
-    now_iso,
 )
 
 logger = logging.getLogger("wafv2")

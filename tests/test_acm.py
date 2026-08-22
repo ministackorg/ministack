@@ -1,13 +1,7 @@
-import io
 import json
 import os
-import time
-import uuid as _uuid_mod
-import zipfile
-from urllib.parse import urlparse
 
 import pytest
-from botocore.exceptions import ClientError
 
 
 def test_acm_request_certificate(acm_client):

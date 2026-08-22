@@ -97,7 +97,7 @@ def _coerce_timestamp(value):
     return value
 
 
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.persistence import load_state
 
 # Per-account and per-region registries. The "default" bus is lazily created
 # per account/region on first access so every tenant has its own default bus

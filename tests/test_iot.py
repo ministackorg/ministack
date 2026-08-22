@@ -1436,8 +1436,6 @@ from ministack.services.iot import (
     _encode_remaining_length,
     _encode_string,
     _InFlightMessage,
-    _make_puback,
-    _make_suback,
     _persistent_sessions,
     _property_value,
     _read_string,

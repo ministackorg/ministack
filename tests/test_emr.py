@@ -1,15 +1,7 @@
-import io
-import json
 import os
-import time
-import uuid as _uuid_mod
-import zipfile
-from urllib.parse import urlparse
 
 import boto3
-import pytest
 from botocore.config import Config
-from botocore.exceptions import ClientError
 
 
 def _emr_client(region):

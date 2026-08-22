@@ -8,7 +8,6 @@ import ast
 import json
 import logging
 import os
-import tempfile
 
 from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict
 

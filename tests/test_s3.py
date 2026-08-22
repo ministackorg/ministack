@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 
 import pytest
 from botocore.exceptions import ClientError
-from conftest import ENDPOINT_HOST, make_client, patch_endpoint_dns
+from conftest import make_client, patch_endpoint_dns
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 

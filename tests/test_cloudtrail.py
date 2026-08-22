@@ -13,7 +13,6 @@ Tests are split into two sections:
 
 import json
 import os
-import time
 from datetime import datetime, timedelta, timezone
 
 import boto3

@@ -28,7 +28,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import smtplib
 import time
 from datetime import datetime, timezone
@@ -38,11 +37,10 @@ from email.mime.text import MIMEText
 from email.policy import default as default_policy
 from urllib.parse import parse_qs, unquote
 
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
-    get_account_id,
     get_region,
     new_uuid,
 )

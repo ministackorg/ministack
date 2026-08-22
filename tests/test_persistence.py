@@ -553,9 +553,8 @@ def test_save_dict_skips_modules_never_imported():
     were never imported at all — there's no state to capture and any
     `get_state()` call on a non-imported module would attribute-error.
     Defensive guard: ensure the fallback path's `hasattr` check works."""
-    import sys as _sys
 
-    from ministack.app import _build_persistence_save_dict, _loaded_modules, _state_map
+    from ministack.app import _build_persistence_save_dict, _state_map
 
     # Pick any persisted module and ensure it's truly absent from both
     # `_loaded_modules` and `sys.modules`. `cur` is an obscure one that

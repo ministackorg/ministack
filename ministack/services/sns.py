@@ -118,7 +118,7 @@ def _resolve_topic_tag_arn(arn: str):
         return arn, None, _error("ResourceNotFoundException", "Resource not found", 404)
     return arn, topic, None
 
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.persistence import load_state
 
 _topics = AccountRegionScopedDict()
 _sub_arn_to_topic = AccountRegionScopedDict()

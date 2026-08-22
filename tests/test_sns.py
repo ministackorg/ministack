@@ -5,7 +5,7 @@ import time
 import urllib.request
 import uuid as _uuid_mod
 import zipfile
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode
 
 import boto3
 import pytest
@@ -549,10 +549,7 @@ def test_sns_to_lambda_event_subscription_arn(lam, sns):
     sns.publish(TopicArn=topic_arn, Message="test-sub-arn")
 
     # Invoke the function directly and check what event it last received
-    import base64
-    import io
     import json
-    import zipfile
 
     result = lam.invoke(FunctionName=fn, Payload=json.dumps({"ping": True}).encode())
     # The subscription ARN should be a real ARN, not "{topic}:subscription"

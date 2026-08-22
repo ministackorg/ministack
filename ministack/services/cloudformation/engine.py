@@ -10,12 +10,11 @@ import json
 import logging
 import os
 import re
-from collections import defaultdict
 from types import SimpleNamespace
 
 import yaml
 
-from ministack.core.responses import get_account_id, get_region, new_uuid
+from ministack.core.responses import get_account_id, get_region
 
 # Sentinel for AWS::NoValue
 _NO_VALUE = object()

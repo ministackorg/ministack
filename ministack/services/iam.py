@@ -42,7 +42,7 @@ from urllib.parse import parse_qs
 from urllib.parse import quote as _url_quote
 from xml.sax.saxutils import escape as _xml_escape
 
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, json_response, new_uuid
+from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("iam")
 
@@ -51,7 +51,7 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # ---------------------------------------------------------------------------
 # Module-level state
 # ---------------------------------------------------------------------------
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.persistence import load_state
 
 _users = AccountScopedDict()
 _roles = AccountScopedDict()
@@ -1414,9 +1414,6 @@ def _list_user_tags(p):
 # -------------------- Simulate --------------------
 
 def _simulate_principal_policy(p):
-    from ministack.core.iam_evaluator import (
-        EvalContext, evaluate, resolve_principal, parse_policy_document,
-    )
     from ministack.core.responses import get_account_id
     principal_arn = _p(p, "PolicySourceArn")
     if not principal_arn:

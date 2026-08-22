@@ -37,8 +37,8 @@ from urllib.parse import parse_qs, urlparse
 from xml.sax.saxutils import escape as _esc
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import PERSIST_STATE, load_state
-from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, md5_hash, new_uuid, now_iso
+from ministack.core.persistence import load_state
+from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, new_uuid
 
 logger = logging.getLogger("sqs")
 

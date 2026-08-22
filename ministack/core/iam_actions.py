@@ -326,6 +326,7 @@ def _load_botocore_routes(botocore_service: str) -> list[tuple[str, re.Pattern, 
     """Load a botocore service model and compile its URI routes."""
     try:
         import gzip
+
         import botocore as _bc
         data_dir = os.path.join(os.path.dirname(_bc.__file__), "data")
     except ImportError:

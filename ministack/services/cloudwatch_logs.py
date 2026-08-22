@@ -46,7 +46,7 @@ logger = logging.getLogger("logs")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.persistence import load_state
 
 _log_groups = AccountRegionScopedDict()
 # group_name -> {

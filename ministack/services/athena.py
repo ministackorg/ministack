@@ -20,14 +20,12 @@ import json
 import logging
 import os
 import re
-import threading
 import time
 import xml.etree.ElementTree as ET
-from datetime import date
 from urllib.parse import urlparse
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,

@@ -736,7 +736,6 @@ def test_bedrock_invoke_model_rejects_empty_body():
 
 
 def test_bedrock_invoke_model_with_response_stream_anthropic_envelope():
-    import base64
 
     client = make_client("bedrock-runtime")
     resp = client.invoke_model_with_response_stream(

@@ -531,7 +531,6 @@ def test_elbv2_dataplane_lambda_target_emits_metrics(elbv2, lam, cw):
 
 def test_elbv2_dataplane_event_shape(elbv2, lam):
     """ALB event passed to Lambda contains all required fields."""
-    import urllib.parse as _parse
     import urllib.request as _req
 
     fn_code = (
@@ -560,7 +559,6 @@ def test_elbv2_dataplane_event_shape(elbv2, lam):
 
 def test_elbv2_dataplane_fixed_response(elbv2, lam):
     """ALB fixed-response action returns configured status/body without invoking Lambda."""
-    import urllib.error as _err
     import urllib.request as _req
 
     fn_code = "def handler(event, context):\n    return {'statusCode': 200, 'body': 'should-not-reach'}\n"
