@@ -1779,6 +1779,15 @@ def _delete_item(data):
     return json_response(result)
 
 
+def _key_attribute_update_error(table, updated_attrs):
+    """AWS error for an update whose targets include a hash or range key."""
+    for key_name in (table.get("pk_name"), table.get("sk_name")):
+        if key_name and key_name in updated_attrs:
+            return error_response_json("ValidationException",
+                f"One or more parameter values were invalid: Cannot update attribute {key_name}. This attribute is part of the key", 400)
+    return None
+
+
 def _update_item(data):
     name = data.get("TableName")
     err = _validate_data_plane_table_name(name)
@@ -1853,30 +1862,22 @@ def _update_item(data):
             return error_response_json("ValidationException",
                 f'Invalid UpdateExpression: Syntax error; token: "{_tokens_pre[0]}", near: "{_near}"', 400)
 
-    # AWS pre-rejects an UpdateExpression that targets a key attribute, even
-    # when the item doesn't exist yet — the rejection is parse-time, not
-    # diff-time. Cheap scan for `SET <keyAttr>[ =]` against the table's
-    # declared key names (alias-resolved via ExpressionAttributeNames).
-    if update_expr.strip():
-        _key_names = [n for n in (table.get("pk_name"), table.get("sk_name")) if n]
-        _resolved_ean = data.get("ExpressionAttributeNames") or {}
-        for _kn in _key_names:
-            # Direct mention of the key name as a SET / ADD / REMOVE / DELETE target.
-            if re.search(rf"(?i)\b(SET|ADD|REMOVE|DELETE)\b[^,]*?\b{re.escape(_kn)}\b", update_expr):
-                return error_response_json("ValidationException",
-                    f"One or more parameter values were invalid: Cannot update attribute {_kn}. This attribute is part of the key", 400)
-            # Alias that resolves to a key name.
-            for _alias, _resolved in _resolved_ean.items():
-                if _resolved == _kn and re.search(rf"(?i)\b(SET|ADD|REMOVE|DELETE)\b[^,]*?{re.escape(_alias)}\b", update_expr):
-                    return error_response_json("ValidationException",
-                        f"One or more parameter values were invalid: Cannot update attribute {_kn}. This attribute is part of the key", 400)
-
     updated_attrs = set()
     if update_expr:
+        # AWS rejects an UpdateExpression that targets a key attribute, even
+        # when the item doesn't exist yet or the value is unchanged — the
+        # rejection is parse-time, and precedes the runtime operand-type
+        # errors the evaluator raises. `updated_attrs` is owned here so the
+        # targets resolved before a raise are still available; they are already
+        # alias-resolved, so the expression is never scanned a second time.
         try:
-            item, updated_attrs = _apply_update_expression(item, update_expr, eav, ean)
+            item, updated_attrs = _apply_update_expression(item, update_expr, eav, ean, updated_attrs)
         except ValueError as exc:
-            return error_response_json("ValidationException", str(exc), 400)
+            return (_key_attribute_update_error(table, updated_attrs)
+                    or error_response_json("ValidationException", str(exc), 400))
+        key_err = _key_attribute_update_error(table, updated_attrs)
+        if key_err:
+            return key_err
     elif attribute_updates:
         try:
             item = _apply_attribute_updates(item, attribute_updates)
@@ -5270,7 +5271,7 @@ def _evaluate_condition(expr, item, attr_values, attr_names,
 # Update expression
 # ---------------------------------------------------------------------------
 
-def _apply_update_expression(item, expr, attr_values, attr_names):
+def _apply_update_expression(item, expr, attr_values, attr_names, updated_attrs=None):
     item = copy.deepcopy(item)
     tokens = _tokenize(expr)
     err = _check_redundant_parens(tokens)
@@ -5296,7 +5297,7 @@ def _apply_update_expression(item, expr, attr_values, attr_names):
     if current_clause is not None:
         clauses[current_clause] = current_tokens
 
-    updated_attrs = set()
+    updated_attrs = set() if updated_attrs is None else updated_attrs
 
     if 'SET' in clauses:
         _apply_set(item, clauses['SET'], attr_values, attr_names, updated_attrs)
@@ -5454,6 +5455,7 @@ def _apply_add(item, tokens, attr_values, attr_names, updated_attrs):
         add_val = attr_values.get(part[val_idx][1])
         if not path or add_val is None:
             continue
+        updated_attrs.add(path[0])
 
         # ADD only accepts Number and set operands (parse-time in AWS), and the
         # existing attribute must carry the same type (runtime in AWS).
@@ -5465,8 +5467,6 @@ def _apply_add(item, tokens, attr_values, attr_names, updated_attrs):
         existing = _get_at_path(item, path)
         if existing is not None and _operand_type(existing) != op_type:
             raise ValueError("An operand in the update expression has an incorrect data type")
-
-        updated_attrs.add(path[0])
 
         if "N" in add_val:
             inc = Decimal(add_val["N"])
@@ -5496,6 +5496,7 @@ def _apply_delete(item, tokens, attr_values, attr_names, updated_attrs):
         del_val = attr_values.get(part[val_idx][1])
         if not path or del_val is None:
             continue
+        updated_attrs.add(path[0])
 
         # DELETE only accepts set operands (parse-time in AWS), and the
         # existing attribute must be a set of the same type (runtime in AWS).
@@ -5506,8 +5507,6 @@ def _apply_delete(item, tokens, attr_values, attr_names, updated_attrs):
             raise ValueError(
                 "Invalid UpdateExpression: Incorrect operand type for operator or function; "
                 f"operator: DELETE, operand type: {_AV_TYPE_NAMES.get(op_type, op_type)}, typeSet: ALLOWED_FOR_ADD_OPERAND")
-
-        updated_attrs.add(path[0])
 
         existing = _get_at_path(item, path)
         if existing is None:

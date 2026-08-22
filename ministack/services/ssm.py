@@ -1,10 +1,12 @@
 """
-SSM Parameter Store Emulator.
+SSM Parameter Store and Run Command Emulator.
 JSON-based API via X-Amz-Target (AmazonSSM).
 Supports: PutParameter, GetParameter, GetParameters, GetParametersByPath,
           DeleteParameter, DeleteParameters, DescribeParameters,
           GetParameterHistory, LabelParameterVersion,
-          AddTagsToResource, RemoveTagsFromResource, ListTagsForResource.
+          AddTagsToResource, RemoveTagsFromResource, ListTagsForResource,
+          SendCommand, GetCommandInvocation, ListCommands,
+          DescribeInstanceInformation.
 """
 
 import base64
@@ -16,6 +18,7 @@ import time
 from datetime import datetime, timezone
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import spawn_background
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -36,6 +39,7 @@ from ministack.core.persistence import PERSIST_STATE, load_state
 _parameters = AccountRegionScopedDict()
 _parameter_history = AccountRegionScopedDict()
 _tags = AccountRegionScopedDict()
+_commands = AccountRegionScopedDict()
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -45,6 +49,7 @@ def get_state():
         "parameters": copy.deepcopy(_parameters),
         "parameter_history": copy.deepcopy(_parameter_history),
         "tags": copy.deepcopy(_tags),
+        "commands": copy.deepcopy(_commands),
     }
 
 
@@ -96,6 +101,7 @@ def restore_state(data):
         _parameters.update(data.get("parameters", {}))
         _restore_parameter_history(data.get("parameter_history", {}))
         _tags.update(data.get("tags", {}))
+        _commands.update(data.get("commands", {}))
 
 
 def _now_iso() -> str:
@@ -243,6 +249,10 @@ async def handle_request(method, path, headers, body, query_params):
         "AddTagsToResource": _add_tags_to_resource,
         "RemoveTagsFromResource": _remove_tags_from_resource,
         "ListTagsForResource": _list_tags_for_resource,
+        "SendCommand": _send_command,
+        "GetCommandInvocation": _get_command_invocation,
+        "ListCommands": _list_commands,
+        "DescribeInstanceInformation": _describe_instance_information,
     }
 
     handler = handlers.get(action)
@@ -689,7 +699,274 @@ def _param_out(param, with_decryption=False):
     return out
 
 
+# ── Run Command ────────────────────────────────────────────
+#
+# An invocation is asynchronous, as on AWS: SendCommand answers Pending and the caller polls
+# GetCommandInvocation until it reaches a terminal state. For AWS-RunShellScript against an
+# instance with a box behind it, the script runs in that box and the invocation carries its real
+# exit code and output, so a health probe can genuinely fail. A document we cannot run completes
+# as Success with empty output rather than never converging.
+
+_RUN_COMMAND_PLUGIN = "aws:runShellScript"
+# GetCommandInvocation: "The first 24,000 characters written by the plugin to stdout" and
+# "The first 8,000 characters written by the plugin to stderr".
+_STDOUT_LIMIT = 24000
+_STDERR_LIMIT = 8000
+_SHELL_DOCUMENTS = {"AWS-RunShellScript"}
+
+
+def _managed_instance_ids() -> set:
+    """Instances Run Command can reach.
+
+    An agent has to be answering, which AWS folds into InvalidInstanceId along with the node's
+    state ("SSM Agent isn't running" is one of the causes it lists). A metadata-only instance has
+    nothing running on it, so real SSM would refuse it too. `instance_is_managed` covers both:
+    it requires the instance to be running and to have a box with a shell behind it.
+    """
+    from ministack.services import ec2 as ec2_svc
+
+    return {
+        instance_id
+        for instance_id in ec2_svc._instances
+        if ec2_svc.instance_is_managed(instance_id)
+    }
+
+
+def _shell_argv(data) -> list:
+    """The argv for an AWS-RunShellScript invocation, from its `commands` parameter."""
+    commands = (data.get("Parameters") or {}).get("commands") or []
+    if isinstance(commands, str):
+        commands = [commands]
+    script = "\n".join(str(c) for c in commands)
+    return ["/bin/sh", "-c", script]
+
+
+def _finish_invocation(command_id, instance_id, argv):
+    """Run one invocation to completion and publish its result.
+
+    On its own thread: the script is the caller's, and a readiness probe calling back into
+    MiniStack is the point of the feature, so it must not take a slot from the shared pool.
+    """
+    from ministack.services import ec2 as ec2_svc
+
+    record = _commands.get(command_id)
+    if not record:
+        return
+    invocation = (record.get("Invocations") or {}).get(instance_id)
+    if invocation is None:
+        return
+    invocation["Status"] = "InProgress"
+    invocation["StatusDetails"] = "In Progress"
+    invocation["ExecutionStartDateTime"] = _now_iso()
+    exit_code, stdout, stderr = ec2_svc.exec_in_instance_blocking(instance_id, argv)
+    invocation["ResponseCode"] = exit_code
+    invocation["StandardOutputContent"] = stdout[:_STDOUT_LIMIT]
+    invocation["StandardErrorContent"] = stderr[:_STDERR_LIMIT]
+    invocation["ExecutionEndDateTime"] = _now_iso()
+    # Status flips last: a poller that sees a terminal state must already see the exit code,
+    # the output and the end time.
+    # "For a plugin, this indicates that the result code wasn't zero."
+    invocation["StatusDetails"] = "Success" if exit_code == 0 else "Failed"
+    invocation["Status"] = invocation["StatusDetails"]
+    _refresh_command_status(record)
+
+
+def _refresh_command_status(record) -> None:
+    """Roll the invocations up into the parent command."""
+    invocations = list((record.get("Invocations") or {}).values())
+    terminal = [i for i in invocations
+                if i["Status"] in ("Success", "Failed", "Cancelled", "TimedOut")]
+    failed = [i for i in invocations if i["Status"] == "Failed"]
+    record["CompletedCount"] = len(terminal)
+    record["ErrorCount"] = len(failed)
+    if len(terminal) < len(invocations):
+        record["Status"] = "InProgress"
+        record["StatusDetails"] = "In Progress"
+    elif failed:
+        record["Status"] = "Failed"
+        record["StatusDetails"] = "Failed"
+    else:
+        record["Status"] = "Success"
+        record["StatusDetails"] = "Success"
+
+
+def _command_target_ids(data) -> list:
+    """The instances a SendCommand addresses: InstanceIds, or a Targets entry naming them."""
+    instance_ids = list(data.get("InstanceIds") or [])
+    for target in data.get("Targets") or []:
+        if target.get("Key") in ("InstanceIds", "instanceids"):
+            instance_ids.extend(target.get("Values") or [])
+    return instance_ids
+
+
+def _public_command(record) -> dict:
+    """The Command shape, without the per-instance invocations kept alongside it."""
+    return {k: v for k, v in record.items() if k != "Invocations"}
+
+
+def _send_command(data):
+    document = data.get("DocumentName") or ""
+    if not document:
+        return error_response_json("ValidationException", "DocumentName is required", 400)
+
+    instance_ids = _command_target_ids(data)
+    if not instance_ids:
+        return error_response_json(
+            "ValidationException", "InstanceIds or a Targets entry is required", 400
+        )
+    live = _managed_instance_ids()
+    unknown = [i for i in instance_ids if i not in live]
+    if unknown:
+        return error_response_json(
+            "InvalidInstanceId",
+            f"Instances [[{', '.join(unknown)}]] not in a valid state for account "
+            f"{get_account_id()}",
+            400,
+        )
+
+    command_id = new_uuid()
+    now = _now_epoch()
+    started = _now_iso()
+    record = {
+        "CommandId": command_id,
+        "DocumentName": document,
+        "DocumentVersion": data.get("DocumentVersion", "$DEFAULT"),
+        "Comment": data.get("Comment", ""),
+        "ExpiresAfter": now + 3600,
+        "Parameters": data.get("Parameters", {}),
+        "InstanceIds": instance_ids,
+        "Targets": data.get("Targets", []),
+        "RequestedDateTime": now,
+        # SendCommand answers before the command has been delivered — the doc's own sample
+        # response is Pending. The caller polls GetCommandInvocation from here.
+        "Status": "Pending",
+        "StatusDetails": "Pending",
+        "OutputS3Region": get_region(),
+        "OutputS3BucketName": data.get("OutputS3BucketName", ""),
+        "OutputS3KeyPrefix": data.get("OutputS3KeyPrefix", ""),
+        "MaxConcurrency": data.get("MaxConcurrency", "50"),
+        "MaxErrors": data.get("MaxErrors", "0"),
+        "TargetCount": len(instance_ids),
+        "CompletedCount": 0,
+        "ErrorCount": 0,
+        "DeliveryTimedOutCount": 0,
+        "ServiceRole": data.get("ServiceRoleArn", ""),
+        "TimeoutSeconds": data.get("TimeoutSeconds", 3600),
+        "Invocations": {
+            instance_id: {
+                "CommandId": command_id,
+                "InstanceId": instance_id,
+                "Comment": data.get("Comment", ""),
+                "DocumentName": document,
+                "DocumentVersion": data.get("DocumentVersion", "$DEFAULT"),
+                "PluginName": _RUN_COMMAND_PLUGIN,
+                # "If the response code is -1, then the command hasn't started running on the
+                # managed node, or it wasn't received by the node."
+                "ResponseCode": -1,
+                # These three are strings in the SSM model, not timestamps, and are empty until
+                # the plugin starts.
+                "ExecutionStartDateTime": "",
+                "ExecutionElapsedTime": "PT0.001S",
+                "ExecutionEndDateTime": "",
+                "Status": "Pending",
+                "StatusDetails": "Pending",
+                "StandardOutputContent": "",
+                "StandardOutputUrl": "",
+                "StandardErrorContent": "",
+                "StandardErrorUrl": "",
+            }
+            for instance_id in instance_ids
+        },
+    }
+    _commands[command_id] = record
+    if document in _SHELL_DOCUMENTS:
+        argv = _shell_argv(data)
+        for instance_id in instance_ids:
+            spawn_background(_finish_invocation, command_id, instance_id, argv,
+                             thread_name=f"ministack-ssm-{command_id[:8]}")
+    else:
+        # A document we cannot run still has to converge, or a caller polling for a terminal
+        # state never returns.
+        for instance_id in instance_ids:
+            invocation = record["Invocations"][instance_id]
+            invocation.update({"ResponseCode": 0, "Status": "Success",
+                               "StatusDetails": "Success",
+                               "ExecutionStartDateTime": started,
+                               "ExecutionEndDateTime": started})
+        _refresh_command_status(record)
+    return json_response({"Command": _public_command(record)})
+
+
+def _get_command_invocation(data):
+    command_id = data.get("CommandId") or ""
+    instance_id = data.get("InstanceId") or ""
+    invocation = ((_commands.get(command_id) or {}).get("Invocations") or {}).get(instance_id)
+    if not invocation:
+        # AWS resolves the invocation before the command, so an unknown command id lands here too.
+        return error_response_json(
+            "InvocationDoesNotExist",
+            f"Invocation not found for {command_id}, {instance_id}",
+            400,
+        )
+    return json_response(dict(invocation))
+
+
+def _list_commands(data):
+    command_id = data.get("CommandId")
+    instance_id = data.get("InstanceId")
+    # An absent command id narrows to nothing rather than failing, which is what AWS answers.
+    commands = [
+        _public_command(record)
+        for record in _commands.values()
+        if (not command_id or record["CommandId"] == command_id)
+        and (not instance_id or instance_id in record.get("InstanceIds", []))
+    ]
+    commands.sort(key=lambda c: c["RequestedDateTime"], reverse=True)
+
+    start = _decode_next_token(data.get("NextToken", "")) if data.get("NextToken") else 0
+    limit = data.get("MaxResults") or DEFAULT_PAGE_SIZE
+    page = commands[start:start + limit]
+    out = {"Commands": page}
+    if start + limit < len(commands):
+        out["NextToken"] = _encode_next_token(start + limit)
+    return json_response(out)
+
+
+def _describe_instance_information(data):
+    from ministack.services import ec2 as ec2_svc
+
+    now = _now_epoch()
+    managed = _managed_instance_ids()
+    entries = []
+    for instance_id, inst in sorted(ec2_svc._instances.items()):
+        if instance_id not in managed:
+            continue
+        private_ip = inst.get("PrivateIpAddress", "")
+        entries.append({
+            "InstanceId": instance_id,
+            "PingStatus": "Online",
+            "LastPingDateTime": now,
+            "AgentVersion": "3.2.1377.0",
+            "IsLatestVersion": True,
+            "PlatformType": "Linux",
+            "PlatformName": "Amazon Linux",
+            "PlatformVersion": "2023",
+            "ResourceType": "EC2Instance",
+            "IPAddress": private_ip,
+            "ComputerName": inst.get("PrivateDnsName", ""),
+        })
+
+    start = _decode_next_token(data.get("NextToken", "")) if data.get("NextToken") else 0
+    limit = data.get("MaxResults") or DEFAULT_PAGE_SIZE
+    page = entries[start:start + limit]
+    out = {"InstanceInformationList": page}
+    if start + limit < len(entries):
+        out["NextToken"] = _encode_next_token(start + limit)
+    return json_response(out)
+
+
 def reset():
     _parameters.clear()
     _parameter_history.clear()
     _tags.clear()
+    _commands.clear()

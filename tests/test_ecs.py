@@ -1,15 +1,14 @@
 import copy
-import io
 import json
 import os
 import time
 import uuid as _uuid_mod
-import zipfile
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
 import pytest
 from botocore.exceptions import ClientError
+from conftest import LoopProbe
 
 from ministack.services import ecs as ecs_service
 
@@ -454,7 +453,7 @@ def test_ecs_create_service_v2(ecs):
     ecs.create_cluster(clusterName="ecs-svc-v2c")
     ecs.register_task_definition(
         family="ecs-svc-v2td",
-        containerDefinitions=[{"name": "w", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "w", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     resp = ecs.create_service(
         cluster="ecs-svc-v2c",
@@ -471,7 +470,7 @@ def test_ecs_describe_services_v2(ecs):
     ecs.create_cluster(clusterName="ecs-ds-v2c")
     ecs.register_task_definition(
         family="ecs-ds-v2td",
-        containerDefinitions=[{"name": "w", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "w", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     ecs.create_service(
         cluster="ecs-ds-v2c",
@@ -495,7 +494,7 @@ def test_ecs_update_service_v2(ecs):
     ecs.create_cluster(clusterName="ecs-us-v2c")
     ecs.register_task_definition(
         family="ecs-us-v2td",
-        containerDefinitions=[{"name": "w", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "w", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     ecs.create_service(
         cluster="ecs-us-v2c",
@@ -567,7 +566,7 @@ def test_ecs_service_arn_parser_does_not_tail_resolve_invalid_arns(ecs):
     cluster_arn = ecs.create_cluster(clusterName=cluster)["cluster"]["clusterArn"]
     ecs.register_task_definition(
         family="ecs-arn-service-td",
-        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "app", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     created = ecs.create_service(
         cluster=cluster,
@@ -656,7 +655,7 @@ def test_ecs_service_arn_parser_does_not_tail_resolve_invalid_arns(ecs):
 def test_ecs_task_definition_arn_parser_does_not_tail_resolve_invalid_arns(ecs):
     resp = ecs.register_task_definition(
         family="ecs-arn-td",
-        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "app", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     task_definition_arn = resp["taskDefinition"]["taskDefinitionArn"]
     valid = ecs.describe_task_definition(taskDefinition=task_definition_arn)
@@ -828,7 +827,7 @@ def test_ecs_timestamps_are_epoch(ecs):
     # registeredAt might not be present on cluster, test on task def
     ecs.register_task_definition(
         family="ts-td-v44",
-        containerDefinitions=[{"name": "app", "image": "nginx", "memory": 256}],
+        containerDefinitions=[{"name": "app", "image": "alpine:latest", "command": ["sleep", "3600"], "memory": 256}],
     )
     td = ecs.describe_task_definition(taskDefinition="ts-td-v44")
     registered_at = td["taskDefinition"].get("registeredAt")
@@ -847,7 +846,7 @@ def test_ecs_service_spawns_tasks(ecs):
     ecs.create_cluster(clusterName=cluster)
     ecs.register_task_definition(
         family="svc-spawn-td",
-        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "app", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     ecs.create_service(
         cluster=cluster,
@@ -872,7 +871,7 @@ def test_ecs_list_services(ecs):
     ecs.create_cluster(clusterName=cluster)
     ecs.register_task_definition(
         family="ls-svc-td",
-        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "app", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     ecs.create_service(
         cluster=cluster, serviceName="ls-svc-a", taskDefinition="ls-svc-td", desiredCount=1,
@@ -893,7 +892,7 @@ def test_ecs_service_running_count(ecs):
     ecs.create_cluster(clusterName=cluster)
     ecs.register_task_definition(
         family="rc-td",
-        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "app", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     ecs.create_service(
         cluster=cluster, serviceName="rc-svc", taskDefinition="rc-td", desiredCount=3,
@@ -910,7 +909,7 @@ def test_ecs_service_scale_up(ecs):
     ecs.create_cluster(clusterName=cluster)
     ecs.register_task_definition(
         family="su-td",
-        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "app", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     ecs.create_service(
         cluster=cluster, serviceName="su-svc", taskDefinition="su-td", desiredCount=1,
@@ -932,7 +931,7 @@ def test_ecs_service_scale_down(ecs):
     ecs.create_cluster(clusterName=cluster)
     ecs.register_task_definition(
         family="sd-td",
-        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "app", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     ecs.create_service(
         cluster=cluster, serviceName="sd-svc", taskDefinition="sd-td", desiredCount=3,
@@ -997,7 +996,7 @@ def test_ecs_service_delete_stops_tasks(ecs):
     ecs.create_cluster(clusterName=cluster)
     ecs.register_task_definition(
         family="del-td",
-        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "app", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     ecs.create_service(
         cluster=cluster, serviceName="del-svc", taskDefinition="del-td", desiredCount=2,
@@ -1027,7 +1026,7 @@ def test_ecs_service_scale_to_zero(ecs):
     ecs.create_cluster(clusterName=cluster)
     ecs.register_task_definition(
         family="z-td",
-        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "app", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     ecs.create_service(
         cluster=cluster, serviceName="z-svc", taskDefinition="z-td", desiredCount=2,
@@ -1050,7 +1049,7 @@ def test_ecs_cluster_task_counts(ecs):
     ecs.create_cluster(clusterName=cluster)
     ecs.register_task_definition(
         family="ct-td",
-        containerDefinitions=[{"name": "app", "image": "nginx", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "app", "image": "alpine:latest", "command": ["sleep", "3600"], "cpu": 64, "memory": 128}],
     )
     ecs.create_service(
         cluster=cluster, serviceName="ct-svc", taskDefinition="ct-td", desiredCount=3,
@@ -1364,3 +1363,37 @@ def test_ecs_container_secret_arn_selects_the_requested_region():
         sm_service.reset()
         set_request_account_id(original_account)
         set_request_region(original_region)
+
+
+# ---------------------------------------------------------------------------
+# Re-entrancy under concurrency — the rest of the suite issues one request at
+# a time, so a service whose blocking work is misclassified passes serially
+# and only wedges under load. These fire N callers at once and assert both
+# that every caller completes and that the event loop keeps serving.
+# ---------------------------------------------------------------------------
+@pytest.mark.serial
+def test_ecs_run_task_does_not_block_the_loop(ecs):
+    """RunTask talks to the Docker daemon; that must never happen on the loop."""
+    cluster = f"conc-{_uuid_mod.uuid4().hex[:8]}"
+    ecs.create_cluster(clusterName=cluster)
+    ecs.register_task_definition(
+        family=f"{cluster}-td",
+        containerDefinitions=[{"name": "app", "image": "alpine:latest",
+                               "command": ["sleep", "3600"], "memory": 64, "essential": True}],
+    )
+    with LoopProbe() as probe:
+        try:
+            ecs.run_task(cluster=cluster, taskDefinition=f"{cluster}-td", count=1)
+        except Exception as exc:                      # no daemon / image pull refused
+            pytest.skip(f"ECS RunTask unavailable in this environment: {exc}")
+        finally:
+            for arn in ecs.list_tasks(cluster=cluster).get("taskArns", []):
+                try:
+                    ecs.stop_task(cluster=cluster, task=arn)
+                except Exception:
+                    pass
+            try:
+                ecs.delete_cluster(cluster=cluster)
+            except Exception:
+                pass
+    probe.assert_responsive("ECS RunTask")

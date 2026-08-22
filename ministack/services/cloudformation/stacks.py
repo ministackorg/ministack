@@ -4,18 +4,15 @@ CloudFormation stacks — async stack lifecycle (deploy, delete, update, diff).
 
 import asyncio
 import copy
-import json
 import logging
-import time
 from contextlib import contextmanager
 
-from ministack.core.responses import get_account_id, get_region, new_uuid, now_iso, set_request_region
+from ministack.core.concurrency import run_reentrant
+from ministack.core.responses import get_region, new_uuid, now_iso, set_request_region
 
 from .engine import (
     _NO_VALUE,
     _evaluate_conditions,
-    _parse_template,
-    _resolve_parameters,
     _resolve_refs,
     _topological_sort,
 )
@@ -162,7 +159,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 old_props = prev_resource.get("Properties", {})
                 old_attrs = prev_resource.get("Attributes", {})
                 if _is_custom_resource(resource_type):
-                    physical_id, attrs = await asyncio.to_thread(
+                    physical_id, attrs = await run_reentrant(
                         _update_resource, resource_type, old_pid, old_props,
                         resolved_props, stack_name, logical_id, old_attrs
                     )
@@ -173,7 +170,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                     )
             else:
                 if _is_custom_resource(resource_type):
-                    physical_id, attrs = await asyncio.to_thread(
+                    physical_id, attrs = await run_reentrant(
                         _provision_resource, resource_type, logical_id, resolved_props, stack_name
                     )
                 else:
@@ -213,7 +210,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
             old_props = old_res.get("Properties", {})
             try:
                 if _is_custom_resource(rtype):
-                    await asyncio.to_thread(
+                    await run_reentrant(
                         _delete_resource, rtype, pid, old_props,
                         stack_name, logical_id
                     )
@@ -247,7 +244,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 res_props = res.get("Properties", {})
                 try:
                     if _is_custom_resource(rtype):
-                        await asyncio.to_thread(
+                        await run_reentrant(
                             _delete_resource, rtype, pid, res_props,
                             stack_name, logical_id
                         )
@@ -355,7 +352,7 @@ async def _delete_stack_async(stack_name: str, stack_id: str):
                    "DELETE_IN_PROGRESS", physical_id=pid)
         try:
             if _is_custom_resource(rtype):
-                await asyncio.to_thread(
+                await run_reentrant(
                     _delete_resource, rtype, pid, res_props,
                     stack_name, logical_id
                 )
