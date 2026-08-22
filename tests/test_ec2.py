@@ -3603,3 +3603,834 @@ def test_ec2_allocated_address_is_a_valid_ipv4(ec2):
         ipaddress.ip_address(described["PublicIp"])
     finally:
         ec2.release_address(AllocationId=alloc["AllocationId"])
+# ---------------------------------------------------------------------------
+# Docker VM manager (EC2_VM_MANAGER=docker)
+# ---------------------------------------------------------------------------
+# Unit tier: in-process, docker faked via monkeypatch on module attributes —
+# runs without a Docker daemon (CI). Integration tier: gated on a reachable
+# daemon (_docker_reachable's ping probe, @requires_docker), and flips the
+# flag on the live server through /_ministack/config — serial-marked, since
+# the flip is process-global.
+
+import base64 as _b64
+import shutil as _shutil
+import tarfile as _tarfile
+
+import ministack.services.ec2 as ec2mod
+
+def _docker_reachable():
+    """Whether a Docker daemon is actually usable from here.
+
+    Probed rather than inferred from an env var, so the integration tier runs
+    wherever Docker exists (CI included) instead of only where someone
+    remembered to export something.
+    """
+    try:
+        import docker as _probe_sdk
+
+        _probe_sdk.from_env().ping()
+        return True
+    except Exception:
+        return False
+
+
+requires_docker = pytest.mark.skipif(
+    not _docker_reachable(),
+    reason="no reachable Docker daemon - skipping docker VM manager integration test",
+)
+
+
+def _fake_docker(images_tags=(), network_ip="172.30.0.9", network="testnet",
+                 create_error=None, create_error_at=None):
+    """Minimal docker-py stand-in recording create/lifecycle calls.
+
+    ``create_error`` fails every create; with ``create_error_at`` it fails only
+    the create with that index (0-based), so a multi-instance launch can fail
+    partway through."""
+
+    class FakeContainer:
+        def __init__(self, name, kwargs):
+            self.id = f"cid-{name}"
+            self.name = name
+            self.kwargs = kwargs
+            self.status = "created"
+            self.attrs = {"NetworkSettings": {"Networks": {network: {"IPAddress": network_ip}}}}
+            self.archives = []
+            self.execs = []
+            self.stop_calls = 0
+            self.start_calls = 0
+            self.restart_calls = 0
+            self.remove_calls = 0
+
+        def reload(self):
+            pass
+
+        def put_archive(self, path, data):
+            self.archives.append((path, data))
+
+        def exec_run(self, cmd, detach=False):
+            self.execs.append((cmd, detach))
+
+        def start(self):
+            self.start_calls += 1
+            self.status = "running"
+
+        def stop(self, timeout=10):
+            self.stop_calls += 1
+            self.status = "exited"
+
+        def restart(self, timeout=10):
+            self.restart_calls += 1
+
+        def remove(self, v=False, force=False):
+            self.remove_calls += 1
+            registry.pop(self.id, None)
+            registry.pop(self.name, None)
+
+    registry = {}
+    creates = []
+
+    class FakeContainers:
+        def create(self, image, **kwargs):
+            if create_error is not None and (
+                create_error_at is None or len(creates) == create_error_at
+            ):
+                raise create_error
+            creates.append({"image": image, **kwargs})
+            container = FakeContainer(kwargs["name"], kwargs)
+            registry[container.id] = container
+            registry[container.name] = container
+            return container
+
+        def get(self, identifier):
+            if identifier not in registry:
+                # The real client raises docker.errors.NotFound; the reconcile
+                # path tells it apart from transient daemon errors.
+                from docker import errors as _docker_errors
+                raise _docker_errors.NotFound("not found")
+            return registry[identifier]
+
+        def list(self, all=False, filters=None):
+            want = (filters or {}).get("label")
+            # docker-py accepts a single "k=v" or a list of them (AND).
+            wanted = [want] if isinstance(want, str) else list(want or [])
+            out = []
+            for c in set(registry.values()):
+                pairs = {f"{k}={v}" for k, v in c.kwargs.get("labels", {}).items()}
+                # NB: the `all` parameter shadows builtins.all here.
+                if not [w for w in wanted if w not in pairs]:
+                    out.append(c)
+            return out
+
+    class FakeImage:
+        def __init__(self, tags):
+            self.tags = tags
+
+    class FakeImages:
+        def list(self):
+            return [FakeImage(list(tags)) for tags in images_tags]
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+            self.images = FakeImages()
+
+        def ping(self):
+            # Present so _vm_reconcile_running_instances treats the fake as a
+            # reachable daemon; tests monkeypatch it to raise for the
+            # daemon-down path.
+            return True
+
+    fake = FakeDocker()
+    fake._registry = registry
+    fake._creates = creates
+    return fake
+
+
+def _vm_on(monkeypatch, fake):
+    monkeypatch.setattr(ec2mod, "EC2_VM_MANAGER", "docker")
+    monkeypatch.setattr(ec2mod, "EC2_DOCKER_IMAGE_PREFIX", "ministack-ec2")
+    monkeypatch.setattr(ec2mod, "_get_docker", lambda: fake)
+    monkeypatch.setattr(ec2mod, "_get_ministack_network", lambda _client: "testnet")
+
+
+def _cleanup_instances(iids):
+    for iid in iids:
+        inst = ec2mod._instances.pop(iid, None)
+        if inst:
+            for bdm in inst.get("BlockDeviceMappings", []):
+                ec2mod._volumes.pop(bdm.get("Ebs", {}).get("VolumeId"), None)
+
+
+def _body(resp):
+    return resp[2].decode()
+
+
+def _iid_of(resp):
+    import re as _re
+    return _re.search(r"<instanceId>(i-[0-9a-f]+)</instanceId>", _body(resp)).group(1)
+
+
+def test_ec2_vm_manager_off_by_default(monkeypatch):
+    monkeypatch.setattr(ec2mod, "EC2_VM_MANAGER", "")
+
+    def _boom():
+        raise AssertionError("docker must not be touched with the flag off")
+
+    monkeypatch.setattr(ec2mod, "_get_docker", _boom)
+    resp = ec2mod._run_instances({"ImageId": "ami-cafecafecafe0001"})
+    assert resp[0] == 200
+    iid = _iid_of(resp)
+    assert "VmManager" not in ec2mod._instances[iid]
+    _cleanup_instances([iid])
+
+
+def test_ec2_parse_docker_flags():
+    kwargs = ec2mod._parse_ec2_docker_flags(
+        "--privileged -e A=1 --env B=two -v /h:/c:ro --cap-add SYS_ADMIN "
+        "--tmpfs /run:rw,size=64m --add-host me:10.0.0.1 -m 512m --shm-size 128m "
+        "--init=false --bogus-flag xyz")
+    assert kwargs["privileged"] is True
+    assert kwargs["environment"] == {"A": "1", "B": "two"}
+    assert kwargs["volumes"] == ["/h:/c:ro"]
+    assert kwargs["cap_add"] == ["SYS_ADMIN"]
+    assert kwargs["tmpfs"] == {"/run": "rw,size=64m"}
+    assert kwargs["extra_hosts"] == {"me": "10.0.0.1"}
+    assert kwargs["mem_limit"] == "512m"
+    assert kwargs["shm_size"] == "128m"
+    assert "init" not in kwargs
+    assert ec2mod._parse_ec2_docker_flags("") == {}
+
+
+def test_ec2_docker_ami_describe_images(monkeypatch):
+    fake = _fake_docker(images_tags=[
+        ["ministack-ec2/box:ami-c0ffee0000000001", "other/alias:latest"],
+        ["ministack-ec2/dup:ami-c0ffee0000000001"],        # duplicate ami id — ignored
+        ["ministack-ec2/noami:latest"],                     # malformed — skipped
+        ["unrelated:tag"],
+    ])
+    _vm_on(monkeypatch, fake)
+    body = _body(ec2mod._describe_images({}))
+    assert body.count("<imageId>ami-c0ffee0000000001</imageId>") == 1
+    assert "<key>ec2_vm_manager</key><value>docker</value>" in body
+    assert "ami-0abcdef1234567890" in body  # stub AMIs still listed
+    filtered = _body(ec2mod._describe_images({"ImageId.1": "ami-c0ffee0000000001"}))
+    assert "ami-c0ffee0000000001" in filtered
+    assert "ami-0abcdef1234567890" not in filtered
+
+
+def test_ec2_run_instances_boots_container(monkeypatch):
+    fake = _fake_docker(images_tags=[["ministack-ec2/box:ami-c0ffee0000000002"]])
+    _vm_on(monkeypatch, fake)
+    resp = ec2mod._run_instances({"ImageId": "ami-c0ffee0000000002"})
+    assert resp[0] == 200
+    iid = _iid_of(resp)
+    inst = ec2mod._instances[iid]
+    create = fake._creates[0]
+    assert create["image"] == "ministack-ec2/box:ami-c0ffee0000000002"
+    assert create["name"].startswith("ministack-ec2-") and create["name"].endswith(iid)
+    assert create["init"] is True
+    assert create["command"] == ["sleep", "infinity"]
+    assert create["network"] == "testnet"
+    assert create["labels"]["ministack"] == "ec2"
+    assert create["labels"]["instance_id"] == iid
+    assert inst["VmManager"] == "docker"
+    assert inst["PrivateIpAddress"] == "172.30.0.9"
+    assert inst["PublicIpAddress"] == "172.30.0.9"
+    assert inst["_container_id"] == f"cid-{create['name']}"
+    # The synthetic root EBS volume is still recorded (Terraform/Custodian parity).
+    vol_id = inst["BlockDeviceMappings"][0]["Ebs"]["VolumeId"]
+    assert vol_id in ec2mod._volumes
+    _cleanup_instances([iid])
+
+
+def test_ec2_run_instances_docker_flags_applied(monkeypatch):
+    fake = _fake_docker(images_tags=[["ministack-ec2/box:ami-c0ffee0000000003"]])
+    _vm_on(monkeypatch, fake)
+    monkeypatch.setattr(ec2mod, "EC2_DOCKER_FLAGS", "--privileged")
+    resp = ec2mod._run_instances({"ImageId": "ami-c0ffee0000000003"})
+    assert fake._creates[0]["privileged"] is True
+    _cleanup_instances([_iid_of(resp)])
+
+
+def test_ec2_run_instances_unknown_ami_falls_back_metadata_only(monkeypatch):
+    fake = _fake_docker(images_tags=[["ministack-ec2/box:ami-c0ffee0000000004"]])
+    _vm_on(monkeypatch, fake)
+    for image_id in ("ami-nope00000000001", "ami-00000000"):
+        resp = ec2mod._run_instances({"ImageId": image_id})
+        assert resp[0] == 200
+        iid = _iid_of(resp)
+        assert "VmManager" not in ec2mod._instances[iid]
+        _cleanup_instances([iid])
+    assert fake._creates == []
+
+
+def test_ec2_run_instances_docker_unreachable_falls_back(monkeypatch):
+    monkeypatch.setattr(ec2mod, "EC2_VM_MANAGER", "docker")
+    monkeypatch.setattr(ec2mod, "_get_docker", lambda: None)
+    resp = ec2mod._run_instances({"ImageId": "ami-c0ffee0000000005"})
+    assert resp[0] == 200
+    iid = _iid_of(resp)
+    assert "VmManager" not in ec2mod._instances[iid]
+    _cleanup_instances([iid])
+
+
+def test_ec2_run_instances_boot_failure_returns_error(monkeypatch):
+    fake = _fake_docker(images_tags=[["ministack-ec2/box:ami-c0ffee0000000006"]],
+                        create_error=RuntimeError("no space left"))
+    _vm_on(monkeypatch, fake)
+    before = set(ec2mod._instances.keys())
+    before_vols = set(ec2mod._volumes.keys())
+    resp = ec2mod._run_instances({"ImageId": "ami-c0ffee0000000006",
+                                  "MinCount": "2", "MaxCount": "2"})
+    assert resp[0] == 500
+    assert "InternalError" in _body(resp)
+    assert "no space left" in _body(resp)
+    assert set(ec2mod._instances.keys()) == before          # records backed out
+    assert set(ec2mod._volumes.keys()) == before_vols       # synthetic volumes too
+
+
+def test_ec2_lifecycle_maps_to_container(monkeypatch):
+    fake = _fake_docker(images_tags=[["ministack-ec2/box:ami-c0ffee0000000007"]])
+    _vm_on(monkeypatch, fake)
+    iid = _iid_of(ec2mod._run_instances({"ImageId": "ami-c0ffee0000000007"}))
+    container = fake._registry[ec2mod._instances[iid]["_container_id"]]
+
+    assert ec2mod._stop_instances({"InstanceId.1": iid})[0] == 200
+    assert container.stop_calls == 1
+    assert ec2mod._start_instances({"InstanceId.1": iid})[0] == 200
+    assert container.start_calls >= 2  # boot + restart (boot counts one)
+    assert ec2mod._reboot_instances({"InstanceId.1": iid})[0] == 200
+    assert container.restart_calls == 1
+    assert ec2mod._reboot_instances({"InstanceId.1": "i-doesnotexist00001"})[0] == 400
+    assert ec2mod._terminate_instances({"InstanceId.1": iid})[0] == 200
+    assert container.remove_calls == 1
+    _cleanup_instances([iid])
+
+
+def test_ec2_start_relaunches_missing_container(monkeypatch):
+    fake = _fake_docker(images_tags=[["ministack-ec2/box:ami-c0ffee0000000008"]])
+    _vm_on(monkeypatch, fake)
+    iid = _iid_of(ec2mod._run_instances({"ImageId": "ami-c0ffee0000000008"}))
+    fake._registry.clear()  # boot reaper removed the container (emulator restart)
+    assert ec2mod._start_instances({"InstanceId.1": iid})[0] == 200
+    assert len(fake._creates) == 2
+    assert ec2mod._instances[iid]["_container_id"] == f"cid-{fake._creates[1]['name']}"
+    _cleanup_instances([iid])
+
+
+def test_ec2_get_state_strips_container_ids_and_restore_marks_stopped(monkeypatch):
+    fake = _fake_docker(images_tags=[["ministack-ec2/box:ami-c0ffee0000000009"]])
+    _vm_on(monkeypatch, fake)
+    iid = _iid_of(ec2mod._run_instances({"ImageId": "ami-c0ffee0000000009"}))
+    state = ec2mod.get_state()
+    persisted = state["instances"].get(iid)
+    assert persisted["VmManager"] == "docker"
+    assert "_container_id" not in persisted
+    assert "_container_name" not in persisted
+
+    ec2mod.restore_state(state)
+    restored = ec2mod._instances[iid]
+    assert restored["State"] == {"Code": 80, "Name": "stopped"}
+    # Leave a sane module state for the tests that follow.
+    monkeypatch.setattr(ec2mod, "_get_docker", lambda: None)
+    ec2mod.reset()
+
+
+def test_ec2_fleet_launches_stay_metadata_only(monkeypatch):
+    fake = _fake_docker(images_tags=[["ministack-ec2/box:ami-c0ffee000000000a"]])
+    _vm_on(monkeypatch, fake)
+    created = ec2mod._launch_instances_internal(
+        image_id="ami-c0ffee000000000a", instance_type="t3.micro",
+        subnet_id=ec2mod._DEFAULT_SUBNET_ID, count=1)
+    assert fake._creates == []  # only _run_instances boots containers
+    assert "VmManager" not in created[0]
+    _cleanup_instances([created[0]["InstanceId"]])
+
+
+def test_ec2_user_data_written_and_executed(monkeypatch):
+    fake = _fake_docker(images_tags=[["ministack-ec2/box:ami-c0ffee000000000b"]])
+    _vm_on(monkeypatch, fake)
+    script = b"#!/bin/sh\ntouch /tmp/ud-ran\n"
+    resp = ec2mod._run_instances({
+        "ImageId": "ami-c0ffee000000000b",
+        "UserData": _b64.b64encode(script).decode(),
+    })
+    iid = _iid_of(resp)
+    container = fake._registry[ec2mod._instances[iid]["_container_id"]]
+    assert len(container.archives) == 1
+    tar = _tarfile.open(fileobj=io.BytesIO(container.archives[0][1]))
+    member = tar.extractfile("var/lib/ec2/user-data")
+    assert member.read() == script
+    assert tar.getmember("var/lib/ec2/user-data").mode == 0o700
+    (cmd, detach), = container.execs
+    assert detach is True
+    assert "/var/lib/ec2/user-data" in cmd[-1]
+    assert "cloud-init-output.log" in cmd[-1]
+    _cleanup_instances([iid])
+
+    # No shebang: written but never executed.
+    resp = ec2mod._run_instances({
+        "ImageId": "ami-c0ffee000000000b",
+        "UserData": _b64.b64encode(b"plain config payload").decode(),
+    })
+    iid = _iid_of(resp)
+    container = fake._registry[ec2mod._instances[iid]["_container_id"]]
+    assert len(container.archives) == 1
+    assert container.execs == []
+    _cleanup_instances([iid])
+
+    # Broken base64: boot still succeeds, nothing delivered.
+    resp = ec2mod._run_instances({
+        "ImageId": "ami-c0ffee000000000b",
+        "UserData": "%%%not-base64%%%",
+    })
+    assert resp[0] == 200
+    iid = _iid_of(resp)
+    container = fake._registry[ec2mod._instances[iid]["_container_id"]]
+    assert container.archives == []
+    assert container.execs == []
+    _cleanup_instances([iid])
+
+
+def test_ec2_describe_instance_attribute_user_data_roundtrip(monkeypatch):
+    monkeypatch.setattr(ec2mod, "EC2_VM_MANAGER", "")
+    encoded = _b64.b64encode(b"#!/bin/sh\necho hi\n").decode()
+    iid = _iid_of(ec2mod._run_instances({"ImageId": "ami-plain0000000001",
+                                         "UserData": encoded}))
+    body = _body(ec2mod._describe_instance_attribute(
+        {"InstanceId": iid, "Attribute": "userData"}))
+    assert f"<userData><value>{encoded}</value></userData>" in body
+    _cleanup_instances([iid])
+
+
+def test_ec2_import_key_pair_stores_public_material():
+    line = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPLACEHOLDERKEYFORTESTS pytest@ministack"
+    name = f"import-{_uuid_mod.uuid4().hex[:8]}"
+    resp = ec2mod._import_key_pair({
+        "KeyName": name,
+        "PublicKeyMaterial": _b64.b64encode(line.encode()).decode(),
+    })
+    assert resp[0] == 200
+    assert ec2mod._key_pairs[name]["PublicKeyMaterial"] == line
+    assert f"<keyName>{name}</keyName>" in _body(resp)
+    ec2mod._key_pairs.pop(name, None)
+
+
+def test_ec2_vm_launch_carries_ownership_labels(monkeypatch):
+    """Instance containers carry container_reaper's ownership labels, and the
+    live-ids provider vouches for them until the record is gone."""
+    from ministack.core import container_reaper
+
+    fake = _fake_docker(images_tags=[["ministack-ec2/box:ami-c0ffee0000000010"]])
+    _vm_on(monkeypatch, fake)
+    resp = ec2mod._run_instances({"ImageId": "ami-c0ffee0000000010"})
+    assert resp[0] == 200
+    iid = _iid_of(resp)
+    labels = fake._creates[-1]["labels"]
+    assert labels["ministack"] == "ec2"
+    assert labels[container_reaper.INSTANCE_LABEL] == container_reaper.instance_id()
+    assert labels[container_reaper.BOOT_LABEL]
+    cid = ec2mod._instances[iid]["_container_id"]
+    assert cid in ec2mod._vm_live_container_ids()
+    _cleanup_instances([iid])
+    assert cid not in ec2mod._vm_live_container_ids()
+
+
+def test_ec2_vm_dead_container_reconciles_on_describe(monkeypatch):
+    """A container that exits or vanishes out-of-band downgrades its record to
+    stopped on the next DescribeInstances; a dead daemon changes nothing."""
+    fake = _fake_docker(images_tags=[["ministack-ec2/box:ami-c0ffee0000000011"]])
+    _vm_on(monkeypatch, fake)
+    resp = ec2mod._run_instances({"ImageId": "ami-c0ffee0000000011"})
+    iid = _iid_of(resp)
+    inst = ec2mod._instances[iid]
+    container = fake._registry[inst["_container_id"]]
+
+    # Daemon unreachable: the record must not be touched.
+    monkeypatch.setattr(fake, "ping", lambda: (_ for _ in ()).throw(Exception("down")))
+    ec2mod._describe_instances({"InstanceId.1": iid})
+    assert inst["State"]["Name"] == "running"
+    monkeypatch.setattr(fake, "ping", lambda: True)
+
+    # Exited out-of-band: stopped, refs kept so StartInstances can restart it.
+    container.status = "exited"
+    ec2mod._describe_instances({"InstanceId.1": iid})
+    assert inst["State"]["Name"] == "stopped"
+    assert inst["_container_id"]
+
+    # "dead" (daemon lost it) downgrades the same way, refs kept.
+    inst["State"] = {"Code": 16, "Name": "running"}
+    container.status = "dead"
+    ec2mod._describe_instances({"InstanceId.1": iid})
+    assert inst["State"]["Name"] == "stopped"
+    assert inst["_container_id"]
+
+    # Gone entirely: stopped with the refs dropped (StartInstances relaunches).
+    inst["State"] = {"Code": 16, "Name": "running"}
+    container.remove()
+    ec2mod._describe_instances({"InstanceId.1": iid})
+    assert inst["State"]["Name"] == "stopped"
+    assert "_container_id" not in inst
+    _cleanup_instances([iid])
+
+
+def test_ec2_vm_partial_multi_instance_boot_backs_out(monkeypatch):
+    """When the second of two containers fails to create, the whole launch
+    fails 500 and the first container plus every record is backed out."""
+    fake = _fake_docker(images_tags=[["ministack-ec2/box:ami-c0ffee0000000013"]],
+                        create_error=RuntimeError("boom"), create_error_at=1)
+    _vm_on(monkeypatch, fake)
+    resp = ec2mod._run_instances({"ImageId": "ami-c0ffee0000000013",
+                                  "MinCount": "2", "MaxCount": "2"})
+    assert resp[0] == 500
+    assert b"InternalError" in resp[2]
+    assert fake._registry == {}, "the first container must be backed out"
+    assert not [i for i in ec2mod._instances.values()
+                if i.get("ImageId") == "ami-c0ffee0000000013"]
+
+
+def test_ec2_vm_start_failure_keeps_previous_state(monkeypatch):
+    """A container that refuses to start answers 500 and the record keeps its
+    previous state instead of claiming running."""
+    fake = _fake_docker(images_tags=[["ministack-ec2/box:ami-c0ffee0000000014"]])
+    _vm_on(monkeypatch, fake)
+    resp = ec2mod._run_instances({"ImageId": "ami-c0ffee0000000014"})
+    iid = _iid_of(resp)
+    inst = ec2mod._instances[iid]
+    ec2mod._stop_instances({"InstanceId.1": iid})
+    assert inst["State"]["Name"] == "stopped"
+    container = fake._registry[inst["_container_id"]]
+
+    def _refuse():
+        raise RuntimeError("no start today")
+
+    monkeypatch.setattr(container, "start", _refuse)
+    resp = ec2mod._start_instances({"InstanceId.1": iid})
+    assert resp[0] == 500
+    assert inst["State"]["Name"] == "stopped"
+    _cleanup_instances([iid])
+
+
+def test_ec2_vm_start_untagged_image_degrades_to_metadata(monkeypatch):
+    """StartInstances on an instance whose container is gone and whose image
+    is no longer tagged degrades to a metadata-only record instead of
+    wedging."""
+    fake = _fake_docker(images_tags=[["ministack-ec2/box:ami-c0ffee0000000015"]])
+    _vm_on(monkeypatch, fake)
+    resp = ec2mod._run_instances({"ImageId": "ami-c0ffee0000000015"})
+    iid = _iid_of(resp)
+    inst = ec2mod._instances[iid]
+    fake._registry[inst["_container_id"]].remove()
+    inst["State"] = {"Code": 80, "Name": "stopped"}
+    inst.pop("_container_id", None)
+    inst.pop("_container_name", None)
+    monkeypatch.setattr(ec2mod, "_list_docker_amis", lambda _client: [])
+    creates_before = len(fake._creates)
+    resp = ec2mod._start_instances({"InstanceId.1": iid})
+    assert resp[0] == 200
+    assert inst["State"]["Name"] == "running"
+    assert len(fake._creates) == creates_before, "no container may be booted"
+    _cleanup_instances([iid])
+
+
+def test_ec2_create_key_pair_stub_without_openssl(monkeypatch):
+    """No openssl on PATH: CreateKeyPair keeps the historical stub material
+    and stores no public key."""
+    import shutil as _shutil_mod
+    monkeypatch.setattr(_shutil_mod, "which", lambda _name: None)
+    name = f"kp-stub-{_uuid_mod.uuid4().hex[:8]}"
+    resp = ec2mod._create_key_pair({"KeyName": name})
+    assert resp[0] == 200
+    assert "(stub)" in _body(resp)
+    assert ec2mod._key_pairs[name]["PublicKeyMaterial"] == ""
+    ec2mod._key_pairs.pop(name, None)
+
+
+def test_ec2_vm_reset_sweep_is_instance_scoped(monkeypatch):
+    """reset() removes only containers labelled with THIS MiniStack's
+    ministack.instance — a foreign instance's box survives."""
+    from ministack.core import container_reaper
+
+    fake = _fake_docker(images_tags=[["ministack-ec2/box:ami-c0ffee0000000012"]])
+    _vm_on(monkeypatch, fake)
+    resp = ec2mod._run_instances({"ImageId": "ami-c0ffee0000000012"})
+    iid = _iid_of(resp)
+    ours = ec2mod._instances[iid]["_container_id"]
+    fake.containers.create(
+        "elsewhere-img",
+        name="ministack-ec2-foreign-box",
+        labels={"ministack": "ec2", container_reaper.INSTANCE_LABEL: "elsewhere:4566",
+                container_reaper.BOOT_LABEL: "deadbeef"},
+    )
+    ec2mod._vm_reap_all_containers()
+    assert ours not in fake._registry
+    assert "ministack-ec2-foreign-box" in fake._registry
+    _cleanup_instances([iid])
+
+
+@pytest.mark.skipif(not (_shutil.which("openssl") and _shutil.which("ssh-keygen")),
+                    reason="openssl/ssh-keygen not available")
+def test_ec2_create_key_pair_real_material():
+    name = f"real-{_uuid_mod.uuid4().hex[:8]}"
+    resp = ec2mod._create_key_pair({"KeyName": name})
+    body = _body(resp)
+    assert "PRIVATE KEY-----" in body
+    assert "(stub)" not in body
+    assert ec2mod._key_pairs[name]["PublicKeyMaterial"].startswith("ssh-")
+    ec2mod._key_pairs.pop(name, None)
+
+    name = f"real-ed-{_uuid_mod.uuid4().hex[:8]}"
+    body = _body(ec2mod._create_key_pair({"KeyName": name, "KeyType": "ed25519"}))
+    assert "PRIVATE KEY-----" in body
+    ec2mod._key_pairs.pop(name, None)
+
+
+def test_ec2_key_name_injects_authorized_keys(monkeypatch):
+    fake = _fake_docker(images_tags=[["ministack-ec2/box:ami-c0ffee000000000c"]])
+    _vm_on(monkeypatch, fake)
+    line = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPLACEHOLDERKEYFORTESTS pytest@ministack"
+    kp_name = f"inject-{_uuid_mod.uuid4().hex[:8]}"
+    ec2mod._import_key_pair({
+        "KeyName": kp_name,
+        "PublicKeyMaterial": _b64.b64encode(line.encode()).decode(),
+    })
+    iid = _iid_of(ec2mod._run_instances({"ImageId": "ami-c0ffee000000000c",
+                                         "KeyName": kp_name}))
+    container = fake._registry[ec2mod._instances[iid]["_container_id"]]
+    tar = _tarfile.open(fileobj=io.BytesIO(container.archives[0][1]))
+    assert tar.extractfile("root/.ssh/authorized_keys").read() == (line + "\n").encode()
+    assert tar.getmember("root/.ssh/authorized_keys").mode == 0o600
+    assert tar.getmember("root/.ssh").mode == 0o700
+    _cleanup_instances([iid])
+    ec2mod._key_pairs.pop(kp_name, None)
+
+    # Unknown KeyName: boots anyway, nothing injected.
+    iid = _iid_of(ec2mod._run_instances({"ImageId": "ami-c0ffee000000000c",
+                                         "KeyName": "no-such-key"}))
+    container = fake._registry[ec2mod._instances[iid]["_container_id"]]
+    assert container.archives == []
+    _cleanup_instances([iid])
+
+
+def _set_server_ec2_vm_manager(value):
+    req = urllib.request.Request(
+        f"{ENDPOINT}/_ministack/config",
+        data=json.dumps({"ec2.EC2_VM_MANAGER": value}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read()).get("applied", {})
+
+
+def _docker_sdk_client():
+    import docker as _docker_sdk
+    return _docker_sdk.from_env()
+
+
+def _tag_test_ami(client, ami_id):
+    """Tag a tiny local image as a launchable AMI; returns the tag or skips."""
+    tag = f"ministack-ec2/pytest-box:{ami_id}"
+    try:
+        try:
+            image = client.images.get("alpine:3")
+        except Exception:
+            image = client.images.pull("alpine", tag="3")
+        image.tag(tag)
+    except Exception as e:
+        pytest.skip(f"could not prepare a test AMI image: {e}")
+    return tag
+
+
+def _find_instance_container(client, iid):
+    got = client.containers.list(all=True, filters={"label": f"instance_id={iid}"})
+    return got[0] if got else None
+
+
+@requires_docker
+def test_ec2_vm_docker_end_to_end(ec2):
+    client = _docker_sdk_client()
+    ami_id = f"ami-{_uuid_mod.uuid4().hex[:12]}"
+    tag = _tag_test_ami(client, ami_id)
+    applied = _set_server_ec2_vm_manager("docker")
+    if "ec2.EC2_VM_MANAGER" not in applied:
+        pytest.skip("server rejected the EC2_VM_MANAGER config flip")
+    iid = None
+    try:
+        images = ec2.describe_images(ImageIds=[ami_id])["Images"]
+        assert images and images[0]["ImageId"] == ami_id
+        assert {"Key": "ec2_vm_manager", "Value": "docker"} in images[0].get("Tags", [])
+
+        inst = ec2.run_instances(ImageId=ami_id, MinCount=1, MaxCount=1,
+                                 InstanceType="t3.micro")["Instances"][0]
+        iid = inst["InstanceId"]
+        container = _find_instance_container(client, iid)
+        assert container is not None, "run_instances did not boot a container"
+        assert container.status == "running"
+        labels = container.labels
+        assert labels.get("ministack") == "ec2"
+        # Ownership labels from core/container_reaper: instance-scoped reaping
+        # (and a reset on a shared daemon) must be able to attribute this
+        # container to this MiniStack and this run of it.
+        assert labels.get("ministack.instance")
+        assert labels.get("ministack.boot")
+        nets = container.attrs["NetworkSettings"]["Networks"]
+        assert inst["PrivateIpAddress"] in {n.get("IPAddress") for n in nets.values()}
+
+        ec2.stop_instances(InstanceIds=[iid])
+        container.reload()
+        assert container.status in ("exited", "removing", "dead")
+        ec2.start_instances(InstanceIds=[iid])
+        container = _find_instance_container(client, iid)
+        container.reload()
+        assert container.status == "running"
+
+        ec2.terminate_instances(InstanceIds=[iid])
+        assert _find_instance_container(client, iid) is None
+        iid = None
+    finally:
+        if iid:
+            try:
+                ec2.terminate_instances(InstanceIds=[iid])
+            except Exception:
+                pass
+        _set_server_ec2_vm_manager("")
+        try:
+            client.images.remove(tag)
+        except Exception:
+            pass
+
+
+@requires_docker
+def test_ec2_vm_user_data_and_key_injection_live(ec2):
+    client = _docker_sdk_client()
+    ami_id = f"ami-{_uuid_mod.uuid4().hex[:12]}"
+    tag = _tag_test_ami(client, ami_id)
+    applied = _set_server_ec2_vm_manager("docker")
+    if "ec2.EC2_VM_MANAGER" not in applied:
+        pytest.skip("server rejected the EC2_VM_MANAGER config flip")
+    key_line = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILIVETESTPLACEHOLDERKEY pytest@live"
+    kp_name = f"live-{_uuid_mod.uuid4().hex[:8]}"
+    iid = None
+    try:
+        ec2.import_key_pair(KeyName=kp_name,
+                            PublicKeyMaterial=key_line.encode())
+        user_data = "#!/bin/sh\ntouch /tmp/ud-ran\n"
+        inst = ec2.run_instances(
+            ImageId=ami_id, MinCount=1, MaxCount=1, KeyName=kp_name,
+            UserData=user_data)["Instances"][0]
+        iid = inst["InstanceId"]
+        container = _find_instance_container(client, iid)
+        assert container is not None
+
+        deadline = time.time() + 15
+        marker = 1
+        while time.time() < deadline:
+            marker = container.exec_run(["/bin/sh", "-c", "test -f /tmp/ud-ran"]).exit_code
+            if marker == 0:
+                break
+            time.sleep(0.5)
+        assert marker == 0, "user-data script did not run"
+        assert container.exec_run(
+            ["/bin/sh", "-c", "test -f /var/log/cloud-init-output.log"]).exit_code == 0
+        keys = container.exec_run(["cat", "/root/.ssh/authorized_keys"])
+        assert keys.exit_code == 0
+        assert key_line in keys.output.decode()
+    finally:
+        if iid:
+            try:
+                ec2.terminate_instances(InstanceIds=[iid])
+            except Exception:
+                pass
+        try:
+            ec2.delete_key_pair(KeyName=kp_name)
+        except Exception:
+            pass
+        _set_server_ec2_vm_manager("")
+        try:
+            client.images.remove(tag)
+        except Exception:
+            pass
+
+
+@requires_docker
+def test_ec2_vm_dead_container_reports_stopped(ec2):
+    """A docker-backed instance whose container dies behind MiniStack's back
+    reports stopped on the next DescribeInstances, and StartInstances brings
+    it back by relaunching from the AMI."""
+    client = _docker_sdk_client()
+    ami_id = f"ami-{_uuid_mod.uuid4().hex[:12]}"
+    tag = _tag_test_ami(client, ami_id)
+    applied = _set_server_ec2_vm_manager("docker")
+    if "ec2.EC2_VM_MANAGER" not in applied:
+        pytest.skip("server rejected the EC2_VM_MANAGER config flip")
+    iid = None
+    try:
+        inst = ec2.run_instances(ImageId=ami_id, MinCount=1, MaxCount=1)["Instances"][0]
+        iid = inst["InstanceId"]
+        container = _find_instance_container(client, iid)
+        assert container is not None
+        container.remove(force=True)   # the box dies out-of-band
+
+        state = ec2.describe_instances(InstanceIds=[iid])[
+            "Reservations"][0]["Instances"][0]["State"]["Name"]
+        assert state == "stopped"
+
+        ec2.start_instances(InstanceIds=[iid])
+        container = _find_instance_container(client, iid)
+        assert container is not None and container.status == "running"
+
+        ec2.terminate_instances(InstanceIds=[iid])
+        assert _find_instance_container(client, iid) is None
+        iid = None
+    finally:
+        if iid:
+            try:
+                ec2.terminate_instances(InstanceIds=[iid])
+            except Exception:
+                pass
+        _set_server_ec2_vm_manager("")
+        try:
+            client.images.remove(tag)
+        except Exception:
+            pass
+
+
+@requires_docker
+def test_ec2_vm_reset_removes_containers(ec2):
+    client = _docker_sdk_client()
+    ami_id = f"ami-{_uuid_mod.uuid4().hex[:12]}"
+    tag = _tag_test_ami(client, ami_id)
+    applied = _set_server_ec2_vm_manager("docker")
+    if "ec2.EC2_VM_MANAGER" not in applied:
+        pytest.skip("server rejected the EC2_VM_MANAGER config flip")
+    try:
+        inst = ec2.run_instances(ImageId=ami_id, MinCount=1, MaxCount=1)["Instances"][0]
+        iid = inst["InstanceId"]
+        assert _find_instance_container(client, iid) is not None
+        # A container another MiniStack on the same daemon owns must survive
+        # this instance's reset: the sweep is scoped by ministack.instance.
+        decoy = client.containers.create(
+            "alpine:3", name=f"ministack-ec2-decoy-{_uuid_mod.uuid4().hex[:8]}",
+            labels={"ministack": "ec2", "ministack.instance": "elsewhere:4566",
+                    "ministack.boot": "deadbeef"},
+            command=["sleep", "infinity"],
+        )
+        try:
+            req = urllib.request.Request(f"{ENDPOINT}/_ministack/reset", method="POST")
+            with urllib.request.urlopen(req, timeout=30):
+                pass
+            assert _find_instance_container(client, iid) is None
+            decoy.reload()  # still exists — reset did not cross instances
+        finally:
+            try:
+                decoy.remove(force=True)
+            except Exception:
+                pass
+    finally:
+        _set_server_ec2_vm_manager("")
+        try:
+            client.images.remove(tag)
+        except Exception:
+            pass

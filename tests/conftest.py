@@ -62,6 +62,13 @@ _SERIAL_TESTS = {
     "tests/test_athena.py::test_athena_engine_mock_via_config",
     "tests/test_athena.py::test_athena_mixed_glue_and_s3_uri",
     "tests/test_ec2.py::test_ec2_create_default_vpc",
+    # Docker VM manager live tests flip ec2.EC2_VM_MANAGER on the running
+    # server via /_ministack/config (one hits /_ministack/reset) — they must
+    # not interleave with anything else.
+    "tests/test_ec2.py::test_ec2_vm_docker_end_to_end",
+    "tests/test_ec2.py::test_ec2_vm_user_data_and_key_injection_live",
+    "tests/test_ec2.py::test_ec2_vm_dead_container_reports_stopped",
+    "tests/test_ec2.py::test_ec2_vm_reset_removes_containers",
     "tests/test_eks.py::test_eks_cfn_cluster",
     "tests/test_eks.py::test_eks_create_describe_delete_cluster",
     "tests/test_eks.py::test_eks_restore_state_normalizes_endpoint_to_localhost",

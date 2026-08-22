@@ -60,6 +60,7 @@ Supports:
                    ModifyLaunchTemplate, DeleteLaunchTemplate
 """
 
+import base64
 import copy
 import hashlib
 import logging
@@ -71,6 +72,8 @@ import time
 from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
+from ministack.core import container_reaper
+from ministack.core.concurrency import run_offloop
 from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -83,6 +86,22 @@ from ministack.core.responses import (
 logger = logging.getLogger("ec2")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+
+# ── Docker VM manager (opt-in) ─────────────────────────────
+# EC2_VM_MANAGER=docker boots RunInstances launches as real containers when the
+# AMI id resolves to a locally tagged Docker image; anything else keeps the
+# historical metadata-only behaviour. See the "Docker VM manager" section below.
+EC2_VM_MANAGER = os.environ.get("EC2_VM_MANAGER", "").lower()
+# Local images tagged "<prefix>/<name>:<ami-id>" become launchable AMIs.
+# Migrations off LocalStack Pro can set EC2_DOCKER_IMAGE_PREFIX=localstack-ec2
+# to reuse images tagged for its VM manager unchanged.
+EC2_DOCKER_IMAGE_PREFIX = os.environ.get("EC2_DOCKER_IMAGE_PREFIX", "ministack-ec2")
+# docker-CLI-style flags applied to every instance container (e.g. --privileged
+# for systemd guests). Parsed by _parse_ec2_docker_flags; --init is refused.
+EC2_DOCKER_FLAGS = os.environ.get("EC2_DOCKER_FLAGS", "")
+DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
+
+_docker = None
 
 # ---------------------------------------------------------------------------
 # State
@@ -124,12 +143,19 @@ _default_initialized_scopes = set()
 # ── Persistence ────────────────────────────────────────────
 
 def get_state():
+    instances = copy.deepcopy(_instances)
+    # Persisted container ids would dangle after a restart (the boot sweep
+    # reclaims this instance's containers, see core/container_reaper.reap_all):
+    # strip them, keep VmManager so restore_state can reconcile the state.
+    for inst in instances.all_values():
+        inst.pop("_container_id", None)
+        inst.pop("_container_name", None)
     return {
         "default_initialized_scopes": [
             {"AccountId": account_id, "Region": region}
             for account_id, region in sorted(_default_initialized_scopes)
         ],
-        "instances": copy.deepcopy(_instances),
+        "instances": instances,
         "security_groups": copy.deepcopy(_security_groups),
         "key_pairs": copy.deepcopy(_key_pairs),
         "placement_groups": copy.deepcopy(_placement_groups),
@@ -260,6 +286,17 @@ def _restore_vpc_peering_store(restored):
         )
 
 
+def _reconcile_docker_backed_instances():
+    """Restored docker-backed instances have no container behind them (the boot
+    reaper removed it): report them stopped rather than lie about a running box.
+    StartInstances relaunches a fresh container from the stored AMI."""
+    for inst in _instances.all_values():
+        if inst.get("VmManager") == "docker" and inst.get("State", {}).get("Name") == "running":
+            inst["State"] = {"Code": 80, "Name": "stopped"}
+            inst.pop("_container_id", None)
+            inst.pop("_container_name", None)
+
+
 def restore_state(data):
     if not data:
         return
@@ -297,6 +334,7 @@ def restore_state(data):
     )
     if "default_initialized_scopes" not in data:
         _infer_default_initialized_scopes_from_restored_stores()
+    _reconcile_docker_backed_instances()
 
 
 def _restore_regional_store(store, restored):
@@ -431,6 +469,18 @@ _ensure_defaults_initialized()
 # Request routing
 # ---------------------------------------------------------------------------
 
+# Actions that reach the Docker daemon when the VM manager is on. Everything
+# else is pure in-memory record work and stays on the event loop, serialised
+# as it always was.
+_VM_DOCKER_ACTIONS = {
+    "RunInstances", "StartInstances", "StopInstances", "RebootInstances",
+    "TerminateInstances", "DescribeInstances", "DescribeImages",
+    # Reaches docker indirectly: its _cleanup_terminated() removes the
+    # containers of terminated instances whose terminate-time removal failed.
+    "DescribeIamInstanceProfileAssociations",
+}
+
+
 async def handle_request(method, path, headers, body, query_params):
     _ensure_defaults_initialized()
     params = dict(query_params)
@@ -443,6 +493,16 @@ async def handle_request(method, path, headers, body, query_params):
     handler = _ACTION_MAP.get(action)
     if not handler:
         return _error("InvalidAction", f"Unknown EC2 action: {action}", 400)
+    # Blocking work goes off the loop (see core/concurrency.py): the VM
+    # manager's container create/start/stop/inspect calls block for as long as
+    # the daemon takes, and CreateKeyPair shells out to openssl/ssh-keygen.
+    # The containers launched here run the AMI's own workload, not anything
+    # wired back to 4566, so this cannot re-enter — the shared pool
+    # (run_offloop) is the right place, not run_reentrant.
+    if action == "CreateKeyPair" or (
+        EC2_VM_MANAGER == "docker" and action in _VM_DOCKER_ACTIONS
+    ):
+        return await run_offloop(handler, params)
     return handler(params)
 
 
@@ -717,6 +777,33 @@ def _run_instances(p):
         iam_profile=iam_profile
     )
 
+    # Docker VM manager: boot each record as a real container when the AMI id
+    # resolves to a locally tagged image. Only RunInstances launches boot —
+    # CreateFleet's call into _launch_instances_internal stays metadata-only.
+    if _vm_manager_enabled():
+        image_ref = _resolve_docker_ami(image_id)
+        if image_ref is None:
+            logger.warning(
+                "EC2: EC2_VM_MANAGER=docker but no local image is tagged %s/<name>:%s "
+                "— instances stay metadata-only", EC2_DOCKER_IMAGE_PREFIX, image_id)
+        else:
+            try:
+                for inst in created:
+                    _vm_launch(inst, image_ref)
+            except Exception as e:
+                # A "running" record with nothing behind it is the silent
+                # degradation this backend exists to remove (LAMBDA_STRICT
+                # precedent): back everything out and surface the failure.
+                logger.warning("EC2: docker boot failed for image %s: %s", image_ref, e)
+                for inst in created:
+                    _vm_remove_container(inst)
+                    _discard_instance_records(inst)
+                return _error(
+                    "InternalError",
+                    f"EC2 Docker VM manager failed to start instance from "
+                    f"{_esc(image_ref)}: {_esc(str(e))}",
+                    500)
+
     # Process TagSpecifications
     i = 1
     while _p(p, f"TagSpecification.{i}.ResourceType"):
@@ -755,7 +842,10 @@ def _cleanup_terminated():
              if v["State"]["Name"] == "terminated"
              and now - v.get("_terminated_at", 0) > 60]
     for k in stale:
-        _instances.pop(k, None)
+        inst = _instances.pop(k, None)
+        # Belt-and-braces for a terminate whose docker call failed.
+        if inst and inst.get("VmManager") == "docker":
+            _vm_remove_container(inst)
 
 
 def _describe_instances(p):
@@ -768,6 +858,13 @@ def _describe_instances(p):
         for iid in filter_ids:
             if iid not in _instances:
                 return _error("InvalidInstanceID.NotFound", f"The instance ID '{iid}' does not exist", 400)
+
+    if EC2_VM_MANAGER == "docker":
+        # Before the filters run, so an instance-state-name filter sees the
+        # reconciled state. Runs off-loop (DescribeInstances is in
+        # _VM_DOCKER_ACTIONS whenever the manager is on), so the container
+        # inspects cannot stall the loop.
+        _vm_reconcile_running_instances(list(_instances.values()))
 
     results = []
     for inst in _instances.values():
@@ -973,6 +1070,8 @@ def _terminate_instances(p):
             prev = inst["State"].copy()
             inst["State"] = {"Code": 48, "Name": "terminated"}
             inst["_terminated_at"] = time.time()
+            if inst.get("VmManager") == "docker":
+                _vm_remove_container(inst)
             assoc = _find_active_iam_instance_profile_association(iid)
             if assoc:
                 _mark_iam_instance_profile_association_disassociated(assoc)
@@ -995,6 +1094,13 @@ def _stop_instances(p):
         if inst:
             prev = inst["State"].copy()
             inst["State"] = {"Code": 80, "Name": "stopped"}
+            if inst.get("VmManager") == "docker":
+                container = _vm_get_container(inst)
+                if container is not None:
+                    try:
+                        container.stop(timeout=10)
+                    except Exception as e:
+                        logger.warning("EC2: could not stop container for %s: %s", iid, e)
             items += f"""<item>
                 <instanceId>{iid}</instanceId>
                 <previousState><code>{prev['Code']}</code><name>{prev['Name']}</name></previousState>
@@ -1013,6 +1119,15 @@ def _start_instances(p):
         inst = _instances.get(iid)
         if inst:
             prev = inst["State"].copy()
+            if inst.get("VmManager") == "docker":
+                # Container first, record second: the describe-time reconcile
+                # only judges records that already say "running", so the record
+                # may not say it before the container actually is — otherwise a
+                # concurrent DescribeInstances can catch the exited container
+                # mid-start and downgrade a box that is about to run.
+                err = _vm_start_or_relaunch(inst)
+                if err is not None:
+                    return err
             inst["State"] = {"Code": 16, "Name": "running"}
             items += f"""<item>
                 <instanceId>{iid}</instanceId>
@@ -1023,6 +1138,24 @@ def _start_instances(p):
 
 
 def _reboot_instances(p):
+    ids = _parse_member_list(p, "InstanceId")
+    # Real EC2 answers InvalidInstanceID.NotFound here. The sibling lifecycle
+    # actions still skip unknown ids silently — that shape predates this
+    # feature and changing it is not this change's business.
+    for iid in ids:
+        if iid not in _instances:
+            return _error("InvalidInstanceID.NotFound", f"The instance ID '{iid}' does not exist", 400)
+    for iid in ids:
+        inst = _instances.get(iid)
+        if inst and inst.get("VmManager") == "docker":
+            container = _vm_get_container(inst)
+            if container is not None:
+                try:
+                    container.restart(timeout=10)
+                    # Container IPs can change across a restart: refresh the record.
+                    _vm_apply_container_ip(inst, container, _get_ministack_network(_get_docker()))
+                except Exception as e:
+                    logger.warning("EC2: could not restart container for %s: %s", iid, e)
     return _xml(200, "RebootInstancesResponse", "<return>true</return>")
 
 
@@ -1043,8 +1176,46 @@ _STUB_AMIS = [
 def _describe_images(p):
     filter_ids = _parse_member_list(p, "ImageId")
     items = ""
+    emitted = set()
+    # Docker VM manager AMIs come first: a locally tagged image is launchable,
+    # the stubs below are metadata-only. The ec2_vm_manager tag makes the
+    # mechanism observable to callers probing for the capability. No caching:
+    # images are typically tagged after the emulator is already up.
+    if _vm_manager_enabled():
+        for ami in _list_docker_amis(_get_docker()):
+            if filter_ids and ami["AmiId"] not in filter_ids:
+                continue
+            emitted.add(ami["AmiId"])
+            items += f"""<item>
+            <imageId>{ami['AmiId']}</imageId>
+            <imageLocation>{ami['Name']}</imageLocation>
+            <imageState>available</imageState>
+            <imageOwnerId>{get_account_id()}</imageOwnerId>
+            <isPublic>false</isPublic>
+            <architecture>x86_64</architecture>
+            <imageType>machine</imageType>
+            <name>{ami['Name']}</name>
+            <description>Docker-backed AMI ({_esc(ami['ImageRef'])})</description>
+            <rootDeviceType>ebs</rootDeviceType>
+            <rootDeviceName>/dev/xvda</rootDeviceName>
+            <blockDeviceMapping>
+                <item>
+                    <deviceName>/dev/xvda</deviceName>
+                    <ebs>
+                        <volumeSize>8</volumeSize>
+                        <volumeType>gp2</volumeType>
+                        <deleteOnTermination>true</deleteOnTermination>
+                    </ebs>
+                </item>
+            </blockDeviceMapping>
+            <virtualizationType>hvm</virtualizationType>
+            <hypervisor>xen</hypervisor>
+            <tagSet><item><key>ec2_vm_manager</key><value>docker</value></item></tagSet>
+        </item>"""
     for ami_id, name, desc, platform, root_device in _STUB_AMIS:
         if filter_ids and ami_id not in filter_ids:
+            continue
+        if ami_id in emitted:
             continue
         # RootDeviceName + BlockDeviceMappings are required by Terraform's AWS
         # provider on aws_instance — it resolves them from DescribeImages before
@@ -1510,6 +1681,53 @@ def _revoke_sg_egress(p):
 # Key Pairs
 # ---------------------------------------------------------------------------
 
+def _generate_key_pair_material(key_type):
+    """Best-effort real key material via the openssl / ssh-keygen CLIs.
+
+    The images ship openssl (the TLS feature depends on it) but deliberately no
+    Python crypto package — mirroring that choice keeps the base install
+    dependency-free. Returns ``(private_pem, public_openssh)``; ``("", "")``
+    when generation is unavailable, in which case the caller falls back to the
+    historical stub material (fingerprints stay random either way).
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    if not shutil.which("openssl"):
+        return "", ""
+    if key_type == "ed25519":
+        cmd = ["openssl", "genpkey", "-algorithm", "ed25519"]
+    else:
+        cmd = ["openssl", "genrsa", "2048"]
+    try:
+        private_pem = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=15, check=True
+        ).stdout
+    except Exception as e:
+        logger.warning("EC2: openssl key generation failed: %s", e)
+        return "", ""
+    public_openssh = ""
+    if shutil.which("ssh-keygen"):
+        fd, path = tempfile.mkstemp(suffix=".pem")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(private_pem)
+            pub = subprocess.run(
+                ["ssh-keygen", "-y", "-f", path],
+                capture_output=True, text=True, timeout=15,
+            )
+            if pub.returncode == 0:
+                public_openssh = pub.stdout.strip()
+            else:
+                logger.debug("EC2: ssh-keygen -y failed: %s", pub.stderr.strip())
+        except Exception as e:
+            logger.debug("EC2: ssh-keygen -y failed: %s", e)
+        finally:
+            os.unlink(path)
+    return private_pem, public_openssh
+
+
 def _create_key_pair(p):
     name = _p(p, "KeyName")
     if not name:
@@ -1517,12 +1735,18 @@ def _create_key_pair(p):
     if name in _key_pairs:
         return _error("InvalidKeyPair.Duplicate",
                       f"The key pair '{name}' already exists", 400)
+    key_type = (_p(p, "KeyType") or "rsa").lower()
     fingerprint = ":".join(f"{random.randint(0,255):02x}" for _ in range(20))
-    material = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA(stub)\n-----END RSA PRIVATE KEY-----"
+    material, public_key = _generate_key_pair_material(key_type)
+    if not material:
+        material = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA(stub)\n-----END RSA PRIVATE KEY-----"
     _key_pairs[name] = {
         "KeyName": name,
         "KeyFingerprint": fingerprint,
         "KeyPairId": f"key-{new_uuid().replace('-','')[:17]}",
+        # OpenSSH public line, injected into docker-backed instances launched
+        # with this KeyName (empty when ssh-keygen is unavailable).
+        "PublicKeyMaterial": public_key,
     }
     _parse_tag_specs(p, "key-pair", _key_pairs[name]['KeyPairId'])
     return _xml(200, "CreateKeyPairResponse", f"""
@@ -1560,16 +1784,492 @@ def _import_key_pair(p):
     name = _p(p, "KeyName")
     if not name:
         return _error("MissingParameter", "KeyName is required", 400)
+    # Keep the public key: docker-backed instances launched with this KeyName
+    # get it written to root's authorized_keys. Undecodable material is kept
+    # non-fatal (historical behaviour) — injection just skips later.
+    public_key = ""
+    material_b64 = _p(p, "PublicKeyMaterial")
+    if material_b64:
+        try:
+            public_key = base64.b64decode(material_b64).decode("utf-8", "replace").strip()
+        except Exception:
+            logger.warning("EC2: PublicKeyMaterial for key pair %r is not valid base64; "
+                           "stored without key material", name)
     fingerprint = ":".join(f"{random.randint(0,255):02x}" for _ in range(20))
     _key_pairs[name] = {
         "KeyName": name,
         "KeyFingerprint": fingerprint,
         "KeyPairId": f"key-{new_uuid().replace('-','')[:17]}",
+        "PublicKeyMaterial": public_key,
     }
     return _xml(200, "ImportKeyPairResponse", f"""
         <keyName>{name}</keyName>
         <keyFingerprint>{fingerprint}</keyFingerprint>
         <keyPairId>{_key_pairs[name]['KeyPairId']}</keyPairId>""")
+
+
+# ---------------------------------------------------------------------------
+# Docker VM manager (EC2_VM_MANAGER=docker)
+# ---------------------------------------------------------------------------
+# Opt-in container backend for RunInstances (upstream ask: #1344). A local
+# Docker image tagged "<EC2_DOCKER_IMAGE_PREFIX>/<name>:<ami-id>" is a
+# launchable AMI: RunInstances with that ami-id boots the image as a container
+# on the emulator's Docker network, the container IP becomes the instance's
+# private/public address, and stop/start/reboot/terminate map onto the
+# container lifecycle. Everything else — unknown AMI ids, no Docker daemon,
+# flag unset — keeps the historical metadata-only behaviour, so CFN/Terraform
+# workloads with fake AMI ids are unaffected.
+#
+# Out of scope: security-group enforcement / port publishing (guests are
+# reached via their network IP), IMDS, CreateImage-from-instance, EBS↔volume
+# mapping, docker-backed CreateFleet, cloud-init beyond shebang scripts.
+# Container filesystem state does not survive an emulator restart: the boot
+# sweep reclaims this instance's containers (core/container_reaper.reap_all),
+# restore_state reports the instance stopped, and StartInstances boots a
+# fresh container from the AMI.
+
+def _get_docker():
+    global _docker
+    if _docker is None:
+        try:
+            import docker
+            # Bounded like rds.py's client: these calls run on the shared
+            # off-loop pool, and a hung daemon must not pin a slot for the
+            # docker-py default of 60s per call.
+            timeout = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
+            _docker = docker.from_env(timeout=timeout)
+        except Exception:
+            pass
+    return _docker
+
+
+def _get_ministack_network(client):
+    """Detect the Docker network MiniStack is running on."""
+    if DOCKER_NETWORK:
+        return DOCKER_NETWORK
+    try:
+        hostname = os.environ.get("HOSTNAME", "")
+        if not hostname:
+            return None
+        self_container = client.containers.get(hostname)
+        nets = list(self_container.attrs["NetworkSettings"]["Networks"].keys())
+        return nets[0] if nets else None
+    except Exception:
+        return None
+
+
+def _vm_manager_enabled():
+    """Whether RunInstances should boot real containers.
+
+    Opt-in via ``EC2_VM_MANAGER=docker``; default is metadata-only records.
+    """
+    return EC2_VM_MANAGER == "docker" and _get_docker() is not None
+
+
+def _ec2_container_name(instance_id):
+    return f"ministack-ec2-{get_account_id()}-{get_region()}-{instance_id}"
+
+
+def _parse_ec2_docker_flags(flags):
+    """Translate a docker-CLI-style ``EC2_DOCKER_FLAGS`` string into docker-py
+    kwargs (subset; unknown flags are ignored). ``--init`` is refused: instance
+    containers always run with init so the appended keepalive command is reaped
+    — disabling it silently breaks container creation."""
+    if not flags:
+        return {}
+    import argparse
+    import shlex
+
+    try:
+        tokens = shlex.split(flags)
+    except ValueError as e:
+        logger.warning("EC2: could not parse EC2_DOCKER_FLAGS %r: %s", flags, e)
+        return {}
+    kept = []
+    for tok in tokens:
+        if tok == "--init" or tok.startswith("--init="):
+            logger.warning("EC2: ignoring %s in EC2_DOCKER_FLAGS — "
+                           "instance containers always run with init", tok)
+            continue
+        kept.append(tok)
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("-e", "--env", action="append", default=[])
+    parser.add_argument("-v", "--volume", action="append", default=[])
+    parser.add_argument("--cap-add", action="append", default=[])
+    parser.add_argument("--tmpfs", action="append", default=[])
+    parser.add_argument("--add-host", action="append", default=[])
+    parser.add_argument("-m", "--memory")
+    parser.add_argument("--shm-size")
+    parser.add_argument("--privileged", action="store_true")
+    args, unknown = parser.parse_known_args(kept)
+    if unknown:
+        logger.debug("EC2: ignoring unsupported EC2_DOCKER_FLAGS tokens: %s", unknown)
+    kwargs = {}
+    if args.privileged:
+        kwargs["privileged"] = True
+    if args.env:
+        kwargs["environment"] = dict(e.partition("=")[::2] for e in args.env)
+    if args.volume:
+        kwargs["volumes"] = args.volume
+    if args.cap_add:
+        kwargs["cap_add"] = args.cap_add
+    if args.tmpfs:
+        kwargs["tmpfs"] = {path: opts for path, _, opts in (t.partition(":") for t in args.tmpfs)}
+    if args.add_host:
+        kwargs["extra_hosts"] = {h: ip for h, _, ip in (a.partition(":") for a in args.add_host)}
+    if args.memory:
+        kwargs["mem_limit"] = args.memory
+    if args.shm_size:
+        kwargs["shm_size"] = args.shm_size
+    return kwargs
+
+
+def _list_docker_amis(docker_client):
+    """Discover launchable AMIs from local image tags.
+
+    NOTE: these are user-local tags, never registry pulls — deliberately NOT
+    routed through ``apply_image_prefix()`` (that rewrite is for the pulled
+    RDS/ElastiCache/EKS engine images and would make local AMIs undiscoverable).
+    """
+    pattern = re.compile(
+        rf"^{re.escape(EC2_DOCKER_IMAGE_PREFIX)}/(?P<name>[^:/]+):(?P<ami>ami-[0-9a-f]+)$")
+    amis = []
+    seen = set()
+    try:
+        images = docker_client.images.list()
+    except Exception as e:
+        logger.warning("EC2: could not list Docker images for AMI discovery: %s", e)
+        return []
+    for image in images:
+        for tag in image.tags or []:
+            m = pattern.match(tag)
+            if not m:
+                continue
+            ami_id = m.group("ami")
+            if ami_id in seen:
+                logger.warning("EC2: duplicate AMI id %s — tag %s ignored", ami_id, tag)
+                continue
+            seen.add(ami_id)
+            amis.append({"AmiId": ami_id, "Name": m.group("name"), "ImageRef": tag})
+    return amis
+
+
+def _resolve_docker_ami(image_id):
+    """Image ref for a docker-backed AMI id; None when it isn't one."""
+    if not _vm_manager_enabled():
+        return None
+    for ami in _list_docker_amis(_get_docker()):
+        if ami["AmiId"] == image_id:
+            return ami["ImageRef"]
+    return None
+
+
+def _build_launch_archive(inst):
+    """In-memory tar of pre-boot guest files: user-data + authorized_keys.
+
+    Written into the container before start, so the files are visible in every
+    namespace — including guests whose entrypoint shim unshares a PID namespace
+    to run systemd (the root filesystem is shared)."""
+    import io
+    import tarfile
+
+    files = []
+    user_data = inst.get("UserData") or ""
+    if user_data:
+        try:
+            files.append(("var/lib/ec2/user-data", 0o700,
+                          base64.b64decode(user_data, validate=True)))
+        except Exception:
+            logger.warning("EC2: UserData for %s is not valid base64; skipping delivery",
+                           inst["InstanceId"])
+    key_name = inst.get("KeyName") or ""
+    if key_name:
+        public_key = (_key_pairs.get(key_name) or {}).get("PublicKeyMaterial", "")
+        if public_key:
+            files.append(("root/.ssh/authorized_keys", 0o600,
+                          (public_key.rstrip("\n") + "\n").encode()))
+        else:
+            logger.info("EC2: key pair %r has no stored public key; "
+                        "skipping injection for %s", key_name, inst["InstanceId"])
+    if not files:
+        return None
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for dirname in ("var/lib/ec2", "root/.ssh"):
+            if any(path.startswith(dirname) for path, _, _ in files):
+                info = tarfile.TarInfo(dirname)
+                info.type = tarfile.DIRTYPE
+                info.mode = 0o700
+                tar.addfile(info)
+        for path, mode, content in files:
+            info = tarfile.TarInfo(path)
+            info.size = len(content)
+            info.mode = mode
+            tar.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+def _vm_exec_user_data(inst, container):
+    """Run a shebang user-data script inside the container (cloud-init parity).
+
+    The exec lands in the container's outer namespace; guests that need to talk
+    to an unshared systemd must use their image's own nsenter helper. Non-fatal
+    by design — AWS doesn't kill instances on cloud-init failure either."""
+    user_data = inst.get("UserData") or ""
+    if not user_data:
+        return
+    try:
+        decoded = base64.b64decode(user_data, validate=True)
+    except Exception:
+        return  # already warned while building the archive
+    if not decoded.startswith(b"#!"):
+        logger.debug("EC2: user-data for %s has no shebang; written but not executed",
+                     inst["InstanceId"])
+        return
+    try:
+        container.exec_run(
+            ["/bin/sh", "-c", "/var/lib/ec2/user-data > /var/log/cloud-init-output.log 2>&1"],
+            detach=True,
+        )
+    except Exception as e:
+        logger.warning("EC2: user-data exec failed for %s: %s", inst["InstanceId"], e)
+
+
+def _vm_apply_container_ip(inst, container, network):
+    """Overwrite the synthetic addresses with the container's real IP."""
+    try:
+        container.reload()
+        nets = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+        if network and network in nets:
+            ip = nets[network].get("IPAddress", "")
+        else:
+            ip = next(iter(nets.values())).get("IPAddress", "") if nets else ""
+        if not ip:
+            logger.warning("EC2: no container IP for %s; keeping synthetic addresses",
+                           inst["InstanceId"])
+            return
+        inst["PrivateIpAddress"] = ip
+        inst["PublicIpAddress"] = ip
+        inst["PrivateDnsName"] = f"ip-{ip.replace('.', '-')}.ec2.internal"
+        inst["PublicDnsName"] = f"ec2-{ip.replace('.', '-')}.compute-1.amazonaws.com"
+    except Exception as e:
+        logger.warning("EC2: could not read container IP for %s: %s", inst["InstanceId"], e)
+
+
+def _vm_launch(inst, image_ref):
+    """Boot one instance record as a container. Raises on create/start failure;
+    the RunInstances caller backs the records out and surfaces the error."""
+    docker_client = _get_docker()
+    network = _get_ministack_network(docker_client)
+    name = _ec2_container_name(inst["InstanceId"])
+    try:
+        docker_client.containers.get(name).remove(force=True)
+    except Exception:
+        pass  # No stale container with that name — fine
+    kwargs = {
+        "name": name,
+        "labels": {
+            **container_reaper.own_labels("ec2"),
+            "instance_id": inst["InstanceId"],
+            "account_id": get_account_id(),
+            "region": get_region(),
+        },
+        # init (tini) as PID 1 reaps the keepalive command; entrypoint shims
+        # that boot systemd in an unshared PID namespace ignore the command.
+        "init": True,
+        "command": ["sleep", "infinity"],
+    }
+    if network:
+        kwargs["network"] = network
+    kwargs.update(_parse_ec2_docker_flags(EC2_DOCKER_FLAGS))
+    container = docker_client.containers.create(image_ref, **kwargs)
+    inst["_container_id"] = container.id
+    inst["_container_name"] = name
+    inst["VmManager"] = "docker"
+    archive = _build_launch_archive(inst)
+    if archive:
+        try:
+            container.put_archive("/", archive)
+        except Exception as e:
+            logger.warning("EC2: could not inject user-data/authorized_keys into %s: %s",
+                           inst["InstanceId"], e)
+    container.start()
+    _vm_apply_container_ip(inst, container, network)
+    _vm_exec_user_data(inst, container)
+    logger.info("EC2: instance %s running in container %s (image %s)",
+                inst["InstanceId"], name, image_ref)
+
+
+def _vm_get_container(inst):
+    docker_client = _get_docker()
+    if not docker_client:
+        return None
+    for ref in (inst.get("_container_id"), inst.get("_container_name"),
+                _ec2_container_name(inst["InstanceId"])):
+        if not ref:
+            continue
+        try:
+            return docker_client.containers.get(ref)
+        except Exception:
+            continue
+    return None
+
+
+def _vm_reconcile_running_instances(instances):
+    """Downgrade a "running" record whose container is gone or has exited.
+
+    A docker-backed instance can die underneath its record (the workload
+    exits, the daemon OOM-kills it, someone removes the container by hand).
+    Reconciled lazily on DescribeInstances rather than by a poller: the
+    record is only wrong for as long as nobody looks at it. Downgrade only —
+    StartInstances is the one path back to "running".
+    """
+    docker_client = _get_docker()
+    if docker_client is None:
+        return
+    try:
+        docker_client.ping()
+    except Exception:
+        return  # daemon unreachable says nothing about the containers
+    from docker import errors as _docker_errors
+    for inst in instances:
+        if inst.get("VmManager") != "docker":
+            continue
+        if inst.get("State", {}).get("Name") != "running":
+            continue
+        refs = [r for r in (inst.get("_container_id"), inst.get("_container_name")) if r]
+        if not refs:
+            continue  # mid-launch record: no container claim to judge yet
+        container = None
+        verdict = "gone"
+        for ref in refs:
+            try:
+                container = docker_client.containers.get(ref)
+                break
+            except _docker_errors.NotFound:
+                continue
+            except Exception as e:
+                # Transient daemon trouble is not evidence the box died.
+                logger.debug("EC2: container lookup for %s failed: %s",
+                             inst["InstanceId"], e)
+                verdict = "unknown"
+                break
+        if verdict == "unknown":
+            continue
+        status = getattr(container, "status", "")
+        if container is not None and status not in ("exited", "dead"):
+            continue
+        inst["State"] = {"Code": 80, "Name": "stopped"}
+        if container is None:
+            # StartInstances relaunches from the AMI when the container is
+            # gone; keep the refs when it merely exited so it can restart.
+            inst.pop("_container_id", None)
+            inst.pop("_container_name", None)
+        logger.info("EC2: instance %s container %s — reporting stopped",
+                    inst["InstanceId"],
+                    "gone" if container is None else status)
+
+
+def _vm_remove_container(inst):
+    container = _vm_get_container(inst)
+    if container is None:
+        return
+    try:
+        container.remove(force=True)
+    except Exception as e:
+        logger.warning("EC2: could not remove container for %s: %s", inst["InstanceId"], e)
+    inst.pop("_container_id", None)
+    inst.pop("_container_name", None)
+
+
+def _vm_start_or_relaunch(inst):
+    """StartInstances backend: start the container, or boot a fresh one.
+
+    After an emulator restart the boot reaper has removed the container, so a
+    restored (stopped) instance relaunches from its stored AMI — with a new
+    filesystem and usually a new IP (callers must re-describe, as on AWS).
+    Returns None on success or an ``_error`` tuple."""
+    container = _vm_get_container(inst)
+    if container is not None:
+        try:
+            container.start()
+            _vm_apply_container_ip(inst, container, _get_ministack_network(_get_docker()))
+            return None
+        except Exception as e:
+            logger.warning("EC2: could not start container for %s: %s", inst["InstanceId"], e)
+            return _error("InternalError",
+                          f"EC2 Docker VM manager failed to start instance "
+                          f"{inst['InstanceId']}: {_esc(str(e))}", 500)
+    image_ref = _resolve_docker_ami(inst.get("ImageId", ""))
+    if image_ref is None:
+        # Image untagged since launch (or flag flipped off): degrade to a
+        # metadata-only record rather than wedging StartInstances forever.
+        logger.warning("EC2: no local image is tagged for %s (ImageId %s); "
+                       "instance stays metadata-only",
+                       inst["InstanceId"], inst.get("ImageId", ""))
+        return None
+    try:
+        _vm_launch(inst, image_ref)
+        return None
+    except Exception as e:
+        logger.warning("EC2: docker relaunch failed for %s: %s", inst["InstanceId"], e)
+        _vm_remove_container(inst)
+        return _error("InternalError",
+                      f"EC2 Docker VM manager failed to start instance "
+                      f"{inst['InstanceId']}: {_esc(str(e))}", 500)
+
+
+def _discard_instance_records(inst):
+    """Back out a failed docker launch: instance + synthetic volume + IAM assoc."""
+    iid = inst["InstanceId"]
+    for bdm in inst.get("BlockDeviceMappings", []):
+        vol_id = bdm.get("Ebs", {}).get("VolumeId")
+        if vol_id:
+            _volumes.pop(vol_id, None)
+    for key in [k for k, a in _iam_instance_profile_associations.items()
+                if a.get("InstanceId") == iid]:
+        _iam_instance_profile_associations.pop(key, None)
+    _instances.pop(iid, None)
+
+
+def _vm_reap_all_containers():
+    """Remove this MiniStack's VM-manager containers. Used by reset.
+
+    Scoped by ``ministack.instance`` like the rest of the reaping machinery
+    (core/container_reaper.py): several instances can share a Docker daemon,
+    and a reset of this one must not take down boxes another instance is
+    running. Containers predating the label scheme are the boot sweep's job.
+    """
+    docker_client = _get_docker()
+    if not docker_client:
+        return
+    try:
+        containers = docker_client.containers.list(all=True, filters={"label": [
+            "ministack=ec2",
+            f"{container_reaper.INSTANCE_LABEL}={container_reaper.instance_id()}",
+        ]})
+    except Exception as e:
+        logger.warning("EC2: reset container sweep failed: %s", e)
+        return
+    # Concurrent stop+remove — this runs on the reset path while the reset
+    # lock is held, where serial stops are O(n) seconds of wall clock.
+    container_reaper.drop_containers(containers, force=True)
+
+
+def _vm_live_container_ids():
+    """Container ids still owned by an instance record, for the periodic reaper.
+
+    A stopped instance keeps its exited container — StartInstances restarts it
+    when it is still around — so every recorded id is reported, whatever the
+    instance state. Terminated instances leave the store within a minute
+    (_cleanup_terminated), after which a container a failed terminate left
+    behind stops being vouched for and the reaper may reclaim it.
+    """
+    return {inst.get("_container_id")
+            for inst in _instances.all_values() if inst.get("_container_id")}
+
+
+container_reaper.register_live_ids("ec2", _vm_live_container_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -4836,6 +5536,7 @@ def _delete_vpn_connection_route(p):
 # ---------------------------------------------------------------------------
 
 def reset():
+    _vm_reap_all_containers()
     _clear_state()
     _init_defaults()
 
@@ -4859,7 +5560,11 @@ def _describe_instance_attribute(p):
     elif attribute == "instanceType":
         value_xml = f"<instanceType><value>{inst.get('InstanceType', 't2.micro')}</value></instanceType>"
     elif attribute == "userData":
-        value_xml = "<userData/>"
+        # AWS returns the launch-time user data base64-encoded — which is
+        # exactly the wire form RunInstances stored.
+        user_data = inst.get("UserData") or ""
+        value_xml = (f"<userData><value>{user_data}</value></userData>"
+                     if user_data else "<userData/>")
     elif attribute == "rootDeviceName":
         value_xml = f"<rootDeviceName><value>{inst.get('RootDeviceName', '/dev/xvda')}</value></rootDeviceName>"
     elif attribute == "blockDeviceMapping":
