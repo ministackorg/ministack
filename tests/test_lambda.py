@@ -4241,6 +4241,49 @@ def test_lambda_nodejs_esm_type_module(lam):
         lam.delete_function(FunctionName=fname)
 
 
+def test_lambda_nodejs_esm_top_level_await(lam):
+    """Node.js ESM handlers using top-level await must load via ERR_REQUIRE_ASYNC_MODULE fallback.
+
+    Node's `require(esm)` interop throws ERR_REQUIRE_ASYNC_MODULE — a
+    distinct error code from ERR_REQUIRE_ESM — specifically when the
+    required module's graph contains a top-level `await`, since a
+    synchronous require() can never wait on an async operation. This is
+    AWS's own documented Lambda cold-start pattern (module-scope
+    `await someClient.send(...)` to force connection setup during Init,
+    before the first invocation), so handlers using it must still load.
+    """
+    fname = f"lam-esm-tla-{_uuid_mod.uuid4().hex[:8]}"
+
+    handler_code = (
+        "await Promise.resolve();\n"
+        "export const handler = async (event) => ({\n"
+        "  statusCode: 200,\n"
+        "  body: 'top-level-await-works',\n"
+        "});\n"
+    )
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("index.mjs", handler_code)
+
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="nodejs20.x",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+    try:
+        resp = lam.invoke(FunctionName=fname, Payload=b"{}")
+        assert resp["StatusCode"] == 200
+        assert "FunctionError" not in resp, f"Lambda error: {resp['Payload'].read().decode()}"
+        payload = json.loads(resp["Payload"].read())
+        assert payload["statusCode"] == 200
+        assert payload["body"] == "top-level-await-works"
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
 def test_lambda_warm_worker_nodejs_uses_layer(lam):
     """Warm worker should extract Node.js layers and make packages available via require()."""
     # Create a layer with a Node.js module under nodejs/node_modules/
