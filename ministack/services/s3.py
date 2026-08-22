@@ -1520,10 +1520,20 @@ def _dispatch(
 # ---------------------------------------------------------------------------
 
 
+def _canonical_owner_id() -> str:
+    """The S3 canonical user ID for the current account.
+
+    Real S3 reports an opaque 64-character hex canonical ID (not the account
+    ID) and returns the same value from every Owner / CanonicalUser field
+    (ListBuckets, GetBucketAcl, GetObjectAcl, object listings). MiniStack
+    derives a stable one from the account so those fields agree (#1459)."""
+    return hashlib.sha256(get_account_id().encode()).hexdigest()
+
+
 def _list_buckets():
     root = Element("ListAllMyBucketsResult", xmlns=S3_NS)
     owner = SubElement(root, "Owner")
-    SubElement(owner, "ID").text = get_account_id()
+    SubElement(owner, "ID").text = _canonical_owner_id()
     SubElement(owner, "DisplayName").text = "ministack"
     buckets_el = SubElement(root, "Buckets")
     for name, data in sorted(_buckets.items()):
@@ -1578,7 +1588,7 @@ def _create_bucket(name: str, body: bytes, headers: dict = None):
     if tags:
         _bucket_tags[name] = tags
     if canned_acl:
-        _bucket_acl[name] = _canned_acl_policy_xml(canned_acl, get_account_id())
+        _bucket_acl[name] = _canned_acl_policy_xml(canned_acl, _canonical_owner_id())
 
     if headers.get("x-amz-bucket-object-lock-enabled", "").lower() == "true":
         _bucket_object_lock[name] = {"enabled": True, "default_retention": None}
@@ -2038,13 +2048,14 @@ def _get_bucket_acl(name: str):
     stored = _bucket_acl.get(name)
     if stored:
         return 200, {"Content-Type": "application/xml"}, stored
+    _oid = _canonical_owner_id().encode()
     body = (
         XML_DECL + b"\n"
         b'<AccessControlPolicy xmlns="' + S3_NS.encode() + b'">'
-        b"<Owner><ID>owner-id</ID><DisplayName>ministack</DisplayName></Owner>"
+        b"<Owner><ID>" + _oid + b"</ID><DisplayName>ministack</DisplayName></Owner>"
         b"<AccessControlList><Grant>"
         b'<Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CanonicalUser">'
-        b"<ID>owner-id</ID><DisplayName>ministack</DisplayName></Grantee>"
+        b"<ID>" + _oid + b"</ID><DisplayName>ministack</DisplayName></Grantee>"
         b"<Permission>FULL_CONTROL</Permission>"
         b"</Grant></AccessControlList></AccessControlPolicy>"
     )
@@ -2067,7 +2078,7 @@ def _put_bucket_acl(name: str, body: bytes, headers: dict | None = None):
         if canned not in _CANNED_BUCKET_ACLS:
             return _error("InvalidArgument",
                           f"Invalid x-amz-acl value: {canned}", 400)
-        _bucket_acl[name] = _canned_acl_policy_xml(canned, get_account_id())
+        _bucket_acl[name] = _canned_acl_policy_xml(canned, _canonical_owner_id())
         return 200, {}, b""
 
     if not body:
@@ -2317,7 +2328,7 @@ def _list_object_versions(bucket_name: str, query_params: dict):
     SubElement(root, "VersionIdMarker").text = version_id_marker
     SubElement(root, "MaxKeys").text = str(max_keys)
 
-    owner_id = get_account_id()
+    owner_id = _canonical_owner_id()
 
     # Collect all keys: from objects AND from version history (deleted objects).
     # When a version-id-marker is supplied we must resume *within* key-marker,
@@ -3008,7 +3019,7 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
         _object_tags[(bucket_name, key, obj.get("version_id"))] = pending_tags
     if canned_acl:
         _object_acl[(bucket_name, key, obj.get("version_id"))] = (
-            _canned_acl_policy_xml(canned_acl, get_account_id()))
+            _canned_acl_policy_xml(canned_acl, _canonical_owner_id()))
     return 200, resp_headers, b""
 
 
@@ -3213,7 +3224,7 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
         _object_tags[(bucket_name, key, version_id)] = pending_tags
     if canned_acl:
         _object_acl[(bucket_name, key, version_id)] = (
-            _canned_acl_policy_xml(canned_acl, get_account_id()))
+            _canned_acl_policy_xml(canned_acl, _canonical_owner_id()))
 
     location = f"http://{bucket_name}.s3.amazonaws.com/{url_quote(key, safe='/')}"
     base_resp = {"ETag": etag, "Location": location}
@@ -4575,7 +4586,7 @@ def _default_object_acl_xml() -> bytes:
     a single Grant of FULL_CONTROL to the bucket owner (CanonicalUser).
     The canonical-user ID is derived from the request's account so cross-
     account callers don't all collide on the same fake ID."""
-    owner_id = get_account_id()
+    owner_id = _canonical_owner_id()
     return (
         XML_DECL + b"\n"
         b'<AccessControlPolicy xmlns="' + S3_NS.encode() + b'">'
@@ -4641,7 +4652,7 @@ def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict,
             return _error("InvalidArgument",
                           f"Invalid x-amz-acl value: {canned}", 400)
         _object_acl[(bucket_name, key, version_id)] = (
-            _canned_acl_policy_xml(canned, get_account_id()))
+            _canned_acl_policy_xml(canned, _canonical_owner_id()))
         return 200, {}, b""
 
     if not body:
@@ -4881,7 +4892,7 @@ def _list_objects_v1(bucket_name: str, query_params: dict):
         SubElement(c, "Size").text = str(obj["size"])
         SubElement(c, "StorageClass").text = obj.get("storage_class") or "STANDARD"
         owner = SubElement(c, "Owner")
-        SubElement(owner, "ID").text = get_account_id()
+        SubElement(owner, "ID").text = _canonical_owner_id()
         SubElement(owner, "DisplayName").text = "ministack"
 
     for cp in sorted(common_prefixes):
@@ -4957,7 +4968,7 @@ def _list_objects_v2(bucket_name: str, query_params: dict):
         SubElement(c, "StorageClass").text = obj.get("storage_class") or "STANDARD"
         if fetch_owner:
             owner = SubElement(c, "Owner")
-            SubElement(owner, "ID").text = get_account_id()
+            SubElement(owner, "ID").text = _canonical_owner_id()
             SubElement(owner, "DisplayName").text = "ministack"
 
     for cp in sorted(common_prefixes):
@@ -5597,7 +5608,7 @@ def _list_multipart_uploads(bucket_name: str, query_params: dict):
         SubElement(initiator, "ID").text = get_account_id()
         SubElement(initiator, "DisplayName").text = "ministack"
         owner = SubElement(u, "Owner")
-        SubElement(owner, "ID").text = get_account_id()
+        SubElement(owner, "ID").text = _canonical_owner_id()
         SubElement(owner, "DisplayName").text = "ministack"
         SubElement(u, "StorageClass").text = upload.get("storage_class") or "STANDARD"
         SubElement(u, "Initiated").text = upload["created"]
@@ -5645,7 +5656,7 @@ def _list_parts(bucket_name: str, key: str, query_params: dict):
     SubElement(initiator, "ID").text = get_account_id()
     SubElement(initiator, "DisplayName").text = "ministack"
     owner = SubElement(root, "Owner")
-    SubElement(owner, "ID").text = get_account_id()
+    SubElement(owner, "ID").text = _canonical_owner_id()
     SubElement(owner, "DisplayName").text = "ministack"
     SubElement(root, "StorageClass").text = upload.get("storage_class") or "STANDARD"
     SubElement(root, "PartNumberMarker").text = str(part_marker)

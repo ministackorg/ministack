@@ -54,7 +54,6 @@ Wire protocol:
   Routing is handled in app.py via two separate SERVICE_HANDLERS entries.
 """
 
-import asyncio
 import base64
 import copy
 import hashlib
@@ -75,7 +74,8 @@ from xml.etree.ElementTree import tostring as xml_tostring
 from defusedxml.ElementTree import fromstring as safe_xml_parse
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.concurrency import run_reentrant
+from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -1919,7 +1919,8 @@ async def _dispatch_idp(action: str, data: dict):
     # back into ministack over HTTP) don't deadlock against a blocked event
     # loop. The Lambda response path needs the loop free to accept new
     # requests while _execute_function is running.
-    return await asyncio.to_thread(_run_idp_handler, handler, action, data)
+    return await run_reentrant(_run_idp_handler, handler, action, data,
+                               thread_name="ministack-cognito-trigger")
 
 
 # ---------------------------------------------------------------------------
@@ -1950,7 +1951,8 @@ async def _dispatch_identity(action: str, data: dict):
     handler = handlers.get(action)
     if not handler:
         return error_response_json("InvalidAction", f"Unknown Cognito Identity action: {action}", 400)
-    return await asyncio.to_thread(_run_identity_handler, handler, action, data)
+    return await run_reentrant(_run_identity_handler, handler, action, data,
+                               thread_name="ministack-cognito-trigger")
 
 
 # ===========================================================================
@@ -5856,6 +5858,11 @@ def _generate_temp_password() -> str:
     return "".join(password)
 
 
+# Attributes that AWS documents as case-sensitive in the ListUsers Filter; all
+# other searchable attributes match case-insensitively.
+_CASE_SENSITIVE_FILTER_ATTRIBUTES = {"username", "status"}
+
+
 def _apply_user_filter(users: list, filter_str: str) -> list:
     """
     Supports Cognito filter syntax:
@@ -5863,12 +5870,18 @@ def _apply_user_filter(users: list, filter_str: str) -> list:
       attribute_name = "value"     (unquoted, kept for backward compatibility)
       attribute_name ^= "value"    (starts with)
       attribute_name != "value"
+
+    Attribute names are case-sensitive. Value matching is case-insensitive for
+    most searchable attributes, but the ListUsers API reference documents
+    "username" and "status" as case-sensitive.
     """
     m = re.match(r'"?(\w+)"?\s*(=|\^=|!=)\s*"([^"]*)"', filter_str.strip())
     if not m:
         logger.warning("Cognito: ListUsers Filter could not be parsed, ignoring: %r", filter_str)
         return users
     attr_name, op, value = m.group(1), m.group(2), m.group(3)
+    case_sensitive = attr_name in _CASE_SENSITIVE_FILTER_ATTRIBUTES
+    value_key = value if case_sensitive else value.casefold()
     result = []
     for user in users:
         attr_dict = _attr_list_to_dict(user.get("Attributes", []))
@@ -5884,11 +5897,12 @@ def _apply_user_filter(users: list, filter_str: str) -> list:
             field_val = "Enabled" if user.get("Enabled", True) else "Disabled"
         elif attr_name == "email_verified":
             field_val = attr_dict.get("email_verified", "")
-        if op == "=" and field_val == value:
+        field_key = field_val if case_sensitive else field_val.casefold()
+        if op == "=" and field_key == value_key:
             result.append(user)
-        elif op == "^=" and field_val.startswith(value):
+        elif op == "^=" and field_key.startswith(value_key):
             result.append(user)
-        elif op == "!=" and field_val != value:
+        elif op == "!=" and field_key != value_key:
             result.append(user)
     return result
 

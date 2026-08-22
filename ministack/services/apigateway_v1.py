@@ -84,7 +84,6 @@ Custom domains:
   data-plane requests by custom domain host today.
 """
 
-import asyncio
 import base64
 import datetime
 import json
@@ -98,6 +97,7 @@ import urllib.request
 import yaml
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import run_reentrant
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -719,7 +719,8 @@ async def _call_lambda_raw(function_ref, event, *, account_id=None, region=None)
         return None, f"Lambda function '{label}' not found"
 
     exec_record = lambda_svc._execution_record_for_config(func_data, func_config)
-    result = await asyncio.to_thread(lambda_svc._execute_function_with_config_scope, exec_record, event)
+    result = await run_reentrant(lambda_svc._execute_function_with_config_scope, exec_record, event,
+                                 thread_name="ministack-apigw-invoke")
     return result, None
 
 
@@ -1395,8 +1396,9 @@ async def _invoke_authorizer_lambda(authorizer, event, account_id, region):
     if func_data is None or func_config is None:
         return None
     exec_record = lambda_svc._execution_record_for_config(func_data, func_config)
-    return await asyncio.to_thread(
-        lambda_svc._execute_function_with_config_scope, exec_record, event
+    return await run_reentrant(
+        lambda_svc._execute_function_with_config_scope, exec_record, event,
+        thread_name="ministack-apigw-authorizer",
     )
 
 

@@ -6937,3 +6937,138 @@ def test_dynamodb_delete_table_in_process_drops_backlog(ddb_stream_state):
     assert name not in ddb_service._stream_records
     assert ddb_service.stream_start_position(name) == 0
     assert ddb_service.stream_end_position(name) == 0
+
+
+# ---------------------------------------------------------------------------
+# UpdateExpression key-attribute pre-check
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def key_guard_table(ddb):
+    """Table whose key names are also usable as expression alias suffixes, so a
+    `#part` alias or `:part` value reference textually contains the key name."""
+    name = f"key-guard-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[
+            {"AttributeName": "part", "KeyType": "HASH"},
+            {"AttributeName": "sort", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "part", "AttributeType": "S"},
+            {"AttributeName": "sort", "AttributeType": "S"},
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    ddb.put_item(
+        TableName=name,
+        Item={
+            "part": {"S": "p1"},
+            "sort": {"S": "s1"},
+            "other-part": {"S": "before"},
+            "tally": {"N": "1"},
+        },
+    )
+    try:
+        yield name
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+_GUARD_KEY = {"part": {"S": "p1"}, "sort": {"S": "s1"}}
+
+
+def test_update_alias_named_after_key_targets_non_key_attribute(ddb, key_guard_table):
+    resp = ddb.update_item(
+        TableName=key_guard_table,
+        Key=_GUARD_KEY,
+        ReturnValues="UPDATED_NEW",
+        UpdateExpression="set #part = :part",
+        ExpressionAttributeNames={"#part": "other-part"},
+        ExpressionAttributeValues={":part": {"S": "after"}},
+    )
+    assert resp["Attributes"] == {"other-part": {"S": "after"}}
+
+    item = ddb.get_item(TableName=key_guard_table, Key=_GUARD_KEY)["Item"]
+    assert item["part"] == {"S": "p1"}
+    assert item["sort"] == {"S": "s1"}
+    assert item["other-part"] == {"S": "after"}
+
+
+def _assert_key_update_rejected(exc_info, key_name):
+    err = exc_info.value.response["Error"]
+    assert err["Code"] == "ValidationException"
+    assert err["Message"] == (
+        f"One or more parameter values were invalid: Cannot update attribute {key_name}. "
+        "This attribute is part of the key"
+    )
+    assert exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
+def test_update_rejects_direct_partition_key_set(ddb, key_guard_table):
+    with pytest.raises(ClientError) as ei:
+        ddb.update_item(
+            TableName=key_guard_table,
+            Key=_GUARD_KEY,
+            UpdateExpression="SET part = :v",
+            ExpressionAttributeValues={":v": {"S": "other"}},
+        )
+    _assert_key_update_rejected(ei, "part")
+
+
+def test_update_rejects_direct_sort_key_set(ddb, key_guard_table):
+    with pytest.raises(ClientError) as ei:
+        ddb.update_item(
+            TableName=key_guard_table,
+            Key=_GUARD_KEY,
+            UpdateExpression="SET sort = :v",
+            ExpressionAttributeValues={":v": {"S": "other"}},
+        )
+    _assert_key_update_rejected(ei, "sort")
+
+
+def test_update_rejects_alias_resolving_to_partition_key(ddb, key_guard_table):
+    with pytest.raises(ClientError) as ei:
+        ddb.update_item(
+            TableName=key_guard_table,
+            Key=_GUARD_KEY,
+            UpdateExpression="SET #k = :v",
+            ExpressionAttributeNames={"#k": "part"},
+            ExpressionAttributeValues={":v": {"S": "other"}},
+        )
+    _assert_key_update_rejected(ei, "part")
+
+
+def test_update_rejects_remove_of_key_attribute(ddb, key_guard_table):
+    with pytest.raises(ClientError) as ei:
+        ddb.update_item(
+            TableName=key_guard_table,
+            Key=_GUARD_KEY,
+            UpdateExpression="REMOVE #k",
+            ExpressionAttributeNames={"#k": "sort"},
+        )
+    _assert_key_update_rejected(ei, "sort")
+
+
+def test_update_rejects_add_on_key_attribute(ddb, key_guard_table):
+    with pytest.raises(ClientError) as ei:
+        ddb.update_item(
+            TableName=key_guard_table,
+            Key=_GUARD_KEY,
+            UpdateExpression="ADD part :v",
+            ExpressionAttributeValues={":v": {"N": "1"}},
+        )
+    _assert_key_update_rejected(ei, "part")
+
+
+def test_update_allows_value_reference_named_after_key(ddb, key_guard_table):
+    resp = ddb.update_item(
+        TableName=key_guard_table,
+        Key=_GUARD_KEY,
+        ReturnValues="UPDATED_NEW",
+        UpdateExpression="SET label = :sort ADD tally :one",
+        ExpressionAttributeValues={":sort": {"S": "v"}, ":one": {"N": "2"}},
+    )
+    assert resp["Attributes"]["label"] == {"S": "v"}
+    assert resp["Attributes"]["tally"] == {"N": "3"}
