@@ -821,7 +821,7 @@ rl.on("line", async (line) => {
         try {
           mod = require(resolvedPath);
         } catch (reqErr) {
-          if (reqErr.code === "ERR_REQUIRE_ESM") {
+          if (reqErr.code === "ERR_REQUIRE_ESM" || reqErr.code === "ERR_REQUIRE_ASYNC_MODULE") {
             const { pathToFileURL } = require("url");
             mod = await import(pathToFileURL(resolvedPath).href);
           } else {
