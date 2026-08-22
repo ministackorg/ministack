@@ -25,6 +25,7 @@ from urllib.parse import parse_qs, unquote
 
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _MINISTACK_PORT = os.environ.get("GATEWAY_PORT", "4566")
+AUTH = os.environ.get("AUTH", "false").lower() == "true"
 
 _VERSION = os.environ.get("MINISTACK_VERSION") or "dev"
 if _VERSION == "dev":
@@ -1336,6 +1337,12 @@ async def _handle_execute_api_request(
     if parsed is None:
         return None
     api_id, tentative_stage, execute_path = parsed
+
+    denied = _enforce_data_plane("apigateway", "execute-api:Invoke",
+                                 headers, query_params, "")
+    if denied:
+        return denied
+
     try:
         # WebSocket @connections management API — /{stage}/@connections/{id}.
         # The @connections prefix is authoritative; skip $default resolution.
@@ -1402,6 +1409,12 @@ async def _handle_lambda_url_request(
     if parsed is None:
         return None
     url_id, function_path = parsed
+
+    denied = _enforce_data_plane("lambda", "lambda:InvokeFunctionUrl",
+                                 headers, query_params, "")
+    if denied:
+        return denied
+
     try:
         return await _get_module("lambda_svc").handle_function_url_request(
             url_id, method, function_path, headers, body, query_params
@@ -1473,6 +1486,20 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
         return None
 
     vhost_path = "/" + bucket + path if path != "/" else "/" + bucket + "/"
+
+    # IAM enforcement for S3 virtual-hosted requests
+    if AUTH:
+        from ministack.core.iam_actions import _s3_action, extract_resource_arn
+        s3_action = _s3_action(method, vhost_path, query_params)
+        if s3_action:
+            s3_resource = extract_resource_arn(
+                "s3", method, vhost_path, headers, body, query_params, "", "")
+            denied = _enforce_data_plane("s3", f"s3:{s3_action}", headers,
+                                         query_params, "",
+                                         resource_arn=s3_resource)
+            if denied:
+                return denied
+
     try:
         # Pass the original (pre-rewrite) URI as signed_path so a presigned
         # virtual-hosted URL, which signed the canonical URI without the bucket,
@@ -1508,6 +1535,28 @@ def _with_data_plane_headers(response, request_id: str, include_s3_id: bool = Fa
     if include_s3_id:
         headers["x-amz-id-2"] = base64.b64encode(os.urandom(48)).decode()
     return status, headers, body
+
+
+def _enforce_data_plane(service: str, iam_action: str, headers: dict,
+                        query_params: dict, request_id: str,
+                        resource_arn: str = "*"):
+    """Enforce IAM auth on a data-plane path. Returns error tuple or None."""
+    if not AUTH:
+        return None
+    from ministack.core.iam_actions import access_denied_response
+    from ministack.core.iam_evaluator import AuthError, enforce
+    access_key = extract_access_key_id(headers, query_params)
+    denied = enforce(access_key, iam_action, service,
+                     extract_region(headers, query_params),
+                     resource_arn=resource_arn)
+    if denied:
+        if isinstance(denied, AuthError):
+            return access_denied_response(
+                service, iam_action, "", request_id,
+                error_code=denied.code, message=denied.message)
+        return access_denied_response(
+            service, iam_action, denied.principal_arn, request_id)
+    return None
 
 
 async def _handle_special_data_plane_request(
@@ -1784,6 +1833,29 @@ async def _dispatch_service_request(
 
     if service == "unknown_query":
         return _unknown_query_error(body, request_id)
+
+    if AUTH:
+        from ministack.core.iam_actions import (
+            extract_iam_action, extract_resource_arn, access_denied_response,
+        )
+        from ministack.core.iam_evaluator import AuthError, enforce
+        from ministack.core.responses import get_account_id
+        iam_action = extract_iam_action(
+            service, method, path, headers, body, routing_params)
+        if iam_action is not None:
+            access_key = extract_access_key_id(headers, query_params)
+            resource_arn = extract_resource_arn(
+                service, method, path, headers, body,
+                routing_params, region, get_account_id())
+            denied = enforce(access_key, iam_action, service, region,
+                             resource_arn=resource_arn)
+            if denied:
+                if isinstance(denied, AuthError):
+                    return access_denied_response(
+                        service, iam_action, "", request_id,
+                        error_code=denied.code, message=denied.message)
+                return access_denied_response(
+                    service, iam_action, denied.principal_arn, request_id)
 
     handler = SERVICE_HANDLERS.get(service)
     if not handler:

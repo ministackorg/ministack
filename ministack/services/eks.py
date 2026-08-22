@@ -561,6 +561,10 @@ def _create_cluster(body):
     now = _now()
     version = body.get("version", "1.30")
     role_arn = body.get("roleArn", f"arn:aws:iam::{get_account_id()}:role/eks-role")
+    from ministack.core.iam_evaluator import validate_role_arn
+    role_err = validate_role_arn(role_arn)
+    if role_err:
+        return _error(400, "InvalidParameterException", role_err)
     vpc_config = body.get("resourcesVpcConfig", {})
 
     # Spawn k3s container

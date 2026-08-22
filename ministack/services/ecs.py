@@ -514,6 +514,14 @@ def _register_task_definition(data):
     compat = data.get("requiresCompatibilities", ["EC2"])
     network_mode = data.get("networkMode", "awsvpc" if "FARGATE" in compat else "bridge")
 
+    from ministack.core.iam_evaluator import validate_role_arn
+    for _role_field in ("executionRoleArn", "taskRoleArn"):
+        _rv = data.get(_role_field, "")
+        if _rv:
+            _role_err = validate_role_arn(_rv)
+            if _role_err:
+                return error_response_json("ClientException", _role_err, 400)
+
     td = {
         "taskDefinitionArn": arn,
         "family": family,

@@ -3288,6 +3288,18 @@ def put_topic_rule(name: str, payload: dict, *, created_at: float | None = None)
             name,
             func,
         )
+    # Validate role ARNs in actions (AUTH=true only)
+    from ministack.core.iam_evaluator import validate_role_arn
+    for _iot_action in (payload.get("actions") or []):
+        if isinstance(_iot_action, dict):
+            for _act_cfg in _iot_action.values():
+                if isinstance(_act_cfg, dict) and "roleArn" in _act_cfg:
+                    _iot_role_err = validate_role_arn(_act_cfg["roleArn"])
+                    if _iot_role_err:
+                        return error_response_json(
+                            "InvalidRequestException",
+                            f"Unable to assume role: {_act_cfg['roleArn']}", 400)
+
     rule = {
         "ruleName": name,
         "sql": sql,

@@ -652,9 +652,15 @@ def _create_delivery_stream(data: dict):
         # Capture Kinesis source config for Source block in DescribeDeliveryStream
         if stream_type == "KinesisStreamAsSource":
             ks_cfg = data.get("KinesisStreamSourceConfiguration", {})
+            _fh_role = ks_cfg.get("RoleARN", "")
+            if _fh_role:
+                from ministack.core.iam_evaluator import validate_role_arn
+                _fh_role_err = validate_role_arn(_fh_role)
+                if _fh_role_err:
+                    return _invalid(_fh_role_err)
             stream["kinesis_source"] = {
                 "KinesisStreamARN": ks_cfg.get("KinesisStreamARN", ""),
-                "RoleARN": ks_cfg.get("RoleARN", ""),
+                "RoleARN": _fh_role,
                 "DeliveryStartTimestamp": now,
             }
 

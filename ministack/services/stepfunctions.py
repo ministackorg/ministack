@@ -304,13 +304,19 @@ def _create_state_machine(data):
             "StateMachineAlreadyExists",
             f"State machine {name} already exists", 400)
 
+    role_arn = data.get("roleArn",
+                        f"arn:aws:iam::{get_account_id()}:role/StepFunctionsRole")
+    from ministack.core.iam_evaluator import validate_role_arn
+    role_err = validate_role_arn(role_arn)
+    if role_err:
+        return error_response_json("ValidationException", role_err, 400)
+
     ts = now_iso()
     _state_machines[arn] = {
         "stateMachineArn": arn,
         "name": name,
         "definition": data.get("definition", "{}"),
-        "roleArn": data.get("roleArn",
-                            f"arn:aws:iam::{get_account_id()}:role/StepFunctionsRole"),
+        "roleArn": role_arn,
         "type": data.get("type", "STANDARD"),
         "creationDate": ts,
         "status": "ACTIVE",
