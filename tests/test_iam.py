@@ -633,7 +633,7 @@ def test_iam_instance_profile_tags_serialized_in_get(iam):
 def test_iam_attach_detach_user_policy(iam):
     """AttachUserPolicy / DetachUserPolicy / ListAttachedUserPolicies."""
     iam.create_user(UserName="qa-iam-attach-user")
-    doc = json.dumps({"Version": "2012-10-17", "Statement": []})
+    doc = json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]})
     policy_arn = iam.create_policy(PolicyName="qa-iam-attach-pol", PolicyDocument=doc)["Policy"]["Arn"]
     iam.attach_user_policy(UserName="qa-iam-attach-user", PolicyArn=policy_arn)
     attached = iam.list_attached_user_policies(UserName="qa-iam-attach-user")["AttachedPolicies"]
@@ -644,7 +644,7 @@ def test_iam_attach_detach_user_policy(iam):
 
 def test_iam_list_entities_for_policy(iam):
     """ListEntitiesForPolicy returns users and roles attached to a policy."""
-    doc = json.dumps({"Version": "2012-10-17", "Statement": []})
+    doc = json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]})
     assume = json.dumps({"Version": "2012-10-17", "Statement": []})
     policy_arn = iam.create_policy(PolicyName="qa-entities-pol", PolicyDocument=doc)["Policy"]["Arn"]
     iam.create_user(UserName="qa-entities-user")
@@ -971,7 +971,7 @@ def test_iam_list_oidc_providers(iam):
 
 
 def test_iam_account_authorization_details_all(iam):
-    policy_doc = json.dumps({"Version": "2012-10-17", "Statement": []})
+    policy_doc = json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]})
     assume_doc = json.dumps({"Version": "2012-10-17", "Statement": []})
 
     pol = iam.create_policy(PolicyName="aad-test-policy", PolicyDocument=policy_doc)
