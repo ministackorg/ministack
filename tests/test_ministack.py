@@ -733,3 +733,81 @@ class TestExtractS3VhostBucket:
 
     def test_bare_s3_without_region(self):
         assert _extract_s3_vhost_bucket("s3.localhost") is None
+
+
+# ---------------------------------------------------------------------------
+# Container reaping is scoped to this MiniStack instance
+# ---------------------------------------------------------------------------
+
+def _exited_container(daemon, reaper, name, **extra):
+    c = daemon.containers.run(name=name, labels=reaper.own_labels("rds", **extra))
+    c.status = "exited"
+    c.attrs["State"] = {"FinishedAt": ""}
+    return c
+
+
+@pytest.mark.serial
+def test_reaper_never_touches_another_instances_container(fake_docker, monkeypatch):
+    """A second gateway on the same daemon must not reclaim the first's work.
+
+    The reaper reclaimed any exited ministack-labelled container absent from
+    *this* process's records. With several instances on one Docker daemon that
+    is wrong: `StopDBCluster` leaves an exited container on purpose, expecting a
+    later start, and a second gateway has no record of it — so it was reaped
+    after the grace period, destroying state its owner meant to keep. Observed
+    live by @Areson, one instance removing another's container ~3 minutes after
+    it was stopped.
+    """
+    from ministack.core import container_reaper
+
+    monkeypatch.setattr(container_reaper, "EXITED_GRACE", 0)
+    monkeypatch.setenv("GATEWAY_PORT", "4566")
+    _exited_container(fake_docker, container_reaper, "owned-by-A", db_id="a")
+
+    monkeypatch.setenv("GATEWAY_PORT", "4599")            # a different instance
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "nonce-B")
+    container_reaper.register_live_ids("rds", lambda: [])
+
+    assert container_reaper.reap_abandoned(fake_docker) == 0
+    assert "owned-by-A" in fake_docker.live(), "instance B destroyed instance A's container"
+
+
+@pytest.mark.serial
+def test_reaper_still_reclaims_its_own_abandoned_container(fake_docker, monkeypatch):
+    """Instance scoping must not cost the reclamation it was added for."""
+    from ministack.core import container_reaper
+
+    monkeypatch.setattr(container_reaper, "EXITED_GRACE", 0)
+    monkeypatch.setenv("GATEWAY_PORT", "4566")
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "nonce-mine")
+    _exited_container(fake_docker, container_reaper, "owned-by-me", db_id="mine")
+    container_reaper.register_live_ids("rds", lambda: [])
+
+    assert container_reaper.reap_abandoned(fake_docker) == 1
+    assert fake_docker.live() == []
+
+
+@pytest.mark.serial
+def test_boot_sweep_takes_our_predecessor_but_spares_other_instances(fake_docker, monkeypatch):
+    """Boot reclaims the previous run on our port, never another instance.
+
+    Holding the gateway port proves the previous owner of that address is gone,
+    so its leftovers are ours to clean; a container labelled for a different
+    address belongs to a MiniStack that may still be running.
+    """
+    from ministack.core import container_reaper
+
+    monkeypatch.setenv("GATEWAY_PORT", "4566")
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "run-1")
+    _exited_container(fake_docker, container_reaper, "ours-previous-run", db_id="old")
+
+    monkeypatch.setenv("GATEWAY_PORT", "4777")
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "other")
+    _exited_container(fake_docker, container_reaper, "another-instance", db_id="theirs")
+
+    monkeypatch.setenv("GATEWAY_PORT", "4566")            # we restart on our port
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "run-2")
+    container_reaper.reap_all(fake_docker, include_unlabelled=True)
+
+    assert "ours-previous-run" not in fake_docker.live(), "boot sweep left our own orphan"
+    assert "another-instance" in fake_docker.live(), "boot sweep destroyed another instance's container"

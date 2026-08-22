@@ -24,20 +24,25 @@ import threading
 import time
 import urllib.parse
 
+from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import run_reentrant
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
     apply_image_prefix,
-    error_response_json,
     get_account_id,
     get_region,
-    json_response,
     new_uuid,
 )
 
 logger = logging.getLogger("eks")
+
+# Cap any single Docker daemon call. docker-py defaults to 60s, which turns a
+# slow or wedged daemon into a minutes-long stall on a request path.
+_DOCKER_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
+
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
@@ -297,7 +302,7 @@ def _get_docker():
     if not _docker_available:
         return None
     try:
-        return docker_lib.from_env()
+        return docker_lib.from_env(timeout=_DOCKER_TIMEOUT)
     except Exception:
         return None
 
@@ -418,7 +423,7 @@ def _k3s_run_kwargs(
         devices=["/dev/fuse"],
         ports={"6443/tcp": port},
         name=f"ministack-eks-{region}-{name}",
-        labels={"ministack": "eks", "cluster_name": name, "region": region},
+        labels=container_reaper.own_labels("eks", cluster_name=name, region=region),
         environment={"K3S_KUBECONFIG_MODE": "644"},
         volumes={"/lib/modules": {"bind": "/lib/modules", "mode": "ro"}},
         tmpfs={"/run": "", "/var/run": "", "/tmp": ""},
@@ -1454,7 +1459,7 @@ def _sanitize(cluster):
 # Request Router
 # ---------------------------------------------------------------------------
 
-async def handle_request(method, path, headers, body_bytes, query_params):
+def _handle_request_sync(method, path, headers, body_bytes, query_params):
     try:
         body = json.loads(body_bytes) if body_bytes else {}
     except json.JSONDecodeError:
@@ -1628,3 +1633,38 @@ async def handle_request(method, path, headers, body_bytes, query_params):
             return _untag_resource(arn, query)
 
     return _error(400, "InvalidRequestException", f"No route for {method} {path}")
+
+
+async def handle_request(method, path, headers, body, query_params):
+    """Dispatch off the event loop.
+
+    Request paths here reach the Docker daemon (container create/start/stop/
+    inspect), which blocks for as long as the daemon takes. Measured on ECS: a
+    cached-image container start held the loop for 7.3s, during which the health
+    endpoint — the cheapest request in the process — could not be served.
+
+    Uses run_reentrant, not the shared pool: containers started here are handed
+    an endpoint pointing back at MiniStack, so one calls in while this
+    dispatch is still running. A bounded pool would queue that nested request
+    behind the call waiting on it.
+    """
+    return await run_reentrant(
+        _handle_request_sync, method, path, headers, body, query_params, thread_name="ministack-eks-dispatch")
+
+
+def _live_container_ids():
+    """Container ids still owned by a live EKS cluster.
+
+    EKS records its k3s container under ``_docker_id`` (not the
+    ``_docker_container_id`` the other services use), which is why this was
+    missed first time round and its exited containers were never reclaimed.
+    """
+    ids = set()
+    for _key, cluster in _clusters.all_items():
+        cid = cluster.get("_docker_id")
+        if cid:
+            ids.add(cid)
+    return ids
+
+
+container_reaper.register_live_ids("eks", _live_container_ids)

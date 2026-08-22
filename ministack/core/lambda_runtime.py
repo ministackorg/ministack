@@ -76,6 +76,18 @@ def _account_region_from_function_config(config: dict) -> tuple[str, str]:
 _workers: dict = {}
 _lock = threading.Lock()
 
+# No per-function ceiling on warm subprocesses: AWS lets an unreserved function
+# scale into the account pool, and capping width here would invent a throttle
+# AWS never sends and diverge from the docker executor, which spawns freely.
+# Concurrency is bounded once, at lambda_svc._acquire_execution_slot, via
+# ReservedConcurrentExecutions and the existing LAMBDA_ACCOUNT_CONCURRENCY.
+# The reaper reclaims the surplus subprocesses a burst leaves behind.
+_LOCAL_MAX_WORKERS = 0
+# Seconds a surplus worker may sit idle before it is reaped (the first worker
+# per function is never reaped, so warm starts are unaffected). Shares the knob
+# that already governs warm-container eviction rather than adding a second one.
+_LOCAL_WORKER_TTL = float(os.environ.get("LAMBDA_WARM_TTL_SECONDS", "300"))
+
 # ---------------------------------------------------------------------------
 # Recursive-loop lineage (runs inside every ministack-owned Python child)
 # ---------------------------------------------------------------------------
@@ -935,6 +947,10 @@ class Worker:
         self._proc = None
         self._tmpdir = None
         self._lock = threading.Lock()
+        # Leased out to an in-flight invocation. Guarded by the module ``_lock``
+        # (see acquire_worker/release_worker), not by ``self._lock``.
+        self.in_use = False
+        self.last_used = time.time()
         self._cold = True
         self._start_time = None
         self._stderr_queue: queue.Queue = queue.Queue()
@@ -1243,9 +1259,9 @@ class Worker:
             if reader.is_alive():
                 # Timeout — kill the worker process
                 logger.warning("Lambda %s timed out after %ds — killing worker", self.func_name, timeout)
-                if self._proc:
-                    self._proc.kill()
-                self._proc = None
+                proc, self._proc = self._proc, None
+                _signal(proc)
+                _collect(proc, time.monotonic() + _REAP_GRACE)
                 return {
                     "status": "error",
                     "error": f"Task timed out after {timeout}.00 seconds",
@@ -1259,37 +1275,195 @@ class Worker:
 
             response = result_box[0]
             if response.get("status") == "error":
-                if self._proc and self._proc.poll() is None:
-                    self._proc.terminate()
-                self._proc = None
+                proc, self._proc = self._proc, None
+                _signal(proc)
+                _collect(proc, time.monotonic() + _REAP_GRACE)
             response["cold_start"] = cold
             # Bounded drain — replaces the fixed 50ms sleep that was paid
             # by every warm invocation. Typical completion is 1–10ms.
             response["log"] = self._drain_stderr_bounded()
             return response
 
-    def kill(self):
-        if self._proc and self._proc.poll() is None:
-            self._proc.terminate()
-            self._proc = None
+    def _discard_tmpdir(self):
         if self._tmpdir and os.path.exists(self._tmpdir):
             shutil.rmtree(self._tmpdir, ignore_errors=True)
 
+    def kill(self):
+        kill_workers([self])
 
-def get_or_create_worker(func_name: str, config: dict, code_zip: bytes,
-                         qualifier: str = "$LATEST") -> Worker:
+
+# Seconds a worker gets to exit on SIGTERM before it is SIGKILLed. Paid once per
+# *batch*, never once per worker — see kill_workers.
+_REAP_GRACE = 2.0
+
+
+def _signal(proc) -> None:
+    """Ask a worker subprocess to exit. Does not wait."""
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+    except Exception:
+        pass
+
+
+def _collect(proc, deadline: float) -> None:
+    """Wait for a signalled subprocess and reap it, escalating if it ignores SIGTERM.
+
+    Collecting is the point. Signalling alone leaves a zombie: ``subprocess``
+    only reaps an abandoned Popen lazily, when the *next* Popen is constructed,
+    so an **idle** server keeps every zombie it made. On a host that is invisible
+    — the count is small and something else is always spawning — but in a
+    container MiniStack is PID 1: the zombies are its own children, nothing else
+    will ever collect them, and they hold PID-table slots against the container's
+    pid limit. Measured: a 320-invocation burst left 244 zombies that survived
+    indefinitely while the server sat idle.
+
+    Warm-worker pooling is what made this reachable. One worker per function was
+    killed rarely; a pool of them is reaped by the hundred.
+    """
+    if proc is None:
+        return
+    try:
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except Exception:
+        try:
+            proc.kill()
+            proc.wait(timeout=0.5)
+        except Exception:
+            pass                # unkillable: leave it rather than block the caller
+
+
+def kill_workers(workers) -> None:
+    """Terminate and reap a batch of workers, paying the grace period once.
+
+    Two-phase on purpose. Signalling every worker first and only then waiting
+    makes a mass teardown cost ``_REAP_GRACE`` in total; doing it worker by
+    worker would cost ``n * _REAP_GRACE``, which on a pool built by a burst is
+    minutes — and ``reset()`` used to pay it holding the global worker lock.
+    """
+    workers = [w for w in workers if w is not None]
+    if not workers:
+        return
+    procs = []
+    for worker in workers:
+        proc, worker._proc = worker._proc, None
+        procs.append(proc)
+        _signal(proc)
+    deadline = time.monotonic() + _REAP_GRACE
+    for proc in procs:
+        _collect(proc, deadline)
+    for worker in workers:
+        try:
+            worker._discard_tmpdir()
+        except Exception:
+            pass
+
+
+def _worker_key(func_name: str, config: dict, qualifier: str) -> str:
     # Include account ID and region in the key to isolate workers across
     # accounts and regions. Two regions deploying the same function name must
     # not share a worker.
     account, region = _account_region_from_function_config(config)
-    key = f"{account}:{region}:{func_name}:{qualifier}"
+    return f"{account}:{region}:{func_name}:{qualifier}"
+
+
+def acquire_worker(func_name: str, config: dict, code_zip: bytes,
+                   qualifier: str = "$LATEST", max_concurrency: int | None = None):
+    """Lease a free execution environment for this function.
+
+    Each key holds a *pool* of workers, mirroring how AWS gives concurrent
+    invocations separate execution environments (and how the Docker executor's
+    ``_warm_pool`` already behaves). A single shared worker per function could
+    not: ``Worker.invoke`` holds the worker's lock for the whole handler, so a
+    handler that invokes its own function — which real AWS supports, up to the
+    ~16-hop recursive-loop limit — waited on the lock its own caller held and
+    deadlocked. The thread the invocation runs on is irrelevant to that; the
+    lock is the bottleneck.
+
+    ``max_concurrency`` is an optional *resource* ceiling on how many warm
+    subprocesses may exist for one function, not a concurrency limit — AWS
+    concurrency is enforced upstream in ``lambda_svc._acquire_execution_slot``,
+    once, for every executor. It defaults to unbounded, matching the docker
+    executor. At a ceiling the caller gets ``(None, "func_cap")`` rather than a
+    blocking wait, because waiting for a worker held by your own caller is the
+    deadlock this exists to remove.
+
+    Returns ``(worker, "reused"|"spawn")`` or ``(None, "func_cap")``. Release
+    with :func:`release_worker`.
+    """
+    key = _worker_key(func_name, config, qualifier)
+    cap = max_concurrency or _LOCAL_MAX_WORKERS
     with _lock:
-        worker = _workers.get(key)
-        if worker is not None:
-            return worker
+        entries = _workers.setdefault(key, [])
+        for worker in entries:
+            if not worker.in_use:
+                worker.in_use = True
+                worker.last_used = time.time()
+                return worker, "reused"
+        if cap and len(entries) >= cap:
+            return None, "func_cap"
         worker = Worker(func_name, config, code_zip)
-        _workers[key] = worker
-        return worker
+        worker.in_use = True
+        worker.last_used = time.time()
+        entries.append(worker)
+        return worker, "spawn"
+
+
+def reap_idle_workers(ttl: float = None) -> int:
+    """Kill workers idle longer than ``ttl`` and drop them from their pool.
+
+    Without this the pools only ever grow: a burst of concurrency leaves its
+    extra subprocesses alive forever. The first worker of each key is kept so
+    the common warm-start path is unaffected.
+    """
+    ttl = _LOCAL_WORKER_TTL if ttl is None else ttl
+    now = time.time()
+    killed = []
+    with _lock:
+        for key, entries in list(_workers.items()):
+            keep = []
+            for i, worker in enumerate(entries):
+                idle = now - getattr(worker, "last_used", now)
+                if i == 0 or worker.in_use or idle < ttl:
+                    keep.append(worker)
+                else:
+                    killed.append(worker)
+            if keep:
+                _workers[key] = keep
+            else:
+                _workers.pop(key, None)
+    kill_workers(killed)
+    return len(killed)
+
+
+def release_worker(worker: Worker) -> None:
+    """Return a leased worker to its pool."""
+    if worker is None:
+        return
+    with _lock:
+        worker.in_use = False
+
+
+def workers_in_use() -> int:
+    """Count of leased workers across every function, for concurrency limits."""
+    with _lock:
+        return sum(1 for lst in _workers.values() for w in lst if w.in_use)
+
+
+def get_or_create_worker(func_name: str, config: dict, code_zip: bytes,
+                         qualifier: str = "$LATEST") -> Worker:
+    """Back-compat lease that never reports a cap and is released immediately.
+
+    Retained for callers that hold a worker only for the duration of a single
+    ``invoke`` on the calling thread. The lease is dropped before returning, so
+    such callers still serialize on ``Worker._lock`` exactly as before rather
+    than silently retaining a pool slot they never release.
+    """
+    worker, _reason = acquire_worker(func_name, config, code_zip, qualifier=qualifier)
+    release_worker(worker)
+    return worker
 
 
 def invalidate_worker(func_name: str, qualifier: str = None,
@@ -1324,16 +1498,16 @@ def invalidate_worker(func_name: str, qualifier: str = None,
         return True
 
     with _lock:
-        to_remove = [k for k in _workers if _matches(k)]
-        for k in to_remove:
-            worker = _workers.pop(k, None)
-            if worker:
-                worker.kill()
+        doomed = [w for k in [k for k in _workers if _matches(k)]
+                  for w in (_workers.pop(k, []) or [])]
+    # Outside the lock: terminating a batch takes as long as the slowest worker
+    # takes to exit, and holding the pool lock for that blocks every invocation.
+    kill_workers(doomed)
 
 
 def reset():
     """Terminate all warm workers, clean up temp dirs, and clear the pool."""
     with _lock:
-        for worker in list(_workers.values()):
-            worker.kill()
+        doomed = [w for entries in _workers.values() for w in entries]
         _workers.clear()
+    kill_workers(doomed)

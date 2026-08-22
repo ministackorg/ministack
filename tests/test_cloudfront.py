@@ -1733,3 +1733,819 @@ def test_cloudfront_get_monitoring_subscription_errors(cloudfront):
     disabled = dict(cfg, Enabled=False)
     upd = cloudfront.update_distribution(DistributionConfig=disabled, Id=dist_id, IfMatch=etag)
     cloudfront.delete_distribution(Id=dist_id, IfMatch=upd["ETag"])
+
+
+# ---------------------------------------------------------------------------
+# CloudFront SaaS Manager — connection groups, distribution tenants, managed
+# certificates, domain verification. Shapes verified against botocore
+# cloudfront service-2.json (2020-05-31).
+# ---------------------------------------------------------------------------
+
+
+def _tenant_only_distribution_config(caller_reference):
+    cfg = copy.deepcopy(_CF_DIST_CONFIG)
+    cfg["CallerReference"] = caller_reference
+    cfg["Comment"] = "multi-tenant distribution"
+    cfg["ConnectionMode"] = "tenant-only"
+    cfg["TenantConfig"] = {
+        "ParameterDefinitions": [
+            {"Name": "tenantName", "Definition": {"StringSchema": {"Required": True}}}
+        ]
+    }
+    return cfg
+
+
+def _create_tenant_only_distribution(cloudfront, sfx):
+    cfg = _tenant_only_distribution_config(f"cf-mt-{sfx}")
+    return cloudfront.create_distribution(DistributionConfig=cfg)["Distribution"]
+
+
+def test_cf_saas_create_connection_group(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    resp = cloudfront.create_connection_group(Name=f"cg-{sfx}")
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 201
+    assert resp["ETag"]
+    cg = resp["ConnectionGroup"]
+    assert cg["Id"].startswith("cg_")
+    assert cg["Name"] == f"cg-{sfx}"
+    assert cg["Arn"] == f"arn:aws:cloudfront::000000000000:connection-group/{cg['Id']}"
+    assert cg["RoutingEndpoint"].endswith(".cloudfront.net")
+    assert cg["Status"] == "Deployed"
+    assert cg["Enabled"] is True
+    assert cg["Ipv6Enabled"] is True
+    assert cg["IsDefault"] is False
+    assert cg["CreatedTime"] and cg["LastModifiedTime"]
+
+
+def test_cf_saas_create_connection_group_duplicate_name(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    cloudfront.create_connection_group(Name=f"cg-dup-{sfx}")
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_connection_group(Name=f"cg-dup-{sfx}")
+    assert exc.value.response["Error"]["Code"] == "EntityAlreadyExists"
+
+
+def test_cf_saas_get_connection_group_by_id_name_arn(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    created = cloudfront.create_connection_group(Name=f"cg-get-{sfx}", Ipv6Enabled=False)
+    cg = created["ConnectionGroup"]
+    for identifier in (cg["Id"], cg["Name"], cg["Arn"]):
+        got = cloudfront.get_connection_group(Identifier=identifier)
+        assert got["ConnectionGroup"]["Id"] == cg["Id"]
+        assert got["ConnectionGroup"]["Ipv6Enabled"] is False
+        assert got["ETag"] == created["ETag"]
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_connection_group(Identifier="cg_DOESNOTEXIST")
+    assert exc.value.response["Error"]["Code"] == "EntityNotFound"
+
+
+def test_cf_saas_get_connection_group_by_routing_endpoint(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    cg = cloudfront.create_connection_group(Name=f"cg-re-{sfx}")["ConnectionGroup"]
+    got = cloudfront.get_connection_group_by_routing_endpoint(RoutingEndpoint=cg["RoutingEndpoint"])
+    assert got["ConnectionGroup"]["Id"] == cg["Id"]
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_connection_group_by_routing_endpoint(RoutingEndpoint="dnope.cloudfront.net")
+    assert exc.value.response["Error"]["Code"] == "EntityNotFound"
+
+
+def test_cf_saas_update_connection_group(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    created = cloudfront.create_connection_group(Name=f"cg-upd-{sfx}")
+    cg_id = created["ConnectionGroup"]["Id"]
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.update_connection_group(Id=cg_id, IfMatch="bogus", Ipv6Enabled=False)
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+
+    upd = cloudfront.update_connection_group(
+        Id=cg_id, IfMatch=created["ETag"], Ipv6Enabled=False, Enabled=False
+    )
+    assert upd["ETag"] != created["ETag"]
+    assert upd["ConnectionGroup"]["Ipv6Enabled"] is False
+    assert upd["ConnectionGroup"]["Enabled"] is False
+    assert upd["ConnectionGroup"]["Name"] == f"cg-upd-{sfx}"
+
+
+def test_cf_saas_delete_connection_group(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    created = cloudfront.create_connection_group(Name=f"cg-del-{sfx}")
+    cg_id = created["ConnectionGroup"]["Id"]
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.delete_connection_group(Id=cg_id, IfMatch=created["ETag"])
+    assert exc.value.response["Error"]["Code"] == "ResourceNotDisabled"
+
+    upd = cloudfront.update_connection_group(Id=cg_id, IfMatch=created["ETag"], Enabled=False)
+    cloudfront.delete_connection_group(Id=cg_id, IfMatch=upd["ETag"])
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_connection_group(Identifier=cg_id)
+    assert exc.value.response["Error"]["Code"] == "EntityNotFound"
+
+
+def test_cf_saas_list_connection_groups(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    cg = cloudfront.create_connection_group(Name=f"cg-list-{sfx}")["ConnectionGroup"]
+    groups = cloudfront.list_connection_groups()["ConnectionGroups"]
+    match = [g for g in groups if g["Id"] == cg["Id"]]
+    assert len(match) == 1
+    assert match[0]["Name"] == cg["Name"]
+    assert match[0]["RoutingEndpoint"] == cg["RoutingEndpoint"]
+    assert match[0]["ETag"]
+
+
+def test_cf_saas_create_distribution_tenant(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    dist = _create_tenant_only_distribution(cloudfront, sfx)
+    resp = cloudfront.create_distribution_tenant(
+        DistributionId=dist["Id"],
+        Name=f"tenant-{sfx}",
+        Domains=[{"Domain": f"app-{sfx}.example.com"}],
+        Parameters=[{"Name": "tenantName", "Value": "acme"}],
+        Tags={"Items": [{"Key": "env", "Value": "test"}]},
+    )
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 201
+    assert resp["ETag"]
+    tenant = resp["DistributionTenant"]
+    assert tenant["Id"].startswith("dt_")
+    assert tenant["Arn"] == f"arn:aws:cloudfront::000000000000:distribution-tenant/{tenant['Id']}"
+    assert tenant["DistributionId"] == dist["Id"]
+    assert tenant["Name"] == f"tenant-{sfx}"
+    assert tenant["Domains"] == [{"Domain": f"app-{sfx}.example.com", "Status": "active"}]
+    assert tenant["Parameters"] == [{"Name": "tenantName", "Value": "acme"}]
+    assert tenant["Enabled"] is True
+    assert tenant["Status"] == "Deployed"
+
+    # A default connection group is created lazily when none is specified.
+    cg = cloudfront.get_connection_group(Identifier=tenant["ConnectionGroupId"])["ConnectionGroup"]
+    assert cg["IsDefault"] is True
+
+    tags = cloudfront.list_tags_for_resource(Resource=tenant["Arn"])["Tags"]["Items"]
+    assert {"Key": "env", "Value": "test"} in tags
+
+
+def test_cf_saas_create_tenant_with_explicit_connection_group(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    dist = _create_tenant_only_distribution(cloudfront, sfx)
+    cg = cloudfront.create_connection_group(Name=f"cg-exp-{sfx}")["ConnectionGroup"]
+    tenant = cloudfront.create_distribution_tenant(
+        DistributionId=dist["Id"],
+        Name=f"tenant-exp-{sfx}",
+        Domains=[{"Domain": f"exp-{sfx}.example.com"}],
+        ConnectionGroupId=cg["Id"],
+    )["DistributionTenant"]
+    assert tenant["ConnectionGroupId"] == cg["Id"]
+
+    # An attached connection group cannot be deleted.
+    got = cloudfront.get_connection_group(Identifier=cg["Id"])
+    upd = cloudfront.update_connection_group(Id=cg["Id"], IfMatch=got["ETag"], Enabled=False)
+    with pytest.raises(ClientError) as exc:
+        cloudfront.delete_connection_group(Id=cg["Id"], IfMatch=upd["ETag"])
+    assert exc.value.response["Error"]["Code"] == "CannotDeleteEntityWhileInUse"
+
+
+def test_cf_saas_create_tenant_validation_errors(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_distribution_tenant(
+            DistributionId="EDOESNOTEXIST0",
+            Name=f"tenant-miss-{sfx}",
+            Domains=[{"Domain": f"miss-{sfx}.example.com"}],
+        )
+    assert exc.value.response["Error"]["Code"] == "EntityNotFound"
+
+    # Tenants only attach to tenant-only (multi-tenant) distributions.
+    direct_cfg = _custom_origin_distribution_config(f"cf-direct-{sfx}")
+    direct = cloudfront.create_distribution(DistributionConfig=direct_cfg)["Distribution"]
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_distribution_tenant(
+            DistributionId=direct["Id"],
+            Name=f"tenant-direct-{sfx}",
+            Domains=[{"Domain": f"direct-{sfx}.example.com"}],
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidAssociation"
+
+    dist = _create_tenant_only_distribution(cloudfront, sfx)
+    cloudfront.create_distribution_tenant(
+        DistributionId=dist["Id"],
+        Name=f"tenant-dupe-{sfx}",
+        Domains=[{"Domain": f"dupe-{sfx}.example.com"}],
+    )
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_distribution_tenant(
+            DistributionId=dist["Id"],
+            Name=f"tenant-dupe-{sfx}",
+            Domains=[{"Domain": f"dupe2-{sfx}.example.com"}],
+        )
+    assert exc.value.response["Error"]["Code"] == "EntityAlreadyExists"
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_distribution_tenant(
+            DistributionId=dist["Id"],
+            Name=f"tenant-cname-{sfx}",
+            Domains=[{"Domain": f"DUPE-{sfx}.example.com"}],
+        )
+    assert exc.value.response["Error"]["Code"] == "CNAMEAlreadyExists"
+
+
+def test_cf_saas_get_distribution_tenant(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    dist = _create_tenant_only_distribution(cloudfront, sfx)
+    created = cloudfront.create_distribution_tenant(
+        DistributionId=dist["Id"],
+        Name=f"tenant-get-{sfx}",
+        Domains=[{"Domain": f"get-{sfx}.example.com"}],
+    )
+    tenant = created["DistributionTenant"]
+    for identifier in (tenant["Id"], tenant["Name"], tenant["Arn"]):
+        got = cloudfront.get_distribution_tenant(Identifier=identifier)
+        assert got["DistributionTenant"]["Id"] == tenant["Id"]
+        assert got["ETag"] == created["ETag"]
+
+    by_domain = cloudfront.get_distribution_tenant_by_domain(Domain=f"get-{sfx}.example.com")
+    assert by_domain["DistributionTenant"]["Id"] == tenant["Id"]
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_distribution_tenant(Identifier="dt_DOESNOTEXIST")
+    assert exc.value.response["Error"]["Code"] == "EntityNotFound"
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_distribution_tenant_by_domain(Domain="nope.example.com")
+    assert exc.value.response["Error"]["Code"] == "EntityNotFound"
+
+
+def test_cf_saas_update_distribution_tenant(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    dist = _create_tenant_only_distribution(cloudfront, sfx)
+    created = cloudfront.create_distribution_tenant(
+        DistributionId=dist["Id"],
+        Name=f"tenant-upd-{sfx}",
+        Domains=[{"Domain": f"upd-{sfx}.example.com"}],
+    )
+    tenant = created["DistributionTenant"]
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.update_distribution_tenant(Id=tenant["Id"], IfMatch="bogus", Enabled=False)
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+
+    upd = cloudfront.update_distribution_tenant(
+        Id=tenant["Id"],
+        IfMatch=created["ETag"],
+        Domains=[{"Domain": f"upd-{sfx}.example.com"}, {"Domain": f"upd2-{sfx}.example.com"}],
+        Parameters=[{"Name": "tenantName", "Value": "acme2"}],
+        Enabled=False,
+    )
+    assert upd["ETag"] != created["ETag"]
+    updated = upd["DistributionTenant"]
+    assert [d["Domain"] for d in updated["Domains"]] == [
+        f"upd-{sfx}.example.com",
+        f"upd2-{sfx}.example.com",
+    ]
+    assert updated["Parameters"] == [{"Name": "tenantName", "Value": "acme2"}]
+    assert updated["Enabled"] is False
+    assert updated["Name"] == f"tenant-upd-{sfx}"
+
+
+def test_cf_saas_delete_distribution_tenant(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    dist = _create_tenant_only_distribution(cloudfront, sfx)
+    created = cloudfront.create_distribution_tenant(
+        DistributionId=dist["Id"],
+        Name=f"tenant-del-{sfx}",
+        Domains=[{"Domain": f"del-{sfx}.example.com"}],
+    )
+    tenant_id = created["DistributionTenant"]["Id"]
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.delete_distribution_tenant(Id=tenant_id, IfMatch=created["ETag"])
+    assert exc.value.response["Error"]["Code"] == "ResourceNotDisabled"
+
+    upd = cloudfront.update_distribution_tenant(Id=tenant_id, IfMatch=created["ETag"], Enabled=False)
+    cloudfront.delete_distribution_tenant(Id=tenant_id, IfMatch=upd["ETag"])
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_distribution_tenant(Identifier=tenant_id)
+    assert exc.value.response["Error"]["Code"] == "EntityNotFound"
+
+
+def test_cf_saas_list_distribution_tenants(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    dist_a = _create_tenant_only_distribution(cloudfront, f"{sfx}-a")
+    dist_b = _create_tenant_only_distribution(cloudfront, f"{sfx}-b")
+    cg = cloudfront.create_connection_group(Name=f"cg-flt-{sfx}")["ConnectionGroup"]
+    t_a = cloudfront.create_distribution_tenant(
+        DistributionId=dist_a["Id"],
+        Name=f"tenant-la-{sfx}",
+        Domains=[{"Domain": f"la-{sfx}.example.com"}],
+        ConnectionGroupId=cg["Id"],
+    )["DistributionTenant"]
+    t_b = cloudfront.create_distribution_tenant(
+        DistributionId=dist_b["Id"],
+        Name=f"tenant-lb-{sfx}",
+        Domains=[{"Domain": f"lb-{sfx}.example.com"}],
+    )["DistributionTenant"]
+
+    all_ids = [t["Id"] for t in cloudfront.list_distribution_tenants()["DistributionTenantList"]]
+    assert t_a["Id"] in all_ids and t_b["Id"] in all_ids
+
+    by_dist = cloudfront.list_distribution_tenants(
+        AssociationFilter={"DistributionId": dist_a["Id"]}
+    )["DistributionTenantList"]
+    assert [t["Id"] for t in by_dist] == [t_a["Id"]]
+    assert by_dist[0]["Domains"] == [{"Domain": f"la-{sfx}.example.com", "Status": "active"}]
+    assert by_dist[0]["ETag"]
+
+    by_cg = cloudfront.list_distribution_tenants(
+        AssociationFilter={"ConnectionGroupId": cg["Id"]}
+    )["DistributionTenantList"]
+    assert [t["Id"] for t in by_cg] == [t_a["Id"]]
+
+
+def test_cf_saas_list_distribution_tenants_by_customization(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    dist = _create_tenant_only_distribution(cloudfront, sfx)
+    cert_arn = f"arn:aws:acm:us-east-1:000000000000:certificate/{sfx}"
+    tenant = cloudfront.create_distribution_tenant(
+        DistributionId=dist["Id"],
+        Name=f"tenant-cust-{sfx}",
+        Domains=[{"Domain": f"cust-{sfx}.example.com"}],
+        Customizations={"Certificate": {"Arn": cert_arn}},
+    )["DistributionTenant"]
+    assert tenant["Customizations"]["Certificate"]["Arn"] == cert_arn
+
+    by_cert = cloudfront.list_distribution_tenants_by_customization(CertificateArn=cert_arn)[
+        "DistributionTenantList"
+    ]
+    assert [t["Id"] for t in by_cert] == [tenant["Id"]]
+
+    none = cloudfront.list_distribution_tenants_by_customization(
+        CertificateArn="arn:aws:acm:us-east-1:000000000000:certificate/none"
+    )["DistributionTenantList"]
+    assert none == []
+
+
+def test_cf_saas_tenant_webacl_associate_disassociate(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    dist = _create_tenant_only_distribution(cloudfront, sfx)
+    created = cloudfront.create_distribution_tenant(
+        DistributionId=dist["Id"],
+        Name=f"tenant-acl-{sfx}",
+        Domains=[{"Domain": f"acl-{sfx}.example.com"}],
+    )
+    tenant_id = created["DistributionTenant"]["Id"]
+    acl_arn = f"arn:aws:wafv2:us-east-1:000000000000:global/webacl/test/{sfx}"
+
+    assoc = cloudfront.associate_distribution_tenant_web_acl(
+        Id=tenant_id, WebACLArn=acl_arn, IfMatch=created["ETag"]
+    )
+    assert assoc["Id"] == tenant_id
+    assert assoc["WebACLArn"] == acl_arn
+    assert assoc["ETag"] != created["ETag"]
+
+    got = cloudfront.get_distribution_tenant(Identifier=tenant_id)["DistributionTenant"]
+    assert got["Customizations"]["WebAcl"] == {"Action": "override", "Arn": acl_arn}
+
+    dis = cloudfront.disassociate_distribution_tenant_web_acl(Id=tenant_id, IfMatch=assoc["ETag"])
+    assert dis["Id"] == tenant_id
+    got = cloudfront.get_distribution_tenant(Identifier=tenant_id)["DistributionTenant"]
+    assert "WebAcl" not in got.get("Customizations", {})
+
+
+def test_cf_saas_tenant_invalidations(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    dist = _create_tenant_only_distribution(cloudfront, sfx)
+    tenant = cloudfront.create_distribution_tenant(
+        DistributionId=dist["Id"],
+        Name=f"tenant-inv-{sfx}",
+        Domains=[{"Domain": f"inv-{sfx}.example.com"}],
+    )["DistributionTenant"]
+
+    batch = {
+        "Paths": {"Quantity": 2, "Items": ["/index.html", "/assets/*"]},
+        "CallerReference": f"inv-{sfx}",
+    }
+    created = cloudfront.create_invalidation_for_distribution_tenant(
+        Id=tenant["Id"], InvalidationBatch=batch
+    )
+    assert created["ResponseMetadata"]["HTTPStatusCode"] == 201
+    inv = created["Invalidation"]
+    assert inv["Status"] == "Completed"
+    assert sorted(inv["InvalidationBatch"]["Paths"]["Items"]) == ["/assets/*", "/index.html"]
+
+    got = cloudfront.get_invalidation_for_distribution_tenant(
+        DistributionTenantId=tenant["Id"], Id=inv["Id"]
+    )["Invalidation"]
+    assert got["Id"] == inv["Id"]
+
+    listed = cloudfront.list_invalidations_for_distribution_tenant(Id=tenant["Id"])[
+        "InvalidationList"
+    ]
+    assert [i["Id"] for i in listed["Items"]] == [inv["Id"]]
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_invalidation_for_distribution_tenant(
+            DistributionTenantId=tenant["Id"], Id="IDOESNOTEXIST0"
+        )
+    assert exc.value.response["Error"]["Code"] == "NoSuchInvalidation"
+    with pytest.raises(ClientError) as exc:
+        cloudfront.list_invalidations_for_distribution_tenant(Id="dt_DOESNOTEXIST")
+    assert exc.value.response["Error"]["Code"] == "EntityNotFound"
+
+
+def test_cf_saas_verify_dns_configuration(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    dist = _create_tenant_only_distribution(cloudfront, sfx)
+    tenant = cloudfront.create_distribution_tenant(
+        DistributionId=dist["Id"],
+        Name=f"tenant-dns-{sfx}",
+        Domains=[{"Domain": f"dns1-{sfx}.example.com"}, {"Domain": f"dns2-{sfx}.example.com"}],
+    )["DistributionTenant"]
+
+    all_domains = cloudfront.verify_dns_configuration(Identifier=tenant["Id"])[
+        "DnsConfigurationList"
+    ]
+    assert {d["Domain"] for d in all_domains} == {
+        f"dns1-{sfx}.example.com",
+        f"dns2-{sfx}.example.com",
+    }
+    assert {d["Status"] for d in all_domains} == {"valid-configuration"}
+
+    one = cloudfront.verify_dns_configuration(
+        Identifier=tenant["Id"], Domain=f"dns2-{sfx}.example.com"
+    )["DnsConfigurationList"]
+    assert [d["Domain"] for d in one] == [f"dns2-{sfx}.example.com"]
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.verify_dns_configuration(Identifier="dt_DOESNOTEXIST")
+    assert exc.value.response["Error"]["Code"] == "EntityNotFound"
+
+
+def test_cf_saas_managed_certificate_details(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    dist = _create_tenant_only_distribution(cloudfront, sfx)
+    tenant = cloudfront.create_distribution_tenant(
+        DistributionId=dist["Id"],
+        Name=f"tenant-cert-{sfx}",
+        Domains=[{"Domain": f"cert-{sfx}.example.com"}],
+        ManagedCertificateRequest={"ValidationTokenHost": "cloudfront"},
+    )["DistributionTenant"]
+
+    details = cloudfront.get_managed_certificate_details(Identifier=tenant["Id"])[
+        "ManagedCertificateDetails"
+    ]
+    assert details["CertificateStatus"] == "issued"
+    assert details["CertificateArn"].startswith("arn:aws:acm:us-east-1:000000000000:certificate/")
+    assert details["ValidationTokenHost"] == "cloudfront"
+    assert [d["Domain"] for d in details["ValidationTokenDetails"]] == [f"cert-{sfx}.example.com"]
+
+    # A tenant without a managed certificate returns empty details.
+    plain = cloudfront.create_distribution_tenant(
+        DistributionId=dist["Id"],
+        Name=f"tenant-nocert-{sfx}",
+        Domains=[{"Domain": f"nocert-{sfx}.example.com"}],
+    )["DistributionTenant"]
+    empty = cloudfront.get_managed_certificate_details(Identifier=plain["Id"])[
+        "ManagedCertificateDetails"
+    ]
+    assert "CertificateArn" not in empty
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_managed_certificate_details(Identifier="dt_DOESNOTEXIST")
+    assert exc.value.response["Error"]["Code"] == "EntityNotFound"
+
+
+def test_cf_saas_list_domain_conflicts(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    dist = _create_tenant_only_distribution(cloudfront, sfx)
+    t_a = cloudfront.create_distribution_tenant(
+        DistributionId=dist["Id"],
+        Name=f"tenant-dca-{sfx}",
+        Domains=[{"Domain": f"conflict-{sfx}.example.com"}],
+    )["DistributionTenant"]
+    t_b = cloudfront.create_distribution_tenant(
+        DistributionId=dist["Id"],
+        Name=f"tenant-dcb-{sfx}",
+        Domains=[{"Domain": f"other-{sfx}.example.com"}],
+    )["DistributionTenant"]
+
+    conflicts = cloudfront.list_domain_conflicts(
+        Domain=f"conflict-{sfx}.example.com",
+        DomainControlValidationResource={"DistributionTenantId": t_b["Id"]},
+    )["DomainConflicts"]
+    assert conflicts == [
+        {
+            "Domain": f"conflict-{sfx}.example.com",
+            "ResourceType": "distribution-tenant",
+            "ResourceId": t_a["Id"],
+            "AccountId": "000000000000",
+        }
+    ]
+
+    # The querying resource itself is excluded from conflicts.
+    own = cloudfront.list_domain_conflicts(
+        Domain=f"conflict-{sfx}.example.com",
+        DomainControlValidationResource={"DistributionTenantId": t_a["Id"]},
+    )["DomainConflicts"]
+    assert own == []
+
+
+def test_cf_saas_update_domain_association(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    dist = _create_tenant_only_distribution(cloudfront, sfx)
+    t_a = cloudfront.create_distribution_tenant(
+        DistributionId=dist["Id"],
+        Name=f"tenant-mva-{sfx}",
+        Domains=[{"Domain": f"move-{sfx}.example.com"}, {"Domain": f"keep-{sfx}.example.com"}],
+    )["DistributionTenant"]
+    t_b = cloudfront.create_distribution_tenant(
+        DistributionId=dist["Id"],
+        Name=f"tenant-mvb-{sfx}",
+        Domains=[{"Domain": f"target-{sfx}.example.com"}],
+    )["DistributionTenant"]
+
+    moved = cloudfront.update_domain_association(
+        Domain=f"move-{sfx}.example.com",
+        TargetResource={"DistributionTenantId": t_b["Id"]},
+    )
+    assert moved["Domain"] == f"move-{sfx}.example.com"
+    assert moved["ResourceId"] == t_b["Id"]
+    assert moved["ETag"]
+
+    got_a = cloudfront.get_distribution_tenant(Identifier=t_a["Id"])["DistributionTenant"]
+    got_b = cloudfront.get_distribution_tenant(Identifier=t_b["Id"])["DistributionTenant"]
+    assert [d["Domain"] for d in got_a["Domains"]] == [f"keep-{sfx}.example.com"]
+    assert sorted(d["Domain"] for d in got_b["Domains"]) == [
+        f"move-{sfx}.example.com",
+        f"target-{sfx}.example.com",
+    ]
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.update_domain_association(
+            Domain=f"keep-{sfx}.example.com",
+            TargetResource={"DistributionTenantId": "dt_DOESNOTEXIST"},
+        )
+    assert exc.value.response["Error"]["Code"] == "EntityNotFound"
+
+
+def test_cf_saas_list_distributions_by_connection_mode(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    mt = _create_tenant_only_distribution(cloudfront, sfx)
+    direct_cfg = _custom_origin_distribution_config(f"cf-lbm-{sfx}")
+    direct = cloudfront.create_distribution(DistributionConfig=direct_cfg)["Distribution"]
+
+    mt_list = cloudfront.list_distributions_by_connection_mode(ConnectionMode="tenant-only")[
+        "DistributionList"
+    ]
+    mt_ids = [d["Id"] for d in mt_list.get("Items", [])]
+    assert mt["Id"] in mt_ids
+    assert direct["Id"] not in mt_ids
+    assert all(d["ConnectionMode"] == "tenant-only" for d in mt_list.get("Items", []))
+
+    direct_list = cloudfront.list_distributions_by_connection_mode(ConnectionMode="direct")[
+        "DistributionList"
+    ]
+    direct_ids = [d["Id"] for d in direct_list.get("Items", [])]
+    assert direct["Id"] in direct_ids
+    assert mt["Id"] not in direct_ids
+
+
+def test_cf_saas_distribution_round_trips_connection_mode(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    dist = _create_tenant_only_distribution(cloudfront, sfx)
+    got_cfg = cloudfront.get_distribution_config(Id=dist["Id"])["DistributionConfig"]
+    assert got_cfg["ConnectionMode"] == "tenant-only"
+    defs = got_cfg["TenantConfig"]["ParameterDefinitions"]
+    assert defs[0]["Name"] == "tenantName"
+    assert defs[0]["Definition"]["StringSchema"]["Required"] is True
+
+    summaries = cloudfront.list_distributions()["DistributionList"]["Items"]
+    mine = [d for d in summaries if d["Id"] == dist["Id"]]
+    assert mine and mine[0]["ConnectionMode"] == "tenant-only"
+
+
+def test_cf_saas_rejected_tenant_update_leaves_tenant_unchanged(cloudfront):
+    """A validation failure part-way through UpdateDistributionTenant must not
+    commit any of the request's mutations (real AWS validates before writing)."""
+    sfx = _uuid_mod.uuid4().hex[:8]
+    dist = _create_tenant_only_distribution(cloudfront, sfx)
+    created = cloudfront.create_distribution_tenant(
+        DistributionId=dist["Id"],
+        Name=f"tenant-atomic-{sfx}",
+        Domains=[{"Domain": f"atomic-{sfx}.example.com"}],
+        Parameters=[{"Name": "tenantName", "Value": "before"}],
+    )
+    tenant = created["DistributionTenant"]
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.update_distribution_tenant(
+            Id=tenant["Id"],
+            IfMatch=created["ETag"],
+            Domains=[{"Domain": f"atomic-changed-{sfx}.example.com"}],
+            Parameters=[{"Name": "tenantName", "Value": "after"}],
+            Enabled=False,
+            ManagedCertificateRequest={"ValidationTokenHost": "bogus-host"},
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidArgument"
+
+    got = cloudfront.get_distribution_tenant(Identifier=tenant["Id"])
+    assert got["ETag"] == created["ETag"]
+    unchanged = got["DistributionTenant"]
+    assert [d["Domain"] for d in unchanged["Domains"]] == [f"atomic-{sfx}.example.com"]
+    assert unchanged["Parameters"] == [{"Name": "tenantName", "Value": "before"}]
+    assert unchanged["Enabled"] is True
+
+    cg = cloudfront.create_connection_group(Name=f"cg-atomic-{sfx}")["ConnectionGroup"]
+    with pytest.raises(ClientError) as exc:
+        cloudfront.update_distribution_tenant(
+            Id=tenant["Id"],
+            IfMatch=created["ETag"],
+            ConnectionGroupId=cg["Id"],
+            Customizations={"WebAcl": {"Action": "bogus-action"}},
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidArgument"
+    got = cloudfront.get_distribution_tenant(Identifier=tenant["Id"])["DistributionTenant"]
+    assert got["ConnectionGroupId"] != cg["Id"]
+
+
+def test_cf_saas_metadata_only_updates_accept_empty_body(cloudfront):
+    """boto3 serializes UpdateConnectionGroup/UpdateDistributionTenant with only
+    Id + IfMatch as an empty request body; real AWS accepts it."""
+    sfx = _uuid_mod.uuid4().hex[:8]
+    created = cloudfront.create_connection_group(Name=f"cg-empty-{sfx}")
+    upd = cloudfront.update_connection_group(Id=created["ConnectionGroup"]["Id"], IfMatch=created["ETag"])
+    assert upd["ETag"] != created["ETag"]
+    assert upd["ConnectionGroup"]["Enabled"] is True
+    assert upd["ConnectionGroup"]["Ipv6Enabled"] is True
+
+    dist = _create_tenant_only_distribution(cloudfront, sfx)
+    t_created = cloudfront.create_distribution_tenant(
+        DistributionId=dist["Id"],
+        Name=f"tenant-empty-{sfx}",
+        Domains=[{"Domain": f"empty-{sfx}.example.com"}],
+    )
+    t_upd = cloudfront.update_distribution_tenant(
+        Id=t_created["DistributionTenant"]["Id"], IfMatch=t_created["ETag"]
+    )
+    assert t_upd["ETag"] != t_created["ETag"]
+    assert [d["Domain"] for d in t_upd["DistributionTenant"]["Domains"]] == [f"empty-{sfx}.example.com"]
+
+
+def test_cf_saas_create_tenant_rejects_duplicate_domains_in_request(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    dist = _create_tenant_only_distribution(cloudfront, sfx)
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_distribution_tenant(
+            DistributionId=dist["Id"],
+            Name=f"tenant-dupdom-{sfx}",
+            Domains=[{"Domain": f"dup-{sfx}.example.com"}, {"Domain": f"DUP-{sfx}.example.com"}],
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidArgument"
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_distribution_tenant(Identifier=f"tenant-dupdom-{sfx}")
+    assert exc.value.response["Error"]["Code"] == "EntityNotFound"
+
+
+def test_cf_saas_delete_distribution_with_tenants_refused(cloudfront):
+    """Deleting a multi-tenant distribution that still has tenants must fail
+    with ResourceInUse instead of orphaning the tenants."""
+    sfx = _uuid_mod.uuid4().hex[:8]
+    cfg = _tenant_only_distribution_config(f"cf-deldist-{sfx}")
+    created = cloudfront.create_distribution(DistributionConfig=cfg)
+    dist_id = created["Distribution"]["Id"]
+    t_created = cloudfront.create_distribution_tenant(
+        DistributionId=dist_id,
+        Name=f"tenant-deldist-{sfx}",
+        Domains=[{"Domain": f"deldist-{sfx}.example.com"}],
+    )
+
+    disabled_cfg = dict(cfg, Enabled=False)
+    upd = cloudfront.update_distribution(DistributionConfig=disabled_cfg, Id=dist_id, IfMatch=created["ETag"])
+    with pytest.raises(ClientError) as exc:
+        cloudfront.delete_distribution(Id=dist_id, IfMatch=upd["ETag"])
+    assert exc.value.response["Error"]["Code"] == "ResourceInUse"
+
+    t_upd = cloudfront.update_distribution_tenant(
+        Id=t_created["DistributionTenant"]["Id"], IfMatch=t_created["ETag"], Enabled=False
+    )
+    cloudfront.delete_distribution_tenant(Id=t_created["DistributionTenant"]["Id"], IfMatch=t_upd["ETag"])
+    cloudfront.delete_distribution(Id=dist_id, IfMatch=upd["ETag"])
+
+
+def test_cf_saas_by_customization_result_root_element(cloudfront):
+    """The by-customization list uses its own result root element; boto3
+    tolerates a wrong root, so assert on the raw wire bytes."""
+    req = urllib.request.Request(
+        f"{ENDPOINT}/2020-05-31/distribution-tenants-by-customization",
+        data=b"",
+        method="POST",
+    )
+    with urllib.request.urlopen(req) as resp:
+        body = resp.read()
+    assert b"<ListDistributionTenantsByCustomizationResult" in body
+
+
+def test_cf_saas_tenant_ops_survive_cfn_created_distribution(cfn, cloudfront):
+    """CloudFormation provisions distribution records with an empty config_xml;
+    tenant-side scans over all distributions must not choke on them."""
+    sfx = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cf-saas-cfn-{sfx}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Distribution": {
+                "Type": "AWS::CloudFront::Distribution",
+                "Properties": {"DistributionConfig": {"Enabled": True}},
+            },
+        },
+        "Outputs": {"DistributionId": {"Value": {"Ref": "Distribution"}}},
+    }
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    for _ in range(30):
+        stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+        if not stack["StackStatus"].endswith("_IN_PROGRESS"):
+            break
+        time.sleep(0.5)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    cfn_dist_id = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["DistributionId"]
+
+    try:
+        dist = _create_tenant_only_distribution(cloudfront, sfx)
+        tenant = cloudfront.create_distribution_tenant(
+            DistributionId=dist["Id"],
+            Name=f"tenant-cfn-{sfx}",
+            Domains=[{"Domain": f"cfn-{sfx}.example.com"}],
+        )["DistributionTenant"]
+        assert tenant["Id"].startswith("dt_")
+
+        direct = cloudfront.list_distributions_by_connection_mode(ConnectionMode="direct")[
+            "DistributionList"
+        ]
+        assert cfn_dist_id in [d["Id"] for d in direct.get("Items", [])]
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+
+
+def test_cf_saas_list_domain_conflicts_wildcard_overlap(cloudfront):
+    """ListDomainConflicts reports single-level wildcard overlaps, not just
+    exact matches."""
+    sfx = _uuid_mod.uuid4().hex[:8]
+    dist = _create_tenant_only_distribution(cloudfront, sfx)
+    t_wild = cloudfront.create_distribution_tenant(
+        DistributionId=dist["Id"],
+        Name=f"tenant-wild-{sfx}",
+        Domains=[{"Domain": f"*.wc-{sfx}.example.com"}],
+    )["DistributionTenant"]
+    t_other = cloudfront.create_distribution_tenant(
+        DistributionId=dist["Id"],
+        Name=f"tenant-wildb-{sfx}",
+        Domains=[{"Domain": f"wildb-{sfx}.example.com"}],
+    )["DistributionTenant"]
+
+    conflicts = cloudfront.list_domain_conflicts(
+        Domain=f"app.wc-{sfx}.example.com",
+        DomainControlValidationResource={"DistributionTenantId": t_other["Id"]},
+    )["DomainConflicts"]
+    assert [c["ResourceId"] for c in conflicts] == [t_wild["Id"]]
+
+    # A wildcard covers exactly one label.
+    deep = cloudfront.list_domain_conflicts(
+        Domain=f"a.b.wc-{sfx}.example.com",
+        DomainControlValidationResource={"DistributionTenantId": t_other["Id"]},
+    )["DomainConflicts"]
+    assert deep == []
+
+
+def test_cf_saas_resourcegroupstagging_tags_new_families(cloudfront, tagging):
+    """The Resource Groups Tagging API can tag a distribution tenant and a
+    connection group that have no tags yet."""
+    sfx = _uuid_mod.uuid4().hex[:8]
+    dist = _create_tenant_only_distribution(cloudfront, sfx)
+    tenant = cloudfront.create_distribution_tenant(
+        DistributionId=dist["Id"],
+        Name=f"tenant-rgt-{sfx}",
+        Domains=[{"Domain": f"rgt-{sfx}.example.com"}],
+    )["DistributionTenant"]
+    cg = cloudfront.create_connection_group(Name=f"cg-rgt-{sfx}")["ConnectionGroup"]
+
+    result = tagging.tag_resources(
+        ResourceARNList=[tenant["Arn"], cg["Arn"]], Tags={"team": "edge"}
+    )
+    assert result["FailedResourcesMap"] == {}
+    for arn in (tenant["Arn"], cg["Arn"]):
+        tags = cloudfront.list_tags_for_resource(Resource=arn)["Tags"]["Items"]
+        assert {"Key": "team", "Value": "edge"} in tags
+
+
+def test_cf_saas_connection_group_tagging(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    cg = cloudfront.create_connection_group(
+        Name=f"cg-tag-{sfx}", Tags={"Items": [{"Key": "team", "Value": "edge"}]}
+    )["ConnectionGroup"]
+    tags = cloudfront.list_tags_for_resource(Resource=cg["Arn"])["Tags"]["Items"]
+    assert {"Key": "team", "Value": "edge"} in tags
+
+    cloudfront.tag_resource(
+        Resource=cg["Arn"], Tags={"Items": [{"Key": "env", "Value": "test"}]}
+    )
+    tags = cloudfront.list_tags_for_resource(Resource=cg["Arn"])["Tags"]["Items"]
+    assert {"Key": "env", "Value": "test"} in tags
