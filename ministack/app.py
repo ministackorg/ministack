@@ -161,6 +161,8 @@ _NON_S3_VHOST_NAMES = frozenset({
     "inspector2", "dsql",
 })
 
+from ministack.core import container_reaper
+from ministack.core.concurrency import spawn_background
 from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
 from ministack.core.responses import _12_DIGIT_RE, set_request_account_id, set_request_region
@@ -229,6 +231,48 @@ def _get_module(name: str):
             mod = _ErrorModule(name, str(e))
         _loaded_modules[name] = mod
     return mod
+
+
+# The loop serving HTTP requests, captured at lifespan startup. Worker threads
+# (Step Functions executions, CloudFormation provisioners) need it to call a
+# service handler, because a handler may genuinely await now.
+_MAIN_LOOP = None
+
+
+def call_service_handler_sync(handler, method, path, headers, body, query_params,
+                              timeout: float | None = None):
+    """Call an async service handler from a worker thread and return its result.
+
+    In-process callers used to drive handlers with ``coro.send(None)``, relying
+    on an unwritten invariant that service handlers never actually await. That
+    held only while every handler was synchronous underneath. The moment one
+    awaits — offloading Docker work, for instance — the first step runs with no
+    running event loop and raises ``RuntimeError: no running event loop``, which
+    escapes past the caller's ``except StopIteration``.
+
+    So the coroutine is scheduled on the loop that is actually running and this
+    thread waits for the result. Callers must be on a worker thread: waiting on
+    the loop from the loop itself would deadlock, so that is refused loudly
+    rather than hanging.
+    """
+    loop = _MAIN_LOOP
+    if loop is None or loop.is_closed():
+        # No server running (unit tests, CLI use): drive it on a private loop.
+        return asyncio.run(handler(method, path, headers, body, query_params))
+
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if running is loop:
+        raise RuntimeError(
+            "call_service_handler_sync must be called from a worker thread, "
+            "not from the event loop — await the handler directly instead"
+        )
+
+    future = asyncio.run_coroutine_threadsafe(
+        handler(method, path, headers, body, query_params), loop)
+    return future.result(timeout)
 
 
 def _lazy_handler(module_name: str):
@@ -1988,6 +2032,8 @@ async def _handle_lifespan(scope, receive, send):
             import concurrent.futures
 
             _max_workers = int(os.environ.get("MINISTACK_WORKER_THREADS", "64"))
+            global _MAIN_LOOP
+            _MAIN_LOOP = asyncio.get_running_loop()
             asyncio.get_running_loop().set_default_executor(
                 concurrent.futures.ThreadPoolExecutor(
                     max_workers=_max_workers,
@@ -2000,7 +2046,28 @@ async def _handle_lifespan(scope, receive, send):
             # process. Persistence strips container ids from snapshots, so any
             # ministack-labelled container alive at boot is by definition an
             # orphan whose name will collide on next create.
-            _stop_docker_containers()
+            #
+            # Bounded: the sweep normally finishes in well under a second and we
+            # wait for it, so a create right after boot still sees a clean slate.
+            # But it talks to the Docker daemon, and a slow or wedged daemon must
+            # never stop MiniStack from binding its port — that presents as a
+            # silent hang with an empty log. Past the deadline it finishes in the
+            # background while the server comes up.
+            # Periodic reclamation for the whole process lifetime, not just at
+            # boot: without it, containers (and their anonymous volumes) pile up
+            # for as long as MiniStack runs.
+            container_reaper.start(_reaper_docker_client)
+            # Boot only: also reclaim ownerless leftovers from a MiniStack that
+            # predates the instance labels. Holding the gateway port means any
+            # such container is ours. Shutdown deliberately does not do this —
+            # another instance may be live on this daemon.
+            _reap = spawn_background(_stop_docker_containers, True,
+                                     thread_name="ministack-boot-reap")
+            _reap.join(timeout=_DOCKER_REAP_BOOT_DEADLINE)
+            if _reap.is_alive():
+                logger.warning(
+                    "Docker orphan reap still running after %ss; continuing "
+                    "startup without it", _DOCKER_REAP_BOOT_DEADLINE)
             if PERSIST_STATE:
                 _load_persisted_state()
             # Start the Transfer Family SFTP listener after persistence is
@@ -2010,14 +2077,21 @@ async def _handle_lifespan(scope, receive, send):
             # — its top-level `import asyncssh` pulls cryptography+OpenSSL
             # (~2–4 MiB of heap, plus C-level SSL contexts) which is pure
             # overhead for callers that aren't using Transfer Family.
+            # Only bind at boot for servers restored from persistence, which a
+            # client can connect to without calling CreateServer first. A fresh
+            # boot binds lazily on CreateServer instead — nobody can connect to
+            # a server that does not exist yet — which keeps asyncssh (and the
+            # cryptography + OpenSSL it drags in, ~26 MB of heap, measured
+            # 39.7 -> 27.9 MiB idle RSS) out of every MiniStack that never
+            # touches Transfer Family. Guarded on the module already being
+            # loaded, mirroring dsql below, so we never import it just to ask.
             _sftp_env = os.environ.get("SFTP_ENABLED", "").strip().lower()
+            _transfer_mod = _loaded_modules.get("transfer")
             if _sftp_env in ("0", "false", "no", "off"):
                 logger.debug("SFTP_ENABLED=%s — skipping transfer module import.", _sftp_env)
-            else:
+            elif _transfer_mod is not None and _transfer_mod.has_servers():
                 try:
-                    from ministack.services import transfer
-
-                    await transfer.sftp_start()
+                    await _transfer_mod.sftp_start()
                 except Exception as e:
                     logger.warning("Transfer SFTP startup failed: %s", e)
             # Start the IoT mTLS MQTT listener, for the same reason and in the
@@ -2093,36 +2167,43 @@ async def _handle_lifespan(scope, receive, send):
             return
 
 
-def _stop_docker_containers():
-    """Stop all Docker containers managed by MiniStack (RDS, ECS, ElastiCache).
-    Uses container labels to find them — does not touch service state.
+# Docker orphan reap bounds. The client timeout caps any single daemon call;
+# the boot deadline caps how long startup will wait for the whole sweep before
+# letting the server bind and finishing the reap in the background.
+_DOCKER_REAP_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
+_DOCKER_REAP_BOOT_DEADLINE = 10.0
 
-    Skip entirely if no Docker socket is available: importing the docker
-    SDK (and its requests/urllib3/idna transitive deps) costs ~1 MiB of
-    Python heap before we even know whether there's anything to clean.
-    """
+
+def _reaper_docker_client():
+    """Docker client for the periodic reaper, or None when there is no daemon."""
     sock = os.environ.get("DOCKER_HOST") or "unix:///var/run/docker.sock"
-    if sock.startswith("unix://"):
-        sock_path = sock[len("unix://"):]
-        if not os.path.exists(sock_path):
-            return
+    if sock.startswith("unix://") and not os.path.exists(sock[len("unix://"):]):
+        return None
     try:
         import docker
 
-        client = docker.from_env()
+        return docker.from_env(timeout=_DOCKER_REAP_TIMEOUT)
     except Exception:
+        return None
+
+
+def _stop_docker_containers(include_unlabelled: bool = False):
+    """Remove every MiniStack container. Boot and shutdown only.
+
+    The reclamation rules live in ``core.container_reaper``: this is the
+    process-boundary phase (everything goes), while the periodic pass while the
+    server is live is ownership-aware and much more conservative. Keeping both
+    in one module means one label list and one place to reason about which
+    containers are ours.
+
+    Skips entirely when there is no Docker socket: importing the docker SDK
+    (and its requests/urllib3/idna transitive deps) costs ~1 MiB of Python heap
+    before we even know whether there is anything to clean.
+    """
+    client = _reaper_docker_client()
+    if client is None:
         return
-    for label in ("ministack=rds", "ministack=ecs", "ministack=elasticache", "ministack=eks", "ministack=lambda", "ministack=dsql"):
-        try:
-            # all=True so exited-but-not-removed orphans get cleaned at boot.
-            for c in client.containers.list(all=True, filters={"label": label}):
-                try:
-                    c.stop(timeout=5)
-                    c.remove(v=True)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+    container_reaper.reap_all(client, include_unlabelled=include_unlabelled)
 
 
 def _build_persistence_save_dict():

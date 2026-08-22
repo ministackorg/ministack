@@ -672,3 +672,44 @@ def test_opensearch_dataplane_names_include_region():
         )
     finally:
         set_request_region(original_region)
+
+
+@pytest.mark.serial
+def test_opensearch_cold_image_publishes_the_real_endpoint(fake_docker, monkeypatch):
+    """`_Endpoint` is what readers prefer, so the finisher must update it.
+
+    Same defect @Areson reported against ElastiCache, found here by inventory:
+    create left `_Endpoint` at the `localhost:BASE_PORT` placeholder and the
+    deferred finisher updated only `Endpoint`, so Describe kept reporting an
+    address nothing listens on.
+    """
+    import threading
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import opensearch as os_
+
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    monkeypatch.setattr(os_, "_get_docker", lambda: fake_docker, raising=False)
+    monkeypatch.setattr(os_, "_image_is_local", lambda *_a: False, raising=False)
+    monkeypatch.setattr(os_, "DATAPLANE_ENABLED", True, raising=False)
+    monkeypatch.setattr(os_, "_spawn_dataplane",
+                        lambda name, ver: ("localhost", 19200, "cid-os", None, None))
+
+    done = threading.Event()
+    orig = os_.spawn_background
+
+    def tracked(fn, *a, **kw):
+        t = orig(fn, *a, **kw)
+        threading.Thread(target=lambda: (t.join(), done.set()), daemon=True).start()
+        return t
+    monkeypatch.setattr(os_, "spawn_background", tracked)
+
+    os_.create_domain_record({"DomainName": "cold-dom"})
+    assert done.wait(timeout=10), "deferred finisher never completed"
+
+    rec = os_._domains["cold-dom"]
+    assert rec["_Endpoint"] == "localhost:19200", (
+        f"readers prefer _Endpoint and it still says {rec['_Endpoint']!r}"
+    )
+    assert rec["Endpoint"] == "localhost:19200"

@@ -38,9 +38,8 @@ import io
 import json
 import logging
 import os
-import re
 import time
-from typing import AsyncIterator, Optional
+from typing import Optional
 
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
@@ -212,6 +211,16 @@ async def _create_server(data):
     }
 
     _servers[sid] = server
+
+    # Bind the shared listener here rather than at boot. Nobody can connect to
+    # a server they have not created, so binding on CreateServer is equivalent
+    # — and it keeps `asyncssh` (which drags in cryptography + OpenSSL, ~26 MB
+    # of heap) out of every MiniStack that never touches Transfer Family.
+    # Idempotent, so repeated CreateServer calls cost one dict lookup.
+    try:
+        await sftp_start()
+    except Exception as e:
+        logger.warning("SFTP listener failed to start for %s: %s", sid, e)
 
     # If SFTP_PORT_PER_SERVER=1, allocate a dedicated SFTP listener for
     # this server (matches AWS's per-server endpoint model). Otherwise
@@ -1217,6 +1226,19 @@ def _ensure_sftp_runtime() -> None:
 
 
 # ── SFTP lifecycle — called from app.py lifespan + Create/Delete handlers ──
+
+
+def has_servers() -> bool:
+    """True if any Transfer server exists, in any account/region.
+
+    Used at boot to decide whether the SFTP listener has to come up before a
+    CreateServer call would bring it up on its own — i.e. only when persistence
+    restored servers that a client may connect to immediately.
+    """
+    try:
+        return bool(_servers.to_dict())
+    except Exception:
+        return False
 
 
 async def sftp_start() -> None:

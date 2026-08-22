@@ -24,8 +24,10 @@ import threading
 import time
 from urllib.parse import unquote
 
+from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.concurrency import run_reentrant
+from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -37,6 +39,11 @@ from ministack.core.responses import (
 )
 
 logger = logging.getLogger("glue")
+
+# Cap any single Docker daemon call. docker-py defaults to 60s, which turns a
+# slow or wedged daemon into a minutes-long stall on a request path.
+_DOCKER_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
+
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 CRAWLER_RUN_SECONDS = int(os.environ.get("GLUE_CRAWLER_RUN_SECONDS", "5"))
@@ -60,7 +67,7 @@ def _get_docker():
     if _docker is None:
         try:
             import docker
-            _docker = docker.from_env()
+            _docker = docker.from_env(timeout=_DOCKER_TIMEOUT)
         except Exception:
             pass
     return _docker
@@ -259,7 +266,7 @@ def _invalid_resource_arn(arn):
     return error_response_json("InvalidInputException", f"Invalid Glue resource ARN: {arn}", 400)
 
 
-async def handle_request(method, path, headers, body, query_params):
+def _handle_request_sync(method, path, headers, body, query_params):
     # Glue's Iceberg REST catalog data plane. On real AWS this is
     # `glue.<region>.amazonaws.com/iceberg` — same service, same SigV4
     # signing name (`glue`), different protocol (Iceberg REST OpenAPI
@@ -1448,7 +1455,7 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
     # Remove stale container with same name
     try:
         existing = docker_client.containers.get(container_name)
-        existing.remove(force=True)
+        existing.remove(force=True, v=True)
     except Exception:
         pass
 
@@ -1531,7 +1538,7 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         "command": cmd,
         "environment": container_env,
         "detach": True,
-        "labels": {"ministack": "glue", "job_name": job_name},
+        "labels": container_reaper.own_labels("glue", job_name=job_name),
     }
 
     if ms_network:
@@ -1561,7 +1568,7 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         run["JobRunState"] = "FAILED"
         run["ErrorMessage"] = f"Docker container start failed: {e}"[:2000]
         try:
-            container.remove(force=True)
+            container.remove(force=True, v=True)
         except Exception:
             pass
         return
@@ -1585,7 +1592,7 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         logger.warning("Glue: Spark container for %s error: %s", job_name, e)
     finally:
         try:
-            container.remove(force=True)
+            container.remove(force=True, v=True)
         except Exception:
             pass
 
@@ -2094,3 +2101,20 @@ def reset():
     _user_defined_functions.clear()
     _table_column_statistics.clear()
     _partition_column_statistics.clear()
+
+
+async def handle_request(method, path, headers, body, query_params):
+    """Dispatch off the event loop.
+
+    Request paths here reach the Docker daemon (container create/start/stop/
+    inspect), which blocks for as long as the daemon takes. Measured on ECS: a
+    cached-image container start held the loop for 7.3s, during which the health
+    endpoint — the cheapest request in the process — could not be served.
+
+    Uses run_reentrant, not the shared pool: containers started here are handed
+    an endpoint pointing back at MiniStack, so one calls in while this
+    dispatch is still running. A bounded pool would queue that nested request
+    behind the call waiting on it.
+    """
+    return await run_reentrant(
+        _handle_request_sync, method, path, headers, body, query_params, thread_name="ministack-glue-dispatch")

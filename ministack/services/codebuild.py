@@ -21,8 +21,10 @@ import re
 import threading
 import time
 
+from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, is_arn, parse_arn
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.concurrency import run_reentrant
+from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     error_response_json,
@@ -33,6 +35,11 @@ from ministack.core.responses import (
 )
 
 logger = logging.getLogger("codebuild")
+
+# Cap any single Docker daemon call. docker-py defaults to 60s, which turns a
+# slow or wedged daemon into a minutes-long stall on a request path.
+_DOCKER_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
+
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
@@ -218,7 +225,7 @@ def _get_docker():
     if _docker is None:
         try:
             import docker
-            _docker = docker.from_env()
+            _docker = docker.from_env(timeout=_DOCKER_TIMEOUT)
         except Exception:
             logger.exception("Docker unavailable; builds stay metadata-only")
             _docker = False
@@ -402,7 +409,7 @@ def _execute_build(build_id, project):
                 "/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"},
                 env_dir: {"bind": "/LocalBuild/envFile", "mode": "ro"},
             },
-            labels={"ministack": "codebuild", "ministack.codebuild.build": build_id},
+            labels=container_reaper.own_labels("codebuild", **{"ministack.codebuild.build": build_id}),
         )
     except Exception:
         logger.exception("Failed to start build %s", build_id)
@@ -423,7 +430,7 @@ def _execute_build(build_id, project):
         timed_out.set()
         logger.error("Build %s exceeded timeoutInMinutes; stopping it", build_id)
         try:
-            container.remove(force=True)
+            container.remove(force=True, v=True)
         except Exception:
             logger.exception("Could not stop the timed-out build %s", build_id)
 
@@ -476,7 +483,7 @@ def _execute_build(build_id, project):
                 "phases in this format", build_id, AGENT_IMAGE
             )
         try:
-            container.remove(force=True)
+            container.remove(force=True, v=True)
         except Exception:
             pass
 
@@ -485,7 +492,7 @@ def _execute_build(build_id, project):
 # Request dispatcher
 # ---------------------------------------------------------------------------
 
-async def handle_request(method, path, headers, body, query_params):
+def _handle_request_sync(method, path, headers, body, query_params):
     target = headers.get("x-amz-target", "")
     action = target.split(".")[-1] if "." in target else ""
 
@@ -690,7 +697,7 @@ def _stop_build(data):
     container = _container_for_build(bid) if EXECUTE_BUILDS else None
     if container:
         try:
-            container.remove(force=True)
+            container.remove(force=True, v=True)
         except Exception:
             logger.exception("Could not stop the build container for %s", bid)
 
@@ -732,3 +739,20 @@ def _batch_delete_builds(data):
         else:
             not_deleted.append(bid)
     return json_response({"buildsDeleted": deleted, "buildsNotDeleted": not_deleted})
+
+
+async def handle_request(method, path, headers, body, query_params):
+    """Dispatch off the event loop.
+
+    Request paths here reach the Docker daemon (container create/start/stop/
+    inspect), which blocks for as long as the daemon takes. Measured on ECS: a
+    cached-image container start held the loop for 7.3s, during which the health
+    endpoint — the cheapest request in the process — could not be served.
+
+    Uses run_reentrant, not the shared pool: containers started here are handed
+    an endpoint pointing back at MiniStack, so one calls in while this
+    dispatch is still running. A bounded pool would queue that nested request
+    behind the call waiting on it.
+    """
+    return await run_reentrant(
+        _handle_request_sync, method, path, headers, body, query_params, thread_name="ministack-codebuild-dispatch")
