@@ -15,6 +15,13 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from conftest import (
+    CONCURRENCY_N_NESTED,
+    ENDPOINT,
+    LoopProbe,
+    concurrent_burst,
+    make_probe_lambda,
+)
 
 _endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
@@ -1657,7 +1664,6 @@ def test_lambda_esm_sqs_report_batch_item_failures(lam, sqs):
 def test_lambda_warm_start(lam, apigw):
     """Warm worker via API Gateway execute-api: module-level state persists across invocations."""
     import urllib.request as _urlreq
-    import uuid as _uuid
 
     fname = f"intg-warm-{_uuid_mod.uuid4().hex[:8]}"
     code = (
@@ -2768,7 +2774,6 @@ def test_lambda_invoke_dry_run_returns_204(lam):
     assert resp["StatusCode"] == 204
 
 def test_lambda_layer_publish(lam):
-    import base64
     import io
     import zipfile
 
@@ -2827,7 +2832,6 @@ def test_lambda_layer_list_layers(lam):
     assert "my-test-layer" in names
 
 def test_lambda_layer_delete_version(lam):
-    import base64
     import io
     import zipfile
 
@@ -3052,7 +3056,7 @@ def test_lambda_pool_kill_function_reaps_all_qualifiers():
             self.removed = False
         def stop(self, timeout=2):
             self.stopped = True
-        def remove(self, force=False):
+        def remove(self, force=False, v=False):
             self.removed = True
 
     stubs = [_StubContainer() for _ in range(3)]
@@ -4042,7 +4046,6 @@ def test_lambda_provided_runtime_parallel_invocations():
 def test_apigwv2_nodejs_lambda_proxy(lam, apigw):
     """API Gateway v2 HTTP API should invoke Node.js Lambda via warm worker, not return mock."""
     import urllib.request as _urlreq
-    import uuid as _uuid
 
     from botocore.exceptions import ClientError
 
@@ -7587,7 +7590,6 @@ def test_nodejs_worker_aws_sdk_v3_stub_wire_roundtrip(lam, ssm):
     router.py undetected by the resolution-only tests).
     """
     import shutil
-    import uuid as _uuid
 
     if not shutil.which("node"):
         pytest.skip("node not found on PATH")
@@ -7696,7 +7698,6 @@ def _create_durable_execution_directly(lam):
     response header. Returns (function_name, function_arn, dict with
     DurableExecutionArn + CheckpointToken)."""
     import base64 as _b64
-    import json as _json
     fname = f"durable-fn-{_uuid_mod.uuid4().hex[:8]}"
     try:
         lam.delete_function(FunctionName=fname)
@@ -7738,7 +7739,6 @@ def test_lambda_durable_function_config_round_trip(lam):
     except Exception:
         pass
     import base64 as _b64
-    import json as _json
     zip_b64 = _b64.b64encode(_make_zip("def handler(e,c): return e")).decode()
     code, body = _raw_durable("POST", "/2015-03-31/functions", body={
         "FunctionName": fname,
@@ -7870,7 +7870,6 @@ def test_lambda_durable_stop(lam):
 def test_lambda_durable_list_by_function(lam):
     fname, fn_arn, rec = _create_durable_execution_directly(lam)
     try:
-        from urllib.parse import quote
         code, body = _raw_durable("GET", f"/2025-12-01/functions/{fname}/durable-executions")
         assert code == 200
         arns = [s["DurableExecutionArn"] for s in body["DurableExecutions"]]
@@ -7940,7 +7939,6 @@ def test_lambda_durable_chained_invoke_runs_child(lam):
     the child function and records the result back into the parent's
     operation log."""
     import base64 as _b64
-    import json as _json
     parent = f"durable-parent-{_uuid_mod.uuid4().hex[:8]}"
     child = f"durable-child-{_uuid_mod.uuid4().hex[:8]}"
     for n in (parent, child):
@@ -8881,7 +8879,6 @@ def test_lambda_durable_create_function_durable_config_round_trip_with_update(la
     """DurableConfig must survive UpdateFunctionConfiguration that touches
     unrelated fields (timeout, memory)."""
     import base64 as _b64
-    import json as _json
 
     fname = f"dur-upd-{_uuid_mod.uuid4().hex[:8]}"
     try:
@@ -10110,7 +10107,7 @@ def test_lambda_keepalive_zero_forces_cold_start(monkeypatch):
             pass
         def stop(self, timeout=2):
             self.stopped = True
-        def remove(self, force=False):
+        def remove(self, force=False, v=False):
             self.removed = True
 
     stub = _StubContainer()
@@ -10139,6 +10136,128 @@ def test_lambda_keepalive_zero_forces_cold_start(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Re-entrant invocation — a handler that calls back into the emulator during
+# its own invocation, including into its own function.
+#
+# Every synchronous execution used to hold one worker out of the event loop's
+# bounded default pool for the whole handler duration, so a handler's nested
+# call queued behind the invocations waiting on it and wedged at exactly the
+# pool size. Separately, the local executor kept a single Worker per function
+# whose lock was held for the whole handler, so a function invoking *itself*
+# deadlocked on the first hop regardless of threading.
+#
+# Executions now run on a dedicated thread each (core.concurrency.run_reentrant)
+# and draw a warm worker from a per-function pool, with AWS's concurrency model
+# enforced once, in lambda_svc._acquire_execution_slot.
+# ---------------------------------------------------------------------------
+
+_SELF_INVOKE_CODE = """
+import json, os, urllib.request
+
+def handler(event, context):
+    depth = int(event.get("depth", 0))
+    limit = int(event.get("limit", 3))
+    if depth >= limit:
+        return {"depth": depth, "leaf": True}
+    req = urllib.request.Request(
+        os.environ["AWS_ENDPOINT_URL"]
+        + "/2015-03-31/functions/" + context.function_name + "/invocations",
+        data=json.dumps({"depth": depth + 1, "limit": limit}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        return {"depth": depth, "child": json.loads(resp.read().decode())}
+"""
+
+
+@pytest.mark.skipif(
+    os.environ.get("LAMBDA_EXECUTOR", "").lower() == "docker",
+    reason="exercises the in-process warm worker pool; the docker executor "
+    "spawns a container per concurrent invocation and has no shared lock",
+)
+def test_lambda_self_invoking_handler_does_not_deadlock(lam):
+    """A handler that invokes its own function completes.
+
+    Real AWS allows this and only intervenes at the ~16-hop recursive-loop
+    limit. Before the per-function worker pool this deadlocked at the *first*
+    hop, with a single caller and no concurrency involved: the nested invoke
+    waited on the worker lock its own parent held, and the invocation burned
+    its whole timeout.
+    """
+    name = f"lam-self-invoke-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=name, Runtime="python3.12", Handler="index.handler",
+        Role=_LAMBDA_ROLE, Code={"ZipFile": _make_zip(_SELF_INVOKE_CODE)},
+        Timeout=30,
+    )
+    try:
+        resp = lam.invoke(
+            FunctionName=name,
+            Payload=json.dumps({"depth": 0, "limit": 4}).encode(),
+        )
+        assert resp.get("FunctionError", "") == "", resp.get("FunctionError")
+        payload = json.loads(resp["Payload"].read())
+        # Four nested levels, each reporting its own depth, innermost a leaf.
+        for expected in range(4):
+            assert payload["depth"] == expected
+            payload = payload["child"]
+        assert payload == {"depth": 4, "leaf": True}
+    finally:
+        with contextlib.suppress(Exception):
+            lam.delete_function(FunctionName=name)
+
+
+def test_lambda_reserved_concurrency_throttles_rather_than_queues(lam):
+    """At ReservedConcurrentExecutions the extra invocation is throttled.
+
+    AWS returns TooManyRequestsException rather than queueing. Queueing would
+    also reintroduce the deadlock: an invocation waiting for a unit its own
+    caller holds waits forever.
+    """
+    import concurrent.futures
+
+    name = f"lam-reserved-{_uuid_mod.uuid4().hex[:8]}"
+    code = "import time\ndef handler(event, context):\n    time.sleep(1.5)\n    return {'ok': True}\n"
+    lam.create_function(
+        FunctionName=name, Runtime="python3.12", Handler="index.handler",
+        Role=_LAMBDA_ROLE, Code={"ZipFile": _make_zip(code)}, Timeout=30,
+    )
+    try:
+        lam.put_function_concurrency(
+            FunctionName=name, ReservedConcurrentExecutions=1)
+
+        def _invoke(_i):
+            try:
+                resp = lam.invoke(FunctionName=name, Payload=b"{}")
+                resp["Payload"].read()
+                return resp["StatusCode"], "", ""
+            except ClientError as exc:
+                return (exc.response["ResponseMetadata"]["HTTPStatusCode"],
+                        exc.response["Error"]["Code"],
+                        exc.response.get("Reason", ""))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+            results = list(ex.map(_invoke, range(3)))
+
+        throttled = [r for r in results if r[0] == 429]
+        succeeded = [r for r in results if r[0] == 200 and not r[1]]
+        assert succeeded, f"reservation of 1 must still admit one invoke: {results}"
+        assert throttled, (
+            f"invocations beyond ReservedConcurrentExecutions=1 must throttle, "
+            f"not queue or hang: {results}"
+        )
+        # The code, not just the status. AWS models exactly one throttle shape
+        # for Invoke; anything else is a string AWS never sends, and
+        # ``except lambda.exceptions.TooManyRequestsException`` would not catch
+        # it — a 429 alone passes on the wrong shape.
+        for status, code, reason in throttled:
+            assert code == "TooManyRequestsException", (
+                f"expected TooManyRequestsException, got {code!r}")
+            assert reason == "ReservedFunctionConcurrentInvocationLimitExceeded", (
+                f"expected the function-limit Reason, got {reason!r}")
+    finally:
+        with contextlib.suppress(Exception):
+            lam.delete_function(FunctionName=name)
 # Recursive-loop detection — PutFunctionRecursionConfig made real.
 #
 # AWS drops an invocation once a request has gone around the same function
@@ -10430,3 +10549,90 @@ def test_lambda_inbound_invoke_depth_parsing(headers, expected):
     from ministack.services.lambda_svc import _inbound_invoke_depth
 
     assert _inbound_invoke_depth(headers) == expected
+
+
+# ---------------------------------------------------------------------------
+# Re-entrancy under concurrency — the rest of the suite issues one request at
+# a time, so a service whose blocking work is misclassified passes serially
+# and only wedges under load. These fire N callers at once and assert both
+# that every caller completes and that the event loop keeps serving.
+# ---------------------------------------------------------------------------
+@pytest.mark.serial
+def test_concurrent_nested_lambda_invocations_do_not_starve(lam):
+    """Callers that each invoke another function must never wedge.
+
+    Three details make this discriminate; without any one of them a build with
+    the bug still passes:
+
+    - **distinct caller functions.** One function invoked N times serialises on
+      its own worker lock and never reaches the shared pool.
+    - **a hold before the nested call**, so every caller is in flight at once
+      rather than completing before the next starts.
+    - **N above the pool size**, since starvation begins at exactly the pool
+      bound.
+
+    A throttle is a correct answer and is allowed — the account concurrency cap
+    is deliberately below N on small hosts. What must never happen is a caller
+    getting no answer at all, which is what starvation looks like.
+    """
+    callee = make_probe_lambda(lam, "def handler(event, context):\n    return {'pong': True}\n")
+    caller_src = f"""
+import json, os, time, urllib.request
+
+def handler(event, context):
+    time.sleep(float(event.get("hold", 1.5)))
+    ep = os.environ["AWS_ENDPOINT_URL"]
+    req = urllib.request.Request(
+        ep + "/2015-03-31/functions/{callee}/invocations",
+        data=json.dumps({{}}).encode(),
+        headers={{"Content-Type": "application/json"}},
+    )
+    return {{"nested": json.loads(urllib.request.urlopen(req, timeout=25).read().decode())}}
+"""
+    callers = [make_probe_lambda(lam, caller_src, timeout=40) for _ in range(CONCURRENCY_N_NESTED)]
+
+    # A client sized for the burst. The shared fixture client pools far fewer
+    # connections than we fire, and the resulting client-side queueing shows up
+    # as latency that looks like server stall but is not.
+    import boto3
+    from botocore.config import Config as _Config
+
+    burst_client = boto3.client(
+        "lambda", endpoint_url=ENDPOINT, aws_access_key_id="test",
+        aws_secret_access_key="test", region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+        config=_Config(retries={"max_attempts": 0}, read_timeout=120,
+                       max_pool_connections=CONCURRENCY_N_NESTED + 8),
+    )
+
+    def invoke(name, hold=1.5):
+        try:
+            payload = burst_client.invoke(
+                FunctionName=name, Payload=json.dumps({"hold": hold}).encode())
+            body = payload["Payload"].read().decode() or "{}"
+            if payload.get("FunctionError"):
+                # A timeout is the starvation signature: the nested call never
+                # got a slot. Anything else is the handler's own failure.
+                return "wedged" if "timed out" in body.lower() else "error"
+            return "ok"
+        except Exception as exc:
+            return "throttled" if "TooManyRequests" in str(exc) else "wedged"
+
+    # Warm every caller first, in small batches. Otherwise the measured burst
+    # pays 70 simultaneous cold starts, which a 2-core CI runner cannot finish
+    # inside the function timeout — 16 of 70 timed out that way, which reads as
+    # starvation but is only the box running out of CPU. Warm workers make the
+    # burst measure scheduling, which is what this test is about.
+    for i in range(0, len(callers), 10):
+        concurrent_burst(lambda n: invoke(n, hold=0.0), items=callers[i:i + 10])
+
+    with LoopProbe() as probe:
+        results = concurrent_burst(invoke, items=callers)
+    probe.assert_responsive("nested lambda burst")
+
+    wedged = results.count("wedged")
+    assert wedged == 0, (
+        f"{wedged}/{CONCURRENCY_N_NESTED} nested invocations never completed — re-entrant work is "
+        f"queueing behind itself (ok={results.count('ok')}, "
+        f"throttled={results.count('throttled')}, error={results.count('error')})"
+    )
+    assert results.count("ok") > 0, "no invocation succeeded at all"

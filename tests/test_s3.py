@@ -5035,6 +5035,24 @@ def test_s3_conditional_delete_if_match(s3):
     assert s3.get_object(Bucket=bucket, Key="cond")["Body"].read() == b"x"
 
 
+def test_s3_bucket_owner_id_is_consistent_and_canonical(s3):
+    """The canonical owner ID is one stable 64-hex value across ListBuckets,
+    GetBucketAcl and GetObjectAcl — not the account id or a placeholder (#1459)."""
+    import re
+    bkt = "intg-owner-1459"
+    s3.create_bucket(Bucket=bkt)
+    try:
+        s3.put_object(Bucket=bkt, Key="k", Body=b"x")
+        lb = s3.list_buckets()["Owner"]["ID"]
+        bacl = s3.get_bucket_acl(Bucket=bkt)["Owner"]["ID"]
+        oacl = s3.get_object_acl(Bucket=bkt, Key="k")["Owner"]["ID"]
+        assert lb == bacl == oacl, (lb, bacl, oacl)
+        assert re.fullmatch(r"[0-9a-f]{64}", lb), lb
+    finally:
+        s3.delete_object(Bucket=bkt, Key="k")
+        s3.delete_bucket(Bucket=bkt)
+
+
 def test_s3_conditional_delete_of_absent_key_succeeds(s3):
     """A conditional delete of a key that is not there is a success, not a
     failed precondition: S3 counts deleting an absent key as done whatever

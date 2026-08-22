@@ -54,7 +54,6 @@ Wire protocol:
   Routing is handled in app.py via two separate SERVICE_HANDLERS entries.
 """
 
-import asyncio
 import base64
 import copy
 import hashlib
@@ -75,7 +74,8 @@ from xml.etree.ElementTree import tostring as xml_tostring
 from defusedxml.ElementTree import fromstring as safe_xml_parse
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.concurrency import run_reentrant
+from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -1919,7 +1919,8 @@ async def _dispatch_idp(action: str, data: dict):
     # back into ministack over HTTP) don't deadlock against a blocked event
     # loop. The Lambda response path needs the loop free to accept new
     # requests while _execute_function is running.
-    return await asyncio.to_thread(_run_idp_handler, handler, action, data)
+    return await run_reentrant(_run_idp_handler, handler, action, data,
+                               thread_name="ministack-cognito-trigger")
 
 
 # ---------------------------------------------------------------------------
@@ -1950,7 +1951,8 @@ async def _dispatch_identity(action: str, data: dict):
     handler = handlers.get(action)
     if not handler:
         return error_response_json("InvalidAction", f"Unknown Cognito Identity action: {action}", 400)
-    return await asyncio.to_thread(_run_identity_handler, handler, action, data)
+    return await run_reentrant(_run_identity_handler, handler, action, data,
+                               thread_name="ministack-cognito-trigger")
 
 
 # ===========================================================================

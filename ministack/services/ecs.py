@@ -31,7 +31,9 @@ import secrets
 import threading
 import time
 
+from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import run_reentrant
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -46,6 +48,11 @@ from ministack.core.responses import (
 from ministack.services import ecs_metadata, secretsmanager
 
 logger = logging.getLogger("ecs")
+
+# Cap any single Docker daemon call. docker-py defaults to 60s, which turns a
+# slow or wedged daemon into a minutes-long stall on a request path.
+_DOCKER_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
+
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
@@ -80,18 +87,29 @@ _ecs_reaper_started = False
 _ecs_reaper_lock = threading.Lock()
 
 
+def _live_container_ids():
+    """Container ids still owned by a live task.
+
+    Registered with ``core.container_reaper``, which reclaims ECS containers
+    that no task references any more. This replaces a service-local reaper that
+    removed every exited/dead/created ECS container regardless of ownership —
+    correct in practice, but a second implementation of the same rule, and one
+    that could race a task between `created` and `running`.
+    """
+    ids = set()
+    for _key, task in _tasks.all_items():
+        for cid in task.get("_docker_ids") or []:
+            if cid:
+                ids.add(cid)
+    return ids
+
+
+container_reaper.register_live_ids("ecs", _live_container_ids)
+
+
 def _reap_exited_containers():
-    docker_client = _get_docker()
-    if not docker_client:
-        return
-    # all=True includes exited containers; reset() uses list() (running only),
-    # so this complements — and overlaps harmlessly — with the reset path.
-    for c in docker_client.containers.list(all=True, filters={"label": "ministack=ecs"}):
-        if c.status in ("exited", "dead", "created"):
-            try:
-                c.remove(v=True, force=True)
-            except Exception:
-                pass
+    """Kept as a no-op shim: reclamation is owned by core.container_reaper."""
+    return
 
 
 def _ensure_ecs_reaper_thread():
@@ -236,7 +254,7 @@ def _get_docker():
     if _docker is None:
         try:
             import docker
-            _docker = docker.from_env()
+            _docker = docker.from_env(timeout=_DOCKER_TIMEOUT)
         except Exception:
             pass
     return _docker
@@ -265,7 +283,7 @@ def _ts_to_epoch(value):
     if not isinstance(value, str):
         return value
     try:
-        from datetime import datetime, timezone
+        from datetime import datetime
         return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
     except (ValueError, TypeError):
         return value
@@ -309,13 +327,26 @@ async def handle_request(method, path, headers, body, query_params):
     target = headers.get("x-amz-target", "") or headers.get("X-Amz-Target", "")
     if target:
         action = target.split(".")[-1]
-        return _finalize_ecs_response(_dispatch_action(action, data))
+        # Docker work (RunTask/StopTask/service updates) blocks for as long as
+        # the daemon takes: a cached nginx start already holds the loop >7s,
+        # measured, during which no service in the process can be served.
+        #
+        # run_reentrant, not the shared pool: every task container is handed
+        # AWS_ENDPOINT_URL pointing back here (see _task_env), so a starting
+        # container calls into MiniStack while this call is still in flight. A
+        # bounded pool — or a per-service lock — would put that nested request
+        # behind the call waiting on it.
+        return _finalize_ecs_response(
+            await run_reentrant(_dispatch_action, action, data,
+                                thread_name="ministack-ecs-dispatch"))
 
     parts = [p for p in path.strip("/").split("/") if p]
     if not parts:
         return error_response_json("ClientException", "Missing path", 400)
 
-    return _finalize_ecs_response(_dispatch_path(method, parts, data))
+    return _finalize_ecs_response(
+        await run_reentrant(_dispatch_path, method, parts, data,
+                            thread_name="ministack-ecs-dispatch"))
 
 
 def _dispatch_action(action, data):
@@ -1069,7 +1100,7 @@ def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
         ports=port_bindings or None,
         name=f"ministack-ecs-{task_id[:8]}-{cdef['name']}",
         labels={
-            "ministack": "ecs",
+            **container_reaper.own_labels("ecs"),
             "com.amazonaws.ecs.cluster": cluster_arn,
             "com.amazonaws.ecs.container-name": cdef["name"],
             "com.amazonaws.ecs.task-arn": task_arn,
@@ -2137,13 +2168,13 @@ def reset():
         # (echo, wget probes) leave Exited containers behind that otherwise
         # only the background reaper would remove.
         try:
-            for c in docker_client.containers.list(all=True, filters={"label": "ministack=ecs"}):
-                try:
-                    if c.status == "running":
-                        c.stop(timeout=2)
-                    c.remove(v=True, force=True)
-                except Exception:
-                    pass
+            from ministack.core import container_reaper
+            # Concurrently: reset holds the global reset lock, and stopping a
+            # run's worth of tasks one at a time is tens of seconds during which
+            # every other request is blocked.
+            container_reaper.drop_containers(
+                docker_client.containers.list(all=True, filters={"label": "ministack=ecs"}),
+                stop_timeout=2, force=True)
         except Exception:
             pass
     _clusters.clear()

@@ -11,7 +11,7 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from conftest import ENDPOINT
+from conftest import ENDPOINT, LoopProbe, concurrent_burst
 
 
 def _make_zip(code: str) -> bytes:
@@ -4895,6 +4895,67 @@ def test_sfn_aws_sdk_query_pascal_case(sfn, sfn_sync, ssm):
     ssm.delete_parameter(Name="sfn-pascal-test-param")
 
 
+def test_sfn_aws_sdk_ssm_run_command_probe(sfn, sfn_sync, ec2):
+    """The health-probe shape: sendCommand, then getCommandInvocation on the id it returned."""
+    try:
+        import docker as _probe
+
+        _probe.from_env(timeout=5).ping()
+    except Exception:
+        pytest.skip("no reachable Docker daemon — Run Command needs a box behind the instance")
+    tag = _uuid_mod.uuid4().hex[:8]
+    # Run Command needs an agent answering, which here is the container behind the instance.
+    ami = ec2.register_image(Name=f"sfn-ssm-{tag}", ImageLocation="alpine:3")["ImageId"]
+    instance_id = ec2.run_instances(ImageId=ami, MinCount=1,
+                                    MaxCount=1)["Instances"][0]["InstanceId"]
+    sm_arn = None
+    try:
+        sm_arn = sfn.create_state_machine(
+            name=f"sfn-ssm-run-{tag}",
+            definition=json.dumps({
+                "StartAt": "Send",
+                "States": {
+                    "Send": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+                        "Parameters": {
+                            "InstanceIds": [instance_id],
+                            "DocumentName": "AWS-RunShellScript",
+                            "Parameters": {"commands": ["echo ok"]},
+                        },
+                        "ResultPath": "$.sent",
+                        "Next": "Poll",
+                    },
+                    "Poll": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+                        "Parameters": {
+                            "CommandId.$": "$.sent.Command.CommandId",
+                            "InstanceId": instance_id,
+                        },
+                        # Run Command is asynchronous, so a probe polls to a terminal state.
+                        "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 1,
+                                   "MaxAttempts": 3}],
+                        "End": True,
+                    },
+                },
+            }),
+            roleArn="arn:aws:iam::000000000000:role/R",
+        )["stateMachineArn"]
+
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input="{}")
+        assert resp["status"] == "SUCCEEDED", f"{resp.get('error')} — {resp.get('cause')}"
+        # The poll addressed the CommandId the send returned, which is the part a probe needs.
+        output = json.loads(resp["output"])
+        assert output["InstanceId"] == instance_id
+        assert output["Status"] in ("Pending", "InProgress", "Success")
+    finally:
+        ec2.terminate_instances(InstanceIds=[instance_id])
+        ec2.deregister_image(ImageId=ami)
+        if sm_arn:
+            sfn.delete_state_machine(stateMachineArn=sm_arn)
+
+
 def test_sfn_aws_sdk_json_pascal_case(sfn, sfn_sync, sm):
     """SFN aws-sdk integration converts camelCase action to PascalCase for JSON-protocol services."""
     definition = json.dumps({
@@ -7523,3 +7584,33 @@ def test_sfn_jsonata_format_number(sfn_sync):
         "neg_sub": "(1,234.50)",
         "plain": "1,234",
     }
+
+
+# ---------------------------------------------------------------------------
+# Re-entrancy under concurrency — the rest of the suite issues one request at
+# a time, so a service whose blocking work is misclassified passes serially
+# and only wedges under load. These fire N callers at once and assert both
+# that every caller completes and that the event loop keeps serving.
+# ---------------------------------------------------------------------------
+@pytest.mark.serial
+def test_concurrent_sync_executions_do_not_block_the_loop(sfn, sfn_sync):
+    """StartSyncExecution runs off the loop; N at once must not stall the server."""
+    definition = json.dumps({
+        "StartAt": "Wait",
+        "States": {"Wait": {"Type": "Wait", "Seconds": 1, "Next": "Done"},
+                   "Done": {"Type": "Pass", "End": True}},
+    })
+    arn = sfn.create_state_machine(
+        name=f"conc-sync-{_uuid_mod.uuid4().hex[:8]}", definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )["stateMachineArn"]
+
+    def run(i):
+        return sfn_sync.start_sync_execution(
+            stateMachineArn=arn, input=json.dumps({"i": i}))["status"]
+
+    with LoopProbe() as probe:
+        statuses = concurrent_burst(run)
+    probe.assert_responsive("sync execution burst")
+
+    assert all(s == "SUCCEEDED" for s in statuses), f"sync executions returned {set(statuses)}"
