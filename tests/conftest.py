@@ -2,10 +2,17 @@
 Pytest fixtures for MiniStack integration tests.
 """
 
+import concurrent.futures
 import contextlib
+import io
 import os
 import socket
+import statistics
+import threading
+import time
 import urllib.request
+import uuid
+import zipfile
 from urllib.parse import urlparse
 
 import boto3
@@ -719,3 +726,171 @@ def dsql():
 @pytest.fixture(scope="session")
 def s3tables():
     return make_client("s3tables")
+
+
+class FakeDockerContainer:
+    """Container double for tests that observe lifecycle without a daemon."""
+
+    def __init__(self, daemon, name, labels):
+        self.daemon, self.name, self.labels = daemon, name, dict(labels or {})
+        self.id = f"cid-{name}"
+        self.status = "running"
+        self.attrs = {"Config": {"Labels": self.labels}, "State": {}, "Created": ""}
+
+    def stop(self, timeout=None):
+        self.status = "exited"
+
+    def remove(self, force=False, v=False):
+        self.daemon.removed.append(self.name)
+        self.daemon.containers._by_name.pop(self.name, None)
+
+    def reload(self):
+        pass
+
+
+class _FakeContainers:
+    def __init__(self, daemon):
+        self.daemon = daemon
+        self._by_name = {}
+
+    def run(self, image=None, command=None, name=None, labels=None, **kw):
+        self._by_name[name] = FakeDockerContainer(self.daemon, name, labels)
+        return self._by_name[name]
+
+    def get(self, key):
+        for c in self._by_name.values():
+            if key in (c.name, c.id):
+                return c
+        raise RuntimeError(f"no such container: {key}")
+
+    def list(self, all=False, filters=None):
+        want = (filters or {}).get("label") or []
+        want = [want] if isinstance(want, str) else want
+        out = []
+        for c in self._by_name.values():
+            ok = True
+            for sel in want:
+                if "=" in sel:
+                    k, v = sel.split("=", 1)
+                    ok = ok and c.labels.get(k) == v
+                else:
+                    ok = ok and sel in c.labels
+            if ok:
+                out.append(c)
+        return out
+
+
+class FakeDockerDaemon:
+    """Enough of the Docker API to assert which containers survive.
+
+    ``images.get`` always raises, so services that check whether an image is
+    cached take their deferred/background provisioning path.
+    """
+
+    def __init__(self):
+        self.containers = _FakeContainers(self)
+        self.removed = []
+        self.images = self
+
+    def get(self, image):
+        raise RuntimeError("image not present")
+
+    def live(self):
+        return sorted(self.containers._by_name)
+
+
+@pytest.fixture
+def fake_docker():
+    return FakeDockerDaemon()
+
+
+# ---------------------------------------------------------------------------
+# Concurrency probes — shared by the per-service re-entrancy tests
+# ---------------------------------------------------------------------------
+
+# Enough callers to exhaust a misclassified bounded pool without being slow.
+CONCURRENCY_N = 12
+# The nested-invoke probe has to exceed the shared worker pool (default 64) or
+# starvation never shows: below the pool size every caller gets a slot and a
+# broken build passes. Verified — at N=12 the probe passes against 1.4.17,
+# which has the bug.
+CONCURRENCY_N_NESTED = 70
+# Judged on the *median*, never the max. A single slow sample says nothing about
+# the event loop: the probe competes with the burst for client connections and
+# CI runner CPU, so the worst sample is dominated by queueing on our side.
+# Measured spread — a build with the bug blocks the loop for the whole burst and
+# every sample is slow (1.4.17: median 6905ms), while a healthy one absorbs it
+# (median 118ms, with an occasional multi-second outlier under a saturated
+# connection pool). The median separates those by ~60x; the max does not
+# separate them at all.
+MEDIAN_LOOP_STALL_MS = 2000
+
+
+class LoopProbe:
+    """Polls /_ministack/health through a burst to detect a blocked event loop.
+
+    Used by the re-entrancy tests: work that can call back into MiniStack must
+    run on a dedicated thread, and work that blocks must never run on the loop.
+    Both failures show up here as the health endpoint going slow or silent.
+    """
+
+    MIN_SAMPLES = 3   # below this an outlier decides the median; too short to judge
+
+    def __init__(self):
+        self.samples = []
+        self._stop = threading.Event()
+        self._thread = None
+
+    def __enter__(self):
+        def poll():
+            while not self._stop.is_set():
+                t0 = time.perf_counter()
+                try:
+                    urllib.request.urlopen(f"{ENDPOINT}/_ministack/health", timeout=15).read()
+                    self.samples.append((time.perf_counter() - t0) * 1000)
+                except Exception:
+                    self.samples.append(None)
+                time.sleep(0.05)
+
+        self._thread = threading.Thread(target=poll, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def assert_responsive(self, what: str):
+        served = [s for s in self.samples if s is not None]
+        assert served, f"{what}: health never responded — the event loop was blocked"
+        if len(served) < self.MIN_SAMPLES:
+            return
+        median = statistics.median(served)
+        assert median < MEDIAN_LOOP_STALL_MS, (
+            f"{what}: event loop median {median:.0f}ms "
+            f"(worst {max(served):.0f}ms, n={len(self.samples)}, "
+            f"unanswered={len(self.samples) - len(served)}) — "
+            f"a blocking call is running on the loop"
+        )
+
+
+def concurrent_burst(fn, items=None, n=CONCURRENCY_N):
+    """Run `fn` concurrently over `items` (or over range(n)); return all results."""
+    work = list(items) if items is not None else list(range(n))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(work))) as ex:
+        return list(ex.map(fn, work))
+
+
+def make_probe_lambda(lam, src: str, timeout: int = 30) -> str:
+    """Deploy a throwaway Python function and return its name."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("index.py", src)
+    name = f"conc-{uuid.uuid4().hex[:10]}"
+    lam.create_function(
+        FunctionName=name, Runtime="python3.11",
+        Role="arn:aws:iam::000000000000:role/lambda-role", Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()}, Timeout=timeout,
+    )
+    return name

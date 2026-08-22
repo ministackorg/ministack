@@ -39,7 +39,8 @@ from concurrent.futures import wait as futures_wait
 from datetime import datetime, timezone
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.concurrency import run_reentrant
+from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -236,6 +237,12 @@ def _finalize_response(response):
 # Entry point
 # ---------------------------------------------------------------------------
 
+# Actions that run a state machine to completion inside the request. They
+# re-enter MiniStack (Lambda invokes, aws-sdk integrations), so they run on a
+# dedicated thread rather than holding the event loop those nested calls need.
+_OFF_LOOP_ACTIONS = {"StartSyncExecution", "TestState"}
+
+
 async def handle_request(method, path, headers, body, query_params):
     target = headers.get("x-amz-target", "")
     action = target.split(".")[-1] if "." in target else ""
@@ -286,6 +293,15 @@ async def handle_request(method, path, headers, body, query_params):
         return error_response_json("InvalidAction", f"Unknown action: {action}", 400)
     if action == "GetActivityTask":
         return _finalize_response(await _get_activity_task(data))
+    if action in _OFF_LOOP_ACTIONS:
+        # These run a state machine to completion inline. Every task state calls
+        # back into MiniStack — Lambda invokes, aws-sdk service integrations —
+        # so this must not hold the event loop: the nested calls need it, and a
+        # service handler that awaits (Docker work runs off-loop now) cannot be
+        # driven from the loop thread at all. Dedicated thread, not the shared
+        # pool, because the work re-enters the server.
+        return _finalize_response(
+            await run_reentrant(handler, data, thread_name="ministack-sfn-sync-exec"))
     return _finalize_response(handler(data))
 
 
@@ -4386,25 +4402,14 @@ def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
         ),
     }
 
-    # Service handlers are async def but perform no real I/O, so we can
-    # drive the coroutine synchronously — this avoids conflicts with the
-    # already-running asyncio event loop.
-    coro = handler("POST", "/", headers, body, {})
-    try:
-        coro.send(None)
-    except StopIteration as stop:
-        status, resp_headers, resp_body = stop.value
-    else:
-        # If the coroutine didn't finish in one step it truly needs async;
-        # fall back to the event loop (only reachable if a handler awaits).
-        coro.close()
-        loop = asyncio.new_event_loop()
-        try:
-            status, resp_headers, resp_body = loop.run_until_complete(
-                handler("POST", "/", headers, body, {})
-            )
-        finally:
-            loop.close()
+    # Service handlers are async def and may now genuinely await (services that
+    # drive Docker run that work off the event loop), so they cannot be driven
+    # by hand with ``coro.send(None)``: the first step would execute with no
+    # running loop and raise "no running event loop". Schedule on the loop that
+    # is actually serving and wait here. This runs on a Step Functions execution
+    # thread, never on the loop itself, so the wait cannot deadlock.
+    status, resp_headers, resp_body = app.call_service_handler_sync(
+        handler, "POST", "/", headers, body, {})
 
     decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else resp_body
     result = json.loads(decoded) if decoded else {}
@@ -4989,20 +4994,9 @@ def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
         ),
     }
 
-    coro = handler("POST", "/", headers, body, {})
-    try:
-        coro.send(None)
-    except StopIteration as stop:
-        status, resp_headers, resp_body = stop.value
-    else:
-        coro.close()
-        loop = asyncio.new_event_loop()
-        try:
-            status, resp_headers, resp_body = loop.run_until_complete(
-                handler("POST", "/", headers, body, {})
-            )
-        finally:
-            loop.close()
+    # Scheduled on the serving loop — see _dispatch_aws_sdk_json.
+    status, resp_headers, resp_body = app.call_service_handler_sync(
+        handler, "POST", "/", headers, body, {})
 
     decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else resp_body
 
@@ -5092,20 +5086,9 @@ def _dispatch_aws_sdk_rest_json(service_info, service_name, action, input_data):
         ),
     }
 
-    coro = handler("POST", path, headers, body, {})
-    try:
-        coro.send(None)
-    except StopIteration as stop:
-        status, resp_headers, resp_body = stop.value
-    else:
-        coro.close()
-        loop = asyncio.new_event_loop()
-        try:
-            status, resp_headers, resp_body = loop.run_until_complete(
-                handler("POST", path, headers, body, {})
-            )
-        finally:
-            loop.close()
+    # Scheduled on the serving loop — see _dispatch_aws_sdk_json.
+    status, resp_headers, resp_body = app.call_service_handler_sync(
+        handler, "POST", path, headers, body, {})
 
     decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else resp_body
 
@@ -5226,26 +5209,11 @@ def _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data
         ),
     }
 
-    # Drive the async handler synchronously. SFN state execution runs inside
-    # the request's event loop, so spawning a fresh loop here would raise
-    # "Cannot run the event loop while another loop is running". The Lambda
-    # REST handlers we dispatch to here only touch in-memory dicts and never
-    # await, so a single ``coro.send(None)`` completes via ``StopIteration``
-    # with the response tuple.
-    coro = handler(method, path, headers, body, query_params)
-    try:
-        coro.send(None)
-    except StopIteration as stop:
-        status, resp_headers, resp_body = stop.value
-    else:
-        # Fallback for an async handler that does await — extremely rare on
-        # this dispatch surface, but guard so we don't return None silently.
-        coro.close()
-        raise _ExecutionError(
-            "States.Runtime",
-            f"aws-sdk:{service_name}:{action} handler awaited unexpectedly; "
-            "cannot drive from sync SFN executor",
-        )
+    # Scheduled on the serving loop — see _dispatch_aws_sdk_json. This replaces
+    # a guard that failed the execution outright when a handler awaited; that is
+    # now an ordinary, supported case.
+    status, resp_headers, resp_body = app.call_service_handler_sync(
+        handler, method, path, headers, body, query_params)
 
     decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else resp_body
     if status >= 400:
@@ -5577,20 +5545,9 @@ def _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data):
     # passing the raw path with "?..." would treat "?list-type=2" as part of
     # the bucket name. Send the query-less path; the dict is the source of
     # truth for query routing.
-    coro = handler(method, path, headers, body, query_dict)
-    try:
-        coro.send(None)
-    except StopIteration as stop:
-        status, resp_headers, resp_body = stop.value
-    else:
-        coro.close()
-        loop = asyncio.new_event_loop()
-        try:
-            status, resp_headers, resp_body = loop.run_until_complete(
-                handler(method, path, headers, body, query_dict)
-            )
-        finally:
-            loop.close()
+    # Scheduled on the serving loop — see _dispatch_aws_sdk_json.
+    status, resp_headers, resp_body = app.call_service_handler_sync(
+        handler, method, path, headers, body, query_dict)
 
     decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else (resp_body or "")
     norm_resp_headers = {k.lower(): v for k, v in (resp_headers or {}).items()}

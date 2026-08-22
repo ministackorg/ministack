@@ -323,7 +323,6 @@ def test_transfer_workos_sftp_workflow(transfer):
 import asyncio
 import os
 import socket
-import time
 import urllib.request
 import uuid
 
@@ -791,6 +790,11 @@ def test_sftp_auth_uses_server_region_and_stashes_connection_metadata():
         assert service._sftp_server_state(account_id, west_region, server_id) == "OFFLINE"
 
         connection = _FakeConnection()
+        # `_MiniStackSSHServer` is built by `_ensure_sftp_runtime()`, not at
+        # import — reaching for the class directly is only safe once that has
+        # run. Previously this test passed only when some earlier test in the
+        # same process happened to trigger it.
+        service._ensure_sftp_runtime()
         auth_server = service._MiniStackSSHServer()
         auth_server.connection_made(connection)
         assert auth_server.validate_public_key(
