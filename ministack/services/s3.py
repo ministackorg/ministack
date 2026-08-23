@@ -3210,14 +3210,6 @@ def _fire_s3_test_event(bucket_name: str) -> None:
         logger.exception("S3 test-event fire failed for %s", bucket_name)
 
 
-def _fire_s3_test_event_async(bucket_name: str) -> None:
-    """Fire s3:TestEvent in a background thread (non-blocking)."""
-    # Carry the request's account/region context into the thread (issue #876).
-    ctx = contextvars.copy_context()
-    t = threading.Thread(target=ctx.run, args=(_fire_s3_test_event, bucket_name), daemon=True)
-    t.start()
-
-
 # ---------------------------------------------------------------------------
 # Object operations
 # ---------------------------------------------------------------------------
