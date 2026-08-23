@@ -5053,26 +5053,93 @@ def test_s3_bucket_owner_id_is_consistent_and_canonical(s3):
         s3.delete_bucket(Bucket=bkt)
 
 
-def test_s3_conditional_delete_of_absent_key_succeeds(s3):
-    """A conditional delete of a key that is not there is a success, not a
-    failed precondition: S3 counts deleting an absent key as done whatever
-    condition the request carries.  If-Match: * means "whatever is there",
-    so it holds against an object of any ETag."""
-    bucket = "intg-s3-conditional-delete-absent"
+def test_s3_conditional_delete_needs_a_current_object(s3):
+    """A conditional delete is evaluated against the current version and nothing
+    else: "Conditional delete evaluations only apply to the current version of the
+    object." With no current object there is nothing for the condition to hold
+    against, so S3 answers 404 NoSuchKey whatever the If-Match carries. Measured
+    against S3 in eu-west-1; the guide's 412 for the delete-marker case is a slip
+    the measurement overrides."""
+    bucket = "intg-s3-cond-delete-current"
     s3.create_bucket(Bucket=bucket)
 
+    # Never written.
     for condition in ("*", "badetag"):
-        resp = s3.delete_object(Bucket=bucket, Key="gone", IfMatch=condition)
-        assert resp["ResponseMetadata"]["HTTPStatusCode"] == 204
+        with pytest.raises(ClientError) as exc:
+            s3.delete_object(Bucket=bucket, Key="gone", IfMatch=condition)
+        assert exc.value.response["Error"]["Code"] == "NoSuchKey", condition
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
 
-    s3.put_object(Bucket=bucket, Key="here", Body=b"x")
-    resp = s3.delete_object(Bucket=bucket, Key="here", IfMatch="*")
-    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 204
+    # Present: a wrong ETag fails and the object survives, the right one and `*` win.
+    etag = s3.put_object(Bucket=bucket, Key="here", Body=b"x")["ETag"]
     with pytest.raises(ClientError) as exc:
-        s3.head_object(Bucket=bucket, Key="here")
-    assert exc.value.response["Error"]["Code"] == "404"
+        s3.delete_object(Bucket=bucket, Key="here", IfMatch="badetag")
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+    assert s3.get_object(Bucket=bucket, Key="here")["Body"].read() == b"x"
+    assert s3.delete_object(Bucket=bucket, Key="here",
+                            IfMatch="*")["ResponseMetadata"]["HTTPStatusCode"] == 204
+
+    s3.put_object(Bucket=bucket, Key="exact", Body=b"y")
+    exact = s3.head_object(Bucket=bucket, Key="exact")["ETag"]
+    assert s3.delete_object(Bucket=bucket, Key="exact",
+                            IfMatch=exact)["ResponseMetadata"]["HTTPStatusCode"] == 204
+    assert etag  # the put's ETag round-tripped
 
     s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_conditional_delete_does_not_look_under_a_delete_marker(s3):
+    """S3 does not peek beneath a delete marker: a key whose history still holds a
+    real version is as absent as one that was never written."""
+    bucket = "intg-s3-cond-delete-marker"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(Bucket=bucket,
+                             VersioningConfiguration={"Status": "Enabled"})
+    try:
+        put = s3.put_object(Bucket=bucket, Key="obj", Body=b"v1")
+        live_etag = put["ETag"]
+        s3.delete_object(Bucket=bucket, Key="obj")  # lays a delete marker on top
+
+        for condition in ("*", "badetag", live_etag):
+            with pytest.raises(ClientError) as exc:
+                s3.delete_object(Bucket=bucket, Key="obj", IfMatch=condition)
+            assert exc.value.response["Error"]["Code"] == "NoSuchKey", condition
+        # The real version is still there underneath, untouched.
+        versions = s3.list_object_versions(Bucket=bucket, Prefix="obj")
+        assert len(versions.get("Versions", [])) == 1
+
+        # Markers only, which is what a delete of an absent key leaves behind.
+        s3.delete_object(Bucket=bucket, Key="never")
+        for condition in ("*", "badetag"):
+            with pytest.raises(ClientError) as exc:
+                s3.delete_object(Bucket=bucket, Key="never", IfMatch=condition)
+            assert exc.value.response["Error"]["Code"] == "NoSuchKey", condition
+    finally:
+        for v in (s3.list_object_versions(Bucket=bucket).get("Versions", [])
+                  + s3.list_object_versions(Bucket=bucket).get("DeleteMarkers", [])):
+            s3.delete_object(Bucket=bucket, Key=v["Key"], VersionId=v["VersionId"])
+        s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_batch_conditional_delete_reports_a_missing_key_not_found(s3):
+    """DeleteObjects: "If the object doesn't exist when evaluating either of the
+    preconditions, S3 rejects the request and returns a Not Found error response",
+    and `*` in the ETag element asks only that a current object exist."""
+    bucket = "intg-s3-cond-delete-batch"
+    s3.create_bucket(Bucket=bucket)
+    try:
+        resp = s3.delete_objects(
+            Bucket=bucket, Delete={"Objects": [{"Key": "gone", "ETag": "*"}]})
+        assert resp["Errors"][0]["Code"] == "NoSuchKey"
+        assert not resp.get("Deleted")
+
+        s3.put_object(Bucket=bucket, Key="here", Body=b"x")
+        resp = s3.delete_objects(
+            Bucket=bucket, Delete={"Objects": [{"Key": "here", "ETag": "*"}]})
+        assert [d["Key"] for d in resp.get("Deleted", [])] == ["here"]
+        assert not resp.get("Errors")
+    finally:
+        s3.delete_bucket(Bucket=bucket)
 
 
 def test_s3_copy_object_specific_version(s3):
