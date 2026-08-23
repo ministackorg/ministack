@@ -987,7 +987,7 @@ launches against that id get a real box, so `ssm:SendCommand` can return a real 
 of always reporting success.
 
 ```bash
-# 1. Register any image your Docker or Podman daemon can pull as an AMI
+# 1. Register any image your daemon can resolve, local or from a registry
 aws --endpoint-url=http://localhost:4566 ec2 register-image \
   --name my-box --image-location ghcr.io/you/my-box:1.0
 # { "ImageId": "ami-0a1b2c3d4e5f60718" }
@@ -999,6 +999,11 @@ aws --endpoint-url=http://localhost:4566 ec2 run-instances \
 # 3. DescribeInstances reports the container's address, and the box answers on it
 aws --endpoint-url=http://localhost:4566 ec2 describe-instances
 ```
+
+A locally built tag counts. The image is only pulled when the daemon does not
+already have it, so `docker build -t my-box:dev .` then registering `my-box:dev` needs
+no registry, no push and no credentials — which also means CI can build and launch an
+image without registry access. Rebuild the tag and the next `RunInstances` picks it up.
 
 No configuration: registering an image is the opt-in. With nothing registered, EC2 never reaches
 for Docker at all, and an unregistered `ami-` id keeps launching the metadata-only record it always
