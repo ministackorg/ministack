@@ -491,13 +491,36 @@ _SERVICE_PROTOCOL: dict[str, str] = {
     "elasticache": "query-xml",
     "elasticloadbalancing": "query-xml",
     "iam": "query-xml",
+    # CloudWatch accepts the legacy Query API, JSON and smithy-rpc-v2-cbor; the
+    # reply has to mirror whatever the caller sent, so the responder resolves
+    # this one from the request headers (see _cbor_capable below).
     "monitoring": "query-xml",
     "rds": "query-xml",
+    "cloudfront": "rest-xml",
     "route53": "rest-xml",
     "ses": "query-xml",
     "sns": "query-xml",
     "sts": "query-xml",
     # Everything else defaults to JSON
+}
+
+# Services whose Query API also answers JSON / smithy-rpc-v2-cbor, where the
+# error has to come back in the encoding the request arrived in.
+_CBOR_CAPABLE = frozenset({"monitoring"})
+
+# xmlNamespace from each service's botocore model. A query-protocol error
+# carries its own service's namespace, not IAM's.
+_QUERY_XML_NS: dict[str, str] = {
+    "autoscaling": "http://autoscaling.amazonaws.com/doc/2011-01-01/",
+    "cloudformation": "http://cloudformation.amazonaws.com/doc/2010-05-15/",
+    "elasticache": "http://elasticache.amazonaws.com/doc/2015-02-02/",
+    "elasticloadbalancing": "http://elasticloadbalancing.amazonaws.com/doc/2015-12-01/",
+    "iam": "https://iam.amazonaws.com/doc/2010-05-08/",
+    "monitoring": "http://monitoring.amazonaws.com/doc/2010-08-01/",
+    "rds": "http://rds.amazonaws.com/doc/2014-10-31/",
+    "ses": "http://ses.amazonaws.com/doc/2010-12-01/",
+    "sns": "http://sns.amazonaws.com/doc/2010-03-31/",
+    "sts": "https://sts.amazonaws.com/doc/2011-06-15/",
 }
 
 
@@ -1219,8 +1242,14 @@ def extract_resource_arn(service: str, method: str, path: str,
 
 def access_denied_response(service: str, action: str, principal_arn: str,
                            request_id: str, *, error_code: str = "",
-                           message: str = "") -> tuple:
-    """Format a 403 error response matching the service's protocol."""
+                           message: str = "", headers: dict | None = None) -> tuple:
+    """Format a 403 error response matching the service's protocol.
+
+    A denial the caller's SDK cannot parse is barely better than no denial: it
+    surfaces as a bare 403 with the code buried in an unread body, so a client
+    catching AccessDenied misses it. `headers` lets the services that accept
+    more than one encoding answer in the one the request arrived in.
+    """
     if not message:
         message = (
             f"User: {principal_arn} is not authorized to perform: {action} "
@@ -1228,6 +1257,27 @@ def access_denied_response(service: str, action: str, principal_arn: str,
         )
     code = error_code or "AccessDenied"
     protocol = _SERVICE_PROTOCOL.get(service, "json")
+    if service in _CBOR_CAPABLE:
+        # CloudWatch answers the legacy Query API in XML but botocore 1.42+
+        # speaks smithy-rpc-v2-cbor to it, and an XML error against a CBOR
+        # request parses as a bare 403. Mirror the request, exactly as the
+        # service's own _error does.
+        ct = (headers or {}).get("content-type", "")
+        smithy = (headers or {}).get("smithy-protocol", "")
+        if "cbor" in ct or "cbor" in smithy:
+            protocol = "cbor"
+        elif "json" in ct or (headers or {}).get("x-amz-target"):
+            protocol = "json"
+
+    if protocol == "cbor":
+        json_type = code if code != "AccessDenied" else "AccessDeniedException"
+        try:
+            import cbor2
+            return (403,
+                    {"Content-Type": "application/cbor", "smithy-protocol": "rpc-v2-cbor"},
+                    cbor2.dumps({"__type": json_type, "message": message}))
+        except ImportError:
+            protocol = "json"
 
     _esc_code = _xml_escape(code)
     _esc_rid = _xml_escape(request_id)
@@ -1255,9 +1305,10 @@ def access_denied_response(service: str, action: str, principal_arn: str,
         return 403, {"Content-Type": "application/xml"}, body.encode()
 
     if protocol == "query-xml":
+        ns = _QUERY_XML_NS.get(service, "https://iam.amazonaws.com/doc/2010-05-08/")
         body = (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
-            '<ErrorResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/">'
+            f'<ErrorResponse xmlns="{ns}">'
             f"<Error><Type>Sender</Type><Code>{_esc_code}</Code>"
             f"<Message>{_esc_msg}</Message></Error>"
             f"<RequestId>{_esc_rid}</RequestId></ErrorResponse>"

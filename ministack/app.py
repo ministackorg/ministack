@@ -1597,9 +1597,9 @@ def _enforce_data_plane(service: str, iam_action: str, headers: dict,
         if isinstance(denied, AuthError):
             return access_denied_response(
                 service, iam_action, "", request_id,
-                error_code=denied.code, message=denied.message)
+                error_code=denied.code, message=denied.message, headers=headers)
         return access_denied_response(
-            service, iam_action, denied.principal_arn, request_id)
+            service, iam_action, denied.principal_arn, request_id, headers=headers)
     return None
 
 
@@ -1899,9 +1899,11 @@ async def _dispatch_service_request(
                 if isinstance(denied, AuthError):
                     return access_denied_response(
                         service, iam_action, "", request_id,
-                        error_code=denied.code, message=denied.message)
+                        error_code=denied.code, message=denied.message,
+                        headers=headers)
                 return access_denied_response(
-                    service, iam_action, denied.principal_arn, request_id)
+                    service, iam_action, denied.principal_arn, request_id,
+                    headers=headers)
 
     handler = SERVICE_HANDLERS.get(service)
     if not handler:
