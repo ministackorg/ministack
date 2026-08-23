@@ -149,6 +149,11 @@ RUN mkdir -p /docker-entrypoint-initaws.d/ready.d \
     chown -R ministack:ministack /docker-entrypoint-initaws.d /etc/localstack
 
 # Swap in the English-only ICU data, then drop payload no runtime path reads:
+# the npm helper packages Debian ships beside node (the keep-list is read out of
+# libnode itself, because it aborts at startup if an externalized builtin such as
+# undici or acorn-walk is missing), perl (nothing here reverse-depends on it, and
+# the dpkg entry goes too so a scanner stops reporting its CVEs against files
+# that are gone),
 # glibc's legacy iconv converters (Python uses its own codecs; the few kept are
 # the ones a C library caller could plausibly ask for) and stdlib corners that
 # cannot run here now that pip is stripped. The `test -f` fails the build rather
@@ -172,6 +177,14 @@ RUN set -eux; \
            /usr/local/lib/python3.13/pydoc_data \
            /usr/local/lib/python3.13/turtledemo \
            /usr/local/lib/python3.13/turtle.py; \
+    python3 -c "import re,glob,os,shutil; \
+lib=glob.glob('/usr/lib/*/libnode.so.*')[0]; \
+keep={q.split('/')[4] for q in re.findall(r'/usr/share/nodejs/[A-Za-z0-9@._/-]+', open(lib,'rb').read().decode('latin1'))}; \
+[shutil.rmtree(os.path.join('/usr/share/nodejs',d), ignore_errors=True) for d in os.listdir('/usr/share/nodejs') if d not in keep]"; \
+    rm -rf /usr/bin/perl /usr/bin/perl5.40.1 /usr/lib/*/perl-base \
+           /usr/lib/*/perl5 /usr/share/perl5 /usr/share/perl; \
+    dpkg --purge --force-remove-essential --force-depends perl-base 2>/dev/null || true; \
+    node -e "require('http'); if (typeof fetch !== 'function') process.exit(1)"; \
     rm -rf /var/cache/* /var/log/* /tmp/*
 
 # The layers above sum to more than the filesystem they produce: `apt-get
