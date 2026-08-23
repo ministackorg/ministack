@@ -165,6 +165,7 @@ _S3_QUERY_ACTIONS: dict[str, dict[str, str]] = {
                     "DELETE": "DeleteReplicationConfiguration"},
     "location": {"GET": "GetBucketLocation"},
     "uploads": {"GET": "ListMultipartUploads", "POST": "CreateMultipartUpload"},
+    "restore": {"POST": "RestoreObject"},
 }
 
 

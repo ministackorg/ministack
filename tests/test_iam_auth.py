@@ -1005,6 +1005,7 @@ class TestActionExtraction:
         assert extract_iam_action("s3", "GET", "/", {}, b"", {}) == "s3:ListAllMyBuckets"
         assert extract_iam_action("s3", "PUT", "/bucket/key", {}, b"", {}) == "s3:PutObject"
         assert extract_iam_action("s3", "GET", "/bucket", {}, b"", {"versioning": [""]}) == "s3:GetBucketVersioning"
+        assert extract_iam_action("s3", "POST", "/bucket/key", {}, b"", {"restore": [""]}) == "s3:RestoreObject"
 
     def test_lambda_rest(self):
         from ministack.core.iam_actions import extract_iam_action

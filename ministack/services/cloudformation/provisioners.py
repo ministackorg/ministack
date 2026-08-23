@@ -990,13 +990,13 @@ def _iam_role_create(logical_id, props, stack_name):
         "Tags": [],
     }
 
-    # ManagedPolicyArns
-    managed = props.get("ManagedPolicyArns", [])
-    for policy_arn in managed:
-        role["AttachedPolicies"].append({
-            "PolicyName": policy_arn.split("/")[-1],
-            "PolicyArn": policy_arn,
-        })
+    # ManagedPolicyArns. Attach through the IAM module so the record carries the
+    # bare ARN every reader expects and AttachmentCount tracks, exactly as
+    # AttachRolePolicy would: a dict here made GetAccountAuthorizationDetails
+    # and ListAttachedRolePolicies fail on _policies.get(<dict>), and left the
+    # attachment invisible to ListEntitiesForPolicy.
+    for policy_arn in props.get("ManagedPolicyArns", []):
+        _iam.attach_managed_policy(role, policy_arn)
 
     # Inline Policies
     policies = props.get("Policies", [])
@@ -1022,6 +1022,22 @@ def _iam_role_delete(physical_id, props):
 
 # --- IAM Policy ---
 
+def _attach_policy_to_entities(arn, props):
+    """Attach a CFN-created policy to the Roles / Users / Groups it names.
+
+    Both AWS::IAM::Policy and AWS::IAM::ManagedPolicy carry these three
+    properties. Attaching through the IAM module keeps AttachedPolicies a list
+    of bare ARNs and AttachmentCount in step, exactly as AttachRolePolicy does.
+    """
+    for prop, store in (("Roles", _iam._roles),
+                        ("Users", _iam._users),
+                        ("Groups", _iam._groups)):
+        for entity_name in props.get(prop, []) or []:
+            entity = store.get(entity_name)
+            if entity is not None:
+                _iam.attach_managed_policy(entity, arn)
+
+
 def _iam_policy_create(logical_id, props, stack_name):
     name = props.get("PolicyName") or _physical_name(stack_name, logical_id, max_len=128)
     path = props.get("Path", "/")
@@ -1030,43 +1046,27 @@ def _iam_policy_create(logical_id, props, stack_name):
     if isinstance(pol_doc, dict):
         pol_doc = json.dumps(pol_doc)
 
-    policy = {
-        "PolicyName": name,
-        "PolicyId": new_uuid().replace("-", "")[:21].upper(),
-        "Arn": arn,
-        "Path": path,
-        "DefaultVersionId": "v1",
-        "AttachmentCount": 0,
-        "IsAttachable": True,
-        "CreateDate": now_iso(),
-        "UpdateDate": now_iso(),
-        "Description": props.get("Description", ""),
-        "Versions": [{
-            "VersionId": "v1",
-            "IsDefaultVersion": True,
-            "Document": pol_doc,
-            "CreateDate": now_iso(),
-        }],
-        "Tags": [],
-    }
-    _iam._policies[arn] = policy
-
-    # Attach to roles if Roles property specified
-    roles = props.get("Roles", [])
-    for role_name in roles:
-        role = _iam._roles.get(role_name)
-        if role:
-            role["AttachedPolicies"].append({
-                "PolicyName": name,
-                "PolicyArn": arn,
-            })
-            policy["AttachmentCount"] += 1
-
-    return arn, {"PolicyArn": arn}
+    record = _iam.store_policy(arn, name, path, pol_doc,
+                               description=props.get("Description", ""))
+    _attach_policy_to_entities(arn, props)
+    # "When the logical ID of this resource is provided to the Ref intrinsic
+    # function, Ref returns the resource name" — so the physical id is the
+    # policy name, not the ARN, and _iam_policy_delete resolves back from it.
+    # AWS::IAM::Policy exposes exactly one attribute, Id; anything else falls
+    # through to the engine's PhysicalResourceId fallback.
+    return name, {"Id": record["PolicyId"]}
 
 
 def _iam_policy_delete(physical_id, props):
-    _iam._policies.pop(physical_id, None)
+    # The physical id is the policy name (what Ref returns), so find the record
+    # by name. Older stacks stored the ARN as the physical id; popping that
+    # first keeps them deletable.
+    if _iam._policies.pop(physical_id, None) is not None:
+        return
+    for arn, policy in list(_iam._policies.items()):
+        if policy.get("PolicyName") == physical_id:
+            _iam._policies.pop(arn, None)
+            return
 
 
 # --- IAM InstanceProfile ---
@@ -3599,22 +3599,24 @@ def _codebuild_project_delete(physical_id, props):
 
 def _iam_managed_policy_create(logical_id, props, stack_name):
     name = props.get("ManagedPolicyName", f"{stack_name}-{logical_id}")
+    path = props.get("Path", "/")
     arn = f"arn:aws:iam::{get_account_id()}:policy/{name}"
-    policy_doc = props.get("PolicyDocument", {})
-    _iam._policies[arn] = {
-        "PolicyName": name,
-        "PolicyId": new_uuid().replace("-", "")[:21].upper(),
-        "Arn": arn,
-        "Path": props.get("Path", "/"),
-        "DefaultVersionId": "v1",
-        "AttachmentCount": 0,
-        "IsAttachable": True,
-        "Description": props.get("Description", ""),
-        "CreateDate": __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime()),
-        "UpdateDate": __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime()),
-        "PolicyVersions": [{"Document": json.dumps(policy_doc) if isinstance(policy_doc, dict) else policy_doc, "VersionId": "v1", "IsDefaultVersion": True}],
+    record = _iam.store_policy(arn, name, path, props.get("PolicyDocument", {}),
+                               description=props.get("Description", ""))
+    _attach_policy_to_entities(arn, props)
+    # The eight attributes AWS::IAM::ManagedPolicy documents. Attachments are
+    # counted after _attach_policy_to_entities has run, so AttachmentCount
+    # reflects the Roles / Users / Groups this same resource named.
+    return arn, {
+        "PolicyArn": arn,
+        "PolicyId": record["PolicyId"],
+        "AttachmentCount": record["AttachmentCount"],
+        "PermissionsBoundaryUsageCount": 0,
+        "DefaultVersionId": record["DefaultVersionId"],
+        "IsAttachable": record["IsAttachable"],
+        "CreateDate": record["CreateDate"],
+        "UpdateDate": record["UpdateDate"],
     }
-    return arn, {"Arn": arn}
 
 
 def _iam_managed_policy_delete(physical_id, props):

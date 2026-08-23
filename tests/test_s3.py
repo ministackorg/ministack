@@ -3268,7 +3268,9 @@ def test_s3_post_object_storage_class(s3):
     )
     r = requests.post(post["url"], data=post["fields"], files={"file": ("x", b"x")})
     assert r.status_code == 204
-    assert s3.get_object(Bucket="qa-s3-post-sc", Key="cold")["StorageClass"] == "GLACIER"
+    # Read the class off HeadObject: a GetObject of an unrestored GLACIER
+    # object is exactly the call AWS rejects with InvalidObjectState.
+    assert s3.head_object(Bucket="qa-s3-post-sc", Key="cold")["StorageClass"] == "GLACIER"
 
 
 def test_s3_post_object_unquoted_field_names(s3):
@@ -5531,3 +5533,114 @@ def test_s3_list_delimiter_next_marker_is_common_prefix(s3):
     full = s3.list_objects(Bucket=bkt, Delimiter="/")
     assert [c["Key"] for c in full.get("Contents", [])] == ["asdf"]
     assert [c["Prefix"] for c in full.get("CommonPrefixes", [])] == ["boo/", "cquux/"]
+
+
+# ---------------------------------------------------------------------------
+# Glacier restore (RestoreObject / x-amz-restore / s3:ObjectRestore:*)
+# ---------------------------------------------------------------------------
+
+def test_s3_restore_object_glacier_flow(s3):
+    s3.create_bucket(Bucket="qa-s3-restore")
+    s3.put_object(Bucket="qa-s3-restore", Key="cold", Body=b"frozen",
+                  StorageClass="GLACIER")
+
+    # Archived and unrestored: GetObject fails InvalidObjectState (403,
+    # carrying StorageClass); HeadObject keeps working — that asymmetry is
+    # how a caller polls for the copy to land.
+    with pytest.raises(ClientError) as exc:
+        s3.get_object(Bucket="qa-s3-restore", Key="cold")
+    assert exc.value.response["Error"]["Code"] == "InvalidObjectState"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+    assert exc.value.response["Error"]["StorageClass"] == "GLACIER"
+    head = s3.head_object(Bucket="qa-s3-restore", Key="cold")
+    assert head["StorageClass"] == "GLACIER"
+    assert "Restore" not in head
+
+    resp = s3.restore_object(
+        Bucket="qa-s3-restore", Key="cold",
+        RestoreRequest={"Days": 1, "GlacierJobParameters": {"Tier": "Bulk"}})
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 202
+    assert s3.head_object(Bucket="qa-s3-restore", Key="cold")["Restore"] == \
+        'ongoing-request="true"'
+    with pytest.raises(ClientError) as exc:
+        s3.restore_object(Bucket="qa-s3-restore", Key="cold",
+                          RestoreRequest={"Days": 1})
+    assert exc.value.response["Error"]["Code"] == "RestoreAlreadyInProgress"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
+    with pytest.raises(ClientError):
+        s3.get_object(Bucket="qa-s3-restore", Key="cold")
+
+    # After the fixed retrieval window the copy is readable and the header
+    # flips to ongoing-request="false" with an expiry-date.
+    time.sleep(2.5)
+    head = s3.head_object(Bucket="qa-s3-restore", Key="cold")
+    assert head["Restore"].startswith('ongoing-request="false", expiry-date="')
+    got = s3.get_object(Bucket="qa-s3-restore", Key="cold")
+    assert got["Body"].read() == b"frozen"
+    assert got["Restore"].startswith('ongoing-request="false"')
+    assert got["StorageClass"] == "GLACIER"
+
+    # Re-requesting while the copy is live only extends the expiry: 200.
+    resp = s3.restore_object(Bucket="qa-s3-restore", Key="cold",
+                             RestoreRequest={"Days": 3})
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+
+
+def test_s3_restore_object_active_tier_rejected(s3):
+    s3.create_bucket(Bucket="qa-s3-restore-active")
+    s3.put_object(Bucket="qa-s3-restore-active", Key="warm", Body=b"x")
+    s3.put_object(Bucket="qa-s3-restore-active", Key="ir", Body=b"y",
+                  StorageClass="GLACIER_IR")
+    # Active tier (STANDARD): ObjectAlreadyInActiveTierError.
+    with pytest.raises(ClientError) as exc:
+        s3.restore_object(Bucket="qa-s3-restore-active", Key="warm",
+                          RestoreRequest={"Days": 1})
+    assert exc.value.response["Error"]["Code"] == \
+        "ObjectAlreadyInActiveTierError"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+    # GLACIER_IR: real AWS answers InvalidObjectState ("Restore is not
+    # allowed for the object's current storage class."), not the
+    # active-tier error.
+    with pytest.raises(ClientError) as exc:
+        s3.restore_object(Bucket="qa-s3-restore-active", Key="ir",
+                          RestoreRequest={"Days": 1})
+    assert exc.value.response["Error"]["Code"] == "InvalidObjectState"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+    # GLACIER_IR is instant retrieval: readable without any restore.
+    got = s3.get_object(Bucket="qa-s3-restore-active", Key="ir")
+    assert got["Body"].read() == b"y"
+
+
+def test_s3_restore_notifications_to_sqs(s3, sqs):
+    s3.create_bucket(Bucket="qa-s3-restore-evt")
+    queue_url = sqs.create_queue(QueueName="qa-s3-restore-evt-q")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=queue_url, AttributeNames=["QueueArn"],
+    )["Attributes"]["QueueArn"]
+    s3.put_bucket_notification_configuration(
+        Bucket="qa-s3-restore-evt",
+        NotificationConfiguration={
+            "QueueConfigurations": [
+                {"QueueArn": queue_arn, "Events": ["s3:ObjectRestore:*"]}],
+        },
+    )
+    s3.put_object(Bucket="qa-s3-restore-evt", Key="cold", Body=b"z",
+                  StorageClass="DEEP_ARCHIVE")
+    s3.restore_object(Bucket="qa-s3-restore-evt", Key="cold",
+                      RestoreRequest={"Days": 1})
+    time.sleep(3)
+    msgs = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10,
+                               WaitTimeSeconds=2)
+    records = [
+        json.loads(m["Body"])["Records"][0]
+        for m in msgs.get("Messages", [])
+        if "Records" in json.loads(m["Body"])
+    ]
+    names = {r["eventName"] for r in records}
+    assert "ObjectRestore:Post" in names
+    assert "ObjectRestore:Completed" in names
+    completed = next(r for r in records
+                     if r["eventName"] == "ObjectRestore:Completed")
+    red = completed["glacierEventData"]["restoreEventData"]
+    assert red["lifecycleRestoreStorageClass"] == "DEEP_ARCHIVE"
+    assert red["lifecycleRestorationExpiryTime"].endswith("Z")

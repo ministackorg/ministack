@@ -56,6 +56,7 @@ from ministack.core.responses import (
     md5_hash,
     new_uuid,
     now_iso,
+    set_request_account_id,
     set_request_region,
 )
 
@@ -199,6 +200,251 @@ def _resolve_storage_class(headers: dict, default: str = "STANDARD"):
             400,
         )
     return sc, None
+
+
+# ---------------------------------------------------------------------------
+# Glacier restore (RestoreObject, x-amz-restore, s3:ObjectRestore:* events)
+# ---------------------------------------------------------------------------
+
+# Storage classes whose objects are unreadable until restored. GLACIER_IR is
+# deliberately absent: instant retrieval is an active tier, readable directly,
+# and RestoreObject against it fails ObjectAlreadyInActiveTierError like any
+# other active class.
+_ARCHIVE_STORAGE_CLASSES = frozenset({"GLACIER", "DEEP_ARCHIVE"})
+
+# Simulated retrieval latency. Fixed on purpose: every caller passes through
+# the ongoing-request="true" state it must handle against real AWS, and the
+# emulator compresses Glacier's hours to the same few seconds for everyone.
+_RESTORE_DELAY_SECONDS = 2.0
+
+
+def _restore_expiry_epoch(start: float, days: int) -> float:
+    """AWS expires the temporary copy at midnight UTC after the restore
+    period (expiry-date always reads 00:00:00 GMT), not at an hour offset."""
+    return float((int(start + days * 86400) // 86400 + 1) * 86400)
+
+
+def _restore_expiry_iso(expires_at: float) -> str:
+    return _dt.datetime.fromtimestamp(
+        expires_at, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _sync_restore(bucket_name: str, key: str, obj: dict | None) -> str | None:
+    """Derive the object's restore phase from its timestamps.
+
+    Returns "in_progress", "restored", or None (no active restore). State is
+    derived rather than flipped by a timer so it survives a restart under
+    S3_PERSIST=1. A lapsed temporary copy reverts the object to archived here,
+    on the next touch, and fires s3:ObjectRestore:Delete — an expiry is Days
+    out, so it rides this lazy sweep instead of a sleeping thread."""
+    restore = (obj or {}).get("restore")
+    if not restore:
+        return None
+    now = time.time()
+    if now < restore["available_at"]:
+        return "in_progress"
+    if now < restore["expires_at"]:
+        return "restored"
+    obj.pop("restore", None)
+    _fire_s3_event_async(bucket_name, key, "s3:ObjectRestore:Delete",
+                         size=obj.get("size", 0), etag=obj.get("etag", ""))
+    return None
+
+
+def _invalid_object_state(bucket_name: str, key: str, storage_class: str) -> tuple:
+    """403 InvalidObjectState, carrying the StorageClass member the error
+    shape models."""
+    root = Element("Error")
+    SubElement(root, "Code").text = "InvalidObjectState"
+    SubElement(root, "Message").text = (
+        "The operation is not valid for the object's storage class")
+    SubElement(root, "StorageClass").text = storage_class
+    SubElement(root, "Resource").text = f"/{bucket_name}/{key}"
+    SubElement(root, "RequestId").text = new_uuid()
+    return 403, {"Content-Type": "application/xml"}, _xml_body(root)
+
+
+def _schedule_restore_completed(bucket_name: str, key: str,
+                                requested_at: float) -> None:
+    """Fire s3:ObjectRestore:Completed once the simulated retrieval lands.
+
+    Same copied-context daemon-thread shape as _fire_s3_event_async (#876).
+    The requested_at stamp guards the sleep window: if the object is deleted,
+    overwritten, or the restore superseded meanwhile, the timer wakes up,
+    sees a different stamp, and fires nothing."""
+    ctx = contextvars.copy_context()
+
+    def _worker():
+        bucket = _buckets.get(bucket_name)
+        obj = bucket["objects"].get(key) if bucket else None
+        restore = (obj or {}).get("restore")
+        if not restore or restore.get("requested_at") != requested_at:
+            return
+        delay = restore["available_at"] - time.time()
+        if delay > 0:
+            time.sleep(delay)
+        bucket = _buckets.get(bucket_name)
+        obj = bucket["objects"].get(key) if bucket else None
+        restore = (obj or {}).get("restore")
+        if not restore or restore.get("requested_at") != requested_at:
+            return
+        restore["completed_fired"] = True
+        _fire_s3_event(
+            bucket_name, key, "s3:ObjectRestore:Completed",
+            size=obj.get("size", 0), etag=obj.get("etag", ""),
+            restore_event_data={
+                "lifecycleRestorationExpiryTime":
+                    _restore_expiry_iso(restore["expires_at"]),
+                "lifecycleRestoreStorageClass":
+                    obj.get("storage_class") or "GLACIER",
+            })
+
+    t = threading.Thread(target=ctx.run, args=(_worker,), daemon=True)
+    t.start()
+
+
+def _schedule_restore_expiry(bucket_name: str, key: str,
+                             expires_at: float) -> None:
+    """Fire s3:ObjectRestore:Delete when the temporary copy lapses.
+
+    Real S3 removes the restored copy and emits the event at expiry time, not
+    on the next read, so a non-polling consumer still hears it. The expires_at
+    stamp guards the sleep: an extension re-arms a new timer and the stale one
+    wakes, sees a different stamp, and exits. The lazy check in _sync_restore
+    stays as a belt-and-braces path for reads that race the timer."""
+    ctx = contextvars.copy_context()
+
+    def _worker():
+        delay = expires_at - time.time()
+        if delay > 0:
+            time.sleep(delay)
+        bucket = _buckets.get(bucket_name)
+        obj = bucket["objects"].get(key) if bucket else None
+        restore = (obj or {}).get("restore")
+        if not restore or restore.get("expires_at") != expires_at:
+            return
+        _sync_restore(bucket_name, key, obj)
+
+    t = threading.Thread(target=ctx.run, args=(_worker,), daemon=True)
+    t.start()
+
+
+def _restore_object(bucket_name: str, key: str, body: bytes) -> tuple:
+    bucket = _ensure_bucket(bucket_name)
+    if bucket is None:
+        return _no_such_bucket(bucket_name)
+    obj = bucket["objects"].get(key)
+    if obj is None:
+        return _error("NoSuchKey", "The specified key does not exist.",
+                      404, f"/{bucket_name}/{key}")
+
+    sc = obj.get("storage_class") or "STANDARD"
+    if sc == "GLACIER_IR":
+        # Real AWS distinguishes instant retrieval from active tiers here:
+        # restore on GLACIER_IR fails InvalidObjectState ("Restore is not
+        # allowed..."), not ObjectAlreadyInActiveTierError.
+        return _error(
+            "InvalidObjectState",
+            "Restore is not allowed for the object's current storage class.",
+            403, f"/{bucket_name}/{key}")
+    if sc not in _ARCHIVE_STORAGE_CLASSES:
+        return _error(
+            "ObjectAlreadyInActiveTierError",
+            "This action is not allowed against this storage tier.",
+            403, f"/{bucket_name}/{key}")
+
+    days = None
+    tier = "Standard"
+    if body:
+        try:
+            root = fromstring(body)
+        except ParseError:
+            return _error(
+                "MalformedXML",
+                "The XML you provided was not well-formed or did not "
+                "validate against our published schema",
+                400, f"/{bucket_name}/{key}")
+        for el in root.iter():
+            name = el.tag.rsplit("}", 1)[-1]
+            if name == "Days" and el.text:
+                try:
+                    days = int(el.text.strip())
+                except ValueError:
+                    days = None
+            elif name == "Tier" and el.text:
+                # Covers both GlacierJobParameters/Tier and top-level Tier.
+                tier = el.text.strip()
+    if days is None:
+        # The Days element is required for regular (non-select) restores.
+        return _error(
+            "MalformedXML",
+            "The XML you provided was not well-formed or did not validate "
+            "against our published schema",
+            400, f"/{bucket_name}/{key}")
+
+    now = time.time()
+    phase = _sync_restore(bucket_name, key, obj)
+    if phase == "in_progress":
+        return _error("RestoreAlreadyInProgress",
+                      "Object restore is already in progress.",
+                      409, f"/{bucket_name}/{key}")
+    if phase == "restored":
+        # Re-request while the copy is live: only the expiry moves, relative
+        # to now, and AWS answers 200 rather than 202.
+        obj["restore"]["expires_at"] = _restore_expiry_epoch(now, days)
+        obj["restore"]["days"] = days
+        _schedule_restore_expiry(bucket_name, key, obj["restore"]["expires_at"])
+        return 200, {}, b""
+
+    obj["restore"] = {
+        "requested_at": now,
+        "available_at": now + _RESTORE_DELAY_SECONDS,
+        "expires_at": _restore_expiry_epoch(now + _RESTORE_DELAY_SECONDS, days),
+        "days": days,
+        "tier": tier,
+        "completed_fired": False,
+    }
+    _fire_s3_event_async(bucket_name, key, "s3:ObjectRestore:Post",
+                         size=obj.get("size", 0), etag=obj.get("etag", ""))
+    _schedule_restore_completed(bucket_name, key, now)
+    _schedule_restore_expiry(bucket_name, key, obj["restore"]["expires_at"])
+    return 202, {}, b""
+
+
+def _reschedule_restores() -> None:
+    """Re-arm pending s3:ObjectRestore:Completed timers after a restart.
+
+    Invoked once at the end of module import, after persisted state loads:
+    a restore in flight when the process died fires on schedule, and one that
+    landed while the process was down (completed_fired still False) fires
+    immediately — the consumer it exists for wasn't polling. A copy that
+    lapsed entirely while down is left to the lazy sweep, which fires
+    s3:ObjectRestore:Delete on the next touch."""
+    try:
+        entries = list(_buckets._data.items())
+    except Exception:
+        return
+    now = time.time()
+    for (account_id, bucket_name), bucket in entries:
+        for key, obj in list((bucket.get("objects") or {}).items()):
+            restore = obj.get("restore")
+            if not restore:
+                continue
+            # The workers copy their context at schedule time, so pin the
+            # owning account around the calls (#876 shape).
+            set_request_account_id(account_id)
+            try:
+                if now >= restore["expires_at"]:
+                    # Lapsed while down: revert to archived and fire :Delete.
+                    _sync_restore(bucket_name, key, obj)
+                    continue
+                if not restore.get("completed_fired"):
+                    _schedule_restore_completed(bucket_name, key,
+                                                restore["requested_at"])
+                _schedule_restore_expiry(bucket_name, key,
+                                         restore["expires_at"])
+            finally:
+                set_request_account_id("")
 
 
 # ---------------------------------------------------------------------------
@@ -1119,6 +1365,16 @@ def _object_response_headers(obj: dict, bucket_name: str = "", key: str = "",
     if sc != "STANDARD":
         # AWS omits the header for STANDARD; SDKs default to STANDARD when absent.
         h["x-amz-storage-class"] = sc
+    restore = obj.get("restore")
+    if restore:
+        now = time.time()
+        if now < restore["available_at"]:
+            h["x-amz-restore"] = 'ongoing-request="true"'
+        elif now < restore["expires_at"]:
+            expiry = time.strftime("%a, %d %b %Y %H:%M:%S GMT",
+                                   time.gmtime(restore["expires_at"]))
+            h["x-amz-restore"] = (
+                f'ongoing-request="false", expiry-date="{expiry}"')
     if bucket_name and key:
         retention = _object_retention.get((bucket_name, key))
         if retention:
@@ -1360,6 +1616,8 @@ def _dispatch(
             return _put_object(bucket, key, body, headers)
 
         if method == "POST":
+            if "restore" in query_params:
+                return _restore_object(bucket, key, body)
             if "uploads" in query_params:
                 return _create_multipart_upload(bucket, key, headers)
             if "uploadId" in query_params:
@@ -2641,6 +2899,13 @@ _S3_EVENTBRIDGE_DETAIL_TYPE = {
     "ObjectCreated": "Object Created",
     "ObjectRemoved": "Object Deleted",
 }
+# The restore family is the one family whose events map to distinct
+# detail-types (and whose details carry no `reason` field).
+_S3_EVENTBRIDGE_EVENT_DETAIL_TYPE = {
+    "ObjectRestore:Post": "Object Restore Initiated",
+    "ObjectRestore:Completed": "Object Restore Completed",
+    "ObjectRestore:Delete": "Object Restore Expired",
+}
 # `reason` reflects the S3 API that produced the event.
 _S3_EVENTBRIDGE_REASON = {
     "Put": "PutObject",
@@ -2651,13 +2916,17 @@ _S3_EVENTBRIDGE_REASON = {
 }
 
 
-def _s3_event_to_eventbridge(event_name: str) -> tuple[str, str]:
+def _s3_event_to_eventbridge(event_name: str) -> tuple[str, str | None]:
     """Map an S3 notification event name (e.g. ``s3:ObjectCreated:Put``) to the EventBridge
-    ``detail-type`` and ``reason`` Amazon S3 emits. The detail-type is per-family, so any
-    sub-action of a family collapses to the same type, exactly as real S3 does."""
+    ``detail-type`` and ``reason`` Amazon S3 emits. Created/Removed collapse per family
+    exactly as real S3 does; the restore events each carry their own detail-type and no
+    reason."""
     parts = event_name.split(":")
     family = parts[1] if len(parts) > 1 else ""
     action = parts[2] if len(parts) > 2 else ""
+    per_event = _S3_EVENTBRIDGE_EVENT_DETAIL_TYPE.get(f"{family}:{action}")
+    if per_event is not None:
+        return per_event, None
     detail_type = _S3_EVENTBRIDGE_DETAIL_TYPE.get(family, "Object Created")
     reason = _S3_EVENTBRIDGE_REASON.get(
         action, "DeleteObject" if family == "ObjectRemoved" else "PutObject"
@@ -2672,6 +2941,7 @@ def _fire_s3_event(
     size: int = 0,
     etag: str = "",
     deletion_type: str | None = None,
+    restore_event_data: dict | None = None,
 ) -> None:
     """Build and deliver an S3 event notification. Best-effort — errors are logged."""
     try:
@@ -2719,6 +2989,11 @@ def _fire_s3_event(
                 }
             ],
         }
+        if restore_event_data:
+            # glacierEventData appears only on s3:ObjectRestore:Completed.
+            event_payload["Records"][0]["glacierEventData"] = {
+                "restoreEventData": restore_event_data,
+            }
 
         for cfg in configs:
             try:
@@ -2758,8 +3033,9 @@ def _fire_s3_event(
                     "request-id": request_id,
                     "requester": get_account_id(),
                     "source-ip-address": "127.0.0.1",
-                    "reason": reason,
                 }
+                if reason is not None:
+                    detail["reason"] = reason
                 if detail_type == "Object Deleted":
                     # AWS always carries a deletion-type on Object Deleted; default to the
                     # unversioned/permanent case unless the caller created a delete marker.
@@ -3335,6 +3611,18 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
                 sse_gate = _check_sse_read_headers(headers, vobj)
                 if sse_gate is not None:
                     return sse_gate
+                vsc = vobj.get("storage_class") or "STANDARD"
+                if vsc in _ARCHIVE_STORAGE_CLASSES:
+                    # Restore state lives on the current object record;
+                    # noncurrent archived versions are simply unreadable
+                    # (restore-by-versionId is not implemented).
+                    cur = bucket["objects"].get(key)
+                    cur_phase = (
+                        _sync_restore(bucket_name, key, cur)
+                        if cur is not None and cur.get("version_id") == version_id
+                        else None)
+                    if cur_phase != "restored":
+                        return _invalid_object_state(bucket_name, key, vsc)
                 resp_headers = _object_response_headers(
                     vobj, bucket_name, key, include_checksums=include_checksums)
                 resp_headers.update(_object_tagging_count_header(bucket_name, key, version_id))
@@ -3362,6 +3650,12 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
     sse_gate = _check_sse_read_headers(headers, obj)
     if sse_gate is not None:
         return sse_gate
+    restore_phase = _sync_restore(bucket_name, key, obj)
+    sc = obj.get("storage_class") or "STANDARD"
+    if sc in _ARCHIVE_STORAGE_CLASSES and restore_phase != "restored":
+        # Archived objects are unreadable until a restore lands; HeadObject
+        # deliberately keeps working — that asymmetry is how callers poll.
+        return _invalid_object_state(bucket_name, key, sc)
     range_header = headers.get("range", "")
     # AWS returns whole-object checksums only on full-object responses (HTTP
     # 200). On a 206 Partial Content reply the bytes are a slice, and a
@@ -3584,6 +3878,9 @@ def _head_object(bucket_name: str, key: str, headers: dict | None = None,
             err_headers.update(_delete_marker_404_headers(bucket_name, key))
             return status, err_headers, err_body
         obj = bucket["objects"][key]
+        # Lazily lapse an expired restore so the x-amz-restore header (and the
+        # s3:ObjectRestore:Delete event) reflect reality on the poll path.
+        _sync_restore(bucket_name, key, obj)
 
     sse_gate = _check_sse_read_headers(headers, obj)
     if sse_gate is not None:
@@ -5992,3 +6289,8 @@ def reset():
         _object_versions,
     ):
         d.clear()
+
+
+# Re-arm restore-completion timers for state loaded from disk. Must run after
+# every function above is defined: the workers resolve _fire_s3_event by name.
+_reschedule_restores()

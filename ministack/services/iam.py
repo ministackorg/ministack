@@ -622,6 +622,45 @@ def _delete_role_permissions_boundary(p):
 
 # -------------------- Managed policy management --------------------
 
+def store_policy(arn: str, name: str, path: str, document, *,
+                 description: str = "", tags=None) -> dict:
+    """Create and store a customer-managed policy record, and return it.
+
+    The record shape is not incidental: ``Versions`` is a dict keyed by version
+    id because GetPolicyVersion, CreatePolicyVersion, DeletePolicyVersion and
+    ListPolicyVersions all index it that way. Writers outside this module (the
+    CloudFormation provisioners) build policies through here rather than
+    assembling the dict themselves, which is what keeps those four operations
+    working on a CFN-created policy.
+    """
+    version_id = "v1"
+    if not isinstance(document, str):
+        document = json.dumps(document)
+    record = {
+        "PolicyName": name,
+        "Arn": arn,
+        "PolicyId": _gen_id("ANPA"),
+        "CreateDate": _now(),
+        "UpdateDate": _now(),
+        "DefaultVersionId": version_id,
+        "AttachmentCount": 0,
+        "IsAttachable": True,
+        "Path": path,
+        "Description": description,
+        "Tags": list(tags or []),
+        "Versions": {
+            version_id: {
+                "Document": document,
+                "VersionId": version_id,
+                "IsDefaultVersion": True,
+                "CreateDate": _now(),
+            }
+        },
+    }
+    _policies[arn] = record
+    return record
+
+
 def _create_policy(p):
     name = _p(p, "PolicyName")
     path = _p(p, "Path") or "/"
@@ -641,29 +680,7 @@ def _create_policy(p):
     description = _p(p, "Description", "")
     # #445 (follow-up): CreatePolicy accepts Tags — honour them on create.
     create_tags = _extract_tags(p)
-    policy_id = _gen_id("ANPA")
-    version_id = "v1"
-    _policies[arn] = {
-        "PolicyName": name,
-        "Arn": arn,
-        "PolicyId": policy_id,
-        "CreateDate": _now(),
-        "UpdateDate": _now(),
-        "DefaultVersionId": version_id,
-        "AttachmentCount": 0,
-        "IsAttachable": True,
-        "Path": path,
-        "Description": description,
-        "Tags": list(create_tags or []),
-        "Versions": {
-            version_id: {
-                "Document": doc,
-                "VersionId": version_id,
-                "IsDefaultVersion": True,
-                "CreateDate": _now(),
-            }
-        },
-    }
+    store_policy(arn, name, path, doc, description=description, tags=create_tags)
     return _xml(200, "CreatePolicyResponse",
                 f"<CreatePolicyResult><Policy>{_managed_policy_xml(arn)}</Policy></CreatePolicyResult>",
                 ns="iam")
@@ -865,6 +882,28 @@ def _list_entities_for_policy(p):
 
 # -------------------- Attached role policies --------------------
 
+def attach_managed_policy(entity: dict, policy_arn: str) -> None:
+    """Attach a managed policy to a role, user or group record.
+
+    ``AttachedPolicies`` holds bare ARN strings. Every consumer reads it that
+    way — GetAccountAuthorizationDetails and ListAttachedRolePolicies feed the
+    entries to _lookup_policy, and ListEntitiesForPolicy tests membership with
+    ``arn in ...`` — so a writer that stores anything else breaks all three.
+    Callers outside this module (the CloudFormation provisioner) go through
+    here rather than appending themselves, which is also what keeps
+    AttachmentCount in step with the API path.
+    """
+    if policy_arn in entity.setdefault("AttachedPolicies", []):
+        return
+    entity["AttachedPolicies"].append(policy_arn)
+    if _is_aws_managed_arn(policy_arn):
+        _bump_aws_managed_attachment(policy_arn, +1)
+    else:
+        pol = _policies.get(policy_arn)
+        if pol:
+            pol["AttachmentCount"] = pol.get("AttachmentCount", 0) + 1
+
+
 def _attach_role_policy(p):
     role_name = _p(p, "RoleName")
     policy_arn = _p(p, "PolicyArn")
@@ -872,14 +911,7 @@ def _attach_role_policy(p):
     if not role:
         return _error(404, "NoSuchEntity",
                       f"Role {role_name} not found.", ns="iam")
-    if policy_arn not in role["AttachedPolicies"]:
-        role["AttachedPolicies"].append(policy_arn)
-        if _is_aws_managed_arn(policy_arn):
-            _bump_aws_managed_attachment(policy_arn, +1)
-        else:
-            pol = _policies.get(policy_arn)
-            if pol:
-                pol["AttachmentCount"] = pol.get("AttachmentCount", 0) + 1
+    attach_managed_policy(role, policy_arn)
     return _xml(200, "AttachRolePolicyResponse", "", ns="iam")
 
 
@@ -1947,12 +1979,16 @@ def _get_account_authorization_details(p):
             # Attached managed policies
             attached_xml = ""
             for arn in user.get("AttachedPolicies", []):
+                # The attachment is reported whether or not the policy document
+                # is readable here: AWS lists it either way, and an unseeded
+                # AWS-managed ARN has no local record unless autovivify is on.
+                # Same fallback ListAttachedRolePolicies already uses.
                 pol = _lookup_policy(arn)
-                if pol:
-                    attached_xml += (f"<member>"
-                                     f"<PolicyName>{pol['PolicyName']}</PolicyName>"
-                                     f"<PolicyArn>{arn}</PolicyArn>"
-                                     f"</member>")
+                pname = pol["PolicyName"] if pol else arn.rsplit("/", 1)[-1]
+                attached_xml += (f"<member>"
+                                 f"<PolicyName>{pname}</PolicyName>"
+                                 f"<PolicyArn>{arn}</PolicyArn>"
+                                 f"</member>")
             # Groups the user belongs to
             group_xml = "".join(
                 f"<member>{g['GroupName']}</member>"
@@ -1994,12 +2030,16 @@ def _get_account_authorization_details(p):
             # Attached managed policies
             attached_xml = ""
             for arn in g.get("AttachedPolicies", []):
+                # The attachment is reported whether or not the policy document
+                # is readable here: AWS lists it either way, and an unseeded
+                # AWS-managed ARN has no local record unless autovivify is on.
+                # Same fallback ListAttachedRolePolicies already uses.
                 pol = _lookup_policy(arn)
-                if pol:
-                    attached_xml += (f"<member>"
-                                     f"<PolicyName>{pol['PolicyName']}</PolicyName>"
-                                     f"<PolicyArn>{arn}</PolicyArn>"
-                                     f"</member>")
+                pname = pol["PolicyName"] if pol else arn.rsplit("/", 1)[-1]
+                attached_xml += (f"<member>"
+                                 f"<PolicyName>{pname}</PolicyName>"
+                                 f"<PolicyArn>{arn}</PolicyArn>"
+                                 f"</member>")
             group_detail_xml += (
                 f"<member>"
                 f"<GroupName>{g['GroupName']}</GroupName>"
@@ -2028,12 +2068,16 @@ def _get_account_authorization_details(p):
             # Attached managed policies
             attached_xml = ""
             for arn in role.get("AttachedPolicies", []):
+                # The attachment is reported whether or not the policy document
+                # is readable here: AWS lists it either way, and an unseeded
+                # AWS-managed ARN has no local record unless autovivify is on.
+                # Same fallback ListAttachedRolePolicies already uses.
                 pol = _lookup_policy(arn)
-                if pol:
-                    attached_xml += (f"<member>"
-                                     f"<PolicyName>{pol['PolicyName']}</PolicyName>"
-                                     f"<PolicyArn>{arn}</PolicyArn>"
-                                     f"</member>")
+                pname = pol["PolicyName"] if pol else arn.rsplit("/", 1)[-1]
+                attached_xml += (f"<member>"
+                                 f"<PolicyName>{pname}</PolicyName>"
+                                 f"<PolicyArn>{arn}</PolicyArn>"
+                                 f"</member>")
             # Instance profiles
             ip_xml = "".join(
                 f"<member>{_instance_profile_xml(ipn)}</member>"
