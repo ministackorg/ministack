@@ -5851,6 +5851,11 @@ def _generate_temp_password() -> str:
     return "".join(password)
 
 
+# Attributes that AWS documents as case-sensitive in the ListUsers Filter; all
+# other searchable attributes match case-insensitively.
+_CASE_SENSITIVE_FILTER_ATTRIBUTES = {"username", "status"}
+
+
 def _apply_user_filter(users: list, filter_str: str) -> list:
     """
     Supports Cognito filter syntax:
@@ -5858,12 +5863,18 @@ def _apply_user_filter(users: list, filter_str: str) -> list:
       attribute_name = "value"     (unquoted, kept for backward compatibility)
       attribute_name ^= "value"    (starts with)
       attribute_name != "value"
+
+    Attribute names are case-sensitive. Value matching is case-insensitive for
+    most searchable attributes, but the ListUsers API reference documents
+    "username" and "status" as case-sensitive.
     """
     m = re.match(r'"?(\w+)"?\s*(=|\^=|!=)\s*"([^"]*)"', filter_str.strip())
     if not m:
         logger.warning("Cognito: ListUsers Filter could not be parsed, ignoring: %r", filter_str)
         return users
     attr_name, op, value = m.group(1), m.group(2), m.group(3)
+    case_sensitive = attr_name in _CASE_SENSITIVE_FILTER_ATTRIBUTES
+    value_key = value if case_sensitive else value.casefold()
     result = []
     for user in users:
         attr_dict = _attr_list_to_dict(user.get("Attributes", []))
@@ -5879,11 +5890,12 @@ def _apply_user_filter(users: list, filter_str: str) -> list:
             field_val = "Enabled" if user.get("Enabled", True) else "Disabled"
         elif attr_name == "email_verified":
             field_val = attr_dict.get("email_verified", "")
-        if op == "=" and field_val == value:
+        field_key = field_val if case_sensitive else field_val.casefold()
+        if op == "=" and field_key == value_key:
             result.append(user)
-        elif op == "^=" and field_val.startswith(value):
+        elif op == "^=" and field_key.startswith(value_key):
             result.append(user)
-        elif op == "!=" and field_val != value:
+        elif op == "!=" and field_key != value_key:
             result.append(user)
     return result
 

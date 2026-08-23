@@ -454,6 +454,10 @@ def _cloudfront_resource_exists(spec: Arn, arn: str) -> bool:
     import ministack.services.cloudfront as svc
     if spec.resource.startswith("distribution/"):
         return _resource_tail(spec, arn, "distribution/") in svc._distributions
+    if spec.resource.startswith("distribution-tenant/"):
+        return _resource_tail(spec, arn, "distribution-tenant/") in svc._distribution_tenants
+    if spec.resource.startswith("connection-group/"):
+        return _resource_tail(spec, arn, "connection-group/") in svc._connection_groups
     if spec.resource.startswith("function/"):
         return _resource_tail(spec, arn, "function/") in svc._functions
     if spec.resource.startswith("key-value-store/"):

@@ -24,6 +24,20 @@ Supports:
                  GetResponseHeadersPolicyConfig, UpdateResponseHeadersPolicy,
                  DeleteResponseHeadersPolicy, ListDistributionsByResponseHeadersPolicyId
   Tags: TagResource, UntagResource, ListTagsForResource
+  SaaS Manager (multi-tenant distributions):
+                 CreateConnectionGroup, GetConnectionGroup,
+                 GetConnectionGroupByRoutingEndpoint, UpdateConnectionGroup,
+                 DeleteConnectionGroup, ListConnectionGroups,
+                 CreateDistributionTenant, GetDistributionTenant,
+                 GetDistributionTenantByDomain, UpdateDistributionTenant,
+                 DeleteDistributionTenant, ListDistributionTenants,
+                 ListDistributionTenantsByCustomization,
+                 AssociateDistributionTenantWebACL, DisassociateDistributionTenantWebACL,
+                 CreateInvalidationForDistributionTenant,
+                 GetInvalidationForDistributionTenant, ListInvalidationsForDistributionTenant,
+                 VerifyDnsConfiguration, GetManagedCertificateDetails,
+                 ListDomainConflicts, UpdateDomainAssociation,
+                 ListDistributionsByConnectionMode
 """
 
 import base64
@@ -34,6 +48,7 @@ import random
 import re
 import string
 from datetime import datetime, timezone
+from urllib.parse import unquote
 from xml.etree.ElementTree import Element, SubElement, tostring
 
 from defusedxml.ElementTree import fromstring
@@ -84,6 +99,27 @@ _RHP_CFG_RE = re.compile(r"^/2020-05-31/response-headers-policy/([^/]+)/config$"
 _RHP_ID_RE = re.compile(r"^/2020-05-31/response-headers-policy/([^/]+)/?$")
 _DIST_BY_RHP_RE = re.compile(r"^/2020-05-31/distributionsByResponseHeadersPolicyId/([^/]+)/?$")
 
+# SaaS Manager path regexes. Get* identifiers may be an ARN — the ASGI layer
+# hands us the percent-decoded path, so an ARN's embedded "/" lands in the
+# identifier segment. The identifier regexes are greedy and MUST be matched
+# after the tenant sub-resource regexes (web-acl, invalidation).
+_CONN_GROUP_RE = re.compile(r"^/2020-05-31/connection-group/?$")
+_CONN_GROUP_ID_RE = re.compile(r"^/2020-05-31/connection-group/(.+?)/?$")
+_CONN_GROUPS_LIST_RE = re.compile(r"^/2020-05-31/connection-groups/?$")
+_TENANT_RE = re.compile(r"^/2020-05-31/distribution-tenant/?$")
+_TENANT_WEBACL_ASSOC_RE = re.compile(r"^/2020-05-31/distribution-tenant/([^/]+)/associate-web-acl/?$")
+_TENANT_WEBACL_DISASSOC_RE = re.compile(r"^/2020-05-31/distribution-tenant/([^/]+)/disassociate-web-acl/?$")
+_TENANT_INV_RE = re.compile(r"^/2020-05-31/distribution-tenant/([^/]+)/invalidation/?$")
+_TENANT_INV_ID_RE = re.compile(r"^/2020-05-31/distribution-tenant/([^/]+)/invalidation/([^/]+)$")
+_TENANT_ID_RE = re.compile(r"^/2020-05-31/distribution-tenant/(.+?)/?$")
+_TENANTS_LIST_RE = re.compile(r"^/2020-05-31/distribution-tenants/?$")
+_TENANTS_BY_CUSTOMIZATION_RE = re.compile(r"^/2020-05-31/distribution-tenants-by-customization/?$")
+_MANAGED_CERT_RE = re.compile(r"^/2020-05-31/managed-certificate/(.+?)/?$")
+_VERIFY_DNS_RE = re.compile(r"^/2020-05-31/verify-dns-configuration/?$")
+_DOMAIN_CONFLICTS_RE = re.compile(r"^/2020-05-31/domain-conflicts/?$")
+_DOMAIN_ASSOCIATION_RE = re.compile(r"^/2020-05-31/domain-association/?$")
+_DIST_BY_CONN_MODE_RE = re.compile(r"^/2020-05-31/distributionsByConnectionMode/([^/]+)/?$")
+
 # ---------------------------------------------------------------------------
 # Read-only surface for resource families MiniStack does not yet persist.
 # These return AWS-shaped empty collections so the SDK gets a valid response
@@ -116,6 +152,9 @@ _kvstores = AccountScopedDict()  # Name -> KVS record
 _cache_policies = AccountScopedDict()  # Id -> cache policy record
 _origin_request_policies = AccountScopedDict()  # Id -> origin request policy record
 _response_headers_policies = AccountScopedDict()  # Id -> response headers policy record
+_connection_groups = AccountScopedDict()  # Id -> connection group record (SaaS Manager)
+_distribution_tenants = AccountScopedDict()  # Id -> distribution tenant record (SaaS Manager)
+_tenant_invalidations = AccountScopedDict()  # tenant_id -> [invalidation record, ...]
 
 
 def reset():
@@ -128,6 +167,9 @@ def reset():
     _cache_policies.clear()
     _origin_request_policies.clear()
     _response_headers_policies.clear()
+    _connection_groups.clear()
+    _distribution_tenants.clear()
+    _tenant_invalidations.clear()
 
 
 def get_state():
@@ -142,6 +184,9 @@ def get_state():
             "cache_policies": _cache_policies,
             "origin_request_policies": _origin_request_policies,
             "response_headers_policies": _response_headers_policies,
+            "connection_groups": _connection_groups,
+            "distribution_tenants": _distribution_tenants,
+            "tenant_invalidations": _tenant_invalidations,
         }
     )
 
@@ -156,6 +201,9 @@ def restore_state(data):
     _cache_policies.update(data.get("cache_policies", {}))
     _origin_request_policies.update(data.get("origin_request_policies", {}))
     _response_headers_policies.update(data.get("response_headers_policies", {}))
+    _connection_groups.update(data.get("connection_groups", {}))
+    _distribution_tenants.update(data.get("distribution_tenants", {}))
+    _tenant_invalidations.update(data.get("tenant_invalidations", {}))
 
 
 try:
@@ -180,6 +228,22 @@ def _dist_id() -> str:
 
 def _inv_id() -> str:
     return "I" + "".join(random.choices(_ID_CHARS, k=13))
+
+
+# Real SaaS Manager resource IDs are dt_/cg_-prefixed KSUIDs (27 base62 chars).
+_KSUID_CHARS = string.ascii_letters + string.digits
+
+
+def _tenant_id() -> str:
+    return "dt_" + "".join(random.choices(_KSUID_CHARS, k=27))
+
+
+def _conn_group_id() -> str:
+    return "cg_" + "".join(random.choices(_KSUID_CHARS, k=27))
+
+
+def _routing_endpoint() -> str:
+    return "d" + "".join(random.choices(string.ascii_lowercase + string.digits, k=13)) + ".cloudfront.net"
 
 
 def _now_iso() -> str:
@@ -453,6 +517,8 @@ def _resolve_taggable_cloudfront_arn(arn: str):
         "distribution": (_distributions, "NoSuchDistribution", "The specified distribution does not exist.", "ARN"),
         "function": (_functions, "NoSuchFunctionExists", "The specified function does not exist.", "arn"),
         "key-value-store": (_kvstores, "EntityNotFound", f"The key value store {name} was not found.", "ARN"),
+        "distribution-tenant": (_distribution_tenants, "EntityNotFound", "The distribution tenant was not found.", "Arn"),
+        "connection-group": (_connection_groups, "EntityNotFound", "The connection group was not found.", "Arn"),
     }
     entry = resources.get(resource_type)
     if not entry:
@@ -1751,6 +1817,104 @@ async def handle_request(method, path, headers, body, query_params):
         if method == "GET":
             return _list_kvstores(query_params)
 
+    # SaaS Manager routes. Tenant sub-resource routes must be matched before
+    # the greedy _TENANT_ID_RE / _CONN_GROUP_ID_RE identifier routes.
+    m = _TENANT_WEBACL_ASSOC_RE.match(path)
+    if m:
+        if method == "PUT":
+            return _associate_tenant_webacl(m.group(1), headers, body)
+
+    m = _TENANT_WEBACL_DISASSOC_RE.match(path)
+    if m:
+        if method == "PUT":
+            return _disassociate_tenant_webacl(m.group(1), headers)
+
+    m = _TENANT_INV_ID_RE.match(path)
+    if m:
+        if method == "GET":
+            return _get_tenant_invalidation(m.group(1), m.group(2))
+
+    m = _TENANT_INV_RE.match(path)
+    if m:
+        if method == "POST":
+            return _create_tenant_invalidation(m.group(1), body)
+        if method == "GET":
+            return _list_tenant_invalidations(m.group(1))
+
+    m = _TENANT_RE.match(path)
+    if m:
+        if method == "POST":
+            return _create_distribution_tenant(body)
+        if method == "GET":
+            return _get_distribution_tenant_by_domain(query_params)
+
+    m = _TENANTS_BY_CUSTOMIZATION_RE.match(path)
+    if m:
+        if method == "POST":
+            return _list_distribution_tenants_by_customization(body)
+
+    m = _TENANTS_LIST_RE.match(path)
+    if m:
+        if method == "POST":
+            return _list_distribution_tenants(body)
+
+    m = _TENANT_ID_RE.match(path)
+    if m:
+        identifier = m.group(1)
+        if method == "GET":
+            return _get_distribution_tenant(identifier)
+        if method == "PUT":
+            return _update_distribution_tenant(identifier, headers, body)
+        if method == "DELETE":
+            return _delete_distribution_tenant(identifier, headers)
+
+    m = _CONN_GROUP_RE.match(path)
+    if m:
+        if method == "POST":
+            return _create_connection_group(body)
+        if method == "GET":
+            return _get_connection_group_by_routing_endpoint(query_params)
+
+    m = _CONN_GROUPS_LIST_RE.match(path)
+    if m:
+        if method == "POST":
+            return _list_connection_groups(body)
+
+    m = _CONN_GROUP_ID_RE.match(path)
+    if m:
+        identifier = m.group(1)
+        if method == "GET":
+            return _get_connection_group(identifier)
+        if method == "PUT":
+            return _update_connection_group(identifier, headers, body)
+        if method == "DELETE":
+            return _delete_connection_group(identifier, headers)
+
+    m = _MANAGED_CERT_RE.match(path)
+    if m:
+        if method == "GET":
+            return _get_managed_certificate_details(m.group(1))
+
+    m = _VERIFY_DNS_RE.match(path)
+    if m:
+        if method == "POST":
+            return _verify_dns_configuration(body)
+
+    m = _DOMAIN_CONFLICTS_RE.match(path)
+    if m:
+        if method == "POST":
+            return _list_domain_conflicts(body)
+
+    m = _DOMAIN_ASSOCIATION_RE.match(path)
+    if m:
+        if method == "POST":
+            return _update_domain_association(headers, body)
+
+    m = _DIST_BY_CONN_MODE_RE.match(path)
+    if m:
+        if method == "GET":
+            return _list_distributions_by_connection_mode(m.group(1))
+
     # Read-only list surface for resource families with no backing store.
     # Family split matches botocore: KeyGroupList-style carry no Marker/
     # IsTruncated; the OAI/StreamingDistribution/VpcOrigin family does.
@@ -1888,43 +2052,63 @@ def _get_distribution_config(dist_id):
     return 200, {"Content-Type": "text/xml", "ETag": dist["ETag"]}, body
 
 
+def _dist_config_el(dist):
+    """Parsed DistributionConfig element for a stored distribution.
+
+    CloudFormation-provisioned records carry an empty ``config_xml``; parse
+    defensively so account-wide scans never fail on them."""
+    xml = dist.get("config_xml")
+    if xml:
+        try:
+            return fromstring(xml)
+        except Exception:
+            pass
+    return Element("DistributionConfig")
+
+
+def _dist_connection_mode(dist) -> str:
+    """A distribution's ConnectionMode; absent in the stored config means direct."""
+    return _text(_dist_config_el(dist), "ConnectionMode") or "direct"
+
+
+def _build_distribution_list_xml(root, items):
+    SubElement(root, "Marker").text = ""
+    SubElement(root, "MaxItems").text = "100"
+    SubElement(root, "IsTruncated").text = "false"
+    SubElement(root, "Quantity").text = str(len(items))
+    if items:
+        items_el = SubElement(root, "Items")
+        for dist in items:
+            ds = SubElement(items_el, "DistributionSummary")
+            SubElement(ds, "Id").text = dist["Id"]
+            SubElement(ds, "ARN").text = dist["ARN"]
+            SubElement(ds, "Status").text = dist["Status"]
+            SubElement(ds, "LastModifiedTime").text = dist["LastModifiedTime"]
+            SubElement(ds, "DomainName").text = dist["DomainName"]
+            config_el = _dist_config_el(dist)
+            # Field order matches real AWS DistributionSummary shape so
+            # SDKs that strict-parse (Go v2, Java v2) don't reject it.
+            # All 19 fields below are REQUIRED per botocore service-2.json.
+            _add_config_block_with_default(ds, config_el, "Aliases")
+            _add_config_block_with_default(ds, config_el, "Origins")
+            _add_config_block_with_default(ds, config_el, "DefaultCacheBehavior")
+            _add_config_block_with_default(ds, config_el, "CacheBehaviors")
+            _add_config_block_with_default(ds, config_el, "CustomErrorResponses")
+            SubElement(ds, "Comment").text = _text(config_el, "Comment") or ""
+            SubElement(ds, "PriceClass").text = _text(config_el, "PriceClass") or "PriceClass_All"
+            SubElement(ds, "Enabled").text = str(dist["enabled"]).lower()
+            _add_config_block_with_default(ds, config_el, "ViewerCertificate")
+            _add_config_block_with_default(ds, config_el, "Restrictions")
+            SubElement(ds, "WebACLId").text = _text(config_el, "WebACLId") or ""
+            SubElement(ds, "HttpVersion").text = _text(config_el, "HttpVersion") or "http2"
+            SubElement(ds, "IsIPV6Enabled").text = (_text(config_el, "IsIPV6Enabled") or "true").lower()
+            SubElement(ds, "Staging").text = str(dist.get("Staging", False)).lower()
+            SubElement(ds, "ConnectionMode").text = _text(config_el, "ConnectionMode") or "direct"
+
+
 def _list_distributions():
     items = list(_distributions.values())
-
-    def build(root):
-        SubElement(root, "Marker").text = ""
-        SubElement(root, "MaxItems").text = "100"
-        SubElement(root, "IsTruncated").text = "false"
-        SubElement(root, "Quantity").text = str(len(items))
-        if items:
-            items_el = SubElement(root, "Items")
-            for dist in items:
-                ds = SubElement(items_el, "DistributionSummary")
-                SubElement(ds, "Id").text = dist["Id"]
-                SubElement(ds, "ARN").text = dist["ARN"]
-                SubElement(ds, "Status").text = dist["Status"]
-                SubElement(ds, "LastModifiedTime").text = dist["LastModifiedTime"]
-                SubElement(ds, "DomainName").text = dist["DomainName"]
-                config_el = fromstring(dist["config_xml"])
-                # Field order matches real AWS DistributionSummary shape so
-                # SDKs that strict-parse (Go v2, Java v2) don't reject it.
-                # All 19 fields below are REQUIRED per botocore service-2.json.
-                _add_config_block_with_default(ds, config_el, "Aliases")
-                _add_config_block_with_default(ds, config_el, "Origins")
-                _add_config_block_with_default(ds, config_el, "DefaultCacheBehavior")
-                _add_config_block_with_default(ds, config_el, "CacheBehaviors")
-                _add_config_block_with_default(ds, config_el, "CustomErrorResponses")
-                SubElement(ds, "Comment").text = _text(config_el, "Comment") or ""
-                SubElement(ds, "PriceClass").text = _text(config_el, "PriceClass") or "PriceClass_All"
-                SubElement(ds, "Enabled").text = str(dist["enabled"]).lower()
-                _add_config_block_with_default(ds, config_el, "ViewerCertificate")
-                _add_config_block_with_default(ds, config_el, "Restrictions")
-                SubElement(ds, "WebACLId").text = _text(config_el, "WebACLId") or ""
-                SubElement(ds, "HttpVersion").text = _text(config_el, "HttpVersion") or "http2"
-                SubElement(ds, "IsIPV6Enabled").text = (_text(config_el, "IsIPV6Enabled") or "true").lower()
-                SubElement(ds, "Staging").text = str(dist.get("Staging", False)).lower()
-
-    return _xml_response("DistributionList", build)
+    return _xml_response("DistributionList", lambda root: _build_distribution_list_xml(root, items))
 
 
 def _update_distribution(dist_id, headers, body):
@@ -1978,6 +2162,13 @@ def _delete_distribution(dist_id, headers):
     if dist["enabled"]:
         return _error(
             "DistributionNotDisabled", "The distribution you are trying to delete has not been disabled.", 409
+        )
+
+    if any(t["DistributionId"] == dist_id for t in _distribution_tenants.values()):
+        return _error(
+            "ResourceInUse",
+            "The distribution has distribution tenants associated with it and cannot be deleted.",
+            409,
         )
 
     del _distributions[dist_id]
@@ -2493,3 +2684,1029 @@ def _delete_kvs(name, headers):
 
     logger.info("DeleteKeyValueStore name=%s", name)
     return 204, {}, b""
+
+
+# ---------------------------------------------------------------------------
+# SaaS Manager — connection groups and distribution tenants.
+# Shapes verified against botocore cloudfront service-2.json (2020-05-31):
+# result shapes without a payload member use an <OperationNameResult> root;
+# payload results use the payload shape name as root. Non-flattened lists
+# without a member locationName (Domains, Parameters, ValidationTokenDetails)
+# serialize items as <member>; named ones use their locationName.
+# MiniStack collapses async workflows: resources deploy, domains activate,
+# and managed certificates issue immediately.
+# ---------------------------------------------------------------------------
+
+_CONNECTION_MODES = {"direct", "tenant-only"}
+_WEBACL_CUSTOMIZATION_ACTIONS = {"override", "disable"}
+_VALIDATION_TOKEN_HOSTS = {"cloudfront", "self-hosted"}
+
+
+def _tenant_arn(tenant_id: str) -> str:
+    return f"arn:aws:cloudfront::{get_account_id()}:distribution-tenant/{tenant_id}"
+
+
+def _conn_group_arn(cg_id: str) -> str:
+    return f"arn:aws:cloudfront::{get_account_id()}:connection-group/{cg_id}"
+
+
+def _find_connection_group(identifier: str):
+    """Resolve a connection group by ID, name, or ARN (per AWS docs)."""
+    identifier = unquote(identifier or "")
+    cg = _connection_groups.get(identifier)
+    if cg:
+        return cg
+    for cg in _connection_groups.values():
+        if cg["Name"] == identifier or cg["Arn"] == identifier:
+            return cg
+    return None
+
+
+def _find_distribution_tenant(identifier: str):
+    """Resolve a distribution tenant by ID, name, or ARN (per AWS docs)."""
+    identifier = unquote(identifier or "")
+    tenant = _distribution_tenants.get(identifier)
+    if tenant:
+        return tenant
+    for tenant in _distribution_tenants.values():
+        if tenant["Name"] == identifier or tenant["Arn"] == identifier:
+            return tenant
+    return None
+
+
+def _domains_overlap(a: str, b: str) -> bool:
+    """Case-insensitive match; a leading ``*.`` wildcard covers exactly one label."""
+    a, b = (a or "").lower(), (b or "").lower()
+    if a == b:
+        return True
+
+    def covers(wild, host):
+        if not wild.startswith("*."):
+            return False
+        suffix = wild[2:]
+        return host.endswith("." + suffix) and "." not in host[: -len(suffix) - 1]
+
+    return covers(a, b) or covers(b, a)
+
+
+def _domain_owners(domain: str, wildcard_overlap: bool = False):
+    """All (resource_type, resource_id) pairs currently claiming ``domain``.
+
+    Scans tenant domains and distribution alias CNAMEs, case-insensitively —
+    CloudFront treats CNAMEs as globally unique across both families.
+    ``wildcard_overlap`` additionally counts single-level wildcard overlaps
+    (ListDomainConflicts semantics).
+    """
+    d = (domain or "").lower()
+
+    def claims(owned):
+        return _domains_overlap(d, owned) if wildcard_overlap else owned.lower() == d
+
+    owners = []
+    for tenant in _distribution_tenants.values():
+        if any(claims(x) for x in tenant["Domains"]):
+            owners.append(("distribution-tenant", tenant["Id"]))
+    for dist in _distributions.values():
+        if any(claims(x) for x in _get_distribution_aliases(dist)):
+            owners.append(("distribution", dist["Id"]))
+    return owners
+
+
+def _get_distribution_aliases(dist):
+    config_el = _dist_config_el(dist)
+    aliases = _find(config_el, "Aliases")
+    items = []
+    if aliases is not None:
+        items_el = _find(aliases, "Items")
+        if items_el is not None:
+            items = [c.text or "" for c in items_el]
+    return items
+
+
+def _set_distribution_aliases(dist, aliases):
+    config_el = _dist_config_el(dist)
+    block = _find(config_el, "Aliases")
+    if block is not None:
+        config_el.remove(block)
+    block = SubElement(config_el, "Aliases")
+    SubElement(block, "Quantity").text = str(len(aliases))
+    if aliases:
+        items_el = SubElement(block, "Items")
+        for alias in aliases:
+            SubElement(items_el, "CNAME").text = alias
+    dist["config_xml"] = tostring(config_el, encoding="unicode")
+
+
+# ---- request XML parsers ----
+
+
+def _parse_tenant_domains(el):
+    """Parse <Domains><member><Domain>..</Domain></member></Domains>; None when absent."""
+    block = _find(el, "Domains")
+    if block is None:
+        return None
+    domains = []
+    for child in block:
+        d = _text(child, "Domain")
+        if d:
+            domains.append(d)
+    return domains
+
+
+def _parse_tenant_parameters(el):
+    block = _find(el, "Parameters")
+    if block is None:
+        return None
+    params = []
+    for child in block:
+        name = _text(child, "Name")
+        if name:
+            params.append({"Name": name, "Value": _text(child, "Value")})
+    return params
+
+
+def _parse_customizations(el):
+    """Parse a <Customizations> block into a dict, or return an _error tuple.
+
+    Returns ``(customizations_or_None, error_or_None)``.
+    """
+    block = _find(el, "Customizations")
+    if block is None:
+        return None, None
+    cust = {}
+    webacl = _find(block, "WebAcl")
+    if webacl is not None:
+        action = _text(webacl, "Action")
+        if action not in _WEBACL_CUSTOMIZATION_ACTIONS:
+            return None, _error("InvalidArgument", "Invalid WebAcl customization Action value.", 400)
+        entry = {"Action": action}
+        arn = _opt_text(webacl, "Arn")
+        if arn:
+            entry["Arn"] = arn
+        cust["WebAcl"] = entry
+    cert = _find(block, "Certificate")
+    if cert is not None:
+        arn = _text(cert, "Arn")
+        if not arn:
+            return None, _error("InvalidArgument", "Certificate customization requires Arn.", 400)
+        cust["Certificate"] = {"Arn": arn}
+    geo = _find(block, "GeoRestrictions")
+    if geo is not None:
+        rtype = _text(geo, "RestrictionType")
+        if rtype not in {"blacklist", "whitelist", "none"}:
+            return None, _error("InvalidArgument", "Invalid GeoRestrictions RestrictionType value.", 400)
+        locations_el = _find(geo, "Locations")
+        locations = [c.text or "" for c in locations_el] if locations_el is not None else []
+        cust["GeoRestrictions"] = {"RestrictionType": rtype, "Locations": locations}
+    return cust, None
+
+
+def _parse_managed_certificate_request(el, domains):
+    """Mint a managed-certificate record from <ManagedCertificateRequest>.
+
+    Returns ``(record_or_None, error_or_None)``. MiniStack issues immediately.
+    """
+    mcr = _find(el, "ManagedCertificateRequest")
+    if mcr is None:
+        return None, None
+    host = _text(mcr, "ValidationTokenHost")
+    if host not in _VALIDATION_TOKEN_HOSTS:
+        return None, _error("InvalidArgument", "Invalid ValidationTokenHost value.", 400)
+    return {
+        "CertificateArn": f"arn:aws:acm:us-east-1:{get_account_id()}:certificate/{new_uuid()}",
+        "CertificateStatus": "issued",
+        "ValidationTokenHost": host,
+        "PrimaryDomainName": _opt_text(mcr, "PrimaryDomainName"),
+        "Domains": list(domains),
+    }, None
+
+
+# ---- response XML builders ----
+
+
+def _build_tags_block_xml(parent, arn):
+    tags_el = SubElement(parent, "Tags")
+    items = SubElement(tags_el, "Items")
+    for t in _tags.get(arn, []):
+        tag_el = SubElement(items, "Tag")
+        SubElement(tag_el, "Key").text = t["Key"]
+        SubElement(tag_el, "Value").text = t["Value"]
+
+
+def _build_customizations_xml(parent, cust):
+    if not cust:
+        return
+    block = SubElement(parent, "Customizations")
+    webacl = cust.get("WebAcl")
+    if webacl:
+        w = SubElement(block, "WebAcl")
+        SubElement(w, "Action").text = webacl["Action"]
+        if webacl.get("Arn"):
+            SubElement(w, "Arn").text = webacl["Arn"]
+    cert = cust.get("Certificate")
+    if cert:
+        c = SubElement(block, "Certificate")
+        SubElement(c, "Arn").text = cert["Arn"]
+    geo = cust.get("GeoRestrictions")
+    if geo:
+        g = SubElement(block, "GeoRestrictions")
+        SubElement(g, "RestrictionType").text = geo["RestrictionType"]
+        if geo.get("Locations"):
+            locs = SubElement(g, "Locations")
+            for loc in geo["Locations"]:
+                SubElement(locs, "Location").text = loc
+
+
+def _build_connection_group_xml(parent, cg):
+    SubElement(parent, "Id").text = cg["Id"]
+    SubElement(parent, "Name").text = cg["Name"]
+    SubElement(parent, "Arn").text = cg["Arn"]
+    SubElement(parent, "CreatedTime").text = cg["CreatedTime"]
+    SubElement(parent, "LastModifiedTime").text = cg["LastModifiedTime"]
+    _build_tags_block_xml(parent, cg["Arn"])
+    SubElement(parent, "Ipv6Enabled").text = _bstr(cg["Ipv6Enabled"])
+    SubElement(parent, "RoutingEndpoint").text = cg["RoutingEndpoint"]
+    if cg.get("AnycastIpListId"):
+        SubElement(parent, "AnycastIpListId").text = cg["AnycastIpListId"]
+    SubElement(parent, "Status").text = "Deployed"
+    SubElement(parent, "Enabled").text = _bstr(cg["Enabled"])
+    SubElement(parent, "IsDefault").text = _bstr(cg["IsDefault"])
+
+
+def _build_connection_group_summary_xml(parent, cg):
+    SubElement(parent, "Id").text = cg["Id"]
+    SubElement(parent, "Name").text = cg["Name"]
+    SubElement(parent, "Arn").text = cg["Arn"]
+    SubElement(parent, "RoutingEndpoint").text = cg["RoutingEndpoint"]
+    SubElement(parent, "CreatedTime").text = cg["CreatedTime"]
+    SubElement(parent, "LastModifiedTime").text = cg["LastModifiedTime"]
+    SubElement(parent, "ETag").text = cg["ETag"]
+    if cg.get("AnycastIpListId"):
+        SubElement(parent, "AnycastIpListId").text = cg["AnycastIpListId"]
+    SubElement(parent, "Enabled").text = _bstr(cg["Enabled"])
+    SubElement(parent, "Status").text = "Deployed"
+    SubElement(parent, "IsDefault").text = _bstr(cg["IsDefault"])
+
+
+def _build_domain_results_xml(parent, domains):
+    block = SubElement(parent, "Domains")
+    for d in domains:
+        item = SubElement(block, "member")
+        SubElement(item, "Domain").text = d
+        SubElement(item, "Status").text = "active"
+
+
+def _build_tenant_parameters_xml(parent, params):
+    if not params:
+        return
+    block = SubElement(parent, "Parameters")
+    for p in params:
+        item = SubElement(block, "member")
+        SubElement(item, "Name").text = p["Name"]
+        SubElement(item, "Value").text = p["Value"]
+
+
+def _build_distribution_tenant_xml(parent, tenant):
+    SubElement(parent, "Id").text = tenant["Id"]
+    SubElement(parent, "DistributionId").text = tenant["DistributionId"]
+    SubElement(parent, "Name").text = tenant["Name"]
+    SubElement(parent, "Arn").text = tenant["Arn"]
+    _build_domain_results_xml(parent, tenant["Domains"])
+    _build_tags_block_xml(parent, tenant["Arn"])
+    _build_customizations_xml(parent, tenant.get("Customizations"))
+    _build_tenant_parameters_xml(parent, tenant.get("Parameters"))
+    SubElement(parent, "ConnectionGroupId").text = tenant["ConnectionGroupId"]
+    SubElement(parent, "CreatedTime").text = tenant["CreatedTime"]
+    SubElement(parent, "LastModifiedTime").text = tenant["LastModifiedTime"]
+    SubElement(parent, "Enabled").text = _bstr(tenant["Enabled"])
+    SubElement(parent, "Status").text = "Deployed"
+
+
+def _build_distribution_tenant_summary_xml(parent, tenant):
+    SubElement(parent, "Id").text = tenant["Id"]
+    SubElement(parent, "DistributionId").text = tenant["DistributionId"]
+    SubElement(parent, "Name").text = tenant["Name"]
+    SubElement(parent, "Arn").text = tenant["Arn"]
+    _build_domain_results_xml(parent, tenant["Domains"])
+    SubElement(parent, "ConnectionGroupId").text = tenant["ConnectionGroupId"]
+    _build_customizations_xml(parent, tenant.get("Customizations"))
+    SubElement(parent, "CreatedTime").text = tenant["CreatedTime"]
+    SubElement(parent, "LastModifiedTime").text = tenant["LastModifiedTime"]
+    SubElement(parent, "ETag").text = tenant["ETag"]
+    SubElement(parent, "Enabled").text = _bstr(tenant["Enabled"])
+    SubElement(parent, "Status").text = "Deployed"
+
+
+def _tenant_response(tenant, status=200):
+    def build(root):
+        _build_distribution_tenant_xml(root, tenant)
+
+    return _xml_response("DistributionTenant", build, status=status, extra_headers={"ETag": tenant["ETag"]})
+
+
+def _conn_group_response(cg, status=200):
+    def build(root):
+        _build_connection_group_xml(root, cg)
+
+    return _xml_response("ConnectionGroup", build, status=status, extra_headers={"ETag": cg["ETag"]})
+
+
+# ---- connection group handlers ----
+
+
+def _create_connection_group(body):
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+    name = _text(el, "Name")
+    if not name:
+        return _error("InvalidArgument", "Name is required.", 400)
+    for existing in _connection_groups.values():
+        if existing["Name"] == name:
+            return _error("EntityAlreadyExists", "A connection group with this name already exists.", 409)
+
+    now = _now_iso()
+    cg = {
+        "Id": _conn_group_id(),
+        "Name": name,
+        "CreatedTime": now,
+        "LastModifiedTime": now,
+        "Ipv6Enabled": _xbool(el, "Ipv6Enabled", True),
+        "RoutingEndpoint": _routing_endpoint(),
+        "AnycastIpListId": _opt_text(el, "AnycastIpListId"),
+        "Enabled": _xbool(el, "Enabled", True),
+        "IsDefault": False,
+        "ETag": new_uuid(),
+    }
+    cg["Arn"] = _conn_group_arn(cg["Id"])
+    _connection_groups[cg["Id"]] = cg
+    _ingest_distribution_tags_from_xml(cg["Arn"], _find(el, "Tags"))
+    logger.info("CreateConnectionGroup id=%s name=%s", cg["Id"], name)
+    return _conn_group_response(cg, status=201)
+
+
+def _default_connection_group():
+    """The account's default connection group, created lazily like real AWS
+    does when a tenant is created without an explicit ConnectionGroupId."""
+    for cg in _connection_groups.values():
+        if cg["IsDefault"]:
+            return cg
+    now = _now_iso()
+    cg = {
+        "Id": _conn_group_id(),
+        "CreatedTime": now,
+        "LastModifiedTime": now,
+        "Ipv6Enabled": True,
+        "RoutingEndpoint": _routing_endpoint(),
+        "AnycastIpListId": None,
+        "Enabled": True,
+        "IsDefault": True,
+        "ETag": new_uuid(),
+    }
+    cg["Name"] = f"CreatedByCloudFront-{cg['Id']}"
+    cg["Arn"] = _conn_group_arn(cg["Id"])
+    _connection_groups[cg["Id"]] = cg
+    logger.info("Created default connection group id=%s", cg["Id"])
+    return cg
+
+
+def _get_connection_group(identifier):
+    cg = _find_connection_group(identifier)
+    if not cg:
+        return _error("EntityNotFound", "The specified connection group does not exist.", 404)
+    return _conn_group_response(cg)
+
+
+def _get_connection_group_by_routing_endpoint(query_params):
+    endpoint = _qval(query_params, "RoutingEndpoint", "")
+    if not endpoint:
+        return _error("InvalidArgument", "The RoutingEndpoint query string parameter is required.", 400)
+    for cg in _connection_groups.values():
+        if cg["RoutingEndpoint"] == endpoint:
+            return _conn_group_response(cg)
+    return _error("EntityNotFound", "The specified connection group does not exist.", 404)
+
+
+def _update_connection_group(identifier, headers, body):
+    cg = _find_connection_group(identifier)
+    if not cg:
+        return _error("EntityNotFound", "The specified connection group does not exist.", 404)
+    pc = _policy_precheck_if_match(headers, cg)
+    if pc is not None:
+        return pc
+    # boto3 serializes a request with only Id + IfMatch as an empty body;
+    # real AWS accepts it as a members-unchanged update.
+    el = _parse_body(body)
+    if el is None and body:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+    if el is not None:
+        ipv6 = _xbool(el, "Ipv6Enabled")
+        if ipv6 is not None:
+            cg["Ipv6Enabled"] = ipv6
+        enabled = _xbool(el, "Enabled")
+        if enabled is not None:
+            cg["Enabled"] = enabled
+        anycast = _opt_text(el, "AnycastIpListId")
+        if anycast is not None:
+            cg["AnycastIpListId"] = anycast
+    cg["ETag"] = new_uuid()
+    cg["LastModifiedTime"] = _now_iso()
+    logger.info("UpdateConnectionGroup id=%s", cg["Id"])
+    return _conn_group_response(cg)
+
+
+def _delete_connection_group(identifier, headers):
+    cg = _find_connection_group(identifier)
+    if not cg:
+        return _error("EntityNotFound", "The specified connection group does not exist.", 404)
+    pc = _policy_precheck_if_match(headers, cg)
+    if pc is not None:
+        return pc
+    if any(t["ConnectionGroupId"] == cg["Id"] for t in _distribution_tenants.values()):
+        return _error(
+            "CannotDeleteEntityWhileInUse",
+            "The connection group has distribution tenants associated with it and cannot be deleted.",
+            409,
+        )
+    if cg["Enabled"]:
+        return _error("ResourceNotDisabled", "The connection group you are trying to delete has not been disabled.", 409)
+    del _connection_groups[cg["Id"]]
+    logger.info("DeleteConnectionGroup id=%s", cg["Id"])
+    return 204, {}, b""
+
+
+def _list_connection_groups(body):
+    el = _parse_body(body)
+    anycast_filter = None
+    if el is not None:
+        assoc = _find(el, "AssociationFilter")
+        if assoc is not None:
+            anycast_filter = _opt_text(assoc, "AnycastIpListId")
+    groups = [
+        cg for cg in _connection_groups.values()
+        if not anycast_filter or cg.get("AnycastIpListId") == anycast_filter
+    ]
+
+    def build(root):
+        items_el = SubElement(root, "ConnectionGroups")
+        for cg in groups:
+            summary = SubElement(items_el, "ConnectionGroupSummary")
+            _build_connection_group_summary_xml(summary, cg)
+
+    return _xml_response("ListConnectionGroupsResult", build)
+
+
+# ---- distribution tenant handlers ----
+
+
+def _check_tenant_distribution(dist_id):
+    """Validate the distribution a tenant attaches to. Returns an error tuple or None."""
+    dist = _distributions.get(dist_id)
+    if not dist:
+        return _error("EntityNotFound", "The specified distribution does not exist.", 404)
+    if _dist_connection_mode(dist) != "tenant-only":
+        return _error(
+            "InvalidAssociation",
+            "Distribution tenants can only be associated with multi-tenant (tenant-only) distributions.",
+            409,
+        )
+    return None
+
+
+def _check_tenant_domain_conflicts(domains, exclude_tenant_id=None):
+    lowered = [d.lower() for d in domains]
+    if len(set(lowered)) != len(lowered):
+        return _error("InvalidArgument", "Duplicate domains are not allowed.", 400)
+    for domain in domains:
+        for _rtype, rid in _domain_owners(domain):
+            if rid != exclude_tenant_id:
+                return _error("CNAMEAlreadyExists", f"The CNAME {domain} is already in use.", 409)
+    return None
+
+
+def _create_distribution_tenant(body):
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+    dist_id = _text(el, "DistributionId")
+    if not dist_id:
+        return _error("InvalidArgument", "DistributionId is required.", 400)
+    name = _text(el, "Name")
+    if not name:
+        return _error("InvalidArgument", "Name is required.", 400)
+    domains = _parse_tenant_domains(el)
+    if not domains:
+        return _error("InvalidArgument", "Domains is required.", 400)
+
+    err = _check_tenant_distribution(dist_id)
+    if err is not None:
+        return err
+    for existing in _distribution_tenants.values():
+        if existing["Name"] == name:
+            return _error("EntityAlreadyExists", "A distribution tenant with this name already exists.", 409)
+    err = _check_tenant_domain_conflicts(domains)
+    if err is not None:
+        return err
+
+    cg_id_text = _text(el, "ConnectionGroupId")
+    if cg_id_text:
+        cg = _find_connection_group(cg_id_text)
+        if not cg:
+            return _error("EntityNotFound", "The specified connection group does not exist.", 404)
+    else:
+        cg = _default_connection_group()
+
+    cust, err = _parse_customizations(el)
+    if err is not None:
+        return err
+    managed_cert, err = _parse_managed_certificate_request(el, domains)
+    if err is not None:
+        return err
+
+    now = _now_iso()
+    tenant = {
+        "Id": _tenant_id(),
+        "DistributionId": dist_id,
+        "Name": name,
+        "Domains": domains,
+        "Customizations": cust,
+        "Parameters": _parse_tenant_parameters(el) or [],
+        "ConnectionGroupId": cg["Id"],
+        "CreatedTime": now,
+        "LastModifiedTime": now,
+        "Enabled": _xbool(el, "Enabled", True),
+        "ETag": new_uuid(),
+        "ManagedCertificate": managed_cert,
+    }
+    tenant["Arn"] = _tenant_arn(tenant["Id"])
+    _distribution_tenants[tenant["Id"]] = tenant
+    _tenant_invalidations[tenant["Id"]] = []
+    _ingest_distribution_tags_from_xml(tenant["Arn"], _find(el, "Tags"))
+    logger.info("CreateDistributionTenant id=%s name=%s dist=%s", tenant["Id"], name, dist_id)
+    return _tenant_response(tenant, status=201)
+
+
+def _get_distribution_tenant(identifier):
+    tenant = _find_distribution_tenant(identifier)
+    if not tenant:
+        return _error("EntityNotFound", "The specified distribution tenant does not exist.", 404)
+    return _tenant_response(tenant)
+
+
+def _get_distribution_tenant_by_domain(query_params):
+    domain = _qval(query_params, "domain", "")
+    if not domain:
+        return _error("InvalidArgument", "The domain query string parameter is required.", 400)
+    d = domain.lower()
+    for tenant in _distribution_tenants.values():
+        if any(x.lower() == d for x in tenant["Domains"]):
+            return _tenant_response(tenant)
+    return _error("EntityNotFound", "The specified distribution tenant does not exist.", 404)
+
+
+def _update_distribution_tenant(identifier, headers, body):
+    tenant = _find_distribution_tenant(identifier)
+    if not tenant:
+        return _error("EntityNotFound", "The specified distribution tenant does not exist.", 404)
+    pc = _policy_precheck_if_match(headers, tenant)
+    if pc is not None:
+        return pc
+    # boto3 serializes a request with only Id + IfMatch as an empty body;
+    # real AWS accepts it as a members-unchanged update.
+    el = _parse_body(body)
+    if el is None and body:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+
+    # Validate the whole request before committing anything — a rejected
+    # update must leave the tenant untouched, like real AWS.
+    updates = {}
+    if el is not None:
+        dist_id = _text(el, "DistributionId")
+        if dist_id and dist_id != tenant["DistributionId"]:
+            err = _check_tenant_distribution(dist_id)
+            if err is not None:
+                return err
+        if dist_id:
+            updates["DistributionId"] = dist_id
+        domains = _parse_tenant_domains(el)
+        if domains is not None:
+            if not domains:
+                return _error("InvalidArgument", "Domains must not be empty.", 400)
+            err = _check_tenant_domain_conflicts(domains, exclude_tenant_id=tenant["Id"])
+            if err is not None:
+                return err
+            updates["Domains"] = domains
+        cg_id_text = _text(el, "ConnectionGroupId")
+        if cg_id_text:
+            cg = _find_connection_group(cg_id_text)
+            if not cg:
+                return _error("EntityNotFound", "The specified connection group does not exist.", 404)
+            updates["ConnectionGroupId"] = cg["Id"]
+        cust, err = _parse_customizations(el)
+        if err is not None:
+            return err
+        if cust is not None:
+            updates["Customizations"] = cust
+        params = _parse_tenant_parameters(el)
+        if params is not None:
+            updates["Parameters"] = params
+        enabled = _xbool(el, "Enabled")
+        if enabled is not None:
+            updates["Enabled"] = enabled
+        managed_cert, err = _parse_managed_certificate_request(el, updates.get("Domains", tenant["Domains"]))
+        if err is not None:
+            return err
+        if managed_cert is not None:
+            updates["ManagedCertificate"] = managed_cert
+
+    tenant.update(updates)
+    tenant["ETag"] = new_uuid()
+    tenant["LastModifiedTime"] = _now_iso()
+    logger.info("UpdateDistributionTenant id=%s", tenant["Id"])
+    return _tenant_response(tenant)
+
+
+def _delete_distribution_tenant(identifier, headers):
+    tenant = _find_distribution_tenant(identifier)
+    if not tenant:
+        return _error("EntityNotFound", "The specified distribution tenant does not exist.", 404)
+    pc = _policy_precheck_if_match(headers, tenant)
+    if pc is not None:
+        return pc
+    if tenant["Enabled"]:
+        return _error(
+            "ResourceNotDisabled", "The distribution tenant you are trying to delete has not been disabled.", 409
+        )
+    del _distribution_tenants[tenant["Id"]]
+    _tenant_invalidations.pop(tenant["Id"], None)
+    logger.info("DeleteDistributionTenant id=%s", tenant["Id"])
+    return 204, {}, b""
+
+
+def _list_distribution_tenants(body):
+    el = _parse_body(body)
+    dist_filter = cg_filter = None
+    if el is not None:
+        assoc = _find(el, "AssociationFilter")
+        if assoc is not None:
+            dist_filter = _opt_text(assoc, "DistributionId")
+            cg_filter = _opt_text(assoc, "ConnectionGroupId")
+    tenants = [
+        t for t in _distribution_tenants.values()
+        if (not dist_filter or t["DistributionId"] == dist_filter)
+        and (not cg_filter or t["ConnectionGroupId"] == cg_filter)
+    ]
+    return _tenant_list_response(tenants, "ListDistributionTenantsResult")
+
+
+def _list_distribution_tenants_by_customization(body):
+    el = _parse_body(body)
+    webacl_filter = cert_filter = None
+    if el is not None:
+        webacl_filter = _opt_text(el, "WebACLArn")
+        cert_filter = _opt_text(el, "CertificateArn")
+
+    def matches(tenant):
+        cust = tenant.get("Customizations") or {}
+        if webacl_filter and (cust.get("WebAcl") or {}).get("Arn") != webacl_filter:
+            return False
+        if cert_filter and (cust.get("Certificate") or {}).get("Arn") != cert_filter:
+            return False
+        return True
+
+    return _tenant_list_response(
+        [t for t in _distribution_tenants.values() if matches(t)],
+        "ListDistributionTenantsByCustomizationResult",
+    )
+
+
+def _tenant_list_response(tenants, root_tag):
+    def build(root):
+        items_el = SubElement(root, "DistributionTenantList")
+        for tenant in tenants:
+            summary = SubElement(items_el, "DistributionTenantSummary")
+            _build_distribution_tenant_summary_xml(summary, tenant)
+
+    return _xml_response(root_tag, build)
+
+
+def _associate_tenant_webacl(tenant_id, headers, body):
+    tenant = _find_distribution_tenant(tenant_id)
+    if not tenant:
+        return _error("EntityNotFound", "The specified distribution tenant does not exist.", 404)
+    if_match = headers.get("if-match")
+    if if_match and if_match != tenant["ETag"]:
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
+    el = _parse_body(body)
+    webacl_arn = _text(el, "WebACLArn") if el is not None else ""
+    if not webacl_arn:
+        return _error("InvalidArgument", "WebACLArn is required.", 400)
+    cust = tenant.get("Customizations") or {}
+    cust["WebAcl"] = {"Action": "override", "Arn": webacl_arn}
+    tenant["Customizations"] = cust
+    tenant["ETag"] = new_uuid()
+    tenant["LastModifiedTime"] = _now_iso()
+    logger.info("AssociateDistributionTenantWebACL id=%s", tenant["Id"])
+
+    def build(root):
+        SubElement(root, "Id").text = tenant["Id"]
+        SubElement(root, "WebACLArn").text = webacl_arn
+
+    return _xml_response(
+        "AssociateDistributionTenantWebACLResult", build, extra_headers={"ETag": tenant["ETag"]}
+    )
+
+
+def _disassociate_tenant_webacl(tenant_id, headers):
+    tenant = _find_distribution_tenant(tenant_id)
+    if not tenant:
+        return _error("EntityNotFound", "The specified distribution tenant does not exist.", 404)
+    if_match = headers.get("if-match")
+    if if_match and if_match != tenant["ETag"]:
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
+    cust = tenant.get("Customizations") or {}
+    cust.pop("WebAcl", None)
+    tenant["Customizations"] = cust
+    tenant["ETag"] = new_uuid()
+    tenant["LastModifiedTime"] = _now_iso()
+    logger.info("DisassociateDistributionTenantWebACL id=%s", tenant["Id"])
+
+    def build(root):
+        SubElement(root, "Id").text = tenant["Id"]
+
+    return _xml_response(
+        "DisassociateDistributionTenantWebACLResult", build, extra_headers={"ETag": tenant["ETag"]}
+    )
+
+
+# ---- tenant invalidation handlers (mirror the distribution ones) ----
+
+
+def _create_tenant_invalidation(tenant_id, body):
+    tenant = _find_distribution_tenant(tenant_id)
+    if not tenant:
+        return _error("EntityNotFound", "The specified distribution tenant does not exist.", 404)
+    batch_el = _parse_body(body)
+    if batch_el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+
+    paths_el = _find(batch_el, "Paths")
+    caller_ref = _text(batch_el, "CallerReference")
+    path_items = []
+    if paths_el is not None:
+        items_el = _find(paths_el, "Items")
+        if items_el is not None:
+            path_items = [child.text for child in items_el if child.text]
+
+    invs = _tenant_invalidations.setdefault(tenant["Id"], [])
+    for existing in invs:
+        if existing["InvalidationBatch"]["CallerReference"] == caller_ref:
+            if set(existing["InvalidationBatch"]["Paths"]["Items"]) != set(path_items):
+                return _error(
+                    "InvalidationBatchAlreadyExists",
+                    "An invalidation batch with this CallerReference already exists.",
+                    400,
+                )
+
+            def build(root, _inv=existing):
+                _build_invalidation_xml(root, _inv)
+
+            return _xml_response(
+                "Invalidation", build, status=201,
+                extra_headers={
+                    "Location": f"/2020-05-31/distribution-tenant/{tenant['Id']}/invalidation/{existing['Id']}",
+                },
+            )
+
+    inv = {
+        "Id": _inv_id(),
+        "Status": "Completed",
+        "CreateTime": _now_iso(),
+        "InvalidationBatch": {
+            "Paths": {"Quantity": len(path_items), "Items": path_items},
+            "CallerReference": caller_ref,
+        },
+    }
+    invs.append(inv)
+    logger.info("CreateInvalidationForDistributionTenant tenant=%s inv=%s", tenant["Id"], inv["Id"])
+
+    def build(root):
+        _build_invalidation_xml(root, inv)
+
+    return _xml_response(
+        "Invalidation", build, status=201,
+        extra_headers={
+            "Location": f"/2020-05-31/distribution-tenant/{tenant['Id']}/invalidation/{inv['Id']}",
+        },
+    )
+
+
+def _list_tenant_invalidations(tenant_id):
+    tenant = _find_distribution_tenant(tenant_id)
+    if not tenant:
+        return _error("EntityNotFound", "The specified distribution tenant does not exist.", 404)
+    invs = _tenant_invalidations.get(tenant["Id"], [])
+
+    def build(root):
+        SubElement(root, "Marker").text = ""
+        SubElement(root, "MaxItems").text = "100"
+        SubElement(root, "IsTruncated").text = "false"
+        SubElement(root, "Quantity").text = str(len(invs))
+        if invs:
+            items_el = SubElement(root, "Items")
+            for inv in invs:
+                summary = SubElement(items_el, "InvalidationSummary")
+                SubElement(summary, "Id").text = inv["Id"]
+                SubElement(summary, "CreateTime").text = inv["CreateTime"]
+                SubElement(summary, "Status").text = inv["Status"]
+
+    return _xml_response("InvalidationList", build)
+
+
+def _get_tenant_invalidation(tenant_id, inv_id):
+    tenant = _find_distribution_tenant(tenant_id)
+    if not tenant:
+        return _error("EntityNotFound", "The specified distribution tenant does not exist.", 404)
+    inv = next((i for i in _tenant_invalidations.get(tenant["Id"], []) if i["Id"] == inv_id), None)
+    if not inv:
+        return _error("NoSuchInvalidation", "The specified invalidation does not exist.", 404)
+
+    def build(root):
+        _build_invalidation_xml(root, inv)
+
+    return _xml_response("Invalidation", build)
+
+
+# ---- domain and certificate handlers ----
+
+
+def _verify_dns_configuration(body):
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+    identifier = _text(el, "Identifier")
+    if not identifier:
+        return _error("InvalidArgument", "Identifier is required.", 400)
+    tenant = _find_distribution_tenant(identifier)
+    if not tenant:
+        return _error("EntityNotFound", "The specified distribution tenant does not exist.", 404)
+    domain = _text(el, "Domain")
+    domains = [domain] if domain else tenant["Domains"]
+
+    def build(root):
+        list_el = SubElement(root, "DnsConfigurationList")
+        for d in domains:
+            item = SubElement(list_el, "DnsConfiguration")
+            SubElement(item, "Domain").text = d
+            SubElement(item, "Status").text = "valid-configuration"
+
+    return _xml_response("VerifyDnsConfigurationResult", build)
+
+
+def _get_managed_certificate_details(identifier):
+    tenant = _find_distribution_tenant(identifier)
+    if not tenant:
+        return _error("EntityNotFound", "The specified distribution tenant does not exist.", 404)
+    mc = tenant.get("ManagedCertificate")
+
+    def build(root):
+        if not mc:
+            return
+        SubElement(root, "CertificateArn").text = mc["CertificateArn"]
+        SubElement(root, "CertificateStatus").text = mc["CertificateStatus"]
+        SubElement(root, "ValidationTokenHost").text = mc["ValidationTokenHost"]
+        details = SubElement(root, "ValidationTokenDetails")
+        for d in mc["Domains"]:
+            item = SubElement(details, "member")
+            SubElement(item, "Domain").text = d
+
+    return _xml_response("ManagedCertificateDetails", build)
+
+
+def _list_domain_conflicts(body):
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+    domain = _text(el, "Domain")
+    resource_el = _find(el, "DomainControlValidationResource")
+    if not domain or resource_el is None:
+        return _error("InvalidArgument", "Domain and DomainControlValidationResource are required.", 400)
+    tenant_ref = _text(resource_el, "DistributionTenantId")
+    dist_ref = _text(resource_el, "DistributionId")
+    exclude_ids = set()
+    if tenant_ref:
+        tenant = _find_distribution_tenant(tenant_ref)
+        if not tenant:
+            return _error("EntityNotFound", "The specified distribution tenant does not exist.", 404)
+        exclude_ids.add(tenant["Id"])
+    elif dist_ref:
+        if dist_ref not in _distributions:
+            return _error("EntityNotFound", "The specified distribution does not exist.", 404)
+        exclude_ids.add(dist_ref)
+    else:
+        return _error("InvalidArgument", "DomainControlValidationResource requires a resource id.", 400)
+
+    conflicts = [
+        (rtype, rid)
+        for rtype, rid in _domain_owners(domain, wildcard_overlap=True)
+        if rid not in exclude_ids
+    ]
+
+    def build(root):
+        list_el = SubElement(root, "DomainConflicts")
+        for rtype, rid in conflicts:
+            # The list member's XML name is DomainConflicts per the model.
+            item = SubElement(list_el, "DomainConflicts")
+            SubElement(item, "Domain").text = domain
+            SubElement(item, "ResourceType").text = rtype
+            SubElement(item, "ResourceId").text = rid
+            SubElement(item, "AccountId").text = get_account_id()
+
+    return _xml_response("ListDomainConflictsResult", build)
+
+
+def _update_domain_association(headers, body):
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+    domain = _text(el, "Domain")
+    target_el = _find(el, "TargetResource")
+    if not domain or target_el is None:
+        return _error("InvalidArgument", "Domain and TargetResource are required.", 400)
+
+    tenant_ref = _text(target_el, "DistributionTenantId")
+    dist_ref = _text(target_el, "DistributionId")
+    target_tenant = target_dist = None
+    if tenant_ref:
+        target_tenant = _find_distribution_tenant(tenant_ref)
+        if not target_tenant:
+            return _error("EntityNotFound", "The specified distribution tenant does not exist.", 404)
+        target = target_tenant
+    elif dist_ref:
+        target_dist = _distributions.get(dist_ref)
+        if not target_dist:
+            return _error("EntityNotFound", "The specified distribution does not exist.", 404)
+        target = target_dist
+    else:
+        return _error("InvalidArgument", "TargetResource requires a resource id.", 400)
+
+    if_match = headers.get("if-match")
+    if if_match and if_match != target["ETag"]:
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
+
+    # Detach the domain from whichever resource currently claims it.
+    d = domain.lower()
+    for tenant in _distribution_tenants.values():
+        if tenant is target_tenant:
+            continue
+        if any(x.lower() == d for x in tenant["Domains"]):
+            tenant["Domains"] = [x for x in tenant["Domains"] if x.lower() != d]
+            tenant["ETag"] = new_uuid()
+            tenant["LastModifiedTime"] = _now_iso()
+    for dist in _distributions.values():
+        if dist is target_dist:
+            continue
+        aliases = _get_distribution_aliases(dist)
+        if any(x.lower() == d for x in aliases):
+            _set_distribution_aliases(dist, [x for x in aliases if x.lower() != d])
+            dist["ETag"] = new_uuid()
+            dist["LastModifiedTime"] = _now_iso()
+
+    # Attach it to the target.
+    if target_tenant is not None:
+        if not any(x.lower() == d for x in target_tenant["Domains"]):
+            target_tenant["Domains"] = [*target_tenant["Domains"], domain]
+        resource_id = target_tenant["Id"]
+    else:
+        aliases = _get_distribution_aliases(target_dist)
+        if not any(x.lower() == d for x in aliases):
+            _set_distribution_aliases(target_dist, [*aliases, domain])
+        resource_id = target_dist["Id"]
+    target["ETag"] = new_uuid()
+    target["LastModifiedTime"] = _now_iso()
+    logger.info("UpdateDomainAssociation domain=%s target=%s", domain, resource_id)
+
+    def build(root):
+        SubElement(root, "Domain").text = domain
+        SubElement(root, "ResourceId").text = resource_id
+
+    return _xml_response("UpdateDomainAssociationResult", build, extra_headers={"ETag": target["ETag"]})
+
+
+def _list_distributions_by_connection_mode(mode):
+    if mode not in _CONNECTION_MODES:
+        return _error("InvalidArgument", "Invalid ConnectionMode value.", 400)
+    items = [d for d in _distributions.values() if _dist_connection_mode(d) == mode]
+    return _xml_response("DistributionList", lambda root: _build_distribution_list_xml(root, items))

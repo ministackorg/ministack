@@ -85,7 +85,33 @@ RUN arch="${TARGETARCH}"; \
       | grep -q ' _mysql_plugin_interface_version_$'
 COPY --from=plugin-build-80 /opt/ministack/mysql-plugins/8.0 /opt/ministack/mysql-plugins/8.0
 
-FROM python:3.13-slim
+# Rebuild ICU's locale data as English-only. Debian's libicudata.so is 31 MB of
+# locale tables and nothing else — statically linked, zero exported symbols —
+# and Node is the only binary in the image that links ICU. Alpine packages the
+# same upstream ICU release as a 3 MB data file, so wrapping that with ICU's own
+# genccode produces a drop-in replacement. Non-English `Intl` formatting falls
+# back to English, which is what the Alpine image has always done; a derived
+# image can restore it with `apt-get install --reinstall libicu76`.
+FROM alpine:3.22 AS icu-data
+RUN apk add --no-cache icu-data-en
+
+FROM python:3.13-slim AS icu-build
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends icu-devtools gcc libc6-dev libicu-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=icu-data /usr/share/icu/ /tmp/icu/
+RUN set -eux; \
+    dat="$(find /tmp/icu -name 'icudt*.dat' | head -1)"; \
+    stem="$(basename "${dat}" .dat)"; \
+    ver="$(basename "$(dirname "${dat}")")"; \
+    cd /tmp; \
+    genccode -e "${stem%l}" -d /tmp "${dat}"; \
+    gcc -shared -fPIC -O2 -o "/tmp/libicudata.so.${ver}" "/tmp/${stem}_dat.c"; \
+    strip "/tmp/libicudata.so.${ver}"; \
+    ln -s "libicudata.so.${ver}" /tmp/libicudata.so.slim
+
+
+FROM python:3.13-slim AS prep
 
 LABEL maintainer="MiniStack" \
       description="Local AWS Service Emulator — full variant with DuckDB (Athena), PostgreSQL, MySQL drivers, and SFTP"
@@ -121,6 +147,54 @@ RUN mkdir -p /docker-entrypoint-initaws.d/ready.d \
              /etc/localstack/init/boot.d \
              /etc/localstack/init/ready.d && \
     chown -R ministack:ministack /docker-entrypoint-initaws.d /etc/localstack
+
+# Swap in the English-only ICU data, then drop payload no runtime path reads:
+# the npm helper packages Debian ships beside node (the keep-list is read out of
+# libnode itself, because it aborts at startup if an externalized builtin such as
+# undici or acorn-walk is missing), perl (nothing here reverse-depends on it, and
+# the dpkg entry goes too so a scanner stops reporting its CVEs against files
+# that are gone),
+# glibc's legacy iconv converters (Python uses its own codecs; the few kept are
+# the ones a C library caller could plausibly ask for) and stdlib corners that
+# cannot run here now that pip is stripped. The `test -f` fails the build rather
+# than shipping a mismatch if the base's ICU major moves ahead of Alpine's, and
+# the node check proves Intl still works after the swap.
+COPY --from=icu-build /tmp/libicudata.so.* /tmp/icu-slim/
+RUN set -eux; \
+    target="$(find /usr/lib -type f -name 'libicudata.so.*' | head -1)"; \
+    slim="/tmp/icu-slim/$(basename "${target}")"; \
+    test -f "${slim}"; \
+    cp "${slim}" "${target}"; \
+    rm -rf /tmp/icu-slim; \
+    node -e "if (new Date(0).toLocaleDateString('en-US',{month:'long'}) !== 'January') process.exit(1)"; \
+    gconv="$(dirname "$(find /usr/lib -name 'UTF-16.so' -path '*gconv*' | head -1)")"; \
+    find "${gconv}" -name '*.so' \
+        ! -name 'UTF-16.so' ! -name 'UTF-32.so' ! -name 'UTF-7.so' \
+        ! -name 'UNICODE.so' ! -name 'ISO8859-1.so' ! -name 'CP1252.so' -delete; \
+    rm -rf /usr/local/lib/python3.13/ensurepip \
+           /usr/local/lib/python3.13/idlelib \
+           /usr/local/lib/python3.13/tkinter \
+           /usr/local/lib/python3.13/pydoc_data \
+           /usr/local/lib/python3.13/turtledemo \
+           /usr/local/lib/python3.13/turtle.py; \
+    python3 -c "import re,glob,os,shutil; \
+lib=glob.glob('/usr/lib/*/libnode.so.*')[0]; \
+keep={q.split('/')[4] for q in re.findall(r'/usr/share/nodejs/[A-Za-z0-9@._/-]+', open(lib,'rb').read().decode('latin1'))}; \
+[shutil.rmtree(os.path.join('/usr/share/nodejs',d), ignore_errors=True) for d in os.listdir('/usr/share/nodejs') if d not in keep]"; \
+    rm -rf /usr/bin/perl /usr/bin/perl5.40.1 /usr/lib/*/perl-base \
+           /usr/lib/*/perl5 /usr/share/perl5 /usr/share/perl; \
+    dpkg --purge --force-remove-essential --force-depends perl-base 2>/dev/null || true; \
+    node -e "require('http'); if (typeof fetch !== 'function') process.exit(1)"; \
+    rm -rf /var/cache/* /var/log/* /tmp/*
+
+# The layers above sum to more than the filesystem they produce: `apt-get
+# upgrade` rewrites base files into a new layer, and a later `rm -rf` cannot
+# shrink the layer beneath it. Flattening reclaims that, at the cost of layer
+# sharing with the base image on pull.
+FROM scratch
+COPY --from=prep / /
+
+WORKDIR /opt/ministack
 VOLUME /docker-entrypoint-initaws.d
 VOLUME /etc/localstack/init
 

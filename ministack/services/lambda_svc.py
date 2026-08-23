@@ -802,7 +802,7 @@ process.stdin.on('end', async () => {
     resolvedPath = require.resolve(fullPath);
     mod = require(resolvedPath);
   } catch (reqErr) {
-    if (reqErr.code === 'ERR_REQUIRE_ESM' && resolvedPath) {
+    if ((reqErr.code === 'ERR_REQUIRE_ESM' || reqErr.code === 'ERR_REQUIRE_ASYNC_MODULE') && resolvedPath) {
       mod = await import(pathToFileURL(resolvedPath).href);
     } else if (reqErr.code === 'MODULE_NOT_FOUND') {
       const mjsPath = fullPath + '.mjs';
