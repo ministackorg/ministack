@@ -282,6 +282,14 @@ AURORA_POSTGRESQL_ENGINE_VERSIONS = [
 AURORA_POSTGRESQL_ENGINE_VERSION_SET = {
     version for version, _ in AURORA_POSTGRESQL_ENGINE_VERSIONS
 }
+# Defaults deliberately trail the newest advertised minor when AWS does. Keep
+# this explicit instead of deriving it from the catalog ordering. Refresh with:
+#   aws rds describe-db-engine-versions --engine aurora-postgresql \
+#     --engine-version <major> --default-only
+AURORA_POSTGRESQL_DEFAULT_ENGINE_VERSIONS = {
+    "16": "16.11",
+    "17": "17.7",
+}
 
 AURORA_MYSQL_IMAGE_MAP = {
     "5.6": "mysql:5.6",
@@ -6739,6 +6747,17 @@ def _global_cluster_xml(gc):
 def _describe_engine_versions(p):
     engine = _p(p, "Engine") or "postgres"
     version_filter = _p(p, "EngineVersion")
+    default_only = _p(p, "DefaultOnly") == "true"
+    major_version_filter = (
+        version_filter
+        if engine == "aurora-postgresql" and version_filter.isdigit()
+        else ""
+    )
+    default_version = (
+        AURORA_POSTGRESQL_DEFAULT_ENGINE_VERSIONS.get(major_version_filter)
+        if major_version_filter
+        else _default_engine_version(engine)
+    )
     versions_map = {
         "postgres": [
             ("18.3", "18"), ("17.5", "17"), ("16.4", "16"),
@@ -6757,7 +6776,12 @@ def _describe_engine_versions(p):
     members = ""
     supports_global = engine in ("aurora-mysql", "aurora-postgresql")
     for ver, family in versions:
-        if version_filter and ver != version_filter:
+        if major_version_filter:
+            if not ver.startswith(major_version_filter + "."):
+                continue
+        elif version_filter and ver != version_filter:
+            continue
+        if default_only and ver != default_version:
             continue
         members += f"""<DBEngineVersion>
             <Engine>{engine}</Engine>

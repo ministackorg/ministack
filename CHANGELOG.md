@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **RDS — Aurora PostgreSQL major-version selectors return the matching catalog** — `DescribeDBEngineVersions` treated `EngineVersion=16` as an exact version and returned nothing. Major-only selectors now return every advertised minor in that family, and `DefaultOnly=true` narrows the result to AWS's configured default minor for that major.
+
 ## [1.5.0] — 2026-08-23
 
 ### Added
