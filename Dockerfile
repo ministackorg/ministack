@@ -1,3 +1,8 @@
+# Non-release builds intentionally use the maintainer-requested fallback of the latest
+# published full image. Release builds override this in docker-publish.yml with the
+# same-release full-image digest; plugin-source PRs use the full-preview label path.
+ARG PLUGIN_DONOR_IMAGE=ghcr.io/ministackorg/ministack:full
+
 FROM python:3.13-alpine AS builder
 
 RUN pip install --no-cache-dir --no-compile \
@@ -17,6 +22,9 @@ RUN rm -rf /usr/local/lib/python3.13/site-packages/awscli/examples \
     && find /usr/local/lib/python3.13/site-packages -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null \
     && rm -rf /usr/local/lib/python3.13/site-packages/pip*.dist-info \
     && rm -rf /usr/local/lib/python3.13/site-packages/pip*
+
+# Plugin artifacts are release-stable; release builds pin this donor by digest.
+FROM ${PLUGIN_DONOR_IMAGE} AS plugin-donor
 
 FROM python:3.13-alpine
 
@@ -40,6 +48,7 @@ COPY bin/awslocal /usr/local/bin/awslocal
 RUN chmod +x /usr/local/bin/awslocal
 
 COPY ministack/ ministack/
+COPY --from=plugin-donor /opt/ministack/mysql-plugins /opt/ministack/mysql-plugins
 
 RUN addgroup -S ministack && adduser -S ministack -G ministack
 RUN mkdir -p /tmp/ministack-data/s3 && chown -R ministack:ministack /tmp/ministack-data

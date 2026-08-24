@@ -1267,6 +1267,40 @@ def test_cfn_fn_sub(cfn, ssm):
     val = ssm.get_parameter(Name="cfn-t06-param")["Parameter"]["Value"]
     assert val == "cfn-t06-src-replica"
 
+
+def test_cfn_fn_sub_literal_escape(cfn, ssm):
+    """`${!Literal}` is Fn::Sub's escape for emitting `${Literal}` verbatim —
+    the way an IoT policy carries `${iot:Connection.Thing.ThingName}` through a
+    template. The name must not be looked up, even when it matches a resource,
+    and the surrounding substitutions must still resolve."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Plain": {
+                "Type": "AWS::S3::Bucket",
+                "Properties": {"BucketName": "cfn-sub-escape-src"},
+            },
+            "Param": {
+                "Type": "AWS::SSM::Parameter",
+                "Properties": {
+                    "Name": "/cfn-sub-escape/literal",
+                    "Type": "String",
+                    "Value": {
+                        "Fn::Sub": "client/${!iot:Connection.Thing.ThingName} "
+                                   "and ${!Plain} in ${AWS::Region}"
+                    },
+                },
+            },
+        },
+    }
+    cfn.create_stack(StackName="cfn-sub-escape", TemplateBody=json.dumps(template))
+    _wait_stack(cfn, "cfn-sub-escape")
+
+    val = ssm.get_parameter(Name="/cfn-sub-escape/literal")["Parameter"]["Value"]
+    assert val == ("client/${iot:Connection.Thing.ThingName} "
+                   "and ${Plain} in us-east-1")
+
+
 def test_cfn_multi_resource_dependencies(cfn, iam, lam):
     template = {
         "AWSTemplateFormatVersion": "2010-09-09",
