@@ -3855,6 +3855,41 @@ def test_ec2_registered_ami_boots_a_container(vm):
     assert inst["PrivateDnsName"] == "ip-172-30-0-9.ec2.internal"
 
 
+def test_ec2_parse_docker_flags():
+    kwargs = ec2mod._parse_ec2_docker_flags(
+        "--privileged -e A=1 --env B=two -v /h:/c:ro --cap-add SYS_ADMIN "
+        "--tmpfs /run:rw,size=64m --add-host me:10.0.0.1 -m 512m --shm-size 128m "
+        "--init=false --bogus-flag xyz")
+    assert kwargs["privileged"] is True
+    assert kwargs["environment"] == {"A": "1", "B": "two"}
+    assert kwargs["volumes"] == ["/h:/c:ro"]
+    assert kwargs["cap_add"] == ["SYS_ADMIN"]
+    assert kwargs["tmpfs"] == {"/run": "rw,size=64m"}
+    assert kwargs["extra_hosts"] == {"me": "10.0.0.1"}
+    assert kwargs["mem_limit"] == "512m"
+    assert kwargs["shm_size"] == "128m"
+    # --init is refused, never forwarded: instance containers always run with init.
+    assert "init" not in kwargs
+    assert ec2mod._parse_ec2_docker_flags("") == {}
+    # Malformed input is ignored rather than raising or exiting inside the server:
+    # a flag missing its value trips argparse's error path, an unbalanced quote
+    # trips shlex.
+    for bad in ("-m", "--cap-add", "'unbalanced"):
+        assert ec2mod._parse_ec2_docker_flags(bad) == {}
+
+
+def test_ec2_docker_flags_reach_the_container(vm, monkeypatch):
+    fake, created = vm
+    monkeypatch.setattr(ec2mod, "EC2_DOCKER_FLAGS", "--privileged --cap-add SYS_ADMIN")
+    ami = _register("example/box:1")
+    iids, _ = _launch(ami)
+    created.extend(iids)
+    run = fake._runs[0]
+    assert run["privileged"] is True
+    assert run["cap_add"] == ["SYS_ADMIN"]
+    assert run["init"] is True
+
+
 def test_ec2_failed_boot_backs_every_record_out(monkeypatch):
     fake = _fake_docker(run_error=RuntimeError("no such image"))
     monkeypatch.setattr(ec2mod, "_get_docker", lambda: fake)

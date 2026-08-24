@@ -60,20 +60,6 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
 
-      - name: Build and push (regular)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            MINISTACK_VERSION=${{ steps.meta.outputs.version }}
-          cache-from: type=gha,scope=regular
-          cache-to: type=gha,mode=max,scope=regular
-
       # ── Full (Debian/glibc) image — :full, :{version}-full, :{major}.{minor}-full ──
       # Adds DuckDB (Athena engine), psycopg2-binary, pymysql. Larger
       # image (~360 MB vs ~110 MB) but all manylinux wheels install
@@ -95,6 +81,7 @@ jobs:
             type=raw,value=full
 
       - name: Build and push (full)
+        id: build_full
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -107,3 +94,18 @@ jobs:
             MINISTACK_VERSION=${{ steps.meta.outputs.version }}
           cache-from: type=gha,scope=full
           cache-to: type=gha,mode=max,scope=full
+
+      - name: Build and push (regular)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            MINISTACK_VERSION=${{ steps.meta.outputs.version }}
+            PLUGIN_DONOR_IMAGE=ghcr.io/ministackorg/ministack@${{ steps.build_full.outputs.digest }}
+          cache-from: type=gha,scope=regular
+          cache-to: type=gha,mode=max,scope=regular

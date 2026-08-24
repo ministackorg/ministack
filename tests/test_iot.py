@@ -1164,6 +1164,91 @@ def test_iot_create_topic_rule_unsupported_where_rejected(iot_client):
     assert ei.value.response["Error"]["Code"] == "SqlParseException"
 
 
+def test_iot_topic_rule_role_validated_under_auth(monkeypatch):
+    """Under AUTH=true a rule naming an action role IAM cannot resolve is
+    refused 400 `InvalidRequestException` ("Unable to assume role: ..."), as
+    real IoT does by probing the role at create time — and the rule must NOT
+    be stored. In-process because the shared test server runs AUTH=false:
+    `validate_role_arn` reads `ministack.app.AUTH` at call time, so the
+    monkeypatch reaches it."""
+    import json as _json
+
+    import ministack.app as _app
+    from ministack.services import iam as _iam
+    from ministack.services import iot as _iot
+
+    monkeypatch.setattr(_app, "AUTH", True)
+    name = _rule_name()
+    bad = {
+        "sql": "SELECT * FROM 'a'",
+        "actions": [{"sqs": {
+            "queueUrl": "http://localhost/000000000000/q",
+            "roleArn": "arn:aws:iam::000000000000:role/absent-role",
+        }}],
+    }
+    try:
+        # Create door: 400, nothing stored.
+        status, _, body = _iot._create_topic_rule(name, bad)
+        assert status == 400
+        err = _json.loads(body)
+        assert err["__type"] == "InvalidRequestException"
+        assert "Unable to assume role" in err["message"]
+        assert name not in _iot._topic_rules
+
+        # An existing role passes the same check.
+        _iam._roles.setdefault("probe-rule-role", {"RoleName": "probe-rule-role"})
+        good = {
+            "sql": "SELECT * FROM 'a'",
+            "actions": [{"sqs": {
+                "queueUrl": "http://localhost/000000000000/q",
+                "roleArn": "arn:aws:iam::000000000000:role/probe-rule-role",
+            }}],
+        }
+        status, _, _b = _iot._create_topic_rule(name, good)
+        assert status == 200
+        assert name in _iot._topic_rules
+
+        # Replace door: same 400, the stored rule stays what it was.
+        status, _, body = _iot._replace_topic_rule(name, bad)
+        assert status == 400
+        assert _json.loads(body)["__type"] == "InvalidRequestException"
+        assert (_iot._topic_rules[name]["actions"][0]["sqs"]["roleArn"]
+                == good["actions"][0]["sqs"]["roleArn"])
+
+        # CFN door: the store-layer helper raises, so the provisioner (which
+        # calls put_topic_rule directly) fails the resource instead of
+        # green-lighting a stack minus its rule.
+        with pytest.raises(_iot.RuleRoleError):
+            _iot.put_topic_rule(name + "cfn", bad)
+        assert (name + "cfn") not in _iot._topic_rules
+    finally:
+        _iot._topic_rules.pop(name, None)
+        _iam._roles.pop("probe-rule-role", None)
+
+
+def test_iot_topic_rule_role_not_validated_without_auth(monkeypatch):
+    """With AUTH=false (the default) an unresolvable role is stored as before —
+    the check is authorization-mode fidelity, not a new default gate."""
+    import ministack.app as _app
+    from ministack.services import iot as _iot
+
+    monkeypatch.setattr(_app, "AUTH", False)
+    name = _rule_name()
+    payload = {
+        "sql": "SELECT * FROM 'a'",
+        "actions": [{"sqs": {
+            "queueUrl": "http://localhost/000000000000/q",
+            "roleArn": "arn:aws:iam::000000000000:role/absent-role",
+        }}],
+    }
+    try:
+        status, _, _b = _iot._create_topic_rule(name, payload)
+        assert status == 200
+        assert name in _iot._topic_rules
+    finally:
+        _iot._topic_rules.pop(name, None)
+
+
 def test_iot_create_topic_rule_accepts_or_and_parentheses(iot_client):
     """`OR` and parenthesised groups are valid AWS rule SQL — rejecting them
     would fail rules that deploy fine on AWS."""

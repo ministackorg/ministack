@@ -7,8 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **EC2 — opt-in launch options for instance containers (`EC2_DOCKER_FLAGS`)** — a registered image that boots an operating system (systemd as PID 1) needs container options the fixed launch arguments cannot express: unprivileged, `unshare` fails with `Operation not permitted` and the instance terminates at boot. `EC2_DOCKER_FLAGS` now takes a docker-CLI-style string (`--privileged`, `--cap-add`, `-e`, `-v`, `--tmpfs`, `--add-host`, `-m`, `--shm-size`) applied to every instance container; unset, nothing changes. `--init` is refused — instance containers always run with init. Contributed by @iot-rocket.
 ### Fixed
 - **EventBridge — dotted pattern keys resolve to the nested path** — [Event Ruler](https://github.com/aws/event-ruler) joins keys with `.` when compiling, so `{"detail.name": [...]}` and `{"detail": {"name": [...]}}` are the same sub-rule on AWS (verified with `TestEventPattern` against the real service); the 1.4 matcher rewrite read a dotted key as one literal segment, so such a rule silently matched nothing — consumer rules written in the dotted form delivered on 1.3.x and stopped after upgrading. Pattern keys are now split on `.` when the compiler extends the path, composing with `$or` expansion, value-side operators, and leaf/object collision handling. The residual divergence — an event *field* literally named `a.b` flattens to the same path on AWS but stays one key here — remains pinned by test; Ruler documents that collision as behaviour that "should not be relied upon". Contributed by @prandogabriel.
+- **IoT Core — an unresolvable action role fails `CreateTopicRule` instead of silently dropping the rule (`AUTH=true`)** — the role check added with the IAM request authorization answered `200 {}` while storing nothing: the store-layer helper returned the error response as a value and both API handlers discarded it, so a client (or a CloudFormation stack) saw success minus its rule. The check now raises through the same door as invalid rule SQL, `CreateTopicRule` / `ReplaceTopicRule` answer `400 InvalidRequestException` (`Unable to assume role: {arn}`) as real IoT does when it cannot assume the role, and the CloudFormation provisioner fails the resource. With `AUTH=false` nothing changes. Reported by @iot-rocket.
+- **RDS — Aurora PostgreSQL major-version selectors return the matching catalog** — `DescribeDBEngineVersions` treated `EngineVersion=16` as an exact version and returned nothing. Major-only selectors now return every advertised minor in that family, and `DefaultOnly=true` narrows the result to AWS's configured default minor for that major.
+
 
 ## [1.5.0] — 2026-08-23
 
