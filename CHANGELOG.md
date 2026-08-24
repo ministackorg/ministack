@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **EC2 — opt-in launch options for instance containers (`EC2_DOCKER_FLAGS`)** — a registered image that boots an operating system (systemd as PID 1) needs container options the fixed launch arguments cannot express: unprivileged, `unshare` fails with `Operation not permitted` and the instance terminates at boot. `EC2_DOCKER_FLAGS` now takes a docker-CLI-style string (`--privileged`, `--cap-add`, `-e`, `-v`, `--tmpfs`, `--add-host`, `-m`, `--shm-size`) applied to every instance container; unset, nothing changes. `--init` is refused — instance containers always run with init. Contributed by @iot-rocket.
+
 ## [1.5.0] — 2026-08-23
 
 ### Added
