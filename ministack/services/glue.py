@@ -1453,6 +1453,40 @@ def _execute_subprocess(run, job, args, resolved):
         run["ErrorMessage"] = str(e)[:2000]
 
 
+# Driver-side bootstrap submitted in place of the user script. The Glue 4.0
+# image ships botocore 1.27, which predates AWS_ENDPOINT_URL (botocore
+# 1.31.57), so the env var alone is silently ignored and a bare
+# boto3.client("s3") in the script escapes to real AWS — which answers
+# InvalidAccessKeyId for the emulator's credentials. Patching
+# Session.create_client covers every botocore vintage; the user script then
+# runs unmodified as __main__ with its own argv, so getResolvedOptions and
+# __name__ checks behave identically.
+_GLUE_BOOT_SCRIPT = """\
+import os
+import runpy
+import sys
+
+_endpoint = os.environ.get("AWS_ENDPOINT_URL")
+if _endpoint:
+    try:
+        import botocore.session as _bs
+        _orig_create_client = _bs.Session.create_client
+
+        def _create_client(self, *args, **kwargs):
+            if not kwargs.get("endpoint_url"):
+                kwargs["endpoint_url"] = _endpoint
+            return _orig_create_client(self, *args, **kwargs)
+
+        _bs.Session.create_client = _create_client
+    except Exception:
+        pass
+
+_script = {script!r}
+sys.argv = [_script] + sys.argv[1:]
+runpy.run_path(_script, run_name="__main__")
+"""
+
+
 def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
     """Run a Glue Spark job inside an amazon/aws-glue-libs Docker container."""
     glue_version = job.get("GlueVersion", "4.0")
@@ -1504,6 +1538,12 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
         "AWS_DEFAULT_REGION": get_region(),
         "AWS_REGION": get_region(),
+        # Route the script's own SDK clients (boto3 et al) at MiniStack, the
+        # same injection Lambda containers, CodeBuild and ECS RunTask do.
+        # Only the S3A conf below covered Spark reads/writes; a bare
+        # boto3.client("s3") in the script escaped to real AWS and failed
+        # InvalidAccessKeyId (#1492).
+        "AWS_ENDPOINT_URL": s3_endpoint,
         "DISABLE_SSL": "true",
     }
 
@@ -1532,9 +1572,11 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
             if conf:
                 cmd.extend(["--conf", conf])
 
-    # The script path inside the container
+    # The script path inside the container; spark-submit is handed the
+    # bootstrap, which re-runs the real script as __main__ (see
+    # _GLUE_BOOT_SCRIPT).
     container_script = f"/tmp/{os.path.basename(script_path)}"
-    cmd.append(container_script)
+    cmd.append("/tmp/_ministack_boot.py")
 
     # Append Glue job arguments (--key value pairs) after the script
     cmd.extend(spark_args)
@@ -1562,11 +1604,14 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         import io
         import tarfile
         script_data = open(script_path, "rb").read()
+        boot_data = _GLUE_BOOT_SCRIPT.format(script=container_script).encode()
         tar_buf = io.BytesIO()
         with tarfile.open(fileobj=tar_buf, mode="w") as tar:
-            info = tarfile.TarInfo(name=os.path.basename(script_path))
-            info.size = len(script_data)
-            tar.addfile(info, io.BytesIO(script_data))
+            for name, data in ((os.path.basename(script_path), script_data),
+                               ("_ministack_boot.py", boot_data)):
+                info = tarfile.TarInfo(name=name)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
         tar_buf.seek(0)
         container.put_archive("/tmp", tar_buf)
         container.start()

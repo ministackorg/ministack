@@ -12221,3 +12221,700 @@ def test_aurora_pg_replicating_reader_live(rds):
                 with pytest.raises(psycopg2.Error) as excinfo:
                     cursor.execute("INSERT INTO repl_rows VALUES (2, 'nope')")
         assert excinfo.value.pgcode == "25006"
+
+
+# ---------------------------------------------------------------------------
+# RDS Proxy (control plane)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def proxy_subnets(ec2):
+    vpc_id = ec2.create_vpc(CidrBlock="10.90.0.0/16")["Vpc"]["VpcId"]
+    subnet_a = ec2.create_subnet(
+        VpcId=vpc_id,
+        CidrBlock="10.90.1.0/24",
+        AvailabilityZone="us-east-1a",
+    )["Subnet"]["SubnetId"]
+    subnet_b = ec2.create_subnet(
+        VpcId=vpc_id,
+        CidrBlock="10.90.2.0/24",
+        AvailabilityZone="us-east-1b",
+    )["Subnet"]["SubnetId"]
+    return vpc_id, [subnet_a, subnet_b]
+
+
+PROXY_AUTH = [{
+    "AuthScheme": "SECRETS",
+    "SecretArn": "arn:aws:secretsmanager:us-east-1:000000000000:secret:db",
+    "IAMAuth": "DISABLED",
+}]
+
+
+def _create_proxy(rds, subnets, name, **kwargs):
+    kwargs.setdefault("EngineFamily", "POSTGRESQL")
+    kwargs.setdefault("RoleArn", "arn:aws:iam::000000000000:role/rds-proxy-role")
+    # AWS: "If you don't specify DefaultAuthScheme or specify this parameter
+    # as NONE, you must specify the Auth option."
+    if "DefaultAuthScheme" not in kwargs:
+        kwargs.setdefault("Auth", PROXY_AUTH)
+    return rds.create_db_proxy(
+        DBProxyName=name, VpcSubnetIds=subnets, **kwargs
+    )["DBProxy"]
+
+
+def test_rds_create_db_proxy_returns_documented_defaults(rds, proxy_subnets):
+    vpc_id, subnets = proxy_subnets
+    proxy = _create_proxy(rds, subnets, "parity-proxy")
+
+    assert proxy["DBProxyArn"].startswith(
+        "arn:aws:rds:us-east-1:000000000000:db-proxy:prx-"
+    )
+    assert proxy["Status"] == "available"
+    assert proxy["EngineFamily"] == "POSTGRESQL"
+    assert proxy["VpcId"] == vpc_id
+    assert proxy["VpcSubnetIds"] == subnets
+    # AWS documents these defaults on CreateDBProxy / DBProxy.
+    assert proxy["IdleClientTimeout"] == 1800
+    assert proxy["RequireTLS"] is False
+    assert proxy["DebugLogging"] is False
+    assert proxy["EndpointNetworkType"] == "IPV4"
+    assert proxy["TargetConnectionNetworkType"] == "IPV4"
+    assert proxy["Endpoint"].startswith("parity-proxy.proxy-")
+    assert proxy["Endpoint"].endswith(".us-east-1.rds.amazonaws.com")
+
+
+def test_rds_create_db_proxy_creates_default_endpoint_and_target_group(
+    rds, proxy_subnets,
+):
+    vpc_id, subnets = proxy_subnets
+    proxy = _create_proxy(rds, subnets, "default-parts-proxy")
+
+    endpoints = rds.describe_db_proxy_endpoints(
+        DBProxyName="default-parts-proxy"
+    )["DBProxyEndpoints"]
+    assert len(endpoints) == 1
+    endpoint = endpoints[0]
+    assert endpoint["DBProxyEndpointName"] == "default-parts-proxy"
+    assert endpoint["IsDefault"] is True
+    assert endpoint["TargetRole"] == "READ_WRITE"
+    assert endpoint["Endpoint"] == proxy["Endpoint"]
+    assert endpoint["VpcId"] == vpc_id
+    assert endpoint["DBProxyEndpointArn"].startswith(
+        "arn:aws:rds:us-east-1:000000000000:db-proxy-endpoint:prx-endpoint-"
+    )
+
+    groups = rds.describe_db_proxy_target_groups(
+        DBProxyName="default-parts-proxy"
+    )["TargetGroups"]
+    assert len(groups) == 1
+    group = groups[0]
+    assert group["TargetGroupName"] == "default"
+    assert group["IsDefault"] is True
+    assert group["Status"] == "available"
+    assert group["TargetGroupArn"].startswith(
+        "arn:aws:rds:us-east-1:000000000000:target-group:prx-tg-"
+    )
+    assert group["ConnectionPoolConfig"] == {
+        "MaxConnectionsPercent": 100,
+        "MaxIdleConnectionsPercent": 50,
+        "ConnectionBorrowTimeout": 120,
+        "SessionPinningFilters": [],
+    }
+
+
+def test_rds_db_proxy_sqlserver_connection_pool_defaults(rds, proxy_subnets):
+    _vpc_id, subnets = proxy_subnets
+    _create_proxy(rds, subnets, "sqlserver-proxy", EngineFamily="SQLSERVER")
+
+    config = rds.describe_db_proxy_target_groups(
+        DBProxyName="sqlserver-proxy"
+    )["TargetGroups"][0]["ConnectionPoolConfig"]
+    # "Default: 10 for RDS for Microsoft SQL Server" / "for SQL Server,
+    # MaxIdleConnectionsPercent is 5".
+    assert config["MaxConnectionsPercent"] == 10
+    assert config["MaxIdleConnectionsPercent"] == 5
+
+
+def test_rds_db_proxy_tags_and_auth_round_trip(rds, proxy_subnets):
+    _vpc_id, subnets = proxy_subnets
+    proxy = _create_proxy(
+        rds,
+        subnets,
+        "tagged-proxy",
+        Auth=[{
+            "Description": "main",
+            "AuthScheme": "SECRETS",
+            "SecretArn": "arn:aws:secretsmanager:us-east-1:000000000000:secret:db",
+            "IAMAuth": "DISABLED",
+        }],
+        Tags=[{"Key": "env", "Value": "dev"}],
+    )
+
+    assert proxy["Auth"] == [{
+        "Description": "main",
+        "AuthScheme": "SECRETS",
+        "SecretArn": "arn:aws:secretsmanager:us-east-1:000000000000:secret:db",
+        "IAMAuth": "DISABLED",
+    }]
+    assert rds.list_tags_for_resource(
+        ResourceName=proxy["DBProxyArn"]
+    )["TagList"] == [{"Key": "env", "Value": "dev"}]
+
+
+def test_rds_db_proxy_duplicate_name_and_unknown_lookups(rds, proxy_subnets):
+    _vpc_id, subnets = proxy_subnets
+    _create_proxy(rds, subnets, "dup-proxy")
+
+    with pytest.raises(ClientError) as exc_info:
+        _create_proxy(rds, subnets, "dup-proxy")
+    assert exc_info.value.response["Error"]["Code"] == "DBProxyAlreadyExistsFault"
+    assert exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+    with pytest.raises(ClientError) as exc_info:
+        rds.describe_db_proxies(DBProxyName="missing-proxy")
+    assert exc_info.value.response["Error"]["Code"] == "DBProxyNotFoundFault"
+    assert exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+    with pytest.raises(ClientError) as exc_info:
+        rds.describe_db_proxy_targets(
+            DBProxyName="dup-proxy", TargetGroupName="not-default",
+        )
+    assert exc_info.value.response["Error"]["Code"] == "DBProxyTargetGroupNotFoundFault"
+
+
+def test_rds_db_proxy_rejects_invalid_subnets(rds, proxy_subnets):
+    _vpc_id, subnets = proxy_subnets
+    with pytest.raises(ClientError) as exc_info:
+        _create_proxy(
+            rds, [subnets[0], "subnet-does-not-exist"], "bad-subnet-proxy",
+        )
+    assert exc_info.value.response["Error"]["Code"] == "InvalidSubnet"
+
+
+def test_rds_db_proxy_endpoint_lifecycle(rds, proxy_subnets):
+    _vpc_id, subnets = proxy_subnets
+    _create_proxy(rds, subnets, "endpoint-proxy")
+
+    endpoint = rds.create_db_proxy_endpoint(
+        DBProxyName="endpoint-proxy",
+        DBProxyEndpointName="reader-endpoint",
+        VpcSubnetIds=subnets,
+        TargetRole="READ_ONLY",
+    )["DBProxyEndpoint"]
+    assert endpoint["IsDefault"] is False
+    assert endpoint["TargetRole"] == "READ_ONLY"
+    assert endpoint["Endpoint"].startswith("reader-endpoint.endpoint.proxy-")
+
+    renamed = rds.modify_db_proxy_endpoint(
+        DBProxyEndpointName="reader-endpoint",
+        NewDBProxyEndpointName="reader-endpoint-2",
+        VpcSecurityGroupIds=["sg-01234567"],
+    )["DBProxyEndpoint"]
+    assert renamed["DBProxyEndpointName"] == "reader-endpoint-2"
+    assert renamed["VpcSecurityGroupIds"] == ["sg-01234567"]
+    assert renamed["Endpoint"].startswith("reader-endpoint-2.endpoint.proxy-")
+
+    deleted = rds.delete_db_proxy_endpoint(
+        DBProxyEndpointName="reader-endpoint-2"
+    )["DBProxyEndpoint"]
+    assert deleted["Status"] == "deleting"
+    assert [
+        e["DBProxyEndpointName"]
+        for e in rds.describe_db_proxy_endpoints(
+            DBProxyName="endpoint-proxy"
+        )["DBProxyEndpoints"]
+    ] == ["endpoint-proxy"]
+
+
+def test_rds_db_proxy_default_endpoint_cannot_be_modified_or_deleted(
+    rds, proxy_subnets,
+):
+    _vpc_id, subnets = proxy_subnets
+    _create_proxy(rds, subnets, "immutable-default-proxy")
+
+    with pytest.raises(ClientError) as exc_info:
+        rds.modify_db_proxy_endpoint(
+            DBProxyEndpointName="immutable-default-proxy",
+            VpcSecurityGroupIds=["sg-01234567"],
+        )
+    assert exc_info.value.response["Error"]["Code"] == (
+        "InvalidDBProxyEndpointStateFault"
+    )
+
+    with pytest.raises(ClientError) as exc_info:
+        rds.delete_db_proxy_endpoint(
+            DBProxyEndpointName="immutable-default-proxy",
+        )
+    assert exc_info.value.response["Error"]["Code"] == (
+        "InvalidDBProxyEndpointStateFault"
+    )
+
+
+def test_rds_db_proxy_target_registration(rds, proxy_subnets):
+    _vpc_id, subnets = proxy_subnets
+    _create_proxy(rds, subnets, "target-proxy")
+    rds.create_db_instance(
+        DBInstanceIdentifier="proxy-target-pg",
+        DBInstanceClass="db.t3.micro",
+        Engine="postgres",
+        MasterUsername="admin",
+        MasterUserPassword="password123",
+        AllocatedStorage=20,
+    )
+
+    targets = rds.register_db_proxy_targets(
+        DBProxyName="target-proxy",
+        TargetGroupName="default",
+        DBInstanceIdentifiers=["proxy-target-pg"],
+    )["DBProxyTargets"]
+    assert len(targets) == 1
+    target = targets[0]
+    assert target["Type"] == "RDS_INSTANCE"
+    assert target["Role"] == "READ_WRITE"
+    assert target["RdsResourceId"] == "proxy-target-pg"
+    assert target["TargetArn"] == (
+        "arn:aws:rds:us-east-1:000000000000:db:proxy-target-pg"
+    )
+    assert target["TargetHealth"]["State"] == "AVAILABLE"
+
+    with pytest.raises(ClientError) as exc_info:
+        rds.register_db_proxy_targets(
+            DBProxyName="target-proxy",
+            DBInstanceIdentifiers=["proxy-target-pg"],
+        )
+    assert exc_info.value.response["Error"]["Code"] == (
+        "DBProxyTargetAlreadyRegisteredFault"
+    )
+
+    with pytest.raises(ClientError) as exc_info:
+        rds.register_db_proxy_targets(
+            DBProxyName="target-proxy",
+            DBInstanceIdentifiers=["no-such-instance"],
+        )
+    assert exc_info.value.response["Error"]["Code"] == "DBInstanceNotFound"
+
+    with pytest.raises(ClientError) as exc_info:
+        rds.deregister_db_proxy_targets(
+            DBProxyName="target-proxy",
+            DBInstanceIdentifiers=["no-such-instance"],
+        )
+    assert exc_info.value.response["Error"]["Code"] == (
+        "DBProxyTargetNotFoundFault"
+    )
+
+    rds.deregister_db_proxy_targets(
+        DBProxyName="target-proxy",
+        DBInstanceIdentifiers=["proxy-target-pg"],
+    )
+    assert rds.describe_db_proxy_targets(
+        DBProxyName="target-proxy"
+    )["Targets"] == []
+    rds.delete_db_instance(
+        DBInstanceIdentifier="proxy-target-pg", SkipFinalSnapshot=True,
+    )
+
+
+def test_rds_db_proxy_cluster_target_is_tracked_cluster(rds, proxy_subnets):
+    _vpc_id, subnets = proxy_subnets
+    _create_proxy(rds, subnets, "cluster-target-proxy", EngineFamily="MYSQL")
+    rds.create_db_cluster(
+        DBClusterIdentifier="proxy-target-cluster",
+        Engine="aurora-mysql",
+        MasterUsername="admin",
+        MasterUserPassword="password123",
+    )
+
+    target = rds.register_db_proxy_targets(
+        DBProxyName="cluster-target-proxy",
+        DBClusterIdentifiers=["proxy-target-cluster"],
+    )["DBProxyTargets"][0]
+    assert target["Type"] == "TRACKED_CLUSTER"
+    assert target["TrackedClusterId"] == "proxy-target-cluster"
+    assert target["RdsResourceId"] == "proxy-target-cluster"
+    assert target["TargetArn"] == (
+        "arn:aws:rds:us-east-1:000000000000:cluster:proxy-target-cluster"
+    )
+    rds.delete_db_cluster(
+        DBClusterIdentifier="proxy-target-cluster", SkipFinalSnapshot=True,
+    )
+
+
+def test_rds_modify_db_proxy_target_group_connection_pool(rds, proxy_subnets):
+    _vpc_id, subnets = proxy_subnets
+    _create_proxy(rds, subnets, "pool-proxy")
+
+    group = rds.modify_db_proxy_target_group(
+        DBProxyName="pool-proxy",
+        TargetGroupName="default",
+        ConnectionPoolConfig={
+            "MaxConnectionsPercent": 80,
+            "MaxIdleConnectionsPercent": 40,
+            "ConnectionBorrowTimeout": 30,
+            "SessionPinningFilters": ["EXCLUDE_VARIABLE_SETS"],
+            "InitQuery": "SET x=1",
+        },
+    )["DBProxyTargetGroup"]
+    assert group["ConnectionPoolConfig"] == {
+        "MaxConnectionsPercent": 80,
+        "MaxIdleConnectionsPercent": 40,
+        "ConnectionBorrowTimeout": 30,
+        "SessionPinningFilters": ["EXCLUDE_VARIABLE_SETS"],
+        "InitQuery": "SET x=1",
+    }
+
+    with pytest.raises(ClientError) as exc_info:
+        rds.modify_db_proxy_target_group(
+            DBProxyName="pool-proxy",
+            TargetGroupName="default",
+            NewName="renamed",
+        )
+    assert exc_info.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+
+def test_rds_modify_and_delete_db_proxy(rds, proxy_subnets):
+    _vpc_id, subnets = proxy_subnets
+    _create_proxy(rds, subnets, "mutable-proxy")
+
+    proxy = rds.modify_db_proxy(
+        DBProxyName="mutable-proxy",
+        NewDBProxyName="mutable-proxy-2",
+        RequireTLS=True,
+        DebugLogging=True,
+        IdleClientTimeout=600,
+        SecurityGroups=["sg-0abcdef0"],
+        RoleArn="arn:aws:iam::000000000000:role/other-role",
+    )["DBProxy"]
+    assert proxy["DBProxyName"] == "mutable-proxy-2"
+    assert proxy["RequireTLS"] is True
+    assert proxy["DebugLogging"] is True
+    assert proxy["IdleClientTimeout"] == 600
+    assert proxy["VpcSecurityGroupIds"] == ["sg-0abcdef0"]
+    assert proxy["RoleArn"] == "arn:aws:iam::000000000000:role/other-role"
+    assert proxy["Endpoint"].startswith("mutable-proxy-2.proxy-")
+
+    # The default endpoint follows the rename.
+    endpoints = rds.describe_db_proxy_endpoints(
+        DBProxyName="mutable-proxy-2"
+    )["DBProxyEndpoints"]
+    assert [e["DBProxyEndpointName"] for e in endpoints] == ["mutable-proxy-2"]
+
+    deleted = rds.delete_db_proxy(DBProxyName="mutable-proxy-2")["DBProxy"]
+    assert deleted["Status"] == "deleting"
+    with pytest.raises(ClientError) as exc_info:
+        rds.describe_db_proxies(DBProxyName="mutable-proxy-2")
+    assert exc_info.value.response["Error"]["Code"] == "DBProxyNotFoundFault"
+    # Deleting the proxy takes its endpoints with it.
+    with pytest.raises(ClientError) as exc_info:
+        rds.describe_db_proxy_endpoints(DBProxyName="mutable-proxy-2")
+    assert exc_info.value.response["Error"]["Code"] == "DBProxyNotFoundFault"
+
+
+def test_rds_db_proxy_rejects_invalid_names_and_engine_family(rds, proxy_subnets):
+    _vpc_id, subnets = proxy_subnets
+
+    with pytest.raises(ClientError) as exc_info:
+        _create_proxy(rds, subnets, "9-starts-with-digit")
+    assert exc_info.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+    with pytest.raises(ClientError) as exc_info:
+        _create_proxy(rds, subnets, "trailing-hyphen-")
+    assert exc_info.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+    with pytest.raises(ClientError) as exc_info:
+        _create_proxy(rds, subnets, "oracle-proxy", EngineFamily="ORACLE")
+    assert exc_info.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+
+def test_rds_db_proxy_requires_auth_without_iam_default_scheme(rds, proxy_subnets):
+    _vpc_id, subnets = proxy_subnets
+
+    # "If you don't specify DefaultAuthScheme or specify this parameter as
+    # NONE, you must specify the Auth option."
+    with pytest.raises(ClientError) as exc_info:
+        rds.create_db_proxy(
+            DBProxyName="no-auth-proxy",
+            EngineFamily="POSTGRESQL",
+            RoleArn="arn:aws:iam::000000000000:role/rds-proxy-role",
+            VpcSubnetIds=subnets,
+        )
+    assert exc_info.value.response["Error"]["Code"] == (
+        "InvalidParameterCombination"
+    )
+
+    with pytest.raises(ClientError) as exc_info:
+        rds.create_db_proxy(
+            DBProxyName="none-scheme-proxy",
+            EngineFamily="POSTGRESQL",
+            RoleArn="arn:aws:iam::000000000000:role/rds-proxy-role",
+            VpcSubnetIds=subnets,
+            DefaultAuthScheme="NONE",
+        )
+    assert exc_info.value.response["Error"]["Code"] == (
+        "InvalidParameterCombination"
+    )
+
+    # IAM_AUTH stands alone.
+    proxy = rds.create_db_proxy(
+        DBProxyName="iam-auth-proxy",
+        EngineFamily="POSTGRESQL",
+        RoleArn="arn:aws:iam::000000000000:role/rds-proxy-role",
+        VpcSubnetIds=subnets,
+        DefaultAuthScheme="IAM_AUTH",
+    )["DBProxy"]
+    assert proxy["DefaultAuthScheme"] == "IAM_AUTH"
+    assert proxy["Auth"] == []
+
+
+def test_rds_db_proxy_validates_documented_ranges(rds, proxy_subnets):
+    _vpc_id, subnets = proxy_subnets
+
+    # "Constraints: 1 to 28,800"
+    for bad in (0, 28801):
+        with pytest.raises(ClientError) as exc_info:
+            _create_proxy(
+                rds, subnets, "timeout-proxy", IdleClientTimeout=bad,
+            )
+        assert exc_info.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+    _create_proxy(rds, subnets, "range-proxy")
+    for field, bad in (
+        ("MaxConnectionsPercent", 0),
+        ("MaxConnectionsPercent", 101),
+        ("ConnectionBorrowTimeout", 301),
+    ):
+        with pytest.raises(ClientError) as exc_info:
+            rds.modify_db_proxy_target_group(
+                DBProxyName="range-proxy",
+                TargetGroupName="default",
+                ConnectionPoolConfig={field: bad},
+            )
+        assert exc_info.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+    # "Must be between 0 and the value of MaxConnectionsPercent."
+    with pytest.raises(ClientError) as exc_info:
+        rds.modify_db_proxy_target_group(
+            DBProxyName="range-proxy",
+            TargetGroupName="default",
+            ConnectionPoolConfig={
+                "MaxConnectionsPercent": 50,
+                "MaxIdleConnectionsPercent": 60,
+            },
+        )
+    assert exc_info.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+    # "If you specify MaxIdleConnectionsPercent, then you must also include a
+    # value for MaxConnectionsPercent."
+    with pytest.raises(ClientError) as exc_info:
+        rds.modify_db_proxy_target_group(
+            DBProxyName="range-proxy",
+            TargetGroupName="default",
+            ConnectionPoolConfig={"MaxIdleConnectionsPercent": 10},
+        )
+    assert exc_info.value.response["Error"]["Code"] == (
+        "InvalidParameterCombination"
+    )
+
+
+def test_rds_db_proxy_max_idle_defaults_to_half_of_max_connections(
+    rds, proxy_subnets,
+):
+    _vpc_id, subnets = proxy_subnets
+    _create_proxy(rds, subnets, "half-proxy")
+
+    # "The default value is half of the value of MaxConnectionsPercent. For
+    # example, if MaxConnectionsPercent is 80, then the default value of
+    # MaxIdleConnectionsPercent is 40."
+    config = rds.modify_db_proxy_target_group(
+        DBProxyName="half-proxy",
+        TargetGroupName="default",
+        ConnectionPoolConfig={"MaxConnectionsPercent": 80},
+    )["DBProxyTargetGroup"]["ConnectionPoolConfig"]
+    assert config["MaxConnectionsPercent"] == 80
+    assert config["MaxIdleConnectionsPercent"] == 40
+    assert config["ConnectionBorrowTimeout"] == 120
+
+
+def test_rds_db_proxy_rejects_enum_values(rds, proxy_subnets):
+    _vpc_id, subnets = proxy_subnets
+
+    for field, bad in (
+        ("DefaultAuthScheme", "PASSWORD"),
+        ("EndpointNetworkType", "IPV5"),
+        ("TargetConnectionNetworkType", "DUAL"),
+    ):
+        with pytest.raises(ClientError) as exc_info:
+            _create_proxy(rds, subnets, "enum-proxy", **{field: bad})
+        assert exc_info.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+
+def test_rds_db_proxy_sqlserver_endpoint_must_be_read_write(rds, proxy_subnets):
+    _vpc_id, subnets = proxy_subnets
+    _create_proxy(rds, subnets, "mssql-proxy", EngineFamily="SQLSERVER")
+
+    # "The only role that proxies for RDS for Microsoft SQL Server support is
+    # READ_WRITE."
+    with pytest.raises(ClientError) as exc_info:
+        rds.create_db_proxy_endpoint(
+            DBProxyName="mssql-proxy",
+            DBProxyEndpointName="mssql-reader",
+            VpcSubnetIds=subnets,
+            TargetRole="READ_ONLY",
+        )
+    assert exc_info.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+
+def test_rds_db_proxy_target_engine_must_match_engine_family(rds, proxy_subnets):
+    _vpc_id, subnets = proxy_subnets
+    _create_proxy(rds, subnets, "family-proxy", EngineFamily="MYSQL")
+    rds.create_db_instance(
+        DBInstanceIdentifier="family-pg",
+        DBInstanceClass="db.t3.micro",
+        Engine="postgres",
+        MasterUsername="admin",
+        MasterUserPassword="password123",
+        AllocatedStorage=20,
+    )
+
+    with pytest.raises(ClientError) as exc_info:
+        rds.register_db_proxy_targets(
+            DBProxyName="family-proxy",
+            DBInstanceIdentifiers=["family-pg"],
+        )
+    assert exc_info.value.response["Error"]["Code"] == "InvalidParameterValue"
+    rds.delete_db_instance(
+        DBInstanceIdentifier="family-pg", SkipFinalSnapshot=True,
+    )
+
+
+def test_rds_db_proxy_takes_a_single_target(rds, proxy_subnets):
+    _vpc_id, subnets = proxy_subnets
+    _create_proxy(rds, subnets, "single-target-proxy")
+    for identifier in ("single-pg-a", "single-pg-b"):
+        rds.create_db_instance(
+            DBInstanceIdentifier=identifier,
+            DBInstanceClass="db.t3.micro",
+            Engine="postgres",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+            AllocatedStorage=20,
+        )
+
+    rds.register_db_proxy_targets(
+        DBProxyName="single-target-proxy",
+        DBInstanceIdentifiers=["single-pg-a"],
+    )
+    # "Each proxy can be associated with a single target DB instance."
+    with pytest.raises(ClientError) as exc_info:
+        rds.register_db_proxy_targets(
+            DBProxyName="single-target-proxy",
+            DBInstanceIdentifiers=["single-pg-b"],
+        )
+    assert exc_info.value.response["Error"]["Code"] == "InvalidParameterValue"
+    assert len(rds.describe_db_proxy_targets(
+        DBProxyName="single-target-proxy"
+    )["Targets"]) == 1
+
+    for identifier in ("single-pg-a", "single-pg-b"):
+        rds.delete_db_instance(
+            DBInstanceIdentifier=identifier, SkipFinalSnapshot=True,
+        )
+
+
+def test_rds_describe_db_proxies_paginates(rds, proxy_subnets):
+    _vpc_id, subnets = proxy_subnets
+    names = [f"page-proxy-{i}" for i in range(3)]
+    for name in names:
+        _create_proxy(rds, subnets, name)
+
+    # "Constraints: Minimum 20, maximum 100." botocore enforces the range
+    # client-side, so drive the server check over the raw Query API.
+    import requests
+    response = requests.post(
+        ENDPOINT,
+        data={"Action": "DescribeDBProxies", "Version": "2014-10-31",
+              "MaxRecords": "19"},
+        headers={"Authorization": "AWS4-HMAC-SHA256 "
+                 "Credential=test/20260824/us-east-1/rds/aws4_request"},
+        timeout=10,
+    )
+    assert response.status_code == 400
+    assert "<Code>InvalidParameterValue</Code>" in response.text
+
+    first = rds.describe_db_proxies(MaxRecords=20)
+    assert "Marker" not in first
+
+    seen = []
+    for page in rds.get_paginator("describe_db_proxies").paginate(
+        PaginationConfig={"PageSize": 20},
+    ):
+        seen.extend(p["DBProxyName"] for p in page["DBProxies"])
+    assert set(names).issubset(set(seen))
+    assert len(seen) == len(set(seen))
+
+
+def _delete_all_db_proxies(rds):
+    for proxy in rds.describe_db_proxies(MaxRecords=100)["DBProxies"]:
+        rds.delete_db_proxy(DBProxyName=proxy["DBProxyName"])
+
+
+def test_rds_db_proxy_quota(rds, proxy_subnets):
+    _vpc_id, subnets = proxy_subnets
+    # The quota is account/Region-wide, so start and finish from a clean slate
+    # rather than poisoning every later proxy test in this file.
+    _delete_all_db_proxies(rds)
+    try:
+        # "Each AWS account ID is limited to 20 proxies."
+        for i in range(20):
+            _create_proxy(rds, subnets, f"quota-proxy-{i}")
+
+        with pytest.raises(ClientError) as exc_info:
+            _create_proxy(rds, subnets, "quota-proxy-over")
+        assert exc_info.value.response["Error"]["Code"] == (
+            "DBProxyQuotaExceededFault"
+        )
+        assert exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    finally:
+        _delete_all_db_proxies(rds)
+
+
+def test_rds_db_proxy_target_health_follows_the_backing_instance(
+    rds, proxy_subnets,
+):
+    _vpc_id, subnets = proxy_subnets
+    _create_proxy(rds, subnets, "health-proxy")
+    rds.create_db_instance(
+        DBInstanceIdentifier="health-pg",
+        DBInstanceClass="db.t3.micro",
+        Engine="postgres",
+        MasterUsername="admin",
+        MasterUserPassword="password123",
+        AllocatedStorage=20,
+    )
+    target = rds.register_db_proxy_targets(
+        DBProxyName="health-proxy", DBInstanceIdentifiers=["health-pg"],
+    )["DBProxyTargets"][0]
+    assert target["TargetHealth"]["State"] == "AVAILABLE"
+    assert target["Endpoint"]
+
+    def health():
+        return rds.describe_db_proxy_targets(
+            DBProxyName="health-proxy"
+        )["Targets"][0]
+
+    rds.stop_db_instance(DBInstanceIdentifier="health-pg")
+    assert health()["TargetHealth"]["State"] == "UNAVAILABLE"
+    rds.start_db_instance(DBInstanceIdentifier="health-pg")
+    assert health()["TargetHealth"]["State"] == "AVAILABLE"
+
+    # A target must not keep reporting itself available at an address that no
+    # longer exists once its backing database is gone.
+    rds.delete_db_instance(
+        DBInstanceIdentifier="health-pg", SkipFinalSnapshot=True,
+    )
+    stale = health()
+    assert stale["TargetHealth"]["State"] == "UNAVAILABLE"
+    assert stale["TargetArn"] == ""
+    assert stale["Endpoint"] == ""
+    rds.deregister_db_proxy_targets(
+        DBProxyName="health-proxy", DBInstanceIdentifiers=["health-pg"],
+    )

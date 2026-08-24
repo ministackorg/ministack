@@ -6,6 +6,10 @@ on:
 
 env:
   DOCKERHUB_IMAGE_ORG: ministackorg/ministack-preview-build
+  # Suppress docker/build-push-action's auto-generated build summary and the
+  # .dockerbuild record artifact — noise on PR preview builds.
+  DOCKER_BUILD_SUMMARY: "false"
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
 
 jobs:
   publish-pr:
@@ -39,7 +43,7 @@ jobs:
 
       - name: Comment that auto-preview was skipped
         if: steps.guard.outputs.skip == 'true'
-        uses: peter-evans/create-or-update-comment@v4
+        uses: peter-evans/create-or-update-comment@v5
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           issue-number: ${{ github.event.pull_request.number }}
@@ -72,6 +76,11 @@ jobs:
       - name: Set up QEMU (multi-arch)
         if: steps.guard.outputs.skip != 'true'
         uses: docker/setup-qemu-action@v4
+        with:
+          # pull_request_target gets a read-only Actions cache, so caching the
+          # binfmt image fails with "cache write denied". Skip it — binfmt just
+          # reinstalls each run (a couple seconds), no warning.
+          cache-image: false
 
       - name: Set up Docker Buildx
         if: steps.guard.outputs.skip != 'true'
@@ -146,7 +155,7 @@ jobs:
 
       - name: Comment on PR with Docker image info
         if: steps.guard.outputs.skip != 'true'
-        uses: peter-evans/create-or-update-comment@v4
+        uses: peter-evans/create-or-update-comment@v5
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           issue-number: ${{ github.event.pull_request.number }}

@@ -2317,3 +2317,72 @@ def test_glue_json_rpc_surface_unaffected():
     )
     assert status == 200
     assert "rpc_db" in _svc("glue")._databases
+
+
+def test_glue_spark_container_env_points_sdk_at_ministack(tmp_path, monkeypatch):
+    """The Spark container env must carry AWS_ENDPOINT_URL so the script's own
+    boto3 clients hit MiniStack rather than escaping to real AWS, which answers
+    InvalidAccessKeyId for the emulator's credentials. Same injection the
+    Lambda-container, CodeBuild and ECS RunTask executors already do. Only the
+    spark.hadoop.fs.s3a.* conf covered Spark reads/writes."""
+    from ministack.services import glue as _glue
+
+    monkeypatch.setattr(_glue, "_ministack_network", "")
+    monkeypatch.delenv("MINISTACK_HOST", raising=False)
+    monkeypatch.delenv("EDGE_PORT", raising=False)
+
+    created = {}
+    archived = {}
+
+    class _FakeContainer:
+        def put_archive(self, path, data):
+            import io
+            import tarfile
+            with tarfile.open(fileobj=io.BytesIO(
+                    data.read() if hasattr(data, "read") else data)) as tar:
+                for m in tar.getmembers():
+                    archived[m.name] = tar.extractfile(m).read().decode()
+
+        def start(self):
+            pass
+
+        def wait(self, timeout=None):
+            return {"StatusCode": 0}
+
+        def logs(self, tail=None):
+            return b""
+
+        def remove(self, force=False, v=False):
+            pass
+
+    class _FakeContainers:
+        def get(self, name):
+            raise RuntimeError("no such container")
+
+        def create(self, **kwargs):
+            created.update(kwargs)
+            return _FakeContainer()
+
+    class _FakeDocker:
+        containers = _FakeContainers()
+
+    script = tmp_path / "job.py"
+    script.write_text("print('hi')")
+    run = {"Id": "jr_test1492"}
+    _glue._execute_spark_docker(
+        run, {"Timeout": 1}, "envjob", {}, str(script), _FakeDocker())
+
+    env = created["environment"]
+    assert env["AWS_ENDPOINT_URL"] == "http://host.docker.internal:4566"
+    # The SDK endpoint and the Spark S3A endpoint must agree.
+    s3a = [c for c in created["command"]
+           if isinstance(c, str) and c.startswith("spark.hadoop.fs.s3a.endpoint=")]
+    assert s3a == [f"spark.hadoop.fs.s3a.endpoint={env['AWS_ENDPOINT_URL']}"]
+    # spark-submit is handed the bootstrap, which patches create_client for
+    # botocore versions predating AWS_ENDPOINT_URL (Glue 4.0 ships 1.27) and
+    # then runs the real script as __main__.
+    assert created["command"][-1] == "/tmp/_ministack_boot.py"
+    assert set(archived) == {"job.py", "_ministack_boot.py"}
+    assert "'/tmp/job.py'" in archived["_ministack_boot.py"]
+    assert "create_client" in archived["_ministack_boot.py"]
+    assert run["JobRunState"] == "SUCCEEDED"
