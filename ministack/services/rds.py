@@ -21,7 +21,13 @@ Supports: CreateDBInstance, DeleteDBInstance, DescribeDBInstances, ModifyDBInsta
           CreateGlobalCluster, DescribeGlobalClusters, DeleteGlobalCluster,
           RemoveFromGlobalCluster, ModifyGlobalCluster,
           SwitchoverGlobalCluster, FailoverGlobalCluster,
-          EnableHttpEndpoint, DisableHttpEndpoint.
+          EnableHttpEndpoint, DisableHttpEndpoint,
+          CreateDBProxy, DescribeDBProxies, ModifyDBProxy, DeleteDBProxy,
+          CreateDBProxyEndpoint, DescribeDBProxyEndpoints,
+          ModifyDBProxyEndpoint, DeleteDBProxyEndpoint,
+          DescribeDBProxyTargetGroups, ModifyDBProxyTargetGroup,
+          RegisterDBProxyTargets, DeregisterDBProxyTargets,
+          DescribeDBProxyTargets.
 
 When Docker is available, CreateDBInstance spins up a real Postgres/MySQL container
 and returns the actual host:port as the endpoint.
@@ -39,6 +45,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets as stdlib_secrets
 import socket
 import threading
@@ -103,6 +110,8 @@ _snapshots = AccountRegionScopedDict()
 _db_cluster_param_groups = AccountRegionScopedDict()
 _db_cluster_snapshots = AccountRegionScopedDict()
 _option_groups = AccountRegionScopedDict()
+_db_proxies = AccountRegionScopedDict()
+_db_proxy_endpoints = AccountRegionScopedDict()
 _global_clusters = AccountScopedDict()
 _tags = AccountScopedDict()
 _port_counter = [BASE_PORT]
@@ -315,6 +324,8 @@ def get_state():
             "db_cluster_param_groups": copy.deepcopy(_db_cluster_param_groups),
             "db_cluster_snapshots": copy.deepcopy(_db_cluster_snapshots),
             "option_groups": copy.deepcopy(_option_groups),
+            "db_proxies": copy.deepcopy(_db_proxies),
+            "db_proxy_endpoints": copy.deepcopy(_db_proxy_endpoints),
             "global_clusters": copy.deepcopy(_global_clusters),
             "tags": copy.deepcopy(_tags),
             "port_counter": _port_counter[0],
@@ -362,6 +373,8 @@ def restore_state(data):
     _db_cluster_param_groups.update(data.get("db_cluster_param_groups", {}))
     _db_cluster_snapshots.update(data.get("db_cluster_snapshots", {}))
     _option_groups.update(data.get("option_groups", {}))
+    _db_proxies.update(data.get("db_proxies", {}))
+    _db_proxy_endpoints.update(data.get("db_proxy_endpoints", {}))
     _global_clusters.update(data.get("global_clusters", {}))
     # Persistence contains every account, while AccountScopedDict.values()
     # intentionally exposes only the active request account. Reconcile the
@@ -2992,6 +3005,44 @@ def _json_key_to_query_param_name(key: str) -> str:
     return key
 
 
+def _flatten_json_scalar(params, key, val):
+    if isinstance(val, bool):
+        params[key] = ["true" if val else "false"]
+    elif isinstance(val, (int, float)):
+        params[key] = [str(val)]
+    elif isinstance(val, str):
+        params[key] = [val]
+    else:
+        return False
+    return True
+
+
+def _flatten_json_struct(params, prefix, data):
+    """Flatten a nested JSON object to Query-API ``Prefix.Member`` params."""
+    for key, val in data.items():
+        if val is None:
+            continue
+        qkey = f"{prefix}.{key}"
+        if _flatten_json_scalar(params, qkey, val):
+            continue
+        if isinstance(val, list):
+            _flatten_json_list(params, qkey, val)
+        elif isinstance(val, dict):
+            _flatten_json_struct(params, qkey, val)
+
+
+def _flatten_json_list(params, prefix, values):
+    """Flatten a JSON array to the Query-API ``Prefix.member.N`` form."""
+    for i, item in enumerate(values, 1):
+        base = f"{prefix}.member.{i}"
+        if item is None:
+            continue
+        if _flatten_json_scalar(params, base, item):
+            continue
+        if isinstance(item, dict):
+            _flatten_json_struct(params, base, item)
+
+
 def _flatten_json_request_params(params, data):
     """Merge SigV4 JSON (``application/x-amz-json-1.*``) bodies into query-style params.
 
@@ -3004,13 +3055,9 @@ def _flatten_json_request_params(params, data):
         if val is None:
             continue
         qkey = _json_key_to_query_param_name(key)
-        if isinstance(val, bool):
-            params[qkey] = ["true" if val else "false"]
-        elif isinstance(val, (int, float)):
-            params[qkey] = [str(val)]
-        elif isinstance(val, str):
-            params[qkey] = [val]
-        elif isinstance(val, list) and qkey == "Filters":
+        if _flatten_json_scalar(params, qkey, val):
+            continue
+        if isinstance(val, list) and qkey == "Filters":
             for i, f in enumerate(val, 1):
                 if not isinstance(f, dict):
                     continue
@@ -3021,6 +3068,10 @@ def _flatten_json_request_params(params, data):
                 values = f.get("Values") or f.get("values") or []
                 for j, v in enumerate(values, 1):
                     params[f"Filters.member.{i}.Values.member.{j}"] = [str(v)]
+        elif isinstance(val, list):
+            _flatten_json_list(params, qkey, val)
+        elif isinstance(val, dict):
+            _flatten_json_struct(params, qkey, val)
 
 
 def _handle_request_sync(method, path, headers, body, query_params):
@@ -7608,6 +7659,1154 @@ def _default_parameters_for_family(family):
     return base
 
 
+# ---------------------------------------------------------------------------
+# RDS Proxy (control plane)
+#
+# Emulation scope: metadata only. Proxies, proxy endpoints, the default target
+# group and its registered targets are modelled with the documented AWS shapes,
+# defaults, constraints and error codes, but no connection pooling happens —
+# the endpoint hostnames are synthetic and nothing listens on them. Clients
+# keep connecting to the instance/cluster endpoints. This is what Terraform,
+# CloudFormation and Crossplane exercise (#1488).
+# ---------------------------------------------------------------------------
+
+# Names for proxies, proxy endpoints and target groups share one constraint:
+# "must begin with a letter and must contain only ASCII letters, digits, and
+# hyphens; it can't end with a hyphen or contain two consecutive hyphens".
+_DB_PROXY_NAME_RE = re.compile(r"^[a-zA-Z](?:-?[a-zA-Z0-9]+)*$")
+_DB_PROXY_ENGINE_FAMILIES = ("MYSQL", "POSTGRESQL", "SQLSERVER")
+_DB_PROXY_DEFAULT_TARGET_GROUP = "default"
+# "Each AWS account ID is limited to 20 proxies."
+_DB_PROXY_QUOTA = 20
+# "You can add up to 20 additional proxy endpoints for each proxy."
+_DB_PROXY_MAX_USER_ENDPOINTS = 20
+# "Array Members: Minimum number of 0 items. Maximum number of 200 items."
+_DB_PROXY_MAX_AUTH_ENTRIES = 200
+# DescribeDBProxies* MaxRecords: "Default: 100  Constraints: Minimum 20,
+# maximum 100."
+_DB_PROXY_DEFAULT_MAX_RECORDS = 100
+_DB_PROXY_MIN_MAX_RECORDS = 20
+# EngineFamily -> the engines that family "supports", per the DBProxy docs:
+# "MYSQL supports Aurora MySQL, RDS for MariaDB, and RDS for MySQL databases.
+# POSTGRESQL supports Aurora PostgreSQL and RDS for PostgreSQL databases.
+# SQLSERVER supports RDS for Microsoft SQL Server databases."
+_DB_PROXY_ENGINE_FAMILY_ENGINES = {
+    "MYSQL": ("mysql", "mariadb", "aurora-mysql", "aurora"),
+    "POSTGRESQL": ("postgres", "aurora-postgresql"),
+    "SQLSERVER": (
+        "sqlserver-se", "sqlserver-ee", "sqlserver-ex", "sqlserver-web",
+    ),
+}
+
+
+def _new_db_proxy_id(prefix):
+    return f"{prefix}-{stdlib_secrets.token_hex(9)[:17]}"
+
+
+def _invalid_parameter_value(message):
+    return _error("InvalidParameterValue", message, 400)
+
+
+def _invalid_parameter_combination(message):
+    return _error("InvalidParameterCombination", message, 400)
+
+
+def _db_proxy_name_error(name, label):
+    if not name:
+        return _error("MissingParameter", f"{label} is required", 400)
+    if len(name) > 63 or not _DB_PROXY_NAME_RE.match(name):
+        return _invalid_parameter_value(
+            f"The parameter {label} is not a valid identifier. "
+            "Identifiers must begin with a letter; must contain only ASCII "
+            "letters, digits, and hyphens; and must not end with a hyphen or "
+            "contain two consecutive hyphens."
+        )
+    return None
+
+
+def _db_proxy_enum_error(params, label, allowed):
+    value = _p(params, label)
+    if value and value not in allowed:
+        return _invalid_parameter_value(
+            f"Invalid value {value} for {label}. "
+            f"Valid values are {' | '.join(allowed)}."
+        )
+    return None
+
+
+def _db_proxy_int_error(params, label, minimum, maximum):
+    """Return (value, error). value is None when the parameter is absent."""
+    raw = _p(params, label)
+    if not raw:
+        return None, None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None, _invalid_parameter_value(
+            f"Invalid value {raw} for {label}. Must be an integer."
+        )
+    if value < minimum or value > maximum:
+        return None, _invalid_parameter_value(
+            f"Invalid value {value} for {label}. "
+            f"Must be between {minimum} and {maximum}."
+        )
+    return value, None
+
+
+def _db_proxy_not_found(name):
+    return _error(
+        "DBProxyNotFoundFault",
+        f"The specified proxy name {name} doesn't correspond to a proxy owned "
+        "by your Amazon Web Services account in the specified Amazon Web "
+        "Services Region.",
+        404,
+    )
+
+
+def _db_proxy_endpoint_not_found(name):
+    return _error(
+        "DBProxyEndpointNotFoundFault",
+        f"The DB proxy endpoint {name} doesn't exist.",
+        404,
+    )
+
+
+def _db_proxy_target_group_not_found(name):
+    return _error(
+        "DBProxyTargetGroupNotFoundFault",
+        f"The specified target group {name} isn't available for a proxy owned "
+        "by your Amazon Web Services account in the specified Amazon Web "
+        "Services Region.",
+        404,
+    )
+
+
+def _get_db_proxy(name):
+    return _request_region_get(_db_proxies, name, "db-proxy")
+
+
+def _db_proxy_page(params, records, key_fn, label):
+    """Apply the RDS `Marker` / `MaxRecords` contract.
+
+    Returns ``(page, next_marker, error)``. ``next_marker`` is None when the
+    page is the last one, in which case no `Marker` is emitted.
+    """
+    max_records, error = _db_proxy_int_error(
+        params, "MaxRecords",
+        _DB_PROXY_MIN_MAX_RECORDS, _DB_PROXY_DEFAULT_MAX_RECORDS,
+    )
+    if error:
+        return None, None, error
+    if max_records is None:
+        max_records = _DB_PROXY_DEFAULT_MAX_RECORDS
+
+    marker = _p(params, "Marker")
+    if marker:
+        keys = [key_fn(record) for record in records]
+        if marker not in keys:
+            return None, None, _invalid_parameter_value(
+                f"Invalid value {marker} for Marker. "
+                f"It does not identify a {label} in this request's results."
+            )
+        records = records[keys.index(marker) + 1:]
+
+    page = records[:max_records]
+    next_marker = key_fn(page[-1]) if len(records) > max_records else None
+    return page, next_marker, None
+
+
+def _marker_xml(next_marker):
+    return f"<Marker>{_esc(next_marker)}</Marker>" if next_marker else ""
+
+
+def _parse_user_auth_configs(params, prefix="Auth"):
+    """Parse Auth.member.N.<field> (Query API) into UserAuthConfig dicts."""
+    fields = (
+        "Description",
+        "UserName",
+        "AuthScheme",
+        "SecretArn",
+        "IAMAuth",
+        "ClientPasswordAuthType",
+    )
+    configs = []
+    i = 1
+    while True:
+        base = f"{prefix}.member.{i}"
+        if not any(_p(params, f"{base}.{field}") for field in fields):
+            break
+        entry = {}
+        for field in fields:
+            value = _p(params, f"{base}.{field}")
+            if value:
+                entry[field] = value
+        configs.append(entry)
+        i += 1
+    return configs
+
+
+def _db_proxy_auth_error(auth):
+    if len(auth) > _DB_PROXY_MAX_AUTH_ENTRIES:
+        return _invalid_parameter_value(
+            f"Invalid number of Auth entries: {len(auth)}. "
+            f"A proxy supports at most {_DB_PROXY_MAX_AUTH_ENTRIES}."
+        )
+    for entry in auth:
+        scheme = entry.get("AuthScheme")
+        if scheme and scheme != "SECRETS":
+            return _invalid_parameter_value(
+                f"Invalid value {scheme} for AuthScheme. "
+                "Valid values are SECRETS."
+            )
+        iam_auth = entry.get("IAMAuth")
+        if iam_auth and iam_auth not in ("DISABLED", "REQUIRED", "ENABLED"):
+            return _invalid_parameter_value(
+                f"Invalid value {iam_auth} for IAMAuth. "
+                "Valid values are DISABLED | REQUIRED | ENABLED."
+            )
+    return None
+
+
+def _default_connection_pool_config(engine_family):
+    # "Default: 10 for RDS for Microsoft SQL Server, and 100 for all other
+    # engines" / "If the value of MaxConnectionsPercent isn't specified, then
+    # for SQL Server, MaxIdleConnectionsPercent is 5, and for all other
+    # engines, the default is 50" / "Default: 120".
+    sqlserver = engine_family == "SQLSERVER"
+    return {
+        "MaxConnectionsPercent": 10 if sqlserver else 100,
+        "MaxIdleConnectionsPercent": 5 if sqlserver else 50,
+        "ConnectionBorrowTimeout": 120,
+        "SessionPinningFilters": [],
+    }
+
+
+def _create_db_proxy(p):
+    name = _p(p, "DBProxyName")
+    name_error = _db_proxy_name_error(name, "DBProxyName")
+    if name_error:
+        return name_error
+
+    engine_family = _p(p, "EngineFamily")
+    if not engine_family:
+        return _error("MissingParameter", "EngineFamily is required", 400)
+    if engine_family not in _DB_PROXY_ENGINE_FAMILIES:
+        return _invalid_parameter_value(
+            f"Invalid value {engine_family} for EngineFamily. "
+            f"Valid values are {' | '.join(_DB_PROXY_ENGINE_FAMILIES)}."
+        )
+
+    role_arn = _p(p, "RoleArn")
+    if not role_arn:
+        return _error("MissingParameter", "RoleArn is required", 400)
+    if not 20 <= len(role_arn) <= 2048:
+        return _invalid_parameter_value(
+            "Invalid value for RoleArn. Must be between 20 and 2048 "
+            "characters."
+        )
+
+    subnet_ids = _parse_member_list(p, "VpcSubnetIds")
+    if not subnet_ids:
+        return _error("MissingParameter", "VpcSubnetIds is required", 400)
+
+    for label, allowed in (
+        ("DefaultAuthScheme", ("IAM_AUTH", "NONE")),
+        ("EndpointNetworkType", ("IPV4", "IPV6", "DUAL")),
+        ("TargetConnectionNetworkType", ("IPV4", "IPV6")),
+    ):
+        enum_error = _db_proxy_enum_error(p, label, allowed)
+        if enum_error:
+            return enum_error
+
+    idle_timeout, error = _db_proxy_int_error(p, "IdleClientTimeout", 1, 28800)
+    if error:
+        return error
+
+    auth = _parse_user_auth_configs(p)
+    auth_error = _db_proxy_auth_error(auth)
+    if auth_error:
+        return auth_error
+    default_auth_scheme = _p(p, "DefaultAuthScheme")
+    # "If you don't specify DefaultAuthScheme or specify this parameter as
+    # NONE, you must specify the Auth option."
+    if default_auth_scheme in ("", "NONE") and not auth:
+        return _invalid_parameter_combination(
+            "Auth is required when DefaultAuthScheme is not specified or is "
+            "NONE."
+        )
+
+    if _db_proxies.get(name):
+        return _error(
+            "DBProxyAlreadyExistsFault",
+            f"The specified proxy name {name} must be unique for all proxies "
+            "owned by your Amazon Web Services account in the specified "
+            "Amazon Web Services Region.",
+            400,
+        )
+    if len(_db_proxies.values()) >= _DB_PROXY_QUOTA:
+        return _error(
+            "DBProxyQuotaExceededFault",
+            "Your Amazon Web Services account already has the maximum number "
+            "of proxies in the specified Amazon Web Services Region.",
+            400,
+        )
+
+    resolved = _resolve_subnet_group_members(subnet_ids)
+    if resolved is None:
+        return _error("InvalidSubnet", _INVALID_SUBNET_MESSAGE, 400)
+    _subnets, vpc_id = resolved
+
+    region = get_region()
+    account_id = get_account_id()
+    proxy_id = _new_db_proxy_id("prx")
+    arn = f"arn:aws:rds:{region}:{account_id}:db-proxy:{proxy_id}"
+    # Real endpoints read "the-proxy.proxy-demo.us-east-1.rds.amazonaws.com" —
+    # the middle label is an account/region-scoped hash we can only synthesize.
+    endpoint_suffix = new_uuid()[:8]
+    now = time.time()
+
+    proxy = {
+        "DBProxyName": name,
+        "DBProxyArn": arn,
+        "Status": "available",
+        "EngineFamily": engine_family,
+        "VpcId": vpc_id,
+        "VpcSecurityGroupIds": _parse_member_list(p, "VpcSecurityGroupIds"),
+        "VpcSubnetIds": subnet_ids,
+        "Auth": auth,
+        "RoleArn": role_arn,
+        "Endpoint": f"{name}.proxy-{endpoint_suffix}.{region}.rds.amazonaws.com",
+        "RequireTLS": _p(p, "RequireTLS") == "true",
+        # "Default: 1800 (30 minutes)  Constraints: 1 to 28,800"
+        "IdleClientTimeout": idle_timeout if idle_timeout is not None else 1800,
+        "DebugLogging": _p(p, "DebugLogging") == "true",
+        "CreatedDate": now,
+        "UpdatedDate": now,
+        # "Default: IPV4" for both network-type parameters.
+        "EndpointNetworkType": _p(p, "EndpointNetworkType") or "IPV4",
+        "TargetConnectionNetworkType": _p(p, "TargetConnectionNetworkType") or "IPV4",
+        "_EndpointSuffix": endpoint_suffix,
+        "TargetGroup": {
+            "DBProxyName": name,
+            "TargetGroupName": _DB_PROXY_DEFAULT_TARGET_GROUP,
+            "TargetGroupArn": (
+                f"arn:aws:rds:{region}:{account_id}:target-group:"
+                f"{_new_db_proxy_id('prx-tg')}"
+            ),
+            "IsDefault": True,
+            "Status": "available",
+            "ConnectionPoolConfig": _default_connection_pool_config(engine_family),
+            "CreatedDate": now,
+            "UpdatedDate": now,
+        },
+        "Targets": [],
+    }
+    if default_auth_scheme:
+        proxy["DefaultAuthScheme"] = default_auth_scheme
+    _db_proxies[name] = proxy
+
+    # "RDS automatically creates one endpoint for each DB proxy." Default
+    # endpoints always have read/write capability.
+    _db_proxy_endpoints[name] = {
+        "DBProxyEndpointName": name,
+        "DBProxyEndpointArn": (
+            f"arn:aws:rds:{region}:{account_id}:db-proxy-endpoint:"
+            f"{_new_db_proxy_id('prx-endpoint')}"
+        ),
+        "DBProxyName": name,
+        "Status": "available",
+        "VpcId": vpc_id,
+        "VpcSecurityGroupIds": list(proxy["VpcSecurityGroupIds"]),
+        "VpcSubnetIds": list(subnet_ids),
+        "Endpoint": proxy["Endpoint"],
+        "CreatedDate": now,
+        "TargetRole": "READ_WRITE",
+        "IsDefault": True,
+        "EndpointNetworkType": proxy["EndpointNetworkType"],
+    }
+
+    req_tags = _parse_tags(p)
+    if req_tags:
+        _tags[arn] = req_tags
+
+    return _xml(200, "CreateDBProxyResponse",
+        f"<CreateDBProxyResult><DBProxy>{_db_proxy_xml(proxy)}</DBProxy></CreateDBProxyResult>")
+
+
+def _describe_db_proxies(p):
+    name = _p(p, "DBProxyName")
+    if name:
+        proxy = _get_db_proxy(name)
+        if not proxy:
+            return _db_proxy_not_found(name)
+        proxies = [proxy]
+    else:
+        proxies = sorted(
+            _db_proxies.values(), key=lambda px: px["DBProxyName"],
+        )
+
+    page, next_marker, error = _db_proxy_page(
+        p, proxies, lambda px: px["DBProxyName"], "DB proxy",
+    )
+    if error:
+        return error
+
+    members = "".join(f"<member>{_db_proxy_xml(px)}</member>" for px in page)
+    return _xml(200, "DescribeDBProxiesResponse",
+        f"<DescribeDBProxiesResult><DBProxies>{members}</DBProxies>"
+        f"{_marker_xml(next_marker)}</DescribeDBProxiesResult>")
+
+
+def _modify_db_proxy(p):
+    name = _p(p, "DBProxyName")
+    proxy = _get_db_proxy(name)
+    if not proxy:
+        return _db_proxy_not_found(name)
+
+    new_name = _p(p, "NewDBProxyName")
+    if new_name and new_name != name:
+        name_error = _db_proxy_name_error(new_name, "NewDBProxyName")
+        if name_error:
+            return name_error
+        if _db_proxies.get(new_name):
+            return _error(
+                "DBProxyAlreadyExistsFault",
+                f"The specified proxy name {new_name} must be unique for all "
+                "proxies owned by your Amazon Web Services account in the "
+                "specified Amazon Web Services Region.",
+                400,
+            )
+
+    enum_error = _db_proxy_enum_error(
+        p, "DefaultAuthScheme", ("IAM_AUTH", "NONE"),
+    )
+    if enum_error:
+        return enum_error
+
+    idle_timeout, error = _db_proxy_int_error(p, "IdleClientTimeout", 1, 28800)
+    if error:
+        return error
+
+    role_arn = _p(p, "RoleArn")
+    if role_arn and not 20 <= len(role_arn) <= 2048:
+        return _invalid_parameter_value(
+            "Invalid value for RoleArn. Must be between 20 and 2048 "
+            "characters."
+        )
+
+    auth = _parse_user_auth_configs(p)
+    auth_error = _db_proxy_auth_error(auth)
+    if auth_error:
+        return auth_error
+    default_auth_scheme = _p(p, "DefaultAuthScheme")
+    effective_auth = auth or proxy["Auth"]
+    effective_scheme = default_auth_scheme or proxy.get("DefaultAuthScheme", "")
+    if effective_scheme in ("", "NONE") and not effective_auth:
+        return _invalid_parameter_combination(
+            "Auth is required when DefaultAuthScheme is not specified or is "
+            "NONE."
+        )
+
+    if "RequireTLS" in p:
+        proxy["RequireTLS"] = _p(p, "RequireTLS") == "true"
+    if "DebugLogging" in p:
+        proxy["DebugLogging"] = _p(p, "DebugLogging") == "true"
+    if idle_timeout is not None:
+        proxy["IdleClientTimeout"] = idle_timeout
+    if role_arn:
+        proxy["RoleArn"] = role_arn
+    if default_auth_scheme:
+        proxy["DefaultAuthScheme"] = default_auth_scheme
+    if auth:
+        proxy["Auth"] = auth
+    security_groups = _parse_member_list(p, "SecurityGroups")
+    if security_groups:
+        proxy["VpcSecurityGroupIds"] = security_groups
+
+    if new_name and new_name != name:
+        region = get_region()
+        proxy["DBProxyName"] = new_name
+        proxy["Endpoint"] = (
+            f"{new_name}.proxy-{proxy['_EndpointSuffix']}.{region}.rds.amazonaws.com"
+        )
+        proxy["TargetGroup"]["DBProxyName"] = new_name
+        for endpoint in list(_db_proxy_endpoints.values()):
+            if endpoint["DBProxyName"] != name:
+                continue
+            endpoint["DBProxyName"] = new_name
+            if endpoint.get("IsDefault"):
+                endpoint["DBProxyEndpointName"] = new_name
+                endpoint["Endpoint"] = proxy["Endpoint"]
+                _db_proxy_endpoints.pop(name, None)
+                _db_proxy_endpoints[new_name] = endpoint
+        _db_proxies.pop(name, None)
+        _db_proxies[new_name] = proxy
+
+    proxy["UpdatedDate"] = time.time()
+    return _xml(200, "ModifyDBProxyResponse",
+        f"<ModifyDBProxyResult><DBProxy>{_db_proxy_xml(proxy)}</DBProxy></ModifyDBProxyResult>")
+
+
+def _delete_db_proxy(p):
+    name = _p(p, "DBProxyName")
+    proxy = _get_db_proxy(name)
+    if not proxy:
+        return _db_proxy_not_found(name)
+
+    proxy_name = proxy["DBProxyName"]
+    for endpoint_name, endpoint in list(_db_proxy_endpoints.items()):
+        if endpoint["DBProxyName"] == proxy_name:
+            _tags.pop(endpoint.get("DBProxyEndpointArn", ""), None)
+            _db_proxy_endpoints.pop(endpoint_name, None)
+    _db_proxies.pop(proxy_name, None)
+    _tags.pop(proxy.get("DBProxyArn", ""), None)
+
+    proxy["Status"] = "deleting"
+    return _xml(200, "DeleteDBProxyResponse",
+        f"<DeleteDBProxyResult><DBProxy>{_db_proxy_xml(proxy)}</DBProxy></DeleteDBProxyResult>")
+
+
+def _create_db_proxy_endpoint(p):
+    proxy_name = _p(p, "DBProxyName")
+    proxy = _get_db_proxy(proxy_name)
+    if not proxy:
+        return _db_proxy_not_found(proxy_name)
+
+    endpoint_name = _p(p, "DBProxyEndpointName")
+    name_error = _db_proxy_name_error(endpoint_name, "DBProxyEndpointName")
+    if name_error:
+        return name_error
+
+    for label, allowed in (
+        ("TargetRole", ("READ_WRITE", "READ_ONLY")),
+        ("EndpointNetworkType", ("IPV4", "IPV6", "DUAL")),
+    ):
+        enum_error = _db_proxy_enum_error(p, label, allowed)
+        if enum_error:
+            return enum_error
+
+    target_role = _p(p, "TargetRole") or "READ_WRITE"
+    # "The only role that proxies for RDS for Microsoft SQL Server support is
+    # READ_WRITE."
+    if proxy["EngineFamily"] == "SQLSERVER" and target_role != "READ_WRITE":
+        return _invalid_parameter_value(
+            f"Invalid value {target_role} for TargetRole. The only role that "
+            "proxies for RDS for Microsoft SQL Server support is READ_WRITE."
+        )
+
+    if _db_proxy_endpoints.get(endpoint_name):
+        return _error(
+            "DBProxyEndpointAlreadyExistsFault",
+            f"The specified DB proxy endpoint name {endpoint_name} must be "
+            "unique for all DB proxy endpoints owned by your Amazon Web "
+            "Services account in the specified Amazon Web Services Region.",
+            400,
+        )
+
+    user_defined = [
+        endpoint
+        for endpoint in _db_proxy_endpoints.values()
+        if endpoint["DBProxyName"] == proxy["DBProxyName"]
+        and not endpoint.get("IsDefault")
+    ]
+    if len(user_defined) >= _DB_PROXY_MAX_USER_ENDPOINTS:
+        return _error(
+            "DBProxyEndpointQuotaExceededFault",
+            "The DB proxy already has the maximum number of endpoints.",
+            400,
+        )
+
+    subnet_ids = _parse_member_list(p, "VpcSubnetIds")
+    if not subnet_ids:
+        return _error("MissingParameter", "VpcSubnetIds is required", 400)
+    resolved = _resolve_subnet_group_members(subnet_ids)
+    if resolved is None:
+        return _error("InvalidSubnet", _INVALID_SUBNET_MESSAGE, 400)
+    _subnets, vpc_id = resolved
+
+    region = get_region()
+    security_groups = _parse_member_list(p, "VpcSecurityGroupIds")
+    endpoint = {
+        "DBProxyEndpointName": endpoint_name,
+        "DBProxyEndpointArn": (
+            f"arn:aws:rds:{region}:{get_account_id()}:db-proxy-endpoint:"
+            f"{_new_db_proxy_id('prx-endpoint')}"
+        ),
+        "DBProxyName": proxy["DBProxyName"],
+        "Status": "available",
+        "VpcId": vpc_id,
+        "VpcSecurityGroupIds": security_groups or list(proxy["VpcSecurityGroupIds"]),
+        "VpcSubnetIds": subnet_ids,
+        "Endpoint": (
+            f"{endpoint_name}.endpoint.proxy-{proxy['_EndpointSuffix']}"
+            f".{region}.rds.amazonaws.com"
+        ),
+        "CreatedDate": time.time(),
+        # "The default is READ_WRITE."
+        "TargetRole": target_role,
+        "IsDefault": False,
+        "EndpointNetworkType": _p(p, "EndpointNetworkType") or "IPV4",
+    }
+    _db_proxy_endpoints[endpoint_name] = endpoint
+
+    req_tags = _parse_tags(p)
+    if req_tags:
+        _tags[endpoint["DBProxyEndpointArn"]] = req_tags
+
+    return _xml(200, "CreateDBProxyEndpointResponse",
+        "<CreateDBProxyEndpointResult><DBProxyEndpoint>"
+        f"{_db_proxy_endpoint_xml(endpoint)}"
+        "</DBProxyEndpoint></CreateDBProxyEndpointResult>")
+
+
+def _describe_db_proxy_endpoints(p):
+    proxy_name = _p(p, "DBProxyName")
+    if proxy_name:
+        proxy = _get_db_proxy(proxy_name)
+        if not proxy:
+            return _db_proxy_not_found(proxy_name)
+        proxy_name = proxy["DBProxyName"]
+
+    endpoint_name = _p(p, "DBProxyEndpointName")
+    if endpoint_name:
+        endpoint = _request_region_get(
+            _db_proxy_endpoints, endpoint_name, "db-proxy-endpoint",
+        )
+        if not endpoint or (proxy_name and endpoint["DBProxyName"] != proxy_name):
+            return _db_proxy_endpoint_not_found(endpoint_name)
+        endpoints = [endpoint]
+    else:
+        endpoints = sorted(
+            (
+                endpoint
+                for endpoint in _db_proxy_endpoints.values()
+                if not proxy_name or endpoint["DBProxyName"] == proxy_name
+            ),
+            key=lambda e: e["DBProxyEndpointName"],
+        )
+
+    page, next_marker, error = _db_proxy_page(
+        p, endpoints, lambda e: e["DBProxyEndpointName"], "DB proxy endpoint",
+    )
+    if error:
+        return error
+
+    members = "".join(
+        f"<member>{_db_proxy_endpoint_xml(e)}</member>" for e in page
+    )
+    return _xml(200, "DescribeDBProxyEndpointsResponse",
+        "<DescribeDBProxyEndpointsResult><DBProxyEndpoints>"
+        f"{members}</DBProxyEndpoints>{_marker_xml(next_marker)}"
+        "</DescribeDBProxyEndpointsResult>")
+
+
+def _modify_db_proxy_endpoint(p):
+    endpoint_name = _p(p, "DBProxyEndpointName")
+    endpoint = _request_region_get(
+        _db_proxy_endpoints, endpoint_name, "db-proxy-endpoint",
+    )
+    if not endpoint:
+        return _db_proxy_endpoint_not_found(endpoint_name)
+    if endpoint.get("IsDefault"):
+        # "The RDS proxy default endpoint cannot be modified."
+        return _error(
+            "InvalidDBProxyEndpointStateFault",
+            f"The DB proxy endpoint {endpoint_name} is the default endpoint "
+            "for its DB proxy and can't be modified.",
+            400,
+        )
+
+    endpoint_name = endpoint["DBProxyEndpointName"]
+    new_name = _p(p, "NewDBProxyEndpointName")
+    if new_name and new_name != endpoint_name:
+        name_error = _db_proxy_name_error(new_name, "NewDBProxyEndpointName")
+        if name_error:
+            return name_error
+        if _db_proxy_endpoints.get(new_name):
+            return _error(
+                "DBProxyEndpointAlreadyExistsFault",
+                f"The specified DB proxy endpoint name {new_name} must be "
+                "unique for all DB proxy endpoints owned by your Amazon Web "
+                "Services account in the specified Amazon Web Services Region.",
+                400,
+            )
+
+    security_groups = _parse_member_list(p, "VpcSecurityGroupIds")
+    if security_groups:
+        endpoint["VpcSecurityGroupIds"] = security_groups
+
+    if new_name and new_name != endpoint_name:
+        proxy = _db_proxies.get(endpoint["DBProxyName"])
+        suffix = proxy["_EndpointSuffix"] if proxy else new_uuid()[:8]
+        endpoint["DBProxyEndpointName"] = new_name
+        endpoint["Endpoint"] = (
+            f"{new_name}.endpoint.proxy-{suffix}.{get_region()}.rds.amazonaws.com"
+        )
+        _db_proxy_endpoints.pop(endpoint_name, None)
+        _db_proxy_endpoints[new_name] = endpoint
+
+    return _xml(200, "ModifyDBProxyEndpointResponse",
+        "<ModifyDBProxyEndpointResult><DBProxyEndpoint>"
+        f"{_db_proxy_endpoint_xml(endpoint)}"
+        "</DBProxyEndpoint></ModifyDBProxyEndpointResult>")
+
+
+def _delete_db_proxy_endpoint(p):
+    endpoint_name = _p(p, "DBProxyEndpointName")
+    endpoint = _request_region_get(
+        _db_proxy_endpoints, endpoint_name, "db-proxy-endpoint",
+    )
+    if not endpoint:
+        return _db_proxy_endpoint_not_found(endpoint_name)
+    if endpoint.get("IsDefault"):
+        return _error(
+            "InvalidDBProxyEndpointStateFault",
+            f"The DB proxy endpoint {endpoint_name} is the default endpoint "
+            "for its DB proxy and can't be deleted.",
+            400,
+        )
+
+    _db_proxy_endpoints.pop(endpoint["DBProxyEndpointName"], None)
+    _tags.pop(endpoint.get("DBProxyEndpointArn", ""), None)
+    endpoint["Status"] = "deleting"
+    return _xml(200, "DeleteDBProxyEndpointResponse",
+        "<DeleteDBProxyEndpointResult><DBProxyEndpoint>"
+        f"{_db_proxy_endpoint_xml(endpoint)}"
+        "</DBProxyEndpoint></DeleteDBProxyEndpointResult>")
+
+
+def _resolve_db_proxy_target_group(p):
+    """Return (proxy, error). The only target group AWS exposes is 'default'."""
+    proxy_name = _p(p, "DBProxyName")
+    proxy = _get_db_proxy(proxy_name)
+    if not proxy:
+        return None, _db_proxy_not_found(proxy_name)
+    group_name = _p(p, "TargetGroupName")
+    if group_name and group_name != _DB_PROXY_DEFAULT_TARGET_GROUP:
+        return None, _db_proxy_target_group_not_found(group_name)
+    return proxy, None
+
+
+def _describe_db_proxy_target_groups(p):
+    proxy, error = _resolve_db_proxy_target_group(p)
+    if error:
+        return error
+
+    page, next_marker, error = _db_proxy_page(
+        p, [proxy["TargetGroup"]], lambda tg: tg["TargetGroupName"],
+        "target group",
+    )
+    if error:
+        return error
+
+    members = "".join(
+        f"<member>{_db_proxy_target_group_xml(tg)}</member>" for tg in page
+    )
+    return _xml(200, "DescribeDBProxyTargetGroupsResponse",
+        f"<DescribeDBProxyTargetGroupsResult><TargetGroups>{members}"
+        f"</TargetGroups>{_marker_xml(next_marker)}"
+        "</DescribeDBProxyTargetGroupsResult>")
+
+
+def _modify_db_proxy_target_group(p):
+    proxy, error = _resolve_db_proxy_target_group(p)
+    if error:
+        return error
+    if not _p(p, "TargetGroupName"):
+        return _error("MissingParameter", "TargetGroupName is required", 400)
+
+    new_name = _p(p, "NewName")
+    if new_name and new_name != _DB_PROXY_DEFAULT_TARGET_GROUP:
+        # "You can't rename the default target group."
+        return _invalid_parameter_value(
+            "You can't rename the default target group."
+        )
+
+    group = proxy["TargetGroup"]
+    supplied = [
+        key for key in p if key.startswith("ConnectionPoolConfig.")
+    ]
+    if supplied:
+        config, config_error = _build_connection_pool_config(
+            p, proxy["EngineFamily"],
+        )
+        if config_error:
+            return config_error
+        group["ConnectionPoolConfig"] = config
+        group["UpdatedDate"] = time.time()
+
+    return _xml(200, "ModifyDBProxyTargetGroupResponse",
+        "<ModifyDBProxyTargetGroupResult><DBProxyTargetGroup>"
+        f"{_db_proxy_target_group_xml(group)}"
+        "</DBProxyTargetGroup></ModifyDBProxyTargetGroupResult>")
+
+
+def _build_connection_pool_config(p, engine_family):
+    """Build a ConnectionPoolConfig from a request, applying AWS's defaults.
+
+    AWS documents each field's default in terms of what the *call* specifies
+    ("If the value of MaxConnectionsPercent isn't specified, then ... the
+    default is 50"), so a supplied ConnectionPoolConfig replaces the stored
+    one rather than merging into it.
+    """
+    max_connections, error = _db_proxy_int_error(
+        p, "ConnectionPoolConfig.MaxConnectionsPercent", 1, 100,
+    )
+    if error:
+        return None, error
+    max_idle, error = _db_proxy_int_error(
+        p, "ConnectionPoolConfig.MaxIdleConnectionsPercent", 0, 100,
+    )
+    if error:
+        return None, error
+    borrow_timeout, error = _db_proxy_int_error(
+        p, "ConnectionPoolConfig.ConnectionBorrowTimeout", 0, 300,
+    )
+    if error:
+        return None, error
+
+    # "If you specify MaxIdleConnectionsPercent, then you must also include a
+    # value for MaxConnectionsPercent."
+    if max_idle is not None and max_connections is None:
+        return None, _invalid_parameter_combination(
+            "MaxConnectionsPercent must be specified when "
+            "MaxIdleConnectionsPercent is specified."
+        )
+
+    defaults = _default_connection_pool_config(engine_family)
+    if max_connections is None:
+        max_connections = defaults["MaxConnectionsPercent"]
+        if max_idle is None:
+            max_idle = defaults["MaxIdleConnectionsPercent"]
+    elif max_idle is None:
+        # "The default value is half of the value of MaxConnectionsPercent."
+        max_idle = max_connections // 2
+
+    # "Must be between 0 and the value of MaxConnectionsPercent."
+    if max_idle > max_connections:
+        return None, _invalid_parameter_value(
+            f"Invalid value {max_idle} for MaxIdleConnectionsPercent. "
+            f"Must be between 0 and the value of MaxConnectionsPercent "
+            f"({max_connections})."
+        )
+
+    config = {
+        "MaxConnectionsPercent": max_connections,
+        "MaxIdleConnectionsPercent": max_idle,
+        "ConnectionBorrowTimeout": (
+            borrow_timeout if borrow_timeout is not None
+            else defaults["ConnectionBorrowTimeout"]
+        ),
+        "SessionPinningFilters": _parse_member_list(
+            p, "ConnectionPoolConfig.SessionPinningFilters",
+        ),
+    }
+    init_query = _p(p, "ConnectionPoolConfig.InitQuery")
+    if init_query:
+        config["InitQuery"] = init_query
+    return config, None
+
+
+def _db_proxy_engine_family_error(proxy, engine, identifier):
+    """Refuse a target whose engine the proxy's EngineFamily doesn't support."""
+    family = proxy["EngineFamily"]
+    supported = _DB_PROXY_ENGINE_FAMILY_ENGINES.get(family, ())
+    if engine and engine not in supported:
+        return _invalid_parameter_value(
+            f"The engine {engine} of {identifier} is not supported by a proxy "
+            f"with an EngineFamily of {family}."
+        )
+    return None
+
+
+def _register_db_proxy_targets(p):
+    proxy, error = _resolve_db_proxy_target_group(p)
+    if error:
+        return error
+
+    instance_ids = _parse_member_list(p, "DBInstanceIdentifiers")
+    cluster_ids = _parse_member_list(p, "DBClusterIdentifiers")
+    registered = {
+        (target["Type"], target["RdsResourceId"]) for target in proxy["Targets"]
+    }
+
+    new_targets = []
+    for instance_id in instance_ids:
+        instance = _instances.get(instance_id)
+        if not instance:
+            return _error(
+                "DBInstanceNotFound",
+                f"DBInstance {instance_id} not found.",
+                404,
+            )
+        if ("RDS_INSTANCE", instance_id) in registered:
+            return _error(
+                "DBProxyTargetAlreadyRegisteredFault",
+                "The proxy is already associated with the specified RDS DB "
+                f"instance {instance_id}.",
+                400,
+            )
+        family_error = _db_proxy_engine_family_error(
+            proxy, instance.get("Engine", ""), instance_id,
+        )
+        if family_error:
+            return family_error
+        new_targets.append({
+            "RdsResourceId": instance_id,
+            "Type": "RDS_INSTANCE",
+            "Role": "READ_WRITE",
+        })
+
+    for cluster_id in cluster_ids:
+        cluster = _clusters.get(cluster_id)
+        if not cluster:
+            return _error(
+                "DBClusterNotFoundFault",
+                f"DBCluster {cluster_id} not found.",
+                404,
+            )
+        if ("TRACKED_CLUSTER", cluster_id) in registered:
+            return _error(
+                "DBProxyTargetAlreadyRegisteredFault",
+                "The proxy is already associated with the specified Aurora DB "
+                f"cluster {cluster_id}.",
+                400,
+            )
+        family_error = _db_proxy_engine_family_error(
+            proxy, cluster.get("Engine", ""), cluster_id,
+        )
+        if family_error:
+            return family_error
+        new_targets.append({
+            "TrackedClusterId": cluster_id,
+            "RdsResourceId": cluster_id,
+            "Type": "TRACKED_CLUSTER",
+            "Role": "READ_WRITE",
+        })
+
+    # "Each proxy can be associated with a single target DB instance. However,
+    # you can associate multiple proxies with the same DB instance."
+    if len(proxy["Targets"]) + len(new_targets) > 1:
+        return _invalid_parameter_value(
+            f"The proxy {proxy['DBProxyName']} can be associated with a "
+            "single target. Deregister the current target before registering "
+            "another one."
+        )
+
+    proxy["Targets"].extend(new_targets)
+    members = "".join(
+        f"<member>{_db_proxy_target_xml(_db_proxy_target_view(t))}</member>"
+        for t in new_targets
+    )
+    return _xml(200, "RegisterDBProxyTargetsResponse",
+        "<RegisterDBProxyTargetsResult><DBProxyTargets>"
+        f"{members}"
+        "</DBProxyTargets></RegisterDBProxyTargetsResult>")
+
+
+def _db_proxy_target_view(target):
+    """Resolve a registration against the live instance/cluster record.
+
+    Endpoint, port and health are read at describe time, not frozen at
+    registration: a target whose backing database was deleted or stopped must
+    not keep reporting itself AVAILABLE at the address it used to have.
+    """
+    view = dict(target)
+    identifier = target["RdsResourceId"]
+    if target["Type"] == "RDS_INSTANCE":
+        record = _instances.get(identifier)
+        arn_key, status_key = "DBInstanceArn", "DBInstanceStatus"
+        endpoint = (record or {}).get("Endpoint", {})
+        address, port = endpoint.get("Address", ""), endpoint.get("Port", 0)
+    else:
+        record = _clusters.get(identifier)
+        arn_key, status_key = "DBClusterArn", "Status"
+        address = (record or {}).get("Endpoint", "")
+        port = (record or {}).get("Port", 0)
+
+    if record is None:
+        view["TargetArn"] = ""
+        view["Endpoint"] = ""
+        view["Port"] = 0
+        view["TargetHealth"] = {"State": "UNAVAILABLE"}
+        return view
+
+    view["TargetArn"] = record.get(arn_key, "")
+    view["Endpoint"] = address
+    view["Port"] = port
+    stopped = record.get(status_key) == "stopped"
+    view["TargetHealth"] = {"State": "UNAVAILABLE" if stopped else "AVAILABLE"}
+    return view
+
+
+def _deregister_db_proxy_targets(p):
+    proxy, error = _resolve_db_proxy_target_group(p)
+    if error:
+        return error
+
+    wanted = [
+        ("RDS_INSTANCE", identifier)
+        for identifier in _parse_member_list(p, "DBInstanceIdentifiers")
+    ] + [
+        ("TRACKED_CLUSTER", identifier)
+        for identifier in _parse_member_list(p, "DBClusterIdentifiers")
+    ]
+    registered = {
+        (target["Type"], target["RdsResourceId"]) for target in proxy["Targets"]
+    }
+    for target_type, identifier in wanted:
+        if (target_type, identifier) not in registered:
+            return _error(
+                "DBProxyTargetNotFoundFault",
+                "The specified RDS DB instance or Aurora DB cluster "
+                f"{identifier} isn't available for a proxy owned by your "
+                "Amazon Web Services account in the specified Amazon Web "
+                "Services Region.",
+                404,
+            )
+
+    drop = set(wanted)
+    proxy["Targets"] = [
+        target
+        for target in proxy["Targets"]
+        if (target["Type"], target["RdsResourceId"]) not in drop
+    ]
+    # DeregisterDBProxyTargets has an empty output shape, so botocore still
+    # looks for the wrapping result element.
+    return _xml(200, "DeregisterDBProxyTargetsResponse",
+        "<DeregisterDBProxyTargetsResult/>")
+
+
+def _describe_db_proxy_targets(p):
+    proxy, error = _resolve_db_proxy_target_group(p)
+    if error:
+        return error
+
+    page, next_marker, error = _db_proxy_page(
+        p, proxy["Targets"],
+        lambda t: f"{t['Type']}:{t['RdsResourceId']}", "target",
+    )
+    if error:
+        return error
+
+    members = "".join(
+        f"<member>{_db_proxy_target_xml(_db_proxy_target_view(t))}</member>"
+        for t in page
+    )
+    return _xml(200, "DescribeDBProxyTargetsResponse",
+        f"<DescribeDBProxyTargetsResult><Targets>{members}</Targets>"
+        f"{_marker_xml(next_marker)}</DescribeDBProxyTargetsResult>")
+
+
+def _string_list_xml(tag, values):
+    members = "".join(f"<member>{_esc(v)}</member>" for v in values)
+    return f"<{tag}>{members}</{tag}>"
+
+
+def _db_proxy_xml(px):
+    auth_xml = ""
+    for entry in px.get("Auth", []):
+        fields = "".join(
+            f"<{field}>{_esc(entry[field])}</{field}>"
+            for field in (
+                "Description",
+                "UserName",
+                "AuthScheme",
+                "SecretArn",
+                "IAMAuth",
+                "ClientPasswordAuthType",
+            )
+            if entry.get(field)
+        )
+        auth_xml += f"<member>{fields}</member>"
+    default_auth_scheme = px.get("DefaultAuthScheme")
+    default_auth_xml = (
+        f"<DefaultAuthScheme>{_esc(default_auth_scheme)}</DefaultAuthScheme>"
+        if default_auth_scheme
+        else ""
+    )
+    return f"""<DBProxyName>{_esc(px['DBProxyName'])}</DBProxyName>
+        <DBProxyArn>{px['DBProxyArn']}</DBProxyArn>
+        <Status>{px['Status']}</Status>
+        <EngineFamily>{px['EngineFamily']}</EngineFamily>
+        <VpcId>{px.get('VpcId','')}</VpcId>
+        {_string_list_xml('VpcSecurityGroupIds', px.get('VpcSecurityGroupIds', []))}
+        {_string_list_xml('VpcSubnetIds', px.get('VpcSubnetIds', []))}
+        {default_auth_xml}
+        <Auth>{auth_xml}</Auth>
+        <RoleArn>{_esc(px.get('RoleArn',''))}</RoleArn>
+        <Endpoint>{px.get('Endpoint','')}</Endpoint>
+        <RequireTLS>{str(px.get('RequireTLS', False)).lower()}</RequireTLS>
+        <IdleClientTimeout>{px.get('IdleClientTimeout', 1800)}</IdleClientTimeout>
+        <DebugLogging>{str(px.get('DebugLogging', False)).lower()}</DebugLogging>
+        <CreatedDate>{_format_time(px['CreatedDate'])}</CreatedDate>
+        <UpdatedDate>{_format_time(px['UpdatedDate'])}</UpdatedDate>
+        <EndpointNetworkType>{px.get('EndpointNetworkType','IPV4')}</EndpointNetworkType>
+        <TargetConnectionNetworkType>{px.get('TargetConnectionNetworkType','IPV4')}</TargetConnectionNetworkType>"""
+
+
+def _db_proxy_endpoint_xml(ep):
+    return f"""<DBProxyEndpointName>{_esc(ep['DBProxyEndpointName'])}</DBProxyEndpointName>
+        <DBProxyEndpointArn>{ep['DBProxyEndpointArn']}</DBProxyEndpointArn>
+        <DBProxyName>{_esc(ep['DBProxyName'])}</DBProxyName>
+        <Status>{ep['Status']}</Status>
+        <VpcId>{ep.get('VpcId','')}</VpcId>
+        {_string_list_xml('VpcSecurityGroupIds', ep.get('VpcSecurityGroupIds', []))}
+        {_string_list_xml('VpcSubnetIds', ep.get('VpcSubnetIds', []))}
+        <Endpoint>{ep.get('Endpoint','')}</Endpoint>
+        <CreatedDate>{_format_time(ep['CreatedDate'])}</CreatedDate>
+        <TargetRole>{ep.get('TargetRole','READ_WRITE')}</TargetRole>
+        <IsDefault>{str(ep.get('IsDefault', False)).lower()}</IsDefault>
+        <EndpointNetworkType>{ep.get('EndpointNetworkType','IPV4')}</EndpointNetworkType>"""
+
+
+def _db_proxy_target_group_xml(tg):
+    config = tg.get("ConnectionPoolConfig", {})
+    init_query = config.get("InitQuery")
+    init_query_xml = (
+        f"<InitQuery>{_esc(init_query)}</InitQuery>" if init_query else ""
+    )
+    return f"""<DBProxyName>{_esc(tg['DBProxyName'])}</DBProxyName>
+        <TargetGroupName>{_esc(tg['TargetGroupName'])}</TargetGroupName>
+        <TargetGroupArn>{tg['TargetGroupArn']}</TargetGroupArn>
+        <IsDefault>{str(tg.get('IsDefault', True)).lower()}</IsDefault>
+        <Status>{tg.get('Status','available')}</Status>
+        <ConnectionPoolConfig>
+            <MaxConnectionsPercent>{config.get('MaxConnectionsPercent', 100)}</MaxConnectionsPercent>
+            <MaxIdleConnectionsPercent>{config.get('MaxIdleConnectionsPercent', 50)}</MaxIdleConnectionsPercent>
+            <ConnectionBorrowTimeout>{config.get('ConnectionBorrowTimeout', 120)}</ConnectionBorrowTimeout>
+            {_string_list_xml('SessionPinningFilters', config.get('SessionPinningFilters', []))}
+            {init_query_xml}
+        </ConnectionPoolConfig>
+        <CreatedDate>{_format_time(tg['CreatedDate'])}</CreatedDate>
+        <UpdatedDate>{_format_time(tg['UpdatedDate'])}</UpdatedDate>"""
+
+
+def _db_proxy_target_xml(target):
+    health = target.get("TargetHealth", {})
+    tracked_cluster = target.get("TrackedClusterId")
+    tracked_xml = (
+        f"<TrackedClusterId>{_esc(tracked_cluster)}</TrackedClusterId>"
+        if tracked_cluster
+        else ""
+    )
+    reason = health.get("Reason")
+    description = health.get("Description")
+    return f"""<TargetArn>{target.get('TargetArn','')}</TargetArn>
+        <Endpoint>{target.get('Endpoint','')}</Endpoint>
+        {tracked_xml}
+        <RdsResourceId>{_esc(target.get('RdsResourceId',''))}</RdsResourceId>
+        <Port>{target.get('Port', 0)}</Port>
+        <Type>{target.get('Type','RDS_INSTANCE')}</Type>
+        <Role>{target.get('Role','READ_WRITE')}</Role>
+        <TargetHealth>
+            <State>{health.get('State','AVAILABLE')}</State>
+            {f'<Reason>{reason}</Reason>' if reason else ''}
+            {f'<Description>{_esc(description)}</Description>' if description else ''}
+        </TargetHealth>"""
+
+
+
 def _xml(status, root_tag, inner):
     body = f"""<?xml version="1.0" encoding="UTF-8"?>
 <{root_tag} xmlns="http://rds.amazonaws.com/doc/2014-10-31/">
@@ -7692,6 +8891,19 @@ _ACTION_MAP = {
     "FailoverGlobalCluster": _failover_global_cluster,
     "EnableHttpEndpoint": _enable_http_endpoint,
     "DisableHttpEndpoint": _disable_http_endpoint,
+    "CreateDBProxy": _create_db_proxy,
+    "DescribeDBProxies": _describe_db_proxies,
+    "ModifyDBProxy": _modify_db_proxy,
+    "DeleteDBProxy": _delete_db_proxy,
+    "CreateDBProxyEndpoint": _create_db_proxy_endpoint,
+    "DescribeDBProxyEndpoints": _describe_db_proxy_endpoints,
+    "ModifyDBProxyEndpoint": _modify_db_proxy_endpoint,
+    "DeleteDBProxyEndpoint": _delete_db_proxy_endpoint,
+    "DescribeDBProxyTargetGroups": _describe_db_proxy_target_groups,
+    "ModifyDBProxyTargetGroup": _modify_db_proxy_target_group,
+    "RegisterDBProxyTargets": _register_db_proxy_targets,
+    "DeregisterDBProxyTargets": _deregister_db_proxy_targets,
+    "DescribeDBProxyTargets": _describe_db_proxy_targets,
 }
 
 
@@ -7752,6 +8964,8 @@ def reset():
         _db_cluster_param_groups.clear()
         _db_cluster_snapshots.clear()
         _option_groups.clear()
+        _db_proxies.clear()
+        _db_proxy_endpoints.clear()
         _global_clusters.clear()
         _tags.clear()
         _port_counter[0] = BASE_PORT
