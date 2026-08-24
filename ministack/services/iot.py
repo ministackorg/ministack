@@ -3220,6 +3220,11 @@ class RuleSqlError(ValueError):
     """Rule SQL the engine cannot evaluate, raised by `put_topic_rule`."""
 
 
+class RuleRoleError(ValueError):
+    """An action role ARN IAM cannot resolve (AUTH=true only), raised by
+    `put_topic_rule`."""
+
+
 def _validate_rule_sql(sql: str) -> str | None:
     """Return an error message when the rule SQL cannot be parsed, else None."""
     sql = sql or ""
@@ -3275,7 +3280,9 @@ def put_topic_rule(name: str, payload: dict, *, created_at: float | None = None)
     API or the CloudFormation provisioner. SQL that only *calls* something the
     evaluator lacks is stored (AWS accepts a larger function library than this
     emulator implements, and rejecting it would fail a stack that deploys on
-    AWS) but warns, so the resulting misfire is visible.
+    AWS) but warns, so the resulting misfire is visible. Raises `RuleRoleError`
+    (under AUTH=true) for an action role IAM cannot resolve, through the same
+    two doors — real IoT probes the role at create time and fails the call.
     """
     sql = payload.get("sql", "")
     error = _validate_rule_sql(sql)
@@ -3296,9 +3303,8 @@ def put_topic_rule(name: str, payload: dict, *, created_at: float | None = None)
                 if isinstance(_act_cfg, dict) and "roleArn" in _act_cfg:
                     _iot_role_err = validate_role_arn(_act_cfg["roleArn"])
                     if _iot_role_err:
-                        return error_response_json(
-                            "InvalidRequestException",
-                            f"Unable to assume role: {_act_cfg['roleArn']}", 400)
+                        raise RuleRoleError(
+                            f"Unable to assume role: {_act_cfg['roleArn']}")
 
     rule = {
         "ruleName": name,
@@ -3350,6 +3356,8 @@ def _create_topic_rule(name: str, payload: dict) -> tuple:
         put_topic_rule(name, payload)
     except RuleSqlError as exc:
         return error_response_json("SqlParseException", str(exc), 400)
+    except RuleRoleError as exc:
+        return error_response_json("InvalidRequestException", str(exc), 400)
     return json_response({})
 
 
@@ -3360,6 +3368,8 @@ def _replace_topic_rule(name: str, payload: dict) -> tuple:
         put_topic_rule(name, payload)
     except RuleSqlError as exc:
         return error_response_json("SqlParseException", str(exc), 400)
+    except RuleRoleError as exc:
+        return error_response_json("InvalidRequestException", str(exc), 400)
     return json_response({})
 
 
