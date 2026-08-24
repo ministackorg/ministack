@@ -385,6 +385,9 @@ def _resolve_refs(value, resources, params, conditions, mappings,
 
         def _sub_replace(match):
             var = match.group(1)
+            # ${!Literal} escape: emit ${Literal} without substituting
+            if var.startswith("!"):
+                return "${" + var[1:] + "}"
             # Check explicit var map first
             if var in resolved_map:
                 return str(resolved_map[var])
@@ -574,6 +577,8 @@ def _extract_deps(resource_def: dict, all_resource_names: set) -> set:
                 template_str = sub_val[0] if isinstance(sub_val, list) else sub_val
                 for match in re.finditer(r"\$\{([^}]+)\}", str(template_str)):
                     var = match.group(1)
+                    if var.startswith("!"):
+                        continue
                     base = var.split(".")[0]
                     if base in all_resource_names:
                         deps.add(base)
