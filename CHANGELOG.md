@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **S3 — a presigned upload no longer drops the `x-amz-*` headers it was signed with** — a presigned URL is sent by a caller who has only the URL and a body, so SigV4 lets the `x-amz-*` headers an operation asked for be hoisted into the query string, where the signature covers them exactly as a signed header would. SDKs presign that way and real S3 applies those params as the headers they stand for. MiniStack only ever read headers, so a presigned `PutObject` carrying user metadata in its query string answered `200` and stored the object with no metadata at all. Hoisted `x-amz-*` params are now folded back into the request headers before routing (user metadata, storage class, tagging, ACL, SSE and copy source) while an explicitly sent header still wins over its hoisted twin, and the SigV4 signing params are never mistaken for one. Contributed by @dennmart.
+
 ## [1.5.0] — 2026-08-23
 
 ### Added
