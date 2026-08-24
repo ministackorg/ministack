@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **EventBridge — dotted pattern keys resolve to the nested path** — [Event Ruler](https://github.com/aws/event-ruler) joins keys with `.` when compiling, so `{"detail.name": [...]}` and `{"detail": {"name": [...]}}` are the same sub-rule on AWS (verified with `TestEventPattern` against the real service); the 1.4 matcher rewrite read a dotted key as one literal segment, so such a rule silently matched nothing — consumer rules written in the dotted form delivered on 1.3.x and stopped after upgrading. Pattern keys are now split on `.` when the compiler extends the path, composing with `$or` expansion, value-side operators, and leaf/object collision handling. The residual divergence — an event *field* literally named `a.b` flattens to the same path on AWS but stays one key here — remains pinned by test; Ruler documents that collision as behaviour that "should not be relied upon". Contributed by @prandogabriel.
+
 ## [1.5.0] — 2026-08-23
 
 ### Added
