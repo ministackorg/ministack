@@ -20,6 +20,7 @@ from conftest import ENDPOINT
 DEFAULT_AURORA_MYSQL_ENGINE_VERSION = "8.0.mysql_aurora.3.10.3"
 UNSUPPORTED_AURORA_MYSQL_ENGINE_VERSION = "9.0.mysql_aurora.9.0.1"
 DEFAULT_AURORA_POSTGRESQL_ENGINE_VERSION = "17.7"
+DEFAULT_AURORA_POSTGRESQL_16_ENGINE_VERSION = "16.11"
 UNSUPPORTED_AURORA_POSTGRESQL_ENGINE_VERSION = "16.99"
 EXPECTED_AURORA_POSTGRESQL_ENGINE_VERSIONS = {
     "11.9": "aurora-postgresql11",
@@ -1182,6 +1183,43 @@ def test_rds_describe_aurora_postgresql_engine_versions_by_family(rds):
         EngineVersion=UNSUPPORTED_AURORA_POSTGRESQL_ENGINE_VERSION,
     )["DBEngineVersions"]
     assert filtered == []
+
+
+def test_rds_describe_aurora_postgresql_engine_versions_by_major(rds):
+    family = "aurora-postgresql16"
+    expected_versions = {
+        version
+        for version, expected_family in EXPECTED_AURORA_POSTGRESQL_ENGINE_VERSIONS.items()
+        if expected_family == family
+    }
+
+    major_versions = rds.describe_db_engine_versions(
+        Engine="aurora-postgresql",
+        EngineVersion="16",
+    )["DBEngineVersions"]
+    assert len(major_versions) == 13
+    assert {version["EngineVersion"] for version in major_versions} == expected_versions
+    assert all(version["DBParameterGroupFamily"] == family for version in major_versions)
+    assert all(version["Status"] == "available" for version in major_versions)
+
+    default_versions = rds.describe_db_engine_versions(
+        Engine="aurora-postgresql",
+        EngineVersion="16",
+        DefaultOnly=True,
+    )["DBEngineVersions"]
+    assert [version["EngineVersion"] for version in default_versions] == [
+        DEFAULT_AURORA_POSTGRESQL_16_ENGINE_VERSION
+    ]
+    assert default_versions[0]["DBParameterGroupFamily"] == family
+    assert default_versions[0]["Status"] == "available"
+
+    exact_versions = rds.describe_db_engine_versions(
+        Engine="aurora-postgresql",
+        EngineVersion="16.14",
+    )["DBEngineVersions"]
+    assert [version["EngineVersion"] for version in exact_versions] == ["16.14"]
+    assert exact_versions[0]["DBParameterGroupFamily"] == family
+    assert exact_versions[0]["Status"] == "available"
 
 
 def test_rds_describe_aurora_postgresql_engine_version_status(rds):
