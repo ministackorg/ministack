@@ -477,7 +477,25 @@ def rds():
 
 @pytest.fixture(scope="session")
 def docdb():
-    return make_client("docdb")
+    """A boto3 ``docdb`` client routed through a DocDB-prefixed hostname.
+
+    DocumentDB shares RDS's signing name (``rds``) and Query API version
+    (2014-10-31), so credential-scope routing cannot tell the two apart.
+    MiniStack dispatches on the endpoint host instead; pointing the client at
+    ``docdb.<ENDPOINT_HOST>`` (with getaddrinfo patched so the name resolves
+    to ENDPOINT_HOST) makes the Host header carry that signal while every
+    request still reaches the same server.
+    """
+    endpoint = ENDPOINT.replace(f"//{ENDPOINT_HOST}", f"//docdb.{ENDPOINT_HOST}", 1)
+    with patch_endpoint_dns():
+        yield boto3.client(
+            "docdb",
+            endpoint_url=endpoint,
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+            region_name=REGION,
+            config=Config(**_default_config_kwargs),
+        )
 
 
 @pytest.fixture(scope="session")

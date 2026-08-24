@@ -86,6 +86,12 @@ SERVICE_PATTERNS = {
     "lambda-microvms": {
         "path_patterns": [r"^/2025-09-09/microvm"],
         "host_patterns": [r"lambda-microvms\."],
+    },
+    # DocumentDB shares RDS's signing name (`rds`) and Query API version, so
+    # credential-scope routing cannot tell the two apart (real AWS serves both
+    # from one control plane). detect_service() therefore dispatches
+    # `rds`-scoped requests on the endpoint host: docdb.*/documentdb.* hosts
+    # are DocumentDB, everything else is RDS.
     "documentdb": {
         "target_prefixes": ["AmazonRDS", "DocDB"],
         "host_patterns": [r"docdb\.", r"documentdb\."],
@@ -736,6 +742,11 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             if svc_name == "lambda" and _LAMBDA_CORE_PATH_RE.match(path):
                 return "lambda-core"
             if svc_name in SERVICE_PATTERNS:
+                # DocDB signs as `rds` (shared signing name and Query API
+                # version), so before returning RDS give DocumentDB's host
+                # patterns first claim — see the SERVICE_PATTERNS note above.
+                if svc_name == "rds" and re.search(r"^(docdb|documentdb)\.", host):
+                    return "documentdb"
                 return svc_name
             # Map common credential scope names
             scope_map = {

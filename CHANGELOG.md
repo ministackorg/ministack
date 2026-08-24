@@ -282,6 +282,19 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **IoT Core — an unresolvable action role fails `CreateTopicRule` instead of silently dropping the rule (`AUTH=true`)** — the role-check error was discarded and the API answered `200 {}` while storing nothing. `CreateTopicRule` / `ReplaceTopicRule` now answer `400 InvalidRequestException` (`Unable to assume role: {arn}`) as real IoT does, and the CloudFormation provisioner fails the resource. Contributed by @iot-rocket.
 - **RDS — Aurora PostgreSQL major-version selectors return the matching catalog** — `DescribeDBEngineVersions` treated `EngineVersion=16` as an exact version and returned nothing; major-only selectors now return every advertised minor in that family, and `DefaultOnly=true` narrows to AWS's configured default minor for that major. Contributed by @jayjanssen.
 
+### Added
+
+- **DocumentDB (docdb) service**: full repair and expansion of `ministack/services/documentdb.py`.
+  - Engine versions **5.0.0** and **8.0.0** (`DOCDB_ENGINE_VERSIONS`, families `docdb5.0`/`docdb8.0`), backed by wire-compatible `mongo:5.0` / `mongo:8.0` containers honoring `MINISTACK_IMAGE_PREFIX`; unsupported versions are rejected with `InvalidParameterCombination` everywhere.
+  - One **shared mongo container per DB cluster** (rds.py Aurora pattern): the first member starts it, later members alias its endpoint; `StopDBCluster`/`StartDBCluster` stop/restart the real container; deleting the final member stops it while keeping the volume (`DOCDB_PERSIST=1`), and only `DeleteDBCluster` removes container + storage.
+  - New IaC-complete control-plane actions: `CreateDBClusterSnapshot` / `DescribeDBClusterSnapshots` / `DeleteDBClusterSnapshot` (metadata-only snapshots with tags), `ModifyDBClusterSnapshotAttribute` / `DescribeDBClusterSnapshotAttributes` (share/restore attributes), cluster parameter groups (`Create/Describe/Delete/Modify/ResetDBClusterParameterGroup`, `DescribeDBClusterParameters` with engine-default overlay), `FailoverDBCluster` (writer rotation by lowest `PromotionTier`, stable endpoints), `RestoreDBClusterFromSnapshot`, `ApplyPendingMaintenanceAction` / `DescribePendingMaintenanceActions`, `DescribeCertificates`, `DescribeEvents`.
+  - Warm-boot respawn: persisted clusters/instances come back `creating` and daemon threads restart their containers (reusing saved host ports when free) before flipping to `available`; state stores switched to `AccountRegionScopedDict` for per-account/per-region isolation.
+  - Routing fix in `core/router.py`: repaired a broken `SERVICE_PATTERNS` entry and taught credential-scope dispatch that DocDB signs as `rds` — `docdb.*` / `documentdb.*` endpoint hosts now route to DocumentDB instead of RDS.
+
+### Changed
+
+- `tests/test_docdb.py`: rewritten against the boto3 `docdb` client (the previous suite could not run — the module failed at import and several calls used parameters/actions the real API rejects). Adds Docker-gated pymongo integration tests proving shared-endpoint visibility across members and real 8.0.0 connections.
+
 ## [1.5.0] — 2026-08-23
 
 ### Added
