@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **IoT Core — an unresolvable action role fails `CreateTopicRule` instead of silently dropping the rule (`AUTH=true`)** — the role check added with the IAM request authorization answered `200 {}` while storing nothing: the store-layer helper returned the error response as a value and both API handlers discarded it, so a client (or a CloudFormation stack) saw success minus its rule. The check now raises through the same door as invalid rule SQL, `CreateTopicRule` / `ReplaceTopicRule` answer `400 InvalidRequestException` (`Unable to assume role: {arn}`) as real IoT does when it cannot assume the role, and the CloudFormation provisioner fails the resource. With `AUTH=false` nothing changes. Reported by @iot-rocket.
+- **RDS — Aurora PostgreSQL major-version selectors return the matching catalog** — `DescribeDBEngineVersions` treated `EngineVersion=16` as an exact version and returned nothing. Major-only selectors now return every advertised minor in that family, and `DefaultOnly=true` narrows the result to AWS's configured default minor for that major.
 
 ## [1.5.0] — 2026-08-23
 
