@@ -3798,6 +3798,94 @@ def test_s3_presigned_url_virtual_hosted_style_is_verified():
     assert code in (200, 204), f"vhost presigned PUT rejected with {code}"
 
 
+def test_s3_presigned_put_metadata_hoisted_into_query(s3):
+    """A presigned URL is sent by a caller who has only the URL and a body, so
+    the `x-amz-*` headers the operation asked for may be hoisted into the query
+    string, where the signature covers them like a signed header. Real S3
+    applies them as the headers they stand for, so user metadata (and storage
+    class, tagging, ...) must land on the object rather than being dropped."""
+    import urllib.request
+
+    from botocore.auth import S3SigV4QueryAuth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    bucket = "presign-hoisted-bkt"
+    key = "uploads/report.pdf"
+    s3.create_bucket(Bucket=bucket)
+
+    # Mixed-case `X-Amz-Meta-` too: header names are case-insensitive, and
+    # SDKs differ on the casing they hoist with.
+    hoisted = "&".join([
+        "x-amz-meta-author=alice",
+        "X-Amz-Meta-Title=quarterly%20report",
+        "x-amz-storage-class=STANDARD_IA",
+        "x-amz-tagging=env%3Dqa",
+    ])
+    signed = AWSRequest(method="PUT", url=f"{ENDPOINT}/{bucket}/{key}?{hoisted}")
+    S3SigV4QueryAuth(
+        Credentials("test", "test"), "s3", "us-east-1", expires=300
+    ).add_auth(signed)
+
+    resp = urllib.request.urlopen(
+        urllib.request.Request(signed.url, data=b"file-bytes", method="PUT"))
+    assert resp.status == 200
+
+    head = s3.head_object(Bucket=bucket, Key=key)
+    assert head["Metadata"] == {"author": "alice", "title": "quarterly report"}
+    assert head["StorageClass"] == "STANDARD_IA"
+    assert s3.get_object_tagging(Bucket=bucket, Key=key)["TagSet"] == [
+        {"Key": "env", "Value": "qa"}
+    ]
+
+
+def test_s3_presigned_put_metadata_sent_as_signed_headers(s3):
+    """The other half of the contract: when the presigner leaves the metadata
+    in `X-Amz-SignedHeaders` instead of hoisting it, the uploader sends the
+    `x-amz-meta-*` headers itself and they must still land on the object."""
+    import urllib.request
+
+    bucket = "presign-meta-hdr-bkt"
+    key = "uploads/report.pdf"
+    s3.create_bucket(Bucket=bucket)
+
+    url = s3.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": bucket, "Key": key,
+                "Metadata": {"author": "alice", "title": "quarterly report"}},
+        ExpiresIn=300,
+    )
+    resp = urllib.request.urlopen(urllib.request.Request(
+        url, data=b"file-bytes", method="PUT",
+        headers={"x-amz-meta-author": "alice",
+                 "x-amz-meta-title": "quarterly report"}))
+    assert resp.status == 200
+
+    head = s3.head_object(Bucket=bucket, Key=key)
+    assert head["Metadata"] == {"author": "alice", "title": "quarterly report"}
+
+
+def test_s3_presigned_post_metadata_fields(s3):
+    """A browser POST upload carries its metadata as `x-amz-meta-*` form
+    fields, which the policy signs; they must land on the object too."""
+    import requests
+
+    bucket = "presign-meta-post-bkt"
+    s3.create_bucket(Bucket=bucket)
+
+    post = s3.generate_presigned_post(
+        Bucket=bucket, Key="uploads/report.pdf",
+        Fields={"x-amz-meta-author": "alice"},
+        Conditions=[{"x-amz-meta-author": "alice"}],
+    )
+    r = requests.post(post["url"], data=post["fields"],
+                      files={"file": ("report.pdf", b"file-bytes")})
+    assert r.status_code == 204
+
+    head = s3.head_object(Bucket=bucket, Key="uploads/report.pdf")
+    assert head["Metadata"] == {"author": "alice"}
+
+
 def test_s3_eventbridge_notification_on_delete(s3, sqs, eb):
     """S3 delete_object should send EventBridge event when EventBridgeConfiguration is enabled."""
     bucket = "s3-eb-del-bkt"

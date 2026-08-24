@@ -1372,11 +1372,14 @@ def _compile_object(alternatives, path, obj, expand_or, inside_or, depth):
         if inside_or and key in _OR_RESERVED_MEMBER_KEYS:
             raise _InvalidPattern(
                 f"{key} is Ruler reserved fieldName which cannot be used inside $or.")
+        # Event Ruler joins keys with ".": a dotted key is the nested path.
+        segments = key.split(".") if "." in key else (key,)
         if isinstance(value, dict):
-            _compile_object(alternatives, [*path, key], value, expand_or, inside_or, depth + 1)
+            _compile_object(alternatives, [*path, *segments], value, expand_or, inside_or,
+                            depth + 1)
         elif isinstance(value, list):
             _validate_value_list(value)
-            _write_leaf(alternatives, [*path, key], value)
+            _write_leaf(alternatives, [*path, *segments], value)
         else:
             raise _InvalidPattern(f'"{key}" must be an object or an array')
 
