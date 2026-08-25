@@ -2308,8 +2308,10 @@ def _email_configuration_out(email_configuration) -> dict:
     # unspecified account means Cognito's built-in mailer.
     # https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_EmailConfigurationType.html
     config = dict(email_configuration or {})
-    if config:
-        config.setdefault("EmailSendingAccount", "COGNITO_DEFAULT")
+    # Cognito reports its default mailer even when no explicit email options
+    # were supplied. This also normalizes pools created by older MiniStack
+    # versions whose persisted EmailConfiguration was empty.
+    config.setdefault("EmailSendingAccount", "COGNITO_DEFAULT")
     return config
 
 

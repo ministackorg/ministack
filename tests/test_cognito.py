@@ -588,6 +588,9 @@ def test_cognito_add_custom_attributes_unknown_pool(cognito_idp):
 
 
 def test_cognito_email_configuration_defaults_to_cognito_default(cognito_idp):
+    empty_pool = cognito_idp.create_user_pool(PoolName="EmailCfgEmptyPool")["UserPool"]
+    assert empty_pool["EmailConfiguration"]["EmailSendingAccount"] == "COGNITO_DEFAULT"
+
     pool = cognito_idp.create_user_pool(
         PoolName="EmailCfgPool",
         EmailConfiguration={"ReplyToEmailAddress": "reply@example.com"},
