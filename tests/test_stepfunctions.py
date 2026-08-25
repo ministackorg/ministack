@@ -720,6 +720,50 @@ def test_sfn_intrinsic_nested(sfn, sfn_sync):
     output = json.loads(resp["output"])
     assert output["result"] == {"key": "hello"}
 
+def test_sfn_aws_sdk_cloudwatchlogs_create_and_tag(sfn_sync):
+    """aws-sdk:cloudwatchlogs routes, and takes the parameter case a machine writes."""
+    group = f"/sfn-sdk-test/{_uuid_mod.uuid4().hex[:8]}"
+    group_arn = f"arn:aws:logs:us-east-1:000000000000:log-group:{group}"
+    sm_name = f"sdk-logs-{_uuid_mod.uuid4().hex[:8]}"
+
+    definition = json.dumps({
+        "StartAt": "CreateLogGroup",
+        "States": {
+            "CreateLogGroup": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:cloudwatchlogs:createLogGroup",
+                "Parameters": {"LogGroupName": group},
+                "ResultPath": "$.created",
+                "Next": "TagLogGroup",
+            },
+            "TagLogGroup": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:cloudwatchlogs:tagResource",
+                "Parameters": {"ResourceArn": group_arn, "Tags": {"owner": "sfn"}},
+                "ResultPath": "$.tagged",
+                "Next": "ReadTags",
+            },
+            "ReadTags": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:cloudwatchlogs:listTagsForResource",
+                "Parameters": {"ResourceArn": group_arn},
+                "ResultPath": "$.tags",
+                "End": True,
+            },
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+    assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+    assert json.loads(resp["output"])["tags"]["Tags"] == {"owner": "sfn"}
+
+
 def test_sfn_aws_sdk_secretsmanager_create_and_get(sfn, sfn_sync, sm):
     """aws-sdk:secretsmanager integration creates and retrieves a secret."""
     import uuid as _uuid
