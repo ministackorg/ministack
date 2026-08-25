@@ -4284,6 +4284,44 @@ def test_cognito_region_scoped_state_round_trips_and_is_rejected_by_v2_reader(
         set_request_region(original_region)
 
 
+def test_cognito_restore_rebuilds_schema_attributes_from_legacy_snapshot(monkeypatch):
+    """A pool snapshotted before SchemaAttributes existed still describes fully."""
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import cognito
+
+    original_account = get_account_id()
+    original_region = get_region()
+    pool_id = "us-west-2_legacyschema"
+    try:
+        set_request_account_id("000000000000")
+        set_request_region("us-west-2")
+        cognito.reset()
+        cognito.restore_state({
+            "user_pools": {
+                pool_id: {
+                    "Id": pool_id,
+                    "Name": "legacy",
+                    "Schema": [{"Name": "tenant", "AttributeDataType": "String"}],
+                }
+            }
+        })
+        pool = cognito._pool_out(cognito._user_pools[pool_id])
+        names = [a["Name"] for a in pool["SchemaAttributes"]]
+        assert "sub" in names and "email" in names
+        assert "custom:tenant" in names
+        # The request-shaped key does not survive into the response shape.
+        assert "Schema" not in pool
+    finally:
+        cognito.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_waf_region_scoped_v3_state_round_trips_idempotently(monkeypatch, tmp_path):
     import json as _json
 

@@ -7,6 +7,7 @@ Covers two boto3 clients:
 
 User Pools operations:
   CreateUserPool, DeleteUserPool, DescribeUserPool, ListUserPools, UpdateUserPool,
+  AddCustomAttributes,
   CreateUserPoolClient, DeleteUserPoolClient, DescribeUserPoolClient,
   ListUserPoolClients, UpdateUserPoolClient,
   AdminCreateUser, AdminDeleteUser, AdminGetUser, ListUsers,
@@ -281,13 +282,163 @@ _SAML_NS = {
 }
 
 # ---------------------------------------------------------------------------
+# User pool schema attributes
+# ---------------------------------------------------------------------------
+# Every user pool carries the standard OIDC attribute set, and DescribeUserPool
+# returns it in `SchemaAttributes` (never `Schema` — that name only exists on the
+# CreateUserPool/UpdateUserPool *request*). Custom attributes are returned with
+# a `custom:` prefix, developer-only ones with `dev:`.
+#   https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_UserPoolType.html
+#   https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_SchemaAttributeType.html
+#   https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-settings-attributes.html
+# Clients diff against this list — the Terraform provider, for one, drops an
+# attribute from state only when it matches the standard entry field for field —
+# so the shapes below mirror what the real service answers with.
+
+_ATTRIBUTE_CUSTOM_PREFIX = "custom:"
+_ATTRIBUTE_DEV_PREFIX = "dev:"
+_MAX_CUSTOM_ATTRIBUTES = 50
+
+
+def _standard_string_attribute(name, min_length="0", max_length="2048"):
+    return {
+        "Name": name,
+        "AttributeDataType": "String",
+        "DeveloperOnlyAttribute": False,
+        "Mutable": True,
+        "Required": False,
+        "StringAttributeConstraints": {
+            "MinLength": min_length,
+            "MaxLength": max_length,
+        },
+    }
+
+
+def _standard_boolean_attribute(name):
+    return {
+        "Name": name,
+        "AttributeDataType": "Boolean",
+        "DeveloperOnlyAttribute": False,
+        "Mutable": True,
+        "Required": False,
+    }
+
+
+_STANDARD_SCHEMA_ATTRIBUTES = [
+    _standard_string_attribute("sub", min_length="1"),
+    _standard_string_attribute("name"),
+    _standard_string_attribute("given_name"),
+    _standard_string_attribute("family_name"),
+    _standard_string_attribute("middle_name"),
+    _standard_string_attribute("nickname"),
+    _standard_string_attribute("preferred_username"),
+    _standard_string_attribute("profile"),
+    _standard_string_attribute("picture"),
+    _standard_string_attribute("website"),
+    _standard_string_attribute("email"),
+    _standard_boolean_attribute("email_verified"),
+    _standard_string_attribute("gender"),
+    _standard_string_attribute("birthdate", min_length="10", max_length="10"),
+    _standard_string_attribute("zoneinfo"),
+    _standard_string_attribute("locale"),
+    _standard_string_attribute("phone_number"),
+    _standard_boolean_attribute("phone_number_verified"),
+    _standard_string_attribute("address"),
+    {
+        "Name": "updated_at",
+        "AttributeDataType": "Number",
+        "DeveloperOnlyAttribute": False,
+        "Mutable": True,
+        "Required": False,
+        "NumberAttributeConstraints": {"MinValue": "0"},
+    },
+]
+# `sub` is the one standard attribute that is immutable and required.
+for _attr in _STANDARD_SCHEMA_ATTRIBUTES:
+    if _attr["Name"] == "sub":
+        _attr["Mutable"] = False
+        _attr["Required"] = True
+del _attr
+
+_STANDARD_ATTRIBUTES_BY_NAME = {a["Name"]: a for a in _STANDARD_SCHEMA_ATTRIBUTES}
+
+
+def _schema_attribute_name(raw) -> str:
+    """Return the stored attribute name, prefixing custom/developer attributes.
+
+    AWS: "When you add an attribute with a Name value of MyAttribute, Amazon
+    Cognito creates the custom attribute custom:MyAttribute", and dev:MyAttribute
+    when DeveloperOnlyAttribute is true. A caller that already sent the prefix
+    (as a round-tripped DescribeUserPool response does) keeps it.
+    """
+    name = (raw.get("Name") or "").strip()
+    if (name in _STANDARD_ATTRIBUTES_BY_NAME
+            or name.startswith(_ATTRIBUTE_CUSTOM_PREFIX)
+            or name.startswith(_ATTRIBUTE_DEV_PREFIX)):
+        return name
+    prefix = (_ATTRIBUTE_DEV_PREFIX if raw.get("DeveloperOnlyAttribute")
+              else _ATTRIBUTE_CUSTOM_PREFIX)
+    return f"{prefix}{name}"
+
+
+def _normalize_schema_attribute(raw: dict) -> dict:
+    """Fill a request SchemaAttributeType out to its DescribeUserPool shape.
+
+    Overriding a standard attribute (a pool that makes `email` required, say)
+    starts from the standard entry, so unspecified fields keep the values the
+    real service reports rather than dropping out of the response.
+    """
+    name = _schema_attribute_name(raw)
+    base = _STANDARD_ATTRIBUTES_BY_NAME.get(name)
+    attr = copy.deepcopy(base) if base else {
+        "Name": name,
+        "AttributeDataType": "String",
+        "DeveloperOnlyAttribute": False,
+        "Mutable": False,
+        "Required": False,
+    }
+    attr["Name"] = name
+    for key in ("AttributeDataType",):
+        if raw.get(key):
+            attr[key] = raw[key]
+    for key in ("DeveloperOnlyAttribute", "Mutable", "Required"):
+        if key in raw:
+            attr[key] = bool(raw[key])
+    for key in ("StringAttributeConstraints", "NumberAttributeConstraints"):
+        if raw.get(key):
+            attr[key] = dict(raw[key])
+    return attr
+
+
+def _build_schema_attributes(schema) -> list:
+    """Standard attributes plus the caller's, as DescribeUserPool returns them."""
+    attrs = copy.deepcopy(_STANDARD_SCHEMA_ATTRIBUTES)
+    index = {a["Name"]: i for i, a in enumerate(attrs)}
+    for raw in schema or []:
+        if not isinstance(raw, dict):
+            continue
+        attr = _normalize_schema_attribute(raw)
+        if attr["Name"] in index:
+            attrs[index[attr["Name"]]] = attr
+        else:
+            index[attr["Name"]] = len(attrs)
+            attrs.append(attr)
+    return attrs
+
+
+def _custom_attribute_count(pool) -> int:
+    return sum(1 for a in pool.get("SchemaAttributes", [])
+               if a["Name"].startswith((_ATTRIBUTE_CUSTOM_PREFIX, _ATTRIBUTE_DEV_PREFIX)))
+
+
+# ---------------------------------------------------------------------------
 # In-memory state — User Pools (cognito-idp)
 # ---------------------------------------------------------------------------
 
 _user_pools = AccountRegionScopedDict()
 # pool_id -> {
 #   Id, Name, Arn, CreationDate, LastModifiedDate, Status,
-#   Policies, Schema, AutoVerifiedAttributes, UsernameAttributes,
+#   Policies, SchemaAttributes, AutoVerifiedAttributes, UsernameAttributes,
 #   MfaConfiguration, EstimatedNumberOfUsers,
 #   AdminCreateUserConfig, UserPoolTags,
 #   Domain (str|None),
@@ -434,6 +585,7 @@ def restore_state(data):
             data.get("user_pools", {}),
             lambda pool_id, _pool: _region_from_pool_id(pool_id),
         )
+
         _restore_regional_store(
             _pool_domain_map,
             data.get("pool_domain_map", {}),
@@ -454,6 +606,19 @@ def restore_state(data):
         _revoked_tokens.update(data.get("revoked_tokens", []))
         _auth_codes.update(data.get("auth_codes", {}))
         _challenge_sessions.update(data.get("challenge_sessions", {}))
+
+
+def _ensure_schema_attributes(pool: dict) -> dict:
+    """Backfill a pool restored from a pre-SchemaAttributes snapshot.
+
+    Older snapshots stored the CreateUserPool request's `Schema` list verbatim
+    and carried no `SchemaAttributes`; rebuilding from it on first use keeps a
+    restored pool describing itself the way a freshly created one does, without
+    rewriting records that a caller never touches.
+    """
+    if not pool.get("SchemaAttributes"):
+        pool["SchemaAttributes"] = _build_schema_attributes(pool.pop("Schema", None))
+    return pool
 
 
 def _restore_regional_store(store, restored, region_for_item):
@@ -1837,6 +2002,7 @@ async def _dispatch_idp(action: str, data: dict):
         "DescribeUserPool": _describe_user_pool,
         "ListUserPools": _list_user_pools,
         "UpdateUserPool": _update_user_pool,
+        "AddCustomAttributes": _add_custom_attributes,
         # User Pool Client CRUD
         "CreateUserPoolClient": _create_user_pool_client,
         "DeleteUserPoolClient": _delete_user_pool_client,
@@ -1982,7 +2148,7 @@ def _create_user_pool(data):
                 "TemporaryPasswordValidityDays": 7,
             }
         }),
-        "Schema": data.get("Schema", []),
+        "SchemaAttributes": _build_schema_attributes(data.get("Schema")),
         "AutoVerifiedAttributes": data.get("AutoVerifiedAttributes", []),
         "AliasAttributes": data.get("AliasAttributes", []),
         "UsernameAttributes": data.get("UsernameAttributes", []),
@@ -1992,7 +2158,7 @@ def _create_user_pool(data):
         "SmsAuthenticationMessage": data.get("SmsAuthenticationMessage", ""),
         "MfaConfiguration": data.get("MfaConfiguration", "OFF"),
         "EstimatedNumberOfUsers": 0,
-        "EmailConfiguration": data.get("EmailConfiguration", {}),
+        "EmailConfiguration": _email_configuration_out(data.get("EmailConfiguration", {})),
         "SmsConfiguration": data.get("SmsConfiguration", {}),
         "UserPoolTags": data.get("UserPoolTags", {}),
         "AdminCreateUserConfig": data.get("AdminCreateUserConfig", {
@@ -2077,11 +2243,78 @@ def _update_user_pool(data):
     for k in updatable:
         if k in data:
             pool[k] = data[k]
+    if "EmailConfiguration" in data:
+        pool["EmailConfiguration"] = _email_configuration_out(data["EmailConfiguration"])
     pool["LastModifiedDate"] = _now_epoch()
     return json_response({})
 
 
+def _add_custom_attributes(data):
+    # https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_AddCustomAttributes.html
+    # Adds to the pool schema only: 1-25 attributes per call, each stored under
+    # its `custom:` (or `dev:`) prefix, and custom attributes can never be
+    # removed or redefined afterwards.
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+    custom_attributes = data.get("CustomAttributes")
+    if not isinstance(custom_attributes, list) or not custom_attributes:
+        return error_response_json(
+            "InvalidParameterException",
+            "1 validation error detected: Value null at 'customAttributes' failed to "
+            "satisfy constraint: Member must not be null", 400)
+    if len(custom_attributes) > 25:
+        return error_response_json(
+            "InvalidParameterException",
+            "1 validation error detected: Value at 'customAttributes' failed to satisfy "
+            "constraint: Member must have length less than or equal to 25", 400)
+
+    existing = {a["Name"] for a in _ensure_schema_attributes(pool)["SchemaAttributes"]}
+    additions = []
+    for raw in custom_attributes:
+        if not isinstance(raw, dict) or not (raw.get("Name") or "").strip():
+            return error_response_json(
+                "InvalidParameterException", "Invalid attribute name.", 400)
+        attr = _normalize_schema_attribute(raw)
+        if not attr["Name"].startswith((_ATTRIBUTE_CUSTOM_PREFIX, _ATTRIBUTE_DEV_PREFIX)):
+            # A standard attribute name is not a custom attribute; AWS refuses
+            # rather than silently redefining the standard schema entry.
+            return error_response_json(
+                "InvalidParameterException",
+                f"{attr['Name']} is a standard attribute and cannot be added as a "
+                "custom attribute.", 400)
+        if attr["Name"] in existing:
+            return error_response_json(
+                "InvalidParameterException",
+                f"{attr['Name']}: Attribute already exists in the schema.", 400)
+        existing.add(attr["Name"])
+        additions.append(attr)
+
+    if _custom_attribute_count(pool) + len(additions) > _MAX_CUSTOM_ATTRIBUTES:
+        return error_response_json(
+            "InvalidParameterException",
+            f"user pool can have up to {_MAX_CUSTOM_ATTRIBUTES} custom attributes.", 400)
+
+    pool["SchemaAttributes"].extend(additions)
+    pool["LastModifiedDate"] = _now_epoch()
+    logger.info("Cognito: AddCustomAttributes %s (%s)",
+                ", ".join(a["Name"] for a in additions), pid)
+    return json_response({})
+
+
+def _email_configuration_out(email_configuration) -> dict:
+    # AWS reports EmailSendingAccount even when the request omitted it: an
+    # unspecified account means Cognito's built-in mailer.
+    # https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_EmailConfigurationType.html
+    config = dict(email_configuration or {})
+    if config:
+        config.setdefault("EmailSendingAccount", "COGNITO_DEFAULT")
+    return config
+
+
 def _pool_out(pool: dict) -> dict:
+    _ensure_schema_attributes(pool)
     return {k: v for k, v in pool.items() if not k.startswith("_")}
 
 
@@ -4130,15 +4363,20 @@ def _get_identity_provider_by_identifier(data):
 # ===========================================================================
 
 def _get_user_pool_mfa_config(data):
+    # https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_GetUserPoolMfaConfig.html
+    # A configuration that was never set is absent from the response rather than
+    # reported as a disabled block — clients diff the response against their
+    # desired state, so an invented SoftwareTokenMfaConfiguration reads as drift.
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
     if err:
         return err
-    return json_response({
-        "SmsMfaConfiguration": pool.get("SmsMfaConfiguration", {}),
-        "SoftwareTokenMfaConfiguration": pool.get("SoftwareTokenMfaConfiguration", {"Enabled": False}),
-        "MfaConfiguration": pool.get("MfaConfiguration", "OFF"),
-    })
+    resp = {"MfaConfiguration": pool.get("MfaConfiguration", "OFF")}
+    for key in ("SmsMfaConfiguration", "SoftwareTokenMfaConfiguration",
+                "EmailMfaConfiguration", "WebAuthnConfiguration"):
+        if pool.get(key):
+            resp[key] = pool[key]
+    return json_response(resp)
 
 
 def _admin_set_user_mfa_preference(data):
@@ -4203,14 +4441,19 @@ def _set_user_pool_mfa_config(data):
         pool["SmsMfaConfiguration"] = data["SmsMfaConfiguration"]
     if "SoftwareTokenMfaConfiguration" in data:
         pool["SoftwareTokenMfaConfiguration"] = data["SoftwareTokenMfaConfiguration"]
+    if "EmailMfaConfiguration" in data:
+        pool["EmailMfaConfiguration"] = data["EmailMfaConfiguration"]
+    if "WebAuthnConfiguration" in data:
+        pool["WebAuthnConfiguration"] = data["WebAuthnConfiguration"]
     if "MfaConfiguration" in data:
         pool["MfaConfiguration"] = data["MfaConfiguration"]
     pool["LastModifiedDate"] = _now_epoch()
-    return json_response({
-        "SmsMfaConfiguration": pool.get("SmsMfaConfiguration", {}),
-        "SoftwareTokenMfaConfiguration": pool.get("SoftwareTokenMfaConfiguration", {}),
-        "MfaConfiguration": pool.get("MfaConfiguration", "OFF"),
-    })
+    resp = {"MfaConfiguration": pool.get("MfaConfiguration", "OFF")}
+    for key in ("SmsMfaConfiguration", "SoftwareTokenMfaConfiguration",
+                "EmailMfaConfiguration", "WebAuthnConfiguration"):
+        if pool.get(key):
+            resp[key] = pool[key]
+    return json_response(resp)
 
 
 def _associate_software_token(data):

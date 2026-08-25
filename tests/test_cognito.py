@@ -464,6 +464,10 @@ def test_cognito_mfa_config(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="MfaPool")["UserPool"]["Id"]
     resp = cognito_idp.get_user_pool_mfa_config(UserPoolId=pid)
     assert resp["MfaConfiguration"] == "OFF"
+    # An unconfigured pool reports no MFA blocks at all; inventing a disabled
+    # SoftwareTokenMfaConfiguration reads as drift to a config-diffing client.
+    assert "SoftwareTokenMfaConfiguration" not in resp
+    assert "SmsMfaConfiguration" not in resp
 
     cognito_idp.set_user_pool_mfa_config(
         UserPoolId=pid,
@@ -473,6 +477,125 @@ def test_cognito_mfa_config(cognito_idp):
     resp = cognito_idp.get_user_pool_mfa_config(UserPoolId=pid)
     assert resp["MfaConfiguration"] == "OPTIONAL"
     assert resp["SoftwareTokenMfaConfiguration"]["Enabled"] is True
+
+def test_cognito_user_pool_returns_standard_schema_attributes(cognito_idp):
+    pool = cognito_idp.create_user_pool(PoolName="SchemaStandardPool")["UserPool"]
+    attrs = {a["Name"]: a for a in pool["SchemaAttributes"]}
+    # AWS always returns the full standard OIDC attribute set.
+    for name in ("sub", "name", "given_name", "family_name", "email",
+                 "email_verified", "phone_number", "address", "updated_at"):
+        assert name in attrs
+    assert attrs["sub"] == {
+        "Name": "sub",
+        "AttributeDataType": "String",
+        "DeveloperOnlyAttribute": False,
+        "Mutable": False,
+        "Required": True,
+        "StringAttributeConstraints": {"MinLength": "1", "MaxLength": "2048"},
+    }
+    assert attrs["email_verified"]["AttributeDataType"] == "Boolean"
+    assert "StringAttributeConstraints" not in attrs["email_verified"]
+    assert attrs["updated_at"]["NumberAttributeConstraints"] == {"MinValue": "0"}
+    assert attrs["birthdate"]["StringAttributeConstraints"] == {
+        "MinLength": "10", "MaxLength": "10"}
+
+
+def test_cognito_user_pool_schema_request_is_echoed_by_describe(cognito_idp):
+    pool = cognito_idp.create_user_pool(
+        PoolName="SchemaEchoPool",
+        Schema=[
+            {"Name": "email", "AttributeDataType": "String", "Mutable": True,
+             "Required": True,
+             "StringAttributeConstraints": {"MinLength": "1", "MaxLength": "256"}},
+            {"Name": "tenant", "AttributeDataType": "String", "Mutable": True,
+             "StringAttributeConstraints": {"MinLength": "1", "MaxLength": "32"}},
+        ],
+    )["UserPool"]
+    described = cognito_idp.describe_user_pool(
+        UserPoolId=pool["Id"])["UserPool"]["SchemaAttributes"]
+    assert described == pool["SchemaAttributes"]
+    attrs = {a["Name"]: a for a in described}
+    # A standard attribute the request redefines keeps the caller's values ...
+    assert attrs["email"]["Required"] is True
+    assert attrs["email"]["StringAttributeConstraints"] == {
+        "MinLength": "1", "MaxLength": "256"}
+    # ... and a new attribute is stored under its custom: prefix.
+    assert "tenant" not in attrs
+    assert attrs["custom:tenant"]["Mutable"] is True
+    assert attrs["custom:tenant"]["Required"] is False
+    assert attrs["custom:tenant"]["DeveloperOnlyAttribute"] is False
+
+
+def test_cognito_user_pool_developer_only_attribute_gets_dev_prefix(cognito_idp):
+    pool = cognito_idp.create_user_pool(
+        PoolName="SchemaDevPool",
+        Schema=[{"Name": "internal", "AttributeDataType": "String",
+                 "DeveloperOnlyAttribute": True}],
+    )["UserPool"]
+    names = [a["Name"] for a in pool["SchemaAttributes"]]
+    assert "dev:internal" in names
+
+
+def test_cognito_add_custom_attributes(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="AddCustomAttrPool")["UserPool"]["Id"]
+    cognito_idp.add_custom_attributes(
+        UserPoolId=pid,
+        CustomAttributes=[
+            {"Name": "deliverables", "AttributeDataType": "String", "Mutable": True,
+             "StringAttributeConstraints": {"MinLength": "1", "MaxLength": "255"}},
+            {"Name": "seats", "AttributeDataType": "Number",
+             "NumberAttributeConstraints": {"MinValue": "1"}},
+        ],
+    )
+    attrs = {a["Name"]: a for a in
+             cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]["SchemaAttributes"]}
+    assert attrs["custom:deliverables"]["StringAttributeConstraints"] == {
+        "MinLength": "1", "MaxLength": "255"}
+    assert attrs["custom:seats"]["AttributeDataType"] == "Number"
+    assert attrs["custom:seats"]["NumberAttributeConstraints"] == {"MinValue": "1"}
+
+
+def test_cognito_add_custom_attributes_rejects_duplicate(cognito_idp):
+    pid = cognito_idp.create_user_pool(
+        PoolName="AddCustomAttrDupPool",
+        Schema=[{"Name": "tenant", "AttributeDataType": "String"}],
+    )["UserPool"]["Id"]
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.add_custom_attributes(
+            UserPoolId=pid,
+            CustomAttributes=[{"Name": "tenant", "AttributeDataType": "String"}],
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+
+def test_cognito_add_custom_attributes_rejects_standard_attribute(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="AddCustomAttrStdPool")["UserPool"]["Id"]
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.add_custom_attributes(
+            UserPoolId=pid,
+            CustomAttributes=[{"Name": "email", "AttributeDataType": "String"}],
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+
+def test_cognito_add_custom_attributes_unknown_pool(cognito_idp):
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.add_custom_attributes(
+            UserPoolId="us-east-1_missingpool",
+            CustomAttributes=[{"Name": "tenant", "AttributeDataType": "String"}],
+        )
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_cognito_email_configuration_defaults_to_cognito_default(cognito_idp):
+    pool = cognito_idp.create_user_pool(
+        PoolName="EmailCfgPool",
+        EmailConfiguration={"ReplyToEmailAddress": "reply@example.com"},
+    )["UserPool"]
+    assert pool["EmailConfiguration"]["EmailSendingAccount"] == "COGNITO_DEFAULT"
+    described = cognito_idp.describe_user_pool(UserPoolId=pool["Id"])["UserPool"]
+    assert described["EmailConfiguration"]["EmailSendingAccount"] == "COGNITO_DEFAULT"
+
 
 def test_cognito_tags(cognito_idp):
     resp = cognito_idp.create_user_pool(PoolName="TagPool")
