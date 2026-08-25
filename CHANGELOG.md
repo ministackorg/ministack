@@ -7,6 +7,35 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- **ALB — `authenticate-oidc` listener action** — ALB rules accepted the action's
+  `Type` and silently discarded its `AuthenticateOidcConfig`, so a listener built
+  from a real Terraform module or `create-listener` call reported success and then
+  forwarded every request to the target unauthenticated. Anything testing an
+  OIDC-protected service against MiniStack therefore passed while proving nothing.
+  The action now works end to end: an unauthenticated request is redirected to the
+  configured `AuthorizationEndpoint` with `state`, the callback at
+  `/oauth2/idpresponse` exchanges the code on the back channel, and the session is
+  written to the client as `AWSELBAuthSessionCookie` shards, which are reassembled
+  and validated on later requests before `X-Amzn-Oidc-Identity`, `-Accesstoken`
+  and `-Data` are injected for the target. `SessionCookieName`, `SessionTimeout`,
+  `Scope` and all three `OnUnauthenticatedRequest` modes are honoured, and
+  `ClientSecret` is held for the token exchange but never echoed back from
+  `Describe*`, as on AWS. Shards are sized so the whole Set-Cookie pair — name,
+  value and attributes — fits the 4096-byte per-cookie ceiling browsers enforce; a
+  shard sized to 4096 bytes of value alone produces a cookie the browser discards,
+  which is indistinguishable from having no session. `authenticate-cognito`
+  returns a `501` rather than forwarding a request nobody authenticated.
+- **ALB — a rule's actions run as a chain** — dispatch executed `Actions[0]` and
+  ignored the rest, so the two-action shape every authentication rule has
+  (authenticate, then forward) could not work. Actions now run in `Order`:
+  authentication actions either short-circuit or pass the request to the action
+  behind them, and the first terminal action answers.
+- **ALB — `ModifyListener` reaches the data plane** — `CreateListener` copies the
+  default actions into an auto-created default rule, and dispatch reads the rule,
+  not the listener. `ModifyListener` updated only the listener record, so it
+  reported success while traffic carried on hitting the original actions. It now
+  updates the default rule too.
+
 ## [1.5.1] — 2026-08-25
 
 ### Added
