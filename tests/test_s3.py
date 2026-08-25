@@ -5732,3 +5732,28 @@ def test_s3_restore_notifications_to_sqs(s3, sqs):
     red = completed["glacierEventData"]["restoreEventData"]
     assert red["lifecycleRestoreStorageClass"] == "DEEP_ARCHIVE"
     assert red["lifecycleRestorationExpiryTime"].endswith("Z")
+
+
+def test_s3_put_object_rejects_a_mismatched_checksum(s3):
+    """A supplied checksum is verified against the body, not just stored.
+
+    The client sends one to have the object checked; storing an unverified
+    value would echo it on every later read as though it had been."""
+    bkt = "s3-checksum-mismatch"
+    s3.create_bucket(Bucket=bkt)
+
+    with pytest.raises(ClientError) as exc:
+        s3.put_object(Bucket=bkt, Key="bad.txt", Body=b"hello",
+                      ChecksumSHA256="q6MvHqxNQz8xzL6UcqhbSY9dAMYo5S3VZjjuQFDJq4c=")
+    assert exc.value.response["Error"]["Code"] == "BadDigest"
+
+    # The rejected put stored nothing.
+    with pytest.raises(ClientError) as exc:
+        s3.head_object(Bucket=bkt, Key="bad.txt")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+    # The matching value is accepted and echoed back.
+    good = "LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ="
+    s3.put_object(Bucket=bkt, Key="good.txt", Body=b"hello", ChecksumSHA256=good)
+    head = s3.head_object(Bucket=bkt, Key="good.txt", ChecksumMode="ENABLED")
+    assert head["ChecksumSHA256"] == good

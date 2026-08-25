@@ -502,6 +502,7 @@ def _decode_aws_chunked_body(body: bytes, headers: dict) -> bytes:
 
     decoded = b""
     remaining = body
+    trailer = b""
     while remaining:
         crlf = remaining.find(b"\r\n")
         if crlf == -1:
@@ -513,10 +514,27 @@ def _decode_aws_chunked_body(body: bytes, headers: dict) -> bytes:
         except ValueError:
             break
         if chunk_size == 0:
+            # Whatever follows the final chunk is the trailing header
+            # section the request announced in x-amz-trailer.
+            trailer = remaining[crlf + 2 :]
             break
         data_start = crlf + 2
         decoded += remaining[data_start : data_start + chunk_size]
         remaining = remaining[data_start + chunk_size + 2 :]  # skip trailing \r\n
+
+    # A checksum computed while the body streamed arrives here rather than
+    # among the request headers, and the rest of the request has no way to
+    # tell the two apart -- so lift it into the headers, where every
+    # checksum reader already looks.  An explicit header wins: the trailer
+    # is the late copy of the same field, not an override.
+    for line in trailer.split(b"\r\n"):
+        name, sep, value = line.partition(b":")
+        if not sep:
+            continue
+        name = name.decode("ascii", errors="replace").strip().lower()
+        if name:
+            headers.setdefault(
+                name, value.decode("utf-8", errors="replace").strip())
 
     body = decoded
     if "aws-chunked" in content_encoding:
