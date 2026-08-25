@@ -208,8 +208,8 @@ def _resolve_storage_class(headers: dict, default: str = "STANDARD"):
 
 # Storage classes whose objects are unreadable until restored. GLACIER_IR is
 # deliberately absent: instant retrieval is an active tier, readable directly,
-# and RestoreObject against it fails ObjectAlreadyInActiveTierError like any
-# other active class.
+# and RestoreObject against it fails InvalidObjectState ("Restore is not
+# allowed for the object's current storage class.").
 _ARCHIVE_STORAGE_CLASSES = frozenset({"GLACIER", "DEEP_ARCHIVE"})
 
 # Simulated retrieval latency. Fixed on purpose: every caller passes through
