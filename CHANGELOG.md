@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **EventBridge — an input template no longer needs quotes around a string variable** — AWS documents that quotes are optional for a variable holding a string and adds them itself so the transformed input stays valid JSON, quoting neither an object nor an array. MiniStack pasted every value in verbatim, so the documented form `{"detail": <detail>, "groupId": <groupId>}` produced `"groupId": some-value` and the target received a body that would not parse, forcing consumers to hand-quote the placeholder. Substitution is now aware of where the placeholder sits: a string variable in a JSON value position is quoted, a variable inside a string literal is interpolated raw as before, and an object or array spliced into a string has its internal quotes stripped the way AWS does.
+
 ## [1.5.1] — 2026-08-25
 
 ### Added
