@@ -8,8 +8,8 @@ pymongo or any MongoDB driver. There is no in-process emulation of Mongo
 commands.
 
 Engine versions (single source of truth: ``DOCDB_ENGINE_VERSIONS``):
-  - 5.0.0 → family ``docdb5.0``, backed by ``mongo:5.0``
-  - 8.0.0 → family ``docdb8.0``, backed by ``mongo:8.0``
+  - 5.0.0 → family ``docdb5.0``, backed by ``mongo:5.0.33``
+  - 8.0.0 → family ``docdb8.0``, backed by ``mongo:8.0.29``
 5.0.0 is the default, matching the AWS SDK default. Images honor
 ``MINISTACK_IMAGE_PREFIX``.
 
@@ -837,8 +837,8 @@ def _engine_version_error(engine_version):
 def _docker_image_for_docdb(engine_version, user, password, db_name=""):
     """Map a DocumentDB engine version to its wire-compatible mongo image.
 
-    DocDB 5.0 ↔ mongo:5.0 and DocDB 8.0 ↔ mongo:8.0 are wire-compatible with
-    their Mongo majors; unknown majors fall back to mongo:5.0 with a warning.
+    DocDB 5.0 ↔ mongo:5.0.33 and DocDB 8.0 ↔ mongo:8.0.29 are wire-compatible with
+    their Mongo majors; unknown majors fall back to mongo:5.0.33 with a warning.
     Honors MINISTACK_IMAGE_PREFIX via :func:`apply_image_prefix`.
 
     Args:
@@ -851,14 +851,14 @@ def _docker_image_for_docdb(engine_version, user, password, db_name=""):
         tuple: ``(image, env_dict, container_port, data_path)``.
     """
     major = str(engine_version or "").split(".")[0]
-    images = {"5": "mongo:5.0", "8": "mongo:8.0"}
+    images = {"5": "mongo:5.0.33", "8": "mongo:8.0.29"}
     image = images.get(major)
     if image is None:
         logger.warning(
-            "docdb: unsupported engine version %s; falling back to mongo:5.0",
+            "docdb: unsupported engine version %s; falling back to mongo:5.0.33",
             engine_version,
         )
-        image = "mongo:5.0"
+        image = "mongo:5.0.33"
     env = {
         "MONGO_INITDB_ROOT_USERNAME": user,
         "MONGO_INITDB_ROOT_PASSWORD": password,

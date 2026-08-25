@@ -3,6 +3,40 @@ import time
 import pytest
 from botocore.exceptions import ClientError
 
+
+@pytest.fixture(scope="module", autouse=True)
+def _docdb_teardown_after_module(docdb):
+    """Tear down every DocumentDB resource after this module's tests.
+
+    Many control-plane tests create clusters whose first member starts a real
+    mongo container; without this teardown those containers keep running after
+    the session (the server deliberately leaves containers alive across
+    restarts for warm-boot reattachment, so it will not reap them on its own).
+    Scoped to the DocumentDB API on purpose — a full ``/_ministack/reset``
+    would wipe other services' state mid-session under xdist.
+    """
+    yield
+    try:
+        for inst in docdb.describe_db_instances()["DBInstances"]:
+            try:
+                docdb.delete_db_instance(DBInstanceIdentifier=inst["DBInstanceIdentifier"])
+            except ClientError:
+                pass
+        for cluster in docdb.describe_db_clusters()["DBClusters"]:
+            try:
+                docdb.delete_db_cluster(DBClusterIdentifier=cluster["DBClusterIdentifier"])
+            except ClientError:
+                pass
+        for snap in docdb.describe_db_cluster_snapshots()["DBClusterSnapshots"]:
+            try:
+                docdb.delete_db_cluster_snapshot(
+                    DBClusterSnapshotIdentifier=snap["DBClusterSnapshotIdentifier"])
+            except ClientError:
+                pass
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Instances (created as cluster members, as the docdb API requires)
 # ---------------------------------------------------------------------------
@@ -419,21 +453,21 @@ def test_docker_image_for_docdb_versions():
     from ministack.services.documentdb import _docker_image_for_docdb
 
     image, env, port, data_path = _docker_image_for_docdb("5.0.0", "root", "secret", "admin")
-    assert image.endswith("mongo:5.0")
+    assert image.endswith("mongo:5.0.33")
     assert env["MONGO_INITDB_ROOT_USERNAME"] == "root"
     assert env["MONGO_INITDB_ROOT_PASSWORD"] == "secret"
     assert port == 27017
     assert data_path == "/data/db"
 
     image8, _, _, _ = _docker_image_for_docdb("8.0.0", "root", "secret", "admin")
-    assert image8.endswith("mongo:8.0")
+    assert image8.endswith("mongo:8.0.29")
 
 
 def test_docker_image_for_docdb_unknown_version_falls_back():
     from ministack.services.documentdb import _docker_image_for_docdb
 
     image, _, _, _ = _docker_image_for_docdb("9.9.9", "root", "secret")
-    assert image.endswith("mongo:5.0")
+    assert image.endswith("mongo:5.0.33")
 
 
 def test_docker_image_prefix_honored(monkeypatch):
@@ -441,7 +475,7 @@ def test_docker_image_prefix_honored(monkeypatch):
     from ministack.services.documentdb import _docker_image_for_docdb
 
     image, _, _, _ = _docker_image_for_docdb("8.0.0", "root", "secret")
-    assert image == "mirror.example.com/mongo:8.0"
+    assert image == "mirror.example.com/mongo:8.0.29"
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +559,7 @@ def test_docdb_pymongo_shared_endpoint(docdb):
 
 
 def test_docdb_pymongo_v8_connects(docdb):
-    """A DocDB 8.0.0 cluster member accepts wire connections (mongo:8.0)."""
+    """A DocDB 8.0.0 cluster member accepts wire connections (mongo:8.0.29)."""
     if not _pymongo_available():
         pytest.skip("pymongo not installed")
     if not _docker_available():
