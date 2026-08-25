@@ -7112,8 +7112,7 @@ def test_sfn_map_parameters_is_the_item_selector(sfn):
 def test_sfn_jsonata_assign_pass_then_choice_references_variable(sfn, sfn_sync):
     """Regression for #645: exact issue repro. A Pass state's `Assign` binds
     a variable from `$states.result`; a downstream Choice's `Condition`
-    references it via `$myList`. Before the fix the evaluator raised
-    `States.QueryEvaluationError: Unsupported JSONata expression: $myList`.
+    references it via `$myList`, which reads whatever the earlier `Assign` wrote.
     """
     import uuid as _uuid_local
     sm_name = f"jsonata-assign-{_uuid_local.uuid4().hex[:8]}"
@@ -7327,6 +7326,37 @@ def _sfn_run_pass_output(sfn_sync, output_expr, input_obj=None):
         sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
 
 
+def _sfn_run_pass_output_expect_failure(sfn_sync, output_expr):
+    """Round-trip helper: build a single Pass state whose Output is `output_expr`,
+    run it sync, and return the (error, cause) of an execution expected to fail."""
+    sm_name = f"jsonata-fail-{_uuid_mod.uuid4().hex[:8]}"
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "Run",
+            "States": {
+                "Run": {
+                    "Type": "Pass",
+                    "Output": output_expr,
+                    "End": True,
+                },
+            },
+        }),
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(
+            stateMachineArn=sm_arn,
+            input="{}",
+        )
+        assert resp["status"] == "FAILED", \
+            f"Expected FAILED, got {resp['status']}: {resp.get('output')}"
+        return resp.get("error"), resp.get("cause")
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
 def test_sfn_jsonata_exists_in_choice_condition_issue_669(sfn_sync):
     """The exact example from issue #669: `$exists($states.input.userId)` used
     as a Choice `Condition` must route correctly whether the field is present
@@ -7405,11 +7435,13 @@ def test_sfn_jsonata_numeric_functions(sfn_sync):
         "power":   "{% $power(2, 8) %}",
         "sqrt":    "{% $sqrt(16) %}",
     })
-    # $round uses banker's rounding: 2.5 -> 2 (round-half-to-even)
+    # $round shifts the decimal point on the digit string, then rounds half to even:
+    # 2.5 -> 2, and 2.345 -> 234.5 -> 234 -> 2.34. The official suite pins the same rule
+    # with `$round(4.525, 2)` -> 4.52.
     assert out == {
         "sum": 10, "avg": 4, "max": 3, "min": 1,
         "abs": 7, "floor": 2, "ceil": 3,
-        "round": 2, "roundp": 2.35,
+        "round": 2, "roundp": 2.34,
         "power": 256, "sqrt": 4,
     }
 
@@ -7434,12 +7466,19 @@ def test_sfn_jsonata_object_functions(sfn_sync):
         sfn_sync,
         {
             "keys":   "{% $keys($states.input.obj) %}",
-            "values": "{% $values($states.input.obj) %}",
+            # JSONata has no `$values`; `$each` is how an object's values are read.
+            "values": "{% $each($states.input.obj, function($v) { $v }) %}",
             "look":   "{% $lookup($states.input.obj, 'a') %}",
+            "spread": "{% $spread($states.input.obj) %}",
         },
         input_obj={"obj": {"a": 1, "b": 2}},
     )
-    assert out == {"keys": ["a", "b"], "values": [1, 2], "look": 1}
+    assert out == {
+        "keys": ["a", "b"],
+        "values": [1, 2],
+        "look": 1,
+        "spread": [{"a": 1}, {"b": 2}],
+    }
 
 
 def test_sfn_jsonata_type_and_boolean(sfn_sync):
@@ -7555,10 +7594,14 @@ def test_sfn_jsonata_boolean_array_of_falsy_is_false(sfn_sync):
 
 
 def test_sfn_jsonata_now_picture_and_timezone(sfn_sync):
-    """$now(picture) and $now(picture, timezone) format per XPath picture."""
+    """$now(picture) and $now(picture, timezone) format per XPath picture.
+
+    The timezone argument is the `±HHMM` offset JSONata specifies, which is the form the
+    official suite uses (`'-0500'`, `'+0530'`).
+    """
     out = _sfn_run_pass_output(sfn_sync, {
         "date_only":   "{% $now('[Y0001]-[M01]-[D01]') %}",
-        "with_tz":     "{% $now('[H01]:[m01][Z]', '+05:30') %}",
+        "with_tz":     "{% $now('[H01]:[m01][Z]', '+0530') %}",
         "default":     "{% $now() %}",
     })
     import re as _re
@@ -7583,6 +7626,371 @@ def test_sfn_jsonata_format_number(sfn_sync):
         "neg_sub": "(1,234.50)",
         "plain": "1,234",
     }
+
+
+# ---------------------------------------------------------------------------
+# JSONata defect fixes: a value JSON cannot represent, the doubled error code
+# in Cause, Map/Parallel evaluating no JSONata, `$states.context` exposing
+# MiniStack's own control state, `$states.result`/`errorOutput` defaulting to
+# `null` instead of unavailable, and Parallel branches leaking `Assign`.
+# ---------------------------------------------------------------------------
+
+def test_sfn_jsonata_output_values_json_cannot_represent_fail_as_query_eval_error(sfn_sync):
+    """A function value (`$append`), Infinity (`1/0`), and NaN (`0/0`) all reach
+    the state output as something JSON cannot serialize. Each must fail the
+    execution as `States.QueryEvaluationError` — the AWS-documented code for a
+    type the query language cannot represent as output — not succeed with a
+    payload that can't be serialized.
+    """
+    for expression in ("$append", "1/0", "0/0"):
+        error, cause = _sfn_run_pass_output_expect_failure(
+            sfn_sync, {"x": f"{{% {expression} %}}"})
+        assert error == "States.QueryEvaluationError", f"{expression}: error={error} cause={cause}"
+        assert "JSON cannot represent" in cause, f"{expression}: cause={cause}"
+
+
+def test_sfn_jsonata_match_reports_an_optional_group_that_did_not_participate(sfn_sync):
+    """`$match` leaves the JSONata `undefined` in `groups` for an optional group that matched
+    nothing, and JSON spells that position `null`. The expression succeeds: only an expression
+    whose own result is undefined fails the execution.
+    """
+    output = _sfn_run_pass_output(sfn_sync, {"m": "{% $match('a1', /(a)(b)?(1)/) %}"})
+    assert output["m"] == {"match": "a1", "index": 0, "groups": ["a", None, "1"]}
+
+
+def test_sfn_jsonata_output_spells_an_integer_larger_than_a_double_in_full(sfn_sync):
+    """JSONata numbers are IEEE 754 doubles, and JSON spells one positionally up to 1e21."""
+    output = _sfn_run_pass_output(sfn_sync, {
+        "big": "{% 100000000000000000 %}",
+        "bigger": "{% 123456789012345678901 %}",
+        "past_the_band": "{% 1e21 %}",
+    })
+    assert output["big"] == 100000000000000000
+    assert output["bigger"] == 123456789012345680000
+    assert output["past_the_band"] == 1e21
+
+
+def test_sfn_jsonata_expression_nested_past_the_depth_cap_fails_the_execution(sfn_sync):
+    """An expression nested deeper than MiniStack allows fails the execution as a query error,
+    which a state can Catch, rather than exhausting the Python stack under the worker.
+    """
+    error, cause = _sfn_run_pass_output_expect_failure(
+        sfn_sync, {"deep": "{% " + "(" * 400 + "1" + ")" * 400 + " %}"})
+    assert error == "States.QueryEvaluationError", f"error={error} cause={cause}"
+    assert "U1001" in cause, f"cause={cause}"
+
+
+def test_sfn_jsonata_output_unrepresentable_value_is_catchable(sfn_sync):
+    """An Output that JSON cannot represent fails inside the state, so the state's own
+    `Catch: ["States.ALL"]` sees it and the execution takes the catch branch.
+    """
+    sm_name = f"jsonata-unrepresentable-catch-{_uuid_mod.uuid4().hex[:8]}"
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "T",
+            "States": {
+                "T": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:sqs:listQueues",
+                    "Arguments": {},
+                    "Output": {"f": "{% $append %}"},
+                    "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "Caught"}],
+                    "End": True,
+                },
+                "Caught": {"Type": "Pass", "Output": {"caught": True}, "End": True},
+            },
+        }),
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input="{}")
+        assert resp["status"] == "SUCCEEDED", \
+            f"Status: {resp.get('status')} error={resp.get('error')} cause={resp.get('cause')}"
+        assert json.loads(resp["output"]) == {"caught": True}
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_jsonata_error_cause_states_the_code_once(sfn_sync):
+    """`str(JsonataError)` already starts with the error code (`T2002: ...`);
+    the Cause must not repeat it (`T2002: T2002: ...`).
+    """
+    error, cause = _sfn_run_pass_output_expect_failure(sfn_sync, {"x": "{% 1 + {} %}"})
+    assert error == "States.QueryEvaluationError"
+    assert cause.count("T2002:") == 1, f"cause repeats the error code: {cause}"
+    assert "while evaluating" in cause
+
+
+def test_sfn_jsonata_map_items_output_and_assign(sfn_sync):
+    """The AWS documentation's own example: a Map state's `Items` field (not
+    `ItemsPath`) selects the array in JSONata mode, `Output` sees
+    `$states.result` as the array of per-item outputs, and a state-level
+    `Assign` on the Map itself is visible after the Map completes.
+    """
+    sm_name = f"jsonata-map-wiring-{_uuid_mod.uuid4().hex[:8]}"
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "M",
+            "States": {
+                "M": {
+                    "Type": "Map",
+                    "Items": "{% $states.input.items %}",
+                    "ItemProcessor": {
+                        "ProcessorConfig": {"Mode": "INLINE"},
+                        "StartAt": "I",
+                        "States": {
+                            "I": {
+                                "Type": "Pass",
+                                "Output": {"n": "{% $states.input.n * 2 %}"},
+                                "End": True,
+                            },
+                        },
+                    },
+                    "Output": {"doubled": "{% $states.result %}"},
+                    "Assign": {"itemCount": "{% $count($states.result) %}"},
+                    "Next": "After",
+                },
+                "After": {
+                    "Type": "Pass",
+                    "Output": {
+                        "doubled": "{% $states.input.doubled %}",
+                        "count": "{% $itemCount %}",
+                    },
+                    "End": True,
+                },
+            },
+        }),
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(
+            stateMachineArn=sm_arn,
+            input=json.dumps({"items": [{"n": 1}, {"n": 2}]}),
+        )
+        assert resp["status"] == "SUCCEEDED", \
+            f"Status: {resp.get('status')} error={resp.get('error')} cause={resp.get('cause')}"
+        assert json.loads(resp["output"]) == {"doubled": [{"n": 2}, {"n": 4}], "count": 2}
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_jsonata_parallel_output_and_assign(sfn_sync):
+    """A Parallel state's `Output` sees `$states.result` as the array of
+    branch outputs, and a state-level `Assign` on the Parallel is visible
+    after it completes.
+    """
+    sm_name = f"jsonata-parallel-wiring-{_uuid_mod.uuid4().hex[:8]}"
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "P",
+            "States": {
+                "P": {
+                    "Type": "Parallel",
+                    "Branches": [
+                        {"StartAt": "B1", "States": {"B1": {"Type": "Pass", "Output": {"b": 1}, "End": True}}},
+                        {"StartAt": "B2", "States": {"B2": {"Type": "Pass", "Output": {"b": 2}, "End": True}}},
+                    ],
+                    "Output": {"joined": "{% $merge($states.result) %}"},
+                    "Assign": {"branchCount": "{% $count($states.result) %}"},
+                    "Next": "After",
+                },
+                "After": {
+                    "Type": "Pass",
+                    "Output": {
+                        "joined": "{% $states.input.joined %}",
+                        "count": "{% $branchCount %}",
+                    },
+                    "End": True,
+                },
+            },
+        }),
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input="{}")
+        assert resp["status"] == "SUCCEEDED", \
+            f"Status: {resp.get('status')} error={resp.get('error')} cause={resp.get('cause')}"
+        assert json.loads(resp["output"]) == {"joined": {"b": 2}, "count": 2}
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_jsonata_states_context_excludes_control_state(sfn_sync):
+    """`$states.context` exposes only the AWS Context Object fields present at
+    that point (here, on a bare Pass: `Execution`, `State`, `StateMachine`) —
+    never MiniStack's own `variables` (the Assign store) or `QueryLanguage`.
+    """
+    out = _sfn_run_pass_output(sfn_sync, {"keys": "{% $keys($states.context) %}"})
+    assert sorted(out["keys"]) == ["Execution", "State", "StateMachine"]
+
+
+def test_sfn_jsonata_states_context_does_not_leak_assign_variables(sfn_sync):
+    """A variable bound by `Assign` must not be reachable through
+    `$states.context.variables` — that dict is MiniStack's own control state,
+    not part of the AWS Context Object.
+    """
+    sm_name = f"jsonata-context-leak-{_uuid_mod.uuid4().hex[:8]}"
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "A",
+            "States": {
+                "A": {"Type": "Pass", "Assign": {"secret": "hunter2"}, "Next": "B"},
+                "B": {
+                    "Type": "Pass",
+                    "Output": {"leak": "{% $states.context.variables.secret %}"},
+                    "End": True,
+                },
+            },
+        }),
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input="{}")
+        assert resp["status"] == "FAILED", f"Expected FAILED (undefined), got: {resp}"
+        assert resp.get("error") == "States.QueryEvaluationError"
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_jsonata_states_result_and_error_output_unavailable_outside_task(sfn_sync):
+    """`$states.result` and `$states.errorOutput` are only bound where AWS
+    binds them (a Task/mock result, and a Catch handler's error, respectively).
+    On a Pass state neither is available: `$exists` must report false, and
+    selecting either directly must fail the execution rather than read back a
+    `null` that only means "the Task returned null" per AWS.
+    """
+    out = _sfn_run_pass_output(sfn_sync, {
+        "resultExists": "{% $exists($states.result) %}",
+        "errorOutputExists": "{% $exists($states.errorOutput) %}",
+    })
+    assert out == {"resultExists": False, "errorOutputExists": False}
+
+    for field in ("result", "errorOutput"):
+        error, cause = _sfn_run_pass_output_expect_failure(
+            sfn_sync, {"x": f"{{% $states.{field} %}}"})
+        assert error == "States.QueryEvaluationError", f"{field}: error={error} cause={cause}"
+
+
+def test_sfn_jsonata_parallel_branch_assign_goes_out_of_scope(sfn_sync):
+    """AWS: 'When a Parallel or Map state completes, all of their variables
+    will go out of scope and stop being accessible.' A variable assigned
+    inside a Parallel branch must not be visible after the Parallel.
+    """
+    sm_name = f"jsonata-parallel-scope-{_uuid_mod.uuid4().hex[:8]}"
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "P",
+            "States": {
+                "P": {
+                    "Type": "Parallel",
+                    "Branches": [
+                        {"StartAt": "B1", "States": {"B1": {"Type": "Pass", "Assign": {"seen": 42}, "End": True}}},
+                    ],
+                    "Next": "After",
+                },
+                "After": {"Type": "Pass", "Output": {"seen": "{% $seen %}"}, "End": True},
+            },
+        }),
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input="{}")
+        assert resp["status"] == "FAILED", \
+            f"Expected the branch's Assign to be out of scope; got: {resp}"
+        assert resp.get("error") == "States.QueryEvaluationError"
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_jsonata_wait_seconds_and_assign(sfn_sync):
+    """A JSONata Wait state's `Seconds` carries the `{% %}` expression directly
+    (no `SecondsPath` in JSONata mode), and it supports `Assign` like every
+    other state AWS allows it on."""
+    sm_name = f"jsonata-wait-seconds-{_uuid_mod.uuid4().hex[:8]}"
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "W",
+            "States": {
+                "W": {
+                    "Type": "Wait",
+                    "Seconds": "{% $states.input.delay %}",
+                    "Assign": {"waited": True},
+                    "Next": "After",
+                },
+                "After": {"Type": "Pass", "Output": {"waited": "{% $waited %}"}, "End": True},
+            },
+        }),
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(
+            stateMachineArn=sm_arn, input=json.dumps({"delay": 0}))
+        assert resp["status"] == "SUCCEEDED", \
+            f"Status: {resp.get('status')} error={resp.get('error')} cause={resp.get('cause')}"
+        assert json.loads(resp["output"]) == {"waited": True}
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_jsonata_wait_seconds_type_mismatch_is_query_eval_error(sfn_sync):
+    """A `Seconds` expression that evaluates to something other than a number is a JSONata type
+    incompatibility, so the Wait fails as the catchable `States.QueryEvaluationError`.
+    """
+    sm_name = f"jsonata-wait-badtype-{_uuid_mod.uuid4().hex[:8]}"
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "W",
+            "States": {
+                "W": {"Type": "Wait", "Seconds": "{% 'nope' %}", "End": True},
+            },
+        }),
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input="{}")
+        assert resp["status"] == "FAILED", f"Expected FAILED, got: {resp}"
+        assert resp.get("error") == "States.QueryEvaluationError", \
+            f"error={resp.get('error')} cause={resp.get('cause')}"
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_jsonata_fail_evaluates_error_and_cause(sfn_sync):
+    """A JSONata Fail state's `Error`/`Cause` are `{% %}` expressions, not
+    literal strings — the exact shape from the issue repro."""
+    sm_name = f"jsonata-fail-{_uuid_mod.uuid4().hex[:8]}"
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "F",
+            "States": {
+                "F": {"Type": "Fail", "Error": "{% 'E' & '1' %}", "Cause": "{% 'boom' %}"},
+            },
+        }),
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input="{}")
+        assert resp["status"] == "FAILED"
+        assert resp.get("error") == "E1", f"error={resp.get('error')!r}"
+        assert resp.get("cause") == "boom", f"cause={resp.get('cause')!r}"
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
 
 
 # ---------------------------------------------------------------------------
