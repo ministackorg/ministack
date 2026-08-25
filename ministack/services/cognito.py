@@ -2315,7 +2315,12 @@ def _email_configuration_out(email_configuration) -> dict:
 
 def _pool_out(pool: dict) -> dict:
     _ensure_schema_attributes(pool)
-    return {k: v for k, v in pool.items() if not k.startswith("_")}
+    output = {k: v for k, v in pool.items() if not k.startswith("_")}
+    if "EmailConfiguration" in output:
+        output["EmailConfiguration"] = _email_configuration_out(
+            output["EmailConfiguration"]
+        )
+    return output
 
 
 # ===========================================================================
