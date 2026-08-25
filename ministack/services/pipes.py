@@ -9,7 +9,7 @@ SDK surface:
 
 Runtime (background poller + CloudFormation) scope is intentionally limited to:
 - Source: DynamoDB Streams
-- Target: SNS
+- Target: SNS, Step Functions state machine
 """
 
 import copy
@@ -222,37 +222,74 @@ def _poll_once():
         account_token = _request_account_id.set(pipe_account_id)
         region_token = _request_region.set(pipe_region)
         try:
-            if pipe.get("CurrentState") != "RUNNING":
-                continue
-
-            source_arn = pipe.get("Source", "")
-            target_arn = pipe.get("Target", "")
-            if _arn_service(source_arn) != "dynamodb" or _arn_service(target_arn) != "sns":
-                continue
-
-            source = _dynamodb_stream_source(source_arn)
-            if source is None:
-                continue
-            source_spec, table_name = source
-            if source_spec.account_id != pipe_account_id:
-                continue
-
-            scope = {"account_id": pipe_account_id, "region": source_spec.region}
-            # Positions are absolute stream positions: records expiring off the
-            # front of the stream must not shift a pipe's read position.
-            horizon = _ddb.stream_start_position(table_name, **scope)
-            end = _ddb.stream_end_position(table_name, **scope)
-            pos = max(int(_positions.get(pipe["Arn"], 0)), horizon)
-            if pos >= end:
-                continue
-
-            batch = _ddb.stream_records_since(table_name, pos, end - pos, **scope)
-            for rec in batch:
-                _publish_record_to_sns(target_arn, pipe, rec)
-            _positions[pipe["Arn"]] = pos + len(batch)
+            _poll_pipe(_ddb, pipe, pipe_account_id)
         finally:
             _request_region.reset(region_token)
             _request_account_id.reset(account_token)
+
+
+def _poll_pipe(_ddb, pipe: dict, pipe_account_id: str) -> None:
+    if pipe.get("CurrentState") != "RUNNING":
+        return
+    if _arn_service(pipe.get("Source", "")) != "dynamodb":
+        return
+
+    source = _dynamodb_stream_source(pipe.get("Source", ""))
+    if source is None:
+        return
+    source_spec, table_name = source
+    if source_spec.account_id != pipe_account_id:
+        return
+
+    scope = {"account_id": pipe_account_id, "region": source_spec.region}
+    # Positions are absolute stream positions: records expiring off the
+    # front of the stream must not shift a pipe's read position.
+    horizon = _ddb.stream_start_position(table_name, **scope)
+    end = _ddb.stream_end_position(table_name, **scope)
+    pos = max(int(_positions.get(pipe["Arn"], 0)), horizon)
+    if pos >= end:
+        return
+
+    batch = _ddb.stream_records_since(table_name, pos, end - pos, **scope)
+    if _deliver_batch(pipe, batch):
+        _positions[pipe["Arn"]] = pos + len(batch)
+
+
+def _deliver_batch(pipe: dict, batch: list) -> bool:
+    """True once every record in the batch has reached the target. A batch that
+    did not is left on the stream: the position stays on it and the next poll
+    retries it, until the records age out of the retention window."""
+    target_arn = pipe.get("Target", "")
+    target_service = _arn_service(target_arn)
+    if target_service == "states":
+        return _start_state_machine_from_records(target_arn, pipe, batch)
+    if target_service == "sns":
+        for rec in batch:
+            _publish_record_to_sns(target_arn, pipe, rec)
+        return True
+    logger.warning(
+        "Pipes %s: holding %d record(s); MiniStack delivers to sns and states, "
+        "not to %s", pipe.get("Name"), len(batch), target_service or target_arn)
+    return False
+
+
+def _start_state_machine_from_records(sm_arn: str, pipe: dict, records: list) -> bool:
+    """Start one execution carrying the batch as the JSON array Pipes delivers.
+
+    `_start_execution` answers the `(status, headers, body)` triple every
+    MiniStack handler answers; anything from 400 up means no execution started.
+    """
+    from ministack.services import stepfunctions as _sfn
+
+    status, _headers, body = _sfn._start_execution({
+        "stateMachineArn": sm_arn,
+        "input": json.dumps(records),
+    })
+    if status >= 400:
+        logger.warning("Pipes %s: StartExecution on %s failed (%s): %s",
+                       pipe.get("Name"), sm_arn, status, body)
+        return False
+    return True
 
 
 def _publish_record_to_sns(topic_arn: str, pipe: dict, record: dict):
