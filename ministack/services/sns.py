@@ -7,6 +7,7 @@ Supports: CreateTopic, DeleteTopic, ListTopics, GetTopicAttributes, SetTopicAttr
           Publish, PublishBatch,
           ListTagsForResource, TagResource, UntagResource,
           CreatePlatformApplication, ListPlatformApplications,
+          GetPlatformApplicationAttributes, SetPlatformApplicationAttributes,
           DeletePlatformApplication,
           CreatePlatformEndpoint, GetEndpointAttributes, SetEndpointAttributes,
           DeleteEndpoint.
@@ -184,6 +185,8 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
         "UntagResource": _untag_resource,
         "CreatePlatformApplication": _create_platform_application,
         "ListPlatformApplications": _list_platform_applications,
+        "GetPlatformApplicationAttributes": _get_platform_application_attributes,
+        "SetPlatformApplicationAttributes": _set_platform_application_attributes,
         "CreatePlatformEndpoint": _create_platform_endpoint,
         "DeletePlatformApplication": _delete_platform_application,
         "GetEndpointAttributes": _get_endpoint_attributes,
@@ -1179,6 +1182,8 @@ def _create_platform_application(params):
         attrs[key] = val
         i += 1
 
+    attrs.setdefault("Enabled", "true")
+
     _platform_applications[arn] = {
         "arn": arn,
         "name": name,
@@ -1224,6 +1229,61 @@ def _list_platform_applications(params):
                 f"<ListPlatformApplicationsResult>"
                 f"<PlatformApplications>{members}</PlatformApplications>"
                 f"{next_token_xml}</ListPlatformApplicationsResult>")
+
+
+def _get_platform_application_attributes(params):
+    # https://docs.aws.amazon.com/sns/latest/api/API_GetPlatformApplicationAttributes.html
+    # PlatformApplicationArn is required (InvalidParameter/400); an unknown ARN
+    # is NotFound/404. Attributes are returned as entry key/value pairs, e.g.
+    # Enabled, AllowEndpointPolicies, AuthenticationMethod and the Event* topic
+    # ARNs. Unlike the endpoint APIs there is no separate "Enabled" default in
+    # the request, so CreatePlatformApplication seeds it.
+    arn = _p(params, "PlatformApplicationArn")
+    if not arn:
+        return _error("InvalidParameter",
+                      "Invalid parameter: PlatformApplicationArn Reason: no value for required parameter",
+                      400)
+    app = _platform_applications.get(arn)
+    if app is None:
+        return _error("NotFound",
+                      f"PlatformApplication does not exist: {arn}", 404)
+    entries = "".join(
+        f"<entry><key>{_xml_escape(k)}</key><value>{_xml_escape(v)}</value></entry>"
+        for k, v in app.get("attributes", {}).items()
+    )
+    return _xml(200, "GetPlatformApplicationAttributesResponse",
+                f"<GetPlatformApplicationAttributesResult>"
+                f"<Attributes>{entries}</Attributes>"
+                f"</GetPlatformApplicationAttributesResult>")
+
+
+def _set_platform_application_attributes(params):
+    # https://docs.aws.amazon.com/sns/latest/api/API_SetPlatformApplicationAttributes.html
+    # Both PlatformApplicationArn and Attributes are required; the call merges
+    # the supplied entries into the existing attribute map (PlatformCredential,
+    # PlatformPrincipal, Event* topic ARNs, *FeedbackRoleArn, Enabled, ...).
+    # The response body carries only ResponseMetadata.
+    arn = _p(params, "PlatformApplicationArn")
+    if not arn:
+        return _error("InvalidParameter",
+                      "Invalid parameter: PlatformApplicationArn Reason: no value for required parameter",
+                      400)
+    updates = {}
+    i = 1
+    while _p(params, f"Attributes.entry.{i}.key"):
+        updates[_p(params, f"Attributes.entry.{i}.key")] = \
+            _p(params, f"Attributes.entry.{i}.value")
+        i += 1
+    if not updates:
+        return _error("InvalidParameter",
+                      "Invalid parameter: Attributes Reason: no value for required parameter",
+                      400)
+    app = _platform_applications.get(arn)
+    if app is None:
+        return _error("NotFound",
+                      f"PlatformApplication does not exist: {arn}", 404)
+    app["attributes"].update(updates)
+    return _xml(200, "SetPlatformApplicationAttributesResponse", "")
 
 
 def _create_platform_endpoint(params):
