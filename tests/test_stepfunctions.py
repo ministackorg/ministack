@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import io
 import json
 import os
@@ -563,6 +564,90 @@ def test_sfn_intrinsic_json_merge(sfn, sfn_sync):
     output = json.loads(resp["output"])
     assert output["merged"] == {"a": 1, "b": 2, "c": 99}
 
+def test_sfn_intrinsic_hash(sfn, sfn_sync):
+    """States.Hash covers AWS's five algorithms and refuses anything else."""
+    definition = json.dumps({
+        "StartAt": "Hash",
+        "States": {
+            "Hash": {
+                "Type": "Pass",
+                "Parameters": {
+                    "md5.$": "States.Hash($.text, 'MD5')",
+                    "sha1.$": "States.Hash($.text, 'SHA-1')",
+                    "sha256.$": "States.Hash($.text, 'SHA-256')",
+                    "sha384.$": "States.Hash($.text, 'SHA-384')",
+                    "sha512.$": "States.Hash($.text, 'SHA-512')",
+                },
+                "End": True,
+            }
+        },
+    })
+    sm = sfn.create_state_machine(
+        name="sfn-intrinsic-hash",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    resp = sfn_sync.start_sync_execution(
+        stateMachineArn=sm["stateMachineArn"], input=json.dumps({"text": "input data"}))
+    assert resp["status"] == "SUCCEEDED"
+    output = json.loads(resp["output"])
+    # Lowercase hex of the UTF-8 bytes, so the digests are the ones any other tool produces.
+    assert output["md5"] == hashlib.md5(b"input data").hexdigest()
+    assert output["sha1"] == hashlib.sha1(b"input data").hexdigest()
+    assert output["sha256"] == hashlib.sha256(b"input data").hexdigest()
+    assert output["sha384"] == hashlib.sha384(b"input data").hexdigest()
+    assert output["sha512"] == hashlib.sha512(b"input data").hexdigest()
+
+    # An algorithm AWS does not publish is refused rather than passed to hashlib.
+    bad = sfn.create_state_machine(
+        name="sfn-intrinsic-hash-bad",
+        definition=json.dumps({"StartAt": "H", "States": {"H": {
+            "Type": "Pass", "Parameters": {"h.$": "States.Hash($.text, 'SHA-224')"}, "End": True}}}),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    resp = sfn_sync.start_sync_execution(
+        stateMachineArn=bad["stateMachineArn"], input=json.dumps({"text": "input data"}))
+    assert resp["status"] == "FAILED"
+    assert resp.get("error") == "States.Runtime"
+
+def test_sfn_intrinsic_string_split(sfn, sfn_sync):
+    """States.StringSplit takes a set of delimiter characters and keeps no empty member."""
+    definition = json.dumps({
+        "StartAt": "Split",
+        "States": {
+            "Split": {
+                "Type": "Pass",
+                "Parameters": {
+                    "simple.$": "States.StringSplit($.csv, ',')",
+                    "charset.$": "States.StringSplit($.mixed, '.+,=')",
+                    "runs.$": "States.StringSplit($.runs, ',')",
+                    "absent.$": "States.StringSplit($.plain, ',')",
+                    # Recovering the region from the execution ARN, which is what needs this.
+                    "region.$": "States.ArrayGetItem(States.StringSplit($$.Execution.Id, ':'), 3)",
+                },
+                "End": True,
+            }
+        },
+    })
+    sm = sfn.create_state_machine(
+        name="sfn-intrinsic-split",
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    resp = sfn_sync.start_sync_execution(
+        stateMachineArn=sm["stateMachineArn"],
+        input=json.dumps({"csv": "1,2,3", "mixed": "This.is+a,test=string",
+                          "runs": ",a,,b,", "plain": "abc"}),
+    )
+    assert resp["status"] == "SUCCEEDED"
+    output = json.loads(resp["output"])
+    assert output["simple"] == ["1", "2", "3"]
+    assert output["charset"] == ["This", "is", "a", "test", "string"]
+    # Runs of delimiters, and delimiters at either end, contribute nothing.
+    assert output["runs"] == ["a", "b"]
+    assert output["absent"] == ["abc"]
+    assert output["region"] == "us-east-1"
+
 def test_sfn_intrinsic_format(sfn, sfn_sync):
     """States.Format interpolates arguments into a template string."""
     definition = json.dumps({
@@ -719,6 +804,50 @@ def test_sfn_intrinsic_nested(sfn, sfn_sync):
     assert resp["status"] == "SUCCEEDED"
     output = json.loads(resp["output"])
     assert output["result"] == {"key": "hello"}
+
+def test_sfn_aws_sdk_cloudwatchlogs_create_and_tag(sfn_sync):
+    """aws-sdk:cloudwatchlogs routes, and takes the parameter case a machine writes."""
+    group = f"/sfn-sdk-test/{_uuid_mod.uuid4().hex[:8]}"
+    group_arn = f"arn:aws:logs:us-east-1:000000000000:log-group:{group}"
+    sm_name = f"sdk-logs-{_uuid_mod.uuid4().hex[:8]}"
+
+    definition = json.dumps({
+        "StartAt": "CreateLogGroup",
+        "States": {
+            "CreateLogGroup": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:cloudwatchlogs:createLogGroup",
+                "Parameters": {"LogGroupName": group},
+                "ResultPath": "$.created",
+                "Next": "TagLogGroup",
+            },
+            "TagLogGroup": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:cloudwatchlogs:tagResource",
+                "Parameters": {"ResourceArn": group_arn, "Tags": {"owner": "sfn"}},
+                "ResultPath": "$.tagged",
+                "Next": "ReadTags",
+            },
+            "ReadTags": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:cloudwatchlogs:listTagsForResource",
+                "Parameters": {"ResourceArn": group_arn},
+                "ResultPath": "$.tags",
+                "End": True,
+            },
+        },
+    })
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+    assert resp["status"] == "SUCCEEDED", f"Execution failed: {resp.get('error')} — {resp.get('cause')}"
+    assert json.loads(resp["output"])["tags"]["Tags"] == {"owner": "sfn"}
+
 
 def test_sfn_aws_sdk_secretsmanager_create_and_get(sfn, sfn_sync, sm):
     """aws-sdk:secretsmanager integration creates and retrieves a secret."""
