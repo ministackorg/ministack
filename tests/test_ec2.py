@@ -3100,6 +3100,58 @@ def test_ebs_create_and_describe_snapshot(ec2):
     assert desc["Snapshots"][0]["VolumeId"] == vol_id
     assert desc["Snapshots"][0]["Description"] == "test snapshot"
 
+def test_ebs_describe_snapshots_honors_filters(ec2):
+    """Filters must narrow the result. Ignoring them returns every snapshot in the account, so a
+    tag scan looking for "the snapshot of this backup" adopts one taken by something else."""
+    tag = _uuid_mod.uuid4().hex[:8]
+    key = f"check-{tag}"          # unique, so other tests' snapshots cannot match the tag filters
+    first_vol = ec2.create_volume(AvailabilityZone="us-east-1a", Size=11, VolumeType="gp2")["VolumeId"]
+    second_vol = ec2.create_volume(AvailabilityZone="us-east-1a", Size=12, VolumeType="gp2")["VolumeId"]
+    tagged = ec2.create_snapshot(
+        VolumeId=first_vol, Description=f"tagged {tag}",
+        TagSpecifications=[{"ResourceType": "snapshot", "Tags": [{"Key": key, "Value": tag}]}],
+    )["SnapshotId"]
+    # A second snapshot of the same volume, untagged: with the filters ignored it comes back too.
+    spare = ec2.create_snapshot(VolumeId=first_vol, Description=f"spare {tag}")["SnapshotId"]
+    other_volume = ec2.create_snapshot(VolumeId=second_vol, Description=f"other {tag}")["SnapshotId"]
+
+    def ids(**kwargs):
+        return sorted(s["SnapshotId"] for s in ec2.describe_snapshots(**kwargs)["Snapshots"])
+
+    try:
+        assert ids(Filters=[{"Name": f"tag:{key}", "Values": [tag]}]) == [tagged]
+        assert ids(Filters=[{"Name": "tag-key", "Values": [key]}]) == [tagged]
+        assert ids(Filters=[{"Name": "volume-id", "Values": [second_vol]}]) == [other_volume]
+        assert ids(Filters=[{"Name": "description", "Values": [f"spare {tag}"]}]) == [spare]
+        assert ids(Filters=[{"Name": "volume-size", "Values": ["12"]}]) == [other_volume]
+        assert ids(Filters=[{"Name": "snapshot-id", "Values": [spare]}]) == [spare]
+        # Other tests leave completed snapshots behind, so this one asserts on membership.
+        completed = ids(Filters=[{"Name": "status", "Values": ["completed"]}])
+        assert tagged in completed and spare in completed
+        # Two filter names is an AND, two values for one name an OR.
+        assert ids(Filters=[{"Name": "volume-id", "Values": [first_vol]},
+                            {"Name": "volume-size", "Values": ["12"]}]) == []
+        assert ids(Filters=[{"Name": "volume-id", "Values": [first_vol, second_vol]}]) == sorted(
+            [tagged, spare, other_volume])
+        # A filter that matches nothing is an empty list, not "everything".
+        assert ids(Filters=[{"Name": f"tag:{key}", "Values": ["matches-nothing"]}]) == []
+        assert ids(Filters=[{"Name": "volume-size", "Values": ["4096"]}]) == []
+        # The SnapshotIds argument and the filters narrow together rather than either winning.
+        assert ids(SnapshotIds=[tagged, spare],
+                   Filters=[{"Name": f"tag:{key}", "Values": [tag]}]) == [tagged]
+    finally:
+        # Cleanup must not mask a failed assertion above.
+        for snapshot_id in (tagged, spare, other_volume):
+            try:
+                ec2.delete_snapshot(SnapshotId=snapshot_id)
+            except ClientError:
+                pass
+        for volume_id in (first_vol, second_vol):
+            try:
+                ec2.delete_volume(VolumeId=volume_id)
+            except ClientError:
+                pass
+
 def test_ebs_delete_snapshot(ec2):
     vol = ec2.create_volume(AvailabilityZone="us-east-1a", Size=10, VolumeType="gp2")
     snap = ec2.create_snapshot(VolumeId=vol["VolumeId"])

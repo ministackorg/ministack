@@ -3800,9 +3800,30 @@ def _delete_snapshot(p):
     return _xml(200, "DeleteSnapshotResponse", "<return>true</return>")
 
 
+def _snapshot_matches_filters(snap, filters):
+    """Apply the DescribeSnapshots filters, except the tag ones the shared helper handles."""
+    scalars = {
+        "snapshot-id": snap["SnapshotId"],
+        "volume-id": snap["VolumeId"],
+        "volume-size": str(snap["VolumeSize"]),
+        "status": snap["State"],
+        "start-time": snap["StartTime"],
+        "progress": snap["Progress"],
+        "owner-id": snap["OwnerId"],
+        "description": snap["Description"],
+        "storage-tier": snap["StorageTier"],
+        "encrypted": "true" if snap.get("Encrypted") else "false",
+    }
+    for name, value in scalars.items():
+        if filters.get(name) and value not in filters[name]:
+            return False
+    return True
+
+
 def _describe_snapshots(p):
     filter_ids = _parse_member_list(p, "SnapshotId")
     owner_ids = _parse_member_list(p, "Owner")
+    filters = _parse_filters(p)
     if filter_ids:
         for sid in filter_ids:
             if sid not in _snapshots:
@@ -3812,6 +3833,10 @@ def _describe_snapshots(p):
         if filter_ids and snap["SnapshotId"] not in filter_ids:
             continue
         if owner_ids and snap["OwnerId"] not in owner_ids and "self" not in owner_ids:
+            continue
+        if not _resource_matches_tag_filters(snap["SnapshotId"], filters):
+            continue
+        if not _snapshot_matches_filters(snap, filters):
             continue
         items += f"<item>{_snapshot_inner_xml(snap)}</item>"
     return _xml(200, "DescribeSnapshotsResponse", f"<snapshotSet>{items}</snapshotSet>")
