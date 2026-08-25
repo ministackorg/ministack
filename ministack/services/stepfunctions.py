@@ -3777,8 +3777,13 @@ def _eval_intrinsic_arg(arg, data, ctx):
     return None
 
 
-# Real AWS caps both base64 intrinsics at 10,000 characters of input
+# Real AWS caps the base64 intrinsics and States.Hash at 10,000 characters of input
 _BASE64_INTRINSIC_MAX = 10_000
+
+# The five States.Hash publishes, mapped to what hashlib calls them.
+_HASH_INTRINSIC_ALGORITHMS = {
+    "MD5": "md5", "SHA-1": "sha1", "SHA-256": "sha256", "SHA-384": "sha384", "SHA-512": "sha512",
+}
 
 
 def _base64_intrinsic_arg(name, value):
@@ -3833,6 +3838,28 @@ def _exec_intrinsic(node, data, ctx):
                 out.append(ch)
                 i += 1
         return "".join(out)
+    elif name == "States.Hash":
+        import hashlib
+        text, algorithm = args[0], args[1]
+        digest = _HASH_INTRINSIC_ALGORITHMS.get(algorithm)
+        if digest is None or not isinstance(text, str) or len(text) > _BASE64_INTRINSIC_MAX:
+            raise ValueError(f"Invalid arguments in {name}")
+        return hashlib.new(digest, text.encode("utf-8")).hexdigest()
+    elif name == "States.StringSplit":
+        # Every character of the second argument is a delimiter in its own right, and a run of them
+        # yields no empty members, so splitting an ARN on ":" indexes the same either way.
+        text, delimiters = args[0], args[1]
+        parts, current = [], []
+        for ch in text:
+            if ch in delimiters:
+                if current:
+                    parts.append("".join(current))
+                    current = []
+            else:
+                current.append(ch)
+        if current:
+            parts.append("".join(current))
+        return parts
     elif name == "States.ArrayGetItem":
         return args[0][int(args[1])]
     elif name == "States.Array":

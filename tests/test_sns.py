@@ -1594,6 +1594,62 @@ def test_sns_list_platform_applications(sns):
         sns.delete_platform_application(PlatformApplicationArn=app_arn)
 
 
+def test_sns_get_platform_application_attributes(sns):
+    name = f"intg-sns-get-app-attrs-{_uuid_mod.uuid4().hex[:8]}"
+    app_arn = sns.create_platform_application(
+        Name=name, Platform="GCM", Attributes={"PlatformCredential": "cred-xyz"},
+    )["PlatformApplicationArn"]
+    try:
+        attrs = sns.get_platform_application_attributes(
+            PlatformApplicationArn=app_arn,
+        )["Attributes"]
+        # AWS reports the application as enabled right after creation.
+        assert attrs["Enabled"] == "true"
+    finally:
+        sns.delete_platform_application(PlatformApplicationArn=app_arn)
+
+
+def test_sns_get_platform_application_attributes_not_found(sns):
+    missing = (
+        f"arn:aws:sns:us-east-1:000000000000:app/GCM/"
+        f"intg-sns-missing-{_uuid_mod.uuid4().hex[:8]}"
+    )
+    with pytest.raises(ClientError) as exc:
+        sns.get_platform_application_attributes(PlatformApplicationArn=missing)
+    assert exc.value.response["Error"]["Code"] == "NotFound"
+
+
+def test_sns_set_platform_application_attributes(sns):
+    name = f"intg-sns-set-app-attrs-{_uuid_mod.uuid4().hex[:8]}"
+    app_arn = sns.create_platform_application(
+        Name=name, Platform="GCM", Attributes={"PlatformCredential": "cred-xyz"},
+    )["PlatformApplicationArn"]
+    try:
+        sns.set_platform_application_attributes(
+            PlatformApplicationArn=app_arn,
+            Attributes={"Enabled": "false", "EventEndpointCreated": "arn:aws:sns:us-east-1:000000000000:evt"},
+        )
+        attrs = sns.get_platform_application_attributes(
+            PlatformApplicationArn=app_arn,
+        )["Attributes"]
+        assert attrs["Enabled"] == "false"
+        assert attrs["EventEndpointCreated"].endswith(":evt")
+    finally:
+        sns.delete_platform_application(PlatformApplicationArn=app_arn)
+
+
+def test_sns_set_platform_application_attributes_not_found(sns):
+    missing = (
+        f"arn:aws:sns:us-east-1:000000000000:app/GCM/"
+        f"intg-sns-missing-{_uuid_mod.uuid4().hex[:8]}"
+    )
+    with pytest.raises(ClientError) as exc:
+        sns.set_platform_application_attributes(
+            PlatformApplicationArn=missing, Attributes={"Enabled": "false"},
+        )
+    assert exc.value.response["Error"]["Code"] == "NotFound"
+
+
 def test_sns_platform_applications_and_endpoints_are_region_scoped(sns):
     west = _regional_client("sns", "us-west-2")
     name = f"mr-sns-platform-region-{_uuid_mod.uuid4().hex[:8]}"
