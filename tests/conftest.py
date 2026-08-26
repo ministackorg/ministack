@@ -564,6 +564,11 @@ def iot_jobs_data():
 
 
 @pytest.fixture(scope="session")
+def iotwireless():
+    return make_client("iotwireless")
+
+
+@pytest.fixture(scope="session")
 def wafv2():
     return make_client("wafv2")
 

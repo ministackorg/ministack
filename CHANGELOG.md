@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **IoT Wireless — `GetPositionEstimate`** — the service was absent. `POST /position-estimate` now answers the way the API is shaped: the output structure declares a `payload` blob, so the HTTP body is the raw GeoJSON `Point` and boto3 hands the caller a `StreamingBody`, not a JSON envelope. The estimate is synthetic and deterministic (the canonical `Ip.IpAddress` hashes onto lon [-180, 180) / lat [-60, 60)); `properties` carry the two accuracy fields plus `timestamp` echoed from the request's `Timestamp`, which AWS documents as the resolve time. `WiFiAccessPoints`, `CellTowers`, `Gnss` and `AdvancedConfiguration` are accepted and ignored. Refusals carry the live service's wording: no measurement or an unparseable address is `ValidationException`; an address that is not globally routable, or is multicast, is `ResourceNotFoundException` `Cannot find position for the IP address <ip>`. Stateless. Contributed by @iot-rocket.
+
 ## [1.5.9] — 2026-09-08
 
 ### Added
