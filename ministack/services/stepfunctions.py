@@ -316,6 +316,20 @@ def _create_state_machine(data):
 
     arn = f"arn:aws:states:{get_region()}:{get_account_id()}:stateMachine:{name}"
     if arn in _state_machines:
+        # Creating the same machine twice is idempotent on AWS and makes SDK retry safe
+        # It checks the sfn itself: definition, type, logging and whether the call publishes
+        existing = _state_machines[arn]
+        publishes = bool(data.get("publish"))
+        if (data.get("definition", "{}") == existing["definition"]
+                and data.get("type", "STANDARD") == existing["type"]
+                and data.get("loggingConfiguration",
+                             {"level": "OFF", "includeExecutionData": False})
+                == existing["loggingConfiguration"]
+                and publishes == bool(existing.get("createVersionArn"))):
+            response = {"stateMachineArn": arn, "creationDate": existing["creationDate"]}
+            if publishes:
+                response["stateMachineVersionArn"] = existing["createVersionArn"]
+            return json_response(response)
         return error_response_json(
             "StateMachineAlreadyExists",
             f"State machine {name} already exists", 400)
@@ -362,6 +376,7 @@ def _create_state_machine(data):
         _state_machines[arn]["lastVersionNumber"] += 1
         next_number = _state_machines[arn]["lastVersionNumber"]
         version_arn = f"{arn}:{next_number}"
+        _state_machines[arn]["createVersionArn"] = version_arn
         _state_machine_versions[version_arn] = {
             "stateMachineVersionArn": version_arn,
             "stateMachineArn": arn,
