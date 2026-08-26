@@ -178,6 +178,16 @@ def test_codebuild_batch_delete_builds(codebuild):
     assert build_id in resp["buildsDeleted"]
 
 
+def test_codebuild_batch_delete_builds_not_deleted_shape(codebuild):
+    """An id that matches no build comes back as a BuildNotDeleted structure
+    ({id, statusCode}), not a bare string — SDK parsers crash on the string."""
+    resp = codebuild.batch_delete_builds(ids=["test-project:00000000-0000-0000-0000-000000000000"])
+    assert resp["buildsDeleted"] == []
+    entry = resp["buildsNotDeleted"][0]
+    assert entry["id"] == "test-project:00000000-0000-0000-0000-000000000000"
+    assert entry["statusCode"]
+
+
 def test_codebuild_delete_project(codebuild):
     codebuild.delete_project(name="test-project")
     resp = codebuild.list_projects()

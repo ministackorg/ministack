@@ -2267,6 +2267,12 @@ async def _invoke_with_response_stream(name: str, event: dict, headers: dict,
     provide — so we cannot do any better without a custom RIE fork.
     """
     status, resp_headers, resp_body = await _invoke(name, event, headers, path_qualifier, query_params)
+    # An HTTP-level failure (ResourceNotFoundException 404, throttles, ...)
+    # never streams on AWS: the error is a plain JSON response, and wrapping
+    # it in an eventstream envelope crashes SDK parsers. Only a 200 —
+    # including a handler error, which rides InvokeComplete — is framed.
+    if status != 200:
+        return status, resp_headers, resp_body
     # Detect handler-level errors from the standard invoke path so we can flip
     # to the InvokeError event type in the stream.
     is_error = bool(resp_headers and resp_headers.get("X-Amz-Function-Error"))

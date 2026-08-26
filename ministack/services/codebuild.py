@@ -737,7 +737,11 @@ def _batch_delete_builds(data):
             del _builds[bid]
             deleted.append(bid)
         else:
-            not_deleted.append(bid)
+            # BuildNotDeleted is a structure ({id, statusCode}), not a bare id —
+            # SDK parsers crash on a plain string here. The AWS reference only
+            # documents BUILD_IN_PROGRESS as an example statusCode; NOT_FOUND is
+            # our value for an unknown id.
+            not_deleted.append({"id": bid, "statusCode": "NOT_FOUND"})
     return json_response({"buildsDeleted": deleted, "buildsNotDeleted": not_deleted})
 
 
