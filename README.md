@@ -508,6 +508,7 @@ subnet = ec2.create_subnet(
 | `AWS::Cognito::UserPoolResourceServer` | Identifier | — |
 | `AWS::Cognito::IdentityPool` | Pool ID | — |
 | `AWS::Cognito::UserPoolDomain` | Domain | — |
+| `AWS::IoT::CACertificate` | Certificate id | Arn, Id |
 | `AWS::ECR::Repository` | Repo name | Arn, RepositoryUri |
 | `AWS::IAM::ManagedPolicy` | Policy ARN | — |
 | `AWS::KMS::Key` | Key ID | Arn, KeyId |

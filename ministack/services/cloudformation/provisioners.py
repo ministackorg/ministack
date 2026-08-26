@@ -6774,6 +6774,93 @@ def _iot_provisioning_template_delete(physical_id, props):
     _iot._delete_provisioning_template(physical_id)
 
 
+def _iot_ca_certificate_apply(ca_id, props):
+    """Bring an existing CA registration to the template's declared state."""
+    resp = _iot._handle_ca_certificate(
+        "PUT", f"/cacertificate/{ca_id}", b"", {
+            "newStatus": props.get("Status", "INACTIVE"),
+            "newAutoRegistrationStatus":
+                "ENABLE" if props.get("AutoRegistrationStatus") == "ENABLE" else "DISABLE",
+        },
+    )
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::CACertificate update failed: {resp[2]!r}")
+    if props.get("CertificateMode"):
+        if props["CertificateMode"] not in ("DEFAULT", "SNI_ONLY"):
+            raise ValueError(
+                "AWS::IoT::CACertificate CertificateMode must be one of ['DEFAULT', 'SNI_ONLY']"
+            )
+        # Deliberate simplification: real CloudFormation documents CertificateMode
+        # as update-requires-replacement (UpdateCACertificate has no mode member),
+        # so the mode is written on the record directly instead. Omitting it on an
+        # update keeps the old mode, where real CFN would revert to DEFAULT by
+        # replacing the certificate.
+        _iot._ca_certificates[ca_id]["certificateMode"] = props["CertificateMode"]
+    return ca_id, {"Arn": _iot._ca_cert_arn(ca_id), "Id": ca_id}
+
+
+def _iot_ca_certificate_create(logical_id, props, stack_name):
+    pem = props.get("CACertificatePem")
+    if not pem:
+        raise ValueError("AWS::IoT::CACertificate requires CACertificatePem")
+    payload = {
+        "caCertificate": pem,
+        "verificationCertificate": props.get("VerificationCertificatePem"),
+        "certificateMode": props.get("CertificateMode"),
+    }
+    resp = _iot._register_ca_certificate(
+        {k: v for k, v in payload.items() if v is not None},
+        {
+            "setAsActive": "true" if props.get("Status", "INACTIVE") == "ACTIVE" else "false",
+            "allowAutoRegistration": "true" if props.get("AutoRegistrationStatus") == "ENABLE" else "false",
+        },
+    )
+    if resp[0] == 409:
+        # The certificate id is derived from the PEM, so re-registering the
+        # same PEM answers ResourceAlreadyExists. CloudFormation's create must
+        # be idempotent — a rollback replay re-enters create — so adopt the
+        # existing registration and bring it to the declared state instead of
+        # failing the stack. Tradeoff: a CA the user registered out of band
+        # under the same PEM is adopted too (and mutated/deleted with the
+        # stack from here on) — an accepted simplification.
+        return _iot_ca_certificate_apply(json.loads(resp[2])["resourceId"], props)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::CACertificate create failed: {resp[2]!r}")
+    ca_id = json.loads(resp[2])["certificateId"]
+    return ca_id, {"Arn": _iot._ca_cert_arn(ca_id), "Id": ca_id}
+
+
+def _iot_ca_certificate_update(physical_id, old_props, new_props, stack_name):
+    """Apply Status/AutoRegistrationStatus/CertificateMode in place.
+
+    The physical id is derived from the certificate content, so a changed
+    ``CACertificatePem`` cannot be an in-place update — and silently replacing
+    the CA would orphan every device certificate registered under the old one.
+    The update fails loudly instead, the way a custom-named replacement is
+    refused.
+    """
+    if new_props.get("CACertificatePem") != old_props.get("CACertificatePem"):
+        raise ValueError(
+            "AWS::IoT::CACertificate cannot update CACertificatePem in place: "
+            "the certificate id is derived from the PEM. Declare a new "
+            "CACertificate resource for the new PEM and remove this one."
+        )
+    return _iot_ca_certificate_apply(physical_id, new_props)
+
+
+def _iot_ca_certificate_delete(physical_id, props):
+    if physical_id not in _iot._ca_certificates:
+        return
+    # An ACTIVE CA refuses deletion (CertificateStateException) — deactivate
+    # first, and delete through the API path rather than a raw pop so the
+    # registry stays consistent with what DeleteCACertificate enforces.
+    if _iot._ca_certificates[physical_id].get("status") == "ACTIVE":
+        _iot._handle_ca_certificate(
+            "PUT", f"/cacertificate/{physical_id}", b"", {"newStatus": "INACTIVE"}
+        )
+    _iot._handle_ca_certificate("DELETE", f"/cacertificate/{physical_id}", b"", {})
+
+
 def _cognito_identity_pool_role_attachment_create(logical_id, props, stack_name):
     iid = props.get("IdentityPoolId")
     if not iid:
@@ -7097,6 +7184,11 @@ _RESOURCE_HANDLERS = {
         "update": _iot_provisioning_template_update,
         "update_with_logical_id": True,
         "delete": _iot_provisioning_template_delete,
+    },
+    "AWS::IoT::CACertificate": {
+        "create": _iot_ca_certificate_create,
+        "update": _iot_ca_certificate_update,
+        "delete": _iot_ca_certificate_delete,
     },
     "AWS::Cognito::IdentityPoolRoleAttachment": {
         "create": _cognito_identity_pool_role_attachment_create,

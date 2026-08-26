@@ -1564,15 +1564,23 @@ def _handle_registration_code(method: str) -> tuple:
 def _register_ca_certificate(payload: dict, qp: dict) -> tuple:
     """``POST /cacertificate`` (``RegisterCACertificate``).
 
-    Body members per the botocore model: ``caCertificate`` (required) and
+    Body members per the botocore model: ``caCertificate`` (required),
     ``verificationCertificate`` (accepted; the registration-code CN handshake
-    is not enforced locally). ``setAsActive`` / ``allowAutoRegistration`` ride
-    as query-string booleans, as on AWS.
+    is not enforced locally) and ``certificateMode`` (``DEFAULT`` when
+    omitted, as on AWS). ``setAsActive`` / ``allowAutoRegistration`` ride as
+    query-string booleans, as on AWS.
     """
     ca_pem = payload.get("caCertificate")
     if not ca_pem:
         return error_response_json(
             "InvalidRequestException", "caCertificate is required", 400
+        )
+    certificate_mode = payload.get("certificateMode") or "DEFAULT"
+    if certificate_mode not in ("DEFAULT", "SNI_ONLY"):
+        return error_response_json(
+            "InvalidRequestException",
+            "certificateMode must be one of ['DEFAULT', 'SNI_ONLY']",
+            400,
         )
     try:
         ca_id = get_certificate_id(ca_pem)
@@ -1592,6 +1600,7 @@ def _register_ca_certificate(payload: dict, qp: dict) -> tuple:
         "certificatePem": ca_pem,  # verbatim
         "status": "ACTIVE" if set_active else "INACTIVE",
         "autoRegistrationStatus": "ENABLE" if allow_auto else "DISABLE",
+        "certificateMode": certificate_mode,
         "creationDate": _now_epoch(),
         "ownedBy": get_account_id(),
     }
@@ -1638,6 +1647,9 @@ def _handle_ca_certificate(method: str, path: str, body: bytes, qp: dict) -> tup
                 "status": record["status"],
                 "certificatePem": record["certificatePem"],
                 "autoRegistrationStatus": record["autoRegistrationStatus"],
+                # .get: a record restored from a snapshot taken before the
+                # field existed carries no mode; AWS's default stands in.
+                "certificateMode": record.get("certificateMode", "DEFAULT"),
                 "ownedBy": record["ownedBy"],
                 "creationDate": record.get("creationDate"),
             }
@@ -1674,9 +1686,11 @@ def _handle_ca_certificate(method: str, path: str, body: bytes, qp: dict) -> tup
         return json_response({})
     if method == "DELETE":
         if record["status"] == "ACTIVE":
+            # Wording verified against real AWS (live probe 2026-08-26).
             return error_response_json(
                 "CertificateStateException",
-                "CA certificate is ACTIVE; deactivate before deletion",
+                "CA Certificate must be deactivated (not ACTIVE) before "
+                f"deletion. Id: {ca_id}",
                 406,
             )
         del _ca_certificates[ca_id]

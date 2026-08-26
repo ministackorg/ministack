@@ -5189,6 +5189,34 @@ def test_iot_register_ca_certificate_duplicate_conflict(iot_client):
     iot_client.delete_ca_certificate(certificateId=ca_id)
 
 
+def test_iot_register_ca_certificate_mode_round_trip(iot_client):
+    ca_pem, _leaf = _generate_ca_and_leaf()
+
+    # An invalid mode is rejected up front — nothing is registered.
+    with pytest.raises(ClientError) as ei:
+        iot_client.register_ca_certificate(
+            caCertificate=ca_pem, certificateMode="BOGUS"
+        )
+    assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+
+    ca_id = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, certificateMode="SNI_ONLY"
+    )["certificateId"]
+    desc = iot_client.describe_ca_certificate(certificateId=ca_id)[
+        "certificateDescription"
+    ]
+    assert desc["certificateMode"] == "SNI_ONLY"
+    iot_client.delete_ca_certificate(certificateId=ca_id)
+
+    # An omitted mode reports AWS's default.
+    ca_id = iot_client.register_ca_certificate(caCertificate=ca_pem)["certificateId"]
+    desc = iot_client.describe_ca_certificate(certificateId=ca_id)[
+        "certificateDescription"
+    ]
+    assert desc["certificateMode"] == "DEFAULT"
+    iot_client.delete_ca_certificate(certificateId=ca_id)
+
+
 def test_iot_jitr_registered_event_published_when_auto_registration_enabled():
     """Register a CA with auto-registration ENABLE, subscribe on
     ``$aws/events/certificates/registered/#``, register a device cert under
