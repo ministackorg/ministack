@@ -4636,25 +4636,102 @@ def test_s3_versioned_get_returns_stored_checksum(s3):
     s3.delete_bucket(Bucket=bucket)
 
 
-def test_s3_put_object_rejects_unsupported_crc32c_explicitly(s3):
-    """CRC32C requires an optional native library ministack doesn't bundle.
-    Rather than silently accept-without-validation, the put must fail loudly
-    so clients see the gap. Issue #831 follow-up: no silent failures."""
-    import base64
-    import os
+def test_s3_list_buckets_paginates(s3):
+    """ListBuckets honors Prefix, MaxBuckets and ContinuationToken; a further
+    page is signalled by ContinuationToken alone (ListBucketsOutput has no
+    IsTruncated member)."""
+    names = [f"qa-lbp-{c}" for c in "abc"]
+    for n in names:
+        s3.create_bucket(Bucket=n)
+    try:
+        page1 = s3.list_buckets(Prefix="qa-lbp-", MaxBuckets=2)
+        assert [b["Name"] for b in page1["Buckets"]] == names[:2]
+        assert page1["Prefix"] == "qa-lbp-"
+        assert "ContinuationToken" in page1
+        page2 = s3.list_buckets(
+            Prefix="qa-lbp-", MaxBuckets=2,
+            ContinuationToken=page1["ContinuationToken"],
+        )
+        assert [b["Name"] for b in page2["Buckets"]] == names[2:]
+        assert "ContinuationToken" not in page2
+    finally:
+        for n in names:
+            s3.delete_bucket(Bucket=n)
 
+
+def test_s3_delete_object_refuses_directory_bucket_conditions(s3):
+    """x-amz-if-match-size / x-amz-if-match-last-modified-time are directory-
+    bucket features; a general-purpose bucket answers NotImplemented and the
+    object stays."""
+    bucket = "qa-del-cond-bucket"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x")
+    with pytest.raises(ClientError) as exc:
+        s3.delete_object(Bucket=bucket, Key="k", IfMatchSize=1)
+    assert exc.value.response["Error"]["Code"] == "NotImplemented"
+    with pytest.raises(ClientError) as exc:
+        s3.delete_object(
+            Bucket=bucket, Key="k",
+            IfMatchLastModifiedTime=datetime(2026, 1, 1),
+        )
+    assert exc.value.response["Error"]["Code"] == "NotImplemented"
+    assert s3.get_object(Bucket=bucket, Key="k")["Body"].read() == b"x"
+    s3.delete_object(Bucket=bucket, Key="k")
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_delete_objects_refuses_size_and_mtime_conditions(s3):
+    """A DeleteObjects entry carrying Size or LastModifiedTime draws a per-key
+    NotImplemented error while unconditional entries in the batch delete."""
+    bucket = "qa-del-batch-cond-bucket"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="cond", Body=b"x")
+    s3.put_object(Bucket=bucket, Key="plain", Body=b"y")
+    resp = s3.delete_objects(
+        Bucket=bucket,
+        Delete={
+            "Objects": [
+                {"Key": "cond", "Size": 1},
+                {"Key": "plain"},
+            ],
+            "Quiet": False,
+        },
+    )
+    assert [e["Key"] for e in resp.get("Deleted", [])] == ["plain"]
+    errors = resp.get("Errors", [])
+    assert len(errors) == 1
+    assert errors[0]["Key"] == "cond"
+    assert errors[0]["Code"] == "NotImplemented"
+    assert s3.get_object(Bucket=bucket, Key="cond")["Body"].read() == b"x"
+    s3.delete_object(Bucket=bucket, Key="cond")
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_put_object_validates_crc32c(s3):
+    """CRC32C is computed in-process: a wrong client value draws BadDigest,
+    a correct one is stored and surfaced when checksum mode is enabled."""
     from botocore.exceptions import ClientError
 
-    bucket = "checksum-crc32c-reject-bucket"
+    bucket = "checksum-crc32c-validate-bucket"
     s3.create_bucket(Bucket=bucket)
-    fake_crc32c = base64.b64encode(os.urandom(4)).decode()
     with pytest.raises(ClientError) as exc:
         s3.put_object(
             Bucket=bucket, Key="k", Body=b"x",
             ChecksumAlgorithm="CRC32C",
-            ChecksumCRC32C=fake_crc32c,
+            ChecksumCRC32C="AAAAAA==",
         )
-    assert exc.value.response["Error"]["Code"] == "InvalidRequest"
+    assert exc.value.response["Error"]["Code"] == "BadDigest"
+
+    good = "qTxfkw=="  # CRC32C(b"x"), big-endian, base64
+    s3.put_object(
+        Bucket=bucket, Key="k", Body=b"x",
+        ChecksumAlgorithm="CRC32C",
+        ChecksumCRC32C=good,
+    )
+    got = s3.get_object(Bucket=bucket, Key="k", ChecksumMode="ENABLED")
+    assert got["ChecksumCRC32C"] == good
+    assert got["Body"].read() == b"x"
+    s3.delete_object(Bucket=bucket, Key="k")
     s3.delete_bucket(Bucket=bucket)
 
 

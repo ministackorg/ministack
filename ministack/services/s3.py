@@ -1238,10 +1238,9 @@ def _crc32c(body: bytes) -> int:
 def _compute_s3_checksum(algorithm: str, body: bytes) -> str | None:
     """Return base64-encoded checksum for the given AWS S3 algorithm name.
 
-    SHA256 / SHA1 / CRC32 come from the stdlib and CRC64NVME from the table
-    above. CRC32C is the one left: it needs the optional native `google-crc32c`
-    that isn't bundled, so we return None for it and the caller refuses the
-    request rather than storing a value it could never verify.
+    SHA256 / SHA1 / CRC32 come from the stdlib; CRC64NVME and CRC32C from the
+    tables above. An algorithm outside those five returns None and the caller
+    refuses the request rather than storing a value it could never verify.
     """
     algo = (algorithm or "").upper().replace("_", "")
     if algo == "SHA256":
@@ -1270,12 +1269,9 @@ def _resolve_object_checksums(body: bytes, headers: dict):
       - `x-amz-sdk-checksum-algorithm: ALG` asks the server to compute that
         algorithm; the resulting value is returned alongside the response.
 
-    Ministack-specific: CRC32C requires an optional native library that the
-    "no new dependencies" rule forbids us from adding. Rather than silently
-    accept an unverifiable checksum (which would round-trip on Get without ever
-    being validated against the body — a worse failure mode than refusing the
-    request), we reject the put with a clear error. SHA256 / SHA1 / CRC32 /
-    CRC64NVME work end-to-end.
+    An algorithm we cannot compute is refused up front: silently accepting an
+    unverifiable checksum would round-trip on Get without ever being validated
+    against the body — a worse failure mode than refusing the request.
 
     Returns ``(checksums_dict, error_response_or_None)``.
     """
@@ -1298,11 +1294,9 @@ def _resolve_object_checksums(body: bytes, headers: dict):
         return {}, _error(
             "InvalidRequest",
             (
-                f"Checksum algorithm not supported in this ministack build: "
+                f"Checksum algorithm not supported: "
                 f"{', '.join(sorted(unverifiable))}. Supported: SHA256, SHA1, "
-                f"CRC32, CRC64NVME. CRC32C requires an optional native "
-                f"dependency that ministack does not bundle; use CRC64NVME "
-                f"instead, or omit the checksum header."
+                f"CRC32, CRC32C, CRC64NVME."
             ),
             400,
         )
@@ -1920,8 +1914,9 @@ def _list_buckets(query_params=None):
         SubElement(b, "BucketArn").text = f"arn:aws:s3:::{name}"
     if prefix:
         SubElement(root, "Prefix").text = prefix
+    # ListBucketsOutput has no IsTruncated member (botocore s3 model): a
+    # further page is signalled by ContinuationToken alone.
     if is_truncated:
-        SubElement(root, "IsTruncated").text = "true"
         SubElement(root, "ContinuationToken").text = page[-1] if page else ""
     return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
@@ -4182,6 +4177,9 @@ def _delete_marker_read_refused(version: dict) -> tuple:
     headers = dict(headers)
     headers["x-amz-delete-marker"] = "true"
     headers["x-amz-version-id"] = version["version_id"]
+    # AWS also stamps the marker's creation time on the 405.
+    if version.get("last_modified"):
+        headers["Last-Modified"] = iso_to_rfc7231(version["last_modified"])
     headers["Allow"] = "DELETE"
     return status, headers, body
 
