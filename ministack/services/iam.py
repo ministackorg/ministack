@@ -904,6 +904,21 @@ def attach_managed_policy(entity: dict, policy_arn: str) -> None:
             pol["AttachmentCount"] = pol.get("AttachmentCount", 0) + 1
 
 
+def detach_managed_policy(entity: dict, policy_arn: str) -> None:
+    """Inverse of attach_managed_policy, with the same bookkeeping contract:
+    the bare-ARN list and AttachmentCount stay in step, exactly as
+    DetachRolePolicy keeps them. Idempotent when the policy isn't attached."""
+    if policy_arn not in entity.get("AttachedPolicies", []):
+        return
+    entity["AttachedPolicies"].remove(policy_arn)
+    if _is_aws_managed_arn(policy_arn):
+        _bump_aws_managed_attachment(policy_arn, -1)
+    else:
+        pol = _policies.get(policy_arn)
+        if pol:
+            pol["AttachmentCount"] = max(pol.get("AttachmentCount", 1) - 1, 0)
+
+
 def _attach_role_policy(p):
     role_name = _p(p, "RoleName")
     policy_arn = _p(p, "PolicyArn")
