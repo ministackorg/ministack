@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **AWS Signer — synchronous `StartSigningJob` with the S3 side effect** — the `signer` API did not exist. `StartSigningJob`, `DescribeSigningJob`, `ListSigningJobs`, `PutSigningProfile` and `GetSigningProfile` are served natively (REST-JSON). Signing is synchronous and synthetic: Start validates the source object against the local S3 store, writes a JSON marker (source reference + SHA-256 of the source bytes) to `destination.prefix + jobId` (`.zip` appended for a `.zip` source on the Lambda platform, as measured) and returns the job already `Succeeded`; a missing source, destination bucket or profile is `ResourceNotFoundException` at Start with no job recorded. `clientRequestToken` replays the first response. Jobs carry the profile's signing material and a `signatureExpiresAt`; list filters and the documented input constraints are enforced. State persists with `PERSIST_STATE=1`. Contributed by @iot-rocket.
+
 ## [1.5.9] — 2026-09-08
 
 ### Added
