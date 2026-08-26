@@ -14,6 +14,13 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``ListCACertificates``, ``DeleteCACertificate``; registering a device
     certificate under a CA with auto-registration enabled publishes the AWS
     JITR event to ``$aws/events/certificates/registered/{caCertificateId}``
+  - Provisioning templates: ``CreateProvisioningTemplate``,
+    ``DescribeProvisioningTemplate``, ``ListProvisioningTemplates``,
+    ``UpdateProvisioningTemplate``, ``DeleteProvisioningTemplate`` —
+    storage + CRUD only: the fleet-provisioning MQTT workflow
+    (``$aws/provisioning-templates/...``) is not implemented, and
+    ``provisioningRoleArn`` is presence-checked but not resolved
+    (MiniStack does not validate IAM role ARNs elsewhere either)
   - Policies: ``CreatePolicy``, ``CreatePolicyVersion``, ``AttachPolicy``,
     ``DetachPolicy``, etc., plus the deprecated principal-policy family
     (``AttachPrincipalPolicy`` / ``DetachPrincipalPolicy`` /
@@ -105,6 +112,8 @@ _indexing_config: AccountRegionScopedDict = AccountRegionScopedDict()
 _ca_certificates: AccountRegionScopedDict = AccountRegionScopedDict()
 # JITR registration code — a single "code" key per account/region
 _registration_codes: AccountRegionScopedDict = AccountRegionScopedDict()
+# Provisioning templates (CreateProvisioningTemplate & friends): templateName -> record
+_provisioning_templates: AccountRegionScopedDict = AccountRegionScopedDict()
 _jobs: AccountRegionScopedDict = AccountRegionScopedDict()  # jobId -> Job dict
 # (thingName, jobId) -> JobExecution dict — tuple keys, same pattern as _shadows
 _job_executions: AccountRegionScopedDict = AccountRegionScopedDict()
@@ -228,6 +237,7 @@ def get_state() -> dict:
         "indexing_config": copy.deepcopy(_indexing_config),
         "ca_certificates": copy.deepcopy(_ca_certificates),
         "registration_codes": copy.deepcopy(_registration_codes),
+        "provisioning_templates": copy.deepcopy(_provisioning_templates),
         "jobs": copy.deepcopy(_jobs),
         "job_executions": copy.deepcopy(_job_executions),
         "ca": {"ca_cert_pem": _ca_cert_pem, "ca_key_pem": _ca_key_pem}
@@ -258,6 +268,7 @@ def restore_state(data: dict | None) -> None:
     _indexing_config.update(data.get("indexing_config", {}))
     _ca_certificates.update(data.get("ca_certificates", {}))
     _registration_codes.update(data.get("registration_codes", {}))
+    _provisioning_templates.update(data.get("provisioning_templates", {}))
     _jobs.update(data.get("jobs", {}))
     _job_executions.update(data.get("job_executions", {}))
     ca_data = data.get("ca")
@@ -297,6 +308,7 @@ def reset() -> None:
     _indexing_config.clear()
     _ca_certificates.clear()
     _registration_codes.clear()
+    _provisioning_templates.clear()
     _jobs.clear()
     _job_executions.clear()
     with _CA_LOCK:
@@ -380,6 +392,10 @@ def _policy_arn(name: str) -> str:
 
 def _topic_rule_arn(name: str) -> str:
     return f"arn:aws:iot:{get_region()}:{get_account_id()}:rule/{name}"
+
+
+def _provisioning_template_arn(name: str) -> str:
+    return f"arn:aws:iot:{get_region()}:{get_account_id()}:provisioningtemplate/{name}"
 
 
 # Rule names are stricter than other IoT resources: [a-zA-Z0-9_] only.
@@ -494,6 +510,14 @@ async def handle_request(
         return _list_things_in_thing_group(path)
     if path.startswith("/thing-groups/"):
         return _handle_thing_group(method, path, body, qp)
+
+    # Provisioning templates
+    if path == "/provisioning-templates" and method == "POST":
+        return _create_provisioning_template(_parse_body(body))
+    if path == "/provisioning-templates" and method == "GET":
+        return _list_provisioning_templates(qp)
+    if path.startswith("/provisioning-templates/"):
+        return _handle_provisioning_template(method, path, body)
 
     # Certificates
     if path == "/keys-and-certificate" and method == "POST":
@@ -1072,6 +1096,198 @@ def _remove_thing_from_group(payload: dict) -> tuple:
     if gname in thing.get("thingGroupNames", []):
         thing["thingGroupNames"].remove(gname)
         _things[tname] = thing
+    return json_response({})
+
+
+# ---------------------------------------------------------------------------
+# Provisioning templates
+#
+# Storage + CRUD only: the fleet-provisioning MQTT workflow
+# ($aws/provisioning-templates/{name}/provision/*) is not implemented, and
+# provisioningRoleArn is presence-checked but never resolved — MiniStack does
+# not validate IAM role ARNs elsewhere either. Template versions are not
+# modeled: a template always carries defaultVersionId 1. Wire shapes and
+# error messages mirror a live probe of the real service (2026-08-26).
+# ---------------------------------------------------------------------------
+
+# Template names are shorter and stricter than most IoT names: no colons,
+# 36 chars max.
+_PROVISIONING_TEMPLATE_NAME_RE = re.compile(r"^[0-9A-Za-z_-]{1,36}$")
+
+
+def _validate_provisioning_template_name(name: str | None) -> tuple | None:
+    if not name or not _PROVISIONING_TEMPLATE_NAME_RE.match(name):
+        return error_response_json(
+            "InvalidRequestException",
+            "Invalid templateName: must match [0-9A-Za-z_-]{1,36}",
+            400,
+        )
+    return None
+
+
+def _validate_provisioning_template_body(body) -> tuple | None:
+    """The live service refuses a body without an AWS::IoT::Certificate
+    resource; its message is quoted verbatim below."""
+    doc = body
+    if not isinstance(doc, dict):
+        try:
+            doc = json.loads(body)
+        except (TypeError, ValueError):
+            doc = None
+    if not isinstance(doc, dict):
+        return error_response_json(
+            "InvalidRequestException",
+            "The template body is invalid: Template body is not valid JSON.",
+            400,
+        )
+    resources = doc.get("Resources")
+    values = resources.values() if isinstance(resources, dict) else ()
+    if not any(
+        isinstance(r, dict) and r.get("Type") == "AWS::IoT::Certificate"
+        for r in values
+    ):
+        return error_response_json(
+            "InvalidRequestException",
+            "The template body is invalid: Template must have certificate resource.",
+            400,
+        )
+    return None
+
+
+def _provisioning_template_not_found(name: str) -> tuple:
+    return error_response_json(
+        "ResourceNotFoundException", f"Unable to find template named {name}", 404
+    )
+
+
+def _handle_provisioning_template(method: str, path: str, body: bytes) -> tuple:
+    suffix = path[len("/provisioning-templates/"):]
+    if "/" in suffix:
+        return error_response_json(
+            "InvalidRequestException", f"Unsupported IoT path: {method} {path}", 400
+        )
+    name = suffix
+    err = _validate_provisioning_template_name(name)
+    if err:
+        return err
+    if method == "GET":
+        return _describe_provisioning_template(name)
+    if method == "PATCH":
+        return _update_provisioning_template(name, _parse_body(body))
+    if method == "DELETE":
+        return _delete_provisioning_template(name)
+    return error_response_json(
+        "InvalidRequestException", f"Unsupported method: {method}", 400
+    )
+
+
+def _create_provisioning_template(payload: dict) -> tuple:
+    name = payload.get("templateName")
+    err = _validate_provisioning_template_name(name)
+    if err:
+        return err
+    for field in ("templateBody", "provisioningRoleArn"):
+        if not payload.get(field):
+            return error_response_json(
+                "InvalidRequestException", f"{field} is required", 400
+            )
+    err = _validate_provisioning_template_body(payload["templateBody"])
+    if err:
+        return err
+    if name in _provisioning_templates:
+        return error_response_json(
+            "ResourceAlreadyExistsException",
+            f"Template with name {name} already exists",
+            409,
+        )
+    now = _now_epoch()
+    record = {
+        "templateName": name,
+        "templateArn": _provisioning_template_arn(name),
+        "templateBody": payload["templateBody"],
+        "enabled": bool(payload.get("enabled", False)),
+        "provisioningRoleArn": payload["provisioningRoleArn"],
+        "type": payload.get("type", "FLEET_PROVISIONING"),
+        "defaultVersionId": 1,
+        "creationDate": now,
+        "lastModifiedDate": now,
+    }
+    # The live service omits description from Describe when it was never set —
+    # absent, not empty — so an unset one is not stored at all.
+    if payload.get("description"):
+        record["description"] = payload["description"]
+    if payload.get("preProvisioningHook"):
+        record["preProvisioningHook"] = payload["preProvisioningHook"]
+    _provisioning_templates[name] = record
+    logger.info("IoT provisioning template created: %s", name)
+    return json_response({
+        "templateArn": record["templateArn"],
+        "templateName": name,
+        "defaultVersionId": 1,
+    })
+
+
+def _describe_provisioning_template(name: str) -> tuple:
+    t = _provisioning_templates.get(name)
+    if t is None:
+        return _provisioning_template_not_found(name)
+    return json_response(t)
+
+
+def _list_provisioning_templates(qp: dict) -> tuple:
+    """``GET /provisioning-templates`` — no pagination (house convention).
+
+    Summaries carry exactly what the live service's do — in particular no
+    ``description``, even for a template that has one.
+    """
+    summary_keys = (
+        "templateArn", "templateName",
+        "creationDate", "lastModifiedDate", "enabled", "type",
+    )
+    return json_response({
+        "templates": [
+            {k: t[k] for k in summary_keys}
+            for t in _provisioning_templates.values()
+        ]
+    })
+
+
+def _update_provisioning_template(name: str, payload: dict) -> tuple:
+    t = _provisioning_templates.get(name)
+    if t is None:
+        return _provisioning_template_not_found(name)
+    version = payload.get("defaultVersionId")
+    if version is not None and version != t["defaultVersionId"]:
+        return error_response_json(
+            "InvalidRequestException",
+            f"ProvisioningTemplate {name!r} has no version {version}",
+            400,
+        )
+    if "description" in payload:
+        # Same absent-not-empty rule as create: clearing removes the key.
+        if payload["description"]:
+            t["description"] = payload["description"]
+        else:
+            t.pop("description", None)
+    for field in ("enabled", "provisioningRoleArn"):
+        if field in payload:
+            t[field] = payload[field]
+    if payload.get("removePreProvisioningHook"):
+        t.pop("preProvisioningHook", None)
+    elif payload.get("preProvisioningHook"):
+        t["preProvisioningHook"] = payload["preProvisioningHook"]
+    t["lastModifiedDate"] = _now_epoch()
+    _provisioning_templates[name] = t
+    # The live service answers 200 with an empty body — not an empty JSON
+    # object — and does not bump defaultVersionId.
+    return 200, {"Content-Type": "application/x-amz-json-1.0"}, b""
+
+
+def _delete_provisioning_template(name: str) -> tuple:
+    if _provisioning_templates.get(name) is None:
+        return _provisioning_template_not_found(name)
+    del _provisioning_templates[name]
+    logger.info("IoT provisioning template deleted: %s", name)
     return json_response({})
 
 
