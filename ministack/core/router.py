@@ -399,6 +399,18 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"^mediaconnect\."],
         "credential_scope": "mediaconnect",
     },
+    # Amazon Location: the client is named `location` but the endpoint prefix
+    # and credential scope are `geo` (botocore signingName), and the modeled
+    # per-operation host prefixes put `cp.tracking.` / `tracking.` in front of
+    # it — so the host reads `cp.tracking.geo.{region}.{host}`. The pattern is
+    # deliberately unanchored to match through those prefixes; no other
+    # service's host contains `geo.`, so ordering is not sensitive. Under an
+    # endpoint override the host carries no `geo.` at all and routing relies
+    # on the `"geo"` entry in the credential-scope map below.
+    "location": {
+        "host_patterns": [r"geo\."],
+        "credential_scope": "geo",
+    },
     "tagging": {
         "target_prefixes": ["ResourceGroupsTaggingAPI_20170126"],
         "host_patterns": [r"tagging\."],
@@ -614,6 +626,11 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "appconfigdata": "appconfigdata",
                 "scheduler": "scheduler",
                 "eks": "eks",
+                # Amazon Location signs with scope `geo`, not `location`
+                # (botocore signingName). With an endpoint override the host
+                # has no `geo.` in it, so this entry is the primary routing
+                # signal for the location service.
+                "geo": "location",
                 "mediaconnect": "mediaconnect",
                 "tagging": "tagging",
                 "resource-groups": "resource-groups",

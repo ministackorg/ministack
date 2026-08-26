@@ -728,6 +728,15 @@ def s3tables():
     return make_client("s3tables")
 
 
+@pytest.fixture(scope="session")
+def location():
+    # The location model puts `cp.tracking.` / `tracking.` host prefixes in
+    # front of the endpoint; against localhost those subdomains need not
+    # resolve, so disable injection (same as the logs fixture) — routing then
+    # rides on the `geo` credential scope.
+    return make_client("location", additional_config_kwargs={"inject_host_prefix": False})
+
+
 class FakeDockerContainer:
     """Container double for tests that observe lifecycle without a daemon."""
 

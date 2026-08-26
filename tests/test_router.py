@@ -144,3 +144,28 @@ def test_iot_jobs_data_host_routes_before_iot(host):
     assert detect_service(
         "GET", "/things/t1/jobs/$next", {"host": host}, {}
     ) == "iot-jobs-data"
+
+
+def test_location_credential_scope_routes():
+    """Amazon Location signs with credential scope `geo`, not `location`
+    (botocore signingName). Under an endpoint override the host carries no
+    `geo.` — the scope map is the only routing signal left."""
+    assert detect_service(
+        "POST", "/tracking/v0/trackers", _sigv4_headers("geo"), {}
+    ) == "location"
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        # The modeled per-operation host prefixes in front of geo.{region}:
+        # `cp.tracking.` on the tracker control plane...
+        "cp.tracking.geo.us-east-1.localhost:4566",
+        # ...and `tracking.` on the device-position data plane.
+        "tracking.geo.us-east-1.localhost:4566",
+    ],
+)
+def test_location_host_routes(host):
+    assert detect_service(
+        "POST", "/tracking/v0/trackers", {"host": host}, {}
+    ) == "location"

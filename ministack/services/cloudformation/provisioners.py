@@ -6041,6 +6041,99 @@ def _cognito_identity_pool_role_attachment_delete(physical_id, props):
         pool["_roles"] = {}
 
 
+# --- Amazon Location (AWS::Location::Tracker) ---
+
+# Properties CloudFormation applies without replacement (via UpdateTracker),
+# with the value a property reverts to when removed from the template;
+# everything else on the resource (KmsKeyId, PricingPlan, Tags via the
+# resource's tagging) is either create-only or out of the emulator's scope.
+_LOCATION_TRACKER_UPDATABLE = {
+    "Description": "",
+    "PositionFiltering": "TimeBased",
+    "EventBridgeEnabled": False,
+}
+
+
+def _location_tracker_apply_update(name, props):
+    import ministack.services.location as _location
+    resp = _location._update_tracker(name, {
+        prop: props.get(prop, default)
+        for prop, default in _LOCATION_TRACKER_UPDATABLE.items()
+    })
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Location::Tracker update failed: {resp[2]!r}")
+
+
+def _location_tracker_body(name, props):
+    """Translate CloudFormation properties to a CreateTracker request body.
+    Both sides are PascalCase; only Tags needs reshaping (CloudFormation's
+    Key/Value list vs the API's map)."""
+    body = {"TrackerName": name}
+    for prop in ("Description", "PricingPlan", "PositionFiltering",
+                 "EventBridgeEnabled", "KmsKeyId"):
+        if prop in props:
+            body[prop] = props[prop]
+    tags = props.get("Tags")
+    if isinstance(tags, list):
+        body["Tags"] = {t["Key"]: t["Value"] for t in tags
+                        if isinstance(t, dict) and "Key" in t}
+    elif isinstance(tags, dict):
+        body["Tags"] = tags
+    return body
+
+
+def _location_tracker_attrs(rec):
+    import ministack.services.location as _location
+    return {
+        "Arn": rec["TrackerArn"],
+        "TrackerArn": rec["TrackerArn"],
+        "CreateTime": _location._iso(rec["CreateTime"]),
+        "UpdateTime": _location._iso(rec["UpdateTime"]),
+    }
+
+
+def _location_tracker_create(logical_id, props, stack_name):
+    import ministack.services.location as _location
+    name = props.get("TrackerName") or _physical_name(stack_name, logical_id, max_len=100)
+    resp = _location._create_tracker(_location_tracker_body(name, props))
+    if resp[0] == 409:
+        # Update-fallthrough re-create: adopt the existing tracker in place
+        # (its device positions survive) and apply the in-place-updatable
+        # properties, instead of failing the stack on ConflictException.
+        _location_tracker_apply_update(name, props)
+    elif resp[0] >= 400:
+        raise ValueError(f"AWS::Location::Tracker create failed: {resp[2]!r}")
+    return name, _location_tracker_attrs(_location._trackers[name])
+
+
+def _location_tracker_update(physical_id, old_props, new_props, stack_name,
+                             logical_id=None):
+    import ministack.services.location as _location
+    name = new_props.get("TrackerName") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=100
+    )
+    if name != physical_id:
+        # TrackerName is create-only, so a rename is a replacement — which
+        # would silently discard every device position the old tracker holds.
+        # Refuse it, the way the custom-named replacement guard protects a
+        # DynamoDB table's data.
+        raise ValueError(
+            "AWS::Location::Tracker TrackerName change requires replacement "
+            f"({physical_id!r} -> {name!r}), which would discard the "
+            "tracker's device positions; MiniStack refuses it."
+        )
+    rec = _location._trackers.get(name)
+    if rec is None:
+        return _location_tracker_create(logical_id or physical_id, new_props, stack_name)
+    _location_tracker_apply_update(name, new_props)
+    return name, _location_tracker_attrs(rec)
+
+
+def _location_tracker_delete(physical_id, props):
+    import ministack.services.location as _location
+    _location._trackers.pop(physical_id, None)
+
+
 _RESOURCE_HANDLERS = {
     "AWS::OpenSearchService::Domain": {
         "create": _opensearch_domain_create,
@@ -6287,6 +6380,13 @@ _RESOURCE_HANDLERS = {
     # EventBridge Scheduler
     "AWS::Scheduler::Schedule": {"create": _scheduler_schedule_create, "delete": _scheduler_schedule_delete},
     "AWS::Scheduler::ScheduleGroup": {"create": _scheduler_group_create, "delete": _scheduler_group_delete},
+    # Amazon Location
+    "AWS::Location::Tracker": {
+        "create": _location_tracker_create,
+        "update": _location_tracker_update,
+        "update_with_logical_id": True,
+        "delete": _location_tracker_delete,
+    },
     # EKS
     "AWS::EKS::Cluster": {"create": _eks_cluster_create, "delete": _eks_cluster_delete},
     "AWS::EKS::Nodegroup": {"create": _eks_nodegroup_create, "delete": _eks_nodegroup_delete},

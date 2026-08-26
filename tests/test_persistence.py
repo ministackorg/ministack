@@ -645,6 +645,31 @@ def test_backup_round_trip():
     _round_trip("backup", "backup", populate, observe)
 
 
+def test_location_round_trip():
+    def populate(mod):
+        mod._trackers["trk-test"] = {
+            "TrackerName": "trk-test",
+            "TrackerArn": "arn:aws:geo:us-east-1:000000000000:tracker/trk-test",
+            "CreateTime": 1000.0,
+            "UpdateTime": 1000.0,
+            "positions": {
+                "dev-1": {
+                    "latest": {"DeviceId": "dev-1", "SampleTime": 1000.0,
+                               "ReceivedTime": 1000.5, "Position": [11.0, 48.0]},
+                    "history": [{"DeviceId": "dev-1", "SampleTime": 1000.0,
+                                 "ReceivedTime": 1000.5, "Position": [11.0, 48.0]}],
+                },
+            },
+        }
+
+    def observe(mod):
+        rec = mod._trackers["trk-test"]
+        assert rec["TrackerArn"].endswith(":tracker/trk-test")
+        assert rec["positions"]["dev-1"]["latest"]["Position"] == [11.0, 48.0]
+
+    _round_trip("location", "location", populate, observe)
+
+
 def test_cloudformation_round_trip():
     """CloudFormation stack metadata (stacks, events, exports, change sets)
     survives a PERSIST_STATE stop/restore cycle — otherwise ListStacks /

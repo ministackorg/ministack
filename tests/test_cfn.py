@@ -4394,6 +4394,58 @@ def test_cfn_scheduler_schedule(cfn):
     assert stack["StackStatus"] == "DELETE_COMPLETE"
 
 
+def test_cfn_location_tracker(cfn, location):
+    """AWS::Location::Tracker provisions through the location service (so it is
+    readable back through the real API), updates Description in place, and
+    deletes cleanly."""
+    def template(description):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "Tracker": {
+                    "Type": "AWS::Location::Tracker",
+                    "Properties": {
+                        "TrackerName": "cfn-loc-tracker",
+                        "Description": description,
+                    },
+                },
+            },
+            "Outputs": {
+                "Name": {"Value": {"Ref": "Tracker"}},
+                "Arn": {"Value": {"Fn::GetAtt": ["Tracker", "Arn"]}},
+                "TrackerArn": {"Value": {"Fn::GetAtt": ["Tracker", "TrackerArn"]}},
+                "UpdateTime": {"Value": {"Fn::GetAtt": ["Tracker", "UpdateTime"]}},
+            },
+        })
+
+    cfn.create_stack(StackName="cfn-loc-test", TemplateBody=template("v1"))
+    stack = _wait_stack(cfn, "cfn-loc-test")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+    assert outputs["Name"] == "cfn-loc-tracker"
+    assert outputs["Arn"].endswith(":tracker/cfn-loc-tracker")
+    # The resource exposes both Arn and TrackerArn, carrying the same value.
+    assert outputs["TrackerArn"] == outputs["Arn"]
+    assert outputs["UpdateTime"].endswith("Z")
+
+    described = location.describe_tracker(TrackerName="cfn-loc-tracker")
+    assert described["Description"] == "v1"
+    assert described["TrackerArn"] == outputs["Arn"]
+
+    cfn.update_stack(StackName="cfn-loc-test", TemplateBody=template("v2"))
+    stack = _wait_stack(cfn, "cfn-loc-test")
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+    resources = cfn.list_stack_resources(StackName="cfn-loc-test")["StackResourceSummaries"]
+    assert resources[0]["PhysicalResourceId"] == "cfn-loc-tracker"
+    assert location.describe_tracker(TrackerName="cfn-loc-tracker")["Description"] == "v2"
+
+    cfn.delete_stack(StackName="cfn-loc-test")
+    stack = _wait_stack(cfn, "cfn-loc-test")
+    assert stack["StackStatus"] in ("DELETE_COMPLETE", "DOES_NOT_EXIST")
+    with pytest.raises(ClientError):
+        location.describe_tracker(TrackerName="cfn-loc-tracker")
+
+
 def test_cfn_eventbus_basic(cfn, eb):
     """Test basic EventBus create and delete."""
     template = {

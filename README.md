@@ -443,6 +443,7 @@ subnet = ec2.create_subnet(
 | **Cost & Usage Reports** | DeleteReportDefinition, DescribeReportDefinitions, ListTagsForResource, ModifyReportDefinition, PutReportDefinition, TagResource, UntagResource | 7 of 7 spec ops |
 | **Inspector2** | Enable, Disable, ListFindings, BatchGetFindingDetails, ListCoverage, ListCoverageStatistics, ListFindingAggregations, SearchVulnerabilities, TagResource, UntagResource, ListTagsForResource, CreateFilter, ListFilters, DeleteFilter | 14 operations; deterministic stub vulnerability findings for ECR images, Lambda functions, and EC2 instances; filtering, sorting, pagination |
 | **AmazonMQ** | CreateBroker, ListBrokers, DescribeBrokers, DeleteBrokers, UpdateBroker, RebootBroker, DescribeBrokerEngineTypes, DescribeBrokerInstanceOptions, CreateTags, ListTags, DeleteTags, CreateUser, DeleteUser, ListUsers, UpdateUser, DescribeUser | 16 of 24 spec ops; No real container support |
+| **Amazon Location (trackers)** | CreateTracker, DescribeTracker, UpdateTracker, ListTrackers, DeleteTracker, BatchUpdateDevicePosition, GetDevicePosition, BatchGetDevicePosition, GetDevicePositionHistory | Tracker control plane + device-position store; signs with credential scope `geo` (the client is named `location`); `SampleTime`/`ReceivedTime` are iso8601 timestamp shapes and `Position` is the modeled `[lon, lat]` double pair (out-of-range lat/lon become per-entry `Errors` items); `GetDevicePositionHistory` returns ascending, defaults to the last 24 h when `StartTimeInclusive`/`EndTimeExclusive` are omitted; `PricingPlan`/`KmsKeyId`/`PositionFiltering`/`EventBridgeEnabled`/`Tags` are stored and echoed but drive no behavior (no KMS, no EventBridge events; real `TimeBased` filtering stores at most one position per 30 s per device and retains 30 days — MiniStack stores every sample and bounds per-device history at the newest 100); no consumers, geofences, maps, places, or routes; CFN `AWS::Location::Tracker` supported |
 
 
 
@@ -550,6 +551,7 @@ subnet = ec2.create_subnet(
 | `AWS::AutoScaling::ScheduledAction` | Action ARN | Arn, ScheduledActionName |
 | `AWS::Scheduler::Schedule` | Schedule name | Arn |
 | `AWS::Scheduler::ScheduleGroup` | Group name | Arn |
+| `AWS::Location::Tracker` | Tracker name | Arn, TrackerArn, CreateTime, UpdateTime |
 | `AWS::CloudFormation::WaitCondition` | Condition ID | — |
 | `AWS::CloudFormation::WaitConditionHandle` | Handle URL | — |
 | `AWS::CloudFormation::Stack` (nested) | Child stack ARN | `Outputs.<Name>` — each child stack Output |
