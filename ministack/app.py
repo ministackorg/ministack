@@ -984,9 +984,14 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
     """Handle fast-path routes that do not require request body parsing."""
     # OPTIONS on an execute-api host / path MUST flow through apigateway.handle_execute
     # so the API's own corsConfiguration is applied (#406). A Function URL owns its
-    # CORS config the same way. Skip the generic wildcard preflight in both cases.
+    # CORS config the same way, as does a registered custom domain. Skip the generic
+    # wildcard preflight in all three cases.
     host = headers.get("host", "")
-    owns_cors = _parse_execute_api_url(host, path) is not None or _parse_lambda_url(host, path) is not None
+    owns_cors = (
+        _parse_execute_api_url(host, path) is not None
+        or _parse_lambda_url(host, path) is not None
+        or _resolve_custom_domain_request(host, path) is not None
+    )
     for response in (
         None if owns_cors else _handle_options_request(method, request_id),
         _handle_health_request(path, request_id),
@@ -1391,11 +1396,43 @@ def _resolve_stage_and_path(api_id: str, tentative_stage: str, execute_path: str
     return tentative_stage, execute_path
 
 
+def _resolve_custom_domain_request(host: str, path: str):
+    """Resolve a request addressed by a registered API Gateway custom domain.
+
+    Returns ``(api_id, stage, execute_path)`` or ``None``. Runs before any
+    host-pattern service guessing, so a registered domain wins even when its
+    name happens to contain a service token (a domain with ``iot.`` in it
+    would otherwise land in the IoT service). Unregistered dotted hosts cost
+    a linear scan over the registered domain names (a local stack holds a
+    handful at most) and fall through unchanged."""
+    hostname = host.split(":")[0].lower()
+    if not hostname or "." not in hostname:
+        # localhost / in-network single-label hosts can never be custom domains
+        return None
+    apigw_v1 = _get_module("apigateway_v1")
+    return apigw_v1.resolve_base_path_mapping(hostname, path)
+
+
 async def _handle_execute_api_request(
     host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict
 ):
-    """Handle API Gateway execute-api data plane requests (Host-based + path-based)."""
+    """Handle API Gateway execute-api data plane requests (Host-based,
+    path-based, and registered custom domains)."""
     parsed = _parse_execute_api_url(host, path)
+    stage_from_mapping = False
+    if parsed is None:
+        resolved = _resolve_custom_domain_request(host, path)
+        if resolved is not None:
+            api_id, mapped_stage, rest = resolved
+            if mapped_stage:
+                parsed = resolved
+                stage_from_mapping = True
+            else:
+                # A stage-less mapping leaves the stage to the request path:
+                # the first remaining segment is the tentative stage, exactly
+                # like a plain execute-api URL.
+                tentative, _, remainder = rest.lstrip("/").partition("/")
+                parsed = (api_id, tentative, "/" + remainder if remainder else "/")
     if parsed is None:
         return None
     api_id, tentative_stage, execute_path = parsed
@@ -1413,7 +1450,11 @@ async def _handle_execute_api_request(
             return await _get_module("apigateway").handle_connections_api(
                 method, api_id, tentative_stage, connection_id, body, headers
             )
-        stage, execute_path = _resolve_stage_and_path(api_id, tentative_stage, execute_path)
+        if stage_from_mapping:
+            # A base-path mapping names its stage; the whole remainder is API path.
+            stage = tentative_stage
+        else:
+            stage, execute_path = _resolve_stage_and_path(api_id, tentative_stage, execute_path)
         apigw_v1 = _get_module("apigateway_v1")
         if apigw_v1.find_api_scope(api_id) is not None:
             return await apigw_v1.handle_execute(
