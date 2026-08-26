@@ -147,8 +147,17 @@ def _delete_resource(resource_type: str, physical_id: str, props: dict,
             resource_type=resource_type,
         )
         return
-    logger.warning("No delete handler for resource type %s (id=%s)",
-                   resource_type, physical_id)
+    # CloudFormation internal types went through the no-op branch of
+    # _provision_resource, so there is nothing real to delete. (The registered
+    # internal types carry their own explicit no-op delete handlers above.)
+    if resource_type.startswith("AWS::CloudFormation::"):
+        logger.info("CloudFormation internal type %s for %s -- noop", resource_type, physical_id)
+        return
+    # Anything else was genuinely provisioned — a create handler ran for it, or
+    # _provision_resource would have refused the type — so a missing delete
+    # handler means the resource leaks. Fail the delete instead of logging a
+    # warning nobody sees.
+    raise ValueError(f"No delete handler for resource type {resource_type} (id={physical_id})")
 
 
 def _requires_replacement_dynamodb(old_props, new_props):
@@ -1818,7 +1827,10 @@ def _lambda_version_create(logical_id, props, stack_name):
         ver_str = str(ver_num)
         ver_config = copy.deepcopy(func["config"])
         ver_config["Version"] = ver_str
-        ver_arn = f"{ver_config['FunctionArn']}"
+        # Ref on AWS::Lambda::Version returns the *qualified* ARN
+        # (arn:...:function:name:version) — that qualifier is also what lets
+        # the delete handler find the version it published.
+        ver_arn = f"{ver_config['FunctionArn']}:{ver_str}"
         func["versions"][ver_str] = {
             "config": ver_config,
             "code_zip": func.get("code_zip"),
@@ -1826,6 +1838,23 @@ def _lambda_version_create(logical_id, props, stack_name):
         return ver_arn, {"Version": ver_str}
     ver_arn = f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{func_name}:1"
     return ver_arn, {"Version": "1"}
+
+
+def _lambda_version_delete(physical_id, props):
+    """Remove the published version, as DeleteFunction with a qualifier does.
+
+    Idempotent when the function (or the version itself) is already gone —
+    the usual case when the same stack also owns the function and deletes it
+    first in reverse dependency order.
+    """
+    func, _func_name, _resource_arn, _qualifier = _lambda_function_for_cfn_ref(
+        props.get("FunctionName", "")
+    )
+    if func is None:
+        return
+    version = physical_id.rsplit(":", 1)[-1]
+    if version.isdigit():
+        func["versions"].pop(version, None)
 
 
 # --- CloudFormation WaitCondition / WaitConditionHandle (no-ops) ---
@@ -1841,6 +1870,12 @@ def _cfn_wait_condition_handle_create(logical_id, props, stack_name):
     pid = f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
     url = f"https://cloudformation-waitcondition-{get_region()}.s3.amazonaws.com/{pid}"
     return pid, {"Ref": url}
+
+
+def _cfn_noop_delete(physical_id, props):
+    """Explicit no-op delete for the intentionally stateless internal types,
+    so that _delete_resource's missing-handler check stays reserved for types
+    that really do leak state."""
 
 
 # --- CloudFormation Nested Stack (AWS::CloudFormation::Stack) ---
@@ -3262,6 +3297,13 @@ def _appsync_schema_create(logical_id, props, stack_name):
         "typeName": "__schema__", "definition": definition, "format": "SDL",
     }
     return f"{api_id}/schema", {}
+
+
+def _appsync_schema_delete(physical_id, props):
+    # The physical id is "{api_id}/schema" — fall back to parsing it when the
+    # stored properties are missing the ApiId.
+    api_id = props.get("ApiId") or physical_id.rsplit("/", 1)[0]
+    _appsync._types.get(api_id, {}).pop("__schema__", None)
 
 
 def _appsync_apikey_create(logical_id, props, stack_name):
@@ -6113,9 +6155,9 @@ _RESOURCE_HANDLERS = {
         "delete": _firehose_delivery_stream_delete,
     },
     "AWS::Lambda::Permission": {"create": _lambda_permission_create, "delete": _lambda_permission_delete},
-    "AWS::Lambda::Version": {"create": _lambda_version_create},
-    "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create},
-    "AWS::CloudFormation::WaitConditionHandle": {"create": _cfn_wait_condition_handle_create},
+    "AWS::Lambda::Version": {"create": _lambda_version_create, "delete": _lambda_version_delete},
+    "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create, "delete": _cfn_noop_delete},
+    "AWS::CloudFormation::WaitConditionHandle": {"create": _cfn_wait_condition_handle_create, "delete": _cfn_noop_delete},
     "AWS::CloudFormation::Stack": {
         "create": _cfn_nested_stack_create,
         "update": _cfn_nested_stack_update,
@@ -6200,7 +6242,7 @@ _RESOURCE_HANDLERS = {
         "delete": _appsync_function_delete,
     },
     "AWS::AppSync::Resolver": {"create": _appsync_resolver_create, "delete": _appsync_resolver_delete},
-    "AWS::AppSync::GraphQLSchema": {"create": _appsync_schema_create},
+    "AWS::AppSync::GraphQLSchema": {"create": _appsync_schema_create, "delete": _appsync_schema_delete},
     "AWS::AppSync::ApiKey": {"create": _appsync_apikey_create, "delete": _appsync_apikey_delete},
     "AWS::SecretsManager::Secret": {"create": _sm_secret_create, "delete": _sm_secret_delete},
     "AWS::Cognito::UserPool": {"create": _cognito_user_pool_create, "delete": _cognito_user_pool_delete},

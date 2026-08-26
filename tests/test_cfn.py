@@ -9419,3 +9419,390 @@ def test_cfn_ses_configuration_set_and_event_destination(cfn, ses, sesv2):
 
     with pytest.raises(ClientError):
         ses.describe_configuration_set(ConfigurationSetName=cs_name)
+
+
+# ===========================================================================
+# Loud deletes — DELETE_FAILED / ROLLBACK_FAILED stack states, and the
+# delete handlers for the types that used to leak silently
+# ===========================================================================
+
+_CR_HANDLER_DELETE_FAILS = """\
+import json, urllib.request
+
+def handler(event, context):
+    status = "FAILED" if event["RequestType"] == "Delete" else "SUCCESS"
+    payload = json.dumps({
+        "Status": status,
+        "Reason": "delete refused for testing",
+        "RequestId": event["RequestId"],
+        "StackId": event["StackId"],
+        "LogicalResourceId": event["LogicalResourceId"],
+        "PhysicalResourceId": event.get("PhysicalResourceId", "delete-fails-cr"),
+    }).encode()
+    req = urllib.request.Request(
+        event["ResponseURL"],
+        data=payload,
+        method="PUT",
+        headers={"content-type": "", "content-length": str(len(payload))},
+    )
+    urllib.request.urlopen(req, timeout=10)
+"""
+
+
+def test_cfn_stack_delete_failure_lands_delete_failed(cfn, lam, sns):
+    """A resource delete that fails lands the stack in DELETE_FAILED, not a
+    silent DELETE_COMPLETE: the other resources are still deleted, the failed
+    resource is retained, and a retried DeleteStack can finish the job."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cr-del-fail-{suffix}"
+    stack_name = f"cfn-delete-failed-{suffix}"
+    topic_name = f"cfn-delete-failed-topic-{suffix}"
+
+    def create_handler():
+        lam.create_function(
+            FunctionName=fn,
+            Runtime="python3.12",
+            Role=_CR_LAMBDA_ROLE,
+            Handler="index.handler",
+            Code={"ZipFile": _cr_make_zip(_CR_HANDLER_SUCCESS)},
+        )
+
+    create_handler()
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Topic": {
+                "Type": "AWS::SNS::Topic",
+                "Properties": {"TopicName": topic_name},
+            },
+            "CR": {
+                "Type": "Custom::Tester",
+                "Properties": {
+                    "ServiceToken": f"arn:aws:lambda:us-east-1:000000000000:function:{fn}",
+                },
+            },
+        },
+    }
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        # Remove the custom resource's handler so its Delete cannot be delivered.
+        lam.delete_function(FunctionName=fn)
+
+        cfn.delete_stack(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "DELETE_FAILED"
+        assert "CR" in stack.get("StackStatusReason", "")
+
+        # The deletable resource is gone regardless — CFN keeps deleting.
+        topic_arns = {t["TopicArn"] for t in sns.list_topics()["Topics"]}
+        assert not any(arn.endswith(f":{topic_name}") for arn in topic_arns)
+
+        # The failed resource is retained on the still-existing stack.
+        retained = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+        assert [r["LogicalResourceId"] for r in retained] == ["CR"]
+        assert retained[0]["ResourceStatus"] == "DELETE_FAILED"
+
+        # And the failure is visible as a stack-level event.
+        events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+        assert any(
+            e["ResourceType"] == "AWS::CloudFormation::Stack"
+            and e["ResourceStatus"] == "DELETE_FAILED"
+            for e in events
+        )
+
+        # Restoring the handler and retrying the delete completes it.
+        create_handler()
+        cfn.delete_stack(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "DELETE_COMPLETE"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
+
+
+def test_cfn_stack_delete_failed_keeps_exports(cfn, lam):
+    """A stack landing in DELETE_FAILED keeps its exports — they belong to
+    the still-existing stack and only go away with DELETE_COMPLETE."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cr-del-exp-{suffix}"
+    stack_name = f"cfn-delete-failed-exp-{suffix}"
+    export_name = f"cfn-del-exp-{suffix}"
+
+    def create_handler():
+        lam.create_function(
+            FunctionName=fn,
+            Runtime="python3.12",
+            Role=_CR_LAMBDA_ROLE,
+            Handler="index.handler",
+            Code={"ZipFile": _cr_make_zip(_CR_HANDLER_SUCCESS)},
+        )
+
+    create_handler()
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "CR": {
+                "Type": "Custom::Tester",
+                "Properties": {
+                    "ServiceToken": f"arn:aws:lambda:us-east-1:000000000000:function:{fn}",
+                },
+            },
+        },
+        "Outputs": {
+            "Kept": {"Value": "still-here", "Export": {"Name": export_name}},
+        },
+    }
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        # Remove the custom resource's handler so its Delete cannot be delivered.
+        lam.delete_function(FunctionName=fn)
+        cfn.delete_stack(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "DELETE_FAILED"
+
+        exports = {e["Name"]: e["Value"] for e in cfn.list_exports()["Exports"]}
+        assert exports.get(export_name) == "still-here"
+
+        # The completed retry removes the export with the stack.
+        create_handler()
+        cfn.delete_stack(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "DELETE_COMPLETE"
+        exports = {e["Name"] for e in cfn.list_exports()["Exports"]}
+        assert export_name not in exports
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
+
+
+def test_cfn_create_rollback_delete_failure_lands_rollback_failed(cfn, lam):
+    """A rollback that cannot undo what it created reports ROLLBACK_FAILED
+    instead of pretending the rollback completed."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cr-rb-fail-{suffix}"
+    stack_name = f"cfn-rollback-failed-{suffix}"
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role=_CR_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_DELETE_FAILS)},
+    )
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "CR": {
+                "Type": "Custom::Tester",
+                "Properties": {
+                    "ServiceToken": f"arn:aws:lambda:us-east-1:000000000000:function:{fn}",
+                },
+            },
+            # Provisioned after CR; its unsupported type fails the create and
+            # triggers the rollback that has to delete CR again.
+            "Bad": {
+                "Type": "AWS::Unsupported::DoesNotExist",
+                "DependsOn": "CR",
+                "Properties": {},
+            },
+        },
+    }
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "ROLLBACK_FAILED", stack.get("StackStatusReason")
+
+        events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+        assert any(
+            e["LogicalResourceId"] == "CR" and e["ResourceStatus"] == "DELETE_FAILED"
+            for e in events
+        )
+        assert any(
+            e["ResourceType"] == "AWS::CloudFormation::Stack"
+            and e["ResourceStatus"] == "ROLLBACK_FAILED"
+            for e in events
+        )
+    finally:
+        # Let the handler accept deletes again so the stack can be cleaned up.
+        try:
+            lam.update_function_code(
+                FunctionName=fn, ZipFile=_cr_make_zip(_CR_HANDLER_SUCCESS)
+            )
+        except ClientError:
+            pass
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
+
+
+def test_cfn_update_rollback_delete_failure_lands_update_rollback_failed(cfn, lam):
+    """An update rollback whose delete fails lands UPDATE_ROLLBACK_FAILED and
+    keeps the previous resources on the stack."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cr-urb-fail-{suffix}"
+    stack_name = f"cfn-update-rollback-failed-{suffix}"
+    topic_name = f"cfn-urb-topic-{suffix}"
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role=_CR_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_DELETE_FAILS)},
+    )
+    base = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Topic": {
+                "Type": "AWS::SNS::Topic",
+                "Properties": {"TopicName": topic_name},
+            },
+        },
+    }
+    updated = json.loads(json.dumps(base))
+    updated["Resources"]["CR"] = {
+        "Type": "Custom::Tester",
+        "Properties": {
+            "ServiceToken": f"arn:aws:lambda:us-east-1:000000000000:function:{fn}",
+        },
+    }
+    updated["Resources"]["Bad"] = {
+        "Type": "AWS::Unsupported::DoesNotExist",
+        "DependsOn": "CR",
+        "Properties": {},
+    }
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(base))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(updated))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_FAILED", stack.get("StackStatusReason")
+
+        # The pre-update resources survive on the stack.
+        retained = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+        assert "Topic" in [r["LogicalResourceId"] for r in retained]
+
+        events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+        assert any(
+            e["ResourceType"] == "AWS::CloudFormation::Stack"
+            and e["ResourceStatus"] == "UPDATE_ROLLBACK_FAILED"
+            for e in events
+        )
+    finally:
+        try:
+            lam.update_function_code(
+                FunctionName=fn, ZipFile=_cr_make_zip(_CR_HANDLER_SUCCESS)
+            )
+        except ClientError:
+            pass
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
+
+
+def test_cfn_lambda_version_stack_delete_removes_version(cfn, lam):
+    """AWS::Lambda::Version now has a real delete handler: deleting the stack
+    removes the published version instead of leaking it, and Ref resolves to
+    the qualified version ARN as on AWS."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cfn-ver-del-{suffix}"
+    stack_name = f"cfn-ver-del-{suffix}"
+    code = "def handler(e,c): return {}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fn, Runtime="python3.12",
+        Role=_CR_LAMBDA_ROLE, Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Ver": {
+                "Type": "AWS::Lambda::Version",
+                "Properties": {"FunctionName": fn},
+            },
+        },
+    }
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        detail = cfn.describe_stack_resource(
+            StackName=stack_name, LogicalResourceId="Ver"
+        )["StackResourceDetail"]
+        assert detail["PhysicalResourceId"].endswith(f":function:{fn}:1")
+
+        versions = lam.list_versions_by_function(FunctionName=fn)["Versions"]
+        assert "1" in [v["Version"] for v in versions]
+
+        cfn.delete_stack(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "DELETE_COMPLETE"
+
+        # The version is gone; the (externally owned) function is untouched.
+        versions = lam.list_versions_by_function(FunctionName=fn)["Versions"]
+        assert [v["Version"] for v in versions] == ["$LATEST"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
+
+
+def test_cfn_appsync_schema_stack_delete_removes_schema(cfn, appsync):
+    """AWS::AppSync::GraphQLSchema now has a real delete handler: deleting the
+    stack removes the schema from the (externally owned) API."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-appsync-schema-{suffix}"
+    api = appsync.create_graphql_api(
+        name=f"cfn-schema-api-{suffix}", authenticationType="API_KEY"
+    )["graphqlApi"]
+    api_id = api["apiId"]
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Schema": {
+                "Type": "AWS::AppSync::GraphQLSchema",
+                "Properties": {
+                    "ApiId": api_id,
+                    "Definition": "type Query { hello: String }",
+                },
+            },
+        },
+    }
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert len(appsync.list_types(apiId=api_id, format="SDL")["types"]) == 1
+
+        cfn.delete_stack(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "DELETE_COMPLETE"
+        assert appsync.list_types(apiId=api_id, format="SDL")["types"] == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            appsync.delete_graphql_api(apiId=api_id)
+        except ClientError:
+            pass
