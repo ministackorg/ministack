@@ -4,7 +4,8 @@ JSON-based API via X-Amz-Target (prefix: TrentService).
 Supports: CreateKey, ListKeys, DescribeKey, Sign, Verify,
           Encrypt, Decrypt, GenerateDataKey,
           GenerateDataKeyWithoutPlaintext, GenerateDataKeyPair,
-          GenerateDataKeyPairWithoutPlaintext, GenerateMac, VerifyMac.
+          GenerateDataKeyPairWithoutPlaintext, GenerateMac, VerifyMac,
+          GenerateRandom.
 """
 
 import base64
@@ -1503,6 +1504,44 @@ def _list_resource_tags(data):
     return json_response({"Tags": rec.get("Tags", []), "Truncated": False})
 
 
+def _generate_random(data):
+    """``GenerateRandom`` — a keyless operation; only the byte count matters.
+
+    ``NumberOfBytes`` is optional in the model but the service refuses its
+    absence with "NumberOfBytes is required.", so an omitted count is a
+    ``ValidationException`` rather than a silent default. ``CustomKeyStoreId``
+    answers ``CustomKeyStoreNotFoundException`` — MiniStack has no custom key
+    stores. The Nitro-enclave ``Recipient`` parameter is not supported and is
+    ignored.
+    """
+    number_of_bytes = data.get("NumberOfBytes")
+    if number_of_bytes is None:
+        return error_response_json("ValidationException", "NumberOfBytes is required.", 400)
+    if type(number_of_bytes) is not int or number_of_bytes < 1:
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{number_of_bytes}' at "
+            "'numberOfBytes' failed to satisfy constraint: Member must have "
+            "value greater than or equal to 1",
+            400,
+        )
+    if number_of_bytes > 1024:
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{number_of_bytes}' at "
+            "'numberOfBytes' failed to satisfy constraint: Member must have "
+            "value less than or equal to 1024",
+            400,
+        )
+    if data.get("CustomKeyStoreId"):
+        return error_response_json(
+            "CustomKeyStoreNotFoundException",
+            f"Custom key store {data['CustomKeyStoreId']} does not exist",
+            400,
+        )
+    return json_response({"Plaintext": base64.b64encode(os.urandom(number_of_bytes)).decode()})
+
+
 # ---- Request handler ----
 
 async def handle_request(method, path, headers, body, query_params):
@@ -1529,6 +1568,7 @@ async def handle_request(method, path, headers, body, query_params):
         "GenerateDataKeyWithoutPlaintext": _generate_data_key_without_plaintext,
         "GenerateDataKeyPair": _generate_data_key_pair,
         "GenerateDataKeyPairWithoutPlaintext": _generate_data_key_pair_without_plaintext,
+        "GenerateRandom": _generate_random,
         "CreateAlias": _create_alias,
         "DeleteAlias": _delete_alias,
         "ListAliases": _list_aliases,
