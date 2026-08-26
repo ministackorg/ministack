@@ -446,6 +446,11 @@ def ses():
 
 
 @pytest.fixture(scope="session")
+def signer():
+    return make_client("signer")
+
+
+@pytest.fixture(scope="session")
 def sfn():
     return make_client("stepfunctions")
 

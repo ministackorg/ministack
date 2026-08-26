@@ -5407,3 +5407,58 @@ def test_batch_persistence_lifecycle_restores_regional_state(monkeypatch, tmp_pa
         assert service._jobs.get_scoped(account_id, boot_region, job_id) is None
     finally:
         service.reset()
+
+
+# ── signer._jobs / signer._profiles ────────────────────────────────────
+
+def test_signer_jobs_and_profiles_survive_warm_boot():
+    """A restored signer job must keep its signedObject reference — the
+    production contract is `destination.prefix + jobId` in S3, and a job
+    record that forgets where its marker lives can no longer answer
+    DescribeSigningJob for it after a restart."""
+    mod = _get_module("signer")
+    mod.reset()
+    job_id = "persisted-signing-job"
+    now = 1700000000
+    mod._profiles["persisted-profile"] = {
+        "profileName": "persisted-profile",
+        "profileVersion": "abc123def4",
+        "profileVersionArn": (
+            "arn:aws:signer:us-east-1:000000000000:"
+            "/signing-profiles/persisted-profile/abc123def4"
+        ),
+        "arn": (
+            "arn:aws:signer:us-east-1:000000000000:"
+            "/signing-profiles/persisted-profile"
+        ),
+        "platformId": "AWSIoTDeviceManagement-SHA256-ECDSA",
+        "status": "Active",
+    }
+    mod._jobs[job_id] = {
+        "jobId": job_id,
+        "source": {"s3": {"bucketName": "src-bkt", "key": "fw.bin"}},
+        "signedObject": {"s3": {"bucketName": "dst-bkt",
+                                "key": f"signed/{job_id}"}},
+        "profileName": "persisted-profile",
+        "profileVersion": "abc123def4",
+        "platformId": "AWSIoTDeviceManagement-SHA256-ECDSA",
+        "status": "Succeeded",
+        "createdAt": now,
+        "completedAt": now,
+        "requestedBy": "arn:aws:iam::000000000000:root",
+        "jobOwner": "000000000000",
+        "jobInvoker": "000000000000",
+    }
+
+    _round_trip_dict(mod, "signer")
+
+    job = mod._jobs.get(job_id)
+    assert job is not None, "_jobs lost across save_state -> load_state"
+    assert job["status"] == "Succeeded"
+    assert job["signedObject"]["s3"]["key"] == f"signed/{job_id}"
+    profile = mod._profiles.get("persisted-profile")
+    assert profile is not None, (
+        "_profiles lost across save_state -> load_state"
+    )
+    assert profile["profileVersion"] == "abc123def4"
+    mod.reset()

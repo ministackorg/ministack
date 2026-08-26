@@ -399,6 +399,14 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"^mediaconnect\."],
         "credential_scope": "mediaconnect",
     },
+    # AWS Signer (REST-JSON, signing name `signer`). No other pattern
+    # contains "signer.", so placement in this dict is not order-sensitive;
+    # SDK requests resolve via the credential-scope early return, unsigned
+    # clients via the /signing-jobs + /signing-profiles path rules.
+    "signer": {
+        "host_patterns": [r"signer\."],
+        "credential_scope": "signer",
+    },
     "tagging": {
         "target_prefixes": ["ResourceGroupsTaggingAPI_20170126"],
         "host_patterns": [r"tagging\."],
@@ -1035,6 +1043,21 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
     # rule below.
     if path_lower.startswith("/oidc/"):
         return "eks"
+    # AWS Signer REST-JSON paths for unsigned clients (SigV4 requests route
+    # via the `signer` credential scope above). Segment-anchored and limited
+    # to the methods the signer surface serves, so path-style S3 traffic for
+    # a bucket like "signing-jobs-archive" — or other verbs on a bucket
+    # literally named "signing-jobs" — still falls through to S3.
+    if path_lower == "/signing-jobs" and method in ("POST", "GET"):
+        return "signer"
+    if method == "GET" and path_lower.startswith("/signing-jobs/"):
+        rest = path_lower[len("/signing-jobs/"):]
+        if rest and "/" not in rest:
+            return "signer"
+    if method in ("PUT", "GET") and path_lower.startswith("/signing-profiles/"):
+        rest = path_lower[len("/signing-profiles/"):]
+        if rest and "/" not in rest:
+            return "signer"
     if path_lower.startswith(("/clusters", "/taskdefinitions", "/tasks", "/services", "/stoptask")):
         return "ecs"
     # smithy-rpc-v2-cbor path: /service/ServiceName/operation/ActionName

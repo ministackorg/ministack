@@ -91,6 +91,7 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "secretsmanager": "secretsmanager",
     "servicediscovery": "servicediscovery",
     "ses": "ses",
+    "signer": "signer",
     "sns": "sns",
     "sqs": "sqs",
     "ssm": "ssm",
@@ -271,6 +272,7 @@ _BOTOCORE_SERVICE_MAP: dict[str, list[str]] = {
     "s3files": [],  # uses S3 namespace but different paths
     "s3tables": ["s3tables"],
     "scheduler": ["scheduler"],
+    "signer": ["signer"],
 }
 
 # Compiled route: (http_method, compiled_regex, operation_name, specificity)

@@ -144,3 +144,60 @@ def test_iot_jobs_data_host_routes_before_iot(host):
     assert detect_service(
         "GET", "/things/t1/jobs/$next", {"host": host}, {}
     ) == "iot-jobs-data"
+
+
+def test_signer_credential_scope_routes():
+    """boto3 signs signer requests with credential scope `signer` (botocore
+    signingName) — the scope early-return must resolve it."""
+    assert detect_service(
+        "POST", "/signing-jobs", _sigv4_headers("signer"), {}
+    ) == "signer"
+    assert detect_service(
+        "GET", "/signing-profiles/prof1", _sigv4_headers("signer"), {}
+    ) == "signer"
+
+
+def test_signer_host_routes():
+    headers = {"host": "signer.us-east-1.localhost:4566"}
+    assert detect_service("GET", "/signing-jobs/abc", headers, {}) == "signer"
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("POST", "/signing-jobs"),
+        ("GET", "/signing-jobs"),
+        ("GET", "/signing-jobs/0000-1111"),
+        ("PUT", "/signing-profiles/prof1"),
+        ("GET", "/signing-profiles/prof1"),
+    ],
+)
+def test_signer_unsigned_paths_route_by_prefix(method, path):
+    """Without SigV4 the default is S3 — the /signing-jobs and
+    /signing-profiles path rules must claim signer's REST-JSON surface
+    before that fallback."""
+    assert detect_service(method, path, _HEADERS, {}) == "signer"
+
+
+@pytest.mark.parametrize(("method", "path"), [
+    # Buckets that merely share the prefix.
+    ("GET", "/signing-jobs-archive"),
+    ("GET", "/signing-jobs-archive/report.json"),
+    ("PUT", "/signing-profiles-backup/dump.bin"),
+    # Verbs signer's surface doesn't serve, on the exact-named bucket.
+    ("PUT", "/signing-jobs/new-object"),
+    ("DELETE", "/signing-jobs/old-object"),
+    ("DELETE", "/signing-profiles/prof1"),
+    # Multi-segment object keys inside the exact-named bucket, and the
+    # bare list-bucket GET on "signing-profiles" (ListSigningProfiles is
+    # not implemented, so S3 keeps it).
+    ("GET", "/signing-jobs/path/to/object"),
+    ("GET", "/signing-profiles/nested/key"),
+    ("GET", "/signing-profiles"),
+])
+def test_signer_lookalike_s3_paths_stay_on_s3(method, path):
+    """Regression: `startswith("/signing-jobs")` hijacked unsigned path-style
+    S3 traffic for any bucket whose name starts with that prefix. The rules
+    are segment-anchored and method-limited now, so this traffic falls
+    through to the S3 default."""
+    assert detect_service(method, path, _HEADERS, {}) == "s3"
