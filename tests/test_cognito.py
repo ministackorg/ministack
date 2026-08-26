@@ -7731,3 +7731,66 @@ def test_cognito_admin_link_provider_rejects_an_already_signed_in_user(
                         "ProviderAttributeName": "Cognito_Subject",
                         "ProviderAttributeValue": "early@example.com"})
     assert exc_info.value.response["Error"]["Code"] == "AliasExistsException"
+
+
+def test_cognito_admin_disable_provider_deactivates_native_user(cognito_idp):
+    """"To deactivate a local user, set ProviderName to Cognito and the
+    ProviderAttributeName to Cognito_Subject. The ProviderAttributeValue must
+    be user's local username." The user then cannot sign in with a password."""
+    pid = cognito_idp.create_user_pool(PoolName="NativeDisablePool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="c",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="gina", MessageAction="SUPPRESS")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="gina", Password="Passw0rd!", Permanent=True)
+
+    cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "gina", "PASSWORD": "Passw0rd!"})
+
+    cognito_idp.admin_disable_provider_for_user(
+        UserPoolId=pid,
+        User={"ProviderName": "Cognito", "ProviderAttributeName": "Cognito_Subject",
+              "ProviderAttributeValue": "gina"})
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.initiate_auth(
+            ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "gina", "PASSWORD": "Passw0rd!"})
+    assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
+
+    # SRP is password sign-in too: answering PASSWORD_VERIFIER must refuse.
+    chal = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="USER_SRP_AUTH",
+        AuthParameters={"USERNAME": "gina", "SRP_A": "1" * 16})
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.respond_to_auth_challenge(
+            ClientId=cid, ChallengeName="PASSWORD_VERIFIER",
+            Session=chal["Session"],
+            ChallengeResponses={"USERNAME": "gina",
+                                "PASSWORD_CLAIM_SIGNATURE": "sig",
+                                "PASSWORD_CLAIM_SECRET_BLOCK": "blk",
+                                "TIMESTAMP": "now"})
+    assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
+
+
+def test_cognito_required_custom_attribute_is_refused(cognito_idp):
+    """"You can't require that users provide a value for the attribute" — a
+    Required custom attribute is refused at CreateUserPool and at
+    AddCustomAttributes, as real Cognito refuses it."""
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.create_user_pool(
+            PoolName="ReqCustomPool",
+            Schema=[{"Name": "tenant", "AttributeDataType": "String",
+                     "Required": True}])
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+    pid = cognito_idp.create_user_pool(PoolName="ReqCustomPool2")["UserPool"]["Id"]
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.add_custom_attributes(
+            UserPoolId=pid,
+            CustomAttributes=[{"Name": "tenant", "AttributeDataType": "String",
+                               "Required": True}])
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
