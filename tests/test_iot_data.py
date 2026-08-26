@@ -1688,6 +1688,140 @@ def test_shadow_update_over_mqtt_emits_accepted_delta_documents(iot_data_client)
     assert shadow["version"] == accepted["version"]
 
 
+def test_shadow_update_over_http_emits_accepted_delta_documents(iot_data_client):
+    """An HTTP `UpdateThingShadow` publishes the same state-change
+    notifications as an MQTT update: accepted + delta + documents. On AWS the
+    Device Shadow service emits these however the update arrived — it is what
+    lets a topic rule on `update/accepted` fire for HTTP callers."""
+    thing = _unique("shadow-http")
+    base = f"$aws/things/{thing}/shadow"
+
+    received = _collect_shadow_frames(
+        f"{base}/update/+",
+        lambda: iot_data_client.update_thing_shadow(
+            thingName=thing,
+            payload=json.dumps(
+                {"state": {"desired": {"led": "on"}}, "clientToken": "tok-http"}
+            ).encode(),
+        ),
+        want=3,
+    )
+
+    frames = {topic: json.loads(payload) for topic, payload in received}
+    accepted = frames[f"{base}/update/accepted"]
+    assert accepted["state"] == {"desired": {"led": "on"}}
+    delta = frames[f"{base}/update/delta"]
+    assert delta["state"] == {"led": "on"}
+    assert delta["clientToken"] == "tok-http"
+    docs = frames[f"{base}/update/documents"]
+    # The envelope carries the triggering request's clientToken and the single
+    # timestamp; previous/current are state + metadata + version only (a live
+    # probe pinned the member keys — no inner timestamp).
+    assert set(docs) == {"previous", "current", "timestamp", "clientToken"}
+    assert docs["clientToken"] == "tok-http"
+    assert docs["previous"] is None
+    assert set(docs["current"]) == {"state", "metadata", "version"}
+    assert docs["current"]["state"]["desired"] == {"led": "on"}
+
+
+def test_shadow_delete_over_http_emits_delete_accepted_but_get_nothing(iot_data_client):
+    """An HTTP `DeleteThingShadow` publishes `delete/accepted` (a state
+    change); an HTTP `GetThingShadow` publishes nothing — `get/accepted` is
+    the MQTT request's response channel and the HTTP read has its own
+    response body."""
+    thing = _unique("shadow-http-del")
+    base = f"$aws/things/{thing}/shadow"
+    iot_data_client.update_thing_shadow(
+        thingName=thing,
+        payload=json.dumps({"state": {"reported": {"v": 1}}}).encode(),
+    )
+
+    received = _collect_shadow_frames(
+        f"{base}/get/+",
+        lambda: iot_data_client.get_thing_shadow(thingName=thing),
+        want=1,
+        timeout=2.0,
+    )
+    assert received == []
+
+    received = _collect_shadow_frames(
+        f"{base}/delete/+",
+        lambda: iot_data_client.delete_thing_shadow(thingName=thing),
+        want=1,
+    )
+    frames = {topic: json.loads(payload) for topic, payload in received}
+    # AWS's delete/accepted body is abbreviated: version + timestamp only.
+    assert set(frames[f"{base}/delete/accepted"]) == {"version", "timestamp"}
+
+
+def test_named_shadow_update_over_http_emits_on_named_topics(iot_data_client):
+    """An HTTP update of a named shadow notifies on that shadow's own
+    `/name/<n>/update/...` topics, not the classic shadow's."""
+    thing = _unique("shadow-http-named")
+    base = f"$aws/things/{thing}/shadow/name/cfg"
+
+    received = _collect_shadow_frames(
+        f"{base}/update/+",
+        lambda: iot_data_client.update_thing_shadow(
+            thingName=thing,
+            shadowName="cfg",
+            payload=json.dumps({"state": {"desired": {"mode": "eco"}}}).encode(),
+        ),
+        want=3,
+    )
+
+    frames = {topic: json.loads(payload) for topic, payload in received}
+    accepted = frames[f"{base}/update/accepted"]
+    assert accepted["state"] == {"desired": {"mode": "eco"}}
+    docs = frames[f"{base}/update/documents"]
+    # No clientToken in the request → none on the documents envelope.
+    assert set(docs) == {"previous", "current", "timestamp"}
+    assert docs["current"]["state"]["desired"] == {"mode": "eco"}
+
+
+def test_shadow_update_over_http_rejected_emits_no_frames(iot_data_client):
+    """A failed HTTP update publishes nothing — no accepted trio and no
+    `rejected` envelope, the HTTP 409 already carries the failure."""
+    thing = _unique("shadow-http-conflict")
+    base = f"$aws/things/{thing}/shadow"
+    iot_data_client.update_thing_shadow(
+        thingName=thing,
+        payload=json.dumps({"state": {"reported": {"x": 1}}}).encode(),
+    )
+
+    def _stale_update():
+        with pytest.raises(ClientError) as ei:
+            iot_data_client.update_thing_shadow(
+                thingName=thing,
+                payload=json.dumps(
+                    {"state": {"reported": {"x": 2}}, "version": 99}
+                ).encode(),
+            )
+        assert ei.value.response["Error"]["Code"] == "ConflictException"
+
+    received = _collect_shadow_frames(
+        f"{base}/update/+", _stale_update, want=1, timeout=2.0
+    )
+    assert received == []
+
+
+def test_shadow_delete_over_http_missing_emits_no_frames(iot_data_client):
+    """An HTTP delete of a shadow that does not exist changes no state, so
+    nothing is published — the HTTP 404 is the whole answer."""
+    thing = _unique("shadow-http-del-miss")
+    base = f"$aws/things/{thing}/shadow"
+
+    def _delete_missing():
+        with pytest.raises(ClientError) as ei:
+            iot_data_client.delete_thing_shadow(thingName=thing)
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    received = _collect_shadow_frames(
+        f"{base}/delete/+", _delete_missing, want=1, timeout=2.0
+    )
+    assert received == []
+
+
 def test_named_shadow_update_over_mqtt(iot_data_client):
     thing = _unique("shadow-named")
     base = f"$aws/things/{thing}/shadow/name/cfg"
