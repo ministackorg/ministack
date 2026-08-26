@@ -5,6 +5,7 @@ IAM action string (``service:ActionName``) from each request's protocol,
 and formats per-protocol AccessDenied error responses.
 """
 
+import base64
 import json
 import logging
 import os
@@ -551,6 +552,50 @@ def _query_param(query_params: dict, key: str) -> str:
     return val or ""
 
 
+def _param(body: bytes, query_params: dict, *fields: str) -> str:
+    """Read a request parameter from the JSON body, falling back to the query form.
+
+    Several services moved to the JSON protocol (SQS in 2023, plus ACM, SSM and
+    CloudWatch), where the parameters travel in the body and nothing reaches
+    ``query_params``, while older clients still send the query form. Reading
+    both keeps one branch correct for either wire shape.
+    """
+    for field in fields:
+        val = _safe_json_field(body, field)
+        if val:
+            return val
+    for field in fields:
+        val = _query_param(query_params, field)
+        if val:
+            return val
+    return ""
+
+
+_KMS_KEY_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+
+
+def _kms_key_id_from_ciphertext(ciphertext_b64: str) -> str:
+    """Recover the key id our symmetric ciphertext carries in its first 36 bytes.
+
+    Decrypt and ReEncrypt do not require a KeyId: "AWS KMS can get this
+    information from metadata that it adds to the symmetric ciphertext blob."
+    IAM still evaluates against that key's ARN, so the resource has to be
+    resolved the same way the KMS handler resolves it.
+    """
+    if not ciphertext_b64:
+        return ""
+    try:
+        raw = base64.b64decode(ciphertext_b64)
+    except Exception:
+        return ""
+    if len(raw) <= 68:
+        return ""
+    candidate = raw[:36].decode("utf-8", errors="ignore")
+    return candidate if _KMS_KEY_ID_RE.match(candidate) else ""
+
+
 def extract_resource_arn(service: str, method: str, path: str,
                          headers: dict, body: bytes,
                          query_params: dict, region: str,
@@ -594,16 +639,21 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "sqs":
-        # Queue URL is in the path or QueueUrl param
-        queue_url = _query_param(query_params, "QueueUrl")
+        # SQS speaks the JSON protocol, so QueueUrl arrives in the body for
+        # current SDKs and in the query form for older ones.
+        queue_url = _param(body, query_params, "QueueUrl")
+        if not queue_url:
+            # Query-protocol callers address the queue by path instead:
+            # POST /{account_id}/{queue_name}
+            parts = [p for p in path.split("/") if p]
+            if len(parts) >= 2 and parts[-2].isdigit():
+                queue_url = parts[-1]
         if queue_url:
-            # Extract queue name from URL
-            q_parts = queue_url.rstrip("/").split("/")
-            queue_name = q_parts[-1] if q_parts else ""
+            queue_name = queue_url.rstrip("/").split("/")[-1]
             if queue_name:
                 return f"arn:aws:sqs:{region}:{account_id}:{queue_name}"
-        # QueueName param (CreateQueue)
-        queue_name = _query_param(query_params, "QueueName")
+        # QueueName param (CreateQueue, GetQueueUrl)
+        queue_name = _param(body, query_params, "QueueName")
         if queue_name:
             return f"arn:aws:sqs:{region}:{account_id}:{queue_name}"
         return "*"
@@ -623,6 +673,11 @@ def extract_resource_arn(service: str, method: str, path: str,
 
     if service == "kms":
         key_id = _safe_json_field(body, "KeyId")
+        if not key_id:
+            # Decrypt, and ReEncrypt's source key, carry no KeyId for symmetric
+            # keys — the key is recovered from the ciphertext.
+            key_id = _kms_key_id_from_ciphertext(
+                _safe_json_field(body, "CiphertextBlob"))
         if key_id:
             # KeyId can be an ARN, alias, or key ID
             if key_id.startswith("arn:"):
@@ -840,7 +895,7 @@ def extract_resource_arn(service: str, method: str, path: str,
     # --- Query-based services ---
 
     if service == "acm":
-        arn = _query_param(query_params, "CertificateArn")
+        arn = _param(body, query_params, "CertificateArn")
         if arn:
             return arn
         return "*"
@@ -855,7 +910,7 @@ def extract_resource_arn(service: str, method: str, path: str,
 
     if service == "monitoring":
         # CloudWatch alarms
-        name = _query_param(query_params, "AlarmName")
+        name = _param(body, query_params, "AlarmName")
         if name:
             return f"arn:aws:cloudwatch:{region}:{account_id}:alarm:{name}"
         ns = _query_param(query_params, "Namespace")
@@ -906,7 +961,7 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "ssm":
-        name = _query_param(query_params, "Name")
+        name = _param(body, query_params, "Name")
         if name:
             return f"arn:aws:ssm:{region}:{account_id}:parameter{name if name.startswith('/') else '/' + name}"
         return "*"

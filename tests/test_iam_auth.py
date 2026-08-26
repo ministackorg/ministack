@@ -1123,3 +1123,151 @@ def test_put_role_policy_rejects_malformed_document(iam):
         assert exc.value.response["Error"]["Code"] == "MalformedPolicyDocument"
     finally:
         iam.delete_role(RoleName="validation-test-role-2")
+
+
+# ---------------------------------------------------------------------------
+# Resource ARN extraction (#1504, #1505)
+#
+# Several services moved to the JSON protocol, so their parameters arrive in
+# the body and never reach query_params. A branch that reads only query params
+# falls back to "*", which no resource-scoped statement matches, and every
+# least-privilege policy for that service denies.
+# ---------------------------------------------------------------------------
+
+class TestExtractResourceArn:
+    ACCOUNT = "000000000000"
+    REGION = "us-east-1"
+
+    def _arn(self, service, body=b"", query=None, path="/", method="POST"):
+        from ministack.core.iam_actions import extract_resource_arn
+        return extract_resource_arn(
+            service, method, path, {}, body, query or {},
+            self.REGION, self.ACCOUNT,
+        )
+
+    def test_sqs_queue_url_from_json_body(self):
+        # SQS is a JSON-protocol service: current SDKs send QueueUrl in the body.
+        body = json.dumps({
+            "QueueUrl": "http://localhost:4566/000000000000/my-queue",
+            "MessageBody": "x",
+        }).encode()
+        assert self._arn("sqs", body=body) == (
+            "arn:aws:sqs:us-east-1:000000000000:my-queue")
+
+    def test_sqs_queue_name_from_json_body(self):
+        body = json.dumps({"QueueName": "my-queue"}).encode()
+        assert self._arn("sqs", body=body) == (
+            "arn:aws:sqs:us-east-1:000000000000:my-queue")
+
+    def test_sqs_queue_url_from_query_form_still_works(self):
+        query = {"QueueUrl": ["http://localhost:4566/000000000000/my-queue"]}
+        assert self._arn("sqs", query=query) == (
+            "arn:aws:sqs:us-east-1:000000000000:my-queue")
+
+    def test_sqs_queue_from_request_path(self):
+        # Query-protocol callers address the queue by path.
+        assert self._arn("sqs", path="/000000000000/my-queue") == (
+            "arn:aws:sqs:us-east-1:000000000000:my-queue")
+
+    def test_sqs_without_a_queue_falls_back_to_star(self):
+        assert self._arn("sqs", body=json.dumps({"MaxResults": 10}).encode()) == "*"
+
+    def test_kms_key_id_from_body(self):
+        body = json.dumps({"KeyId": "1234abcd-12ab-34cd-56ef-1234567890ab"}).encode()
+        assert self._arn("kms", body=body) == (
+            "arn:aws:kms:us-east-1:000000000000:key/"
+            "1234abcd-12ab-34cd-56ef-1234567890ab")
+
+    def test_kms_decrypt_resolves_the_key_from_the_ciphertext(self):
+        # Decrypt carries no KeyId for a symmetric key: "AWS KMS can get this
+        # information from metadata that it adds to the symmetric ciphertext
+        # blob." IAM still evaluates against that key's ARN.
+        import base64
+        key_id = "1234abcd-12ab-34cd-56ef-1234567890ab"
+        blob = key_id.encode() + b"\x00" * 32 + b"\x00" * 16 + b"payload"
+        body = json.dumps({
+            "CiphertextBlob": base64.b64encode(blob).decode(),
+        }).encode()
+        assert self._arn("kms", body=body) == (
+            f"arn:aws:kms:us-east-1:000000000000:key/{key_id}")
+
+    def test_kms_unparseable_ciphertext_falls_back_to_star(self):
+        import base64
+        body = json.dumps({
+            "CiphertextBlob": base64.b64encode(b"too-short").decode(),
+        }).encode()
+        assert self._arn("kms", body=body) == "*"
+
+    def test_kms_explicit_key_id_wins_over_the_ciphertext(self):
+        import base64
+        blob = ("1234abcd-12ab-34cd-56ef-1234567890ab".encode()
+                + b"\x00" * 48 + b"payload")
+        body = json.dumps({
+            "KeyId": "alias/my-key",
+            "CiphertextBlob": base64.b64encode(blob).decode(),
+        }).encode()
+        assert self._arn("kms", body=body) == (
+            "arn:aws:kms:us-east-1:000000000000:alias/my-key")
+
+    def test_acm_certificate_arn_from_json_body(self):
+        arn = "arn:aws:acm:us-east-1:000000000000:certificate/abc"
+        body = json.dumps({"CertificateArn": arn}).encode()
+        assert self._arn("acm", body=body) == arn
+
+    def test_ssm_parameter_name_from_json_body(self):
+        body = json.dumps({"Name": "/app/db"}).encode()
+        assert self._arn("ssm", body=body) == (
+            "arn:aws:ssm:us-east-1:000000000000:parameter/app/db")
+
+    def test_cloudwatch_alarm_name_from_json_body(self):
+        body = json.dumps({"AlarmName": "cpu-high"}).encode()
+        assert self._arn("monitoring", body=body) == (
+            "arn:aws:cloudwatch:us-east-1:000000000000:alarm:cpu-high")
+
+
+# ---------------------------------------------------------------------------
+# CreateFunction with an unresolvable role (#1506)
+# ---------------------------------------------------------------------------
+
+def test_lambda_create_function_with_a_missing_role_answers_400(monkeypatch):
+    """The role check must reach the client, not blow up inside _build_config."""
+    import io
+    import zipfile
+
+    import ministack.app as app_mod
+    from ministack.services import lambda_svc
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("index.js", "exports.handler=async()=>({})")
+
+    monkeypatch.setattr(app_mod, "AUTH", True, raising=False)
+    name = "iam-auth-missing-role-fn"
+    status, _headers, body = lambda_svc._create_function({
+        "FunctionName": name,
+        "Runtime": "nodejs22.x",
+        "Handler": "index.handler",
+        "Role": "arn:aws:iam::000000000000:role/does-not-exist",
+        "Code": {"ZipFile": __import__("base64").b64encode(buf.getvalue()).decode()},
+    })
+    assert status == 400
+    payload = json.loads(body)
+    assert payload["__type"] == "InvalidParameterValueException"
+    assert "does-not-exist" in payload["message"]
+    # Nothing may be persisted for a function that was refused.
+    assert name not in lambda_svc._functions
+
+
+def test_lambda_build_config_returns_a_config_not_an_error(monkeypatch):
+    """_build_config is annotated -> dict; it must never return an error tuple."""
+    import ministack.app as app_mod
+    from ministack.services import lambda_svc
+
+    monkeypatch.setattr(app_mod, "AUTH", True, raising=False)
+    config = lambda_svc._build_config("f", {
+        "Runtime": "nodejs22.x",
+        "Handler": "index.handler",
+        "Role": "arn:aws:iam::000000000000:role/does-not-exist",
+    })
+    assert isinstance(config, dict)
+    assert config["FunctionName"] == "f"

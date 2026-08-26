@@ -1213,12 +1213,13 @@ def _resolve_object_checksums(body: bytes, headers: dict):
     """Build the stored checksum dict and validate any client-supplied values.
 
     AWS PutObject contract:
-      - `x-amz-checksum-{alg}` headers carry a client-computed value.
+      - `x-amz-checksum-{alg}` headers carry a client-computed value, which
+        the server recomputes from the body and MUST reject with `BadDigest`
+        (HTTP 400) when the two disagree.  A value that is never checked is
+        worse than none: it round-trips on Get as though the body had been
+        verified.
       - `x-amz-sdk-checksum-algorithm: ALG` asks the server to compute that
         algorithm; the resulting value is returned alongside the response.
-      - When the SDK both names an algorithm AND supplies its value, the
-        server-computed value MUST match the supplied one or the request is
-        rejected with `BadDigest` (HTTP 400).
 
     Ministack-specific: CRC32C requires an optional native library that the
     "no new dependencies" rule forbids us from adding. Rather than silently
@@ -1257,18 +1258,24 @@ def _resolve_object_checksums(body: bytes, headers: dict):
             400,
         )
 
+    # Every supplied value is verified against the body, whether or not the
+    # request also names an algorithm for the server to compute: the client
+    # asked for the object to be checked, and an unverified value would be
+    # stored and echoed as if it had been.
     checksums = dict(provided)
+    for alg, supplied in provided.items():
+        computed = _compute_s3_checksum(alg, body)
+        if computed is not None and supplied != computed:
+            return {}, _error(
+                "BadDigest",
+                f"The {alg} you specified did not match the calculated checksum.",
+                400,
+            )
+
     if sdk_alg_raw:
         sdk_key = sdk_alg_raw.upper().replace("_", "")
         computed = _compute_s3_checksum(sdk_alg_raw, body)
         if computed is not None:
-            existing = provided.get(sdk_key)
-            if existing and existing != computed:
-                return {}, _error(
-                    "BadDigest",
-                    f"The {sdk_key} you specified did not match the calculated checksum.",
-                    400,
-                )
             checksums[sdk_key] = computed
     return checksums, None
 
