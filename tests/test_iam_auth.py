@@ -1024,6 +1024,12 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("pipes", "GET", "/v1/pipes/my-pipe", {}, b"", {}, "us-east-1", "123") == "arn:aws:pipes:us-east-1:123:pipe/my-pipe"
 
+    def test_location_tracker(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("location", "GET", "/tracking/v0/trackers/fleet", {}, b"", {}, "us-east-1", "123") == "arn:aws:geo:us-east-1:123:tracker/fleet"
+        assert extract_resource_arn("location", "POST", "/tracking/v0/trackers/fleet/positions", {}, b"", {}, "us-east-1", "123") == "arn:aws:geo:us-east-1:123:tracker/fleet"
+        assert extract_resource_arn("location", "POST", "/tracking/v0/list-trackers", {}, b"", {}, "us-east-1", "123") == "*"
+
     def test_mq_broker(self):
         from ministack.core.iam_actions import extract_resource_arn
         assert "mq" in extract_resource_arn("mq", "GET", "/v1/brokers/my-broker", {}, b"", {}, "us-east-1", "123")

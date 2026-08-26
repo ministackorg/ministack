@@ -78,6 +78,7 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "kms": "kms",
     "lambda": "lambda",
     "lambda-microvms": "lambda",
+    "location": "geo",
     "logs": "logs",
     "mediaconnect": "mediaconnect",
     "monitoring": "cloudwatch",
@@ -441,6 +442,7 @@ _BOTOCORE_SERVICE_MAP: dict[str, list[str]] = {
     "iot-data": ["iot-data"],
     "iot-jobs-data": ["iot-jobs-data"],
     "kafka": ["kafka"],
+    "location": ["location"],
     "mediaconnect": ["mediaconnect"],
     "mq": ["mq"],
     "airflow": ["mwaa"],
@@ -1207,6 +1209,15 @@ def extract_resource_arn(service: str, method: str, path: str,
             pi = parts.index("pipes")
             if pi + 1 < len(parts):
                 return f"arn:aws:pipes:{region}:{account_id}:pipe/{parts[pi + 1]}"
+        return "*"
+
+    if service == "location":
+        # /tracking/v0/trackers/{TrackerName}[/...]; the ARN service is geo.
+        parts = [p for p in path.split("/") if p]
+        if "trackers" in parts:
+            ti = parts.index("trackers")
+            if ti + 1 < len(parts):
+                return f"arn:aws:geo:{region}:{account_id}:tracker/{parts[ti + 1]}"
         return "*"
 
     if service == "mq":

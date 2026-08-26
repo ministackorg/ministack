@@ -445,6 +445,7 @@ subnet = ec2.create_subnet(
 | **Cost & Usage Reports** | DeleteReportDefinition, DescribeReportDefinitions, ListTagsForResource, ModifyReportDefinition, PutReportDefinition, TagResource, UntagResource | 7 of 7 spec ops |
 | **Inspector2** | Enable, Disable, ListFindings, BatchGetFindingDetails, ListCoverage, ListCoverageStatistics, ListFindingAggregations, SearchVulnerabilities, TagResource, UntagResource, ListTagsForResource, CreateFilter, ListFilters, DeleteFilter | 14 operations; deterministic stub vulnerability findings for ECR images, Lambda functions, and EC2 instances; filtering, sorting, pagination |
 | **AmazonMQ** | CreateBroker, ListBrokers, DescribeBrokers, DeleteBrokers, UpdateBroker, RebootBroker, DescribeBrokerEngineTypes, DescribeBrokerInstanceOptions, CreateTags, ListTags, DeleteTags, CreateUser, DeleteUser, ListUsers, UpdateUser, DescribeUser | 16 of 24 spec ops; No real container support |
+| **Amazon Location (trackers)** | CreateTracker, DescribeTracker, UpdateTracker, ListTrackers, DeleteTracker, BatchUpdateDevicePosition, GetDevicePosition, BatchGetDevicePosition, GetDevicePositionHistory | Tracker control plane + in-memory device-position store; signs with credential scope `geo` (the client is named `location`); ISO 8601 `SampleTime`/`ReceivedTime`, `Position` as the modeled `[lon, lat]` double pair, out-of-range coordinates as per-entry `Errors`; `GetDevicePositionHistory` ascending, defaulting to the last 24 h; `ListTrackers` and the history page at `MaxResults` 1..100 with `NextToken`; every sample is stored (no position filtering, no 30-day expiry), newest 100 per device; `KmsKeyId`/`PositionFiltering`/`EventBridgeEnabled`/`Tags` stored without effect; no consumers, geofences, maps, places or routes; CFN `AWS::Location::Tracker` supported |
 
 
 
@@ -560,6 +561,7 @@ subnet = ec2.create_subnet(
 | `AWS::AutoScaling::ScheduledAction` | Action ARN | Arn, ScheduledActionName |
 | `AWS::Scheduler::Schedule` | Schedule name | Arn |
 | `AWS::Scheduler::ScheduleGroup` | Group name | Arn |
+| `AWS::Location::Tracker` | Tracker name | Arn, TrackerArn, CreateTime, UpdateTime |
 | `AWS::CloudFormation::WaitCondition` | Condition ID | Data, Id |
 | `AWS::CloudFormation::WaitConditionHandle` | Signal URL | Id |
 | `AWS::CloudFormation::Stack` (nested) | Child stack ARN | `Outputs.<Name>` — each child stack Output |

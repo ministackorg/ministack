@@ -331,3 +331,28 @@ def test_ministack_host_env_is_a_served_suffix(monkeypatch):
 def test_container_hostname_is_a_served_suffix(monkeypatch):
     monkeypatch.setenv("HOSTNAME", "core-7f3a")
     assert detect_service("GET", "/status", {"host": "sns.core-7f3a:4566"}, {}) == "sns"
+
+
+def test_location_credential_scope_routes():
+    """Amazon Location signs with credential scope `geo`, not `location`
+    (botocore signingName). Under an endpoint override the host carries no
+    `geo.` — the scope map is the only routing signal left."""
+    assert detect_service(
+        "POST", "/tracking/v0/trackers", _sigv4_headers("geo"), {}
+    ) == "location"
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        # The modeled per-operation host prefixes in front of geo.{region}:
+        # `cp.tracking.` on the tracker control plane...
+        "cp.tracking.geo.us-east-1.localhost:4566",
+        # ...and `tracking.` on the device-position data plane.
+        "tracking.geo.us-east-1.localhost:4566",
+    ],
+)
+def test_location_host_routes(host):
+    assert detect_service(
+        "POST", "/tracking/v0/trackers", {"host": host}, {}
+    ) == "location"
