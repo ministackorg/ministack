@@ -1298,10 +1298,6 @@ def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
         env["Variables"] = {}
 
     role_arn = data.get("Role", f"arn:aws:iam::{get_account_id()}:role/lambda-role")
-    from ministack.core.iam_evaluator import validate_role_arn
-    role_err = validate_role_arn(role_arn)
-    if role_err:
-        return error_response_json("InvalidParameterValueException", role_err, 400)
 
     config = {
         "FunctionName": name,
@@ -1963,6 +1959,15 @@ def _create_function(data: dict):
     if data.get("Layers") is not None:
         data = dict(data)
         data["Layers"] = layers_cfg
+
+    # Validate the execution role before building anything: _build_config
+    # returns a config dict, so the error has to be raised by the caller, and
+    # nothing may be persisted for a function that is going to be refused.
+    from ministack.core.iam_evaluator import validate_role_arn
+    role_err = validate_role_arn(
+        data.get("Role", f"arn:aws:iam::{get_account_id()}:role/lambda-role"))
+    if role_err:
+        return error_response_json("InvalidParameterValueException", role_err, 400)
 
     config = _build_config(name, data, code_zip)
     if image_uri:
