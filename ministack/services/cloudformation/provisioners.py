@@ -3356,7 +3356,7 @@ def _cognito_user_pool_create(logical_id, props, stack_name):
                 "TemporaryPasswordValidityDays": 7,
             }
         }),
-        "Schema": props.get("Schema", []),
+        "SchemaAttributes": _cognito._build_schema_attributes(props.get("Schema")),
         "AutoVerifiedAttributes": props.get("AutoVerifiedAttributes", []),
         "AliasAttributes": props.get("AliasAttributes", []),
         "UsernameAttributes": props.get("UsernameAttributes", []),
