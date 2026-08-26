@@ -10679,3 +10679,12 @@ def handler(event, context):
         f"throttled={results.count('throttled')}, error={results.count('error')})"
     )
     assert results.count("ok") > 0, "no invocation succeeded at all"
+
+
+def test_lambda_invoke_with_response_stream_missing_function_is_plain_error(lam):
+    """An HTTP-level failure never streams: AWS answers a plain JSON
+    ResourceNotFoundException, and an eventstream-framed error body would
+    crash the SDK's stream parser with a decode error."""
+    with pytest.raises(ClientError) as exc:
+        lam.invoke_with_response_stream(FunctionName="stream-does-not-exist")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"

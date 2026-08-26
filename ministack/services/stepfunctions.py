@@ -325,7 +325,15 @@ def _create_state_machine(data):
                 and data.get("loggingConfiguration",
                              {"level": "OFF", "includeExecutionData": False})
                 == existing["loggingConfiguration"]
-                and publishes == bool(existing.get("createVersionArn"))):
+                and publishes == bool(existing.get("createVersionArn"))
+                # AWS's idempotency check also covers versionDescription: a
+                # publishing re-create carrying a different description is a
+                # different machine, not a retry.
+                and (not publishes
+                     or data.get("versionDescription", "")
+                     == _state_machine_versions.get(
+                         existing.get("createVersionArn") or "", {}
+                     ).get("description", ""))):
             response = {"stateMachineArn": arn, "creationDate": existing["creationDate"]}
             if publishes:
                 response["stateMachineVersionArn"] = existing["createVersionArn"]
@@ -408,11 +416,17 @@ def _delete_state_machine(data):
     return json_response({})
 
 
+# Bookkeeping the machine record carries that is NOT part of AWS's
+# DescribeStateMachine response shape and must never reach a caller.
+_SM_INTERNAL_KEYS = frozenset({"createVersionArn", "lastVersionNumber"})
+
+
 def _describe_state_machine(data):
     arn = data.get("stateMachineArn")
     sm = _state_machines.get(arn)
     if sm:
-        return json_response(sm)
+        return json_response({k: v for k, v in sm.items()
+                              if k not in _SM_INTERNAL_KEYS})
     # AWS's DescribeStateMachine also accepts a qualified version ARN
     # (arn:...:stateMachine:<name>:<N>) and returns the snapshot
     # captured at publish time, with stateMachineArn echoing the
