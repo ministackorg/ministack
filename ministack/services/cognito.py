@@ -3127,14 +3127,33 @@ def _admin_list_groups_for_user(data):
 
 
 def _admin_list_user_auth_events(data):
+    """List a user's auth events, gated on user-pool add-ons as real Cognito is.
+
+    Auth events are never recorded here (there is no event store), so a pool
+    with add-ons enabled always answers an empty list. A pool without add-ons
+    (AdvancedSecurityMode OFF or UserPoolAddOns absent) is refused with
+    UserPoolAddOnNotEnabledException. The add-on gate fires before the user is
+    resolved — measured against the live service (2026-08-26): an unknown user
+    in a pool without add-ons gets the add-on error, not UserNotFound.
+    """
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
     if err:
         return err
+    if (pool.get("UserPoolAddOns") or {}).get("AdvancedSecurityMode", "OFF") == "OFF":
+        return error_response_json(
+            "UserPoolAddOnNotEnabledException",
+            "This is an add on feature. Please update AdvancedSecurityMode"
+            " for your user pool to access this API.",
+            400,
+        )
     username = data.get("Username")
-    _, err = _resolve_user(pool, username)
-    if err:
-        return err
+    user, _ = _resolve_user(pool, username)
+    if user is None:
+        # Real AWS answers this op with the plain message, without the name.
+        return error_response_json(
+            "UserNotFoundException", "User does not exist.", 400,
+        )
     return json_response({"AuthEvents": []})
 
 
