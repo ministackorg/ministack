@@ -292,6 +292,37 @@ def test_iot_thing_group_membership(iot_client):
     iot_client.delete_thing_group(thingGroupName=gname)
 
 
+def test_iot_list_thing_groups_for_thing(iot_client):
+    tname = _unique("thing")
+    g1 = _unique("group")
+    g2 = _unique("group")
+    iot_client.create_thing(thingName=tname)
+    iot_client.create_thing_group(thingGroupName=g1)
+    iot_client.create_thing_group(thingGroupName=g2)
+
+    # A thing in no groups answers an empty list, not an error.
+    assert iot_client.list_thing_groups_for_thing(thingName=tname)["thingGroups"] == []
+
+    iot_client.add_thing_to_thing_group(thingGroupName=g1, thingName=tname)
+    iot_client.add_thing_to_thing_group(thingGroupName=g2, thingName=tname)
+    groups = iot_client.list_thing_groups_for_thing(thingName=tname)["thingGroups"]
+    assert {g["groupName"] for g in groups} == {g1, g2}
+    for g in groups:
+        assert g["groupArn"].endswith(":thinggroup/" + g["groupName"])
+
+    iot_client.remove_thing_from_thing_group(thingGroupName=g1, thingName=tname)
+    remaining = iot_client.list_thing_groups_for_thing(thingName=tname)["thingGroups"]
+    assert [g["groupName"] for g in remaining] == [g2]
+
+    with pytest.raises(ClientError) as ei:
+        iot_client.list_thing_groups_for_thing(thingName=_unique("absent"))
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    iot_client.delete_thing(thingName=tname)
+    iot_client.delete_thing_group(thingGroupName=g1)
+    iot_client.delete_thing_group(thingGroupName=g2)
+
+
 # ---------------------------------------------------------------------------
 # Certificates (issued via the Local CA)
 # ---------------------------------------------------------------------------
