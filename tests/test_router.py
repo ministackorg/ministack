@@ -144,3 +144,47 @@ def test_iot_jobs_data_host_routes_before_iot(host):
     assert detect_service(
         "GET", "/things/t1/jobs/$next", {"host": host}, {}
     ) == "iot-jobs-data"
+
+
+def test_iotwireless_credential_scope_routes():
+    """boto3 signs GetPositionEstimate with the `iotwireless` scope
+    (botocore signingName); the scope early-return resolves it directly."""
+    assert detect_service(
+        "POST", "/position-estimate", _sigv4_headers("iotwireless"), {}
+    ) == "iotwireless"
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        # The real endpoint prefix: api.iotwireless.{region}.
+        "api.iotwireless.us-east-1.localhost:4566",
+        "iotwireless.us-east-1.localhost:4566",
+    ],
+)
+def test_iotwireless_host_routes(host):
+    assert detect_service(
+        "POST", "/position-estimate", {"host": host}, {}
+    ) == "iotwireless"
+
+
+def test_iotwireless_host_does_not_disturb_iot_family():
+    """`api.iotwireless.` never contains the literal `iot.` segment, so there
+    is no overlap with the iot control-plane regex in either direction — pin
+    that the iot family still resolves as before."""
+    assert detect_service(
+        "GET", "/things", {"host": "iot.us-east-1.localhost:4566"}, {}
+    ) == "iot"
+    assert detect_service(
+        "GET",
+        "/things/t1/jobs/$next",
+        {"host": "a1b2c3.jobs.iot.us-east-1.localhost:4566"},
+        {},
+    ) == "iot-jobs-data"
+
+
+def test_iotwireless_unsigned_path_routes_post_only():
+    """An unsigned POST resolves by path; a GET of the same path stays on the
+    S3 fallback (an object may legitimately be named `position-estimate`)."""
+    assert detect_service("POST", "/position-estimate", _HEADERS, {}) == "iotwireless"
+    assert detect_service("GET", "/position-estimate", _HEADERS, {}) == "s3"
