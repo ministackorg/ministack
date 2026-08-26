@@ -2895,6 +2895,133 @@ def test_eventbridge_input_transformer_ingestion_time(eb, sqs):
 
 
 # ---------------------------------------------------------------------------
+# Input template quoting
+# ---------------------------------------------------------------------------
+
+def _transform_to_queue(eb, sqs, slug, source, template, paths_map, detail):
+    """Route one event through an input transformer and return the delivered body."""
+    bus_name = f"qa-eb-{slug}-bus"
+    eb.create_event_bus(Name=bus_name)
+    q_url = sqs.create_queue(QueueName=f"qa-eb-{slug}-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name=f"qa-eb-{slug}-rule",
+        EventBusName=bus_name,
+        EventPattern=json.dumps({"source": [source]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule=f"qa-eb-{slug}-rule",
+        EventBusName=bus_name,
+        Targets=[
+            {
+                "Id": "t1",
+                "Arn": q_arn,
+                "InputTransformer": {"InputPathsMap": paths_map, "InputTemplate": template},
+            }
+        ],
+    )
+    eb.put_events(
+        Entries=[
+            {
+                "Source": source,
+                "DetailType": "TestEvent",
+                "Detail": json.dumps(detail),
+                "EventBusName": bus_name,
+            }
+        ]
+    )
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert len(msgs.get("Messages", [])) == 1
+    return msgs["Messages"][0]["Body"]
+
+
+def test_eventbridge_input_template_quotes_unquoted_string_variable(eb, sqs):
+    """Quotes around a string variable are optional; AWS adds them in a value position."""
+    body = _transform_to_queue(
+        eb,
+        sqs,
+        "tmpl-unquoted-str",
+        "myapp.tmpl.unquoted",
+        '{"widgetId": <widgetId>, "state": <state>}',
+        {"widgetId": "$.detail.widgetId", "state": "$.detail.state"},
+        {"widgetId": "widget-1", "state": "READY"},
+    )
+    assert json.loads(body) == {"widgetId": "widget-1", "state": "READY"}
+
+
+def test_eventbridge_input_template_mixes_unquoted_object_and_string(eb, sqs):
+    """An unquoted object variable stays raw JSON while a string variable gains quotes."""
+    detail = {"widgetId": "widget-2", "quantity": 3}
+    body = _transform_to_queue(
+        eb,
+        sqs,
+        "tmpl-mixed",
+        "myapp.tmpl.mixed",
+        '{"detail": <detail>, "groupId": <groupId>}',
+        {"groupId": "$.detail.widgetId", "detail": "$.detail"},
+        detail,
+    )
+    assert json.loads(body) == {"detail": detail, "groupId": "widget-2"}
+
+
+def test_eventbridge_input_template_quoted_string_variable_unchanged(eb, sqs):
+    """Explicitly quoting a string variable still yields a single set of quotes."""
+    body = _transform_to_queue(
+        eb,
+        sqs,
+        "tmpl-quoted-str",
+        "myapp.tmpl.quoted",
+        '{"groupId": "<groupId>"}',
+        {"groupId": "$.detail.widgetId"},
+        {"widgetId": "widget-3"},
+    )
+    assert json.loads(body) == {"groupId": "widget-3"}
+
+
+def test_eventbridge_input_template_variable_inside_string_literal(eb, sqs):
+    """A variable embedded in surrounding text is interpolated without added quotes."""
+    body = _transform_to_queue(
+        eb,
+        sqs,
+        "tmpl-inline",
+        "myapp.tmpl.inline",
+        '{"message": "widget <widgetId> is <state>", "state": <state>}',
+        {"widgetId": "$.detail.widgetId", "state": "$.detail.state"},
+        {"widgetId": "widget-4", "state": "READY"},
+    )
+    assert json.loads(body) == {"message": "widget widget-4 is READY", "state": "READY"}
+
+
+def test_eventbridge_input_template_plain_text(eb, sqs):
+    """A template with no JSON quoting is delivered as plain interpolated text."""
+    body = _transform_to_queue(
+        eb,
+        sqs,
+        "tmpl-plain",
+        "myapp.tmpl.plain",
+        "widget <widgetId> is <state>",
+        {"widgetId": "$.detail.widgetId", "state": "$.detail.state"},
+        {"widgetId": "widget-5", "state": "READY"},
+    )
+    assert body == "widget widget-5 is READY"
+
+
+def test_eventbridge_input_template_object_inside_string_literal(eb, sqs):
+    """An object variable used inside a string has its quotes stripped, as AWS does."""
+    body = _transform_to_queue(
+        eb,
+        sqs,
+        "tmpl-obj-in-str",
+        "myapp.tmpl.objinstr",
+        '{"message": "detail is <detail>"}',
+        {"detail": "$.detail"},
+        {"widgetId": "widget-6"},
+    )
+    assert json.loads(body) == {"message": "detail is {widgetId: widget-6}"}
+
+
+# ---------------------------------------------------------------------------
 # API destination dispatch
 # ---------------------------------------------------------------------------
 

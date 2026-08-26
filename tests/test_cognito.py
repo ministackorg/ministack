@@ -464,6 +464,10 @@ def test_cognito_mfa_config(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="MfaPool")["UserPool"]["Id"]
     resp = cognito_idp.get_user_pool_mfa_config(UserPoolId=pid)
     assert resp["MfaConfiguration"] == "OFF"
+    # An unconfigured pool reports no MFA blocks at all; inventing a disabled
+    # SoftwareTokenMfaConfiguration reads as drift to a config-diffing client.
+    assert "SoftwareTokenMfaConfiguration" not in resp
+    assert "SmsMfaConfiguration" not in resp
 
     cognito_idp.set_user_pool_mfa_config(
         UserPoolId=pid,
@@ -473,6 +477,128 @@ def test_cognito_mfa_config(cognito_idp):
     resp = cognito_idp.get_user_pool_mfa_config(UserPoolId=pid)
     assert resp["MfaConfiguration"] == "OPTIONAL"
     assert resp["SoftwareTokenMfaConfiguration"]["Enabled"] is True
+
+def test_cognito_user_pool_returns_standard_schema_attributes(cognito_idp):
+    pool = cognito_idp.create_user_pool(PoolName="SchemaStandardPool")["UserPool"]
+    attrs = {a["Name"]: a for a in pool["SchemaAttributes"]}
+    # AWS always returns the full standard OIDC attribute set.
+    for name in ("sub", "name", "given_name", "family_name", "email",
+                 "email_verified", "phone_number", "address", "updated_at"):
+        assert name in attrs
+    assert attrs["sub"] == {
+        "Name": "sub",
+        "AttributeDataType": "String",
+        "DeveloperOnlyAttribute": False,
+        "Mutable": False,
+        "Required": True,
+        "StringAttributeConstraints": {"MinLength": "1", "MaxLength": "2048"},
+    }
+    assert attrs["email_verified"]["AttributeDataType"] == "Boolean"
+    assert "StringAttributeConstraints" not in attrs["email_verified"]
+    assert attrs["updated_at"]["NumberAttributeConstraints"] == {"MinValue": "0"}
+    assert attrs["birthdate"]["StringAttributeConstraints"] == {
+        "MinLength": "10", "MaxLength": "10"}
+
+
+def test_cognito_user_pool_schema_request_is_echoed_by_describe(cognito_idp):
+    pool = cognito_idp.create_user_pool(
+        PoolName="SchemaEchoPool",
+        Schema=[
+            {"Name": "email", "AttributeDataType": "String", "Mutable": True,
+             "Required": True,
+             "StringAttributeConstraints": {"MinLength": "1", "MaxLength": "256"}},
+            {"Name": "tenant", "AttributeDataType": "String", "Mutable": True,
+             "StringAttributeConstraints": {"MinLength": "1", "MaxLength": "32"}},
+        ],
+    )["UserPool"]
+    described = cognito_idp.describe_user_pool(
+        UserPoolId=pool["Id"])["UserPool"]["SchemaAttributes"]
+    assert described == pool["SchemaAttributes"]
+    attrs = {a["Name"]: a for a in described}
+    # A standard attribute the request redefines keeps the caller's values ...
+    assert attrs["email"]["Required"] is True
+    assert attrs["email"]["StringAttributeConstraints"] == {
+        "MinLength": "1", "MaxLength": "256"}
+    # ... and a new attribute is stored under its custom: prefix.
+    assert "tenant" not in attrs
+    assert attrs["custom:tenant"]["Mutable"] is True
+    assert attrs["custom:tenant"]["Required"] is False
+    assert attrs["custom:tenant"]["DeveloperOnlyAttribute"] is False
+
+
+def test_cognito_user_pool_developer_only_attribute_gets_dev_prefix(cognito_idp):
+    pool = cognito_idp.create_user_pool(
+        PoolName="SchemaDevPool",
+        Schema=[{"Name": "internal", "AttributeDataType": "String",
+                 "DeveloperOnlyAttribute": True}],
+    )["UserPool"]
+    names = [a["Name"] for a in pool["SchemaAttributes"]]
+    assert "dev:internal" in names
+
+
+def test_cognito_add_custom_attributes(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="AddCustomAttrPool")["UserPool"]["Id"]
+    cognito_idp.add_custom_attributes(
+        UserPoolId=pid,
+        CustomAttributes=[
+            {"Name": "deliverables", "AttributeDataType": "String", "Mutable": True,
+             "StringAttributeConstraints": {"MinLength": "1", "MaxLength": "255"}},
+            {"Name": "seats", "AttributeDataType": "Number",
+             "NumberAttributeConstraints": {"MinValue": "1"}},
+        ],
+    )
+    attrs = {a["Name"]: a for a in
+             cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]["SchemaAttributes"]}
+    assert attrs["custom:deliverables"]["StringAttributeConstraints"] == {
+        "MinLength": "1", "MaxLength": "255"}
+    assert attrs["custom:seats"]["AttributeDataType"] == "Number"
+    assert attrs["custom:seats"]["NumberAttributeConstraints"] == {"MinValue": "1"}
+
+
+def test_cognito_add_custom_attributes_rejects_duplicate(cognito_idp):
+    pid = cognito_idp.create_user_pool(
+        PoolName="AddCustomAttrDupPool",
+        Schema=[{"Name": "tenant", "AttributeDataType": "String"}],
+    )["UserPool"]["Id"]
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.add_custom_attributes(
+            UserPoolId=pid,
+            CustomAttributes=[{"Name": "tenant", "AttributeDataType": "String"}],
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+
+def test_cognito_add_custom_attributes_rejects_standard_attribute(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="AddCustomAttrStdPool")["UserPool"]["Id"]
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.add_custom_attributes(
+            UserPoolId=pid,
+            CustomAttributes=[{"Name": "email", "AttributeDataType": "String"}],
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+
+def test_cognito_add_custom_attributes_unknown_pool(cognito_idp):
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.add_custom_attributes(
+            UserPoolId="us-east-1_missingpool",
+            CustomAttributes=[{"Name": "tenant", "AttributeDataType": "String"}],
+        )
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_cognito_email_configuration_defaults_to_cognito_default(cognito_idp):
+    empty_pool = cognito_idp.create_user_pool(PoolName="EmailCfgEmptyPool")["UserPool"]
+    assert empty_pool["EmailConfiguration"]["EmailSendingAccount"] == "COGNITO_DEFAULT"
+
+    pool = cognito_idp.create_user_pool(
+        PoolName="EmailCfgPool",
+        EmailConfiguration={"ReplyToEmailAddress": "reply@example.com"},
+    )["UserPool"]
+    assert pool["EmailConfiguration"]["EmailSendingAccount"] == "COGNITO_DEFAULT"
+    described = cognito_idp.describe_user_pool(UserPoolId=pool["Id"])["UserPool"]
+    assert described["EmailConfiguration"]["EmailSendingAccount"] == "COGNITO_DEFAULT"
+
 
 def test_cognito_tags(cognito_idp):
     resp = cognito_idp.create_user_pool(PoolName="TagPool")
@@ -7353,3 +7479,255 @@ def test_cognito_saml_authn_request_acs_uses_custom_domain(cognito_idp):
     xml = zlib.decompress(base64.b64decode(saml_request), -15).decode()
     assert f'AssertionConsumerServiceURL="https://{domain}/saml2/idpresponse"' in xml
     assert f'urn:amazon:cognito:sp:{pid}' in xml
+
+
+# ---------------------------------------------------------------------------
+# Linking federated users to an existing profile (#1499)
+# ---------------------------------------------------------------------------
+
+def _saml_sign_in(cid, name_id, attributes):
+    """Drive /oauth2/authorize -> /saml2/idpresponse -> /oauth2/token."""
+    url = (
+        f"{ENDPOINT}/oauth2/authorize?"
+        f"response_type=code&client_id={cid}"
+        f"&redirect_uri=http://localhost:3000/callback"
+        f"&identity_provider=TestSAML&state=mystate&scope=openid"
+    )
+    try:
+        _no_redirect_opener.open(url)
+        raise AssertionError("Expected redirect")
+    except urllib.error.HTTPError as e:
+        location = e.headers.get("Location", "")
+    relay_state = _parse_qs(urlparse(location).query).get("RelayState", [""])[0]
+
+    form = _urlencode({
+        "SAMLResponse": _build_mock_saml_response(name_id, attributes),
+        "RelayState": relay_state,
+    }).encode()
+    req = urllib.request.Request(
+        f"{ENDPOINT}/saml2/idpresponse", data=form,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        _no_redirect_opener.open(req)
+        raise AssertionError("Expected redirect")
+    except urllib.error.HTTPError as e:
+        callback = e.headers.get("Location", "")
+    code = _parse_qs(urlparse(callback).query).get("code", [""])[0]
+
+    token_req = urllib.request.Request(
+        f"{ENDPOINT}/oauth2/token",
+        data=(f"grant_type=authorization_code&code={code}&client_id={cid}"
+              f"&redirect_uri=http://localhost:3000/callback").encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(token_req) as resp:
+        tokens = json.loads(resp.read())
+    payload = tokens["id_token"].split(".")[1]
+    payload += "=" * (4 - len(payload) % 4)
+    return json.loads(base64.urlsafe_b64decode(payload))
+
+
+def test_cognito_admin_link_provider_writes_identities_attribute(cognito_idp):
+    pid, _cid = _setup_saml_pool(cognito_idp)
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="carlos", MessageAction="SUPPRESS",
+        UserAttributes=[{"Name": "email", "Value": "msp_carlos@example.com"}],
+    )
+
+    assert cognito_idp.admin_link_provider_for_user(
+        UserPoolId=pid,
+        DestinationUser={"ProviderName": "Cognito", "ProviderAttributeValue": "carlos"},
+        SourceUser={"ProviderName": "TestSAML", "ProviderAttributeName": "email",
+                    "ProviderAttributeValue": "msp_carlos@example.com"},
+    )["ResponseMetadata"]["HTTPStatusCode"] == 200
+
+    attrs = {a["Name"]: a["Value"] for a in cognito_idp.admin_get_user(
+        UserPoolId=pid, Username="carlos")["UserAttributes"]}
+    identities = json.loads(attrs["identities"])
+    assert len(identities) == 1
+    identity = identities[0]
+    assert identity["userId"] == "msp_carlos@example.com"
+    assert identity["providerName"] == "TestSAML"
+    assert identity["providerType"] == "SAML"
+    # A linked identity is never the profile's primary one.
+    assert identity["primary"] is False
+    assert isinstance(identity["dateCreated"], int)
+    assert set(identity) == {
+        "userId", "providerName", "providerType", "issuer", "primary",
+        "dateCreated",
+    }
+
+
+def test_cognito_linked_federated_sign_in_resolves_to_the_local_profile(
+    cognito_idp,
+):
+    """A linked user signs in to the profile they were linked to, not a new one."""
+    pid, cid = _setup_saml_pool(cognito_idp)
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="carlos", MessageAction="SUPPRESS",
+        UserAttributes=[{"Name": "email", "Value": "msp_carlos@example.com"}],
+    )
+    native_sub = {a["Name"]: a["Value"] for a in cognito_idp.admin_get_user(
+        UserPoolId=pid, Username="carlos")["UserAttributes"]}["sub"]
+
+    cognito_idp.admin_link_provider_for_user(
+        UserPoolId=pid,
+        DestinationUser={"ProviderName": "Cognito", "ProviderAttributeValue": "carlos"},
+        SourceUser={"ProviderName": "TestSAML",
+                    "ProviderAttributeName": "Cognito_Subject",
+                    "ProviderAttributeValue": "msp_carlos@example.com"},
+    )
+
+    claims = _saml_sign_in(cid, "msp_carlos@example.com", {
+        "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress":
+            "msp_carlos@example.com",
+        "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name": "Carlos",
+    })
+
+    # "After Amazon Cognito matches your federated user to a linked profile,
+    # they always sign in to that profile."
+    assert claims["sub"] == native_sub
+    assert claims["cognito:username"] == "carlos"
+    # "Your user's ID token contains all of their associated providers in the
+    # identities claim."
+    assert isinstance(claims["identities"], list)
+    assert claims["identities"][0]["providerName"] == "TestSAML"
+
+    # No second `{Provider}_id` profile was minted.
+    with pytest.raises(ClientError) as exc_info:
+        cognito_idp.admin_get_user(
+            UserPoolId=pid, Username="TestSAML_msp_carlos@example.com")
+    assert exc_info.value.response["Error"]["Code"] == "UserNotFoundException"
+
+    # "Your user pool then updates the linked local profile with the claims
+    # mapped from their sign-in."
+    attrs = {a["Name"]: a["Value"] for a in cognito_idp.admin_get_user(
+        UserPoolId=pid, Username="carlos")["UserAttributes"]}
+    assert attrs["name"] == "Carlos"
+
+
+def test_cognito_unlinked_federated_sign_in_still_creates_its_own_profile(
+    cognito_idp,
+):
+    pid, cid = _setup_saml_pool(cognito_idp)
+    claims = _saml_sign_in(cid, "stranger@example.com", {
+        "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress":
+            "stranger@example.com",
+    })
+    user = cognito_idp.admin_get_user(
+        UserPoolId=pid, Username="TestSAML_stranger@example.com")
+    assert user["UserStatus"] == "EXTERNAL_PROVIDER"
+    assert claims["cognito:username"] == "TestSAML_stranger@example.com"
+
+
+def test_cognito_admin_disable_provider_unlinks_and_restores_new_profiles(
+    cognito_idp,
+):
+    pid, cid = _setup_saml_pool(cognito_idp)
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="carlos", MessageAction="SUPPRESS",
+        UserAttributes=[{"Name": "email", "Value": "msp_carlos@example.com"}],
+    )
+    source = {"ProviderName": "TestSAML",
+              "ProviderAttributeName": "Cognito_Subject",
+              "ProviderAttributeValue": "msp_carlos@example.com"}
+    cognito_idp.admin_link_provider_for_user(
+        UserPoolId=pid,
+        DestinationUser={"ProviderName": "Cognito", "ProviderAttributeValue": "carlos"},
+        SourceUser=source,
+    )
+    cognito_idp.admin_disable_provider_for_user(UserPoolId=pid, User=source)
+
+    attrs = {a["Name"]: a["Value"] for a in cognito_idp.admin_get_user(
+        UserPoolId=pid, Username="carlos")["UserAttributes"]}
+    assert "identities" not in attrs
+
+    # Unlinked again, the same sign-in mints its own federated profile.
+    _saml_sign_in(cid, "msp_carlos@example.com", {
+        "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress":
+            "msp_carlos@example.com",
+    })
+    assert cognito_idp.admin_get_user(
+        UserPoolId=pid, Username="TestSAML_msp_carlos@example.com",
+    )["UserStatus"] == "EXTERNAL_PROVIDER"
+
+    with pytest.raises(ClientError) as exc_info:
+        cognito_idp.admin_disable_provider_for_user(UserPoolId=pid, User=source)
+    assert exc_info.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_cognito_admin_link_provider_errors(cognito_idp):
+    pid, _cid = _setup_saml_pool(cognito_idp)
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="carlos", MessageAction="SUPPRESS",
+        UserAttributes=[{"Name": "email", "Value": "msp_carlos@example.com"}],
+    )
+    dest = {"ProviderName": "Cognito", "ProviderAttributeValue": "carlos"}
+
+    def source(value, provider="TestSAML", attribute="Cognito_Subject"):
+        return {"ProviderName": provider, "ProviderAttributeName": attribute,
+                "ProviderAttributeValue": value}
+
+    with pytest.raises(ClientError) as exc_info:
+        cognito_idp.admin_link_provider_for_user(
+            UserPoolId=pid,
+            DestinationUser={"ProviderName": "Cognito",
+                             "ProviderAttributeValue": "nobody"},
+            SourceUser=source("a"))
+    assert exc_info.value.response["Error"]["Code"] == "UserNotFoundException"
+
+    # "This user must be a federated user ... not another native user."
+    with pytest.raises(ClientError) as exc_info:
+        cognito_idp.admin_link_provider_for_user(
+            UserPoolId=pid, DestinationUser=dest,
+            SourceUser=source("carlos", provider="Cognito"))
+    assert exc_info.value.response["Error"]["Code"] == "InvalidParameterException"
+
+    # Relinking the same pair is a no-op; relinking to another profile is not.
+    cognito_idp.admin_link_provider_for_user(
+        UserPoolId=pid, DestinationUser=dest, SourceUser=source("dup"))
+    cognito_idp.admin_link_provider_for_user(
+        UserPoolId=pid, DestinationUser=dest, SourceUser=source("dup"))
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="other", MessageAction="SUPPRESS")
+    with pytest.raises(ClientError) as exc_info:
+        cognito_idp.admin_link_provider_for_user(
+            UserPoolId=pid,
+            DestinationUser={"ProviderName": "Cognito",
+                             "ProviderAttributeValue": "other"},
+            SourceUser=source("dup"))
+    assert exc_info.value.response["Error"]["Code"] == "AliasExistsException"
+
+    # "You can link up to five federated users to each user profile."
+    for i in range(4):
+        cognito_idp.admin_link_provider_for_user(
+            UserPoolId=pid, DestinationUser=dest, SourceUser=source(f"extra-{i}"))
+    with pytest.raises(ClientError) as exc_info:
+        cognito_idp.admin_link_provider_for_user(
+            UserPoolId=pid, DestinationUser=dest, SourceUser=source("one-too-many"))
+    assert exc_info.value.response["Error"]["Code"] == "LimitExceededException"
+
+
+def test_cognito_admin_link_provider_rejects_an_already_signed_in_user(
+    cognito_idp,
+):
+    """"To link a federated user who has previously signed in, you must first
+    delete their existing profile."""
+    pid, cid = _setup_saml_pool(cognito_idp)
+    _saml_sign_in(cid, "early@example.com", {
+        "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress":
+            "early@example.com",
+    })
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="carlos", MessageAction="SUPPRESS")
+
+    with pytest.raises(ClientError) as exc_info:
+        cognito_idp.admin_link_provider_for_user(
+            UserPoolId=pid,
+            DestinationUser={"ProviderName": "Cognito",
+                             "ProviderAttributeValue": "carlos"},
+            SourceUser={"ProviderName": "TestSAML",
+                        "ProviderAttributeName": "Cognito_Subject",
+                        "ProviderAttributeValue": "early@example.com"})
+    assert exc_info.value.response["Error"]["Code"] == "AliasExistsException"
