@@ -4914,23 +4914,43 @@ def test_sfn_update_state_machine(sfn):
     assert desc["definition"] == defn_v2
 
 def test_sfn_create_duplicate_name(sfn):
-    """CreateStateMachine with duplicate name should fail."""
+    """An identical CreateStateMachine is idempotent; a name reused for another machine is not."""
     defn = json.dumps({
         "StartAt": "X",
         "States": {"X": {"Type": "Pass", "End": True}},
     })
-    sfn.create_state_machine(
+    first = sfn.create_state_machine(
         name="sfn-dup-err-test",
         definition=defn,
         roleArn="arn:aws:iam::000000000000:role/R",
     )
+    # What an SDK retry looks like: the same call again answers with the machine it already made.
+    again = sfn.create_state_machine(
+        name="sfn-dup-err-test",
+        definition=defn,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    assert again["stateMachineArn"] == first["stateMachineArn"]
+    assert again["creationDate"] == first["creationDate"]
+
+    # A differing roleArn is ignored rather than rejected, and is not written over either.
+    other_role = sfn.create_state_machine(
+        name="sfn-dup-err-test",
+        definition=defn,
+        roleArn="arn:aws:iam::000000000000:role/Other",
+    )
+    assert other_role["stateMachineArn"] == first["stateMachineArn"]
+    assert sfn.describe_state_machine(
+        stateMachineArn=first["stateMachineArn"])["roleArn"].endswith(":role/R")
+
+    # The reserved case: the same name carrying a different machine.
     with pytest.raises(ClientError) as exc:
         sfn.create_state_machine(
             name="sfn-dup-err-test",
-            definition=defn,
+            definition=json.dumps({"StartAt": "Y", "States": {"Y": {"Type": "Pass", "End": True}}}),
             roleArn="arn:aws:iam::000000000000:role/R",
         )
-    assert "StateMachineAlreadyExists" in str(exc.value) or "Conflict" in str(exc.value) or exc.value.response["Error"]["Code"]
+    assert exc.value.response["Error"]["Code"] == "StateMachineAlreadyExists"
 
 def test_sfn_describe_not_found(sfn):
     """DescribeStateMachine on non-existent ARN should fail."""

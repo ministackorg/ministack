@@ -2342,7 +2342,7 @@ def _apply_input_transformer(transformer, rule, view):
             for p in parts:
                 if p:
                     val = val[p]
-            replacements[var_name] = val if isinstance(val, str) else json.dumps(val)
+            replacements[var_name] = val
         except (KeyError, TypeError, IndexError):
             replacements[var_name] = ""
 
@@ -2351,8 +2351,8 @@ def _apply_input_transformer(transformer, rule, view):
     # cannot be overwritten by an InputPathsMap entry.
     ingestion_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     reserved = {
-        "aws.events.event.json": json.dumps(event_envelope),
-        "aws.events.event": json.dumps(view.envelope()),
+        "aws.events.event.json": event_envelope,
+        "aws.events.event": view.envelope(),
         "aws.events.event.ingestion-time": ingestion_time,
     }
     if rule:
@@ -2363,11 +2363,53 @@ def _apply_input_transformer(transformer, rule, view):
     # ingestion-time is reserved and uneditable, even if InputPathsMap declares it.
     replacements["aws.events.event.ingestion-time"] = ingestion_time
 
-    result = template
-    for var_name, val in replacements.items():
-        result = result.replace(f"<{var_name}>", str(val))
+    return _render_input_template(template, replacements)
 
-    return result
+
+def _render_input_template(template, replacements):
+    """Substitute ``<var>`` placeholders the way EventBridge does.
+
+    Quotes around a variable that resolves to a string are optional: AWS adds
+    them when the placeholder sits in a JSON value position, so
+    ``{"groupId": <groupId>}`` and ``{"groupId": "<groupId>"}`` both render
+    valid JSON. Values are never escaped, and a JSON object or array
+    referenced from inside a string literal has its quotes stripped so the
+    surrounding string stays valid.
+    """
+
+    def in_string(match):
+        return _render_placeholder(match.group(1), match.group(0), replacements, True)
+
+    def render(match):
+        token = match.group(0)
+        if token.startswith('"'):
+            return _PLACEHOLDER_RE.sub(in_string, token)
+        return _render_placeholder(token[1:-1], token, replacements, False)
+
+    # A template with no double quotes at all is plain text rather than JSON,
+    # so every placeholder in it is a string interpolation.
+    if '"' not in template:
+        return _PLACEHOLDER_RE.sub(in_string, template)
+    return _STRING_OR_PLACEHOLDER_RE.sub(render, template)
+
+
+# Matching whole string literals alongside placeholders is what tells a
+# placeholder in a JSON value position from one inside a string; consuming the
+# literal in one bite also skips any escaped quote it contains.
+_STRING_OR_PLACEHOLDER_RE = re.compile(r'"(?:\\.|[^"\\])*"|<[^<>]*>')
+_PLACEHOLDER_RE = re.compile(r"<([^<>]*)>")
+
+
+def _render_placeholder(var_name, token, replacements, in_string):
+    if var_name not in replacements:
+        return token
+    value = replacements[var_name]
+    if isinstance(value, str):
+        return value if in_string else json.dumps(value)
+    rendered = json.dumps(value)
+    # AWS drops the internal quotes of an object or array spliced into a
+    # string so that the result is still a single valid JSON string.
+    return rendered.replace('"', "") if in_string else rendered
 
 
 def _dispatch_to_lambda(arn, payload):

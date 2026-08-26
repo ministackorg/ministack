@@ -7,6 +7,7 @@ Covers two boto3 clients:
 
 User Pools operations:
   CreateUserPool, DeleteUserPool, DescribeUserPool, ListUserPools, UpdateUserPool,
+  AddCustomAttributes,
   CreateUserPoolClient, DeleteUserPoolClient, DescribeUserPoolClient,
   ListUserPoolClients, UpdateUserPoolClient,
   AdminCreateUser, AdminDeleteUser, AdminGetUser, ListUsers,
@@ -24,6 +25,7 @@ User Pools operations:
   CreateUserPoolDomain, DeleteUserPoolDomain, DescribeUserPoolDomain,
   CreateIdentityProvider, DescribeIdentityProvider, UpdateIdentityProvider,
   DeleteIdentityProvider, ListIdentityProviders, GetIdentityProviderByIdentifier,
+  AdminLinkProviderForUser, AdminDisableProviderForUser,
   GetUserPoolMfaConfig, SetUserPoolMfaConfig,
   AssociateSoftwareToken, VerifySoftwareToken,
   TagResource, UntagResource, ListTagsForResource.
@@ -281,13 +283,163 @@ _SAML_NS = {
 }
 
 # ---------------------------------------------------------------------------
+# User pool schema attributes
+# ---------------------------------------------------------------------------
+# Every user pool carries the standard OIDC attribute set, and DescribeUserPool
+# returns it in `SchemaAttributes` (never `Schema` — that name only exists on the
+# CreateUserPool/UpdateUserPool *request*). Custom attributes are returned with
+# a `custom:` prefix, developer-only ones with `dev:`.
+#   https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_UserPoolType.html
+#   https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_SchemaAttributeType.html
+#   https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-settings-attributes.html
+# Clients diff against this list — the Terraform provider, for one, drops an
+# attribute from state only when it matches the standard entry field for field —
+# so the shapes below mirror what the real service answers with.
+
+_ATTRIBUTE_CUSTOM_PREFIX = "custom:"
+_ATTRIBUTE_DEV_PREFIX = "dev:"
+_MAX_CUSTOM_ATTRIBUTES = 50
+
+
+def _standard_string_attribute(name, min_length="0", max_length="2048"):
+    return {
+        "Name": name,
+        "AttributeDataType": "String",
+        "DeveloperOnlyAttribute": False,
+        "Mutable": True,
+        "Required": False,
+        "StringAttributeConstraints": {
+            "MinLength": min_length,
+            "MaxLength": max_length,
+        },
+    }
+
+
+def _standard_boolean_attribute(name):
+    return {
+        "Name": name,
+        "AttributeDataType": "Boolean",
+        "DeveloperOnlyAttribute": False,
+        "Mutable": True,
+        "Required": False,
+    }
+
+
+_STANDARD_SCHEMA_ATTRIBUTES = [
+    _standard_string_attribute("sub", min_length="1"),
+    _standard_string_attribute("name"),
+    _standard_string_attribute("given_name"),
+    _standard_string_attribute("family_name"),
+    _standard_string_attribute("middle_name"),
+    _standard_string_attribute("nickname"),
+    _standard_string_attribute("preferred_username"),
+    _standard_string_attribute("profile"),
+    _standard_string_attribute("picture"),
+    _standard_string_attribute("website"),
+    _standard_string_attribute("email"),
+    _standard_boolean_attribute("email_verified"),
+    _standard_string_attribute("gender"),
+    _standard_string_attribute("birthdate", min_length="10", max_length="10"),
+    _standard_string_attribute("zoneinfo"),
+    _standard_string_attribute("locale"),
+    _standard_string_attribute("phone_number"),
+    _standard_boolean_attribute("phone_number_verified"),
+    _standard_string_attribute("address"),
+    {
+        "Name": "updated_at",
+        "AttributeDataType": "Number",
+        "DeveloperOnlyAttribute": False,
+        "Mutable": True,
+        "Required": False,
+        "NumberAttributeConstraints": {"MinValue": "0"},
+    },
+]
+# `sub` is the one standard attribute that is immutable and required.
+for _attr in _STANDARD_SCHEMA_ATTRIBUTES:
+    if _attr["Name"] == "sub":
+        _attr["Mutable"] = False
+        _attr["Required"] = True
+del _attr
+
+_STANDARD_ATTRIBUTES_BY_NAME = {a["Name"]: a for a in _STANDARD_SCHEMA_ATTRIBUTES}
+
+
+def _schema_attribute_name(raw) -> str:
+    """Return the stored attribute name, prefixing custom/developer attributes.
+
+    AWS: "When you add an attribute with a Name value of MyAttribute, Amazon
+    Cognito creates the custom attribute custom:MyAttribute", and dev:MyAttribute
+    when DeveloperOnlyAttribute is true. A caller that already sent the prefix
+    (as a round-tripped DescribeUserPool response does) keeps it.
+    """
+    name = (raw.get("Name") or "").strip()
+    if (name in _STANDARD_ATTRIBUTES_BY_NAME
+            or name.startswith(_ATTRIBUTE_CUSTOM_PREFIX)
+            or name.startswith(_ATTRIBUTE_DEV_PREFIX)):
+        return name
+    prefix = (_ATTRIBUTE_DEV_PREFIX if raw.get("DeveloperOnlyAttribute")
+              else _ATTRIBUTE_CUSTOM_PREFIX)
+    return f"{prefix}{name}"
+
+
+def _normalize_schema_attribute(raw: dict) -> dict:
+    """Fill a request SchemaAttributeType out to its DescribeUserPool shape.
+
+    Overriding a standard attribute (a pool that makes `email` required, say)
+    starts from the standard entry, so unspecified fields keep the values the
+    real service reports rather than dropping out of the response.
+    """
+    name = _schema_attribute_name(raw)
+    base = _STANDARD_ATTRIBUTES_BY_NAME.get(name)
+    attr = copy.deepcopy(base) if base else {
+        "Name": name,
+        "AttributeDataType": "String",
+        "DeveloperOnlyAttribute": False,
+        "Mutable": False,
+        "Required": False,
+    }
+    attr["Name"] = name
+    for key in ("AttributeDataType",):
+        if raw.get(key):
+            attr[key] = raw[key]
+    for key in ("DeveloperOnlyAttribute", "Mutable", "Required"):
+        if key in raw:
+            attr[key] = bool(raw[key])
+    for key in ("StringAttributeConstraints", "NumberAttributeConstraints"):
+        if raw.get(key):
+            attr[key] = dict(raw[key])
+    return attr
+
+
+def _build_schema_attributes(schema) -> list:
+    """Standard attributes plus the caller's, as DescribeUserPool returns them."""
+    attrs = copy.deepcopy(_STANDARD_SCHEMA_ATTRIBUTES)
+    index = {a["Name"]: i for i, a in enumerate(attrs)}
+    for raw in schema or []:
+        if not isinstance(raw, dict):
+            continue
+        attr = _normalize_schema_attribute(raw)
+        if attr["Name"] in index:
+            attrs[index[attr["Name"]]] = attr
+        else:
+            index[attr["Name"]] = len(attrs)
+            attrs.append(attr)
+    return attrs
+
+
+def _custom_attribute_count(pool) -> int:
+    return sum(1 for a in pool.get("SchemaAttributes", [])
+               if a["Name"].startswith((_ATTRIBUTE_CUSTOM_PREFIX, _ATTRIBUTE_DEV_PREFIX)))
+
+
+# ---------------------------------------------------------------------------
 # In-memory state — User Pools (cognito-idp)
 # ---------------------------------------------------------------------------
 
 _user_pools = AccountRegionScopedDict()
 # pool_id -> {
 #   Id, Name, Arn, CreationDate, LastModifiedDate, Status,
-#   Policies, Schema, AutoVerifiedAttributes, UsernameAttributes,
+#   Policies, SchemaAttributes, AutoVerifiedAttributes, UsernameAttributes,
 #   MfaConfiguration, EstimatedNumberOfUsers,
 #   AdminCreateUserConfig, UserPoolTags,
 #   Domain (str|None),
@@ -434,6 +586,7 @@ def restore_state(data):
             data.get("user_pools", {}),
             lambda pool_id, _pool: _region_from_pool_id(pool_id),
         )
+
         _restore_regional_store(
             _pool_domain_map,
             data.get("pool_domain_map", {}),
@@ -454,6 +607,19 @@ def restore_state(data):
         _revoked_tokens.update(data.get("revoked_tokens", []))
         _auth_codes.update(data.get("auth_codes", {}))
         _challenge_sessions.update(data.get("challenge_sessions", {}))
+
+
+def _ensure_schema_attributes(pool: dict) -> dict:
+    """Backfill a pool restored from a pre-SchemaAttributes snapshot.
+
+    Older snapshots stored the CreateUserPool request's `Schema` list verbatim
+    and carried no `SchemaAttributes`; rebuilding from it on first use keeps a
+    restored pool describing itself the way a freshly created one does, without
+    rewriting records that a caller never touches.
+    """
+    if not pool.get("SchemaAttributes"):
+        pool["SchemaAttributes"] = _build_schema_attributes(pool.pop("Schema", None))
+    return pool
 
 
 def _restore_regional_store(store, restored, region_for_item):
@@ -619,6 +785,15 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
         if user_attrs:
             for k, v in user_attrs.items():
                 if k == "sub":
+                    continue
+                if k == "identities":
+                    # "Your user's ID token contains all of their associated
+                    # providers in the identities claim" — as an array, while
+                    # the user attribute itself carries JSON text.
+                    try:
+                        claims[k] = json.loads(v)
+                    except (TypeError, ValueError):
+                        claims[k] = v
                     continue
                 claims[k] = v
             if "email" in user_attrs:
@@ -1837,6 +2012,7 @@ async def _dispatch_idp(action: str, data: dict):
         "DescribeUserPool": _describe_user_pool,
         "ListUserPools": _list_user_pools,
         "UpdateUserPool": _update_user_pool,
+        "AddCustomAttributes": _add_custom_attributes,
         # User Pool Client CRUD
         "CreateUserPoolClient": _create_user_pool_client,
         "DeleteUserPoolClient": _delete_user_pool_client,
@@ -1900,6 +2076,8 @@ async def _dispatch_idp(action: str, data: dict):
         "DeleteIdentityProvider": _delete_identity_provider,
         "ListIdentityProviders": _list_identity_providers,
         "GetIdentityProviderByIdentifier": _get_identity_provider_by_identifier,
+        "AdminLinkProviderForUser": _admin_link_provider_for_user,
+        "AdminDisableProviderForUser": _admin_disable_provider_for_user,
         # MFA
         "GetUserPoolMfaConfig": _get_user_pool_mfa_config,
         "SetUserPoolMfaConfig": _set_user_pool_mfa_config,
@@ -1982,7 +2160,7 @@ def _create_user_pool(data):
                 "TemporaryPasswordValidityDays": 7,
             }
         }),
-        "Schema": data.get("Schema", []),
+        "SchemaAttributes": _build_schema_attributes(data.get("Schema")),
         "AutoVerifiedAttributes": data.get("AutoVerifiedAttributes", []),
         "AliasAttributes": data.get("AliasAttributes", []),
         "UsernameAttributes": data.get("UsernameAttributes", []),
@@ -1992,7 +2170,7 @@ def _create_user_pool(data):
         "SmsAuthenticationMessage": data.get("SmsAuthenticationMessage", ""),
         "MfaConfiguration": data.get("MfaConfiguration", "OFF"),
         "EstimatedNumberOfUsers": 0,
-        "EmailConfiguration": data.get("EmailConfiguration", {}),
+        "EmailConfiguration": _email_configuration_out(data.get("EmailConfiguration", {})),
         "SmsConfiguration": data.get("SmsConfiguration", {}),
         "UserPoolTags": data.get("UserPoolTags", {}),
         "AdminCreateUserConfig": data.get("AdminCreateUserConfig", {
@@ -2077,12 +2255,86 @@ def _update_user_pool(data):
     for k in updatable:
         if k in data:
             pool[k] = data[k]
+    if "EmailConfiguration" in data:
+        pool["EmailConfiguration"] = _email_configuration_out(data["EmailConfiguration"])
     pool["LastModifiedDate"] = _now_epoch()
     return json_response({})
 
 
+def _add_custom_attributes(data):
+    # https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_AddCustomAttributes.html
+    # Adds to the pool schema only: 1-25 attributes per call, each stored under
+    # its `custom:` (or `dev:`) prefix, and custom attributes can never be
+    # removed or redefined afterwards.
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+    custom_attributes = data.get("CustomAttributes")
+    if not isinstance(custom_attributes, list) or not custom_attributes:
+        return error_response_json(
+            "InvalidParameterException",
+            "1 validation error detected: Value null at 'customAttributes' failed to "
+            "satisfy constraint: Member must not be null", 400)
+    if len(custom_attributes) > 25:
+        return error_response_json(
+            "InvalidParameterException",
+            "1 validation error detected: Value at 'customAttributes' failed to satisfy "
+            "constraint: Member must have length less than or equal to 25", 400)
+
+    existing = {a["Name"] for a in _ensure_schema_attributes(pool)["SchemaAttributes"]}
+    additions = []
+    for raw in custom_attributes:
+        if not isinstance(raw, dict) or not (raw.get("Name") or "").strip():
+            return error_response_json(
+                "InvalidParameterException", "Invalid attribute name.", 400)
+        attr = _normalize_schema_attribute(raw)
+        if not attr["Name"].startswith((_ATTRIBUTE_CUSTOM_PREFIX, _ATTRIBUTE_DEV_PREFIX)):
+            # A standard attribute name is not a custom attribute; AWS refuses
+            # rather than silently redefining the standard schema entry.
+            return error_response_json(
+                "InvalidParameterException",
+                f"{attr['Name']} is a standard attribute and cannot be added as a "
+                "custom attribute.", 400)
+        if attr["Name"] in existing:
+            return error_response_json(
+                "InvalidParameterException",
+                f"{attr['Name']}: Attribute already exists in the schema.", 400)
+        existing.add(attr["Name"])
+        additions.append(attr)
+
+    if _custom_attribute_count(pool) + len(additions) > _MAX_CUSTOM_ATTRIBUTES:
+        return error_response_json(
+            "InvalidParameterException",
+            f"user pool can have up to {_MAX_CUSTOM_ATTRIBUTES} custom attributes.", 400)
+
+    pool["SchemaAttributes"].extend(additions)
+    pool["LastModifiedDate"] = _now_epoch()
+    logger.info("Cognito: AddCustomAttributes %s (%s)",
+                ", ".join(a["Name"] for a in additions), pid)
+    return json_response({})
+
+
+def _email_configuration_out(email_configuration) -> dict:
+    # AWS reports EmailSendingAccount even when the request omitted it: an
+    # unspecified account means Cognito's built-in mailer.
+    # https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_EmailConfigurationType.html
+    config = dict(email_configuration or {})
+    # Cognito reports its default mailer even when no explicit email options
+    # were supplied. This also normalizes pools created by older MiniStack
+    # versions whose persisted EmailConfiguration was empty.
+    config.setdefault("EmailSendingAccount", "COGNITO_DEFAULT")
+    return config
+
+
 def _pool_out(pool: dict) -> dict:
-    return {k: v for k, v in pool.items() if not k.startswith("_")}
+    _ensure_schema_attributes(pool)
+    output = {k: v for k, v in pool.items() if not k.startswith("_")}
+    if "EmailConfiguration" in output:
+        output["EmailConfiguration"] = _email_configuration_out(
+            output["EmailConfiguration"]
+        )
+    return output
 
 
 # ===========================================================================
@@ -4131,16 +4383,272 @@ def _get_identity_provider_by_identifier(data):
 # MFA CONFIG
 # ===========================================================================
 
-def _get_user_pool_mfa_config(data):
+# ---------------------------------------------------------------------------
+# Linking federated users to an existing profile (#1499)
+#
+# "When a federated user signs in to your user pool for the first time, Amazon
+# Cognito looks for a local profile that you have linked to their identity. If
+# no linked profile exists, your user pool creates a new profile." Links are
+# created ahead of that first sign-in, typically from a PreSignUp trigger.
+# ---------------------------------------------------------------------------
+
+# "You can link up to five federated users to each user profile."
+_PROVIDER_LINK_MAX_PER_USER = 5
+# "You can link users to each IdP from up to five IdP attribute claims."
+_PROVIDER_LINK_MAX_ATTRIBUTES_PER_IDP = 5
+# ProviderName values Cognito recognises without a SAML/OIDC configuration.
+_SOCIAL_PROVIDER_TYPES = {
+    "Facebook": "Facebook",
+    "Google": "Google",
+    "LoginWithAmazon": "LoginWithAmazon",
+    "SignInWithApple": "SignInWithApple",
+}
+
+
+def _provider_links(pool: dict) -> dict:
+    """{(provider, attribute_name, attribute_value): destination username}."""
+    return pool.setdefault("_provider_links", {})
+
+
+def _provider_link_key(provider_name, attribute_name, attribute_value):
+    return "\x00".join((provider_name, attribute_name or "", attribute_value))
+
+
+def _provider_type_for(pool: dict, provider_name: str) -> str:
+    """Resolve the IdP's ProviderType, preferring the pool's own configuration."""
+    for provider in pool.get("_identity_providers", {}).values():
+        if provider.get("ProviderName") == provider_name:
+            return provider.get("ProviderType") or "OIDC"
+    return _SOCIAL_PROVIDER_TYPES.get(provider_name, "OIDC")
+
+
+def _user_identities(user: dict) -> list:
+    """The user's `identities` attribute, decoded. AWS stores it as JSON text."""
+    raw = _attr_list_to_dict(user.get("Attributes", [])).get("identities")
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _set_user_identities(user: dict, identities: list) -> None:
+    attrs = _attr_list_to_dict(user.get("Attributes", []))
+    if identities:
+        attrs["identities"] = json.dumps(identities)
+    else:
+        attrs.pop("identities", None)
+    user["Attributes"] = _dict_to_attr_list(attrs)
+
+
+def _provider_user_identifier(data, field):
+    """Validate a ProviderUserIdentifierType member. Returns (value, error)."""
+    raw = data.get(field)
+    if not isinstance(raw, dict):
+        return None, error_response_json(
+            "InvalidParameterException", f"{field} is required.", 400)
+    provider_name = (raw.get("ProviderName") or "").strip()
+    attribute_value = (raw.get("ProviderAttributeValue") or "").strip()
+    if not provider_name:
+        return None, error_response_json(
+            "InvalidParameterException",
+            f"{field}.ProviderName is required.", 400)
+    if not attribute_value:
+        return None, error_response_json(
+            "InvalidParameterException",
+            f"{field}.ProviderAttributeValue is required.", 400)
+    return {
+        "ProviderName": provider_name,
+        "ProviderAttributeName": (raw.get("ProviderAttributeName") or "").strip(),
+        "ProviderAttributeValue": attribute_value,
+    }, None
+
+
+def _federated_profile_username(provider_name, attribute_value):
+    """Auto-created federated profiles are named `{Provider name}_identifier`."""
+    return f"{provider_name}_{attribute_value}"
+
+
+def _admin_link_provider_for_user(data):
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
     if err:
         return err
-    return json_response({
-        "SmsMfaConfiguration": pool.get("SmsMfaConfiguration", {}),
-        "SoftwareTokenMfaConfiguration": pool.get("SoftwareTokenMfaConfiguration", {"Enabled": False}),
-        "MfaConfiguration": pool.get("MfaConfiguration", "OFF"),
+
+    destination, err = _provider_user_identifier(data, "DestinationUser")
+    if err:
+        return err
+    source, err = _provider_user_identifier(data, "SourceUser")
+    if err:
+        return err
+
+    # "This user must be a federated user (for example, a SAML or Facebook
+    # user), not another native user."
+    if source["ProviderName"] == "Cognito":
+        return error_response_json(
+            "InvalidParameterException",
+            "SourceUser must be a federated user, not a Cognito user.", 400)
+
+    # "For a native username + password user, the ProviderAttributeValue for
+    # the DestinationUser should be the username in the user pool. For a
+    # federated user, it should be the provider-specific user_id." The
+    # DestinationUser's ProviderAttributeName is ignored.
+    if destination["ProviderName"] == "Cognito":
+        destination_username = destination["ProviderAttributeValue"]
+    else:
+        destination_username = _federated_profile_username(
+            destination["ProviderName"], destination["ProviderAttributeValue"])
+    destination_user = pool["_users"].get(destination_username)
+    if not destination_user:
+        return error_response_json(
+            "UserNotFoundException", "User does not exist.", 400)
+
+    # "To link a federated user who has previously signed in, you must first
+    # delete their existing profile."
+    source_profile = _federated_profile_username(
+        source["ProviderName"], source["ProviderAttributeValue"])
+    if source_profile in pool["_users"]:
+        return error_response_json(
+            "AliasExistsException",
+            "This user already exists in the user pool. To link this "
+            "federated identity, delete the existing profile first.", 400)
+
+    links = _provider_links(pool)
+    key = _provider_link_key(
+        source["ProviderName"], source["ProviderAttributeName"],
+        source["ProviderAttributeValue"])
+    linked_to = links.get(key)
+    if linked_to == destination_username:
+        return json_response({})
+    if linked_to:
+        return error_response_json(
+            "AliasExistsException",
+            "This federated identity is already linked to another user "
+            "profile.", 400)
+
+    identities = _user_identities(destination_user)
+    if len(identities) >= _PROVIDER_LINK_MAX_PER_USER:
+        return error_response_json(
+            "LimitExceededException",
+            "You can link up to "
+            f"{_PROVIDER_LINK_MAX_PER_USER} federated users to each user "
+            "profile.", 400)
+    attribute_names = {
+        stored_key.split("\x00")[1]
+        for stored_key in links
+        if stored_key.split("\x00")[0] == source["ProviderName"]
+    }
+    if (source["ProviderAttributeName"] not in attribute_names
+            and len(attribute_names) >= _PROVIDER_LINK_MAX_ATTRIBUTES_PER_IDP):
+        return error_response_json(
+            "LimitExceededException",
+            "You can link users to each IdP from up to "
+            f"{_PROVIDER_LINK_MAX_ATTRIBUTES_PER_IDP} IdP attribute claims.",
+            400)
+
+    links[key] = destination_username
+    identities.append({
+        "userId": source["ProviderAttributeValue"],
+        "providerName": source["ProviderName"],
+        "providerType": _provider_type_for(pool, source["ProviderName"]),
+        # AWS carries the SAML entity issuer here and null for social IdPs. We
+        # never learn an entity id, so it stays null.
+        "issuer": None,
+        # A linked identity is never the profile's primary one.
+        "primary": False,
+        "dateCreated": int(time.time() * 1000),
     })
+    _set_user_identities(destination_user, identities)
+    destination_user["UserLastModifiedDate"] = _now_epoch()
+    logger.info("Cognito: linked %s user %s to %s in pool %s",
+                source["ProviderName"], source["ProviderAttributeValue"],
+                destination_username, pid)
+    return json_response({})
+
+
+def _admin_disable_provider_for_user(data):
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+
+    user_identifier, err = _provider_user_identifier(data, "User")
+    if err:
+        return err
+
+    links = _provider_links(pool)
+    key = _provider_link_key(
+        user_identifier["ProviderName"],
+        user_identifier["ProviderAttributeName"],
+        user_identifier["ProviderAttributeValue"])
+    destination_username = links.get(key)
+    if not destination_username:
+        return error_response_json(
+            "ResourceNotFoundException",
+            "The specified federated identity is not linked to a user "
+            "profile.", 400)
+
+    del links[key]
+    destination_user = pool["_users"].get(destination_username)
+    if destination_user:
+        identities = [
+            identity for identity in _user_identities(destination_user)
+            if not (identity.get("providerName") == user_identifier["ProviderName"]
+                    and identity.get("userId")
+                    == user_identifier["ProviderAttributeValue"])
+        ]
+        _set_user_identities(destination_user, identities)
+        destination_user["UserLastModifiedDate"] = _now_epoch()
+    return json_response({})
+
+
+def _linked_username_for_federation(pool, provider_name, name_id, user_attrs):
+    """Resolve a federated sign-in to a linked local profile, if one exists.
+
+    Cognito looks for the link before it would create a `{Provider}_id`
+    profile, so a linked user signs in to the profile they were linked to
+    rather than getting a second one.
+    """
+    links = _provider_links(pool)
+    if not links:
+        return None
+    # "When you set ProviderAttributeName to Cognito_Subject, Amazon Cognito
+    # will automatically parse the default unique identifier found in the
+    # subject from the IdP token."
+    candidates = [("Cognito_Subject", name_id), ("", name_id)]
+    # "For OIDC, the ProviderAttributeName can be any mapped value from a claim
+    # in the ID token" — match against the mapped attributes of this sign-in.
+    candidates.extend(
+        (attribute_name, value)
+        for attribute_name, value in (user_attrs or {}).items()
+        if isinstance(value, str)
+    )
+    for attribute_name, value in candidates:
+        username = links.get(
+            _provider_link_key(provider_name, attribute_name, value))
+        if username and username in pool["_users"]:
+            return username
+    return None
+
+
+
+def _get_user_pool_mfa_config(data):
+    # https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_GetUserPoolMfaConfig.html
+    # A configuration that was never set is absent from the response rather than
+    # reported as a disabled block — clients diff the response against their
+    # desired state, so an invented SoftwareTokenMfaConfiguration reads as drift.
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+    resp = {"MfaConfiguration": pool.get("MfaConfiguration", "OFF")}
+    for key in ("SmsMfaConfiguration", "SoftwareTokenMfaConfiguration",
+                "EmailMfaConfiguration", "WebAuthnConfiguration"):
+        if pool.get(key):
+            resp[key] = pool[key]
+    return json_response(resp)
 
 
 def _admin_set_user_mfa_preference(data):
@@ -4205,14 +4713,19 @@ def _set_user_pool_mfa_config(data):
         pool["SmsMfaConfiguration"] = data["SmsMfaConfiguration"]
     if "SoftwareTokenMfaConfiguration" in data:
         pool["SoftwareTokenMfaConfiguration"] = data["SoftwareTokenMfaConfiguration"]
+    if "EmailMfaConfiguration" in data:
+        pool["EmailMfaConfiguration"] = data["EmailMfaConfiguration"]
+    if "WebAuthnConfiguration" in data:
+        pool["WebAuthnConfiguration"] = data["WebAuthnConfiguration"]
     if "MfaConfiguration" in data:
         pool["MfaConfiguration"] = data["MfaConfiguration"]
     pool["LastModifiedDate"] = _now_epoch()
-    return json_response({
-        "SmsMfaConfiguration": pool.get("SmsMfaConfiguration", {}),
-        "SoftwareTokenMfaConfiguration": pool.get("SoftwareTokenMfaConfiguration", {}),
-        "MfaConfiguration": pool.get("MfaConfiguration", "OFF"),
-    })
+    resp = {"MfaConfiguration": pool.get("MfaConfiguration", "OFF")}
+    for key in ("SmsMfaConfiguration", "SoftwareTokenMfaConfiguration",
+                "EmailMfaConfiguration", "WebAuthnConfiguration"):
+        if pool.get(key):
+            resp[key] = pool[key]
+    return json_response(resp)
 
 
 def _associate_software_token(data):
@@ -4688,8 +5201,10 @@ def _saml2_idp_response(body: bytes, query_params):
         cognito_attr = reverse_mapping.get(idp_claim, idp_claim)
         user_attrs[cognito_attr] = value
 
-    # Create or update federated user
-    username = f"{provider_name}_{name_id}"
+    # Create or update federated user. A profile linked ahead of this first
+    # sign-in wins over minting a new `{Provider}_id` one (#1499).
+    username = (_linked_username_for_federation(pool, provider_name, name_id, user_attrs)
+                or f"{provider_name}_{name_id}")
     existing_user = pool["_users"].get(username)
     now = _now_epoch()
 
@@ -4919,7 +5434,8 @@ def _oauth2_idp_response(method, body, query_params):
         return error_response_json("InvalidParameterException",
                                    "OIDC id_token has no `sub` or `email` claim.", 400)
 
-    username = f"{provider_name}_{name_id}"
+    username = (_linked_username_for_federation(pool, provider_name, name_id, user_attrs)
+                or f"{provider_name}_{name_id}")
     existing_user = pool["_users"].get(username)
     now = _now_epoch()
 

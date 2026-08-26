@@ -7,6 +7,12 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Cognito — `AddCustomAttributes`, and a user pool that reports its schema (`SchemaAttributes`)** — `DescribeUserPool` never returned the pool's attribute schema (the create request's `Schema` was stored under that request-shaped key and no `SchemaAttributes` was ever produced), so a client that diffs its desired schema against the pool saw every attribute as missing. Terraform re-planned an `aws_cognito_user_pool` as changed immediately after creating it and then failed the follow-up apply with `InvalidAction: Unknown Cognito IDP action: AddCustomAttributes`, because that is the operation the provider uses to reconcile added schema items. A pool now carries the full standard attribute set (`sub`, `email`, `email_verified`, `phone_number`, `updated_at`, ... with AWS's data types, mutability, and constraints), a request's `Schema` entries are stored under their `custom:` (or `dev:`) prefix and override a standard entry field-for-field when they redefine one, and `AddCustomAttributes` adds 1-25 attributes per call with `InvalidParameterException` for a duplicate, a standard attribute name, or more than 50 custom attributes, and `ResourceNotFoundException` for an unknown pool. Pools restored from an older snapshot rebuild their schema on load. Also fixed two adjacent read-back gaps that showed up as permanent drift: `EmailConfiguration` now reports `EmailSendingAccount: COGNITO_DEFAULT` when the request omitted it, and `GetUserPoolMfaConfig` no longer invents a disabled `SoftwareTokenMfaConfiguration` for a pool that never configured MFA.
+
+### Fixed
+- **EventBridge — an input template no longer needs quotes around a string variable** — AWS documents that quotes are optional for a variable holding a string and adds them itself so the transformed input stays valid JSON, quoting neither an object nor an array. MiniStack pasted every value in verbatim, so the documented form `{"detail": <detail>, "groupId": <groupId>}` produced `"groupId": some-value` and the target received a body that would not parse, forcing consumers to hand-quote the placeholder. Substitution is now aware of where the placeholder sits: a string variable in a JSON value position is quoted, a variable inside a string literal is interpolated raw as before, and an object or array spliced into a string has its internal quotes stripped the way AWS does.
+
 ## [1.5.1] — 2026-08-25
 
 ### Added
