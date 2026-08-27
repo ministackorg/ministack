@@ -253,20 +253,49 @@ def _parse_actions(params, prefix="DefaultActions"):
     return actions
 
 
+# A rule condition carries its values either in the flat legacy ``Values`` list or
+# in a per-field typed config. The Terraform AWS provider sends the typed form, so a
+# parser that reads only ``Values`` records an empty condition, and the rule then
+# matches nothing and the listener falls through to its default action.
+_CONDITION_VALUE_KEYS = {
+    "path-pattern": "PathPatternConfig",
+    "host-header": "HostHeaderConfig",
+    "http-request-method": "HttpRequestMethodConfig",
+    "source-ip": "SourceIpConfig",
+}
+
+
+def _parse_condition_values(params, base):
+    """Read a condition's values from whichever shape the caller used."""
+    def _values_at(prefix):
+        out, j = [], 1
+        while True:
+            v = _p(params, f"{prefix}.member.{j}")
+            if not v:
+                break
+            out.append(v)
+            j += 1
+        return out
+
+    values = _values_at(f"{base}.Values")
+    if values:
+        return values
+
+    for config_key in _CONDITION_VALUE_KEYS.values():
+        values = _values_at(f"{base}.{config_key}.Values")
+        if values:
+            return values
+    return []
+
+
 def _parse_conditions(params, prefix="Conditions"):
     conditions, i = [], 1
     while True:
-        field = _p(params, f"{prefix}.member.{i}.Field")
+        base = f"{prefix}.member.{i}"
+        field = _p(params, f"{base}.Field")
         if not field:
             break
-        values, j = [], 1
-        while True:
-            v = _p(params, f"{prefix}.member.{i}.Values.member.{j}")
-            if not v:
-                break
-            values.append(v)
-            j += 1
-        conditions.append({"Field": field, "Values": values})
+        conditions.append({"Field": field, "Values": _parse_condition_values(params, base)})
         i += 1
     return conditions
 
