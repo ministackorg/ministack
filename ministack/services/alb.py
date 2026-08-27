@@ -863,6 +863,19 @@ def _set_rule_priorities(params):
 # Target registration handlers
 # ---------------------------------------------------------------------------
 
+def set_targets_for_group(tg_arn, targets):
+    """Replace a target group's registrations. Used by ECS, whose services own the
+    membership of their target group and reconcile it as tasks come and go.
+
+    ``targets`` is an iterable of ``(id, port)``. Unknown target groups are ignored
+    rather than raising: a service can outlive the group it referenced.
+    """
+    if tg_arn not in _tgs:
+        return False
+    _targets[tg_arn] = [{"Id": tid, "Port": port} for tid, port in targets]
+    return True
+
+
 def _register_targets(params):
     tg_arn = _p(params, "TargetGroupArn")
     if tg_arn not in _tgs:

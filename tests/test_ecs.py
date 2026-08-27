@@ -1471,3 +1471,100 @@ def test_ecs_bridge_task_still_publishes_host_ports(monkeypatch):
     _image, kwargs = fake_containers.calls[0]
     assert kwargs.get("ports") == {"80/tcp": 8080}
 
+def test_ecs_service_registers_tasks_in_target_group(monkeypatch):
+    """A service with loadBalancers must register its running tasks as targets.
+
+    Without this the ALB data plane has nothing to forward to and every request
+    falls through to the listener's default action.
+    """
+    from ministack.services import alb as _alb
+    from ministack.services import ecs as _ecs
+
+    task_ip = "172.30.0.7"
+
+    class FakeContainer:
+        def __init__(self, cid):
+            self.id = cid
+            self.attrs = {"NetworkSettings": {"Networks": {"ministack_default": {"IPAddress": task_ip}}}}
+
+        def reload(self):
+            pass
+
+    class FakeContainers:
+        def __init__(self):
+            self.n = 0
+
+        def get(self, _name):
+            raise Exception("not found")
+
+        def list(self, *a, **k):
+            return []
+
+        def run(self, image, **kwargs):
+            self.n += 1
+            return FakeContainer(f"container-{self.n:012d}")
+
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: SimpleNamespace(containers=FakeContainers()))
+
+    tg_arn = "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/tg-reg/abc123"
+    _alb._tgs[tg_arn] = {"TargetGroupArn": tg_arn, "Port": 80, "TargetType": "ip"}
+    _alb._targets[tg_arn] = []
+
+    _ecs._register_task_definition({
+        "family": "lb-reg-td",
+        "networkMode": "awsvpc",
+        "containerDefinitions": [{"name": "web", "image": "busybox"}],
+    })
+    _ecs._create_service({
+        "cluster": "lb-reg-c",
+        "serviceName": "lb-reg-svc",
+        "taskDefinition": "lb-reg-td",
+        "desiredCount": 1,
+        "loadBalancers": [
+            {"targetGroupArn": tg_arn, "containerName": "web", "containerPort": 80},
+        ],
+    })
+
+    registered = _alb._targets.get(tg_arn, [])
+    assert registered == [{"Id": task_ip, "Port": 80}], registered
+
+    # ...and deleting the service leaves nothing registered behind it.
+    _ecs._delete_service({"cluster": "lb-reg-c", "service": "lb-reg-svc", "force": True})
+    assert _alb._targets.get(tg_arn) == []
+
+
+def test_ecs_task_records_private_ipv4_attachment(monkeypatch):
+    """awsvpc tasks expose their address the way real ECS does."""
+    from ministack.services import ecs as _ecs
+
+    class FakeContainer:
+        id = "container-000000000001"
+        attrs = {"NetworkSettings": {"Networks": {"ministack_default": {"IPAddress": "172.30.0.9"}}}}
+
+        def reload(self):
+            pass
+
+    class FakeContainers:
+        def get(self, _name):
+            raise Exception("not found")
+
+        def list(self, *a, **k):
+            return []
+
+        def run(self, image, **kwargs):
+            return FakeContainer()
+
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: SimpleNamespace(containers=FakeContainers()))
+
+    _ecs._register_task_definition({
+        "family": "eni-td",
+        "networkMode": "awsvpc",
+        "containerDefinitions": [{"name": "web", "image": "busybox"}],
+    })
+    resp = _ecs._run_task({"cluster": "eni-c", "taskDefinition": "eni-td"})
+    _status, _headers, raw = resp
+    task = json.loads(raw)["tasks"][0]
+
+    assert _ecs._task_ip(task) == "172.30.0.9"
+    assert task["attachmentsStatus"] == "ATTACHED"
+    assert task["attachments"][0]["type"] == "ElasticNetworkInterface"
