@@ -260,7 +260,7 @@ def _delete_table_bucket(arn):
     del _table_buckets[name]
     import ministack.services.s3 as _s3
     _s3._buckets.pop(name, None)
-    return json_response({})
+    return 204, {}, b""  # AWS answers 204 No Content on the deletes
 
 
 def _create_namespace(bucket_arn, data):
@@ -312,7 +312,7 @@ def _delete_namespace(bucket_arn, namespace):
     if key not in _namespaces:
         return error_response_json("NotFoundException", f"Namespace {namespace} not found", 404)
     del _namespaces[key]
-    return json_response({})
+    return 204, {}, b""  # AWS answers 204 No Content on the deletes
 
 
 def _create_table(bucket_arn, namespace, data):
@@ -400,7 +400,7 @@ def _delete_table(bucket_arn, namespace, table_name):
     if key not in _tables:
         return error_response_json("NotFoundException", f"Table {table_name} not found", 404)
     del _tables[key]
-    return json_response({})
+    return 204, {}, b""  # AWS answers 204 No Content on the deletes
 
 
 def _get_table_metadata_location(bucket_arn, namespace, table_name):
