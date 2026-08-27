@@ -4952,6 +4952,45 @@ def test_sfn_create_duplicate_name(sfn):
         )
     assert exc.value.response["Error"]["Code"] == "StateMachineAlreadyExists"
 
+def test_sfn_describe_carries_no_internal_bookkeeping(sfn):
+    """DescribeStateMachine must not leak createVersionArn / lastVersionNumber,
+    which are MiniStack bookkeeping, not AWS response fields."""
+    defn = json.dumps({"StartAt": "X", "States": {"X": {"Type": "Pass", "End": True}}})
+    arn = sfn.create_state_machine(
+        name="sfn-desc-shape-test", definition=defn,
+        roleArn="arn:aws:iam::000000000000:role/R", publish=True,
+    )["stateMachineArn"]
+    desc = sfn.describe_state_machine(stateMachineArn=arn)
+    assert "createVersionArn" not in desc
+    assert "lastVersionNumber" not in desc
+
+
+def test_sfn_create_idempotency_covers_version_description(sfn):
+    """AWS's idempotency check includes versionDescription: a publishing
+    re-create with a different description raises StateMachineAlreadyExists,
+    while the same description answers idempotently."""
+    defn = json.dumps({"StartAt": "X", "States": {"X": {"Type": "Pass", "End": True}}})
+    first = sfn.create_state_machine(
+        name="sfn-dup-verdesc-test", definition=defn,
+        roleArn="arn:aws:iam::000000000000:role/R",
+        publish=True, versionDescription="v-one",
+    )
+    again = sfn.create_state_machine(
+        name="sfn-dup-verdesc-test", definition=defn,
+        roleArn="arn:aws:iam::000000000000:role/R",
+        publish=True, versionDescription="v-one",
+    )
+    assert again["stateMachineArn"] == first["stateMachineArn"]
+    assert again["stateMachineVersionArn"] == first["stateMachineVersionArn"]
+    with pytest.raises(ClientError) as exc:
+        sfn.create_state_machine(
+            name="sfn-dup-verdesc-test", definition=defn,
+            roleArn="arn:aws:iam::000000000000:role/R",
+            publish=True, versionDescription="v-two",
+        )
+    assert exc.value.response["Error"]["Code"] == "StateMachineAlreadyExists"
+
+
 def test_sfn_describe_not_found(sfn):
     """DescribeStateMachine on non-existent ARN should fail."""
     with pytest.raises(ClientError) as exc:
