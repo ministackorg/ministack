@@ -7801,3 +7801,151 @@ def test_concurrent_sync_executions_do_not_block_the_loop(sfn, sfn_sync):
     probe.assert_responsive("sync execution burst")
 
     assert all(s == "SUCCEEDED" for s in statuses), f"sync executions returned {set(statuses)}"
+
+
+# ---------------------------------------------------------------------------
+# Execution status change events (EventBridge)
+# ---------------------------------------------------------------------------
+
+def _drain_queue(sqs, q_url, want, tries=20):
+    """Collect up to `want` messages, polling briefly."""
+    got = []
+    for _ in range(tries):
+        resp = sqs.receive_message(
+            QueueUrl=q_url, MaxNumberOfMessages=10, WaitTimeSeconds=1
+        )
+        for m in resp.get("Messages", []):
+            got.append(m)
+            sqs.delete_message(QueueUrl=q_url, ReceiptHandle=m["ReceiptHandle"])
+        if len(got) >= want:
+            break
+    return got
+
+
+def _status_event_rule(eb, sqs, slug):
+    q_url = sqs.create_queue(QueueName=f"qa-sfn-evt-{slug}")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url, AttributeNames=["QueueArn"]
+    )["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name=f"qa-sfn-evt-{slug}",
+        EventPattern=json.dumps({
+            "source": ["aws.states"],
+            "detail-type": ["Step Functions Execution Status Change"],
+        }),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule=f"qa-sfn-evt-{slug}", Targets=[{"Id": "t1", "Arn": q_arn}]
+    )
+    return q_url, f"qa-sfn-evt-{slug}"
+
+
+def test_sfn_execution_emits_status_change_events(sfn, eb, sqs):
+    """A standard execution publishes aws.states / "Step Functions Execution
+    Status Change" to the default bus on start (RUNNING) and completion
+    (SUCCEEDED), with the documented detail fields and epoch-ms dates."""
+    q_url, rule = _status_event_rule(eb, sqs, "ok")
+    sm_arn = sfn.create_state_machine(
+        name="qa-evt-ok",
+        definition=json.dumps(
+            {"StartAt": "Done", "States": {"Done": {"Type": "Succeed"}}}
+        ),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )["stateMachineArn"]
+    try:
+        exec_arn = sfn.start_execution(
+            stateMachineArn=sm_arn, input='{"a": 1}'
+        )["executionArn"]
+        msgs = _drain_queue(sqs, q_url, want=2)
+        details = []
+        for m in msgs:
+            env = json.loads(m["Body"])
+            assert env["source"] == "aws.states"
+            assert env["detail-type"] == "Step Functions Execution Status Change"
+            assert env["resources"] == [exec_arn]
+            details.append(env["detail"])
+        statuses = {d["status"] for d in details}
+        assert statuses == {"RUNNING", "SUCCEEDED"}
+        for d in details:
+            assert d["executionArn"] == exec_arn
+            assert d["stateMachineArn"] == sm_arn
+            assert isinstance(d["startDate"], int) and d["startDate"] > 10**12
+            assert d["input"] == '{"a": 1}'
+            assert d["inputDetails"] == {"included": True}
+            assert d["redriveStatus"] == "NOT_REDRIVABLE"
+        running = next(d for d in details if d["status"] == "RUNNING")
+        assert running["stopDate"] is None
+        assert running["output"] is None and running["outputDetails"] is None
+        done = next(d for d in details if d["status"] == "SUCCEEDED")
+        assert isinstance(d["stopDate"], int)
+        assert json.loads(done["output"]) == {"a": 1}
+        assert done["outputDetails"] == {"included": True}
+    finally:
+        sfn.delete_state_machine(stateMachineArn=sm_arn)
+        eb.remove_targets(Rule=rule, Ids=["t1"])
+        eb.delete_rule(Name=rule)
+        sqs.delete_queue(QueueUrl=q_url)
+
+
+def test_sfn_failed_and_aborted_executions_emit_status_events(sfn, eb, sqs):
+    """FAILED carries error/cause and reports REDRIVABLE; a StopExecution
+    lands ABORTED with error/cause null, per the documented payloads."""
+    q_url, rule = _status_event_rule(eb, sqs, "failstop")
+    fail_arn = sfn.create_state_machine(
+        name="qa-evt-fail",
+        definition=json.dumps({"StartAt": "Boom", "States": {
+            "Boom": {"Type": "Fail", "Error": "Kaput", "Cause": "went wrong"}
+        }}),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )["stateMachineArn"]
+    wait_arn = sfn.create_state_machine(
+        name="qa-evt-wait",
+        definition=json.dumps({"StartAt": "W", "States": {
+            "W": {"Type": "Wait", "Seconds": 30, "End": True}
+        }}),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )["stateMachineArn"]
+    try:
+        sfn.start_execution(stateMachineArn=fail_arn)
+        waiting = sfn.start_execution(stateMachineArn=wait_arn)["executionArn"]
+        time.sleep(0.5)
+        sfn.stop_execution(executionArn=waiting)
+        msgs = _drain_queue(sqs, q_url, want=4)
+        details = [json.loads(m["Body"])["detail"] for m in msgs]
+        failed = next(d for d in details if d["status"] == "FAILED")
+        assert failed["error"] == "Kaput" and failed["cause"] == "went wrong"
+        assert failed["redriveStatus"] == "REDRIVABLE"
+        assert failed["output"] is None and failed["outputDetails"] is None
+        aborted = next(d for d in details if d["status"] == "ABORTED")
+        assert aborted["executionArn"] == waiting
+        assert aborted["error"] is None and aborted["cause"] is None
+        assert aborted["redriveStatus"] == "NOT_REDRIVABLE"
+    finally:
+        sfn.delete_state_machine(stateMachineArn=fail_arn)
+        sfn.delete_state_machine(stateMachineArn=wait_arn)
+        eb.remove_targets(Rule=rule, Ids=["t1"])
+        eb.delete_rule(Name=rule)
+        sqs.delete_queue(QueueUrl=q_url)
+
+
+def test_sfn_sync_execution_emits_no_status_events(sfn_sync, sfn, eb, sqs):
+    """StartSyncExecution is the express-flavored path; express workflows
+    emit no status events on AWS, so none are published."""
+    q_url, rule = _status_event_rule(eb, sqs, "sync")
+    sm_arn = sfn.create_state_machine(
+        name="qa-evt-sync",
+        definition=json.dumps(
+            {"StartAt": "Done", "States": {"Done": {"Type": "Succeed"}}}
+        ),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )["stateMachineArn"]
+    try:
+        sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input="{}")
+        msgs = _drain_queue(sqs, q_url, want=1, tries=3)
+        assert msgs == []
+    finally:
+        sfn.delete_state_machine(stateMachineArn=sm_arn)
+        eb.remove_targets(Rule=rule, Ids=["t1"])
+        eb.delete_rule(Name=rule)
+        sqs.delete_queue(QueueUrl=q_url)

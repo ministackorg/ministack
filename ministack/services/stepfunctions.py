@@ -629,6 +629,8 @@ def _start_execution(data):
     # this snapshot the worker runs under the default scope and silently
     # fails to find the execution stored under the caller's account and
     # region. See issue #639.
+    _emit_execution_status_event(_executions[exec_arn])
+
     ctx_snapshot = contextvars.copy_context()
     threading.Thread(
         target=ctx_snapshot.run,
@@ -660,6 +662,7 @@ def _stop_execution(data):
             "cause": data.get("cause", ""),
         },
     })
+    _emit_execution_status_event(execution)
     return json_response({"stopDate": stop_date})
 
 
@@ -774,6 +777,9 @@ def _start_sync_execution(data):
                  "input": input_str, "roleArn": sm["roleArn"]}},
         ],
     }
+    # StartSyncExecution is the express-flavored path: express workflows emit
+    # no EventBridge status events on AWS, so the emitter skips this record.
+    _executions[exec_arn]["sync"] = True
 
     _run_execution(exec_arn)
 
@@ -1272,6 +1278,84 @@ class _ExecutionError(Exception):
         super().__init__(f"{error}: {cause}")
 
 
+def _iso_to_epoch_ms(iso):
+    """AWS's ISO record stamp -> the epoch-millisecond integer the status
+    event carries (the documented payloads show 13-digit values)."""
+    if not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return int(dt.timestamp() * 1000)
+
+
+# The status event excludes an input/output whose escaped form exceeds 248 KiB
+# (an EventBridge quota Step Functions documents for these events); the
+# inputDetails/outputDetails "included" flag reports the exclusion.
+_STATUS_EVENT_PAYLOAD_CAP = 248 * 1024
+
+
+def _emit_execution_status_event(execution) -> None:
+    """Publish "Step Functions Execution Status Change" to the default bus.
+
+    Standard-workflow executions emit this automatically on AWS at every
+    status change (source aws.states): it is how consumers track a run
+    without polling DescribeExecution. Delivery is best-effort there, so a
+    publish failure is logged and never fails the execution. Sync-started
+    executions (the express-flavored path) emit nothing, as on AWS.
+    """
+    if execution.get("sync"):
+        return
+    status = execution["status"]
+    failed = status == "FAILED"
+    redrivable = failed  # TIMED_OUT is never set locally; FAILED is the one
+    detail = {
+        "executionArn": execution["executionArn"],
+        "stateMachineArn": execution["stateMachineArn"],
+        "name": execution["name"],
+        "status": status,
+        "startDate": _iso_to_epoch_ms(execution.get("startDate")),
+        "stopDate": _iso_to_epoch_ms(execution.get("stopDate")),
+        "input": execution.get("input"),
+        "inputDetails": {"included": True},
+        # The documented payloads carry the output only on SUCCEEDED; a failed
+        # record's local output (the Error/Cause document) stays off the event.
+        "output": execution.get("output") if status == "SUCCEEDED" else None,
+        "outputDetails": {"included": True} if status == "SUCCEEDED" else None,
+        "stateMachineVersionArn": None,
+        "stateMachineAliasArn": None,
+        "redriveCount": 0,
+        "redriveDate": None,
+        "redriveStatus": "REDRIVABLE" if redrivable else "NOT_REDRIVABLE",
+        "redriveStatusReason": (
+            f"Execution is {status} and is redrivable" if redrivable
+            else f"Execution is {status} and cannot be redriven"
+        ),
+        "error": execution.get("error") if failed else None,
+        "cause": execution.get("cause") if failed else None,
+    }
+    if detail["input"] is not None and len(detail["input"]) > _STATUS_EVENT_PAYLOAD_CAP:
+        detail["input"] = None
+        detail["inputDetails"] = {"included": False}
+    if detail["output"] is not None and len(detail["output"]) > _STATUS_EVENT_PAYLOAD_CAP:
+        detail["output"] = None
+        detail["outputDetails"] = {"included": False}
+    try:
+        from ministack.services import eventbridge
+        eventbridge._put_events({
+            "Entries": [{
+                "Source": "aws.states",
+                "DetailType": "Step Functions Execution Status Change",
+                "Detail": json.dumps(detail),
+                "Resources": [execution["executionArn"]],
+            }]
+        })
+    except Exception:
+        logger.warning("Failed to publish execution status event for %s",
+                       execution["executionArn"], exc_info=True)
+
+
 def _run_execution(exec_arn):
     """Background thread: walk the ASL definition to completion."""
     execution = _executions.get(exec_arn)
@@ -1395,6 +1479,7 @@ def _run_execution(exec_arn):
             _add_event(execution, "ExecutionSucceeded", {
                 "executionSucceededEventDetails": {"output": output_json},
             })
+            _emit_execution_status_event(execution)
 
     except _ExecutionError as err:
         _fail_execution(execution, err.error, err.cause)
@@ -1412,6 +1497,7 @@ def _fail_execution(execution, error, cause):
     _add_event(execution, "ExecutionFailed", {
         "executionFailedEventDetails": {"error": error, "cause": cause},
     })
+    _emit_execution_status_event(execution)
 
 
 # ---------------------------------------------------------------------------

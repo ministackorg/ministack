@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **Step Functions — execution status changes are published to EventBridge** — real Step Functions automatically emits `source: aws.states` / `detail-type: "Step Functions Execution Status Change"` to the default bus whenever a standard execution changes status; MiniStack ran the execution and published nothing, so a rule matching those events never fired and applications waiting on them hung with no error anywhere. Every `StartExecution` now emits `RUNNING` and its completion `SUCCEEDED`, `FAILED` (with `error`/`cause` and `REDRIVABLE`) or `ABORTED` on `StopExecution`, carrying the documented detail fields with epoch-millisecond dates; payloads over 248 KiB are excluded and flagged via `inputDetails`/`outputDetails`, and `StartSyncExecution` (the express-flavored path) emits nothing, as on AWS. Reported by @moonyseven.
+
 ## [1.5.2] — 2026-08-26
 
 ### Added
