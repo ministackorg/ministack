@@ -1314,10 +1314,15 @@ def _run_task(data):
                 if "command" in container_override:
                     effective_cdef["command"] = container_override["command"]
 
+                # awsvpc tasks get their own network namespace — an ENI in AWS — so
+                # container ports are never published on the host. Publishing them
+                # makes two tasks that share a container port collide on the host,
+                # which cannot happen on Fargate. Only bridge/host mode publishes.
                 port_bindings = {}
-                for pm in cdef.get("portMappings", []):
-                    host_port = pm.get("hostPort", pm.get("containerPort"))
-                    port_bindings[f"{pm['containerPort']}/tcp"] = host_port
+                if td.get("networkMode") != "awsvpc":
+                    for pm in cdef.get("portMappings", []):
+                        host_port = pm.get("hostPort", pm.get("containerPort"))
+                        port_bindings[f"{pm['containerPort']}/tcp"] = host_port
 
                 host_mode = td.get("networkMode") == "host"
                 metadata_token = _register_metadata(

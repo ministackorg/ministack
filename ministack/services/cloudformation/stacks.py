@@ -217,8 +217,14 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 else:
                     _delete_resource(rtype, pid, old_props, stack_name, logical_id)
             except Exception as exc:
-                logger.warning("Failed to delete old resource %s: %s",
-                               logical_id, exc)
+                # A cleanup miss doesn't fail the update — real CloudFormation
+                # reports the resource DELETE_FAILED during the
+                # UPDATE_COMPLETE_CLEANUP phase and still lands the stack in
+                # UPDATE_COMPLETE — but it must be visible, not a warning.
+                logger.error("Failed to delete old resource %s: %s",
+                             logical_id, exc)
+                _add_event(stack_id, stack_name, logical_id, rtype,
+                           "DELETE_FAILED", str(exc), pid)
             provisioned_resources.pop(logical_id, None)
 
     await asyncio.sleep(0)
@@ -237,6 +243,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                        "AWS::CloudFormation::Stack", stack["StackStatus"],
                        "Rollback requested", stack_id)
 
+            rollback_delete_failures = []
             for logical_id in reversed(created_in_this_run):
                 res = provisioned_resources.get(logical_id, {})
                 rtype = res.get("ResourceType", "")
@@ -253,10 +260,11 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                     _add_event(stack_id, stack_name, logical_id, rtype,
                                "DELETE_COMPLETE", physical_id=pid)
                 except Exception as del_exc:
-                    logger.warning("Rollback delete of %s failed: %s",
-                                   logical_id, del_exc)
+                    logger.error("Rollback delete of %s failed: %s",
+                                 logical_id, del_exc)
                     _add_event(stack_id, stack_name, logical_id, rtype,
                                "DELETE_FAILED", str(del_exc), pid)
+                    rollback_delete_failures.append(logical_id)
                 provisioned_resources.pop(logical_id, None)
 
             if is_update and previous_stack:
@@ -268,6 +276,21 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 stack["StackStatus"] = "UPDATE_ROLLBACK_COMPLETE"
             else:
                 stack["StackStatus"] = "ROLLBACK_COMPLETE"
+            if rollback_delete_failures:
+                # A rollback that could not undo what it created must not
+                # report success — real CloudFormation lands the stack in
+                # (UPDATE_)ROLLBACK_FAILED and keeps the failure visible.
+                stack["StackStatus"] = (
+                    "UPDATE_ROLLBACK_FAILED" if is_update and previous_stack
+                    else "ROLLBACK_FAILED"
+                )
+                reason = ("The following resource(s) failed to delete: "
+                          f"[{', '.join(sorted(rollback_delete_failures))}].")
+                stack["StackStatusReason"] = reason
+                _add_event(stack_id, stack_name, stack_name,
+                           "AWS::CloudFormation::Stack", stack["StackStatus"],
+                           reason, stack_id)
+                return
             _add_event(stack_id, stack_name, stack_name,
                        "AWS::CloudFormation::Stack", stack["StackStatus"],
                        "Rollback complete", stack_id)
@@ -340,6 +363,7 @@ async def _delete_stack_async(stack_name: str, stack_id: str):
     except ValueError:
         ordered = list(resources.keys())
 
+    delete_failures = []
     for logical_id in reversed(ordered):
         res = resources.get(logical_id)
         if not res:
@@ -360,18 +384,36 @@ async def _delete_stack_async(stack_name: str, stack_id: str):
                 _delete_resource(rtype, pid, res_props, stack_name, logical_id)
             _add_event(stack_id, stack_name, logical_id, rtype,
                        "DELETE_COMPLETE", physical_id=pid)
+            resources.pop(logical_id, None)
         except Exception as exc:
-            logger.warning("Delete of %s (%s) failed: %s", logical_id, pid, exc)
+            logger.error("Delete of %s (%s) failed: %s", logical_id, pid, exc)
             _add_event(stack_id, stack_name, logical_id, rtype,
                        "DELETE_FAILED", str(exc), pid)
+            res["ResourceStatus"] = "DELETE_FAILED"
+            res["ResourceStatusReason"] = str(exc)
+            delete_failures.append(logical_id)
+
+    await asyncio.sleep(0)
+
+    if delete_failures:
+        # Real CloudFormation keeps deleting the other resources, then lands
+        # the stack in DELETE_FAILED: the failed resources stay in the stack
+        # (a retried DeleteStack picks them up again), everything that did
+        # delete is gone, and the exports stay with the still-existing stack.
+        reason = ("The following resource(s) failed to delete: "
+                  f"[{', '.join(sorted(delete_failures))}].")
+        stack["StackStatus"] = "DELETE_FAILED"
+        stack["StackStatusReason"] = reason
+        _add_event(stack_id, stack_name, stack_name,
+                   "AWS::CloudFormation::Stack", "DELETE_FAILED",
+                   reason, stack_id)
+        return
 
     # Remove exports
     for out in stack.get("Outputs", []):
         export_name = out.get("ExportName")
         if export_name:
             _exports.pop(export_name, None)
-
-    await asyncio.sleep(0)
 
     stack["StackStatus"] = "DELETE_COMPLETE"
     _add_event(stack_id, stack_name, stack_name,

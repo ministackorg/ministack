@@ -1397,3 +1397,77 @@ def test_ecs_run_task_does_not_block_the_loop(ecs):
             except Exception:
                 pass
     probe.assert_responsive("ECS RunTask")
+
+
+def _fake_docker_recorder(run_impl=None):
+    """Docker double that records containers.run kwargs (see command-override tests)."""
+    class FakeContainers:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, _name):
+            raise Exception("not found")
+
+        def list(self, *args, **kwargs):
+            return []
+
+        def run(self, image, **kwargs):
+            self.calls.append((image, kwargs))
+            if run_impl is not None:
+                return run_impl(image, kwargs)
+            return SimpleNamespace(id=f"container-{len(self.calls):012d}")
+
+    fake_containers = FakeContainers()
+    return fake_containers, SimpleNamespace(containers=fake_containers)
+
+
+def test_ecs_awsvpc_task_does_not_publish_host_ports(monkeypatch):
+    """awsvpc tasks get their own ENI, so container ports are not bound on the host.
+
+    Publishing them means two tasks sharing a container port collide on the host —
+    something that cannot happen on Fargate.
+    """
+    from ministack.services import ecs as _ecs
+
+    fake_containers, fake_docker = _fake_docker_recorder()
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: fake_docker)
+
+    _ecs._register_task_definition({
+        "family": "awsvpc-ports-td",
+        "networkMode": "awsvpc",
+        "containerDefinitions": [{
+            "name": "web",
+            "image": "busybox",
+            "portMappings": [{"containerPort": 80, "hostPort": 80, "protocol": "tcp"}],
+        }],
+    })
+    _ecs._run_task({"cluster": "awsvpc-ports-c", "taskDefinition": "awsvpc-ports-td"})
+
+    assert fake_containers.calls, "expected the container to be launched"
+    _image, kwargs = fake_containers.calls[0]
+    assert not kwargs.get("ports"), (
+        f"awsvpc task must not publish host ports, got {kwargs.get('ports')!r}"
+    )
+
+
+def test_ecs_bridge_task_still_publishes_host_ports(monkeypatch):
+    """bridge networking does publish to the host — the awsvpc fix must not affect it."""
+    from ministack.services import ecs as _ecs
+
+    fake_containers, fake_docker = _fake_docker_recorder()
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: fake_docker)
+
+    _ecs._register_task_definition({
+        "family": "bridge-ports-td",
+        "networkMode": "bridge",
+        "containerDefinitions": [{
+            "name": "web",
+            "image": "busybox",
+            "portMappings": [{"containerPort": 80, "hostPort": 8080, "protocol": "tcp"}],
+        }],
+    })
+    _ecs._run_task({"cluster": "bridge-ports-c", "taskDefinition": "bridge-ports-td"})
+
+    _image, kwargs = fake_containers.calls[0]
+    assert kwargs.get("ports") == {"80/tcp": 8080}
+

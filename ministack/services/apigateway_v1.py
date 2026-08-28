@@ -79,9 +79,13 @@ Data plane:
   owning region by API id and run the invocation in that scope.
 
 Custom domains:
-  REGIONAL and EDGE records are both keyed per region in MiniStack. EDGE
-  global name uniqueness is not enforced because MiniStack does not route
-  data-plane requests by custom domain host today.
+  REGIONAL and EDGE records are both keyed per region in MiniStack; EDGE
+  global name uniqueness is not enforced. Data-plane requests addressed by a
+  registered custom domain host ARE routed: app.py resolves the Host through
+  resolve_base_path_mapping() before any host-pattern guessing runs (longest
+  base path wins, "(none)" or an empty base path is the root mapping, a
+  mapping's stage is authoritative when set, and a stage-less mapping takes
+  the stage from the remaining request path).
 """
 
 import base64
@@ -871,6 +875,59 @@ def find_api_scope(api_id):
         if stored_account == account_id and stored_api_id == api_id:
             return stored_account, region
     return None
+
+
+def find_domain_scope(domain_name):
+    """Return (account_id, region, stored_name) owning a custom domain within
+    the ambient account.
+
+    Host headers are case-insensitive, so the comparison lowercases both
+    sides; ``stored_name`` is the exact key the control plane stored, which
+    the child-store lookup needs. A data-plane request addressed by a custom
+    domain carries no signed scope, so like ``find_api_scope`` this resolves
+    within the ambient account. EDGE global name uniqueness across accounts
+    stays unenforced (see the module docstring) — the ambient default covers
+    the single-account case a local stack actually runs."""
+    account_id = get_account_id()
+    wanted = domain_name.lower()
+    for (stored_account, region, stored_domain), _rec in _domain_names.all_items():
+        if stored_account == account_id and stored_domain.lower() == wanted:
+            return stored_account, region, stored_domain
+    return None
+
+
+def resolve_base_path_mapping(domain_name, path):
+    """Resolve ``(api_id, stage, execute_path)`` through a registered custom
+    domain's base-path mappings, or ``None``.
+
+    The longest matching base path wins; the ``"(none)"`` sentinel (or an
+    explicit empty base path) is the root mapping and matches everything.
+    A mapping that names a stage is authoritative — the whole remainder
+    belongs to the API. A stage-less mapping returns ``""`` as the stage and
+    the caller derives the stage from the returned path instead."""
+    scope = find_domain_scope(domain_name)
+    if scope is None:
+        return None
+    account_id, region, stored_name = scope
+    mappings = _base_path_mappings.get_scoped(account_id, region, stored_name, {})
+    best = None
+    for base_path, mapping in mappings.items():
+        if not base_path or base_path == "(none)":
+            candidate_len, rest = 0, path
+        else:
+            prefix = "/" + base_path
+            if path == prefix:
+                candidate_len, rest = len(base_path), "/"
+            elif path.startswith(prefix + "/"):
+                candidate_len, rest = len(base_path), path[len(prefix):]
+            else:
+                continue
+        if best is None or candidate_len > best[0]:
+            best = (candidate_len, mapping, rest)
+    if best is None:
+        return None
+    _, mapping, rest = best
+    return mapping["restApiId"], mapping["stage"], rest or "/"
 
 
 def stages_for_api(api_id):

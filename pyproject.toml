@@ -32,6 +32,11 @@ dependencies = [
     # is a runtime dependency rather than a dev one. Pinned to the version the
     # images already carry: awscli==1.45.63 requires botocore==1.43.63.
     "botocore==1.43.63",
+    # Step Functions JSONata expressions (QueryLanguage: JSONata) are evaluated
+    # by this pure-Python port of the reference jsonata-js engine, which AWS
+    # documents Step Functions as implementing per the JSONata 2.0.6 spec. Pure
+    # Python, no transitive dependencies.
+    "jsonata-python>=0.7.0",
 ]
 
 [project.optional-dependencies]

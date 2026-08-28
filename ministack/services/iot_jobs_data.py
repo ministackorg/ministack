@@ -15,12 +15,12 @@ machine live in :mod:`ministack.services.iot`, reached through its public
 ``jobs_*`` seam (the same way ``iot_data.py`` reaches the shadow store), so
 nothing here can mutate an execution behind the control plane's back.
 
-Timestamp contract: the shared records store epoch MILLISECONDS. This data
-plane models timestamps as raw ``long`` shapes, so responses emit those
-millisecond integers unchanged — unlike the ``iot`` control plane, whose
-``timestamp`` shapes botocore parses as epoch SECONDS. Mixing the units up
-makes botocore explode while parsing ("year 58580 is out of range"); see
-``iot._jobs_now_ms``.
+Timestamp contract: the shared records store epoch MILLISECONDS internally
+(so same-second executions keep their queue order), but every response emits
+epoch SECONDS — this plane's raw ``long`` shapes carry whole-second integers
+(the API reference words every JobExecution stamp as "the time, in seconds
+since the epoch"), and the ``iot`` control plane's ``timestamp`` shapes are
+what botocore parses into datetimes. See ``iot._jobs_now_ms``.
 """
 
 from __future__ import annotations
@@ -28,7 +28,12 @@ from __future__ import annotations
 import logging
 from urllib.parse import unquote
 
-from ministack.core.responses import error_response_json, json_response
+from ministack.core.responses import (
+    error_response_json,
+    get_account_id,
+    get_region,
+    json_response,
+)
 from ministack.services import iot as _iot_module
 
 logger = logging.getLogger("iot_jobs_data")
@@ -93,7 +98,7 @@ async def handle_request(
     if method == "GET":
         return _describe_execution(thing, job_id, qp)
     if method == "POST":
-        return _update_execution(thing, job_id, _iot_module.parse_json_body(body))
+        return await _update_execution(thing, job_id, _iot_module.parse_json_body(body))
     return _unsupported_path(method, path)
 
 
@@ -111,52 +116,36 @@ def _unsupported_path(method: str, path: str) -> tuple:
 
 
 def _execution_view(execution: dict, document: str | None) -> dict:
-    """Data-plane JobExecution — millisecond `long` timestamps, flat
-    statusDetails map."""
-    view = {
-        "jobId": execution["jobId"],
-        "thingName": execution["thingName"],
-        "status": execution["status"],
-        "statusDetails": execution.get("statusDetails") or {},
-        "queuedAt": execution["queuedAt"],
-        "lastUpdatedAt": execution["lastUpdatedAt"],
-        "executionNumber": execution["executionNumber"],
-        "versionNumber": execution["versionNumber"],
-    }
-    if execution.get("startedAt") is not None:
-        view["startedAt"] = execution["startedAt"]
-    if document is not None:
-        view["jobDocument"] = document
-    return view
+    """Data-plane JobExecution — delegates to the shared view in ``iot`` so
+    the HTTP plane and the jobs-over-MQTT bridge speak one shape."""
+    return _iot_module.jobs_execution_view(execution, document)
 
 
 def _get_pending(thing: str) -> tuple:
-    """GetPendingJobExecutions — queued and in-progress, split, ms stamps."""
-
-    def summary(execution: dict) -> dict:
-        entry = {
-            "jobId": execution["jobId"],
-            "queuedAt": execution["queuedAt"],
-            "lastUpdatedAt": execution["lastUpdatedAt"],
-            "versionNumber": execution["versionNumber"],
-            "executionNumber": execution["executionNumber"],
-        }
-        if execution.get("startedAt") is not None:
-            entry["startedAt"] = execution["startedAt"]
-        return entry
-
+    """GetPendingJobExecutions — queued and in-progress, split; the shared
+    summary shape (whole-second stamps, same as the notify payload)."""
     pending = _iot_module.jobs_pending_for_thing(thing)
     return json_response({
         "inProgressJobs": [
-            summary(e) for e in pending if e["status"] == "IN_PROGRESS"
+            _iot_module.jobs_execution_summary(e)
+            for e in pending
+            if e["status"] == "IN_PROGRESS"
         ],
-        "queuedJobs": [summary(e) for e in pending if e["status"] == "QUEUED"],
+        "queuedJobs": [
+            _iot_module.jobs_execution_summary(e)
+            for e in pending
+            if e["status"] == "QUEUED"
+        ],
     })
 
 
 def _start_next(thing: str, payload: dict, *, peek: bool) -> tuple:
     """StartNextPendingJobExecution (PUT) / DescribeJobExecution of ``$next``
-    (GET, ``peek=True`` — reads without starting)."""
+    (GET, ``peek=True`` — reads without starting).
+
+    No jobs/notify(-next) publish: QUEUED -> IN_PROGRESS keeps the execution
+    both pending and at the front of the queue, and AWS stays silent
+    (live-captured)."""
     execution = _iot_module.jobs_start_next_execution(
         thing, status_details=payload.get("statusDetails"), peek=peek
     )
@@ -203,7 +192,8 @@ def _describe_execution(thing: str, job_id: str, qp: dict) -> tuple:
     return json_response({"execution": _execution_view(execution, document)})
 
 
-def _update_execution(thing: str, job_id: str, payload: dict) -> tuple:
+async def _update_execution(thing: str, job_id: str, payload: dict) -> tuple:
+    prev_next = _iot_module.jobs_first_pending_job_id(thing)
     execution, error = _iot_module.jobs_update_execution(
         thing,
         job_id,
@@ -227,4 +217,9 @@ def _update_execution(thing: str, job_id: str, payload: dict) -> tuple:
         }
     if str(payload.get("includeJobDocument", "")).lower() in ("true", "1"):
         response["jobDocument"] = _iot_module.jobs_job_document(job_id)
+    if execution["status"] in ("SUCCEEDED", "FAILED", "REJECTED"):
+        # A terminal report removed the execution from the pending set.
+        await _iot_module.jobs_notify_thing(
+            get_account_id(), get_region(), thing, prev_next
+        )
     return json_response(response)
