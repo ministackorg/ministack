@@ -7794,3 +7794,62 @@ def test_cognito_required_custom_attribute_is_refused(cognito_idp):
             CustomAttributes=[{"Name": "tenant", "AttributeDataType": "String",
                                "Required": True}])
     assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+
+def test_cognito_user_pool_keeps_mfa_and_attribute_update_settings(cognito_idp):
+    """UserAttributeUpdateSettings and a false SoftwareTokenMfaConfiguration
+    round-trip.
+
+    Both are declared on aws_cognito_user_pool. The provider sends the attribute
+    settings on Create and Update, and the MFA config through
+    SetUserPoolMfaConfig as an empty object — `enabled = false` serialises with
+    the false field omitted. Neither was reported back: the settings were never
+    stored, and `{}` was treated as never-set. Terraform proposed the same two
+    blocks on every plan, and applying did not settle it.
+    """
+    pool = cognito_idp.create_user_pool(
+        PoolName="qa-pool-settings",
+        MfaConfiguration="OPTIONAL",
+        UserAttributeUpdateSettings={
+            "AttributesRequireVerificationBeforeUpdate": ["email", "phone_number"]
+        },
+    )["UserPool"]
+    pid = pool["Id"]
+
+    assert pool["UserAttributeUpdateSettings"][
+        "AttributesRequireVerificationBeforeUpdate"
+    ] == ["email", "phone_number"]
+    described = cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]
+    assert described["UserAttributeUpdateSettings"][
+        "AttributesRequireVerificationBeforeUpdate"
+    ] == ["email", "phone_number"]
+
+    # An update must carry the setting through, not drop it.
+    cognito_idp.update_user_pool(
+        UserPoolId=pid,
+        MfaConfiguration="OPTIONAL",
+        UserAttributeUpdateSettings={
+            "AttributesRequireVerificationBeforeUpdate": ["email"]
+        },
+    )
+    described = cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]
+    assert described["UserAttributeUpdateSettings"][
+        "AttributesRequireVerificationBeforeUpdate"
+    ] == ["email"]
+
+    # The empty object the provider sends for `enabled = false` is a value that
+    # was set, not an unset field, so it has to be reported as {"Enabled": false}.
+    cognito_idp.set_user_pool_mfa_config(
+        UserPoolId=pid,
+        SoftwareTokenMfaConfiguration={},
+        MfaConfiguration="OPTIONAL",
+    )
+    mfa = cognito_idp.get_user_pool_mfa_config(UserPoolId=pid)
+    assert mfa["SoftwareTokenMfaConfiguration"] == {"Enabled": False}
+
+    # A pool that never configured software-token MFA still reports nothing,
+    # which is what keeps an unset field from reading as drift.
+    other = cognito_idp.create_user_pool(PoolName="qa-pool-no-mfa")["UserPool"]["Id"]
+    assert "SoftwareTokenMfaConfiguration" not in cognito_idp.get_user_pool_mfa_config(
+        UserPoolId=other
+    )
