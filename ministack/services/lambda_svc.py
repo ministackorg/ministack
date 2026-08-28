@@ -1078,6 +1078,13 @@ def _layer_arn(name: str) -> str:
     return f"arn:aws:lambda:{get_region()}:{get_account_id()}:layer:{name}"
 
 
+def _esm_arn(esm_id: str) -> str:
+    return (
+        f"arn:aws:lambda:{get_region()}:{get_account_id()}"
+        f":event-source-mapping:{esm_id}"
+    )
+
+
 def _now_iso() -> str:
     now = datetime.now(timezone.utc)
     ms = now.microsecond // 1000
@@ -6011,8 +6018,18 @@ def _delete_provisioned_concurrency(func_name: str, qualifier: str):
 
 
 def _esm_response(esm: dict) -> dict:
-    """Return ESM dict without internal-only fields."""
-    return {k: v for k, v in esm.items() if k not in ("FunctionName", "Enabled")}
+    """Return ESM dict without internal-only fields.
+
+    EventSourceMappingArn is derived here rather than stored on the record so
+    that mappings created before it existed — restored state included — report
+    it too. Callers cannot construct this ARN themselves, and ListTags is keyed
+    on it, so omitting it leaves tags unreadable.
+    """
+    out = {k: v for k, v in esm.items() if k not in ("FunctionName", "Enabled")}
+    esm_id = esm.get("UUID")
+    if esm_id:
+        out["EventSourceMappingArn"] = _esm_arn(esm_id)
+    return out
 
 
 def _resolve_existing_esm_function(function_ref: str):
