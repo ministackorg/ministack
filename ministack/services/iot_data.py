@@ -14,6 +14,7 @@ which applies account-and-region-scoped topic prefixing transparently.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from urllib.parse import unquote
@@ -86,7 +87,7 @@ async def handle_request(
 
     # Device Shadow: /things/{thingName}/shadow[?name={shadowName}]
     if path.startswith("/things/") and path.endswith("/shadow"):
-        return _shadow(method, path, body, qp)
+        return await _shadow(method, path, body, qp)
 
     # Placeholders — return 501 so SDKs that probe these endpoints
     # get a clear "not implemented" rather than a generic 404.
@@ -108,10 +109,23 @@ async def handle_request(
     )
 
 
-def _shadow(method: str, path: str, body: bytes, qp: dict) -> tuple:
-    """Route ``GetThingShadow`` / ``UpdateThingShadow`` / ``DeleteThingShadow``."""
+async def _shadow(method: str, path: str, body: bytes, qp: dict) -> tuple:
+    """Route ``GetThingShadow`` / ``UpdateThingShadow`` / ``DeleteThingShadow``.
+
+    An accepted update or delete also publishes the reserved-topic
+    notifications through the broker (``update/accepted``/``delta``/
+    ``documents``, ``delete/accepted``): on AWS those are state-change
+    messages the Device Shadow service emits however the change arrived, so a
+    topic rule on them fires for HTTP callers too. A ``get`` publishes
+    nothing — ``get/accepted`` is the MQTT request's response channel and an
+    HTTP read is answered by its own response body. HTTP failures publish no
+    ``rejected`` envelope either; the HTTP status already carries them."""
     thing = unquote(path[len("/things/"):-len("/shadow")])
     shadow_name = qp.get("name", "") or ""
+    base = f"{_iot_module.SHADOW_TOPIC_PREFIX}{thing}/shadow" + (
+        f"/name/{shadow_name}" if shadow_name else ""
+    )
+    account_id, region = get_account_id(), get_region()
 
     if method == "GET":
         status, doc = _iot_module.get_thing_shadow(thing, shadow_name)
@@ -120,9 +134,30 @@ def _shadow(method: str, path: str, body: bytes, qp: dict) -> tuple:
             request = json.loads(body) if body else {}
         except json.JSONDecodeError:
             return error_response_json("InvalidRequestException", "Invalid JSON", 400)
+        # Snapshot around the mutation: the store hands back live dicts, and
+        # the documents notification needs the before/after pair (same
+        # discipline as the MQTT bridge).
+        pre_status, pre_doc = _iot_module.get_thing_shadow(thing, shadow_name)
+        pre_doc = copy.deepcopy(pre_doc)
         status, doc = _iot_module.update_thing_shadow(thing, shadow_name, request)
+        if status == 200:
+            post_status, post_doc = _iot_module.get_thing_shadow(thing, shadow_name)
+            post_doc = copy.deepcopy(post_doc)
+            await _iot_module.shadow_emit_update_responses(
+                account_id, region, base, doc,
+                pre_status, pre_doc, post_status, post_doc,
+                request.get("clientToken") if isinstance(request, dict) else None,
+            )
     elif method == "DELETE":
         status, doc = _iot_module.delete_thing_shadow(thing, shadow_name)
+        if status == 200:
+            await _iot_module.broker_publish(
+                account_id,
+                region,
+                f"{base}/delete/accepted",
+                json.dumps(doc).encode("utf-8"),
+                qos=1,
+            )
     else:
         return error_response_json(
             "InvalidRequestException", f"Unsupported iot-data path: {method} {path}", 400
