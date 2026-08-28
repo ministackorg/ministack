@@ -1690,3 +1690,62 @@ def test_ecs_sync_service_targets_does_not_publish_a_stale_view(monkeypatch):
 
     final = sorted(t["Id"] for t in _alb._targets[tg_arn])
     assert final == ["10.3.0.1"], f"a stale view was published: {final}"
+
+
+def test_ecs_service_reconcile_spares_foreign_targets(monkeypatch):
+    """A service withdraws only its own registrations: targets registered by
+    hand (or by another service sharing the group) survive its reconcile and
+    its deletion — real ECS deregisters only its own tasks."""
+    from ministack.services import alb as _alb
+    from ministack.services import ecs as _ecs
+
+    task_ip = "172.30.0.21"
+
+    class FakeContainer:
+        def __init__(self, cid):
+            self.id = cid
+            self.attrs = {"NetworkSettings": {"Networks": {"ministack_default": {"IPAddress": task_ip}}}}
+
+        def reload(self):
+            pass
+
+    class FakeContainers:
+        def __init__(self):
+            self.n = 0
+
+        def get(self, _name):
+            raise Exception("not found")
+
+        def list(self, *a, **k):
+            return []
+
+        def run(self, image, **kwargs):
+            self.n += 1
+            return FakeContainer(f"container-{self.n:012d}")
+
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: SimpleNamespace(containers=FakeContainers()))
+
+    tg_arn = "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/tg-shared/def456"
+    _alb._tgs[tg_arn] = {"TargetGroupArn": tg_arn, "Port": 80, "TargetType": "ip"}
+    # A registration the service does not own.
+    _alb._targets[tg_arn] = [{"Id": "10.9.9.9", "Port": 80}]
+
+    _ecs._register_task_definition({
+        "family": "lb-shared-td",
+        "networkMode": "awsvpc",
+        "containerDefinitions": [{"name": "web", "image": "busybox"}],
+    })
+    _ecs._create_service({
+        "cluster": "lb-shared-c",
+        "serviceName": "lb-shared-svc",
+        "taskDefinition": "lb-shared-td",
+        "desiredCount": 1,
+        "loadBalancers": [
+            {"targetGroupArn": tg_arn, "containerName": "web", "containerPort": 80},
+        ],
+    })
+    registered = sorted(t["Id"] for t in _alb._targets.get(tg_arn, []))
+    assert registered == ["10.9.9.9", task_ip], registered
+
+    _ecs._delete_service({"cluster": "lb-shared-c", "service": "lb-shared-svc", "force": True})
+    assert _alb._targets.get(tg_arn) == [{"Id": "10.9.9.9", "Port": 80}]

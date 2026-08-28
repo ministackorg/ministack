@@ -215,7 +215,7 @@ use1.list_tables()["TableNames"]   # → ["users"]
 euw1.list_tables()["TableNames"]   # → [] — eu-west-1 is independent
 ```
 
-**Region-isolated services:** as of 1.5.2, every regional service is region-isolated except S3 and Aurora DSQL (the isolation migrations rolled out service by service from 1.4.0 to 1.4.12 — see the CHANGELOG for the per-release history; services introduced later, like AWS Config and the Cloud Control API in 1.4.14, were born region-scoped).
+**Region-isolated services:** as of 1.5.3, every regional service is region-isolated except S3 and Aurora DSQL (the isolation migrations rolled out service by service from 1.4.0 to 1.4.12 — see the CHANGELOG for the per-release history; services introduced later, like AWS Config and the Cloud Control API in 1.4.14, were born region-scoped).
 
 Cross-resource references resolve in the referenced ARN's own account and region (SNS→SQS fanout, EventBridge targets, event source mappings), and cross-region references that real AWS rejects return the same errors AWS returns — e.g. invoking a `eu-west-1` Lambda from a `us-east-1` Step Functions task fails with `Functions from 'eu-west-1' are not reachable in this region`, exactly as on AWS.
 
