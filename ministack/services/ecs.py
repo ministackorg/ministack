@@ -33,7 +33,7 @@ import time
 
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.concurrency import run_reentrant
+from ministack.core.concurrency import resource_lock, run_reentrant
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -692,6 +692,15 @@ def _sync_service_targets(cluster_name, svc):
     loadBalancers block, so this replaces the registration wholesale rather than
     tracking individual add/remove events — that makes it correct for scale-up,
     scale-in, task replacement and service deletion alike.
+
+    Tasks are selected by ``group``, the same predicate _reconcile_service_tasks
+    uses for its own recount, so the registered targets cannot disagree with the
+    runningCount reported alongside them.
+
+    Collecting the addresses and publishing them is a read-modify-write on shared
+    state, and handlers no longer run serialised on the event loop, so it is done
+    under resource_lock. There is no Docker call or re-entrant dispatch inside the
+    lock, per the rule in ministack.core.concurrency.
     """
     lbs = svc.get("loadBalancers") or []
     if not lbs:
@@ -702,25 +711,30 @@ def _sync_service_targets(cluster_name, svc):
         return
 
     svc_name = svc.get("serviceName")
+    cluster_arn = svc.get("clusterArn")
     active = svc.get("status") == "ACTIVE"
+    group = f"service:{svc_name}"
+
     for lb in lbs:
         tg_arn = lb.get("targetGroupArn")
         if not tg_arn:
             continue
         port = lb.get("containerPort", 80)
-        targets = []
-        if active:
-            for task in _tasks.values():
-                if task.get("startedBy") != svc_name:
-                    continue
-                if task.get("clusterArn") != svc.get("clusterArn"):
-                    continue
-                if task.get("lastStatus") != "RUNNING":
-                    continue
-                ip = _task_ip(task)
-                if ip:
-                    targets.append((ip, port))
-        if alb.set_targets_for_group(tg_arn, targets):
+        with resource_lock("elbv2-targets", tg_arn):
+            targets = []
+            if active:
+                for task in list(_tasks.values()):
+                    if task.get("group") != group:
+                        continue
+                    if task.get("clusterArn") != cluster_arn:
+                        continue
+                    if task.get("lastStatus") != "RUNNING":
+                        continue
+                    ip = _task_ip(task)
+                    if ip:
+                        targets.append((ip, port))
+            published = alb.set_targets_for_group(tg_arn, targets)
+        if published:
             logger.debug("ECS: %s -> %d target(s) in %s", svc_name, len(targets), tg_arn)
 
 

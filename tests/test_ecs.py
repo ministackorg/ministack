@@ -1568,3 +1568,125 @@ def test_ecs_task_records_private_ipv4_attachment(monkeypatch):
     assert _ecs._task_ip(task) == "172.30.0.9"
     assert task["attachmentsStatus"] == "ATTACHED"
     assert task["attachments"][0]["type"] == "ElasticNetworkInterface"
+
+
+def test_ecs_sync_service_targets_selects_tasks_by_group(monkeypatch):
+    """Target selection must use the same predicate as the service's own recount.
+
+    _reconcile_service_tasks counts a service's tasks by `group`; selecting targets
+    by any other field lets the registered targets disagree with the runningCount
+    reported next to them.
+    """
+    from ministack.services import alb as _alb
+    from ministack.services import ecs as _ecs
+
+    tg_arn = "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/tg-pred/abc"
+    _alb._tgs[tg_arn] = {"TargetGroupArn": tg_arn, "Port": 80, "TargetType": "ip"}
+    _alb._targets[tg_arn] = []
+
+    svc = {
+        "serviceName": "pred-svc",
+        "clusterArn": "arn:aws:ecs:us-east-1:000000000000:cluster/pred-c",
+        "status": "ACTIVE",
+        "loadBalancers": [{"targetGroupArn": tg_arn, "containerName": "web", "containerPort": 80}],
+    }
+
+    def _task(ip, **over):
+        t = {
+            "group": "service:pred-svc",
+            "clusterArn": svc["clusterArn"],
+            "lastStatus": "RUNNING",
+            "attachments": [{
+                "type": "ElasticNetworkInterface",
+                "details": [{"name": "privateIPv4Address", "value": ip}],
+            }],
+        }
+        t.update(over)
+        return t
+
+    monkeypatch.setattr(_ecs, "_tasks", {
+        "a": _task("10.0.0.1"),
+        # carries the group but no startedBy — still this service's task
+        "b": _task("10.0.0.2", startedBy=None),
+        # right group, wrong cluster
+        "c": _task("10.0.0.3", clusterArn="arn:aws:ecs:us-east-1:000000000000:cluster/other"),
+        # right cluster, different service
+        "d": _task("10.0.0.4", group="service:someone-else"),
+        # this service, not running
+        "e": _task("10.0.0.5", lastStatus="STOPPED"),
+    })
+
+    _ecs._sync_service_targets("pred-c", svc)
+    assert sorted(t["Id"] for t in _alb._targets[tg_arn]) == ["10.0.0.1", "10.0.0.2"]
+
+
+def test_ecs_sync_service_targets_does_not_publish_a_stale_view(monkeypatch):
+    """A slow reconciliation must not overwrite a newer one's registration.
+
+    The failure this guards is last-writer-wins on a stale read: a reconcile that
+    sampled the tasks before a scale-in, but publishes after it, would re-register
+    the tasks that scale-in removed. Serialising the read and the publish means the
+    last write is also the last read, so the final registration matches the final
+    task state.
+    """
+    import threading
+
+    from ministack.services import alb as _alb
+    from ministack.services import ecs as _ecs
+
+    tg_arn = "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/tg-stale/abc"
+    _alb._tgs[tg_arn] = {"TargetGroupArn": tg_arn, "Port": 80, "TargetType": "ip"}
+    _alb._targets[tg_arn] = []
+
+    svc = {
+        "serviceName": "stale-svc",
+        "clusterArn": "arn:aws:ecs:us-east-1:000000000000:cluster/stale-c",
+        "status": "ACTIVE",
+        "loadBalancers": [{"targetGroupArn": tg_arn, "containerName": "web", "containerPort": 80}],
+    }
+
+    def _task(ip):
+        return {
+            "group": "service:stale-svc",
+            "clusterArn": svc["clusterArn"],
+            "lastStatus": "RUNNING",
+            "attachments": [{
+                "type": "ElasticNetworkInterface",
+                "details": [{"name": "privateIPv4Address", "value": ip}],
+            }],
+        }
+
+    before = {ip: _task(ip) for ip in ("10.3.0.1", "10.3.0.2", "10.3.0.3")}
+    after = {"10.3.0.1": _task("10.3.0.1")}          # scaled in to one task
+    shared = dict(before)
+    monkeypatch.setattr(_ecs, "_tasks", shared, raising=False)
+
+    sampled = threading.Event()
+    scaled_in = threading.Event()
+
+    real_task_ip = _ecs._task_ip
+    slowed = {"done": False}
+
+    def slow_task_ip(task):
+        # Let the first reconcile sample the pre-scale-in state, then stall it
+        # until the scale-in has happened and been published by the other thread.
+        if not slowed["done"]:
+            slowed["done"] = True
+            sampled.set()
+            scaled_in.wait(timeout=5)
+        return real_task_ip(task)
+
+    monkeypatch.setattr(_ecs, "_task_ip", slow_task_ip)
+
+    slow = threading.Thread(target=_ecs._sync_service_targets, args=("stale-c", svc))
+    slow.start()
+
+    assert sampled.wait(timeout=5), "the slow reconcile never sampled"
+    shared.clear()
+    shared.update(after)
+    _ecs._sync_service_targets("stale-c", svc)   # the newer, post-scale-in view
+    scaled_in.set()
+    slow.join(timeout=10)
+
+    final = sorted(t["Id"] for t in _alb._targets[tg_arn])
+    assert final == ["10.3.0.1"], f"a stale view was published: {final}"
