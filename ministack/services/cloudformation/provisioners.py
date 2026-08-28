@@ -6670,6 +6670,110 @@ def _iot_policy_delete(physical_id, props):
     _iot._policies.pop(physical_id, None)
 
 
+def _iot_provisioning_template_body(props):
+    body = props.get("TemplateBody")
+    # TemplateBody is a JSON *string* in the CloudFormation schema; a template
+    # that inlines it as an object is serialized, never key-cased — the
+    # document's own Parameters/Resources keys are part of its contract.
+    return json.dumps(body) if isinstance(body, (dict, list)) else body
+
+
+def _iot_provisioning_template_payload(name, props):
+    payload = {
+        "templateName": name,
+        "templateBody": _iot_provisioning_template_body(props),
+        "provisioningRoleArn": props.get("ProvisioningRoleArn"),
+    }
+    if "Description" in props:
+        payload["description"] = props["Description"]
+    if "Enabled" in props:
+        payload["enabled"] = props["Enabled"]
+    if "TemplateType" in props:
+        payload["type"] = props["TemplateType"]
+    if props.get("PreProvisioningHook"):
+        payload["preProvisioningHook"] = _pascal_to_camel(props["PreProvisioningHook"])
+    return payload
+
+
+def _iot_provisioning_template_attrs(name):
+    arn = _iot._provisioning_template_arn(name)
+    # Real CloudFormation exposes the ARN as TemplateArn; Arn is kept alongside
+    # for symmetry with the other IoT provisioners here.
+    return {"TemplateArn": arn, "Arn": arn}
+
+
+def _iot_provisioning_template_create(logical_id, props, stack_name):
+    # TemplateName is optional in the CloudFormation schema; template names cap
+    # at 36 chars, so the generated fallback must stay within that.
+    name = props.get("TemplateName") or _physical_name(
+        stack_name, logical_id, max_len=36
+    )
+    resp = _iot._create_provisioning_template(
+        _iot_provisioning_template_payload(name, props)
+    )
+    if resp[0] == 409:
+        # Re-create of a surviving template (rollback replay re-enters create):
+        # adopt it and apply the declared properties in place instead of
+        # failing the stack. Tradeoff: a template the user created out of band
+        # under the same name is adopted too (and mutated/deleted with the
+        # stack from here on) — an accepted simplification.
+        return _iot_provisioning_template_update(name, {}, props, stack_name, logical_id)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::ProvisioningTemplate create failed: {resp[2]!r}")
+    return name, _iot_provisioning_template_attrs(name)
+
+
+def _iot_provisioning_template_update(physical_id, old_props, new_props, stack_name,
+                                      logical_id=None):
+    """Apply a template change in place through UpdateProvisioningTemplate.
+
+    A TemplateName change is a replacement, handled the way AWS::IoT::Policy's
+    rename is: the new template is created and the old one removed, since a
+    template no stack still declares is not left behind. TemplateBody is not
+    an UpdateProvisioningTemplate member (AWS stores it as a new version via
+    CreateProvisioningTemplateVersion, which MiniStack does not model), so a
+    changed body is written onto the stored record directly — the template
+    always stays at defaultVersionId 1. TemplateType is create-only on AWS
+    (a change replaces the template); a changed value is ignored here.
+    """
+    name = new_props.get("TemplateName") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=36
+    )
+    if name != physical_id:
+        created = _iot_provisioning_template_create(
+            logical_id or physical_id, new_props, stack_name
+        )
+        _iot_provisioning_template_delete(physical_id, old_props)
+        return created
+    payload = _iot_provisioning_template_payload(name, new_props)
+    payload.pop("templateName", None)
+    payload.pop("templateBody", None)
+    payload.pop("type", None)
+    # A member the stack omits must stay untouched, not be nulled — e.g. a
+    # template update without ProvisioningRoleArn keeps the stored role.
+    payload = {k: v for k, v in payload.items() if v is not None}
+    if new_props.get("PreProvisioningHook") is None and old_props.get("PreProvisioningHook"):
+        payload["removePreProvisioningHook"] = True
+    resp = _iot._update_provisioning_template(name, payload)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::ProvisioningTemplate update failed: {resp[2]!r}")
+    body = _iot_provisioning_template_body(new_props)
+    tmpl = _iot._provisioning_templates.get(name)
+    if tmpl is not None and body and body != tmpl.get("templateBody"):
+        err = _iot._validate_provisioning_template_body(body)
+        if err is not None:
+            raise ValueError(
+                f"AWS::IoT::ProvisioningTemplate update failed: {err[2]!r}"
+            )
+        tmpl["templateBody"] = body
+        _iot._provisioning_templates[name] = tmpl
+    return name, _iot_provisioning_template_attrs(name)
+
+
+def _iot_provisioning_template_delete(physical_id, props):
+    _iot._delete_provisioning_template(physical_id)
+
+
 def _cognito_identity_pool_role_attachment_create(logical_id, props, stack_name):
     iid = props.get("IdentityPoolId")
     if not iid:
@@ -6987,6 +7091,12 @@ _RESOURCE_HANDLERS = {
         "update": _iot_policy_update,
         "update_with_logical_id": True,
         "delete": _iot_policy_delete,
+    },
+    "AWS::IoT::ProvisioningTemplate": {
+        "create": _iot_provisioning_template_create,
+        "update": _iot_provisioning_template_update,
+        "update_with_logical_id": True,
+        "delete": _iot_provisioning_template_delete,
     },
     "AWS::Cognito::IdentityPoolRoleAttachment": {
         "create": _cognito_identity_pool_role_attachment_create,

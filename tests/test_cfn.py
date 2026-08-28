@@ -650,6 +650,155 @@ def test_cfn_iot_policy_rename_replaces_the_policy(cfn, iot_client):
     _wait_stack(cfn, "cfn-iot-pol-ren")
 
 
+def _cfn_provisioning_template_body(marker="one"):
+    # The IoT control plane refuses a body without an AWS::IoT::Certificate
+    # resource, so every stack body carries one; `marker` varies the body so a
+    # stack update can carry a genuinely changed TemplateBody.
+    return json.dumps({
+        "Parameters": {"SerialNumber": {"Type": "String"}},
+        "Resources": {
+            "certificate": {"Type": "AWS::IoT::Certificate",
+                            "Properties": {"CertificateId":
+                                           {"Ref": "AWS::IoT::Certificate::Id"}}},
+            "thing": {"Type": "AWS::IoT::Thing",
+                      "Properties": {"ThingName": {"Ref": "SerialNumber"},
+                                     "AttributePayload": {"Attributes":
+                                                          {"marker": marker}}}},
+        },
+    })
+
+
+def test_cfn_iot_provisioning_template(cfn, iot_client):
+    """AWS::IoT::ProvisioningTemplate provisions onto the IoT control plane
+    instead of rolling the stack back, is readable through the real API, and
+    Description + TemplateBody changes apply in place under the same
+    physical id."""
+
+    def template(description, body):
+        return json.dumps({
+            "Resources": {"PT": {"Type": "AWS::IoT::ProvisioningTemplate", "Properties": {
+                "TemplateName": "cfn-provtemplate",
+                "Description": description,
+                "Enabled": True,
+                "ProvisioningRoleArn": "arn:aws:iam::000000000000:role/provisioning",
+                "TemplateBody": body}}},
+            "Outputs": {"Name": {"Value": {"Ref": "PT"}},
+                        "Arn": {"Value": {"Fn::GetAtt": ["PT", "TemplateArn"]}}},
+        })
+
+    body_before = _cfn_provisioning_template_body("before")
+    cfn.create_stack(StackName="cfn-iot-provtmpl",
+                     TemplateBody=template("before", body_before))
+    stack = _wait_stack(cfn, "cfn-iot-provtmpl")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+    assert outputs["Name"] == "cfn-provtemplate"
+    assert outputs["Arn"].endswith(":provisioningtemplate/cfn-provtemplate")
+
+    desc = iot_client.describe_provisioning_template(templateName="cfn-provtemplate")
+    assert desc["description"] == "before"
+    assert desc["enabled"] is True
+    assert desc["templateBody"] == body_before
+    assert desc["templateArn"] == outputs["Arn"]
+
+    body_after = _cfn_provisioning_template_body("after")
+    cfn.update_stack(StackName="cfn-iot-provtmpl",
+                     TemplateBody=template("after", body_after))
+    stack = _wait_stack(cfn, "cfn-iot-provtmpl")
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+    assert next(
+        o["OutputValue"] for o in stack["Outputs"] if o["OutputKey"] == "Name"
+    ) == "cfn-provtemplate"
+    desc = iot_client.describe_provisioning_template(templateName="cfn-provtemplate")
+    assert desc["description"] == "after"
+    assert desc["enabled"] is True
+    assert desc["templateBody"] == body_after
+    assert desc["provisioningRoleArn"] == "arn:aws:iam::000000000000:role/provisioning"
+
+    cfn.delete_stack(StackName="cfn-iot-provtmpl")
+    _wait_stack(cfn, "cfn-iot-provtmpl")
+    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        iot_client.describe_provisioning_template(templateName="cfn-provtemplate")
+
+
+def test_cfn_iot_provisioning_template_rename_replaces(cfn, iot_client):
+    """A TemplateName change replaces the template the way AWS::IoT::Policy's
+    rename does: new physical id, old template gone."""
+    body = _cfn_provisioning_template_body()
+
+    def template(name):
+        return json.dumps({
+            "Resources": {"PT": {"Type": "AWS::IoT::ProvisioningTemplate", "Properties": {
+                "TemplateName": name,
+                "ProvisioningRoleArn": "arn:aws:iam::000000000000:role/provisioning",
+                "TemplateBody": body}}},
+            "Outputs": {"Name": {"Value": {"Ref": "PT"}}},
+        })
+
+    cfn.create_stack(StackName="cfn-iot-provtmpl-ren",
+                     TemplateBody=template("cfn-provtemplate-old"))
+    assert _wait_stack(cfn, "cfn-iot-provtmpl-ren")["StackStatus"] == "CREATE_COMPLETE"
+
+    cfn.update_stack(StackName="cfn-iot-provtmpl-ren",
+                     TemplateBody=template("cfn-provtemplate-new"))
+    stack = _wait_stack(cfn, "cfn-iot-provtmpl-ren")
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+    assert next(
+        o["OutputValue"] for o in stack["Outputs"] if o["OutputKey"] == "Name"
+    ) == "cfn-provtemplate-new"
+    iot_client.describe_provisioning_template(templateName="cfn-provtemplate-new")
+    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        iot_client.describe_provisioning_template(templateName="cfn-provtemplate-old")
+
+    cfn.delete_stack(StackName="cfn-iot-provtmpl-ren")
+    _wait_stack(cfn, "cfn-iot-provtmpl-ren")
+    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        iot_client.describe_provisioning_template(templateName="cfn-provtemplate-new")
+
+
+def test_cfn_iot_provisioning_template_generated_name(cfn, iot_client):
+    """TemplateName is optional in the CloudFormation schema: an omitted one
+    gets a generated physical name that satisfies the 36-char template-name
+    limit, and an in-place update keeps that name stable."""
+
+    def template(description):
+        return json.dumps({
+            "Resources": {"PT": {"Type": "AWS::IoT::ProvisioningTemplate", "Properties": {
+                "Description": description,
+                "ProvisioningRoleArn": "arn:aws:iam::000000000000:role/provisioning",
+                "TemplateBody": _cfn_provisioning_template_body()}}},
+            "Outputs": {"Name": {"Value": {"Ref": "PT"}}},
+        })
+
+    cfn.create_stack(StackName="cfn-iot-provtmpl-auto",
+                     TemplateBody=template("before"))
+    stack = _wait_stack(cfn, "cfn-iot-provtmpl-auto")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    name = next(
+        o["OutputValue"] for o in stack["Outputs"] if o["OutputKey"] == "Name"
+    )
+    assert re.fullmatch(r"[0-9A-Za-z_-]{1,36}", name)
+    assert iot_client.describe_provisioning_template(
+        templateName=name
+    )["description"] == "before"
+
+    cfn.update_stack(StackName="cfn-iot-provtmpl-auto",
+                     TemplateBody=template("after"))
+    stack = _wait_stack(cfn, "cfn-iot-provtmpl-auto")
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+    assert next(
+        o["OutputValue"] for o in stack["Outputs"] if o["OutputKey"] == "Name"
+    ) == name
+    assert iot_client.describe_provisioning_template(
+        templateName=name
+    )["description"] == "after"
+
+    cfn.delete_stack(StackName="cfn-iot-provtmpl-auto")
+    _wait_stack(cfn, "cfn-iot-provtmpl-auto")
+    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        iot_client.describe_provisioning_template(templateName=name)
+
+
 def test_cfn_lambda_layer_version_permission(cfn, lam):
     """AWS::Lambda::LayerVersionPermission attaches a statement to the real
     layer version's policy, readable via GetLayerVersionPolicy. (#1345, item 5)"""
