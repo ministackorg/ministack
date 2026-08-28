@@ -5346,9 +5346,9 @@ def _parse_jobs_topic(topic: str) -> tuple[str, str, str | None] | None:
     jobIds control-side) is unroutable here: its topics collide with the
     reserved thing-level and notification topics, so such a job can only be
     worked over HTTP."""
-    if not topic.startswith(_SHADOW_TOPIC_PREFIX):
+    if not topic.startswith(SHADOW_TOPIC_PREFIX):
         return None
-    rest = topic[len(_SHADOW_TOPIC_PREFIX):]
+    rest = topic[len(SHADOW_TOPIC_PREFIX):]
     parts = rest.split("/")
     if len(parts) < 3 or parts[1] != "jobs":
         return None
@@ -5441,7 +5441,7 @@ async def _handle_jobs_publish(
     write-once so there is never more than one execution to address. Every
     ``timestamp`` and execution stamp is epoch seconds; ``jobDocument`` is
     served as a JSON object here (over HTTP it stays a string, as on AWS)."""
-    base = f"{_SHADOW_TOPIC_PREFIX}{thing}/jobs"
+    base = f"{SHADOW_TOPIC_PREFIX}{thing}/jobs"
     suffix_base = f"{job_id}/{verb}" if job_id is not None else verb
 
     async def _respond(kind: str, doc: dict) -> None:
