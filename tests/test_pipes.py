@@ -5,7 +5,9 @@ from urllib.parse import quote
 import pytest
 
 from ministack.core.responses import (
+    _request_account_id,
     _request_region,
+    json_response,
     set_request_account_id,
     set_request_region,
 )
@@ -212,6 +214,123 @@ def test_pipes_dynamodb_stream_read_rejects_cross_account_source(monkeypatch):
         assert delivered == []
         assert _pipes._positions[pipe_arn] == 0
     finally:
+        _pipes.reset()
+        _ddb._stream_records.clear()
+
+
+def test_pipes_dynamodb_stream_starts_state_machine_with_the_whole_batch(monkeypatch):
+    """A `states` target receives one StartExecution carrying the batch as an array."""
+    from ministack.services import stepfunctions as _sfn
+
+    _pipes.reset()
+    _ddb._stream_records.clear()
+    region_token = _request_region.set("us-east-1")
+    try:
+        table_name = "PipeTable"
+        source_arn = _stream_arn("us-east-1", table_name)
+        target_arn = "arn:aws:states:us-east-1:000000000000:stateMachine:PipeMachine"
+        pipe_arn = "arn:aws:pipes:us-east-1:000000000000:pipe/PipeName"
+        records = [
+            {"eventID": "evt-1", "eventSource": "aws:dynamodb"},
+            {"eventID": "evt-2", "eventSource": "aws:dynamodb"},
+        ]
+
+        _ddb._stream_records.set_scoped("000000000000", "us-east-1", table_name, records)
+        _pipes._pipes["PipeName"] = {
+            "Name": "PipeName",
+            "Arn": pipe_arn,
+            "Source": source_arn,
+            "Target": target_arn,
+            "CurrentState": "RUNNING",
+            "StartingPosition": "TRIM_HORIZON",
+        }
+        _pipes._positions[pipe_arn] = 0
+
+        started = []
+
+        def _record(data):
+            started.append(data)
+            return json_response({"executionArn": "arn:aws:states:x", "startDate": "t"})
+
+        monkeypatch.setattr(_sfn, "_start_execution", _record)
+
+        _pipes._poll_once()
+
+        assert len(started) == 1, "the batch is one execution, not one per record"
+        assert started[0]["stateMachineArn"] == target_arn
+        assert json.loads(started[0]["input"]) == records
+        assert _pipes._positions[pipe_arn] == 2
+    finally:
+        _request_region.reset(region_token)
+        _pipes.reset()
+        _ddb._stream_records.clear()
+
+
+def test_pipes_holds_the_batch_when_the_state_machine_does_not_exist(caplog):
+    """A StartExecution that fails leaves the position on the batch, so the next
+    poll redelivers it instead of skipping the records."""
+    _pipes.reset()
+    _ddb._stream_records.clear()
+    region_token = _request_region.set("us-east-1")
+    account_token = _request_account_id.set("000000000000")
+    try:
+        table_name = "PipeTable"
+        pipe_arn = "arn:aws:pipes:us-east-1:000000000000:pipe/PipeName"
+        records = [{"eventID": "evt-1"}, {"eventID": "evt-2"}]
+        _ddb._stream_records.set_scoped("000000000000", "us-east-1", table_name, records)
+        _pipes._pipes["PipeName"] = {
+            "Name": "PipeName",
+            "Arn": pipe_arn,
+            "Source": _stream_arn("us-east-1", table_name),
+            "Target": "arn:aws:states:us-east-1:000000000000:stateMachine:Missing",
+            "CurrentState": "RUNNING",
+            "StartingPosition": "TRIM_HORIZON",
+        }
+        _pipes._positions[pipe_arn] = 0
+
+        with caplog.at_level("WARNING"):
+            _pipes._poll_once()
+
+        assert "StartExecution" in caplog.text and "PipeName" in caplog.text
+        assert _pipes._positions[pipe_arn] == 0, "an undelivered batch is not skipped"
+    finally:
+        _request_account_id.reset(account_token)
+        _request_region.reset(region_token)
+        _pipes.reset()
+        _ddb._stream_records.clear()
+
+
+def test_pipes_target_this_poller_cannot_deliver_to_says_so(caplog):
+    """A pipe reporting RUNNING while dropping every record names the target it cannot serve."""
+    _pipes.reset()
+    _ddb._stream_records.clear()
+    region_token = _request_region.set("us-east-1")
+    try:
+        table_name = "PipeTable"
+        source_arn = _stream_arn("us-east-1", table_name)
+        target_arn = "arn:aws:sqs:us-east-1:000000000000:PipeQueue"
+        pipe_arn = "arn:aws:pipes:us-east-1:000000000000:pipe/PipeName"
+
+        _ddb._stream_records.set_scoped(
+            "000000000000", "us-east-1", table_name,
+            [{"eventID": "evt-1", "eventSource": "aws:dynamodb"}])
+        _pipes._pipes["PipeName"] = {
+            "Name": "PipeName",
+            "Arn": pipe_arn,
+            "Source": source_arn,
+            "Target": target_arn,
+            "CurrentState": "RUNNING",
+            "StartingPosition": "TRIM_HORIZON",
+        }
+        _pipes._positions[pipe_arn] = 0
+
+        with caplog.at_level("WARNING"):
+            _pipes._poll_once()
+
+        assert "sqs" in caplog.text and "PipeName" in caplog.text
+        assert _pipes._positions[pipe_arn] == 0
+    finally:
+        _request_region.reset(region_token)
         _pipes.reset()
         _ddb._stream_records.clear()
 
