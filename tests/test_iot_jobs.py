@@ -8,7 +8,8 @@ DescribeJobExecution incl. the `$next` sentinel, UpdateJobExecution).
 
 The timestamp contract is asserted explicitly: control-plane responses use
 `timestamp` shapes (epoch seconds — botocore parses them to datetimes),
-data-plane responses use raw `long` shapes (epoch milliseconds).
+data-plane responses use raw `long` shapes carrying whole epoch seconds
+(the API reference words them as "the time, in seconds since the epoch").
 """
 
 import json
@@ -112,15 +113,16 @@ def _cleanup(iot_client, jobs=(), things=(), groups=()):
             pass
 
 
-def _assert_ms_epoch(value):
-    """A data-plane stamp must be an epoch-milliseconds integer (a `long` on
-    the wire) — seconds here would be off by 1000x."""
+def _assert_epoch_seconds(value):
+    """A data-plane stamp must be a whole epoch-seconds integer (a `long` on
+    the wire, documented "in seconds since the epoch") — milliseconds here
+    would be off by 1000x."""
     assert isinstance(value, int)
-    assert abs(value - time.time() * 1000) < 5 * 60 * 1000
+    assert abs(value - time.time()) < 5 * 60
 
 
 # ---------------------------------------------------------------------------
-# Create / describe / document — and the seconds-vs-milliseconds contract
+# Create / describe / document — and the timestamp contract
 # ---------------------------------------------------------------------------
 
 
@@ -156,9 +158,9 @@ def test_iot_jobs_create_describe_and_pending(iot_client, iot_jobs_data):
         assert [q["jobId"] for q in queued] == [job_id]
         assert queued[0]["versionNumber"] == 1
         assert queued[0]["executionNumber"] == 1
-        # Data plane emits `long` shapes: raw epoch milliseconds.
-        _assert_ms_epoch(queued[0]["queuedAt"])
-        _assert_ms_epoch(queued[0]["lastUpdatedAt"])
+        # Data plane emits `long` shapes: whole epoch seconds.
+        _assert_epoch_seconds(queued[0]["queuedAt"])
+        _assert_epoch_seconds(queued[0]["lastUpdatedAt"])
     finally:
         _cleanup(iot_client, jobs=[job_id], things=[thing])
 
@@ -244,7 +246,7 @@ def test_iot_jobs_start_next_update_and_auto_complete(iot_client, iot_jobs_data)
         assert execution["status"] == "IN_PROGRESS"
         assert execution["versionNumber"] == 2  # start bumped it from 1
         assert execution["jobDocument"] == _DOCUMENT
-        _assert_ms_epoch(execution["startedAt"])
+        _assert_epoch_seconds(execution["startedAt"])
 
         pending = iot_jobs_data.get_pending_job_executions(thingName=thing)
         assert [e["jobId"] for e in pending["inProgressJobs"]] == [job_id]
@@ -268,7 +270,7 @@ def test_iot_jobs_start_next_update_and_auto_complete(iot_client, iot_jobs_data)
         error = ei.value.response["Error"]
         assert error["Code"] == "InvalidStateTransitionException"
         assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
-        assert "current version 2" in error["Message"]
+        assert "found version 2" in error["Message"]
 
         updated = iot_jobs_data.update_job_execution(
             jobId=job_id,
@@ -813,7 +815,7 @@ def test_iot_jobs_cancel_execution_wrong_expected_version(iot_client):
             )
         error = ei.value.response["Error"]
         assert error["Code"] == "VersionConflictException"
-        assert "current version 1" in error["Message"]
+        assert "found version 1" in error["Message"]
 
         execution = iot_client.describe_job_execution(
             jobId=job_id, thingName=thing

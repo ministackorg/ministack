@@ -488,7 +488,7 @@ async def handle_request(
     if path.startswith("/things/"):
         _thing, _, _sub = path[len("/things/"):].partition("/")
         if _thing and (_sub == "jobs" or _sub.startswith("jobs/")):
-            return _handle_thing_jobs(method, path, body, qp)
+            return await _handle_thing_jobs(method, path, body, qp)
     if path.startswith("/things/") and method in ("POST", "GET", "PATCH", "DELETE"):
         return _handle_thing(method, path, body, qp)
 
@@ -583,7 +583,7 @@ async def handle_request(
     if path == "/jobs" and method == "GET":
         return _list_jobs(qp)
     if path.startswith("/jobs/"):
-        return _handle_job(method, path, body, qp)
+        return await _handle_job(method, path, body, qp)
 
     # Topic rules
     if path == "/rules" and method == "GET":
@@ -3659,15 +3659,19 @@ _DEVICE_SETTABLE_STATUSES = {"IN_PROGRESS", "SUCCEEDED", "FAILED", "REJECTED"}
 
 
 def _jobs_now_ms() -> int:
-    """Epoch MILLISECONDS — the unit job/execution records store internally.
+    """Epoch MILLISECONDS — the unit job/execution records store internally
+    (millisecond resolution keeps same-second executions in queue order).
 
-    The two planes emit different units for these same instants: the `iot`
-    control plane models them as `timestamp` shapes, which botocore parses
-    as epoch SECONDS (so control-plane responses divide by 1000 via
-    :func:`_jobs_ms_to_s`), while `iot-jobs-data` models them as raw `long`
-    shapes carrying epoch MILLISECONDS (emitted as-is). Mixing the units up
-    makes botocore explode while parsing ("year 58580 is out of range"), so
-    every response path converts explicitly at the edge.
+    Every response edge emits epoch SECONDS, which is how the API reference
+    words every job/execution stamp ("the time, in seconds since the epoch"):
+    the `iot` control plane models them as `timestamp` shapes (floats via
+    :func:`_jobs_ms_to_s` — botocore parses them into datetimes), while
+    `iot-jobs-data` and the jobs-over-MQTT bridge model them as raw `long`
+    shapes carrying whole seconds (:func:`_jobs_ms_to_long_s`). Serving the
+    stored milliseconds through either edge is off by 1000x — botocore
+    explodes parsing a `timestamp` shape ("year 58580 is out of range"), and
+    a device diffing a `long` stamp against its own clock sees the same
+    year-58580 nonsense.
     """
     return int(time.time() * 1000)
 
@@ -3675,6 +3679,12 @@ def _jobs_now_ms() -> int:
 def _jobs_ms_to_s(millis: int | None) -> float | None:
     """Millisecond record stamp → epoch-seconds float for `timestamp` shapes."""
     return None if millis is None else millis / 1000.0
+
+
+def _jobs_ms_to_long_s(millis: int | None) -> int | None:
+    """Millisecond record stamp → whole epoch seconds for the device plane's
+    `long` shapes."""
+    return None if millis is None else millis // 1000
 
 
 def _job_arn(job_id: str) -> str:
@@ -3810,8 +3820,8 @@ def _jobs_check_expected_version(
     if expected != execution["versionNumber"]:
         return error_response_json(
             conflict_code,
-            f"Expected version {expected} does not match current version "
-            f"{execution['versionNumber']} of the job execution",
+            f"Expected version {expected} but found version "
+            f"{execution['versionNumber']}",
             409,
         )
     return None
@@ -3829,11 +3839,15 @@ def _jobs_reject_if_terminal(execution: dict, verb: str) -> tuple | None:
     )
 
 
-def _handle_job(method: str, path: str, body: bytes, qp: dict) -> tuple:
-    """Dispatch /jobs/{jobId}[...] control-plane routes."""
+async def _handle_job(method: str, path: str, body: bytes, qp: dict) -> tuple:
+    """Dispatch /jobs/{jobId}[...] control-plane routes.
+
+    Async because CreateJob, CancelJob, and DeleteJob publish
+    jobs/notify(-next) through the broker — the same reason
+    _register_certificate is async."""
     suffix = path[len("/jobs/"):]
     if suffix.endswith("/cancel") and method == "PUT":
-        return _cancel_job(suffix[:-len("/cancel")], _parse_body(body), qp)
+        return await _cancel_job(suffix[:-len("/cancel")], _parse_body(body), qp)
     if suffix.endswith("/job-document") and method == "GET":
         return _get_job_document(suffix[:-len("/job-document")])
     if "/" in suffix:
@@ -3842,17 +3856,17 @@ def _handle_job(method: str, path: str, body: bytes, qp: dict) -> tuple:
         )
     job_id = suffix
     if method == "PUT":
-        return _create_job(job_id, _parse_body(body))
+        return await _create_job(job_id, _parse_body(body))
     if method == "GET":
         return _describe_job(job_id)
     if method == "DELETE":
-        return _delete_job(job_id, qp)
+        return await _delete_job(job_id, qp)
     return error_response_json(
         "InvalidRequestException", f"Unsupported method: {method}", 400
     )
 
 
-def _create_job(job_id: str, payload: dict) -> tuple:
+async def _create_job(job_id: str, payload: dict) -> tuple:
     if not job_id or not _JOB_ID_RE.match(job_id):
         return error_response_json(
             "InvalidRequestException",
@@ -3884,6 +3898,7 @@ def _create_job(job_id: str, payload: dict) -> tuple:
     # Every target must name a thing or thing group this caller can reach, as
     # on AWS — and reach means under the SAME account and region, which is what
     # the materializer resolves against.
+    target_things: set[str] = set()
     for arn in targets:
         try:
             parse_arn(arn)
@@ -3891,10 +3906,12 @@ def _create_job(job_id: str, payload: dict) -> tuple:
             return error_response_json(
                 "InvalidRequestException", f"Invalid target arn: {arn}", 400
             )
-        if _job_target_resolve(arn) is None:
+        resolved = _job_target_resolve(arn)
+        if resolved is None:
             return error_response_json(
                 "ResourceNotFoundException", f"Job target {arn} not found", 404
             )
+        target_things.update(resolved)
     document = payload.get("document")
     if not document and payload.get("documentSource"):
         # DELIBERATE DIVERGENCE: AWS fetches the document from the S3 URL and
@@ -3904,6 +3921,10 @@ def _create_job(job_id: str, payload: dict) -> tuple:
         # A device that parses the document therefore sees the URL, not the
         # payload; pass `document` when the content matters.
         document = json.dumps({"documentSource": payload["documentSource"]})
+    # Captured BEFORE the job record exists: jobs_first_pending_job_id
+    # materializes, and once the new job is in the store it would already
+    # count as the front of the queue.
+    prev_next = {t: jobs_first_pending_job_id(t) for t in target_things}
     now = _jobs_now_ms()
     _jobs[job_id] = {
         "jobId": job_id,
@@ -3923,6 +3944,17 @@ def _create_job(job_id: str, payload: dict) -> tuple:
         "snapshotted": False,
     }
     _jobs_materialize_executions(job_id)
+    # New QUEUED executions joined each target's pending set — notify, as AWS
+    # does (notify-next only reaches the things whose queue front changed).
+    account_id, region = get_account_id(), get_region()
+    for thing_name in sorted({
+        execution["thingName"]
+        for execution in _job_executions.values()
+        if execution["jobId"] == job_id
+    }):
+        await jobs_notify_thing(
+            account_id, region, thing_name, prev_next.get(thing_name)
+        )
     response = {"jobArn": _job_arn(job_id), "jobId": job_id}
     if payload.get("description") is not None:
         response["description"] = payload["description"]
@@ -3980,7 +4012,7 @@ def _describe_job(job_id: str) -> tuple:
     return json_response(response)
 
 
-def _delete_job(job_id: str, qp: dict) -> tuple:
+async def _delete_job(job_id: str, qp: dict) -> tuple:
     job = _jobs.get(job_id)
     if job is None:
         return _error_not_found("Job", job_id)
@@ -3992,9 +4024,21 @@ def _delete_job(job_id: str, qp: dict) -> tuple:
             "without force",
             409,
         )
+    # Sweeping the executions removes any pending ones from their thing's
+    # pending set — notify those things, as AWS does on execution removal.
+    affected = sorted({
+        execution["thingName"]
+        for execution in _job_executions.values()
+        if execution["jobId"] == job_id
+        and execution["status"] in ("QUEUED", "IN_PROGRESS")
+    })
+    prev_next = {t: jobs_first_pending_job_id(t) for t in affected}
     del _jobs[job_id]
     for key in [k for k in _job_executions.keys() if k[1] == job_id]:
         del _job_executions[key]
+    account_id, region = get_account_id(), get_region()
+    for thing_name in affected:
+        await jobs_notify_thing(account_id, region, thing_name, prev_next[thing_name])
     return json_response({})
 
 
@@ -4023,7 +4067,7 @@ def _get_job_document(job_id: str) -> tuple:
     return json_response({"document": job.get("document") or "{}"})
 
 
-def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:
+async def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:
     job = _jobs.get(job_id)
     if job is None:
         return _error_not_found("Job", job_id)
@@ -4043,7 +4087,16 @@ def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:
     if payload.get("reasonCode") is not None:
         job["reasonCode"] = payload["reasonCode"]
     # QUEUED executions are always canceled with the job; IN_PROGRESS ones
-    # only when force is set — as on AWS.
+    # only when force is set — as on AWS. Queue fronts are snapshotted before
+    # the sweep so notify-next fires only where the front actually changed.
+    prev_next = {
+        execution["thingName"]: None
+        for execution in _job_executions.values()
+        if execution["jobId"] == job_id
+    }
+    for thing_name in prev_next:
+        prev_next[thing_name] = jobs_first_pending_job_id(thing_name)
+    canceled_things = set()
     for execution in _job_executions.values():
         if execution["jobId"] != job_id:
             continue
@@ -4053,14 +4106,20 @@ def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:
             execution["status"] = "CANCELED"
             execution["lastUpdatedAt"] = now
             execution["versionNumber"] += 1
+            canceled_things.add(execution["thingName"])
+    account_id, region = get_account_id(), get_region()
+    for thing_name in sorted(canceled_things):
+        await jobs_notify_thing(account_id, region, thing_name, prev_next[thing_name])
     response = {"jobArn": job["jobArn"], "jobId": job_id}
     if job.get("description") is not None:
         response["description"] = job["description"]
     return json_response(response)
 
 
-def _handle_thing_jobs(method: str, path: str, body: bytes, qp: dict) -> tuple:
-    """Dispatch /things/{name}/jobs[...] control-plane routes."""
+async def _handle_thing_jobs(method: str, path: str, body: bytes, qp: dict) -> tuple:
+    """Dispatch /things/{name}/jobs[...] control-plane routes.
+
+    Async because CancelJobExecution publishes jobs/notify(-next)."""
     rest = path[len("/things/"):]
     thing, _, sub = rest.partition("/")
     err = _validate_name(thing, "thingName")
@@ -4078,7 +4137,7 @@ def _handle_thing_jobs(method: str, path: str, body: bytes, qp: dict) -> tuple:
         )
     tail = sub[len("jobs/"):]
     if tail.endswith("/cancel") and method == "PUT":
-        return _cancel_job_execution(
+        return await _cancel_job_execution(
             thing, tail[:-len("/cancel")], _parse_body(body), qp
         )
     if "/" not in tail and method == "GET":
@@ -4139,7 +4198,7 @@ def _describe_job_execution(thing: str, job_id: str) -> tuple:
     return json_response({"execution": view})
 
 
-def _cancel_job_execution(
+async def _cancel_job_execution(
     thing: str, job_id: str, payload: dict, qp: dict
 ) -> tuple:
     _jobs_materialize_executions(job_id)
@@ -4161,12 +4220,14 @@ def _cancel_job_execution(
             "Job execution is IN_PROGRESS and cannot be canceled without force",
             409,
         )
+    prev_next = jobs_first_pending_job_id(thing)
     execution["status"] = "CANCELED"
     if payload.get("statusDetails"):
         execution["statusDetails"] = dict(payload["statusDetails"])
     execution["lastUpdatedAt"] = _jobs_now_ms()
     execution["versionNumber"] += 1
     _jobs_maybe_complete(job_id)
+    await jobs_notify_thing(get_account_id(), get_region(), thing, prev_next)
     return json_response({})
 
 
@@ -4236,6 +4297,17 @@ def jobs_start_next_execution(
     return dict(execution)
 
 
+def jobs_first_pending_job_id(thing_name: str) -> str | None:
+    """jobId at the front of the thing's pending queue — the execution
+    ``notify-next`` points at — or ``None`` when the thing is idle.
+
+    Callers about to mutate the pending set capture this BEFORE the mutation
+    and hand it to :func:`jobs_notify_thing`, which publishes ``notify-next``
+    only when the front actually changed."""
+    pending = jobs_pending_for_thing(thing_name)
+    return pending[0]["jobId"] if pending else None
+
+
 def jobs_describe_execution(thing_name: str, job_id: str) -> dict | None:
     """One execution (a copy), materializing the job's targets first."""
     _jobs_materialize_executions(job_id)
@@ -4247,6 +4319,18 @@ def jobs_job_document(job_id: str) -> str:
     """The document a device should run for a job — ``{}`` if there is none."""
     job = _jobs.get(job_id)
     return (job or {}).get("document") or "{}"
+
+
+def _jobs_job_document_object(job_id: str):
+    """The job document as a JSON object — the shape AWS serves over MQTT
+    (over HTTP the same document stays a string; see jobs-mqtt-api vs the
+    REST JobExecution shape). A stored document that is not valid JSON
+    passes through as the raw string rather than being invented into one."""
+    document = jobs_job_document(job_id)
+    try:
+        return json.loads(document)
+    except ValueError:
+        return document
 
 
 def jobs_update_execution(
@@ -4310,6 +4394,105 @@ def jobs_update_execution(
     execution["versionNumber"] += 1
     _jobs_maybe_complete(job_id)
     return dict(execution), None
+
+
+def jobs_execution_view(execution: dict, document: str | dict | None) -> dict:
+    """Device-plane JobExecution — whole-second ``long`` timestamps (the API
+    reference words every stamp as "the time, in seconds since the epoch"),
+    flat statusDetails map. Shared by the iot-jobs-data HTTP plane (which
+    passes ``document`` as the string AWS serves there) and the
+    jobs-over-MQTT bridge (which passes the parsed object) so both speak one
+    shape."""
+    view = {
+        "jobId": execution["jobId"],
+        "thingName": execution["thingName"],
+        "status": execution["status"],
+        "statusDetails": execution.get("statusDetails") or {},
+        "queuedAt": _jobs_ms_to_long_s(execution["queuedAt"]),
+        "lastUpdatedAt": _jobs_ms_to_long_s(execution["lastUpdatedAt"]),
+        "executionNumber": execution["executionNumber"],
+        "versionNumber": execution["versionNumber"],
+    }
+    if execution.get("startedAt") is not None:
+        view["startedAt"] = _jobs_ms_to_long_s(execution["startedAt"])
+    if document is not None:
+        view["jobDocument"] = document
+    return view
+
+
+def jobs_execution_summary(execution: dict) -> dict:
+    """Device-plane JobExecutionSummary (the notify / GetPendingJobExecutions
+    entry) — same whole-second stamps as the full view."""
+    entry = {
+        "jobId": execution["jobId"],
+        "queuedAt": _jobs_ms_to_long_s(execution["queuedAt"]),
+        "lastUpdatedAt": _jobs_ms_to_long_s(execution["lastUpdatedAt"]),
+        "versionNumber": execution["versionNumber"],
+        "executionNumber": execution["executionNumber"],
+    }
+    if execution.get("startedAt") is not None:
+        entry["startedAt"] = _jobs_ms_to_long_s(execution["startedAt"])
+    return entry
+
+
+async def jobs_notify_thing(
+    account_id: str, region: str, thing_name: str, prev_next_job_id: str | None
+) -> None:
+    """Publish ``$aws/things/<t>/jobs/notify`` — and ``notify-next`` when the
+    front of the queue changed — after an execution was ADDED to or REMOVED
+    from the thing's pending set (job created, canceled, or deleted, or a
+    terminal device report).
+
+    AWS publishes ``notify`` on every pending-set membership change and
+    ``notify-next`` only when the FIRST pending execution is now a different
+    job (jobs-comm-notifications, confirmed against a live device capture):
+    creating a job behind existing ones notifies without a notify-next, and
+    starting the job already at the front — QUEUED → IN_PROGRESS keeps it
+    both pending and first — publishes NEITHER, so start paths never call
+    here. ``prev_next_job_id`` is the front-of-queue jobId captured before
+    the mutation (:func:`jobs_first_pending_job_id`).
+
+    Payloads (all timestamps epoch seconds): ``notify`` carries
+    ``{"timestamp", "jobs": {<STATUS>: [summaries]}}`` with empty status
+    lists omitted (``{}`` once nothing is pending); ``notify-next`` carries
+    the full execution view — status and ``jobDocument`` as a JSON object
+    included — or a bare ``{"timestamp"}`` when the queue emptied.
+
+    Known boundaries: a CONTINUOUS job's execution materialized lazily on a
+    *read* (a thing that joined the target group later) does not notify —
+    the materialization sites are synchronous read paths — and DeleteThing's
+    execution sweep does not notify the deleted thing (that sweep is itself
+    a divergence: AWS keeps a deleted thing's executions, so it publishes
+    nothing there either)."""
+    with request_scope(account_id, region):
+        pending = jobs_pending_for_thing(thing_name)
+        nxt = jobs_start_next_execution(thing_name, peek=True)
+        next_view = (
+            jobs_execution_view(nxt, _jobs_job_document_object(nxt["jobId"]))
+            if nxt is not None
+            else None
+        )
+    ts = int(time.time())
+    jobs_by_status: dict = {}
+    for execution in pending:
+        jobs_by_status.setdefault(execution["status"], []).append(
+            jobs_execution_summary(execution)
+        )
+    base = f"$aws/things/{thing_name}/jobs"
+    await broker_publish(
+        account_id, region, f"{base}/notify",
+        json.dumps({"timestamp": ts, "jobs": jobs_by_status}).encode("utf-8"), qos=1,
+    )
+    next_job_id = nxt["jobId"] if nxt is not None else None
+    if next_job_id == prev_next_job_id:
+        return
+    notify_next: dict = {"timestamp": ts}
+    if next_view is not None:
+        notify_next["execution"] = next_view
+    await broker_publish(
+        account_id, region, f"{base}/notify-next",
+        json.dumps(notify_next).encode("utf-8"), qos=1,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -5149,6 +5332,254 @@ def _parse_shadow_topic(topic: str) -> tuple[str, str, str | None] | None:
     return thing, verb, name
 
 
+def _parse_jobs_topic(topic: str) -> tuple[str, str, str | None] | None:
+    """``$aws/things/<thing>/jobs[/<jobId>]/<verb>`` → (thing, verb, jobId).
+
+    Request verbs only: ``get`` and ``start-next`` at the thing level,
+    ``get`` and ``update`` at the job level — with ``$next`` accepted as the
+    jobId on ``get``, the documented sentinel that resolves like the HTTP
+    plane's DescribeJobExecution of ``$next``. The response and notification
+    suffixes (``accepted`` / ``rejected`` / ``notify`` / ``notify-next``)
+    parse as ``None`` so the bridge's own publishes never re-trigger it —
+    the same recursion guard the shadow bridge uses. A job literally named
+    ``get``, ``start-next``, ``notify``, or ``notify-next`` (all valid
+    jobIds control-side) is unroutable here: its topics collide with the
+    reserved thing-level and notification topics, so such a job can only be
+    worked over HTTP."""
+    if not topic.startswith(_SHADOW_TOPIC_PREFIX):
+        return None
+    rest = topic[len(_SHADOW_TOPIC_PREFIX):]
+    parts = rest.split("/")
+    if len(parts) < 3 or parts[1] != "jobs":
+        return None
+    thing = parts[0]
+    tail = parts[2:]
+    if len(tail) == 1:
+        if tail[0] in ("get", "start-next"):
+            return thing, tail[0], None
+        return None
+    if len(tail) == 2:
+        job_id, verb = tail
+        if job_id in ("get", "start-next", "notify", "notify-next"):
+            return None
+        if verb == "get" or (verb == "update" and job_id != "$next"):
+            return thing, verb, job_id
+    return None
+
+
+def _jobs_rejected(
+    code: str, message: str, client_token=None, execution_state: dict | None = None
+) -> dict:
+    """AWS's jobs error response document — ``code`` is the string ErrorCode
+    enum (InvalidRequest, InvalidJson, ResourceNotFound, VersionMismatch,
+    InvalidStateTransition, TerminalStateReached), never a numeric HTTP
+    status."""
+    doc = {"code": code, "message": message, "timestamp": int(time.time())}
+    if execution_state is not None:
+        doc["executionState"] = execution_state
+    if client_token is not None:
+        doc["clientToken"] = client_token
+    return doc
+
+
+def _jobs_error_tuple_to_rejected(
+    error: tuple, client_token=None, execution: dict | None = None
+) -> dict:
+    """Map a jobs_* seam error (a ready HTTP response tuple) onto the MQTT
+    rejected document.
+
+    The HTTP status folds onto the string ErrorCode enum; the three 409s all
+    share one HTTP ``__type`` (InvalidStateTransitionException), so the
+    specific code is read off the message sentence — every candidate
+    sentence is authored in this module (_jobs_check_expected_version,
+    _jobs_reject_if_terminal, jobs_update_execution), so the match cannot
+    drift silently. ``execution`` is the execution's current state, when it
+    exists: VersionMismatch and InvalidStateTransition rejections carry its
+    status + versionNumber as ``executionState``, as AWS does (live-captured
+    for the version case)."""
+    status = error[0]
+    try:
+        message = json.loads(error[2]).get("message", "")
+    except Exception:
+        message = ""
+    if status == 404:
+        code = "ResourceNotFound"
+    elif status == 400:
+        code = "InvalidRequest"
+    elif message.startswith("Expected version"):
+        code = "VersionMismatch"
+    elif "terminal status" in message:
+        code = "TerminalStateReached"
+    else:
+        code = "InvalidStateTransition"
+    execution_state = None
+    if code in ("VersionMismatch", "InvalidStateTransition") and execution is not None:
+        execution_state = {
+            "status": execution["status"],
+            "versionNumber": execution["versionNumber"],
+        }
+    return _jobs_rejected(code, message, client_token, execution_state)
+
+
+async def _handle_jobs_publish(
+    account_id: str,
+    region: str,
+    thing: str,
+    verb: str,
+    job_id: str | None,
+    payload: bytes,
+) -> None:
+    """Jobs-over-MQTT bridge: serve the reserved jobs request topics from the
+    same store the iot-jobs-data HTTP plane uses, publishing the
+    ``accepted`` / ``rejected`` responses back through the broker.
+
+    Payload members (`statusDetails`, `expectedVersion`,
+    `includeJobExecutionState`, `includeJobDocument`, `clientToken`) follow
+    the device SDK contract and mirror the HTTP plane's handling; the request
+    members `stepTimeoutInMinutes` and `executionNumber` are accepted but
+    ignored — MiniStack has no execution timeouts, and `executionNumber` is
+    write-once so there is never more than one execution to address. Every
+    ``timestamp`` and execution stamp is epoch seconds; ``jobDocument`` is
+    served as a JSON object here (over HTTP it stays a string, as on AWS)."""
+    base = f"{_SHADOW_TOPIC_PREFIX}{thing}/jobs"
+    suffix_base = f"{job_id}/{verb}" if job_id is not None else verb
+
+    async def _respond(kind: str, doc: dict) -> None:
+        await broker_publish(
+            account_id, region,
+            f"{base}/{suffix_base}/{kind}",
+            json.dumps(doc).encode("utf-8"), qos=1,
+        )
+
+    try:
+        request = json.loads(payload) if payload else {}
+    except (ValueError, UnicodeDecodeError):
+        await _respond(
+            "rejected",
+            _jobs_rejected(
+                "InvalidJson",
+                "The contents of the request could not be interpreted as "
+                "valid UTF-8-encoded JSON",
+            ),
+        )
+        return
+    if not isinstance(request, dict):
+        # A JSON array or scalar parses, but is not a request document.
+        await _respond(
+            "rejected",
+            _jobs_rejected("InvalidJson", "The request payload must be a JSON object"),
+        )
+        return
+    client_token = request.get("clientToken")
+    ts = int(time.time())
+
+    if verb == "get" and job_id is None:
+        with request_scope(account_id, region):
+            pending = jobs_pending_for_thing(thing)
+        doc = {
+            "timestamp": ts,
+            "inProgressJobs": [
+                jobs_execution_summary(e) for e in pending if e["status"] == "IN_PROGRESS"
+            ],
+            "queuedJobs": [
+                jobs_execution_summary(e) for e in pending if e["status"] == "QUEUED"
+            ],
+        }
+        if client_token is not None:
+            doc["clientToken"] = client_token
+        await _respond("accepted", doc)
+        return
+
+    if verb == "start-next":
+        with request_scope(account_id, region):
+            execution = jobs_start_next_execution(
+                thing, status_details=request.get("statusDetails"), peek=False
+            )
+            document = (
+                _jobs_job_document_object(execution["jobId"])
+                if execution is not None
+                else None
+            )
+        doc = {"timestamp": ts}
+        if execution is not None:
+            doc["execution"] = jobs_execution_view(execution, document)
+        if client_token is not None:
+            doc["clientToken"] = client_token
+        await _respond("accepted", doc)
+        # No notify / notify-next here: QUEUED -> IN_PROGRESS keeps the
+        # execution both pending and at the front of the queue, and AWS stays
+        # silent (live-captured) — likewise for re-handing an execution that
+        # is already IN_PROGRESS.
+        return
+
+    if verb == "get":
+        with request_scope(account_id, region):
+            # "$next" resolves like the HTTP plane's DescribeJobExecution
+            # sentinel: the front of the pending queue, without starting it.
+            if job_id == "$next":
+                execution = jobs_start_next_execution(thing, peek=True)
+            else:
+                execution = jobs_describe_execution(thing, job_id)
+            include_document = request.get("includeJobDocument", True)
+            document = (
+                _jobs_job_document_object(execution["jobId"])
+                if execution is not None and include_document
+                else None
+            )
+        if execution is None and job_id != "$next":
+            await _respond(
+                "rejected",
+                _jobs_rejected(
+                    "ResourceNotFound",
+                    f"No job execution found for thing {thing} and job {job_id}",
+                    client_token,
+                ),
+            )
+            return
+        # An idle thing's "$next" mirrors the HTTP plane's empty structure.
+        doc = {"timestamp": ts}
+        if execution is not None:
+            doc["execution"] = jobs_execution_view(execution, document)
+        if client_token is not None:
+            doc["clientToken"] = client_token
+        await _respond("accepted", doc)
+        return
+
+    # verb == "update"
+    with request_scope(account_id, region):
+        prev_next = jobs_first_pending_job_id(thing)
+        execution, error = jobs_update_execution(
+            thing, job_id,
+            status=request.get("status"),
+            expected_version=request.get("expectedVersion"),
+            status_details=request.get("statusDetails"),
+        )
+        current = jobs_describe_execution(thing, job_id) if error else None
+    if error:
+        await _respond(
+            "rejected", _jobs_error_tuple_to_rejected(error, client_token, current)
+        )
+        return
+    doc = {"timestamp": ts}
+    if request.get("includeJobExecutionState"):
+        doc["executionState"] = {
+            "status": execution["status"],
+            "statusDetails": execution.get("statusDetails") or {},
+            "versionNumber": execution["versionNumber"],
+        }
+    if request.get("includeJobDocument"):
+        with request_scope(account_id, region):
+            doc["jobDocument"] = _jobs_job_document_object(job_id)
+    if client_token is not None:
+        doc["clientToken"] = client_token
+    await _respond("accepted", doc)
+    if execution["status"] in ("SUCCEEDED", "FAILED", "REJECTED"):
+        # A terminal report removed the execution from the pending set. AWS
+        # publishes update/accepted first, then notify + notify-next
+        # (live-captured order) — which the _respond above just preserved.
+        await jobs_notify_thing(account_id, region, thing, prev_next)
+
+
 def _shadow_rejected(status: int, message: str, client_token: str | None = None) -> dict:
     """AWS's shadow error response document."""
     doc = {"code": status, "message": message}
@@ -5446,6 +5877,16 @@ async def broker_publish(
             # inside does not catch) must not tear down the MQTT session.
             _broker_logger.warning(
                 "IoT shadow bridge failed for %r", topic, exc_info=True
+            )
+
+    jobs = _parse_jobs_topic(topic)
+    if jobs is not None:
+        try:
+            await _handle_jobs_publish(account_id, region, *jobs, payload)
+        except Exception:
+            # Same guard as the shadow bridge above.
+            _broker_logger.warning(
+                "IoT jobs bridge failed for %r", topic, exc_info=True
             )
 
     return delivered

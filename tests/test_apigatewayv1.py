@@ -2369,6 +2369,131 @@ def test_apigwv1_base_path_mapping_crud(apigw_v1):
     apigw_v1.delete_rest_api(restApiId=api_id)
     apigw_v1.delete_domain_name(domainName="bpm.example.com")
 
+
+
+def _mock_api(apigw_v1, name, path_part, body_marker, stage):
+    """A deployed v1 API whose GET /<path_part> answers a fixed MOCK body."""
+    api_id = apigw_v1.create_rest_api(name=name)["id"]
+    root = next(r for r in apigw_v1.get_resources(restApiId=api_id)["items"] if r["path"] == "/")
+    resource_id = apigw_v1.create_resource(
+        restApiId=api_id, parentId=root["id"], pathPart=path_part
+    )["id"]
+    apigw_v1.put_method(
+        restApiId=api_id, resourceId=resource_id, httpMethod="GET", authorizationType="NONE"
+    )
+    apigw_v1.put_integration(
+        restApiId=api_id, resourceId=resource_id, httpMethod="GET", type="MOCK",
+        integrationHttpMethod="GET", uri="",
+        requestTemplates={"application/json": '{"statusCode": 200}'},
+    )
+    apigw_v1.put_method_response(
+        restApiId=api_id, resourceId=resource_id, httpMethod="GET", statusCode="200"
+    )
+    apigw_v1.put_integration_response(
+        restApiId=api_id, resourceId=resource_id, httpMethod="GET", statusCode="200",
+        selectionPattern="", responseTemplates={"application/json": body_marker},
+    )
+    dep_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
+    apigw_v1.create_stage(restApiId=api_id, stageName=stage, deploymentId=dep_id)
+    return api_id
+
+
+def _request_via_host(host, path):
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+
+    url = f"http://localhost:{_EXECUTE_PORT}{path}"
+    req = _urlreq.Request(url, method="GET")
+    req.add_header("Host", host)
+    try:
+        resp = _urlreq.urlopen(req)
+        return resp.status, resp.read()
+    except _urlerr.HTTPError as e:
+        return e.code, e.read()
+
+
+def test_apigwv1_custom_domain_routes_the_data_plane(apigw_v1):
+    """A request addressed by a registered custom domain routes through its
+    base-path mappings: longest base path wins, "(none)" is the root mapping,
+    the mapping's stage is authoritative. The domain deliberately contains
+    the substring `iot.` — a registered domain must win before any
+    host-pattern service guessing (an unregistered host with that substring
+    lands in the IoT service)."""
+    domain = "svc.iot.example.com"
+    feature_api = _mock_api(apigw_v1, "v1-cd-feature", "health", '{"api": "feature"}', "prod")
+    root_api = _mock_api(apigw_v1, "v1-cd-root", "status", '{"api": "root"}', "live")
+
+    apigw_v1.create_domain_name(domainName=domain)
+    apigw_v1.create_base_path_mapping(
+        domainName=domain, basePath="feature", restApiId=feature_api, stage="prod"
+    )
+    apigw_v1.create_base_path_mapping(
+        domainName=domain, restApiId=root_api, stage="live"
+    )
+
+    # Longest-prefix: /feature/... strips the base path, stage from the mapping.
+    status, body = _request_via_host(domain, "/feature/health")
+    assert status == 200, body
+    assert b'"feature"' in body
+    # Everything else falls to the root "(none)" mapping, whole path forwarded.
+    # (/health would be swallowed by the emulator's own health endpoint, which
+    # answers before the data-plane chain — use a non-reserved path.)
+    status, body = _request_via_host(domain, "/status")
+    assert status == 200, body
+    assert b'"root"' in body
+
+    # An unregistered host keeps today's fallthrough behaviour.
+    status, body = _request_via_host("unregistered.example.com", "/feature/health")
+    assert status != 200
+
+    apigw_v1.delete_base_path_mapping(domainName=domain, basePath="feature")
+    apigw_v1.delete_base_path_mapping(domainName=domain, basePath="(none)")
+    apigw_v1.delete_domain_name(domainName=domain)
+    apigw_v1.delete_rest_api(restApiId=feature_api)
+    apigw_v1.delete_rest_api(restApiId=root_api)
+
+
+def test_apigwv1_custom_domain_stage_less_mapping_takes_stage_from_path(apigw_v1):
+    """A base-path mapping created without a stage takes the stage from the
+    first path segment after the base path, like a plain execute-api URL.
+    The domain is registered with mixed case but requested lowercase — the
+    Host lookup must be case-insensitive."""
+    domain = "StageLess.Example.Com"
+    api_id = _mock_api(apigw_v1, "v1-cd-stageless", "ping", '{"api": "stageless"}', "dev")
+
+    apigw_v1.create_domain_name(domainName=domain)
+    apigw_v1.create_base_path_mapping(domainName=domain, basePath="svc", restApiId=api_id)
+
+    status, body = _request_via_host("stageless.example.com", "/svc/dev/ping")
+    assert status == 200, body
+    assert b'"stageless"' in body
+
+    apigw_v1.delete_base_path_mapping(domainName=domain, basePath="svc")
+    apigw_v1.delete_domain_name(domainName=domain)
+    apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_custom_domain_empty_base_path_is_root_mapping(apigw_v1):
+    """An explicit basePath of "" behaves exactly like the "(none)" sentinel:
+    it is the root mapping and the whole path is forwarded to the API."""
+    domain = "emptybase.example.com"
+    api_id = _mock_api(apigw_v1, "v1-cd-emptybase", "status", '{"api": "emptybase"}', "live")
+
+    apigw_v1.create_domain_name(domainName=domain)
+    apigw_v1.create_base_path_mapping(
+        domainName=domain, basePath="", restApiId=api_id, stage="live"
+    )
+
+    status, body = _request_via_host(domain, "/status")
+    assert status == 200, body
+    assert b'"emptybase"' in body
+
+    # DeleteDomainName drops the mapping store with it — the "" base path is
+    # not addressable as a URI path parameter.
+    apigw_v1.delete_domain_name(domainName=domain)
+    apigw_v1.delete_rest_api(restApiId=api_id)
+
+
 def test_apigwv1_execute_missing_stage_404(apigw_v1):
     """execute-api returns 404 when stage does not exist."""
     import urllib.error as _urlerr
