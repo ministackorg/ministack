@@ -33,7 +33,7 @@ import time
 
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.concurrency import run_reentrant
+from ministack.core.concurrency import resource_lock, run_reentrant
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -652,6 +652,92 @@ def _make_deployment(task_definition, desired_count, status="PRIMARY"):
     }
 
 
+def _record_task_ip(task, container, ecs_network):
+    """Store the container's address on the task as an ENI attachment.
+
+    Real awsvpc tasks expose it as attachments[].details[privateIPv4Address], which
+    is where an ALB target group and DescribeTasks both look for it.
+    """
+    if task.get("attachments"):
+        return
+    try:
+        container.reload()
+        nets = container.attrs["NetworkSettings"]["Networks"]
+        ip = (nets.get(ecs_network) or next(iter(nets.values()), {})).get("IPAddress")
+    except Exception:
+        ip = None
+    if not ip:
+        return
+    task["attachments"] = [{
+        "id": new_uuid(),
+        "type": "ElasticNetworkInterface",
+        "status": "ATTACHED",
+        "details": [{"name": "privateIPv4Address", "value": ip}],
+    }]
+    task["attachmentsStatus"] = "ATTACHED"
+
+
+def _task_ip(task):
+    for att in task.get("attachments") or []:
+        for d in att.get("details") or []:
+            if d.get("name") == "privateIPv4Address":
+                return d.get("value")
+    return None
+
+
+def _sync_service_targets(cluster_name, svc):
+    """Register the service's running tasks in its target groups.
+
+    An ECS service owns the membership of the target groups named in its
+    loadBalancers block, so this replaces the registration wholesale rather than
+    tracking individual add/remove events — that makes it correct for scale-up,
+    scale-in, task replacement and service deletion alike.
+
+    Tasks are selected by ``group``, the same predicate _reconcile_service_tasks
+    uses for its own recount, so the registered targets cannot disagree with the
+    runningCount reported alongside them.
+
+    Collecting the addresses and publishing them is a read-modify-write on shared
+    state, and handlers no longer run serialised on the event loop, so it is done
+    under resource_lock. There is no Docker call or re-entrant dispatch inside the
+    lock, per the rule in ministack.core.concurrency.
+    """
+    lbs = svc.get("loadBalancers") or []
+    if not lbs:
+        return
+    try:
+        from ministack.services import alb
+    except Exception:
+        return
+
+    svc_name = svc.get("serviceName")
+    cluster_arn = svc.get("clusterArn")
+    active = svc.get("status") == "ACTIVE"
+    group = f"service:{svc_name}"
+
+    for lb in lbs:
+        tg_arn = lb.get("targetGroupArn")
+        if not tg_arn:
+            continue
+        port = lb.get("containerPort", 80)
+        with resource_lock("elbv2-targets", tg_arn):
+            targets = []
+            if active:
+                for task in list(_tasks.values()):
+                    if task.get("group") != group:
+                        continue
+                    if task.get("clusterArn") != cluster_arn:
+                        continue
+                    if task.get("lastStatus") != "RUNNING":
+                        continue
+                    ip = _task_ip(task)
+                    if ip:
+                        targets.append((ip, port))
+            published = alb.set_targets_for_group(tg_arn, targets)
+        if published:
+            logger.debug("ECS: %s -> %d target(s) in %s", svc_name, len(targets), tg_arn)
+
+
 def _reconcile_service_tasks(cluster_name, svc_key):
     """Spawn or stop tasks so running tasks match desiredCount and task definition."""
     svc = _services.get(svc_key)
@@ -724,6 +810,9 @@ def _reconcile_service_tasks(cluster_name, svc_key):
     if svc["deployments"]:
         svc["deployments"][0]["runningCount"] = running
     _recount_cluster(cluster_name)
+
+    # Membership of the service's target groups follows its running tasks.
+    _sync_service_targets(cluster_name, svc)
 
 
 def _create_service(data):
@@ -848,6 +937,9 @@ def _delete_service(data):
     # Re-creating with the same name is allowed because _create_service only
     # conflicts on status=ACTIVE.
     svc["status"] = "INACTIVE"
+
+    # A deleted service leaves nothing registered behind it.
+    _sync_service_targets(cluster_name, svc)
 
     _recount_cluster(cluster_name)
     return json_response({"service": _sanitize(svc)})
@@ -1342,6 +1434,7 @@ def _run_task(data):
                     task.setdefault("_metadata_tokens", []).append(metadata_token)
                     if i < len(task["containers"]):
                         task["containers"][i]["runtimeId"] = container.id[:12]
+                    _record_task_ip(task, container, ecs_network)
                     logger.info("ECS: started container %s for task %s", cdef['image'], task_id[:8])
                 except Exception as e:
                     ecs_metadata.unregister_token(metadata_token)
