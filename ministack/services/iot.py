@@ -4524,7 +4524,7 @@ async def broker_stop() -> None:
 
 
 _BASIC_INGEST_PREFIX = "$aws/rules/"
-_SHADOW_TOPIC_PREFIX = "$aws/things/"
+SHADOW_TOPIC_PREFIX = "$aws/things/"
 
 
 def _rules_for_account(account_id: str, region: str) -> list[dict]:
@@ -4913,9 +4913,9 @@ def _parse_shadow_topic(topic: str) -> tuple[str, str, str | None] | None:
     Anything longer — the ``accepted`` / ``rejected`` / ``delta`` /
     ``documents`` response suffixes — parses as ``None``, so the bridge's own
     response publishes can never re-trigger it (no recursion)."""
-    if not topic.startswith(_SHADOW_TOPIC_PREFIX):
+    if not topic.startswith(SHADOW_TOPIC_PREFIX):
         return None
-    rest = topic[len(_SHADOW_TOPIC_PREFIX):]
+    rest = topic[len(SHADOW_TOPIC_PREFIX):]
     parts = rest.split("/")
     if len(parts) < 3 or parts[1] != "shadow":
         return None
@@ -4942,20 +4942,79 @@ def _shadow_rejected(status: int, message: str, client_token: str | None = None)
 
 
 def _shadow_document(doc: dict) -> dict:
-    """Strip the computed ``delta`` sections out of a shadow snapshot.
+    """Project a GET snapshot onto a ``documents`` member: ``state`` +
+    ``metadata`` + ``version``, nothing else.
 
-    `get_thing_shadow` injects ``state.delta`` (and its ``metadata.delta``) by
-    design, because that is what the GET response carries. The documents topic
-    is not a GET: on AWS the ``previous``/``current`` documents report only
-    ``desired`` and ``reported``, and the delta has its own topic. Publishing
-    the snapshot verbatim invented a section real devices never see.
+    `get_thing_shadow` injects ``state.delta`` (and its ``metadata.delta``)
+    and a top-level ``timestamp`` by design, because that is what the GET
+    response carries. The documents topic is not a GET: on AWS the
+    ``previous``/``current`` members report only ``desired`` and ``reported``
+    (the delta has its own topic) and carry no ``timestamp`` of their own —
+    the single timestamp sits on the envelope. Publishing the snapshot
+    verbatim invented members real devices never see.
     """
-    stripped = dict(doc)
+    stripped = {k: doc[k] for k in ("state", "metadata", "version") if k in doc}
     for section in ("state", "metadata"):
         block = stripped.get(section)
         if isinstance(block, dict) and "delta" in block:
             stripped[section] = {k: v for k, v in block.items() if k != "delta"}
     return stripped
+
+
+async def shadow_emit_update_responses(
+    account_id: str,
+    region: str,
+    base: str,
+    doc: dict,
+    pre_status: int,
+    pre_doc: dict,
+    post_status: int,
+    post_doc: dict,
+    client_token: str | None,
+) -> None:
+    """Publish the reserved-topic responses for one ACCEPTED shadow update:
+    ``update/accepted``, ``update/delta`` (when the post-update document
+    carries one) and ``update/documents``.
+
+    Shared by the MQTT bridge and the HTTP data plane: on AWS these are
+    state-change notifications the Device Shadow service emits however the
+    update arrived, which is what lets a topic rule on ``update/accepted``
+    fire for an HTTP ``UpdateThingShadow``. The caller must hand in
+    deep-copied pre/post snapshots (the store returns live dicts)."""
+
+    async def _respond(suffix: str, payload_doc: dict) -> None:
+        await broker_publish(
+            account_id,
+            region,
+            f"{base}/{suffix}",
+            json.dumps(payload_doc).encode("utf-8"),
+            qos=1,
+        )
+
+    # The core update response already echoes clientToken when present.
+    await _respond("update/accepted", doc)
+    if post_status == 200:
+        delta = (post_doc.get("state") or {}).get("delta")
+        if delta:
+            # The delta section of the GET document, with the metadata AWS
+            # reports alongside it and the triggering request's clientToken.
+            delta_doc = {
+                "state": delta,
+                "metadata": (post_doc.get("metadata") or {}).get("delta", {}),
+                "version": post_doc["version"],
+                "timestamp": post_doc["timestamp"],
+            }
+            if client_token is not None:
+                delta_doc["clientToken"] = client_token
+            await _respond("update/delta", delta_doc)
+    documents_doc = {
+        "previous": _shadow_document(pre_doc) if pre_status == 200 else None,
+        "current": _shadow_document(post_doc) if post_status == 200 else None,
+        "timestamp": _shadow_now(),
+    }
+    if client_token is not None:
+        documents_doc["clientToken"] = client_token
+    await _respond("update/documents", documents_doc)
 
 
 async def _handle_shadow_publish(
@@ -4972,7 +5031,7 @@ async def _handle_shadow_publish(
     # `name is not None` rather than a truthiness test: an empty named shadow
     # (`.../shadow/name//update`) must answer on the topic the requester is
     # listening on, not collapse onto the classic shadow's.
-    base = f"{_SHADOW_TOPIC_PREFIX}{thing}/shadow" + (f"/name/{name}" if name is not None else "")
+    base = f"{SHADOW_TOPIC_PREFIX}{thing}/shadow" + (f"/name/{name}" if name is not None else "")
     shadow_name = name or ""
 
     async def _respond(suffix: str, doc: dict) -> None:
@@ -5026,29 +5085,9 @@ async def _handle_shadow_publish(
                 _shadow_rejected(status, doc.get("message", ""), client_token),
             )
             return
-        # The core update response already echoes clientToken when present.
-        await _respond("update/accepted", doc)
-        if post_status == 200:
-            delta = (post_doc.get("state") or {}).get("delta")
-            if delta:
-                # The delta section of the GET document, with the metadata AWS
-                # reports alongside it and the triggering request's clientToken.
-                delta_doc = {
-                    "state": delta,
-                    "metadata": (post_doc.get("metadata") or {}).get("delta", {}),
-                    "version": post_doc["version"],
-                    "timestamp": post_doc["timestamp"],
-                }
-                if client_token is not None:
-                    delta_doc["clientToken"] = client_token
-                await _respond("update/delta", delta_doc)
-        await _respond(
-            "update/documents",
-            {
-                "previous": _shadow_document(pre_doc) if pre_status == 200 else None,
-                "current": _shadow_document(post_doc) if post_status == 200 else None,
-                "timestamp": _shadow_now(),
-            },
+        await shadow_emit_update_responses(
+            account_id, region, base, doc,
+            pre_status, pre_doc, post_status, post_doc, client_token,
         )
         return
 
