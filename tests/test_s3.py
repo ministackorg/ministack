@@ -6103,8 +6103,9 @@ def test_s3_control_list_tags_uses_the_tag_element_aws_uses(s3):
     left emitting <member>. Asserting on the wire format is the only way to
     catch that from Python.
     """
-    import requests
     from urllib.parse import quote
+
+    import requests
 
     bkt = "intg-s3control-tag-element"
     s3.create_bucket(Bucket=bkt)
