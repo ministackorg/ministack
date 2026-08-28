@@ -1409,6 +1409,8 @@ def _object_response_headers(obj: dict, bucket_name: str = "", key: str = "", in
     h.update(obj.get("metadata", {}))
     if obj.get("version_id"):
         h["x-amz-version-id"] = obj["version_id"]
+    if obj.get("replication_status"):
+        h["x-amz-replication-status"] = obj["replication_status"]
     sc = obj.get("storage_class") or "STANDARD"
     if sc != "STANDARD":
         # AWS omits the header for STANDARD; SDKs default to STANDARD when absent.
@@ -3406,6 +3408,7 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
 
     resp_headers = {"ETag": obj["etag"], "Content-Length": "0"}
     resp_headers.update(sse_headers)
+    _maybe_replicate(bucket_name, key, obj, body)
     version_id = _record_object_version(bucket_name, key, prior_obj, obj, body)
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
@@ -3417,6 +3420,9 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
 
     if pending_tags is not None:
         _object_tags[(bucket_name, key, obj.get("version_id"))] = pending_tags
+        if obj.get("_replica"):
+            dest_name, replica_version = obj["_replica"]
+            _object_tags[(dest_name, key, replica_version)] = dict(pending_tags)
     if canned_acl:
         _object_acl[(bucket_name, key, obj.get("version_id"))] = _canned_acl_policy_xml(
             canned_acl, _canonical_owner_id()
@@ -3629,6 +3635,7 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
 
     _fire_s3_event_async(bucket_name, key, "s3:ObjectCreated:Post", size=obj["size"], etag=etag)
 
+    _maybe_replicate(bucket_name, key, obj, file_value)
     version_id = _record_object_version(bucket_name, key, prior_obj, obj, file_value)
 
     # Persist only after the versioning block: the .meta.json sidecar must
@@ -3638,6 +3645,8 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
 
     if pending_tags is not None:
         _object_tags[(bucket_name, key, version_id)] = pending_tags
+        if obj.get("_replica"):
+            _object_tags[(obj["_replica"][0], key, obj["_replica"][1])] = dict(pending_tags)
     if canned_acl:
         _object_acl[(bucket_name, key, version_id)] = _canned_acl_policy_xml(canned_acl, _canonical_owner_id())
 
@@ -4065,6 +4074,7 @@ def _object_record_from_version(v: dict) -> dict:
         "preserved_headers": v.get("preserved_headers", {}),
         "storage_class": v.get("storage_class") or "STANDARD",
         "checksums": v.get("checksums") or {},
+        "replication_status": v.get("replication_status"),
         # The "null" version promotes to a current object WITHOUT a version
         # id, the same shape a pre-versioning object has — per-version tags
         # and subresources key it as None, and the literal "null" is only a
@@ -4089,6 +4099,7 @@ def _version_entry_from_record(obj: dict, version_id: str, data) -> dict:
         "storage_class": obj.get("storage_class") or "STANDARD",
         "checksums": obj.get("checksums") or {},
         "parts": obj.get("parts"),
+        "replication_status": obj.get("replication_status"),
     }
 
 
@@ -4104,6 +4115,63 @@ def _preserve_null_version(bucket_name: str, key: str, versions: list, prior_obj
     if any(v["version_id"] == "null" for v in versions):
         return
     versions.append(_version_entry_from_record(prior_obj, "null", _read_body(bucket_name, key, prior_obj)))
+
+
+def _replication_rule_for(bucket_name: str, key: str) -> dict | None:
+    """The first Enabled rule whose Prefix covers `key`, or None.
+
+    Replication runs only while the source bucket's versioning is Enabled,
+    as on AWS (a Suspended bucket stops replicating; the stored config stays).
+    """
+    config = _bucket_replication.get(bucket_name)
+    if not config or _bucket_versioning.get(bucket_name) != "Enabled":
+        return None
+    for rule in config.get("Rules", []):
+        if rule.get("Status") != "Enabled":
+            continue
+        if key.startswith(rule.get("Prefix") or ""):
+            return rule
+    return None
+
+
+def _maybe_replicate(bucket_name: str, key: str, obj: dict, data) -> None:
+    """Write the replica a matching replication rule asks for, and stamp the
+    source's x-amz-replication-status.
+
+    AWS marks the source PENDING and flips it to COMPLETED (or FAILED) once
+    the copy lands; the destination copy reads REPLICA. The emulator's copy is
+    synchronous, so the source is stamped with its final status immediately
+    and tests see a deterministic answer. Runs BEFORE the source's version
+    entry is recorded, so a version-addressed read carries the status too.
+    A destination that no longer exists or is no longer versioned stamps the
+    source FAILED, which is how AWS reports a replica it could not write.
+    """
+    rule = _replication_rule_for(bucket_name, key)
+    if rule is None:
+        return
+    dest_ref = (rule.get("Destination") or {}).get("Bucket") or ""
+    dest_name = dest_ref.split(":::")[-1] if ":::" in dest_ref else dest_ref
+    dest_bucket = _buckets.get(dest_name)
+    if (dest_bucket is None or dest_name == bucket_name
+            or _bucket_versioning.get(dest_name) != "Enabled"):
+        obj["replication_status"] = "FAILED"
+        return
+
+    replica = copy.deepcopy(obj)
+    replica["replication_status"] = "REPLICA"
+    replica.pop("version_id", None)
+    if rule.get("Destination", {}).get("StorageClass"):
+        replica["storage_class"] = rule["Destination"]["StorageClass"]
+    prior = dest_bucket["objects"].get(key)
+    dest_bucket["objects"][key] = replica
+    replica_version = _record_object_version(dest_name, key, prior, replica, data)
+    # The write paths store the source's tags after the version is cut; the
+    # pointer lets them mirror the tags onto the replica, as AWS replicates
+    # them. Internal bookkeeping only — never serialized onto a response.
+    obj["_replica"] = (dest_name, replica_version)
+    if S3_PERSIST:
+        _persist_object(dest_name, key, replica)
+    obj["replication_status"] = "COMPLETED"
 
 
 def _record_object_version(bucket_name: str, key: str, prior_obj: dict | None, obj: dict, data) -> str | None:
@@ -4616,6 +4684,7 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         resp_headers["x-amz-copy-source-version-id"] = copy_src_vid
     if dest_sc != "STANDARD":
         resp_headers["x-amz-storage-class"] = dest_sc
+    _maybe_replicate(bucket_name, dest_key, dest_obj, src_body)
     version_id = _record_object_version(bucket_name, dest_key, dest_prior_obj, dest_obj, src_body)
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
@@ -4628,6 +4697,8 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     dest_version_id = dest_obj.get("version_id")
     if pending_dest_tags is not None:
         _object_tags[(bucket_name, dest_key, dest_version_id)] = pending_dest_tags
+        if dest_obj.get("_replica"):
+            _object_tags[(dest_obj["_replica"][0], dest_key, dest_obj["_replica"][1])] = dict(pending_dest_tags)
     else:
         _object_tags.pop((bucket_name, dest_key, dest_version_id), None)
 
@@ -5993,6 +6064,7 @@ def _complete_multipart_upload(
 
     resp_headers = {"Content-Type": "application/xml"}
     resp_headers.update(_stored_sse_headers(obj))
+    _maybe_replicate(bucket_name, key, obj, combined)
     version_id = _record_object_version(bucket_name, key, prior_obj, obj, combined)
     if version_id:
         resp_headers["x-amz-version-id"] = version_id

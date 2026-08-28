@@ -5979,3 +5979,110 @@ def test_s3_put_object_rejects_a_mismatched_checksum(s3):
     s3.put_object(Bucket=bkt, Key="good.txt", Body=b"hello", ChecksumSHA256=good)
     head = s3.head_object(Bucket=bkt, Key="good.txt", ChecksumMode="ENABLED")
     assert head["ChecksumSHA256"] == good
+
+
+# ---------------------------------------------------------------------------
+# Replication data plane (x-amz-replication-status)
+# ---------------------------------------------------------------------------
+
+def _replicated_pair(s3, slug):
+    """Source + destination buckets, both versioned, one Enabled rule."""
+    src, dst = f"qa-repl-src-{slug}", f"qa-repl-dst-{slug}"
+    for b in (src, dst):
+        s3.create_bucket(Bucket=b)
+        s3.put_bucket_versioning(Bucket=b, VersioningConfiguration={"Status": "Enabled"})
+    s3.put_bucket_replication(
+        Bucket=src,
+        ReplicationConfiguration={
+            "Role": "arn:aws:iam::000000000000:role/repl",
+            "Rules": [{
+                "ID": "r1", "Status": "Enabled", "Prefix": "",
+                "Destination": {"Bucket": f"arn:aws:s3:::{dst}"},
+            }],
+        },
+    )
+    return src, dst
+
+
+def _purge_versioned(s3, bucket):
+    lv = s3.list_object_versions(Bucket=bucket)
+    for v in lv.get("Versions", []) + lv.get("DeleteMarkers", []):
+        s3.delete_object(Bucket=bucket, Key=v["Key"], VersionId=v["VersionId"])
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_replication_copies_object_and_stamps_status(s3):
+    """A put under an Enabled rule lands in the destination; the source
+    reports COMPLETED and the replica REPLICA, per S3's replication-status
+    contract."""
+    src, dst = _replicated_pair(s3, "basic")
+    try:
+        s3.put_object(Bucket=src, Key="a/k", Body=b"payload",
+                      Tagging="team=core")
+        head = s3.head_object(Bucket=src, Key="a/k")
+        assert head["ReplicationStatus"] == "COMPLETED"
+        replica = s3.get_object(Bucket=dst, Key="a/k")
+        assert replica["ReplicationStatus"] == "REPLICA"
+        assert replica["Body"].read() == b"payload"
+        tags = s3.get_object_tagging(Bucket=dst, Key="a/k")["TagSet"]
+        assert tags == [{"Key": "team", "Value": "core"}]
+    finally:
+        _purge_versioned(s3, src)
+        _purge_versioned(s3, dst)
+
+
+def test_s3_replication_honors_prefix_and_failure(s3):
+    """A key outside the rule's Prefix carries no status; a destination that
+    stops being usable stamps the source FAILED."""
+    src, dst = f"qa-repl-src-pref", f"qa-repl-dst-pref"
+    for b in (src, dst):
+        s3.create_bucket(Bucket=b)
+        s3.put_bucket_versioning(Bucket=b, VersioningConfiguration={"Status": "Enabled"})
+    s3.put_bucket_replication(
+        Bucket=src,
+        ReplicationConfiguration={
+            "Role": "arn:aws:iam::000000000000:role/repl",
+            "Rules": [{
+                "ID": "r1", "Status": "Enabled", "Prefix": "logs/",
+                "Destination": {"Bucket": f"arn:aws:s3:::{dst}"},
+            }],
+        },
+    )
+    try:
+        s3.put_object(Bucket=src, Key="other/k", Body=b"x")
+        head = s3.head_object(Bucket=src, Key="other/k")
+        assert "ReplicationStatus" not in head
+        # Destination becomes unusable: versioning suspended.
+        s3.put_bucket_versioning(Bucket=dst, VersioningConfiguration={"Status": "Suspended"})
+        s3.put_object(Bucket=src, Key="logs/k", Body=b"x")
+        assert s3.head_object(Bucket=src, Key="logs/k")["ReplicationStatus"] == "FAILED"
+        from botocore.exceptions import ClientError
+        try:
+            s3.head_object(Bucket=dst, Key="logs/k")
+            raise AssertionError("replica must not exist")
+        except ClientError:
+            pass
+    finally:
+        _purge_versioned(s3, src)
+        lv = s3.list_object_versions(Bucket=dst)
+        for v in lv.get("Versions", []) + lv.get("DeleteMarkers", []):
+            s3.delete_object(Bucket=dst, Key=v["Key"], VersionId=v["VersionId"])
+        s3.delete_bucket(Bucket=dst)
+
+
+def test_s3_replication_covers_copy_and_versioned_reads(s3):
+    """CopyObject into the source bucket replicates too, and the status rides
+    on a version-addressed read."""
+    src, dst = _replicated_pair(s3, "copy")
+    try:
+        s3.put_object(Bucket=src, Key="orig", Body=b"v")
+        s3.copy_object(Bucket=src, Key="copied",
+                       CopySource={"Bucket": src, "Key": "orig"})
+        assert s3.head_object(Bucket=src, Key="copied")["ReplicationStatus"] == "COMPLETED"
+        assert s3.get_object(Bucket=dst, Key="copied")["Body"].read() == b"v"
+        vid = s3.head_object(Bucket=src, Key="copied")["VersionId"]
+        versioned = s3.head_object(Bucket=src, Key="copied", VersionId=vid)
+        assert versioned["ReplicationStatus"] == "COMPLETED"
+    finally:
+        _purge_versioned(s3, src)
+        _purge_versioned(s3, dst)
