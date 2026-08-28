@@ -2142,6 +2142,17 @@ def _create_user_pool(data):
     if not name:
         return error_response_json("InvalidParameterException", "PoolName is required.", 400)
 
+    # "You can't require that users provide a value for the attribute" — a
+    # custom (or developer-only) schema entry with Required=true is a pool
+    # real Cognito refuses to create.
+    for raw in data.get("Schema") or []:
+        if (isinstance(raw, dict) and raw.get("Required")
+                and _schema_attribute_name(raw).startswith(
+                    (_ATTRIBUTE_CUSTOM_PREFIX, _ATTRIBUTE_DEV_PREFIX))):
+            return error_response_json(
+                "InvalidParameterException",
+                "Required custom attributes are not supported.", 400)
+
     pid = _pool_id()
     now = _now_epoch()
     pool = {
@@ -2300,6 +2311,10 @@ def _add_custom_attributes(data):
             return error_response_json(
                 "InvalidParameterException",
                 f"{attr['Name']}: Attribute already exists in the schema.", 400)
+        if attr.get("Required"):
+            return error_response_json(
+                "InvalidParameterException",
+                "Required custom attributes are not supported.", 400)
         existing.add(attr["Name"])
         additions.append(attr)
 
@@ -3227,6 +3242,9 @@ def _admin_initiate_auth(data):
             return _err
         if not user.get("Enabled", True):
             return error_response_json("NotAuthorizedException", "User is disabled.", 400)
+        refused = _password_signin_refused(user)
+        if refused:
+            return refused
         if user.get("_password") and user["_password"] != password:
             return error_response_json("NotAuthorizedException", "Incorrect username or password.", 400)
         if user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
@@ -3402,6 +3420,9 @@ def _admin_respond_to_auth_challenge(data):
             if err:
                 del _challenge_sessions[token]
                 return err
+            refused = _password_signin_refused(user)
+            if refused:
+                return refused
             _append_challenge_to_session(session, "PASSWORD_VERIFIER", True, None, {}, {})
             session["pending_builtin_challenge"] = None
             user_attrs = _attr_list_to_dict(user.get("Attributes", []))
@@ -3424,6 +3445,9 @@ def _admin_respond_to_auth_challenge(data):
         user, _err = _resolve_user(pool, username)
         if _err:
             return _err
+        refused = _password_signin_refused(user)
+        if refused:
+            return refused
         if new_password:
             user["_password"] = new_password
         user["UserStatus"] = "CONFIRMED"
@@ -3544,6 +3568,9 @@ def _initiate_auth(data):
             return _err
         if not user.get("Enabled", True):
             return error_response_json("NotAuthorizedException", "User is disabled.", 400)
+        refused = _password_signin_refused(user)
+        if refused:
+            return refused
         if user.get("_password") and user["_password"] != password:
             return error_response_json("NotAuthorizedException", "Incorrect username or password.", 400)
         if user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
@@ -3725,6 +3752,9 @@ def _respond_to_auth_challenge(data):
             if err:
                 del _challenge_sessions[token]
                 return err
+            refused = _password_signin_refused(user)
+            if refused:
+                return refused
             # Emulator parity with USER_SRP_AUTH: accept Amplify's PASSWORD_CLAIM_* without
             # full SRP math.
             _append_challenge_to_session(session, "PASSWORD_VERIFIER", True, None, {}, {})
@@ -3746,6 +3776,9 @@ def _respond_to_auth_challenge(data):
         user, _err = _resolve_user(pool, username)
         if _err:
             return _err
+        refused = _password_signin_refused(user)
+        if refused:
+            return refused
         if new_password:
             user["_password"] = new_password
         user["UserStatus"] = "CONFIRMED"
@@ -3760,6 +3793,9 @@ def _respond_to_auth_challenge(data):
         user, _err = _resolve_user(pool, username)
         if _err:
             return _err
+        refused = _password_signin_refused(user)
+        if refused:
+            return refused
         if new_password:
             user["_password"] = new_password
         user["UserStatus"] = "CONFIRMED"
@@ -4568,6 +4604,19 @@ def _admin_link_provider_for_user(data):
     return json_response({})
 
 
+def _password_signin_refused(user):
+    """The refusal a password sign-in draws for a provider-deactivated local user.
+
+    AdminDisableProviderForUser with ProviderName=Cognito: "they can't use
+    their password to sign in", while the profile itself stays (AdminGetUser,
+    tokens already issued, and non-password flows are untouched).
+    """
+    if user.get("_provider_disabled"):
+        return error_response_json(
+            "NotAuthorizedException", "Incorrect username or password.", 400)
+    return None
+
+
 def _admin_disable_provider_for_user(data):
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
@@ -4577,6 +4626,18 @@ def _admin_disable_provider_for_user(data):
     user_identifier, err = _provider_user_identifier(data, "User")
     if err:
         return err
+
+    # "To deactivate a local user, set ProviderName to Cognito and the
+    # ProviderAttributeName to Cognito_Subject. The ProviderAttributeValue
+    # must be user's local username." The user keeps existing but can no
+    # longer sign in with their password.
+    if user_identifier["ProviderName"] == "Cognito":
+        user, err = _resolve_user(pool, user_identifier["ProviderAttributeValue"])
+        if err:
+            return err
+        user["_provider_disabled"] = True
+        user["UserLastModifiedDate"] = _now_epoch()
+        return json_response({})
 
     links = _provider_links(pool)
     key = _provider_link_key(
@@ -5550,6 +5611,8 @@ def _authenticate_hosted_ui_user(pool, username, password):
     status_error = _hosted_ui_user_status_error(user)
     if status_error:
         return None, status_error
+    if _password_signin_refused(user) is not None:
+        return None, "Incorrect username or password."
     if user.get("_password") != password:
         return None, "Incorrect username or password."
     return user, ""

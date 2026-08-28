@@ -5835,26 +5835,6 @@ def _describe_instance_credit_specifications(p):
                 f"<instanceCreditSpecificationSet>{items}</instanceCreditSpecificationSet>")
 
 
-def _describe_instance_maintenance_options(p):
-    instance_ids = _parse_member_list(p, "InstanceId")
-    items = "".join(
-        f"<item><instanceId>{iid}</instanceId><autoRecovery>default</autoRecovery></item>"
-        for iid in (instance_ids or list(_instances.keys()))
-    )
-    return _xml(200, "DescribeInstanceMaintenanceOptionsResponse",
-                f"<instanceMaintenanceOptionSet>{items}</instanceMaintenanceOptionSet>")
-
-
-def _describe_instance_auto_recovery_attribute(p):
-    instance_ids = _parse_member_list(p, "InstanceId")
-    items = "".join(
-        f"<item><instanceId>{iid}</instanceId><autoRecovery><value>default</value></autoRecovery></item>"
-        for iid in (instance_ids or list(_instances.keys()))
-    )
-    return _xml(200, "DescribeInstanceAutoRecoveryAttributeResponse",
-                f"<instanceAutoRecoveryAttributeSet>{items}</instanceAutoRecoveryAttributeSet>")
-
-
 def _modify_instance_maintenance_options(p):
     instance_id = _p(p, "InstanceId")
     return _xml(200, "ModifyInstanceMaintenanceOptionsResponse",
@@ -6876,8 +6856,6 @@ _ACTION_MAP = {
     "DescribeInstanceStatus": _describe_instance_status,
     "DescribeInstanceAttribute": _describe_instance_attribute,
     "DescribeInstanceCreditSpecifications": _describe_instance_credit_specifications,
-    "DescribeInstanceMaintenanceOptions": _describe_instance_maintenance_options,
-    "DescribeInstanceAutoRecoveryAttribute": _describe_instance_auto_recovery_attribute,
     "ModifyInstanceMaintenanceOptions": _modify_instance_maintenance_options,
     "DescribeInstanceTopology": _describe_instance_topology,
     "DescribeSpotInstanceRequests": _describe_spot_instance_requests,
