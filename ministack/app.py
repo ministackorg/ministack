@@ -2445,6 +2445,19 @@ def _load_persisted_state():
         _get_module("lambda_svc")  # module file is lambda_svc.py (lambda is a keyword)
         logger.info("Lambda: eager-loaded module to resume event-source-mapping pollers at boot")
 
+    # ECS services are restored with every task marked STOPPED — their
+    # containers went with the previous process — and the relaunch happens on
+    # the module's import-time restore hook. ECS is otherwise imported lazily on
+    # the first ECS request, so a workload that only talks to the service
+    # through a load balancer never triggers it: the service reports its
+    # persisted runningCount, nothing is running, and every request through the
+    # balancer fails. Same conditional shape as RDS — only pay the cold-start
+    # when there are services to bring back.
+    _ecs_state = load_state("ecs")
+    if _ecs_state and getattr(_ecs_state.get("services"), "_data", _ecs_state.get("services")):
+        _get_module("ecs")
+        logger.info("ECS: eager-loaded module to relaunch persisted services at boot")
+
 
 async def _wait_for_port(port, timeout=30):
     """Wait until the server is accepting TCP connections."""

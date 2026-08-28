@@ -83,6 +83,10 @@ _docker = None
 # exit on their own and accumulate indefinitely. A background daemon thread
 # sweeps them every ECS_REAP_INTERVAL_SECONDS (default 60).
 _ECS_REAP_INTERVAL = int(os.environ.get("ECS_REAP_INTERVAL_SECONDS", "60"))
+# Give the process a moment to finish binding before pulling images and starting
+# containers for restored services.
+_ECS_RESTORE_RECONCILE_DELAY = float(
+    os.environ.get("ECS_RESTORE_RECONCILE_DELAY_SECONDS", "2"))
 _ecs_reaper_started = False
 _ecs_reaper_lock = threading.Lock()
 
@@ -238,10 +242,54 @@ def restore_state(data):
             _tasks.set_scoped(get_account_id(), region, arn, restored_task)
 
 
+def _reconcile_restored_services():
+    """Relaunch the tasks of every ACTIVE service after a restore.
+
+    restore_state marks each restored task STOPPED — its container went with the
+    process that ran it. Without this the service still reports its persisted
+    runningCount while nothing is running, and any load balancer in front of it
+    keeps forwarding to addresses nothing is listening on. Real ECS relaunches:
+    keeping desiredCount satisfied is the service scheduler's whole job.
+
+    Failures are logged and skipped rather than raised, so one unreachable image
+    cannot stop the remaining services from coming back.
+    """
+    for svc_key, svc in list(_services.items()):
+        if not isinstance(svc, dict) or svc.get("status") != "ACTIVE":
+            continue
+        cluster_name = svc_key.split("/", 1)[0]
+        try:
+            _reconcile_service_tasks(cluster_name, svc_key)
+        except Exception as exc:
+            logger.warning(
+                "ECS: could not relaunch service %s after restore: %s",
+                svc.get("serviceName", svc_key), exc)
+
+
+def _start_restored_service_reconciler():
+    """Run the reconcile off the import path.
+
+    restore_state runs at import; pulling images and starting containers there
+    would block startup behind the Docker daemon, so this happens on a daemon
+    thread once the process is up.
+    """
+    def _run():
+        time.sleep(_ECS_RESTORE_RECONCILE_DELAY)
+        try:
+            _reconcile_restored_services()
+        except Exception:
+            logger.exception("ECS: restored-service reconcile failed")
+
+    threading.Thread(
+        target=_run, daemon=True, name="ministack-ecs-restore-reconcile"
+    ).start()
+
+
 try:
     _restored = load_state("ecs")
     if _restored:
         restore_state(_restored)
+        _start_restored_service_reconciler()
 except Exception:
     import logging
     logging.getLogger(__name__).exception(

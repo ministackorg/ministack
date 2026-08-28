@@ -1690,3 +1690,52 @@ def test_ecs_sync_service_targets_does_not_publish_a_stale_view(monkeypatch):
 
     final = sorted(t["Id"] for t in _alb._targets[tg_arn])
     assert final == ["10.3.0.1"], f"a stale view was published: {final}"
+
+
+def test_ecs_restored_services_relaunch_their_tasks(monkeypatch):
+    """A service must satisfy desiredCount again after a restore.
+
+    restore_state marks every restored task STOPPED, because its container is
+    gone with the process that ran it. Nothing then reconciles the services, so
+    a restarted ministack reports runningCount from the persisted record while
+    no container exists, and the load balancer keeps forwarding to addresses
+    nothing is listening on. Real ECS relaunches: the service scheduler exists
+    to keep desiredCount satisfied.
+    """
+    from ministack.services import ecs as _ecs
+
+    launched = []
+    monkeypatch.setattr(_ecs, "_run_task", lambda data: launched.append(data))
+    monkeypatch.setattr(_ecs, "_clusters", {"c1": {"clusterName": "c1"}})
+    monkeypatch.setattr(_ecs, "_task_defs", {
+        "web:1": {"taskDefinitionArn": "arn:aws:ecs:us-east-1:000000000000:task-definition/web:1",
+        "family": "web"},
+    })
+    monkeypatch.setattr(_ecs, "_services", {
+        "c1/web": {
+            "serviceName": "web", "status": "ACTIVE", "desiredCount": 2,
+            "taskDefinition": "arn:aws:ecs:us-east-1:000000000000:task-definition/web:1", "clusterArn": "arn:cluster/c1",
+            "launchType": "FARGATE", "deployments": [{"runningCount": 2}],
+        },
+        # An inactive service must not be relaunched.
+        "c1/old": {
+            "serviceName": "old", "status": "INACTIVE", "desiredCount": 3,
+            "taskDefinition": "arn:aws:ecs:us-east-1:000000000000:task-definition/web:1", "clusterArn": "arn:cluster/c1",
+            "launchType": "FARGATE", "deployments": [],
+        },
+    })
+    # What restore_state leaves behind: the tasks exist but are STOPPED.
+    monkeypatch.setattr(_ecs, "_tasks", {
+        "arn:task/1": {"group": "service:web", "clusterArn": "arn:cluster/c1",
+                       "lastStatus": "STOPPED", "taskDefinitionArn": "arn:aws:ecs:us-east-1:000000000000:task-definition/web:1"},
+        "arn:task/2": {"group": "service:web", "clusterArn": "arn:cluster/c1",
+                       "lastStatus": "STOPPED", "taskDefinitionArn": "arn:aws:ecs:us-east-1:000000000000:task-definition/web:1"},
+    })
+
+    _ecs._reconcile_restored_services()
+
+    assert len(launched) == 1, f"expected one RunTask call, got {launched}"
+    call = launched[0]
+    assert call["group"] == "service:web"
+    assert call["count"] == 2, "both stopped tasks must be replaced"
+    assert all(c["group"] != "service:old" for c in launched)
