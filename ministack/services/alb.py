@@ -458,13 +458,25 @@ def _listener_xml(l):
     )
 
 
+def _condition_xml(c):
+    """Render a condition the way AWS does: the flat Values list *and*, for the
+    fields that have one, the typed config carrying the same values.
+
+    A client that reads only the typed config — the Terraform provider does, for
+    path_pattern and host_header — sees an empty condition otherwise, and plans a
+    change on every run to put the values back.
+    """
+    values = c.get("Values", [])
+    members = "".join(f"<member>{v}</member>" for v in values)
+    xml = f"<member><Field>{c['Field']}</Field><Values>{members}</Values>"
+    config_key = _CONDITION_VALUE_KEYS.get(c.get("Field"))
+    if config_key:
+        xml += f"<{config_key}><Values>{members}</Values></{config_key}>"
+    return xml + "</member>"
+
+
 def _rule_xml(r):
-    conds = "".join(
-        f"<member><Field>{c['Field']}</Field>"
-        f"<Values>{''.join(f'<member>{v}</member>' for v in c.get('Values',[]))}</Values>"
-        f"</member>"
-        for c in r.get("Conditions", [])
-    )
+    conds = "".join(_condition_xml(c) for c in r.get("Conditions", []))
     acts = "".join(_action_xml(a) for a in r.get("Actions", []))
     return (
         f"<member>"
