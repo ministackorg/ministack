@@ -10688,3 +10688,50 @@ def test_lambda_invoke_with_response_stream_missing_function_is_plain_error(lam)
     with pytest.raises(ClientError) as exc:
         lam.invoke_with_response_stream(FunctionName="stream-does-not-exist")
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_lambda_event_source_mapping_response_carries_its_arn(lam, sqs):
+    """CreateEventSourceMapping / Get / List must return EventSourceMappingArn.
+
+    ListTags already works when given the ARN, but a caller has no way to build
+    that ARN itself — the Terraform provider reads EventSourceMappingArn off the
+    ESM and calls ListTags with it. With the field absent the provider reads no
+    tags at all, so `tags_all` comes back empty and every plan shows a tag diff
+    on every mapping, forever.
+    """
+    code = _zip_lambda("def handler(e,c): return 'ok'")
+    fn = "qa-esm-arn-fn"
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/r",
+        Handler="index.handler",
+        Code={"ZipFile": code},
+    )
+    q = sqs.create_queue(QueueName="qa-esm-arn-queue")
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q["QueueUrl"], AttributeNames=["QueueArn"]
+    )["Attributes"]["QueueArn"]
+
+    created = lam.create_event_source_mapping(
+        FunctionName=fn, EventSourceArn=q_arn, Tags={"Team": "billing"}
+    )
+    uuid = created["UUID"]
+    expected = f"arn:aws:lambda:us-east-1:000000000000:event-source-mapping:{uuid}"
+
+    assert created.get("EventSourceMappingArn") == expected
+
+    got = lam.get_event_source_mapping(UUID=uuid)
+    assert got.get("EventSourceMappingArn") == expected
+
+    listed = [
+        m for m in lam.list_event_source_mappings(FunctionName=fn)["EventSourceMappings"]
+        if m["UUID"] == uuid
+    ]
+    assert listed and listed[0].get("EventSourceMappingArn") == expected
+
+    # The ARN the response hands back must be the one ListTags accepts, which is
+    # the whole point of returning it.
+    assert lam.list_tags(Resource=created["EventSourceMappingArn"])["Tags"] == {
+        "Team": "billing"
+    }

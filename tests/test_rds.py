@@ -12918,3 +12918,77 @@ def test_rds_db_proxy_target_health_follows_the_backing_instance(
     rds.deregister_db_proxy_targets(
         DBProxyName="health-proxy", DBInstanceIdentifiers=["health-pg"],
     )
+
+
+def test_rds_cluster_echoes_serverlessv2_scaling_configuration(rds):
+    """ServerlessV2ScalingConfiguration must round-trip on a cluster.
+
+    Terraform's serverlessv2_scaling_configuration block reads back empty when
+    the field is dropped, so every plan proposes adding it again.
+    """
+    cid = "qa-slv2-cluster"
+    rds.create_db_cluster(
+        DBClusterIdentifier=cid,
+        Engine="aurora-postgresql",
+        MasterUsername="admin",
+        MasterUserPassword="password123",
+        ServerlessV2ScalingConfiguration={"MinCapacity": 0.5, "MaxCapacity": 1.0},
+    )
+    c = rds.describe_db_clusters(DBClusterIdentifier=cid)["DBClusters"][0]
+    slv2 = c.get("ServerlessV2ScalingConfiguration")
+    assert slv2, "ServerlessV2ScalingConfiguration missing from DescribeDBClusters"
+    assert slv2["MinCapacity"] == 0.5
+    assert slv2["MaxCapacity"] == 1.0
+
+
+def test_rds_instance_echoes_performance_insights_retention(rds):
+    """PerformanceInsightsRetentionPeriod must reflect what was requested.
+
+    The value was hardcoded to 7 on the record and then never serialised, so the
+    provider read 0 and planned the same change on every run.
+    """
+    iid = "qa-pi-retention"
+    rds.create_db_instance(
+        DBInstanceIdentifier=iid,
+        DBInstanceClass="db.t3.medium",
+        Engine="postgres",
+        MasterUsername="admin",
+        MasterUserPassword="password123",
+        AllocatedStorage=20,
+        EnablePerformanceInsights=True,
+        PerformanceInsightsRetentionPeriod=31,
+    )
+    i = rds.describe_db_instances(DBInstanceIdentifier=iid)["DBInstances"][0]
+    assert i["PerformanceInsightsEnabled"] is True
+    assert i.get("PerformanceInsightsRetentionPeriod") == 31
+
+
+def test_rds_modify_cluster_sets_serverlessv2_scaling_configuration(rds):
+    """ModifyDBCluster must accept ServerlessV2ScalingConfiguration too.
+
+    A cluster created without it — or before it was stored at all — is brought
+    into line by an update, not a create. If modify drops the field the plan
+    proposes the block, the apply reports success, and the next plan proposes
+    it again unchanged.
+    """
+    cid = "qa-slv2-modify"
+    rds.create_db_cluster(
+        DBClusterIdentifier=cid,
+        Engine="aurora-postgresql",
+        MasterUsername="admin",
+        MasterUserPassword="password123",
+    )
+    assert not rds.describe_db_clusters(DBClusterIdentifier=cid)["DBClusters"][0].get(
+        "ServerlessV2ScalingConfiguration"
+    )
+
+    rds.modify_db_cluster(
+        DBClusterIdentifier=cid,
+        ServerlessV2ScalingConfiguration={"MinCapacity": 2.0, "MaxCapacity": 8.0},
+        ApplyImmediately=True,
+    )
+    slv2 = rds.describe_db_clusters(DBClusterIdentifier=cid)["DBClusters"][0][
+        "ServerlessV2ScalingConfiguration"
+    ]
+    assert slv2["MinCapacity"] == 2.0
+    assert slv2["MaxCapacity"] == 8.0

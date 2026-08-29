@@ -7966,3 +7966,100 @@ def test_sfn_sync_execution_emits_no_status_events(sfn_sync, sfn, eb, sqs):
         eb.remove_targets(Rule=rule, Ids=["t1"])
         eb.delete_rule(Name=rule)
         sqs.delete_queue(QueueUrl=q_url)
+
+
+# ---------------------------------------------------------------------------
+# JSONata: definition-time validation and AWS-parity failures
+# ---------------------------------------------------------------------------
+
+def _jsonata_pass_machine(expr):
+    return json.dumps({
+        "QueryLanguage": "JSONata",
+        "StartAt": "Eval",
+        "States": {"Eval": {"Type": "Pass", "Output": {"v": "{% " + expr + " %}"},
+                            "End": True}},
+    })
+
+
+def _jsonata_eval(sfn, name, expr, wait=5.0):
+    """Run one JSONata expression through a Pass state; (status, cause)."""
+    sm_arn = sfn.create_state_machine(
+        name=name, definition=_jsonata_pass_machine(expr),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )["stateMachineArn"]
+    try:
+        exec_arn = sfn.start_execution(stateMachineArn=sm_arn)["executionArn"]
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            desc = sfn.describe_execution(executionArn=exec_arn)
+            if desc["status"] != "RUNNING":
+                break
+            time.sleep(0.1)
+        events = sfn.get_execution_history(executionArn=exec_arn)["events"]
+        cause = ""
+        for e in events:
+            details = e.get("executionFailedEventDetails")
+            if details:
+                cause = details.get("cause", "")
+        return desc["status"], cause
+    finally:
+        sfn.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_jsonata_syntax_error_rejected_at_definition_time(sfn):
+    """AWS refuses a malformed JSONata expression at CreateStateMachine, not
+    at run time, with INVALID_JSONATA_EXPRESSION naming the field's path."""
+    from botocore.exceptions import ClientError
+    with pytest.raises(ClientError) as exc:
+        sfn.create_state_machine(
+            name="qa-jsonata-invalid", definition=_jsonata_pass_machine("[1,2)"),
+            roleArn="arn:aws:iam::000000000000:role/R",
+        )
+    err = exc.value.response["Error"]
+    assert err["Code"] == "InvalidDefinition"
+    assert "INVALID_JSONATA_EXPRESSION" in err["Message"]
+    assert "/States/Eval/Output/v" in err["Message"]
+
+
+def test_sfn_jsonata_cause_carries_the_error_code(sfn):
+    """The evaluation cause leads with the JSONata error code, as AWS's does."""
+    status, cause = _jsonata_eval(sfn, "qa-jsonata-t2010", "null <= \"world\"")
+    assert status == "FAILED"
+    assert "T2010:" in cause, cause
+
+
+def test_sfn_jsonata_tomillis_requires_iso8601(sfn):
+    """A space-separated timestamp draws D3110, as on AWS, instead of a value."""
+    status, cause = _jsonata_eval(
+        sfn, "qa-jsonata-d3110", "$toMillis(\"2018-02-03 11:15:33\")")
+    assert status == "FAILED"
+    assert "D3110" in cause, cause
+
+
+def test_sfn_jsonata_replace_refuses_zero_length_regex(sfn):
+    """A regex that can match nothing draws D1004, as on AWS."""
+    status, cause = _jsonata_eval(
+        sfn, "qa-jsonata-d1004", "$replace(\"abracadabra\", /.*?/, \"x\")")
+    assert status == "FAILED"
+    assert "D1004" in cause, cause
+
+
+def test_sfn_jsonata_tomillis_still_parses_iso(sfn):
+    """The strictness must not break a well-formed timestamp."""
+    sm = sfn.create_state_machine(
+        name="qa-jsonata-iso-ok",
+        definition=_jsonata_pass_machine("$toMillis(\"2020-01-01T00:00:00Z\")"),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )["stateMachineArn"]
+    try:
+        exec_arn = sfn.start_execution(stateMachineArn=sm)["executionArn"]
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            desc = sfn.describe_execution(executionArn=exec_arn)
+            if desc["status"] != "RUNNING":
+                break
+            time.sleep(0.1)
+        assert desc["status"] == "SUCCEEDED"
+        assert json.loads(desc["output"]) == {"v": 1577836800000}
+    finally:
+        sfn.delete_state_machine(stateMachineArn=sm)

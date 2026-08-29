@@ -1194,7 +1194,11 @@ async def _handle_s3_control_request(path: str, method: str, body: bytes, query_
 
         if method == "GET":
             tags = _get_module("s3")._bucket_tags.get(bucket_name, {})
-            tag_members = "".join(f"<member><Key>{k}</Key><Value>{v}</Value></member>" for k, v in tags.items())
+            # s3control's TagList declares locationName "Tag", so each entry is
+            # <Tag>, not the <member> the query protocol uses elsewhere. boto3
+            # tolerates <member>; aws-sdk-go-v2 — and therefore Terraform —
+            # parses an empty list from it and reports the resource as untagged.
+            tag_members = "".join(f"<Tag><Key>{k}</Key><Value>{v}</Value></Tag>" for k, v in tags.items())
             xml_body = (
                 '<?xml version="1.0" encoding="UTF-8"?>'
                 '<ListTagsForResourceResult xmlns="https://awss3control.amazonaws.com/doc/2018-08-20/">'

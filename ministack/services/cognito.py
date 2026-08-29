@@ -2207,6 +2207,8 @@ def _create_user_pool(data):
         pool["UserPoolAddOns"] = data["UserPoolAddOns"]
     if data.get("VerificationMessageTemplate"):
         pool["VerificationMessageTemplate"] = data["VerificationMessageTemplate"]
+    if data.get("UserAttributeUpdateSettings"):
+        pool["UserAttributeUpdateSettings"] = data["UserAttributeUpdateSettings"]
     _user_pools[pid] = pool
     logger.info("Cognito: CreateUserPool %s (%s)", name, pid)
     return json_response({"UserPool": _pool_out(pool)})
@@ -2262,6 +2264,7 @@ def _update_user_pool(data):
         "EmailConfiguration", "SmsConfiguration", "UserPoolTags",
         "AdminCreateUserConfig", "UserPoolAddOns", "VerificationMessageTemplate",
         "AccountRecoverySetting", "LambdaConfig",
+        "UserAttributeUpdateSettings",
     }
     for k in updatable:
         if k in data:
@@ -4707,8 +4710,18 @@ def _get_user_pool_mfa_config(data):
     resp = {"MfaConfiguration": pool.get("MfaConfiguration", "OFF")}
     for key in ("SmsMfaConfiguration", "SoftwareTokenMfaConfiguration",
                 "EmailMfaConfiguration", "WebAuthnConfiguration"):
-        if pool.get(key):
-            resp[key] = pool[key]
+        # `is not None`, not truthiness: a caller turning software-token MFA
+        # off sends an empty object — `enabled = false` serialises with the
+        # false field omitted — and that is a value it set, not a field it left
+        # unset. Dropping it makes the caller re-send the change on every run.
+        value = pool.get(key)
+        if value is None:
+            continue
+        if key == "SoftwareTokenMfaConfiguration":
+            value = {"Enabled": bool(value.get("Enabled", False))}
+        elif not value:
+            continue
+        resp[key] = value
     return json_response(resp)
 
 
@@ -4784,8 +4797,18 @@ def _set_user_pool_mfa_config(data):
     resp = {"MfaConfiguration": pool.get("MfaConfiguration", "OFF")}
     for key in ("SmsMfaConfiguration", "SoftwareTokenMfaConfiguration",
                 "EmailMfaConfiguration", "WebAuthnConfiguration"):
-        if pool.get(key):
-            resp[key] = pool[key]
+        # `is not None`, not truthiness: a caller turning software-token MFA
+        # off sends an empty object — `enabled = false` serialises with the
+        # false field omitted — and that is a value it set, not a field it left
+        # unset. Dropping it makes the caller re-send the change on every run.
+        value = pool.get(key)
+        if value is None:
+            continue
+        if key == "SoftwareTokenMfaConfiguration":
+            value = {"Enabled": bool(value.get("Enabled", False))}
+        elif not value:
+            continue
+        resp[key] = value
     return json_response(resp)
 
 

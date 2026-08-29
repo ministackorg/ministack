@@ -38,7 +38,10 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait as futures_wait
 from datetime import datetime, timezone
 
-import jsonata
+try:
+    import jsonata
+except ImportError:  # the wheel is optional at runtime: JSONata states refuse
+    jsonata = None   # cleanly instead of the whole service failing to load
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
@@ -311,10 +314,49 @@ async def handle_request(method, path, headers, body, query_params):
 # State machine CRUD
 # ---------------------------------------------------------------------------
 
+def _validate_definition_jsonata(definition_str) -> str | None:
+    """The first malformed ``{% ... %}`` expression's refusal, or None.
+
+    AWS rejects a definition carrying an unparsable JSONata expression at
+    CreateStateMachine/UpdateStateMachine time with InvalidDefinition and an
+    INVALID_JSONATA_EXPRESSION message naming the field's path — a typo never
+    reaches an execution. Parse only: evaluation errors stay runtime."""
+    if jsonata is None or not isinstance(definition_str, str):
+        return None
+    try:
+        definition = json.loads(definition_str)
+    except (TypeError, ValueError):
+        return None  # JSON validity is judged by the existing checks
+
+    def walk(node, path):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                found = walk(v, f"{path}/{k}")
+                if found:
+                    return found
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                found = walk(v, f"{path}/{i}")
+                if found:
+                    return found
+        elif (isinstance(node, str) and node.startswith("{%")
+                and node.endswith("%}")):
+            try:
+                jsonata.Jsonata.jsonata(node[2:-2].strip())
+            except Exception as exc:
+                return f"INVALID_JSONATA_EXPRESSION: {exc}\n  at {path or '/'}"
+        return None
+
+    return walk(definition, "")
+
+
 def _create_state_machine(data):
     name = data.get("name")
     if not name:
         return error_response_json("ValidationException", "name is required", 400)
+    invalid = _validate_definition_jsonata(data.get("definition"))
+    if invalid:
+        return error_response_json("InvalidDefinition", invalid, 400)
 
     arn = f"arn:aws:states:{get_region()}:{get_account_id()}:stateMachine:{name}"
     if arn in _state_machines:
@@ -482,6 +524,9 @@ def _update_state_machine(data):
             "StateMachineDoesNotExist",
             f"State machine {arn} not found", 400)
     if "definition" in data:
+        invalid = _validate_definition_jsonata(data["definition"])
+        if invalid:
+            return error_response_json("InvalidDefinition", invalid, 400)
         sm["definition"] = data["definition"]
     if "roleArn" in data:
         sm["roleArn"] = data["roleArn"]
@@ -2353,6 +2398,11 @@ def _evaluate_jsonata(expression, raw_input, ctx=None, result=None, error_output
     # `$states.input`.
     bindings = dict(ctx.get("variables", {}))
     bindings["states"] = states
+    if jsonata is None:
+        raise _ExecutionError(
+            "States.QueryEvaluationError",
+            "JSONata support requires the jsonata-python package, which is "
+            "not installed in this build")
     try:
         expr = jsonata.Jsonata.jsonata(expression, timeout=1000)
         _register_sfn_jsonata_functions(expr)
@@ -2360,7 +2410,12 @@ def _evaluate_jsonata(expression, raw_input, ctx=None, result=None, error_output
     except _ExecutionError:
         raise
     except Exception as exc:
-        raise _ExecutionError("States.QueryEvaluationError", str(exc))
+        # AWS's cause leads with the JSONata error code (T2010, D3030, ...).
+        # The engine keeps it in JException.error and leaves it out of the
+        # message, so it is prefixed here; a plain Python exception has none.
+        code = getattr(exc, "error", None)
+        message = f"{code}: {exc}" if isinstance(code, str) and code else str(exc)
+        raise _ExecutionError("States.QueryEvaluationError", message)
     if value is None and not _jsonata_result_defined(expression, bindings):
         # AWS raises on an expression that yields JSONata `undefined` (a missing
         # field or unbound variable): "JSON cannot represent an undefined value
@@ -2391,12 +2446,45 @@ def _jsonata_result_defined(expression, bindings):
 # States.* intrinsics available to JSONPath states. Per AWS, functions that
 # take integer parameters round any non-integer argument down.
 def _register_sfn_jsonata_functions(expr):
+    # Two base-engine functions are shadowed because jsonata-python returns a
+    # value where AWS (and jsonata-js) fail the evaluation; the shadows refuse
+    # exactly there and delegate everywhere else.
+    expr.register_lambda("toMillis", _sfn_jsonata_to_millis)
+    expr.register_lambda("replace", _sfn_jsonata_replace)
     expr.register_lambda("partition", _sfn_jsonata_partition)
     expr.register_lambda("range", _sfn_jsonata_range)
     expr.register_lambda("hash", _sfn_jsonata_hash)
     expr.register_lambda("random", _sfn_jsonata_random)
     expr.register_lambda("uuid", _sfn_jsonata_uuid)
     expr.register_lambda("parse", _sfn_jsonata_parse)
+
+
+def _sfn_jsonata_to_millis(timestamp=None, picture=None):
+    """`$toMillis` requiring a real ISO 8601 timestamp, as AWS does (D3110).
+
+    jsonata-python's parser also accepts a space-separated form; AWS refuses
+    it, so the space form and anything else the parser cannot read answer the
+    documented D3110 message."""
+    from jsonata import functions as _jsonata_functions
+    refusal = ValueError(
+        "D3110: The argument of the toMillis function must be an ISO 8601 "
+        f'formatted timestamp. Given "{timestamp}"')
+    if picture is None and isinstance(timestamp, str) and "T" not in timestamp:
+        raise refusal
+    try:
+        return _jsonata_functions.Functions.datetime_to_millis(timestamp, picture)
+    except ValueError:
+        raise refusal
+
+
+def _sfn_jsonata_replace(string=None, pattern=None, replacement=None, limit=None):
+    """`$replace` refusing a regex that can match nothing, as AWS does (D1004)."""
+    from jsonata import functions as _jsonata_functions
+    if hasattr(pattern, "search"):
+        m = pattern.search("")
+        if m is not None and m.group() == "":
+            raise ValueError("D1004: Regular expression matches zero length string")
+    return _jsonata_functions.Functions.replace(string, pattern, replacement, limit)
 
 
 def _sfn_jsonata_partition(array, size):

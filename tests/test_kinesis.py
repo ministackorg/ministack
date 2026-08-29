@@ -573,3 +573,38 @@ def test_kinesis_cbor_put_record(kin):
     )
     records = kin.get_records(ShardIterator=it["ShardIterator"])
     assert len(records["Records"]) == 1
+
+
+def test_kinesis_describe_echoes_the_encryption_key_id(kin):
+    """StartStreamEncryption stores KeyId; the describe paths must return it.
+
+    AWS reports KeyId alongside EncryptionType in both StreamDescription and
+    StreamDescriptionSummary. Storing it without echoing it means the Terraform
+    provider reads kms_key_id as empty on a stream that is in fact encrypted, so
+    every plan proposes setting it again.
+    """
+    name = "qa-kinesis-keyid"
+    kin.create_stream(StreamName=name, ShardCount=1)
+    key = "arn:aws:kms:us-east-1:000000000000:alias/aws/kinesis"
+    kin.start_stream_encryption(
+        StreamName=name, EncryptionType="KMS", KeyId=key
+    )
+
+    desc = kin.describe_stream(StreamName=name)["StreamDescription"]
+    assert desc["EncryptionType"] == "KMS"
+    assert desc.get("KeyId") == key
+
+    summary = kin.describe_stream_summary(StreamName=name)[
+        "StreamDescriptionSummary"
+    ]
+    assert summary["EncryptionType"] == "KMS"
+    assert summary.get("KeyId") == key
+
+    # An unencrypted stream must not report a KeyId at all — AWS omits the field
+    # rather than returning an empty one, and an empty string would read as drift.
+    kin.stop_stream_encryption(
+        StreamName=name, EncryptionType="KMS", KeyId=key
+    )
+    desc = kin.describe_stream(StreamName=name)["StreamDescription"]
+    assert desc["EncryptionType"] == "NONE"
+    assert "KeyId" not in desc
