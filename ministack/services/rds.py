@@ -3827,7 +3827,9 @@ def _create_db_instance_impl(p):
         "IAMDatabaseAuthenticationEnabled": _p(p, "EnableIAMDatabaseAuthentication") == "true",
         "PerformanceInsightsEnabled": _p(p, "EnablePerformanceInsights") == "true",
         "PerformanceInsightsKMSKeyId": "",
-        "PerformanceInsightsRetentionPeriod": 7,
+        "PerformanceInsightsRetentionPeriod": int(
+            _p(p, "PerformanceInsightsRetentionPeriod") or "7"
+        ),
         "EnabledCloudwatchLogsExports": [],
         "ProcessorFeatures": [],
         "DeletionProtection": _p(p, "DeletionProtection") == "true",
@@ -4511,6 +4513,22 @@ def _restore_from_snapshot(p):
 # DB Clusters
 # ---------------------------------------------------------------------------
 
+def _serverlessv2_from_params(p):
+    """Read ServerlessV2ScalingConfiguration.{Min,Max}Capacity from query params.
+
+    Returned as a dict only when at least one bound was supplied — an Aurora
+    cluster that is not Serverless v2 has no such configuration, and echoing an
+    empty one would read as drift the other way.
+    """
+    prefix = "ServerlessV2ScalingConfiguration."
+    out = {}
+    for key, field in (("MinCapacity", "MinCapacity"), ("MaxCapacity", "MaxCapacity")):
+        raw = _p(p, f"{prefix}{key}")
+        if raw not in (None, ""):
+            out[field] = float(raw)
+    return out or None
+
+
 def _create_db_cluster(p):
     cluster_id = _p(p, "DBClusterIdentifier")
     if not cluster_id:
@@ -4682,6 +4700,7 @@ def _create_db_cluster(p):
         "Engine": engine,
         "EngineVersion": engine_version,
         "EngineMode": _p(p, "EngineMode") or "provisioned",
+        "ServerlessV2ScalingConfiguration": _serverlessv2_from_params(p),
         "Status": "available",
         "MasterUsername": master_user,
         "_MasterUserPassword": master_pass,
@@ -5072,6 +5091,12 @@ def _modify_db_cluster(p):
         cluster["Port"] = int(_p(p, "Port"))
     if _p(p, "BackupRetentionPeriod"):
         cluster["BackupRetentionPeriod"] = int(_p(p, "BackupRetentionPeriod"))
+    # Without this a cluster created before the field was stored can never be
+    # brought into line: the plan proposes the block, the apply drops it, and
+    # the next plan proposes it again.
+    serverlessv2 = _serverlessv2_from_params(p)
+    if serverlessv2:
+        cluster["ServerlessV2ScalingConfiguration"] = serverlessv2
     if _p(p, "PreferredBackupWindow"):
         cluster["PreferredBackupWindow"] = _p(p, "PreferredBackupWindow")
     if _p(p, "PreferredMaintenanceWindow"):
@@ -7035,6 +7060,7 @@ def _instance_xml(i):
         <DBInstanceArn>{i['DBInstanceArn']}</DBInstanceArn>
         <IAMDatabaseAuthenticationEnabled>{str(i.get('IAMDatabaseAuthenticationEnabled',False)).lower()}</IAMDatabaseAuthenticationEnabled>
         <PerformanceInsightsEnabled>{str(i.get('PerformanceInsightsEnabled',False)).lower()}</PerformanceInsightsEnabled>
+        <PerformanceInsightsRetentionPeriod>{i.get('PerformanceInsightsRetentionPeriod',7)}</PerformanceInsightsRetentionPeriod>
         <EnabledCloudwatchLogsExports/>
         <ProcessorFeatures/>
         <DeletionProtection>{str(i.get('DeletionProtection',False)).lower()}</DeletionProtection>
@@ -7047,6 +7073,18 @@ def _instance_xml(i):
         <NetworkType>{i.get('NetworkType','IPV4')}</NetworkType>
         <StorageThroughput>{i.get('StorageThroughput',0)}</StorageThroughput>
         <IsStorageConfigUpgradeAvailable>{str(i.get('IsStorageConfigUpgradeAvailable',False)).lower()}</IsStorageConfigUpgradeAvailable>"""
+
+
+def _serverlessv2_xml(c):
+    cfg = c.get("ServerlessV2ScalingConfiguration")
+    if not cfg:
+        return ""
+    return (
+        "<ServerlessV2ScalingConfiguration>"
+        f"<MinCapacity>{cfg.get('MinCapacity', 0.5)}</MinCapacity>"
+        f"<MaxCapacity>{cfg.get('MaxCapacity', 1.0)}</MaxCapacity>"
+        "</ServerlessV2ScalingConfiguration>"
+    )
 
 
 def _cluster_xml(c):
@@ -7110,6 +7148,7 @@ def _cluster_xml(c):
         <Engine>{c['Engine']}</Engine>
         <EngineVersion>{c['EngineVersion']}</EngineVersion>
         <EngineMode>{c.get('EngineMode','provisioned')}</EngineMode>
+        {_serverlessv2_xml(c)}
         <Status>{c['Status']}</Status>
         <MasterUsername>{c.get('MasterUsername','admin')}</MasterUsername>
         {db_name_xml}

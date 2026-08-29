@@ -1189,3 +1189,91 @@ def test_alb_load_balancers_are_region_isolated(elbv2):
         assert arn not in west
     finally:
         elbv2.delete_load_balancer(LoadBalancerArn=arn)
+
+
+def test_alb_rule_condition_accepts_typed_config_shape(elbv2):
+    """A rule condition's values may arrive as PathPatternConfig, not a flat Values list.
+
+    The Terraform AWS provider sends the typed form. Parsing only the legacy flat
+    list records an empty condition, so the rule matches nothing and every request
+    falls through to the listener's default action.
+    """
+    vpc = "vpc-typedcond"
+    lb = elbv2.create_load_balancer(Name="typedcond-lb", Subnets=["subnet-1"])["LoadBalancers"][0]
+    tg = elbv2.create_target_group(Name="typedcond-tg", Port=80, Protocol="HTTP", VpcId=vpc)["TargetGroups"][0]
+    listener = elbv2.create_listener(
+        LoadBalancerArn=lb["LoadBalancerArn"], Protocol="HTTP", Port=80,
+        DefaultActions=[{
+            "Type": "fixed-response",
+            "FixedResponseConfig": {"StatusCode": "200", "ContentType": "text/plain", "MessageBody": "OK"},
+        }],
+    )["Listeners"][0]
+
+    # botocore serialises this as Conditions.member.1.PathPatternConfig.Values.member.1
+    elbv2.create_rule(
+        ListenerArn=listener["ListenerArn"],
+        Priority=1,
+        Conditions=[{"Field": "path-pattern", "PathPatternConfig": {"Values": ["/q"]}}],
+        Actions=[{"Type": "forward", "TargetGroupArn": tg["TargetGroupArn"]}],
+    )
+
+    rules = elbv2.describe_rules(ListenerArn=listener["ListenerArn"])["Rules"]
+    rule = next(r for r in rules if r.get("Priority") == "1")
+    cond = rule["Conditions"][0]
+    assert cond["Field"] == "path-pattern"
+    assert cond["Values"] == ["/q"], f"condition values were dropped: {cond}"
+    # AWS answers with both shapes. A client reading only the typed config — the
+    # Terraform provider does — sees an empty condition without this, and plans a
+    # change on every run to put the values back.
+    assert cond["PathPatternConfig"]["Values"] == ["/q"], f"typed config not returned: {cond}"
+
+
+def test_alb_rule_condition_still_accepts_flat_values(elbv2):
+    """The legacy flat Values list must keep working."""
+    vpc = "vpc-flatcond"
+    lb = elbv2.create_load_balancer(Name="flatcond-lb", Subnets=["subnet-1"])["LoadBalancers"][0]
+    tg = elbv2.create_target_group(Name="flatcond-tg", Port=80, Protocol="HTTP", VpcId=vpc)["TargetGroups"][0]
+    listener = elbv2.create_listener(
+        LoadBalancerArn=lb["LoadBalancerArn"], Protocol="HTTP", Port=80,
+        DefaultActions=[{"Type": "forward", "TargetGroupArn": tg["TargetGroupArn"]}],
+    )["Listeners"][0]
+
+    elbv2.create_rule(
+        ListenerArn=listener["ListenerArn"],
+        Priority=5,
+        Conditions=[{"Field": "path-pattern", "Values": ["/legacy"]}],
+        Actions=[{"Type": "forward", "TargetGroupArn": tg["TargetGroupArn"]}],
+    )
+
+    rules = elbv2.describe_rules(ListenerArn=listener["ListenerArn"])["Rules"]
+    rule = next(r for r in rules if r.get("Priority") == "5")
+    assert rule["Conditions"][0]["Values"] == ["/legacy"]
+
+
+def test_alb_rule_conditions_round_trip_in_both_shapes(elbv2):
+    """host-header and http-request-method must also come back in their typed config."""
+    vpc = "vpc-bothshapes"
+    lb = elbv2.create_load_balancer(Name="bothshapes-lb", Subnets=["subnet-1"])["LoadBalancers"][0]
+    tg = elbv2.create_target_group(Name="bothshapes-tg", Port=80, Protocol="HTTP", VpcId=vpc)["TargetGroups"][0]
+    listener = elbv2.create_listener(
+        LoadBalancerArn=lb["LoadBalancerArn"], Protocol="HTTP", Port=80,
+        DefaultActions=[{"Type": "forward", "TargetGroupArn": tg["TargetGroupArn"]}],
+    )["Listeners"][0]
+
+    cases = [
+        (20, {"Field": "host-header", "HostHeaderConfig": {"Values": ["api.example.com"]}},
+         "HostHeaderConfig", ["api.example.com"]),
+        (21, {"Field": "http-request-method", "HttpRequestMethodConfig": {"Values": ["POST"]}},
+         "HttpRequestMethodConfig", ["POST"]),
+    ]
+    for priority, condition, config_key, expected in cases:
+        elbv2.create_rule(
+            ListenerArn=listener["ListenerArn"], Priority=priority, Conditions=[condition],
+            Actions=[{"Type": "forward", "TargetGroupArn": tg["TargetGroupArn"]}],
+        )
+
+    rules = {r["Priority"]: r for r in elbv2.describe_rules(ListenerArn=listener["ListenerArn"])["Rules"]}
+    for priority, _cond, config_key, expected in cases:
+        cond = rules[str(priority)]["Conditions"][0]
+        assert cond["Values"] == expected
+        assert cond[config_key]["Values"] == expected, f"{config_key} not returned: {cond}"

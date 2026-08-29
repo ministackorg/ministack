@@ -4636,25 +4636,102 @@ def test_s3_versioned_get_returns_stored_checksum(s3):
     s3.delete_bucket(Bucket=bucket)
 
 
-def test_s3_put_object_rejects_unsupported_crc32c_explicitly(s3):
-    """CRC32C requires an optional native library ministack doesn't bundle.
-    Rather than silently accept-without-validation, the put must fail loudly
-    so clients see the gap. Issue #831 follow-up: no silent failures."""
-    import base64
-    import os
+def test_s3_list_buckets_paginates(s3):
+    """ListBuckets honors Prefix, MaxBuckets and ContinuationToken; a further
+    page is signalled by ContinuationToken alone (ListBucketsOutput has no
+    IsTruncated member)."""
+    names = [f"qa-lbp-{c}" for c in "abc"]
+    for n in names:
+        s3.create_bucket(Bucket=n)
+    try:
+        page1 = s3.list_buckets(Prefix="qa-lbp-", MaxBuckets=2)
+        assert [b["Name"] for b in page1["Buckets"]] == names[:2]
+        assert page1["Prefix"] == "qa-lbp-"
+        assert "ContinuationToken" in page1
+        page2 = s3.list_buckets(
+            Prefix="qa-lbp-", MaxBuckets=2,
+            ContinuationToken=page1["ContinuationToken"],
+        )
+        assert [b["Name"] for b in page2["Buckets"]] == names[2:]
+        assert "ContinuationToken" not in page2
+    finally:
+        for n in names:
+            s3.delete_bucket(Bucket=n)
 
+
+def test_s3_delete_object_refuses_directory_bucket_conditions(s3):
+    """x-amz-if-match-size / x-amz-if-match-last-modified-time are directory-
+    bucket features; a general-purpose bucket answers NotImplemented and the
+    object stays."""
+    bucket = "qa-del-cond-bucket"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x")
+    with pytest.raises(ClientError) as exc:
+        s3.delete_object(Bucket=bucket, Key="k", IfMatchSize=1)
+    assert exc.value.response["Error"]["Code"] == "NotImplemented"
+    with pytest.raises(ClientError) as exc:
+        s3.delete_object(
+            Bucket=bucket, Key="k",
+            IfMatchLastModifiedTime=datetime(2026, 1, 1),
+        )
+    assert exc.value.response["Error"]["Code"] == "NotImplemented"
+    assert s3.get_object(Bucket=bucket, Key="k")["Body"].read() == b"x"
+    s3.delete_object(Bucket=bucket, Key="k")
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_delete_objects_refuses_size_and_mtime_conditions(s3):
+    """A DeleteObjects entry carrying Size or LastModifiedTime draws a per-key
+    NotImplemented error while unconditional entries in the batch delete."""
+    bucket = "qa-del-batch-cond-bucket"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="cond", Body=b"x")
+    s3.put_object(Bucket=bucket, Key="plain", Body=b"y")
+    resp = s3.delete_objects(
+        Bucket=bucket,
+        Delete={
+            "Objects": [
+                {"Key": "cond", "Size": 1},
+                {"Key": "plain"},
+            ],
+            "Quiet": False,
+        },
+    )
+    assert [e["Key"] for e in resp.get("Deleted", [])] == ["plain"]
+    errors = resp.get("Errors", [])
+    assert len(errors) == 1
+    assert errors[0]["Key"] == "cond"
+    assert errors[0]["Code"] == "NotImplemented"
+    assert s3.get_object(Bucket=bucket, Key="cond")["Body"].read() == b"x"
+    s3.delete_object(Bucket=bucket, Key="cond")
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_put_object_validates_crc32c(s3):
+    """CRC32C is computed in-process: a wrong client value draws BadDigest,
+    a correct one is stored and surfaced when checksum mode is enabled."""
     from botocore.exceptions import ClientError
 
-    bucket = "checksum-crc32c-reject-bucket"
+    bucket = "checksum-crc32c-validate-bucket"
     s3.create_bucket(Bucket=bucket)
-    fake_crc32c = base64.b64encode(os.urandom(4)).decode()
     with pytest.raises(ClientError) as exc:
         s3.put_object(
             Bucket=bucket, Key="k", Body=b"x",
             ChecksumAlgorithm="CRC32C",
-            ChecksumCRC32C=fake_crc32c,
+            ChecksumCRC32C="AAAAAA==",
         )
-    assert exc.value.response["Error"]["Code"] == "InvalidRequest"
+    assert exc.value.response["Error"]["Code"] == "BadDigest"
+
+    good = "qTxfkw=="  # CRC32C(b"x"), big-endian, base64
+    s3.put_object(
+        Bucket=bucket, Key="k", Body=b"x",
+        ChecksumAlgorithm="CRC32C",
+        ChecksumCRC32C=good,
+    )
+    got = s3.get_object(Bucket=bucket, Key="k", ChecksumMode="ENABLED")
+    assert got["ChecksumCRC32C"] == good
+    assert got["Body"].read() == b"x"
+    s3.delete_object(Bucket=bucket, Key="k")
     s3.delete_bucket(Bucket=bucket)
 
 
@@ -5734,6 +5811,151 @@ def test_s3_restore_notifications_to_sqs(s3, sqs):
     assert red["lifecycleRestorationExpiryTime"].endswith("Z")
 
 
+def test_s3_delete_bucket_refuses_while_versions_remain(s3):
+    """A versioned bucket is not empty while any version or marker is left.
+
+    The delete markers a versioning bucket writes hide its objects without
+    removing them, so the bucket still holds every version and AWS refuses
+    to delete it until they go by version id."""
+    bkt = "s3-ver-notempty"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+    s3.put_object(Bucket=bkt, Key="doc.txt", Body=b"v1")
+    s3.delete_object(Bucket=bkt, Key="doc.txt")
+
+    assert s3.list_objects_v2(Bucket=bkt).get("KeyCount", 0) == 0
+    with pytest.raises(ClientError) as exc:
+        s3.delete_bucket(Bucket=bkt)
+    assert exc.value.response["Error"]["Code"] == "BucketNotEmpty"
+
+    for v in s3.list_object_versions(Bucket=bkt).get("Versions", []):
+        s3.delete_object(Bucket=bkt, Key=v["Key"], VersionId=v["VersionId"])
+    for m in s3.list_object_versions(Bucket=bkt).get("DeleteMarkers", []):
+        s3.delete_object(Bucket=bkt, Key=m["Key"], VersionId=m["VersionId"])
+    s3.delete_bucket(Bucket=bkt)
+
+
+def test_s3_reading_a_delete_marker_is_refused(s3):
+    """A delete marker has no content: reading one by id answers 405.
+
+    The version is there, it simply cannot be read, which AWS distinguishes
+    from a missing version by answering MethodNotAllowed rather than 404 --
+    and it names the marker on the way out."""
+    bkt = "s3-ver-marker-read"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+    s3.put_object(Bucket=bkt, Key="doc.txt", Body=b"v1")
+    marker = s3.delete_object(Bucket=bkt, Key="doc.txt")["VersionId"]
+
+    for op in (s3.get_object, s3.head_object):
+        with pytest.raises(ClientError) as exc:
+            op(Bucket=bkt, Key="doc.txt", VersionId=marker)
+        meta = exc.value.response["ResponseMetadata"]
+        assert meta["HTTPStatusCode"] == 405
+        assert meta["HTTPHeaders"]["x-amz-delete-marker"] == "true"
+        assert meta["HTTPHeaders"]["x-amz-version-id"] == marker
+
+
+def test_s3_subresource_of_a_version_that_does_not_exist(s3):
+    """An ACL or tag op naming a version that is gone answers NoSuchVersion.
+
+    A version id addresses a version the way a key addresses an object, so
+    one that has been deleted cannot read back the default policy as though
+    it were simply unpermissioned."""
+    bkt = "s3-ver-subresource"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+    s3.put_object(Bucket=bkt, Key="doc.txt", Body=b"v1")
+    gone = s3.put_object(Bucket=bkt, Key="doc.txt", Body=b"v2")["VersionId"]
+    s3.delete_object(Bucket=bkt, Key="doc.txt", VersionId=gone)
+
+    for call in (
+        lambda: s3.get_object_acl(Bucket=bkt, Key="doc.txt", VersionId=gone),
+        lambda: s3.get_object_tagging(Bucket=bkt, Key="doc.txt", VersionId=gone),
+    ):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["Error"]["Code"] == "NoSuchVersion"
+
+    # The version that is still there answers normally.
+    current = s3.head_object(Bucket=bkt, Key="doc.txt")["VersionId"]
+    assert s3.get_object_acl(Bucket=bkt, Key="doc.txt", VersionId=current)["Grants"]
+
+
+def test_s3_list_object_versions_rolls_up_prefixes(s3):
+    """A delimiter groups versions exactly as it groups a plain listing."""
+    bkt = "s3-ver-delimiter"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+    s3.put_object(Bucket=bkt, Key="dir/one.txt", Body=b"a")
+    s3.put_object(Bucket=bkt, Key="dir/one.txt", Body=b"b")
+    s3.put_object(Bucket=bkt, Key="dir/two.txt", Body=b"c")
+    s3.put_object(Bucket=bkt, Key="top.txt", Body=b"d")
+
+    resp = s3.list_object_versions(Bucket=bkt, Delimiter="/")
+    assert [p["Prefix"] for p in resp.get("CommonPrefixes", [])] == ["dir/"]
+    # The rolled-up keys' versions are not listed beside the group.
+    assert [v["Key"] for v in resp.get("Versions", [])] == ["top.txt"]
+    assert resp["Delimiter"] == "/"
+
+    # Without the delimiter every version is listed as before.
+    plain = s3.list_object_versions(Bucket=bkt)
+    assert len(plain.get("Versions", [])) == 4
+    assert not plain.get("CommonPrefixes")
+def test_s3_copy_object_applies_canned_acl(s3):
+    """x-amz-acl on a copy permissions the destination, as it does on a put."""
+    bkt = "s3-copy-acl"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="src.txt", Body=b"body")
+
+    s3.copy_object(Bucket=bkt, Key="dst.txt", ACL="public-read",
+                   CopySource={"Bucket": bkt, "Key": "src.txt"})
+    grants = s3.get_object_acl(Bucket=bkt, Key="dst.txt")["Grants"]
+    assert any(g.get("Grantee", {}).get("URI", "").endswith("AllUsers")
+               for g in grants)
+
+    # A copy without one leaves the destination private.
+    s3.copy_object(Bucket=bkt, Key="plain.txt",
+                   CopySource={"Bucket": bkt, "Key": "src.txt"})
+    grants = s3.get_object_acl(Bucket=bkt, Key="plain.txt")["Grants"]
+    assert not any(g.get("Grantee", {}).get("URI", "").endswith("AllUsers")
+                   for g in grants)
+
+    with pytest.raises(ClientError) as exc:
+        s3.copy_object(Bucket=bkt, Key="bad.txt", ACL="nonsense",
+                       CopySource={"Bucket": bkt, "Key": "src.txt"})
+    assert exc.value.response["Error"]["Code"] == "InvalidArgument"
+
+
+def test_s3_upload_part_copy_honours_source_preconditions(s3):
+    """UploadPartCopy carries the same copy-source conditions CopyObject does."""
+    bkt = "s3-upc-precond"
+    s3.create_bucket(Bucket=bkt)
+    body = b"x" * (5 * 1024 * 1024)
+    etag = s3.put_object(Bucket=bkt, Key="src.bin", Body=body)["ETag"]
+
+    upload = s3.create_multipart_upload(Bucket=bkt, Key="dst.bin")["UploadId"]
+    with pytest.raises(ClientError) as exc:
+        s3.upload_part_copy(Bucket=bkt, Key="dst.bin", UploadId=upload,
+                            PartNumber=1,
+                            CopySource={"Bucket": bkt, "Key": "src.bin"},
+                            CopySourceIfMatch='"00000000000000000000000000000000"')
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+
+    with pytest.raises(ClientError) as exc:
+        s3.upload_part_copy(Bucket=bkt, Key="dst.bin", UploadId=upload,
+                            PartNumber=1,
+                            CopySource={"Bucket": bkt, "Key": "src.bin"},
+                            CopySourceIfNoneMatch=etag)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+
+    # The condition that holds copies the range.
+    part = s3.upload_part_copy(Bucket=bkt, Key="dst.bin", UploadId=upload,
+                               PartNumber=1,
+                               CopySource={"Bucket": bkt, "Key": "src.bin"},
+                               CopySourceIfMatch=etag)
+    assert part["CopyPartResult"]["ETag"]
+    s3.abort_multipart_upload(Bucket=bkt, Key="dst.bin", UploadId=upload)
 def test_s3_put_object_rejects_a_mismatched_checksum(s3):
     """A supplied checksum is verified against the body, not just stored.
 
@@ -5757,3 +5979,144 @@ def test_s3_put_object_rejects_a_mismatched_checksum(s3):
     s3.put_object(Bucket=bkt, Key="good.txt", Body=b"hello", ChecksumSHA256=good)
     head = s3.head_object(Bucket=bkt, Key="good.txt", ChecksumMode="ENABLED")
     assert head["ChecksumSHA256"] == good
+
+
+# ---------------------------------------------------------------------------
+# Replication data plane (x-amz-replication-status)
+# ---------------------------------------------------------------------------
+
+def _replicated_pair(s3, slug):
+    """Source + destination buckets, both versioned, one Enabled rule."""
+    src, dst = f"qa-repl-src-{slug}", f"qa-repl-dst-{slug}"
+    for b in (src, dst):
+        s3.create_bucket(Bucket=b)
+        s3.put_bucket_versioning(Bucket=b, VersioningConfiguration={"Status": "Enabled"})
+    s3.put_bucket_replication(
+        Bucket=src,
+        ReplicationConfiguration={
+            "Role": "arn:aws:iam::000000000000:role/repl",
+            "Rules": [{
+                "ID": "r1", "Status": "Enabled", "Prefix": "",
+                "Destination": {"Bucket": f"arn:aws:s3:::{dst}"},
+            }],
+        },
+    )
+    return src, dst
+
+
+def _purge_versioned(s3, bucket):
+    lv = s3.list_object_versions(Bucket=bucket)
+    for v in lv.get("Versions", []) + lv.get("DeleteMarkers", []):
+        s3.delete_object(Bucket=bucket, Key=v["Key"], VersionId=v["VersionId"])
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_replication_copies_object_and_stamps_status(s3):
+    """A put under an Enabled rule lands in the destination; the source
+    reports COMPLETED and the replica REPLICA, per S3's replication-status
+    contract."""
+    src, dst = _replicated_pair(s3, "basic")
+    try:
+        s3.put_object(Bucket=src, Key="a/k", Body=b"payload",
+                      Tagging="team=core")
+        head = s3.head_object(Bucket=src, Key="a/k")
+        assert head["ReplicationStatus"] == "COMPLETED"
+        replica = s3.get_object(Bucket=dst, Key="a/k")
+        assert replica["ReplicationStatus"] == "REPLICA"
+        assert replica["Body"].read() == b"payload"
+        tags = s3.get_object_tagging(Bucket=dst, Key="a/k")["TagSet"]
+        assert tags == [{"Key": "team", "Value": "core"}]
+    finally:
+        _purge_versioned(s3, src)
+        _purge_versioned(s3, dst)
+
+
+def test_s3_replication_honors_prefix_and_failure(s3):
+    """A key outside the rule's Prefix carries no status; a destination that
+    stops being usable stamps the source FAILED."""
+    src, dst = f"qa-repl-src-pref", f"qa-repl-dst-pref"
+    for b in (src, dst):
+        s3.create_bucket(Bucket=b)
+        s3.put_bucket_versioning(Bucket=b, VersioningConfiguration={"Status": "Enabled"})
+    s3.put_bucket_replication(
+        Bucket=src,
+        ReplicationConfiguration={
+            "Role": "arn:aws:iam::000000000000:role/repl",
+            "Rules": [{
+                "ID": "r1", "Status": "Enabled", "Prefix": "logs/",
+                "Destination": {"Bucket": f"arn:aws:s3:::{dst}"},
+            }],
+        },
+    )
+    try:
+        s3.put_object(Bucket=src, Key="other/k", Body=b"x")
+        head = s3.head_object(Bucket=src, Key="other/k")
+        assert "ReplicationStatus" not in head
+        # Destination becomes unusable: versioning suspended.
+        s3.put_bucket_versioning(Bucket=dst, VersioningConfiguration={"Status": "Suspended"})
+        s3.put_object(Bucket=src, Key="logs/k", Body=b"x")
+        assert s3.head_object(Bucket=src, Key="logs/k")["ReplicationStatus"] == "FAILED"
+        from botocore.exceptions import ClientError
+        try:
+            s3.head_object(Bucket=dst, Key="logs/k")
+            raise AssertionError("replica must not exist")
+        except ClientError:
+            pass
+    finally:
+        _purge_versioned(s3, src)
+        lv = s3.list_object_versions(Bucket=dst)
+        for v in lv.get("Versions", []) + lv.get("DeleteMarkers", []):
+            s3.delete_object(Bucket=dst, Key=v["Key"], VersionId=v["VersionId"])
+        s3.delete_bucket(Bucket=dst)
+
+
+def test_s3_replication_covers_copy_and_versioned_reads(s3):
+    """CopyObject into the source bucket replicates too, and the status rides
+    on a version-addressed read."""
+    src, dst = _replicated_pair(s3, "copy")
+    try:
+        s3.put_object(Bucket=src, Key="orig", Body=b"v")
+        s3.copy_object(Bucket=src, Key="copied",
+                       CopySource={"Bucket": src, "Key": "orig"})
+        assert s3.head_object(Bucket=src, Key="copied")["ReplicationStatus"] == "COMPLETED"
+        assert s3.get_object(Bucket=dst, Key="copied")["Body"].read() == b"v"
+        vid = s3.head_object(Bucket=src, Key="copied")["VersionId"]
+        versioned = s3.head_object(Bucket=src, Key="copied", VersionId=vid)
+        assert versioned["ReplicationStatus"] == "COMPLETED"
+    finally:
+        _purge_versioned(s3, src)
+        _purge_versioned(s3, dst)
+
+
+def test_s3_control_list_tags_uses_the_tag_element_aws_uses(s3):
+    """ListTagsForResource must wrap each tag in <Tag>, not <member>.
+
+    The two tests above assert through boto3, which is lenient about the element
+    name and so passes either way. AWS's own model is explicit — s3control's
+    TagList declares `locationName: "Tag"` — and aws-sdk-go-v2 honours it
+    strictly: given <member> wrappers it parses an empty tag list and reports no
+    tags at all. That is what the Terraform AWS provider uses, so a bucket's
+    `tags_all` refreshes to empty and every plan shows the same tag diff, which
+    survives being applied.
+
+    #447 fixed the TagResource *write* path to read <Tag>; the read path was
+    left emitting <member>. Asserting on the wire format is the only way to
+    catch that from Python.
+    """
+    from urllib.parse import quote
+
+    import requests
+
+    bkt = "intg-s3control-tag-element"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_tagging(
+        Bucket=bkt, Tagging={"TagSet": [{"Key": "team", "Value": "platform"}]}
+    )
+
+    arn = quote(f"arn:aws:s3:::{bkt}", safe="")
+    resp = requests.get(f"{ENDPOINT}/v20180820/tags/{arn}", timeout=10)
+    assert resp.status_code == 200
+    body = resp.text
+
+    assert "<Tag><Key>team</Key><Value>platform</Value></Tag>" in body, body
+    assert "<member>" not in body, body

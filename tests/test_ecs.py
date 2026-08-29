@@ -1397,3 +1397,402 @@ def test_ecs_run_task_does_not_block_the_loop(ecs):
             except Exception:
                 pass
     probe.assert_responsive("ECS RunTask")
+
+
+def _fake_docker_recorder(run_impl=None):
+    """Docker double that records containers.run kwargs (see command-override tests)."""
+    class FakeContainers:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, _name):
+            raise Exception("not found")
+
+        def list(self, *args, **kwargs):
+            return []
+
+        def run(self, image, **kwargs):
+            self.calls.append((image, kwargs))
+            if run_impl is not None:
+                return run_impl(image, kwargs)
+            return SimpleNamespace(id=f"container-{len(self.calls):012d}")
+
+    fake_containers = FakeContainers()
+    return fake_containers, SimpleNamespace(containers=fake_containers)
+
+
+def test_ecs_awsvpc_task_does_not_publish_host_ports(monkeypatch):
+    """awsvpc tasks get their own ENI, so container ports are not bound on the host.
+
+    Publishing them means two tasks sharing a container port collide on the host —
+    something that cannot happen on Fargate.
+    """
+    from ministack.services import ecs as _ecs
+
+    fake_containers, fake_docker = _fake_docker_recorder()
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: fake_docker)
+
+    _ecs._register_task_definition({
+        "family": "awsvpc-ports-td",
+        "networkMode": "awsvpc",
+        "containerDefinitions": [{
+            "name": "web",
+            "image": "busybox",
+            "portMappings": [{"containerPort": 80, "hostPort": 80, "protocol": "tcp"}],
+        }],
+    })
+    _ecs._run_task({"cluster": "awsvpc-ports-c", "taskDefinition": "awsvpc-ports-td"})
+
+    assert fake_containers.calls, "expected the container to be launched"
+    _image, kwargs = fake_containers.calls[0]
+    assert not kwargs.get("ports"), (
+        f"awsvpc task must not publish host ports, got {kwargs.get('ports')!r}"
+    )
+
+
+def test_ecs_bridge_task_still_publishes_host_ports(monkeypatch):
+    """bridge networking does publish to the host — the awsvpc fix must not affect it."""
+    from ministack.services import ecs as _ecs
+
+    fake_containers, fake_docker = _fake_docker_recorder()
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: fake_docker)
+
+    _ecs._register_task_definition({
+        "family": "bridge-ports-td",
+        "networkMode": "bridge",
+        "containerDefinitions": [{
+            "name": "web",
+            "image": "busybox",
+            "portMappings": [{"containerPort": 80, "hostPort": 8080, "protocol": "tcp"}],
+        }],
+    })
+    _ecs._run_task({"cluster": "bridge-ports-c", "taskDefinition": "bridge-ports-td"})
+
+    _image, kwargs = fake_containers.calls[0]
+    assert kwargs.get("ports") == {"80/tcp": 8080}
+
+def test_ecs_service_registers_tasks_in_target_group(monkeypatch):
+    """A service with loadBalancers must register its running tasks as targets.
+
+    Without this the ALB data plane has nothing to forward to and every request
+    falls through to the listener's default action.
+    """
+    from ministack.services import alb as _alb
+    from ministack.services import ecs as _ecs
+
+    task_ip = "172.30.0.7"
+
+    class FakeContainer:
+        def __init__(self, cid):
+            self.id = cid
+            self.attrs = {"NetworkSettings": {"Networks": {"ministack_default": {"IPAddress": task_ip}}}}
+
+        def reload(self):
+            pass
+
+    class FakeContainers:
+        def __init__(self):
+            self.n = 0
+
+        def get(self, _name):
+            raise Exception("not found")
+
+        def list(self, *a, **k):
+            return []
+
+        def run(self, image, **kwargs):
+            self.n += 1
+            return FakeContainer(f"container-{self.n:012d}")
+
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: SimpleNamespace(containers=FakeContainers()))
+
+    tg_arn = "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/tg-reg/abc123"
+    _alb._tgs[tg_arn] = {"TargetGroupArn": tg_arn, "Port": 80, "TargetType": "ip"}
+    _alb._targets[tg_arn] = []
+
+    _ecs._register_task_definition({
+        "family": "lb-reg-td",
+        "networkMode": "awsvpc",
+        "containerDefinitions": [{"name": "web", "image": "busybox"}],
+    })
+    _ecs._create_service({
+        "cluster": "lb-reg-c",
+        "serviceName": "lb-reg-svc",
+        "taskDefinition": "lb-reg-td",
+        "desiredCount": 1,
+        "loadBalancers": [
+            {"targetGroupArn": tg_arn, "containerName": "web", "containerPort": 80},
+        ],
+    })
+
+    registered = _alb._targets.get(tg_arn, [])
+    assert registered == [{"Id": task_ip, "Port": 80}], registered
+
+    # ...and deleting the service leaves nothing registered behind it.
+    _ecs._delete_service({"cluster": "lb-reg-c", "service": "lb-reg-svc", "force": True})
+    assert _alb._targets.get(tg_arn) == []
+
+
+def test_ecs_task_records_private_ipv4_attachment(monkeypatch):
+    """awsvpc tasks expose their address the way real ECS does."""
+    from ministack.services import ecs as _ecs
+
+    class FakeContainer:
+        id = "container-000000000001"
+        attrs = {"NetworkSettings": {"Networks": {"ministack_default": {"IPAddress": "172.30.0.9"}}}}
+
+        def reload(self):
+            pass
+
+    class FakeContainers:
+        def get(self, _name):
+            raise Exception("not found")
+
+        def list(self, *a, **k):
+            return []
+
+        def run(self, image, **kwargs):
+            return FakeContainer()
+
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: SimpleNamespace(containers=FakeContainers()))
+
+    _ecs._register_task_definition({
+        "family": "eni-td",
+        "networkMode": "awsvpc",
+        "containerDefinitions": [{"name": "web", "image": "busybox"}],
+    })
+    resp = _ecs._run_task({"cluster": "eni-c", "taskDefinition": "eni-td"})
+    _status, _headers, raw = resp
+    task = json.loads(raw)["tasks"][0]
+
+    assert _ecs._task_ip(task) == "172.30.0.9"
+    assert task["attachmentsStatus"] == "ATTACHED"
+    assert task["attachments"][0]["type"] == "ElasticNetworkInterface"
+
+
+def test_ecs_sync_service_targets_selects_tasks_by_group(monkeypatch):
+    """Target selection must use the same predicate as the service's own recount.
+
+    _reconcile_service_tasks counts a service's tasks by `group`; selecting targets
+    by any other field lets the registered targets disagree with the runningCount
+    reported next to them.
+    """
+    from ministack.services import alb as _alb
+    from ministack.services import ecs as _ecs
+
+    tg_arn = "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/tg-pred/abc"
+    _alb._tgs[tg_arn] = {"TargetGroupArn": tg_arn, "Port": 80, "TargetType": "ip"}
+    _alb._targets[tg_arn] = []
+
+    svc = {
+        "serviceName": "pred-svc",
+        "clusterArn": "arn:aws:ecs:us-east-1:000000000000:cluster/pred-c",
+        "status": "ACTIVE",
+        "loadBalancers": [{"targetGroupArn": tg_arn, "containerName": "web", "containerPort": 80}],
+    }
+
+    def _task(ip, **over):
+        t = {
+            "group": "service:pred-svc",
+            "clusterArn": svc["clusterArn"],
+            "lastStatus": "RUNNING",
+            "attachments": [{
+                "type": "ElasticNetworkInterface",
+                "details": [{"name": "privateIPv4Address", "value": ip}],
+            }],
+        }
+        t.update(over)
+        return t
+
+    monkeypatch.setattr(_ecs, "_tasks", {
+        "a": _task("10.0.0.1"),
+        # carries the group but no startedBy — still this service's task
+        "b": _task("10.0.0.2", startedBy=None),
+        # right group, wrong cluster
+        "c": _task("10.0.0.3", clusterArn="arn:aws:ecs:us-east-1:000000000000:cluster/other"),
+        # right cluster, different service
+        "d": _task("10.0.0.4", group="service:someone-else"),
+        # this service, not running
+        "e": _task("10.0.0.5", lastStatus="STOPPED"),
+    })
+
+    _ecs._sync_service_targets("pred-c", svc)
+    assert sorted(t["Id"] for t in _alb._targets[tg_arn]) == ["10.0.0.1", "10.0.0.2"]
+
+
+def test_ecs_sync_service_targets_does_not_publish_a_stale_view(monkeypatch):
+    """A slow reconciliation must not overwrite a newer one's registration.
+
+    The failure this guards is last-writer-wins on a stale read: a reconcile that
+    sampled the tasks before a scale-in, but publishes after it, would re-register
+    the tasks that scale-in removed. Serialising the read and the publish means the
+    last write is also the last read, so the final registration matches the final
+    task state.
+    """
+    import threading
+
+    from ministack.services import alb as _alb
+    from ministack.services import ecs as _ecs
+
+    tg_arn = "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/tg-stale/abc"
+    _alb._tgs[tg_arn] = {"TargetGroupArn": tg_arn, "Port": 80, "TargetType": "ip"}
+    _alb._targets[tg_arn] = []
+
+    svc = {
+        "serviceName": "stale-svc",
+        "clusterArn": "arn:aws:ecs:us-east-1:000000000000:cluster/stale-c",
+        "status": "ACTIVE",
+        "loadBalancers": [{"targetGroupArn": tg_arn, "containerName": "web", "containerPort": 80}],
+    }
+
+    def _task(ip):
+        return {
+            "group": "service:stale-svc",
+            "clusterArn": svc["clusterArn"],
+            "lastStatus": "RUNNING",
+            "attachments": [{
+                "type": "ElasticNetworkInterface",
+                "details": [{"name": "privateIPv4Address", "value": ip}],
+            }],
+        }
+
+    before = {ip: _task(ip) for ip in ("10.3.0.1", "10.3.0.2", "10.3.0.3")}
+    after = {"10.3.0.1": _task("10.3.0.1")}          # scaled in to one task
+    shared = dict(before)
+    monkeypatch.setattr(_ecs, "_tasks", shared, raising=False)
+
+    sampled = threading.Event()
+    scaled_in = threading.Event()
+
+    real_task_ip = _ecs._task_ip
+    slowed = {"done": False}
+
+    def slow_task_ip(task):
+        # Let the first reconcile sample the pre-scale-in state, then stall it
+        # until the scale-in has happened and been published by the other thread.
+        if not slowed["done"]:
+            slowed["done"] = True
+            sampled.set()
+            scaled_in.wait(timeout=5)
+        return real_task_ip(task)
+
+    monkeypatch.setattr(_ecs, "_task_ip", slow_task_ip)
+
+    slow = threading.Thread(target=_ecs._sync_service_targets, args=("stale-c", svc))
+    slow.start()
+
+    assert sampled.wait(timeout=5), "the slow reconcile never sampled"
+    shared.clear()
+    shared.update(after)
+    _ecs._sync_service_targets("stale-c", svc)   # the newer, post-scale-in view
+    scaled_in.set()
+    slow.join(timeout=10)
+
+    final = sorted(t["Id"] for t in _alb._targets[tg_arn])
+    assert final == ["10.3.0.1"], f"a stale view was published: {final}"
+
+
+def test_ecs_restored_services_relaunch_their_tasks(monkeypatch):
+    """A service must satisfy desiredCount again after a restore.
+
+    restore_state marks every restored task STOPPED, because its container is
+    gone with the process that ran it. Nothing then reconciles the services, so
+    a restarted ministack reports runningCount from the persisted record while
+    no container exists, and the load balancer keeps forwarding to addresses
+    nothing is listening on. Real ECS relaunches: the service scheduler exists
+    to keep desiredCount satisfied.
+    """
+    from ministack.services import ecs as _ecs
+
+    launched = []
+    monkeypatch.setattr(_ecs, "_run_task", lambda data: launched.append(data))
+    monkeypatch.setattr(_ecs, "_clusters", {"c1": {"clusterName": "c1"}})
+    monkeypatch.setattr(_ecs, "_task_defs", {
+        "web:1": {"taskDefinitionArn": "arn:aws:ecs:us-east-1:000000000000:task-definition/web:1",
+        "family": "web"},
+    })
+    monkeypatch.setattr(_ecs, "_services", {
+        "c1/web": {
+            "serviceName": "web", "status": "ACTIVE", "desiredCount": 2,
+            "taskDefinition": "arn:aws:ecs:us-east-1:000000000000:task-definition/web:1", "clusterArn": "arn:cluster/c1",
+            "launchType": "FARGATE", "deployments": [{"runningCount": 2}],
+        },
+        # An inactive service must not be relaunched.
+        "c1/old": {
+            "serviceName": "old", "status": "INACTIVE", "desiredCount": 3,
+            "taskDefinition": "arn:aws:ecs:us-east-1:000000000000:task-definition/web:1", "clusterArn": "arn:cluster/c1",
+            "launchType": "FARGATE", "deployments": [],
+        },
+    })
+    # What restore_state leaves behind: the tasks exist but are STOPPED.
+    monkeypatch.setattr(_ecs, "_tasks", {
+        "arn:task/1": {"group": "service:web", "clusterArn": "arn:cluster/c1",
+                       "lastStatus": "STOPPED", "taskDefinitionArn": "arn:aws:ecs:us-east-1:000000000000:task-definition/web:1"},
+        "arn:task/2": {"group": "service:web", "clusterArn": "arn:cluster/c1",
+                       "lastStatus": "STOPPED", "taskDefinitionArn": "arn:aws:ecs:us-east-1:000000000000:task-definition/web:1"},
+    })
+
+    _ecs._reconcile_restored_services()
+
+    assert len(launched) == 1, f"expected one RunTask call, got {launched}"
+    call = launched[0]
+    assert call["group"] == "service:web"
+    assert call["count"] == 2, "both stopped tasks must be replaced"
+    assert all(c["group"] != "service:old" for c in launched)
+def test_ecs_service_reconcile_spares_foreign_targets(monkeypatch):
+    """A service withdraws only its own registrations: targets registered by
+    hand (or by another service sharing the group) survive its reconcile and
+    its deletion — real ECS deregisters only its own tasks."""
+    from ministack.services import alb as _alb
+    from ministack.services import ecs as _ecs
+
+    task_ip = "172.30.0.21"
+
+    class FakeContainer:
+        def __init__(self, cid):
+            self.id = cid
+            self.attrs = {"NetworkSettings": {"Networks": {"ministack_default": {"IPAddress": task_ip}}}}
+
+        def reload(self):
+            pass
+
+    class FakeContainers:
+        def __init__(self):
+            self.n = 0
+
+        def get(self, _name):
+            raise Exception("not found")
+
+        def list(self, *a, **k):
+            return []
+
+        def run(self, image, **kwargs):
+            self.n += 1
+            return FakeContainer(f"container-{self.n:012d}")
+
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: SimpleNamespace(containers=FakeContainers()))
+
+    tg_arn = "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/tg-shared/def456"
+    _alb._tgs[tg_arn] = {"TargetGroupArn": tg_arn, "Port": 80, "TargetType": "ip"}
+    # A registration the service does not own.
+    _alb._targets[tg_arn] = [{"Id": "10.9.9.9", "Port": 80}]
+
+    _ecs._register_task_definition({
+        "family": "lb-shared-td",
+        "networkMode": "awsvpc",
+        "containerDefinitions": [{"name": "web", "image": "busybox"}],
+    })
+    _ecs._create_service({
+        "cluster": "lb-shared-c",
+        "serviceName": "lb-shared-svc",
+        "taskDefinition": "lb-shared-td",
+        "desiredCount": 1,
+        "loadBalancers": [
+            {"targetGroupArn": tg_arn, "containerName": "web", "containerPort": 80},
+        ],
+    })
+    registered = sorted(t["Id"] for t in _alb._targets.get(tg_arn, []))
+    assert registered == ["10.9.9.9", task_ip], registered
+
+    _ecs._delete_service({"cluster": "lb-shared-c", "service": "lb-shared-svc", "force": True})
+    assert _alb._targets.get(tg_arn) == [{"Id": "10.9.9.9", "Port": 80}]

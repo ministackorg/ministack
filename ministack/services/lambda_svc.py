@@ -1078,6 +1078,13 @@ def _layer_arn(name: str) -> str:
     return f"arn:aws:lambda:{get_region()}:{get_account_id()}:layer:{name}"
 
 
+def _esm_arn(esm_id: str) -> str:
+    return (
+        f"arn:aws:lambda:{get_region()}:{get_account_id()}"
+        f":event-source-mapping:{esm_id}"
+    )
+
+
 def _now_iso() -> str:
     now = datetime.now(timezone.utc)
     ms = now.microsecond // 1000
@@ -2267,6 +2274,12 @@ async def _invoke_with_response_stream(name: str, event: dict, headers: dict,
     provide — so we cannot do any better without a custom RIE fork.
     """
     status, resp_headers, resp_body = await _invoke(name, event, headers, path_qualifier, query_params)
+    # An HTTP-level failure (ResourceNotFoundException 404, throttles, ...)
+    # never streams on AWS: the error is a plain JSON response, and wrapping
+    # it in an eventstream envelope crashes SDK parsers. Only a 200 —
+    # including a handler error, which rides InvokeComplete — is framed.
+    if status != 200:
+        return status, resp_headers, resp_body
     # Detect handler-level errors from the standard invoke path so we can flip
     # to the InvokeError event type in the stream.
     is_error = bool(resp_headers and resp_headers.get("X-Amz-Function-Error"))
@@ -6005,8 +6018,18 @@ def _delete_provisioned_concurrency(func_name: str, qualifier: str):
 
 
 def _esm_response(esm: dict) -> dict:
-    """Return ESM dict without internal-only fields."""
-    return {k: v for k, v in esm.items() if k not in ("FunctionName", "Enabled")}
+    """Return ESM dict without internal-only fields.
+
+    EventSourceMappingArn is derived here rather than stored on the record so
+    that mappings created before it existed — restored state included — report
+    it too. Callers cannot construct this ARN themselves, and ListTags is keyed
+    on it, so omitting it leaves tags unreadable.
+    """
+    out = {k: v for k, v in esm.items() if k not in ("FunctionName", "Enabled")}
+    esm_id = esm.get("UUID")
+    if esm_id:
+        out["EventSourceMappingArn"] = _esm_arn(esm_id)
+    return out
 
 
 def _resolve_existing_esm_function(function_ref: str):

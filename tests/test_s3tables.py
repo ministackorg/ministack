@@ -1008,3 +1008,17 @@ def test_s3tables_iceberg_add_sort_order_is_idempotent_by_order_id(s3tables):
         except Exception:
             pass
         s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
+
+
+def test_s3tables_deletes_answer_204(s3tables):
+    """DeleteNamespace / DeleteTable / DeleteTableBucket answer 204 No Content."""
+    arn = s3tables.create_table_bucket(name="del-status-bkt")["arn"]
+    s3tables.create_namespace(tableBucketARN=arn, namespace=["ns204"])
+    s3tables.create_table(tableBucketARN=arn, namespace="ns204", name="t204",
+                          format="ICEBERG")
+    r = s3tables.delete_table(tableBucketARN=arn, namespace="ns204", name="t204")
+    assert r["ResponseMetadata"]["HTTPStatusCode"] == 204
+    r = s3tables.delete_namespace(tableBucketARN=arn, namespace="ns204")
+    assert r["ResponseMetadata"]["HTTPStatusCode"] == 204
+    r = s3tables.delete_table_bucket(tableBucketARN=arn)
+    assert r["ResponseMetadata"]["HTTPStatusCode"] == 204
