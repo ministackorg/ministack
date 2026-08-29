@@ -904,16 +904,26 @@ def _set_rule_priorities(params):
 # Target registration handlers
 # ---------------------------------------------------------------------------
 
-def set_targets_for_group(tg_arn, targets):
-    """Replace a target group's registrations. Used by ECS, whose services own the
-    membership of their target group and reconcile it as tasks come and go.
+def set_targets_for_group(tg_arn, targets, previous_ids=()):
+    """Replace the caller's own registrations in a target group.
 
-    ``targets`` is an iterable of ``(id, port)``. Unknown target groups are ignored
-    rather than raising: a service can outlive the group it referenced.
+    Used by ECS, whose services reconcile their tasks' addresses as they come
+    and go. Real ECS deregisters only its own tasks, so registrations made by
+    anyone else — RegisterTargets calls, or a second service sharing the
+    group — survive: only ``previous_ids`` (the caller's last publication) are
+    withdrawn before ``targets`` (as ``(id, port)`` pairs) are added.
+    Unknown target groups are ignored rather than raising: a service can
+    outlive the group it referenced.
     """
     if tg_arn not in _tgs:
         return False
-    _targets[tg_arn] = [{"Id": tid, "Port": port} for tid, port in targets]
+    withdrawn = set(previous_ids)
+    fresh = [{"Id": tid, "Port": port} for tid, port in targets]
+    fresh_ids = {t["Id"] for t in fresh}
+    _targets[tg_arn] = [
+        t for t in _targets.get(tg_arn, [])
+        if t["Id"] not in withdrawn and t["Id"] not in fresh_ids
+    ] + fresh
     return True
 
 
@@ -1159,7 +1169,9 @@ def _match_condition(cond, method, path, headers, query_params):
         hostname = headers.get("host", "").split(":")[0]
         return any(fnmatch.fnmatch(hostname, v) for v in values)
 
-    if field == "http-method":
+    if field in ("http-request-method", "http-method"):
+        # AWS's field name is http-request-method; the old local-only spelling
+        # keeps matching for rules stored before the rename.
         return method.upper() in [v.upper() for v in values]
 
     if field == "query-string":

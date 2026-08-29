@@ -733,7 +733,14 @@ def _sync_service_targets(cluster_name, svc):
                     ip = _task_ip(task)
                     if ip:
                         targets.append((ip, port))
-            published = alb.set_targets_for_group(tg_arn, targets)
+            # Only this service's previous publication is withdrawn: a second
+            # service sharing the group, or targets registered by hand, stay —
+            # real ECS deregisters only its own tasks.
+            ledger = svc.setdefault("_published_targets", {})
+            published = alb.set_targets_for_group(
+                tg_arn, targets, ledger.get(tg_arn, ())
+            )
+            ledger[tg_arn] = [ip for ip, _ in targets]
         if published:
             logger.debug("ECS: %s -> %d target(s) in %s", svc_name, len(targets), tg_arn)
 
