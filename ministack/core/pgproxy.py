@@ -166,12 +166,13 @@ def _bump_catalog(cluster_id):
     return _catalog_versions[cluster_id]
 
 
-def _register_job(cluster_id, object_name, job_type="INDEX_BUILD"):
+def _register_job(cluster_id, object_name, job_type="INDEX_BUILD",
+                  status="completed", details=""):
     now = datetime.now(timezone.utc).isoformat()
     job = {
         "job_id": "".join(secrets.choice(_ID_ALPHABET) for _ in range(26)),
-        "status": "completed",
-        "details": "",
+        "status": status,
+        "details": details,
         "job_type": job_type,
         "class_id": "1259",
         "object_id": str(16384 + secrets.randbelow(100000)),
@@ -672,20 +673,11 @@ def _check_denylist(sql):
     ):
         if re.search(r"\bPARTITION\s+BY\b|\bPARTITION\s+OF\b|\bINHERITS\b", sql, re.I):
             return DsqlError("0A000", "table partitioning is not supported")
-        if re.search(r"\bEXCLUDE\b", sql, re.I):
-            return DsqlError("0A000", "the EXCLUDE constraint is not supported")
-    if re.match(r"\s*ALTER\s+TABLE\b", sql, re.I):
-        add = re.search(r"\bADD\s+COLUMN\b", sql, re.I)
-        # STORAGE DEFAULT is a storage option and BY DEFAULT an identity
-        # option — neither is an inline column default. Generated columns
-        # (GENERATED ALWAYS AS ... STORED / identity) are allowed.
-        if add and re.search(
-            r"(?<!STORAGE )(?<!BY )\bDEFAULT\b|\bNOT\s+NULL\b", sql[add.end():], re.I
+        if re.search(r"\bEXCLUDE\b", sql, re.I) and not re.match(
+            r"\s*ALTER\s+TABLE\b", sql, re.I
         ):
-            return DsqlError(
-                "0A000",
-                "ALTER TABLE ADD COLUMN with DEFAULT or NOT NULL is not supported",
-            )
+            # On ALTER TABLE it is an ADD CONSTRAINT form, refused as one.
+            return DsqlError("0A000", "the EXCLUDE constraint is not supported")
     return None
 
 
@@ -837,9 +829,15 @@ def _check_column_types(sql):
         return None
     m = re.match(r"\s*ALTER\s+TABLE\b", sql, re.I)
     if m:
-        add = re.search(r"\bADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?([\w\"]+)\s+", sql, re.I)
-        if add:
-            tail = sql[add.end():]
+        # One action per part: a statement can add several columns at once.
+        for part in _split_top_level(sql):
+            add = re.search(
+                r"\bADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?([\w\"]+)\s+",
+                part, re.I,
+            )
+            if not add:
+                continue
+            tail = part[add.end():]
             tokens = tail.split()
             raw_type = _type_from_tokens(tokens)
             err = _check_type(raw_type)
@@ -876,27 +874,23 @@ def _check_alter_table(sql):
     add = re.search(r"\bADD\s+(?:CONSTRAINT\s+[\w\"]+\s+)?(\w+)", sql, re.I)
     if add and add.group(1).upper() != "COLUMN":
         what = add.group(1).upper()
-        if what == "PRIMARY":
+        # Only two ADD CONSTRAINT forms exist: a CHECK or FOREIGN KEY added
+        # NOT VALID, and UNIQUE USING INDEX. Every other one draws the same
+        # message, whatever the constraint (measured, eu-central-1).
+        refused = (
+            what in ("PRIMARY", "EXCLUDE")
+            or (what == "UNIQUE"
+                and not re.search(r"\bUNIQUE\s+USING\s+INDEX\b", sql, re.I))
+            or (what in ("CHECK", "FOREIGN")
+                and not re.search(r"\bNOT\s+VALID\b", sql, re.I))
+        )
+        if refused:
             return DsqlError(
-                "0A000", "ADD CONSTRAINT PRIMARY KEY is not supported"
+                "0A000", "unsupported ALTER TABLE ADD CONSTRAINT statement"
             )
-        if what == "UNIQUE" and not re.search(
-            r"\bUNIQUE\s+USING\s+INDEX\b", sql, re.I
-        ):
-            return DsqlError(
-                "0A000",
-                "ADD CONSTRAINT UNIQUE (...) is not supported — use "
-                "CREATE UNIQUE INDEX ASYNC, then ADD CONSTRAINT ... "
-                "UNIQUE USING INDEX",
-            )
-        if what in ("CHECK", "FOREIGN") and not re.search(
-            r"\bNOT\s+VALID\b", sql, re.I
-        ):
-            kind = "CHECK" if what == "CHECK" else "FOREIGN KEY"
-            return DsqlError(
-                "0A000",
-                f"{kind} constraints added via ALTER TABLE must use NOT VALID",
-            )
+    err = _check_add_column(sql)
+    if err:
+        return err
     # ADD GENERATED ... AS IDENTITY requires an explicit CACHE value.
     if re.search(r"\bADD\s+GENERATED\b", sql, re.I) and re.search(
         r"\bIDENTITY\b", sql, re.I
@@ -906,6 +900,46 @@ def _check_alter_table(sql):
                 "0A000",
                 "ADD GENERATED AS IDENTITY requires an explicit CACHE value",
             )
+    return None
+
+
+# ALTER TABLE ADD COLUMN takes a name, a type and an optional STORAGE mode —
+# nothing else. Every column constraint draws one message, a bare NULL (which
+# constrains nothing) and COLLATE apart (measured, eu-central-1 2026-08-30).
+_ADD_COLUMN_RE = re.compile(
+    rf"\bADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?({_IDENT})\s+(.+)$",
+    re.I | re.S,
+)
+
+
+def _check_add_column(sql):
+    for part in _split_top_level(sql):
+        # ALTER COLUMN x ADD GENERATED ... is an identity action, not a column.
+        if re.search(r"\bALTER\s+(?:COLUMN\s+)?[\w\"]+\s+ADD\b", part, re.I):
+            continue
+        m = _ADD_COLUMN_RE.search(part)
+        if not m:
+            continue
+        name, quoted = fold_identifier(m.group(1))
+        if not quoted and name in _TABLE_CONSTRAINT_STARTERS:
+            continue  # ADD <table constraint>, handled above
+        tokens = m.group(2).split()
+        raw_type = _type_from_tokens(tokens)
+        tail = tokens[len(raw_type.split()):]
+        i = 0
+        while i < len(tail):
+            word = tail[i].upper().rstrip(",")
+            if word == "NULL":
+                i += 1
+            elif word == "STORAGE":
+                i += 2
+            elif word == "COLLATE":
+                return DsqlError("0A000", "COLLATE clause not supported")
+            else:
+                return DsqlError(
+                    "0A000",
+                    "ALTER TABLE ADD COLUMN with constraint not supported",
+                )
     return None
 
 
@@ -925,13 +959,14 @@ def _check_deferrable(sql):
     m = re.match(
         r"\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[\w\".]+\s*", sql, re.I
     )
+    is_alter = bool(re.match(r"\s*ALTER\s+TABLE\b", sql, re.I))
     if m and sql[m.end():].lstrip().startswith("("):
         start = sql.index("(", m.end())
         end = _match_paren(sql, start)
         if end < 0:
             return None
         body = sql[start + 1 : end]
-    elif re.match(r"\s*ALTER\s+TABLE\b", sql, re.I):
+    elif is_alter:
         body = sql
     else:
         return None
@@ -949,9 +984,17 @@ def _check_deferrable(sql):
             continue
         if "references" in words or ("foreign", "key") in pairs:
             continue
-        return DsqlError(
-            "0A000", "DEFERRABLE is supported for foreign key constraints only"
-        )
+        if "check" in words:
+            return DsqlError(
+                "0A000", "CHECK constraints cannot be marked DEFERRABLE"
+            )
+        if is_alter and "unique" in words:
+            return DsqlError(
+                "0A000",
+                "ALTER TABLE / ADD CONSTRAINT UNIQUE / DEFERRED / "
+                "INITIALLY DEFERRED not supported",
+            )
+        return DsqlError("0A000", "DEFERRABLE constraint not supported")
     return None
 
 
@@ -1655,11 +1698,32 @@ def _synth_columns(kind, result):
     return result["cols"] if kind == "rows" else ["job_id"]
 
 
+def _error_payload_fields(payload):
+    """SQLSTATE and primary message out of an ErrorResponse payload."""
+    fields = {}
+    for field in payload.split(b"\0"):
+        if field:
+            fields[field[:1]] = field[1:].decode("utf-8", "replace")
+    return fields.get(b"C", ""), fields.get(b"M", "")
+
+
 async def _run_rewrite(conn, b_writer, rewrite):
     """Execute a rewritten ASYNC statement; return (job, backend_error)."""
     frames = await _run_backend_capture(conn, b_writer, rewrite.sql)
     backend_err = next((p for t, p in frames if t == b"E"), None)
     if backend_err is not None:
+        sqlstate, message = _error_payload_fields(backend_err)
+        # Data that does not satisfy the constraint (or a duplicate key for a
+        # unique index) fails the job, not its submission: DSQL answers with a
+        # job_id and reports the failure through sys.jobs. Anything else — an
+        # unresolvable relation, a syntax error — is refused on the spot. In a
+        # transaction the backend is left aborted, so relay there either way.
+        if sqlstate.startswith("23") and not conn.txn.in_txn:
+            job = _register_job(
+                conn.cluster_id, rewrite.object_name, rewrite.job_type,
+                status="failed", details=message,
+            )
+            return job, None
         return None, backend_err
     conn.catalog_version = _bump_catalog(conn.cluster_id)
     job = _register_job(conn.cluster_id, rewrite.object_name, rewrite.job_type)
