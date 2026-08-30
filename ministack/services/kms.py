@@ -1511,8 +1511,11 @@ def _generate_random(data):
     absence with "NumberOfBytes is required.", so an omitted count is a
     ``ValidationException`` rather than a silent default. ``CustomKeyStoreId``
     answers ``CustomKeyStoreNotFoundException`` — MiniStack has no custom key
-    stores. The Nitro-enclave ``Recipient`` parameter is not supported and is
-    ignored.
+    stores. The Nitro-enclave ``Recipient`` parameter answers
+    ``UnsupportedOperationException``: a caller sending it expects
+    ``CiphertextForRecipient`` and a null ``Plaintext``, and MiniStack cannot
+    encrypt to an enclave's attestation key — answering ``Plaintext`` anyway
+    would be a shape the real service never produces for that request.
     """
     number_of_bytes = data.get("NumberOfBytes")
     if number_of_bytes is None:
@@ -1537,6 +1540,13 @@ def _generate_random(data):
         return error_response_json(
             "CustomKeyStoreNotFoundException",
             f"Custom key store {data['CustomKeyStoreId']} does not exist",
+            400,
+        )
+    if data.get("Recipient"):
+        return error_response_json(
+            "UnsupportedOperationException",
+            "The Recipient parameter is not supported by MiniStack: plaintext "
+            "cannot be encrypted to a Nitro enclave attestation key.",
             400,
         )
     return json_response({"Plaintext": base64.b64encode(os.urandom(number_of_bytes)).decode()})

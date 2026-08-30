@@ -44,6 +44,7 @@ from ministack.core.responses import (
     json_response,
     new_uuid,
     now_iso,
+    request_scope,
 )
 from ministack.services import ecs_metadata, secretsmanager
 
@@ -254,12 +255,17 @@ def _reconcile_restored_services():
     Failures are logged and skipped rather than raised, so one unreachable image
     cannot stop the remaining services from coming back.
     """
-    for svc_key, svc in list(_services.items()):
+    # This runs on a daemon thread with no request scope, so plain .items()
+    # would only see the default account and region — a service persisted under
+    # any other tenant would never come back. Walk every stored service and pin
+    # its own account and region around the relaunch.
+    for (account_id, region, svc_key), svc in _services.all_items():
         if not isinstance(svc, dict) or svc.get("status") != "ACTIVE":
             continue
         cluster_name = svc_key.split("/", 1)[0]
         try:
-            _reconcile_service_tasks(cluster_name, svc_key)
+            with request_scope(account_id, region):
+                _reconcile_service_tasks(cluster_name, svc_key)
         except Exception as exc:
             logger.warning(
                 "ECS: could not relaunch service %s after restore: %s",

@@ -2018,3 +2018,22 @@ def test_kms_generate_random_validation(kms_client):
     resp = _raw({"NumberOfBytes": 16, "CustomKeyStoreId": "cks-does-not-exist"})
     assert resp.status_code == 400
     assert "CustomKeyStoreNotFoundException" in resp.json().get("__type", "")
+
+
+def test_kms_generate_random_refuses_a_recipient(kms_client):
+    """The Nitro-enclave Recipient parameter is refused, not silently ignored.
+
+    A caller sending Recipient expects CiphertextForRecipient and a null
+    Plaintext; MiniStack cannot encrypt to an enclave attestation key, and
+    answering Plaintext anyway is a response shape the request never gets from
+    the real service.
+    """
+    with pytest.raises(ClientError) as e:
+        kms_client.generate_random(
+            NumberOfBytes=32,
+            Recipient={
+                "KeyEncryptionAlgorithm": "RSAES_OAEP_SHA_256",
+                "AttestationDocument": b"not-a-real-attestation-document",
+            },
+        )
+    assert e.value.response["Error"]["Code"] == "UnsupportedOperationException"
