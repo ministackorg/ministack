@@ -29,6 +29,9 @@ Documented limitations:
   same relation supersedes (``SELECT * FROM (SELECT id FROM t FOR UPDATE) x
   FOR SHARE``). Both are no-ops; the proxy refuses them anyway rather than
   model the planner's strongest-lock-wins merge.
+- Foreign keys are enforced by the backend, so a referencing write and a
+  concurrent change to the referenced key wait on a row lock where DSQL
+  resolves them optimistically and fails the loser with ``40001`` (OC000).
 - Transaction row counting is static (``VALUES`` tuples only); ``INSERT ...
   SELECT`` / ``UPDATE`` / ``DELETE`` affected-row counts are not tracked.
 - OC001 emulation is optimistic: the catalog version bumps on forwarded DDL,
@@ -667,8 +670,6 @@ def _check_denylist(sql):
     if re.match(r"\s*(CREATE|ALTER)\s+TABLE\b", sql, re.I) or re.match(
         r"\s*CREATE\s+(TEMP|TEMPORARY|UNLOGGED)\s+TABLE\b", sql, re.I
     ):
-        if re.search(r"\bFOREIGN\s+KEY\b|\bREFERENCES\b", sql, re.I):
-            return DsqlError("0A000", "foreign key constraints are not supported")
         if re.search(r"\bPARTITION\s+BY\b|\bPARTITION\s+OF\b|\bINHERITS\b", sql, re.I):
             return DsqlError("0A000", "table partitioning is not supported")
         if re.search(r"\bEXCLUDE\b", sql, re.I):
@@ -857,9 +858,10 @@ def _check_column_types(sql):
 # columns, but not a primary key column — needs a catalog probe, so it lives in
 # _check_drop_column rather than here), SET/DROP
 # DEFAULT, DROP NOT NULL, DROP EXPRESSION, identity actions, SET STORAGE,
-# ADD CONSTRAINT ... CHECK ... NOT VALID, ADD CONSTRAINT ... UNIQUE USING
-# INDEX, DROP CONSTRAINT, RENAME, SET SCHEMA, OWNER TO, and the async
-# VALIDATE CONSTRAINT form (handled as a Rewrite in validate()).
+# ADD CONSTRAINT ... CHECK / FOREIGN KEY ... NOT VALID, ADD CONSTRAINT ...
+# UNIQUE USING INDEX, ALTER CONSTRAINT, DROP CONSTRAINT, RENAME, SET SCHEMA,
+# OWNER TO, and the async VALIDATE CONSTRAINT form (handled as a Rewrite in
+# validate()).
 def _check_alter_table(sql):
     if not re.match(r"\s*ALTER\s+TABLE\b", sql, re.I):
         return None
@@ -887,10 +889,13 @@ def _check_alter_table(sql):
                 "CREATE UNIQUE INDEX ASYNC, then ADD CONSTRAINT ... "
                 "UNIQUE USING INDEX",
             )
-        if what == "CHECK" and not re.search(r"\bNOT\s+VALID\b", sql, re.I):
+        if what in ("CHECK", "FOREIGN") and not re.search(
+            r"\bNOT\s+VALID\b", sql, re.I
+        ):
+            kind = "CHECK" if what == "CHECK" else "FOREIGN KEY"
             return DsqlError(
                 "0A000",
-                "CHECK constraints added via ALTER TABLE must use NOT VALID",
+                f"{kind} constraints added via ALTER TABLE must use NOT VALID",
             )
     # ADD GENERATED ... AS IDENTITY requires an explicit CACHE value.
     if re.search(r"\bADD\s+GENERATED\b", sql, re.I) and re.search(
@@ -901,6 +906,52 @@ def _check_alter_table(sql):
                 "0A000",
                 "ADD GENERATED AS IDENTITY requires an explicit CACHE value",
             )
+    return None
+
+
+# --- Foreign keys (AWS create-table-syntax-support, 2026-08-26) -------------
+
+# A foreign key is otherwise plain PostgreSQL — the referential actions, both
+# match types and deferrability all behave as they do on the backend, so the
+# only DSQL-specific rules are that ALTER TABLE must add one NOT VALID
+# (_check_alter_table) and that DEFERRABLE applies to foreign keys alone.
+# Cheap gate: only tokenize a statement that could carry a deferral.
+_DEFERRABLE_RE = re.compile(r"\bDEFERRABLE\b|\bINITIALLY\s+DEFERRED\b", re.I)
+
+
+def _check_deferrable(sql):
+    if not _DEFERRABLE_RE.search(sql):
+        return None
+    m = re.match(
+        r"\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[\w\".]+\s*", sql, re.I
+    )
+    if m and sql[m.end():].lstrip().startswith("("):
+        start = sql.index("(", m.end())
+        end = _match_paren(sql, start)
+        if end < 0:
+            return None
+        body = sql[start + 1 : end]
+    elif re.match(r"\s*ALTER\s+TABLE\b", sql, re.I):
+        body = sql
+    else:
+        return None
+    for part in _split_top_level(body):
+        words = [t for k, t in _sql_tokens(part) if k == "name"]
+        pairs = list(zip(words, words[1:]))
+        # NOT DEFERRABLE is the default, so only an actual deferral counts.
+        if not any(
+            w == "deferrable" and (i == 0 or words[i - 1] != "not")
+            for i, w in enumerate(words)
+        ) and ("initially", "deferred") not in pairs:
+            continue
+        # ALTER CONSTRAINT only ever targets a foreign key constraint.
+        if ("alter", "constraint") in pairs:
+            continue
+        if "references" in words or ("foreign", "key") in pairs:
+            continue
+        return DsqlError(
+            "0A000", "DEFERRABLE is supported for foreign key constraints only"
+        )
     return None
 
 
@@ -1089,19 +1140,17 @@ def match_wait_for_job(sql):
 
 # --- Locking clauses (measured against Aurora DSQL, 2026-08-18) -------------
 
-# DSQL supports one locking clause, FOR UPDATE, with its optional
-# OF / NOWAIT / SKIP LOCKED tail. It places no restriction on the query the
-# clause locks — no WHERE clause, a non-key column, an inequality, IN/OR, a
-# join and a table without a primary key all lock fine.
-_UNSUPPORTED_LOCKS = (("no", "key", "update"), ("key", "share"), ("share",))
+# DSQL supports two locking clauses, FOR UPDATE and FOR KEY SHARE (added
+# 2026-08-25), each with its optional OF / NOWAIT / SKIP LOCKED tail. Neither
+# restricts the query the clause locks — no WHERE clause, a non-key column, an
+# inequality, IN/OR, a join and a table without a primary key all lock fine.
+_UNSUPPORTED_LOCKS = (("no", "key", "update"), ("share",))
 # Cheap gate: only tokenize a statement that could carry one of those.
-_LOCK_CLAUSE_RE = re.compile(
-    r"\bFOR\s+(?:NO\s+KEY\s+UPDATE|(?:KEY\s+)?SHARE)\b", re.I
-)
+_LOCK_CLAUSE_RE = re.compile(r"\bFOR\s+(?:NO\s+KEY\s+UPDATE|SHARE)\b", re.I)
 
 
 def _check_locking_clause(sql):
-    """Refuse every locking clause but FOR UPDATE.
+    """Refuse every locking clause but FOR UPDATE and FOR KEY SHARE.
 
     The check reads the statement's tokens, so ``FOR SHARE`` inside a string
     literal is text rather than a clause. A clause nested in a CTE or subquery
@@ -1116,8 +1165,7 @@ def _check_locking_clause(sql):
             continue
         words = tuple(t for k, t in toks[i + 1 : i + 4] if k == "name")
         if any(words[: len(lock)] == lock for lock in _UNSUPPORTED_LOCKS):
-            # Verbatim from the service, which names FOR KEY SHARE as
-            # supported and then refuses it too.
+            # Verbatim from the service.
             return DsqlError(
                 "0A000",
                 "locking clauses other than FOR UPDATE/FOR KEY SHARE "
@@ -1183,6 +1231,9 @@ def validate(sql, txn_state=None):
     if err:
         return err
     err = _check_alter_table(s)
+    if err:
+        return err
+    err = _check_deferrable(s)
     if err:
         return err
     err = _check_cache_value(s)

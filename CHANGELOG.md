@@ -5,6 +5,12 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Aurora DSQL — foreign key constraints** — every `REFERENCES` / `FOREIGN KEY` clause was refused `0A000`, so a schema with referential integrity could not be created at all; Aurora DSQL has supported foreign keys since 2026-08-26. They now reach the backend as written — the five referential actions, `MATCH FULL` / `MATCH SIMPLE`, self-references, composite keys and deferrability — with the two DSQL-specific rules enforced: `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY` must use `NOT VALID` (as `CHECK` already did, with `ALTER TABLE ASYNC ... VALIDATE CONSTRAINT` validating it as a job afterwards), and `DEFERRABLE` is refused on any other kind of constraint, DSQL restricting it to foreign keys. Referential integrity is the backend's, so a referencing write racing a change to the referenced key waits on a row lock instead of failing the loser with `40001` (OC000). Contributed by @vivedo.
+- **Aurora DSQL — `SELECT ... FOR KEY SHARE`** — the clause was refused `0A000` alongside `FOR SHARE` and `FOR NO KEY UPDATE`, which matched a live cluster in August but not the service since 2026-08-25; it is now forwarded, and only `FOR SHARE` and `FOR NO KEY UPDATE` are refused. Contributed by @vivedo.
+
 ## [1.5.3] — 2026-08-28
 
 ### Added

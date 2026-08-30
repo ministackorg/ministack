@@ -661,20 +661,6 @@ class TestDenylist:
     @pytest.mark.parametrize(
         "sql",
         [
-            "CREATE TABLE t (a int, b int REFERENCES other (id))",
-            "CREATE TABLE t (a int, FOREIGN KEY (a) REFERENCES other (id))",
-            "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES o (id)",
-        ],
-    )
-    def test_foreign_keys_denied(self, sql):
-        err = pgproxy.validate(sql, pgproxy.TxnState())
-        assert isinstance(err, pgproxy.DsqlError), sql
-        assert err.sqlstate == "0A000"
-        assert "foreign key" in err.message
-
-    @pytest.mark.parametrize(
-        "sql",
-        [
             "ALTER TABLE t ADD COLUMN c int DEFAULT 0",
             "ALTER TABLE t ADD COLUMN c text NOT NULL",
         ],
@@ -841,6 +827,89 @@ class TestAlterTableSubset:
         assert result.job_type == "VALIDATE_CONSTRAINT"
         assert result.object_name == "public.t"
 
+
+
+
+class TestForeignKeys:
+    """Foreign keys, supported since 2026-08-26 (AWS release notes)."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "CREATE TABLE orders (id int PRIMARY KEY, p int REFERENCES products)",
+            "CREATE TABLE orders (id int PRIMARY KEY, "
+            "p int REFERENCES products (product_no))",
+            "CREATE TABLE orders (id int PRIMARY KEY, "
+            "p int CONSTRAINT fk_product REFERENCES products)",
+            "CREATE TABLE shipments (id int PRIMARY KEY, w int, p int, "
+            "FOREIGN KEY (w, p) REFERENCES inventory (warehouse_id, product_no))",
+            # Self-referencing.
+            "CREATE TABLE tree (id int PRIMARY KEY, parent int REFERENCES tree)",
+            # Every referential action DSQL supports.
+            "CREATE TABLE o (p int REFERENCES products ON DELETE NO ACTION)",
+            "CREATE TABLE o (p int REFERENCES products ON DELETE RESTRICT)",
+            "CREATE TABLE o (p int REFERENCES products ON DELETE CASCADE)",
+            "CREATE TABLE o (p int REFERENCES products ON DELETE SET NULL)",
+            "CREATE TABLE o (p int REFERENCES products ON DELETE SET DEFAULT)",
+            "CREATE TABLE o (p int REFERENCES products "
+            "ON DELETE CASCADE ON UPDATE CASCADE)",
+            # Match types and deferrability.
+            "CREATE TABLE s (w int, p int, FOREIGN KEY (w, p) "
+            "REFERENCES inventory (w, p) MATCH FULL)",
+            "CREATE TABLE s (w int, p int, FOREIGN KEY (w, p) "
+            "REFERENCES inventory (w, p) MATCH SIMPLE)",
+            "CREATE TABLE o (p int REFERENCES products DEFERRABLE)",
+            "CREATE TABLE o (p int REFERENCES products "
+            "DEFERRABLE INITIALLY DEFERRED)",
+            "CREATE TABLE o (p int REFERENCES products NOT DEFERRABLE)",
+            "ALTER TABLE o ALTER CONSTRAINT fk DEFERRABLE INITIALLY DEFERRED",
+            "ALTER TABLE o ADD CONSTRAINT fk FOREIGN KEY (p) "
+            "REFERENCES products NOT VALID",
+            "ALTER TABLE o ADD FOREIGN KEY (p) REFERENCES products "
+            "ON DELETE CASCADE NOT VALID",
+            "ALTER TABLE o ADD CONSTRAINT fk FOREIGN KEY (p) "
+            "REFERENCES products DEFERRABLE INITIALLY DEFERRED NOT VALID",
+            "ALTER TABLE o DROP CONSTRAINT fk",
+            "SET CONSTRAINTS ALL DEFERRED",
+        ],
+    )
+    def test_allowed(self, sql):
+        assert pgproxy.validate(sql, pgproxy.TxnState()) is None, sql
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "ALTER TABLE o ADD CONSTRAINT fk FOREIGN KEY (p) REFERENCES products",
+            "ALTER TABLE o ADD FOREIGN KEY (p) REFERENCES products ON DELETE CASCADE",
+        ],
+    )
+    def test_alter_table_requires_not_valid(self, sql):
+        err = pgproxy.validate(sql, pgproxy.TxnState())
+        assert isinstance(err, pgproxy.DsqlError), sql
+        assert err.sqlstate == "0A000"
+        assert err.message == (
+            "FOREIGN KEY constraints added via ALTER TABLE must use NOT VALID"
+        )
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "CREATE TABLE t (a int, UNIQUE (a) DEFERRABLE)",
+            "CREATE TABLE t (a int PRIMARY KEY DEFERRABLE INITIALLY DEFERRED)",
+            "CREATE TABLE t (a int, CONSTRAINT c CHECK (a > 0) "
+            "DEFERRABLE INITIALLY IMMEDIATE)",
+            "ALTER TABLE t ADD CONSTRAINT u UNIQUE USING INDEX idx DEFERRABLE",
+        ],
+    )
+    def test_deferrable_on_a_non_foreign_key_denied(self, sql):
+        err = pgproxy.validate(sql, pgproxy.TxnState())
+        assert isinstance(err, pgproxy.DsqlError), sql
+        assert err.sqlstate == "0A000"
+        assert "DEFERRABLE" in err.message
+
+    def test_deferrable_as_text_is_not_a_constraint_option(self):
+        sql = "CREATE TABLE t (a int, CHECK (s <> 'DEFERRABLE'))"
+        assert pgproxy.validate(sql, pgproxy.TxnState()) is None
 
 class TestIdentityAndSequences:
     @pytest.mark.parametrize(
@@ -1247,8 +1316,8 @@ class TestLockingClauses:
     not the predicate. Measured against a live cluster (eu-central-1,
     2026-08-18, server_version 16.15): FOR UPDATE locks whatever the query
     selects — no WHERE clause, a non-key column, an inequality, IN/OR, a join,
-    a table with no primary key — while FOR NO KEY UPDATE, FOR SHARE and
-    FOR KEY SHARE are all refused with 0A000."""
+    a table with no primary key — while FOR NO KEY UPDATE and FOR SHARE are
+    refused with 0A000. FOR KEY SHARE joined FOR UPDATE on 2026-08-25."""
 
     MESSAGE = "locking clauses other than FOR UPDATE/FOR KEY SHARE are not supported"
 
@@ -1269,6 +1338,11 @@ class TestLockingClauses:
             "SELECT s FROM t WHERE id = 1 FOR UPDATE SKIP LOCKED",
             "SELECT s FROM t WHERE id = 1 FOR UPDATE OF t NOWAIT",
             "SELECT * FROM (SELECT 1 FOR UPDATE) x FOR UPDATE",
+            # FOR KEY SHARE, supported since 2026-08-25.
+            "SELECT s FROM t WHERE id = 1 FOR KEY SHARE",
+            "SELECT s FROM t FOR KEY SHARE NOWAIT",
+            "SELECT * FROM (SELECT s FROM t FOR KEY SHARE) y",
+            "WITH x AS (SELECT s FROM t FOR KEY SHARE) SELECT * FROM x",
             # The words only as text — not a locking clause at all.
             "SELECT s FROM t WHERE s = 'FOR SHARE'",
             "SELECT 'FOR NO KEY UPDATE' AS lit",
@@ -1284,13 +1358,12 @@ class TestLockingClauses:
         "sql",
         [
             "SELECT s FROM t WHERE id = 1 FOR SHARE",
-            "SELECT s FROM t WHERE id = 1 FOR KEY SHARE",
             "SELECT s FROM t WHERE id = 1 FOR NO KEY UPDATE",
             "SELECT s FROM t for share",
             "SELECT s FROM t FOR SHARE NOWAIT",
             # Any nesting depth: DSQL refuses it inside a CTE or a subquery.
             "WITH x AS (SELECT s FROM t WHERE id = 1 FOR SHARE) SELECT * FROM x",
-            "SELECT * FROM (SELECT s FROM t FOR KEY SHARE) y",
+            "SELECT * FROM (SELECT s FROM t FOR SHARE) y",
             # A supported clause earlier in the statement must not hide one
             # that still reaches a relation (both verified rejected by DSQL).
             "SELECT x.id FROM (SELECT id FROM t FOR UPDATE) x, "
@@ -1596,8 +1669,8 @@ class TestExtendedProtocol:
         "sql,expected",
         [
             ("CREATE TABLE xp_serial (id serial)", "serial"),
-            ("CREATE TABLE xp_fk (id int, p int REFERENCES xp_serial (id))",
-             "foreign key"),
+            ("CREATE TABLE xp_uq (id int, UNIQUE (id) DEFERRABLE)",
+             "DEFERRABLE"),
             ("CREATE EXTENSION pgcrypto", "CREATE EXTENSION"),
             ("CREATE TEMP TABLE xp_tmp (id int)", "temporary"),
             ("TRUNCATE xp_base", "TRUNCATE"),
@@ -1778,7 +1851,7 @@ class TestLockingReads:
     """A locking read has to reach the backend whatever its predicate looks
     like — an ORM quotes every identifier, and DSQL itself places no
     restriction on the predicate (measured, eu-central-1, 2026-08-18). What it
-    does refuse is a lock strength other than FOR UPDATE."""
+    does refuse is a lock strength other than FOR UPDATE/FOR KEY SHARE."""
 
     UUID = "11111111-1111-1111-1111-111111111111"
     MESSAGE = "locking clauses other than FOR UPDATE/FOR KEY SHARE are not supported"
@@ -1901,9 +1974,7 @@ class TestLockingReads:
                 result = c.simple(sql)
                 assert result.ok, f"{sql} -> {result.sqlstate} {result.message}"
 
-    @pytest.mark.parametrize(
-        "clause", ["FOR SHARE", "FOR KEY SHARE", "FOR NO KEY UPDATE"]
-    )
+    @pytest.mark.parametrize("clause", ["FOR SHARE", "FOR NO KEY UPDATE"])
     def test_other_lock_strengths_rejected(self, dsql_proxy, clause):
         with _WireClient(dsql_proxy) as c:
             self._setup(c, "fu_l")
@@ -1912,6 +1983,15 @@ class TestLockingReads:
                 result = send(sql)
                 assert result.sqlstate == "0A000", sql
                 assert result.message == self.MESSAGE, sql
+
+    def test_key_share_reaches_the_backend(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            self._setup(c, "fu_ks")
+            sql = f"SELECT s FROM fu_ks WHERE id = '{self.UUID}' FOR KEY SHARE"
+            for send in (c.simple, c.extended):
+                result = send(sql)
+                assert result.ok, f"{sql} -> {result.sqlstate} {result.message}"
+                assert result.rows == [("a",)], sql
 
     def test_lock_strength_in_a_literal_is_not_a_clause(self, dsql_proxy):
         with _WireClient(dsql_proxy) as c:
@@ -2057,17 +2137,64 @@ class TestLiveProxy:
         finally:
             conn.close()
 
-    def test_foreign_key_rejected(self, dsql_proxy):
+    def test_foreign_key_enforced(self, dsql_proxy):
+        """Foreign keys, supported since 2026-08-26, reach the backend and
+        enforce referential integrity."""
         psycopg2 = pytest.importorskip("psycopg2")
         conn = _pg_connect(dsql_proxy)
         try:
             cur = conn.cursor()
+            cur.execute("CREATE TABLE fk_parent (id int PRIMARY KEY, name text)")
+            cur.execute(
+                "CREATE TABLE fk_child (id int PRIMARY KEY, "
+                "p int REFERENCES fk_parent ON DELETE CASCADE)"
+            )
+            cur.execute("INSERT INTO fk_parent VALUES (1, 'a')")
+            cur.execute("INSERT INTO fk_child VALUES (10, 1)")
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("INSERT INTO fk_child VALUES (11, 99)")
+            assert exc.value.pgcode == "23503"
+            # ON DELETE CASCADE removes the referencing row with the parent.
+            cur.execute("DELETE FROM fk_parent WHERE id = 1")
+            cur.execute("SELECT count(*) FROM fk_child")
+            assert cur.fetchone()[0] == 0
+            cur.execute("DROP TABLE fk_child")
+            cur.execute("DROP TABLE fk_parent")
+        finally:
+            conn.close()
+
+    def test_foreign_key_via_alter_table_requires_not_valid(self, dsql_proxy):
+        psycopg2 = pytest.importorskip("psycopg2")
+        conn = _pg_connect(dsql_proxy)
+        try:
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE fka_parent (id int PRIMARY KEY)")
+            cur.execute("CREATE TABLE fka_child (id int PRIMARY KEY, p int)")
+            cur.execute("INSERT INTO fka_parent VALUES (1)")
+            cur.execute("INSERT INTO fka_child VALUES (10, 1)")
             with pytest.raises(psycopg2.Error) as exc:
                 cur.execute(
-                    "CREATE TABLE fk_live (a int REFERENCES other_table (id))"
+                    "ALTER TABLE fka_child ADD CONSTRAINT fk "
+                    "FOREIGN KEY (p) REFERENCES fka_parent"
                 )
             assert exc.value.pgcode == "0A000"
-            assert "foreign key" in str(exc.value)
+            assert "NOT VALID" in str(exc.value)
+            cur.execute(
+                "ALTER TABLE fka_child ADD CONSTRAINT fk "
+                "FOREIGN KEY (p) REFERENCES fka_parent NOT VALID"
+            )
+            # Async validation of a NOT VALID foreign key registers a job.
+            cur.execute("ALTER TABLE ASYNC fka_child VALIDATE CONSTRAINT fk")
+            job_id = cur.fetchone()[0]
+            cur.execute(
+                "SELECT job_type, status FROM sys.jobs WHERE job_id = %s" % repr(job_id)
+            )
+            assert cur.fetchone() == ("VALIDATE_CONSTRAINT", "completed")
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("INSERT INTO fka_child VALUES (11, 99)")
+            assert exc.value.pgcode == "23503"
+            cur.execute("DROP TABLE fka_child")
+            cur.execute("DROP TABLE fka_parent")
         finally:
             conn.close()
 
@@ -2213,10 +2340,11 @@ class TestLiveProxy:
                 cur.execute(sql)
                 cur.fetchall()
             # Any other lock strength is not supported.
+            cur.execute("SELECT * FROM fu_live WHERE id = 1 FOR KEY SHARE")
+            cur.fetchall()
             for sql in (
                 "SELECT * FROM fu_live WHERE id = 1 FOR SHARE",
                 "SELECT * FROM fu_live WHERE id = 1 FOR NO KEY UPDATE",
-                "SELECT * FROM fu_live WHERE id = 1 FOR KEY SHARE",
             ):
                 with pytest.raises(psycopg2.Error) as exc:
                     cur.execute(sql)
