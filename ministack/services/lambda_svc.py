@@ -1999,6 +1999,11 @@ def _create_function(data: dict):
         "s3_object_storage_mode": code_data.get("S3ObjectStorageMode"),
         "source_kms_key_arn": code_data.get("SourceKMSKeyArn"),
         "s3_object_ref": _s3_object_ref,
+        # Whether the caller explicitly chose an architecture, as distinct from
+        # the stored x86_64 default. The wire shape is identical either way;
+        # only the Docker executor reads this, to pin the container platform
+        # for functions that actually declared one.
+        "architectures_declared": "Architectures" in data,
         "versions": {},
         "next_version": 1,
         "tags": data.get("Tags", {}),
@@ -2359,6 +2364,11 @@ def _update_code(name: str, data: dict):
         )
     func = _functions[name]
     code_zip = None
+    # UpdateFunctionCode is where AWS lets the architecture change (the
+    # UpdateFunctionConfiguration model has no Architectures member).
+    if "Architectures" in data:
+        func["config"]["Architectures"] = data["Architectures"]
+        func["architectures_declared"] = True
     if "ImageUri" in data:
         func["config"]["ImageUri"] = data["ImageUri"]
         func["config"]["PackageType"] = "Image"
@@ -2481,6 +2491,8 @@ def _update_config(name: str, data: dict):
                 config["Layers"] = layers_cfg
             else:
                 config[key] = data[key]
+    if "Architectures" in data:
+        _functions[name]["architectures_declared"] = True
     if "ImageConfig" in data:
         config["ImageConfigResponse"] = {"ImageConfig": data["ImageConfig"]}
     config["LastModified"] = _now_iso()
@@ -3644,6 +3656,23 @@ def _parse_docker_flags(flags: str) -> dict:
     return kwargs
 
 
+def _declared_docker_platform(config: dict):
+    """The linux/* platform to pin, or None when the function never declared one.
+
+    Every stored config carries ``Architectures`` because AWS's x86_64 default
+    is echoed on the wire — so the config alone cannot say whether the caller
+    chose an architecture. The function record tracks that at create/update
+    time, and only an explicit choice pins the container platform: pinning the
+    stored default onto undeclared functions would break arm64 hosts with no
+    amd64 binfmt handler, whose functions ran natively before.
+    """
+    func = _functions.get(config.get("FunctionName") or "")
+    if not func or not func.get("architectures_declared"):
+        return None
+    arch = (config.get("Architectures") or ["x86_64"])[0]
+    return "linux/arm64" if arch == "arm64" else "linux/amd64"
+
+
 def _spawn_lambda_container(config: dict, code_zip: bytes | None):
     """Create and start a Lambda container for the given config.
 
@@ -3834,10 +3863,14 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
     # handler dies at import naming the library rather than the mismatch
     # ("no pq wrapper available" from psycopg, for instance). Set it before the
     # flags merge so an explicit --platform in LAMBDA_DOCKER_FLAGS still wins.
-    declared_arch = (config.get("Architectures") or ["x86_64"])[0]
-    docker_arch = "arm64" if declared_arch == "arm64" else "amd64"
-    docker_platform = f"linux/{docker_arch}"
-    run_kwargs["platform"] = docker_platform
+    # Only a function whose creator explicitly chose an architecture is pinned:
+    # every stored record carries the x86_64 default, and pinning that onto
+    # functions that never declared one would break arm64 hosts without a
+    # binfmt handler that ran those functions natively before.
+    docker_platform = _declared_docker_platform(config)
+    docker_arch = docker_platform.rsplit("/", 1)[1] if docker_platform else None
+    if docker_platform:
+        run_kwargs["platform"] = docker_platform
 
     # Apply LAMBDA_DOCKER_FLAGS — merge parsed kwargs into run_kwargs
     if LAMBDA_DOCKER_FLAGS:
@@ -3868,11 +3901,13 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
         local_image = client.images.get(image)
         # A cached image of the wrong architecture is as unusable as no image:
         # docker refuses to start it, and without this check the refusal arrives
-        # as an opaque run error rather than a pull.
-        if local_image.attrs.get("Architecture") not in (None, docker_arch):
+        # as an opaque run error rather than a pull. Only checked when the
+        # function pinned a platform — with no declaration any cached image is
+        # the host's, which is what will run.
+        if docker_arch and local_image.attrs.get("Architecture") not in (None, docker_arch):
             raise docker_lib.errors.ImageNotFound("cached image is the wrong architecture")
     except docker_lib.errors.ImageNotFound:
-        logger.info("Pulling Lambda image: %s (%s)", image, docker_platform)
+        logger.info("Pulling Lambda image: %s (%s)", image, docker_platform or "host platform")
         try:
             client.images.pull(image, platform=docker_platform)
         except Exception as exc:
