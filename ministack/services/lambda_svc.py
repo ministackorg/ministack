@@ -3673,8 +3673,15 @@ def _declared_docker_platform(config: dict):
     return "linux/arm64" if arch == "arm64" else "linux/amd64"
 
 
-def _spawn_lambda_container(config: dict, code_zip: bytes | None):
+def _spawn_lambda_container(config: dict, code_zip: bytes | None,
+                            _pin_platform: bool = True):
     """Create and start a Lambda container for the given config.
+
+    A function that explicitly declared an architecture is pinned to it — but
+    only best-effort: a host that cannot run the declared platform (no qemu or
+    Rosetta for the emulation) logs the mismatch and retries on the host's own
+    architecture instead of failing an invoke that worked before the pin
+    existed. `_pin_platform=False` is that retry.
 
     Returns (container, tmpdir). The caller is responsible for pool registration
     and for `_kill_pool_entry` on cleanup (tmpdir is None for Image-type).
@@ -3867,10 +3874,22 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
     # every stored record carries the x86_64 default, and pinning that onto
     # functions that never declared one would break arm64 hosts without a
     # binfmt handler that ran those functions natively before.
-    docker_platform = _declared_docker_platform(config)
+    docker_platform = _declared_docker_platform(config) if _pin_platform else None
     docker_arch = docker_platform.rsplit("/", 1)[1] if docker_platform else None
     if docker_platform:
         run_kwargs["platform"] = docker_platform
+
+    def _platform_fallback(reason):
+        """The declared platform cannot run here: log it, run on the host's."""
+        logger.warning(
+            "Lambda %s declares %s but this host cannot run it (%s); "
+            "running on the host architecture instead. Install a binfmt/qemu "
+            "handler (or Rosetta) for real cross-architecture execution.",
+            config.get("FunctionName"), docker_platform, reason)
+        if tmpdir and os.path.exists(tmpdir):
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        return _spawn_lambda_container(config, code_zip, _pin_platform=False)
 
     # Apply LAMBDA_DOCKER_FLAGS — merge parsed kwargs into run_kwargs
     if LAMBDA_DOCKER_FLAGS:
@@ -3911,6 +3930,8 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
         try:
             client.images.pull(image, platform=docker_platform)
         except Exception as exc:
+            if docker_platform:
+                return _platform_fallback(f"pull failed: {exc}")
             if tmpdir and os.path.exists(tmpdir):
                 import shutil
                 shutil.rmtree(tmpdir, ignore_errors=True)
@@ -3937,11 +3958,37 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
             container.start()
         else:
             container = client.containers.run(**run_kwargs)
-    except Exception:
+    except Exception as exc:
+        if docker_platform:
+            return _platform_fallback(f"container create/start failed: {exc}")
         if tmpdir and os.path.exists(tmpdir):
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
         raise
+
+    if docker_platform:
+        # A host with no emulation handler starts the container fine and its
+        # entrypoint dies instantly with an exec-format error — docker raises
+        # nothing, and without this check the failure surfaces later as an
+        # opaque invoke timeout. An immediate exit while pinned means the host
+        # cannot run the declared platform: fall back to the host's.
+        time.sleep(0.25)
+        try:
+            container.reload()
+            died = container.status == "exited"
+        except Exception:
+            died = False
+        if died:
+            try:
+                tail = container.logs(tail=5).decode(errors="replace").strip()
+            except Exception:
+                tail = ""
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
+            return _platform_fallback(
+                f"container exited immediately: {tail or 'no output'}")
 
     return container, tmpdir
 

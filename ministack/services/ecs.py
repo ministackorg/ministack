@@ -1508,7 +1508,56 @@ def _run_task(data):
                 )
 
                 try:
-                    container = docker_client.containers.run(cdef["image"], **run_kwargs)
+                    try:
+                        container = docker_client.containers.run(cdef["image"], **run_kwargs)
+                    except Exception as exc:
+                        # Best-effort platform pin: a host that cannot run the
+                        # declared runtimePlatform (no emulation handler, or a
+                        # cached image of the other architecture) logs the
+                        # mismatch and runs on its own architecture, as every
+                        # setup did before the pin existed.
+                        pinned = run_kwargs.pop("platform", None)
+                        if not pinned:
+                            raise
+                        logger.warning(
+                            "ECS: task definition declares %s but this host cannot "
+                            "run it (%s); running %s on the host architecture "
+                            "instead. Install a binfmt/qemu handler for real "
+                            "cross-architecture execution.",
+                            pinned, exc, cdef.get("image"))
+                        container = docker_client.containers.run(cdef["image"], **run_kwargs)
+                    pinned = run_kwargs.get("platform")
+                    if pinned:
+                        # No emulation handler makes the container start cleanly
+                        # and die on its first instruction — docker raises
+                        # nothing. Only an exec-format death triggers the
+                        # fallback: an instant exit for any other reason is the
+                        # task's own business.
+                        time.sleep(0.25)
+                        exec_dead = False
+                        try:
+                            container.reload()
+                            exec_dead = (container.status == "exited"
+                                         and b"exec format error"
+                                         in (container.logs(tail=5) or b""))
+                        except Exception:
+                            # The death-check is best-effort; if it cannot even
+                            # be performed, keep the container that started.
+                            exec_dead = False
+                        if exec_dead:
+                            logger.warning(
+                                "ECS: task definition declares %s but this host "
+                                "cannot execute it; running %s on the host "
+                                "architecture instead. Install a binfmt/qemu "
+                                "handler for real cross-architecture execution.",
+                                pinned, cdef.get("image"))
+                            try:
+                                container.remove(force=True)
+                            except Exception:
+                                pass
+                            run_kwargs.pop("platform", None)
+                            container = docker_client.containers.run(
+                                cdef["image"], **run_kwargs)
                     task["_docker_ids"].append(container.id)
                     ecs_metadata.set_docker_id(metadata_token, container.id)
                     task.setdefault("_metadata_tokens", []).append(metadata_token)
