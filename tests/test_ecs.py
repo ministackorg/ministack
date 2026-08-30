@@ -1796,3 +1796,40 @@ def test_ecs_service_reconcile_spares_foreign_targets(monkeypatch):
 
     _ecs._delete_service({"cluster": "lb-shared-c", "service": "lb-shared-svc", "force": True})
     assert _alb._targets.get(tg_arn) == [{"Id": "10.9.9.9", "Port": 80}]
+@pytest.mark.parametrize(
+    "cpu_architecture,expected_platform",
+    [
+        ("ARM64", "linux/arm64"),
+        ("X86_64", "linux/amd64"),
+        (None, None),
+    ],
+)
+def test_ecs_task_runs_on_its_declared_runtime_platform(cpu_architecture, expected_platform):
+    """A task definition's runtimePlatform decides the container's platform.
+
+    It was stored and never read, so Docker chose the host's architecture. An
+    ARM64 task definition on an x86_64 host then started a container that could
+    not execute its own entrypoint — and the task still reported as started,
+    because creating the container is the part that succeeds.
+
+    An absent runtimePlatform must stay absent rather than defaulting to the
+    host explicitly, so existing single-architecture setups are untouched.
+    """
+    td = {"networkMode": "bridge"}
+    if cpu_architecture:
+        td["runtimePlatform"] = {"cpuArchitecture": cpu_architecture}
+
+    kwargs = ecs_service._build_run_kwargs(
+        {"name": "app", "image": "busybox:latest"},
+        td,
+        {},                      # env
+        {},                      # port_bindings
+        None,                    # ecs_network
+        False,                   # host_mode
+        "task1234",              # task_id
+        "arn:aws:ecs:us-east-1:000000000000:task/c/task1234",
+        None,                    # ministack_net_ip
+        "arn:aws:ecs:us-east-1:000000000000:cluster/c",
+    )
+
+    assert kwargs.get("platform") == expected_platform

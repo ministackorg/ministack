@@ -3828,6 +3828,17 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
     if LAMBDA_DOCKER_NETWORK:
         run_kwargs["network"] = LAMBDA_DOCKER_NETWORK
 
+    # AWS runs a function on the architecture it declares. Docker otherwise
+    # picks the host's, so an arm64 function on an x86_64 host quietly ran as
+    # x86_64 — fine until a layer carries a native wheel, at which point the
+    # handler dies at import naming the library rather than the mismatch
+    # ("no pq wrapper available" from psycopg, for instance). Set it before the
+    # flags merge so an explicit --platform in LAMBDA_DOCKER_FLAGS still wins.
+    declared_arch = (config.get("Architectures") or ["x86_64"])[0]
+    docker_arch = "arm64" if declared_arch == "arm64" else "amd64"
+    docker_platform = f"linux/{docker_arch}"
+    run_kwargs["platform"] = docker_platform
+
     # Apply LAMBDA_DOCKER_FLAGS — merge parsed kwargs into run_kwargs
     if LAMBDA_DOCKER_FLAGS:
         df_kwargs = _parse_docker_flags(LAMBDA_DOCKER_FLAGS)
@@ -3854,11 +3865,16 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
 
     # Pull the image on first use (both Zip RIE images and user Image types)
     try:
-        client.images.get(image)
+        local_image = client.images.get(image)
+        # A cached image of the wrong architecture is as unusable as no image:
+        # docker refuses to start it, and without this check the refusal arrives
+        # as an opaque run error rather than a pull.
+        if local_image.attrs.get("Architecture") not in (None, docker_arch):
+            raise docker_lib.errors.ImageNotFound("cached image is the wrong architecture")
     except docker_lib.errors.ImageNotFound:
-        logger.info("Pulling Lambda image: %s", image)
+        logger.info("Pulling Lambda image: %s (%s)", image, docker_platform)
         try:
-            client.images.pull(image)
+            client.images.pull(image, platform=docker_platform)
         except Exception as exc:
             if tmpdir and os.path.exists(tmpdir):
                 import shutil

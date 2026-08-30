@@ -1249,6 +1249,19 @@ def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
     cap_add = caps.get("Add") or caps.get("add") or []
     binds = _docker_binds_from_taskdef(td, cdef)
 
+    # A task definition's runtimePlatform says which architecture its image is
+    # built for, and AWS launches it on that. Docker otherwise picks the host's,
+    # so an ARM64 task definition on an x86_64 host produced a container that
+    # could not execute its own entrypoint — and the task still reported as
+    # started, because creating the container is what succeeds.
+    rp = td.get("runtimePlatform") or {}
+    cpu_arch = (rp.get("cpuArchitecture") or rp.get("CpuArchitecture") or "").upper()
+    docker_platform = (
+        "linux/arm64" if cpu_arch == "ARM64"
+        else "linux/amd64" if cpu_arch == "X86_64"
+        else None
+    )
+
     kwargs = dict(
         detach=True,
         environment=env,
@@ -1279,6 +1292,12 @@ def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
             # Docker-Desktop fallback: when we couldn't discover Ministack's
             # IP on the shared network, route via host.docker.internal.
             kwargs["extra_hosts"] = {"host.docker.internal": "host-gateway"}
+
+    # Only when the task definition asked for one. An absent runtimePlatform
+    # means no preference was expressed, and the host default is then correct.
+    if docker_platform:
+        kwargs["platform"] = docker_platform
+
     return kwargs
 
 

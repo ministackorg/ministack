@@ -10735,3 +10735,47 @@ def test_lambda_event_source_mapping_response_carries_its_arn(lam, sqs):
     assert lam.list_tags(Resource=created["EventSourceMappingArn"])["Tags"] == {
         "Team": "billing"
     }
+@pytest.mark.skipif(
+    os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
+    reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
+)
+@pytest.mark.parametrize(
+    "declared,expected_machine",
+    [("arm64", "aarch64"), ("x86_64", "x86_64")],
+)
+def test_lambda_runs_on_the_architecture_it_declares(lam, declared, expected_machine):
+    """A function runs as the architecture it declares, not as the host's.
+
+    The container was created without a platform, so Docker used the host's
+    architecture whatever the function said. That is invisible until a layer
+    carries a native wheel: an arm64 layer in an x86_64 container fails at
+    import, naming the library rather than the mismatch.
+
+    The handler reports what it is actually running on, which is the only thing
+    that distinguishes the fix from the bug on a host of either architecture.
+    """
+    fname = f"lam-arch-{declared}-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        "import platform\n"
+        "def handler(event, context):\n"
+        "    return {'machine': platform.machine()}\n"
+    )
+
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+        Architectures=[declared],
+    )
+
+    try:
+        resp = lam.invoke(FunctionName=fname, Payload=json.dumps({}))
+        payload = json.loads(resp["Payload"].read())
+        if resp.get("FunctionError") and "exec format" in str(payload).lower():
+            pytest.skip(f"host cannot run linux/{declared} — no binfmt handler registered")
+        assert resp.get("FunctionError") is None, payload
+        assert payload.get("machine") == expected_machine, payload
+    finally:
+        lam.delete_function(FunctionName=fname)
