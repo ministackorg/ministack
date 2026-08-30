@@ -2,7 +2,8 @@
 Amazon Aurora DSQL Emulator (control plane + data plane wiring).
 
 REST-JSON API (no X-Amz-Target; routed on method + path). Covers cluster
-lifecycle, tags, and cluster policies.
+lifecycle, tags, cluster policies, and CDC streams (metadata only — no change
+records are delivered to the Kinesis target).
 
 Data plane: with ``DSQL_STRICT=1`` and a Docker daemon available, each
 cluster gets a real Postgres container (RDS idiom, capped by a fixed port
@@ -13,6 +14,7 @@ the cluster goes ACTIVE metadata-only — nothing listens on its port.
 
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -46,7 +48,9 @@ DSQL_STRICT = os.environ.get("DSQL_STRICT", "0").lower() in ("1", "true", "yes")
 
 _clusters = AccountScopedDict()  # identifier -> cluster dict
 _client_tokens = AccountScopedDict()  # clientToken -> identifier (create idempotency)
-_tags = AccountScopedDict()  # cluster arn -> {key: value}
+_tags = AccountScopedDict()  # cluster/stream arn -> {key: value}
+_streams = AccountScopedDict()  # "{clusterId}/{streamId}" -> stream dict
+_stream_tokens = AccountScopedDict()  # clientToken -> stream key (create idempotency)
 
 _port_counter = [BASE_PORT]
 _port_lock = threading.Lock()
@@ -583,6 +587,10 @@ def _delete_cluster(identifier, query_params):
     cluster["status"] = "DELETING"
     resp = _lifecycle_response(cluster)
     _tags.pop(cluster["arn"], None)
+    for key, stream in list(_streams.items()):
+        if stream["clusterIdentifier"] == identifier:
+            _tags.pop(stream["arn"], None)
+            del _streams[key]
     del _clusters[identifier]
     if client_token:
         # Cache the entire response so an idempotent retry succeeds.
@@ -718,13 +726,248 @@ def _delete_cluster_policy(identifier, query_params):
 
 
 # ---------------------------------------------------------------------------
+# CDC streams
+# ---------------------------------------------------------------------------
+
+# A cluster allows 5 CDC streams (AWS cluster quotas). Only the Kinesis target,
+# UNORDERED ordering and the JSON format exist in the API today.
+_MAX_STREAMS_PER_CLUSTER = 5
+_STREAM_ORDERINGS = ("UNORDERED",)
+_STREAM_FORMATS = ("JSON",)
+
+
+def _stream_arn(cluster_identifier, stream_identifier, account_id=None, region=None):
+    cluster = _cluster_arn(cluster_identifier, account_id, region)
+    return f"{cluster}/stream/{stream_identifier}"
+
+
+def _stream_key(cluster_identifier, stream_identifier):
+    return f"{cluster_identifier}/{stream_identifier}"
+
+
+def _stream_not_found(cluster_identifier, stream_identifier):
+    return _not_found(
+        _stream_key(cluster_identifier, stream_identifier), resource_type="stream"
+    )
+
+
+def _stream_summary(stream):
+    """The five members ListStreams and DeleteStream report."""
+    return {
+        "clusterIdentifier": stream["clusterIdentifier"],
+        "streamIdentifier": stream["streamIdentifier"],
+        "arn": stream["arn"],
+        "status": stream["status"],
+        "creationTime": stream["creationTime"],
+    }
+
+
+def _stream_response(stream, include_target=False):
+    resp = _stream_summary(stream)
+    resp["ordering"] = stream["ordering"]
+    resp["format"] = stream["format"]
+    if include_target:
+        resp["targetDefinition"] = stream["targetDefinition"]
+        if stream.get("statusReason"):
+            resp["statusReason"] = stream["statusReason"]
+        resp["tags"] = _tags.get(stream["arn"], {})
+    return resp
+
+
+def _check_target_definition(target):
+    """ValidationException for a target the API's union shape can't hold."""
+    if not isinstance(target, dict) or len(target) != 1 or "kinesis" not in target:
+        return _validation(
+            "targetDefinition must set exactly one member: kinesis",
+            reason="fieldValidationFailed", field="targetDefinition",
+        )
+    kinesis_target = target["kinesis"]
+    if not isinstance(kinesis_target, dict):
+        return _validation(
+            "targetDefinition.kinesis must be a structure",
+            reason="fieldValidationFailed", field="targetDefinition.kinesis",
+        )
+    for member in ("streamArn", "roleArn"):
+        if not kinesis_target.get(member):
+            return _validation(
+                f"targetDefinition.kinesis.{member} is required",
+                reason="fieldValidationFailed",
+                field=f"targetDefinition.kinesis.{member}",
+            )
+    return None
+
+
+def _target_failure(target):
+    """The failure real DSQL reports through statusReason, or None.
+
+    Delivery is not emulated, so the target is judged once at create time:
+    a role that cannot be assumed (AUTH=true only, as everywhere else) and a
+    Kinesis stream that isn't there are the two cases MiniStack can see.
+    """
+    kinesis_target = target["kinesis"]
+    from ministack.core.iam_evaluator import validate_role_arn
+
+    if validate_role_arn(kinesis_target["roleArn"]):
+        return "ROLE_ACCESS_DENIED"
+    from ministack.services import kinesis
+
+    if kinesis._resolve_stream_by_arn(kinesis_target["streamArn"]) is None:
+        return "KINESIS_STREAM_NOT_FOUND"
+    return None
+
+
+def _create_stream(cluster_identifier, data):
+    cluster = _clusters.get(cluster_identifier)
+    if not cluster:
+        return _not_found(cluster_identifier)
+
+    client_token = data.get("clientToken")
+    if client_token:
+        existing_key = _stream_tokens.get(client_token)
+        if isinstance(existing_key, str) and existing_key in _streams:
+            return json_response(_stream_response(_streams[existing_key]))
+
+    err = _check_target_definition(data.get("targetDefinition"))
+    if err:
+        return err
+    ordering = data.get("ordering")
+    if ordering not in _STREAM_ORDERINGS:
+        return _validation(
+            f"ordering must be one of: {', '.join(_STREAM_ORDERINGS)}",
+            reason="fieldValidationFailed", field="ordering",
+        )
+    fmt = data.get("format")
+    if fmt not in _STREAM_FORMATS:
+        return _validation(
+            f"format must be one of: {', '.join(_STREAM_FORMATS)}",
+            reason="fieldValidationFailed", field="format",
+        )
+
+    existing = [
+        st for st in _streams.values()
+        if st["clusterIdentifier"] == cluster_identifier
+    ]
+    if len(existing) >= _MAX_STREAMS_PER_CLUSTER:
+        return _error(
+            "ServiceQuotaExceededException", "You have reached the stream limit.",
+            402, resourceId=cluster_identifier, resourceType="stream",
+            serviceCode="dsql", quotaCode="StreamsPerCluster",
+        )
+
+    identifier = _new_identifier()
+    arn = _stream_arn(cluster_identifier, identifier)
+    failure = _target_failure(data["targetDefinition"])
+    stream = {
+        "clusterIdentifier": cluster_identifier,
+        "streamIdentifier": identifier,
+        "arn": arn,
+        # Nothing is delivered, so a stream that has a target to deliver to
+        # is ACTIVE straight away rather than going through CREATING.
+        "status": "FAILED" if failure else "ACTIVE",
+        "creationTime": int(time.time()),
+        "ordering": ordering,
+        "format": fmt,
+        "targetDefinition": copy.deepcopy(data["targetDefinition"]),
+    }
+    if failure:
+        stream["statusReason"] = {"error": failure, "updatedAt": stream["creationTime"]}
+
+    _streams[_stream_key(cluster_identifier, identifier)] = stream
+    if client_token:
+        _stream_tokens[client_token] = _stream_key(cluster_identifier, identifier)
+    if data.get("tags"):
+        _tags[arn] = dict(data["tags"])
+
+    return json_response(_stream_response(stream))
+
+
+def _get_stream(cluster_identifier, stream_identifier):
+    if cluster_identifier not in _clusters:
+        return _not_found(cluster_identifier)
+    stream = _streams.get(_stream_key(cluster_identifier, stream_identifier))
+    if not stream:
+        return _stream_not_found(cluster_identifier, stream_identifier)
+    return json_response(_stream_response(stream, include_target=True))
+
+
+def _list_streams(cluster_identifier, query_params):
+    if cluster_identifier not in _clusters:
+        return _not_found(cluster_identifier)
+
+    raw_max = _qp(query_params, "max-results", "maxResults")
+    next_token = _qp(query_params, "next-token", "nextToken")
+    try:
+        max_results = int(raw_max) if raw_max else 100
+    except (TypeError, ValueError):
+        return _validation(
+            f"Invalid maxResults: {raw_max}",
+            reason="fieldValidationFailed", field="maxResults",
+        )
+    if max_results < 1 or max_results > 100:
+        return _validation(
+            "maxResults must be between 1 and 100",
+            reason="fieldValidationFailed", field="maxResults",
+        )
+    start = 0
+    if next_token:
+        try:
+            start = int(next_token)
+            if start < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return _validation(
+                f"Invalid nextToken: {next_token}",
+                reason="fieldValidationFailed", field="nextToken",
+            )
+
+    summaries = [
+        _stream_summary(st) for st in _streams.values()
+        if st["clusterIdentifier"] == cluster_identifier
+    ]
+    resp = {"streams": summaries[start : start + max_results]}
+    if start + max_results < len(summaries):
+        resp["nextToken"] = str(start + max_results)
+    return json_response(resp)
+
+
+def _delete_stream(cluster_identifier, stream_identifier, query_params):
+    if cluster_identifier not in _clusters:
+        return _not_found(cluster_identifier)
+    key = _stream_key(cluster_identifier, stream_identifier)
+    stream = _streams.get(key)
+    if not stream:
+        return _stream_not_found(cluster_identifier, stream_identifier)
+    stream["status"] = "DELETING"
+    resp = json_response(_stream_summary(stream))
+    _tags.pop(stream["arn"], None)
+    del _streams[key]
+    return resp
+
+
+def _get_vpc_endpoint_service_name(identifier):
+    cluster = _clusters.get(identifier)
+    if not cluster:
+        return _not_found(identifier)
+    # The service name's suffix is per-cluster and stable, as on AWS.
+    suffix = hashlib.sha256(identifier.encode()).hexdigest()[:6]
+    return json_response({
+        "serviceName": f"com.amazonaws.{get_region()}.dsql-{suffix}",
+    })
+
+
+# ---------------------------------------------------------------------------
 # Tags
 # ---------------------------------------------------------------------------
 
 
 def _tags_for_arn(arn):
-    """Return tags for a known cluster ARN, or a 404 response."""
+    """Return tags for a known cluster or stream ARN, or a 404 response."""
     identifier = _identifier_from_arn(arn)
+    if "/stream/" in identifier:
+        cluster_identifier, _, stream_identifier = identifier.partition("/stream/")
+        if _stream_key(cluster_identifier, stream_identifier) not in _streams:
+            return None, _not_found(arn, resource_type="stream")
+        return _tags.get(arn, {}), None
     if not identifier or identifier not in _clusters:
         return None, _not_found(arn, resource_type="cluster")
     return _tags.get(arn, {}), None
@@ -790,6 +1033,38 @@ def _handle_request_sync(method, path, headers, body, query_params):
                 return _list_tags_for_resource(arn)
             return _validation(f"Unknown method for /tags: {method}", reason="unknownOperation")
 
+        if path.startswith("/stream/"):
+            parts = path[len("/stream/") :].split("/")
+            if len(parts) == 1 and parts[0]:
+                if method == "POST":
+                    return _create_stream(parts[0], data)
+                if method == "GET":
+                    return _list_streams(parts[0], query_params)
+                return _validation(
+                    f"Unknown method for /stream/{{id}}: {method}",
+                    reason="unknownOperation",
+                )
+            if len(parts) == 2 and all(parts):
+                if method == "GET":
+                    return _get_stream(parts[0], parts[1])
+                if method == "DELETE":
+                    return _delete_stream(parts[0], parts[1], query_params)
+                return _validation(
+                    f"Unknown method for /stream/{{id}}/{{streamId}}: {method}",
+                    reason="unknownOperation",
+                )
+            return _validation(f"Unknown path: {method} {path}", reason="unknownOperation")
+
+        if path.startswith("/clusters/") and path.endswith(
+            "/vpc-endpoint-service-name"
+        ):
+            identifier = path[len("/clusters/") : -len("/vpc-endpoint-service-name")]
+            if method == "GET":
+                return _get_vpc_endpoint_service_name(identifier)
+            return _validation(
+                f"Unknown method for {path}: {method}", reason="unknownOperation"
+            )
+
         if path == "/cluster":
             if method == "POST":
                 return _create_cluster(data)
@@ -843,6 +1118,8 @@ def get_state():
         "clusters": clusters,
         "client_tokens": copy.deepcopy(dict(_client_tokens._data)),
         "tags": copy.deepcopy(dict(_tags._data)),
+        "streams": copy.deepcopy(dict(_streams._data)),
+        "stream_tokens": copy.deepcopy(dict(_stream_tokens._data)),
         "port_counter": _port_counter[0],
     }
 
@@ -859,6 +1136,12 @@ def restore_state(data):
     tags = data.get("tags", {})
     if tags:
         _tags._data.update(tags)
+    streams = data.get("streams", {})
+    if streams:
+        _streams._data.update(streams)
+    stream_tokens = data.get("stream_tokens", {})
+    if stream_tokens:
+        _stream_tokens._data.update(stream_tokens)
     saved_counter = data.get("port_counter")
     if isinstance(saved_counter, int) and saved_counter > _port_counter[0]:
         _port_counter[0] = saved_counter
@@ -924,6 +1207,8 @@ def reset():
     _clusters.clear()
     _client_tokens.clear()
     _tags.clear()
+    _streams.clear()
+    _stream_tokens.clear()
     _port_counter[0] = BASE_PORT
 
 

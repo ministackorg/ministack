@@ -413,6 +413,198 @@ class TestClusterPolicy:
             _cleanup(dsql, identifier)
 
 
+
+
+class TestStreams:
+    """CDC streams (GA 2026-07-08): metadata only — nothing is delivered."""
+
+    ROLE_ARN = "arn:aws:iam::000000000000:role/dsql-cdc"
+
+    def _target(self, kin, name):
+        try:
+            kin.create_stream(StreamName=name, ShardCount=1)
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ResourceInUseException":
+                raise
+        arn = kin.describe_stream(StreamName=name)["StreamDescription"]["StreamARN"]
+        return {"kinesis": {"streamArn": arn, "roleArn": self.ROLE_ARN}}
+
+    def test_stream_lifecycle(self, dsql, kin):
+        identifier = _create(dsql)
+        try:
+            target = self._target(kin, "dsql-cdc-life")
+            created = dsql.create_stream(
+                clusterIdentifier=identifier,
+                targetDefinition=target,
+                ordering="UNORDERED",
+                format="JSON",
+                tags={"env": "test"},
+            )
+            stream_id = created["streamIdentifier"]
+            assert ID_RE.match(stream_id)
+            assert created["status"] == "ACTIVE"
+            assert created["arn"] == (
+                f"arn:aws:dsql:us-east-1:000000000000:cluster/{identifier}"
+                f"/stream/{stream_id}"
+            )
+
+            got = dsql.get_stream(
+                clusterIdentifier=identifier, streamIdentifier=stream_id
+            )
+            assert got["targetDefinition"] == target
+            assert got["ordering"] == "UNORDERED"
+            assert got["format"] == "JSON"
+            assert got["tags"] == {"env": "test"}
+            assert "statusReason" not in got
+
+            listed = dsql.list_streams(clusterIdentifier=identifier)["streams"]
+            assert [st["streamIdentifier"] for st in listed] == [stream_id]
+
+            deleted = dsql.delete_stream(
+                clusterIdentifier=identifier, streamIdentifier=stream_id
+            )
+            assert deleted["status"] == "DELETING"
+            with pytest.raises(ClientError) as exc:
+                dsql.get_stream(
+                    clusterIdentifier=identifier, streamIdentifier=stream_id
+                )
+            assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        finally:
+            _cleanup(dsql, identifier)
+
+    def test_stream_tags_and_client_token(self, dsql, kin):
+        identifier = _create(dsql)
+        try:
+            target = self._target(kin, "dsql-cdc-tags")
+            created = dsql.create_stream(
+                clusterIdentifier=identifier,
+                targetDefinition=target,
+                ordering="UNORDERED",
+                format="JSON",
+                clientToken="tok-cdc",
+            )
+            repeat = dsql.create_stream(
+                clusterIdentifier=identifier,
+                targetDefinition=target,
+                ordering="UNORDERED",
+                format="JSON",
+                clientToken="tok-cdc",
+            )
+            assert repeat["streamIdentifier"] == created["streamIdentifier"]
+
+            dsql.tag_resource(resourceArn=created["arn"], tags={"team": "data"})
+            assert dsql.list_tags_for_resource(resourceArn=created["arn"])["tags"] == {
+                "team": "data"
+            }
+            dsql.untag_resource(resourceArn=created["arn"], tagKeys=["team"])
+            assert dsql.list_tags_for_resource(resourceArn=created["arn"])["tags"] == {}
+        finally:
+            _cleanup(dsql, identifier)
+
+    def test_missing_kinesis_target_lands_failed(self, dsql):
+        identifier = _create(dsql)
+        try:
+            created = dsql.create_stream(
+                clusterIdentifier=identifier,
+                targetDefinition={"kinesis": {
+                    "streamArn": "arn:aws:kinesis:us-east-1:000000000000:stream/absent",
+                    "roleArn": self.ROLE_ARN,
+                }},
+                ordering="UNORDERED",
+                format="JSON",
+            )
+            assert created["status"] == "FAILED"
+            got = dsql.get_stream(
+                clusterIdentifier=identifier,
+                streamIdentifier=created["streamIdentifier"],
+            )
+            assert got["statusReason"]["error"] == "KINESIS_STREAM_NOT_FOUND"
+        finally:
+            _cleanup(dsql, identifier)
+
+    def test_stream_limit_per_cluster(self, dsql, kin):
+        identifier = _create(dsql)
+        try:
+            target = self._target(kin, "dsql-cdc-limit")
+            for _ in range(5):
+                dsql.create_stream(
+                    clusterIdentifier=identifier,
+                    targetDefinition=target,
+                    ordering="UNORDERED",
+                    format="JSON",
+                )
+            with pytest.raises(ClientError) as exc:
+                dsql.create_stream(
+                    clusterIdentifier=identifier,
+                    targetDefinition=target,
+                    ordering="UNORDERED",
+                    format="JSON",
+                )
+            assert exc.value.response["Error"]["Code"] == "ServiceQuotaExceededException"
+            assert "stream limit" in exc.value.response["Error"]["Message"]
+        finally:
+            _cleanup(dsql, identifier)
+
+    def test_stream_on_unknown_cluster(self, dsql):
+        unknown = "z" * 26
+        with pytest.raises(ClientError) as exc:
+            dsql.list_streams(clusterIdentifier=unknown)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    def test_deleting_a_cluster_takes_its_streams(self, dsql, kin):
+        identifier = _create(dsql)
+        target = self._target(kin, "dsql-cdc-gone")
+        created = dsql.create_stream(
+            clusterIdentifier=identifier,
+            targetDefinition=target,
+            ordering="UNORDERED",
+            format="JSON",
+        )
+        _cleanup(dsql, identifier)
+        with pytest.raises(ClientError) as exc:
+            dsql.get_stream(
+                clusterIdentifier=identifier,
+                streamIdentifier=created["streamIdentifier"],
+            )
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    def test_stream_active_waiter(self, dsql, kin):
+        identifier = _create(dsql)
+        try:
+            target = self._target(kin, "dsql-cdc-waiter")
+            created = dsql.create_stream(
+                clusterIdentifier=identifier,
+                targetDefinition=target,
+                ordering="UNORDERED",
+                format="JSON",
+            )
+            dsql.get_waiter("stream_active").wait(
+                clusterIdentifier=identifier,
+                streamIdentifier=created["streamIdentifier"],
+                WaiterConfig={"Delay": 1, "MaxAttempts": 3},
+            )
+        finally:
+            _cleanup(dsql, identifier)
+
+
+class TestVpcEndpointServiceName:
+    def test_service_name_is_stable_per_cluster(self, dsql):
+        identifier = _create(dsql)
+        try:
+            first = dsql.get_vpc_endpoint_service_name(identifier=identifier)
+            assert re.match(
+                r"^com\.amazonaws\.us-east-1\.dsql-[a-f0-9]{6}$", first["serviceName"]
+            )
+            second = dsql.get_vpc_endpoint_service_name(identifier=identifier)
+            assert second["serviceName"] == first["serviceName"]
+        finally:
+            _cleanup(dsql, identifier)
+
+    def test_unknown_cluster(self, dsql):
+        with pytest.raises(ClientError) as exc:
+            dsql.get_vpc_endpoint_service_name(identifier="z" * 26)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
 class TestBotoParity:
     """Waiters, paginators, and structured error members (botocore model)."""
 
