@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
@@ -58,7 +59,10 @@ _caches = AccountRegionScopedDict()           # apiId -> ApiCache record
 # apiId -> {cache key -> (expires_at, value)}. Separate from _caches, which holds
 # the ApiCache configuration; this is the cached data itself. Not persisted: a
 # restart is a cold cache, as replacing the cache instance would be on AWS.
+# Read and written from the worker threads resolver execution runs on, so every
+# access takes the lock — the expiry check-then-pop is not atomic without it.
 _cache_entries: dict = {}
+_cache_entries_lock = threading.Lock()
 _tags = AccountScopedDict()            # resource_arn -> {key: value}
 
 # ---------------------------------------------------------------------------
@@ -269,7 +273,8 @@ def _delete_graphql_api(api_id):
     _caches.pop(api_id, None)
     from ministack.core import appsync_graphql
     appsync_graphql.forget_schema(api_id)
-    _cache_entries.pop(api_id, None)
+    with _cache_entries_lock:
+        _cache_entries.pop(api_id, None)
     _tags.pop(arn, None)
 
     return _json(200, {})
@@ -583,23 +588,36 @@ def _get_schema_creation_status(api_id):
 
 
 def _get_introspection_schema(api_id, query_params):
-    """GetIntrospectionSchema — the response body is the schema blob itself."""
+    """GetIntrospectionSchema — the response body is the schema blob itself.
+
+    `format` is a required parameter with two values: SDL serves the stored
+    definition verbatim, JSON serves the introspection query result built from
+    it — the document `aws appsync get-introspection-schema --format JSON`
+    hands to codegen tooling.
+    """
     if api_id not in _apis:
         return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
     schema = _schemas.get(api_id)
     if not schema:
         return error_response_json("GraphQLSchemaException", "No schema found for this API", 404)
 
-    fmt = (query_params.get("format") or ["SDL"])
-    fmt = (fmt[0] if isinstance(fmt, list) else fmt or "SDL").upper()
+    fmt = query_params.get("format")
+    fmt = (fmt[0] if isinstance(fmt, list) else fmt or "").upper()
+    if not fmt:
+        return error_response_json("BadRequestException", "format is required", 400)
     if fmt not in ("SDL", "JSON"):
         return error_response_json("BadRequestException", f"Unsupported format: {fmt}", 400)
+
     if fmt == "JSON":
-        # A JSON introspection result requires a parsed type graph, which is
-        # deliberately not built here; SDL is what tooling against MiniStack uses.
-        return error_response_json(
-            "BadRequestException",
-            "JSON introspection is not supported by MiniStack; request format=SDL.", 400)
+        from graphql.utilities import introspection_from_schema
+
+        from ministack.core import appsync_graphql
+        try:
+            built = appsync_graphql.build_api_schema(api_id, schema["definition"])
+        except appsync_graphql.SchemaUnavailable as exc:
+            return error_response_json("GraphQLSchemaException", str(exc), 400)
+        document = introspection_from_schema(built)
+        return 200, {"Content-Type": "application/json"}, json.dumps(document).encode("utf-8")
 
     return 200, {"Content-Type": "application/octet-stream"}, schema["definition"].encode("utf-8")
 
@@ -651,6 +669,8 @@ def _update_type(api_id, type_name, body):
         return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
     if type_name not in _types.get(api_id, {}):
         return error_response_json("NotFoundException", f"Type {type_name} not found", 404)
+    if not body.get("format"):
+        return error_response_json("BadRequestException", "format is required", 400)
     body = dict(body)
     body.setdefault("name", type_name)
     return _create_type(api_id, body)
@@ -717,6 +737,8 @@ def _create_function(api_id, body):
     name = body.get("name")
     if not name:
         return error_response_json("BadRequestException", "name is required", 400)
+    if not body.get("dataSourceName"):
+        return error_response_json("BadRequestException", "dataSourceName is required", 400)
 
     function_id = new_uuid().replace("-", "")[:26]
     record = _function_record(api_id, function_id, body)
@@ -744,6 +766,10 @@ def _update_function(api_id, function_id, body):
         return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
     if function_id not in _functions.get(api_id, {}):
         return error_response_json("NotFoundException", f"Function {function_id} not found", 404)
+    if not body.get("name"):
+        return error_response_json("BadRequestException", "name is required", 400)
+    if not body.get("dataSourceName"):
+        return error_response_json("BadRequestException", "dataSourceName is required", 400)
     record = _function_record(api_id, function_id, body)
     _functions[api_id][function_id] = record
     return _json(200, {"functionConfiguration": record})
@@ -788,8 +814,46 @@ def _list_tags_for_resource(arn):
     return _json(200, {"tags": tags})
 
 
+# Enum values from the AppSync API reference (CreateApiCache).
+_API_CACHING_BEHAVIORS = ("FULL_REQUEST_CACHING", "PER_RESOLVER_CACHING",
+                          "OPERATION_LEVEL_CACHING")
+_API_CACHE_TYPES = ("T2_SMALL", "T2_MEDIUM", "R4_LARGE", "R4_XLARGE", "R4_2XLARGE",
+                    "R4_4XLARGE", "R4_8XLARGE", "SMALL", "MEDIUM", "LARGE", "XLARGE",
+                    "LARGE_2X", "LARGE_4X", "LARGE_8X", "LARGE_12X")
+_CACHE_HEALTH_METRICS = ("ENABLED", "DISABLED")
+
+
+def _validate_cache_request(data):
+    """ttl, apiCachingBehavior and type are required on create AND update, ttl
+    within 1-3600, enums closed — AWS refuses rather than defaulting. Returns an
+    error response, or None when the request is valid."""
+    for member in ("ttl", "apiCachingBehavior", "type"):
+        if data.get(member) is None:
+            return error_response_json("BadRequestException", f"{member} is required", 400)
+    try:
+        ttl = int(data["ttl"])
+    except (TypeError, ValueError):
+        return error_response_json("BadRequestException", "ttl must be a number", 400)
+    if not 1 <= ttl <= 3600:
+        return error_response_json(
+            "BadRequestException", "ttl must be between 1 and 3600 seconds", 400)
+    if data["apiCachingBehavior"] not in _API_CACHING_BEHAVIORS:
+        return error_response_json(
+            "BadRequestException",
+            f"Unknown apiCachingBehavior: {data['apiCachingBehavior']}", 400)
+    if data["type"] not in _API_CACHE_TYPES:
+        return error_response_json(
+            "BadRequestException", f"Unknown cache type: {data['type']}", 400)
+    if data.get("healthMetricsConfig") is not None \
+            and data["healthMetricsConfig"] not in _CACHE_HEALTH_METRICS:
+        return error_response_json(
+            "BadRequestException",
+            f"Unknown healthMetricsConfig: {data['healthMetricsConfig']}", 400)
+    return None
+
+
 def _cache_record(data, existing=None):
-    """Build an ApiCache from a create or update request.
+    """Build an ApiCache from a validated create or update request.
 
     atRestEncryptionEnabled and transitEncryptionEnabled are set at create time
     and cannot be changed afterwards, so an update carries them forward from the
@@ -797,11 +861,9 @@ def _cache_record(data, existing=None):
     """
     base = existing or {}
     return {
-        "ttl": int(data.get("ttl", base.get("ttl", 0))),
-        "apiCachingBehavior": data.get(
-            "apiCachingBehavior", base.get("apiCachingBehavior", "FULL_REQUEST_CACHING")
-        ),
-        "type": data.get("type", base.get("type", "SMALL")),
+        "ttl": int(data["ttl"]),
+        "apiCachingBehavior": data["apiCachingBehavior"],
+        "type": data["type"],
         "transitEncryptionEnabled": bool(
             base.get("transitEncryptionEnabled",
                      data.get("transitEncryptionEnabled", False))
@@ -810,10 +872,8 @@ def _cache_record(data, existing=None):
             base.get("atRestEncryptionEnabled",
                      data.get("atRestEncryptionEnabled", False))
         ),
-        # No cache is actually kept — AppSync's cache is not observable through
-        # the control plane, and emulating eviction would invent behaviour a
-        # caller cannot verify. The record exists so the resource can be
-        # created, read back and destroyed.
+        "healthMetricsConfig": data.get(
+            "healthMetricsConfig", base.get("healthMetricsConfig", "DISABLED")),
         "status": "AVAILABLE",
     }
 
@@ -824,6 +884,9 @@ def _create_api_cache(api_id, data):
     if _caches.get(api_id) is not None:
         return error_response_json(
             "BadRequestException", f"Cache already exists for API {api_id}", 400)
+    invalid = _validate_cache_request(data)
+    if invalid:
+        return invalid
     record = _cache_record(data)
     _caches[api_id] = record
     return _json(200, {"apiCache": record})
@@ -842,6 +905,9 @@ def _update_api_cache(api_id, data):
     if existing is None:
         return error_response_json(
             "NotFoundException", f"Cache not found for API {api_id}", 404)
+    invalid = _validate_cache_request(data)
+    if invalid:
+        return invalid
     record = _cache_record(data, existing)
     _caches[api_id] = record
     return _json(200, {"apiCache": record})
@@ -852,7 +918,8 @@ def _delete_api_cache(api_id):
         return error_response_json(
             "NotFoundException", f"Cache not found for API {api_id}", 404)
     _caches.pop(api_id, None)
-    _cache_entries.pop(api_id, None)
+    with _cache_entries_lock:
+        _cache_entries.pop(api_id, None)
     return _json(200, {})
 
 
@@ -860,7 +927,8 @@ def _flush_api_cache(api_id):
     if _caches.get(api_id) is None:
         return error_response_json(
             "NotFoundException", f"Cache not found for API {api_id}", 404)
-    _cache_entries.pop(api_id, None)
+    with _cache_entries_lock:
+        _cache_entries.pop(api_id, None)
     return _json(200, {})
 
 
@@ -901,6 +969,11 @@ def _evaluate_code(body):
     except appsync_js.AppSyncJsError as exc:
         return _json(200, {"error": {"message": str(exc),
                                      "codeErrors": []},
+                           "logs": []})
+    except appsync_js.AppSyncJsTimeout as exc:
+        # A stuck evaluation is a result of the code under test, not a fault of
+        # the service — report it in the response's error detail.
+        return _json(200, {"error": {"message": str(exc), "codeErrors": []},
                            "logs": []})
     except RuntimeError as exc:
         return error_response_json("InternalFailureException", str(exc), 500)
@@ -955,7 +1028,9 @@ async def handle_request(method, path, headers, body, query_params):
             return _list_tags_for_resource(arn)
 
     if path == "/v1/dataplane-evaluatecode" and method == "POST":
-        return _evaluate_code(json.loads(body) if body else {})
+        # Evaluation blocks on the Node worker; keep it off the event loop for
+        # the same reason resolver execution runs on a thread.
+        return await asyncio.to_thread(_evaluate_code, json.loads(body) if body else {})
 
     # GraphQL data plane: POST /graphql or POST /v1/apis/{apiId}/graphql
     if path == "/graphql" and method == "POST":
@@ -1155,13 +1230,13 @@ def reset():
     _functions.clear()
     _schemas.clear()
     _caches.clear()
-    _cache_entries.clear()
-    # Drop the JS worker so its compiled-module cache does not outlive a reset.
+    with _cache_entries_lock:
+        _cache_entries.clear()
+    # Drop the JS workers so their compiled-module cache does not outlive a
+    # reset, and the built-schema cache with them.
     from ministack.core import appsync_graphql, appsync_js
     appsync_js.reset()
     appsync_graphql.forget_schema()
-    from ministack.core import appsync_js
-    appsync_js.reset()
     _tags.clear()
 
 
@@ -1375,14 +1450,6 @@ def _unauthorized_response():
     })
 
 
-# Off by default: ministack has no authentication of its own by design, and a
-# suite written against the permissive behaviour would start failing. Set
-# APPSYNC_ENFORCE_AUTH=1 to have an API refuse a caller that satisfies none of
-# its configured providers, the way AWS does — which is what makes an
-# authorization test meaningful.
-_ENFORCE_AUTH = os.environ.get("APPSYNC_ENFORCE_AUTH", "0") not in ("0", "", "false", "False")
-
-
 def _auth_modes(api):
     """Every authentication type the API accepts."""
     modes = {api.get("authenticationType") or "API_KEY"}
@@ -1491,9 +1558,11 @@ def _execute_graphql(api_id, data, request_headers=None):
     if api_id not in _apis:
         return _json(404, {"errors": [{"message": f"API {api_id} not found"}]})
 
-    # Applied before either execution path, so it does not depend on whether the
-    # API has a schema.
-    if _ENFORCE_AUTH and not _request_is_authenticated(
+    # Applied before either execution path, so it does not depend on whether
+    # the API has a schema. AWS refuses a request that satisfies none of the
+    # API's configured auth providers; matching that is what makes an
+    # authorization test against ministack meaningful.
+    if not _request_is_authenticated(
             api_id, _apis.get(api_id, {}), request_headers or {}):
         return _unauthorized_response()
 
@@ -1688,18 +1757,20 @@ def _cache_key_for(api_id, resolver, field_name, args, identity, source):
 
 
 def _cache_get(api_id, key):
-    entry = _cache_entries.get(api_id, {}).get(key)
-    if not entry:
-        return None
-    expires_at, value = entry
-    if expires_at <= time.time():
-        _cache_entries.get(api_id, {}).pop(key, None)
-        return None
-    return copy.deepcopy(value)
+    with _cache_entries_lock:
+        entry = _cache_entries.get(api_id, {}).get(key)
+        if not entry:
+            return None
+        expires_at, value = entry
+        if expires_at <= time.time():
+            _cache_entries.get(api_id, {}).pop(key, None)
+            return None
+        return copy.deepcopy(value)
 
 
 def _cache_put(api_id, key, ttl, value):
-    _cache_entries.setdefault(api_id, {})[key] = (time.time() + ttl, copy.deepcopy(value))
+    with _cache_entries_lock:
+        _cache_entries.setdefault(api_id, {})[key] = (time.time() + ttl, copy.deepcopy(value))
 
 
 def _find_resolver(api_id, type_name, field_name):
@@ -1772,7 +1843,21 @@ def _ds_dynamodb(api_id, data_source, request_obj, ctx):
 
     The non-JS path infers an operation from the field name because it has no
     request object to read; here the resolver said what it wanted, so honour it.
+    Runs in the data source's declared region, as the non-JS path does — the
+    table lives where dynamodbConfig.awsRegion says, not where the request came
+    in.
     """
+    cfg = data_source.get("dynamodbConfig", {})
+    request_region = get_region()
+    data_source_region = cfg.get("awsRegion") or request_region
+    set_request_region(data_source_region)
+    try:
+        return _ds_dynamodb_in_region(api_id, data_source, request_obj, ctx)
+    finally:
+        set_request_region(request_region)
+
+
+def _ds_dynamodb_in_region(api_id, data_source, request_obj, ctx):
     import ministack.services.dynamodb as _ddb
 
     cfg = data_source.get("dynamodbConfig", {})
@@ -1809,16 +1894,34 @@ def _ddb_plain(value):
     if isinstance(value, dict):
         if len(value) == 1:
             (tag, inner), = value.items()
-            if tag in ("S", "N", "BOOL", "B"):
-                return int(inner) if tag == "N" and str(inner).isdigit() else inner
+            if tag in ("S", "BOOL", "B"):
+                return inner
+            if tag == "N":
+                return _ddb_number(inner)
             if tag == "NULL":
                 return None
             if tag == "M":
                 return {k: _ddb_plain(v) for k, v in inner.items()}
             if tag == "L":
                 return [_ddb_plain(v) for v in inner]
+            if tag in ("SS", "BS"):
+                return list(inner or [])
+            if tag == "NS":
+                return [_ddb_number(v) for v in (inner or [])]
         return {k: _ddb_plain(v) for k, v in value.items()}
     return value
+
+
+def _ddb_number(inner):
+    """DynamoDB's N is a string; floats and negatives are numbers too."""
+    text = str(inner)
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        try:
+            return float(text)
+        except (TypeError, ValueError):
+            return inner
 
 
 def _ds_lambda(api_id, data_source, request_obj, ctx):

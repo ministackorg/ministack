@@ -361,6 +361,7 @@ def test_ministack_persist_s3_logging_accelerate_request_payment_roundtrip():
 def test_ministack_persist_lambda_roundtrip():
     import hashlib
     import os
+
     from ministack.services import lambda_svc as _lam
     code = b"fake-zip-bytes"
     sha = hashlib.sha256(code).hexdigest()

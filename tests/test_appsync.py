@@ -60,9 +60,11 @@ def test_appsync_graphql_apis_are_region_scoped():
 
         # Local data-plane URLs do not encode or sign a region. The API ID
         # must select its stored region before resolver execution.
+        west_key = west.create_api_key(apiId=west_api["apiId"])["apiKey"]["id"]
         west_graphql = _appsync_graphql_post(
             f"{_ENDPOINT}/v1/apis/{west_api['apiId']}/graphql",
             "{ __typename }",
+            headers={"x-api-key": west_key},
         )
         assert "errors" not in west_graphql
     finally:
@@ -184,10 +186,13 @@ def test_appsync_graphql_honors_dynamodb_data_source_region():
         dataSourceName="east-table",
     )
 
+    api_key = west_appsync.create_api_key(apiId=api["apiId"])["apiKey"]["id"]
+
     try:
         response = _appsync_graphql_post(
             f"{_ENDPOINT}/v1/apis/{api['apiId']}/graphql",
             'query { getItem(id: "item-1") { id name } }',
+            headers={"x-api-key": api_key},
         )
         assert response["data"]["getItem"] == {
             "id": "item-1",
@@ -443,7 +448,8 @@ def test_appsync_graphql_update_mutation(ddb):
 
     def gql(query):
         req = urllib.request.Request(f"{_ENDPOINT}/v1/apis/{api['apiId']}/graphql",
-            data=_json.dumps({"query": query}).encode(), headers={"Content-Type": "application/json"})
+            data=_json.dumps({"query": query}).encode(),
+            headers={"Content-Type": "application/json", "x-api-key": key["id"]})
         with urllib.request.urlopen(req) as r:
             return _json.loads(r.read())
 
@@ -471,6 +477,7 @@ def test_appsync_graphql_delete_mutation(ddb):
         pass
 
     api = appsync.create_graphql_api(name="gql-del", authenticationType="API_KEY")["graphqlApi"]
+    key = appsync.create_api_key(apiId=api["apiId"])["apiKey"]
     appsync.create_data_source(apiId=api["apiId"], name="ds", type="AMAZON_DYNAMODB",
                                dynamodbConfig={"tableName": "gql-del", "awsRegion": "us-east-1"})
     appsync.create_resolver(apiId=api["apiId"], typeName="Mutation", fieldName="createItem", dataSourceName="ds")
@@ -479,7 +486,8 @@ def test_appsync_graphql_delete_mutation(ddb):
 
     def gql(query):
         req = urllib.request.Request(f"{_ENDPOINT}/v1/apis/{api['apiId']}/graphql",
-            data=_json.dumps({"query": query}).encode(), headers={"Content-Type": "application/json"})
+            data=_json.dumps({"query": query}).encode(),
+            headers={"Content-Type": "application/json", "x-api-key": key["id"]})
         with urllib.request.urlopen(req) as r:
             return _json.loads(r.read())
 
@@ -506,6 +514,7 @@ def test_appsync_graphql_with_variables():
         pass
 
     api = appsync.create_graphql_api(name="gql-vars", authenticationType="API_KEY")["graphqlApi"]
+    key = appsync.create_api_key(apiId=api["apiId"])["apiKey"]
     appsync.create_data_source(apiId=api["apiId"], name="ds", type="AMAZON_DYNAMODB",
                                dynamodbConfig={"tableName": "gql-vars", "awsRegion": "us-east-1"})
     appsync.create_resolver(apiId=api["apiId"], typeName="Mutation", fieldName="createItem", dataSourceName="ds")
@@ -516,7 +525,8 @@ def test_appsync_graphql_with_variables():
         if variables:
             body["variables"] = variables
         req = urllib.request.Request(f"{_ENDPOINT}/v1/apis/{api['apiId']}/graphql",
-            data=_json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            data=_json.dumps(body).encode(),
+            headers={"Content-Type": "application/json", "x-api-key": key["id"]})
         with urllib.request.urlopen(req) as r:
             return _json.loads(r.read())
 
@@ -540,13 +550,14 @@ def test_appsync_graphql_nonexistent_item():
         pass
 
     api = appsync.create_graphql_api(name="gql-404", authenticationType="API_KEY")["graphqlApi"]
+    key = appsync.create_api_key(apiId=api["apiId"])["apiKey"]
     appsync.create_data_source(apiId=api["apiId"], name="ds", type="AMAZON_DYNAMODB",
                                dynamodbConfig={"tableName": "gql-404", "awsRegion": "us-east-1"})
     appsync.create_resolver(apiId=api["apiId"], typeName="Query", fieldName="getItem", dataSourceName="ds")
 
     req = urllib.request.Request(f"{_ENDPOINT}/v1/apis/{api['apiId']}/graphql",
         data=_json.dumps({"query": 'query { getItem(id: "ghost") { id } }'}).encode(),
-        headers={"Content-Type": "application/json"})
+        headers={"Content-Type": "application/json", "x-api-key": key["id"]})
     with urllib.request.urlopen(req) as r:
         resp = _json.loads(r.read())
     assert resp["data"]["getItem"] is None
@@ -1326,12 +1337,6 @@ def _graphql(api_id, api_key, query, variables=None):
     r = _rq.post(f"{_ENDPOINT}/v1/apis/{api_id}/graphql",
                  headers={"x-api-key": api_key, "content-type": "application/json"},
                  json=payload, timeout=15)
-def _graphql(api_id, api_key, query):
-    """POST a query to the API's data plane the way an SDK would."""
-    import requests as _rq
-    r = _rq.post(f"{_ENDPOINT}/v1/apis/{api_id}/graphql",
-                 headers={"x-api-key": api_key, "content-type": "application/json"},
-                 json={"query": query}, timeout=15)
     return r.json()
 
 def _cache_ds_api(appsync, ddb, name):
@@ -1987,12 +1992,6 @@ def test_appsync_js_function_early_return_continues_the_pipeline(appsync):
     function request handler (or the pipeline resolver response handler if this
     was the last AWS AppSync function) is called."
 
-def test_appsync_js_function_early_return_continues_the_pipeline(appsync):
-    """earlyReturn in a FUNCTION skips its data source and response — and the
-    pipeline continues to the next function.
-    AWS: "the data source and response handler are skipped, and the next
-    function request handler (or the pipeline resolver response handler if this
-    was the last AWS AppSync function) is called."
     Ending the whole pipeline instead means every later function is silently
     skipped. A real resolver that guards its first function this way then
     returns null with no error, because the function that would have set the
@@ -2032,9 +2031,6 @@ def test_appsync_js_resolver_early_return_still_runs_the_response(appsync):
     """earlyReturn in the pipeline RESOLVER's request skips the functions, and
     the resolver's own response handler still runs.
 
-def test_appsync_js_resolver_early_return_still_runs_the_response(appsync):
-    """earlyReturn in the pipeline RESOLVER's request skips the functions, and
-    the resolver's own response handler still runs.
     AWS: "the pipeline execution is skipped, and the pipeline resolver response
     handler is called immediately."
     """
@@ -2122,9 +2118,6 @@ def test_appsync_js_lambda_datasource_receives_the_payload_verbatim(appsync, lam
     """A JS resolver returning {operation: 'Invoke', payload} sends exactly that
     payload as the Lambda event.
 
-def test_appsync_js_lambda_datasource_receives_the_payload_verbatim(appsync, lam):
-    """A JS resolver returning {operation: 'Invoke', payload} sends exactly that
-    payload as the Lambda event.
     It was being wrapped in the standard resolver event instead, so a function
     expecting its own shape — say {text: [...]} — received
     {arguments: {text: [...]}, info: {...}} and returned something the resolver
@@ -2174,17 +2167,14 @@ def test_appsync_js_lambda_datasource_receives_the_payload_verbatim(appsync, lam
         f"the payload must arrive verbatim, not wrapped in a resolver event: {got}"
 
 
-@pytest.mark.skipif(
-    os.environ.get("APPSYNC_ENFORCE_AUTH", "0") in ("0", "", "false", "False"),
-    reason="enforcement is opt-in; run the server with APPSYNC_ENFORCE_AUTH=1")
 def test_appsync_cognito_api_refuses_an_unauthenticated_request(appsync, cognito_idp):
     """An API whose auth mode is AMAZON_COGNITO_USER_POOLS refuses a caller with
-    no credentials.
+    no credentials, as AWS does — unconditionally, not behind a switch.
 
-    ministack already refuses an unknown API key on this path, so an API that
-    declares Cognito should likewise not serve an anonymous caller — otherwise
-    every authorization test passes locally regardless of what the resolvers do,
-    which is the opposite of useful.
+    Credentials are still not verified (ministack issued them itself); what is
+    refused is a request satisfying none of the API's configured providers,
+    which is the case that made every authorization test pass regardless of
+    what the resolvers did.
     """
     pool = cognito_idp.create_user_pool(PoolName="qa-authmode-pool")["UserPool"]
     api = appsync.create_graphql_api(
@@ -2221,6 +2211,7 @@ def test_appsync_schemaless_api_keeps_lenient_execution(ddb):
     """
     import json
     import urllib.request
+
     from conftest import make_client
 
     appsync = make_client("appsync")
@@ -2266,3 +2257,238 @@ def test_appsync_schemaless_api_keeps_lenient_execution(ddb):
     # before any resolver ran. Schemaless, it must still reach the resolver.
     body = _post('mutation { createUser(input: {id: "u2", nope: 1}) { id } }')
     assert body.get("data", {}).get("createUser", {}).get("id") == "u2", body
+
+
+# ---------------------------------------------------------------------------
+# Fixes on top of the AppSync execution merge: required members validated,
+# ApiCache carries healthMetricsConfig, introspection serves JSON, the JS
+# worker is bounded, DynamoDB requests decode and scope correctly, and CFN
+# releases every child store.
+# ---------------------------------------------------------------------------
+
+
+def test_appsync_ddb_plain_decodes_numbers_and_sets():
+    """AttributeValue N is a string that may be a float or negative, and the
+    set types are sets — none of them survive a digits-only int() decode."""
+    from ministack.services.appsync import _ddb_plain
+
+    assert _ddb_plain({"N": "42"}) == 42
+    assert _ddb_plain({"N": "-2"}) == -2
+    assert _ddb_plain({"N": "3.5"}) == 3.5
+    assert _ddb_plain({"N": "-0.25"}) == -0.25
+    assert _ddb_plain({"SS": ["a", "b"]}) == ["a", "b"]
+    assert _ddb_plain({"NS": ["1", "-2", "3.5"]}) == [1, -2, 3.5]
+    assert _ddb_plain({"BS": ["AQ==", "Ag=="]}) == ["AQ==", "Ag=="]
+    assert _ddb_plain({"M": {"n": {"N": "-7"}, "s": {"SS": ["x"]}}}) == {"n": -7, "s": ["x"]}
+    assert _ddb_plain({"L": [{"N": "1.5"}, {"NULL": True}]}) == [1.5, None]
+
+
+def test_appsync_api_cache_validates_required_members():
+    """CreateApiCache requires ttl (1-3600), apiCachingBehavior and type; AWS
+    refuses a missing or out-of-range member rather than defaulting it.
+
+    Driven through the handlers directly: boto3 enforces required members
+    client-side, so the wire-level refusal is unreachable through it.
+    """
+    import json as _json_mod
+
+    from ministack.services import appsync as _appsync
+
+    resp = _appsync._create_graphql_api({"name": "cache-validate", "authenticationType": "API_KEY"})
+    api_id = _json_mod.loads(resp[2])["graphqlApi"]["apiId"]
+
+    valid = {"ttl": 60, "apiCachingBehavior": "FULL_REQUEST_CACHING", "type": "SMALL"}
+    for member in ("ttl", "apiCachingBehavior", "type"):
+        body = {k: v for k, v in valid.items() if k != member}
+        status, _hdrs, payload = _appsync._create_api_cache(api_id, body)
+        assert status == 400, f"missing {member} must be refused, got {status}"
+        assert _json_mod.loads(payload)["__type"].endswith("BadRequestException")
+
+    for bad_ttl in (0, 3601):
+        status, _hdrs, payload = _appsync._create_api_cache(api_id, {**valid, "ttl": bad_ttl})
+        assert status == 400, f"ttl={bad_ttl} must be refused"
+
+    status, _hdrs, payload = _appsync._create_api_cache(api_id, {**valid, "apiCachingBehavior": "SOMETIMES"})
+    assert status == 400
+
+    # A valid create reports healthMetricsConfig, defaulted DISABLED when unset.
+    status, _hdrs, payload = _appsync._create_api_cache(api_id, valid)
+    assert status == 200
+    record = _json_mod.loads(payload)["apiCache"]
+    assert record["healthMetricsConfig"] == "DISABLED"
+
+    # An update must re-supply the required members too, and carries
+    # healthMetricsConfig forward when not restated.
+    status, _hdrs, payload = _appsync._update_api_cache(api_id, {"ttl": 120})
+    assert status == 400
+    status, _hdrs, payload = _appsync._update_api_cache(
+        api_id, {**valid, "ttl": 120, "healthMetricsConfig": "ENABLED"})
+    assert _json_mod.loads(payload)["apiCache"]["healthMetricsConfig"] == "ENABLED"
+    status, _hdrs, payload = _appsync._update_api_cache(api_id, {**valid, "ttl": 180})
+    assert _json_mod.loads(payload)["apiCache"]["healthMetricsConfig"] == "ENABLED"
+
+    _appsync._delete_graphql_api(api_id)
+
+
+def test_appsync_function_requires_data_source_name():
+    """CreateFunction and UpdateFunction refuse a missing dataSourceName, which
+    the API declares required, instead of storing an empty string."""
+    import json as _json_mod
+
+    from ministack.services import appsync as _appsync
+
+    resp = _appsync._create_graphql_api({"name": "fn-validate", "authenticationType": "API_KEY"})
+    api_id = _json_mod.loads(resp[2])["graphqlApi"]["apiId"]
+
+    status, _hdrs, payload = _appsync._create_function(api_id, {"name": "orphan"})
+    assert status == 400
+    assert _json_mod.loads(payload)["__type"].endswith("BadRequestException")
+
+    _appsync._create_data_source(api_id, {"name": "DS", "type": "NONE"})
+    resp = _appsync._create_function(api_id, {"name": "fn", "dataSourceName": "DS"})
+    fn_id = _json_mod.loads(resp[2])["functionConfiguration"]["functionId"]
+
+    status, _hdrs, _payload = _appsync._update_function(api_id, fn_id, {"name": "fn"})
+    assert status == 400, "UpdateFunction without dataSourceName must be refused"
+
+    _appsync._delete_graphql_api(api_id)
+
+
+def test_appsync_introspection_schema_json_is_a_real_document(appsync):
+    """format=JSON answers the introspection query result, not SDL and not a
+    400 — it is what `aws appsync get-introspection-schema --format JSON`
+    writes for codegen tooling."""
+    api = appsync.create_graphql_api(name="introspect-json", authenticationType="API_KEY")["graphqlApi"]
+    try:
+        appsync.start_schema_creation(
+            apiId=api["apiId"],
+            definition=b"type Query { hello: String }\nschema { query: Query }\n")
+
+        blob = appsync.get_introspection_schema(apiId=api["apiId"], format="JSON")["schema"].read()
+        document = json.loads(blob)
+        assert "__schema" in document
+        type_names = {t["name"] for t in document["__schema"]["types"]}
+        assert "Query" in type_names
+
+        sdl = appsync.get_introspection_schema(apiId=api["apiId"], format="SDL")["schema"].read()
+        assert b"type Query" in sdl
+    finally:
+        appsync.delete_graphql_api(apiId=api["apiId"])
+
+
+def test_appsync_js_worker_timeout_kills_and_recovers():
+    """An infinite loop in a resolver must not wedge evaluation for the whole
+    service: the evaluation is bounded, the stuck process is killed, and the
+    next evaluation runs on a fresh worker."""
+    from ministack.core import appsync_js
+
+    if not appsync_js.available():
+        pytest.skip("node is not available")
+
+    code = "export function request(ctx) { return { payload: ctx.args.x } }"
+    try:
+        with pytest.raises(appsync_js.AppSyncJsTimeout):
+            appsync_js.evaluate(
+                "export function request(ctx) { while (true) {} }",
+                "request", {"args": {}, "stash": {}}, timeout=2)
+
+        status, value, _appended, _stash, _skip = appsync_js.evaluate(
+            code, "request", {"args": {"x": 7}, "stash": {}})
+        assert status == "ok" and value == {"payload": 7}
+    finally:
+        appsync_js.reset()
+
+
+def test_appsync_js_resolver_honors_dynamodb_data_source_region(appsync, ddb):
+    """A JS resolver's DynamoDB data source reads the table in the region the
+    data source declares, not the region the request came in on."""
+    import uuid as _uuid
+
+    east_ddb = ddb  # conftest ddb client is us-east-1
+    west = boto3.client("appsync", endpoint_url=_ENDPOINT, region_name="us-west-2",
+                        aws_access_key_id="test", aws_secret_access_key="test")
+    table = f"js-cross-region-{_uuid.uuid4().hex[:12]}"
+    east_ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    east_ddb.put_item(TableName=table, Item={"id": {"S": "k1"}, "v": {"S": "east"}})
+
+    api = west.create_graphql_api(name="js-cross-region", authenticationType="API_KEY")["graphqlApi"]
+    api_id = api["apiId"]
+    key = west.create_api_key(apiId=api_id)["apiKey"]["id"]
+    west.create_data_source(
+        apiId=api_id, name="EastTable", type="AMAZON_DYNAMODB",
+        dynamodbConfig={"tableName": table, "awsRegion": "us-east-1"},
+    )
+    west.create_resolver(
+        apiId=api_id, typeName="Query", fieldName="getThing", dataSourceName="EastTable",
+        runtime={"name": "APPSYNC_JS", "runtimeVersion": "1.0.0"},
+        code="""
+            export function request(ctx) {
+                return { operation: 'GetItem', key: { id: { S: ctx.args.id } } }
+            }
+            export function response(ctx) { return ctx.result }
+        """,
+    )
+    try:
+        out = _appsync_graphql_post(
+            f"{_ENDPOINT}/v1/apis/{api_id}/graphql",
+            'query { getThing(id: "k1") { id v } }',
+            headers={"x-api-key": key},
+        )
+        assert out["data"]["getThing"] == {"id": "k1", "v": "east"}, out
+    finally:
+        west.delete_graphql_api(apiId=api_id)
+        east_ddb.delete_table(TableName=table)
+
+
+def test_appsync_cfn_api_delete_releases_every_child_store():
+    """The CloudFormation provisioner's delete must release the same stores the
+    service's own DeleteGraphqlApi releases — functions, schema, cache and
+    cache entries included, which a hand-kept pop list silently missed."""
+    import json as _json_mod
+
+    from ministack.services import appsync as _appsync
+    from ministack.services.cloudformation import provisioners as _prov
+
+    resp = _appsync._create_graphql_api({"name": "cfn-cascade", "authenticationType": "API_KEY"})
+    api_id = _json_mod.loads(resp[2])["graphqlApi"]["apiId"]
+    _appsync._start_schema_creation(api_id, {"definition": "type Query { hi: String }"})
+    _appsync._create_data_source(api_id, {"name": "DS", "type": "NONE"})
+    _appsync._create_function(api_id, {"name": "fn", "dataSourceName": "DS"})
+    _appsync._create_api_cache(
+        api_id, {"ttl": 60, "apiCachingBehavior": "FULL_REQUEST_CACHING", "type": "SMALL"})
+    _appsync._cache_put(api_id, "k", 60, {"cached": True})
+
+    _prov._appsync_api_delete(api_id, {})
+
+    for store, label in (
+        (_appsync._apis, "apis"), (_appsync._functions, "functions"),
+        (_appsync._schemas, "schemas"), (_appsync._caches, "caches"),
+        (_appsync._cache_entries, "cache entries"), (_appsync._data_sources, "data sources"),
+    ):
+        assert api_id not in store, f"{label} leaked after the CFN delete"
+
+
+def test_appsync_cfn_schema_lands_in_the_schema_store():
+    """A CFN-provisioned AWS::AppSync::GraphQLSchema must be visible where the
+    data plane and GetIntrospectionSchema read schemas from."""
+    import json as _json_mod
+
+    from ministack.services import appsync as _appsync
+    from ministack.services.cloudformation import provisioners as _prov
+
+    resp = _appsync._create_graphql_api({"name": "cfn-schema", "authenticationType": "API_KEY"})
+    api_id = _json_mod.loads(resp[2])["graphqlApi"]["apiId"]
+
+    _prov._appsync_schema_create(
+        "Schema", {"ApiId": api_id, "Definition": "type Query { hi: String }"}, "stack")
+    assert (_appsync._schemas.get(api_id) or {}).get("definition") == "type Query { hi: String }"
+
+    _prov._appsync_schema_delete(f"{api_id}/schema", {"ApiId": api_id})
+    assert _appsync._schemas.get(api_id) is None
+
+    _appsync._delete_graphql_api(api_id)

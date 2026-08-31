@@ -5,10 +5,14 @@ Evaluating them needs a JavaScript engine, and the image already ships Node for
 the `nodejs*` Lambda runtimes (`Dockerfile`, `core/lambda_runtime.py`), so this
 reuses it rather than adding a dependency.
 
-One long-lived worker handles every evaluation over a JSON-line protocol, the
-same shape `lambda_runtime` uses: a request per line on stdin, a reply per line
-on stdout. Compiled modules are cached in the worker by the hash of their source,
-so a resolver is only compiled once however many times it runs.
+A pool of workers handles evaluations over a JSON-line protocol, the same
+shape `lambda_runtime` uses: a request per line on stdin, a reply per line on
+stdout, one evaluation in flight per worker. A free worker is leased per
+evaluation and one is spawned when none is free — never queued behind, which
+would recreate the re-entrancy deadlock `lambda_runtime` documents. Each
+worker caches compiled modules by the hash of their source, evaluations are
+bounded by a timeout that kills and respawns a stuck process, and resolver
+stderr is surfaced through the service logger.
 
 Fidelity note: Node is more permissive than the real APPSYNC_JS sandbox, which
 forbids `async`/`await`, `try`/`catch` and most globals. A resolver that runs
@@ -26,6 +30,17 @@ import threading
 logger = logging.getLogger("appsync")
 
 _NODE_BINARY = "node"
+# AppSync ends a request after 30 seconds, so no single evaluation may outlive
+# that. An infinite loop cannot be interrupted from inside Node (vm timeouts do
+# not cover async continuations); on expiry the process is killed and respawned.
+_EVAL_TIMEOUT = 30.0
+# Heap ceiling per worker (MB), so a runaway resolver is contained rather than
+# taking the host's memory with it.
+_MAX_OLD_SPACE_MB = 256
+# Evaluations a worker serves before its process is recycled.
+_RECYCLE_AFTER = 1000
+# Idle workers kept warm beyond the first; a burst's surplus is folded on release.
+_MAX_IDLE = 2
 
 # stdout carries the protocol, so anything the resolver logs goes to stderr.
 _WORKER_SCRIPT = r"""
@@ -503,46 +518,91 @@ class AppSyncJsError(Exception):
         self.error_info = error_info
 
 
+class AppSyncJsTimeout(RuntimeError):
+    """An evaluation outlived its deadline; the worker process was killed."""
+
+
 class _Worker:
-    """One Node process, shared by every evaluation."""
+    """One Node process, running one evaluation at a time.
+
+    A worker holds no evaluation-independent state other than its compiled-
+    module cache, so any free worker can serve any resolver. Single-flight per
+    worker matters beyond throughput: the compiled module's mutable holder
+    (``state`` in the worker script) is per-process, so two evaluations of the
+    same resolver in one process would corrupt each other's appended errors.
+    """
 
     def __init__(self):
         self._proc = None
         self._lock = threading.Lock()
+        self.in_use = False
+        self.evals = 0
 
     def _ensure(self):
         if self._proc is not None and self._proc.poll() is None:
             return self._proc
         self._proc = subprocess.Popen(
-            [_NODE_BINARY, "-e", _WORKER_SCRIPT],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            [_NODE_BINARY, f"--max-old-space-size={_MAX_OLD_SPACE_MB}",
+             "-e", _WORKER_SCRIPT],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1,
         )
+        # Resolver console.log lands on stderr (stdout carries the protocol);
+        # surface it through the service logger rather than dropping it.
+        threading.Thread(target=_pump_stderr, args=(self._proc,), daemon=True).start()
         return self._proc
 
-    def evaluate(self, code, fn, ctx):
+    def _take_proc(self):
+        proc, self._proc = self._proc, None
+        return proc
+
+    def evaluate(self, code, fn, ctx, timeout=None):
         """Run `fn` (request/response) from `code` against `ctx`.
 
         Returns (status, value, appended_errors, stash, skip_to) where status is
         "ok", "earlyReturn" or "missing". Raises AppSyncJsError on a resolver
-        error, and RuntimeError when the worker cannot be used at all.
+        error, AppSyncJsTimeout when the evaluation outlives `timeout` (the
+        worker is killed — an infinite loop cannot be interrupted from inside
+        Node — and a fresh process spawns on the next call), and RuntimeError
+        when the worker cannot be used at all.
         """
+        timeout = _EVAL_TIMEOUT if timeout is None else timeout
         payload = json.dumps({"code": code, "fn": fn, "ctx": ctx}) + "\n"
         with self._lock:
+            self.evals += 1
             try:
                 proc = self._ensure()
                 proc.stdin.write(payload)
                 proc.stdin.flush()
-                line = proc.stdout.readline()
-            except (BrokenPipeError, OSError) as exc:
-                self._proc = None
-                raise RuntimeError(f"APPSYNC_JS worker failed: {exc}") from exc
             except FileNotFoundError as exc:  # no node on PATH
                 raise RuntimeError(
                     "APPSYNC_JS resolvers need Node, which was not found") from exc
-        if not line:
-            self._proc = None
-            raise RuntimeError("APPSYNC_JS worker closed unexpectedly")
+            except (BrokenPipeError, OSError) as exc:
+                self._proc = None
+                raise RuntimeError(f"APPSYNC_JS worker failed: {exc}") from exc
+
+            # readline on a thread so a stuck resolver is bounded by `timeout`
+            # rather than holding this worker forever — the same shape
+            # core/lambda_runtime.py uses for a handler that never returns.
+            box = []
+
+            def _read():
+                try:
+                    box.append(proc.stdout.readline())
+                except Exception:
+                    box.append("")
+
+            reader = threading.Thread(target=_read, daemon=True)
+            reader.start()
+            reader.join(timeout)
+            if reader.is_alive():
+                _terminate(self._take_proc())
+                raise AppSyncJsTimeout(
+                    f"APPSYNC_JS evaluation exceeded {int(timeout)} seconds and was cancelled")
+            line = box[0] if box else ""
+            if not line:
+                self._proc = None
+                raise RuntimeError("APPSYNC_JS worker closed unexpectedly")
 
         out = json.loads(line)
         if out["status"] == "error":
@@ -554,24 +614,94 @@ class _Worker:
 
     def shutdown(self):
         with self._lock:
-            if self._proc is not None:
-                try:
-                    self._proc.terminate()
-                except Exception:
-                    pass
-                self._proc = None
+            _terminate(self._take_proc())
 
 
-_worker = _Worker()
+def _pump_stderr(proc):
+    try:
+        for line in proc.stderr:
+            line = line.rstrip("\n")
+            if line:
+                logger.info("[appsync-js] %s", line)
+    except Exception:
+        pass
 
 
-def evaluate(code, fn, ctx):
-    return _worker.evaluate(code, fn, ctx)
+def _terminate(proc):
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Worker pool
+#
+# Lease a free worker or spawn one; never queue behind a busy worker. Waiting
+# would recreate the re-entrancy deadlock core/lambda_runtime.py documents: a
+# resolver whose data source calls back into ministack needs a second worker
+# while its own request still holds the first. Concurrency is already bounded
+# upstream by the asyncio.to_thread pool the data plane runs on, so unbounded
+# spawn here cannot run away.
+# ---------------------------------------------------------------------------
+
+_pool_lock = threading.Lock()
+_pool: list = []
+
+
+def _acquire():
+    with _pool_lock:
+        for worker in _pool:
+            if not worker.in_use:
+                worker.in_use = True
+                return worker
+        worker = _Worker()
+        worker.in_use = True
+        _pool.append(worker)
+        return worker
+
+
+def _release(worker):
+    to_kill = None
+    with _pool_lock:
+        worker.in_use = False
+        if worker.evals >= _RECYCLE_AFTER:
+            # Recycling bounds whatever a long-lived Node process accumulates
+            # (compiled modules, heap fragmentation). The worker stays pooled
+            # and respawns lazily on its next lease.
+            worker.evals = 0
+            to_kill = worker._take_proc()
+        else:
+            idle = [w for w in _pool if not w.in_use]
+            if len(idle) > _MAX_IDLE and worker is not _pool[0]:
+                # A burst leaves surplus processes behind; keep a couple warm
+                # beyond the first and fold the rest.
+                _pool.remove(worker)
+                to_kill = worker._take_proc()
+    _terminate(to_kill)
+
+
+def evaluate(code, fn, ctx, timeout=None):
+    worker = _acquire()
+    try:
+        return worker.evaluate(code, fn, ctx, timeout=timeout)
+    finally:
+        _release(worker)
 
 
 def reset():
-    """Drop the worker, so a reset leaves no compiled-module cache behind."""
-    _worker.shutdown()
+    """Drop every worker, so a reset leaves no compiled-module cache behind."""
+    with _pool_lock:
+        workers, _pool[:] = _pool[:], []
+    for worker in workers:
+        worker.shutdown()
 
 
 def available():
