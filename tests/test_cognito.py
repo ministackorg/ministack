@@ -7902,3 +7902,172 @@ def test_cognito_user_pool_keeps_mfa_and_attribute_update_settings(cognito_idp):
     assert "SoftwareTokenMfaConfiguration" not in cognito_idp.get_user_pool_mfa_config(
         UserPoolId=other
     )
+
+
+def _pool_with_client(cognito_idp, prevent):
+    """A pool plus an app client with a given PreventUserExistenceErrors value."""
+    pid = cognito_idp.create_user_pool(PoolName="ExistencePool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid,
+        ClientName="existence",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_ADMIN_USER_PASSWORD_AUTH",
+                           "ALLOW_USER_SRP_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+        PreventUserExistenceErrors=prevent,
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="known@example.test", MessageAction="SUPPRESS",
+    )
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="known@example.test",
+        Password="Correct1!", Permanent=True,
+    )
+    return pid, cid
+
+
+def test_cognito_prevent_user_existence_errors_masks_initiate_auth(cognito_idp):
+    """An unknown username must be indistinguishable from a wrong password."""
+    _pid, cid = _pool_with_client(cognito_idp, "ENABLED")
+
+    def failure(username):
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.initiate_auth(
+                ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+                AuthParameters={"USERNAME": username, "PASSWORD": "Wrong1!"},
+            )
+        err = exc.value.response["Error"]
+        return err["Code"], err["Message"]
+
+    unknown = failure("unknown@example.test")
+    known = failure("known@example.test")
+
+    assert unknown == known, "the two failures must not be distinguishable"
+    assert unknown[0] == "NotAuthorizedException"
+    # And the message must not name the address that was probed.
+    assert "unknown@example.test" not in unknown[1]
+
+
+def test_cognito_prevent_user_existence_errors_legacy_still_reports(cognito_idp):
+    """LEGACY keeps the distinct error, which is what AWS does."""
+    _pid, cid = _pool_with_client(cognito_idp, "LEGACY")
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.initiate_auth(
+            ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "unknown@example.test", "PASSWORD": "Wrong1!"},
+        )
+    assert exc.value.response["Error"]["Code"] == "UserNotFoundException"
+
+
+def test_cognito_prevent_user_existence_errors_masks_forgot_password(cognito_idp):
+    """ForgotPassword answers as though a code was sent."""
+    _pid, cid = _pool_with_client(cognito_idp, "ENABLED")
+
+    resp = cognito_idp.forgot_password(ClientId=cid, Username="unknown@example.test")
+    delivery = resp["CodeDeliveryDetails"]
+    assert delivery["DeliveryMedium"] == "EMAIL"
+    # The destination is masked, so it cannot be used to confirm the address.
+    assert delivery["Destination"] != "unknown@example.test"
+    assert "***" in delivery["Destination"]
+
+
+def test_cognito_prevent_user_existence_errors_masks_resend_confirmation(cognito_idp):
+    _pid, cid = _pool_with_client(cognito_idp, "ENABLED")
+
+    resp = cognito_idp.resend_confirmation_code(
+        ClientId=cid, Username="unknown@example.test",
+    )
+    assert resp["CodeDeliveryDetails"]["DeliveryMedium"] == "EMAIL"
+
+
+def test_cognito_prevent_user_existence_errors_masks_confirm_forgot_password(cognito_idp):
+    """An unknown username looks like a bad code."""
+    _pid, cid = _pool_with_client(cognito_idp, "ENABLED")
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.confirm_forgot_password(
+            ClientId=cid, Username="unknown@example.test",
+            ConfirmationCode="000000", Password="Another1!",
+        )
+    assert exc.value.response["Error"]["Code"] == "CodeMismatchException"
+
+
+def test_cognito_prevent_user_existence_errors_delivery_details_identical(cognito_idp):
+    """The masked destination must carry no trace of whether the user exists.
+
+    Masking only the unknown-user path would leave the oracle in place: a full
+    address for a real user and a mask for an unknown one is still a yes/no
+    answer. The two usernames below mask to the same string, so an identical
+    response proves the field is a function of the request alone.
+    """
+    _pid, cid = _pool_with_client(cognito_idp, "ENABLED")
+    real = "known@example.test"          # exists
+    unknown = "kevin@elsewhere.test"     # does not — same mask: k***@e***.test
+
+    for call in ("forgot_password", "resend_confirmation_code"):
+        send = getattr(cognito_idp, call)
+        a = send(ClientId=cid, Username=real)["CodeDeliveryDetails"]
+        b = send(ClientId=cid, Username=unknown)["CodeDeliveryDetails"]
+        assert a == b, f"{call} distinguishes the two users: {a} vs {b}"
+        assert a["Destination"] == "k****@e****"
+        assert real not in a["Destination"]
+
+
+def test_cognito_prevent_user_existence_errors_admin_directory_still_reports(cognito_idp):
+    """The setting covers the admin auth flow, not the admin directory reads.
+
+    AWS names ADMIN_USER_PASSWORD_AUTH among the flows it masks, so
+    AdminInitiateAuth must fail the same way for an unknown user as for a wrong
+    password. AdminGetUser is not an auth flow and keeps reporting the truth,
+    which provisioning scripts branch on.
+    """
+    pid, cid = _pool_with_client(cognito_idp, "ENABLED")
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_get_user(UserPoolId=pid, Username="unknown@example.test")
+    assert exc.value.response["Error"]["Code"] == "UserNotFoundException"
+
+    def admin_failure(username):
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.admin_initiate_auth(
+                UserPoolId=pid, ClientId=cid, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+                AuthParameters={"USERNAME": username, "PASSWORD": "Wrong1!"},
+            )
+        err = exc.value.response["Error"]
+        return err["Code"], err["Message"]
+
+    assert admin_failure("unknown@example.test") == admin_failure("known@example.test")
+    assert admin_failure("unknown@example.test")[0] == "NotAuthorizedException"
+
+
+def test_cognito_prevent_user_existence_errors_masks_srp_challenge(cognito_idp):
+    """USER_SRP_AUTH must not leak at RespondToAuthChallenge.
+
+    This is the flow a browser SDK uses. InitiateAuth answers a
+    PASSWORD_VERIFIER challenge without resolving the user at all, so masking
+    InitiateAuth alone would leave the whole browser sign-in leaking one step
+    later, where the password proof is checked.
+    """
+    _pid, cid = _pool_with_client(cognito_idp, "ENABLED")
+
+    def srp_failure(username):
+        started = cognito_idp.initiate_auth(
+            ClientId=cid, AuthFlow="USER_SRP_AUTH",
+            AuthParameters={"USERNAME": username, "SRP_A": "ab" * 32},
+        )
+        assert started["ChallengeName"] == "PASSWORD_VERIFIER"
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.respond_to_auth_challenge(
+                ClientId=cid, ChallengeName="PASSWORD_VERIFIER",
+                Session=started["Session"],
+                ChallengeResponses={
+                    "USERNAME": username,
+                    "PASSWORD_CLAIM_SIGNATURE": "sig",
+                    "PASSWORD_CLAIM_SECRET_BLOCK": "blk",
+                    "TIMESTAMP": "Mon Aug 31 00:00:00 UTC 2026",
+                },
+            )
+        err = exc.value.response["Error"]
+        return err["Code"], err["Message"]
+
+    assert srp_failure("unknown@example.test") == (
+        "NotAuthorizedException", "Incorrect username or password.")
