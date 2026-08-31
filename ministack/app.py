@@ -209,7 +209,10 @@ class _ErrorModule:
         )
 
     def get_state(self):
-        return {}
+        # None, not {}. This module never loaded, so it has no state — and
+        # writing an empty dict here would overwrite whatever the last working
+        # run persisted, losing every resource the service held.
+        return None
 
     def restore_state(self, data):
         pass

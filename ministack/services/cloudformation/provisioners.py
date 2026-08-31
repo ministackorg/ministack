@@ -3722,11 +3722,11 @@ def _appsync_api_create(logical_id, props, stack_name):
 
 
 def _appsync_api_delete(physical_id, props):
-    _appsync._apis.pop(physical_id, None)
-    _appsync._api_keys.pop(physical_id, None)
-    _appsync._data_sources.pop(physical_id, None)
-    _appsync._resolvers.pop(physical_id, None)
-    _appsync._types.pop(physical_id, None)
+    # Route through the service's own delete so every child store the API owns
+    # — functions, schema, cache, cache entries, tags, the built-schema cache —
+    # is released with it; popping a hand-kept list here is how the newer
+    # stores got leaked. A missing API is already the deleted outcome.
+    _appsync._delete_graphql_api(physical_id)
 
 
 def _appsync_ds_create(logical_id, props, stack_name):
@@ -3817,6 +3817,16 @@ def _appsync_schema_create(logical_id, props, stack_name):
     _appsync._types.setdefault(api_id, {})["__schema__"] = {
         "typeName": "__schema__", "definition": definition, "format": "SDL",
     }
+    # The data plane and GetIntrospectionSchema read the schema from _schemas,
+    # not from the "__schema__" type entry — a CFN-provisioned schema has to
+    # land in both or the API behaves as if it had none.
+    from ministack.core import appsync_graphql
+    appsync_graphql.forget_schema(api_id)
+    _appsync._schemas[api_id] = {
+        "definition": definition,
+        "status": "SUCCESS",
+        "details": "Schema creation successful.",
+    }
     return f"{api_id}/schema", {}
 
 
@@ -3825,6 +3835,9 @@ def _appsync_schema_delete(physical_id, props):
     # stored properties are missing the ApiId.
     api_id = props.get("ApiId") or physical_id.rsplit("/", 1)[0]
     _appsync._types.get(api_id, {}).pop("__schema__", None)
+    _appsync._schemas.pop(api_id, None)
+    from ministack.core import appsync_graphql
+    appsync_graphql.forget_schema(api_id)
 
 
 def _appsync_apikey_create(logical_id, props, stack_name):

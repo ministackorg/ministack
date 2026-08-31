@@ -481,6 +481,10 @@ async def handle_request(
     # Principal lives at /things/{name}/principals — must come BEFORE generic /things/{name}
     if path.startswith("/things/") and path.endswith("/principals"):
         return _handle_thing_principals(method, path, hdr, body, qp)
+    # Group membership lives at /things/{name}/thing-groups — like /principals,
+    # must come BEFORE the generic /things/{name} branch.
+    if path.startswith("/things/") and path.endswith("/thing-groups") and method == "GET":
+        return _list_thing_groups_for_thing(path)
     # Job executions live at /things/{name}/jobs[/{jobId}[/cancel]] — like
     # /principals, must come BEFORE the generic /things/{name} branch. The
     # `jobs` segment only counts when a thing name precedes it: `/things/jobs`
@@ -1024,6 +1028,36 @@ def _list_things_in_thing_group(path: str) -> tuple:
     if g is None:
         return _error_not_found("ThingGroup", middle)
     return json_response({"things": list(g.get("things", []))})
+
+
+def _list_thing_groups_for_thing(path: str) -> tuple:
+    """``GET /things/{thingName}/thing-groups``.
+
+    The reverse of ``ListThingsInThingGroup``: the forward lookup existed, but
+    resolving which groups a *thing* belongs to meant scanning every group. The
+    membership store is bidirectional, so this reads the thing record's
+    ``thingGroupNames`` directly.
+
+    ``maxResults`` / ``nextToken`` are not honored — the full list is returned
+    in one page, like the other IoT list operations here.
+    """
+    middle = path[len("/things/"):-len("/thing-groups")]
+    if "/" in middle:
+        return error_response_json(
+            "InvalidRequestException", f"Unsupported IoT path: GET {path}", 400
+        )
+    thing = _things.get(middle)
+    if thing is None:
+        return _error_not_found("Thing", middle)
+    return json_response({
+        "thingGroups": [
+            {"groupName": g, "groupArn": _thing_group_arn(g)}
+            for g in thing.get("thingGroupNames", [])
+            # Membership is kept consistent on both sides, but a group deleted
+            # out from under a stale reference must not surface here.
+            if g in _thing_groups
+        ]
+    })
 
 
 def _update_thing_group(name: str, payload: dict) -> tuple:
