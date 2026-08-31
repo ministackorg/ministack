@@ -10779,3 +10779,32 @@ def test_lambda_runs_on_the_architecture_it_declares(lam, declared, expected_mac
         assert payload.get("machine") == expected_machine, payload
     finally:
         lam.delete_function(FunctionName=fname)
+
+
+def test_lambda_platform_pinned_only_when_architectures_declared(monkeypatch):
+    """The Docker platform is pinned only for an explicitly chosen architecture.
+
+    Every stored config carries Architectures because the x86_64 default is
+    echoed on the wire, so the executor must not read the config alone: pinning
+    the stored default onto functions that never declared one would break arm64
+    hosts without an amd64 binfmt handler, whose functions ran natively before.
+    A record persisted before the marker existed counts as undeclared.
+    """
+    from ministack.services import lambda_svc as _lam
+
+    monkeypatch.setattr(_lam, "_functions", {
+        "declared-arm": {"architectures_declared": True},
+        "declared-x86": {"architectures_declared": True},
+        "undeclared": {"architectures_declared": False},
+        "pre-marker-record": {},
+    })
+
+    assert _lam._declared_docker_platform(
+        {"FunctionName": "declared-arm", "Architectures": ["arm64"]}) == "linux/arm64"
+    assert _lam._declared_docker_platform(
+        {"FunctionName": "declared-x86", "Architectures": ["x86_64"]}) == "linux/amd64"
+    assert _lam._declared_docker_platform(
+        {"FunctionName": "undeclared", "Architectures": ["x86_64"]}) is None
+    assert _lam._declared_docker_platform(
+        {"FunctionName": "pre-marker-record", "Architectures": ["x86_64"]}) is None
+    assert _lam._declared_docker_platform({"FunctionName": "never-created"}) is None

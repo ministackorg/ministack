@@ -44,6 +44,7 @@ from ministack.core.responses import (
     json_response,
     new_uuid,
     now_iso,
+    request_scope,
 )
 from ministack.services import ecs_metadata, secretsmanager
 
@@ -254,12 +255,17 @@ def _reconcile_restored_services():
     Failures are logged and skipped rather than raised, so one unreachable image
     cannot stop the remaining services from coming back.
     """
-    for svc_key, svc in list(_services.items()):
+    # This runs on a daemon thread with no request scope, so plain .items()
+    # would only see the default account and region — a service persisted under
+    # any other tenant would never come back. Walk every stored service and pin
+    # its own account and region around the relaunch.
+    for (account_id, region, svc_key), svc in _services.all_items():
         if not isinstance(svc, dict) or svc.get("status") != "ACTIVE":
             continue
         cluster_name = svc_key.split("/", 1)[0]
         try:
-            _reconcile_service_tasks(cluster_name, svc_key)
+            with request_scope(account_id, region):
+                _reconcile_service_tasks(cluster_name, svc_key)
         except Exception as exc:
             logger.warning(
                 "ECS: could not relaunch service %s after restore: %s",
@@ -1502,7 +1508,56 @@ def _run_task(data):
                 )
 
                 try:
-                    container = docker_client.containers.run(cdef["image"], **run_kwargs)
+                    try:
+                        container = docker_client.containers.run(cdef["image"], **run_kwargs)
+                    except Exception as exc:
+                        # Best-effort platform pin: a host that cannot run the
+                        # declared runtimePlatform (no emulation handler, or a
+                        # cached image of the other architecture) logs the
+                        # mismatch and runs on its own architecture, as every
+                        # setup did before the pin existed.
+                        pinned = run_kwargs.pop("platform", None)
+                        if not pinned:
+                            raise
+                        logger.warning(
+                            "ECS: task definition declares %s but this host cannot "
+                            "run it (%s); running %s on the host architecture "
+                            "instead. Install a binfmt/qemu handler for real "
+                            "cross-architecture execution.",
+                            pinned, exc, cdef.get("image"))
+                        container = docker_client.containers.run(cdef["image"], **run_kwargs)
+                    pinned = run_kwargs.get("platform")
+                    if pinned:
+                        # No emulation handler makes the container start cleanly
+                        # and die on its first instruction — docker raises
+                        # nothing. Only an exec-format death triggers the
+                        # fallback: an instant exit for any other reason is the
+                        # task's own business.
+                        time.sleep(0.25)
+                        exec_dead = False
+                        try:
+                            container.reload()
+                            exec_dead = (container.status == "exited"
+                                         and b"exec format error"
+                                         in (container.logs(tail=5) or b""))
+                        except Exception:
+                            # The death-check is best-effort; if it cannot even
+                            # be performed, keep the container that started.
+                            exec_dead = False
+                        if exec_dead:
+                            logger.warning(
+                                "ECS: task definition declares %s but this host "
+                                "cannot execute it; running %s on the host "
+                                "architecture instead. Install a binfmt/qemu "
+                                "handler for real cross-architecture execution.",
+                                pinned, cdef.get("image"))
+                            try:
+                                container.remove(force=True)
+                            except Exception:
+                                pass
+                            run_kwargs.pop("platform", None)
+                            container = docker_client.containers.run(
+                                cdef["image"], **run_kwargs)
                     task["_docker_ids"].append(container.id)
                     ecs_metadata.set_docker_id(metadata_token, container.id)
                     task.setdefault("_metadata_tokens", []).append(metadata_token)
