@@ -202,7 +202,7 @@ except Exception:
     )
 
 try:
-    import duckdb
+    import duckdb  # noqa: F401 — the import is the availability probe
 
     _duckdb_available = True
 except ImportError:

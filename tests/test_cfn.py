@@ -799,6 +799,213 @@ def test_cfn_iot_provisioning_template_generated_name(cfn, iot_client):
         iot_client.describe_provisioning_template(templateName=name)
 
 
+def test_cfn_iot_ca_certificate_lifecycle(cfn, iot_client):
+    """AWS::IoT::CACertificate provisions onto the real CA registry instead of
+    rolling the stack back: create registers the PEM (readable back through
+    DescribeCACertificate), a status change is applied in place under the same
+    PEM-derived physical id, and delete deactivates first — an ACTIVE CA
+    refuses deletion — before removing the registration."""
+    pytest.importorskip("cryptography")
+    from ministack.core.x509_utils import generate_ca
+
+    ca_pem, _ca_key = generate_ca(common_name="cfn-test-ca")
+
+    def template(status):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {"CA": {"Type": "AWS::IoT::CACertificate", "Properties": {
+                "CACertificatePem": ca_pem,
+                "Status": status,
+                "AutoRegistrationStatus": "ENABLE",
+                "CertificateMode": "SNI_ONLY",
+            }}},
+            "Outputs": {
+                "CaRef": {"Value": {"Ref": "CA"}},
+                "CaArn": {"Value": {"Fn::GetAtt": ["CA", "Arn"]}},
+                "CaId": {"Value": {"Fn::GetAtt": ["CA", "Id"]}},
+            },
+        })
+
+    cfn.create_stack(StackName="cfn-iot-ca", TemplateBody=template("ACTIVE"))
+    stack = _wait_stack(cfn, "cfn-iot-ca")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+    ca_id = outputs["CaId"]
+    assert outputs["CaRef"] == ca_id
+    assert outputs["CaArn"].endswith(":cacert/" + ca_id)
+
+    # Readable back through the CA registry's own API, with every declared
+    # property applied.
+    desc = iot_client.describe_ca_certificate(certificateId=ca_id)[
+        "certificateDescription"]
+    assert desc["certificatePem"] == ca_pem
+    assert desc["status"] == "ACTIVE"
+    assert desc["autoRegistrationStatus"] == "ENABLE"
+    assert desc["certificateMode"] == "SNI_ONLY"
+
+    # A status change is applied in place: same physical id, no replacement.
+    cfn.update_stack(StackName="cfn-iot-ca", TemplateBody=template("INACTIVE"))
+    stack = _wait_stack(cfn, "cfn-iot-ca")
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+    assert outputs["CaId"] == ca_id
+    desc = iot_client.describe_ca_certificate(certificateId=ca_id)[
+        "certificateDescription"]
+    assert desc["status"] == "INACTIVE"
+
+    # Reactivate, then delete the stack: an ACTIVE CA refuses DeleteCACertificate,
+    # so the provisioner must deactivate before deleting.
+    cfn.update_stack(StackName="cfn-iot-ca", TemplateBody=template("ACTIVE"))
+    assert _wait_stack(cfn, "cfn-iot-ca")["StackStatus"] == "UPDATE_COMPLETE"
+
+    cfn.delete_stack(StackName="cfn-iot-ca")
+    _wait_stack(cfn, "cfn-iot-ca")
+    with pytest.raises(ClientError) as ei:
+        iot_client.describe_ca_certificate(certificateId=ca_id)
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_cfn_iot_ca_certificate_existing_registration_fails_the_stack(cfn, iot_client):
+    """A CA already registered out of band answers ResourceAlreadyExists when
+    the stack's create re-registers the PEM (the certificate id is derived
+    from it). Real CloudFormation fails the create on a resource that already
+    exists rather than adopting one the stack never created — and the
+    out-of-band registration survives, untouched by the rollback."""
+    pytest.importorskip("cryptography")
+    from ministack.core.x509_utils import generate_ca
+
+    ca_pem, _ca_key = generate_ca(common_name="cfn-adopt-ca")
+    # Registered out of band: INACTIVE, auto-registration DISABLE.
+    pre_id = iot_client.register_ca_certificate(caCertificate=ca_pem)["certificateId"]
+
+    template = json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {"CA": {"Type": "AWS::IoT::CACertificate", "Properties": {
+            "CACertificatePem": ca_pem,
+            "Status": "ACTIVE",
+            "AutoRegistrationStatus": "ENABLE",
+        }}},
+    })
+    cfn.create_stack(StackName="cfn-iot-ca-exists", TemplateBody=template)
+    stack = _wait_stack(cfn, "cfn-iot-ca-exists")
+    assert stack["StackStatus"] in ("CREATE_FAILED", "ROLLBACK_COMPLETE"), stack["StackStatus"]
+
+    # The out-of-band CA is untouched: still registered, still INACTIVE.
+    desc = iot_client.describe_ca_certificate(certificateId=pre_id)[
+        "certificateDescription"]
+    assert desc["status"] == "INACTIVE"
+    assert desc["autoRegistrationStatus"] == "DISABLE"
+
+    cfn.delete_stack(StackName="cfn-iot-ca-exists")
+    _wait_stack(cfn, "cfn-iot-ca-exists")
+    # And it survives the failed stack's deletion too.
+    assert iot_client.describe_ca_certificate(certificateId=pre_id)
+    iot_client.delete_ca_certificate(certificateId=pre_id)
+
+
+def test_cfn_iot_ca_certificate_registration_config_and_mode_immutability(cfn, iot_client):
+    """RegistrationConfig round-trips through the provisioner into
+    DescribeCACertificate (it is the JITR provisioning config — the property a
+    JITR CA exists for), RemoveAutoRegistration turns auto-registration off on
+    update, and a CertificateMode change is refused the way CloudFormation's
+    update-requires-replacement would replace it."""
+    pytest.importorskip("cryptography")
+    from ministack.core.x509_utils import generate_ca
+
+    ca_pem, _ca_key = generate_ca(common_name="cfn-ca-regcfg")
+
+    def template(mode, remove_auto=False):
+        props = {
+            "CACertificatePem": ca_pem,
+            "Status": "INACTIVE",
+            "AutoRegistrationStatus": "ENABLE",
+            "CertificateMode": mode,
+            "RegistrationConfig": {
+                "RoleArn": "arn:aws:iam::123456789012:role/jitr-role",
+                "TemplateName": "jitr-template",
+            },
+        }
+        if remove_auto:
+            props["RemoveAutoRegistration"] = True
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {"CA": {"Type": "AWS::IoT::CACertificate",
+                                 "Properties": props}},
+            "Outputs": {"CaId": {"Value": {"Fn::GetAtt": ["CA", "Id"]}}},
+        })
+
+    cfn.create_stack(StackName="cfn-iot-ca-regcfg", TemplateBody=template("SNI_ONLY"))
+    stack = _wait_stack(cfn, "cfn-iot-ca-regcfg")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    ca_id = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["CaId"]
+
+    got = iot_client.describe_ca_certificate(certificateId=ca_id)
+    assert got["registrationConfig"] == {
+        "roleArn": "arn:aws:iam::123456789012:role/jitr-role",
+        "templateName": "jitr-template",
+    }
+
+    # RemoveAutoRegistration on an update turns auto-registration off.
+    cfn.update_stack(StackName="cfn-iot-ca-regcfg",
+                     TemplateBody=template("SNI_ONLY", remove_auto=True))
+    assert _wait_stack(cfn, "cfn-iot-ca-regcfg")["StackStatus"] == "UPDATE_COMPLETE"
+    desc = iot_client.describe_ca_certificate(certificateId=ca_id)[
+        "certificateDescription"]
+    assert desc["autoRegistrationStatus"] == "DISABLE"
+
+    # A CertificateMode change cannot be applied in place; the update fails
+    # and rolls back, the stored mode untouched.
+    cfn.update_stack(StackName="cfn-iot-ca-regcfg", TemplateBody=template("DEFAULT"))
+    stack = _wait_stack(cfn, "cfn-iot-ca-regcfg")
+    assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+    desc = iot_client.describe_ca_certificate(certificateId=ca_id)[
+        "certificateDescription"]
+    assert desc["certificateMode"] == "SNI_ONLY"
+
+    cfn.delete_stack(StackName="cfn-iot-ca-regcfg")
+    _wait_stack(cfn, "cfn-iot-ca-regcfg")
+
+
+def test_cfn_iot_ca_certificate_pem_change_refused(cfn, iot_client):
+    """CACertificatePem is the physical identity — the certificate id derives
+    from it — so an update that changes the PEM fails loudly and rolls back
+    instead of silently replacing the CA (which would orphan every device
+    certificate registered under the old one). The original registration
+    survives untouched."""
+    pytest.importorskip("cryptography")
+    from ministack.core.x509_utils import generate_ca
+
+    pem_a, _key_a = generate_ca(common_name="cfn-ca-pem-a")
+    pem_b, _key_b = generate_ca(common_name="cfn-ca-pem-b")
+
+    def template(pem):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {"CA": {"Type": "AWS::IoT::CACertificate", "Properties": {
+                "CACertificatePem": pem,
+                "Status": "INACTIVE",
+            }}},
+            "Outputs": {"CaId": {"Value": {"Fn::GetAtt": ["CA", "Id"]}}},
+        })
+
+    cfn.create_stack(StackName="cfn-iot-ca-pem", TemplateBody=template(pem_a))
+    stack = _wait_stack(cfn, "cfn-iot-ca-pem")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    ca_id = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["CaId"]
+
+    cfn.update_stack(StackName="cfn-iot-ca-pem", TemplateBody=template(pem_b))
+    stack = _wait_stack(cfn, "cfn-iot-ca-pem")
+    assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+
+    desc = iot_client.describe_ca_certificate(certificateId=ca_id)[
+        "certificateDescription"]
+    assert desc["certificatePem"] == pem_a
+
+    cfn.delete_stack(StackName="cfn-iot-ca-pem")
+    _wait_stack(cfn, "cfn-iot-ca-pem")
+
+
 def test_cfn_lambda_layer_version_permission(cfn, lam):
     """AWS::Lambda::LayerVersionPermission attaches a statement to the real
     layer version's policy, readable via GetLayerVersionPolicy. (#1345, item 5)"""

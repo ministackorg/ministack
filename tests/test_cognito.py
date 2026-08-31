@@ -446,6 +446,55 @@ def test_cognito_admin_add_remove_user_from_group(cognito_idp):
     members = cognito_idp.list_users_in_group(UserPoolId=pid, GroupName="editors")["Users"]
     assert not any(u["Username"] == "liam" for u in members)
 
+def test_cognito_admin_list_user_auth_events_requires_addons(cognito_idp):
+    addon_msg = (
+        "This is an add on feature. Please update AdvancedSecurityMode"
+        " for your user pool to access this API."
+    )
+
+    pid = cognito_idp.create_user_pool(PoolName="AuthEventsPlainPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="mona")
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_list_user_auth_events(UserPoolId=pid, Username="mona")
+    assert exc.value.response["Error"]["Code"] == "UserPoolAddOnNotEnabledException"
+    assert exc.value.response["Error"]["Message"] == addon_msg
+
+    # The add-on gate fires before user resolution: an unknown user in a pool
+    # without add-ons still gets the add-on error, not UserNotFound.
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_list_user_auth_events(UserPoolId=pid, Username="ghost")
+    assert exc.value.response["Error"]["Code"] == "UserPoolAddOnNotEnabledException"
+
+    pid = cognito_idp.create_user_pool(
+        PoolName="AuthEventsOffPool",
+        UserPoolAddOns={"AdvancedSecurityMode": "OFF"},
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="olga")
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_list_user_auth_events(UserPoolId=pid, Username="olga")
+    assert exc.value.response["Error"]["Code"] == "UserPoolAddOnNotEnabledException"
+
+    pid = cognito_idp.create_user_pool(
+        PoolName="AuthEventsAuditPool",
+        UserPoolAddOns={"AdvancedSecurityMode": "AUDIT"},
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="axel")
+    resp = cognito_idp.admin_list_user_auth_events(UserPoolId=pid, Username="axel")
+    assert resp["AuthEvents"] == []
+
+    pid = cognito_idp.create_user_pool(
+        PoolName="AuthEventsAddonsPool",
+        UserPoolAddOns={"AdvancedSecurityMode": "ENFORCED"},
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="nils")
+    resp = cognito_idp.admin_list_user_auth_events(UserPoolId=pid, Username="nils")
+    assert resp["AuthEvents"] == []
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_list_user_auth_events(UserPoolId=pid, Username="ghost")
+    assert exc.value.response["Error"]["Code"] == "UserNotFoundException"
+    assert exc.value.response["Error"]["Message"] == "User does not exist."
+
 def test_cognito_domain_crud(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="DomainPool")["UserPool"]["Id"]
     resp = cognito_idp.create_user_pool_domain(UserPoolId=pid, Domain="my-test-domain")

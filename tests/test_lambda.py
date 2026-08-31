@@ -10735,3 +10735,76 @@ def test_lambda_event_source_mapping_response_carries_its_arn(lam, sqs):
     assert lam.list_tags(Resource=created["EventSourceMappingArn"])["Tags"] == {
         "Team": "billing"
     }
+@pytest.mark.skipif(
+    os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
+    reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
+)
+@pytest.mark.parametrize(
+    "declared,expected_machine",
+    [("arm64", "aarch64"), ("x86_64", "x86_64")],
+)
+def test_lambda_runs_on_the_architecture_it_declares(lam, declared, expected_machine):
+    """A function runs as the architecture it declares, not as the host's.
+
+    The container was created without a platform, so Docker used the host's
+    architecture whatever the function said. That is invisible until a layer
+    carries a native wheel: an arm64 layer in an x86_64 container fails at
+    import, naming the library rather than the mismatch.
+
+    The handler reports what it is actually running on, which is the only thing
+    that distinguishes the fix from the bug on a host of either architecture.
+    """
+    fname = f"lam-arch-{declared}-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        "import platform\n"
+        "def handler(event, context):\n"
+        "    return {'machine': platform.machine()}\n"
+    )
+
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+        Architectures=[declared],
+    )
+
+    try:
+        resp = lam.invoke(FunctionName=fname, Payload=json.dumps({}))
+        payload = json.loads(resp["Payload"].read())
+        if resp.get("FunctionError") and "exec format" in str(payload).lower():
+            pytest.skip(f"host cannot run linux/{declared} — no binfmt handler registered")
+        assert resp.get("FunctionError") is None, payload
+        assert payload.get("machine") == expected_machine, payload
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_lambda_platform_pinned_only_when_architectures_declared(monkeypatch):
+    """The Docker platform is pinned only for an explicitly chosen architecture.
+
+    Every stored config carries Architectures because the x86_64 default is
+    echoed on the wire, so the executor must not read the config alone: pinning
+    the stored default onto functions that never declared one would break arm64
+    hosts without an amd64 binfmt handler, whose functions ran natively before.
+    A record persisted before the marker existed counts as undeclared.
+    """
+    from ministack.services import lambda_svc as _lam
+
+    monkeypatch.setattr(_lam, "_functions", {
+        "declared-arm": {"architectures_declared": True},
+        "declared-x86": {"architectures_declared": True},
+        "undeclared": {"architectures_declared": False},
+        "pre-marker-record": {},
+    })
+
+    assert _lam._declared_docker_platform(
+        {"FunctionName": "declared-arm", "Architectures": ["arm64"]}) == "linux/arm64"
+    assert _lam._declared_docker_platform(
+        {"FunctionName": "declared-x86", "Architectures": ["x86_64"]}) == "linux/amd64"
+    assert _lam._declared_docker_platform(
+        {"FunctionName": "undeclared", "Architectures": ["x86_64"]}) is None
+    assert _lam._declared_docker_platform(
+        {"FunctionName": "pre-marker-record", "Architectures": ["x86_64"]}) is None
+    assert _lam._declared_docker_platform({"FunctionName": "never-created"}) is None

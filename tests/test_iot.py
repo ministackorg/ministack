@@ -292,6 +292,37 @@ def test_iot_thing_group_membership(iot_client):
     iot_client.delete_thing_group(thingGroupName=gname)
 
 
+def test_iot_list_thing_groups_for_thing(iot_client):
+    tname = _unique("thing")
+    g1 = _unique("group")
+    g2 = _unique("group")
+    iot_client.create_thing(thingName=tname)
+    iot_client.create_thing_group(thingGroupName=g1)
+    iot_client.create_thing_group(thingGroupName=g2)
+
+    # A thing in no groups answers an empty list, not an error.
+    assert iot_client.list_thing_groups_for_thing(thingName=tname)["thingGroups"] == []
+
+    iot_client.add_thing_to_thing_group(thingGroupName=g1, thingName=tname)
+    iot_client.add_thing_to_thing_group(thingGroupName=g2, thingName=tname)
+    groups = iot_client.list_thing_groups_for_thing(thingName=tname)["thingGroups"]
+    assert {g["groupName"] for g in groups} == {g1, g2}
+    for g in groups:
+        assert g["groupArn"].endswith(":thinggroup/" + g["groupName"])
+
+    iot_client.remove_thing_from_thing_group(thingGroupName=g1, thingName=tname)
+    remaining = iot_client.list_thing_groups_for_thing(thingName=tname)["thingGroups"]
+    assert [g["groupName"] for g in remaining] == [g2]
+
+    with pytest.raises(ClientError) as ei:
+        iot_client.list_thing_groups_for_thing(thingName=_unique("absent"))
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    iot_client.delete_thing(thingName=tname)
+    iot_client.delete_thing_group(thingGroupName=g1)
+    iot_client.delete_thing_group(thingGroupName=g2)
+
+
 # ---------------------------------------------------------------------------
 # Certificates (issued via the Local CA)
 # ---------------------------------------------------------------------------
@@ -5186,6 +5217,67 @@ def test_iot_register_ca_certificate_duplicate_conflict(iot_client):
     assert err["Error"]["Code"] == "ResourceAlreadyExistsException"
     assert err["resourceId"] == ca_id
     assert err["resourceArn"].endswith(":cacert/" + ca_id)
+    iot_client.delete_ca_certificate(certificateId=ca_id)
+
+
+def test_iot_register_ca_certificate_mode_round_trip(iot_client):
+    ca_pem, _leaf = _generate_ca_and_leaf()
+
+    # An invalid mode is rejected up front — nothing is registered.
+    with pytest.raises(ClientError) as ei:
+        iot_client.register_ca_certificate(
+            caCertificate=ca_pem, certificateMode="BOGUS"
+        )
+    assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+
+    ca_id = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, certificateMode="SNI_ONLY"
+    )["certificateId"]
+    desc = iot_client.describe_ca_certificate(certificateId=ca_id)[
+        "certificateDescription"
+    ]
+    assert desc["certificateMode"] == "SNI_ONLY"
+    iot_client.delete_ca_certificate(certificateId=ca_id)
+
+    # An omitted mode reports AWS's default.
+    ca_id = iot_client.register_ca_certificate(caCertificate=ca_pem)["certificateId"]
+    desc = iot_client.describe_ca_certificate(certificateId=ca_id)[
+        "certificateDescription"
+    ]
+    assert desc["certificateMode"] == "DEFAULT"
+    iot_client.delete_ca_certificate(certificateId=ca_id)
+
+
+def test_iot_ca_certificate_registration_config_round_trip(iot_client):
+    """registrationConfig rides Register and Update and comes back as
+    DescribeCACertificate's top-level member — the JITR provisioning config."""
+    ca_pem, _leaf = _generate_ca_and_leaf()
+    cfg = {"roleArn": "arn:aws:iam::123456789012:role/jitr",
+           "templateName": "jitr-template"}
+    ca_id = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, allowAutoRegistration=True, registrationConfig=cfg
+    )["certificateId"]
+
+    got = iot_client.describe_ca_certificate(certificateId=ca_id)
+    assert got["registrationConfig"] == cfg
+    assert got["certificateDescription"]["autoRegistrationStatus"] == "ENABLE"
+
+    # Update replaces the config, and removeAutoRegistration turns
+    # auto-registration off.
+    new_cfg = {"roleArn": "arn:aws:iam::123456789012:role/jitr-v2",
+               "templateBody": "{}"}
+    iot_client.update_ca_certificate(
+        certificateId=ca_id, registrationConfig=new_cfg, removeAutoRegistration=True
+    )
+    got = iot_client.describe_ca_certificate(certificateId=ca_id)
+    assert got["registrationConfig"] == new_cfg
+    assert got["certificateDescription"]["autoRegistrationStatus"] == "DISABLE"
+
+    # A CA registered without a config omits the member entirely.
+    iot_client.delete_ca_certificate(certificateId=ca_id)
+    ca_id = iot_client.register_ca_certificate(caCertificate=ca_pem)["certificateId"]
+    assert "registrationConfig" not in iot_client.describe_ca_certificate(
+        certificateId=ca_id)
     iot_client.delete_ca_certificate(certificateId=ca_id)
 
 

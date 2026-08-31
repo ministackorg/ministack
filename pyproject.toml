@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ministack"
-version = "1.5.3"
+version = "1.5.4"
 description = "Free, open-source local AWS emulator — drop-in LocalStack replacement"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -37,6 +37,10 @@ dependencies = [
     # documents Step Functions as implementing per the JSONata 2.0.6 spec. Pure
     # Python, no transitive dependencies.
     "jsonata-python>=0.7.0",
+    # AppSync queries are parsed, validated and executed by the reference Python
+    # GraphQL implementation rather than by regular expressions. Pure Python, no
+    # transitive dependencies. Pinned: a parser change is a behaviour change.
+    "graphql-core==3.2.12",
 ]
 
 [project.optional-dependencies]
