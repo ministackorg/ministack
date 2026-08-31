@@ -804,3 +804,47 @@ def test_boot_sweep_takes_our_predecessor_but_spares_other_instances(fake_docker
 
     assert "ours-previous-run" not in fake_docker.live(), "boot sweep left our own orphan"
     assert "another-instance" in fake_docker.live(), "boot sweep destroyed another instance's container"
+
+
+def test_persistence_keeps_state_when_a_module_fails_to_load():
+    """A service that could not import must not overwrite its persisted state.
+
+    A failed import produces a stand-in module with no state. It used to report
+    an empty dict, which save_all happily wrote over the file — so one bad boot
+    (a missing dependency, a syntax error) silently destroyed every resource the
+    service had persisted. Recovering meant recreating them from scratch.
+    """
+    import json
+    import os
+    import tempfile
+
+    from ministack.core import persistence
+
+    with tempfile.TemporaryDirectory() as tmp:
+        original_dir, original_flag = persistence.STATE_DIR, persistence.PERSIST_STATE
+        persistence.STATE_DIR, persistence.PERSIST_STATE = tmp, True
+        try:
+            path = os.path.join(tmp, "svc.json")
+            persistence.save_state("svc", {"things": {"a": 1}})
+            assert os.path.exists(path)
+
+            # A module that loaded and genuinely holds nothing still writes.
+            persistence.save_all({"svc": lambda: {"things": {}}})
+            with open(path) as f:
+                assert json.load(f)["payload"] == {"things": {}}
+
+            persistence.save_state("svc", {"things": {"a": 1}})
+            # A module that failed to load reports None, and the file survives.
+            persistence.save_all({"svc": lambda: None})
+            with open(path) as f:
+                assert json.load(f)["payload"] == {"things": {"a": 1}}, \
+                    "a failed module must not overwrite persisted state"
+        finally:
+            persistence.STATE_DIR, persistence.PERSIST_STATE = original_dir, original_flag
+
+
+def test_a_failed_service_module_reports_no_state():
+    """The stand-in for a module that would not import reports None."""
+    from ministack.app import _ErrorModule
+
+    assert _ErrorModule("appsync", "No module named 'graphql'").get_state() is None

@@ -413,6 +413,198 @@ class TestClusterPolicy:
             _cleanup(dsql, identifier)
 
 
+
+
+class TestStreams:
+    """CDC streams (GA 2026-07-08): metadata only — nothing is delivered."""
+
+    ROLE_ARN = "arn:aws:iam::000000000000:role/dsql-cdc"
+
+    def _target(self, kin, name):
+        try:
+            kin.create_stream(StreamName=name, ShardCount=1)
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ResourceInUseException":
+                raise
+        arn = kin.describe_stream(StreamName=name)["StreamDescription"]["StreamARN"]
+        return {"kinesis": {"streamArn": arn, "roleArn": self.ROLE_ARN}}
+
+    def test_stream_lifecycle(self, dsql, kin):
+        identifier = _create(dsql)
+        try:
+            target = self._target(kin, "dsql-cdc-life")
+            created = dsql.create_stream(
+                clusterIdentifier=identifier,
+                targetDefinition=target,
+                ordering="UNORDERED",
+                format="JSON",
+                tags={"env": "test"},
+            )
+            stream_id = created["streamIdentifier"]
+            assert ID_RE.match(stream_id)
+            assert created["status"] == "ACTIVE"
+            assert created["arn"] == (
+                f"arn:aws:dsql:us-east-1:000000000000:cluster/{identifier}"
+                f"/stream/{stream_id}"
+            )
+
+            got = dsql.get_stream(
+                clusterIdentifier=identifier, streamIdentifier=stream_id
+            )
+            assert got["targetDefinition"] == target
+            assert got["ordering"] == "UNORDERED"
+            assert got["format"] == "JSON"
+            assert got["tags"] == {"env": "test"}
+            assert "statusReason" not in got
+
+            listed = dsql.list_streams(clusterIdentifier=identifier)["streams"]
+            assert [st["streamIdentifier"] for st in listed] == [stream_id]
+
+            deleted = dsql.delete_stream(
+                clusterIdentifier=identifier, streamIdentifier=stream_id
+            )
+            assert deleted["status"] == "DELETING"
+            with pytest.raises(ClientError) as exc:
+                dsql.get_stream(
+                    clusterIdentifier=identifier, streamIdentifier=stream_id
+                )
+            assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        finally:
+            _cleanup(dsql, identifier)
+
+    def test_stream_tags_and_client_token(self, dsql, kin):
+        identifier = _create(dsql)
+        try:
+            target = self._target(kin, "dsql-cdc-tags")
+            created = dsql.create_stream(
+                clusterIdentifier=identifier,
+                targetDefinition=target,
+                ordering="UNORDERED",
+                format="JSON",
+                clientToken="tok-cdc",
+            )
+            repeat = dsql.create_stream(
+                clusterIdentifier=identifier,
+                targetDefinition=target,
+                ordering="UNORDERED",
+                format="JSON",
+                clientToken="tok-cdc",
+            )
+            assert repeat["streamIdentifier"] == created["streamIdentifier"]
+
+            dsql.tag_resource(resourceArn=created["arn"], tags={"team": "data"})
+            assert dsql.list_tags_for_resource(resourceArn=created["arn"])["tags"] == {
+                "team": "data"
+            }
+            dsql.untag_resource(resourceArn=created["arn"], tagKeys=["team"])
+            assert dsql.list_tags_for_resource(resourceArn=created["arn"])["tags"] == {}
+        finally:
+            _cleanup(dsql, identifier)
+
+    def test_missing_kinesis_target_lands_failed(self, dsql):
+        identifier = _create(dsql)
+        try:
+            created = dsql.create_stream(
+                clusterIdentifier=identifier,
+                targetDefinition={"kinesis": {
+                    "streamArn": "arn:aws:kinesis:us-east-1:000000000000:stream/absent",
+                    "roleArn": self.ROLE_ARN,
+                }},
+                ordering="UNORDERED",
+                format="JSON",
+            )
+            assert created["status"] == "FAILED"
+            got = dsql.get_stream(
+                clusterIdentifier=identifier,
+                streamIdentifier=created["streamIdentifier"],
+            )
+            assert got["statusReason"]["error"] == "KINESIS_STREAM_NOT_FOUND"
+        finally:
+            _cleanup(dsql, identifier)
+
+    def test_stream_limit_per_cluster(self, dsql, kin):
+        identifier = _create(dsql)
+        try:
+            target = self._target(kin, "dsql-cdc-limit")
+            for _ in range(5):
+                dsql.create_stream(
+                    clusterIdentifier=identifier,
+                    targetDefinition=target,
+                    ordering="UNORDERED",
+                    format="JSON",
+                )
+            with pytest.raises(ClientError) as exc:
+                dsql.create_stream(
+                    clusterIdentifier=identifier,
+                    targetDefinition=target,
+                    ordering="UNORDERED",
+                    format="JSON",
+                )
+            assert exc.value.response["Error"]["Code"] == "ServiceQuotaExceededException"
+            assert "stream limit" in exc.value.response["Error"]["Message"]
+        finally:
+            _cleanup(dsql, identifier)
+
+    def test_stream_on_unknown_cluster(self, dsql):
+        unknown = "z" * 26
+        with pytest.raises(ClientError) as exc:
+            dsql.list_streams(clusterIdentifier=unknown)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    def test_deleting_a_cluster_takes_its_streams(self, dsql, kin):
+        identifier = _create(dsql)
+        target = self._target(kin, "dsql-cdc-gone")
+        created = dsql.create_stream(
+            clusterIdentifier=identifier,
+            targetDefinition=target,
+            ordering="UNORDERED",
+            format="JSON",
+        )
+        _cleanup(dsql, identifier)
+        with pytest.raises(ClientError) as exc:
+            dsql.get_stream(
+                clusterIdentifier=identifier,
+                streamIdentifier=created["streamIdentifier"],
+            )
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    def test_stream_active_waiter(self, dsql, kin):
+        identifier = _create(dsql)
+        try:
+            target = self._target(kin, "dsql-cdc-waiter")
+            created = dsql.create_stream(
+                clusterIdentifier=identifier,
+                targetDefinition=target,
+                ordering="UNORDERED",
+                format="JSON",
+            )
+            dsql.get_waiter("stream_active").wait(
+                clusterIdentifier=identifier,
+                streamIdentifier=created["streamIdentifier"],
+                WaiterConfig={"Delay": 1, "MaxAttempts": 3},
+            )
+        finally:
+            _cleanup(dsql, identifier)
+
+
+class TestVpcEndpointServiceName:
+    def test_service_name_is_stable_per_cluster(self, dsql):
+        identifier = _create(dsql)
+        try:
+            first = dsql.get_vpc_endpoint_service_name(identifier=identifier)
+            assert re.match(
+                r"^com\.amazonaws\.us-east-1\.dsql-[a-f0-9]{6}$", first["serviceName"]
+            )
+            second = dsql.get_vpc_endpoint_service_name(identifier=identifier)
+            assert second["serviceName"] == first["serviceName"]
+        finally:
+            _cleanup(dsql, identifier)
+
+    def test_unknown_cluster(self, dsql):
+        with pytest.raises(ClientError) as exc:
+            dsql.get_vpc_endpoint_service_name(identifier="z" * 26)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
 class TestBotoParity:
     """Waiters, paginators, and structured error members (botocore model)."""
 
@@ -659,30 +851,32 @@ class TestDenylist:
         assert "is not supported" in err.message
 
     @pytest.mark.parametrize(
-        "sql",
+        "sql,message",
         [
-            "CREATE TABLE t (a int, b int REFERENCES other (id))",
-            "CREATE TABLE t (a int, FOREIGN KEY (a) REFERENCES other (id))",
-            "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES o (id)",
+            ("ALTER TABLE t ADD COLUMN c int DEFAULT 0",
+             "ALTER TABLE ADD COLUMN with constraint not supported"),
+            ("ALTER TABLE t ADD COLUMN c text NOT NULL",
+             "ALTER TABLE ADD COLUMN with constraint not supported"),
+            ("ALTER TABLE t ADD COLUMN c int UNIQUE",
+             "ALTER TABLE ADD COLUMN with constraint not supported"),
+            ("ALTER TABLE t ADD COLUMN c int CHECK (c > 0)",
+             "ALTER TABLE ADD COLUMN with constraint not supported"),
+            ("ALTER TABLE t ADD COLUMN c int REFERENCES o",
+             "ALTER TABLE ADD COLUMN with constraint not supported"),
+            ("ALTER TABLE t ADD COLUMN c text GENERATED ALWAYS AS (lower(e)) STORED",
+             "ALTER TABLE ADD COLUMN with constraint not supported"),
+            ("ALTER TABLE t ADD COLUMN c bigint GENERATED BY DEFAULT AS IDENTITY "
+             "(CACHE 1)",
+             "ALTER TABLE ADD COLUMN with constraint not supported"),
+            ('ALTER TABLE t ADD COLUMN c text COLLATE "C"',
+             "COLLATE clause not supported"),
         ],
     )
-    def test_foreign_keys_denied(self, sql):
+    def test_add_column_takes_no_constraint(self, sql, message):
         err = pgproxy.validate(sql, pgproxy.TxnState())
         assert isinstance(err, pgproxy.DsqlError), sql
         assert err.sqlstate == "0A000"
-        assert "foreign key" in err.message
-
-    @pytest.mark.parametrize(
-        "sql",
-        [
-            "ALTER TABLE t ADD COLUMN c int DEFAULT 0",
-            "ALTER TABLE t ADD COLUMN c text NOT NULL",
-        ],
-    )
-    def test_add_column_default_not_null_denied(self, sql):
-        err = pgproxy.validate(sql, pgproxy.TxnState())
-        assert isinstance(err, pgproxy.DsqlError), sql
-        assert err.sqlstate == "0A000"
+        assert err.message == message, sql
 
     def test_create_function_language_sql_allowed(self):
         sql = "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$"
@@ -798,8 +992,9 @@ class TestAlterTableSubset:
             "ALTER TABLE t ALTER COLUMN c ADD GENERATED BY DEFAULT AS IDENTITY (CACHE 1)",
             "ALTER TABLE t ADD COLUMN c integer",
             "ALTER TABLE t ADD COLUMN j jsonb STORAGE PLAIN",
-            "ALTER TABLE t ADD COLUMN c bigint GENERATED BY DEFAULT AS IDENTITY (CACHE 1)",
-            "ALTER TABLE t ADD COLUMN cl text GENERATED ALWAYS AS (lower(email)) STORED",
+            "ALTER TABLE t ADD COLUMN c int NULL",
+            "ALTER TABLE t ADD COLUMN IF NOT EXISTS c numeric(18,6)",
+            "ALTER TABLE t ADD COLUMN a int, ADD COLUMN b text",
         ],
     )
     def test_supported_actions_allowed(self, sql):
@@ -841,6 +1036,124 @@ class TestAlterTableSubset:
         assert result.job_type == "VALIDATE_CONSTRAINT"
         assert result.object_name == "public.t"
 
+
+
+
+class TestForeignKeys:
+    """Foreign keys, supported since 2026-08-26 (AWS release notes)."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "CREATE TABLE orders (id int PRIMARY KEY, p int REFERENCES products)",
+            "CREATE TABLE orders (id int PRIMARY KEY, "
+            "p int REFERENCES products (product_no))",
+            "CREATE TABLE orders (id int PRIMARY KEY, "
+            "p int CONSTRAINT fk_product REFERENCES products)",
+            "CREATE TABLE shipments (id int PRIMARY KEY, w int, p int, "
+            "FOREIGN KEY (w, p) REFERENCES inventory (warehouse_id, product_no))",
+            # Self-referencing.
+            "CREATE TABLE tree (id int PRIMARY KEY, parent int REFERENCES tree)",
+            # Every referential action DSQL supports.
+            "CREATE TABLE o (p int REFERENCES products ON DELETE NO ACTION)",
+            "CREATE TABLE o (p int REFERENCES products ON DELETE RESTRICT)",
+            "CREATE TABLE o (p int REFERENCES products ON DELETE CASCADE)",
+            "CREATE TABLE o (p int REFERENCES products ON DELETE SET NULL)",
+            "CREATE TABLE o (p int REFERENCES products ON DELETE SET DEFAULT)",
+            "CREATE TABLE o (p int REFERENCES products "
+            "ON DELETE CASCADE ON UPDATE CASCADE)",
+            # Match types and deferrability.
+            "CREATE TABLE s (w int, p int, FOREIGN KEY (w, p) "
+            "REFERENCES inventory (w, p) MATCH FULL)",
+            "CREATE TABLE s (w int, p int, FOREIGN KEY (w, p) "
+            "REFERENCES inventory (w, p) MATCH SIMPLE)",
+            "CREATE TABLE o (p int REFERENCES products DEFERRABLE)",
+            "CREATE TABLE o (p int REFERENCES products "
+            "DEFERRABLE INITIALLY DEFERRED)",
+            "CREATE TABLE o (p int REFERENCES products NOT DEFERRABLE)",
+            "ALTER TABLE o ALTER CONSTRAINT fk DEFERRABLE INITIALLY DEFERRED",
+            "ALTER TABLE o ADD CONSTRAINT fk FOREIGN KEY (p) "
+            "REFERENCES products NOT VALID",
+            "ALTER TABLE o ADD FOREIGN KEY (p) REFERENCES products "
+            "ON DELETE CASCADE NOT VALID",
+            "ALTER TABLE o ADD CONSTRAINT fk FOREIGN KEY (p) "
+            "REFERENCES products DEFERRABLE INITIALLY DEFERRED NOT VALID",
+            "ALTER TABLE o DROP CONSTRAINT fk",
+            "SET CONSTRAINTS ALL DEFERRED",
+        ],
+    )
+    def test_allowed(self, sql):
+        assert pgproxy.validate(sql, pgproxy.TxnState()) is None, sql
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "ALTER TABLE o ADD CONSTRAINT fk FOREIGN KEY (p) REFERENCES products",
+            "ALTER TABLE o ADD FOREIGN KEY (p) REFERENCES products ON DELETE CASCADE",
+        ],
+    )
+    def test_alter_table_requires_not_valid(self, sql):
+        err = pgproxy.validate(sql, pgproxy.TxnState())
+        assert isinstance(err, pgproxy.DsqlError), sql
+        assert err.sqlstate == "0A000"
+        assert err.message == "unsupported ALTER TABLE ADD CONSTRAINT statement"
+
+    @pytest.mark.parametrize(
+        "sql,message",
+        [
+            ("CREATE TABLE t (a int, UNIQUE (a) DEFERRABLE)",
+             "DEFERRABLE constraint not supported"),
+            ("CREATE TABLE t (a int PRIMARY KEY DEFERRABLE INITIALLY DEFERRED)",
+             "DEFERRABLE constraint not supported"),
+            # INITIALLY DEFERRED without DEFERRABLE is refused the same way.
+            ("CREATE TABLE t (a int, UNIQUE (a) INITIALLY DEFERRED)",
+             "DEFERRABLE constraint not supported"),
+            # ADD CONSTRAINT ... UNIQUE has its own wording again.
+            ("ALTER TABLE t ADD CONSTRAINT u UNIQUE USING INDEX idx DEFERRABLE",
+             "ALTER TABLE / ADD CONSTRAINT UNIQUE / DEFERRED / "
+             "INITIALLY DEFERRED not supported"),
+            ("ALTER TABLE t ADD CONSTRAINT u UNIQUE USING INDEX idx "
+             "INITIALLY DEFERRED",
+             "ALTER TABLE / ADD CONSTRAINT UNIQUE / DEFERRED / "
+             "INITIALLY DEFERRED not supported"),
+            ("ALTER TABLE t ADD CONSTRAINT c CHECK (a > 0) DEFERRABLE NOT VALID",
+             "CHECK constraints cannot be marked DEFERRABLE"),
+            # A CHECK constraint has its own wording.
+            ("CREATE TABLE t (a int, CONSTRAINT c CHECK (a > 0) "
+             "DEFERRABLE INITIALLY IMMEDIATE)",
+             "CHECK constraints cannot be marked DEFERRABLE"),
+        ],
+    )
+    def test_deferrable_on_a_non_foreign_key_denied(self, sql, message):
+        err = pgproxy.validate(sql, pgproxy.TxnState())
+        assert isinstance(err, pgproxy.DsqlError), sql
+        assert err.sqlstate == "0A000"
+        assert err.message == message
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # NOT DEFERRABLE is the default, so it is accepted anywhere.
+            "CREATE TABLE t (a int, UNIQUE (a) NOT DEFERRABLE)",
+            "CREATE TABLE t (a int PRIMARY KEY NOT DEFERRABLE)",
+            "CREATE TABLE t (a int, CHECK (a > 0) NOT DEFERRABLE)",
+            # A column carrying both constraints defers the foreign key.
+            "CREATE TABLE t (p int UNIQUE REFERENCES o DEFERRABLE)",
+            "CREATE TABLE t (a int UNIQUE, p int REFERENCES o "
+            "DEFERRABLE INITIALLY DEFERRED)",
+            # INITIALLY IMMEDIATE declares no deferral either.
+            "ALTER TABLE t ADD CONSTRAINT u UNIQUE USING INDEX idx "
+            "INITIALLY IMMEDIATE",
+            "ALTER TABLE t ADD CONSTRAINT u UNIQUE USING INDEX idx NOT DEFERRABLE",
+            "ALTER TABLE t ADD CONSTRAINT c CHECK (a > 0) NOT DEFERRABLE NOT VALID",
+            "ALTER TABLE t ADD CONSTRAINT f FOREIGN KEY (p) REFERENCES o "
+            "NOT VALID DEFERRABLE",
+            # The word as data, not as a constraint option.
+            "CREATE TABLE t (a int, s text, CHECK (s <> 'DEFERRABLE'))",
+        ],
+    )
+    def test_deferrable_accepted(self, sql):
+        assert pgproxy.validate(sql, pgproxy.TxnState()) is None, sql
 
 class TestIdentityAndSequences:
     @pytest.mark.parametrize(
@@ -1247,8 +1560,8 @@ class TestLockingClauses:
     not the predicate. Measured against a live cluster (eu-central-1,
     2026-08-18, server_version 16.15): FOR UPDATE locks whatever the query
     selects — no WHERE clause, a non-key column, an inequality, IN/OR, a join,
-    a table with no primary key — while FOR NO KEY UPDATE, FOR SHARE and
-    FOR KEY SHARE are all refused with 0A000."""
+    a table with no primary key — while FOR NO KEY UPDATE and FOR SHARE are
+    refused with 0A000. FOR KEY SHARE joined FOR UPDATE on 2026-08-25."""
 
     MESSAGE = "locking clauses other than FOR UPDATE/FOR KEY SHARE are not supported"
 
@@ -1269,6 +1582,11 @@ class TestLockingClauses:
             "SELECT s FROM t WHERE id = 1 FOR UPDATE SKIP LOCKED",
             "SELECT s FROM t WHERE id = 1 FOR UPDATE OF t NOWAIT",
             "SELECT * FROM (SELECT 1 FOR UPDATE) x FOR UPDATE",
+            # FOR KEY SHARE, supported since 2026-08-25.
+            "SELECT s FROM t WHERE id = 1 FOR KEY SHARE",
+            "SELECT s FROM t FOR KEY SHARE NOWAIT",
+            "SELECT * FROM (SELECT s FROM t FOR KEY SHARE) y",
+            "WITH x AS (SELECT s FROM t FOR KEY SHARE) SELECT * FROM x",
             # The words only as text — not a locking clause at all.
             "SELECT s FROM t WHERE s = 'FOR SHARE'",
             "SELECT 'FOR NO KEY UPDATE' AS lit",
@@ -1284,13 +1602,12 @@ class TestLockingClauses:
         "sql",
         [
             "SELECT s FROM t WHERE id = 1 FOR SHARE",
-            "SELECT s FROM t WHERE id = 1 FOR KEY SHARE",
             "SELECT s FROM t WHERE id = 1 FOR NO KEY UPDATE",
             "SELECT s FROM t for share",
             "SELECT s FROM t FOR SHARE NOWAIT",
             # Any nesting depth: DSQL refuses it inside a CTE or a subquery.
             "WITH x AS (SELECT s FROM t WHERE id = 1 FOR SHARE) SELECT * FROM x",
-            "SELECT * FROM (SELECT s FROM t FOR KEY SHARE) y",
+            "SELECT * FROM (SELECT s FROM t FOR SHARE) y",
             # A supported clause earlier in the statement must not hide one
             # that still reaches a relation (both verified rejected by DSQL).
             "SELECT x.id FROM (SELECT id FROM t FOR UPDATE) x, "
@@ -1596,8 +1913,8 @@ class TestExtendedProtocol:
         "sql,expected",
         [
             ("CREATE TABLE xp_serial (id serial)", "serial"),
-            ("CREATE TABLE xp_fk (id int, p int REFERENCES xp_serial (id))",
-             "foreign key"),
+            ("CREATE TABLE xp_uq (id int, UNIQUE (id) DEFERRABLE)",
+             "DEFERRABLE"),
             ("CREATE EXTENSION pgcrypto", "CREATE EXTENSION"),
             ("CREATE TEMP TABLE xp_tmp (id int)", "temporary"),
             ("TRUNCATE xp_base", "TRUNCATE"),
@@ -1778,7 +2095,7 @@ class TestLockingReads:
     """A locking read has to reach the backend whatever its predicate looks
     like — an ORM quotes every identifier, and DSQL itself places no
     restriction on the predicate (measured, eu-central-1, 2026-08-18). What it
-    does refuse is a lock strength other than FOR UPDATE."""
+    does refuse is a lock strength other than FOR UPDATE/FOR KEY SHARE."""
 
     UUID = "11111111-1111-1111-1111-111111111111"
     MESSAGE = "locking clauses other than FOR UPDATE/FOR KEY SHARE are not supported"
@@ -1901,9 +2218,7 @@ class TestLockingReads:
                 result = c.simple(sql)
                 assert result.ok, f"{sql} -> {result.sqlstate} {result.message}"
 
-    @pytest.mark.parametrize(
-        "clause", ["FOR SHARE", "FOR KEY SHARE", "FOR NO KEY UPDATE"]
-    )
+    @pytest.mark.parametrize("clause", ["FOR SHARE", "FOR NO KEY UPDATE"])
     def test_other_lock_strengths_rejected(self, dsql_proxy, clause):
         with _WireClient(dsql_proxy) as c:
             self._setup(c, "fu_l")
@@ -1912,6 +2227,15 @@ class TestLockingReads:
                 result = send(sql)
                 assert result.sqlstate == "0A000", sql
                 assert result.message == self.MESSAGE, sql
+
+    def test_key_share_reaches_the_backend(self, dsql_proxy):
+        with _WireClient(dsql_proxy) as c:
+            self._setup(c, "fu_ks")
+            sql = f"SELECT s FROM fu_ks WHERE id = '{self.UUID}' FOR KEY SHARE"
+            for send in (c.simple, c.extended):
+                result = send(sql)
+                assert result.ok, f"{sql} -> {result.sqlstate} {result.message}"
+                assert result.rows == [("a",)], sql
 
     def test_lock_strength_in_a_literal_is_not_a_clause(self, dsql_proxy):
         with _WireClient(dsql_proxy) as c:
@@ -2057,17 +2381,64 @@ class TestLiveProxy:
         finally:
             conn.close()
 
-    def test_foreign_key_rejected(self, dsql_proxy):
+    def test_foreign_key_enforced(self, dsql_proxy):
+        """Foreign keys, supported since 2026-08-26, reach the backend and
+        enforce referential integrity."""
         psycopg2 = pytest.importorskip("psycopg2")
         conn = _pg_connect(dsql_proxy)
         try:
             cur = conn.cursor()
+            cur.execute("CREATE TABLE fk_parent (id int PRIMARY KEY, name text)")
+            cur.execute(
+                "CREATE TABLE fk_child (id int PRIMARY KEY, "
+                "p int REFERENCES fk_parent ON DELETE CASCADE)"
+            )
+            cur.execute("INSERT INTO fk_parent VALUES (1, 'a')")
+            cur.execute("INSERT INTO fk_child VALUES (10, 1)")
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("INSERT INTO fk_child VALUES (11, 99)")
+            assert exc.value.pgcode == "23503"
+            # ON DELETE CASCADE removes the referencing row with the parent.
+            cur.execute("DELETE FROM fk_parent WHERE id = 1")
+            cur.execute("SELECT count(*) FROM fk_child")
+            assert cur.fetchone()[0] == 0
+            cur.execute("DROP TABLE fk_child")
+            cur.execute("DROP TABLE fk_parent")
+        finally:
+            conn.close()
+
+    def test_foreign_key_via_alter_table_requires_not_valid(self, dsql_proxy):
+        psycopg2 = pytest.importorskip("psycopg2")
+        conn = _pg_connect(dsql_proxy)
+        try:
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE fka_parent (id int PRIMARY KEY)")
+            cur.execute("CREATE TABLE fka_child (id int PRIMARY KEY, p int)")
+            cur.execute("INSERT INTO fka_parent VALUES (1)")
+            cur.execute("INSERT INTO fka_child VALUES (10, 1)")
             with pytest.raises(psycopg2.Error) as exc:
                 cur.execute(
-                    "CREATE TABLE fk_live (a int REFERENCES other_table (id))"
+                    "ALTER TABLE fka_child ADD CONSTRAINT fk "
+                    "FOREIGN KEY (p) REFERENCES fka_parent"
                 )
             assert exc.value.pgcode == "0A000"
-            assert "foreign key" in str(exc.value)
+            assert "unsupported ALTER TABLE ADD CONSTRAINT" in str(exc.value)
+            cur.execute(
+                "ALTER TABLE fka_child ADD CONSTRAINT fk "
+                "FOREIGN KEY (p) REFERENCES fka_parent NOT VALID"
+            )
+            # Async validation of a NOT VALID foreign key registers a job.
+            cur.execute("ALTER TABLE ASYNC fka_child VALIDATE CONSTRAINT fk")
+            job_id = cur.fetchone()[0]
+            cur.execute(
+                "SELECT job_type, status FROM sys.jobs WHERE job_id = %s" % repr(job_id)
+            )
+            assert cur.fetchone() == ("VALIDATE_CONSTRAINT", "completed")
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("INSERT INTO fka_child VALUES (11, 99)")
+            assert exc.value.pgcode == "23503"
+            cur.execute("DROP TABLE fka_child")
+            cur.execute("DROP TABLE fka_parent")
         finally:
             conn.close()
 
@@ -2141,7 +2512,7 @@ class TestLiveProxy:
                     "ALTER TABLE chk_live ADD CONSTRAINT chk_a CHECK (a > 0)"
                 )
             assert exc.value.pgcode == "0A000"
-            assert "NOT VALID" in str(exc.value)
+            assert "unsupported ALTER TABLE ADD CONSTRAINT" in str(exc.value)
             cur.execute(
                 "ALTER TABLE chk_live ADD CONSTRAINT chk_a CHECK (a > 0) NOT VALID"
             )
@@ -2156,6 +2527,41 @@ class TestLiveProxy:
             with pytest.raises(psycopg2.Error):
                 cur.execute("INSERT INTO chk_live VALUES (-1)")
             cur.execute("DROP TABLE chk_live")
+        finally:
+            conn.close()
+
+    def test_validate_constraint_over_violating_rows_fails_the_job(self, dsql_proxy):
+        """Existing data that breaks the constraint fails the job, not the
+        submit: DSQL answers with a job_id and reports it through sys.jobs
+        (measured, eu-central-1 2026-08-30)."""
+        psycopg2 = pytest.importorskip("psycopg2")
+        conn = _pg_connect(dsql_proxy)
+        try:
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE vj_parent (id int PRIMARY KEY)")
+            cur.execute("CREATE TABLE vj_child (id int PRIMARY KEY, p int)")
+            cur.execute("INSERT INTO vj_parent VALUES (1)")
+            cur.execute("INSERT INTO vj_child VALUES (1, 999)")
+            cur.execute(
+                "ALTER TABLE vj_child ADD CONSTRAINT vj_fk FOREIGN KEY (p) "
+                "REFERENCES vj_parent NOT VALID"
+            )
+            cur.execute("ALTER TABLE ASYNC vj_child VALIDATE CONSTRAINT vj_fk")
+            job_id = cur.fetchone()[0]
+            cur.execute(
+                "SELECT status, details FROM sys.jobs WHERE job_id = %s" % repr(job_id)
+            )
+            status, details = cur.fetchone()
+            assert status == "failed"
+            assert "violates foreign key constraint" in details
+            cur.execute(f"SELECT sys.wait_for_job('{job_id}')")
+            assert cur.fetchone()[0] is False
+            # A NOT VALID constraint still holds against new rows.
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("INSERT INTO vj_child VALUES (2, 998)")
+            assert exc.value.pgcode == "23503"
+            cur.execute("DROP TABLE vj_child")
+            cur.execute("DROP TABLE vj_parent")
         finally:
             conn.close()
 
@@ -2213,10 +2619,11 @@ class TestLiveProxy:
                 cur.execute(sql)
                 cur.fetchall()
             # Any other lock strength is not supported.
+            cur.execute("SELECT * FROM fu_live WHERE id = 1 FOR KEY SHARE")
+            cur.fetchall()
             for sql in (
                 "SELECT * FROM fu_live WHERE id = 1 FOR SHARE",
                 "SELECT * FROM fu_live WHERE id = 1 FOR NO KEY UPDATE",
-                "SELECT * FROM fu_live WHERE id = 1 FOR KEY SHARE",
             ):
                 with pytest.raises(psycopg2.Error) as exc:
                     cur.execute(sql)
