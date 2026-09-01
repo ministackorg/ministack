@@ -151,11 +151,18 @@ def _autovivify_aws_managed_policy(arn: str) -> dict:
 
 
 def _make_aws_managed_record(name: str, document: str, description: str = "") -> dict:
-    """Build a policy record matching the shape ``_create_policy`` stores."""
+    """Build a policy record matching the shape ``_create_policy`` stores.
+
+    ``name`` is the ARN's resource part, path included
+    (``service-role/AWSLambdaBasicExecutionRole``): the path becomes the
+    record's ``Path`` and only the last segment its ``PolicyName``, as AWS
+    reports them — Terraform's ``aws_iam_policy`` data source and
+    ``ListPolicies PathPrefix`` both read those two fields."""
     arn = f"{_AWS_MANAGED_POLICY_PREFIX}{name}"
+    path, _, policy_name = name.rpartition("/")
     created = _now()
     return {
-        "PolicyName": name,
+        "PolicyName": policy_name,
         "Arn": arn,
         "PolicyId": _gen_id("ANPA"),
         "CreateDate": created,
@@ -163,7 +170,7 @@ def _make_aws_managed_record(name: str, document: str, description: str = "") ->
         "DefaultVersionId": "v1",
         "AttachmentCount": 0,
         "IsAttachable": True,
-        "Path": "/",
+        "Path": f"/{path}/" if path else "/",
         "Description": description,
         "Tags": [],
         "Versions": {
@@ -202,6 +209,44 @@ def _seed_aws_managed_policies() -> None:
     update via ``aws iam get-policy-version`` against real AWS when
     a new policy version ships."""
     seeds = [
+        # The service-role/* policies live under that path on AWS: it is the
+        # only ARN CDK, SAM and Serverless emit for a Lambda execution role.
+        # Earlier versions seeded four of them under a path-less ARN AWS does
+        # not publish; those stay reachable as aliases of the real record
+        # (``_AWS_MANAGED_POLICY_ALIASES``).
+        ('service-role/AWSLambdaBasicExecutionRole',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}',
+         "Provides write permissions to CloudWatch Logs."),
+        ('service-role/AWSLambdaVPCAccessExecutionRole',
+         '{"Version":"2012-10-17","Statement":[{"Sid":"AWSLambdaVPCAccessExecutionPermissions","Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents","ec2:CreateNetworkInterface","ec2:DescribeNetworkInterfaces","ec2:DescribeSubnets","ec2:DeleteNetworkInterface","ec2:AssignPrivateIpAddresses","ec2:UnassignPrivateIpAddresses"],"Resource":"*"}]}',
+         "Provides minimum permissions for a Lambda function to execute while accessing a resource within a VPC - create, describe, delete network interfaces and write permissions to CloudWatch Logs."),
+        ('service-role/AWSLambdaRole',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["lambda:InvokeFunction"],"Resource":["*"]}]}',
+         "Default policy for AWS Lambda service role."),
+        ('service-role/AmazonECSTaskExecutionRolePolicy',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ecr:GetAuthorizationToken","ecr:BatchCheckLayerAvailability","ecr:GetDownloadUrlForLayer","ecr:BatchGetImage","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}',
+         "Provides access to other AWS service resources that are required to run Amazon ECS tasks"),
+        ('service-role/AmazonAPIGatewayPushToCloudWatchLogs',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:DescribeLogGroups","logs:DescribeLogStreams","logs:PutLogEvents","logs:GetLogEvents","logs:FilterLogEvents"],"Resource":"*"}]}',
+         "Allows API Gateway to push logs to user's account."),
+        ('service-role/AWSIoTThingsRegistration',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["iot:AddThingToThingGroup","iot:AttachPolicy","iot:AttachPrincipalPolicy","iot:AttachThingPrincipal","iot:CreateCertificateFromCsr","iot:CreatePolicy","iot:CreateThing","iot:DescribeCertificate","iot:DescribeThing","iot:DescribeThingGroup","iot:DescribeThingType","iot:DetachPolicy","iot:DetachThingPrincipal","iot:GetPolicy","iot:ListAttachedPolicies","iot:ListPolicyPrincipals","iot:ListPrincipalPolicies","iot:ListPrincipalThings","iot:ListTargetsForPolicy","iot:ListThingGroupsForThing","iot:ListThingPrincipals","iot:RegisterCertificate","iot:RegisterThing","iot:RemoveThingFromThingGroup","iot:UpdateCertificate","iot:UpdateThing","iot:UpdateThingGroupsForThing","iot:AddThingToBillingGroup","iot:DescribeBillingGroup","iot:RemoveThingFromBillingGroup"],"Resource":["*"]}]}',
+         "This policy allows users to register things at bulk using AWS IoT StartThingRegistrationTask API"),
+        ('AWSCloudFormationReadOnlyAccess',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["cloudformation:Describe*","cloudformation:BatchDescribe*","cloudformation:EstimateTemplateCost","cloudformation:Get*","cloudformation:List*","cloudformation:ValidateTemplate","cloudformation:Detect*"],"Resource":"*"}]}',
+         "Provides access to AWS CloudFormation via the AWS Management Console."),
+        ('CloudWatchLambdaInsightsExecutionRolePolicy',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"logs:CreateLogGroup","Resource":"*"},{"Effect":"Allow","Action":["logs:CreateLogStream","logs:PutLogEvents"],"Resource":"arn:aws:logs:*:*:log-group:/aws/lambda-insights:*"}]}',
+         "Policy required for the Lambda Insights Extension"),
+        ('service-role/AWSLambdaSQSQueueExecutionRole',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["sqs:ReceiveMessage","sqs:DeleteMessage","sqs:GetQueueAttributes","logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}',
+         "Provides receive message, delete message, and read attribute access to SQS queues, and write permissions to CloudWatch logs."),
+        ('service-role/AWSLambdaKinesisExecutionRole',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["kinesis:DescribeStream","kinesis:DescribeStreamSummary","kinesis:GetRecords","kinesis:GetShardIterator","kinesis:ListShards","kinesis:ListStreams","kinesis:SubscribeToShard","logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}',
+         "Provides list and read access to Kinesis streams and write permissions to CloudWatch logs."),
+        ('service-role/AWSLambdaDynamoDBExecutionRole',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["dynamodb:DescribeStream","dynamodb:GetRecords","dynamodb:GetShardIterator","dynamodb:ListStreams","logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}',
+         "Provides list and read access to DynamoDB streams and write permissions to CloudWatch logs."),
         ('AdministratorAccess',
          '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}',
          "Provides full access to AWS services and resources."),
@@ -238,21 +283,12 @@ def _seed_aws_managed_policies() -> None:
         ('AmazonDynamoDBFullAccess',
          '{"Version":"2012-10-17","Statement":[{"Action":["dynamodb:*","dax:*","application-autoscaling:DeleteScalingPolicy","application-autoscaling:DeregisterScalableTarget","application-autoscaling:DescribeScalableTargets","application-autoscaling:DescribeScalingActivities","application-autoscaling:DescribeScalingPolicies","application-autoscaling:PutScalingPolicy","application-autoscaling:RegisterScalableTarget","cloudwatch:DeleteAlarms","cloudwatch:DescribeAlarmHistory","cloudwatch:DescribeAlarms","cloudwatch:DescribeAlarmsForMetric","cloudwatch:GetMetricStatistics","cloudwatch:ListMetrics","cloudwatch:PutMetricAlarm","cloudwatch:GetMetricData","datapipeline:ActivatePipeline","datapipeline:CreatePipeline","datapipeline:DeletePipeline","datapipeline:DescribeObjects","datapipeline:DescribePipelines","datapipeline:GetPipelineDefinition","datapipeline:ListPipelines","datapipeline:PutPipelineDefinition","datapipeline:QueryObjects","ec2:DescribeVpcs","ec2:DescribeSubnets","ec2:DescribeSecurityGroups","iam:GetRole","iam:ListRoles","kms:DescribeKey","kms:ListAliases","sns:CreateTopic","sns:DeleteTopic","sns:ListSubscriptions","sns:ListSubscriptionsByTopic","sns:ListTopics","sns:Subscribe","sns:Unsubscribe","sns:SetTopicAttributes","lambda:CreateFunction","lambda:ListFunctions","lambda:ListEventSourceMappings","lambda:CreateEventSourceMapping","lambda:DeleteEventSourceMapping","lambda:GetFunctionConfiguration","lambda:DeleteFunction","resource-groups:ListGroups","resource-groups:ListGroupResources","resource-groups:GetGroup","resource-groups:GetGroupQuery","resource-groups:DeleteGroup","resource-groups:CreateGroup","tag:GetResources","kinesis:ListStreams","kinesis:DescribeStream","kinesis:DescribeStreamSummary"],"Effect":"Allow","Resource":"*"},{"Action":"cloudwatch:GetInsightRuleReport","Effect":"Allow","Resource":"arn:aws:cloudwatch:*:*:insight-rule/DynamoDBContributorInsights*"},{"Action":["iam:PassRole"],"Effect":"Allow","Resource":"*","Condition":{"StringLike":{"iam:PassedToService":["application-autoscaling.amazonaws.com","application-autoscaling.amazonaws.com.cn","dax.amazonaws.com"]}}},{"Effect":"Allow","Action":["iam:CreateServiceLinkedRole"],"Resource":"*","Condition":{"StringEquals":{"iam:AWSServiceName":["replication.dynamodb.amazonaws.com","dax.amazonaws.com","dynamodb.application-autoscaling.amazonaws.com","contributorinsights.dynamodb.amazonaws.com","kinesisreplication.dynamodb.amazonaws.com"]}}}]}',
          "Provides full access to Amazon DynamoDB via the AWS Management Console."),
-        ('AWSLambdaBasicExecutionRole',
-         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}',
-         "Provides write permissions to CloudWatch Logs."),
-        ('AWSLambdaVPCAccessExecutionRole',
-         '{"Version":"2012-10-17","Statement":[{"Sid":"AWSLambdaVPCAccessExecutionPermissions","Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents","ec2:CreateNetworkInterface","ec2:DescribeNetworkInterfaces","ec2:DescribeSubnets","ec2:DeleteNetworkInterface","ec2:AssignPrivateIpAddresses","ec2:UnassignPrivateIpAddresses"],"Resource":"*"}]}',
-         "Provides minimum permissions for a Lambda function to execute while accessing a resource within a VPC - create, describe, delete network interfaces and write permissions to CloudWatch Logs."),
         ('AmazonSQSFullAccess',
          '{"Version":"2012-10-17","Statement":[{"Action":["sqs:*"],"Effect":"Allow","Resource":"*"}]}',
          "Provides full access to Amazon SQS via the AWS Management Console."),
         ('AmazonSNSFullAccess',
          '{"Version":"2012-10-17","Statement":[{"Sid":"SNSFullAccess","Effect":"Allow","Action":"sns:*","Resource":"*"},{"Sid":"SMSAccessViaSNS","Effect":"Allow","Action":["sms-voice:DescribeVerifiedDestinationNumbers","sms-voice:CreateVerifiedDestinationNumber","sms-voice:SendDestinationNumberVerificationCode","sms-voice:SendTextMessage","sms-voice:DeleteVerifiedDestinationNumber","sms-voice:VerifyDestinationNumber","sms-voice:DescribeAccountAttributes","sms-voice:DescribeSpendLimits","sms-voice:DescribePhoneNumbers","sms-voice:SetTextMessageSpendLimitOverride","sms-voice:DescribeOptedOutNumbers","sms-voice:DeleteOptedOutNumber"],"Resource":"*","Condition":{"StringEquals":{"aws:CalledViaLast":"sns.amazonaws.com"}}}]}',
          "Provides full access to Amazon SNS via the AWS Management Console."),
-        ('AmazonECSTaskExecutionRolePolicy',
-         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ecr:GetAuthorizationToken","ecr:BatchCheckLayerAvailability","ecr:GetDownloadUrlForLayer","ecr:BatchGetImage","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}',
-         "Provides access to other AWS service resources that are required to run Amazon ECS tasks"),
         ('CloudWatchAgentServerPolicy',
          '{"Version":"2012-10-17","Statement":[{"Sid":"CWACloudWatchServerPermissions","Effect":"Allow","Action":["cloudwatch:PutMetricData","ec2:DescribeVolumes","ec2:DescribeTags","logs:PutLogEvents","logs:PutRetentionPolicy","logs:DescribeLogStreams","logs:DescribeLogGroups","logs:CreateLogStream","logs:CreateLogGroup","xray:PutTraceSegments","xray:PutTelemetryRecords","xray:GetSamplingRules","xray:GetSamplingTargets","xray:GetSamplingStatisticSummaries"],"Resource":"*"},{"Sid":"CWASSMServerPermissions","Effect":"Allow","Action":["ssm:GetParameter"],"Resource":"arn:aws:ssm:*:*:parameter/AmazonCloudWatch-*"}]}',
          "Permissions required to use AmazonCloudWatchAgent on servers"),
@@ -285,15 +321,29 @@ def _seed_aws_managed_policies() -> None:
         ('AWSXrayReadOnlyAccess',
          '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["xray:GetSamplingRules","xray:GetSamplingTargets","xray:GetSamplingStatisticSummaries","xray:BatchGetTraces","xray:BatchGetTraceSummaryById","xray:GetDistinctTraceGraphs","xray:GetServiceGraph","xray:GetTraceGraph","xray:GetTraceSummaries","xray:GetGroups","xray:GetGroup","xray:ListTagsForResource","xray:ListResourcePolicies","xray:GetTimeSeriesServiceStatistics","xray:GetInsightSummaries","xray:GetInsight","xray:GetInsightEvents","xray:GetInsightImpactGraph"],"Resource":["*"]}]}',
          "AWS X-Ray read-only access. Grants permission to retrieve trace data, service graphs, and sampling rules."),
-        ('AWSLambdaRole',
-         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["lambda:InvokeFunction"],"Resource":["*"]}]}',
-         "Default policy for AWS Lambda service role — permits Lambda to invoke other Lambda functions."),
     ]
 
     for name, document, description in seeds:
         _aws_managed_policies[f"{_AWS_MANAGED_POLICY_PREFIX}{name}"] = _make_aws_managed_record(
             name, document, description,
         )
+    for alias, real in _AWS_MANAGED_POLICY_ALIASES.items():
+        _aws_managed_policies[f"{_AWS_MANAGED_POLICY_PREFIX}{alias}"] = (
+            _aws_managed_policies[f"{_AWS_MANAGED_POLICY_PREFIX}{real}"]
+        )
+
+
+# Path-less ARNs earlier versions seeded for policies AWS only publishes under
+# ``service-role/``. They do not exist on AWS, but templates written against
+# those versions attach them, so each resolves to the real policy's record —
+# the same object, so the document, id and attachment count are shared.
+# ``ListPolicies`` reports the real ARN only.
+_AWS_MANAGED_POLICY_ALIASES: dict[str, str] = {
+    "AWSLambdaBasicExecutionRole": "service-role/AWSLambdaBasicExecutionRole",
+    "AWSLambdaVPCAccessExecutionRole": "service-role/AWSLambdaVPCAccessExecutionRole",
+    "AWSLambdaRole": "service-role/AWSLambdaRole",
+    "AmazonECSTaskExecutionRolePolicy": "service-role/AmazonECSTaskExecutionRolePolicy",
+}
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -810,6 +860,8 @@ def _list_policies(p):
     # AWS-managed policies — returned for scope "All" or "AWS".
     if scope != "Local":
         for arn, pol in _aws_managed_policies.items():
+            if pol.get("Arn") != arn:  # a legacy alias of a real policy
+                continue
             if not pol.get("Path", "/").startswith(prefix):
                 continue
             members += f"<member>{_managed_policy_xml(arn)}</member>"

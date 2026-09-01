@@ -583,9 +583,12 @@ def _resolve_managed_policy_document(policy_arn: str,
     """Resolve a managed policy ARN to its default version's document."""
     from ministack.services import iam as iam_svc
 
-    # AWS-managed policy
+    # AWS-managed policy — through the service's own lookup so that
+    # MINISTACK_AUTOCREATE_AWS_MANAGED applies to enforcement exactly as it
+    # applies to GetPolicy (an attached-but-never-fetched ARN used to resolve
+    # to nothing here while GetPolicy would have autocreated it).
     if policy_arn.startswith("arn:aws:iam::aws:policy/"):
-        mp = iam_svc._aws_managed_policies.get(policy_arn)
+        mp = iam_svc._lookup_policy(policy_arn)
         if mp:
             default_vid = mp.get("DefaultVersionId", "v1")
             versions = mp.get("Versions", {})

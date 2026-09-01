@@ -7,6 +7,11 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **IAM — the AWS-managed policies a CDK, SAM or Serverless deployment attaches resolve by their real ARNs** — the seeded catalogue filed the Lambda execution-role policies under `arn:aws:iam::aws:policy/<Name>` while AWS publishes them under `…:policy/service-role/<Name>`, the only ARN those tools emit, so `GetPolicy` on the real ARN answered `NoSuchEntity` and under `AUTH=true` a role that attached one carried no permissions from it; `AWSCloudFormationReadOnlyAccess` (the CDK deploy role's read grant), `CloudWatchLambdaInsightsExecutionRolePolicy`, `service-role/AmazonAPIGatewayPushToCloudWatchLogs` and `service-role/AWSIoTThingsRegistration` were missing altogether, which denied `cdk deploy` its first `DescribeStacks` under enforcement. The catalogue now carries them under their real path with the documents from the AWS Managed Policy Reference, reports `PolicyName` and `Path` as AWS does (so `ListPolicies` with `PathPrefix=/service-role/` finds them), adds the SQS, Kinesis and DynamoDB Lambda execution-role policies, and keeps the four path-less ARNs earlier versions seeded as aliases of the real record. Contributed by @iot-rocket.
+
+
 ## [1.5.5] — 2026-09-01
 
 ### Added

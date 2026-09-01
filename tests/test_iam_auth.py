@@ -708,6 +708,97 @@ class TestEnforce:
             iam_svc._access_keys.pop(fake_key, None)
             iam_svc._users.pop("inline-user", None)
             iam_svc._user_inline_policies.pop("inline-user", None)
+class TestSeededAwsManagedPolicies:
+    """The AWS-managed policies CDK, SAM and Serverless attach by their real ARNs
+    resolve to a document: the service-role/* path is the only one AWS has for the
+    Lambda execution roles, and a CDK deploy role reads stacks through
+    AWSCloudFormationReadOnlyAccess."""
+
+    @pytest.mark.parametrize("name,action", [
+        ("service-role/AWSLambdaBasicExecutionRole", "logs:PutLogEvents"),
+        ("service-role/AWSLambdaVPCAccessExecutionRole", "ec2:CreateNetworkInterface"),
+        ("service-role/AmazonAPIGatewayPushToCloudWatchLogs", "logs:CreateLogGroup"),
+        ("service-role/AWSIoTThingsRegistration", "iot:RegisterThing"),
+        ("AWSCloudFormationReadOnlyAccess", "cloudformation:DescribeStacks"),
+        ("AWSCloudFormationReadOnlyAccess", "cloudformation:BatchDescribeTypeConfigurations"),
+        ("CloudWatchLambdaInsightsExecutionRolePolicy", "logs:CreateLogGroup"),
+        ("service-role/AWSLambdaSQSQueueExecutionRole", "sqs:ReceiveMessage"),
+        ("service-role/AWSLambdaKinesisExecutionRole", "kinesis:GetRecords"),
+        ("service-role/AWSLambdaDynamoDBExecutionRole", "dynamodb:GetShardIterator"),
+    ])
+    def test_real_arn_resolves_and_grants(self, name, action):
+        from ministack.core.iam_evaluator import _resolve_managed_policy_document
+        doc = _resolve_managed_policy_document(f"arn:aws:iam::aws:policy/{name}", "000000000000")
+        assert doc, name
+        stmts = parse_policy_document(doc)
+        assert evaluate(_ctx(action=action), [stmts]).decision == "Allow", action
+
+    def test_lambda_insights_log_writes_are_scoped_to_its_log_group(self):
+        from ministack.core.iam_evaluator import _resolve_managed_policy_document
+        stmts = parse_policy_document(_resolve_managed_policy_document(
+            "arn:aws:iam::aws:policy/CloudWatchLambdaInsightsExecutionRolePolicy", "000000000000"))
+        insights = "arn:aws:logs:us-east-1:000000000000:log-group:/aws/lambda-insights:log-stream:x"
+        assert evaluate(_ctx(action="logs:PutLogEvents", resource=insights), [stmts]).decision == "Allow"
+        other = "arn:aws:logs:us-east-1:000000000000:log-group:/aws/lambda/f:log-stream:x"
+        assert evaluate(_ctx(action="logs:PutLogEvents", resource=other), [stmts]).decision == "ImplicitDeny"
+
+    @pytest.mark.parametrize("name", [
+        "service-role/AWSLambdaBasicExecutionRole",
+        "service-role/AmazonAPIGatewayPushToCloudWatchLogs",
+    ])
+    def test_get_policy_reports_path_and_bare_name(self, name):
+        from ministack.services.iam import _get_policy
+        status, _, body = _get_policy({"PolicyArn": [f"arn:aws:iam::aws:policy/{name}"]})
+        body = body.decode()
+        assert status == 200
+        path, _, policy_name = name.rpartition("/")
+        assert f"<PolicyName>{policy_name}</PolicyName>" in body
+        assert f"<Path>/{path}/</Path>" in body
+        assert f"<Arn>arn:aws:iam::aws:policy/{name}</Arn>" in body
+
+    def test_list_policies_by_path_prefix_finds_service_role_policies(self):
+        from ministack.services.iam import _list_policies
+        body = _list_policies({"Scope": ["AWS"], "PathPrefix": ["/service-role/"]})[2].decode()
+        assert "<Arn>arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole</Arn>" in body
+        assert "<Arn>arn:aws:iam::aws:policy/AdministratorAccess</Arn>" not in body
+
+    def test_legacy_bare_arn_is_an_alias_of_the_real_policy(self):
+        # Earlier versions seeded the Lambda execution-role policies under an
+        # ARN without the service-role/ path. Templates written against them
+        # still resolve — to the same record — but ListPolicies reports the
+        # real ARN only.
+        from ministack.core.iam_evaluator import _resolve_managed_policy_document
+        from ministack.services.iam import _get_policy, _list_policies
+        bare = "arn:aws:iam::aws:policy/AWSLambdaBasicExecutionRole"
+        real = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        assert (_resolve_managed_policy_document(bare, "000000000000")
+                == _resolve_managed_policy_document(real, "000000000000"))
+        status, _, body = _get_policy({"PolicyArn": [bare]})
+        assert status == 200 and f"<Arn>{bare}</Arn>" in body.decode()
+        listing = _list_policies({"Scope": ["AWS"]})[2].decode()
+        assert f"<Arn>{real}</Arn>" in listing
+        assert f"<Arn>{bare}</Arn>" not in listing
+
+    def test_cloudformation_readonly_does_not_grant_writes(self):
+        from ministack.core.iam_evaluator import _resolve_managed_policy_document
+        doc = _resolve_managed_policy_document(
+            "arn:aws:iam::aws:policy/AWSCloudFormationReadOnlyAccess", "000000000000")
+        stmts = parse_policy_document(doc)
+        assert evaluate(_ctx(action="cloudformation:CreateStack"), [stmts]).decision == "ImplicitDeny"
+
+    def test_autocreate_applies_to_enforcement(self, monkeypatch):
+        from ministack.core.iam_evaluator import _resolve_managed_policy_document
+        from ministack.services import iam as iam_svc
+        arn = "arn:aws:iam::aws:policy/SomethingNobodySeeded"
+        monkeypatch.delenv("MINISTACK_AUTOCREATE_AWS_MANAGED", raising=False)
+        assert _resolve_managed_policy_document(arn, "000000000000") is None
+        monkeypatch.setenv("MINISTACK_AUTOCREATE_AWS_MANAGED", "1")
+        monkeypatch.setattr(iam_svc, "_aws_managed_policies", dict(iam_svc._aws_managed_policies))
+        doc = _resolve_managed_policy_document(arn, "000000000000")
+        assert doc and evaluate(_ctx(action="sqs:SendMessage"),
+                                [parse_policy_document(doc)]).decision == "Allow"
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -1271,3 +1362,4 @@ def test_lambda_build_config_returns_a_config_not_an_error(monkeypatch):
     })
     assert isinstance(config, dict)
     assert config["FunctionName"] == "f"
+
