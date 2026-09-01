@@ -1765,10 +1765,12 @@ async def _handle_query(conn, sql, b_writer, c_writer):
             await c_writer.drain()
             return
         if kind == "rows":
-            out = _row_description(result["cols"])
-            for row in result["rows"]:
-                out += _data_row(row)
-            out += _command_complete(result["tag"])
+            # One join, not a growing bytes append -- per-row += re-copies the
+            # whole response for every row, quadratic in result-set size.
+            frames = [_row_description(result["cols"])]
+            frames.extend(_data_row(row) for row in result["rows"])
+            frames.append(_command_complete(result["tag"]))
+            out = b"".join(frames)
             c_writer.write(out + _ready(_status(conn)))
             await c_writer.drain()
             return
@@ -1985,9 +1987,7 @@ async def _ext_execute(conn, payload, b_writer, c_writer):
 
     kind, result = entry["synth"]
     if kind == "rows":
-        out = b""
-        for row in result["rows"]:
-            out += _data_row(row)
+        out = b"".join(_data_row(row) for row in result["rows"])
         c_writer.write(out + _command_complete(result["tag"]))
         await c_writer.drain()
         return

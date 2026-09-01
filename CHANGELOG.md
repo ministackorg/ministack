@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **Cognito — `PreventUserExistenceErrors=ENABLED` now hides an unknown user** — an app client created with the setting still answered `UserNotFoundException` from the flows a browser reaches, so any sign-in or password-reset form backed by MiniStack told an attacker which addresses have an account. The setting was accepted, stored and echoed back by `DescribeUserPoolClient`, so the client looked correctly configured while nothing read it. The flows AWS names for the setting — `USER_PASSWORD_AUTH`, `USER_SRP_AUTH` and `ADMIN_USER_PASSWORD_AUTH` — now answer `NotAuthorizedException` with the wrong-password message, at `RespondToAuthChallenge` as well as at `InitiateAuth`, which is what closes SRP: its `InitiateAuth` returns a `PASSWORD_VERIFIER` challenge without resolving the user, so the leak sat one step later, in the step every browser SDK makes. `ForgotPassword` and `ResendConfirmationCode` answer a normal `CodeDeliveryDetails` while delivering nothing and changing no state, and `ConfirmForgotPassword` answers `CodeMismatchException`. The `Destination` those two report is now masked as AWS reports it (`j****@e****`) on the real-user path too, since a full address there would have restored the same oracle in another field. `LEGACY` clients are unchanged, and the admin *directory* operations such as `AdminGetUser` keep reporting `UserNotFoundException` — only the admin auth flow is covered, as AWS documents. `CUSTOM_AUTH` is untouched: AWS handles it by passing `UserNotFound: true` to the challenge Lambda, which MiniStack does not model yet. Reported by @fhfournier.
+
 ## [1.5.4] — 2026-08-31
 
 ### Added

@@ -5982,7 +5982,10 @@ def _complete_multipart_upload(
     ordered_parts.sort(key=lambda x: x[0])
 
     md5_digests = b""
-    combined = b""
+    # Part bodies are joined once at the end: appending each 5 MB+ part to a
+    # growing bytes object re-copies the whole object per part, which is
+    # quadratic in object size across up to 10,000 parts.
+    combined_parts = []
     part_records = []
     checksum_algorithm = upload.get("checksum_algorithm")
     part_digests = []
@@ -6016,7 +6019,7 @@ def _complete_multipart_upload(
         if checksum_algorithm:
             part_digests.append(stored_checksums.get(checksum_algorithm))
         md5_digests += hashlib.md5(stored["body"]).digest()
-        combined += stored["body"]
+        combined_parts.append(stored["body"])
         # Retained so GetObjectAttributes can report ObjectParts (ListParts
         # functionality) for the completed multipart object.
         part_records.append({"PartNumber": pn, "Size": len(stored["body"])})
@@ -6035,6 +6038,7 @@ def _complete_multipart_upload(
     final_md5 = hashlib.md5(md5_digests).hexdigest()
     final_etag = f'"{final_md5}-{len(ordered_parts)}"'
 
+    combined = b"".join(combined_parts)
     obj = {
         "body": combined,
         "content_type": upload["content_type"],

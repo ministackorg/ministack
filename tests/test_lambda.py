@@ -5409,6 +5409,76 @@ def test_poll_sqs_backs_off_failing_esm_without_starving_other_esms(esm_poll_sta
     assert len(_sqs._queues[broken_queue_url]["messages"]) == 1
 
 
+def test_poll_sqs_record_carries_trace_header_and_fifo_attributes(esm_poll_state, monkeypatch):
+    """The record's attributes map carries AWSTraceHeader when the producer set
+    it, and the FIFO sequencing attributes on a FIFO message — the keys AWS
+    documents in the SQS event shape, which X-Ray/OpenTelemetry consumers read.
+    A message without them omits the keys rather than sending empty ones."""
+    _lsvc, _sqs, _kin, _ddb = esm_poll_state
+
+    queue_name = "esm-trace-attrs"
+    queue_url = f"http://localhost:4566/000000000000/{queue_name}"
+    trace = "Root=1-6893a2b4-aaaabbbbccccddddeeeeffff;Parent=0123456789abcdef;Sampled=1"
+    base = {
+        "md5_body": "", "sent_at": time.time(), "visible_at": 0,
+        "receive_count": 0, "first_receive_at": None, "message_attributes": {},
+    }
+    _sqs._queues[queue_url] = {
+        "name": queue_name,
+        "messages": [
+            {**base, "id": "msg-plain", "body": "plain", "receipt_handle": "rh-1"},
+            {**base, "id": "msg-traced", "body": "traced", "receipt_handle": "rh-2",
+             "sys": {"SenderId": "000000000000", "SentTimestamp": "0",
+                     "AWSTraceHeader": trace},
+             "group_id": "g1", "dedup_id": "d1", "seq": 18849496460467696128},
+        ],
+        "attributes": {
+            "QueueArn": f"arn:aws:sqs:us-east-1:000000000000:{queue_name}",
+            "VisibilityTimeout": "0",
+        },
+        "is_fifo": False,
+        "dedup_cache": {},
+        "fifo_seq": 0,
+    }
+    _lsvc._functions["esm-trace-attrs-fn"] = {
+        "config": {
+            "FunctionName": "esm-trace-attrs-fn",
+            "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:esm-trace-attrs-fn",
+        },
+        "versions": {}, "aliases": {},
+    }
+    _lsvc._esms["esm-trace-attrs"] = {
+        "UUID": "esm-trace-attrs",
+        "EventSourceArn": f"arn:aws:sqs:us-east-1:000000000000:{queue_name}",
+        "FunctionName": "esm-trace-attrs-fn",
+        "State": "Enabled",
+        "Enabled": True,
+        "BatchSize": 10,
+    }
+    events = []
+    monkeypatch.setattr(
+        _lsvc, "_execute_function",
+        lambda _func, event: (events.append(event), {"body": "ok"})[1],
+    )
+
+    _lsvc._poll_sqs()
+
+    records = {r["messageId"]: r for e in events for r in e["Records"]}
+    plain = records["msg-plain"]["attributes"]
+    assert "AWSTraceHeader" not in plain
+    assert "MessageGroupId" not in plain and "SequenceNumber" not in plain
+
+    traced = records["msg-traced"]["attributes"]
+    assert traced["AWSTraceHeader"] == trace
+    assert traced["MessageGroupId"] == "g1"
+    assert traced["MessageDeduplicationId"] == "d1"
+    assert traced["SequenceNumber"] == "18849496460467696128"
+    # The standard four are still present alongside.
+    for key in ("ApproximateReceiveCount", "SentTimestamp", "SenderId",
+                "ApproximateFirstReceiveTimestamp"):
+        assert key in traced, key
+
+
 def test_poll_sqs_retries_esm_after_backoff_expires(esm_poll_state, monkeypatch):
     """Once the cooldown elapses, a previously-failing ESM is retried again —
     the backoff paces retries, it doesn't disable the ESM."""
