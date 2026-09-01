@@ -1761,6 +1761,30 @@ def _extract_python_error(logs: str) -> str:
     return logs[idx:].strip()
 
 
+_LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "host.docker.internal")
+
+
+def _translate_loopback_conf(value: str, ministack_host: str, ministack_port: str) -> str:
+    """Rewrite loopback references to MiniStack in a user Spark conf value.
+
+    A ``--conf`` value carrying ``localhost:4566`` (or ``127.0.0.1`` /
+    ``host.docker.internal``) was written from the submitting host's point of
+    view; inside the job container those names do not reach MiniStack, so the
+    Iceberg REST client falls back to a dead endpoint. From inside the
+    container they can only have meant "MiniStack as the submitter saw it", so
+    the host part is rewritten to the resolved gateway address. Only the
+    gateway port qualifies — any other host or port passes through untouched,
+    so a conf pointing at an external REST catalog keeps working.
+    """
+    for h in _LOOPBACK_HOSTS:
+        value = re.sub(
+            rf"(?<![\w.-]){re.escape(h)}:{ministack_port}(?!\d)",
+            f"{ministack_host}:{ministack_port}",
+            value,
+        )
+    return value
+
+
 def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
     """Run a Glue Spark job inside an amazon/aws-glue-libs Docker container."""
     glue_version = job.get("GlueVersion", "4.0")
@@ -1789,7 +1813,8 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
     # Determine MiniStack's S3 endpoint from inside the container.
     # If on a Docker network, use the ministack container's IP; otherwise localhost.
     ministack_host = os.environ.get("MINISTACK_HOST", "")
-    ministack_port = os.environ.get("EDGE_PORT", "4566")
+    ministack_port = (os.environ.get("GATEWAY_PORT")
+                      or os.environ.get("EDGE_PORT") or "4566")
     if ms_network and not ministack_host:
         # Try to resolve from HOSTNAME
         try:
@@ -1898,7 +1923,8 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         for conf in conf_arg.split(" --conf "):
             conf = conf.strip()
             if conf:
-                cmd.extend(["--conf", conf])
+                cmd.extend(["--conf", _translate_loopback_conf(
+                    conf, ministack_host, ministack_port)])
 
     # The script path inside the container; spark-submit is handed the
     # bootstrap, which re-runs the real script as __main__ (see
@@ -1931,6 +1957,10 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         "environment": container_env,
         "detach": True,
         "labels": container_reaper.own_labels("glue", job_name=job_name),
+        # host.docker.internal resolves natively on Docker Desktop but not on
+        # a Linux engine; map it so a user conf pointing at the host resolves
+        # there too.
+        "extra_hosts": {"host.docker.internal": "host-gateway"},
     }
     if _entrypoint_override:
         container_kwargs["entrypoint"] = _entrypoint_override

@@ -2478,3 +2478,32 @@ def test_glue_spark_container_env_points_sdk_at_ministack(tmp_path, monkeypatch)
     assert "'/tmp/job.py'" in archived["_ministack_boot.py"]
     assert "create_client" in archived["_ministack_boot.py"]
     assert run["JobRunState"] == "SUCCEEDED"
+
+
+def test_glue_translate_loopback_conf_rewrites_only_gateway_loopbacks():
+    from ministack.services.glue import _translate_loopback_conf
+
+    host, port = "172.21.0.3", "4566"
+    # Loopback hosts on the gateway port are rewritten to the resolved address.
+    assert _translate_loopback_conf(
+        "spark.sql.catalog.ms.uri=http://host.docker.internal:4566/iceberg",
+        host, port,
+    ) == "spark.sql.catalog.ms.uri=http://172.21.0.3:4566/iceberg"
+    assert _translate_loopback_conf(
+        "spark.hadoop.fs.s3a.endpoint=http://localhost:4566",
+        host, port,
+    ) == "spark.hadoop.fs.s3a.endpoint=http://172.21.0.3:4566"
+    assert _translate_loopback_conf(
+        "a=http://127.0.0.1:4566/x", host, port,
+    ) == "a=http://172.21.0.3:4566/x"
+
+    # An external catalog, a different port, and a host merely containing a
+    # loopback name all pass through untouched.
+    for untouched in (
+        "spark.sql.catalog.ext.uri=https://polaris.example.com:8181/api",
+        "a=http://localhost:8080/other",
+        "a=http://localhost:45660/x",
+        "a=http://notlocalhost:4566/x",
+        "a=http://my.localhost.example:4566/x",
+    ):
+        assert _translate_loopback_conf(untouched, host, port) == untouched
