@@ -186,6 +186,7 @@ _knowledge_bases = AccountRegionScopedDict()         # kb_id -> KnowledgeBase
 _data_sources = AccountRegionScopedDict()            # f"{kb_id}/{ds_id}" -> DataSource
 _ingestion_jobs = AccountRegionScopedDict()          # f"{kb_id}/{ds_id}/{job_id}" -> IngestionJob
 _kb_documents = AccountRegionScopedDict()            # f"{kb_id}/{ds_id}/{doc_id}" -> Doc
+_kb_document_texts = AccountRegionScopedDict()       # f"{kb_id}/{ds_id}/{doc_id}" -> {Text, Uri}
 _flows = AccountRegionScopedDict()                   # flow_id -> Flow
 _flow_versions = AccountRegionScopedDict()           # f"{flow_id}/{version}" -> FlowVersion
 _flow_aliases = AccountRegionScopedDict()            # f"{flow_id}/{alias_id}" -> FlowAlias
@@ -196,7 +197,8 @@ _tags = AccountRegionScopedDict()                    # arn -> {key: value}
 
 _ALL_STORES = [_agents, _agent_versions, _agent_aliases, _agent_action_groups,
                 _agent_collaborators, _agent_knowledge_bases, _knowledge_bases,
-                _data_sources, _ingestion_jobs, _kb_documents, _flows,
+                _data_sources, _ingestion_jobs, _kb_documents,
+                _kb_document_texts, _flows,
                 _flow_versions, _flow_aliases, _prompts, _prompt_versions, _tags]
 
 
@@ -213,6 +215,7 @@ def get_state():
         "agent_knowledge_bases": _agent_knowledge_bases,
         "knowledge_bases": _knowledge_bases, "data_sources": _data_sources,
         "ingestion_jobs": _ingestion_jobs, "kb_documents": _kb_documents,
+        "kb_document_texts": _kb_document_texts,
         "flows": _flows, "flow_versions": _flow_versions,
         "flow_aliases": _flow_aliases, "prompts": _prompts,
         "prompt_versions": _prompt_versions, "tags": _tags,
@@ -232,6 +235,7 @@ def restore_state(data):
     _data_sources.update(data.get("data_sources", {}))
     _ingestion_jobs.update(data.get("ingestion_jobs", {}))
     _kb_documents.update(data.get("kb_documents", {}))
+    _kb_document_texts.update(data.get("kb_document_texts", {}))
     _flows.update(data.get("flows", {}))
     _flow_versions.update(data.get("flow_versions", {}))
     _flow_aliases.update(data.get("flow_aliases", {}))
@@ -854,9 +858,20 @@ def _update_ds(kb_id: str, ds_id: str, body) -> tuple:
 
 def _delete_ds(kb_id: str, ds_id: str) -> tuple:
     key = f"{kb_id}/{ds_id}"
-    if key not in _data_sources:
+    rec = _data_sources.get(key)
+    if rec is None:
         return _not_found(f"Data source {ds_id} not found.")
     del _data_sources[key]
+    # dataDeletionPolicy DELETE removes the vector-store data on AWS; RETAIN
+    # (the default) leaves the ingested documents retrievable.
+    if rec.get("DataDeletionPolicy") == "DELETE":
+        prefix = f"{kb_id}/{ds_id}/"
+        for doc_key in [k for k in _kb_document_texts.keys()
+                        if k.startswith(prefix)]:
+            del _kb_document_texts[doc_key]
+        for doc_key in [k for k in _kb_documents.keys()
+                        if k.startswith(prefix)]:
+            del _kb_documents[doc_key]
     return _json({"KnowledgeBaseId": kb_id, "DataSourceId": ds_id,
                    "Status": "DELETING"}, status=202)
 
@@ -866,33 +881,104 @@ def _delete_ds(kb_id: str, ds_id: str) -> tuple:
 # ===========================================================================
 
 
+def _run_s3_ingestion(kb_id: str, ds_id: str, ds_rec: dict) -> tuple[dict, list]:
+    """Read the data source's S3 bucket and index its text documents.
+
+    Returns (statistics, failure_reasons). The statistics are real counts of
+    what was read and stored — never a fabricated success.
+    """
+    from ministack.services import s3 as s3_svc
+
+    stats = {"NumberOfDocumentsScanned": 0,
+             "NumberOfNewDocumentsIndexed": 0,
+             "NumberOfModifiedDocumentsIndexed": 0,
+             "NumberOfDocumentsDeleted": 0,
+             "NumberOfDocumentsFailed": 0,
+             "NumberOfMetadataDocumentsScanned": 0,
+             "NumberOfMetadataDocumentsModified": 0}
+    failures = []
+
+    config = ds_rec.get("DataSourceConfiguration") or {}
+    if config.get("type") != "S3":
+        failures.append(
+            f"Data source type {config.get('type')} is not ingested by "
+            "MiniStack; only S3 data sources are read.")
+        return stats, failures
+    s3_config = config.get("s3Configuration") or {}
+    bucket_arn = s3_config.get("bucketArn") or ""
+    bucket_name = bucket_arn.rsplit(":", 1)[-1]
+    prefixes = s3_config.get("inclusionPrefixes") or []
+    bucket = s3_svc._buckets.get(bucket_name)
+    if bucket is None:
+        failures.append(f"S3 bucket {bucket_name} does not exist.")
+        return stats, failures
+
+    for key in sorted(bucket["objects"].keys()):
+        if key.endswith("/"):
+            continue
+        if prefixes and not any(key.startswith(p) for p in prefixes):
+            continue
+        if key.endswith(".metadata.json"):
+            stats["NumberOfMetadataDocumentsScanned"] += 1
+            continue
+        stats["NumberOfDocumentsScanned"] += 1
+        data = s3_svc._get_object_data(bucket_name, key)
+        try:
+            text = (data or b"").decode("utf-8")
+        except UnicodeDecodeError:
+            stats["NumberOfDocumentsFailed"] += 1
+            failures.append(f"Document s3://{bucket_name}/{key} is not UTF-8 "
+                            "text and was not indexed.")
+            continue
+        doc_key = f"{kb_id}/{ds_id}/{key}"
+        existing = doc_key in _kb_document_texts
+        uri = f"s3://{bucket_name}/{key}"
+        _kb_document_texts[doc_key] = {"Text": text, "Uri": uri}
+        _kb_documents[doc_key] = {
+            "DocumentIdentifier": {"dataSourceType": "S3", "s3": {"uri": uri}},
+            "Status": "INDEXED",
+            "StatusReason": "",
+            "UpdatedAt": _now_iso(),
+        }
+        if existing:
+            stats["NumberOfModifiedDocumentsIndexed"] += 1
+        else:
+            stats["NumberOfNewDocumentsIndexed"] += 1
+    return stats, failures
+
+
 def _start_ingestion_job(kb_id: str, ds_id: str, body) -> tuple:
     body_obj, err = _parse_body(body)
     if err:
         return err
-    if f"{kb_id}/{ds_id}" not in _data_sources:
+    ds_rec = _data_sources.get(f"{kb_id}/{ds_id}")
+    if ds_rec is None:
         return _not_found(f"Data source {ds_id} not found.")
     job_id = _id("IJ")
     now = _now_iso()
+    stats, failures = _run_s3_ingestion(kb_id, ds_id, ds_rec)
+    indexed = (stats["NumberOfNewDocumentsIndexed"]
+               + stats["NumberOfModifiedDocumentsIndexed"])
+    # A job that could not read its source at all is FAILED, loudly; a job that
+    # read the bucket reports what it actually indexed.
+    status = "FAILED" if (failures and not indexed
+                          and not stats["NumberOfDocumentsScanned"]) else "COMPLETE"
     rec = {
         "DataSourceId": ds_id,
         "KnowledgeBaseId": kb_id,
         "IngestionJobId": job_id,
-        "Status": "COMPLETE",
+        "Status": status,
         "StartedAt": now,
         "UpdatedAt": now,
         "Description": body_obj.get("description", ""),
-        "Statistics": {"NumberOfDocumentsScanned": 0,
-                        "NumberOfNewDocumentsIndexed": 0,
-                        "NumberOfModifiedDocumentsIndexed": 0,
-                        "NumberOfDocumentsDeleted": 0,
-                        "NumberOfDocumentsFailed": 0,
-                        "NumberOfMetadataDocumentsScanned": 0,
-                        "NumberOfMetadataDocumentsModified": 0},
-        "FailureReasons": [],
+        "Statistics": stats,
+        "FailureReasons": failures,
     }
     _ingestion_jobs[f"{kb_id}/{ds_id}/{job_id}"] = rec
-    return _json({"IngestionJob": rec}, status=202)
+    # The start response reports STARTING, as on AWS; the work is already done
+    # synchronously, so the first GetIngestionJob sees the final state.
+    started_view = dict(rec, Status="STARTING" if status == "COMPLETE" else status)
+    return _json({"IngestionJob": started_view}, status=202)
 
 
 def _get_ingestion_job(kb_id: str, ds_id: str, job_id: str) -> tuple:

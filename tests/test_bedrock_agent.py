@@ -221,24 +221,86 @@ def test_bedrock_agent_data_source_crud():
 
 
 def test_bedrock_agent_ingestion_job_lifecycle():
+    s3 = make_client("s3")
+    s3.create_bucket(Bucket="kb-ij-docs")
+    s3.put_object(Bucket="kb-ij-docs", Key="a.txt", Body=b"MiniStack runs on port 4566.")
+    s3.put_object(Bucket="kb-ij-docs", Key="b.txt", Body=b"Ingestion stores documents.")
     kb = _make_kb("kb-ij")
     ds = _agent().create_data_source(
         knowledgeBaseId=kb["knowledgeBaseId"], name="ds-ij",
-        dataSourceConfiguration={"type": "S3", "s3Configuration": {"bucketArn": "arn:aws:s3:::b"}},
+        dataSourceConfiguration={"type": "S3", "s3Configuration": {"bucketArn": "arn:aws:s3:::kb-ij-docs"}},
     )["dataSource"]
     job = _agent().start_ingestion_job(
         knowledgeBaseId=kb["knowledgeBaseId"], dataSourceId=ds["dataSourceId"],
     )["ingestionJob"]
+    assert job["status"] == "STARTING"
     g = _agent().get_ingestion_job(
         knowledgeBaseId=kb["knowledgeBaseId"], dataSourceId=ds["dataSourceId"],
         ingestionJobId=job["ingestionJobId"],
     )
-    assert g["ingestionJob"]["status"] in ("STARTING", "IN_PROGRESS", "COMPLETE")
+    assert g["ingestionJob"]["status"] == "COMPLETE"
+    stats = g["ingestionJob"]["statistics"]
+    assert stats["numberOfDocumentsScanned"] == 2
+    assert stats["numberOfNewDocumentsIndexed"] == 2
+    assert stats["numberOfDocumentsFailed"] == 0
     lst = _agent().list_ingestion_jobs(
         knowledgeBaseId=kb["knowledgeBaseId"], dataSourceId=ds["dataSourceId"],
     )
     assert any(j["ingestionJobId"] == job["ingestionJobId"]
                 for j in lst["ingestionJobSummaries"])
+
+
+def test_bedrock_agent_ingestion_job_missing_bucket_fails_loudly():
+    kb = _make_kb("kb-ij-missing")
+    ds = _agent().create_data_source(
+        knowledgeBaseId=kb["knowledgeBaseId"], name="ds-ij-missing",
+        dataSourceConfiguration={"type": "S3", "s3Configuration": {
+            "bucketArn": "arn:aws:s3:::kb-ij-no-such-bucket"}},
+    )["dataSource"]
+    job = _agent().start_ingestion_job(
+        knowledgeBaseId=kb["knowledgeBaseId"], dataSourceId=ds["dataSourceId"],
+    )["ingestionJob"]
+    assert job["status"] == "FAILED"
+    g = _agent().get_ingestion_job(
+        knowledgeBaseId=kb["knowledgeBaseId"], dataSourceId=ds["dataSourceId"],
+        ingestionJobId=job["ingestionJobId"],
+    )["ingestionJob"]
+    assert g["status"] == "FAILED"
+    assert g["failureReasons"]
+    assert "kb-ij-no-such-bucket" in g["failureReasons"][0]
+    assert g["statistics"]["numberOfDocumentsScanned"] == 0
+
+
+def test_bedrock_agent_ingestion_reindex_counts_modified_and_failed():
+    s3 = make_client("s3")
+    s3.create_bucket(Bucket="kb-ij-mixed")
+    s3.put_object(Bucket="kb-ij-mixed", Key="doc.txt", Body=b"Readable text.")
+    s3.put_object(Bucket="kb-ij-mixed", Key="blob.bin", Body=b"\xff\xfe\x00\x01binary")
+    kb = _make_kb("kb-ij-mixed")
+    ds = _agent().create_data_source(
+        knowledgeBaseId=kb["knowledgeBaseId"], name="ds-ij-mixed",
+        dataSourceConfiguration={"type": "S3", "s3Configuration": {"bucketArn": "arn:aws:s3:::kb-ij-mixed"}},
+    )["dataSource"]
+
+    def run():
+        job = _agent().start_ingestion_job(
+            knowledgeBaseId=kb["knowledgeBaseId"], dataSourceId=ds["dataSourceId"],
+        )["ingestionJob"]
+        return _agent().get_ingestion_job(
+            knowledgeBaseId=kb["knowledgeBaseId"], dataSourceId=ds["dataSourceId"],
+            ingestionJobId=job["ingestionJobId"],
+        )["ingestionJob"]
+
+    first = run()
+    assert first["status"] == "COMPLETE"
+    assert first["statistics"]["numberOfDocumentsScanned"] == 2
+    assert first["statistics"]["numberOfNewDocumentsIndexed"] == 1
+    assert first["statistics"]["numberOfDocumentsFailed"] == 1
+    assert any("blob.bin" in r for r in first["failureReasons"])
+
+    second = run()
+    assert second["statistics"]["numberOfNewDocumentsIndexed"] == 0
+    assert second["statistics"]["numberOfModifiedDocumentsIndexed"] == 1
 
 
 # ---------------------------------------------------------------------------

@@ -778,10 +778,20 @@ def test_bedrock_invoke_model_with_response_stream_titan_envelope():
 # ---------------------------------------------------------------------------
 
 
+def _make_guardrail(name, **policies):
+    return _bedrock().create_guardrail(
+        name=name,
+        blockedInputMessaging="Input blocked by guardrail.",
+        blockedOutputsMessaging="Output blocked by guardrail.",
+        **policies,
+    )["guardrailId"]
+
+
 def test_bedrock_apply_guardrail_returns_required_fields():
+    gid = _make_guardrail("gr-apply-shape")
     client = make_client("bedrock-runtime")
     resp = client.apply_guardrail(
-        guardrailIdentifier="gr-anything",
+        guardrailIdentifier=gid,
         guardrailVersion="DRAFT",
         source="INPUT",
         content=[{"text": {"text": "hello world"}}],
@@ -793,6 +803,125 @@ def test_bedrock_apply_guardrail_returns_required_fields():
     assert resp["outputs"][0]["text"] == "hello world"
     assert isinstance(resp["usage"]["topicPolicyUnits"], int)
     assert resp["guardrailCoverage"]["textCharacters"]["total"] == len("hello world")
+
+
+def test_bedrock_apply_guardrail_unknown_id_is_not_found():
+    client = make_client("bedrock-runtime")
+    try:
+        client.apply_guardrail(
+            guardrailIdentifier="gr-does-not-exist",
+            guardrailVersion="DRAFT",
+            source="INPUT",
+            content=[{"text": {"text": "hello"}}],
+        )
+        raise AssertionError("expected ResourceNotFoundException")
+    except botocore.exceptions.ClientError as e:
+        assert e.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_bedrock_apply_guardrail_blocks_configured_word():
+    gid = _make_guardrail(
+        "gr-word-block",
+        wordPolicyConfig={"wordsConfig": [{"text": "pineapple"}]},
+    )
+    client = make_client("bedrock-runtime")
+    resp = client.apply_guardrail(
+        guardrailIdentifier=gid, guardrailVersion="DRAFT", source="INPUT",
+        content=[{"text": {"text": "I love Pineapple on pizza"}}],
+    )
+    assert resp["action"] == "GUARDRAIL_INTERVENED"
+    assert resp["outputs"] == [{"text": "Input blocked by guardrail."}]
+    words = resp["assessments"][0]["wordPolicy"]["customWords"]
+    assert words[0]["match"] == "pineapple"
+    assert words[0]["action"] == "BLOCKED"
+    assert resp["usage"]["wordPolicyUnits"] >= 1
+    # A clean input passes the same guardrail
+    clean = client.apply_guardrail(
+        guardrailIdentifier=gid, guardrailVersion="DRAFT", source="INPUT",
+        content=[{"text": {"text": "I love mango on pizza"}}],
+    )
+    assert clean["action"] == "NONE"
+    assert clean["outputs"][0]["text"] == "I love mango on pizza"
+
+
+def test_bedrock_apply_guardrail_anonymizes_pii_and_regex():
+    gid = _make_guardrail(
+        "gr-pii-anon",
+        sensitiveInformationPolicyConfig={
+            "piiEntitiesConfig": [{"type": "EMAIL", "action": "ANONYMIZE"}],
+            "regexesConfig": [{"name": "ticket", "pattern": r"TICKET-\d+",
+                               "action": "ANONYMIZE"}],
+        },
+    )
+    client = make_client("bedrock-runtime")
+    resp = client.apply_guardrail(
+        guardrailIdentifier=gid, guardrailVersion="DRAFT", source="OUTPUT",
+        content=[{"text": {"text": "Contact bob@example.com about TICKET-42"}}],
+    )
+    assert resp["action"] == "GUARDRAIL_INTERVENED"
+    assert resp["outputs"][0]["text"] == "Contact {EMAIL} about {ticket}"
+    sip = resp["assessments"][0]["sensitiveInformationPolicy"]
+    assert sip["piiEntities"][0]["type"] == "EMAIL"
+    assert sip["piiEntities"][0]["action"] == "ANONYMIZED"
+    assert sip["regexes"][0]["name"] == "ticket"
+    assert sip["regexes"][0]["action"] == "ANONYMIZED"
+
+
+def test_bedrock_apply_guardrail_blocking_pii_blocks():
+    gid = _make_guardrail(
+        "gr-pii-block",
+        sensitiveInformationPolicyConfig={
+            "piiEntitiesConfig": [{"type": "US_SOCIAL_SECURITY_NUMBER",
+                                   "action": "BLOCK"}],
+        },
+    )
+    client = make_client("bedrock-runtime")
+    resp = client.apply_guardrail(
+        guardrailIdentifier=gid, guardrailVersion="DRAFT", source="INPUT",
+        content=[{"text": {"text": "my ssn is 123-45-6789"}}],
+    )
+    assert resp["action"] == "GUARDRAIL_INTERVENED"
+    assert resp["outputs"] == [{"text": "Input blocked by guardrail."}]
+
+
+def test_bedrock_converse_honours_guardrail_config():
+    gid = _make_guardrail(
+        "gr-converse",
+        wordPolicyConfig={"wordsConfig": [{"text": "forbidden"}]},
+    )
+    client = make_client("bedrock-runtime")
+    blocked = client.converse(
+        modelId="anthropic.claude-3-5-sonnet-20241022-v2:0",
+        messages=[{"role": "user", "content": [{"text": "say the forbidden word"}]}],
+        guardrailConfig={"guardrailIdentifier": gid, "guardrailVersion": "DRAFT",
+                         "trace": "enabled"},
+    )
+    assert blocked["stopReason"] == "guardrail_intervened"
+    assert blocked["output"]["message"]["content"][0]["text"] == \
+        "Input blocked by guardrail."
+    assessment = blocked["trace"]["guardrail"]["inputAssessment"][gid]
+    assert assessment["wordPolicy"]["customWords"][0]["match"] == "forbidden"
+
+    clean = client.converse(
+        modelId="anthropic.claude-3-5-sonnet-20241022-v2:0",
+        messages=[{"role": "user", "content": [{"text": "hello there"}]}],
+        guardrailConfig={"guardrailIdentifier": gid, "guardrailVersion": "DRAFT"},
+    )
+    assert clean["stopReason"] == "end_turn"
+
+
+def test_bedrock_converse_unknown_guardrail_is_not_found():
+    client = make_client("bedrock-runtime")
+    try:
+        client.converse(
+            modelId="anthropic.claude-3-5-sonnet-20241022-v2:0",
+            messages=[{"role": "user", "content": [{"text": "hello"}]}],
+            guardrailConfig={"guardrailIdentifier": "gr-nope",
+                             "guardrailVersion": "DRAFT"},
+        )
+        raise AssertionError("expected ResourceNotFoundException")
+    except botocore.exceptions.ClientError as e:
+        assert e.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
 def test_bedrock_apply_guardrail_rejects_invalid_source():
