@@ -28,16 +28,6 @@ _stack_events = AccountRegionScopedDict()  # stack_id -> [event list]
 _exports = AccountRegionScopedDict()       # export_name -> {StackId, Name, Value}
 _change_sets = AccountRegionScopedDict()   # cs_id -> change set dict
 
-# Re-exports for compatibility
-from .engine import (  # noqa: E402
-    _NO_VALUE,
-    _evaluate_conditions,
-    _extract_deps,
-    _parse_template,
-    _resolve_parameters,
-    _resolve_refs,
-    _topological_sort,
-)
 from .helpers import _p  # noqa: E402
 
 
@@ -114,9 +104,7 @@ def restore_state(data):
 
 
 # Must be last — handlers imports from this module
-from ministack.core.responses import get_account_id
-
-from .handlers import _ACTION_HANDLERS, _validate_template  # noqa: E402
+from .handlers import _ACTION_HANDLERS  # noqa: E402
 
 # Restore persisted stack metadata on first import (a CloudFormation request, or
 # the eager boot import when a state file exists). Failure falls back to a fresh

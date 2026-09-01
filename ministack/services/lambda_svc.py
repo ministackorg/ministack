@@ -6488,16 +6488,31 @@ def _poll_sqs():
             records = []
             for msg in batch:
                 first_recv = msg.get("first_receive_at") or now
+                attributes = {
+                    "ApproximateReceiveCount": str(msg.get("receive_count", 1)),
+                    "SentTimestamp": str(int(msg["sent_at"] * 1000)),
+                    "SenderId": get_account_id(),
+                    "ApproximateFirstReceiveTimestamp": str(int(first_recv * 1000)),
+                }
+                # AWSTraceHeader carries X-Ray / OpenTelemetry trace context
+                # through SQS into the consumer; AWS delivers it inside the
+                # record's attributes map when the producer set it.
+                trace_header = (msg.get("sys") or {}).get("AWSTraceHeader")
+                if trace_header:
+                    attributes["AWSTraceHeader"] = trace_header
+                # FIFO records carry their sequencing attributes, per the
+                # documented FIFO event shape.
+                if msg.get("group_id"):
+                    attributes["MessageGroupId"] = msg["group_id"]
+                if msg.get("dedup_id"):
+                    attributes["MessageDeduplicationId"] = msg["dedup_id"]
+                if msg.get("seq") is not None:
+                    attributes["SequenceNumber"] = str(msg["seq"])
                 records.append({
                     "messageId": msg["id"],
                     "receiptHandle": msg["receipt_handle"],
                     "body": msg["body"],
-                    "attributes": {
-                        "ApproximateReceiveCount": str(msg.get("receive_count", 1)),
-                        "SentTimestamp": str(int(msg["sent_at"] * 1000)),
-                        "SenderId": get_account_id(),
-                        "ApproximateFirstReceiveTimestamp": str(int(first_recv * 1000)),
-                    },
+                    "attributes": attributes,
                     "messageAttributes": _sqs_message_attributes_to_camel_case(
                         msg.get("message_attributes", {})
                     ),

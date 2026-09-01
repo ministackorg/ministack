@@ -1099,6 +1099,28 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
         volume_name: {"bind": data_path, "mode": "rw"},
     }
 
+    # Publish the cluster's endpoint as a network alias on its container.
+    #
+    # networking_config must be a plain {network: EndpointConfig} dict and must
+    # be passed *with* network=, not instead of it. docker-py checks
+    # `network not in networking_config` and silently drops the config when the
+    # key is missing, so api.create_networking_config() — which wraps the dict in
+    # {'EndpointsConfig': ...} — fails that check and the aliases vanish without
+    # an error. network= also sets host_config's network_mode, so removing it
+    # breaks the container outright.
+    endpoint_aliases = (
+        _cluster_endpoint_aliases(cluster)
+        if _network_supports_aliases(container_kwargs.get("network"))
+        else []
+    )
+    if endpoint_aliases:
+        # The endpoint config is written out directly rather than through
+        # docker_client.api.create_endpoint_config, which returns exactly this
+        # dict. Reaching for .api also reaches past the test doubles this module
+        # is exercised with, and they have no such attribute.
+        container_kwargs["networking_config"] = {
+            container_kwargs["network"]: {"Aliases": list(endpoint_aliases)},
+        }
     try:
         container = docker_client.containers.run(**container_kwargs)
     except Exception as e:
@@ -1118,7 +1140,12 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
             networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
             container_ip = networks.get(ms_network, {}).get("IPAddress", "")
             if container_ip:
-                endpoint_host = container_ip
+                # Report the alias, not the address behind it. An address changes
+                # when the container is replaced, and every consumer holding the
+                # old one is then pointing at whatever took over that IP. Internal
+                # wiring and the readiness probe keep using the address.
+                endpoint_host = (endpoint_aliases[0] if endpoint_aliases
+                                 else container_ip)
                 endpoint_port = container_port
                 internal_host = container_ip
                 internal_port = container_port
@@ -3006,6 +3033,45 @@ def _is_host_port_free(port: int) -> bool:
         s.close()
 
 
+# Docker refuses network-scoped aliases outside user-defined networks:
+# "network-scoped alias is supported only for containers in user defined
+# networks". ministack started with a plain `docker run` sits on the default
+# bridge, so the alias has to be skipped there rather than failing the container.
+_NON_ALIASABLE_NETWORKS = frozenset({"bridge", "host", "none", ""})
+
+
+def _network_supports_aliases(network):
+    return bool(network) and network not in _NON_ALIASABLE_NETWORKS
+
+
+def _cluster_endpoint_aliases(cluster):
+    """The DNS name this cluster advertises, for use as a Docker network alias.
+
+    CreateDBCluster already answers with an AWS-shaped endpoint —
+    ``mydb.cluster-abc123.us-east-2.rds.amazonaws.com`` — and consumers store it,
+    because on AWS an endpoint is stable for the life of the cluster. Registering
+    that same name on the container makes that true here: the value handed out at
+    create time keeps resolving after the container is replaced at a different
+    address. Docker's embedded DNS accepts dotted names, so the alias can be the
+    real endpoint rather than something invented alongside it.
+
+    The writer endpoint only. ReaderEndpoint has to follow whichever member is
+    currently a reader, and a cluster can promote one on failover, so pinning it
+    to the writer's container would answer with the wrong database.
+    """
+    value = cluster.get("Endpoint")
+    # Two shapes in practice: a bare string when the cluster is created, and the
+    # {Address, Port, HostedZoneId} record once a container has run. Handling only
+    # the first attaches the alias on the first launch and skips every relaunch —
+    # which is precisely when it is needed.
+    if isinstance(value, dict):
+        value = value.get("Address")
+    # A name, not an address: an earlier container may have left one here.
+    if isinstance(value, str) and value and not value[0].isdigit():
+        return [value]
+    return []
+
+
 def _next_port():
     """Return the next free host port for an RDS container. Increments
     the persisted counter, but skips ports that are already bound on the
@@ -3451,9 +3517,20 @@ def _sync_cluster_endpoints(cluster):
         return
     reader_endpoint = _cluster_reader_endpoint(cluster) or endpoint
     cluster["Endpoint"] = endpoint.get("Address", cluster.get("Endpoint", ""))
-    cluster["ReaderEndpoint"] = reader_endpoint.get(
-        "Address", cluster.get("ReaderEndpoint", ""),
-    )
+    if reader_endpoint is endpoint:
+        # Falling back to the writer's container. The writer's Address may be a
+        # network alias, which is stable precisely because it is pinned to one
+        # container — and the reader endpoint must be free to move to a standby
+        # when one appears. Publish the address here, as before.
+        reader_address = (
+            cluster.get("_shared_internal_address")
+            or endpoint.get("Address", cluster.get("ReaderEndpoint", ""))
+        )
+    else:
+        reader_address = reader_endpoint.get(
+            "Address", cluster.get("ReaderEndpoint", ""),
+        )
+    cluster["ReaderEndpoint"] = reader_address
     cluster["Port"] = int(endpoint.get("Port", cluster.get("Port", 0)))
 
 

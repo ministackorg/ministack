@@ -1609,6 +1609,11 @@ def _register_ca_certificate(payload: dict, qp: dict) -> tuple:
         return error_response_json(
             "InvalidRequestException", "caCertificate is required", 400
         )
+    registration_config = payload.get("registrationConfig")
+    if registration_config is not None and not isinstance(registration_config, dict):
+        return error_response_json(
+            "InvalidRequestException", "registrationConfig must be an object", 400
+        )
     certificate_mode = payload.get("certificateMode") or "DEFAULT"
     if certificate_mode not in ("DEFAULT", "SNI_ONLY"):
         return error_response_json(
@@ -1638,6 +1643,8 @@ def _register_ca_certificate(payload: dict, qp: dict) -> tuple:
         "creationDate": _now_epoch(),
         "ownedBy": get_account_id(),
     }
+    if registration_config is not None:
+        record["registrationConfig"] = registration_config
     _ca_certificates[ca_id] = record
     return json_response({
         "certificateArn": record["certificateArn"],
@@ -1686,7 +1693,11 @@ def _handle_ca_certificate(method: str, path: str, body: bytes, qp: dict) -> tup
                 "certificateMode": record.get("certificateMode", "DEFAULT"),
                 "ownedBy": record["ownedBy"],
                 "creationDate": record.get("creationDate"),
-            }
+            },
+            # registrationConfig is a sibling of certificateDescription in
+            # DescribeCACertificateResponse, omitted when never configured.
+            **({"registrationConfig": record["registrationConfig"]}
+               if record.get("registrationConfig") is not None else {}),
         })
     if method == "PUT":
         # newStatus / newAutoRegistrationStatus are query-string params per the
@@ -1716,6 +1727,19 @@ def _handle_ca_certificate(method: str, path: str, body: bytes, qp: dict) -> tup
             record["status"] = new_status
         if new_auto is not None:
             record["autoRegistrationStatus"] = new_auto
+        # Body members per the model: registrationConfig replaces the stored
+        # JITR provisioning config; removeAutoRegistration, when true, turns
+        # auto-registration off.
+        registration_config = payload.get("registrationConfig")
+        if registration_config is not None:
+            if not isinstance(registration_config, dict):
+                return error_response_json(
+                    "InvalidRequestException",
+                    "registrationConfig must be an object", 400,
+                )
+            record["registrationConfig"] = registration_config
+        if payload.get("removeAutoRegistration"):
+            record["autoRegistrationStatus"] = "DISABLE"
         _ca_certificates[ca_id] = record
         return json_response({})
     if method == "DELETE":

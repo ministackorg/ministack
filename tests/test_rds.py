@@ -11050,7 +11050,12 @@ def test_rds_pg_replicating_reader_lifecycle(monkeypatch):
         # ReaderEndpoint now resolves to the standby; the writer endpoint
         # stays on the shared container; the writer stays the only writer.
         assert cluster["ReaderEndpoint"] == "10.0.0.7"
-        assert cluster["Endpoint"] == "10.0.0.5"
+        # The writer endpoint still identifies the shared container rather
+        # than moving to the standby. It is the cluster's stable name now, not
+        # the container address, so compare against what the shared endpoint
+        # publishes instead of the address it happens to resolve to.
+        assert cluster["Endpoint"] == cluster["_shared_endpoint"]["Address"]
+        assert cluster["Endpoint"] != "10.0.0.7"
         writers = [
             member for member in cluster["DBClusterMembers"]
             if member.get("IsClusterWriter")
@@ -13176,3 +13181,49 @@ def test_rds_modify_cluster_sets_serverlessv2_scaling_configuration(rds):
     ]
     assert slv2["MinCapacity"] == 2.0
     assert slv2["MaxCapacity"] == 8.0
+
+
+def test_rds_cluster_endpoint_alias_survives_the_record_changing_shape():
+    """The endpoint alias is read from both shapes the cluster record takes.
+
+    A cluster carries ``Endpoint`` as a bare string when it is created and as an
+    {Address, Port, HostedZoneId} record once a container has run. Reading only
+    the string attaches the alias on the first launch and skips it on every
+    relaunch — which is the one case the alias exists for, so it looks correct
+    until something restarts.
+    """
+    from ministack.services import rds as rds_service
+
+    name = "mydb.cluster-abc123.us-east-2.rds.amazonaws.com"
+    assert rds_service._cluster_endpoint_aliases({"Endpoint": name}) == [name]
+    assert rds_service._cluster_endpoint_aliases(
+        {"Endpoint": {"Address": name, "Port": 5432}}) == [name]
+
+    # An address is not a name. An earlier container may have left one behind,
+    # and aliasing it would pin the endpoint to an address that has already moved.
+    assert rds_service._cluster_endpoint_aliases({"Endpoint": "172.20.0.4"}) == []
+    assert rds_service._cluster_endpoint_aliases(
+        {"Endpoint": {"Address": "172.20.0.4"}}) == []
+    assert rds_service._cluster_endpoint_aliases({}) == []
+
+    # ReaderEndpoint is deliberately not aliased: it has to follow whichever
+    # member is currently a reader, and failover moves that.
+    assert rds_service._cluster_endpoint_aliases(
+        {"Endpoint": name, "ReaderEndpoint": "ro.cluster-abc.rds.amazonaws.com"}
+    ) == [name]
+
+
+def test_rds_network_aliases_only_on_user_defined_networks():
+    """Docker refuses network-scoped aliases outside user-defined networks.
+
+    Asking for one on the default bridge fails the container outright — "network
+    -scoped alias is supported only for containers in user defined networks" —
+    so a ministack started with a plain `docker run` must skip the alias rather
+    than fail to start its databases.
+    """
+    from ministack.services import rds as rds_service
+
+    for network in ("bridge", "host", "none", "", None):
+        assert not rds_service._network_supports_aliases(network), network
+    for network in ("ministack_default", "my-compose_default", "anything-else"):
+        assert rds_service._network_supports_aliases(network), network

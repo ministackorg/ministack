@@ -5248,6 +5248,39 @@ def test_iot_register_ca_certificate_mode_round_trip(iot_client):
     iot_client.delete_ca_certificate(certificateId=ca_id)
 
 
+def test_iot_ca_certificate_registration_config_round_trip(iot_client):
+    """registrationConfig rides Register and Update and comes back as
+    DescribeCACertificate's top-level member — the JITR provisioning config."""
+    ca_pem, _leaf = _generate_ca_and_leaf()
+    cfg = {"roleArn": "arn:aws:iam::123456789012:role/jitr",
+           "templateName": "jitr-template"}
+    ca_id = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, allowAutoRegistration=True, registrationConfig=cfg
+    )["certificateId"]
+
+    got = iot_client.describe_ca_certificate(certificateId=ca_id)
+    assert got["registrationConfig"] == cfg
+    assert got["certificateDescription"]["autoRegistrationStatus"] == "ENABLE"
+
+    # Update replaces the config, and removeAutoRegistration turns
+    # auto-registration off.
+    new_cfg = {"roleArn": "arn:aws:iam::123456789012:role/jitr-v2",
+               "templateBody": "{}"}
+    iot_client.update_ca_certificate(
+        certificateId=ca_id, registrationConfig=new_cfg, removeAutoRegistration=True
+    )
+    got = iot_client.describe_ca_certificate(certificateId=ca_id)
+    assert got["registrationConfig"] == new_cfg
+    assert got["certificateDescription"]["autoRegistrationStatus"] == "DISABLE"
+
+    # A CA registered without a config omits the member entirely.
+    iot_client.delete_ca_certificate(certificateId=ca_id)
+    ca_id = iot_client.register_ca_certificate(caCertificate=ca_pem)["certificateId"]
+    assert "registrationConfig" not in iot_client.describe_ca_certificate(
+        certificateId=ca_id)
+    iot_client.delete_ca_certificate(certificateId=ca_id)
+
+
 def test_iot_jitr_registered_event_published_when_auto_registration_enabled():
     """Register a CA with auto-registration ENABLE, subscribe on
     ``$aws/events/certificates/registered/#``, register a device cert under
