@@ -235,17 +235,11 @@ def _invoke_agent(agent_id: str, alias_id: str, session_id: str, body) -> tuple:
     prompt = body_obj.get("inputText", "")
     end_session = bool(body_obj.get("endSession"))
     reply = _mock_reply(agent_id, prompt)
-    # Stream: trace -> chunk(s) -> (optional end-of-session)
+    # Stream: chunk(s) -> (optional end-of-session). No trace events are
+    # emitted, even with enableTrace: no orchestration happens here (no model
+    # call, no action-group selection), and a fabricated ORCHESTRATE trace is
+    # exactly the artifact a developer would read to conclude that it did.
     stream = b""
-    if body_obj.get("enableTrace"):
-        stream += _es_event("trace", {
-            "agentId": agent_id,
-            "agentAliasId": alias_id,
-            "sessionId": session_id,
-            "trace": {"orchestrationTrace": {
-                "modelInvocationInput": {"text": prompt, "type": "ORCHESTRATE"},
-            }},
-        })
     # Chunk(s) — body is base64 of bytes per AWS, but for InvokeAgent the inner
     # `bytes` field is the raw response text bytes encoded as a Blob (boto3
     # handles base64 transparently in protocol layer for blob members).
@@ -296,10 +290,34 @@ def _retrieve(kb_id: str, body) -> tuple:
     body_obj, err = _parse_body(body)
     if err:
         return err
+    query = (body_obj.get("retrievalQuery") or {}).get("text")
     if not body_obj.get("retrievalQuery"):
         return _validation("retrievalQuery is required.")
-    # Return empty results — shape-correct
-    return _json({"RetrievalResults": [], "NextToken": None})
+    from ministack.services import bedrock_agent as agent_svc
+    if kb_id not in agent_svc._knowledge_bases:
+        return _not_found(f"Knowledge base {kb_id} not found.")
+    number_of_results = (((body_obj.get("retrievalConfiguration") or {})
+                          .get("vectorSearchConfiguration") or {})
+                         .get("numberOfResults")) or 5
+    # Lexical retrieval over the documents ingestion actually stored — no
+    # embeddings locally, so scoring is term overlap: the fraction of query
+    # terms present in the document.
+    terms = {t for t in re.findall(r"[a-z0-9]+", (query or "").lower()) if t}
+    scored = []
+    for key, doc in agent_svc._kb_document_texts.items():
+        if not key.startswith(f"{kb_id}/"):
+            continue
+        doc_terms = set(re.findall(r"[a-z0-9]+", doc["Text"].lower()))
+        hits = len(terms & doc_terms)
+        if hits:
+            scored.append((hits / len(terms), doc))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    results = [{
+        "Content": {"Text": doc["Text"], "Type": "TEXT"},
+        "Location": {"Type": "S3", "S3Location": {"Uri": doc["Uri"]}},
+        "Score": round(score, 4),
+    } for score, doc in scored[:number_of_results]]
+    return _json({"RetrievalResults": results, "NextToken": None})
 
 
 def _retrieve_and_generate(body) -> tuple:

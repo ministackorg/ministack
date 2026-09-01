@@ -172,6 +172,16 @@ def _messages_text(messages) -> str:
     return "\n".join(chunks)
 
 
+def _last_user_text(messages) -> str:
+    """The text of the newest user message — what a guardrail's INPUT stage sees."""
+    for m in reversed(messages or []):
+        if m.get("role") == "user":
+            return "\n".join(
+                c["text"] for c in m.get("content") or []
+                if isinstance(c, dict) and "text" in c)
+    return ""
+
+
 def _system_text(system) -> str:
     chunks = []
     for s in system or []:
@@ -329,10 +339,58 @@ def _converse(model_id: str, headers, body) -> tuple:
     system = body_obj.get("system", [])
     inference_config = body_obj.get("inferenceConfig") or {}
     started = int(time.time() * 1000)
+
+    guardrail_config = body_obj.get("guardrailConfig")
+    guardrail = None
+    if guardrail_config:
+        identifier = guardrail_config.get("guardrailIdentifier", "")
+        guardrail = _resolve_guardrail(
+            identifier, guardrail_config.get("guardrailVersion", "DRAFT"))
+        if guardrail is None:
+            return _guardrail_not_found(identifier)
+        input_result = _evaluate_guardrail(
+            guardrail, "INPUT", _last_user_text(messages))
+        if input_result["blocked"]:
+            response = _build_converse_response(
+                model_id, messages, system, started,
+                guardrail.get("BlockedInputMessaging") or "Blocked by guardrail.")
+            response["stopReason"] = "guardrail_intervened"
+            if guardrail_config.get("trace") in ("enabled", "enabled_full"):
+                response["trace"] = {"guardrail": {"inputAssessment": {
+                    guardrail["GuardrailId"]: input_result["assessment"],
+                }}}
+            return 200, {
+                "Content-Type": "application/json",
+                "x-amzn-bedrock-input-token-count": str(response["usage"]["inputTokens"]),
+                "x-amzn-bedrock-output-token-count": str(response["usage"]["outputTokens"]),
+            }, json.dumps(response).encode()
+
     text = _proxy_to_openai_chat(model_id, messages, system, inference_config)
     if text is None:
         text = _mock_reply(model_id, messages, system)
+
+    output_assessment = None
+    if guardrail is not None:
+        output_result = _evaluate_guardrail(guardrail, "OUTPUT", text)
+        output_assessment = output_result["assessment"]
+        if output_result["blocked"]:
+            text = guardrail.get("BlockedOutputsMessaging") or "Blocked by guardrail."
+        elif output_result["anonymized"]:
+            text = output_result["masked_text"]
+
     response = _build_converse_response(model_id, messages, system, started, text)
+    if guardrail is not None:
+        if output_assessment and any(
+            f.get("action") == "BLOCKED"
+            for policy in output_assessment.values()
+            for entries in policy.values()
+            for f in entries
+        ):
+            response["stopReason"] = "guardrail_intervened"
+        if guardrail_config.get("trace") in ("enabled", "enabled_full"):
+            response["trace"] = {"guardrail": {"outputAssessments": {
+                guardrail["GuardrailId"]: [output_assessment or {}],
+            }}}
     resp_headers = {
         "Content-Type": "application/json",
         "x-amzn-bedrock-input-token-count": str(response["usage"]["inputTokens"]),
@@ -376,7 +434,8 @@ def _es_event(event_type: str, payload: dict) -> bytes:
     )
 
 
-def _build_converse_stream(model_id: str, messages, system, started_at_ms: int, text: str) -> bytes:
+def _build_converse_stream(model_id: str, messages, system, started_at_ms: int, text: str,
+                           stop_reason: str = "end_turn") -> bytes:
     """Emit the AWS ConverseStream event sequence:
       messageStart -> contentBlockDelta* -> contentBlockStop -> messageStop -> metadata
     All events under :event-type, payload is application/json per AWS wire trace.
@@ -399,7 +458,7 @@ def _build_converse_stream(model_id: str, messages, system, started_at_ms: int, 
             "delta": {"text": ""},
         })
     stream += _es_event("contentBlockStop", {"contentBlockIndex": 0})
-    stream += _es_event("messageStop", {"stopReason": "end_turn"})
+    stream += _es_event("messageStop", {"stopReason": stop_reason})
     input_tokens = _estimate_tokens(_system_text(system) + _messages_text(messages))
     output_tokens = _estimate_tokens(text)
     latency_ms = max(1, int(time.time() * 1000) - started_at_ms)
@@ -429,10 +488,37 @@ def _converse_stream(model_id: str, headers, body) -> tuple:
     system = body_obj.get("system", [])
     inference_config = body_obj.get("inferenceConfig") or {}
     started = int(time.time() * 1000)
-    text = _proxy_to_openai_chat(model_id, messages, system, inference_config)
-    if text is None:
-        text = _mock_reply(model_id, messages, system)
-    stream_bytes = _build_converse_stream(model_id, messages, system, started, text)
+
+    guardrail_config = body_obj.get("guardrailConfig")
+    guardrail = None
+    stop_reason = None
+    if guardrail_config:
+        identifier = guardrail_config.get("guardrailIdentifier", "")
+        guardrail = _resolve_guardrail(
+            identifier, guardrail_config.get("guardrailVersion", "DRAFT"))
+        if guardrail is None:
+            return _guardrail_not_found(identifier)
+        input_result = _evaluate_guardrail(
+            guardrail, "INPUT", _last_user_text(messages))
+        if input_result["blocked"]:
+            text = guardrail.get("BlockedInputMessaging") or "Blocked by guardrail."
+            stop_reason = "guardrail_intervened"
+            guardrail = None  # no output pass on a blocked input
+
+    if stop_reason is None:
+        text = _proxy_to_openai_chat(model_id, messages, system, inference_config)
+        if text is None:
+            text = _mock_reply(model_id, messages, system)
+        if guardrail is not None:
+            output_result = _evaluate_guardrail(guardrail, "OUTPUT", text)
+            if output_result["blocked"]:
+                text = guardrail.get("BlockedOutputsMessaging") or "Blocked by guardrail."
+                stop_reason = "guardrail_intervened"
+            elif output_result["anonymized"]:
+                text = output_result["masked_text"]
+
+    stream_bytes = _build_converse_stream(model_id, messages, system, started, text,
+                                          stop_reason=stop_reason or "end_turn")
     resp_headers = {
         "Content-Type": "application/vnd.amazon.eventstream",
         "x-amzn-bedrock-content-type": "application/json",
@@ -724,6 +810,161 @@ def _invoke_model_with_response_stream(model_id: str, headers, body) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# Guardrail evaluation
+#
+# The deterministic policies are enforced for real: word policy (exact
+# words/phrases), the sensitive-information regexes, and the PII entity types
+# that reduce to a pattern. The model-graded policies (topic, content,
+# contextual grounding, the managed PROFANITY word list) need a classifier
+# real Bedrock runs server-side and are not evaluated — they are reported as
+# not-assessed rather than passed.
+# ---------------------------------------------------------------------------
+
+# PII entity types that are deterministically matchable. The remaining types
+# (NAME, ADDRESS, AGE, ...) need entity recognition and are not evaluated.
+_PII_PATTERNS = {
+    "EMAIL": r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+    "PHONE": r"(?<![\d.])(?:\+?\d{1,3}[ .-]?)?(?:\(\d{2,4}\)[ .-]?)?\d{3}[ .-]?\d{3,4}[ .-]?\d{0,4}(?<![ .-])(?![\d.])",
+    "IP_ADDRESS": r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
+    "MAC_ADDRESS": r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b",
+    "URL": r"https?://[^\s<>\"]+",
+    "US_SOCIAL_SECURITY_NUMBER": r"\b\d{3}-\d{2}-\d{4}\b",
+    "CREDIT_DEBIT_CARD_NUMBER": r"\b(?:\d[ -]?){13,16}\b",
+    "AWS_ACCESS_KEY": r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
+    "AWS_SECRET_KEY": r"\b[A-Za-z0-9/+=]{40}\b",
+}
+
+
+def _resolve_guardrail(identifier: str, version: str):
+    """Return the guardrail record, or None. Identifier may be an ID or ARN."""
+    from ministack.services import bedrock as bedrock_svc
+    rec = bedrock_svc._guardrails.get(identifier)
+    if rec is None:
+        for r in bedrock_svc._guardrails.values():
+            if r.get("GuardrailArn") == identifier:
+                rec = r
+                break
+    if rec is None:
+        return None
+    if version and version != "DRAFT":
+        return bedrock_svc._guardrail_versions.get(
+            f"{rec['GuardrailId']}/{version}")
+    return rec
+
+
+def _guardrail_filter_applies(cfg: dict, source: str) -> tuple:
+    """Resolve a policy entry's (enabled, action) for INPUT or OUTPUT."""
+    if source == "INPUT":
+        enabled = cfg.get("inputEnabled", True)
+        action = cfg.get("inputAction") or cfg.get("action") or "BLOCK"
+    else:
+        enabled = cfg.get("outputEnabled", True)
+        action = cfg.get("outputAction") or cfg.get("action") or "BLOCK"
+    return enabled, action
+
+
+# Config action -> assessment filter action (per botocore enums)
+_GUARDRAIL_ACTION_WIRE = {"BLOCK": "BLOCKED", "ANONYMIZE": "ANONYMIZED", "NONE": "NONE"}
+
+
+def _evaluate_guardrail(rec: dict, source: str, text: str) -> dict:
+    """Evaluate the deterministic policies of a guardrail against one text.
+
+    Returns {assessment, blocked, anonymized, masked_text, word_chars,
+    sip_chars} where masked_text carries ANONYMIZE replacements.
+    """
+    custom_words = []
+    pii_findings = []
+    regex_findings = []
+    blocked = False
+    masked = text
+    word_cfgs = ((rec.get("WordPolicy") or {}).get("wordsConfig")) or []
+    for cfg in word_cfgs:
+        word = cfg.get("text") or ""
+        if not word:
+            continue
+        enabled, action = _guardrail_filter_applies(cfg, source)
+        if not enabled or action == "NONE":
+            continue
+        if re.search(rf"(?<![\w]){re.escape(word)}(?![\w])", text, re.IGNORECASE):
+            custom_words.append(
+                {"match": word, "action": "BLOCKED", "detected": True})
+            blocked = True
+
+    sip = rec.get("SensitiveInformationPolicy") or {}
+    for cfg in sip.get("regexesConfig") or []:
+        pattern = cfg.get("pattern") or ""
+        enabled, action = _guardrail_filter_applies(cfg, source)
+        if not pattern or not enabled:
+            continue
+        try:
+            matches = list(re.finditer(pattern, masked))
+        except re.error:
+            continue
+        if not matches:
+            continue
+        name = cfg.get("name") or "regex"
+        wire_action = _GUARDRAIL_ACTION_WIRE.get(action, "BLOCKED")
+        regex_findings.append({
+            "name": name,
+            "match": matches[0].group(0),
+            "regex": pattern,
+            "action": wire_action,
+            "detected": True,
+        })
+        if action == "BLOCK":
+            blocked = True
+        elif action == "ANONYMIZE":
+            masked = re.sub(pattern, "{" + name + "}", masked)
+    for cfg in sip.get("piiEntitiesConfig") or []:
+        pii_type = cfg.get("type") or ""
+        pattern = _PII_PATTERNS.get(pii_type)
+        enabled, action = _guardrail_filter_applies(cfg, source)
+        if not pattern or not enabled:
+            continue
+        matches = list(re.finditer(pattern, masked))
+        if not matches:
+            continue
+        wire_action = _GUARDRAIL_ACTION_WIRE.get(action, "BLOCKED")
+        pii_findings.append({
+            "match": matches[0].group(0),
+            "type": pii_type,
+            "action": wire_action,
+            "detected": True,
+        })
+        if action == "BLOCK":
+            blocked = True
+        elif action == "ANONYMIZE":
+            masked = re.sub(pattern, "{" + pii_type + "}", masked)
+
+    assessment = {}
+    if custom_words:
+        assessment["wordPolicy"] = {"customWords": custom_words}
+    if pii_findings or regex_findings:
+        sip_assessment = {}
+        if pii_findings:
+            sip_assessment["piiEntities"] = pii_findings
+        if regex_findings:
+            sip_assessment["regexes"] = regex_findings
+        assessment["sensitiveInformationPolicy"] = sip_assessment
+    units = max(1, -(-len(text) // 1000)) if text else 1
+    return {
+        "assessment": assessment,
+        "blocked": blocked,
+        "anonymized": masked != text,
+        "masked_text": masked,
+        "word_units": units if word_cfgs else 0,
+        "sip_units": units if (sip.get("regexesConfig")
+                               or sip.get("piiEntitiesConfig")) else 0,
+    }
+
+
+def _guardrail_not_found(identifier: str) -> tuple:
+    return _error("ResourceNotFoundException",
+                  f"Guardrail with identifier {identifier} not found.", 404)
+
+
+# ---------------------------------------------------------------------------
 # ApplyGuardrail
 # ---------------------------------------------------------------------------
 
@@ -742,32 +983,50 @@ def _apply_guardrail(guardrail_id: str, version: str, body) -> tuple:
                       "source must be one of: INPUT, OUTPUT.", 400)
     if not isinstance(content, list):
         return _error("ValidationException", "content must be an array.", 400)
-    # Mock evaluation: pass everything through unchanged.
+    rec = _resolve_guardrail(guardrail_id, version)
+    if rec is None:
+        return _guardrail_not_found(guardrail_id)
     outputs = []
+    assessment = {}
+    blocked = False
+    anonymized = False
     total_chars = 0
+    word_units = 0
+    sip_units = 0
     for block in content:
-        if isinstance(block, dict) and "text" in block:
-            text = block["text"].get("text", "")
-            outputs.append({"text": text})
-            total_chars += len(text)
+        if not (isinstance(block, dict) and "text" in block):
+            continue
+        text = block["text"].get("text", "")
+        total_chars += len(text)
+        result = _evaluate_guardrail(rec, source, text)
+        blocked = blocked or result["blocked"]
+        anonymized = anonymized or result["anonymized"]
+        word_units += result["word_units"]
+        sip_units += result["sip_units"]
+        for policy, findings in result["assessment"].items():
+            merged = assessment.setdefault(policy, {})
+            for key, entries in findings.items():
+                merged.setdefault(key, []).extend(entries)
+        outputs.append({"text": result["masked_text"]})
+    if blocked:
+        message = (rec.get("BlockedInputMessaging") if source == "INPUT"
+                   else rec.get("BlockedOutputsMessaging"))
+        outputs = [{"text": message or "Blocked by guardrail."}]
+    # Detection-only findings (config action NONE) are reported in the
+    # assessment without intervening, as on AWS.
+    intervened = blocked or anonymized
     response = {
         "usage": {
             "topicPolicyUnits": 0,
             "contentPolicyUnits": 0,
-            "wordPolicyUnits": 0,
-            "sensitiveInformationPolicyUnits": 0,
+            "wordPolicyUnits": word_units,
+            "sensitiveInformationPolicyUnits": sip_units,
             "sensitiveInformationPolicyFreeUnits": 0,
             "contextualGroundingPolicyUnits": 0,
         },
-        "action": "NONE",
+        "action": "GUARDRAIL_INTERVENED" if intervened else "NONE",
         "outputs": outputs,
-        "assessments": [{
-            "topicPolicy": None,
-            "contentPolicy": None,
-            "wordPolicy": None,
-            "sensitiveInformationPolicy": None,
-            "contextualGroundingPolicy": None,
-        }] if outputs else [],
+        "assessments": [assessment] if assessment else ([{}] if outputs else []),
         "guardrailCoverage": {
             "textCharacters": {"guarded": total_chars, "total": total_chars},
         },

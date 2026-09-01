@@ -1198,7 +1198,7 @@ def _hides_user_existence(pool: dict, client_id: str) -> bool:
     does not affect.
     """
     client = (pool.get("_clients") or {}).get(client_id) or {}
-    return client.get("PreventUserExistenceErrors", "ENABLED") == "ENABLED"
+    return client.get("PreventUserExistenceErrors", "LEGACY") == "ENABLED"
 
 
 def _hidden_user_error(pool: dict, client_id: str, err):
@@ -2463,7 +2463,7 @@ def _create_user_pool_client(data):
         "AllowedOAuthScopes": data.get("AllowedOAuthScopes", []),
         "AllowedOAuthFlowsUserPoolClient": data.get("AllowedOAuthFlowsUserPoolClient", False),
         "AnalyticsConfiguration": data.get("AnalyticsConfiguration"),
-        "PreventUserExistenceErrors": data.get("PreventUserExistenceErrors", "ENABLED"),
+        "PreventUserExistenceErrors": data.get("PreventUserExistenceErrors", "LEGACY"),
         "EnableTokenRevocation": data.get("EnableTokenRevocation", True),
         "EnablePropagateAdditionalUserContextData": data.get("EnablePropagateAdditionalUserContextData", False),
         "AuthSessionValidity": data.get("AuthSessionValidity", 3),

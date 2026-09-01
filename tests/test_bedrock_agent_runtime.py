@@ -19,13 +19,76 @@ def _ar():
 # ---------------------------------------------------------------------------
 
 
+def _make_kb(name):
+    return make_client("bedrock-agent").create_knowledge_base(
+        name=name,
+        roleArn="arn:aws:iam::000000000000:role/kb-role",
+        knowledgeBaseConfiguration={
+            "type": "VECTOR",
+            "vectorKnowledgeBaseConfiguration": {
+                "embeddingModelArn":
+                    "arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-embed-text-v2:0",
+            },
+        },
+        storageConfiguration={
+            "type": "OPENSEARCH_SERVERLESS",
+            "opensearchServerlessConfiguration": {
+                "collectionArn": "arn:aws:aoss:us-east-1:000000000000:collection/c",
+                "vectorIndexName": "idx",
+                "fieldMapping": {"vectorField": "v", "textField": "t",
+                                 "metadataField": "m"},
+            },
+        },
+    )["knowledgeBase"]
+
+
 def test_bedrock_ar_retrieve_returns_results_envelope():
+    kb = _make_kb("kb-ar-envelope")
     resp = _ar().retrieve(
-        knowledgeBaseId="KBTEST1234",
+        knowledgeBaseId=kb["knowledgeBaseId"],
         retrievalQuery={"text": "what is AWS?"},
     )
     assert "retrievalResults" in resp
     assert isinstance(resp["retrievalResults"], list)
+
+
+def test_bedrock_ar_retrieve_unknown_kb_is_not_found():
+    try:
+        _ar().retrieve(knowledgeBaseId="KBNOPE1234",
+                       retrievalQuery={"text": "anything"})
+        raise AssertionError("expected ResourceNotFoundException")
+    except botocore.exceptions.ClientError as e:
+        assert e.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_bedrock_ar_retrieve_returns_ingested_documents():
+    s3 = make_client("s3")
+    s3.create_bucket(Bucket="kb-ar-docs")
+    s3.put_object(Bucket="kb-ar-docs", Key="ports.txt",
+                  Body=b"MiniStack serves every service on port 4566.")
+    s3.put_object(Bucket="kb-ar-docs", Key="pets.txt",
+                  Body=b"Cats sleep most of the day.")
+    kb = _make_kb("kb-ar-retrieve")
+    agent_api = make_client("bedrock-agent")
+    ds = agent_api.create_data_source(
+        knowledgeBaseId=kb["knowledgeBaseId"], name="ds-ar",
+        dataSourceConfiguration={"type": "S3", "s3Configuration": {
+            "bucketArn": "arn:aws:s3:::kb-ar-docs"}},
+    )["dataSource"]
+    agent_api.start_ingestion_job(
+        knowledgeBaseId=kb["knowledgeBaseId"], dataSourceId=ds["dataSourceId"])
+
+    resp = _ar().retrieve(
+        knowledgeBaseId=kb["knowledgeBaseId"],
+        retrievalQuery={"text": "which port does ministack serve on"},
+    )
+    results = resp["retrievalResults"]
+    assert results
+    top = results[0]
+    assert "4566" in top["content"]["text"]
+    assert top["location"]["s3Location"]["uri"] == "s3://kb-ar-docs/ports.txt"
+    assert top["location"]["type"] == "S3"
+    assert 0 < top["score"] <= 1
 
 
 def test_bedrock_ar_retrieve_validation_missing_query():
@@ -263,6 +326,24 @@ def test_bedrock_ar_invoke_agent_returns_chunk_eventstream():
         if isinstance(e, dict):
             names.extend(e.keys())
     assert "chunk" in names
+
+
+def test_bedrock_ar_invoke_agent_emits_no_fabricated_trace():
+    # No orchestration happens locally, so enableTrace must not produce an
+    # ORCHESTRATE trace describing reasoning that never ran.
+    resp = _ar().invoke_agent(
+        agentId="AG-2",
+        agentAliasId="AL-2",
+        sessionId="sess-trace",
+        inputText="what is the weather",
+        enableTrace=True,
+    )
+    names = []
+    for e in resp["completion"]:
+        if isinstance(e, dict):
+            names.extend(e.keys())
+    assert "chunk" in names
+    assert "trace" not in names
 
 
 def test_bedrock_ar_get_and_delete_agent_memory():
