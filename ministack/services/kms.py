@@ -26,6 +26,7 @@ from ministack.core.responses import (
     get_region,
     json_response,
     new_uuid,
+    request_scope,
 )
 
 logger = logging.getLogger("kms")
@@ -238,6 +239,23 @@ def _key_metadata(rec):
     # that is, when its KeyState is PendingDeletion."
     if "DeletionDate" in rec:
         metadata["DeletionDate"] = rec["DeletionDate"]
+    metadata["MultiRegion"] = rec.get("MultiRegion", False)
+    if rec.get("MultiRegion"):
+        account = get_account_id()
+        primary_region = rec.get("_mrk_primary_region", get_region())
+        regions = rec.get("_mrk_regions") or [primary_region]
+        def member_arn(region):
+            return f"arn:aws:kms:{region}:{account}:key/{rec['KeyId']}"
+        metadata["MultiRegionConfiguration"] = {
+            "MultiRegionKeyType": rec.get("_mrk_type", "PRIMARY"),
+            "PrimaryKey": {"Arn": member_arn(primary_region), "Region": primary_region},
+            "ReplicaKeys": [
+                {"Arn": member_arn(region), "Region": region}
+                for region in regions if region != primary_region
+            ],
+        }
+        if rec.get("KeyState") == "PendingReplicaDeletion" and rec.get("_pending_window_days"):
+            metadata["PendingDeletionWindowInDays"] = rec["_pending_window_days"]
     return metadata
 
 
@@ -331,7 +349,10 @@ def _require_crypto(operation):
 
 
 def _create_key(data):
-    key_id = new_uuid()
+    # A multi-Region key's id carries the mrk- prefix, and the id is what ties
+    # the primary and its replicas together across regions.
+    multi_region = bool(data.get("MultiRegion", False))
+    key_id = f"mrk-{new_uuid().replace('-', '')}" if multi_region else new_uuid()
     key_spec = data.get("KeySpec", data.get("CustomerMasterKeySpec", "SYMMETRIC_DEFAULT"))
     key_usage = data.get("KeyUsage", "ENCRYPT_DECRYPT")
     if key_spec in _HMAC_KEY_SPECS and key_usage != MAC_KEY_USAGE:
@@ -375,7 +396,16 @@ def _create_key(data):
         "Origin": "AWS_KMS",
         "Tags": tags,
         "Policy": policy,
+        "MultiRegion": multi_region,
     }
+    if multi_region:
+        # Topology lives on every member and is kept in sync by ReplicateKey
+        # and ScheduleKeyDeletion: the primary region plus every region that
+        # holds a member, from which each member's MultiRegionConfiguration is
+        # rebuilt on read.
+        rec["_mrk_type"] = "PRIMARY"
+        rec["_mrk_primary_region"] = get_region()
+        rec["_mrk_regions"] = [get_region()]
 
     if key_spec == "SYMMETRIC_DEFAULT":
         rec["_symmetric_key"] = os.urandom(32)
@@ -1447,17 +1477,142 @@ def _update_key_description(data):
     return json_response({})
 
 
+_KEY_MATERIAL_FIELDS = (
+    "_symmetric_key", "_hmac_key", "_private_key", "_public_key_der",
+    "EncryptionAlgorithms", "SigningAlgorithms", "MacAlgorithms",
+)
+
+
+def _mrk_members(rec):
+    """Yield (region, member record) for every member of a multi-Region key."""
+    account = get_account_id()
+    for region in rec.get("_mrk_regions") or []:
+        with request_scope(account, region):
+            member = _keys.get(rec["KeyId"])
+        if member is not None:
+            yield region, member
+
+
+def _replicate_key(data):
+    """ReplicateKey — create a replica of a multi-Region primary key in
+    another region, sharing its id and key material, so a ciphertext produced
+    in one region decrypts in the other, as AWS's shared-material model
+    guarantees."""
+    rec = _resolve_key(data.get("KeyId", ""))
+    if not rec:
+        return error_response_json(
+            "NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+    if not rec.get("MultiRegion"):
+        return error_response_json(
+            "UnsupportedOperationException",
+            f"{rec['Arn']} is not a multi-Region key.", 400)
+    if rec.get("_mrk_type") != "PRIMARY":
+        return error_response_json(
+            "UnsupportedOperationException",
+            f"{rec['Arn']} is a multi-Region replica key. ReplicateKey must be "
+            "called on the multi-Region primary key.", 400)
+    if rec.get("KeyState") not in ("Enabled", "Disabled"):
+        return error_response_json(
+            "KMSInvalidStateException",
+            f"{rec['Arn']} is in the {rec.get('KeyState')} state; it cannot be "
+            "replicated.", 400)
+    replica_region = data.get("ReplicaRegion")
+    if not replica_region:
+        return error_response_json(
+            "ValidationException", "ReplicaRegion is required", 400)
+    if replica_region in (rec.get("_mrk_regions") or []):
+        return error_response_json(
+            "AlreadyExistsException",
+            f"Key {rec['KeyId']} already exists in region {replica_region}", 400)
+
+    account = get_account_id()
+    tags = data.get("Tags", [])
+    policy = data.get("Policy") or json.dumps({
+        "Version": "2012-10-17",
+        "Id": "key-default-1",
+        "Statement": [{
+            "Sid": "Enable IAM User Permissions",
+            "Effect": "Allow",
+            "Principal": {"AWS": f"arn:aws:iam::{account}:root"},
+            "Action": "kms:*",
+            "Resource": "*",
+        }],
+    })
+    replica = {
+        "KeyId": rec["KeyId"],
+        "Arn": f"arn:aws:kms:{replica_region}:{account}:key/{rec['KeyId']}",
+        "KeyState": "Enabled",
+        "Enabled": True,
+        "KeySpec": rec["KeySpec"],
+        "KeyUsage": rec["KeyUsage"],
+        # The replica has its own description, policy and tags; only the key
+        # material and id are shared. An omitted Description is empty, per the
+        # API reference.
+        "Description": data.get("Description", ""),
+        "CreationDate": int(time.time()),
+        "Origin": rec["Origin"],
+        "Tags": tags,
+        "Policy": policy,
+        "MultiRegion": True,
+        "_mrk_type": "REPLICA",
+        "_mrk_primary_region": rec["_mrk_primary_region"],
+    }
+    for field in _KEY_MATERIAL_FIELDS:
+        if field in rec:
+            replica[field] = rec[field]
+
+    regions = list(rec.get("_mrk_regions") or []) + [replica_region]
+    replica["_mrk_regions"] = regions
+    with request_scope(account, replica_region):
+        _keys[rec["KeyId"]] = replica
+    # Every member reports the full topology.
+    for _region, member in _mrk_members(rec):
+        member["_mrk_regions"] = regions
+
+    return json_response({
+        "ReplicaKeyMetadata": _key_metadata_in_region(replica, replica_region),
+        "ReplicaPolicy": policy,
+        "ReplicaTags": tags,
+    })
+
+
+def _key_metadata_in_region(rec, region):
+    """_key_metadata built as the target region would build it — the ARNs it
+    contains are region-qualified via the request context."""
+    with request_scope(get_account_id(), region):
+        return _key_metadata(rec)
+
+
 def _schedule_key_deletion(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
         return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
     days = data.get("PendingWindowInDays", 30)
-    rec["KeyState"] = "PendingDeletion"
+    state = "PendingDeletion"
+    if rec.get("MultiRegion"):
+        others = [r for r in (rec.get("_mrk_regions") or []) if r != get_region()]
+        if rec.get("_mrk_type") == "PRIMARY" and others:
+            # A primary with live replicas waits on them, as AWS does.
+            state = "PendingReplicaDeletion"
+            rec["_pending_window_days"] = days
+        elif rec.get("_mrk_type") == "REPLICA":
+            # The departing replica leaves the topology every member reports,
+            # and a primary that was only waiting on it moves on to
+            # PendingDeletion.
+            regions = [r for r in (rec.get("_mrk_regions") or []) if r != get_region()]
+            for _region, member in _mrk_members(rec):
+                member["_mrk_regions"] = regions
+                if (member.get("_mrk_type") == "PRIMARY"
+                        and member.get("KeyState") == "PendingReplicaDeletion"
+                        and len(regions) == 1):
+                    member["KeyState"] = "PendingDeletion"
+            rec["_mrk_regions"] = [get_region()]
+    rec["KeyState"] = state
     rec["Enabled"] = False
     rec["DeletionDate"] = int(time.time() + (days * 86400))
     return json_response({
         "KeyId": rec["Arn"],
-        "KeyState": "PendingDeletion",
+        "KeyState": state,
         "DeletionDate": rec["DeletionDate"],
     })
 
@@ -1565,6 +1720,7 @@ async def handle_request(method, path, headers, body, query_params):
 
     handlers = {
         "CreateKey": _create_key,
+        "ReplicateKey": _replicate_key,
         "ListKeys": _list_keys,
         "DescribeKey": _describe_key,
         "GetPublicKey": _get_public_key,
