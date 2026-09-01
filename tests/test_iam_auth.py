@@ -1017,6 +1017,57 @@ class TestActionExtraction:
         assert extract_iam_action("unknown_svc", "GET", "/", {}, b"", {}) is None
 
 
+
+class TestS3ActionMapping:
+    """S3 authorizes by the IAM actions its documentation lists, not by API
+    operation name: every multipart operation except abort is ``s3:PutObject``."""
+
+    def _act(self, method, path, query):
+        from ministack.core.iam_actions import extract_iam_action
+        return extract_iam_action("s3", method, path, {}, b"", query)
+
+    @pytest.mark.parametrize("method,path,query,expected", [
+        ("POST", "/bucket/key", {"uploads": ""}, "s3:PutObject"),          # CreateMultipartUpload
+        ("PUT", "/bucket/key", {"uploadId": "u", "partNumber": "1"}, "s3:PutObject"),  # UploadPart
+        ("POST", "/bucket/key", {"uploadId": "u"}, "s3:PutObject"),        # CompleteMultipartUpload
+        ("DELETE", "/bucket/key", {"uploadId": "u"}, "s3:AbortMultipartUpload"),
+        ("GET", "/bucket/key", {"uploadId": "u"}, "s3:ListMultipartUploadParts"),
+        ("GET", "/bucket", {"uploads": ""}, "s3:ListBucketMultipartUploads"),
+        ("GET", "/bucket", {"versions": ""}, "s3:ListBucketVersions"),
+        ("GET", "/bucket/key", {"tagging": ""}, "s3:GetObjectTagging"),
+        ("PUT", "/bucket/key", {"acl": ""}, "s3:PutObjectAcl"),
+        ("GET", "/bucket", {"tagging": ""}, "s3:GetBucketTagging"),
+        ("DELETE", "/bucket", {"tagging": ""}, "s3:PutBucketTagging"),     # no s3:DeleteBucketTagging
+        ("DELETE", "/bucket/key", {"tagging": ""}, "s3:DeleteObjectTagging"),
+        ("GET", "/bucket", {"acl": ""}, "s3:GetBucketAcl"),
+        ("DELETE", "/bucket", {"lifecycle": ""}, "s3:PutLifecycleConfiguration"),
+        ("DELETE", "/bucket", {"encryption": ""}, "s3:PutEncryptionConfiguration"),
+        ("DELETE", "/bucket", {"replication": ""}, "s3:PutReplicationConfiguration"),
+        ("DELETE", "/bucket", {"cors": ""}, "s3:PutBucketCORS"),
+        ("DELETE", "/bucket", {"policy": ""}, "s3:DeleteBucketPolicy"),   # this one exists
+        ("GET", "/bucket/key", {"versions": ""}, "s3:GetObject"),         # bucket-only sub-resource
+        ("GET", "/bucket/key", {"versionId": "v1"}, "s3:GetObject"),      # not s3:GetObjectVersion (known gap)
+        ("PUT", "/bucket/key", {}, "s3:PutObject"),
+        ("HEAD", "/bucket/key", {}, "s3:GetObject"),
+        ("GET", "/bucket", {}, "s3:ListBucket"),
+    ])
+    def test_operation_maps_to_documented_iam_action(self, method, path, query, expected):
+        assert self._act(method, path, query) == expected
+
+    def test_cdk_publishing_role_grant_covers_multipart(self):
+        # The CDK bootstrap file-publishing role grants s3:PutObject* and
+        # s3:Abort*; a multipart asset upload must be authorized by those.
+        stmts = parse_policy_document({"Statement": [{
+            "Effect": "Allow",
+            "Action": ["s3:GetObject*", "s3:GetBucket*", "s3:List*", "s3:PutObject*", "s3:Abort*"],
+            "Resource": ["arn:aws:s3:::cdk-assets", "arn:aws:s3:::cdk-assets/*"]}]})
+        for method, query in (("POST", {"uploads": ""}), ("PUT", {"uploadId": "u", "partNumber": "1"}),
+                              ("POST", {"uploadId": "u"}), ("DELETE", {"uploadId": "u"})):
+            action = self._act(method, "/cdk-assets/asset.zip", query)
+            ctx = _ctx(action=action, resource="arn:aws:s3:::cdk-assets/asset.zip")
+            assert evaluate(ctx, [stmts]).decision == "Allow", action
+
+
 # ---------------------------------------------------------------------------
 # AccessDenied response formatting
 # ---------------------------------------------------------------------------
@@ -1271,3 +1322,4 @@ def test_lambda_build_config_returns_a_config_not_an_error(monkeypatch):
     })
     assert isinstance(config, dict)
     assert config["FunctionName"] == "f"
+

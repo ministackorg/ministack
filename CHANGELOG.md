@@ -7,6 +7,11 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **IAM enforcement — S3 multipart uploads authorize as `s3:PutObject`** — with `AUTH=true` a `CreateMultipartUpload` was checked as the literal action `s3:CreateMultipartUpload`, which no policy grants because it is not an IAM action; `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload` and `ListParts` fell to the generic object actions. Every upload above the SDK's multipart threshold was therefore denied, and `cdk deploy` failed on its first Lambda layer asset even with a correct file-publishing role. The operations now map to the actions S3 documents: the three upload steps to `s3:PutObject`, abort to `s3:AbortMultipartUpload`, the listings to `s3:ListBucketMultipartUploads` / `s3:ListMultipartUploadParts`; `?versions` is `s3:ListBucketVersions`, object-level `?tagging` / `?acl` are the object actions rather than the bucket ones, and the `DELETE` calls on the lifecycle, encryption, replication, tagging and CORS configurations authorize as the matching `Put*` action, since S3 defines no `Delete*` action for them (the table named actions such as `s3:DeleteBucketCors` that no policy can grant). Contributed by @iot-rocket.
+
+
 ## [1.5.5] — 2026-09-01
 
 ### Added
