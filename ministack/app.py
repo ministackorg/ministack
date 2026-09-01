@@ -8,6 +8,7 @@ Compatible with AWS CLI, boto3, and any AWS SDK via --endpoint-url.
 import argparse
 import asyncio
 import base64
+import gzip
 import json
 import logging
 import math
@@ -613,6 +614,33 @@ def _decode_aws_chunked_body(body: bytes, headers: dict) -> bytes:
         else:
             headers.pop("content-encoding", None)
     return body
+
+
+def _decompress_request_body(body: bytes, headers: dict) -> bytes:
+    """Inflate a gzip-compressed request body and drop the gzip token.
+
+    Smithy's ``@requestCompression`` trait makes AWS SDKs gzip a request body
+    once it passes ``REQUEST_MIN_COMPRESSION_SIZE_BYTES`` (default 10240) and
+    send ``Content-Encoding: gzip``. CloudWatch ``PutMetricData`` carries the
+    trait today; any client may compress a body it is allowed to compress.
+    Returns ``body`` unchanged when the header does not ask for gzip.
+    """
+    content_encoding = headers.get("content-encoding", "")
+    if "gzip" not in content_encoding.lower():
+        return body
+    try:
+        inflated = gzip.decompress(body)
+    except (OSError, EOFError) as e:
+        # A body flagged gzip that will not inflate is a real bug. Log it and
+        # pass the raw bytes on, so the handler's own error surfaces.
+        logger.warning("gzip request body failed to inflate: %s", e)
+        return body
+    encodings = [p.strip() for p in content_encoding.split(",") if p.strip().lower() != "gzip"]
+    if encodings:
+        headers["content-encoding"] = ", ".join(encodings)
+    else:
+        headers.pop("content-encoding", None)
+    return inflated
 
 
 async def _read_request_body(receive, method: str, headers: dict) -> bytes:
@@ -2028,6 +2056,16 @@ async def _dispatch_service_request(
     """Dispatch a request through the generic service router."""
     routing_params = _routing_params(method, path, headers, body, query_params)
     service = detect_service(method, path, headers, routing_params)
+
+    # S3 is the exception: there Content-Encoding is object metadata, and the
+    # body must reach the handler exactly as sent. Everywhere else the header
+    # means the request body itself is compressed.
+    if service != "s3":
+        inflated = _decompress_request_body(body, headers)
+        if inflated is not body:
+            body = inflated
+            routing_params = _routing_params(method, path, headers, body, query_params)
+
     region = extract_region(headers)
 
     logger.debug("%s %s -> service=%s region=%s", method, path, service, region)

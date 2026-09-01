@@ -13202,6 +13202,11 @@ def test_rds_cluster_endpoint_alias_survives_the_record_changing_shape():
     # An address is not a name. An earlier container may have left one behind,
     # and aliasing it would pin the endpoint to an address that has already moved.
     assert rds_service._cluster_endpoint_aliases({"Endpoint": "172.20.0.4"}) == []
+    # Nor is the host-run fallback: registering "localhost" (or MINISTACK_HOST)
+    # as a network alias would hijack that name inside the Docker network.
+    assert rds_service._cluster_endpoint_aliases({"Endpoint": "localhost"}) == []
+    assert rds_service._cluster_endpoint_aliases(
+        {"Endpoint": {"Address": rds_service._MINISTACK_HOST, "Port": 5432}}) == []
     assert rds_service._cluster_endpoint_aliases(
         {"Endpoint": {"Address": "172.20.0.4"}}) == []
     assert rds_service._cluster_endpoint_aliases({}) == []
