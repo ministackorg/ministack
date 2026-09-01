@@ -2560,6 +2560,80 @@ def _ensure_mysql_replication_user(cluster):
             conn.close()
 
 
+def _configure_mysql_replica_from_source(cluster_id, replica, source):
+    """Configure a replica channel from an explicit source cluster.
+
+    The caller owns role validation and must ensure the replication account is
+    already available on the source. Keeping this primitive independent of
+    global-cluster writer metadata allows a planned switchover to establish the
+    reverse channel before committing the metadata role exchange. A false
+    return can follow partial channel configuration; callers performing a role
+    switch must reset the replica channel before attempting rollback.
+    """
+    conn = None
+    cur = None
+    try:
+        conn = _mysql_replication_connection(replica)
+        if conn is None:
+            return False
+        cur = conn.cursor()
+        try:
+            cur.execute("STOP REPLICA")
+        except Exception as e:
+            logger.debug(
+                "RDS: STOP REPLICA was a no-op for %s: %s",
+                cluster_id,
+                e,
+            )
+        if replica.get("_mysql_replication_reset_pending"):
+            # RESET REPLICA ALL clears stale connection/applier repositories
+            # and relay logs but deliberately preserves gtid_executed. Within
+            # the source's configured retention window, auto-position can
+            # request every transaction not yet applied before the restart.
+            cur.execute("RESET REPLICA ALL")
+        cur.execute(
+            "CHANGE REPLICATION SOURCE TO "
+            "SOURCE_HOST=%s, SOURCE_PORT=%s, SOURCE_USER=%s, "
+            "SOURCE_PASSWORD=%s, SOURCE_AUTO_POSITION=1, "
+            "GET_SOURCE_PUBLIC_KEY=1",
+            (
+                source["_shared_internal_address"],
+                int(source["_shared_internal_port"]),
+                _MYSQL_REPLICATION_USER,
+                _MYSQL_REPLICATION_PASSWORD,
+            ),
+        )
+        cur.execute("START REPLICA")
+        cur.execute("SET GLOBAL super_read_only=ON")
+    except Exception as e:
+        logger.warning(
+            "RDS: failed to configure MySQL replication for %s: %s",
+            cluster_id,
+            e,
+        )
+        return False
+    finally:
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            conn.close()
+
+    replica["_mysql_replication_source_arn"] = source.get("DBClusterArn")
+    replica.pop("_mysql_replication_reset_pending", None)
+    replica.pop("_mysql_replication_retry_marker", None)
+    # If MiniStack restarted or a detach statement failed after the channel
+    # had been changed, successful reconfiguration is the rollback/repair
+    # point.  Global membership remains authoritative until RemoveFromGlobal
+    # Cluster commits its metadata update.
+    replica.pop("_mysql_replication_detach_state", None)
+    logger.info(
+        "RDS: configured MySQL replication for %s from %s",
+        cluster_id,
+        source.get("DBClusterIdentifier", "unknown"),
+    )
+    return True
+
+
 def _configure_mysql_replication(cluster_id, cluster):
     """Configure an Aurora MySQL 8 global member as source or replica.
 
@@ -2622,74 +2696,24 @@ def _configure_mysql_replication(cluster_id, cluster):
     if not _ensure_mysql_replication_user(writer):
         return False
 
-    conn = None
-    cur = None
-    try:
-        conn = _mysql_replication_connection(cluster)
-        if conn is None:
-            return False
-        cur = conn.cursor()
-        try:
-            cur.execute("STOP REPLICA")
-        except Exception as e:
-            logger.debug(
-                "RDS: STOP REPLICA was a no-op for %s: %s",
-                cluster_id,
-                e,
-            )
-        if cluster.get("_mysql_replication_reset_pending"):
-            # RESET REPLICA ALL clears stale connection/applier repositories
-            # and relay logs but deliberately preserves gtid_executed. Within
-            # the source's configured retention window, auto-position can
-            # request every transaction not yet applied before the restart.
-            cur.execute("RESET REPLICA ALL")
-        cur.execute(
-            "CHANGE REPLICATION SOURCE TO "
-            "SOURCE_HOST=%s, SOURCE_PORT=%s, SOURCE_USER=%s, "
-            "SOURCE_PASSWORD=%s, SOURCE_AUTO_POSITION=1, "
-            "GET_SOURCE_PUBLIC_KEY=1",
-            (
-                writer["_shared_internal_address"],
-                int(writer["_shared_internal_port"]),
-                _MYSQL_REPLICATION_USER,
-                _MYSQL_REPLICATION_PASSWORD,
-            ),
-        )
-        cur.execute("START REPLICA")
-        cur.execute("SET GLOBAL super_read_only=ON")
-    except Exception as e:
-        logger.warning(
-            "RDS: failed to configure MySQL replication for %s: %s",
-            cluster_id,
-            e,
-        )
-        return False
-    finally:
-        if cur is not None:
-            cur.close()
-        if conn is not None:
-            conn.close()
-
-    cluster["_mysql_replication_source_arn"] = writer.get("DBClusterArn")
-    cluster.pop("_mysql_replication_reset_pending", None)
-    cluster.pop("_mysql_replication_retry_marker", None)
-    # If MiniStack restarted or a detach statement failed after the channel
-    # had been changed, successful reconfiguration is the rollback/repair
-    # point.  Global membership remains authoritative until RemoveFromGlobal
-    # Cluster commits its metadata update.
-    cluster.pop("_mysql_replication_detach_state", None)
-    logger.info(
-        "RDS: configured MySQL replication for %s from %s",
-        cluster_id,
-        writer.get("DBClusterIdentifier", "unknown"),
-    )
-    return True
+    return _configure_mysql_replica_from_source(cluster_id, cluster, writer)
 
 
-def _detach_mysql_replication(cluster_id, cluster):
-    """Stop a global secondary and make its data plane writable."""
-    if not _mysql_replication_secondary(cluster):
-        return True
+def _reset_mysql_replication_channel(
+    cluster_id,
+    cluster,
+    *,
+    clear_super_read_only=True,
+):
+    """Stop and reset a replica channel without consulting global role metadata.
+
+    SQL failures are raised so the role-aware caller can apply its existing
+    rollback policy. A false return means the backing data plane is not ready
+    for channel work and no rollback should be inferred. This primitive leaves
+    source/detach metadata for its caller to clear and, when requested, clears
+    only ``super_read_only`` to preserve existing detach behavior. It does not
+    guarantee general-client writability while ``read_only`` remains enabled.
+    """
     if not cluster.get("_shared_storage_initialized"):
         return True
     if not cluster.get("_shared_container_ready"):
@@ -2721,14 +2745,32 @@ def _detach_mysql_replication(cluster_id, cluster):
             cur.execute("RESET REPLICA ALL")
             cluster["_mysql_replication_detach_state"] = "reset"
             state = "reset"
-        if state == "reset":
+        if state == "reset" and clear_super_read_only:
             cur.execute("SET GLOBAL super_read_only=OFF")
     except Exception as e:
         logger.warning(
-            "RDS: failed to detach MySQL replication for %s: %s",
+            "RDS: failed to reset MySQL replication channel for %s: %s",
             cluster_id,
             e,
         )
+        raise
+    finally:
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            conn.close()
+
+    return True
+
+
+def _detach_mysql_replication(cluster_id, cluster):
+    """Stop a global secondary and make its data plane writable."""
+    if not _mysql_replication_secondary(cluster):
+        return True
+
+    try:
+        return _reset_mysql_replication_channel(cluster_id, cluster)
+    except Exception:
         # Best-effort atomic rollback: if the connection is still usable (or a
         # fresh one can be opened), restore auto-position and read-only mode.
         # If that is temporarily impossible, the durable state remains and the
@@ -2745,13 +2787,6 @@ def _detach_mysql_replication(cluster_id, cluster):
             # stop and reset any channel that may now exist.
             cluster["_mysql_replication_detach_state"] = "requested"
         return False
-    finally:
-        if cur is not None:
-            cur.close()
-        if conn is not None:
-            conn.close()
-
-    return True
 
 
 def _clear_mysql_replication_metadata(cluster):

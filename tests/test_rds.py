@@ -8685,6 +8685,69 @@ def test_rds_mysql_replication_secondary_sql_is_idempotent(monkeypatch):
     assert "_mysql_replication_detach_state" not in secondary
 
 
+def test_rds_mysql_replication_configures_from_explicit_source_without_role_lookup(
+    monkeypatch,
+):
+    from ministack.services import rds as m
+
+    writer, secondary, _writer_member, _secondary_member, _global = (
+        _mysql_replication_unit_topology()
+    )
+    statements = []
+    closed = []
+
+    class FakeCursor:
+        def execute(self, statement, params=None):
+            statements.append((statement, params))
+
+        def close(self):
+            closed.append("cursor")
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            closed.append("connection")
+
+    monkeypatch.setattr(
+        m,
+        "_global_cluster_member_for_cluster",
+        lambda _cluster: pytest.fail("explicit-source configure consulted roles"),
+    )
+    monkeypatch.setattr(
+        m,
+        "_mysql_replication_connection",
+        lambda cluster: FakeConnection() if cluster is writer else None,
+    )
+
+    assert m._configure_mysql_replica_from_source(
+        "primary",
+        writer,
+        secondary,
+    ) is True
+
+    assert [statement for statement, _params in statements] == [
+        "STOP REPLICA",
+        (
+            "CHANGE REPLICATION SOURCE TO "
+            "SOURCE_HOST=%s, SOURCE_PORT=%s, SOURCE_USER=%s, "
+            "SOURCE_PASSWORD=%s, SOURCE_AUTO_POSITION=1, "
+            "GET_SOURCE_PUBLIC_KEY=1"
+        ),
+        "START REPLICA",
+        "SET GLOBAL super_read_only=ON",
+    ]
+    assert statements[1][1] == (
+        secondary["_shared_internal_address"],
+        secondary["_shared_internal_port"],
+        m._MYSQL_REPLICATION_USER,
+        m._MYSQL_REPLICATION_PASSWORD,
+    )
+    assert writer["_mysql_replication_source_arn"] == secondary["DBClusterArn"]
+    assert closed == ["cursor", "connection"]
+
+
 def test_rds_mysql_replication_restore_resets_once_then_is_idempotent(monkeypatch):
     from ministack.services import rds as m
 
@@ -9378,6 +9441,127 @@ def test_rds_mysql_replication_detach_stops_resets_and_enables_writes(
     assert "_mysql_replication_reset_pending" not in secondary
     assert "_mysql_replication_retry_marker" not in secondary
     assert "_mysql_replication_detach_state" not in secondary
+
+
+def test_rds_mysql_replication_channel_reset_is_role_independent_and_keeps_fence(
+    monkeypatch,
+):
+    from ministack.services import rds as m
+
+    writer, _secondary, _writer_member, _secondary_member, _global = (
+        _mysql_replication_unit_topology()
+    )
+    writer["_shared_storage_initialized"] = True
+    statements = []
+    closed = []
+
+    class FakeCursor:
+        def execute(self, statement, params=None):
+            statements.append((statement, params))
+
+        def close(self):
+            closed.append("cursor")
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            closed.append("connection")
+
+    monkeypatch.setattr(m, "_ensure_mysql_control_user", lambda _cluster: True)
+    monkeypatch.setattr(
+        m,
+        "_mysql_replication_secondary",
+        lambda _cluster: pytest.fail("channel reset consulted global role"),
+    )
+    monkeypatch.setattr(
+        m,
+        "_mysql_replication_connection",
+        lambda cluster: FakeConnection() if cluster is writer else None,
+    )
+
+    assert m._reset_mysql_replication_channel(
+        "primary",
+        writer,
+        clear_super_read_only=False,
+    ) is True
+
+    assert [statement for statement, _params in statements] == [
+        "STOP REPLICA",
+        "RESET REPLICA ALL",
+    ]
+    assert writer["_mysql_replication_detach_state"] == "reset"
+    assert closed == ["cursor", "connection"]
+
+
+@pytest.mark.parametrize(
+    "failed_statement",
+    [
+        "START REPLICA",
+        "SET GLOBAL super_read_only=ON",
+    ],
+)
+def test_rds_mysql_explicit_source_failure_can_be_reset_without_role_lookup(
+    monkeypatch,
+    failed_statement,
+):
+    from ministack.services import rds as m
+
+    writer, secondary, _writer_member, _secondary_member, _global = (
+        _mysql_replication_unit_topology()
+    )
+    writer["_shared_storage_initialized"] = True
+    statements = []
+    failure_remaining = [True]
+
+    class FakeCursor:
+        def execute(self, statement, params=None):
+            statements.append((statement, params))
+            if statement == failed_statement and failure_remaining[0]:
+                failure_remaining[0] = False
+                raise RuntimeError(f"failed once: {statement}")
+
+        def close(self):
+            pass
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(m, "_ensure_mysql_control_user", lambda _cluster: True)
+    monkeypatch.setattr(
+        m,
+        "_mysql_replication_secondary",
+        lambda _cluster: pytest.fail("channel operation consulted global role"),
+    )
+    monkeypatch.setattr(
+        m,
+        "_mysql_replication_connection",
+        lambda cluster: FakeConnection() if cluster is writer else None,
+    )
+
+    assert m._configure_mysql_replica_from_source(
+        "primary",
+        writer,
+        secondary,
+    ) is False
+    assert "_mysql_replication_source_arn" not in writer
+
+    reset_start = len(statements)
+    assert m._reset_mysql_replication_channel(
+        "primary",
+        writer,
+        clear_super_read_only=False,
+    ) is True
+    assert [statement for statement, _params in statements[reset_start:]] == [
+        "STOP REPLICA",
+        "RESET REPLICA ALL",
+    ]
+    assert writer["_mysql_replication_detach_state"] == "reset"
 
 
 @pytest.mark.parametrize(
