@@ -7,6 +7,11 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **IAM enforcement — the `aws:ResourceAccount` condition key resolves** — with `AUTH=true` a statement conditioned on `aws:ResourceAccount` (or its `s3:ResourceAccount` alias) never matched: the key was unknown to the evaluator, an unknown key is a no-match, and the statement's Allow never applied. CDK's own bootstrap template conditions the file-publishing role's S3 grant on exactly this key, so every `cdk deploy` under enforcement failed at asset publishing with "Bucket ... exists, but we dont have access to it". The key now resolves to the account that owns the resource — the requesting account, since MiniStack hosts one account per request and models no cross-account access, unless the resource ARN carries a different account field, which wins. A condition naming another account still denies, and every other unknown global key keeps denying. Contributed by @iot-rocket.
+
+
 ## [1.5.5] — 2026-09-01
 
 ### Added
