@@ -3067,7 +3067,12 @@ def _cluster_endpoint_aliases(cluster):
     if isinstance(value, dict):
         value = value.get("Address")
     # A name, not an address: an earlier container may have left one here.
-    if isinstance(value, str) and value and not value[0].isdigit():
+    # _MINISTACK_HOST ("localhost", or e.g. "host.docker.internal") is what a
+    # host-run ministack stamps into Endpoint — registering it as a network
+    # alias would hijack that name inside the Docker network after a
+    # host-run -> containerized restart, so it never qualifies.
+    if (isinstance(value, str) and value and not value[0].isdigit()
+            and value not in ("localhost", _MINISTACK_HOST)):
         return [value]
     return []
 
