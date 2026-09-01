@@ -10180,20 +10180,19 @@ def test_rds_mysql_control_query_uses_remaining_deadline(
     elapsed,
     expected,
 ):
-    import pymysql
-
     from ministack.services import rds as m
 
     now = iter([100.0, 111.0 if elapsed else 100.0, 111.0 if elapsed else 100.0])
     events = []
     timeouts = []
+
+    def connect(**kwargs):
+        timeouts.append(kwargs)
+        return _mysql_test_connection(events, rows=((1,),))
+
     monkeypatch.setattr(m.time, "monotonic", lambda: next(now))
-    monkeypatch.setattr(
-        pymysql,
-        "connect",
-        lambda **kwargs: (
-            timeouts.append(kwargs) or _mysql_test_connection(events, rows=((1,),))
-        ),
+    monkeypatch.setitem(
+        sys.modules, "pymysql", types.SimpleNamespace(connect=connect),
     )
     cluster = {"_shared_endpoint": {"Address": "writer", "Port": 3306}}
     assert m._mysql_control_query(cluster, "SELECT 1", deadline=110.0) == expected
