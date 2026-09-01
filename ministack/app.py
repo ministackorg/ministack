@@ -503,14 +503,19 @@ def _decode_aws_chunked_body(body: bytes, headers: dict) -> bytes:
     ):
         return body
 
-    decoded = b""
-    remaining = body
+    # Walked by index with the chunks collected for one join. Both the
+    # decoded += chunk append and re-slicing the unparsed tail copy an
+    # amount proportional to the whole body on every chunk, which made this
+    # decode quadratic twice over -- and aws-chunked is what the AWS CLI
+    # sends for a large streaming PutObject.
+    chunks = []
+    pos = 0
     trailer = b""
-    while remaining:
-        crlf = remaining.find(b"\r\n")
+    while pos < len(body):
+        crlf = body.find(b"\r\n", pos)
         if crlf == -1:
             break
-        chunk_header = remaining[:crlf].decode("ascii", errors="replace")
+        chunk_header = body[pos:crlf].decode("ascii", errors="replace")
         size_hex = chunk_header.split(";")[0].strip()
         try:
             chunk_size = int(size_hex, 16)
@@ -519,11 +524,12 @@ def _decode_aws_chunked_body(body: bytes, headers: dict) -> bytes:
         if chunk_size == 0:
             # Whatever follows the final chunk is the trailing header
             # section the request announced in x-amz-trailer.
-            trailer = remaining[crlf + 2 :]
+            trailer = body[crlf + 2 :]
             break
         data_start = crlf + 2
-        decoded += remaining[data_start : data_start + chunk_size]
-        remaining = remaining[data_start + chunk_size + 2 :]  # skip trailing \r\n
+        chunks.append(body[data_start : data_start + chunk_size])
+        pos = data_start + chunk_size + 2  # skip trailing \r\n
+    decoded = b"".join(chunks)
 
     # A checksum computed while the body streamed arrives here rather than
     # among the request headers, and the rest of the request has no way to
@@ -553,11 +559,18 @@ async def _read_request_body(receive, method: str, headers: dict) -> bytes:
     """Read and decode the request body only for methods or headers that can carry one."""
     body = b""
     if headers.get("content-length") or headers.get("transfer-encoding") or method in _BODY_METHODS:
+        # Chunks are collected and joined once. Appending to a bytes object
+        # re-copies everything received so far on every 64 KB chunk, which made
+        # assembling a 95 MB PutObject copy ~76 GB of memory.
+        chunks = []
         while True:
             message = await receive()
-            body += message.get("body", b"")
+            chunk = message.get("body", b"")
+            if chunk:
+                chunks.append(chunk)
             if not message.get("more_body", False):
                 break
+        body = b"".join(chunks)
     return _decode_aws_chunked_body(body, headers)
 
 
