@@ -212,7 +212,7 @@ def _initial_iceberg_metadata(table_name, schema_fields, location):
         )
     schema = {"type": "struct", "schema-id": 0, "fields": fields}
     return {
-        "format-version": 3,
+        "format-version": 2,
         "table-uuid": table_uuid,
         "location": location,
         "last-sequence-number": 0,
@@ -602,6 +602,40 @@ def _iceberg_list_namespaces(allow_cross_region):
     return json_response({"namespaces": result})
 
 
+def _iceberg_create_namespace(data, allow_cross_region, bucket_filter=None):
+    """POST /iceberg/v1/namespaces — Iceberg REST createNamespace.
+
+    Delegates to the control-plane CreateNamespace, which stores the record.
+    The Iceberg REST spec returns the namespace and its properties on success,
+    and AlreadyExistsException (409) when the namespace exists.
+    """
+    ns_list = data.get("namespace", [])
+    ns_name = ns_list[0] if isinstance(ns_list, list) and ns_list else data.get("namespace", "")
+    if not ns_name:
+        return _iceberg_error("namespace is required", "BadRequestException", 400)
+    # Find the table bucket to create the namespace in. When the prefix
+    # carries a bucket filter (from the /v1/config warehouse), use that;
+    # otherwise fall back to the first visible bucket.
+    if bucket_filter:
+        buckets = _iceberg_values(
+            _table_buckets, lambda b: b.get("arn", "").endswith("/" + bucket_filter),
+            allow_cross_region)
+    else:
+        buckets = _iceberg_values(_table_buckets, lambda _b: True, allow_cross_region)
+    if not buckets:
+        return _iceberg_error("No table bucket found", "NoSuchNamespaceException", 404)
+    bucket = buckets[0]
+    bucket_arn = bucket.get("arn", "")
+    # Check if namespace already exists.
+    existing = _iceberg_values(
+        _namespaces, lambda ns: _namespace_name(ns) == ns_name, allow_cross_region)
+    if existing:
+        return _iceberg_error(
+            f"Namespace already exists: {ns_name}", "AlreadyExistsException", 409)
+    _create_namespace(bucket_arn, {"namespace": [ns_name]})
+    return json_response({"namespace": [ns_name], "properties": data.get("properties", {})})
+
+
 def _iceberg_get_namespace(namespace, allow_cross_region):
     if _iceberg_values(_namespaces, lambda ns: _namespace_name(ns) == namespace, allow_cross_region):
         return json_response({"namespace": [namespace], "properties": {}})
@@ -712,7 +746,12 @@ def _apply_iceberg_updates(metadata, updates):
             if field_ids:
                 metadata["last-column-id"] = max(metadata.get("last-column-id", 0), max(field_ids))
         elif action == "set-current-schema":
-            metadata["current-schema-id"] = update.get("schema-id", 0)
+            schema_id = update.get("schema-id", 0)
+            if schema_id == -1:
+                # -1 means "the schema added earlier in this commit".
+                ids = [s.get("schema-id", 0) for s in metadata.get("schemas", [])]
+                schema_id = max(ids) if ids else 0
+            metadata["current-schema-id"] = schema_id
         elif action in ("add-spec", "add-partition-spec"):
             # "add-spec" is the Iceberg REST spec's action name (what
             # duckdb-iceberg sends); "add-partition-spec" is a non-standard
@@ -723,7 +762,11 @@ def _apply_iceberg_updates(metadata, updates):
             if not any(s.get("spec-id") == new_spec.get("spec-id") for s in specs):
                 specs.append(new_spec)
         elif action == "set-default-spec":
-            metadata["default-spec-id"] = update.get("spec-id", 0)
+            spec_id = update.get("spec-id", 0)
+            if spec_id == -1:
+                ids = [s.get("spec-id", 0) for s in metadata.get("partition-specs", [])]
+                spec_id = max(ids) if ids else 0
+            metadata["default-spec-id"] = spec_id
         elif action == "add-sort-order":
             new_order = update.get("sort-order", {})
             orders = metadata.setdefault("sort-orders", [])
@@ -731,7 +774,11 @@ def _apply_iceberg_updates(metadata, updates):
             if not any(o.get("order-id") == new_order.get("order-id") for o in orders):
                 orders.append(new_order)
         elif action == "set-default-sort-order":
-            metadata["default-sort-order-id"] = update.get("sort-order-id", 0)
+            order_id = update.get("sort-order-id", 0)
+            if order_id == -1:
+                ids = [o.get("order-id", 0) for o in metadata.get("sort-orders", [])]
+                order_id = max(ids) if ids else 0
+            metadata["default-sort-order-id"] = order_id
         elif action == "set-properties":
             metadata.setdefault("properties", {}).update(update.get("updates", {}))
         elif action == "remove-properties":
@@ -807,6 +854,10 @@ def _iceberg_create_table(namespace, data, allow_cross_region):
     bucket_name = bucket_arn.rsplit("/", 1)[-1]
     location = data.get("location", f"s3://{bucket_name}/{namespace}/{table_name}")
     iceberg_metadata = _initial_iceberg_metadata(table_name, schema_fields, location)
+    # Honor a format-version from the client's request or properties.
+    fmt_ver = data.get("format-version") or data.get("properties", {}).get("format-version")
+    if fmt_ver is not None:
+        iceberg_metadata["format-version"] = int(fmt_ver)
     if schema:
         iceberg_metadata["schemas"] = [schema]
     partition_spec = data.get("partition-spec")
@@ -900,6 +951,9 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
 
     if len(rest) == 0 and method == "GET":
         return _iceberg_list_namespaces(allow_cross_region)
+    if len(rest) == 0 and method == "POST":
+        data = json.loads(body) if body else {}
+        return _iceberg_create_namespace(data, allow_cross_region, bucket_filter)
     if len(rest) == 1 and method == "GET":
         return _iceberg_get_namespace(rest[0], allow_cross_region)
     if len(rest) >= 2 and rest[1] == "tables":
