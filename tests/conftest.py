@@ -728,6 +728,11 @@ def s3tables():
     return make_client("s3tables")
 
 
+@pytest.fixture(scope="session")
+def transcribe():
+    return make_client("transcribe")
+
+
 class FakeDockerContainer:
     """Container double for tests that observe lifecycle without a daemon."""
 

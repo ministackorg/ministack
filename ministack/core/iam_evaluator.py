@@ -130,6 +130,21 @@ def _resource_matches(resource_arn: str, resources: list[str],
 # Condition evaluation
 # ---------------------------------------------------------------------------
 
+def _account_from_arn(arn: str) -> str | None:
+    """The account field of an ARN, or None when the ARN carries none: ``*``,
+    partition-only ARNs such as S3 (``arn:aws:s3:::bucket``), AWS-owned ARNs
+    (``arn:aws:iam::aws:policy/...``) and malformed values."""
+    if not arn or arn == "*" or not arn.startswith("arn:"):
+        return None
+    parts = arn.split(":", 5)
+    if len(parts) < 6:
+        return None
+    account = parts[4]
+    if not account or account == "aws":
+        return None
+    return account
+
+
 def _resolve_condition_key(key: str, ctx: EvalContext) -> Any:
     """Resolve a global condition context key to its value."""
     k = key.lower()
@@ -154,6 +169,14 @@ def _resolve_condition_key(key: str, ctx: EvalContext) -> Any:
     if k.startswith("aws:requesttag/"):
         tag_key = key[len("aws:RequestTag/"):]
         return ctx.request_tags.get(tag_key)
+    if k in ("aws:resourceaccount", "s3:resourceaccount"):
+        # The account that owns the resource. The emulator hosts one account
+        # per request and models no cross-account access, so it is the
+        # requesting account — unless the resource ARN carries a different
+        # account field, which then wins. CDK's bootstrap file-publishing
+        # role conditions its S3 grant on this key, so leaving it unresolved
+        # denied every `cdk deploy` under AUTH=true.
+        return _account_from_arn(ctx.resource_arn) or ctx.principal_account
     return None  # key not present
 
 

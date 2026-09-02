@@ -143,6 +143,10 @@ SERVICE_PATTERNS = {
         "target_prefixes": ["AmazonAthena"],
         "host_patterns": [r"athena\."],
     },
+    "transcribe": {
+        "target_prefixes": ["Transcribe."],
+        "host_patterns": [r"transcribe\."],
+    },
     "airflow": {
         "host_patterns": [r"airflow\."],
         "path_patterns": [

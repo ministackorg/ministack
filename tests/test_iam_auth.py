@@ -397,6 +397,87 @@ class TestConditions:
         assert evaluate(ctx, [stmts]).decision == "ImplicitDeny"
 
 
+
+class TestResourceAccountCondition:
+    """``aws:ResourceAccount`` (and the ``s3:ResourceAccount`` alias) resolve to the
+    account that owns the resource. The emulator hosts one account per request and
+    models no cross-account access, so that is the requesting account unless the
+    resource ARN carries an account field. CDK's bootstrap file-publishing role
+    conditions its S3 grant on this key, so an unresolved key denied every
+    ``cdk deploy`` under AUTH=true."""
+
+    _S3 = {"Effect": "Allow", "Action": ["s3:GetBucket*", "s3:List*"],
+           "Resource": ["arn:aws:s3:::cdk-assets", "arn:aws:s3:::cdk-assets/*"]}
+
+    def _policy(self, condition):
+        return parse_policy_document({"Statement": [dict(self._S3, Condition=condition)]})
+
+    def test_same_account_condition_allows(self):
+        stmts = self._policy({"StringEquals": {"aws:ResourceAccount": ["000000000000"]}})
+        ctx = _ctx(action="s3:GetBucketLocation", resource="arn:aws:s3:::cdk-assets")
+        assert evaluate(ctx, [stmts]).decision == "Allow"
+
+    def test_s3_alias_allows(self):
+        stmts = self._policy({"StringEquals": {"s3:ResourceAccount": "000000000000"}})
+        ctx = _ctx(action="s3:ListBucket", resource="arn:aws:s3:::cdk-assets")
+        assert evaluate(ctx, [stmts]).decision == "Allow"
+
+    def test_foreign_account_condition_still_denies(self):
+        stmts = self._policy({"StringEquals": {"aws:ResourceAccount": ["111111111111"]}})
+        ctx = _ctx(action="s3:GetBucketLocation", resource="arn:aws:s3:::cdk-assets")
+        assert evaluate(ctx, [stmts]).decision == "ImplicitDeny"
+
+    def test_resource_arn_account_field_wins(self):
+        # An ARN that names a different owning account is that account's resource.
+        stmts = parse_policy_document({"Statement": [{
+            "Effect": "Allow", "Action": "sqs:SendMessage", "Resource": "*",
+            "Condition": {"StringEquals": {"aws:ResourceAccount": "222222222222"}}}]})
+        ctx = _ctx(action="sqs:SendMessage",
+                   resource="arn:aws:sqs:us-east-1:222222222222:queue")
+        assert evaluate(ctx, [stmts]).decision == "Allow"
+        ctx_own = _ctx(action="sqs:SendMessage",
+                       resource="arn:aws:sqs:us-east-1:000000000000:queue")
+        assert evaluate(ctx_own, [stmts]).decision == "ImplicitDeny"
+
+    def test_unknown_global_key_still_denies(self):
+        stmts = self._policy({"StringEquals": {"aws:PrincipalOrgID": "o-abc"}})
+        ctx = _ctx(action="s3:ListBucket", resource="arn:aws:s3:::cdk-assets")
+        assert evaluate(ctx, [stmts]).decision == "ImplicitDeny"
+
+    @pytest.mark.parametrize("arn,expected", [
+        ("*", None),
+        ("", None),
+        ("arn:aws:s3:::bucket", None),                    # partition-only, no account
+        ("arn:aws:s3:::bucket/key", None),
+        ("arn:aws:iam::aws:policy/AdministratorAccess", None),  # AWS-owned
+        ("arn:aws:sqs:us-east-1:222222222222:q", "222222222222"),
+        ("not-an-arn", None),
+        ("arn:aws:sqs", None),                            # too short
+    ])
+    def test_account_from_arn(self, arn, expected):
+        from ministack.core.iam_evaluator import _account_from_arn
+        assert _account_from_arn(arn) == expected
+
+    def test_deny_statement_conditioned_on_resource_account(self):
+        # A Deny guarded by aws:ResourceAccount fires for the caller's own account.
+        stmts = parse_policy_document({"Statement": [
+            {"Effect": "Allow", "Action": "s3:*", "Resource": "*"},
+            {"Effect": "Deny", "Action": "s3:DeleteObject", "Resource": "*",
+             "Condition": {"StringEquals": {"s3:ResourceAccount": "000000000000"}}},
+        ]})
+        ctx = _ctx(action="s3:DeleteObject", resource="arn:aws:s3:::cdk-assets/x")
+        assert evaluate(ctx, [stmts]).decision == "Deny"
+        ctx = _ctx(action="s3:GetObject", resource="arn:aws:s3:::cdk-assets/x")
+        assert evaluate(ctx, [stmts]).decision == "Allow"
+
+    def test_string_not_equals_on_resource_account(self):
+        # The CDK bootstrap shape inverted: allow only when the resource is NOT
+        # in a foreign account — resolves to the caller's account, so it allows.
+        stmts = self._policy({"StringNotEquals": {"aws:ResourceAccount": "111111111111"}})
+        ctx = _ctx(action="s3:ListBucket", resource="arn:aws:s3:::cdk-assets")
+        assert evaluate(ctx, [stmts]).decision == "Allow"
+
+
 # ---------------------------------------------------------------------------
 # Trust policy evaluation (per AWS AssumeRole documentation)
 # ---------------------------------------------------------------------------
@@ -1106,6 +1187,57 @@ class TestActionExtraction:
     def test_unknown_service_returns_none(self):
         from ministack.core.iam_actions import extract_iam_action
         assert extract_iam_action("unknown_svc", "GET", "/", {}, b"", {}) is None
+
+
+
+class TestS3ActionMapping:
+    """S3 authorizes by the IAM actions its documentation lists, not by API
+    operation name: every multipart operation except abort is ``s3:PutObject``."""
+
+    def _act(self, method, path, query):
+        from ministack.core.iam_actions import extract_iam_action
+        return extract_iam_action("s3", method, path, {}, b"", query)
+
+    @pytest.mark.parametrize("method,path,query,expected", [
+        ("POST", "/bucket/key", {"uploads": ""}, "s3:PutObject"),          # CreateMultipartUpload
+        ("PUT", "/bucket/key", {"uploadId": "u", "partNumber": "1"}, "s3:PutObject"),  # UploadPart
+        ("POST", "/bucket/key", {"uploadId": "u"}, "s3:PutObject"),        # CompleteMultipartUpload
+        ("DELETE", "/bucket/key", {"uploadId": "u"}, "s3:AbortMultipartUpload"),
+        ("GET", "/bucket/key", {"uploadId": "u"}, "s3:ListMultipartUploadParts"),
+        ("GET", "/bucket", {"uploads": ""}, "s3:ListBucketMultipartUploads"),
+        ("GET", "/bucket", {"versions": ""}, "s3:ListBucketVersions"),
+        ("GET", "/bucket/key", {"tagging": ""}, "s3:GetObjectTagging"),
+        ("PUT", "/bucket/key", {"acl": ""}, "s3:PutObjectAcl"),
+        ("GET", "/bucket", {"tagging": ""}, "s3:GetBucketTagging"),
+        ("DELETE", "/bucket", {"tagging": ""}, "s3:PutBucketTagging"),     # no s3:DeleteBucketTagging
+        ("DELETE", "/bucket/key", {"tagging": ""}, "s3:DeleteObjectTagging"),
+        ("GET", "/bucket", {"acl": ""}, "s3:GetBucketAcl"),
+        ("DELETE", "/bucket", {"lifecycle": ""}, "s3:PutLifecycleConfiguration"),
+        ("DELETE", "/bucket", {"encryption": ""}, "s3:PutEncryptionConfiguration"),
+        ("DELETE", "/bucket", {"replication": ""}, "s3:PutReplicationConfiguration"),
+        ("DELETE", "/bucket", {"cors": ""}, "s3:PutBucketCORS"),
+        ("DELETE", "/bucket", {"policy": ""}, "s3:DeleteBucketPolicy"),   # this one exists
+        ("GET", "/bucket/key", {"versions": ""}, "s3:GetObject"),         # bucket-only sub-resource
+        ("GET", "/bucket/key", {"versionId": "v1"}, "s3:GetObject"),      # not s3:GetObjectVersion (known gap)
+        ("PUT", "/bucket/key", {}, "s3:PutObject"),
+        ("HEAD", "/bucket/key", {}, "s3:GetObject"),
+        ("GET", "/bucket", {}, "s3:ListBucket"),
+    ])
+    def test_operation_maps_to_documented_iam_action(self, method, path, query, expected):
+        assert self._act(method, path, query) == expected
+
+    def test_cdk_publishing_role_grant_covers_multipart(self):
+        # The CDK bootstrap file-publishing role grants s3:PutObject* and
+        # s3:Abort*; a multipart asset upload must be authorized by those.
+        stmts = parse_policy_document({"Statement": [{
+            "Effect": "Allow",
+            "Action": ["s3:GetObject*", "s3:GetBucket*", "s3:List*", "s3:PutObject*", "s3:Abort*"],
+            "Resource": ["arn:aws:s3:::cdk-assets", "arn:aws:s3:::cdk-assets/*"]}]})
+        for method, query in (("POST", {"uploads": ""}), ("PUT", {"uploadId": "u", "partNumber": "1"}),
+                              ("POST", {"uploadId": "u"}), ("DELETE", {"uploadId": "u"})):
+            action = self._act(method, "/cdk-assets/asset.zip", query)
+            ctx = _ctx(action=action, resource="arn:aws:s3:::cdk-assets/asset.zip")
+            assert evaluate(ctx, [stmts]).decision == "Allow", action
 
 
 # ---------------------------------------------------------------------------
