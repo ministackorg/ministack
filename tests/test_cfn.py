@@ -10983,3 +10983,794 @@ def test_cfn_cognito_user_pool_name_is_the_userpoolname_property(cfn, cognito_id
         assert listed[outputs["NamedId"]] == f"cfn-named-pool-{uid}"
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
+
+
+def _user_pool_ids_named(cognito_idp, name):
+    ids, token = [], None
+    while True:
+        page = cognito_idp.list_user_pools(MaxResults=60, **({"NextToken": token} if token else {}))
+        ids += [p["Id"] for p in page["UserPools"] if p["Name"] == name]
+        token = page.get("NextToken")
+        if not token:
+            return ids
+
+
+def test_cfn_cognito_user_pool_update_keeps_id_and_users(cfn, cognito_idp):
+    """Changing MfaConfiguration and the password policy updates the pool in
+    place: same pool id, the user created before the update is still there,
+    and DescribeUserPool reports the new settings."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-pool-upd-{uid}"
+
+    def template(mfa, min_len):
+        return json.dumps({
+            "Resources": {"Pool": {"Type": "AWS::Cognito::UserPool", "Properties": {
+                "UserPoolName": f"cfn-pool-upd-{uid}",
+                "MfaConfiguration": mfa,
+                "Policies": {"PasswordPolicy": {"MinimumLength": min_len}},
+            }}},
+            "Outputs": {"PoolId": {"Value": {"Ref": "Pool"}},
+                        "PoolArn": {"Value": {"Fn::GetAtt": ["Pool", "Arn"]}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("OFF", 8))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        pool_id, pool_arn = _output(stack, "PoolId"), _output(stack, "PoolArn")
+        assert cognito_idp.describe_user_pool(UserPoolId=pool_id)["UserPool"]["Name"] == (
+            f"cfn-pool-upd-{uid}"
+        )
+        cognito_idp.admin_create_user(UserPoolId=pool_id, Username="alice")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("OPTIONAL", 12))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "PoolId") == pool_id
+        assert _output(stack, "PoolArn") == pool_arn
+
+        pool = cognito_idp.describe_user_pool(UserPoolId=pool_id)["UserPool"]
+        assert pool["MfaConfiguration"] == "OPTIONAL"
+        assert pool["Policies"]["PasswordPolicy"]["MinimumLength"] == 12
+        users = cognito_idp.list_users(UserPoolId=pool_id)["Users"]
+        assert [u["Username"] for u in users] == ["alice"]
+        assert _user_pool_ids_named(cognito_idp, f"cfn-pool-upd-{uid}") == [pool_id]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cognito_user_pool_rename_keeps_id_and_users(cfn, cognito_idp):
+    """UserPoolName updates without interruption per the resource reference:
+    the pool keeps its id and its users and DescribeUserPool reports the
+    new name."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-pool-ren-{uid}"
+
+    def template(name):
+        return json.dumps({
+            "Resources": {"Pool": {"Type": "AWS::Cognito::UserPool",
+                                   "Properties": {"UserPoolName": name}}},
+            "Outputs": {"PoolId": {"Value": {"Ref": "Pool"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(f"cfn-pool-a-{uid}"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        pool_id = _output(stack, "PoolId")
+        cognito_idp.admin_create_user(UserPoolId=pool_id, Username="alice")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(f"cfn-pool-b-{uid}"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "PoolId") == pool_id
+        assert cognito_idp.describe_user_pool(UserPoolId=pool_id)["UserPool"]["Name"] == (
+            f"cfn-pool-b-{uid}"
+        )
+        users = cognito_idp.list_users(UserPoolId=pool_id)["Users"]
+        assert [u["Username"] for u in users] == ["alice"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize("prop", ["AliasAttributes", "UsernameAttributes"])
+def test_cfn_cognito_user_pool_sign_in_attributes_change_fails_loudly(cfn, cognito_idp, prop):
+    """AliasAttributes and UsernameAttributes are fixed at CreateUserPool and
+    no API call changes them afterwards, so MiniStack refuses the update
+    instead of altering the record: the stack rolls back, the pool keeps
+    its id, its users and its sign-in settings."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-pool-attr-{uid}"
+
+    def template(attributes):
+        props = {"UserPoolName": f"cfn-pool-attr-{uid}"}
+        if attributes:
+            props[prop] = attributes
+        return json.dumps({
+            "Resources": {"Pool": {"Type": "AWS::Cognito::UserPool", "Properties": props}},
+            "Outputs": {"PoolId": {"Value": {"Ref": "Pool"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(None))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        pool_id = _output(stack, "PoolId")
+        cognito_idp.admin_create_user(UserPoolId=pool_id, Username="alice")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(["email"]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert f"AWS::Cognito::UserPool {prop} is set at CreateUserPool" in _stack_event_reasons(cfn, stack_name)
+        assert _output(stack, "PoolId") == pool_id
+
+        pool = cognito_idp.describe_user_pool(UserPoolId=pool_id)["UserPool"]
+        assert pool.get(prop, []) == []
+        users = cognito_idp.list_users(UserPoolId=pool_id)["Users"]
+        assert [u["Username"] for u in users] == ["alice"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cognito_user_pool_client_update_keeps_client_id(cfn, cognito_idp):
+    """ClientName and CallbackURLs update in place through
+    UpdateUserPoolClient; Ref keeps returning the same ClientId."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-client-upd-{uid}"
+
+    def template(client_name, callbacks):
+        props = {"UserPoolId": {"Ref": "Pool"}, "ClientName": client_name,
+                 "ExplicitAuthFlows": ["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"]}
+        if callbacks:
+            props["CallbackURLs"] = callbacks
+        return json.dumps({
+            "Resources": {
+                "Pool": {"Type": "AWS::Cognito::UserPool",
+                         "Properties": {"UserPoolName": f"cfn-client-pool-{uid}"}},
+                "Client": {"Type": "AWS::Cognito::UserPoolClient", "Properties": props},
+            },
+            "Outputs": {"PoolId": {"Value": {"Ref": "Pool"}},
+                        "ClientId": {"Value": {"Ref": "Client"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("app-v1", None))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        pool_id, client_id = _output(stack, "PoolId"), _output(stack, "ClientId")
+
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=template("app-v2", ["https://example.com/callback"]),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "ClientId") == client_id
+
+        client = cognito_idp.describe_user_pool_client(
+            UserPoolId=pool_id, ClientId=client_id
+        )["UserPoolClient"]
+        assert client["ClientName"] == "app-v2"
+        assert client["CallbackURLs"] == ["https://example.com/callback"]
+        assert client["ExplicitAuthFlows"] == ["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"]
+        clients = cognito_idp.list_user_pool_clients(UserPoolId=pool_id, MaxResults=60)
+        assert [c["ClientId"] for c in clients["UserPoolClients"]] == [client_id]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cognito_user_pool_client_generate_secret_change_replaces_the_client(cfn, cognito_idp):
+    """GenerateSecret requires replacement: the new client is created before
+    the old one is removed, Ref moves to the new ClientId, and the new
+    client carries the secret. The pool lives outside the stack, so the
+    stack delete leaves it alone."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-client-repl-{uid}"
+    pool_id = cognito_idp.create_user_pool(PoolName=f"cfn-client-repl-pool-{uid}")["UserPool"]["Id"]
+
+    def template(generate_secret):
+        return json.dumps({
+            "Resources": {"Client": {"Type": "AWS::Cognito::UserPoolClient", "Properties": {
+                "UserPoolId": pool_id, "ClientName": "app",
+                "GenerateSecret": generate_secret}}},
+            "Outputs": {"ClientId": {"Value": {"Ref": "Client"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(False))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        client_id = _output(stack, "ClientId")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        new_id = _output(stack, "ClientId")
+        assert new_id != client_id
+        clients = cognito_idp.list_user_pool_clients(UserPoolId=pool_id, MaxResults=60)
+        assert [c["ClientId"] for c in clients["UserPoolClients"]] == [new_id]
+        client = cognito_idp.describe_user_pool_client(
+            UserPoolId=pool_id, ClientId=new_id
+        )["UserPoolClient"]
+        assert client["ClientSecret"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_cfn_cognito_user_pool_client_pool_move_replaces_the_client(cfn, cognito_idp):
+    """UserPoolId requires replacement: the client is created in the new
+    pool before the old one is removed from the old pool, and Ref moves to
+    the new ClientId. The pools live outside the stack."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-client-move-{uid}"
+    pool_a = cognito_idp.create_user_pool(PoolName=f"cfn-client-move-a-{uid}")["UserPool"]["Id"]
+    pool_b = cognito_idp.create_user_pool(PoolName=f"cfn-client-move-b-{uid}")["UserPool"]["Id"]
+
+    def template(pool_id):
+        return json.dumps({
+            "Resources": {"Client": {"Type": "AWS::Cognito::UserPoolClient", "Properties": {
+                "UserPoolId": pool_id, "ClientName": "app"}}},
+            "Outputs": {"ClientId": {"Value": {"Ref": "Client"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(pool_a))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        client_id = _output(stack, "ClientId")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(pool_b))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        new_id = _output(stack, "ClientId")
+        assert new_id != client_id
+        assert cognito_idp.list_user_pool_clients(UserPoolId=pool_a, MaxResults=60)["UserPoolClients"] == []
+        clients = cognito_idp.list_user_pool_clients(UserPoolId=pool_b, MaxResults=60)
+        assert [c["ClientId"] for c in clients["UserPoolClients"]] == [new_id]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        left = cognito_idp.list_user_pool_clients(UserPoolId=pool_b, MaxResults=60)["UserPoolClients"]
+        for pool_id in (pool_a, pool_b):
+            cognito_idp.delete_user_pool(UserPoolId=pool_id)
+    assert left == []
+
+
+def test_cfn_cognito_user_pool_dropped_property_reverts_to_default(cfn, cognito_idp):
+    """A property the new template no longer declares reverts to the default
+    the create handler applies, as CloudFormation does: MfaConfiguration
+    goes back to OFF and AutoVerifiedAttributes is cleared, while the pool
+    keeps its id and its user."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-pool-drop-{uid}"
+
+    def template(declared):
+        props = {"UserPoolName": f"cfn-pool-drop-{uid}"}
+        if declared:
+            props["MfaConfiguration"] = "OPTIONAL"
+            props["AutoVerifiedAttributes"] = ["email"]
+        return json.dumps({
+            "Resources": {"Pool": {"Type": "AWS::Cognito::UserPool", "Properties": props}},
+            "Outputs": {"PoolId": {"Value": {"Ref": "Pool"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(True))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        pool_id = _output(stack, "PoolId")
+        pool = cognito_idp.describe_user_pool(UserPoolId=pool_id)["UserPool"]
+        assert pool["MfaConfiguration"] == "OPTIONAL"
+        assert pool["AutoVerifiedAttributes"] == ["email"]
+        cognito_idp.admin_create_user(UserPoolId=pool_id, Username="alice")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(False))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "PoolId") == pool_id
+        pool = cognito_idp.describe_user_pool(UserPoolId=pool_id)["UserPool"]
+        assert pool["MfaConfiguration"] == "OFF"
+        assert pool.get("AutoVerifiedAttributes", []) == []
+        users = cognito_idp.list_users(UserPoolId=pool_id)["Users"]
+        assert [u["Username"] for u in users] == ["alice"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cognito_identity_pool_update_keeps_id_and_roles(cfn, cognito_identity):
+    """AllowUnauthenticatedIdentities flips in place through
+    UpdateIdentityPool: same IdentityPoolId, and the role mapping set outside
+    the template survives."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-idp-upd-{uid}"
+
+    def template(allow_unauth):
+        return json.dumps({
+            "Resources": {"IdPool": {"Type": "AWS::Cognito::IdentityPool", "Properties": {
+                "IdentityPoolName": f"cfn_idp_upd_{uid}",
+                "AllowUnauthenticatedIdentities": allow_unauth,
+            }}},
+            "Outputs": {"PoolId": {"Value": {"Ref": "IdPool"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(False))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        pool_id = _output(stack, "PoolId")
+        cognito_identity.set_identity_pool_roles(
+            IdentityPoolId=pool_id,
+            Roles={"authenticated": "arn:aws:iam::000000000000:role/auth-upd"},
+        )
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "PoolId") == pool_id
+
+        pool = cognito_identity.describe_identity_pool(IdentityPoolId=pool_id)
+        assert pool["AllowUnauthenticatedIdentities"] is True
+        assert pool["IdentityPoolName"] == f"cfn_idp_upd_{uid}"
+        roles = cognito_identity.get_identity_pool_roles(IdentityPoolId=pool_id)["Roles"]
+        assert roles == {"authenticated": "arn:aws:iam::000000000000:role/auth-upd"}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cognito_user_pool_group_update_keeps_members(cfn, cognito_idp):
+    """Description and Precedence update the group in place: Ref still
+    returns the group name and the user added to the group stays a member."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-group-upd-{uid}"
+
+    def template(description, precedence):
+        return json.dumps({
+            "Resources": {
+                "Pool": {"Type": "AWS::Cognito::UserPool",
+                         "Properties": {"UserPoolName": f"cfn-group-upd-pool-{uid}"}},
+                "Group": {"Type": "AWS::Cognito::UserPoolGroup", "Properties": {
+                    "UserPoolId": {"Ref": "Pool"}, "GroupName": "admins",
+                    "Description": description, "Precedence": precedence}},
+            },
+            "Outputs": {"PoolId": {"Value": {"Ref": "Pool"}},
+                        "GroupRef": {"Value": {"Ref": "Group"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("Administrators", 1))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        pool_id = _output(stack, "PoolId")
+        cognito_idp.admin_create_user(UserPoolId=pool_id, Username="alice")
+        cognito_idp.admin_add_user_to_group(UserPoolId=pool_id, Username="alice", GroupName="admins")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("Platform admins", 5))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "GroupRef") == "admins"
+
+        group = cognito_idp.get_group(UserPoolId=pool_id, GroupName="admins")["Group"]
+        assert group["Description"] == "Platform admins"
+        assert group["Precedence"] == 5
+        members = cognito_idp.list_users_in_group(UserPoolId=pool_id, GroupName="admins")["Users"]
+        assert [u["Username"] for u in members] == ["alice"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cognito_user_pool_group_rename_replaces_the_group(cfn, cognito_idp):
+    """GroupName requires replacement: the renamed group is created before
+    the old one is removed, and Ref follows the new name."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-group-ren-{uid}"
+
+    def template(group_name):
+        return json.dumps({
+            "Resources": {
+                "Pool": {"Type": "AWS::Cognito::UserPool",
+                         "Properties": {"UserPoolName": f"cfn-group-ren-pool-{uid}"}},
+                "Group": {"Type": "AWS::Cognito::UserPoolGroup", "Properties": {
+                    "UserPoolId": {"Ref": "Pool"}, "GroupName": group_name}},
+            },
+            "Outputs": {"PoolId": {"Value": {"Ref": "Pool"}},
+                        "GroupRef": {"Value": {"Ref": "Group"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("admins"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        pool_id = _output(stack, "PoolId")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("operators"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "GroupRef") == "operators"
+        groups = cognito_idp.list_groups(UserPoolId=pool_id)["Groups"]
+        assert [g["GroupName"] for g in groups] == ["operators"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cognito_user_pool_group_move_under_custom_name_fails_loudly(cfn, cognito_idp):
+    """UserPoolId requires replacement, which CloudFormation refuses for a
+    custom-named group: the stack rolls back and the group stays in its
+    pool with its members. The pools live outside the stack, so the
+    rollback has nothing else to undo."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-group-move-{uid}"
+    pool_a = cognito_idp.create_user_pool(PoolName=f"cfn-group-move-a-{uid}")["UserPool"]["Id"]
+    pool_b = cognito_idp.create_user_pool(PoolName=f"cfn-group-move-b-{uid}")["UserPool"]["Id"]
+
+    def template(pool_id):
+        return json.dumps({
+            "Resources": {"Group": {"Type": "AWS::Cognito::UserPoolGroup", "Properties": {
+                "UserPoolId": pool_id, "GroupName": "admins"}}},
+            "Outputs": {"GroupRef": {"Value": {"Ref": "Group"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(pool_a))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        cognito_idp.admin_create_user(UserPoolId=pool_a, Username="alice")
+        cognito_idp.admin_add_user_to_group(UserPoolId=pool_a, Username="alice", GroupName="admins")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(pool_b))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert "custom-named resource requires replacing" in _stack_event_reasons(cfn, stack_name)
+        assert _output(stack, "GroupRef") == "admins"
+
+        members = cognito_idp.list_users_in_group(UserPoolId=pool_a, GroupName="admins")["Users"]
+        assert [u["Username"] for u in members] == ["alice"]
+        assert cognito_idp.list_groups(UserPoolId=pool_b)["Groups"] == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for pool_id in (pool_a, pool_b):
+            cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_cfn_cognito_user_pool_client_dropped_properties_revert_to_defaults(cfn, cognito_idp):
+    """A client property the new template drops goes back to the default
+    CreateUserPoolClient applies ("If you don't specify a value for a
+    parameter, Amazon Cognito sets it to a default value" on the resource
+    reference): the callback list empties, PreventUserExistenceErrors is
+    LEGACY again and RefreshTokenValidity is the service default, while
+    Ref keeps the ClientId."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-client-drop-{uid}"
+
+    def template(declared):
+        props = {"UserPoolId": {"Ref": "Pool"}, "ClientName": "app"}
+        if declared:
+            props.update({"CallbackURLs": ["https://example.com/cb"],
+                          "PreventUserExistenceErrors": "ENABLED",
+                          "RefreshTokenValidity": 10})
+        return json.dumps({
+            "Resources": {
+                "Pool": {"Type": "AWS::Cognito::UserPool",
+                         "Properties": {"UserPoolName": f"cfn-client-drop-pool-{uid}"}},
+                "Client": {"Type": "AWS::Cognito::UserPoolClient", "Properties": props},
+            },
+            "Outputs": {"PoolId": {"Value": {"Ref": "Pool"}},
+                        "ClientId": {"Value": {"Ref": "Client"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(True))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        pool_id, client_id = _output(stack, "PoolId"), _output(stack, "ClientId")
+        client = cognito_idp.describe_user_pool_client(
+            UserPoolId=pool_id, ClientId=client_id
+        )["UserPoolClient"]
+        assert client["CallbackURLs"] == ["https://example.com/cb"]
+        assert client["PreventUserExistenceErrors"] == "ENABLED"
+        assert client["RefreshTokenValidity"] == 10
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(False))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "ClientId") == client_id
+        client = cognito_idp.describe_user_pool_client(
+            UserPoolId=pool_id, ClientId=client_id
+        )["UserPoolClient"]
+        assert client.get("CallbackURLs", []) == []
+        assert client["PreventUserExistenceErrors"] == "LEGACY"
+        assert client["RefreshTokenValidity"] == 30
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cognito_user_pool_client_replacement_carries_the_template_over(cfn, cognito_idp):
+    """The replacement a GenerateSecret change forces creates the new client
+    from the whole template: token validity, PreventUserExistenceErrors and
+    the OAuth settings arrive on the new ClientId, not only the six
+    properties the old create handler copied."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-client-carry-{uid}"
+    pool_id = cognito_idp.create_user_pool(PoolName=f"cfn-client-carry-pool-{uid}")["UserPool"]["Id"]
+
+    def template(generate_secret):
+        return json.dumps({
+            "Resources": {"Client": {"Type": "AWS::Cognito::UserPoolClient", "Properties": {
+                "UserPoolId": pool_id, "ClientName": "app", "GenerateSecret": generate_secret,
+                "AccessTokenValidity": 15, "TokenValidityUnits": {"AccessToken": "minutes"},
+                "PreventUserExistenceErrors": "ENABLED",
+                "AllowedOAuthFlowsUserPoolClient": True,
+                "AllowedOAuthFlows": ["code"], "AllowedOAuthScopes": ["openid"],
+                "ReadAttributes": ["email"], "AuthSessionValidity": 5}}},
+            "Outputs": {"ClientId": {"Value": {"Ref": "Client"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(False))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        client_id = _output(stack, "ClientId")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        new_id = _output(stack, "ClientId")
+        assert new_id != client_id
+        client = cognito_idp.describe_user_pool_client(
+            UserPoolId=pool_id, ClientId=new_id
+        )["UserPoolClient"]
+        assert client["ClientSecret"]
+        assert client["AccessTokenValidity"] == 15
+        assert client["TokenValidityUnits"] == {"AccessToken": "minutes"}
+        assert client["PreventUserExistenceErrors"] == "ENABLED"
+        assert client["AllowedOAuthFlowsUserPoolClient"] is True
+        assert client["AllowedOAuthFlows"] == ["code"]
+        assert client["AllowedOAuthScopes"] == ["openid"]
+        assert client["ReadAttributes"] == ["email"]
+        assert client["AuthSessionValidity"] == 5
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_cfn_cognito_identity_pool_dropped_properties_revert_and_principal_tags_survive(
+    cfn, cognito_identity
+):
+    """An identity pool property the new template drops reverts to the create
+    default (AllowClassicFlow false, no DeveloperProviderName) while the
+    pool keeps its id, the principal-tag mapping set outside the template
+    is still there after the update, and Fn::GetAtt Name is the name the
+    resource reference documents."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-idp-drop-{uid}"
+    provider = f"cognito-idp.us-east-1.amazonaws.com/us-east-1_{uid}"
+
+    def template(declared):
+        props = {"IdentityPoolName": f"cfn_idp_drop_{uid}",
+                 "AllowUnauthenticatedIdentities": False}
+        if declared:
+            props.update({"AllowClassicFlow": True, "DeveloperProviderName": "login.example"})
+        return json.dumps({
+            "Resources": {"IdPool": {"Type": "AWS::Cognito::IdentityPool", "Properties": props}},
+            "Outputs": {"PoolId": {"Value": {"Ref": "IdPool"}},
+                        "PoolName": {"Value": {"Fn::GetAtt": ["IdPool", "Name"]}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(True))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        pool_id = _output(stack, "PoolId")
+        assert _output(stack, "PoolName") == f"cfn_idp_drop_{uid}"
+        pool = cognito_identity.describe_identity_pool(IdentityPoolId=pool_id)
+        assert pool["AllowClassicFlow"] is True
+        assert pool["DeveloperProviderName"] == "login.example"
+        cognito_identity.set_principal_tag_attribute_map(
+            IdentityPoolId=pool_id, IdentityProviderName=provider,
+            PrincipalTags={"tenant": "custom:tenant"},
+        )
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(False))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "PoolId") == pool_id
+        assert _output(stack, "PoolName") == f"cfn_idp_drop_{uid}"
+        pool = cognito_identity.describe_identity_pool(IdentityPoolId=pool_id)
+        assert pool["AllowClassicFlow"] is False
+        assert pool.get("DeveloperProviderName", "") == ""
+        mapping = cognito_identity.get_principal_tag_attribute_map(
+            IdentityPoolId=pool_id, IdentityProviderName=provider
+        )
+        assert mapping["PrincipalTags"] == {"tenant": "custom:tenant"}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cognito_user_pool_group_dropped_properties_revert(cfn, cognito_idp):
+    """Dropping Description and Precedence from a group reverts them: the
+    description empties and the precedence goes away, since "The default
+    Precedence value is null" on the resource reference. The group keeps
+    its name and its member."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-group-drop-{uid}"
+
+    def template(declared):
+        props = {"UserPoolId": {"Ref": "Pool"}, "GroupName": "admins"}
+        if declared:
+            props.update({"Description": "Administrators", "Precedence": 3})
+        return json.dumps({
+            "Resources": {
+                "Pool": {"Type": "AWS::Cognito::UserPool",
+                         "Properties": {"UserPoolName": f"cfn-group-drop-pool-{uid}"}},
+                "Group": {"Type": "AWS::Cognito::UserPoolGroup", "Properties": props},
+            },
+            "Outputs": {"PoolId": {"Value": {"Ref": "Pool"}},
+                        "GroupRef": {"Value": {"Ref": "Group"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(True))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        pool_id = _output(stack, "PoolId")
+        group = cognito_idp.get_group(UserPoolId=pool_id, GroupName="admins")["Group"]
+        assert group["Precedence"] == 3
+        cognito_idp.admin_create_user(UserPoolId=pool_id, Username="alice")
+        cognito_idp.admin_add_user_to_group(UserPoolId=pool_id, Username="alice", GroupName="admins")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(False))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "GroupRef") == "admins"
+        group = cognito_idp.get_group(UserPoolId=pool_id, GroupName="admins")["Group"]
+        assert group.get("Description", "") == ""
+        assert "Precedence" not in group
+        members = cognito_idp.list_users_in_group(UserPoolId=pool_id, GroupName="admins")["Users"]
+        assert [u["Username"] for u in members] == ["alice"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cognito_user_pool_group_under_generated_name_moves_and_renames(cfn, cognito_idp):
+    """A group without a GroupName carries a generated name, which
+    CloudFormation may replace: a UserPoolId change moves it to the other
+    pool (same generated name, so Ref is unchanged, and the old pool is
+    left without it), and declaring a GroupName afterwards replaces it once
+    more with Ref following the new name. The pools live outside the
+    stack."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-group-gen-{uid}"
+    pool_a = cognito_idp.create_user_pool(PoolName=f"cfn-group-gen-a-{uid}")["UserPool"]["Id"]
+    pool_b = cognito_idp.create_user_pool(PoolName=f"cfn-group-gen-b-{uid}")["UserPool"]["Id"]
+
+    def template(pool_id, group_name=None):
+        props = {"UserPoolId": pool_id, "Description": "generated"}
+        if group_name:
+            props["GroupName"] = group_name
+        return json.dumps({
+            "Resources": {"Group": {"Type": "AWS::Cognito::UserPoolGroup", "Properties": props}},
+            "Outputs": {"GroupRef": {"Value": {"Ref": "Group"}}},
+        })
+
+    def group_names(pool_id):
+        return [g["GroupName"] for g in cognito_idp.list_groups(UserPoolId=pool_id)["Groups"]]
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(pool_a))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        generated = _output(stack, "GroupRef")
+        assert group_names(pool_a) == [generated]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(pool_b))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "GroupRef") == generated
+        assert group_names(pool_a) == []
+        assert group_names(pool_b) == [generated]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(pool_b, "admins"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "GroupRef") == "admins"
+        assert group_names(pool_b) == ["admins"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for pool_id in (pool_a, pool_b):
+            cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+_COGNITO_POOL_PROPERTY_CHANGES = [
+    ("LambdaConfig",
+     {"PreSignUp": "arn:aws:lambda:us-east-1:000000000000:function:pre-signup-v1"},
+     {"PreSignUp": "arn:aws:lambda:us-east-1:000000000000:function:pre-signup-v2",
+      "PostConfirmation": "arn:aws:lambda:us-east-1:000000000000:function:post-confirm"}),
+    ("AdminCreateUserConfig",
+     {"AllowAdminCreateUserOnly": False, "UnusedAccountValidityDays": 7},
+     {"AllowAdminCreateUserOnly": True, "UnusedAccountValidityDays": 3}),
+    ("UserPoolTags", {"env": "dev"}, {"env": "prod", "team": "platform"}),
+    ("AccountRecoverySetting",
+     {"RecoveryMechanisms": [{"Name": "verified_email", "Priority": 1}]},
+     {"RecoveryMechanisms": [{"Name": "verified_phone_number", "Priority": 1},
+                             {"Name": "verified_email", "Priority": 2}]}),
+    ("DeviceConfiguration",
+     {"ChallengeRequiredOnNewDevice": False},
+     {"ChallengeRequiredOnNewDevice": True, "DeviceOnlyRememberedOnUserPrompt": True}),
+]
+
+
+@pytest.mark.parametrize("prop,before,after", _COGNITO_POOL_PROPERTY_CHANGES,
+                         ids=[c[0] for c in _COGNITO_POOL_PROPERTY_CHANGES])
+def test_cfn_cognito_user_pool_property_changes_in_place(cfn, cognito_idp, prop, before, after):
+    """Each of these properties is "Update requires: No interruption" on the
+    resource reference: the change lands on the same pool id and
+    DescribeUserPool reports the new value, with the user kept."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-pool-{prop.lower()[:12]}-{uid}"
+
+    def template(value):
+        return json.dumps({
+            "Resources": {"Pool": {"Type": "AWS::Cognito::UserPool", "Properties": {
+                "UserPoolName": f"cfn-pool-prop-{uid}", prop: value}}},
+            "Outputs": {"PoolId": {"Value": {"Ref": "Pool"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(before))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        pool_id = _output(stack, "PoolId")
+        assert cognito_idp.describe_user_pool(UserPoolId=pool_id)["UserPool"][prop] == before
+        cognito_idp.admin_create_user(UserPoolId=pool_id, Username="alice")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(after))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "PoolId") == pool_id
+        assert cognito_idp.describe_user_pool(UserPoolId=pool_id)["UserPool"][prop] == after
+        users = cognito_idp.list_users(UserPoolId=pool_id)["Users"]
+        assert [u["Username"] for u in users] == ["alice"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cognito_user_pool_schema_update_adds_custom_attributes(cfn, cognito_idp):
+    """A Schema entry the pool does not have yet is added through
+    AddCustomAttributes on update: the pool keeps its id and its user, the
+    attribute from the first template is still there, and the new one shows
+    up under its custom: prefix. A standard attribute the template also
+    lists (email) is left as it is."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-pool-schema-{uid}"
+
+    def template(names):
+        schema = [{"Name": "email", "AttributeDataType": "String", "Required": True}]
+        schema += [{"Name": n, "AttributeDataType": "String", "Mutable": True} for n in names]
+        return json.dumps({
+            "Resources": {"Pool": {"Type": "AWS::Cognito::UserPool", "Properties": {
+                "UserPoolName": f"cfn-pool-schema-{uid}", "Schema": schema}}},
+            "Outputs": {"PoolId": {"Value": {"Ref": "Pool"}}},
+        })
+
+    def custom_names(pool_id):
+        attrs = cognito_idp.describe_user_pool(UserPoolId=pool_id)["UserPool"]["SchemaAttributes"]
+        return sorted(a["Name"] for a in attrs if a["Name"].startswith("custom:"))
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(["tier"]))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        pool_id = _output(stack, "PoolId")
+        assert custom_names(pool_id) == ["custom:tier"]
+        cognito_idp.admin_create_user(UserPoolId=pool_id, Username="alice")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(["tier", "plan"]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "PoolId") == pool_id
+        assert custom_names(pool_id) == ["custom:plan", "custom:tier"]
+        attrs = cognito_idp.describe_user_pool(UserPoolId=pool_id)["UserPool"]["SchemaAttributes"]
+        email = next(a for a in attrs if a["Name"] == "email")
+        assert email["Required"] is True
+        users = cognito_idp.list_users(UserPoolId=pool_id)["Users"]
+        assert [u["Username"] for u in users] == ["alice"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)

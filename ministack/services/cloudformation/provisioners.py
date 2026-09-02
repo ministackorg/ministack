@@ -178,6 +178,13 @@ def _requires_replacement_dynamodb(old_props, new_props):
     return False
 
 
+def _requires_replacement_cognito_user_pool_group(old_props, new_props):
+    """AWS::Cognito::UserPoolGroup requires replacement when UserPoolId
+    changes (the resource reference marks the property "Update requires:
+    Replacement")."""
+    return old_props.get("UserPoolId") != new_props.get("UserPoolId")
+
+
 # Resource types that carry a user-supplied physical name AND can require
 # replacement. Real CloudFormation refuses an update that would replace a
 # custom-named resource (you must rename it first), so MiniStack must fail the
@@ -187,6 +194,10 @@ _CUSTOM_NAME_REPLACEMENT = {
     "AWS::DynamoDB::Table": {
         "name": "TableName",
         "requires_replacement": _requires_replacement_dynamodb,
+    },
+    "AWS::Cognito::UserPoolGroup": {
+        "name": "GroupName",
+        "requires_replacement": _requires_replacement_cognito_user_pool_group,
     },
 }
 
@@ -3923,55 +3934,166 @@ def _cognito_user_pool_name(props, stack_name, logical_id):
             or _physical_name(stack_name, logical_id, max_len=128))
 
 
-def _cognito_user_pool_create(logical_id, props, stack_name):
-    name = _cognito_user_pool_name(props, stack_name, logical_id)
-    pid = _cognito._pool_id()
-    now = _cognito._now_epoch()
-    pool = {
-        "Id": pid,
-        "Name": name,
+# UpdateUserPool's parameters, with the value CloudFormation applies when the
+# template drops the property. The resource reference says "If you don't
+# specify a value for a parameter, Amazon Cognito sets it to a default value",
+# and the defaults here are what the service's CreateUserPool fills in, so a
+# dropped property ends up as it would on a pool created without it. A
+# property absent from both templates is never touched.
+_COGNITO_USER_POOL_UPDATABLE = {
+    "Policies": {
+        "PasswordPolicy": {
+            "MinimumLength": 8,
+            "RequireUppercase": True,
+            "RequireLowercase": True,
+            "RequireNumbers": True,
+            "RequireSymbols": True,
+            "TemporaryPasswordValidityDays": 7,
+        }
+    },
+    "DeletionProtection": "INACTIVE",
+    "AutoVerifiedAttributes": [],
+    "SmsVerificationMessage": "",
+    "EmailVerificationMessage": "",
+    "EmailVerificationSubject": "",
+    "SmsAuthenticationMessage": "",
+    "MfaConfiguration": "OFF",
+    "DeviceConfiguration": {},
+    "EmailConfiguration": {},
+    "SmsConfiguration": {},
+    "UserPoolTags": {},
+    "AdminCreateUserConfig": {
+        "AllowAdminCreateUserOnly": False,
+        "UnusedAccountValidityDays": 7,
+    },
+    "UserPoolAddOns": {},
+    "VerificationMessageTemplate": {},
+    "AccountRecoverySetting": {},
+    "LambdaConfig": {},
+    "UserAttributeUpdateSettings": {},
+}
+
+# Properties CreateUserPool takes that no later API call changes: the sign-in
+# attributes are fixed at creation, and the resource reference says of
+# UsernameConfiguration "This configuration is immutable after you set it".
+# Schema is create-time too, but AddCustomAttributes can grow it afterwards.
+_COGNITO_USER_POOL_CREATE_ONLY = ("Schema", "AliasAttributes", "UsernameAttributes",
+                                  "UsernameConfiguration")
+
+# The rest of the AWS::Cognito::UserPool reference (UserPoolTier, the
+# EmailAuthentication* and WebAuthn* properties, IssuerConfiguration,
+# KeyConfiguration) has no field on the service's record and is not
+# modelled: it is accepted and ignored on create and on update alike.
+
+
+def _cognito_user_pool_attributes(pid):
+    return {
         "Arn": _cognito._pool_arn(pid),
-        "CreationDate": now,
-        "LastModifiedDate": now,
-        "Policies": props.get("Policies", {
-            "PasswordPolicy": {
-                "MinimumLength": 8,
-                "RequireUppercase": True,
-                "RequireLowercase": True,
-                "RequireNumbers": True,
-                "RequireSymbols": True,
-                "TemporaryPasswordValidityDays": 7,
-            }
-        }),
-        "SchemaAttributes": _cognito._build_schema_attributes(props.get("Schema")),
-        "AutoVerifiedAttributes": props.get("AutoVerifiedAttributes", []),
-        "AliasAttributes": props.get("AliasAttributes", []),
-        "UsernameAttributes": props.get("UsernameAttributes", []),
-        "MfaConfiguration": props.get("MfaConfiguration", "OFF"),
+        "ProviderName": f"cognito-idp.{get_region()}.amazonaws.com/{pid}",
+        "UserPoolId": pid,
+    }
+
+
+def _cognito_user_pool_create(logical_id, props, stack_name):
+    """Create the pool through the service's CreateUserPool so the record
+    carries every property the API stores, the same set
+    _cognito_user_pool_update applies later."""
+    payload = {
+        key: props[key]
+        for key in (*_COGNITO_USER_POOL_CREATE_ONLY, *_COGNITO_USER_POOL_UPDATABLE)
+        if key in props
+    }
+    payload["PoolName"] = _cognito_user_pool_name(props, stack_name, logical_id)
+    status, _, body = _cognito._create_user_pool(payload)
+    if status >= 400:
+        raise ValueError(f"AWS::Cognito::UserPool create failed: {body!r}")
+    pid = json.loads(body)["UserPool"]["Id"]
+    if "SOFTWARE_TOKEN_MFA" in (props.get("EnabledMfas") or []):
         # EnabledMfas (what CDK emits for mfaSecondFactor) maps onto the per
         # method config blocks GetUserPoolMfaConfig reports. Only the software
         # token block carries an Enabled flag in the API model; SMS and email
         # configs are message/role shapes that come from their own properties,
         # so a bare SMS_MFA/EMAIL_OTP entry has nothing faithful to invent.
-        **({"SoftwareTokenMfaConfiguration": {"Enabled": True}}
-           if "SOFTWARE_TOKEN_MFA" in (props.get("EnabledMfas") or []) else {}),
-        "EstimatedNumberOfUsers": 0,
-        "UserPoolTags": props.get("UserPoolTags", {}),
-        "AdminCreateUserConfig": props.get("AdminCreateUserConfig", {
-            "AllowAdminCreateUserOnly": False,
-            "UnusedAccountValidityDays": 7,
-        }),
-        "LambdaConfig": props.get("LambdaConfig", {}),
-        "Domain": None,
-        "_clients": {},
-        "_users": {},
-        "_groups": {},
-        "_resource_servers": {},
-    }
-    _cognito._user_pools[pid] = pool
-    arn = _cognito._pool_arn(pid)
-    provider_name = f"cognito-idp.{get_region()}.amazonaws.com/{pid}"
-    return pid, {"Arn": arn, "ProviderName": provider_name}
+        _cognito._set_user_pool_mfa_config({
+            "UserPoolId": pid, "SoftwareTokenMfaConfiguration": {"Enabled": True},
+        })
+    return pid, _cognito_user_pool_attributes(pid)
+
+
+def _declared_or_default(old_props, new_props, defaults):
+    """The API payload for a set of updatable properties: each one the new
+    template declares, plus the default for each one the old template
+    declared and the new one dropped."""
+    payload = {}
+    for key, default in defaults.items():
+        if key in new_props:
+            payload[key] = new_props[key]
+        elif key in old_props:
+            payload[key] = copy.deepcopy(default)
+    return payload
+
+
+def _cognito_user_pool_add_attributes(physical_id, pool, schema):
+    """Send the Schema entries the pool does not carry yet through
+    AddCustomAttributes, the one API call that changes a pool's schema after
+    CreateUserPool. It adds and never removes or redefines, so an entry the
+    pool already has (a standard attribute, or a custom one from an earlier
+    template) is left as it is, and it takes at most 25 attributes per call,
+    so a larger addition goes in batches. The service validates the rest: a
+    Required custom attribute, or more than the pool's custom-attribute
+    limit, fails the update.
+    """
+    known = {a["Name"] for a in _cognito._ensure_schema_attributes(pool)["SchemaAttributes"]}
+    additions = [
+        raw for raw in schema or []
+        if isinstance(raw, dict) and _cognito._schema_attribute_name(raw) not in known
+    ]
+    for start in range(0, len(additions), 25):
+        status, _, body = _cognito._add_custom_attributes({
+            "UserPoolId": physical_id, "CustomAttributes": additions[start:start + 25],
+        })
+        if status >= 400:
+            raise ValueError(f"AWS::Cognito::UserPool Schema update failed: {body!r}")
+
+
+def _cognito_user_pool_update(physical_id, old_props, new_props, stack_name,
+                              logical_id=None):
+    """Update a user pool in place: no AWS::Cognito::UserPool property
+    requires replacement
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cognito-userpool.html),
+    so the pool keeps its generated id, its ARN and its users, clients and
+    groups. What UpdateUserPool accepts goes through that path; the name,
+    create-only on the API but not in CloudFormation, is applied to the
+    record directly. AliasAttributes, UsernameAttributes and
+    UsernameConfiguration are fixed at CreateUserPool and no API call
+    changes them afterwards, so a change fails the update with a message
+    naming the property rather than altering the record behind the
+    service's back. A Schema change can only add attributes, through
+    AddCustomAttributes.
+    """
+    pool = _cognito._user_pools.get(physical_id)
+    if pool is None:
+        raise ValueError(f"AWS::Cognito::UserPool {physical_id} no longer exists")
+    for prop in _COGNITO_USER_POOL_CREATE_ONLY[1:]:
+        if new_props.get(prop) != old_props.get(prop) and (new_props.get(prop) or old_props.get(prop)):
+            raise ValueError(
+                f"AWS::Cognito::UserPool {prop} is set at CreateUserPool and no "
+                f"API call changes it afterwards, so MiniStack fails the update "
+                f"for pool {physical_id} instead of altering the record; declare "
+                "a new UserPool resource instead."
+            )
+    payload = _declared_or_default(old_props, new_props, _COGNITO_USER_POOL_UPDATABLE)
+    if payload:
+        payload["UserPoolId"] = physical_id
+        status, _, body = _cognito._update_user_pool(payload)
+        if status >= 400:
+            raise ValueError(f"AWS::Cognito::UserPool update failed: {body!r}")
+
+    pool["Name"] = _cognito_user_pool_name(new_props, stack_name, logical_id or physical_id)
+    if new_props.get("Schema") != old_props.get("Schema"):
+        _cognito_user_pool_add_attributes(physical_id, pool, new_props.get("Schema"))
+    pool["LastModifiedDate"] = _cognito._now_epoch()
+    return physical_id, _cognito_user_pool_attributes(physical_id)
 
 
 def _cognito_user_pool_delete(physical_id, props):
@@ -3982,30 +4104,81 @@ def _cognito_user_pool_delete(physical_id, props):
 
 # --- Cognito UserPoolClient ---
 
-def _cognito_user_pool_client_create(logical_id, props, stack_name):
-    pid = props.get("UserPoolId", "")
-    pool = _cognito._user_pools.get(pid)
-    if not pool:
-        raise ValueError(f"UserPool {pid} not found for UserPoolClient")
+# UpdateUserPoolClient's parameters, with the value a dropped property
+# reverts to: what the service's CreateUserPoolClient fills in when the
+# request omits it, since the resource reference says a parameter without a
+# value is set to its default. None clears AnalyticsConfiguration, which the
+# client record omits on read. RefreshTokenRotation has no field on the
+# record and is not modelled.
+_COGNITO_USER_POOL_CLIENT_UPDATABLE = {
+    "ClientName": "",
+    "RefreshTokenValidity": 30,
+    "AccessTokenValidity": 60,
+    "IdTokenValidity": 60,
+    "TokenValidityUnits": {},
+    "ReadAttributes": [],
+    "WriteAttributes": [],
+    "ExplicitAuthFlows": [],
+    "SupportedIdentityProviders": [],
+    "CallbackURLs": [],
+    "LogoutURLs": [],
+    "DefaultRedirectURI": "",
+    "AllowedOAuthFlows": [],
+    "AllowedOAuthScopes": [],
+    "AllowedOAuthFlowsUserPoolClient": False,
+    "AnalyticsConfiguration": None,
+    "PreventUserExistenceErrors": "LEGACY",
+    "EnableTokenRevocation": True,
+    "EnablePropagateAdditionalUserContextData": False,
+    "AuthSessionValidity": 3,
+}
 
-    cid = _cognito._client_id()
-    now = _cognito._now_epoch()
-    client = {
-        "UserPoolId": pid,
-        "ClientName": props.get("ClientName", ""),
-        "ClientId": cid,
-        "ClientSecret": props.get("GenerateSecret", False) and _cognito._client_secret() or None,
-        "CreationDate": now,
-        "LastModifiedDate": now,
-        "ExplicitAuthFlows": props.get("ExplicitAuthFlows", []),
-        "AllowedOAuthFlows": props.get("AllowedOAuthFlows", []),
-        "AllowedOAuthScopes": props.get("AllowedOAuthScopes", []),
-        "CallbackURLs": props.get("CallbackURLs", []),
-        "LogoutURLs": props.get("LogoutURLs", []),
-        "SupportedIdentityProviders": props.get("SupportedIdentityProviders", []),
-    }
-    pool["_clients"][cid] = client
-    return cid, {}
+
+def _cognito_user_pool_client_create(logical_id, props, stack_name):
+    """Create the app client through the service's CreateUserPoolClient so
+    the record carries every property UpdateUserPoolClient can change
+    later, and a replacement (UserPoolId or GenerateSecret changed) carries
+    the whole template over."""
+    payload = {key: props[key] for key in _COGNITO_USER_POOL_CLIENT_UPDATABLE if key in props}
+    payload["UserPoolId"] = props.get("UserPoolId", "")
+    payload["GenerateSecret"] = bool(props.get("GenerateSecret", False))
+    status, _, body = _cognito._create_user_pool_client(payload)
+    if status >= 400:
+        raise ValueError(f"AWS::Cognito::UserPoolClient create failed: {body!r}")
+    cid = json.loads(body)["UserPoolClient"]["ClientId"]
+    return cid, {"ClientId": cid}
+
+
+def _cognito_user_pool_client_update(physical_id, old_props, new_props, stack_name,
+                                     logical_id=None):
+    """Update an app client in place through UpdateUserPoolClient, keeping
+    its ClientId (what Ref returns) and its secret. UserPoolId and
+    GenerateSecret require replacement
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cognito-userpoolclient.html):
+    the client id is generated, so the new client is created before the old
+    one is removed and Ref moves to the new id, as on AWS.
+
+    The replacement prologue is spelled out here rather than going through
+    _rename_replacement because that helper keys on a create-only name
+    property, and the two properties that replace a client are not its
+    name: ClientName changes in place, while UserPoolId and GenerateSecret
+    replace.
+    """
+    if (new_props.get("UserPoolId") != old_props.get("UserPoolId")
+            or bool(new_props.get("GenerateSecret")) != bool(old_props.get("GenerateSecret"))):
+        created = _cognito_user_pool_client_create(logical_id or physical_id, new_props, stack_name)
+        _cognito_user_pool_client_delete(physical_id, old_props)
+        return created
+    payload = _declared_or_default(
+        old_props, new_props, _COGNITO_USER_POOL_CLIENT_UPDATABLE
+    )
+    if payload:
+        payload["UserPoolId"] = new_props.get("UserPoolId", "")
+        payload["ClientId"] = physical_id
+        status, _, body = _cognito._update_user_pool_client(payload)
+        if status >= 400:
+            raise ValueError(f"AWS::Cognito::UserPoolClient update failed: {body!r}")
+    return physical_id, {"ClientId": physical_id}
 
 
 def _cognito_user_pool_client_delete(physical_id, props):
@@ -4055,14 +4228,61 @@ def _cognito_user_pool_group_create(logical_id, props, stack_name):
         "UserPoolId": pid,
         "Description": props.get("Description", ""),
         "RoleArn": props.get("RoleArn", ""),
-        "Precedence": props.get("Precedence", 0),
         "CreationDate": now,
         "LastModifiedDate": now,
         "_members": [],
     }
+    # "The default Precedence value is null" on the resource reference, so a
+    # template that does not set it gets a group without one.
+    if "Precedence" in props:
+        group["Precedence"] = props["Precedence"]
     pool["_groups"][name] = group
     # Ref on this resource type returns the GroupName (matches real AWS —
     # see https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cognito-userpoolgroup.html#aws-resource-cognito-userpoolgroup-return-values).
+    return name, {}
+
+
+def _cognito_user_pool_group_update(physical_id, old_props, new_props, stack_name,
+                                    logical_id=None):
+    """Update a group in place, keeping its name (what Ref returns) and its
+    members. GroupName and UserPoolId require replacement
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cognito-userpoolgroup.html):
+    a rename, or a move to another pool, creates the new group before the
+    old one is removed; a move that keeps an explicit GroupName was already
+    refused by _custom_named_replacement_error, the way CloudFormation
+    refuses to replace a custom-named resource. Description, Precedence and
+    RoleArn are what UpdateGroup takes, applied to the record directly since
+    the service has no UpdateGroup handler.
+
+    The replacement prologue is spelled out here rather than going through
+    _rename_replacement because a group is keyed by (pool, name), and the
+    helper only compares names: a move to another pool under a generated
+    name keeps the same name, so the helper would see no replacement and
+    the old group would stay stranded in the old pool. The pool has to be
+    part of the replacement test.
+    """
+    name = new_props.get("GroupName") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=128
+    )
+    old_pid = old_props.get("UserPoolId", "")
+    new_pid = new_props.get("UserPoolId", "")
+    pool = _cognito._user_pools.get(old_pid)
+    group = pool["_groups"].get(physical_id) if pool else None
+    if group is None or name != physical_id or new_pid != old_pid:
+        created = _cognito_user_pool_group_create(
+            logical_id or physical_id, new_props, stack_name
+        )
+        if group is not None:
+            _cognito_user_pool_group_delete(physical_id, old_props)
+        return created
+
+    group["Description"] = new_props.get("Description", "")
+    group["RoleArn"] = new_props.get("RoleArn", "")
+    if "Precedence" in new_props:
+        group["Precedence"] = new_props["Precedence"]
+    else:
+        group.pop("Precedence", None)
+    group["LastModifiedDate"] = _cognito._now_epoch()
     return name, {}
 
 
@@ -4082,8 +4302,12 @@ def _cognito_user_pool_group_delete(physical_id, props):
 
 # --- Cognito IdentityPool ---
 
+def _cognito_identity_pool_name(props, stack_name, logical_id):
+    return props.get("IdentityPoolName") or _physical_name(stack_name, logical_id, max_len=128)
+
+
 def _cognito_identity_pool_create(logical_id, props, stack_name):
-    name = props.get("IdentityPoolName") or _physical_name(stack_name, logical_id, max_len=128)
+    name = _cognito_identity_pool_name(props, stack_name, logical_id)
     iid = _cognito._identity_pool_id()
     pool = {
         "IdentityPoolId": iid,
@@ -4100,7 +4324,45 @@ def _cognito_identity_pool_create(logical_id, props, stack_name):
         "_identities": {},
     }
     _cognito._identity_pools[iid] = pool
-    return iid, {}
+    # The one Fn::GetAtt the resource reference lists is Name.
+    return iid, {"Name": name}
+
+
+# UpdateIdentityPool's parameters, with the value a dropped property reverts
+# to (the create handler's defaults). CognitoEvents, CognitoStreams and
+# PushSync have no field on the record and are not modelled.
+_COGNITO_IDENTITY_POOL_UPDATABLE = {
+    "AllowUnauthenticatedIdentities": False,
+    "AllowClassicFlow": False,
+    "SupportedLoginProviders": {},
+    "DeveloperProviderName": "",
+    "OpenIdConnectProviderARNs": [],
+    "CognitoIdentityProviders": [],
+    "SamlProviderARNs": [],
+    "IdentityPoolTags": {},
+}
+
+
+def _cognito_identity_pool_update(physical_id, old_props, new_props, stack_name,
+                                  logical_id=None):
+    """Update an identity pool in place through UpdateIdentityPool: no
+    AWS::Cognito::IdentityPool property requires replacement
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cognito-identitypool.html),
+    so the pool keeps its generated id, its role mapping, its principal-tag
+    mappings and its identities.
+    """
+    if physical_id not in _cognito._identity_pools:
+        raise ValueError(f"AWS::Cognito::IdentityPool {physical_id} no longer exists")
+    payload = _declared_or_default(
+        old_props, new_props, _COGNITO_IDENTITY_POOL_UPDATABLE
+    )
+    name = _cognito_identity_pool_name(new_props, stack_name, logical_id or physical_id)
+    payload["IdentityPoolId"] = physical_id
+    payload["IdentityPoolName"] = name
+    status, _, body = _cognito._update_identity_pool(payload)
+    if status >= 400:
+        raise ValueError(f"AWS::Cognito::IdentityPool update failed: {body!r}")
+    return physical_id, {"Name": name}
 
 
 def _cognito_identity_pool_delete(physical_id, props):
@@ -7190,11 +7452,31 @@ _RESOURCE_HANDLERS = {
     "AWS::AppSync::GraphQLSchema": {"create": _appsync_schema_create, "delete": _appsync_schema_delete},
     "AWS::AppSync::ApiKey": {"create": _appsync_apikey_create, "delete": _appsync_apikey_delete},
     "AWS::SecretsManager::Secret": {"create": _sm_secret_create, "delete": _sm_secret_delete},
-    "AWS::Cognito::UserPool": {"create": _cognito_user_pool_create, "delete": _cognito_user_pool_delete},
-    "AWS::Cognito::UserPoolClient": {"create": _cognito_user_pool_client_create, "delete": _cognito_user_pool_client_delete},
+    "AWS::Cognito::UserPool": {
+        "create": _cognito_user_pool_create,
+        "update": _cognito_user_pool_update,
+        "update_with_logical_id": True,
+        "delete": _cognito_user_pool_delete,
+    },
+    "AWS::Cognito::UserPoolClient": {
+        "create": _cognito_user_pool_client_create,
+        "update": _cognito_user_pool_client_update,
+        "update_with_logical_id": True,
+        "delete": _cognito_user_pool_client_delete,
+    },
     "AWS::Cognito::UserPoolResourceServer": {"create": _cognito_user_pool_resource_server_create, "delete": _cognito_user_pool_resource_server_delete},
-    "AWS::Cognito::UserPoolGroup": {"create": _cognito_user_pool_group_create, "delete": _cognito_user_pool_group_delete},
-    "AWS::Cognito::IdentityPool": {"create": _cognito_identity_pool_create, "delete": _cognito_identity_pool_delete},
+    "AWS::Cognito::UserPoolGroup": {
+        "create": _cognito_user_pool_group_create,
+        "update": _cognito_user_pool_group_update,
+        "update_with_logical_id": True,
+        "delete": _cognito_user_pool_group_delete,
+    },
+    "AWS::Cognito::IdentityPool": {
+        "create": _cognito_identity_pool_create,
+        "update": _cognito_identity_pool_update,
+        "update_with_logical_id": True,
+        "delete": _cognito_identity_pool_delete,
+    },
     "AWS::Cognito::UserPoolDomain": {"create": _cognito_user_pool_domain_create, "delete": _cognito_user_pool_domain_delete},
     "AWS::ECR::Repository": {"create": _ecr_repo_create, "delete": _ecr_repo_delete},
     "AWS::CertificateManager::Certificate": {"create": _acm_certificate_create, "delete": _acm_certificate_delete},
