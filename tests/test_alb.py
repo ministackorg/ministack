@@ -1705,8 +1705,7 @@ def test_oidc_data_is_an_alb_format_claims_jwt(elbv2, lam):
         "    return {'statusCode': 200, 'headers': {'Content-Type': 'application/json'},\n"
         "            'body': json.dumps({'data': h.get('x-amzn-oidc-data')})}\n"
     )
-    from tests.test_alb import _alb_setup as _setup
-    lb_arn, tg_arn, l_arn, _ = _setup(elbv2, lam, name, f"{name}-fn", fn_code)
+    lb_arn, tg_arn, l_arn, _ = _alb_setup(elbv2, lam, name, f"{name}-fn", fn_code)
     try:
         elbv2.modify_listener(
             ListenerArn=l_arn,
