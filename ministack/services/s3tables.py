@@ -508,19 +508,31 @@ def _update_table_metadata_location(bucket_arn, namespace, table_name, data):
 # ── Iceberg REST catalog (data plane for Spark) ───────────
 
 
-def _iceberg_config(query_params=None):
+def _iceberg_config(query_params=None, headers=None):
     warehouse = ""
     if query_params:
         warehouse = query_params.get("warehouse", "")
         if isinstance(warehouse, list):
             warehouse = warehouse[0] if warehouse else ""
+    # The s3.endpoint must be reachable from whoever called /v1/config. When a
+    # Spark container on a Docker network calls us, the Host header carries the
+    # container IP it used to reach MiniStack — use that so the S3FileIO writes
+    # to the same address. Falling back to _gateway_url() covers the host-side
+    # case (CLI, DuckDB, boto3) where "localhost" is correct.
+    host = (headers or {}).get("host", "")
+    if host:
+        from ministack.core import tls as _tls
+        scheme = "https" if _tls.use_ssl_enabled() else "http"
+        s3_endpoint = f"{scheme}://{host}" if ":" in host else f"{scheme}://{host}:{_GATEWAY_PORT}"
+    else:
+        s3_endpoint = _gateway_url()
     # S3 connection properties go in ``defaults`` so a client that already
     # supplies them (e.g. a Spark job with its own s3.endpoint pointing at
     # host.docker.internal) is not overridden. Iceberg REST spec: ``defaults``
     # are used only when the client has no value; ``overrides`` always win.
     defaults = {
         "client.region": get_region(),
-        "s3.endpoint": _gateway_url(),
+        "s3.endpoint": s3_endpoint,
         "s3.access-key-id": "test",
         "s3.secret-access-key": "test",
         "s3.path-style-access": "true",
@@ -800,7 +812,7 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
         return None
 
     if parts[1] == "v1" and len(parts) == 3 and parts[2] == "config" and method == "GET":
-        return _iceberg_config(query_params)
+        return _iceberg_config(query_params, headers)
 
     # POST /iceberg/v1/transactions/commit — DuckDB atomic multi-table commit.
     # DuckDB prepends the /v1/config prefix (the warehouse) to every path, so
