@@ -7,9 +7,11 @@ Routes incoming requests to the correct service handler based on:
   - URL path patterns (e.g., /2015-03-31/functions for Lambda)
 """
 
+import ipaddress
 import logging
 import os
 import re
+import socket
 from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
@@ -473,6 +475,109 @@ SERVICE_PATTERNS = {
 _OPENSEARCH_PATH_PREFIXES = tuple(
     prefix.lower() for prefix in SERVICE_PATTERNS["opensearch"]["path_prefixes"]
 )
+
+
+# Host-header routing (step 5 of detect_service) is restricted to hosts the
+# stack is reachable under. Real AWS endpoints are ``<service>.<region>.
+# amazonaws.com``; local deployments answer under ``localhost``,
+# ``*.localhost`` / ``localhost.localstack.cloud``, the bare container name,
+# a two-label alias (``s3.dev``, ``sqs.internal``), an IP literal,
+# ``MINISTACK_HOST`` and whatever the operator adds through
+# ``MINISTACK_EXTRA_HOST_SUFFIXES`` (comma-separated; ``s3.<suffix>``,
+# ``<api-id>.execute-api.<suffix>``, ``<prefix>-ats.iot.<region>.<suffix>``).
+# Anything else — a customer domain fronted by a proxy, a probe with a
+# made-up Host — is never an AWS endpoint, so its labels carry no routing
+# information.
+_BUILTIN_HOST_SUFFIXES = (
+    "localhost",
+    "localhost.localstack.cloud",
+    "amazonaws.com",
+    "amazonaws.com.cn",
+)
+
+
+def _container_hostname() -> str:
+    try:
+        return socket.gethostname().lower()
+    except OSError:
+        return ""
+
+
+_CONTAINER_HOSTNAME = _container_hostname()
+
+
+def _served_host_suffixes() -> tuple:
+    """Suffixes (lower-case, no port) a Host header may end with to qualify for
+    host-pattern routing. Read per call so tests and init scripts can change the
+    environment without a restart; the work is a handful of dict lookups."""
+    suffixes = list(_BUILTIN_HOST_SUFFIXES)
+    for value in (
+        os.environ.get("MINISTACK_HOST", ""),
+        os.environ.get("HOSTNAME", ""),
+        _CONTAINER_HOSTNAME,
+    ):
+        value = _strip_host_port(value)
+        if value:
+            suffixes.append(value)
+    for value in os.environ.get("MINISTACK_EXTRA_HOST_SUFFIXES", "").split(","):
+        value = _strip_host_port(value).strip(".")
+        if value:
+            suffixes.append(value)
+    return tuple(suffixes)
+
+
+def _strip_host_port(host: str) -> str:
+    """``example.com:4566`` -> ``example.com``; ``[::1]:4566`` -> ``::1``.
+    Lower-cases and trims whitespace."""
+    host = (host or "").strip().lower()
+    if host.startswith("["):
+        end = host.find("]")
+        return host[1:end] if end > 0 else host
+    if host.count(":") == 1:
+        return host.rsplit(":", 1)[0]
+    return host  # bare IPv6 without brackets, or no port
+
+
+def _host_served_by_stack(host: str) -> bool:
+    """True when ``host`` names this stack: no Host at all, a single label
+    (``ministack``, ``localhost``, a compose service name), a two-label alias
+    (``s3.dev``), an IPv4/IPv6 literal, or a name under one of the served
+    suffixes at a label boundary (``s3.localhost.localstack.cloud`` yes,
+    ``notlocalhost`` no). A customer domain has at least three labels."""
+    hostname = _strip_host_port(host)
+    if not hostname or "." not in hostname:
+        return True
+    try:
+        ipaddress.ip_address(hostname)
+        return True
+    except ValueError:
+        pass
+    hostname = hostname.rstrip(".")
+    if hostname.count(".") == 1:
+        return True  # ``<service>.<lan-suffix>`` alias, the LocalStack-era shape
+    for suffix in _served_host_suffixes():
+        if hostname == suffix or hostname.endswith("." + suffix):
+            return True
+    return False
+
+
+_ANCHORED_HOST_PATTERNS: dict = {}
+
+
+def _anchored_host_pattern(pattern: str) -> "re.Pattern":
+    r"""Compile a ``host_patterns`` entry so a bare service token matches only at
+    the start of a label. ``iot\.`` becomes ``(^|\.)iot\.`` — it still matches
+    ``a1-ats.iot.us-east-1.amazonaws.com`` but no longer ``notiot.example``.
+    Entries that already anchor themselves (``^es\.``) or begin at a dot
+    (``\.s3\.``) are compiled as written."""
+    compiled = _ANCHORED_HOST_PATTERNS.get(pattern)
+    if compiled is None:
+        anchored = pattern
+        if pattern[:1].isalnum():
+            anchored = r"(^|\.)" + pattern
+        compiled = re.compile(anchored)
+        _ANCHORED_HOST_PATTERNS[pattern] = compiled
+    return compiled
 
 
 def detect_service(method: str, path: str, headers: dict, query_params: dict) -> str:
@@ -1046,11 +1151,17 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         if "granite" in path_lower or "cloudwatch" in path_lower:
             return "monitoring"
 
-    # 5. Check host header patterns
-    for svc, patterns in SERVICE_PATTERNS.items():
-        for hp in patterns.get("host_patterns", []):
-            if re.search(hp, host):
-                return svc
+    # 5. Check host header patterns — only for hosts this stack actually
+    # serves. The patterns are service tokens (``iot\.``, ``logs\.``,
+    # ``email\.`` ...) and a customer domain that happens to contain one
+    # (``probe.iot.example.com``, ``logs.example.com``) must not be routed
+    # into that service; it falls through to the default like any other
+    # unclassified request. Each token is matched at a label boundary.
+    if _host_served_by_stack(host):
+        for svc, patterns in SERVICE_PATTERNS.items():
+            for hp in patterns.get("host_patterns", []):
+                if _anchored_host_pattern(hp).search(host):
+                    return svc
 
     # 6a. A Query-protocol call to a service we don't implement (redshift,
     # elasticbeanstalk, cloudsearch, sdb, importexport, ...) is a POST to the

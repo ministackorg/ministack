@@ -798,6 +798,7 @@ end-to-end without any client config.
 |----------|---------|-------------|
 | `GATEWAY_PORT` | `4566` | Port to listen on. Also accepts `EDGE_PORT` (LocalStack compatibility alias) |
 | `MINISTACK_HOST` | `localhost` | Hostname used in response URLs (SQS queues, SNS subscriptions, API Gateway endpoints, Lambda layers) |
+| `MINISTACK_EXTRA_HOST_SUFFIXES` | _(unset)_ | Comma-separated domain suffixes MiniStack is reachable under besides `localhost`, `*.localhost` / `localhost.localstack.cloud`, `amazonaws.com`, `MINISTACK_HOST`, the container hostname, two-label aliases and IP literals. Routing by host name (`s3.<suffix>`, `<api-id>.execute-api.<suffix>`) applies only to served hosts; any other `Host` is routed by the request alone |
 | `MINISTACK_ACCOUNT_ID` | `000000000000` | Default AWS account ID. Overridden per-request when `AWS_ACCESS_KEY_ID` is a 12-digit number (see [Multi-Tenancy](#multi-tenancy)) |
 | `MINISTACK_REGION` | `us-east-1` | AWS region reported in ARNs and service responses across all services |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
