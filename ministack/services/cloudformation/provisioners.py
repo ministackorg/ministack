@@ -137,7 +137,10 @@ def _delete_resource(resource_type: str, physical_id: str, props: dict,
     """Delete a provisioned resource."""
     handler = _RESOURCE_HANDLERS.get(resource_type)
     if handler and "delete" in handler:
-        handler["delete"](physical_id, props)
+        if handler.get("delete_with_logical_id"):
+            handler["delete"](physical_id, props, logical_id)
+        else:
+            handler["delete"](physical_id, props)
         return
     # Custom resource types
     if resource_type.startswith("Custom::") or resource_type == "AWS::CloudFormation::CustomResource":
@@ -2305,31 +2308,66 @@ def _lambda_function_for_cfn_ref(function_ref: str) -> tuple[dict | None, str, s
     return func, name, resource_arn, qualifier
 
 
+# Every property of the type, all create-only
+# (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-lambda-permission.html),
+# forwarded to AddPermission under the same names.
+_LAMBDA_PERMISSION_PROPERTIES = (
+    "Action",
+    "Principal",
+    "SourceArn",
+    "SourceAccount",
+    "PrincipalOrgID",
+    "FunctionUrlAuthType",
+    "InvokedViaFunctionUrl",
+    "EventSourceToken",
+)
+
+
+def _lambda_permission_sid(props, logical_id):
+    # ``Id`` is not an AWS property, but templates written against earlier
+    # releases rely on it; otherwise the logical id is the Sid.
+    return props.get("Id") or logical_id or ""
+
+
 def _lambda_permission_create(logical_id, props, stack_name):
-    func, _func_name, resource_arn, _qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
+    func, func_name, _resource_arn, qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
     if func:
-        stmt = {
-            "Sid": props.get("Id") or logical_id,
-            "Effect": "Allow",
-            "Principal": props.get("Principal", "*"),
-            "Action": props.get("Action", "lambda:InvokeFunction"),
-            "Resource": resource_arn,
-        }
-        source_arn = props.get("SourceArn")
-        if source_arn:
-            stmt["Condition"] = {"ArnLike": {"AWS:SourceArn": source_arn}}
-        func["policy"]["Statement"].append(stmt)
+        data = {"StatementId": _lambda_permission_sid(props, logical_id), "Principal": "*"}
+        data.update({key: props[key] for key in _LAMBDA_PERMISSION_PROPERTIES if props.get(key) is not None})
+        status, _headers, body = _lambda_svc._add_permission(func_name, data, path_qualifier=qualifier)
+        if status >= 400:
+            raise ValueError(
+                f"AWS::Lambda::Permission AddPermission failed: {body.decode() if isinstance(body, bytes) else body}"
+            )
     pid = f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
     return pid, {}
 
 
-def _lambda_permission_delete(physical_id, props):
-    func, _func_name, _resource_arn, _qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
+def _lambda_permission_remove_statement(props, sid):
+    func, func_name, _resource_arn, qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
     if func:
-        sid = props.get("Id") or ""
-        func["policy"]["Statement"] = [
-            s for s in func["policy"]["Statement"] if s.get("Sid") != sid
-        ]
+        # A statement already gone (removed by hand, or the function policy
+        # rewritten) is nothing to fail a stack delete over.
+        _lambda_svc._remove_permission(func_name, sid, {}, path_qualifier=qualifier)
+
+
+def _lambda_permission_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Every AWS::Lambda::Permission property requires replacement
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-lambda-permission.html),
+    so any change is RemovePermission followed by AddPermission under a fresh
+    physical id, as on AWS. Removal goes first: both statements carry the
+    same Sid unless the template's Id changed (the default Sid is the
+    logical id), so the reverse order would remove the statement just added.
+    """
+    _lambda_permission_remove_statement(old_props, _lambda_permission_sid(old_props, logical_id))
+    return _lambda_permission_create(logical_id or physical_id, new_props, stack_name)
+
+
+def _lambda_permission_delete(physical_id, props, logical_id=None):
+    # The Sid defaults to the logical id exactly as in create, so a
+    # permission declared without an Id removes the statement it added —
+    # on stack delete, and on the rollback of a replacement.
+    _lambda_permission_remove_statement(props, _lambda_permission_sid(props, logical_id))
 
 
 # --- Lambda Version ---
@@ -7675,7 +7713,13 @@ _RESOURCE_HANDLERS = {
         "update": _firehose_delivery_stream_update,
         "delete": _firehose_delivery_stream_delete,
     },
-    "AWS::Lambda::Permission": {"create": _lambda_permission_create, "delete": _lambda_permission_delete},
+    "AWS::Lambda::Permission": {
+        "create": _lambda_permission_create,
+        "update": _lambda_permission_update,
+        "update_with_logical_id": True,
+        "delete": _lambda_permission_delete,
+        "delete_with_logical_id": True,
+    },
     "AWS::Lambda::Version": {"create": _lambda_version_create, "delete": _lambda_version_delete},
     "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create, "delete": _cfn_noop_delete},
     "AWS::CloudFormation::WaitConditionHandle": {"create": _cfn_wait_condition_handle_create, "delete": _cfn_noop_delete},

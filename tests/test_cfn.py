@@ -12956,3 +12956,344 @@ def test_cfn_cloudwatch_alarm_tags_apply_on_create_and_update(cfn, cw):
         assert exc.value.response["Error"]["Code"] == "ResourceNotFound"
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
+
+
+def _cfn_permission_test_function(lam, fn_name):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", "def handler(e, c): return {}")
+    lam.create_function(
+        FunctionName=fn_name, Runtime="python3.11",
+        Role="arn:aws:iam::000000000000:role/r", Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+
+
+def _lambda_policy_statements(lam, fn_name):
+    try:
+        return json.loads(lam.get_policy(FunctionName=fn_name)["Policy"])["Statement"]
+    except ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
+        return []
+
+
+def test_cfn_lambda_permission_update_replaces_the_statement(cfn, lam):
+    """Every AWS::Lambda::Permission property is create-only, so a changed
+    Principal removes the old statement and adds the new one: the function
+    policy ends up with exactly one statement carrying the new principal,
+    not two under the same Sid."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-perm-upd-{uid}"
+    fn_name = f"cfn-perm-upd-{uid}"
+    _cfn_permission_test_function(lam, fn_name)
+
+    def template(principal, source_arn):
+        return json.dumps({
+            "Resources": {"Perm": {"Type": "AWS::Lambda::Permission", "Properties": {
+                "FunctionName": fn_name, "Action": "lambda:InvokeFunction",
+                "Principal": principal, "SourceArn": source_arn,
+            }}},
+        })
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template(
+            "s3.amazonaws.com", f"arn:aws:s3:::cfn-perm-upd-{uid}"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        statements = _lambda_policy_statements(lam, fn_name)
+        assert len(statements) == 1
+        assert "s3.amazonaws.com" in json.dumps(statements[0]["Principal"])
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(
+            "events.amazonaws.com", f"arn:aws:events:us-east-1:000000000000:rule/cfn-perm-{uid}"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        statements = _lambda_policy_statements(lam, fn_name)
+        assert len(statements) == 1
+        assert statements[0]["Sid"] == "Perm"
+        assert "events.amazonaws.com" in json.dumps(statements[0]["Principal"])
+        assert statements[0]["Condition"]["ArnLike"]["AWS:SourceArn"].endswith(f"rule/cfn-perm-{uid}")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        lam.delete_function(FunctionName=fn_name)
+
+
+def test_cfn_lambda_permission_delete_removes_the_statement_it_added(cfn, lam):
+    """A permission declared without an Id gets the logical id as its Sid on
+    create; the delete resolves the same default, so deleting the stack
+    removes the statement instead of leaving it on the function."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-perm-del-{uid}"
+    fn_name = f"cfn-perm-del-{uid}"
+    _cfn_permission_test_function(lam, fn_name)
+    lam.add_permission(
+        FunctionName=fn_name, StatementId="kept", Action="lambda:InvokeFunction",
+        Principal="sns.amazonaws.com",
+    )
+    template = json.dumps({
+        "Resources": {"Perm": {"Type": "AWS::Lambda::Permission", "Properties": {
+            "FunctionName": fn_name, "Action": "lambda:InvokeFunction",
+            "Principal": "s3.amazonaws.com",
+        }}},
+    })
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert {s["Sid"] for s in _lambda_policy_statements(lam, fn_name)} == {"kept", "Perm"}
+
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        assert {s["Sid"] for s in _lambda_policy_statements(lam, fn_name)} == {"kept"}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        lam.delete_function(FunctionName=fn_name)
+
+
+def test_cfn_lambda_permission_id_change_replaces_the_statement(cfn, lam):
+    """Id is create-only like every other property: changing it removes the
+    statement under the old Sid and adds one under the new, so the function
+    policy never carries both."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-perm-sid-{uid}"
+    fn_name = f"cfn-perm-sid-{uid}"
+    _cfn_permission_test_function(lam, fn_name)
+
+    def template(sid):
+        return json.dumps({
+            "Resources": {"Perm": {"Type": "AWS::Lambda::Permission", "Properties": {
+                "FunctionName": fn_name, "Action": "lambda:InvokeFunction",
+                "Principal": "s3.amazonaws.com", "Id": sid,
+            }}},
+        })
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template("first"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert {s["Sid"] for s in _lambda_policy_statements(lam, fn_name)} == {"first"}
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("second"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert {s["Sid"] for s in _lambda_policy_statements(lam, fn_name)} == {"second"}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        lam.delete_function(FunctionName=fn_name)
+
+
+def test_cfn_lambda_permission_rollback_of_a_replacement_removes_the_new_statement(cfn, lam, ddb):
+    """When an update that replaced the permission fails later in the run,
+    the rollback removes the statement the replacement added, since the
+    delete resolves the Sid the way the create did. The previous statement
+    is not re-added: the rollback restores the stack record without
+    re-provisioning, which is disclosed in the PR."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-perm-rb-{uid}"
+    fn_name = f"cfn-perm-rb-{uid}"
+    table_name = f"cfn-perm-rb-{uid}"
+    _cfn_permission_test_function(lam, fn_name)
+    lam.add_permission(
+        FunctionName=fn_name, StatementId="kept", Action="lambda:InvokeFunction",
+        Principal="sns.amazonaws.com",
+    )
+
+    def template(principal, key_type):
+        return json.dumps({
+            "Resources": {
+                "Perm": {"Type": "AWS::Lambda::Permission", "Properties": {
+                    "FunctionName": fn_name, "Action": "lambda:InvokeFunction",
+                    "Principal": principal,
+                }},
+                "Table": {"Type": "AWS::DynamoDB::Table", "DependsOn": "Perm", "Properties": {
+                    "TableName": table_name,
+                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": key_type}],
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "BillingMode": "PAY_PER_REQUEST",
+                }},
+            },
+        })
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template("s3.amazonaws.com", "S"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert {s["Sid"] for s in _lambda_policy_statements(lam, fn_name)} == {"kept", "Perm"}
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("events.amazonaws.com", "N"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        statements = _lambda_policy_statements(lam, fn_name)
+        assert {s["Sid"] for s in statements} == {"kept"}
+        assert ddb.describe_table(TableName=table_name)["Table"]["AttributeDefinitions"] == [
+            {"AttributeName": "pk", "AttributeType": "S"}]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        lam.delete_function(FunctionName=fn_name)
+
+
+def _cfn_permission_template(fn_name, **props):
+    return json.dumps({
+        "Resources": {"Perm": {"Type": "AWS::Lambda::Permission", "Properties": {
+            "FunctionName": fn_name, "Action": "lambda:InvokeFunction",
+            "Principal": "s3.amazonaws.com", **props,
+        }}},
+    })
+
+
+def test_cfn_lambda_permission_create_keeps_every_condition_property(cfn, lam):
+    """AWS::Lambda::Permission forwards all of EventSourceToken,
+    FunctionUrlAuthType, InvokedViaFunctionUrl, PrincipalOrgID, SourceAccount
+    and SourceArn to AddPermission (the nine documented properties, per the
+    AWS::Lambda::Permission reference), so the statement carries them as
+    conditions instead of silently dropping them."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-perm-props-{uid}"
+    fn_name = f"cfn-perm-props-{uid}"
+    _cfn_permission_test_function(lam, fn_name)
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_permission_template(
+            fn_name, SourceArn=f"arn:aws:s3:::cfn-perm-props-{uid}", SourceAccount="111122223333",
+            PrincipalOrgID="o-a1b2c3d4e5", FunctionUrlAuthType="AWS_IAM", InvokedViaFunctionUrl=True,
+            EventSourceToken="amzn1.ask.skill.cfn-perm-props",
+        ))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        statements = _lambda_policy_statements(lam, fn_name)
+        assert len(statements) == 1
+        assert statements[0]["Condition"] == {
+            "ArnLike": {"AWS:SourceArn": f"arn:aws:s3:::cfn-perm-props-{uid}"},
+            "StringEquals": {
+                "AWS:SourceAccount": "111122223333",
+                "aws:PrincipalOrgID": "o-a1b2c3d4e5",
+                "lambda:FunctionUrlAuthType": "AWS_IAM",
+                "lambda:EventSourceToken": "amzn1.ask.skill.cfn-perm-props",
+            },
+            "Bool": {"lambda:InvokedViaFunctionUrl": "true"},
+        }
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        lam.delete_function(FunctionName=fn_name)
+
+
+def test_cfn_lambda_permission_function_name_change_replaces_the_statement(cfn, lam):
+    """FunctionName is create-only (AWS::Lambda::Permission reference: Update
+    requires Replacement), so pointing the permission at another function
+    removes the statement from the old function's policy and adds exactly one
+    to the new function's."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-perm-fn-{uid}"
+    old_fn, new_fn = f"cfn-perm-fn-old-{uid}", f"cfn-perm-fn-new-{uid}"
+    _cfn_permission_test_function(lam, old_fn)
+    _cfn_permission_test_function(lam, new_fn)
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_permission_template(old_fn))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert {s["Sid"] for s in _lambda_policy_statements(lam, old_fn)} == {"Perm"}
+        assert _lambda_policy_statements(lam, new_fn) == []
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_permission_template(new_fn))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _lambda_policy_statements(lam, old_fn) == []
+        statements = _lambda_policy_statements(lam, new_fn)
+        assert len(statements) == 1
+        assert statements[0]["Sid"] == "Perm"
+        assert statements[0]["Resource"].endswith(f":function:{new_fn}")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        lam.delete_function(FunctionName=old_fn)
+        lam.delete_function(FunctionName=new_fn)
+
+
+def test_cfn_lambda_permission_action_change_replaces_the_statement(cfn, lam):
+    """Action is create-only (AWS::Lambda::Permission reference), so a changed
+    Action leaves exactly one statement, carrying the new action."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-perm-action-{uid}"
+    fn_name = f"cfn-perm-action-{uid}"
+    _cfn_permission_test_function(lam, fn_name)
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_permission_template(fn_name))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert [s["Action"] for s in _lambda_policy_statements(lam, fn_name)] == ["lambda:InvokeFunction"]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_permission_template(
+            fn_name, Action="lambda:InvokeFunctionUrl"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        statements = _lambda_policy_statements(lam, fn_name)
+        assert len(statements) == 1
+        assert statements[0]["Sid"] == "Perm"
+        assert statements[0]["Action"] == "lambda:InvokeFunctionUrl"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        lam.delete_function(FunctionName=fn_name)
+
+
+def test_cfn_lambda_permission_source_account_change_replaces_the_statement(cfn, lam):
+    """SourceAccount is create-only (AWS::Lambda::Permission reference) and
+    reaches the statement as an AWS:SourceAccount condition, so a changed
+    account leaves exactly one statement carrying the new value."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-perm-acct-{uid}"
+    fn_name = f"cfn-perm-acct-{uid}"
+    _cfn_permission_test_function(lam, fn_name)
+    source_arn = f"arn:aws:s3:::cfn-perm-acct-{uid}"
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_permission_template(
+            fn_name, SourceArn=source_arn, SourceAccount="111111111111"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        statements = _lambda_policy_statements(lam, fn_name)
+        assert len(statements) == 1
+        assert statements[0]["Condition"]["StringEquals"] == {"AWS:SourceAccount": "111111111111"}
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_permission_template(
+            fn_name, SourceArn=source_arn, SourceAccount="222222222222"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        statements = _lambda_policy_statements(lam, fn_name)
+        assert len(statements) == 1
+        assert statements[0]["Sid"] == "Perm"
+        assert statements[0]["Condition"] == {
+            "ArnLike": {"AWS:SourceArn": source_arn},
+            "StringEquals": {"AWS:SourceAccount": "222222222222"},
+        }
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        lam.delete_function(FunctionName=fn_name)
+
+
+def test_cfn_lambda_permission_qualified_arn_update_replaces_on_the_qualified_resource(cfn, lam):
+    """The update counterpart of the qualified-ARN create: a permission on an
+    alias ARN is replaced in the base function's policy, and the one statement
+    left still names the alias ARN as its Resource (AWS::Lambda::Permission
+    reference: "specify a qualifier to restrict access to a single version or
+    alias")."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-perm-qual-upd-{uid}"
+    fn_name = f"cfn-perm-qual-upd-{uid}"
+    _cfn_permission_test_function(lam, fn_name)
+    try:
+        version = lam.publish_version(FunctionName=fn_name)["Version"]
+        alias_arn = lam.create_alias(FunctionName=fn_name, Name="live", FunctionVersion=version)["AliasArn"]
+        cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_permission_template(alias_arn))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert [s["Resource"] for s in _lambda_policy_statements(lam, fn_name)] == [alias_arn]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_permission_template(
+            alias_arn, Principal="events.amazonaws.com"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        statements = _lambda_policy_statements(lam, fn_name)
+        assert len(statements) == 1
+        assert statements[0]["Sid"] == "Perm"
+        assert statements[0]["Resource"] == alias_arn
+        assert "events.amazonaws.com" in json.dumps(statements[0]["Principal"])
+        assert _lambda_policy_statements(lam, f"{fn_name}:live") == statements
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        lam.delete_function(FunctionName=fn_name)

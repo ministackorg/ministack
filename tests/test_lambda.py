@@ -2711,6 +2711,37 @@ def test_lambda_add_remove_permission(lam):
     policy2 = json.loads(lam.get_policy(FunctionName="qa-lam-policy")["Policy"])
     assert not any(s["Sid"] == "allow-s3" for s in policy2["Statement"])
 
+def test_lambda_add_permission_keeps_event_source_token_and_invoked_via_function_url(lam):
+    """EventSourceToken lands as a StringEquals on lambda:EventSourceToken and
+    InvokedViaFunctionUrl as a Bool on lambda:InvokedViaFunctionUrl with a
+    string value, the shape Lambda writes for function URL statements
+    (https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html)."""
+    fn = f"qa-lam-policy-cond-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/r",
+        Handler="index.handler",
+        Code={"ZipFile": _zip_lambda("def handler(e,c): return {}")},
+    )
+    try:
+        added = json.loads(lam.add_permission(
+            FunctionName=fn,
+            StatementId="alexa",
+            Action="lambda:InvokeFunction",
+            Principal="alexa-appkit.amazon.com",
+            EventSourceToken="amzn1.ask.skill.qa-lam-policy-cond",
+            InvokedViaFunctionUrl=True,
+        )["Statement"])
+        assert added["Condition"] == {
+            "StringEquals": {"lambda:EventSourceToken": "amzn1.ask.skill.qa-lam-policy-cond"},
+            "Bool": {"lambda:InvokedViaFunctionUrl": "true"},
+        }
+        policy = json.loads(lam.get_policy(FunctionName=fn)["Policy"])
+        assert [s["Condition"] for s in policy["Statement"]] == [added["Condition"]]
+    finally:
+        lam.delete_function(FunctionName=fn)
+
 def test_lambda_list_functions_pagination(lam):
     """ListFunctions pagination with Marker works correctly."""
     for i in range(5):
