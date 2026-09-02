@@ -11820,3 +11820,231 @@ def test_cfn_cognito_user_pool_enabled_mfas_update(cfn, cognito_idp):
         assert [u["Username"] for u in users] == ["alice"]
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_secret_update_publishes_a_new_version(cfn, sm):
+    """A changed SecretString publishes a new AWSCURRENT version of the same
+    secret: same ARN, the first value still there as AWSPREVIOUS, and the
+    Description updated alongside."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-secret-upd-{uid}"
+    secret_name = f"cfn/secret-upd-{uid}"
+
+    def template(value, description):
+        return json.dumps({
+            "Resources": {"Secret": {"Type": "AWS::SecretsManager::Secret", "Properties": {
+                "Name": secret_name, "Description": description, "SecretString": value,
+                "Tags": [{"Key": "stage", "Value": description}],
+            }}},
+            "Outputs": {"SecretRef": {"Value": {"Ref": "Secret"}},
+                        "SecretArn": {"Value": {"Fn::GetAtt": ["Secret", "Arn"]}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("v1", "first"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        ref, arn = _output(stack, "SecretRef"), _output(stack, "SecretArn")
+        first = sm.get_secret_value(SecretId=secret_name)
+        assert first["SecretString"] == "v1"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("v2", "second"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "SecretRef") == ref
+        assert _output(stack, "SecretArn") == arn
+
+        current = sm.get_secret_value(SecretId=secret_name)
+        assert current["SecretString"] == "v2"
+        assert current["ARN"] == arn
+        assert current["VersionId"] != first["VersionId"]
+        previous = sm.get_secret_value(SecretId=secret_name, VersionStage="AWSPREVIOUS")
+        assert previous["SecretString"] == "v1"
+        assert previous["VersionId"] == first["VersionId"]
+        described = sm.describe_secret(SecretId=secret_name)
+        assert described["Description"] == "second"
+        assert described["Tags"] == [{"Key": "stage", "Value": "second"}]
+        assert set(described["VersionIdsToStages"]) == {first["VersionId"], current["VersionId"]}
+
+        _delete_cfn_test_stack(cfn, stack_name)
+        with pytest.raises(ClientError):
+            sm.describe_secret(SecretId=secret_name)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_secret_update_keeps_an_undeclared_kms_key(cfn, sm):
+    """A property the template never declared is not the stack's to clear: a
+    KmsKeyId set through UpdateSecret outside the stack survives an update
+    that changes the Description, and one that drops it."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-secret-kms-{uid}"
+    secret_name = f"cfn/secret-kms-{uid}"
+
+    def template(value, description=None):
+        props = {"Name": secret_name, "SecretString": value}
+        if description is not None:
+            props["Description"] = description
+        return json.dumps({
+            "Resources": {"Secret": {"Type": "AWS::SecretsManager::Secret", "Properties": props}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("v1", "declared"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        sm.update_secret(SecretId=secret_name, KmsKeyId=f"alias/cfn-secret-kms-{uid}")
+        assert sm.describe_secret(SecretId=secret_name)["KmsKeyId"] == f"alias/cfn-secret-kms-{uid}"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("v1", "changed"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        described = sm.describe_secret(SecretId=secret_name)
+        assert described["KmsKeyId"] == f"alias/cfn-secret-kms-{uid}"
+        assert described["Description"] == "changed"
+
+        # Dropping the Description from the template clears it, as on AWS.
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("v2"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        described = sm.describe_secret(SecretId=secret_name)
+        assert described.get("Description", "") == ""
+        assert described["KmsKeyId"] == f"alias/cfn-secret-kms-{uid}"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_secret_rename_replaces_the_secret(cfn, sm):
+    """Name is create-only: renaming creates the new secret and removes the
+    old one, in CloudFormation's replacement order."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-secret-ren-{uid}"
+
+    def template(name):
+        return json.dumps({
+            "Resources": {"Secret": {"Type": "AWS::SecretsManager::Secret", "Properties": {
+                "Name": name, "SecretString": "same"}}},
+            "Outputs": {"SecretRef": {"Value": {"Ref": "Secret"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(f"cfn-secret-a-{uid}"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(f"cfn-secret-b-{uid}"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "SecretRef") == f"cfn-secret-b-{uid}"
+        assert sm.get_secret_value(SecretId=f"cfn-secret-b-{uid}")["SecretString"] == "same"
+        with pytest.raises(ClientError):
+            sm.describe_secret(SecretId=f"cfn-secret-a-{uid}")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_secret_generate_secret_string_change_publishes_a_new_version(cfn, sm):
+    """"When you make a change to this property, a new secret version is
+    created" (GenerateSecretString, AWS::SecretsManager::Secret reference):
+    a changed PasswordLength regenerates the value as a new AWSCURRENT version
+    of the same secret, the previous one staying behind as AWSPREVIOUS."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-secret-gen-{uid}"
+    secret_name = f"cfn/secret-gen-{uid}"
+
+    def template(length):
+        return json.dumps({
+            "Resources": {"Secret": {"Type": "AWS::SecretsManager::Secret", "Properties": {
+                "Name": secret_name,
+                "GenerateSecretString": {
+                    "SecretStringTemplate": '{"username": "admin"}',
+                    "GenerateStringKey": "password",
+                    "PasswordLength": length,
+                    "ExcludeCharacters": '"@/\\',
+                },
+            }}},
+            "Outputs": {"SecretArn": {"Value": {"Fn::GetAtt": ["Secret", "Arn"]}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(16))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _output(stack, "SecretArn")
+        first = sm.get_secret_value(SecretId=secret_name)
+        assert len(json.loads(first["SecretString"])["password"]) == 16
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(24))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "SecretArn") == arn
+
+        current = sm.get_secret_value(SecretId=secret_name)
+        assert current["ARN"] == arn
+        assert current["VersionId"] != first["VersionId"]
+        assert current["VersionStages"] == ["AWSCURRENT"]
+        generated = json.loads(current["SecretString"])
+        assert generated["username"] == "admin"
+        assert len(generated["password"]) == 24
+        previous = sm.get_secret_value(SecretId=secret_name, VersionStage="AWSPREVIOUS")
+        assert previous["VersionId"] == first["VersionId"]
+        assert previous["SecretString"] == first["SecretString"]
+
+        # An update that leaves GenerateSecretString alone does not regenerate.
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(24), Tags=[{"Key": "touch", "Value": "1"}])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert sm.get_secret_value(SecretId=secret_name)["VersionId"] == current["VersionId"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_secret_replica_regions_apply_on_create_and_update(cfn, sm):
+    """ReplicaRegions is "Update requires: No interruption" (reference): the
+    regions a template declares are replicated on create, a region added or
+    re-keyed on update is applied to the same secret, a new value reaches the
+    replicas, and the replicas go away with the stack."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-secret-rep-{uid}"
+    secret_name = f"cfn/secret-rep-{uid}"
+    home = sm.meta.region_name
+    west = _regional_cfn_test_client("secretsmanager", "us-west-2")
+    frankfurt = _regional_cfn_test_client("secretsmanager", "eu-central-1")
+
+    def template(value, replicas):
+        return json.dumps({
+            "Resources": {"Secret": {"Type": "AWS::SecretsManager::Secret", "Properties": {
+                "Name": secret_name, "SecretString": value, "ReplicaRegions": replicas,
+            }}},
+            "Outputs": {"SecretArn": {"Value": {"Fn::GetAtt": ["Secret", "Arn"]}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("v1", [{"Region": "us-west-2"}]))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _output(stack, "SecretArn")
+        primary = sm.describe_secret(SecretId=secret_name)
+        assert [s["Region"] for s in primary["ReplicationStatus"]] == ["us-west-2"]
+        replica = west.describe_secret(SecretId=secret_name)
+        assert replica["PrimaryRegion"] == home
+        assert replica["ARN"] == arn.replace(f":{home}:", ":us-west-2:")
+        assert west.get_secret_value(SecretId=secret_name)["SecretString"] == "v1"
+        with pytest.raises(ClientError):
+            frankfurt.describe_secret(SecretId=secret_name)
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("v2", [
+            {"Region": "us-west-2", "KmsKeyId": f"alias/cfn-secret-rep-{uid}"},
+            {"Region": "eu-central-1"},
+        ]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "SecretArn") == arn
+        primary = sm.describe_secret(SecretId=secret_name)
+        assert sorted(s["Region"] for s in primary["ReplicationStatus"]) == ["eu-central-1", "us-west-2"]
+        assert west.describe_secret(SecretId=secret_name)["KmsKeyId"] == f"alias/cfn-secret-rep-{uid}"
+        assert west.get_secret_value(SecretId=secret_name)["SecretString"] == "v2"
+        assert frankfurt.get_secret_value(SecretId=secret_name)["SecretString"] == "v2"
+
+        _delete_cfn_test_stack(cfn, stack_name)
+        for client in (sm, west, frankfurt):
+            with pytest.raises(ClientError):
+                client.describe_secret(SecretId=secret_name)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)

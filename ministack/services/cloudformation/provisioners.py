@@ -3873,9 +3873,10 @@ def _appsync_apikey_delete(physical_id, props):
 
 # --- SecretsManager resource provisioners ---
 
-def _sm_secret_create(logical_id, props, stack_name):
+def _sm_secret_string(props):
+    """The secret value a template declares: SecretString verbatim, or one
+    generated from GenerateSecretString."""
     import string as _string
-    name = props.get("Name") or _physical_name(stack_name, logical_id)
     secret_string = props.get("SecretString", "")
     gen = props.get("GenerateSecretString")
     if gen and not secret_string:
@@ -3888,7 +3889,6 @@ def _sm_secret_create(logical_id, props, stack_name):
         template = gen.get("SecretStringTemplate")
         gen_key = gen.get("GenerateStringKey", "password")
         if template:
-            import json
             try:
                 obj = json.loads(template)
                 obj[gen_key] = generated
@@ -3897,6 +3897,12 @@ def _sm_secret_create(logical_id, props, stack_name):
                 secret_string = generated
         else:
             secret_string = generated
+    return secret_string
+
+
+def _sm_secret_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(stack_name, logical_id)
+    secret_string = _sm_secret_string(props)
 
     arn = f"arn:aws:secretsmanager:{get_region()}:{get_account_id()}:secret:{name}-{new_uuid()[:6]}"
     import time as _time
@@ -3917,11 +3923,71 @@ def _sm_secret_create(logical_id, props, stack_name):
             }
         },
     }
+    if props.get("ReplicaRegions"):
+        _sm_secret_replicate(name, props["ReplicaRegions"])
     return name, {"Arn": arn}
 
 
+def _sm_secret_replicate(secret_id, regions):
+    """Replicate a secret to the regions a template declares, through the
+    service's ReplicateSecretToRegions: a region already replicated keeps its
+    replica (the KmsKeyId is refreshed), a new one gets a copy of the secret.
+    The template's ReplicaRegion entries carry Region and KmsKeyId, the shape
+    AddReplicaRegions expects, so they are passed through as they are."""
+    resp = _sm._replicate_secret_to_regions({"SecretId": secret_id, "AddReplicaRegions": list(regions)})
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::SecretsManager::Secret replication failed: {resp[2]!r}")
+
+
+def _sm_secret_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a secret in place through UpdateSecret, keeping its ARN and every
+    stored version. Name is the one create-only property
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-secretsmanager-secret.html):
+    a rename is a replacement, the new secret created before the old one is
+    removed. A changed SecretString or GenerateSecretString publishes a new
+    AWSCURRENT version, as the reference documents; the previous version
+    stays behind as AWSPREVIOUS. ReplicaRegions is applied through
+    ReplicateSecretToRegions. Type is not stored by the service and is
+    ignored.
+    """
+    name = new_props.get("Name") or _physical_name(stack_name, logical_id or physical_id)
+    secret = _sm._secrets.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        name, secret.get("Name") if secret else None, _sm_secret_create, _sm_secret_delete,
+    )
+    if replaced is not None:
+        return replaced
+
+    data = {"SecretId": physical_id}
+    # Sent only when the template speaks to the property: declared, or
+    # dropped since the previous template, which clears it as
+    # CloudFormation does. A value set outside the stack on a property
+    # the template never declared is left alone.
+    data.update(_declared_or_default(old_props, new_props, {"Description": "", "KmsKeyId": None}))
+    if (new_props.get("SecretString") != old_props.get("SecretString")
+            or new_props.get("GenerateSecretString") != old_props.get("GenerateSecretString")):
+        data["SecretString"] = _sm_secret_string(new_props)
+    resp = _sm._update_secret(data)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::SecretsManager::Secret update failed: {resp[2]!r}")
+    if "Tags" in new_props or "Tags" in old_props:
+        # Same rule as above: tags applied through TagResource on a secret
+        # whose template never declared any are not the stack's to clear.
+        secret["Tags"] = list(new_props.get("Tags", []))
+    if new_props.get("ReplicaRegions") and new_props["ReplicaRegions"] != old_props.get("ReplicaRegions"):
+        # Regions added or re-keyed since the previous template are applied;
+        # a region dropped from the template keeps its replica, the service
+        # has no RemoveRegionsFromReplication to take it down with.
+        _sm_secret_replicate(physical_id, new_props["ReplicaRegions"])
+    return physical_id, {"Arn": secret["ARN"]}
+
+
 def _sm_secret_delete(physical_id, props):
-    _sm._secrets.pop(physical_id, None)
+    secret = _sm._secrets.get(physical_id)
+    if secret is not None:
+        # Takes the replicas and the resource policy down with the secret.
+        _sm._purge_secret(physical_id, secret)
 
 
 # --- Cognito UserPool ---
@@ -7467,7 +7533,12 @@ _RESOURCE_HANDLERS = {
     "AWS::AppSync::Resolver": {"create": _appsync_resolver_create, "delete": _appsync_resolver_delete},
     "AWS::AppSync::GraphQLSchema": {"create": _appsync_schema_create, "delete": _appsync_schema_delete},
     "AWS::AppSync::ApiKey": {"create": _appsync_apikey_create, "delete": _appsync_apikey_delete},
-    "AWS::SecretsManager::Secret": {"create": _sm_secret_create, "delete": _sm_secret_delete},
+    "AWS::SecretsManager::Secret": {
+        "create": _sm_secret_create,
+        "update": _sm_secret_update,
+        "update_with_logical_id": True,
+        "delete": _sm_secret_delete,
+    },
     "AWS::Cognito::UserPool": {
         "create": _cognito_user_pool_create,
         "update": _cognito_user_pool_update,
