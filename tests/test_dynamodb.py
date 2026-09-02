@@ -10,7 +10,6 @@ import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-
 _ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
 
@@ -4036,7 +4035,8 @@ def _raw_ddb(target: str, body: dict):
     """Direct HTTP DDB call — bypasses boto3's client-side validation so we
     can verify the server's own length checks (which is what the conformance
     suite hits)."""
-    import urllib.request, urllib.error
+    import urllib.error
+    import urllib.request
     req = urllib.request.Request(
         f"{_ENDPOINT}/",
         data=json.dumps(body).encode("utf-8"),
@@ -7071,3 +7071,17 @@ def test_update_allows_value_reference_named_after_key(ddb, key_guard_table):
     )
     assert resp["Attributes"]["label"] == {"S": "v"}
     assert resp["Attributes"]["tally"] == {"N": "3"}
+
+
+def test_unicode_dynamodb_item(ddb):
+    table = "unicode-ddb"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    item = {"pk": {"S": "ключ"}, "value": {"S": "значение 日本語 مرحبا"}}
+    ddb.put_item(TableName=table, Item=item)
+    resp = ddb.get_item(TableName=table, Key={"pk": {"S": "ключ"}})
+    assert resp["Item"]["value"]["S"] == "значение 日本語 مرحبا"

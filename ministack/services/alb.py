@@ -28,7 +28,7 @@ import random
 import socket
 import string
 import time
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlencode
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
@@ -44,6 +44,22 @@ TARGET_CONNECT_TIMEOUT = float(os.environ.get("ALB_TARGET_CONNECT_TIMEOUT_SECOND
 TARGET_IDLE_TIMEOUT = float(os.environ.get("ALB_TARGET_IDLE_TIMEOUT_SECONDS", "60"))
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+
+# authenticate-oidc defaults, matching the AWS API.
+OIDC_DEFAULT_COOKIE_NAME = "AWSELBAuthSessionCookie"
+OIDC_DEFAULT_SESSION_TIMEOUT = 604800  # 7 days, as AWS documents
+OIDC_CALLBACK_PATH = "/oauth2/idpresponse"
+# AWS splits the session cookie into shards named -0, -1, -2, … A client that
+# reads only the first shard silently loses the tail of a large session, so the
+# split is reproduced here rather than smoothed over.
+#
+# 4096 is the per-cookie ceiling browsers enforce (RFC 6265 §6.1 asks for at
+# least 4096 bytes per cookie, and the major engines treat it as the maximum),
+# and it covers the *whole* Set-Cookie pair — name, value and attributes. A
+# shard sized to 4096 bytes of value alone produces a cookie the browser
+# silently discards, which is the same symptom as no session at all, so the
+# name and attributes are subtracted from the budget below.
+OIDC_COOKIE_MAX_BYTES = 4096
 NS = "http://elasticloadbalancing.amazonaws.com/doc/2015-12-01/"
 
 # ---------------------------------------------------------------------------
@@ -62,6 +78,13 @@ _lb_attrs = AccountScopedDict()   # lb_arn   -> [{Key, Value}] (ARN key embeds r
 _tg_attrs = AccountScopedDict()   # tg_arn   -> [{Key, Value}] (ARN key embeds region)
 _listener_attrs = AccountScopedDict()  # l_arn -> [{Key, Value}] (ARN key embeds region)
 
+# authenticate-oidc: in-flight authorization requests, keyed by the opaque
+# `state` value handed to the identity provider. Holds only the URL to return
+# the browser to once the callback lands — the session itself lives in the
+# client's cookie, exactly as it does on a real load balancer, so nothing here
+# is needed to validate a request.
+_oidc_pending = AccountScopedDict()  # state -> {"url": str, "created": float}
+
 
 def get_state():
     return copy.deepcopy({
@@ -74,6 +97,7 @@ def get_state():
         "_lb_attrs": _lb_attrs,
         "_tg_attrs": _tg_attrs,
         "_listener_attrs": _listener_attrs,
+        "_oidc_pending": _oidc_pending,
     })
 
 
@@ -115,6 +139,7 @@ def restore_state(data):
     _lb_attrs.update(data.get("_lb_attrs", {}))
     _tg_attrs.update(data.get("_tg_attrs", {}))
     _listener_attrs.update(data.get("_listener_attrs", {}))
+    _oidc_pending.update(data.get("_oidc_pending", {}))
 
 
 try:
@@ -241,6 +266,32 @@ def _parse_actions(params, prefix="DefaultActions"):
                 "Path": _p(params, f"{prefix}.member.{i}.RedirectConfig.Path", "/#{path}"),
                 "StatusCode": rc_code,
             }
+        oidc_issuer = _p(params, f"{prefix}.member.{i}.AuthenticateOidcConfig.Issuer")
+        if oidc_issuer:
+            oidc = {
+                "Issuer": oidc_issuer,
+                "AuthorizationEndpoint": _p(params, f"{prefix}.member.{i}.AuthenticateOidcConfig.AuthorizationEndpoint"),
+                "TokenEndpoint": _p(params, f"{prefix}.member.{i}.AuthenticateOidcConfig.TokenEndpoint"),
+                "UserInfoEndpoint": _p(params, f"{prefix}.member.{i}.AuthenticateOidcConfig.UserInfoEndpoint"),
+                "ClientId": _p(params, f"{prefix}.member.{i}.AuthenticateOidcConfig.ClientId"),
+                "Scope": _p(params, f"{prefix}.member.{i}.AuthenticateOidcConfig.Scope", "openid"),
+                "SessionCookieName": _p(params, f"{prefix}.member.{i}.AuthenticateOidcConfig.SessionCookieName",
+                                        OIDC_DEFAULT_COOKIE_NAME),
+                "SessionTimeout": _p(params, f"{prefix}.member.{i}.AuthenticateOidcConfig.SessionTimeout",
+                                     str(OIDC_DEFAULT_SESSION_TIMEOUT)),
+                "OnUnauthenticatedRequest": _p(params, f"{prefix}.member.{i}.AuthenticateOidcConfig.OnUnauthenticatedRequest",
+                                               "authenticate"),
+            }
+            secret = _p(params, f"{prefix}.member.{i}.AuthenticateOidcConfig.ClientSecret")
+            if secret:
+                # Held for the back-channel token exchange only. AWS never
+                # returns it from Describe*, and neither does _action_xml.
+                oidc["ClientSecret"] = secret
+            reuse = _p(params, f"{prefix}.member.{i}.AuthenticateOidcConfig.UseExistingClientSecret")
+            if reuse:
+                oidc["UseExistingClientSecret"] = reuse.lower() == "true"
+            action["AuthenticateOidcConfig"] = oidc
+
         fr_code = _p(params, f"{prefix}.member.{i}.FixedResponseConfig.StatusCode")
         if fr_code:
             action["FixedResponseConfig"] = {
@@ -432,6 +483,22 @@ def _action_xml(a):
             f"<Path>{rc.get('Path','/#{path}')}</Path>"
             f"<StatusCode>{rc.get('StatusCode','HTTP_301')}</StatusCode>"
             f"</RedirectConfig>"
+        )
+    if "AuthenticateOidcConfig" in a:
+        oc = a["AuthenticateOidcConfig"]
+        # ClientSecret is deliberately absent: AWS never echoes it back.
+        inner += (
+            f"<AuthenticateOidcConfig>"
+            f"<Issuer>{oc.get('Issuer','')}</Issuer>"
+            f"<AuthorizationEndpoint>{oc.get('AuthorizationEndpoint','')}</AuthorizationEndpoint>"
+            f"<TokenEndpoint>{oc.get('TokenEndpoint','')}</TokenEndpoint>"
+            f"<UserInfoEndpoint>{oc.get('UserInfoEndpoint','')}</UserInfoEndpoint>"
+            f"<ClientId>{oc.get('ClientId','')}</ClientId>"
+            f"<Scope>{oc.get('Scope','openid')}</Scope>"
+            f"<SessionCookieName>{oc.get('SessionCookieName', OIDC_DEFAULT_COOKIE_NAME)}</SessionCookieName>"
+            f"<SessionTimeout>{oc.get('SessionTimeout', OIDC_DEFAULT_SESSION_TIMEOUT)}</SessionTimeout>"
+            f"<OnUnauthenticatedRequest>{oc.get('OnUnauthenticatedRequest','authenticate')}</OnUnauthenticatedRequest>"
+            f"</AuthenticateOidcConfig>"
         )
     if "FixedResponseConfig" in a:
         frc = a["FixedResponseConfig"]
@@ -777,6 +844,13 @@ def _modify_listener(params):
     actions = _parse_actions(params, "DefaultActions")
     if actions:
         listener["DefaultActions"] = actions
+        # CreateListener snapshots the default actions into an auto-created
+        # default rule, and the data plane reads the rule, not the listener.
+        # Updating only the listener leaves the old actions serving traffic —
+        # ModifyListener would appear to succeed and change nothing.
+        for rule in _rules.values():
+            if rule.get("ListenerArn") == arn and rule.get("IsDefault"):
+                rule["Actions"] = actions
     return _xml(200, "ModifyListener", f"<Listeners>{_listener_xml(listener)}</Listeners>")
 
 
@@ -1210,8 +1284,398 @@ def _rule_sort_key(rule):
 
 
 # ---------------------------------------------------------------------------
+# Data-plane: authenticate-oidc
+# ---------------------------------------------------------------------------
+#
+# The listener rule action that makes a load balancer an OIDC relying party.
+# An unauthenticated request is sent to the identity provider; the provider
+# returns the browser to OIDC_CALLBACK_PATH with a code; the load balancer
+# exchanges that code for tokens on the back channel and writes the session
+# into the client's cookie. Only then does the request reach the target, with
+# the caller's identity attached in X-Amzn-Oidc-* headers.
+#
+# The session lives entirely in the cookie, as it does on AWS, so no
+# server-side lookup is needed to validate a request. AWS encrypts that cookie
+# with a key only the load balancer holds; here it is base64-encoded JSON,
+# because the point is to reproduce the protocol a client observes, not to
+# keep a secret from the developer running the emulator.
+
+
+def _oidc_parse_cookies(headers):
+    """Parse a Cookie header into a plain dict."""
+    jar = {}
+    for part in (headers.get("cookie") or "").split(";"):
+        name, sep, value = part.partition("=")
+        if sep:
+            jar[name.strip()] = value.strip()
+    return jar
+
+
+def _oidc_read_session(jar, cookie_name):
+    """Reassemble a session from its cookie shards, or return None.
+
+    Shards must be contiguous from -0. A gap means the client dropped part of
+    the session, which is indistinguishable from having no session at all.
+    """
+    shards, index = [], 0
+    while f"{cookie_name}-{index}" in jar:
+        shards.append(jar[f"{cookie_name}-{index}"])
+        index += 1
+    if not shards:
+        return None
+    try:
+        blob = "".join(shards)
+        blob += "=" * (-len(blob) % 4)  # restore stripped base64 padding
+        return json.loads(base64.urlsafe_b64decode(blob.encode()))
+    except Exception:
+        return None
+
+
+def _oidc_session_cookies(cookie_name, session, max_age, secure):
+    """Render a session as Set-Cookie values, sharded the way AWS shards them.
+
+    Each shard is sized so the complete Set-Cookie pair fits inside the
+    browser's per-cookie ceiling — see OIDC_COOKIE_MAX_BYTES.
+    """
+    blob = base64.urlsafe_b64encode(json.dumps(session).encode()).decode().rstrip("=")
+    attrs = f"; Path=/; HttpOnly; Max-Age={max_age}"
+    if secure:
+        attrs += "; Secure"
+
+    # Budget for the value alone. The index is allowed three digits, which is
+    # far more shards than a session can plausibly need, so the reservation
+    # stays correct as the count grows.
+    overhead = len(f"{cookie_name}-000=") + len(attrs)
+    budget = max(OIDC_COOKIE_MAX_BYTES - overhead, 1)
+
+    shards = [blob[i:i + budget] for i in range(0, len(blob), budget)] or [""]
+    return [f"{cookie_name}-{i}={shard}{attrs}" for i, shard in enumerate(shards)]
+
+
+def _oidc_expiry_cookies(cookie_name, count):
+    """Expire previously-set shards so a stale session cannot linger."""
+    return [f"{cookie_name}-{i}=; Path=/; HttpOnly; Max-Age=0" for i in range(max(count, 1))]
+
+
+def _oidc_request_url(headers, path, query_params, listener_port):
+    """Rebuild the URL the client asked for, to return to after authenticating."""
+    host = headers.get("host") or f"localhost:{listener_port}"
+    proto = headers.get("x-forwarded-proto") or "http"
+    qs = urlencode([(k, v) for k, vs in (query_params or {}).items()
+                    for v in (vs if isinstance(vs, list) else [vs])])
+    return f"{proto}://{host}{path}" + (f"?{qs}" if qs else "")
+
+
+def _oidc_post_form(url, form, timeout=10.0):
+    """POST a form to the identity provider's token endpoint and read JSON back.
+
+    Blocking on purpose: run it through run_reentrant, the same way the target
+    proxy does, rather than adding an async HTTP dependency to the emulator.
+    """
+    import http.client
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    conn_cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+    conn = conn_cls(parts.hostname, parts.port or (443 if parts.scheme == "https" else 80),
+                    timeout=timeout)
+    try:
+        body = urlencode(form)
+        conn.request("POST", parts.path or "/", body=body, headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Content-Length": str(len(body)),
+            "Accept": "application/json",
+        })
+        resp = conn.getresponse()
+        raw = resp.read()
+        try:
+            return resp.status, json.loads(raw or b"{}")
+        except ValueError:
+            return resp.status, {"raw": raw.decode("utf-8", errors="replace")}
+    finally:
+        with contextlib.suppress(Exception):
+            conn.close()
+
+
+def _oidc_get_userinfo(url, access_token, timeout=10.0):
+    """GET the IdP's user info endpoint with the access token.
+
+    This is where the claims the target sees come from on AWS: the load
+    balancer exchanges the access token at the user info endpoint and passes
+    those claims on — it never passes the ID token to the backend.
+    """
+    import http.client
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    conn_cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+    conn = conn_cls(parts.hostname, parts.port or (443 if parts.scheme == "https" else 80),
+                    timeout=timeout)
+    try:
+        conn.request("GET", parts.path or "/", headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+        })
+        resp = conn.getresponse()
+        raw = resp.read()
+        if resp.status >= 400:
+            return None
+        try:
+            claims = json.loads(raw or b"{}")
+        except ValueError:
+            return None
+        return claims if isinstance(claims, dict) else None
+    except Exception:
+        return None
+    finally:
+        with contextlib.suppress(Exception):
+            conn.close()
+
+
+# The key the emulator signs x-amzn-oidc-data with. AWS signs with a regional
+# key served from public-keys.auth.elb.<region>.amazonaws.com/<kid>; there is
+# no such endpoint locally, so the signature is real ES256 but verifiable only
+# in principle. Apps that decode the payload (the common pattern) work; apps
+# that fetch the AWS key endpoint fail loudly, exactly as they would against
+# any non-AWS host.
+_OIDC_SIGNING_KEY = None
+_OIDC_KID = None
+
+
+def _oidc_signing_material():
+    global _OIDC_SIGNING_KEY, _OIDC_KID
+    if _OIDC_KID is None:
+        _OIDC_KID = new_uuid()
+        try:
+            from cryptography.hazmat.primitives.asymmetric import ec
+            _OIDC_SIGNING_KEY = ec.generate_private_key(ec.SECP256R1())
+        except Exception:
+            _OIDC_SIGNING_KEY = None
+    return _OIDC_SIGNING_KEY, _OIDC_KID
+
+
+def _oidc_b64url(raw: bytes) -> str:
+    # ALB's documented quirk: unlike standard JWTs, the x-amzn-oidc-data
+    # segments are base64url WITH the trailing padding characters ("includes
+    # padding characters at the end" per the user-claims-encoding docs) —
+    # strict JWT libraries choke on real ALB tokens for exactly this reason,
+    # so an emulator that strips the padding hides that failure mode.
+    return base64.urlsafe_b64encode(raw).decode()
+
+
+def _oidc_data_jwt(claims, cfg, lb_arn, exp):
+    """Build x-amzn-oidc-data the way AWS documents it: the user claims as an
+    ES256 JWT whose header carries ``kid``, ``signer`` (the load balancer ARN),
+    ``iss``, ``client`` and ``exp``. The payload is the claims from the user
+    info endpoint — never the provider's ID token, which AWS does not pass to
+    the backend."""
+    key, kid = _oidc_signing_material()
+    header = {
+        "typ": "JWT",
+        "alg": "ES256",
+        "kid": kid,
+        "signer": lb_arn,
+        "iss": cfg.get("Issuer", ""),
+        "client": cfg.get("ClientId", ""),
+        "exp": exp,
+    }
+    signing_input = (
+        _oidc_b64url(json.dumps(header, separators=(",", ":")).encode())
+        + "."
+        + _oidc_b64url(json.dumps(claims, separators=(",", ":")).encode())
+    )
+    signature = b""
+    if key is not None:
+        try:
+            from cryptography.hazmat.primitives import hashes
+            from cryptography.hazmat.primitives.asymmetric import ec, utils
+            der = key.sign(signing_input.encode(), ec.ECDSA(hashes.SHA256()))
+            r, s = utils.decode_dss_signature(der)
+            signature = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+        except Exception:
+            signature = b""
+    return f"{signing_input}.{_oidc_b64url(signature)}"
+
+
+def _oidc_claims(id_token):
+    """Read the claims out of an ID token without verifying it.
+
+    The token came straight from the provider over the back channel, so there
+    is no third party to have tampered with it. Verification would mean
+    fetching JWKS, which buys an emulator nothing.
+    """
+    try:
+        payload = id_token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload.encode()))
+    except Exception:
+        return {}
+
+
+async def _authenticate_oidc(action, method, path, headers, body, query_params, listener_port,
+                             lb_arn=""):
+    """Run one authenticate-oidc action.
+
+    Returns None when the caller is authenticated and the request should carry
+    on to the next action in the rule; otherwise returns the (status, headers,
+    body) triple to send back. On success the caller's identity is injected
+    into `headers` for the target to read.
+    """
+    cfg = action.get("AuthenticateOidcConfig") or {}
+    cookie_name = cfg.get("SessionCookieName") or OIDC_DEFAULT_COOKIE_NAME
+    try:
+        session_timeout = int(cfg.get("SessionTimeout") or OIDC_DEFAULT_SESSION_TIMEOUT)
+    except (TypeError, ValueError):
+        session_timeout = OIDC_DEFAULT_SESSION_TIMEOUT
+    secure = (headers.get("x-forwarded-proto") or "").lower() == "https"
+    jar = _oidc_parse_cookies(headers)
+
+    # The X-Amzn-Oidc-* headers are the load balancer's to set. Strip any the
+    # client supplied before anything else runs — otherwise `allow` mode would
+    # forward a forged identity straight to the target.
+    for forged in ("x-amzn-oidc-identity", "x-amzn-oidc-accesstoken", "x-amzn-oidc-data"):
+        headers.pop(forged, None)
+
+    # --- the callback leg -------------------------------------------------
+    if path == OIDC_CALLBACK_PATH:
+        code = _oidc_first(query_params.get("code"))
+        state = _oidc_first(query_params.get("state"))
+        pending = _oidc_pending.pop(state, None) if state else None
+        if not code or pending is None:
+            # A replayed, forged, or timed-out callback. AWS bounds the whole
+            # login at 15 minutes and answers HTTP 401 when it is exceeded.
+            return (401, {"Content-Type": "text/plain"},
+                    b"Invalid or expired authentication response")
+
+        status, tokens = await run_reentrant(
+            lambda: _oidc_post_form(cfg.get("TokenEndpoint", ""), {
+                "grant_type": "authorization_code",
+                "code": code,
+                "client_id": cfg.get("ClientId", ""),
+                "client_secret": cfg.get("ClientSecret", ""),
+                "redirect_uri": pending["redirect_uri"],
+            }),
+            thread_name="ministack-alb-oidc-token",
+        )
+        if status >= 400 or "access_token" not in tokens:
+            logger.warning("ALB authenticate-oidc: token exchange failed (%s): %s", status, tokens)
+            return (561, {"Content-Type": "text/plain"},
+                    b"Authentication failed: the identity provider rejected the code exchange")
+
+        # The claims the target sees come from the user info endpoint, as on
+        # AWS; the ID token only serves as a fallback when the IdP has no
+        # usable user info response. AWS never passes the ID token itself to
+        # the backend, and neither does this.
+        userinfo = cfg.get("UserInfoEndpoint", "")
+        claims = None
+        if userinfo:
+            claims = await run_reentrant(
+                lambda: _oidc_get_userinfo(userinfo, tokens.get("access_token", "")),
+                thread_name="ministack-alb-oidc-userinfo",
+            )
+        if not claims:
+            claims = _oidc_claims(tokens.get("id_token", ""))
+        session = {
+            "claims": claims,
+            "access_token": tokens.get("access_token", ""),
+            "exp": int(time.time()) + session_timeout,
+        }
+        return (302, {
+            "Location": pending["url"],
+            "Set-Cookie": _oidc_session_cookies(cookie_name, session, session_timeout, secure),
+            "Content-Type": "text/plain",
+        }, b"")
+
+    # --- an established session -------------------------------------------
+    session = _oidc_read_session(jar, cookie_name)
+    if session and int(session.get("exp", 0)) > time.time():
+        claims = session.get("claims") or {}
+        headers["x-amzn-oidc-identity"] = str(claims.get("sub", ""))
+        headers["x-amzn-oidc-accesstoken"] = session.get("access_token", "")
+        headers["x-amzn-oidc-data"] = _oidc_data_jwt(
+            claims, cfg, lb_arn, int(session.get("exp", 0)))
+        return None
+
+    # --- no usable session -------------------------------------------------
+    on_unauth = (cfg.get("OnUnauthenticatedRequest") or "authenticate").lower()
+    if on_unauth == "allow":
+        return None
+    if on_unauth == "deny":
+        return (401, {"Content-Type": "text/plain"}, b"Unauthorized")
+
+    host = headers.get("host") or f"localhost:{listener_port}"
+    proto = headers.get("x-forwarded-proto") or "http"
+    redirect_uri = f"{proto}://{host}{OIDC_CALLBACK_PATH}"
+    state = new_uuid()
+    # AWS bounds a login attempt at 15 minutes; anything older is dead weight
+    # an abandoned redirect left behind.
+    cutoff = time.time() - 900
+    for stale in [k for k, v in _oidc_pending.items() if v.get("created", 0) < cutoff]:
+        _oidc_pending.pop(stale, None)
+    _oidc_pending[state] = {
+        "url": _oidc_request_url(headers, path, query_params, listener_port),
+        "redirect_uri": redirect_uri,
+        "created": time.time(),
+    }
+    location = cfg.get("AuthorizationEndpoint", "") + "?" + urlencode({
+        "client_id": cfg.get("ClientId", ""),
+        "response_type": "code",
+        "scope": cfg.get("Scope") or "openid",
+        "redirect_uri": redirect_uri,
+        "state": state,
+    })
+    expired = _oidc_expiry_cookies(cookie_name, len(jar)) if session else []
+    out_headers = {"Location": location, "Content-Type": "text/plain"}
+    if expired:
+        out_headers["Set-Cookie"] = expired
+    return (302, out_headers, b"")
+
+
+def _oidc_first(value):
+    """Query parameters arrive as either a scalar or a list."""
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else None
+    return value
+
+
+# ---------------------------------------------------------------------------
 # Data-plane: action execution
 # ---------------------------------------------------------------------------
+
+async def _execute_actions(actions, method, path, headers, body, query_params, listener_port=80,
+                           lb_arn=""):
+    """Run a rule's actions in Order until one produces a response.
+
+    Authentication actions are gates: they either short-circuit with a redirect
+    or a refusal, or they pass the request on to the action behind them, having
+    attached the caller's identity. Every other action type is terminal, which
+    is why the loop returns on the first one it meets.
+    """
+    ordered = sorted(actions, key=lambda a: int(a.get("Order", 1) or 1))
+    forwarded = dict(headers)
+
+    for action in ordered:
+        atype = (action.get("Type") or "").lower()
+        if atype == "authenticate-oidc":
+            response = await _authenticate_oidc(action, method, path, forwarded,
+                                                body, query_params, listener_port,
+                                                lb_arn=lb_arn)
+            if response is not None:
+                return response
+            continue
+        if atype == "authenticate-cognito":
+            # Cognito authentication is the same protocol with the endpoints
+            # derived from a user pool rather than given explicitly. Not
+            # implemented; failing loudly beats forwarding an unauthenticated
+            # request to a target that assumes the load balancer checked.
+            return (501, {"Content-Type": "application/json"},
+                    json.dumps({"message": "authenticate-cognito is not implemented"}).encode())
+        return await _execute_action(action, method, path, forwarded, body, query_params)
+
+    # Every action was a gate that passed and none of them was terminal.
+    return (502, {"Content-Type": "application/json"},
+            json.dumps({"message": "Rule has no terminal action"}).encode())
+
 
 async def _execute_action(action, method, path, headers, body, query_params):
     atype = action.get("Type", "").lower()
@@ -1510,8 +1974,9 @@ async def dispatch_request(lb, method, path, headers, body, query_params, port=8
         if matched:
             actions = rule.get("Actions") or listener.get("DefaultActions", [])
             if actions:
-                return await _execute_action(actions[0], method, path,
-                                             headers, body, query_params)
+                return await _execute_actions(actions, method, path,
+                                              headers, body, query_params, port,
+                                              lb_arn=lb.get("LoadBalancerArn", ""))
 
     return (502, {"Content-Type": "application/json"},
             json.dumps({"message": "No matching ALB rule found"}).encode())
