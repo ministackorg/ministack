@@ -1799,7 +1799,12 @@ async def _handle_special_data_plane_request(
                 result = await _get_module("s3tables").handle_request(method, path, headers, body, query_params)
             if result is not None:
                 return result
-            return 200, {"Content-Type": "application/json"}, b"{}"
+            # Neither catalog matched the path: a proper Iceberg REST error,
+            # not an empty 200 a client would read as success.
+            return 404, {"Content-Type": "application/json"}, json.dumps(
+                {"error": {"message": f"Unknown Iceberg REST path: {path}",
+                           "type": "NotFoundException", "code": 404}}
+            ).encode()
         except Exception as e:
             logger.exception("Error in Iceberg REST catalog: %s", e)
             return 500, {"Content-Type": "application/json"}, json.dumps({"error": str(e)}).encode()

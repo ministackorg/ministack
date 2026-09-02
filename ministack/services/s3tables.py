@@ -374,7 +374,7 @@ def _create_table(bucket_arn, namespace, data):
     schema_def = iceberg_meta.get("schema", iceberg_meta.get("schemaV2", {}))
     for f in schema_def.get("field", schema_def.get("fields", [])):
         schema_fields.append({"name": f["name"], "type": f.get("type", "string"), "required": f.get("required", False)})
-    logger.info(
+    logger.debug(
         "S3Tables: create_table %s/%s schema_fields=%d metadata_keys=%s",
         namespace,
         table_name,
@@ -689,6 +689,13 @@ def _iceberg_load_table(namespace, table_name, allow_cross_region, bucket_filter
                         if k.startswith(meta_dir) and k.endswith(".metadata.json")
                     )
                     if meta_files:
+                        # Order vN.metadata.json numerically: lexically v10
+                        # sorts before v2, so from the 10th commit on the scan
+                        # would serve v9 forever. Spark-style zero-padded
+                        # names all map to -1 and keep their lexical order.
+                        from ministack.services.glue import _metadata_version_from_location
+
+                        meta_files.sort(key=_metadata_version_from_location)
                         latest_key = meta_files[-1]
                         raw = _s3._get_object_data(bkt, latest_key)
                         if raw:

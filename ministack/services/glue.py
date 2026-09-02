@@ -1880,9 +1880,10 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         "AWS_DEFAULT_REGION": get_region(),
         "AWS_REGION": get_region(),
         "AWS_ENDPOINT_URL": s3_endpoint,
-        # The Java AWS SDK v2 does not read AWS_ENDPOINT_URL (that is a
-        # boto3/Python convention). Iceberg's S3FileIO uses the Java SDK for
-        # the actual S3 PutObject, so it needs the Java-side env var.
+        # Java AWS SDK v2 reads AWS_ENDPOINT_URL only from 2.21 (late 2023);
+        # the Glue images ship older SDKs, and Iceberg's S3FileIO does the
+        # actual S3 PutObject through them — so set the service-specific var
+        # (and the system property below) explicitly.
         "AWS_ENDPOINT_URL_S3": s3_endpoint,
         "DISABLE_SSL": "true",
     }
@@ -1913,18 +1914,6 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         "spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem",
         "--conf",
         "spark.hadoop.fs.s3a.connection.ssl.enabled=false",
-        # Iceberg's S3FileIO creates its own S3 client, independent of the
-        # Hadoop S3A client above. Without these defaults every catalog the
-        # user defines would need its own s3.endpoint conf, and the write
-        # path (S3OutputStream.close) would resolve to localhost.
-        "--conf",
-        f"spark.sql.catalog.default.s3.endpoint={s3_endpoint}",
-        "--conf",
-        "spark.sql.catalog.default.s3.path-style-access=true",
-        "--conf",
-        f"spark.sql.catalog.default.s3.access-key-id={ak}",
-        "--conf",
-        f"spark.sql.catalog.default.s3.secret-access-key={sk}",
     ]
 
     # Iceberg GlueCatalog conf -- add when the user's job or --conf references
@@ -1989,7 +1978,10 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         catalog_names = set()
         for uc in user_confs:
             m = re.match(r"spark\.sql\.catalog\.(\w+)=", uc)
-            if m and m.group(1) not in ("spark_catalog", "default"):
+            # spark_catalog gets the full GlueCatalog block above; every
+            # other user-defined catalog (including one named "default")
+            # gets its S3FileIO endpoint injected here.
+            if m and m.group(1) != "spark_catalog":
                 catalog_names.add(m.group(1))
         for cat in sorted(catalog_names):
             prefix = f"spark.sql.catalog.{cat}"
