@@ -1827,7 +1827,37 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         except Exception:
             pass
     if not ministack_host:
-        ministack_host = "host.docker.internal"
+        # HOSTNAME lookup failed. Try to find our own container by name on the
+        # network — the compose service name or the container name both work.
+        for name in ("ministack", os.environ.get("HOSTNAME", "")):
+            if not name:
+                continue
+            try:
+                c = docker_client.containers.get(name)
+                c.reload()
+                nets = c.attrs.get("NetworkSettings", {}).get("Networks", {})
+                for net_name, net_info in nets.items():
+                    ip = net_info.get("IPAddress", "")
+                    if ip:
+                        ministack_host = ip
+                        if not ms_network:
+                            ms_network = net_name
+                        break
+                if ministack_host:
+                    break
+            except Exception:
+                pass
+    if not ministack_host:
+        # Last resort: resolve the gateway address, which is how
+        # host.docker.internal resolves on Docker Desktop. On Linux the
+        # extra_hosts entry maps it to host-gateway, so this is what the
+        # Spark container would see — use it directly rather than relying
+        # on the name, which the Java SDK may resolve to 127.0.0.1.
+        try:
+            import socket
+            ministack_host = socket.gethostbyname("host.docker.internal")
+        except Exception:
+            ministack_host = "host.docker.internal"
 
     s3_endpoint = f"http://{ministack_host}:{ministack_port}"
 
@@ -1873,6 +1903,18 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         "spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem",
         "--conf",
         "spark.hadoop.fs.s3a.connection.ssl.enabled=false",
+        # Iceberg's S3FileIO creates its own S3 client, independent of the
+        # Hadoop S3A client above. Without these defaults every catalog the
+        # user defines would need its own s3.endpoint conf, and the write
+        # path (S3OutputStream.close) would resolve to localhost.
+        "--conf",
+        f"spark.sql.catalog.default.s3.endpoint={s3_endpoint}",
+        "--conf",
+        "spark.sql.catalog.default.s3.path-style-access=true",
+        "--conf",
+        f"spark.sql.catalog.default.s3.access-key-id={ak}",
+        "--conf",
+        f"spark.sql.catalog.default.s3.secret-access-key={sk}",
     ]
 
     # Iceberg GlueCatalog conf -- add when the user's job or --conf references
@@ -1919,12 +1961,36 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
 
     # Add Spark/Iceberg conf from job arguments
     conf_arg = args.get("--conf", "")
+    user_confs = []
     if conf_arg:
         for conf in conf_arg.split(" --conf "):
             conf = conf.strip()
             if conf:
-                cmd.extend(["--conf", _translate_loopback_conf(
-                    conf, ministack_host, ministack_port)])
+                translated = _translate_loopback_conf(conf, ministack_host, ministack_port)
+                cmd.extend(["--conf", translated])
+                user_confs.append(translated)
+
+    # Iceberg's S3FileIO creates its own S3 client per catalog. If the user
+    # defined a catalog (spark.sql.catalog.<name>=...) but did not set its
+    # s3.endpoint, the write path resolves to localhost. Inject the MiniStack
+    # endpoint for every user catalog that doesn't already have one.
+    if uses_iceberg:
+        user_conf_str = " ".join(user_confs)
+        catalog_names = set()
+        for uc in user_confs:
+            m = re.match(r"spark\.sql\.catalog\.(\w+)=", uc)
+            if m and m.group(1) not in ("spark_catalog", "default"):
+                catalog_names.add(m.group(1))
+        for cat in sorted(catalog_names):
+            prefix = f"spark.sql.catalog.{cat}"
+            if f"{prefix}.s3.endpoint=" not in user_conf_str:
+                cmd.extend(["--conf", f"{prefix}.s3.endpoint={s3_endpoint}"])
+            if f"{prefix}.s3.path-style-access=" not in user_conf_str:
+                cmd.extend(["--conf", f"{prefix}.s3.path-style-access=true"])
+            if f"{prefix}.s3.access-key-id=" not in user_conf_str:
+                cmd.extend(["--conf", f"{prefix}.s3.access-key-id={ak}"])
+            if f"{prefix}.s3.secret-access-key=" not in user_conf_str:
+                cmd.extend(["--conf", f"{prefix}.s3.secret-access-key={sk}"])
 
     # The script path inside the container; spark-submit is handed the
     # bootstrap, which re-runs the real script as __main__ (see
