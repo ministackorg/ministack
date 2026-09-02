@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import datetime
 import io
 import json
 import os
@@ -10001,41 +10002,426 @@ def test_rds_restore_syncs_stale_secondary_credentials_from_global_writer(
 def test_rds_mysql_control_user_is_local_and_used_for_replica_sql(monkeypatch):
     from ministack.services import rds as m
 
-    cluster = {"DBClusterIdentifier": "secondary"}
-    statements = []
+    cluster = {
+        "DBClusterIdentifier": "secondary",
+        "_mysql_control_user_ready": True,
+    }
+    events = []
     connection_args = []
-
-    class FakeCursor:
-        def execute(self, statement, params=None):
-            statements.append((statement, params))
-
-        def close(self):
-            pass
-
-    class FakeConnection:
-        def cursor(self):
-            return FakeCursor()
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(m, "_mysql_admin_connection", lambda _cluster: FakeConnection())
+    monkeypatch.setattr(
+        m, "_mysql_admin_connection", lambda _cluster: _mysql_test_connection(events),
+    )
 
     assert m._ensure_mysql_control_user(cluster) is True
-    assert statements[0][0] == "SET SESSION sql_log_bin=0"
-    assert cluster["_mysql_control_user_ready"] is True
+    assert events == []
+    assert m._ensure_mysql_control_user(
+        cluster, require_quiescence_grants=True,
+    ) is True
+    grant_count = len(events)
+    statements = [event[1:] for event in events if isinstance(event, tuple)]
+    assert [statement for statement, _params in statements] == [
+        "SET SESSION sql_log_bin=0",
+        (
+            "CREATE USER IF NOT EXISTS %s@'%%' "
+            "IDENTIFIED WITH mysql_native_password BY %s"
+        ),
+        "GRANT PROCESS, RELOAD ON *.* TO %s@'%%'",
+        (
+            "GRANT CONNECTION_ADMIN, REPLICATION_SLAVE_ADMIN, "
+            "SYSTEM_VARIABLES_ADMIN, XA_RECOVER_ADMIN ON *.* TO %s@'%%'"
+        ),
+        "FLUSH PRIVILEGES",
+    ]
+    assert statements[2][1] == statements[3][1] == (m._MYSQL_CONTROL_USER,)
+    assert cluster["_mysql_writer_quiescence_grants_ready"] is True
+    assert m._ensure_mysql_control_user(cluster) is True
+    assert m._ensure_mysql_control_user(
+        cluster, require_quiescence_grants=True,
+    ) is True
+    assert len(events) == grant_count
 
     monkeypatch.setattr(
         m,
         "_mysql_cluster_connection",
         lambda target, user, password: connection_args.append(
             (target, user, password),
-        ) or FakeConnection(),
+        ) or _mysql_test_connection([]),
     )
     m._mysql_replication_connection(cluster)
     assert connection_args == [
         (cluster, m._MYSQL_CONTROL_USER, m._MYSQL_CONTROL_PASSWORD),
     ]
+
+
+def _mysql_modified_transaction_row(state="RUNNING"):
+    started = datetime.datetime(2026, 9, 1, 12, 0)
+    return ("1840", state, started, 13, 0, 2, 13, "admin", "172.20.0.1:50000", "Sleep")
+
+
+def _mysql_test_connection(events, rows=(), failure=None):
+    class FakeCursor:
+        def execute(self, statement, params=None):
+            events.append(("execute", statement, params))
+            if failure == "execute":
+                raise RuntimeError("execute failed")
+
+        def fetchall(self):
+            events.append("fetchall")
+            if failure == "fetch":
+                raise RuntimeError("fetch failed")
+            return rows
+
+        def close(self):
+            events.append("cursor.close")
+            if failure == "cursor-close":
+                raise RuntimeError("cursor close failed")
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            events.append("connection.close")
+            if failure == "connection-close":
+                raise RuntimeError("connection close failed")
+
+    return FakeConnection()
+
+
+@pytest.mark.parametrize("failure", ["cursor-close", "connection-close"])
+def test_rds_mysql_control_user_does_not_publish_grants_after_close_failure(
+    monkeypatch,
+    failure,
+):
+    from ministack.services import rds as m
+
+    cluster = {"_mysql_control_user_ready": True}
+    monkeypatch.setattr(
+        m, "_mysql_admin_connection",
+        lambda _cluster: _mysql_test_connection([], failure=failure),
+    )
+    assert not m._ensure_mysql_control_user(
+        cluster, require_quiescence_grants=True,
+    )
+    assert cluster == {"_mysql_control_user_ready": True}
+
+
+def _patch_mysql_quiescence(monkeypatch, m, *, fence, normal, xa, gtid):
+    for name, value in (
+        ("_mysql_writer_fence_active", fence),
+        ("_mysql_modified_transactions", normal),
+        ("_mysql_prepared_xa_empty", xa),
+        ("_capture_mysql_gtid_executed", gtid),
+    ):
+        monkeypatch.setattr(
+            m,
+            name,
+            value if callable(value) else lambda _cluster, *, deadline=None, v=value: v,
+        )
+
+
+@pytest.mark.parametrize(("failure", "expected"), [(None, True), ("cursor-close", False)])
+def test_rds_mysql_writer_fence_keeps_caller_connection(monkeypatch, failure, expected):
+    from ministack.services import rds as m
+
+    events = []
+    conn = _mysql_test_connection(events, failure=failure)
+    assert m._set_mysql_writer_fence(conn) is expected
+    assert events[0] == ("execute", "SET GLOBAL super_read_only=ON", None)
+    assert "cursor.close" in events
+    assert "connection.close" not in events
+
+
+@pytest.mark.parametrize(
+    ("readback", "expected"),
+    [
+        (((1, 1),), True),
+        (((0, 1),), False),
+        (((1, 0),), False),
+        (((True, True),), None),
+        (None, None),
+    ],
+)
+def test_rds_mysql_writer_fence_requires_exact_readback(monkeypatch, readback, expected):
+    from ministack.services import rds as m
+
+    queries = []
+    monkeypatch.setattr(
+        m,
+        "_mysql_control_query",
+        lambda _cluster, statement, *, deadline=None: (
+            queries.append((statement, deadline)) or readback
+        ),
+    )
+    assert m._mysql_writer_fence_active({}, deadline=10) is expected
+    assert queries == [
+        ("SELECT @@GLOBAL.read_only, @@GLOBAL.super_read_only", 10),
+    ]
+
+
+@pytest.mark.parametrize("failure", ["execute", "fetch", "cursor-close", "connection-close"])
+def test_rds_mysql_control_query_failures_close_owned_resources(
+    monkeypatch,
+    failure,
+):
+    from ministack.services import rds as m
+
+    events = []
+    conn = _mysql_test_connection(events, rows=((1,),), failure=failure)
+    monkeypatch.setattr(m, "_mysql_replication_connection", lambda _cluster: conn)
+    assert m._mysql_control_query({}, "SELECT 1") is None
+    assert "cursor.close" in events
+    assert "connection.close" in events
+
+
+@pytest.mark.parametrize(("elapsed", "expected"), [(False, ((1,),)), (True, None)])
+def test_rds_mysql_control_query_uses_remaining_deadline(
+    monkeypatch,
+    elapsed,
+    expected,
+):
+    from ministack.services import rds as m
+
+    now = iter([100.0, 111.0 if elapsed else 100.0, 111.0 if elapsed else 100.0])
+    events = []
+    timeouts = []
+
+    def connect(**kwargs):
+        timeouts.append(kwargs)
+        return _mysql_test_connection(events, rows=((1,),))
+
+    monkeypatch.setattr(m.time, "monotonic", lambda: next(now))
+    monkeypatch.setitem(
+        sys.modules, "pymysql", types.SimpleNamespace(connect=connect),
+    )
+    cluster = {"_shared_endpoint": {"Address": "writer", "Port": 3306}}
+    assert m._mysql_control_query(cluster, "SELECT 1", deadline=110.0) == expected
+    assert timeouts == [{
+        "host": "writer",
+        "port": 3306,
+        "user": m._MYSQL_CONTROL_USER,
+        "password": m._MYSQL_CONTROL_PASSWORD,
+        "autocommit": True,
+        "connect_timeout": 3,
+        "read_timeout": 10.0,
+        "write_timeout": 10.0,
+    }]
+    assert events[-2:] == ["cursor.close", "connection.close"]
+
+
+@pytest.mark.parametrize("state", ["RUNNING", "LOCK WAIT", "ROLLING BACK", "COMMITTING"])
+def test_rds_mysql_modified_transactions_accept_documented_states(monkeypatch, state):
+    from ministack.services import rds as m
+
+    row = _mysql_modified_transaction_row(state)
+    monkeypatch.setattr(m, "_mysql_control_query", lambda *_args, **_kwargs: (row,))
+    assert m._mysql_modified_transactions({}) == (row,)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "malformed",
+        "unknown-state",
+        "unhashable-state",
+        "duplicate",
+        "thread-mismatch",
+        "zero-ids",
+        "overlong-id",
+        "query-error",
+    ],
+)
+def test_rds_mysql_modified_transactions_fail_closed(monkeypatch, invalid):
+    from ministack.services import rds as m
+
+    row = _mysql_modified_transaction_row()
+    if invalid == "malformed":
+        rows = (row[:-1],)
+    elif invalid == "unknown-state":
+        rows = ((row[0], "PREPARED", *row[2:]),)
+    elif invalid == "unhashable-state":
+        rows = ((row[0], [], *row[2:]),)
+    elif invalid == "duplicate":
+        rows = (row, row)
+    elif invalid == "thread-mismatch":
+        rows = ((*row[:6], 14, *row[7:]),)
+    elif invalid == "zero-ids":
+        rows = ((*row[:3], 0, *row[4:6], 0, *row[7:]),)
+    elif invalid == "overlong-id":
+        rows = (("1" * 5000, *row[1:]),)
+    else:
+        rows = None
+    monkeypatch.setattr(m, "_mysql_control_query", lambda *_args, **_kwargs: rows)
+    assert m._mysql_modified_transactions({}) is None
+
+
+@pytest.mark.parametrize(("rows", "expected"), [((), True), (((1, 4, 0, b"xid"),), False), (None, None)])
+def test_rds_mysql_prepared_xa_inventory_fails_closed(monkeypatch, rows, expected):
+    from ministack.services import rds as m
+
+    statements = []
+    monkeypatch.setattr(
+        m,
+        "_mysql_control_query",
+        lambda _cluster, statement, *, deadline=None: (
+            statements.append((statement, deadline)) or rows
+        ),
+    )
+    assert m._mysql_prepared_xa_empty({}, deadline=10) is expected
+    assert statements == [("XA RECOVER CONVERT XID", 10)]
+
+
+@pytest.mark.parametrize(
+    ("rows", "expected"),
+    [
+        ((("source:1-7",),), "source:1-7"),
+        ((), None),
+        ((("source:1",), ("source:2",)), None),
+        ((("source:1", "extra"),), None),
+        ((("",),), None),
+        (((" source:1",),), None),
+        (((1,),), None),
+    ],
+)
+def test_rds_mysql_gtid_capture_requires_exact_value(monkeypatch, rows, expected):
+    from ministack.services import rds as m
+
+    calls = []
+    monkeypatch.setattr(
+        m,
+        "_mysql_control_query",
+        lambda _cluster, statement, *, deadline=None: (
+            calls.append((statement, deadline)) or rows
+        ),
+    )
+    assert m._capture_mysql_gtid_executed({}, deadline=10) == expected
+    assert calls == [("SELECT @@GLOBAL.gtid_executed", 10)]
+
+
+def test_rds_mysql_quiescence_orders_normal_xa_normal_before_gtid(monkeypatch):
+    from ministack.services import rds as m
+
+    events = []
+    normal = iter([(), ()])
+    _patch_mysql_quiescence(
+        monkeypatch,
+        m,
+        fence=lambda _cluster, **_kwargs: events.append("fence") or True,
+        normal=lambda _cluster, **_kwargs: events.append("normal") or next(normal),
+        xa=lambda _cluster, **_kwargs: events.append("xa") or True,
+        gtid=lambda _cluster, **_kwargs: events.append("gtid") or "source:1-7",
+    )
+
+    assert m._wait_for_mysql_writer_quiescence({}, 1) == "source:1-7"
+    assert events == [
+        "fence", "normal", "xa", "normal", "fence", "gtid", "fence",
+    ]
+
+
+@pytest.mark.parametrize(("normal_results", "xa_result"), [
+    ((None,), True), (((), None), True), (((), ()), None),
+])
+def test_rds_mysql_quiescence_inventory_error_suppresses_gtid(
+    monkeypatch,
+    normal_results,
+    xa_result,
+):
+    from ministack.services import rds as m
+
+    results = iter(normal_results)
+    _patch_mysql_quiescence(
+        monkeypatch, m, fence=True,
+        normal=lambda *_args, **_kwargs: next(results), xa=xa_result,
+        gtid=lambda *_args, **_kwargs: pytest.fail("captured GTID after inventory error"),
+    )
+    assert m._wait_for_mysql_writer_quiescence({}, 1) is None
+
+
+@pytest.mark.parametrize("blocker", ["normal", "xa"])
+def test_rds_mysql_quiescence_timeout_never_kills_or_resolves(monkeypatch, blocker):
+    from ministack.services import rds as m
+
+    row = _mysql_modified_transaction_row()
+    statements = []
+    sleeps = []
+    now = iter([0.0, 0.4, 1.0])
+
+    def query(_cluster, statement, *, deadline=None):
+        statements.append(statement)
+        if statement == "SELECT @@GLOBAL.read_only, @@GLOBAL.super_read_only":
+            return ((1, 1),)
+        if statement == m._MYSQL_MODIFIED_TRANSACTION_QUERY:
+            return (row,) if blocker == "normal" else ()
+        if statement == "XA RECOVER CONVERT XID":
+            return ((1, 4, 0, b"xid"),)
+        pytest.fail(f"unexpected control statement: {statement}")
+
+    monkeypatch.setattr(m, "_mysql_control_query", query)
+    monkeypatch.setattr(m.time, "monotonic", lambda: next(now))
+    monkeypatch.setattr(m.time, "sleep", sleeps.append)
+    assert m._wait_for_mysql_writer_quiescence({}, 1.0, 0.6) is None
+    assert statements == [
+        "SELECT @@GLOBAL.read_only, @@GLOBAL.super_read_only",
+        m._MYSQL_MODIFIED_TRANSACTION_QUERY,
+        *([] if blocker == "normal" else ["XA RECOVER CONVERT XID"]),
+    ] * 2
+    assert sleeps == [0.6]
+
+
+@pytest.mark.parametrize(("timeout", "poll_interval"), [
+    (0, 0.1), (float("nan"), 0.1), (float("inf"), 0.1),
+    (float("-inf"), 0.1), (10**1000, 0.1), (1, 10**1000),
+])
+def test_rds_mysql_quiescence_rejects_invalid_duration(
+    monkeypatch, timeout, poll_interval,
+):
+    from ministack.services import rds as m
+
+    monkeypatch.setattr(
+        m,
+        "_mysql_writer_fence_active",
+        lambda *_args, **_kwargs: pytest.fail("invalid timeout queried MySQL"),
+    )
+    assert m._wait_for_mysql_writer_quiescence({}, timeout, poll_interval) is None
+
+
+@pytest.mark.parametrize(("fences", "gtid_calls"), [
+    ([True, False], 0), ([True, True, False], 1),
+])
+def test_rds_mysql_quiescence_fence_loss_suppresses_result(
+    monkeypatch,
+    fences,
+    gtid_calls,
+):
+    from ministack.services import rds as m
+
+    fence_results = iter(fences)
+    captured = []
+    _patch_mysql_quiescence(
+        monkeypatch,
+        m,
+        fence=lambda _cluster, **_kwargs: next(fence_results),
+        normal=(),
+        xa=True,
+        gtid=lambda _cluster, **_kwargs: captured.append("gtid") or "source:1-7",
+    )
+    assert m._wait_for_mysql_writer_quiescence({}, 1) is None
+    assert len(captured) == gtid_calls
+
+
+def test_rds_mysql_quiescence_epoch_change_suppresses_result(monkeypatch):
+    from ministack.services import rds as m
+
+    cluster = {"_shared_container_epoch": 7}
+
+    def capture(_cluster, *, deadline=None):
+        cluster["_shared_container_epoch"] = 8
+        return "source:1-7"
+
+    _patch_mysql_quiescence(
+        monkeypatch, m, fence=True, normal=(), xa=True, gtid=capture,
+    )
+    assert m._wait_for_mysql_writer_quiescence(cluster, 1) is None
 
 
 def _wait_for_replica_status(endpoint, timeout=120):
@@ -10084,6 +10470,102 @@ def _wait_for_gtid(
         f"secondary did not execute writer GTID set within {timeout}s: "
         f"result={result!r}, gtid={executed!r}"
     )
+
+
+@pytest.mark.skipif(
+    not os.environ.get("DOCKER_NETWORK"),
+    reason="DOCKER_NETWORK not set -- live Aurora",
+)
+def test_aurora_mysql_control_user_can_inventory_writer_transactions():
+    from ministack.services import rds as m
+
+    east = _regional_rds("us-east-1")
+    suffix = uuid.uuid4().hex[:10]
+    global_id = f"global-control-{suffix}"
+    cluster_id = f"global-control-writer-{suffix}"
+    instance_id = f"{cluster_id}-instance"
+    cluster_arn = None
+    admin = None
+
+    try:
+        cluster = east.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            EngineVersion="8.0.mysql_aurora.3.10.3",
+            MasterUsername="admin",
+            MasterUserPassword=PASSWORD,
+            DatabaseName=DATABASE,
+        )["DBCluster"]
+        cluster_arn = cluster["DBClusterArn"]
+        east.create_global_cluster(
+            GlobalClusterIdentifier=global_id,
+            SourceDBClusterIdentifier=cluster_arn,
+        )
+        east.create_db_instance(
+            DBInstanceIdentifier=instance_id,
+            DBClusterIdentifier=cluster_id,
+            DBInstanceClass="db.r6g.large",
+            Engine="aurora-mysql",
+        )
+        writer = _wait_for_instance(east, instance_id)
+
+        admin = _aurora_connect(writer["Endpoint"])
+        with admin.cursor() as cursor:
+            cursor.execute(
+                "CREATE TABLE control_inventory_rows "
+                "(id INT PRIMARY KEY, value VARCHAR(32))"
+            )
+            cursor.execute("SELECT CONNECTION_ID()")
+            admin_thread_id = cursor.fetchone()[0]
+        admin.autocommit(False)
+        with admin.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO control_inventory_rows VALUES (1, 'uncommitted')"
+            )
+
+        with _aurora_connect(
+            writer["Endpoint"],
+            user="rdsadmin",
+            password="ministack-rds-control",
+            database=None,
+        ) as control:
+            with control.cursor() as cursor:
+                cursor.execute("SELECT CURRENT_USER()")
+                assert cursor.fetchone() == ("rdsadmin@%",)
+                deadline = time.time() + 5
+                matching = []
+                while time.time() < deadline:
+                    cursor.execute(m._MYSQL_MODIFIED_TRANSACTION_QUERY)
+                    matching = [
+                        row
+                        for row in cursor.fetchall()
+                        if row[3] == admin_thread_id
+                    ]
+                    if matching:
+                        break
+                    time.sleep(0.1)
+                assert len(matching) == 1
+                row = matching[0]
+                assert len(row) == 10 and isinstance(row[2], datetime.datetime)
+                assert (type(row[0]) is int and row[0] > 0) or (isinstance(row[0], str) and row[0].isdecimal() and int(row[0]) > 0)
+                assert all(type(row[index]) is int for index in (3, 4, 5, 6))
+                assert all(isinstance(row[index], str) for index in (1, 7, 8, 9))
+                assert row[1] in m._MYSQL_TRANSACTION_STATES
+                assert row[3] == row[6] == admin_thread_id
+                assert row[4] == 0 and row[5] > 0 and row[7] == "admin"
+                cursor.execute("XA RECOVER CONVERT XID")
+                assert cursor.fetchall() == ()
+    finally:
+        if admin is not None:
+            with contextlib.suppress(Exception):
+                admin.rollback()
+            with contextlib.suppress(Exception):
+                admin.close()
+        if cluster_arn is not None:
+            _remove_global_member(east, global_id, cluster_arn)
+        _delete_instance(east, instance_id)
+        _delete_cluster(east, cluster_id)
+        _delete_global_cluster(east, global_id)
 
 
 @pytest.mark.skipif(

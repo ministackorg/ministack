@@ -645,6 +645,97 @@ def test_backup_round_trip():
     _round_trip("backup", "backup", populate, observe)
 
 
+def test_transcribe_round_trip():
+    import time as _time
+
+    def populate(mod):
+        mod._jobs["job-test"] = {
+            "TranscriptionJobName": "job-test",
+            "TranscriptionJobStatus": "COMPLETED",
+            "LanguageCode": "en-US",
+            "Media": {"MediaFileUri": "s3://media/call.mp3"},
+            "Transcript": {
+                "TranscriptFileUri": "http://localhost:4566/out/job-test.json"
+            },
+            "CreationTime": _time.time(),
+            "StartTime": _time.time(),
+            "CompletionTime": _time.time(),
+            "OutputLocationType": "SERVICE_BUCKET",
+            "_run_id": "run-1",
+            "_output_bucket": "out",
+            "_output_key": "job-test.json",
+        }
+
+    def observe(mod):
+        job = mod._jobs.get("job-test")
+        assert job is not None
+        assert job["TranscriptionJobStatus"] == "COMPLETED"
+        # A completed job's transcript pointer and media reference are what
+        # callers read after a warm boot; losing either leaves GetTranscriptionJob
+        # reporting COMPLETED with nothing to fetch.
+        assert job["Transcript"]["TranscriptFileUri"].endswith("job-test.json")
+        assert job["Media"]["MediaFileUri"] == "s3://media/call.mp3"
+        assert job["_output_bucket"] == "out"
+
+    _round_trip("transcribe", "transcribe", populate, observe)
+
+
+def test_transcribe_jobs_round_trip_outside_boot_region():
+    """Transcribe jobs are region-scoped. `AccountRegionScopedDict.__bool__`
+    is scope-relative, so a snapshot holding jobs only in regions other than
+    the one restore runs in must not be treated as empty."""
+    import time as _time
+
+    from ministack.core.responses import request_scope
+
+    def populate(mod):
+        with request_scope("000000000000", "eu-west-1"):
+            mod._jobs["eu-job"] = {
+                "TranscriptionJobName": "eu-job",
+                "TranscriptionJobStatus": "COMPLETED",
+                "CreationTime": _time.time(),
+                "CompletionTime": _time.time(),
+                "Media": {"MediaFileUri": "s3://b/a.mp3"},
+                "OutputLocationType": "SERVICE_BUCKET",
+                "_output_bucket": "b",
+                "_output_key": "k.json",
+            }
+
+    def observe(mod):
+        with request_scope("000000000000", "eu-west-1"):
+            job = mod._jobs.get("eu-job")
+            assert job is not None, "a job outside the restoring region was dropped"
+            assert job["TranscriptionJobStatus"] == "COMPLETED"
+
+    _round_trip("transcribe", "transcribe", populate, observe)
+
+
+def test_transcribe_round_trip_fails_a_job_left_mid_flight():
+    """A restart leaves no worker behind, so a job restored as QUEUED or
+    IN_PROGRESS would strand every caller polling GetTranscriptionJob."""
+    import time as _time
+
+    def populate(mod):
+        mod._jobs["stuck-job"] = {
+            "TranscriptionJobName": "stuck-job",
+            "TranscriptionJobStatus": "IN_PROGRESS",
+            "CreationTime": _time.time(),
+            "Media": {"MediaFileUri": "s3://b/a.mp3"},
+            "OutputLocationType": "SERVICE_BUCKET",
+            "_output_bucket": "b",
+            "_output_key": "k.json",
+        }
+
+    def observe(mod):
+        job = mod._jobs.get("stuck-job")
+        assert job is not None
+        assert job["TranscriptionJobStatus"] == "FAILED"
+        assert job["CompletionTime"] is not None
+        assert "restart" in job["FailureReason"]
+
+    _round_trip("transcribe", "transcribe", populate, observe)
+
+
 def test_cloudformation_round_trip():
     """CloudFormation stack metadata (stacks, events, exports, change sets)
     survives a PERSIST_STATE stop/restore cycle — otherwise ListStacks /

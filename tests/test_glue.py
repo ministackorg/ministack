@@ -47,11 +47,13 @@ def test_glue_catalog(glue):
     resp = glue.get_table(DatabaseName="test_db", Name="test_table")
     assert resp["Table"]["Name"] == "test_table"
 
+
 def test_glue_list(glue):
     dbs = glue.get_databases()
     assert any(d["Name"] == "test_db" for d in dbs["DatabaseList"])
     tables = glue.get_tables(DatabaseName="test_db")
     assert any(t["Name"] == "test_table" for t in tables["TableList"])
+
 
 def test_glue_job(glue):
     glue.create_job(
@@ -64,6 +66,7 @@ def test_glue_job(glue):
     assert "JobRunId" in resp
     runs = glue.get_job_runs(JobName="test-job")
     assert len(runs["JobRuns"]) == 1
+
 
 def test_glue_crawler(glue):
     glue.create_crawler(
@@ -86,9 +89,7 @@ def test_glue_catalog_jobs_and_crawlers_are_region_scoped():
     crawler_name = "glue-regional-crawler"
 
     def create_resources(client, region):
-        client.create_database(
-            DatabaseInput={"Name": db_name, "Description": region}
-        )
+        client.create_database(DatabaseInput={"Name": db_name, "Description": region})
         client.create_table(
             DatabaseName=db_name,
             TableInput={
@@ -138,47 +139,39 @@ def test_glue_catalog_jobs_and_crawlers_are_region_scoped():
         east_run_id = create_resources(east, "us-east-1")
         west_run_id = create_resources(west, "us-west-2")
 
-        assert [db["Description"] for db in east.get_databases()["DatabaseList"]
-                if db["Name"] == db_name] == ["us-east-1"]
-        assert [db["Description"] for db in west.get_databases()["DatabaseList"]
-                if db["Name"] == db_name] == ["us-west-2"]
-        assert [table["Description"] for table in east.get_tables(
-            DatabaseName=db_name
-        )["TableList"]] == ["us-east-1"]
-        assert [table["Description"] for table in west.get_tables(
-            DatabaseName=db_name
-        )["TableList"]] == ["us-west-2"]
-        assert east.get_partitions(
-            DatabaseName=db_name, TableName=table_name
-        )["Partitions"][0]["Values"] == ["us-east-1"]
-        assert west.get_partitions(
-            DatabaseName=db_name, TableName=table_name
-        )["Partitions"][0]["Values"] == ["us-west-2"]
-        assert [job["Description"] for job in east.get_jobs()["Jobs"]
-                if job["Name"] == job_name] == ["us-east-1"]
-        assert [job["Description"] for job in west.get_jobs()["Jobs"]
-                if job["Name"] == job_name] == ["us-west-2"]
-        assert [run["Id"] for run in east.get_job_runs(JobName=job_name)["JobRuns"]] == [
-            east_run_id
+        assert [db["Description"] for db in east.get_databases()["DatabaseList"] if db["Name"] == db_name] == [
+            "us-east-1"
         ]
-        assert [run["Id"] for run in west.get_job_runs(JobName=job_name)["JobRuns"]] == [
-            west_run_id
+        assert [db["Description"] for db in west.get_databases()["DatabaseList"] if db["Name"] == db_name] == [
+            "us-west-2"
         ]
-        assert [crawler["Description"] for crawler in east.get_crawlers()["Crawlers"]
-                if crawler["Name"] == crawler_name] == ["us-east-1"]
-        assert [crawler["Description"] for crawler in west.get_crawlers()["Crawlers"]
-                if crawler["Name"] == crawler_name] == ["us-west-2"]
+        assert [table["Description"] for table in east.get_tables(DatabaseName=db_name)["TableList"]] == ["us-east-1"]
+        assert [table["Description"] for table in west.get_tables(DatabaseName=db_name)["TableList"]] == ["us-west-2"]
+        assert east.get_partitions(DatabaseName=db_name, TableName=table_name)["Partitions"][0]["Values"] == [
+            "us-east-1"
+        ]
+        assert west.get_partitions(DatabaseName=db_name, TableName=table_name)["Partitions"][0]["Values"] == [
+            "us-west-2"
+        ]
+        assert [job["Description"] for job in east.get_jobs()["Jobs"] if job["Name"] == job_name] == ["us-east-1"]
+        assert [job["Description"] for job in west.get_jobs()["Jobs"] if job["Name"] == job_name] == ["us-west-2"]
+        assert [run["Id"] for run in east.get_job_runs(JobName=job_name)["JobRuns"]] == [east_run_id]
+        assert [run["Id"] for run in west.get_job_runs(JobName=job_name)["JobRuns"]] == [west_run_id]
+        assert [
+            crawler["Description"] for crawler in east.get_crawlers()["Crawlers"] if crawler["Name"] == crawler_name
+        ] == ["us-east-1"]
+        assert [
+            crawler["Description"] for crawler in west.get_crawlers()["Crawlers"] if crawler["Name"] == crawler_name
+        ] == ["us-west-2"]
 
         east.delete_database(Name=db_name)
         with pytest.raises(ClientError) as exc:
             east.get_database(Name=db_name)
         assert exc.value.response["Error"]["Code"] == "EntityNotFoundException"
-        assert west.get_table(DatabaseName=db_name, Name=table_name)["Table"][
-            "Description"
-        ] == "us-west-2"
-        assert west.get_partitions(
-            DatabaseName=db_name, TableName=table_name
-        )["Partitions"][0]["Values"] == ["us-west-2"]
+        assert west.get_table(DatabaseName=db_name, Name=table_name)["Table"]["Description"] == "us-west-2"
+        assert west.get_partitions(DatabaseName=db_name, TableName=table_name)["Partitions"][0]["Values"] == [
+            "us-west-2"
+        ]
     finally:
         for client in (east, west):
             for operation, kwargs in (
@@ -191,6 +184,7 @@ def test_glue_catalog_jobs_and_crawlers_are_region_scoped():
                 except ClientError:
                     pass
 
+
 def test_glue_database_location_uri(glue):
     glue.create_database(DatabaseInput={"Name": "db_no_location"})
     resp = glue.get_database(Name="db_no_location")
@@ -199,6 +193,7 @@ def test_glue_database_location_uri(glue):
     glue.create_database(DatabaseInput={"Name": "db_with_location", "LocationUri": "s3://my-bucket/warehouse/"})
     resp = glue.get_database(Name="db_with_location")
     assert resp["Database"]["LocationUri"] == "s3://my-bucket/warehouse/"
+
 
 def test_glue_database_v2(glue):
     glue.create_database(DatabaseInput={"Name": "glue_db_v2", "Description": "v2 DB"})
@@ -217,6 +212,7 @@ def test_glue_database_v2(glue):
     with pytest.raises(ClientError) as exc:
         glue.get_database(Name="glue_db_v2")
     assert exc.value.response["Error"]["Code"] == "EntityNotFoundException"
+
 
 def test_glue_table_v2(glue):
     glue.create_database(DatabaseInput={"Name": "glue_tbl_v2db"})
@@ -253,6 +249,7 @@ def test_glue_table_v2(glue):
         glue.get_table(DatabaseName="glue_tbl_v2db", Name="tbl_v2")
     assert exc.value.response["Error"]["Code"] == "EntityNotFoundException"
 
+
 def test_glue_view_original_text_roundtrip(glue):
     glue.create_database(DatabaseInput={"Name": "glue_view_db"})
     original = "/* Presto View: eyJjYXRhbG9nIjoiaWNlYmVyZyJ9 */"
@@ -282,6 +279,7 @@ def test_glue_view_original_text_roundtrip(glue):
     resp2 = glue.get_table(DatabaseName="glue_view_db", Name="vw_x")
     assert resp2["Table"]["ViewOriginalText"] == original + " v2"
     assert resp2["Table"]["ViewExpandedText"] == expanded + " v2"
+
 
 def test_glue_list_v2(glue):
     glue.create_database(DatabaseInput={"Name": "glue_lst_v2db"})
@@ -318,6 +316,7 @@ def test_glue_list_v2(glue):
     assert "lt_a" in names
     assert "lt_b" in names
 
+
 def test_glue_job_v2(glue):
     glue.create_job(
         Name="glue-job-v2",
@@ -339,6 +338,7 @@ def test_glue_job_v2(glue):
     runs = glue.get_job_runs(JobName="glue-job-v2")["JobRuns"]
     assert any(r["Id"] == run_id for r in runs)
 
+
 def test_glue_crawler_v2(glue):
     glue.create_database(DatabaseInput={"Name": "glue_cr_v2db"})
     glue.create_crawler(
@@ -354,6 +354,7 @@ def test_glue_crawler_v2(glue):
     glue.start_crawler(Name="glue-cr-v2")
     cr2 = glue.get_crawler(Name="glue-cr-v2")["Crawler"]
     assert cr2["State"] == "RUNNING"
+
 
 def test_glue_tags_v2(glue):
     glue.create_database(DatabaseInput={"Name": "glue_tag_v2db"})
@@ -422,9 +423,7 @@ def test_glue_tag_resource_accepts_supported_arn_shapes(resource):
         set_request_account_id("000000000000")
         set_request_region("us-east-1")
 
-        status, body = _glue_json(
-            _glue._tag_resource({"ResourceArn": arn, "TagsToAdd": {"env": "test"}})
-        )
+        status, body = _glue_json(_glue._tag_resource({"ResourceArn": arn, "TagsToAdd": {"env": "test"}}))
         assert status == 200
         assert body == {}
 
@@ -501,6 +500,7 @@ def test_glue_create_database_persists_tags(glue):
     tags = glue.get_tags(ResourceArn=arn)["Tags"]
     assert tags == {"env": "prod", "owner": "data-platform"}
 
+
 def test_glue_partition_v2(glue):
     glue.create_database(DatabaseInput={"Name": "glue_part_v2db"})
     glue.create_table(
@@ -558,6 +558,7 @@ def test_glue_partition_v2(glue):
     parts = glue.get_partitions(DatabaseName="glue_part_v2db", TableName="ptbl_v2")
     assert len(parts["Partitions"]) == 2
 
+
 def test_glue_connection_v2(glue):
     glue.create_connection(
         ConnectionInput={
@@ -582,6 +583,7 @@ def test_glue_connection_v2(glue):
         glue.get_connection(Name="glue-conn-v2")
     assert exc.value.response["Error"]["Code"] == "EntityNotFoundException"
 
+
 def test_glue_trigger(glue):
     glue.create_trigger(Name="test-trig", Type="ON_DEMAND", Actions=[{"JobName": "nonexistent-job"}])
     resp = glue.get_trigger(Name="test-trig")
@@ -595,6 +597,7 @@ def test_glue_trigger(glue):
     assert resp3["Trigger"]["State"] == "DEACTIVATED"
     glue.delete_trigger(Name="test-trig")
 
+
 def test_glue_workflow(glue):
     glue.create_workflow(Name="test-wf", Description="Test workflow")
     resp = glue.get_workflow(Name="test-wf")
@@ -602,6 +605,7 @@ def test_glue_workflow(glue):
     run = glue.start_workflow_run(Name="test-wf")
     assert "RunId" in run
     glue.delete_workflow(Name="test-wf")
+
 
 def test_glue_partition_crud(glue):
     """CreatePartition / GetPartition / GetPartitions / DeletePartition."""
@@ -650,6 +654,7 @@ def test_glue_partition_crud(glue):
     parts2 = glue.get_partitions(DatabaseName="qa-glue-partdb", TableName="qa-glue-parttbl")["Partitions"]
     assert len(parts2) == 0
 
+
 def test_glue_duplicate_partition_error(glue):
     """CreatePartition with duplicate values raises AlreadyExistsException."""
     glue.create_database(DatabaseInput={"Name": "qa-glue-duppartdb"})
@@ -695,6 +700,7 @@ def test_glue_duplicate_partition_error(glue):
 # BatchDeleteTable
 # ---------------------------------------------------------------------------
 
+
 def test_glue_batch_delete_table(glue):
     db = "qa-bdt-db"
     glue.create_database(DatabaseInput={"Name": db})
@@ -729,6 +735,7 @@ def test_glue_batch_delete_table(glue):
 # ---------------------------------------------------------------------------
 # BatchGetPartition
 # ---------------------------------------------------------------------------
+
 
 def test_glue_batch_get_partition(glue):
     db = "qa-bgp-db"
@@ -783,6 +790,7 @@ def test_glue_batch_get_partition(glue):
 # ---------------------------------------------------------------------------
 # BatchCreatePartition
 # ---------------------------------------------------------------------------
+
 
 def test_glue_batch_create_partition(glue):
     db = "qa-bcp-db"
@@ -858,6 +866,7 @@ def test_glue_batch_create_partition(glue):
 # ---------------------------------------------------------------------------
 # BatchUpdatePartition
 # ---------------------------------------------------------------------------
+
 
 def test_glue_batch_update_partition(glue):
     db = "qa-bup-db"
@@ -967,6 +976,7 @@ def test_glue_batch_update_partition(glue):
 # GetCrawlerMetrics
 # ---------------------------------------------------------------------------
 
+
 def test_glue_get_crawler_metrics(glue):
     name = "qa-metrics-cr"
     glue.create_crawler(
@@ -988,6 +998,7 @@ def test_glue_get_crawler_metrics(glue):
 # UpdateCrawler
 # ---------------------------------------------------------------------------
 
+
 def test_glue_update_crawler(glue):
     name = "qa-upd-cr"
     glue.create_crawler(
@@ -1008,6 +1019,7 @@ def test_glue_update_crawler(glue):
 # ---------------------------------------------------------------------------
 # StopCrawler
 # ---------------------------------------------------------------------------
+
 
 def test_glue_stop_crawler(glue):
     name = "qa-stop-cr"
@@ -1034,6 +1046,7 @@ def test_glue_stop_crawler(glue):
 # ---------------------------------------------------------------------------
 # CreateJob / DeleteJob / GetJobs / UpdateJob
 # ---------------------------------------------------------------------------
+
 
 def test_glue_create_delete_job(glue):
     name = "qa-cd-job"
@@ -1095,6 +1108,7 @@ def test_glue_update_job(glue):
 # BatchStopJobRun
 # ---------------------------------------------------------------------------
 
+
 def test_glue_batch_stop_job_run(glue):
     name = "qa-bsjr-job"
     glue.create_job(
@@ -1133,6 +1147,7 @@ def test_glue_batch_stop_job_run(glue):
 # SecurityConfigurations (Create / Delete / Get / GetAll)
 # ---------------------------------------------------------------------------
 
+
 def test_glue_security_configuration_crud(glue):
     name = "qa-sec-cfg"
     resp = glue.create_security_configuration(
@@ -1170,6 +1185,7 @@ def test_glue_security_configuration_duplicate(glue):
 # ---------------------------------------------------------------------------
 # Classifiers (Create / Get / GetAll / Delete)
 # ---------------------------------------------------------------------------
+
 
 def test_glue_classifier_crud(glue):
     name = "qa-cls-grok"
@@ -1224,6 +1240,7 @@ def test_glue_classifier_duplicate(glue):
 # BatchGetTriggers
 # ---------------------------------------------------------------------------
 
+
 def test_glue_batch_get_triggers(glue):
     names = ["qa-bgt-a", "qa-bgt-b"]
     for n in names:
@@ -1241,6 +1258,7 @@ def test_glue_batch_get_triggers(glue):
 # ---------------------------------------------------------------------------
 # GetTriggers
 # ---------------------------------------------------------------------------
+
 
 def test_glue_get_triggers(glue):
     names = ["qa-gt-x", "qa-gt-y"]
@@ -1264,6 +1282,7 @@ def test_glue_get_triggers(glue):
 # UpdateWorkflow
 # ---------------------------------------------------------------------------
 
+
 def test_glue_update_workflow(glue):
     name = "qa-upd-wf"
     glue.create_workflow(Name=name, Description="orig")
@@ -1283,6 +1302,7 @@ def test_glue_update_workflow(glue):
 # ---------------------------------------------------------------------------
 # CreatePartitionIndex / GetPartitionIndexes
 # ---------------------------------------------------------------------------
+
 
 def test_glue_partition_indexes(glue):
     db = "qa-pidx-db"
@@ -1329,11 +1349,13 @@ def test_glue_partition_indexes(glue):
 
 # ── Spark job image selection (1.3.50) ─────────────────────
 
+
 def test_glue_spark_skips_docker_when_image_missing(glue):
     """glueetl job falls back to subprocess when the Spark Docker image is not pulled.
     The job should not crash MiniStack — it either runs via subprocess (and fails
     on pyspark import) or stubs as SUCCEEDED if the script can't be resolved."""
     import time
+
     job_name = "test-spark-no-image"
     try:
         glue.delete_job(JobName=job_name)
@@ -1358,9 +1380,10 @@ def test_glue_spark_skips_docker_when_image_missing(glue):
 
     # Script can't be resolved (nonexistent S3 path) so it should stub as SUCCEEDED
     # The key assertion: it does NOT hang or crash — it reaches a terminal state
-    assert run["JobRunState"] in ("SUCCEEDED", "FAILED"), (
-        f"Job should reach terminal state without Docker image. Got: {run['JobRunState']}"
-    )
+    assert run["JobRunState"] in (
+        "SUCCEEDED",
+        "FAILED",
+    ), f"Job should reach terminal state without Docker image. Got: {run['JobRunState']}"
 
 
 def test_glue_spark_image_for_version_maps_to_official_aws_image():
@@ -1618,16 +1641,18 @@ def test_glue_start_job_run_resolves_script_in_worker_thread(tmp_path, monkeypat
         s3mod._persist_object("glue-scripts", "etl/main.py", b"print('ok')\n")
         persisted = s3mod._object_disk_path("glue-scripts", "etl/main.py")
 
-        gluemod._create_job({
-            "Name": "ctx-job",
-            "Command": {"Name": "pythonshell", "ScriptLocation": "s3://glue-scripts/etl/main.py"},
-        })
+        gluemod._create_job(
+            {
+                "Name": "ctx-job",
+                "Command": {"Name": "pythonshell", "ScriptLocation": "s3://glue-scripts/etl/main.py"},
+            }
+        )
         gluemod._start_job_run({"JobName": "ctx-job"})
 
         assert done.wait(5), "worker thread never invoked _resolve_script"
-        assert captured["account"] == account, (
-            f"worker ran under {captured.get('account')!r}, not caller account {account!r}"
-        )
+        assert (
+            captured["account"] == account
+        ), f"worker ran under {captured.get('account')!r}, not caller account {account!r}"
         assert captured["region"] == region
         assert captured["resolved"] is not None
         assert os.path.samefile(captured["resolved"], persisted)
@@ -1660,11 +1685,13 @@ def test_glue_crawler_completes_for_non_default_account(monkeypatch):
     region_token = respmod._request_region.set(region)
     try:
         gluemod._crawlers.pop_scoped(account, region, name, None)
-        gluemod._create_crawler({
-            "Name": name,
-            "Role": "arn:aws:iam::555555555555:role/GlueRole",
-            "Targets": {"S3Targets": [{"Path": "s3://b/data/"}]},
-        })
+        gluemod._create_crawler(
+            {
+                "Name": name,
+                "Role": "arn:aws:iam::555555555555:role/GlueRole",
+                "Targets": {"S3Targets": [{"Path": "s3://b/data/"}]},
+            }
+        )
         gluemod._start_crawler({"Name": name})
         assert gluemod._crawlers[name]["State"] == "RUNNING"
 
@@ -1673,9 +1700,9 @@ def test_glue_crawler_completes_for_non_default_account(monkeypatch):
         while time.time() < deadline and gluemod._crawlers[name]["State"] != "READY":
             time.sleep(0.05)
 
-        assert gluemod._crawlers[name]["State"] == "READY", (
-            "crawler stuck in RUNNING — finish timer ran under the wrong account"
-        )
+        assert (
+            gluemod._crawlers[name]["State"] == "READY"
+        ), "crawler stuck in RUNNING — finish timer ran under the wrong account"
         last_crawl = gluemod._crawlers[name]["LastCrawl"]
         assert last_crawl is not None and last_crawl["Status"] == "SUCCEEDED"
     finally:
@@ -1705,9 +1732,7 @@ def test_glue_legacy_account_scoped_state_falls_back_to_ambient_region():
         return store
 
     state = {
-        "databases": legacy_store(
-            "legacy-db", {"Name": "legacy-db", "CatalogId": account}
-        ),
+        "databases": legacy_store("legacy-db", {"Name": "legacy-db", "CatalogId": account}),
         "tables": legacy_store(
             "legacy-db/legacy-table",
             {
@@ -1716,12 +1741,7 @@ def test_glue_legacy_account_scoped_state_falls_back_to_ambient_region():
                 "CatalogId": account,
                 "StorageDescriptor": {
                     "SchemaReference": {
-                        "SchemaId": {
-                            "SchemaArn": (
-                                "arn:aws:glue:us-west-2:123456789012:"
-                                "schema/registry/schema"
-                            )
-                        }
+                        "SchemaId": {"SchemaArn": ("arn:aws:glue:us-west-2:123456789012:" "schema/registry/schema")}
                     }
                 },
             },
@@ -1743,9 +1763,7 @@ def test_glue_legacy_account_scoped_state_falls_back_to_ambient_region():
                 {
                     "Id": "legacy-run",
                     "JobName": "legacy-job",
-                    "Arguments": {
-                        "--key": "arn:aws:kms:us-west-2:123456789012:key/legacy"
-                    },
+                    "Arguments": {"--key": "arn:aws:kms:us-west-2:123456789012:key/legacy"},
                 }
             ],
         ),
@@ -1756,18 +1774,10 @@ def test_glue_legacy_account_scoped_state_falls_back_to_ambient_region():
         set_request_region(region)
         gluemod.restore_state(state)
 
-        assert gluemod._databases.get_scoped(account, region, "legacy-db")[
-            "Name"
-        ] == "legacy-db"
-        assert gluemod._tables.get_scoped(
-            account, region, "legacy-db/legacy-table"
-        )["Name"] == "legacy-table"
-        assert gluemod._partitions.get_scoped(
-            account, region, "legacy-db/legacy-table"
-        )[0]["Values"] == ["legacy"]
-        assert gluemod._job_runs.get_scoped(account, region, "legacy-job")[0][
-            "Id"
-        ] == "legacy-run"
+        assert gluemod._databases.get_scoped(account, region, "legacy-db")["Name"] == "legacy-db"
+        assert gluemod._tables.get_scoped(account, region, "legacy-db/legacy-table")["Name"] == "legacy-table"
+        assert gluemod._partitions.get_scoped(account, region, "legacy-db/legacy-table")[0]["Values"] == ["legacy"]
+        assert gluemod._job_runs.get_scoped(account, region, "legacy-job")[0]["Id"] == "legacy-run"
 
         for store, key in (
             (gluemod._databases, "legacy-db"),
@@ -1787,17 +1797,13 @@ def test_glue_reset_clears_every_store_across_regions():
     from ministack.services import glue as gluemod
 
     account = "123456789012"
-    regional_stores = {
-        key: store for key, store in gluemod._ALL_STATE.items() if key != "tags"
-    }
+    regional_stores = {key: store for key, store in gluemod._ALL_STATE.items() if key != "tags"}
     assert len(regional_stores) == 16
 
     for index, store in enumerate(regional_stores.values()):
         store.set_scoped(account, "us-east-1", f"east-{index}", {"scope": "east"})
         store.set_scoped(account, "us-west-2", f"west-{index}", {"scope": "west"})
-    gluemod._tags._data[
-        (account, "arn:aws:glue:us-east-1:123456789012:database/tagged")
-    ] = {"team": "platform"}
+    gluemod._tags._data[(account, "arn:aws:glue:us-east-1:123456789012:database/tagged")] = {"team": "platform"}
 
     gluemod.reset()
 
@@ -1841,6 +1847,7 @@ def test_glue_resolve_script_isolated_per_account(tmp_path, monkeypatch):
 
 
 # ---- Column Statistics ----
+
 
 def _make_int_column_stats(column_name):
     return {
@@ -1886,28 +1893,37 @@ def test_glue_column_statistics_for_table_crud(glue):
     stats_id = _make_int_column_stats("id")
     stats_amount = _make_int_column_stats("amount")
     upd = glue.update_column_statistics_for_table(
-        DatabaseName=db, TableName=table,
+        DatabaseName=db,
+        TableName=table,
         ColumnStatisticsList=[stats_id, stats_amount],
     )
     assert upd.get("Errors", []) == []
 
     got = glue.get_column_statistics_for_table(
-        DatabaseName=db, TableName=table, ColumnNames=["id", "amount"],
+        DatabaseName=db,
+        TableName=table,
+        ColumnNames=["id", "amount"],
     )
     assert {s["ColumnName"] for s in got["ColumnStatisticsList"]} == {"id", "amount"}
     assert got.get("Errors", []) == []
 
     missing = glue.get_column_statistics_for_table(
-        DatabaseName=db, TableName=table, ColumnNames=["id", "missing"],
+        DatabaseName=db,
+        TableName=table,
+        ColumnNames=["id", "missing"],
     )
     assert [s["ColumnName"] for s in missing["ColumnStatisticsList"]] == ["id"]
     assert missing["Errors"][0]["ColumnName"] == "missing"
 
     glue.delete_column_statistics_for_table(
-        DatabaseName=db, TableName=table, ColumnName="id",
+        DatabaseName=db,
+        TableName=table,
+        ColumnName="id",
     )
     after = glue.get_column_statistics_for_table(
-        DatabaseName=db, TableName=table, ColumnNames=["id", "amount"],
+        DatabaseName=db,
+        TableName=table,
+        ColumnNames=["id", "amount"],
     )
     assert [s["ColumnName"] for s in after["ColumnStatisticsList"]] == ["amount"]
 
@@ -1915,7 +1931,9 @@ def test_glue_column_statistics_for_table_crud(glue):
 def test_glue_column_statistics_for_table_missing_table(glue):
     with pytest.raises(ClientError) as exc:
         glue.get_column_statistics_for_table(
-            DatabaseName="nope-db", TableName="nope-tbl", ColumnNames=["id"],
+            DatabaseName="nope-db",
+            TableName="nope-tbl",
+            ColumnNames=["id"],
         )
     assert exc.value.response["Error"]["Code"] == "EntityNotFoundException"
 
@@ -1926,7 +1944,9 @@ def test_glue_delete_column_statistics_for_table_unknown_column_is_idempotent(gl
     # Real AWS Glue returns 200 / empty body when deleting stats for a column
     # that never had any — Delete* operations are idempotent.
     glue.delete_column_statistics_for_table(
-        DatabaseName=db, TableName=table, ColumnName="never-set",
+        DatabaseName=db,
+        TableName=table,
+        ColumnName="never-set",
     )
 
 
@@ -1934,7 +1954,8 @@ def test_glue_column_statistics_cleared_on_table_delete(glue):
     db, table = "qa-glue-colstats-cleanup-db", "qa-glue-colstats-cleanup"
     _setup_stats_table(glue, db, table)
     glue.update_column_statistics_for_table(
-        DatabaseName=db, TableName=table,
+        DatabaseName=db,
+        TableName=table,
         ColumnStatisticsList=[_make_int_column_stats("id")],
     )
     glue.delete_table(DatabaseName=db, Name=table)
@@ -1947,12 +1968,16 @@ def test_glue_column_statistics_cleared_on_table_delete(glue):
             "StorageDescriptor": {
                 "Columns": [{"Name": "id", "Type": "int"}],
                 "Location": f"s3://bucket/{db}/{table}/",
-                "InputFormat": "", "OutputFormat": "", "SerdeInfo": {},
+                "InputFormat": "",
+                "OutputFormat": "",
+                "SerdeInfo": {},
             },
         },
     )
     got = glue.get_column_statistics_for_table(
-        DatabaseName=db, TableName=table, ColumnNames=["id"],
+        DatabaseName=db,
+        TableName=table,
+        ColumnNames=["id"],
     )
     assert got["ColumnStatisticsList"] == []
     assert got["Errors"][0]["ColumnName"] == "id"
@@ -1962,12 +1987,16 @@ def test_glue_column_statistics_for_partition_crud(glue):
     db, table = "qa-glue-colstats-part-db", "qa-glue-colstats-part"
     _setup_stats_table(glue, db, table, partitioned=True)
     glue.create_partition(
-        DatabaseName=db, TableName=table,
+        DatabaseName=db,
+        TableName=table,
         PartitionInput={
             "Values": ["2024-01-01"],
             "StorageDescriptor": {
-                "Columns": [], "Location": f"s3://bucket/{db}/{table}/dt=2024-01-01",
-                "InputFormat": "", "OutputFormat": "", "SerdeInfo": {},
+                "Columns": [],
+                "Location": f"s3://bucket/{db}/{table}/dt=2024-01-01",
+                "InputFormat": "",
+                "OutputFormat": "",
+                "SerdeInfo": {},
             },
         },
     )
@@ -1975,25 +2004,32 @@ def test_glue_column_statistics_for_partition_crud(glue):
     stats_id = _make_int_column_stats("id")
     stats_amount = _make_int_column_stats("amount")
     upd = glue.update_column_statistics_for_partition(
-        DatabaseName=db, TableName=table,
+        DatabaseName=db,
+        TableName=table,
         PartitionValues=["2024-01-01"],
         ColumnStatisticsList=[stats_id, stats_amount],
     )
     assert upd.get("Errors", []) == []
 
     got = glue.get_column_statistics_for_partition(
-        DatabaseName=db, TableName=table,
-        PartitionValues=["2024-01-01"], ColumnNames=["id", "amount"],
+        DatabaseName=db,
+        TableName=table,
+        PartitionValues=["2024-01-01"],
+        ColumnNames=["id", "amount"],
     )
     assert {s["ColumnName"] for s in got["ColumnStatisticsList"]} == {"id", "amount"}
 
     glue.delete_column_statistics_for_partition(
-        DatabaseName=db, TableName=table,
-        PartitionValues=["2024-01-01"], ColumnName="amount",
+        DatabaseName=db,
+        TableName=table,
+        PartitionValues=["2024-01-01"],
+        ColumnName="amount",
     )
     after = glue.get_column_statistics_for_partition(
-        DatabaseName=db, TableName=table,
-        PartitionValues=["2024-01-01"], ColumnNames=["id", "amount"],
+        DatabaseName=db,
+        TableName=table,
+        PartitionValues=["2024-01-01"],
+        ColumnNames=["id", "amount"],
     )
     assert [s["ColumnName"] for s in after["ColumnStatisticsList"]] == ["id"]
     assert after["Errors"][0]["ColumnName"] == "amount"
@@ -2004,7 +2040,8 @@ def test_glue_column_statistics_for_partition_missing_partition(glue):
     _setup_stats_table(glue, db, table, partitioned=True)
     with pytest.raises(ClientError) as exc:
         glue.update_column_statistics_for_partition(
-            DatabaseName=db, TableName=table,
+            DatabaseName=db,
+            TableName=table,
             PartitionValues=["never"],
             ColumnStatisticsList=[_make_int_column_stats("id")],
         )
@@ -2032,9 +2069,7 @@ def _svc(name):
 
 
 def _call(method, path, query_params=None):
-    status, headers, body = asyncio.run(
-        _svc("glue").handle_request(method, path, {}, b"", query_params or {})
-    )
+    status, headers, body = asyncio.run(_svc("glue").handle_request(method, path, {}, b"", query_params or {}))
     payload = json.loads(body) if body else None
     return status, headers, payload
 
@@ -2084,9 +2119,7 @@ def test_s3tables_signed_iceberg_request_still_routes_to_s3tables():
 
 
 def test_config_returns_glue_catalogs_prefix_and_s3_overrides():
-    status, headers, payload = _call(
-        "GET", "/iceberg/v1/config", {"warehouse": ["000000000000"]}
-    )
+    status, headers, payload = _call("GET", "/iceberg/v1/config", {"warehouse": ["000000000000"]})
     assert status == 200
     assert headers["Content-Type"] == "application/json"
     # Glue's prefix shape — subsequent client URLs become
@@ -2120,18 +2153,14 @@ def test_list_namespaces_returns_glue_databases():
 
 
 def test_get_namespace_404s_when_database_missing():
-    status, _, payload = _call(
-        "GET", "/iceberg/v1/catalogs/000000000000/namespaces/nope"
-    )
+    status, _, payload = _call("GET", "/iceberg/v1/catalogs/000000000000/namespaces/nope")
     assert status == 404
     assert payload["error"]["type"] == "NoSuchNamespaceException"
 
 
 def test_get_namespace_returns_shape_when_database_exists():
     _svc("glue")._databases["db"] = {"Name": "db"}
-    status, _, payload = _call(
-        "GET", "/iceberg/v1/catalogs/000000000000/namespaces/db"
-    )
+    status, _, payload = _call("GET", "/iceberg/v1/catalogs/000000000000/namespaces/db")
     assert status == 200
     assert payload == {"namespace": ["db"], "properties": {}}
 
@@ -2142,9 +2171,7 @@ def test_get_namespace_returns_shape_when_database_exists():
 def test_list_tables_404s_when_namespace_missing():
     """Real Iceberg REST returns NoSuchNamespaceException for ListTables on
     an unknown namespace — not an empty 200 list."""
-    status, _, payload = _call(
-        "GET", "/iceberg/v1/catalogs/000000000000/namespaces/nope/tables"
-    )
+    status, _, payload = _call("GET", "/iceberg/v1/catalogs/000000000000/namespaces/nope/tables")
     assert status == 404
     assert payload["error"]["type"] == "NoSuchNamespaceException"
 
@@ -2159,11 +2186,11 @@ def test_list_tables_hides_non_iceberg_glue_tables():
         "Parameters": {"metadata_location": "s3://lake/t/metadata/v0.metadata.json"},
     }
     _svc("glue")._tables["db/csv_table"] = {
-        "Name": "csv_table", "DatabaseName": "db", "Parameters": {},
+        "Name": "csv_table",
+        "DatabaseName": "db",
+        "Parameters": {},
     }
-    _, _, payload = _call(
-        "GET", "/iceberg/v1/catalogs/000000000000/namespaces/db/tables"
-    )
+    _, _, payload = _call("GET", "/iceberg/v1/catalogs/000000000000/namespaces/db/tables")
     assert [t["name"] for t in payload["identifiers"]] == ["iceberg_table"]
     assert payload["identifiers"][0]["namespace"] == ["db"]
 
@@ -2215,9 +2242,7 @@ def test_load_table_404s_when_metadata_object_missing():
         "DatabaseName": "db",
         "Parameters": {"metadata_location": "s3://lake/orphan/metadata/v0.metadata.json"},
     }
-    status, _, payload = _call(
-        "GET", "/iceberg/v1/catalogs/000000000000/namespaces/db/tables/orphan"
-    )
+    status, _, payload = _call("GET", "/iceberg/v1/catalogs/000000000000/namespaces/db/tables/orphan")
     assert status == 404
     assert payload["error"]["type"] == "NoSuchTableException"
     assert payload["error"]["code"] == 404
@@ -2232,17 +2257,13 @@ def test_load_table_404s_when_metadata_json_unparseable():
         "DatabaseName": "db",
         "Parameters": {"metadata_location": f"s3://lake/{key}"},
     }
-    status, _, payload = _call(
-        "GET", "/iceberg/v1/catalogs/000000000000/namespaces/db/tables/broken"
-    )
+    status, _, payload = _call("GET", "/iceberg/v1/catalogs/000000000000/namespaces/db/tables/broken")
     assert status == 404
     assert payload["error"]["type"] == "NoSuchTableException"
 
 
 def test_load_table_404s_on_unknown_table():
-    status, _, payload = _call(
-        "GET", "/iceberg/v1/catalogs/000000000000/namespaces/db/tables/missing"
-    )
+    status, _, payload = _call("GET", "/iceberg/v1/catalogs/000000000000/namespaces/db/tables/missing")
     assert status == 404
     assert payload["error"]["type"] == "NoSuchTableException"
 
@@ -2250,9 +2271,7 @@ def test_load_table_404s_on_unknown_table():
 def test_load_table_404s_on_non_iceberg_table():
     _svc("glue")._databases["db"] = {"Name": "db"}
     _svc("glue")._tables["db/csv"] = {"Name": "csv", "DatabaseName": "db", "Parameters": {}}
-    status, _, payload = _call(
-        "GET", "/iceberg/v1/catalogs/000000000000/namespaces/db/tables/csv"
-    )
+    status, _, payload = _call("GET", "/iceberg/v1/catalogs/000000000000/namespaces/db/tables/csv")
     assert status == 404
 
 
@@ -2271,31 +2290,105 @@ def test_head_returns_200_for_iceberg_table():
 def test_head_returns_404_for_non_iceberg_table():
     _svc("glue")._databases["db"] = {"Name": "db"}
     _svc("glue")._tables["db/csv"] = {"Name": "csv", "DatabaseName": "db", "Parameters": {}}
-    status, _, _ = _call(
-        "HEAD", "/iceberg/v1/catalogs/000000000000/namespaces/db/tables/csv"
-    )
+    status, _, _ = _call("HEAD", "/iceberg/v1/catalogs/000000000000/namespaces/db/tables/csv")
     assert status == 404
 
 
 # ── Fall-throughs ────────────────────────────────────────────
 
 
-def test_post_to_table_returns_501_unsupported():
-    """Read-only surface: writes get an explicit 501 envelope instead of a
-    silent success that never persisted anything."""
-    status, _, payload = _call(
-        "POST", "/iceberg/v1/catalogs/000000000000/namespaces/db/tables/t"
+def test_commit_to_missing_table_returns_no_such_table():
+    """The Glue Data Catalog Iceberg REST catalog is writable (Firehose and
+    Glue jobs commit through it), so a POST is a real commit rather than a
+    blanket 501. A commit against a table that does not exist returns
+    NoSuchTableException, not a silent success."""
+    status, _, payload = _call("POST", "/iceberg/v1/catalogs/000000000000/namespaces/db/tables/t")
+    assert status == 404
+    assert payload["error"]["type"] == "NoSuchTableException"
+
+
+def _call_body(method, path, body=None):
+    raw = json.dumps(body).encode() if body is not None else b""
+    status, _headers, resp = asyncio.run(_svc("glue").handle_request(method, path, {}, raw, {}))
+    return status, (json.loads(resp) if resp else None)
+
+
+_GLUE_ICEBERG_CATALOG = "arn:aws:glue:us-east-1:000000000000:catalog"
+_GLUE_ICEBERG_PREFIX = f"catalogs/{_GLUE_ICEBERG_CATALOG}"
+
+
+def test_iceberg_rest_create_commit_load_shares_glue_catalog():
+    """A table created and committed through the Glue Data Catalog Iceberg REST
+    catalog (Firehose's write path) is a real Glue table the Glue API — and thus
+    a Spark job's GlueCatalog — sees. This shared store is what lets Firehose
+    and Glue jobs converge on one table."""
+    _svc("glue")._create_database({"DatabaseInput": {"Name": "lake"}})
+    status, _ = _call_body(
+        "POST",
+        f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/namespaces/lake/tables",
+        {"name": "orders", "schema": {"type": "struct", "schema-id": 0,
+            "fields": [{"id": 1, "name": "id", "required": False, "type": "int"}]}},
     )
-    assert status == 501
-    assert payload["error"]["type"] == "UnsupportedOperationException"
+    assert status == 200
+    # Same store as the Glue API: it is a real Glue Iceberg table.
+    table = _svc("glue")._tables["lake/orders"]
+    assert table["Parameters"]["table_type"] == "ICEBERG"
+    assert table["TableType"] == "EXTERNAL_TABLE"
+    # Commit a snapshot (what DuckDB does after writing data files).
+    status, doc = _call_body(
+        "POST",
+        f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/namespaces/lake/tables/orders",
+        {"updates": [
+            {"action": "add-snapshot", "snapshot": {"snapshot-id": 42, "sequence-number": 1,
+                "timestamp-ms": 1, "manifest-list": "s3://x/m.avro", "summary": {"operation": "append"}}},
+            {"action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": 42}]},
+    )
+    assert status == 200
+    assert doc["metadata"]["current-snapshot-id"] == 42
+    # loadTable reflects the committed snapshot.
+    status, doc = _call_body("GET", f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/namespaces/lake/tables/orders")
+    assert status == 200
+    assert doc["metadata"]["current-snapshot-id"] == 42
+
+
+def test_iceberg_rest_loads_table_written_with_s3a_scheme():
+    """Spark's S3FileIO records the metadata location with the ``s3a://`` scheme
+    (a Glue job writing via GlueCatalog). The REST catalog must read that — the
+    same MiniStack object as ``s3://`` — so a Glue-job-written table is loadable
+    by Firehose's DuckDB. Regression for the last convergence gap."""
+    _svc("glue")._create_database({"DatabaseInput": {"Name": "lake"}})
+    from ministack.services import s3tables as _s3t
+
+    meta = _s3t._initial_iceberg_metadata(
+        "orders", [{"name": "id", "type": "int"}], "s3a://ministack-glue-warehouse/lake.db/orders")
+    key = "lake.db/orders/metadata/00000-x.metadata.json"
+    _svc("s3")._buckets["ministack-glue-warehouse"] = {"objects": {key: {"body": json.dumps(meta).encode()}}}
+    _svc("glue")._tables["lake/orders"] = {
+        "Name": "orders", "DatabaseName": "lake", "TableType": "EXTERNAL_TABLE",
+        "Parameters": {"table_type": "ICEBERG",
+            "metadata_location": f"s3a://ministack-glue-warehouse/{key}"}}
+    status, doc = _call_body("GET", f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/namespaces/lake/tables/orders")
+    assert status == 200
+    assert doc["metadata-location"].startswith("s3a://")
+    assert doc["metadata"]["schemas"]
+
+
+def test_iceberg_dispatch_routes_glue_vs_s3tables():
+    """The app-level dispatch keeps Firehose and Glue on the Glue Data Catalog
+    while S3 Tables clients keep their own catalog."""
+    from ministack.app import _iceberg_targets_glue_catalog as targets_glue
+
+    assert targets_glue("/iceberg/v1/catalogs/x/namespaces/db/tables", {}) is True
+    assert targets_glue("/iceberg/v1/config", {"warehouse": "arn:aws:glue:us-east-1:000000000000:catalog"}) is True
+    assert targets_glue("/iceberg/v1/config", {"warehouse": "arn:aws:s3tables:us-east-1:000000000000:bucket/b"}) is False
+    assert targets_glue("/iceberg/v1/config", {"warehouse": "000000000000:s3tablescatalog/b"}) is False
+    assert targets_glue("/iceberg/v1/config", {}) is False
 
 
 def test_non_catalogs_prefix_returns_501():
     """Bare-warehouse prefixes (`/v1/{warehouse}/namespaces`) are the
     S3 Tables shape, not Glue's — reject rather than guess."""
-    status, _, payload = _call(
-        "GET", "/iceberg/v1/000000000000/namespaces"
-    )
+    status, _, payload = _call("GET", "/iceberg/v1/000000000000/namespaces")
     assert status == 501
 
 
@@ -2309,7 +2402,8 @@ def test_glue_json_rpc_surface_unaffected():
     Iceberg branch — same module, two protocols."""
     status, _, body = asyncio.run(
         _svc("glue").handle_request(
-            "POST", "/",
+            "POST",
+            "/",
             {"x-amz-target": "AWSGlue.CreateDatabase"},
             json.dumps({"DatabaseInput": {"Name": "rpc_db"}}).encode(),
             {},
@@ -2338,8 +2432,8 @@ def test_glue_spark_container_env_points_sdk_at_ministack(tmp_path, monkeypatch)
         def put_archive(self, path, data):
             import io
             import tarfile
-            with tarfile.open(fileobj=io.BytesIO(
-                    data.read() if hasattr(data, "read") else data)) as tar:
+
+            with tarfile.open(fileobj=io.BytesIO(data.read() if hasattr(data, "read") else data)) as tar:
                 for m in tar.getmembers():
                     archived[m.name] = tar.extractfile(m).read().decode()
 
@@ -2369,14 +2463,12 @@ def test_glue_spark_container_env_points_sdk_at_ministack(tmp_path, monkeypatch)
     script = tmp_path / "job.py"
     script.write_text("print('hi')")
     run = {"Id": "jr_test1492"}
-    _glue._execute_spark_docker(
-        run, {"Timeout": 1}, "envjob", {}, str(script), _FakeDocker())
+    _glue._execute_spark_docker(run, {"Timeout": 1}, "envjob", {}, str(script), _FakeDocker())
 
     env = created["environment"]
     assert env["AWS_ENDPOINT_URL"] == "http://host.docker.internal:4566"
     # The SDK endpoint and the Spark S3A endpoint must agree.
-    s3a = [c for c in created["command"]
-           if isinstance(c, str) and c.startswith("spark.hadoop.fs.s3a.endpoint=")]
+    s3a = [c for c in created["command"] if isinstance(c, str) and c.startswith("spark.hadoop.fs.s3a.endpoint=")]
     assert s3a == [f"spark.hadoop.fs.s3a.endpoint={env['AWS_ENDPOINT_URL']}"]
     # spark-submit is handed the bootstrap, which patches create_client for
     # botocore versions predating AWS_ENDPOINT_URL (Glue 4.0 ships 1.27) and
@@ -2386,3 +2478,104 @@ def test_glue_spark_container_env_points_sdk_at_ministack(tmp_path, monkeypatch)
     assert "'/tmp/job.py'" in archived["_ministack_boot.py"]
     assert "create_client" in archived["_ministack_boot.py"]
     assert run["JobRunState"] == "SUCCEEDED"
+
+
+def test_glue_translate_loopback_conf_rewrites_only_gateway_loopbacks():
+    from ministack.services.glue import _translate_loopback_conf
+
+    host, port = "172.21.0.3", "4566"
+    # Loopback hosts on the gateway port are rewritten to the resolved address.
+    assert _translate_loopback_conf(
+        "spark.sql.catalog.ms.uri=http://host.docker.internal:4566/iceberg",
+        host, port,
+    ) == "spark.sql.catalog.ms.uri=http://172.21.0.3:4566/iceberg"
+    assert _translate_loopback_conf(
+        "spark.hadoop.fs.s3a.endpoint=http://localhost:4566",
+        host, port,
+    ) == "spark.hadoop.fs.s3a.endpoint=http://172.21.0.3:4566"
+    assert _translate_loopback_conf(
+        "a=http://127.0.0.1:4566/x", host, port,
+    ) == "a=http://172.21.0.3:4566/x"
+
+    # An external catalog, a different port, and a host merely containing a
+    # loopback name all pass through untouched.
+    for untouched in (
+        "spark.sql.catalog.ext.uri=https://polaris.example.com:8181/api",
+        "a=http://localhost:8080/other",
+        "a=http://localhost:45660/x",
+        "a=http://notlocalhost:4566/x",
+        "a=http://my.localhost.example:4566/x",
+    ):
+        assert _translate_loopback_conf(untouched, host, port) == untouched
+
+
+def test_iceberg_rest_apply_updates_resolves_minus_one_sentinels():
+    """Spark 3.5 commits `set-current-schema` / `set-default-spec` with -1,
+    meaning "the one added earlier in this commit". Taking -1 literally leaves
+    the table pointing at a schema id that does not exist."""
+    from ministack.services.s3tables import _apply_iceberg_updates
+
+    metadata = {"schemas": [{"schema-id": 0}], "partition-specs": [{"spec-id": 0}],
+                "sort-orders": [{"order-id": 0}]}
+    _apply_iceberg_updates(metadata, [
+        {"action": "add-schema", "schema": {"schema-id": 3, "fields": [{"id": 7}]}},
+        {"action": "set-current-schema", "schema-id": -1},
+        {"action": "add-spec", "spec": {"spec-id": 2}},
+        {"action": "set-default-spec", "spec-id": -1},
+        {"action": "add-sort-order", "sort-order": {"order-id": 4}},
+        {"action": "set-default-sort-order", "sort-order-id": -1},
+    ])
+    assert metadata["current-schema-id"] == 3
+    assert metadata["default-spec-id"] == 2
+    assert metadata["default-sort-order-id"] == 4
+    assert metadata["last-column-id"] == 7
+    # Explicit ids still pass through untouched.
+    _apply_iceberg_updates(metadata, [{"action": "set-current-schema", "schema-id": 0}])
+    assert metadata["current-schema-id"] == 0
+
+
+def test_iceberg_rest_create_namespace_and_transaction_commit():
+    """POST namespaces creates a Glue database; transactions/commit (DuckDB's
+    atomic multi-table commit) applies each table change and 404s on a
+    missing table instead of reporting success."""
+    status, doc = _call_body(
+        "POST", f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/namespaces", {"namespace": ["txlake"]})
+    assert status == 200
+    assert doc["namespace"] == ["txlake"]
+    assert "txlake" in _svc("glue")._databases
+
+    status, _ = _call_body(
+        "POST", f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/namespaces/txlake/tables",
+        {"name": "events", "schema": {"type": "struct", "schema-id": 0,
+            "fields": [{"id": 1, "name": "id", "required": False, "type": "int"}]}})
+    assert status == 200
+
+    status, doc = _call_body(
+        "POST", f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/transactions/commit",
+        {"table-changes": [{"identifier": {"namespace": ["txlake"], "name": "events"},
+            "updates": [{"action": "add-snapshot", "snapshot": {
+                "snapshot-id": 7, "sequence-number": 1, "timestamp-ms": 1,
+                "manifest-list": "s3://x/m.avro", "summary": {"operation": "append"}}}]}]})
+    assert status == 200
+    _, doc = _call_body("GET", f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/namespaces/txlake/tables/events")
+    assert doc["metadata"]["current-snapshot-id"] == 7
+    # The commit advanced the metadata pointer and wrote the new version to S3.
+    assert doc["metadata-location"].endswith("/v1.metadata.json")
+
+    status, doc = _call_body(
+        "POST", f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/transactions/commit",
+        {"table-changes": [{"identifier": {"namespace": ["txlake"], "name": "ghost"},
+                            "updates": []}]})
+    assert status == 404
+    assert doc["error"]["type"] == "NoSuchTableException"
+
+
+def test_glue_extract_python_error_finds_last_traceback():
+    from ministack.services.glue import _extract_python_error
+
+    logs = ("INFO spark stuff\nTraceback (most recent call last):\n  File x\nOldError: a\n"
+            "INFO more\nTraceback (most recent call last):\n  File y\nValueError: real\n")
+    out = _extract_python_error(logs)
+    assert out.startswith("Traceback")
+    assert "ValueError: real" in out and "OldError" not in out
+    assert _extract_python_error("just INFO lines") == ""
