@@ -514,18 +514,7 @@ def _iceberg_config(query_params=None, headers=None):
         warehouse = query_params.get("warehouse", "")
         if isinstance(warehouse, list):
             warehouse = warehouse[0] if warehouse else ""
-    # The s3.endpoint must be reachable from whoever called /v1/config. When a
-    # Spark container on a Docker network calls us, the Host header carries the
-    # container IP it used to reach MiniStack — use that so the S3FileIO writes
-    # to the same address. Falling back to _gateway_url() covers the host-side
-    # case (CLI, DuckDB, boto3) where "localhost" is correct.
-    host = (headers or {}).get("host", "")
-    if host:
-        from ministack.core import tls as _tls
-        scheme = "https" if _tls.use_ssl_enabled() else "http"
-        s3_endpoint = f"{scheme}://{host}" if ":" in host else f"{scheme}://{host}:{_GATEWAY_PORT}"
-    else:
-        s3_endpoint = _gateway_url()
+    s3_endpoint = _reachable_s3_endpoint()
     # S3 connection properties go in ``defaults`` so a client that already
     # supplies them (e.g. a Spark job with its own s3.endpoint pointing at
     # host.docker.internal) is not overridden. Iceberg REST spec: ``defaults``
@@ -541,6 +530,54 @@ def _iceberg_config(query_params=None, headers=None):
     if warehouse:
         overrides["prefix"] = warehouse
     return json_response({"defaults": defaults, "overrides": overrides})
+
+
+def _resolve_container_ip():
+    """Return our own container IP on the Docker network, or None.
+
+    This is the address a sibling container (e.g. a Glue Spark job) can use
+    to reach MiniStack. Cached after the first successful resolution.
+    """
+    if hasattr(_resolve_container_ip, "_cached"):
+        return _resolve_container_ip._cached
+    ip = os.environ.get("MINISTACK_HOST", "")
+    if ip and ip not in ("localhost", "127.0.0.1", "host.docker.internal"):
+        _resolve_container_ip._cached = ip
+        return ip
+    try:
+        import docker
+        client = docker.from_env()
+        hostname = os.environ.get("HOSTNAME", "")
+        if hostname:
+            container = client.containers.get(hostname)
+            container.reload()
+            nets = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+            for net_info in nets.values():
+                addr = net_info.get("IPAddress", "")
+                if addr:
+                    _resolve_container_ip._cached = addr
+                    return addr
+    except Exception:
+        pass
+    _resolve_container_ip._cached = None
+    return None
+
+
+def _reachable_s3_endpoint():
+    """S3 endpoint URL that both host-side and container-side callers can reach.
+
+    Used in every Iceberg REST response that carries s3.endpoint — the
+    /v1/config response and each LoadTable response. The Iceberg S3FileIO
+    builds its S3 client from this value, so returning localhost when the
+    caller is a Docker container means every S3 write (PutObject during
+    S3OutputStream.close) fails with Connection refused.
+    """
+    resolved = _resolve_container_ip()
+    if resolved:
+        from ministack.core import tls as _tls
+        scheme = "https" if _tls.use_ssl_enabled() else "http"
+        return f"{scheme}://{resolved}:{_GATEWAY_PORT}"
+    return _gateway_url()
 
 
 def _iceberg_error(message, exc_type, code):
@@ -630,7 +667,7 @@ def _iceberg_load_table(namespace, table_name, allow_cross_region, bucket_filter
                 "metadata-location": meta_loc,
                 "metadata": metadata,
                 "config": {
-                    "s3.endpoint": _gateway_url(),
+                    "s3.endpoint": _reachable_s3_endpoint(),
                     "s3.access-key-id": "test",
                     "s3.secret-access-key": "test",
                     "s3.path-style-access": "true",
