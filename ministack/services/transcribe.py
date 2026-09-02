@@ -174,9 +174,16 @@ _SUMMARY_MEMBERS = (
     "StartTime",
     "CompletionTime",
     "LanguageCode",
+    "LanguageCodes",
     "TranscriptionJobStatus",
     "FailureReason",
     "OutputLocationType",
+    "ContentRedaction",
+    "ModelSettings",
+    "IdentifyLanguage",
+    "IdentifyMultipleLanguages",
+    "IdentifiedLanguageScore",
+    "ToxicityDetection",
 )
 
 

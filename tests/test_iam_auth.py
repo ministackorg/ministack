@@ -843,19 +843,15 @@ class TestSeededAwsManagedPolicies:
         assert "<Arn>arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole</Arn>" in body
         assert "<Arn>arn:aws:iam::aws:policy/AdministratorAccess</Arn>" not in body
 
-    def test_legacy_bare_arn_is_an_alias_of_the_real_policy(self):
-        # Earlier versions seeded the Lambda execution-role policies under an
-        # ARN without the service-role/ path. Templates written against them
-        # still resolve — to the same record — but ListPolicies reports the
-        # real ARN only.
-        from ministack.core.iam_evaluator import _resolve_managed_policy_document
+    def test_bare_arn_of_a_service_role_policy_answers_no_such_entity(self):
+        # AWS publishes the Lambda execution-role policies only under
+        # service-role/; the path-less spelling does not exist there and does
+        # not exist here.
         from ministack.services.iam import _get_policy, _list_policies
         bare = "arn:aws:iam::aws:policy/AWSLambdaBasicExecutionRole"
         real = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-        assert (_resolve_managed_policy_document(bare, "000000000000")
-                == _resolve_managed_policy_document(real, "000000000000"))
         status, _, body = _get_policy({"PolicyArn": [bare]})
-        assert status == 200 and f"<Arn>{bare}</Arn>" in body.decode()
+        assert status == 404 and "NoSuchEntity" in body.decode()
         listing = _list_policies({"Scope": ["AWS"]})[2].decode()
         assert f"<Arn>{real}</Arn>" in listing
         assert f"<Arn>{bare}</Arn>" not in listing
@@ -1494,4 +1490,3 @@ def test_lambda_build_config_returns_a_config_not_an_error(monkeypatch):
     })
     assert isinstance(config, dict)
     assert config["FunctionName"] == "f"
-

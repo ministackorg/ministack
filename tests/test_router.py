@@ -194,8 +194,7 @@ _TOKEN_ROUTES = {
 
 _SERVED_SUFFIXES = (
     "eu-central-1.amazonaws.com",
-    "eu-central-1.localhost.localstack.cloud",
-    "localhost.localstack.cloud:4566",
+    "us-east-1.amazonaws.com",
     "us-east-1.localhost:4566",
     "localhost:4566",           # the short form: sts.localhost:4566
 )
@@ -209,7 +208,7 @@ _ALIAS_SUFFIX = "dev"
 # the token, plus a few AWS hosts no pattern claims (must stay on the default).
 _EXPLICIT_HOST_ROUTES = [
     ("mybucket.s3.eu-central-1.amazonaws.com", "s3"),
-    ("mybucket.s3.localhost.localstack.cloud:4566", "s3"),
+    ("mybucket.s3.us-east-1.localhost:4566", "s3"),
     ("mybucket.s3-eu-west-1.amazonaws.com", "s3"),
     ("s3-eu-west-1.amazonaws.com", "s3"),
     ("mybucket.s3-website-us-east-1.amazonaws.com", "s3"),
@@ -218,7 +217,6 @@ _EXPLICIT_HOST_ROUTES = [
     ("sqs.cn-north-1.amazonaws.com.cn", "sqs"),
     ("abcd1234.execute-api.eu-central-1.amazonaws.com", "apigateway"),
     ("abcd1234.execute-api.localhost:4566", "apigateway"),
-    ("abcd1234.execute-api.us-east-1.localhost.localstack.cloud:4566", "apigateway"),
     ("a1b2c3-ats.iot.eu-central-1.amazonaws.com", "iot"),
     ("a1b2c3-ats.iot.us-east-1.localhost:4566", "iot"),
     ("a1b2c3.credentials.iot.eu-central-1.amazonaws.com", "iot"),
@@ -227,7 +225,7 @@ _EXPLICIT_HOST_ROUTES = [
     ("a1b2c3.jobs.iot.eu-central-1.amazonaws.com", "iot-jobs-data"),
     ("a1b2c3.data.jobs.iot.eu-central-1.amazonaws.com", "iot-jobs-data"),
     ("lambda-microvms.localhost:4566", "lambda-microvms"),
-    ("myfn.lambda-microvms.localhost.localstack.cloud:4566", "lambda-microvms"),
+    ("myfn.lambda-microvms.us-east-1.localhost:4566", "lambda-microvms"),
     ("123456789012.dkr.ecr.eu-central-1.amazonaws.com", "ecr"),
     ("abcd1234.appsync-api.eu-central-1.amazonaws.com", "appsync-events"),
     ("abcd1234.appsync-realtime-api.eu-central-1.amazonaws.com", "appsync-events"),
@@ -297,7 +295,7 @@ def test_guard_boundaries(host, expected):
 @pytest.mark.parametrize("host", [
     "probe-iot.localhost:4566",         # token after a hyphen
     "notlogs.localhost:4566",           # token inside a label
-    "myemail.localhost.localstack.cloud",
+    "myemail.us-east-1.localhost:4566",
 ])
 def test_served_host_tokens_match_only_at_label_start(host):
     assert detect_service("GET", "/status", {"host": host}, {}) == "s3"
@@ -319,21 +317,6 @@ def test_served_host_prefers_the_multi_label_token():
 ])
 def test_stack_hosts_without_service_labels_fall_to_default(host):
     assert detect_service("GET", "/status", {"host": host}, {}) == "s3"
-
-
-def test_extra_host_suffixes_env_opens_pattern_routing(monkeypatch):
-    monkeypatch.delenv("MINISTACK_EXTRA_HOST_SUFFIXES", raising=False)
-    assert detect_service("GET", "/status", {"host": "s3.iot-example.local"}, {}) == "s3"
-    assert detect_service("GET", "/status", {"host": "iot.iot-example.local"}, {}) == "s3"
-
-    monkeypatch.setenv("MINISTACK_EXTRA_HOST_SUFFIXES", "corp.example, iot-example.local")
-    assert detect_service("GET", "/status", {"host": "iot.iot-example.local"}, {}) == "iot"
-    assert detect_service(
-        "GET", "/status", {"host": "a1-ats.iot.eu-central-1.iot-example.local:4566"}, {}
-    ) == "iot"
-    assert detect_service("GET", "/status", {"host": "logs.corp.example"}, {}) == "logs"
-    # label boundary: ``notiot-example.local`` is not under ``iot-example.local``
-    assert detect_service("GET", "/status", {"host": "iot.notiot-example.local"}, {}) == "s3"
 
 
 def test_ministack_host_env_is_a_served_suffix(monkeypatch):

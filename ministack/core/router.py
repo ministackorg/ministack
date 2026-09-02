@@ -479,18 +479,15 @@ _OPENSEARCH_PATH_PREFIXES = tuple(
 
 # Host-header routing (step 5 of detect_service) is restricted to hosts the
 # stack is reachable under. Real AWS endpoints are ``<service>.<region>.
-# amazonaws.com``; local deployments answer under ``localhost``,
-# ``*.localhost`` / ``localhost.localstack.cloud``, the bare container name,
-# a two-label alias (``s3.dev``, ``sqs.internal``), an IP literal,
-# ``MINISTACK_HOST`` and whatever the operator adds through
-# ``MINISTACK_EXTRA_HOST_SUFFIXES`` (comma-separated; ``s3.<suffix>``,
-# ``<api-id>.execute-api.<suffix>``, ``<prefix>-ats.iot.<region>.<suffix>``).
-# Anything else — a customer domain fronted by a proxy, a probe with a
-# made-up Host — is never an AWS endpoint, so its labels carry no routing
-# information.
+# amazonaws.com``; local deployments answer under ``localhost`` /
+# ``*.localhost``, the bare container name, a two-label alias (``s3.dev``,
+# ``sqs.internal``), an IP literal, ``MINISTACK_HOST`` and the container
+# hostname. Anything else — a customer domain fronted by a proxy, a probe
+# with a made-up Host — is never an AWS endpoint, so its labels carry no
+# routing information. A deployment reachable under another name points
+# ``MINISTACK_HOST`` at it.
 _BUILTIN_HOST_SUFFIXES = (
     "localhost",
-    "localhost.localstack.cloud",
     "amazonaws.com",
     "amazonaws.com.cn",
 )
@@ -519,10 +516,6 @@ def _served_host_suffixes() -> tuple:
         value = _strip_host_port(value)
         if value:
             suffixes.append(value)
-    for value in os.environ.get("MINISTACK_EXTRA_HOST_SUFFIXES", "").split(","):
-        value = _strip_host_port(value).strip(".")
-        if value:
-            suffixes.append(value)
     return tuple(suffixes)
 
 
@@ -542,7 +535,7 @@ def _host_served_by_stack(host: str) -> bool:
     """True when ``host`` names this stack: no Host at all, a single label
     (``ministack``, ``localhost``, a compose service name), a two-label alias
     (``s3.dev``), an IPv4/IPv6 literal, or a name under one of the served
-    suffixes at a label boundary (``s3.localhost.localstack.cloud`` yes,
+    suffixes at a label boundary (``s3.us-east-1.localhost`` yes,
     ``notlocalhost`` no). A customer domain has at least three labels."""
     hostname = _strip_host_port(host)
     if not hostname or "." not in hostname:

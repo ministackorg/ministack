@@ -759,7 +759,9 @@ def test_iam_seeded_aws_xray_readonly(iam):
 
 
 def test_iam_seeded_aws_lambda_role(iam):
-    arn = "arn:aws:iam::aws:policy/AWSLambdaRole"
+    # AWS publishes this policy only under service-role/; the path-less ARN
+    # answers NoSuchEntity, as on AWS.
+    arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaRole"
     pv = iam.get_policy_version(PolicyArn=arn, VersionId="v1")["PolicyVersion"]
     doc = pv["Document"] if isinstance(pv["Document"], dict) else json.loads(pv["Document"])
     actions = doc["Statement"][0]["Action"]

@@ -211,9 +211,9 @@ def _seed_aws_managed_policies() -> None:
     seeds = [
         # The service-role/* policies live under that path on AWS: it is the
         # only ARN CDK, SAM and Serverless emit for a Lambda execution role.
-        # Earlier versions seeded four of them under a path-less ARN AWS does
-        # not publish; those stay reachable as aliases of the real record
-        # (``_AWS_MANAGED_POLICY_ALIASES``).
+        # A path-less spelling of them does not exist on AWS and answers
+        # NoSuchEntity here too; the one-line fix for a template written
+        # against the old seeds is to attach the real service-role/ ARN.
         ('service-role/AWSLambdaBasicExecutionRole',
          '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}',
          "Provides write permissions to CloudWatch Logs."),
@@ -327,24 +327,6 @@ def _seed_aws_managed_policies() -> None:
         _aws_managed_policies[f"{_AWS_MANAGED_POLICY_PREFIX}{name}"] = _make_aws_managed_record(
             name, document, description,
         )
-    for alias, real in _AWS_MANAGED_POLICY_ALIASES.items():
-        _aws_managed_policies[f"{_AWS_MANAGED_POLICY_PREFIX}{alias}"] = (
-            _aws_managed_policies[f"{_AWS_MANAGED_POLICY_PREFIX}{real}"]
-        )
-
-
-# Path-less ARNs earlier versions seeded for policies AWS only publishes under
-# ``service-role/``. They do not exist on AWS, but templates written against
-# those versions attach them, so each resolves to the real policy's record —
-# the same object, so the document, id and attachment count are shared.
-# ``ListPolicies`` reports the real ARN only.
-_AWS_MANAGED_POLICY_ALIASES: dict[str, str] = {
-    "AWSLambdaBasicExecutionRole": "service-role/AWSLambdaBasicExecutionRole",
-    "AWSLambdaVPCAccessExecutionRole": "service-role/AWSLambdaVPCAccessExecutionRole",
-    "AWSLambdaRole": "service-role/AWSLambdaRole",
-    "AmazonECSTaskExecutionRolePolicy": "service-role/AmazonECSTaskExecutionRolePolicy",
-}
-
 
 # ── Persistence ────────────────────────────────────────────
 
@@ -860,8 +842,6 @@ def _list_policies(p):
     # AWS-managed policies — returned for scope "All" or "AWS".
     if scope != "Local":
         for arn, pol in _aws_managed_policies.items():
-            if pol.get("Arn") != arn:  # a legacy alias of a real policy
-                continue
             if not pol.get("Path", "/").startswith(prefix):
                 continue
             members += f"<member>{_managed_policy_xml(arn)}</member>"
