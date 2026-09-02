@@ -12048,3 +12048,387 @@ def test_cfn_secret_replica_regions_apply_on_create_and_update(cfn, sm):
                 client.describe_secret(SecretId=secret_name)
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_rule_update_keeps_arn_and_foreign_targets(cfn, eb, sqs):
+    """Schedule, description and the declared targets update in place through
+    PutRule / PutTargets / RemoveTargets: same rule ARN, a target added with
+    PutTargets outside the template survives, a target dropped from the
+    template is removed and a changed one is rewritten."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rule-upd-{uid}"
+    rule_name = f"cfn-rule-upd-{uid}"
+    queues, queue_urls = {}, {}
+    for label in ("a", "b", "c"):
+        queue_urls[label] = sqs.create_queue(QueueName=f"cfn-rule-upd-{uid}-{label}")["QueueUrl"]
+        queues[label] = sqs.get_queue_attributes(
+            QueueUrl=queue_urls[label], AttributeNames=["QueueArn"]
+        )["Attributes"]["QueueArn"]
+
+    def template(schedule, description, targets):
+        return json.dumps({
+            "Resources": {"Rule": {"Type": "AWS::Events::Rule", "Properties": {
+                "Name": rule_name, "ScheduleExpression": schedule,
+                "Description": description, "State": "ENABLED", "Targets": targets,
+            }}},
+            "Outputs": {"RuleRef": {"Value": {"Ref": "Rule"}},
+                        "RuleArn": {"Value": {"Fn::GetAtt": ["Rule", "Arn"]}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(
+        "rate(5 minutes)", "before",
+        [{"Id": "A", "Arn": queues["a"], "Input": '{"v": 1}'},
+         {"Id": "B", "Arn": queues["b"]}],
+    ))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _output(stack, "RuleArn")
+        assert eb.describe_rule(Name=rule_name)["Arn"] == arn
+        eb.put_targets(Rule=rule_name, Targets=[{"Id": "Foreign", "Arn": queues["c"]}])
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(
+            "rate(10 minutes)", "after",
+            [{"Id": "A", "Arn": queues["a"], "Input": '{"v": 2}'},
+             {"Id": "C", "Arn": queues["c"]}],
+        ))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "RuleRef") == rule_name
+        assert _output(stack, "RuleArn") == arn
+
+        rule = eb.describe_rule(Name=rule_name)
+        assert rule["Arn"] == arn
+        assert rule["ScheduleExpression"] == "rate(10 minutes)"
+        assert rule["Description"] == "after"
+        assert rule["State"] == "ENABLED"
+        targets = {t["Id"]: t for t in eb.list_targets_by_rule(Rule=rule_name)["Targets"]}
+        assert set(targets) == {"A", "C", "Foreign"}
+        assert targets["A"]["Input"] == '{"v": 2}'
+        assert targets["Foreign"]["Arn"] == queues["c"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for queue_url in queue_urls.values():
+            sqs.delete_queue(QueueUrl=queue_url)
+    with pytest.raises(ClientError):
+        eb.describe_rule(Name=rule_name)
+
+
+def test_cfn_events_rule_rename_replaces_the_rule(cfn, eb):
+    """Name is create-only: renaming creates the new rule and removes the old
+    one, and Ref follows the new name."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rule-ren-{uid}"
+
+    def template(name):
+        return json.dumps({
+            "Resources": {"Rule": {"Type": "AWS::Events::Rule", "Properties": {
+                "Name": name, "ScheduleExpression": "rate(1 hour)"}}},
+            "Outputs": {"RuleRef": {"Value": {"Ref": "Rule"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(f"cfn-rule-a-{uid}"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(f"cfn-rule-b-{uid}"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "RuleRef") == f"cfn-rule-b-{uid}"
+        assert eb.describe_rule(Name=f"cfn-rule-b-{uid}")["ScheduleExpression"] == "rate(1 hour)"
+        with pytest.raises(ClientError):
+            eb.describe_rule(Name=f"cfn-rule-a-{uid}")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_rule_bus_move_keeps_name_and_targets(cfn, eb, sqs):
+    """EventBusName updates with some interruptions per the resource
+    reference: the rule moves to the other bus under the same name, its
+    targets come along, GetAtt Arn follows the bus, and nothing is left on
+    the bus it came from."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rule-move-{uid}"
+    rule_name = f"cfn-rule-move-{uid}"
+    bus_name = f"cfn-rule-move-bus-{uid}"
+    url = sqs.create_queue(QueueName=f"cfn-rule-move-{uid}")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+
+    def template(on_bus):
+        props = {"Name": rule_name, "EventPattern": {"source": ["cfn.test"]},
+                 "Targets": [{"Id": "Q", "Arn": queue_arn}]}
+        if on_bus:
+            props["EventBusName"] = {"Ref": "Bus"}
+        return json.dumps({
+            "Resources": {
+                "Bus": {"Type": "AWS::Events::EventBus", "Properties": {"Name": bus_name}},
+                "Rule": {"Type": "AWS::Events::Rule", "Properties": props},
+            },
+            "Outputs": {"RuleRef": {"Value": {"Ref": "Rule"}},
+                        "RuleArn": {"Value": {"Fn::GetAtt": ["Rule", "Arn"]}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(False))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "RuleArn") == eb.describe_rule(Name=rule_name)["Arn"]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "RuleRef") == rule_name
+        moved = eb.describe_rule(Name=rule_name, EventBusName=bus_name)
+        assert moved["Arn"].endswith(f"rule/{bus_name}/{rule_name}")
+        assert _output(stack, "RuleArn") == moved["Arn"]
+        targets = eb.list_targets_by_rule(Rule=rule_name, EventBusName=bus_name)["Targets"]
+        assert [t["Arn"] for t in targets] == [queue_arn]
+        with pytest.raises(ClientError):
+            eb.describe_rule(Name=rule_name)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        sqs.delete_queue(QueueUrl=url)
+    with pytest.raises(ClientError):
+        eb.describe_rule(Name=rule_name, EventBusName=bus_name)
+
+
+def test_cfn_events_rule_move_to_a_missing_bus_rolls_back(cfn, eb, sqs):
+    """A move onto a bus that does not exist fails the update before the
+    rule is touched: the stack rolls back, the rule stays on the default
+    bus with its target, and nothing is left under the other bus name."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rule-nobus-{uid}"
+    rule_name = f"cfn-rule-nobus-{uid}"
+    missing_bus = f"cfn-rule-nobus-missing-{uid}"
+    url = sqs.create_queue(QueueName=f"cfn-rule-nobus-{uid}")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+
+    def template(bus):
+        props = {"Name": rule_name, "EventPattern": {"source": ["cfn.test"]},
+                 "Targets": [{"Id": "Q", "Arn": queue_arn}]}
+        if bus:
+            props["EventBusName"] = bus
+        return json.dumps({
+            "Resources": {"Rule": {"Type": "AWS::Events::Rule", "Properties": props}},
+            "Outputs": {"RuleArn": {"Value": {"Fn::GetAtt": ["Rule", "Arn"]}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(None))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _output(stack, "RuleArn")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(missing_bus))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert "AWS::Events::Rule update failed" in _stack_event_reasons(cfn, stack_name)
+        assert _output(stack, "RuleArn") == arn
+        assert eb.describe_rule(Name=rule_name)["Arn"] == arn
+        targets = eb.list_targets_by_rule(Rule=rule_name)["Targets"]
+        assert [t["Arn"] for t in targets] == [queue_arn]
+        with pytest.raises(ClientError):
+            eb.describe_rule(Name=rule_name, EventBusName=missing_bus)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        sqs.delete_queue(QueueUrl=url)
+
+
+def test_cfn_events_rule_tags_apply_on_create_and_update(cfn, eb):
+    """Tags update with no interruption per the resource reference: the
+    template's tags are on the rule after create, a changed value and a new
+    key are written on update, a key the template dropped is removed, and a
+    tag added with TagResource outside the stack survives."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rule-tags-{uid}"
+    rule_name = f"cfn-rule-tags-{uid}"
+
+    def template(tags):
+        return json.dumps({
+            "Resources": {"Rule": {"Type": "AWS::Events::Rule", "Properties": {
+                "Name": rule_name, "ScheduleExpression": "rate(1 hour)",
+                "Tags": [{"Key": k, "Value": v} for k, v in tags.items()],
+            }}},
+            "Outputs": {"RuleArn": {"Value": {"Fn::GetAtt": ["Rule", "Arn"]}}},
+        })
+
+    def tags_of(arn):
+        return {t["Key"]: t["Value"] for t in eb.list_tags_for_resource(ResourceARN=arn)["Tags"]}
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template({"env": "dev", "team": "a"}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _output(stack, "RuleArn")
+        assert tags_of(arn) == {"env": "dev", "team": "a"}
+        eb.tag_resource(ResourceARN=arn, Tags=[{"Key": "foreign", "Value": "kept"}])
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template({"env": "prod", "owner": "b"}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "RuleArn") == arn
+        assert tags_of(arn) == {"env": "prod", "owner": "b", "foreign": "kept"}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    with pytest.raises(ClientError):
+        eb.list_tags_for_resource(ResourceARN=arn)
+
+
+def test_cfn_events_rule_tags_follow_a_bus_move(cfn, eb):
+    """A rule moved to another bus by an EventBusName update keeps its tags
+    under the new ARN, a tag changed in the same update applies there, and
+    nothing is left under the ARN it had on the default bus."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rule-tagmove-{uid}"
+    rule_name = f"cfn-rule-tagmove-{uid}"
+    bus_name = f"cfn-rule-tagmove-bus-{uid}"
+
+    def template(on_bus, env):
+        props = {"Name": rule_name, "EventPattern": {"source": ["cfn.test"]},
+                 "Tags": [{"Key": "env", "Value": env}, {"Key": "team", "Value": "a"}]}
+        if on_bus:
+            props["EventBusName"] = {"Ref": "Bus"}
+        return json.dumps({
+            "Resources": {
+                "Bus": {"Type": "AWS::Events::EventBus", "Properties": {"Name": bus_name}},
+                "Rule": {"Type": "AWS::Events::Rule", "Properties": props},
+            },
+            "Outputs": {"RuleArn": {"Value": {"Fn::GetAtt": ["Rule", "Arn"]}}},
+        })
+
+    def tags_of(arn):
+        return {t["Key"]: t["Value"] for t in eb.list_tags_for_resource(ResourceARN=arn)["Tags"]}
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(False, "dev"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        old_arn = _output(stack, "RuleArn")
+        eb.tag_resource(ResourceARN=old_arn, Tags=[{"Key": "foreign", "Value": "kept"}])
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(True, "prod"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        new_arn = _output(stack, "RuleArn")
+        assert new_arn == eb.describe_rule(Name=rule_name, EventBusName=bus_name)["Arn"]
+        assert new_arn != old_arn
+        assert tags_of(new_arn) == {"env": "prod", "team": "a", "foreign": "kept"}
+        with pytest.raises(ClientError):
+            eb.list_tags_for_resource(ResourceARN=old_arn)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_rule_dropped_description_reverts(cfn, eb):
+    """Description updates with no interruption, and per the resource
+    reference an argument omitted from PutRule is not kept: a Description
+    dropped from the template is gone from the rule after the update."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rule-desc-{uid}"
+    rule_name = f"cfn-rule-desc-{uid}"
+
+    def template(description):
+        props = {"Name": rule_name, "ScheduleExpression": "rate(1 hour)"}
+        if description is not None:
+            props["Description"] = description
+        return json.dumps({"Resources": {"Rule": {"Type": "AWS::Events::Rule", "Properties": props}}})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("described"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert eb.describe_rule(Name=rule_name)["Description"] == "described"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(None))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        rule = eb.describe_rule(Name=rule_name)
+        assert "Description" not in rule
+        assert rule["ScheduleExpression"] == "rate(1 hour)"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_rule_removing_every_target_removes_them(cfn, eb, sqs):
+    """Targets update with no interruption: a template that drops all of
+    its targets leaves the rule with none of them, while a target added
+    with PutTargets outside the stack stays."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rule-notgt-{uid}"
+    rule_name = f"cfn-rule-notgt-{uid}"
+    queue_urls, queue_arns = [], []
+    for label in ("a", "b", "c"):
+        url = sqs.create_queue(QueueName=f"cfn-rule-notgt-{uid}-{label}")["QueueUrl"]
+        queue_urls.append(url)
+        queue_arns.append(sqs.get_queue_attributes(
+            QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"])
+
+    def template(targets):
+        props = {"Name": rule_name, "ScheduleExpression": "rate(1 hour)"}
+        if targets is not None:
+            props["Targets"] = targets
+        return json.dumps({"Resources": {"Rule": {"Type": "AWS::Events::Rule", "Properties": props}}})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(
+        [{"Id": "A", "Arn": queue_arns[0]}, {"Id": "B", "Arn": queue_arns[1]}]))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert {t["Id"] for t in eb.list_targets_by_rule(Rule=rule_name)["Targets"]} == {"A", "B"}
+        eb.put_targets(Rule=rule_name, Targets=[{"Id": "Foreign", "Arn": queue_arns[2]}])
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(None))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        targets = eb.list_targets_by_rule(Rule=rule_name)["Targets"]
+        assert [t["Id"] for t in targets] == ["Foreign"]
+        assert eb.describe_rule(Name=rule_name)["ScheduleExpression"] == "rate(1 hour)"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for url in queue_urls:
+            sqs.delete_queue(QueueUrl=url)
+
+
+def test_cfn_events_rule_generated_name_updates_in_place(cfn, eb):
+    """A rule without Name gets a generated physical ID (Ref returns the
+    rule ID, such as mystack-ScheduledRule-ABCDEFGHIJK, per the resource
+    reference) and updates in place: Ref, GetAtt Arn and GetAtt RuleName
+    are unchanged across a schedule change, and the service shows the new
+    schedule under that name."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rule-gen-{uid}"
+
+    def template(schedule):
+        return json.dumps({
+            "Resources": {"Rule": {"Type": "AWS::Events::Rule", "Properties": {
+                "ScheduleExpression": schedule}}},
+            "Outputs": {"RuleRef": {"Value": {"Ref": "Rule"}},
+                        "RuleArn": {"Value": {"Fn::GetAtt": ["Rule", "Arn"]}},
+                        "RuleName": {"Value": {"Fn::GetAtt": ["Rule", "RuleName"]}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("rate(5 minutes)"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        name, arn = _output(stack, "RuleRef"), _output(stack, "RuleArn")
+        assert name.startswith(f"{stack_name}-Rule-")
+        assert _output(stack, "RuleName") == name
+        assert eb.describe_rule(Name=name)["Arn"] == arn
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("rate(10 minutes)"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "RuleRef") == name
+        assert _output(stack, "RuleArn") == arn
+        assert _output(stack, "RuleName") == name
+        rule = eb.describe_rule(Name=name)
+        assert rule["Arn"] == arn
+        assert rule["ScheduleExpression"] == "rate(10 minutes)"
+        assert len(eb.list_rules(NamePrefix=f"{stack_name}-Rule-")["Rules"]) == 1
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    with pytest.raises(ClientError):
+        eb.describe_rule(Name=name)

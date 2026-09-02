@@ -1946,14 +1946,100 @@ def _eb_rule_create(logical_id, props, stack_name):
     for t in targets:
         _eb._targets[key].append(t)
 
-    return name, {"Arn": arn}
+    _eb_rule_apply_tags(arn, [], props.get("Tags") or [])
+    return name, {"Arn": arn, "RuleName": name}
+
+
+def _eb_rule_apply_tags(arn, old_tags, new_tags):
+    """Reconcile the template's tags on a rule through TagResource /
+    UntagResource: a key the template dropped is removed, the declared ones
+    are written, and a tag added outside the stack is left alone.
+    """
+    declared = {t["Key"] for t in new_tags}
+    dropped = sorted({t["Key"] for t in old_tags} - declared)
+    if dropped:
+        _eb._untag_resource({"ResourceARN": arn, "TagKeys": dropped})
+    if new_tags:
+        resp = _eb._tag_resource({"ResourceARN": arn, "Tags": new_tags})
+        if resp[0] >= 400:
+            raise ValueError(f"AWS::Events::Rule TagResource failed: {resp[2]!r}")
+
+
+def _eb_rule_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a rule in place through PutRule / PutTargets / RemoveTargets, so
+    the rule keeps its name and ARN and any target added outside the
+    template survives. Name is the one create-only property
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-events-rule.html):
+    a rename is a replacement, the new rule created before the old one is
+    removed. EventBusName updates with "some interruptions": the rule moves
+    to the other bus under the same name, carrying its targets and tags
+    along. Tags update without interruption: the template's tag set is
+    reconciled the same way the targets are.
+    """
+    name = new_props.get("Name") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=64
+    )
+    old_bus = old_props.get("EventBusName", "default")
+    new_bus = new_props.get("EventBusName", "default")
+    old_key = _eb._rule_key(physical_id, old_bus)
+    rule = _eb._rules.get(old_key)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        name, rule.get("Name") if rule else None, _eb_rule_create, _eb_rule_delete,
+    )
+    if replaced is not None:
+        return replaced
+
+    _eb._ensure_default_bus()
+    pattern = new_props.get("EventPattern", "")
+    resp = _eb._put_rule({
+        "Name": name,
+        "EventBusName": new_bus,
+        "State": new_props.get("State", "ENABLED"),
+        "Description": new_props.get("Description", ""),
+        "ScheduleExpression": new_props.get("ScheduleExpression", ""),
+        "EventPattern": json.dumps(pattern) if isinstance(pattern, dict) else pattern,
+        "RoleArn": new_props.get("RoleArn", ""),
+    })
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Events::Rule update failed: {resp[2]!r}")
+    new_key = _eb._rule_key(name, new_bus)
+    if new_bus != old_bus:
+        # PutRule accepted the new bus, so the rule exists there now: the
+        # old record goes, and its targets (the template's and any added
+        # outside the stack, reconciled below) and tags move over. A move
+        # onto a bus that does not exist fails above, leaving the rule as
+        # it was.
+        old_rule = _eb._rules.pop(old_key, None) or {}
+        _eb._targets[new_key] = list(_eb._targets.pop(old_key, []))
+        if old_rule.get("Arn") in _eb._tags:
+            _eb._tags[_eb._rules[new_key]["Arn"]] = _eb._tags.pop(old_rule["Arn"])
+
+    old_ids = {t.get("Id") for t in old_props.get("Targets", []) or []}
+    new_targets = new_props.get("Targets", []) or []
+    new_ids = {t.get("Id") for t in new_targets}
+    if old_ids - new_ids:
+        _eb._remove_targets({
+            "Rule": name, "EventBusName": new_bus, "Ids": sorted(old_ids - new_ids),
+        })
+    if new_targets:
+        resp = _eb._put_targets({
+            "Rule": name, "EventBusName": new_bus, "Targets": new_targets,
+        })
+        if resp[0] >= 400:
+            raise ValueError(f"AWS::Events::Rule PutTargets failed: {resp[2]!r}")
+    arn = _eb._rules[new_key]["Arn"]
+    _eb_rule_apply_tags(arn, old_props.get("Tags") or [], new_props.get("Tags") or [])
+    return name, {"Arn": arn, "RuleName": name}
 
 
 def _eb_rule_delete(physical_id, props):
     bus = props.get("EventBusName", "default")
     key = _eb._rule_key(physical_id, bus)
-    _eb._rules.pop(key, None)
+    rule = _eb._rules.pop(key, None)
     _eb._targets.pop(key, None)
+    if rule:
+        _eb._tags.pop(rule["Arn"], None)
 
 
 # --- IoT Topic Rule (AWS::IoT::TopicRule) ---
@@ -7416,7 +7502,12 @@ _RESOURCE_HANDLERS = {
         "delete": _cwlogs_resource_policy_delete,
     },
     "AWS::Logs::SubscriptionFilter": {"create": _cwlogs_subfilter_create, "delete": _cwlogs_subfilter_delete},
-    "AWS::Events::Rule": {"create": _eb_rule_create, "delete": _eb_rule_delete},
+    "AWS::Events::Rule": {
+        "create": _eb_rule_create,
+        "update": _eb_rule_update,
+        "update_with_logical_id": True,
+        "delete": _eb_rule_delete,
+    },
     "AWS::Events::EventBus": {"create": _eb_event_bus_create, "delete": _eb_event_bus_delete},
     "AWS::Kinesis::Stream": {"create": _kinesis_stream_create, "delete": _kinesis_stream_delete},
     "AWS::KinesisFirehose::DeliveryStream": {
