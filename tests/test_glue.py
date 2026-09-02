@@ -2507,3 +2507,75 @@ def test_glue_translate_loopback_conf_rewrites_only_gateway_loopbacks():
         "a=http://my.localhost.example:4566/x",
     ):
         assert _translate_loopback_conf(untouched, host, port) == untouched
+
+
+def test_iceberg_rest_apply_updates_resolves_minus_one_sentinels():
+    """Spark 3.5 commits `set-current-schema` / `set-default-spec` with -1,
+    meaning "the one added earlier in this commit". Taking -1 literally leaves
+    the table pointing at a schema id that does not exist."""
+    from ministack.services.s3tables import _apply_iceberg_updates
+
+    metadata = {"schemas": [{"schema-id": 0}], "partition-specs": [{"spec-id": 0}],
+                "sort-orders": [{"order-id": 0}]}
+    _apply_iceberg_updates(metadata, [
+        {"action": "add-schema", "schema": {"schema-id": 3, "fields": [{"id": 7}]}},
+        {"action": "set-current-schema", "schema-id": -1},
+        {"action": "add-spec", "spec": {"spec-id": 2}},
+        {"action": "set-default-spec", "spec-id": -1},
+        {"action": "add-sort-order", "sort-order": {"order-id": 4}},
+        {"action": "set-default-sort-order", "sort-order-id": -1},
+    ])
+    assert metadata["current-schema-id"] == 3
+    assert metadata["default-spec-id"] == 2
+    assert metadata["default-sort-order-id"] == 4
+    assert metadata["last-column-id"] == 7
+    # Explicit ids still pass through untouched.
+    _apply_iceberg_updates(metadata, [{"action": "set-current-schema", "schema-id": 0}])
+    assert metadata["current-schema-id"] == 0
+
+
+def test_iceberg_rest_create_namespace_and_transaction_commit():
+    """POST namespaces creates a Glue database; transactions/commit (DuckDB's
+    atomic multi-table commit) applies each table change and 404s on a
+    missing table instead of reporting success."""
+    status, doc = _call_body(
+        "POST", f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/namespaces", {"namespace": ["txlake"]})
+    assert status == 200
+    assert doc["namespace"] == ["txlake"]
+    assert "txlake" in _svc("glue")._databases
+
+    status, _ = _call_body(
+        "POST", f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/namespaces/txlake/tables",
+        {"name": "events", "schema": {"type": "struct", "schema-id": 0,
+            "fields": [{"id": 1, "name": "id", "required": False, "type": "int"}]}})
+    assert status == 200
+
+    status, doc = _call_body(
+        "POST", f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/transactions/commit",
+        {"table-changes": [{"identifier": {"namespace": ["txlake"], "name": "events"},
+            "updates": [{"action": "add-snapshot", "snapshot": {
+                "snapshot-id": 7, "sequence-number": 1, "timestamp-ms": 1,
+                "manifest-list": "s3://x/m.avro", "summary": {"operation": "append"}}}]}]})
+    assert status == 200
+    _, doc = _call_body("GET", f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/namespaces/txlake/tables/events")
+    assert doc["metadata"]["current-snapshot-id"] == 7
+    # The commit advanced the metadata pointer and wrote the new version to S3.
+    assert doc["metadata-location"].endswith("/v1.metadata.json")
+
+    status, doc = _call_body(
+        "POST", f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/transactions/commit",
+        {"table-changes": [{"identifier": {"namespace": ["txlake"], "name": "ghost"},
+                            "updates": []}]})
+    assert status == 404
+    assert doc["error"]["type"] == "NoSuchTableException"
+
+
+def test_glue_extract_python_error_finds_last_traceback():
+    from ministack.services.glue import _extract_python_error
+
+    logs = ("INFO spark stuff\nTraceback (most recent call last):\n  File x\nOldError: a\n"
+            "INFO more\nTraceback (most recent call last):\n  File y\nValueError: real\n")
+    out = _extract_python_error(logs)
+    assert out.startswith("Traceback")
+    assert "ValueError: real" in out and "OldError" not in out
+    assert _extract_python_error("just INFO lines") == ""

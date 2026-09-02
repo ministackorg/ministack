@@ -1056,3 +1056,50 @@ def test_s3tables_iceberg_load_table_serves_the_numerically_latest_metadata(s3ta
         except Exception:
             pass
         s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
+
+
+def test_s3tables_iceberg_prefixed_lookup_scopes_to_the_bucket(s3tables):
+    """Two table buckets holding a same-named table must resolve per the
+    ``{account}:s3tablescatalog/{bucket}`` prefix — without the filter the
+    first match wins and the wrong table's schema comes back."""
+    ns, table = "scopens", "orders"
+    arns = {}
+    try:
+        for b in ("tb-scope-a", "tb-scope-b"):
+            arns[b] = s3tables.create_table_bucket(name=b)["arn"]
+            s3tables.create_namespace(tableBucketARN=arns[b], namespace=[ns])
+            s3tables.create_table(
+                tableBucketARN=arns[b], namespace=ns, name=table, format="ICEBERG",
+                metadata={"iceberg": {"schema": {"fields": [
+                    {"name": f"col_{b[-1]}", "type": "string"}]}}},
+            )
+        for b in ("tb-scope-a", "tb-scope-b"):
+            resp = _iceberg_json(
+                f"/iceberg/v1/000000000000:s3tablescatalog/{b}/namespaces/{ns}/tables/{table}")
+            fields = resp["metadata"]["schemas"][0]["fields"]
+            assert [f["name"] for f in fields] == [f"col_{b[-1]}"], (b, fields)
+    finally:
+        for b, arn in arns.items():
+            try:
+                s3tables.delete_table(tableBucketARN=arn, namespace=ns, name=table)
+                s3tables.delete_namespace(tableBucketARN=arn, namespace=ns)
+            except Exception:
+                pass
+            try:
+                s3tables.delete_table_bucket(tableBucketARN=arn)
+            except Exception:
+                pass
+
+
+def test_iceberg_unknown_path_answers_404_envelope():
+    """A path neither catalog serves must be an Iceberg error envelope, not an
+    empty 200 a client would read as success."""
+    import urllib.error
+
+    try:
+        _iceberg_json("/iceberg/v9/definitely/not/a/route")
+        raise AssertionError("expected HTTP error")
+    except urllib.error.HTTPError as e:
+        assert e.code == 404
+        doc = json.loads(e.read())
+        assert doc["error"]["type"] == "NotFoundException"
