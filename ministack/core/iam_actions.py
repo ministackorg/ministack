@@ -97,6 +97,7 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "states": "states",
     "sts": "sts",
     "tagging": "tag",
+    "transcribe": "transcribe",
     "transfer": "transfer",
     "waf": "waf",
     "waf-regional": "waf-regional",
@@ -149,24 +150,50 @@ _S3_ACTIONS: dict[tuple[str, int], str] = {
 }
 
 # S3 query-param sub-operations
+# Sub-resource (query parameter) → IAM action, keyed by HTTP method. The values
+# are the IAM actions the Amazon S3 authorization reference lists, not the API
+# operation names: multipart uploads authorize as s3:PutObject
+# (CreateMultipartUpload, UploadPart, UploadPartCopy, CompleteMultipartUpload),
+# abort as s3:AbortMultipartUpload and the two listings under their own actions;
+# the DELETE configuration calls (lifecycle, encryption, replication, tagging,
+# CORS) authorize as the matching Put* action, because S3 defines no Delete*
+# action for them. The literal "s3:CreateMultipartUpload" matched no policy and
+# denied every upload above the SDK's multipart threshold — CDK publishes any
+# asset that size (Lambda layers) that way, so `cdk deploy` failed under
+# AUTH=true. Consulted at both the bucket and the object level.
 _S3_QUERY_ACTIONS: dict[str, dict[str, str]] = {
-    "tagging": {"GET": "GetBucketTagging", "PUT": "PutBucketTagging", "DELETE": "DeleteBucketTagging"},
+    "tagging": {"GET": "GetBucketTagging", "PUT": "PutBucketTagging", "DELETE": "PutBucketTagging"},
     "versioning": {"GET": "GetBucketVersioning", "PUT": "PutBucketVersioning"},
     "policy": {"GET": "GetBucketPolicy", "PUT": "PutBucketPolicy", "DELETE": "DeleteBucketPolicy"},
-    "cors": {"GET": "GetBucketCors", "PUT": "PutBucketCors", "DELETE": "DeleteBucketCors"},
+    "cors": {"GET": "GetBucketCORS", "PUT": "PutBucketCORS", "DELETE": "PutBucketCORS"},
     "lifecycle": {"GET": "GetLifecycleConfiguration", "PUT": "PutLifecycleConfiguration",
-                  "DELETE": "DeleteLifecycleConfiguration"},
+                  "DELETE": "PutLifecycleConfiguration"},
     "encryption": {"GET": "GetEncryptionConfiguration", "PUT": "PutEncryptionConfiguration",
-                   "DELETE": "DeleteEncryptionConfiguration"},
+                   "DELETE": "PutEncryptionConfiguration"},
     "notification": {"GET": "GetBucketNotification", "PUT": "PutBucketNotification"},
     "acl": {"GET": "GetBucketAcl", "PUT": "PutBucketAcl"},
     "website": {"GET": "GetBucketWebsite", "PUT": "PutBucketWebsite", "DELETE": "DeleteBucketWebsite"},
     "logging": {"GET": "GetBucketLogging", "PUT": "PutBucketLogging"},
     "replication": {"GET": "GetReplicationConfiguration", "PUT": "PutReplicationConfiguration",
-                    "DELETE": "DeleteReplicationConfiguration"},
+                    "DELETE": "PutReplicationConfiguration"},
     "location": {"GET": "GetBucketLocation"},
-    "uploads": {"GET": "ListMultipartUploads", "POST": "CreateMultipartUpload"},
+    "uploads": {"GET": "ListBucketMultipartUploads", "POST": "PutObject"},
+    "uploadId": {"GET": "ListMultipartUploadParts", "PUT": "PutObject",
+                 "POST": "PutObject", "DELETE": "AbortMultipartUpload"},
     "restore": {"POST": "RestoreObject"},
+}
+
+# Sub-resources that only exist at the bucket level.
+_S3_BUCKET_QUERY_ACTIONS: dict[str, dict[str, str]] = {
+    "versions": {"GET": "ListBucketVersions"},
+}
+
+# Sub-resources whose IAM action differs between the bucket and the object
+# level; these win over the shared table for an object request.
+_S3_OBJECT_QUERY_ACTIONS: dict[str, dict[str, str]] = {
+    "tagging": {"GET": "GetObjectTagging", "PUT": "PutObjectTagging",
+                "DELETE": "DeleteObjectTagging"},
+    "acl": {"GET": "GetObjectAcl", "PUT": "PutObjectAcl"},
 }
 
 
@@ -174,13 +201,16 @@ def _s3_action(method: str, path: str, query_params: dict) -> str | None:
     parts = [p for p in path.split("/") if p]
     depth = min(len(parts), 2)
 
-    # Check sub-operation query params first (bucket-level)
+    # Sub-operation query params first: the level-specific table, then the
+    # shared one. A request for the service root has no sub-resources.
     if depth >= 1:
-        for qp, action_map in _S3_QUERY_ACTIONS.items():
-            if qp in query_params:
-                a = action_map.get(method)
-                if a:
-                    return a
+        level_table = _S3_OBJECT_QUERY_ACTIONS if depth == 2 else _S3_BUCKET_QUERY_ACTIONS
+        for table in (level_table, _S3_QUERY_ACTIONS):
+            for qp, action_map in table.items():
+                if qp in query_params:
+                    a = action_map.get(method)
+                    if a:
+                        return a
 
     return _S3_ACTIONS.get((method, depth))
 

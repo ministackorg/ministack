@@ -44,6 +44,7 @@ import datetime
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import secrets as stdlib_secrets
@@ -126,6 +127,16 @@ _MYSQL_CONTROL_USER = "rdsadmin"
 _MYSQL_CONTROL_PASSWORD = "ministack-rds-control"
 _MYSQL_REPLICATION_RETRY_ATTEMPTS = 60
 _MYSQL_REPLICATION_RETRY_INTERVAL = 1
+_MYSQL_TRANSACTION_STATES = frozenset({"RUNNING", "LOCK WAIT", "ROLLING BACK", "COMMITTING"})
+_MYSQL_MODIFIED_TRANSACTION_QUERY = (
+    "SELECT i.TRX_ID, i.TRX_STATE, i.TRX_STARTED, i.TRX_MYSQL_THREAD_ID, "
+    "i.TRX_IS_READ_ONLY, i.TRX_ROWS_MODIFIED, p.ID, p.USER, p.HOST, p.COMMAND "
+    "FROM information_schema.innodb_trx AS i "
+    "JOIN information_schema.processlist AS p "
+    "ON p.ID = i.TRX_MYSQL_THREAD_ID "
+    "WHERE i.TRX_IS_READ_ONLY = 0 AND i.TRX_ROWS_MODIFIED > 0 "
+    "ORDER BY i.TRX_STARTED, i.TRX_ID"
+)
 # Internal binlog retention for the local MySQL container, long enough for
 # replicas to catch up. Not an AWS-facing knob: Aurora exposes retention per
 # cluster through the mysql.rds_set_configuration stored procedure (hours),
@@ -2359,7 +2370,7 @@ def _sync_global_mysql_credentials(writer, global_cluster=None):
                 _attach_instance_to_shared_cluster(instance, cluster)
 
 
-def _mysql_cluster_connection(cluster, user, password):
+def _mysql_cluster_connection(cluster, user, password, *, timeout=None):
     import pymysql
 
     endpoint = cluster.get("_shared_endpoint") or {}
@@ -2367,13 +2378,20 @@ def _mysql_cluster_connection(cluster, user, password):
     port = cluster.get("_shared_internal_port") or endpoint.get("Port")
     if not host or not port:
         return None
+    connect_timeout = 3
+    socket_timeout = None
+    if timeout is not None:
+        socket_timeout = max(float(timeout), 0.001)
+        connect_timeout = min(connect_timeout, socket_timeout)
     return pymysql.connect(
         host=host,
         port=int(port),
         user=user,
         password=password,
         autocommit=True,
-        connect_timeout=3,
+        connect_timeout=connect_timeout,
+        read_timeout=socket_timeout,
+        write_timeout=socket_timeout,
     )
 
 
@@ -2473,21 +2491,40 @@ def _ensure_mysql_compatibility(
     return procedures_ready, plugin_ready
 
 
-def _mysql_replication_connection(cluster):
-    return _mysql_cluster_connection(
-        cluster,
-        _MYSQL_CONTROL_USER,
-        _MYSQL_CONTROL_PASSWORD,
-    )
+def _mysql_replication_connection(cluster, *, timeout=None):
+    args = (cluster, _MYSQL_CONTROL_USER, _MYSQL_CONTROL_PASSWORD)
+    if timeout is None:
+        return _mysql_cluster_connection(*args)
+    return _mysql_cluster_connection(*args, timeout=timeout)
 
 
-def _ensure_mysql_control_user(cluster):
+def _close_mysql_resources(operation, **resources):
+    succeeded = True
+    for resource_type, resource in resources.items():
+        if resource is None:
+            continue
+        try:
+            resource.close()
+        except Exception as e:
+            logger.warning(
+                "RDS: failed to close MySQL %s %s: %s",
+                operation, resource_type, e,
+            )
+            succeeded = False
+    return succeeded
+
+
+def _ensure_mysql_control_user(cluster, *, require_quiescence_grants=False):
     """Create a local, non-replicated account for replica lifecycle SQL."""
-    if cluster.get("_mysql_control_user_ready"):
+    if cluster.get("_mysql_control_user_ready") and (
+        not require_quiescence_grants
+        or cluster.get("_mysql_writer_quiescence_grants_ready")
+    ):
         return True
     cluster_id = cluster.get("DBClusterIdentifier", "unknown")
     conn = None
     cur = None
+    succeeded = False
     try:
         conn = _mysql_admin_connection(cluster)
         if conn is None:
@@ -2500,29 +2537,250 @@ def _ensure_mysql_control_user(cluster):
             (_MYSQL_CONTROL_USER, _MYSQL_CONTROL_PASSWORD),
         )
         cur.execute(
-            "GRANT RELOAD ON *.* TO %s@'%%'",
+            "GRANT PROCESS, RELOAD ON *.* TO %s@'%%'",
             (_MYSQL_CONTROL_USER,),
         )
         cur.execute(
             "GRANT CONNECTION_ADMIN, REPLICATION_SLAVE_ADMIN, "
-            "SYSTEM_VARIABLES_ADMIN ON *.* TO %s@'%%'",
+            "SYSTEM_VARIABLES_ADMIN, XA_RECOVER_ADMIN ON *.* TO %s@'%%'",
             (_MYSQL_CONTROL_USER,),
         )
         cur.execute("FLUSH PRIVILEGES")
-        cluster["_mysql_control_user_ready"] = True
-        return True
+        succeeded = True
     except Exception as e:
         logger.warning(
             "RDS: failed to prepare local MySQL control account for %s: %s",
             cluster_id,
             e,
         )
-        return False
     finally:
-        if cur is not None:
-            cur.close()
-        if conn is not None:
-            conn.close()
+        if not _close_mysql_resources("admin", cursor=cur, connection=conn):
+            succeeded = False
+    if succeeded:
+        cluster["_mysql_control_user_ready"] = True
+        cluster["_mysql_writer_quiescence_grants_ready"] = True
+    return succeeded
+
+
+def _set_mysql_writer_fence(conn):
+    """Fence on a caller-owned connection; never close or bound that owner."""
+    cur = None
+    succeeded = False
+    try:
+        cur = conn.cursor()
+        cur.execute("SET GLOBAL super_read_only=ON")
+        succeeded = True
+    except Exception as e:
+        logger.warning("RDS: failed to install MySQL writer fence: %s", e)
+    finally:
+        if not _close_mysql_resources("fence", cursor=cur):
+            succeeded = False
+    return succeeded
+
+
+def _mysql_writer_fence_active(cluster, *, deadline=None):
+    """Return exact fence state, or None when it cannot be proved."""
+    rows = _mysql_control_query(
+        cluster,
+        "SELECT @@GLOBAL.read_only, @@GLOBAL.super_read_only",
+        deadline=deadline,
+    )
+    if rows is None or len(rows) != 1:
+        return None
+    row = rows[0]
+    if not isinstance(row, (tuple, list)) or len(row) != 2:
+        return None
+    if any(type(value) is not int or value not in (0, 1) for value in row):
+        return None
+    return tuple(row) == (1, 1)
+
+
+def _mysql_control_query(cluster, statement, *, deadline=None):
+    conn = None
+    cur = None
+    rows = None
+    try:
+        timeout = None
+        if deadline is not None:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                return None
+        conn = (
+            _mysql_replication_connection(cluster)
+            if timeout is None
+            else _mysql_replication_connection(cluster, timeout=timeout)
+        )
+        if conn is None:
+            return None
+        cur = conn.cursor()
+        cur.execute(statement)
+        result = cur.fetchall()
+        if isinstance(result, (tuple, list)) and (
+            deadline is None or time.monotonic() <= deadline
+        ):
+            rows = result
+    except Exception as e:
+        logger.warning(
+            "RDS: MySQL control query failed for %s: %s",
+            cluster.get("DBClusterIdentifier", "unknown"), e,
+        )
+    finally:
+        if not _close_mysql_resources("control", cursor=cur, connection=conn):
+            rows = None
+    if deadline is not None and time.monotonic() > deadline:
+        return None
+    return rows
+
+
+def _mysql_modified_transactions(cluster, *, deadline=None):
+    """Return a validated modified read-write transaction inventory."""
+    rows = _mysql_control_query(
+        cluster, _MYSQL_MODIFIED_TRANSACTION_QUERY, deadline=deadline,
+    )
+    if rows is None:
+        return None
+    identities, inventory = set(), []
+    for row in rows:
+        if not isinstance(row, (tuple, list)) or len(row) != 10:
+            return None
+        (trx_id, state, started, trx_thread, read_only, modified,
+         process_id, user, host, command) = row
+        decimal_trx_id = (type(trx_id) is int and trx_id > 0) or (
+            isinstance(trx_id, str)
+            and trx_id.isascii()
+            and trx_id.isdecimal()
+            and 1 <= len(trx_id) <= 18
+            and int(trx_id) > 0
+        )
+        if (
+            not decimal_trx_id
+            or not isinstance(state, str)
+            or state not in _MYSQL_TRANSACTION_STATES
+            or not isinstance(started, datetime.datetime)
+            or type(trx_thread) is not int
+            or type(process_id) is not int
+            or trx_thread <= 0
+            or trx_thread != process_id
+            or type(read_only) is not int
+            or read_only != 0
+            or type(modified) is not int
+            or modified <= 0
+            or not all(isinstance(value, str) for value in (user, host, command))
+        ):
+            return None
+        identity = (int(trx_id), started, trx_thread, process_id)
+        if identity in identities:
+            return None
+        identities.add(identity)
+        inventory.append(tuple(row))
+    return tuple(inventory)
+
+
+def _mysql_prepared_xa_empty(cluster, *, deadline=None):
+    """Return whether XA inventory is empty, or None on query uncertainty."""
+    rows = _mysql_control_query(
+        cluster, "XA RECOVER CONVERT XID", deadline=deadline,
+    )
+    if rows is None:
+        return None
+    return not rows
+
+
+def _capture_mysql_gtid_executed(cluster, *, deadline=None):
+    """Capture the exact fenced source GTID set, failing closed on shape."""
+    rows = _mysql_control_query(
+        cluster, "SELECT @@GLOBAL.gtid_executed", deadline=deadline,
+    )
+    if rows is None or len(rows) != 1:
+        return None
+    row = rows[0]
+    if not isinstance(row, (tuple, list)) or len(row) != 1:
+        return None
+    gtid = row[0]
+    return gtid if isinstance(gtid, str) and gtid and gtid == gtid.strip() else None
+
+
+def _wait_for_mysql_writer_quiescence(cluster, timeout, poll_interval=0.1):
+    """Naturally drain a separately fenced writer and capture its GTID set."""
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or isinstance(poll_interval, bool)
+        or not isinstance(poll_interval, (int, float))
+    ):
+        return None
+    try:
+        timeout = float(timeout)
+        poll_interval = float(poll_interval)
+    except (OverflowError, ValueError):
+        return None
+    if (
+        not math.isfinite(timeout)
+        or timeout <= 0
+        or not math.isfinite(poll_interval)
+        or poll_interval <= 0
+    ):
+        return None
+    deadline = time.monotonic() + timeout
+    container_epoch = cluster.get("_shared_container_epoch")
+
+    def _retry():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(poll_interval, remaining))
+        return True
+
+    while True:
+        fence_active = _mysql_writer_fence_active(cluster, deadline=deadline)
+        if fence_active is None:
+            return None
+        if not fence_active:
+            if not _retry():
+                return None
+            continue
+
+        normal_before = _mysql_modified_transactions(cluster, deadline=deadline)
+        if normal_before is None:
+            return None
+        if normal_before:
+            if not _retry():
+                return None
+            continue
+
+        xa_empty = _mysql_prepared_xa_empty(cluster, deadline=deadline)
+        if xa_empty is None:
+            return None
+        if not xa_empty:
+            if not _retry():
+                return None
+            continue
+
+        normal_after = _mysql_modified_transactions(cluster, deadline=deadline)
+        if normal_after is None:
+            return None
+        if normal_after:
+            if not _retry():
+                return None
+            continue
+        if _mysql_writer_fence_active(cluster, deadline=deadline) is not True:
+            return None
+        if (
+            container_epoch is not None
+            and cluster.get("_shared_container_epoch") != container_epoch
+        ):
+            return None
+        gtid = _capture_mysql_gtid_executed(cluster, deadline=deadline)
+        if gtid is None:
+            return None
+        if _mysql_writer_fence_active(cluster, deadline=deadline) is not True:
+            return None
+        if (
+            container_epoch is not None
+            and cluster.get("_shared_container_epoch") != container_epoch
+        ):
+            return None
+        return gtid
 
 
 def _ensure_mysql_replication_user(cluster):

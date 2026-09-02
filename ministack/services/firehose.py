@@ -25,7 +25,7 @@ import threading
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.concurrency import spawn_background
+from ministack.core.concurrency import run_reentrant, spawn_background
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -46,7 +46,7 @@ _S3_BUCKET_NAME_RE = re.compile(
 
 # ─── in-memory state ──────────────────────────────────────────────────────────
 
-_streams = AccountRegionScopedDict()     # (account, region, name) -> stream descriptor
+_streams = AccountRegionScopedDict()  # (account, region, name) -> stream descriptor
 _lock = threading.Lock()
 _dest_counter = 0
 
@@ -74,12 +74,12 @@ try:
         restore_state(_restored)
 except Exception:
     import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
+
+    logging.getLogger(__name__).exception("Failed to restore persisted state; continuing with fresh store")
 
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
+
 
 def _stream_arn(name: str) -> str:
     return f"arn:aws:firehose:{get_region()}:{get_account_id()}:deliverystream/{name}"
@@ -157,8 +157,12 @@ def _dest_description(dest: dict) -> dict:
             "ErrorOutputPrefix": cfg.get("ErrorOutputPrefix", ""),
             "S3BackupMode": cfg.get("S3BackupMode", "Disabled"),
         }
-        for opt in ("ProcessingConfiguration", "CloudWatchLoggingOptions",
-                    "DataFormatConversionConfiguration", "DynamicPartitioningConfiguration"):
+        for opt in (
+            "ProcessingConfiguration",
+            "CloudWatchLoggingOptions",
+            "DataFormatConversionConfiguration",
+            "DynamicPartitioningConfiguration",
+        ):
             if opt in cfg:
                 desc[opt] = cfg[opt]
         out[key] = desc
@@ -233,8 +237,7 @@ def _resolve_dest_update_config(data: dict):
     return None, None
 
 
-def _apply_lambda_processors(stream: dict, dest: dict, records: list,
-                             metadata_sink: dict = None) -> list:
+def _apply_lambda_processors(stream: dict, dest: dict, records: list, metadata_sink: dict = None) -> list:
     """Apply a destination's ProcessingConfiguration Lambda processors to a
     batch of records.
 
@@ -270,6 +273,7 @@ def _apply_lambda_processors(stream: dict, dest: dict, records: list,
         return records
 
     from ministack.services import lambda_svc
+
     current = list(records)
     stream_arn = stream.get("arn", "")
     stream_name = stream.get("name", "?")
@@ -282,7 +286,8 @@ def _apply_lambda_processors(stream: dict, dest: dict, records: list,
         if func_record is None:
             logger.warning(
                 "Firehose %s: processor Lambda %s not found; passing records through",
-                stream_name, arn,
+                stream_name,
+                arn,
             )
             continue
         now_ms = int(time.time() * 1000)
@@ -302,12 +307,17 @@ def _apply_lambda_processors(stream: dict, dest: dict, records: list,
         try:
             result = lambda_svc._execute_function(func_record, event)
         except Exception as exc:
-            logger.warning("Firehose %s: processor Lambda %s invocation failed: %s; passing through",
-                           stream_name, arn, exc)
+            logger.warning(
+                "Firehose %s: processor Lambda %s invocation failed: %s; passing through", stream_name, arn, exc
+            )
             continue
         if result.get("error"):
-            logger.warning("Firehose %s: processor Lambda %s returned error: %s; passing through",
-                           stream_name, arn, result.get("body"))
+            logger.warning(
+                "Firehose %s: processor Lambda %s returned error: %s; passing through",
+                stream_name,
+                arn,
+                result.get("body"),
+            )
             continue
         body = result.get("body")
         if isinstance(body, (str, bytes)):
@@ -316,8 +326,9 @@ def _apply_lambda_processors(stream: dict, dest: dict, records: list,
             except (ValueError, TypeError):
                 body = None
         if not isinstance(body, dict) or "records" not in body:
-            logger.warning("Firehose %s: processor Lambda %s returned malformed body; passing through",
-                           stream_name, arn)
+            logger.warning(
+                "Firehose %s: processor Lambda %s returned malformed body; passing through", stream_name, arn
+            )
             continue
         by_id = {r.get("recordId"): r for r in body.get("records", []) if isinstance(r, dict)}
         next_round = []
@@ -397,8 +408,7 @@ _ICEBERG_WRITE_LOCK = threading.Lock()
 
 def _iceberg_unique_keys(table_cfgs: list, db: str, table: str) -> list:
     for tc in table_cfgs:
-        if (tc.get("DestinationDatabaseName") == db
-                and tc.get("DestinationTableName") == table):
+        if tc.get("DestinationDatabaseName") == db and tc.get("DestinationTableName") == table:
             return list(tc.get("UniqueKeys") or [])
     return []
 
@@ -441,9 +451,7 @@ def _iceberg_write_group(warehouse: str, db: str, table: str, keys: list, group:
         )
         if group.get("insert"):
             path = _tmp(group["insert"])
-            con.execute(
-                f"INSERT INTO {tbl} BY NAME "
-                f"SELECT * FROM read_json(?, format='array')", [path])
+            con.execute(f"INSERT INTO {tbl} BY NAME " f"SELECT * FROM read_json(?, format='array')", [path])
             _os.unlink(path)
         if group.get("update") and keys:
             cols = [row[0] for row in con.execute(f"DESCRIBE {tbl}").fetchall()]
@@ -454,7 +462,9 @@ def _iceberg_write_group(warehouse: str, db: str, table: str, keys: list, group:
             con.execute(
                 f"MERGE INTO {tbl} AS t USING "
                 f"(SELECT * FROM read_json(?, format='array')) AS s ON {on} "
-                f"WHEN MATCHED THEN UPDATE SET {set_clause}", [path])
+                f"WHEN MATCHED THEN UPDATE SET {set_clause}",
+                [path],
+            )
             _os.unlink(path)
         if group.get("delete") and keys:
             on = " AND ".join(f't."{k}" = s."{k}"' for k in keys)
@@ -462,7 +472,9 @@ def _iceberg_write_group(warehouse: str, db: str, table: str, keys: list, group:
             con.execute(
                 f"MERGE INTO {tbl} AS t USING "
                 f"(SELECT * FROM read_json(?, format='array')) AS s ON {on} "
-                f"WHEN MATCHED THEN DELETE", [path])
+                f"WHEN MATCHED THEN DELETE",
+                [path],
+            )
             _os.unlink(path)
     finally:
         try:
@@ -495,8 +507,9 @@ def _deliver_to_iceberg(stream: dict, dest: dict, records: list):
         try:
             record = json.loads(payload)
         except (ValueError, TypeError):
-            logger.warning("Firehose %s: non-JSON record for Iceberg "
-                           "destination dropped (AWS routes to S3 error bucket)", name)
+            logger.warning(
+                "Firehose %s: non-JSON record for Iceberg " "destination dropped (AWS routes to S3 error bucket)", name
+            )
             continue
         otf = meta.get(rid) or {}
         db = otf.get("destinationDatabaseName") or default_tc.get("DestinationDatabaseName")
@@ -505,13 +518,17 @@ def _deliver_to_iceberg(stream: dict, dest: dict, records: list):
         if op not in ("insert", "update", "delete"):
             op = "insert"
         if not db or not table:
-            logger.warning("Firehose %s: record has no destination database/table; "
-                           "routed to S3 error bucket", name)
+            logger.warning("Firehose %s: record has no destination database/table; " "routed to S3 error bucket", name)
             continue
         keys = _iceberg_unique_keys(table_cfgs, db, table)
         if op in ("update", "delete") and not keys:
-            logger.warning("Firehose %s: '%s' on %s.%s requires UniqueKeys; "
-                           "record routed to S3 error bucket", name, op, db, table)
+            logger.warning(
+                "Firehose %s: '%s' on %s.%s requires UniqueKeys; " "record routed to S3 error bucket",
+                name,
+                op,
+                db,
+                table,
+            )
             continue
         g = groups.setdefault(
             (warehouse, db, table, tuple(keys)),
@@ -527,8 +544,7 @@ def _deliver_to_iceberg(stream: dict, dest: dict, records: list):
             try:
                 _iceberg_write_group(wh, db, table, list(keys), group)
             except Exception as exc:
-                logger.warning("Firehose %s: Iceberg delivery to %s.%s failed: %s",
-                               name, db, table, exc)
+                logger.warning("Firehose %s: Iceberg delivery to %s.%s failed: %s", name, db, table, exc)
 
     # Inline if no thread can be started: losing delivery records silently is
     # worse than blocking this caller. (Before this ran on `spawn_background`,
@@ -569,7 +585,8 @@ def ingest_from_kinesis_source(stream_arn: str, records: list) -> None:
     now_ts = now_epoch()
     with _lock:
         targets = [
-            s for s in _streams.values()
+            s
+            for s in _streams.values()
             if s.get("type") == "KinesisStreamAsSource"
             and s.get("status") == "ACTIVE"
             and (s.get("kinesis_source") or {}).get("KinesisStreamARN") == stream_arn
@@ -591,18 +608,18 @@ def ingest_from_kinesis_source(stream_arn: str, records: list) -> None:
                     plan.append((stream, dest, rid, raw))
     for stream, dest, rid, raw in plan:
         try:
-            for _rid, payload in _apply_lambda_processors(
-                stream, dest, [(rid, raw)]
-            ):
+            for _rid, payload in _apply_lambda_processors(stream, dest, [(rid, raw)]):
                 _deliver_to_s3(stream, dest, payload)
         except Exception as exc:
             logger.warning(
                 "Firehose Kinesis-source delivery to %s failed: %s",
-                stream.get("name"), exc,
+                stream.get("name"),
+                exc,
             )
 
 
 # ─── operations ──────────────────────────────────────────────────────────────
+
 
 def _create_delivery_stream(data: dict):
     name = data.get("DeliveryStreamName", "")
@@ -630,12 +647,14 @@ def _create_delivery_stream(data: dict):
             validation_error = _validate_s3_destination_config(dtype, cfg)
             if validation_error:
                 return validation_error
-            destinations.append({
-                "id": _next_dest_id(),
-                "type": dtype,
-                "config": cfg,
-                "records": [],
-            })
+            destinations.append(
+                {
+                    "id": _next_dest_id(),
+                    "type": dtype,
+                    "config": cfg,
+                    "records": [],
+                }
+            )
 
         stream_type = data.get("DeliveryStreamType", "DirectPut")
         now = now_epoch()
@@ -659,6 +678,7 @@ def _create_delivery_stream(data: dict):
             _fh_role = ks_cfg.get("RoleARN", "")
             if _fh_role:
                 from ministack.core.iam_evaluator import validate_role_arn
+
                 _fh_role_err = validate_role_arn(_fh_role)
                 if _fh_role_err:
                     return _invalid(_fh_role_err)
@@ -716,15 +736,17 @@ def _list_delivery_streams(data: dict):
     if start:
         try:
             idx = names.index(start)
-            names = names[idx + 1:]
+            names = names[idx + 1 :]
         except ValueError:
             pass
 
     has_more = len(names) > limit
-    return json_response({
-        "DeliveryStreamNames": names[:limit],
-        "HasMoreDeliveryStreams": has_more,
-    })
+    return json_response(
+        {
+            "DeliveryStreamNames": names[:limit],
+            "HasMoreDeliveryStreams": has_more,
+        }
+    )
 
 
 def _put_record(data: dict):
@@ -752,9 +774,7 @@ def _put_record(data: dict):
             dest["records"].append({"id": record_id, "data": raw_data, "ts": now_epoch()})
             if dest["type"] in ("ExtendedS3", "S3"):
                 # Apply ProcessingConfiguration.Lambda transforms before S3.
-                for _rid, payload in _apply_lambda_processors(
-                    stream, dest, [(record_id, decoded)]
-                ):
+                for _rid, payload in _apply_lambda_processors(stream, dest, [(record_id, decoded)]):
                     _deliver_to_s3(stream, dest, payload)
             elif dest["type"] == "Iceberg":
                 _deliver_to_iceberg(stream, dest, [(record_id, decoded)])
@@ -790,25 +810,27 @@ def _put_record_batch(data: dict):
                 for dest in stream["destinations"]:
                     dest["records"].append({"id": record_id, "data": raw_data, "ts": now_epoch()})
                     if dest["type"] in ("ExtendedS3", "S3"):
-                        for _rid, payload in _apply_lambda_processors(
-                            stream, dest, [(record_id, decoded)]
-                        ):
+                        for _rid, payload in _apply_lambda_processors(stream, dest, [(record_id, decoded)]):
                             _deliver_to_s3(stream, dest, payload)
                     elif dest["type"] == "Iceberg":
                         _deliver_to_iceberg(stream, dest, [(record_id, decoded)])
                 responses.append({"RecordId": record_id, "Encrypted": False})
             except Exception as e:
                 failed += 1
-                responses.append({
-                    "ErrorCode": "ServiceUnavailableException",
-                    "ErrorMessage": str(e),
-                })
+                responses.append(
+                    {
+                        "ErrorCode": "ServiceUnavailableException",
+                        "ErrorMessage": str(e),
+                    }
+                )
 
-    return json_response({
-        "FailedPutCount": failed,
-        "Encrypted": False,
-        "RequestResponses": responses,
-    })
+    return json_response(
+        {
+            "FailedPutCount": failed,
+            "Encrypted": False,
+            "RequestResponses": responses,
+        }
+    )
 
 
 def _update_destination(data: dict):
@@ -905,15 +927,17 @@ def _list_tags_for_delivery_stream(data: dict):
     if start:
         try:
             idx = next(i for i, t in enumerate(all_tags) if t["Key"] == start)
-            all_tags = all_tags[idx + 1:]
+            all_tags = all_tags[idx + 1 :]
         except StopIteration:
             pass
 
     has_more = len(all_tags) > limit
-    return json_response({
-        "Tags": all_tags[:limit],
-        "HasMoreTags": has_more,
-    })
+    return json_response(
+        {
+            "Tags": all_tags[:limit],
+            "HasMoreTags": has_more,
+        }
+    )
 
 
 def _start_delivery_stream_encryption(data: dict):
@@ -966,9 +990,8 @@ _HANDLERS = {
 }
 
 
-async def handle_request(method, path, headers, body, query_params):
+def _handle_request_sync(method, path, headers, body, query_params):
     target = headers.get("x-amz-target", "")
-    # Target format: Firehose_20150804.OperationName
     action = target.split(".")[-1] if "." in target else ""
 
     if not action:
@@ -984,3 +1007,17 @@ async def handle_request(method, path, headers, body, query_params):
         return error_response_json("InvalidArgumentException", "Request body is not valid JSON.", 400)
 
     return handler(data)
+
+
+async def handle_request(method, path, headers, body, query_params):
+    """Dispatch off the event loop.
+
+    PutRecord with an Iceberg destination delivers via DuckDB, which makes
+    loopback HTTP calls back to the gateway. Running the handler on the event
+    loop thread deadlocks: the background thread's POST waits for the event
+    loop, which is blocked on handler(). run_reentrant gives the handler its
+    own thread so the event loop stays free for the loopback.
+    """
+    return await run_reentrant(
+        _handle_request_sync, method, path, headers, body, query_params, thread_name="ministack-firehose-dispatch"
+    )
