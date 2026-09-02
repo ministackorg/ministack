@@ -1880,6 +1880,10 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         "AWS_DEFAULT_REGION": get_region(),
         "AWS_REGION": get_region(),
         "AWS_ENDPOINT_URL": s3_endpoint,
+        # The Java AWS SDK v2 does not read AWS_ENDPOINT_URL (that is a
+        # boto3/Python convention). Iceberg's S3FileIO uses the Java SDK for
+        # the actual S3 PutObject, so it needs the Java-side env var.
+        "AWS_ENDPOINT_URL_S3": s3_endpoint,
         "DISABLE_SSL": "true",
     }
 
@@ -1890,6 +1894,12 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         "spark-submit",
         "--master",
         "local[*]",
+        # Java SDK v2 system property: Iceberg's S3FileIO reads this for
+        # the S3 endpoint when the env var is not picked up.
+        "--conf",
+        f"spark.driver.extraJavaOptions=-Daws.endpointUrlS3={s3_endpoint}",
+        "--conf",
+        f"spark.executor.extraJavaOptions=-Daws.endpointUrlS3={s3_endpoint}",
         # S3A (Hadoop filesystem for s3a:// paths)
         "--conf",
         f"spark.hadoop.fs.s3a.endpoint={s3_endpoint}",
