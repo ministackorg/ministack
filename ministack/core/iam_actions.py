@@ -97,6 +97,7 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "states": "states",
     "sts": "sts",
     "tagging": "tag",
+    "transcribe": "transcribe",
     "transfer": "transfer",
     "waf": "waf",
     "waf-regional": "waf-regional",

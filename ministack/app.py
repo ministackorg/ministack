@@ -366,6 +366,7 @@ SERVICE_REGISTRY = {
     "states": {"module": "stepfunctions", "aliases": ("step-functions", "stepfunctions")},
     "sts": {"module": "sts"},
     "tagging": {"module": "tagging"},
+    "transcribe": {"module": "transcribe"},
     "transfer": {"module": "transfer"},
     "waf": {"module": "waf_v1"},
     "waf-regional": {"module": "waf_v1"},
@@ -430,6 +431,7 @@ _state_map = {
     "bedrock_agent_runtime": "bedrock_agent_runtime",
     "bedrock_agentcore": "bedrock_agentcore",
     "msk": "msk",
+    "transcribe": "transcribe",
 }
 
 SERVICE_NAME_ALIASES = {
