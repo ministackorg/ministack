@@ -178,6 +178,14 @@ def _requires_replacement_dynamodb(old_props, new_props):
     return False
 
 
+def _requires_replacement_sfn(old_props, new_props):
+    """AWS::StepFunctions::StateMachine requires replacement when
+    StateMachineType changes (the resource reference marks the property
+    "Update requires: Replacement")."""
+    return (old_props.get("StateMachineType", "STANDARD")
+            != new_props.get("StateMachineType", "STANDARD"))
+
+
 def _requires_replacement_cognito_user_pool_group(old_props, new_props):
     """AWS::Cognito::UserPoolGroup requires replacement when UserPoolId
     changes (the resource reference marks the property "Update requires:
@@ -194,6 +202,10 @@ _CUSTOM_NAME_REPLACEMENT = {
     "AWS::DynamoDB::Table": {
         "name": "TableName",
         "requires_replacement": _requires_replacement_dynamodb,
+    },
+    "AWS::StepFunctions::StateMachine": {
+        "name": "StateMachineName",
+        "requires_replacement": _requires_replacement_sfn,
     },
     "AWS::Cognito::UserPoolGroup": {
         "name": "GroupName",
@@ -5596,9 +5608,10 @@ def _lambda_layer_version_permission_delete(physical_id, props):
 # StepFunctions StateMachine
 # ---------------------------------------------------------------------------
 
-def _sfn_state_machine_create(logical_id, props, stack_name):
-    name = props.get("StateMachineName") or _physical_name(stack_name, logical_id, max_len=80)
-    role_arn = props.get("RoleArn", f"arn:aws:iam::{get_account_id()}:role/StepFunctionsRole")
+def _sfn_definition(props):
+    """The Amazon States Language definition a template declares, resolved
+    from whichever of the three sources it uses, with DefinitionSubstitutions
+    applied."""
     import json as _json
 
     # Real CFN accepts three mutually-exclusive definition shapes:
@@ -5640,11 +5653,38 @@ def _sfn_state_machine_create(logical_id, props, stack_name):
     if subs:
         for k, v in subs.items():
             definition = definition.replace("${" + str(k) + "}", str(v))
+    return definition
 
+
+def _sfn_tags(props):
+    """CloudFormation ``Tags`` ([{Key, Value}]) in the shape the Step
+    Functions tag store keeps ([{key, value}])."""
+    return [{"key": t.get("Key", ""), "value": t.get("Value", "")} for t in props.get("Tags") or []]
+
+
+def _sfn_attrs(arn, name):
+    """Ref is the ARN; Fn::GetAtt serves Arn, Name and StateMachineRevisionId,
+    the revision the record carries (rotated by every create and update)."""
+    attrs = {"Arn": arn, "Name": name}
+    sm = _sfn._state_machines.get(arn)
+    if sm and sm.get("revisionId"):
+        attrs["StateMachineRevisionId"] = sm["revisionId"]
+    return attrs
+
+
+def _sfn_state_machine_create(logical_id, props, stack_name):
+    name = props.get("StateMachineName") or _physical_name(stack_name, logical_id, max_len=80)
+    role_arn = props.get("RoleArn", f"arn:aws:iam::{get_account_id()}:role/StepFunctionsRole")
+    definition = _sfn_definition(props)
     sm_type = props.get("StateMachineType", "STANDARD")
 
     arn = f"arn:aws:states:{get_region()}:{get_account_id()}:stateMachine:{name}"
     ts = now_iso()
+    # The record mirrors what CreateStateMachine writes, revision id and
+    # version counter included, so versions published later behave the same
+    # for a template-created machine. TracingConfiguration and
+    # EncryptionConfiguration have no field in the store and are accepted
+    # without effect.
     _sfn._state_machines[arn] = {
         "stateMachineArn": arn,
         "name": name,
@@ -5654,12 +5694,87 @@ def _sfn_state_machine_create(logical_id, props, stack_name):
         "creationDate": ts,
         "status": "ACTIVE",
         "loggingConfiguration": props.get("LoggingConfiguration", {"level": "OFF", "includeExecutionData": False}),
+        "revisionId": new_uuid(),
+        "lastVersionNumber": 0,
     }
-    return arn, {"Arn": arn, "Name": name}
+    tags = _sfn_tags(props)
+    if tags:
+        _sfn._tag_resource({"resourceArn": arn, "tags": tags})
+    return arn, _sfn_attrs(arn, name)
+
+
+def _sfn_state_machine_update(physical_id, old_props, new_props, stack_name,
+                              logical_id=None):
+    """Update a state machine in place through UpdateStateMachine, keeping
+    its ARN (what Ref returns), its executions and its published versions.
+    StateMachineName and StateMachineType require replacement
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-stepfunctions-statemachine.html):
+    a rename creates the new machine before the old one is removed; a type
+    change under an unchanged name is refused — for a custom name by
+    _custom_named_replacement_error, as CloudFormation refuses it, and here
+    for a generated name, whose deterministic derivation cannot yield a
+    fresh identity. Definition, DefinitionSubstitutions, RoleArn,
+    LoggingConfiguration and Tags update without interruption;
+    TracingConfiguration and EncryptionConfiguration are accepted without
+    effect, the store has no field for them.
+    """
+    name = new_props.get("StateMachineName") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=80
+    )
+    sm = _sfn._state_machines.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        name, sm.get("name") if sm else None,
+        _sfn_state_machine_create, _sfn_state_machine_delete,
+    )
+    if replaced is not None:
+        return replaced
+
+    old_type = old_props.get("StateMachineType", "STANDARD")
+    new_type = new_props.get("StateMachineType", "STANDARD")
+    if new_type != old_type:
+        raise ValueError(
+            f"AWS::StepFunctions::StateMachine StateMachineType ({old_type} -> "
+            f"{new_type}) requires replacement, which MiniStack does not perform "
+            f"for {name}; set a StateMachineName to create the replacement."
+        )
+
+    data = {
+        "stateMachineArn": physical_id,
+        "definition": _sfn_definition(new_props),
+        "roleArn": new_props.get(
+            "RoleArn", f"arn:aws:iam::{get_account_id()}:role/StepFunctionsRole"
+        ),
+    }
+    # Sent only when the template speaks to the property: declared, or
+    # dropped since the previous template, which reverts it to the default
+    # the create applies. A logging configuration set outside the stack on a
+    # machine whose template never declared one is left alone.
+    logging = _declared_or_default(old_props, new_props, {
+        "LoggingConfiguration": {"level": "OFF", "includeExecutionData": False}})
+    if logging:
+        data["loggingConfiguration"] = logging["LoggingConfiguration"]
+    resp = _sfn._update_state_machine(data)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::StepFunctions::StateMachine update failed: {resp[2]!r}")
+
+    # Tags reconcile through TagResource / UntagResource as on AWS: keys the
+    # template dropped are removed, the rest are written in place.
+    old_tags = {t["key"]: t["value"] for t in _sfn_tags(old_props)}
+    new_tags = {t["key"]: t["value"] for t in _sfn_tags(new_props)}
+    if old_tags != new_tags:
+        dropped = sorted(old_tags.keys() - new_tags.keys())
+        if dropped:
+            _sfn._untag_resource({"resourceArn": physical_id, "tagKeys": dropped})
+        changed = [t for t in _sfn_tags(new_props) if old_tags.get(t["key"]) != t["value"]]
+        if changed:
+            _sfn._tag_resource({"resourceArn": physical_id, "tags": changed})
+    return physical_id, _sfn_attrs(physical_id, name)
 
 
 def _sfn_state_machine_delete(physical_id, props):
     _sfn._state_machines.pop(physical_id, None)
+    _sfn._tags.pop(physical_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -7697,7 +7812,12 @@ _RESOURCE_HANDLERS = {
         "create": _lambda_layer_version_permission_create,
         "delete": _lambda_layer_version_permission_delete,
     },
-    "AWS::StepFunctions::StateMachine": {"create": _sfn_state_machine_create, "delete": _sfn_state_machine_delete},
+    "AWS::StepFunctions::StateMachine": {
+        "create": _sfn_state_machine_create,
+        "update": _sfn_state_machine_update,
+        "update_with_logical_id": True,
+        "delete": _sfn_state_machine_delete,
+    },
     "AWS::Route53::HostedZone": {"create": _r53_hosted_zone_create, "delete": _r53_hosted_zone_delete},
     "AWS::Route53::RecordSet": {"create": _r53_record_set_create, "delete": _r53_record_set_delete},
     "AWS::ApiGatewayV2::Api": {"create": _apigw_v2_api_create, "delete": _apigw_v2_api_delete},

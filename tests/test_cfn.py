@@ -12432,3 +12432,317 @@ def test_cfn_events_rule_generated_name_updates_in_place(cfn, eb):
         _delete_cfn_test_stack(cfn, stack_name)
     with pytest.raises(ClientError):
         eb.describe_rule(Name=name)
+
+
+def _sfn_definition_json(comment):
+    return json.dumps({
+        "Comment": comment,
+        "StartAt": "Done",
+        "States": {"Done": {"Type": "Pass", "End": True}},
+    })
+
+
+def test_cfn_state_machine_update_keeps_arn_and_executions(cfn, sfn):
+    """A changed definition and role update the machine in place through
+    UpdateStateMachine: same ARN, the execution started before the update is
+    still listed, DescribeStateMachine shows the new definition."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sfn-upd-{uid}"
+
+    def template(comment, role):
+        return json.dumps({
+            "Resources": {"SM": {"Type": "AWS::StepFunctions::StateMachine", "Properties": {
+                "StateMachineName": f"cfn-sfn-upd-{uid}",
+                "DefinitionString": _sfn_definition_json(comment),
+                "RoleArn": f"arn:aws:iam::000000000000:role/{role}",
+            }}},
+            "Outputs": {"Arn": {"Value": {"Ref": "SM"}},
+                        "Name": {"Value": {"Fn::GetAtt": ["SM", "Name"]}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("v1", "sfn-role-a"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _output(stack, "Arn")
+        execution = sfn.start_execution(stateMachineArn=arn, input="{}")["executionArn"]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("v2", "sfn-role-b"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Arn") == arn
+        assert _output(stack, "Name") == f"cfn-sfn-upd-{uid}"
+
+        described = sfn.describe_state_machine(stateMachineArn=arn)
+        assert json.loads(described["definition"])["Comment"] == "v2"
+        assert described["roleArn"] == "arn:aws:iam::000000000000:role/sfn-role-b"
+        executions = sfn.list_executions(stateMachineArn=arn)["executions"]
+        assert [e["executionArn"] for e in executions] == [execution]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_state_machine_type_change_under_custom_name_fails_loudly(cfn, sfn):
+    """StateMachineType requires replacement, which CloudFormation refuses
+    for a custom-named machine: the stack rolls back and the machine keeps
+    its type."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sfn-type-{uid}"
+
+    def template(sm_type):
+        return json.dumps({
+            "Resources": {"SM": {"Type": "AWS::StepFunctions::StateMachine", "Properties": {
+                "StateMachineName": f"cfn-sfn-type-{uid}",
+                "StateMachineType": sm_type,
+                "DefinitionString": _sfn_definition_json("typed"),
+                "RoleArn": "arn:aws:iam::000000000000:role/sfn-role",
+            }}},
+            "Outputs": {"Arn": {"Value": {"Ref": "SM"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("STANDARD"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _output(stack, "Arn")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("EXPRESS"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        reasons = _stack_event_reasons(cfn, stack_name)
+        assert "custom-named resource requires replacing" in reasons
+        assert sfn.describe_state_machine(stateMachineArn=arn)["type"] == "STANDARD"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_state_machine_type_change_under_generated_name_fails_loudly(cfn, sfn):
+    """Under a generated name the deterministic derivation cannot yield a
+    fresh identity for the replacement, so MiniStack fails the update
+    naming the property instead of rebuilding the machine in place: the
+    stack rolls back and the machine keeps its ARN and type."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sfn-gentype-{uid}"
+
+    def template(sm_type):
+        return json.dumps({
+            "Resources": {"SM": {"Type": "AWS::StepFunctions::StateMachine", "Properties": {
+                "StateMachineType": sm_type,
+                "DefinitionString": _sfn_definition_json("generated"),
+                "RoleArn": "arn:aws:iam::000000000000:role/sfn-role",
+            }}},
+            "Outputs": {"Arn": {"Value": {"Ref": "SM"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("STANDARD"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _output(stack, "Arn")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("EXPRESS"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        reasons = _stack_event_reasons(cfn, stack_name)
+        assert "StateMachineType (STANDARD -> EXPRESS) requires replacement" in reasons
+        assert _output(stack, "Arn") == arn
+        assert sfn.describe_state_machine(stateMachineArn=arn)["type"] == "STANDARD"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_state_machine_rename_replaces_the_machine(cfn, sfn):
+    """StateMachineName requires replacement: the renamed machine is created
+    before the old one is removed, Ref follows the new ARN, and a logging
+    configuration set outside the stack on the old machine does not carry
+    over, since the new one is created from the template alone."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sfn-ren-{uid}"
+
+    def template(name):
+        return json.dumps({
+            "Resources": {"SM": {"Type": "AWS::StepFunctions::StateMachine", "Properties": {
+                "StateMachineName": name,
+                "DefinitionString": _sfn_definition_json("renamed"),
+                "RoleArn": "arn:aws:iam::000000000000:role/sfn-role",
+            }}},
+            "Outputs": {"Arn": {"Value": {"Ref": "SM"}},
+                        "Name": {"Value": {"Fn::GetAtt": ["SM", "Name"]}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(f"cfn-sfn-a-{uid}"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        old_arn = _output(stack, "Arn")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(f"cfn-sfn-b-{uid}"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        new_arn = _output(stack, "Arn")
+        assert new_arn != old_arn
+        assert _output(stack, "Name") == f"cfn-sfn-b-{uid}"
+        assert sfn.describe_state_machine(stateMachineArn=new_arn)["name"] == f"cfn-sfn-b-{uid}"
+        with pytest.raises(ClientError):
+            sfn.describe_state_machine(stateMachineArn=old_arn)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_state_machine_update_keeps_an_undeclared_logging_configuration(cfn, sfn):
+    """A property the template never declared is not the stack's to reset: a
+    LoggingConfiguration set through UpdateStateMachine outside the stack
+    survives an update that only changes the definition."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sfn-log-{uid}"
+
+    def template(comment):
+        return json.dumps({
+            "Resources": {"SM": {"Type": "AWS::StepFunctions::StateMachine", "Properties": {
+                "StateMachineName": f"cfn-sfn-log-{uid}",
+                "DefinitionString": _sfn_definition_json(comment),
+                "RoleArn": "arn:aws:iam::000000000000:role/sfn-role",
+            }}},
+            "Outputs": {"Arn": {"Value": {"Ref": "SM"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("v1"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _output(stack, "Arn")
+        sfn.update_state_machine(
+            stateMachineArn=arn,
+            loggingConfiguration={"level": "ALL", "includeExecutionData": True},
+        )
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("v2"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        described = sfn.describe_state_machine(stateMachineArn=arn)
+        assert json.loads(described["definition"])["Comment"] == "v2"
+        assert described["loggingConfiguration"]["level"] == "ALL"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_state_machine_update_drops_a_declared_logging_configuration(cfn, sfn):
+    """LoggingConfiguration updates without interruption ("By default, the
+    level is set to OFF", AWS::StepFunctions::StateMachine reference): a
+    template that stops declaring it reverts the machine to OFF, since the
+    property was the stack's to set."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sfn-unlog-{uid}"
+
+    def template(logging):
+        props = {
+            "StateMachineName": f"cfn-sfn-unlog-{uid}",
+            "DefinitionString": _sfn_definition_json("logged"),
+            "RoleArn": "arn:aws:iam::000000000000:role/sfn-role",
+        }
+        if logging:
+            props["LoggingConfiguration"] = {"level": "ALL", "includeExecutionData": True}
+        return json.dumps({
+            "Resources": {"SM": {"Type": "AWS::StepFunctions::StateMachine", "Properties": props}},
+            "Outputs": {"Arn": {"Value": {"Ref": "SM"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(True))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _output(stack, "Arn")
+        assert sfn.describe_state_machine(stateMachineArn=arn)["loggingConfiguration"]["level"] == "ALL"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(False))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        described = sfn.describe_state_machine(stateMachineArn=arn)
+        assert described["loggingConfiguration"] == {"level": "OFF", "includeExecutionData": False}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_state_machine_update_applies_definition_substitutions(cfn, sfn):
+    """DefinitionSubstitutions updates without interruption: a changed value
+    lands in the definition through UpdateStateMachine, and the
+    StateMachineRevisionId attribute ("Identifier for a state machine
+    revision", AWS::StepFunctions::StateMachine reference) moves with it."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sfn-subs-{uid}"
+    definition = json.dumps({
+        "StartAt": "Call",
+        "States": {"Call": {"Type": "Task", "Resource": "${Target}", "End": True}},
+    })
+
+    def template(target):
+        return json.dumps({
+            "Resources": {"SM": {"Type": "AWS::StepFunctions::StateMachine", "Properties": {
+                "StateMachineName": f"cfn-sfn-subs-{uid}",
+                "DefinitionString": definition,
+                "DefinitionSubstitutions": {"Target": target},
+                "RoleArn": "arn:aws:iam::000000000000:role/sfn-role",
+            }}},
+            "Outputs": {"Arn": {"Value": {"Ref": "SM"}},
+                        "Revision": {"Value": {"Fn::GetAtt": ["SM", "StateMachineRevisionId"]}}},
+        })
+
+    fn_a = "arn:aws:lambda:us-east-1:000000000000:function:target-a"
+    fn_b = "arn:aws:lambda:us-east-1:000000000000:function:target-b"
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(fn_a))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _output(stack, "Arn")
+        described = sfn.describe_state_machine(stateMachineArn=arn)
+        assert json.loads(described["definition"])["States"]["Call"]["Resource"] == fn_a
+        revision = _output(stack, "Revision")
+        assert revision == described["revisionId"]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(fn_b))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Arn") == arn
+        described = sfn.describe_state_machine(stateMachineArn=arn)
+        assert json.loads(described["definition"])["States"]["Call"]["Resource"] == fn_b
+        assert _output(stack, "Revision") == described["revisionId"]
+        assert _output(stack, "Revision") != revision
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_state_machine_update_changes_tags_in_place(cfn, sfn):
+    """Tags update without interruption (AWS::StepFunctions::StateMachine
+    reference): the machine is tagged on create, and an update rewrites a
+    value, adds a key and drops another under the same ARN."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sfn-tags-{uid}"
+
+    def template(tags):
+        return json.dumps({
+            "Resources": {"SM": {"Type": "AWS::StepFunctions::StateMachine", "Properties": {
+                "StateMachineName": f"cfn-sfn-tags-{uid}",
+                "DefinitionString": _sfn_definition_json("tagged"),
+                "RoleArn": "arn:aws:iam::000000000000:role/sfn-role",
+                "Tags": [{"Key": k, "Value": v} for k, v in tags.items()],
+            }}},
+            "Outputs": {"Arn": {"Value": {"Ref": "SM"}}},
+        })
+
+    def tags_of(arn):
+        return {t["key"]: t["value"] for t in sfn.list_tags_for_resource(resourceArn=arn)["tags"]}
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template({"env": "dev", "team": "iot"}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _output(stack, "Arn")
+        assert tags_of(arn) == {"env": "dev", "team": "iot"}
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template({"env": "prod", "owner": "ops"}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Arn") == arn
+        assert tags_of(arn) == {"env": "prod", "owner": "ops"}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
