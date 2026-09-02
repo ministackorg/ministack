@@ -1522,3 +1522,11 @@ def test_sqs_invalid_chars_regex_matches_xml10_complement():
     for c in ("\t", "\n", "\r", "퟿", "", "�",
               "a", "こ", "\U0001f600"):
         assert not rx.search(c), f"must allow {c!r}"
+
+
+def test_unicode_sqs_message(sqs):
+    url = sqs.create_queue(QueueName="unicode-sqs")["QueueUrl"]
+    msg = "こんにちは世界 héllo wörld"
+    sqs.send_message(QueueUrl=url, MessageBody=msg)
+    resp = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=1)
+    assert resp["Messages"][0]["Body"] == msg

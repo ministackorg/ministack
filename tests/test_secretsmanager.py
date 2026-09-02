@@ -932,3 +932,9 @@ def test_secret_label_updated_event_to_eventbridge(sm, eb, sqs):
     # Metadata-only update must not have emitted an extra event beyond the
     # AWSCURRENT moves (create + put); AWSPENDING/AWSPREVIOUS never emit.
     assert all(e["detail"]["labelUpdated"] == "AWSCURRENT" for e in label_events)
+
+
+def test_unicode_secretsmanager(sm):
+    sm.create_secret(Name="unicode-secret", SecretString="пароль: 密码")
+    resp = sm.get_secret_value(SecretId="unicode-secret")
+    assert resp["SecretString"] == "пароль: 密码"

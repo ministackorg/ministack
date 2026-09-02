@@ -1994,6 +1994,18 @@ def _image_is_local(docker_client, image: str) -> bool:
         return False
 
 
+def _instance_available_unless_stopped(instance):
+    """Finish a container worker without clobbering an intervened stop.
+
+    StopDBInstance can land while the worker is still pulling and starting
+    the container; flipping the status back to "available" here would undo
+    the stop the caller was already told succeeded — the same intervened-stop
+    rule the replicating-reader path applies.
+    """
+    if instance.get("DBInstanceStatus") != "stopped":
+        instance["DBInstanceStatus"] = "available"
+
+
 def _start_rds_container_for_instance(db_id, instance):
     """Re-spin (or re-attach to) the Docker container for a restored instance.
 
@@ -2007,7 +2019,7 @@ def _start_rds_container_for_instance(db_id, instance):
     """
     docker_client = _get_docker()
     if not docker_client:
-        instance["DBInstanceStatus"] = "available"
+        _instance_available_unless_stopped(instance)
         return
 
     engine = instance.get("Engine", "postgres")
@@ -2038,7 +2050,7 @@ def _start_rds_container_for_instance(db_id, instance):
         engine, engine_version, master_user, master_pass, db_name,
     )
     if not image:
-        instance["DBInstanceStatus"] = "available"
+        _instance_available_unless_stopped(instance)
         return
 
     container_name = _rds_docker_name(db_id)
@@ -2173,7 +2185,7 @@ def _start_rds_container_for_instance(db_id, instance):
             except Exception:
                 pass
             return
-    instance["DBInstanceStatus"] = "available"
+    _instance_available_unless_stopped(instance)
     logger.info("RDS: respawned container %s for instance %s",
                 container_name, db_id)
 
