@@ -13714,3 +13714,21 @@ def test_rds_network_aliases_only_on_user_defined_networks():
         assert not rds_service._network_supports_aliases(network), network
     for network in ("ministack_default", "my-compose_default", "anything-else"):
         assert rds_service._network_supports_aliases(network), network
+
+
+def test_rds_container_worker_does_not_clobber_an_intervened_stop(monkeypatch):
+    """StopDBInstance while the create worker is still starting the container
+    must stay stopped: the finishing worker used to write "available"
+    unconditionally, so a proxy target went back to AVAILABLE and pollers saw
+    the instance running again."""
+    from ministack.services import rds as m
+
+    monkeypatch.setattr(m, "_get_docker", lambda: None)
+    instance = {"DBInstanceIdentifier": "stopped-mid-create",
+                "DBInstanceStatus": "stopped", "Engine": "postgres"}
+    m._start_rds_container_for_instance("stopped-mid-create", instance)
+    assert instance["DBInstanceStatus"] == "stopped"
+
+    instance["DBInstanceStatus"] = "creating"
+    m._start_rds_container_for_instance("stopped-mid-create", instance)
+    assert instance["DBInstanceStatus"] == "available"

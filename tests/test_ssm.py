@@ -962,3 +962,9 @@ def test_ssm_command_lookup_filters_and_errors(ssm, ec2):
     finally:
         ec2.terminate_instances(InstanceIds=[instance_id, other_id])
         ec2.deregister_image(ImageId=ami)
+
+
+def test_unicode_ssm_parameter(ssm):
+    ssm.put_parameter(Name="/unicode/param", Value="값: τιμή", Type="String")
+    resp = ssm.get_parameter(Name="/unicode/param")
+    assert resp["Parameter"]["Value"] == "값: τιμή"

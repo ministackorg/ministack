@@ -675,3 +675,14 @@ def test_route53_create_record_duplicate_fails(r53):
         )
     assert exc.value.response["Error"]["Code"] == "InvalidChangeBatch"
 
+
+
+def test_unicode_route53_zone_comment(r53):
+    resp = r53.create_hosted_zone(
+        Name="unicode-zone.com",
+        CallerReference="ref-uc-1",
+        HostedZoneConfig={"Comment": "zona en español — Ünïcödé"},
+    )
+    zone_id = resp["HostedZone"]["Id"].split("/")[-1]
+    get = r53.get_hosted_zone(Id=zone_id)
+    assert get["HostedZone"]["Config"]["Comment"] == "zona en español — Ünïcödé"
