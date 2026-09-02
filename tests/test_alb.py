@@ -1724,9 +1724,12 @@ def test_oidc_data_is_an_alb_format_claims_jwt(elbv2, lam):
         status, _, body = _oidc_get("/private", name, {"Cookie": jar})
         assert status == 200
         token = json.loads(body)["data"]
-        head, payload, _sig = token.split(".")
-        head += "=" * (-len(head) % 4)
-        payload += "=" * (-len(payload) % 4)
+        head, payload, sig = token.split(".")
+        # ALB's documented deviation from standard JWT: every segment keeps
+        # its base64 padding. Strict JWT parsers fail on real ALB tokens
+        # because of it, so the emulator must reproduce it.
+        for segment in (head, payload, sig):
+            assert len(segment) % 4 == 0
         header = json.loads(base64.urlsafe_b64decode(head))
         claims = json.loads(base64.urlsafe_b64decode(payload))
         assert header["alg"] == "ES256"

@@ -1455,7 +1455,12 @@ def _oidc_signing_material():
 
 
 def _oidc_b64url(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    # ALB's documented quirk: unlike standard JWTs, the x-amzn-oidc-data
+    # segments are base64url WITH the trailing padding characters ("includes
+    # padding characters at the end" per the user-claims-encoding docs) —
+    # strict JWT libraries choke on real ALB tokens for exactly this reason,
+    # so an emulator that strips the padding hides that failure mode.
+    return base64.urlsafe_b64encode(raw).decode()
 
 
 def _oidc_data_jwt(claims, cfg, lb_arn, exp):
