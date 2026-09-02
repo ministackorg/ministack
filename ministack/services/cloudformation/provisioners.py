@@ -1440,10 +1440,16 @@ def _attach_policy_to_entities(arn, props):
                 _iam.attach_managed_policy(entity, arn)
 
 
+def _iam_policy_arn(props, name):
+    """The ARN MiniStack keys an AWS::IAM::Policy record by. Derived from the
+    name, so create and rename must agree on it."""
+    return f"arn:aws:iam::{get_account_id()}:policy{props.get('Path', '/')}{name}"
+
+
 def _iam_policy_create(logical_id, props, stack_name):
     name = props.get("PolicyName") or _physical_name(stack_name, logical_id, max_len=128)
     path = props.get("Path", "/")
-    arn = f"arn:aws:iam::{get_account_id()}:policy{path}{name}"
+    arn = _iam_policy_arn(props, name)
     pol_doc = props.get("PolicyDocument", {})
     if isinstance(pol_doc, dict):
         pol_doc = json.dumps(pol_doc)
@@ -1459,16 +1465,107 @@ def _iam_policy_create(logical_id, props, stack_name):
     return name, {"Id": record["PolicyId"]}
 
 
-def _iam_policy_delete(physical_id, props):
-    # The physical id is the policy name (what Ref returns), so find the record
-    # by name. Older stacks stored the ARN as the physical id; popping that
-    # first keeps them deletable.
-    if _iam._policies.pop(physical_id, None) is not None:
-        return
-    for arn, policy in list(_iam._policies.items()):
+def _iam_policy_record(physical_id):
+    """Find the record behind an AWS::IAM::Policy physical id. The physical id
+    is the policy name (what Ref returns); older stacks stored the ARN."""
+    record = _iam._policies.get(physical_id)
+    if record is not None:
+        return physical_id, record
+    for arn, policy in _iam._policies.items():
         if policy.get("PolicyName") == physical_id:
-            _iam._policies.pop(arn, None)
-            return
+            return arn, policy
+    return None, None
+
+
+def _iam_policy_set_document(arn, record, document, resource_type):
+    """A new PolicyDocument becomes a new default policy version through the
+    IAM module's own CreatePolicyVersion (pruning the oldest non-default
+    version at the five-version cap first, like the CFN handler), so the
+    policy id, the creation date and the attachments stay. Shared by the
+    inline and the managed policy handlers."""
+    versions = record["Versions"]
+    surplus = len(versions) - _IAM_POLICY_VERSION_LIMIT + 1
+    if surplus > 0:
+        prunable = sorted(
+            (v["VersionId"] for v in versions.values() if not v["IsDefaultVersion"]),
+            key=lambda vid: int(vid.lstrip("v")),
+        )
+        for version_id in prunable[:surplus]:
+            _iam._delete_policy_version({"PolicyArn": arn, "VersionId": version_id})
+    if not isinstance(document, str):
+        document = json.dumps(document)
+    resp = _iam._create_policy_version({
+        "PolicyArn": arn,
+        "PolicyDocument": document,
+        "SetAsDefault": "true",
+    })
+    if resp[0] >= 400:
+        raise ValueError(f"{resource_type} update failed: {resp[2]!r}")
+
+
+def _iam_policy_reconcile_entities(arn, old_props, new_props):
+    """Attach the policy to the Roles / Users / Groups the new template names
+    and detach it from the ones the old template named, through the IAM
+    helpers so AttachmentCount stays in step. Shared by the inline and the
+    managed policy handlers."""
+    for prop, store in (("Roles", _iam._roles),
+                        ("Users", _iam._users),
+                        ("Groups", _iam._groups)):
+        old_names = set(old_props.get(prop, []) or [])
+        new_names = set(new_props.get(prop, []) or [])
+        for entity_name in sorted(old_names - new_names):
+            entity = store.get(entity_name)
+            if entity is not None:
+                _iam.detach_managed_policy(entity, arn)
+        for entity_name in sorted(new_names - old_names):
+            entity = store.get(entity_name)
+            if entity is not None:
+                _iam.attach_managed_policy(entity, arn)
+
+
+def _iam_policy_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update an inline policy in place, as PutRolePolicy / PutUserPolicy /
+    PutGroupPolicy do on AWS: every property of AWS::IAM::Policy, PolicyName
+    included, updates with no interruption
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-iam-policy.html).
+    A new PolicyDocument becomes the default version under the same policy
+    id, the Roles / Users / Groups lists reconcile through attach/detach,
+    and a new PolicyName re-keys the record (MiniStack keys it by an ARN
+    derived from the name) with its id, versions and attachments intact;
+    Ref follows the new name, as it does on AWS.
+    """
+    name = new_props.get("PolicyName") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=128
+    )
+    arn, record = _iam_policy_record(physical_id)
+    if record is None:
+        return _iam_policy_create(logical_id or physical_id, new_props, stack_name)
+
+    new_arn = _iam_policy_arn(new_props, name)
+    if new_arn != arn or name != record.get("PolicyName"):
+        _iam.rename_policy(arn, new_arn, name)
+        arn = new_arn
+
+    if new_props.get("PolicyDocument") != old_props.get("PolicyDocument"):
+        _iam_policy_set_document(
+            arn, record, new_props.get("PolicyDocument", {}), "AWS::IAM::Policy"
+        )
+    _iam_policy_reconcile_entities(arn, old_props, new_props)
+    return name, {"Id": record["PolicyId"]}
+
+
+def _iam_policy_remove(arn, props):
+    """Detach the policy from every Role / User / Group the template named,
+    through the IAM helpers so AttachmentCount follows, then drop the
+    record. Shared by the inline and the managed policy delete handlers."""
+    _iam_policy_reconcile_entities(arn, props, {})
+    _iam._policies.pop(arn, None)
+
+
+def _iam_policy_delete(physical_id, props):
+    arn, _record = _iam_policy_record(physical_id)
+    if arn is not None:
+        _iam_policy_remove(arn, props)
 
 
 # --- IAM InstanceProfile ---
@@ -4727,41 +4824,10 @@ def _iam_managed_policy_update(physical_id, old_props, new_props, stack_name, lo
         return _iam_managed_policy_create(logical_id or physical_id, new_props, stack_name)
 
     if new_props.get("PolicyDocument") != old_props.get("PolicyDocument"):
-        versions = record["Versions"]
-        surplus = len(versions) - _IAM_POLICY_VERSION_LIMIT + 1
-        if surplus > 0:
-            prunable = sorted(
-                (v["VersionId"] for v in versions.values() if not v["IsDefaultVersion"]),
-                key=lambda vid: int(vid.lstrip("v")),
-            )
-            for version_id in prunable[:surplus]:
-                _iam._delete_policy_version(
-                    {"PolicyArn": physical_id, "VersionId": version_id}
-                )
-        document = new_props.get("PolicyDocument", {})
-        if not isinstance(document, str):
-            document = json.dumps(document)
-        resp = _iam._create_policy_version({
-            "PolicyArn": physical_id,
-            "PolicyDocument": document,
-            "SetAsDefault": "true",
-        })
-        if resp[0] >= 400:
-            raise ValueError(f"AWS::IAM::ManagedPolicy update failed: {resp[2]!r}")
-
-    for prop, store in (("Roles", _iam._roles),
-                        ("Users", _iam._users),
-                        ("Groups", _iam._groups)):
-        old_names = set(old_props.get(prop, []) or [])
-        new_names = set(new_props.get(prop, []) or [])
-        for entity_name in sorted(old_names - new_names):
-            entity = store.get(entity_name)
-            if entity is not None:
-                _iam.detach_managed_policy(entity, physical_id)
-        for entity_name in sorted(new_names - old_names):
-            entity = store.get(entity_name)
-            if entity is not None:
-                _iam.attach_managed_policy(entity, physical_id)
+        _iam_policy_set_document(
+            physical_id, record, new_props.get("PolicyDocument", {}), "AWS::IAM::ManagedPolicy"
+        )
+    _iam_policy_reconcile_entities(physical_id, old_props, new_props)
 
     return physical_id, {
         "PolicyArn": physical_id,
@@ -4776,7 +4842,7 @@ def _iam_managed_policy_update(physical_id, old_props, new_props, stack_name, lo
 
 
 def _iam_managed_policy_delete(physical_id, props):
-    _iam._policies.pop(physical_id, None)
+    _iam_policy_remove(physical_id, props)
 
 
 # --- KMS resource provisioners ---
@@ -7661,7 +7727,12 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _iam_role_delete,
     },
-    "AWS::IAM::Policy": {"create": _iam_policy_create, "delete": _iam_policy_delete},
+    "AWS::IAM::Policy": {
+        "create": _iam_policy_create,
+        "update": _iam_policy_update,
+        "update_with_logical_id": True,
+        "delete": _iam_policy_delete,
+    },
     "AWS::IAM::InstanceProfile": {"create": _iam_ip_create, "delete": _iam_ip_delete},
     "AWS::SSM::Parameter": {"create": _ssm_create, "update": _ssm_update, "delete": _ssm_delete},
     "AWS::AppConfig::Application": {
