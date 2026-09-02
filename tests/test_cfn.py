@@ -10896,3 +10896,63 @@ def test_cfn_cognito_user_pool_enabled_mfas(cfn, cognito_idp):
 
     cfn.delete_stack(StackName="cfn-enabled-mfas")
     _wait_stack(cfn, "cfn-enabled-mfas")
+
+
+def test_cfn_delete_change_set_existing_succeeds(cfn):
+    """DeleteChangeSet of an existing change set succeeds -- by stack name and
+    by stack ID -- and the response parses (boto3 needs the
+    DeleteChangeSetResult element; the success answer used to lack it)."""
+    name = f"cfn-delcs-ok-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=name, TemplateBody=json.dumps(
+        {"Resources": {"Q": {"Type": "AWS::SQS::Queue"}}}))
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        stack_id = stack["StackId"]
+        update = json.dumps({"Resources": {
+            "Q": {"Type": "AWS::SQS::Queue"},
+            "P": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": f"/{name}/p", "Type": "String", "Value": "v"}}}})
+        for cs_name, by in (("cs-by-name", name), ("cs-by-id", stack_id)):
+            cfn.create_change_set(StackName=name, ChangeSetName=cs_name,
+                                  TemplateBody=update, ChangeSetType="UPDATE")
+            assert cfn.describe_change_set(
+                StackName=name, ChangeSetName=cs_name)["Status"] == "CREATE_COMPLETE"
+            resp = cfn.delete_change_set(StackName=by, ChangeSetName=cs_name)
+            assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+            with pytest.raises(ClientError) as exc:
+                cfn.describe_change_set(StackName=name, ChangeSetName=cs_name)
+            assert exc.value.response["Error"]["Code"] == "ChangeSetNotFound"
+        names = [c["ChangeSetName"] for c in cfn.list_change_sets(StackName=name)["Summaries"]]
+        assert names == []
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_delete_change_set_missing_is_idempotent(cfn):
+    """DeleteChangeSet of a change set that does not exist succeeds on an
+    existing stack, addressed by name or by stack ID (measured on a real
+    account) -- the CDK removes a possible leftover `cdk-deploy-change-set`
+    before every deploy, addresses the stack by ARN, and aborts on any error
+    other than ChangeSetNotFoundException. A missing stack is still a
+    ValidationError, and so is a deleted one."""
+    name = f"cfn-delcs-idem-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=name, TemplateBody=json.dumps(
+        {"Resources": {"Q": {"Type": "AWS::SQS::Queue"}}}))
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        for by in (name, stack["StackId"]):
+            resp = cfn.delete_change_set(StackName=by, ChangeSetName="cdk-deploy-change-set")
+            assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+        with pytest.raises(ClientError) as exc:
+            cfn.describe_change_set(StackName=name, ChangeSetName="cdk-deploy-change-set")
+        assert exc.value.response["Error"]["Code"] == "ChangeSetNotFound"
+        with pytest.raises(ClientError) as exc:
+            cfn.delete_change_set(StackName=f"{name}-nope", ChangeSetName="x")
+        assert exc.value.response["Error"]["Code"] == "ValidationError"
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+    with pytest.raises(ClientError) as exc:
+        cfn.delete_change_set(StackName=name, ChangeSetName="cdk-deploy-change-set")
+    assert exc.value.response["Error"]["Code"] == "ValidationError"

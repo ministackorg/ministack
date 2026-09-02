@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **CloudFormation — `DeleteChangeSet` of a change set that does not exist succeeds** — it answered `ChangeSetNotFound` (404), and the response of a successful delete carried no `DeleteChangeSetResult` element, so boto3 could not parse it at all. The CDK removes a possible leftover `cdk-deploy-change-set` before every deploy of an existing stack, addresses the stack by its ARN, and only tolerates `ChangeSetNotFoundException`, so every `cdk deploy` of an already deployed stack aborted with `ChangeSet [cdk-deploy-change-set] does not exist`. A real account answers that delete with a plain success; the stack is now resolved by name or stack ID first, and a stack that does not exist is still a `ValidationError`. Contributed by @iot-rocket.
+
 ## [1.5.7] — 2026-09-04
 
 ### Added
