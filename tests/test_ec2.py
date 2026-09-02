@@ -541,9 +541,41 @@ def test_ec2_run_multiple_instances(ec2):
     ec2.terminate_instances(InstanceIds=ids)
 
 def test_ec2_describe_images(ec2):
-    resp = ec2.describe_images(Owners=["self"])
-    assert len(resp["Images"]) >= 1
+    resp = ec2.describe_images()
+    assert len(resp["Images"]) >= 3
     assert all("ImageId" in img for img in resp["Images"])
+
+
+def test_ec2_describe_images_amazon_owner_matches_aws_shape(ec2):
+    """Owners=["amazon"] selects the Amazon-published images with their real
+    publishing accounts and ImageOwnerAlias, as on AWS — a Terraform aws_ami
+    data source with owners = ["amazon"] must find them."""
+    amazon = ec2.describe_images(Owners=["amazon"])["Images"]
+    names = {img["Name"] for img in amazon}
+    assert any(n.startswith("amzn2-ami-hvm") for n in names)
+    assert any(n.startswith("Windows_Server") for n in names)
+    assert not any("ubuntu" in n for n in names)
+    by_name = {img["Name"]: img for img in amazon}
+    al2 = next(img for n, img in by_name.items() if n.startswith("amzn2-ami-hvm"))
+    assert al2["OwnerId"] == "137112412989"
+    assert al2["ImageOwnerAlias"] == "amazon"
+
+    # Canonical's Ubuntu carries its real account and no amazon alias.
+    ubuntu = ec2.describe_images(Owners=["099720109477"])["Images"]
+    assert any("ubuntu" in img["Name"] for img in ubuntu)
+    assert all("ImageOwnerAlias" not in img or img["ImageOwnerAlias"] != "amazon"
+               for img in ubuntu)
+
+    # owner-alias filter, same selection.
+    via_filter = ec2.describe_images(
+        Filters=[{"Name": "owner-alias", "Values": ["amazon"]}])["Images"]
+    assert {img["ImageId"] for img in via_filter} == {img["ImageId"] for img in amazon}
+
+    # The seeded public images are not the caller's: self selects only
+    # registered/created images, empty when there are none — as on AWS.
+    mine = ec2.describe_images(Owners=["self"])["Images"]
+    assert not any(img["Name"].startswith(("amzn2-ami-hvm", "Windows_Server"))
+                   or "ubuntu" in img["Name"] for img in mine)
 
 
 def test_ec2_describe_images_has_root_device_and_block_mappings(ec2):
@@ -4254,14 +4286,18 @@ def test_ec2_image_with_an_entrypoint_is_left_alone(monkeypatch):
 
 
 def test_ec2_describe_images_scopes_by_owner(ec2):
-    """Owner.N: account ids and `self` select ours; an alias or another account selects nothing."""
+    """Owner.N: account ids and `self` select ours; `amazon` selects the
+    Amazon-published public images (their real publishing accounts, as on
+    AWS); an alias nothing carries, or a foreign account, selects nothing."""
     ami = ec2.register_image(Name=f"owned-{_uuid_mod.uuid4().hex[:8]}",
                              ImageLocation="alpine:3")["ImageId"]
     try:
         assert ami in [i["ImageId"] for i in ec2.describe_images(Owners=["self"])["Images"]]
         assert ami in [i["ImageId"] for i in
                        ec2.describe_images(Owners=["000000000000"])["Images"]]
-        for scope in (["amazon"], ["aws-marketplace"], ["123456789012"]):
+        amazon = [i["ImageId"] for i in ec2.describe_images(Owners=["amazon"])["Images"]]
+        assert "ami-0abcdef1234567890" in amazon and ami not in amazon
+        for scope in (["aws-marketplace"], ["123456789012"]):
             assert ec2.describe_images(Owners=scope)["Images"] == [], scope
     finally:
         ec2.deregister_image(ImageId=ami)

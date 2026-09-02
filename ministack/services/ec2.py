@@ -1195,10 +1195,16 @@ def _reboot_instances(p):
 # (ami_id, name, description, platform, root_device_name)
 # platform: "windows" or "" (Linux/Unix — matches AWS's empty-field behaviour)
 # root_device_name: Windows AMIs use /dev/sda1, Linux HVM uses /dev/xvda.
+# (ami_id, name, description, platform, root_device, owner_id, owner_alias).
+# Owner ids are the real publishing accounts — 137112412989 (Amazon Linux),
+# 801119661308 (Windows), 099720109477 (Canonical) — with ImageOwnerAlias
+# "amazon" on the Amazon-published pair and none on Canonical's, exactly as
+# DescribeImages reports them on AWS. That is what makes Owners=["amazon"]
+# (Terraform's aws_ami data source) select the same images it selects there.
 _STUB_AMIS = [
-    ("ami-0abcdef1234567890", "amzn2-ami-hvm-2.0.20231116.0-x86_64-gp2", "Amazon Linux 2", "", "/dev/xvda"),
-    ("ami-0123456789abcdef0", "ubuntu/images/hvm-ssd/ubuntu-22.04-amd64-server", "Ubuntu 22.04", "", "/dev/xvda"),
-    ("ami-0fedcba9876543210", "Windows_Server-2022-English-Full-Base", "Windows Server 2022", "windows", "/dev/sda1"),
+    ("ami-0abcdef1234567890", "amzn2-ami-hvm-2.0.20231116.0-x86_64-gp2", "Amazon Linux 2", "", "/dev/xvda", "137112412989", "amazon"),
+    ("ami-0123456789abcdef0", "ubuntu/images/hvm-ssd/ubuntu-22.04-amd64-server", "Ubuntu 22.04", "", "/dev/xvda", "099720109477", None),
+    ("ami-0fedcba9876543210", "Windows_Server-2022-English-Full-Base", "Windows Server 2022", "windows", "/dev/sda1", "801119661308", "amazon"),
 ]
 
 
@@ -1223,7 +1229,7 @@ def _image_view(image):
     }
 
 
-def _stub_image_view(ami_id, name, desc, platform, root_device):
+def _stub_image_view(ami_id, name, desc, platform, root_device, owner_id, owner_alias):
     return {
         "ImageId": ami_id,
         "Name": name,
@@ -1234,7 +1240,8 @@ def _stub_image_view(ami_id, name, desc, platform, root_device):
         "BlockDeviceMappings": [],
         "Architecture": "x86_64",
         "VirtualizationType": "hvm",
-        "OwnerId": get_account_id(),
+        "OwnerId": owner_id,
+        "ImageOwnerAlias": owner_alias,
         "IsPublic": "true",
         "Backed": False,
     }
@@ -1250,6 +1257,8 @@ def _image_matches_filters(view, filters):
             actual = [view["Description"]]
         elif name == "owner-id":
             actual = [view["OwnerId"]]
+        elif name == "owner-alias":
+            actual = [view.get("ImageOwnerAlias") or ""]
         elif name == "architecture":
             actual = [view["Architecture"]]
         elif name == "virtualization-type":
@@ -1318,10 +1327,19 @@ def _image_bdm_xml(view):
 
 def _image_owner_matches(view, owners):
     """Owner.N: "a combination of AWS account IDs, self, amazon, aws-backup-vault, and
-    aws-marketplace". Every image here belongs to the calling account, so an alias or another
-    account's id matches nothing."""
+    aws-marketplace". A registered image belongs to the calling account (matched by id or
+    ``self``); the seeded public images carry their real publishing account and, for the
+    Amazon-published ones, the ``amazon`` alias — so ``Owners=["amazon"]`` selects them as
+    it does on AWS."""
     account = get_account_id()
-    return view["OwnerId"] == account and any(o in ("self", account) for o in owners)
+    for o in owners:
+        if o == view["OwnerId"]:
+            return True
+        if o == "self" and view["OwnerId"] == account:
+            return True
+        if o == view.get("ImageOwnerAlias"):
+            return True
+    return False
 
 
 def _image_executable_by_matches(view, users):
@@ -1356,6 +1374,10 @@ def _describe_images(p):
         # provider on aws_instance — it resolves them from DescribeImages before
         # RunInstances and fails with "finding Root Device Name for AMI" if absent.
         platform_xml = f"<platform>{view['Platform']}</platform>" if view["Platform"] else ""
+        owner_alias_xml = (
+            f"<imageOwnerAlias>{view['ImageOwnerAlias']}</imageOwnerAlias>"
+            if view.get("ImageOwnerAlias") else ""
+        )
         tag_items = "".join(
             f"<item><key>{_esc(t['Key'])}</key><value>{_esc(t.get('Value', ''))}</value></item>"
             for t in _tags.get(view["ImageId"], []))
@@ -1365,6 +1387,7 @@ def _describe_images(p):
             <imageLocation>{_esc(view['Name'])}</imageLocation>
             <imageState>available</imageState>
             <imageOwnerId>{view['OwnerId']}</imageOwnerId>
+            {owner_alias_xml}
             <isPublic>{view['IsPublic']}</isPublic>
             <architecture>{view['Architecture']}</architecture>
             <imageType>machine</imageType>
