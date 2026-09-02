@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **CloudFormation — a failed update keeps the pre-existing resources when it rolls back** — the rollback of a failed stack update deleted every resource the run had touched, and a run touches every resource in the template: unchanged resources and resources updated in place went down together with what the update had actually created, while the restored stack still recorded them. The rollback now deletes only what the update created and replacements under a new physical id; a resource that kept its physical id is left standing. Not covered: an in-place change is not reverted, and a replacement's old resource, already removed by the update, is not recreated. Contributed by @iot-rocket.
+
 ## [1.5.7] — 2026-09-04
 
 ### Added

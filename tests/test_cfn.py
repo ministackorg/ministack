@@ -10896,3 +10896,137 @@ def test_cfn_cognito_user_pool_enabled_mfas(cfn, cognito_idp):
 
     cfn.delete_stack(StackName="cfn-enabled-mfas")
     _wait_stack(cfn, "cfn-enabled-mfas")
+
+
+def test_cfn_update_rollback_keeps_the_resources_that_existed_before(cfn, sqs, ddb):
+    """A failed update rolls back only what the update created. The queue
+    existed before the update and kept its physical id through an in-place
+    change, so the rollback leaves it alone; the queue the update added is
+    deleted; the table, whose attribute type change is refused under its
+    custom name, is what fails the update. The in-place change itself is not
+    reverted: the queue keeps the new VisibilityTimeout while the stack
+    records the old template."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rb-keep-{uid}"
+    queue_name = f"cfn-rb-keep-{uid}"
+    added_name = f"cfn-rb-added-{uid}"
+    table_name = f"cfn-rb-keep-{uid}"
+
+    def template(visibility, key_type, with_added):
+        resources = {
+            "Queue": {"Type": "AWS::SQS::Queue", "Properties": {
+                "QueueName": queue_name, "VisibilityTimeout": visibility}},
+            "Table": {"Type": "AWS::DynamoDB::Table", "DependsOn": "Queue", "Properties": {
+                "TableName": table_name,
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": key_type}],
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                "BillingMode": "PAY_PER_REQUEST",
+            }},
+        }
+        if with_added:
+            resources["Added"] = {"Type": "AWS::SQS::Queue", "DependsOn": "Queue",
+                                  "Properties": {"QueueName": added_name}}
+            resources["Table"]["DependsOn"] = "Added"
+        return json.dumps({"Resources": resources})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(30, "S", False))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        queue_url = sqs.get_queue_url(QueueName=queue_name)["QueueUrl"]
+        sqs.send_message(QueueUrl=queue_url, MessageBody="kept")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(45, "N", True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+        assert not [e for e in events if e["LogicalResourceId"] == "Queue"
+                    and e["ResourceStatus"].startswith("DELETE")]
+        assert [e for e in events if e["LogicalResourceId"] == "Added"
+                and e["ResourceStatus"] == "DELETE_COMPLETE"]
+
+        assert sqs.get_queue_url(QueueName=queue_name)["QueueUrl"] == queue_url
+        attributes = sqs.get_queue_attributes(
+            QueueUrl=queue_url, AttributeNames=["VisibilityTimeout", "ApproximateNumberOfMessages"]
+        )["Attributes"]
+        assert attributes["ApproximateNumberOfMessages"] == "1"
+        assert attributes["VisibilityTimeout"] == "45"  # the in-place change is not reverted
+        with pytest.raises(ClientError):
+            sqs.get_queue_url(QueueName=added_name)
+        table = ddb.describe_table(TableName=table_name)["Table"]
+        assert table["AttributeDefinitions"] == [{"AttributeName": "pk", "AttributeType": "S"}]
+        resources = {r["LogicalResourceId"]: r for r in cfn.describe_stack_resources(
+            StackName=stack_name)["StackResources"]}
+        assert set(resources) == {"Queue", "Table"}
+        assert resources["Queue"]["PhysicalResourceId"].endswith(f"/{queue_name}")
+        assert resources["Table"]["PhysicalResourceId"] == table_name
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    with pytest.raises(ClientError):
+        sqs.get_queue_url(QueueName=queue_name)
+
+
+def test_cfn_update_rollback_deletes_the_replacement_and_restores_the_old_record(cfn, sqs, ddb):
+    """A resource replaced under a new physical id during a failed update has
+    the replacement deleted on rollback, and the restored stack record points
+    at the old physical id again. The queue is renamed, which is a replacement
+    (QueueName is create-only); the table, whose attribute type change is
+    refused under its custom name, is what fails the update.
+
+    AWS, "Understand update behaviors of stack resources": a replacement
+    "recreates the resource during an update, which also generates a new
+    physical ID. CloudFormation usually creates the replacement resource
+    first, changes references from other dependent resources to point to the
+    replacement resource, and then deletes the old resource." And on a failed
+    operation ("Managing AWS resources as a single unit"): "CloudFormation
+    rolls the stack back and automatically deletes any resources that were
+    created."
+
+    The emulator's replacement deletes the old queue as soon as the new one
+    exists, so the rollback cannot bring it back: the restored record names a
+    queue that no longer exists. That is the disclosed limit this test pins.
+    """
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rb-replace-{uid}"
+    old_name = f"cfn-rb-old-{uid}"
+    new_name = f"cfn-rb-new-{uid}"
+    table_name = f"cfn-rb-replace-{uid}"
+
+    def template(queue_name, key_type):
+        return json.dumps({"Resources": {
+            "Queue": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": queue_name}},
+            "Table": {"Type": "AWS::DynamoDB::Table", "DependsOn": "Queue", "Properties": {
+                "TableName": table_name,
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": key_type}],
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                "BillingMode": "PAY_PER_REQUEST",
+            }},
+        }})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(old_name, "S"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        old_url = sqs.get_queue_url(QueueName=old_name)["QueueUrl"]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(new_name, "N"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        events = [e for e in cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+                  if e["LogicalResourceId"] == "Queue"]
+        deleted = [e for e in events if e["ResourceStatus"] == "DELETE_COMPLETE"]
+        assert [e["PhysicalResourceId"] for e in deleted] == [f"{old_url.rsplit('/', 1)[0]}/{new_name}"]
+
+        with pytest.raises(ClientError):
+            sqs.get_queue_url(QueueName=new_name)
+        with pytest.raises(ClientError):  # the replacement already removed it; not restored
+            sqs.get_queue_url(QueueName=old_name)
+        resources = {r["LogicalResourceId"]: r for r in cfn.describe_stack_resources(
+            StackName=stack_name)["StackResources"]}
+        assert set(resources) == {"Queue", "Table"}
+        assert resources["Queue"]["PhysicalResourceId"] == old_url
+        assert resources["Table"]["PhysicalResourceId"] == table_name
+        table = ddb.describe_table(TableName=table_name)["Table"]
+        assert table["AttributeDefinitions"] == [{"AttributeName": "pk", "AttributeType": "S"}]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
