@@ -183,6 +183,25 @@ def run():
     try:
         mod = importlib.import_module(module_name)
         handler_fn = getattr(mod, handler_name)
+        if init.get("snapstart"):
+            # SnapStart runtime hooks (snapshot-restore-py, bundled in AWS's
+            # python3.12+ runtimes). Each environment of a published SnapStart
+            # version runs one snapshot/restore cycle: before-snapshot hooks
+            # in reverse registration order, then after-restore hooks in
+            # registration order, before the first invocation. A hook that
+            # raises fails the init, which fails the publish, as on AWS.
+            try:
+                from snapshot_restore_py import (
+                    get_after_restore,
+                    get_before_snapshot,
+                )
+            except ImportError:
+                pass
+            else:
+                for _fn, _args, _kwargs in reversed(get_before_snapshot()):
+                    _fn(*_args, **_kwargs)
+                for _fn, _args, _kwargs in get_after_restore():
+                    _fn(*_args, **_kwargs)
         _real_stdout.write(json.dumps({"status": "ready", "cold": True}) + "\\n")
         _real_stdout.flush()
     except Exception as e:
@@ -1132,6 +1151,11 @@ class Worker:
             "function_name": self.config.get("FunctionName", ""),
             "memory": self.config.get("MemorySize", 128),
             "arn": self.config.get("FunctionArn", ""),
+            # A published SnapStart version runs its snapshot/restore runtime
+            # hooks during init (see the worker script). $LATEST never does —
+            # it has no snapshot on AWS either.
+            "snapstart": (self.config.get("SnapStart") or {}).get(
+                "OptimizationStatus") == "On",
         }
         self._proc.stdin.write(json.dumps(init) + "\n")
         self._proc.stdin.flush()
@@ -1426,7 +1450,18 @@ def reap_idle_workers(ttl: float = None) -> int:
             keep = []
             for i, worker in enumerate(entries):
                 idle = now - getattr(worker, "last_used", now)
-                if i == 0 or worker.in_use or idle < ttl:
+                # The first worker per key is kept warm indefinitely — except
+                # for a published SnapStart version's worker, which exists
+                # because PublishVersion pre-initialized it: without the
+                # exception every publish would pin one subprocess forever.
+                # Reaping it costs a re-init on the next invoke, the same as
+                # the docker pool's TTL eviction.
+                snapstart_version = (
+                    (worker.config.get("SnapStart") or {}).get(
+                        "OptimizationStatus") == "On"
+                    and worker.config.get("Version", "$LATEST") != "$LATEST"
+                )
+                if worker.in_use or idle < ttl or (i == 0 and not snapstart_version):
                     keep.append(worker)
                 else:
                     killed.append(worker)
@@ -1436,6 +1471,20 @@ def reap_idle_workers(ttl: float = None) -> int:
                 _workers.pop(key, None)
     kill_workers(killed)
     return len(killed)
+
+
+def ensure_spawned(worker: Worker) -> None:
+    """Spawn the worker's subprocess now if it isn't running.
+
+    SnapStart moves initialization to PublishVersion: the publish path leases
+    a worker for the new version and forces the cold start here, so an init
+    failure fails the publish (version State=Failed, as on AWS) and the first
+    invoke finds the environment already warm.
+    """
+    with worker._lock:
+        if worker._proc is None or worker._proc.poll() is not None:
+            worker._spawn()
+            worker._cold = False
 
 
 def release_worker(worker: Worker) -> None:

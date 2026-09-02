@@ -10878,3 +10878,373 @@ def test_lambda_platform_pinned_only_when_architectures_declared(monkeypatch):
     assert _lam._declared_docker_platform(
         {"FunctionName": "pre-marker-record", "Architectures": ["x86_64"]}) is None
     assert _lam._declared_docker_platform({"FunctionName": "never-created"}) is None
+
+
+# ─────────────────────────────── SnapStart ───────────────────────────────
+
+
+def _snap_wait_active(lam, fname, qualifier=None):
+    kw = {"FunctionName": fname}
+    if qualifier:
+        kw["Qualifier"] = qualifier
+    for _ in range(40):
+        cfg = lam.get_function_configuration(**kw)
+        if cfg["State"] == "Active":
+            return cfg
+        time.sleep(0.25)
+    raise AssertionError(f"{fname}:{qualifier} never became Active")
+
+
+def test_snapstart_defaults_off(lam):
+    fname = f"snap-default-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _zip_lambda(_LAMBDA_CODE)},
+    )
+    try:
+        cfg = lam.get_function_configuration(FunctionName=fname)
+        assert cfg["SnapStart"] == {"ApplyOn": "None", "OptimizationStatus": "Off"}
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_snapstart_lifecycle_published_version_reports_on(lam):
+    """AWS: $LATEST echoes ApplyOn with OptimizationStatus Off; publishing
+    takes the snapshot, so the version reports On and transitions
+    Pending → Active."""
+    fname = f"snap-life-{_uuid_mod.uuid4().hex[:8]}"
+    created = lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _zip_lambda(_LAMBDA_CODE)},
+        SnapStart={"ApplyOn": "PublishedVersions"},
+    )
+    try:
+        assert created["SnapStart"] == {
+            "ApplyOn": "PublishedVersions", "OptimizationStatus": "Off",
+        }
+        _snap_wait_active(lam, fname)
+
+        ver = lam.publish_version(FunctionName=fname)
+        assert ver["SnapStart"] == {
+            "ApplyOn": "PublishedVersions", "OptimizationStatus": "On",
+        }
+        vcfg = _snap_wait_active(lam, fname, qualifier=ver["Version"])
+        assert vcfg["SnapStart"]["OptimizationStatus"] == "On"
+
+        # $LATEST never has a snapshot.
+        latest = lam.get_function_configuration(FunctionName=fname)
+        assert latest["SnapStart"] == {
+            "ApplyOn": "PublishedVersions", "OptimizationStatus": "Off",
+        }
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_snapstart_create_with_publish_stamps_version_one(lam):
+    fname = f"snap-pub1-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _zip_lambda(_LAMBDA_CODE)},
+        SnapStart={"ApplyOn": "PublishedVersions"}, Publish=True,
+    )
+    try:
+        vcfg = _snap_wait_active(lam, fname, qualifier="1")
+        assert vcfg["SnapStart"] == {
+            "ApplyOn": "PublishedVersions", "OptimizationStatus": "On",
+        }
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_snapstart_update_function_configuration_roundtrip(lam):
+    fname = f"snap-upd-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _zip_lambda(_LAMBDA_CODE)},
+    )
+    try:
+        _snap_wait_active(lam, fname)
+        updated = lam.update_function_configuration(
+            FunctionName=fname, SnapStart={"ApplyOn": "PublishedVersions"},
+        )
+        assert updated["SnapStart"] == {
+            "ApplyOn": "PublishedVersions", "OptimizationStatus": "Off",
+        }
+        _snap_wait_active(lam, fname)
+        back = lam.update_function_configuration(
+            FunctionName=fname, SnapStart={"ApplyOn": "None"},
+        )
+        assert back["SnapStart"] == {"ApplyOn": "None", "OptimizationStatus": "Off"}
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_snapstart_rejected_for_unsupported_runtime(lam):
+    fname = f"snap-badrt-{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        lam.create_function(
+            FunctionName=fname, Runtime="nodejs20.x", Role=_LAMBDA_ROLE,
+            Handler="index.handler", Code={"ZipFile": _make_zip_js(_NODE_CODE)},
+            SnapStart={"ApplyOn": "PublishedVersions"},
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+
+    # Enabling it later on an unsupported runtime is refused the same way.
+    lam.create_function(
+        FunctionName=fname, Runtime="nodejs20.x", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip_js(_NODE_CODE)},
+    )
+    try:
+        _snap_wait_active(lam, fname)
+        with pytest.raises(ClientError) as exc:
+            lam.update_function_configuration(
+                FunctionName=fname, SnapStart={"ApplyOn": "PublishedVersions"},
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_snapstart_rejected_with_large_ephemeral_storage(lam):
+    fname = f"snap-eph-{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        lam.create_function(
+            FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+            Handler="index.handler", Code={"ZipFile": _zip_lambda(_LAMBDA_CODE)},
+            SnapStart={"ApplyOn": "PublishedVersions"},
+            EphemeralStorage={"Size": 1024},
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+
+    # Raising ephemeral storage past 512 MB while SnapStart is on is refused.
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _zip_lambda(_LAMBDA_CODE)},
+        SnapStart={"ApplyOn": "PublishedVersions"},
+    )
+    try:
+        _snap_wait_active(lam, fname)
+        with pytest.raises(ClientError) as exc:
+            lam.update_function_configuration(
+                FunctionName=fname, EphemeralStorage={"Size": 1024},
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+# ──────────────── docker executor: no extraction-dir leak ────────────────
+
+
+_SPAWN_LEAK_CONFIG = {
+    "FunctionName": "leak-fn", "Runtime": "python3.12",
+    "Handler": "index.handler", "PackageType": "Zip", "Timeout": 3,
+    "MemorySize": 128,
+    "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:leak-fn",
+}
+
+
+def _capture_mkdtemp(monkeypatch):
+    import tempfile as _tf
+    created = []
+    real = _tf.mkdtemp
+
+    def _capture(*a, **kw):
+        d = real(*a, **kw)
+        created.append(d)
+        return d
+
+    monkeypatch.setattr(_tf, "mkdtemp", _capture)
+    return created
+
+
+def test_spawn_failure_on_corrupt_zip_leaves_no_tmpdir(monkeypatch):
+    """A corrupt code zip raises out of the extraction block; the tmpdir made
+    just before must not be orphaned (issue #1600)."""
+    monkeypatch.setattr(lsvc, "_docker_available", True)
+    monkeypatch.setattr(lsvc, "_get_docker_client", lambda: object())
+    created = _capture_mkdtemp(monkeypatch)
+
+    with pytest.raises(zipfile.BadZipFile):
+        lsvc._spawn_lambda_container(dict(_SPAWN_LEAK_CONFIG), b"this is not a zip")
+
+    assert created, "spawn never created an extraction dir"
+    assert not any(os.path.exists(d) for d in created)
+
+
+def test_spawn_failure_on_docker_api_timeout_leaves_no_tmpdir(monkeypatch):
+    """images.get raising anything other than ImageNotFound (the reported
+    case: a socket read timeout) propagates after extraction; the tmpdir must
+    be removed on the way out (issue #1600)."""
+    monkeypatch.setattr(lsvc, "_docker_available", True)
+    fake_client = MagicMock()
+    fake_client.images.get.side_effect = TimeoutError("Read timed out.")
+    monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)
+    created = _capture_mkdtemp(monkeypatch)
+
+    with pytest.raises(TimeoutError):
+        lsvc._spawn_lambda_container(
+            dict(_SPAWN_LEAK_CONFIG), _make_zip("def handler(e, c): pass"),
+        )
+
+    assert created, "spawn never created an extraction dir"
+    assert not any(os.path.exists(d) for d in created)
+
+
+def _make_zip_multi(files: dict) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, code in files.items():
+            zf.writestr(name, code)
+    return buf.getvalue()
+
+
+def _snap_wait_state(lam, fname, qualifier, want, attempts=60):
+    for _ in range(attempts):
+        cfg = lam.get_function_configuration(FunctionName=fname, Qualifier=qualifier)
+        if cfg["State"] == want:
+            return cfg
+        time.sleep(0.25)
+    raise AssertionError(f"{fname}:{qualifier} never reached {want} (last: {cfg['State']})")
+
+
+def test_snapstart_publish_initializes_and_pending_version_conflicts(lam):
+    """SnapStart moves init to PublishVersion: while the environment spins up
+    the version is Pending and Invoke answers ResourceConflictException; once
+    Active the first invoke hits the pre-warmed environment."""
+    fname = f"snap-pend-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        "import time\n"
+        "time.sleep(2)\n"
+        "def handler(event, context):\n"
+        "    return {'ok': True}\n"
+    )
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _zip_lambda(code)},
+        SnapStart={"ApplyOn": "PublishedVersions"},
+    )
+    try:
+        _snap_wait_active(lam, fname)
+        ver = lam.publish_version(FunctionName=fname)
+        assert ver["State"] == "Pending"
+        with pytest.raises(ClientError) as exc:
+            lam.invoke(FunctionName=fname, Qualifier=ver["Version"], Payload=b"{}")
+        assert exc.value.response["Error"]["Code"] == "ResourceConflictException"
+
+        _snap_wait_state(lam, fname, ver["Version"], "Active")
+        resp = lam.invoke(FunctionName=fname, Qualifier=ver["Version"], Payload=b"{}")
+        assert json.loads(resp["Payload"].read()) == {"ok": True}
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_snapstart_publish_fails_version_on_broken_init(lam):
+    """An init that raises fails the *publish*: the version lands State=Failed
+    (AWS's failed-snapshot surface) instead of erroring at first invoke."""
+    fname = f"snap-fail-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _zip_lambda("raise RuntimeError('boom-init')\n")},
+        SnapStart={"ApplyOn": "PublishedVersions"},
+    )
+    try:
+        _snap_wait_active(lam, fname)
+        ver = lam.publish_version(FunctionName=fname)
+        cfg = _snap_wait_state(lam, fname, ver["Version"], "Failed")
+        assert cfg["StateReasonCode"] == "FunctionError"
+        assert "boom-init" in cfg["StateReason"]
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+_SNAP_HOOK_LIB = (
+    "_before = []\n"
+    "_after = []\n"
+    "def register_before_snapshot(func, *args, **kwargs):\n"
+    "    _before.append((func, args, kwargs))\n"
+    "    return func\n"
+    "def register_after_restore(func, *args, **kwargs):\n"
+    "    _after.append((func, args, kwargs))\n"
+    "    return func\n"
+    "def get_before_snapshot():\n"
+    "    return _before\n"
+    "def get_after_restore():\n"
+    "    return _after\n"
+)
+
+_SNAP_HOOK_HANDLER = (
+    "import snapshot_restore_py as srp\n"
+    "CALLS = []\n"
+    "srp.register_before_snapshot(lambda: CALLS.append('before1'))\n"
+    "srp.register_before_snapshot(lambda: CALLS.append('before2'))\n"
+    "srp.register_after_restore(lambda: CALLS.append('after1'))\n"
+    "srp.register_after_restore(lambda: CALLS.append('after2'))\n"
+    "def handler(event, context):\n"
+    "    return {'calls': CALLS}\n"
+)
+
+
+def test_snapstart_runtime_hooks_fire_on_published_version_only(lam):
+    """snapshot-restore-py hooks run during a published version's init —
+    before-snapshot hooks in reverse registration order, after-restore hooks
+    in registration order — and never for $LATEST, which has no snapshot."""
+    fname = f"snap-hook-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip_multi({
+            "index.py": _SNAP_HOOK_HANDLER,
+            "snapshot_restore_py.py": _SNAP_HOOK_LIB,
+        })},
+        SnapStart={"ApplyOn": "PublishedVersions"},
+    )
+    try:
+        _snap_wait_active(lam, fname)
+        ver = lam.publish_version(FunctionName=fname)
+        _snap_wait_state(lam, fname, ver["Version"], "Active")
+
+        resp = lam.invoke(FunctionName=fname, Qualifier=ver["Version"], Payload=b"{}")
+        payload = json.loads(resp["Payload"].read())
+        assert payload == {"calls": ["before2", "before1", "after1", "after2"]}
+
+        latest = lam.invoke(FunctionName=fname, Payload=b"{}")
+        assert json.loads(latest["Payload"].read()) == {"calls": []}
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_snapstart_version_worker_is_reapable():
+    """A published SnapStart version's pre-warmed worker must not be pinned by
+    the keep-the-first-worker rule, or every publish holds a subprocess
+    forever; the $LATEST first worker keeps its exemption."""
+    from ministack.core import lambda_runtime as lr
+
+    def _mk(version, snap_status):
+        cfg = {
+            "FunctionName": "reap-probe", "Runtime": "python3.12",
+            "Version": version,
+            "SnapStart": {"ApplyOn": "PublishedVersions",
+                          "OptimizationStatus": snap_status},
+            "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:reap-probe",
+        }
+        w = lr.Worker("reap-probe", cfg, b"")
+        w.in_use = False
+        w.last_used = time.time() - 10_000
+        return w
+
+    latest = _mk("$LATEST", "Off")
+    snap_ver = _mk("1", "On")
+    with lr._lock:
+        lr._workers["000000000000:us-east-1:reap-probe:$LATEST"] = [latest]
+        lr._workers["000000000000:us-east-1:reap-probe:1"] = [snap_ver]
+    try:
+        lr.reap_idle_workers(ttl=1)
+        with lr._lock:
+            assert lr._workers.get("000000000000:us-east-1:reap-probe:$LATEST") == [latest]
+            assert "000000000000:us-east-1:reap-probe:1" not in lr._workers
+    finally:
+        with lr._lock:
+            lr._workers.pop("000000000000:us-east-1:reap-probe:$LATEST", None)
+            lr._workers.pop("000000000000:us-east-1:reap-probe:1", None)

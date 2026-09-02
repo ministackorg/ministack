@@ -56,6 +56,7 @@ from ministack.core.lambda_runtime import (
     INVOKE_DEPTH_EVENT_KEY,
     INVOKE_DEPTH_HEADER,
     acquire_worker,
+    ensure_spawned,
     invalidate_worker,
     reap_idle_workers,
     release_worker,
@@ -1285,6 +1286,160 @@ def _durable_arn_lookup(name_or_arn: str) -> str | None:
     return func.get("FunctionArn") or _func_arn(canonical)
 
 
+# ---------------------------------------------------------------------------
+# SnapStart
+# ---------------------------------------------------------------------------
+# AWS accepts ``SnapStart.ApplyOn`` on CreateFunction and
+# UpdateFunctionConfiguration and reports ``{ApplyOn, OptimizationStatus}`` on
+# every read. $LATEST always reports OptimizationStatus=Off — a snapshot only
+# exists per published version — while a version published with
+# ApplyOn=PublishedVersions reports On, sits in State=Pending while the
+# snapshot is created, then transitions to Active. Supported runtimes per the
+# SnapStart docs: Java 11+, Python 3.12+, .NET 8+, for both Zip and
+# container-image packages; incompatible with ephemeral storage above 512 MB.
+
+_SNAPSTART_APPLY_ON_VALUES = ("PublishedVersions", "None")
+
+
+def _snapstart_runtime_supported(runtime: str) -> bool:
+    m = re.match(r"^(java|python|dotnet)(\d+)(?:\.(\d+))?", runtime or "")
+    if not m:
+        return False
+    family, major, minor = m.group(1), int(m.group(2)), int(m.group(3) or 0)
+    if family == "java":
+        return major >= 11
+    if family == "python":
+        return (major, minor) >= (3, 12)
+    return major >= 8  # dotnet
+
+
+def _validate_snapstart(snap: dict | None, *, runtime: str, package_type: str,
+                        ephemeral_size) -> tuple | None:
+    """Validate a SnapStart request block against AWS's documented constraints."""
+    if snap is None:
+        return None
+    apply_on = (snap or {}).get("ApplyOn", "None")
+    if apply_on not in _SNAPSTART_APPLY_ON_VALUES:
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{apply_on}' at "
+            "'snapStart.applyOn' failed to satisfy constraint: Member must "
+            "satisfy enum value set: [PublishedVersions, None]",
+            400,
+        )
+    if apply_on == "None":
+        return None
+    if package_type != "Image" and not _snapstart_runtime_supported(runtime):
+        return error_response_json(
+            "InvalidParameterValueException",
+            f"SnapStart is not supported for the {runtime} runtime.",
+            400,
+        )
+    try:
+        too_big = ephemeral_size is not None and int(ephemeral_size) > 512
+    except (TypeError, ValueError):
+        too_big = False
+    if too_big:
+        return error_response_json(
+            "InvalidParameterValueException",
+            "SnapStart is not supported with ephemeral storage greater than "
+            "512 MB.",
+            400,
+        )
+    return None
+
+
+def _snapstart_response(snap: dict | None) -> dict:
+    apply_on = (snap or {}).get("ApplyOn") or "None"
+    return {"ApplyOn": apply_on, "OptimizationStatus": "Off"}
+
+
+def _stamp_snapstart_published_version(ver_config: dict) -> bool:
+    """AWS creates the snapshot when a version is published: the version
+    reports OptimizationStatus=On and stays Pending until the snapshot is
+    ready. Returns True when the version is SnapStart-enabled so the caller
+    schedules the Pending→Active transition."""
+    if (ver_config.get("SnapStart") or {}).get("ApplyOn") != "PublishedVersions":
+        return False
+    ver_config["SnapStart"] = {
+        "ApplyOn": "PublishedVersions",
+        "OptimizationStatus": "On",
+    }
+    ver_config["State"] = "Pending"
+    ver_config["StateReason"] = "The function is being created."
+    ver_config["StateReasonCode"] = "Creating"
+    return True
+
+
+def _snapstart_provision_version_async(name: str, ver_record: dict) -> None:
+    """SnapStart moves initialization to PublishVersion: create the version's
+    execution environment now — a warm worker for python, a pooled RIE
+    container for java/dotnet/Image — instead of at first invoke.
+
+    Success flips the version Pending → Active with the environment already
+    warm (the snapshot's observable effect); an init failure — a handler that
+    won't import, a before-snapshot/after-restore hook that raises — lands the
+    version in State=Failed, as AWS surfaces a failed snapshot. This thread
+    owns the version's state transition; the generic Pending flipper skips
+    SnapStart versions.
+    """
+    ver_config = ver_record["config"]
+    code_zip = ver_record.get("code_zip")
+
+    def _provision():
+        try:
+            account_id, region = _account_region_from_function_config(ver_config)
+            _request_account_id.set(account_id)
+            _request_region.set(region)
+        except ArnParseError:
+            pass
+        try:
+            runtime = ver_config.get("Runtime", "")
+            package_type = ver_config.get("PackageType", "Zip")
+            use_docker = (
+                LAMBDA_STRICT
+                or package_type == "Image"
+                or LAMBDA_EXECUTOR == "docker"
+                or not runtime.startswith("python")
+            )
+            if use_docker:
+                if _docker_available and _get_docker_client() is not None:
+                    container, tmpdir = _spawn_lambda_container(ver_config, code_zip)
+                    key = _warm_pool_key(ver_config["FunctionName"], ver_config)
+                    entry = _pool_register(key, container, tmpdir)
+                    _pool_release(entry)
+                    _ensure_reaper_thread()
+                # Docker unreachable: nothing to pre-warm; the invoke path
+                # falls back exactly as it always did.
+            elif code_zip:
+                worker, _reason = acquire_worker(
+                    ver_config["FunctionName"], ver_config, code_zip,
+                    qualifier=ver_config.get("Version", "$LATEST"),
+                )
+                try:
+                    ensure_spawned(worker)
+                finally:
+                    release_worker(worker)
+                _ensure_reaper_thread()
+        except Exception as exc:
+            logger.warning("Lambda %s: SnapStart init failed at publish: %s",
+                           name, exc)
+            ver_config["State"] = "Failed"
+            ver_config["StateReason"] = str(exc)
+            ver_config["StateReasonCode"] = "FunctionError"
+            return
+        ver_config["State"] = "Active"
+        ver_config["StateReason"] = ""
+        ver_config["StateReasonCode"] = ""
+        ver_config["LastUpdateStatus"] = "Successful"
+
+    ctx_snapshot = contextvars.copy_context()
+    threading.Thread(
+        target=ctx_snapshot.run, args=(_provision,), daemon=True,
+        name="ministack-lambda-snapstart-init",
+    ).start()
+
+
 def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
     code_size = len(code_zip) if code_zip else 0
     code_sha = base64.b64encode(hashlib.sha256(code_zip).digest()).decode() if code_zip else ""
@@ -1343,7 +1498,7 @@ def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
         "KMSKeyArn": data.get("KMSKeyArn", ""),
         "RevisionId": new_uuid(),
         "EphemeralStorage": data.get("EphemeralStorage", {"Size": 512}),
-        "SnapStart": {"ApplyOn": "None", "OptimizationStatus": "Off"},
+        "SnapStart": _snapstart_response(data.get("SnapStart")),
         "LoggingConfig": data.get(
             "LoggingConfig",
             {
@@ -1967,6 +2122,15 @@ def _create_function(data: dict):
         data = dict(data)
         data["Layers"] = layers_cfg
 
+    err = _validate_snapstart(
+        data.get("SnapStart"),
+        runtime=data.get("Runtime", ""),
+        package_type=data.get("PackageType", "Zip"),
+        ephemeral_size=(data.get("EphemeralStorage") or {}).get("Size", 512),
+    )
+    if err:
+        return err
+
     # Validate the execution role before building anything: _build_config
     # returns a config dict, so the error has to be raised by the caller, and
     # nothing may be persisted for a function that is going to be refused.
@@ -2020,10 +2184,13 @@ def _create_function(data: dict):
         _functions[name]["next_version"] = ver_num + 1
         ver_config = copy.deepcopy(config)
         ver_config["Version"] = str(ver_num)
-        _functions[name]["versions"][str(ver_num)] = {
+        ver_record = {
             "config": ver_config,
             "code_zip": code_zip,
         }
+        _functions[name]["versions"][str(ver_num)] = ver_record
+        if _stamp_snapstart_published_version(ver_config):
+            _snapstart_provision_version_async(name, ver_record)
         config["Version"] = str(ver_num)
 
     _schedule_state_transition(name, _LAMBDA_STATE_TRANSITION_DELAY)
@@ -2346,6 +2513,10 @@ def _delete_function(name: str, query_params: dict, path_qualifier: str | None =
                 409,
             )
         _functions[name]["versions"].pop(qualifier, None)
+        # The version's warm worker (SnapStart pre-initialized it at publish,
+        # or a past invoke spawned it) has nothing left to serve.
+        invalidate_worker(name, qualifier=qualifier,
+                          account=get_account_id(), region=get_region())
     else:
         del _functions[name]
         invalidate_worker(name, account=get_account_id(), region=get_region())
@@ -2430,10 +2601,13 @@ def _update_code(name: str, data: dict):
         func["next_version"] = ver_num + 1
         ver_config = copy.deepcopy(func["config"])
         ver_config["Version"] = str(ver_num)
-        func["versions"][str(ver_num)] = {
+        ver_record = {
             "config": ver_config,
             "code_zip": func.get("code_zip"),
         }
+        func["versions"][str(ver_num)] = ver_record
+        if _stamp_snapstart_published_version(ver_config):
+            _snapstart_provision_version_async(name, ver_record)
         func["config"]["Version"] = str(ver_num)
 
     return json_response(func["config"])
@@ -2456,6 +2630,21 @@ def _update_config(name: str, data: dict):
         data = dict(data)
         data["Layers"] = layers_cfg
     config = _functions[name]["config"]
+    if "SnapStart" in data or "Runtime" in data or "EphemeralStorage" in data:
+        # Validate the *effective* combination, so enabling SnapStart, moving
+        # to an unsupported runtime, or raising ephemeral storage past 512 MB
+        # while SnapStart is on are all refused before any field mutates.
+        effective_snap = data.get("SnapStart", config.get("SnapStart"))
+        err = _validate_snapstart(
+            effective_snap,
+            runtime=data.get("Runtime") or config.get("Runtime", ""),
+            package_type=config.get("PackageType", "Zip"),
+            ephemeral_size=(data.get("EphemeralStorage")
+                            or config.get("EphemeralStorage")
+                            or {}).get("Size", 512),
+        )
+        if err:
+            return err
     for key in (
         "Runtime",
         "Handler",
@@ -2476,6 +2665,7 @@ def _update_config(name: str, data: dict):
         "DurableConfig",
         "TenancyConfig",
         "CapacityProviderConfig",
+        "SnapStart",
     ):
         if key in data:
             if key == "Layers":
@@ -2489,6 +2679,10 @@ def _update_config(name: str, data: dict):
                             layer["CodeSize"] = _layer_codesize_for_arn(layer["Arn"])
                         layers_cfg.append(layer)
                 config["Layers"] = layers_cfg
+            elif key == "SnapStart":
+                # Request carries only ApplyOn; the stored/echoed shape adds
+                # OptimizationStatus, which is always Off on $LATEST.
+                config["SnapStart"] = _snapstart_response(data["SnapStart"])
             else:
                 config[key] = data[key]
     if "Architectures" in data:
@@ -2563,6 +2757,21 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
                 f"Function not found: {_func_arn(name)}:{qualifier}",
                 404,
             )
+
+    exec_config = exec_record.get("config") or {}
+    if (
+        executed_version != "$LATEST"
+        and (exec_config.get("SnapStart") or {}).get("OptimizationStatus") == "On"
+        and exec_config.get("State") == "Pending"
+    ):
+        # AWS: invoking a SnapStart version while its snapshot is being
+        # created answers ResourceConflictException until it goes Active.
+        return error_response_json(
+            "ResourceConflictException",
+            "The operation cannot be performed at this time. "
+            "The function is currently in the following state: Pending",
+            409,
+        )
 
     if invocation_type == "DryRun":
         return 204, {"X-Amz-Executed-Version": executed_version}, b""
@@ -3092,6 +3301,13 @@ def _schedule_state_transition(func_name: str, delay: float) -> None:
             if (
                 cfg.get("State") not in (None, "", "Pending")
                 and cfg.get("LastUpdateStatus") not in (None, "", "InProgress")
+            ):
+                continue
+            # A pending SnapStart version is mid-initialization: its
+            # provisioning thread owns the Pending → Active/Failed decision.
+            if (
+                cfg.get("Version") not in (None, "", "$LATEST")
+                and (cfg.get("SnapStart") or {}).get("OptimizationStatus") == "On"
             ):
                 continue
             cfg["State"] = "Active"
@@ -3675,6 +3891,29 @@ def _declared_docker_platform(config: dict):
 
 def _spawn_lambda_container(config: dict, code_zip: bytes | None,
                             _pin_platform: bool = True):
+    """Create and start a Lambda container, never leaking the extraction dir.
+
+    Everything between the extraction tmpdir's creation and the pool
+    registration can raise — a corrupt code or layer zip, or any Docker API
+    failure that is not one of the specifically-handled cases (e.g. a socket
+    read timeout out of ``images.get``, which is not ``ImageNotFound``).
+    Ownership of the tmpdir passes to the caller only on a successful return;
+    on any exception it is removed here instead of orphaning one extraction
+    per failed cold start (issue #1600).
+    """
+    made_tmpdirs: list[str] = []
+    try:
+        return _spawn_lambda_container_impl(config, code_zip, _pin_platform,
+                                            made_tmpdirs)
+    except BaseException:
+        import shutil
+        for d in made_tmpdirs:
+            shutil.rmtree(d, ignore_errors=True)
+        raise
+
+
+def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
+                                 _pin_platform: bool, _made_tmpdirs: list):
     """Create and start a Lambda container for the given config.
 
     A function that explicitly declared an architecture is pinned to it — but
@@ -3723,6 +3962,7 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None,
         if not code_zip:
             raise ValueError("Zip PackageType requires code_zip bytes")
         tmpdir = tempfile.mkdtemp(prefix="ministack-lambda-docker-")
+        _made_tmpdirs.append(tmpdir)
         code_dir = os.path.join(tmpdir, "code")
         os.makedirs(code_dir)
         code_zip_path = os.path.join(tmpdir, "code.zip")
@@ -5034,10 +5274,13 @@ def _publish_version(name: str, data: dict):
     if data.get("Description"):
         ver_config["Description"] = data["Description"]
 
-    func["versions"][str(ver_num)] = {
+    ver_record = {
         "config": ver_config,
         "code_zip": func.get("code_zip"),
     }
+    func["versions"][str(ver_num)] = ver_record
+    if _stamp_snapstart_published_version(ver_config):
+        _snapstart_provision_version_async(name, ver_record)
     return json_response(ver_config, 201)
 
 

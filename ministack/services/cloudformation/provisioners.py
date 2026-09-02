@@ -1084,6 +1084,7 @@ def _lambda_create(logical_id, props, stack_name):
             "EphemeralStorage": {"Size": props.get("EphemeralStorage", {}).get("Size", 512)},
             "TracingConfig": props.get("TracingConfig", {"Mode": "PassThrough"}),
             "LoggingConfig": props.get("LoggingConfig", {"LogFormat": "Text", "LogGroup": f"/aws/lambda/{name}"}),
+            "SnapStart": _lambda_svc._snapstart_response(props.get("SnapStart")),
             "RevisionId": new_uuid(),
         },
         "code_zip": code_zip,
@@ -1193,6 +1194,7 @@ def _lambda_update(physical_id, old_props, new_props, stack_name, logical_id=Non
             "LoggingConfig", {"LogFormat": "Text", "LogGroup": f"/aws/lambda/{name}"}
         ),
         "Architectures": new_props.get("Architectures", ["x86_64"]),
+        "SnapStart": new_props.get("SnapStart", {"ApplyOn": "None"}),
     }
     if new_props.get("ImageConfig"):
         config_data["ImageConfig"] = new_props["ImageConfig"]
