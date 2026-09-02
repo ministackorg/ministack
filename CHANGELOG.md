@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **CloudFormation — `AWS::Events::Rule` reports the rule ARN the EventBridge service reports** — `Fn::GetAtt` `Arn` on a rule was built with the bus name in every case, so a rule on the default bus answered `rule/default/<name>` while `DescribeRule` and `ListRules` for the same rule answered `rule/<name>`; a permission or a target keyed on the template's ARN never matched the service's. The provisioner now derives the ARN through the service's own helper: no bus segment on the default bus, `rule/<bus>/<name>` on a custom one. Contributed by @iot-rocket.
+- **CloudFormation — `AWS::Cognito::UserPool` reads `UserPoolName`** — the provisioner read `PoolName`, the API's name for the property, where the resource reference defines `UserPoolName`, so every pool declared with the documented property came up under a generated `<stack>-<logical id>` name and `ListUserPools` never showed the name the template gave it. `UserPoolName` is honoured now; `PoolName` stays accepted for templates written against MiniStack. Contributed by @iot-rocket.
 
 ## [1.5.7] — 2026-09-04
 

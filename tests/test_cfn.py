@@ -10944,3 +10944,42 @@ def test_cfn_events_rule_arn_matches_the_service(cfn, eb):
         assert outputs["BusArn"] == eb.describe_rule(Name=bus_rule, EventBusName=bus_name)["Arn"]
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cognito_user_pool_name_is_the_userpoolname_property(cfn, cognito_idp):
+    """UserPoolName is the template property the resource reference defines;
+    DescribeUserPool reports it. PoolName, the API's name for the same
+    thing, stays accepted for templates written against MiniStack."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-poolname-{uid}"
+    template = json.dumps({
+        "Resources": {
+            "Named": {"Type": "AWS::Cognito::UserPool",
+                      "Properties": {"UserPoolName": f"cfn-named-pool-{uid}"}},
+            "Legacy": {"Type": "AWS::Cognito::UserPool",
+                       "Properties": {"PoolName": f"cfn-legacy-pool-{uid}"}},
+        },
+        "Outputs": {"NamedId": {"Value": {"Ref": "Named"}},
+                    "LegacyId": {"Value": {"Ref": "Legacy"}}},
+    })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+
+        named = cognito_idp.describe_user_pool(UserPoolId=outputs["NamedId"])["UserPool"]
+        assert named["Name"] == f"cfn-named-pool-{uid}"
+        legacy = cognito_idp.describe_user_pool(UserPoolId=outputs["LegacyId"])["UserPool"]
+        assert legacy["Name"] == f"cfn-legacy-pool-{uid}"
+        listed, token = {}, None
+        while True:
+            page = cognito_idp.list_user_pools(MaxResults=60, **({"NextToken": token} if token else {}))
+            listed.update({p["Id"]: p["Name"] for p in page["UserPools"]})
+            token = page.get("NextToken")
+            if not token:
+                break
+        assert listed[outputs["NamedId"]] == f"cfn-named-pool-{uid}"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
