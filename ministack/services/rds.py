@@ -54,7 +54,7 @@ import time
 from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
-from ministack.core import container_reaper
+from ministack.core import container_reaper, persistence
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import resource_lock, run_offloop, spawn_background
 from ministack.core.persistence import load_state
@@ -130,6 +130,8 @@ _MYSQL_CONTROL_USER = "rdsadmin"
 _MYSQL_CONTROL_PASSWORD = "ministack-rds-control"
 _MYSQL_REPLICATION_RETRY_ATTEMPTS = 60
 _MYSQL_REPLICATION_RETRY_INTERVAL = 1
+_MYSQL_GLOBAL_SWITCHOVER_TIMEOUT = 30
+_MYSQL_GLOBAL_SWITCHOVER_STATE = "_mysql_global_writer_switch_state"
 _MYSQL_TRANSACTION_STATES = frozenset({"RUNNING", "LOCK WAIT", "ROLLING BACK", "COMMITTING"})
 _MYSQL_MODIFIED_TRANSACTION_QUERY = (
     "SELECT i.TRX_ID, i.TRX_STATE, i.TRX_STARTED, i.TRX_MYSQL_THREAD_ID, "
@@ -390,6 +392,13 @@ def restore_state(data):
     _db_proxies.update(data.get("db_proxies", {}))
     _db_proxy_endpoints.update(data.get("db_proxy_endpoints", {}))
     _global_clusters.update(data.get("global_clusters", {}))
+    for global_cluster in _global_clusters._data.values():
+        marker = global_cluster.get(_MYSQL_GLOBAL_SWITCHOVER_STATE)
+        if isinstance(marker, dict):
+            # A live request owner cannot survive a process restart. Any
+            # persisted in-progress operation therefore becomes an explicit
+            # repair state rather than being resumed from an unknown phase.
+            marker["state"] = "repair_required"
     # Persistence contains every account, while AccountScopedDict.values()
     # intentionally exposes only the active request account. Reconcile the
     # raw persisted records so a warm boot cannot leave secondary metadata
@@ -807,6 +816,14 @@ def restore_state(data):
                         cluster_id,
                         engine=cluster.get("Engine", "aurora-mysql"),
                     )
+                repair_required = (
+                    _mysql_global_writer_switch_repair_required(cluster)
+                )
+                repair_fence_verified = bool(
+                    authenticated_ready
+                    and repair_required
+                    and _mysql_writer_fence_active(cluster) is True
+                )
                 with _shared_container_lock:
                     current_cluster = _clusters.get(cluster_id)
                     if (
@@ -819,6 +836,26 @@ def restore_state(data):
                         or cluster.get("_shared_container_id") != container_id
                     ):
                         return
+                    if repair_required:
+                        if authenticated_ready and not repair_fence_verified:
+                            logger.error(
+                                "RDS: stopping restored MySQL compute for %s "
+                                "because its repair fence could not be verified",
+                                cluster_id,
+                            )
+                            if not _contain_cluster_compute_preserving_volume(
+                                cluster_id, cluster,
+                            ):
+                                logger.critical(
+                                    "RDS: unfenced repair compute for %s could "
+                                    "not be contained",
+                                    cluster_id,
+                                )
+                        # Keep a verified-fenced server reachable only as
+                        # repair compute. Do not advertise it as ready or run
+                        # normal replication reconciliation against an
+                        # uncertain channel topology.
+                        authenticated_ready = False
                     pending_rotation = cluster.get(
                         "_pending_master_password_rotation",
                     )
@@ -881,7 +918,12 @@ def restore_state(data):
                         # that transition.
                         break
             else:
-                cluster["_shared_container_ready"] = status == "available"
+                if _mysql_global_writer_switch_repair_required(cluster):
+                    cluster["_shared_container_ready"] = False
+                    _set_cluster_members_status(cluster, "failed")
+                    _refresh_cluster_status(cluster_id)
+                else:
+                    cluster["_shared_container_ready"] = status == "available"
 
             # Superseded member volumes are recovery copies until the adopted
             # writer volume has passed an authenticated database readiness
@@ -1099,6 +1141,17 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
             "--log-replica-updates",
             f"--binlog-expire-logs-seconds={_MYSQL_BINLOG_RETENTION_SECONDS}",
         ]
+    if (
+        _is_mysql_engine(engine)
+        and _mysql_global_writer_switch_repair_required(cluster)
+    ):
+        # SET GLOBAL fences do not reliably survive a container restart. A
+        # persisted repair marker therefore has to fence the server before it
+        # accepts its first connection, not after readiness publishes it.
+        container_kwargs.setdefault("command", []).extend([
+            "--read-only=ON",
+            "--super-read-only=ON",
+        ])
     if ms_network:
         container_kwargs["network"] = ms_network
     # Aurora storage belongs to the cluster, not to any member instance. Use a
@@ -1857,6 +1910,109 @@ def _stop_cluster_shared_container(cluster_id, cluster):
                         _sync_cluster_endpoints(cluster)
                 return False
         return True
+
+
+def _force_remove_cluster_compute_preserving_volume(cluster_id, cluster):
+    """Force-remove owned cluster compute without deleting durable storage."""
+    parsed = _parse_rds_arn(cluster.get("DBClusterArn", ""))
+    if not parsed or parsed[1] != "cluster":
+        logger.error(
+            "RDS: cannot prove repair compute scope for cluster %s",
+            cluster_id,
+        )
+        return False
+    scope, _resource_type, parsed_cluster_id = parsed
+    if parsed_cluster_id != cluster_id:
+        logger.error(
+            "RDS: repair compute identifier %s does not match ARN for %s",
+            cluster_id,
+            parsed_cluster_id,
+        )
+        return False
+    docker_client = _get_docker()
+    if not docker_client:
+        return False
+    identifiers = []
+    if cluster.get("_shared_container_id"):
+        identifiers.append(cluster["_shared_container_id"])
+    container_name = _rds_cluster_docker_name(
+        cluster_id, scope.account_id, scope.region,
+    )
+    if container_name not in identifiers:
+        identifiers.append(container_name)
+
+    def _not_found(error):
+        response = getattr(error, "response", None)
+        return (
+            getattr(error, "status_code", None) == 404
+            or getattr(response, "status_code", None) == 404
+        )
+
+    for identifier in identifiers:
+        try:
+            container = docker_client.containers.get(identifier)
+        except Exception as e:
+            if _not_found(e):
+                continue
+            logger.error(
+                "RDS: failed to inspect repair container %s for cluster %s: %s",
+                identifier,
+                cluster_id,
+                e,
+            )
+            return False
+        if not _rds_container_is_owned_by(
+            container,
+            expected_cluster_ids={cluster_id},
+            account_id=scope.account_id,
+            region=scope.region,
+        ):
+            logger.error(
+                "RDS: refusing to force-remove unowned repair container %s "
+                "for cluster %s",
+                identifier,
+                cluster_id,
+            )
+            return False
+        try:
+            container.remove(force=True, v=False)
+        except Exception as e:
+            logger.error(
+                "RDS: failed to force-remove repair container %s for cluster "
+                "%s: %s",
+                identifier,
+                cluster_id,
+                e,
+            )
+            return False
+    for identifier in identifiers:
+        try:
+            docker_client.containers.get(identifier)
+        except Exception as e:
+            if _not_found(e):
+                continue
+            logger.error(
+                "RDS: failed to verify repair container %s removal for cluster "
+                "%s: %s",
+                identifier,
+                cluster_id,
+                e,
+            )
+            return False
+        logger.error(
+            "RDS: repair container %s for cluster %s remains after force-remove",
+            identifier,
+            cluster_id,
+        )
+        return False
+    cluster["_shared_container_id"] = None
+    cluster["_shared_internal_address"] = None
+    cluster["_shared_internal_port"] = None
+    return True
+
+
+def _contain_cluster_compute_preserving_volume(cluster_id, cluster):
+    return _force_remove_cluster_compute_preserving_volume(cluster_id, cluster)
 
 
 def _remove_cluster_shared_resources(
@@ -2993,6 +3149,57 @@ def _ensure_mysql_replication_user(cluster, *, timeout=None, deadline=None):
     return succeeded
 
 
+def _set_mysql_cluster_fenced(cluster, *, timeout=None, deadline=None):
+    """Install and verify a writer fence using bounded control connections."""
+    conn = None
+    succeeded = False
+    try:
+        if deadline is None and timeout is not None:
+            deadline = time.monotonic() + max(float(timeout), 0.0)
+        conn = _connect_mysql(
+            _mysql_replication_connection,
+            cluster,
+            _mysql_deadline_timeout(timeout=timeout, deadline=deadline),
+        )
+        if conn is None:
+            return False
+        succeeded = _set_mysql_writer_fence(conn, deadline=deadline)
+        if succeeded:
+            succeeded = _mysql_writer_fence_active(
+                cluster, deadline=deadline,
+            ) is True
+    except Exception as e:
+        logger.warning(
+            "RDS: failed to fence MySQL cluster %s: %s",
+            cluster.get("DBClusterIdentifier", "unknown"),
+            e,
+        )
+    finally:
+        if not _close_mysql_resources("cluster fence", connection=conn):
+            succeeded = False
+    return succeeded
+
+
+def _fence_or_contain_mysql_cluster(cluster, *, timeout=3):
+    """Return ``fenced`` or ``contained`` only after proving one is true."""
+    if _set_mysql_cluster_fenced(cluster, timeout=timeout):
+        return "fenced"
+    cluster_id = cluster.get("DBClusterIdentifier", "")
+    with _shared_container_lock:
+        contained = _contain_cluster_compute_preserving_volume(
+            cluster_id, cluster,
+        )
+        _set_cluster_members_status(cluster, "failed")
+        cluster["Status"] = "creating"
+    if contained:
+        return "contained"
+    logger.critical(
+        "RDS: unfenced MySQL compute for %s could not be contained",
+        cluster_id or "unknown",
+    )
+    return None
+
+
 def _configure_mysql_replica_from_source(
     cluster_id, replica, source, *, timeout=None, deadline=None,
 ):
@@ -3920,10 +4127,8 @@ def _resolve_instance(db_id):
 
 
 def _set_cluster_members_status(cluster, status):
-    for member in cluster.get("DBClusterMembers", []):
-        instance = _instances.get(member.get("DBInstanceIdentifier"))
-        if instance is not None:
-            instance["DBInstanceStatus"] = status
+    for instance in _cluster_member_instances(cluster):
+        instance["DBInstanceStatus"] = status
 
 
 def _attach_instance_to_shared_cluster(instance, cluster):
@@ -4978,7 +5183,7 @@ def _modify_db_instance(p):
     return _single_instance_response("ModifyDBInstanceResponse", "ModifyDBInstanceResult", instance)
 
 
-def _start_db_instance(p):
+def _set_db_instance_status(p, status, response_name, result_name):
     db_id = _p(p, "DBInstanceIdentifier")
     instance = _resolve_instance(db_id)
     if not instance:
@@ -4986,32 +5191,36 @@ def _start_db_instance(p):
         if invalid_arn:
             return invalid_arn
         return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
-    instance["DBInstanceStatus"] = "available"
-    return _single_instance_response("StartDBInstanceResponse", "StartDBInstanceResult", instance)
+    cluster_id = (
+        instance.get("_shared_cluster_id") or instance.get("DBClusterIdentifier")
+    )
+    cluster = _resolve_cluster_in_request_region(cluster_id) if cluster_id else None
+    if cluster and (switch_error := _begin_mysql_global_instance_mutation(cluster)):
+        return switch_error
+    try:
+        instance["DBInstanceStatus"] = status
+        return _single_instance_response(response_name, result_name, instance)
+    finally:
+        if cluster:
+            _end_mysql_global_instance_mutation(cluster)
+
+
+def _start_db_instance(p):
+    return _set_db_instance_status(
+        p, "available", "StartDBInstanceResponse", "StartDBInstanceResult",
+    )
 
 
 def _stop_db_instance(p):
-    db_id = _p(p, "DBInstanceIdentifier")
-    instance = _resolve_instance(db_id)
-    if not instance:
-        invalid_arn = _invalid_db_instance_identifier_error(db_id)
-        if invalid_arn:
-            return invalid_arn
-        return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
-    instance["DBInstanceStatus"] = "stopped"
-    return _single_instance_response("StopDBInstanceResponse", "StopDBInstanceResult", instance)
+    return _set_db_instance_status(
+        p, "stopped", "StopDBInstanceResponse", "StopDBInstanceResult",
+    )
 
 
 def _reboot_db_instance(p):
-    db_id = _p(p, "DBInstanceIdentifier")
-    instance = _resolve_instance(db_id)
-    if not instance:
-        invalid_arn = _invalid_db_instance_identifier_error(db_id)
-        if invalid_arn:
-            return invalid_arn
-        return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
-    instance["DBInstanceStatus"] = "available"
-    return _single_instance_response("RebootDBInstanceResponse", "RebootDBInstanceResult", instance)
+    return _set_db_instance_status(
+        p, "available", "RebootDBInstanceResponse", "RebootDBInstanceResult",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -7085,8 +7294,8 @@ def _invalid_global_cluster_identifier_error(global_id):
 # Global Clusters
 #
 # Emulation scope: Aurora Global Database membership plus native MySQL 8 GTID
-# replication between provisioned members. Failover and switchover remain
-# metadata-only; their data-plane promotion behavior is a separate phase.
+# replication between provisioned members. Planned Aurora MySQL 8 switchovers
+# move the data plane synchronously; lossy failover remains metadata-only.
 # ---------------------------------------------------------------------------
 
 def _create_global_cluster(p):
@@ -7354,11 +7563,113 @@ def _find_global_cluster_target_member(gc, target_cluster_id):
     return cluster, member
 
 
+def _resolve_global_writer_switch(p, *, exact_two=False):
+    gc_id = _p(p, "GlobalClusterIdentifier")
+    target_id = _p(p, "TargetDbClusterIdentifier")
+    invalid_id = _invalid_global_cluster_identifier_error(gc_id)
+    if invalid_id:
+        return None, invalid_id
+    gc = _resolve_global_cluster(gc_id)
+    if not gc:
+        return None, _error(
+            "GlobalClusterNotFoundFault", f"Global cluster {gc_id} not found.", 404,
+        )
+    if not target_id:
+        return None, _error("MissingParameter", "TargetDbClusterIdentifier is required", 400)
+    target, target_member = _find_global_cluster_target_member(gc, target_id)
+    if not target_member:
+        if not _resolve_cluster(target_id):
+            return None, _error(
+                "DBClusterNotFoundFault", f"DBCluster {target_id} not found.", 404,
+            )
+        return None, _error(
+            "InvalidGlobalClusterStateFault",
+            f"DBCluster {target_id} is not a secondary member of global "
+            f"cluster {gc_id}.",
+            400,
+        )
+    members = gc.get("GlobalClusterMembers", [])
+    writer = next((member for member in members if member.get("IsWriter")), None)
+    wrong_size = len(members) != 2 if exact_two else len(members) < 2
+    if not writer or target_member.get("IsWriter") or wrong_size:
+        requirement = "one writer and one secondary" if exact_two else "a secondary"
+        return None, _error(
+            "InvalidGlobalClusterStateFault",
+            f"Global cluster {gc_id} must have {requirement} target to promote.",
+            400,
+        )
+    return (gc, target, target_member, writer), None
+
+
+def _persisted_mysql_global_writer_switch_state(gc):
+    marker = gc.get(_MYSQL_GLOBAL_SWITCHOVER_STATE) if gc else None
+    if (
+        isinstance(marker, dict)
+        and marker.get("state") in ("in_progress", "repair_required")
+    ):
+        return marker
+    return None
+
+
+def _persisted_mysql_global_writer_switch_cluster(data, gc):
+    if not isinstance(data, dict):
+        return None
+    global_clusters = data.get("global_clusters")
+    if isinstance(global_clusters, (AccountScopedDict, AccountRegionScopedDict)):
+        candidates = global_clusters.values()
+    elif isinstance(global_clusters, dict):
+        candidates = global_clusters.values()
+    else:
+        return None
+    identifier = gc.get("GlobalClusterIdentifier")
+    arn = gc.get("GlobalClusterArn")
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        if candidate.get("GlobalClusterIdentifier") != identifier:
+            continue
+        if arn and candidate.get("GlobalClusterArn") != arn:
+            continue
+        return candidate
+    return None
+
+
+def _persisted_mysql_global_writer_switch_marker(data, gc):
+    persisted_gc = _persisted_mysql_global_writer_switch_cluster(data, gc)
+    if persisted_gc is None:
+        return None
+    return persisted_gc.get(_MYSQL_GLOBAL_SWITCHOVER_STATE)
+
+
+def _durably_persist_mysql_global_writer_switch_state(gc, expected_marker):
+    """Write and verify the recovery state around data-plane changes."""
+    if not persistence.PERSIST_STATE:
+        return True
+    persistence.save_state("rds", get_state())
+    persisted = persistence.load_state("rds")
+    persisted_gc = _persisted_mysql_global_writer_switch_cluster(persisted, gc)
+    if (
+        persisted_gc is not None
+        and persisted_gc.get(_MYSQL_GLOBAL_SWITCHOVER_STATE) == expected_marker
+    ):
+        return True
+    logger.error(
+        "RDS: global writer switchover recovery state could not be durably "
+        "persisted"
+    )
+    return False
+
+
+def _mysql_global_writer_switch_repair_required(cluster):
+    gc, _member = _global_cluster_member_for_cluster(cluster)
+    return _persisted_mysql_global_writer_switch_state(gc) is not None
+
+
 def _active_mysql_global_writer_switch(gc):
     owner = _mysql_global_writer_switch_owners.get(id(gc)) if gc else None
     if owner and owner.get("global_cluster") is gc:
         return owner
-    return None
+    return _persisted_mysql_global_writer_switch_state(gc)
 
 
 def _mysql_global_writer_switch_mutation_error(cluster):
@@ -7451,6 +7762,18 @@ def _mysql_global_writer_switch_ready(gc, source, target):
     )
 
 
+def _mysql_global_writer_switch_owner(gc, source, target, operation_id):
+    return {
+        "global_cluster": gc,
+        "source": source,
+        "target": target,
+        "topology": _mysql_global_writer_switch_topology(gc),
+        "source_identity": _mysql_global_writer_switch_identity(source),
+        "target_identity": _mysql_global_writer_switch_identity(target),
+        "operation_id": operation_id,
+    }
+
+
 def _claim_mysql_global_writer_switch(gc, source, target):
     with _mysql_global_writer_switch_lock:
         if _active_mysql_global_writer_switch(gc) or any(
@@ -7458,16 +7781,114 @@ def _claim_mysql_global_writer_switch(gc, source, target):
             for cluster in (source, target)
         ):
             return None
-        owner = {
-            "global_cluster": gc,
-            "source": source,
-            "target": target,
-            "topology": _mysql_global_writer_switch_topology(gc),
-            "source_identity": _mysql_global_writer_switch_identity(source),
-            "target_identity": _mysql_global_writer_switch_identity(target),
+        operation_id = new_uuid()
+        owner = _mysql_global_writer_switch_owner(
+            gc, source, target, operation_id,
+        )
+        marker = {
+            "state": "in_progress",
+            "source_arn": source.get("DBClusterArn"),
+            "target_arn": target.get("DBClusterArn"),
+            "operation_id": operation_id,
         }
+        gc[_MYSQL_GLOBAL_SWITCHOVER_STATE] = marker
+        if not _durably_persist_mysql_global_writer_switch_state(gc, marker):
+            gc.pop(_MYSQL_GLOBAL_SWITCHOVER_STATE, None)
+            return None
         _mysql_global_writer_switch_owners[id(gc)] = owner
         return owner
+
+
+def _mysql_global_writer_switch_repair_matches(marker, source, target):
+    return bool(
+        isinstance(marker, dict)
+        and marker.get("state") == "repair_required"
+        and marker.get("operation_id")
+        and marker.get("source_arn") == source.get("DBClusterArn")
+        and marker.get("target_arn") == target.get("DBClusterArn")
+    )
+
+
+def _mysql_global_writer_switch_repair_ready(gc, source, target, marker):
+    return bool(
+        _mysql_global_writer_switch_repair_matches(marker, source, target)
+        and gc.get(_MYSQL_GLOBAL_SWITCHOVER_STATE) is marker
+        and source.get("EngineVersion") == target.get("EngineVersion")
+        and _mysql_gtid_history_ready(source)
+        and _mysql_gtid_history_ready(target)
+        and all(
+            cluster.get("_shared_storage_initialized")
+            and cluster.get("DBClusterMembers")
+            and cluster.get("_shared_container_id")
+            and cluster.get("_shared_internal_address")
+            and cluster.get("_shared_internal_port")
+            and isinstance(cluster.get("_shared_container_epoch"), int)
+            and cluster.get("_shared_container_epoch") > 0
+            and not cluster.get("_pending_master_password_rotation")
+            and not _active_mysql_global_instance_mutation(cluster)
+            for cluster in (source, target)
+        )
+    )
+
+
+def _resume_mysql_global_writer_switch(gc, source, target, marker):
+    """Reclaim a restored repair marker for a retry of the same switchover."""
+    with _mysql_global_writer_switch_lock:
+        if id(gc) in _mysql_global_writer_switch_owners:
+            return None
+        if not _mysql_global_writer_switch_repair_ready(
+            gc, source, target, marker,
+        ):
+            return None
+        for cluster in (source, target):
+            cluster["_shared_container_ready"] = True
+            cluster["Status"] = "available"
+            _set_cluster_members_status(cluster, "available")
+        gc["Status"] = "available"
+        marker["state"] = "in_progress"
+        owner = _mysql_global_writer_switch_owner(
+            gc, source, target, marker["operation_id"],
+        )
+        _mysql_global_writer_switch_owners[id(gc)] = owner
+        return owner
+
+
+def _resolve_committed_mysql_global_writer_switch_repair(p):
+    gc = _resolve_global_cluster(_p(p, "GlobalClusterIdentifier"))
+    marker = _persisted_mysql_global_writer_switch_state(gc)
+    if not gc or not marker or marker.get("state") != "repair_required":
+        return None
+    members = gc.get("GlobalClusterMembers", [])
+    source_member = next(
+        (
+            member for member in members
+            if member.get("DBClusterArn") == marker.get("source_arn")
+        ),
+        None,
+    )
+    target_member = next(
+        (
+            member for member in members
+            if member.get("DBClusterArn") == marker.get("target_arn")
+        ),
+        None,
+    )
+    source = _resolve_global_member_cluster(source_member)
+    target = _resolve_global_member_cluster(target_member)
+    requested_target = _p(p, "TargetDbClusterIdentifier")
+    if (
+        not source
+        or not target
+        or not source_member
+        or not target_member
+        or source_member.get("IsWriter")
+        or not target_member.get("IsWriter")
+        or requested_target not in (
+            target.get("DBClusterIdentifier"), target.get("DBClusterArn"),
+        )
+    ):
+        return None
+    return gc, source, target, source_member, target_member, marker
 
 
 def _mysql_global_writer_switch_still_owned(owner, expected_topology):
@@ -7494,44 +7915,39 @@ def _finish_mysql_global_writer_switch(owner, *, repair_required=False):
         return
     if repair_required:
         owner["state"] = "repair_required"
+        marker = gc.get(_MYSQL_GLOBAL_SWITCHOVER_STATE)
+        if not isinstance(marker, dict):
+            marker = {}
+            gc[_MYSQL_GLOBAL_SWITCHOVER_STATE] = marker
+        marker.update({
+            "state": "repair_required",
+            "source_arn": owner["source"].get("DBClusterArn"),
+            "target_arn": owner["target"].get("DBClusterArn"),
+            "operation_id": owner["operation_id"],
+        })
+        # The durable in-progress claim already restores as repair-required,
+        # so a failed update remains fail-closed across a restart.
+        _durably_persist_mysql_global_writer_switch_state(gc, marker)
+        return True
     else:
-        _mysql_global_writer_switch_owners.pop(id(gc), None)
+        gc.pop(_MYSQL_GLOBAL_SWITCHOVER_STATE, None)
         gc["Status"] = "available"
+        if not _durably_persist_mysql_global_writer_switch_state(gc, None):
+            owner["state"] = "repair_required"
+            gc[_MYSQL_GLOBAL_SWITCHOVER_STATE] = {
+                "state": "repair_required",
+                "source_arn": owner["source"].get("DBClusterArn"),
+                "target_arn": owner["target"].get("DBClusterArn"),
+                "operation_id": owner["operation_id"],
+            }
+            return False
+        _mysql_global_writer_switch_owners.pop(id(gc), None)
+        return True
 
 
-def _switch_global_cluster_writer(p, *, allow_data_loss=False):
-    gc_id = _p(p, "GlobalClusterIdentifier")
-    target_cluster_id = _p(p, "TargetDbClusterIdentifier")
-    invalid_id = _invalid_global_cluster_identifier_error(gc_id)
-    if invalid_id:
-        return invalid_id
-    gc = _resolve_global_cluster(gc_id)
-    if not gc:
-        return _error("GlobalClusterNotFoundFault",
-            f"Global cluster {gc_id} not found.", 404)
-    if not target_cluster_id:
-        return _error("MissingParameter", "TargetDbClusterIdentifier is required", 400)
-
-    _target_cluster, target_member = _find_global_cluster_target_member(gc, target_cluster_id)
-    if not target_member:
-        cluster = _resolve_cluster(target_cluster_id)
-        if not cluster:
-            return _error("DBClusterNotFoundFault",
-                f"DBCluster {target_cluster_id} not found.", 404)
-        return _error("InvalidGlobalClusterStateFault",
-            f"DBCluster {target_cluster_id} is not a secondary member of global cluster {gc_id}.", 400)
-
-    members = gc.get("GlobalClusterMembers", [])
-    current_writer = next((m for m in members if m.get("IsWriter")), None)
-    if not current_writer or target_member.get("IsWriter") or len(members) < 2:
-        return _error("InvalidGlobalClusterStateFault",
-            f"Global cluster {gc_id} does not have a secondary target to promote.", 400)
-
-    _set_global_cluster_writer(gc, target_member)
-    gc["Status"] = "available"
-
+def _global_cluster_writer_switch_response(gc, current_writer, target_member, *, allow_data_loss):
     response_gc = copy.deepcopy(gc)
-    response_gc["Status"] = "switching-over" if not allow_data_loss else "failing-over"
+    response_gc["Status"] = "failing-over" if allow_data_loss else "switching-over"
     response_gc["FailoverState"] = {
         "Status": "pending",
         "FromDbClusterArn": current_writer["DBClusterArn"],
@@ -7541,8 +7957,571 @@ def _switch_global_cluster_writer(p, *, allow_data_loss=False):
     return response_gc
 
 
+def _wait_for_mysql_replication_healthy(replica, source, *, deadline):
+    """Wait for both reverse replication threads to reach the expected source."""
+    conn = None
+    cur = None
+    healthy = False
+    try:
+        conn = _connect_mysql(
+            _mysql_replication_connection,
+            replica,
+            _mysql_deadline_timeout(deadline=deadline),
+        )
+        if conn is None:
+            return False
+        cur = conn.cursor()
+        while True:
+            _execute_mysql(cur, "SHOW REPLICA STATUS", deadline=deadline)
+            row = cur.fetchone()
+            if isinstance(row, dict):
+                status = row
+            else:
+                description = getattr(cur, "description", None) or ()
+                columns = [column[0] for column in description]
+                status = dict(zip(columns, row or ()))
+            try:
+                source_port_matches = int(status.get("Source_Port")) == int(
+                    source.get("_shared_internal_port"),
+                )
+            except (TypeError, ValueError):
+                source_port_matches = False
+            if (
+                status.get("Replica_IO_Running") == "Yes"
+                and status.get("Replica_SQL_Running") == "Yes"
+                and status.get("Source_Host") == source.get("_shared_internal_address")
+                and source_port_matches
+            ):
+                healthy = True
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(_MYSQL_REPLICATION_RETRY_INTERVAL, remaining))
+    except Exception as e:
+        logger.warning(
+            "RDS: reverse MySQL replication did not become healthy for %s: %s",
+            replica.get("DBClusterIdentifier", "unknown"), e,
+        )
+    finally:
+        if not _close_mysql_resources(
+            "replication health check", cursor=cur, connection=conn,
+        ):
+            healthy = False
+    return healthy
+
+
+def _rollback_mysql_global_writer_switch(
+    owner, *, target_channel_changed=False, reverse_channel_attempted=False,
+):
+    gc = owner["global_cluster"]
+    source = owner["source"]
+    target = owner["target"]
+    # Compensation has its own bounded budget so safety restoration is tried.
+    deadline = time.monotonic() + _MYSQL_GLOBAL_SWITCHOVER_TIMEOUT
+
+    safe = True
+    if reverse_channel_attempted:
+        try:
+            source_reset = bool(_reset_mysql_replication_channel(
+                source.get("DBClusterIdentifier", ""),
+                source,
+                clear_super_read_only=False,
+                allow_missing_channel=True,
+                deadline=deadline,
+            ))
+            if source_reset:
+                _clear_mysql_replication_metadata(source)
+        except Exception as e:
+            logger.warning("RDS: reverse channel rollback failed: %s", e)
+            source_reset = False
+        safe = safe and source_reset
+    if target_channel_changed:
+        try:
+            target_restored = bool(_configure_mysql_replica_from_source(
+                target.get("DBClusterIdentifier", ""), target, source,
+                deadline=deadline,
+            ))
+            if target_restored:
+                target_restored = _wait_for_mysql_replication_healthy(
+                    target, source, deadline=deadline,
+                )
+        except Exception as e:
+            logger.warning("RDS: target channel rollback failed: %s", e)
+            target_restored = False
+        safe = safe and target_restored
+    try:
+        target_safety = _fence_or_contain_mysql_cluster(target)
+        safe = safe and target_safety == "fenced"
+        if safe:
+            if not _acquire_mysql_lifecycle_lock(deadline):
+                safe = False
+            else:
+                try:
+                    safe = _mysql_global_writer_switch_still_owned(
+                        owner, owner["topology"],
+                    )
+                finally:
+                    _shared_container_lock.release()
+        if safe:
+            safe = _set_mysql_cluster_writable(source, deadline=deadline)
+    except Exception as e:
+        logger.warning("RDS: global writer rollback failed: %s", e)
+        safe = False
+    finally:
+        # Repair ownership must be finalized even after compensation expires.
+        with _shared_container_lock:
+            owned = _active_mysql_global_writer_switch(gc) is owner
+            finalized = False
+            if owned:
+                finalized = _finish_mysql_global_writer_switch(
+                    owner, repair_required=not safe,
+                )
+    if safe and owned and not finalized:
+        _fence_or_contain_mysql_cluster(source)
+        _fence_or_contain_mysql_cluster(target)
+        with _shared_container_lock:
+            if _active_mysql_global_writer_switch(gc) is owner:
+                _finish_mysql_global_writer_switch(
+                    owner, repair_required=True,
+                )
+    return safe and owned and finalized
+
+
+def _planned_mysql_global_writer_switch_not_ready(target_cluster_id, message=None):
+    return _error(
+        "InvalidDBClusterStateFault",
+        message or f"DBCluster {target_cluster_id} is not ready for a "
+        "planned global writer switchover.",
+        400,
+    )
+
+
+def _repair_committed_mysql_global_writer_switch(
+    p,
+    gc,
+    source,
+    target,
+    source_member,
+    target_member,
+    marker,
+    original_topology,
+    original_identities,
+    *,
+    deadline,
+):
+    """Finalize a retry whose durable metadata already names the new writer."""
+    gc_id = _p(p, "GlobalClusterIdentifier")
+    target_id = _p(p, "TargetDbClusterIdentifier")
+
+    if not _ensure_mysql_control_user(
+        source, require_quiescence_grants=True, deadline=deadline,
+    ) or not _ensure_mysql_control_user(target, deadline=deadline):
+        return _planned_mysql_global_writer_switch_not_ready(target_id)
+    if not _ensure_mysql_replication_user(target, deadline=deadline):
+        return _planned_mysql_global_writer_switch_not_ready(target_id)
+    if any(
+        _mysql_writer_fence_active(cluster, deadline=deadline) is not True
+        for cluster in (source, target)
+    ):
+        return _planned_mysql_global_writer_switch_not_ready(target_id)
+
+    if not _acquire_mysql_lifecycle_lock(deadline):
+        return _planned_mysql_global_writer_switch_not_ready(target_id)
+    try:
+        if (
+            _resolve_global_cluster(gc_id) is not gc
+            or _mysql_global_writer_switch_topology(gc) != original_topology
+            or not _mysql_global_writer_switch_repair_ready(
+                gc, source, target, marker,
+            )
+            or original_identities != tuple(
+                _mysql_global_writer_switch_identity(cluster)
+                for cluster in (source, target)
+            )
+            or _global_cluster_writer_cluster(gc) is not target
+        ):
+            return _planned_mysql_global_writer_switch_not_ready(
+                target_id,
+                f"Global cluster {gc_id} changed while preparing its "
+                "committed writer repair.",
+            )
+        owner = _resume_mysql_global_writer_switch(gc, source, target, marker)
+        if owner is None:
+            return _planned_mysql_global_writer_switch_not_ready(target_id)
+    finally:
+        _shared_container_lock.release()
+
+    try:
+        if not _configure_mysql_replica_from_source(
+            source.get("DBClusterIdentifier", ""), source, target,
+            deadline=deadline,
+        ):
+            raise RuntimeError("committed writer replica repair failed")
+        if not _wait_for_mysql_replication_healthy(
+            source, target, deadline=deadline,
+        ):
+            raise RuntimeError("committed writer replica did not become healthy")
+        if not _set_mysql_cluster_writable(target, deadline=deadline):
+            raise RuntimeError("committed writer could not be made writable")
+
+        source_fenced = _mysql_writer_fence_active(
+            source, deadline=deadline,
+        ) is True
+        target_writable = _mysql_control_query(
+            target, "SELECT @@GLOBAL.read_only, @@GLOBAL.super_read_only",
+            deadline=deadline,
+        ) == ((0, 0),)
+        if not _acquire_mysql_lifecycle_lock(deadline):
+            raise RuntimeError("committed writer repair lock deadline elapsed")
+        try:
+            if (
+                not source_fenced
+                or not target_writable
+                or not _mysql_global_writer_switch_still_owned(
+                    owner, original_topology,
+                )
+                or _global_cluster_writer_cluster(gc) is not target
+            ):
+                raise RuntimeError("committed writer repair changed before finalization")
+            if not _finish_mysql_global_writer_switch(owner):
+                raise RuntimeError("committed writer repair could not be persisted")
+            result = _global_cluster_writer_switch_response(
+                gc,
+                source_member,
+                target_member,
+                allow_data_loss=False,
+            )
+        finally:
+            _shared_container_lock.release()
+        return result
+    except Exception as e:
+        logger.warning(
+            "RDS: committed global writer repair for %s failed: %s", gc_id, e,
+        )
+        _fence_or_contain_mysql_cluster(source)
+        _fence_or_contain_mysql_cluster(target)
+        with _shared_container_lock:
+            if _active_mysql_global_writer_switch(gc) is owner:
+                _finish_mysql_global_writer_switch(owner, repair_required=True)
+        return _planned_mysql_global_writer_switch_not_ready(target_id)
+
+
+def _planned_mysql_global_writer_switch(p):
+    """Synchronously exchange a two-member Aurora MySQL global writer."""
+    gc_id = _p(p, "GlobalClusterIdentifier")
+    target_cluster_id = _p(p, "TargetDbClusterIdentifier")
+
+    def _not_ready_error(message=None):
+        return _planned_mysql_global_writer_switch_not_ready(
+            target_cluster_id, message,
+        )
+
+    deadline = time.monotonic() + _MYSQL_GLOBAL_SWITCHOVER_TIMEOUT
+    if not _acquire_mysql_lifecycle_lock(deadline):
+        return _not_ready_error()
+    try:
+        committed_repair = _resolve_committed_mysql_global_writer_switch_repair(p)
+        if committed_repair:
+            (
+                gc,
+                source,
+                target,
+                current_writer,
+                target_member,
+                repair_marker,
+            ) = committed_repair
+            recovering = True
+        else:
+            resolved, error = _resolve_global_writer_switch(p)
+            if error:
+                return error
+            gc, target, target_member, current_writer = resolved
+            source = _resolve_global_member_cluster(current_writer)
+            if not source or not target:
+                return _not_ready_error()
+            repair_marker = _persisted_mysql_global_writer_switch_state(gc)
+            recovering = repair_marker is not None
+        live_owner = _mysql_global_writer_switch_owners.get(id(gc))
+        if live_owner and live_owner.get("global_cluster") is gc:
+            return _error(
+                "InvalidGlobalClusterStateFault",
+                f"Global cluster {gc_id} already has a writer switchover in "
+                "progress.",
+                400,
+            )
+        if recovering and not _mysql_global_writer_switch_repair_matches(
+            repair_marker, source, target,
+        ):
+            return _error(
+                "InvalidGlobalClusterStateFault",
+                f"Global cluster {gc_id} requires repair by retrying its "
+                "interrupted writer switchover target.",
+                400,
+            )
+        native = tuple(
+            _aurora_mysql_8_replication_enabled(cluster)
+            for cluster in (source, target)
+        )
+        if native == (False, False):
+            return _switch_global_cluster_writer_locked(
+                p, allow_data_loss=False,
+            )
+        if native != (True, True):
+            return _not_ready_error()
+        if len(gc.get("GlobalClusterMembers", [])) != 2:
+            return _not_ready_error()
+        if recovering:
+            if not _mysql_global_writer_switch_repair_ready(
+                gc, source, target, repair_marker,
+            ):
+                return _not_ready_error(
+                    f"Global cluster {gc_id} repair compute is not ready to "
+                    "retry its interrupted writer switchover.",
+                )
+        elif not _mysql_global_writer_switch_ready(gc, source, target):
+            return _not_ready_error()
+        original_topology = _mysql_global_writer_switch_topology(gc)
+        original_identities = tuple(
+            _mysql_global_writer_switch_identity(cluster)
+            for cluster in (source, target)
+        )
+    finally:
+        _shared_container_lock.release()
+
+    if committed_repair:
+        return _repair_committed_mysql_global_writer_switch(
+            p,
+            gc,
+            source,
+            target,
+            current_writer,
+            target_member,
+            repair_marker,
+            original_topology,
+            original_identities,
+            deadline=deadline,
+        )
+
+    def _remaining():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("global writer switchover deadline elapsed")
+        return remaining
+
+    if not _ensure_mysql_control_user(
+        source, require_quiescence_grants=True, deadline=deadline,
+    ) or not _ensure_mysql_control_user(target, deadline=deadline):
+        return _not_ready_error()
+    if not _ensure_mysql_replication_user(source, deadline=deadline):
+        return _not_ready_error()
+    if (
+        recovering
+        and _mysql_writer_fence_active(source, deadline=deadline) is not True
+    ):
+        return _not_ready_error()
+    if _mysql_writer_fence_active(target, deadline=deadline) is not True:
+        return _not_ready_error()
+
+    if not _acquire_mysql_lifecycle_lock(deadline):
+        return _not_ready_error()
+    try:
+        if (
+            _resolve_global_cluster(gc_id) is not gc
+            or _mysql_global_writer_switch_topology(gc) != original_topology
+            or _resolve_global_member_cluster(current_writer) is not source
+            or _resolve_global_member_cluster(target_member) is not target
+            or not (
+                _mysql_global_writer_switch_repair_ready(
+                    gc, source, target, repair_marker,
+                )
+                if recovering else
+                _mysql_global_writer_switch_ready(gc, source, target)
+            )
+            or original_identities != tuple(
+                _mysql_global_writer_switch_identity(cluster)
+                for cluster in (source, target)
+            )
+        ):
+            return _not_ready_error(
+                f"Global cluster {gc_id} changed while preparing switchover.",
+            )
+        owner = (
+            _resume_mysql_global_writer_switch(
+                gc, source, target, repair_marker,
+            )
+            if recovering else
+            _claim_mysql_global_writer_switch(gc, source, target)
+        )
+        if owner is None:
+            if recovering:
+                return _not_ready_error(
+                    f"Global cluster {gc_id} repair claim changed while "
+                    "preparing its writer switchover retry.",
+                )
+            if not _active_mysql_global_writer_switch(gc):
+                return _not_ready_error(
+                    f"Global cluster {gc_id} could not durably record its "
+                    "planned writer switchover.",
+                )
+            return _error(
+                "InvalidGlobalClusterStateFault",
+                f"Global cluster {gc_id} already has a writer switchover in "
+                "progress.",
+                400,
+            )
+    finally:
+        _shared_container_lock.release()
+
+    fence_conn = None
+    target_channel_changed = False
+    reverse_channel_attempted = False
+    metadata_flipped = False
+    try:
+        fence_conn = _mysql_replication_connection(source, timeout=_remaining())
+        if fence_conn is None or not _set_mysql_writer_fence(
+            fence_conn, deadline=deadline,
+        ):
+            raise RuntimeError("writer fence failed")
+        gtid = _wait_for_mysql_writer_quiescence(
+            source, _remaining(), deadline=deadline,
+        )
+        if gtid is None:
+            raise RuntimeError("writer drain failed")
+        if not _close_mysql_resources("switchover fence", connection=fence_conn):
+            raise RuntimeError("writer fence connection close failed")
+        fence_conn = None
+
+        if not _wait_for_mysql_gtid(
+            target, gtid, _remaining(), deadline=deadline,
+        ):
+            raise RuntimeError("target GTID convergence failed")
+
+        target_channel_changed = True
+        if not _reset_mysql_replication_channel(
+            target.get("DBClusterIdentifier", ""),
+            target,
+            clear_super_read_only=False,
+            allow_missing_channel=recovering,
+            deadline=deadline,
+        ):
+            raise RuntimeError("target replication reset failed")
+
+        reverse_channel_attempted = True
+        if not _configure_mysql_replica_from_source(
+            source.get("DBClusterIdentifier", ""),
+            source,
+            target,
+            deadline=deadline,
+        ):
+            raise RuntimeError("reverse replication configuration failed")
+        if not _wait_for_mysql_replication_healthy(
+            source, target, deadline=deadline,
+        ):
+            raise RuntimeError("reverse replication did not become healthy")
+
+        if not _acquire_mysql_lifecycle_lock(deadline):
+            raise RuntimeError("global writer commit lock deadline elapsed")
+        try:
+            if not _mysql_global_writer_switch_still_owned(
+                owner, owner["topology"],
+            ):
+                raise RuntimeError("global topology changed before commit")
+            _set_global_cluster_writer(gc, target_member)
+            metadata_flipped = True
+            committed_topology = _mysql_global_writer_switch_topology(gc)
+            _clear_mysql_replication_metadata(target)
+            _sync_global_mysql_credentials(target, gc)
+        finally:
+            _shared_container_lock.release()
+
+        if not _set_mysql_cluster_writable(target, deadline=deadline):
+            raise RuntimeError("promoted writer could not be made writable")
+
+        source_fenced = _mysql_writer_fence_active(source, deadline=deadline) is True
+        target_writable = _mysql_control_query(
+            target, "SELECT @@GLOBAL.read_only, @@GLOBAL.super_read_only",
+            deadline=deadline,
+        ) == ((0, 0),)
+
+        if not _acquire_mysql_lifecycle_lock(deadline):
+            raise RuntimeError("global writer finalization lock deadline elapsed")
+        try:
+            if (
+                not source_fenced
+                or not target_writable
+                or not _mysql_global_writer_switch_still_owned(
+                    owner, committed_topology,
+                )
+                or _global_cluster_writer_cluster(gc) is not target
+            ):
+                raise RuntimeError("global topology changed after commit")
+            if not _finish_mysql_global_writer_switch(owner):
+                raise RuntimeError(
+                    "global writer finalization could not be persisted"
+                )
+            result = _global_cluster_writer_switch_response(
+                gc,
+                current_writer,
+                target_member,
+                allow_data_loss=False,
+            )
+        finally:
+            _shared_container_lock.release()
+        return result
+    except Exception as e:
+        logger.warning("RDS: planned global switchover for %s failed: %s", gc_id, e)
+        if metadata_flipped:
+            _fence_or_contain_mysql_cluster(source)
+            _fence_or_contain_mysql_cluster(target)
+            with _shared_container_lock:
+                if _active_mysql_global_writer_switch(gc) is owner:
+                    _finish_mysql_global_writer_switch(
+                        owner, repair_required=True,
+                    )
+        else:
+            _rollback_mysql_global_writer_switch(
+                owner,
+                target_channel_changed=target_channel_changed,
+                reverse_channel_attempted=reverse_channel_attempted,
+            )
+        return _not_ready_error()
+    finally:
+        _close_mysql_resources("switchover fence", connection=fence_conn)
+
+
+def _switch_global_cluster_writer(p, *, allow_data_loss=False):
+    with _shared_container_lock:
+        return _switch_global_cluster_writer_locked(
+            p, allow_data_loss=allow_data_loss,
+        )
+
+
+def _switch_global_cluster_writer_locked(p, *, allow_data_loss=False):
+    resolved, error = _resolve_global_writer_switch(p)
+    if error:
+        return error
+    gc, _target, target_member, current_writer = resolved
+    if _active_mysql_global_writer_switch(gc):
+        return _error(
+            "InvalidGlobalClusterStateFault",
+            f"Global cluster {gc['GlobalClusterIdentifier']} already has a "
+            "writer switchover in progress.",
+            400,
+        )
+    _set_global_cluster_writer(gc, target_member)
+    gc["Status"] = "available"
+
+    return _global_cluster_writer_switch_response(
+        gc,
+        current_writer,
+        target_member,
+        allow_data_loss=allow_data_loss,
+    )
+
+
 def _switchover_global_cluster(p):
-    result = _switch_global_cluster_writer(p, allow_data_loss=False)
+    result = _planned_mysql_global_writer_switch(p)
     if isinstance(result, tuple):
         return result
     return _xml(200, "SwitchoverGlobalClusterResponse",
@@ -7566,7 +8545,10 @@ def _failover_global_cluster(p):
             "AllowDataLoss and Switchover cannot both be specified.",
             400,
         )
-    result = _switch_global_cluster_writer(p, allow_data_loss=allow_data_loss)
+    if allow_data_loss:
+        result = _switch_global_cluster_writer(p, allow_data_loss=True)
+    else:
+        result = _planned_mysql_global_writer_switch(p)
     if isinstance(result, tuple):
         return result
     return _xml(200, "FailoverGlobalClusterResponse",
