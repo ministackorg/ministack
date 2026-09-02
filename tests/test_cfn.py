@@ -10907,3 +10907,40 @@ def test_cfn_cognito_user_pool_enabled_mfas(cfn, cognito_idp):
 
     cfn.delete_stack(StackName="cfn-enabled-mfas")
     _wait_stack(cfn, "cfn-enabled-mfas")
+
+
+def test_cfn_events_rule_arn_matches_the_service(cfn, eb):
+    """GetAtt Arn on a rule is the ARN the EventBridge service reports for
+    it: no bus segment on the default bus, rule/<bus>/<name> on a custom
+    bus. The provisioner used to put a default/ segment in that the service
+    itself never produces."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rule-arn-{uid}"
+    bus_name = f"cfn-rule-arn-bus-{uid}"
+    default_rule, bus_rule = f"cfn-rule-arn-def-{uid}", f"cfn-rule-arn-on-bus-{uid}"
+    template = json.dumps({
+        "Resources": {
+            "Bus": {"Type": "AWS::Events::EventBus", "Properties": {"Name": bus_name}},
+            "OnDefault": {"Type": "AWS::Events::Rule", "Properties": {
+                "Name": default_rule, "ScheduleExpression": "rate(1 hour)"}},
+            "OnBus": {"Type": "AWS::Events::Rule", "Properties": {
+                "Name": bus_rule, "EventBusName": {"Ref": "Bus"},
+                "EventPattern": {"source": ["cfn.test"]}}},
+        },
+        "Outputs": {"DefaultArn": {"Value": {"Fn::GetAtt": ["OnDefault", "Arn"]}},
+                    "BusArn": {"Value": {"Fn::GetAtt": ["OnBus", "Arn"]}}},
+    })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+        prefix = f"arn:aws:events:{eb.meta.region_name}:000000000000:rule/"
+
+        assert outputs["DefaultArn"] == f"{prefix}{default_rule}"
+        assert outputs["DefaultArn"] == eb.describe_rule(Name=default_rule)["Arn"]
+        assert outputs["BusArn"] == f"{prefix}{bus_name}/{bus_rule}"
+        assert outputs["BusArn"] == eb.describe_rule(Name=bus_rule, EventBusName=bus_name)["Arn"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)

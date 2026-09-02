@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **CloudFormation — `AWS::Events::Rule` reports the rule ARN the EventBridge service reports** — `Fn::GetAtt` `Arn` on a rule was built with the bus name in every case, so a rule on the default bus answered `rule/default/<name>` while `DescribeRule` and `ListRules` for the same rule answered `rule/<name>`; a permission or a target keyed on the template's ARN never matched the service's. The provisioner now derives the ARN through the service's own helper: no bus segment on the default bus, `rule/<bus>/<name>` on a custom one. Contributed by @iot-rocket.
+
 ## [1.5.7] — 2026-09-04
 
 ### Added

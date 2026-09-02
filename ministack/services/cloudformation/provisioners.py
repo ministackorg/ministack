@@ -1916,7 +1916,8 @@ def _eb_rule_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
     bus = props.get("EventBusName", "default")
     key = _eb._rule_key(name, bus)
-    arn = f"arn:aws:events:{get_region()}:{get_account_id()}:rule/{bus}/{name}"
+    # The service's own ARN shape: a default-bus rule has no bus segment.
+    arn = _eb._rule_arn(name, bus)
 
     _eb._rules[key] = {
         "Name": name,
