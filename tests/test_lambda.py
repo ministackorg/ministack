@@ -11248,3 +11248,47 @@ def test_snapstart_version_worker_is_reapable():
         with lr._lock:
             lr._workers.pop("000000000000:us-east-1:reap-probe:$LATEST", None)
             lr._workers.pop("000000000000:us-east-1:reap-probe:1", None)
+
+
+def test_snapstart_pending_version_reprovisions_on_restore():
+    """A SnapStart version persisted while Pending (crash mid-publish) must be
+    re-provisioned by restore_state — otherwise it answers 409 forever."""
+    import copy as _copy
+
+    arn = "arn:aws:lambda:us-east-1:000000000000:function:snap-restore-fn"
+    ver_cfg = {
+        "FunctionName": "snap-restore-fn", "FunctionArn": f"{arn}:1",
+        "Runtime": "python3.12", "Handler": "index.handler",
+        "MemorySize": 128, "Timeout": 3, "Version": "1",
+        "State": "Pending", "StateReason": "The function is being created.",
+        "StateReasonCode": "Creating",
+        "SnapStart": {"ApplyOn": "PublishedVersions", "OptimizationStatus": "On"},
+        "PackageType": "Zip",
+    }
+    func = {
+        "config": {**_copy.deepcopy(ver_cfg), "FunctionArn": arn,
+                   "Version": "$LATEST", "State": "Active",
+                   "SnapStart": {"ApplyOn": "PublishedVersions",
+                                 "OptimizationStatus": "Off"}},
+        "code_zip": _make_zip("def handler(e, c):\n    return {}\n"),
+        "versions": {"1": {"config": ver_cfg,
+                           "code_zip": _make_zip("def handler(e, c):\n    return {}\n")}},
+        "next_version": 2, "tags": {}, "aliases": {},
+        "policy": {"Version": "2012-10-17", "Id": "default", "Statement": []},
+        "event_invoke_config": None, "event_invoke_configs": {},
+        "concurrency": None, "provisioned_concurrency": {},
+    }
+    key = ("000000000000", "us-east-1", "snap-restore-fn")
+    try:
+        lsvc.restore_state({"functions": {"snap-restore-fn": func}})
+        for _ in range(60):
+            state = ver_cfg["State"]
+            if state != "Pending":
+                break
+            time.sleep(0.25)
+        assert ver_cfg["State"] == "Active", f"stuck in {ver_cfg['State']}"
+    finally:
+        lsvc._functions._data.pop(key, None)
+        from ministack.core import lambda_runtime as _lr
+        _lr.invalidate_worker("snap-restore-fn", account="000000000000",
+                              region="us-east-1")
