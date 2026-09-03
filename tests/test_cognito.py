@@ -926,6 +926,77 @@ def test_cognito_identity_pool_roles(cognito_identity):
     assert roles["Roles"]["authenticated"] == "arn:aws:iam::000000000000:role/AuthRole"
     assert roles["Roles"]["unauthenticated"] == "arn:aws:iam::000000000000:role/UnauthRole"
 
+def test_cognito_identity_pool_principal_tags(cognito_identity):
+    """SetPrincipalTagAttributeMap stores a provider's attribute mapping and
+    GetPrincipalTagAttributeMap reports it back."""
+    iid = cognito_identity.create_identity_pool(
+        IdentityPoolName="PrincipalTagPool",
+        AllowUnauthenticatedIdentities=True,
+    )["IdentityPoolId"]
+    provider = "cognito-idp.us-east-1.amazonaws.com/us-east-1_example"
+
+    resp = cognito_identity.set_principal_tag_attribute_map(
+        IdentityPoolId=iid,
+        IdentityProviderName=provider,
+        UseDefaults=False,
+        PrincipalTags={"tenant": "custom:tenant"},
+    )
+    assert resp["IdentityPoolId"] == iid
+    assert resp["IdentityProviderName"] == provider
+    assert resp["UseDefaults"] is False
+    assert resp["PrincipalTags"] == {"tenant": "custom:tenant"}
+
+    got = cognito_identity.get_principal_tag_attribute_map(
+        IdentityPoolId=iid, IdentityProviderName=provider)
+    assert got["UseDefaults"] is False
+    assert got["PrincipalTags"] == {"tenant": "custom:tenant"}
+
+    # A second provider on the same pool keeps its own mapping.
+    other = "cognito-idp.us-east-1.amazonaws.com/us-east-1_other"
+    cognito_identity.set_principal_tag_attribute_map(
+        IdentityPoolId=iid, IdentityProviderName=other,
+        UseDefaults=False, PrincipalTags={"email": "email"})
+    assert cognito_identity.get_principal_tag_attribute_map(
+        IdentityPoolId=iid, IdentityProviderName=provider,
+    )["PrincipalTags"] == {"tenant": "custom:tenant"}
+
+
+def test_cognito_identity_pool_principal_tags_unconfigured_provider(cognito_identity):
+    """A provider nobody has configured is not readable, and UseDefaults
+    round-trips without materializing a tag map."""
+    iid = cognito_identity.create_identity_pool(
+        IdentityPoolName="PrincipalTagDefaultsPool",
+        AllowUnauthenticatedIdentities=True,
+    )["IdentityPoolId"]
+    provider = "cognito-idp.us-east-1.amazonaws.com/us-east-1_example"
+
+    with pytest.raises(ClientError) as exc:
+        cognito_identity.get_principal_tag_attribute_map(
+            IdentityPoolId=iid, IdentityProviderName=provider)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert exc.value.response["Error"]["Message"] == (
+        f"No Principal Tags configured for Provider {provider}")
+
+    # UseDefaults selects the mapping AWS applies when it vends credentials; it
+    # does not populate PrincipalTags. terraform-provider-aws sends both
+    # members together like this on destroy.
+    cognito_identity.set_principal_tag_attribute_map(
+        IdentityPoolId=iid, IdentityProviderName=provider,
+        UseDefaults=True, PrincipalTags={})
+    defaulted = cognito_identity.get_principal_tag_attribute_map(
+        IdentityPoolId=iid, IdentityProviderName=provider)
+    assert defaulted["UseDefaults"] is True
+    assert defaulted["PrincipalTags"] == {}
+
+
+def test_cognito_identity_pool_principal_tags_unknown_pool(cognito_identity):
+    with pytest.raises(ClientError) as exc:
+        cognito_identity.get_principal_tag_attribute_map(
+            IdentityPoolId="us-east-1:00000000-0000-0000-0000-000000000000",
+            IdentityProviderName="cognito-idp.us-east-1.amazonaws.com/us-east-1_example")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 def test_cognito_list_identities(cognito_identity):
     resp = cognito_identity.create_identity_pool(
         IdentityPoolName="ListIdPool",

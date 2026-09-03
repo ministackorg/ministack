@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Cognito — identity pool principal tag attribute maps** — `SetPrincipalTagAttributeMap` and `GetPrincipalTagAttributeMap` were missing, so a CDK or CloudFormation deployment declaring `AWS::Cognito::IdentityPoolPrincipalTag` rolled the stack back on an unknown resource type. The two operations now round-trip a per-provider mapping on the identity pool, verified against botocore `cognito-identity-2014-06-30`: both members are optional and are stored as sent, a provider nobody has configured answers `ResourceNotFoundException` with AWS's `No Principal Tags configured for Provider {name}` message rather than an empty mapping, and each identity provider on a pool keeps its own map. `UseDefaults` is not expanded into a tag map — AWS applies the per-provider default claim mapping when it vends credentials — and it is accepted alongside `PrincipalTags`, which is what terraform-provider-aws sends on every destroy. The CloudFormation resource provisions onto the pool, keys its physical id on the pool/provider pair so several providers coexist, applies a changed `PrincipalTags` in place, and clears the mapping on delete or on a replacement that moves the pool or provider. The mapping is stored and reported only — `GetCredentialsForIdentity` vends stub credentials without evaluating policy, so the tags never reach a session's `aws:PrincipalTag` context. State is account- and region-scoped and persisted.
+
 ## [1.5.6] — 2026-09-02
 
 ### Added
