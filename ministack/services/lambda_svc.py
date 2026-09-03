@@ -3831,6 +3831,7 @@ def _parse_docker_flags(flags: str) -> dict:
     parser.add_argument("--shm-size")
     parser.add_argument("--tmpfs", action="append", default=[])
     parser.add_argument("--add-host", action="append", default=[])
+    parser.add_argument("--security-opt", action="append", default=[])
     parser.add_argument("--privileged", action="store_true")
     parser.add_argument("--read-only", action="store_true")
     args, _ = parser.parse_known_args(shlex.split(flags))
@@ -3864,6 +3865,8 @@ def _parse_docker_flags(flags: str) -> dict:
         kwargs["mem_limit"] = args.memory
     if args.shm_size:
         kwargs["shm_size"] = args.shm_size
+    if args.security_opt:
+        kwargs["security_opt"] = args.security_opt
     if args.privileged:
         kwargs["privileged"] = True
     if args.read_only:
