@@ -718,6 +718,70 @@ _ALWAYS_ALLOWED_ACTIONS = frozenset({
 })
 
 
+def resolve_caller_identity(access_key_id: str) -> dict | None:
+    """Display identity for a caller's access key — no signature verification
+    (never modeled) and no policy evaluation, just the same key resolution the
+    evaluator uses, shaped for API Gateway's IAM-authorized proxy events.
+
+    Returns None for an unknown key. The ``session`` value is the raw
+    ``sts._sessions`` record when the key is a temporary session (AssumeRole or
+    Cognito identity-pool credentials), letting callers surface the cognito*
+    identity fields it carries.
+    """
+    from ministack.core.responses import get_account_id
+    from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_svc
+
+    if not access_key_id:
+        return None
+    account_id = get_account_id()
+
+    def _principal_org_id():
+        # aws:PrincipalOrgID — the caller account's Organization, when it has
+        # one. In this emulator's model every account is the master of its own
+        # org the moment it calls Organizations, so the id resolves from the
+        # caller's own scope.
+        try:
+            from ministack.services import organizations as org_svc
+            org = org_svc._orgs.get("self")
+            return org.get("Id") if org else None
+        except Exception:
+            return None
+
+    if _is_root_key(access_key_id):
+        return {
+            "accessKey": access_key_id,
+            "accountId": account_id,
+            "userArn": f"arn:aws:iam::{account_id}:root",
+            "userId": account_id,
+            "principalOrgId": _principal_org_id(),
+            "session": None,
+        }
+    session = sts_svc._sessions.get(access_key_id)
+    if session is not None:
+        return {
+            "accessKey": access_key_id,
+            "accountId": account_id,
+            "userArn": session.get("Arn", ""),
+            "userId": session.get("UserId", ""),
+            "principalOrgId": _principal_org_id(),
+            "session": session,
+        }
+    key_record = iam_svc._access_keys.get_scoped(account_id, None, access_key_id)
+    if key_record is not None:
+        user_name = key_record.get("UserName", "")
+        user = iam_svc._users.get_scoped(account_id, None, user_name) or {}
+        return {
+            "accessKey": access_key_id,
+            "accountId": account_id,
+            "userArn": f"arn:aws:iam::{account_id}:user/{user_name}",
+            "userId": user.get("UserId", ""),
+            "principalOrgId": _principal_org_id(),
+            "session": None,
+        }
+    return None
+
+
 def enforce(access_key_id: str, iam_action: str, service: str,
             region: str, resource_arn: str = "*") -> EvalResult | AuthError | None:
     """Check whether the request should be allowed.

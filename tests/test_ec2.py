@@ -4368,6 +4368,8 @@ def test_ec2_cross_account_ami_sharing():
     with _pytest.raises(ClientError) as exc:
         consumer.modify_image_attribute(
             ImageId=ami, LaunchPermission={"Add": [{"Group": "all"}]})
-    assert exc.value.response["Error"]["Code"] == "InvalidAMIID.NotFound"
+    # Real EC2 answers a non-owner with AuthFailure "Not authorized for image:...".
+    assert exc.value.response["Error"]["Code"] == "AuthFailure"
+    assert f"Not authorized for image:{ami}" in exc.value.response["Error"]["Message"]
 
     owner.deregister_image(ImageId=ami)

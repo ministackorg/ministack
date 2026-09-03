@@ -2138,14 +2138,19 @@ def _parse_launch_permission_list(p, prefix):
 
 
 def _modify_image_attribute(p):
-    """launchPermission add/remove — the AMI sharing flow. Owner-scoped: the
-    image resolves in the caller's own account, so another account's AMI is
-    NotFound here, as the owner-only AWS call effectively behaves."""
+    """launchPermission add/remove — the AMI sharing flow. Owner-only: another
+    account's image answers ``AuthFailure`` "Not authorized for image:{id}"
+    (the error real EC2 returns to a non-owner), an unknown id NotFound."""
     image_id = _p(p, "ImageId")
     if not image_id:
         return _error("MissingParameter", "The request must contain the parameter ImageId", 400)
     image = _images.get(image_id)
     if not image:
+        region = get_region()
+        if any(key == image_id and img_region == region
+               for (_acct, img_region, key), _img in _images.all_items()):
+            return _error("AuthFailure",
+                          f"Not authorized for image:{image_id}", 400)
         return _error("InvalidAMIID.NotFound",
                       f"The image id '[{image_id}]' does not exist", 400)
 

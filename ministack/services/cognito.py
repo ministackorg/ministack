@@ -60,6 +60,7 @@ Wire protocol:
 import base64
 import copy
 import hashlib
+import hmac
 import html as html_mod
 import json
 import logging
@@ -67,6 +68,7 @@ import os
 import re
 import secrets
 import string
+import struct
 import time
 import zlib
 from datetime import datetime, timezone
@@ -3565,7 +3567,15 @@ def _admin_respond_to_auth_challenge(data):
         user, _err = _resolve_user(pool, username)
         if _err:
             return _hidden_user_error(pool, cid, _err)
-        # Accept any TOTP code in emulator — no real TOTP validation
+        # The code is checked against the secret VerifySoftwareToken enrolled.
+        # A user enrolled before secrets were stored has nothing to check
+        # against; that legacy state keeps the old accept-any behaviour until
+        # re-enrolment.
+        totp_secret = user.get("_totp_secret")
+        if totp_secret and not _totp_matches(
+                totp_secret, responses.get("SOFTWARE_TOKEN_MFA_CODE", "")):
+            return error_response_json(
+                "CodeMismatchException", "Invalid code received for user", 400)
         return json_response({"AuthenticationResult": _build_auth_result(
             pid, cid, user, client_metadata=client_metadata)})
 
@@ -3904,7 +3914,15 @@ def _respond_to_auth_challenge(data):
         user, _err = _resolve_user(pool, username)
         if _err:
             return _hidden_user_error(pool, cid, _err)
-        # Accept any TOTP code in emulator
+        # SOFTWARE_TOKEN_MFA checks the code against the enrolled secret
+        # (legacy pre-secret enrolments keep accept-any until re-enrolment).
+        # MFA_SETUP's verification already happened in VerifySoftwareToken.
+        if challenge_name == "SOFTWARE_TOKEN_MFA":
+            totp_secret = user.get("_totp_secret")
+            if totp_secret and not _totp_matches(
+                    totp_secret, responses.get("SOFTWARE_TOKEN_MFA_CODE", "")):
+                return error_response_json(
+                    "CodeMismatchException", "Invalid code received for user", 400)
         return json_response({"AuthenticationResult": _build_auth_result(
             pid, cid, user, client_metadata=client_metadata)})
 
@@ -4114,68 +4132,74 @@ def _confirm_forgot_password(data):
     return json_response({})
 
 
+def _user_pool_for_access_token(access_token):
+    """Resolve (user, pool) from an access token across the pools in scope."""
+    if not access_token:
+        return None, None
+    for pool in _user_pools.values():
+        user = _user_from_token(access_token, pool)
+        if user:
+            return user, pool
+    return None, None
+
+
 def _change_password(data):
     access_token = data.get("AccessToken", "")
     if not access_token:
         return error_response_json("NotAuthorizedException", "Access token is missing.", 400)
     proposed = data.get("ProposedPassword", "")
-    # Decode token to find user and update password
-    for pool in _user_pools.values():
-        user = _user_from_token(access_token, pool)
-        if user:
-            pw_err = _validate_password(pool, proposed)
-            if pw_err:
-                return pw_err
-            user["_password"] = proposed
-            user["UserLastModifiedDate"] = _now_epoch()
-            return json_response({})
-    return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    user, pool = _user_pool_for_access_token(access_token)
+    if not user:
+        return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    pw_err = _validate_password(pool, proposed)
+    if pw_err:
+        return pw_err
+    user["_password"] = proposed
+    user["UserLastModifiedDate"] = _now_epoch()
+    return json_response({})
 
 
 def _get_user(data):
     access_token = data.get("AccessToken", "")
     if not access_token:
         return error_response_json("NotAuthorizedException", "Access token is missing.", 400)
-    for pool in _user_pools.values():
-        user = _user_from_token(access_token, pool)
-        if user:
-            out = _user_out(user)
-            # GetUser uses UserAttributes, not Attributes (per AWS API shape)
-            out["UserAttributes"] = out.pop("Attributes", [])
-            out["UserMFASettingList"] = user.get("_mfa_enabled", [])
-            out["PreferredMfaSetting"] = user.get("_preferred_mfa", "")
-            return json_response(out)
-    return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    user, _pool = _user_pool_for_access_token(access_token)
+    if not user:
+        return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    out = _user_out(user)
+    # GetUser uses UserAttributes, not Attributes (per AWS API shape)
+    out["UserAttributes"] = out.pop("Attributes", [])
+    out["UserMFASettingList"] = user.get("_mfa_enabled", [])
+    out["PreferredMfaSetting"] = user.get("_preferred_mfa", "")
+    return json_response(out)
 
 
 def _update_user_attributes(data):
     access_token = data.get("AccessToken", "")
     if not access_token:
         return error_response_json("NotAuthorizedException", "Access token is missing.", 400)
-    for pool in _user_pools.values():
-        user = _user_from_token(access_token, pool)
-        if user:
-            user["Attributes"] = _merge_attributes(
-                user.get("Attributes", []),
-                data.get("UserAttributes", []),
-            )
-            user["UserLastModifiedDate"] = _now_epoch()
-            return json_response({"CodeDeliveryDetailsList": []})
-    return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    user, _pool = _user_pool_for_access_token(access_token)
+    if not user:
+        return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    user["Attributes"] = _merge_attributes(
+        user.get("Attributes", []),
+        data.get("UserAttributes", []),
+    )
+    user["UserLastModifiedDate"] = _now_epoch()
+    return json_response({"CodeDeliveryDetailsList": []})
 
 
 def _delete_user(data):
     access_token = data.get("AccessToken", "")
     if not access_token:
         return error_response_json("NotAuthorizedException", "Access token is missing.", 400)
-    for pool in _user_pools.values():
-        user = _user_from_token(access_token, pool)
-        if user:
-            username = user["Username"]
-            del pool["_users"][username]
-            pool["EstimatedNumberOfUsers"] = len(pool["_users"])
-            return json_response({})
-    return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    user, pool = _user_pool_for_access_token(access_token)
+    if not user:
+        return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    username = user["Username"]
+    del pool["_users"][username]
+    pool["EstimatedNumberOfUsers"] = len(pool["_users"])
+    return json_response({})
 
 
 # ===========================================================================
@@ -4840,12 +4864,11 @@ def _set_user_mfa_preference(data):
     access_token = data.get("AccessToken")
     if not access_token:
         return error_response_json("NotAuthorizedException", "Missing access token.", 400)
-    for pool in _user_pools.values():
-        user = _user_from_token(access_token, pool)
-        if user:
-            _apply_mfa_preference(user, data)
-            return json_response({})
-    return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    user, _pool = _user_pool_for_access_token(access_token)
+    if not user:
+        return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    _apply_mfa_preference(user, data)
+    return json_response({})
 
 
 def _apply_mfa_preference(user: dict, data: dict):
@@ -4909,31 +4932,84 @@ def _set_user_pool_mfa_config(data):
     return json_response(resp)
 
 
+# Session string (from AssociateSoftwareToken) -> pending TOTP secret, for the
+# MFA_SETUP flow where no access token exists yet. Ephemeral, keyed by an
+# unguessable random session — the same isolation argument as the OAuth code
+# stores above.
+_totp_session_secrets: dict[str, str] = {}
+
+
+def _totp_code(secret_b32: str, step_offset: int = 0) -> str:
+    """RFC 6238: HMAC-SHA1, 30-second step, 6 digits."""
+    key = base64.b32decode(secret_b32 + "=" * (-len(secret_b32) % 8), casefold=True)
+    counter = int(time.time() // 30) + step_offset
+    mac = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = mac[-1] & 0x0F
+    return f"{(struct.unpack('>I', mac[offset:offset + 4])[0] & 0x7FFFFFFF) % 10**6:06d}"
+
+
+def _totp_matches(secret_b32: str, user_code) -> bool:
+    """Accept the current step plus one on either side, as authenticators drift."""
+    if not secret_b32 or not isinstance(user_code, str):
+        return False
+    try:
+        return any(hmac.compare_digest(_totp_code(secret_b32, off), user_code)
+                   for off in (-1, 0, 1))
+    except Exception:
+        return False
+
+
+def _user_for_access_token(access_token):
+    return _user_pool_for_access_token(access_token)[0]
+
+
 def _associate_software_token(data):
-    """Issue a stub TOTP secret. Works with both AccessToken and Session."""
+    """Issue a TOTP secret and remember it as pending for verification."""
     secret = base64.b32encode(secrets.token_bytes(20)).decode()
     session = base64.b64encode(secrets.token_bytes(32)).decode()
+    user = _user_for_access_token(data.get("AccessToken"))
+    if user is not None:
+        user["_totp_pending_secret"] = secret
+    _totp_session_secrets[session] = secret
     return json_response({"SecretCode": secret, "Session": session})
 
 
 def _verify_software_token(data):
-    """Accept any TOTP code. Mark the user as TOTP-enrolled so auth flow issues the challenge."""
+    """Verify the user's code against the pending secret (RFC 6238) and, on
+    success, promote it to the active TOTP secret and mark the user enrolled."""
     access_token = data.get("AccessToken")
-    user_code = data.get("UserCode", "")  # accepted regardless of value in emulator
-    friendly_name = data.get("FriendlyDeviceName", "TOTP device")
+    session = data.get("Session")
+    user_code = data.get("UserCode", "")
 
-    if access_token:
-        # Find the user by token across all pools
-        for pool in _user_pools.values():
-            user = _user_from_token(access_token, pool)
-            if user:
-                user.setdefault("_mfa_enabled", [])
-                if "SOFTWARE_TOKEN_MFA" not in user["_mfa_enabled"]:
-                    user["_mfa_enabled"].append("SOFTWARE_TOKEN_MFA")
-                user["_preferred_mfa"] = "SOFTWARE_TOKEN_MFA"
-                break
+    user = _user_for_access_token(access_token)
+    secret = None
+    if user is not None:
+        secret = user.get("_totp_pending_secret") or user.get("_totp_secret")
+    if not secret and session:
+        secret = _totp_session_secrets.get(session)
+    if not secret:
+        # Nothing was associated: there is no secret to verify a code against.
+        return error_response_json(
+            "EnableSoftwareTokenMFAException",
+            "No software token MFA has been associated for verification.", 400)
+    if not _totp_matches(secret, user_code):
+        return error_response_json(
+            "EnableSoftwareTokenMFAException", "Code mismatch", 400)
 
-    return json_response({"Status": "SUCCESS"})
+    if user is not None:
+        user["_totp_secret"] = secret
+        user.pop("_totp_pending_secret", None)
+        user.setdefault("_mfa_enabled", [])
+        if "SOFTWARE_TOKEN_MFA" not in user["_mfa_enabled"]:
+            user["_mfa_enabled"].append("SOFTWARE_TOKEN_MFA")
+        user["_preferred_mfa"] = "SOFTWARE_TOKEN_MFA"
+    if session:
+        _totp_session_secrets.pop(session, None)
+
+    resp = {"Status": "SUCCESS"}
+    if session:
+        resp["Session"] = base64.b64encode(secrets.token_bytes(32)).decode()
+    return json_response(resp)
 
 
 # ===========================================================================
@@ -6409,13 +6485,80 @@ def _get_id(data):
 
 
 def _get_credentials_for_identity(data):
+    """Vend identity-pool credentials AND register them as an STS session.
+
+    The AUTH=true evaluator resolves temporary keys through ``sts._sessions``;
+    unregistered vended keys were rejected as an invalid security token, so
+    our own GetCredentialsForIdentity output could never call an enforced API.
+    On AWS these credentials are the pool role assumed with the session name
+    ``CognitoIdentityCredentials`` — GetCallerIdentity reports
+    ``arn:aws:sts::<account>:assumed-role/<RoleName>/CognitoIdentityCredentials``.
+    """
     identity_id = data.get("IdentityId", new_uuid())
     now = int(time.time())
+    logins = data.get("Logins") or {}
+    pool = None
+    for _iid, candidate in _identity_pools.items():
+        if identity_id in candidate.get("_identities", {}):
+            pool = candidate
+            if not logins:
+                logins = candidate["_identities"][identity_id].get("Logins") or {}
+            break
+
+    flavor = "authenticated" if logins else "unauthenticated"
+    role_arn = (pool or {}).get("_roles", {}).get(flavor, "")
+    # A pool with no SetIdentityPoolRoles keeps vending (lenient, matching the
+    # emulator's accept-all model) under a synthesized role name.
+    role_name = role_arn.rpartition("/")[2] if role_arn else "CognitoIdentityPoolRole"
+
+    access_key = f"ASIA{''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(16))}"
+    secret_key = base64.b64encode(secrets.token_bytes(30)).decode()
+    role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
+
+    # The cognito* identity fields API Gateway reports for IAM-authorized
+    # calls, precomputed here where the login tokens are at hand: the provider
+    # string is "<provider>,<provider>:CognitoSignIn:<sub>" per the mapping
+    # template reference, sub from the login's id token.
+    provider_parts = []
+    amr = ["authenticated"] if logins else ["unauthenticated"]
+    for provider_name, login_token in logins.items():
+        sub = ""
+        try:
+            payload = json.loads(base64.urlsafe_b64decode(
+                login_token.split(".")[1] + "=="))
+            sub = payload.get("sub", "")
+        except Exception:
+            pass
+        # amr carries the bare provider name (what trust policies match with
+        # ForAnyValue:StringLike per the Cognito RBAC doc) and, for a
+        # user-pool sign-in, the CognitoSignIn entry alongside it.
+        amr.append(provider_name)
+        if sub:
+            provider_parts.append(f"{provider_name},{provider_name}:CognitoSignIn:{sub}")
+            amr.append(f"{provider_name}:CognitoSignIn:{sub}")
+        else:
+            provider_parts.append(provider_name)
+
+    from ministack.services import sts as sts_svc
+    sts_svc._sessions[access_key] = {
+        "Arn": (f"arn:aws:sts::{get_account_id()}:assumed-role/"
+                f"{role_name}/CognitoIdentityCredentials"),
+        "UserId": f"{role_id}:CognitoIdentityCredentials",
+        "SecretAccessKey": secret_key,
+        "Expiration": now + 3600,
+        "_identity_id": identity_id,
+        "_identity_pool_id": (pool or {}).get("IdentityPoolId", ""),
+        "_logins": logins,
+        "_cognito_auth_type": "authenticated" if logins else "unauthenticated",
+        "_cognito_auth_provider": ",".join(provider_parts) or None,
+        "_cognito_amr": amr,
+    }
+
     return json_response({
         "IdentityId": identity_id,
         "Credentials": {
-            "AccessKeyId": f"ASIA{''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(16))}",
-            "SecretKey": base64.b64encode(secrets.token_bytes(30)).decode(),
+            "AccessKeyId": access_key,
+            "SecretKey": secret_key,
             "SessionToken": base64.b64encode(secrets.token_bytes(64)).decode(),
             "Expiration": now + 3600,
         },

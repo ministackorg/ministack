@@ -4197,3 +4197,95 @@ def test_concurrent_apigw_lambda_proxy_requests(apigw, lam):
         f"{codes.count(None)}/{CONCURRENCY_N} API Gateway requests got no response at all — "
         f"the Lambda dispatch wedged"
     )
+
+
+def test_apigwv2_aws_iam_route_fills_authorizer_iam(apigw, lam, cognito_identity):
+    """An AWS_IAM route reports the resolved caller under
+    requestContext.authorizer.iam (payload 2.0 shape: accessKey/accountId/
+    callerId/userArn/userId, plus cognitoIdentity for identity-pool sessions),
+    and a request with no Authorization header is 403."""
+    import http.client as _http
+
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    fname = f"v2-iam-ident-{_uuid_mod.uuid4().hex[:8]}"
+    code = (b"import json\n"
+            b"def handler(event, context):\n"
+            b"    return {'statusCode': 200,\n"
+            b"            'body': json.dumps(event['requestContext'].get('authorizer'))}\n")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler", Code={"ZipFile": buf.getvalue()},
+    )
+    fn_arn = f"arn:aws:lambda:us-east-1:000000000000:function:{fname}"
+
+    api_id = apigw.create_api(Name=f"iam-ident-{fname}", ProtocolType="HTTP")["ApiId"]
+    try:
+        integ_id = apigw.create_integration(
+            ApiId=api_id, IntegrationType="AWS_PROXY",
+            IntegrationUri=fn_arn, PayloadFormatVersion="2.0",
+        )["IntegrationId"]
+        apigw.create_route(
+            ApiId=api_id, RouteKey="GET /whoami",
+            AuthorizationType="AWS_IAM", Target=f"integrations/{integ_id}",
+        )
+        apigw.create_stage(ApiId=api_id, StageName="$default", AutoDeploy=True)
+
+        host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+
+        # No Authorization header: 403 Forbidden.
+        conn = _http.HTTPConnection("127.0.0.1", _EXECUTE_PORT)
+        conn.request("GET", "/whoami", headers={"Host": host})
+        assert conn.getresponse().status == 403
+
+        def signed_call(creds):
+            req = AWSRequest(method="GET", url=f"http://{host}/whoami", headers={"Host": host})
+            SigV4Auth(creds, "execute-api", "us-east-1").add_auth(req)
+            c2 = _http.HTTPConnection("127.0.0.1", _EXECUTE_PORT)
+            c2.request("GET", "/whoami", headers=dict(req.headers))
+            resp = c2.getresponse()
+            return resp.status, json.loads(resp.read().decode())
+
+        import boto3 as _boto3
+        orgs = _boto3.client(
+            "organizations", endpoint_url=_endpoint, region_name="us-east-1",
+            aws_access_key_id="test", aws_secret_access_key="test")
+        org_id = orgs.describe_organization()["Organization"]["Id"]
+
+        status, authorizer = signed_call(Credentials("test", "test"))
+        assert status == 200
+        iam = authorizer["iam"]
+        assert iam["accessKey"] == "test"
+        assert iam["accountId"] == "000000000000"
+        assert iam["userArn"] == "arn:aws:iam::000000000000:root"
+        assert iam["principalOrgId"] == org_id
+        assert "cognitoIdentity" not in iam
+
+        idpool = cognito_identity.create_identity_pool(
+            IdentityPoolName=f"ip-{fname}", AllowUnauthenticatedIdentities=True,
+        )["IdentityPoolId"]
+        cognito_identity.set_identity_pool_roles(
+            IdentityPoolId=idpool,
+            Roles={"unauthenticated": "arn:aws:iam::000000000000:role/UnauthPoolRole"})
+        identity_id = cognito_identity.get_id(IdentityPoolId=idpool)["IdentityId"]
+        c = cognito_identity.get_credentials_for_identity(
+            IdentityId=identity_id)["Credentials"]
+
+        status, authorizer = signed_call(
+            Credentials(c["AccessKeyId"], c["SecretKey"], c["SessionToken"]))
+        assert status == 200
+        iam = authorizer["iam"]
+        assert iam["userArn"] == (
+            "arn:aws:sts::000000000000:assumed-role/UnauthPoolRole/CognitoIdentityCredentials")
+        assert iam["cognitoIdentity"]["identityId"] == identity_id
+        assert iam["cognitoIdentity"]["identityPoolId"] == idpool
+        assert iam["cognitoIdentity"]["amr"] == ["unauthenticated"]
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=fname)

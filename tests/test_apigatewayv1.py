@@ -4178,3 +4178,106 @@ def test_apigwv1_cors_preflight_only_resource_falls_through(apigw_v1, lam):
         _proxy_fb_drop_api(apigw_v1, api_id)
         _proxy_fb_drop_lambda(lam, proxy_backend)
         _proxy_fb_drop_lambda(lam, preflight_backend)
+
+
+def test_apigwv1_aws_iam_method_fills_caller_identity(apigw_v1, lam, cognito_idp, cognito_identity):
+    """An AWS_IAM method reports the resolved caller in requestContext.identity:
+    accessKey/accountId/caller/user/userArn for any resolvable key, plus the
+    four cognito* fields (documented CognitoSignIn format) when the request is
+    signed with identity-pool credentials."""
+    import http.client as _http
+    import uuid as _uuid
+
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    fname = f"intg-v1-iam-ident-{_uuid.uuid4().hex[:8]}"
+    code = (b"import json\n"
+            b"def handler(event, context):\n"
+            b"    return {'statusCode': 200, 'body': json.dumps(event['requestContext']['identity'])}\n")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler", Code={"ZipFile": buf.getvalue()},
+    )
+
+    api_id = apigw_v1.create_rest_api(name=f"v1-iam-ident-{fname}")["id"]
+    pool_id = client_id = None
+    try:
+        root = next(r for r in apigw_v1.get_resources(restApiId=api_id)["items"] if r["path"] == "/")
+        resource_id = apigw_v1.create_resource(
+            restApiId=api_id, parentId=root["id"], pathPart="whoami",
+        )["id"]
+        apigw_v1.put_method(
+            restApiId=api_id, resourceId=resource_id, httpMethod="GET",
+            authorizationType="AWS_IAM",
+        )
+        apigw_v1.put_integration(
+            restApiId=api_id, resourceId=resource_id, httpMethod="GET",
+            type="AWS_PROXY", integrationHttpMethod="POST",
+            uri=(
+                f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+                f"arn:aws:lambda:us-east-1:000000000000:function:{fname}/invocations"
+            ),
+        )
+        dep_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
+        apigw_v1.create_stage(restApiId=api_id, stageName="dev", deploymentId=dep_id)
+
+        host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+
+        def signed_call(creds):
+            req = AWSRequest(method="GET", url=f"http://{host}/dev/whoami", headers={"Host": host})
+            SigV4Auth(creds, "execute-api", "us-east-1").add_auth(req)
+            conn = _http.HTTPConnection("127.0.0.1", _EXECUTE_PORT)
+            conn.request("GET", "/dev/whoami", headers=dict(req.headers))
+            resp = conn.getresponse()
+            return resp.status, json.loads(resp.read().decode())
+
+        status, ident = signed_call(Credentials("test", "test"))
+        assert status == 200
+        assert ident["accessKey"] == "test"
+        assert ident["accountId"] == "000000000000"
+        assert ident["userArn"] == "arn:aws:iam::000000000000:root"
+        assert ident["cognitoIdentityId"] is None
+
+        # Identity-pool credentials carry the cognito* fields.
+        pool_id = cognito_idp.create_user_pool(PoolName=f"iam-ident-{fname}")["UserPool"]["Id"]
+        client_id = cognito_idp.create_user_pool_client(
+            UserPoolId=pool_id, ClientName="c",
+            ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"])["UserPoolClient"]["ClientId"]
+        cognito_idp.admin_create_user(UserPoolId=pool_id, Username="u", MessageAction="SUPPRESS")
+        cognito_idp.admin_set_user_password(
+            UserPoolId=pool_id, Username="u", Password="Passw0rd!x", Permanent=True)
+        id_token = cognito_idp.initiate_auth(
+            ClientId=client_id, AuthFlow="USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "u", "PASSWORD": "Passw0rd!x"},
+        )["AuthenticationResult"]["IdToken"]
+        provider = f"cognito-idp.us-east-1.amazonaws.com/{pool_id}"
+        idpool = cognito_identity.create_identity_pool(
+            IdentityPoolName=f"ip-{fname}", AllowUnauthenticatedIdentities=False,
+            CognitoIdentityProviders=[{"ProviderName": provider, "ClientId": client_id}],
+        )["IdentityPoolId"]
+        cognito_identity.set_identity_pool_roles(
+            IdentityPoolId=idpool,
+            Roles={"authenticated": "arn:aws:iam::000000000000:role/AuthPoolRole"})
+        logins = {provider: id_token}
+        identity_id = cognito_identity.get_id(IdentityPoolId=idpool, Logins=logins)["IdentityId"]
+        c = cognito_identity.get_credentials_for_identity(
+            IdentityId=identity_id, Logins=logins)["Credentials"]
+
+        status, ident = signed_call(
+            Credentials(c["AccessKeyId"], c["SecretKey"], c["SessionToken"]))
+        assert status == 200
+        assert ident["userArn"] == (
+            "arn:aws:sts::000000000000:assumed-role/AuthPoolRole/CognitoIdentityCredentials")
+        assert ident["cognitoIdentityId"] == identity_id
+        assert ident["cognitoIdentityPoolId"] == idpool
+        assert ident["cognitoAuthenticationType"] == "authenticated"
+        assert ident["cognitoAuthenticationProvider"].startswith(f"{provider},{provider}:CognitoSignIn:")
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        lam.delete_function(FunctionName=fname)

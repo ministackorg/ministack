@@ -10872,3 +10872,27 @@ def test_cfn_stack_addressable_by_id_for_delete_and_update(cfn):
     _wait_stack(cfn, "cfn-by-id")
     described = cfn.describe_stacks(StackName=stack_id)["Stacks"]
     assert described[0]["StackStatus"] == "DELETE_COMPLETE"
+
+
+def test_cfn_cognito_user_pool_enabled_mfas(cfn, cognito_idp):
+    """EnabledMfas (what CDK emits for mfaSecondFactor otp) maps onto the
+    software-token config block GetUserPoolMfaConfig reports."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {"Pool": {"Type": "AWS::Cognito::UserPool", "Properties": {
+            "UserPoolName": "cfn-enabled-mfas",
+            "MfaConfiguration": "OPTIONAL",
+            "EnabledMfas": ["SOFTWARE_TOKEN_MFA"]}}},
+        "Outputs": {"PoolId": {"Value": {"Ref": "Pool"}}},
+    }
+    cfn.create_stack(StackName="cfn-enabled-mfas", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-enabled-mfas")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    pool_id = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["PoolId"]
+
+    cfg = cognito_idp.get_user_pool_mfa_config(UserPoolId=pool_id)
+    assert cfg["MfaConfiguration"] == "OPTIONAL"
+    assert cfg["SoftwareTokenMfaConfiguration"]["Enabled"] is True
+
+    cfn.delete_stack(StackName="cfn-enabled-mfas")
+    _wait_stack(cfn, "cfn-enabled-mfas")

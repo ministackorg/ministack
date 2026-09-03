@@ -3939,6 +3939,13 @@ def _cognito_user_pool_create(logical_id, props, stack_name):
         "AliasAttributes": props.get("AliasAttributes", []),
         "UsernameAttributes": props.get("UsernameAttributes", []),
         "MfaConfiguration": props.get("MfaConfiguration", "OFF"),
+        # EnabledMfas (what CDK emits for mfaSecondFactor) maps onto the per
+        # method config blocks GetUserPoolMfaConfig reports. Only the software
+        # token block carries an Enabled flag in the API model; SMS and email
+        # configs are message/role shapes that come from their own properties,
+        # so a bare SMS_MFA/EMAIL_OTP entry has nothing faithful to invent.
+        **({"SoftwareTokenMfaConfiguration": {"Enabled": True}}
+           if "SOFTWARE_TOKEN_MFA" in (props.get("EnabledMfas") or []) else {}),
         "EstimatedNumberOfUsers": 0,
         "UserPoolTags": props.get("UserPoolTags", {}),
         "AdminCreateUserConfig": props.get("AdminCreateUserConfig", {

@@ -1522,6 +1522,44 @@ def _cache_authorizer_result(key, expires_at, policy_doc, context):
     _authorizer_cache[key] = (expires_at, policy_doc, context)
 
 
+def _iam_caller_identity(headers, query_params):
+    """The payload-1.0 ``requestContext.identity`` fields for an AWS_IAM method.
+
+    Key resolution only — signatures are never verified. Unknown/absent keys
+    return None and the event keeps its two-field identity (the documented
+    no-IAM behaviour). For a Cognito identity-pool session the cognito* fields
+    ride along, ``cognitoAuthenticationProvider`` in the documented
+    ``<provider>,<provider>:CognitoSignIn:<sub>`` format.
+    """
+    from ministack.core.iam_evaluator import resolve_caller_identity
+    from ministack.core.router import extract_access_key_id
+
+    info = resolve_caller_identity(extract_access_key_id(headers, query_params))
+    if not info:
+        return None
+    identity = {
+        "accessKey": info["accessKey"],
+        "accountId": info["accountId"],
+        "caller": info["userId"] or None,
+        "user": info["userId"] or None,
+        "userArn": info["userArn"] or None,
+        "principalOrgId": info.get("principalOrgId"),
+        "cognitoAuthenticationProvider": None,
+        "cognitoAuthenticationType": None,
+        "cognitoIdentityId": None,
+        "cognitoIdentityPoolId": None,
+    }
+    session = info.get("session") or {}
+    if session.get("_identity_id"):
+        identity.update({
+            "cognitoAuthenticationProvider": session.get("_cognito_auth_provider"),
+            "cognitoAuthenticationType": session.get("_cognito_auth_type"),
+            "cognitoIdentityId": session.get("_identity_id"),
+            "cognitoIdentityPoolId": session.get("_identity_pool_id"),
+        })
+    return identity
+
+
 async def _authorize_request_v1(
     api_id, stage_name, method_obj, method, request_path, resource,
     headers, body, query_params, path_params, stage,
@@ -1746,6 +1784,9 @@ async def _handle_execute_in_scope(
         # non-proxy `AWS` (custom / "lambda") integration returns the handler's
         # output as the body verbatim. Same event in, different response
         # contract out.
+        caller_identity = None
+        if (method_obj.get("authorizationType") or "").upper() == "AWS_IAM":
+            caller_identity = _iam_caller_identity(headers, query_params)
         invoke = _invoke_lambda_proxy_v1 if int_type == "AWS_PROXY" else _invoke_lambda_custom_v1
         return await invoke(
             integration, api_id, stage_name, stage, resource, path, method,
@@ -1754,6 +1795,7 @@ async def _handle_execute_in_scope(
             owner_region=owner_region,
             binary_media_types=api.get("binaryMediaTypes") or [],
             authorizer_context=authorizer_context,
+            caller_identity=caller_identity,
         )
     elif int_type in ("HTTP_PROXY", "HTTP"):
         return await _invoke_http_proxy_v1(
@@ -1798,6 +1840,7 @@ def _build_lambda_event_v1(
     *,
     binary_media_types=None,
     authorizer_context=None,
+    caller_identity=None,
 ):
     """Build the API Gateway v1 payload format 1.0 event handed to Lambda.
 
@@ -1866,6 +1909,11 @@ def _build_lambda_event_v1(
 
     # A custom authorizer's returned context (values stringified) plus its
     # principalId reach the integration under requestContext.authorizer.
+    if caller_identity:
+        # AWS_IAM methods report the resolved caller: accessKey/accountId/
+        # caller/user/userArn, plus the cognito* fields for identity-pool
+        # sessions — per the payload 1.0 identity shape.
+        event["requestContext"]["identity"].update(caller_identity)
     if authorizer_context is not None:
         event["requestContext"]["authorizer"] = authorizer_context
 
@@ -1889,6 +1937,7 @@ async def _invoke_lambda_proxy_v1(
     owner_region=None,
     binary_media_types=None,
     authorizer_context=None,
+    caller_identity=None,
 ):
     """Invoke Lambda through an AWS_PROXY integration and interpret its
     `{statusCode, headers, body}` response envelope."""
@@ -1899,6 +1948,7 @@ async def _invoke_lambda_proxy_v1(
         headers, body, query_params, path_params,
         binary_media_types=binary_media_types,
         authorizer_context=authorizer_context,
+        caller_identity=caller_identity,
     )
 
     lambda_response, err = await _call_lambda(
@@ -1989,6 +2039,7 @@ async def _invoke_lambda_custom_v1(
     owner_region=None,
     binary_media_types=None,
     authorizer_context=None,
+    caller_identity=None,
 ):
     """Invoke Lambda through a non-proxy (custom) ``AWS`` integration.
 
@@ -2011,6 +2062,7 @@ async def _invoke_lambda_custom_v1(
         headers, body, query_params, path_params,
         binary_media_types=binary_media_types,
         authorizer_context=authorizer_context,
+        caller_identity=caller_identity,
     )
 
     result, err = await _call_lambda_raw(

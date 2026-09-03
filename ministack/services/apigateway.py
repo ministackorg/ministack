@@ -558,6 +558,36 @@ def _b64url_decode(segment: str) -> bytes:
     return base64.urlsafe_b64decode(padded.encode("utf-8"))
 
 
+def _iam_caller_identity_v2(headers, query_params):
+    """The payload-2.0 ``requestContext.authorizer.iam`` block for an AWS_IAM
+    route — field names per the AWS-maintained typed event model
+    (aws-lambda-go ``APIGatewayV2HTTPRequestContextAuthorizerIAMDescription``).
+    Key resolution only; unknown keys return None and the event carries no
+    authorizer block."""
+    from ministack.core.iam_evaluator import resolve_caller_identity
+    from ministack.core.router import extract_access_key_id
+
+    info = resolve_caller_identity(extract_access_key_id(headers, query_params))
+    if not info:
+        return None
+    iam = {
+        "accessKey": info["accessKey"],
+        "accountId": info["accountId"],
+        "callerId": info["userId"] or None,
+        "principalOrgId": info.get("principalOrgId"),
+        "userArn": info["userArn"] or None,
+        "userId": info["userId"] or None,
+    }
+    session = info.get("session") or {}
+    if session.get("_identity_id"):
+        iam["cognitoIdentity"] = {
+            "amr": session.get("_cognito_amr") or [],
+            "identityId": session.get("_identity_id"),
+            "identityPoolId": session.get("_identity_pool_id"),
+        }
+    return iam
+
+
 def _jwt_unauthorized(message: str = "Unauthorized") -> tuple:
     return 401, {"Content-Type": "application/json"}, json.dumps({"message": message}).encode("utf-8")
 
@@ -1282,6 +1312,7 @@ async def _handle_execute_in_scope(
     authorizer_claims = None
     authorizer_scopes = []
     authorizer_lambda_ctx = None
+    authorizer_iam = None
     if auth_type == "JWT":
         authorizer_id = route.get("authorizerId")
         if not authorizer_id:
@@ -1294,6 +1325,13 @@ async def _handle_execute_in_scope(
             return auth_error
         authorizer_claims = claims or {}
         authorizer_scopes = scopes or []
+    elif auth_type == "AWS_IAM":
+        # Same stance as REST (v1): signatures are never verified; a request
+        # with no Authorization header is rejected, a resolvable access key
+        # fills requestContext.authorizer.iam (aws-lambda-go event shape).
+        if not any(k.lower() == "authorization" for k in request_headers):
+            return _jwt_forbidden()
+        authorizer_iam = _iam_caller_identity_v2(request_headers, query_params or {})
     elif auth_type == "CUSTOM":
         # A route's AuthorizationType is CUSTOM when it references a Lambda
         # (REQUEST-type) authorizer — same convention as REST (v1): the
@@ -1344,6 +1382,7 @@ async def _handle_execute_in_scope(
             authorizer_claims=authorizer_claims,
             authorizer_scopes=authorizer_scopes,
             authorizer_lambda_context=authorizer_lambda_ctx,
+            authorizer_iam=authorizer_iam,
             owner_account_id=owner_account_id,
             owner_region=owner_region,
         )
@@ -1498,6 +1537,7 @@ async def _invoke_lambda_proxy(
     authorizer_claims=None,
     authorizer_scopes=None,
     authorizer_lambda_context=None,
+    authorizer_iam=None,
     owner_account_id=None,
     owner_region=None,
 ):
@@ -1587,6 +1627,8 @@ async def _invoke_lambda_proxy(
         }
     elif authorizer_lambda_context is not None:
         event["requestContext"]["authorizer"] = {"lambda": authorizer_lambda_context}
+    elif authorizer_iam is not None:
+        event["requestContext"]["authorizer"] = {"iam": authorizer_iam}
 
     # Route through the central _execute_function dispatcher so CloudWatch
     # Logs emission and Docker log output work for API Gateway invocations.
