@@ -6915,6 +6915,50 @@ def _cognito_identity_pool_role_attachment_delete(physical_id, props):
         pool["_roles"] = {}
 
 
+def _cognito_identity_pool_principal_tag_apply(props):
+    iid = props.get("IdentityPoolId")
+    if not iid:
+        raise ValueError("AWS::Cognito::IdentityPoolPrincipalTag requires IdentityPoolId")
+    provider = props.get("IdentityProviderName")
+    if not provider:
+        raise ValueError("AWS::Cognito::IdentityPoolPrincipalTag requires IdentityProviderName")
+    resp = _cognito._set_principal_tag_attribute_map({
+        "IdentityPoolId": iid,
+        "IdentityProviderName": provider,
+        **({"UseDefaults": props["UseDefaults"]} if "UseDefaults" in props else {}),
+        **({"PrincipalTags": props["PrincipalTags"]} if "PrincipalTags" in props else {}),
+    })
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Cognito::IdentityPoolPrincipalTag failed: {resp[2]!r}")
+    return iid, provider
+
+
+def _cognito_identity_pool_principal_tag_create(logical_id, props, stack_name):
+    iid, provider = _cognito_identity_pool_principal_tag_apply(props)
+    # Ref is the primary identifier, which AWS documents as the identity pool
+    # and the provider name joined by a pipe, so one pool carries a mapping per
+    # provider without sharing a physical id. The resource publishes no
+    # Fn::GetAtt attributes.
+    return f"{iid}|{provider}", {}
+
+
+def _cognito_identity_pool_principal_tag_update(physical_id, old_props, new_props, stack_name):
+    iid, provider = _cognito_identity_pool_principal_tag_apply(new_props)
+    # IdentityPoolId and IdentityProviderName are create-only: a change to
+    # either is a replacement, and the mapping left on the old pair would
+    # otherwise keep tagging principals after the template stopped declaring it.
+    if (old_props.get("IdentityPoolId"), old_props.get("IdentityProviderName")) != (iid, provider):
+        _cognito_identity_pool_principal_tag_delete(physical_id, old_props)
+    return f"{iid}|{provider}", {}
+
+
+def _cognito_identity_pool_principal_tag_delete(physical_id, props):
+    iid, _, provider = physical_id.partition("|")
+    pool = _cognito._identity_pools.get(iid)
+    if pool is not None:
+        pool.get("_principal_tags", {}).pop(provider, None)
+
+
 _RESOURCE_HANDLERS = {
     "AWS::OpenSearchService::Domain": {
         "create": _opensearch_domain_create,
@@ -7231,6 +7275,11 @@ _RESOURCE_HANDLERS = {
     "AWS::Cognito::IdentityPoolRoleAttachment": {
         "create": _cognito_identity_pool_role_attachment_create,
         "delete": _cognito_identity_pool_role_attachment_delete,
+    },
+    "AWS::Cognito::IdentityPoolPrincipalTag": {
+        "create": _cognito_identity_pool_principal_tag_create,
+        "update": _cognito_identity_pool_principal_tag_update,
+        "delete": _cognito_identity_pool_principal_tag_delete,
     },
     # EventBridge Scheduler
     "AWS::Scheduler::Schedule": {"create": _scheduler_schedule_create, "delete": _scheduler_schedule_delete},
