@@ -121,6 +121,31 @@ def _create_stack(params):
 
 # --- DescribeStacks ---
 
+def _resolve_stack(stack_name):
+    """Find a stack by name or by its unique stack ID.
+
+    Every CloudFormation operation that takes a ``StackName`` accepts "the name
+    or the unique stack ID" per the API reference, and the CDK CLI uses the ID:
+    it reads the stack once and then addresses it by ARN, so
+    ``DeleteStack(StackName="arn:aws:cloudformation:...:stack/name/uuid")`` is
+    what `cdk destroy` actually sends. Four handlers already carried this
+    fallback inline; the rest looked up the name only, so an ARN missed — and in
+    DeleteStack's case the miss was indistinguishable from "no such stack",
+    which is answered with 200 success. `cdk destroy` therefore reported
+    ``Failed to destroy <stack>: UPDATE_COMPLETE`` and left every resource in
+    place, after a DeleteStack that had returned OK.
+    """
+    from ministack.services.cloudformation import _stacks
+
+    stack = _stacks.get(stack_name)
+    if stack is not None:
+        return stack
+    for candidate in _stacks.values():
+        if candidate.get("StackId") == stack_name:
+            return candidate
+    return None
+
+
 def _describe_stacks(params):
     from ministack.services.cloudformation import _stacks
     stack_name = _p(params, "StackName")
@@ -288,7 +313,7 @@ def _describe_stack_resource(params):
     stack_name = _p(params, "StackName")
     logical_id = _p(params, "LogicalResourceId")
 
-    stack = _stacks.get(stack_name)
+    stack = _resolve_stack(stack_name)
     if not stack:
         return _error("ValidationError",
                       f"Stack [{stack_name}] does not exist")
@@ -322,7 +347,7 @@ def _describe_stack_resources(params):
     stack_name = _p(params, "StackName")
     logical_resource_id = _p(params, "LogicalResourceId")
 
-    stack = _stacks.get(stack_name)
+    stack = _resolve_stack(stack_name)
     if not stack:
         return _error("ValidationError",
                       f"Stack [{stack_name}] does not exist")
@@ -425,10 +450,17 @@ def _delete_stack(params):
     if not stack_name:
         return _error("ValidationError", "StackName is required")
 
-    stack = _stacks.get(stack_name)
+    stack = _resolve_stack(stack_name)
     if not stack:
         # AWS returns success for deleting non-existent stacks
         return _xml(200, "DeleteStackResponse", "")
+
+    # From here on, address the stack by its NAME rather than by whatever the
+    # caller passed: `_stacks` is keyed by name, so a caller who supplied a
+    # stack ID would otherwise sail past the lookup above and then miss in
+    # `_delete_stack_async`, which does its own `_stacks.get(stack_name)` and
+    # returns silently — leaving the stack untouched behind a 200.
+    stack_name = stack.get("StackName", stack_name)
 
     if stack.get("StackStatus") == "DELETE_COMPLETE":
         return _xml(200, "DeleteStackResponse", "")
@@ -475,7 +507,7 @@ def _update_stack(params):
     if not stack_name:
         return _error("ValidationError", "StackName is required")
 
-    stack = _stacks.get(stack_name)
+    stack = _resolve_stack(stack_name)
     # A deleted stack is not addressable by name — updating it is "does not
     # exist", not "cannot be updated" (a deployed stack name is free to re-create).
     if not stack or stack.get("StackStatus") == "DELETE_COMPLETE":
