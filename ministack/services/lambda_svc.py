@@ -4004,12 +4004,14 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
             layers_dirs.append(layer_dir)
 
     # Shared environment
+    account_id = _account_region_from_function_config(config)[0]
     container_env: dict[str, str] = {
         "AWS_DEFAULT_REGION": get_region(),
         "AWS_REGION": get_region(),
-        "AWS_ACCESS_KEY_ID": _account_region_from_function_config(config)[0],
+        "AWS_ACCESS_KEY_ID": account_id,
         "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
         "AWS_SESSION_TOKEN": os.environ.get("AWS_SESSION_TOKEN", ""),
+        "AWS_ACCOUNT_ID": account_id,
         "AWS_LAMBDA_FUNCTION_NAME": config["FunctionName"],
         "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": str(config.get("MemorySize", 128)),
         "AWS_LAMBDA_FUNCTION_VERSION": config.get("Version", "$LATEST"),
