@@ -114,7 +114,20 @@ async def handle_request(method, path, headers, body, query_params):
             from ministack.services import iam as iam_svc
             # Extract role name from ARN
             role_name = role_arn.split("/")[-1] if "/" in role_arn else ""
-            role = iam_svc._roles.get(role_name)
+            # Resolve the role in the account the ARN names, not the caller's. `_roles` is
+            # account-scoped, so a plain `.get()` looks in the CALLER's account — and a
+            # cross-account AssumeRole, where the role by definition lives somewhere else, then
+            # finds nothing and is refused with the role-missing message below (which reports an
+            # empty `User:`, since it never got as far as resolving the caller).
+            role_account = role_arn.split(":")[4] if role_arn.count(":") > 4 else ""
+            role = None
+            if role_account and role_account != get_account_id():
+                try:
+                    role = iam_svc._roles.get_scoped(role_account, None, role_name)
+                except Exception:
+                    role = None
+            if role is None:
+                role = iam_svc._roles.get(role_name)
             if role is None:
                 return _error(403, "AccessDenied",
                               f"User: is not authorized to perform: sts:AssumeRole on resource: {role_arn}",

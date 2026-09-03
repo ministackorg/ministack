@@ -1697,8 +1697,52 @@ def _cbor_ok(data: dict):
     )
 
 
+def _json_timestamp(value):
+    """Encode one timestamp member for awsJson1_0, which models it as epoch seconds.
+
+    The XML path builds every timestamp as an ISO-8601 string (``_ts_iso``) and
+    the JSON branches return those same dicts unchanged, so an AWS SDK — which
+    parses a smithy ``timestamp`` over awsJson1_0 as a number — fails the whole
+    response with ``Expected real number, got implicit NaN``. Same class of bug
+    as the CBOR tag-1 issue (#1261), one protocol over: the data is right and
+    only its encoding is wrong.
+    """
+    if isinstance(value, str):
+        epoch = _parse_ts(value)
+        if epoch is not None:
+            return float(epoch)
+    return value
+
+
+def _json_timestamps(value):
+    """Recursively convert Timestamp members in a JSON response to epoch seconds.
+
+    Applied inside ``_json_ok`` rather than at each return site. CloudWatch has
+    five JSON responses carrying timestamps — GetMetricStatistics,
+    GetMetricData, DescribeAlarms, DescribeAlarmsForMetric and
+    DescribeAlarmHistory — and a per-shape converter for each, mirroring the
+    ``_cbor_*`` family, would be five chances to miss one and five more for
+    every response added later. Every timestamp member in this service's model
+    is named ``Timestamp`` or ``Timestamps``, so the key is a reliable marker.
+    """
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            if key.endswith("Timestamps") and isinstance(item, list):
+                out[key] = [_json_timestamp(each) for each in item]
+            elif key.endswith("Timestamp"):
+                out[key] = _json_timestamp(item)
+            else:
+                out[key] = _json_timestamps(item)
+        return out
+    if isinstance(value, list):
+        return [_json_timestamps(item) for item in value]
+    return value
+
+
 def _json_ok(data: dict):
-    return 200, {"Content-Type": "application/json"}, json.dumps(data).encode()
+    return (200, {"Content-Type": "application/json"},
+            json.dumps(_json_timestamps(data)).encode())
 
 
 def _xml(status, root_tag, inner):
