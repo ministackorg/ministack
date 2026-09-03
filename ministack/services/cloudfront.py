@@ -302,6 +302,26 @@ def _local_tag_name(el) -> str:
     return t.split("}")[-1] if "}" in t else t
 
 
+def _strip_namespace(el):
+    """Rewrite an element tree's tags to their local names, in place.
+
+    A stored ``config_xml`` is the client's own request body, which declares
+    ``xmlns="http://cloudfront.amazonaws.com/doc/2020-05-31/"`` on
+    ``DistributionConfig`` — so ``fromstring`` qualifies every tag as
+    ``{ns}Tag``. Re-serialising that inside a response whose root carries
+    ``xmlns`` as a plain attribute makes ElementTree invent an ``ns0:`` prefix
+    for all of them, and AWS SDKs parse REST-XML without namespace awareness:
+    ``ns0:Origins`` does not match ``Origins``, so the whole config reads as
+    absent. Only the root tag was being corrected, which is why
+    ``GetDistribution`` returned a ``DistributionConfig`` containing nothing but
+    the handful of elements built with unqualified names.
+    """
+    el.tag = _local_tag_name(el)
+    for child in el:
+        _strip_namespace(child)
+    return el
+
+
 def _add_xml_block(parent, source_el):
     block = SubElement(parent, _local_tag_name(source_el))
     block.text = source_el.text
@@ -404,7 +424,7 @@ def _build_distribution_xml(parent, dist):
     SubElement(parent, "InProgressInvalidationBatches").text = "0"
     SubElement(parent, "DomainName").text = dist["DomainName"]
     # Re-parse and embed the stored config XML
-    config_el = fromstring(dist["config_xml"])
+    config_el = _strip_namespace(fromstring(dist["config_xml"]))
     _ensure_distribution_config_sdk_compat(config_el)
     config_el.tag = "DistributionConfig"
     parent.append(config_el)
@@ -2043,7 +2063,7 @@ def _get_distribution_config(dist_id):
     if not dist:
         return _error("NoSuchDistribution", "The specified distribution does not exist.", 404)
 
-    config_el = fromstring(dist["config_xml"])
+    config_el = _strip_namespace(fromstring(dist["config_xml"]))
     _ensure_distribution_config_sdk_compat(config_el)
     config_el.tag = "DistributionConfig"
     config_el.set("xmlns", NS)
