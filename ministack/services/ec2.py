@@ -1224,7 +1224,12 @@ def _image_view(image):
         "Architecture": image["Architecture"],
         "VirtualizationType": image["VirtualizationType"],
         "OwnerId": image.get("OwnerId") or get_account_id(),
-        "IsPublic": "false",
+        # An AMI is public exactly when its launch permissions carry the
+        # ``all`` group, as on AWS.
+        "IsPublic": ("true" if any(perm.get("Group") == "all"
+                                   for perm in image.get("LaunchPermissions") or [])
+                     else "false"),
+        "LaunchPermissions": image.get("LaunchPermissions") or [],
         "Backed": True,
     }
 
@@ -1344,9 +1349,19 @@ def _image_owner_matches(view, owners):
 
 def _image_executable_by_matches(view, users):
     """ExecutableBy.N: "Specify an AWS account ID, self (the sender of the request), or all
-    (public AMIs)." Nothing here is shared by explicit launch permission, so only `all`
-    selects anything and it selects the public images."""
-    return "all" in users and view["IsPublic"] == "true"
+    (public AMIs)." ``all`` selects public images; ``self`` or an account ID selects images
+    whose launch permissions name that account explicitly."""
+    perms = view.get("LaunchPermissions") or []
+    perm_users = {perm.get("UserId") for perm in perms if perm.get("UserId")}
+    account = get_account_id()
+    for u in users:
+        if u == "all" and view["IsPublic"] == "true":
+            return True
+        if u == "self" and account in perm_users:
+            return True
+        if u in perm_users:
+            return True
+    return False
 
 
 def _describe_images(p):
@@ -1356,7 +1371,23 @@ def _describe_images(p):
     filters = _parse_filters(p)
     # Registered images first: those are the ones that actually boot. The stubs
     # stay so a workload naming one keeps launching a metadata-only instance.
-    views = [_image_view(img) for img in _images.values()]
+    # Visibility matches AWS: the caller's own images, plus other accounts'
+    # images in this region whose launch permissions name the caller (or the
+    # ``all`` group). A shared image keeps its owner's OwnerId.
+    account = get_account_id()
+    region = get_region()
+    visible = []
+    for (img_account, img_region, _key), img in _images.all_items():
+        if img_region != region:
+            continue
+        if img_account == account:
+            visible.append(img)
+            continue
+        perms = img.get("LaunchPermissions") or []
+        if any(perm.get("Group") == "all" or perm.get("UserId") == account
+               for perm in perms):
+            visible.append(img)
+    views = [_image_view(img) for img in visible]
     seen = {v["ImageId"] for v in views}
     views += [_stub_image_view(*stub) for stub in _STUB_AMIS if stub[0] not in seen]
 
@@ -1955,8 +1986,27 @@ def _get_ministack_network(client):
 
 
 def _registered_image(image_id):
-    """The registered image record for an AMI id, or None."""
-    return _images.get(image_id) if image_id else None
+    """The registered image record for an AMI id, or None.
+
+    Resolves in the caller's scope first; a miss falls through to another
+    account's image in this region that the caller holds a launch permission
+    for (or a public one) — launch permission is exactly the right to run it.
+    """
+    if not image_id:
+        return None
+    image = _images.get(image_id)
+    if image is not None:
+        return image
+    account = get_account_id()
+    region = get_region()
+    for (img_account, img_region, key), img in _images.all_items():
+        if key != image_id or img_region != region or img_account == account:
+            continue
+        perms = img.get("LaunchPermissions") or []
+        if any(perm.get("Group") == "all" or perm.get("UserId") == account
+               for perm in perms):
+            return img
+    return None
 
 
 # Set the first time a container is launched. A registration can be withdrawn while its
@@ -2071,6 +2121,100 @@ def _deregister_image(p):
     _images.pop(image_id, None)
     _tags.pop(image_id, None)
     return _xml(200, "DeregisterImageResponse", "<return>true</return>")
+
+
+def _parse_launch_permission_list(p, prefix):
+    """LaunchPermission.{Add|Remove}.N.{UserId|Group} off the Query wire."""
+    perms = []
+    i = 1
+    while True:
+        user = _p(p, f"{prefix}.{i}.UserId")
+        group = _p(p, f"{prefix}.{i}.Group")
+        if not user and not group:
+            break
+        perms.append({"UserId": user} if user else {"Group": group})
+        i += 1
+    return perms
+
+
+def _modify_image_attribute(p):
+    """launchPermission add/remove — the AMI sharing flow. Owner-scoped: the
+    image resolves in the caller's own account, so another account's AMI is
+    NotFound here, as the owner-only AWS call effectively behaves."""
+    image_id = _p(p, "ImageId")
+    if not image_id:
+        return _error("MissingParameter", "The request must contain the parameter ImageId", 400)
+    image = _images.get(image_id)
+    if not image:
+        return _error("InvalidAMIID.NotFound",
+                      f"The image id '[{image_id}]' does not exist", 400)
+
+    add = _parse_launch_permission_list(p, "LaunchPermission.Add")
+    remove = _parse_launch_permission_list(p, "LaunchPermission.Remove")
+    # Legacy flat form: Attribute=launchPermission + OperationType=add|remove
+    # + UserId.N / UserGroup.N (what older SDKs and the CLI shorthand send).
+    if not add and not remove and _p(p, "Attribute") == "launchPermission":
+        flat = ([{"UserId": u} for u in _parse_member_list(p, "UserId")]
+                + [{"Group": g} for g in _parse_member_list(p, "UserGroup")])
+        if _p(p, "OperationType") == "remove":
+            remove = flat
+        else:
+            add = flat
+    if not add and not remove:
+        return _error("InvalidParameterCombination",
+                      "The request must contain launch permissions to add or remove", 400)
+    for perm in add + remove:
+        if perm.get("Group") and perm["Group"] != "all":
+            return _error("InvalidParameterValue",
+                          f"Value ({perm['Group']}) for parameter Group is invalid. Valid value: all", 400)
+
+    perms = image.setdefault("LaunchPermissions", [])
+    for perm in add:
+        if perm not in perms:
+            perms.append(perm)
+    for perm in remove:
+        if perm in perms:
+            perms.remove(perm)
+    return _xml(200, "ModifyImageAttributeResponse", "<return>true</return>")
+
+
+def _describe_image_attribute(p):
+    image_id = _p(p, "ImageId")
+    attribute = _p(p, "Attribute")
+    image = _images.get(image_id) if image_id else None
+    if not image:
+        return _error("InvalidAMIID.NotFound",
+                      f"The image id '[{image_id}]' does not exist", 400)
+    if attribute == "launchPermission":
+        items = "".join(
+            (f"<item><userId>{perm['UserId']}</userId></item>" if perm.get("UserId")
+             else f"<item><group>{perm['Group']}</group></item>")
+            for perm in image.get("LaunchPermissions") or [])
+        return _xml(200, "DescribeImageAttributeResponse",
+                    f"<imageId>{image_id}</imageId>"
+                    f"<launchPermission>{items}</launchPermission>")
+    if attribute == "description":
+        return _xml(200, "DescribeImageAttributeResponse",
+                    f"<imageId>{image_id}</imageId>"
+                    f"<description><value>{_esc(image.get('Description') or '')}</value></description>")
+    return _error("InvalidParameterValue",
+                  f"Value ({attribute}) for parameter attribute is invalid.", 400)
+
+
+def _reset_image_attribute(p):
+    image_id = _p(p, "ImageId")
+    attribute = _p(p, "Attribute")
+    if attribute != "launchPermission":
+        # launchPermission is the only resettable image attribute in the model.
+        return _error("InvalidParameterValue",
+                      f"Value ({attribute}) for parameter attribute is invalid. "
+                      "Valid value: launchPermission", 400)
+    image = _images.get(image_id) if image_id else None
+    if not image:
+        return _error("InvalidAMIID.NotFound",
+                      f"The image id '[{image_id}]' does not exist", 400)
+    image["LaunchPermissions"] = []
+    return _xml(200, "ResetImageAttributeResponse", "<return>true</return>")
 
 
 # ── Container lifecycle ────────────────────────────────────
@@ -6894,6 +7038,9 @@ _ACTION_MAP = {
     "ReplaceIamInstanceProfileAssociation": _replace_iam_instance_profile_association,
     "DescribeImages": _describe_images,
     "RegisterImage": _register_image,
+    "ModifyImageAttribute": _modify_image_attribute,
+    "DescribeImageAttribute": _describe_image_attribute,
+    "ResetImageAttribute": _reset_image_attribute,
     "DeregisterImage": _deregister_image,
     "CreateSecurityGroup": _create_security_group,
     "DeleteSecurityGroup": _delete_security_group,

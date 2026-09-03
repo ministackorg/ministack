@@ -11292,3 +11292,46 @@ def test_snapstart_pending_version_reprovisions_on_restore():
         from ministack.core import lambda_runtime as _lr
         _lr.invalidate_worker("snap-restore-fn", account="000000000000",
                               region="us-east-1")
+
+
+def test_lambda_rie_sentinel_arn_resolves_in_caller_scope():
+    """An ARN carrying the RIE's hardcoded scope (us-east-1 / 012345678912 —
+    what context.invoked_function_arn reports inside an unshimmed docker
+    container) resolves as "self": in the caller's own account and region."""
+    account_id = "555566667777"
+    function_name = f"rie-sentinel-{_uuid_mod.uuid4().hex}"
+    real_arn = f"arn:aws:lambda:eu-central-1:{account_id}:function:{function_name}"
+    sentinel_arn = f"arn:aws:lambda:us-east-1:012345678912:function:{function_name}"
+    original_account = get_account_id()
+    original_region = get_region()
+
+    lsvc._functions.set_scoped(
+        account_id, "eu-central-1", function_name,
+        {
+            "config": {"FunctionName": function_name, "FunctionArn": real_arn},
+            "versions": {},
+            "aliases": {},
+        },
+    )
+    try:
+        set_request_account_id(account_id)
+        set_request_region("eu-central-1")
+
+        record, config, resolved_name = lsvc._get_func_record_for_ref(sentinel_arn)
+        assert record is not None
+        assert resolved_name == function_name
+        assert config["FunctionArn"] == real_arn
+
+        base_record, base_config, _ = lsvc._get_base_func_record_for_ref(sentinel_arn)
+        assert base_record is not None
+        assert base_config["FunctionArn"] == real_arn
+
+        # Any OTHER foreign account is still rejected — the fallback is only
+        # for the exact RIE-manufactured scope.
+        other = f"arn:aws:lambda:eu-central-1:999999999999:function:{function_name}"
+        rejected, _, _ = lsvc._get_func_record_for_ref(other)
+        assert rejected is None
+    finally:
+        lsvc._functions.pop_scoped(account_id, "eu-central-1", function_name, None)
+        set_request_account_id(original_account)
+        set_request_region(original_region)

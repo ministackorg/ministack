@@ -10848,3 +10848,27 @@ def test_cfn_update_iam_managed_policy_in_place(cfn, iam):
         assert document["Statement"][0]["Action"] == "s3:GetObject"
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_stack_addressable_by_id_for_delete_and_update(cfn):
+    """Every StackName parameter accepts the unique stack ID; the CDK CLI
+    addresses stacks by ARN, so DeleteStack/UpdateStack must resolve it —
+    a missed DeleteStack returned 200 and deleted nothing."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {"Topic": {"Type": "AWS::SNS::Topic",
+                                "Properties": {"TopicName": "cfn-by-id-a"}}},
+    }
+    cfn.create_stack(StackName="cfn-by-id", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-by-id")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    stack_id = stack["StackId"]
+
+    template["Resources"]["Topic"]["Properties"]["TopicName"] = "cfn-by-id-b"
+    cfn.update_stack(StackName=stack_id, TemplateBody=json.dumps(template))
+    assert _wait_stack(cfn, "cfn-by-id")["StackStatus"] == "UPDATE_COMPLETE"
+
+    cfn.delete_stack(StackName=stack_id)
+    _wait_stack(cfn, "cfn-by-id")
+    described = cfn.describe_stacks(StackName=stack_id)["Stacks"]
+    assert described[0]["StackStatus"] == "DELETE_COMPLETE"

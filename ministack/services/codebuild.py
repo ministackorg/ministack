@@ -206,7 +206,7 @@ WORKSPACE = "/tmp/ministack-codebuild"
 # Without this hook there is no configuration that makes CodeBuild work under
 # SELinux, and the failure is silent — the agent exits 0 after starting nothing,
 # and _execute_build reads that exit code as SUCCEEDED.
-CODEBUILD_DOCKER_FLAGS = os.environ.get("MINISTACK_CODEBUILD_DOCKER_FLAGS", "")
+CODEBUILD_DOCKER_FLAGS = os.environ.get("CODEBUILD_DOCKER_FLAGS", "")
 
 _PHASE_COMPLETE_RE = re.compile(r"Phase complete: ([A-Z_]+) State: ([A-Z_]+)")
 
@@ -490,7 +490,19 @@ def _execute_build(build_id, project):
             _finish_build(build, "TIMED_OUT")
         else:
             exit_code = container.wait().get("StatusCode", 1)
-            _finish_build(build, "SUCCEEDED" if exit_code == 0 else "FAILED")
+            if exit_code == 0 and not saw_phase:
+                # The agent exits 0 even when it started nothing (e.g. it was
+                # denied the Docker socket under SELinux), so a bare exit code
+                # would report a build that never ran as SUCCEEDED. No "Phase
+                # complete" line means no build phase executed: that is an
+                # infrastructure failure, not a build result.
+                logger.error(
+                    "Build %s: agent exited 0 without completing any phase; "
+                    "reporting FAULT", build_id,
+                )
+                _finish_build(build, "FAULT")
+            else:
+                _finish_build(build, "SUCCEEDED" if exit_code == 0 else "FAILED")
         logger.info("Build %s finished: %s", build_id, build["buildStatus"])
     except Exception:
         if _stop_requested(build_id):

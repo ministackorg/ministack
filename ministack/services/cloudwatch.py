@@ -1710,7 +1710,9 @@ def _json_timestamp(value):
     if isinstance(value, str):
         epoch = _parse_ts(value)
         if epoch is not None:
-            return float(epoch)
+            # Int epoch, not float: the project convention for JSON bodies
+            # (Java SDK v2 rejects high-precision float timestamps).
+            return int(epoch)
     return value
 
 

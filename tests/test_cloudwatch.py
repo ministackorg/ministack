@@ -863,3 +863,45 @@ def test_cloudwatch_percentile_alarm_reason_reports_statistic(cw):
     assert alarm["StateValue"] == "ALARM"
     assert "p90" in alarm["StateReason"]
     assert "Average" not in alarm["StateReason"]
+
+
+def test_cloudwatch_json_timestamps_are_epoch_numbers(cw):
+    """Over awsJson1_0 a smithy timestamp is epoch seconds; the JSON branches
+    used to leak the XML path's ISO strings, which every SDK's number parser
+    rejects. Raw HTTP because boto3 speaks Query here and would mask the shape.
+    Int (not float) epoch is the project convention for JSON bodies."""
+    import os
+    import urllib.request
+
+    ns = f"JsonTs{_uuid_mod.uuid4().hex[:8]}"
+    cw.put_metric_data(
+        Namespace=ns,
+        MetricData=[{"MetricName": "Latency", "Value": 42.0}],
+    )
+    now = int(time.time())
+    body = json.dumps({
+        "Namespace": ns,
+        "MetricName": "Latency",
+        "StartTime": now - 600,
+        "EndTime": now + 60,
+        "Period": 60,
+        "Statistics": ["Average"],
+    }).encode()
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    req = urllib.request.Request(
+        f"{endpoint}/",
+        data=body,
+        headers={
+            "Content-Type": "application/x-amz-json-1.0",
+            "X-Amz-Target": "GraniteServiceVersion20100801.GetMetricStatistics",
+            "x-amzn-query-mode": "true",
+            "Authorization": "AWS4-HMAC-SHA256 Credential=test/20200101/us-east-1/monitoring/aws4_request, SignedHeaders=host, Signature=00",
+        },
+    )
+    with urllib.request.urlopen(req) as resp:
+        payload = json.loads(resp.read())
+    datapoints = payload.get("Datapoints", [])
+    assert datapoints, "expected at least one datapoint"
+    for dp in datapoints:
+        assert isinstance(dp["Timestamp"], int), (
+            f"Timestamp must be int epoch over JSON, got {type(dp['Timestamp']).__name__}: {dp['Timestamp']}")

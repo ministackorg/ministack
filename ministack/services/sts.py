@@ -122,11 +122,16 @@ async def handle_request(method, path, headers, body, query_params):
             role_account = role_arn.split(":")[4] if role_arn.count(":") > 4 else ""
             role = None
             if role_account and role_account != get_account_id():
+                # The ARN's account is authoritative: a role that isn't found
+                # there does NOT fall back to a same-named role in the caller's
+                # account — that resolution exists nowhere in AWS, and the miss
+                # must surface as the same AccessDenied a denial produces (AWS
+                # deliberately doesn't disclose role existence).
                 try:
                     role = iam_svc._roles.get_scoped(role_account, None, role_name)
                 except Exception:
                     role = None
-            if role is None:
+            else:
                 role = iam_svc._roles.get(role_name)
             if role is None:
                 return _error(403, "AccessDenied",

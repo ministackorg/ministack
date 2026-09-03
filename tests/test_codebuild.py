@@ -584,3 +584,23 @@ def test_execute_build_without_docker_reports_fault(monkeypatch, tmp_path):
     codebuild._execute_build("demo:0004", project)
 
     assert build["buildStatus"] == "FAULT"
+
+
+def test_execute_build_agent_exit_zero_without_phases_is_fault(monkeypatch, tmp_path):
+    """The agent exits 0 even when it started nothing (e.g. denied the Docker
+    socket under SELinux). A zero exit with no 'Phase complete' line means no
+    build phase ran, so the outcome is FAULT — not a silent SUCCEEDED."""
+    container = _FakeContainer([
+        "permission denied while trying to connect to the Docker daemon socket",
+    ])
+    docker = _FakeDocker(container)
+    monkeypatch.setattr(codebuild, "_get_docker", lambda: docker)
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+
+    project = _execution_project()
+    build = _seed_execution_build(project)
+
+    codebuild._execute_build("demo:0001", project)
+
+    assert build["buildStatus"] == "FAULT"
+    assert container.removed is True

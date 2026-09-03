@@ -2546,3 +2546,19 @@ def test_cf_saas_connection_group_tagging(cloudfront):
     )
     tags = cloudfront.list_tags_for_resource(Resource=cg["Arn"])["Tags"]["Items"]
     assert {"Key": "env", "Value": "test"} in tags
+
+
+def test_cloudfront_get_distribution_xml_has_no_namespace_prefixes(cloudfront):
+    """Re-serialising the client's own namespaced config used to invent ns0:
+    prefixes on every child, which SDK REST-XML parsers read as absent members.
+    Raw HTTP because boto3's parser is namespace-tolerant and masked the bug."""
+    dist_id = cloudfront.create_distribution(
+        DistributionConfig=_CF_DIST_CONFIG)["Distribution"]["Id"]
+    req = urllib.request.Request(
+        f"{ENDPOINT}/2020-05-31/distribution/{dist_id}",
+        headers={"Authorization": "AWS4-HMAC-SHA256 Credential=test/20200101/us-east-1/cloudfront/aws4_request, SignedHeaders=host, Signature=00"},
+    )
+    with urllib.request.urlopen(req) as resp:
+        raw = resp.read()
+    assert b"ns0:" not in raw, "namespace prefixes leaked into the response XML"
+    assert b"<Origins>" in raw and b"<DefaultCacheBehavior>" in raw

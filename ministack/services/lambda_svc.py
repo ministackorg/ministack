@@ -1712,6 +1712,25 @@ def _validate_latest_mutation_qualifier(func_name: str, qualifier: str | None):
     )
 
 
+def _is_rie_sentinel_scope(spec) -> bool:
+    """True for the ARN scope the AWS Lambda RIE manufactures.
+
+    Under ``LAMBDA_EXECUTOR=docker`` the handler's
+    ``context.invoked_function_arn`` comes from the RIE inside the official
+    image, which hardcodes ``arn:aws:lambda:us-east-1:012345678912:function:…``
+    — account AND region, with no override (verified in
+    aws-lambda-runtime-interface-emulator ``internal/lambda/rie/handlers.go``).
+    A function that self-registers that ARN (the textbook
+    ``context.invoked_function_arn`` pattern, e.g. into a Cognito
+    ``LambdaConfig`` trigger) then points at a scope where nothing exists. An
+    ARN carrying exactly that scope is treated as "self": it re-resolves in
+    the caller's own account and region. A tenant genuinely running as
+    012345678912 in us-east-1 is unaffected — its account matches the caller
+    and resolution never reaches this fallback.
+    """
+    return spec.account_id == "012345678912" and spec.region == "us-east-1"
+
+
 def _get_func_record_for_ref(function_ref: str) -> tuple[dict | None, dict | None, str]:
     if isinstance(function_ref, str) and function_ref.startswith("arn:"):
         try:
@@ -1722,8 +1741,11 @@ def _get_func_record_for_ref(function_ref: str) -> tuple[dict | None, dict | Non
             name, qualifier = _lambda_function_name_and_qualifier_from_arn(function_ref)
             if name:
                 if spec.account_id != get_account_id():
-                    return None, None, name
-                func = _functions.get_scoped(get_account_id(), spec.region, name)
+                    if not _is_rie_sentinel_scope(spec):
+                        return None, None, name
+                    spec = None  # RIE self-ARN: resolve in the caller's scope
+                region = spec.region if spec else get_region()
+                func = _functions.get_scoped(get_account_id(), region, name)
                 if not _function_qualifier_exists(func, qualifier):
                     return None, None, name
                 record, config = _effective_func_record_for_qualifier(func, qualifier)
@@ -1747,8 +1769,11 @@ def _get_base_func_record_for_ref(function_ref: str) -> tuple[dict | None, dict 
             name, _qualifier = _lambda_function_name_and_qualifier_from_arn(function_ref)
             if name:
                 if spec.account_id != get_account_id():
-                    return None, None, name
-                func = _functions.get_scoped(get_account_id(), spec.region, name)
+                    if not _is_rie_sentinel_scope(spec):
+                        return None, None, name
+                    spec = None  # RIE self-ARN: resolve in the caller's scope
+                region = spec.region if spec else get_region()
+                func = _functions.get_scoped(get_account_id(), region, name)
                 return func, (func or {}).get("config"), name
 
     name, _qualifier = _resolve_name_and_qualifier(function_ref)
@@ -3929,6 +3954,89 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None,
         raise
 
 
+_PY_CTX_ARN_SHIM = '''\
+"""MiniStack shim: hand user code the control-plane ARN in its context."""
+import importlib
+import os
+
+_real = os.environ.get("_MS_REAL_HANDLER", "index.handler")
+_mod_name, _, _fn_name = _real.rpartition(".")
+_target = getattr(importlib.import_module(_mod_name.replace("/", ".")), _fn_name)
+_ARN = os.environ.get("_LAMBDA_FUNCTION_ARN", "")
+
+
+def handler(event, context):
+    if _ARN:
+        try:
+            context.invoked_function_arn = _ARN
+        except Exception:
+            pass
+    return _target(event, context)
+'''
+
+_JS_CTX_ARN_SHIM = '''\
+// MiniStack shim: hand user code the control-plane ARN in its context.
+const path = require("path");
+const fs = require("fs");
+const REAL = process.env._MS_REAL_HANDLER || "index.handler";
+const ARN = process.env._LAMBDA_FUNCTION_ARN || "";
+const dot = REAL.lastIndexOf(".");
+const modPart = REAL.slice(0, dot);
+const fnName = REAL.slice(dot + 1);
+let cached = null;
+async function load() {
+  if (cached) return cached;
+  const base = path.join("/var/task", modPart);
+  for (const ext of [".mjs", ".js", ".cjs"]) {
+    const p = base + ext;
+    if (fs.existsSync(p)) {
+      const m = await import("file://" + p);
+      cached = m[fnName] || (m.default && m.default[fnName]);
+      if (cached) return cached;
+    }
+  }
+  throw new Error("ministack context shim: handler not found: " + REAL);
+}
+exports.handler = async (event, context) => {
+  if (ARN) { try { context.invokedFunctionArn = ARN; } catch (e) {} }
+  const fn = await load();
+  if (fn.length >= 3) {
+    return await new Promise((resolve, reject) =>
+      fn(event, context, (err, res) => (err ? reject(err) : resolve(res))));
+  }
+  return fn(event, context);
+};
+'''
+
+
+def _write_context_arn_shim(code_dir: str, runtime: str, handler: str) -> str | None:
+    """Drop a context-ARN shim into the code dir; return its handler string.
+
+    Returns None (no shim, original handler runs directly) for runtimes we
+    can't wrap, a handler already pointing at the shim's name, or a code dir
+    that already contains a same-named file.
+    """
+    if handler.rpartition(".")[0].replace("/", ".") == "_msctx_shim":
+        return None
+    if runtime.startswith("python"):
+        name, shim_handler, source = "_msctx_shim.py", "_msctx_shim.handler", _PY_CTX_ARN_SHIM
+    elif runtime.startswith("nodejs"):
+        name, shim_handler, source = "_msctx_shim.js", "_msctx_shim.handler", _JS_CTX_ARN_SHIM
+    else:
+        return None
+    shim_path = os.path.join(code_dir, name)
+    if os.path.exists(shim_path):
+        return None
+    try:
+        with open(shim_path, "w") as f:
+            f.write(source)
+    except OSError as exc:
+        logger.warning("Lambda context-ARN shim not written (%s); "
+                       "container will report the RIE default ARN", exc)
+        return None
+    return shim_handler
+
+
 def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
                                  _pin_platform: bool, _made_tmpdirs: list):
     """Create and start a Lambda container for the given config.
@@ -4115,6 +4223,20 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
     else:
         # Zip: RIE expects handler as CMD (or "bootstrap" for provided)
         run_kwargs["command"] = ["bootstrap"] if is_provided else [handler]
+        # The RIE inside the official images hardcodes
+        # arn:aws:lambda:us-east-1:012345678912:function:{name} as the
+        # context's invoked_function_arn — account AND region, no override —
+        # so a handler that self-registers its own ARN (the textbook
+        # ``context.invoked_function_arn`` pattern) stores a scope where
+        # nothing exists. For the runtimes whose code dir we own, run the
+        # handler through a shim that overwrites the context ARN with the
+        # control-plane FunctionArn (already in ``_LAMBDA_FUNCTION_ARN``)
+        # before user code sees it. ``provided`` bootstraps and Image-type
+        # functions own their code path end-to-end and cannot be shimmed.
+        shim_cmd = _write_context_arn_shim(code_dir, runtime, handler)
+        if shim_cmd:
+            container_env["_MS_REAL_HANDLER"] = handler
+            run_kwargs["command"] = [shim_cmd]
 
     if mounts:
         run_kwargs["mounts"] = mounts

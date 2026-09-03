@@ -264,18 +264,12 @@ def _list_stacks(params):
 # --- DescribeStackEvents ---
 
 def _describe_stack_events(params):
-    from ministack.services.cloudformation import _stack_events, _stacks
+    from ministack.services.cloudformation import _stack_events
     stack_name = _p(params, "StackName")
     if not stack_name:
         return _error("ValidationError", "StackName is required")
 
-    stack = _stacks.get(stack_name)
-    if not stack:
-        # Try by stack ID
-        for s in _stacks.values():
-            if s.get("StackId") == stack_name:
-                stack = s
-                break
+    stack = _resolve_stack(stack_name)
     if not stack:
         return _error("ValidationError",
                       f"Stack [{stack_name}] does not exist")
@@ -385,17 +379,11 @@ def _describe_stack_resources(params):
 # --- ListStackResources ---
 
 def _list_stack_resources(params):
-    from ministack.services.cloudformation import _stacks
     stack_name = _p(params, "StackName")
     if not stack_name:
         return _error("ValidationError", "StackName is required")
 
-    stack = _stacks.get(stack_name)
-    if not stack:
-        for s in _stacks.values():
-            if s.get("StackId") == stack_name:
-                stack = s
-                break
+    stack = _resolve_stack(stack_name)
     if not stack:
         return _error("ValidationError",
                       f"Stack [{stack_name}] does not exist")
@@ -422,15 +410,9 @@ def _list_stack_resources(params):
 # --- GetTemplate ---
 
 def _get_template(params):
-    from ministack.services.cloudformation import _stacks
     stack_name = _p(params, "StackName")
 
-    stack = _stacks.get(stack_name)
-    if not stack:
-        for s in _stacks.values():
-            if s.get("StackId") == stack_name:
-                stack = s
-                break
+    stack = _resolve_stack(stack_name)
     if not stack:
         return _error("ValidationError",
                       f"Stack [{stack_name}] does not exist")
@@ -513,6 +495,12 @@ def _update_stack(params):
     if not stack or stack.get("StackStatus") == "DELETE_COMPLETE":
         return _error("ValidationError",
                       f"Stack [{stack_name}] does not exist")
+
+    # Address the stack by NAME from here on, as _delete_stack does: `_stacks`
+    # is keyed by name, and `_deploy_stack_async` re-looks the stack up by this
+    # value — handed the caller's stack ID it misses, returns silently, and the
+    # stack is left UPDATE_IN_PROGRESS forever.
+    stack_name = stack.get("StackName", stack_name)
 
     current_status = stack.get("StackStatus", "")
     if current_status not in ("CREATE_COMPLETE", "UPDATE_COMPLETE",

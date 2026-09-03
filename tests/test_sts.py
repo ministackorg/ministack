@@ -306,3 +306,63 @@ def test_get_caller_identity_different_roles_return_different_arns(sts_as_role):
     assert "RoleA" in arn_a
     assert "RoleB" in arn_b
     assert arn_a != arn_b
+
+
+def test_sts_cross_account_assumed_session_runs_in_role_account():
+    """An assumed session's ASIA key resolves to the account of the role it
+    assumed, so the session operates in that tenant — not the default one."""
+    import boto3
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    caller = boto3.client(
+        "sts", endpoint_url=endpoint, region_name="us-east-1",
+        aws_access_key_id="111111111111", aws_secret_access_key="test",
+    )
+    resp = caller.assume_role(
+        RoleArn="arn:aws:iam::999888777666:role/CrossReader",
+        RoleSessionName="xacct",
+    )
+    assert resp["AssumedRoleUser"]["Arn"].startswith(
+        "arn:aws:sts::999888777666:assumed-role/CrossReader/")
+    creds = resp["Credentials"]
+    session_sts = boto3.client(
+        "sts", endpoint_url=endpoint, region_name="us-east-1",
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"],
+    )
+    assert session_sts.get_caller_identity()["Account"] == "999888777666"
+
+
+def test_sts_assume_role_foreign_arn_never_falls_back_to_caller(monkeypatch):
+    """Under AUTH, a role ARN naming another account resolves ONLY there: a
+    miss is the same AccessDenied a denial produces (AWS never resolves the
+    caller's same-named role, and never discloses role existence)."""
+    import asyncio
+
+    import ministack.app as app_mod
+    from ministack.core.responses import set_request_account_id
+    from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_mod
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    set_request_account_id("111111111111")
+    # The caller's own account HAS a role with the same name — the trap the
+    # fallback used to fall into.
+    iam_svc._roles.set_scoped("111111111111", None, "Trap", {
+        "RoleName": "Trap",
+        "Arn": "arn:aws:iam::111111111111:role/Trap",
+        "AssumeRolePolicyDocument": "{}",
+    })
+    body = (
+        "Action=AssumeRole&Version=2011-06-15"
+        "&RoleArn=arn%3Aaws%3Aiam%3A%3A999999999999%3Arole%2FTrap"
+        "&RoleSessionName=probe"
+    ).encode()
+    status, _headers, payload = asyncio.run(sts_mod.handle_request(
+        "POST", "/", {"content-type": "application/x-www-form-urlencoded"},
+        body, {},
+    ))
+    assert status == 403
+    assert b"AccessDenied" in payload
+    iam_svc._roles.pop_scoped("111111111111", None, "Trap", None)
