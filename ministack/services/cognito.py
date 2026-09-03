@@ -35,6 +35,7 @@ Identity Pools operations:
   ListIdentityPools, UpdateIdentityPool,
   GetId, GetCredentialsForIdentity, GetOpenIdToken,
   SetIdentityPoolRoles, GetIdentityPoolRoles,
+  SetPrincipalTagAttributeMap, GetPrincipalTagAttributeMap,
   ListIdentities, DescribeIdentity, MergeDeveloperIdentities,
   UnlinkDeveloperIdentity, UnlinkIdentity,
   TagResource, UntagResource, ListTagsForResource.
@@ -471,6 +472,7 @@ _identity_pools = AccountRegionScopedDict()
 #   OpenIdConnectProviderARNs, CognitoIdentityProviders,
 #   SamlProviderARNs, IdentityPoolTags,
 #   _roles: {authenticated: arn, unauthenticated: arn},
+#   _principal_tags: {provider_name -> {UseDefaults, PrincipalTags}},
 #   _identities: {identity_id -> identity_dict},
 # }
 
@@ -2190,6 +2192,8 @@ async def _dispatch_identity(action: str, data: dict):
         "GetOpenIdToken": _get_open_id_token,
         "SetIdentityPoolRoles": _set_identity_pool_roles,
         "GetIdentityPoolRoles": _get_identity_pool_roles,
+        "SetPrincipalTagAttributeMap": _set_principal_tag_attribute_map,
+        "GetPrincipalTagAttributeMap": _get_principal_tag_attribute_map,
         "ListIdentities": _list_identities,
         "DescribeIdentity": _describe_identity,
         "MergeDeveloperIdentities": _merge_developer_identities,
@@ -6332,6 +6336,7 @@ def _create_identity_pool(data):
         "SamlProviderARNs": data.get("SamlProviderARNs", []),
         "IdentityPoolTags": data.get("IdentityPoolTags", {}),
         "_roles": {},
+        "_principal_tags": {},
         "_identities": {},
     }
     _identity_pools[iid] = pool
@@ -6448,6 +6453,63 @@ def _get_identity_pool_roles(data):
         "Roles": pool.get("_roles", {}),
         "RoleMappings": {},
     })
+
+
+def _principal_tag_target(data):
+    """Resolve the (IdentityPoolId, IdentityProviderName) pair both principal-tag
+    operations require. Returns (pool, provider_name, error_response)."""
+    iid = data.get("IdentityPoolId")
+    pool = _identity_pools.get(iid)
+    if not pool:
+        return None, "", error_response_json(
+            "ResourceNotFoundException", f"Identity pool {iid} not found.", 400)
+    provider = data.get("IdentityProviderName")
+    if not provider:
+        return None, "", error_response_json(
+            "InvalidParameterException", "IdentityProviderName is required.", 400)
+    return pool, provider, None
+
+
+def _principal_tag_out(iid, provider, mapping):
+    return {
+        "IdentityPoolId": iid,
+        "IdentityProviderName": provider,
+        "UseDefaults": mapping["UseDefaults"],
+        "PrincipalTags": mapping["PrincipalTags"],
+    }
+
+
+def _set_principal_tag_attribute_map(data):
+    pool, provider, err = _principal_tag_target(data)
+    if err:
+        return err
+    # Both members are optional and are stored exactly as sent. UseDefaults
+    # selects the per-provider default claim-to-tag mapping (`sub` and `aud`
+    # for a user pool IdP), which AWS applies when it vends credentials rather
+    # than materializing into PrincipalTags — so no default map is fabricated
+    # here. AWS accepts both members together: terraform-provider-aws sends
+    # UseDefaults with an empty PrincipalTags on every destroy.
+    mapping = {
+        "UseDefaults": data.get("UseDefaults", False),
+        "PrincipalTags": data.get("PrincipalTags", {}),
+    }
+    pool.setdefault("_principal_tags", {})[provider] = mapping
+    return json_response(_principal_tag_out(pool["IdentityPoolId"], provider, mapping))
+
+
+def _get_principal_tag_attribute_map(data):
+    pool, provider, err = _principal_tag_target(data)
+    if err:
+        return err
+    mapping = pool.get("_principal_tags", {}).get(provider)
+    if not mapping:
+        # A provider nobody has configured is not readable: AWS answers
+        # ResourceNotFoundException with this message rather than describing an
+        # empty mapping (verified against cognito-identity in ap-southeast-2).
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"No Principal Tags configured for Provider {provider}", 400)
+    return json_response(_principal_tag_out(pool["IdentityPoolId"], provider, mapping))
 
 
 def _list_identities(data):

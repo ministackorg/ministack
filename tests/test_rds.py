@@ -8773,7 +8773,7 @@ def test_rds_mysql_replication_restore_resets_once_then_is_idempotent(monkeypatc
         def close(self):
             pass
 
-    monkeypatch.setattr(m, "_ensure_mysql_replication_user", lambda _cluster: True)
+    monkeypatch.setattr(m, "_ensure_mysql_replication_user", lambda *_a, **_k: True)
     monkeypatch.setattr(
         m,
         "_mysql_replication_connection",
@@ -8838,7 +8838,7 @@ def test_rds_mysql_replication_writer_sweep_closes_reverse_readiness_race(
         def close(self):
             pass
 
-    monkeypatch.setattr(m, "_ensure_mysql_replication_user", lambda _cluster: True)
+    monkeypatch.setattr(m, "_ensure_mysql_replication_user", lambda *_a, **_k: True)
     monkeypatch.setattr(
         m,
         "_mysql_replication_connection",
@@ -8897,7 +8897,7 @@ def test_rds_mysql_replication_failure_is_retryable_and_closes_connections(
         def close(self):
             closed.append("connection")
 
-    monkeypatch.setattr(m, "_ensure_mysql_replication_user", lambda _cluster: True)
+    monkeypatch.setattr(m, "_ensure_mysql_replication_user", lambda *_a, **_k: True)
     monkeypatch.setattr(m, "_mysql_replication_connection", lambda _cluster: FakeConnection())
     monkeypatch.setattr(
         m,
@@ -9497,6 +9497,63 @@ def test_rds_mysql_replication_channel_reset_is_role_independent_and_keeps_fence
 
 
 @pytest.mark.parametrize(
+    ("clear_super_read_only", "expected_statements"),
+    [
+        (True, ["SHOW REPLICA STATUS", "SET GLOBAL super_read_only=OFF"]),
+        (False, ["SHOW REPLICA STATUS"]),
+    ],
+)
+def test_rds_mysql_replication_channel_reset_allows_missing_channel(
+    monkeypatch,
+    clear_super_read_only,
+    expected_statements,
+):
+    from ministack.services import rds as m
+
+    writer, _secondary, _writer_member, _secondary_member, _global = (
+        _mysql_replication_unit_topology()
+    )
+    writer["_shared_storage_initialized"] = True
+    statements = []
+    closed = []
+
+    class FakeCursor:
+        def execute(self, statement, params=None):
+            statements.append((statement, params))
+
+        def fetchone(self):
+            return None
+
+        def close(self):
+            closed.append("cursor")
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            closed.append("connection")
+
+    monkeypatch.setattr(m, "_ensure_mysql_control_user", lambda _cluster: True)
+    monkeypatch.setattr(
+        m,
+        "_mysql_replication_connection",
+        lambda cluster: FakeConnection() if cluster is writer else None,
+    )
+
+    assert m._reset_mysql_replication_channel(
+        "primary",
+        writer,
+        clear_super_read_only=clear_super_read_only,
+        allow_missing_channel=True,
+    ) is True
+
+    assert [statement for statement, _params in statements] == expected_statements
+    assert writer["_mysql_replication_detach_state"] == "reset"
+    assert closed == ["cursor", "connection"]
+
+
+@pytest.mark.parametrize(
     "failed_statement",
     [
         "START REPLICA",
@@ -9668,7 +9725,7 @@ def test_rds_mysql_replication_detach_failure_rolls_channel_back_atomically(
         def close(self):
             pass
 
-    monkeypatch.setattr(m, "_ensure_mysql_replication_user", lambda _cluster: True)
+    monkeypatch.setattr(m, "_ensure_mysql_replication_user", lambda *_a, **_k: True)
     monkeypatch.setattr(m, "_mysql_replication_connection", lambda _cluster: FakeConnection())
 
     assert m._detach_mysql_replication("secondary", secondary) is False
@@ -9725,7 +9782,7 @@ def test_rds_mysql_replication_detach_partial_rollback_retries_from_requested(
         def close(self):
             pass
 
-    monkeypatch.setattr(m, "_ensure_mysql_replication_user", lambda _cluster: True)
+    monkeypatch.setattr(m, "_ensure_mysql_replication_user", lambda *_a, **_k: True)
     monkeypatch.setattr(m, "_mysql_replication_connection", lambda _cluster: FakeConnection())
 
     assert m._detach_mysql_replication("secondary", secondary) is False
@@ -10005,6 +10062,7 @@ def test_rds_mysql_control_user_is_local_and_used_for_replica_sql(monkeypatch):
     cluster = {
         "DBClusterIdentifier": "secondary",
         "_mysql_control_user_ready": True,
+        "_mysql_replication_status_grant_ready": True,
     }
     events = []
     connection_args = []
@@ -10025,7 +10083,7 @@ def test_rds_mysql_control_user_is_local_and_used_for_replica_sql(monkeypatch):
             "CREATE USER IF NOT EXISTS %s@'%%' "
             "IDENTIFIED WITH mysql_native_password BY %s"
         ),
-        "GRANT PROCESS, RELOAD ON *.* TO %s@'%%'",
+        "GRANT PROCESS, RELOAD, REPLICATION CLIENT ON *.* TO %s@'%%'",
         (
             "GRANT CONNECTION_ADMIN, REPLICATION_SLAVE_ADMIN, "
             "SYSTEM_VARIABLES_ADMIN, XA_RECOVER_ADMIN ON *.* TO %s@'%%'"
@@ -10033,12 +10091,18 @@ def test_rds_mysql_control_user_is_local_and_used_for_replica_sql(monkeypatch):
         "FLUSH PRIVILEGES",
     ]
     assert statements[2][1] == statements[3][1] == (m._MYSQL_CONTROL_USER,)
+    assert cluster["_mysql_replication_status_grant_ready"] is True
     assert cluster["_mysql_writer_quiescence_grants_ready"] is True
     assert m._ensure_mysql_control_user(cluster) is True
     assert m._ensure_mysql_control_user(
         cluster, require_quiescence_grants=True,
     ) is True
     assert len(events) == grant_count
+
+    cluster.pop("_mysql_replication_status_grant_ready")
+    assert m._ensure_mysql_control_user(cluster) is True
+    assert len(events) == grant_count * 2
+    assert cluster["_mysql_replication_status_grant_ready"] is True
 
     monkeypatch.setattr(
         m,
@@ -10078,7 +10142,9 @@ def _mysql_test_connection(events, rows=(), failure=None):
 
     class FakeConnection:
         def cursor(self):
-            return FakeCursor()
+            cursor = FakeCursor()
+            cursor.connection = self
+            return cursor
 
         def close(self):
             events.append("connection.close")
@@ -10132,6 +10198,16 @@ def test_rds_mysql_writer_fence_keeps_caller_connection(monkeypatch, failure, ex
     assert "connection.close" not in events
 
 
+def test_rds_mysql_writer_fence_recomputes_shared_deadline(monkeypatch):
+    from ministack.services import rds as m
+
+    conn = _mysql_test_connection([])
+    monkeypatch.setattr(m.time, "monotonic", lambda: 104.0)
+
+    assert m._set_mysql_writer_fence(conn, deadline=110.0) is True
+    assert conn._read_timeout == conn._write_timeout == 6.0
+
+
 @pytest.mark.parametrize(
     ("readback", "expected"),
     [
@@ -10182,13 +10258,17 @@ def test_rds_mysql_control_query_uses_remaining_deadline(
 ):
     from ministack.services import rds as m
 
-    now = iter([100.0, 111.0 if elapsed else 100.0, 111.0 if elapsed else 100.0])
+    after = 111.0 if elapsed else 104.0
+    now = iter([100.0, after, after, after])
     events = []
     timeouts = []
+    connections = []
 
     def connect(**kwargs):
         timeouts.append(kwargs)
-        return _mysql_test_connection(events, rows=((1,),))
+        connection = _mysql_test_connection(events, rows=((1,),))
+        connections.append(connection)
+        return connection
 
     monkeypatch.setattr(m.time, "monotonic", lambda: next(now))
     monkeypatch.setitem(
@@ -10206,6 +10286,9 @@ def test_rds_mysql_control_query_uses_remaining_deadline(
         "read_timeout": 10.0,
         "write_timeout": 10.0,
     }]
+    if not elapsed:
+        assert connections[0]._read_timeout == 6.0
+        assert connections[0]._write_timeout == 6.0
     assert events[-2:] == ["cursor.close", "connection.close"]
 
 
@@ -10318,6 +10401,29 @@ def test_rds_mysql_quiescence_orders_normal_xa_normal_before_gtid(monkeypatch):
     ]
 
 
+def test_rds_mysql_quiescence_preserves_shared_deadline(monkeypatch):
+    from ministack.services import rds as m
+
+    deadlines = []
+    normal = iter([(), ()])
+
+    def result(value):
+        return lambda _cluster, *, deadline=None: (
+            deadlines.append(deadline) or (next(value) if hasattr(value, "__next__") else value)
+        )
+
+    _patch_mysql_quiescence(
+        monkeypatch, m,
+        fence=result(True), normal=result(normal), xa=result(True),
+        gtid=result("source:1-7"),
+    )
+
+    assert m._wait_for_mysql_writer_quiescence(
+        {}, 30, deadline=130.0,
+    ) == "source:1-7"
+    assert deadlines == [130.0] * 7
+
+
 @pytest.mark.parametrize(("normal_results", "xa_result"), [
     ((None,), True), (((), None), True), (((), ()), None),
 ])
@@ -10422,6 +10528,330 @@ def test_rds_mysql_quiescence_epoch_change_suppresses_result(monkeypatch):
         monkeypatch, m, fence=True, normal=(), xa=True, gtid=capture,
     )
     assert m._wait_for_mysql_writer_quiescence(cluster, 1) is None
+
+
+def _mysql_switchover_unit_topology(monkeypatch, m):
+    topology = _mysql_replication_unit_topology()
+    writer, target, writer_member, target_member, global_cluster = topology
+    for index, cluster in enumerate((writer, target), start=1):
+        cluster.update({
+            "_shared_storage_initialized": True,
+            "_shared_container_id": f"container-{index}",
+            "_shared_container_epoch": index,
+            "Status": "available",
+            "DBClusterMembers": [{"DBInstanceIdentifier": f"instance-{index}"}],
+        })
+    target["_mysql_replication_source_arn"] = writer["DBClusterArn"]
+    global_cluster.update({
+        "Engine": "aurora-mysql",
+        "EngineVersion": writer["EngineVersion"],
+        "GlobalClusterArn": "arn:aws:rds::111111111111:global-cluster:global-repl",
+        "GlobalClusterResourceId": "cluster-globalrepl",
+        "Status": "available",
+    })
+    clusters = {
+        value: cluster
+        for cluster in (writer, target)
+        for value in (cluster["DBClusterIdentifier"], cluster["DBClusterArn"])
+    }
+    _patch_mysql_replication_unit_topology(monkeypatch, m, topology)
+    monkeypatch.setattr(
+        m, "_resolve_global_cluster",
+        lambda identifier: global_cluster if identifier == "global-repl" else None,
+    )
+    monkeypatch.setattr(m, "_resolve_cluster", clusters.get)
+    monkeypatch.setattr(m, "_resolve_cluster_in_request_region", clusters.get)
+    monkeypatch.setattr(
+        m, "_cluster_member_instances",
+        lambda cluster: [{
+            "DBInstanceIdentifier": cluster["DBClusterMembers"][0]["DBInstanceIdentifier"],
+            "DBInstanceStatus": "available",
+        }] if cluster.get("DBClusterMembers") else [],
+    )
+    monkeypatch.setattr(m, "_mysql_global_writer_switch_owners", {})
+    return topology
+
+
+def _mysql_switchover_params(target="secondary"):
+    return {
+        "GlobalClusterIdentifier": "global-repl",
+        "TargetDbClusterIdentifier": target,
+    }
+
+
+def test_rds_mysql_gtid_wait_recomputes_shared_deadline(monkeypatch):
+    from ministack.services import rds as m
+
+    now = [100.0]
+    observed = {}
+    monkeypatch.setattr(m.time, "monotonic", lambda: now[0])
+
+    class Cursor:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def execute(self, statement, params):
+            observed["sql"] = (statement, params)
+
+        def fetchone(self):
+            return (0,)
+
+        def close(self):
+            pass
+
+    class Connection:
+        def cursor(self):
+            now[0] += 4
+            return Cursor(self)
+
+        def close(self):
+            pass
+
+    def connect(_cluster, *, timeout):
+        observed["connect_timeout"] = timeout
+        return Connection()
+
+    monkeypatch.setattr(m, "_mysql_replication_connection", connect)
+
+    assert m._wait_for_mysql_gtid(
+        {"DBClusterIdentifier": "secondary"}, "source:1-9", 30,
+        deadline=130.0,
+    ) is True
+    assert observed["connect_timeout"] == 30.0
+    assert observed["sql"][1] == ("source:1-9", 26.0)
+
+
+@pytest.mark.parametrize("mutation", ["password", "topology"])
+def test_rds_active_switchover_rejects_mutation(monkeypatch, mutation):
+    from ministack.services import rds as m
+
+    writer, target, writer_member, target_member, global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    with m._shared_container_lock:
+        owner = m._claim_mysql_global_writer_switch(global_cluster, writer, target)
+    if mutation == "password":
+        result = m._modify_db_cluster({
+            "DBClusterIdentifier": "primary",
+            "MasterUserPassword": "changed-password",
+        })
+    elif mutation == "topology":
+        result = m._remove_from_global_cluster({
+            "GlobalClusterIdentifier": "global-repl",
+            "DbClusterIdentifier": "secondary",
+        })
+    else:
+        result = m._failover_global_cluster({
+            "GlobalClusterIdentifier": "global-repl",
+            "TargetDbClusterIdentifier": "secondary",
+            "AllowDataLoss": "true",
+        })
+
+    assert result[0] == 400
+    assert m._active_mysql_global_writer_switch(global_cluster) is owner
+    assert writer_member["IsWriter"] is True
+    assert target_member["IsWriter"] is False
+    assert writer.get("_MasterUserPassword") != "changed-password"
+    assert target["GlobalClusterIdentifier"] == "global-repl"
+    assert target["_mysql_replication_source_arn"] == writer["DBClusterArn"]
+
+
+@pytest.mark.parametrize(
+    ("handler_name", "impl_name"),
+    [
+        ("_create_db_instance", "_create_db_instance_impl"),
+        ("_delete_db_instance", "_delete_db_instance_impl"),
+    ],
+)
+def test_rds_instance_mutation_prevents_switchover_claim(
+    monkeypatch,
+    handler_name,
+    impl_name,
+):
+    from ministack.services import rds as m
+
+    writer, target, _writer_member, _target_member, global_cluster = (
+        _mysql_switchover_unit_topology(monkeypatch, m)
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    claimed = threading.Event()
+    order = []
+
+    def mutation_impl(_params):
+        entered.set()
+        assert release.wait(timeout=1)
+        order.append("mutation")
+        return "mutated"
+
+    monkeypatch.setattr(m, impl_name, mutation_impl)
+    if handler_name == "_create_db_instance":
+        params = {"DBClusterIdentifier": "primary"}
+    else:
+        m._instances["mutating-instance"] = {
+            "DBInstanceIdentifier": "mutating-instance",
+            "DBClusterIdentifier": "primary",
+        }
+        params = {"DBInstanceIdentifier": "mutating-instance"}
+    mutation = threading.Thread(target=getattr(m, handler_name), args=(params,))
+    mutation.start()
+    assert entered.wait(timeout=1)
+
+    def claim():
+        with m._shared_container_lock:
+            owner = m._claim_mysql_global_writer_switch(
+                global_cluster, writer, target,
+            )
+            order.append(("claim", owner))
+            claimed.set()
+
+    claimant = threading.Thread(target=claim)
+    claimant.start()
+    assert claimed.wait(timeout=1)
+    assert order == [("claim", None)]
+    release.set()
+    mutation.join(timeout=1)
+    claimant.join(timeout=1)
+
+    assert not mutation.is_alive() and not claimant.is_alive()
+    assert order == [("claim", None), "mutation"]
+    with m._shared_container_lock:
+        assert m._claim_mysql_global_writer_switch(
+            global_cluster, writer, target,
+        ) is not None
+
+
+def test_rds_mysql_gtid_wait_and_write_enable_use_exact_sql(monkeypatch):
+    from ministack.services import rds as m
+
+    events = []
+    rows = iter([(0,), (0, 0)])
+
+    class Cursor:
+        def execute(self, statement, params=None):
+            events.append((statement, params))
+
+        def fetchone(self):
+            return next(rows)
+
+        def close(self):
+            events.append("cursor-close")
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+        def close(self):
+            events.append("connection-close")
+
+    monkeypatch.setattr(m, "_mysql_replication_connection", lambda *_a, **_k: Connection())
+    cluster = {"DBClusterIdentifier": "secondary"}
+    assert m._wait_for_mysql_gtid(cluster, "source:1-9", 10) is True
+    assert m._set_mysql_cluster_writable(cluster) is True
+    assert events == [
+        ("SELECT WAIT_FOR_EXECUTED_GTID_SET(%s, %s)", ("source:1-9", 10.0)),
+        "cursor-close", "connection-close",
+        ("SET GLOBAL super_read_only=OFF", None),
+        ("SET GLOBAL read_only=OFF", None),
+        ("SELECT @@GLOBAL.read_only, @@GLOBAL.super_read_only", None),
+        "cursor-close", "connection-close",
+    ]
+
+
+def test_rds_mysql_write_enable_refences_partial_failure(monkeypatch):
+    from ministack.services import rds as m
+
+    statements = []
+
+    class Cursor:
+        def execute(self, statement, _params=None):
+            statements.append(statement)
+            if statement == "SET GLOBAL read_only=OFF":
+                raise RuntimeError("read-only write failed")
+
+        def close(self):
+            pass
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(m, "_mysql_replication_connection", lambda *_a, **_k: Connection())
+
+    assert m._set_mysql_cluster_writable({"DBClusterIdentifier": "target"}) is False
+    assert statements == [
+        "SET GLOBAL super_read_only=OFF",
+        "SET GLOBAL read_only=OFF",
+        "SET GLOBAL super_read_only=ON",
+    ]
+
+
+def test_rds_mysql_write_enable_refences_lost_disable_acknowledgment(monkeypatch):
+    from ministack.services import rds as m
+
+    statements = []
+    server_state = {"super_read_only": True}
+
+    class Cursor:
+        def execute(self, statement, _params=None):
+            statements.append(statement)
+            if statement == "SET GLOBAL super_read_only=OFF":
+                server_state["super_read_only"] = False
+                raise RuntimeError("write applied but acknowledgment was lost")
+            if statement == "SET GLOBAL super_read_only=ON":
+                server_state["super_read_only"] = True
+
+        def close(self):
+            pass
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(m, "_mysql_replication_connection", lambda *_a, **_k: Connection())
+
+    assert m._set_mysql_cluster_writable({"DBClusterIdentifier": "target"}) is False
+    assert statements == [
+        "SET GLOBAL super_read_only=OFF",
+        "SET GLOBAL super_read_only=ON",
+    ]
+    assert server_state["super_read_only"] is True
+
+
+@pytest.mark.parametrize("close_failure", ["cursor", "connection"])
+def test_rds_mysql_verified_write_enable_survives_cleanup_failure(
+    monkeypatch,
+    close_failure,
+):
+    from ministack.services import rds as m
+
+    class Cursor:
+        def execute(self, _statement, _params=None):
+            pass
+
+        def fetchone(self):
+            return (0, 0)
+
+        def close(self):
+            if close_failure == "cursor":
+                raise RuntimeError("cursor close failed")
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+        def close(self):
+            if close_failure == "connection":
+                raise RuntimeError("connection close failed")
+
+    monkeypatch.setattr(m, "_mysql_replication_connection", lambda *_a, **_k: Connection())
+    assert m._set_mysql_cluster_writable({"DBClusterIdentifier": "target"}) is True
 
 
 def _wait_for_replica_status(endpoint, timeout=120):
