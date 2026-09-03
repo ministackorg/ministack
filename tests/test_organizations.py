@@ -205,3 +205,13 @@ def test_organizations_tags_are_account_scoped():
         assert tags == {"owner": "a"}
     finally:
         a.delete_organizational_unit(OrganizationalUnitId=ou_a["Id"])
+
+
+def test_organizations_list_responses_omit_empty_next_token(orgs):
+    """Empty NextToken is omitted (null breaks non-boto pagination clients)."""
+    orgs.describe_organization()
+    assert "NextToken" not in orgs.list_roots()
+    assert "NextToken" not in orgs.list_accounts()
+    root_id = orgs.list_roots()["Roots"][0]["Id"]
+    assert "NextToken" not in orgs.list_organizational_units_for_parent(ParentId=root_id)
+    assert "NextToken" not in orgs.list_accounts_for_parent(ParentId=root_id)

@@ -405,3 +405,17 @@ def test_msk_clusters_isolated_by_region():
     assert "east-only" not in west_names
     assert "west-only" in west_names
     assert "west-only" not in east_names
+
+
+def test_msk_list_responses_omit_empty_next_token():
+    """Empty NextToken must be omitted, not emitted as null — a literal null
+    reads as a real token to Go/Java SDK pagination and Terraform sees drift."""
+    kafka = _kafka()
+    arn = _create_basic_cluster("mst-no-token")["ClusterArn"]
+    try:
+        assert "NextToken" not in kafka.list_clusters()
+        assert "NextToken" not in kafka.list_nodes(ClusterArn=arn)
+        assert "NextToken" not in kafka.list_configurations()
+        assert "NextToken" not in kafka.list_scram_secrets(ClusterArn=arn)
+    finally:
+        kafka.delete_cluster(ClusterArn=arn)

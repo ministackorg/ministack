@@ -88,7 +88,7 @@ _pitr_settings = AccountRegionScopedDict()
 _kinesis_destinations = AccountRegionScopedDict()
 # Contributor Insights — key is "TableName" or "TableName/index/IndexName".
 # Value: {"ContributorInsightsStatus": "ENABLED"|"DISABLED",
-#         "LastUpdateDateTime": float epoch, "ContributorInsightsRuleList": [str, ...]}.
+#         "LastUpdateDateTime": int epoch, "ContributorInsightsRuleList": [str, ...]}.
 _backups = AccountRegionScopedDict()  # BackupArn -> BackupDescription dict
 _contributor_insights = AccountRegionScopedDict()
 # Resource-based policies — ResourceArn -> {"Policy": str, "RevisionId": str}.
@@ -4222,7 +4222,7 @@ def _update_contributor_insights(data):
     new_status = "ENABLING" if action == "ENABLE" else "DISABLING"
     _contributor_insights[key] = {
         "ContributorInsightsStatus": new_status,
-        "LastUpdateDateTime": time.time(),
+        "LastUpdateDateTime": int(time.time()),
         "ContributorInsightsRuleList": [],
     }
     resp = {
@@ -4261,11 +4261,11 @@ def _describe_contributor_insights(data):
         if cur == "ENABLING":
             cur = "ENABLED"
             entry["ContributorInsightsStatus"] = "ENABLED"
-            entry["LastUpdateDateTime"] = time.time()
+            entry["LastUpdateDateTime"] = int(time.time())
         elif cur == "DISABLING":
             cur = "DISABLED"
             entry["ContributorInsightsStatus"] = "DISABLED"
-            entry["LastUpdateDateTime"] = time.time()
+            entry["LastUpdateDateTime"] = int(time.time())
         status = cur
         last_update = entry.get("LastUpdateDateTime")
         rules = list(entry.get("ContributorInsightsRuleList") or [])

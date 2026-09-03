@@ -1112,7 +1112,12 @@ def _fanout_to_subscription_filters(group_name, stream_name, events):
             from ministack.services import lambda_svc
             rec = lambda_svc._functions.get(fn)
             if rec:
-                threading.Thread(target=lambda_svc._execute_function,
+                # Scope the invoke from the function's own config: a bare
+                # thread has an empty context, so plain _execute_function would
+                # run the subscriber (and its side effects — own log group,
+                # downstream calls) under the default account for any
+                # non-default tenant.
+                threading.Thread(target=lambda_svc._execute_function_with_config_scope,
                                  args=(rec, awslogs_event), daemon=True).start()
             else:
                 logger.warning("subscription filter %s: destination Lambda %s not found",

@@ -1776,3 +1776,79 @@ def test_logs_delivery_source_tag_round_trip(logs):
     logs.untag_resource(resourceArn=arn, tagKeys=["env"])
     assert logs.list_tags_for_resource(resourceArn=arn)["tags"] == {"team": "events"}
     logs.delete_delivery_source(name=src_name)
+
+
+def test_logs_subscription_filter_delivers_for_non_default_account():
+    """Subscription-filter → Lambda delivery under a 12-digit-key tenant.
+
+    Guards the account-scoped path end-to-end: the destination function is
+    resolved in the caller's account and invoked via the config-scope wrapper
+    (a bare-thread invoke would otherwise run the subscriber's bookkeeping
+    under the default account)."""
+    import io
+    import zipfile
+
+    account = "271828182845"
+
+    def _acct(service):
+        return boto3.client(
+            service,
+            endpoint_url=_endpoint,
+            region_name="us-east-1",
+            aws_access_key_id=account,
+            aws_secret_access_key="test",
+            config=Config(retries={"mode": "standard"}),
+        )
+
+    logs_c = _acct("logs")
+    lam_c = _acct("lambda")
+    sqs_c = _acct("sqs")
+    suffix = _uuid_mod.uuid4().hex[:8]
+
+    qname = f"subfilter-xacct-signal-{suffix}"
+    q_url = sqs_c.create_queue(QueueName=qname)["QueueUrl"]
+
+    fn = f"subfilter-xacct-{suffix}"
+    code = (
+        "import os, boto3\n"
+        f"QNAME = {qname!r}\n"
+        "def handler(event, context):\n"
+        "    sqs = boto3.client('sqs', endpoint_url=os.environ['AWS_ENDPOINT_URL'])\n"
+        "    url = sqs.get_queue_url(QueueName=QNAME)['QueueUrl']\n"
+        "    sqs.send_message(QueueUrl=url, MessageBody='delivered')\n"
+        "    return {'ok': True}\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam_c.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role=f"arn:aws:iam::{account}:role/lambda-role",
+        Handler="index.handler",
+        Timeout=30,
+        Code={"ZipFile": buf.getvalue()},
+    )
+    func_arn = f"arn:aws:lambda:us-east-1:{account}:function:{fn}"
+
+    group = f"/intg/subfilter-xacct/{suffix}"
+    logs_c.create_log_group(logGroupName=group)
+    logs_c.create_log_stream(logGroupName=group, logStreamName="s1")
+    logs_c.put_subscription_filter(
+        logGroupName=group,
+        filterName="xacct-filter",
+        filterPattern="ERROR",
+        destinationArn=func_arn,
+    )
+    logs_c.put_log_events(
+        logGroupName=group,
+        logStreamName="s1",
+        logEvents=[{"timestamp": int(time.time() * 1000), "message": "ERROR boom"}],
+    )
+
+    deadline = time.time() + 30
+    got = []
+    while time.time() < deadline and not got:
+        msgs = sqs_c.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=2)
+        got = msgs.get("Messages", [])
+    assert got, "subscription-filter → Lambda delivery never arrived for a non-default account"

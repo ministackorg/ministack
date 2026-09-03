@@ -2402,7 +2402,7 @@ def _ddb_scan(table, table_name, args, sub_fields):
                 filtered.append(item)
         items = filtered
 
-    return {"items": items, "nextToken": None}
+    return {"items": items}
 
 
 def _ddb_put_item(table, table_name, args):

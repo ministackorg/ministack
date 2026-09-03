@@ -89,3 +89,10 @@ def test_waf_v1_module_exposes_no_op_reset():
     from ministack.services import waf_v1
     assert callable(getattr(waf_v1, "reset", None))
     waf_v1.reset()
+
+
+def test_waf_v1_list_responses_omit_empty_next_marker(waf_classic):
+    """Empty NextMarker is omitted from the v1 stub's list responses."""
+    assert "NextMarker" not in waf_classic.list_web_acls()
+    assert "NextMarker" not in waf_classic.list_tags_for_resource(
+        ResourceARN="arn:aws:waf::000000000000:webacl/none")

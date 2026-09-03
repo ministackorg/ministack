@@ -18,6 +18,7 @@ FIFO topics: .fifo naming validation, MessageGroupId/MessageDeduplicationId enfo
 """
 
 import asyncio
+import contextvars
 import copy
 import hashlib
 import json
@@ -970,9 +971,15 @@ def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
             # subscriber's execution. Deliver on a background thread, mirroring
             # the http(s) path above; a slow or failing subscriber Lambda no
             # longer stalls the Publish call (or its upstream caller).
+            # The publisher's account/region contextvars must travel into the
+            # thread: _get_func_record_for_ref rejects an ARN whose account
+            # differs from get_account_id(), and a fresh thread's empty context
+            # reads back the default account — dropping every delivery for a
+            # non-default tenant.
+            _sns_ctx = contextvars.copy_context()
             _threading.Thread(
-                target=_deliver_to_lambda,
-                args=(endpoint, envelope, topic_arn, sub["arn"], msg_id, effective_message, message_attributes or {}),
+                target=_sns_ctx.run,
+                args=(_deliver_to_lambda, endpoint, envelope, topic_arn, sub["arn"], msg_id, effective_message, message_attributes or {}),
                 daemon=True,
             ).start()
         elif protocol == "email" or protocol == "email-json":

@@ -1105,7 +1105,6 @@ def _list_async_invokes(query_params) -> tuple:
             continue
         summaries.append(rec)
     return 200, {"Content-Type": "application/json"}, json.dumps({
-        "nextToken": None,
         "asyncInvokeSummaries": summaries,
     }).encode()
 

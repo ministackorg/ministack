@@ -1831,3 +1831,22 @@ def test_elasticache_delete_during_deferred_start_leaves_no_container(fake_docke
     assert fake_docker.live() == [], (
         f"leaked container(s) {fake_docker.live()} — running, and no API call can reach them"
     )
+
+
+def test_elasticache_cluster_create_time_present_and_parsed(ec):
+    """DescribeCacheClusters emits CacheClusterCreateTime as an ISO8601 TStamp
+    (it was stored as a float epoch and previously absent from the XML)."""
+    import datetime
+
+    ec.create_cache_cluster(
+        CacheClusterId="cluster-createtime",
+        Engine="redis",
+        CacheNodeType="cache.t3.micro",
+        NumCacheNodes=1,
+    )
+    try:
+        cluster = ec.describe_cache_clusters(
+            CacheClusterId="cluster-createtime")["CacheClusters"][0]
+        assert isinstance(cluster.get("CacheClusterCreateTime"), datetime.datetime)
+    finally:
+        ec.delete_cache_cluster(CacheClusterId="cluster-createtime")

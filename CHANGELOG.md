@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **EC2 — the seeded AMIs carry their real AWS owners, so `Owners=["amazon"]` finds them** — 1.5.0 started honouring `DescribeImages`' `Owners` parameter but left every seeded image owned by the calling account, so an AMI lookup with owner `amazon` (Terraform's `aws_ami` data source) matched nothing. The stub images now report their real publishing accounts — `137112412989` (Amazon Linux) and `801119661308` (Windows) with `ImageOwnerAlias: amazon`, `099720109477` (Canonical) without — the `owner-alias` filter is evaluated, and `Owners=["self"]` selects only the caller's registered images, all exactly as on AWS. Reported by @rozchrom.
+
 ## [1.5.6] — 2026-09-02
 
 ### Added

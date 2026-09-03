@@ -545,7 +545,6 @@ def handle_checkpoint(arn_path: str, body: bytes) -> tuple:
     return json_response({
         "CheckpointToken": new_token,
         "NewExecutionState": {
-            "NextMarker": "",
             "Operations": _serialize_operations(rec["Operations"]),
         },
     })

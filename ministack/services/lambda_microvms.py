@@ -206,7 +206,7 @@ def _list_microvms(query_params):
         if version_filter and record.get("imageVersion") != version_filter:
             continue
         items.append(_microvm_item(record))
-    return json_response({"items": items, "nextToken": None})
+    return json_response({"items": items})
 
 
 def _suspend_microvm(microvm_id):

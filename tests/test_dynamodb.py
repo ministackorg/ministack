@@ -7085,3 +7085,29 @@ def test_unicode_dynamodb_item(ddb):
     ddb.put_item(TableName=table, Item=item)
     resp = ddb.get_item(TableName=table, Key={"pk": {"S": "ключ"}})
     assert resp["Item"]["value"]["S"] == "значение 日本語 مرحبا"
+
+
+def test_contributor_insights_last_update_is_int_epoch(ddb):
+    """LastUpdateDateTime rides the wire as an int epoch (project convention;
+    a float breaks Java SDK v2 timestamp parsing). Raw HTTP because boto3
+    converts either form to datetime and hides the difference."""
+    table = "ci-int-epoch"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    try:
+        code, _ = _raw_ddb("UpdateContributorInsights", {
+            "TableName": table,
+            "ContributorInsightsAction": "ENABLE",
+        })
+        assert code == 200
+        code, body = _raw_ddb("DescribeContributorInsights", {"TableName": table})
+        assert code == 200
+        lud = body.get("LastUpdateDateTime")
+        if lud is not None:
+            assert isinstance(lud, int), f"expected int epoch, got {type(lud).__name__}: {lud}"
+    finally:
+        ddb.delete_table(TableName=table)

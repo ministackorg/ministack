@@ -272,7 +272,7 @@ def _invoke_inline_agent(session_id: str, body) -> tuple:
 def _get_agent_memory(agent_id: str, alias_id: str, query_params) -> tuple:
     key = f"{agent_id}/{alias_id}"
     memories = _agent_memories.get(key, [])
-    return _json({"MemoryContents": memories, "NextToken": None})
+    return _json({"MemoryContents": memories})
 
 
 def _delete_agent_memory(agent_id: str, alias_id: str, query_params) -> tuple:
@@ -317,7 +317,7 @@ def _retrieve(kb_id: str, body) -> tuple:
         "Location": {"Type": "S3", "S3Location": {"Uri": doc["Uri"]}},
         "Score": round(score, 4),
     } for score, doc in scored[:number_of_results]]
-    return _json({"RetrievalResults": results, "NextToken": None})
+    return _json({"RetrievalResults": results})
 
 
 def _retrieve_and_generate(body) -> tuple:
@@ -365,7 +365,7 @@ def _rerank(body) -> tuple:
     sources = body_obj.get("sources", [])
     results = [{"Index": i, "RelevanceScore": 1.0 - (i * 0.1)}
                 for i in range(len(sources))]
-    return _json({"Results": results, "NextToken": None})
+    return _json({"Results": results})
 
 
 def _generate_query(body) -> tuple:
