@@ -8011,6 +8011,112 @@ def test_lambda_durable_stop(lam):
         lam.delete_function(FunctionName=fname)
 
 
+def test_lambda_durable_invocation_completed_recorded(lam):
+    """Every handler invocation of a durable execution ends with an
+    InvocationCompleted history event (a real EventType on the model,
+    previously never emitted), carrying a RequestId and both timestamps."""
+    fname, _, rec = _create_durable_execution_directly(lam)
+    try:
+        from urllib.parse import quote
+        arn = quote(rec["DurableExecutionArn"], safe="/:$")
+        code, body = _raw_durable("GET", f"/2025-12-01/durable-executions/{arn}/history")
+        assert code == 200
+        completed = [e for e in body["Events"] if e["EventType"] == "InvocationCompleted"]
+        assert completed, [e["EventType"] for e in body["Events"]]
+        details = completed[0]["InvocationCompletedDetails"]
+        assert details["RequestId"]
+        assert details["EndTimestamp"] >= details["StartTimestamp"] - 1
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+@pytest.mark.serial
+def test_lambda_durable_execution_timeout_enforced(lam):
+    """DurableConfig.ExecutionTimeout (a real field, seconds) caps the whole
+    execution: it was stored and ignored, so a RUNNING execution could out-
+    live its cap forever. It now lands TIMED_OUT with an ExecutionTimedOut
+    event once the deadline passes. The wait below is the 1-second timeout
+    itself firing, not a contention budget."""
+    import base64 as _b64
+    fname = f"durable-timeout-{_uuid_mod.uuid4().hex[:8]}"
+    zip_b64 = _b64.b64encode(_make_zip("def handler(e,c): return {}")).decode()
+    _raw_durable("POST", "/2015-03-31/functions", body={
+        "FunctionName": fname, "Runtime": "python3.12", "Role": _LAMBDA_ROLE,
+        "Handler": "index.handler", "Code": {"ZipFile": zip_b64},
+        "DurableConfig": {"Enabled": True, "ExecutionTimeout": 1},
+    })
+    try:
+        invoke_req = urllib.request.Request(
+            f"{_ms_endpoint()}/2015-03-31/functions/{fname}/invocations",
+            method="POST", data=b"{}", headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(invoke_req) as r:
+            arn_raw = r.headers.get("X-Amz-Durable-Execution-Arn")
+            r.read()
+        from urllib.parse import quote
+        arn = quote(arn_raw, safe="/:$")
+        deadline = time.time() + 10
+        status = None
+        while time.time() < deadline:
+            code, body = _raw_durable("GET", f"/2025-12-01/durable-executions/{arn}")
+            status = body["Status"]
+            if status != "RUNNING":
+                break
+            time.sleep(0.2)
+        assert status == "TIMED_OUT", status
+        code, hist = _raw_durable("GET", f"/2025-12-01/durable-executions/{arn}/history")
+        assert any(e["EventType"] == "ExecutionTimedOut" for e in hist["Events"]), (
+            [e["EventType"] for e in hist["Events"]])
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+@pytest.mark.serial
+def test_lambda_durable_stop_reaches_inflight_chained_invoke(lam):
+    """StopDurableExecution reaches an in-flight chained invoke: the op lands
+    STOPPED with a ChainedInvokeStopped event (a real EventType, previously
+    never emitted), and the child's late result is discarded instead of
+    appending ChainedInvokeSucceeded onto a stopped execution."""
+    import base64 as _b64
+    child = f"durable-stopchild-{_uuid_mod.uuid4().hex[:8]}"
+    _raw_durable("POST", "/2015-03-31/functions", body={
+        "FunctionName": child, "Runtime": "python3.12", "Role": _LAMBDA_ROLE,
+        "Handler": "index.handler",
+        "Code": {"ZipFile": _b64.b64encode(_make_zip(
+            "import time\ndef handler(e,c):\n    time.sleep(2)\n    return {'late': True}")).decode()},
+        "Timeout": 30,
+    })
+    fname, _, rec = _create_durable_execution_directly(lam)
+    try:
+        from urllib.parse import quote
+        arn = quote(rec["DurableExecutionArn"], safe="/:$")
+        code, _b = _raw_durable("POST", f"/2025-12-01/durable-executions/{arn}/checkpoint", body={
+            "CheckpointToken": rec["CheckpointToken"],
+            "Updates": [{"Id": "chain-stop", "Type": "CHAINED_INVOKE",
+                         "Action": "START", "Name": "slow-child",
+                         "ChainedInvokeOptions": {"FunctionName": child}}],
+        })
+        assert code == 200
+        code, _b = _raw_durable("POST", f"/2025-12-01/durable-executions/{arn}/stop", body={
+            "ErrorMessage": "stopping with child in flight",
+        })
+        assert code == 200
+        code, hist = _raw_durable("GET", f"/2025-12-01/durable-executions/{arn}/history")
+        types = [e["EventType"] for e in hist["Events"]]
+        assert "ChainedInvokeStarted" in types, types
+        assert "ChainedInvokeStopped" in types, types
+        # Past the child's 2s sleep: its late result must not have been applied.
+        time.sleep(3)
+        code, hist = _raw_durable("GET", f"/2025-12-01/durable-executions/{arn}/history")
+        types = [e["EventType"] for e in hist["Events"]]
+        assert "ChainedInvokeSucceeded" not in types, types
+        code, body = _raw_durable("GET", f"/2025-12-01/durable-executions/{arn}")
+        assert body["Status"] == "STOPPED"
+    finally:
+        lam.delete_function(FunctionName=fname)
+        lam.delete_function(FunctionName=child)
+
+
 def test_lambda_durable_list_by_function(lam):
     fname, fn_arn, rec = _create_durable_execution_directly(lam)
     try:
@@ -8078,6 +8184,7 @@ def handler(event, context):
             pass
 
 
+@pytest.mark.serial
 def test_lambda_durable_chained_invoke_runs_child(lam):
     """A CHAINED_INVOKE checkpoint update with Action=START actually spawns
     the child function and records the result back into the parent's
@@ -8133,13 +8240,24 @@ def test_lambda_durable_chained_invoke_runs_child(lam):
                 }],
             })
         assert code == 200
-        # The child runs in a daemon thread; give it a moment.
+        # ChainedInvokeStarted is recorded synchronously when the checkpoint
+        # accepts the START update, so it must already be on the log — no
+        # polling, no budget.
+        code, history = _raw_durable("GET",
+            f"/2025-12-01/durable-executions/{arn_enc}/history")
+        started = [e for e in history["Events"] if e["EventType"] == "ChainedInvokeStarted"]
+        assert started, [e["EventType"] for e in history["Events"]]
+        assert started[0]["ChainedInvokeStartedDetails"]["FunctionName"] == child
+        # The child completes in a background thread; serial keeps the box
+        # quiet so the short poll is honest. Breaking on Failed keeps a real
+        # child error visible instead of reading as a timeout.
         import time as _time
         for _ in range(30):
             _time.sleep(0.1)
             code, history = _raw_durable("GET",
                 f"/2025-12-01/durable-executions/{arn_enc}/history")
-            if any(e["EventType"] == "ChainedInvokeSucceeded" for e in history.get("Events", [])):
+            if any(e["EventType"] in ("ChainedInvokeSucceeded", "ChainedInvokeFailed")
+                   for e in history.get("Events", [])):
                 break
         events = history["Events"]
         assert any(e["EventType"] == "ChainedInvokeSucceeded" for e in events), \
