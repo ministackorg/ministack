@@ -3075,6 +3075,10 @@ def _create_authorizer(api_id, data):
         ),
         "providerARNs": data.get("providerARNs", []),
     }
+    if "authType" in data:
+        # An informational field (OpenAPI import/export); reported when set,
+        # as GetAuthorizer does.
+        authorizer["authType"] = data["authType"]
     _authorizers_v1.setdefault(api_id, {})[auth_id] = authorizer
     return _v1_response(authorizer, 201)
 

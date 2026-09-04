@@ -3399,34 +3399,75 @@ def _apigw_model_delete(physical_id, props):
 
 # --- API Gateway Authorizer ---
 
-def _apigw_authorizer_create(logical_id, props, stack_name):
-    """Provision an AWS::ApiGateway::Authorizer.
+# (CFN property, authorizer field, value the create fills in when the template
+# omits the property — the defaults of the resource reference: a 300 s result
+# TTL and the Authorization header as identity source). Name is required on
+# AWS and defaults to the logical id here; RestApiId is the one property that
+# requires replacement.
+_APIGW_AUTHORIZER_PROPERTIES = (
+    ("Type", "type", "TOKEN"),
+    ("AuthorizerUri", "authorizerUri", ""),
+    ("AuthorizerCredentials", "authorizerCredentials", None),
+    ("IdentitySource", "identitySource", "method.request.header.Authorization"),
+    ("IdentityValidationExpression", "identityValidationExpression", ""),
+    ("AuthorizerResultTtlInSeconds", "authorizerResultTtlInSeconds", 300),
+    ("ProviderARNs", "providerARNs", []),
+    ("AuthType", "authType", None),
+)
 
-    Maps CFN properties to the existing apigateway_v1 authorizer store:
-    Name, Type (TOKEN / REQUEST / COGNITO_USER_POOLS), AuthorizerUri,
-    AuthorizerCredentials, IdentitySource, IdentityValidationExpression,
-    AuthorizerResultTtlInSeconds, ProviderARNs, RestApiId. ``AuthType`` is
-    documented in the AWS CFN spec as informational only; the underlying
-    apigateway_v1._create_authorizer record does not currently expose it,
-    so the field is dropped here.
-    """
+
+def _apigw_authorizer_create(logical_id, props, stack_name):
+    """Provision an AWS::ApiGateway::Authorizer through the apigateway_v1
+    authorizer store: Name, Type (TOKEN / REQUEST / COGNITO_USER_POOLS),
+    AuthorizerUri, AuthorizerCredentials, IdentitySource,
+    IdentityValidationExpression, AuthorizerResultTtlInSeconds, ProviderARNs,
+    AuthType (informational, kept as GetAuthorizer reports it), RestApiId."""
     api_id = props.get("RestApiId", "")
-    data = {
-        "name": props.get("Name", logical_id),
-        "type": props.get("Type", "TOKEN"),
-        "authorizerUri": props.get("AuthorizerUri", ""),
-        "authorizerCredentials": props.get("AuthorizerCredentials"),
-        "identitySource": props.get("IdentitySource", "method.request.header.Authorization"),
-        "identityValidationExpression": props.get("IdentityValidationExpression", ""),
-        "authorizerResultTtlInSeconds": props.get("AuthorizerResultTtlInSeconds", 300),
-        "providerARNs": props.get("ProviderARNs", []),
-    }
-    status, headers, body = _apigw_v1._create_authorizer(api_id, data)
+    data = {"name": props.get("Name", logical_id)}
+    for prop, field, default in _APIGW_AUTHORIZER_PROPERTIES:
+        value = props.get(prop, default)
+        if prop == "AuthType" and value is None:
+            continue
+        data[field] = value
+    status, _headers, body = _apigw_v1._create_authorizer(api_id, data)
     if status >= 400:
         raise ValueError(f"AWS::ApiGateway::Authorizer create failed: {body!r}")
-    authorizer = json.loads(body) if isinstance(body, (bytes, bytearray)) else json.loads(body)
-    authorizer_id = authorizer.get("id", "")
+    authorizer_id = json.loads(body).get("id", "")
     return authorizer_id, {"AuthorizerId": authorizer_id}
+
+
+def _apigw_authorizer_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update an authorizer in place through UpdateAuthorizer, keeping its id
+    (what Ref and AuthorizerId return): every property but RestApiId is No
+    interruption on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-authorizer.html).
+    A property the new template drops reverts to the value the create fills
+    in. A changed RestApiId, or an authorizer deleted behind the stack's back,
+    is a replacement: the new authorizer is created and the engine removes
+    the old one."""
+    api_id = new_props.get("RestApiId", "")
+    record = _apigw_v1._authorizers_v1.get(api_id, {}).get(physical_id)
+    if record is None or new_props.get("RestApiId") != old_props.get("RestApiId"):
+        return _apigw_authorizer_create(logical_id or physical_id, new_props, stack_name)
+    default_name = logical_id or physical_id
+    patch_ops = []
+    if new_props.get("Name", default_name) != old_props.get("Name", default_name):
+        patch_ops.append({"op": "replace", "path": "/name",
+                          "value": new_props.get("Name", default_name)})
+    for prop, field, default in _APIGW_AUTHORIZER_PROPERTIES:
+        value = new_props.get(prop, default)
+        if value == old_props.get(prop, default):
+            continue
+        if prop == "AuthType" and value is None:
+            patch_ops.append({"op": "remove", "path": f"/{field}"})
+        else:
+            patch_ops.append({"op": "replace", "path": f"/{field}", "value": value})
+    if patch_ops:
+        status, _headers, body = _apigw_v1._update_authorizer(
+            api_id, physical_id, {"patchOperations": patch_ops})
+        if status >= 400:
+            raise ValueError(f"AWS::ApiGateway::Authorizer update failed: {body!r}")
+    return physical_id, {"AuthorizerId": physical_id}
 
 
 def _apigw_authorizer_delete(physical_id, props):
@@ -8221,7 +8262,12 @@ _RESOURCE_HANDLERS = {
         "update": _apigw_model_update,
         "delete": _apigw_model_delete,
     },
-    "AWS::ApiGateway::Authorizer": {"create": _apigw_authorizer_create, "delete": _apigw_authorizer_delete},
+    "AWS::ApiGateway::Authorizer": {
+        "create": _apigw_authorizer_create,
+        "update": _apigw_authorizer_update,
+        "update_with_logical_id": True,
+        "delete": _apigw_authorizer_delete,
+    },
     # Deployment stays create-only: AWS treats a deployment as an immutable
     # snapshot — an update is a new deployment (CFN replaces the resource).
     "AWS::ApiGateway::Deployment": {"create": _apigw_deployment_create, "delete": _apigw_deployment_delete},

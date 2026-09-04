@@ -14362,3 +14362,73 @@ def test_cfn_delete_change_set_missing_is_idempotent(cfn):
     with pytest.raises(ClientError) as exc:
         cfn.delete_change_set(StackName=name, ChangeSetName="cdk-deploy-change-set")
     assert exc.value.response["Error"]["Code"] == "ValidationError"
+
+
+def test_cfn_apigateway_authorizer_update_in_place_and_replacement(cfn, apigw_v1):
+    """An authorizer property change updates the authorizer under the same id
+    (Ref and AuthorizerId keep their value), a property the template drops
+    reverts to the create default, and a RestApiId change replaces the
+    authorizer: it appears on the new API and is gone from the old one."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-authz-upd-{uid}"
+    uri = ("arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+           "arn:aws:lambda:us-east-1:000000000000:function:noop/invocations")
+
+    def template(api, name, ttl, identity_source, auth_type, kind="TOKEN", providers=None):
+        properties = {"Name": name, "Type": kind, "RestApiId": {"Ref": api},
+                      "AuthorizerUri": uri, "IdentitySource": identity_source}
+        if providers:
+            properties["ProviderARNs"] = providers
+        if ttl is not None:
+            properties["AuthorizerResultTtlInSeconds"] = ttl
+        if auth_type is not None:
+            properties["AuthType"] = auth_type
+        return json.dumps({
+            "Resources": {
+                "ApiA": {"Type": "AWS::ApiGateway::RestApi", "Properties": {"Name": f"cfn-authz-a-{uid}"}},
+                "ApiB": {"Type": "AWS::ApiGateway::RestApi", "Properties": {"Name": f"cfn-authz-b-{uid}"}},
+                "Auth": {"Type": "AWS::ApiGateway::Authorizer", "Properties": properties},
+            },
+            "Outputs": {"Id": {"Value": {"Ref": "Auth"}},
+                        "AttId": {"Value": {"Fn::GetAtt": ["Auth", "AuthorizerId"]}},
+                        "ApiA": {"Value": {"Ref": "ApiA"}}, "ApiB": {"Value": {"Ref": "ApiB"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(
+        "ApiA", "first", 60, "method.request.header.X-Token", "custom"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        api_a, api_b = _output(stack, "ApiA"), _output(stack, "ApiB")
+        auth_id = _output(stack, "Id")
+        assert _output(stack, "AttId") == auth_id
+        authorizer = apigw_v1.get_authorizer(restApiId=api_a, authorizerId=auth_id)
+        assert (authorizer["name"], authorizer["authorizerResultTtlInSeconds"],
+                authorizer["identitySource"], authorizer["authType"]) == (
+            "first", 60, "method.request.header.X-Token", "custom")
+
+        pool_arn = f"arn:aws:cognito-idp:us-east-1:000000000000:userpool/us-east-1_{uid}"
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(
+            "ApiA", "second", None, "method.request.header.Authorization", None,
+            kind="COGNITO_USER_POOLS", providers=[pool_arn]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Id") == auth_id
+        authorizer = apigw_v1.get_authorizer(restApiId=api_a, authorizerId=auth_id)
+        assert (authorizer["name"], authorizer["authorizerResultTtlInSeconds"],
+                authorizer["identitySource"], authorizer["type"], authorizer["providerARNs"]) == (
+            "second", 300, "method.request.header.Authorization", "COGNITO_USER_POOLS", [pool_arn])
+        assert "authType" not in authorizer
+        assert len(apigw_v1.get_authorizers(restApiId=api_a)["items"]) == 1
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(
+            "ApiB", "second", None, "method.request.header.Authorization", None))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        new_id = _output(stack, "Id")
+        assert new_id != auth_id
+        assert apigw_v1.get_authorizers(restApiId=api_a)["items"] == []
+        assert [a["id"] for a in apigw_v1.get_authorizers(restApiId=api_b)["items"]] == [new_id]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
