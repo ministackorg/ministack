@@ -29,7 +29,6 @@ import contextvars
 import copy
 import datetime as _dt
 import hashlib
-import hmac
 import json
 import logging
 import os
@@ -60,6 +59,13 @@ from ministack.core.responses import (
     now_iso,
     set_request_account_id,
     set_request_region,
+)
+from ministack.core.sigv4 import (
+    build_canonical_request,
+    build_string_to_sign,
+    calculate_signature,
+    presigned_request_is_expired,
+    signatures_match,
 )
 
 logger = logging.getLogger("s3")
@@ -1492,27 +1498,6 @@ def _object_response_headers(obj: dict, bucket_name: str = "", key: str = "", in
 # ---------------------------------------------------------------------------
 
 
-_SIGV4_UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD"
-
-
-def _uri_encode(value: str, encode_slash: bool = True) -> str:
-    """RFC3986 encoding per the SigV4 spec: unreserved chars (A-Za-z0-9-_.~)
-    stay literal, everything else is percent-encoded. ``/`` is preserved in
-    the canonical URI (path separators) and encoded everywhere else."""
-    safe = "-_.~" + ("" if encode_slash else "/")
-    return url_quote(value, safe=safe)
-
-
-def _sigv4_signing_key(secret: str, date_stamp: str, region: str, service: str) -> bytes:
-    def _h(key, msg):
-        return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
-
-    k_date = _h(("AWS4" + secret).encode("utf-8"), date_stamp)
-    k_region = _h(k_date, region)
-    k_service = _h(k_region, service)
-    return _h(k_service, "aws4_request")
-
-
 def _resolve_presign_secret(access_key_id):
     """The secret a presigned URL was signed with.
 
@@ -1574,55 +1559,30 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
     expires = _qp(query_params, "X-Amz-Expires", "") or _qp(query_params, "x-amz-expires", "")
     if expires:
         try:
-            signed_at = _dt.datetime.strptime(amz_date, "%Y%m%dT%H%M%SZ").replace(tzinfo=_dt.timezone.utc)
-            if _dt.datetime.now(_dt.timezone.utc) > signed_at + _dt.timedelta(seconds=int(expires)):
+            if presigned_request_is_expired(amz_date, expires):
                 return _error("AccessDenied", "Request has expired", 403, path)
         except (ValueError, TypeError):
             pass
 
-    # Canonical query string: every query param except X-Amz-Signature,
-    # RFC3986-encoded, sorted by encoded key then value.
-    pairs = []
-    for name, values in query_params.items():
-        if name.lower() == "x-amz-signature":
-            continue
-        vlist = values if isinstance(values, list) else [values]
-        for v in vlist:
-            pairs.append((_uri_encode(name), _uri_encode(v)))
-    pairs.sort()
-    canonical_qs = "&".join(f"{k}={v}" for k, v in pairs)
-
-    # Canonical headers: the signed headers, lowercased names, trimmed values.
-    canonical_headers = ""
-    for hname in (h for h in signed_headers.split(";") if h):
-        raw = headers.get(hname, headers.get(hname.lower(), ""))
-        canonical_headers += f"{hname.lower()}:{' '.join(str(raw).split())}\n"
-
-    canonical_request = "\n".join(
-        [
-            method,
-            _uri_encode(path, encode_slash=False),
-            canonical_qs,
-            canonical_headers,
-            signed_headers,
-            _SIGV4_UNSIGNED_PAYLOAD,
-        ]
+    canonical_request = build_canonical_request(
+        method,
+        path,
+        headers,
+        query_params,
+        signed_headers,
     )
-
-    string_to_sign = "\n".join(
-        [
-            "AWS4-HMAC-SHA256",
-            amz_date,
-            f"{date_stamp}/{region}/{service}/aws4_request",
-            hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
-        ]
+    string_to_sign = build_string_to_sign(
+        amz_date,
+        date_stamp,
+        region,
+        service,
+        canonical_request,
     )
 
     secret = _resolve_presign_secret(_akid)
-    signing_key = _sigv4_signing_key(secret, date_stamp, region, service)
-    computed = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    computed = calculate_signature(secret, date_stamp, region, service, string_to_sign)
 
-    if not hmac.compare_digest(computed, signature):
+    if not signatures_match(computed, signature):
         return _bad_signature()
     return None
 
