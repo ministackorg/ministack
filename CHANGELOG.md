@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **IAM enforcement — the remaining S3 operations authorize as S3 documents them** — with `AUTH=true`, a browser `POST Object` was checked as `s3:DeleteObject`, a request naming a `versionId` as the unversioned action, `DeleteObjects` once against the bucket ARN (so a grant on `arn:aws:s3:::bucket/*` denied every batch delete), `CopyObject` / `UploadPartCopy` without `s3:GetObject` on the source, `GetObjectAttributes` without its `s3:GetObject` companion, `x-amz-bypass-governance-retention` without `s3:BypassGovernanceRetention`, and the sub-resources without a table row (`accelerate`, `requestPayment`, `publicAccessBlock`, `ownershipControls`, `intelligent-tiering`, `metrics`, `analytics`, `inventory`, `object-lock`, `policyStatus`, `retention`, `legal-hold`, `attributes`, `select`, `torrent`) fell to the method default. Each now maps to the action the S3 reference lists, a `versionId` resolves to the `*Version*` action, and both enforcement sites run the extra per-request checks (per key, source object, attributes pair, governance bypass). Contributed by @iot-rocket.
+
 ## [1.5.7] — 2026-09-04
 
 ### Added

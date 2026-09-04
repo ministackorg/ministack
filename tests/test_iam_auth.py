@@ -1410,6 +1410,114 @@ class TestS3AdditionalChecks:
             assert evaluate(_ctx(action=act, resource=arn), [stmts]).decision == "Allow", (act, arn)
 
 
+class TestS3EnforcementSites:
+    """Both S3 enforcement sites (virtual-hosted and path-style) run the
+    additional checks after the primary one. The evaluator is stubbed with a
+    policy so the tests drive the app functions in-process."""
+
+    _NS = "http://s3.amazonaws.com/doc/2006-03-01/"
+    _BATCH = (f'<Delete xmlns="{_NS}"><Object><Key>a.txt</Key></Object>'
+              '<Object><Key>b.txt</Key></Object></Delete>').encode()
+
+    @staticmethod
+    def _stub_evaluator(monkeypatch, policy):
+        """Route enforce() through a fixed policy; return the checks it saw."""
+        import ministack.app as app_mod
+        from ministack.core import iam_evaluator
+
+        stmts = parse_policy_document(policy)
+        seen = []
+
+        def enforce_stub(access_key_id, iam_action, service, region, resource_arn="*"):
+            seen.append((iam_action, resource_arn))
+            result = evaluate(_ctx(action=iam_action, resource=resource_arn), [stmts])
+            if result.decision == "Allow":
+                return None
+            result.principal_arn = "arn:aws:iam::000000000000:user/testuser"
+            return result
+
+        monkeypatch.setattr(app_mod, "AUTH", True, raising=False)
+        monkeypatch.setattr(iam_evaluator, "enforce", enforce_stub)
+        return seen
+
+    @staticmethod
+    def _vhost(bucket, path, method, headers, body, query):
+        import asyncio
+
+        import ministack.app as app_mod
+        return asyncio.run(app_mod._handle_s3_vhost_request(
+            f"{bucket}.localhost:4566", path, method, headers, body, query))
+
+    @staticmethod
+    def _path_style(method, path, headers, body, query):
+        import asyncio
+
+        import ministack.app as app_mod
+        headers = {"host": "localhost:4566", **headers}
+        return asyncio.run(app_mod._dispatch_service_request(method, path, headers, body, query, "req-1"))
+
+    _ONLY_FIRST_KEY = {"Statement": [{
+        "Effect": "Allow", "Action": "s3:DeleteObject", "Resource": "arn:aws:s3:::iam-sites-b/a.txt"}]}
+    _EVERY_KEY = {"Statement": [{
+        "Effect": "Allow", "Action": "s3:DeleteObject", "Resource": "arn:aws:s3:::iam-sites-b/*"}]}
+    _WRITE_ONLY = {"Statement": [{
+        "Effect": "Allow", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::iam-sites-dst/*"}]}
+
+    def test_vhost_batch_delete_is_denied_on_the_second_key(self, monkeypatch):
+        seen = self._stub_evaluator(monkeypatch, self._ONLY_FIRST_KEY)
+        status, _headers, body = self._vhost("iam-sites-b", "/", "POST", {}, self._BATCH, {"delete": ""})
+        assert status == 403
+        assert b"AccessDenied" in body
+        assert seen == [("s3:DeleteObject", "arn:aws:s3:::iam-sites-b/a.txt"),
+                        ("s3:DeleteObject", "arn:aws:s3:::iam-sites-b/b.txt")]
+
+    def test_vhost_batch_delete_with_an_object_scoped_grant_passes(self, monkeypatch):
+        seen = self._stub_evaluator(monkeypatch, self._EVERY_KEY)
+        status, _headers, _body = self._vhost("iam-sites-b", "/", "POST", {}, self._BATCH, {"delete": ""})
+        assert status != 403
+        assert [a for a, _ in seen] == ["s3:DeleteObject", "s3:DeleteObject"]
+
+    def test_vhost_copy_without_read_on_the_source_is_denied(self, monkeypatch):
+        seen = self._stub_evaluator(monkeypatch, self._WRITE_ONLY)
+        status, _headers, body = self._vhost(
+            "iam-sites-dst", "/k", "PUT", {"x-amz-copy-source": "/iam-sites-src/k"}, b"", {})
+        assert status == 403
+        assert b"AccessDenied" in body
+        assert seen == [("s3:PutObject", "arn:aws:s3:::iam-sites-dst/k"),
+                        ("s3:GetObject", "arn:aws:s3:::iam-sites-src/k")]
+
+    def test_path_style_batch_delete_is_denied_on_the_second_key(self, monkeypatch):
+        seen = self._stub_evaluator(monkeypatch, self._ONLY_FIRST_KEY)
+        status, _headers, body = self._path_style("POST", "/iam-sites-b", {}, self._BATCH, {"delete": ""})
+        assert status == 403
+        assert b"AccessDenied" in body
+        assert seen == [("s3:DeleteObject", "arn:aws:s3:::iam-sites-b/a.txt"),
+                        ("s3:DeleteObject", "arn:aws:s3:::iam-sites-b/b.txt")]
+
+    def test_path_style_batch_delete_with_an_object_scoped_grant_passes(self, monkeypatch):
+        seen = self._stub_evaluator(monkeypatch, self._EVERY_KEY)
+        status, _headers, _body = self._path_style("POST", "/iam-sites-b", {}, self._BATCH, {"delete": ""})
+        assert status != 403
+        assert [a for a, _ in seen] == ["s3:DeleteObject", "s3:DeleteObject"]
+
+    def test_path_style_copy_without_read_on_the_source_is_denied(self, monkeypatch):
+        seen = self._stub_evaluator(monkeypatch, self._WRITE_ONLY)
+        status, _headers, body = self._path_style(
+            "PUT", "/iam-sites-dst/k", {"x-amz-copy-source": "/iam-sites-src/k"}, b"", {})
+        assert status == 403
+        assert b"AccessDenied" in body
+        assert seen == [("s3:PutObject", "arn:aws:s3:::iam-sites-dst/k"),
+                        ("s3:GetObject", "arn:aws:s3:::iam-sites-src/k")]
+
+    def test_a_primary_denial_stops_before_the_extra_checks(self, monkeypatch):
+        seen = self._stub_evaluator(monkeypatch, {"Statement": [
+            {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]})
+        status, _headers, _body = self._path_style(
+            "PUT", "/iam-sites-dst/k", {"x-amz-copy-source": "/iam-sites-src/k"}, b"", {})
+        assert status == 403
+        assert seen == [("s3:PutObject", "arn:aws:s3:::iam-sites-dst/k")]
+
+
 # ---------------------------------------------------------------------------
 # AccessDenied response formatting
 # ---------------------------------------------------------------------------
