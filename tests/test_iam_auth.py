@@ -1215,6 +1215,44 @@ class TestS3ActionMapping:
         ("DELETE", "/bucket", {"policy": ""}, "s3:DeleteBucketPolicy"),   # this one exists
         ("GET", "/bucket/key", {"versions": ""}, "s3:GetObject"),         # bucket-only sub-resource
         ("GET", "/bucket/key", {"versionId": "v1"}, "s3:GetObject"),      # not s3:GetObjectVersion (known gap)
+        # a POST on the bucket is the browser form upload unless it says ?delete
+        ("POST", "/bucket", {}, "s3:PutObject"),                          # POST Object
+        ("POST", "/bucket", {"delete": ""}, "s3:DeleteObject"),           # DeleteObjects
+        # object sub-resources
+        ("POST", "/bucket/key", {"select": "", "select-type": "2"}, "s3:GetObject"),  # SelectObjectContent
+        ("GET", "/bucket/key", {"attributes": ""}, "s3:GetObjectAttributes"),
+        ("GET", "/bucket/key", {"retention": ""}, "s3:GetObjectRetention"),
+        ("PUT", "/bucket/key", {"retention": ""}, "s3:PutObjectRetention"),
+        ("GET", "/bucket/key", {"legal-hold": ""}, "s3:GetObjectLegalHold"),
+        ("PUT", "/bucket/key", {"legal-hold": ""}, "s3:PutObjectLegalHold"),
+        ("GET", "/bucket/key", {"torrent": ""}, "s3:GetObject"),
+        ("GET", "/bucket/key", {"object-lock": ""}, "s3:GetObject"),      # bucket-only sub-resource
+        # bucket sub-resources; a DELETE of a configuration is its Put action
+        ("GET", "/bucket", {"accelerate": ""}, "s3:GetAccelerateConfiguration"),
+        ("PUT", "/bucket", {"accelerate": ""}, "s3:PutAccelerateConfiguration"),
+        ("GET", "/bucket", {"requestPayment": ""}, "s3:GetBucketRequestPayment"),
+        ("PUT", "/bucket", {"requestPayment": ""}, "s3:PutBucketRequestPayment"),
+        ("GET", "/bucket", {"publicAccessBlock": ""}, "s3:GetBucketPublicAccessBlock"),
+        ("PUT", "/bucket", {"publicAccessBlock": ""}, "s3:PutBucketPublicAccessBlock"),
+        ("DELETE", "/bucket", {"publicAccessBlock": ""}, "s3:PutBucketPublicAccessBlock"),
+        ("GET", "/bucket", {"ownershipControls": ""}, "s3:GetBucketOwnershipControls"),
+        ("PUT", "/bucket", {"ownershipControls": ""}, "s3:PutBucketOwnershipControls"),
+        ("DELETE", "/bucket", {"ownershipControls": ""}, "s3:PutBucketOwnershipControls"),
+        ("GET", "/bucket", {"intelligent-tiering": "", "id": "x"}, "s3:GetIntelligentTieringConfiguration"),
+        ("PUT", "/bucket", {"intelligent-tiering": "", "id": "x"}, "s3:PutIntelligentTieringConfiguration"),
+        ("DELETE", "/bucket", {"intelligent-tiering": "", "id": "x"}, "s3:PutIntelligentTieringConfiguration"),
+        ("GET", "/bucket", {"metrics": "", "id": "x"}, "s3:GetMetricsConfiguration"),
+        ("PUT", "/bucket", {"metrics": "", "id": "x"}, "s3:PutMetricsConfiguration"),
+        ("DELETE", "/bucket", {"metrics": "", "id": "x"}, "s3:PutMetricsConfiguration"),
+        ("GET", "/bucket", {"analytics": "", "id": "x"}, "s3:GetAnalyticsConfiguration"),
+        ("PUT", "/bucket", {"analytics": "", "id": "x"}, "s3:PutAnalyticsConfiguration"),
+        ("DELETE", "/bucket", {"analytics": "", "id": "x"}, "s3:PutAnalyticsConfiguration"),
+        ("GET", "/bucket", {"inventory": "", "id": "x"}, "s3:GetInventoryConfiguration"),
+        ("PUT", "/bucket", {"inventory": "", "id": "x"}, "s3:PutInventoryConfiguration"),
+        ("DELETE", "/bucket", {"inventory": "", "id": "x"}, "s3:PutInventoryConfiguration"),
+        ("GET", "/bucket", {"object-lock": ""}, "s3:GetBucketObjectLockConfiguration"),
+        ("PUT", "/bucket", {"object-lock": ""}, "s3:PutBucketObjectLockConfiguration"),
+        ("GET", "/bucket", {"policyStatus": ""}, "s3:GetBucketPolicyStatus"),
         ("PUT", "/bucket/key", {}, "s3:PutObject"),
         ("HEAD", "/bucket/key", {}, "s3:GetObject"),
         ("GET", "/bucket", {}, "s3:ListBucket"),

@@ -146,7 +146,7 @@ _S3_ACTIONS: dict[tuple[str, int], str] = {
     ("DELETE", 2): "DeleteObject",
     ("HEAD", 2): "GetObject",
     ("POST", 2): "PutObject",
-    ("POST", 1): "DeleteObject",  # DeleteObjects (batch)
+    ("POST", 1): "PutObject",  # POST Object (the browser form upload); ?delete is a table row
 }
 
 # S3 query-param sub-operations
@@ -183,17 +183,43 @@ _S3_QUERY_ACTIONS: dict[str, dict[str, str]] = {
     "restore": {"POST": "RestoreObject"},
 }
 
-# Sub-resources that only exist at the bucket level.
+# Sub-resources that only exist at the bucket level. A DELETE of a
+# configuration authorizes as its Put action, like the shared table's rows.
 _S3_BUCKET_QUERY_ACTIONS: dict[str, dict[str, str]] = {
     "versions": {"GET": "ListBucketVersions"},
+    "delete": {"POST": "DeleteObject"},   # DeleteObjects (batch)
+    "accelerate": {"GET": "GetAccelerateConfiguration", "PUT": "PutAccelerateConfiguration"},
+    "requestPayment": {"GET": "GetBucketRequestPayment", "PUT": "PutBucketRequestPayment"},
+    "publicAccessBlock": {"GET": "GetBucketPublicAccessBlock", "PUT": "PutBucketPublicAccessBlock",
+                          "DELETE": "PutBucketPublicAccessBlock"},
+    "ownershipControls": {"GET": "GetBucketOwnershipControls", "PUT": "PutBucketOwnershipControls",
+                          "DELETE": "PutBucketOwnershipControls"},
+    "intelligent-tiering": {"GET": "GetIntelligentTieringConfiguration",
+                            "PUT": "PutIntelligentTieringConfiguration",
+                            "DELETE": "PutIntelligentTieringConfiguration"},
+    "metrics": {"GET": "GetMetricsConfiguration", "PUT": "PutMetricsConfiguration",
+                "DELETE": "PutMetricsConfiguration"},
+    "analytics": {"GET": "GetAnalyticsConfiguration", "PUT": "PutAnalyticsConfiguration",
+                  "DELETE": "PutAnalyticsConfiguration"},
+    "inventory": {"GET": "GetInventoryConfiguration", "PUT": "PutInventoryConfiguration",
+                  "DELETE": "PutInventoryConfiguration"},
+    "object-lock": {"GET": "GetBucketObjectLockConfiguration",
+                    "PUT": "PutBucketObjectLockConfiguration"},
+    "policyStatus": {"GET": "GetBucketPolicyStatus"},
 }
 
 # Sub-resources whose IAM action differs between the bucket and the object
-# level; these win over the shared table for an object request.
+# level, or that only exist on an object; these win over the shared table
+# for an object request.
 _S3_OBJECT_QUERY_ACTIONS: dict[str, dict[str, str]] = {
     "tagging": {"GET": "GetObjectTagging", "PUT": "PutObjectTagging",
                 "DELETE": "DeleteObjectTagging"},
     "acl": {"GET": "GetObjectAcl", "PUT": "PutObjectAcl"},
+    "retention": {"GET": "GetObjectRetention", "PUT": "PutObjectRetention"},
+    "legal-hold": {"GET": "GetObjectLegalHold", "PUT": "PutObjectLegalHold"},
+    "attributes": {"GET": "GetObjectAttributes"},
+    "select": {"POST": "GetObject"},   # SelectObjectContent reads the object
+    "torrent": {"GET": "GetObject"},
 }
 
 
