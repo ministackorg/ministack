@@ -6259,6 +6259,62 @@ def test_cfn_cloudfront_distribution_supports_invalidations(cfn, cloudfront):
     assert stack["StackStatus"] == "DELETE_COMPLETE"
 
 
+
+def _mrap_template(name, buckets):
+    return json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            **{f"B{i}": {"Type": "AWS::S3::Bucket", "Properties": {"BucketName": b}}
+               for i, b in enumerate(buckets)},
+            "Mrap": {"Type": "AWS::S3::MultiRegionAccessPoint",
+                     "DependsOn": [f"B{i}" for i in range(len(buckets))],
+                     "Properties": {"Name": name,
+                                    "Regions": [{"Bucket": b} for b in buckets]}},
+        },
+        "Outputs": {"Alias": {"Value": {"Fn::GetAtt": ["Mrap", "Alias"]}}},
+    })
+
+
+def _mrap_get(alias, key, region=None):
+    """GET through the MRAP hostname. The host is sent explicitly rather than
+    resolved: <alias>.mrap.accesspoint.s3-global.amazonaws.com is a real public
+    suffix, so letting DNS see it would leave the test dependent on egress."""
+    import urllib.request
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+    req = urllib.request.Request(f"{endpoint}/{key}")
+    req.add_header("Host", f"{alias}.mrap.accesspoint.s3-global.amazonaws.com")
+    if region:
+        req.add_header("Authorization",
+                       "AWS4-HMAC-SHA256 "
+                       f"Credential=test/20260101/{region}/s3/aws4_request, "
+                       "SignedHeaders=host, Signature=unsigned")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return resp.status, resp.read().decode()
+
+
+def test_cfn_s3_multi_region_access_point(cfn, s3):
+    """AWS::S3::MultiRegionAccessPoint used to roll the stack back, so a CDK app
+    fronting regional buckets with one could not deploy at all. It now provisions
+    and hands back the 13-character alias — the only attribute a template reads,
+    and the name the data plane is addressed by."""
+    buckets = ["mrap-cfn-us-east-1-app", "mrap-cfn-eu-west-1-app"]
+    cfn.create_stack(StackName="cfn-s3-mrap",
+                     TemplateBody=_mrap_template("cfn-mrap-app", buckets))
+    stack = _wait_stack(cfn, "cfn-s3-mrap")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    alias = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["Alias"]
+    assert len(alias) == 13 and alias.islower()
+
+    cfn.delete_stack(StackName="cfn-s3-mrap")
+    _wait_stack(cfn, "cfn-s3-mrap")
+    # The alias stops resolving with the stack.
+    import urllib.error
+    with pytest.raises(urllib.error.HTTPError) as ei:
+        _mrap_get(alias, "anything")
+    assert ei.value.code in (403, 404)
+
+
 def test_cfn_auto_named_s3_bucket_stable_across_updates(cfn, s3):
     """Regression: auto-named S3 buckets (no explicit BucketName) must keep
     the same physical resource ID across stack updates.  Before the fix,

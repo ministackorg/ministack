@@ -465,6 +465,54 @@ def _s3_apply_notification(name, notif):
         )
 
 
+# ---------------------------------------------------------------------------
+# S3 Multi-Region Access Point
+# ---------------------------------------------------------------------------
+
+def _s3_mrap_create(logical_id, props, stack_name):
+    """Provision an AWS::S3::MultiRegionAccessPoint.
+
+    On AWS this is asynchronous — `CreateMultiRegionAccessPoint` returns a
+    request token you poll — but CloudFormation hides that behind the resource,
+    and every attribute a template can read (`Alias`, `CreatedAt`) is known the
+    moment the access point exists. So it is created synchronously here.
+
+    `Regions` is a list of `{Bucket}`; the member names are kept so the data
+    plane can resolve the alias to one of them.
+    """
+    name = props.get("Name") or _physical_name(stack_name, logical_id, lowercase=True, max_len=50)
+    buckets = [
+        r.get("Bucket") for r in (props.get("Regions") or [])
+        if isinstance(r, dict) and r.get("Bucket")
+    ]
+
+    for existing in _s3._mraps.values():
+        if existing.get("Name") == name:
+            return existing["Alias"], {"Alias": existing["Alias"],
+                                       "CreatedAt": existing["CreatedAt"]}
+
+    alias = _s3.new_mrap_alias()
+    created_at = now_iso()
+    _s3._mraps[alias] = {
+        "Name": name,
+        "Alias": alias,
+        "Regions": buckets,
+        "CreatedAt": created_at,
+        "PublicAccessBlockConfiguration": props.get("PublicAccessBlockConfiguration") or {},
+    }
+    logger.info("Created MultiRegionAccessPoint %s alias=%s over %d bucket(s)",
+                name, alias, len(buckets))
+    # The physical id is the NAME (what DeleteMultiRegionAccessPoint takes);
+    # `Alias` is the attribute a distribution origin is built from.
+    return name, {"Alias": alias, "CreatedAt": created_at}
+
+
+def _s3_mrap_delete(physical_id, props):
+    for alias, record in list(_s3._mraps.items()):
+        if record.get("Name") == physical_id:
+            _s3._mraps.pop(alias, None)
+
+
 def _s3_create(logical_id, props, stack_name):
     name = props.get("BucketName") or _physical_name(stack_name, logical_id, lowercase=True, max_len=63)
     _s3._buckets.setdefault(name, {
@@ -6974,6 +7022,7 @@ _RESOURCE_HANDLERS = {
         "delete": _opensearch_domain_delete,
     },
     "AWS::S3::Bucket": {"create": _s3_create, "update": _s3_update, "delete": _s3_delete},
+    "AWS::S3::MultiRegionAccessPoint": {"create": _s3_mrap_create, "delete": _s3_mrap_delete},
     "AWS::S3::BucketPolicy": {
         "create": _s3_bucket_policy_create,
         "update": _s3_bucket_policy_update,

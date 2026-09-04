@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **S3 — Multi-Region Access Points deploy and serve** — `AWS::S3::MultiRegionAccessPoint` rolled the stack back with `Unsupported resource type` and the MRAP hostname resolved nowhere, so a CDK app fronting regional buckets with one could not deploy. The type now provisions (minting the 13-character alias and remembering its member buckets) and `<alias>.mrap.accesspoint.s3-global.amazonaws.com` resolves onto the existing virtual-hosted S3 path, so path-style rewriting, IAM enforcement and the handler apply unchanged. The member carrying the request region is served, else the first. State is account-scoped, cleared by `/_ministack/reset` and persisted. SigV4A, which S3 requires for an MRAP, is not verified — consistent with the documented no-SigV4 stance: such a request has its presign parameters dropped and is served rather than refused for a signature that could never have matched, and because a SigV4A credential scope carries no region it falls back to the first member. The s3control control plane (`CreateMultiRegionAccessPoint` and the async request token, Get/List/Delete, policies) is not included. Contributed by @mm-salesqueze.
+
 ## [1.5.7] — 2026-09-04
 
 ### Added
