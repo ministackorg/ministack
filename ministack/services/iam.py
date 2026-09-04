@@ -695,6 +695,36 @@ def store_policy(arn: str, name: str, path: str, document, *,
     return record
 
 
+def rename_policy(old_arn: str, new_arn: str, new_name: str) -> dict:
+    """Re-key a customer-managed policy record under a new ARN and name.
+
+    Everything else about the record stays — PolicyId, Versions,
+    DefaultVersionId, CreateDate, AttachmentCount — and every role, user and
+    group that holds the old ARN in ``AttachedPolicies`` is rewritten to the
+    new one, so ListAttachedRolePolicies, ListEntitiesForPolicy and
+    GetAccountAuthorizationDetails keep resolving the attachment. Used by the
+    CloudFormation provisioner for a PolicyName change, which AWS applies
+    without replacing the resource.
+    """
+    if new_arn == old_arn:
+        record = _policies[old_arn]
+        record["PolicyName"] = new_name
+        return record
+    if new_arn in _policies:
+        raise ValueError(f"A policy called {new_name} already exists.")
+    record = _policies.pop(old_arn)
+    record["PolicyName"] = new_name
+    record["Arn"] = new_arn
+    record["UpdateDate"] = _now()
+    _policies[new_arn] = record
+    for store in (_roles, _users, _groups):
+        for entity in store.values():
+            attached = entity.get("AttachedPolicies") or []
+            if old_arn in attached:
+                attached[attached.index(old_arn)] = new_arn
+    return record
+
+
 def _create_policy(p):
     name = _p(p, "PolicyName")
     path = _p(p, "Path") or "/"

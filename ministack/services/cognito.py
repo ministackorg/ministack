@@ -2346,6 +2346,10 @@ def _update_user_pool(data):
         "AdminCreateUserConfig", "UserPoolAddOns", "VerificationMessageTemplate",
         "AccountRecoverySetting", "LambdaConfig",
         "UserAttributeUpdateSettings",
+        # Deletion protection is switched off through UpdateUserPool before a
+        # protected pool can be deleted (per the DeletionProtection property
+        # on the CloudFormation resource reference).
+        "DeletionProtection",
     }
     for k in updatable:
         if k in data:

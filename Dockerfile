@@ -1,6 +1,7 @@
 # Non-release builds intentionally use the maintainer-requested fallback of the latest
 # published full image. Release builds override this in docker-publish.yml with the
-# same-release full-image digest; plugin-source PRs use the full-preview label path.
+# same-release full-image digest; plugin-source PRs build and consume a head-matched
+# full-preview digest in docker-publish-on-pr.yml.
 ARG PLUGIN_DONOR_IMAGE=ghcr.io/ministackorg/ministack:full
 
 FROM python:3.13-alpine AS builder

@@ -15,6 +15,7 @@ from .engine import (
     _parse_template,
     _resolve_parameters,
     _resolve_refs,
+    validate_template_support,
 )
 from .helpers import _error, _esc, _extract_members, _p, _resolve_template, _xml
 from .stacks import (
@@ -153,17 +154,31 @@ def _create_change_set(params):
         if not template_body:
             template_body = stack.get("_template_body", "{}")
 
+    def _rejected(message):
+        # A rejected CreateChangeSet leaves no stack behind on AWS; drop the
+        # REVIEW_IN_PROGRESS placeholder created above for CREATE sets.
+        if cs_type == "CREATE":
+            _stacks.pop(stack_name, None)
+            _stack_events.pop(stack_id, None)
+        return _error("ValidationError", message)
+
     try:
         template = _parse_template(template_body)
         template = _apply_sam_transform_if_applicable(template)
     except Exception as e:
-        return _error("ValidationError", f"Template format error: {e}")
+        return _rejected(f"Template format error: {e}")
 
     try:
         param_values = _resolve_parameters(
             template, provided_params, stack.get("_resolved_params", {}))
     except ValueError as exc:
-        return _error("ValidationError", str(exc))
+        return _rejected(str(exc))
+
+    try:
+        validate_template_support(
+            template, _evaluate_conditions(template, param_values))
+    except ValueError as exc:
+        return _rejected(str(exc))
 
     # Compute changes — resolve parameters/intrinsics in BOTH templates first so
     # parameter-driven changes (the `aws cloudformation deploy
@@ -390,14 +405,28 @@ def _execute_change_set(params):
 
 def _delete_change_set(params):
     from ministack.services.cloudformation import _change_sets
+    from ministack.services.cloudformation.handlers import _resolve_stack
     cs_name = _p(params, "ChangeSetName")
     stack_name = _p(params, "StackName")
-    cs_id, cs = _find_change_set(cs_name, stack_name)
-    if not cs_id:
-        return _error("ChangeSetNotFound",
-                      f"ChangeSet [{cs_name}] does not exist", 404)
-    _change_sets.pop(cs_id, None)
-    return _xml(200, "DeleteChangeSetResponse", "")
+    # StackName is "the name or the unique stack ID", and the CDK addresses a
+    # stack it has already read by ARN, so resolve it first and look the change
+    # set up under the stack's name. A stack that does not exist is a
+    # ValidationError, as on AWS -- and a deleted stack counts as one, since it
+    # is addressable only by stack id.
+    stack = _resolve_stack(stack_name) if stack_name else None
+    if stack_name and (not stack or stack.get("StackStatus") == "DELETE_COMPLETE"):
+        return _error("ValidationError",
+                      f"Stack [{stack_name}] does not exist")
+    cs_id, _cs = _find_change_set(cs_name, stack["StackName"] if stack else stack_name)
+    # Real CloudFormation answers a delete of a change set that does not exist
+    # (on a stack that does) with a plain success, and the CDK relies on that:
+    # before every deploy of an existing stack it removes a possible leftover
+    # `cdk-deploy-change-set` and only tolerates a `ChangeSetNotFoundException`
+    # -- so the 404 answered here aborted every `cdk deploy` of an already
+    # deployed stack.
+    if cs_id:
+        _change_sets.pop(cs_id, None)
+    return _xml(200, "DeleteChangeSetResponse", "<DeleteChangeSetResult/>")
 
 
 # --- ListChangeSets ---

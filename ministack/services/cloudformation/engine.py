@@ -111,6 +111,84 @@ def _parse_template(template_body: str) -> dict:
 
 
 # ===========================================================================
+# Template pre-flight
+# ===========================================================================
+
+_DYNAMIC_REFERENCE = re.compile(r"\{\{resolve:([a-z-]+):[^}]*\}\}")
+
+
+def _find_dynamic_references(value, found: set) -> None:
+    if isinstance(value, str):
+        for m in _DYNAMIC_REFERENCE.finditer(value):
+            found.add(m.group(0))
+    elif isinstance(value, dict):
+        for v in value.values():
+            _find_dynamic_references(v, found)
+    elif isinstance(value, list):
+        for v in value:
+            _find_dynamic_references(v, found)
+
+
+def validate_template_support(template: dict, conditions: dict) -> None:
+    """Reject up front what provisioning could only fail on halfway through.
+
+    Real CloudFormation validates resource types before it touches anything:
+    CreateStack, UpdateStack, CreateChangeSet and ValidateTemplate all answer
+    ``Template format error: Unrecognized resource types: [...]`` and no stack
+    record is created. Doing the same here means an unsupported type no longer
+    provisions its predecessors first and rolls them back. Condition-false
+    resources are exempt, as they are during provisioning.
+
+    Dynamic references (``{{resolve:ssm:...}}`` and friends) are not resolved
+    by this emulator; refusing them here replaces the old behaviour of passing
+    the literal ``{{resolve:...}}`` string on to the service.
+
+    Raises ``ValueError`` with the message the caller wraps as a
+    ``ValidationError``.
+
+    A template that still declares a ``Transform`` is exempt from the type
+    check: a macro can rewrite any resource, so real CloudFormation cannot
+    (and does not) pre-validate types through one — ``sam validate`` sends
+    SAM templates with ``AWS::Serverless::*`` resources to ValidateTemplate
+    and they pass. CreateStack, UpdateStack and CreateChangeSet apply the SAM
+    transform before calling this, so their expanded templates are validated
+    as usual.
+    """
+    from .provisioners import _RESOURCE_HANDLERS
+
+    unrecognized: set[str] = set()
+    if not template.get("Transform"):
+        for res in (template.get("Resources") or {}).values():
+            if not isinstance(res, dict):
+                continue
+            cond = res.get("Condition")
+            if cond and not conditions.get(cond, True):
+                continue
+            rtype = res.get("Type", "AWS::CloudFormation::CustomResource")
+            if (
+                rtype in _RESOURCE_HANDLERS
+                or rtype.startswith("Custom::")
+                or rtype.startswith("AWS::CloudFormation::")
+            ):
+                continue
+            unrecognized.add(rtype)
+    if unrecognized:
+        raise ValueError(
+            "Template format error: Unrecognized resource types: ["
+            + ", ".join(sorted(unrecognized)) + "]"
+        )
+
+    refs: set[str] = set()
+    _find_dynamic_references(template.get("Resources"), refs)
+    _find_dynamic_references(template.get("Outputs"), refs)
+    if refs:
+        raise ValueError(
+            "Template format error: dynamic references are not supported by "
+            "ministack: " + ", ".join(sorted(refs))
+        )
+
+
+# ===========================================================================
 # Parameter Resolver
 # ===========================================================================
 
@@ -304,6 +382,13 @@ def _evaluate_conditions(template: dict, params: dict) -> dict:
 # Intrinsic Function Resolver
 # ===========================================================================
 
+def _unknown_attribute_message(res: dict, logical_id: str, attr: str) -> str:
+    # Verbatim what CloudFormation reports in the stack event that starts the
+    # rollback (measured on a real account against AWS::SQS::Queue).
+    rtype = res.get("ResourceType") or logical_id
+    return f"Requested attribute {attr} does not exist in schema for {rtype}"
+
+
 def _resolve_refs(value, resources, params, conditions, mappings,
                   stack_name, stack_id):
     """Recursively resolve CloudFormation intrinsic functions."""
@@ -358,8 +443,14 @@ def _resolve_refs(value, resources, params, conditions, mappings,
         attrs = res.get("Attributes", {})
         if attr in attrs:
             return attrs[attr]
-        # Fallback: try PhysicalResourceId
-        return res.get("PhysicalResourceId", "")
+        if "PhysicalResourceId" in res:
+            # The resource exists and does not expose the attribute. Real
+            # CloudFormation fails the operation here (the stack rolls back);
+            # returning the physical id instead handed callers a silently wrong
+            # value.
+            raise ValueError(_unknown_attribute_message(res, logical_id, attr))
+        # Not provisioned yet (change-set diff): nothing to resolve against.
+        return ""
 
     # --- Fn::Join ---
     if "Fn::Join" in value:
@@ -414,7 +505,10 @@ def _resolve_refs(value, resources, params, conditions, mappings,
                 attrs = res.get("Attributes", {})
                 if parts[1] in attrs:
                     return str(attrs[parts[1]])
-                return str(res.get("PhysicalResourceId", var))
+                if "PhysicalResourceId" in res:
+                    raise ValueError(
+                        _unknown_attribute_message(res, parts[0], parts[1]))
+                return var
             # Resource physical ID
             if var in resources and "PhysicalResourceId" in resources[var]:
                 return str(resources[var]["PhysicalResourceId"])

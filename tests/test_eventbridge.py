@@ -2082,36 +2082,47 @@ def test_eventbridge_replay_dispatch_uses_replay_region(eb, sqs):
 
 
 def test_eventbridge_archive_event_count_unchanged_after_replay(eb):
-    """Replay reads archived events non-destructively; EventCount stays the same."""
-    arch_name = f"postcnt-arch-{_uuid_mod.uuid4().hex[:8]}"
-    bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    """Replay reads archived events non-destructively; EventCount stays the same.
+
+    The archive lives on a dedicated bus: an unfiltered archive on the shared
+    default bus captures every event other xdist workers put there during the
+    replay window, so the count assertion would blame the replay for growth it
+    did not cause (that exact flake hit CI)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    bus_name = f"postcnt-bus-{uid}"
+    arch_name = f"postcnt-arch-{uid}"
+    bus_arn = eb.create_event_bus(Name=bus_name)["EventBusArn"]
     eb.create_archive(ArchiveName=arch_name, EventSourceArn=bus_arn)
-    eb.put_events(
-        Entries=[
-            {
-                "Source": "postcnt.src",
-                "DetailType": "CountCheck",
-                "Detail": json.dumps({}),
-                "EventBusName": "default",
-            }
-        ]
-    )
-    count_before = eb.describe_archive(ArchiveName=arch_name)["EventCount"]
-    archive_arn = eb.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
-    rep_name = f"rep-postcnt-{_uuid_mod.uuid4().hex[:8]}"
-    eb.start_replay(
-        ReplayName=rep_name,
-        EventSourceArn=archive_arn,
-        EventStartTime=0,
-        EventEndTime=time.time() + 3600,
-        Destination={"Arn": bus_arn},
-    )
-    time.sleep(0.3)
-    count_after = eb.describe_archive(ArchiveName=arch_name)["EventCount"]
-    assert count_after == count_before, (
-        "Replay must not consume or modify archived events"
-    )
-    eb.delete_archive(ArchiveName=arch_name)
+    try:
+        eb.put_events(
+            Entries=[
+                {
+                    "Source": "postcnt.src",
+                    "DetailType": "CountCheck",
+                    "Detail": json.dumps({}),
+                    "EventBusName": bus_name,
+                }
+            ]
+        )
+        count_before = eb.describe_archive(ArchiveName=arch_name)["EventCount"]
+        assert count_before == 1
+        archive_arn = eb.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
+        rep_name = f"rep-postcnt-{uid}"
+        eb.start_replay(
+            ReplayName=rep_name,
+            EventSourceArn=archive_arn,
+            EventStartTime=0,
+            EventEndTime=time.time() + 3600,
+            Destination={"Arn": bus_arn},
+        )
+        time.sleep(0.3)
+        count_after = eb.describe_archive(ArchiveName=arch_name)["EventCount"]
+        assert count_after == count_before, (
+            "Replay must not consume or modify archived events"
+        )
+    finally:
+        eb.delete_archive(ArchiveName=arch_name)
+        eb.delete_event_bus(Name=bus_name)
 
 
 def test_eventbridge_duplicate_replay_name_fails(eb):

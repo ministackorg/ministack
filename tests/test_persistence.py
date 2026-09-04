@@ -645,6 +645,26 @@ def test_backup_round_trip():
     _round_trip("backup", "backup", populate, observe)
 
 
+def test_s3_mrap_round_trip():
+    """A multi-region access point outlives a restart. Its alias is baked into
+    client configuration, so member buckets coming back without the alias
+    fronting them fails where a missing bucket would not."""
+    def populate(mod):
+        mod._mraps["ea0672af90364.mrap"] = {
+            "Name": "app-release",
+            "Alias": "ea0672af90364.mrap",
+            "Regions": ["app-us-east-1-release", "app-eu-west-1-release"],
+            "CreatedAt": "2026-01-01T00:00:00Z",
+        }
+
+    def observe(mod):
+        mrap = mod._mraps["ea0672af90364.mrap"]
+        assert mrap["Name"] == "app-release"
+        assert mrap["Regions"] == ["app-us-east-1-release", "app-eu-west-1-release"]
+
+    _round_trip("s3", "s3", populate, observe)
+
+
 def test_transcribe_round_trip():
     import time as _time
 
