@@ -5650,6 +5650,15 @@ def _add_permission(
         condition.setdefault("StringEquals", {})["aws:PrincipalOrgID"] = data["PrincipalOrgID"]
     if "FunctionUrlAuthType" in data:
         condition.setdefault("StringEquals", {})["lambda:FunctionUrlAuthType"] = data["FunctionUrlAuthType"]
+    if "EventSourceToken" in data:
+        condition.setdefault("StringEquals", {})["lambda:EventSourceToken"] = data["EventSourceToken"]
+    if "InvokedViaFunctionUrl" in data:
+        # Lambda writes this one as a Bool condition with a string value
+        # (https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html).
+        invoked = data["InvokedViaFunctionUrl"]
+        if not isinstance(invoked, bool):
+            invoked = str(invoked).lower() == "true"
+        condition["Bool"] = {"lambda:InvokedViaFunctionUrl": "true" if invoked else "false"}
     if condition:
         statement["Condition"] = condition
 
