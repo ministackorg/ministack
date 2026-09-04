@@ -6112,13 +6112,15 @@ def _r53_record_set_delete(physical_id, props):
 # ---------------------------------------------------------------------------
 
 
-def _cw_metric_alarm_create(logical_id, props, stack_name):
+def _cw_metric_alarm_record(name, props):
+    """The PutMetricAlarm-shaped record for a template's alarm properties.
+    An existing alarm of that name keeps its state: CloudFormation leaves
+    the state untouched on update and only rewrites the configuration."""
     if props.get("Metrics"):
         raise ValueError(
             "AWS::CloudWatch::Alarm Properties.Metrics (metric math) is not supported; "
             "use MetricName and Namespace."
         )
-    name = props.get("AlarmName") or _physical_name(stack_name, logical_id, max_len=255)
     metric_name = props.get("MetricName")
     namespace = props.get("Namespace")
     if not metric_name or not namespace:
@@ -6179,7 +6181,9 @@ def _cw_metric_alarm_create(logical_id, props, stack_name):
         "StateReason": _cw._alarms[name]["StateReason"]
         if name in _cw._alarms
         else "Unchecked: Initial alarm creation",
-        "StateUpdatedTimestamp": int(time.time()),
+        "StateUpdatedTimestamp": _cw._alarms[name].get("StateUpdatedTimestamp", int(time.time()))
+        if name in _cw._alarms
+        else int(time.time()),
         "ActionsEnabled": ae,
         "AlarmActions": alarm_actions,
         "OKActions": ok_actions,
@@ -6188,9 +6192,50 @@ def _cw_metric_alarm_create(logical_id, props, stack_name):
         "Unit": props.get("Unit"),
         "AlarmConfigurationUpdatedTimestamp": int(time.time()),
     }
+    return alarm
+
+
+def _cw_metric_alarm_put(name, props):
+    """Create or overwrite the alarm and apply the template's Tags. Every
+    property but AlarmName is "No interruption", so create and update run the
+    same path; Tags go through the tag store because PutMetricAlarm ignores
+    Tags on an existing alarm (its reference: "To change the tags of an
+    existing alarm, use TagResource or UntagResource")."""
+    alarm = _cw_metric_alarm_record(name, props)
     _cw.cloudformation_put_metric_alarm(alarm)
-    arn = alarm["AlarmArn"]
-    return name, {"Arn": arn}
+    tags = props.get("Tags") or []
+    _cw.cloudformation_set_metric_alarm_tags(
+        name, [t for t in tags if isinstance(t, dict) and t.get("Key")]
+    )
+    return name, {"Arn": alarm["AlarmArn"]}
+
+
+def _cw_metric_alarm_create(logical_id, props, stack_name):
+    name = props.get("AlarmName") or _physical_name(stack_name, logical_id, max_len=255)
+    return _cw_metric_alarm_put(name, props)
+
+
+def _cw_metric_alarm_update(physical_id, old_props, new_props, stack_name,
+                            logical_id=None):
+    """Update an alarm in place as PutMetricAlarm does: the configuration is
+    rewritten under the same name (what Ref returns) and the alarm state and
+    history stay. AlarmName is the one property with "Update requires:
+    Replacement"
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cloudwatch-alarm.html):
+    a rename creates the new alarm before the old one is removed. An alarm
+    deleted behind CloudFormation's back is recreated the same way.
+    """
+    name = new_props.get("AlarmName") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=255
+    )
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        name, physical_id if physical_id in _cw._alarms else None,
+        _cw_metric_alarm_create, _cw_metric_alarm_delete,
+    )
+    if replaced is not None:
+        return replaced
+    return _cw_metric_alarm_put(name, new_props)
 
 
 def _cw_metric_alarm_delete(physical_id, props):
@@ -7836,7 +7881,12 @@ _RESOURCE_HANDLERS = {
     },
     "AWS::CloudFront::Distribution": {"create": _cf_distribution_create, "delete": _cf_distribution_delete},
     "AWS::CloudFront::KeyValueStore": {"create": _cf_kvs_create, "update": _cf_kvs_update, "delete": _cf_kvs_delete},
-    "AWS::CloudWatch::Alarm": {"create": _cw_metric_alarm_create, "delete": _cw_metric_alarm_delete},
+    "AWS::CloudWatch::Alarm": {
+        "create": _cw_metric_alarm_create,
+        "update": _cw_metric_alarm_update,
+        "update_with_logical_id": True,
+        "delete": _cw_metric_alarm_delete,
+    },
     "AWS::CloudWatch::Dashboard": {
         "create": _cw_dashboard_create,
         "update": _cw_dashboard_update,

@@ -12746,3 +12746,213 @@ def test_cfn_state_machine_update_changes_tags_in_place(cfn, sfn):
         assert tags_of(arn) == {"env": "prod", "owner": "ops"}
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cloudwatch_alarm_update_keeps_name_and_state(cfn, cw):
+    """Threshold and description update the alarm in place as PutMetricAlarm
+    does: same name and ARN, and the alarm state set before the update is
+    left unchanged, as CloudFormation documents — its timestamp included,
+    since the state did not change."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-alarm-upd-{uid}"
+    alarm_name = f"cfn-alarm-upd-{uid}"
+
+    def template(threshold, description):
+        return json.dumps({
+            "Resources": {"Alarm": {"Type": "AWS::CloudWatch::Alarm", "Properties": {
+                "AlarmName": alarm_name, "AlarmDescription": description,
+                "MetricName": "CPUUtilization", "Namespace": f"CfnAlarmUpd/{uid}",
+                "Statistic": "Average", "Period": 60, "EvaluationPeriods": 1,
+                "Threshold": threshold, "ComparisonOperator": "GreaterThanThreshold",
+            }}},
+            "Outputs": {"Name": {"Value": {"Ref": "Alarm"}},
+                        "Arn": {"Value": {"Fn::GetAtt": ["Alarm", "Arn"]}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(80, "before"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _output(stack, "Arn")
+        cw.set_alarm_state(AlarmName=alarm_name, StateValue="ALARM", StateReason="seeded")
+        seeded = cw.describe_alarms(AlarmNames=[alarm_name])["MetricAlarms"][0]
+        time.sleep(1.1)  # timestamps are whole seconds; a reset must be visible
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(90, "after"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Name") == alarm_name
+        assert _output(stack, "Arn") == arn
+
+        alarms = cw.describe_alarms(AlarmNames=[alarm_name])["MetricAlarms"]
+        assert len(alarms) == 1
+        assert float(alarms[0]["Threshold"]) == 90.0
+        assert alarms[0]["AlarmDescription"] == "after"
+        assert alarms[0]["AlarmArn"] == arn
+        assert alarms[0]["StateValue"] == "ALARM"
+        assert alarms[0]["StateReason"] == "seeded"
+        assert alarms[0]["StateUpdatedTimestamp"] == seeded["StateUpdatedTimestamp"]
+        assert alarms[0]["AlarmConfigurationUpdatedTimestamp"] > seeded["AlarmConfigurationUpdatedTimestamp"]
+
+        _delete_cfn_test_stack(cfn, stack_name)
+        assert cw.describe_alarms(AlarmNames=[alarm_name])["MetricAlarms"] == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cloudwatch_alarm_rename_replaces_the_alarm(cfn, cw):
+    """AlarmName is create-only: renaming creates the new alarm and removes
+    the old one."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-alarm-ren-{uid}"
+
+    def template(name):
+        return json.dumps({
+            "Resources": {"Alarm": {"Type": "AWS::CloudWatch::Alarm", "Properties": {
+                "AlarmName": name, "MetricName": "Errors", "Namespace": f"CfnAlarmRen/{uid}",
+                "Statistic": "Sum", "Period": 60, "EvaluationPeriods": 1,
+                "Threshold": 1, "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+            }}},
+            "Outputs": {"Name": {"Value": {"Ref": "Alarm"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(f"cfn-alarm-a-{uid}"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(f"cfn-alarm-b-{uid}"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Name") == f"cfn-alarm-b-{uid}"
+        names = {a["AlarmName"] for a in cw.describe_alarms(
+            AlarmNamePrefix="cfn-alarm-")["MetricAlarms"]}
+        assert f"cfn-alarm-b-{uid}" in names
+        assert f"cfn-alarm-a-{uid}" not in names
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cloudwatch_alarm_update_drops_omitted_properties(cfn, cw):
+    """"the update completely overwrites the previous configuration of the
+    alarm" (aws-resource-cloudwatch-alarm.html): a property left out of the
+    new template falls back to its default rather than surviving from the
+    old one."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-alarm-drop-{uid}"
+    alarm_name = f"cfn-alarm-drop-{uid}"
+    base = {
+        "AlarmName": alarm_name, "MetricName": "Errors", "Namespace": f"CfnAlarmDrop/{uid}",
+        "Statistic": "Sum", "Period": 60, "EvaluationPeriods": 1,
+        "Threshold": 1, "ComparisonOperator": "GreaterThanThreshold",
+    }
+
+    def template(**extra):
+        return json.dumps({"Resources": {"Alarm": {
+            "Type": "AWS::CloudWatch::Alarm", "Properties": {**base, **extra}}}})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(
+        AlarmDescription="described", TreatMissingData="notBreaching",
+        OKActions=[f"arn:aws:sns:us-east-1:000000000000:ok-{uid}"], Unit="Count"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        before = cw.describe_alarms(AlarmNames=[alarm_name])["MetricAlarms"][0]
+        assert before["AlarmDescription"] == "described"
+        assert before["TreatMissingData"] == "notBreaching"
+        assert before["OKActions"] == [f"arn:aws:sns:us-east-1:000000000000:ok-{uid}"]
+        assert before["Unit"] == "Count"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(Threshold=2))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        after = cw.describe_alarms(AlarmNames=[alarm_name])["MetricAlarms"][0]
+        assert float(after["Threshold"]) == 2.0
+        assert after.get("AlarmDescription", "") == ""
+        assert after["TreatMissingData"] == "missing"
+        assert after["OKActions"] == []
+        assert "Unit" not in after
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cloudwatch_alarm_update_recreates_an_alarm_deleted_out_of_band(cfn, cw):
+    """An alarm removed through DeleteAlarms while its stack still declares it
+    is created again by the next update (the replacement path), under the
+    same name so Ref and the ARN stay what the stack reported."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-alarm-oob-{uid}"
+    alarm_name = f"cfn-alarm-oob-{uid}"
+
+    def template(threshold):
+        return json.dumps({
+            "Resources": {"Alarm": {"Type": "AWS::CloudWatch::Alarm", "Properties": {
+                "AlarmName": alarm_name, "MetricName": "Errors", "Namespace": f"CfnAlarmOob/{uid}",
+                "Statistic": "Sum", "Period": 60, "EvaluationPeriods": 1,
+                "Threshold": threshold, "ComparisonOperator": "GreaterThanThreshold",
+            }}},
+            "Outputs": {"Name": {"Value": {"Ref": "Alarm"}},
+                        "Arn": {"Value": {"Fn::GetAtt": ["Alarm", "Arn"]}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(1))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _output(stack, "Arn")
+        cw.delete_alarms(AlarmNames=[alarm_name])
+        assert cw.describe_alarms(AlarmNames=[alarm_name])["MetricAlarms"] == []
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(2))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Name") == alarm_name
+        assert _output(stack, "Arn") == arn
+        alarms = cw.describe_alarms(AlarmNames=[alarm_name])["MetricAlarms"]
+        assert len(alarms) == 1
+        assert float(alarms[0]["Threshold"]) == 2.0
+        assert alarms[0]["StateValue"] == "INSUFFICIENT_DATA"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cloudwatch_alarm_tags_apply_on_create_and_update(cfn, cw):
+    """Tags is "No interruption" (aws-resource-cloudwatch-alarm.html) and
+    PutMetricAlarm ignores Tags on an existing alarm ("To change the tags of
+    an existing alarm, use TagResource or UntagResource"), so the template's
+    Tags are applied as a whole: a changed value lands, a dropped key goes,
+    and the tags leave with the alarm."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-alarm-tags-{uid}"
+    alarm_name = f"cfn-alarm-tags-{uid}"
+
+    def template(tags):
+        return json.dumps({
+            "Resources": {"Alarm": {"Type": "AWS::CloudWatch::Alarm", "Properties": {
+                "AlarmName": alarm_name, "MetricName": "Errors", "Namespace": f"CfnAlarmTags/{uid}",
+                "Statistic": "Sum", "Period": 60, "EvaluationPeriods": 1,
+                "Threshold": 1, "ComparisonOperator": "GreaterThanThreshold",
+                "Tags": [{"Key": k, "Value": v} for k, v in tags.items()],
+            }}},
+            "Outputs": {"Arn": {"Value": {"Fn::GetAtt": ["Alarm", "Arn"]}}},
+        })
+
+    def tags_of(arn):
+        return {t["Key"]: t["Value"] for t in cw.list_tags_for_resource(ResourceARN=arn)["Tags"]}
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template({"env": "dev", "team": "a"}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _output(stack, "Arn")
+        assert tags_of(arn) == {"env": "dev", "team": "a"}
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template({"env": "prod"}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert tags_of(arn) == {"env": "prod"}
+
+        _delete_cfn_test_stack(cfn, stack_name)
+        with pytest.raises(ClientError) as exc:
+            cw.list_tags_for_resource(ResourceARN=arn)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFound"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
