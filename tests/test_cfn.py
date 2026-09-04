@@ -11774,3 +11774,49 @@ def test_cfn_cognito_user_pool_schema_update_adds_custom_attributes(cfn, cognito
         assert [u["Username"] for u in users] == ["alice"]
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cognito_user_pool_enabled_mfas_update(cfn, cognito_idp):
+    """EnabledMfas is "Update requires: No interruption" on the resource
+    reference: adding SOFTWARE_TOKEN_MFA on update switches the software
+    token block on in GetUserPoolMfaConfig, and dropping the property
+    switches it off again, on the same pool id with its user kept."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-pool-mfas-{uid}"
+
+    def template(enabled_mfas):
+        props = {"UserPoolName": f"cfn-pool-mfas-{uid}", "MfaConfiguration": "OPTIONAL"}
+        if enabled_mfas is not None:
+            props["EnabledMfas"] = enabled_mfas
+        return json.dumps({
+            "Resources": {"Pool": {"Type": "AWS::Cognito::UserPool", "Properties": props}},
+            "Outputs": {"PoolId": {"Value": {"Ref": "Pool"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(None))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        pool_id = _output(stack, "PoolId")
+        cfg = cognito_idp.get_user_pool_mfa_config(UserPoolId=pool_id)
+        assert "SoftwareTokenMfaConfiguration" not in cfg
+        cognito_idp.admin_create_user(UserPoolId=pool_id, Username="alice")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(["SOFTWARE_TOKEN_MFA"]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "PoolId") == pool_id
+        cfg = cognito_idp.get_user_pool_mfa_config(UserPoolId=pool_id)
+        assert cfg["MfaConfiguration"] == "OPTIONAL"
+        assert cfg["SoftwareTokenMfaConfiguration"]["Enabled"] is True
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(None))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "PoolId") == pool_id
+        cfg = cognito_idp.get_user_pool_mfa_config(UserPoolId=pool_id)
+        assert cfg["SoftwareTokenMfaConfiguration"]["Enabled"] is False
+        users = cognito_idp.list_users(UserPoolId=pool_id)["Users"]
+        assert [u["Username"] for u in users] == ["alice"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)

@@ -4008,16 +4008,31 @@ def _cognito_user_pool_create(logical_id, props, stack_name):
     if status >= 400:
         raise ValueError(f"AWS::Cognito::UserPool create failed: {body!r}")
     pid = json.loads(body)["UserPool"]["Id"]
-    if "SOFTWARE_TOKEN_MFA" in (props.get("EnabledMfas") or []):
-        # EnabledMfas (what CDK emits for mfaSecondFactor) maps onto the per
-        # method config blocks GetUserPoolMfaConfig reports. Only the software
-        # token block carries an Enabled flag in the API model; SMS and email
-        # configs are message/role shapes that come from their own properties,
-        # so a bare SMS_MFA/EMAIL_OTP entry has nothing faithful to invent.
-        _cognito._set_user_pool_mfa_config({
-            "UserPoolId": pid, "SoftwareTokenMfaConfiguration": {"Enabled": True},
-        })
+    _cognito_user_pool_software_token_mfa(pid, {}, props)
     return pid, _cognito_user_pool_attributes(pid)
+
+
+def _cognito_user_pool_software_token_mfa(pid, old_props, new_props):
+    """Apply an EnabledMfas change through SetUserPoolMfaConfig. EnabledMfas
+    (what CDK emits for mfaSecondFactor) maps onto the per method config
+    blocks GetUserPoolMfaConfig reports. Only the software token block
+    carries an Enabled flag in the API model; SMS and email configs are
+    message/role shapes that come from their own properties, so a bare
+    SMS_MFA/EMAIL_OTP entry has nothing faithful to invent. SOFTWARE_TOKEN_MFA
+    arriving switches the block on, its removal (or the property being
+    dropped) switches it off; a pool that never listed it is left without
+    the block, since a disabled block nobody asked for reads as drift to a
+    client that diffs the config.
+    """
+    was = "SOFTWARE_TOKEN_MFA" in (old_props.get("EnabledMfas") or [])
+    now = "SOFTWARE_TOKEN_MFA" in (new_props.get("EnabledMfas") or [])
+    if was == now:
+        return
+    status, _, body = _cognito._set_user_pool_mfa_config({
+        "UserPoolId": pid, "SoftwareTokenMfaConfiguration": {"Enabled": now},
+    })
+    if status >= 400:
+        raise ValueError(f"AWS::Cognito::UserPool EnabledMfas update failed: {body!r}")
 
 
 def _declared_or_default(old_props, new_props, defaults):
@@ -4089,6 +4104,7 @@ def _cognito_user_pool_update(physical_id, old_props, new_props, stack_name,
         if status >= 400:
             raise ValueError(f"AWS::Cognito::UserPool update failed: {body!r}")
 
+    _cognito_user_pool_software_token_mfa(physical_id, old_props, new_props)
     pool["Name"] = _cognito_user_pool_name(new_props, stack_name, logical_id or physical_id)
     if new_props.get("Schema") != old_props.get("Schema"):
         _cognito_user_pool_add_attributes(physical_id, pool, new_props.get("Schema"))
