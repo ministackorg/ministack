@@ -11182,7 +11182,7 @@ def test_snapstart_rejected_with_large_ephemeral_storage(lam):
         lam.delete_function(FunctionName=fname)
 
 
-# ──────────────── docker executor: no extraction-dir leak ────────────────
+# ──────────── docker executor: shared extraction cache (issue #1600) ────────────
 
 
 _SPAWN_LEAK_CONFIG = {
@@ -11193,51 +11193,100 @@ _SPAWN_LEAK_CONFIG = {
 }
 
 
-def _capture_mkdtemp(monkeypatch):
-    import tempfile as _tf
-    created = []
-    real = _tf.mkdtemp
-
-    def _capture(*a, **kw):
-        d = real(*a, **kw)
-        created.append(d)
-        return d
-
-    monkeypatch.setattr(_tf, "mkdtemp", _capture)
-    return created
+def _fresh_extract_cache(monkeypatch, tmp_path):
+    """Point the extraction cache at an empty per-test root."""
+    monkeypatch.setattr(lsvc, "_DOCKER_EXTRACT_CACHE", str(tmp_path / "extract"))
+    monkeypatch.setattr(lsvc, "_docker_extract_dirs", {})
 
 
-def test_spawn_failure_on_corrupt_zip_leaves_no_tmpdir(monkeypatch):
-    """A corrupt code zip raises out of the extraction block; the tmpdir made
-    just before must not be orphaned (issue #1600)."""
+def _count_extractions(monkeypatch):
+    calls = []
+    real = lsvc._extract_zip_preserving_mode
+
+    def counting(zf, dest):
+        calls.append(dest)
+        return real(zf, dest)
+
+    monkeypatch.setattr(lsvc, "_extract_zip_preserving_mode", counting)
+    return calls
+
+
+def test_spawn_failure_on_corrupt_zip_leaves_no_extraction(monkeypatch, tmp_path):
+    """A corrupt code zip raises out of the cache build; no partial tree may
+    linger on disk and nothing may be registered in the cache (issue #1600)."""
     monkeypatch.setattr(lsvc, "_docker_available", True)
     monkeypatch.setattr(lsvc, "_get_docker_client", lambda: object())
-    created = _capture_mkdtemp(monkeypatch)
+    _fresh_extract_cache(monkeypatch, tmp_path)
 
     with pytest.raises(zipfile.BadZipFile):
         lsvc._spawn_lambda_container(dict(_SPAWN_LEAK_CONFIG), b"this is not a zip")
 
-    assert created, "spawn never created an extraction dir"
-    assert not any(os.path.exists(d) for d in created)
+    assert lsvc._docker_extract_dirs == {}
+    assert not os.path.exists(lsvc._DOCKER_EXTRACT_CACHE) or not os.listdir(
+        lsvc._DOCKER_EXTRACT_CACHE)
 
 
-def test_spawn_failure_on_docker_api_timeout_leaves_no_tmpdir(monkeypatch):
+def test_spawn_failure_after_extraction_keeps_the_cache(monkeypatch, tmp_path):
     """images.get raising anything other than ImageNotFound (the reported
-    case: a socket read timeout) propagates after extraction; the tmpdir must
-    be removed on the way out (issue #1600)."""
+    case: a socket read timeout) propagates after extraction. The extracted
+    tree stays in the content-addressed cache — that is the point of it — and
+    the retry reuses it without a second unpack (issue #1600)."""
     monkeypatch.setattr(lsvc, "_docker_available", True)
     fake_client = MagicMock()
     fake_client.images.get.side_effect = TimeoutError("Read timed out.")
     monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)
-    created = _capture_mkdtemp(monkeypatch)
+    _fresh_extract_cache(monkeypatch, tmp_path)
+    extractions = _count_extractions(monkeypatch)
+    code = _make_zip("def handler(e, c): pass")
 
-    with pytest.raises(TimeoutError):
-        lsvc._spawn_lambda_container(
-            dict(_SPAWN_LEAK_CONFIG), _make_zip("def handler(e, c): pass"),
-        )
+    for _ in range(2):
+        with pytest.raises(TimeoutError):
+            lsvc._spawn_lambda_container(dict(_SPAWN_LEAK_CONFIG), code)
 
-    assert created, "spawn never created an extraction dir"
-    assert not any(os.path.exists(d) for d in created)
+    assert len(extractions) == 1, "second cold start must reuse the cached tree"
+    (key,) = lsvc._docker_extract_dirs
+    assert key.startswith("code-") and os.path.isdir(lsvc._docker_extract_dirs[key])
+
+
+def test_docker_extracted_dir_is_content_addressed(monkeypatch, tmp_path):
+    """Identical blobs share one tree; different blobs and kinds get their
+    own. The dirs are what every container of that code receives (read-only
+    bind mount or docker cp), so sharing is invisible from inside."""
+    _fresh_extract_cache(monkeypatch, tmp_path)
+    extractions = _count_extractions(monkeypatch)
+    code_a = _make_zip("def handler(e, c): return 1")
+    code_b = _make_zip("def handler(e, c): return 2")
+
+    d1 = lsvc._docker_extracted_dir(code_a, "code")
+    d2 = lsvc._docker_extracted_dir(code_a, "code")
+    d3 = lsvc._docker_extracted_dir(code_b, "code")
+    d4 = lsvc._docker_extracted_dir(code_a, "layer")
+    assert d1 == d2 and len({d1, d3, d4}) == 3
+    assert len(extractions) == 3
+    assert os.path.exists(os.path.join(d1, "index.py"))
+
+
+def test_context_arn_shim_survives_a_cached_code_dir(tmp_path):
+    """On a shared cached code dir the shim file already exists from the first
+    cold start; recognizing our own content must return the shim handler
+    rather than silently running the container without the shim."""
+    code_dir = tmp_path / "code"
+    code_dir.mkdir()
+    first = lsvc._write_context_arn_shim(str(code_dir), "python3.12", "index.handler")
+    second = lsvc._write_context_arn_shim(str(code_dir), "python3.12", "index.handler")
+    assert first == second == "_msctx_shim.handler"
+    # A same-named file that came from the user's own zip is left alone.
+    (code_dir / "_msctx_shim.js").write_text("// user's own module")
+    assert lsvc._write_context_arn_shim(str(code_dir), "nodejs20.x", "index.handler") is None
+
+
+def test_reset_clears_the_extraction_cache(monkeypatch, tmp_path):
+    _fresh_extract_cache(monkeypatch, tmp_path)
+    lsvc._docker_extracted_dir(_make_zip("def handler(e, c): pass"), "code")
+    assert lsvc._docker_extract_dirs
+    lsvc.reset()
+    assert lsvc._docker_extract_dirs == {}
+    assert not os.path.exists(lsvc._DOCKER_EXTRACT_CACHE)
 
 
 def _make_zip_multi(files: dict) -> bytes:

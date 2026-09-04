@@ -389,6 +389,50 @@ def _provided_runtime_code_dir(code_zip: bytes) -> str:
         return code_dir
 
 
+# Content-addressed extraction cache for the docker executor (issue #1600).
+# One shared read-only tree per distinct code zip and per distinct layer zip,
+# extracted straight from memory once under the lock — which also paces a
+# cold-start burst: concurrent first-time extractions queue instead of
+# saturating the disk, the collapse mode reported in #1600. Containers
+# receive the tree by read-only bind mount or docker cp, so nothing inside a
+# container can observe the sharing: real Lambda extracts once per execution
+# environment and mounts /var/task and /opt read-only. Directories accumulate
+# per distinct blob within ``tempfile.gettempdir()``; ``reset()`` removes
+# them, like the provided-runtime cache above.
+_DOCKER_EXTRACT_CACHE = os.path.join(tempfile.gettempdir(), "ministack-lambda-extract")
+_docker_extract_lock = threading.Lock()
+_docker_extract_dirs: dict[str, str] = {}
+
+
+def _docker_extracted_dir(blob: bytes, kind: str) -> str:
+    """Extract ``blob`` once into a shared per-sha directory and return it."""
+    key = f"{kind}-{hashlib.sha256(blob).hexdigest()}"
+    with _docker_extract_lock:
+        cached = _docker_extract_dirs.get(key)
+        if cached and os.path.isdir(cached):
+            return cached
+        target = os.path.join(_DOCKER_EXTRACT_CACHE, key)
+        if os.path.isdir(target):
+            # Leftover from a previous process — contents may be partial.
+            import shutil
+            shutil.rmtree(target, ignore_errors=True)
+        os.makedirs(target, exist_ok=True)
+        try:
+            with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+                _extract_zip_preserving_mode(zf, target)
+            if kind == "code":
+                bootstrap = os.path.join(target, "bootstrap")
+                if os.path.exists(bootstrap):
+                    os.chmod(bootstrap, 0o755)
+        except BaseException:
+            # A partial tree must not linger (issue #1600) nor ever be served.
+            import shutil
+            shutil.rmtree(target, ignore_errors=True)
+            raise
+        _docker_extract_dirs[key] = target
+        return target
+
+
 # ── Persistence ────────────────────────────────────────────
 
 # Lambda code zips are stored on disk as content-addressed blob files under
@@ -3953,25 +3997,14 @@ def _declared_docker_platform(config: dict):
 
 def _spawn_lambda_container(config: dict, code_zip: bytes | None,
                             _pin_platform: bool = True):
-    """Create and start a Lambda container, never leaking the extraction dir.
+    """Create and start a Lambda container.
 
-    Everything between the extraction tmpdir's creation and the pool
-    registration can raise — a corrupt code or layer zip, or any Docker API
-    failure that is not one of the specifically-handled cases (e.g. a socket
-    read timeout out of ``images.get``, which is not ``ImageNotFound``).
-    Ownership of the tmpdir passes to the caller only on a successful return;
-    on any exception it is removed here instead of orphaning one extraction
-    per failed cold start (issue #1600).
+    Extraction happens into the shared content-addressed cache
+    (``_docker_extracted_dir``), which owns its directories — a failure
+    anywhere in the spawn leaks nothing per cold start (issue #1600), and
+    ``reset()`` clears the cache itself.
     """
-    made_tmpdirs: list[str] = []
-    try:
-        return _spawn_lambda_container_impl(config, code_zip, _pin_platform,
-                                            made_tmpdirs)
-    except BaseException:
-        import shutil
-        for d in made_tmpdirs:
-            shutil.rmtree(d, ignore_errors=True)
-        raise
+    return _spawn_lambda_container_impl(config, code_zip, _pin_platform)
 
 
 _PY_CTX_ARN_SHIM = '''\
@@ -4046,6 +4079,15 @@ def _write_context_arn_shim(code_dir: str, runtime: str, handler: str) -> str | 
         return None
     shim_path = os.path.join(code_dir, name)
     if os.path.exists(shim_path):
+        # On a shared cached code dir an earlier cold start of the same code
+        # already wrote the shim: ours by content means use it. A same-named
+        # file that came from the user's own zip is left alone.
+        try:
+            with open(shim_path) as f:
+                if f.read() == source:
+                    return shim_handler
+        except OSError:
+            pass
         return None
     try:
         with open(shim_path, "w") as f:
@@ -4058,7 +4100,7 @@ def _write_context_arn_shim(code_dir: str, runtime: str, handler: str) -> str | 
 
 
 def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
-                                 _pin_platform: bool, _made_tmpdirs: list):
+                                 _pin_platform: bool):
     """Create and start a Lambda container for the given config.
 
     A function that explicitly declared an architecture is pinned to it — but
@@ -4106,33 +4148,13 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
     if package_type == "Zip":
         if not code_zip:
             raise ValueError("Zip PackageType requires code_zip bytes")
-        tmpdir = tempfile.mkdtemp(prefix="ministack-lambda-docker-")
-        _made_tmpdirs.append(tmpdir)
-        code_dir = os.path.join(tmpdir, "code")
-        os.makedirs(code_dir)
-        code_zip_path = os.path.join(tmpdir, "code.zip")
-        with open(code_zip_path, "wb") as f:
-            f.write(code_zip)
-        with zipfile.ZipFile(code_zip_path) as zf:
-            _extract_zip_preserving_mode(zf, code_dir)
-        if is_provided:
-            bootstrap = os.path.join(code_dir, "bootstrap")
-            if os.path.exists(bootstrap):
-                os.chmod(bootstrap, 0o755)
+        code_dir = _docker_extracted_dir(code_zip, "code")
         for layer_ref in layers_list:
             layer_arn_str = layer_ref if isinstance(layer_ref, str) else layer_ref.get("Arn", "")
             layer_zip = _resolve_layer_zip(layer_arn_str)
             if not layer_zip:
                 continue
-            idx = len(layers_dirs)
-            layer_dir = os.path.join(tmpdir, f"layer_{idx}")
-            os.makedirs(layer_dir)
-            layer_zip_path = os.path.join(tmpdir, f"layer_{idx}.zip")
-            with open(layer_zip_path, "wb") as lf:
-                lf.write(layer_zip)
-            with zipfile.ZipFile(layer_zip_path) as lzf:
-                _extract_zip_preserving_mode(lzf, layer_dir)
-            layers_dirs.append(layer_dir)
+            layers_dirs.append(_docker_extracted_dir(layer_zip, "layer"))
 
     # Shared environment
     container_env: dict[str, str] = {
@@ -4285,9 +4307,6 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
             "running on the host architecture instead. Install a binfmt/qemu "
             "handler (or Rosetta) for real cross-architecture execution.",
             config.get("FunctionName"), docker_platform, reason)
-        if tmpdir and os.path.exists(tmpdir):
-            import shutil
-            shutil.rmtree(tmpdir, ignore_errors=True)
         return _spawn_lambda_container(config, code_zip, _pin_platform=False)
 
     # Apply LAMBDA_DOCKER_FLAGS — merge parsed kwargs into run_kwargs
@@ -4331,9 +4350,6 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
         except Exception as exc:
             if docker_platform:
                 return _platform_fallback(f"pull failed: {exc}")
-            if tmpdir and os.path.exists(tmpdir):
-                import shutil
-                shutil.rmtree(tmpdir, ignore_errors=True)
             raise RuntimeError(f"Failed to pull image {image}: {exc}")
 
     try:
@@ -4360,9 +4376,6 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
     except Exception as exc:
         if docker_platform:
             return _platform_fallback(f"container create/start failed: {exc}")
-        if tmpdir and os.path.exists(tmpdir):
-            import shutil
-            shutil.rmtree(tmpdir, ignore_errors=True)
         raise
 
     if docker_platform:
@@ -7705,6 +7718,9 @@ def reset():
     with _provided_code_lock:
         _provided_code_dirs.clear()
     shutil.rmtree(_PROVIDED_CODE_CACHE, ignore_errors=True)
+    with _docker_extract_lock:
+        _docker_extract_dirs.clear()
+    shutil.rmtree(_DOCKER_EXTRACT_CACHE, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
