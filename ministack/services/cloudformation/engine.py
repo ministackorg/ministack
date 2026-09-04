@@ -143,24 +143,33 @@ def validate_template_support(template: dict, conditions: dict) -> None:
 
     Raises ``ValueError`` with the message the caller wraps as a
     ``ValidationError``.
+
+    A template that still declares a ``Transform`` is exempt from the type
+    check: a macro can rewrite any resource, so real CloudFormation cannot
+    (and does not) pre-validate types through one — ``sam validate`` sends
+    SAM templates with ``AWS::Serverless::*`` resources to ValidateTemplate
+    and they pass. CreateStack, UpdateStack and CreateChangeSet apply the SAM
+    transform before calling this, so their expanded templates are validated
+    as usual.
     """
     from .provisioners import _RESOURCE_HANDLERS
 
     unrecognized: set[str] = set()
-    for res in (template.get("Resources") or {}).values():
-        if not isinstance(res, dict):
-            continue
-        cond = res.get("Condition")
-        if cond and not conditions.get(cond, True):
-            continue
-        rtype = res.get("Type", "AWS::CloudFormation::CustomResource")
-        if (
-            rtype in _RESOURCE_HANDLERS
-            or rtype.startswith("Custom::")
-            or rtype.startswith("AWS::CloudFormation::")
-        ):
-            continue
-        unrecognized.add(rtype)
+    if not template.get("Transform"):
+        for res in (template.get("Resources") or {}).values():
+            if not isinstance(res, dict):
+                continue
+            cond = res.get("Condition")
+            if cond and not conditions.get(cond, True):
+                continue
+            rtype = res.get("Type", "AWS::CloudFormation::CustomResource")
+            if (
+                rtype in _RESOURCE_HANDLERS
+                or rtype.startswith("Custom::")
+                or rtype.startswith("AWS::CloudFormation::")
+            ):
+                continue
+            unrecognized.add(rtype)
     if unrecognized:
         raise ValueError(
             "Template format error: Unrecognized resource types: ["

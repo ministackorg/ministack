@@ -5346,6 +5346,21 @@ def test_rds_restore_state_respawns_one_container_per_cluster(
                     },
                 },
             }
+
+        # Track the background provisioning threads restore_state starts so the
+        # assertions below can join them: the runner marks members available
+        # before it reaps the superseded legacy volumes, so a status-only wait
+        # can observe "settled" while the reap has not run yet (#1629).
+        started_threads = []
+        _RealThread = threading.Thread
+
+        class TrackedThread(_RealThread):
+            def start(self):
+                started_threads.append(self)
+                super().start()
+
+        monkeypatch.setattr(m.threading, "Thread", TrackedThread)
+
         m.restore_state({
             "instances": instances,
             "clusters": clusters,
@@ -5417,6 +5432,17 @@ def test_rds_restore_state_respawns_one_container_per_cluster(
             f"{scenario}: restore did not settle within 20s — the background "
             f"provisioning thread is still running, so the assertions below "
             f"would report a timeout as a behaviour change"
+        )
+
+        # "Settled" means the members' statuses landed; the legacy-volume reap
+        # runs after that write, in the same runner thread. Join the threads so
+        # the assertions observe the runner's full effect, not a snapshot taken
+        # inside its final window (#1629).
+        for thread in started_threads:
+            thread.join(timeout=10)
+        assert not any(t.is_alive() for t in started_threads), (
+            f"{scenario}: restore_state background threads still running "
+            f"after the settle wait"
         )
 
         if not writer_removal_succeeds or not reader_removal_succeeds or (

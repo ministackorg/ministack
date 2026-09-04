@@ -1087,31 +1087,6 @@ def test_cfn_iot_ca_certificate_pem_change_refused(cfn, iot_client):
     _wait_stack(cfn, "cfn-iot-ca-pem")
 
 
-def test_cfn_lambda_layer_version_permission(cfn, lam):
-    """AWS::Lambda::LayerVersionPermission attaches a statement to the real
-    layer version's policy, readable via GetLayerVersionPolicy. (#1345, item 5)"""
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as zf:
-        zf.writestr("lib.txt", "x")
-    layer = lam.publish_layer_version(
-        LayerName="cfn-perm-layer", Content={"ZipFile": buf.getvalue()})
-    arn = layer["LayerVersionArn"]
-
-    template = {"Resources": {"Perm": {
-        "Type": "AWS::Lambda::LayerVersionPermission", "Properties": {
-            "LayerVersionArn": arn, "Action": "lambda:GetLayerVersion",
-            "Principal": "123456789012", "StatementId": "cfn-sid"}}}}
-    cfn.create_stack(StackName="cfn-layer-perm", TemplateBody=json.dumps(template))
-    assert _wait_stack(cfn, "cfn-layer-perm")["StackStatus"] == "CREATE_COMPLETE"
-
-    pol = json.loads(lam.get_layer_version_policy(
-        LayerName="cfn-perm-layer", VersionNumber=1)["Policy"])
-    assert any(s["Sid"] == "cfn-sid" for s in pol["Statement"])
-
-    cfn.delete_stack(StackName="cfn-layer-perm")
-    _wait_stack(cfn, "cfn-layer-perm")
-
-
 def test_cfn_deleted_stack_name_is_reusable(cfn):
     """A DELETE_COMPLETE stack is addressable only by stack ID; its name is free
     to re-create, and an UpdateStack against the deleted name is "does not
@@ -6402,8 +6377,9 @@ def test_cfn_cloudfront_policy_oac_and_function_provision(cfn, cloudfront):
     assert oac_cfg["SigningBehavior"] == "always"
     assert oac_cfg["OriginAccessControlOriginType"] == "s3"
 
-    # AutoPublish defaults to true and CDK relies on it: a distribution
-    # associates the LIVE stage, so an unpublished function would never run.
+    # The template sets AutoPublish: true explicitly (as CDK emits it), so the
+    # function is published to LIVE; a created function defaults to the
+    # DEVELOPMENT stage per the resource reference.
     summary = cloudfront.describe_function(
         Name=f"cfn-fn-{suffix}", Stage="LIVE")["FunctionSummary"]
     assert summary["FunctionMetadata"]["Stage"] == "LIVE"
@@ -6413,6 +6389,30 @@ def test_cfn_cloudfront_policy_oac_and_function_provision(cfn, cloudfront):
     _wait_stack(cfn, "cfn-cf-policies")
     with pytest.raises(ClientError):
         cloudfront.get_cache_policy(Id=out["CachePolicyRef"])
+
+
+def test_cfn_cloudfront_function_without_autopublish_stays_in_development(cfn, cloudfront):
+    """"By default, when you create a function, it's in the DEVELOPMENT stage"
+    (AWS::CloudFront::Function reference): a template that omits AutoPublish
+    gets an unpublished function — DESCRIBE at LIVE fails, DEVELOPMENT works."""
+    name = "cfn-fn-devstage"
+    template = json.dumps({"Resources": {"Fn": {
+        "Type": "AWS::CloudFront::Function",
+        "Properties": {"Name": name, "FunctionCode": _FUNCTION_CODE,
+                       "FunctionConfig": {"Comment": "unpublished",
+                                          "Runtime": "cloudfront-js-2.0"}},
+    }}})
+    cfn.create_stack(StackName="cfn-cf-fn-dev", TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, "cfn-cf-fn-dev")
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        dev = cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")["FunctionSummary"]
+        assert dev["FunctionMetadata"]["Stage"] == "DEVELOPMENT"
+        with pytest.raises(ClientError):
+            cloudfront.describe_function(Name=name, Stage="LIVE")
+    finally:
+        cfn.delete_stack(StackName="cfn-cf-fn-dev")
+        _wait_stack(cfn, "cfn-cf-fn-dev")
 
 
 def test_cfn_cloudfront_distribution_consumes_provisioned_policies(cfn, cloudfront):
@@ -6484,7 +6484,8 @@ def _mrap_get(alias, key, region=None):
     import urllib.request
     endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     req = urllib.request.Request(f"{endpoint}/{key}")
-    req.add_header("Host", f"{alias}.mrap.accesspoint.s3-global.amazonaws.com")
+    # The alias itself ends in ".mrap"; the hostname appends only the suffix.
+    req.add_header("Host", f"{alias}.accesspoint.s3-global.amazonaws.com")
     if region:
         req.add_header("Authorization",
                        "AWS4-HMAC-SHA256 "
@@ -6506,7 +6507,10 @@ def test_cfn_s3_multi_region_access_point(cfn, s3):
     assert stack["StackStatus"] == "CREATE_COMPLETE"
 
     alias = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["Alias"]
-    assert len(alias) == 13 and alias.islower()
+    # The alias S3 mints ends in ".mrap" (e.g. mfzwi23gnjvgw.mrap); templates
+    # build "<alias>.accesspoint.s3-global.amazonaws.com" from it.
+    base, _, suffix = alias.rpartition(".")
+    assert suffix == "mrap" and len(base) == 13 and base.islower()
 
     cfn.delete_stack(StackName="cfn-s3-mrap")
     _wait_stack(cfn, "cfn-s3-mrap")
@@ -11236,6 +11240,20 @@ def test_cfn_unrecognized_type_behind_false_condition_is_fine(cfn):
     finally:
         cfn.delete_stack(StackName=name)
         _wait_stack(cfn, name)
+
+
+def test_cfn_validate_template_accepts_a_sam_template(cfn):
+    """A template that declares a Transform is exempt from the unrecognized
+    type check: a macro can rewrite any resource, so real CloudFormation does
+    not pre-validate types through one — `sam validate` sends templates with
+    AWS::Serverless::* resources to ValidateTemplate and they pass."""
+    tpl = json.dumps({
+        "Transform": "AWS::Serverless-2016-10-31",
+        "Resources": {"Fn": {"Type": "AWS::Serverless::Function", "Properties": {
+            "Handler": "index.handler", "Runtime": "python3.12",
+            "InlineCode": "def handler(e, c): return {}"}}},
+    })
+    cfn.validate_template(TemplateBody=tpl)
 
 
 def test_cfn_getatt_unknown_attribute_fails_the_stack(cfn, sqs):

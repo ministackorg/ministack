@@ -6189,7 +6189,8 @@ def _mrap_get(alias, key, region=None):
     import urllib.request
     endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     req = urllib.request.Request(f"{endpoint}/{key}")
-    req.add_header("Host", f"{alias}.mrap.accesspoint.s3-global.amazonaws.com")
+    # The alias itself ends in ".mrap"; the hostname appends only the suffix.
+    req.add_header("Host", f"{alias}.accesspoint.s3-global.amazonaws.com")
     if region:
         req.add_header("Authorization",
                        "AWS4-HMAC-SHA256 "
@@ -6201,29 +6202,47 @@ def _mrap_get(alias, key, region=None):
 
 def test_s3_mrap_alias_serves_the_region_member(cfn, s3):
     """The MRAP hostname resolved nowhere — it is not a bucket name and matched
-    no virtual-host rule. It now lands on the existing vhost path, and the member
-    carrying the request region is served rather than whichever is listed first."""
-    buckets = ["mrap-serve-us-east-1-app", "mrap-serve-eu-west-1-app"]
-    cfn.create_stack(StackName="cfn-s3-mrap-serve",
-                     TemplateBody=_mrap_template("serve-mrap-app", buckets))
-    stack = _wait_stack(cfn, "cfn-s3-mrap-serve")
-    assert stack["StackStatus"] == "CREATE_COMPLETE"
-    alias = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["Alias"]
+    no virtual-host rule. It now lands on the existing vhost path, and the
+    member whose *stored* bucket region matches the request region is served
+    rather than whichever is listed first. The buckets are created through the
+    S3 API (one per region, like a real MRAP's members) and only the access
+    point comes from the stack."""
+    us_bucket, eu_bucket = "mrap-serve-us-app", "mrap-serve-eu-app"
+    s3.create_bucket(Bucket=us_bucket)  # the client's own region, us-east-1
+    s3.create_bucket(Bucket=eu_bucket, CreateBucketConfiguration={
+        "LocationConstraint": "eu-west-1"})
+    template = json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {"Mrap": {"Type": "AWS::S3::MultiRegionAccessPoint",
+                               "Properties": {"Name": "serve-mrap-app",
+                                              "Regions": [{"Bucket": us_bucket},
+                                                          {"Bucket": eu_bucket}]}}},
+        "Outputs": {"Alias": {"Value": {"Fn::GetAtt": ["Mrap", "Alias"]}}},
+    })
+    cfn.create_stack(StackName="cfn-s3-mrap-serve", TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, "cfn-s3-mrap-serve")
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        alias = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["Alias"]
 
-    s3.put_object(Bucket=buckets[0], Key="who.txt", Body=b"US BUCKET")
-    s3.put_object(Bucket=buckets[1], Key="who.txt", Body=b"EU BUCKET")
+        s3.put_object(Bucket=us_bucket, Key="who.txt", Body=b"US BUCKET")
+        s3.put_object(Bucket=eu_bucket, Key="who.txt", Body=b"EU BUCKET")
 
-    # us-east-1 is listed first, so serving the eu-west-1 member proves the
-    # member is chosen by region rather than taken off the front of the list.
-    assert _mrap_get(alias, "who.txt", region="eu-west-1") == (200, "EU BUCKET")
-    assert _mrap_get(alias, "who.txt", region="us-east-1") == (200, "US BUCKET")
+        # us-east-1 is listed first, so serving the eu-west-1 member proves the
+        # member is chosen by its stored region rather than taken off the front.
+        assert _mrap_get(alias, "who.txt", region="eu-west-1") == (200, "EU BUCKET")
+        assert _mrap_get(alias, "who.txt", region="us-east-1") == (200, "US BUCKET")
 
-    # A request that carries no region at all (SigV4A's credential scope has
-    # none) falls back to the first member rather than failing.
-    assert _mrap_get(alias, "who.txt") == (200, "US BUCKET")
-
-    cfn.delete_stack(StackName="cfn-s3-mrap-serve")
-    _wait_stack(cfn, "cfn-s3-mrap-serve")
+        # A request whose credential scope names a region with no member falls
+        # back to the first member rather than failing (SigV4A carries no
+        # region at all and lands the same way).
+        assert _mrap_get(alias, "who.txt", region="ap-south-1") == (200, "US BUCKET")
+    finally:
+        cfn.delete_stack(StackName="cfn-s3-mrap-serve")
+        _wait_stack(cfn, "cfn-s3-mrap-serve")
+        for bucket in (us_bucket, eu_bucket):
+            s3.delete_object(Bucket=bucket, Key="who.txt")
+            s3.delete_bucket(Bucket=bucket)
 
 
 def _reset():

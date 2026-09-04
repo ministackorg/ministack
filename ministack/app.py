@@ -1663,7 +1663,7 @@ async def _handle_alb_request(host: str, path: str, method: str, headers: dict, 
 
 
 _MRAP_HOST_RE = re.compile(
-    r"^([a-z0-9]+)\.mrap\.accesspoint\.s3-global\.amazonaws\.com$", re.IGNORECASE
+    r"^([a-z0-9]+\.mrap)\.accesspoint\.s3-global\.amazonaws\.com$", re.IGNORECASE
 )
 
 

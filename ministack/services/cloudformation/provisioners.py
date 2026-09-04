@@ -284,10 +284,10 @@ def _cf_function_create(logical_id, props, stack_name):
 
     now = now_iso()
     dev_etag = new_uuid()
-    # AutoPublish defaults to true in the CFN spec, and CDK relies on it: a
-    # distribution associates the LIVE stage, so an unpublished function would
-    # never run.
-    auto_publish = props.get("AutoPublish", True)
+    # "By default, when you create a function, it's in the DEVELOPMENT stage"
+    # (AWS::CloudFront::Function reference) — publishing to LIVE happens only
+    # when the template sets AutoPublish to true, which CDK emits explicitly.
+    auto_publish = props.get("AutoPublish", False)
     if isinstance(auto_publish, str):
         auto_publish = auto_publish.lower() == "true"
 
@@ -304,9 +304,10 @@ def _cf_function_create(logical_id, props, stack_name):
         "dev_etag": dev_etag,
         "live_etag": new_uuid() if auto_publish else None,
     }
+    # The reference lists only FunctionARN and FunctionMetadata.FunctionARN as
+    # GetAtt attributes — no Stage.
     arn = _cf._func_arn(name)
-    return name, {"FunctionARN": arn, "FunctionMetadata.FunctionARN": arn,
-                  "Stage": "LIVE" if auto_publish else "DEVELOPMENT"}
+    return name, {"FunctionARN": arn, "FunctionMetadata.FunctionARN": arn}
 
 
 def _cf_function_delete(physical_id, props):

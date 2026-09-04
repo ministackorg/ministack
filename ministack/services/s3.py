@@ -83,18 +83,21 @@ _mraps = AccountScopedDict()  # Alias -> {Name, Alias, Regions: [bucket, ...], C
 
 
 def new_mrap_alias() -> str:
-    """A 13-character alias, the shape S3 mints for a Multi-Region Access Point."""
-    return new_uuid().replace("-", "")[:13].lower()
+    """The alias S3 mints for a Multi-Region Access Point: a 13-character
+    string suffixed with ``.mrap`` (e.g. ``mfzwi23gnjvgw.mrap``). The suffix is
+    part of the alias itself — GetAtt/GetMultiRegionAccessPoint return it, and
+    the hostname is ``<alias>.accesspoint.s3-global.amazonaws.com``."""
+    return new_uuid().replace("-", "")[:13].lower() + ".mrap"
 
 
 def resolve_mrap_bucket(alias: str):
     """The bucket an MRAP alias serves, or None.
 
     A real MRAP routes to whichever member bucket is nearest the caller. Nearest
-    has no meaning in a single-process emulator, so the member whose name carries
-    the request region wins and the first member is the fallback — deterministic,
-    and it makes a single-region MRAP (the common case in a local stack) resolve
-    to the only bucket it has.
+    has no meaning in a single-process emulator, so the member whose *stored*
+    region (recorded at CreateBucket) matches the request region wins and the
+    first member is the fallback — deterministic, and it makes a single-region
+    MRAP (the common case in a local stack) resolve to the only bucket it has.
     """
     record = _mraps.get(alias)
     if not record:
@@ -103,9 +106,11 @@ def resolve_mrap_bucket(alias: str):
     if not buckets:
         return None
     region = get_region()
-    for bucket in buckets:
-        if region and region in bucket:
-            return bucket
+    if region:
+        for bucket in buckets:
+            meta = _buckets.get(bucket)
+            if meta is not None and meta.get("region") == region:
+                return bucket
     return buckets[0]
 _bucket_acl = AccountScopedDict()
 _bucket_websites = AccountScopedDict()
