@@ -36,6 +36,18 @@ def _cfn_iceberg_json(path):
         return json.loads(resp.read().decode("utf-8") or "{}")
 
 
+# A resource that is accepted by the template pre-flight but fails when
+# provisioned: a custom resource whose Lambda does not exist. Tests that need a
+# runtime failure use this; unrecognized types are rejected before any
+# resource is touched (see test_cfn_unrecognized_resource_type_rejected_up_front).
+_FAILING_RESOURCE = {
+    "Type": "AWS::CloudFormation::CustomResource",
+    "Properties": {
+        "ServiceToken": "arn:aws:lambda:us-east-1:000000000000:function:cfn-does-not-exist",
+    },
+}
+
+
 def _wait_stack(cfn, name, timeout=30):
     """Poll until stack reaches terminal status.
 
@@ -1282,8 +1294,10 @@ def test_cfn_change_set_status_execution_and_lifecycle(cfn):
     does not outlive its stack (#1418)."""
     S = "cfn-1418"
     CS = "cdk-deploy-change-set"
-    bad = json.dumps({"Resources": {"X": {
-        "Type": "AWS::FakeService::Thing", "Properties": {}}}})
+    # Unrecognized types are rejected at CreateChangeSet time now (like AWS),
+    # so a custom resource whose Lambda does not exist provides the
+    # execution-time failure this test is about.
+    bad = json.dumps({"Resources": {"X": _FAILING_RESOURCE}})
     ok = json.dumps({"Resources": {"P": {"Type": "AWS::SSM::Parameter",
         "Properties": {"Name": "/cfn-1418/p", "Type": "String",
                        "Value": "v"}}}})
@@ -2016,10 +2030,7 @@ def test_cfn_rollback_on_failure(cfn, s3):
                 "Type": "AWS::S3::Bucket",
                 "Properties": {"BucketName": "cfn-t15-rollback"},
             },
-            "Bad": {
-                "Type": "AWS::Fake::Nope",
-                "Properties": {},
-            },
+            "Bad": _FAILING_RESOURCE,
         },
     }
     cfn.create_stack(
@@ -2109,10 +2120,7 @@ def test_cfn_update_rollback_on_failure(cfn, s3):
                 "Type": "AWS::S3::Bucket",
                 "Properties": {"BucketName": "cfn-t18-orig"},
             },
-            "Bad": {
-                "Type": "AWS::Fake::Nope",
-                "Properties": {},
-            },
+            "Bad": _FAILING_RESOURCE,
         },
     }
     cfn.update_stack(StackName="cfn-t18", TemplateBody=json.dumps(template_v2))
@@ -10022,13 +10030,10 @@ def test_cfn_create_rollback_delete_failure_lands_rollback_failed(cfn, lam):
                     "ServiceToken": f"arn:aws:lambda:us-east-1:000000000000:function:{fn}",
                 },
             },
-            # Provisioned after CR; its unsupported type fails the create and
-            # triggers the rollback that has to delete CR again.
-            "Bad": {
-                "Type": "AWS::Unsupported::DoesNotExist",
-                "DependsOn": "CR",
-                "Properties": {},
-            },
+            # Provisioned after CR; its create fails (custom resource whose
+            # Lambda does not exist) and triggers the rollback that has to
+            # delete CR again.
+            "Bad": {**_FAILING_RESOURCE, "DependsOn": "CR"},
         },
     }
     try:
@@ -10092,9 +10097,8 @@ def test_cfn_update_rollback_delete_failure_lands_update_rollback_failed(cfn, la
         },
     }
     updated["Resources"]["Bad"] = {
-        "Type": "AWS::Unsupported::DoesNotExist",
+        **_FAILING_RESOURCE,
         "DependsOn": "CR",
-        "Properties": {},
     }
     try:
         cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(base))
@@ -10896,3 +10900,156 @@ def test_cfn_cognito_user_pool_enabled_mfas(cfn, cognito_idp):
 
     cfn.delete_stack(StackName="cfn-enabled-mfas")
     _wait_stack(cfn, "cfn-enabled-mfas")
+
+
+# -- Template pre-flight and Fn::GetAtt strictness ---------------------------
+# Measured on a real account (eu-central-1, 2026-09-02): CreateStack,
+# UpdateStack, CreateChangeSet and ValidateTemplate reject an unrecognized
+# resource type synchronously with the exact message below and create no stack;
+# a Fn::GetAtt to an attribute the type does not have passes validation, the
+# resource is created, then the stack rolls back with
+# "Requested attribute X does not exist in schema for T".
+
+_UNRECOGNIZED_MESSAGE = (
+    "Template format error: Unrecognized resource types: [AWS::Baz::Qux, AWS::Foo::Bar]"
+)
+
+
+def _bad_types_template():
+    return json.dumps({"Resources": {
+        "Queue": {"Type": "AWS::SQS::Queue"},
+        "Thing": {"Type": "AWS::Foo::Bar", "Properties": {}},
+        "Other": {"Type": "AWS::Baz::Qux", "Properties": {}},
+    }})
+
+
+def test_cfn_unrecognized_resource_type_rejected_up_front(cfn, sqs):
+    """No stack, no change set and no resource exist after the rejections."""
+    bad = _bad_types_template()
+    name = "cfn-preflight-types"
+    for call in (
+        lambda: cfn.validate_template(TemplateBody=bad),
+        lambda: cfn.create_stack(StackName=name, TemplateBody=bad),
+        lambda: cfn.create_change_set(StackName=name, ChangeSetName="cs",
+                                      ChangeSetType="CREATE", TemplateBody=bad),
+    ):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["Error"]["Code"] == "ValidationError"
+        assert exc.value.response["Error"]["Message"] == _UNRECOGNIZED_MESSAGE
+
+    with pytest.raises(ClientError) as exc:
+        cfn.describe_stacks(StackName=name)
+    assert "does not exist" in str(exc.value)
+    assert not [s for s in cfn.list_stacks()["StackSummaries"]
+                if s["StackName"] == name]
+    # The valid sibling was never provisioned.
+    assert not [u for u in sqs.list_queues().get("QueueUrls", [])
+                if "cfn-preflight-types" in u]
+
+
+def test_cfn_unrecognized_resource_type_rejected_on_update(cfn, sqs):
+    """An update carrying an unrecognized type is refused without touching the
+    stack: status and resources stay as they were."""
+    name = "cfn-preflight-update"
+    good = json.dumps({"Resources": {"Queue": {"Type": "AWS::SQS::Queue"}}})
+    cfn.create_stack(StackName=name, TemplateBody=good)
+    try:
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        with pytest.raises(ClientError) as exc:
+            cfn.update_stack(StackName=name, TemplateBody=_bad_types_template())
+        assert exc.value.response["Error"]["Message"] == _UNRECOGNIZED_MESSAGE
+        stack = cfn.describe_stacks(StackName=name)["Stacks"][0]
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        assert [r["LogicalResourceId"] for r in
+                cfn.list_stack_resources(StackName=name)["StackResourceSummaries"]] == ["Queue"]
+    finally:
+        cfn.delete_stack(StackName=name)
+        _wait_stack(cfn, name)
+
+
+def test_cfn_unrecognized_type_behind_false_condition_is_fine(cfn):
+    """Condition-false resources are not provisioned, so their type is not
+    checked either (same rule as before)."""
+    name = "cfn-preflight-cond"
+    tpl = json.dumps({
+        "Conditions": {"Never": {"Fn::Equals": ["a", "b"]}},
+        "Resources": {
+            "Queue": {"Type": "AWS::SQS::Queue"},
+            "Thing": {"Type": "AWS::Foo::Bar", "Condition": "Never", "Properties": {}},
+        },
+    })
+    cfn.validate_template(TemplateBody=tpl)
+    cfn.create_stack(StackName=name, TemplateBody=tpl)
+    try:
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+    finally:
+        cfn.delete_stack(StackName=name)
+        _wait_stack(cfn, name)
+
+
+def test_cfn_getatt_unknown_attribute_fails_the_stack(cfn, sqs):
+    """Fn::GetAtt to an attribute the resource does not expose is no longer
+    answered with the physical id: the stack fails and rolls back with the
+    reason CloudFormation reports."""
+    name = "cfn-preflight-getatt"
+    tpl = json.dumps({
+        "Resources": {"Queue": {"Type": "AWS::SQS::Queue",
+                                "Properties": {"QueueName": "cfn-preflight-getatt-q"}}},
+        "Outputs": {"X": {"Value": {"Fn::GetAtt": ["Queue", "NoSuchAttr"]}}},
+    })
+    cfn.validate_template(TemplateBody=tpl)  # passes validation, as on AWS
+    cfn.create_stack(StackName=name, TemplateBody=tpl)
+    try:
+        assert _wait_stack(cfn, name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        reasons = [e.get("ResourceStatusReason", "") for e in
+                   cfn.describe_stack_events(StackName=name)["StackEvents"]]
+        assert any("Requested attribute NoSuchAttr does not exist in schema "
+                   "for AWS::SQS::Queue" in r for r in reasons), reasons
+        with pytest.raises(ClientError):
+            sqs.get_queue_url(QueueName="cfn-preflight-getatt-q")
+        assert not cfn.list_exports()["Exports"] or all(
+            e["ExportingStackId"] != cfn.describe_stacks(StackName=name)["Stacks"][0]["StackId"]
+            for e in cfn.list_exports()["Exports"])
+    finally:
+        cfn.delete_stack(StackName=name)
+        _wait_stack(cfn, name)
+
+
+def test_cfn_getatt_unknown_attribute_in_properties_fails_the_resource(cfn, sqs):
+    """The same rule inside Properties: the consumer fails, the stack rolls back
+    and the producer created before it is removed again."""
+    name = "cfn-preflight-getatt-prop"
+    tpl = json.dumps({"Resources": {
+        "A": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": "cfn-preflight-gp-a"}},
+        "B": {"Type": "AWS::SNS::Topic",
+              "Properties": {"DisplayName": {"Fn::GetAtt": ["A", "Nope"]}}},
+    }})
+    cfn.create_stack(StackName=name, TemplateBody=tpl)
+    try:
+        assert _wait_stack(cfn, name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        events = cfn.describe_stack_events(StackName=name)["StackEvents"]
+        b = [e for e in events if e["LogicalResourceId"] == "B"
+             and e["ResourceStatus"] == "CREATE_FAILED"]
+        assert b and "Requested attribute Nope does not exist in schema for AWS::SQS::Queue" in b[0]["ResourceStatusReason"]
+        with pytest.raises(ClientError):
+            sqs.get_queue_url(QueueName="cfn-preflight-gp-a")
+    finally:
+        cfn.delete_stack(StackName=name)
+        _wait_stack(cfn, name)
+
+
+def test_cfn_dynamic_reference_rejected(cfn):
+    """{{resolve:...}} is not resolved by the emulator; refusing it up front
+    beats handing the literal string to the service."""
+    tpl = json.dumps({"Resources": {"P": {
+        "Type": "AWS::SSM::Parameter",
+        "Properties": {"Type": "String", "Name": "/cfn-preflight/dyn",
+                       "Value": "{{resolve:secretsmanager:my-secret:SecretString:key}}"}}}})
+    with pytest.raises(ClientError) as exc:
+        cfn.create_stack(StackName="cfn-preflight-dyn", TemplateBody=tpl)
+    msg = exc.value.response["Error"]["Message"]
+    assert msg.startswith("Template format error: dynamic references are not supported")
+    assert "{{resolve:secretsmanager:my-secret:SecretString:key}}" in msg
+    with pytest.raises(ClientError):
+        cfn.describe_stacks(StackName="cfn-preflight-dyn")

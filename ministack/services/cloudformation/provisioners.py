@@ -126,7 +126,9 @@ def _provision_resource(resource_type: str, logical_id: str, props: dict,
         return _custom_resource_create(logical_id, props, stack_name, resource_type)
     # CloudFormation internal types are no-ops
     if resource_type.startswith("AWS::CloudFormation::"):
-        logger.info("CloudFormation internal type %s for %s -- noop", resource_type, logical_id)
+        logger.warning(
+            "CloudFormation type %s (%s) has no provisioner -- recorded as a "
+            "no-op placeholder, nothing is created", resource_type, logical_id)
         noop_id = f"{stack_name}-{logical_id}-noop-{new_uuid()[:8]}"
         return noop_id, {}
     raise ValueError(f"Unsupported resource type: {resource_type}")

@@ -20,6 +20,7 @@ from .engine import (
     _evaluate_conditions,
     _parse_template,
     _resolve_parameters,
+    validate_template_support,
 )
 from .helpers import _error, _esc, _extract_members, _extract_stack_status_filters, _p, _resolve_template, _xml
 from .stacks import (
@@ -70,6 +71,12 @@ def _create_stack(params):
     except ValueError as exc:
         return _error("ValidationError", str(exc))
 
+    conditions = _evaluate_conditions(template, param_values)
+    try:
+        validate_template_support(template, conditions)
+    except ValueError as exc:
+        return _error("ValidationError", str(exc))
+
     stack_id = (
         f"arn:aws:cloudformation:{get_region()}:{get_account_id()}:"
         f"stack/{stack_name}/{new_uuid()}"
@@ -99,7 +106,7 @@ def _create_stack(params):
         "_template": template,
         "_template_body": template_body,
         "_resolved_params": param_values,
-        "_conditions": _evaluate_conditions(template, param_values),
+        "_conditions": conditions,
     }
     _stacks[stack_name] = stack
     _stack_events[stack_id] = []
@@ -534,6 +541,12 @@ def _update_stack(params):
     except ValueError as exc:
         return _error("ValidationError", str(exc))
 
+    try:
+        validate_template_support(
+            template, _evaluate_conditions(template, param_values))
+    except ValueError as exc:
+        return _error("ValidationError", str(exc))
+
     # Save previous state for rollback
     previous_stack = {
         "_resources": copy.deepcopy(stack.get("_resources", {})),
@@ -595,6 +608,17 @@ def _validate_template(params):
     if "Resources" not in template:
         return _error("ValidationError",
                       "Template format error: At least one Resources member must be defined.")
+    try:
+        conditions = _evaluate_conditions(
+            template, _resolve_parameters(template, []))
+    except Exception:
+        # Parameters without defaults: validate every resource, conditions
+        # unknown.
+        conditions = {}
+    try:
+        validate_template_support(template, conditions)
+    except ValueError as exc:
+        return _error("ValidationError", str(exc))
     description = template.get("Description", "")
     param_defs = template.get("Parameters", {})
 

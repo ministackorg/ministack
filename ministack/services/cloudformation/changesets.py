@@ -13,6 +13,7 @@ from .engine import (
     _parse_template,
     _resolve_parameters,
     _resolve_refs,
+    validate_template_support,
 )
 from .helpers import _error, _esc, _extract_members, _p, _resolve_template, _xml
 from .stacks import (
@@ -151,17 +152,31 @@ def _create_change_set(params):
         if not template_body:
             template_body = stack.get("_template_body", "{}")
 
+    def _rejected(message):
+        # A rejected CreateChangeSet leaves no stack behind on AWS; drop the
+        # REVIEW_IN_PROGRESS placeholder created above for CREATE sets.
+        if cs_type == "CREATE":
+            _stacks.pop(stack_name, None)
+            _stack_events.pop(stack_id, None)
+        return _error("ValidationError", message)
+
     try:
         template = _parse_template(template_body)
         template = _apply_sam_transform_if_applicable(template)
     except Exception as e:
-        return _error("ValidationError", f"Template format error: {e}")
+        return _rejected(f"Template format error: {e}")
 
     try:
         param_values = _resolve_parameters(
             template, provided_params, stack.get("_resolved_params", {}))
     except ValueError as exc:
-        return _error("ValidationError", str(exc))
+        return _rejected(str(exc))
+
+    try:
+        validate_template_support(
+            template, _evaluate_conditions(template, param_values))
+    except ValueError as exc:
+        return _rejected(str(exc))
 
     # Compute changes — resolve parameters/intrinsics in BOTH templates first so
     # parameter-driven changes (the `aws cloudformation deploy

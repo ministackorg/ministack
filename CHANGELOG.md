@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **CloudFormation — unrecognized resource types are rejected up front, `Fn::GetAtt` to a missing attribute fails the stack** — a template with a resource type the emulator does not know provisioned every resource ahead of it, failed on that one and rolled the stack back; `CreateStack`, `UpdateStack`, `CreateChangeSet` and `ValidateTemplate` now refuse it synchronously with CloudFormation's own `Template format error: Unrecognized resource types: [...]` and leave no stack (or `REVIEW_IN_PROGRESS` placeholder) behind. Dynamic references (`{{resolve:ssm:...}}`, `{{resolve:secretsmanager:...}}`), which the emulator does not resolve, are refused the same way instead of reaching the service as literal strings. `Fn::GetAtt` to an attribute a resource does not expose answered with the physical id, a silently wrong value; it now fails the operation with `Requested attribute X does not exist in schema for T` and the stack rolls back, matching what a real account does. Outputs are resolved before the success path commits, so a failing output rolls back too and registers no export. Contributed by @iot-rocket.
+
 ## [1.5.7] — 2026-09-04
 
 ### Added

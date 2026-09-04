@@ -84,6 +84,46 @@ def _add_event(stack_id, stack_name, logical_id, resource_type, status,
 # Stack Deploy / Delete / Update Logic
 # ===========================================================================
 
+def _resolve_stack_outputs(outputs_defs, conditions, resources, param_values,
+                           mappings, stack_name, stack_id):
+    """Resolve the Outputs section against the provisioned resources.
+
+    Returns ``(outputs, exports)``. Nothing is written to the export table here,
+    so an output that fails to resolve leaves no half-registered exports behind.
+    """
+    resolved_outputs = []
+    exports = {}
+    for out_name, out_def in outputs_defs.items():
+        cond = out_def.get("Condition")
+        if cond and not conditions.get(cond, True):
+            continue
+        out_value = _resolve_refs(
+            copy.deepcopy(out_def.get("Value", "")),
+            resources, param_values, conditions,
+            mappings, stack_name, stack_id
+        )
+        output = {
+            "OutputKey": out_name,
+            "OutputValue": str(out_value),
+            "Description": out_def.get("Description", ""),
+        }
+        export_def = out_def.get("Export", {})
+        if export_def:
+            export_name = _resolve_refs(
+                copy.deepcopy(export_def.get("Name", "")),
+                resources, param_values, conditions,
+                mappings, stack_name, stack_id
+            )
+            output["ExportName"] = str(export_name)
+            exports[str(export_name)] = {
+                "StackId": stack_id,
+                "Name": str(export_name),
+                "Value": str(out_value),
+            }
+        resolved_outputs.append(output)
+    return resolved_outputs, exports
+
+
 async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                               param_values: dict, disable_rollback: bool,
                               tags: list, is_update: bool = False,
@@ -229,6 +269,25 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
 
     await asyncio.sleep(0)
 
+    resolved_outputs: list = []
+    new_exports: dict = {}
+    if not failed:
+        try:
+            resolved_outputs, new_exports = _resolve_stack_outputs(
+                outputs_defs, conditions, provisioned_resources, param_values,
+                mappings, stack_name, stack_id)
+        except Exception as exc:
+            # An output that cannot be resolved -- typically Fn::GetAtt to an
+            # attribute the resource does not expose -- fails the operation
+            # after every resource was created. Real CloudFormation rolls back
+            # at exactly this point, with the resolution error as the reason.
+            logger.error("Failed to resolve outputs of %s: %s", stack_name, exc)
+            failed = True
+            fail_reason = str(exc)
+            _add_event(stack_id, stack_name, stack_name,
+                       "AWS::CloudFormation::Stack", f"{status_prefix}_FAILED",
+                       fail_reason, stack_id)
+
     if failed:
         if disable_rollback:
             stack["StackStatus"] = f"{status_prefix}_FAILED"
@@ -296,41 +355,11 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                        "Rollback complete", stack_id)
         return
 
-    # Success: resolve outputs
+    # Success: publish outputs and exports
     stack["_resources"] = provisioned_resources
     stack["_template"] = template
     stack["_resolved_params"] = param_values
-
-    resolved_outputs = []
-    for out_name, out_def in outputs_defs.items():
-        cond = out_def.get("Condition")
-        if cond and not conditions.get(cond, True):
-            continue
-        out_value = _resolve_refs(
-            copy.deepcopy(out_def.get("Value", "")),
-            provisioned_resources, param_values, conditions,
-            mappings, stack_name, stack_id
-        )
-        output = {
-            "OutputKey": out_name,
-            "OutputValue": str(out_value),
-            "Description": out_def.get("Description", ""),
-        }
-        export_def = out_def.get("Export", {})
-        if export_def:
-            export_name = _resolve_refs(
-                copy.deepcopy(export_def.get("Name", "")),
-                provisioned_resources, param_values, conditions,
-                mappings, stack_name, stack_id
-            )
-            output["ExportName"] = str(export_name)
-            _exports[str(export_name)] = {
-                "StackId": stack_id,
-                "Name": str(export_name),
-                "Value": str(out_value),
-            }
-        resolved_outputs.append(output)
-
+    _exports.update(new_exports)
     stack["Outputs"] = resolved_outputs
     stack["StackStatus"] = f"{status_prefix}_COMPLETE"
     _add_event(stack_id, stack_name, stack_name,
