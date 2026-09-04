@@ -2945,29 +2945,38 @@ def _create_deployment(api_id, data):
     # If stageName is provided, create/update the stage automatically
     stage_name = data.get("stageName")
     if stage_name:
-        existing_stage = _stages_v1.get(api_id, {}).get(stage_name)
-        if existing_stage:
-            existing_stage["deploymentId"] = deployment_id
-            existing_stage["lastUpdatedDate"] = _now_unix()
-        else:
-            stage = {
-                "stageName": stage_name,
-                "deploymentId": deployment_id,
-                "description": data.get("stageDescription", ""),
-                "createdDate": _now_unix(),
-                "lastUpdatedDate": _now_unix(),
-                "variables": data.get("variables", {}),
-                "methodSettings": {},
-                "accessLogSettings": {},
-                "cacheClusterEnabled": False,
-                "cacheClusterSize": None,
-                "tracingEnabled": False,
-                "tags": {},
-                "documentationVersion": None,
-            }
-            _stages_v1.setdefault(api_id, {})[stage_name] = stage
+        _deploy_to_stage(api_id, deployment_id, stage_name,
+                         data.get("stageDescription", ""), data.get("variables", {}))
 
     return _v1_response(deployment, 201)
+
+
+def _deploy_to_stage(api_id, deployment_id, stage_name, description="", variables=None):
+    """Point a stage at a deployment, creating the stage when it does not
+    exist — what CreateDeployment does for its stageName, and what an
+    AWS::ApiGateway::Deployment update does for a changed StageName."""
+    existing_stage = _stages_v1.get(api_id, {}).get(stage_name)
+    if existing_stage:
+        existing_stage["deploymentId"] = deployment_id
+        existing_stage["lastUpdatedDate"] = _now_unix()
+        return existing_stage
+    stage = {
+        "stageName": stage_name,
+        "deploymentId": deployment_id,
+        "description": description,
+        "createdDate": _now_unix(),
+        "lastUpdatedDate": _now_unix(),
+        "variables": variables or {},
+        "methodSettings": {},
+        "accessLogSettings": {},
+        "cacheClusterEnabled": False,
+        "cacheClusterSize": None,
+        "tracingEnabled": False,
+        "tags": {},
+        "documentationVersion": None,
+    }
+    _stages_v1.setdefault(api_id, {})[stage_name] = stage
+    return stage
 
 
 def _get_deployments(api_id, query_params):

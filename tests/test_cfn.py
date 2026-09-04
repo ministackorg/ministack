@@ -14432,3 +14432,77 @@ def test_cfn_apigateway_authorizer_update_in_place_and_replacement(cfn, apigw_v1
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
 
+
+def test_cfn_apigateway_deployment_update_in_place_and_replacement(cfn, apigw_v1):
+    """A deployment's Description, StageName and StageDescription update in
+    place under the same deployment id: the description patches the
+    deployment, a new stage name deploys the same deployment to that stage
+    and leaves the previous stage standing. A RestApiId change replaces the
+    deployment on the other API."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-deploy-upd-{uid}"
+
+    def template(api, description, stage_name, stage_description, canary=None):
+        properties = {"RestApiId": {"Ref": api}, "Description": description}
+        if canary is not None:
+            properties["DeploymentCanarySettings"] = {"PercentTraffic": canary}
+        if stage_name:
+            properties["StageName"] = stage_name
+            properties["StageDescription"] = {"Description": stage_description,
+                                              "Variables": {"stage": stage_name}}
+        return json.dumps({
+            "Resources": {
+                "ApiA": {"Type": "AWS::ApiGateway::RestApi", "Properties": {"Name": f"cfn-deploy-a-{uid}"}},
+                "ApiB": {"Type": "AWS::ApiGateway::RestApi", "Properties": {"Name": f"cfn-deploy-b-{uid}"}},
+                "Dep": {"Type": "AWS::ApiGateway::Deployment", "Properties": properties},
+            },
+            "Outputs": {"Id": {"Value": {"Ref": "Dep"}},
+                        "AttId": {"Value": {"Fn::GetAtt": ["Dep", "DeploymentId"]}},
+                        "ApiA": {"Value": {"Ref": "ApiA"}}, "ApiB": {"Value": {"Ref": "ApiB"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("ApiA", "one", "alpha", "stage one"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        api_a, api_b = _output(stack, "ApiA"), _output(stack, "ApiB")
+        dep_id = _output(stack, "Id")
+        assert _output(stack, "AttId") == dep_id
+        assert apigw_v1.get_deployment(restApiId=api_a, deploymentId=dep_id)["description"] == "one"
+        stage = apigw_v1.get_stage(restApiId=api_a, stageName="alpha")
+        assert (stage["deploymentId"], stage["description"], stage["variables"]) == (
+            dep_id, "stage one", {"stage": "alpha"})
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("ApiA", "two", "beta", "stage two"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Id") == dep_id
+        assert apigw_v1.get_deployment(restApiId=api_a, deploymentId=dep_id)["description"] == "two"
+        assert len(apigw_v1.get_deployments(restApiId=api_a)["items"]) == 1
+        beta = apigw_v1.get_stage(restApiId=api_a, stageName="beta")
+        assert (beta["deploymentId"], beta["description"], beta["variables"]) == (
+            dep_id, "stage two", {"stage": "beta"})
+        assert apigw_v1.get_stage(restApiId=api_a, stageName="alpha")["deploymentId"] == dep_id
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("ApiB", "two", "beta", "stage two"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        new_id = _output(stack, "Id")
+        assert new_id != dep_id
+        assert apigw_v1.get_deployments(restApiId=api_a)["items"] == []
+        assert [d["id"] for d in apigw_v1.get_deployments(restApiId=api_b)["items"]] == [new_id]
+        assert apigw_v1.get_stage(restApiId=api_b, stageName="beta")["deploymentId"] == new_id
+
+        # DeploymentCanarySettings requires replacement on the reference: a
+        # new deployment id, the previous one removed by the engine.
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(
+            "ApiB", "two", "beta", "stage two", canary=10.0))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        canary_id = _output(stack, "Id")
+        assert canary_id != new_id
+        assert [d["id"] for d in apigw_v1.get_deployments(restApiId=api_b)["items"]] == [canary_id]
+        assert apigw_v1.get_stage(restApiId=api_b, stageName="beta")["deploymentId"] == canary_id
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+

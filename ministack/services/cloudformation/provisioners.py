@@ -3478,17 +3478,66 @@ def _apigw_authorizer_delete(physical_id, props):
 
 # --- API Gateway Deployment ---
 
+def _apigw_deployment_stage(props):
+    """The stage a deployment declares: StageName plus the StageDescription
+    object's Description and Variables (a plain string is taken as the
+    description, for templates written against earlier releases)."""
+    stage_description = props.get("StageDescription") or {}
+    if isinstance(stage_description, dict):
+        description = stage_description.get("Description", "")
+        variables = stage_description.get("Variables") or {}
+    else:
+        description, variables = str(stage_description), {}
+    return props.get("StageName"), description, variables
+
+
 def _apigw_deployment_create(logical_id, props, stack_name):
     api_id = props.get("RestApiId", "")
+    stage_name, stage_description, variables = _apigw_deployment_stage(props)
     data = {
         "description": props.get("Description", ""),
-        "stageName": props.get("StageName"),
-        "stageDescription": props.get("StageDescription", ""),
+        "stageName": stage_name,
+        "stageDescription": stage_description,
+        "variables": variables,
     }
-    status, headers, body = _apigw_v1._create_deployment(api_id, data)
-    deployment = json.loads(body) if isinstance(body, bytes) else json.loads(body)
-    deployment_id = deployment.get("id", "")
+    status, _headers, body = _apigw_v1._create_deployment(api_id, data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::Deployment create failed: {body!r}")
+    deployment_id = json.loads(body).get("id", "")
     return deployment_id, {"DeploymentId": deployment_id}
+
+
+def _apigw_deployment_update(physical_id, old_props, new_props, stack_name):
+    """Update a deployment in place, keeping its id (what Ref and DeploymentId
+    return): Description, StageName and StageDescription are No interruption
+    on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-deployment.html),
+    so a changed description patches the deployment and a changed stage name
+    or stage description deploys the same deployment to that stage, as the
+    create does. RestApiId and DeploymentCanarySettings require replacement:
+    a new deployment is created and the engine removes the old one. A stage
+    the template stops naming is left standing, as on AWS.
+
+    Not modelled: DeploymentCanarySettings is accepted without effect (the
+    create does not store it; a change still replaces), and of the
+    StageDescription object only Description and Variables reach the stage."""
+    api_id = new_props.get("RestApiId", "")
+    record = _apigw_v1._deployments_v1.get(api_id, {}).get(physical_id)
+    if record is None or any(
+        new_props.get(key) != old_props.get(key)
+        for key in ("RestApiId", "DeploymentCanarySettings")
+    ):
+        return _apigw_deployment_create(physical_id, new_props, stack_name)
+    if new_props.get("Description", "") != old_props.get("Description", ""):
+        status, _headers, body = _apigw_v1._update_deployment(api_id, physical_id, {
+            "patchOperations": [{"op": "replace", "path": "/description",
+                                 "value": new_props.get("Description", "")}]})
+        if status >= 400:
+            raise ValueError(f"AWS::ApiGateway::Deployment update failed: {body!r}")
+    stage = _apigw_deployment_stage(new_props)
+    if stage[0] and stage != _apigw_deployment_stage(old_props):
+        _apigw_v1._deploy_to_stage(api_id, physical_id, *stage)
+    return physical_id, {"DeploymentId": physical_id}
 
 
 def _apigw_deployment_delete(physical_id, props):
@@ -8268,9 +8317,11 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _apigw_authorizer_delete,
     },
-    # Deployment stays create-only: AWS treats a deployment as an immutable
-    # snapshot — an update is a new deployment (CFN replaces the resource).
-    "AWS::ApiGateway::Deployment": {"create": _apigw_deployment_create, "delete": _apigw_deployment_delete},
+    "AWS::ApiGateway::Deployment": {
+        "create": _apigw_deployment_create,
+        "update": _apigw_deployment_update,
+        "delete": _apigw_deployment_delete,
+    },
     "AWS::ApiGateway::Stage": {
         "create": _apigw_stage_create,
         "update": _apigw_stage_update,
