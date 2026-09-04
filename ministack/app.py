@@ -1693,7 +1693,7 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
 
     # IAM enforcement for S3 virtual-hosted requests
     if AUTH:
-        from ministack.core.iam_actions import _s3_action, extract_resource_arn
+        from ministack.core.iam_actions import _s3_action, extract_resource_arn, s3_additional_checks
 
         s3_action = _s3_action(method, vhost_path, query_params)
         if s3_action:
@@ -1701,6 +1701,12 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
             denied = _enforce_data_plane("s3", f"s3:{s3_action}", headers, query_params, "", resource_arn=s3_resource)
             if denied:
                 return denied
+            # A copy also reads its source, a batch delete is one check per
+            # key, an attributes call is a pair, a governance bypass its own action.
+            for extra_action, extra_arn in s3_additional_checks(method, vhost_path, headers, body, query_params):
+                denied = _enforce_data_plane("s3", extra_action, headers, query_params, "", resource_arn=extra_arn)
+                if denied:
+                    return denied
 
     try:
         # Pass the original (pre-rewrite) URI as signed_path so a presigned
@@ -2096,6 +2102,16 @@ async def _dispatch_service_request(
                 service, method, path, headers, body, routing_params, region, get_account_id()
             )
             denied = enforce(access_key, iam_action, service, region, resource_arn=resource_arn)
+            # A copy also reads its source, a batch delete is one check per
+            # key, an attributes call is a pair, a governance bypass its own action.
+            if service == "s3" and not denied:
+                from ministack.core.iam_actions import s3_additional_checks
+
+                for extra_action, extra_arn in s3_additional_checks(method, path, headers, body, routing_params):
+                    denied = enforce(access_key, extra_action, service, region, resource_arn=extra_arn)
+                    if denied:
+                        iam_action = extra_action
+                        break
             if denied:
                 if isinstance(denied, AuthError):
                     return access_denied_response(
