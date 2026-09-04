@@ -154,6 +154,7 @@ _MYSQL_BINLOG_RETENTION_SECONDS = 604800  # 7 days
 # convention as the MySQL replication user above.
 _PG_REPLICATION_USER = "rdsrepladmin"
 _PG_REPLICATION_PASSWORD = "rdsrepladmin-local-password"
+_PG_FAILOVER_TIMEOUT_SECONDS = 60
 
 # Runs on the writer container (docker exec). Idempotently creates the
 # replication role and opens pg_hba.conf for remote replication connections:
@@ -6969,21 +6970,136 @@ def _stop_db_cluster(p):
         f"<StopDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></StopDBClusterResult>")
 
 
+def _promote_pg_reader(instance):
+    """Promote a PostgreSQL standby and wait for recovery to finish."""
+    docker_client = _get_docker()
+    container_id = instance.get("_docker_container_id")
+    if not docker_client or not container_id:
+        return False
+    try:
+        container = docker_client.containers.get(container_id)
+        exit_code, output = container.exec_run([
+            "sh", "-c",
+            "psql -v ON_ERROR_STOP=1 --username \"$POSTGRES_USER\" "
+            "--dbname \"$POSTGRES_DB\" -Atc "
+            f"\"SELECT pg_promote(true, {_PG_FAILOVER_TIMEOUT_SECONDS}) "
+            "AND NOT pg_is_in_recovery()\"",
+        ])
+    except Exception as e:
+        logger.warning("RDS: failed to promote reader %s: %s",
+                       instance.get("DBInstanceIdentifier"), e)
+        return False
+    promoted = output.decode(errors="replace").strip().lower() if isinstance(output, bytes) else str(output).strip().lower()
+    if exit_code != 0 or promoted not in ("t", "true"):
+        logger.warning("RDS: reader promotion for %s exited %s: %s",
+                       instance.get("DBInstanceIdentifier"), exit_code, promoted)
+        return False
+    return True
+
+
+def _adopt_promoted_pg_writer(cluster, target):
+    """Make a promoted reader's container the cluster-owned writer compute."""
+    old = {
+        "container_id": cluster.get("_shared_container_id"),
+        "volume_name": cluster.get("_shared_volume_name"),
+        "host_port": cluster.get("_shared_host_port"),
+        "internal_address": cluster.get("_shared_internal_address"),
+        "internal_port": cluster.get("_shared_internal_port"),
+    }
+    cluster.update({
+        "_shared_container_id": target.get("_docker_container_id"),
+        "_shared_volume_name": target.get("_docker_volume_name"),
+        "_shared_host_port": target.get("_HostPort"),
+        "_shared_internal_address": target.get("_internal_address"),
+        "_shared_internal_port": target.get("_internal_port"),
+        "_shared_container_ready": True,
+        "_pg_replication_source_ready": True,
+    })
+    # Keep the stable cluster address where Docker DNS is available. The
+    # promoted container already has its instance endpoint for host-mode use.
+    endpoint = copy.deepcopy(target.get("Endpoint") or cluster.get("_shared_endpoint"))
+    cluster["_shared_endpoint"] = endpoint
+    target.pop("_pg_standby", None)
+    target["_shared_cluster_id"] = cluster["DBClusterIdentifier"]
+    return old
+
+
+def _reclone_old_pg_writer(cluster, instance, old_compute):
+    """Replace the former writer with a fresh base-backup standby.
+
+    MiniStack readers are disposable compute, like Aurora readers. Re-cloning
+    with the existing pg_basebackup bootstrap is slower than pg_rewind but
+    avoids a second recovery implementation and guarantees the former writer
+    follows the complete promoted timeline.
+    """
+    instance.pop("_shared_cluster_id", None)
+    instance.update({
+        "_pg_standby": True,
+        "_docker_container_id": old_compute.get("container_id"),
+        "_docker_volume_name": old_compute.get("volume_name"),
+        "_HostPort": old_compute.get("host_port"),
+        "_internal_address": old_compute.get("internal_address"),
+        "_internal_port": old_compute.get("internal_port"),
+        "DBInstanceStatus": "rebooting",
+    })
+    if not _revive_pg_reader(instance["DBInstanceIdentifier"], instance, cluster):
+        return False
+    deadline = time.time() + _PG_FAILOVER_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        if instance.get("DBInstanceStatus") == "available":
+            return True
+        if instance.get("DBInstanceStatus") in ("failed", "stopped"):
+            return False
+        time.sleep(0.25)
+    return False
+
+
 def _failover_db_cluster(p):
     with _shared_container_lock:
-        return _failover_db_cluster_impl(p)
+        response, reclone = _failover_db_cluster_impl(p)
+    if reclone is None:
+        return response
+    # The former writer is re-cloned outside the lock. Its readiness worker
+    # takes ``_shared_container_lock`` to provision the replication source
+    # and to publish the member ``available``, so waiting for that landing
+    # while holding the lock could only ever time out.
+    cluster, old_writer, old_compute = reclone
+    recloned = old_writer is not None and _reclone_old_pg_writer(
+        cluster, old_writer, old_compute,
+    )
+    cluster["Status"] = "available"
+    _sync_cluster_endpoints(cluster)
+    if not recloned:
+        # Promotion cannot safely be undone after the new timeline accepts
+        # writes. Keep metadata pointed at the real writer and fail loudly.
+        return _error(
+            "InternalFailure",
+            "Failed to create a standby after failing over DB cluster "
+            f"{cluster['DBClusterIdentifier']}.",
+            500,
+        )
+    return _failover_db_cluster_response(cluster)
+
+
+def _failover_db_cluster_response(cluster):
+    response_cluster = copy.deepcopy(cluster)
+    response_cluster["Status"] = "failing-over"
+    return _xml(200, "FailoverDBClusterResponse",
+        f"<FailoverDBClusterResult><DBCluster>{_cluster_xml(response_cluster)}</DBCluster></FailoverDBClusterResult>")
 
 
 def _failover_db_cluster_impl(p):
     """Force an intra-cluster failover: promote a reader member to writer.
 
-    Metadata-only for now, mirroring ``_failover_global_cluster``: the member
-    ``IsClusterWriter`` flags flip and the response reports the transitional
-    ``failing-over`` cluster status (the stored status stays ``available``,
-    as a follow-up DescribeDBClusters observes on AWS once the failover
-    completes). Data-plane promotion of a replicating reader container is a
-    follow-up (#1325); with today's shared-container clusters every member
-    already points at the same process, so there is nothing to re-point.
+    Runs under ``_shared_container_lock``. Returns ``(response, reclone)``:
+    ``reclone`` is ``None`` when the response is final, or the
+    ``(cluster, old_writer, old_compute)`` the caller must re-clone once
+    the lock is released, in which case ``response`` is ``None``.
+
+    Replicating Aurora PostgreSQL readers are promoted in PostgreSQL before
+    their metadata changes. The former writer is then re-cloned as a standby.
+    Shared-container and control-plane-only clusters retain the metadata-only
+    behavior because every member already addresses the same process.
 
     Error fidelity notes (wire codes from the RDS service model):
     - unknown cluster: ``DBClusterNotFoundFault`` (404)
@@ -6998,10 +7114,10 @@ def _failover_db_cluster_impl(p):
     if not cluster:
         wrong_region = _invalid_cluster_identifier_error(cluster_id)
         if wrong_region:
-            return wrong_region
-        return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
+            return wrong_region, None
+        return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404), None
     if switch_error := _mysql_global_writer_switch_mutation_error(cluster):
-        return switch_error
+        return switch_error, None
     cluster_id = cluster.get("DBClusterIdentifier", cluster_id)
     status = cluster.get("Status")
     if status != "available":
@@ -7010,7 +7126,7 @@ def _failover_db_cluster_impl(p):
             f"DbCluster {cluster_id} is in {status} state but expected it to "
             "be one of available.",
             400,
-        )
+        ), None
     if cluster.get("_shared_legacy_migration_in_progress") or cluster.get(
         "_shared_legacy_migration_blocked",
     ):
@@ -7024,7 +7140,7 @@ def _failover_db_cluster_impl(p):
             f"Cannot failover DB cluster {cluster_id} while legacy shared-"
             "storage migration is in progress.",
             400,
-        )
+        ), None
 
     members = cluster.get("DBClusterMembers", [])
     readers = [m for m in members if not m.get("IsClusterWriter")]
@@ -7038,27 +7154,27 @@ def _failover_db_cluster_impl(p):
         if not target:
             if not _resolve_instance(target_id):
                 return _error(
-                    "DBInstanceNotFound", f"DBInstance {target_id} not found.", 404)
+                    "DBInstanceNotFound", f"DBInstance {target_id} not found.", 404), None
             return _error(
                 "InvalidDBInstanceState",
                 f"DBInstance {target_id} is not a member of DB cluster "
                 f"{cluster_id}.",
                 400,
-            )
+            ), None
         if target.get("IsClusterWriter"):
             return _error(
                 "InvalidDBInstanceState",
                 f"DBInstance {target_id} is already the writer of DB cluster "
                 f"{cluster_id}; specify a reader instance to promote.",
                 400,
-            )
+            ), None
         target_instance = _resolve_instance(target_id)
         if target_instance is None:
             # A member with no backing instance record cannot happen today
             # (deletion unregisters the member synchronously), but promoting
             # a phantom would strand the cluster; refuse defensively.
             return _error(
-                "DBInstanceNotFound", f"DBInstance {target_id} not found.", 404)
+                "DBInstanceNotFound", f"DBInstance {target_id} not found.", 404), None
         if target_instance.get("DBInstanceStatus") != "available":
             return _error(
                 "InvalidDBInstanceState",
@@ -7066,7 +7182,7 @@ def _failover_db_cluster_impl(p):
                 f"{target_instance.get('DBInstanceStatus')} state but expected "
                 "it to be one of available.",
                 400,
-            )
+            ), None
     else:
         # AWS promotes the best candidate from the lowest promotion tier;
         # within a tier Ministack keeps member order (no instance sizing).
@@ -7084,19 +7200,41 @@ def _failover_db_cluster_impl(p):
                 f"Cannot failover DB cluster {cluster_id} because it has no "
                 "available reader instance to promote.",
                 400,
-            )
+            ), None
         target = candidates[0]
         target_id = target["DBInstanceIdentifier"]
+
+    old_writer_member = next((m for m in members if m.get("IsClusterWriter")), None)
+    old_writer = _resolve_instance(old_writer_member.get("DBInstanceIdentifier")) if old_writer_member else None
+    target_instance = _resolve_instance(target_id)
+    data_plane_failover = bool(
+        target_instance
+        and target_instance.get("_pg_standby")
+        and _pg_cluster_replication_enabled(cluster)
+    )
+    if data_plane_failover:
+        cluster["Status"] = "failing-over"
+        target_instance["DBInstanceStatus"] = "rebooting"
+        if not _promote_pg_reader(target_instance):
+            cluster["Status"] = "available"
+            target_instance["DBInstanceStatus"] = "available"
+            return _error(
+                "InternalFailure",
+                f"Failed to promote reader {target_id} for DB cluster {cluster_id}.",
+                500,
+            ), None
+        old_compute = _adopt_promoted_pg_writer(cluster, target_instance)
 
     for member in members:
         member["IsClusterWriter"] = (
             member.get("DBInstanceIdentifier") == target_id
         )
 
-    response_cluster = copy.deepcopy(cluster)
-    response_cluster["Status"] = "failing-over"
-    return _xml(200, "FailoverDBClusterResponse",
-        f"<FailoverDBClusterResult><DBCluster>{_cluster_xml(response_cluster)}</DBCluster></FailoverDBClusterResult>")
+    if data_plane_failover:
+        target_instance["DBInstanceStatus"] = "available"
+        return None, (cluster, old_writer, old_compute)
+
+    return _failover_db_cluster_response(cluster), None
 
 
 # ---------------------------------------------------------------------------

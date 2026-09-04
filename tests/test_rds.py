@@ -13381,8 +13381,10 @@ def _pg_repl_fake_docker(m, monkeypatch, member_ips, exec_calls, removed):
         def reload(self):
             pass
 
-        def exec_run(self, _cmd):
+        def exec_run(self, cmd):
             exec_calls.append(self.name)
+            if "pg_promote" in str(cmd):
+                return 0, b"t\n"
             return 0, b""
 
         def start(self):
@@ -13437,6 +13439,61 @@ def _pg_repl_fake_docker(m, monkeypatch, member_ips, exec_calls, removed):
         "volumes": volumes,
         "removed_volumes": removed_volumes,
     }
+
+
+def test_rds_pg_failover_promotes_and_reclones_writer(monkeypatch):
+    """The data-plane failover swaps compute only after promotion succeeds."""
+    from ministack.services import rds as m
+
+    exec_calls = []
+    removed = []
+    _pg_repl_fake_docker(
+        m, monkeypatch,
+        {"failover-pg-reader": "10.0.0.7", "failover-pg-writer": "10.0.0.8"},
+        exec_calls, removed,
+    )
+    monkeypatch.setattr(m, "_wait_for_database_ready", lambda *_args: True)
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "failover-pg",
+            "Engine": "aurora-postgresql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        for db_id in ("failover-pg-writer", "failover-pg-reader"):
+            m._create_db_instance({
+                "DBInstanceIdentifier": db_id,
+                "DBClusterIdentifier": "failover-pg",
+                "DBInstanceClass": "db.r6g.large",
+                "Engine": "aurora-postgresql",
+            })
+        cluster = m._clusters.get("failover-pg")
+        assert _poll_until(lambda: cluster["Status"] == "available")
+
+        status, _, body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-pg",
+            "TargetDBInstanceIdentifier": "failover-pg-reader",
+        })
+        assert status == 200
+        assert b"<Status>failing-over</Status>" in body
+        assert cluster["Status"] == "available"
+        assert _cluster_writer_flags(cluster) == {
+            "failover-pg-writer": False,
+            "failover-pg-reader": True,
+        }
+        promoted = m._instances.get("failover-pg-reader")
+        standby = m._instances.get("failover-pg-writer")
+        assert "_pg_standby" not in promoted
+        assert standby["_pg_standby"] is True
+        assert standby["DBInstanceStatus"] == "available"
+        assert cluster["_shared_container_id"] == promoted["_docker_container_id"]
+        assert cluster["ReaderEndpoint"] == standby["Endpoint"]["Address"]
+        assert any("failover-pg-reader" in name for name in exec_calls)
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
 
 
 def test_rds_pg_two_replicating_readers_provision_source_once(monkeypatch):
@@ -14633,6 +14690,53 @@ def test_aurora_pg_replicating_reader_live(rds):
             with conn.cursor() as cursor:
                 with pytest.raises(psycopg2.Error) as excinfo:
                     cursor.execute("INSERT INTO repl_rows VALUES (2, 'nope')")
+        assert excinfo.value.pgcode == "25006"
+
+
+@pytest.mark.skipif(
+    not _PG_REPLICATION_LIVE,
+    reason="DOCKER_NETWORK and MINISTACK_RDS_PG_CLUSTER_REPLICATION not set "
+    "-- live Aurora PostgreSQL replication",
+)
+def test_aurora_pg_failover_promotes_data_plane(rds):
+    """Failover moves writes to the reader and re-clones the old writer."""
+    with _live_pg_cluster(rds) as (cluster_id, writer_id, reader_id, writer, _reader, _cluster):
+        with _pg_connect(writer["Endpoint"]) as conn:
+            conn.autocommit = True
+            with conn.cursor() as cursor:
+                cursor.execute("CREATE TABLE failover_rows (id INT PRIMARY KEY)")
+                cursor.execute("INSERT INTO failover_rows VALUES (1)")
+
+        response = rds.failover_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            TargetDBInstanceIdentifier=reader_id,
+        )["DBCluster"]
+        assert response["Status"] == "failing-over"
+
+        cluster = rds.describe_db_clusters(
+            DBClusterIdentifier=cluster_id,
+        )["DBClusters"][0]
+        assert cluster["Status"] == "available"
+        assert {
+            member["DBInstanceIdentifier"]: member["IsClusterWriter"]
+            for member in cluster["DBClusterMembers"]
+        } == {writer_id: False, reader_id: True}
+
+        writer_endpoint = {"Address": cluster["Endpoint"], "Port": cluster["Port"]}
+        with _pg_connect(writer_endpoint) as conn:
+            conn.autocommit = True
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT id FROM failover_rows")
+                assert cursor.fetchall() == [(1,)]
+                cursor.execute("INSERT INTO failover_rows VALUES (2)")
+
+        reader_endpoint = {"Address": cluster["ReaderEndpoint"], "Port": cluster["Port"]}
+        import psycopg2
+
+        with _pg_connect(reader_endpoint) as conn:
+            conn.autocommit = True
+            with conn.cursor() as cursor, pytest.raises(psycopg2.Error) as excinfo:
+                cursor.execute("INSERT INTO failover_rows VALUES (3)")
         assert excinfo.value.pgcode == "25006"
 
 
