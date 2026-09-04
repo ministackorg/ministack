@@ -14107,9 +14107,13 @@ def test_rds_cluster_endpoint_alias_survives_the_record_changing_shape():
     from ministack.services import rds as rds_service
 
     name = "mydb.cluster-abc123.us-east-2.rds.amazonaws.com"
-    assert rds_service._cluster_endpoint_aliases({"Endpoint": name}) == [name]
+    reader = "mydb.cluster-ro-abc123.us-east-2.rds.amazonaws.com"
+    # The reader name rides along in shared-container mode: CreateDBCluster
+    # hands it out, so it has to resolve to the container that serves reads —
+    # which, while reads cannot move, is the writer's own container.
+    assert rds_service._cluster_endpoint_aliases({"Endpoint": name}) == [name, reader]
     assert rds_service._cluster_endpoint_aliases(
-        {"Endpoint": {"Address": name, "Port": 5432}}) == [name]
+        {"Endpoint": {"Address": name, "Port": 5432}}) == [name, reader]
 
     # An address is not a name. An earlier container may have left one behind,
     # and aliasing it would pin the endpoint to an address that has already moved.
@@ -14123,11 +14127,12 @@ def test_rds_cluster_endpoint_alias_survives_the_record_changing_shape():
         {"Endpoint": {"Address": "172.20.0.4"}}) == []
     assert rds_service._cluster_endpoint_aliases({}) == []
 
-    # ReaderEndpoint is deliberately not aliased: it has to follow whichever
-    # member is currently a reader, and failover moves that.
+    # The reader alias derives from the writer name (same unique suffix), not
+    # from whatever ReaderEndpoint currently holds — after the first sync that
+    # field carries an address, and the created name must survive relaunches.
     assert rds_service._cluster_endpoint_aliases(
-        {"Endpoint": name, "ReaderEndpoint": "ro.cluster-abc.rds.amazonaws.com"}
-    ) == [name]
+        {"Endpoint": name, "ReaderEndpoint": "172.20.0.9"}
+    ) == [name, reader]
 
 
 def test_rds_network_aliases_only_on_user_defined_networks():
@@ -14162,3 +14167,18 @@ def test_rds_container_worker_does_not_clobber_an_intervened_stop(monkeypatch):
     instance["DBInstanceStatus"] = "creating"
     m._start_rds_container_for_instance("stopped-mid-create", instance)
     assert instance["DBInstanceStatus"] == "available"
+
+
+def test_rds_cluster_reader_alias_skipped_under_pg_replication(monkeypatch):
+    """With PG streaming replication on, a standby serves reads — the
+    cluster-ro- name must not pin to the writer's container."""
+    from ministack.services import rds as rds_service
+
+    name = "mydb.cluster-abc123.us-east-2.rds.amazonaws.com"
+    monkeypatch.setattr(rds_service, "RDS_PG_CLUSTER_REPLICATION", True)
+    assert rds_service._cluster_endpoint_aliases(
+        {"Endpoint": name, "Engine": "aurora-postgresql"}) == [name]
+    # Aurora MySQL keeps aliasing the shared container even with the flag on.
+    assert rds_service._cluster_endpoint_aliases(
+        {"Endpoint": name, "Engine": "aurora-mysql"}) == [
+        name, "mydb.cluster-ro-abc123.us-east-2.rds.amazonaws.com"]

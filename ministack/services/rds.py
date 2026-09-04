@@ -3521,9 +3521,14 @@ def _cluster_endpoint_aliases(cluster):
     address. Docker's embedded DNS accepts dotted names, so the alias can be the
     real endpoint rather than something invented alongside it.
 
-    The writer endpoint only. ReaderEndpoint has to follow whichever member is
-    currently a reader, and a cluster can promote one on failover, so pinning it
-    to the writer's container would answer with the wrong database.
+    The reader endpoint rides along while reads cannot move off this
+    container: ``CreateDBCluster`` hands out the ``cluster-ro-`` name too, and
+    a consumer that stored it (Terraform's ``reader_endpoint`` during the
+    creating apply) otherwise gets a name nothing ever registered — the only
+    unresolvable endpoint we emit. In shared-container mode reads and writes
+    are the same database, so both names belong on the one container. When
+    PG streaming replication is on, a standby serves reads and the name is
+    left off the writer's container.
     """
     value = cluster.get("Endpoint")
     # Two shapes in practice: a bare string when the cluster is created, and the
@@ -3539,7 +3544,12 @@ def _cluster_endpoint_aliases(cluster):
     # host-run -> containerized restart, so it never qualifies.
     if (isinstance(value, str) and value and not value[0].isdigit()
             and value not in ("localhost", _MINISTACK_HOST)):
-        return [value]
+        aliases = [value]
+        if not _pg_cluster_replication_enabled(cluster) and ".cluster-" in value:
+            # Same unique suffix as the writer name, so the reader alias is
+            # derivable across relaunches without storing another field.
+            aliases.append(value.replace(".cluster-", ".cluster-ro-", 1))
+        return aliases
     return []
 
 
@@ -3987,16 +3997,24 @@ def _sync_cluster_endpoints(cluster):
     if not endpoint:
         return
     reader_endpoint = _cluster_reader_endpoint(cluster) or endpoint
-    cluster["Endpoint"] = endpoint.get("Address", cluster.get("Endpoint", ""))
+    writer_address = endpoint.get("Address", cluster.get("Endpoint", ""))
+    cluster["Endpoint"] = writer_address
     if reader_endpoint is endpoint:
-        # Falling back to the writer's container. The writer's Address may be a
-        # network alias, which is stable precisely because it is pinned to one
-        # container — and the reader endpoint must be free to move to a standby
-        # when one appears. Publish the address here, as before.
-        reader_address = (
-            cluster.get("_shared_internal_address")
-            or endpoint.get("Address", cluster.get("ReaderEndpoint", ""))
-        )
+        # Falling back to the writer's container. When the writer publishes
+        # its stable cluster- name (alias mode), the reader publishes the
+        # matching cluster-ro- name — the same one registered as an alias on
+        # the shared container — so DescribeDBClusters reports the AWS shape:
+        # a stable reader name that, with no replica, connects to the primary.
+        # Outside alias mode (host-run, default bridge) names cannot resolve,
+        # so the address is published as before.
+        if (isinstance(writer_address, str) and ".cluster-" in writer_address
+                and not _pg_cluster_replication_enabled(cluster)):
+            reader_address = writer_address.replace(".cluster-", ".cluster-ro-", 1)
+        else:
+            reader_address = (
+                cluster.get("_shared_internal_address")
+                or endpoint.get("Address", cluster.get("ReaderEndpoint", ""))
+            )
     else:
         reader_address = reader_endpoint.get(
             "Address", cluster.get("ReaderEndpoint", ""),
