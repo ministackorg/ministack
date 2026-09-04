@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **CloudFront — the policy, OAC and function types provision from CloudFormation** — `AWS::CloudFront::CachePolicy`, `OriginRequestPolicy`, `ResponseHeadersPolicy`, `OriginAccessControl` and `Function` had complete APIs and no CloudFormation provisioner, so a CDK app declaring any of them rolled the stack back with `Unsupported resource type` while the same objects were creatable over the API. Each type now provisions by converting its CFN properties to the element the service's own config parser accepts, so validation, defaults and the stored record are identical to the API path, and `Ref`/`Fn::GetAtt` return the documented values (policy `Id`, OAC `Id`, function `FunctionARN`). Deletes are wired; an update replaces rather than mutating in place. Contributed by @mm-salesqueze.
+
 ## [1.5.7] — 2026-09-04
 
 ### Added

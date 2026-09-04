@@ -4,6 +4,7 @@ import json
 import os
 import re
 import time
+import urllib.error
 import urllib.request
 import uuid as _uuid_mod
 import zipfile
@@ -6257,6 +6258,191 @@ def test_cfn_cloudfront_distribution_supports_invalidations(cfn, cloudfront):
     cfn.delete_stack(StackName=stack_name)
     stack = _wait_stack(cfn, stack_name)
     assert stack["StackStatus"] == "DELETE_COMPLETE"
+
+
+
+_FUNCTION_CODE = """
+function handler(event) {
+    var request = event.request;
+    request.headers['x-provisioned-by'] = {value: 'cloudformation'};
+    return request;
+}
+"""
+
+
+def _cloudfront_template(suffix):
+    return json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "CachePolicy": {"Type": "AWS::CloudFront::CachePolicy", "Properties": {
+                "CachePolicyConfig": {
+                    "Name": f"cfn-cache-{suffix}",
+                    "DefaultTTL": 3600, "MaxTTL": 86400, "MinTTL": 1,
+                    "ParametersInCacheKeyAndForwardedToOrigin": {
+                        "EnableAcceptEncodingGzip": True,
+                        "EnableAcceptEncodingBrotli": True,
+                        # CDK emits cache-policy lists bare, without an Items wrapper.
+                        "HeadersConfig": {"HeaderBehavior": "whitelist",
+                                          "Headers": ["X-Service", "X-Query"]},
+                        "QueryStringsConfig": {"QueryStringBehavior": "whitelist",
+                                               "QueryStrings": ["page"]},
+                        "CookiesConfig": {"CookieBehavior": "none"},
+                    },
+                },
+            }},
+            "OriginRequestPolicy": {"Type": "AWS::CloudFront::OriginRequestPolicy", "Properties": {
+                "OriginRequestPolicyConfig": {
+                    "Name": f"cfn-orp-{suffix}",
+                    "HeadersConfig": {"HeaderBehavior": "whitelist",
+                                      "Headers": ["X-Tenant-Key", "X-Service"]},
+                    "QueryStringsConfig": {"QueryStringBehavior": "all"},
+                    "CookiesConfig": {"CookieBehavior": "none"},
+                },
+            }},
+            "ResponseHeadersPolicy": {"Type": "AWS::CloudFront::ResponseHeadersPolicy", "Properties": {
+                "ResponseHeadersPolicyConfig": {
+                    "Name": f"cfn-rhp-{suffix}",
+                    # ...while CORS lists arrive wrapped. Both shapes must land.
+                    "CorsConfig": {
+                        "AccessControlAllowCredentials": False,
+                        "AccessControlAllowHeaders": {"Items": ["Authorization"]},
+                        "AccessControlAllowMethods": {"Items": ["GET", "HEAD"]},
+                        "AccessControlAllowOrigins": {"Items": ["https://example.test"]},
+                        "AccessControlMaxAgeSec": 86400,
+                        "OriginOverride": True,
+                    },
+                    "CustomHeadersConfig": {"Items": [
+                        {"Header": "X-Env", "Value": "local", "Override": True},
+                    ]},
+                },
+            }},
+            "OriginAccessControl": {"Type": "AWS::CloudFront::OriginAccessControl", "Properties": {
+                "OriginAccessControlConfig": {
+                    "Name": f"cfn-oac-{suffix}",
+                    "OriginAccessControlOriginType": "s3",
+                    "SigningBehavior": "always",
+                    "SigningProtocol": "sigv4",
+                },
+            }},
+            "Function": {"Type": "AWS::CloudFront::Function", "Properties": {
+                "Name": f"cfn-fn-{suffix}",
+                "AutoPublish": True,
+                "FunctionCode": _FUNCTION_CODE,
+                "FunctionConfig": {"Comment": "provisioned by cfn",
+                                   "Runtime": "cloudfront-js-2.0"},
+            }},
+        },
+        "Outputs": {
+            "CachePolicyRef": {"Value": {"Ref": "CachePolicy"}},
+            "OrpRef": {"Value": {"Ref": "OriginRequestPolicy"}},
+            "RhpRef": {"Value": {"Ref": "ResponseHeadersPolicy"}},
+            "OacId": {"Value": {"Fn::GetAtt": ["OriginAccessControl", "Id"]}},
+            "FunctionArn": {"Value": {"Fn::GetAtt": ["Function", "FunctionARN"]}},
+        },
+    })
+
+
+def test_cfn_cloudfront_policy_oac_and_function_provision(cfn, cloudfront):
+    """The five CloudFront types with a complete API and no provisioner used to
+    roll the stack back on "Unsupported resource type". Each now provisions onto
+    the service's own parser, so every nested list — including the whitelists a
+    hand-written mapper most easily loses — reads back through the CloudFront
+    API exactly as CreateCachePolicy would have stored it."""
+    suffix = "prov1"
+    cfn.create_stack(StackName="cfn-cf-policies", TemplateBody=_cloudfront_template(suffix))
+    stack = _wait_stack(cfn, "cfn-cf-policies")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    out = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+
+    # Ref returns the policy Id for the three policy families (CFN spec), and
+    # that Id addresses the object through the service's own API.
+    cache_cfg = cloudfront.get_cache_policy(Id=out["CachePolicyRef"])["CachePolicy"]["CachePolicyConfig"]
+    assert cache_cfg["Name"] == f"cfn-cache-{suffix}"
+    assert cache_cfg["DefaultTTL"] == 3600
+    params = cache_cfg["ParametersInCacheKeyAndForwardedToOrigin"]
+    assert params["EnableAcceptEncodingGzip"] is True
+    assert params["HeadersConfig"]["HeaderBehavior"] == "whitelist"
+    assert params["HeadersConfig"]["Headers"]["Items"] == ["X-Service", "X-Query"]
+    assert params["QueryStringsConfig"]["QueryStrings"]["Items"] == ["page"]
+
+    orp_cfg = cloudfront.get_origin_request_policy(
+        Id=out["OrpRef"])["OriginRequestPolicy"]["OriginRequestPolicyConfig"]
+    assert orp_cfg["HeadersConfig"]["Headers"]["Items"] == ["X-Tenant-Key", "X-Service"]
+    assert orp_cfg["QueryStringsConfig"]["QueryStringBehavior"] == "all"
+
+    rhp_cfg = cloudfront.get_response_headers_policy(
+        Id=out["RhpRef"])["ResponseHeadersPolicy"]["ResponseHeadersPolicyConfig"]
+    cors = rhp_cfg["CorsConfig"]
+    assert cors["AccessControlMaxAgeSec"] == 86400
+    assert cors["AccessControlAllowMethods"]["Items"] == ["GET", "HEAD"]
+    assert cors["AccessControlAllowOrigins"]["Items"] == ["https://example.test"]
+    assert rhp_cfg["CustomHeadersConfig"]["Items"][0]["Header"] == "X-Env"
+
+    oac_cfg = cloudfront.get_origin_access_control(
+        Id=out["OacId"])["OriginAccessControl"]["OriginAccessControlConfig"]
+    assert oac_cfg["SigningBehavior"] == "always"
+    assert oac_cfg["OriginAccessControlOriginType"] == "s3"
+
+    # AutoPublish defaults to true and CDK relies on it: a distribution
+    # associates the LIVE stage, so an unpublished function would never run.
+    summary = cloudfront.describe_function(
+        Name=f"cfn-fn-{suffix}", Stage="LIVE")["FunctionSummary"]
+    assert summary["FunctionMetadata"]["Stage"] == "LIVE"
+    assert summary["FunctionMetadata"]["FunctionARN"] == out["FunctionArn"]
+
+    cfn.delete_stack(StackName="cfn-cf-policies")
+    _wait_stack(cfn, "cfn-cf-policies")
+    with pytest.raises(ClientError):
+        cloudfront.get_cache_policy(Id=out["CachePolicyRef"])
+
+
+def test_cfn_cloudfront_distribution_consumes_provisioned_policies(cfn, cloudfront):
+    """The payoff: a distribution in the same stack references the policies and
+    the function by Ref/GetAtt. This is what a CDK app emits, and it only works
+    if Ref yields the value the distribution's own parser expects."""
+    template = json.loads(_cloudfront_template("prov2"))
+    template["Resources"]["Dist"] = {
+        "Type": "AWS::CloudFront::Distribution",
+        "Properties": {"DistributionConfig": {
+            "Enabled": True,
+            "Comment": "consumes provisioned policies",
+            "Origins": [{"Id": "origin1", "DomainName": "example.test",
+                         "CustomOriginConfig": {"OriginProtocolPolicy": "https-only"}}],
+            "DefaultCacheBehavior": {
+                "TargetOriginId": "origin1",
+                "ViewerProtocolPolicy": "allow-all",
+                "CachePolicyId": {"Ref": "CachePolicy"},
+                "OriginRequestPolicyId": {"Ref": "OriginRequestPolicy"},
+                "ResponseHeadersPolicyId": {"Ref": "ResponseHeadersPolicy"},
+                "FunctionAssociations": [{
+                    "EventType": "viewer-request",
+                    "FunctionARN": {"Fn::GetAtt": ["Function", "FunctionARN"]},
+                }],
+            },
+        }},
+    }
+    template["Outputs"]["DistId"] = {"Value": {"Ref": "Dist"}}
+
+    cfn.create_stack(StackName="cfn-cf-dist-policies", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-cf-dist-policies")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    out = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+
+    # The distribution provisioner accepted every Ref without rolling back, and
+    # each one addresses a real object. Asserting the stored DefaultCacheBehavior
+    # would be the stronger check, but GetDistribution and GetDistributionConfig
+    # both 500 on any CloudFormation-provisioned distribution (the record carries
+    # an empty config_xml) — that is a separate, pre-existing bug.
+    assert cloudfront.get_cache_policy(Id=out["CachePolicyRef"])["CachePolicy"]["Id"]
+    assert cloudfront.get_origin_request_policy(
+        Id=out["OrpRef"])["OriginRequestPolicy"]["Id"]
+    assert cloudfront.get_response_headers_policy(
+        Id=out["RhpRef"])["ResponseHeadersPolicy"]["Id"]
+    assert out["FunctionArn"].endswith(":function/cfn-fn-prov2")
+    assert out["DistId"]
+
+    cfn.delete_stack(StackName="cfn-cf-dist-policies")
+    _wait_stack(cfn, "cfn-cf-dist-policies")
 
 
 def test_cfn_auto_named_s3_bucket_stable_across_updates(cfn, s3):

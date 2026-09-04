@@ -111,6 +111,208 @@ def _physical_name(stack_name: str, logical_id: str, *,
     return base[:max_len]
 
 
+# ---------------------------------------------------------------------------
+# CloudFront policies, functions and origin access controls
+#
+# The CloudFront APIs for these five types are fully implemented; only their
+# CloudFormation provisioners were missing, so a CDK app that declares a cache
+# policy or a viewer function rolled back with "Unsupported resource type" while
+# the same objects could be created over the API.
+#
+# Rather than re-implement the property mapping (ResponseHeadersPolicyConfig
+# alone is CORS, six security headers, server-timing, custom and removed
+# headers), each provisioner converts its CFN property dict to the XML element
+# the service's own parser already accepts and calls that parser. The property
+# names are identical — both are generated from the same AWS model — so the only
+# real difference is how lists are wrapped, which `_cf_props_to_element` handles.
+# Validation, defaults and the stored record shape are then exactly what the API
+# produces.
+# ---------------------------------------------------------------------------
+
+# XML wraps every list as <Field><Quantity>n</Quantity><Items><Tag>..; the item
+# tag varies by field and JSON does not carry it.
+_CF_LIST_ITEM_TAGS = {
+    "Headers": "Name",
+    "Cookies": "Name",
+    "QueryStrings": "Name",
+    "AccessControlAllowOrigins": "Origin",
+    "AccessControlAllowHeaders": "Header",
+    "AccessControlExposeHeaders": "Header",
+    "AccessControlAllowMethods": "Method",
+    "KeyValueStoreAssociations": "KeyValueStoreAssociation",
+    # These two break the pattern at both ends: the CFN property carrying the
+    # list is the *Config wrapper rather than the bare field name, and
+    # `_parse_rhp_config` matches the fully qualified item tag. Getting either
+    # half wrong drops every custom and removed header silently.
+    "CustomHeadersConfig": "ResponseHeadersPolicyCustomHeader",
+    "RemoveHeadersConfig": "ResponseHeadersPolicyRemoveHeader",
+}
+
+
+def _cf_props_to_element(tag, value):
+    """Render a CloudFormation property dict as the XML element CloudFront parses."""
+    from xml.etree.ElementTree import Element, SubElement
+
+    el = Element(tag)
+
+    def fill(parent, data):
+        for key, item in (data or {}).items():
+            if item is None:
+                continue
+            # CFN writes a list either bare (`Headers: [..]`) or wrapped
+            # (`AccessControlAllowHeaders: {Items: [..]}`); XML wants both as a
+            # counted Items block.
+            listed = None
+            if isinstance(item, list):
+                listed = item
+            elif isinstance(item, dict) and set(item) <= {"Items", "Quantity"} and isinstance(item.get("Items"), list):
+                listed = item["Items"]
+
+            if listed is not None:
+                block = SubElement(parent, key)
+                SubElement(block, "Quantity").text = str(len(listed))
+                if listed:
+                    items_el = SubElement(block, "Items")
+                    item_tag = _CF_LIST_ITEM_TAGS.get(key, "Name")
+                    for entry in listed:
+                        child = SubElement(items_el, item_tag)
+                        if isinstance(entry, dict):
+                            fill(child, entry)
+                        else:
+                            child.text = str(entry)
+            elif isinstance(item, dict):
+                fill(SubElement(parent, key), item)
+            elif isinstance(item, bool):
+                SubElement(parent, key).text = "true" if item else "false"
+            else:
+                SubElement(parent, key).text = str(item)
+
+    fill(el, value)
+    return el
+
+
+def _cf_policy_create(store, parse, label, props, config_key, logical_id, stack_name):
+    """Create one of the three CloudFront policy families from CFN properties.
+
+    `parse` is the service's own config parser — the generic `_ORP_SPEC`/`_RHP_SPEC`
+    ones, or `_parse_cache_policy_config`, which predates that framework and has
+    no spec entry.
+    """
+    cfg_props = dict(props.get(config_key) or {})
+    cfg_props.setdefault("Name", _physical_name(stack_name, logical_id, max_len=128))
+    cfg, err = parse(_cf_props_to_element(config_key, cfg_props))
+    if err is not None:
+        # `parse` returns an HTTP error tuple; CFN needs an exception so the
+        # stack rolls back with the reason attached rather than half-created.
+        raise ValueError(f"{label}: {cfg_props.get('Name')} is not valid")
+    for existing in store.values():
+        if existing["Config"]["Name"] == cfg["Name"]:
+            return existing["Id"], {"Id": existing["Id"],
+                                    "LastModifiedTime": existing["LastModifiedTime"]}
+    pid = new_uuid()
+    record = {"Id": pid, "ETag": new_uuid(), "LastModifiedTime": now_iso(), "Config": cfg}
+    store[pid] = record
+    # Ref resolves to the Id for all three families, which is what a
+    # DistributionConfig references.
+    return pid, {"Id": pid, "LastModifiedTime": record["LastModifiedTime"]}
+
+
+def _cf_cache_policy_create(logical_id, props, stack_name):
+    return _cf_policy_create(_cf._cache_policies, _cf._parse_cache_policy_config,
+                             "AWS::CloudFront::CachePolicy", props,
+                             "CachePolicyConfig", logical_id, stack_name)
+
+
+def _cf_cache_policy_delete(physical_id, props):
+    _cf._cache_policies.pop(physical_id, None)
+
+
+def _cf_origin_request_policy_create(logical_id, props, stack_name):
+    return _cf_policy_create(_cf._origin_request_policies, _cf._ORP_SPEC["parse"],
+                             "AWS::CloudFront::OriginRequestPolicy", props,
+                             "OriginRequestPolicyConfig", logical_id, stack_name)
+
+
+def _cf_origin_request_policy_delete(physical_id, props):
+    _cf._origin_request_policies.pop(physical_id, None)
+
+
+def _cf_response_headers_policy_create(logical_id, props, stack_name):
+    return _cf_policy_create(_cf._response_headers_policies, _cf._RHP_SPEC["parse"],
+                             "AWS::CloudFront::ResponseHeadersPolicy", props,
+                             "ResponseHeadersPolicyConfig", logical_id, stack_name)
+
+
+def _cf_response_headers_policy_delete(physical_id, props):
+    _cf._response_headers_policies.pop(physical_id, None)
+
+
+def _cf_oac_create(logical_id, props, stack_name):
+    cfg = dict(props.get("OriginAccessControlConfig") or {})
+    name = cfg.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
+    for existing in _cf._oacs.values():
+        if existing.get("Name") == name:
+            return existing["Id"], {"Id": existing["Id"]}
+    oac_id = _cf._dist_id()
+    _cf._oacs[oac_id] = {
+        "Id": oac_id,
+        "Name": name,
+        "Description": cfg.get("Description", ""),
+        "OriginAccessControlOriginType": cfg.get("OriginAccessControlOriginType", "s3"),
+        "SigningBehavior": cfg.get("SigningBehavior", "always"),
+        "SigningProtocol": cfg.get("SigningProtocol", "sigv4"),
+        "ETag": new_uuid(),
+    }
+    return oac_id, {"Id": oac_id}
+
+
+def _cf_oac_delete(physical_id, props):
+    _cf._oacs.pop(physical_id, None)
+
+
+def _cf_function_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
+    cfg_el = _cf_props_to_element("FunctionConfig", props.get("FunctionConfig") or {})
+    cfg, err = _cf._cf_parse_function_config(cfg_el)
+    if err is not None:
+        raise ValueError(f"AWS::CloudFront::Function {name}: FunctionConfig is not valid")
+
+    # CFN carries the source verbatim; the API takes it base64-encoded.
+    code = props.get("FunctionCode") or ""
+    if isinstance(code, str):
+        code = code.encode("utf-8")
+
+    now = now_iso()
+    dev_etag = new_uuid()
+    # AutoPublish defaults to true in the CFN spec, and CDK relies on it: a
+    # distribution associates the LIVE stage, so an unpublished function would
+    # never run.
+    auto_publish = props.get("AutoPublish", True)
+    if isinstance(auto_publish, str):
+        auto_publish = auto_publish.lower() == "true"
+
+    _cf._functions[name] = {
+        "name": name,
+        "arn": _cf._func_arn(name),
+        "comment": cfg["comment"],
+        "runtime": cfg["runtime"],
+        "kvs_arns": cfg["kvs_arns"],
+        "code": code,
+        "created": now,
+        "last_modified_dev": now,
+        "last_modified_live": now if auto_publish else None,
+        "dev_etag": dev_etag,
+        "live_etag": new_uuid() if auto_publish else None,
+    }
+    arn = _cf._func_arn(name)
+    return name, {"FunctionARN": arn, "FunctionMetadata.FunctionARN": arn,
+                  "Stage": "LIVE" if auto_publish else "DEVELOPMENT"}
+
+
+def _cf_function_delete(physical_id, props):
+    _cf._functions.pop(physical_id, None)
+
+
 # ===========================================================================
 # Resource Provisioner Framework
 # ===========================================================================
@@ -7247,6 +7449,11 @@ _RESOURCE_HANDLERS = {
     },
     "AWS::CloudFront::Distribution": {"create": _cf_distribution_create, "delete": _cf_distribution_delete},
     "AWS::CloudFront::KeyValueStore": {"create": _cf_kvs_create, "update": _cf_kvs_update, "delete": _cf_kvs_delete},
+    "AWS::CloudFront::CachePolicy": {"create": _cf_cache_policy_create, "delete": _cf_cache_policy_delete},
+    "AWS::CloudFront::OriginRequestPolicy": {"create": _cf_origin_request_policy_create, "delete": _cf_origin_request_policy_delete},
+    "AWS::CloudFront::ResponseHeadersPolicy": {"create": _cf_response_headers_policy_create, "delete": _cf_response_headers_policy_delete},
+    "AWS::CloudFront::OriginAccessControl": {"create": _cf_oac_create, "delete": _cf_oac_delete},
+    "AWS::CloudFront::Function": {"create": _cf_function_create, "delete": _cf_function_delete},
     "AWS::CloudWatch::Alarm": {"create": _cw_metric_alarm_create, "delete": _cw_metric_alarm_delete},
     "AWS::CloudWatch::Dashboard": {
         "create": _cw_dashboard_create,
