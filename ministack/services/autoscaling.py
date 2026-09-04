@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 AutoScaling Service Emulator.
 Query API (Action=...) — groups, launch configs, policies, hooks, scheduled actions.

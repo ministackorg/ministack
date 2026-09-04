@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """ECS Task Metadata V4 emulator.
 
 Real ECS injects ECS_CONTAINER_METADATA_URI_V4=http://169.254.170.2/v4/<token>

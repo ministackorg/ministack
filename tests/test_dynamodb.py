@@ -1288,7 +1288,7 @@ def test_dynamodb_scan_projection_expression_without_select(ddb):
     with pytest.raises(ClientError) as exc:
         ddb.scan(TableName="t_pe_no_select", ProjectionExpression="pk", Select="ALL_ATTRIBUTES")
     assert exc.value.response["Error"]["Code"] == "ValidationException"
-    assert "Select value ALL_ATTRIBUTES is not compatible with ProjectionExpression" in exc.value.response["Error"]["Message"]
+    assert "Cannot specify the ProjectionExpression when choosing to get ALL_ATTRIBUTES" in exc.value.response["Error"]["Message"]
 
 def test_dynamodb_batch_write(ddb):
     ddb.create_table(

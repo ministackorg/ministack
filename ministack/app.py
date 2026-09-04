@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 MiniStack — Local AWS Service Emulator.
 Single-port ASGI application on port 4566 (configurable via GATEWAY_PORT).

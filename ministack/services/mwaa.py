@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 MWAA (Managed Workflows for Apache Airflow) Service Emulator.
 REST API (path-based routing) for the MWAA control plane.

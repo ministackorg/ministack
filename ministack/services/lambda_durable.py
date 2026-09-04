@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """AWS Lambda Durable Functions / Durable Execution emulator.
 
 Implements the seven management-plane operations of the Lambda Durable Execution

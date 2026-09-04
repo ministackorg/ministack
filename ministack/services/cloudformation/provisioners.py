@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 CloudFormation provisioners — resource create/delete handlers for each AWS resource type.
 """
@@ -6966,6 +6968,216 @@ def _cognito_identity_pool_principal_tag_delete(physical_id, props):
         pool.get("_principal_tags", {}).pop(provider, None)
 
 
+
+# ---------------------------------------------------------------------------
+# In-place update handlers for the types whose create-fallback destroyed data
+# (generated identities, wiped children) or failed loudly. Each mutates the
+# existing service record; a genuinely create-only property returns the
+# resource to the engine as a replacement (new physical id), whose predecessor
+# the engine now deletes in its cleanup phase.
+# ---------------------------------------------------------------------------
+
+def _cognito_user_pool_update(physical_id, old_props, new_props, stack_name):
+    pool = _cognito._user_pools.get(physical_id)
+    if pool is None:
+        return _cognito_user_pool_create(physical_id, new_props, stack_name)
+    if "PoolName" in new_props:
+        pool["Name"] = new_props["PoolName"]
+    for prop, key in (("Policies", "Policies"),
+                      ("AutoVerifiedAttributes", "AutoVerifiedAttributes"),
+                      ("AliasAttributes", "AliasAttributes"),
+                      ("UsernameAttributes", "UsernameAttributes"),
+                      ("MfaConfiguration", "MfaConfiguration"),
+                      ("UserPoolTags", "UserPoolTags"),
+                      ("AdminCreateUserConfig", "AdminCreateUserConfig"),
+                      ("LambdaConfig", "LambdaConfig")):
+        if prop in new_props:
+            pool[key] = new_props[prop]
+    if "SOFTWARE_TOKEN_MFA" in (new_props.get("EnabledMfas") or []):
+        pool["SoftwareTokenMfaConfiguration"] = {"Enabled": True}
+    elif "EnabledMfas" in new_props:
+        pool.pop("SoftwareTokenMfaConfiguration", None)
+    pool["LastModifiedDate"] = _cognito._now_epoch()
+    provider_name = f"cognito-idp.{get_region()}.amazonaws.com/{physical_id}"
+    return physical_id, {"Arn": pool["Arn"], "ProviderName": provider_name}
+
+
+def _cognito_user_pool_client_update(physical_id, old_props, new_props, stack_name):
+    pid = new_props.get("UserPoolId", old_props.get("UserPoolId", ""))
+    pool = _cognito._user_pools.get(pid)
+    client = (pool or {}).get("_clients", {}).get(physical_id)
+    if client is None:
+        return _cognito_user_pool_client_create(physical_id, new_props, stack_name)
+    for prop, key in (("ClientName", "ClientName"),
+                      ("ExplicitAuthFlows", "ExplicitAuthFlows"),
+                      ("AllowedOAuthFlows", "AllowedOAuthFlows"),
+                      ("AllowedOAuthScopes", "AllowedOAuthScopes"),
+                      ("CallbackURLs", "CallbackURLs"),
+                      ("LogoutURLs", "LogoutURLs"),
+                      ("SupportedIdentityProviders", "SupportedIdentityProviders")):
+        if prop in new_props:
+            client[key] = new_props[prop]
+    client["LastModifiedDate"] = _cognito._now_epoch()
+    return physical_id, {}
+
+
+def _cognito_identity_pool_update(physical_id, old_props, new_props, stack_name):
+    pool = _cognito._identity_pools.get(physical_id)
+    if pool is None:
+        return _cognito_identity_pool_create(physical_id, new_props, stack_name)
+    for prop in ("IdentityPoolName", "AllowUnauthenticatedIdentities",
+                 "AllowClassicFlow", "SupportedLoginProviders",
+                 "DeveloperProviderName", "OpenIdConnectProviderARNs",
+                 "CognitoIdentityProviders", "SamlProviderARNs",
+                 "IdentityPoolTags"):
+        if prop in new_props:
+            pool[prop] = new_props[prop]
+    return physical_id, {}
+
+
+def _cognito_user_pool_group_update(physical_id, old_props, new_props, stack_name):
+    pid = new_props.get("UserPoolId", old_props.get("UserPoolId", ""))
+    pool = _cognito._user_pools.get(pid)
+    group = (pool or {}).get("_groups", {}).get(physical_id)
+    new_name = new_props.get("GroupName") or physical_id
+    if group is None or new_name != physical_id:
+        # Name change is a replacement; the engine deletes the old group.
+        return _cognito_user_pool_group_create(physical_id, new_props, stack_name)
+    for prop in ("Description", "RoleArn", "Precedence"):
+        if prop in new_props:
+            group[prop] = new_props[prop]
+    group["LastModifiedDate"] = _cognito._now_epoch()
+    return physical_id, {}
+
+
+def _sm_secret_update(physical_id, old_props, new_props, stack_name):
+    secret = _sm._secrets.get(physical_id)
+    new_name = new_props.get("Name") or _physical_name(stack_name, physical_id)
+    if secret is None or (old_props.get("Name") or physical_id) != new_name and "Name" in new_props:
+        # Name is create-only: replacement, predecessor cleaned by the engine.
+        return _sm_secret_create(physical_id, new_props, stack_name)
+    for prop in ("Description", "KmsKeyId"):
+        if prop in new_props:
+            secret[prop] = new_props[prop]
+    if "Tags" in new_props:
+        secret["Tags"] = new_props["Tags"]
+    if "SecretString" in new_props and new_props["SecretString"] != old_props.get("SecretString"):
+        # A changed value becomes the new AWSCURRENT version; history is kept.
+        import time as _time
+        for version in secret.get("Versions", {}).values():
+            version["Stages"] = [s for s in version.get("Stages", []) if s != "AWSCURRENT"]
+        secret["Versions"][new_uuid()] = {
+            "SecretString": new_props["SecretString"],
+            "SecretBinary": None,
+            "CreatedDate": int(_time.time()),
+            "Stages": ["AWSCURRENT"],
+        }
+        secret["LastChangedDate"] = int(_time.time())
+    return physical_id, {"Arn": secret["ARN"]}
+
+
+def _kinesis_stream_update(physical_id, old_props, new_props, stack_name):
+    stream = _kinesis._streams.get(physical_id)
+    new_name = new_props.get("Name")
+    if stream is None or (new_name and new_name != physical_id):
+        return _kinesis_stream_create(physical_id, new_props, stack_name)
+    if "RetentionPeriodHours" in new_props:
+        stream["RetentionPeriodHours"] = max(24, min(8760, int(new_props["RetentionPeriodHours"])))
+    smd = new_props.get("StreamModeDetails")
+    if isinstance(smd, dict) and smd.get("StreamMode"):
+        stream["StreamModeDetails"] = {"StreamMode": smd["StreamMode"]}
+    # ShardCount changes keep the existing shards — records live in them.
+    return physical_id, {"Arn": stream["StreamARN"]}
+
+
+def _ecr_repo_update(physical_id, old_props, new_props, stack_name):
+    repo = _ecr._repositories.get(physical_id)
+    new_name = new_props.get("RepositoryName")
+    if repo is None or (new_name and new_name != physical_id):
+        return _ecr_repo_create(physical_id, new_props, stack_name)
+    for prop, key in (("ImageTagMutability", "imageTagMutability"),
+                      ("ImageScanningConfiguration", "imageScanningConfiguration")):
+        if prop in new_props:
+            repo[key] = new_props[prop]
+    return physical_id, {"Arn": repo["repositoryArn"], "RepositoryUri": repo["repositoryUri"]}
+
+
+def _ddb_global_table_update(physical_id, old_props, new_props, stack_name):
+    # Same property translation as create, then the Table update handler —
+    # the create-fallback rebuilt the table record and dropped every item.
+    translated = dict(new_props)
+    for prop in ("Replicas", "MultiRegionConsistency", "GlobalTableWitnesses",
+                 "GlobalTableSourceArn", "WarmThroughput",
+                 "WriteOnDemandThroughputSettings", "ReadOnDemandThroughputSettings",
+                 "WriteProvisionedThroughputSettings", "ReadProvisionedThroughputSettings"):
+        translated.pop(prop, None)
+    return _ddb_update(physical_id, old_props, translated, stack_name)
+
+
+def _eb_event_bus_update(physical_id, old_props, new_props, stack_name):
+    new_name = new_props.get("Name")
+    if new_name and new_name != physical_id:
+        # Name is create-only: replacement (the fallback used to fail the
+        # stack with "EventBus already exists" on ANY property change).
+        return _eb_event_bus_create(physical_id, new_props, stack_name)
+    bus = _eb._event_buses.get(physical_id)
+    if bus is not None and isinstance(bus, dict):
+        if "Description" in new_props:
+            bus["Description"] = new_props["Description"]
+    return physical_id, {"Arn": f"arn:aws:events:{get_region()}:{get_account_id()}:event-bus/{physical_id}", "Name": physical_id}
+
+
+def _codebuild_project_update(physical_id, old_props, new_props, stack_name):
+    project = _codebuild._projects.get(physical_id)
+    new_name = new_props.get("Name")
+    if project is None or (new_name and new_name != physical_id):
+        return _codebuild_project_create(physical_id, new_props, stack_name)
+    for prop, key in (("Description", "description"), ("Source", "source"),
+                      ("SourceVersion", "sourceVersion"), ("Artifacts", "artifacts"),
+                      ("Environment", "environment"), ("ServiceRole", "serviceRole")):
+        if prop in new_props:
+            project[key] = new_props[prop]
+    if "TimeoutInMinutes" in new_props:
+        project["timeoutInMinutes"] = int(new_props["TimeoutInMinutes"])
+    return physical_id, {"Arn": _codebuild._project_arn(physical_id)}
+
+
+def _r53_record_set_update(physical_id, old_props, new_props, stack_name):
+    # Same name+type: the values update in place (the fallback raised
+    # "record already exists", so EVERY record edit rolled the stack back).
+    zone_id = _r53_resolve_hosted_zone_id(new_props)
+    new_rs = _r53_record_set_build_rs(new_props)
+    old_zone_id = _r53_resolve_hosted_zone_id(old_props)
+    old_rs = _r53_record_set_build_rs(old_props)
+    if zone_id != old_zone_id or _r53._rs_key(new_rs) != _r53._rs_key(old_rs):
+        # Different record identity: create the new one; the engine deletes
+        # the predecessor through the delete handler.
+        return _r53_record_set_create(physical_id, new_props, stack_name)
+    with _r53._lock:
+        records = list(_r53._records.get(zone_id, []))
+        key = _r53._rs_key(new_rs)
+        records = [r for r in records if _r53._rs_key(r) != key]
+        records.append(new_rs)
+        _r53._records[zone_id] = records
+    return new_rs["Name"], {"Name": new_rs["Name"]}
+
+
+def _scheduler_schedule_update(physical_id, old_props, new_props, stack_name):
+    import ministack.services.scheduler as _sched
+    new_name = new_props.get("Name")
+    if new_name and new_name != physical_id:
+        return _scheduler_schedule_create(physical_id, new_props, stack_name)
+    group = new_props.get("GroupName", old_props.get("GroupName", "default"))
+    key = f"{group}/{physical_id}"
+    schedule = _sched._schedules.get(key)
+    if schedule is None:
+        return _scheduler_schedule_create(physical_id, new_props, stack_name)
+    for prop in ("ScheduleExpression", "FlexibleTimeWindow", "Target",
+                 "State", "Description"):
+        if prop in new_props:
+            schedule[prop] = new_props[prop]
+    return physical_id, {"Arn": _sched._schedule_arn(group, physical_id)}
+
 _RESOURCE_HANDLERS = {
     "AWS::OpenSearchService::Domain": {
         "create": _opensearch_domain_create,
@@ -7006,7 +7218,7 @@ _RESOURCE_HANDLERS = {
     # comes from WriteProvisionedThroughputSettings; Replicas is required and
     # ignored locally), so it gets a dedicated provisioner that translates
     # before delegating to the Table engine.
-    "AWS::DynamoDB::GlobalTable": {"create": _ddb_global_table_create, "delete": _ddb_global_table_delete},
+    "AWS::DynamoDB::GlobalTable": {"create": _ddb_global_table_create, "update": _ddb_global_table_update, "delete": _ddb_global_table_delete},
     "AWS::Lambda::Function": {
         "create": _lambda_create,
         "update": _lambda_update,
@@ -7064,8 +7276,8 @@ _RESOURCE_HANDLERS = {
     },
     "AWS::Logs::SubscriptionFilter": {"create": _cwlogs_subfilter_create, "delete": _cwlogs_subfilter_delete},
     "AWS::Events::Rule": {"create": _eb_rule_create, "delete": _eb_rule_delete},
-    "AWS::Events::EventBus": {"create": _eb_event_bus_create, "delete": _eb_event_bus_delete},
-    "AWS::Kinesis::Stream": {"create": _kinesis_stream_create, "delete": _kinesis_stream_delete},
+    "AWS::Events::EventBus": {"create": _eb_event_bus_create, "update": _eb_event_bus_update, "delete": _eb_event_bus_delete},
+    "AWS::Kinesis::Stream": {"create": _kinesis_stream_create, "update": _kinesis_stream_update, "delete": _kinesis_stream_delete},
     "AWS::KinesisFirehose::DeliveryStream": {
         "create": _firehose_delivery_stream_create,
         "update": _firehose_delivery_stream_update,
@@ -7180,18 +7392,18 @@ _RESOURCE_HANDLERS = {
     "AWS::AppSync::Resolver": {"create": _appsync_resolver_create, "delete": _appsync_resolver_delete},
     "AWS::AppSync::GraphQLSchema": {"create": _appsync_schema_create, "delete": _appsync_schema_delete},
     "AWS::AppSync::ApiKey": {"create": _appsync_apikey_create, "delete": _appsync_apikey_delete},
-    "AWS::SecretsManager::Secret": {"create": _sm_secret_create, "delete": _sm_secret_delete},
-    "AWS::Cognito::UserPool": {"create": _cognito_user_pool_create, "delete": _cognito_user_pool_delete},
-    "AWS::Cognito::UserPoolClient": {"create": _cognito_user_pool_client_create, "delete": _cognito_user_pool_client_delete},
+    "AWS::SecretsManager::Secret": {"create": _sm_secret_create, "update": _sm_secret_update, "delete": _sm_secret_delete},
+    "AWS::Cognito::UserPool": {"create": _cognito_user_pool_create, "update": _cognito_user_pool_update, "delete": _cognito_user_pool_delete},
+    "AWS::Cognito::UserPoolClient": {"create": _cognito_user_pool_client_create, "update": _cognito_user_pool_client_update, "delete": _cognito_user_pool_client_delete},
     "AWS::Cognito::UserPoolResourceServer": {"create": _cognito_user_pool_resource_server_create, "delete": _cognito_user_pool_resource_server_delete},
-    "AWS::Cognito::UserPoolGroup": {"create": _cognito_user_pool_group_create, "delete": _cognito_user_pool_group_delete},
-    "AWS::Cognito::IdentityPool": {"create": _cognito_identity_pool_create, "delete": _cognito_identity_pool_delete},
+    "AWS::Cognito::UserPoolGroup": {"create": _cognito_user_pool_group_create, "update": _cognito_user_pool_group_update, "delete": _cognito_user_pool_group_delete},
+    "AWS::Cognito::IdentityPool": {"create": _cognito_identity_pool_create, "update": _cognito_identity_pool_update, "delete": _cognito_identity_pool_delete},
     "AWS::Cognito::UserPoolDomain": {"create": _cognito_user_pool_domain_create, "delete": _cognito_user_pool_domain_delete},
-    "AWS::ECR::Repository": {"create": _ecr_repo_create, "delete": _ecr_repo_delete},
+    "AWS::ECR::Repository": {"create": _ecr_repo_create, "update": _ecr_repo_update, "delete": _ecr_repo_delete},
     "AWS::CertificateManager::Certificate": {"create": _acm_certificate_create, "delete": _acm_certificate_delete},
     "AWS::ElasticLoadBalancingV2::TargetGroup": {"create": _elbv2_target_group_create, "delete": _elbv2_target_group_delete},
     "AWS::ElasticLoadBalancingV2::ListenerRule": {"create": _elbv2_listener_rule_create, "delete": _elbv2_listener_rule_delete},
-    "AWS::CodeBuild::Project": {"create": _codebuild_project_create, "delete": _codebuild_project_delete},
+    "AWS::CodeBuild::Project": {"create": _codebuild_project_create, "update": _codebuild_project_update, "delete": _codebuild_project_delete},
     "AWS::IAM::ManagedPolicy": {
         "create": _iam_managed_policy_create,
         "update": _iam_managed_policy_update,
@@ -7230,7 +7442,7 @@ _RESOURCE_HANDLERS = {
     },
     "AWS::StepFunctions::StateMachine": {"create": _sfn_state_machine_create, "delete": _sfn_state_machine_delete},
     "AWS::Route53::HostedZone": {"create": _r53_hosted_zone_create, "delete": _r53_hosted_zone_delete},
-    "AWS::Route53::RecordSet": {"create": _r53_record_set_create, "delete": _r53_record_set_delete},
+    "AWS::Route53::RecordSet": {"create": _r53_record_set_create, "update": _r53_record_set_update, "delete": _r53_record_set_delete},
     "AWS::ApiGatewayV2::Api": {"create": _apigw_v2_api_create, "delete": _apigw_v2_api_delete},
     "AWS::ApiGatewayV2::Stage": {"create": _apigw_v2_stage_create, "delete": _apigw_v2_stage_delete},
     "AWS::ApiGatewayV2::Integration": {"create": _apigw_v2_integration_create, "delete": _apigw_v2_integration_delete},
@@ -7289,7 +7501,7 @@ _RESOURCE_HANDLERS = {
         "delete": _cognito_identity_pool_principal_tag_delete,
     },
     # EventBridge Scheduler
-    "AWS::Scheduler::Schedule": {"create": _scheduler_schedule_create, "delete": _scheduler_schedule_delete},
+    "AWS::Scheduler::Schedule": {"create": _scheduler_schedule_create, "update": _scheduler_schedule_update, "delete": _scheduler_schedule_delete},
     "AWS::Scheduler::ScheduleGroup": {"create": _scheduler_group_create, "delete": _scheduler_group_delete},
     # EKS
     "AWS::EKS::Cluster": {"create": _eks_cluster_create, "delete": _eks_cluster_delete},

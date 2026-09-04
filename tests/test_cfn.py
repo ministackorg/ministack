@@ -10896,3 +10896,99 @@ def test_cfn_cognito_user_pool_enabled_mfas(cfn, cognito_idp):
 
     cfn.delete_stack(StackName="cfn-enabled-mfas")
     _wait_stack(cfn, "cfn-enabled-mfas")
+
+
+def test_cfn_cognito_user_pool_update_preserves_users(cfn, cognito_idp):
+    """A property change on AWS::Cognito::UserPool updates in place: the pool
+    keeps its id and its users (the create-fallback minted a new empty pool)."""
+    def template(mfa):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {"Pool": {"Type": "AWS::Cognito::UserPool", "Properties": {
+                "UserPoolName": "cfn-upd-pool", "MfaConfiguration": mfa}}},
+            "Outputs": {"Id": {"Value": {"Ref": "Pool"}}},
+        }
+    cfn.create_stack(StackName="cfn-pool-upd", TemplateBody=json.dumps(template("OFF")))
+    stack = _wait_stack(cfn, "cfn-pool-upd")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    pool_id = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pool_id, Username="alice", MessageAction="SUPPRESS")
+
+    cfn.update_stack(StackName="cfn-pool-upd", TemplateBody=json.dumps(template("OPTIONAL")))
+    stack = _wait_stack(cfn, "cfn-pool-upd")
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+    new_id = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["Id"]
+    assert new_id == pool_id
+    pool = cognito_idp.describe_user_pool(UserPoolId=pool_id)["UserPool"]
+    assert pool["MfaConfiguration"] == "OPTIONAL"
+    users = cognito_idp.list_users(UserPoolId=pool_id)["Users"]
+    assert [u["Username"] for u in users] == ["alice"]
+
+    cfn.delete_stack(StackName="cfn-pool-upd")
+    _wait_stack(cfn, "cfn-pool-upd")
+
+
+def test_cfn_secret_update_keeps_arn_and_versions(cfn):
+    """A changed SecretString becomes the new AWSCURRENT on the same secret —
+    same ARN, history kept (the fallback minted a new ARN and dropped it all)."""
+    import boto3
+    sm = boto3.client("secretsmanager", endpoint_url=os.environ.get(
+        "MINISTACK_ENDPOINT", "http://localhost:4566"), region_name="us-east-1",
+        aws_access_key_id="test", aws_secret_access_key="test")
+
+    def template(value):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {"S": {"Type": "AWS::SecretsManager::Secret", "Properties": {
+                "Name": "cfn-upd-secret", "SecretString": value}}},
+        }
+    cfn.create_stack(StackName="cfn-secret-upd", TemplateBody=json.dumps(template("v1")))
+    assert _wait_stack(cfn, "cfn-secret-upd")["StackStatus"] == "CREATE_COMPLETE"
+    arn1 = sm.describe_secret(SecretId="cfn-upd-secret")["ARN"]
+
+    cfn.update_stack(StackName="cfn-secret-upd", TemplateBody=json.dumps(template("v2")))
+    assert _wait_stack(cfn, "cfn-secret-upd")["StackStatus"] == "UPDATE_COMPLETE"
+    desc = sm.describe_secret(SecretId="cfn-upd-secret")
+    assert desc["ARN"] == arn1
+    assert sm.get_secret_value(SecretId="cfn-upd-secret")["SecretString"] == "v2"
+
+    cfn.delete_stack(StackName="cfn-secret-upd")
+    _wait_stack(cfn, "cfn-secret-upd")
+
+
+def test_cfn_event_bus_and_record_set_update_in_place(cfn):
+    """An EventBus property change no longer fails the stack with "already
+    exists", and a RecordSet value change updates instead of raising."""
+    import boto3
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    r53 = boto3.client("route53", endpoint_url=endpoint, region_name="us-east-1",
+                       aws_access_key_id="test", aws_secret_access_key="test")
+
+    def template(ttl):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "Bus": {"Type": "AWS::Events::EventBus", "Properties": {
+                    "Name": "cfn-upd-bus", "Description": f"ttl-{ttl}"}},
+                "Zone": {"Type": "AWS::Route53::HostedZone", "Properties": {
+                    "Name": "cfn-upd.example.com"}},
+                "Rec": {"Type": "AWS::Route53::RecordSet", "Properties": {
+                    "HostedZoneId": {"Ref": "Zone"},
+                    "Name": "api.cfn-upd.example.com", "Type": "A",
+                    "TTL": str(ttl), "ResourceRecords": ["192.0.2.7"]}},
+            },
+            "Outputs": {"ZoneId": {"Value": {"Ref": "Zone"}}},
+        }
+    cfn.create_stack(StackName="cfn-bus-rec", TemplateBody=json.dumps(template(60)))
+    stack = _wait_stack(cfn, "cfn-bus-rec")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    zone_id = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["ZoneId"]
+
+    cfn.update_stack(StackName="cfn-bus-rec", TemplateBody=json.dumps(template(300)))
+    assert _wait_stack(cfn, "cfn-bus-rec")["StackStatus"] == "UPDATE_COMPLETE"
+    recs = r53.list_resource_record_sets(HostedZoneId=zone_id)["ResourceRecordSets"]
+    rec = next(r for r in recs if r["Name"].startswith("api."))
+    assert rec["TTL"] == 300
+
+    cfn.delete_stack(StackName="cfn-bus-rec")
+    _wait_stack(cfn, "cfn-bus-rec")

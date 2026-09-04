@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 ECS (Elastic Container Service) Emulator.
 REST JSON API — X-Amz-Target header routing with path-based fallback.

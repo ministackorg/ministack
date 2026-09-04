@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """IoT Jobs Data Plane HTTP API (``iot-jobs-data`` AWS service).
 
 Implements the device-side REST surface of AWS IoT Jobs:

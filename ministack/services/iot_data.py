@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """IoT Data Plane HTTP API (``iot-data`` AWS service).
 
 Implements the HTTP-side of the AWS IoT Data Plane. The data plane mirrors

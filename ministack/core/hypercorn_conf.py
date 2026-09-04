@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """Hypercorn config — applied via `-c file:` in the Dockerfile ENTRYPOINT.
 
 Hypercorn's `from_pyfile` collects every non-module, non-dunder

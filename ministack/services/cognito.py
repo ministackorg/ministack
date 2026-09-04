@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 Amazon Cognito Service Emulator.
 
@@ -4013,10 +4015,26 @@ def _sign_up(data):
         attr_dict["sub"] = new_uuid()
     attrs = _dict_to_attr_list(attr_dict)
 
-    # SignUp always creates UNCONFIRMED — ConfirmSignUp (or AdminConfirmSignUp) confirms the account.
-    # AutoVerifiedAttributes only auto-verifies those attributes (e.g. email), not the account itself.
-    # Auto-confirming accounts requires a pre-signup Lambda trigger, which we don't emulate.
+    # SignUp creates UNCONFIRMED unless the pool's PreSignUp Lambda trigger
+    # auto-confirms — invoked before the user is persisted, fail-closed, as on
+    # AWS (a rejecting or failing trigger blocks the sign-up with
+    # UserLambdaValidationException).
     status = "UNCONFIRMED"
+    try:
+        presignup = _apply_presignup_trigger(
+            pid, cid, username, dict(attr_dict),
+            trigger_source="PreSignUp_SignUp",
+        )
+    except _PreSignUpRejected as e:
+        logger.info("Cognito: PreSignUp Lambda rejected sign-up for %s: %s", username, e)
+        return error_response_json("UserLambdaValidationException", str(e), 400)
+    if presignup["autoConfirmUser"]:
+        status = "CONFIRMED"
+    if presignup["autoVerifyEmail"] and "email" in attr_dict:
+        attr_dict["email_verified"] = "true"
+    if presignup["autoVerifyPhone"] and "phone_number" in attr_dict:
+        attr_dict["phone_number_verified"] = "true"
+    attrs = _dict_to_attr_list(attr_dict)
 
     user = {
         "Username": username,
@@ -4038,7 +4056,8 @@ def _sign_up(data):
         "UserConfirmed": status == "CONFIRMED",
         "UserSub": attr_dict["sub"],
     }
-    if "email" in attr_dict:
+    if "email" in attr_dict and status != "CONFIRMED":
+        # An auto-confirmed user has nothing to verify — no code is delivered.
         resp["CodeDeliveryDetails"] = {
             "Destination": attr_dict["email"],
             "DeliveryMedium": "EMAIL",
@@ -6540,7 +6559,7 @@ def _get_credentials_for_identity(data):
             provider_parts.append(provider_name)
 
     from ministack.services import sts as sts_svc
-    sts_svc._sessions[access_key] = {
+    sts_svc.register_session(access_key, {
         "Arn": (f"arn:aws:sts::{get_account_id()}:assumed-role/"
                 f"{role_name}/CognitoIdentityCredentials"),
         "UserId": f"{role_id}:CognitoIdentityCredentials",
@@ -6552,7 +6571,7 @@ def _get_credentials_for_identity(data):
         "_cognito_auth_type": "authenticated" if logins else "unauthenticated",
         "_cognito_auth_provider": ",".join(provider_parts) or None,
         "_cognito_amr": amr,
-    }
+    })
 
     return json_response({
         "IdentityId": identity_id,

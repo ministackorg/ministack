@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """Amazon Bedrock AgentCore emulator.
 
 Covers the two AgentCore services, which both sign as ``bedrock-agentcore``:

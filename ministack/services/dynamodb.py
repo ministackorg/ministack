@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 DynamoDB Service Emulator.
 Supports: CreateTable, DeleteTable, DescribeTable, ListTables, UpdateTable,
@@ -1338,10 +1340,12 @@ def _update_table(data):
             table["ProvisionedThroughput"] = {"ReadCapacityUnits": 0, "WriteCapacityUnits": 0}
     if "AttributeDefinitions" in data:
         # Merge incoming AttributeDefinitions with existing ones (union by name).
-        # New definitions override existing ones with the same name.
+        # A redeclaration of an existing attribute — even with a conflicting
+        # type — is accepted and the STORED type wins; real DynamoDB neither
+        # rejects nor overwrites (measured eu-west-2, 2026-07-12, paritysuite).
         existing_ad = {ad["AttributeName"]: ad for ad in table.get("AttributeDefinitions", [])}
         for ad in data["AttributeDefinitions"]:
-            existing_ad[ad["AttributeName"]] = ad
+            existing_ad.setdefault(ad["AttributeName"], ad)
         table["AttributeDefinitions"] = list(existing_ad.values())
     if "StreamSpecification" in data:
         stream_spec = data["StreamSpecification"]
@@ -1375,7 +1379,10 @@ def _update_table(data):
         }
 
     existing_idx_names = {g["IndexName"] for g in table.get("GlobalSecondaryIndexes", [])}
-    defined_attrs = {a["AttributeName"] for a in table.get("AttributeDefinitions", [])}
+    # A new index's key attributes must all appear in the REQUEST's own
+    # AttributeDefinitions — stored definitions do not satisfy the check
+    # (measured eu-west-2, 2026-07-12, paritysuite).
+    defined_attrs = {a["AttributeName"] for a in data.get("AttributeDefinitions", [])}
     for update in data.get("GlobalSecondaryIndexUpdates", []):
         if "Create" in update:
             gsi_def = copy.deepcopy(update["Create"])
@@ -1684,7 +1691,7 @@ def _put_item(data):
     result = {}
     if data.get("ReturnValues") == "ALL_OLD" and old_item:
         result["Attributes"] = old_item
-    _add_consumed_capacity(result, data, name, write=True)
+    _add_consumed_capacity(result, data, name, write=True, old_item=old_item, new_item=item)
     _add_item_collection_metrics(result, data, table, item, None)
     return json_response(result)
 
@@ -1774,15 +1781,16 @@ def _delete_item(data):
     result = {}
     if data.get("ReturnValues") == "ALL_OLD" and old_item:
         result["Attributes"] = old_item
-    _add_consumed_capacity(result, data, name, write=True)
+    _add_consumed_capacity(result, data, name, write=True, old_item=old_item)
     _add_item_collection_metrics(result, data, table, None, key)
     return json_response(result)
 
 
 def _key_attribute_update_error(table, updated_attrs):
     """AWS error for an update whose targets include a hash or range key."""
+    tops = {p[0] if isinstance(p, tuple) else p for p in updated_attrs}
     for key_name in (table.get("pk_name"), table.get("sk_name")):
-        if key_name and key_name in updated_attrs:
+        if key_name and key_name in tops:
             return error_response_json("ValidationException",
                 f"One or more parameter values were invalid: Cannot update attribute {key_name}. This attribute is part of the key", 400)
     return None
@@ -1896,7 +1904,7 @@ def _update_item(data):
     if err:
         return err
     # Validate GSI/LSI key attribute types and values after the update is applied.
-    err = _validate_index_key_values(table, item)
+    err = _validate_index_key_values(table, item, update_expr=bool(data.get("UpdateExpression")))
     if err:
         return err
 
@@ -1920,7 +1928,7 @@ def _update_item(data):
         new_attrs = _diff_attributes(old_item or {}, item, updated_attrs, return_old=False)
         if new_attrs:
             result["Attributes"] = new_attrs
-    _add_consumed_capacity(result, data, name, write=True)
+    _add_consumed_capacity(result, data, name, write=True, old_item=old_item, new_item=item)
     _add_item_collection_metrics(result, data, table, item, key)
     return json_response(result)
 
@@ -2013,24 +2021,25 @@ def _query(data):
     if limit is not None and int(limit) <= 0:
         return error_response_json("ValidationException",
             "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1", 400)
-    # Select validation per AWS: ALL_PROJECTED_ATTRIBUTES is only valid on an
-    # index; SPECIFIC_ATTRIBUTES requires a ProjectionExpression / AttributesToGet.
+    # Select validation per AWS (messages measured against real DynamoDB by
+    # paritysuite). A ProjectionExpression with a non-SPECIFIC Select is
+    # reported first, even when the IndexName rule is also broken.
+    if "Select" in data and data.get("ProjectionExpression"):
+        if select == "ALL_ATTRIBUTES":
+            return error_response_json("ValidationException",
+                "Cannot specify the ProjectionExpression when choosing to get ALL_ATTRIBUTES", 400)
+        if select == "COUNT":
+            return error_response_json("ValidationException",
+                "Cannot specify the ProjectionExpression when choosing to get only the Count", 400)
+        if select == "ALL_PROJECTED_ATTRIBUTES":
+            return error_response_json("ValidationException",
+                "Cannot specify the ProjectionExpression when choosing to get ALL_PROJECTED_ATTRIBUTES", 400)
     if select == "ALL_PROJECTED_ATTRIBUTES" and not index_name:
         return error_response_json("ValidationException",
-            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying an index", 400)
+            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName", 400)
     if select == "SPECIFIC_ATTRIBUTES" and not data.get("ProjectionExpression") and not data.get("AttributesToGet"):
         return error_response_json("ValidationException",
             "1 validation error detected: Must specify either a ProjectionExpression or non-empty AttributesToGet when Select is SPECIFIC_ATTRIBUTES", 400)
-    # ALL_ATTRIBUTES or COUNT cannot be combined with ProjectionExpression.
-    if select in ("ALL_ATTRIBUTES", "COUNT") and data.get("ProjectionExpression"):
-        return error_response_json("ValidationException",
-            f"One or more parameter values were invalid: Select value {select} is not compatible with ProjectionExpression", 400)
-    if select == "ALL_PROJECTED_ATTRIBUTES" and data.get("ProjectionExpression") and not index_name:
-        return error_response_json("ValidationException",
-            "Cannot specify the ProjectionExpression when ALL_PROJECTED_ATTRIBUTES Select is used without an index", 400)
-    if select == "ALL_PROJECTED_ATTRIBUTES" and data.get("ProjectionExpression") and index_name:
-        return error_response_json("ValidationException",
-            "Cannot specify the ProjectionExpression when ALL_PROJECTED_ATTRIBUTES Select is used", 400)
 
     pk_name, sk_name, is_gsi = _resolve_index_keys(table, index_name)
     # ConsistentRead on a GSI is invalid (only LSIs support strongly-consistent reads).
@@ -2085,6 +2094,10 @@ def _query(data):
         allowed = {pk_name}
         if sk_name:
             allowed.add(sk_name)
+        # A document path on a key attribute is rejected up front (AWS).
+        if any(tok[0] == "DOT" for tok in kce_tokens):
+            return error_response_json("ValidationException",
+                "KeyConditionExpressions cannot have conditions on nested attributes", 400)
         for tok in kce_tokens:
             if tok[0] == "IDENT":
                 name_ = tok[1]
@@ -2219,7 +2232,7 @@ def _query(data):
                 lek.setdefault(k, v)
         result["LastEvaluatedKey"] = lek
 
-    _add_consumed_capacity(result, data, name)
+    _add_consumed_capacity(result, data, name, index_name=data.get("IndexName"))
     return json_response(result)
 
 
@@ -2314,23 +2327,24 @@ def _scan(data):
         if seg >= ts:
             return error_response_json("ValidationException",
                 f"The Segment parameter is zero-based and must be less than parameter TotalSegments: Segment: {seg} is not less than TotalSegments: {ts}", 400)
-    # Select validation.
+    # Select validation per AWS (messages measured against real DynamoDB by
+    # paritysuite — Scan reuses the Query-worded IndexName message verbatim).
+    if "Select" in data and data.get("ProjectionExpression"):
+        if select == "ALL_ATTRIBUTES":
+            return error_response_json("ValidationException",
+                "Cannot specify the ProjectionExpression when choosing to get ALL_ATTRIBUTES", 400)
+        if select == "COUNT":
+            return error_response_json("ValidationException",
+                "Cannot specify the ProjectionExpression when choosing to get only the Count", 400)
+        if select == "ALL_PROJECTED_ATTRIBUTES":
+            return error_response_json("ValidationException",
+                "Cannot specify the ProjectionExpression when choosing to get ALL_PROJECTED_ATTRIBUTES", 400)
     if select == "ALL_PROJECTED_ATTRIBUTES" and not index_name:
         return error_response_json("ValidationException",
-            "ALL_PROJECTED_ATTRIBUTES can be used only when Scanning an index", 400)
+            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName", 400)
     if select == "SPECIFIC_ATTRIBUTES" and not data.get("ProjectionExpression") and not data.get("AttributesToGet"):
         return error_response_json("ValidationException",
             "1 validation error detected: Must specify either a ProjectionExpression or non-empty AttributesToGet when Select is SPECIFIC_ATTRIBUTES", 400)
-    # ALL_ATTRIBUTES or COUNT cannot be combined with ProjectionExpression.
-    if select in ("ALL_ATTRIBUTES", "COUNT") and data.get("ProjectionExpression"):
-        return error_response_json("ValidationException",
-            f"One or more parameter values were invalid: Select value {select} is not compatible with ProjectionExpression", 400)
-    if select == "ALL_PROJECTED_ATTRIBUTES" and data.get("ProjectionExpression") and not index_name:
-        return error_response_json("ValidationException",
-            "ALL_PROJECTED_ATTRIBUTES can be used only when Scanning an index. Cannot specify the ProjectionExpression when ALL_PROJECTED_ATTRIBUTES Select is used without an index", 400)
-    if select == "ALL_PROJECTED_ATTRIBUTES" and data.get("ProjectionExpression") and index_name:
-        return error_response_json("ValidationException",
-            "Cannot specify the ProjectionExpression when ALL_PROJECTED_ATTRIBUTES Select is used", 400)
     # ConsistentRead on a GSI is invalid.
     if index_name and data.get("ConsistentRead"):
         _, _, is_gsi_scan = _resolve_index_keys(table, index_name)
@@ -2347,9 +2361,9 @@ def _scan(data):
     if index_name:
         pk_name_idx, sk_name_idx, is_gsi = _resolve_index_keys(table, index_name)
         if is_gsi:
-            # Sparse GSI semantics: items lacking the index's HASH attribute
-            # don't appear in the index.
-            all_items = [it for it in all_items if pk_name_idx in it]
+            # Sparse GSI semantics: items lacking ANY of the index's key
+            # attributes (hash, or range on a composite GSI) don't appear.
+            all_items = [it for it in all_items if pk_name_idx in it and (not sk_name_idx or sk_name_idx in it)]
         else:
             # LSI: items lacking the index's RANGE attribute don't appear.
             if sk_name_idx:
@@ -2439,7 +2453,7 @@ def _scan(data):
                 lek.setdefault(k, v)
         result["LastEvaluatedKey"] = lek
 
-    _add_consumed_capacity(result, data, name)
+    _add_consumed_capacity(result, data, name, index_name=data.get("IndexName"))
     return json_response(result)
 
 
@@ -2467,7 +2481,10 @@ def _execute_statement(data):
                                    f"Requested resource not found: Table: {table_name} not found", 400)
 
     if op == "SELECT":
-        status, headers, body = _partiql_select(table, parsed)
+        if parsed.get("index"):
+            status, headers, body = _partiql_select_index(table, parsed, data)
+        else:
+            status, headers, body = _partiql_select(table, parsed)
     elif op == "INSERT":
         status, headers, body = _partiql_insert(table, parsed)
     elif op == "UPDATE":
@@ -2483,12 +2500,144 @@ def _execute_statement(data):
             payload = json.loads(body)
         except (TypeError, ValueError):
             payload = None
-        if isinstance(payload, dict):
+        if isinstance(payload, dict) and "ConsumedCapacity" not in payload:
             units = max(1.0, float(len(payload.get("Items", []) or [1])))
             payload["ConsumedCapacity"] = {"TableName": table_name, "CapacityUnits": units}
             new_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             return status, headers, new_body
     return status, headers, body
+
+
+def _partiql_select_index(table, parsed, data):
+    """Serve SELECT ... FROM "table"."index" per real DynamoDB (paritysuite):
+    membership and projection follow the index; an LSI reaches back to the
+    base table for unprojected attributes (charged on the table arm per row
+    walked) while a GSI rejects them; a keyed read refuses filters on
+    unprojected attributes; capacity lands on the index arm; NextTokens are
+    bound to the index that minted them."""
+    index_name = parsed["index"]
+    gsis = {i.get("IndexName"): (i, True) for i in table.get("GlobalSecondaryIndexes", []) or []}
+    lsis = {i.get("IndexName"): (i, False) for i in table.get("LocalSecondaryIndexes", []) or []}
+    idx, is_gsi = (gsis.get(index_name) or lsis.get(index_name) or (None, None))
+    if idx is None:
+        return error_response_json("ValidationException",
+            f"The table does not have the specified index: {index_name}", 400)
+
+    consistent = bool(data.get("ConsistentRead"))
+    if consistent and is_gsi:
+        return error_response_json("ValidationException",
+            "Consistent reads are not supported on global secondary indexes", 400)
+    rate = 1.0 if consistent else 0.5
+
+    key_names = [ks.get("AttributeName") for ks in idx.get("KeySchema", []) or []]
+    table_keys = [table.get("pk_name")] + ([table.get("sk_name")] if table.get("sk_name") else [])
+    proj = idx.get("Projection") or {}
+    ptype = proj.get("ProjectionType", "ALL")
+    view_attrs = None  # None == ALL
+    if ptype != "ALL":
+        view_attrs = set(key_names) | set(table_keys)
+        if ptype == "INCLUDE":
+            view_attrs |= set(proj.get("NonKeyAttributes") or [])
+
+    conditions = parsed.get("conditions") or []
+    keyed = any(attr in key_names for attr, _op, _v in conditions)
+    if keyed and view_attrs is not None:
+        for attr, _op, _v in conditions:
+            if attr not in view_attrs:
+                return error_response_json("ValidationException",
+                    f"One or more parameter values were invalid: Filter expression can only contain non-primary key attributes projected into the index: {attr}", 400)
+
+    projections = parsed.get("projections")
+    reach_back = False
+    if projections and view_attrs is not None:
+        unprojected = [a for a in projections if a not in view_attrs]
+        if unprojected:
+            if is_gsi:
+                return error_response_json("ValidationException",
+                    f"One or more parameter values were invalid: Global secondary index {index_name} does not project {unprojected}", 400)
+            reach_back = True
+
+    def _index_view(item):
+        if view_attrs is None:
+            return dict(item)
+        return {k: v for k, v in item.items() if k in view_attrs}
+
+    # Membership + index ordering.
+    members = []
+    for pk in table["items"]:
+        for sk in table["items"][pk]:
+            it = table["items"][pk][sk]
+            if all(k in it for k in key_names):
+                members.append(it)
+    def _order_key(it):
+        return tuple(json.dumps(it.get(k), sort_keys=True) for k in key_names + table_keys)
+    members.sort(key=_order_key)
+
+    # Rows walked = rows matching the key conditions (filters apply later).
+    key_conds = [(a, o, v) for a, o, v in conditions if a in key_names]
+    walked = [it for it in members
+              if all(_eval_partiql_pred(_index_view(it), a, o, v) for a, o, v in key_conds)]
+
+    # Pagination: tokens are bound to the index that minted them.
+    offset = 0
+    token = data.get("NextToken")
+    if token:
+        try:
+            import base64 as _b64
+            tk = json.loads(_b64.b64decode(token).decode("utf-8"))
+            assert tk.get("t") == table.get("TableName") and tk.get("i") == index_name
+            offset = int(tk.get("o", 0))
+        except Exception:
+            return error_response_json("ValidationException",
+                "The provided NextToken is invalid", 400)
+    limit = data.get("Limit")
+    page = walked[offset:]
+    next_token = None
+    if limit is not None and int(limit) < len(page):
+        page = page[: int(limit)]
+        import base64 as _b64
+        next_token = _b64.b64encode(json.dumps(
+            {"t": table.get("TableName"), "i": index_name, "o": offset + len(page)}
+        ).encode("utf-8")).decode("ascii")
+
+    where_fn = parsed.get("where_fn")
+    kept = [it for it in page if (where_fn is None or where_fn(_index_view(it)))]
+
+    items = []
+    for it in kept:
+        if projections:
+            src = it if reach_back else _index_view(it)
+            row = {}
+            for attr in projections:
+                if attr in src:
+                    row[attr] = src[attr]
+                elif ("." in attr or "[" in attr):
+                    try:
+                        parts = _partiql_parse_path(attr)
+                    except ValueError:
+                        continue
+                    leaf = _partiql_get_path(src, parts)
+                    if leaf is not None:
+                        key = next((seg for seg in reversed(parts) if isinstance(seg, str)), attr)
+                        row[key] = leaf
+            items.append(row)
+        else:
+            items.append(_index_view(it))
+
+    payload = {"Items": items}
+    if next_token:
+        payload["NextToken"] = next_token
+    rc = data.get("ReturnConsumedCapacity", "NONE")
+    if rc != "NONE":
+        table_units = rate * len(page) if reach_back else 0.0
+        total = rate + table_units
+        cap = {"TableName": table.get("TableName"), "CapacityUnits": total}
+        if rc == "INDEXES":
+            cap["Table"] = {"CapacityUnits": table_units}
+            arm = {"GlobalSecondaryIndexes" if is_gsi else "LocalSecondaryIndexes": {index_name: {"CapacityUnits": rate}}}
+            cap.update(arm)
+        payload["ConsumedCapacity"] = cap
+    return 200, {"Content-Type": "application/x-amz-json-1.0"}, json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
 def _partiql_select(table, parsed):
@@ -2510,6 +2659,17 @@ def _partiql_select(table, parsed):
             for attr in projections:
                 if attr in it:
                     proj[attr] = it[attr]
+                elif "." in attr or "[" in attr:
+                    # Document path: the result column is named by the final
+                    # path segment (SELECT mymap.nested -> {nested: ...}).
+                    try:
+                        parts = _partiql_parse_path(attr)
+                    except ValueError:
+                        continue
+                    leaf = _partiql_get_path(it, parts)
+                    if leaf is not None:
+                        key = next((seg for seg in reversed(parts) if isinstance(seg, str)), attr)
+                        proj[key] = leaf
             projected.append(proj)
         filtered = projected
 
@@ -2602,6 +2762,141 @@ def _partiql_key_target(table, parsed):
     return pk_key, sk_key, non_key_fn, None
 
 
+def _partiql_parse_path(raw):
+    """Parse a PartiQL document path: 'profile.sub' -> ["profile", "sub"],
+    'tags[0]' -> ["tags", 0]. Attribute names may be double-quoted."""
+    import re as _re
+    parts = []
+    for seg in raw.split('.'):
+        seg = seg.strip().strip('"')
+        m = _re.match(r'^([^\[\]]+)((?:\[\d+\])*)$', seg)
+        if not m:
+            raise ValueError(f"Invalid document path: {raw}")
+        parts.append(m.group(1))
+        for idx in _re.findall(r'\[(\d+)\]', m.group(2)):
+            parts.append(int(idx))
+    return parts
+
+
+def _partiql_get_path(item, parts):
+    if item is None:
+        return None
+    node = item.get(parts[0])
+    for part in parts[1:]:
+        if node is None:
+            return None
+        if isinstance(part, str):
+            node = node.get("M", {}).get(part) if isinstance(node, dict) else None
+        else:
+            lst = node.get("L") if isinstance(node, dict) else None
+            node = lst[part] if lst is not None and part < len(lst) else None
+    return node
+
+
+def _partiql_walk_parent(item, parts):
+    """The AV container holding the leaf of `parts`, or None if the path's
+    ancestors don't exist / have the wrong shape."""
+    node = None
+    for i, part in enumerate(parts[:-1]):
+        if i == 0:
+            node = item.get(part)
+        elif isinstance(part, str):
+            node = node["M"].get(part) if (isinstance(node, dict) and "M" in node) else None
+        else:
+            lst = node.get("L") if isinstance(node, dict) else None
+            node = lst[part] if lst is not None and part < len(lst) else None
+        if node is None:
+            return None
+    return node
+
+
+_PARTIQL_BAD_PATH = "The document path provided in the update expression is invalid for update"
+
+
+def _partiql_set_path(item, parts, val):
+    """Apply a SET along a document path. Returns an error message or None.
+    A list index at or past the end appends (AWS clamps); a missing ancestor
+    (including SET tags[0] on an absent attribute) is rejected, not created."""
+    if len(parts) == 1:
+        item[parts[0]] = val
+        return None
+    parent = _partiql_walk_parent(item, parts)
+    if parent is None:
+        return _PARTIQL_BAD_PATH
+    leaf = parts[-1]
+    if isinstance(leaf, str):
+        if not (isinstance(parent, dict) and "M" in parent):
+            return _PARTIQL_BAD_PATH
+        parent["M"][leaf] = val
+    else:
+        if not (isinstance(parent, dict) and "L" in parent):
+            return _PARTIQL_BAD_PATH
+        lst = parent["L"]
+        if leaf < len(lst):
+            lst[leaf] = val
+        else:
+            lst.append(val)
+    return None
+
+
+def _partiql_remove_path(item, parts):
+    """Apply a REMOVE along a document path (missing paths are no-ops)."""
+    if len(parts) == 1:
+        item.pop(parts[0], None)
+        return None
+    parent = _partiql_walk_parent(item, parts)
+    if parent is None:
+        return None
+    leaf = parts[-1]
+    if isinstance(leaf, str):
+        if isinstance(parent, dict) and "M" in parent:
+            parent["M"].pop(leaf, None)
+    else:
+        if isinstance(parent, dict) and "L" in parent and leaf < len(parent["L"]):
+            del parent["L"][leaf]
+    return None
+
+
+def _partiql_modified_items(item_before, item_after, paths, want_old):
+    """RETURNING MODIFIED OLD/NEW * per real DynamoDB: only the changed leaf
+    comes back — nested map paths as a one-leaf fragment, list indices packed
+    densely in ascending index order (measured by paritysuite). Reading the
+    post-image at the written path naturally yields the shifted element after
+    a list REMOVE and nothing for a clamped out-of-range append."""
+    frag = {}
+    list_packs = {}
+    for parts in paths:
+        top = parts[0]
+        old_leaf = _partiql_get_path(item_before, parts)
+        new_leaf = _partiql_get_path(item_after, parts)
+        if old_leaf == new_leaf:
+            continue
+        leaf = old_leaf if want_old else new_leaf
+        if leaf is None:
+            continue
+        if len(parts) == 1:
+            frag[top] = leaf
+        elif len(parts) == 2 and isinstance(parts[1], int):
+            list_packs.setdefault(top, []).append((parts[1], leaf))
+        elif all(isinstance(part, str) for part in parts):
+            node = frag.setdefault(top, {"M": {}})
+            if not (isinstance(node, dict) and set(node.keys()) == {"M"}):
+                continue
+            cur = node
+            for part in parts[1:-1]:
+                cur = cur["M"].setdefault(part, {"M": {}})
+            cur["M"][parts[-1]] = leaf
+        else:
+            src = item_before if want_old else item_after
+            v = (src or {}).get(top)
+            if v is not None:
+                frag[top] = v
+    for top, pairs in list_packs.items():
+        pairs.sort(key=lambda x: x[0])
+        frag[top] = {"L": [leaf for _, leaf in pairs]}
+    return [frag] if frag else []
+
+
 def _build_partiql_returning(item_before, item_after, returning_clause):
     """Build the Items list for a RETURNING clause response.
 
@@ -2661,7 +2956,9 @@ def _partiql_update(table, parsed):
     if not non_key_fn(item):
         return _conditional_check_failed({}, item)
 
-    item_before = copy.deepcopy(item) if returning else None
+    item_before = copy.deepcopy(item)
+    work = copy.deepcopy(item)
+    applied_paths = []
     for attr, val in set_attrs.items():
         # Handle arithmetic: {"__partiql_arith": {"attr": "n", "op": "+", "val": {"N": "1"}}}
         if isinstance(val, dict) and "__partiql_arith" in val:
@@ -2669,23 +2966,44 @@ def _partiql_update(table, parsed):
             src_attr = arith["attr"]
             op = arith["op"]
             operand = arith["val"]
-            cur = item.get(src_attr)
+            cur = work.get(src_attr)
             if cur and "N" in cur and "N" in operand:
                 from decimal import Decimal
                 result_n = Decimal(cur["N"]) + Decimal(operand["N"]) if op == "+" else Decimal(cur["N"]) - Decimal(operand["N"])
-                item[attr] = {"N": str(result_n)}
+                work[attr] = {"N": str(result_n)}
             else:
-                item[attr] = operand  # fallback: just set to operand
-        else:
-            item[attr] = val
+                work[attr] = operand  # fallback: just set to operand
+            applied_paths.append([attr])
+            continue
+        try:
+            parts = _partiql_parse_path(attr)
+        except ValueError as exc:
+            return error_response_json("ValidationException", str(exc), 400)
+        err_msg = _partiql_set_path(work, parts, val)
+        if err_msg:
+            return error_response_json("ValidationException", err_msg, 400)
+        applied_paths.append(parts)
     for attr in remove_attrs:
-        item.pop(attr, None)
+        try:
+            parts = _partiql_parse_path(attr)
+        except ValueError as exc:
+            return error_response_json("ValidationException", str(exc), 400)
+        _partiql_remove_path(work, parts)
+        applied_paths.append(parts)
+    # Nothing failed — commit the working copy.
+    item.clear()
+    item.update(work)
     item_after = item
 
     if returning:
-        items_list, ret_err = _build_partiql_returning(item_before, item_after, returning)
-        if ret_err:
-            return error_response_json("ValidationException", ret_err, 400)
+        r = returning.upper().strip()
+        if r in ("MODIFIED OLD *", "MODIFIED NEW *"):
+            items_list = _partiql_modified_items(item_before, item_after, applied_paths,
+                                                 want_old=(r == "MODIFIED OLD *"))
+        elif r == "ALL OLD *":
+            items_list = [item_before] if item_before else []
+        else:
+            items_list = [copy.deepcopy(item_after)]
         return json_response({"Items": items_list})
     return json_response({"Items": []})
 
@@ -2701,7 +3019,7 @@ def _partiql_delete(table, parsed):
         r = returning.upper().strip()
         if r not in ("ALL OLD *",):
             return error_response_json("ValidationException",
-                f"Only RETURNING ALL OLD * is allowed on DELETE statements; got: RETURNING {returning}", 400)
+                "Only RETURNING ALL OLD * is allowed in DELETE statements", 400)
 
     pk_key, sk_key, non_key_fn, err = _partiql_key_target(table, parsed)
     if err:
@@ -2755,18 +3073,45 @@ def _batch_execute_statement(data):
         import re as _re
         _ret_match = _re.search(r'\s+RETURNING\s+', raw_stmt, _re.IGNORECASE)
         if _ret_match:
-            # Check if it's a valid RETURNING variant — invalid ones get ValidationError.
-            _ret_clause = raw_stmt[_ret_match.end():].strip().rstrip(';').strip().upper()
+            _ret_orig = raw_stmt[_ret_match.end():].strip().rstrip(';').strip()
+            _ret_clause = _ret_orig.upper()
             _valid_ret = {"ALL OLD *", "ALL NEW *", "MODIFIED OLD *", "MODIFIED NEW *"}
-            # For DELETE, only ALL OLD * is valid.
+            # For DELETE, only ALL OLD * is valid (verbatim AWS message,
+            # measured by paritysuite).
             _is_delete = raw_stmt.strip().upper().startswith("DELETE")
             if _is_delete and _ret_clause not in ("ALL OLD *",):
                 responses.append({"Error": {"Code": "ValidationError",
-                    "Message": "Only RETURNING ALL OLD * is allowed on DELETE statements"}})
+                    "Message": f"Invalid returning clause: RETURNING {_ret_orig}. Only RETURNING ALL OLD * is allowed in DELETE statements."}})
                 continue
             if _ret_clause not in _valid_ret:
                 responses.append({"Error": {"Code": "ValidationError",
                     "Message": f"Invalid RETURNING clause: {_ret_clause}"}})
+                continue
+        # Parse up front — parse failures and batch-only SELECT constraints are
+        # per-member rejections that never reach a table (no TableName echoed,
+        # no capacity charged).
+        try:
+            parsed = _parse_partiql(raw_stmt, stmt.get("Parameters", []))
+        except ValueError as exc:
+            msg = str(exc)
+            if msg.startswith(("Unsupported PartiQL statement", "Could not parse")):
+                msg = "Statement wasn't well formed, can't be processed: Expected data manipulation"
+            responses.append({"Error": {"Code": "ValidationError", "Message": msg}})
+            continue
+        if parsed["op"] == "SELECT":
+            # A batch SELECT must name the full table primary key with equality,
+            # and an index-qualified read is not reachable from a batch at all.
+            key_err = None
+            tbl = _tables.get(parsed["table"])
+            if parsed.get("index"):
+                key_err = True
+            elif tbl is not None:
+                eq_attrs = {attr for attr, op_, _ in (parsed.get("conditions") or []) if op_ == "="}
+                need = {tbl.get("pk_name")} | ({tbl.get("sk_name")} if tbl.get("sk_name") else set())
+                key_err = not need.issubset(eq_attrs)
+            if key_err:
+                responses.append({"Error": {"Code": "ValidationError",
+                    "Message": "Select statements within BatchExecuteStatement must specify the primary key in the where clause"}})
                 continue
         sub = {"Statement": raw_stmt, "Parameters": stmt.get("Parameters", [])}
         status, _, body = _execute_statement(sub)
@@ -2774,14 +3119,14 @@ def _batch_execute_statement(data):
             payload = json.loads(body)
         except (TypeError, ValueError):
             payload = {}
+        ran = False
         if status == 200:
-            entry: dict = {}
+            entry: dict = {"TableName": parsed["table"]}
             items = payload.get("Items")
-            if items is not None:
-                # RETURNING responses: include the item if present
-                if items:
-                    entry["Item"] = items[0]
+            if items:
+                entry["Item"] = items[0]
             responses.append(entry)
+            ran = True
         else:
             err_code = payload.get("__type", "ValidationException")
             err_msg = payload.get("message", "")
@@ -2792,13 +3137,20 @@ def _batch_execute_statement(data):
                 short = "ValidationError"
             elif short.endswith("Exception"):
                 short = short[: -len("Exception")]
-            responses.append({"Error": {"Code": short, "Message": err_msg}})
-        # Per-table unit attribution.
-        try:
-            parsed = _parse_partiql(raw_stmt, stmt.get("Parameters", []))
-            per_table_units[parsed["table"]] = per_table_units.get(parsed["table"], 0.0) + 1.0
-        except Exception:
-            pass
+            err_entry: dict = {"Error": {"Code": short, "Message": err_msg}}
+            # TableName is echoed only on a member that ran and failed during
+            # execution — not on one rejected before it reached its table.
+            if short in ("ConditionalCheckFailed", "DuplicateItem"):
+                err_entry["TableName"] = parsed["table"]
+                ran = True
+            responses.append(err_entry)
+        if ran:
+            # Reads rate by the member's own ConsistentRead; writes cost 1 WCU.
+            if parsed["op"] == "SELECT":
+                units = 1.0 if stmt.get("ConsistentRead") else 0.5
+            else:
+                units = 1.0
+            per_table_units[parsed["table"]] = per_table_units.get(parsed["table"], 0.0) + units
     result = {"Responses": responses}
     if rc != "NONE":
         result["ConsumedCapacity"] = [
@@ -2832,7 +3184,16 @@ def _execute_transaction(data):
         signature = {k: v for k, v in data.items() if k != "ClientRequestToken"}
         if prior is not None:
             if prior.get("signature") == signature:
-                return json_response(prior.get("response", {}))
+                replay = {k: v for k, v in prior.get("response", {}).items() if k != "ConsumedCapacity"}
+                if data.get("ReturnConsumedCapacity", "NONE") != "NONE":
+                    consumed = []
+                    for tname, sizes in (prior.get("sizes") or {}).items():
+                        read_units = sum(2.0 * max(1.0, float(-(-sz // 4096))) for sz in sizes)
+                        consumed.append({"TableName": tname, "CapacityUnits": read_units,
+                                         "ReadCapacityUnits": read_units})
+                    if consumed:
+                        replay["ConsumedCapacity"] = consumed
+                return json_response(replay)
             return error_response_json("IdempotentParameterMismatchException",
                 "Request token already in use for another request with a different payload", 400)
 
@@ -2846,11 +3207,14 @@ def _execute_transaction(data):
         import re as _re2
         if _re2.search(r'\s+RETURNING\s+', statement, _re2.IGNORECASE):
             return error_response_json("ValidationException",
-                "RETURNING clause is not supported in TransactStatement", 400)
+                "RETURNING clause is not supported in ExecuteTransaction", 400)
         try:
             parsed = _parse_partiql(statement, parameters)
         except ValueError as e:
             return error_response_json("ValidationException", str(e), 400)
+        if parsed.get("op") == "SELECT" and parsed.get("index"):
+            return error_response_json("ValidationException",
+                "Reads on indices are not supported within transactions", 400)
         table = _tables.get(parsed["table"])
         if not table:
             return error_response_json("ResourceNotFoundException",
@@ -2914,15 +3278,31 @@ def _execute_transaction(data):
         return 400, {"Content-Type": "application/x-amz-json-1.0", "x-amzn-errortype": "TransactionCanceledException"}, body
 
     result = {"Responses": responses}
+    # Per-table item sizes: a transactional write costs 2 x ceil(size/1KB) WCU,
+    # a same-token replay 2 x ceil(size/4KB) RCU (measured, paritysuite).
+    txn_sizes: dict = {}
+    for parsed, _ in parsed_list:
+        tname = parsed["table"]
+        tbl = _tables.get(tname)
+        sz = 0
+        if tbl is not None and parsed["op"] != "SELECT":
+            try:
+                pk_key, sk_key, _fn, _err = _partiql_key_target(tbl, parsed)
+                if _err is None:
+                    it = tbl["items"].get(pk_key, {}).get(sk_key)
+                    sz = _item_size_bytes(it) if it else 0
+            except Exception:
+                sz = 0
+        txn_sizes.setdefault(tname, []).append(sz)
     if rc != "NONE":
-        per_table: dict[str, float] = {}
-        for parsed, _ in parsed_list:
-            per_table[parsed["table"]] = per_table.get(parsed["table"], 0.0) + 2.0
-        result["ConsumedCapacity"] = [
-            {"TableName": t, "CapacityUnits": u} for t, u in per_table.items()
-        ]
+        consumed = []
+        for tname, sizes in txn_sizes.items():
+            write_units = sum(2.0 * _capacity_kb(sz) for sz in sizes)
+            consumed.append({"TableName": tname, "CapacityUnits": write_units,
+                             "WriteCapacityUnits": write_units})
+        result["ConsumedCapacity"] = consumed
     if crt:
-        _txn_idempotency[crt] = {"signature": signature, "response": result}
+        _txn_idempotency[crt] = {"signature": signature, "response": result, "sizes": txn_sizes}
     return json_response(result)
 
 
@@ -2947,15 +3327,24 @@ def _parse_partiql_select(s, parameters):
     import re
     # SELECT <projections> FROM <table> [WHERE <condition>]
     m = re.match(
-        r'SELECT\s+(.*?)\s+FROM\s+"?([A-Za-z0-9_.\-]+)"?(?:\s+WHERE\s+(.+))?$',
+        r'SELECT\s+(.*?)\s+FROM\s+("?[A-Za-z0-9_.\-]+"?(?:\s*\.\s*"[A-Za-z0-9_.\-]+")?)(?:\s+WHERE\s+(.+))?$',
         s, re.IGNORECASE | re.DOTALL,
     )
     if not m:
         raise ValueError(f"Could not parse SELECT statement: {s}")
 
     proj_str = m.group(1).strip()
-    table_name = m.group(2).strip()
+    from_str = m.group(2).strip()
     where_str = m.group(3)
+    # FROM "table"."index" — the index qualifier must be quoted, so a plain
+    # table name containing dots keeps its existing meaning.
+    index_name = None
+    qm = re.match(r'^"?([A-Za-z0-9_.\-]+?)"?\s*\.\s*"([A-Za-z0-9_.\-]+)"$', from_str)
+    if '"' in from_str and qm:
+        table_name = qm.group(1)
+        index_name = qm.group(2)
+    else:
+        table_name = from_str.strip('"')
 
     projections = None
     if proj_str != "*":
@@ -2964,13 +3353,16 @@ def _parse_partiql_select(s, parameters):
     where_fn, conditions = (_build_partiql_where(where_str, parameters)
                             if where_str else (None, []))
 
-    return {"op": "SELECT", "table": table_name, "projections": projections,
-            "where_fn": where_fn, "conditions": conditions}
+    return {"op": "SELECT", "table": table_name, "index": index_name,
+            "projections": projections, "where_fn": where_fn, "conditions": conditions}
 
 
 def _parse_partiql_insert(s, parameters):
     import re
     # INSERT INTO <table> VALUE { ... }
+    if re.search(r'INTO\s+"[^"]+"\s*\.\s*"', s, re.IGNORECASE):
+        raise ValueError(
+            "Statement wasn't well formed, can't be processed: FROM clause may only contain a single table name")
     m = re.match(
         r"INSERT\s+INTO\s+\"?([A-Za-z0-9_.\-]+)\"?\s+VALUE\s+(.+)$",
         s, re.IGNORECASE | re.DOTALL,
@@ -2996,6 +3388,8 @@ def _parse_partiql_update(s, parameters):
         returning = ret_match.group(1).strip()
         s = s[:ret_match.start()].strip()
 
+    if re.match(r'UPDATE\s+"[^"]+"\s*\.\s*"', s, re.IGNORECASE):
+        raise ValueError("This operation is not supported on an index")
     # Try SET ... WHERE form first.
     m = re.match(
         r"UPDATE\s+\"?([A-Za-z0-9_.\-]+)\"?\s+SET\s+(.+?)\s+WHERE\s+(.+)$",
@@ -3052,6 +3446,8 @@ def _parse_partiql_delete(s, parameters):
         returning = ret_match.group(1).strip()
         s = s[:ret_match.start()].strip()
 
+    if re.match(r'DELETE\s+FROM\s+"[^"]+"\s*\.\s*"', s, re.IGNORECASE):
+        raise ValueError("This operation is not supported on an index")
     # DELETE FROM <table> WHERE <condition>
     m = re.match(
         r"DELETE\s+FROM\s+\"?([A-Za-z0-9_.\-]+)\"?\s+WHERE\s+(.+)$",
@@ -3066,49 +3462,110 @@ def _parse_partiql_delete(s, parameters):
             "conditions": conditions, "returning": returning}
 
 
+def _eval_partiql_pred(item, attr, op, val):
+    """Evaluate one PartiQL predicate against an item. `op` may carry a
+    "NOT:" prefix for a negated comparison."""
+    if isinstance(op, str) and op.startswith("NOT:"):
+        return not _eval_partiql_pred(item, attr, op[4:], val)
+    item_val = item.get(attr)
+    if op == "begins_with":
+        if item_val is None or not isinstance(item_val, dict) or "S" not in item_val:
+            return False
+        prefix = val.get("S", "") if isinstance(val, dict) else str(val)
+        return item_val["S"].startswith(prefix)
+    if op == "not_begins_with":
+        if item_val is not None and isinstance(item_val, dict) and "S" in item_val:
+            prefix = val.get("S", "") if isinstance(val, dict) else str(val)
+            return not item_val["S"].startswith(prefix)
+        return True
+    if op == "is_missing":
+        return item_val is None
+    if op == "is_not_missing":
+        return item_val is not None
+    if op == "IN":
+        return item_val is not None and any(_ddb_equals(item_val, v) for v in val)
+    return _compare_ddb(item_val, op, val)
+
+
 def _build_partiql_where(where_str, parameters, param_idx=None):
-    """Build a predicate function + structural conditions list for a PartiQL WHERE."""
+    """Build a predicate function + structural conditions list for a PartiQL
+    WHERE. Top-level OR splits into branches (DNF); the conditions list is
+    only populated for the single-branch form, which is what key targeting
+    and batch key validation consume."""
     if not where_str or not where_str.strip():
         return None, []
     if param_idx is None:
         param_idx = [0]
 
-    conditions = _parse_partiql_conditions(where_str, parameters, param_idx)
+    branches = []
+    for branch_str in _split_top_level_by_or(where_str):
+        b = branch_str.strip()
+        # Strip one pair of parens wrapping the whole branch.
+        if b.startswith("(") and b.endswith(")"):
+            depth = 0
+            wraps = True
+            for k, ch in enumerate(b):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0 and k != len(b) - 1:
+                        wraps = False
+                        break
+            if wraps:
+                b = b[1:-1].strip()
+        branches.append(_parse_partiql_conditions(b, parameters, param_idx))
+
+    conditions = branches[0] if len(branches) == 1 else []
 
     def where_fn(item):
-        # Fail-fast per predicate (see non_key_fn): a passing condition falls
-        # through to the next one instead of returning, so every predicate in a
-        # multi-condition WHERE is evaluated regardless of order.
-        for attr, op, val in conditions:
-            item_val = item.get(attr)
-            if op == "begins_with":
-                if item_val is None or not isinstance(item_val, dict) or "S" not in item_val:
-                    return False
-                prefix = val.get("S", "") if isinstance(val, dict) else str(val)
-                if not item_val["S"].startswith(prefix):
-                    return False
-            elif op == "not_begins_with":
-                # missing attribute / non-string → NOT begins_with is True (pass)
-                if item_val is not None and isinstance(item_val, dict) and "S" in item_val:
-                    prefix = val.get("S", "") if isinstance(val, dict) else str(val)
-                    if item_val["S"].startswith(prefix):
-                        return False
-            elif op == "is_missing":
-                if item_val is not None:
-                    return False
-            elif op == "is_not_missing":
-                if item_val is None:
-                    return False
-            elif op == "IN":
-                if item_val is None or not any(_ddb_equals(item_val, v) for v in val):
-                    return False
-            else:
-                if not _compare_ddb(item_val, op, val):
-                    return False
-        return True
+        return any(all(_eval_partiql_pred(item, attr, op, val) for attr, op, val in branch)
+                   for branch in branches)
 
     return where_fn, conditions
 
+
+def _split_top_level_by_or(s):
+    """Split a WHERE string on OR at the top level (respecting parens/quotes)."""
+    parts = []
+    depth = 0
+    in_str = None
+    current = []
+    i = 0
+    s_up = s.upper()
+    while i < len(s):
+        ch = s[i]
+        if in_str:
+            current.append(ch)
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            in_str = ch
+            current.append(ch)
+            i += 1
+            continue
+        if ch in ('(', '[', '{'):
+            depth += 1
+            current.append(ch)
+            i += 1
+            continue
+        if ch in (')', ']', '}'):
+            depth -= 1
+            current.append(ch)
+            i += 1
+            continue
+        if depth == 0 and s_up[i:i+3] == ' OR' and (i + 3 >= len(s) or s[i+3] == ' '):
+            parts.append("".join(current))
+            current = []
+            i += 3
+            continue
+        current.append(ch)
+        i += 1
+    if current:
+        parts.append("".join(current))
+    return [p.strip() for p in parts if p.strip()]
 
 def _parse_partiql_conditions(where_str, parameters, param_idx):
     """Parse WHERE conditions joined by AND. Returns list of (attr, op, ddb_value)."""
@@ -3152,6 +3609,27 @@ def _parse_partiql_conditions(where_str, parameters, param_idx):
                     for v in _split_top_level(m.group(2), ',')]
             conditions.append((attr, "IN", vals))
             continue
+        # NOT <comparison> — negated predicate (begins_with has its own form).
+        mnot = re.match(r'NOT\s+("?[A-Za-z0-9_.\-]+"?\s*(?:=|<>|!=|<=|>=|<|>).+)$', part, re.IGNORECASE)
+        if mnot and not re.match(r'NOT\s+begins_with', part, re.IGNORECASE):
+            inner = _parse_partiql_conditions(mnot.group(1), parameters, param_idx)
+            for attr_i, op_i, val_i in inner:
+                conditions.append((attr_i, f"NOT:{op_i}", val_i))
+            continue
+        # attr BETWEEN lo AND hi (the inner AND is re-joined by the splitter)
+        m = re.match(r'"?([A-Za-z0-9_.\-]+)"?\s+BETWEEN\s+(.+?)\s+AND\s+(.+)$', part, re.IGNORECASE)
+        if m:
+            attr = m.group(1)
+            lo = _parse_partiql_literal(m.group(2).strip(), parameters, param_idx)
+            hi = _parse_partiql_literal(m.group(3).strip(), parameters, param_idx)
+            for bound in (lo, hi):
+                bt = _ddb_type(bound)
+                if bt and bt not in ("S", "N", "B"):
+                    raise ValueError(
+                        f"Incorrect operand type for operator or function; operator or function: BETWEEN, operand type: {bt}")
+            conditions.append((attr, ">=", lo))
+            conditions.append((attr, "<=", hi))
+            continue
         # Standard comparison
         m = re.match(r'"?([A-Za-z0-9_.\-]+)"?\s*(=|<>|!=|<=|>=|<|>)\s*(.+)$', part)
         if not m:
@@ -3162,6 +3640,13 @@ def _parse_partiql_conditions(where_str, parameters, param_idx):
             op = '<>'
         val_str = m.group(3).strip()
         val = _parse_partiql_literal(val_str, parameters, param_idx)
+        if op in ("<", "<=", ">", ">="):
+            # Ordering only exists for S / N / B operands; AWS rejects the
+            # statement naming the operator as written (measured, paritysuite).
+            vt = _ddb_type(val)
+            if vt and vt not in ("S", "N", "B"):
+                raise ValueError(
+                    f"Incorrect operand type for operator or function; operator or function: {op}, operand type: {vt}")
         conditions.append((attr, op, val))
     return conditions
 
@@ -3198,12 +3683,17 @@ def _split_top_level_by_and(s):
             current.append(ch)
             i += 1
             continue
-        # Check for AND keyword at depth 0
+        # Check for AND keyword at depth 0 — but the AND that separates a
+        # BETWEEN's bounds belongs to the BETWEEN, not the conjunction.
         if depth == 0 and s_up[i:i+4] == ' AND' and (i + 4 >= len(s) or s[i+4] == ' '):
-            parts.append("".join(current))
-            current = []
-            i += 4  # skip " AND"
-            continue
+            cur_up = "".join(current).upper()
+            between_pending = (' BETWEEN ' in cur_up
+                               and ' AND ' not in cur_up.split(' BETWEEN ', 1)[1] + ' ')
+            if not between_pending:
+                parts.append("".join(current))
+                current = []
+                i += 4  # skip " AND"
+                continue
         current.append(ch)
         i += 1
     if current:
@@ -3324,7 +3814,20 @@ def _split_top_level(s, delimiter):
 # Batch operations
 # ---------------------------------------------------------------------------
 
+def _accumulate_write_capacity(cap, table, old_item, new_item):
+    """Fold one write's table + per-index units into a batch accumulator."""
+    old_size = _item_size_bytes(old_item) if old_item else 0
+    new_size = _item_size_bytes(new_item) if new_item else 0
+    cap["table"] += _capacity_kb(max(old_size, new_size))
+    for kind, key in (("GlobalSecondaryIndexes", "gsi"), ("LocalSecondaryIndexes", "lsi")):
+        for idx in table.get(kind, []) or []:
+            u = _index_write_units(table, idx, old_item, new_item)
+            if u:
+                cap[key][idx["IndexName"]] = cap[key].get(idx["IndexName"], 0.0) + u
+
+
 def _batch_write_item(data):
+    _batch_capacity: dict = {}
     request_items = data.get("RequestItems")
     if not request_items:
         return error_response_json("ValidationException",
@@ -3390,6 +3893,7 @@ def _batch_write_item(data):
                 "Requested resource not found",
                 400,
             )
+        cap = _batch_capacity.setdefault(table_name, {"table": 0.0, "gsi": {}, "lsi": {}})
         for req in requests:
             if "PutRequest" in req:
                 item = req["PutRequest"]["Item"]
@@ -3402,6 +3906,7 @@ def _batch_write_item(data):
                 old_item = table["items"].get(pk_val, {}).get(sk_val)
                 table["items"][pk_val][sk_val] = item
                 _emit_stream_event(table_name, "MODIFY" if old_item else "INSERT", old_item, item)
+                _accumulate_write_capacity(cap, table, old_item, item)
             elif "DeleteRequest" in req:
                 key = req["DeleteRequest"]["Key"]
                 pk_val, sk_val, key_err = _resolve_table_key_values(table, key, allow_extra=False)
@@ -3411,22 +3916,24 @@ def _batch_write_item(data):
                 table["items"].get(pk_val, {}).pop(sk_val, None)
                 if old_item:
                     _emit_stream_event(table_name, "REMOVE", old_item, None)
+                _accumulate_write_capacity(cap, table, old_item, None)
         _update_counts(table)
     result = {"UnprocessedItems": unprocessed}
     rc = data.get("ReturnConsumedCapacity", "NONE")
     if rc != "NONE":
         consumed = []
-        for t, reqs in request_items.items():
-            if t not in _tables:
+        for t in request_items:
+            cap = _batch_capacity.get(t)
+            if cap is None:
                 continue
-            gsi_count = len(_tables[t].get("GlobalSecondaryIndexes", []))
-            units = len(reqs) * (1.0 + gsi_count)
-            entry = {"TableName": t, "CapacityUnits": units}
-            if rc == "INDEXES" and gsi_count:
-                entry["GlobalSecondaryIndexes"] = {
-                    gsi["IndexName"]: {"CapacityUnits": float(len(reqs))}
-                    for gsi in _tables[t].get("GlobalSecondaryIndexes", [])
-                }
+            total = cap["table"] + sum(cap["gsi"].values()) + sum(cap["lsi"].values())
+            entry = {"TableName": t, "CapacityUnits": total}
+            if rc == "INDEXES":
+                entry["Table"] = {"CapacityUnits": cap["table"]}
+                if cap["gsi"]:
+                    entry["GlobalSecondaryIndexes"] = {n: {"CapacityUnits": u} for n, u in cap["gsi"].items()}
+                if cap["lsi"]:
+                    entry["LocalSecondaryIndexes"] = {n: {"CapacityUnits": u} for n, u in cap["lsi"].items()}
             consumed.append(entry)
         result["ConsumedCapacity"] = consumed
     return json_response(result)
@@ -3519,7 +4026,21 @@ def _transact_write_items(data):
         signature = {k: v for k, v in data.items() if k != "ClientRequestToken"}
         if prior is not None:
             if prior.get("signature") == signature:
-                return json_response(prior.get("response", {}))
+                # A same-token replay does not re-apply the writes; AWS reports
+                # a transactional READ of the stored result, recomputed against
+                # the item sizes (2 x ceil(size/4KB) per item) — measured
+                # against real DynamoDB (eu-west-2) by paritysuite.
+                replay = {k: v for k, v in prior.get("response", {}).items() if k != "ConsumedCapacity"}
+                rc_replay = data.get("ReturnConsumedCapacity", "NONE")
+                if rc_replay != "NONE":
+                    consumed = []
+                    for tname, sizes in (prior.get("sizes") or {}).items():
+                        read_units = sum(2.0 * max(1.0, float(-(-sz // 4096))) for sz in sizes)
+                        consumed.append({"TableName": tname, "CapacityUnits": read_units,
+                                         "ReadCapacityUnits": read_units})
+                    if consumed:
+                        replay["ConsumedCapacity"] = consumed
+                return json_response(replay)
             return error_response_json("IdempotentParameterMismatchException",
                 "Request token already in use for another request with a different payload", 400)
     # Member validation across the transaction. AWS validates every member
@@ -3553,6 +4074,27 @@ def _transact_write_items(data):
             item_err = _validate_item(key_src, tbl.get("pk_name"), tbl.get("sk_name"))
             if item_err:
                 return item_err
+            # Empty-string/binary secondary-index key -> top-level
+            # ValidationException; wrong-typed index keys instead cancel in
+            # Phase 1 (measured against real DynamoDB by paritysuite).
+            msg = _index_key_empty_reason(tbl, key_src)
+            if msg:
+                return error_response_json("ValidationException", msg, 400)
+        elif op_type == "Update" and op.get("UpdateExpression"):
+            pk_val = _extract_key_val(key_src.get(tbl["pk_name"]))
+            sk_val = _extract_key_val(key_src.get(tbl["sk_name"])) if tbl["sk_name"] else "__no_sort__"
+            existing = tbl["items"].get(pk_val, {}).get(sk_val)
+            probe = copy.deepcopy(existing) if existing else dict(key_src)
+            try:
+                probe, _ = _apply_update_expression(probe, op.get("UpdateExpression", ""),
+                                                    op.get("ExpressionAttributeValues", {}),
+                                                    op.get("ExpressionAttributeNames", {}))
+            except ValueError:
+                probe = None  # type errors surface in Phase 1 as cancellations
+            if probe is not None:
+                msg = _index_key_empty_reason(tbl, probe, update_expr=True)
+                if msg:
+                    return error_response_json("ValidationException", msg, 400)
         target = (tn,
                   _extract_key_val(key_src.get(tbl.get("pk_name") or "")),
                   _extract_key_val(key_src.get(tbl.get("sk_name") or "")) if tbl.get("sk_name") else None)
@@ -3576,6 +4118,11 @@ def _transact_write_items(data):
         if type_msg:
             val_reasons[idx] = type_msg
             continue
+        if op_type == "Put":
+            imsg = _index_key_type_reason(tbl, key_src)
+            if imsg:
+                val_reasons[idx] = imsg
+                continue
         if op_type == "Update":
             ue = op.get("UpdateExpression", "")
             if ue:
@@ -3584,9 +4131,13 @@ def _transact_write_items(data):
                 existing = tbl["items"].get(pk_val, {}).get(sk_val)
                 probe = copy.deepcopy(existing) if existing else dict(key_src)
                 try:
-                    _apply_update_expression(probe, ue, op.get("ExpressionAttributeValues", {}), op.get("ExpressionAttributeNames", {}))
+                    probe, _ = _apply_update_expression(probe, ue, op.get("ExpressionAttributeValues", {}), op.get("ExpressionAttributeNames", {}))
                 except ValueError as exc:
                     val_reasons[idx] = str(exc)
+                else:
+                    imsg = _index_key_type_reason(tbl, probe)
+                    if imsg:
+                        val_reasons[idx] = imsg
     if val_reasons:
         return _transact_validation_cancel_response(len(items_list), val_reasons)
 
@@ -3613,9 +4164,21 @@ def _transact_write_items(data):
     if failures:
         return _transact_cancel_response(len(items_list), failures)
 
+    _txn_write_effects: dict = {}
+
     for transact in items_list:
         op_type, op = _extract_transact_op(transact)
         if op is None or op_type == "ConditionCheck":
+            # A ConditionCheck writes nothing but still consumes transactional
+            # write capacity (2 x ceil(size/1KB), measured by paritysuite).
+            if op_type == "ConditionCheck" and op is not None:
+                cc_tbl = _tables.get(op.get("TableName", ""))
+                if cc_tbl:
+                    cc_key = op.get("Key", {})
+                    cc_pk = _extract_key_val(cc_key.get(cc_tbl["pk_name"]))
+                    cc_sk = _extract_key_val(cc_key.get(cc_tbl["sk_name"])) if cc_tbl["sk_name"] else "__no_sort__"
+                    cc_ref = cc_tbl["items"].get(cc_pk, {}).get(cc_sk) or cc_key
+                    _txn_write_effects.setdefault(op.get("TableName", ""), []).append((cc_ref, cc_ref))
             continue
         table_name = op.get("TableName", "")
         tbl = _tables.get(table_name)
@@ -3628,6 +4191,7 @@ def _transact_write_items(data):
             old_item = tbl["items"].get(pk_val, {}).get(sk_val)
             tbl["items"][pk_val][sk_val] = item
             _emit_stream_event(table_name, "MODIFY" if old_item else "INSERT", old_item, item)
+            _txn_write_effects.setdefault(table_name, []).append((old_item, item))
         elif op_type == "Delete":
             key = op["Key"]
             pk_val = _extract_key_val(key.get(tbl["pk_name"]))
@@ -3636,6 +4200,7 @@ def _transact_write_items(data):
             tbl["items"].get(pk_val, {}).pop(sk_val, None)
             if old_item:
                 _emit_stream_event(table_name, "REMOVE", old_item, None)
+            _txn_write_effects.setdefault(table_name, []).append((old_item, None))
         elif op_type == "Update":
             key = op["Key"]
             pk_val = _extract_key_val(key.get(tbl["pk_name"]))
@@ -3647,31 +4212,47 @@ def _transact_write_items(data):
                 item, _ = _apply_update_expression(item, ue, op.get("ExpressionAttributeValues", {}), op.get("ExpressionAttributeNames", {}))
             tbl["items"][pk_val][sk_val] = item
             _emit_stream_event(table_name, "MODIFY" if old_item else "INSERT", old_item, item)
+            _txn_write_effects.setdefault(table_name, []).append((old_item, item))
         _update_counts(tbl)
 
-    # ConsumedCapacity (2 units per item for transactions).
+    # ConsumedCapacity: a transactional write costs 2 x ceil(size/1KB) WCU per
+    # item on the table (measured against real DynamoDB, eu-west-2, by
+    # paritysuite); index replication is asynchronous, so index arms carry the
+    # standard 1x units.
     result = {}
+    txn_sizes: dict = {}
     rc = data.get("ReturnConsumedCapacity", "NONE")
-    if rc != "NONE":
-        per_table_units: dict[str, float] = {}
-        for transact in items_list:
-            op_type, op = _extract_transact_op(transact)
-            if op is None:
-                continue
-            tname = op.get("TableName", "")
-            per_table_units[tname] = per_table_units.get(tname, 0.0) + 2.0
-        consumed = []
-        for tname, units in per_table_units.items():
-            entry = {"TableName": tname, "CapacityUnits": units, "WriteCapacityUnits": units}
-            if rc == "INDEXES" and _tables.get(tname, {}).get("GlobalSecondaryIndexes"):
-                entry["GlobalSecondaryIndexes"] = {
-                    gsi["IndexName"]: {"CapacityUnits": units, "WriteCapacityUnits": units}
-                    for gsi in _tables[tname].get("GlobalSecondaryIndexes", [])
-                }
+    consumed = []
+    for tname, effects in _txn_write_effects.items():
+        tbl = _tables.get(tname, {})
+        sizes = []
+        write_units = 0.0
+        gsi_units: dict = {}
+        lsi_units: dict = {}
+        for old_it, new_it in effects:
+            sz = max(_item_size_bytes(old_it) if old_it else 0,
+                     _item_size_bytes(new_it) if new_it else 0)
+            sizes.append(sz)
+            write_units += 2.0 * _capacity_kb(sz)
+            for kind, acc in (("GlobalSecondaryIndexes", gsi_units), ("LocalSecondaryIndexes", lsi_units)):
+                for idx in tbl.get(kind, []) or []:
+                    u = _index_write_units(tbl, idx, old_it, new_it)
+                    if u:
+                        acc[idx["IndexName"]] = acc.get(idx["IndexName"], 0.0) + u
+        txn_sizes[tname] = sizes
+        if rc != "NONE":
+            total = write_units + sum(gsi_units.values()) + sum(lsi_units.values())
+            entry = {"TableName": tname, "CapacityUnits": total, "WriteCapacityUnits": write_units}
+            if rc == "INDEXES":
+                if gsi_units:
+                    entry["GlobalSecondaryIndexes"] = {n: {"CapacityUnits": u, "WriteCapacityUnits": u} for n, u in gsi_units.items()}
+                if lsi_units:
+                    entry["LocalSecondaryIndexes"] = {n: {"CapacityUnits": u, "WriteCapacityUnits": u} for n, u in lsi_units.items()}
             consumed.append(entry)
+    if rc != "NONE" and consumed:
         result["ConsumedCapacity"] = consumed
     if crt:
-        _txn_idempotency[crt] = {"signature": signature, "response": result}
+        _txn_idempotency[crt] = {"signature": signature, "response": result, "sizes": txn_sizes}
     return json_response(result)
 
 
@@ -5334,7 +5915,7 @@ def _apply_set(item, tokens, attr_values, attr_names, updated_attrs):
                         f"The document path provided in the update expression is invalid for update: {'.'.join(str(p) for p in path_parts[:-1])}"
                     )
             pending.append((path_parts, value))
-            updated_attrs.add(path_parts[0])
+            updated_attrs.add(tuple(path_parts))
     for path_parts, value in pending:
         _set_at_path(item, path_parts, value)
 
@@ -5424,7 +6005,7 @@ def _apply_remove(item, tokens, attr_names, updated_attrs):
     for path_tokens in _split_by_comma(tokens):
         path = _parse_path_from_tokens(path_tokens, attr_names)
         if path:
-            updated_attrs.add(path[0])
+            updated_attrs.add(tuple(path))
             _remove_at_path(item, path)
 
 
@@ -5454,7 +6035,7 @@ def _apply_add(item, tokens, attr_values, attr_names, updated_attrs):
         add_val = attr_values.get(part[val_idx][1])
         if not path or add_val is None:
             continue
-        updated_attrs.add(path[0])
+        updated_attrs.add(tuple(path))
 
         # ADD only accepts Number and set operands (parse-time in AWS), and the
         # existing attribute must carry the same type (runtime in AWS).
@@ -5495,7 +6076,7 @@ def _apply_delete(item, tokens, attr_values, attr_names, updated_attrs):
         del_val = attr_values.get(part[val_idx][1])
         if not path or del_val is None:
             continue
-        updated_attrs.add(path[0])
+        updated_attrs.add(tuple(path))
 
         # DELETE only accepts set operands (parse-time in AWS), and the
         # existing attribute must be a set of the same type (runtime in AWS).
@@ -5729,10 +6310,33 @@ def _ddb_comparable(val):
         if "SS" in val:
             return ("SS", frozenset(val["SS"]))
         if "NS" in val:
-            return ("NS", frozenset(val["NS"]))
+            return ("NS", frozenset(_canonical_number(n) for n in val["NS"]))
         if "BS" in val:
-            return ("BS", frozenset(val["BS"]))
-    return ("UNKNOWN", None)
+            return ("BS", frozenset(_canonical_binary(b) for b in val["BS"]))
+        if "L" in val:
+            # Lists compare element-wise, in order.
+            return ("L", tuple(_ddb_comparable(el) for el in val["L"]))
+        if "M" in val:
+            # Maps compare by content, not key arrival order.
+            return ("M", tuple(sorted((k, _ddb_comparable(v)) for k, v in val["M"].items())))
+    return ("UNKNOWN", object())
+
+
+def _canonical_number(n):
+    try:
+        return Decimal(n)
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal(0)
+
+
+def _canonical_binary(b):
+    if isinstance(b, bytes):
+        return b
+    try:
+        import base64
+        return base64.b64decode(b)
+    except Exception:
+        return b if isinstance(b, str) else b""
 
 
 def _ddb_equals(a, b):
@@ -5821,41 +6425,71 @@ def _key_schema_validation_error():
     return error_response_json("ValidationException", "The provided key element does not match the schema", 400)
 
 
-def _validate_index_key_values(table: dict, item: dict) -> tuple | None:
-    """Validate that any GSI/LSI key attributes present in `item` have the
-    correct type and are not empty. AWS rejects puts/updates that would write
-    a wrong-typed, non-scalar, or empty-string/binary value into a secondary
-    index key attribute. Items missing a GSI key attribute entirely are fine —
-    they just won't appear in that sparse GSI."""
+def _index_key_type_reason(table: dict, item: dict) -> str | None:
+    """AWS's type-mismatch message for a wrong-typed / non-scalar secondary
+    index key attribute in `item`, or None. Used both as a top-level
+    ValidationException (single writes) and as a per-item TransactionCanceled
+    ValidationError reason (transactions)."""
     attr_defs = {ad["AttributeName"]: ad["AttributeType"]
                  for ad in (table.get("AttributeDefinitions") or [])}
     for idx in (table.get("GlobalSecondaryIndexes") or []) + (table.get("LocalSecondaryIndexes") or []):
+        idx_name = idx.get("IndexName")
         for ks in (idx.get("KeySchema") or []):
             key_name = ks.get("AttributeName")
             if not key_name or key_name not in item:
-                continue  # sparse index — item simply won't appear in this index
+                continue
             expected_type = attr_defs.get(key_name)
             if not expected_type:
                 continue
             raw = item[key_name]
             if not isinstance(raw, dict) or len(raw) != 1:
-                return error_response_json("ValidationException",
-                    f"One or more parameter values were invalid: Type mismatch for Index Key {key_name} Expected: {expected_type} Actual: map", 400)
+                return f"One or more parameter values were invalid: Type mismatch for Index Key {key_name} Expected: {expected_type} Actual: map IndexName: {idx_name}"
             actual_type = next(iter(raw))
-            # Must be a scalar type (S, N, B) — not SS, NS, BS, L, M, BOOL, NULL
-            if actual_type not in ("S", "N", "B"):
-                return error_response_json("ValidationException",
-                    f"One or more parameter values were invalid: Type mismatch for Index Key {key_name} Expected: {expected_type} Actual: {actual_type}", 400)
             if actual_type != expected_type:
-                return error_response_json("ValidationException",
-                    f"One or more parameter values were invalid: Type mismatch for Index Key {key_name} Expected: {expected_type} Actual: {actual_type}", 400)
-            # Reject empty string/binary for index keys
-            err = _empty_key_value_error(key_name, raw)
-            if err:
-                return error_response_json("ValidationException",
-                    "One or more parameter values were invalid: Condition parameter type does not match schema type", 400)
+                return f"One or more parameter values were invalid: Type mismatch for Index Key {key_name} Expected: {expected_type} Actual: {actual_type} IndexName: {idx_name}"
     return None
 
+
+def _index_key_empty_reason(table: dict, item: dict, update_expr: bool = False) -> str | None:
+    """AWS's empty-value message for a secondary index key attribute in `item`
+    holding an empty string/binary, or None. UpdateItem words it differently
+    and omits the index name (measured by paritysuite, 2026-06-23)."""
+    attr_defs = {ad["AttributeName"]: ad["AttributeType"]
+                 for ad in (table.get("AttributeDefinitions") or [])}
+    for idx in (table.get("GlobalSecondaryIndexes") or []) + (table.get("LocalSecondaryIndexes") or []):
+        idx_name = idx.get("IndexName")
+        for ks in (idx.get("KeySchema") or []):
+            key_name = ks.get("AttributeName")
+            if not key_name or key_name not in item:
+                continue
+            expected_type = attr_defs.get(key_name)
+            raw = item[key_name]
+            if not isinstance(raw, dict) or len(raw) != 1:
+                continue
+            actual_type = next(iter(raw))
+            if actual_type != expected_type:
+                continue
+            if (actual_type == "S" and raw.get("S") == "") or (actual_type == "B" and not raw.get("B")):
+                kind = "string" if actual_type == "S" else "binary"
+                if update_expr:
+                    return f"One or more parameter values are not valid. The update expression attempted to update a secondary index key to a value that is not supported. The AttributeValue for a key attribute cannot contain an empty {kind} value."
+                return f"One or more parameter values are not valid. A value specified for a secondary index key is not supported. The AttributeValue for a key attribute cannot contain an empty {kind} value. IndexName: {idx_name}, IndexKey: {key_name}"
+    return None
+
+
+def _validate_index_key_values(table: dict, item: dict, update_expr: bool = False) -> tuple | None:
+    """Validate that any GSI/LSI key attributes present in `item` have the
+    correct type and are not empty. AWS rejects puts/updates that would write
+    a wrong-typed, non-scalar, or empty-string/binary value into a secondary
+    index key attribute. Items missing a GSI key attribute entirely are fine —
+    they just won't appear in that sparse GSI."""
+    msg = _index_key_type_reason(table, item)
+    if msg:
+        return error_response_json("ValidationException", msg, 400)
+    msg = _index_key_empty_reason(table, item, update_expr=update_expr)
+    if msg:
+        return error_response_json("ValidationException", msg, 400)
+    return None
 
 def _key_type_mismatch_reason(table, attrs):
     """Return the AWS message for a key attribute present with the wrong type,
@@ -6626,27 +7260,100 @@ def _evaluate_key_conditions_item(item, key_conditions, pk_name):
     return True
 
 
-def _add_consumed_capacity(result, data, table_name, write=False):
+def _capacity_kb(nbytes: int) -> float:
+    """Write units for an entry of `nbytes` bytes: 1 WCU per started KB."""
+    return max(1.0, float(-(-nbytes // 1024)))
+
+
+def _index_write_view(table, idx, item):
+    """The (key signature, projected view) of `item` in index `idx`, or None
+    when the item is absent from the index (missing an index key attribute)."""
+    if not item:
+        return None
+    key_names = [ks.get("AttributeName") for ks in idx.get("KeySchema", []) or []]
+    for k in key_names:
+        if k not in item:
+            return None
+    proj = idx.get("Projection") or {}
+    ptype = proj.get("ProjectionType", "ALL")
+    if ptype == "ALL":
+        view = dict(item)
+    else:
+        view = {}
+        table_keys = [table.get("pk_name")] + ([table.get("sk_name")] if table.get("sk_name") else [])
+        for k in list(key_names) + table_keys:
+            if k and k in item:
+                view[k] = item[k]
+        if ptype == "INCLUDE":
+            for k in proj.get("NonKeyAttributes") or []:
+                if k in item:
+                    view[k] = item[k]
+    key_sig = json.dumps([item.get(k) for k in key_names], sort_keys=True)
+    return key_sig, view
+
+
+def _index_write_units(table, idx, old_item, new_item):
+    """Write units a Put/Update/Delete costs one index, per real DynamoDB:
+    nothing when the index's stored view is unchanged, one write to insert or
+    delete an entry or rewrite it in place, two (delete + insert) when the
+    index key changes so the entry moves."""
+    ov = _index_write_view(table, idx, old_item)
+    nv = _index_write_view(table, idx, new_item)
+    if ov is None and nv is None:
+        return 0.0
+    if ov is None:
+        return _capacity_kb(_item_size_bytes(nv[1]))
+    if nv is None:
+        return _capacity_kb(_item_size_bytes(ov[1]))
+    if ov[0] != nv[0]:
+        return _capacity_kb(_item_size_bytes(ov[1])) + _capacity_kb(_item_size_bytes(nv[1]))
+    if ov[1] == nv[1]:
+        return 0.0
+    return max(_capacity_kb(_item_size_bytes(ov[1])), _capacity_kb(_item_size_bytes(nv[1])))
+
+
+def _add_consumed_capacity(result, data, table_name, write=False, old_item=None,
+                           new_item=None, index_name=None):
     rc = data.get("ReturnConsumedCapacity", "NONE")
     if rc == "NONE":
         return
     table = _tables.get(table_name, {})
-    gsi_count = len(table.get("GlobalSecondaryIndexes", [])) if write else 0
-    # Eventually-consistent reads (ConsistentRead not set or False) cost 0.5 RCU;
-    # strongly-consistent reads cost 1.0 RCU. Writes always cost 1.0 WCU.
+    gsi_units: dict = {}
+    lsi_units: dict = {}
     if write:
-        units = 1.0 + gsi_count
+        old_size = _item_size_bytes(old_item) if old_item else 0
+        new_size = _item_size_bytes(new_item) if new_item else 0
+        table_units = _capacity_kb(max(old_size, new_size))
+        for idx in table.get("GlobalSecondaryIndexes", []) or []:
+            u = _index_write_units(table, idx, old_item, new_item)
+            if u:
+                gsi_units[idx["IndexName"]] = u
+        for idx in table.get("LocalSecondaryIndexes", []) or []:
+            u = _index_write_units(table, idx, old_item, new_item)
+            if u:
+                lsi_units[idx["IndexName"]] = u
     else:
+        # Eventually-consistent reads cost 0.5 RCU; strongly-consistent 1.0.
         consistent = data.get("ConsistentRead", False)
-        units = 1.0 if consistent else 0.5
-    cap = {"TableName": table_name, "CapacityUnits": units}
+        table_units = 1.0 if consistent else 0.5
+        if index_name:
+            # The index carries the read; the base table's share is 0.
+            names_gsi = {i.get("IndexName") for i in table.get("GlobalSecondaryIndexes", []) or []}
+            names_lsi = {i.get("IndexName") for i in table.get("LocalSecondaryIndexes", []) or []}
+            if index_name in names_gsi:
+                gsi_units[index_name] = table_units
+                table_units = 0.0
+            elif index_name in names_lsi:
+                lsi_units[index_name] = table_units
+                table_units = 0.0
+    total = table_units + sum(gsi_units.values()) + sum(lsi_units.values())
+    cap = {"TableName": table_name, "CapacityUnits": total}
     if rc == "INDEXES":
-        cap["Table"] = {"CapacityUnits": units}
-        if write and gsi_count:
-            cap["GlobalSecondaryIndexes"] = {
-                gsi["IndexName"]: {"CapacityUnits": 1.0}
-                for gsi in table.get("GlobalSecondaryIndexes", [])
-            }
+        cap["Table"] = {"CapacityUnits": table_units}
+        if gsi_units:
+            cap["GlobalSecondaryIndexes"] = {n: {"CapacityUnits": u} for n, u in gsi_units.items()}
+        if lsi_units:
+            cap["LocalSecondaryIndexes"] = {n: {"CapacityUnits": u} for n, u in lsi_units.items()}
     result["ConsumedCapacity"] = cap
 
 
@@ -6674,16 +7381,31 @@ def _diff_attributes(old_item, new_item, updated_attrs, return_old=True):
       removals where there is no new value (per AWS, REMOVE-only updates with
       UPDATED_NEW omit Attributes entirely).
     """
+    src = old_item if return_old else new_item
     result = {}
-    for k in updated_attrs:
-        if return_old:
-            v = old_item.get(k)
+    for path in updated_attrs:
+        if isinstance(path, str):
+            path = (path,)
+        top = path[0]
+        # Whole-attribute update, or a path with list indices: return the
+        # top-level attribute (AWS only fragments plain map paths).
+        if len(path) == 1 or not all(isinstance(part, str) for part in path):
+            v = src.get(top)
             if v is not None:
-                result[k] = v
-        else:
-            v = new_item.get(k)
-            if v is not None:
-                result[k] = v
+                result[top] = v
+            continue
+        # Nested map path: AWS returns only the changed fragment, e.g.
+        # SET parent.child = :v with UPDATED_NEW -> {parent: {M: {child: v}}}.
+        v = _get_at_path(src, list(path))
+        if v is None:
+            continue
+        node = result.setdefault(top, {"M": {}})
+        if not (isinstance(node, dict) and set(node.keys()) == {"M"}):
+            continue  # whole attribute already reported
+        cur = node
+        for part in path[1:-1]:
+            cur = cur["M"].setdefault(part, {"M": {}})
+        cur["M"][path[-1]] = v
     return result
 
 

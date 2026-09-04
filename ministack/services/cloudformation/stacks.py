@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 CloudFormation stacks — async stack lifecycle (deploy, delete, update, diff).
 """
@@ -122,6 +124,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
 
     failed = False
     fail_reason = ""
+    replaced_resources = []
 
     for logical_id in ordered:
         res_def = resources_defs[logical_id]
@@ -168,6 +171,13 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                         resource_type, old_pid, old_props, resolved_props,
                         stack_name, logical_id, old_attrs
                     )
+                if physical_id != old_pid:
+                    # A changed physical id is a replacement. Real
+                    # CloudFormation deletes the predecessor in the
+                    # UPDATE_COMPLETE_CLEANUP phase; without this the old
+                    # resource leaked forever, still holding its data.
+                    replaced_resources.append(
+                        (logical_id, resource_type, old_pid, old_props))
             else:
                 if _is_custom_resource(resource_type):
                     physical_id, attrs = await run_reentrant(
@@ -199,6 +209,24 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
 
         _add_event(stack_id, stack_name, logical_id, resource_type,
                    f"{status_prefix}_COMPLETE", physical_id=physical_id)
+
+    # Replacement cleanup (update case): delete each replaced resource's
+    # predecessor, as real CloudFormation does after UPDATE_COMPLETE.
+    if not failed and replaced_resources:
+        for logical_id, rtype, old_pid, old_props in replaced_resources:
+            try:
+                if _is_custom_resource(rtype):
+                    await run_reentrant(
+                        _delete_resource, rtype, old_pid, old_props,
+                        stack_name, logical_id
+                    )
+                else:
+                    _delete_resource(rtype, old_pid, old_props, stack_name, logical_id)
+            except Exception as exc:
+                logger.error("Failed to delete replaced resource %s (%s): %s",
+                             logical_id, old_pid, exc)
+                _add_event(stack_id, stack_name, logical_id, rtype,
+                           "DELETE_FAILED", str(exc), old_pid)
 
     # Delete removed resources (update case)
     if not failed and to_remove:

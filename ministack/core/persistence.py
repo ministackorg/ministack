@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 State persistence for MiniStack services.
 When PERSIST_STATE=1, service state is saved to STATE_DIR on shutdown

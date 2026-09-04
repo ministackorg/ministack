@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 AWS Cloud Map (Service Discovery) emulator.
 JSON-based API via X-Amz-Target: Route53AutoNaming_v20170314.

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 STS Service Emulator (AWS-compatible).
 
@@ -22,6 +24,28 @@ from ministack.core.router import extract_access_key_id
 from ministack.services.iam import _error, _future, _gen_secret, _gen_session_access_key, _gen_session_token, _p, _xml
 
 _sessions: dict[str, dict] = {}
+
+
+def _evict_expired_sessions():
+    """Drop sessions past their Expiration — the store otherwise grows with
+    every AssumeRole and every vended identity-pool credential, forever.
+    Called on each insert; entries without an Expiration are kept."""
+    now = time.time()
+    for key in [k for k, s in _sessions.items()
+                if isinstance(s.get("Expiration"), (int, float))
+                and now > s["Expiration"]]:
+        _sessions.pop(key, None)
+
+
+def _session_expired(session) -> bool:
+    exp = session.get("Expiration")
+    return isinstance(exp, (int, float)) and time.time() > exp
+
+
+def register_session(access_key: str, session: dict) -> None:
+    """Register a temporary-credential session (AssumeRole, identity pools)."""
+    _evict_expired_sessions()
+    _sessions[access_key] = session
 
 
 def reset():
@@ -86,8 +110,13 @@ async def handle_request(method, path, headers, body, query_params):
             try:
                 access_key = auth.split("Credential=")[1].split("/")[0]
                 if access_key in _sessions:
-                    caller_arn = _sessions[access_key]["Arn"]
-                    caller_user_id = _sessions[access_key]["UserId"]
+                    session = _sessions[access_key]
+                    if _session_expired(session):
+                        return _error(403, "ExpiredToken",
+                                      "The security token included in the request is expired",
+                                      ns="sts")
+                    caller_arn = session["Arn"]
+                    caller_user_id = session["UserId"]
             except Exception:
                 pass
         if use_json:
@@ -158,12 +187,12 @@ async def handle_request(method, path, headers, body, query_params):
         secret_key = _gen_secret()
         session_token = _gen_session_token()
         role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
-        _sessions[access_key] = {
+        register_session(access_key, {
             "Arn": assumed_arn,
             "UserId": f"{role_id}:{session_name}",
             "SecretAccessKey": secret_key,
             "Expiration": time.time() + duration,
-        }
+        })
         if use_json:
             return json_response({
                 "Credentials": {"AccessKeyId": access_key, "SecretAccessKey": secret_key, "SessionToken": session_token, "Expiration": int(time.time() + duration)},
@@ -197,12 +226,12 @@ async def handle_request(method, path, headers, body, query_params):
         secret_key = _gen_secret()
         session_token = _gen_session_token()
         role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
-        _sessions[access_key] = {
+        register_session(access_key, {
             "Arn": assumed_arn,
             "UserId": f"{role_id}:{session}",
             "SecretAccessKey": secret_key,
             "Expiration": time.time() + duration,
-        }
+        })
         provider = _p(params, "ProviderId") or "sts.amazonaws.com"
         if use_json:
             return json_response({

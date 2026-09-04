@@ -8202,3 +8202,56 @@ def test_cognito_identity_pool_credentials_are_sts_sessions(cognito_identity):
     assert ident["Arn"] == (
         "arn:aws:sts::000000000000:assumed-role/UnauthPoolRole/CognitoIdentityCredentials")
     assert ident["UserId"].endswith(":CognitoIdentityCredentials")
+
+
+def test_cognito_presignup_trigger_fires_on_plain_signup(cognito_idp, lam):
+    """A pool's PreSignUp Lambda runs on ordinary SignUp: autoConfirmUser
+    confirms the account (no code delivery), and a rejecting trigger blocks
+    the sign-up with UserLambdaValidationException, as on AWS."""
+    import io
+    import zipfile
+
+    fname = f"presignup-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        "def handler(event, context):\n"
+        "    if event['userName'].startswith('deny'):\n"
+        "        raise Exception('no room for you')\n"
+        "    event['response']['autoConfirmUser'] = True\n"
+        "    event['response']['autoVerifyEmail'] = True\n"
+        "    return event\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler", Code={"ZipFile": buf.getvalue()},
+    )
+    fn_arn = f"arn:aws:lambda:us-east-1:000000000000:function:{fname}"
+
+    pid = cognito_idp.create_user_pool(
+        PoolName=f"presignup-{fname}",
+        LambdaConfig={"PreSignUp": fn_arn},
+    )["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="c")["UserPoolClient"]["ClientId"]
+
+    resp = cognito_idp.sign_up(
+        ClientId=cid, Username="alice", Password="Passw0rd!x",
+        UserAttributes=[{"Name": "email", "Value": "alice@example.com"}])
+    assert resp["UserConfirmed"] is True
+    assert "CodeDeliveryDetails" not in resp
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="alice")
+    assert user["UserStatus"] == "CONFIRMED"
+    attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+    assert attrs.get("email_verified") == "true"
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.sign_up(ClientId=cid, Username="deny-bob", Password="Passw0rd!x")
+    assert exc.value.response["Error"]["Code"] == "UserLambdaValidationException"
+    with pytest.raises(ClientError):
+        cognito_idp.admin_get_user(UserPoolId=pid, Username="deny-bob")
+
+    cognito_idp.delete_user_pool(UserPoolId=pid)
+    lam.delete_function(FunctionName=fname)

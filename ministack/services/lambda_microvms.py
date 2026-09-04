@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """AWS Lambda MicroVMs emulation (REST-JSON, API version 2025-09-09).
 
 Control-plane emulation of the Lambda MicroVM API: build images, run MicroVMs,

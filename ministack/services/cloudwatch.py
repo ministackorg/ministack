@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 CloudWatch Metrics Service Emulator.
 Supports legacy Query API (form-encoded), smithy-rpc-v2-cbor (botocore 1.42+),

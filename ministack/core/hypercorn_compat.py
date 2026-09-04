@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """Compatibility shims for the hypercorn/h11 stack.
 
 h11 serialises ``InformationalResponse`` with an empty reason phrase by

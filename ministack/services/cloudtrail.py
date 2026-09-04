@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 AWS CloudTrail Service Emulator.
 In-memory audit log — records all API calls and exposes LookupEvents for test assertions.

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """TLS material helpers — env-driven cert/key resolution for the gateway.
 
 `USE_SSL=1` enables HTTPS (LocalStack-compatible). Self-signed cert
