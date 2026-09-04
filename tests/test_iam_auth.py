@@ -1214,7 +1214,20 @@ class TestS3ActionMapping:
         ("DELETE", "/bucket", {"cors": ""}, "s3:PutBucketCORS"),
         ("DELETE", "/bucket", {"policy": ""}, "s3:DeleteBucketPolicy"),   # this one exists
         ("GET", "/bucket/key", {"versions": ""}, "s3:GetObject"),         # bucket-only sub-resource
-        ("GET", "/bucket/key", {"versionId": "v1"}, "s3:GetObject"),      # not s3:GetObjectVersion (known gap)
+        # a request that names a version authorizes as the version action
+        ("GET", "/bucket/key", {"versionId": "v1"}, "s3:GetObjectVersion"),
+        ("HEAD", "/bucket/key", {"versionId": "v1"}, "s3:GetObjectVersion"),
+        ("DELETE", "/bucket/key", {"versionId": "v1"}, "s3:DeleteObjectVersion"),
+        ("GET", "/bucket/key", {"versionId": "v1", "tagging": ""}, "s3:GetObjectVersionTagging"),
+        ("PUT", "/bucket/key", {"versionId": "v1", "tagging": ""}, "s3:PutObjectVersionTagging"),
+        ("DELETE", "/bucket/key", {"versionId": "v1", "tagging": ""}, "s3:DeleteObjectVersionTagging"),
+        ("GET", "/bucket/key", {"versionId": "v1", "acl": ""}, "s3:GetObjectVersionAcl"),
+        ("PUT", "/bucket/key", {"versionId": "v1", "acl": ""}, "s3:PutObjectVersionAcl"),
+        ("GET", "/bucket/key", {"versionId": "v1", "attributes": ""}, "s3:GetObjectVersionAttributes"),
+        ("GET", "/bucket/key", {"versionId": ["v1"]}, "s3:GetObjectVersion"),  # parse_qs list form
+        ("GET", "/bucket/key", {"versionId": ""}, "s3:GetObject"),        # an empty versionId names nothing
+        ("PUT", "/bucket/key", {"versionId": "v1", "retention": ""}, "s3:PutObjectRetention"),  # no version action
+        ("GET", "/bucket", {"versionId": "v1"}, "s3:ListBucket"),         # bucket level: no version action
         # a POST on the bucket is the browser form upload unless it says ?delete
         ("POST", "/bucket", {}, "s3:PutObject"),                          # POST Object
         ("POST", "/bucket", {"delete": ""}, "s3:DeleteObject"),           # DeleteObjects

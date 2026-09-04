@@ -222,11 +222,25 @@ _S3_OBJECT_QUERY_ACTIONS: dict[str, dict[str, str]] = {
     "torrent": {"GET": "GetObject"},
 }
 
+# An object request that names a version (``?versionId=``) authorizes as
+# the version-specific action.
+_S3_VERSIONED_ACTIONS: dict[str, str] = {
+    "GetObject": "GetObjectVersion",
+    "DeleteObject": "DeleteObjectVersion",
+    "GetObjectTagging": "GetObjectVersionTagging",
+    "PutObjectTagging": "PutObjectVersionTagging",
+    "DeleteObjectTagging": "DeleteObjectVersionTagging",
+    "GetObjectAcl": "GetObjectVersionAcl",
+    "PutObjectAcl": "PutObjectVersionAcl",
+    "GetObjectAttributes": "GetObjectVersionAttributes",
+}
+
 
 def _s3_action(method: str, path: str, query_params: dict) -> str | None:
     parts = [p for p in path.split("/") if p]
     depth = min(len(parts), 2)
 
+    action = None
     # Sub-operation query params first: the level-specific table, then the
     # shared one. A request for the service root has no sub-resources.
     if depth >= 1:
@@ -236,9 +250,16 @@ def _s3_action(method: str, path: str, query_params: dict) -> str | None:
                 if qp in query_params:
                     a = action_map.get(method)
                     if a:
-                        return a
+                        action = a
+                        break
+            if action:
+                break
+    if action is None:
+        action = _S3_ACTIONS.get((method, depth))
 
-    return _S3_ACTIONS.get((method, depth))
+    if depth == 2 and action and _query_param(query_params, "versionId"):
+        action = _S3_VERSIONED_ACTIONS.get(action, action)
+    return action
 
 
 # Lambda REST path → IAM action
