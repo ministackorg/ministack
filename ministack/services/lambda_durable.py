@@ -361,7 +361,8 @@ def _emit_history_event(rec: dict, event_type: str, details_key: str, details: d
 def create_execution_for_invoke(function_arn: str, version: str,
                                 input_payload: str,
                                 name: str | None = None,
-                                trace_id: str | None = None) -> dict:
+                                trace_id: str | None = None,
+                                execution_timeout: int | None = None) -> dict:
     """Spin up a new durable execution and return its record. The Lambda
     runtime is expected to read the ARN from the AWS_DURABLE_EXECUTION_ARN
     env var and call Checkpoint/GetState through the regular Lambda endpoint."""
@@ -397,10 +398,19 @@ def create_execution_for_invoke(function_arn: str, version: str,
         "History": [],
         "NextEventId": 0,
     }
+    if execution_timeout:
+        # DurableConfig.ExecutionTimeout caps the whole execution (the AWS
+        # field is seconds, 1..31622400). Stored as an absolute epoch deadline
+        # so it survives restarts; enforced by the resume scheduler. No
+        # default is invented — an unset field leaves the execution uncapped,
+        # exactly as broadly as before.
+        rec["_TimeoutDeadline"] = rec["StartTimestamp"] + int(execution_timeout)
     _executions[arn] = rec
     _emit_history_event(rec, "ExecutionStarted", "ExecutionStartedDetails", {
         "Input": {"Payload": input_payload or "", "Truncated": False},
     })
+    if execution_timeout:
+        schedule_resume(arn)
     return rec
 
 
@@ -408,6 +418,10 @@ def mark_execution_completed(arn: str, result_payload: str | None,
                              error: dict | None) -> None:
     rec = _executions.get(arn)
     if not rec:
+        return
+    if rec.get("Status") != "RUNNING":
+        # Stopped or timed out while the invocation was in flight: the late
+        # result must not overwrite the terminal state or append to history.
         return
     rec["EndTimestamp"] = _now()
     if error:
@@ -422,6 +436,55 @@ def mark_execution_completed(arn: str, result_payload: str | None,
         _emit_history_event(rec, "ExecutionSucceeded", "ExecutionSucceededDetails", {
             "Result": {"Payload": result_payload or "", "Truncated": False},
         })
+
+
+def record_invocation_completed(arn: str, start_ts: float, request_id: str,
+                                error: dict | None = None) -> None:
+    """One InvocationCompleted history event per handler invocation (initial
+    and every replay), the shape the model defines: StartTimestamp,
+    EndTimestamp, RequestId, and Error when the invocation itself failed."""
+    rec = _executions.get(arn)
+    if not rec:
+        return
+    details = {
+        "StartTimestamp": start_ts,
+        "EndTimestamp": _now(),
+        "RequestId": request_id,
+    }
+    if error:
+        details["Error"] = {"Payload": error, "Truncated": False}
+    _emit_history_event(rec, "InvocationCompleted", "InvocationCompletedDetails",
+                        details)
+
+
+def _time_out_execution(rec: dict) -> None:
+    """Enforce DurableConfig.ExecutionTimeout: the execution lands TIMED_OUT
+    with an ExecutionTimedOut event, and every in-flight chained invoke is
+    marked TIMED_OUT with its own ChainedInvokeTimedOut event."""
+    if rec.get("Status") != "RUNNING":
+        return
+    err = {
+        "ErrorType": "DurableExecutionTimedOut",
+        "ErrorMessage": "The durable execution exceeded its configured "
+                        "ExecutionTimeout.",
+        "ErrorData": "",
+        "StackTrace": [],
+    }
+    for op in rec.get("Operations", []):
+        if op.get("Type") == "CHAINED_INVOKE" and op.get("Status") == "STARTED":
+            op["Status"] = "TIMED_OUT"
+            op["EndTimestamp"] = _now()
+            op.setdefault("ChainedInvokeDetails", {})["Error"] = err
+            _emit_history_event(rec, "ChainedInvokeTimedOut",
+                                "ChainedInvokeTimedOutDetails",
+                                {"Error": {"Payload": err, "Truncated": False}},
+                                event_id=op.get("Id"))
+    rec["Status"] = "TIMED_OUT"
+    rec["EndTimestamp"] = _now()
+    rec["Error"] = err
+    _emit_history_event(rec, "ExecutionTimedOut", "ExecutionTimedOutDetails", {
+        "Error": {"Payload": err, "Truncated": False},
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +555,10 @@ def _append_chained_result(parent_rec: dict, op_id: str, success: bool,
                            result: str | None, err: dict | None) -> None:
     """Apply the child invocation's outcome onto the parent ChainedInvoke
     operation in the operation log + emit a history event."""
+    if parent_rec.get("Status") != "RUNNING":
+        # The execution was stopped or timed out while the child ran; its op
+        # already carries the terminal status and event.
+        return
     for op in parent_rec["Operations"]:
         if op.get("Id") == op_id and op.get("Type") == "CHAINED_INVOKE":
             op["Status"] = "SUCCEEDED" if success else "FAILED"
@@ -672,11 +739,11 @@ def _apply_update(rec: dict, upd: dict) -> None:
             details["Result"] = payload
         if err is not None:
             details["Error"] = err
-        # On START, kick off the child function invocation asynchronously so
-        # downstream durable workflows actually run (item #3 in the parity gap).
+        # The child fires below, after the history mirror, so the
+        # ChainedInvokeStarted event is on the log before a fast child can
+        # append its ChainedInvokeSucceeded (history order matters to
+        # replaying SDKs).
         ci_opts = upd.get("ChainedInvokeOptions") or {}
-        if action == "START" and ci_opts.get("FunctionName"):
-            _fire_chained_invoke(rec, op_id, ci_opts, payload)
     elif op_type == "EXECUTION":
         details = existing.setdefault("ExecutionDetails", {})
         if rec.get("InputPayload"):
@@ -701,6 +768,14 @@ def _apply_update(rec: dict, upd: dict) -> None:
                                   {"Result": {"Payload": payload or "", "Truncated": False}}),
         ("CALLBACK", "FAIL"): ("CallbackFailed", "CallbackFailedDetails",
                                {"Error": {"Payload": err or {}, "Truncated": False}}),
+        # ChainedInvokeStarted is a real history EventType on the model;
+        # without it a client polling GetDurableExecutionHistory cannot see
+        # an in-flight child at all.
+        ("CHAINED_INVOKE", "START"): (
+            "ChainedInvokeStarted", "ChainedInvokeStartedDetails",
+            {"FunctionName": upd.get("ChainedInvokeOptions", {}).get("FunctionName", ""),
+             "Input": {"Payload": payload or "", "Truncated": False},
+             "DurableExecutionArn": rec.get("DurableExecutionArn", "")}),
         ("CONTEXT", "START"): ("ContextStarted", "ContextStartedDetails", {}),
         ("CONTEXT", "SUCCEED"): ("ContextSucceeded", "ContextSucceededDetails",
                                  {"Result": {"Payload": payload or "", "Truncated": False}}),
@@ -713,6 +788,11 @@ def _apply_update(rec: dict, upd: dict) -> None:
         _emit_history_event(rec, ev_type, details_key, details,
                             name=name, parent_id=parent_id, sub_type=sub_type,
                             event_id=op_id)
+
+    # Kick off the chained child only after its Started event is on the log.
+    if op_type == "CHAINED_INVOKE" and action == "START" and (
+            upd.get("ChainedInvokeOptions") or {}).get("FunctionName"):
+        _fire_chained_invoke(rec, op_id, upd.get("ChainedInvokeOptions") or {}, payload)
 
 
 def handle_get_state(arn_path: str, query_params: dict) -> tuple:
@@ -905,6 +985,20 @@ def handle_stop(arn_path: str, body: bytes) -> tuple:
         "ErrorData": data.get("ErrorData") or "",
         "StackTrace": data.get("StackTrace") or [],
     }
+    # A stop reaches the in-flight chained invokes too: each STARTED
+    # CHAINED_INVOKE op lands STOPPED with its own history event
+    # (ChainedInvokeStopped is a real EventType on the model), and the late
+    # child result is discarded by the RUNNING guard in
+    # _append_chained_result instead of appending onto a stopped execution.
+    for op in rec.get("Operations", []):
+        if op.get("Type") == "CHAINED_INVOKE" and op.get("Status") == "STARTED":
+            op["Status"] = "STOPPED"
+            op["EndTimestamp"] = _now()
+            op.setdefault("ChainedInvokeDetails", {})["Error"] = rec["Error"]
+            _emit_history_event(rec, "ChainedInvokeStopped",
+                                "ChainedInvokeStoppedDetails",
+                                {"Error": {"Payload": rec["Error"], "Truncated": False}},
+                                event_id=op.get("Id"))
     _emit_history_event(rec, "ExecutionStopped", "ExecutionStoppedDetails", {
         "Error": {"Payload": rec["Error"], "Truncated": False},
     })
@@ -1169,6 +1263,12 @@ def schedule_resume(arn: str, account_id: str | None = None,
     if not rec or rec.get("Status") != "RUNNING":
         return False
     expiry = _next_expiry(rec)
+    deadline = rec.get("_TimeoutDeadline")
+    if deadline is not None:
+        # The execution-timeout deadline is a wake-up like any other: the
+        # earliest pending timer wins, and an execution with no waits at all
+        # still gets its timeout enforced.
+        expiry = deadline if expiry is None else min(expiry, deadline)
     # When called from a Send*Callback handler we want to wake the execution
     # immediately so the SDK observes the resolution on its next replay.
     has_resolved_callback = any(
@@ -1252,6 +1352,13 @@ def _resume_execution(arn: str, account_id: str = "000000000000",
     if not rec or rec.get("Status") != "RUNNING":
         return
     now = _now()
+    deadline = rec.get("_TimeoutDeadline")
+    if deadline is not None and now >= deadline:
+        # DurableConfig.ExecutionTimeout elapsed: the execution lands
+        # TIMED_OUT instead of being re-invoked, and every in-flight chained
+        # invoke is timed out with it.
+        _time_out_execution(rec)
+        return
     anything_elapsed = False
     has_resolved_callback = any(
         op.get("Type") == "CALLBACK" and op.get("Status") in ("SUCCEEDED", "FAILED")
