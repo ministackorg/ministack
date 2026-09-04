@@ -8205,6 +8205,7 @@ def test_lambda_durable_chained_invoke_runs_child(lam):
         "Role": _LAMBDA_ROLE,
         "Handler": "index.handler",
         "Code": {"ZipFile": _b64.b64encode(_make_zip(child_code)).decode()},
+        "Timeout": 30,
     })
     parent_code = "def handler(e,c): return {}"
     _raw_durable("POST", "/2015-03-31/functions", body={
@@ -8214,6 +8215,7 @@ def test_lambda_durable_chained_invoke_runs_child(lam):
         "Handler": "index.handler",
         "Code": {"ZipFile": _b64.b64encode(_make_zip(parent_code)).decode()},
         "DurableConfig": {"Enabled": True},
+        "Timeout": 30,
     })
     try:
         # Invoke parent to spin up its durable execution.
@@ -8252,13 +8254,14 @@ def test_lambda_durable_chained_invoke_runs_child(lam):
         # quiet so the short poll is honest. Breaking on Failed keeps a real
         # child error visible instead of reading as a timeout.
         import time as _time
-        for _ in range(30):
-            _time.sleep(0.1)
+        deadline = _time.time() + 20
+        while _time.time() < deadline:
             code, history = _raw_durable("GET",
                 f"/2025-12-01/durable-executions/{arn_enc}/history")
             if any(e["EventType"] in ("ChainedInvokeSucceeded", "ChainedInvokeFailed")
                    for e in history.get("Events", [])):
                 break
+            _time.sleep(0.2)
         events = history["Events"]
         assert any(e["EventType"] == "ChainedInvokeSucceeded" for e in events), \
             f"expected ChainedInvokeSucceeded, got {[e['EventType'] for e in events]}"
@@ -8517,6 +8520,10 @@ def handler(event, context):
         "Handler": "index.handler",
         "Code": {"ZipFile": _b64.b64encode(_make_zip(code)).decode()},
         "DurableConfig": {"Enabled": True},
+        # Lambda's default 3s timeout reads a loaded CI runner's slow
+        # subprocess cold start as a function timeout (no SDK fields in the
+        # error body); the budget, not the wrapping, is what varies here.
+        "Timeout": 30,
     })
     try:
         resp = lam.invoke(FunctionName=fname, Payload=b'{"user":"data"}')
