@@ -920,7 +920,9 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
             "StateReason": _alarms[name]["StateReason"]
             if name in _alarms
             else "Unchecked: Initial alarm creation",
-            "StateUpdatedTimestamp": int(time.time()),
+            "StateUpdatedTimestamp": _alarms[name].get("StateUpdatedTimestamp", int(time.time()))
+            if name in _alarms
+            else int(time.time()),
             "ActionsEnabled": cbor_data.get("ActionsEnabled", True),
             "AlarmActions": cbor_data.get("AlarmActions", []),
             "OKActions": cbor_data.get("OKActions", []),
@@ -975,7 +977,9 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
             "StateReason": _alarms[name]["StateReason"]
             if name in _alarms
             else "Unchecked: Initial alarm creation",
-            "StateUpdatedTimestamp": int(time.time()),
+            "StateUpdatedTimestamp": _alarms[name].get("StateUpdatedTimestamp", int(time.time()))
+            if name in _alarms
+            else int(time.time()),
             "ActionsEnabled": _p(params, "ActionsEnabled") != "false",
             "AlarmActions": alarm_actions,
             "OKActions": ok_actions,
