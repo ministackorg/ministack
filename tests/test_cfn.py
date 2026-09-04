@@ -14362,3 +14362,61 @@ def test_cfn_delete_change_set_missing_is_idempotent(cfn):
     with pytest.raises(ClientError) as exc:
         cfn.delete_change_set(StackName=name, ChangeSetName="cdk-deploy-change-set")
     assert exc.value.response["Error"]["Code"] == "ValidationError"
+
+
+def test_cfn_update_rollback_reports_the_previous_template_parameters_and_tags(cfn, sqs):
+    """After UPDATE_ROLLBACK_COMPLETE the stack describes what it ran before
+    the failed update: GetTemplate returns the previous template body,
+    DescribeStacks the previous parameter values and tags. The update fails on
+    the custom-named table whose key type change requires replacement."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rb-report-{uid}"
+    queue_name = f"cfn-rb-report-{uid}"
+    table_name = f"cfn-rb-report-{uid}"
+
+    def template(key_type, description):
+        return json.dumps({
+            "Description": description,
+            "Parameters": {"Visibility": {"Type": "Number", "Default": 30}},
+            "Resources": {
+                "Queue": {"Type": "AWS::SQS::Queue", "Properties": {
+                    "QueueName": queue_name,
+                    "VisibilityTimeout": {"Ref": "Visibility"}}},
+                "Table": {"Type": "AWS::DynamoDB::Table", "DependsOn": "Queue", "Properties": {
+                    "TableName": table_name,
+                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": key_type}],
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "BillingMode": "PAY_PER_REQUEST",
+                }},
+            },
+        })
+
+    def normalized(body):
+        return json.loads(body) if isinstance(body, str) else body
+
+    original = template("S", "before")
+    cfn.create_stack(
+        StackName=stack_name, TemplateBody=original,
+        Parameters=[{"ParameterKey": "Visibility", "ParameterValue": "30"}],
+        Tags=[{"Key": "stage", "Value": "before"}],
+    )
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(
+            StackName=stack_name, TemplateBody=template("N", "after"),
+            Parameters=[{"ParameterKey": "Visibility", "ParameterValue": "45"}],
+            Tags=[{"Key": "stage", "Value": "after"}],
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+
+        assert normalized(cfn.get_template(StackName=stack_name)["TemplateBody"]) == json.loads(original)
+        assert stack["Parameters"] == [
+            {"ParameterKey": "Visibility", "ParameterValue": "30"}]
+        assert stack["Tags"] == [{"Key": "stage", "Value": "before"}]
+        assert stack.get("Description") in (None, "before")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+

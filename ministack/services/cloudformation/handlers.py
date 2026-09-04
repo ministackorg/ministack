@@ -555,6 +555,8 @@ def _update_stack(params):
         "_template": copy.deepcopy(stack.get("_template", {})),
         "_template_body": stack.get("_template_body", ""),
         "_resolved_params": copy.deepcopy(stack.get("_resolved_params", {})),
+        "Parameters": copy.deepcopy(stack.get("Parameters", [])),
+        "Tags": copy.deepcopy(stack.get("Tags", [])),
         "Outputs": copy.deepcopy(stack.get("Outputs", [])),
     }
 
