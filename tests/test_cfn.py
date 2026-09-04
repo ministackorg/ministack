@@ -14506,3 +14506,61 @@ def test_cfn_apigateway_deployment_update_in_place_and_replacement(cfn, apigw_v1
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
 
+
+def test_cfn_kms_alias_target_change_in_place_and_rename_replaces(cfn, kms_client):
+    """A TargetKeyId change re-points the alias under its name (Ref keeps its
+    value), an AliasName change replaces the alias — the new name exists, the
+    old one is gone — and an alias name without the alias/ prefix fails the
+    stack as the resource reference requires."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-kms-alias-{uid}"
+
+    def template(alias_name, key):
+        return json.dumps({
+            "Resources": {
+                "KeyA": {"Type": "AWS::KMS::Key", "Properties": {"Description": f"a-{uid}"}},
+                "KeyB": {"Type": "AWS::KMS::Key", "Properties": {"Description": f"b-{uid}"}},
+                "Alias": {"Type": "AWS::KMS::Alias", "Properties": {
+                    "AliasName": alias_name, "TargetKeyId": {"Ref": key}}},
+            },
+            "Outputs": {"Alias": {"Value": {"Ref": "Alias"}},
+                        "KeyA": {"Value": {"Ref": "KeyA"}}, "KeyB": {"Value": {"Ref": "KeyB"}}},
+        })
+
+    def alias_targets():
+        return {a["AliasName"]: a.get("TargetKeyId")
+                for a in kms_client.list_aliases()["Aliases"]}
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(f"alias/cfn-a-{uid}", "KeyA"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        key_a, key_b = _output(stack, "KeyA"), _output(stack, "KeyB")
+        assert _output(stack, "Alias") == f"alias/cfn-a-{uid}"
+        assert alias_targets()[f"alias/cfn-a-{uid}"] == key_a
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(f"alias/cfn-a-{uid}", "KeyB"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Alias") == f"alias/cfn-a-{uid}"
+        assert alias_targets()[f"alias/cfn-a-{uid}"] == key_b
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(f"alias/cfn-b-{uid}", "KeyB"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Alias") == f"alias/cfn-b-{uid}"
+        targets = alias_targets()
+        assert targets[f"alias/cfn-b-{uid}"] == key_b
+        assert f"alias/cfn-a-{uid}" not in targets
+
+        for bad_name in (f"cfn-c-{uid}", f"alias/aws/cfn-c-{uid}", f"alias/cfn c {uid}"):
+            cfn.update_stack(StackName=stack_name, TemplateBody=template(bad_name, "KeyB"))
+            stack = _wait_stack(cfn, stack_name)
+            assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+            assert "must begin with alias/" in _stack_event_reasons(cfn, stack_name)
+            assert alias_targets()[f"alias/cfn-b-{uid}"] == key_b
+            assert bad_name not in alias_targets()
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    assert f"alias/cfn-b-{uid}" not in alias_targets()
+

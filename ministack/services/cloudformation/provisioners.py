@@ -5334,13 +5334,55 @@ def _kms_key_delete(physical_id, props):
         })
 
 
-def _kms_alias_create(logical_id, props, stack_name):
-    alias_name = props.get("AliasName", f"alias/{stack_name}-{logical_id}")
-    target_key = props.get("TargetKeyId", "")
+_KMS_ALIAS_NAME = re.compile(r"^alias/[a-zA-Z0-9:/_-]{1,250}$")
+
+
+def _kms_alias_target(target_key):
     rec = _kms._resolve_key(target_key)
-    alias_arn = _kms._alias_arn(alias_name)
-    _kms._aliases[alias_arn] = rec["KeyId"] if rec else target_key
+    return rec["KeyId"] if rec else target_key
+
+
+def _kms_alias_name(props, stack_name, logical_id):
+    return props.get("AliasName") or f"alias/{stack_name}-{logical_id}"
+
+
+def _kms_alias_create(logical_id, props, stack_name):
+    alias_name = _kms_alias_name(props, stack_name, logical_id)
+    if not _KMS_ALIAS_NAME.match(alias_name) or alias_name.startswith("alias/aws/"):
+        # The constraints the resource reference states: the alias/ prefix,
+        # alphanumerics plus :/_- up to 256 characters, and alias/aws/
+        # reserved for AWS managed keys.
+        raise ValueError(
+            f"AWS::KMS::Alias AliasName {alias_name!r} must begin with alias/, "
+            "contain only alphanumerics, :, /, _ and -, and must not begin "
+            "with the reserved alias/aws/ prefix")
+    target_key = props.get("TargetKeyId", "")
+    if not target_key:
+        raise ValueError("AWS::KMS::Alias requires TargetKeyId")
+    _kms._aliases[_kms._alias_arn(alias_name)] = _kms_alias_target(target_key)
     return alias_name, {}
+
+
+def _kms_alias_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update an alias in place: TargetKeyId is No interruption on the
+    resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-kms-alias.html),
+    so a changed target re-points the alias under its name (what Ref
+    returns), as UpdateAlias does. AliasName requires replacement: the new
+    alias is created before the old one is removed."""
+    current = physical_id if _kms._alias_arn(physical_id) in _kms._aliases else None
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        _kms_alias_name(new_props, stack_name, logical_id or physical_id), current,
+        _kms_alias_create, _kms_alias_delete,
+    )
+    if replaced is not None:
+        return replaced
+    target_key = new_props.get("TargetKeyId", "")
+    if not target_key:
+        raise ValueError("AWS::KMS::Alias requires TargetKeyId")
+    _kms._aliases[_kms._alias_arn(physical_id)] = _kms_alias_target(target_key)
+    return physical_id, {}
 
 
 def _kms_alias_delete(physical_id, props):
@@ -8440,7 +8482,12 @@ _RESOURCE_HANDLERS = {
         "update": _kms_key_update,
         "delete": _kms_key_delete,
     },
-    "AWS::KMS::Alias": {"create": _kms_alias_create, "delete": _kms_alias_delete},
+    "AWS::KMS::Alias": {
+        "create": _kms_alias_create,
+        "update": _kms_alias_update,
+        "update_with_logical_id": True,
+        "delete": _kms_alias_delete,
+    },
     "AWS::EC2::VPC": {"create": _ec2_vpc_create, "delete": _ec2_vpc_delete},
     "AWS::EC2::VPCEndpoint": {
         "create": _ec2_vpc_endpoint_create,
