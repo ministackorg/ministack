@@ -22,6 +22,7 @@ from .engine import (
     _evaluate_conditions,
     _parse_template,
     _resolve_parameters,
+    _resolve_refs,
     validate_template_support,
 )
 from .helpers import _error, _esc, _extract_members, _extract_stack_status_filters, _p, _resolve_template, _xml
@@ -435,6 +436,42 @@ def _get_template(params):
 
 # --- DeleteStack ---
 
+def _imported_export_names(stack, stack_name):
+    """The export names a stack imports: every ``Fn::ImportValue`` in its
+    Resources, Outputs and Conditions, with the argument resolved against
+    the stack's own parameters, mappings and resources (``Fn::Sub`` and
+    ``Ref`` inside the argument are common). Only such an import blocks the
+    deletion of the exporting stack on AWS; a template that merely mentions
+    the export name in a string, or in ``Metadata``, does not."""
+    template = stack.get("_template", {})
+    names = set()
+
+    def walk(node):
+        if isinstance(node, dict):
+            if len(node) == 1 and "Fn::ImportValue" in node:
+                arg = node["Fn::ImportValue"]
+                try:
+                    resolved = _resolve_refs(
+                        arg, stack.get("_resources", {}),
+                        stack.get("_resolved_params", {}),
+                        stack.get("_conditions", {}),
+                        template.get("Mappings", {}),
+                        stack_name, stack.get("StackId", ""))
+                except Exception:
+                    resolved = arg
+                names.add(str(resolved))
+                return
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    for section in ("Resources", "Outputs", "Conditions"):
+        walk(template.get(section, {}))
+    return names
+
+
 def _delete_stack(params):
     from ministack.services.cloudformation import _stacks
     stack_name = _p(params, "StackName")
@@ -467,8 +504,7 @@ def _delete_stack(params):
                 continue
             other_status = other_stack.get("StackStatus", "")
             if other_status.endswith("_COMPLETE") and "DELETE" not in other_status:
-                other_template = other_stack.get("_template", {})
-                if export_name in json.dumps(other_template):
+                if export_name in _imported_export_names(other_stack, other_name):
                     return _error("ValidationError",
                                   f"Export {export_name} is imported by stack {other_name}")
 

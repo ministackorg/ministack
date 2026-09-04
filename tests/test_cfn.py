@@ -14362,3 +14362,52 @@ def test_cfn_delete_change_set_missing_is_idempotent(cfn):
     with pytest.raises(ClientError) as exc:
         cfn.delete_change_set(StackName=name, ChangeSetName="cdk-deploy-change-set")
     assert exc.value.response["Error"]["Code"] == "ValidationError"
+
+
+def test_cfn_export_in_use_is_an_import_not_a_mention(cfn, ssm):
+    """Deleting an exporting stack is refused only while another stack imports
+    the export through Fn::ImportValue, its argument resolved with that stack's
+    parameters. A stack whose template merely carries the export name in a
+    string value, or an Fn::ImportValue under Metadata, does not block the
+    delete."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    export_name = f"cfn-export-use-{uid}"
+    producer = f"cfn-export-producer-{uid}"
+    mention = f"cfn-export-mention-{uid}"
+    importer = f"cfn-export-importer-{uid}"
+    cfn.create_stack(StackName=producer, TemplateBody=json.dumps({
+        "Resources": {},
+        "Outputs": {"Shared": {"Value": "shared", "Export": {"Name": export_name}}},
+    }))
+    try:
+        assert _wait_stack(cfn, producer)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.create_stack(StackName=mention, TemplateBody=json.dumps({
+            "Metadata": {"Note": {"Fn::ImportValue": export_name}},
+            "Resources": {"P": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": f"/cfn/export-use/{uid}/mention", "Type": "String",
+                "Value": f"the export is called {export_name}"}}},
+        }))
+        assert _wait_stack(cfn, mention)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.create_stack(StackName=importer, TemplateBody=json.dumps({
+            "Parameters": {"Prefix": {"Type": "String"}},
+            "Resources": {"P": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": f"/cfn/export-use/{uid}/import", "Type": "String",
+                "Value": {"Fn::ImportValue": {"Fn::Sub": "${Prefix}-" + uid}}}}},
+        }), Parameters=[{"ParameterKey": "Prefix", "ParameterValue": "cfn-export-use"}])
+        stack = _wait_stack(cfn, importer)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert ssm.get_parameter(Name=f"/cfn/export-use/{uid}/import")["Parameter"]["Value"] == "shared"
+
+        with pytest.raises(ClientError) as exc:
+            cfn.delete_stack(StackName=producer)
+        assert exc.value.response["Error"]["Code"] == "ValidationError"
+        assert f"Export {export_name} is imported by stack {importer}" in exc.value.response["Error"]["Message"]
+
+        cfn.delete_stack(StackName=importer)
+        _wait_stack(cfn, importer)
+        cfn.delete_stack(StackName=producer)
+        assert _wait_stack(cfn, producer)["StackStatus"] == "DELETE_COMPLETE"
+    finally:
+        for name in (importer, mention, producer):
+            _delete_cfn_test_stack(cfn, name)
+
