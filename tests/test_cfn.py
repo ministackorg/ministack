@@ -1169,7 +1169,7 @@ def test_cfn_unnamed_dynamodb_table_survives_unrelated_update(cfn, ddb, ssm):
     resource referencing the table via Ref (real CloudFormation propagates
     that Ref's resolved value on every update) picked up that new, wrong
     identity the moment it was reprocessed."""
-    def template(param_value_source):
+    def template(param_value_source, description="unrelated change forces this resource to be reprocessed"):
         return json.dumps({
             "AWSTemplateFormatVersion": "2010-09-09",
             "Resources": {
@@ -1187,7 +1187,7 @@ def test_cfn_unnamed_dynamodb_table_survives_unrelated_update(cfn, ddb, ssm):
                         "Name": "/cfn-t02f/table-name",
                         "Type": "String",
                         "Value": param_value_source,
-                        "Description": "unrelated change forces this resource to be reprocessed",
+                        "Description": description,
                     },
                 },
             },
@@ -1200,8 +1200,10 @@ def test_cfn_unnamed_dynamodb_table_survives_unrelated_update(cfn, ddb, ssm):
     assert table_name_before in tables_before
 
     # Table itself is untouched; only Param's Description changes (forcing
-    # Param, not Table, to actually be reprocessed this update).
-    cfn.update_stack(StackName="cfn-t02f", TemplateBody=template({"Ref": "Table"}))
+    # Param, not Table, to actually be reprocessed this update). An identical
+    # template would be refused with "No updates are to be performed."
+    cfn.update_stack(StackName="cfn-t02f", TemplateBody=template(
+        {"Ref": "Table"}, description="the unrelated change, second edition"))
     stack = _wait_stack(cfn, "cfn-t02f")
     assert stack["StackStatus"] == "UPDATE_COMPLETE"
 
@@ -14362,3 +14364,60 @@ def test_cfn_delete_change_set_missing_is_idempotent(cfn):
     with pytest.raises(ClientError) as exc:
         cfn.delete_change_set(StackName=name, ChangeSetName="cdk-deploy-change-set")
     assert exc.value.response["Error"]["Code"] == "ValidationError"
+
+
+def test_cfn_update_stack_without_changes_is_refused(cfn, sqs):
+    """UpdateStack with the template and parameters the stack already runs is
+    refused with CloudFormation's ``No updates are to be performed.``, for an
+    identical TemplateBody and for UsePreviousTemplate alike; a changed
+    parameter value or a changed tag set is an update."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-no-updates-{uid}"
+    template = json.dumps({
+        "Parameters": {"Visibility": {"Type": "Number", "Default": 30}},
+        "Resources": {"Queue": {"Type": "AWS::SQS::Queue", "Properties": {
+            "QueueName": f"cfn-no-updates-{uid}",
+            "VisibilityTimeout": {"Ref": "Visibility"}}}},
+    })
+    cfn.create_stack(StackName=stack_name, TemplateBody=template,
+                     Tags=[{"Key": "stage", "Value": "one"}])
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        for kwargs in (
+            {"TemplateBody": template},
+            {"UsePreviousTemplate": True},
+            {"TemplateBody": template, "Parameters": [
+                {"ParameterKey": "Visibility", "ParameterValue": "30"}]},
+            {"UsePreviousTemplate": True, "Tags": [{"Key": "stage", "Value": "one"}]},
+        ):
+            with pytest.raises(ClientError) as exc:
+                cfn.update_stack(StackName=stack_name, **kwargs)
+            assert exc.value.response["Error"]["Code"] == "ValidationError"
+            assert exc.value.response["Error"]["Message"] == "No updates are to be performed."
+        events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+        assert not [e for e in events if e["ResourceStatus"].startswith("UPDATE")]
+
+        cfn.update_stack(StackName=stack_name, UsePreviousTemplate=True,
+                         Parameters=[{"ParameterKey": "Visibility", "ParameterValue": "45"}])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        queue_url = sqs.get_queue_url(QueueName=f"cfn-no-updates-{uid}")["QueueUrl"]
+        assert sqs.get_queue_attributes(
+            QueueUrl=queue_url, AttributeNames=["VisibilityTimeout"]
+        )["Attributes"]["VisibilityTimeout"] == "45"
+
+        # A parameter left out of an update reverts to its template default,
+        # so a tags-only update keeps the value with UsePreviousValue.
+        cfn.update_stack(StackName=stack_name, UsePreviousTemplate=True,
+                         Parameters=[{"ParameterKey": "Visibility", "UsePreviousValue": True}],
+                         Tags=[{"Key": "stage", "Value": "two"}])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert stack["Tags"] == [{"Key": "stage", "Value": "two"}]
+        assert stack["Parameters"] == [
+            {"ParameterKey": "Visibility", "ParameterValue": "45"}]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+

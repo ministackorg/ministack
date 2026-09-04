@@ -492,6 +492,24 @@ def _delete_stack(params):
 
 # --- UpdateStack ---
 
+def _stack_has_no_updates(stack, template, param_values, tags):
+    """True when an UpdateStack would change nothing: the template equals the
+    one the stack runs, every parameter resolves to its current value, and the
+    request either carries no tags or the tags the stack already has. Real
+    CloudFormation refuses such a request with ``No updates are to be
+    performed.`` instead of running an empty update (a template with a
+    dynamic reference is the documented exception, and the emulator refuses
+    dynamic references up front)."""
+    if template != stack.get("_template", {}):
+        return False
+    current = {k: v.get("Value") for k, v in stack.get("_resolved_params", {}).items()}
+    if {k: v.get("Value") for k, v in param_values.items()} != current:
+        return False
+    if tags and tags != stack.get("Tags", []):
+        return False
+    return True
+
+
 def _update_stack(params):
     from ministack.services.cloudformation import _stacks
     stack_name = _p(params, "StackName")
@@ -548,6 +566,9 @@ def _update_stack(params):
             template, _evaluate_conditions(template, param_values))
     except ValueError as exc:
         return _error("ValidationError", str(exc))
+
+    if _stack_has_no_updates(stack, template, param_values, tags):
+        return _error("ValidationError", "No updates are to be performed.")
 
     # Save previous state for rollback
     previous_stack = {
