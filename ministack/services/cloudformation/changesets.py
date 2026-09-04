@@ -388,14 +388,28 @@ def _execute_change_set(params):
 
 def _delete_change_set(params):
     from ministack.services.cloudformation import _change_sets
+    from ministack.services.cloudformation.handlers import _resolve_stack
     cs_name = _p(params, "ChangeSetName")
     stack_name = _p(params, "StackName")
-    cs_id, cs = _find_change_set(cs_name, stack_name)
-    if not cs_id:
-        return _error("ChangeSetNotFound",
-                      f"ChangeSet [{cs_name}] does not exist", 404)
-    _change_sets.pop(cs_id, None)
-    return _xml(200, "DeleteChangeSetResponse", "")
+    # StackName is "the name or the unique stack ID", and the CDK addresses a
+    # stack it has already read by ARN, so resolve it first and look the change
+    # set up under the stack's name. A stack that does not exist is a
+    # ValidationError, as on AWS -- and a deleted stack counts as one, since it
+    # is addressable only by stack id.
+    stack = _resolve_stack(stack_name) if stack_name else None
+    if stack_name and (not stack or stack.get("StackStatus") == "DELETE_COMPLETE"):
+        return _error("ValidationError",
+                      f"Stack [{stack_name}] does not exist")
+    cs_id, _cs = _find_change_set(cs_name, stack["StackName"] if stack else stack_name)
+    # Real CloudFormation answers a delete of a change set that does not exist
+    # (on a stack that does) with a plain success, and the CDK relies on that:
+    # before every deploy of an existing stack it removes a possible leftover
+    # `cdk-deploy-change-set` and only tolerates a `ChangeSetNotFoundException`
+    # -- so the 404 answered here aborted every `cdk deploy` of an already
+    # deployed stack.
+    if cs_id:
+        _change_sets.pop(cs_id, None)
+    return _xml(200, "DeleteChangeSetResponse", "<DeleteChangeSetResult/>")
 
 
 # --- ListChangeSets ---
