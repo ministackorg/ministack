@@ -192,6 +192,87 @@ def test_cloudwatch_set_alarm_state_v2(cw):
     assert after["StateValue"] == "ALARM"
     assert after["StateReason"] == "Manual trigger for testing"
 
+def test_cloudwatch_put_metric_alarm_keeps_state_of_existing_alarm(cw):
+    """PutMetricAlarm on an existing alarm: "its state is left unchanged, but
+    the update completely overwrites the previous configuration of the alarm"
+    (https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_PutMetricAlarm.html).
+    The state timestamp is part of the state: only the configuration timestamp
+    moves. Goes over the wire, which botocore sends as smithy-rpc-v2-cbor."""
+    name = f"cw-keep-state-{_uuid_mod.uuid4().hex[:8]}"
+
+    def put(threshold):
+        cw.put_metric_alarm(
+            AlarmName=name,
+            MetricName="Errors",
+            Namespace=f"CwKeepState/{name}",
+            Statistic="Sum",
+            Period=60,
+            EvaluationPeriods=1,
+            Threshold=threshold,
+            ComparisonOperator="GreaterThanThreshold",
+        )
+
+    put(1.0)
+    try:
+        cw.set_alarm_state(AlarmName=name, StateValue="ALARM", StateReason="seeded")
+        seeded = cw.describe_alarms(AlarmNames=[name])["MetricAlarms"][0]
+        time.sleep(1.1)  # timestamps are whole seconds; a reset must be visible
+
+        put(2.0)
+        after = cw.describe_alarms(AlarmNames=[name])["MetricAlarms"][0]
+        assert after["Threshold"] == 2.0
+        assert after["StateValue"] == "ALARM"
+        assert after["StateReason"] == "seeded"
+        assert after["StateUpdatedTimestamp"] == seeded["StateUpdatedTimestamp"]
+        assert after["AlarmConfigurationUpdatedTimestamp"] > seeded["AlarmConfigurationUpdatedTimestamp"]
+    finally:
+        cw.delete_alarms(AlarmNames=[name])
+
+
+def test_cloudwatch_put_metric_alarm_query_keeps_state_of_existing_alarm():
+    """The query-protocol branch of PutMetricAlarm (what the AWS CLI v1 and
+    older SDKs send) keeps the state of an existing alarm the same way:
+    "its state is left unchanged" per the PutMetricAlarm reference."""
+    from ministack.core import responses as _resp
+    from ministack.services import cloudwatch as _cw
+
+    acct_tok = _resp._request_account_id.set("000000000000")
+    region_tok = _resp._request_region.set("us-east-1")
+    name = f"query-keep-state-{_uuid_mod.uuid4().hex[:8]}"
+
+    def put(threshold):
+        status, _headers, _body = _cw._put_metric_alarm({
+            "AlarmName": [name],
+            "MetricName": ["Errors"],
+            "Namespace": [f"QueryKeepState/{name}"],
+            "Statistic": ["Sum"],
+            "Period": ["60"],
+            "EvaluationPeriods": ["1"],
+            "Threshold": [threshold],
+            "ComparisonOperator": ["GreaterThanThreshold"],
+        }, {}, is_cbor=False)
+        assert status == 200
+
+    try:
+        put("1")
+        _cw._alarms[name]["StateValue"] = "ALARM"
+        _cw._alarms[name]["StateReason"] = "seeded"
+        _cw._alarms[name]["StateUpdatedTimestamp"] = 1_000_000
+        _cw._alarms[name]["AlarmConfigurationUpdatedTimestamp"] = 1_000_000
+
+        put("2")
+        alarm = _cw._alarms[name]
+        assert alarm["Threshold"] == 2.0
+        assert alarm["StateValue"] == "ALARM"
+        assert alarm["StateReason"] == "seeded"
+        assert alarm["StateUpdatedTimestamp"] == 1_000_000
+        assert alarm["AlarmConfigurationUpdatedTimestamp"] > 1_000_000
+    finally:
+        _cw._alarms.pop_scoped("000000000000", "us-east-1", name, None)
+        _resp._request_region.reset(region_tok)
+        _resp._request_account_id.reset(acct_tok)
+
+
 def test_cloudwatch_get_metric_data_v2(cw):
     cw.put_metric_data(
         Namespace="CWData2",
