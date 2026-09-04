@@ -14362,3 +14362,175 @@ def test_cfn_delete_change_set_missing_is_idempotent(cfn):
     with pytest.raises(ClientError) as exc:
         cfn.delete_change_set(StackName=name, ChangeSetName="cdk-deploy-change-set")
     assert exc.value.response["Error"]["Code"] == "ValidationError"
+
+
+def test_cfn_iot_thing_group_lifecycle(cfn, iot_client):
+    """AWS::IoT::ThingGroup provisions with its properties and parent, Ref is
+    the group id and Fn::GetAtt serves Arn and Id; a ThingGroupProperties
+    change updates the group in place under the same id, a dropped
+    description or attribute set is cleared, and deleting the stack removes
+    the group."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-thing-group-{uid}"
+    parent_name = f"cfn-tg-parent-{uid}"
+    group_name = f"cfn-tg-child-{uid}"
+
+    def template(description, attributes):
+        # ParentGroupName takes the parent's NAME; Ref would give its id.
+        properties = {"ThingGroupName": group_name, "ParentGroupName": parent_name}
+        if description is not None or attributes is not None:
+            properties["ThingGroupProperties"] = {}
+            if description is not None:
+                properties["ThingGroupProperties"]["ThingGroupDescription"] = description
+            if attributes is not None:
+                properties["ThingGroupProperties"]["AttributePayload"] = {"Attributes": attributes}
+        return json.dumps({
+            "Resources": {
+                "Parent": {"Type": "AWS::IoT::ThingGroup", "Properties": {
+                    "ThingGroupName": parent_name}},
+                "Group": {"Type": "AWS::IoT::ThingGroup", "DependsOn": "Parent",
+                          "Properties": properties},
+            },
+            "Outputs": {
+                "Id": {"Value": {"Ref": "Group"}},
+                "Arn": {"Value": {"Fn::GetAtt": ["Group", "Arn"]}},
+                "AttId": {"Value": {"Fn::GetAtt": ["Group", "Id"]}},
+                "ParentRef": {"Value": {"Ref": "Parent"}},
+            },
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("fleet", {"site": "a"}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        group = iot_client.describe_thing_group(thingGroupName=group_name)
+        assert _output(stack, "Id") == group["thingGroupId"] == _output(stack, "AttId")
+        assert _output(stack, "Arn") == group["thingGroupArn"]
+        assert group["thingGroupProperties"]["thingGroupDescription"] == "fleet"
+        assert group["thingGroupProperties"]["attributePayload"]["attributes"] == {"site": "a"}
+        assert group["thingGroupMetadata"]["parentGroupName"] == parent_name
+        parent = iot_client.describe_thing_group(thingGroupName=parent_name)
+        assert _output(stack, "ParentRef") == parent["thingGroupId"]
+        # The Ref is the id, not the name, as the resource reference documents.
+        assert _output(stack, "Id") != group_name
+        group_id = group["thingGroupId"]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("fleet-b", {"site": "b", "tier": "1"}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        group = iot_client.describe_thing_group(thingGroupName=group_name)
+        assert group["thingGroupId"] == group_id == _output(stack, "Id")
+        assert group["thingGroupProperties"]["thingGroupDescription"] == "fleet-b"
+        assert group["thingGroupProperties"]["attributePayload"]["attributes"] == {"site": "b", "tier": "1"}
+        assert group["version"] == 2
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(None, None))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        group = iot_client.describe_thing_group(thingGroupName=group_name)
+        assert group["thingGroupId"] == group_id
+        assert not group["thingGroupProperties"].get("thingGroupDescription")
+        assert group["thingGroupProperties"]["attributePayload"]["attributes"] == {}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    for name in (group_name, parent_name):
+        with pytest.raises(ClientError) as exc:
+            iot_client.describe_thing_group(thingGroupName=name)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_cfn_iot_thing_group_rename_replaces_and_parent_change_is_refused(cfn, iot_client):
+    """ThingGroupName and ParentGroupName require replacement: a renamed group
+    is created before the old one is removed and Ref follows the new id, while
+    a parent change under an unchanged custom name gets CloudFormation's own
+    refusal; a group without ThingGroupName gets a generated name and can be
+    re-parented, since the replacement runs under a fresh identity."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-thing-group-repl-{uid}"
+    parents = (f"cfn-tg-p1-{uid}", f"cfn-tg-p2-{uid}")
+
+    def template(name, parent):
+        return json.dumps({
+            "Resources": {
+                "P1": {"Type": "AWS::IoT::ThingGroup", "Properties": {"ThingGroupName": parents[0]}},
+                "P2": {"Type": "AWS::IoT::ThingGroup", "Properties": {"ThingGroupName": parents[1]}},
+                "Group": {"Type": "AWS::IoT::ThingGroup", "DependsOn": ["P1", "P2"], "Properties": {
+                    "ThingGroupName": name, "ParentGroupName": parent}},
+                "Unnamed": {"Type": "AWS::IoT::ThingGroup", "DependsOn": ["P1", "P2"], "Properties": {
+                    "ParentGroupName": parent}},
+            },
+            "Outputs": {"Id": {"Value": {"Ref": "Group"}},
+                        "UnnamedId": {"Value": {"Ref": "Unnamed"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(f"cfn-tg-a-{uid}", parents[0]))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        first_id = _output(stack, "Id")
+        unnamed_id = _output(stack, "UnnamedId")
+        unnamed_name = next(
+            g["groupName"] for g in iot_client.list_thing_groups()["thingGroups"]
+            if g["groupName"].startswith(f"{stack_name}-Unnamed-"))
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(f"cfn-tg-b-{uid}", parents[0]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        renamed = iot_client.describe_thing_group(thingGroupName=f"cfn-tg-b-{uid}")
+        assert _output(stack, "Id") == renamed["thingGroupId"] != first_id
+        with pytest.raises(ClientError):
+            iot_client.describe_thing_group(thingGroupName=f"cfn-tg-a-{uid}")
+        assert _output(stack, "UnnamedId") == unnamed_id
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(f"cfn-tg-b-{uid}", parents[1]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        reasons = _stack_event_reasons(cfn, stack_name)
+        assert "custom-named resource requires replacing" in reasons, reasons
+        assert iot_client.describe_thing_group(thingGroupName=f"cfn-tg-b-{uid}")[
+            "thingGroupMetadata"]["parentGroupName"] == parents[0]
+        # The generated-name group was re-parented before the failure and
+        # rolled back with the stack: it still reports the first parent.
+        unnamed = iot_client.describe_thing_group(thingGroupName=unnamed_name)
+        assert unnamed["thingGroupMetadata"]["parentGroupName"] in parents
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_iot_thing_group_missing_parent_fails_and_unmodelled_properties_are_accepted(cfn, iot_client):
+    """A parent that does not exist fails the stack with the service's own
+    ResourceNotFoundException; QueryString (dynamic groups) and Tags, which
+    the service does not model, are accepted without effect."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-thing-group-edge-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({
+        "Resources": {"Group": {"Type": "AWS::IoT::ThingGroup", "Properties": {
+            "ThingGroupName": f"cfn-tg-orphan-{uid}", "ParentGroupName": f"cfn-tg-nowhere-{uid}"}}},
+    }))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert "ResourceNotFoundException" in _stack_event_reasons(cfn, stack_name)
+        with pytest.raises(ClientError):
+            iot_client.describe_thing_group(thingGroupName=f"cfn-tg-orphan-{uid}")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+    stack_name = f"cfn-thing-group-dyn-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({
+        "Resources": {"Group": {"Type": "AWS::IoT::ThingGroup", "Properties": {
+            "ThingGroupName": f"cfn-tg-dyn-{uid}",
+            "QueryString": "attributes.site:a",
+            "Tags": [{"Key": "owner", "Value": "fleet"}],
+            "ThingGroupProperties": {"ThingGroupDescription": "dynamic on AWS, static here"}}}},
+        "Outputs": {"Id": {"Value": {"Ref": "Group"}}},
+    }))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        group = iot_client.describe_thing_group(thingGroupName=f"cfn-tg-dyn-{uid}")
+        assert group["thingGroupId"] == _output(stack, "Id")
+        assert group["thingGroupProperties"]["thingGroupDescription"] == "dynamic on AWS, static here"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+

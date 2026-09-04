@@ -421,6 +421,10 @@ _CUSTOM_NAME_REPLACEMENT = {
         "name": "GroupName",
         "requires_replacement": _requires_replacement_cognito_user_pool_group,
     },
+    "AWS::IoT::ThingGroup": {
+        "name": "ThingGroupName",
+        "requires_replacement": lambda old, new: old.get("ParentGroupName") != new.get("ParentGroupName"),
+    },
 }
 
 
@@ -7610,6 +7614,72 @@ def _iot_thing_type_delete(physical_id, props):
     _iot._thing_types.pop(physical_id, None)
 
 
+# --- IoT ThingGroup ---
+# Ref is the thing group id (the resource reference), so the physical id is
+# the id and the handlers find the record by it.
+
+def _iot_thing_group_record(physical_id):
+    return next((g for g in _iot._thing_groups.values()
+                 if g.get("thingGroupId") == physical_id), None)
+
+
+def _iot_thing_group_properties(props):
+    """The ThingGroupProperties payload, with a dropped property at the
+    value the service stores for an omitted one (no description, no
+    attributes), so an update that removes a property clears it."""
+    declared = _pascal_to_camel(props.get("ThingGroupProperties") or {})
+    attributes = (declared.get("attributePayload") or {}).get("attributes") or {}
+    return {
+        "thingGroupDescription": declared.get("thingGroupDescription"),
+        "attributePayload": {"attributes": dict(attributes)},
+    }
+
+
+def _iot_thing_group_create(logical_id, props, stack_name):
+    name = props.get("ThingGroupName") or _physical_name(stack_name, logical_id)
+    payload = {"thingGroupProperties": _iot_thing_group_properties(props)}
+    if props.get("ParentGroupName"):
+        payload["parentGroupName"] = props["ParentGroupName"]
+    resp = _iot._create_thing_group(name, payload)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::ThingGroup create failed: {resp[2]!r}")
+    rec = _iot._thing_groups.get(name) or {}
+    return rec.get("thingGroupId", name), {
+        "Arn": rec.get("thingGroupArn", _iot._thing_group_arn(name)),
+        "Id": rec.get("thingGroupId", ""),
+    }
+
+
+def _iot_thing_group_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a thing group in place through UpdateThingGroup: ThingGroupProperties
+    is the one property the reference marks No interruption that the service
+    stores. ThingGroupName and ParentGroupName require replacement
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-iot-thinggroup.html):
+    the new group is created before the old one is removed, as CloudFormation
+    orders a replacement, and Ref follows the new id. QueryString and Tags are
+    accepted without effect — the service has no dynamic groups and no tag
+    store for thing groups."""
+    rec = _iot_thing_group_record(physical_id)
+    replacement = rec is None or any(
+        new_props.get(key) != old_props.get(key)
+        for key in ("ThingGroupName", "ParentGroupName")
+    )
+    if replacement:
+        return _iot_thing_group_create(logical_id or physical_id, new_props, stack_name)
+    name = rec["thingGroupName"]
+    resp = _iot._update_thing_group(
+        name, {"thingGroupProperties": _iot_thing_group_properties(new_props)})
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::ThingGroup update failed: {resp[2]!r}")
+    return physical_id, {"Arn": rec["thingGroupArn"], "Id": physical_id}
+
+
+def _iot_thing_group_delete(physical_id, props):
+    rec = _iot_thing_group_record(physical_id)
+    if rec is not None:
+        _iot._delete_thing_group(rec["thingGroupName"])
+
+
 def _iot_policy_document(props):
     doc = props.get("PolicyDocument")
     return json.dumps(doc) if isinstance(doc, (dict, list)) else doc
@@ -8417,6 +8487,12 @@ _RESOURCE_HANDLERS = {
         "delete": _iot_topic_rule_delete,
     },
     "AWS::IoT::ThingType": {"create": _iot_thing_type_create, "delete": _iot_thing_type_delete},
+    "AWS::IoT::ThingGroup": {
+        "create": _iot_thing_group_create,
+        "update": _iot_thing_group_update,
+        "update_with_logical_id": True,
+        "delete": _iot_thing_group_delete,
+    },
     "AWS::IoT::Policy": {
         "create": _iot_policy_create,
         "update": _iot_policy_update,
