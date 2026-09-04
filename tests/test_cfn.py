@@ -87,6 +87,17 @@ def _delete_cfn_test_stack(cfn, stack_name):
         pass
 
 
+def _output(stack, key):
+    return next(o["OutputValue"] for o in stack["Outputs"] if o["OutputKey"] == key)
+
+
+def _stack_event_reasons(cfn, stack_name):
+    return " ".join(
+        e.get("ResourceStatusReason", "")
+        for e in cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+    )
+
+
 def test_cfn_region_scopes_stacks_change_sets_and_events():
     suffix = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-regional-{suffix}"
