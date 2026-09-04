@@ -10,6 +10,9 @@ import json
 import logging
 import os
 import re
+from urllib.parse import unquote
+
+from defusedxml.ElementTree import ParseError, fromstring
 
 logger = logging.getLogger("ministack")
 
@@ -260,6 +263,103 @@ def _s3_action(method: str, path: str, query_params: dict) -> str | None:
     if depth == 2 and action and _query_param(query_params, "versionId"):
         action = _S3_VERSIONED_ACTIONS.get(action, action)
     return action
+
+
+# Operations that take x-amz-bypass-governance-retention; when the header says
+# true they also need s3:BypassGovernanceRetention on the object.
+_S3_GOVERNANCE_BYPASS_ACTIONS = frozenset({"DeleteObject", "DeleteObjectVersion", "PutObjectRetention"})
+
+
+def _s3_source_object(headers: dict) -> tuple[str, str] | None:
+    """The ``(arn, version_id)`` of a CopyObject / UploadPartCopy source, from
+    ``x-amz-copy-source`` (``/bucket/key`` or ``bucket/key``, optionally
+    ``?versionId=``), or None when the header is absent or malformed."""
+    src = headers.get("x-amz-copy-source", "")
+    if not src:
+        return None
+    src, _, query = src.partition("?")
+    src = unquote(src).lstrip("/")
+    if "/" not in src:
+        return None
+    version_id = ""
+    for pair in query.split("&"):
+        k, _, v = pair.partition("=")
+        if k == "versionId":
+            version_id = unquote(v)
+    return f"arn:aws:s3:::{src}", version_id
+
+
+def _s3_batch_delete_targets(bucket: str, body: bytes) -> list[tuple[str, str]]:
+    """``(arn, version_id)`` for every ``<Object>`` of a DeleteObjects body.
+    The SDKs send the elements in the S3 namespace; a bare body works too."""
+    targets: list[tuple[str, str]] = []
+    if not body:
+        return targets
+    try:
+        root = fromstring(body)
+    except (ParseError, ValueError):  # ValueError: defusedxml's forbidden constructs
+        return targets
+    for obj in root.iter():
+        if obj.tag.rpartition("}")[2] != "Object":
+            continue
+        key = version_id = ""
+        for child in obj:
+            tag = child.tag.rpartition("}")[2]
+            if tag == "Key":
+                key = child.text or ""
+            elif tag == "VersionId":
+                version_id = child.text or ""
+        if key:
+            targets.append((f"arn:aws:s3:::{bucket}/{key}", version_id))
+    return targets
+
+
+def s3_additional_checks(method: str, path: str, headers: dict, body: bytes,
+                         query_params: dict) -> list[tuple[str, str]]:
+    """``(iam_action, resource_arn)`` pairs an S3 request needs on top of the
+    primary check, per the S3 reference:
+
+    - CopyObject and UploadPartCopy read the source: ``s3:GetObject`` (or
+      ``s3:GetObjectVersion``) on the ``x-amz-copy-source`` object.
+    - GetObjectAttributes needs ``s3:GetObject`` next to
+      ``s3:GetObjectAttributes`` (the ``*Version*`` pair with a versionId).
+    - DeleteObjects is one ``s3:DeleteObject`` (``s3:DeleteObjectVersion``
+      for a versioned entry) per key. The first key is the primary check's
+      resource (see ``extract_resource_arn``); the rest are listed here.
+    - ``x-amz-bypass-governance-retention: true`` on DeleteObject,
+      DeleteObjects or PutObjectRetention adds
+      ``s3:BypassGovernanceRetention`` on every object.
+    """
+    parts = [p for p in path.split("/") if p]
+    action = _s3_action(method, path, query_params)
+    if not parts or not action:
+        return []
+    checks: list[tuple[str, str]] = []
+    bypass = headers.get("x-amz-bypass-governance-retention", "").strip().lower() == "true"
+
+    if len(parts) >= 2:
+        key_arn = f"arn:aws:s3:::{parts[0]}/{'/'.join(parts[1:])}"
+        if action == "PutObject":
+            source = _s3_source_object(headers)
+            if source:
+                arn, version_id = source
+                checks.append(("s3:GetObjectVersion" if version_id else "s3:GetObject", arn))
+        elif action == "GetObjectAttributes":
+            checks.append(("s3:GetObject", key_arn))
+        elif action == "GetObjectVersionAttributes":
+            checks.append(("s3:GetObjectVersion", key_arn))
+        if bypass and action in _S3_GOVERNANCE_BYPASS_ACTIONS:
+            checks.append(("s3:BypassGovernanceRetention", key_arn))
+        return checks
+
+    if method == "POST" and "delete" in query_params:
+        targets = _s3_batch_delete_targets(parts[0], body)
+        for arn, version_id in targets[1:]:
+            checks.append(("s3:DeleteObjectVersion" if version_id else "s3:DeleteObject", arn))
+        if bypass:
+            for arn, _ in targets:
+                checks.append(("s3:BypassGovernanceRetention", arn))
+    return checks
 
 
 # Lambda REST path → IAM action
@@ -687,6 +787,13 @@ def extract_resource_arn(service: str, method: str, path: str,
         if len(parts) >= 2:
             key = "/".join(parts[1:])
             return f"arn:aws:s3:::{bucket}/{key}"
+        if method == "POST" and "delete" in query_params:
+            # DeleteObjects authorizes per object, not on the bucket: the
+            # first key is the primary resource, s3_additional_checks()
+            # carries the rest.
+            targets = _s3_batch_delete_targets(bucket, body)
+            if targets:
+                return targets[0][0]
         return f"arn:aws:s3:::{bucket}"
 
     if service == "dynamodb":

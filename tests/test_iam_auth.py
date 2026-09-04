@@ -1287,6 +1287,129 @@ class TestS3ActionMapping:
             assert evaluate(ctx, [stmts]).decision == "Allow", action
 
 
+class TestS3AdditionalChecks:
+    """A copy reads its source, an attributes call is a pair, a batch delete
+    is authorized per key and a governance bypass is its own action, so those
+    requests carry checks beyond the (action, resource) pair the extractors
+    return."""
+
+    _NS = "http://s3.amazonaws.com/doc/2006-03-01/"   # what boto3 sends
+    _DELETE_BODY = (f'<Delete xmlns="{_NS}"><Object><Key>a.txt</Key></Object>'
+                    '<Object><Key>dir/b.txt</Key><VersionId>v7</VersionId></Object>'
+                    '<Quiet>true</Quiet></Delete>').encode()
+    _BYPASS = {"x-amz-bypass-governance-retention": "true"}
+
+    @staticmethod
+    def _checks(method, path, headers=None, body=b"", query=None):
+        from ministack.core.iam_actions import s3_additional_checks
+        return s3_additional_checks(method, path, headers or {}, body, query or {})
+
+    # -- copy source --------------------------------------------------------
+
+    def test_copy_object_reads_the_source(self):
+        assert self._checks("PUT", "/dst/key", {"x-amz-copy-source": "/src/a%20b.txt"}) == [
+            ("s3:GetObject", "arn:aws:s3:::src/a b.txt")]
+
+    def test_copy_source_may_omit_the_leading_slash_and_name_a_version(self):
+        checks = self._checks("PUT", "/dst/key", {"x-amz-copy-source": "src/dir/a.txt?versionId=v3"},
+                              query={"uploadId": "u", "partNumber": "1"})  # UploadPartCopy
+        assert checks == [("s3:GetObjectVersion", "arn:aws:s3:::src/dir/a.txt")]
+
+    def test_plain_put_and_malformed_source_add_nothing(self):
+        assert self._checks("PUT", "/dst/key") == []
+        assert self._checks("PUT", "/dst/key", {"x-amz-copy-source": "nokey"}) == []
+        assert self._checks("PUT", "/dst", {"x-amz-copy-source": "/src/k"}) == []   # CreateBucket
+        assert self._checks("GET", "/") == []
+
+    def test_copy_needs_read_on_the_source(self):
+        stmts = parse_policy_document({"Statement": [{
+            "Effect": "Allow", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::dst/*"}]})
+        (act, arn), = self._checks("PUT", "/dst/k", {"x-amz-copy-source": "/src/k"})
+        assert evaluate(_ctx(action=act, resource=arn), [stmts]).decision == "ImplicitDeny"
+
+    # -- attributes pair ----------------------------------------------------
+
+    def test_attributes_also_need_get_object(self):
+        assert self._checks("GET", "/b/dir/sub/k.txt", query={"attributes": ""}) == [
+            ("s3:GetObject", "arn:aws:s3:::b/dir/sub/k.txt")]
+
+    def test_versioned_attributes_pair_with_get_object_version(self):
+        assert self._checks("GET", "/b/k", query={"attributes": "", "versionId": "v1"}) == [
+            ("s3:GetObjectVersion", "arn:aws:s3:::b/k")]
+
+    def test_a_plain_get_or_head_is_a_single_check(self):
+        assert self._checks("GET", "/b/k") == []
+        assert self._checks("HEAD", "/b/k", query={"versionId": "v1"}) == []
+
+    # -- governance bypass --------------------------------------------------
+
+    def test_bypass_header_adds_the_bypass_action_on_the_object(self):
+        assert self._checks("DELETE", "/b/k", self._BYPASS) == [
+            ("s3:BypassGovernanceRetention", "arn:aws:s3:::b/k")]
+        assert self._checks("DELETE", "/b/k", self._BYPASS, query={"versionId": "v1"}) == [
+            ("s3:BypassGovernanceRetention", "arn:aws:s3:::b/k")]
+        assert self._checks("PUT", "/b/k", self._BYPASS, query={"retention": ""}) == [
+            ("s3:BypassGovernanceRetention", "arn:aws:s3:::b/k")]
+
+    def test_bypass_header_is_ignored_where_the_operation_has_none(self):
+        assert self._checks("DELETE", "/b/k", {"x-amz-bypass-governance-retention": "false"}) == []
+        assert self._checks("DELETE", "/b/k", self._BYPASS, query={"tagging": ""}) == []
+        assert self._checks("PUT", "/b/k", self._BYPASS) == []
+        assert self._checks("DELETE", "/b", self._BYPASS) == []
+
+    def test_batch_delete_bypass_covers_every_key(self):
+        checks = self._checks("POST", "/b", self._BYPASS, self._DELETE_BODY, {"delete": ""})
+        assert checks == [
+            ("s3:DeleteObjectVersion", "arn:aws:s3:::b/dir/b.txt"),
+            ("s3:BypassGovernanceRetention", "arn:aws:s3:::b/a.txt"),
+            ("s3:BypassGovernanceRetention", "arn:aws:s3:::b/dir/b.txt"),
+        ]
+
+    # -- batch delete -------------------------------------------------------
+
+    def test_batch_delete_is_one_check_per_key(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        primary = extract_resource_arn("s3", "POST", "/b", {}, self._DELETE_BODY, {"delete": ""}, "", "")
+        assert primary == "arn:aws:s3:::b/a.txt"
+        assert self._checks("POST", "/b", body=self._DELETE_BODY, query={"delete": ""}) == [
+            ("s3:DeleteObjectVersion", "arn:aws:s3:::b/dir/b.txt"),
+        ]
+
+    def test_batch_delete_body_without_a_namespace_parses_too(self):
+        body = b"<Delete><Object><Key>x</Key></Object><Object><Key>y</Key></Object></Delete>"
+        assert self._checks("POST", "/b", body=body, query={"delete": ""}) == [
+            ("s3:DeleteObject", "arn:aws:s3:::b/y")]
+
+    def test_batch_delete_skips_an_object_without_a_key(self):
+        body = (b"<Delete><Object><VersionId>v1</VersionId></Object>"
+                b"<Object><Key></Key></Object><Object><Key>z</Key></Object></Delete>")
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("s3", "POST", "/b", {}, body, {"delete": ""}, "", "") == "arn:aws:s3:::b/z"
+        assert self._checks("POST", "/b", body=body, query={"delete": ""}) == []
+
+    @pytest.mark.parametrize("body", [b"", b"<Delete>", b"<!DOCTYPE d [<!ENTITY e 'x'>]><Delete>&e;</Delete>"])
+    def test_batch_delete_with_no_usable_body_keeps_the_bucket(self, body):
+        from ministack.core.iam_actions import extract_resource_arn
+        assert extract_resource_arn("s3", "POST", "/b", {}, body, {"delete": ""}, "", "") == "arn:aws:s3:::b"
+        assert self._checks("POST", "/b", body=body, query={"delete": ""}) == []
+
+    def test_a_plain_bucket_post_is_not_a_batch_delete(self):
+        assert self._checks("POST", "/b", body=self._DELETE_BODY) == []   # POST Object
+
+    def test_object_scoped_policy_allows_a_batch_delete(self):
+        # The case from the report: a grant on arn:aws:s3:::b/* used to be
+        # denied because the batch was evaluated against the bucket ARN.
+        from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+        stmts = parse_policy_document({"Statement": [{
+            "Effect": "Allow", "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+            "Resource": "arn:aws:s3:::b/*"}]})
+        action = extract_iam_action("s3", "POST", "/b", {}, self._DELETE_BODY, {"delete": ""})
+        primary = extract_resource_arn("s3", "POST", "/b", {}, self._DELETE_BODY, {"delete": ""}, "", "")
+        checks = [(action, primary)] + self._checks("POST", "/b", body=self._DELETE_BODY, query={"delete": ""})
+        for act, arn in checks:
+            assert evaluate(_ctx(action=act, resource=arn), [stmts]).decision == "Allow", (act, arn)
+
+
 # ---------------------------------------------------------------------------
 # AccessDenied response formatting
 # ---------------------------------------------------------------------------
