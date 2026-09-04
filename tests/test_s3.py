@@ -6146,3 +6146,110 @@ def test_unicode_s3_metadata(s3):
     head = s3.head_object(Bucket="unicode-meta", Key="file.bin")
     assert unquote(head["Metadata"]["filename"]) == "résumé.pdf"
     assert unquote(head["Metadata"]["author"]) == "Ñoño"
+
+
+def _wait_stack(cfn, name, timeout=30):
+    """Poll until the stack reaches a terminal status; a deleted stack is
+    addressable only by its id, so describe-by-name failing means gone."""
+    deadline = time.time() + timeout
+    status = "UNKNOWN"
+    while time.time() < deadline:
+        try:
+            stack = cfn.describe_stacks(StackName=name)["Stacks"][0]
+        except ClientError as exc:
+            if "does not exist" in str(exc):
+                return {"StackStatus": "DELETE_COMPLETE", "StackName": name}
+            raise
+        status = stack["StackStatus"]
+        if status.endswith("_COMPLETE") or status.endswith("_FAILED"):
+            return stack
+        time.sleep(0.2)
+    raise AssertionError(f"stack {name} stuck in {status}")
+
+
+def _mrap_template(name, buckets):
+    return json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            **{f"B{i}": {"Type": "AWS::S3::Bucket", "Properties": {"BucketName": b}}
+               for i, b in enumerate(buckets)},
+            "Mrap": {"Type": "AWS::S3::MultiRegionAccessPoint",
+                     "DependsOn": [f"B{i}" for i in range(len(buckets))],
+                     "Properties": {"Name": name,
+                                    "Regions": [{"Bucket": b} for b in buckets]}},
+        },
+        "Outputs": {"Alias": {"Value": {"Fn::GetAtt": ["Mrap", "Alias"]}}},
+    })
+
+
+def _mrap_get(alias, key, region=None):
+    """GET through the MRAP hostname. The host is sent explicitly rather than
+    resolved: <alias>.mrap.accesspoint.s3-global.amazonaws.com is a real public
+    suffix, so letting DNS see it would leave the test dependent on egress."""
+    import urllib.request
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+    req = urllib.request.Request(f"{endpoint}/{key}")
+    req.add_header("Host", f"{alias}.mrap.accesspoint.s3-global.amazonaws.com")
+    if region:
+        req.add_header("Authorization",
+                       "AWS4-HMAC-SHA256 "
+                       f"Credential=test/20260101/{region}/s3/aws4_request, "
+                       "SignedHeaders=host, Signature=unsigned")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return resp.status, resp.read().decode()
+
+
+def test_s3_mrap_alias_serves_the_region_member(cfn, s3):
+    """The MRAP hostname resolved nowhere — it is not a bucket name and matched
+    no virtual-host rule. It now lands on the existing vhost path, and the member
+    carrying the request region is served rather than whichever is listed first."""
+    buckets = ["mrap-serve-us-east-1-app", "mrap-serve-eu-west-1-app"]
+    cfn.create_stack(StackName="cfn-s3-mrap-serve",
+                     TemplateBody=_mrap_template("serve-mrap-app", buckets))
+    stack = _wait_stack(cfn, "cfn-s3-mrap-serve")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    alias = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["Alias"]
+
+    s3.put_object(Bucket=buckets[0], Key="who.txt", Body=b"US BUCKET")
+    s3.put_object(Bucket=buckets[1], Key="who.txt", Body=b"EU BUCKET")
+
+    # us-east-1 is listed first, so serving the eu-west-1 member proves the
+    # member is chosen by region rather than taken off the front of the list.
+    assert _mrap_get(alias, "who.txt", region="eu-west-1") == (200, "EU BUCKET")
+    assert _mrap_get(alias, "who.txt", region="us-east-1") == (200, "US BUCKET")
+
+    # A request that carries no region at all (SigV4A's credential scope has
+    # none) falls back to the first member rather than failing.
+    assert _mrap_get(alias, "who.txt") == (200, "US BUCKET")
+
+    cfn.delete_stack(StackName="cfn-s3-mrap-serve")
+    _wait_stack(cfn, "cfn-s3-mrap-serve")
+
+
+def _reset():
+    import urllib.request
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+    urllib.request.urlopen(
+        urllib.request.Request(f"{endpoint}/_ministack/reset", data=b"", method="POST"),
+        timeout=10)
+
+
+@pytest.mark.serial
+def test_s3_mrap_cleared_by_reset(cfn, s3):
+    """Every module-level store must be cleared by reset() — /_ministack/reset is
+    what test isolation depends on, so an access point surviving it would leak
+    an alias into the next test."""
+    buckets = ["mrap-reset-us-east-1-app"]
+    cfn.create_stack(StackName="cfn-s3-mrap-reset",
+                     TemplateBody=_mrap_template("reset-mrap-app", buckets))
+    stack = _wait_stack(cfn, "cfn-s3-mrap-reset")
+    alias = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["Alias"]
+    s3.put_object(Bucket=buckets[0], Key="who.txt", Body=b"US BUCKET")
+    assert _mrap_get(alias, "who.txt") == (200, "US BUCKET")
+
+    _reset()
+
+    import urllib.error
+    with pytest.raises(urllib.error.HTTPError) as ei:
+        _mrap_get(alias, "who.txt")
+    assert ei.value.code in (403, 404)

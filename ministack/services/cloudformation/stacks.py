@@ -244,11 +244,24 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                        "Rollback requested", stack_id)
 
             rollback_delete_failures = []
+            previous_resources = (
+                previous_stack.get("_resources", {})
+                if is_update and previous_stack else {}
+            )
             for logical_id in reversed(created_in_this_run):
                 res = provisioned_resources.get(logical_id, {})
                 rtype = res.get("ResourceType", "")
                 pid = res.get("PhysicalResourceId", "")
                 res_props = res.get("Properties", {})
+                prev = previous_resources.get(logical_id)
+                if prev is not None and prev.get("PhysicalResourceId") == pid:
+                    # The resource existed before this update and kept its
+                    # identity (untouched, or updated in place), so it is not
+                    # something this run created: deleting it would destroy a
+                    # resource the restored stack still records. Only new
+                    # resources and replacements under a new physical id are
+                    # undone. An in-place change is not reverted here.
+                    continue
                 try:
                     if _is_custom_resource(rtype):
                         await run_reentrant(

@@ -1662,8 +1662,50 @@ async def _handle_alb_request(host: str, path: str, method: str, headers: dict, 
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
 
 
+_MRAP_HOST_RE = re.compile(
+    r"^([a-z0-9]+)\.mrap\.accesspoint\.s3-global\.amazonaws\.com$", re.IGNORECASE
+)
+
+
+def _resolve_mrap_host(host: str):
+    """The member bucket for a Multi-Region Access Point host, or None.
+
+    An MRAP is addressed as `<alias>.mrap.accesspoint.s3-global.amazonaws.com`,
+    which is not a bucket name and so never matches the virtual-hosted rules.
+    Resolving it to a member bucket lets the whole existing S3 vhost path —
+    rewrite to path-style, IAM enforcement, the handler — apply unchanged.
+    """
+    match = _MRAP_HOST_RE.match(host.split(":")[0].strip())
+    if not match:
+        return None
+    try:
+        return _get_module("s3").resolve_mrap_bucket(match.group(1).lower())
+    except Exception:
+        return None
+
+
 async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict):
     """Handle virtual-hosted S3 requests before generic routing."""
+    mrap_bucket = _resolve_mrap_host(host)
+    if mrap_bucket:
+        # SigV4A (`AWS4-ECDSA-P256-SHA256`) is what S3 requires for an MRAP and
+        # what MiniStack does not implement: verifying it means ECDSA P-256 key
+        # derivation, and the emulator does not verify header-signed SigV4
+        # requests either. So the presign parameters are dropped and the request
+        # is served unverified rather than rejected for a signature that could
+        # never have matched. A plain SigV4 presign is left alone and still
+        # verifies.
+        algorithm = (query_params.get("X-Amz-Algorithm") or [""])[0]
+        if "ECDSA" in str(algorithm).upper():
+            query_params = {
+                k: v for k, v in query_params.items()
+                if not k.lower().startswith("x-amz-")
+            }
+        mrap_path = "/" + mrap_bucket + (path if path != "/" else "/")
+        return await _get_module("s3").handle_request(
+            method, mrap_path, headers, body, query_params, signed_path=path
+        )
+
     bucket = _extract_s3_vhost_bucket(host)
     if not bucket or _S3_VHOST_EXCLUDE_RE.search(host) or bucket in _NON_S3_VHOST_NAMES:
         return None
@@ -1693,7 +1735,7 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
 
     # IAM enforcement for S3 virtual-hosted requests
     if AUTH:
-        from ministack.core.iam_actions import _s3_action, extract_resource_arn
+        from ministack.core.iam_actions import _s3_action, extract_resource_arn, s3_additional_checks
 
         s3_action = _s3_action(method, vhost_path, query_params)
         if s3_action:
@@ -1701,6 +1743,12 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
             denied = _enforce_data_plane("s3", f"s3:{s3_action}", headers, query_params, "", resource_arn=s3_resource)
             if denied:
                 return denied
+            # A copy also reads its source, a batch delete is one check per
+            # key, an attributes call is a pair, a governance bypass its own action.
+            for extra_action, extra_arn in s3_additional_checks(method, vhost_path, headers, body, query_params):
+                denied = _enforce_data_plane("s3", extra_action, headers, query_params, "", resource_arn=extra_arn)
+                if denied:
+                    return denied
 
     try:
         # Pass the original (pre-rewrite) URI as signed_path so a presigned
@@ -2096,6 +2144,16 @@ async def _dispatch_service_request(
                 service, method, path, headers, body, routing_params, region, get_account_id()
             )
             denied = enforce(access_key, iam_action, service, region, resource_arn=resource_arn)
+            # A copy also reads its source, a batch delete is one check per
+            # key, an attributes call is a pair, a governance bypass its own action.
+            if service == "s3" and not denied:
+                from ministack.core.iam_actions import s3_additional_checks
+
+                for extra_action, extra_arn in s3_additional_checks(method, path, headers, body, routing_params):
+                    denied = enforce(access_key, extra_action, service, region, resource_arn=extra_arn)
+                    if denied:
+                        iam_action = extra_action
+                        break
             if denied:
                 if isinstance(denied, AuthError):
                     return access_denied_response(

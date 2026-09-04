@@ -77,6 +77,36 @@ _bucket_versioning = AccountScopedDict()
 _bucket_encryption = AccountScopedDict()
 _bucket_lifecycle = AccountScopedDict()
 _bucket_cors = AccountScopedDict()
+# Multi-Region Access Points. Keyed by ALIAS rather than name, because the alias
+# is what the data plane is addressed by: `<alias>.mrap.accesspoint.s3-global.amazonaws.com`.
+_mraps = AccountScopedDict()  # Alias -> {Name, Alias, Regions: [bucket, ...], CreatedAt}
+
+
+def new_mrap_alias() -> str:
+    """A 13-character alias, the shape S3 mints for a Multi-Region Access Point."""
+    return new_uuid().replace("-", "")[:13].lower()
+
+
+def resolve_mrap_bucket(alias: str):
+    """The bucket an MRAP alias serves, or None.
+
+    A real MRAP routes to whichever member bucket is nearest the caller. Nearest
+    has no meaning in a single-process emulator, so the member whose name carries
+    the request region wins and the first member is the fallback — deterministic,
+    and it makes a single-region MRAP (the common case in a local stack) resolve
+    to the only bucket it has.
+    """
+    record = _mraps.get(alias)
+    if not record:
+        return None
+    buckets = record.get("Regions") or []
+    if not buckets:
+        return None
+    region = get_region()
+    for bucket in buckets:
+        if region and region in bucket:
+            return bucket
+    return buckets[0]
 _bucket_acl = AccountScopedDict()
 _bucket_websites = AccountScopedDict()
 _bucket_logging_config = AccountScopedDict()
@@ -123,6 +153,10 @@ _PERSISTED_BUCKET_DICTS = {
     "bucket_request_payment_config": _bucket_request_payment_config,
     "bucket_object_lock": _bucket_object_lock,
     "bucket_replication": _bucket_replication,
+    # An access point outliving a restart matters more than most: its alias is
+    # baked into client configuration, so member buckets coming back without the
+    # alias fronting them fails where a missing bucket would not.
+    "mraps": _mraps,
 }
 
 
@@ -6528,6 +6562,7 @@ def reset():
         _object_retention,
         _object_legal_hold,
         _object_versions,
+        _mraps,
     ):
         d.clear()
 
