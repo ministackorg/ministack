@@ -421,6 +421,10 @@ _CUSTOM_NAME_REPLACEMENT = {
         "name": "GroupName",
         "requires_replacement": _requires_replacement_cognito_user_pool_group,
     },
+    "AWS::IoT::ThingGroup": {
+        "name": "ThingGroupName",
+        "requires_replacement": lambda old, new: old.get("ParentGroupName") != new.get("ParentGroupName"),
+    },
 }
 
 
@@ -3399,34 +3403,75 @@ def _apigw_model_delete(physical_id, props):
 
 # --- API Gateway Authorizer ---
 
-def _apigw_authorizer_create(logical_id, props, stack_name):
-    """Provision an AWS::ApiGateway::Authorizer.
+# (CFN property, authorizer field, value the create fills in when the template
+# omits the property — the defaults of the resource reference: a 300 s result
+# TTL and the Authorization header as identity source). Name is required on
+# AWS and defaults to the logical id here; RestApiId is the one property that
+# requires replacement.
+_APIGW_AUTHORIZER_PROPERTIES = (
+    ("Type", "type", "TOKEN"),
+    ("AuthorizerUri", "authorizerUri", ""),
+    ("AuthorizerCredentials", "authorizerCredentials", None),
+    ("IdentitySource", "identitySource", "method.request.header.Authorization"),
+    ("IdentityValidationExpression", "identityValidationExpression", ""),
+    ("AuthorizerResultTtlInSeconds", "authorizerResultTtlInSeconds", 300),
+    ("ProviderARNs", "providerARNs", []),
+    ("AuthType", "authType", None),
+)
 
-    Maps CFN properties to the existing apigateway_v1 authorizer store:
-    Name, Type (TOKEN / REQUEST / COGNITO_USER_POOLS), AuthorizerUri,
-    AuthorizerCredentials, IdentitySource, IdentityValidationExpression,
-    AuthorizerResultTtlInSeconds, ProviderARNs, RestApiId. ``AuthType`` is
-    documented in the AWS CFN spec as informational only; the underlying
-    apigateway_v1._create_authorizer record does not currently expose it,
-    so the field is dropped here.
-    """
+
+def _apigw_authorizer_create(logical_id, props, stack_name):
+    """Provision an AWS::ApiGateway::Authorizer through the apigateway_v1
+    authorizer store: Name, Type (TOKEN / REQUEST / COGNITO_USER_POOLS),
+    AuthorizerUri, AuthorizerCredentials, IdentitySource,
+    IdentityValidationExpression, AuthorizerResultTtlInSeconds, ProviderARNs,
+    AuthType (informational, kept as GetAuthorizer reports it), RestApiId."""
     api_id = props.get("RestApiId", "")
-    data = {
-        "name": props.get("Name", logical_id),
-        "type": props.get("Type", "TOKEN"),
-        "authorizerUri": props.get("AuthorizerUri", ""),
-        "authorizerCredentials": props.get("AuthorizerCredentials"),
-        "identitySource": props.get("IdentitySource", "method.request.header.Authorization"),
-        "identityValidationExpression": props.get("IdentityValidationExpression", ""),
-        "authorizerResultTtlInSeconds": props.get("AuthorizerResultTtlInSeconds", 300),
-        "providerARNs": props.get("ProviderARNs", []),
-    }
-    status, headers, body = _apigw_v1._create_authorizer(api_id, data)
+    data = {"name": props.get("Name", logical_id)}
+    for prop, field, default in _APIGW_AUTHORIZER_PROPERTIES:
+        value = props.get(prop, default)
+        if prop == "AuthType" and value is None:
+            continue
+        data[field] = value
+    status, _headers, body = _apigw_v1._create_authorizer(api_id, data)
     if status >= 400:
         raise ValueError(f"AWS::ApiGateway::Authorizer create failed: {body!r}")
-    authorizer = json.loads(body) if isinstance(body, (bytes, bytearray)) else json.loads(body)
-    authorizer_id = authorizer.get("id", "")
+    authorizer_id = json.loads(body).get("id", "")
     return authorizer_id, {"AuthorizerId": authorizer_id}
+
+
+def _apigw_authorizer_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update an authorizer in place through UpdateAuthorizer, keeping its id
+    (what Ref and AuthorizerId return): every property but RestApiId is No
+    interruption on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-authorizer.html).
+    A property the new template drops reverts to the value the create fills
+    in. A changed RestApiId, or an authorizer deleted behind the stack's back,
+    is a replacement: the new authorizer is created and the engine removes
+    the old one."""
+    api_id = new_props.get("RestApiId", "")
+    record = _apigw_v1._authorizers_v1.get(api_id, {}).get(physical_id)
+    if record is None or new_props.get("RestApiId") != old_props.get("RestApiId"):
+        return _apigw_authorizer_create(logical_id or physical_id, new_props, stack_name)
+    default_name = logical_id or physical_id
+    patch_ops = []
+    if new_props.get("Name", default_name) != old_props.get("Name", default_name):
+        patch_ops.append({"op": "replace", "path": "/name",
+                          "value": new_props.get("Name", default_name)})
+    for prop, field, default in _APIGW_AUTHORIZER_PROPERTIES:
+        value = new_props.get(prop, default)
+        if value == old_props.get(prop, default):
+            continue
+        if prop == "AuthType" and value is None:
+            patch_ops.append({"op": "remove", "path": f"/{field}"})
+        else:
+            patch_ops.append({"op": "replace", "path": f"/{field}", "value": value})
+    if patch_ops:
+        status, _headers, body = _apigw_v1._update_authorizer(
+            api_id, physical_id, {"patchOperations": patch_ops})
+        if status >= 400:
+            raise ValueError(f"AWS::ApiGateway::Authorizer update failed: {body!r}")
+    return physical_id, {"AuthorizerId": physical_id}
 
 
 def _apigw_authorizer_delete(physical_id, props):
@@ -3437,17 +3482,66 @@ def _apigw_authorizer_delete(physical_id, props):
 
 # --- API Gateway Deployment ---
 
+def _apigw_deployment_stage(props):
+    """The stage a deployment declares: StageName plus the StageDescription
+    object's Description and Variables (a plain string is taken as the
+    description, for templates written against earlier releases)."""
+    stage_description = props.get("StageDescription") or {}
+    if isinstance(stage_description, dict):
+        description = stage_description.get("Description", "")
+        variables = stage_description.get("Variables") or {}
+    else:
+        description, variables = str(stage_description), {}
+    return props.get("StageName"), description, variables
+
+
 def _apigw_deployment_create(logical_id, props, stack_name):
     api_id = props.get("RestApiId", "")
+    stage_name, stage_description, variables = _apigw_deployment_stage(props)
     data = {
         "description": props.get("Description", ""),
-        "stageName": props.get("StageName"),
-        "stageDescription": props.get("StageDescription", ""),
+        "stageName": stage_name,
+        "stageDescription": stage_description,
+        "variables": variables,
     }
-    status, headers, body = _apigw_v1._create_deployment(api_id, data)
-    deployment = json.loads(body) if isinstance(body, bytes) else json.loads(body)
-    deployment_id = deployment.get("id", "")
+    status, _headers, body = _apigw_v1._create_deployment(api_id, data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::Deployment create failed: {body!r}")
+    deployment_id = json.loads(body).get("id", "")
     return deployment_id, {"DeploymentId": deployment_id}
+
+
+def _apigw_deployment_update(physical_id, old_props, new_props, stack_name):
+    """Update a deployment in place, keeping its id (what Ref and DeploymentId
+    return): Description, StageName and StageDescription are No interruption
+    on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-deployment.html),
+    so a changed description patches the deployment and a changed stage name
+    or stage description deploys the same deployment to that stage, as the
+    create does. RestApiId and DeploymentCanarySettings require replacement:
+    a new deployment is created and the engine removes the old one. A stage
+    the template stops naming is left standing, as on AWS.
+
+    Not modelled: DeploymentCanarySettings is accepted without effect (the
+    create does not store it; a change still replaces), and of the
+    StageDescription object only Description and Variables reach the stage."""
+    api_id = new_props.get("RestApiId", "")
+    record = _apigw_v1._deployments_v1.get(api_id, {}).get(physical_id)
+    if record is None or any(
+        new_props.get(key) != old_props.get(key)
+        for key in ("RestApiId", "DeploymentCanarySettings")
+    ):
+        return _apigw_deployment_create(physical_id, new_props, stack_name)
+    if new_props.get("Description", "") != old_props.get("Description", ""):
+        status, _headers, body = _apigw_v1._update_deployment(api_id, physical_id, {
+            "patchOperations": [{"op": "replace", "path": "/description",
+                                 "value": new_props.get("Description", "")}]})
+        if status >= 400:
+            raise ValueError(f"AWS::ApiGateway::Deployment update failed: {body!r}")
+    stage = _apigw_deployment_stage(new_props)
+    if stage[0] and stage != _apigw_deployment_stage(old_props):
+        _apigw_v1._deploy_to_stage(api_id, physical_id, *stage)
+    return physical_id, {"DeploymentId": physical_id}
 
 
 def _apigw_deployment_delete(physical_id, props):
@@ -5244,13 +5338,55 @@ def _kms_key_delete(physical_id, props):
         })
 
 
-def _kms_alias_create(logical_id, props, stack_name):
-    alias_name = props.get("AliasName", f"alias/{stack_name}-{logical_id}")
-    target_key = props.get("TargetKeyId", "")
+_KMS_ALIAS_NAME = re.compile(r"^alias/[a-zA-Z0-9:/_-]{1,250}$")
+
+
+def _kms_alias_target(target_key):
     rec = _kms._resolve_key(target_key)
-    alias_arn = _kms._alias_arn(alias_name)
-    _kms._aliases[alias_arn] = rec["KeyId"] if rec else target_key
+    return rec["KeyId"] if rec else target_key
+
+
+def _kms_alias_name(props, stack_name, logical_id):
+    return props.get("AliasName") or f"alias/{stack_name}-{logical_id}"
+
+
+def _kms_alias_create(logical_id, props, stack_name):
+    alias_name = _kms_alias_name(props, stack_name, logical_id)
+    if not _KMS_ALIAS_NAME.match(alias_name) or alias_name.startswith("alias/aws/"):
+        # The constraints the resource reference states: the alias/ prefix,
+        # alphanumerics plus :/_- up to 256 characters, and alias/aws/
+        # reserved for AWS managed keys.
+        raise ValueError(
+            f"AWS::KMS::Alias AliasName {alias_name!r} must begin with alias/, "
+            "contain only alphanumerics, :, /, _ and -, and must not begin "
+            "with the reserved alias/aws/ prefix")
+    target_key = props.get("TargetKeyId", "")
+    if not target_key:
+        raise ValueError("AWS::KMS::Alias requires TargetKeyId")
+    _kms._aliases[_kms._alias_arn(alias_name)] = _kms_alias_target(target_key)
     return alias_name, {}
+
+
+def _kms_alias_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update an alias in place: TargetKeyId is No interruption on the
+    resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-kms-alias.html),
+    so a changed target re-points the alias under its name (what Ref
+    returns), as UpdateAlias does. AliasName requires replacement: the new
+    alias is created before the old one is removed."""
+    current = physical_id if _kms._alias_arn(physical_id) in _kms._aliases else None
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        _kms_alias_name(new_props, stack_name, logical_id or physical_id), current,
+        _kms_alias_create, _kms_alias_delete,
+    )
+    if replaced is not None:
+        return replaced
+    target_key = new_props.get("TargetKeyId", "")
+    if not target_key:
+        raise ValueError("AWS::KMS::Alias requires TargetKeyId")
+    _kms._aliases[_kms._alias_arn(physical_id)] = _kms_alias_target(target_key)
+    return physical_id, {}
 
 
 def _kms_alias_delete(physical_id, props):
@@ -7610,6 +7746,72 @@ def _iot_thing_type_delete(physical_id, props):
     _iot._thing_types.pop(physical_id, None)
 
 
+# --- IoT ThingGroup ---
+# Ref is the thing group id (the resource reference), so the physical id is
+# the id and the handlers find the record by it.
+
+def _iot_thing_group_record(physical_id):
+    return next((g for g in _iot._thing_groups.values()
+                 if g.get("thingGroupId") == physical_id), None)
+
+
+def _iot_thing_group_properties(props):
+    """The ThingGroupProperties payload, with a dropped property at the
+    value the service stores for an omitted one (no description, no
+    attributes), so an update that removes a property clears it."""
+    declared = _pascal_to_camel(props.get("ThingGroupProperties") or {})
+    attributes = (declared.get("attributePayload") or {}).get("attributes") or {}
+    return {
+        "thingGroupDescription": declared.get("thingGroupDescription"),
+        "attributePayload": {"attributes": dict(attributes)},
+    }
+
+
+def _iot_thing_group_create(logical_id, props, stack_name):
+    name = props.get("ThingGroupName") or _physical_name(stack_name, logical_id)
+    payload = {"thingGroupProperties": _iot_thing_group_properties(props)}
+    if props.get("ParentGroupName"):
+        payload["parentGroupName"] = props["ParentGroupName"]
+    resp = _iot._create_thing_group(name, payload)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::ThingGroup create failed: {resp[2]!r}")
+    rec = _iot._thing_groups.get(name) or {}
+    return rec.get("thingGroupId", name), {
+        "Arn": rec.get("thingGroupArn", _iot._thing_group_arn(name)),
+        "Id": rec.get("thingGroupId", ""),
+    }
+
+
+def _iot_thing_group_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a thing group in place through UpdateThingGroup: ThingGroupProperties
+    is the one property the reference marks No interruption that the service
+    stores. ThingGroupName and ParentGroupName require replacement
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-iot-thinggroup.html):
+    the new group is created before the old one is removed, as CloudFormation
+    orders a replacement, and Ref follows the new id. QueryString and Tags are
+    accepted without effect — the service has no dynamic groups and no tag
+    store for thing groups."""
+    rec = _iot_thing_group_record(physical_id)
+    replacement = rec is None or any(
+        new_props.get(key) != old_props.get(key)
+        for key in ("ThingGroupName", "ParentGroupName")
+    )
+    if replacement:
+        return _iot_thing_group_create(logical_id or physical_id, new_props, stack_name)
+    name = rec["thingGroupName"]
+    resp = _iot._update_thing_group(
+        name, {"thingGroupProperties": _iot_thing_group_properties(new_props)})
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::ThingGroup update failed: {resp[2]!r}")
+    return physical_id, {"Arn": rec["thingGroupArn"], "Id": physical_id}
+
+
+def _iot_thing_group_delete(physical_id, props):
+    rec = _iot_thing_group_record(physical_id)
+    if rec is not None:
+        _iot._delete_thing_group(rec["thingGroupName"])
+
+
 def _iot_policy_document(props):
     doc = props.get("PolicyDocument")
     return json.dumps(doc) if isinstance(doc, (dict, list)) else doc
@@ -8221,10 +8423,17 @@ _RESOURCE_HANDLERS = {
         "update": _apigw_model_update,
         "delete": _apigw_model_delete,
     },
-    "AWS::ApiGateway::Authorizer": {"create": _apigw_authorizer_create, "delete": _apigw_authorizer_delete},
-    # Deployment stays create-only: AWS treats a deployment as an immutable
-    # snapshot — an update is a new deployment (CFN replaces the resource).
-    "AWS::ApiGateway::Deployment": {"create": _apigw_deployment_create, "delete": _apigw_deployment_delete},
+    "AWS::ApiGateway::Authorizer": {
+        "create": _apigw_authorizer_create,
+        "update": _apigw_authorizer_update,
+        "update_with_logical_id": True,
+        "delete": _apigw_authorizer_delete,
+    },
+    "AWS::ApiGateway::Deployment": {
+        "create": _apigw_deployment_create,
+        "update": _apigw_deployment_update,
+        "delete": _apigw_deployment_delete,
+    },
     "AWS::ApiGateway::Stage": {
         "create": _apigw_stage_create,
         "update": _apigw_stage_update,
@@ -8343,7 +8552,12 @@ _RESOURCE_HANDLERS = {
         "update": _kms_key_update,
         "delete": _kms_key_delete,
     },
-    "AWS::KMS::Alias": {"create": _kms_alias_create, "delete": _kms_alias_delete},
+    "AWS::KMS::Alias": {
+        "create": _kms_alias_create,
+        "update": _kms_alias_update,
+        "update_with_logical_id": True,
+        "delete": _kms_alias_delete,
+    },
     "AWS::EC2::VPC": {"create": _ec2_vpc_create, "delete": _ec2_vpc_delete},
     "AWS::EC2::VPCEndpoint": {
         "create": _ec2_vpc_endpoint_create,
@@ -8417,6 +8631,12 @@ _RESOURCE_HANDLERS = {
         "delete": _iot_topic_rule_delete,
     },
     "AWS::IoT::ThingType": {"create": _iot_thing_type_create, "delete": _iot_thing_type_delete},
+    "AWS::IoT::ThingGroup": {
+        "create": _iot_thing_group_create,
+        "update": _iot_thing_group_update,
+        "update_with_logical_id": True,
+        "delete": _iot_thing_group_delete,
+    },
     "AWS::IoT::Policy": {
         "create": _iot_policy_create,
         "update": _iot_policy_update,

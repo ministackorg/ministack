@@ -987,6 +987,9 @@ def _create_thing_group(name: str, payload: dict) -> tuple:
         )
     props = payload.get("thingGroupProperties") or {}
     attr_payload = props.get("attributePayload") or {}
+    parent = payload.get("parentGroupName")
+    if parent and parent not in _thing_groups:
+        return _error_not_found("ThingGroup", parent)
     record = {
         "thingGroupName": name,
         "thingGroupId": new_uuid(),
@@ -999,6 +1002,13 @@ def _create_thing_group(name: str, payload: dict) -> tuple:
         "things": [],
         "creationDate": _now_epoch(),
     }
+    if parent:
+        # DescribeThingGroup reports the parent under thingGroupMetadata, as
+        # the API reference documents it.
+        record["thingGroupMetadata"] = {
+            "parentGroupName": parent,
+            "creationDate": record["creationDate"],
+        }
     _thing_groups[name] = record
     return json_response({
         "thingGroupName": name,

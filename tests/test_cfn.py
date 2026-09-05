@@ -14366,6 +14366,368 @@ def test_cfn_delete_change_set_missing_is_idempotent(cfn):
     assert exc.value.response["Error"]["Code"] == "ValidationError"
 
 
+def test_cfn_iot_thing_group_lifecycle(cfn, iot_client):
+    """AWS::IoT::ThingGroup provisions with its properties and parent, Ref is
+    the group id and Fn::GetAtt serves Arn and Id; a ThingGroupProperties
+    change updates the group in place under the same id, a dropped
+    description or attribute set is cleared, and deleting the stack removes
+    the group."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-thing-group-{uid}"
+    parent_name = f"cfn-tg-parent-{uid}"
+    group_name = f"cfn-tg-child-{uid}"
+
+    def template(description, attributes):
+        # ParentGroupName takes the parent's NAME; Ref would give its id.
+        properties = {"ThingGroupName": group_name, "ParentGroupName": parent_name}
+        if description is not None or attributes is not None:
+            properties["ThingGroupProperties"] = {}
+            if description is not None:
+                properties["ThingGroupProperties"]["ThingGroupDescription"] = description
+            if attributes is not None:
+                properties["ThingGroupProperties"]["AttributePayload"] = {"Attributes": attributes}
+        return json.dumps({
+            "Resources": {
+                "Parent": {"Type": "AWS::IoT::ThingGroup", "Properties": {
+                    "ThingGroupName": parent_name}},
+                "Group": {"Type": "AWS::IoT::ThingGroup", "DependsOn": "Parent",
+                          "Properties": properties},
+            },
+            "Outputs": {
+                "Id": {"Value": {"Ref": "Group"}},
+                "Arn": {"Value": {"Fn::GetAtt": ["Group", "Arn"]}},
+                "AttId": {"Value": {"Fn::GetAtt": ["Group", "Id"]}},
+                "ParentRef": {"Value": {"Ref": "Parent"}},
+            },
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("fleet", {"site": "a"}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        group = iot_client.describe_thing_group(thingGroupName=group_name)
+        assert _output(stack, "Id") == group["thingGroupId"] == _output(stack, "AttId")
+        assert _output(stack, "Arn") == group["thingGroupArn"]
+        assert group["thingGroupProperties"]["thingGroupDescription"] == "fleet"
+        assert group["thingGroupProperties"]["attributePayload"]["attributes"] == {"site": "a"}
+        assert group["thingGroupMetadata"]["parentGroupName"] == parent_name
+        parent = iot_client.describe_thing_group(thingGroupName=parent_name)
+        assert _output(stack, "ParentRef") == parent["thingGroupId"]
+        # The Ref is the id, not the name, as the resource reference documents.
+        assert _output(stack, "Id") != group_name
+        group_id = group["thingGroupId"]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("fleet-b", {"site": "b", "tier": "1"}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        group = iot_client.describe_thing_group(thingGroupName=group_name)
+        assert group["thingGroupId"] == group_id == _output(stack, "Id")
+        assert group["thingGroupProperties"]["thingGroupDescription"] == "fleet-b"
+        assert group["thingGroupProperties"]["attributePayload"]["attributes"] == {"site": "b", "tier": "1"}
+        assert group["version"] == 2
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(None, None))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        group = iot_client.describe_thing_group(thingGroupName=group_name)
+        assert group["thingGroupId"] == group_id
+        assert not group["thingGroupProperties"].get("thingGroupDescription")
+        assert group["thingGroupProperties"]["attributePayload"]["attributes"] == {}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    for name in (group_name, parent_name):
+        with pytest.raises(ClientError) as exc:
+            iot_client.describe_thing_group(thingGroupName=name)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_cfn_iot_thing_group_rename_replaces_and_parent_change_is_refused(cfn, iot_client):
+    """ThingGroupName and ParentGroupName require replacement: a renamed group
+    is created before the old one is removed and Ref follows the new id, while
+    a parent change under an unchanged custom name gets CloudFormation's own
+    refusal; a group without ThingGroupName gets a generated name and can be
+    re-parented, since the replacement runs under a fresh identity."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-thing-group-repl-{uid}"
+    parents = (f"cfn-tg-p1-{uid}", f"cfn-tg-p2-{uid}")
+
+    def template(name, parent):
+        return json.dumps({
+            "Resources": {
+                "P1": {"Type": "AWS::IoT::ThingGroup", "Properties": {"ThingGroupName": parents[0]}},
+                "P2": {"Type": "AWS::IoT::ThingGroup", "Properties": {"ThingGroupName": parents[1]}},
+                "Group": {"Type": "AWS::IoT::ThingGroup", "DependsOn": ["P1", "P2"], "Properties": {
+                    "ThingGroupName": name, "ParentGroupName": parent}},
+                "Unnamed": {"Type": "AWS::IoT::ThingGroup", "DependsOn": ["P1", "P2"], "Properties": {
+                    "ParentGroupName": parent}},
+            },
+            "Outputs": {"Id": {"Value": {"Ref": "Group"}},
+                        "UnnamedId": {"Value": {"Ref": "Unnamed"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(f"cfn-tg-a-{uid}", parents[0]))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        first_id = _output(stack, "Id")
+        unnamed_id = _output(stack, "UnnamedId")
+        unnamed_name = next(
+            g["groupName"] for g in iot_client.list_thing_groups()["thingGroups"]
+            if g["groupName"].startswith(f"{stack_name}-Unnamed-"))
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(f"cfn-tg-b-{uid}", parents[0]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        renamed = iot_client.describe_thing_group(thingGroupName=f"cfn-tg-b-{uid}")
+        assert _output(stack, "Id") == renamed["thingGroupId"] != first_id
+        with pytest.raises(ClientError):
+            iot_client.describe_thing_group(thingGroupName=f"cfn-tg-a-{uid}")
+        assert _output(stack, "UnnamedId") == unnamed_id
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(f"cfn-tg-b-{uid}", parents[1]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        reasons = _stack_event_reasons(cfn, stack_name)
+        assert "custom-named resource requires replacing" in reasons, reasons
+        assert iot_client.describe_thing_group(thingGroupName=f"cfn-tg-b-{uid}")[
+            "thingGroupMetadata"]["parentGroupName"] == parents[0]
+        # The generated-name group was re-parented before the failure and
+        # rolled back with the stack: it still reports the first parent.
+        unnamed = iot_client.describe_thing_group(thingGroupName=unnamed_name)
+        assert unnamed["thingGroupMetadata"]["parentGroupName"] in parents
+def test_cfn_apigateway_authorizer_update_in_place_and_replacement(cfn, apigw_v1):
+    """An authorizer property change updates the authorizer under the same id
+    (Ref and AuthorizerId keep their value), a property the template drops
+    reverts to the create default, and a RestApiId change replaces the
+    authorizer: it appears on the new API and is gone from the old one."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-authz-upd-{uid}"
+    uri = ("arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+           "arn:aws:lambda:us-east-1:000000000000:function:noop/invocations")
+
+    def template(api, name, ttl, identity_source, auth_type, kind="TOKEN", providers=None):
+        properties = {"Name": name, "Type": kind, "RestApiId": {"Ref": api},
+                      "AuthorizerUri": uri, "IdentitySource": identity_source}
+        if providers:
+            properties["ProviderARNs"] = providers
+        if ttl is not None:
+            properties["AuthorizerResultTtlInSeconds"] = ttl
+        if auth_type is not None:
+            properties["AuthType"] = auth_type
+        return json.dumps({
+            "Resources": {
+                "ApiA": {"Type": "AWS::ApiGateway::RestApi", "Properties": {"Name": f"cfn-authz-a-{uid}"}},
+                "ApiB": {"Type": "AWS::ApiGateway::RestApi", "Properties": {"Name": f"cfn-authz-b-{uid}"}},
+                "Auth": {"Type": "AWS::ApiGateway::Authorizer", "Properties": properties},
+            },
+            "Outputs": {"Id": {"Value": {"Ref": "Auth"}},
+                        "AttId": {"Value": {"Fn::GetAtt": ["Auth", "AuthorizerId"]}},
+                        "ApiA": {"Value": {"Ref": "ApiA"}}, "ApiB": {"Value": {"Ref": "ApiB"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(
+        "ApiA", "first", 60, "method.request.header.X-Token", "custom"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        api_a, api_b = _output(stack, "ApiA"), _output(stack, "ApiB")
+        auth_id = _output(stack, "Id")
+        assert _output(stack, "AttId") == auth_id
+        authorizer = apigw_v1.get_authorizer(restApiId=api_a, authorizerId=auth_id)
+        assert (authorizer["name"], authorizer["authorizerResultTtlInSeconds"],
+                authorizer["identitySource"], authorizer["authType"]) == (
+            "first", 60, "method.request.header.X-Token", "custom")
+
+        pool_arn = f"arn:aws:cognito-idp:us-east-1:000000000000:userpool/us-east-1_{uid}"
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(
+            "ApiA", "second", None, "method.request.header.Authorization", None,
+            kind="COGNITO_USER_POOLS", providers=[pool_arn]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Id") == auth_id
+        authorizer = apigw_v1.get_authorizer(restApiId=api_a, authorizerId=auth_id)
+        assert (authorizer["name"], authorizer["authorizerResultTtlInSeconds"],
+                authorizer["identitySource"], authorizer["type"], authorizer["providerARNs"]) == (
+            "second", 300, "method.request.header.Authorization", "COGNITO_USER_POOLS", [pool_arn])
+        assert "authType" not in authorizer
+        assert len(apigw_v1.get_authorizers(restApiId=api_a)["items"]) == 1
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(
+            "ApiB", "second", None, "method.request.header.Authorization", None))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        new_id = _output(stack, "Id")
+        assert new_id != auth_id
+        assert apigw_v1.get_authorizers(restApiId=api_a)["items"] == []
+        assert [a["id"] for a in apigw_v1.get_authorizers(restApiId=api_b)["items"]] == [new_id]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_apigateway_deployment_update_in_place_and_replacement(cfn, apigw_v1):
+    """A deployment's Description, StageName and StageDescription update in
+    place under the same deployment id: the description patches the
+    deployment, a new stage name deploys the same deployment to that stage
+    and leaves the previous stage standing. A RestApiId change replaces the
+    deployment on the other API."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-deploy-upd-{uid}"
+
+    def template(api, description, stage_name, stage_description, canary=None):
+        properties = {"RestApiId": {"Ref": api}, "Description": description}
+        if canary is not None:
+            properties["DeploymentCanarySettings"] = {"PercentTraffic": canary}
+        if stage_name:
+            properties["StageName"] = stage_name
+            properties["StageDescription"] = {"Description": stage_description,
+                                              "Variables": {"stage": stage_name}}
+        return json.dumps({
+            "Resources": {
+                "ApiA": {"Type": "AWS::ApiGateway::RestApi", "Properties": {"Name": f"cfn-deploy-a-{uid}"}},
+                "ApiB": {"Type": "AWS::ApiGateway::RestApi", "Properties": {"Name": f"cfn-deploy-b-{uid}"}},
+                "Dep": {"Type": "AWS::ApiGateway::Deployment", "Properties": properties},
+            },
+            "Outputs": {"Id": {"Value": {"Ref": "Dep"}},
+                        "AttId": {"Value": {"Fn::GetAtt": ["Dep", "DeploymentId"]}},
+                        "ApiA": {"Value": {"Ref": "ApiA"}}, "ApiB": {"Value": {"Ref": "ApiB"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("ApiA", "one", "alpha", "stage one"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        api_a, api_b = _output(stack, "ApiA"), _output(stack, "ApiB")
+        dep_id = _output(stack, "Id")
+        assert _output(stack, "AttId") == dep_id
+        assert apigw_v1.get_deployment(restApiId=api_a, deploymentId=dep_id)["description"] == "one"
+        stage = apigw_v1.get_stage(restApiId=api_a, stageName="alpha")
+        assert (stage["deploymentId"], stage["description"], stage["variables"]) == (
+            dep_id, "stage one", {"stage": "alpha"})
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("ApiA", "two", "beta", "stage two"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Id") == dep_id
+        assert apigw_v1.get_deployment(restApiId=api_a, deploymentId=dep_id)["description"] == "two"
+        assert len(apigw_v1.get_deployments(restApiId=api_a)["items"]) == 1
+        beta = apigw_v1.get_stage(restApiId=api_a, stageName="beta")
+        assert (beta["deploymentId"], beta["description"], beta["variables"]) == (
+            dep_id, "stage two", {"stage": "beta"})
+        assert apigw_v1.get_stage(restApiId=api_a, stageName="alpha")["deploymentId"] == dep_id
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("ApiB", "two", "beta", "stage two"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        new_id = _output(stack, "Id")
+        assert new_id != dep_id
+        assert apigw_v1.get_deployments(restApiId=api_a)["items"] == []
+        assert [d["id"] for d in apigw_v1.get_deployments(restApiId=api_b)["items"]] == [new_id]
+        assert apigw_v1.get_stage(restApiId=api_b, stageName="beta")["deploymentId"] == new_id
+
+        # DeploymentCanarySettings requires replacement on the reference: a
+        # new deployment id, the previous one removed by the engine.
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(
+            "ApiB", "two", "beta", "stage two", canary=10.0))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        canary_id = _output(stack, "Id")
+        assert canary_id != new_id
+        assert [d["id"] for d in apigw_v1.get_deployments(restApiId=api_b)["items"]] == [canary_id]
+        assert apigw_v1.get_stage(restApiId=api_b, stageName="beta")["deploymentId"] == canary_id
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_iot_thing_group_missing_parent_fails_and_unmodelled_properties_are_accepted(cfn, iot_client):
+    """A parent that does not exist fails the stack with the service's own
+    ResourceNotFoundException; QueryString (dynamic groups) and Tags, which
+    the service does not model, are accepted without effect."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-thing-group-edge-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({
+        "Resources": {"Group": {"Type": "AWS::IoT::ThingGroup", "Properties": {
+            "ThingGroupName": f"cfn-tg-orphan-{uid}", "ParentGroupName": f"cfn-tg-nowhere-{uid}"}}},
+    }))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert "ResourceNotFoundException" in _stack_event_reasons(cfn, stack_name)
+        with pytest.raises(ClientError):
+            iot_client.describe_thing_group(thingGroupName=f"cfn-tg-orphan-{uid}")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+    stack_name = f"cfn-thing-group-dyn-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({
+        "Resources": {"Group": {"Type": "AWS::IoT::ThingGroup", "Properties": {
+            "ThingGroupName": f"cfn-tg-dyn-{uid}",
+            "QueryString": "attributes.site:a",
+            "Tags": [{"Key": "owner", "Value": "fleet"}],
+            "ThingGroupProperties": {"ThingGroupDescription": "dynamic on AWS, static here"}}}},
+        "Outputs": {"Id": {"Value": {"Ref": "Group"}}},
+    }))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        group = iot_client.describe_thing_group(thingGroupName=f"cfn-tg-dyn-{uid}")
+        assert group["thingGroupId"] == _output(stack, "Id")
+        assert group["thingGroupProperties"]["thingGroupDescription"] == "dynamic on AWS, static here"
+def test_cfn_kms_alias_target_change_in_place_and_rename_replaces(cfn, kms_client):
+    """A TargetKeyId change re-points the alias under its name (Ref keeps its
+    value), an AliasName change replaces the alias — the new name exists, the
+    old one is gone — and an alias name without the alias/ prefix fails the
+    stack as the resource reference requires."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-kms-alias-{uid}"
+
+    def template(alias_name, key):
+        return json.dumps({
+            "Resources": {
+                "KeyA": {"Type": "AWS::KMS::Key", "Properties": {"Description": f"a-{uid}"}},
+                "KeyB": {"Type": "AWS::KMS::Key", "Properties": {"Description": f"b-{uid}"}},
+                "Alias": {"Type": "AWS::KMS::Alias", "Properties": {
+                    "AliasName": alias_name, "TargetKeyId": {"Ref": key}}},
+            },
+            "Outputs": {"Alias": {"Value": {"Ref": "Alias"}},
+                        "KeyA": {"Value": {"Ref": "KeyA"}}, "KeyB": {"Value": {"Ref": "KeyB"}}},
+        })
+
+    def alias_targets():
+        return {a["AliasName"]: a.get("TargetKeyId")
+                for a in kms_client.list_aliases()["Aliases"]}
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(f"alias/cfn-a-{uid}", "KeyA"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        key_a, key_b = _output(stack, "KeyA"), _output(stack, "KeyB")
+        assert _output(stack, "Alias") == f"alias/cfn-a-{uid}"
+        assert alias_targets()[f"alias/cfn-a-{uid}"] == key_a
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(f"alias/cfn-a-{uid}", "KeyB"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Alias") == f"alias/cfn-a-{uid}"
+        assert alias_targets()[f"alias/cfn-a-{uid}"] == key_b
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(f"alias/cfn-b-{uid}", "KeyB"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Alias") == f"alias/cfn-b-{uid}"
+        targets = alias_targets()
+        assert targets[f"alias/cfn-b-{uid}"] == key_b
+        assert f"alias/cfn-a-{uid}" not in targets
+
+        for bad_name in (f"cfn-c-{uid}", f"alias/aws/cfn-c-{uid}", f"alias/cfn c {uid}"):
+            cfn.update_stack(StackName=stack_name, TemplateBody=template(bad_name, "KeyB"))
+            stack = _wait_stack(cfn, stack_name)
+            assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+            assert "must begin with alias/" in _stack_event_reasons(cfn, stack_name)
+            assert alias_targets()[f"alias/cfn-b-{uid}"] == key_b
+            assert bad_name not in alias_targets()
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    assert f"alias/cfn-b-{uid}" not in alias_targets()
 def test_cfn_update_rollback_reports_the_previous_template_parameters_and_tags(cfn, sqs):
     """After UPDATE_ROLLBACK_COMPLETE the stack describes what it ran before
     the failed update: GetTemplate returns the previous template body,
