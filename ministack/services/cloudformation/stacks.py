@@ -104,6 +104,9 @@ def _resolve_stack_outputs(outputs_defs, conditions, resources, param_values,
             resources, param_values, conditions,
             mappings, stack_name, stack_id
         )
+        if isinstance(out_value, (bool, list, dict)):
+            raise ValueError("Template format error: The Value field of every "
+                             "Outputs member must evaluate to a String.")
         output = {
             "OutputKey": out_name,
             "OutputValue": str(out_value),

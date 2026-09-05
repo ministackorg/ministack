@@ -8,6 +8,8 @@ condition evaluation, intrinsic function resolution, and topological sorting.
 import base64
 import copy
 import heapq
+import ipaddress
+import itertools
 import json
 import logging
 import os
@@ -177,6 +179,7 @@ def validate_template_support(template: dict, conditions: dict) -> None:
             "Template format error: Unrecognized resource types: ["
             + ", ".join(sorted(unrecognized)) + "]"
         )
+    _validate_template_statics(template)
 
     refs: set[str] = set()
     _find_dynamic_references(template.get("Resources"), refs)
@@ -382,6 +385,70 @@ def _evaluate_conditions(template: dict, params: dict) -> dict:
 # Intrinsic Function Resolver
 # ===========================================================================
 
+def _cidr_blocks(ip_block: str, count: int, cidr_bits: int) -> list[str]:
+    """``Fn::Cidr``: ``count`` consecutive subnets of ``ip_block`` whose mask is
+    ``cidr_bits`` shorter than the address length (``cidrBits`` are subnet
+    bits: 8 on an IPv4 /16 gives /24 blocks — measured on AWS:
+    ``192.168.0.0/16, 2, 8`` is ``192.168.0.0/24,192.168.1.0/24``)."""
+    if not 1 <= count <= 256:
+        raise ValueError(
+            f"Template error: Fn::Cidr count must be between 1 and 256, got {count}")
+    try:
+        network = ipaddress.ip_network(ip_block, strict=False)
+    except ValueError:
+        raise ValueError(f"Template error: Fn::Cidr ipBlock {ip_block!r} is not a CIDR block") from None
+    new_prefix = network.max_prefixlen - cidr_bits
+    if not network.prefixlen < new_prefix <= network.max_prefixlen:
+        raise ValueError(
+            f"Template error: Fn::Cidr cannot split {ip_block} into /{new_prefix} blocks")
+    subnets = list(itertools.islice(network.subnets(new_prefix=new_prefix), count))
+    if len(subnets) < count:
+        raise ValueError(
+            f"Template error: Fn::Cidr {ip_block} holds only {len(subnets)} /{new_prefix} blocks, "
+            f"{count} requested")
+    return [str(subnet) for subnet in subnets]
+
+
+_CONDITION_FUNCTIONS = ("Fn::And", "Fn::Or", "Fn::Not", "Fn::Equals")
+
+
+def _validate_template_statics(template: dict) -> None:
+    """The template errors a real account raises before any stack exists and
+    that need nothing but the template: a condition function as an Output
+    value, and an Fn::FindInMap with literal keys that the Mappings section
+    does not hold (both measured)."""
+    for out in (template.get("Outputs") or {}).values():
+        val = out.get("Value") if isinstance(out, dict) else None
+        if isinstance(val, dict) and len(val) == 1 and next(iter(val)) in _CONDITION_FUNCTIONS:
+            raise ValueError("Template format error: The Value field of every "
+                             "Outputs member must evaluate to a String.")
+    mappings = template.get("Mappings") or {}
+
+    def walk(node):
+        if isinstance(node, dict):
+            if len(node) == 1 and "Fn::FindInMap" in node:
+                args = node["Fn::FindInMap"]
+                if (isinstance(args, list) and len(args) >= 3
+                        and all(isinstance(a, str) for a in args[:3])
+                        and not (len(args) > 3 and isinstance(args[3], dict)
+                                 and "DefaultValue" in args[3])):
+                    name, k1, k2 = args[:3]
+                    if k1 not in mappings.get(name, {}) or k2 not in mappings.get(name, {}).get(k1, {}):
+                        raise ValueError(
+                            f"Template error: Unable to get mapping for {name}::{k1}::{k2}")
+                for arg in args if isinstance(args, list) else []:
+                    walk(arg)
+                return
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    for section in ("Resources", "Outputs", "Conditions"):
+        walk(template.get(section) or {})
+
+
 def _unknown_attribute_message(res: dict, logical_id: str, attr: str) -> str:
     # Verbatim what CloudFormation reports in the stack event that starts the
     # rollback (measured on a real account against AWS::SQS::Queue).
@@ -562,7 +629,17 @@ def _resolve_refs(value, resources, params, conditions, mappings,
                              mappings, stack_name, stack_id)
         key2 = _resolve_refs(args[2], resources, params, conditions,
                              mappings, stack_name, stack_id)
-        return mappings.get(str(map_name), {}).get(str(key1), {}).get(str(key2), "")
+        top = mappings.get(str(map_name), {})
+        if str(key1) in top and str(key2) in top[str(key1)]:
+            return top[str(key1)][str(key2)]
+        # The optional fourth argument is {"DefaultValue": ...}; without it a
+        # missing key is a template error, as on AWS (measured: "Template
+        # error: Unable to get mapping for M::x::y").
+        if len(args) > 3 and isinstance(args[3], dict) and "DefaultValue" in args[3]:
+            return _resolve_refs(args[3]["DefaultValue"], resources, params,
+                                 conditions, mappings, stack_name, stack_id)
+        raise ValueError(
+            f"Template error: Unable to get mapping for {map_name}::{key1}::{key2}")
 
     # --- Fn::ImportValue ---
     if "Fn::ImportValue" in value:
@@ -608,6 +685,11 @@ def _resolve_refs(value, resources, params, conditions, mappings,
                                conditions, mappings, stack_name, stack_id)
         if not region:
             region = get_region()
+        # The zones the emulator's EC2 DescribeAvailabilityZones reports for
+        # the stack's region. For any other region a real account answered an
+        # empty list (measured), not a fabricated a/b/c.
+        if str(region) != get_region():
+            return []
         return [f"{region}a", f"{region}b", f"{region}c"]
 
     # --- Fn::Cidr ---
@@ -619,8 +701,7 @@ def _resolve_refs(value, resources, params, conditions, mappings,
                                   mappings, stack_name, stack_id))
         cidr_bits = int(_resolve_refs(args[2], resources, params, conditions,
                                       mappings, stack_name, stack_id))
-        # Simplified CIDR generation
-        return [f"10.0.{i}.0/{32 - cidr_bits}" for i in range(count)]
+        return _cidr_blocks(str(ip_block), count, cidr_bits)
 
     # --- Fn::Equals (condition-like in non-condition context) ---
     if "Fn::Equals" in value:
@@ -630,6 +711,23 @@ def _resolve_refs(value, resources, params, conditions, mappings,
         right = _resolve_refs(args[1], resources, params, conditions,
                               mappings, stack_name, stack_id)
         return str(left) == str(right)
+    for fn in ("Fn::And", "Fn::Or", "Fn::Not"):
+        if fn in value:
+            # Condition functions belong in Conditions and Fn::If. In a value
+            # position they evaluate to a boolean here, like Fn::Equals above,
+            # instead of leaking the unresolved call through to the service.
+            # What AWS does with one in a property was not measured; as an
+            # Output value it is refused up front (see _validate_template_statics).
+            operands = [
+                _resolve_refs(arg, resources, params, conditions, mappings,
+                              stack_name, stack_id)
+                for arg in value[fn]
+            ]
+            if fn == "Fn::And":
+                return all(bool(o) for o in operands)
+            if fn == "Fn::Or":
+                return any(bool(o) for o in operands)
+            return not bool(operands[0]) if operands else True
 
     # --- Condition (reference) ---
     if "Condition" in value and len(value) == 1:

@@ -1717,6 +1717,92 @@ def test_cfn_fn_sub_literal_escape(cfn, ssm):
                    "and ${Plain} in us-east-1")
 
 
+def test_cfn_intrinsics_cidr_getazs_findinmap_and_condition_functions(cfn, ssm):
+    """Fn::Cidr splits the block it is given (measured: 192.168.0.0/16, 2, 8 is
+    192.168.0.0/24,192.168.1.0/24), Fn::GetAZs answers the stack's zones for
+    its own region and an empty list for another (measured), Fn::FindInMap
+    takes a DefaultValue and a missing key without one is a template error
+    (measured), a condition function as an Output value is refused up front
+    (measured) and in a property position evaluates to a boolean."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-intrinsics-{uid}"
+    region = cfn.meta.region_name
+    template = json.dumps({
+        "Mappings": {"M": {"a": {"b": "ok"}}},
+        "Resources": {
+            "P": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": f"/cfn-intrinsics/{uid}", "Type": "String",
+                "Value": {"Fn::Join": [",", {"Fn::Cidr": ["192.168.0.0/16", "2", "8"]}]}}},
+            "Bools": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": f"/cfn-intrinsics/{uid}/bools", "Type": "String",
+                "Value": {"Fn::Join": [",", [
+                    {"Fn::Not": [{"Fn::Equals": ["a", "b"]}]},
+                    {"Fn::Or": [{"Fn::Equals": ["a", "b"]}, {"Fn::Equals": ["b", "b"]}]},
+                    {"Fn::And": [{"Fn::Equals": ["a", "a"]}, {"Fn::Equals": ["a", "b"]}]}]]}}},
+        },
+        "Outputs": {
+            "Cidr": {"Value": {"Fn::Join": [",", {"Fn::Cidr": ["10.0.0.0/24", 6, 5]}]}},
+            "OwnAzs": {"Value": {"Fn::Join": [",", {"Fn::GetAZs": ""}]}},
+            "RefAzs": {"Value": {"Fn::Join": [",", {"Fn::GetAZs": {"Ref": "AWS::Region"}}]}},
+            "OtherAzs": {"Value": {"Fn::Join": [",", {"Fn::GetAZs": "eu-north-1"}]}},
+            "Map": {"Value": {"Fn::FindInMap": ["M", "a", "b"]}},
+            "MapDefault": {"Value": {"Fn::FindInMap": ["M", "x", "y", {"DefaultValue": "dflt"}]}},
+            "AndInIf": {"Value": {"Fn::If": ["Yes", "yes", "no"]}},
+        },
+        "Conditions": {"Yes": {"Fn::And": [{"Fn::Equals": ["a", "a"]}, {"Fn::Not": [{"Fn::Equals": ["a", "b"]}]}]}},
+    })
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+        assert outputs["Cidr"] == ",".join(f"10.0.0.{32 * i}/27" for i in range(6))
+        assert outputs["OwnAzs"] == f"{region}a,{region}b,{region}c"
+        assert outputs["RefAzs"] == outputs["OwnAzs"]
+        assert outputs["OtherAzs"] == ""
+        assert outputs["Map"] == "ok"
+        assert outputs["MapDefault"] == "dflt"
+        assert outputs["AndInIf"] == "yes"
+        assert ssm.get_parameter(Name=f"/cfn-intrinsics/{uid}")["Parameter"]["Value"] == (
+            "192.168.0.0/24,192.168.1.0/24")
+        # In a property position the condition functions evaluate to booleans
+        # (joined as their string form), never to the Python repr of the call.
+        assert ssm.get_parameter(Name=f"/cfn-intrinsics/{uid}/bools")["Parameter"]["Value"] == (
+            "True,True,False")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+    # An impossible Fn::Cidr fails the resource with the reason.
+    bad_cidr = f"cfn-intrinsics-cidr-{uid}"
+    cfn.create_stack(StackName=bad_cidr, TemplateBody=json.dumps({"Resources": {
+        "P": {"Type": "AWS::SSM::Parameter", "Properties": {
+            "Name": f"/cfn-intrinsics/{uid}/cidr", "Type": "String",
+            "Value": {"Fn::Select": [0, {"Fn::Cidr": ["10.0.0.0/24", 300, 8]}]}}}}}))
+    try:
+        stack = _wait_stack(cfn, bad_cidr)
+        assert stack["StackStatus"] == "ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert "Fn::Cidr count must be between 1 and 256" in _stack_event_reasons(cfn, bad_cidr)
+    finally:
+        _delete_cfn_test_stack(cfn, bad_cidr)
+
+    def refused(body, message):
+        name = f"cfn-intrinsics-bad-{_uuid_mod.uuid4().hex[:6]}"
+        with pytest.raises(ClientError) as exc:
+            cfn.create_stack(StackName=name, TemplateBody=json.dumps(body))
+        assert exc.value.response["Error"]["Code"] == "ValidationError"
+        assert exc.value.response["Error"]["Message"] == message
+        with pytest.raises(ClientError):
+            cfn.describe_stacks(StackName=name)
+
+    queue = {"Resources": {"Q": {"Type": "AWS::SQS::Queue"}}}
+    refused({**queue, "Mappings": {"M": {"a": {"b": "ok"}}},
+             "Outputs": {"Map": {"Value": {"Fn::FindInMap": ["M", "x", "y"]}}}},
+            "Template error: Unable to get mapping for M::x::y")
+    refused({**queue, "Outputs": {"And": {"Value": {"Fn::And": [
+                {"Fn::Equals": ["a", "a"]}, {"Fn::Equals": ["a", "b"]}]}}}},
+            "Template format error: The Value field of every Outputs member must evaluate to a String.")
+
+
 def test_cfn_multi_resource_dependencies(cfn, iam, lam):
     template = {
         "AWSTemplateFormatVersion": "2010-09-09",

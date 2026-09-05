@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **CloudFormation — `Fn::Cidr`, `Fn::GetAZs`, `Fn::FindInMap` and the condition functions follow AWS** — `Fn::Cidr` answered `10.0.{i}.0/…` whatever block it was given (now the block is split: `192.168.0.0/16, 2, 8` is `192.168.0.0/24,192.168.1.0/24`, measured; IPv6 included), `Fn::GetAZs` answered a fabricated `a/b/c` for any region (now the stack's own zones, and an empty list for another region, measured), `Fn::FindInMap` answered `""` for a missing key and had no `DefaultValue` (now the default when given, otherwise `Template error: Unable to get mapping for M::x::y` before the stack exists, measured), and `Fn::And`/`Fn::Or`/`Fn::Not` in a value position leaked the unresolved call (now a boolean; as an Output value they are refused with `The Value field of every Outputs member must evaluate to a String.`, measured). Contributed by @iot-rocket.
+
 ## [1.5.8] — 2026-09-05
 
 ### Added
