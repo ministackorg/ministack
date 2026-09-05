@@ -372,6 +372,15 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 stack["_resources"] = previous_stack.get("_resources", {})
                 stack["_template"] = previous_stack.get("_template", {})
                 stack["_resolved_params"] = previous_stack.get("_resolved_params", {})
+                # What the API reports has to follow: GetTemplate serves
+                # _template_body and DescribeStacks the Parameters and Tags,
+                # and a rolled-back stack reports what it ran before the
+                # update, not what failed.
+                stack["_template_body"] = previous_stack.get(
+                    "_template_body", stack.get("_template_body", ""))
+                stack["Parameters"] = previous_stack.get(
+                    "Parameters", stack.get("Parameters", []))
+                stack["Tags"] = previous_stack.get("Tags", stack.get("Tags", []))
                 stack["Outputs"] = previous_stack.get("Outputs", [])
                 stack["StackStatus"] = "UPDATE_ROLLBACK_COMPLETE"
             else:
