@@ -20,6 +20,7 @@ from .changesets import (
 from .engine import (
     _apply_sam_transform_if_applicable,
     _evaluate_conditions,
+    _has_dynamic_references,
     _parse_template,
     _resolve_parameters,
     _resolve_refs,
@@ -528,15 +529,18 @@ def _delete_stack(params):
 
 # --- UpdateStack ---
 
-def _stack_has_no_updates(stack, template, param_values, tags):
+def _stack_has_no_updates(stack, template, param_values, tags,
+                          use_previous_template=False):
     """True when an UpdateStack would change nothing: the template equals the
     one the stack runs, every parameter resolves to its current value, and the
     request either carries no tags or the tags the stack already has. Real
     CloudFormation refuses such a request with ``No updates are to be
-    performed.`` instead of running an empty update (a template with a
-    dynamic reference is the documented exception, and the emulator refuses
-    dynamic references up front)."""
+    performed.`` instead of running an empty update. A template body that
+    carries a dynamic reference is the exception: the update is accepted
+    (with ``UsePreviousTemplate`` it is still refused) — measured on AWS."""
     if template != stack.get("_template", {}):
+        return False
+    if not use_previous_template and _has_dynamic_references(template):
         return False
     current = {k: v.get("Value") for k, v in stack.get("_resolved_params", {}).items()}
     if {k: v.get("Value") for k, v in param_values.items()} != current:
@@ -575,10 +579,12 @@ def _update_stack(params):
     template_body, resolve_err = _resolve_template(params)
     if resolve_err:
         return resolve_err
+    use_previous_template = False
     if not template_body:
         # Use previous template if UsePreviousTemplate
         if _p(params, "UsePreviousTemplate", "false").lower() == "true":
             template_body = stack.get("_template_body", "{}")
+            use_previous_template = True
         else:
             return _error("ValidationError", "TemplateBody or TemplateURL is required")
 
@@ -603,7 +609,8 @@ def _update_stack(params):
     except ValueError as exc:
         return _error("ValidationError", str(exc))
 
-    if _stack_has_no_updates(stack, template, param_values, tags):
+    if _stack_has_no_updates(stack, template, param_values, tags,
+                             use_previous_template):
         return _error("ValidationError", "No updates are to be performed.")
 
     # Save previous state for rollback

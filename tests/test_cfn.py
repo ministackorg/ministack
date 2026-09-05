@@ -1507,6 +1507,156 @@ def test_cfn_ssm_parameter_value_type_missing_parameter_fails_stack(cfn):
     assert exc_info.value.response["Error"]["Code"] == "ValidationError"
 
 
+def _ssm_value(ssm, name):
+    return ssm.get_parameter(Name=name, WithDecryption=True)["Parameter"]["Value"]
+
+
+def test_cfn_dynamic_references_resolve_and_follow_the_update_rules(cfn, ssm, sm):
+    """{{resolve:ssm}}, {{resolve:ssm-secure}} and {{resolve:secretsmanager}}
+    resolve at provisioning time; GetTemplate keeps the literal. On update an
+    identical template is accepted but changes nothing, UsePreviousTemplate is
+    refused, a changed template re-resolves the ssm references (a pinned
+    version stays), and a secretsmanager reference re-resolves only when its
+    resource changes (measured on AWS)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-dynref-{uid}"
+    src, secure, secret, json_secret = (
+        f"/cfn-dynref/{uid}/in", f"/cfn-dynref/{uid}/secure",
+        f"cfn-dynref-{uid}-plain", f"cfn-dynref-{uid}-json")
+    ssm.put_parameter(Name=src, Value="v1", Type="String")
+    ssm.put_parameter(Name=secure, Value="hush", Type="SecureString")
+    sm.create_secret(Name=secret, SecretString="s1")
+    sm.create_secret(Name=json_secret, SecretString=json.dumps({"password": "p1"}))
+    outs = {k: f"/cfn-dynref/{uid}/out-{k}" for k in ("ssm", "pinned", "secure", "secret", "key")}
+
+    def param(name, value, description=None):
+        props = {"Name": name, "Type": "String", "Value": value}
+        if description:
+            props["Description"] = description
+        return {"Type": "AWS::SSM::Parameter", "Properties": props}
+
+    def template(description="one", secret_description=None):
+        return json.dumps({"Description": description, "Resources": {
+            "FromSsm": param(outs["ssm"], f"{{{{resolve:ssm:{src}}}}}"),
+            "Pinned": param(outs["pinned"], f"{{{{resolve:ssm:{src}:1}}}}"),
+            "Secure": param(outs["secure"], f"{{{{resolve:ssm-secure:{secure}}}}}"),
+            "FromSecret": param(outs["secret"], f"prefix-{{{{resolve:secretsmanager:{secret}}}}}",
+                                secret_description),
+            "FromKey": param(outs["key"],
+                             f"{{{{resolve:secretsmanager:{json_secret}:SecretString:password}}}}"),
+        }})
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template())
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert _ssm_value(ssm, outs["ssm"]) == "v1"
+        assert _ssm_value(ssm, outs["pinned"]) == "v1"
+        assert _ssm_value(ssm, outs["secure"]) == "hush"
+        assert _ssm_value(ssm, outs["secret"]) == "prefix-s1"
+        assert _ssm_value(ssm, outs["key"]) == "p1"
+        body = cfn.get_template(StackName=stack_name)["TemplateBody"]
+        body = json.dumps(body) if not isinstance(body, str) else body
+        assert f"{{{{resolve:ssm:{src}}}}}" in body
+
+        ssm.put_parameter(Name=src, Value="v2", Type="String", Overwrite=True)
+        sm.put_secret_value(SecretId=secret, SecretString="s2")
+
+        # identical template: accepted, nothing re-resolved
+        cfn.update_stack(StackName=stack_name, TemplateBody=template())
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _ssm_value(ssm, outs["ssm"]) == "v1"
+        assert _ssm_value(ssm, outs["secret"]) == "prefix-s1"
+
+        with pytest.raises(ClientError) as exc:
+            cfn.update_stack(StackName=stack_name, UsePreviousTemplate=True)
+        assert "No updates are to be performed" in exc.value.response["Error"]["Message"]
+
+        # a changed template: ssm re-resolves, the pinned version and the secret stay
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(description="two"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _ssm_value(ssm, outs["ssm"]) == "v2"
+        assert _ssm_value(ssm, outs["pinned"]) == "v1"
+        assert _ssm_value(ssm, outs["secret"]) == "prefix-s1"
+
+        # the resource carrying the secret changes: the secret re-resolves
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=template(description="two", secret_description="touched"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _ssm_value(ssm, outs["secret"]) == "prefix-s2"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for name in (src, secure):
+            try:
+                ssm.delete_parameter(Name=name)
+            except ClientError:
+                pass
+        for name in (secret, json_secret):
+            try:
+                sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+            except ClientError:
+                pass
+
+
+def test_cfn_secretsmanager_reference_by_arn_version_id_and_json_number(cfn, ssm, sm):
+    """The secret id may be an ARN (its colons do not split the segments), a
+    version-stage or a version-id selects an older version, and a JSON key
+    whose value is not a string comes back as its JSON text."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-dynref-arn-{uid}"
+    secret = f"cfn-dynref-arn-{uid}"
+    created = sm.create_secret(Name=secret, SecretString=json.dumps({"port": 5432, "host": "old"}))
+    arn, first_version = created["ARN"], created["VersionId"]
+    sm.put_secret_value(SecretId=secret, SecretString=json.dumps({"port": 5433, "host": "new"}))
+    outs = {k: f"/cfn-dynref-arn/{uid}/{k}" for k in ("arn", "previous", "version")}
+
+    def param(name, value):
+        return {"Type": "AWS::SSM::Parameter",
+                "Properties": {"Name": name, "Type": "String", "Value": value}}
+
+    template = json.dumps({"Resources": {
+        "ByArn": param(outs["arn"], f"{{{{resolve:secretsmanager:{arn}:SecretString:port}}}}"),
+        "Previous": param(outs["previous"],
+                          f"{{{{resolve:secretsmanager:{secret}:SecretString:host:AWSPREVIOUS}}}}"),
+        "ByVersion": param(outs["version"],
+                           f"{{{{resolve:secretsmanager:{secret}:SecretString:host::{first_version}}}}}"),
+    }})
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert _ssm_value(ssm, outs["arn"]) == "5433"
+        assert _ssm_value(ssm, outs["previous"]) == "old"
+        assert _ssm_value(ssm, outs["version"]) == "old"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            sm.delete_secret(SecretId=secret, ForceDeleteWithoutRecovery=True)
+        except ClientError:
+            pass
+
+
+def test_cfn_dynamic_reference_that_cannot_resolve_fails_the_resource(cfn, ssm):
+    """A reference to a missing parameter fails the resource and rolls the
+    stack back with the reason."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-dynref-bad-{uid}"
+    template = json.dumps({"Resources": {"P": {
+        "Type": "AWS::SSM::Parameter",
+        "Properties": {"Name": f"/cfn-dynref-bad/{uid}", "Type": "String",
+                       "Value": f"{{{{resolve:ssm:/cfn-dynref-bad/{uid}/missing}}}}"}}}})
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert f"/cfn-dynref-bad/{uid}/missing" in _stack_event_reasons(cfn, stack_name)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_change_set_use_previous_value_updates_resource(cfn, ssm):
     """A change set created with UsePreviousValue (the `aws cloudformation deploy`
     no-`--parameter-overrides` path) must resolve the parameter to its stored
@@ -11403,20 +11553,23 @@ def test_cfn_getatt_unknown_attribute_in_properties_fails_the_resource(cfn, sqs)
         _wait_stack(cfn, name)
 
 
-def test_cfn_dynamic_reference_rejected(cfn):
-    """{{resolve:...}} is not resolved by the emulator; refusing it up front
-    beats handing the literal string to the service."""
+def test_cfn_dynamic_reference_to_an_unsupported_service_is_rejected(cfn):
+    """{{resolve:ssm}}, {{resolve:ssm-secure}} and {{resolve:secretsmanager}}
+    resolve at provisioning time; a reference to any other service is refused
+    up front, before a stack record exists."""
     tpl = json.dumps({"Resources": {"P": {
         "Type": "AWS::SSM::Parameter",
         "Properties": {"Type": "String", "Name": "/cfn-preflight/dyn",
-                       "Value": "{{resolve:secretsmanager:my-secret:SecretString:key}}"}}}})
+                       "Value": "{{resolve:vault:my-secret:key}}"}}}})
     with pytest.raises(ClientError) as exc:
         cfn.create_stack(StackName="cfn-preflight-dyn", TemplateBody=tpl)
     msg = exc.value.response["Error"]["Message"]
-    assert msg.startswith("Template format error: dynamic references are not supported")
-    assert "{{resolve:secretsmanager:my-secret:SecretString:key}}" in msg
+    assert msg.startswith("Template format error: unsupported dynamic reference")
+    assert "{{resolve:vault:my-secret:key}}" in msg
     with pytest.raises(ClientError):
         cfn.describe_stacks(StackName="cfn-preflight-dyn")
+
+
 def test_cfn_events_rule_arn_matches_the_service(cfn, eb):
     """GetAtt Arn on a rule is the ARN the EventBridge service reports for
     it: no bus segment on the default bus, rule/<bus>/<name> on a custom

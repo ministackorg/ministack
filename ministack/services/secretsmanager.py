@@ -162,17 +162,22 @@ def _find_stage_version(secret, stage):
     return None, None
 
 
-def resolve_secret_string(secret_id, version_stage="AWSCURRENT"):
-    """Return the SecretString for *secret_id* at *version_stage*, or None.
+def resolve_secret_string(secret_id, version_stage="AWSCURRENT", version_id=None):
+    """Return the SecretString for *secret_id* at *version_stage* (or the
+    version *version_id*), or None.
 
-    Used by other services (e.g. ECS) that need to read a secret value
-    in-process without going through the HTTP API. Returns None if the secret
-    does not exist, is scheduled for deletion, or has no value for the stage.
+    Used by other services (e.g. ECS, CloudFormation dynamic references) that
+    need to read a secret value in-process without going through the HTTP API.
+    Returns None if the secret does not exist, is scheduled for deletion, or
+    has no value for the stage / version.
     """
     _, secret = _resolve(secret_id, use_arn_scope=True)
     if not secret or secret.get("DeletedDate"):
         return None
-    _, ver = _find_stage_version(secret, version_stage)
+    if version_id:
+        ver = secret["Versions"].get(version_id)
+    else:
+        _, ver = _find_stage_version(secret, version_stage)
     if not ver:
         return None
     return ver.get("SecretString")

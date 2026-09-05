@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **CloudFormation — dynamic references resolve** — `{{resolve:ssm:...}}`, `{{resolve:ssm-secure:...}}` and `{{resolve:secretsmanager:...}}` were refused up front (before that, the literal reached the service). They now resolve at provisioning time against the in-process stores — a parameter by name and optional version, a secret by name or ARN with the optional `SecretString`, JSON key, version stage or version id segments — and `GetTemplate` keeps the literal. On update the two kinds follow what a real account does: an `ssm` reference re-resolves when the stack is updated with a changed template or parameters (an identical template is accepted and changes nothing; `UsePreviousTemplate` is still refused with "No updates are to be performed."), a `secretsmanager` reference only when the resource that carries it changes. A reference that cannot be resolved fails the resource; a reference to any other service is refused before a stack exists. Contributed by @iot-rocket.
+
 ## [1.5.8] — 2026-09-05
 
 ### Added

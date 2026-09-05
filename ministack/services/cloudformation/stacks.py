@@ -15,6 +15,7 @@ from ministack.core.responses import get_region, new_uuid, now_iso, set_request_
 from .engine import (
     _NO_VALUE,
     _evaluate_conditions,
+    _resolve_dynamic_references,
     _resolve_refs,
     _topological_sort,
 )
@@ -186,6 +187,30 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 resolved_props = {
                     k: v for k, v in resolved_props.items() if v is not _NO_VALUE
                 }
+            # Dynamic references, after the intrinsics: an `ssm` reference
+            # re-resolves on an update that changed the template or its
+            # parameters (an identical update keeps what the stack has), a
+            # `secretsmanager` reference only when this resource's definition
+            # changed. The per-resource map of resolved values is what the
+            # next update reuses. (measured on AWS 2026-09-02)
+            prev_for_dynamic = (
+                previous_stack.get("_resources", {}).get(logical_id)
+                if is_update and previous_stack else None
+            )
+            stack_unchanged = bool(
+                is_update and previous_stack
+                and template == previous_stack.get("_template")
+                and param_values == previous_stack.get("_resolved_params"))
+            resource_unchanged = bool(
+                prev_for_dynamic is not None and previous_stack
+                and (previous_stack.get("_template", {}).get("Resources", {})
+                     .get(logical_id) == res_def))
+            resolved_props, dynamic_values = _resolve_dynamic_references(
+                resolved_props,
+                (prev_for_dynamic or {}).get("_dynamic"),
+                reuse_ssm=stack_unchanged,
+                reuse_secrets=resource_unchanged,
+            )
 
             _add_event(stack_id, stack_name, logical_id, resource_type,
                        f"{status_prefix}_IN_PROGRESS")
@@ -245,6 +270,8 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
             "Attributes": attrs,
             "Timestamp": now_iso(),
         }
+        if dynamic_values:
+            provisioned_resources[logical_id]["_dynamic"] = dynamic_values
         created_in_this_run.append(logical_id)
 
         _add_event(stack_id, stack_name, logical_id, resource_type,
