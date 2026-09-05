@@ -1350,6 +1350,77 @@ def test_cfn_change_set_no_changes_is_failed(cfn, ssm):
         cfn.delete_stack(StackName=S)
 
 
+def test_cfn_change_set_sees_policy_and_metadata_changes(cfn, sqs):
+    """A change set lists a resource whose DeletionPolicy, UpdateReplacePolicy
+    or Metadata changed and nothing else: Modify, Replacement False, the
+    attribute in Scope and Details, and the executed set stores the new
+    template. A DependsOn-only edit is not a change, as on AWS."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cs-attrs-{uid}"
+
+    def template(policy=None, depends=False, metadata=None, queue_name=None):
+        queue = {"Type": "AWS::SQS::Queue",
+                 "Properties": {"QueueName": queue_name or f"cfn-cs-attrs-{uid}"}}
+        if policy:
+            queue["DeletionPolicy"] = policy
+            queue["UpdateReplacePolicy"] = policy
+        if metadata:
+            queue["Metadata"] = metadata
+        param = {"Type": "AWS::SSM::Parameter",
+                 "Properties": {"Name": f"/cfn-cs-attrs/{uid}", "Type": "String",
+                                "Value": "v"}}
+        if depends:
+            param["DependsOn"] = "Queue"
+        return json.dumps({"Resources": {"Queue": queue, "Param": param}})
+
+    def changes_of(name, body):
+        cfn.create_change_set(StackName=stack_name, ChangeSetName=name,
+                              ChangeSetType="UPDATE", TemplateBody=body)
+        return cfn.describe_change_set(ChangeSetName=name, StackName=stack_name)
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template())
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        described = changes_of("depends-only", template(depends=True))
+        assert described["Status"] == "FAILED"
+        assert "didn't contain changes" in described["StatusReason"]
+
+        described = changes_of("retain", template(policy="Retain", depends=True))
+        assert described["Status"] == "CREATE_COMPLETE", described.get("StatusReason")
+        assert described["ExecutionStatus"] == "AVAILABLE"
+        assert [c["ResourceChange"]["LogicalResourceId"] for c in described["Changes"]] == ["Queue"]
+        change = described["Changes"][0]["ResourceChange"]
+        assert change["Action"] == "Modify"
+        assert change["Replacement"] == "False"
+        assert sorted(change["Scope"]) == ["DeletionPolicy", "UpdateReplacePolicy"]
+        assert sorted(d["Target"]["Attribute"] for d in change["Details"]) == [
+            "DeletionPolicy", "UpdateReplacePolicy"]
+
+        cfn.execute_change_set(ChangeSetName="retain", StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        body = cfn.get_template(StackName=stack_name)["TemplateBody"]
+        stored = json.loads(body) if isinstance(body, str) else body
+        assert stored["Resources"]["Queue"]["DeletionPolicy"] == "Retain"
+
+        described = changes_of("metadata", template(policy="Retain", depends=True,
+                                                    metadata={"owner": "fleet"}))
+        change = described["Changes"][0]["ResourceChange"]
+        assert change["Replacement"] == "False"
+        assert change["Scope"] == ["Metadata"]
+
+        described = changes_of("rename", template(policy="Retain", depends=True,
+                                                  queue_name=f"cfn-cs-attrs-{uid}-b"))
+        change = described["Changes"][0]["ResourceChange"]
+        assert change["Scope"] == ["Properties"]
+        assert [d["Target"]["Name"] for d in change["Details"]] == ["QueueName"]
+        assert change["Details"][0]["Target"]["RequiresRecreation"] == "Conditionally"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_execute_change_set_deletes_sibling_change_sets(cfn, ssm):
     """Executing a change set deletes the stack's other change sets — they are
     no longer valid for the updated stack (#1418)."""
@@ -14306,6 +14377,278 @@ def test_cfn_update_rollback_deletes_the_replacement_and_restores_the_old_record
         assert table["AttributeDefinitions"] == [{"AttributeName": "pk", "AttributeType": "S"}]
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
+def _queue_exists(sqs, name):
+    try:
+        sqs.get_queue_url(QueueName=name)
+        return True
+    except ClientError as exc:
+        assert "NonExistentQueue" in exc.response["Error"]["Code"], exc.response["Error"]
+        return False
+
+
+def _delete_queue_if_present(sqs, name):
+    try:
+        sqs.delete_queue(QueueUrl=sqs.get_queue_url(QueueName=name)["QueueUrl"])
+    except ClientError:
+        pass
+
+
+def _resource_events(cfn, stack_name, logical_id):
+    return [(e["ResourceStatus"], e.get("PhysicalResourceId", ""))
+            for e in cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+            if e["LogicalResourceId"] == logical_id]
+
+
+def test_cfn_deletion_policy_retain_survives_the_stack_delete(cfn, sqs):
+    """DeletionPolicy Retain keeps the resource when the stack is deleted: the
+    queue survives with a DELETE_SKIPPED event, its sibling is deleted, the
+    stack still reaches DELETE_COMPLETE."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-retain-del-{uid}"
+    keep, gone = f"cfn-retain-keep-{uid}", f"cfn-retain-gone-{uid}"
+    template = json.dumps({"Resources": {
+        "Keep": {"Type": "AWS::SQS::Queue", "DeletionPolicy": "Retain",
+                 "Properties": {"QueueName": keep}},
+        "Gone": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": gone}},
+    }})
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        stack_id = stack["StackId"]
+
+        cfn.delete_stack(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "DELETE_COMPLETE"
+        assert _queue_exists(sqs, keep)
+        assert not _queue_exists(sqs, gone)
+        events = _resource_events(cfn, stack_id, "Keep")
+        assert ("DELETE_SKIPPED", sqs.get_queue_url(QueueName=keep)["QueueUrl"]) in events
+        assert "DELETE_IN_PROGRESS" not in [status for status, _ in events]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        _delete_queue_if_present(sqs, keep)
+        _delete_queue_if_present(sqs, gone)
+
+
+def test_cfn_update_replace_policy_retain_keeps_the_predecessor(cfn, sqs):
+    """A replacement under UpdateReplacePolicy Retain leaves the old physical
+    resource in place (DELETE_SKIPPED); without the policy the predecessor is
+    deleted in the cleanup phase."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-retain-repl-{uid}"
+    names = [f"cfn-retain-repl-{uid}-{i}" for i in ("a", "b", "c")]
+
+    def template(name, policy):
+        queue = {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": name}}
+        if policy:
+            queue["UpdateReplacePolicy"] = policy
+        return json.dumps({"Resources": {"Queue": queue}})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(names[0], "Retain"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(names[1], "Retain"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _queue_exists(sqs, names[0])
+        assert _queue_exists(sqs, names[1])
+        assert "DELETE_SKIPPED" in [s for s, _ in _resource_events(cfn, stack_name, "Queue")]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(names[2], None))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert not _queue_exists(sqs, names[1])
+        assert _queue_exists(sqs, names[2])
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for name in names:
+            _delete_queue_if_present(sqs, name)
+
+
+def test_cfn_deletion_policy_retain_on_a_removed_resource(cfn, sqs):
+    """A resource dropped from the template on update keeps existing when its
+    (previous) DeletionPolicy was Retain; it leaves the stack's scope."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-retain-rm-{uid}"
+    keep, other = f"cfn-retain-rm-keep-{uid}", f"cfn-retain-rm-other-{uid}"
+    with_keep = json.dumps({"Resources": {
+        "Keep": {"Type": "AWS::SQS::Queue", "DeletionPolicy": "Retain",
+                 "Properties": {"QueueName": keep}},
+        "Other": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": other}},
+    }})
+    without = json.dumps({"Resources": {
+        "Other": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": other}},
+    }})
+    cfn.create_stack(StackName=stack_name, TemplateBody=with_keep)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        cfn.update_stack(StackName=stack_name, TemplateBody=without)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _queue_exists(sqs, keep)
+        assert [r["LogicalResourceId"] for r in
+                cfn.describe_stack_resources(StackName=stack_name)["StackResources"]] == ["Other"]
+        assert "DELETE_SKIPPED" in [s for s, _ in _resource_events(cfn, stack_name, "Keep")]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        _delete_queue_if_present(sqs, keep)
+
+
+def test_cfn_retain_except_on_create_is_deleted_by_the_create_rollback(cfn, sqs):
+    """Retain survives the rollback of the operation that created the resource;
+    RetainExceptOnCreate does not, and neither does Retain when the request
+    carries RetainExceptOnCreate=true."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    retained, except_on_create, flagged = (
+        f"cfn-reoc-retain-{uid}", f"cfn-reoc-except-{uid}", f"cfn-reoc-flag-{uid}")
+
+    def template(name, policy):
+        return json.dumps({"Resources": {
+            "Queue": {"Type": "AWS::SQS::Queue", "DeletionPolicy": policy,
+                      "Properties": {"QueueName": name}},
+            "Bad": {**_FAILING_RESOURCE, "DependsOn": "Queue"},
+        }})
+
+    stacks = [f"cfn-reoc-a-{uid}", f"cfn-reoc-b-{uid}", f"cfn-reoc-c-{uid}"]
+    try:
+        cfn.create_stack(StackName=stacks[0], TemplateBody=template(retained, "Retain"))
+        cfn.create_stack(StackName=stacks[1],
+                         TemplateBody=template(except_on_create, "RetainExceptOnCreate"))
+        cfn.create_stack(StackName=stacks[2], TemplateBody=template(flagged, "Retain"),
+                         RetainExceptOnCreate=True)
+        for name in stacks:
+            stack = _wait_stack(cfn, name)
+            assert stack["StackStatus"] == "ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert _queue_exists(sqs, retained)
+        assert "DELETE_SKIPPED" in [s for s, _ in _resource_events(cfn, stacks[0], "Queue")]
+        assert not _queue_exists(sqs, except_on_create)
+        assert not _queue_exists(sqs, flagged)
+    finally:
+        for name in stacks:
+            _delete_cfn_test_stack(cfn, name)
+        for name in (retained, except_on_create, flagged):
+            _delete_queue_if_present(sqs, name)
+
+
+def test_cfn_retain_except_on_create_on_an_update_rollback(cfn, sqs):
+    """A resource that an update adds is "created" by that update: on the
+    update's rollback RetainExceptOnCreate deletes it, Retain keeps it."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-reoc-upd-{uid}"
+    base_name, kept, dropped = (f"cfn-reoc-upd-{uid}", f"cfn-reoc-upd-keep-{uid}",
+                                f"cfn-reoc-upd-drop-{uid}")
+    base = {"Resources": {"Base": {"Type": "AWS::SQS::Queue",
+                                   "Properties": {"QueueName": base_name}}}}
+    updated = json.loads(json.dumps(base))
+    updated["Resources"]["Kept"] = {"Type": "AWS::SQS::Queue", "DeletionPolicy": "Retain",
+                                    "Properties": {"QueueName": kept}}
+    updated["Resources"]["Dropped"] = {"Type": "AWS::SQS::Queue",
+                                       "DeletionPolicy": "RetainExceptOnCreate",
+                                       "Properties": {"QueueName": dropped}}
+    updated["Resources"]["Bad"] = {**_FAILING_RESOURCE, "DependsOn": ["Kept", "Dropped"]}
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(base))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(updated))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert _queue_exists(sqs, base_name)
+        assert _queue_exists(sqs, kept)
+        assert not _queue_exists(sqs, dropped)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for name in (base_name, kept, dropped):
+            _delete_queue_if_present(sqs, name)
+
+
+def test_cfn_deletion_policy_from_an_intrinsic(cfn, sqs):
+    """A DeletionPolicy given as Fn::If resolves against the stack's
+    conditions before it is applied."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    template = json.dumps({
+        "Parameters": {"Keep": {"Type": "String", "Default": "no"}},
+        "Conditions": {"KeepIt": {"Fn::Equals": [{"Ref": "Keep"}, "yes"]}},
+        "Resources": {"Queue": {
+            "Type": "AWS::SQS::Queue",
+            "DeletionPolicy": {"Fn::If": ["KeepIt", "Retain", "Delete"]},
+            "Properties": {"QueueName": {"Ref": "AWS::StackName"}}}},
+    })
+    stacks = {f"cfn-policy-if-keep-{uid}": "yes", f"cfn-policy-if-drop-{uid}": "no"}
+    try:
+        for name, keep in stacks.items():
+            cfn.create_stack(StackName=name, TemplateBody=template,
+                             Parameters=[{"ParameterKey": "Keep", "ParameterValue": keep}])
+        for name in stacks:
+            assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+            cfn.delete_stack(StackName=name)
+            assert _wait_stack(cfn, name)["StackStatus"] == "DELETE_COMPLETE"
+        assert _queue_exists(sqs, f"cfn-policy-if-keep-{uid}")
+        assert not _queue_exists(sqs, f"cfn-policy-if-drop-{uid}")
+    finally:
+        for name in stacks:
+            _delete_cfn_test_stack(cfn, name)
+            _delete_queue_if_present(sqs, name)
+
+
+def test_cfn_delete_stack_retain_resources_only_for_delete_failed(cfn, sqs, lam):
+    """RetainResources is refused on a healthy stack; on a DELETE_FAILED stack
+    it skips the named resource and the stack reaches DELETE_COMPLETE."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cr-retain-res-{suffix}"
+    stack_name = f"cfn-retain-resources-{suffix}"
+    queue = f"cfn-retain-resources-{suffix}"
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role=_CR_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_DELETE_FAILS)},
+    )
+    template = json.dumps({"Resources": {
+        "Queue": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": queue}},
+        "CR": {"Type": "Custom::Tester", "Properties": {
+            "ServiceToken": f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"}},
+    }})
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        with pytest.raises(ClientError) as exc:
+            cfn.delete_stack(StackName=stack_name, RetainResources=["CR"])
+        assert exc.value.response["Error"]["Code"] == "ValidationError"
+        assert "DELETE_FAILED" in exc.value.response["Error"]["Message"]
+
+        cfn.delete_stack(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "DELETE_FAILED", stack.get("StackStatusReason")
+        assert not _queue_exists(sqs, queue)
+
+        with pytest.raises(ClientError) as exc:
+            cfn.delete_stack(StackName=stack_name, RetainResources=["Nope"])
+        assert "Nope" in exc.value.response["Error"]["Message"]
+
+        cfn.delete_stack(StackName=stack_name, RetainResources=["CR"])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "DELETE_COMPLETE", stack.get("StackStatusReason")
+    finally:
+        try:
+            lam.update_function_code(FunctionName=fn, ZipFile=_cr_make_zip(_CR_HANDLER_SUCCESS))
+        except ClientError:
+            pass
+        _delete_cfn_test_stack(cfn, stack_name)
+        _delete_queue_if_present(sqs, queue)
+        try:
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
+
+
 def test_cfn_delete_change_set_existing_succeeds(cfn):
     """DeleteChangeSet of an existing change set succeeds -- by stack name and
     by stack ID -- and the response parses (boto3 needs the

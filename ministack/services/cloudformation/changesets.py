@@ -258,12 +258,33 @@ def _describe_change_set(params):
     changes_xml = ""
     for ch in cs.get("Changes", []):
         rc = ch.get("ResourceChange", {})
+        scope_xml = "".join(f"<member>{_esc(a)}</member>" for a in rc.get("Scope", []))
+        details_xml = ""
+        for d in rc.get("Details", []):
+            target = d.get("Target", {})
+            target_xml = f"<Attribute>{_esc(target.get('Attribute', ''))}</Attribute>"
+            if target.get("Name"):
+                target_xml += f"<Name>{_esc(target['Name'])}</Name>"
+            if target.get("RequiresRecreation"):
+                target_xml += (
+                    f"<RequiresRecreation>{_esc(target['RequiresRecreation'])}"
+                    "</RequiresRecreation>"
+                )
+            details_xml += (
+                "<member>"
+                f"<Target>{target_xml}</Target>"
+                f"<Evaluation>{_esc(d.get('Evaluation', 'Static'))}</Evaluation>"
+                f"<ChangeSource>{_esc(d.get('ChangeSource', 'DirectModification'))}</ChangeSource>"
+                "</member>"
+            )
         changes_xml += (
             "<member><ResourceChange>"
             f"<Action>{rc.get('Action', '')}</Action>"
             f"<LogicalResourceId>{_esc(rc.get('LogicalResourceId', ''))}</LogicalResourceId>"
             f"<ResourceType>{_esc(rc.get('ResourceType', ''))}</ResourceType>"
             f"<Replacement>{rc.get('Replacement', '')}</Replacement>"
+            f"<Scope>{scope_xml}</Scope>"
+            f"<Details>{details_xml}</Details>"
             "</ResourceChange></member>"
         )
 
@@ -350,10 +371,12 @@ def _execute_change_set(params):
             "_template": copy.deepcopy(stack.get("_template", {})),
             "_template_body": stack.get("_template_body", ""),
             "_resolved_params": copy.deepcopy(stack.get("_resolved_params", {})),
+            "_conditions": copy.deepcopy(stack.get("_conditions", {})),
             "Outputs": copy.deepcopy(stack.get("Outputs", [])),
         }
     else:
         previous_stack = None
+    retain_except_on_create = _p(params, "RetainExceptOnCreate", "false").lower() == "true"
 
     status_prefix = "UPDATE" if is_update else "CREATE"
     stack["StackStatus"] = f"{status_prefix}_IN_PROGRESS"
@@ -379,7 +402,8 @@ def _execute_change_set(params):
                 _deploy_stack_async(real_stack_name, stack_id, template,
                                     param_values, False, tags,
                                     is_update=is_update,
-                                    previous_stack=previous_stack),
+                                    previous_stack=previous_stack,
+                                    retain_except_on_create=retain_except_on_create),
             ),
             stack,
             stack_id,

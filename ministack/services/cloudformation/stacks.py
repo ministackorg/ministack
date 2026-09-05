@@ -18,7 +18,12 @@ from .engine import (
     _resolve_refs,
     _topological_sort,
 )
-from .provisioners import _delete_resource, _provision_resource, _update_resource
+from .provisioners import (
+    _RETAIN_REPLACED,
+    _delete_resource,
+    _provision_resource,
+    _update_resource,
+)
 
 logger = logging.getLogger("cloudformation")
 
@@ -61,6 +66,31 @@ def _is_custom_resource(resource_type: str) -> bool:
 # ===========================================================================
 # Stack Events helper
 # ===========================================================================
+
+# The policies that keep a resource. Snapshot is not among them: the emulator
+# takes no snapshots, so a Snapshot resource is deleted like a Delete one.
+_RETAINING_POLICIES = ("Retain", "RetainExceptOnCreate")
+
+
+def _resource_policy(res_def, attribute, resources, params, conditions, mappings,
+                     stack_name, stack_id):
+    """A resource's ``DeletionPolicy`` / ``UpdateReplacePolicy`` as a string,
+    ``Delete`` when the template sets none. An intrinsic (``Fn::If``) is
+    resolved like a property; one that does not resolve counts as ``Delete``
+    and is logged, since that is the destructive reading."""
+    value = (res_def or {}).get(attribute)
+    if value is None:
+        return "Delete"
+    if isinstance(value, dict):
+        try:
+            value = _resolve_refs(copy.deepcopy(value), resources, params, conditions,
+                                  mappings, stack_name, stack_id)
+        except Exception as exc:
+            logger.warning("%s of %s in %s did not resolve (%s); treating it as Delete",
+                           attribute, stack_name, value, exc)
+            return "Delete"
+    return str(value)
+
 
 def _add_event(stack_id, stack_name, logical_id, resource_type, status,
                reason="", physical_id=""):
@@ -129,8 +159,13 @@ def _resolve_stack_outputs(outputs_defs, conditions, resources, param_values,
 async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                               param_values: dict, disable_rollback: bool,
                               tags: list, is_update: bool = False,
-                              previous_stack: dict | None = None):
-    """Background task: provision resources and set final stack status."""
+                              previous_stack: dict | None = None,
+                              retain_except_on_create: bool = False):
+    """Background task: provision resources and set final stack status.
+
+    ``retain_except_on_create`` is the API parameter of the same name: a
+    rollback of this operation then deletes what the operation created even
+    when the template says ``DeletionPolicy: Retain``."""
     from ministack.services.cloudformation import _exports, _stacks
     status_prefix = "UPDATE" if is_update else "CREATE"
     stack = _stacks[stack_name]
@@ -201,16 +236,27 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 old_pid = prev_resource.get("PhysicalResourceId", logical_id)
                 old_props = prev_resource.get("Properties", {})
                 old_attrs = prev_resource.get("Attributes", {})
-                if _is_custom_resource(resource_type):
-                    physical_id, attrs = await run_reentrant(
-                        _update_resource, resource_type, old_pid, old_props,
-                        resolved_props, stack_name, logical_id, old_attrs
-                    )
-                else:
-                    physical_id, attrs = _update_resource(
-                        resource_type, old_pid, old_props, resolved_props,
-                        stack_name, logical_id, old_attrs
-                    )
+                # A handler that replaces the resource itself (the name-keyed
+                # ones) must leave the predecessor alone when the template
+                # retains it; the cleanup below then records DELETE_SKIPPED.
+                retain_replaced = _resource_policy(
+                    res_def, "UpdateReplacePolicy", provisioned_resources,
+                    param_values, conditions, mappings, stack_name, stack_id,
+                ) in _RETAINING_POLICIES
+                token = _RETAIN_REPLACED.set(retain_replaced)
+                try:
+                    if _is_custom_resource(resource_type):
+                        physical_id, attrs = await run_reentrant(
+                            _update_resource, resource_type, old_pid, old_props,
+                            resolved_props, stack_name, logical_id, old_attrs
+                        )
+                    else:
+                        physical_id, attrs = _update_resource(
+                            resource_type, old_pid, old_props, resolved_props,
+                            stack_name, logical_id, old_attrs
+                        )
+                finally:
+                    _RETAIN_REPLACED.reset(token)
                 if physical_id != old_pid:
                     # A changed physical id is a replacement. Real
                     # CloudFormation deletes the predecessor in the
@@ -254,6 +300,16 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
     # predecessor, as real CloudFormation does after UPDATE_COMPLETE.
     if not failed and replaced_resources:
         for logical_id, rtype, old_pid, old_props in replaced_resources:
+            policy = _resource_policy(
+                resources_defs.get(logical_id), "UpdateReplacePolicy",
+                provisioned_resources, param_values, conditions, mappings,
+                stack_name, stack_id)
+            if policy in _RETAINING_POLICIES:
+                # The predecessor leaves CloudFormation's scope and keeps
+                # existing, as on AWS (a DELETE_SKIPPED event, no delete call).
+                _add_event(stack_id, stack_name, logical_id, rtype,
+                           "DELETE_SKIPPED", physical_id=old_pid)
+                continue
             try:
                 if _is_custom_resource(rtype):
                     await run_reentrant(
@@ -271,11 +327,23 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
     # Delete removed resources (update case)
     if not failed and to_remove:
         old_resources = previous_stack.get("_resources", {})
+        old_template = previous_stack.get("_template", {}) or {}
+        old_defs = old_template.get("Resources", {}) or {}
         for logical_id in to_remove:
             old_res = old_resources.get(logical_id, {})
             rtype = old_res.get("ResourceType", "")
             pid = old_res.get("PhysicalResourceId", "")
             old_props = old_res.get("Properties", {})
+            policy = _resource_policy(
+                old_defs.get(logical_id), "DeletionPolicy", old_resources,
+                previous_stack.get("_resolved_params", {}),
+                previous_stack.get("_conditions", conditions),
+                old_template.get("Mappings", {}), stack_name, stack_id)
+            if policy in _RETAINING_POLICIES:
+                _add_event(stack_id, stack_name, logical_id, rtype,
+                           "DELETE_SKIPPED", physical_id=pid)
+                provisioned_resources.pop(logical_id, None)
+                continue
             try:
                 if _is_custom_resource(rtype):
                     await run_reentrant(
@@ -349,6 +417,18 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                     # resources and replacements under a new physical id are
                     # undone. An in-place change is not reverted here.
                     continue
+                policy = _resource_policy(
+                    resources_defs.get(logical_id), "DeletionPolicy",
+                    provisioned_resources, param_values, conditions, mappings,
+                    stack_name, stack_id)
+                if policy == "Retain" and not retain_except_on_create:
+                    # ``Retain`` survives even the rollback of the operation
+                    # that created it; ``RetainExceptOnCreate`` and the API
+                    # parameter of that name are exactly the exception.
+                    _add_event(stack_id, stack_name, logical_id, rtype,
+                               "DELETE_SKIPPED", physical_id=pid)
+                    provisioned_resources.pop(logical_id, None)
+                    continue
                 try:
                     if _is_custom_resource(rtype):
                         await run_reentrant(
@@ -417,8 +497,14 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                physical_id=stack_id)
 
 
-async def _delete_stack_async(stack_name: str, stack_id: str):
-    """Background task: delete all resources and mark stack DELETE_COMPLETE."""
+async def _delete_stack_async(stack_name: str, stack_id: str,
+                              retain_resources=()):
+    """Background task: delete all resources and mark stack DELETE_COMPLETE.
+
+    A resource whose ``DeletionPolicy`` is ``Retain`` or
+    ``RetainExceptOnCreate``, or whose logical id is in ``retain_resources``
+    (the ``RetainResources`` parameter of a DeleteStack on a ``DELETE_FAILED``
+    stack), is skipped with a ``DELETE_SKIPPED`` event and keeps existing."""
     from ministack.services.cloudformation import _exports, _stacks
     stack = _stacks.get(stack_name)
     if not stack:
@@ -450,6 +536,16 @@ async def _delete_stack_async(stack_name: str, stack_id: str):
         rtype = res.get("ResourceType", "")
         pid = res.get("PhysicalResourceId", "")
         res_props = res.get("Properties", {})
+
+        policy = _resource_policy(
+            res_defs.get(logical_id), "DeletionPolicy", resources,
+            stack.get("_resolved_params", {}), conditions,
+            template.get("Mappings", {}) if template else {}, stack_name, stack_id)
+        if policy in _RETAINING_POLICIES or logical_id in retain_resources:
+            _add_event(stack_id, stack_name, logical_id, rtype,
+                       "DELETE_SKIPPED", physical_id=pid)
+            resources.pop(logical_id, None)
+            continue
 
         _add_event(stack_id, stack_name, logical_id, rtype,
                    "DELETE_IN_PROGRESS", physical_id=pid)
@@ -504,8 +600,29 @@ async def _delete_stack_async(stack_name: str, stack_id: str):
 # Change Set Helpers
 # ===========================================================================
 
+# The resource attributes a change set compares next to Properties; each is
+# also the ResourceTargetDefinition Attribute value it reports. A change to one
+# of them alone is a Modify with Replacement False (measured: an
+# UpdateReplacePolicy edit lists `Modify / False / UpdateReplacePolicy`). A Type
+# change is handled apart (a replacement). DependsOn and Condition are absent on
+# purpose: a DependsOn-only edit did not show up as a change on AWS.
+_DIFFED_ATTRIBUTES = (
+    "Metadata",
+    "CreationPolicy",
+    "UpdatePolicy",
+    "DeletionPolicy",
+    "UpdateReplacePolicy",
+)
+
+
 def _diff_resources(old_template: dict, new_template: dict) -> list:
-    """Diff two templates and return a list of change dicts."""
+    """Diff two templates and return a list of change dicts.
+
+    A resource is a ``Modify`` when its ``Properties`` differ or when one of the
+    attributes in ``_DIFFED_ATTRIBUTES`` differs; each changed attribute becomes
+    a ``Details`` entry (``Target.Attribute``, plus the property name for
+    ``Properties``) and is listed in ``Scope``, as the API reference defines them.
+    """
     old_res = old_template.get("Resources", {})
     new_res = new_template.get("Resources", {})
     changes = []
@@ -532,15 +649,44 @@ def _diff_resources(old_template: dict, new_template: dict) -> list:
                 }
             })
         else:
-            old_props = old_res[key].get("Properties", {})
-            new_props = new_res[key].get("Properties", {})
+            details = []
+            old_props = old_res[key].get("Properties", {}) or {}
+            new_props = new_res[key].get("Properties", {}) or {}
             if old_props != new_props:
-                changes.append({
-                    "ResourceChange": {
-                        "Action": "Modify",
-                        "LogicalResourceId": key,
-                        "ResourceType": new_res[key].get("Type", ""),
-                        "Replacement": "Conditional",
-                    }
-                })
+                for name in sorted(set(old_props) | set(new_props)):
+                    if old_props.get(name) != new_props.get(name):
+                        details.append({
+                            "Target": {"Attribute": "Properties", "Name": name,
+                                       "RequiresRecreation": "Conditionally"},
+                            "Evaluation": "Static",
+                            "ChangeSource": "DirectModification",
+                        })
+            for attr in _DIFFED_ATTRIBUTES:
+                if old_res[key].get(attr) != new_res[key].get(attr):
+                    details.append({
+                        "Target": {"Attribute": attr},
+                        "Evaluation": "Static",
+                        "ChangeSource": "DirectModification",
+                    })
+            type_changed = old_res[key].get("Type") != new_res[key].get("Type")
+            if not details and not type_changed:
+                continue
+            scope = []
+            for d in details:
+                if d["Target"]["Attribute"] not in scope:
+                    scope.append(d["Target"]["Attribute"])
+            if type_changed or old_props != new_props:
+                replacement = "True" if type_changed else "Conditional"
+            else:
+                replacement = "False"
+            changes.append({
+                "ResourceChange": {
+                    "Action": "Modify",
+                    "LogicalResourceId": key,
+                    "ResourceType": new_res[key].get("Type", ""),
+                    "Replacement": replacement,
+                    "Scope": scope,
+                    "Details": details,
+                }
+            })
     return changes

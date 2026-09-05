@@ -5,6 +5,14 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **CloudFormation — a change set sees `DeletionPolicy`, `UpdateReplacePolicy` and `Metadata` edits** — the diff compared `Properties` only, so a change set that only changed a resource's removal policy (a CDK `removalPolicy` edit) ended `FAILED` with "didn't contain changes" and the policy never reached the stack. Those attributes now count as a `Modify` with `Replacement: False` and are reported in `Scope` and `Details` with the target attribute, as the API reference defines them; a property change lists the property names. A `DependsOn`-only edit stays a no-change set, as on AWS. Contributed by @iot-rocket.
+
+### Added
+- **CloudFormation — `DeletionPolicy` and `UpdateReplacePolicy` are honoured** — neither attribute was read, so a `Retain` resource was deleted with its stack, when it was dropped from the template, and when a replacement retired it. A retained resource now stays and leaves the stack's scope with a `DELETE_SKIPPED` event, on stack delete, on removal and on replacement; `RetainExceptOnCreate` (the policy and the API parameter of the same name on CreateStack, UpdateStack and ExecuteChangeSet) deletes what the rolled-back operation itself created; `DeleteStack` takes `RetainResources` for a stack in `DELETE_FAILED` and refuses it otherwise. `Snapshot` deletes, since the emulator takes no snapshots. Contributed by @iot-rocket.
+
 ## [1.5.8] — 2026-09-05
 
 ### Added
