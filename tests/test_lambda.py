@@ -8205,6 +8205,7 @@ def test_lambda_durable_chained_invoke_runs_child(lam):
         "Role": _LAMBDA_ROLE,
         "Handler": "index.handler",
         "Code": {"ZipFile": _b64.b64encode(_make_zip(child_code)).decode()},
+        "Timeout": 30,
     })
     parent_code = "def handler(e,c): return {}"
     _raw_durable("POST", "/2015-03-31/functions", body={
@@ -8214,6 +8215,7 @@ def test_lambda_durable_chained_invoke_runs_child(lam):
         "Handler": "index.handler",
         "Code": {"ZipFile": _b64.b64encode(_make_zip(parent_code)).decode()},
         "DurableConfig": {"Enabled": True},
+        "Timeout": 30,
     })
     try:
         # Invoke parent to spin up its durable execution.
@@ -8252,13 +8254,14 @@ def test_lambda_durable_chained_invoke_runs_child(lam):
         # quiet so the short poll is honest. Breaking on Failed keeps a real
         # child error visible instead of reading as a timeout.
         import time as _time
-        for _ in range(30):
-            _time.sleep(0.1)
+        deadline = _time.time() + 20
+        while _time.time() < deadline:
             code, history = _raw_durable("GET",
                 f"/2025-12-01/durable-executions/{arn_enc}/history")
             if any(e["EventType"] in ("ChainedInvokeSucceeded", "ChainedInvokeFailed")
                    for e in history.get("Events", [])):
                 break
+            _time.sleep(0.2)
         events = history["Events"]
         assert any(e["EventType"] == "ChainedInvokeSucceeded" for e in events), \
             f"expected ChainedInvokeSucceeded, got {[e['EventType'] for e in events]}"
@@ -8517,6 +8520,10 @@ def handler(event, context):
         "Handler": "index.handler",
         "Code": {"ZipFile": _b64.b64encode(_make_zip(code)).decode()},
         "DurableConfig": {"Enabled": True},
+        # Lambda's default 3s timeout reads a loaded CI runner's slow
+        # subprocess cold start as a function timeout (no SDK fields in the
+        # error body); the budget, not the wrapping, is what varies here.
+        "Timeout": 30,
     })
     try:
         resp = lam.invoke(FunctionName=fname, Payload=b'{"user":"data"}')
@@ -11182,7 +11189,7 @@ def test_snapstart_rejected_with_large_ephemeral_storage(lam):
         lam.delete_function(FunctionName=fname)
 
 
-# ──────────────── docker executor: no extraction-dir leak ────────────────
+# ──────────── docker executor: shared extraction cache (issue #1600) ────────────
 
 
 _SPAWN_LEAK_CONFIG = {
@@ -11193,51 +11200,159 @@ _SPAWN_LEAK_CONFIG = {
 }
 
 
-def _capture_mkdtemp(monkeypatch):
-    import tempfile as _tf
-    created = []
-    real = _tf.mkdtemp
-
-    def _capture(*a, **kw):
-        d = real(*a, **kw)
-        created.append(d)
-        return d
-
-    monkeypatch.setattr(_tf, "mkdtemp", _capture)
-    return created
+def _fresh_extract_cache(monkeypatch, tmp_path):
+    """Point the extraction cache at an empty per-test root."""
+    monkeypatch.setattr(lsvc, "_DOCKER_EXTRACT_CACHE", str(tmp_path / "extract"))
+    monkeypatch.setattr(lsvc, "_docker_extract_dirs", {})
 
 
-def test_spawn_failure_on_corrupt_zip_leaves_no_tmpdir(monkeypatch):
-    """A corrupt code zip raises out of the extraction block; the tmpdir made
-    just before must not be orphaned (issue #1600)."""
+def _count_extractions(monkeypatch):
+    calls = []
+    real = lsvc._extract_zip_preserving_mode
+
+    def counting(zf, dest):
+        calls.append(dest)
+        return real(zf, dest)
+
+    monkeypatch.setattr(lsvc, "_extract_zip_preserving_mode", counting)
+    return calls
+
+
+def test_spawn_failure_on_corrupt_zip_leaves_no_extraction(monkeypatch, tmp_path):
+    """A corrupt code zip raises out of the cache build; no partial tree may
+    linger on disk and nothing may be registered in the cache (issue #1600)."""
     monkeypatch.setattr(lsvc, "_docker_available", True)
     monkeypatch.setattr(lsvc, "_get_docker_client", lambda: object())
-    created = _capture_mkdtemp(monkeypatch)
+    _fresh_extract_cache(monkeypatch, tmp_path)
 
     with pytest.raises(zipfile.BadZipFile):
         lsvc._spawn_lambda_container(dict(_SPAWN_LEAK_CONFIG), b"this is not a zip")
 
-    assert created, "spawn never created an extraction dir"
-    assert not any(os.path.exists(d) for d in created)
+    assert lsvc._docker_extract_dirs == {}
+    assert not os.path.exists(lsvc._DOCKER_EXTRACT_CACHE) or not os.listdir(
+        lsvc._DOCKER_EXTRACT_CACHE)
 
 
-def test_spawn_failure_on_docker_api_timeout_leaves_no_tmpdir(monkeypatch):
+def test_spawn_failure_after_extraction_keeps_the_cache(monkeypatch, tmp_path):
     """images.get raising anything other than ImageNotFound (the reported
-    case: a socket read timeout) propagates after extraction; the tmpdir must
-    be removed on the way out (issue #1600)."""
+    case: a socket read timeout) propagates after extraction. The extracted
+    tree stays in the content-addressed cache — that is the point of it — and
+    the retry reuses it without a second unpack (issue #1600)."""
     monkeypatch.setattr(lsvc, "_docker_available", True)
     fake_client = MagicMock()
     fake_client.images.get.side_effect = TimeoutError("Read timed out.")
     monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)
-    created = _capture_mkdtemp(monkeypatch)
+    _fresh_extract_cache(monkeypatch, tmp_path)
+    extractions = _count_extractions(monkeypatch)
+    code = _make_zip("def handler(e, c): pass")
 
-    with pytest.raises(TimeoutError):
-        lsvc._spawn_lambda_container(
-            dict(_SPAWN_LEAK_CONFIG), _make_zip("def handler(e, c): pass"),
-        )
+    for _ in range(2):
+        with pytest.raises(TimeoutError):
+            lsvc._spawn_lambda_container(dict(_SPAWN_LEAK_CONFIG), code)
 
-    assert created, "spawn never created an extraction dir"
-    assert not any(os.path.exists(d) for d in created)
+    assert len(extractions) == 1, "second cold start must reuse the cached tree"
+    (key,) = lsvc._docker_extract_dirs
+    assert key.startswith("code-") and os.path.isdir(lsvc._docker_extract_dirs[key])
+
+
+def test_docker_extracted_dir_is_content_addressed(monkeypatch, tmp_path):
+    """Identical blobs share one tree; different blobs and kinds get their
+    own. The dirs are what every container of that code receives (read-only
+    bind mount or docker cp), so sharing is invisible from inside."""
+    _fresh_extract_cache(monkeypatch, tmp_path)
+    extractions = _count_extractions(monkeypatch)
+    code_a = _make_zip("def handler(e, c): return 1")
+    code_b = _make_zip("def handler(e, c): return 2")
+
+    d1 = lsvc._docker_extracted_dir(code_a, "code")
+    d2 = lsvc._docker_extracted_dir(code_a, "code")
+    d3 = lsvc._docker_extracted_dir(code_b, "code")
+    d4 = lsvc._docker_extracted_dir(code_a, "layer")
+    assert d1 == d2 and len({d1, d3, d4}) == 3
+    assert len(extractions) == 3
+    assert os.path.exists(os.path.join(d1, "index.py"))
+
+
+def test_context_arn_shim_survives_a_cached_code_dir(tmp_path):
+    """On a shared cached code dir the shim file already exists from the first
+    cold start; recognizing our own content must return the shim handler
+    rather than silently running the container without the shim."""
+    code_dir = tmp_path / "code"
+    code_dir.mkdir()
+    first = lsvc._write_context_arn_shim(str(code_dir), "python3.12", "index.handler")
+    second = lsvc._write_context_arn_shim(str(code_dir), "python3.12", "index.handler")
+    assert first == second == "_msctx_shim.handler"
+    # A same-named file that came from the user's own zip is left alone.
+    (code_dir / "_msctx_shim.js").write_text("// user's own module")
+    assert lsvc._write_context_arn_shim(str(code_dir), "nodejs20.x", "index.handler") is None
+
+
+def test_extract_cache_sweep_is_reference_based(monkeypatch, tmp_path):
+    """The sweep drops extracted trees whose blob no longer backs any
+    function, version, or layer version — and only those. References are read
+    from stored CodeSha256 values (base64), never by re-hashing blobs."""
+    import base64 as _b64
+    import hashlib as _hashlib
+    from ministack.core.responses import AccountRegionScopedDict
+    _fresh_extract_cache(monkeypatch, tmp_path)
+    code_a, code_b = _make_zip("def handler(e,c): return 1"), _make_zip("def handler(e,c): return 2")
+    layer_z = _make_zip("def handler(e,c): return 3")
+    d_a = lsvc._docker_extracted_dir(code_a, "code")
+    d_b = lsvc._docker_extracted_dir(code_b, "code")
+    d_l = lsvc._docker_extracted_dir(layer_z, "layer")
+
+    def b64(blob):
+        return _b64.b64encode(_hashlib.sha256(blob).digest()).decode()
+
+    funcs = AccountRegionScopedDict()
+    funcs["fn-a"] = {"config": {"CodeSha256": b64(code_a)},
+                     "versions": {"1": {"config": {"CodeSha256": b64(code_a)}}}}
+    layers = AccountRegionScopedDict()
+    layers["shared"] = {"versions": [{"Content": {"CodeSha256": b64(layer_z)}}]}
+    monkeypatch.setattr(lsvc, "_functions", funcs)
+    monkeypatch.setattr(lsvc, "_layers", layers)
+
+    lsvc._sweep_extract_cache()
+    assert os.path.isdir(d_a) and os.path.isdir(d_l)
+    assert not os.path.isdir(d_b), "unreferenced code tree must be evicted"
+    assert set(lsvc._docker_extract_dirs) == {f"code-{_hashlib.sha256(code_a).hexdigest()}",
+                                              f"layer-{_hashlib.sha256(layer_z).hexdigest()}"}
+
+    # Last references gone -> everything evicted.
+    del funcs["fn-a"]
+    layers["shared"]["versions"] = []
+    lsvc._sweep_extract_cache()
+    assert lsvc._docker_extract_dirs == {}
+    assert not os.path.isdir(d_a) and not os.path.isdir(d_l)
+
+
+def test_delete_and_update_paths_trigger_the_sweep(lam, monkeypatch):
+    """DeleteFunction, UpdateFunctionCode and DeleteLayerVersion are the
+    moments references disappear; each must run the cache sweep."""
+    calls = []
+    monkeypatch.setattr(lsvc, "_sweep_extract_cache", lambda: calls.append(1))
+    import base64 as _b64
+    fname = f"sweep-hooks-{_uuid_mod.uuid4().hex[:8]}"
+    lsvc._create_function({"FunctionName": fname, "Runtime": "python3.12",
+                           "Role": _LAMBDA_ROLE, "Handler": "index.handler",
+                           "Code": {"ZipFile": _b64.b64encode(
+                               _make_zip("def handler(e,c): return 1")).decode()}})
+    lsvc._update_code(fname, {"ZipFile": _b64.b64encode(
+        _make_zip("def handler(e,c): return 2")).decode()})
+    lsvc._delete_function(fname, {})
+    lsvc._publish_layer_version("sweep-layer", {"Content": {"ZipFile": _b64.b64encode(
+        _make_zip("x = 1")).decode()}})
+    lsvc._delete_layer_version("sweep-layer", 1)
+    assert len(calls) >= 3, calls
+
+
+def test_reset_clears_the_extraction_cache(monkeypatch, tmp_path):
+    _fresh_extract_cache(monkeypatch, tmp_path)
+    lsvc._docker_extracted_dir(_make_zip("def handler(e, c): pass"), "code")
+    assert lsvc._docker_extract_dirs
+    lsvc.reset()
+    assert lsvc._docker_extract_dirs == {}
+    assert not os.path.exists(lsvc._DOCKER_EXTRACT_CACHE)
 
 
 def _make_zip_multi(files: dict) -> bytes:
