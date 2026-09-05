@@ -2089,6 +2089,119 @@ def test_cfn_delete_stack_with_active_imports(cfn):
     with pytest.raises(ClientError):
         cfn.delete_stack(StackName="cfn-t17-exp")
 
+def test_cfn_list_imports_names_the_importing_stacks(cfn):
+    """ListImports lists the stacks whose templates import the export through
+    Fn::ImportValue; a template that only mentions the name does not count,
+    and an export nobody imports is a ValidationError."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    export_name = f"cfn-imports-{uid}"
+    exporter, importer, mention = (f"cfn-imports-exp-{uid}", f"cfn-imports-imp-{uid}",
+                                   f"cfn-imports-mention-{uid}")
+    cfn.create_stack(StackName=exporter, TemplateBody=json.dumps({
+        "Resources": {"P": {"Type": "AWS::SSM::Parameter", "Properties": {
+            "Name": f"/cfn-imports/{uid}/exp", "Type": "String", "Value": "v"}}},
+        "Outputs": {"Out": {"Value": "v", "Export": {"Name": export_name}}}}))
+    try:
+        assert _wait_stack(cfn, exporter)["StackStatus"] == "CREATE_COMPLETE"
+        with pytest.raises(ClientError) as exc:
+            cfn.list_imports(ExportName=export_name)
+        assert exc.value.response["Error"]["Message"] == (
+            f"Export '{export_name}' is not imported by any stack.")
+
+        cfn.create_stack(StackName=importer, TemplateBody=json.dumps({"Resources": {
+            "P": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": f"/cfn-imports/{uid}/imp", "Type": "String",
+                "Value": {"Fn::ImportValue": export_name}}}}}))
+        cfn.create_stack(StackName=mention, TemplateBody=json.dumps({"Resources": {
+            "P": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": f"/cfn-imports/{uid}/mention", "Type": "String",
+                "Value": export_name}}}}))
+        for name in (importer, mention):
+            assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        assert cfn.list_imports(ExportName=export_name)["Imports"] == [importer]
+    finally:
+        for name in (importer, mention, exporter):
+            _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_termination_protection_blocks_delete_until_disabled(cfn):
+    """A stack created with EnableTerminationProtection refuses DeleteStack
+    and stays as it is; UpdateTerminationProtection turns it off, DescribeStacks
+    reports the flag either way."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-protected-{uid}"
+    template = json.dumps({"Resources": {"P": {"Type": "AWS::SSM::Parameter", "Properties": {
+        "Name": f"/cfn-protected/{uid}", "Type": "String", "Value": "v"}}}})
+    cfn.create_stack(StackName=stack_name, TemplateBody=template,
+                     EnableTerminationProtection=True)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert stack["EnableTerminationProtection"] is True
+
+        with pytest.raises(ClientError) as exc:
+            cfn.delete_stack(StackName=stack_name)
+        assert "cannot be deleted while TerminationProtection is enabled" in (
+            exc.value.response["Error"]["Message"])
+        assert cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["StackStatus"] == (
+            "CREATE_COMPLETE")
+
+        result = cfn.update_termination_protection(
+            StackName=stack_name, EnableTerminationProtection=False)
+        assert result["StackId"] == stack["StackId"]
+        assert cfn.describe_stacks(StackName=stack_name)["Stacks"][0][
+            "EnableTerminationProtection"] is False
+        with pytest.raises(ClientError):
+            cfn.update_termination_protection(
+                StackName=f"{stack_name}-nope", EnableTerminationProtection=True)
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+    finally:
+        try:
+            cfn.update_termination_protection(
+                StackName=stack_name, EnableTerminationProtection=False)
+        except ClientError:
+            pass
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_stack_policy_is_stored_and_returned(cfn):
+    """SetStackPolicy stores the policy and GetStackPolicy returns it; a stack
+    without one answers no StackPolicyBody; CreateStack takes StackPolicyBody."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-policy-{uid}"
+    template = json.dumps({"Resources": {"P": {"Type": "AWS::SSM::Parameter", "Properties": {
+        "Name": f"/cfn-policy/{uid}", "Type": "String", "Value": "v"}}}})
+    policy = json.dumps({"Statement": [{"Effect": "Deny", "Action": "Update:*",
+                                        "Principal": "*", "Resource": "LogicalResourceId/P"}]})
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        assert "StackPolicyBody" not in cfn.get_stack_policy(StackName=stack_name)
+        cfn.set_stack_policy(StackName=stack_name, StackPolicyBody=policy)
+        assert json.loads(cfn.get_stack_policy(StackName=stack_name)["StackPolicyBody"]) == (
+            json.loads(policy))
+        with pytest.raises(ClientError):
+            cfn.set_stack_policy(StackName=stack_name, StackPolicyBody="not json")
+
+        cfn.create_stack(StackName=f"{stack_name}-b", TemplateBody=template.replace(
+            f"/cfn-policy/{uid}", f"/cfn-policy/{uid}/b"), StackPolicyBody=policy)
+        assert _wait_stack(cfn, f"{stack_name}-b")["StackStatus"] == "CREATE_COMPLETE"
+        assert cfn.get_stack_policy(StackName=f"{stack_name}-b")["StackPolicyBody"]
+
+        replaced = json.dumps({"Statement": [{"Effect": "Allow", "Action": "Update:*",
+                                              "Principal": "*", "Resource": "*"}]})
+        cfn.update_stack(StackName=f"{stack_name}-b", TemplateBody=template.replace(
+            f"/cfn-policy/{uid}", f"/cfn-policy/{uid}/b").replace('"v"', '"w"'),
+            StackPolicyBody=replaced)
+        assert _wait_stack(cfn, f"{stack_name}-b")["StackStatus"] == "UPDATE_COMPLETE"
+        assert json.loads(cfn.get_stack_policy(StackName=f"{stack_name}-b")["StackPolicyBody"]) == (
+            json.loads(replaced))
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        _delete_cfn_test_stack(cfn, f"{stack_name}-b")
+
+
 def test_cfn_update_rollback_on_failure(cfn, s3):
     template_v1 = {
         "AWSTemplateFormatVersion": "2010-09-09",
@@ -10382,6 +10495,179 @@ def test_cfn_update_rollback_delete_failure_lands_update_rollback_failed(cfn, la
             )
         except ClientError:
             pass
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
+
+
+_CR_HANDLER_SLOW = """\
+import json, time, urllib.request
+
+def handler(event, context):
+    if event["RequestType"] == "Create":
+        time.sleep(2)
+    payload = json.dumps({
+        "Status": "SUCCESS",
+        "RequestId": event["RequestId"],
+        "StackId": event["StackId"],
+        "LogicalResourceId": event["LogicalResourceId"],
+        "PhysicalResourceId": event.get("PhysicalResourceId") or "slow-custom-resource",
+        "Data": {},
+    }).encode()
+    req = urllib.request.Request(
+        event["ResponseURL"], data=payload, method="PUT",
+        headers={"content-type": "", "content-length": str(len(payload))},
+    )
+    urllib.request.urlopen(req, timeout=10)
+"""
+
+
+def test_cfn_continue_update_rollback_recovers_the_stack(cfn, lam):
+    """A stack in UPDATE_ROLLBACK_FAILED is not updatable; ContinueUpdateRollback
+    retries the failed deletes (and fails again while the resource still cannot
+    be deleted), an unknown ResourcesToSkip entry is refused, and once the
+    delete works the retry lands UPDATE_ROLLBACK_COMPLETE and the stack is
+    updatable again. Any other status is refused."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cr-cur-{suffix}"
+    stack_name = f"cfn-continue-rollback-{suffix}"
+    lam.create_function(
+        FunctionName=fn, Runtime="python3.12", Role=_CR_LAMBDA_ROLE, Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_DELETE_FAILS)},
+    )
+    base = {"Resources": {"Topic": {"Type": "AWS::SNS::Topic",
+                                    "Properties": {"TopicName": f"cfn-cur-{suffix}"}}}}
+    updated = json.loads(json.dumps(base))
+    updated["Resources"]["CR"] = {"Type": "Custom::Tester", "Properties": {
+        "ServiceToken": f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"}}
+    updated["Resources"]["Bad"] = {**_FAILING_RESOURCE, "DependsOn": "CR"}
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(base))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        with pytest.raises(ClientError) as exc:
+            cfn.continue_update_rollback(StackName=stack_name)
+        assert "cannot be called from current stack status" in (
+            exc.value.response["Error"]["Message"])
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(updated))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_FAILED", stack.get("StackStatusReason")
+
+        cfn.continue_update_rollback(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_FAILED", stack.get("StackStatusReason")
+
+        with pytest.raises(ClientError) as exc:
+            cfn.continue_update_rollback(StackName=stack_name, ResourcesToSkip=["Topic"])
+        assert "Topic" in exc.value.response["Error"]["Message"]
+
+        # Once the resource can be deleted, the retry completes the rollback
+        # without skipping anything.
+        lam.update_function_code(FunctionName=fn, ZipFile=_cr_make_zip(_CR_HANDLER_SUCCESS))
+        cfn.continue_update_rollback(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+        assert any(e["LogicalResourceId"] == "CR" and e["ResourceStatus"] == "DELETE_COMPLETE"
+                   for e in events)
+
+        again = json.loads(json.dumps(base))
+        again["Resources"]["Topic"]["Properties"]["DisplayName"] = "after"
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(again))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    finally:
+        try:
+            lam.update_function_code(FunctionName=fn, ZipFile=_cr_make_zip(_CR_HANDLER_SUCCESS))
+        except ClientError:
+            pass
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
+
+
+def test_cfn_continue_update_rollback_skips_the_named_resource(cfn, lam):
+    """ResourcesToSkip leaves the resource in place (an UPDATE_COMPLETE event)
+    and the stack still reaches UPDATE_ROLLBACK_COMPLETE."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cr-cur-skip-{suffix}"
+    stack_name = f"cfn-continue-skip-{suffix}"
+    lam.create_function(
+        FunctionName=fn, Runtime="python3.12", Role=_CR_LAMBDA_ROLE, Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_DELETE_FAILS)},
+    )
+    base = {"Resources": {"Topic": {"Type": "AWS::SNS::Topic",
+                                    "Properties": {"TopicName": f"cfn-cur-skip-{suffix}"}}}}
+    updated = json.loads(json.dumps(base))
+    updated["Resources"]["CR"] = {"Type": "Custom::Tester", "Properties": {
+        "ServiceToken": f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"}}
+    updated["Resources"]["Bad"] = {**_FAILING_RESOURCE, "DependsOn": "CR"}
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(base))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(updated))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_ROLLBACK_FAILED"
+
+        cfn.continue_update_rollback(StackName=stack_name, ResourcesToSkip=["CR"])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+        assert any(e["LogicalResourceId"] == "CR" and e["ResourceStatus"] == "UPDATE_COMPLETE"
+                   for e in events)
+    finally:
+        try:
+            lam.update_function_code(FunctionName=fn, ZipFile=_cr_make_zip(_CR_HANDLER_SUCCESS))
+        except ClientError:
+            pass
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
+
+
+def test_cfn_cancel_update_stack_rolls_the_update_back(cfn, lam):
+    """CancelUpdateStack on an UPDATE_IN_PROGRESS stack stops before the next
+    resource and rolls back to the previous state ("User Initiated"); on any
+    other status it is refused."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cr-cancel-{suffix}"
+    stack_name = f"cfn-cancel-{suffix}"
+    lam.create_function(
+        FunctionName=fn, Runtime="python3.12", Role=_CR_LAMBDA_ROLE, Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_SLOW)}, Timeout=30,
+    )
+    base = {"Resources": {"Topic": {"Type": "AWS::SNS::Topic",
+                                    "Properties": {"TopicName": f"cfn-cancel-{suffix}"}}}}
+    updated = json.loads(json.dumps(base))
+    updated["Resources"]["Slow"] = {"Type": "Custom::Tester", "Properties": {
+        "ServiceToken": f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"}}
+    updated["Resources"]["Later"] = {"Type": "AWS::SNS::Topic", "DependsOn": "Slow",
+                                     "Properties": {"TopicName": f"cfn-cancel-later-{suffix}"}}
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(base))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        with pytest.raises(ClientError) as exc:
+            cfn.cancel_update_stack(StackName=stack_name)
+        assert exc.value.response["Error"]["Message"] == (
+            "CancelUpdateStack cannot be called from current stack status")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(updated))
+        assert cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["StackStatus"] == (
+            "UPDATE_IN_PROGRESS")
+        cfn.cancel_update_stack(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name, timeout=60)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert [r["LogicalResourceId"] for r in
+                cfn.describe_stack_resources(StackName=stack_name)["StackResources"]] == ["Topic"]
+        assert "User Initiated" in _stack_event_reasons(cfn, stack_name)
+    finally:
         _delete_cfn_test_stack(cfn, stack_name)
         try:
             lam.delete_function(FunctionName=fn)

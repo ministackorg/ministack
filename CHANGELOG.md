@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **CloudFormation — `ListImports`, `UpdateTerminationProtection`, `SetStackPolicy`, `GetStackPolicy`, `CancelUpdateStack` and `ContinueUpdateRollback`** — the first four were routed to the service and answered `InvalidAction`, the last two did not exist, so a stack in `UPDATE_ROLLBACK_FAILED` had no way out short of a reset. `ListImports` names the stacks importing an export (a `ValidationError` when none does); termination protection is set on create or later and makes `DeleteStack` refuse with the stack unchanged (`DescribeStacks` reports `EnableTerminationProtection`); a stack policy is stored and returned (it is not enforced); `CancelUpdateStack` stops an `UPDATE_IN_PROGRESS` update before its next resource and rolls it back ("User Initiated"); `ContinueUpdateRollback` retries the deletes that failed the rollback, skips the `ResourcesToSkip` (their status becomes `UPDATE_COMPLETE`, the resource stays) and lands the stack in `UPDATE_ROLLBACK_COMPLETE`. Contributed by @iot-rocket.
+
 ## [1.5.8] — 2026-09-05
 
 ### Added

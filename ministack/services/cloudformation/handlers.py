@@ -28,6 +28,7 @@ from .engine import (
 from .helpers import _error, _esc, _extract_members, _extract_stack_status_filters, _p, _resolve_template, _xml
 from .stacks import (
     _add_event,
+    _continue_update_rollback_async,
     _create_stack_task_in_region,
     _delete_stack_async,
     _deploy_stack_async,
@@ -41,6 +42,8 @@ logger = logging.getLogger("cloudformation")
 
 def _create_stack(params):
     from ministack.services.cloudformation import _stack_events, _stacks
+
+    from .helpers import _resolve_document
     stack_name = _p(params, "StackName")
     if not stack_name:
         return _error("ValidationError", "StackName is required")
@@ -85,6 +88,13 @@ def _create_stack(params):
         f"stack/{stack_name}/{new_uuid()}"
     )
 
+    termination_protection = (
+        _p(params, "EnableTerminationProtection", "false").lower() == "true")
+    stack_policy, policy_err = _resolve_document(
+        params, "StackPolicyBody", "StackPolicyURL", "Stack policy")
+    if policy_err:
+        return policy_err
+
     stack = {
         "StackName": stack_name,
         "StackId": stack_id,
@@ -104,6 +114,8 @@ def _create_stack(params):
         "Tags": tags,
         "Outputs": [],
         "DisableRollback": disable_rollback,
+        "EnableTerminationProtection": termination_protection,
+        "_stack_policy": stack_policy or "",
         "_region": get_region(),
         "_resources": {},
         "_template": template,
@@ -230,6 +242,9 @@ def _describe_stacks(params):
             f"<LastUpdatedTime>{s.get('LastUpdatedTime', '')}</LastUpdatedTime>"
             f"<Description>{_esc(s.get('Description', ''))}</Description>"
             f"<DisableRollback>{str(s.get('DisableRollback', False)).lower()}</DisableRollback>"
+            "<EnableTerminationProtection>"
+            f"{str(s.get('EnableTerminationProtection', False)).lower()}"
+            "</EnableTerminationProtection>"
             f"<Parameters>{params_xml}</Parameters>"
             f"<Outputs>{outputs_xml}</Outputs>"
             f"<Tags>{tags_xml}</Tags>"
@@ -493,6 +508,11 @@ def _delete_stack(params):
     if stack.get("StackStatus") == "DELETE_COMPLETE":
         return _xml(200, "DeleteStackResponse", "")
 
+    if stack.get("EnableTerminationProtection"):
+        return _error("ValidationError",
+                      f"Stack [{stack['StackId']}] cannot be deleted while "
+                      "TerminationProtection is enabled")
+
     # Check for active imports before deleting
     stack_exports = [
         out.get("ExportName") for out in stack.get("Outputs", [])
@@ -548,6 +568,8 @@ def _stack_has_no_updates(stack, template, param_values, tags):
 
 def _update_stack(params):
     from ministack.services.cloudformation import _stacks
+
+    from .helpers import _resolve_document
     stack_name = _p(params, "StackName")
     if not stack_name:
         return _error("ValidationError", "StackName is required")
@@ -626,6 +648,13 @@ def _update_stack(params):
         if (_cs.get("StackId") == stack_id
                 and _cs.get("ExecutionStatus") == "AVAILABLE"):
             _cs["ExecutionStatus"] = "OBSOLETE"
+
+    stack_policy, policy_err = _resolve_document(
+        params, "StackPolicyBody", "StackPolicyURL", "Stack policy")
+    if policy_err:
+        return policy_err
+    if stack_policy:
+        stack["_stack_policy"] = stack_policy
 
     stack["StackStatus"] = "UPDATE_IN_PROGRESS"
     stack["LastUpdatedTime"] = now_iso()
@@ -831,6 +860,122 @@ def _get_template_summary(params):
                 f"</GetTemplateSummaryResult>")
 
 
+# --- ListImports ---
+
+def _list_imports(params):
+    from ministack.services.cloudformation import _stacks
+    export_name = _p(params, "ExportName")
+    if not export_name:
+        return _error("ValidationError", "ExportName is required")
+    importers = sorted(
+        name for name, stack in _stacks.items()
+        if stack.get("StackStatus", "").endswith("_COMPLETE")
+        and "DELETE" not in stack.get("StackStatus", "")
+        and export_name in _imported_export_names(stack, name)
+    )
+    if not importers:
+        return _error("ValidationError",
+                      f"Export '{export_name}' is not imported by any stack.")
+    members = "".join(f"<member>{_esc(n)}</member>" for n in importers)
+    return _xml(200, "ListImportsResponse",
+                f"<ListImportsResult><Imports>{members}</Imports></ListImportsResult>")
+
+
+# --- UpdateTerminationProtection / stack policy ---
+
+def _update_termination_protection(params):
+    stack_name = _p(params, "StackName")
+    stack = _resolve_stack(stack_name)
+    if not stack or stack.get("StackStatus") in ("DELETE_IN_PROGRESS", "DELETE_COMPLETE"):
+        return _error("ValidationError", f"Stack [{stack_name}] does not exist")
+    enable = _p(params, "EnableTerminationProtection")
+    if not enable:
+        return _error("ValidationError", "EnableTerminationProtection is required")
+    stack["EnableTerminationProtection"] = enable.lower() == "true"
+    return _xml(200, "UpdateTerminationProtectionResponse",
+                "<UpdateTerminationProtectionResult>"
+                f"<StackId>{_esc(stack['StackId'])}</StackId>"
+                "</UpdateTerminationProtectionResult>")
+
+
+def _set_stack_policy(params):
+    from .helpers import _resolve_document
+    stack_name = _p(params, "StackName")
+    stack = _resolve_stack(stack_name)
+    if not stack or stack.get("StackStatus") == "DELETE_COMPLETE":
+        return _error("ValidationError", f"Stack [{stack_name}] does not exist")
+    policy, policy_err = _resolve_document(
+        params, "StackPolicyBody", "StackPolicyURL", "Stack policy")
+    if policy_err:
+        return policy_err
+    if not policy:
+        return _error("ValidationError", "StackPolicyBody or StackPolicyURL is required")
+    try:
+        json.loads(policy)
+    except ValueError:
+        return _error("ValidationError", "Error validating stack policy: Invalid stack policy")
+    stack["_stack_policy"] = policy
+    return _xml(200, "SetStackPolicyResponse", "")
+
+
+def _get_stack_policy(params):
+    stack_name = _p(params, "StackName")
+    stack = _resolve_stack(stack_name)
+    if not stack or stack.get("StackStatus") == "DELETE_COMPLETE":
+        return _error("ValidationError", f"Stack [{stack_name}] does not exist")
+    policy = stack.get("_stack_policy") or ""
+    body = f"<StackPolicyBody>{_esc(policy)}</StackPolicyBody>" if policy else ""
+    return _xml(200, "GetStackPolicyResponse",
+                f"<GetStackPolicyResult>{body}</GetStackPolicyResult>")
+
+
+# --- CancelUpdateStack / ContinueUpdateRollback ---
+
+def _cancel_update_stack(params):
+    stack_name = _p(params, "StackName")
+    stack = _resolve_stack(stack_name)
+    if not stack or stack.get("StackStatus") == "DELETE_COMPLETE":
+        return _error("ValidationError", f"Stack [{stack_name}] does not exist")
+    if stack.get("StackStatus") != "UPDATE_IN_PROGRESS":
+        return _error("ValidationError",
+                      "CancelUpdateStack cannot be called from current stack status")
+    # The running update checks the flag before each resource and rolls back.
+    stack["_cancel_requested"] = True
+    return _xml(200, "CancelUpdateStackResponse", "")
+
+
+def _continue_update_rollback(params):
+    stack_name = _p(params, "StackName")
+    stack = _resolve_stack(stack_name)
+    if not stack or stack.get("StackStatus") == "DELETE_COMPLETE":
+        return _error("ValidationError", f"Stack [{stack_name}] does not exist")
+    stack_name = stack.get("StackName", stack_name)
+    if stack.get("StackStatus") != "UPDATE_ROLLBACK_FAILED":
+        return _error("ValidationError",
+                      "ContinueUpdateRollback cannot be called from current stack status")
+    # ResourcesToSkip.member.N on the query protocol, a plain list on the JSON one.
+    skip = params.get("ResourcesToSkip")
+    if not isinstance(skip, list):
+        skip = []
+        while _p(params, f"ResourcesToSkip.member.{len(skip) + 1}"):
+            skip.append(_p(params, f"ResourcesToSkip.member.{len(skip) + 1}"))
+    skip = [str(s) for s in skip]
+    pending = stack.get("_rollback_failed", {})
+    unknown = sorted(set(skip) - set(pending))
+    if unknown:
+        return _error("ValidationError",
+                      f"Resource(s) [{', '.join(unknown)}] cannot be skipped: only "
+                      "resources whose rollback failed can be skipped")
+    stack_id = stack["StackId"]
+    _create_stack_task_in_region(
+        _continue_update_rollback_async(stack_name, stack_id, frozenset(skip)),
+        stack,
+        stack_id,
+    )
+    return _xml(200, "ContinueUpdateRollbackResponse",
+                "<ContinueUpdateRollbackResult></ContinueUpdateRollbackResult>")
+
+
 # ===========================================================================
 # Action Handler Registry
 # ===========================================================================
@@ -854,4 +999,10 @@ _ACTION_HANDLERS = {
     "DeleteChangeSet": _delete_change_set,
     "ListChangeSets": _list_change_sets,
     "GetTemplateSummary": _get_template_summary,
+    "ListImports": _list_imports,
+    "UpdateTerminationProtection": _update_termination_protection,
+    "SetStackPolicy": _set_stack_policy,
+    "GetStackPolicy": _get_stack_policy,
+    "CancelUpdateStack": _cancel_update_stack,
+    "ContinueUpdateRollback": _continue_update_rollback,
 }

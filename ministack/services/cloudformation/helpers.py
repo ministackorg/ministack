@@ -67,16 +67,23 @@ def _resolve_template(params):
     """Resolve TemplateBody or TemplateURL to a template string.
     If TemplateURL is provided, fetch the template from S3.
     Returns (template_body, error_tuple) — error_tuple is None on success."""
-    template_body = _p(params, "TemplateBody")
-    template_url = _p(params, "TemplateURL")
+    return _resolve_document(params, "TemplateBody", "TemplateURL", "Template")
 
-    if template_body:
-        return template_body, None
 
-    if template_url:
+def _resolve_document(params, body_key, url_key, label):
+    """Resolve an inline document or its S3 URL (``TemplateBody``/``TemplateURL``,
+    ``StackPolicyBody``/``StackPolicyURL``) to a string; ``label`` names the
+    document in the errors. Returns (body, error_tuple)."""
+    body = _p(params, body_key)
+    url = _p(params, url_key)
+
+    if body:
+        return body, None
+
+    if url:
         try:
             from ministack.services import s3 as _s3
-            parsed = urlparse(template_url)
+            parsed = urlparse(url)
             # Support formats:
             #   http://localhost:4566/bucket/key
             #   https://s3.amazonaws.com/bucket/key
@@ -84,18 +91,15 @@ def _resolve_template(params):
             path = parsed.path.lstrip("/")
             parts = path.split("/", 1)
             if len(parts) < 2:
-                return None, _error("ValidationError",
-                                    f"Invalid TemplateURL: {template_url}")
+                return None, _error("ValidationError", f"Invalid {url_key}: {url}")
             bucket_name, key = parts[0], parts[1]
             obj_data = _s3._get_object_data(bucket_name, key)
             if obj_data is None:
-                return None, _error("ValidationError",
-                                    f"Template not found at {template_url}")
+                return None, _error("ValidationError", f"{label} not found at {url}")
             return obj_data.decode("utf-8"), None
         except Exception as e:
-            logger.warning("Failed to fetch TemplateURL %s: %s", template_url, e)
-            return None, _error("ValidationError",
-                                f"Error fetching TemplateURL: {e}")
+            logger.warning("Failed to fetch %s %s: %s", url_key, url, e)
+            return None, _error("ValidationError", f"Error fetching {url_key}: {e}")
 
     return None, None  # neither provided
 

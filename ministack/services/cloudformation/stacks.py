@@ -126,6 +126,60 @@ def _resolve_stack_outputs(outputs_defs, conditions, resources, param_values,
     return resolved_outputs, exports
 
 
+async def _continue_update_rollback_async(stack_name: str, stack_id: str,
+                                          resources_to_skip):
+    """Background task for ContinueUpdateRollback: retry the deletes that
+    failed the update rollback, skipping the logical ids the caller named
+    (their status becomes UPDATE_COMPLETE and the resource stays, as on AWS),
+    and land the stack in UPDATE_ROLLBACK_COMPLETE or, if a delete fails
+    again, UPDATE_ROLLBACK_FAILED."""
+    from ministack.services.cloudformation import _stacks
+    stack = _stacks.get(stack_name)
+    if not stack:
+        return
+    pending = dict(stack.get("_rollback_failed", {}))
+    stack["StackStatus"] = "UPDATE_ROLLBACK_IN_PROGRESS"
+    _add_event(stack_id, stack_name, stack_name, "AWS::CloudFormation::Stack",
+               "UPDATE_ROLLBACK_IN_PROGRESS", "User Initiated", stack_id)
+    still_failed = {}
+    for logical_id, res in pending.items():
+        rtype = res.get("ResourceType", "")
+        pid = res.get("PhysicalResourceId", "")
+        if logical_id in resources_to_skip:
+            _add_event(stack_id, stack_name, logical_id, rtype,
+                       "UPDATE_COMPLETE", "Resource rollback skipped by user", pid)
+            continue
+        try:
+            if _is_custom_resource(rtype):
+                await run_reentrant(_delete_resource, rtype, pid,
+                                    res.get("Properties", {}), stack_name, logical_id)
+            else:
+                _delete_resource(rtype, pid, res.get("Properties", {}),
+                                 stack_name, logical_id)
+            _add_event(stack_id, stack_name, logical_id, rtype,
+                       "DELETE_COMPLETE", physical_id=pid)
+        except Exception as exc:
+            logger.error("Continue rollback delete of %s failed: %s", logical_id, exc)
+            _add_event(stack_id, stack_name, logical_id, rtype,
+                       "DELETE_FAILED", str(exc), pid)
+            still_failed[logical_id] = res
+    await asyncio.sleep(0)
+    if still_failed:
+        stack["_rollback_failed"] = still_failed
+        reason = ("The following resource(s) failed to delete: "
+                  f"[{', '.join(sorted(still_failed))}].")
+        stack["StackStatus"] = "UPDATE_ROLLBACK_FAILED"
+        stack["StackStatusReason"] = reason
+        _add_event(stack_id, stack_name, stack_name, "AWS::CloudFormation::Stack",
+                   "UPDATE_ROLLBACK_FAILED", reason, stack_id)
+        return
+    stack.pop("_rollback_failed", None)
+    stack["StackStatus"] = "UPDATE_ROLLBACK_COMPLETE"
+    stack["StackStatusReason"] = ""
+    _add_event(stack_id, stack_name, stack_name, "AWS::CloudFormation::Stack",
+               "UPDATE_ROLLBACK_COMPLETE", physical_id=stack_id)
+
+
 async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                               param_values: dict, disable_rollback: bool,
                               tags: list, is_update: bool = False,
@@ -164,9 +218,17 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
 
     failed = False
     fail_reason = ""
+    cancelled = False
     replaced_resources = []
+    stack.pop("_cancel_requested", None)
 
     for logical_id in ordered:
+        if is_update and stack.pop("_cancel_requested", False):
+            # CancelUpdateStack: stop before the next resource and roll the
+            # update back, as on AWS ("User Initiated").
+            failed = cancelled = True
+            fail_reason = "User Initiated"
+            break
         res_def = resources_defs[logical_id]
         cond = res_def.get("Condition")
         if cond and not conditions.get(cond, True):
@@ -328,9 +390,11 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
             stack["StackStatus"] = "ROLLBACK_IN_PROGRESS" if not is_update else "UPDATE_ROLLBACK_IN_PROGRESS"
             _add_event(stack_id, stack_name, stack_name,
                        "AWS::CloudFormation::Stack", stack["StackStatus"],
-                       "Rollback requested", stack_id)
+                       "User Initiated" if cancelled else "Rollback requested",
+                       stack_id)
 
             rollback_delete_failures = []
+            rollback_failed_records = {}
             previous_resources = (
                 previous_stack.get("_resources", {})
                 if is_update and previous_stack else {}
@@ -365,6 +429,10 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                     _add_event(stack_id, stack_name, logical_id, rtype,
                                "DELETE_FAILED", str(del_exc), pid)
                     rollback_delete_failures.append(logical_id)
+                    rollback_failed_records[logical_id] = {
+                        "PhysicalResourceId": pid, "ResourceType": rtype,
+                        "Properties": res_props,
+                    }
                 provisioned_resources.pop(logical_id, None)
 
             if is_update and previous_stack:
@@ -396,6 +464,8 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 reason = ("The following resource(s) failed to delete: "
                           f"[{', '.join(sorted(rollback_delete_failures))}].")
                 stack["StackStatusReason"] = reason
+                # What ContinueUpdateRollback retries (or skips).
+                stack["_rollback_failed"] = rollback_failed_records
                 _add_event(stack_id, stack_name, stack_name,
                            "AWS::CloudFormation::Stack", stack["StackStatus"],
                            reason, stack_id)
