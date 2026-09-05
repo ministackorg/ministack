@@ -1261,7 +1261,14 @@ def invoke_durable_resume(function_name: str, durable_arn: str, original_event: 
         },
     }
     try:
+        _replay_started = time.time()
         result = _execute_function(func, resume_event)
+        lambda_durable.record_invocation_completed(
+            durable_arn,
+            start_ts=_replay_started,
+            request_id=new_uuid(),
+            error=(result.get("body") if result.get("error") else None),
+        )
         # If the resume still returns PENDING, schedule the next wakeup.
         try:
             payload = result.get("body")
@@ -2840,6 +2847,8 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
             function_arn=_func_arn(name),
             version=executed_version,
             input_payload=event_payload,
+            execution_timeout=(func.get("config", {}) or {}).get(
+                "DurableConfig", {}).get("ExecutionTimeout"),
         )
         durable_arn = rec["DurableExecutionArn"]
         _durable_ctx.set({
@@ -2899,6 +2908,15 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
         _de_rec = lambda_durable._executions.get(durable_arn)
         if _de_rec:
             resp_headers["X-Amz-Durable-Checkpoint-Token"] = _de_rec["CheckpointToken"]
+        # Every handler invocation of a durable execution ends with an
+        # InvocationCompleted history event (initial and each replay), before
+        # any terminal ExecutionSucceeded/Failed the payload may cause.
+        lambda_durable.record_invocation_completed(
+            durable_arn,
+            start_ts=(_de_rec or {}).get("StartTimestamp") or time.time(),
+            request_id=new_uuid(),
+            error=(result.get("body") if result.get("error") else None),
+        )
         # Inspect the SDK's return value: PENDING → schedule the next wakeup
         # from the latest WAIT timestamp; SUCCEEDED/FAILED → mark terminal.
         try:
