@@ -1159,6 +1159,64 @@ def test_cfn_stack_with_parameters(cfn, sqs):
     assert any("cfn-t02-custom" in u for u in urls)
 
 
+def test_cfn_parameter_constraints_are_enforced(cfn):
+    """AllowedPattern, MinLength, MaxLength, MinValue and MaxValue are checked
+    before a stack exists, with CloudFormation's message (measured:
+    ``Parameter 'P' must match pattern ^[a-z]+$``); a ConstraintDescription
+    replaces the reason; a CommaDelimitedList is checked per member."""
+    uid = _uuid_mod.uuid4().hex[:8]
+
+    def template(params):
+        return json.dumps({"Parameters": params, "Resources": {"P": {
+            "Type": "AWS::SSM::Parameter",
+            "Properties": {"Name": f"/cfn-constraints/{uid}", "Type": "String",
+                           "Value": {"Ref": next(iter(params))}}}}})
+
+    def refused(params, value, expected):
+        name = f"cfn-constraints-{uid}-{_uuid_mod.uuid4().hex[:4]}"
+        key = next(iter(params))
+        with pytest.raises(ClientError) as exc:
+            cfn.create_stack(StackName=name, TemplateBody=template(params),
+                             Parameters=[{"ParameterKey": key, "ParameterValue": value}])
+        assert exc.value.response["Error"]["Code"] == "ValidationError"
+        assert exc.value.response["Error"]["Message"] == expected
+        with pytest.raises(ClientError):
+            cfn.describe_stacks(StackName=name)
+
+    refused({"P": {"Type": "String", "AllowedPattern": "^[a-z]+$", "MinLength": "3",
+                   "MaxLength": "3"}}, "ABC1", "Parameter 'P' must match pattern ^[a-z]+$")
+    refused({"P": {"Type": "String", "AllowedPattern": "[a-z]+", "ConstraintDescription":
+                   "must be lowercase letters"}}, "abc1", "Parameter 'P' must be lowercase letters")
+    refused({"P": {"Type": "String", "MinLength": "3"}}, "ab",
+            "Parameter 'P' must contain at least 3 characters")
+    refused({"P": {"Type": "String", "MaxLength": "3"}}, "abcd",
+            "Parameter 'P' must contain at most 3 characters")
+    refused({"N": {"Type": "Number", "MinValue": "1", "MaxValue": "10"}}, "0",
+            "Parameter 'N' must be a number not less than 1")
+    refused({"N": {"Type": "Number", "MinValue": "1", "MaxValue": "10"}}, "11",
+            "Parameter 'N' must be a number not greater than 10")
+    refused({"L": {"Type": "CommaDelimitedList", "AllowedPattern": "[a-z]+"}}, "ab, c1",
+            "Parameter 'L' must match pattern [a-z]+")
+    refused({"L": {"Type": "List<Number>"}}, "1,x",
+            "Parameter 'L' value '1,x' is not a valid List<Number>")
+    refused({"L": {"Type": "List<Number>", "MinValue": "1"}}, "1,0",
+            "Parameter 'L' must be a number not less than 1")
+    refused({"P": {"Type": "String", "AllowedPattern": "["}}, "abc",
+            "Parameter 'P' has an invalid AllowedPattern: unterminated character set at position 0")
+
+    # A Default that satisfies the constraints and a valid override both pass.
+    name = f"cfn-constraints-ok-{uid}"
+    params = {"P": {"Type": "String", "Default": "abc", "AllowedPattern": "^[a-z]+$",
+                    "MinLength": "1", "MaxLength": "5"}}
+    cfn.create_stack(StackName=name, TemplateBody=template(params),
+                     Parameters=[{"ParameterKey": "P", "ParameterValue": "hello"}])
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
 def test_cfn_unnamed_dynamodb_table_survives_unrelated_update(cfn, ddb, ssm):
     """A stack update must not touch an auto-named resource whose own
     properties didn't change — DynamoDB::Table has no update handler, so it
@@ -1995,6 +2053,42 @@ def test_cfn_describe_stack_resources_logical_id_filter(cfn, s3, sqs):
             StackName="cfn-t10", LogicalResourceId="DoesNotExist"
         )
     assert exc_info.value.response["Error"]["Code"] == "ValidationError"
+
+
+def test_cfn_stack_id_addresses_every_read_action(cfn, sqs):
+    """Every action that takes a StackName accepts the stack id (what the CDK
+    sends after its first DescribeStacks), and the responses carry the stack's
+    name, not the id that was passed."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-by-id-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({"Resources": {
+        "Queue": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": f"cfn-by-id-{uid}"}}}}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        stack_id = stack["StackId"]
+
+        assert cfn.describe_stacks(StackName=stack_id)["Stacks"][0]["StackName"] == stack_name
+        detail = cfn.describe_stack_resource(StackName=stack_id, LogicalResourceId="Queue")
+        assert detail["StackResourceDetail"]["StackName"] == stack_name
+        resources = cfn.describe_stack_resources(StackName=stack_id)["StackResources"]
+        assert [r["StackName"] for r in resources] == [stack_name]
+        summaries = cfn.list_stack_resources(StackName=stack_id)["StackResourceSummaries"]
+        assert [r["LogicalResourceId"] for r in summaries] == ["Queue"]
+        assert cfn.get_template(StackName=stack_id)["TemplateBody"]
+        assert cfn.describe_stack_events(StackName=stack_id)["StackEvents"]
+        assert cfn.get_template_summary(StackName=stack_id)["ResourceTypes"] == ["AWS::SQS::Queue"]
+
+        cfn.create_change_set(StackName=stack_id, ChangeSetName="by-id", ChangeSetType="UPDATE",
+                              TemplateBody=json.dumps({"Resources": {"Queue": {
+                                  "Type": "AWS::SQS::Queue", "Properties": {
+                                      "QueueName": f"cfn-by-id-{uid}",
+                                      "VisibilityTimeout": 45}}}}))
+        described = cfn.describe_change_set(ChangeSetName="by-id", StackName=stack_name)
+        assert described["StackName"] == stack_name
+        assert described["Status"] == "CREATE_COMPLETE", described.get("StatusReason")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
 
 
 def test_cfn_yaml_template(cfn, s3):
@@ -11336,6 +11430,32 @@ def test_cfn_unrecognized_type_behind_false_condition_is_fine(cfn):
     finally:
         cfn.delete_stack(StackName=name)
         _wait_stack(cfn, name)
+
+
+def test_cfn_unknown_cloudformation_type_is_rejected_like_any_other(cfn):
+    """An unregistered AWS::CloudFormation::* type (a Macro, a typo) is
+    'Unrecognized resource types', not a silent no-op placeholder; the
+    registered ones (WaitConditionHandle) still deploy."""
+    name = "cfn-preflight-cfn-types"
+    bad = json.dumps({"Resources": {
+        "Handle": {"Type": "AWS::CloudFormation::WaitConditionHandle"},
+        "Typo": {"Type": "AWS::CloudFormation::DoesNotExist", "Properties": {}},
+    }})
+    with pytest.raises(ClientError) as exc:
+        cfn.create_stack(StackName=name, TemplateBody=bad)
+    assert exc.value.response["Error"]["Message"] == (
+        "Template format error: Unrecognized resource types: "
+        "[AWS::CloudFormation::DoesNotExist]")
+    with pytest.raises(ClientError):
+        cfn.describe_stacks(StackName=name)
+
+    good = json.dumps({"Resources": {
+        "Handle": {"Type": "AWS::CloudFormation::WaitConditionHandle"}}})
+    cfn.create_stack(StackName=name, TemplateBody=good)
+    try:
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+    finally:
+        _delete_cfn_test_stack(cfn, name)
 
 
 def test_cfn_validate_template_accepts_a_sam_template(cfn):

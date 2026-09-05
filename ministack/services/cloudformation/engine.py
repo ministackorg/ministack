@@ -165,11 +165,11 @@ def validate_template_support(template: dict, conditions: dict) -> None:
             if cond and not conditions.get(cond, True):
                 continue
             rtype = res.get("Type", "AWS::CloudFormation::CustomResource")
-            if (
-                rtype in _RESOURCE_HANDLERS
-                or rtype.startswith("Custom::")
-                or rtype.startswith("AWS::CloudFormation::")
-            ):
+            # The registered AWS::CloudFormation::* types (WaitCondition,
+            # WaitConditionHandle, Stack, CustomResource) pass like any other
+            # handler; an unregistered one (Macro, HookVersion, a typo) is
+            # unrecognized, not a silent placeholder.
+            if rtype in _RESOURCE_HANDLERS or rtype.startswith("Custom::"):
                 continue
             unrecognized.add(rtype)
     if unrecognized:
@@ -217,6 +217,47 @@ _AWS_SPECIFIC_TYPES = {
 # ``AWS::SSM::Parameter::Name`` (Ref returns the name) and
 # ``AWS::SSM::Parameter::Type`` (a template-side type constraint, not a lookup).
 _SSM_PARAMETER_VALUE_PREFIX = "AWS::SSM::Parameter::Value<"
+
+
+def _constraint_error(name: str, defn: dict, reason: str) -> ValueError:
+    """The ValidationError a violated parameter constraint raises: real
+    CloudFormation answers ``Parameter 'P' must match pattern ^[a-z]+$`` (measured),
+    and a ``ConstraintDescription`` replaces the generic reason."""
+    description = defn.get("ConstraintDescription")
+    return ValueError(f"Parameter '{name}' {description or reason}")
+
+
+def _check_parameter_constraints(name: str, defn: dict, ptype: str, value: str) -> None:
+    """Apply AllowedPattern, MinLength, MaxLength, MinValue and MaxValue the way
+    the Parameters reference defines them: the pattern matches the whole value
+    (each member of a CommaDelimitedList), the lengths apply to String types,
+    the bounds to Number types (each member of a List<Number>)."""
+    is_list = ptype in ("CommaDelimitedList", "List<Number>")
+    members = [m.strip() for m in value.split(",")] if is_list else [value]
+    pattern = defn.get("AllowedPattern")
+    if pattern is not None and ptype != "Number":
+        try:
+            compiled = re.compile(str(pattern))
+        except re.error as exc:
+            raise ValueError(
+                f"Parameter '{name}' has an invalid AllowedPattern: {exc}") from None
+        if not all(compiled.fullmatch(m) for m in members):
+            raise _constraint_error(name, defn, f"must match pattern {pattern}")
+    if ptype in ("Number", "List<Number>"):
+        numbers = [float(m) for m in members]
+        if "MinValue" in defn and any(n < float(defn["MinValue"]) for n in numbers):
+            raise _constraint_error(
+                name, defn, f"must be a number not less than {defn['MinValue']}")
+        if "MaxValue" in defn and any(n > float(defn["MaxValue"]) for n in numbers):
+            raise _constraint_error(
+                name, defn, f"must be a number not greater than {defn['MaxValue']}")
+    elif not is_list:
+        if "MinLength" in defn and len(value) < int(defn["MinLength"]):
+            raise _constraint_error(
+                name, defn, f"must contain at least {defn['MinLength']} characters")
+        if "MaxLength" in defn and len(value) > int(defn["MaxLength"]):
+            raise _constraint_error(
+                name, defn, f"must contain at most {defn['MaxLength']} characters")
 
 
 def _resolve_parameters(template: dict, provided_params: list[dict],
@@ -312,10 +353,19 @@ def _resolve_parameters(template: dict, provided_params: list[dict],
                 float(value)
             except ValueError:
                 raise ValueError(f"Parameter '{name}' value '{value}' is not a valid Number")
+        elif ptype == "List<Number>":
+            for member in value.split(","):
+                try:
+                    float(member.strip())
+                except ValueError:
+                    raise ValueError(
+                        f"Parameter '{name}' value '{value}' is not a valid List<Number>")
         elif ptype == "CommaDelimitedList":
             # Keep as string; Fn::Select will split
             pass
         # AWS-specific types treated as String -- no extra validation
+
+        _check_parameter_constraints(name, defn, ptype, value)
 
         out = {"Value": value, "NoEcho": no_echo}
         if ssm_name is not None:

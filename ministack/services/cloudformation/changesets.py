@@ -77,6 +77,7 @@ def _resolve_props_for_diff(template, params, stack_name, stack_id):
 
 def _create_change_set(params):
     from ministack.services.cloudformation import _change_sets, _stack_events, _stacks
+    from ministack.services.cloudformation.handlers import _resolve_stack
     stack_name = _p(params, "StackName")
     cs_name = _p(params, "ChangeSetName")
     cs_type = _p(params, "ChangeSetType", "UPDATE")
@@ -102,7 +103,11 @@ def _create_change_set(params):
     provided_params = _extract_members(params, "Parameters")
     tags = _extract_members(params, "Tags")
 
-    stack = _stacks.get(stack_name)
+    stack = _resolve_stack(stack_name)
+    if stack is not None and cs_type != "CREATE":
+        # A change set is keyed by the stack's name; an UPDATE set addressed
+        # by stack id carries on under the name.
+        stack_name = stack.get("StackName", stack_name)
 
     if cs_type == "CREATE":
         if stack and stack.get("StackStatus") not in (
