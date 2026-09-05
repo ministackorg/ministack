@@ -14495,6 +14495,10 @@ def test_cfn_iot_thing_group_rename_replaces_and_parent_change_is_refused(cfn, i
         # rolled back with the stack: it still reports the first parent.
         unnamed = iot_client.describe_thing_group(thingGroupName=unnamed_name)
         assert unnamed["thingGroupMetadata"]["parentGroupName"] in parents
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_apigateway_authorizer_update_in_place_and_replacement(cfn, apigw_v1):
     """An authorizer property change updates the authorizer under the same id
     (Ref and AuthorizerId keep their value), a property the template drops
@@ -14672,6 +14676,10 @@ def test_cfn_iot_thing_group_missing_parent_fails_and_unmodelled_properties_are_
         group = iot_client.describe_thing_group(thingGroupName=f"cfn-tg-dyn-{uid}")
         assert group["thingGroupId"] == _output(stack, "Id")
         assert group["thingGroupProperties"]["thingGroupDescription"] == "dynamic on AWS, static here"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_kms_alias_target_change_in_place_and_rename_replaces(cfn, kms_client):
     """A TargetKeyId change re-points the alias under its name (Ref keeps its
     value), an AliasName change replaces the alias — the new name exists, the
@@ -14764,6 +14772,25 @@ def test_cfn_update_rollback_reports_the_previous_template_parameters_and_tags(c
         Parameters=[{"ParameterKey": "Visibility", "ParameterValue": "30"}],
         Tags=[{"Key": "stage", "Value": "before"}],
     )
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(
+            StackName=stack_name, TemplateBody=template("N", "after"),
+            Parameters=[{"ParameterKey": "Visibility", "ParameterValue": "45"}],
+            Tags=[{"Key": "stage", "Value": "after"}],
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+
+        assert normalized(cfn.get_template(StackName=stack_name)["TemplateBody"]) == json.loads(original)
+        assert stack["Parameters"] == [
+            {"ParameterKey": "Visibility", "ParameterValue": "30"}]
+        assert stack["Tags"] == [{"Key": "stage", "Value": "before"}]
+        assert stack.get("Description") in (None, "before")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
 def test_cfn_export_in_use_is_an_import_not_a_mention(cfn, ssm):
     """Deleting an exporting stack is refused only while another stack imports
     the export through Fn::ImportValue, its argument resolved with that stack's
@@ -14829,19 +14856,6 @@ def test_cfn_update_stack_without_changes_is_refused(cfn, sqs):
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
 
-        cfn.update_stack(
-            StackName=stack_name, TemplateBody=template("N", "after"),
-            Parameters=[{"ParameterKey": "Visibility", "ParameterValue": "45"}],
-            Tags=[{"Key": "stage", "Value": "after"}],
-        )
-        stack = _wait_stack(cfn, stack_name)
-        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
-
-        assert normalized(cfn.get_template(StackName=stack_name)["TemplateBody"]) == json.loads(original)
-        assert stack["Parameters"] == [
-            {"ParameterKey": "Visibility", "ParameterValue": "30"}]
-        assert stack["Tags"] == [{"Key": "stage", "Value": "before"}]
-        assert stack.get("Description") in (None, "before")
         for kwargs in (
             {"TemplateBody": template},
             {"UsePreviousTemplate": True},
