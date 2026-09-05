@@ -11287,6 +11287,65 @@ def test_context_arn_shim_survives_a_cached_code_dir(tmp_path):
     assert lsvc._write_context_arn_shim(str(code_dir), "nodejs20.x", "index.handler") is None
 
 
+def test_extract_cache_sweep_is_reference_based(monkeypatch, tmp_path):
+    """The sweep drops extracted trees whose blob no longer backs any
+    function, version, or layer version — and only those. References are read
+    from stored CodeSha256 values (base64), never by re-hashing blobs."""
+    import base64 as _b64
+    import hashlib as _hashlib
+    from ministack.core.responses import AccountRegionScopedDict
+    _fresh_extract_cache(monkeypatch, tmp_path)
+    code_a, code_b = _make_zip("def handler(e,c): return 1"), _make_zip("def handler(e,c): return 2")
+    layer_z = _make_zip("def handler(e,c): return 3")
+    d_a = lsvc._docker_extracted_dir(code_a, "code")
+    d_b = lsvc._docker_extracted_dir(code_b, "code")
+    d_l = lsvc._docker_extracted_dir(layer_z, "layer")
+
+    def b64(blob):
+        return _b64.b64encode(_hashlib.sha256(blob).digest()).decode()
+
+    funcs = AccountRegionScopedDict()
+    funcs["fn-a"] = {"config": {"CodeSha256": b64(code_a)},
+                     "versions": {"1": {"config": {"CodeSha256": b64(code_a)}}}}
+    layers = AccountRegionScopedDict()
+    layers["shared"] = {"versions": [{"Content": {"CodeSha256": b64(layer_z)}}]}
+    monkeypatch.setattr(lsvc, "_functions", funcs)
+    monkeypatch.setattr(lsvc, "_layers", layers)
+
+    lsvc._sweep_extract_cache()
+    assert os.path.isdir(d_a) and os.path.isdir(d_l)
+    assert not os.path.isdir(d_b), "unreferenced code tree must be evicted"
+    assert set(lsvc._docker_extract_dirs) == {f"code-{_hashlib.sha256(code_a).hexdigest()}",
+                                              f"layer-{_hashlib.sha256(layer_z).hexdigest()}"}
+
+    # Last references gone -> everything evicted.
+    del funcs["fn-a"]
+    layers["shared"]["versions"] = []
+    lsvc._sweep_extract_cache()
+    assert lsvc._docker_extract_dirs == {}
+    assert not os.path.isdir(d_a) and not os.path.isdir(d_l)
+
+
+def test_delete_and_update_paths_trigger_the_sweep(lam, monkeypatch):
+    """DeleteFunction, UpdateFunctionCode and DeleteLayerVersion are the
+    moments references disappear; each must run the cache sweep."""
+    calls = []
+    monkeypatch.setattr(lsvc, "_sweep_extract_cache", lambda: calls.append(1))
+    import base64 as _b64
+    fname = f"sweep-hooks-{_uuid_mod.uuid4().hex[:8]}"
+    lsvc._create_function({"FunctionName": fname, "Runtime": "python3.12",
+                           "Role": _LAMBDA_ROLE, "Handler": "index.handler",
+                           "Code": {"ZipFile": _b64.b64encode(
+                               _make_zip("def handler(e,c): return 1")).decode()}})
+    lsvc._update_code(fname, {"ZipFile": _b64.b64encode(
+        _make_zip("def handler(e,c): return 2")).decode()})
+    lsvc._delete_function(fname, {})
+    lsvc._publish_layer_version("sweep-layer", {"Content": {"ZipFile": _b64.b64encode(
+        _make_zip("x = 1")).decode()}})
+    lsvc._delete_layer_version("sweep-layer", 1)
+    assert len(calls) >= 3, calls
+
+
 def test_reset_clears_the_extraction_cache(monkeypatch, tmp_path):
     _fresh_extract_cache(monkeypatch, tmp_path)
     lsvc._docker_extracted_dir(_make_zip("def handler(e, c): pass"), "code")

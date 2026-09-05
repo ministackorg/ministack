@@ -433,6 +433,44 @@ def _docker_extracted_dir(blob: bytes, kind: str) -> str:
         return target
 
 
+def _b64_sha_to_hex(b64_sha: str) -> str | None:
+    """CodeSha256 as stored on records (base64 of the digest) → the hex the
+    extraction cache keys by. Same digest, no re-hashing of blobs."""
+    try:
+        return base64.b64decode(b64_sha).hex() if b64_sha else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _sweep_extract_cache() -> None:
+    """Drop cached extraction trees whose blob no longer backs any function,
+    function version, or layer version — the same reference-based policy the
+    lambda-blob persistence sweep uses. Called when references disappear
+    (function delete, code update, layer-version delete); reset() still
+    clears everything wholesale. Runs on stored CodeSha256 values only, so a
+    sweep never hashes a byte."""
+    live_code: set[str] = set()
+    live_layer: set[str] = set()
+    for func in _functions._data.values():
+        for cfg in [func.get("config") or {}] + [
+                (v or {}).get("config") or {} for v in (func.get("versions") or {}).values()]:
+            sha = _b64_sha_to_hex(cfg.get("CodeSha256", ""))
+            if sha:
+                live_code.add(sha)
+    for layer in _layers._data.values():
+        for ver in layer.get("versions", []):
+            sha = _b64_sha_to_hex((ver.get("Content") or {}).get("CodeSha256", ""))
+            if sha:
+                live_layer.add(sha)
+    with _docker_extract_lock:
+        for key in list(_docker_extract_dirs):
+            kind, _, sha = key.partition("-")
+            live = live_code if kind == "code" else live_layer
+            if sha not in live:
+                import shutil
+                shutil.rmtree(_docker_extract_dirs.pop(key), ignore_errors=True)
+
+
 # ── Persistence ────────────────────────────────────────────
 
 # Lambda code zips are stored on disk as content-addressed blob files under
@@ -2615,6 +2653,9 @@ def _delete_function(name: str, query_params: dict, path_qualifier: str | None =
         # Docker pool too — otherwise the function's pooled containers leak
         # until _WARM_CONTAINER_TTL eviction.
         _pool_kill_function(get_account_id(), name)
+    # The deleted record may have been the last reference to its extracted
+    # code tree in the docker executor cache.
+    _sweep_extract_cache()
     return 204, {}, b""
 
 
@@ -2682,6 +2723,8 @@ def _update_code(name: str, data: dict):
 
     # Invalidate only the old $LATEST worker — published version workers stay alive
     invalidate_worker(name, qualifier="$LATEST", account=get_account_id(), region=get_region())
+    # The replaced zip's extracted tree may now be unreferenced.
+    _sweep_extract_cache()
     # Docker pool: the new CodeSha256 changes the pool key so new invokes
     # spawn fresh containers anyway, but the old containers under the old key
     # would linger until _WARM_CONTAINER_TTL. Reap them now.
@@ -6050,6 +6093,9 @@ def _delete_layer_version(layer_name: str, version: int):
     if not layer:
         return 204, {}, b""
     layer["versions"] = [vc for vc in layer["versions"] if vc["Version"] != version]
+    # The removed version may have been the last reference to its extracted
+    # layer tree in the docker executor cache.
+    _sweep_extract_cache()
     return 204, {}, b""
 
 
