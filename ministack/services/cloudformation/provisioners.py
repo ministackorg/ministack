@@ -5,6 +5,7 @@ CloudFormation provisioners — resource create/delete handlers for each AWS res
 """
 
 import base64
+import contextvars
 import copy
 import hashlib
 import io
@@ -451,18 +452,26 @@ def _custom_named_replacement_error(resource_type, old_props, new_props):
     return None
 
 
+# Set by the stack engine around an update whose resource carries
+# ``UpdateReplacePolicy: Retain`` (or ``RetainExceptOnCreate``): a handler that
+# replaces the resource must then leave the predecessor in place; the engine
+# records the DELETE_SKIPPED event.
+_RETAIN_REPLACED = contextvars.ContextVar("cfn_retain_replaced", default=False)
+
+
 def _rename_replacement(physical_id, old_props, new_props, stack_name, logical_id,
                         declared_name, current_name, create_fn, delete_fn):
     """Shared prologue for the name-keyed update handlers: when the resource
     record is gone (current_name is None) or its create-only name property
     changed, the update is a replacement — create the new resource first, then
-    delete the old one, in CloudFormation's replacement order. Returns the
-    create result, or None when the update can proceed in place.
+    delete the old one, in CloudFormation's replacement order (unless the
+    resource's UpdateReplacePolicy retains it). Returns the create result, or
+    None when the update can proceed in place.
     """
     if current_name is not None and declared_name == current_name:
         return None
     created = create_fn(logical_id or physical_id, new_props, stack_name)
-    if current_name is not None and created[0] != physical_id:
+    if current_name is not None and created[0] != physical_id and not _RETAIN_REPLACED.get():
         delete_fn(physical_id, old_props)
     return created
 
