@@ -448,11 +448,19 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 # A cleanup miss doesn't fail the update — real CloudFormation
                 # reports the resource DELETE_FAILED during the
                 # UPDATE_COMPLETE_CLEANUP phase and still lands the stack in
-                # UPDATE_COMPLETE — but it must be visible, not a warning.
+                # UPDATE_COMPLETE. The resource stays in the stack with that
+                # status (it still exists in the service), so the next update
+                # or the stack delete tries the delete again.
                 logger.error("Failed to delete old resource %s: %s",
                              logical_id, exc)
                 _add_event(stack_id, stack_name, logical_id, rtype,
                            "DELETE_FAILED", str(exc), pid)
+                leftover = provisioned_resources.get(logical_id)
+                if leftover is not None:
+                    leftover["ResourceStatus"] = "DELETE_FAILED"
+                    leftover["ResourceStatusReason"] = str(exc)
+                    leftover["Timestamp"] = now_iso()
+                continue
             provisioned_resources.pop(logical_id, None)
 
     await asyncio.sleep(0)
@@ -627,6 +635,10 @@ async def _delete_stack_async(stack_name: str, stack_id: str,
         ordered = _topological_sort(res_defs, conditions) if res_defs else list(resources.keys())
     except ValueError:
         ordered = list(resources.keys())
+    # A resource the template no longer declares but the stack still holds
+    # (its cleanup delete failed on an earlier update) has no dependents left;
+    # it goes first, so a retried delete reaches it.
+    ordered += [lid for lid in resources if lid not in ordered]
 
     delete_failures = []
     for logical_id in reversed(ordered):
