@@ -17,7 +17,7 @@ from .engine import (
     _resolve_refs,
     validate_template_support,
 )
-from .helpers import _error, _esc, _extract_members, _p, _resolve_template, _xml
+from .helpers import _error, _esc, _extract_members, _p, _page, _resolve_template, _xml
 from .stacks import (
     _add_event,
     _create_stack_task_in_region,
@@ -466,10 +466,12 @@ def _list_change_sets(params):
     if not stack_name:
         return _error("ValidationError", "StackName is required")
 
+    listed = [cs for cs in _change_sets.values() if cs["StackName"] == stack_name]
+    listed, next_token_xml, err = _page(listed, params, "ListChangeSets")
+    if err:
+        return err
     members = ""
-    for cs in _change_sets.values():
-        if cs["StackName"] != stack_name:
-            continue
+    for cs in listed:
         members += (
             "<member>"
             f"<ChangeSetId>{_esc(cs['ChangeSetId'])}</ChangeSetId>"
@@ -487,7 +489,7 @@ def _list_change_sets(params):
     return _xml(200, "ListChangeSetsResponse",
                 f"<ListChangeSetsResult>"
                 f"<Summaries>{members}</Summaries>"
-                f"</ListChangeSetsResult>")
+                f"{next_token_xml}</ListChangeSetsResult>")
 
 
 # --- GetTemplateSummary ---

@@ -33,6 +33,7 @@ from .helpers import (
     _extract_stack_status_filters,
     _extract_string_members,
     _p,
+    _page,
     _resolve_template,
     _xml,
 )
@@ -209,6 +210,9 @@ def _describe_stacks(params):
             if s.get("StackStatus") != "DELETE_COMPLETE"
         ]
 
+    stacks_to_describe, next_token_xml, err = _page(stacks_to_describe, params, "DescribeStacks")
+    if err:
+        return err
     members = ""
     for s in stacks_to_describe:
         params_xml = ""
@@ -264,7 +268,8 @@ def _describe_stacks(params):
         )
 
     return _xml(200, "DescribeStacksResponse",
-                f"<DescribeStacksResult><Stacks>{members}</Stacks></DescribeStacksResult>")
+                f"<DescribeStacksResult><Stacks>{members}</Stacks>"
+                f"{next_token_xml}</DescribeStacksResult>")
 
 
 # --- ListStacks ---
@@ -272,12 +277,17 @@ def _describe_stacks(params):
 def _list_stacks(params):
     from ministack.services.cloudformation import _stacks
     status_filters = _extract_stack_status_filters(params)
+    listed = [
+        s for s in _stacks.values()
+        if not status_filters or s.get("StackStatus", "") in status_filters
+    ]
+    listed, next_token_xml, err = _page(listed, params, "ListStacks")
+    if err:
+        return err
 
     summaries = ""
-    for s in _stacks.values():
+    for s in listed:
         status = s.get("StackStatus", "")
-        if status_filters and status not in status_filters:
-            continue
         entry = (
             "<member>"
             f"<StackName>{_esc(s['StackName'])}</StackName>"
@@ -295,7 +305,8 @@ def _list_stacks(params):
         summaries += entry
 
     return _xml(200, "ListStacksResponse",
-                f"<ListStacksResult><StackSummaries>{summaries}</StackSummaries></ListStacksResult>")
+                f"<ListStacksResult><StackSummaries>{summaries}</StackSummaries>"
+                f"{next_token_xml}</ListStacksResult>")
 
 
 # --- DescribeStackEvents ---
@@ -313,9 +324,16 @@ def _describe_stack_events(params):
 
     stack_id = stack["StackId"]
     events = _stack_events.get(stack_id, [])
-    # Newest first
-    events_sorted = sorted(events, key=lambda e: e.get("Timestamp", ""),
-                           reverse=True)
+    # Newest first; events of one millisecond in reverse emission order
+    events_sorted = [
+        e for _, e in sorted(
+            enumerate(events),
+            key=lambda pair: (pair[1].get("Timestamp", ""), pair[0]),
+            reverse=True)
+    ]
+    events_sorted, next_token_xml, err = _page(events_sorted, params, "DescribeStackEvents")
+    if err:
+        return err
 
     members = ""
     for e in events_sorted:
@@ -334,7 +352,8 @@ def _describe_stack_events(params):
         )
 
     return _xml(200, "DescribeStackEventsResponse",
-                f"<DescribeStackEventsResult><StackEvents>{members}</StackEvents></DescribeStackEventsResult>")
+                f"<DescribeStackEventsResult><StackEvents>{members}</StackEvents>"
+                f"{next_token_xml}</DescribeStackEventsResult>")
 
 
 # --- DescribeStackResource ---
@@ -428,8 +447,11 @@ def _list_stack_resources(params):
                       f"Stack [{stack_name}] does not exist")
 
     resources = stack.get("_resources", {})
+    listed, next_token_xml, err = _page(list(resources.items()), params, "ListStackResources")
+    if err:
+        return err
     members = ""
-    for logical_id, res in resources.items():
+    for logical_id, res in listed:
         members += (
             "<member>"
             f"<LogicalResourceId>{_esc(logical_id)}</LogicalResourceId>"
@@ -443,7 +465,7 @@ def _list_stack_resources(params):
     return _xml(200, "ListStackResourcesResponse",
                 f"<ListStackResourcesResult>"
                 f"<StackResourceSummaries>{members}</StackResourceSummaries>"
-                f"</ListStackResourcesResult>")
+                f"{next_token_xml}</ListStackResourcesResult>")
 
 
 # --- GetTemplate ---
@@ -776,8 +798,11 @@ def _validate_template(params):
 
 def _list_exports(params):
     from ministack.services.cloudformation import _exports
+    listed, next_token_xml, err = _page(list(_exports.items()), params, "ListExports")
+    if err:
+        return err
     members = ""
-    for name, exp in _exports.items():
+    for name, exp in listed:
         members += (
             "<member>"
             f"<ExportingStackId>{_esc(exp.get('StackId', ''))}</ExportingStackId>"
@@ -787,7 +812,8 @@ def _list_exports(params):
         )
 
     return _xml(200, "ListExportsResponse",
-                f"<ListExportsResult><Exports>{members}</Exports></ListExportsResult>")
+                f"<ListExportsResult><Exports>{members}</Exports>"
+                f"{next_token_xml}</ListExportsResult>")
 # --- GetTemplateSummary ---
 
 def _get_template_summary(params):
@@ -913,9 +939,13 @@ def _list_imports(params):
     if not importers:
         return _error("ValidationError",
                       f"Export '{export_name}' is not imported by any stack.")
+    importers, next_token_xml, err = _page(importers, params, "ListImports")
+    if err:
+        return err
     members = "".join(f"<member>{_esc(n)}</member>" for n in importers)
     return _xml(200, "ListImportsResponse",
-                f"<ListImportsResult><Imports>{members}</Imports></ListImportsResult>")
+                f"<ListImportsResult><Imports>{members}</Imports>"
+                f"{next_token_xml}</ListImportsResult>")
 
 
 # --- UpdateTerminationProtection / stack policy ---
