@@ -527,6 +527,35 @@ def _update_resource(resource_type: str, physical_id: str, old_props: dict,
     return _provision_resource(resource_type, logical_id or physical_id, new_props, stack_name)
 
 
+# ---------------------------------------------------------------------------
+# Tags
+# ---------------------------------------------------------------------------
+
+def _tag_map(tags) -> dict:
+    """The ``{Key: Value}`` view of a CloudFormation ``Tags`` property; a map
+    (the shape SSM and API Gateway v2 use) passes through."""
+    if isinstance(tags, dict):
+        return {str(k): str(v) for k, v in tags.items()}
+    return {
+        str(t["Key"]): str(t.get("Value", ""))
+        for t in (tags or [])
+        if isinstance(t, dict) and "Key" in t
+    }
+
+
+def _reconcile_tag_map(store: dict, old_props: dict, new_props: dict) -> None:
+    """Apply a ``Tags`` property change to a service's ``{key: value}`` tag
+    store: keys the template dropped are removed, the rest set. Tags added
+    through the service's own tagging API stay untouched, as on AWS."""
+    old_tags = _tag_map(old_props.get("Tags"))
+    new_tags = _tag_map(new_props.get("Tags"))
+    if old_tags == new_tags:
+        return
+    for key in old_tags.keys() - new_tags.keys():
+        store.pop(key, None)
+    store.update(new_tags)
+
+
 # ===========================================================================
 # Resource Provisioners
 # ===========================================================================
@@ -877,7 +906,7 @@ def _sqs_create(logical_id, props, stack_name):
         "is_fifo": is_fifo,
         "attributes": attributes,
         "messages": [],
-        "tags": {},
+        "tags": _tag_map(props.get("Tags")),
         "dedup_cache": {},
         "fifo_seq": 0,
     }
@@ -919,6 +948,7 @@ def _sqs_update(physical_id, old_props, new_props, stack_name, logical_id=None):
             ).lower()
         else:
             attributes.pop("ContentBasedDeduplication", None)
+    _reconcile_tag_map(queue.setdefault("tags", {}), old_props, new_props)
     attributes["LastModifiedTimestamp"] = str(int(time.time()))
     arn = attributes["QueueArn"]
     return physical_id, {"Arn": arn, "QueueName": name, "QueueUrl": physical_id}
@@ -969,7 +999,7 @@ def _sns_create(logical_id, props, stack_name):
         },
         "subscriptions": [],
         "messages": [],
-        "tags": {},
+        "tags": _tag_map(props.get("Tags")),
     }
 
     # Handle Subscription property. The private _cfn_inline marker is what
@@ -1013,6 +1043,7 @@ def _sns_update(physical_id, old_props, new_props, stack_name, logical_id=None):
     if replaced is not None:
         return replaced
     topic["attributes"]["DisplayName"] = new_props.get("DisplayName", name)
+    _reconcile_tag_map(topic.setdefault("tags", {}), old_props, new_props)
     # Reconcile the template-inline subscriptions by (Protocol, Endpoint).
     # Only records carrying the _cfn_inline marker are eligible for removal:
     # a standalone AWS::SNS::Subscription resource (or a plain Subscribe call)
@@ -1153,6 +1184,10 @@ def _ddb_create(logical_id, props, stack_name):
         "Tags": [],
     }
     _dynamodb._tables[name] = table
+    if props.get("Tags"):
+        _dynamodb._tags[arn] = [
+            {"Key": k, "Value": v} for k, v in _tag_map(props["Tags"]).items()
+        ]
 
     attrs = {"Arn": arn}
     if stream_arn:
@@ -1202,6 +1237,19 @@ def _ddb_update(physical_id, old_props, new_props, stack_name, logical_id=None):
             )
         _ddb_delete(physical_id, old_props)
         return _ddb_create(logical_id or physical_id, new_props, stack_name)
+
+    old_tags = _tag_map(old_props.get("Tags"))
+    new_tags = _tag_map(new_props.get("Tags"))
+    if old_tags != new_tags:
+        # The table's tag list lives in the service's own store; tags the
+        # template dropped go, the rest are set, foreign tags stay.
+        kept = [
+            t for t in _dynamodb._tags.get(table["TableArn"], [])
+            if t["Key"] not in old_tags and t["Key"] not in new_tags
+        ]
+        _dynamodb._tags[table["TableArn"]] = kept + [
+            {"Key": k, "Value": v} for k, v in new_tags.items()
+        ]
 
     data = {"TableName": name}
     old_billing = old_props.get("BillingMode", "PROVISIONED")
@@ -1387,7 +1435,7 @@ def _lambda_create(logical_id, props, stack_name):
         "code_s3_object_version": code.get("S3ObjectVersion"),
         "versions": {},
         "next_version": 1,
-        "tags": {},
+        "tags": _tag_map(props.get("Tags")),
         "policy": {"Version": "2012-10-17", "Id": "default", "Statement": []},
         "event_invoke_config": None,
         "event_invoke_configs": {},
@@ -1495,6 +1543,7 @@ def _lambda_update(physical_id, old_props, new_props, stack_name, logical_id=Non
     resp = _lambda_svc._update_config(name, config_data)
     if resp[0] >= 400:
         raise ValueError(f"AWS::Lambda::Function configuration update failed: {resp[2]!r}")
+    _reconcile_tag_map(func.setdefault("tags", {}), old_props, new_props)
     return name, {"Arn": func["config"]["FunctionArn"]}
 
 
@@ -2215,7 +2264,7 @@ def _cwlogs_create(logical_id, props, stack_name):
         "arn": arn,
         "creationTime": int(time.time() * 1000),
         "retentionInDays": int(retention) if retention else None,
-        "tags": {},
+        "tags": _tag_map(props.get("Tags")),
         "streams": {},
         "subscriptionFilters": {},
     }
@@ -2237,6 +2286,7 @@ def _cwlogs_update(physical_id, old_props, new_props, stack_name, logical_id=Non
         return replaced
     retention = new_props.get("RetentionInDays")
     group["retentionInDays"] = int(retention) if retention else None
+    _reconcile_tag_map(group.setdefault("tags", {}), old_props, new_props)
     return name, {"Arn": group["arn"]}
 
 
@@ -2631,7 +2681,7 @@ def _kinesis_stream_create(logical_id, props, stack_name):
         "StreamModeDetails": {"StreamMode": stream_mode},
         "RetentionPeriodHours": retention,
         "shards": _kinesis._build_shards(shard_count),
-        "tags": {},
+        "tags": _tag_map(props.get("Tags")),
         "CreationTimestamp": int(time.time()),
         "EncryptionType": "NONE",
     }
@@ -8183,6 +8233,7 @@ def _kinesis_stream_update(physical_id, old_props, new_props, stack_name):
     smd = new_props.get("StreamModeDetails")
     if isinstance(smd, dict) and smd.get("StreamMode"):
         stream["StreamModeDetails"] = {"StreamMode": smd["StreamMode"]}
+    _reconcile_tag_map(stream.setdefault("tags", {}), old_props, new_props)
     # ShardCount changes keep the existing shards — records live in them.
     return physical_id, {"Arn": stream["StreamARN"]}
 

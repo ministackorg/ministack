@@ -5472,6 +5472,103 @@ def test_cfn_eventbus_tags(cfn, eb):
     _wait_stack(cfn, "cfn-eb-t04")
 
 
+def _cfn_tag_template(tags):
+    return {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Queue": {"Type": "AWS::SQS::Queue", "Properties": {"Tags": tags}},
+            "Topic": {"Type": "AWS::SNS::Topic", "Properties": {"Tags": tags}},
+            "Table": {
+                "Type": "AWS::DynamoDB::Table",
+                "Properties": {
+                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "BillingMode": "PAY_PER_REQUEST",
+                    "Tags": tags,
+                },
+            },
+            "Fn": {
+                "Type": "AWS::Lambda::Function",
+                "Properties": {
+                    "Runtime": "python3.12",
+                    "Handler": "index.handler",
+                    "Role": "arn:aws:iam::000000000000:role/cfn-tags-role",
+                    "Code": {"ZipFile": "def handler(e, c): return {}"},
+                    "Tags": tags,
+                },
+            },
+            "Logs": {"Type": "AWS::Logs::LogGroup", "Properties": {"Tags": tags}},
+            "Stream": {
+                "Type": "AWS::Kinesis::Stream",
+                "Properties": {"ShardCount": 1, "Tags": tags},
+            },
+        },
+        "Outputs": {
+            "QueueUrl": {"Value": {"Ref": "Queue"}},
+            "TopicArn": {"Value": {"Ref": "Topic"}},
+            "TableArn": {"Value": {"Fn::GetAtt": ["Table", "Arn"]}},
+            "FnArn": {"Value": {"Fn::GetAtt": ["Fn", "Arn"]}},
+            "LogGroup": {"Value": {"Ref": "Logs"}},
+            "StreamName": {"Value": {"Ref": "Stream"}},
+        },
+    }
+
+
+def _cfn_tag_readback(sqs, sns, ddb, lam, logs, kinesis, stack):
+    """The tags each service reports for the resources of `stack`, keyed by
+    logical id, as {key: value} maps."""
+    return {
+        "Queue": sqs.list_queue_tags(QueueUrl=_output(stack, "QueueUrl")).get("Tags", {}),
+        "Topic": {
+            t["Key"]: t["Value"]
+            for t in sns.list_tags_for_resource(ResourceArn=_output(stack, "TopicArn"))["Tags"]
+        },
+        "Table": {
+            t["Key"]: t["Value"]
+            for t in ddb.list_tags_of_resource(ResourceArn=_output(stack, "TableArn"))["Tags"]
+        },
+        "Fn": lam.list_tags(Resource=_output(stack, "FnArn"))["Tags"],
+        "Logs": logs.list_tags_log_group(logGroupName=_output(stack, "LogGroup"))["tags"],
+        "Stream": {
+            t["Key"]: t["Value"]
+            for t in kinesis.list_tags_for_stream(StreamName=_output(stack, "StreamName"))["Tags"]
+        },
+    }
+
+
+def test_cfn_resource_tags_reach_the_service(cfn, sqs, sns, ddb, lam, logs):
+    """The Tags property of a queue, topic, table, function, log group and
+    stream is stored where the service's own tag API reads it, and a template
+    change to it is reconciled on update without touching tags added through
+    that API."""
+    kinesis = _regional_cfn_test_client("kinesis", cfn.meta.region_name)
+    name = f"cfn-res-tags-{_uuid_mod.uuid4().hex[:8]}"
+    first = [{"Key": "env", "Value": "test"}, {"Key": "team", "Value": "platform"}]
+    cfn.create_stack(StackName=name, TemplateBody=json.dumps(_cfn_tag_template(first)))
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        seen = _cfn_tag_readback(sqs, sns, ddb, lam, logs, kinesis, stack)
+        for logical_id, tags in seen.items():
+            assert tags == {"env": "test", "team": "platform"}, logical_id
+
+        # A tag set through the service API is not CloudFormation's to remove.
+        sqs.tag_queue(QueueUrl=_output(stack, "QueueUrl"), Tags={"manual": "yes"})
+        lam.tag_resource(Resource=_output(stack, "FnArn"), Tags={"manual": "yes"})
+
+        second = [{"Key": "env", "Value": "prod"}, {"Key": "owner", "Value": "ops"}]
+        cfn.update_stack(StackName=name, TemplateBody=json.dumps(_cfn_tag_template(second)))
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE"
+        seen = _cfn_tag_readback(sqs, sns, ddb, lam, logs, kinesis, stack)
+        for logical_id in ("Topic", "Table", "Logs", "Stream"):
+            assert seen[logical_id] == {"env": "prod", "owner": "ops"}, logical_id
+        assert seen["Queue"] == {"env": "prod", "owner": "ops", "manual": "yes"}
+        assert seen["Fn"] == {"env": "prod", "owner": "ops", "manual": "yes"}
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
 def test_cfn_eventbus_with_rule(cfn, eb):
     """Test EventBus with EventBridge Rule on custom bus."""
     template = {
