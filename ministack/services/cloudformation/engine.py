@@ -8,6 +8,8 @@ condition evaluation, intrinsic function resolution, and topological sorting.
 import base64
 import copy
 import heapq
+import ipaddress
+import itertools
 import json
 import logging
 import os
@@ -114,7 +116,8 @@ def _parse_template(template_body: str) -> dict:
 # Template pre-flight
 # ===========================================================================
 
-_DYNAMIC_REFERENCE = re.compile(r"\{\{resolve:([a-z-]+):[^}]*\}\}")
+_DYNAMIC_REFERENCE = re.compile(r"\{\{resolve:([a-z-]+):([^}]*)\}\}")
+_DYNAMIC_SERVICES = ("ssm", "ssm-secure", "secretsmanager")
 
 
 def _find_dynamic_references(value, found: set) -> None:
@@ -129,6 +132,107 @@ def _find_dynamic_references(value, found: set) -> None:
             _find_dynamic_references(v, found)
 
 
+def _has_dynamic_references(template: dict) -> bool:
+    refs: set[str] = set()
+    _find_dynamic_references((template or {}).get("Resources"), refs)
+    return bool(refs)
+
+
+def _resolve_dynamic_reference(literal: str) -> str:
+    """Resolve one ``{{resolve:...}}`` literal against the in-process SSM /
+    Secrets Manager stores. Raises ``ValueError`` when it cannot be resolved,
+    which fails the resource the way an unresolvable reference does on AWS.
+    ``ssm`` / ``ssm-secure`` take ``name[:version]`` (no version = latest);
+    ``secretsmanager`` takes
+    ``secret-id[:SecretString[:json-key[:version-stage[:version-id]]]]``,
+    the secret id being a name or an ARN."""
+    from ministack.services import secretsmanager, ssm
+
+    m = _DYNAMIC_REFERENCE.fullmatch(literal)
+    service, body = m.group(1), m.group(2)
+    if service in ("ssm", "ssm-secure"):
+        name, _, version = body.partition(":")
+        value = ssm.resolve_parameter_value(name, version or None, decrypt=True)
+        if value is None:
+            raise ValueError(
+                f"Dynamic reference {literal} could not be resolved: parameter "
+                f"{name}" + (f" version {version}" if version else "") + " not found")
+        return value
+    if body.startswith("arn:"):
+        parts = body.split(":")
+        secret_id, rest = ":".join(parts[:7]), parts[7:]
+    else:
+        parts = body.split(":")
+        secret_id, rest = parts[0], parts[1:]
+    rest += [""] * (4 - len(rest))
+    secret_string, json_key, version_stage, version_id = rest[:4]
+    if secret_string and secret_string != "SecretString":
+        raise ValueError(
+            f"Dynamic reference {literal} is invalid: the secret-string segment "
+            "must be SecretString")
+    if version_stage and version_id:
+        raise ValueError(
+            f"Dynamic reference {literal} is invalid: specify either a version "
+            "stage or a version id, not both")
+    value = secretsmanager.resolve_secret_string(
+        secret_id, version_stage or "AWSCURRENT", version_id or None)
+    if value is None:
+        raise ValueError(
+            f"Dynamic reference {literal} could not be resolved: secret "
+            f"{secret_id} not found")
+    if json_key:
+        try:
+            value = json.loads(value)[json_key]
+        except (ValueError, KeyError, TypeError):
+            raise ValueError(
+                f"Dynamic reference {literal} could not be resolved: key "
+                f"{json_key} not found in the secret") from None
+        if not isinstance(value, str):
+            value = json.dumps(value)
+    return value
+
+
+def _resolve_dynamic_references(value, previous: dict | None = None,
+                                reuse_ssm: bool = False,
+                                reuse_secrets: bool = False):
+    """Substitute every ``{{resolve:...}}`` inside ``value`` (recursively).
+
+    Returns ``(resolved_value, {literal: value})``. ``previous`` is the map a
+    prior deployment of the same resource recorded; ``reuse_ssm`` /
+    ``reuse_secrets`` keep those values instead of resolving again, which is
+    how the two kinds differ on update: an ``ssm`` reference re-resolves
+    whenever the stack is updated with a changed template, a
+    ``secretsmanager`` reference only when the resource that carries it
+    changes.
+    """
+    previous = previous or {}
+    resolved: dict = {}
+
+    def one(literal):
+        if literal in resolved:
+            return resolved[literal]
+        service = _DYNAMIC_REFERENCE.fullmatch(literal).group(1)
+        reuse = reuse_secrets if service == "secretsmanager" else reuse_ssm
+        if reuse and literal in previous:
+            resolved[literal] = previous[literal]
+        else:
+            resolved[literal] = _resolve_dynamic_reference(literal)
+        return resolved[literal]
+
+    def walk(node):
+        if isinstance(node, str):
+            if "{{resolve:" not in node:
+                return node
+            return _DYNAMIC_REFERENCE.sub(lambda m: one(m.group(0)), node)
+        if isinstance(node, list):
+            return [walk(v) for v in node]
+        if isinstance(node, dict):
+            return {k: walk(v) for k, v in node.items()}
+        return node
+
+    return walk(value), resolved
+
+
 def validate_template_support(template: dict, conditions: dict) -> None:
     """Reject up front what provisioning could only fail on halfway through.
 
@@ -139,9 +243,9 @@ def validate_template_support(template: dict, conditions: dict) -> None:
     provisions its predecessors first and rolls them back. Condition-false
     resources are exempt, as they are during provisioning.
 
-    Dynamic references (``{{resolve:ssm:...}}`` and friends) are not resolved
-    by this emulator; refusing them here replaces the old behaviour of passing
-    the literal ``{{resolve:...}}`` string on to the service.
+    Dynamic references are resolved at provisioning time (``ssm``,
+    ``ssm-secure`` and ``secretsmanager``); a reference to any other service
+    is refused here, as is a malformed one.
 
     Raises ``ValueError`` with the message the caller wraps as a
     ``ValidationError``.
@@ -165,11 +269,11 @@ def validate_template_support(template: dict, conditions: dict) -> None:
             if cond and not conditions.get(cond, True):
                 continue
             rtype = res.get("Type", "AWS::CloudFormation::CustomResource")
-            if (
-                rtype in _RESOURCE_HANDLERS
-                or rtype.startswith("Custom::")
-                or rtype.startswith("AWS::CloudFormation::")
-            ):
+            # The registered AWS::CloudFormation::* types (WaitCondition,
+            # WaitConditionHandle, Stack, CustomResource) pass like any other
+            # handler; an unregistered one (Macro, HookVersion, a typo) is
+            # unrecognized, not a silent placeholder.
+            if rtype in _RESOURCE_HANDLERS or rtype.startswith("Custom::"):
                 continue
             unrecognized.add(rtype)
     if unrecognized:
@@ -177,14 +281,18 @@ def validate_template_support(template: dict, conditions: dict) -> None:
             "Template format error: Unrecognized resource types: ["
             + ", ".join(sorted(unrecognized)) + "]"
         )
+    _validate_template_statics(template)
 
     refs: set[str] = set()
     _find_dynamic_references(template.get("Resources"), refs)
     _find_dynamic_references(template.get("Outputs"), refs)
-    if refs:
+    unsupported = sorted(
+        r for r in refs if _DYNAMIC_REFERENCE.fullmatch(r).group(1) not in _DYNAMIC_SERVICES)
+    if unsupported:
         raise ValueError(
-            "Template format error: dynamic references are not supported by "
-            "ministack: " + ", ".join(sorted(refs))
+            "Template format error: unsupported dynamic reference(s): "
+            + ", ".join(unsupported)
+            + " (supported: ssm, ssm-secure, secretsmanager)"
         )
 
 
@@ -217,6 +325,47 @@ _AWS_SPECIFIC_TYPES = {
 # ``AWS::SSM::Parameter::Name`` (Ref returns the name) and
 # ``AWS::SSM::Parameter::Type`` (a template-side type constraint, not a lookup).
 _SSM_PARAMETER_VALUE_PREFIX = "AWS::SSM::Parameter::Value<"
+
+
+def _constraint_error(name: str, defn: dict, reason: str) -> ValueError:
+    """The ValidationError a violated parameter constraint raises: real
+    CloudFormation answers ``Parameter 'P' must match pattern ^[a-z]+$`` (measured),
+    and a ``ConstraintDescription`` replaces the generic reason."""
+    description = defn.get("ConstraintDescription")
+    return ValueError(f"Parameter '{name}' {description or reason}")
+
+
+def _check_parameter_constraints(name: str, defn: dict, ptype: str, value: str) -> None:
+    """Apply AllowedPattern, MinLength, MaxLength, MinValue and MaxValue the way
+    the Parameters reference defines them: the pattern matches the whole value
+    (each member of a CommaDelimitedList), the lengths apply to String types,
+    the bounds to Number types (each member of a List<Number>)."""
+    is_list = ptype in ("CommaDelimitedList", "List<Number>")
+    members = [m.strip() for m in value.split(",")] if is_list else [value]
+    pattern = defn.get("AllowedPattern")
+    if pattern is not None and ptype != "Number":
+        try:
+            compiled = re.compile(str(pattern))
+        except re.error as exc:
+            raise ValueError(
+                f"Parameter '{name}' has an invalid AllowedPattern: {exc}") from None
+        if not all(compiled.fullmatch(m) for m in members):
+            raise _constraint_error(name, defn, f"must match pattern {pattern}")
+    if ptype in ("Number", "List<Number>"):
+        numbers = [float(m) for m in members]
+        if "MinValue" in defn and any(n < float(defn["MinValue"]) for n in numbers):
+            raise _constraint_error(
+                name, defn, f"must be a number not less than {defn['MinValue']}")
+        if "MaxValue" in defn and any(n > float(defn["MaxValue"]) for n in numbers):
+            raise _constraint_error(
+                name, defn, f"must be a number not greater than {defn['MaxValue']}")
+    elif not is_list:
+        if "MinLength" in defn and len(value) < int(defn["MinLength"]):
+            raise _constraint_error(
+                name, defn, f"must contain at least {defn['MinLength']} characters")
+        if "MaxLength" in defn and len(value) > int(defn["MaxLength"]):
+            raise _constraint_error(
+                name, defn, f"must contain at most {defn['MaxLength']} characters")
 
 
 def _resolve_parameters(template: dict, provided_params: list[dict],
@@ -312,10 +461,19 @@ def _resolve_parameters(template: dict, provided_params: list[dict],
                 float(value)
             except ValueError:
                 raise ValueError(f"Parameter '{name}' value '{value}' is not a valid Number")
+        elif ptype == "List<Number>":
+            for member in value.split(","):
+                try:
+                    float(member.strip())
+                except ValueError:
+                    raise ValueError(
+                        f"Parameter '{name}' value '{value}' is not a valid List<Number>")
         elif ptype == "CommaDelimitedList":
             # Keep as string; Fn::Select will split
             pass
         # AWS-specific types treated as String -- no extra validation
+
+        _check_parameter_constraints(name, defn, ptype, value)
 
         out = {"Value": value, "NoEcho": no_echo}
         if ssm_name is not None:
@@ -381,6 +539,70 @@ def _evaluate_conditions(template: dict, params: dict) -> dict:
 # ===========================================================================
 # Intrinsic Function Resolver
 # ===========================================================================
+
+def _cidr_blocks(ip_block: str, count: int, cidr_bits: int) -> list[str]:
+    """``Fn::Cidr``: ``count`` consecutive subnets of ``ip_block`` whose mask is
+    ``cidr_bits`` shorter than the address length (``cidrBits`` are subnet
+    bits: 8 on an IPv4 /16 gives /24 blocks — measured on AWS:
+    ``192.168.0.0/16, 2, 8`` is ``192.168.0.0/24,192.168.1.0/24``)."""
+    if not 1 <= count <= 256:
+        raise ValueError(
+            f"Template error: Fn::Cidr count must be between 1 and 256, got {count}")
+    try:
+        network = ipaddress.ip_network(ip_block, strict=False)
+    except ValueError:
+        raise ValueError(f"Template error: Fn::Cidr ipBlock {ip_block!r} is not a CIDR block") from None
+    new_prefix = network.max_prefixlen - cidr_bits
+    if not network.prefixlen < new_prefix <= network.max_prefixlen:
+        raise ValueError(
+            f"Template error: Fn::Cidr cannot split {ip_block} into /{new_prefix} blocks")
+    subnets = list(itertools.islice(network.subnets(new_prefix=new_prefix), count))
+    if len(subnets) < count:
+        raise ValueError(
+            f"Template error: Fn::Cidr {ip_block} holds only {len(subnets)} /{new_prefix} blocks, "
+            f"{count} requested")
+    return [str(subnet) for subnet in subnets]
+
+
+_CONDITION_FUNCTIONS = ("Fn::And", "Fn::Or", "Fn::Not", "Fn::Equals")
+
+
+def _validate_template_statics(template: dict) -> None:
+    """The template errors a real account raises before any stack exists and
+    that need nothing but the template: a condition function as an Output
+    value, and an Fn::FindInMap with literal keys that the Mappings section
+    does not hold (both measured)."""
+    for out in (template.get("Outputs") or {}).values():
+        val = out.get("Value") if isinstance(out, dict) else None
+        if isinstance(val, dict) and len(val) == 1 and next(iter(val)) in _CONDITION_FUNCTIONS:
+            raise ValueError("Template format error: The Value field of every "
+                             "Outputs member must evaluate to a String.")
+    mappings = template.get("Mappings") or {}
+
+    def walk(node):
+        if isinstance(node, dict):
+            if len(node) == 1 and "Fn::FindInMap" in node:
+                args = node["Fn::FindInMap"]
+                if (isinstance(args, list) and len(args) >= 3
+                        and all(isinstance(a, str) for a in args[:3])
+                        and not (len(args) > 3 and isinstance(args[3], dict)
+                                 and "DefaultValue" in args[3])):
+                    name, k1, k2 = args[:3]
+                    if k1 not in mappings.get(name, {}) or k2 not in mappings.get(name, {}).get(k1, {}):
+                        raise ValueError(
+                            f"Template error: Unable to get mapping for {name}::{k1}::{k2}")
+                for arg in args if isinstance(args, list) else []:
+                    walk(arg)
+                return
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    for section in ("Resources", "Outputs", "Conditions"):
+        walk(template.get(section) or {})
+
 
 def _unknown_attribute_message(res: dict, logical_id: str, attr: str) -> str:
     # Verbatim what CloudFormation reports in the stack event that starts the
@@ -562,7 +784,17 @@ def _resolve_refs(value, resources, params, conditions, mappings,
                              mappings, stack_name, stack_id)
         key2 = _resolve_refs(args[2], resources, params, conditions,
                              mappings, stack_name, stack_id)
-        return mappings.get(str(map_name), {}).get(str(key1), {}).get(str(key2), "")
+        top = mappings.get(str(map_name), {})
+        if str(key1) in top and str(key2) in top[str(key1)]:
+            return top[str(key1)][str(key2)]
+        # The optional fourth argument is {"DefaultValue": ...}; without it a
+        # missing key is a template error, as on AWS (measured: "Template
+        # error: Unable to get mapping for M::x::y").
+        if len(args) > 3 and isinstance(args[3], dict) and "DefaultValue" in args[3]:
+            return _resolve_refs(args[3]["DefaultValue"], resources, params,
+                                 conditions, mappings, stack_name, stack_id)
+        raise ValueError(
+            f"Template error: Unable to get mapping for {map_name}::{key1}::{key2}")
 
     # --- Fn::ImportValue ---
     if "Fn::ImportValue" in value:
@@ -608,6 +840,11 @@ def _resolve_refs(value, resources, params, conditions, mappings,
                                conditions, mappings, stack_name, stack_id)
         if not region:
             region = get_region()
+        # The zones the emulator's EC2 DescribeAvailabilityZones reports for
+        # the stack's region. For any other region a real account answered an
+        # empty list (measured), not a fabricated a/b/c.
+        if str(region) != get_region():
+            return []
         return [f"{region}a", f"{region}b", f"{region}c"]
 
     # --- Fn::Cidr ---
@@ -619,8 +856,7 @@ def _resolve_refs(value, resources, params, conditions, mappings,
                                   mappings, stack_name, stack_id))
         cidr_bits = int(_resolve_refs(args[2], resources, params, conditions,
                                       mappings, stack_name, stack_id))
-        # Simplified CIDR generation
-        return [f"10.0.{i}.0/{32 - cidr_bits}" for i in range(count)]
+        return _cidr_blocks(str(ip_block), count, cidr_bits)
 
     # --- Fn::Equals (condition-like in non-condition context) ---
     if "Fn::Equals" in value:
@@ -630,6 +866,23 @@ def _resolve_refs(value, resources, params, conditions, mappings,
         right = _resolve_refs(args[1], resources, params, conditions,
                               mappings, stack_name, stack_id)
         return str(left) == str(right)
+    for fn in ("Fn::And", "Fn::Or", "Fn::Not"):
+        if fn in value:
+            # Condition functions belong in Conditions and Fn::If. In a value
+            # position they evaluate to a boolean here, like Fn::Equals above,
+            # instead of leaking the unresolved call through to the service.
+            # What AWS does with one in a property was not measured; as an
+            # Output value it is refused up front (see _validate_template_statics).
+            operands = [
+                _resolve_refs(arg, resources, params, conditions, mappings,
+                              stack_name, stack_id)
+                for arg in value[fn]
+            ]
+            if fn == "Fn::And":
+                return all(bool(o) for o in operands)
+            if fn == "Fn::Or":
+                return any(bool(o) for o in operands)
+            return not bool(operands[0]) if operands else True
 
     # --- Condition (reference) ---
     if "Condition" in value and len(value) == 1:
