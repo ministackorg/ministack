@@ -24,6 +24,7 @@ from .provisioners import (
     _delete_resource,
     _provision_resource,
     _update_resource,
+    _with_stack_tags,
 )
 
 logger = logging.getLogger("cloudformation")
@@ -253,6 +254,11 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
 
     provisioned_resources: dict = stack.get("_resources", {})
     created_in_this_run = []
+    # Stack-level tags reach the resources through their own tag property;
+    # the stack record keeps the template's properties (below), so the
+    # change-set diff and the next update compare templates, not tags.
+    stack_tags = stack.get("Tags") or []
+    previous_tags = (previous_stack or {}).get("Tags") or []
 
     # If update: figure out what to add/modify/remove
     if is_update and previous_stack:
@@ -341,15 +347,21 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                     param_values, conditions, mappings, stack_name, stack_id,
                 ) in _RETAINING_POLICIES
                 token = _RETAIN_REPLACED.set(retain_replaced)
+                old_tagged = _with_stack_tags(
+                    resource_type, old_props, previous_tags,
+                    stack_name, stack_id, logical_id)
+                new_tagged = _with_stack_tags(
+                    resource_type, resolved_props, stack_tags,
+                    stack_name, stack_id, logical_id)
                 try:
                     if _is_custom_resource(resource_type):
                         physical_id, attrs = await run_reentrant(
-                            _update_resource, resource_type, old_pid, old_props,
-                            resolved_props, stack_name, logical_id, old_attrs
+                            _update_resource, resource_type, old_pid, old_tagged,
+                            new_tagged, stack_name, logical_id, old_attrs
                         )
                     else:
                         physical_id, attrs = _update_resource(
-                            resource_type, old_pid, old_props, resolved_props,
+                            resource_type, old_pid, old_tagged, new_tagged,
                             stack_name, logical_id, old_attrs
                         )
                 finally:
@@ -362,13 +374,16 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                     replaced_resources.append(
                         (logical_id, resource_type, old_pid, old_props))
             else:
+                new_tagged = _with_stack_tags(
+                    resource_type, resolved_props, stack_tags,
+                    stack_name, stack_id, logical_id)
                 if _is_custom_resource(resource_type):
                     physical_id, attrs = await run_reentrant(
-                        _provision_resource, resource_type, logical_id, resolved_props, stack_name
+                        _provision_resource, resource_type, logical_id, new_tagged, stack_name
                     )
                 else:
                     physical_id, attrs = _provision_resource(
-                        resource_type, logical_id, resolved_props, stack_name
+                        resource_type, logical_id, new_tagged, stack_name
                     )
         except Exception as exc:
             logger.error("Failed to provision %s (%s): %s",
@@ -455,11 +470,19 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 # A cleanup miss doesn't fail the update — real CloudFormation
                 # reports the resource DELETE_FAILED during the
                 # UPDATE_COMPLETE_CLEANUP phase and still lands the stack in
-                # UPDATE_COMPLETE — but it must be visible, not a warning.
+                # UPDATE_COMPLETE. The resource stays in the stack with that
+                # status (it still exists in the service), so the next update
+                # or the stack delete tries the delete again.
                 logger.error("Failed to delete old resource %s: %s",
                              logical_id, exc)
                 _add_event(stack_id, stack_name, logical_id, rtype,
                            "DELETE_FAILED", str(exc), pid)
+                leftover = provisioned_resources.get(logical_id)
+                if leftover is not None:
+                    leftover["ResourceStatus"] = "DELETE_FAILED"
+                    leftover["ResourceStatusReason"] = str(exc)
+                    leftover["Timestamp"] = now_iso()
+                continue
             provisioned_resources.pop(logical_id, None)
 
     await asyncio.sleep(0)
@@ -634,6 +657,10 @@ async def _delete_stack_async(stack_name: str, stack_id: str,
         ordered = _topological_sort(res_defs, conditions) if res_defs else list(resources.keys())
     except ValueError:
         ordered = list(resources.keys())
+    # A resource the template no longer declares but the stack still holds
+    # (its cleanup delete failed on an earlier update) has no dependents left;
+    # it goes first, so a retried delete reaches it.
+    ordered += [lid for lid in resources if lid not in ordered]
 
     delete_failures = []
     for logical_id in reversed(ordered):

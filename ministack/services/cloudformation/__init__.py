@@ -51,7 +51,9 @@ async def handle_request(method: str, path: str, headers: dict,
             except (json.JSONDecodeError, TypeError):
                 pass
     elif method == "POST" and body:
-        form_params = parse_qs(body.decode("utf-8", errors="replace"))
+        # keep_blank_values: an empty list arrives as ``Tags=`` and must stay
+        # distinguishable from an omitted parameter.
+        form_params = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
         for k, v in form_params.items():
             params[k] = v
 

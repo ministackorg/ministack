@@ -19,6 +19,7 @@ from .changesets import (
     _list_change_sets,
 )
 from .engine import (
+    _NO_VALUE,
     _apply_sam_transform_if_applicable,
     _evaluate_conditions,
     _has_dynamic_references,
@@ -34,6 +35,7 @@ from .helpers import (
     _extract_stack_status_filters,
     _extract_string_members,
     _p,
+    _page,
     _resolve_template,
     _xml,
 )
@@ -82,6 +84,10 @@ def _create_stack(params):
     tags = _extract_members(params, "Tags")
     disable_rollback = _p(params, "DisableRollback", "false").lower() == "true"
     retain_except_on_create = _p(params, "RetainExceptOnCreate", "false").lower() == "true"
+    from .helpers import _validate_stack_tags
+    tags_error = _validate_stack_tags(tags)
+    if tags_error:
+        return tags_error
 
     # Resolve parameters
     try:
@@ -210,6 +216,9 @@ def _describe_stacks(params):
             if s.get("StackStatus") != "DELETE_COMPLETE"
         ]
 
+    stacks_to_describe, next_token_xml, err = _page(stacks_to_describe, params, "DescribeStacks")
+    if err:
+        return err
     members = ""
     for s in stacks_to_describe:
         params_xml = ""
@@ -265,7 +274,8 @@ def _describe_stacks(params):
         )
 
     return _xml(200, "DescribeStacksResponse",
-                f"<DescribeStacksResult><Stacks>{members}</Stacks></DescribeStacksResult>")
+                f"<DescribeStacksResult><Stacks>{members}</Stacks>"
+                f"{next_token_xml}</DescribeStacksResult>")
 
 
 # --- ListStacks ---
@@ -273,12 +283,17 @@ def _describe_stacks(params):
 def _list_stacks(params):
     from ministack.services.cloudformation import _stacks
     status_filters = _extract_stack_status_filters(params)
+    listed = [
+        s for s in _stacks.values()
+        if not status_filters or s.get("StackStatus", "") in status_filters
+    ]
+    listed, next_token_xml, err = _page(listed, params, "ListStacks")
+    if err:
+        return err
 
     summaries = ""
-    for s in _stacks.values():
+    for s in listed:
         status = s.get("StackStatus", "")
-        if status_filters and status not in status_filters:
-            continue
         entry = (
             "<member>"
             f"<StackName>{_esc(s['StackName'])}</StackName>"
@@ -296,7 +311,8 @@ def _list_stacks(params):
         summaries += entry
 
     return _xml(200, "ListStacksResponse",
-                f"<ListStacksResult><StackSummaries>{summaries}</StackSummaries></ListStacksResult>")
+                f"<ListStacksResult><StackSummaries>{summaries}</StackSummaries>"
+                f"{next_token_xml}</ListStacksResult>")
 
 
 # --- DescribeStackEvents ---
@@ -314,9 +330,16 @@ def _describe_stack_events(params):
 
     stack_id = stack["StackId"]
     events = _stack_events.get(stack_id, [])
-    # Newest first
-    events_sorted = sorted(events, key=lambda e: e.get("Timestamp", ""),
-                           reverse=True)
+    # Newest first; events of one millisecond in reverse emission order
+    events_sorted = [
+        e for _, e in sorted(
+            enumerate(events),
+            key=lambda pair: (pair[1].get("Timestamp", ""), pair[0]),
+            reverse=True)
+    ]
+    events_sorted, next_token_xml, err = _page(events_sorted, params, "DescribeStackEvents")
+    if err:
+        return err
 
     members = ""
     for e in events_sorted:
@@ -335,10 +358,45 @@ def _describe_stack_events(params):
         )
 
     return _xml(200, "DescribeStackEventsResponse",
-                f"<DescribeStackEventsResult><StackEvents>{members}</StackEvents></DescribeStackEventsResult>")
+                f"<DescribeStackEventsResult><StackEvents>{members}</StackEvents>"
+                f"{next_token_xml}</DescribeStackEventsResult>")
 
 
 # --- DescribeStackResource ---
+
+def _resource_status_reason_xml(res):
+    """The ``ResourceStatusReason`` element of a stack resource, empty when
+    the record carries none (a healthy resource has no reason on AWS)."""
+    reason = res.get("ResourceStatusReason")
+    if not reason:
+        return ""
+    return f"<ResourceStatusReason>{_esc(reason)}</ResourceStatusReason>"
+
+
+def _resource_metadata_xml(stack, logical_id):
+    """The ``Metadata`` element of ``StackResourceDetail``: the resource's
+    ``Metadata`` attribute as a JSON string, intrinsics resolved the way a
+    property is (AWS interprets ``Ref``/``Fn::GetAtt`` inside it), empty when
+    the template declares none."""
+    template = stack.get("_template") or {}
+    res_def = (template.get("Resources") or {}).get(logical_id) or {}
+    metadata = res_def.get("Metadata")
+    if metadata is None:
+        return ""
+    try:
+        resolved = _resolve_refs(
+            copy.deepcopy(metadata), stack.get("_resources", {}),
+            stack.get("_resolved_params", {}), stack.get("_conditions", {}),
+            template.get("Mappings", {}), stack.get("StackName", ""),
+            stack.get("StackId", ""))
+        # ``Metadata: {"Ref": "AWS::NoValue"}`` resolves the whole attribute
+        # away; the literal is what the template declared.
+        body = json.dumps(metadata if resolved is _NO_VALUE else resolved)
+    except Exception as exc:  # the literal is still better than nothing
+        logger.warning("Metadata of %s left unresolved: %s", logical_id, exc)
+        body = json.dumps(metadata)
+    return f"<Metadata>{_esc(body)}</Metadata>"
+
 
 def _describe_stack_resource(params):
     from ministack.services.cloudformation import _stacks
@@ -362,9 +420,11 @@ def _describe_stack_resource(params):
         f"<PhysicalResourceId>{_esc(res.get('PhysicalResourceId', ''))}</PhysicalResourceId>"
         f"<ResourceType>{_esc(res.get('ResourceType', ''))}</ResourceType>"
         f"<ResourceStatus>{res.get('ResourceStatus', '')}</ResourceStatus>"
-        f"<Timestamp>{res.get('Timestamp', '')}</Timestamp>"
+        f"{_resource_status_reason_xml(res)}"
+        f"<LastUpdatedTimestamp>{res.get('Timestamp', '')}</LastUpdatedTimestamp>"
         f"<StackName>{_esc(stack_name)}</StackName>"
         f"<StackId>{_esc(stack['StackId'])}</StackId>"
+        f"{_resource_metadata_xml(stack, logical_id)}"
     )
 
     return _xml(200, "DescribeStackResourceResponse",
@@ -404,6 +464,7 @@ def _describe_stack_resources(params):
             f"<PhysicalResourceId>{_esc(res.get('PhysicalResourceId', ''))}</PhysicalResourceId>"
             f"<ResourceType>{_esc(res.get('ResourceType', ''))}</ResourceType>"
             f"<ResourceStatus>{res.get('ResourceStatus', '')}</ResourceStatus>"
+            f"{_resource_status_reason_xml(res)}"
             f"<Timestamp>{res.get('Timestamp', '')}</Timestamp>"
             f"<StackName>{_esc(stack_name)}</StackName>"
             f"<StackId>{_esc(stack['StackId'])}</StackId>"
@@ -429,8 +490,11 @@ def _list_stack_resources(params):
                       f"Stack [{stack_name}] does not exist")
 
     resources = stack.get("_resources", {})
+    listed, next_token_xml, err = _page(list(resources.items()), params, "ListStackResources")
+    if err:
+        return err
     members = ""
-    for logical_id, res in resources.items():
+    for logical_id, res in listed:
         members += (
             "<member>"
             f"<LogicalResourceId>{_esc(logical_id)}</LogicalResourceId>"
@@ -444,7 +508,7 @@ def _list_stack_resources(params):
     return _xml(200, "ListStackResourcesResponse",
                 f"<ListStackResourcesResult>"
                 f"<StackResourceSummaries>{members}</StackResourceSummaries>"
-                f"</ListStackResourcesResult>")
+                f"{next_token_xml}</ListStackResourcesResult>")
 
 
 # --- GetTemplate ---
@@ -578,7 +642,7 @@ def _delete_stack(params):
 # --- UpdateStack ---
 
 def _stack_has_no_updates(stack, template, param_values, tags,
-                          use_previous_template=False):
+                          use_previous_template=False, tags_given=False):
     """True when an UpdateStack would change nothing: the template equals the
     one the stack runs, every parameter resolves to its current value, and the
     request either carries no tags or the tags the stack already has. Real
@@ -593,7 +657,7 @@ def _stack_has_no_updates(stack, template, param_values, tags,
     current = {k: v.get("Value") for k, v in stack.get("_resolved_params", {}).items()}
     if {k: v.get("Value") for k, v in param_values.items()} != current:
         return False
-    if tags and tags != stack.get("Tags", []):
+    if (tags or tags_given) and tags != stack.get("Tags", []):
         return False
     return True
 
@@ -647,6 +711,14 @@ def _update_stack(params):
     tags = _extract_members(params, "Tags")
     disable_rollback = _p(params, "DisableRollback", "false").lower() == "true"
     retain_except_on_create = _p(params, "RetainExceptOnCreate", "false").lower() == "true"
+    # botocore sends an empty Tags list as ``Tags=``: given and empty clears
+    # the stack's tags ("If you specify an empty value, CloudFormation
+    # removes all associated tags"); an omitted Tags keeps them.
+    tags_given = "Tags" in params or bool(tags)
+    from .helpers import _validate_stack_tags
+    tags_error = _validate_stack_tags(tags)
+    if tags_error:
+        return tags_error
 
     try:
         param_values = _resolve_parameters(
@@ -661,7 +733,7 @@ def _update_stack(params):
         return _error("ValidationError", str(exc))
 
     if _stack_has_no_updates(stack, template, param_values, tags,
-                             use_previous_template):
+                             use_previous_template, tags_given):
         return _error("ValidationError", "No updates are to be performed.")
 
     # Save previous state for rollback
@@ -696,7 +768,7 @@ def _update_stack(params):
     stack["StackStatus"] = "UPDATE_IN_PROGRESS"
     stack["LastUpdatedTime"] = now_iso()
     stack["_template_body"] = template_body
-    if tags:
+    if tags or tags_given:
         stack["Tags"] = tags
     stack["Parameters"] = [
         {"ParameterKey": k, "ParameterValue": v["Value"], "NoEcho": v["NoEcho"]}
@@ -777,8 +849,11 @@ def _validate_template(params):
 
 def _list_exports(params):
     from ministack.services.cloudformation import _exports
+    listed, next_token_xml, err = _page(list(_exports.items()), params, "ListExports")
+    if err:
+        return err
     members = ""
-    for name, exp in _exports.items():
+    for name, exp in listed:
         members += (
             "<member>"
             f"<ExportingStackId>{_esc(exp.get('StackId', ''))}</ExportingStackId>"
@@ -788,7 +863,8 @@ def _list_exports(params):
         )
 
     return _xml(200, "ListExportsResponse",
-                f"<ListExportsResult><Exports>{members}</Exports></ListExportsResult>")
+                f"<ListExportsResult><Exports>{members}</Exports>"
+                f"{next_token_xml}</ListExportsResult>")
 # --- GetTemplateSummary ---
 
 def _get_template_summary(params):
@@ -914,9 +990,13 @@ def _list_imports(params):
     if not importers:
         return _error("ValidationError",
                       f"Export '{export_name}' is not imported by any stack.")
+    importers, next_token_xml, err = _page(importers, params, "ListImports")
+    if err:
+        return err
     members = "".join(f"<member>{_esc(n)}</member>" for n in importers)
     return _xml(200, "ListImportsResponse",
-                f"<ListImportsResult><Imports>{members}</Imports></ListImportsResult>")
+                f"<ListImportsResult><Imports>{members}</Imports>"
+                f"{next_token_xml}</ListImportsResult>")
 
 
 # --- UpdateTerminationProtection / stack policy ---

@@ -17,7 +17,7 @@ from .engine import (
     _resolve_refs,
     validate_template_support,
 )
-from .helpers import _error, _esc, _extract_members, _p, _resolve_template, _xml
+from .helpers import _error, _esc, _extract_members, _p, _page, _resolve_template, _xml
 from .stacks import (
     _add_event,
     _create_stack_task_in_region,
@@ -102,6 +102,13 @@ def _create_change_set(params):
 
     provided_params = _extract_members(params, "Parameters")
     tags = _extract_members(params, "Tags")
+    # An empty Tags list arrives as ``Tags=``: given-empty clears the stack's
+    # tags on execute, an omitted Tags keeps them (as UpdateStack does).
+    tags_given = "Tags" in params or bool(tags)
+    from .helpers import _validate_stack_tags
+    tags_error = _validate_stack_tags(tags)
+    if tags_error:
+        return tags_error
 
     stack = _resolve_stack(stack_name)
     if stack is not None and cs_type != "CREATE":
@@ -228,6 +235,7 @@ def _create_change_set(params):
             for k, v in param_values.items()
         ],
         "Tags": tags,
+        "_tags_given": tags_given,
         "_template": template,
         "_template_body": template_body,
         "_resolved_params": param_values,
@@ -377,6 +385,7 @@ def _execute_change_set(params):
             "_template_body": stack.get("_template_body", ""),
             "_resolved_params": copy.deepcopy(stack.get("_resolved_params", {})),
             "_conditions": copy.deepcopy(stack.get("_conditions", {})),
+            "Tags": copy.deepcopy(stack.get("Tags", [])),
             "Outputs": copy.deepcopy(stack.get("Outputs", [])),
         }
     else:
@@ -387,7 +396,7 @@ def _execute_change_set(params):
     stack["StackStatus"] = f"{status_prefix}_IN_PROGRESS"
     stack["LastUpdatedTime"] = now_iso()
     stack["_template_body"] = template_body
-    if tags:
+    if tags or cs.get("_tags_given"):
         stack["Tags"] = tags
     stack["Parameters"] = [
         {"ParameterKey": k, "ParameterValue": v["Value"], "NoEcho": v["NoEcho"]}
@@ -466,10 +475,12 @@ def _list_change_sets(params):
     if not stack_name:
         return _error("ValidationError", "StackName is required")
 
+    listed = [cs for cs in _change_sets.values() if cs["StackName"] == stack_name]
+    listed, next_token_xml, err = _page(listed, params, "ListChangeSets")
+    if err:
+        return err
     members = ""
-    for cs in _change_sets.values():
-        if cs["StackName"] != stack_name:
-            continue
+    for cs in listed:
         members += (
             "<member>"
             f"<ChangeSetId>{_esc(cs['ChangeSetId'])}</ChangeSetId>"
@@ -487,7 +498,7 @@ def _list_change_sets(params):
     return _xml(200, "ListChangeSetsResponse",
                 f"<ListChangeSetsResult>"
                 f"<Summaries>{members}</Summaries>"
-                f"</ListChangeSetsResult>")
+                f"{next_token_xml}</ListChangeSetsResult>")
 
 
 # --- GetTemplateSummary ---
