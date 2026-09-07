@@ -2553,6 +2553,75 @@ def test_cfn_describe_stack_resources_logical_id_filter(cfn, s3, sqs):
     assert exc_info.value.response["Error"]["Code"] == "ValidationError"
 
 
+def test_cfn_describe_stack_resource_returns_the_metadata(cfn):
+    """DescribeStackResource carries the resource's Metadata attribute as a
+    JSON string with intrinsics interpreted, and follows the template after an
+    update; a Metadata that resolves away or cannot be resolved is returned as
+    declared; a resource without Metadata has no such field; a healthy resource
+    has no ResourceStatusReason."""
+    stack_name = f"cfn-resource-metadata-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(path, rev):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Parameters": {"Owner": {"Type": "String", "Default": "platform"}},
+            "Resources": {
+                "Queue": {
+                    "Type": "AWS::SQS::Queue",
+                    "Metadata": {
+                        "aws:cdk:path": path,
+                        "Owner": {"Ref": "Owner"},
+                        "Region": {"Ref": "AWS::Region"},
+                        "Nested": {"Flag": True, "List": [1, rev]},
+                    },
+                },
+                "Plain": {"Type": "AWS::SQS::Queue"},
+                "Gone": {
+                    "Type": "AWS::SQS::Queue",
+                    "Metadata": {"Ref": "AWS::NoValue"},
+                },
+                "Broken": {
+                    "Type": "AWS::SQS::Queue",
+                    "Metadata": {"Fn::GetAtt": ["Plain", "NoSuchAttr"]},
+                },
+            },
+        }
+
+    def detail(logical_id):
+        return cfn.describe_stack_resource(
+            StackName=stack_name, LogicalResourceId=logical_id)["StackResourceDetail"]
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=json.dumps(template("ExampleStack/Queue/Resource", 2)))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        queue = detail("Queue")
+        assert json.loads(queue["Metadata"]) == {
+            "aws:cdk:path": "ExampleStack/Queue/Resource",
+            "Owner": "platform",
+            "Region": "us-east-1",
+            "Nested": {"Flag": True, "List": [1, 2]},
+        }
+        assert "ResourceStatusReason" not in queue
+        assert queue["LastUpdatedTimestamp"]
+        assert "Metadata" not in detail("Plain")
+        # A Metadata that resolves away entirely, or one that cannot be
+        # resolved, is returned as declared, not a failed request.
+        assert json.loads(detail("Gone")["Metadata"]) == {"Ref": "AWS::NoValue"}
+        assert json.loads(detail("Broken")["Metadata"]) == {
+            "Fn::GetAtt": ["Plain", "NoSuchAttr"]}
+
+        # After an update the new template's Metadata is what comes back.
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=json.dumps(template("ExampleStack/Queue/Resource/v2", 3)))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        updated = json.loads(detail("Queue")["Metadata"])
+        assert updated["aws:cdk:path"] == "ExampleStack/Queue/Resource/v2"
+        assert updated["Nested"] == {"Flag": True, "List": [1, 3]}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_stack_id_addresses_every_read_action(cfn, sqs):
     """Every action that takes a StackName accepts the stack id (what the CDK
     sends after its first DescribeStacks), and the responses carry the stack's
@@ -7214,10 +7283,11 @@ def test_cfn_s3_multi_region_access_point(cfn, s3):
     assert stack["StackStatus"] == "CREATE_COMPLETE"
 
     alias = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["Alias"]
-    # The alias S3 mints ends in ".mrap" (e.g. mfzwi23gnjvgw.mrap); templates
-    # build "<alias>.accesspoint.s3-global.amazonaws.com" from it.
+    # The alias S3 mints ends in ".mrap" (e.g. mfzwi23gnjvgw.mrap; documented
+    # pattern ^[a-z][a-z0-9]*[.]mrap$); templates build
+    # "<alias>.accesspoint.s3-global.amazonaws.com" from it.
     base, _, suffix = alias.rpartition(".")
-    assert suffix == "mrap" and len(base) == 13 and base.islower()
+    assert suffix == "mrap" and re.fullmatch(r"[a-z][a-z0-9]{12}", base)
 
     cfn.delete_stack(StackName="cfn-s3-mrap")
     _wait_stack(cfn, "cfn-s3-mrap")
@@ -7226,6 +7296,17 @@ def test_cfn_s3_multi_region_access_point(cfn, s3):
     with pytest.raises(urllib.error.HTTPError) as ei:
         _mrap_get(alias, "anything")
     assert ei.value.code in (403, 404)
+
+
+def test_s3_mrap_alias_matches_the_documented_pattern():
+    # In-process: the generator alone. A digit-only draw was possible before
+    # (uuid hex prefix), which is outside ^[a-z][a-z0-9]*[.]mrap$.
+    from ministack.services.s3 import new_mrap_alias
+
+    pattern = re.compile(r"^[a-z][a-z0-9]{12}\.mrap$")
+    for _ in range(200):
+        alias = new_mrap_alias()
+        assert pattern.fullmatch(alias), alias
 
 
 def test_cfn_auto_named_s3_bucket_stable_across_updates(cfn, s3):
@@ -10886,6 +10967,12 @@ def test_cfn_stack_delete_failure_lands_delete_failed(cfn, lam, sns):
         retained = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
         assert [r["LogicalResourceId"] for r in retained] == ["CR"]
         assert retained[0]["ResourceStatus"] == "DELETE_FAILED"
+        assert fn in retained[0]["ResourceStatusReason"]
+        detail = cfn.describe_stack_resource(
+            StackName=stack_name, LogicalResourceId="CR")["StackResourceDetail"]
+        assert detail["ResourceStatus"] == "DELETE_FAILED"
+        assert fn in detail["ResourceStatusReason"]
+        assert detail["LastUpdatedTimestamp"]
 
         # And the failure is visible as a stack-level event.
         events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
@@ -10962,6 +11049,153 @@ def test_cfn_stack_delete_failed_keeps_exports(cfn, lam):
         assert stack["StackStatus"] == "DELETE_COMPLETE"
         exports = {e["Name"] for e in _all_pages(cfn, "list_exports", "Exports")}
         assert export_name not in exports
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
+
+
+def _stack_with_a_failed_cleanup_delete(cfn, lam, fn, stack_name, queue_name):
+    """Create a stack (queue, SSM marker, custom resource whose handler
+    refuses the Delete), then drop the custom resource from the template.
+    Returns the template without it; ``Rev`` changes the marker's value."""
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role=_CR_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_DELETE_FAILS)},
+    )
+    resources = {
+        "Queue": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": queue_name}},
+        "Marker": {
+            "Type": "AWS::SSM::Parameter",
+            "Properties": {"Name": f"/{stack_name}/rev", "Type": "String",
+                           "Value": {"Ref": "Rev"}},
+        },
+    }
+    cr = {
+        "Type": "Custom::Tester",
+        "Properties": {
+            "ServiceToken": f"arn:aws:lambda:us-east-1:000000000000:function:{fn}",
+        },
+    }
+    without_cr = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Parameters": {"Rev": {"Type": "String", "Default": "1"}},
+        "Resources": resources,
+    }
+    with_cr = json.loads(json.dumps(without_cr))
+    with_cr["Resources"]["CR"] = cr
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(with_cr))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(without_cr))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    return without_cr
+
+
+def _swap_cr_handler(lam, fn, code):
+    lam.delete_function(FunctionName=fn)
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role=_CR_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(code)},
+    )
+
+
+def test_cfn_update_cleanup_delete_failure_keeps_the_resource_visible(cfn, lam, ssm):
+    """A resource dropped from the template whose delete fails during the
+    cleanup phase stays in the stack as DELETE_FAILED with its reason: the
+    update still ends UPDATE_COMPLETE (the new template is in effect), and the
+    next update with a changed template retries the delete, which removes the
+    resource once the delete works."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cr-cleanup-fail-{suffix}"
+    stack_name = f"cfn-cleanup-failed-{suffix}"
+    queue_name = f"cfn-cleanup-failed-q-{suffix}"
+    try:
+        without_cr = _stack_with_a_failed_cleanup_delete(cfn, lam, fn, stack_name, queue_name)
+
+        # The failed cleanup is an event and a visible resource, not a log line.
+        events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+        assert any(e["LogicalResourceId"] == "CR" and e["ResourceStatus"] == "DELETE_FAILED"
+                   for e in events)
+        by_id = {r["LogicalResourceId"]: r
+                 for r in cfn.describe_stack_resources(StackName=stack_name)["StackResources"]}
+        assert set(by_id) == {"Queue", "Marker", "CR"}
+        assert by_id["CR"]["ResourceStatus"] == "DELETE_FAILED"
+        assert "delete refused for testing" in by_id["CR"]["ResourceStatusReason"]
+        assert by_id["Queue"]["ResourceStatus"] == "UPDATE_COMPLETE"
+        assert "ResourceStatusReason" not in by_id["Queue"]
+        detail = cfn.describe_stack_resource(
+            StackName=stack_name, LogicalResourceId="CR")["StackResourceDetail"]
+        assert detail["ResourceStatus"] == "DELETE_FAILED"
+        assert "delete refused for testing" in detail["ResourceStatusReason"]
+        assert detail["LastUpdatedTimestamp"]
+        # The new template is what the stack runs.
+        assert "CR" not in cfn.get_template(StackName=stack_name)["TemplateBody"]["Resources"]
+
+        # A changed template retries the delete; still refused, the resource
+        # stays DELETE_FAILED and the update itself succeeds.
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(without_cr),
+                         Parameters=[{"ParameterKey": "Rev", "ParameterValue": "2"}])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert ssm.get_parameter(Name=f"/{stack_name}/rev")["Parameter"]["Value"] == "2"
+        by_id = {r["LogicalResourceId"]: r
+                 for r in cfn.describe_stack_resources(StackName=stack_name)["StackResources"]}
+        assert by_id["CR"]["ResourceStatus"] == "DELETE_FAILED"
+        assert "delete refused for testing" in by_id["CR"]["ResourceStatusReason"]
+
+        # With a handler that accepts the delete, the next update removes it.
+        _swap_cr_handler(lam, fn, _CR_HANDLER_SUCCESS)
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(without_cr),
+                         Parameters=[{"ParameterKey": "Rev", "ParameterValue": "3"}])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        listed = {r["LogicalResourceId"]
+                  for r in cfn.describe_stack_resources(StackName=stack_name)["StackResources"]}
+        assert listed == {"Queue", "Marker"}
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
+
+
+def test_cfn_delete_stack_retries_a_failed_cleanup_delete(cfn, lam, sqs):
+    """DeleteStack reaches a resource the template no longer declares: the
+    retry is refused again, the stack lands DELETE_FAILED naming it while the
+    declared resources are gone, and a delete that works completes the stack."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cr-cleanup-del-{suffix}"
+    stack_name = f"cfn-cleanup-delete-{suffix}"
+    queue_name = f"cfn-cleanup-delete-q-{suffix}"
+    try:
+        _stack_with_a_failed_cleanup_delete(cfn, lam, fn, stack_name, queue_name)
+
+        cfn.delete_stack(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "DELETE_FAILED"
+        assert "CR" in stack.get("StackStatusReason", "")
+        remaining = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+        assert [r["LogicalResourceId"] for r in remaining] == ["CR"]
+        assert "delete refused for testing" in remaining[0]["ResourceStatusReason"]
+        with pytest.raises(ClientError):
+            sqs.get_queue_url(QueueName=queue_name)
+
+        _swap_cr_handler(lam, fn, _CR_HANDLER_SUCCESS)
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
         try:

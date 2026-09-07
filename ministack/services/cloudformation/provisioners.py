@@ -3007,8 +3007,14 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
                                  old.get("Properties", {}),
                                  child_name, stale_id)
             except Exception as exc:
-                logger.warning("Nested-stack %s: failed to delete pruned %s: %s",
-                               child_name, stale_id, exc)
+                # As for a top-level stack: the resource stays in the child
+                # stack as DELETE_FAILED so a later delete retries it.
+                logger.error("Nested-stack %s: failed to delete pruned %s: %s",
+                             child_name, stale_id, exc)
+                stale = provisioned.setdefault(stale_id, dict(old))
+                stale["ResourceStatus"] = "DELETE_FAILED"
+                stale["ResourceStatusReason"] = str(exc)
+                stale["Timestamp"] = now_iso()
 
     resolved_outputs = []
     output_attrs: dict[str, str] = {}

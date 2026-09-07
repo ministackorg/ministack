@@ -18,6 +18,7 @@ from .changesets import (
     _list_change_sets,
 )
 from .engine import (
+    _NO_VALUE,
     _apply_sam_transform_if_applicable,
     _evaluate_conditions,
     _has_dynamic_references,
@@ -358,6 +359,40 @@ def _describe_stack_events(params):
 
 # --- DescribeStackResource ---
 
+def _resource_status_reason_xml(res):
+    """The ``ResourceStatusReason`` element of a stack resource, empty when
+    the record carries none (a healthy resource has no reason on AWS)."""
+    reason = res.get("ResourceStatusReason")
+    if not reason:
+        return ""
+    return f"<ResourceStatusReason>{_esc(reason)}</ResourceStatusReason>"
+
+
+def _resource_metadata_xml(stack, logical_id):
+    """The ``Metadata`` element of ``StackResourceDetail``: the resource's
+    ``Metadata`` attribute as a JSON string, intrinsics resolved the way a
+    property is (AWS interprets ``Ref``/``Fn::GetAtt`` inside it), empty when
+    the template declares none."""
+    template = stack.get("_template") or {}
+    res_def = (template.get("Resources") or {}).get(logical_id) or {}
+    metadata = res_def.get("Metadata")
+    if metadata is None:
+        return ""
+    try:
+        resolved = _resolve_refs(
+            copy.deepcopy(metadata), stack.get("_resources", {}),
+            stack.get("_resolved_params", {}), stack.get("_conditions", {}),
+            template.get("Mappings", {}), stack.get("StackName", ""),
+            stack.get("StackId", ""))
+        # ``Metadata: {"Ref": "AWS::NoValue"}`` resolves the whole attribute
+        # away; the literal is what the template declared.
+        body = json.dumps(metadata if resolved is _NO_VALUE else resolved)
+    except Exception as exc:  # the literal is still better than nothing
+        logger.warning("Metadata of %s left unresolved: %s", logical_id, exc)
+        body = json.dumps(metadata)
+    return f"<Metadata>{_esc(body)}</Metadata>"
+
+
 def _describe_stack_resource(params):
     from ministack.services.cloudformation import _stacks
     stack_name = _p(params, "StackName")
@@ -380,9 +415,11 @@ def _describe_stack_resource(params):
         f"<PhysicalResourceId>{_esc(res.get('PhysicalResourceId', ''))}</PhysicalResourceId>"
         f"<ResourceType>{_esc(res.get('ResourceType', ''))}</ResourceType>"
         f"<ResourceStatus>{res.get('ResourceStatus', '')}</ResourceStatus>"
-        f"<Timestamp>{res.get('Timestamp', '')}</Timestamp>"
+        f"{_resource_status_reason_xml(res)}"
+        f"<LastUpdatedTimestamp>{res.get('Timestamp', '')}</LastUpdatedTimestamp>"
         f"<StackName>{_esc(stack_name)}</StackName>"
         f"<StackId>{_esc(stack['StackId'])}</StackId>"
+        f"{_resource_metadata_xml(stack, logical_id)}"
     )
 
     return _xml(200, "DescribeStackResourceResponse",
@@ -422,6 +459,7 @@ def _describe_stack_resources(params):
             f"<PhysicalResourceId>{_esc(res.get('PhysicalResourceId', ''))}</PhysicalResourceId>"
             f"<ResourceType>{_esc(res.get('ResourceType', ''))}</ResourceType>"
             f"<ResourceStatus>{res.get('ResourceStatus', '')}</ResourceStatus>"
+            f"{_resource_status_reason_xml(res)}"
             f"<Timestamp>{res.get('Timestamp', '')}</Timestamp>"
             f"<StackName>{_esc(stack_name)}</StackName>"
             f"<StackId>{_esc(stack['StackId'])}</StackId>"
