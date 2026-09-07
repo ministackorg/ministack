@@ -1279,6 +1279,27 @@ async def _handle_post_body_shortcuts(
             logging.getLogger("cloudformation").warning("CFN ResponseURL PUT for unknown token %r — ignoring", token)
         return 200, {}, b""
 
+    # CloudFormation WaitConditionHandle signal URL (the presigned S3 URL on AWS)
+    from ministack.services.cloudformation import wait_conditions as _cfn_wc
+
+    if method == "PUT" and path.startswith(_cfn_wc.SIGNAL_PATH):
+        token = path[len(_cfn_wc.SIGNAL_PATH) :]
+        if not _cfn_wc.has_handle(token):
+            logging.getLogger("cloudformation").warning("CFN wait condition signal for unknown token %r", token)
+            return 404, {"Content-Type": "application/json"}, b'{"message": "unknown wait condition handle"}'
+        if headers.get("content-type"):
+            # The user guide, "To send a signal", step 3: the request method must
+            # be PUT and the Content-Type header must be an empty string or omitted.
+            return 403, {"Content-Type": "application/json"}, json.dumps(
+                {"message": "the Content-Type header must be an empty string or omitted"}
+            ).encode()
+        try:
+            payload = json.loads(body) if body else {}
+            _cfn_wc.deliver_signal(token, payload)
+        except (json.JSONDecodeError, ValueError) as exc:
+            return 400, {"Content-Type": "application/json"}, json.dumps({"message": str(exc)}).encode()
+        return 200, {}, b""
+
     response = await _handle_cognito_body_request(method, path, headers, body, query_params)
     if response is not None:
         # See _handle_pre_body_request: browser-based OIDC clients need CORS.

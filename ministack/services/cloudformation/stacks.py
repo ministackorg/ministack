@@ -61,7 +61,14 @@ def _create_stack_task_in_region(coro, stack: dict | None, stack_id: str | None 
 
 
 def _is_custom_resource(resource_type: str) -> bool:
-    return resource_type.startswith("Custom::") or resource_type == "AWS::CloudFormation::CustomResource"
+    """The types whose provisioning blocks on a callback into this server, so
+    they run on a worker thread: custom resources wait for the ResponseURL
+    PUT, a WaitCondition for the signals on its handle, and a nested stack
+    deploys inline and may contain either."""
+    return (resource_type.startswith("Custom::")
+            or resource_type in ("AWS::CloudFormation::CustomResource",
+                                 "AWS::CloudFormation::WaitCondition",
+                                 "AWS::CloudFormation::Stack"))
 
 
 # ===========================================================================

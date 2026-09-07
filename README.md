@@ -555,8 +555,8 @@ subnet = ec2.create_subnet(
 | `AWS::AutoScaling::ScheduledAction` | Action ARN | Arn, ScheduledActionName |
 | `AWS::Scheduler::Schedule` | Schedule name | Arn |
 | `AWS::Scheduler::ScheduleGroup` | Group name | Arn |
-| `AWS::CloudFormation::WaitCondition` | Condition ID | — |
-| `AWS::CloudFormation::WaitConditionHandle` | Handle URL | — |
+| `AWS::CloudFormation::WaitCondition` | Condition ID | Data, Id |
+| `AWS::CloudFormation::WaitConditionHandle` | Signal URL | Id |
 | `AWS::CloudFormation::Stack` (nested) | Child stack ARN | `Outputs.<Name>` — each child stack Output |
 
 Unsupported resource types fail with `CREATE_FAILED` (or `ROLLBACK_COMPLETE` if rollback is enabled), so templates with unsupported types won't silently succeed.

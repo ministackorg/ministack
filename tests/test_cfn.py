@@ -3611,23 +3611,273 @@ def test_cfn_lambda_provisioners_reject_missing_bare_qualifier(cfn, lam):
         lam.delete_function(FunctionName=fn)
 
 
-def test_cfn_wait_condition(cfn):
-    """AWS::CloudFormation::WaitCondition and WaitConditionHandle are no-ops."""
-    template = {
+def _wait_condition_template(timeout="20", count=None):
+    """A handle, a wait condition on it, a resource that must not start before
+    the wait ends. The 20 s fuse keeps a failing test from parking a worker."""
+    props = {"Handle": {"Ref": "Handle"}, "Timeout": timeout}
+    if count is not None:
+        props["Count"] = count
+    return {
         "AWSTemplateFormatVersion": "2010-09-09",
         "Resources": {
             "Handle": {"Type": "AWS::CloudFormation::WaitConditionHandle"},
-            "Wait": {
-                "Type": "AWS::CloudFormation::WaitCondition",
-                "Properties": {"Handle": {"Ref": "Handle"}, "Timeout": "10"},
+            "Wait": {"Type": "AWS::CloudFormation::WaitCondition", "Properties": props},
+            "After": {
+                "Type": "AWS::SSM::Parameter",
+                "DependsOn": "Wait",
+                "Properties": {"Type": "String", "Name": {"Fn::Sub": "/${AWS::StackName}/after"}, "Value": "x"},
             },
         },
+        "Outputs": {
+            "Url": {"Value": {"Ref": "Handle"}},
+            "HandleId": {"Value": {"Fn::GetAtt": ["Handle", "Id"]}},
+            "Data": {"Value": {"Fn::GetAtt": ["Wait", "Data"]}},
+        },
     }
-    cfn.create_stack(StackName="cfn-wait", TemplateBody=json.dumps(template))
-    stack = _wait_stack(cfn, "cfn-wait")
-    assert stack["StackStatus"] == "CREATE_COMPLETE"
-    cfn.delete_stack(StackName="cfn-wait")
-    _wait_stack(cfn, "cfn-wait")
+
+
+def _wait_condition_is_waiting(cfn, stack_name, logical_id="Wait"):
+    events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+    return any(e["LogicalResourceId"] == logical_id and e["ResourceStatus"] == "CREATE_IN_PROGRESS"
+               for e in events)
+
+
+def _wait_for_wait_condition(cfn, stack_name, timeout=15):
+    """Poll until the wait condition is CREATE_IN_PROGRESS; the handle URL, if any."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _wait_condition_is_waiting(cfn, stack_name):
+            events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+            return next((e["PhysicalResourceId"] for e in events
+                         if e["LogicalResourceId"] == "Handle" and e["ResourceStatus"] == "CREATE_COMPLETE"), None)
+        time.sleep(0.2)
+    raise TimeoutError(f"{stack_name}: the wait condition never started waiting")
+
+
+def _assert_still_waiting(cfn, stack_name, seconds=1.0):
+    """The stack stays CREATE_IN_PROGRESS for the whole window."""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        assert cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["StackStatus"] == "CREATE_IN_PROGRESS"
+        time.sleep(0.2)
+
+
+def _signal_events(cfn, stack_name):
+    return [e.get("ResourceStatusReason", "")
+            for e in cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+            if "signal with UniqueId" in e.get("ResourceStatusReason", "")]
+
+
+def _put_wait_condition_signal(url, status="SUCCESS", unique_id="ID1", data="", reason="",
+                               content_type="", body=None):
+    """PUT the signal JSON to the handle URL, addressed at the test endpoint
+    (the minted URL names the server's own host), with an empty Content-Type
+    as the user guide asks for."""
+    endpoint = urlparse(os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"))
+    target = urlparse(url)._replace(scheme=endpoint.scheme, netloc=endpoint.netloc).geturl()
+    if body is None:
+        body = json.dumps({"Status": status, "UniqueId": unique_id, "Data": data, "Reason": reason}).encode()
+    req = urllib.request.Request(target, data=body, method="PUT", headers={"Content-Type": content_type})
+    with urllib.request.urlopen(req) as resp:
+        return resp.status
+
+
+def _assert_validation_error(exc_info, message):
+    assert exc_info.value.response["Error"]["Code"] == "ValidationError"
+    assert message in exc_info.value.response["Error"]["Message"]
+
+
+def test_cfn_wait_condition(cfn):
+    """A WaitCondition holds the stack until its handle receives the SUCCESS
+    signal; the handle's Ref is the signal URL, Data carries the signal, the
+    signal is published to the stack events, a deleted handle answers 404."""
+    stack_name = f"cfn-wait-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_wait_condition_template()))
+    try:
+        url = _wait_for_wait_condition(cfn, stack_name)
+        assert "/_ministack/cfn-signal/" in url
+        events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+        assert not any(e["LogicalResourceId"] == "After" for e in events)
+        _assert_still_waiting(cfn, stack_name, 0.5)
+        assert _put_wait_condition_signal(url, "SUCCESS", "ID1234", data="Application has completed configuration.") == 200
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        assert _output(stack, "Url") == url
+        assert url.endswith("/" + _output(stack, "HandleId"))
+        assert json.loads(_output(stack, "Data")) == {"ID1234": "Application has completed configuration."}
+        resources = {r["LogicalResourceId"]: r for r in cfn.describe_stack_resources(StackName=stack_name)["StackResources"]}
+        assert resources["Handle"]["PhysicalResourceId"] == url
+        assert resources["After"]["ResourceStatus"] == "CREATE_COMPLETE"
+        assert _signal_events(cfn, stack_name) == ["Received SUCCESS signal with UniqueId ID1234"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        _put_wait_condition_signal(url, "SUCCESS", "late")
+    assert exc_info.value.code == 404
+
+
+def test_cfn_wait_condition_failure_signal_rolls_back(cfn):
+    stack_name = f"cfn-wait-fail-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_wait_condition_template()))
+    try:
+        url = _wait_for_wait_condition(cfn, stack_name)
+        assert _put_wait_condition_signal(url, "FAILURE", "node-1", reason="Setup failed") == 200
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        reasons = _stack_event_reasons(cfn, stack_name)
+        assert "WaitCondition received failed message: 'Setup failed' for uniqueId: node-1" in reasons
+        assert "Received FAILURE signal with UniqueId node-1" in reasons
+        assert not any(e["LogicalResourceId"] == "After"
+                       for e in cfn.describe_stack_events(StackName=stack_name)["StackEvents"])
+        # The rollback deleted the handle: its URL is gone.
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            _put_wait_condition_signal(url, "SUCCESS", "late")
+        assert exc_info.value.code == 404
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_wait_condition_timeout_rolls_back(cfn):
+    stack_name = f"cfn-wait-timeout-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_wait_condition_template(timeout="1")))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert "WaitCondition timed out. Received 0 conditions when expecting 1" in _stack_event_reasons(cfn, stack_name)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_wait_condition_count_and_signal_endpoint_rules(cfn):
+    """Count=2 needs two distinct UniqueIds; a repeated UniqueId is a
+    retransmission and does not count. The endpoint refuses a non-empty
+    Content-Type (403), a body that is not the signal JSON (400) and an
+    unknown token (404)."""
+    stack_name = f"cfn-wait-count-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_wait_condition_template(count=2)))
+    try:
+        url = _wait_for_wait_condition(cfn, stack_name)
+        for kwargs, code in (
+            ({"status": "DONE"}, 400),
+            ({"body": b"not json"}, 400),
+            ({"content_type": "application/json"}, 403),
+            ({"url": url.rsplit("/", 1)[0] + "/no-such-token"}, 404),
+        ):
+            with pytest.raises(urllib.error.HTTPError) as exc_info:
+                _put_wait_condition_signal(**{"url": url, "unique_id": "node-1", **kwargs})
+            assert exc_info.value.code == code, kwargs
+        assert "must be an empty string or omitted" in str(
+            pytest.raises(urllib.error.HTTPError, _put_wait_condition_signal, url,
+                          unique_id="node-1", content_type="text/plain").value.read())
+        _put_wait_condition_signal(url, "SUCCESS", "node-1", data="first")
+        _put_wait_condition_signal(url, "SUCCESS", "node-1", data="again")
+        _assert_still_waiting(cfn, stack_name)
+        assert _signal_events(cfn, stack_name) == ["Received SUCCESS signal with UniqueId node-1"]
+        _put_wait_condition_signal(url, "SUCCESS", "node-2", data="second")
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        assert json.loads(_output(stack, "Data")) == {"node-1": "first", "node-2": "second"}
+        assert sorted(_signal_events(cfn, stack_name)) == [
+            "Received SUCCESS signal with UniqueId node-1",
+            "Received SUCCESS signal with UniqueId node-2",
+        ]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_wait_condition_handle_must_be_a_handle_of_the_stack(cfn):
+    """A Handle that is not a handle URL, or the handle of another stack, fails
+    the resource; the other stack's handle stays usable."""
+    other_name = f"cfn-wait-other-{_uuid_mod.uuid4().hex[:8]}"
+    stack_name = f"cfn-wait-badhandle-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=other_name, TemplateBody=json.dumps(_wait_condition_template()))
+    try:
+        other_url = _wait_for_wait_condition(cfn, other_name)
+        for handle, message in (
+            (other_url, "Handle must be the Ref of an AWS::CloudFormation::WaitConditionHandle of this stack"),
+            ("https://example.local/not-a-handle", "Handle must be the Ref of an AWS::CloudFormation::WaitConditionHandle"),
+        ):
+            template = _wait_condition_template()
+            template["Resources"]["Wait"]["Properties"]["Handle"] = handle
+            cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+            try:
+                assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+                assert message in _stack_event_reasons(cfn, stack_name)
+            finally:
+                _delete_cfn_test_stack(cfn, stack_name)
+        _put_wait_condition_signal(other_url, "SUCCESS", "still-works")
+        assert _wait_stack(cfn, other_name)["StackStatus"] == "CREATE_COMPLETE"
+    finally:
+        _delete_cfn_test_stack(cfn, other_name)
+
+
+@pytest.mark.parametrize(
+    ("props", "message"),
+    [
+        ({"Count": 1}, "Timeout is required"),
+        ({"Timeout": "30", "Count": "0"}, "Count must be an integer of at least 1"),
+    ],
+)
+def test_cfn_wait_condition_refuses_invalid_properties(cfn, props, message):
+    stack_name = f"cfn-wait-invalid-{_uuid_mod.uuid4().hex[:8]}"
+    template = _wait_condition_template()
+    template["Resources"]["Wait"]["Properties"] = {"Handle": {"Ref": "Handle"}, **props}
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert message in _stack_event_reasons(cfn, stack_name)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize(
+    ("validator", "value", "message"),
+    [
+        ("validate_timeout_seconds", "0", "Timeout must be a number of seconds between 1 and 43200"),
+        ("validate_timeout_seconds", "43201", "Timeout must be a number of seconds between 1 and 43200"),
+        ("validate_timeout_seconds", "PT5M", "Timeout must be a number of seconds between 1 and 43200"),
+        ("validate_count", "two", "Count must be an integer of at least 1"),
+        ("validate_resource_signal_timeout", "5 minutes", "ResourceSignal Timeout must be an ISO 8601 duration"),
+        ("validate_resource_signal_timeout", "PT0S", "ResourceSignal Timeout must be at least one second"),
+        ("validate_resource_signal_timeout", "PT13H", "ResourceSignal Timeout must be at most 12 hours"),
+    ],
+)
+def test_cfn_wait_condition_validators(validator, value, message):
+    from ministack.services.cloudformation import wait_conditions as wc
+
+    with pytest.raises(ValueError, match=re.escape(message)):
+        getattr(wc, validator)(value, "Wait")
+    assert wc.validate_count("3", "Wait") == 3
+    assert wc.validate_count(None, "Wait") == 1
+    assert wc.validate_timeout_seconds(" 300 ", "Wait") == 300
+    assert wc.validate_resource_signal_timeout(None, "Wait") == 300
+    assert wc.validate_resource_signal_timeout("PT1H30M15S", "Wait") == 5415
+
+
+def test_cfn_wait_condition_store_reset_releases_a_waiter():
+    """The service's reset (what POST /_ministack/reset calls) must not leave
+    a worker thread blocked in a wait that nothing can signal any more. Run
+    in-process against this test's own copy of the stores."""
+    import threading
+
+    from ministack.services import cloudformation as cfn_service
+    from ministack.services.cloudformation import wait_conditions as wc
+
+    token = wc.register_slot("arn:aws:cloudformation:eu-central-1:000000000000:stack/reset-probe/1")
+    outcome = {}
+
+    def waiter():
+        try:
+            wc.wait_for(token, "arn:aws:cloudformation:eu-central-1:000000000000:stack/reset-probe/1",
+                        "reset-probe", "Wait", "AWS::CloudFormation::WaitCondition", 1, 30)
+        except Exception as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=waiter, daemon=True)
+    thread.start()
+    time.sleep(0.2)
+    cfn_service.reset()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert "state was reset" in str(outcome.get("error"))
 
 
 @pytest.mark.parametrize(

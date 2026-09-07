@@ -70,6 +70,8 @@ def reset():
     _change_sets.clear()
     from ministack.services.cloudformation import custom_resource as _cr
     _cr.reset()
+    from ministack.services.cloudformation import wait_conditions as _wc
+    _wc.reset()
 
 
 # Stores that need to survive a PERSIST_STATE=1 stop/restore cycle. The actual

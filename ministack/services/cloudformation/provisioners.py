@@ -2803,19 +2803,86 @@ def _lambda_version_delete(physical_id, props):
         func["versions"].pop(version, None)
 
 
-# --- CloudFormation WaitCondition / WaitConditionHandle (no-ops) ---
+# --- CloudFormation WaitCondition / WaitConditionHandle ---
+
+def _cfn_wait_condition_definition(stack_name: str, logical_id: str) -> dict:
+    """The resource definition as the running operation sees it: the stack
+    record's ``_template_body`` is the template being deployed (create,
+    update and change-set execution set it before the run starts)."""
+    from ministack.services.cloudformation import _stacks
+    from ministack.services.cloudformation.engine import _parse_template
+    stack = _stacks.get(stack_name) or {}
+    template = None
+    body = stack.get("_template_body")
+    if body:
+        try:
+            template = _parse_template(body)
+        except Exception:
+            template = None
+    if not isinstance(template, dict):
+        template = stack.get("_template") or {}
+    res_def = (template.get("Resources") or {}).get(logical_id) or {}
+    return res_def if isinstance(res_def, dict) else {}
+
 
 def _cfn_wait_condition_create(logical_id, props, stack_name):
-    """WaitCondition — no-op, return immediately (no real signalling in local emulation)."""
+    """WaitCondition: block the stack until ``Count`` SUCCESS signals arrived,
+    a FAILURE signal arrived, or the timeout passed. With a ``CreationPolicy``
+    the signals come through SignalResource only; otherwise through the
+    handle's URL (and SignalResource). Runs on a worker thread (see
+    ``_is_custom_resource`` in stacks.py)."""
+    from ministack.services.cloudformation import wait_conditions as _wc
+    stack_id = _cr_stack_id(stack_name)
+    res_def = _cfn_wait_condition_definition(stack_name, logical_id)
+    if "CreationPolicy" in res_def:
+        creation_policy = res_def.get("CreationPolicy")
+        if not isinstance(creation_policy, dict):
+            raise ValueError(f"WaitCondition {logical_id!r}: CreationPolicy must be an object")
+        signal = creation_policy.get("ResourceSignal")
+        if signal is None:
+            signal = {}
+        if not isinstance(signal, dict):
+            raise ValueError(f"WaitCondition {logical_id!r}: CreationPolicy ResourceSignal must be an object")
+        count = _wc.validate_count(signal.get("Count"), logical_id)
+        timeout_s = _wc.validate_resource_signal_timeout(signal.get("Timeout"), logical_id)
+        token = _wc.register_slot(stack_id)
+    else:
+        token = _wc.token_from_url(props.get("Handle"))
+        if token is None or _wc.handle_owner(token) != stack_id:
+            raise ValueError(
+                f"WaitCondition {logical_id!r}: Handle must be the Ref of an "
+                "AWS::CloudFormation::WaitConditionHandle of this stack"
+            )
+        if props.get("Timeout") in (None, ""):
+            raise ValueError(f"WaitCondition {logical_id!r}: Timeout is required")
+        count = _wc.validate_count(props.get("Count"), logical_id)
+        timeout_s = _wc.validate_timeout_seconds(props.get("Timeout"), logical_id)
+    data = _wc.wait_for(token, stack_id, stack_name, logical_id,
+                        "AWS::CloudFormation::WaitCondition", count, timeout_s)
     pid = f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
-    return pid, {"Data": "{}"}
+    attrs = {"Data": json.dumps(data), "Id": pid}
+    _wc.remember_result(pid, attrs)
+    return pid, attrs
+
+
+def _cfn_wait_condition_update(physical_id, old_props, new_props, stack_name):
+    """Updates are not supported on AWS; the resource keeps its id and data."""
+    from ministack.services.cloudformation import wait_conditions as _wc
+    return physical_id, _wc.recall_result(physical_id) or {"Data": "{}", "Id": physical_id}
 
 
 def _cfn_wait_condition_handle_create(logical_id, props, stack_name):
-    """WaitConditionHandle — no-op, return a presigned-style URL."""
-    pid = f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
-    url = f"https://cloudformation-waitcondition-{get_region()}.s3.amazonaws.com/{pid}"
-    return pid, {"Ref": url}
+    """WaitConditionHandle: the physical id (and ``Ref``) is the URL a signal
+    is PUT to, served under ``/_ministack/cfn-signal/``; ``Id`` is its token."""
+    from ministack.services.cloudformation import wait_conditions as _wc
+    url, token = _wc.register_handle(_cr_stack_id(stack_name))
+    return url, {"Ref": url, "Id": token}
+
+
+def _cfn_wait_condition_handle_delete(physical_id, props):
+    """Forget the handle: a later PUT to its URL is a 404."""
+    from ministack.services.cloudformation import wait_conditions as _wc
+    _wc.discard_handle(physical_id)
 
 
 def _cfn_noop_delete(physical_id, props):
@@ -8399,8 +8466,8 @@ _RESOURCE_HANDLERS = {
         "delete_with_logical_id": True,
     },
     "AWS::Lambda::Version": {"create": _lambda_version_create, "delete": _lambda_version_delete},
-    "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create, "delete": _cfn_noop_delete},
-    "AWS::CloudFormation::WaitConditionHandle": {"create": _cfn_wait_condition_handle_create, "delete": _cfn_noop_delete},
+    "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create, "update": _cfn_wait_condition_update, "delete": _cfn_noop_delete},
+    "AWS::CloudFormation::WaitConditionHandle": {"create": _cfn_wait_condition_handle_create, "delete": _cfn_wait_condition_handle_delete},
     "AWS::CloudFormation::Stack": {
         "create": _cfn_nested_stack_create,
         "update": _cfn_nested_stack_update,
