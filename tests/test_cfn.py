@@ -3636,6 +3636,22 @@ def _wait_condition_template(timeout="20", count=None):
     }
 
 
+def _creation_policy_wait_template(policy):
+    """The form the CreationPolicy attribute reference documents: no handle,
+    no Properties, signals through SignalResource only."""
+    return {
+        "Resources": {
+            "Wait": {"Type": "AWS::CloudFormation::WaitCondition", "CreationPolicy": policy},
+            "After": {
+                "Type": "AWS::SSM::Parameter",
+                "DependsOn": "Wait",
+                "Properties": {"Type": "String", "Name": {"Fn::Sub": "/${AWS::StackName}/after"}, "Value": "x"},
+            },
+        },
+        "Outputs": {"Data": {"Value": {"Fn::GetAtt": ["Wait", "Data"]}}},
+    }
+
+
 def _wait_condition_is_waiting(cfn, stack_name, logical_id="Wait"):
     events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
     return any(e["LogicalResourceId"] == logical_id and e["ResourceStatus"] == "CREATE_IN_PROGRESS"
@@ -3852,6 +3868,70 @@ def test_cfn_wait_condition_validators(validator, value, message):
     assert wc.validate_resource_signal_timeout("PT1H30M15S", "Wait") == 5415
 
 
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"ResourceSignal": {"Timeout": "PT2M", "Count": "2"}},
+        {"ResourceSignal": {"Count": 2}},
+    ],
+)
+def test_cfn_wait_condition_creation_policy_waits_for_signal_resource(cfn, policy):
+    """The CreationPolicy form: no handle, SignalResource only, Timeout
+    defaults to PT5M; an update never waits again."""
+    stack_name = f"cfn-wait-cp-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_creation_policy_wait_template(policy)))
+    try:
+        _wait_for_wait_condition(cfn, stack_name)
+        cfn.signal_resource(StackName=stack_name, LogicalResourceId="Wait", UniqueId="i-1", Status="SUCCESS")
+        _assert_still_waiting(cfn, stack_name)
+        assert _signal_events(cfn, stack_name) == ["Received SUCCESS signal with UniqueId i-1"]
+        cfn.signal_resource(StackName=stack_name, LogicalResourceId="Wait", UniqueId="i-2", Status="SUCCESS")
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        assert json.loads(_output(stack, "Data")) == {"i-1": "", "i-2": ""}
+        assert len(_signal_events(cfn, stack_name)) == 2
+        template = _creation_policy_wait_template({"ResourceSignal": {"Count": "5"}})
+        template["Resources"]["After"]["Properties"]["Value"] = "y"
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE"
+        assert json.loads(_output(stack, "Data")) == {"i-1": "", "i-2": ""}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize("policy", [{}, {"ResourceSignal": {}}])
+def test_cfn_wait_condition_creation_policy_defaults(cfn, policy):
+    """An empty CreationPolicy or ResourceSignal means one signal, PT5M."""
+    stack_name = f"cfn-wait-cpdef-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_creation_policy_wait_template(policy)))
+    try:
+        _wait_for_wait_condition(cfn, stack_name)
+        _assert_still_waiting(cfn, stack_name, 0.5)
+        cfn.signal_resource(StackName=stack_name, LogicalResourceId="Wait", UniqueId="only", Status="SUCCESS")
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected"),
+    [
+        ({"ResourceSignal": {"Timeout": "PT1S"}}, "WaitCondition timed out. Received 0 conditions when expecting 1"),
+        ("PT5M", "CreationPolicy must be an object"),
+        ({"ResourceSignal": "PT5M"}, "CreationPolicy ResourceSignal must be an object"),
+    ],
+)
+def test_cfn_wait_condition_creation_policy_timeout_and_shape(cfn, policy, expected):
+    stack_name = f"cfn-wait-cpfail-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_creation_policy_wait_template(policy)))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert expected in _stack_event_reasons(cfn, stack_name)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_wait_condition_store_reset_releases_a_waiter():
     """The service's reset (what POST /_ministack/reset calls) must not leave
     a worker thread blocked in a wait that nothing can signal any more. Run
@@ -3878,6 +3958,128 @@ def test_cfn_wait_condition_store_reset_releases_a_waiter():
     thread.join(timeout=5)
     assert not thread.is_alive()
     assert "state was reset" in str(outcome.get("error"))
+
+
+def test_cfn_signal_resource_completes_the_wait_condition(cfn):
+    """SignalResource delivers a signal without the handle URL; the stack name
+    or its id addresses the stack."""
+    stack_name = f"cfn-wait-signal-{_uuid_mod.uuid4().hex[:8]}"
+    stack_id = cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_wait_condition_template(count=2)))["StackId"]
+    try:
+        _wait_for_wait_condition(cfn, stack_name)
+        with pytest.raises(ClientError) as exc_info:
+            cfn.signal_resource(StackName=stack_name, LogicalResourceId="After", UniqueId="s1", Status="SUCCESS")
+        _assert_validation_error(exc_info, f"Resource [After] in stack [{stack_name}] is not waiting for signals")
+        with pytest.raises(ClientError) as exc_info:
+            cfn.signal_resource(StackName=stack_name, LogicalResourceId="Wait", UniqueId="s1", Status="DONE")
+        _assert_validation_error(exc_info, "Member must satisfy enum value set: [FAILURE, SUCCESS]")
+        with pytest.raises(ClientError) as exc_info:
+            cfn.signal_resource(StackName=stack_name, LogicalResourceId="Wait", UniqueId="x" * 65, Status="SUCCESS")
+        _assert_validation_error(exc_info, "Member must have length less than or equal to 64")
+        cfn.signal_resource(StackName=stack_name, LogicalResourceId="Wait", UniqueId="s1", Status="SUCCESS")
+        cfn.signal_resource(StackName=stack_id, LogicalResourceId="Wait", UniqueId="s2", Status="SUCCESS")
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        assert json.loads(_output(stack, "Data")) == {"s1": "", "s2": ""}
+        assert sorted(_signal_events(cfn, stack_name)) == [
+            "Received SUCCESS signal with UniqueId s1",
+            "Received SUCCESS signal with UniqueId s2",
+        ]
+        with pytest.raises(ClientError) as exc_info:
+            cfn.signal_resource(StackName=stack_name, LogicalResourceId="Wait", UniqueId="s3", Status="SUCCESS")
+        _assert_validation_error(exc_info, f"Stack [{stack_name}] is in CREATE_COMPLETE state and cannot be signaled")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    with pytest.raises(ClientError) as exc_info:
+        cfn.signal_resource(StackName=stack_name, LogicalResourceId="Wait", UniqueId="s4", Status="SUCCESS")
+    _assert_validation_error(exc_info, f"Stack [{stack_name}] does not exist")
+
+
+@pytest.mark.parametrize("missing", ["StackName", "LogicalResourceId", "UniqueId", "Status"])
+def test_cfn_signal_resource_requires_every_field(missing):
+    """boto3 refuses a missing field itself; a client without parameter
+    validation shows the service's own answer."""
+    client = boto3.client(
+        "cloudformation",
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        config=Config(parameter_validation=False, retries={"mode": "standard"}),
+    )
+    params = {"StackName": "no-such-stack", "LogicalResourceId": "Wait", "UniqueId": "s1", "Status": "SUCCESS"}
+    params.pop(missing)
+    with pytest.raises(ClientError) as exc_info:
+        client.signal_resource(**params)
+    _assert_validation_error(exc_info, f"{missing} is required")
+
+
+def test_cfn_signal_resource_failure_rolls_back(cfn):
+    stack_name = f"cfn-wait-signalfail-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_wait_condition_template()))
+    try:
+        _wait_for_wait_condition(cfn, stack_name)
+        cfn.signal_resource(StackName=stack_name, LogicalResourceId="Wait", UniqueId="node-9", Status="FAILURE")
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        reasons = _stack_event_reasons(cfn, stack_name)
+        assert "for uniqueId: node-9" in reasons
+        assert "Received FAILURE signal with UniqueId node-9" in reasons
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_wait_condition_in_a_nested_stack(cfn, s3):
+    """A nested stack deploys on a worker thread, so a wait condition inside
+    it holds the parent without blocking the server; SignalResource on the
+    child stack (its id is the parent's resource physical id) releases it."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    templates_bucket = f"cfn-wait-nested-{suffix}"
+    s3.create_bucket(Bucket=templates_bucket)
+    s3.put_object(Bucket=templates_bucket, Key="child.json",
+                  Body=json.dumps(_wait_condition_template()).encode())
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+    parent_name = f"cfn-wait-parent-{suffix}"
+    parent_template = {
+        "Resources": {
+            "Nested": {
+                "Type": "AWS::CloudFormation::Stack",
+                "Properties": {"TemplateURL": f"{endpoint}/{templates_bucket}/child.json"},
+            },
+            "AfterNested": {
+                "Type": "AWS::SSM::Parameter",
+                "DependsOn": "Nested",
+                "Properties": {"Type": "String", "Name": f"/{parent_name}/after", "Value": "x"},
+            },
+        },
+        "Outputs": {"ChildData": {"Value": {"Fn::GetAtt": ["Nested", "Outputs.Data"]}}},
+    }
+    cfn.create_stack(StackName=parent_name, TemplateBody=json.dumps(parent_template))
+    try:
+        deadline = time.time() + 15
+        child_id = None
+        while time.time() < deadline and child_id is None:
+            for summary in cfn.list_stacks(StackStatusFilter=["CREATE_IN_PROGRESS"])["StackSummaries"]:
+                if summary["StackName"].startswith(f"{parent_name}-Nested-") \
+                        and _wait_condition_is_waiting(cfn, summary["StackId"]):
+                    child_id = summary["StackId"]
+            time.sleep(0.2)
+        assert child_id, "the child stack never reached its wait condition"
+        # The server answers while the parent waits.
+        assert cfn.describe_stacks(StackName=parent_name)["Stacks"][0]["StackStatus"] == "CREATE_IN_PROGRESS"
+        cfn.signal_resource(StackName=child_id, LogicalResourceId="Wait", UniqueId="child-1", Status="SUCCESS")
+        stack = _wait_stack(cfn, parent_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        assert json.loads(_output(stack, "ChildData")) == {"child-1": ""}
+        nested = next(r for r in cfn.describe_stack_resources(StackName=parent_name)["StackResources"]
+                      if r["LogicalResourceId"] == "Nested")
+        assert nested["PhysicalResourceId"] == child_id
+    finally:
+        _delete_cfn_test_stack(cfn, parent_name)
+        try:
+            s3.delete_object(Bucket=templates_bucket, Key="child.json")
+            s3.delete_bucket(Bucket=templates_bucket)
+        except ClientError:
+            pass
 
 
 @pytest.mark.parametrize(

@@ -9,6 +9,7 @@ import json
 import logging
 
 from ministack.core.responses import get_account_id, get_region, new_uuid, now_iso
+from ministack.services.cloudformation import wait_conditions as _wc
 
 from .changesets import (
     _create_change_set,
@@ -1013,6 +1014,41 @@ def _continue_update_rollback(params):
                 "<ContinueUpdateRollbackResult></ContinueUpdateRollbackResult>")
 
 
+# --- SignalResource ---
+
+def _signal_resource(params):
+    """Deliver a SUCCESS or FAILURE signal to the wait condition of a stack
+    that is waiting under the logical id, from anywhere other than the
+    handle URL (the only way in for a wait condition with a CreationPolicy)."""
+    stack_name = _p(params, "StackName")
+    logical_id = _p(params, "LogicalResourceId")
+    unique_id = _p(params, "UniqueId")
+    status = _p(params, "Status")
+    for name, value in (("StackName", stack_name), ("LogicalResourceId", logical_id),
+                        ("UniqueId", unique_id), ("Status", status)):
+        if not value:
+            return _error("ValidationError", f"{name} is required")
+    if status not in ("SUCCESS", "FAILURE"):
+        return _error("ValidationError",
+                      f"1 validation error detected: Value '{status}' at 'status' failed to satisfy "
+                      "constraint: Member must satisfy enum value set: [FAILURE, SUCCESS]")
+    if len(unique_id) > 64:
+        return _error("ValidationError",
+                      f"1 validation error detected: Value '{unique_id}' at 'uniqueId' failed to "
+                      "satisfy constraint: Member must have length less than or equal to 64")
+    stack = _resolve_stack(stack_name)
+    if not stack or stack.get("StackStatus") == "DELETE_COMPLETE":
+        return _error("ValidationError", f"Stack [{stack_name}] does not exist")
+    stack_name = stack.get("StackName", stack_name)
+    if stack.get("StackStatus") not in ("CREATE_IN_PROGRESS", "UPDATE_IN_PROGRESS"):
+        return _error("ValidationError",
+                      f"Stack [{stack_name}] is in {stack.get('StackStatus')} state and cannot be signaled")
+    if not _wc.signal_resource(stack["StackId"], logical_id, unique_id, status):
+        return _error("ValidationError",
+                      f"Resource [{logical_id}] in stack [{stack_name}] is not waiting for signals")
+    return _xml(200, "SignalResourceResponse", "")
+
+
 # ===========================================================================
 # Action Handler Registry
 # ===========================================================================
@@ -1042,4 +1078,5 @@ _ACTION_HANDLERS = {
     "GetStackPolicy": _get_stack_policy,
     "CancelUpdateStack": _cancel_update_stack,
     "ContinueUpdateRollback": _continue_update_rollback,
+    "SignalResource": _signal_resource,
 }
