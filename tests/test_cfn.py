@@ -7023,10 +7023,11 @@ def test_cfn_s3_multi_region_access_point(cfn, s3):
     assert stack["StackStatus"] == "CREATE_COMPLETE"
 
     alias = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["Alias"]
-    # The alias S3 mints ends in ".mrap" (e.g. mfzwi23gnjvgw.mrap); templates
-    # build "<alias>.accesspoint.s3-global.amazonaws.com" from it.
+    # The alias S3 mints ends in ".mrap" (e.g. mfzwi23gnjvgw.mrap; documented
+    # pattern ^[a-z][a-z0-9]*[.]mrap$); templates build
+    # "<alias>.accesspoint.s3-global.amazonaws.com" from it.
     base, _, suffix = alias.rpartition(".")
-    assert suffix == "mrap" and len(base) == 13 and base.islower()
+    assert suffix == "mrap" and re.fullmatch(r"[a-z][a-z0-9]{12}", base)
 
     cfn.delete_stack(StackName="cfn-s3-mrap")
     _wait_stack(cfn, "cfn-s3-mrap")
@@ -7035,6 +7036,17 @@ def test_cfn_s3_multi_region_access_point(cfn, s3):
     with pytest.raises(urllib.error.HTTPError) as ei:
         _mrap_get(alias, "anything")
     assert ei.value.code in (403, 404)
+
+
+def test_s3_mrap_alias_matches_the_documented_pattern():
+    # In-process: the generator alone. A digit-only draw was possible before
+    # (uuid hex prefix), which is outside ^[a-z][a-z0-9]*[.]mrap$.
+    from ministack.services.s3 import new_mrap_alias
+
+    pattern = re.compile(r"^[a-z][a-z0-9]{12}\.mrap$")
+    for _ in range(200):
+        alias = new_mrap_alias()
+        assert pattern.fullmatch(alias), alias
 
 
 def test_cfn_auto_named_s3_bucket_stable_across_updates(cfn, s3):
