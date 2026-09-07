@@ -499,12 +499,24 @@ def _update_resource(resource_type: str, physical_id: str, old_props: dict,
         # still referencing it via Ref/Fn::GetAtt would then pick up the
         # instant it was reprocessed later in the same update.
         return physical_id, old_attrs or {}
+    handler = _RESOURCE_HANDLERS.get(resource_type)
+    tag_spec = _STACK_TAG_PROPERTY.get(resource_type)
+    if tag_spec and not (handler and "update" in handler):
+        # Only the tag property differs (a stack-tag change reaches every
+        # tagged resource): without an update handler the fallback below
+        # would re-create the resource under a new physical id. The tags
+        # stay as they are rather than that.
+        tag_prop = tag_spec[0]
+        if ({k: v for k, v in old_props.items() if k != tag_prop}
+                == {k: v for k, v in new_props.items() if k != tag_prop}):
+            logger.debug("Tag-only change on %s %s ignored: no update handler",
+                         resource_type, physical_id)
+            return physical_id, old_attrs or {}
     replacement_error = _custom_named_replacement_error(
         resource_type, old_props, new_props
     )
     if replacement_error:
         raise ValueError(replacement_error)
-    handler = _RESOURCE_HANDLERS.get(resource_type)
     if handler and "update" in handler:
         if handler.get("update_with_logical_id"):
             return handler["update"](
@@ -543,17 +555,118 @@ def _tag_map(tags) -> dict:
     }
 
 
-def _reconcile_tag_map(store: dict, old_props: dict, new_props: dict) -> None:
-    """Apply a ``Tags`` property change to a service's ``{key: value}`` tag
+def _reconcile_tag_map(store: dict, old_props: dict, new_props: dict,
+                       prop: str = "Tags") -> None:
+    """Apply a tag property change to a service's ``{key: value}`` tag
     store: keys the template dropped are removed, the rest set. Tags added
     through the service's own tagging API stay untouched, as on AWS."""
-    old_tags = _tag_map(old_props.get("Tags"))
-    new_tags = _tag_map(new_props.get("Tags"))
+    old_tags = _tag_map(old_props.get(prop))
+    new_tags = _tag_map(new_props.get(prop))
     if old_tags == new_tags:
         return
     for key in old_tags.keys() - new_tags.keys():
         store.pop(key, None)
     store.update(new_tags)
+
+
+def _reconcile_tag_list(store: list, old_props: dict, new_props: dict,
+                        key: str = "Key", value: str = "Value") -> None:
+    """The list-store twin of ``_reconcile_tag_map``: entries the template
+    dropped are removed, the new ones set, entries from elsewhere kept. The
+    list is changed in place; ``key``/``value`` name the entry fields."""
+    old_tags = _tag_map(old_props.get("Tags"))
+    new_tags = _tag_map(new_props.get("Tags"))
+    if old_tags == new_tags:
+        return
+    store[:] = [
+        t for t in store
+        if t.get(key) not in old_tags and t.get(key) not in new_tags
+    ] + [{key: k, value: v} for k, v in new_tags.items()]
+
+
+# The types whose provisioner stores a tag property, with that property's name
+# and shape. Stack-level tags and the three ``aws:cloudformation:`` tags are
+# merged into the property before the resource is created or updated; a type
+# outside this table has no tag store the stack tags could reach.
+_STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
+    "AWS::ApiGateway::ApiKey": ("Tags", "list"),
+    "AWS::ApiGateway::DomainName": ("Tags", "list"),
+    "AWS::ApiGateway::RestApi": ("Tags", "list"),
+    "AWS::ApiGateway::Stage": ("Tags", "list"),
+    "AWS::ApiGateway::UsagePlan": ("Tags", "list"),
+    "AWS::ApiGatewayV2::Api": ("Tags", "map"),
+    "AWS::ApiGatewayV2::Stage": ("Tags", "map"),
+    "AWS::AppConfig::Application": ("Tags", "list"),
+    "AWS::AppConfig::ConfigurationProfile": ("Tags", "list"),
+    "AWS::AppConfig::Deployment": ("Tags", "list"),
+    "AWS::AppConfig::DeploymentStrategy": ("Tags", "list"),
+    "AWS::AppConfig::Environment": ("Tags", "list"),
+    "AWS::AutoScaling::AutoScalingGroup": ("Tags", "list"),
+    "AWS::Backup::BackupPlan": ("BackupPlanTags", "map"),
+    "AWS::Backup::BackupVault": ("BackupVaultTags", "map"),
+    "AWS::CertificateManager::Certificate": ("Tags", "list"),
+    "AWS::CloudFormation::Stack": ("Tags", "list"),
+    "AWS::CloudWatch::Alarm": ("Tags", "list"),
+    "AWS::CodeBuild::Project": ("Tags", "list"),
+    "AWS::Cognito::IdentityPool": ("IdentityPoolTags", "map"),
+    "AWS::Cognito::UserPool": ("UserPoolTags", "map"),
+    "AWS::DynamoDB::Table": ("Tags", "list"),
+    "AWS::EC2::VPCEndpoint": ("Tags", "list"),
+    "AWS::ECS::Cluster": ("Tags", "list"),
+    "AWS::ECS::Service": ("Tags", "list"),
+    "AWS::EKS::Cluster": ("Tags", "list"),
+    "AWS::EKS::Nodegroup": ("Tags", "map"),
+    "AWS::ElasticLoadBalancingV2::Listener": ("Tags", "list"),
+    "AWS::ElasticLoadBalancingV2::LoadBalancer": ("Tags", "list"),
+    "AWS::ElasticLoadBalancingV2::TargetGroup": ("Tags", "list"),
+    "AWS::Events::EventBus": ("Tags", "list"),
+    "AWS::IAM::Role": ("Tags", "list"),
+    "AWS::KMS::Key": ("Tags", "list"),
+    "AWS::Kinesis::Stream": ("Tags", "list"),
+    "AWS::Lambda::Function": ("Tags", "list"),
+    "AWS::Logs::LogGroup": ("Tags", "list"),
+    "AWS::OpenSearchService::Domain": ("Tags", "list"),
+    "AWS::RDS::DBInstance": ("Tags", "list"),
+    "AWS::SNS::Topic": ("Tags", "list"),
+    "AWS::SQS::Queue": ("Tags", "list"),
+    "AWS::SSM::Parameter": ("Tags", "map"),
+    "AWS::Scheduler::ScheduleGroup": ("Tags", "list"),
+    "AWS::SecretsManager::Secret": ("Tags", "list"),
+    "AWS::StepFunctions::StateMachine": ("Tags", "list"),
+}
+
+
+def _with_stack_tags(resource_type: str, props: dict, stack_tags: list,
+                     stack_name: str, stack_id: str, logical_id: str) -> dict:
+    """The properties a resource is provisioned with: the template's own tag
+    property plus the stack-level tags and the three ``aws:cloudformation:``
+    tags CloudFormation adds, for the types in ``_STACK_TAG_PROPERTY``. A key
+    the template sets wins over the stack-level tag of the same name. Returns
+    ``props`` itself for every other type, and a copy otherwise: the stack
+    record keeps the template's properties."""
+    spec = _STACK_TAG_PROPERTY.get(resource_type)
+    if spec is None:
+        return props
+    prop, shape = spec
+    extra = _tag_map(stack_tags)
+    extra["aws:cloudformation:stack-name"] = stack_name
+    extra["aws:cloudformation:stack-id"] = stack_id
+    extra["aws:cloudformation:logical-id"] = logical_id
+    own = props.get(prop)
+    if shape == "map":
+        merged = {**extra, **(own if isinstance(own, dict) else _tag_map(own))}
+    else:
+        if isinstance(own, dict):
+            own = [{"Key": key, "Value": value} for key, value in own.items()]
+        own_list = [t for t in (own or []) if isinstance(t, dict) and "Key" in t]
+        present = {t["Key"] for t in own_list}
+        merged = own_list + [
+            {"Key": key, "Value": value}
+            for key, value in extra.items() if key not in present
+        ]
+    out = dict(props)
+    out[prop] = merged
+    return out
 
 
 # ===========================================================================
@@ -1238,18 +1351,8 @@ def _ddb_update(physical_id, old_props, new_props, stack_name, logical_id=None):
         _ddb_delete(physical_id, old_props)
         return _ddb_create(logical_id or physical_id, new_props, stack_name)
 
-    old_tags = _tag_map(old_props.get("Tags"))
-    new_tags = _tag_map(new_props.get("Tags"))
-    if old_tags != new_tags:
-        # The table's tag list lives in the service's own store; tags the
-        # template dropped go, the rest are set, foreign tags stay.
-        kept = [
-            t for t in _dynamodb._tags.get(table["TableArn"], [])
-            if t["Key"] not in old_tags and t["Key"] not in new_tags
-        ]
-        _dynamodb._tags[table["TableArn"]] = kept + [
-            {"Key": k, "Value": v} for k, v in new_tags.items()
-        ]
+    _reconcile_tag_list(
+        _dynamodb._tags.setdefault(table["TableArn"], []), old_props, new_props)
 
     data = {"TableName": name}
     old_billing = old_props.get("BillingMode", "PROVISIONED")
@@ -1995,9 +2098,15 @@ def _ssm_update(physical_id, old_props, new_props, stack_name):
     # pinned Version at 1 forever).
     data = _ssm_put_data(physical_id, new_props)
     data["Overwrite"] = True
+    # PutParameter replaces the parameter's tag set; reconcile it instead so
+    # tags added through AddTagsToResource stay.
+    data.pop("Tags", None)
     status, _headers, body = _ssm._put_parameter(data)
     if status >= 400:
         raise ValueError(f"AWS::SSM::Parameter update failed: {body!r}")
+    _reconcile_tag_map(
+        _ssm._tags.setdefault(_ssm._param_arn(physical_id), {}), old_props, new_props
+    )
     return physical_id, _ssm_attrs(physical_id, data)
 
 
@@ -2614,7 +2723,7 @@ def _eks_nodegroup_create(logical_id, props, stack_name):
         "amiType": props.get("AmiType", "AL2_x86_64"),
         "diskSize": props.get("DiskSize", 20),
         "labels": props.get("Labels", {}),
-        "tags": {t["Key"]: t["Value"] for t in props.get("Tags", [])},
+        "tags": _tag_map(props.get("Tags")),
     }
     _eks._create_nodegroup(cluster_name, body)
     key = f"{cluster_name}/{ng_name}"
@@ -2959,7 +3068,11 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
             {"ParameterKey": k, "ParameterValue": v["Value"], "NoEcho": v["NoEcho"]}
             for k, v in param_values.items()
         ],
-        "Tags": [],
+        "Tags": [
+            {"Key": key, "Value": value}
+            for key, value in _tag_map(props.get("Tags")).items()
+            if not key.startswith("aws:")
+        ],
         "Outputs": [],
         "DisableRollback": True,
         "_resources": (previous_stack_snapshot.get("_resources", {})
@@ -3017,15 +3130,21 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
                    f"{status_prefix}_IN_PROGRESS")
         try:
             prev = prev_resources.get(child_logical_id)
+            new_tagged = _with_stack_tags(
+                resource_type, resolved_props, child_stack["Tags"],
+                child_name, child_stack_id, child_logical_id)
             if prev:
+                old_tagged = _with_stack_tags(
+                    resource_type, prev.get("Properties", {}),
+                    (previous_stack_snapshot or {}).get("Tags") or [],
+                    child_name, child_stack_id, child_logical_id)
                 physical_id, attrs = _update_resource(
                     resource_type, prev.get("PhysicalResourceId", child_logical_id),
-                    prev.get("Properties", {}), resolved_props, child_name,
-                    child_logical_id,
+                    old_tagged, new_tagged, child_name, child_logical_id,
                 )
             else:
                 physical_id, attrs = _provision_resource(
-                    resource_type, child_logical_id, resolved_props, child_name,
+                    resource_type, child_logical_id, new_tagged, child_name,
                 )
         except Exception as exc:
             child_stack["StackStatus"] = f"{status_prefix}_FAILED"
@@ -3672,13 +3791,6 @@ def _apigw_stage_delete(physical_id, props):
 
 # --- API Gateway ApiKey / UsagePlan (v1) ---
 
-def _apigw_tag_map(raw):
-    """Normalize CFN ``Tags`` (a map, or a list of {Key, Value}) to a dict."""
-    if isinstance(raw, dict):
-        return dict(raw)
-    return {t["Key"]: t["Value"] for t in raw or []}
-
-
 def _apigw_throttle(raw):
     """Map a CFN ThrottleSettings block to the API Gateway wire shape."""
     if not raw:
@@ -3718,7 +3830,7 @@ def _apigw_api_key_create(logical_id, props, stack_name):
             {"restApiId": sk.get("RestApiId", ""), "stageName": sk.get("StageName", "")}
             for sk in props.get("StageKeys", [])
         ],
-        "tags": _apigw_tag_map(props.get("Tags")),
+        "tags": _tag_map(props.get("Tags")),
     }
     status, _headers, body = _apigw_v1._create_api_key(data)
     if status >= 400:
@@ -3752,6 +3864,7 @@ def _apigw_api_key_update(physical_id, old_props, new_props, stack_name):
     key["enabled"] = new_props.get("Enabled", True)
     key["customerId"] = new_props.get("CustomerId", key.get("customerId", ""))
     key["lastUpdatedDate"] = _apigw_v1._now_unix()
+    _reconcile_tag_map(key.setdefault("tags", {}), old_props, new_props)
     return physical_id, {"APIKeyId": physical_id}
 
 
@@ -3774,7 +3887,7 @@ def _apigw_usage_plan_body(props):
         ],
         "throttle": _apigw_throttle(props.get("Throttle")),
         "quota": _apigw_quota(props.get("Quota")),
-        "tags": _apigw_tag_map(props.get("Tags")),
+        "tags": _tag_map(props.get("Tags")),
     }
 
 
@@ -3799,7 +3912,10 @@ def _apigw_usage_plan_update(physical_id, old_props, new_props, stack_name):
         return _apigw_usage_plan_create(physical_id, new_props, stack_name)
     if new_props.get("UsagePlanName"):
         plan["name"] = new_props["UsagePlanName"]
-    plan.update(_apigw_usage_plan_body(new_props))
+    body = _apigw_usage_plan_body(new_props)
+    body["tags"] = dict(plan.get("tags") or {})
+    _reconcile_tag_map(body["tags"], old_props, new_props)
+    plan.update(body)
     return physical_id, {"Id": physical_id}
 
 
@@ -4639,10 +4755,9 @@ def _sm_secret_update(physical_id, old_props, new_props, stack_name, logical_id=
     resp = _sm._update_secret(data)
     if resp[0] >= 400:
         raise ValueError(f"AWS::SecretsManager::Secret update failed: {resp[2]!r}")
-    if "Tags" in new_props or "Tags" in old_props:
-        # Same rule as above: tags applied through TagResource on a secret
-        # whose template never declared any are not the stack's to clear.
-        secret["Tags"] = list(new_props.get("Tags", []))
+    # Keys the template dropped go, the rest are set; tags applied through
+    # TagResource are not the stack's to clear.
+    _reconcile_tag_list(secret.setdefault("Tags", []), old_props, new_props)
     if new_props.get("ReplicaRegions") and new_props["ReplicaRegions"] != old_props.get("ReplicaRegions"):
         # Regions added or re-keyed since the previous template are applied;
         # a region dropped from the template keeps its replica, the service
@@ -5074,6 +5189,8 @@ def _cognito_identity_pool_create(logical_id, props, stack_name):
         "_identities": {},
     }
     _cognito._identity_pools[iid] = pool
+    # ListTagsForResource reads the pool's tag store, not the record.
+    _cognito._identity_tags[iid] = _tag_map(props.get("IdentityPoolTags"))
     # The one Fn::GetAtt the resource reference lists is Name.
     return iid, {"Name": name}
 
@@ -5112,6 +5229,8 @@ def _cognito_identity_pool_update(physical_id, old_props, new_props, stack_name,
     status, _, body = _cognito._update_identity_pool(payload)
     if status >= 400:
         raise ValueError(f"AWS::Cognito::IdentityPool update failed: {body!r}")
+    _reconcile_tag_map(_cognito._identity_tags.setdefault(physical_id, {}),
+                       old_props, new_props, prop="IdentityPoolTags")
     return physical_id, {"Name": name}
 
 
@@ -8272,7 +8391,9 @@ def _eb_event_bus_update(physical_id, old_props, new_props, stack_name):
     if bus is not None and isinstance(bus, dict):
         if "Description" in new_props:
             bus["Description"] = new_props["Description"]
-    return physical_id, {"Arn": f"arn:aws:events:{get_region()}:{get_account_id()}:event-bus/{physical_id}", "Name": physical_id}
+    arn = f"arn:aws:events:{get_region()}:{get_account_id()}:event-bus/{physical_id}"
+    _reconcile_tag_map(_eb._tags.setdefault(arn, {}), old_props, new_props)
+    return physical_id, {"Arn": arn, "Name": physical_id}
 
 
 def _codebuild_project_update(physical_id, old_props, new_props, stack_name):
@@ -8287,6 +8408,8 @@ def _codebuild_project_update(physical_id, old_props, new_props, stack_name):
             project[key] = new_props[prop]
     if "TimeoutInMinutes" in new_props:
         project["timeoutInMinutes"] = int(new_props["TimeoutInMinutes"])
+    _reconcile_tag_list(project.setdefault("tags", []), old_props, new_props,
+                        key="key", value="value")
     return physical_id, {"Arn": _codebuild._project_arn(physical_id)}
 
 

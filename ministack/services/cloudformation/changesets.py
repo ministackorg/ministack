@@ -102,6 +102,13 @@ def _create_change_set(params):
 
     provided_params = _extract_members(params, "Parameters")
     tags = _extract_members(params, "Tags")
+    # An empty Tags list arrives as ``Tags=``: given-empty clears the stack's
+    # tags on execute, an omitted Tags keeps them (as UpdateStack does).
+    tags_given = "Tags" in params or bool(tags)
+    from .helpers import _validate_stack_tags
+    tags_error = _validate_stack_tags(tags)
+    if tags_error:
+        return tags_error
 
     stack = _resolve_stack(stack_name)
     if stack is not None and cs_type != "CREATE":
@@ -228,6 +235,7 @@ def _create_change_set(params):
             for k, v in param_values.items()
         ],
         "Tags": tags,
+        "_tags_given": tags_given,
         "_template": template,
         "_template_body": template_body,
         "_resolved_params": param_values,
@@ -377,6 +385,7 @@ def _execute_change_set(params):
             "_template_body": stack.get("_template_body", ""),
             "_resolved_params": copy.deepcopy(stack.get("_resolved_params", {})),
             "_conditions": copy.deepcopy(stack.get("_conditions", {})),
+            "Tags": copy.deepcopy(stack.get("Tags", [])),
             "Outputs": copy.deepcopy(stack.get("Outputs", [])),
         }
     else:
@@ -387,7 +396,7 @@ def _execute_change_set(params):
     stack["StackStatus"] = f"{status_prefix}_IN_PROGRESS"
     stack["LastUpdatedTime"] = now_iso()
     stack["_template_body"] = template_body
-    if tags:
+    if tags or cs.get("_tags_given"):
         stack["Tags"] = tags
     stack["Parameters"] = [
         {"ParameterKey": k, "ParameterValue": v["Value"], "NoEcho": v["NoEcho"]}

@@ -81,6 +81,10 @@ def _create_stack(params):
     tags = _extract_members(params, "Tags")
     disable_rollback = _p(params, "DisableRollback", "false").lower() == "true"
     retain_except_on_create = _p(params, "RetainExceptOnCreate", "false").lower() == "true"
+    from .helpers import _validate_stack_tags
+    tags_error = _validate_stack_tags(tags)
+    if tags_error:
+        return tags_error
 
     # Resolve parameters
     try:
@@ -577,7 +581,7 @@ def _delete_stack(params):
 # --- UpdateStack ---
 
 def _stack_has_no_updates(stack, template, param_values, tags,
-                          use_previous_template=False):
+                          use_previous_template=False, tags_given=False):
     """True when an UpdateStack would change nothing: the template equals the
     one the stack runs, every parameter resolves to its current value, and the
     request either carries no tags or the tags the stack already has. Real
@@ -592,7 +596,7 @@ def _stack_has_no_updates(stack, template, param_values, tags,
     current = {k: v.get("Value") for k, v in stack.get("_resolved_params", {}).items()}
     if {k: v.get("Value") for k, v in param_values.items()} != current:
         return False
-    if tags and tags != stack.get("Tags", []):
+    if (tags or tags_given) and tags != stack.get("Tags", []):
         return False
     return True
 
@@ -646,6 +650,14 @@ def _update_stack(params):
     tags = _extract_members(params, "Tags")
     disable_rollback = _p(params, "DisableRollback", "false").lower() == "true"
     retain_except_on_create = _p(params, "RetainExceptOnCreate", "false").lower() == "true"
+    # botocore sends an empty Tags list as ``Tags=``: given and empty clears
+    # the stack's tags ("If you specify an empty value, CloudFormation
+    # removes all associated tags"); an omitted Tags keeps them.
+    tags_given = "Tags" in params or bool(tags)
+    from .helpers import _validate_stack_tags
+    tags_error = _validate_stack_tags(tags)
+    if tags_error:
+        return tags_error
 
     try:
         param_values = _resolve_parameters(
@@ -660,7 +672,7 @@ def _update_stack(params):
         return _error("ValidationError", str(exc))
 
     if _stack_has_no_updates(stack, template, param_values, tags,
-                             use_previous_template):
+                             use_previous_template, tags_given):
         return _error("ValidationError", "No updates are to be performed.")
 
     # Save previous state for rollback
@@ -695,7 +707,7 @@ def _update_stack(params):
     stack["StackStatus"] = "UPDATE_IN_PROGRESS"
     stack["LastUpdatedTime"] = now_iso()
     stack["_template_body"] = template_body
-    if tags:
+    if tags or tags_given:
         stack["Tags"] = tags
     stack["Parameters"] = [
         {"ParameterKey": k, "ParameterValue": v["Value"], "NoEcho": v["NoEcho"]}

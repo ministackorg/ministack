@@ -62,6 +62,31 @@ def _extract_members(params, prefix):
         i += 1
     return result
 
+def _validate_stack_tags(tags):
+    """The checks CreateStack, UpdateStack and CreateChangeSet apply to the
+    stack-level ``Tags``: at most 50, no ``aws:`` prefix (reserved for AWS),
+    keys up to 128 and values up to 256 characters. Returns the error
+    response, or None when the tags pass."""
+    if len(tags) > 50:
+        return _error("ValidationError", "A maximum number of 50 tags can be specified")
+    for tag in tags:
+        key = str(tag.get("Key", ""))
+        value = str(tag.get("Value", ""))
+        if key.lower().startswith("aws:"):
+            return _error(
+                "ValidationError",
+                f"Tag key '{key}' is reserved: the aws: prefix cannot be used")
+        if len(key) > 128:
+            return _error(
+                "ValidationError",
+                f"Tag key '{key[:32]}...' exceeds the maximum length of 128 characters")
+        if len(value) > 256:
+            return _error(
+                "ValidationError",
+                f"Tag value for key '{key}' exceeds the maximum length of 256 characters")
+    return None
+
+
 
 def _resolve_template(params):
     """Resolve TemplateBody or TemplateURL to a template string.

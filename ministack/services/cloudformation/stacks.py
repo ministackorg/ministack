@@ -24,6 +24,7 @@ from .provisioners import (
     _delete_resource,
     _provision_resource,
     _update_resource,
+    _with_stack_tags,
 )
 
 logger = logging.getLogger("cloudformation")
@@ -246,6 +247,11 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
 
     provisioned_resources: dict = stack.get("_resources", {})
     created_in_this_run = []
+    # Stack-level tags reach the resources through their own tag property;
+    # the stack record keeps the template's properties (below), so the
+    # change-set diff and the next update compare templates, not tags.
+    stack_tags = stack.get("Tags") or []
+    previous_tags = (previous_stack or {}).get("Tags") or []
 
     # If update: figure out what to add/modify/remove
     if is_update and previous_stack:
@@ -334,15 +340,21 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                     param_values, conditions, mappings, stack_name, stack_id,
                 ) in _RETAINING_POLICIES
                 token = _RETAIN_REPLACED.set(retain_replaced)
+                old_tagged = _with_stack_tags(
+                    resource_type, old_props, previous_tags,
+                    stack_name, stack_id, logical_id)
+                new_tagged = _with_stack_tags(
+                    resource_type, resolved_props, stack_tags,
+                    stack_name, stack_id, logical_id)
                 try:
                     if _is_custom_resource(resource_type):
                         physical_id, attrs = await run_reentrant(
-                            _update_resource, resource_type, old_pid, old_props,
-                            resolved_props, stack_name, logical_id, old_attrs
+                            _update_resource, resource_type, old_pid, old_tagged,
+                            new_tagged, stack_name, logical_id, old_attrs
                         )
                     else:
                         physical_id, attrs = _update_resource(
-                            resource_type, old_pid, old_props, resolved_props,
+                            resource_type, old_pid, old_tagged, new_tagged,
                             stack_name, logical_id, old_attrs
                         )
                 finally:
@@ -355,13 +367,16 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                     replaced_resources.append(
                         (logical_id, resource_type, old_pid, old_props))
             else:
+                new_tagged = _with_stack_tags(
+                    resource_type, resolved_props, stack_tags,
+                    stack_name, stack_id, logical_id)
                 if _is_custom_resource(resource_type):
                     physical_id, attrs = await run_reentrant(
-                        _provision_resource, resource_type, logical_id, resolved_props, stack_name
+                        _provision_resource, resource_type, logical_id, new_tagged, stack_name
                     )
                 else:
                     physical_id, attrs = _provision_resource(
-                        resource_type, logical_id, resolved_props, stack_name
+                        resource_type, logical_id, new_tagged, stack_name
                     )
         except Exception as exc:
             logger.error("Failed to provision %s (%s): %s",
