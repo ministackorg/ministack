@@ -32,8 +32,10 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import shutil
+import string
 import struct
 import threading
 import time
@@ -91,11 +93,15 @@ _mraps = AccountScopedDict()  # Alias -> {Name, Alias, Regions: [bucket, ...], C
 
 
 def new_mrap_alias() -> str:
-    """The alias S3 mints for a Multi-Region Access Point: a 13-character
-    string suffixed with ``.mrap`` (e.g. ``mfzwi23gnjvgw.mrap``). The suffix is
-    part of the alias itself — GetAtt/GetMultiRegionAccessPoint return it, and
-    the hostname is ``<alias>.accesspoint.s3-global.amazonaws.com``."""
-    return new_uuid().replace("-", "")[:13].lower() + ".mrap"
+    """The alias S3 mints for a Multi-Region Access Point: a letter followed
+    by twelve lowercase letters or digits, suffixed with ``.mrap`` (e.g.
+    ``mfzwi23gnjvgw.mrap``; the documented pattern is
+    ``^[a-z][a-z0-9]*[.]mrap$``). The suffix is part of the alias itself —
+    GetAtt/GetMultiRegionAccessPoint return it, and the hostname is
+    ``<alias>.accesspoint.s3-global.amazonaws.com``."""
+    alphabet = string.ascii_lowercase + string.digits
+    base = random.choice(string.ascii_lowercase) + "".join(random.choices(alphabet, k=12))
+    return base + ".mrap"
 
 
 def resolve_mrap_bucket(alias: str):
