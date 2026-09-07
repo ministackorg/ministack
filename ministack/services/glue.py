@@ -678,7 +678,12 @@ def _iceberg_rest_commit_table(namespace, table_name, body):
         return _iceberg_error(f"Table does not exist: {namespace}.{table_name}", "NoSuchTableException", 404)
     meta_loc = table["Parameters"]["metadata_location"]
     metadata = _iceberg_fetch_metadata(meta_loc) or {}
-    _s3t._apply_iceberg_updates(metadata, body.get("updates", []))
+    try:
+        _s3t._apply_iceberg_updates(metadata, body.get("updates", []))
+    except ValueError as exc:
+        # A refused update (an illegal format-version change) commits
+        # nothing: the stored metadata_location is only advanced below.
+        return _iceberg_error(str(exc), "BadRequestException", 400)
     version = _metadata_version_from_location(meta_loc) + 1
     new_loc = _iceberg_write_metadata(namespace, table_name, version, metadata)
     table["Parameters"]["metadata_location"] = new_loc

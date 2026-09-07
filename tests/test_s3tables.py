@@ -642,6 +642,63 @@ def test_s3tables_iceberg_transactions_commit(s3tables):
 
 
 
+def test_s3tables_iceberg_upgrade_format_version(s3tables):
+    """A commit carrying the Iceberg REST ``upgrade-format-version`` action
+    (what Spark sends for ``.tableProperty("format-version", "3")`` on an
+    existing table) moves the table's metadata to that version; re-asserting
+    the current version is a no-op and a downgrade is refused with 400.
+    Real S3 Tables supports Iceberg format version 3."""
+    bucket_name = f"tb-fv-{_uuid_mod.uuid4().hex[:6]}"
+    bucket_arn = s3tables.create_table_bucket(name=bucket_name)["arn"]
+    ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
+    table = f"t_{_uuid_mod.uuid4().hex[:6]}"
+    try:
+        s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
+        s3tables.create_table(tableBucketARN=bucket_arn, namespace=ns, name=table, format="ICEBERG")
+
+        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        assert loaded["metadata"]["format-version"] == 2
+
+        resp = _iceberg_json(
+            f"/iceberg/v1/namespaces/{ns}/tables/{table}", method="POST",
+            payload={"requirements": [],
+                     "updates": [{"action": "upgrade-format-version", "format-version": 3}]},
+        )
+        assert resp["metadata"]["format-version"] == 3
+        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        assert loaded["metadata"]["format-version"] == 3
+
+        # Re-asserting the version the table already has is a no-op commit.
+        resp = _iceberg_json(
+            f"/iceberg/v1/namespaces/{ns}/tables/{table}", method="POST",
+            payload={"requirements": [],
+                     "updates": [{"action": "upgrade-format-version", "format-version": 3}]},
+        )
+        assert resp["metadata"]["format-version"] == 3
+
+        # A downgrade is refused, and the table keeps its version.
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            _iceberg_json(
+                f"/iceberg/v1/namespaces/{ns}/tables/{table}", method="POST",
+                payload={"requirements": [],
+                         "updates": [{"action": "upgrade-format-version", "format-version": 2}]},
+            )
+        assert exc_info.value.code == 400
+        assert b"downgrade" in exc_info.value.read()
+        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        assert loaded["metadata"]["format-version"] == 3
+    finally:
+        try:
+            s3tables.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=table)
+        except Exception:
+            pass
+        try:
+            s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
+        except Exception:
+            pass
+        s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
+
+
 def test_s3tables_iceberg_create_table_rejects_resend_instead_of_wiping_data(s3tables):
     """CreateTable is not idempotent per the Iceberg REST spec -- a resent create
     (e.g. a client retry after a lost response to a create that already landed)

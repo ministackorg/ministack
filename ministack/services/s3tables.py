@@ -788,6 +788,19 @@ def _apply_iceberg_updates(metadata, updates):
                 ids = [o.get("order-id", 0) for o in metadata.get("sort-orders", [])]
                 order_id = max(ids) if ids else 0
             metadata["default-sort-order-id"] = order_id
+        elif action == "upgrade-format-version":
+            # Iceberg REST UpgradeFormatVersionUpdate (what Spark commits for
+            # a format-version table property on an existing table). Upgrades
+            # only: Iceberg refuses downgrades, and S3 Tables supports the
+            # format up to v3. Re-asserting the current version is a no-op.
+            requested = int(update.get("format-version", 0))
+            current = int(metadata.get("format-version", 2))
+            if requested < current:
+                raise ValueError(f"Cannot downgrade v{current} table to v{requested}")
+            if requested > 3:
+                raise ValueError(
+                    f"Cannot upgrade table to unsupported format version: v{requested} (supported: v3)")
+            metadata["format-version"] = requested
         elif action == "set-properties":
             metadata.setdefault("properties", {}).update(update.get("updates", {}))
         elif action == "remove-properties":
@@ -808,8 +821,15 @@ def _iceberg_commit_table(namespace, table_name, data, allow_cross_region, bucke
     matches = _iceberg_values(_tables, _pred, allow_cross_region)
     if matches:
         table = matches[0]
-        metadata = table.get("_iceberg_metadata", {})
-        _apply_iceberg_updates(metadata, data.get("updates", []))
+        # Stage the commit on a copy: a refused update (an illegal
+        # format-version change) must not leave the earlier updates of the
+        # same commit applied — an Iceberg commit is atomic.
+        metadata = copy.deepcopy(table.get("_iceberg_metadata", {}))
+        try:
+            _apply_iceberg_updates(metadata, data.get("updates", []))
+        except ValueError as exc:
+            return _iceberg_error(str(exc), "BadRequestException", 400)
+        table["_iceberg_metadata"] = metadata
 
         table["_metadata_version"] = table.get("_metadata_version", 0) + 1
         v = table["_metadata_version"]

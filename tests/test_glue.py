@@ -2351,6 +2351,43 @@ def test_iceberg_rest_create_commit_load_shares_glue_catalog():
     assert doc["metadata"]["current-snapshot-id"] == 42
 
 
+def test_iceberg_rest_upgrade_format_version_and_refused_downgrade():
+    """The Glue-route Iceberg REST catalog honours ``upgrade-format-version``
+    (a Glue Spark job writing with the format-version 3 table property), and a
+    refused downgrade commits nothing: the metadata_location is not advanced."""
+    _svc("glue")._create_database({"DatabaseInput": {"Name": "lake"}})
+    status, _ = _call_body(
+        "POST",
+        f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/namespaces/lake/tables",
+        {"name": "orders", "schema": {"type": "struct", "schema-id": 0,
+            "fields": [{"id": 1, "name": "id", "required": False, "type": "int"}]}},
+    )
+    assert status == 200
+    status, doc = _call_body(
+        "POST",
+        f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/namespaces/lake/tables/orders",
+        {"updates": [{"action": "upgrade-format-version", "format-version": 3}]},
+    )
+    assert status == 200
+    assert doc["metadata"]["format-version"] == 3
+    status, doc = _call_body("GET", f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/namespaces/lake/tables/orders")
+    assert status == 200
+    assert doc["metadata"]["format-version"] == 3
+    loc_before = _svc("glue")._tables["lake/orders"]["Parameters"]["metadata_location"]
+
+    status, doc = _call_body(
+        "POST",
+        f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/namespaces/lake/tables/orders",
+        {"updates": [{"action": "upgrade-format-version", "format-version": 2}]},
+    )
+    assert status == 400
+    assert "downgrade" in json.dumps(doc)
+    assert _svc("glue")._tables["lake/orders"]["Parameters"]["metadata_location"] == loc_before
+    status, doc = _call_body("GET", f"/iceberg/v1/{_GLUE_ICEBERG_PREFIX}/namespaces/lake/tables/orders")
+    assert status == 200
+    assert doc["metadata"]["format-version"] == 3
+
+
 def test_iceberg_rest_loads_table_written_with_s3a_scheme():
     """Spark's S3FileIO records the metadata location with the ``s3a://`` scheme
     (a Glue job writing via GlueCatalog). The REST catalog must read that — the
