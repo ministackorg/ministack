@@ -2362,6 +2362,75 @@ def test_cfn_describe_stack_resources_logical_id_filter(cfn, s3, sqs):
     assert exc_info.value.response["Error"]["Code"] == "ValidationError"
 
 
+def test_cfn_describe_stack_resource_returns_the_metadata(cfn):
+    """DescribeStackResource carries the resource's Metadata attribute as a
+    JSON string with intrinsics interpreted, and follows the template after an
+    update; a Metadata that resolves away or cannot be resolved is returned as
+    declared; a resource without Metadata has no such field; a healthy resource
+    has no ResourceStatusReason."""
+    stack_name = f"cfn-resource-metadata-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(path, rev):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Parameters": {"Owner": {"Type": "String", "Default": "platform"}},
+            "Resources": {
+                "Queue": {
+                    "Type": "AWS::SQS::Queue",
+                    "Metadata": {
+                        "aws:cdk:path": path,
+                        "Owner": {"Ref": "Owner"},
+                        "Region": {"Ref": "AWS::Region"},
+                        "Nested": {"Flag": True, "List": [1, rev]},
+                    },
+                },
+                "Plain": {"Type": "AWS::SQS::Queue"},
+                "Gone": {
+                    "Type": "AWS::SQS::Queue",
+                    "Metadata": {"Ref": "AWS::NoValue"},
+                },
+                "Broken": {
+                    "Type": "AWS::SQS::Queue",
+                    "Metadata": {"Fn::GetAtt": ["Plain", "NoSuchAttr"]},
+                },
+            },
+        }
+
+    def detail(logical_id):
+        return cfn.describe_stack_resource(
+            StackName=stack_name, LogicalResourceId=logical_id)["StackResourceDetail"]
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=json.dumps(template("ExampleStack/Queue/Resource", 2)))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        queue = detail("Queue")
+        assert json.loads(queue["Metadata"]) == {
+            "aws:cdk:path": "ExampleStack/Queue/Resource",
+            "Owner": "platform",
+            "Region": "us-east-1",
+            "Nested": {"Flag": True, "List": [1, 2]},
+        }
+        assert "ResourceStatusReason" not in queue
+        assert queue["LastUpdatedTimestamp"]
+        assert "Metadata" not in detail("Plain")
+        # A Metadata that resolves away entirely, or one that cannot be
+        # resolved, is returned as declared, not a failed request.
+        assert json.loads(detail("Gone")["Metadata"]) == {"Ref": "AWS::NoValue"}
+        assert json.loads(detail("Broken")["Metadata"]) == {
+            "Fn::GetAtt": ["Plain", "NoSuchAttr"]}
+
+        # After an update the new template's Metadata is what comes back.
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=json.dumps(template("ExampleStack/Queue/Resource/v2", 3)))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        updated = json.loads(detail("Queue")["Metadata"])
+        assert updated["aws:cdk:path"] == "ExampleStack/Queue/Resource/v2"
+        assert updated["Nested"] == {"Flag": True, "List": [1, 3]}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_stack_id_addresses_every_read_action(cfn, sqs):
     """Every action that takes a StackName accepts the stack id (what the CDK
     sends after its first DescribeStacks), and the responses carry the stack's
