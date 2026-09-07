@@ -20,12 +20,22 @@ from .changesets import (
 from .engine import (
     _apply_sam_transform_if_applicable,
     _evaluate_conditions,
+    _has_dynamic_references,
     _parse_template,
     _resolve_parameters,
     _resolve_refs,
     validate_template_support,
 )
-from .helpers import _error, _esc, _extract_members, _extract_stack_status_filters, _p, _resolve_template, _xml
+from .helpers import (
+    _error,
+    _esc,
+    _extract_members,
+    _extract_stack_status_filters,
+    _extract_string_members,
+    _p,
+    _resolve_template,
+    _xml,
+)
 from .stacks import (
     _add_event,
     _create_stack_task_in_region,
@@ -67,6 +77,7 @@ def _create_stack(params):
     provided_params = _extract_members(params, "Parameters")
     tags = _extract_members(params, "Tags")
     disable_rollback = _p(params, "DisableRollback", "false").lower() == "true"
+    retain_except_on_create = _p(params, "RetainExceptOnCreate", "false").lower() == "true"
 
     # Resolve parameters
     try:
@@ -120,7 +131,8 @@ def _create_stack(params):
 
     _create_stack_task_in_region(
         _deploy_stack_async(stack_name, stack_id, template,
-                            param_values, disable_rollback, tags),
+                            param_values, disable_rollback, tags,
+                            retain_except_on_create=retain_except_on_create),
         stack,
         stack_id,
     )
@@ -512,6 +524,20 @@ def _delete_stack(params):
 
     stack_id = stack["StackId"]
 
+    # RetainResources: only for a DELETE_FAILED stack, only its own resources.
+    retain = _extract_string_members(params, "RetainResources")
+    if retain:
+        if stack.get("StackStatus") != "DELETE_FAILED":
+            return _error("ValidationError",
+                          f"Stack [{stack_name}] is not in DELETE_FAILED state; "
+                          "RetainResources can only be specified for a stack in "
+                          "DELETE_FAILED state")
+        unknown = sorted(set(retain) - set(stack.get("_resources", {})))
+        if unknown:
+            return _error("ValidationError",
+                          f"Resource(s) [{', '.join(unknown)}] do not exist in "
+                          f"stack [{stack_name}]")
+
     # Deleting a stack removes its change sets; they must not outlive it and
     # shadow a later same-named change set on a re-created stack. #1418
     from ministack.services.cloudformation import _change_sets
@@ -520,7 +546,7 @@ def _delete_stack(params):
         _change_sets.pop(_cid, None)
 
     _create_stack_task_in_region(
-        _delete_stack_async(stack_name, stack_id),
+        _delete_stack_async(stack_name, stack_id, frozenset(retain)),
         stack,
         stack_id,
     )
@@ -530,15 +556,18 @@ def _delete_stack(params):
 
 # --- UpdateStack ---
 
-def _stack_has_no_updates(stack, template, param_values, tags):
+def _stack_has_no_updates(stack, template, param_values, tags,
+                          use_previous_template=False):
     """True when an UpdateStack would change nothing: the template equals the
     one the stack runs, every parameter resolves to its current value, and the
     request either carries no tags or the tags the stack already has. Real
     CloudFormation refuses such a request with ``No updates are to be
-    performed.`` instead of running an empty update (a template with a
-    dynamic reference is the documented exception, and the emulator refuses
-    dynamic references up front)."""
+    performed.`` instead of running an empty update. A template body that
+    carries a dynamic reference is the exception: the update is accepted
+    (with ``UsePreviousTemplate`` it is still refused) — measured on AWS."""
     if template != stack.get("_template", {}):
+        return False
+    if not use_previous_template and _has_dynamic_references(template):
         return False
     current = {k: v.get("Value") for k, v in stack.get("_resolved_params", {}).items()}
     if {k: v.get("Value") for k, v in param_values.items()} != current:
@@ -577,10 +606,12 @@ def _update_stack(params):
     template_body, resolve_err = _resolve_template(params)
     if resolve_err:
         return resolve_err
+    use_previous_template = False
     if not template_body:
         # Use previous template if UsePreviousTemplate
         if _p(params, "UsePreviousTemplate", "false").lower() == "true":
             template_body = stack.get("_template_body", "{}")
+            use_previous_template = True
         else:
             return _error("ValidationError", "TemplateBody or TemplateURL is required")
 
@@ -592,6 +623,7 @@ def _update_stack(params):
     provided_params = _extract_members(params, "Parameters")
     tags = _extract_members(params, "Tags")
     disable_rollback = _p(params, "DisableRollback", "false").lower() == "true"
+    retain_except_on_create = _p(params, "RetainExceptOnCreate", "false").lower() == "true"
 
     try:
         param_values = _resolve_parameters(
@@ -605,7 +637,8 @@ def _update_stack(params):
     except ValueError as exc:
         return _error("ValidationError", str(exc))
 
-    if _stack_has_no_updates(stack, template, param_values, tags):
+    if _stack_has_no_updates(stack, template, param_values, tags,
+                             use_previous_template):
         return _error("ValidationError", "No updates are to be performed.")
 
     # Save previous state for rollback
@@ -614,6 +647,7 @@ def _update_stack(params):
         "_template": copy.deepcopy(stack.get("_template", {})),
         "_template_body": stack.get("_template_body", ""),
         "_resolved_params": copy.deepcopy(stack.get("_resolved_params", {})),
+        "_conditions": copy.deepcopy(stack.get("_conditions", {})),
         "Parameters": copy.deepcopy(stack.get("Parameters", [])),
         "Tags": copy.deepcopy(stack.get("Tags", [])),
         "Outputs": copy.deepcopy(stack.get("Outputs", [])),
@@ -648,7 +682,8 @@ def _update_stack(params):
         _create_stack_task_in_region(
             _deploy_stack_async(stack_name, stack_id, template,
                                 param_values, disable_rollback, tags,
-                                is_update=True, previous_stack=previous_stack),
+                                is_update=True, previous_stack=previous_stack,
+                                retain_except_on_create=retain_except_on_create),
             stack,
             stack_id,
         )

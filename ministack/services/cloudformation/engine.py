@@ -114,7 +114,8 @@ def _parse_template(template_body: str) -> dict:
 # Template pre-flight
 # ===========================================================================
 
-_DYNAMIC_REFERENCE = re.compile(r"\{\{resolve:([a-z-]+):[^}]*\}\}")
+_DYNAMIC_REFERENCE = re.compile(r"\{\{resolve:([a-z-]+):([^}]*)\}\}")
+_DYNAMIC_SERVICES = ("ssm", "ssm-secure", "secretsmanager")
 
 
 def _find_dynamic_references(value, found: set) -> None:
@@ -129,6 +130,107 @@ def _find_dynamic_references(value, found: set) -> None:
             _find_dynamic_references(v, found)
 
 
+def _has_dynamic_references(template: dict) -> bool:
+    refs: set[str] = set()
+    _find_dynamic_references((template or {}).get("Resources"), refs)
+    return bool(refs)
+
+
+def _resolve_dynamic_reference(literal: str) -> str:
+    """Resolve one ``{{resolve:...}}`` literal against the in-process SSM /
+    Secrets Manager stores. Raises ``ValueError`` when it cannot be resolved,
+    which fails the resource the way an unresolvable reference does on AWS.
+    ``ssm`` / ``ssm-secure`` take ``name[:version]`` (no version = latest);
+    ``secretsmanager`` takes
+    ``secret-id[:SecretString[:json-key[:version-stage[:version-id]]]]``,
+    the secret id being a name or an ARN."""
+    from ministack.services import secretsmanager, ssm
+
+    m = _DYNAMIC_REFERENCE.fullmatch(literal)
+    service, body = m.group(1), m.group(2)
+    if service in ("ssm", "ssm-secure"):
+        name, _, version = body.partition(":")
+        value = ssm.resolve_parameter_value(name, version or None, decrypt=True)
+        if value is None:
+            raise ValueError(
+                f"Dynamic reference {literal} could not be resolved: parameter "
+                f"{name}" + (f" version {version}" if version else "") + " not found")
+        return value
+    if body.startswith("arn:"):
+        parts = body.split(":")
+        secret_id, rest = ":".join(parts[:7]), parts[7:]
+    else:
+        parts = body.split(":")
+        secret_id, rest = parts[0], parts[1:]
+    rest += [""] * (4 - len(rest))
+    secret_string, json_key, version_stage, version_id = rest[:4]
+    if secret_string and secret_string != "SecretString":
+        raise ValueError(
+            f"Dynamic reference {literal} is invalid: the secret-string segment "
+            "must be SecretString")
+    if version_stage and version_id:
+        raise ValueError(
+            f"Dynamic reference {literal} is invalid: specify either a version "
+            "stage or a version id, not both")
+    value = secretsmanager.resolve_secret_string(
+        secret_id, version_stage or "AWSCURRENT", version_id or None)
+    if value is None:
+        raise ValueError(
+            f"Dynamic reference {literal} could not be resolved: secret "
+            f"{secret_id} not found")
+    if json_key:
+        try:
+            value = json.loads(value)[json_key]
+        except (ValueError, KeyError, TypeError):
+            raise ValueError(
+                f"Dynamic reference {literal} could not be resolved: key "
+                f"{json_key} not found in the secret") from None
+        if not isinstance(value, str):
+            value = json.dumps(value)
+    return value
+
+
+def _resolve_dynamic_references(value, previous: dict | None = None,
+                                reuse_ssm: bool = False,
+                                reuse_secrets: bool = False):
+    """Substitute every ``{{resolve:...}}`` inside ``value`` (recursively).
+
+    Returns ``(resolved_value, {literal: value})``. ``previous`` is the map a
+    prior deployment of the same resource recorded; ``reuse_ssm`` /
+    ``reuse_secrets`` keep those values instead of resolving again, which is
+    how the two kinds differ on update: an ``ssm`` reference re-resolves
+    whenever the stack is updated with a changed template, a
+    ``secretsmanager`` reference only when the resource that carries it
+    changes.
+    """
+    previous = previous or {}
+    resolved: dict = {}
+
+    def one(literal):
+        if literal in resolved:
+            return resolved[literal]
+        service = _DYNAMIC_REFERENCE.fullmatch(literal).group(1)
+        reuse = reuse_secrets if service == "secretsmanager" else reuse_ssm
+        if reuse and literal in previous:
+            resolved[literal] = previous[literal]
+        else:
+            resolved[literal] = _resolve_dynamic_reference(literal)
+        return resolved[literal]
+
+    def walk(node):
+        if isinstance(node, str):
+            if "{{resolve:" not in node:
+                return node
+            return _DYNAMIC_REFERENCE.sub(lambda m: one(m.group(0)), node)
+        if isinstance(node, list):
+            return [walk(v) for v in node]
+        if isinstance(node, dict):
+            return {k: walk(v) for k, v in node.items()}
+        return node
+
+    return walk(value), resolved
+
+
 def validate_template_support(template: dict, conditions: dict) -> None:
     """Reject up front what provisioning could only fail on halfway through.
 
@@ -139,9 +241,9 @@ def validate_template_support(template: dict, conditions: dict) -> None:
     provisions its predecessors first and rolls them back. Condition-false
     resources are exempt, as they are during provisioning.
 
-    Dynamic references (``{{resolve:ssm:...}}`` and friends) are not resolved
-    by this emulator; refusing them here replaces the old behaviour of passing
-    the literal ``{{resolve:...}}`` string on to the service.
+    Dynamic references are resolved at provisioning time (``ssm``,
+    ``ssm-secure`` and ``secretsmanager``); a reference to any other service
+    is refused here, as is a malformed one.
 
     Raises ``ValueError`` with the message the caller wraps as a
     ``ValidationError``.
@@ -181,10 +283,13 @@ def validate_template_support(template: dict, conditions: dict) -> None:
     refs: set[str] = set()
     _find_dynamic_references(template.get("Resources"), refs)
     _find_dynamic_references(template.get("Outputs"), refs)
-    if refs:
+    unsupported = sorted(
+        r for r in refs if _DYNAMIC_REFERENCE.fullmatch(r).group(1) not in _DYNAMIC_SERVICES)
+    if unsupported:
         raise ValueError(
-            "Template format error: dynamic references are not supported by "
-            "ministack: " + ", ".join(sorted(refs))
+            "Template format error: unsupported dynamic reference(s): "
+            + ", ".join(unsupported)
+            + " (supported: ssm, ssm-secure, secretsmanager)"
         )
 
 

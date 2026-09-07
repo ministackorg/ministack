@@ -111,3 +111,20 @@ def _extract_stack_status_filters(params):
         filters.append(val)
         i += 1
     return filters
+
+
+def _extract_string_members(params, prefix):
+    """Extract a plain string list (``RetainResources.member.N``); the JSON
+    protocol sends it as a list under the bare key."""
+    direct = params.get(prefix)
+    if isinstance(direct, list):
+        return [str(v) for v in direct]
+    result = []
+    i = 1
+    while True:
+        value = _p(params, f"{prefix}.member.{i}")
+        if not value:
+            break
+        result.append(value)
+        i += 1
+    return result
