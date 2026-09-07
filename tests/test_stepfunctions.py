@@ -7839,7 +7839,11 @@ def _drain_queue(sqs, q_url, want, tries=20):
     return got
 
 
-def _status_event_rule(eb, sqs, slug):
+def _status_event_rule(eb, sqs, slug, sm_arns):
+    """A rule scoped to the given state machines, the way a real consumer
+    scopes it. The scoping matters to the tests themselves: the suite runs
+    sharded, and an unscoped aws.states pattern also catches the status
+    events of every standard execution a parallel worker starts."""
     q_url = sqs.create_queue(QueueName=f"qa-sfn-evt-{slug}")["QueueUrl"]
     q_arn = sqs.get_queue_attributes(
         QueueUrl=q_url, AttributeNames=["QueueArn"]
@@ -7849,6 +7853,7 @@ def _status_event_rule(eb, sqs, slug):
         EventPattern=json.dumps({
             "source": ["aws.states"],
             "detail-type": ["Step Functions Execution Status Change"],
+            "detail": {"stateMachineArn": list(sm_arns)},
         }),
         State="ENABLED",
     )
@@ -7862,7 +7867,6 @@ def test_sfn_execution_emits_status_change_events(sfn, eb, sqs):
     """A standard execution publishes aws.states / "Step Functions Execution
     Status Change" to the default bus on start (RUNNING) and completion
     (SUCCEEDED), with the documented detail fields and epoch-ms dates."""
-    q_url, rule = _status_event_rule(eb, sqs, "ok")
     sm_arn = sfn.create_state_machine(
         name="qa-evt-ok",
         definition=json.dumps(
@@ -7870,6 +7874,7 @@ def test_sfn_execution_emits_status_change_events(sfn, eb, sqs):
         ),
         roleArn="arn:aws:iam::000000000000:role/R",
     )["stateMachineArn"]
+    q_url, rule = _status_event_rule(eb, sqs, "ok", [sm_arn])
     try:
         exec_arn = sfn.start_execution(
             stateMachineArn=sm_arn, input='{"a": 1}'
@@ -7908,7 +7913,6 @@ def test_sfn_execution_emits_status_change_events(sfn, eb, sqs):
 def test_sfn_failed_and_aborted_executions_emit_status_events(sfn, eb, sqs):
     """FAILED carries error/cause and reports REDRIVABLE; a StopExecution
     lands ABORTED with error/cause null, per the documented payloads."""
-    q_url, rule = _status_event_rule(eb, sqs, "failstop")
     fail_arn = sfn.create_state_machine(
         name="qa-evt-fail",
         definition=json.dumps({"StartAt": "Boom", "States": {
@@ -7923,6 +7927,7 @@ def test_sfn_failed_and_aborted_executions_emit_status_events(sfn, eb, sqs):
         }}),
         roleArn="arn:aws:iam::000000000000:role/R",
     )["stateMachineArn"]
+    q_url, rule = _status_event_rule(eb, sqs, "failstop", [fail_arn, wait_arn])
     try:
         sfn.start_execution(stateMachineArn=fail_arn)
         waiting = sfn.start_execution(stateMachineArn=wait_arn)["executionArn"]
@@ -7949,7 +7954,6 @@ def test_sfn_failed_and_aborted_executions_emit_status_events(sfn, eb, sqs):
 def test_sfn_sync_execution_emits_no_status_events(sfn_sync, sfn, eb, sqs):
     """StartSyncExecution is the express-flavored path; express workflows
     emit no status events on AWS, so none are published."""
-    q_url, rule = _status_event_rule(eb, sqs, "sync")
     sm_arn = sfn.create_state_machine(
         name="qa-evt-sync",
         definition=json.dumps(
@@ -7957,6 +7961,7 @@ def test_sfn_sync_execution_emits_no_status_events(sfn_sync, sfn, eb, sqs):
         ),
         roleArn="arn:aws:iam::000000000000:role/R",
     )["stateMachineArn"]
+    q_url, rule = _status_event_rule(eb, sqs, "sync", [sm_arn])
     try:
         sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input="{}")
         msgs = _drain_queue(sqs, q_url, want=1, tries=3)

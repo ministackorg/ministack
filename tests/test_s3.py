@@ -2161,7 +2161,8 @@ def test_s3_eventbridge_notification(s3, sqs, eb):
     # Rule matches the AWS-documented detail-type, not source alone.
     eb.put_rule(
         Name="s3-to-sqs-rule",
-        EventPattern=json.dumps({"source": ["aws.s3"], "detail-type": ["Object Created"]}),
+        EventPattern=json.dumps({"source": ["aws.s3"], "detail-type": ["Object Created"],
+                                 "detail": {"bucket": {"name": ["s3-eb-bkt"]}}}),
         State="ENABLED",
     )
     eb.put_targets(
@@ -2208,7 +2209,8 @@ def test_s3_eventbridge_notification_dispatches_in_bucket_region(s3):
     )
     west_eb.put_rule(
         Name=rule_name,
-        EventPattern=json.dumps({"source": ["aws.s3"], "detail-type": ["Object Created"]}),
+        EventPattern=json.dumps({"source": ["aws.s3"], "detail-type": ["Object Created"],
+                                 "detail": {"bucket": {"name": [bucket_name]}}}),
         State="ENABLED",
     )
     west_eb.put_targets(
@@ -2245,7 +2247,7 @@ def test_s3_eventbridge_notification_copy_reason(s3, sqs, eb):
             {
                 "source": ["aws.s3"],
                 "detail-type": ["Object Created"],
-                "detail": {"reason": ["CopyObject"]},
+                "detail": {"reason": ["CopyObject"], "bucket": {"name": ["s3-eb-copy-bkt"]}},
             }
         ),
         State="ENABLED",
@@ -2279,7 +2281,8 @@ def test_s3_eventbridge_notification_object_deleted(s3, sqs, eb):
     )
     eb.put_rule(
         Name="s3-del-rule",
-        EventPattern=json.dumps({"source": ["aws.s3"], "detail-type": ["Object Deleted"]}),
+        EventPattern=json.dumps({"source": ["aws.s3"], "detail-type": ["Object Deleted"],
+                                 "detail": {"bucket": {"name": ["s3-eb-del-bkt"]}}}),
         State="ENABLED",
     )
     eb.put_targets(Rule="s3-del-rule", Targets=[{"Id": "t", "Arn": queue_arn}])
@@ -3904,7 +3907,8 @@ def test_s3_eventbridge_notification_on_delete(s3, sqs, eb):
     # Create EventBridge rule matching S3 events -> SQS target
     eb.put_rule(
         Name="s3-del-to-sqs-rule",
-        EventPattern=json.dumps({"source": ["aws.s3"]}),
+        EventPattern=json.dumps({"source": ["aws.s3"],
+                                 "detail": {"bucket": {"name": [bucket]}}}),
         State="ENABLED",
     )
     eb.put_targets(
