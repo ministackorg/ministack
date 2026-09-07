@@ -17,7 +17,7 @@ from .engine import (
     _resolve_refs,
     validate_template_support,
 )
-from .helpers import _error, _esc, _extract_members, _p, _resolve_template, _xml
+from .helpers import _error, _esc, _extract_members, _p, _page, _resolve_template, _xml
 from .stacks import (
     _add_event,
     _create_stack_task_in_region,
@@ -77,6 +77,7 @@ def _resolve_props_for_diff(template, params, stack_name, stack_id):
 
 def _create_change_set(params):
     from ministack.services.cloudformation import _change_sets, _stack_events, _stacks
+    from ministack.services.cloudformation.handlers import _resolve_stack
     stack_name = _p(params, "StackName")
     cs_name = _p(params, "ChangeSetName")
     cs_type = _p(params, "ChangeSetType", "UPDATE")
@@ -101,8 +102,19 @@ def _create_change_set(params):
 
     provided_params = _extract_members(params, "Parameters")
     tags = _extract_members(params, "Tags")
+    # An empty Tags list arrives as ``Tags=``: given-empty clears the stack's
+    # tags on execute, an omitted Tags keeps them (as UpdateStack does).
+    tags_given = "Tags" in params or bool(tags)
+    from .helpers import _validate_stack_tags
+    tags_error = _validate_stack_tags(tags)
+    if tags_error:
+        return tags_error
 
-    stack = _stacks.get(stack_name)
+    stack = _resolve_stack(stack_name)
+    if stack is not None and cs_type != "CREATE":
+        # A change set is keyed by the stack's name; an UPDATE set addressed
+        # by stack id carries on under the name.
+        stack_name = stack.get("StackName", stack_name)
 
     if cs_type == "CREATE":
         if stack and stack.get("StackStatus") not in (
@@ -223,6 +235,7 @@ def _create_change_set(params):
             for k, v in param_values.items()
         ],
         "Tags": tags,
+        "_tags_given": tags_given,
         "_template": template,
         "_template_body": template_body,
         "_resolved_params": param_values,
@@ -258,12 +271,33 @@ def _describe_change_set(params):
     changes_xml = ""
     for ch in cs.get("Changes", []):
         rc = ch.get("ResourceChange", {})
+        scope_xml = "".join(f"<member>{_esc(a)}</member>" for a in rc.get("Scope", []))
+        details_xml = ""
+        for d in rc.get("Details", []):
+            target = d.get("Target", {})
+            target_xml = f"<Attribute>{_esc(target.get('Attribute', ''))}</Attribute>"
+            if target.get("Name"):
+                target_xml += f"<Name>{_esc(target['Name'])}</Name>"
+            if target.get("RequiresRecreation"):
+                target_xml += (
+                    f"<RequiresRecreation>{_esc(target['RequiresRecreation'])}"
+                    "</RequiresRecreation>"
+                )
+            details_xml += (
+                "<member>"
+                f"<Target>{target_xml}</Target>"
+                f"<Evaluation>{_esc(d.get('Evaluation', 'Static'))}</Evaluation>"
+                f"<ChangeSource>{_esc(d.get('ChangeSource', 'DirectModification'))}</ChangeSource>"
+                "</member>"
+            )
         changes_xml += (
             "<member><ResourceChange>"
             f"<Action>{rc.get('Action', '')}</Action>"
             f"<LogicalResourceId>{_esc(rc.get('LogicalResourceId', ''))}</LogicalResourceId>"
             f"<ResourceType>{_esc(rc.get('ResourceType', ''))}</ResourceType>"
             f"<Replacement>{rc.get('Replacement', '')}</Replacement>"
+            f"<Scope>{scope_xml}</Scope>"
+            f"<Details>{details_xml}</Details>"
             "</ResourceChange></member>"
         )
 
@@ -350,16 +384,19 @@ def _execute_change_set(params):
             "_template": copy.deepcopy(stack.get("_template", {})),
             "_template_body": stack.get("_template_body", ""),
             "_resolved_params": copy.deepcopy(stack.get("_resolved_params", {})),
+            "_conditions": copy.deepcopy(stack.get("_conditions", {})),
+            "Tags": copy.deepcopy(stack.get("Tags", [])),
             "Outputs": copy.deepcopy(stack.get("Outputs", [])),
         }
     else:
         previous_stack = None
+    retain_except_on_create = _p(params, "RetainExceptOnCreate", "false").lower() == "true"
 
     status_prefix = "UPDATE" if is_update else "CREATE"
     stack["StackStatus"] = f"{status_prefix}_IN_PROGRESS"
     stack["LastUpdatedTime"] = now_iso()
     stack["_template_body"] = template_body
-    if tags:
+    if tags or cs.get("_tags_given"):
         stack["Tags"] = tags
     stack["Parameters"] = [
         {"ParameterKey": k, "ParameterValue": v["Value"], "NoEcho": v["NoEcho"]}
@@ -379,7 +416,8 @@ def _execute_change_set(params):
                 _deploy_stack_async(real_stack_name, stack_id, template,
                                     param_values, False, tags,
                                     is_update=is_update,
-                                    previous_stack=previous_stack),
+                                    previous_stack=previous_stack,
+                                    retain_except_on_create=retain_except_on_create),
             ),
             stack,
             stack_id,
@@ -437,10 +475,12 @@ def _list_change_sets(params):
     if not stack_name:
         return _error("ValidationError", "StackName is required")
 
+    listed = [cs for cs in _change_sets.values() if cs["StackName"] == stack_name]
+    listed, next_token_xml, err = _page(listed, params, "ListChangeSets")
+    if err:
+        return err
     members = ""
-    for cs in _change_sets.values():
-        if cs["StackName"] != stack_name:
-            continue
+    for cs in listed:
         members += (
             "<member>"
             f"<ChangeSetId>{_esc(cs['ChangeSetId'])}</ChangeSetId>"
@@ -458,7 +498,7 @@ def _list_change_sets(params):
     return _xml(200, "ListChangeSetsResponse",
                 f"<ListChangeSetsResult>"
                 f"<Summaries>{members}</Summaries>"
-                f"</ListChangeSetsResult>")
+                f"{next_token_xml}</ListChangeSetsResult>")
 
 
 # --- GetTemplateSummary ---

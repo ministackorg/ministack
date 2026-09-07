@@ -9,6 +9,7 @@ import json
 import logging
 
 from ministack.core.responses import get_account_id, get_region, new_uuid, now_iso
+from ministack.services.cloudformation import wait_conditions as _wc
 
 from .changesets import (
     _create_change_set,
@@ -18,16 +19,29 @@ from .changesets import (
     _list_change_sets,
 )
 from .engine import (
+    _NO_VALUE,
     _apply_sam_transform_if_applicable,
     _evaluate_conditions,
+    _has_dynamic_references,
     _parse_template,
     _resolve_parameters,
     _resolve_refs,
     validate_template_support,
 )
-from .helpers import _error, _esc, _extract_members, _extract_stack_status_filters, _p, _resolve_template, _xml
+from .helpers import (
+    _error,
+    _esc,
+    _extract_members,
+    _extract_stack_status_filters,
+    _extract_string_members,
+    _p,
+    _page,
+    _resolve_template,
+    _xml,
+)
 from .stacks import (
     _add_event,
+    _continue_update_rollback_async,
     _create_stack_task_in_region,
     _delete_stack_async,
     _deploy_stack_async,
@@ -41,6 +55,8 @@ logger = logging.getLogger("cloudformation")
 
 def _create_stack(params):
     from ministack.services.cloudformation import _stack_events, _stacks
+
+    from .helpers import _resolve_document
     stack_name = _p(params, "StackName")
     if not stack_name:
         return _error("ValidationError", "StackName is required")
@@ -67,6 +83,11 @@ def _create_stack(params):
     provided_params = _extract_members(params, "Parameters")
     tags = _extract_members(params, "Tags")
     disable_rollback = _p(params, "DisableRollback", "false").lower() == "true"
+    retain_except_on_create = _p(params, "RetainExceptOnCreate", "false").lower() == "true"
+    from .helpers import _validate_stack_tags
+    tags_error = _validate_stack_tags(tags)
+    if tags_error:
+        return tags_error
 
     # Resolve parameters
     try:
@@ -84,6 +105,13 @@ def _create_stack(params):
         f"arn:aws:cloudformation:{get_region()}:{get_account_id()}:"
         f"stack/{stack_name}/{new_uuid()}"
     )
+
+    termination_protection = (
+        _p(params, "EnableTerminationProtection", "false").lower() == "true")
+    stack_policy, policy_err = _resolve_document(
+        params, "StackPolicyBody", "StackPolicyURL", "Stack policy")
+    if policy_err:
+        return policy_err
 
     stack = {
         "StackName": stack_name,
@@ -104,6 +132,8 @@ def _create_stack(params):
         "Tags": tags,
         "Outputs": [],
         "DisableRollback": disable_rollback,
+        "EnableTerminationProtection": termination_protection,
+        "_stack_policy": stack_policy or "",
         "_region": get_region(),
         "_resources": {},
         "_template": template,
@@ -120,7 +150,8 @@ def _create_stack(params):
 
     _create_stack_task_in_region(
         _deploy_stack_async(stack_name, stack_id, template,
-                            param_values, disable_rollback, tags),
+                            param_values, disable_rollback, tags,
+                            retain_except_on_create=retain_except_on_create),
         stack,
         stack_id,
     )
@@ -185,6 +216,9 @@ def _describe_stacks(params):
             if s.get("StackStatus") != "DELETE_COMPLETE"
         ]
 
+    stacks_to_describe, next_token_xml, err = _page(stacks_to_describe, params, "DescribeStacks")
+    if err:
+        return err
     members = ""
     for s in stacks_to_describe:
         params_xml = ""
@@ -230,6 +264,9 @@ def _describe_stacks(params):
             f"<LastUpdatedTime>{s.get('LastUpdatedTime', '')}</LastUpdatedTime>"
             f"<Description>{_esc(s.get('Description', ''))}</Description>"
             f"<DisableRollback>{str(s.get('DisableRollback', False)).lower()}</DisableRollback>"
+            "<EnableTerminationProtection>"
+            f"{str(s.get('EnableTerminationProtection', False)).lower()}"
+            "</EnableTerminationProtection>"
             f"<Parameters>{params_xml}</Parameters>"
             f"<Outputs>{outputs_xml}</Outputs>"
             f"<Tags>{tags_xml}</Tags>"
@@ -237,7 +274,8 @@ def _describe_stacks(params):
         )
 
     return _xml(200, "DescribeStacksResponse",
-                f"<DescribeStacksResult><Stacks>{members}</Stacks></DescribeStacksResult>")
+                f"<DescribeStacksResult><Stacks>{members}</Stacks>"
+                f"{next_token_xml}</DescribeStacksResult>")
 
 
 # --- ListStacks ---
@@ -245,12 +283,17 @@ def _describe_stacks(params):
 def _list_stacks(params):
     from ministack.services.cloudformation import _stacks
     status_filters = _extract_stack_status_filters(params)
+    listed = [
+        s for s in _stacks.values()
+        if not status_filters or s.get("StackStatus", "") in status_filters
+    ]
+    listed, next_token_xml, err = _page(listed, params, "ListStacks")
+    if err:
+        return err
 
     summaries = ""
-    for s in _stacks.values():
+    for s in listed:
         status = s.get("StackStatus", "")
-        if status_filters and status not in status_filters:
-            continue
         entry = (
             "<member>"
             f"<StackName>{_esc(s['StackName'])}</StackName>"
@@ -268,7 +311,8 @@ def _list_stacks(params):
         summaries += entry
 
     return _xml(200, "ListStacksResponse",
-                f"<ListStacksResult><StackSummaries>{summaries}</StackSummaries></ListStacksResult>")
+                f"<ListStacksResult><StackSummaries>{summaries}</StackSummaries>"
+                f"{next_token_xml}</ListStacksResult>")
 
 
 # --- DescribeStackEvents ---
@@ -286,9 +330,16 @@ def _describe_stack_events(params):
 
     stack_id = stack["StackId"]
     events = _stack_events.get(stack_id, [])
-    # Newest first
-    events_sorted = sorted(events, key=lambda e: e.get("Timestamp", ""),
-                           reverse=True)
+    # Newest first; events of one millisecond in reverse emission order
+    events_sorted = [
+        e for _, e in sorted(
+            enumerate(events),
+            key=lambda pair: (pair[1].get("Timestamp", ""), pair[0]),
+            reverse=True)
+    ]
+    events_sorted, next_token_xml, err = _page(events_sorted, params, "DescribeStackEvents")
+    if err:
+        return err
 
     members = ""
     for e in events_sorted:
@@ -307,10 +358,45 @@ def _describe_stack_events(params):
         )
 
     return _xml(200, "DescribeStackEventsResponse",
-                f"<DescribeStackEventsResult><StackEvents>{members}</StackEvents></DescribeStackEventsResult>")
+                f"<DescribeStackEventsResult><StackEvents>{members}</StackEvents>"
+                f"{next_token_xml}</DescribeStackEventsResult>")
 
 
 # --- DescribeStackResource ---
+
+def _resource_status_reason_xml(res):
+    """The ``ResourceStatusReason`` element of a stack resource, empty when
+    the record carries none (a healthy resource has no reason on AWS)."""
+    reason = res.get("ResourceStatusReason")
+    if not reason:
+        return ""
+    return f"<ResourceStatusReason>{_esc(reason)}</ResourceStatusReason>"
+
+
+def _resource_metadata_xml(stack, logical_id):
+    """The ``Metadata`` element of ``StackResourceDetail``: the resource's
+    ``Metadata`` attribute as a JSON string, intrinsics resolved the way a
+    property is (AWS interprets ``Ref``/``Fn::GetAtt`` inside it), empty when
+    the template declares none."""
+    template = stack.get("_template") or {}
+    res_def = (template.get("Resources") or {}).get(logical_id) or {}
+    metadata = res_def.get("Metadata")
+    if metadata is None:
+        return ""
+    try:
+        resolved = _resolve_refs(
+            copy.deepcopy(metadata), stack.get("_resources", {}),
+            stack.get("_resolved_params", {}), stack.get("_conditions", {}),
+            template.get("Mappings", {}), stack.get("StackName", ""),
+            stack.get("StackId", ""))
+        # ``Metadata: {"Ref": "AWS::NoValue"}`` resolves the whole attribute
+        # away; the literal is what the template declared.
+        body = json.dumps(metadata if resolved is _NO_VALUE else resolved)
+    except Exception as exc:  # the literal is still better than nothing
+        logger.warning("Metadata of %s left unresolved: %s", logical_id, exc)
+        body = json.dumps(metadata)
+    return f"<Metadata>{_esc(body)}</Metadata>"
+
 
 def _describe_stack_resource(params):
     from ministack.services.cloudformation import _stacks
@@ -321,6 +407,7 @@ def _describe_stack_resource(params):
     if not stack:
         return _error("ValidationError",
                       f"Stack [{stack_name}] does not exist")
+    stack_name = stack.get("StackName", stack_name)
 
     resources = stack.get("_resources", {})
     res = resources.get(logical_id)
@@ -333,9 +420,11 @@ def _describe_stack_resource(params):
         f"<PhysicalResourceId>{_esc(res.get('PhysicalResourceId', ''))}</PhysicalResourceId>"
         f"<ResourceType>{_esc(res.get('ResourceType', ''))}</ResourceType>"
         f"<ResourceStatus>{res.get('ResourceStatus', '')}</ResourceStatus>"
-        f"<Timestamp>{res.get('Timestamp', '')}</Timestamp>"
+        f"{_resource_status_reason_xml(res)}"
+        f"<LastUpdatedTimestamp>{res.get('Timestamp', '')}</LastUpdatedTimestamp>"
         f"<StackName>{_esc(stack_name)}</StackName>"
         f"<StackId>{_esc(stack['StackId'])}</StackId>"
+        f"{_resource_metadata_xml(stack, logical_id)}"
     )
 
     return _xml(200, "DescribeStackResourceResponse",
@@ -355,6 +444,7 @@ def _describe_stack_resources(params):
     if not stack:
         return _error("ValidationError",
                       f"Stack [{stack_name}] does not exist")
+    stack_name = stack.get("StackName", stack_name)
 
     resources = stack.get("_resources", {})
 
@@ -374,6 +464,7 @@ def _describe_stack_resources(params):
             f"<PhysicalResourceId>{_esc(res.get('PhysicalResourceId', ''))}</PhysicalResourceId>"
             f"<ResourceType>{_esc(res.get('ResourceType', ''))}</ResourceType>"
             f"<ResourceStatus>{res.get('ResourceStatus', '')}</ResourceStatus>"
+            f"{_resource_status_reason_xml(res)}"
             f"<Timestamp>{res.get('Timestamp', '')}</Timestamp>"
             f"<StackName>{_esc(stack_name)}</StackName>"
             f"<StackId>{_esc(stack['StackId'])}</StackId>"
@@ -399,8 +490,11 @@ def _list_stack_resources(params):
                       f"Stack [{stack_name}] does not exist")
 
     resources = stack.get("_resources", {})
+    listed, next_token_xml, err = _page(list(resources.items()), params, "ListStackResources")
+    if err:
+        return err
     members = ""
-    for logical_id, res in resources.items():
+    for logical_id, res in listed:
         members += (
             "<member>"
             f"<LogicalResourceId>{_esc(logical_id)}</LogicalResourceId>"
@@ -414,7 +508,7 @@ def _list_stack_resources(params):
     return _xml(200, "ListStackResourcesResponse",
                 f"<ListStackResourcesResult>"
                 f"<StackResourceSummaries>{members}</StackResourceSummaries>"
-                f"</ListStackResourcesResult>")
+                f"{next_token_xml}</ListStackResourcesResult>")
 
 
 # --- GetTemplate ---
@@ -493,6 +587,11 @@ def _delete_stack(params):
     if stack.get("StackStatus") == "DELETE_COMPLETE":
         return _xml(200, "DeleteStackResponse", "")
 
+    if stack.get("EnableTerminationProtection"):
+        return _error("ValidationError",
+                      f"Stack [{stack['StackId']}] cannot be deleted while "
+                      "TerminationProtection is enabled")
+
     # Check for active imports before deleting
     stack_exports = [
         out.get("ExportName") for out in stack.get("Outputs", [])
@@ -510,6 +609,20 @@ def _delete_stack(params):
 
     stack_id = stack["StackId"]
 
+    # RetainResources: only for a DELETE_FAILED stack, only its own resources.
+    retain = _extract_string_members(params, "RetainResources")
+    if retain:
+        if stack.get("StackStatus") != "DELETE_FAILED":
+            return _error("ValidationError",
+                          f"Stack [{stack_name}] is not in DELETE_FAILED state; "
+                          "RetainResources can only be specified for a stack in "
+                          "DELETE_FAILED state")
+        unknown = sorted(set(retain) - set(stack.get("_resources", {})))
+        if unknown:
+            return _error("ValidationError",
+                          f"Resource(s) [{', '.join(unknown)}] do not exist in "
+                          f"stack [{stack_name}]")
+
     # Deleting a stack removes its change sets; they must not outlive it and
     # shadow a later same-named change set on a re-created stack. #1418
     from ministack.services.cloudformation import _change_sets
@@ -518,7 +631,7 @@ def _delete_stack(params):
         _change_sets.pop(_cid, None)
 
     _create_stack_task_in_region(
-        _delete_stack_async(stack_name, stack_id),
+        _delete_stack_async(stack_name, stack_id, frozenset(retain)),
         stack,
         stack_id,
     )
@@ -528,26 +641,31 @@ def _delete_stack(params):
 
 # --- UpdateStack ---
 
-def _stack_has_no_updates(stack, template, param_values, tags):
+def _stack_has_no_updates(stack, template, param_values, tags,
+                          use_previous_template=False, tags_given=False):
     """True when an UpdateStack would change nothing: the template equals the
     one the stack runs, every parameter resolves to its current value, and the
     request either carries no tags or the tags the stack already has. Real
     CloudFormation refuses such a request with ``No updates are to be
-    performed.`` instead of running an empty update (a template with a
-    dynamic reference is the documented exception, and the emulator refuses
-    dynamic references up front)."""
+    performed.`` instead of running an empty update. A template body that
+    carries a dynamic reference is the exception: the update is accepted
+    (with ``UsePreviousTemplate`` it is still refused) — measured on AWS."""
     if template != stack.get("_template", {}):
+        return False
+    if not use_previous_template and _has_dynamic_references(template):
         return False
     current = {k: v.get("Value") for k, v in stack.get("_resolved_params", {}).items()}
     if {k: v.get("Value") for k, v in param_values.items()} != current:
         return False
-    if tags and tags != stack.get("Tags", []):
+    if (tags or tags_given) and tags != stack.get("Tags", []):
         return False
     return True
 
 
 def _update_stack(params):
     from ministack.services.cloudformation import _stacks
+
+    from .helpers import _resolve_document
     stack_name = _p(params, "StackName")
     if not stack_name:
         return _error("ValidationError", "StackName is required")
@@ -575,10 +693,12 @@ def _update_stack(params):
     template_body, resolve_err = _resolve_template(params)
     if resolve_err:
         return resolve_err
+    use_previous_template = False
     if not template_body:
         # Use previous template if UsePreviousTemplate
         if _p(params, "UsePreviousTemplate", "false").lower() == "true":
             template_body = stack.get("_template_body", "{}")
+            use_previous_template = True
         else:
             return _error("ValidationError", "TemplateBody or TemplateURL is required")
 
@@ -590,6 +710,15 @@ def _update_stack(params):
     provided_params = _extract_members(params, "Parameters")
     tags = _extract_members(params, "Tags")
     disable_rollback = _p(params, "DisableRollback", "false").lower() == "true"
+    retain_except_on_create = _p(params, "RetainExceptOnCreate", "false").lower() == "true"
+    # botocore sends an empty Tags list as ``Tags=``: given and empty clears
+    # the stack's tags ("If you specify an empty value, CloudFormation
+    # removes all associated tags"); an omitted Tags keeps them.
+    tags_given = "Tags" in params or bool(tags)
+    from .helpers import _validate_stack_tags
+    tags_error = _validate_stack_tags(tags)
+    if tags_error:
+        return tags_error
 
     try:
         param_values = _resolve_parameters(
@@ -603,7 +732,8 @@ def _update_stack(params):
     except ValueError as exc:
         return _error("ValidationError", str(exc))
 
-    if _stack_has_no_updates(stack, template, param_values, tags):
+    if _stack_has_no_updates(stack, template, param_values, tags,
+                             use_previous_template, tags_given):
         return _error("ValidationError", "No updates are to be performed.")
 
     # Save previous state for rollback
@@ -612,6 +742,7 @@ def _update_stack(params):
         "_template": copy.deepcopy(stack.get("_template", {})),
         "_template_body": stack.get("_template_body", ""),
         "_resolved_params": copy.deepcopy(stack.get("_resolved_params", {})),
+        "_conditions": copy.deepcopy(stack.get("_conditions", {})),
         "Parameters": copy.deepcopy(stack.get("Parameters", [])),
         "Tags": copy.deepcopy(stack.get("Tags", [])),
         "Outputs": copy.deepcopy(stack.get("Outputs", [])),
@@ -627,10 +758,17 @@ def _update_stack(params):
                 and _cs.get("ExecutionStatus") == "AVAILABLE"):
             _cs["ExecutionStatus"] = "OBSOLETE"
 
+    stack_policy, policy_err = _resolve_document(
+        params, "StackPolicyBody", "StackPolicyURL", "Stack policy")
+    if policy_err:
+        return policy_err
+    if stack_policy:
+        stack["_stack_policy"] = stack_policy
+
     stack["StackStatus"] = "UPDATE_IN_PROGRESS"
     stack["LastUpdatedTime"] = now_iso()
     stack["_template_body"] = template_body
-    if tags:
+    if tags or tags_given:
         stack["Tags"] = tags
     stack["Parameters"] = [
         {"ParameterKey": k, "ParameterValue": v["Value"], "NoEcho": v["NoEcho"]}
@@ -646,7 +784,8 @@ def _update_stack(params):
         _create_stack_task_in_region(
             _deploy_stack_async(stack_name, stack_id, template,
                                 param_values, disable_rollback, tags,
-                                is_update=True, previous_stack=previous_stack),
+                                is_update=True, previous_stack=previous_stack,
+                                retain_except_on_create=retain_except_on_create),
             stack,
             stack_id,
         )
@@ -710,8 +849,11 @@ def _validate_template(params):
 
 def _list_exports(params):
     from ministack.services.cloudformation import _exports
+    listed, next_token_xml, err = _page(list(_exports.items()), params, "ListExports")
+    if err:
+        return err
     members = ""
-    for name, exp in _exports.items():
+    for name, exp in listed:
         members += (
             "<member>"
             f"<ExportingStackId>{_esc(exp.get('StackId', ''))}</ExportingStackId>"
@@ -721,7 +863,8 @@ def _list_exports(params):
         )
 
     return _xml(200, "ListExportsResponse",
-                f"<ListExportsResult><Exports>{members}</Exports></ListExportsResult>")
+                f"<ListExportsResult><Exports>{members}</Exports>"
+                f"{next_token_xml}</ListExportsResult>")
 # --- GetTemplateSummary ---
 
 def _get_template_summary(params):
@@ -732,8 +875,8 @@ def _get_template_summary(params):
     stack_name = _p(params, "StackName")
 
     if stack_name and not template_body:
-        stack = _stacks.get(stack_name)
-        if not stack:
+        stack = _resolve_stack(stack_name)
+        if not stack or stack.get("StackStatus") == "DELETE_COMPLETE":
             return _error("ValidationError",
                           f"Stack [{stack_name}] does not exist")
         template_body = stack.get("_template_body", "{}")
@@ -831,6 +974,161 @@ def _get_template_summary(params):
                 f"</GetTemplateSummaryResult>")
 
 
+# --- ListImports ---
+
+def _list_imports(params):
+    from ministack.services.cloudformation import _stacks
+    export_name = _p(params, "ExportName")
+    if not export_name:
+        return _error("ValidationError", "ExportName is required")
+    importers = sorted(
+        name for name, stack in _stacks.items()
+        if stack.get("StackStatus", "").endswith("_COMPLETE")
+        and "DELETE" not in stack.get("StackStatus", "")
+        and export_name in _imported_export_names(stack, name)
+    )
+    if not importers:
+        return _error("ValidationError",
+                      f"Export '{export_name}' is not imported by any stack.")
+    importers, next_token_xml, err = _page(importers, params, "ListImports")
+    if err:
+        return err
+    members = "".join(f"<member>{_esc(n)}</member>" for n in importers)
+    return _xml(200, "ListImportsResponse",
+                f"<ListImportsResult><Imports>{members}</Imports>"
+                f"{next_token_xml}</ListImportsResult>")
+
+
+# --- UpdateTerminationProtection / stack policy ---
+
+def _update_termination_protection(params):
+    stack_name = _p(params, "StackName")
+    stack = _resolve_stack(stack_name)
+    if not stack or stack.get("StackStatus") in ("DELETE_IN_PROGRESS", "DELETE_COMPLETE"):
+        return _error("ValidationError", f"Stack [{stack_name}] does not exist")
+    enable = _p(params, "EnableTerminationProtection")
+    if not enable:
+        return _error("ValidationError", "EnableTerminationProtection is required")
+    stack["EnableTerminationProtection"] = enable.lower() == "true"
+    return _xml(200, "UpdateTerminationProtectionResponse",
+                "<UpdateTerminationProtectionResult>"
+                f"<StackId>{_esc(stack['StackId'])}</StackId>"
+                "</UpdateTerminationProtectionResult>")
+
+
+def _set_stack_policy(params):
+    from .helpers import _resolve_document
+    stack_name = _p(params, "StackName")
+    stack = _resolve_stack(stack_name)
+    if not stack or stack.get("StackStatus") == "DELETE_COMPLETE":
+        return _error("ValidationError", f"Stack [{stack_name}] does not exist")
+    policy, policy_err = _resolve_document(
+        params, "StackPolicyBody", "StackPolicyURL", "Stack policy")
+    if policy_err:
+        return policy_err
+    if not policy:
+        return _error("ValidationError", "StackPolicyBody or StackPolicyURL is required")
+    try:
+        json.loads(policy)
+    except ValueError:
+        return _error("ValidationError", "Error validating stack policy: Invalid stack policy")
+    stack["_stack_policy"] = policy
+    return _xml(200, "SetStackPolicyResponse", "")
+
+
+def _get_stack_policy(params):
+    stack_name = _p(params, "StackName")
+    stack = _resolve_stack(stack_name)
+    if not stack or stack.get("StackStatus") == "DELETE_COMPLETE":
+        return _error("ValidationError", f"Stack [{stack_name}] does not exist")
+    policy = stack.get("_stack_policy") or ""
+    body = f"<StackPolicyBody>{_esc(policy)}</StackPolicyBody>" if policy else ""
+    return _xml(200, "GetStackPolicyResponse",
+                f"<GetStackPolicyResult>{body}</GetStackPolicyResult>")
+
+
+# --- CancelUpdateStack / ContinueUpdateRollback ---
+
+def _cancel_update_stack(params):
+    stack_name = _p(params, "StackName")
+    stack = _resolve_stack(stack_name)
+    if not stack or stack.get("StackStatus") == "DELETE_COMPLETE":
+        return _error("ValidationError", f"Stack [{stack_name}] does not exist")
+    if stack.get("StackStatus") != "UPDATE_IN_PROGRESS":
+        return _error("ValidationError",
+                      "CancelUpdateStack cannot be called from current stack status")
+    # The running update checks the flag before each resource and rolls back.
+    stack["_cancel_requested"] = True
+    return _xml(200, "CancelUpdateStackResponse", "")
+
+
+def _continue_update_rollback(params):
+    stack_name = _p(params, "StackName")
+    stack = _resolve_stack(stack_name)
+    if not stack or stack.get("StackStatus") == "DELETE_COMPLETE":
+        return _error("ValidationError", f"Stack [{stack_name}] does not exist")
+    stack_name = stack.get("StackName", stack_name)
+    if stack.get("StackStatus") != "UPDATE_ROLLBACK_FAILED":
+        return _error("ValidationError",
+                      "ContinueUpdateRollback cannot be called from current stack status")
+    # ResourcesToSkip.member.N on the query protocol, a plain list on the JSON one.
+    skip = params.get("ResourcesToSkip")
+    if not isinstance(skip, list):
+        skip = []
+        while _p(params, f"ResourcesToSkip.member.{len(skip) + 1}"):
+            skip.append(_p(params, f"ResourcesToSkip.member.{len(skip) + 1}"))
+    skip = [str(s) for s in skip]
+    pending = stack.get("_rollback_failed", {})
+    unknown = sorted(set(skip) - set(pending))
+    if unknown:
+        return _error("ValidationError",
+                      f"Resource(s) [{', '.join(unknown)}] cannot be skipped: only "
+                      "resources whose rollback failed can be skipped")
+    stack_id = stack["StackId"]
+    _create_stack_task_in_region(
+        _continue_update_rollback_async(stack_name, stack_id, frozenset(skip)),
+        stack,
+        stack_id,
+    )
+    return _xml(200, "ContinueUpdateRollbackResponse",
+                "<ContinueUpdateRollbackResult></ContinueUpdateRollbackResult>")
+
+
+# --- SignalResource ---
+
+def _signal_resource(params):
+    """Deliver a SUCCESS or FAILURE signal to the wait condition of a stack
+    that is waiting under the logical id, from anywhere other than the
+    handle URL (the only way in for a wait condition with a CreationPolicy)."""
+    stack_name = _p(params, "StackName")
+    logical_id = _p(params, "LogicalResourceId")
+    unique_id = _p(params, "UniqueId")
+    status = _p(params, "Status")
+    for name, value in (("StackName", stack_name), ("LogicalResourceId", logical_id),
+                        ("UniqueId", unique_id), ("Status", status)):
+        if not value:
+            return _error("ValidationError", f"{name} is required")
+    if status not in ("SUCCESS", "FAILURE"):
+        return _error("ValidationError",
+                      f"1 validation error detected: Value '{status}' at 'status' failed to satisfy "
+                      "constraint: Member must satisfy enum value set: [FAILURE, SUCCESS]")
+    if len(unique_id) > 64:
+        return _error("ValidationError",
+                      f"1 validation error detected: Value '{unique_id}' at 'uniqueId' failed to "
+                      "satisfy constraint: Member must have length less than or equal to 64")
+    stack = _resolve_stack(stack_name)
+    if not stack or stack.get("StackStatus") == "DELETE_COMPLETE":
+        return _error("ValidationError", f"Stack [{stack_name}] does not exist")
+    stack_name = stack.get("StackName", stack_name)
+    if stack.get("StackStatus") not in ("CREATE_IN_PROGRESS", "UPDATE_IN_PROGRESS"):
+        return _error("ValidationError",
+                      f"Stack [{stack_name}] is in {stack.get('StackStatus')} state and cannot be signaled")
+    if not _wc.signal_resource(stack["StackId"], logical_id, unique_id, status):
+        return _error("ValidationError",
+                      f"Resource [{logical_id}] in stack [{stack_name}] is not waiting for signals")
+    return _xml(200, "SignalResourceResponse", "")
+
+
 # ===========================================================================
 # Action Handler Registry
 # ===========================================================================
@@ -854,4 +1152,11 @@ _ACTION_HANDLERS = {
     "DeleteChangeSet": _delete_change_set,
     "ListChangeSets": _list_change_sets,
     "GetTemplateSummary": _get_template_summary,
+    "ListImports": _list_imports,
+    "UpdateTerminationProtection": _update_termination_protection,
+    "SetStackPolicy": _set_stack_policy,
+    "GetStackPolicy": _get_stack_policy,
+    "CancelUpdateStack": _cancel_update_stack,
+    "ContinueUpdateRollback": _continue_update_rollback,
+    "SignalResource": _signal_resource,
 }

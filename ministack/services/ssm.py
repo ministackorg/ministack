@@ -348,18 +348,30 @@ def _put_parameter(data):
     return json_response({"Version": version, "Tier": record["Tier"]})
 
 
-def resolve_parameter_value(name_or_arn):
+def resolve_parameter_value(name_or_arn, version=None, decrypt=False):
     """Return an SSM parameter's value by name or ARN, or None.
 
-    Used by other services (e.g. ECS `secrets[].valueFrom`) that need to read a
-    parameter value in-process without going through the HTTP API. Accepts a
-    bare name (``/path/name`` or ``name``) or a full ARN
-    (``arn:aws:ssm:region:acct:parameter/path/name``).
+    Used by other services (e.g. ECS `secrets[].valueFrom`, CloudFormation
+    dynamic references) that need to read a parameter value in-process without
+    going through the HTTP API. Accepts a bare name (``/path/name`` or
+    ``name``) or a full ARN (``arn:aws:ssm:region:acct:parameter/path/name``).
+    ``version`` selects an earlier version from the parameter's history;
+    ``decrypt`` returns a SecureString's plaintext, as GetParameter with
+    WithDecryption does.
     """
     if not name_or_arn:
         return None
-    _, param = _lookup_parameter(name_or_arn, allow_arn_region=True, flexible_name=True)
-    return param.get("Value") if param else None
+    name, param = _lookup_parameter(name_or_arn, allow_arn_region=True, flexible_name=True)
+    if not param:
+        return None
+    if version is not None and str(version) != str(param.get("Version")):
+        history = _parameter_history.get(name) or []
+        param = next((h for h in history if str(h.get("Version")) == str(version)), None)
+        if not param:
+            return None
+    if decrypt:
+        return param.get("OriginalValue", param.get("Value"))
+    return param.get("Value")
 
 
 def _get_parameter(data):

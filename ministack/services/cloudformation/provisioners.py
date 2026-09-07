@@ -5,6 +5,7 @@ CloudFormation provisioners — resource create/delete handlers for each AWS res
 """
 
 import base64
+import contextvars
 import copy
 import hashlib
 import io
@@ -451,18 +452,26 @@ def _custom_named_replacement_error(resource_type, old_props, new_props):
     return None
 
 
+# Set by the stack engine around an update whose resource carries
+# ``UpdateReplacePolicy: Retain`` (or ``RetainExceptOnCreate``): a handler that
+# replaces the resource must then leave the predecessor in place; the engine
+# records the DELETE_SKIPPED event.
+_RETAIN_REPLACED = contextvars.ContextVar("cfn_retain_replaced", default=False)
+
+
 def _rename_replacement(physical_id, old_props, new_props, stack_name, logical_id,
                         declared_name, current_name, create_fn, delete_fn):
     """Shared prologue for the name-keyed update handlers: when the resource
     record is gone (current_name is None) or its create-only name property
     changed, the update is a replacement — create the new resource first, then
-    delete the old one, in CloudFormation's replacement order. Returns the
-    create result, or None when the update can proceed in place.
+    delete the old one, in CloudFormation's replacement order (unless the
+    resource's UpdateReplacePolicy retains it). Returns the create result, or
+    None when the update can proceed in place.
     """
     if current_name is not None and declared_name == current_name:
         return None
     created = create_fn(logical_id or physical_id, new_props, stack_name)
-    if current_name is not None and created[0] != physical_id:
+    if current_name is not None and created[0] != physical_id and not _RETAIN_REPLACED.get():
         delete_fn(physical_id, old_props)
     return created
 
@@ -490,12 +499,24 @@ def _update_resource(resource_type: str, physical_id: str, old_props: dict,
         # still referencing it via Ref/Fn::GetAtt would then pick up the
         # instant it was reprocessed later in the same update.
         return physical_id, old_attrs or {}
+    handler = _RESOURCE_HANDLERS.get(resource_type)
+    tag_spec = _STACK_TAG_PROPERTY.get(resource_type)
+    if tag_spec and not (handler and "update" in handler):
+        # Only the tag property differs (a stack-tag change reaches every
+        # tagged resource): without an update handler the fallback below
+        # would re-create the resource under a new physical id. The tags
+        # stay as they are rather than that.
+        tag_prop = tag_spec[0]
+        if ({k: v for k, v in old_props.items() if k != tag_prop}
+                == {k: v for k, v in new_props.items() if k != tag_prop}):
+            logger.debug("Tag-only change on %s %s ignored: no update handler",
+                         resource_type, physical_id)
+            return physical_id, old_attrs or {}
     replacement_error = _custom_named_replacement_error(
         resource_type, old_props, new_props
     )
     if replacement_error:
         raise ValueError(replacement_error)
-    handler = _RESOURCE_HANDLERS.get(resource_type)
     if handler and "update" in handler:
         if handler.get("update_with_logical_id"):
             return handler["update"](
@@ -516,6 +537,136 @@ def _update_resource(resource_type: str, physical_id: str, old_props: dict,
     # resource types make their create idempotent on that stable name;
     # real CloudFormation never presents a fresh physical id this way.
     return _provision_resource(resource_type, logical_id or physical_id, new_props, stack_name)
+
+
+# ---------------------------------------------------------------------------
+# Tags
+# ---------------------------------------------------------------------------
+
+def _tag_map(tags) -> dict:
+    """The ``{Key: Value}`` view of a CloudFormation ``Tags`` property; a map
+    (the shape SSM and API Gateway v2 use) passes through."""
+    if isinstance(tags, dict):
+        return {str(k): str(v) for k, v in tags.items()}
+    return {
+        str(t["Key"]): str(t.get("Value", ""))
+        for t in (tags or [])
+        if isinstance(t, dict) and "Key" in t
+    }
+
+
+def _reconcile_tag_map(store: dict, old_props: dict, new_props: dict,
+                       prop: str = "Tags") -> None:
+    """Apply a tag property change to a service's ``{key: value}`` tag
+    store: keys the template dropped are removed, the rest set. Tags added
+    through the service's own tagging API stay untouched, as on AWS."""
+    old_tags = _tag_map(old_props.get(prop))
+    new_tags = _tag_map(new_props.get(prop))
+    if old_tags == new_tags:
+        return
+    for key in old_tags.keys() - new_tags.keys():
+        store.pop(key, None)
+    store.update(new_tags)
+
+
+def _reconcile_tag_list(store: list, old_props: dict, new_props: dict,
+                        key: str = "Key", value: str = "Value") -> None:
+    """The list-store twin of ``_reconcile_tag_map``: entries the template
+    dropped are removed, the new ones set, entries from elsewhere kept. The
+    list is changed in place; ``key``/``value`` name the entry fields."""
+    old_tags = _tag_map(old_props.get("Tags"))
+    new_tags = _tag_map(new_props.get("Tags"))
+    if old_tags == new_tags:
+        return
+    store[:] = [
+        t for t in store
+        if t.get(key) not in old_tags and t.get(key) not in new_tags
+    ] + [{key: k, value: v} for k, v in new_tags.items()]
+
+
+# The types whose provisioner stores a tag property, with that property's name
+# and shape. Stack-level tags and the three ``aws:cloudformation:`` tags are
+# merged into the property before the resource is created or updated; a type
+# outside this table has no tag store the stack tags could reach.
+_STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
+    "AWS::ApiGateway::ApiKey": ("Tags", "list"),
+    "AWS::ApiGateway::DomainName": ("Tags", "list"),
+    "AWS::ApiGateway::RestApi": ("Tags", "list"),
+    "AWS::ApiGateway::Stage": ("Tags", "list"),
+    "AWS::ApiGateway::UsagePlan": ("Tags", "list"),
+    "AWS::ApiGatewayV2::Api": ("Tags", "map"),
+    "AWS::ApiGatewayV2::Stage": ("Tags", "map"),
+    "AWS::AppConfig::Application": ("Tags", "list"),
+    "AWS::AppConfig::ConfigurationProfile": ("Tags", "list"),
+    "AWS::AppConfig::Deployment": ("Tags", "list"),
+    "AWS::AppConfig::DeploymentStrategy": ("Tags", "list"),
+    "AWS::AppConfig::Environment": ("Tags", "list"),
+    "AWS::AutoScaling::AutoScalingGroup": ("Tags", "list"),
+    "AWS::Backup::BackupPlan": ("BackupPlanTags", "map"),
+    "AWS::Backup::BackupVault": ("BackupVaultTags", "map"),
+    "AWS::CertificateManager::Certificate": ("Tags", "list"),
+    "AWS::CloudFormation::Stack": ("Tags", "list"),
+    "AWS::CloudWatch::Alarm": ("Tags", "list"),
+    "AWS::CodeBuild::Project": ("Tags", "list"),
+    "AWS::Cognito::IdentityPool": ("IdentityPoolTags", "map"),
+    "AWS::Cognito::UserPool": ("UserPoolTags", "map"),
+    "AWS::DynamoDB::Table": ("Tags", "list"),
+    "AWS::EC2::VPCEndpoint": ("Tags", "list"),
+    "AWS::ECS::Cluster": ("Tags", "list"),
+    "AWS::ECS::Service": ("Tags", "list"),
+    "AWS::EKS::Cluster": ("Tags", "list"),
+    "AWS::EKS::Nodegroup": ("Tags", "map"),
+    "AWS::ElasticLoadBalancingV2::Listener": ("Tags", "list"),
+    "AWS::ElasticLoadBalancingV2::LoadBalancer": ("Tags", "list"),
+    "AWS::ElasticLoadBalancingV2::TargetGroup": ("Tags", "list"),
+    "AWS::Events::EventBus": ("Tags", "list"),
+    "AWS::IAM::Role": ("Tags", "list"),
+    "AWS::KMS::Key": ("Tags", "list"),
+    "AWS::Kinesis::Stream": ("Tags", "list"),
+    "AWS::Lambda::Function": ("Tags", "list"),
+    "AWS::Logs::LogGroup": ("Tags", "list"),
+    "AWS::OpenSearchService::Domain": ("Tags", "list"),
+    "AWS::RDS::DBInstance": ("Tags", "list"),
+    "AWS::SNS::Topic": ("Tags", "list"),
+    "AWS::SQS::Queue": ("Tags", "list"),
+    "AWS::SSM::Parameter": ("Tags", "map"),
+    "AWS::Scheduler::ScheduleGroup": ("Tags", "list"),
+    "AWS::SecretsManager::Secret": ("Tags", "list"),
+    "AWS::StepFunctions::StateMachine": ("Tags", "list"),
+}
+
+
+def _with_stack_tags(resource_type: str, props: dict, stack_tags: list,
+                     stack_name: str, stack_id: str, logical_id: str) -> dict:
+    """The properties a resource is provisioned with: the template's own tag
+    property plus the stack-level tags and the three ``aws:cloudformation:``
+    tags CloudFormation adds, for the types in ``_STACK_TAG_PROPERTY``. A key
+    the template sets wins over the stack-level tag of the same name. Returns
+    ``props`` itself for every other type, and a copy otherwise: the stack
+    record keeps the template's properties."""
+    spec = _STACK_TAG_PROPERTY.get(resource_type)
+    if spec is None:
+        return props
+    prop, shape = spec
+    extra = _tag_map(stack_tags)
+    extra["aws:cloudformation:stack-name"] = stack_name
+    extra["aws:cloudformation:stack-id"] = stack_id
+    extra["aws:cloudformation:logical-id"] = logical_id
+    own = props.get(prop)
+    if shape == "map":
+        merged = {**extra, **(own if isinstance(own, dict) else _tag_map(own))}
+    else:
+        if isinstance(own, dict):
+            own = [{"Key": key, "Value": value} for key, value in own.items()]
+        own_list = [t for t in (own or []) if isinstance(t, dict) and "Key" in t]
+        present = {t["Key"] for t in own_list}
+        merged = own_list + [
+            {"Key": key, "Value": value}
+            for key, value in extra.items() if key not in present
+        ]
+    out = dict(props)
+    out[prop] = merged
+    return out
 
 
 # ===========================================================================
@@ -868,7 +1019,7 @@ def _sqs_create(logical_id, props, stack_name):
         "is_fifo": is_fifo,
         "attributes": attributes,
         "messages": [],
-        "tags": {},
+        "tags": _tag_map(props.get("Tags")),
         "dedup_cache": {},
         "fifo_seq": 0,
     }
@@ -910,6 +1061,7 @@ def _sqs_update(physical_id, old_props, new_props, stack_name, logical_id=None):
             ).lower()
         else:
             attributes.pop("ContentBasedDeduplication", None)
+    _reconcile_tag_map(queue.setdefault("tags", {}), old_props, new_props)
     attributes["LastModifiedTimestamp"] = str(int(time.time()))
     arn = attributes["QueueArn"]
     return physical_id, {"Arn": arn, "QueueName": name, "QueueUrl": physical_id}
@@ -960,7 +1112,7 @@ def _sns_create(logical_id, props, stack_name):
         },
         "subscriptions": [],
         "messages": [],
-        "tags": {},
+        "tags": _tag_map(props.get("Tags")),
     }
 
     # Handle Subscription property. The private _cfn_inline marker is what
@@ -1004,6 +1156,7 @@ def _sns_update(physical_id, old_props, new_props, stack_name, logical_id=None):
     if replaced is not None:
         return replaced
     topic["attributes"]["DisplayName"] = new_props.get("DisplayName", name)
+    _reconcile_tag_map(topic.setdefault("tags", {}), old_props, new_props)
     # Reconcile the template-inline subscriptions by (Protocol, Endpoint).
     # Only records carrying the _cfn_inline marker are eligible for removal:
     # a standalone AWS::SNS::Subscription resource (or a plain Subscribe call)
@@ -1144,6 +1297,10 @@ def _ddb_create(logical_id, props, stack_name):
         "Tags": [],
     }
     _dynamodb._tables[name] = table
+    if props.get("Tags"):
+        _dynamodb._tags[arn] = [
+            {"Key": k, "Value": v} for k, v in _tag_map(props["Tags"]).items()
+        ]
 
     attrs = {"Arn": arn}
     if stream_arn:
@@ -1193,6 +1350,9 @@ def _ddb_update(physical_id, old_props, new_props, stack_name, logical_id=None):
             )
         _ddb_delete(physical_id, old_props)
         return _ddb_create(logical_id or physical_id, new_props, stack_name)
+
+    _reconcile_tag_list(
+        _dynamodb._tags.setdefault(table["TableArn"], []), old_props, new_props)
 
     data = {"TableName": name}
     old_billing = old_props.get("BillingMode", "PROVISIONED")
@@ -1378,7 +1538,7 @@ def _lambda_create(logical_id, props, stack_name):
         "code_s3_object_version": code.get("S3ObjectVersion"),
         "versions": {},
         "next_version": 1,
-        "tags": {},
+        "tags": _tag_map(props.get("Tags")),
         "policy": {"Version": "2012-10-17", "Id": "default", "Statement": []},
         "event_invoke_config": None,
         "event_invoke_configs": {},
@@ -1486,6 +1646,7 @@ def _lambda_update(physical_id, old_props, new_props, stack_name, logical_id=Non
     resp = _lambda_svc._update_config(name, config_data)
     if resp[0] >= 400:
         raise ValueError(f"AWS::Lambda::Function configuration update failed: {resp[2]!r}")
+    _reconcile_tag_map(func.setdefault("tags", {}), old_props, new_props)
     return name, {"Arn": func["config"]["FunctionArn"]}
 
 
@@ -1937,9 +2098,15 @@ def _ssm_update(physical_id, old_props, new_props, stack_name):
     # pinned Version at 1 forever).
     data = _ssm_put_data(physical_id, new_props)
     data["Overwrite"] = True
+    # PutParameter replaces the parameter's tag set; reconcile it instead so
+    # tags added through AddTagsToResource stay.
+    data.pop("Tags", None)
     status, _headers, body = _ssm._put_parameter(data)
     if status >= 400:
         raise ValueError(f"AWS::SSM::Parameter update failed: {body!r}")
+    _reconcile_tag_map(
+        _ssm._tags.setdefault(_ssm._param_arn(physical_id), {}), old_props, new_props
+    )
     return physical_id, _ssm_attrs(physical_id, data)
 
 
@@ -2206,7 +2373,7 @@ def _cwlogs_create(logical_id, props, stack_name):
         "arn": arn,
         "creationTime": int(time.time() * 1000),
         "retentionInDays": int(retention) if retention else None,
-        "tags": {},
+        "tags": _tag_map(props.get("Tags")),
         "streams": {},
         "subscriptionFilters": {},
     }
@@ -2228,6 +2395,7 @@ def _cwlogs_update(physical_id, old_props, new_props, stack_name, logical_id=Non
         return replaced
     retention = new_props.get("RetentionInDays")
     group["retentionInDays"] = int(retention) if retention else None
+    _reconcile_tag_map(group.setdefault("tags", {}), old_props, new_props)
     return name, {"Arn": group["arn"]}
 
 
@@ -2555,7 +2723,7 @@ def _eks_nodegroup_create(logical_id, props, stack_name):
         "amiType": props.get("AmiType", "AL2_x86_64"),
         "diskSize": props.get("DiskSize", 20),
         "labels": props.get("Labels", {}),
-        "tags": {t["Key"]: t["Value"] for t in props.get("Tags", [])},
+        "tags": _tag_map(props.get("Tags")),
     }
     _eks._create_nodegroup(cluster_name, body)
     key = f"{cluster_name}/{ng_name}"
@@ -2622,7 +2790,7 @@ def _kinesis_stream_create(logical_id, props, stack_name):
         "StreamModeDetails": {"StreamMode": stream_mode},
         "RetentionPeriodHours": retention,
         "shards": _kinesis._build_shards(shard_count),
-        "tags": {},
+        "tags": _tag_map(props.get("Tags")),
         "CreationTimestamp": int(time.time()),
         "EncryptionType": "NONE",
     }
@@ -2794,19 +2962,86 @@ def _lambda_version_delete(physical_id, props):
         func["versions"].pop(version, None)
 
 
-# --- CloudFormation WaitCondition / WaitConditionHandle (no-ops) ---
+# --- CloudFormation WaitCondition / WaitConditionHandle ---
+
+def _cfn_wait_condition_definition(stack_name: str, logical_id: str) -> dict:
+    """The resource definition as the running operation sees it: the stack
+    record's ``_template_body`` is the template being deployed (create,
+    update and change-set execution set it before the run starts)."""
+    from ministack.services.cloudformation import _stacks
+    from ministack.services.cloudformation.engine import _parse_template
+    stack = _stacks.get(stack_name) or {}
+    template = None
+    body = stack.get("_template_body")
+    if body:
+        try:
+            template = _parse_template(body)
+        except Exception:
+            template = None
+    if not isinstance(template, dict):
+        template = stack.get("_template") or {}
+    res_def = (template.get("Resources") or {}).get(logical_id) or {}
+    return res_def if isinstance(res_def, dict) else {}
+
 
 def _cfn_wait_condition_create(logical_id, props, stack_name):
-    """WaitCondition — no-op, return immediately (no real signalling in local emulation)."""
+    """WaitCondition: block the stack until ``Count`` SUCCESS signals arrived,
+    a FAILURE signal arrived, or the timeout passed. With a ``CreationPolicy``
+    the signals come through SignalResource only; otherwise through the
+    handle's URL (and SignalResource). Runs on a worker thread (see
+    ``_is_custom_resource`` in stacks.py)."""
+    from ministack.services.cloudformation import wait_conditions as _wc
+    stack_id = _cr_stack_id(stack_name)
+    res_def = _cfn_wait_condition_definition(stack_name, logical_id)
+    if "CreationPolicy" in res_def:
+        creation_policy = res_def.get("CreationPolicy")
+        if not isinstance(creation_policy, dict):
+            raise ValueError(f"WaitCondition {logical_id!r}: CreationPolicy must be an object")
+        signal = creation_policy.get("ResourceSignal")
+        if signal is None:
+            signal = {}
+        if not isinstance(signal, dict):
+            raise ValueError(f"WaitCondition {logical_id!r}: CreationPolicy ResourceSignal must be an object")
+        count = _wc.validate_count(signal.get("Count"), logical_id)
+        timeout_s = _wc.validate_resource_signal_timeout(signal.get("Timeout"), logical_id)
+        token = _wc.register_slot(stack_id)
+    else:
+        token = _wc.token_from_url(props.get("Handle"))
+        if token is None or _wc.handle_owner(token) != stack_id:
+            raise ValueError(
+                f"WaitCondition {logical_id!r}: Handle must be the Ref of an "
+                "AWS::CloudFormation::WaitConditionHandle of this stack"
+            )
+        if props.get("Timeout") in (None, ""):
+            raise ValueError(f"WaitCondition {logical_id!r}: Timeout is required")
+        count = _wc.validate_count(props.get("Count"), logical_id)
+        timeout_s = _wc.validate_timeout_seconds(props.get("Timeout"), logical_id)
+    data = _wc.wait_for(token, stack_id, stack_name, logical_id,
+                        "AWS::CloudFormation::WaitCondition", count, timeout_s)
     pid = f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
-    return pid, {"Data": "{}"}
+    attrs = {"Data": json.dumps(data), "Id": pid}
+    _wc.remember_result(pid, attrs)
+    return pid, attrs
+
+
+def _cfn_wait_condition_update(physical_id, old_props, new_props, stack_name):
+    """Updates are not supported on AWS; the resource keeps its id and data."""
+    from ministack.services.cloudformation import wait_conditions as _wc
+    return physical_id, _wc.recall_result(physical_id) or {"Data": "{}", "Id": physical_id}
 
 
 def _cfn_wait_condition_handle_create(logical_id, props, stack_name):
-    """WaitConditionHandle — no-op, return a presigned-style URL."""
-    pid = f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
-    url = f"https://cloudformation-waitcondition-{get_region()}.s3.amazonaws.com/{pid}"
-    return pid, {"Ref": url}
+    """WaitConditionHandle: the physical id (and ``Ref``) is the URL a signal
+    is PUT to, served under ``/_ministack/cfn-signal/``; ``Id`` is its token."""
+    from ministack.services.cloudformation import wait_conditions as _wc
+    url, token = _wc.register_handle(_cr_stack_id(stack_name))
+    return url, {"Ref": url, "Id": token}
+
+
+def _cfn_wait_condition_handle_delete(physical_id, props):
+    """Forget the handle: a later PUT to its URL is a 404."""
+    from ministack.services.cloudformation import wait_conditions as _wc
+    _wc.discard_handle(physical_id)
 
 
 def _cfn_noop_delete(physical_id, props):
@@ -2900,7 +3135,11 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
             {"ParameterKey": k, "ParameterValue": v["Value"], "NoEcho": v["NoEcho"]}
             for k, v in param_values.items()
         ],
-        "Tags": [],
+        "Tags": [
+            {"Key": key, "Value": value}
+            for key, value in _tag_map(props.get("Tags")).items()
+            if not key.startswith("aws:")
+        ],
         "Outputs": [],
         "DisableRollback": True,
         "_resources": (previous_stack_snapshot.get("_resources", {})
@@ -2958,15 +3197,21 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
                    f"{status_prefix}_IN_PROGRESS")
         try:
             prev = prev_resources.get(child_logical_id)
+            new_tagged = _with_stack_tags(
+                resource_type, resolved_props, child_stack["Tags"],
+                child_name, child_stack_id, child_logical_id)
             if prev:
+                old_tagged = _with_stack_tags(
+                    resource_type, prev.get("Properties", {}),
+                    (previous_stack_snapshot or {}).get("Tags") or [],
+                    child_name, child_stack_id, child_logical_id)
                 physical_id, attrs = _update_resource(
                     resource_type, prev.get("PhysicalResourceId", child_logical_id),
-                    prev.get("Properties", {}), resolved_props, child_name,
-                    child_logical_id,
+                    old_tagged, new_tagged, child_name, child_logical_id,
                 )
             else:
                 physical_id, attrs = _provision_resource(
-                    resource_type, child_logical_id, resolved_props, child_name,
+                    resource_type, child_logical_id, new_tagged, child_name,
                 )
         except Exception as exc:
             child_stack["StackStatus"] = f"{status_prefix}_FAILED"
@@ -2998,8 +3243,14 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
                                  old.get("Properties", {}),
                                  child_name, stale_id)
             except Exception as exc:
-                logger.warning("Nested-stack %s: failed to delete pruned %s: %s",
-                               child_name, stale_id, exc)
+                # As for a top-level stack: the resource stays in the child
+                # stack as DELETE_FAILED so a later delete retries it.
+                logger.error("Nested-stack %s: failed to delete pruned %s: %s",
+                             child_name, stale_id, exc)
+                stale = provisioned.setdefault(stale_id, dict(old))
+                stale["ResourceStatus"] = "DELETE_FAILED"
+                stale["ResourceStatusReason"] = str(exc)
+                stale["Timestamp"] = now_iso()
 
     resolved_outputs = []
     output_attrs: dict[str, str] = {}
@@ -3613,13 +3864,6 @@ def _apigw_stage_delete(physical_id, props):
 
 # --- API Gateway ApiKey / UsagePlan (v1) ---
 
-def _apigw_tag_map(raw):
-    """Normalize CFN ``Tags`` (a map, or a list of {Key, Value}) to a dict."""
-    if isinstance(raw, dict):
-        return dict(raw)
-    return {t["Key"]: t["Value"] for t in raw or []}
-
-
 def _apigw_throttle(raw):
     """Map a CFN ThrottleSettings block to the API Gateway wire shape."""
     if not raw:
@@ -3659,7 +3903,7 @@ def _apigw_api_key_create(logical_id, props, stack_name):
             {"restApiId": sk.get("RestApiId", ""), "stageName": sk.get("StageName", "")}
             for sk in props.get("StageKeys", [])
         ],
-        "tags": _apigw_tag_map(props.get("Tags")),
+        "tags": _tag_map(props.get("Tags")),
     }
     status, _headers, body = _apigw_v1._create_api_key(data)
     if status >= 400:
@@ -3693,6 +3937,7 @@ def _apigw_api_key_update(physical_id, old_props, new_props, stack_name):
     key["enabled"] = new_props.get("Enabled", True)
     key["customerId"] = new_props.get("CustomerId", key.get("customerId", ""))
     key["lastUpdatedDate"] = _apigw_v1._now_unix()
+    _reconcile_tag_map(key.setdefault("tags", {}), old_props, new_props)
     return physical_id, {"APIKeyId": physical_id}
 
 
@@ -3715,7 +3960,7 @@ def _apigw_usage_plan_body(props):
         ],
         "throttle": _apigw_throttle(props.get("Throttle")),
         "quota": _apigw_quota(props.get("Quota")),
-        "tags": _apigw_tag_map(props.get("Tags")),
+        "tags": _tag_map(props.get("Tags")),
     }
 
 
@@ -3740,7 +3985,10 @@ def _apigw_usage_plan_update(physical_id, old_props, new_props, stack_name):
         return _apigw_usage_plan_create(physical_id, new_props, stack_name)
     if new_props.get("UsagePlanName"):
         plan["name"] = new_props["UsagePlanName"]
-    plan.update(_apigw_usage_plan_body(new_props))
+    body = _apigw_usage_plan_body(new_props)
+    body["tags"] = dict(plan.get("tags") or {})
+    _reconcile_tag_map(body["tags"], old_props, new_props)
+    plan.update(body)
     return physical_id, {"Id": physical_id}
 
 
@@ -4580,10 +4828,9 @@ def _sm_secret_update(physical_id, old_props, new_props, stack_name, logical_id=
     resp = _sm._update_secret(data)
     if resp[0] >= 400:
         raise ValueError(f"AWS::SecretsManager::Secret update failed: {resp[2]!r}")
-    if "Tags" in new_props or "Tags" in old_props:
-        # Same rule as above: tags applied through TagResource on a secret
-        # whose template never declared any are not the stack's to clear.
-        secret["Tags"] = list(new_props.get("Tags", []))
+    # Keys the template dropped go, the rest are set; tags applied through
+    # TagResource are not the stack's to clear.
+    _reconcile_tag_list(secret.setdefault("Tags", []), old_props, new_props)
     if new_props.get("ReplicaRegions") and new_props["ReplicaRegions"] != old_props.get("ReplicaRegions"):
         # Regions added or re-keyed since the previous template are applied;
         # a region dropped from the template keeps its replica, the service
@@ -5015,6 +5262,8 @@ def _cognito_identity_pool_create(logical_id, props, stack_name):
         "_identities": {},
     }
     _cognito._identity_pools[iid] = pool
+    # ListTagsForResource reads the pool's tag store, not the record.
+    _cognito._identity_tags[iid] = _tag_map(props.get("IdentityPoolTags"))
     # The one Fn::GetAtt the resource reference lists is Name.
     return iid, {"Name": name}
 
@@ -5053,6 +5302,8 @@ def _cognito_identity_pool_update(physical_id, old_props, new_props, stack_name,
     status, _, body = _cognito._update_identity_pool(payload)
     if status >= 400:
         raise ValueError(f"AWS::Cognito::IdentityPool update failed: {body!r}")
+    _reconcile_tag_map(_cognito._identity_tags.setdefault(physical_id, {}),
+                       old_props, new_props, prop="IdentityPoolTags")
     return physical_id, {"Name": name}
 
 
@@ -8174,6 +8425,7 @@ def _kinesis_stream_update(physical_id, old_props, new_props, stack_name):
     smd = new_props.get("StreamModeDetails")
     if isinstance(smd, dict) and smd.get("StreamMode"):
         stream["StreamModeDetails"] = {"StreamMode": smd["StreamMode"]}
+    _reconcile_tag_map(stream.setdefault("tags", {}), old_props, new_props)
     # ShardCount changes keep the existing shards — records live in them.
     return physical_id, {"Arn": stream["StreamARN"]}
 
@@ -8212,7 +8464,9 @@ def _eb_event_bus_update(physical_id, old_props, new_props, stack_name):
     if bus is not None and isinstance(bus, dict):
         if "Description" in new_props:
             bus["Description"] = new_props["Description"]
-    return physical_id, {"Arn": f"arn:aws:events:{get_region()}:{get_account_id()}:event-bus/{physical_id}", "Name": physical_id}
+    arn = f"arn:aws:events:{get_region()}:{get_account_id()}:event-bus/{physical_id}"
+    _reconcile_tag_map(_eb._tags.setdefault(arn, {}), old_props, new_props)
+    return physical_id, {"Arn": arn, "Name": physical_id}
 
 
 def _codebuild_project_update(physical_id, old_props, new_props, stack_name):
@@ -8227,6 +8481,8 @@ def _codebuild_project_update(physical_id, old_props, new_props, stack_name):
             project[key] = new_props[prop]
     if "TimeoutInMinutes" in new_props:
         project["timeoutInMinutes"] = int(new_props["TimeoutInMinutes"])
+    _reconcile_tag_list(project.setdefault("tags", []), old_props, new_props,
+                        key="key", value="value")
     return physical_id, {"Arn": _codebuild._project_arn(physical_id)}
 
 
@@ -8390,8 +8646,8 @@ _RESOURCE_HANDLERS = {
         "delete_with_logical_id": True,
     },
     "AWS::Lambda::Version": {"create": _lambda_version_create, "delete": _lambda_version_delete},
-    "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create, "delete": _cfn_noop_delete},
-    "AWS::CloudFormation::WaitConditionHandle": {"create": _cfn_wait_condition_handle_create, "delete": _cfn_noop_delete},
+    "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create, "update": _cfn_wait_condition_update, "delete": _cfn_noop_delete},
+    "AWS::CloudFormation::WaitConditionHandle": {"create": _cfn_wait_condition_handle_create, "delete": _cfn_wait_condition_handle_delete},
     "AWS::CloudFormation::Stack": {
         "create": _cfn_nested_stack_create,
         "update": _cfn_nested_stack_update,

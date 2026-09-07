@@ -1057,6 +1057,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "UpdateTerminationProtection": "cloudformation",
             "SetStackPolicy": "cloudformation",
             "GetStackPolicy": "cloudformation",
+            "SignalResource": "cloudformation",
             # EBS Snapshots
             # Note: CreateSnapshot, DeleteSnapshot, DescribeSnapshots are intentionally
             # omitted here because they conflict with ElastiCache actions of the same

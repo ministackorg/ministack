@@ -100,6 +100,15 @@ def _delete_cfn_test_stack(cfn, stack_name):
         pass
 
 
+def _all_pages(client, operation, key, **kwargs):
+    """Every item of a list action; the service pages at 100 items."""
+    return [
+        item
+        for page in client.get_paginator(operation).paginate(**kwargs)
+        for item in page[key]
+    ]
+
+
 def _output(stack, key):
     return next(o["OutputValue"] for o in stack["Outputs"] if o["OutputKey"] == key)
 
@@ -107,8 +116,23 @@ def _output(stack, key):
 def _stack_event_reasons(cfn, stack_name):
     return " ".join(
         e.get("ResourceStatusReason", "")
-        for e in cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+        for e in _all_pages(cfn, "describe_stack_events", "StackEvents",
+                            StackName=stack_name)
     )
+
+
+def _template_tags(value):
+    """`value` without the ``aws:cloudformation:`` tags every stack resource
+    carries since stack tags propagate: what the template itself set. Tag
+    dicts, ``Key``/``Value`` lists and ``TagKey``/``TagValue`` lists are
+    filtered; anything else is returned as is."""
+    if isinstance(value, dict):
+        return {k: v for k, v in value.items() if not str(k).startswith("aws:")}
+    if isinstance(value, list) and value and all(
+        isinstance(t, dict) and ("Key" in t or "TagKey" in t) for t in value
+    ):
+        return [t for t in value if not str(t.get("Key", t.get("TagKey"))).startswith("aws:")]
+    return value
 
 
 def test_cfn_region_scopes_stacks_change_sets_and_events():
@@ -141,10 +165,12 @@ def test_cfn_region_scopes_stacks_change_sets_and_events():
         assert ":us-west-2:" in west_stack["StackId"]
 
         east_described_ids = {
-            stack["StackId"] for stack in east.describe_stacks()["Stacks"]
+            stack["StackId"]
+            for stack in _all_pages(east, "describe_stacks", "Stacks")
         }
         west_described_ids = {
-            stack["StackId"] for stack in west.describe_stacks()["Stacks"]
+            stack["StackId"]
+            for stack in _all_pages(west, "describe_stacks", "Stacks")
         }
         assert east_stack["StackId"] in east_described_ids
         assert west_stack["StackId"] not in east_described_ids
@@ -152,10 +178,12 @@ def test_cfn_region_scopes_stacks_change_sets_and_events():
         assert east_stack["StackId"] not in west_described_ids
 
         east_listed_ids = {
-            stack["StackId"] for stack in east.list_stacks()["StackSummaries"]
+            stack["StackId"]
+            for stack in _all_pages(east, "list_stacks", "StackSummaries")
         }
         west_listed_ids = {
-            stack["StackId"] for stack in west.list_stacks()["StackSummaries"]
+            stack["StackId"]
+            for stack in _all_pages(west, "list_stacks", "StackSummaries")
         }
         assert east_stack["StackId"] in east_listed_ids
         assert west_stack["StackId"] not in east_listed_ids
@@ -251,10 +279,10 @@ def test_cfn_region_scopes_exports_imports_and_delete_checks():
         assert producer["StackStatus"] == "CREATE_COMPLETE"
         assert {
             export["Name"]: export["Value"]
-            for export in east.list_exports()["Exports"]
+            for export in _all_pages(east, "list_exports", "Exports")
         }[export_name] == "east-value"
         assert export_name not in {
-            export["Name"] for export in west.list_exports()["Exports"]
+            export["Name"] for export in _all_pages(west, "list_exports", "Exports")
         }
         with pytest.raises(ClientError) as exc:
             west.describe_stacks(StackName=producer_name)
@@ -284,6 +312,183 @@ def test_cfn_region_scopes_exports_imports_and_delete_checks():
         _delete_cfn_test_stack(east, producer_name)
         _delete_cfn_test_stack(west, consumer_name)
         _delete_cfn_test_stack(west, decoy_name)
+
+
+def test_cfn_list_actions_page_at_one_hundred(cfn):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-paging-{suffix}"
+    template = {
+        "Resources": {
+            f"P{i}": {
+                "Type": "AWS::SSM::Parameter",
+                "Properties": {
+                    "Type": "String",
+                    "Name": f"/cfn-paging/{suffix}/{i}",
+                    "Value": str(i),
+                },
+            }
+            for i in range(101)
+        }
+    }
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+
+        # 101 resources: two pages, the token only on the first one.
+        first = cfn.list_stack_resources(StackName=stack_name)
+        assert len(first["StackResourceSummaries"]) == 100
+        second = cfn.list_stack_resources(
+            StackName=stack_name, NextToken=first["NextToken"])
+        assert len(second["StackResourceSummaries"]) == 1
+        assert "NextToken" not in second
+        logical_ids = {r["LogicalResourceId"] for r in first["StackResourceSummaries"]}
+        logical_ids |= {r["LogicalResourceId"] for r in second["StackResourceSummaries"]}
+        assert logical_ids == set(template["Resources"])
+        assert len(_all_pages(cfn, "list_stack_resources", "StackResourceSummaries",
+                              StackName=stack_name)) == 101
+        assert "NextToken" not in cfn.describe_stacks(StackName=stack_name)
+
+        # Two events per resource plus the stack's own: three pages, newest first
+        # across the page boundary.
+        pages = list(cfn.get_paginator("describe_stack_events").paginate(
+            StackName=stack_name))
+        assert len(pages) == 3
+        assert [len(page["StackEvents"]) for page in pages[:2]] == [100, 100]
+        events = [e for page in pages for e in page["StackEvents"]]
+        assert len({e["EventId"] for e in events}) == len(events) > 200
+        timestamps = [e["Timestamp"] for e in events]
+        assert timestamps == sorted(timestamps, reverse=True)
+        # The stack's own CREATE_IN_PROGRESS is the oldest event and lands on
+        # the last page (events of one millisecond keep their emission order).
+        stack_start = [
+            e for e in pages[-1]["StackEvents"]
+            if e["ResourceType"] == "AWS::CloudFormation::Stack"
+            and e["ResourceStatus"] == "CREATE_IN_PROGRESS"
+        ]
+        assert len(stack_start) == 1
+        assert stack_start[0]["Timestamp"] == min(timestamps)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_list_exports_pages_at_one_hundred(cfn):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-paging-exports-{suffix}"
+    template = {
+        "Resources": {
+            "P": {
+                "Type": "AWS::SSM::Parameter",
+                "Properties": {
+                    "Type": "String",
+                    "Name": f"/cfn-paging-exports/{suffix}",
+                    "Value": "v",
+                },
+            }
+        },
+        "Outputs": {
+            f"O{i}": {"Value": str(i), "Export": {"Name": f"cfn-paging-{suffix}-{i}"}}
+            for i in range(101)
+        },
+    }
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        pages = list(cfn.get_paginator("list_exports").paginate())
+        assert len(pages) >= 2
+        assert all(len(page["Exports"]) == 100 for page in pages[:-1])
+        assert "NextToken" not in pages[-1]
+        names = {e["Name"] for page in pages for e in page["Exports"]}
+        assert {f"cfn-paging-{suffix}-{i}" for i in range(101)} <= names
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_list_imports_and_change_sets_take_a_token(cfn):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    producer = f"cfn-paging-producer-{suffix}"
+    consumer = f"cfn-paging-consumer-{suffix}"
+    export_name = f"cfn-paging-export-{suffix}"
+    producer_template = {
+        "Resources": {"Q": {"Type": "AWS::SQS::Queue"}},
+        "Outputs": {"Q": {"Value": {"Ref": "Q"}, "Export": {"Name": export_name}}},
+    }
+    consumer_template = {
+        "Resources": {
+            "P": {
+                "Type": "AWS::SSM::Parameter",
+                "Properties": {
+                    "Type": "String",
+                    "Name": f"/cfn-paging-consumer/{suffix}",
+                    "Value": {"Fn::ImportValue": export_name},
+                },
+            }
+        }
+    }
+    cfn.create_stack(StackName=producer, TemplateBody=json.dumps(producer_template))
+    try:
+        assert _wait_stack(cfn, producer)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.create_stack(StackName=consumer, TemplateBody=json.dumps(consumer_template))
+        try:
+            assert _wait_stack(cfn, consumer)["StackStatus"] == "CREATE_COMPLETE"
+            assert _all_pages(cfn, "list_imports", "Imports",
+                              ExportName=export_name) == [consumer]
+            assert "NextToken" not in cfn.list_imports(ExportName=export_name)
+            # The token is checked once the export is known to be imported.
+            with pytest.raises(ClientError) as exc:
+                cfn.list_imports(ExportName=export_name, NextToken="ListStacks:0")
+            assert exc.value.response["Error"]["Code"] == "ValidationError"
+            assert "NextToken" in exc.value.response["Error"]["Message"]
+            with pytest.raises(ClientError) as exc:
+                cfn.list_imports(ExportName=f"{export_name}-unused", NextToken="ListStacks:0")
+            assert "not imported" in exc.value.response["Error"]["Message"]
+
+            cfn.create_change_set(
+                StackName=producer, ChangeSetName=f"cs-{suffix}",
+                ChangeSetType="UPDATE",
+                TemplateBody=json.dumps({**producer_template, "Description": "changed"}),
+            )
+            listed = cfn.list_change_sets(StackName=producer)
+            assert [cs["ChangeSetName"] for cs in listed["Summaries"]] == [f"cs-{suffix}"]
+            assert "NextToken" not in listed
+            assert _all_pages(cfn, "list_change_sets", "Summaries",
+                              StackName=producer) == listed["Summaries"]
+            with pytest.raises(ClientError) as exc:
+                cfn.list_change_sets(StackName=producer, NextToken="ListStacks:0")
+            assert exc.value.response["Error"]["Code"] == "ValidationError"
+            assert "NextToken" in exc.value.response["Error"]["Message"]
+        finally:
+            _delete_cfn_test_stack(cfn, consumer)
+    finally:
+        _delete_cfn_test_stack(cfn, producer)
+
+
+def test_cfn_list_actions_offset_past_the_end_is_an_empty_page(cfn):
+    listed = cfn.list_stacks(NextToken="ListStacks:999999")
+    assert listed["StackSummaries"] == []
+    assert "NextToken" not in listed
+    exports = cfn.list_exports(NextToken="ListExports:999999")
+    assert exports["Exports"] == []
+    assert "NextToken" not in exports
+
+
+@pytest.mark.parametrize(
+    ("operation", "token"),
+    [
+        ("list_stacks", "not-a-token"),
+        ("describe_stacks", "not-a-token"),
+        ("list_exports", "not-a-token"),
+        ("list_exports", "ListStacks:100"),
+        ("list_stacks", "ListStacks:hundred"),
+        ("describe_stacks", "DescribeStacks:"),
+    ],
+)
+def test_cfn_list_actions_refuse_a_foreign_next_token(cfn, operation, token):
+    """A token is ``<Action>:<offset>``; anything else, a token of another
+    action included, is refused before a page is built."""
+    with pytest.raises(ClientError) as exc:
+        getattr(cfn, operation)(NextToken=token)
+    assert exc.value.response["Error"]["Code"] == "ValidationError"
+    assert "NextToken" in exc.value.response["Error"]["Message"]
 
 
 def test_cfn_nested_stack_stays_in_parent_region():
@@ -341,7 +546,7 @@ def test_cfn_nested_stack_stays_in_parent_region():
 
         child = next(
             stack
-            for stack in west.describe_stacks()["Stacks"]
+            for stack in _all_pages(west, "describe_stacks", "Stacks")
             if stack["StackName"].startswith(f"{parent_name}-Nested-")
         )
         assert ":us-west-2:" in child["StackId"]
@@ -1159,6 +1364,64 @@ def test_cfn_stack_with_parameters(cfn, sqs):
     assert any("cfn-t02-custom" in u for u in urls)
 
 
+def test_cfn_parameter_constraints_are_enforced(cfn):
+    """AllowedPattern, MinLength, MaxLength, MinValue and MaxValue are checked
+    before a stack exists, with CloudFormation's message (measured:
+    ``Parameter 'P' must match pattern ^[a-z]+$``); a ConstraintDescription
+    replaces the reason; a CommaDelimitedList is checked per member."""
+    uid = _uuid_mod.uuid4().hex[:8]
+
+    def template(params):
+        return json.dumps({"Parameters": params, "Resources": {"P": {
+            "Type": "AWS::SSM::Parameter",
+            "Properties": {"Name": f"/cfn-constraints/{uid}", "Type": "String",
+                           "Value": {"Ref": next(iter(params))}}}}})
+
+    def refused(params, value, expected):
+        name = f"cfn-constraints-{uid}-{_uuid_mod.uuid4().hex[:4]}"
+        key = next(iter(params))
+        with pytest.raises(ClientError) as exc:
+            cfn.create_stack(StackName=name, TemplateBody=template(params),
+                             Parameters=[{"ParameterKey": key, "ParameterValue": value}])
+        assert exc.value.response["Error"]["Code"] == "ValidationError"
+        assert exc.value.response["Error"]["Message"] == expected
+        with pytest.raises(ClientError):
+            cfn.describe_stacks(StackName=name)
+
+    refused({"P": {"Type": "String", "AllowedPattern": "^[a-z]+$", "MinLength": "3",
+                   "MaxLength": "3"}}, "ABC1", "Parameter 'P' must match pattern ^[a-z]+$")
+    refused({"P": {"Type": "String", "AllowedPattern": "[a-z]+", "ConstraintDescription":
+                   "must be lowercase letters"}}, "abc1", "Parameter 'P' must be lowercase letters")
+    refused({"P": {"Type": "String", "MinLength": "3"}}, "ab",
+            "Parameter 'P' must contain at least 3 characters")
+    refused({"P": {"Type": "String", "MaxLength": "3"}}, "abcd",
+            "Parameter 'P' must contain at most 3 characters")
+    refused({"N": {"Type": "Number", "MinValue": "1", "MaxValue": "10"}}, "0",
+            "Parameter 'N' must be a number not less than 1")
+    refused({"N": {"Type": "Number", "MinValue": "1", "MaxValue": "10"}}, "11",
+            "Parameter 'N' must be a number not greater than 10")
+    refused({"L": {"Type": "CommaDelimitedList", "AllowedPattern": "[a-z]+"}}, "ab, c1",
+            "Parameter 'L' must match pattern [a-z]+")
+    refused({"L": {"Type": "List<Number>"}}, "1,x",
+            "Parameter 'L' value '1,x' is not a valid List<Number>")
+    refused({"L": {"Type": "List<Number>", "MinValue": "1"}}, "1,0",
+            "Parameter 'L' must be a number not less than 1")
+    refused({"P": {"Type": "String", "AllowedPattern": "["}}, "abc",
+            "Parameter 'P' has an invalid AllowedPattern: unterminated character set at position 0")
+
+    # A Default that satisfies the constraints and a valid override both pass.
+    name = f"cfn-constraints-ok-{uid}"
+    params = {"P": {"Type": "String", "Default": "abc", "AllowedPattern": "^[a-z]+$",
+                    "MinLength": "1", "MaxLength": "5"}}
+    cfn.create_stack(StackName=name, TemplateBody=template(params),
+                     Parameters=[{"ParameterKey": "P", "ParameterValue": "hello"}])
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
 def test_cfn_unnamed_dynamodb_table_survives_unrelated_update(cfn, ddb, ssm):
     """A stack update must not touch an auto-named resource whose own
     properties didn't change — DynamoDB::Table has no update handler, so it
@@ -1350,6 +1613,77 @@ def test_cfn_change_set_no_changes_is_failed(cfn, ssm):
         cfn.delete_stack(StackName=S)
 
 
+def test_cfn_change_set_sees_policy_and_metadata_changes(cfn, sqs):
+    """A change set lists a resource whose DeletionPolicy, UpdateReplacePolicy
+    or Metadata changed and nothing else: Modify, Replacement False, the
+    attribute in Scope and Details, and the executed set stores the new
+    template. A DependsOn-only edit is not a change, as on AWS."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cs-attrs-{uid}"
+
+    def template(policy=None, depends=False, metadata=None, queue_name=None):
+        queue = {"Type": "AWS::SQS::Queue",
+                 "Properties": {"QueueName": queue_name or f"cfn-cs-attrs-{uid}"}}
+        if policy:
+            queue["DeletionPolicy"] = policy
+            queue["UpdateReplacePolicy"] = policy
+        if metadata:
+            queue["Metadata"] = metadata
+        param = {"Type": "AWS::SSM::Parameter",
+                 "Properties": {"Name": f"/cfn-cs-attrs/{uid}", "Type": "String",
+                                "Value": "v"}}
+        if depends:
+            param["DependsOn"] = "Queue"
+        return json.dumps({"Resources": {"Queue": queue, "Param": param}})
+
+    def changes_of(name, body):
+        cfn.create_change_set(StackName=stack_name, ChangeSetName=name,
+                              ChangeSetType="UPDATE", TemplateBody=body)
+        return cfn.describe_change_set(ChangeSetName=name, StackName=stack_name)
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template())
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        described = changes_of("depends-only", template(depends=True))
+        assert described["Status"] == "FAILED"
+        assert "didn't contain changes" in described["StatusReason"]
+
+        described = changes_of("retain", template(policy="Retain", depends=True))
+        assert described["Status"] == "CREATE_COMPLETE", described.get("StatusReason")
+        assert described["ExecutionStatus"] == "AVAILABLE"
+        assert [c["ResourceChange"]["LogicalResourceId"] for c in described["Changes"]] == ["Queue"]
+        change = described["Changes"][0]["ResourceChange"]
+        assert change["Action"] == "Modify"
+        assert change["Replacement"] == "False"
+        assert sorted(change["Scope"]) == ["DeletionPolicy", "UpdateReplacePolicy"]
+        assert sorted(d["Target"]["Attribute"] for d in change["Details"]) == [
+            "DeletionPolicy", "UpdateReplacePolicy"]
+
+        cfn.execute_change_set(ChangeSetName="retain", StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        body = cfn.get_template(StackName=stack_name)["TemplateBody"]
+        stored = json.loads(body) if isinstance(body, str) else body
+        assert stored["Resources"]["Queue"]["DeletionPolicy"] == "Retain"
+
+        described = changes_of("metadata", template(policy="Retain", depends=True,
+                                                    metadata={"owner": "fleet"}))
+        change = described["Changes"][0]["ResourceChange"]
+        assert change["Replacement"] == "False"
+        assert change["Scope"] == ["Metadata"]
+
+        described = changes_of("rename", template(policy="Retain", depends=True,
+                                                  queue_name=f"cfn-cs-attrs-{uid}-b"))
+        change = described["Changes"][0]["ResourceChange"]
+        assert change["Scope"] == ["Properties"]
+        assert [d["Target"]["Name"] for d in change["Details"]] == ["QueueName"]
+        assert change["Details"][0]["Target"]["RequiresRecreation"] == "Conditionally"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_execute_change_set_deletes_sibling_change_sets(cfn, ssm):
     """Executing a change set deletes the stack's other change sets — they are
     no longer valid for the updated stack (#1418)."""
@@ -1507,6 +1841,156 @@ def test_cfn_ssm_parameter_value_type_missing_parameter_fails_stack(cfn):
     assert exc_info.value.response["Error"]["Code"] == "ValidationError"
 
 
+def _ssm_value(ssm, name):
+    return ssm.get_parameter(Name=name, WithDecryption=True)["Parameter"]["Value"]
+
+
+def test_cfn_dynamic_references_resolve_and_follow_the_update_rules(cfn, ssm, sm):
+    """{{resolve:ssm}}, {{resolve:ssm-secure}} and {{resolve:secretsmanager}}
+    resolve at provisioning time; GetTemplate keeps the literal. On update an
+    identical template is accepted but changes nothing, UsePreviousTemplate is
+    refused, a changed template re-resolves the ssm references (a pinned
+    version stays), and a secretsmanager reference re-resolves only when its
+    resource changes (measured on AWS)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-dynref-{uid}"
+    src, secure, secret, json_secret = (
+        f"/cfn-dynref/{uid}/in", f"/cfn-dynref/{uid}/secure",
+        f"cfn-dynref-{uid}-plain", f"cfn-dynref-{uid}-json")
+    ssm.put_parameter(Name=src, Value="v1", Type="String")
+    ssm.put_parameter(Name=secure, Value="hush", Type="SecureString")
+    sm.create_secret(Name=secret, SecretString="s1")
+    sm.create_secret(Name=json_secret, SecretString=json.dumps({"password": "p1"}))
+    outs = {k: f"/cfn-dynref/{uid}/out-{k}" for k in ("ssm", "pinned", "secure", "secret", "key")}
+
+    def param(name, value, description=None):
+        props = {"Name": name, "Type": "String", "Value": value}
+        if description:
+            props["Description"] = description
+        return {"Type": "AWS::SSM::Parameter", "Properties": props}
+
+    def template(description="one", secret_description=None):
+        return json.dumps({"Description": description, "Resources": {
+            "FromSsm": param(outs["ssm"], f"{{{{resolve:ssm:{src}}}}}"),
+            "Pinned": param(outs["pinned"], f"{{{{resolve:ssm:{src}:1}}}}"),
+            "Secure": param(outs["secure"], f"{{{{resolve:ssm-secure:{secure}}}}}"),
+            "FromSecret": param(outs["secret"], f"prefix-{{{{resolve:secretsmanager:{secret}}}}}",
+                                secret_description),
+            "FromKey": param(outs["key"],
+                             f"{{{{resolve:secretsmanager:{json_secret}:SecretString:password}}}}"),
+        }})
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template())
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert _ssm_value(ssm, outs["ssm"]) == "v1"
+        assert _ssm_value(ssm, outs["pinned"]) == "v1"
+        assert _ssm_value(ssm, outs["secure"]) == "hush"
+        assert _ssm_value(ssm, outs["secret"]) == "prefix-s1"
+        assert _ssm_value(ssm, outs["key"]) == "p1"
+        body = cfn.get_template(StackName=stack_name)["TemplateBody"]
+        body = json.dumps(body) if not isinstance(body, str) else body
+        assert f"{{{{resolve:ssm:{src}}}}}" in body
+
+        ssm.put_parameter(Name=src, Value="v2", Type="String", Overwrite=True)
+        sm.put_secret_value(SecretId=secret, SecretString="s2")
+
+        # identical template: accepted, nothing re-resolved
+        cfn.update_stack(StackName=stack_name, TemplateBody=template())
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _ssm_value(ssm, outs["ssm"]) == "v1"
+        assert _ssm_value(ssm, outs["secret"]) == "prefix-s1"
+
+        with pytest.raises(ClientError) as exc:
+            cfn.update_stack(StackName=stack_name, UsePreviousTemplate=True)
+        assert "No updates are to be performed" in exc.value.response["Error"]["Message"]
+
+        # a changed template: ssm re-resolves, the pinned version and the secret stay
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(description="two"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _ssm_value(ssm, outs["ssm"]) == "v2"
+        assert _ssm_value(ssm, outs["pinned"]) == "v1"
+        assert _ssm_value(ssm, outs["secret"]) == "prefix-s1"
+
+        # the resource carrying the secret changes: the secret re-resolves
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=template(description="two", secret_description="touched"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _ssm_value(ssm, outs["secret"]) == "prefix-s2"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for name in (src, secure):
+            try:
+                ssm.delete_parameter(Name=name)
+            except ClientError:
+                pass
+        for name in (secret, json_secret):
+            try:
+                sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+            except ClientError:
+                pass
+
+
+def test_cfn_secretsmanager_reference_by_arn_version_id_and_json_number(cfn, ssm, sm):
+    """The secret id may be an ARN (its colons do not split the segments), a
+    version-stage or a version-id selects an older version, and a JSON key
+    whose value is not a string comes back as its JSON text."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-dynref-arn-{uid}"
+    secret = f"cfn-dynref-arn-{uid}"
+    created = sm.create_secret(Name=secret, SecretString=json.dumps({"port": 5432, "host": "old"}))
+    arn, first_version = created["ARN"], created["VersionId"]
+    sm.put_secret_value(SecretId=secret, SecretString=json.dumps({"port": 5433, "host": "new"}))
+    outs = {k: f"/cfn-dynref-arn/{uid}/{k}" for k in ("arn", "previous", "version")}
+
+    def param(name, value):
+        return {"Type": "AWS::SSM::Parameter",
+                "Properties": {"Name": name, "Type": "String", "Value": value}}
+
+    template = json.dumps({"Resources": {
+        "ByArn": param(outs["arn"], f"{{{{resolve:secretsmanager:{arn}:SecretString:port}}}}"),
+        "Previous": param(outs["previous"],
+                          f"{{{{resolve:secretsmanager:{secret}:SecretString:host:AWSPREVIOUS}}}}"),
+        "ByVersion": param(outs["version"],
+                           f"{{{{resolve:secretsmanager:{secret}:SecretString:host::{first_version}}}}}"),
+    }})
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert _ssm_value(ssm, outs["arn"]) == "5433"
+        assert _ssm_value(ssm, outs["previous"]) == "old"
+        assert _ssm_value(ssm, outs["version"]) == "old"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            sm.delete_secret(SecretId=secret, ForceDeleteWithoutRecovery=True)
+        except ClientError:
+            pass
+
+
+def test_cfn_dynamic_reference_that_cannot_resolve_fails_the_resource(cfn, ssm):
+    """A reference to a missing parameter fails the resource and rolls the
+    stack back with the reason."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-dynref-bad-{uid}"
+    template = json.dumps({"Resources": {"P": {
+        "Type": "AWS::SSM::Parameter",
+        "Properties": {"Name": f"/cfn-dynref-bad/{uid}", "Type": "String",
+                       "Value": f"{{{{resolve:ssm:/cfn-dynref-bad/{uid}/missing}}}}"}}}})
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert f"/cfn-dynref-bad/{uid}/missing" in _stack_event_reasons(cfn, stack_name)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_change_set_use_previous_value_updates_resource(cfn, ssm):
     """A change set created with UsePreviousValue (the `aws cloudformation deploy`
     no-`--parameter-overrides` path) must resolve the parameter to its stored
@@ -1620,7 +2104,7 @@ def test_cfn_outputs_exports(cfn):
     cfn.create_stack(StackName="cfn-t05", TemplateBody=json.dumps(template))
     _wait_stack(cfn, "cfn-t05")
 
-    exports = cfn.list_exports()["Exports"]
+    exports = _all_pages(cfn, "list_exports", "Exports")
     assert any(e["Name"] == "cfn-t05-bucket-export" for e in exports)
 
 
@@ -1715,6 +2199,92 @@ def test_cfn_fn_sub_literal_escape(cfn, ssm):
     val = ssm.get_parameter(Name="/cfn-sub-escape/literal")["Parameter"]["Value"]
     assert val == ("client/${iot:Connection.Thing.ThingName} "
                    "and ${Plain} in us-east-1")
+
+
+def test_cfn_intrinsics_cidr_getazs_findinmap_and_condition_functions(cfn, ssm):
+    """Fn::Cidr splits the block it is given (measured: 192.168.0.0/16, 2, 8 is
+    192.168.0.0/24,192.168.1.0/24), Fn::GetAZs answers the stack's zones for
+    its own region and an empty list for another (measured), Fn::FindInMap
+    takes a DefaultValue and a missing key without one is a template error
+    (measured), a condition function as an Output value is refused up front
+    (measured) and in a property position evaluates to a boolean."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-intrinsics-{uid}"
+    region = cfn.meta.region_name
+    template = json.dumps({
+        "Mappings": {"M": {"a": {"b": "ok"}}},
+        "Resources": {
+            "P": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": f"/cfn-intrinsics/{uid}", "Type": "String",
+                "Value": {"Fn::Join": [",", {"Fn::Cidr": ["192.168.0.0/16", "2", "8"]}]}}},
+            "Bools": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": f"/cfn-intrinsics/{uid}/bools", "Type": "String",
+                "Value": {"Fn::Join": [",", [
+                    {"Fn::Not": [{"Fn::Equals": ["a", "b"]}]},
+                    {"Fn::Or": [{"Fn::Equals": ["a", "b"]}, {"Fn::Equals": ["b", "b"]}]},
+                    {"Fn::And": [{"Fn::Equals": ["a", "a"]}, {"Fn::Equals": ["a", "b"]}]}]]}}},
+        },
+        "Outputs": {
+            "Cidr": {"Value": {"Fn::Join": [",", {"Fn::Cidr": ["10.0.0.0/24", 6, 5]}]}},
+            "OwnAzs": {"Value": {"Fn::Join": [",", {"Fn::GetAZs": ""}]}},
+            "RefAzs": {"Value": {"Fn::Join": [",", {"Fn::GetAZs": {"Ref": "AWS::Region"}}]}},
+            "OtherAzs": {"Value": {"Fn::Join": [",", {"Fn::GetAZs": "eu-north-1"}]}},
+            "Map": {"Value": {"Fn::FindInMap": ["M", "a", "b"]}},
+            "MapDefault": {"Value": {"Fn::FindInMap": ["M", "x", "y", {"DefaultValue": "dflt"}]}},
+            "AndInIf": {"Value": {"Fn::If": ["Yes", "yes", "no"]}},
+        },
+        "Conditions": {"Yes": {"Fn::And": [{"Fn::Equals": ["a", "a"]}, {"Fn::Not": [{"Fn::Equals": ["a", "b"]}]}]}},
+    })
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+        assert outputs["Cidr"] == ",".join(f"10.0.0.{32 * i}/27" for i in range(6))
+        assert outputs["OwnAzs"] == f"{region}a,{region}b,{region}c"
+        assert outputs["RefAzs"] == outputs["OwnAzs"]
+        assert outputs["OtherAzs"] == ""
+        assert outputs["Map"] == "ok"
+        assert outputs["MapDefault"] == "dflt"
+        assert outputs["AndInIf"] == "yes"
+        assert ssm.get_parameter(Name=f"/cfn-intrinsics/{uid}")["Parameter"]["Value"] == (
+            "192.168.0.0/24,192.168.1.0/24")
+        # In a property position the condition functions evaluate to booleans
+        # (joined as their string form), never to the Python repr of the call.
+        assert ssm.get_parameter(Name=f"/cfn-intrinsics/{uid}/bools")["Parameter"]["Value"] == (
+            "True,True,False")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+    # An impossible Fn::Cidr fails the resource with the reason.
+    bad_cidr = f"cfn-intrinsics-cidr-{uid}"
+    cfn.create_stack(StackName=bad_cidr, TemplateBody=json.dumps({"Resources": {
+        "P": {"Type": "AWS::SSM::Parameter", "Properties": {
+            "Name": f"/cfn-intrinsics/{uid}/cidr", "Type": "String",
+            "Value": {"Fn::Select": [0, {"Fn::Cidr": ["10.0.0.0/24", 300, 8]}]}}}}}))
+    try:
+        stack = _wait_stack(cfn, bad_cidr)
+        assert stack["StackStatus"] == "ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert "Fn::Cidr count must be between 1 and 256" in _stack_event_reasons(cfn, bad_cidr)
+    finally:
+        _delete_cfn_test_stack(cfn, bad_cidr)
+
+    def refused(body, message):
+        name = f"cfn-intrinsics-bad-{_uuid_mod.uuid4().hex[:6]}"
+        with pytest.raises(ClientError) as exc:
+            cfn.create_stack(StackName=name, TemplateBody=json.dumps(body))
+        assert exc.value.response["Error"]["Code"] == "ValidationError"
+        assert exc.value.response["Error"]["Message"] == message
+        with pytest.raises(ClientError):
+            cfn.describe_stacks(StackName=name)
+
+    queue = {"Resources": {"Q": {"Type": "AWS::SQS::Queue"}}}
+    refused({**queue, "Mappings": {"M": {"a": {"b": "ok"}}},
+             "Outputs": {"Map": {"Value": {"Fn::FindInMap": ["M", "x", "y"]}}}},
+            "Template error: Unable to get mapping for M::x::y")
+    refused({**queue, "Outputs": {"And": {"Value": {"Fn::And": [
+                {"Fn::Equals": ["a", "a"]}, {"Fn::Equals": ["a", "b"]}]}}}},
+            "Template format error: The Value field of every Outputs member must evaluate to a String.")
 
 
 def test_cfn_multi_resource_dependencies(cfn, iam, lam):
@@ -1944,7 +2514,7 @@ def test_cfn_list_stacks(cfn):
     _wait_stack(cfn, "cfn-t12-a")
     _wait_stack(cfn, "cfn-t12-b")
 
-    summaries = cfn.list_stacks()["StackSummaries"]
+    summaries = _all_pages(cfn, "list_stacks", "StackSummaries")
     names = [s["StackName"] for s in summaries]
     assert "cfn-t12-a" in names
     assert "cfn-t12-b" in names
@@ -1995,6 +2565,111 @@ def test_cfn_describe_stack_resources_logical_id_filter(cfn, s3, sqs):
             StackName="cfn-t10", LogicalResourceId="DoesNotExist"
         )
     assert exc_info.value.response["Error"]["Code"] == "ValidationError"
+
+
+def test_cfn_describe_stack_resource_returns_the_metadata(cfn):
+    """DescribeStackResource carries the resource's Metadata attribute as a
+    JSON string with intrinsics interpreted, and follows the template after an
+    update; a Metadata that resolves away or cannot be resolved is returned as
+    declared; a resource without Metadata has no such field; a healthy resource
+    has no ResourceStatusReason."""
+    stack_name = f"cfn-resource-metadata-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(path, rev):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Parameters": {"Owner": {"Type": "String", "Default": "platform"}},
+            "Resources": {
+                "Queue": {
+                    "Type": "AWS::SQS::Queue",
+                    "Metadata": {
+                        "aws:cdk:path": path,
+                        "Owner": {"Ref": "Owner"},
+                        "Region": {"Ref": "AWS::Region"},
+                        "Nested": {"Flag": True, "List": [1, rev]},
+                    },
+                },
+                "Plain": {"Type": "AWS::SQS::Queue"},
+                "Gone": {
+                    "Type": "AWS::SQS::Queue",
+                    "Metadata": {"Ref": "AWS::NoValue"},
+                },
+                "Broken": {
+                    "Type": "AWS::SQS::Queue",
+                    "Metadata": {"Fn::GetAtt": ["Plain", "NoSuchAttr"]},
+                },
+            },
+        }
+
+    def detail(logical_id):
+        return cfn.describe_stack_resource(
+            StackName=stack_name, LogicalResourceId=logical_id)["StackResourceDetail"]
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=json.dumps(template("ExampleStack/Queue/Resource", 2)))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        queue = detail("Queue")
+        assert json.loads(queue["Metadata"]) == {
+            "aws:cdk:path": "ExampleStack/Queue/Resource",
+            "Owner": "platform",
+            "Region": "us-east-1",
+            "Nested": {"Flag": True, "List": [1, 2]},
+        }
+        assert "ResourceStatusReason" not in queue
+        assert queue["LastUpdatedTimestamp"]
+        assert "Metadata" not in detail("Plain")
+        # A Metadata that resolves away entirely, or one that cannot be
+        # resolved, is returned as declared, not a failed request.
+        assert json.loads(detail("Gone")["Metadata"]) == {"Ref": "AWS::NoValue"}
+        assert json.loads(detail("Broken")["Metadata"]) == {
+            "Fn::GetAtt": ["Plain", "NoSuchAttr"]}
+
+        # After an update the new template's Metadata is what comes back.
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=json.dumps(template("ExampleStack/Queue/Resource/v2", 3)))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        updated = json.loads(detail("Queue")["Metadata"])
+        assert updated["aws:cdk:path"] == "ExampleStack/Queue/Resource/v2"
+        assert updated["Nested"] == {"Flag": True, "List": [1, 3]}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_stack_id_addresses_every_read_action(cfn, sqs):
+    """Every action that takes a StackName accepts the stack id (what the CDK
+    sends after its first DescribeStacks), and the responses carry the stack's
+    name, not the id that was passed."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-by-id-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({"Resources": {
+        "Queue": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": f"cfn-by-id-{uid}"}}}}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        stack_id = stack["StackId"]
+
+        assert cfn.describe_stacks(StackName=stack_id)["Stacks"][0]["StackName"] == stack_name
+        detail = cfn.describe_stack_resource(StackName=stack_id, LogicalResourceId="Queue")
+        assert detail["StackResourceDetail"]["StackName"] == stack_name
+        resources = cfn.describe_stack_resources(StackName=stack_id)["StackResources"]
+        assert [r["StackName"] for r in resources] == [stack_name]
+        summaries = cfn.list_stack_resources(StackName=stack_id)["StackResourceSummaries"]
+        assert [r["LogicalResourceId"] for r in summaries] == ["Queue"]
+        assert cfn.get_template(StackName=stack_id)["TemplateBody"]
+        assert cfn.describe_stack_events(StackName=stack_id)["StackEvents"]
+        assert cfn.get_template_summary(StackName=stack_id)["ResourceTypes"] == ["AWS::SQS::Queue"]
+
+        cfn.create_change_set(StackName=stack_id, ChangeSetName="by-id", ChangeSetType="UPDATE",
+                              TemplateBody=json.dumps({"Resources": {"Queue": {
+                                  "Type": "AWS::SQS::Queue", "Properties": {
+                                      "QueueName": f"cfn-by-id-{uid}",
+                                      "VisibilityTimeout": 45}}}}))
+        described = cfn.describe_change_set(ChangeSetName="by-id", StackName=stack_name)
+        assert described["StackName"] == stack_name
+        assert described["Status"] == "CREATE_COMPLETE", described.get("StatusReason")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
 
 
 def test_cfn_yaml_template(cfn, s3):
@@ -2088,6 +2763,119 @@ def test_cfn_delete_stack_with_active_imports(cfn):
 
     with pytest.raises(ClientError):
         cfn.delete_stack(StackName="cfn-t17-exp")
+
+def test_cfn_list_imports_names_the_importing_stacks(cfn):
+    """ListImports lists the stacks whose templates import the export through
+    Fn::ImportValue; a template that only mentions the name does not count,
+    and an export nobody imports is a ValidationError."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    export_name = f"cfn-imports-{uid}"
+    exporter, importer, mention = (f"cfn-imports-exp-{uid}", f"cfn-imports-imp-{uid}",
+                                   f"cfn-imports-mention-{uid}")
+    cfn.create_stack(StackName=exporter, TemplateBody=json.dumps({
+        "Resources": {"P": {"Type": "AWS::SSM::Parameter", "Properties": {
+            "Name": f"/cfn-imports/{uid}/exp", "Type": "String", "Value": "v"}}},
+        "Outputs": {"Out": {"Value": "v", "Export": {"Name": export_name}}}}))
+    try:
+        assert _wait_stack(cfn, exporter)["StackStatus"] == "CREATE_COMPLETE"
+        with pytest.raises(ClientError) as exc:
+            cfn.list_imports(ExportName=export_name)
+        assert exc.value.response["Error"]["Message"] == (
+            f"Export '{export_name}' is not imported by any stack.")
+
+        cfn.create_stack(StackName=importer, TemplateBody=json.dumps({"Resources": {
+            "P": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": f"/cfn-imports/{uid}/imp", "Type": "String",
+                "Value": {"Fn::ImportValue": export_name}}}}}))
+        cfn.create_stack(StackName=mention, TemplateBody=json.dumps({"Resources": {
+            "P": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": f"/cfn-imports/{uid}/mention", "Type": "String",
+                "Value": export_name}}}}))
+        for name in (importer, mention):
+            assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        assert cfn.list_imports(ExportName=export_name)["Imports"] == [importer]
+    finally:
+        for name in (importer, mention, exporter):
+            _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_termination_protection_blocks_delete_until_disabled(cfn):
+    """A stack created with EnableTerminationProtection refuses DeleteStack
+    and stays as it is; UpdateTerminationProtection turns it off, DescribeStacks
+    reports the flag either way."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-protected-{uid}"
+    template = json.dumps({"Resources": {"P": {"Type": "AWS::SSM::Parameter", "Properties": {
+        "Name": f"/cfn-protected/{uid}", "Type": "String", "Value": "v"}}}})
+    cfn.create_stack(StackName=stack_name, TemplateBody=template,
+                     EnableTerminationProtection=True)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert stack["EnableTerminationProtection"] is True
+
+        with pytest.raises(ClientError) as exc:
+            cfn.delete_stack(StackName=stack_name)
+        assert "cannot be deleted while TerminationProtection is enabled" in (
+            exc.value.response["Error"]["Message"])
+        assert cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["StackStatus"] == (
+            "CREATE_COMPLETE")
+
+        result = cfn.update_termination_protection(
+            StackName=stack_name, EnableTerminationProtection=False)
+        assert result["StackId"] == stack["StackId"]
+        assert cfn.describe_stacks(StackName=stack_name)["Stacks"][0][
+            "EnableTerminationProtection"] is False
+        with pytest.raises(ClientError):
+            cfn.update_termination_protection(
+                StackName=f"{stack_name}-nope", EnableTerminationProtection=True)
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+    finally:
+        try:
+            cfn.update_termination_protection(
+                StackName=stack_name, EnableTerminationProtection=False)
+        except ClientError:
+            pass
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_stack_policy_is_stored_and_returned(cfn):
+    """SetStackPolicy stores the policy and GetStackPolicy returns it; a stack
+    without one answers no StackPolicyBody; CreateStack takes StackPolicyBody."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-policy-{uid}"
+    template = json.dumps({"Resources": {"P": {"Type": "AWS::SSM::Parameter", "Properties": {
+        "Name": f"/cfn-policy/{uid}", "Type": "String", "Value": "v"}}}})
+    policy = json.dumps({"Statement": [{"Effect": "Deny", "Action": "Update:*",
+                                        "Principal": "*", "Resource": "LogicalResourceId/P"}]})
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        assert "StackPolicyBody" not in cfn.get_stack_policy(StackName=stack_name)
+        cfn.set_stack_policy(StackName=stack_name, StackPolicyBody=policy)
+        assert json.loads(cfn.get_stack_policy(StackName=stack_name)["StackPolicyBody"]) == (
+            json.loads(policy))
+        with pytest.raises(ClientError):
+            cfn.set_stack_policy(StackName=stack_name, StackPolicyBody="not json")
+
+        cfn.create_stack(StackName=f"{stack_name}-b", TemplateBody=template.replace(
+            f"/cfn-policy/{uid}", f"/cfn-policy/{uid}/b"), StackPolicyBody=policy)
+        assert _wait_stack(cfn, f"{stack_name}-b")["StackStatus"] == "CREATE_COMPLETE"
+        assert cfn.get_stack_policy(StackName=f"{stack_name}-b")["StackPolicyBody"]
+
+        replaced = json.dumps({"Statement": [{"Effect": "Allow", "Action": "Update:*",
+                                              "Principal": "*", "Resource": "*"}]})
+        cfn.update_stack(StackName=f"{stack_name}-b", TemplateBody=template.replace(
+            f"/cfn-policy/{uid}", f"/cfn-policy/{uid}/b").replace('"v"', '"w"'),
+            StackPolicyBody=replaced)
+        assert _wait_stack(cfn, f"{stack_name}-b")["StackStatus"] == "UPDATE_COMPLETE"
+        assert json.loads(cfn.get_stack_policy(StackName=f"{stack_name}-b")["StackPolicyBody"]) == (
+            json.loads(replaced))
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        _delete_cfn_test_stack(cfn, f"{stack_name}-b")
+
 
 def test_cfn_update_rollback_on_failure(cfn, s3):
     template_v1 = {
@@ -2208,7 +2996,7 @@ def test_cfn_e2e_pipeline(cfn_e2e_stack, s3, sqs, sns):
     assert "MessageId" in resp
 
 def test_cfn_e2e_exports_available(cfn_e2e_stack, cfn):
-    exports = cfn.list_exports()["Exports"]
+    exports = _all_pages(cfn, "list_exports", "Exports")
     names = {e["Name"]: e["Value"] for e in exports}
     assert f"{_E2E_STACK}-bucket" in names
     assert names[f"{_E2E_STACK}-bucket"] == cfn_e2e_stack["BucketName"]
@@ -3097,23 +3885,475 @@ def test_cfn_lambda_provisioners_reject_missing_bare_qualifier(cfn, lam):
         lam.delete_function(FunctionName=fn)
 
 
-def test_cfn_wait_condition(cfn):
-    """AWS::CloudFormation::WaitCondition and WaitConditionHandle are no-ops."""
-    template = {
+def _wait_condition_template(timeout="20", count=None):
+    """A handle, a wait condition on it, a resource that must not start before
+    the wait ends. The 20 s fuse keeps a failing test from parking a worker."""
+    props = {"Handle": {"Ref": "Handle"}, "Timeout": timeout}
+    if count is not None:
+        props["Count"] = count
+    return {
         "AWSTemplateFormatVersion": "2010-09-09",
         "Resources": {
             "Handle": {"Type": "AWS::CloudFormation::WaitConditionHandle"},
-            "Wait": {
-                "Type": "AWS::CloudFormation::WaitCondition",
-                "Properties": {"Handle": {"Ref": "Handle"}, "Timeout": "10"},
+            "Wait": {"Type": "AWS::CloudFormation::WaitCondition", "Properties": props},
+            "After": {
+                "Type": "AWS::SSM::Parameter",
+                "DependsOn": "Wait",
+                "Properties": {"Type": "String", "Name": {"Fn::Sub": "/${AWS::StackName}/after"}, "Value": "x"},
             },
         },
+        "Outputs": {
+            "Url": {"Value": {"Ref": "Handle"}},
+            "HandleId": {"Value": {"Fn::GetAtt": ["Handle", "Id"]}},
+            "Data": {"Value": {"Fn::GetAtt": ["Wait", "Data"]}},
+        },
     }
-    cfn.create_stack(StackName="cfn-wait", TemplateBody=json.dumps(template))
-    stack = _wait_stack(cfn, "cfn-wait")
-    assert stack["StackStatus"] == "CREATE_COMPLETE"
-    cfn.delete_stack(StackName="cfn-wait")
-    _wait_stack(cfn, "cfn-wait")
+
+
+def _creation_policy_wait_template(policy):
+    """The form the CreationPolicy attribute reference documents: no handle,
+    no Properties, signals through SignalResource only."""
+    return {
+        "Resources": {
+            "Wait": {"Type": "AWS::CloudFormation::WaitCondition", "CreationPolicy": policy},
+            "After": {
+                "Type": "AWS::SSM::Parameter",
+                "DependsOn": "Wait",
+                "Properties": {"Type": "String", "Name": {"Fn::Sub": "/${AWS::StackName}/after"}, "Value": "x"},
+            },
+        },
+        "Outputs": {"Data": {"Value": {"Fn::GetAtt": ["Wait", "Data"]}}},
+    }
+
+
+def _wait_condition_is_waiting(cfn, stack_name, logical_id="Wait"):
+    events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+    return any(e["LogicalResourceId"] == logical_id and e["ResourceStatus"] == "CREATE_IN_PROGRESS"
+               for e in events)
+
+
+def _wait_for_wait_condition(cfn, stack_name, timeout=15):
+    """Poll until the wait condition is CREATE_IN_PROGRESS; the handle URL, if any."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _wait_condition_is_waiting(cfn, stack_name):
+            events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+            return next((e["PhysicalResourceId"] for e in events
+                         if e["LogicalResourceId"] == "Handle" and e["ResourceStatus"] == "CREATE_COMPLETE"), None)
+        time.sleep(0.2)
+    raise TimeoutError(f"{stack_name}: the wait condition never started waiting")
+
+
+def _assert_still_waiting(cfn, stack_name, seconds=1.0):
+    """The stack stays CREATE_IN_PROGRESS for the whole window."""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        assert cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["StackStatus"] == "CREATE_IN_PROGRESS"
+        time.sleep(0.2)
+
+
+def _signal_events(cfn, stack_name):
+    return [e.get("ResourceStatusReason", "")
+            for e in cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+            if "signal with UniqueId" in e.get("ResourceStatusReason", "")]
+
+
+def _put_wait_condition_signal(url, status="SUCCESS", unique_id="ID1", data="", reason="",
+                               content_type="", body=None):
+    """PUT the signal JSON to the handle URL, addressed at the test endpoint
+    (the minted URL names the server's own host), with an empty Content-Type
+    as the user guide asks for."""
+    endpoint = urlparse(os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"))
+    target = urlparse(url)._replace(scheme=endpoint.scheme, netloc=endpoint.netloc).geturl()
+    if body is None:
+        body = json.dumps({"Status": status, "UniqueId": unique_id, "Data": data, "Reason": reason}).encode()
+    req = urllib.request.Request(target, data=body, method="PUT", headers={"Content-Type": content_type})
+    with urllib.request.urlopen(req) as resp:
+        return resp.status
+
+
+def _assert_validation_error(exc_info, message):
+    assert exc_info.value.response["Error"]["Code"] == "ValidationError"
+    assert message in exc_info.value.response["Error"]["Message"]
+
+
+def test_cfn_wait_condition(cfn):
+    """A WaitCondition holds the stack until its handle receives the SUCCESS
+    signal; the handle's Ref is the signal URL, Data carries the signal, the
+    signal is published to the stack events, a deleted handle answers 404."""
+    stack_name = f"cfn-wait-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_wait_condition_template()))
+    try:
+        url = _wait_for_wait_condition(cfn, stack_name)
+        assert "/_ministack/cfn-signal/" in url
+        events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+        assert not any(e["LogicalResourceId"] == "After" for e in events)
+        _assert_still_waiting(cfn, stack_name, 0.5)
+        assert _put_wait_condition_signal(url, "SUCCESS", "ID1234", data="Application has completed configuration.") == 200
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        assert _output(stack, "Url") == url
+        assert url.endswith("/" + _output(stack, "HandleId"))
+        assert json.loads(_output(stack, "Data")) == {"ID1234": "Application has completed configuration."}
+        resources = {r["LogicalResourceId"]: r for r in cfn.describe_stack_resources(StackName=stack_name)["StackResources"]}
+        assert resources["Handle"]["PhysicalResourceId"] == url
+        assert resources["After"]["ResourceStatus"] == "CREATE_COMPLETE"
+        assert _signal_events(cfn, stack_name) == ["Received SUCCESS signal with UniqueId ID1234"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        _put_wait_condition_signal(url, "SUCCESS", "late")
+    assert exc_info.value.code == 404
+
+
+def test_cfn_wait_condition_failure_signal_rolls_back(cfn):
+    stack_name = f"cfn-wait-fail-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_wait_condition_template()))
+    try:
+        url = _wait_for_wait_condition(cfn, stack_name)
+        assert _put_wait_condition_signal(url, "FAILURE", "node-1", reason="Setup failed") == 200
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        reasons = _stack_event_reasons(cfn, stack_name)
+        assert "WaitCondition received failed message: 'Setup failed' for uniqueId: node-1" in reasons
+        assert "Received FAILURE signal with UniqueId node-1" in reasons
+        assert not any(e["LogicalResourceId"] == "After"
+                       for e in cfn.describe_stack_events(StackName=stack_name)["StackEvents"])
+        # The rollback deleted the handle: its URL is gone.
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            _put_wait_condition_signal(url, "SUCCESS", "late")
+        assert exc_info.value.code == 404
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_wait_condition_timeout_rolls_back(cfn):
+    stack_name = f"cfn-wait-timeout-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_wait_condition_template(timeout="1")))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert "WaitCondition timed out. Received 0 conditions when expecting 1" in _stack_event_reasons(cfn, stack_name)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_wait_condition_count_and_signal_endpoint_rules(cfn):
+    """Count=2 needs two distinct UniqueIds; a repeated UniqueId is a
+    retransmission and does not count. The endpoint refuses a non-empty
+    Content-Type (403), a body that is not the signal JSON (400) and an
+    unknown token (404)."""
+    stack_name = f"cfn-wait-count-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_wait_condition_template(count=2)))
+    try:
+        url = _wait_for_wait_condition(cfn, stack_name)
+        for kwargs, code in (
+            ({"status": "DONE"}, 400),
+            ({"body": b"not json"}, 400),
+            ({"content_type": "application/json"}, 403),
+            ({"url": url.rsplit("/", 1)[0] + "/no-such-token"}, 404),
+        ):
+            with pytest.raises(urllib.error.HTTPError) as exc_info:
+                _put_wait_condition_signal(**{"url": url, "unique_id": "node-1", **kwargs})
+            assert exc_info.value.code == code, kwargs
+        assert "must be an empty string or omitted" in str(
+            pytest.raises(urllib.error.HTTPError, _put_wait_condition_signal, url,
+                          unique_id="node-1", content_type="text/plain").value.read())
+        _put_wait_condition_signal(url, "SUCCESS", "node-1", data="first")
+        _put_wait_condition_signal(url, "SUCCESS", "node-1", data="again")
+        _assert_still_waiting(cfn, stack_name)
+        assert _signal_events(cfn, stack_name) == ["Received SUCCESS signal with UniqueId node-1"]
+        _put_wait_condition_signal(url, "SUCCESS", "node-2", data="second")
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        assert json.loads(_output(stack, "Data")) == {"node-1": "first", "node-2": "second"}
+        assert sorted(_signal_events(cfn, stack_name)) == [
+            "Received SUCCESS signal with UniqueId node-1",
+            "Received SUCCESS signal with UniqueId node-2",
+        ]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_wait_condition_handle_must_be_a_handle_of_the_stack(cfn):
+    """A Handle that is not a handle URL, or the handle of another stack, fails
+    the resource; the other stack's handle stays usable."""
+    other_name = f"cfn-wait-other-{_uuid_mod.uuid4().hex[:8]}"
+    stack_name = f"cfn-wait-badhandle-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=other_name, TemplateBody=json.dumps(_wait_condition_template()))
+    try:
+        other_url = _wait_for_wait_condition(cfn, other_name)
+        for handle, message in (
+            (other_url, "Handle must be the Ref of an AWS::CloudFormation::WaitConditionHandle of this stack"),
+            ("https://example.local/not-a-handle", "Handle must be the Ref of an AWS::CloudFormation::WaitConditionHandle"),
+        ):
+            template = _wait_condition_template()
+            template["Resources"]["Wait"]["Properties"]["Handle"] = handle
+            cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+            try:
+                assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+                assert message in _stack_event_reasons(cfn, stack_name)
+            finally:
+                _delete_cfn_test_stack(cfn, stack_name)
+        _put_wait_condition_signal(other_url, "SUCCESS", "still-works")
+        assert _wait_stack(cfn, other_name)["StackStatus"] == "CREATE_COMPLETE"
+    finally:
+        _delete_cfn_test_stack(cfn, other_name)
+
+
+@pytest.mark.parametrize(
+    ("props", "message"),
+    [
+        ({"Count": 1}, "Timeout is required"),
+        ({"Timeout": "30", "Count": "0"}, "Count must be an integer of at least 1"),
+    ],
+)
+def test_cfn_wait_condition_refuses_invalid_properties(cfn, props, message):
+    stack_name = f"cfn-wait-invalid-{_uuid_mod.uuid4().hex[:8]}"
+    template = _wait_condition_template()
+    template["Resources"]["Wait"]["Properties"] = {"Handle": {"Ref": "Handle"}, **props}
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert message in _stack_event_reasons(cfn, stack_name)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize(
+    ("validator", "value", "message"),
+    [
+        ("validate_timeout_seconds", "0", "Timeout must be a number of seconds between 1 and 43200"),
+        ("validate_timeout_seconds", "43201", "Timeout must be a number of seconds between 1 and 43200"),
+        ("validate_timeout_seconds", "PT5M", "Timeout must be a number of seconds between 1 and 43200"),
+        ("validate_count", "two", "Count must be an integer of at least 1"),
+        ("validate_resource_signal_timeout", "5 minutes", "ResourceSignal Timeout must be an ISO 8601 duration"),
+        ("validate_resource_signal_timeout", "PT0S", "ResourceSignal Timeout must be at least one second"),
+        ("validate_resource_signal_timeout", "PT13H", "ResourceSignal Timeout must be at most 12 hours"),
+    ],
+)
+def test_cfn_wait_condition_validators(validator, value, message):
+    from ministack.services.cloudformation import wait_conditions as wc
+
+    with pytest.raises(ValueError, match=re.escape(message)):
+        getattr(wc, validator)(value, "Wait")
+    assert wc.validate_count("3", "Wait") == 3
+    assert wc.validate_count(None, "Wait") == 1
+    assert wc.validate_timeout_seconds(" 300 ", "Wait") == 300
+    assert wc.validate_resource_signal_timeout(None, "Wait") == 300
+    assert wc.validate_resource_signal_timeout("PT1H30M15S", "Wait") == 5415
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"ResourceSignal": {"Timeout": "PT2M", "Count": "2"}},
+        {"ResourceSignal": {"Count": 2}},
+    ],
+)
+def test_cfn_wait_condition_creation_policy_waits_for_signal_resource(cfn, policy):
+    """The CreationPolicy form: no handle, SignalResource only, Timeout
+    defaults to PT5M; an update never waits again."""
+    stack_name = f"cfn-wait-cp-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_creation_policy_wait_template(policy)))
+    try:
+        _wait_for_wait_condition(cfn, stack_name)
+        cfn.signal_resource(StackName=stack_name, LogicalResourceId="Wait", UniqueId="i-1", Status="SUCCESS")
+        _assert_still_waiting(cfn, stack_name)
+        assert _signal_events(cfn, stack_name) == ["Received SUCCESS signal with UniqueId i-1"]
+        cfn.signal_resource(StackName=stack_name, LogicalResourceId="Wait", UniqueId="i-2", Status="SUCCESS")
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        assert json.loads(_output(stack, "Data")) == {"i-1": "", "i-2": ""}
+        assert len(_signal_events(cfn, stack_name)) == 2
+        template = _creation_policy_wait_template({"ResourceSignal": {"Count": "5"}})
+        template["Resources"]["After"]["Properties"]["Value"] = "y"
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE"
+        assert json.loads(_output(stack, "Data")) == {"i-1": "", "i-2": ""}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize("policy", [{}, {"ResourceSignal": {}}])
+def test_cfn_wait_condition_creation_policy_defaults(cfn, policy):
+    """An empty CreationPolicy or ResourceSignal means one signal, PT5M."""
+    stack_name = f"cfn-wait-cpdef-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_creation_policy_wait_template(policy)))
+    try:
+        _wait_for_wait_condition(cfn, stack_name)
+        _assert_still_waiting(cfn, stack_name, 0.5)
+        cfn.signal_resource(StackName=stack_name, LogicalResourceId="Wait", UniqueId="only", Status="SUCCESS")
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected"),
+    [
+        ({"ResourceSignal": {"Timeout": "PT1S"}}, "WaitCondition timed out. Received 0 conditions when expecting 1"),
+        ("PT5M", "CreationPolicy must be an object"),
+        ({"ResourceSignal": "PT5M"}, "CreationPolicy ResourceSignal must be an object"),
+    ],
+)
+def test_cfn_wait_condition_creation_policy_timeout_and_shape(cfn, policy, expected):
+    stack_name = f"cfn-wait-cpfail-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_creation_policy_wait_template(policy)))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert expected in _stack_event_reasons(cfn, stack_name)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_wait_condition_store_reset_releases_a_waiter():
+    """The service's reset (what POST /_ministack/reset calls) must not leave
+    a worker thread blocked in a wait that nothing can signal any more. Run
+    in-process against this test's own copy of the stores."""
+    import threading
+
+    from ministack.services import cloudformation as cfn_service
+    from ministack.services.cloudformation import wait_conditions as wc
+
+    token = wc.register_slot("arn:aws:cloudformation:eu-central-1:000000000000:stack/reset-probe/1")
+    outcome = {}
+
+    def waiter():
+        try:
+            wc.wait_for(token, "arn:aws:cloudformation:eu-central-1:000000000000:stack/reset-probe/1",
+                        "reset-probe", "Wait", "AWS::CloudFormation::WaitCondition", 1, 30)
+        except Exception as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=waiter, daemon=True)
+    thread.start()
+    time.sleep(0.2)
+    cfn_service.reset()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert "state was reset" in str(outcome.get("error"))
+
+
+def test_cfn_signal_resource_completes_the_wait_condition(cfn):
+    """SignalResource delivers a signal without the handle URL; the stack name
+    or its id addresses the stack."""
+    stack_name = f"cfn-wait-signal-{_uuid_mod.uuid4().hex[:8]}"
+    stack_id = cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_wait_condition_template(count=2)))["StackId"]
+    try:
+        _wait_for_wait_condition(cfn, stack_name)
+        with pytest.raises(ClientError) as exc_info:
+            cfn.signal_resource(StackName=stack_name, LogicalResourceId="After", UniqueId="s1", Status="SUCCESS")
+        _assert_validation_error(exc_info, f"Resource [After] in stack [{stack_name}] is not waiting for signals")
+        with pytest.raises(ClientError) as exc_info:
+            cfn.signal_resource(StackName=stack_name, LogicalResourceId="Wait", UniqueId="s1", Status="DONE")
+        _assert_validation_error(exc_info, "Member must satisfy enum value set: [FAILURE, SUCCESS]")
+        with pytest.raises(ClientError) as exc_info:
+            cfn.signal_resource(StackName=stack_name, LogicalResourceId="Wait", UniqueId="x" * 65, Status="SUCCESS")
+        _assert_validation_error(exc_info, "Member must have length less than or equal to 64")
+        cfn.signal_resource(StackName=stack_name, LogicalResourceId="Wait", UniqueId="s1", Status="SUCCESS")
+        cfn.signal_resource(StackName=stack_id, LogicalResourceId="Wait", UniqueId="s2", Status="SUCCESS")
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        assert json.loads(_output(stack, "Data")) == {"s1": "", "s2": ""}
+        assert sorted(_signal_events(cfn, stack_name)) == [
+            "Received SUCCESS signal with UniqueId s1",
+            "Received SUCCESS signal with UniqueId s2",
+        ]
+        with pytest.raises(ClientError) as exc_info:
+            cfn.signal_resource(StackName=stack_name, LogicalResourceId="Wait", UniqueId="s3", Status="SUCCESS")
+        _assert_validation_error(exc_info, f"Stack [{stack_name}] is in CREATE_COMPLETE state and cannot be signaled")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    with pytest.raises(ClientError) as exc_info:
+        cfn.signal_resource(StackName=stack_name, LogicalResourceId="Wait", UniqueId="s4", Status="SUCCESS")
+    _assert_validation_error(exc_info, f"Stack [{stack_name}] does not exist")
+
+
+@pytest.mark.parametrize("missing", ["StackName", "LogicalResourceId", "UniqueId", "Status"])
+def test_cfn_signal_resource_requires_every_field(missing):
+    """boto3 refuses a missing field itself; a client without parameter
+    validation shows the service's own answer."""
+    client = boto3.client(
+        "cloudformation",
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        config=Config(parameter_validation=False, retries={"mode": "standard"}),
+    )
+    params = {"StackName": "no-such-stack", "LogicalResourceId": "Wait", "UniqueId": "s1", "Status": "SUCCESS"}
+    params.pop(missing)
+    with pytest.raises(ClientError) as exc_info:
+        client.signal_resource(**params)
+    _assert_validation_error(exc_info, f"{missing} is required")
+
+
+def test_cfn_signal_resource_failure_rolls_back(cfn):
+    stack_name = f"cfn-wait-signalfail-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_wait_condition_template()))
+    try:
+        _wait_for_wait_condition(cfn, stack_name)
+        cfn.signal_resource(StackName=stack_name, LogicalResourceId="Wait", UniqueId="node-9", Status="FAILURE")
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        reasons = _stack_event_reasons(cfn, stack_name)
+        assert "for uniqueId: node-9" in reasons
+        assert "Received FAILURE signal with UniqueId node-9" in reasons
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_wait_condition_in_a_nested_stack(cfn, s3):
+    """A nested stack deploys on a worker thread, so a wait condition inside
+    it holds the parent without blocking the server; SignalResource on the
+    child stack (its id is the parent's resource physical id) releases it."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    templates_bucket = f"cfn-wait-nested-{suffix}"
+    s3.create_bucket(Bucket=templates_bucket)
+    s3.put_object(Bucket=templates_bucket, Key="child.json",
+                  Body=json.dumps(_wait_condition_template()).encode())
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+    parent_name = f"cfn-wait-parent-{suffix}"
+    parent_template = {
+        "Resources": {
+            "Nested": {
+                "Type": "AWS::CloudFormation::Stack",
+                "Properties": {"TemplateURL": f"{endpoint}/{templates_bucket}/child.json"},
+            },
+            "AfterNested": {
+                "Type": "AWS::SSM::Parameter",
+                "DependsOn": "Nested",
+                "Properties": {"Type": "String", "Name": f"/{parent_name}/after", "Value": "x"},
+            },
+        },
+        "Outputs": {"ChildData": {"Value": {"Fn::GetAtt": ["Nested", "Outputs.Data"]}}},
+    }
+    cfn.create_stack(StackName=parent_name, TemplateBody=json.dumps(parent_template))
+    try:
+        deadline = time.time() + 15
+        child_id = None
+        while time.time() < deadline and child_id is None:
+            for summary in cfn.list_stacks(StackStatusFilter=["CREATE_IN_PROGRESS"])["StackSummaries"]:
+                if summary["StackName"].startswith(f"{parent_name}-Nested-") \
+                        and _wait_condition_is_waiting(cfn, summary["StackId"]):
+                    child_id = summary["StackId"]
+            time.sleep(0.2)
+        assert child_id, "the child stack never reached its wait condition"
+        # The server answers while the parent waits.
+        assert cfn.describe_stacks(StackName=parent_name)["Stacks"][0]["StackStatus"] == "CREATE_IN_PROGRESS"
+        cfn.signal_resource(StackName=child_id, LogicalResourceId="Wait", UniqueId="child-1", Status="SUCCESS")
+        stack = _wait_stack(cfn, parent_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        assert json.loads(_output(stack, "ChildData")) == {"child-1": ""}
+        nested = next(r for r in cfn.describe_stack_resources(StackName=parent_name)["StackResources"]
+                      if r["LogicalResourceId"] == "Nested")
+        assert nested["PhysicalResourceId"] == child_id
+    finally:
+        _delete_cfn_test_stack(cfn, parent_name)
+        try:
+            s3.delete_object(Bucket=templates_bucket, Key="child.json")
+            s3.delete_bucket(Bucket=templates_bucket)
+        except ClientError:
+            pass
 
 
 @pytest.mark.parametrize(
@@ -3279,7 +4519,7 @@ def test_cfn_stack_with_s3_lambda_dynamodb(cfn, s3, lam, ddb):
     # Delete stack and verify cleanup
     cfn.delete_stack(StackName=stack_name)
     time.sleep(2)
-    stacks = cfn.describe_stacks()["Stacks"]
+    stacks = _all_pages(cfn, "describe_stacks", "Stacks")
     active = [st for st in stacks if st["StackName"] == stack_name and "DELETE" not in st["StackStatus"]]
     assert len(active) == 0
 
@@ -3492,7 +4732,7 @@ def test_cfn_ec2_vpc_endpoint_uses_ec2_state(cfn, ec2):
     assert len(endpoints) == 1
     assert endpoints[0]["VpcEndpointId"] == outputs["RefId"]
     assert endpoints[0]["ServiceName"] == "com.amazonaws.us-east-1.s3"
-    assert endpoints[0]["Tags"] == [{"Key": "source", "Value": "cloudformation"}]
+    assert _template_tags(endpoints[0]["Tags"]) == [{"Key": "source", "Value": "cloudformation"}]
 
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
@@ -5037,6 +6277,770 @@ def test_cfn_eventbus_default_name_fails(cfn, eb):
     assert bus["Name"] == "default"
 
 
+# --- Tags: the Tags property of the common types, stack-level tags ---
+
+def _cfn_tag_template(tags):
+    return {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Queue": {"Type": "AWS::SQS::Queue", "Properties": {"Tags": tags}},
+            "Topic": {"Type": "AWS::SNS::Topic", "Properties": {"Tags": tags}},
+            "Table": {
+                "Type": "AWS::DynamoDB::Table",
+                "Properties": {
+                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "BillingMode": "PAY_PER_REQUEST",
+                    "Tags": tags,
+                },
+            },
+            "Fn": {
+                "Type": "AWS::Lambda::Function",
+                "Properties": {
+                    "Runtime": "python3.12",
+                    "Handler": "index.handler",
+                    "Role": "arn:aws:iam::000000000000:role/cfn-tags-role",
+                    "Code": {"ZipFile": "def handler(e, c): return {}"},
+                    "Tags": tags,
+                },
+            },
+            "Logs": {"Type": "AWS::Logs::LogGroup", "Properties": {"Tags": tags}},
+            "Stream": {
+                "Type": "AWS::Kinesis::Stream",
+                "Properties": {"ShardCount": 1, "Tags": tags},
+            },
+        },
+        "Outputs": {
+            "QueueUrl": {"Value": {"Ref": "Queue"}},
+            "TopicArn": {"Value": {"Ref": "Topic"}},
+            "TableArn": {"Value": {"Fn::GetAtt": ["Table", "Arn"]}},
+            "FnArn": {"Value": {"Fn::GetAtt": ["Fn", "Arn"]}},
+            "LogGroup": {"Value": {"Ref": "Logs"}},
+            "StreamName": {"Value": {"Ref": "Stream"}},
+        },
+    }
+
+
+def _cfn_tag_readback(sqs, sns, ddb, lam, logs, kin, stack):
+    """The tags each service reports for the resources of `stack`, keyed by
+    logical id, as {key: value} maps."""
+    return {
+        "Queue": sqs.list_queue_tags(QueueUrl=_output(stack, "QueueUrl")).get("Tags", {}),
+        "Topic": {
+            t["Key"]: t["Value"]
+            for t in sns.list_tags_for_resource(ResourceArn=_output(stack, "TopicArn"))["Tags"]
+        },
+        "Table": {
+            t["Key"]: t["Value"]
+            for t in ddb.list_tags_of_resource(ResourceArn=_output(stack, "TableArn"))["Tags"]
+        },
+        "Fn": lam.list_tags(Resource=_output(stack, "FnArn"))["Tags"],
+        "Logs": logs.list_tags_log_group(logGroupName=_output(stack, "LogGroup"))["tags"],
+        "Stream": {
+            t["Key"]: t["Value"]
+            for t in kin.list_tags_for_stream(StreamName=_output(stack, "StreamName"))["Tags"]
+        },
+    }
+
+
+def test_cfn_resource_tags_reach_the_service(cfn, sqs, sns, ddb, lam, logs, kin):
+    """The Tags property of a queue, topic, table, function, log group and
+    stream is stored where the service's own tag API reads it, and a template
+    change to it is reconciled on update without touching tags added through
+    that API."""
+    name = f"cfn-res-tags-{_uuid_mod.uuid4().hex[:8]}"
+    first = [{"Key": "env", "Value": "test"}, {"Key": "team", "Value": "platform"}]
+    cfn.create_stack(StackName=name, TemplateBody=json.dumps(_cfn_tag_template(first)))
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        seen = _cfn_tag_readback(sqs, sns, ddb, lam, logs, kin, stack)
+        for logical_id, tags in seen.items():
+            assert _template_tags(tags) == {"env": "test", "team": "platform"}, logical_id
+
+        # A tag set through the service API is not CloudFormation's to remove.
+        sqs.tag_queue(QueueUrl=_output(stack, "QueueUrl"), Tags={"manual": "yes"})
+        lam.tag_resource(Resource=_output(stack, "FnArn"), Tags={"manual": "yes"})
+
+        second = [{"Key": "env", "Value": "prod"}, {"Key": "owner", "Value": "ops"}]
+        cfn.update_stack(StackName=name, TemplateBody=json.dumps(_cfn_tag_template(second)))
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE"
+        seen = _cfn_tag_readback(sqs, sns, ddb, lam, logs, kin, stack)
+        for logical_id in ("Topic", "Table", "Logs", "Stream"):
+            assert _template_tags(seen[logical_id]) == {"env": "prod", "owner": "ops"}, logical_id
+        assert _template_tags(seen["Queue"]) == {"env": "prod", "owner": "ops", "manual": "yes"}
+        assert _template_tags(seen["Fn"]) == {"env": "prod", "owner": "ops", "manual": "yes"}
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def _system_tags(stack, logical_id):
+    return {
+        "aws:cloudformation:stack-name": stack["StackName"],
+        "aws:cloudformation:stack-id": stack["StackId"],
+        "aws:cloudformation:logical-id": logical_id,
+    }
+
+
+def test_cfn_stack_tags_reach_the_resources(cfn, sqs, ssm):
+    """Stack-level tags and the three aws:cloudformation tags land on the
+    resources (a list-shaped Tags property and a map-shaped one), the
+    template's own tag wins on a shared key, and a stack-tag change on update
+    reaches the resources."""
+    name = f"cfn-stack-tags-{_uuid_mod.uuid4().hex[:8]}"
+    template = {
+        "Resources": {
+            "Q": {
+                "Type": "AWS::SQS::Queue",
+                "Properties": {"Tags": [{"Key": "env", "Value": "template"}]},
+            },
+            "P": {
+                "Type": "AWS::SSM::Parameter",
+                "Properties": {
+                    "Name": f"/{name}/p",
+                    "Type": "String",
+                    "Value": "v",
+                    "Tags": {"tier": "gold"},
+                },
+            },
+        },
+        "Outputs": {"QueueUrl": {"Value": {"Ref": "Q"}}},
+    }
+    cfn.create_stack(
+        StackName=name,
+        TemplateBody=json.dumps(template),
+        Tags=[{"Key": "owner", "Value": "team-a"}, {"Key": "env", "Value": "stack"}],
+    )
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        queue_url = _output(stack, "QueueUrl")
+        assert sqs.list_queue_tags(QueueUrl=queue_url)["Tags"] == {
+            "env": "template",
+            "owner": "team-a",
+            **_system_tags(stack, "Q"),
+        }
+        param_tags = {
+            t["Key"]: t["Value"]
+            for t in ssm.list_tags_for_resource(
+                ResourceType="Parameter", ResourceId=f"/{name}/p"
+            )["TagList"]
+        }
+        assert param_tags == {
+            "tier": "gold",
+            "owner": "team-a",
+            "env": "stack",
+            **_system_tags(stack, "P"),
+        }
+        # An unchanged template with changed stack tags is an update (the tag
+        # change reaches the resources); the same tags again are refused.
+        with pytest.raises(ClientError, match="No updates are to be performed"):
+            cfn.update_stack(
+                StackName=name,
+                UsePreviousTemplate=True,
+                Tags=[{"Key": "owner", "Value": "team-a"}, {"Key": "env", "Value": "stack"}],
+            )
+
+        cfn.update_stack(
+            StackName=name,
+            UsePreviousTemplate=True,
+            Tags=[{"Key": "owner", "Value": "team-b"}, {"Key": "cost", "Value": "42"}],
+        )
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert sqs.list_queue_tags(QueueUrl=queue_url)["Tags"] == {
+            "env": "template",
+            "owner": "team-b",
+            "cost": "42",
+            **_system_tags(stack, "Q"),
+        }
+        param_tags = {
+            t["Key"]: t["Value"]
+            for t in ssm.list_tags_for_resource(
+                ResourceType="Parameter", ResourceId=f"/{name}/p"
+            )["TagList"]
+        }
+        assert param_tags == {
+            "tier": "gold",
+            "owner": "team-b",
+            "cost": "42",
+            **_system_tags(stack, "P"),
+        }
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_stack_tags_reach_a_nested_stack(cfn, s3, sqs):
+    """The parent's stack tags reach the resources of a nested stack; the
+    aws:cloudformation tags carry the nested stack's own name and id."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    templates_bucket = f"cfn-tags-templates-{suffix}"
+    child_template = {
+        "Resources": {"Q": {"Type": "AWS::SQS::Queue"}},
+        "Outputs": {"QueueUrl": {"Value": {"Ref": "Q"}}},
+    }
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+    parent_template = {
+        "Resources": {
+            "Nested": {
+                "Type": "AWS::CloudFormation::Stack",
+                "Properties": {"TemplateURL": f"{endpoint}/{templates_bucket}/child.json"},
+            },
+        },
+        "Outputs": {
+            "QueueUrl": {"Value": {"Fn::GetAtt": ["Nested", "Outputs.QueueUrl"]}},
+            "NestedId": {"Value": {"Ref": "Nested"}},
+        },
+    }
+    parent_name = f"cfn-tags-parent-{suffix}"
+    s3.create_bucket(Bucket=templates_bucket)
+    try:
+        s3.put_object(Bucket=templates_bucket, Key="child.json",
+                      Body=json.dumps(child_template).encode())
+        cfn.create_stack(
+            StackName=parent_name,
+            TemplateBody=json.dumps(parent_template),
+            Tags=[{"Key": "owner", "Value": "team-a"}],
+        )
+        stack = _wait_stack(cfn, parent_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        nested = cfn.describe_stacks(StackName=_output(stack, "NestedId"))["Stacks"][0]
+        assert nested["Tags"] == [{"Key": "owner", "Value": "team-a"}]
+        tags = sqs.list_queue_tags(QueueUrl=_output(stack, "QueueUrl"))["Tags"]
+        assert tags == {"owner": "team-a", **_system_tags(nested, "Q")}
+    finally:
+        _delete_cfn_test_stack(cfn, parent_name)
+        s3.delete_object(Bucket=templates_bucket, Key="child.json")
+        s3.delete_bucket(Bucket=templates_bucket)
+
+
+def test_cfn_change_set_keeps_tagged_resources_without_update_handler(cfn, sqs):
+    """Executing an UPDATE change set on a tagged stack does not re-create the
+    tagged resources: the snapshot the execution compares against carries the
+    stack's tags, so a type without an update handler (an HTTP API) keeps its
+    physical id while the queue next to it changes."""
+    name = f"cfn-cs-tags-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(visibility):
+        return json.dumps({
+            "Resources": {
+                "Q": {
+                    "Type": "AWS::SQS::Queue",
+                    "Properties": {"VisibilityTimeout": visibility},
+                },
+                "Api": {
+                    "Type": "AWS::ApiGatewayV2::Api",
+                    "Properties": {"Name": f"{name}-api", "ProtocolType": "HTTP"},
+                },
+            },
+            "Outputs": {
+                "ApiId": {"Value": {"Ref": "Api"}},
+                "QueueUrl": {"Value": {"Ref": "Q"}},
+            },
+        })
+
+    cfn.create_stack(
+        StackName=name, TemplateBody=template(30),
+        Tags=[{"Key": "owner", "Value": "team-a"}],
+    )
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        api_id = _output(stack, "ApiId")
+        queue_url = _output(stack, "QueueUrl")
+
+        cfn.create_change_set(
+            StackName=name, ChangeSetName="visibility", TemplateBody=template(60),
+        )
+        described = cfn.describe_change_set(ChangeSetName="visibility", StackName=name)
+        assert [c["ResourceChange"]["LogicalResourceId"] for c in described["Changes"]] == ["Q"]
+        cfn.execute_change_set(ChangeSetName="visibility", StackName=name)
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "ApiId") == api_id
+        attributes = sqs.get_queue_attributes(
+            QueueUrl=queue_url, AttributeNames=["VisibilityTimeout"]
+        )["Attributes"]
+        assert attributes["VisibilityTimeout"] == "60"
+        assert sqs.list_queue_tags(QueueUrl=queue_url)["Tags"] == {
+            "owner": "team-a", **_system_tags(stack, "Q")}
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_stack_tag_change_keeps_a_resource_without_update_handler(cfn):
+    """A stack-tag change is an update; a tagged type without an update
+    handler (a certificate) keeps its ARN instead of being re-created."""
+    name = f"cfn-tag-only-{_uuid_mod.uuid4().hex[:8]}"
+    template = json.dumps({
+        "Resources": {
+            "Cert": {
+                "Type": "AWS::CertificateManager::Certificate",
+                "Properties": {"DomainName": f"{name}.example.local", "ValidationMethod": "DNS"},
+            },
+        },
+        "Outputs": {"CertArn": {"Value": {"Ref": "Cert"}}},
+    })
+    cfn.create_stack(
+        StackName=name, TemplateBody=template, Tags=[{"Key": "owner", "Value": "team-a"}],
+    )
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _output(stack, "CertArn")
+        cfn.update_stack(
+            StackName=name, UsePreviousTemplate=True,
+            Tags=[{"Key": "owner", "Value": "team-b"}],
+        )
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "CertArn") == arn
+        assert stack["Tags"] == [{"Key": "owner", "Value": "team-b"}]
+        detail = cfn.describe_stack_resource(StackName=name, LogicalResourceId="Cert")
+        assert detail["StackResourceDetail"]["PhysicalResourceId"] == arn
+        # Without an update handler the certificate keeps the tags it was
+        # created with; the changed stack tag does not reach it.
+        acm = _regional_cfn_test_client("acm", cfn.meta.region_name)
+        cert_tags = {t["Key"]: t["Value"] for t in acm.list_tags_for_certificate(CertificateArn=arn)["Tags"]}
+        assert cert_tags == {"owner": "team-a", **_system_tags(stack, "Cert")}
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_secret_and_parameter_manual_tags_survive_a_stack_update(cfn, sm, ssm):
+    """Tags added through TagResource / AddTagsToResource on a secret and a
+    parameter the template never tagged are kept by a stack update, next to
+    the stack tags and the aws:cloudformation tags."""
+    name = f"cfn-manual-tags-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(description, value):
+        return json.dumps({
+            "Resources": {
+                "Secret": {
+                    "Type": "AWS::SecretsManager::Secret",
+                    "Properties": {
+                        "Name": f"{name}-secret",
+                        "Description": description,
+                        "SecretString": "s3cret",
+                    },
+                },
+                "Param": {
+                    "Type": "AWS::SSM::Parameter",
+                    "Properties": {"Name": f"/{name}/p", "Type": "String", "Value": value},
+                },
+            },
+            "Outputs": {"SecretArn": {"Value": {"Ref": "Secret"}}},
+        })
+
+    cfn.create_stack(
+        StackName=name, TemplateBody=template("one", "v1"),
+        Tags=[{"Key": "owner", "Value": "team-a"}],
+    )
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        secret_arn = _output(stack, "SecretArn")
+        sm.tag_resource(SecretId=secret_arn, Tags=[{"Key": "manual", "Value": "yes"}])
+        ssm.add_tags_to_resource(
+            ResourceType="Parameter", ResourceId=f"/{name}/p",
+            Tags=[{"Key": "manual", "Value": "yes"}],
+        )
+
+        cfn.update_stack(StackName=name, TemplateBody=template("two", "v2"))
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        secret = sm.describe_secret(SecretId=secret_arn)
+        assert secret["Description"] == "two"
+        assert {t["Key"]: t["Value"] for t in secret["Tags"]} == {
+            "manual": "yes", "owner": "team-a", **_system_tags(stack, "Secret")}
+        assert ssm.get_parameter(Name=f"/{name}/p")["Parameter"]["Value"] == "v2"
+        param_tags = ssm.list_tags_for_resource(
+            ResourceType="Parameter", ResourceId=f"/{name}/p")["TagList"]
+        assert {t["Key"]: t["Value"] for t in param_tags} == {
+            "manual": "yes", "owner": "team-a", **_system_tags(stack, "Param")}
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_stack_tag_change_reaches_an_event_bus_and_an_api_key(cfn, eb, apigw_v1):
+    """Types whose update handler used to ignore the tag property (an event
+    bus, an API key) receive a stack-tag change on update."""
+    name = f"cfn-tag-upd-{_uuid_mod.uuid4().hex[:8]}"
+    template = json.dumps({
+        "Resources": {
+            "Bus": {"Type": "AWS::Events::EventBus", "Properties": {"Name": f"{name}-bus"}},
+            "Key": {
+                "Type": "AWS::ApiGateway::ApiKey",
+                "Properties": {"Name": f"{name}-key", "Enabled": True},
+            },
+        },
+        "Outputs": {
+            "BusArn": {"Value": {"Fn::GetAtt": ["Bus", "Arn"]}},
+            "KeyId": {"Value": {"Ref": "Key"}},
+        },
+    })
+
+    def bus_tags(arn):
+        return {t["Key"]: t["Value"] for t in eb.list_tags_for_resource(ResourceARN=arn)["Tags"]}
+
+    cfn.create_stack(
+        StackName=name, TemplateBody=template, Tags=[{"Key": "owner", "Value": "team-a"}],
+    )
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        bus_arn = _output(stack, "BusArn")
+        key_id = _output(stack, "KeyId")
+        assert bus_tags(bus_arn) == {"owner": "team-a", **_system_tags(stack, "Bus")}
+        assert apigw_v1.get_api_key(apiKey=key_id)["tags"] == {
+            "owner": "team-a", **_system_tags(stack, "Key")}
+
+        cfn.update_stack(
+            StackName=name, UsePreviousTemplate=True,
+            Tags=[{"Key": "owner", "Value": "team-b"}, {"Key": "cost", "Value": "42"}],
+        )
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "KeyId") == key_id
+        expected = {"owner": "team-b", "cost": "42"}
+        assert bus_tags(bus_arn) == {**expected, **_system_tags(stack, "Bus")}
+        assert apigw_v1.get_api_key(apiKey=key_id)["tags"] == {
+            **expected, **_system_tags(stack, "Key")}
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_stack_tags_reach_the_map_shaped_tag_properties(cfn, cognito_idp, cognito_identity):
+    """The map-shaped properties receive the stack tags too: UserPoolTags,
+    IdentityPoolTags, BackupVaultTags and BackupPlanTags, each read back
+    through the service's own tag API."""
+    name = f"cfn-map-tags-{_uuid_mod.uuid4().hex[:8]}"
+    template = json.dumps({
+        "Resources": {
+            "Pool": {
+                "Type": "AWS::Cognito::UserPool",
+                "Properties": {"UserPoolName": f"{name}-pool", "UserPoolTags": {"tier": "gold"}},
+            },
+            "IdPool": {
+                "Type": "AWS::Cognito::IdentityPool",
+                "Properties": {
+                    "IdentityPoolName": f"{name}-idpool",
+                    "AllowUnauthenticatedIdentities": True,
+                    "IdentityPoolTags": {"tier": "silver"},
+                },
+            },
+            "Vault": {
+                "Type": "AWS::Backup::BackupVault",
+                "Properties": {"BackupVaultName": f"{name}-vault", "BackupVaultTags": {"tier": "bronze"}},
+            },
+            "Plan": {
+                "Type": "AWS::Backup::BackupPlan",
+                "Properties": {
+                    "BackupPlan": {
+                        "BackupPlanName": f"{name}-plan",
+                        "BackupPlanRule": [{
+                            "RuleName": "daily",
+                            "TargetBackupVault": {"Ref": "Vault"},
+                            "ScheduleExpression": "cron(0 5 ? * * *)",
+                        }],
+                    },
+                    "BackupPlanTags": {"tier": "iron"},
+                },
+            },
+        },
+        "Outputs": {
+            "PoolArn": {"Value": {"Fn::GetAtt": ["Pool", "Arn"]}},
+            "IdPoolId": {"Value": {"Ref": "IdPool"}},
+            "VaultArn": {"Value": {"Fn::GetAtt": ["Vault", "BackupVaultArn"]}},
+            "PlanArn": {"Value": {"Fn::GetAtt": ["Plan", "BackupPlanArn"]}},
+        },
+    })
+    backup = _regional_cfn_test_client("backup", cfn.meta.region_name)
+    cfn.create_stack(
+        StackName=name, TemplateBody=template, Tags=[{"Key": "owner", "Value": "team-a"}],
+    )
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        pool_tags = cognito_idp.list_tags_for_resource(ResourceArn=_output(stack, "PoolArn"))["Tags"]
+        assert pool_tags == {"tier": "gold", "owner": "team-a", **_system_tags(stack, "Pool")}
+        idpool_arn = (
+            f"arn:aws:cognito-identity:{cfn.meta.region_name}:000000000000:"
+            f"identitypool/{_output(stack, 'IdPoolId')}"
+        )
+        idpool_tags = cognito_identity.list_tags_for_resource(ResourceArn=idpool_arn)["Tags"]
+        assert idpool_tags == {"tier": "silver", "owner": "team-a", **_system_tags(stack, "IdPool")}
+        vault_tags = backup.list_tags(ResourceArn=_output(stack, "VaultArn"))["Tags"]
+        assert vault_tags == {"tier": "bronze", "owner": "team-a", **_system_tags(stack, "Vault")}
+        plan_tags = backup.list_tags(ResourceArn=_output(stack, "PlanArn"))["Tags"]
+        assert plan_tags == {"tier": "iron", "owner": "team-a", **_system_tags(stack, "Plan")}
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_stack_tags_map_valued_tags_and_eks_nodegroup(cfn, sqs, eks):
+    """An EKS node group's Tags is a map on AWS and is stored as one; a
+    map-valued Tags on a list-shaped type (a queue) is accepted as well."""
+    name = f"cfn-eks-tags-{_uuid_mod.uuid4().hex[:8]}"
+    template = json.dumps({
+        "Resources": {
+            "Cluster": {
+                "Type": "AWS::EKS::Cluster",
+                "Properties": {
+                    "Name": f"{name}-cluster",
+                    "RoleArn": "arn:aws:iam::000000000000:role/eks-role",
+                    "ResourcesVpcConfig": {"SubnetIds": ["subnet-1", "subnet-2"]},
+                },
+            },
+            "Nodes": {
+                "Type": "AWS::EKS::Nodegroup",
+                "Properties": {
+                    "ClusterName": {"Ref": "Cluster"},
+                    "NodegroupName": f"{name}-nodes",
+                    "NodeRole": "arn:aws:iam::000000000000:role/eks-node-role",
+                    "Subnets": ["subnet-1"],
+                    "Tags": {"tier": "gold"},
+                },
+            },
+            "Q": {"Type": "AWS::SQS::Queue", "Properties": {"Tags": {"env": "map"}}},
+        },
+        "Outputs": {
+            "NodesArn": {"Value": {"Fn::GetAtt": ["Nodes", "Arn"]}},
+            "QueueUrl": {"Value": {"Ref": "Q"}},
+        },
+    })
+    cfn.create_stack(
+        StackName=name, TemplateBody=template, Tags=[{"Key": "owner", "Value": "team-a"}],
+    )
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        node_tags = eks.list_tags_for_resource(resourceArn=_output(stack, "NodesArn"))["tags"]
+        assert node_tags == {"tier": "gold", "owner": "team-a", **_system_tags(stack, "Nodes")}
+        assert sqs.list_queue_tags(QueueUrl=_output(stack, "QueueUrl"))["Tags"] == {
+            "env": "map", "owner": "team-a", **_system_tags(stack, "Q")}
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_change_set_tags_replace_the_previous_stack_tags(cfn, sqs):
+    """An UPDATE change set that carries new stack tags: after execute the
+    queue carries the new tag and no longer the old one. The execution
+    compares against a snapshot that holds the previous tags; without them
+    the old tag would survive on the queue."""
+    name = f"cfn-cs-retag-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(visibility):
+        return json.dumps({
+            "Resources": {
+                "Q": {"Type": "AWS::SQS::Queue", "Properties": {"VisibilityTimeout": visibility}},
+            },
+            "Outputs": {"QueueUrl": {"Value": {"Ref": "Q"}}},
+        })
+
+    cfn.create_stack(
+        StackName=name, TemplateBody=template(30), Tags=[{"Key": "phase", "Value": "a"}],
+    )
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        queue_url = _output(stack, "QueueUrl")
+        assert sqs.list_queue_tags(QueueUrl=queue_url)["Tags"]["phase"] == "a"
+
+        cfn.create_change_set(
+            StackName=name, ChangeSetName="retag", TemplateBody=template(60),
+            Tags=[{"Key": "owner", "Value": "b"}],
+        )
+        cfn.execute_change_set(ChangeSetName="retag", StackName=name)
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert stack["Tags"] == [{"Key": "owner", "Value": "b"}]
+        assert sqs.list_queue_tags(QueueUrl=queue_url)["Tags"] == {
+            "owner": "b", **_system_tags(stack, "Q")}
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_stack_update_keeps_foreign_tags_on_table_and_project(cfn, ddb, codebuild, apigw_v1):
+    """Tags set outside the stack on a table (TagResource) and on a CodeBuild
+    project (UpdateProject) survive a stack-tag change, which also reaches a
+    usage plan through its update handler."""
+    name = f"cfn-foreign-tags-{_uuid_mod.uuid4().hex[:8]}"
+    template = json.dumps({
+        "Resources": {
+            "Table": {
+                "Type": "AWS::DynamoDB::Table",
+                "Properties": {
+                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "BillingMode": "PAY_PER_REQUEST",
+                },
+            },
+            "Project": {
+                "Type": "AWS::CodeBuild::Project",
+                "Properties": {
+                    "Name": f"{name}-project",
+                    "Source": {"Type": "NO_SOURCE"},
+                    "Artifacts": {"Type": "NO_ARTIFACTS"},
+                    "Environment": {
+                        "Type": "LINUX_CONTAINER",
+                        "Image": "aws/codebuild/standard:7.0",
+                        "ComputeType": "BUILD_GENERAL1_SMALL",
+                    },
+                    "ServiceRole": "arn:aws:iam::000000000000:role/codebuild-role",
+                },
+            },
+            "Plan": {
+                "Type": "AWS::ApiGateway::UsagePlan",
+                "Properties": {"UsagePlanName": f"{name}-plan", "Description": "plan"},
+            },
+        },
+        "Outputs": {
+            "TableArn": {"Value": {"Fn::GetAtt": ["Table", "Arn"]}},
+            "PlanId": {"Value": {"Ref": "Plan"}},
+        },
+    })
+    cfn.create_stack(
+        StackName=name, TemplateBody=template, Tags=[{"Key": "owner", "Value": "team-a"}],
+    )
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        table_arn = _output(stack, "TableArn")
+        plan_id = _output(stack, "PlanId")
+        ddb.tag_resource(ResourceArn=table_arn, Tags=[{"Key": "manual", "Value": "yes"}])
+        project = codebuild.batch_get_projects(names=[f"{name}-project"])["projects"][0]
+        codebuild.update_project(
+            name=f"{name}-project",
+            tags=project["tags"] + [{"key": "manual", "value": "yes"}],
+        )
+        assert apigw_v1.get_usage_plan(usagePlanId=plan_id)["tags"] == {
+            "owner": "team-a", **_system_tags(stack, "Plan")}
+
+        cfn.update_stack(
+            StackName=name, UsePreviousTemplate=True,
+            Tags=[{"Key": "owner", "Value": "team-b"}],
+        )
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        table_tags = {t["Key"]: t["Value"] for t in ddb.list_tags_of_resource(ResourceArn=table_arn)["Tags"]}
+        assert table_tags == {"manual": "yes", "owner": "team-b", **_system_tags(stack, "Table")}
+        project = codebuild.batch_get_projects(names=[f"{name}-project"])["projects"][0]
+        assert {t["key"]: t["value"] for t in project["tags"]} == {
+            "manual": "yes", "owner": "team-b", **_system_tags(stack, "Project")}
+        assert apigw_v1.get_usage_plan(usagePlanId=plan_id)["tags"] == {
+            "owner": "team-b", **_system_tags(stack, "Plan")}
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_stack_tags_update_reaches_a_nested_stack(cfn, s3, sqs):
+    """A stack-tag change on the parent reaches the resources of the nested
+    stack: the child's queue is updated against the tags it had before, and
+    the child's own Tags never carry the parent's aws: keys."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    templates_bucket = f"cfn-tags-upd-templates-{suffix}"
+    child_template = {
+        "Resources": {"Q": {"Type": "AWS::SQS::Queue"}},
+        "Outputs": {"QueueUrl": {"Value": {"Ref": "Q"}}},
+    }
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+    parent_template = json.dumps({
+        "Resources": {
+            "Nested": {
+                "Type": "AWS::CloudFormation::Stack",
+                "Properties": {"TemplateURL": f"{endpoint}/{templates_bucket}/child.json"},
+            },
+        },
+        "Outputs": {
+            "QueueUrl": {"Value": {"Fn::GetAtt": ["Nested", "Outputs.QueueUrl"]}},
+            "NestedId": {"Value": {"Ref": "Nested"}},
+        },
+    })
+    parent_name = f"cfn-tags-upd-parent-{suffix}"
+    s3.create_bucket(Bucket=templates_bucket)
+    try:
+        s3.put_object(Bucket=templates_bucket, Key="child.json",
+                      Body=json.dumps(child_template).encode())
+        cfn.create_stack(
+            StackName=parent_name, TemplateBody=parent_template,
+            Tags=[{"Key": "owner", "Value": "team-a"}],
+        )
+        stack = _wait_stack(cfn, parent_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        queue_url = _output(stack, "QueueUrl")
+        nested_id = _output(stack, "NestedId")
+
+        cfn.update_stack(
+            StackName=parent_name, UsePreviousTemplate=True,
+            Tags=[{"Key": "owner", "Value": "team-b"}, {"Key": "cost", "Value": "42"}],
+        )
+        stack = _wait_stack(cfn, parent_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "NestedId") == nested_id
+        nested = cfn.describe_stacks(StackName=nested_id)["Stacks"][0]
+        assert nested["Tags"] == [{"Key": "owner", "Value": "team-b"}, {"Key": "cost", "Value": "42"}]
+        assert sqs.list_queue_tags(QueueUrl=queue_url)["Tags"] == {
+            "owner": "team-b", "cost": "42", **_system_tags(nested, "Q")}
+    finally:
+        _delete_cfn_test_stack(cfn, parent_name)
+        s3.delete_object(Bucket=templates_bucket, Key="child.json")
+        s3.delete_bucket(Bucket=templates_bucket)
+
+
+def test_cfn_stack_tags_are_validated_and_an_empty_list_clears_them(cfn, sqs):
+    """More than 50 tags and an aws: prefixed key are refused before a stack
+    exists; Tags=[] on UpdateStack removes the stack's tags, from the stack
+    and from the queue, as the API documents for an empty value."""
+    name = f"cfn-tag-rules-{_uuid_mod.uuid4().hex[:8]}"
+    template = json.dumps({
+        "Resources": {"Q": {"Type": "AWS::SQS::Queue"}},
+        "Outputs": {"QueueUrl": {"Value": {"Ref": "Q"}}},
+    })
+    with pytest.raises(ClientError, match="maximum number of 50 tags"):
+        cfn.create_stack(
+            StackName=name, TemplateBody=template,
+            Tags=[{"Key": f"k{i}", "Value": "v"} for i in range(51)],
+        )
+    with pytest.raises(ClientError, match="aws:"):
+        cfn.create_stack(
+            StackName=name, TemplateBody=template,
+            Tags=[{"Key": "aws:cloudformation:stack-name", "Value": "spoof"}],
+        )
+    with pytest.raises(ClientError):
+        cfn.describe_stacks(StackName=name)
+
+    cfn.create_stack(
+        StackName=name, TemplateBody=template, Tags=[{"Key": "owner", "Value": "team-a"}],
+    )
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        queue_url = _output(stack, "QueueUrl")
+        with pytest.raises(ClientError, match="maximum number of 50 tags"):
+            cfn.update_stack(
+                StackName=name, UsePreviousTemplate=True,
+                Tags=[{"Key": f"k{i}", "Value": "v"} for i in range(51)],
+            )
+        with pytest.raises(ClientError, match="aws:"):
+            cfn.create_change_set(
+                StackName=name, ChangeSetName="spoof", UsePreviousTemplate=True,
+                Tags=[{"Key": "AWS:reserved", "Value": "spoof"}],
+            )
+
+        cfn.update_stack(StackName=name, UsePreviousTemplate=True, Tags=[])
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert stack.get("Tags", []) == []
+        assert sqs.list_queue_tags(QueueUrl=queue_url)["Tags"] == _system_tags(stack, "Q")
+        # The same empty list again is no update.
+        with pytest.raises(ClientError, match="No updates are to be performed"):
+            cfn.update_stack(StackName=name, UsePreviousTemplate=True, Tags=[])
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
 def test_cfn_aws_region_pseudo_param_uses_caller_region():
     """CFN's AWS::Region pseudo-param must resolve to the caller's request region,
     not MINISTACK_REGION (issue #398 — CDK bootstrap resources inheriting wrong region)."""
@@ -6509,10 +8513,11 @@ def test_cfn_s3_multi_region_access_point(cfn, s3):
     assert stack["StackStatus"] == "CREATE_COMPLETE"
 
     alias = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["Alias"]
-    # The alias S3 mints ends in ".mrap" (e.g. mfzwi23gnjvgw.mrap); templates
-    # build "<alias>.accesspoint.s3-global.amazonaws.com" from it.
+    # The alias S3 mints ends in ".mrap" (e.g. mfzwi23gnjvgw.mrap; documented
+    # pattern ^[a-z][a-z0-9]*[.]mrap$); templates build
+    # "<alias>.accesspoint.s3-global.amazonaws.com" from it.
     base, _, suffix = alias.rpartition(".")
-    assert suffix == "mrap" and len(base) == 13 and base.islower()
+    assert suffix == "mrap" and re.fullmatch(r"[a-z][a-z0-9]{12}", base)
 
     cfn.delete_stack(StackName="cfn-s3-mrap")
     _wait_stack(cfn, "cfn-s3-mrap")
@@ -6521,6 +8526,17 @@ def test_cfn_s3_multi_region_access_point(cfn, s3):
     with pytest.raises(urllib.error.HTTPError) as ei:
         _mrap_get(alias, "anything")
     assert ei.value.code in (403, 404)
+
+
+def test_s3_mrap_alias_matches_the_documented_pattern():
+    # In-process: the generator alone. A digit-only draw was possible before
+    # (uuid hex prefix), which is outside ^[a-z][a-z0-9]*[.]mrap$.
+    from ministack.services.s3 import new_mrap_alias
+
+    pattern = re.compile(r"^[a-z][a-z0-9]{12}\.mrap$")
+    for _ in range(200):
+        alias = new_mrap_alias()
+        assert pattern.fullmatch(alias), alias
 
 
 def test_cfn_auto_named_s3_bucket_stable_across_updates(cfn, s3):
@@ -7091,7 +9107,7 @@ def test_cfn_apigateway_domain_name_lifecycle(cfn, apigw_v1):
     regional = apigw_v1.get_domain_name(domainName=regional_name)
     assert regional["endpointConfiguration"] == {"types": ["REGIONAL"]}
     assert regional["regionalCertificateArn"] == regional_certificate_arn
-    assert regional["tags"] == {"created-by": "cloudformation"}
+    assert _template_tags(regional["tags"]) == {"created-by": "cloudformation"}
     edge = apigw_v1.get_domain_name(domainName=edge_name)
     assert edge["endpointConfiguration"] == {"types": ["EDGE"]}
     assert edge["certificateArn"] == edge_certificate_arn
@@ -8700,7 +10716,7 @@ def test_cfn_opensearch_domain_create_update_replace_and_idempotent_delete(
     assert status["SoftwareUpdateOptions"]["AutoSoftwareUpdateEnabled"] is True
     assert sentinel not in json.dumps(status, default=str)
     tags = opensearch.list_tags(ARN=expected_arn)["TagList"]
-    assert {t["Key"]: t["Value"] for t in tags} == {
+    assert _template_tags({t["Key"]: t["Value"] for t in tags}) == {
         "Environment": "test", "Changing": "old"
     }
     assert domain_name in {
@@ -8731,7 +10747,7 @@ def test_cfn_opensearch_domain_create_update_replace_and_idempotent_delete(
     assert status["AdvancedOptions"] == {}
     assert status["OffPeakWindowOptions"] == {"Enabled": False}
     tags = opensearch.list_tags(ARN=expected_arn)["TagList"]
-    assert {t["Key"]: t["Value"] for t in tags} == {
+    assert _template_tags({t["Key"]: t["Value"] for t in tags}) == {
         "Changing": "new", "Added": "yes"
     }
     progress = opensearch.describe_domain_change_progress(DomainName=domain_name)[
@@ -9352,7 +11368,7 @@ def test_cfn_kms_key_tags_rotation_and_enabled(cfn, kms_client):
     assert rotation["RotationPeriodInDays"] == 180
 
     tags = kms_client.list_resource_tags(KeyId=arn)["Tags"]
-    assert tags == [{"TagKey": "env", "TagValue": "test"}]
+    assert _template_tags(tags) == [{"TagKey": "env", "TagValue": "test"}]
 
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
@@ -10181,6 +12197,12 @@ def test_cfn_stack_delete_failure_lands_delete_failed(cfn, lam, sns):
         retained = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
         assert [r["LogicalResourceId"] for r in retained] == ["CR"]
         assert retained[0]["ResourceStatus"] == "DELETE_FAILED"
+        assert fn in retained[0]["ResourceStatusReason"]
+        detail = cfn.describe_stack_resource(
+            StackName=stack_name, LogicalResourceId="CR")["StackResourceDetail"]
+        assert detail["ResourceStatus"] == "DELETE_FAILED"
+        assert fn in detail["ResourceStatusReason"]
+        assert detail["LastUpdatedTimestamp"]
 
         # And the failure is visible as a stack-level event.
         events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
@@ -10246,7 +12268,8 @@ def test_cfn_stack_delete_failed_keeps_exports(cfn, lam):
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "DELETE_FAILED"
 
-        exports = {e["Name"]: e["Value"] for e in cfn.list_exports()["Exports"]}
+        exports = {e["Name"]: e["Value"]
+                   for e in _all_pages(cfn, "list_exports", "Exports")}
         assert exports.get(export_name) == "still-here"
 
         # The completed retry removes the export with the stack.
@@ -10254,8 +12277,155 @@ def test_cfn_stack_delete_failed_keeps_exports(cfn, lam):
         cfn.delete_stack(StackName=stack_name)
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "DELETE_COMPLETE"
-        exports = {e["Name"] for e in cfn.list_exports()["Exports"]}
+        exports = {e["Name"] for e in _all_pages(cfn, "list_exports", "Exports")}
         assert export_name not in exports
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
+
+
+def _stack_with_a_failed_cleanup_delete(cfn, lam, fn, stack_name, queue_name):
+    """Create a stack (queue, SSM marker, custom resource whose handler
+    refuses the Delete), then drop the custom resource from the template.
+    Returns the template without it; ``Rev`` changes the marker's value."""
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role=_CR_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_DELETE_FAILS)},
+    )
+    resources = {
+        "Queue": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": queue_name}},
+        "Marker": {
+            "Type": "AWS::SSM::Parameter",
+            "Properties": {"Name": f"/{stack_name}/rev", "Type": "String",
+                           "Value": {"Ref": "Rev"}},
+        },
+    }
+    cr = {
+        "Type": "Custom::Tester",
+        "Properties": {
+            "ServiceToken": f"arn:aws:lambda:us-east-1:000000000000:function:{fn}",
+        },
+    }
+    without_cr = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Parameters": {"Rev": {"Type": "String", "Default": "1"}},
+        "Resources": resources,
+    }
+    with_cr = json.loads(json.dumps(without_cr))
+    with_cr["Resources"]["CR"] = cr
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(with_cr))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(without_cr))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    return without_cr
+
+
+def _swap_cr_handler(lam, fn, code):
+    lam.delete_function(FunctionName=fn)
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role=_CR_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(code)},
+    )
+
+
+def test_cfn_update_cleanup_delete_failure_keeps_the_resource_visible(cfn, lam, ssm):
+    """A resource dropped from the template whose delete fails during the
+    cleanup phase stays in the stack as DELETE_FAILED with its reason: the
+    update still ends UPDATE_COMPLETE (the new template is in effect), and the
+    next update with a changed template retries the delete, which removes the
+    resource once the delete works."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cr-cleanup-fail-{suffix}"
+    stack_name = f"cfn-cleanup-failed-{suffix}"
+    queue_name = f"cfn-cleanup-failed-q-{suffix}"
+    try:
+        without_cr = _stack_with_a_failed_cleanup_delete(cfn, lam, fn, stack_name, queue_name)
+
+        # The failed cleanup is an event and a visible resource, not a log line.
+        events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+        assert any(e["LogicalResourceId"] == "CR" and e["ResourceStatus"] == "DELETE_FAILED"
+                   for e in events)
+        by_id = {r["LogicalResourceId"]: r
+                 for r in cfn.describe_stack_resources(StackName=stack_name)["StackResources"]}
+        assert set(by_id) == {"Queue", "Marker", "CR"}
+        assert by_id["CR"]["ResourceStatus"] == "DELETE_FAILED"
+        assert "delete refused for testing" in by_id["CR"]["ResourceStatusReason"]
+        assert by_id["Queue"]["ResourceStatus"] == "UPDATE_COMPLETE"
+        assert "ResourceStatusReason" not in by_id["Queue"]
+        detail = cfn.describe_stack_resource(
+            StackName=stack_name, LogicalResourceId="CR")["StackResourceDetail"]
+        assert detail["ResourceStatus"] == "DELETE_FAILED"
+        assert "delete refused for testing" in detail["ResourceStatusReason"]
+        assert detail["LastUpdatedTimestamp"]
+        # The new template is what the stack runs.
+        assert "CR" not in cfn.get_template(StackName=stack_name)["TemplateBody"]["Resources"]
+
+        # A changed template retries the delete; still refused, the resource
+        # stays DELETE_FAILED and the update itself succeeds.
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(without_cr),
+                         Parameters=[{"ParameterKey": "Rev", "ParameterValue": "2"}])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert ssm.get_parameter(Name=f"/{stack_name}/rev")["Parameter"]["Value"] == "2"
+        by_id = {r["LogicalResourceId"]: r
+                 for r in cfn.describe_stack_resources(StackName=stack_name)["StackResources"]}
+        assert by_id["CR"]["ResourceStatus"] == "DELETE_FAILED"
+        assert "delete refused for testing" in by_id["CR"]["ResourceStatusReason"]
+
+        # With a handler that accepts the delete, the next update removes it.
+        _swap_cr_handler(lam, fn, _CR_HANDLER_SUCCESS)
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(without_cr),
+                         Parameters=[{"ParameterKey": "Rev", "ParameterValue": "3"}])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        listed = {r["LogicalResourceId"]
+                  for r in cfn.describe_stack_resources(StackName=stack_name)["StackResources"]}
+        assert listed == {"Queue", "Marker"}
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
+
+
+def test_cfn_delete_stack_retries_a_failed_cleanup_delete(cfn, lam, sqs):
+    """DeleteStack reaches a resource the template no longer declares: the
+    retry is refused again, the stack lands DELETE_FAILED naming it while the
+    declared resources are gone, and a delete that works completes the stack."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cr-cleanup-del-{suffix}"
+    stack_name = f"cfn-cleanup-delete-{suffix}"
+    queue_name = f"cfn-cleanup-delete-q-{suffix}"
+    try:
+        _stack_with_a_failed_cleanup_delete(cfn, lam, fn, stack_name, queue_name)
+
+        cfn.delete_stack(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "DELETE_FAILED"
+        assert "CR" in stack.get("StackStatusReason", "")
+        remaining = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+        assert [r["LogicalResourceId"] for r in remaining] == ["CR"]
+        assert "delete refused for testing" in remaining[0]["ResourceStatusReason"]
+        with pytest.raises(ClientError):
+            sqs.get_queue_url(QueueName=queue_name)
+
+        _swap_cr_handler(lam, fn, _CR_HANDLER_SUCCESS)
+        cfn.delete_stack(StackName=stack_name)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "DELETE_COMPLETE"
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
         try:
@@ -10382,6 +12552,179 @@ def test_cfn_update_rollback_delete_failure_lands_update_rollback_failed(cfn, la
             )
         except ClientError:
             pass
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
+
+
+_CR_HANDLER_SLOW = """\
+import json, time, urllib.request
+
+def handler(event, context):
+    if event["RequestType"] == "Create":
+        time.sleep(2)
+    payload = json.dumps({
+        "Status": "SUCCESS",
+        "RequestId": event["RequestId"],
+        "StackId": event["StackId"],
+        "LogicalResourceId": event["LogicalResourceId"],
+        "PhysicalResourceId": event.get("PhysicalResourceId") or "slow-custom-resource",
+        "Data": {},
+    }).encode()
+    req = urllib.request.Request(
+        event["ResponseURL"], data=payload, method="PUT",
+        headers={"content-type": "", "content-length": str(len(payload))},
+    )
+    urllib.request.urlopen(req, timeout=10)
+"""
+
+
+def test_cfn_continue_update_rollback_recovers_the_stack(cfn, lam):
+    """A stack in UPDATE_ROLLBACK_FAILED is not updatable; ContinueUpdateRollback
+    retries the failed deletes (and fails again while the resource still cannot
+    be deleted), an unknown ResourcesToSkip entry is refused, and once the
+    delete works the retry lands UPDATE_ROLLBACK_COMPLETE and the stack is
+    updatable again. Any other status is refused."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cr-cur-{suffix}"
+    stack_name = f"cfn-continue-rollback-{suffix}"
+    lam.create_function(
+        FunctionName=fn, Runtime="python3.12", Role=_CR_LAMBDA_ROLE, Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_DELETE_FAILS)},
+    )
+    base = {"Resources": {"Topic": {"Type": "AWS::SNS::Topic",
+                                    "Properties": {"TopicName": f"cfn-cur-{suffix}"}}}}
+    updated = json.loads(json.dumps(base))
+    updated["Resources"]["CR"] = {"Type": "Custom::Tester", "Properties": {
+        "ServiceToken": f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"}}
+    updated["Resources"]["Bad"] = {**_FAILING_RESOURCE, "DependsOn": "CR"}
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(base))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        with pytest.raises(ClientError) as exc:
+            cfn.continue_update_rollback(StackName=stack_name)
+        assert "cannot be called from current stack status" in (
+            exc.value.response["Error"]["Message"])
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(updated))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_FAILED", stack.get("StackStatusReason")
+
+        cfn.continue_update_rollback(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_FAILED", stack.get("StackStatusReason")
+
+        with pytest.raises(ClientError) as exc:
+            cfn.continue_update_rollback(StackName=stack_name, ResourcesToSkip=["Topic"])
+        assert "Topic" in exc.value.response["Error"]["Message"]
+
+        # Once the resource can be deleted, the retry completes the rollback
+        # without skipping anything.
+        lam.update_function_code(FunctionName=fn, ZipFile=_cr_make_zip(_CR_HANDLER_SUCCESS))
+        cfn.continue_update_rollback(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+        assert any(e["LogicalResourceId"] == "CR" and e["ResourceStatus"] == "DELETE_COMPLETE"
+                   for e in events)
+
+        again = json.loads(json.dumps(base))
+        again["Resources"]["Topic"]["Properties"]["DisplayName"] = "after"
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(again))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    finally:
+        try:
+            lam.update_function_code(FunctionName=fn, ZipFile=_cr_make_zip(_CR_HANDLER_SUCCESS))
+        except ClientError:
+            pass
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
+
+
+def test_cfn_continue_update_rollback_skips_the_named_resource(cfn, lam):
+    """ResourcesToSkip leaves the resource in place (an UPDATE_COMPLETE event)
+    and the stack still reaches UPDATE_ROLLBACK_COMPLETE."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cr-cur-skip-{suffix}"
+    stack_name = f"cfn-continue-skip-{suffix}"
+    lam.create_function(
+        FunctionName=fn, Runtime="python3.12", Role=_CR_LAMBDA_ROLE, Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_DELETE_FAILS)},
+    )
+    base = {"Resources": {"Topic": {"Type": "AWS::SNS::Topic",
+                                    "Properties": {"TopicName": f"cfn-cur-skip-{suffix}"}}}}
+    updated = json.loads(json.dumps(base))
+    updated["Resources"]["CR"] = {"Type": "Custom::Tester", "Properties": {
+        "ServiceToken": f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"}}
+    updated["Resources"]["Bad"] = {**_FAILING_RESOURCE, "DependsOn": "CR"}
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(base))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(updated))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_ROLLBACK_FAILED"
+
+        cfn.continue_update_rollback(StackName=stack_name, ResourcesToSkip=["CR"])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+        assert any(e["LogicalResourceId"] == "CR" and e["ResourceStatus"] == "UPDATE_COMPLETE"
+                   for e in events)
+    finally:
+        try:
+            lam.update_function_code(FunctionName=fn, ZipFile=_cr_make_zip(_CR_HANDLER_SUCCESS))
+        except ClientError:
+            pass
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
+
+
+def test_cfn_cancel_update_stack_rolls_the_update_back(cfn, lam):
+    """CancelUpdateStack on an UPDATE_IN_PROGRESS stack stops before the next
+    resource and rolls back to the previous state ("User Initiated"); on any
+    other status it is refused."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cr-cancel-{suffix}"
+    stack_name = f"cfn-cancel-{suffix}"
+    lam.create_function(
+        FunctionName=fn, Runtime="python3.12", Role=_CR_LAMBDA_ROLE, Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_SLOW)}, Timeout=30,
+    )
+    base = {"Resources": {"Topic": {"Type": "AWS::SNS::Topic",
+                                    "Properties": {"TopicName": f"cfn-cancel-{suffix}"}}}}
+    updated = json.loads(json.dumps(base))
+    updated["Resources"]["Slow"] = {"Type": "Custom::Tester", "Properties": {
+        "ServiceToken": f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"}}
+    updated["Resources"]["Later"] = {"Type": "AWS::SNS::Topic", "DependsOn": "Slow",
+                                     "Properties": {"TopicName": f"cfn-cancel-later-{suffix}"}}
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(base))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        with pytest.raises(ClientError) as exc:
+            cfn.cancel_update_stack(StackName=stack_name)
+        assert exc.value.response["Error"]["Message"] == (
+            "CancelUpdateStack cannot be called from current stack status")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(updated))
+        assert cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["StackStatus"] == (
+            "UPDATE_IN_PROGRESS")
+        cfn.cancel_update_stack(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name, timeout=60)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert [r["LogicalResourceId"] for r in
+                cfn.describe_stack_resources(StackName=stack_name)["StackResources"]] == ["Topic"]
+        assert "User Initiated" in _stack_event_reasons(cfn, stack_name)
+    finally:
         _delete_cfn_test_stack(cfn, stack_name)
         try:
             lam.delete_function(FunctionName=fn)
@@ -11291,7 +13634,7 @@ def test_cfn_unrecognized_resource_type_rejected_up_front(cfn, sqs):
     with pytest.raises(ClientError) as exc:
         cfn.describe_stacks(StackName=name)
     assert "does not exist" in str(exc.value)
-    assert not [s for s in cfn.list_stacks()["StackSummaries"]
+    assert not [s for s in _all_pages(cfn, "list_stacks", "StackSummaries")
                 if s["StackName"] == name]
     # The valid sibling was never provisioned.
     assert not [u for u in sqs.list_queues().get("QueueUrls", [])
@@ -11338,6 +13681,32 @@ def test_cfn_unrecognized_type_behind_false_condition_is_fine(cfn):
         _wait_stack(cfn, name)
 
 
+def test_cfn_unknown_cloudformation_type_is_rejected_like_any_other(cfn):
+    """An unregistered AWS::CloudFormation::* type (a Macro, a typo) is
+    'Unrecognized resource types', not a silent no-op placeholder; the
+    registered ones (WaitConditionHandle) still deploy."""
+    name = "cfn-preflight-cfn-types"
+    bad = json.dumps({"Resources": {
+        "Handle": {"Type": "AWS::CloudFormation::WaitConditionHandle"},
+        "Typo": {"Type": "AWS::CloudFormation::DoesNotExist", "Properties": {}},
+    }})
+    with pytest.raises(ClientError) as exc:
+        cfn.create_stack(StackName=name, TemplateBody=bad)
+    assert exc.value.response["Error"]["Message"] == (
+        "Template format error: Unrecognized resource types: "
+        "[AWS::CloudFormation::DoesNotExist]")
+    with pytest.raises(ClientError):
+        cfn.describe_stacks(StackName=name)
+
+    good = json.dumps({"Resources": {
+        "Handle": {"Type": "AWS::CloudFormation::WaitConditionHandle"}}})
+    cfn.create_stack(StackName=name, TemplateBody=good)
+    try:
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
 def test_cfn_validate_template_accepts_a_sam_template(cfn):
     """A template that declares a Transform is exempt from the unrecognized
     type check: a macro can rewrite any resource, so real CloudFormation does
@@ -11372,9 +13741,9 @@ def test_cfn_getatt_unknown_attribute_fails_the_stack(cfn, sqs):
                    "for AWS::SQS::Queue" in r for r in reasons), reasons
         with pytest.raises(ClientError):
             sqs.get_queue_url(QueueName="cfn-preflight-getatt-q")
-        assert not cfn.list_exports()["Exports"] or all(
+        assert all(
             e["ExportingStackId"] != cfn.describe_stacks(StackName=name)["Stacks"][0]["StackId"]
-            for e in cfn.list_exports()["Exports"])
+            for e in _all_pages(cfn, "list_exports", "Exports"))
     finally:
         cfn.delete_stack(StackName=name)
         _wait_stack(cfn, name)
@@ -11403,20 +13772,23 @@ def test_cfn_getatt_unknown_attribute_in_properties_fails_the_resource(cfn, sqs)
         _wait_stack(cfn, name)
 
 
-def test_cfn_dynamic_reference_rejected(cfn):
-    """{{resolve:...}} is not resolved by the emulator; refusing it up front
-    beats handing the literal string to the service."""
+def test_cfn_dynamic_reference_to_an_unsupported_service_is_rejected(cfn):
+    """{{resolve:ssm}}, {{resolve:ssm-secure}} and {{resolve:secretsmanager}}
+    resolve at provisioning time; a reference to any other service is refused
+    up front, before a stack record exists."""
     tpl = json.dumps({"Resources": {"P": {
         "Type": "AWS::SSM::Parameter",
         "Properties": {"Type": "String", "Name": "/cfn-preflight/dyn",
-                       "Value": "{{resolve:secretsmanager:my-secret:SecretString:key}}"}}}})
+                       "Value": "{{resolve:vault:my-secret:key}}"}}}})
     with pytest.raises(ClientError) as exc:
         cfn.create_stack(StackName="cfn-preflight-dyn", TemplateBody=tpl)
     msg = exc.value.response["Error"]["Message"]
-    assert msg.startswith("Template format error: dynamic references are not supported")
-    assert "{{resolve:secretsmanager:my-secret:SecretString:key}}" in msg
+    assert msg.startswith("Template format error: unsupported dynamic reference")
+    assert "{{resolve:vault:my-secret:key}}" in msg
     with pytest.raises(ClientError):
         cfn.describe_stacks(StackName="cfn-preflight-dyn")
+
+
 def test_cfn_events_rule_arn_matches_the_service(cfn, eb):
     """GetAtt Arn on a rule is the ARN the EventBridge service reports for
     it: no bus segment on the default bus, rule/<bus>/<name> on a custom
@@ -12226,14 +14598,20 @@ def test_cfn_cognito_user_pool_property_changes_in_place(cfn, cognito_idp, prop,
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
         pool_id = _output(stack, "PoolId")
-        assert cognito_idp.describe_user_pool(UserPoolId=pool_id)["UserPool"][prop] == before
+        observed = cognito_idp.describe_user_pool(UserPoolId=pool_id)["UserPool"][prop]
+        if prop == "UserPoolTags":
+            observed = _template_tags(observed)
+        assert observed == before
         cognito_idp.admin_create_user(UserPoolId=pool_id, Username="alice")
 
         cfn.update_stack(StackName=stack_name, TemplateBody=template(after))
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
         assert _output(stack, "PoolId") == pool_id
-        assert cognito_idp.describe_user_pool(UserPoolId=pool_id)["UserPool"][prop] == after
+        observed = cognito_idp.describe_user_pool(UserPoolId=pool_id)["UserPool"][prop]
+        if prop == "UserPoolTags":
+            observed = _template_tags(observed)
+        assert observed == after
         users = cognito_idp.list_users(UserPoolId=pool_id)["Users"]
         assert [u["Username"] for u in users] == ["alice"]
     finally:
@@ -12371,7 +14749,7 @@ def test_cfn_secret_update_publishes_a_new_version(cfn, sm):
         assert previous["VersionId"] == first["VersionId"]
         described = sm.describe_secret(SecretId=secret_name)
         assert described["Description"] == "second"
-        assert described["Tags"] == [{"Key": "stage", "Value": "second"}]
+        assert _template_tags(described["Tags"]) == [{"Key": "stage", "Value": "second"}]
         assert set(described["VersionIdsToStages"]) == {first["VersionId"], current["VersionId"]}
 
         _delete_cfn_test_stack(cfn, stack_name)
@@ -12770,14 +15148,14 @@ def test_cfn_events_rule_tags_apply_on_create_and_update(cfn, eb):
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
         arn = _output(stack, "RuleArn")
-        assert tags_of(arn) == {"env": "dev", "team": "a"}
+        assert _template_tags(tags_of(arn)) == {"env": "dev", "team": "a"}
         eb.tag_resource(ResourceARN=arn, Tags=[{"Key": "foreign", "Value": "kept"}])
 
         cfn.update_stack(StackName=stack_name, TemplateBody=template({"env": "prod", "owner": "b"}))
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
         assert _output(stack, "RuleArn") == arn
-        assert tags_of(arn) == {"env": "prod", "owner": "b", "foreign": "kept"}
+        assert _template_tags(tags_of(arn)) == {"env": "prod", "owner": "b", "foreign": "kept"}
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
     with pytest.raises(ClientError):
@@ -13245,13 +15623,13 @@ def test_cfn_state_machine_update_changes_tags_in_place(cfn, sfn):
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
         arn = _output(stack, "Arn")
-        assert tags_of(arn) == {"env": "dev", "team": "iot"}
+        assert _template_tags(tags_of(arn)) == {"env": "dev", "team": "iot"}
 
         cfn.update_stack(StackName=stack_name, TemplateBody=template({"env": "prod", "owner": "ops"}))
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
         assert _output(stack, "Arn") == arn
-        assert tags_of(arn) == {"env": "prod", "owner": "ops"}
+        assert _template_tags(tags_of(arn)) == {"env": "prod", "owner": "ops"}
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
 
@@ -13451,12 +15829,12 @@ def test_cfn_cloudwatch_alarm_tags_apply_on_create_and_update(cfn, cw):
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
         arn = _output(stack, "Arn")
-        assert tags_of(arn) == {"env": "dev", "team": "a"}
+        assert _template_tags(tags_of(arn)) == {"env": "dev", "team": "a"}
 
         cfn.update_stack(StackName=stack_name, TemplateBody=template({"env": "prod"}))
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
-        assert tags_of(arn) == {"env": "prod"}
+        assert _template_tags(tags_of(arn)) == {"env": "prod"}
 
         _delete_cfn_test_stack(cfn, stack_name)
         with pytest.raises(ClientError) as exc:
@@ -14306,6 +16684,278 @@ def test_cfn_update_rollback_deletes_the_replacement_and_restores_the_old_record
         assert table["AttributeDefinitions"] == [{"AttributeName": "pk", "AttributeType": "S"}]
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
+def _queue_exists(sqs, name):
+    try:
+        sqs.get_queue_url(QueueName=name)
+        return True
+    except ClientError as exc:
+        assert "NonExistentQueue" in exc.response["Error"]["Code"], exc.response["Error"]
+        return False
+
+
+def _delete_queue_if_present(sqs, name):
+    try:
+        sqs.delete_queue(QueueUrl=sqs.get_queue_url(QueueName=name)["QueueUrl"])
+    except ClientError:
+        pass
+
+
+def _resource_events(cfn, stack_name, logical_id):
+    return [(e["ResourceStatus"], e.get("PhysicalResourceId", ""))
+            for e in cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+            if e["LogicalResourceId"] == logical_id]
+
+
+def test_cfn_deletion_policy_retain_survives_the_stack_delete(cfn, sqs):
+    """DeletionPolicy Retain keeps the resource when the stack is deleted: the
+    queue survives with a DELETE_SKIPPED event, its sibling is deleted, the
+    stack still reaches DELETE_COMPLETE."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-retain-del-{uid}"
+    keep, gone = f"cfn-retain-keep-{uid}", f"cfn-retain-gone-{uid}"
+    template = json.dumps({"Resources": {
+        "Keep": {"Type": "AWS::SQS::Queue", "DeletionPolicy": "Retain",
+                 "Properties": {"QueueName": keep}},
+        "Gone": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": gone}},
+    }})
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        stack_id = stack["StackId"]
+
+        cfn.delete_stack(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "DELETE_COMPLETE"
+        assert _queue_exists(sqs, keep)
+        assert not _queue_exists(sqs, gone)
+        events = _resource_events(cfn, stack_id, "Keep")
+        assert ("DELETE_SKIPPED", sqs.get_queue_url(QueueName=keep)["QueueUrl"]) in events
+        assert "DELETE_IN_PROGRESS" not in [status for status, _ in events]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        _delete_queue_if_present(sqs, keep)
+        _delete_queue_if_present(sqs, gone)
+
+
+def test_cfn_update_replace_policy_retain_keeps_the_predecessor(cfn, sqs):
+    """A replacement under UpdateReplacePolicy Retain leaves the old physical
+    resource in place (DELETE_SKIPPED); without the policy the predecessor is
+    deleted in the cleanup phase."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-retain-repl-{uid}"
+    names = [f"cfn-retain-repl-{uid}-{i}" for i in ("a", "b", "c")]
+
+    def template(name, policy):
+        queue = {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": name}}
+        if policy:
+            queue["UpdateReplacePolicy"] = policy
+        return json.dumps({"Resources": {"Queue": queue}})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(names[0], "Retain"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(names[1], "Retain"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _queue_exists(sqs, names[0])
+        assert _queue_exists(sqs, names[1])
+        assert "DELETE_SKIPPED" in [s for s, _ in _resource_events(cfn, stack_name, "Queue")]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(names[2], None))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert not _queue_exists(sqs, names[1])
+        assert _queue_exists(sqs, names[2])
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for name in names:
+            _delete_queue_if_present(sqs, name)
+
+
+def test_cfn_deletion_policy_retain_on_a_removed_resource(cfn, sqs):
+    """A resource dropped from the template on update keeps existing when its
+    (previous) DeletionPolicy was Retain; it leaves the stack's scope."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-retain-rm-{uid}"
+    keep, other = f"cfn-retain-rm-keep-{uid}", f"cfn-retain-rm-other-{uid}"
+    with_keep = json.dumps({"Resources": {
+        "Keep": {"Type": "AWS::SQS::Queue", "DeletionPolicy": "Retain",
+                 "Properties": {"QueueName": keep}},
+        "Other": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": other}},
+    }})
+    without = json.dumps({"Resources": {
+        "Other": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": other}},
+    }})
+    cfn.create_stack(StackName=stack_name, TemplateBody=with_keep)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        cfn.update_stack(StackName=stack_name, TemplateBody=without)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _queue_exists(sqs, keep)
+        assert [r["LogicalResourceId"] for r in
+                cfn.describe_stack_resources(StackName=stack_name)["StackResources"]] == ["Other"]
+        assert "DELETE_SKIPPED" in [s for s, _ in _resource_events(cfn, stack_name, "Keep")]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        _delete_queue_if_present(sqs, keep)
+
+
+def test_cfn_retain_except_on_create_is_deleted_by_the_create_rollback(cfn, sqs):
+    """Retain survives the rollback of the operation that created the resource;
+    RetainExceptOnCreate does not, and neither does Retain when the request
+    carries RetainExceptOnCreate=true."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    retained, except_on_create, flagged = (
+        f"cfn-reoc-retain-{uid}", f"cfn-reoc-except-{uid}", f"cfn-reoc-flag-{uid}")
+
+    def template(name, policy):
+        return json.dumps({"Resources": {
+            "Queue": {"Type": "AWS::SQS::Queue", "DeletionPolicy": policy,
+                      "Properties": {"QueueName": name}},
+            "Bad": {**_FAILING_RESOURCE, "DependsOn": "Queue"},
+        }})
+
+    stacks = [f"cfn-reoc-a-{uid}", f"cfn-reoc-b-{uid}", f"cfn-reoc-c-{uid}"]
+    try:
+        cfn.create_stack(StackName=stacks[0], TemplateBody=template(retained, "Retain"))
+        cfn.create_stack(StackName=stacks[1],
+                         TemplateBody=template(except_on_create, "RetainExceptOnCreate"))
+        cfn.create_stack(StackName=stacks[2], TemplateBody=template(flagged, "Retain"),
+                         RetainExceptOnCreate=True)
+        for name in stacks:
+            stack = _wait_stack(cfn, name)
+            assert stack["StackStatus"] == "ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert _queue_exists(sqs, retained)
+        assert "DELETE_SKIPPED" in [s for s, _ in _resource_events(cfn, stacks[0], "Queue")]
+        assert not _queue_exists(sqs, except_on_create)
+        assert not _queue_exists(sqs, flagged)
+    finally:
+        for name in stacks:
+            _delete_cfn_test_stack(cfn, name)
+        for name in (retained, except_on_create, flagged):
+            _delete_queue_if_present(sqs, name)
+
+
+def test_cfn_retain_except_on_create_on_an_update_rollback(cfn, sqs):
+    """A resource that an update adds is "created" by that update: on the
+    update's rollback RetainExceptOnCreate deletes it, Retain keeps it."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-reoc-upd-{uid}"
+    base_name, kept, dropped = (f"cfn-reoc-upd-{uid}", f"cfn-reoc-upd-keep-{uid}",
+                                f"cfn-reoc-upd-drop-{uid}")
+    base = {"Resources": {"Base": {"Type": "AWS::SQS::Queue",
+                                   "Properties": {"QueueName": base_name}}}}
+    updated = json.loads(json.dumps(base))
+    updated["Resources"]["Kept"] = {"Type": "AWS::SQS::Queue", "DeletionPolicy": "Retain",
+                                    "Properties": {"QueueName": kept}}
+    updated["Resources"]["Dropped"] = {"Type": "AWS::SQS::Queue",
+                                       "DeletionPolicy": "RetainExceptOnCreate",
+                                       "Properties": {"QueueName": dropped}}
+    updated["Resources"]["Bad"] = {**_FAILING_RESOURCE, "DependsOn": ["Kept", "Dropped"]}
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(base))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(updated))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert _queue_exists(sqs, base_name)
+        assert _queue_exists(sqs, kept)
+        assert not _queue_exists(sqs, dropped)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for name in (base_name, kept, dropped):
+            _delete_queue_if_present(sqs, name)
+
+
+def test_cfn_deletion_policy_from_an_intrinsic(cfn, sqs):
+    """A DeletionPolicy given as Fn::If resolves against the stack's
+    conditions before it is applied."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    template = json.dumps({
+        "Parameters": {"Keep": {"Type": "String", "Default": "no"}},
+        "Conditions": {"KeepIt": {"Fn::Equals": [{"Ref": "Keep"}, "yes"]}},
+        "Resources": {"Queue": {
+            "Type": "AWS::SQS::Queue",
+            "DeletionPolicy": {"Fn::If": ["KeepIt", "Retain", "Delete"]},
+            "Properties": {"QueueName": {"Ref": "AWS::StackName"}}}},
+    })
+    stacks = {f"cfn-policy-if-keep-{uid}": "yes", f"cfn-policy-if-drop-{uid}": "no"}
+    try:
+        for name, keep in stacks.items():
+            cfn.create_stack(StackName=name, TemplateBody=template,
+                             Parameters=[{"ParameterKey": "Keep", "ParameterValue": keep}])
+        for name in stacks:
+            assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+            cfn.delete_stack(StackName=name)
+            assert _wait_stack(cfn, name)["StackStatus"] == "DELETE_COMPLETE"
+        assert _queue_exists(sqs, f"cfn-policy-if-keep-{uid}")
+        assert not _queue_exists(sqs, f"cfn-policy-if-drop-{uid}")
+    finally:
+        for name in stacks:
+            _delete_cfn_test_stack(cfn, name)
+            _delete_queue_if_present(sqs, name)
+
+
+def test_cfn_delete_stack_retain_resources_only_for_delete_failed(cfn, sqs, lam):
+    """RetainResources is refused on a healthy stack; on a DELETE_FAILED stack
+    it skips the named resource and the stack reaches DELETE_COMPLETE."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cr-retain-res-{suffix}"
+    stack_name = f"cfn-retain-resources-{suffix}"
+    queue = f"cfn-retain-resources-{suffix}"
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role=_CR_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _cr_make_zip(_CR_HANDLER_DELETE_FAILS)},
+    )
+    template = json.dumps({"Resources": {
+        "Queue": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": queue}},
+        "CR": {"Type": "Custom::Tester", "Properties": {
+            "ServiceToken": f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"}},
+    }})
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        with pytest.raises(ClientError) as exc:
+            cfn.delete_stack(StackName=stack_name, RetainResources=["CR"])
+        assert exc.value.response["Error"]["Code"] == "ValidationError"
+        assert "DELETE_FAILED" in exc.value.response["Error"]["Message"]
+
+        cfn.delete_stack(StackName=stack_name)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "DELETE_FAILED", stack.get("StackStatusReason")
+        assert not _queue_exists(sqs, queue)
+
+        with pytest.raises(ClientError) as exc:
+            cfn.delete_stack(StackName=stack_name, RetainResources=["Nope"])
+        assert "Nope" in exc.value.response["Error"]["Message"]
+
+        cfn.delete_stack(StackName=stack_name, RetainResources=["CR"])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "DELETE_COMPLETE", stack.get("StackStatusReason")
+    finally:
+        try:
+            lam.update_function_code(FunctionName=fn, ZipFile=_cr_make_zip(_CR_HANDLER_SUCCESS))
+        except ClientError:
+            pass
+        _delete_cfn_test_stack(cfn, stack_name)
+        _delete_queue_if_present(sqs, queue)
+        try:
+            lam.delete_function(FunctionName=fn)
+        except ClientError:
+            pass
+
+
 def test_cfn_delete_change_set_existing_succeeds(cfn):
     """DeleteChangeSet of an existing change set succeeds -- by stack name and
     by stack ID -- and the response parses (boto3 needs the
