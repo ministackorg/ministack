@@ -339,6 +339,15 @@ def _describe_stack_events(params):
 
 # --- DescribeStackResource ---
 
+def _resource_status_reason_xml(res):
+    """The ``ResourceStatusReason`` element of a stack resource, empty when
+    the record carries none (a healthy resource has no reason on AWS)."""
+    reason = res.get("ResourceStatusReason")
+    if not reason:
+        return ""
+    return f"<ResourceStatusReason>{_esc(reason)}</ResourceStatusReason>"
+
+
 def _describe_stack_resource(params):
     from ministack.services.cloudformation import _stacks
     stack_name = _p(params, "StackName")
@@ -361,7 +370,8 @@ def _describe_stack_resource(params):
         f"<PhysicalResourceId>{_esc(res.get('PhysicalResourceId', ''))}</PhysicalResourceId>"
         f"<ResourceType>{_esc(res.get('ResourceType', ''))}</ResourceType>"
         f"<ResourceStatus>{res.get('ResourceStatus', '')}</ResourceStatus>"
-        f"<Timestamp>{res.get('Timestamp', '')}</Timestamp>"
+        f"{_resource_status_reason_xml(res)}"
+        f"<LastUpdatedTimestamp>{res.get('Timestamp', '')}</LastUpdatedTimestamp>"
         f"<StackName>{_esc(stack_name)}</StackName>"
         f"<StackId>{_esc(stack['StackId'])}</StackId>"
     )
@@ -403,6 +413,7 @@ def _describe_stack_resources(params):
             f"<PhysicalResourceId>{_esc(res.get('PhysicalResourceId', ''))}</PhysicalResourceId>"
             f"<ResourceType>{_esc(res.get('ResourceType', ''))}</ResourceType>"
             f"<ResourceStatus>{res.get('ResourceStatus', '')}</ResourceStatus>"
+            f"{_resource_status_reason_xml(res)}"
             f"<Timestamp>{res.get('Timestamp', '')}</Timestamp>"
             f"<StackName>{_esc(stack_name)}</StackName>"
             f"<StackId>{_esc(stack['StackId'])}</StackId>"

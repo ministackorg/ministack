@@ -10695,6 +10695,12 @@ def test_cfn_stack_delete_failure_lands_delete_failed(cfn, lam, sns):
         retained = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
         assert [r["LogicalResourceId"] for r in retained] == ["CR"]
         assert retained[0]["ResourceStatus"] == "DELETE_FAILED"
+        assert fn in retained[0]["ResourceStatusReason"]
+        detail = cfn.describe_stack_resource(
+            StackName=stack_name, LogicalResourceId="CR")["StackResourceDetail"]
+        assert detail["ResourceStatus"] == "DELETE_FAILED"
+        assert fn in detail["ResourceStatusReason"]
+        assert detail["LastUpdatedTimestamp"]
 
         # And the failure is visible as a stack-level event.
         events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
