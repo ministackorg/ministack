@@ -2499,6 +2499,473 @@ def test_cfn_get_template_summary(cfn):
     result = cfn.get_template_summary(TemplateBody=json.dumps(transform_tpl))
     assert "CAPABILITY_AUTO_EXPAND" in result["Capabilities"]
 
+
+# --- Capabilities are enforced under AUTH=true (in-process, no server) ---
+#
+# API_CreateStack / API_UpdateStack / API_CreateChangeSet, "Capabilities":
+# IAM resources need CAPABILITY_IAM or CAPABILITY_NAMED_IAM, custom-named
+# ones CAPABILITY_NAMED_IAM, a template with macros CAPABILITY_AUTO_EXPAND on
+# CreateStack / UpdateStack ("doesn't apply to creating change sets");
+# otherwise the InsufficientCapabilities error, HTTP 400. Measured on AWS for
+# an unnamed role: "Requires capabilities : [CAPABILITY_IAM]", no stack.
+
+_CAPS_ROLE_TEMPLATE = {
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Resources": {
+        "Role": {
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": []},
+            },
+        }
+    },
+}
+_CAPS_NAMED_ROLE_TEMPLATE = {
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Resources": {
+        "Role": {
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "RoleName": "cfn-caps-named-role",
+                "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": []},
+            },
+        }
+    },
+}
+# A SAM template the transform accepts. The transform generates an unnamed
+# execution role for the function, so a handler needs CAPABILITY_IAM for the
+# transformed template and CAPABILITY_AUTO_EXPAND for the macro. The helper
+# tests below pass this template untransformed, where only the macro counts.
+_CAPS_TRANSFORM_TEMPLATE = {
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Transform": "AWS::Serverless-2016-10-31",
+    "Resources": {
+        "Fn": {
+            "Type": "AWS::Serverless::Function",
+            "Properties": {
+                "Handler": "index.handler",
+                "Runtime": "python3.12",
+                "InlineCode": "def handler(event, context): return None",
+            },
+        },
+    },
+}
+_CAPS_BUCKET_TEMPLATE = {
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Resources": {"Bucket": {"Type": "AWS::S3::Bucket"}},
+}
+# PolicyName is a required property of AWS::IAM::Policy, not a custom name
+# (aws-resource-iam-policy.html): CAPABILITY_IAM is enough.
+_CAPS_POLICY_TEMPLATE = {
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Resources": {
+        "Policy": {
+            "Type": "AWS::IAM::Policy",
+            "Properties": {
+                "PolicyName": "cfn-caps-inline",
+                "PolicyDocument": {"Version": "2012-10-17", "Statement": []},
+                "Roles": ["cfn-caps-some-role"],
+            },
+        }
+    },
+}
+# Not one of the eight documented types: no capability needed.
+_CAPS_SERVICE_LINKED_ROLE_TEMPLATE = {
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Resources": {
+        "Slr": {
+            "Type": "AWS::IAM::ServiceLinkedRole",
+            "Properties": {"AWSServiceName": "autoscaling.amazonaws.com"},
+        }
+    },
+}
+_CAPS_NULL_PROPS_ROLE_TEMPLATE = {
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Resources": {"Role": {"Type": "AWS::IAM::Role", "Properties": None}},
+}
+
+
+def _caps_params(template, *capabilities, **extra):
+    """A parsed query-protocol request the way ``handle_request`` builds it."""
+    params = {"TemplateBody": [json.dumps(template)]}
+    for i, cap in enumerate(capabilities, 1):
+        params[f"Capabilities.member.{i}"] = [cap]
+    for key, value in extra.items():
+        params[key] = [value]
+    return params
+
+
+def _caps_error(response):
+    """``(status, code, message)`` of an in-process CloudFormation response."""
+    status, _headers, body = response
+    text = body.decode("utf-8")
+    code = re.search(r"<Code>([^<]*)</Code>", text)
+    message = re.search(r"<Message>([^<]*)</Message>", text)
+    return status, code.group(1) if code else "", message.group(1) if message else ""
+
+
+def test_cfn_required_capabilities_helper():
+    from ministack.services.cloudformation.handlers import _required_capabilities
+
+    assert _required_capabilities(_CAPS_BUCKET_TEMPLATE) == ([], [])
+    assert _required_capabilities(_CAPS_ROLE_TEMPLATE) == (
+        ["CAPABILITY_IAM"], ["AWS::IAM::Role"])
+    assert _required_capabilities(_CAPS_NAMED_ROLE_TEMPLATE) == (
+        ["CAPABILITY_NAMED_IAM"], ["AWS::IAM::Role"])
+    assert _required_capabilities(_CAPS_TRANSFORM_TEMPLATE) == (
+        ["CAPABILITY_AUTO_EXPAND"], [])
+    both = dict(_CAPS_NAMED_ROLE_TEMPLATE, Transform="AWS::LanguageExtensions")
+    assert _required_capabilities(both) == (
+        ["CAPABILITY_NAMED_IAM", "CAPABILITY_AUTO_EXPAND"], ["AWS::IAM::Role"])
+    assert _required_capabilities(_CAPS_NULL_PROPS_ROLE_TEMPLATE) == (
+        ["CAPABILITY_IAM"], ["AWS::IAM::Role"])
+
+    # The summary's rule stays as it was: PolicyName counts as a name and every
+    # AWS::IAM::* type needs a capability. The documented rule the enforcement
+    # uses (strict=True) differs on both.
+    assert _required_capabilities(_CAPS_POLICY_TEMPLATE) == (
+        ["CAPABILITY_NAMED_IAM"], ["AWS::IAM::Policy"])
+    assert _required_capabilities(_CAPS_POLICY_TEMPLATE, strict=True) == (
+        ["CAPABILITY_IAM"], ["AWS::IAM::Policy"])
+    assert _required_capabilities(_CAPS_SERVICE_LINKED_ROLE_TEMPLATE) == (
+        ["CAPABILITY_IAM"], ["AWS::IAM::ServiceLinkedRole"])
+    assert _required_capabilities(_CAPS_SERVICE_LINKED_ROLE_TEMPLATE, strict=True) == ([], [])
+    assert _required_capabilities(_CAPS_NAMED_ROLE_TEMPLATE, strict=True) == (
+        ["CAPABILITY_NAMED_IAM"], ["AWS::IAM::Role"])
+
+
+def test_cfn_capabilities_not_enforced_without_auth(monkeypatch):
+    import ministack.app as app_mod
+    from ministack.services.cloudformation import _change_sets, _stack_events, _stacks
+    from ministack.services.cloudformation.changesets import _create_change_set
+    from ministack.services.cloudformation.handlers import _check_capabilities
+
+    monkeypatch.setattr(app_mod, "AUTH", False)
+    # The check takes the template as sent and the transformed one; these
+    # templates are passed untransformed, so both arguments are the same.
+    assert _check_capabilities(
+        _CAPS_ROLE_TEMPLATE, _CAPS_ROLE_TEMPLATE, _caps_params(_CAPS_ROLE_TEMPLATE)) is None
+    assert _check_capabilities(
+        _CAPS_NAMED_ROLE_TEMPLATE, _CAPS_NAMED_ROLE_TEMPLATE,
+        _caps_params(_CAPS_NAMED_ROLE_TEMPLATE)) is None
+    assert _check_capabilities(
+        _CAPS_TRANSFORM_TEMPLATE, _CAPS_TRANSFORM_TEMPLATE,
+        _caps_params(_CAPS_TRANSFORM_TEMPLATE)) is None
+
+    # A handler accepts the IAM template without any capability, as before.
+    stack_name = "cfn-caps-noauth-cs"
+    try:
+        response = _create_change_set(_caps_params(
+            _CAPS_ROLE_TEMPLATE, StackName=stack_name,
+            ChangeSetName="cs1", ChangeSetType="CREATE"))
+        status, code, _ = _caps_error(response)
+        assert status == 200, code
+        assert stack_name in _stacks
+    finally:
+        stack = _stacks.pop(stack_name, None)
+        if stack:
+            _stack_events.pop(stack["StackId"], None)
+        for cs_id in [k for k, v in _change_sets.items()
+                      if v.get("StackName") == stack_name]:
+            _change_sets.pop(cs_id, None)
+
+
+def test_cfn_capabilities_check_under_auth(monkeypatch):
+    import ministack.app as app_mod
+    from ministack.services.cloudformation.handlers import _check_capabilities
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+
+    def check(template, *caps, **kw):
+        # Untransformed: the template as sent and the transformed one are equal.
+        response = _check_capabilities(
+            template, template, _caps_params(template, *caps), **kw)
+        return None if response is None else _caps_error(response)
+
+    refused = (400, "InsufficientCapabilitiesException",
+               "Requires capabilities : [CAPABILITY_IAM]")
+    assert check(_CAPS_BUCKET_TEMPLATE) is None
+    assert check(_CAPS_ROLE_TEMPLATE) == refused
+    assert check(_CAPS_ROLE_TEMPLATE, "CAPABILITY_AUTO_EXPAND") == refused
+    # "If you have IAM resources, you can specify either capability."
+    assert check(_CAPS_ROLE_TEMPLATE, "CAPABILITY_IAM") is None
+    assert check(_CAPS_ROLE_TEMPLATE, "CAPABILITY_NAMED_IAM") is None
+    # "If you have IAM resources with custom names, you must specify
+    # CAPABILITY_NAMED_IAM."
+    assert check(_CAPS_NAMED_ROLE_TEMPLATE, "CAPABILITY_IAM") == (
+        400, "InsufficientCapabilitiesException",
+        "Requires capabilities : [CAPABILITY_NAMED_IAM]")
+    assert check(_CAPS_NAMED_ROLE_TEMPLATE, "CAPABILITY_NAMED_IAM") is None
+    assert check(_CAPS_NAMED_ROLE_TEMPLATE, "CAPABILITY_IAM", "CAPABILITY_NAMED_IAM") is None
+    # A macro template needs CAPABILITY_AUTO_EXPAND on CreateStack / UpdateStack
+    # but not on CreateChangeSet.
+    assert check(_CAPS_TRANSFORM_TEMPLATE) == (
+        400, "InsufficientCapabilitiesException",
+        "Requires capabilities : [CAPABILITY_AUTO_EXPAND]")
+    assert check(_CAPS_TRANSFORM_TEMPLATE, "CAPABILITY_AUTO_EXPAND") is None
+    assert check(_CAPS_TRANSFORM_TEMPLATE, macros=False) is None
+    both = dict(_CAPS_ROLE_TEMPLATE, Transform="AWS::LanguageExtensions")
+    assert check(both, "CAPABILITY_IAM") == (
+        400, "InsufficientCapabilitiesException",
+        "Requires capabilities : [CAPABILITY_AUTO_EXPAND]")
+    assert check(both, "CAPABILITY_AUTO_EXPAND") == refused
+    assert check(both, "CAPABILITY_AUTO_EXPAND", "CAPABILITY_IAM") is None
+    # An AWS::IAM::Policy needs CAPABILITY_IAM only; a type outside the
+    # documented eight needs nothing; a null Properties is an unnamed resource.
+    assert check(_CAPS_POLICY_TEMPLATE) == refused
+    assert check(_CAPS_POLICY_TEMPLATE, "CAPABILITY_IAM") is None
+    assert check(_CAPS_SERVICE_LINKED_ROLE_TEMPLATE) is None
+    assert check(_CAPS_NULL_PROPS_ROLE_TEMPLATE) == refused
+
+
+def test_cfn_create_stack_refuses_missing_capabilities_under_auth(monkeypatch):
+    import ministack.app as app_mod
+    from ministack.services.cloudformation import _stack_events, _stacks
+    from ministack.services.cloudformation.handlers import _create_stack
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    stack_name = "cfn-caps-auth-create"
+
+    try:
+        response = _create_stack(_caps_params(_CAPS_ROLE_TEMPLATE, StackName=stack_name))
+        assert _caps_error(response) == (
+            400, "InsufficientCapabilitiesException",
+            "Requires capabilities : [CAPABILITY_IAM]")
+        assert stack_name not in _stacks
+
+        response = _create_stack(_caps_params(
+            _CAPS_NAMED_ROLE_TEMPLATE, "CAPABILITY_IAM", StackName=stack_name))
+        assert _caps_error(response) == (
+            400, "InsufficientCapabilitiesException",
+            "Requires capabilities : [CAPABILITY_NAMED_IAM]")
+        assert stack_name not in _stacks
+
+        # Two capabilities missing at once. The macro rule reads the template
+        # as sent, whose Transform the SAM transform drops; the IAM rule reads
+        # the transformed template, which carries the generated function role.
+        pytest.importorskip("samtranslator")
+        response = _create_stack(_caps_params(_CAPS_TRANSFORM_TEMPLATE, StackName=stack_name))
+        assert _caps_error(response) == (
+            400, "InsufficientCapabilitiesException",
+            "Requires capabilities : [CAPABILITY_IAM, CAPABILITY_AUTO_EXPAND]")
+        assert stack_name not in _stacks
+
+        response = _create_stack(_caps_params(
+            _CAPS_TRANSFORM_TEMPLATE, "CAPABILITY_AUTO_EXPAND", StackName=stack_name))
+        assert _caps_error(response) == (
+            400, "InsufficientCapabilitiesException",
+            "Requires capabilities : [CAPABILITY_IAM]")
+        assert stack_name not in _stacks
+
+        response = _create_stack(_caps_params(
+            _CAPS_NULL_PROPS_ROLE_TEMPLATE, StackName=stack_name))
+        assert _caps_error(response) == (
+            400, "InsufficientCapabilitiesException",
+            "Requires capabilities : [CAPABILITY_IAM]")
+        assert stack_name not in _stacks
+    finally:
+        stack = _stacks.pop(stack_name, None)
+        if stack:
+            _stack_events.pop(stack["StackId"], None)
+
+
+def test_cfn_embedded_fn_transform_needs_auto_expand_under_auth(monkeypatch):
+    """A macro called on part of the template (``Fn::Transform``, e.g.
+    ``AWS::Include``) has no top-level ``Transform`` but is a macro all the
+    same, so CreateStack needs CAPABILITY_AUTO_EXPAND for it. The summary's
+    rule stays top-level only."""
+    import ministack.app as app_mod
+    from ministack.services.cloudformation import _stacks
+    from ministack.services.cloudformation.handlers import (
+        _check_capabilities,
+        _create_stack,
+        _required_capabilities,
+    )
+
+    embedded = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Bucket": {
+                "Type": "AWS::S3::Bucket",
+                "Properties": {
+                    "Fn::Transform": {
+                        "Name": "AWS::Include",
+                        "Parameters": {"Location": "s3://example.local/bucket-props.yaml"},
+                    },
+                },
+            },
+        },
+    }
+    assert _required_capabilities(embedded) == ([], [])
+    assert _required_capabilities(embedded, strict=True) == (["CAPABILITY_AUTO_EXPAND"], [])
+    # A parameter default is not walked: a macro name there is not a macro call.
+    in_parameters = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Parameters": {"P": {"Type": "String", "Default": "Fn::Transform"}},
+        "Resources": {"Bucket": {"Type": "AWS::S3::Bucket"}},
+    }
+    assert _required_capabilities(in_parameters, strict=True) == ([], [])
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    refused = (400, "InsufficientCapabilitiesException",
+               "Requires capabilities : [CAPABILITY_AUTO_EXPAND]")
+    assert _caps_error(
+        _check_capabilities(embedded, embedded, _caps_params(embedded))) == refused
+    assert _check_capabilities(
+        embedded, embedded, _caps_params(embedded, "CAPABILITY_AUTO_EXPAND")) is None
+    # Not on a change set (macros=False).
+    assert _check_capabilities(embedded, embedded, _caps_params(embedded), macros=False) is None
+
+    stack_name = "cfn-caps-auth-embedded"
+    response = _create_stack(_caps_params(embedded, StackName=stack_name))
+    assert _caps_error(response) == refused
+    assert stack_name not in _stacks
+
+
+def test_cfn_create_stack_capabilities_parsed_from_wire_under_auth(monkeypatch):
+    import asyncio
+    from urllib.parse import urlencode
+
+    import ministack.app as app_mod
+    from ministack.services.cloudformation import _stacks, handle_request
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    stack_name = "cfn-caps-auth-wire"
+    body = urlencode({
+        "Action": "CreateStack",
+        "Version": "2010-05-15",
+        "StackName": stack_name,
+        "TemplateBody": json.dumps(_CAPS_NAMED_ROLE_TEMPLATE),
+        "Capabilities.member.1": "CAPABILITY_IAM",
+        "Capabilities.member.2": "CAPABILITY_AUTO_EXPAND",
+    }).encode()
+    headers = {"content-type": "application/x-www-form-urlencoded"}
+    response = asyncio.run(handle_request("POST", "/", headers, body, {}))
+    # CAPABILITY_IAM arrived and was considered: only NAMED_IAM is missing.
+    assert _caps_error(response) == (
+        400, "InsufficientCapabilitiesException",
+        "Requires capabilities : [CAPABILITY_NAMED_IAM]")
+    assert stack_name not in _stacks
+
+
+def test_cfn_update_stack_refuses_missing_capabilities_under_auth(monkeypatch):
+    import ministack.app as app_mod
+    from ministack.services.cloudformation import _stack_events, _stacks
+    from ministack.services.cloudformation.handlers import _update_stack
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    stack_name = "cfn-caps-auth-update"
+    stack_id = f"arn:aws:cloudformation:us-east-1:000000000000:stack/{stack_name}/caps-1"
+    _stacks[stack_name] = {
+        "StackName": stack_name,
+        "StackId": stack_id,
+        "StackStatus": "CREATE_COMPLETE",
+        "Parameters": [],
+        "Tags": [],
+        "Outputs": [],
+        "_region": "us-east-1",
+        "_resources": {},
+        "_template": _CAPS_BUCKET_TEMPLATE,
+        "_template_body": json.dumps(_CAPS_BUCKET_TEMPLATE),
+        "_resolved_params": {},
+        "_conditions": {},
+    }
+    _stack_events[stack_id] = []
+    try:
+        response = _update_stack(_caps_params(_CAPS_ROLE_TEMPLATE, StackName=stack_name))
+        assert _caps_error(response) == (
+            400, "InsufficientCapabilitiesException",
+            "Requires capabilities : [CAPABILITY_IAM]")
+        assert _stacks[stack_name]["StackStatus"] == "CREATE_COMPLETE"
+
+        pytest.importorskip("samtranslator")
+        response = _update_stack(_caps_params(_CAPS_TRANSFORM_TEMPLATE, StackName=stack_name))
+        assert _caps_error(response) == (
+            400, "InsufficientCapabilitiesException",
+            "Requires capabilities : [CAPABILITY_IAM, CAPABILITY_AUTO_EXPAND]")
+        assert _stacks[stack_name]["StackStatus"] == "CREATE_COMPLETE"
+
+        # UsePreviousTemplate re-checks the stored template (unmeasured on AWS).
+        _stacks[stack_name]["_template"] = _CAPS_ROLE_TEMPLATE
+        _stacks[stack_name]["_template_body"] = json.dumps(_CAPS_ROLE_TEMPLATE)
+        response = _update_stack({
+            "StackName": [stack_name], "UsePreviousTemplate": ["true"],
+            "Parameters.member.1.ParameterKey": ["Unused"],
+        })
+        assert _caps_error(response) == (
+            400, "InsufficientCapabilitiesException",
+            "Requires capabilities : [CAPABILITY_IAM]")
+        assert _stacks[stack_name]["StackStatus"] == "CREATE_COMPLETE"
+    finally:
+        _stacks.pop(stack_name, None)
+        _stack_events.pop(stack_id, None)
+
+
+def test_cfn_create_change_set_refuses_missing_iam_capability_under_auth(monkeypatch):
+    import ministack.app as app_mod
+    from ministack.services.cloudformation import _change_sets, _stack_events, _stacks
+    from ministack.services.cloudformation.changesets import _create_change_set
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    stack_name = "cfn-caps-auth-cs"
+
+    try:
+        response = _create_change_set(_caps_params(
+            _CAPS_ROLE_TEMPLATE, StackName=stack_name,
+            ChangeSetName="cs1", ChangeSetType="CREATE"))
+        assert _caps_error(response) == (
+            400, "InsufficientCapabilitiesException",
+            "Requires capabilities : [CAPABILITY_IAM]")
+        # A refused CREATE change set leaves no REVIEW_IN_PROGRESS stack behind.
+        assert stack_name not in _stacks
+
+        response = _create_change_set(_caps_params(
+            _CAPS_NAMED_ROLE_TEMPLATE, "CAPABILITY_IAM", StackName=stack_name,
+            ChangeSetName="cs1", ChangeSetType="CREATE"))
+        assert _caps_error(response) == (
+            400, "InsufficientCapabilitiesException",
+            "Requires capabilities : [CAPABILITY_NAMED_IAM]")
+        assert stack_name not in _stacks
+    finally:
+        stack = _stacks.pop(stack_name, None)
+        if stack:
+            _stack_events.pop(stack["StackId"], None)
+        for cs_id in [k for k, v in _change_sets.items()
+                      if v.get("StackName") == stack_name]:
+            _change_sets.pop(cs_id, None)
+
+    # With CAPABILITY_IAM the set is created and the REVIEW_IN_PROGRESS
+    # placeholder stays.
+    try:
+        response = _create_change_set(_caps_params(
+            _CAPS_ROLE_TEMPLATE, "CAPABILITY_IAM", StackName=stack_name,
+            ChangeSetName="cs1", ChangeSetType="CREATE"))
+        status, code, _ = _caps_error(response)
+        assert status == 200, code
+        assert _stacks[stack_name]["StackStatus"] == "REVIEW_IN_PROGRESS"
+    finally:
+        stack = _stacks.pop(stack_name, None)
+        if stack:
+            _stack_events.pop(stack["StackId"], None)
+        for cs_id in [k for k, v in _change_sets.items()
+                      if v.get("StackName") == stack_name]:
+            _change_sets.pop(cs_id, None)
+
+    # CAPABILITY_AUTO_EXPAND "doesn't apply to creating change sets": a macro
+    # template without it is not refused for capabilities.
+    macro = dict(_CAPS_BUCKET_TEMPLATE, Transform="AWS::LanguageExtensions")
+    try:
+        response = _create_change_set(_caps_params(
+            macro, StackName=stack_name, ChangeSetName="cs1", ChangeSetType="CREATE"))
+        assert _caps_error(response)[1] != "InsufficientCapabilitiesException"
+    finally:
+        stack = _stacks.pop(stack_name, None)
+        if stack:
+            _stack_events.pop(stack["StackId"], None)
+        for cs_id in [k for k, v in _change_sets.items()
+                      if v.get("StackName") == stack_name]:
+            _change_sets.pop(cs_id, None)
+
 def test_cfn_list_stacks(cfn):
     for name in ("cfn-t12-a", "cfn-t12-b"):
         template = {

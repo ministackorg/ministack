@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **CloudFormation — `Capabilities` are enforced under `AUTH=true`** — `CreateStack`, `UpdateStack` and `CreateChangeSet` accepted a template with IAM resources or a `Transform` whatever the request acknowledged, so a deploy that CloudFormation refuses with `InsufficientCapabilitiesException` went through. With `AUTH=true` they now answer that error (HTTP 400, `Requires capabilities : [CAPABILITY_IAM]`, measured) and create nothing: an IAM resource needs `CAPABILITY_IAM` or `CAPABILITY_NAMED_IAM`, one with a custom name `CAPABILITY_NAMED_IAM`, a template with a `Transform` `CAPABILITY_AUTO_EXPAND` on `CreateStack` and `UpdateStack` (not on a change set, as the API documents). Without `AUTH` nothing changes; `GetTemplateSummary` keeps reporting the same set. Contributed by @iot-rocket.
+
 ## [1.5.9] — 2026-09-08
 
 ### Added
