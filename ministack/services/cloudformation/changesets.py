@@ -188,7 +188,7 @@ def _create_change_set(params):
 
     try:
         validate_template_support(
-            template, _evaluate_conditions(template, param_values))
+            template, _evaluate_conditions(template, param_values), params=param_values)
     except ValueError as exc:
         return _rejected(str(exc))
 

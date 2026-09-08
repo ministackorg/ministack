@@ -17548,3 +17548,323 @@ def test_cfn_update_stack_without_changes_is_refused(cfn, sqs):
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
 
+
+
+# ---------------------------------------------------------------------------
+# Rules section
+# ---------------------------------------------------------------------------
+
+def _rules_template(rules, params):
+    """A template with the given Rules and Parameters and one resource that
+    provisions instantly."""
+    return json.dumps({
+        "Parameters": params,
+        "Rules": rules,
+        "Resources": {"Handle": {"Type": "AWS::CloudFormation::WaitConditionHandle"}},
+    })
+
+
+def _refused_by_rules(cfn, stack_name, body, parameters, expected):
+    with pytest.raises(ClientError) as exc:
+        cfn.create_stack(StackName=stack_name, TemplateBody=body, Parameters=parameters)
+    assert exc.value.response["Error"]["Code"] == "ValidationError"
+    assert exc.value.response["Error"]["Message"] == expected
+    with pytest.raises(ClientError):
+        cfn.describe_stacks(StackName=stack_name)
+
+
+def test_cfn_rules_cdk_check_bootstrap_version(cfn, ssm):
+    """The rule every CDK-synthesized template carries: `BootstrapVersion` is an
+    `AWS::SSM::Parameter::Value<String>` and the assertion refuses the values
+    1 to 5. The rule passes when the SSM parameter holds "30" and refuses the
+    stack with the AssertDescription when it holds "5", on CreateStack,
+    UpdateStack and CreateChangeSet (both types), and no stack record is left
+    behind. The failure text is unmeasured."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    ssm_name = f"/cdk-bootstrap/{uid}/version"
+    description = ("CDK bootstrap stack version 6 required. Please run 'cdk bootstrap' "
+                   "with a recent version of the CDK CLI.")
+    template = json.dumps({
+        "Parameters": {"BootstrapVersion": {
+            "Type": "AWS::SSM::Parameter::Value<String>", "Default": ssm_name,
+            "Description": "Version of the CDK Bootstrap resources in this environment, "
+                           "automatically retrieved from SSM Parameter Store."}},
+        "Rules": {"CheckBootstrapVersion": {"Assertions": [{
+            "Assert": {"Fn::Not": [{"Fn::Contains": [
+                ["1", "2", "3", "4", "5"], {"Ref": "BootstrapVersion"}]}]},
+            "AssertDescription": description}]}},
+        "Resources": {"Handle": {"Type": "AWS::CloudFormation::WaitConditionHandle"}},
+    })
+    expected = f"Template error: rule CheckBootstrapVersion failed: {description}"
+    stack_name = f"cfn-rules-cdk-{uid}"
+
+    ssm.put_parameter(Name=ssm_name, Value="5", Type="String")
+    try:
+        _refused_by_rules(cfn, stack_name, template, [], expected)
+        with pytest.raises(ClientError) as exc:
+            cfn.create_change_set(StackName=stack_name, ChangeSetName="cs",
+                                  ChangeSetType="CREATE", TemplateBody=template)
+        assert exc.value.response["Error"]["Message"] == expected
+        with pytest.raises(ClientError):
+            cfn.describe_stacks(StackName=stack_name)
+
+        ssm.put_parameter(Name=ssm_name, Value="30", Type="String", Overwrite=True)
+        cfn.create_stack(StackName=stack_name, TemplateBody=template)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        ssm.put_parameter(Name=ssm_name, Value="5", Type="String", Overwrite=True)
+        with pytest.raises(ClientError) as exc:
+            cfn.update_stack(StackName=stack_name, TemplateBody=template,
+                             Tags=[{"Key": "stage", "Value": "two"}])
+        assert exc.value.response["Error"]["Code"] == "ValidationError"
+        assert exc.value.response["Error"]["Message"] == expected
+        # UsePreviousTemplate re-resolves the SSM parameter and re-runs the rule.
+        with pytest.raises(ClientError) as exc:
+            cfn.update_stack(StackName=stack_name, UsePreviousTemplate=True,
+                             Parameters=[{"ParameterKey": "BootstrapVersion",
+                                          "UsePreviousValue": True}],
+                             Tags=[{"Key": "stage", "Value": "two"}])
+        assert exc.value.response["Error"]["Message"] == expected
+        with pytest.raises(ClientError) as exc:
+            cfn.create_change_set(StackName=stack_name, ChangeSetName="cs",
+                                  TemplateBody=template, Tags=[{"Key": "stage", "Value": "two"}])
+        assert exc.value.response["Error"]["Message"] == expected
+        assert cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["StackStatus"] \
+            == "CREATE_COMPLETE"
+        assert cfn.list_change_sets(StackName=stack_name)["Summaries"] == []
+
+        ssm.put_parameter(Name=ssm_name, Value="31", Type="String", Overwrite=True)
+        cfn.update_stack(StackName=stack_name, TemplateBody=template,
+                         Tags=[{"Key": "stage", "Value": "two"}])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            ssm.delete_parameter(Name=ssm_name)
+        except ClientError:
+            pass
+
+
+def test_cfn_rules_condition_and_list_functions(cfn):
+    """A rule whose RuleCondition is false is skipped; Fn::Contains,
+    Fn::EachMemberEquals and Fn::EachMemberIn see a CommaDelimitedList
+    parameter as a list of trimmed members; Fn::And, Fn::Or, Fn::Equals and
+    Fn::If nest; the pseudo parameters resolve."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    params = {
+        "Env": {"Type": "String", "Default": "test"},
+        "Size": {"Type": "String", "Default": "t3.medium"},
+        "Subnets": {"Type": "CommaDelimitedList", "Default": "a, b"},
+        "Zones": {"Type": "CommaDelimitedList", "Default": "us-east-1a,us-east-1b"},
+    }
+    rules = {
+        "ProdOnly": {  # RuleCondition false: the failing assertion is never checked
+            "RuleCondition": {"Fn::Equals": [{"Ref": "Env"}, "prod"]},
+            "Assertions": [{"Assert": {"Fn::Equals": [{"Ref": "Size"}, "t3.large"]},
+                            "AssertDescription": "prod needs t3.large"}]},
+        "TestSize": {
+            "RuleCondition": {"Fn::Equals": [{"Ref": "Env"}, "test"]},
+            "Assertions": [
+                {"Assert": {"Fn::Contains": [["t3.medium", "t3.small"], {"Ref": "Size"}]},
+                 "AssertDescription": "test needs t3.medium or t3.small"},
+                {"Assert": {"Fn::EachMemberIn": [{"Ref": "Subnets"}, ["a", "b", "c"]]}},
+                {"Assert": {"Fn::EachMemberEquals": [{"Ref": "Subnets"}, "a"]},
+                 "AssertDescription": "all subnets must be a"}]},
+        "Nested": {"Assertions": [{"Assert": {"Fn::And": [
+            {"Fn::Or": [{"Fn::Equals": [{"Ref": "AWS::Region"}, "us-east-1"]},
+                        {"Fn::Equals": [{"Ref": "AWS::AccountId"}, "000000000000"]}]},
+            {"Fn::Not": [{"Fn::Equals": [{"Ref": "AWS::Partition"}, "aws-cn"]}]},
+            {"Fn::Contains": [{"Ref": "Zones"},
+                              {"Fn::If": [{"Fn::Equals": [{"Ref": "Env"}, "test"]},
+                                          "us-east-1b", "us-east-1z"]}]},
+        ]}}]},
+    }
+    body = _rules_template(rules, params)
+    name = f"cfn-rules-fn-{uid}"
+
+    _refused_by_rules(cfn, name, body, [{"ParameterKey": "Subnets", "ParameterValue": "a,b,z"}],
+                      "Template error: rule TestSize failed: assertion 2 evaluated to false")
+    _refused_by_rules(cfn, name, body, [{"ParameterKey": "Subnets", "ParameterValue": "a,b"},
+                                        {"ParameterKey": "Size", "ParameterValue": "t3.large"}],
+                      "Template error: rule TestSize failed: test needs t3.medium or t3.small")
+    _refused_by_rules(cfn, name, body, [{"ParameterKey": "Env", "ParameterValue": "prod"}],
+                      "Template error: rule ProdOnly failed: prod needs t3.large")
+
+    cfn.create_stack(StackName=name, TemplateBody=body,
+                     Parameters=[{"ParameterKey": "Subnets", "ParameterValue": "a, a"}])
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_rules_shape_and_function_errors(cfn):
+    """An assertion that is not a boolean, a RuleCondition that is not a
+    boolean, a Ref to something that is not a parameter, a function outside
+    the rule set (measured for ``[Fn::If]`` in cloudformation-coverage-roadmap
+    issue 921; the bracket lists the offending names), a rule without
+    Assertions and a malformed argument list are refused before a stack
+    exists with a ValidationError, never an internal error; the function
+    and shape checks also run on ValidateTemplate."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    params = {"P": {"Type": "String", "Default": "x"}}
+    name = f"cfn-rules-shape-{uid}"
+
+    _refused_by_rules(
+        cfn, name, _rules_template({"R": {"Assertions": [{"Assert": {"Ref": "P"}}]}}, params),
+        [], "Template error: assertion 1 of rule R must evaluate to true or false, got 'x'")
+    _refused_by_rules(
+        cfn, name, _rules_template(
+            {"R": {"Assertions": [{"Assert": {"Fn::Equals": [{"Ref": "Handle"}, "x"]}}]}},
+            params),
+        [], "Template format error: Unresolved resource dependencies [Handle] in the Rules "
+            "block of the template")
+    unsupported = _rules_template(
+        {"R": {"Assertions": [{"Assert": {"Fn::Equals": [{"Fn::Sub": "${P}"}, "x"]}}]}}, params)
+    expected = ("Template format error: Following functions are not supported in the Rules "
+                "block of the template: [Fn::Sub]")
+    _refused_by_rules(cfn, name, unsupported, [], expected)
+    with pytest.raises(ClientError) as exc:
+        cfn.validate_template(TemplateBody=unsupported)
+    assert exc.value.response["Error"]["Message"] == expected
+    _refused_by_rules(cfn, name, _rules_template({"R": {"RuleCondition": True}}, params), [],
+                      "Template format error: Rule R must contain an Assertions list")
+    _refused_by_rules(
+        cfn, name, _rules_template({"R": {"RuleCondition": {"Ref": "P"},
+                                          "Assertions": [{"Assert": True}]}}, params),
+        [], "Template error: the RuleCondition of rule R must evaluate to true or false, got 'x'")
+    for assertion, expected in (
+        ({"Fn::Equals": "x"},
+         "Template format error: Fn::Equals in rule R must be a list of 2 elements"),
+        ({"Fn::Equals": [{"Ref": "P"}]},
+         "Template format error: Fn::Equals in rule R must be a list of 2 elements"),
+        ({"Ref": ["P"]}, "Template format error: Ref in rule R must name a parameter"),
+        ({"Fn::ValueOf": "P"},
+         "Template format error: Fn::ValueOf in rule R must be a list of 2 elements"),
+        ({"Fn::ValueOf": [{"Ref": "P"}, "VpcId"]},
+         "Template format error: Fn::ValueOf in rule R takes two strings; no function "
+         "can be used within it"),
+        ({"Fn::And": None},
+         "Template format error: Fn::And in rule R must be a list of conditions"),
+        ({"Fn::Not": [{"Fn::Equals": [{"Ref": "P"}, "x"]}, True]},
+         "Template format error: Fn::Not in rule R must be a list of 1 elements"),
+    ):
+        body = _rules_template({"R": {"Assertions": [{"Assert": assertion}]}}, params)
+        _refused_by_rules(cfn, name, body, [], expected)
+        with pytest.raises(ClientError) as exc:
+            cfn.validate_template(TemplateBody=body)
+        assert exc.value.response["Error"]["Message"] == expected
+    # A template whose rules pass validates; ValidateTemplate has no values to
+    # evaluate against, so a rule that would fail on CreateStack passes there.
+    failing = _rules_template(
+        {"R": {"Assertions": [{"Assert": {"Fn::Equals": [{"Ref": "P"}, "y"]},
+                               "AssertDescription": "P must be y"}]}}, params)
+    cfn.validate_template(TemplateBody=failing)
+    _refused_by_rules(cfn, name, failing, [], "Template error: rule R failed: P must be y")
+
+
+def test_cfn_rules_account_lookups(cfn, ec2, ssm):
+    """Fn::RefAll, Fn::ValueOf and Fn::ValueOfAll are served from the EC2 store
+    for the VPC, subnet and security-group parameter types, with every
+    attribute the reference lists, also behind an SSM ``Value<List<...>>``
+    parameter type; a rule over any other type is skipped (logged), not
+    failed."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    vpc_id = ec2.create_vpc(CidrBlock="10.77.0.0/16", TagSpecifications=[{
+        "ResourceType": "vpc", "Tags": [{"Key": "Department", "Value": "IT"}]}])["Vpc"]["VpcId"]
+    subnet_ids, other_vpc, other_subnet = [], None, None
+    try:
+        subnet_ids = [
+            ec2.create_subnet(VpcId=vpc_id, CidrBlock=f"10.77.{i}.0/24",
+                              AvailabilityZone="us-east-1a")["Subnet"]["SubnetId"]
+            for i in (1, 2)]
+        other_vpc = ec2.create_vpc(CidrBlock="10.78.0.0/16")["Vpc"]["VpcId"]
+        other_subnet = ec2.create_subnet(
+            VpcId=other_vpc, CidrBlock="10.78.1.0/24")["Subnet"]["SubnetId"]
+        vpc = {
+            "DefaultSecurityGroupId": ec2.describe_security_groups(Filters=[
+                {"Name": "vpc-id", "Values": [vpc_id]},
+                {"Name": "group-name", "Values": ["default"]}])["SecurityGroups"][0]["GroupId"],
+            "DefaultNetworkAclId": ec2.describe_network_acls(Filters=[
+                {"Name": "vpc-id", "Values": [vpc_id]}])["NetworkAcls"][0]["NetworkAclId"],
+        }
+        ssm_name = f"/cfn-rules/{uid}/subnets"
+        ssm.put_parameter(Name=ssm_name, Value=",".join(subnet_ids), Type="StringList")
+        _rules_account_lookups(cfn, uid, vpc_id, subnet_ids, other_vpc, other_subnet,
+                               vpc, ssm_name)
+    finally:
+        for sid in subnet_ids + ([other_subnet] if other_subnet else []):
+            ec2.delete_subnet(SubnetId=sid)
+        ec2.delete_vpc(VpcId=vpc_id)
+        if other_vpc:
+            ec2.delete_vpc(VpcId=other_vpc)
+        try:
+            ssm.delete_parameter(Name=f"/cfn-rules/{uid}/subnets")
+        except ClientError:
+            pass
+
+
+def _rules_account_lookups(cfn, uid, vpc_id, subnet_ids, other_vpc, other_subnet, vpc, ssm_name):
+    params = {
+        "VpcId": {"Type": "AWS::EC2::VPC::Id"},
+        "Subnets": {"Type": "List<AWS::EC2::Subnet::Id>"},
+        "SsmSubnets": {"Type": "AWS::SSM::Parameter::Value<List<AWS::EC2::Subnet::Id>>",
+                       "Default": ssm_name},
+        "KeyName": {"Type": "AWS::EC2::KeyPair::KeyName", "Default": "any"},
+    }
+    rules = {
+        "VpcExists": {"Assertions": [{
+            "Assert": {"Fn::Contains": [{"Fn::RefAll": "AWS::EC2::VPC::Id"}, {"Ref": "VpcId"}]},
+            "AssertDescription": "The VPC must exist"}]},
+        "Department": {"Assertions": [{
+            "Assert": {"Fn::Equals": [{"Fn::ValueOf": ["VpcId", "Tags.Department"]}, "IT"]},
+            "AssertDescription": "The VPC must belong to IT"}]},
+        "SubnetsInVpc": {"Assertions": [{
+            "Assert": {"Fn::EachMemberEquals": [{"Fn::ValueOf": ["Subnets", "VpcId"]},
+                                                {"Ref": "VpcId"}]},
+            "AssertDescription": "All subnets must be in the VPC"}]},
+        "VpcAttributes": {"Assertions": [
+            {"Assert": {"Fn::Equals": [{"Fn::ValueOf": ["VpcId", "DefaultSecurityGroup"]},
+                                       vpc["DefaultSecurityGroupId"]]}},
+            {"Assert": {"Fn::Equals": [{"Fn::ValueOf": ["VpcId", "DefaultNetworkAcl"]},
+                                       vpc["DefaultNetworkAclId"]]}},
+            {"Assert": {"Fn::EachMemberEquals": [{"Fn::ValueOf": ["Subnets", "AvailabilityZone"]},
+                                                 "us-east-1a"]},
+             "AssertDescription": "All subnets must be in us-east-1a"}]},
+        "SubnetsExist": {"Assertions": [{
+            "Assert": {"Fn::EachMemberIn": [{"Ref": "Subnets"},
+                                            {"Fn::RefAll": "AWS::EC2::Subnet::Id"}]}}]},
+        "SsmSubnetsInVpc": {"Assertions": [{
+            "Assert": {"Fn::EachMemberEquals": [{"Fn::ValueOf": ["SsmSubnets", "VpcId"]},
+                                                {"Ref": "VpcId"}]},
+            "AssertDescription": "All SSM subnets must be in the VPC"}]},
+        "SomeVpcIsIT": {"Assertions": [{
+            "Assert": {"Fn::Contains": [{"Fn::ValueOfAll": ["AWS::EC2::VPC::Id", "Tags.Department"]},
+                                        "IT"]}}]},
+        "Skipped": {"Assertions": [{  # key pairs are not listed: skipped, never failed
+            "Assert": {"Fn::Contains": [{"Fn::RefAll": "AWS::EC2::KeyPair::KeyName"},
+                                        {"Ref": "KeyName"}]}}]},
+    }
+    body = _rules_template(rules, params)
+    name = f"cfn-rules-account-{uid}"
+
+    def parameters(vpc, subnets):
+        return [{"ParameterKey": "VpcId", "ParameterValue": vpc},
+                {"ParameterKey": "Subnets", "ParameterValue": ",".join(subnets)}]
+
+    _refused_by_rules(cfn, name, body, parameters("vpc-0000000000000dead", subnet_ids),
+                      "Template error: rule VpcExists failed: The VPC must exist")
+    _refused_by_rules(cfn, name, body, parameters(vpc_id, subnet_ids + [other_subnet]),
+                      "Template error: rule SubnetsInVpc failed: All subnets must be in the VPC")
+    _refused_by_rules(cfn, name, body, parameters(other_vpc, [other_subnet]),
+                      "Template error: rule Department failed: The VPC must belong to IT")
+
+    cfn.create_stack(StackName=name, TemplateBody=body, Parameters=parameters(vpc_id, subnet_ids))
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    finally:
+        _delete_cfn_test_stack(cfn, name)

@@ -97,7 +97,7 @@ def _create_stack(params):
 
     conditions = _evaluate_conditions(template, param_values)
     try:
-        validate_template_support(template, conditions)
+        validate_template_support(template, conditions, params=param_values)
     except ValueError as exc:
         return _error("ValidationError", str(exc))
 
@@ -728,7 +728,7 @@ def _update_stack(params):
 
     try:
         validate_template_support(
-            template, _evaluate_conditions(template, param_values))
+            template, _evaluate_conditions(template, param_values), params=param_values)
     except ValueError as exc:
         return _error("ValidationError", str(exc))
 

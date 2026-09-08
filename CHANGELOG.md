@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **CloudFormation — the `Rules` section is evaluated** — a template's rules were ignored; they now run after the parameters resolve and before any resource is touched, on `CreateStack`, `UpdateStack` and `CreateChangeSet`: a rule whose `RuleCondition` is false is skipped, a false `Assert` refuses the operation with its `AssertDescription` as a `ValidationError`, and the CDK's `CheckBootstrapVersion` rule therefore refuses an outdated bootstrap version instead of passing silently. `Fn::And`, `Fn::Or`, `Fn::Not`, `Fn::Equals`, `Fn::If`, `Fn::Contains`, `Fn::EachMemberEquals`, `Fn::EachMemberIn` and `Ref` are evaluated; `Fn::RefAll`, `Fn::ValueOf` and `Fn::ValueOfAll` are served from the EC2 store for the VPC, subnet and security-group id types, and a rule over any other type is skipped with a warning. A function outside the rule set is refused as a template format error. Contributed by @iot-rocket.
+
 ## [1.5.9] — 2026-09-08
 
 ### Added
