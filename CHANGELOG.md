@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Amazon Translate (`translate`)** — new service emulator for batch text translation jobs: `StartTextTranslationJob`, `DescribeTextTranslationJob`, `ListTextTranslationJobs`, `StopTextTranslationJob`, verified against botocore `translate-2017-07-01`. Jobs walk `SUBMITTED` → `IN_PROGRESS` → `COMPLETED` (paced by `TRANSLATE_JOB_RUN_SECONDS`), read every document under `InputDataConfig.S3Uri` from MiniStack S3, and write output to the location the real service uses — `OutputDataConfig.S3Uri` is reported as `s3://<bucket>/<prefix><account-id>-TranslateText-<JobId>/` — as `<target-code>.<input name>`, with a `details/<code>.auxiliary-translation-details.json` summary per target language. `text/plain`, `text/html` and `application/x-xliff+xml` are rewritten in place (an XLIFF job gets a populated `<target>` in every `<trans-unit>` and `target-language` on every `<file>`) and the Office ZIP types are copied through; an unreadable document ends the job `COMPLETED_WITH_ERROR`, and an empty or unreachable input location fails it with a `Message`. `ClientToken` is idempotent, `StopTextTranslationJob` reaches a running worker, and terminal states publish a `Translate TextTranslationJob State Change` event on the default bus. A Node.js Lambda that leaves `@aws-sdk/client-translate` unbundled reaches the service through the local executor's stub. The translated text is deterministic canned output — there is no machine translation. The synchronous `TranslateText` / `TranslateDocument` pair, custom terminologies, parallel data, `ListLanguages` and tagging are not implemented. Contributed by @ppettitau.
+
 ## [1.5.9] — 2026-09-08
 
 ### Added
