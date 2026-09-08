@@ -267,6 +267,7 @@ def validate_template_support(template: dict, conditions: dict,
     """
     from .provisioners import _RESOURCE_HANDLERS
 
+    _validate_template_limits(template)
     unrecognized: set[str] = set()
     if not template.get("Transform"):
         for res in (template.get("Resources") or {}).values():
@@ -303,6 +304,92 @@ def validate_template_support(template: dict, conditions: dict,
         )
     if params is not None:
         _evaluate_rules(template, params, conditions)
+
+
+# ===========================================================================
+# Template and stack quotas
+# ===========================================================================
+
+# The CloudFormation quotas page (cloudformation-limits.html): section sizes,
+# name lengths, the template description and the parameter value.
+_SECTION_QUOTAS = (
+    ("Resources", "resources", "Resource", 500),
+    ("Parameters", "parameters", "Parameter", 200),
+    ("Outputs", "outputs", "Output", 200),
+    ("Mappings", "mappings", "Mapping", 200),
+)
+_MAPPING_ATTRIBUTES_MAX = 200
+_NAME_MAX_CHARS = 255
+_DESCRIPTION_MAX_BYTES = 1024
+_PARAMETER_VALUE_MAX_BYTES = 4096
+
+
+def _quota_error(noun: str, count: int, maximum: int) -> ValueError:
+    # The sentence a real account answers for too many resources ("Template
+    # format error: Number of resources, 536, is greater than maximum allowed,
+    # 500"); the other sections reuse it, unmeasured.
+    return ValueError(
+        f"Template format error: Number of {noun}, {count}, is greater than "
+        f"maximum allowed, {maximum}")
+
+
+def _validate_template_limits(template: dict) -> None:
+    """The template quotas that need nothing but the template: 500 resources,
+    200 parameters, outputs and mappings, 200 attributes per mapping, names
+    of 255 characters, a description of 1,024 bytes and a parameter default
+    of 4,096 bytes. Raises ``ValueError`` with the message the caller wraps
+    as a ``ValidationError``; the wordings other than the resource count and
+    the parameter default are unmeasured."""
+    for section, noun, singular, maximum in _SECTION_QUOTAS:
+        members = template.get(section) or {}
+        if not isinstance(members, dict):
+            continue
+        if len(members) > maximum:
+            raise _quota_error(noun, len(members), maximum)
+        for name in members:
+            if len(str(name)) > _NAME_MAX_CHARS:
+                raise ValueError(
+                    f"Template format error: {singular} name {str(name)[:32]}... may "
+                    f"not exceed {_NAME_MAX_CHARS} characters")
+    for name, mapping in (template.get("Mappings") or {}).items():
+        if not isinstance(mapping, dict):
+            continue
+        if len(mapping) > _MAPPING_ATTRIBUTES_MAX:
+            raise _quota_error(f"attributes in mapping {name}", len(mapping),
+                               _MAPPING_ATTRIBUTES_MAX)
+        for attribute in mapping:
+            if len(str(attribute)) > _NAME_MAX_CHARS:
+                raise ValueError(
+                    f"Template format error: Mapping attribute name {str(attribute)[:32]}"
+                    f"... of mapping {name} may not exceed {_NAME_MAX_CHARS} characters")
+    description = template.get("Description")
+    if isinstance(description, str) and len(description.encode("utf-8")) > _DESCRIPTION_MAX_BYTES:
+        raise ValueError(
+            f"Template format error: Template description may not exceed "
+            f"{_DESCRIPTION_MAX_BYTES} bytes in size")
+    for name, defn in (template.get("Parameters") or {}).items():
+        default = defn.get("Default") if isinstance(defn, dict) else None
+        if default is not None and len(str(default).encode("utf-8")) > _PARAMETER_VALUE_MAX_BYTES:
+            # Quoted from a report of the error ("Template format error:
+            # Parameter 'EnvironmentVariables' default value '[****]' length is
+            # greater than 4096.").
+            raise ValueError(
+                f"Template format error: Parameter '{name}' default value '{default}' "
+                f"length is greater than {_PARAMETER_VALUE_MAX_BYTES}.")
+
+
+def _check_provided_parameter_values(provided_params: list[dict]) -> None:
+    """The request-level constraint on a parameter value (4,096 bytes): the
+    message follows the API's parameter validation, with the 1-based member
+    index of the request; unmeasured."""
+    for index, entry in enumerate(provided_params, 1):
+        value = entry.get("Value", "")
+        if value is not None and len(str(value).encode("utf-8")) > _PARAMETER_VALUE_MAX_BYTES:
+            raise ValueError(
+                f"1 validation error detected: Value '{value}' at "
+                f"'parameters.{index}.member.parameterValue' failed to satisfy "
+                "constraint: Member must have length less than or equal to "
+                f"{_PARAMETER_VALUE_MAX_BYTES}")
 
 
 # ===========================================================================
@@ -388,6 +475,7 @@ def _resolve_parameters(template: dict, provided_params: list[dict],
 
     Returns dict of param_name -> {Value, NoEcho}.
     """
+    _check_provided_parameter_values(provided_params)
     param_defs = template.get("Parameters", {})
     provided_map = {p["Key"]: p for p in provided_params if "Key" in p}
     previous_params = previous_params or {}

@@ -17,7 +17,16 @@ from .engine import (
     _resolve_refs,
     validate_template_support,
 )
-from .helpers import _error, _esc, _extract_members, _p, _page, _resolve_template, _xml
+from .helpers import (
+    _error,
+    _esc,
+    _extract_members,
+    _p,
+    _page,
+    _request_problems,
+    _resolve_template,
+    _xml,
+)
 from .stacks import (
     _add_event,
     _create_stack_task_in_region,
@@ -95,6 +104,11 @@ def _create_change_set(params):
                 and _existing["StackName"] == stack_name):
             return _error("AlreadyExistsException",
                           f"ChangeSet [{cs_name}] already exists")
+
+    if cs_type == "CREATE":
+        # The request-level constraints of a new stack, joined as the API does.
+        if request_error := _request_problems(params, stack_name):
+            return request_error
 
     template_body, resolve_err = _resolve_template(params)
     if resolve_err:

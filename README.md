@@ -463,6 +463,7 @@ subnet = ec2.create_subnet(
 | **Rules** | The `Rules` section runs after the parameters resolve and before any resource is touched (CreateStack, UpdateStack, CreateChangeSet): `RuleCondition`, `Assertions` with `AssertDescription`, Fn::And/Or/Not/Equals/If/Contains/EachMemberEquals/EachMemberIn and Ref; Fn::RefAll, Fn::ValueOf and Fn::ValueOfAll read the EC2 store for VPC, subnet and security-group ids |
 | **Rollback** | Configurable via `DisableRollback` — on failure, previously created resources are cleaned up in reverse dependency order |
 | **Async Status** | Stacks deploy asynchronously (`CREATE_IN_PROGRESS` → `CREATE_COMPLETE`) — poll with DescribeStacks |
+| **Quotas** | The template and stack quotas of the CloudFormation quotas page are enforced before a stack exists: 51,200 bytes of `TemplateBody`, 1,000,000 bytes behind `TemplateURL`, 500 resources, 200 parameters / outputs / mappings, 200 attributes per mapping, 255-character names, a 1,024-byte description, 4,096-byte parameter values, and a stack name of up to 128 alphanumeric characters and hyphens starting with a letter |
 
 **Supported Resource Types:**
 

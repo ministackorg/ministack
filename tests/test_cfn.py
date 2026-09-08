@@ -17868,3 +17868,239 @@ def _rules_account_lookups(cfn, uid, vpc_id, subnet_ids, other_vpc, other_subnet
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
     finally:
         _delete_cfn_test_stack(cfn, name)
+
+
+# ---------------------------------------------------------------------------
+# Template and stack quotas
+# ---------------------------------------------------------------------------
+
+_HANDLE = {"Type": "AWS::CloudFormation::WaitConditionHandle"}
+
+
+def _refused_quota(cfn, stack_name, body, expected, parameters=None):
+    with pytest.raises(ClientError) as exc:
+        cfn.create_stack(StackName=stack_name, TemplateBody=body, Parameters=parameters or [])
+    assert exc.value.response["Error"]["Code"] == "ValidationError"
+    message = exc.value.response["Error"]["Message"]
+    if callable(expected):
+        assert expected(message), message
+    else:
+        assert message == expected
+    with pytest.raises(ClientError):
+        cfn.describe_stacks(StackName=stack_name)
+
+
+def test_cfn_template_body_size_quotas(cfn, s3):
+    """A TemplateBody of 51,200 bytes is accepted and one of 51,201 refused by
+    the request-level constraint (quoted: ``at 'templateBody' failed to
+    satisfy constraint: Member must have length less than or equal to
+    51200``), on CreateStack, UpdateStack, ValidateTemplate and
+    GetTemplateSummary; a template behind TemplateURL may not exceed
+    1,000,000 bytes (quoted: ``Template may not exceed 1000000 bytes in
+    size.``). ValidateTemplate reads its template through the same path, so it
+    takes a TemplateURL now."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-body-size-{uid}"
+
+    def body_of(size):
+        skeleton = json.dumps({"Metadata": {"Pad": ""}, "Resources": {"Handle": _HANDLE}})
+        return json.dumps({"Metadata": {"Pad": "x" * (size - len(skeleton))},
+                           "Resources": {"Handle": _HANDLE}})
+
+    assert len(body_of(51200).encode()) == 51200
+    too_big = body_of(51201)
+
+    def refused(message):
+        return (message.startswith("1 validation error detected: Value '")
+                and message.endswith("' at 'templateBody' failed to satisfy constraint: "
+                                     "Member must have length less than or equal to 51200"))
+
+    _refused_quota(cfn, name, too_big, refused)
+    with pytest.raises(ClientError) as exc:
+        cfn.validate_template(TemplateBody=too_big)
+    assert refused(exc.value.response["Error"]["Message"])
+    with pytest.raises(ClientError) as exc:
+        cfn.get_template_summary(TemplateBody=too_big)
+    assert refused(exc.value.response["Error"]["Message"])
+
+    cfn.create_stack(StackName=name, TemplateBody=body_of(51200))
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        with pytest.raises(ClientError) as exc:
+            cfn.update_stack(StackName=name, TemplateBody=too_big)
+        assert refused(exc.value.response["Error"]["Message"])
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+    bucket = f"cfn-body-size-{uid}"
+    s3.create_bucket(Bucket=bucket)
+    try:
+        endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+        s3.put_object(Bucket=bucket, Key="big.json", Body=body_of(1000001).encode())
+        s3.put_object(Bucket=bucket, Key="ok.json", Body=body_of(1000000).encode())
+        s3.put_object(Bucket=bucket, Key="validate.json", Body=json.dumps({
+            "Description": "a template behind a URL",
+            "Parameters": {"P": {"Type": "String", "Default": "d"}},
+            "Resources": {"Handle": _HANDLE}}).encode())
+        # ValidateTemplate took TemplateBody only; it reads the same path now.
+        validated = cfn.validate_template(TemplateURL=f"{endpoint}/{bucket}/validate.json")
+        assert validated["Description"] == "a template behind a URL"
+        assert [p["ParameterKey"] for p in validated["Parameters"]] == ["P"]
+        with pytest.raises(ClientError) as exc:
+            cfn.create_stack(StackName=name, TemplateURL=f"{endpoint}/{bucket}/big.json")
+        assert exc.value.response["Error"]["Code"] == "ValidationError"
+        assert exc.value.response["Error"]["Message"] == \
+            "Template may not exceed 1000000 bytes in size."
+        with pytest.raises(ClientError):
+            cfn.describe_stacks(StackName=name)
+        cfn.create_stack(StackName=name, TemplateURL=f"{endpoint}/{bucket}/ok.json")
+        try:
+            stack = _wait_stack(cfn, name)
+            assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        finally:
+            _delete_cfn_test_stack(cfn, name)
+    finally:
+        for key in ("big.json", "ok.json", "validate.json"):
+            s3.delete_object(Bucket=bucket, Key=key)
+        s3.delete_bucket(Bucket=bucket)
+
+
+def test_cfn_template_section_quotas(cfn):
+    """501 resources (quoted: ``Template format error: Number of resources,
+    536, is greater than maximum allowed, 500``), 201 parameters, outputs or
+    mappings, 201 attributes in a mapping, a 256-character name of any
+    section, a 256-character mapping attribute name, a 1,025-byte
+    description, a parameter default over 4,096 bytes (quoted shape) and a
+    provided value over 4,096 bytes are refused before a stack exists; the
+    maximum of each passes the check in process."""
+    from ministack.services.cloudformation.engine import validate_template_support
+
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-quotas-{uid}"
+
+    def template(**sections):
+        return {"Resources": {"Handle": _HANDLE}, **sections}
+
+    resources = {f"H{i}": _HANDLE for i in range(501)}
+    _refused_quota(cfn, name, json.dumps({"Resources": resources}),
+                   "Template format error: Number of resources, 501, is greater than "
+                   "maximum allowed, 500")
+    params = {f"P{i}": {"Type": "String", "Default": "x"} for i in range(201)}
+    _refused_quota(cfn, name, json.dumps(template(Parameters=params)),
+                   "Template format error: Number of parameters, 201, is greater than "
+                   "maximum allowed, 200")
+    outputs = {f"O{i}": {"Value": "x"} for i in range(201)}
+    _refused_quota(cfn, name, json.dumps(template(Outputs=outputs)),
+                   "Template format error: Number of outputs, 201, is greater than "
+                   "maximum allowed, 200")
+    mappings = {f"M{i}": {"a": {"b": "c"}} for i in range(201)}
+    _refused_quota(cfn, name, json.dumps(template(Mappings=mappings)),
+                   "Template format error: Number of mappings, 201, is greater than "
+                   "maximum allowed, 200")
+    wide = {"M": {f"a{i}": {"b": "c"} for i in range(201)}}
+    _refused_quota(cfn, name, json.dumps(template(Mappings=wide)),
+                   "Template format error: Number of attributes in mapping M, 201, is "
+                   "greater than maximum allowed, 200")
+    long_name = "R" * 256
+    _refused_quota(cfn, name, json.dumps({"Resources": {long_name: _HANDLE}}),
+                   f"Template format error: Resource name {'R' * 32}... may not exceed "
+                   "255 characters")
+    _refused_quota(cfn, name, json.dumps(template(Description="d" * 1025)),
+                   "Template format error: Template description may not exceed 1024 "
+                   "bytes in size")
+    big_default = "v" * 4097
+    _refused_quota(cfn, name, json.dumps(template(
+        Parameters={"P": {"Type": "String", "Default": big_default}})),
+        f"Template format error: Parameter 'P' default value '{big_default}' length is "
+        "greater than 4096.")
+    _refused_quota(cfn, name, json.dumps(template(Parameters={"P": {"Type": "String"}})),
+                   f"1 validation error detected: Value '{big_default}' at "
+                   "'parameters.1.member.parameterValue' failed to satisfy constraint: "
+                   "Member must have length less than or equal to 4096",
+                   parameters=[{"ParameterKey": "P", "ParameterValue": big_default}])
+
+    # The name-length branch of the other sections and the attribute name of
+    # a mapping, in process: they refuse before a stack record exists too, but
+    # the message is what this checks.
+    for singular, section in (
+        ("Parameter", {"Parameters": {"N" * 256: {"Type": "String"}}}),
+        ("Output", {"Outputs": {"N" * 256: {"Value": "x"}}}),
+        ("Mapping", {"Mappings": {"N" * 256: {"a": {"b": "c"}}}}),
+    ):
+        with pytest.raises(ValueError) as err:
+            validate_template_support(template(**section), {})
+        assert str(err.value) == (
+            f"Template format error: {singular} name {'N' * 32}... may not exceed "
+            "255 characters")
+    with pytest.raises(ValueError) as err:
+        validate_template_support(template(Mappings={"M": {"a" * 256: {"b": "c"}}}), {})
+    assert str(err.value) == (
+        f"Template format error: Mapping attribute name {'a' * 32}... of mapping M "
+        "may not exceed 255 characters")
+
+    # The maximum of each quota passes (checked in process: 500 handles would
+    # deploy, but the check is what this test is about).
+    validate_template_support({
+        "Description": "d" * 1024,
+        "Parameters": {f"P{i}": {"Type": "String", "Default": "v" * 4096} for i in range(200)},
+        "Mappings": {f"M{i}": {f"a{j}": {"b": "c"} for j in range(200)} for i in range(200)},
+        "Resources": {"R" * 252 + f"{i:03d}": _HANDLE for i in range(500)},
+        "Outputs": {f"O{i}": {"Value": "x"} for i in range(200)},
+    }, {})
+
+
+def test_cfn_stack_name_quotas(cfn):
+    """CreateStack and a CREATE change set refuse a stack name that is not
+    alphanumeric-and-hyphens starting with a letter (quoted: ``at
+    'stackName' failed to satisfy constraint: Member must satisfy regular
+    expression pattern``) or longer than 128 characters, before a stack
+    exists; a 128-character name is accepted."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    body = json.dumps({"Resources": {"Handle": _HANDLE}})
+    pattern = ("failed to satisfy constraint: Member must satisfy regular expression "
+               "pattern: [a-zA-Z][-a-zA-Z0-9]*")
+    for bad in (f"cfn_name_{uid}", f"1cfn-name-{uid}", f"cfn.name.{uid}"):
+        _refused_quota(cfn, bad, body,
+                       f"1 validation error detected: Value '{bad}' at 'stackName' {pattern}")
+    with pytest.raises(ClientError) as exc:
+        cfn.create_change_set(StackName=f"cfn_cs_{uid}", ChangeSetName="cs",
+                              ChangeSetType="CREATE", TemplateBody=body)
+    assert exc.value.response["Error"]["Message"] == \
+        f"1 validation error detected: Value 'cfn_cs_{uid}' at 'stackName' {pattern}"
+    with pytest.raises(ClientError):
+        cfn.describe_stacks(StackName=f"cfn_cs_{uid}")
+
+    long = f"cfn-long-{uid}-" + "x" * (129 - len(f"cfn-long-{uid}-"))
+    assert len(long) == 129
+    _refused_quota(cfn, long, body,
+                   f"1 validation error detected: Value '{long}' at 'stackName' failed to "
+                   "satisfy constraint: Member must have length less than or equal to 128")
+    both = f"cfn_long_{uid}_" + "x" * (129 - len(f"cfn_long_{uid}_"))
+    _refused_quota(cfn, both, body,
+                   f"2 validation errors detected: Value '{both}' at 'stackName' failed to "
+                   "satisfy constraint: Member must have length less than or equal to 128; "
+                   f"Value '{both}' at 'stackName' {pattern}")
+
+    # Every request-level violation is reported in one message: a bad name
+    # and an oversized body together, on CreateStack and on a CREATE change
+    # set alike (the name problem first, order unmeasured).
+    big = json.dumps({"Metadata": {"Pad": "x" * 51200}, "Resources": {"Handle": _HANDLE}})
+    joined = (f"2 validation errors detected: Value 'cfn_both_{uid}' at 'stackName' {pattern}; "
+              f"Value '{big}' at 'templateBody' failed to satisfy constraint: Member must have "
+              "length less than or equal to 51200")
+    _refused_quota(cfn, f"cfn_both_{uid}", big, joined)
+    with pytest.raises(ClientError) as exc:
+        cfn.create_change_set(StackName=f"cfn_both_{uid}", ChangeSetName="cs",
+                              ChangeSetType="CREATE", TemplateBody=big)
+    assert exc.value.response["Error"]["Message"] == joined
+    with pytest.raises(ClientError):
+        cfn.describe_stacks(StackName=f"cfn_both_{uid}")
+
+    ok = long[:128]
+    cfn.create_stack(StackName=ok, TemplateBody=body)
+    try:
+        stack = _wait_stack(cfn, ok)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    finally:
+        _delete_cfn_test_stack(cfn, ok)
