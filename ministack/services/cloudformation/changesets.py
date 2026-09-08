@@ -113,6 +113,7 @@ def _create_change_set(params):
     template_body, resolve_err = _resolve_template(params)
     if resolve_err:
         return resolve_err
+    template_given = bool(template_body)
 
     provided_params = _extract_members(params, "Parameters")
     tags = _extract_members(params, "Tags")
@@ -200,6 +201,10 @@ def _create_change_set(params):
     except ValueError as exc:
         return _rejected(str(exc))
 
+    if cs_type == "UPDATE" and not template_given and stack.get("_template"):
+        # As UpdateStack with UsePreviousTemplate: the stored processed
+        # template, so an AWS::Include snippet changed in S3 is not picked up.
+        template = copy.deepcopy(stack["_template"])
     try:
         validate_template_support(
             template, _evaluate_conditions(template, param_values), params=param_values)

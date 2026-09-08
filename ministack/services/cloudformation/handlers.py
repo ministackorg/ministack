@@ -730,6 +730,12 @@ def _update_stack(params):
     except ValueError as exc:
         return _error("ValidationError", str(exc))
 
+    if use_previous_template and stack.get("_template"):
+        # The stored template is the processed one: an AWS::Include snippet
+        # edited or removed in S3 since the deploy is not picked up (the
+        # transform reference: "your stack doesn't automatically pick up
+        # those changes").
+        template = copy.deepcopy(stack["_template"])
     try:
         validate_template_support(
             template, _evaluate_conditions(template, param_values), params=param_values)

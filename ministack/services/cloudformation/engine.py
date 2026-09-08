@@ -267,6 +267,8 @@ def validate_template_support(template: dict, conditions: dict,
     """
     from .provisioners import _RESOURCE_HANDLERS
 
+    if isinstance(template, _IncludeFailed):
+        raise ValueError(template.error)
     _validate_template_limits(template)
     unrecognized: set[str] = set()
     if not template.get("Transform"):
@@ -1405,6 +1407,146 @@ def _topological_sort(resources: dict, conditions: dict) -> list:
 
 
 # ===========================================================================
+# AWS::Include transform
+# ===========================================================================
+
+_INCLUDE_TRANSFORM = "AWS::Include"
+_INCLUDE_ERROR = "Transform AWS::Include failed with: "
+# The reference: the transform may be used anywhere except the Parameters
+# section and the template version; the top-level Transform form is not
+# expanded here.
+_INCLUDE_SKIPPED_SECTIONS = ("Parameters", "AWSTemplateFormatVersion", "Transform")
+
+
+class _IncludeError(ValueError):
+    """An ``AWS::Include`` that could not be expanded; the message is what the
+    caller answers, unwrapped."""
+
+
+class _IncludeFailed(dict):
+    """The template as sent, carrying the message of an include that failed.
+
+    The handlers apply the transforms in one step and wrap everything that
+    step raises as ``Template format error: ...``; a real account answers
+    the include sentence bare (``Transform AWS::Include failed with: ...``),
+    so the failure travels with the template to ``validate_template_support``,
+    which raises it as is. UpdateStack with ``UsePreviousTemplate`` swaps in
+    the stored processed template before that point, so a snippet that went
+    missing since the deploy does not fail the update."""
+
+    def __init__(self, template: dict, error: str):
+        super().__init__(template)
+        self.error = error
+
+
+def _is_include(node) -> bool:
+    """True for a map that carries an ``Fn::Transform`` naming ``AWS::Include``."""
+    spec = node.get("Fn::Transform") if isinstance(node, dict) else None
+    return isinstance(spec, dict) and spec.get("Name") == _INCLUDE_TRANSFORM
+
+
+def _include_location(node: dict):
+    """The ``Location`` parameter of an include node, or None."""
+    parameters = node["Fn::Transform"].get("Parameters")
+    return parameters.get("Location") if isinstance(parameters, dict) else None
+
+
+def _parse_snippet(text: str):
+    """A snippet is JSON or plain YAML: the reference says shorthand
+    notations are not supported in snippets, and a real account answers the
+    sentence below for a ``!Ref`` inside one (re:Post, "Include Parameters
+    in an AWS Include file"), so the plain SafeLoader is used, not the
+    template loader with its tag constructors."""
+    text = text.strip()
+    try:
+        return json.loads(text) if text.startswith("{") \
+            else yaml.load(text, Loader=yaml.SafeLoader)
+    except Exception as exc:
+        raise _IncludeError(
+            _INCLUDE_ERROR + "The specified S3 object's content should be valid "
+            "Yaml/JSON") from exc
+
+
+def _fetch_include_snippet(location) -> dict:
+    """The key-value object behind an ``s3://bucket/key`` location. The
+    location sentence and the content sentence are the ones a real account
+    answers; the missing-object, key-value and nesting sentences are
+    unmeasured."""
+    if not isinstance(location, str) or not location.startswith("s3://"):
+        raise _IncludeError(_INCLUDE_ERROR + "The location parameter is not a valid S3 uri.")
+    bucket, _, key = location[len("s3://"):].partition("/")
+    if not bucket or not key:
+        raise _IncludeError(_INCLUDE_ERROR + "The location parameter is not a valid S3 uri.")
+    from ministack.services import s3 as _s3
+    data = _s3._get_object_data(bucket, key)
+    if data is None:
+        raise _IncludeError(_INCLUDE_ERROR + f"The S3 object {location} does not exist.")
+    snippet = _parse_snippet(data.decode("utf-8"))
+    if not isinstance(snippet, dict):
+        raise _IncludeError(_INCLUDE_ERROR + f"The snippet at {location} must be a "
+                            "key-value object.")
+    nested: list = []
+    _find_includes(snippet, nested)
+    if nested:
+        raise _IncludeError(_INCLUDE_ERROR + f"The snippet at {location} uses AWS::Include, "
+                            "which cannot be nested.")
+    return snippet
+
+
+def _find_includes(node, found: list) -> None:
+    if isinstance(node, dict):
+        if _is_include(node):
+            found.append(node)
+        for value in node.values():
+            _find_includes(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            _find_includes(value, found)
+
+
+def _apply_include_transform(template: dict) -> dict:
+    """Replace every embedded ``Fn::Transform`` that names ``AWS::Include``
+    by the contents of the S3 object it points to, the way the transform
+    reference describes: the snippet is inserted at the location of the
+    transform. A node that holds nothing but the transform becomes the
+    snippet; a node with other keys (``Resources`` next to a sibling
+    resource, a ``Properties`` map) takes the snippet's keys, the snippet
+    winning a duplicate key (unmeasured). The ``Parameters`` section and the
+    template version are not walked. An include that cannot be expanded
+    returns the template as ``_IncludeFailed``, which the validation step
+    turns into the ``ValidationError``."""
+    found: list = []
+    for section, value in template.items():
+        if section not in _INCLUDE_SKIPPED_SECTIONS:
+            _find_includes(value, found)
+    if not found:
+        return template
+
+    def walk(node):
+        if isinstance(node, list):
+            return [walk(v) for v in node]
+        if not isinstance(node, dict):
+            return node
+        if _is_include(node):
+            snippet = _fetch_include_snippet(_include_location(node))
+            rest = {k: walk(v) for k, v in node.items() if k != "Fn::Transform"}
+            if not rest:
+                return snippet
+            rest.update(snippet)
+            return rest
+        return {k: walk(v) for k, v in node.items()}
+
+    expanded = dict(template)
+    try:
+        for section, value in template.items():
+            if section not in _INCLUDE_SKIPPED_SECTIONS:
+                expanded[section] = walk(value)
+    except _IncludeError as exc:
+        return _IncludeFailed(template, str(exc))
+    return expanded
+
+
+# ===========================================================================
 # SAM Transform
 # ===========================================================================
 
@@ -1416,6 +1558,12 @@ logging.getLogger("samtranslator.feature_toggle.feature_toggle").setLevel(loggin
 _NO_IAM_POLICY_LOADER = SimpleNamespace(load=lambda: {})
 
 def _apply_sam_transform_if_applicable(template: dict) -> dict:
+    """The transforms a stack operation applies before validation: every
+    embedded ``AWS::Include`` first, then the SAM transform when the template
+    declares it."""
+    template = _apply_include_transform(template)
+    if isinstance(template, _IncludeFailed):
+        return template
     declared = template.get("Transform")
     transforms = declared if isinstance(declared, list) else [declared]
     if _SAM_TRANSFORM not in transforms:

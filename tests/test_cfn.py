@@ -18104,3 +18104,172 @@ def test_cfn_stack_name_quotas(cfn):
         assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
     finally:
         _delete_cfn_test_stack(cfn, ok)
+
+
+# ---------------------------------------------------------------------------
+# AWS::Include transform
+# ---------------------------------------------------------------------------
+
+def test_cfn_include_transform(cfn, s3, ssm):
+    """An embedded ``Fn::Transform`` naming ``AWS::Include`` is replaced by the
+    S3 object it points to (JSON or plain YAML, a key-value object): next to
+    a sibling resource inside Resources, as a whole Properties map, inside a
+    Properties map next to other properties, inside Outputs and inside
+    Mappings (the reference names the mappings section as an example of where
+    the transform may sit). A location
+    that is not an ``s3://`` URI and a snippet with a YAML shorthand tag are
+    refused with the sentences a real account answers, bare (no ``Template
+    format error:`` prefix); a missing object, a snippet that is not an
+    object and a nested include are refused too, all before a stack exists.
+    On UpdateStack and CreateChangeSet the include is expanded the same way
+    and the change set lists the included resource; with UsePreviousTemplate
+    the stored processed template is used, so a snippet edited in S3 since
+    the deploy is not picked up."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    bucket = f"cfn-include-{uid}"
+    name = f"cfn-include-{uid}"
+    s3.create_bucket(Bucket=bucket)
+    try:
+        _include_transform(cfn, s3, ssm, uid, bucket, name)
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+        for key in ("resources.yaml", "properties.json", "value.json", "list.json",
+                    "nested.json", "shorthand.yaml", "outputs.json", "second.json",
+                    "mappings.json"):
+            s3.delete_object(Bucket=bucket, Key=key)
+        s3.delete_bucket(Bucket=bucket)
+
+
+def _include_transform(cfn, s3, ssm, uid, bucket, name):
+    s3.put_object(Bucket=bucket, Key="resources.yaml", Body=(
+        "Included:\n"
+        "  Type: AWS::SSM::Parameter\n"
+        "  Properties:\n"
+        f"    Name: /cfn-include/{uid}/from-yaml\n"
+        "    Type: String\n"
+        "    Value: {Ref: Handle}\n").encode())
+    s3.put_object(Bucket=bucket, Key="shorthand.yaml", Body=(
+        "Included:\n"
+        "  Type: AWS::SSM::Parameter\n"
+        "  Properties:\n"
+        f"    Name: /cfn-include/{uid}/shorthand\n"
+        "    Type: String\n"
+        "    Value: !Ref Handle\n").encode())
+    s3.put_object(Bucket=bucket, Key="properties.json", Body=json.dumps({
+        "Name": f"/cfn-include/{uid}/whole", "Type": "String", "Value": "whole"}).encode())
+    s3.put_object(Bucket=bucket, Key="value.json", Body=json.dumps({
+        "Value": "merged", "Type": "String"}).encode())
+    s3.put_object(Bucket=bucket, Key="outputs.json", Body=json.dumps({
+        "IncludedOutput": {"Value": {"Ref": "Handle"}}}).encode())
+    s3.put_object(Bucket=bucket, Key="second.json", Body=json.dumps({
+        "Second": {"Type": "AWS::SSM::Parameter", "Properties": {
+            "Name": f"/cfn-include/{uid}/second", "Type": "String", "Value": "second"}}}).encode())
+    s3.put_object(Bucket=bucket, Key="mappings.json", Body=json.dumps({
+        "Sizes": {"small": {"Value": "from-map"}}}).encode())
+    s3.put_object(Bucket=bucket, Key="list.json", Body=b"[1, 2]")
+    s3.put_object(Bucket=bucket, Key="nested.json", Body=json.dumps({
+        "Fn::Transform": {"Name": "AWS::Include",
+                          "Parameters": {"Location": f"s3://{bucket}/value.json"}}}).encode())
+
+    def include(key):
+        return {"Fn::Transform": {"Name": "AWS::Include",
+                                  "Parameters": {"Location": f"s3://{bucket}/{key}"}}}
+
+    template = {
+        "Resources": {
+            "Handle": _HANDLE,
+            "Whole": {"Type": "AWS::SSM::Parameter", "Properties": include("properties.json")},
+            "Merged": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": f"/cfn-include/{uid}/merged", **include("value.json")}},
+            "FromMap": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": f"/cfn-include/{uid}/from-map", "Type": "String",
+                "Value": {"Fn::FindInMap": ["Sizes", "small", "Value"]}}},
+            **include("resources.yaml"),
+        },
+        "Mappings": include("mappings.json"),
+        "Outputs": include("outputs.json"),
+    }
+
+    def refused(body, expected):
+        with pytest.raises(ClientError) as exc:
+            cfn.create_stack(StackName=name, TemplateBody=json.dumps(body))
+        assert exc.value.response["Error"]["Code"] == "ValidationError"
+        assert exc.value.response["Error"]["Message"] == expected, \
+            exc.value.response["Error"]["Message"]
+        with pytest.raises(ClientError):
+            cfn.describe_stacks(StackName=name)
+
+    def with_include(key_or_location):
+        location = key_or_location if "://" in key_or_location \
+            else f"s3://{bucket}/{key_or_location}"
+        return {"Resources": {"Handle": _HANDLE, "Fn::Transform": {
+            "Name": "AWS::Include", "Parameters": {"Location": location}}}}
+
+    refused(with_include(f"https://{bucket}.s3.amazonaws.com/resources.yaml"),
+            "Transform AWS::Include failed with: The location parameter is not a valid S3 uri.")
+    refused(with_include("shorthand.yaml"),
+            "Transform AWS::Include failed with: The specified S3 object's content should be "
+            "valid Yaml/JSON")
+    refused(with_include("missing.yaml"),
+            f"Transform AWS::Include failed with: The S3 object s3://{bucket}/missing.yaml "
+            "does not exist.")
+    refused(with_include("list.json"),
+            f"Transform AWS::Include failed with: The snippet at s3://{bucket}/list.json must "
+            "be a key-value object.")
+    refused(with_include("nested.json"),
+            f"Transform AWS::Include failed with: The snippet at s3://{bucket}/nested.json uses "
+            "AWS::Include, which cannot be nested.")
+
+    cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    logical_ids = sorted(r["LogicalResourceId"] for r in
+                         cfn.describe_stack_resources(StackName=name)["StackResources"])
+    assert logical_ids == ["FromMap", "Handle", "Included", "Merged", "Whole"]
+    assert ssm.get_parameter(Name=f"/cfn-include/{uid}/whole")["Parameter"]["Value"] == "whole"
+    # The Mappings section is expanded too, so Fn::FindInMap reads the snippet.
+    assert ssm.get_parameter(Name=f"/cfn-include/{uid}/from-map")["Parameter"]["Value"] \
+        == "from-map"
+    assert ssm.get_parameter(Name=f"/cfn-include/{uid}/merged")["Parameter"]["Value"] \
+        == "merged"
+    handle_url = ssm.get_parameter(Name=f"/cfn-include/{uid}/from-yaml")["Parameter"]["Value"]
+    assert handle_url.startswith("http")
+    assert _output(stack, "IncludedOutput") == handle_url
+    # The stored template is the one the caller sent: the include is not
+    # baked into it.
+    stored = cfn.get_template(StackName=name)["TemplateBody"]
+    assert "Fn::Transform" in stored["Resources"] and "Included" not in stored["Resources"]
+
+    # A snippet edited in S3 after the deploy is not picked up by an update
+    # that reuses the template: nothing changed from the stack's point of view.
+    s3.put_object(Bucket=bucket, Key="value.json", Body=json.dumps({
+        "Value": "edited", "Type": "String"}).encode())
+    with pytest.raises(ClientError) as exc:
+        cfn.update_stack(StackName=name, UsePreviousTemplate=True)
+    assert exc.value.response["Error"]["Message"] == "No updates are to be performed."
+    assert ssm.get_parameter(Name=f"/cfn-include/{uid}/merged")["Parameter"]["Value"] \
+        == "merged"
+
+    # A change set and an update with a new body expand the include again:
+    # the change set lists the included resource, the update provisions it.
+    second = json.loads(json.dumps(template))
+    second["Resources"].update(include("second.json"))
+    cfn.create_change_set(StackName=name, ChangeSetName="second",
+                          TemplateBody=json.dumps(second))
+    for _ in range(40):
+        described = cfn.describe_change_set(StackName=name, ChangeSetName="second")
+        if described["Status"] in ("CREATE_COMPLETE", "FAILED"):
+            break
+        time.sleep(0.25)
+    assert described["Status"] == "CREATE_COMPLETE", described.get("StatusReason")
+    added = sorted(c["ResourceChange"]["LogicalResourceId"] for c in described["Changes"]
+                   if c["ResourceChange"]["Action"] == "Add")
+    assert added == ["Second"]
+    cfn.delete_change_set(StackName=name, ChangeSetName="second")
+    cfn.update_stack(StackName=name, TemplateBody=json.dumps(second))
+    stack = _wait_stack(cfn, name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    assert ssm.get_parameter(Name=f"/cfn-include/{uid}/second")["Parameter"]["Value"] \
+        == "second"
+    assert ssm.get_parameter(Name=f"/cfn-include/{uid}/merged")["Parameter"]["Value"] \
+        == "edited"
