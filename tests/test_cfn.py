@@ -4175,6 +4175,119 @@ def test_cfn_lambda_alias_and_esm_keep_function_name(cfn, lam):
             pass
 
 
+def _cfn_alias_test_function(lam, fn):
+    """A function with two published versions, for the alias update tests."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", "def handler(e,c): return {}")
+    lam.create_function(
+        FunctionName=fn, Runtime="python3.11", Role="arn:aws:iam::000000000000:role/r",
+        Handler="index.handler", Code={"ZipFile": buf.getvalue()},
+    )
+    v1 = lam.publish_version(FunctionName=fn)["Version"]
+    lam.update_function_configuration(FunctionName=fn, Description="second")
+    v2 = lam.publish_version(FunctionName=fn)["Version"]
+    assert v1 != v2
+    return v1, v2
+
+
+def _cfn_alias_template(fn, properties):
+    return json.dumps({
+        "Resources": {"Alias": {"Type": "AWS::Lambda::Alias",
+                                "Properties": {"FunctionName": fn, **properties}}},
+        "Outputs": {"AliasArn": {"Value": {"Ref": "Alias"}}},
+    })
+
+
+def test_cfn_lambda_alias_updates_in_place(cfn, lam):
+    """FunctionVersion, Description, RoutingConfig and
+    ProvisionedConcurrencyConfig are No interruption on the resource
+    reference: the alias keeps its ARN and GetAlias reads the new values,
+    the routing weights in the API's map shape and the provisioned
+    concurrency on the alias qualifier. A dropped Description empties, a
+    dropped RoutingConfig or ProvisionedConcurrencyConfig is removed."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cfn-alias-upd-{suffix}"
+    stack_name = f"cfn-alias-upd-{suffix}"
+    v1, v2 = _cfn_alias_test_function(lam, fn)
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_alias_template(fn, {
+            "Name": "live", "FunctionVersion": v1, "Description": "first",
+            "ProvisionedConcurrencyConfig": {"ProvisionedConcurrentExecutions": 2},
+        }))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        alias_arn = _output(stack, "AliasArn")
+        assert alias_arn.endswith(f":function:{fn}:live")
+        pc = lam.get_provisioned_concurrency_config(FunctionName=fn, Qualifier="live")
+        assert pc["RequestedProvisionedConcurrentExecutions"] == 2
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_alias_template(fn, {
+            "Name": "live", "FunctionVersion": v2, "Description": "second",
+            "RoutingConfig": {"AdditionalVersionWeights": [
+                {"FunctionVersion": v1, "FunctionWeight": 0.3}]},
+            "ProvisionedConcurrencyConfig": {"ProvisionedConcurrentExecutions": 3},
+        }))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "AliasArn") == alias_arn
+        alias = lam.get_alias(FunctionName=fn, Name="live")
+        assert alias["FunctionVersion"] == v2
+        assert alias["Description"] == "second"
+        assert alias["RoutingConfig"] == {"AdditionalVersionWeights": {v1: 0.3}}
+        pc = lam.get_provisioned_concurrency_config(FunctionName=fn, Qualifier="live")
+        assert pc["RequestedProvisionedConcurrentExecutions"] == 3
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_alias_template(fn, {
+            "Name": "live", "FunctionVersion": v2,
+        }))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "AliasArn") == alias_arn
+        alias = lam.get_alias(FunctionName=fn, Name="live")
+        assert alias["FunctionVersion"] == v2
+        assert alias.get("Description", "") == ""
+        assert "RoutingConfig" not in alias
+        with pytest.raises(ClientError) as exc_info:
+            lam.get_provisioned_concurrency_config(FunctionName=fn, Qualifier="live")
+        assert exc_info.value.response["Error"]["Code"] == "ProvisionedConcurrencyConfigNotFoundException"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        lam.delete_function(FunctionName=fn)
+
+
+def test_cfn_lambda_alias_rename_replaces_it(cfn, lam):
+    """Name requires replacement: the alias under the new name is created
+    and the old one removed, so the ARN changes and the function carries
+    exactly one alias."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"cfn-alias-ren-{suffix}"
+    stack_name = f"cfn-alias-ren-{suffix}"
+    v1, _v2 = _cfn_alias_test_function(lam, fn)
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_alias_template(fn, {
+            "Name": "live", "FunctionVersion": v1,
+        }))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        old_arn = _output(stack, "AliasArn")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_alias_template(fn, {
+            "Name": "blue", "FunctionVersion": v1,
+        }))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        new_arn = _output(stack, "AliasArn")
+        assert new_arn != old_arn
+        assert new_arn.endswith(f":function:{fn}:blue")
+        aliases = lam.list_aliases(FunctionName=fn)["Aliases"]
+        assert [a["Name"] for a in aliases] == ["blue"]
+        assert aliases[0]["FunctionVersion"] == v1
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        lam.delete_function(FunctionName=fn)
+
+
 def test_cfn_lambda_esm_preserves_qualified_function_ref(cfn, lam):
     suffix = _uuid_mod.uuid4().hex[:8]
     fn = f"cfn-esm-qualified-{suffix}"

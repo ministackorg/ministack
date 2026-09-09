@@ -4771,12 +4771,55 @@ def _pipes_pipe_delete(physical_id, props):
 
 # --- Lambda Alias ---
 
+def _lambda_alias_routing_config(props):
+    """The template's RoutingConfig in the shape the API stores: the
+    AliasRoutingConfiguration property type lists AdditionalVersionWeights
+    as ``{FunctionVersion, FunctionWeight}`` entries, the API keeps a
+    ``{version: weight}`` map, which is what GetAlias returns. None when
+    the template declares no routing."""
+    rc = props.get("RoutingConfig")
+    if not rc:
+        return None
+    weights = rc.get("AdditionalVersionWeights") or {}
+    if isinstance(weights, list):
+        try:
+            weights = {str(w["FunctionVersion"]): float(w["FunctionWeight"]) for w in weights}
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(
+                "AWS::Lambda::Alias: every AdditionalVersionWeights entry needs a "
+                "FunctionVersion and a numeric FunctionWeight") from None
+    return {"AdditionalVersionWeights": weights}
+
+
+def _lambda_alias_provisioned_concurrency(func_name, alias_name, old_props, new_props):
+    """Apply the ProvisionedConcurrencyConfig property to the alias
+    qualifier through the service's put and delete: declared, it is put;
+    dropped since the previous template, it is deleted; never declared,
+    a configuration set through the API is left alone."""
+    payload = _declared_or_default(old_props, new_props, {"ProvisionedConcurrencyConfig": None})
+    if "ProvisionedConcurrencyConfig" not in payload:
+        return
+    config = payload["ProvisionedConcurrencyConfig"]
+    if config:
+        resp = _lambda_svc._put_provisioned_concurrency(func_name, alias_name, {
+            "ProvisionedConcurrentExecutions": int(config.get("ProvisionedConcurrentExecutions", 0)),
+        })
+    else:
+        resp = _lambda_svc._delete_provisioned_concurrency(func_name, alias_name)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Lambda::Alias ProvisionedConcurrencyConfig failed: {resp[2]!r}")
+
+
 def _lambda_alias_create(logical_id, props, stack_name):
     func, func_name, _resource_arn, _qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
     alias_name = props.get("Name", "")
     func_version = props.get("FunctionVersion", "$LATEST")
 
     if func:
+        if alias_name in func.get("aliases", {}):
+            # CreateAlias answers ResourceConflictException; a stack must not
+            # write over an alias it does not own, on a create or on a rename.
+            raise ValueError(f"AWS::Lambda::Alias: {func_name}:{alias_name} already exists")
         alias = {
             "AliasArn": f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{func_name}:{alias_name}",
             "Name": alias_name,
@@ -4784,14 +4827,50 @@ def _lambda_alias_create(logical_id, props, stack_name):
             "Description": props.get("Description", ""),
             "RevisionId": new_uuid(),
         }
-        rc = props.get("RoutingConfig")
-        if rc:
+        rc = _lambda_alias_routing_config(props)
+        if rc and rc["AdditionalVersionWeights"]:
             alias["RoutingConfig"] = rc
         func["aliases"][alias_name] = alias
+        _lambda_alias_provisioned_concurrency(func_name, alias_name, {}, props)
         return alias["AliasArn"], {"AliasArn": alias["AliasArn"]}
 
     alias_arn = f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{func_name}:{alias_name}"
     return alias_arn, {"AliasArn": alias_arn}
+
+
+def _lambda_alias_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update an alias in place through UpdateAlias, keeping its ARN, for
+    the No-interruption properties of the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-lambda-alias.html):
+    FunctionVersion, Description, RoutingConfig and
+    ProvisionedConcurrencyConfig. A dropped Description empties, a dropped
+    RoutingConfig or ProvisionedConcurrencyConfig is removed. Name and
+    FunctionName require replacement: the new alias is created before the
+    old one is removed."""
+    func, func_name, _resource_arn, _qualifier = _lambda_function_for_cfn_ref(
+        old_props.get("FunctionName", ""))
+    _new_func, new_func_name, _new_arn, _new_qualifier = _lambda_function_for_cfn_ref(
+        new_props.get("FunctionName", ""))
+    alias_name = old_props.get("Name", "")
+    current = (func_name, alias_name) if func and alias_name in func["aliases"] else None
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        (new_func_name, new_props.get("Name", "")), current,
+        _lambda_alias_create, _lambda_alias_delete,
+    )
+    if replaced is not None:
+        return replaced
+
+    data = _declared_or_default(old_props, new_props, {
+        "FunctionVersion": "$LATEST", "Description": "", "RoutingConfig": None,
+    })
+    if "RoutingConfig" in data:
+        data["RoutingConfig"] = _lambda_alias_routing_config(new_props)
+    resp = _lambda_svc._update_alias(func_name, alias_name, data)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Lambda::Alias update failed: {resp[2]!r}")
+    _lambda_alias_provisioned_concurrency(func_name, alias_name, old_props, new_props)
+    return physical_id, {"AliasArn": physical_id}
 
 
 def _lambda_alias_delete(physical_id, props):
@@ -4799,6 +4878,8 @@ def _lambda_alias_delete(physical_id, props):
     alias_name = props.get("Name", "")
     if func:
         func["aliases"].pop(alias_name, None)
+        # The alias qualifier's provisioned concurrency goes with the alias.
+        func.get("provisioned_concurrency", {}).pop(alias_name, None)
 
 
 # --- Resource policy attachments (SQS QueuePolicy, SNS TopicPolicy) ---
@@ -9259,7 +9340,12 @@ _RESOURCE_HANDLERS = {
         "delete": _lambda_event_invoke_config_delete,
     },
     "AWS::Pipes::Pipe": {"create": _pipes_pipe_create, "delete": _pipes_pipe_delete},
-    "AWS::Lambda::Alias": {"create": _lambda_alias_create, "delete": _lambda_alias_delete},
+    "AWS::Lambda::Alias": {
+        "create": _lambda_alias_create,
+        "update": _lambda_alias_update,
+        "update_with_logical_id": True,
+        "delete": _lambda_alias_delete,
+    },
     "AWS::SQS::QueuePolicy": {
         "create": _sqs_queue_policy_create,
         "update": _sqs_queue_policy_update,
