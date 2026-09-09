@@ -626,6 +626,36 @@ def test_location_history_default_window_is_last_24_hours(location):
     location.delete_tracker(TrackerName=name)
 
 
+def test_location_history_rejects_an_unparseable_window(location):
+    """A window bound that is not a timestamp is a ValidationException. The
+    24-hour default belongs to the member being absent; substituting it for
+    an unparseable one answers a window the caller never asked for, and does
+    it in the same 200 as a window it did. The shapes are ones botocore
+    refuses to send, so they go over the raw wire."""
+    name = _uid()
+    location.create_tracker(TrackerName=name, **_KEEP_EVERY_SAMPLE)
+    location.batch_update_device_position(
+        TrackerName=name,
+        Updates=[{"DeviceId": "veh-1", "SampleTime": _ts(0), "Position": [1.0, 1.0]}],
+    )
+    history = f"/tracking/v0/trackers/{name}/devices/veh-1/list-positions"
+    for payload in (
+        {"StartTimeInclusive": "yesterday"},
+        {"EndTimeExclusive": "2026-13-45T99:00:00Z"},
+        {"StartTimeInclusive": True},
+        {"EndTimeExclusive": {"Not": "a timestamp"}},
+    ):
+        status, body = _raw_post(history, payload)
+        assert status == 400, body
+        assert next(iter(payload)) in json.dumps(body)
+
+    # A bound the parser does understand still answers over the same wire.
+    status, body = _raw_post(history, {"StartTimeInclusive": _ts(-60).timestamp()})
+    assert status == 200, body
+    assert len(body["DevicePositions"]) == 1
+    location.delete_tracker(TrackerName=name)
+
+
 # ---------------------------------------------------------------------------
 # Request validation and paging
 # ---------------------------------------------------------------------------

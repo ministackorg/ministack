@@ -235,6 +235,21 @@ def _max_results(body):
     return value, None
 
 
+def _time_bound(body, member, default):
+    """A history window bound as ``(value, error_response)``: the documented
+    default when the member is absent, and a ValidationException when it is
+    there but not a timestamp. Substituting the default for an unparseable
+    one would answer a window the caller never asked for, in the same 200 as
+    a window it did."""
+    value = body.get(member)
+    if value is None:
+        return default, None
+    parsed = _parse_timestamp(value)
+    if parsed is None:
+        return None, _validation(f"{member} must be a timestamp")
+    return parsed, None
+
+
 def _encode_token(key):
     """Tokens carry the sort position of the last item returned, not an
     index: an offset would skip an item whenever one was deleted between
@@ -848,17 +863,17 @@ def _get_position_history(name, device_id, body):
         cursor = _decode_token(token, (float, float, int))
         if cursor is None:
             return _validation(_INVALID_TOKEN)
+    # Documented defaults when the members are omitted: the 24 hours up to now.
+    start, err = _time_bound(body, "StartTimeInclusive", _now() - 24 * 3600)
+    if err is not None:
+        return err
+    end, err = _time_bound(body, "EndTimeExclusive", _now())
+    if err is not None:
+        return err
     rec = _trackers.get(name)
     if rec is None:
         return _not_found(name)
     device = rec["positions"].get(device_id, {})
-    # Documented defaults when the members are omitted: the 24 hours up to now.
-    start = _parse_timestamp(body.get("StartTimeInclusive"))
-    if start is None:
-        start = _now() - 24 * 3600
-    end = _parse_timestamp(body.get("EndTimeExclusive"))
-    if end is None:
-        end = _now()
     positions = [
         pos for pos in device.get("history", [])
         if start <= pos["SampleTime"] < end
