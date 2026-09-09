@@ -11661,6 +11661,104 @@ def test_cfn_logs_subscription_filter_provisions(cfn, logs):
         logs.describe_subscription_filters(logGroupName="/cfn/subfilter-test")
 
 
+def _cfn_subfilter_template(uid, filter_props):
+    return json.dumps({
+        "Resources": {
+            "GroupA": {"Type": "AWS::Logs::LogGroup",
+                       "Properties": {"LogGroupName": f"/cfn/subfilter-upd-a-{uid}"}},
+            "GroupB": {"Type": "AWS::Logs::LogGroup",
+                       "Properties": {"LogGroupName": f"/cfn/subfilter-upd-b-{uid}"}},
+            "Filter": {"Type": "AWS::Logs::SubscriptionFilter", "Properties": filter_props},
+        },
+        "Outputs": {"FilterRef": {"Value": {"Ref": "Filter"}}},
+    })
+
+
+def test_cfn_logs_subscription_filter_updates_in_place(cfn, logs):
+    """FilterPattern, DestinationArn, RoleArn and Distribution are No
+    interruption on the resource reference: the filter keeps its name (what
+    Ref returns) and DescribeSubscriptionFilters reads the new values. A
+    dropped RoleArn empties and a dropped Distribution reverts to
+    ByLogStream, what the create stores without them."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-subfilter-upd-{uid}"
+    group = f"/cfn/subfilter-upd-a-{uid}"
+    base = {"LogGroupName": {"Ref": "GroupA"}}
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_subfilter_template(uid, {
+        **base, "FilterPattern": "[Producer]",
+        "DestinationArn": "arn:aws:lambda:us-east-1:000000000000:function:consumer",
+    }))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        filter_name = _output(stack, "FilterRef")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_subfilter_template(uid, {
+            **base, "FilterPattern": "ERROR",
+            "DestinationArn": "arn:aws:kinesis:us-east-1:000000000000:stream/errors",
+            "RoleArn": "arn:aws:iam::000000000000:role/logs-to-kinesis",
+            "Distribution": "Random",
+        }))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "FilterRef") == filter_name
+        filters = logs.describe_subscription_filters(logGroupName=group)["subscriptionFilters"]
+        assert [f["filterName"] for f in filters] == [filter_name]
+        assert filters[0]["filterPattern"] == "ERROR"
+        assert filters[0]["destinationArn"].endswith(":stream/errors")
+        assert filters[0]["roleArn"].endswith(":role/logs-to-kinesis")
+        assert filters[0]["distribution"] == "Random"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_subfilter_template(uid, {
+            **base, "FilterPattern": "ERROR",
+            "DestinationArn": "arn:aws:kinesis:us-east-1:000000000000:stream/errors",
+        }))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "FilterRef") == filter_name
+        filters = logs.describe_subscription_filters(logGroupName=group)["subscriptionFilters"]
+        assert [f["filterName"] for f in filters] == [filter_name]
+        assert filters[0].get("roleArn", "") == ""
+        assert filters[0]["distribution"] == "ByLogStream"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_logs_subscription_filter_group_change_moves_it(cfn, logs):
+    """LogGroupName requires replacement: the filter is created on the new
+    group and removed from the old one. The filter keeps its explicit
+    FilterName, so the physical id does not change; without an update
+    handler the create wrote the new filter and the old group kept its
+    copy, since the engine saw no replacement to clean up."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-subfilter-move-{uid}"
+    group_a = f"/cfn/subfilter-upd-a-{uid}"
+    group_b = f"/cfn/subfilter-upd-b-{uid}"
+
+    def filter_props(group):
+        return {"LogGroupName": {"Ref": group}, "FilterName": f"cfn-move-{uid}",
+                "FilterPattern": "[Producer]",
+                "DestinationArn": "arn:aws:lambda:us-east-1:000000000000:function:consumer"}
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_subfilter_template(uid, filter_props("GroupA")))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_subfilter_template(uid, filter_props("GroupB")))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "FilterRef") == f"cfn-move-{uid}"
+        assert logs.describe_subscription_filters(logGroupName=group_a)["subscriptionFilters"] == []
+        moved = logs.describe_subscription_filters(logGroupName=group_b)["subscriptionFilters"]
+        assert [f["filterName"] for f in moved] == [f"cfn-move-{uid}"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_logs_resource_policy_identity_and_lifecycle(cfn):
     """Logs resource policies expose their policy name without enforcing it."""
     suffix = _uuid_mod.uuid4().hex[:8]

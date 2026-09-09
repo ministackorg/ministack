@@ -2705,6 +2705,52 @@ def _cwlogs_subfilter_create(logical_id, props, stack_name):
     return filter_name, {}
 
 
+def _cwlogs_subfilter_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a subscription filter in place through PutSubscriptionFilter,
+    keeping its name (what Ref returns), for the No-interruption properties
+    of the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-logs-subscriptionfilter.html):
+    FilterPattern, DestinationArn, RoleArn and Distribution. The record is
+    put whole, so a property the template drops reverts to what the create
+    stores without it (empty pattern and role, ByLogStream). FilterName and
+    LogGroupName require replacement: the new filter is created before the
+    old one is removed.
+
+    The replacement is spelled out rather than going through
+    _rename_replacement, because a filter is keyed by (group, name): a move
+    to another group under the same name keeps the physical id, so the
+    engine records no replacement and the helper would see none either,
+    leaving the old filter behind in the old group. ApplyOnTransformedLogs,
+    EmitSystemFields and FieldSelectionCriteria are not stored by the
+    service and are ignored.
+    """
+    old_group = old_props.get("LogGroupName")
+    new_group = new_props.get("LogGroupName")
+    if not new_group:
+        raise ValueError("AWS::Logs::SubscriptionFilter requires LogGroupName")
+    filter_name = new_props.get("FilterName") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=512)
+    grp = _cw_logs._log_groups.get(old_group)
+    current = grp.get("subscriptionFilters", {}).get(physical_id) if grp else None
+    if current is None or filter_name != physical_id or new_group != old_group:
+        created = _cwlogs_subfilter_create(logical_id or physical_id, new_props, stack_name)
+        if current is not None and not _RETAIN_REPLACED.get():
+            _cwlogs_subfilter_delete(physical_id, old_props)
+        return created
+
+    resp = _cw_logs._put_subscription_filter({
+        "logGroupName": new_group,
+        "filterName": physical_id,
+        "filterPattern": new_props.get("FilterPattern", ""),
+        "destinationArn": new_props.get("DestinationArn", ""),
+        "roleArn": new_props.get("RoleArn", ""),
+        "distribution": new_props.get("Distribution", "ByLogStream"),
+    })
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Logs::SubscriptionFilter update failed: {resp[2]!r}")
+    return physical_id, {}
+
+
 def _cwlogs_subfilter_delete(physical_id, props):
     grp = _cw_logs._log_groups.get(props.get("LogGroupName"))
     if grp:
@@ -9217,7 +9263,12 @@ _RESOURCE_HANDLERS = {
         "update": _cwlogs_resource_policy_update,
         "delete": _cwlogs_resource_policy_delete,
     },
-    "AWS::Logs::SubscriptionFilter": {"create": _cwlogs_subfilter_create, "delete": _cwlogs_subfilter_delete},
+    "AWS::Logs::SubscriptionFilter": {
+        "create": _cwlogs_subfilter_create,
+        "update": _cwlogs_subfilter_update,
+        "update_with_logical_id": True,
+        "delete": _cwlogs_subfilter_delete,
+    },
     "AWS::Events::EventBus": {"create": _eb_event_bus_create, "update": _eb_event_bus_update, "delete": _eb_event_bus_delete},
     "AWS::Kinesis::Stream": {"create": _kinesis_stream_create, "update": _kinesis_stream_update, "delete": _kinesis_stream_delete},
     "AWS::Events::Rule": {
