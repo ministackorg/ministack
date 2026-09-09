@@ -9050,6 +9050,83 @@ def test_cfn_cloudfront_policy_rename_onto_a_taken_name_is_refused(cfn, cloudfro
         cloudfront.delete_cache_policy(Id=other, IfMatch=etag)
 
 
+def _origin_request_policy_template(name, comment=None, query_behavior="all",
+                                    headers=("X-Tenant-Key",)):
+    config = {
+        "Name": name,
+        "HeadersConfig": {"HeaderBehavior": "whitelist", "Headers": list(headers)},
+        "QueryStringsConfig": {"QueryStringBehavior": query_behavior},
+        "CookiesConfig": {"CookieBehavior": "none"},
+    }
+    if comment is not None:
+        config["Comment"] = comment
+    return {
+        "Resources": {"Orp": {"Type": "AWS::CloudFront::OriginRequestPolicy",
+                              "Properties": {"OriginRequestPolicyConfig": config}}},
+        "Outputs": {"Id": {"Value": {"Ref": "Orp"}}},
+    }
+
+
+def test_cfn_cloudfront_origin_request_policy_updates_in_place(cfn, cloudfront):
+    """AWS::CloudFront::OriginRequestPolicy is "No interruption" throughout, so
+    an UpdateStack keeps the policy Id, the whitelists follow the template, and
+    a dropped Comment goes back to the create default."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-orp-update-{uid}"
+    name = f"cfn-orp-update-{uid}"
+    renamed = f"cfn-orp-renamed-{uid}"
+    try:
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _origin_request_policy_template(name, comment="v1"))
+        policy_id = out["Id"]
+        cfg = cloudfront.get_origin_request_policy(
+            Id=policy_id)["OriginRequestPolicy"]["OriginRequestPolicyConfig"]
+        assert cfg["Comment"] == "v1"
+        assert cfg["QueryStringsConfig"]["QueryStringBehavior"] == "all"
+
+        # In-place: the behaviour flips and the header whitelist grows, same Id.
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _origin_request_policy_template(
+                                name, comment="v2", query_behavior="none",
+                                headers=("X-Tenant-Key", "X-Service")),
+                            update=True)
+        assert out["Id"] == policy_id
+        cfg = cloudfront.get_origin_request_policy(
+            Id=policy_id)["OriginRequestPolicy"]["OriginRequestPolicyConfig"]
+        assert cfg["Comment"] == "v2"
+        assert cfg["QueryStringsConfig"]["QueryStringBehavior"] == "none"
+        assert cfg["HeadersConfig"]["Headers"]["Items"] == ["X-Tenant-Key", "X-Service"]
+
+        # A rename keeps the same policy.
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _origin_request_policy_template(
+                                renamed, comment="v2", query_behavior="none",
+                                headers=("X-Tenant-Key", "X-Service")),
+                            update=True)
+        assert out["Id"] == policy_id
+        cfg = cloudfront.get_origin_request_policy(
+            Id=policy_id)["OriginRequestPolicy"]["OriginRequestPolicyConfig"]
+        assert cfg["Name"] == renamed
+        names = [p["OriginRequestPolicy"]["OriginRequestPolicyConfig"]["Name"] for p in
+                 cloudfront.list_origin_request_policies()[
+                     "OriginRequestPolicyList"]["Items"]]
+        assert names.count(renamed) == 1
+        assert name not in names
+
+        # Dropped Comment reverts.
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _origin_request_policy_template(
+                                renamed, query_behavior="none",
+                                headers=("X-Tenant-Key", "X-Service")),
+                            update=True)
+        assert out["Id"] == policy_id
+        cfg = cloudfront.get_origin_request_policy(
+            Id=policy_id)["OriginRequestPolicy"]["OriginRequestPolicyConfig"]
+        assert cfg.get("Comment", "") == ""
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_cloudfront_distribution_consumes_provisioned_policies(cfn, cloudfront):
     """The payoff: a distribution in the same stack references the policies and
     the function by Ref/GetAtt. This is what a CDK app emits, and it only works

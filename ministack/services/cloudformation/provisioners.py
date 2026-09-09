@@ -290,6 +290,15 @@ def _cf_origin_request_policy_create(logical_id, props, stack_name):
                              "OriginRequestPolicyConfig", logical_id, stack_name)
 
 
+def _cf_origin_request_policy_update(physical_id, old_props, new_props, stack_name,
+                                     logical_id=None):
+    return _cf_policy_update(_cf._origin_request_policies, _cf._ORP_SPEC["parse"],
+                             "AWS::CloudFront::OriginRequestPolicy",
+                             _cf_origin_request_policy_create,
+                             physical_id, new_props, "OriginRequestPolicyConfig",
+                             logical_id, stack_name)
+
+
 def _cf_origin_request_policy_delete(physical_id, props):
     _cf._origin_request_policies.pop(physical_id, None)
 
@@ -8923,7 +8932,12 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _cf_cache_policy_delete,
     },
-    "AWS::CloudFront::OriginRequestPolicy": {"create": _cf_origin_request_policy_create, "delete": _cf_origin_request_policy_delete},
+    "AWS::CloudFront::OriginRequestPolicy": {
+        "create": _cf_origin_request_policy_create,
+        "update": _cf_origin_request_policy_update,
+        "update_with_logical_id": True,
+        "delete": _cf_origin_request_policy_delete,
+    },
     "AWS::CloudFront::ResponseHeadersPolicy": {"create": _cf_response_headers_policy_create, "delete": _cf_response_headers_policy_delete},
     "AWS::CloudFront::OriginAccessControl": {"create": _cf_oac_create, "delete": _cf_oac_delete},
     "AWS::CloudFront::Function": {"create": _cf_function_create, "delete": _cf_function_delete},
