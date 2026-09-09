@@ -240,6 +240,115 @@ def test_location_batch_update_then_get_position(location):
     location.delete_tracker(TrackerName=name)
 
 
+def test_location_time_based_filtering_stores_one_sample_per_30_seconds(location):
+    """TimeBased is the default: "If your update frequency is more often than
+    30 seconds, only one update per 30 seconds is stored for each unique
+    device ID"."""
+    name = _uid()
+    location.create_tracker(TrackerName=name)
+    assert location.describe_tracker(
+        TrackerName=name)["PositionFiltering"] == "TimeBased"
+
+    for offset in (0, 10, 29, 30, 61):
+        resp = location.batch_update_device_position(
+            TrackerName=name,
+            Updates=[{"DeviceId": "veh-1", "SampleTime": _ts(offset),
+                      "Position": [11.5761 + offset / 1000.0, 48.1371]}],
+        )
+        # A filtered update is not an error: it is simply not stored.
+        assert resp["Errors"] == []
+
+    history = location.get_device_position_history(
+        TrackerName=name, DeviceId="veh-1")["DevicePositions"]
+    assert [p["SampleTime"] for p in history] == [_ts(0), _ts(30), _ts(61)]
+    location.delete_tracker(TrackerName=name)
+
+
+def test_location_distance_based_filtering_ignores_moves_under_30_m(location):
+    """DistanceBased: "If the device has moved less than 30 m (98.4 ft),
+    location updates are ignored"."""
+    name = _uid()
+    location.create_tracker(TrackerName=name, PositionFiltering="DistanceBased")
+    # 0.0001 degrees of latitude is about 11 m, 0.0005 about 56 m.
+    for offset, lat in ((0, 48.1371), (60, 48.1372), (120, 48.1376)):
+        location.batch_update_device_position(
+            TrackerName=name,
+            Updates=[{"DeviceId": "veh-1", "SampleTime": _ts(offset),
+                      "Position": [11.5761, lat]}],
+        )
+
+    history = location.get_device_position_history(
+        TrackerName=name, DeviceId="veh-1")["DevicePositions"]
+    assert [p["SampleTime"] for p in history] == [_ts(0), _ts(120)]
+    assert [p["Position"][1] for p in history] == [48.1371, 48.1376]
+    location.delete_tracker(TrackerName=name)
+
+
+def test_location_accuracy_based_filtering_ignores_moves_under_the_accuracy(location):
+    """AccuracyBased, with the reference's own example: two consecutive
+    updates of 5 m and 10 m horizontal accuracy ignore the second when the
+    device has moved less than 15 m."""
+    name = _uid()
+    location.create_tracker(TrackerName=name, PositionFiltering="AccuracyBased")
+    location.batch_update_device_position(
+        TrackerName=name,
+        Updates=[{"DeviceId": "veh-1", "SampleTime": _ts(0),
+                  "Position": [11.5761, 48.1371],
+                  "Accuracy": {"Horizontal": 5.0}}],
+    )
+    # About 11 m north, under the 15 m the two accuracies add up to.
+    location.batch_update_device_position(
+        TrackerName=name,
+        Updates=[{"DeviceId": "veh-1", "SampleTime": _ts(60),
+                  "Position": [11.5761, 48.1372],
+                  "Accuracy": {"Horizontal": 10.0}}],
+    )
+    # About 56 m north, above it.
+    location.batch_update_device_position(
+        TrackerName=name,
+        Updates=[{"DeviceId": "veh-1", "SampleTime": _ts(120),
+                  "Position": [11.5761, 48.1376],
+                  "Accuracy": {"Horizontal": 10.0}}],
+    )
+
+    history = location.get_device_position_history(
+        TrackerName=name, DeviceId="veh-1")["DevicePositions"]
+    assert [p["SampleTime"] for p in history] == [_ts(0), _ts(120)]
+    location.delete_tracker(TrackerName=name)
+
+
+def test_location_filtering_is_per_device_and_survives_an_update_tracker(location):
+    """The 30 second window is per unique device id, and UpdateTracker can
+    switch the mode of an existing tracker."""
+    name = _uid()
+    location.create_tracker(TrackerName=name)
+    location.batch_update_device_position(
+        TrackerName=name,
+        Updates=[
+            {"DeviceId": "veh-1", "SampleTime": _ts(0), "Position": [11.5761, 48.1371]},
+            {"DeviceId": "veh-2", "SampleTime": _ts(1), "Position": [11.5761, 48.1371]},
+        ],
+    )
+    for device in ("veh-1", "veh-2"):
+        assert location.get_device_position(
+            TrackerName=name, DeviceId=device)["SampleTime"] in (_ts(0), _ts(1))
+
+    location.update_tracker(TrackerName=name, PositionFiltering="DistanceBased")
+    assert location.describe_tracker(
+        TrackerName=name)["PositionFiltering"] == "DistanceBased"
+    # One second later but 56 m away: TimeBased would have dropped it,
+    # DistanceBased keeps it.
+    location.batch_update_device_position(
+        TrackerName=name,
+        Updates=[{"DeviceId": "veh-1", "SampleTime": _ts(1),
+                  "Position": [11.5761, 48.1376]}],
+    )
+    history = location.get_device_position_history(
+        TrackerName=name, DeviceId="veh-1")["DevicePositions"]
+    assert len(history) == 2
+    location.delete_tracker(TrackerName=name)
+
+
 def test_location_get_position_unknown_device_404(location):
     name = _uid()
     location.create_tracker(TrackerName=name)
@@ -252,9 +361,18 @@ def test_location_get_position_unknown_device_404(location):
     location.delete_tracker(TrackerName=name)
 
 
+# The history tests below need every sample they send to be stored. All three
+# filtering modes drop something, and the only configuration that keeps every
+# sample is AccuracyBased on updates that carry no Accuracy: the reference
+# ignores an update when the device "has moved less than the measured
+# accuracy", and nothing measured it. TimeBased, the default, would collapse
+# samples closer together than 30 seconds.
+_KEEP_EVERY_SAMPLE = {"PositionFiltering": "AccuracyBased"}
+
+
 def test_location_position_history_in_order(location):
     name = _uid()
-    location.create_tracker(TrackerName=name)
+    location.create_tracker(TrackerName=name, **_KEEP_EVERY_SAMPLE)
     # Delivered out of order — history must come back ascending by SampleTime.
     location.batch_update_device_position(
         TrackerName=name,
@@ -386,12 +504,11 @@ def test_location_batch_update_rejects_out_of_range_positions(location):
 
 
 def test_location_history_bounded_to_newest_100(location):
-    """Per-device history keeps the newest 100 samples (a stated divergence:
-    real TimeBased filtering stores at most one position per 30 s per device
-    and retains 30 days; MiniStack keeps every sample but only the newest
-    100)."""
+    """Per-device history keeps the newest 100 samples. A stated divergence:
+    the service retains 30 days of positions, MiniStack the newest 100 per
+    device."""
     name = _uid()
-    location.create_tracker(TrackerName=name)
+    location.create_tracker(TrackerName=name, **_KEEP_EVERY_SAMPLE)
     # The modeled Updates list caps at 10 entries per call.
     for chunk_start in range(0, 105, 10):
         location.batch_update_device_position(
@@ -415,7 +532,7 @@ def test_location_history_default_window_is_last_24_hours(location):
     """With StartTimeInclusive/EndTimeExclusive omitted, the documented
     defaults apply: the 24 hours up to now."""
     name = _uid()
-    location.create_tracker(TrackerName=name)
+    location.create_tracker(TrackerName=name, **_KEEP_EVERY_SAMPLE)
     old = _ts(-24 * 3600)  # 25 hours ago — outside the default window
     location.batch_update_device_position(
         TrackerName=name,
@@ -660,7 +777,7 @@ def test_location_position_history_pages(location):
     """GetDevicePositionHistory pages at MaxResults, ascending across pages,
     and refuses a foreign token."""
     name = _uid()
-    location.create_tracker(TrackerName=name)
+    location.create_tracker(TrackerName=name, **_KEEP_EVERY_SAMPLE)
     location.batch_update_device_position(
         TrackerName=name,
         Updates=[{"DeviceId": "veh-1", "SampleTime": _ts(i), "Position": [1.0, 1.0]}
@@ -692,7 +809,7 @@ def test_location_position_history_pages_over_equal_timestamps(location):
     with a strict `>`, so a sort key of the two timestamps alone would drop the
     second one whenever the page boundary falls between them."""
     name = _uid()
-    location.create_tracker(TrackerName=name)
+    location.create_tracker(TrackerName=name, **_KEEP_EVERY_SAMPLE)
     location.batch_update_device_position(
         TrackerName=name,
         Updates=[

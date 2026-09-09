@@ -67,6 +67,7 @@ import copy
 import datetime
 import json
 import logging
+import math
 import re
 import time
 import unicodedata
@@ -568,6 +569,63 @@ def _parse_update(index, update):
     return (device_id, sample_time, position), None
 
 
+# The filtering thresholds the CreateTracker reference documents: TimeBased
+# stores "only one update per 30 seconds ... for each unique device ID",
+# DistanceBased ignores an update when "the device has moved less than 30 m
+# (98.4 ft)", and AccuracyBased ignores it when the device "has moved less
+# than the measured accuracy" (the reference's own example adds the two
+# horizontal accuracies: 5 m and 10 m ignore a move under 15 m).
+_TIME_FILTER_SECONDS = 30.0
+_DISTANCE_FILTER_METRES = 30.0
+_EARTH_RADIUS_METRES = 6371008.8
+
+
+def _metres_between(a, b):
+    """Great-circle distance between two [lon, lat] pairs, in metres."""
+    lon1, lat1 = math.radians(a[0]), math.radians(a[1])
+    lon2, lat2 = math.radians(b[0]), math.radians(b[1])
+    dlon, dlat = lon2 - lon1, lat2 - lat1
+    h = (math.sin(dlat / 2) ** 2
+         + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2)
+    return 2 * _EARTH_RADIUS_METRES * math.asin(min(1.0, math.sqrt(h)))
+
+
+def _horizontal_accuracy(accuracy):
+    """The Horizontal member of a PositionalAccuracy, or None."""
+    if isinstance(accuracy, dict) and _is_number(accuracy.get("Horizontal")):
+        return float(accuracy["Horizontal"])
+    return None
+
+
+def _is_filtered_out(mode, previous, sample_time, position, accuracy):
+    """Whether the tracker's PositionFiltering drops this update.
+
+    The comparison is against the newest sample the device already has. A
+    dropped update is not an error: the reference says such updates are
+    "neither evaluated against linked geofence collections, nor stored", and
+    BatchUpdateDevicePosition reports nothing for them. Unmeasured: an update
+    whose SampleTime is older than the stored one, which the reference does
+    not describe; MiniStack treats it by the same distance in time.
+    """
+    if previous is None:
+        return False
+    if mode == "TimeBased":
+        # SampleTime is epoch seconds here (see _parse_timestamp).
+        return abs(sample_time - previous["SampleTime"]) < _TIME_FILTER_SECONDS
+    moved = _metres_between(previous["Position"], position)
+    if mode == "DistanceBased":
+        return moved < _DISTANCE_FILTER_METRES
+    if mode == "AccuracyBased":
+        previous_accuracy = _horizontal_accuracy(previous.get("Accuracy"))
+        current_accuracy = _horizontal_accuracy(accuracy)
+        if previous_accuracy is None and current_accuracy is None:
+            # Nothing measured the accuracy, so nothing can be below it.
+            return False
+        threshold = (previous_accuracy or 0.0) + (current_accuracy or 0.0)
+        return moved < threshold
+    return False
+
+
 def _batch_update_positions(name, body):
     rec = _trackers.get(name)
     if rec is None:
@@ -607,6 +665,11 @@ def _batch_update_positions(name, body):
                 "Error": {"Code": "ValidationError", "Message": problem},
             })
             continue
+        device = rec["positions"].setdefault(device_id, {"latest": None, "history": []})
+        if _is_filtered_out(rec.get("PositionFiltering", "TimeBased"),
+                            device["latest"], sample_time, position,
+                            update.get("Accuracy")):
+            continue
         pos = {
             "DeviceId": device_id,
             "SampleTime": sample_time,
@@ -618,7 +681,6 @@ def _batch_update_positions(name, body):
             pos["Accuracy"] = update["Accuracy"]
         if "PositionProperties" in update:
             pos["PositionProperties"] = update["PositionProperties"]
-        device = rec["positions"].setdefault(device_id, {"latest": None, "history": []})
         history = device["history"]
         history.append(pos)
         history.sort(key=_history_key)
