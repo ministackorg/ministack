@@ -836,6 +836,50 @@ def test_location_accuracy_validated(location):
     location.delete_tracker(TrackerName=name)
 
 
+def test_location_device_id_validated(location):
+    """DeviceId is the modeled Id — "Length Constraints: Minimum length of 1.
+    Maximum length of 100" on DevicePositionUpdate, BatchGetDevicePosition,
+    GetDevicePosition and GetDevicePositionHistory alike, on the pattern
+    ([-._\\p{L}\\p{N}]+). botocore checks neither the maximum nor the pattern,
+    so both reach the emulator from an ordinary SDK call. Wordings
+    unmeasured."""
+    name = _uid()
+    location.create_tracker(TrackerName=name)
+    for device_id in ("d" * 101, "veh 1"):
+        with pytest.raises(ClientError) as excinfo:
+            location.batch_update_device_position(
+                TrackerName=name,
+                Updates=[{"DeviceId": device_id, "SampleTime": _ts(0),
+                          "Position": [1.0, 1.0]}],
+            )
+        err = excinfo.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert "deviceId" in err["Message"]
+        for read in (location.get_device_position,
+                     location.get_device_position_history):
+            with pytest.raises(ClientError) as excinfo:
+                read(TrackerName=name, DeviceId=device_id)
+            err = excinfo.value.response["Error"]
+            assert err["Code"] == "ValidationException", (device_id, err)
+            assert "deviceId" in err["Message"]
+        with pytest.raises(ClientError) as excinfo:
+            location.batch_get_device_position(
+                TrackerName=name, DeviceIds=[device_id])
+        assert excinfo.value.response["Error"]["Code"] == "ValidationException"
+
+    # The bounds themselves pass, Unicode letters included: unlike the tracker
+    # name, the Id pattern is written with \p{L}\p{N} and takes them.
+    for device_id in ("d" * 100, "gerät-1"):
+        location.batch_update_device_position(
+            TrackerName=name,
+            Updates=[{"DeviceId": device_id, "SampleTime": _ts(0),
+                      "Position": [1.0, 1.0]}],
+        )
+        stored = location.get_device_position(TrackerName=name, DeviceId=device_id)
+        assert stored["DeviceId"] == device_id
+    location.delete_tracker(TrackerName=name)
+
+
 def test_location_batch_get_device_ids_bounded(location):
     name = _uid()
     location.create_tracker(TrackerName=name)
@@ -846,6 +890,27 @@ def test_location_batch_get_device_ids_bounded(location):
     err = excinfo.value.response["Error"]
     assert err["Code"] == "ValidationException"
     assert "deviceIds" in err["Message"]
+    location.delete_tracker(TrackerName=name)
+
+
+def test_location_batch_get_rejects_invalid_device_ids(location):
+    """The list's member is an Id too, so an element that breaks it is
+    refused — not dropped from the response, which is what a device that has
+    no position looks like. botocore refuses to send a non-string element:
+    raw wire."""
+    name = _uid()
+    location.create_tracker(TrackerName=name)
+    location.batch_update_device_position(
+        TrackerName=name,
+        Updates=[{"DeviceId": "veh-1", "SampleTime": _ts(0), "Position": [1.0, 1.0]}],
+    )
+    for device_ids in (["veh-1", 5], ["veh-1", ""], ["veh-1", "d" * 101],
+                       ["veh-1", "veh 2"]):
+        status, body = _raw_post(
+            f"/tracking/v0/trackers/{name}/get-positions", {"DeviceIds": device_ids}
+        )
+        assert status == 400, body
+        assert "deviceIds.2.member" in json.dumps(body)
     location.delete_tracker(TrackerName=name)
 
 

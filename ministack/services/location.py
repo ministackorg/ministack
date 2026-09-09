@@ -52,8 +52,10 @@ Scope boundaries (metadata-only control plane + in-memory position store):
     0..1000, ``KmsKeyId`` 1..2048, ``Tags`` at most 50 entries with keys
     1..128 and values 0..256 on the tag pattern, ``PositionProperties`` at
     most 4 entries with keys 1..20 and values 1..150, ``Accuracy`` a
-    structure whose required ``Horizontal`` runs 0..10000000. The message
-    wordings are unmeasured.
+    structure whose required ``Horizontal`` runs 0..10000000, and every
+    ``DeviceId`` — in an update, in a ``DeviceIds`` list or in the path — the
+    modeled ``Id``: 1..100 on ``[-._\\p{L}\\p{N}]+``. The message wordings are
+    unmeasured.
   * ``BatchUpdateDevicePosition`` answers a structurally invalid entry (a
     required member missing, ``Position`` not two numbers) with a
     request-level ``ValidationException``; the per-entry ``Errors`` list is
@@ -309,6 +311,20 @@ def _tag_text_ok(value):
     )
 
 
+# The model's Id shape (DeviceId everywhere it appears), pattern
+# ``([-._\p{L}\p{N}]+)``: the same missing Unicode property classes as the tag
+# pattern above, so letters (L*) and numbers (N*) go through unicodedata too.
+# It carries no separator class, so a device id may not contain a space.
+_DEVICE_ID_LITERALS = frozenset("-._")
+
+
+def _device_id_ok(value):
+    return all(
+        unicodedata.category(ch)[0] in ("L", "N") or ch in _DEVICE_ID_LITERALS
+        for ch in value
+    )
+
+
 def _validate_string_length(body, member, field, minimum, maximum):
     """A documented string length constraint, checked before the request is
     processed. The wordings are unmeasured (see ``_constraint``)."""
@@ -362,6 +378,30 @@ def _validate_string_map(value, field, max_entries, key_len, value_len, pattern=
                     f"Map {kind} must satisfy regular expression pattern: "
                     r"([\p{L}\p{Z}\p{N}_.,:/=+\-@]*)",
                 )
+    return None
+
+
+def _validate_device_id(value, field):
+    """The model's Id shape: a 1..100 string on ``[-._\\p{L}\\p{N}]+``. Every
+    reference that carries a device id documents it — DevicePositionUpdate,
+    BatchGetDevicePosition, GetDevicePosition, GetDevicePositionHistory —
+    including the ones that take it from the path. Wordings unmeasured."""
+    if not isinstance(value, str):
+        return _constraint(value, field, "Member must be a string")
+    if len(value) > 100:
+        return _constraint(
+            value, field, "Member must have length less than or equal to 100"
+        )
+    if not value:
+        return _constraint(
+            value, field, "Member must have length greater than or equal to 1"
+        )
+    if not _device_id_ok(value):
+        return _constraint(
+            value, field,
+            "Member must satisfy regular expression pattern: "
+            r"([-._\p{L}\p{N}]+)",
+        )
     return None
 
 
@@ -590,8 +630,11 @@ def _parse_update(index, update):
     if not isinstance(update, dict):
         return None, _constraint(update, member, "Member must be a structure")
     device_id = update.get("DeviceId")
-    if not isinstance(device_id, str) or not device_id:
+    if device_id is None:
         return None, _constraint(device_id, f"{member}.deviceId", "Member must not be null")
+    err = _validate_device_id(device_id, f"{member}.deviceId")
+    if err is not None:
+        return None, err
     sample_time = _parse_timestamp(update.get("SampleTime"))
     if sample_time is None:
         return None, _constraint(
@@ -748,6 +791,9 @@ def _history_key(pos):
 
 
 def _get_device_position(name, device_id):
+    err = _validate_device_id(device_id, "deviceId")
+    if err is not None:
+        return err
     rec = _trackers.get(name)
     if rec is None:
         return _not_found(name)
@@ -769,6 +815,13 @@ def _batch_get_positions(name, body):
         return _constraint(
             len(device_ids), "deviceIds", "Member must have length less than or equal to 10"
         )
+    for index, device_id in enumerate(device_ids):
+        # The list's member is the Id shape too: an element that breaks it is
+        # refused, not quietly left out of the response as a device without a
+        # position would be.
+        err = _validate_device_id(device_id, f"deviceIds.{index + 1}.member")
+        if err is not None:
+            return err
     rec = _trackers.get(name)
     if rec is None:
         return _not_found(name)
@@ -783,6 +836,9 @@ def _batch_get_positions(name, body):
 
 
 def _get_position_history(name, device_id, body):
+    err = _validate_device_id(device_id, "deviceId")
+    if err is not None:
+        return err
     max_results, err = _max_results(body)
     if err is not None:
         return err
