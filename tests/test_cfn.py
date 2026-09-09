@@ -2350,6 +2350,57 @@ def test_cfn_change_set_lifecycle(cfn):
     stack = _wait_stack(cfn, "cfn-t08")
     assert stack["StackStatus"] == "CREATE_COMPLETE"
 
+def test_cfn_stack_and_change_set_report_their_capabilities(cfn):
+    """DescribeStacks and DescribeChangeSet report the capabilities the
+    operation acknowledged; an update replaces them, and an update that sends
+    none leaves the member empty."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-caps-rep-{uid}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Q": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": f"{stack_name}-q"}},
+        },
+    }
+    try:
+        cfn.create_change_set(
+            StackName=stack_name,
+            ChangeSetName="cs1",
+            TemplateBody=json.dumps(template),
+            ChangeSetType="CREATE",
+            Capabilities=["CAPABILITY_IAM"],
+        )
+        time.sleep(1)
+        cs = cfn.describe_change_set(StackName=stack_name, ChangeSetName="cs1")
+        assert cs["Capabilities"] == ["CAPABILITY_IAM"]
+
+        cfn.execute_change_set(StackName=stack_name, ChangeSetName="cs1")
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        assert stack["Capabilities"] == ["CAPABILITY_IAM"]
+
+        updated = json.loads(json.dumps(template))
+        updated["Resources"]["Q"]["Properties"]["DelaySeconds"] = 5
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(updated),
+            Capabilities=["CAPABILITY_NAMED_IAM", "CAPABILITY_AUTO_EXPAND"],
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE"
+        assert stack["Capabilities"] == ["CAPABILITY_NAMED_IAM", "CAPABILITY_AUTO_EXPAND"]
+
+        # The member is what the last operation acknowledged: an update that
+        # sends none blanks it.
+        updated["Resources"]["Q"]["Properties"]["DelaySeconds"] = 6
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(updated))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE"
+        assert stack.get("Capabilities", []) == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_change_set_create_emits_review_event(cfn):
     template = {
         "AWSTemplateFormatVersion": "2010-09-09",

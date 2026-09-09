@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 - **CloudFormation — `ValidateTemplate` reports the capabilities and transforms it found** — it answered `Description` and `Parameters` only, so a caller checking a template before a deploy could not see that it needs `CAPABILITY_IAM` or that it declares a transform. It now returns `Capabilities`, `CapabilitiesReason` and `DeclaredTransforms` as the API documents, using the same rule `GetTemplateSummary` already applied. Contributed by @iot-rocket.
+- **CloudFormation — a stack and a change set report their capabilities** — `DescribeStacks` and `DescribeChangeSet` left the `Capabilities` member out, so a client could not see what a deploy had acknowledged. Both report them now: a stack carries what its last `CreateStack` or `UpdateStack` acknowledged, an executed change set makes its own set the stack's, and a change set reports what it was created with. Contributed by @iot-rocket.
 
 ### Changed
 - **Lambda — warm local custom runtimes** — `provided.*` bootstraps now reuse the existing subprocess worker pool instead of restarting on every invocation. Each invocation receives its request metadata through the Lambda Runtime API, concurrent calls use separate workers, and failed environments are cleaned up before reuse. Durable invocations retain their one-shot executor; Docker, image, and proxy execution are unchanged.

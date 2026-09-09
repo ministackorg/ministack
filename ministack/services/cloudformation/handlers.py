@@ -323,6 +323,7 @@ def _create_stack(params):
             for k, v in param_values.items()
         ],
         "Tags": tags,
+        "Capabilities": _extract_string_members(params, "Capabilities"),
         "Outputs": [],
         "DisableRollback": disable_rollback,
         "EnableTerminationProtection": termination_protection,
@@ -447,6 +448,9 @@ def _describe_stacks(params):
                 "</member>"
             )
 
+        caps_xml = "".join(
+            f"<member>{_esc(c)}</member>" for c in s.get("Capabilities", []))
+
         members += (
             "<member>"
             f"<StackName>{_esc(s['StackName'])}</StackName>"
@@ -460,6 +464,7 @@ def _describe_stacks(params):
             "<EnableTerminationProtection>"
             f"{str(s.get('EnableTerminationProtection', False)).lower()}"
             "</EnableTerminationProtection>"
+            f"<Capabilities>{caps_xml}</Capabilities>"
             f"<Parameters>{params_xml}</Parameters>"
             f"<Outputs>{outputs_xml}</Outputs>"
             f"<Tags>{tags_xml}</Tags>"
@@ -970,6 +975,9 @@ def _update_stack(params):
     stack["StackStatus"] = "UPDATE_IN_PROGRESS"
     stack["LastUpdatedTime"] = now_iso()
     stack["_template_body"] = template_body
+    # The capabilities a stack reports are the ones its last operation
+    # acknowledged, so an update replaces them rather than adding to them.
+    stack["Capabilities"] = _extract_string_members(params, "Capabilities")
     if tags or tags_given:
         stack["Tags"] = tags
     stack["Parameters"] = [
