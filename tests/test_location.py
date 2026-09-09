@@ -137,6 +137,21 @@ def test_location_tracker_name_validated(location):
     assert "length less than or equal to 100" in err["Message"]
 
 
+def test_location_tracker_name_is_ascii(location):
+    """The pattern [-._\\w]+ is a Java regex service-side, where \\w is ASCII.
+    The CreateTracker reference spells it out — a name may "contain only
+    alphanumeric characters (A-Z, a-z, 0-9), hyphens (-), periods (.), and
+    underscores (_)" — so a Unicode letter is refused, not stored."""
+    for name in ("Trackeré", "トラッカー", "trk-µ"):
+        with pytest.raises(ClientError) as excinfo:
+            location.create_tracker(TrackerName=name)
+        err = excinfo.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert "[-._\\w]+" in err["Message"]
+        with pytest.raises(ClientError):
+            location.describe_tracker(TrackerName=name)
+
+
 def test_location_duplicate_tracker_conflicts(location):
     name = _uid()
     location.create_tracker(TrackerName=name)

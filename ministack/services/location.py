@@ -255,8 +255,13 @@ _INVALID_TOKEN = "The NextToken that you provided is invalid."
 
 
 # The model's ResourceName shape: pattern [-._\w]+, length 1-100 (the length
-# is checked separately so the two constraints report distinctly).
-_TRACKER_NAME_RE = re.compile(r"[-._\w]+")
+# is checked separately so the two constraints report distinctly). The pattern
+# is a Java regex, where \w is [a-zA-Z0-9_]; Python's \w also matches every
+# Unicode letter and digit, so re.ASCII is what makes the two agree. The
+# CreateTracker reference spells the same thing out: a tracker name may
+# "contain only alphanumeric characters (A-Z, a-z, 0-9), hyphens (-), periods
+# (.), and underscores (_)".
+_TRACKER_NAME_RE = re.compile(r"[-._\w]+", re.ASCII)
 
 _POSITION_FILTERING = ("TimeBased", "DistanceBased", "AccuracyBased")
 
