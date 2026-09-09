@@ -728,7 +728,11 @@ def _is_filtered_out(mode, previous, sample_time, position, accuracy):
         previous_accuracy = _horizontal_accuracy(previous.get("Accuracy"))
         current_accuracy = _horizontal_accuracy(accuracy)
         if previous_accuracy is None and current_accuracy is None:
-            # Nothing measured the accuracy, so nothing can be below it.
+            # BatchUpdateDevicePosition: "If PositionFiltering is set to
+            # AccuracyBased filtering, Amazon Location uses the default value
+            # { "Horizontal": 0} when accuracy is not provided on a
+            # DevicePositionUpdate." A threshold of 0 keeps every update,
+            # which is what returning here does.
             return False
         threshold = (previous_accuracy or 0.0) + (current_accuracy or 0.0)
         return moved < threshold
