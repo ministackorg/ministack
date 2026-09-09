@@ -129,6 +129,68 @@ def test_provided_dispatch_preserves_other_executors(monkeypatch, mode, target):
         executors[target].assert_called_once_with(func, {}, "request-1")
 
 
+@pytest.mark.parametrize("runtime", ["python3.12", "nodejs20.x"])
+@pytest.mark.parametrize("durable", [False, True])
+def test_python_and_nodejs_dispatch_to_the_warm_pool_durable_or_not(
+        monkeypatch, runtime, durable):
+    """The sibling of the provided.* routing above: python and nodejs reach
+    _execute_function_warm whether or not the invocation is durable, because
+    their per-call durable context rides in the event rather than in the
+    worker's spawn environment."""
+    monkeypatch.setattr(lambda_svc, "LAMBDA_EXECUTOR", "local")
+    monkeypatch.setattr(lambda_svc, "LAMBDA_STRICT", False)
+    monkeypatch.setattr(lambda_svc, "_proxy_url_for", lambda config: None)
+    monkeypatch.setattr(lambda_svc, "_emit_lambda_logs", Mock())
+    names = ["_execute_function_warm", "_execute_function_local",
+             "_execute_function_provided", "_execute_function_provided_warm",
+             "_execute_function_docker", "_execute_function_proxy"]
+    executors = {name: Mock(return_value={"body": name}) for name in names}
+    for name, executor in executors.items():
+        monkeypatch.setattr(lambda_svc, name, executor)
+    config = _config()
+    config["Runtime"] = runtime
+    func = {"config": config, "code_zip": b"zip"}
+    token = lambda_svc._durable_ctx.set({"test": True} if durable else None)
+    try:
+        result = lambda_svc._execute_function_dispatch(func, config, {}, "request-1", time.time())
+    finally:
+        lambda_svc._durable_ctx.reset(token)
+    assert result == {"body": "_execute_function_warm"}
+    for name, executor in executors.items():
+        assert executor.call_count == (1 if name == "_execute_function_warm" else 0)
+
+
+@pytest.mark.parametrize("unavailable", ["sdk", "daemon"])
+def test_docker_unavailable_fallback_carries_the_durable_context(monkeypatch, unavailable):
+    """Both permissive Docker fallbacks send python and nodejs to the warm
+    pool, so the durable context reaches the handler there too. Before the
+    carrier moved into the event they invoked with the three variables unset."""
+    monkeypatch.setattr(lambda_svc, "_docker_available", unavailable != "sdk")
+    monkeypatch.setattr(lambda_svc, "_get_docker_client",
+                        lambda: None if unavailable == "daemon" else object())
+    monkeypatch.setattr(lambda_svc, "LAMBDA_STRICT", False)
+    warm = Mock(return_value={"body": "warm"})
+    one_shot = Mock(return_value={"body": "one-shot"})
+    monkeypatch.setattr(lambda_svc, "_execute_function_warm", warm)
+    monkeypatch.setattr(lambda_svc, "_execute_function_local", one_shot)
+    config = _config()
+    config["Runtime"] = "python3.12"
+    func = {"config": config, "code_zip": b"zip"}
+    token = lambda_svc._durable_ctx.set({"arn": "exec-arn", "token": "tok", "name": "exec"})
+    try:
+        assert lambda_svc._execute_function_docker(func, {}) == {"body": "warm"}
+        overlay = lambda_svc._durable_env_overlay()
+    finally:
+        lambda_svc._durable_ctx.reset(token)
+    warm.assert_called_once_with(func, {})
+    one_shot.assert_not_called()
+    assert overlay == {
+        "AWS_LAMBDA_DURABLE_EXECUTION_ARN": "exec-arn",
+        "AWS_LAMBDA_DURABLE_CHECKPOINT_TOKEN": "tok",
+        "AWS_LAMBDA_DURABLE_EXECUTION_NAME": "exec",
+    }
+
+
 def test_provided_env_keeps_function_vars_and_endpoint_precedence(monkeypatch):
     config = _config()
     config.update(MemorySize=256, Environment={"Variables": {

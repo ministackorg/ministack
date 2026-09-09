@@ -1102,7 +1102,7 @@ aws --endpoint-url=http://localhost:4566 eks delete-cluster --name my-cluster
 
 MiniStack keeps Python, Node.js, and `provided.*` Lambda functions warm between invocations with the local executor. After the first call (cold start), the handler module or custom-runtime bootstrap stays alive in a persistent subprocess. Subsequent calls skip initialization, matching real AWS warm-start behaviour and making test suites significantly faster.
 
-Custom runtimes receive each event through the Lambda Runtime API's long-polling `/runtime/invocation/next` endpoint, with a fresh request ID, deadline, and X-Ray trace header. Concurrent invocations lease separate workers; function updates and deletion invalidate the workers. A timeout or crashed bootstrap is discarded so the next invocation starts a fresh process. Durable invocations retain the one-shot executor because their execution context changes per call. Docker, container-image, and proxy execution are unchanged.
+Custom runtimes receive each event through the Lambda Runtime API's long-polling `/runtime/invocation/next` endpoint, with a fresh request ID, deadline, and X-Ray trace header. Concurrent invocations lease separate workers; function updates and deletion invalidate the workers. A timeout or crashed bootstrap is discarded so the next invocation starts a fresh process. Durable invocations of a custom runtime retain the one-shot executor: a bootstrap's environment is fixed when the process starts, while Python and Node.js carry their per-call durable context in the event and stay on the warm pool. Docker, container-image, and proxy execution are unchanged.
 
 ### Lambda Node.js Runtimes
 
