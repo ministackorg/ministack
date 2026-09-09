@@ -544,19 +544,35 @@ def _job_sort_key(job):
     return (job.get("createdAt") or 0, job.get("jobId") or "")
 
 
-def _encode_job_token(job):
+_TOKEN_FILTERS = ("status", "isRevoked", "platformId", "requestedBy", "jobInvoker")
+
+
+def _token_filter_digest(query):
+    """A fingerprint of the filters a listing was made with. A token is only
+    meaningful for the list it was minted from, so it carries the fingerprint
+    and a call that changes a filter mid-walk is refused rather than resumed
+    at a position that means nothing for the new list."""
+    filters = [(name, query.get(name)) for name in _TOKEN_FILTERS]
+    raw = json.dumps(filters, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _encode_job_token(job, query):
     """A token carries the sort position of the last job on the page, not an
     offset: an offset would skip a job whenever one was created between two
     calls."""
-    raw = json.dumps(list(_job_sort_key(job))).encode("utf-8")
-    return base64.urlsafe_b64encode(raw).decode("ascii")
+    raw = json.dumps(list(_job_sort_key(job)) + [_token_filter_digest(query)])
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
 
 
-def _decode_job_token(token):
-    """The sort key a token carries, or None when the token is not ours."""
+def _decode_job_token(token, query):
+    """The sort key a token carries, or None when the token is not ours or was
+    minted for a different filter set."""
     try:
         raw = json.loads(base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8"))
-        if not isinstance(raw, list) or len(raw) != 2:
+        if not isinstance(raw, list) or len(raw) != 3:
+            return None
+        if raw[2] != _token_filter_digest(query):
             return None
         return (float(raw[0]), str(raw[1]))
     except Exception:
@@ -597,8 +613,18 @@ def _list_signing_jobs(query):
         if str(is_revoked).lower() not in ("true", "false"):
             return _error(400, "ValidationException",
                           f"Invalid value for isRevoked: {is_revoked!r}.")
-        if str(is_revoked).lower() == "true":
-            return json_response({"jobs": []})
+    token = query.get("nextToken")
+    cursor = None
+    if token is not None:
+        cursor = _decode_job_token(token, query)
+        if cursor is None:
+            return _error(400, "ValidationException",
+                          f"Invalid value for nextToken: {token!r}.")
+    # Nothing is ever revoked, so the revoked listing is empty whatever the
+    # rest of the query says. The token is still validated first, or the same
+    # bad token would be a 400 alone and a 200 next to isRevoked=true.
+    if is_revoked is not None and str(is_revoked).lower() == "true":
+        return json_response({"jobs": []})
     invoker_problem = _validate_account_id(query.get("jobInvoker"), "jobInvoker")
     if invoker_problem is not None:
         return invoker_problem
@@ -607,13 +633,6 @@ def _list_signing_jobs(query):
         for field in ("platformId", "requestedBy", "jobInvoker")
         if query.get(field) is not None
     }
-    token = query.get("nextToken")
-    cursor = None
-    if token is not None:
-        cursor = _decode_job_token(token)
-        if cursor is None:
-            return _error(400, "ValidationException",
-                          f"Invalid value for nextToken: {token!r}.")
     matched = []
     for job in _jobs.values():
         if status_filter and job.get("status") != status_filter:
@@ -634,7 +653,7 @@ def _list_signing_jobs(query):
         jobs.append(summary)
     result = {"jobs": jobs}
     if remaining:
-        result["nextToken"] = _encode_job_token(page[-1])
+        result["nextToken"] = _encode_job_token(page[-1], query)
     return json_response(result)
 
 

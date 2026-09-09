@@ -592,6 +592,35 @@ def test_signer_list_jobs_last_page_has_no_next_token(signer, s3, buckets, profi
     assert "nextToken" not in page
 
 
+def test_signer_list_jobs_token_is_bound_to_its_filter_set(signer, s3, buckets, profile):
+    """A token is only meaningful for the list it came from, so resuming with
+    a different filter is refused rather than served from a position that
+    means nothing for the new list."""
+    src, dst = buckets
+    s3.put_object(Bucket=src, Key="bound.bin", Body=b"b")
+    for _ in range(2):
+        _start(signer, src, dst, key="bound.bin", profile=profile)
+
+    page = signer.list_signing_jobs(maxResults=1, status="Succeeded")
+    assert page.get("nextToken")
+    with pytest.raises(ClientError) as exc:
+        signer.list_signing_jobs(maxResults=1, nextToken=page["nextToken"])
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    # The same token resumes fine under the filter set it was minted with.
+    assert "jobs" in signer.list_signing_jobs(
+        maxResults=1, status="Succeeded", nextToken=page["nextToken"])
+
+
+def test_signer_list_jobs_revoked_filter_still_refuses_a_foreign_token(signer):
+    """isRevoked=true short-circuits to an empty page, but a token that is not
+    ours is a 400 there too: the same value cannot be a 400 alone and a 200
+    next to another filter."""
+    with pytest.raises(ClientError) as exc:
+        signer.list_signing_jobs(isRevoked=True, nextToken="not-a-real-token")
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert signer.list_signing_jobs(isRevoked=True)["jobs"] == []
+
+
 def test_signer_list_jobs_foreign_next_token_is_refused(signer):
     """A token MiniStack did not mint is a 400, not a silent full listing."""
     with pytest.raises(ClientError) as exc:
