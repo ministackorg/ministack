@@ -48,13 +48,15 @@ that is not globally routable or is multicast and resolving every other one
 view: private, loopback, link-local, reserved, TEST-NET and multicast
 addresses do not resolve.
 
+An input whose only hints are WLAN/cell/GNSS measurements is well formed and
+unresolvable, so it answers ``ResourceNotFoundException`` too, with a
+message naming the IP-only scope: AWS documents that class for "no location
+information was found or solved ... insufficient data in the measurement
+data input", where the real service would run the third-party solvers.
+
 An IPv4-mapped IPv6 address hashes as its IPv4 form. A malformed JSON body
-is a ``ValidationException`` too, as is a ``Timestamp`` that is not a Unix
-timestamp (a raw HTTP caller can send one; an SDK cannot), and an input
-whose only hints are
-WLAN/cell/GNSS measurements is answered ``ValidationException`` with a
-message naming the IP-only scope, where the real service would run the
-third-party solvers.
+is a ``ValidationException``, as is a ``Timestamp`` that is not a Unix
+timestamp (a raw HTTP caller can send one; an SDK cannot).
 """
 
 from __future__ import annotations
@@ -153,9 +155,17 @@ def _get_position_estimate(body: bytes) -> tuple:
             "Timestamp must be a Unix timestamp, in seconds since the epoch"
         )
     if "Ip" not in payload:
-        return _validation(
+        # A WLAN/cell/GNSS-only request is well formed, MiniStack simply has
+        # no solver behind it. AWS reserves 400 for malformed input and
+        # documents 404 for exactly this outcome: "no location information
+        # was found or solved ... due to cases such as insufficient data in
+        # the measurement data input", so the scope limit refuses like the
+        # address the resolver cannot place, not like bad JSON.
+        return error_response_json(
+            "ResourceNotFoundException",
             "MiniStack resolves position from Ip only: provide Ip.IpAddress "
-            "(WiFiAccessPoints/CellTowers/Gnss are accepted but not resolved)"
+            "(WiFiAccessPoints/CellTowers/Gnss are accepted but not resolved)",
+            404,
         )
     ip_member = payload["Ip"]
     raw = ip_member.get("IpAddress") if isinstance(ip_member, dict) else None

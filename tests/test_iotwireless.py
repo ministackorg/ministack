@@ -213,17 +213,21 @@ def test_iotwireless_timestamp_only_input_is_validation_exception(iotwireless):
     assert excinfo.value.response["Error"]["Code"] == "ValidationException"
 
 
-def test_iotwireless_non_ip_hints_alone_are_validation_exception(iotwireless):
+def test_iotwireless_non_ip_hints_alone_are_resource_not_found(iotwireless):
     """Documented divergence: MiniStack resolves from Ip only, so an input
     carrying nothing but WLAN measurements is refused with a message naming
-    the IP-only scope (the real service would run the third-party solver)."""
+    the IP-only scope (the real service would run the third-party solver).
+    The input is well formed, and AWS documents 404 for a measurement it
+    cannot solve and 400 for measurement data formatted incorrectly, so the
+    scope limit refuses like the address the resolver cannot place."""
     with pytest.raises(ClientError) as excinfo:
         iotwireless.get_position_estimate(
             WiFiAccessPoints=[{"MacAddress": "A0:EC:F9:1E:32:C1", "Rss": -75}]
         )
-    error = excinfo.value.response["Error"]
-    assert error["Code"] == "ValidationException"
-    assert "Ip only" in error["Message"]
+    response = excinfo.value.response
+    assert response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert response["Error"]["Code"] == "ResourceNotFoundException"
+    assert "Ip only" in response["Error"]["Message"]
 
 
 # ---------------------------------------------------------------------------
