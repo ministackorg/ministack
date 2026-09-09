@@ -926,6 +926,35 @@ def test_cognito_identity_pool_roles(cognito_identity):
     assert roles["Roles"]["authenticated"] == "arn:aws:iam::000000000000:role/AuthRole"
     assert roles["Roles"]["unauthenticated"] == "arn:aws:iam::000000000000:role/UnauthRole"
 
+def test_cognito_identity_pool_role_mappings_round_trip(cognito_identity):
+    """SetIdentityPoolRoles keeps the RoleMappings it is given and
+    GetIdentityPoolRoles serves them back; a later call without RoleMappings
+    clears them, since the call sets the whole configuration."""
+    iid = cognito_identity.create_identity_pool(
+        IdentityPoolName="RoleMappingsPool",
+        AllowUnauthenticatedIdentities=True,
+    )["IdentityPoolId"]
+    provider = "cognito-idp.us-east-1.amazonaws.com/us-east-1_example:client"
+    mapping = {"Type": "Token", "AmbiguousRoleResolution": "AuthenticatedRole"}
+
+    cognito_identity.set_identity_pool_roles(
+        IdentityPoolId=iid,
+        Roles={"authenticated": "arn:aws:iam::000000000000:role/AuthRole"},
+        RoleMappings={provider: mapping},
+    )
+    roles = cognito_identity.get_identity_pool_roles(IdentityPoolId=iid)
+    assert roles["Roles"] == {"authenticated": "arn:aws:iam::000000000000:role/AuthRole"}
+    assert roles["RoleMappings"] == {provider: mapping}
+
+    cognito_identity.set_identity_pool_roles(
+        IdentityPoolId=iid,
+        Roles={"authenticated": "arn:aws:iam::000000000000:role/AuthRole"},
+    )
+    roles = cognito_identity.get_identity_pool_roles(IdentityPoolId=iid)
+    assert roles["Roles"] == {"authenticated": "arn:aws:iam::000000000000:role/AuthRole"}
+    assert roles.get("RoleMappings", {}) == {}
+
+
 def test_cognito_identity_pool_principal_tags(cognito_identity):
     """SetPrincipalTagAttributeMap stores a provider's attribute mapping and
     GetPrincipalTagAttributeMap reports it back."""
