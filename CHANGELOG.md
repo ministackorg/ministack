@@ -23,6 +23,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 - **CloudFormation — `AWS::SQS::QueuePolicy` updates in place** — the type had no update handler, so a stack update that changed the policy fell through to create, which minted a new physical id; the engine recorded a replacement and the cleanup delete then removed `Policy` from the very queues the new document had just been written to (measured: after the update the queue had no policy at all). `PolicyDocument` and `Queues` are both No interruption on the resource reference, so the resource now keeps its physical id, writes the new document on every queue the template names and removes it from a queue dropped from `Queues`. Contributed by @iot-rocket.
 
+- **CloudFormation — `AWS::SNS::TopicPolicy` updates in place** — the same defect as the queue policy: no update handler, so a changed policy fell through to create under a fresh physical id, the engine recorded a replacement and the cleanup delete removed `Policy` from the topics the new document had just been written to (measured: after the update `GetTopicAttributes` returned no policy). `PolicyDocument` and `Topics` are both No interruption on the resource reference, so the resource now keeps its physical id, writes the new document on every topic the template names and removes it from a topic dropped from `Topics`. Contributed by @iot-rocket.
+
 ## [1.5.10] — 2026-09-10
 
 ### Added

@@ -4797,9 +4797,7 @@ def _sqs_queue_policy_delete(physical_id, props):
 # --- SNS TopicPolicy ---
 
 def _sns_topic_policy_create(logical_id, props, stack_name):
-    policy_doc = props.get("PolicyDocument", {})
-    if isinstance(policy_doc, dict):
-        policy_doc = json.dumps(policy_doc)
+    policy_doc = _policy_document_json(props)
     topics = props.get("Topics", [])
     for topic_arn in topics:
         topic = _sns._topics.get(topic_arn)
@@ -4807,6 +4805,10 @@ def _sns_topic_policy_create(logical_id, props, stack_name):
             topic["attributes"]["Policy"] = policy_doc
     pid = f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
     return pid, {}
+
+
+def _sns_topic_policy_update(physical_id, old_props, new_props, stack_name):
+    return _policy_attachment_update(physical_id, old_props, new_props, "Topics", _sns._topics)
 
 
 def _sns_topic_policy_delete(physical_id, props):
@@ -9191,7 +9193,11 @@ _RESOURCE_HANDLERS = {
         "update": _sqs_queue_policy_update,
         "delete": _sqs_queue_policy_delete,
     },
-    "AWS::SNS::TopicPolicy": {"create": _sns_topic_policy_create, "delete": _sns_topic_policy_delete},
+    "AWS::SNS::TopicPolicy": {
+        "create": _sns_topic_policy_create,
+        "update": _sns_topic_policy_update,
+        "delete": _sns_topic_policy_delete,
+    },
     "AWS::AppSync::GraphQLApi": {"create": _appsync_api_create, "delete": _appsync_api_delete},
     "AWS::AppSync::DataSource": {"create": _appsync_ds_create, "delete": _appsync_ds_delete},
     "AWS::AppSync::FunctionConfiguration": {

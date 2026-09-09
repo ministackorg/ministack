@@ -6262,6 +6262,69 @@ def test_cfn_sqs_queue_policy_updates_in_place(cfn, sqs):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def _sns_policy_sids(sns, topic_arn):
+    """The statement ids of the topic's Policy attribute, [] when it has none."""
+    policy = sns.get_topic_attributes(TopicArn=topic_arn)["Attributes"].get("Policy")
+    if not policy:
+        return []
+    return [st.get("Sid") for st in json.loads(policy)["Statement"]]
+
+
+def test_cfn_sns_topic_policy_updates_in_place(cfn, sns):
+    """PolicyDocument and Topics are both No interruption on the resource
+    reference: the policy resource keeps its physical id, the topics it
+    still names carry the new document, and a topic dropped from Topics
+    loses its policy. Without an update handler the resource was replaced
+    and the replacement's cleanup delete stripped the policy off the very
+    topics the new document had just been written to."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sns-tpol-{uid}"
+
+    def template(sid, topics):
+        return json.dumps({
+            "Resources": {
+                "TopicA": {"Type": "AWS::SNS::Topic",
+                           "Properties": {"TopicName": f"cfn-tpol-a-{uid}"}},
+                "TopicB": {"Type": "AWS::SNS::Topic",
+                           "Properties": {"TopicName": f"cfn-tpol-b-{uid}"}},
+                "Policy": {"Type": "AWS::SNS::TopicPolicy", "Properties": {
+                    "Topics": [{"Ref": t} for t in topics],
+                    "PolicyDocument": {
+                        "Version": "2012-10-17",
+                        "Statement": [{
+                            "Sid": sid,
+                            "Effect": "Allow",
+                            "Principal": {"Service": "events.amazonaws.com"},
+                            "Action": "sns:Publish",
+                            "Resource": [{"Ref": t} for t in topics],
+                        }],
+                    },
+                }},
+            },
+            "Outputs": {"TopicA": {"Value": {"Ref": "TopicA"}},
+                        "TopicB": {"Value": {"Ref": "TopicB"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("AllowEvents", ["TopicA", "TopicB"]))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        topic_a = _output(stack, "TopicA")
+        topic_b = _output(stack, "TopicB")
+        assert _sns_policy_sids(sns, topic_a) == ["AllowEvents"]
+        assert _sns_policy_sids(sns, topic_b) == ["AllowEvents"]
+        physical_id = _stack_physical_id(cfn, stack_name, "Policy")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("AllowEventsV2", ["TopicA"]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _sns_policy_sids(sns, topic_a) == ["AllowEventsV2"]
+        assert _sns_policy_sids(sns, topic_b) == []
+        assert _stack_physical_id(cfn, stack_name, "Policy") == physical_id
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 # ===========================================================================
 # CodeBuild Project Tests
 # ===========================================================================
