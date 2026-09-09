@@ -220,10 +220,64 @@ def _cf_policy_create(store, parse, label, props, config_key, logical_id, stack_
     return pid, {"Id": pid, "LastModifiedTime": record["LastModifiedTime"]}
 
 
+def _cf_refuse_taken_name(store, physical_id, name, label, name_of):
+    """Refuse a rename onto a name another object of the store already holds.
+
+    The service refuses it (UpdateCachePolicy and its siblings answer
+    CachePolicyAlreadyExists and the like), so the update handler must as well,
+    or the store ends up with two objects under one name.
+    """
+    for existing in store.values():
+        if existing["Id"] != physical_id and name_of(existing) == name:
+            raise ValueError(f"{label}: {name} already exists")
+
+
+def _cf_policy_update(store, parse, label, create_fn, physical_id, new_props,
+                      config_key, logical_id, stack_name):
+    """Update one of the three CloudFront policy families in place.
+
+    Every property of all three types is "Update requires: No interruption" in
+    the resource references, the config's `Name` included, so there is no
+    replacement path here: the policy keeps its Id (which is its physical id,
+    and what `Ref` hands to a distribution) across every change.
+
+    The whole config is re-parsed from the template and swapped in, the way
+    UpdateCachePolicy replaces the config it is sent, so a property the
+    template drops falls back to the parser's create default rather than
+    lingering from the previous version.
+    """
+    record = store.get(physical_id)
+    if record is None:
+        # The policy is gone (deleted through the API between updates); create
+        # it again so the stack converges on what the template asks for.
+        return create_fn(logical_id or physical_id, new_props, stack_name)
+    cfg_props = dict(new_props.get(config_key) or {})
+    cfg_props.setdefault("Name", _physical_name(stack_name, logical_id or physical_id,
+                                                max_len=128))
+    cfg, err = parse(_cf_props_to_element(config_key, cfg_props))
+    if err is not None:
+        raise ValueError(f"{label}: {cfg_props.get('Name')} is not valid")
+    _cf_refuse_taken_name(store, physical_id, cfg["Name"], label,
+                          lambda existing: existing["Config"]["Name"])
+    record["Config"] = cfg
+    record["ETag"] = new_uuid()
+    record["LastModifiedTime"] = now_iso()
+    return physical_id, {"Id": physical_id,
+                         "LastModifiedTime": record["LastModifiedTime"]}
+
+
 def _cf_cache_policy_create(logical_id, props, stack_name):
     return _cf_policy_create(_cf._cache_policies, _cf._parse_cache_policy_config,
                              "AWS::CloudFront::CachePolicy", props,
                              "CachePolicyConfig", logical_id, stack_name)
+
+
+def _cf_cache_policy_update(physical_id, old_props, new_props, stack_name,
+                            logical_id=None):
+    return _cf_policy_update(_cf._cache_policies, _cf._parse_cache_policy_config,
+                             "AWS::CloudFront::CachePolicy", _cf_cache_policy_create,
+                             physical_id, new_props, "CachePolicyConfig",
+                             logical_id, stack_name)
 
 
 def _cf_cache_policy_delete(physical_id, props):
@@ -8863,7 +8917,12 @@ _RESOURCE_HANDLERS = {
     },
     "AWS::CloudFront::Distribution": {"create": _cf_distribution_create, "delete": _cf_distribution_delete},
     "AWS::CloudFront::KeyValueStore": {"create": _cf_kvs_create, "update": _cf_kvs_update, "delete": _cf_kvs_delete},
-    "AWS::CloudFront::CachePolicy": {"create": _cf_cache_policy_create, "delete": _cf_cache_policy_delete},
+    "AWS::CloudFront::CachePolicy": {
+        "create": _cf_cache_policy_create,
+        "update": _cf_cache_policy_update,
+        "update_with_logical_id": True,
+        "delete": _cf_cache_policy_delete,
+    },
     "AWS::CloudFront::OriginRequestPolicy": {"create": _cf_origin_request_policy_create, "delete": _cf_origin_request_policy_delete},
     "AWS::CloudFront::ResponseHeadersPolicy": {"create": _cf_response_headers_policy_create, "delete": _cf_response_headers_policy_delete},
     "AWS::CloudFront::OriginAccessControl": {"create": _cf_oac_create, "delete": _cf_oac_delete},

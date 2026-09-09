@@ -8888,6 +8888,168 @@ def test_cfn_cloudfront_function_without_autopublish_stays_in_development(cfn, c
         _wait_stack(cfn, "cfn-cf-fn-dev")
 
 
+# ---------------------------------------------------------------------------
+# Updating the five CloudFront types. Every property of the three policy
+# families and of the OAC is "Update requires: No interruption" in the resource
+# references, so the object keeps its Id across every change; only
+# AWS::CloudFront::Function has a Replacement property (Name).
+# ---------------------------------------------------------------------------
+
+def _cfn_cf_stack(cfn, stack_name, template, update=False):
+    """Create or update one CloudFront stack and return its outputs."""
+    body = json.dumps(template)
+    if update:
+        cfn.update_stack(StackName=stack_name, TemplateBody=body)
+    else:
+        cfn.create_stack(StackName=stack_name, TemplateBody=body)
+    stack = _wait_stack(cfn, stack_name)
+    expected = "UPDATE_COMPLETE" if update else "CREATE_COMPLETE"
+    assert stack["StackStatus"] == expected, stack.get("StackStatusReason")
+    return {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+
+
+def _cache_policy_template(name, comment=None, default_ttl=3600):
+    config = {
+        "Name": name,
+        "DefaultTTL": default_ttl, "MaxTTL": 86400, "MinTTL": 1,
+        "ParametersInCacheKeyAndForwardedToOrigin": {
+            "EnableAcceptEncodingGzip": True,
+            "HeadersConfig": {"HeaderBehavior": "whitelist", "Headers": ["X-Service"]},
+            "QueryStringsConfig": {"QueryStringBehavior": "none"},
+            "CookiesConfig": {"CookieBehavior": "none"},
+        },
+    }
+    if comment is not None:
+        config["Comment"] = comment
+    return {
+        "Resources": {"CachePolicy": {"Type": "AWS::CloudFront::CachePolicy",
+                                      "Properties": {"CachePolicyConfig": config}}},
+        "Outputs": {"Id": {"Value": {"Ref": "CachePolicy"}}},
+    }
+
+
+def test_cfn_cloudfront_cache_policy_updates_in_place(cfn, cloudfront):
+    """AWS::CloudFront::CachePolicy has no Replacement property — CachePolicyConfig
+    and every field under it are "No interruption" — so an UpdateStack keeps the
+    policy Id that Ref handed to the distribution, a rename included, and a
+    property the template drops falls back to its create default."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-cp-update-{uid}"
+    name = f"cfn-cp-update-{uid}"
+    renamed = f"cfn-cp-renamed-{uid}"
+    policy_id = None
+    try:
+        out = _cfn_cf_stack(cfn, stack_name, _cache_policy_template(name, comment="v1"))
+        policy_id = out["Id"]
+        cfg = cloudfront.get_cache_policy(Id=policy_id)["CachePolicy"]["CachePolicyConfig"]
+        assert cfg["Comment"] == "v1"
+        assert cfg["DefaultTTL"] == 3600
+
+        # In-place change: same Id, new values.
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _cache_policy_template(name, comment="v2", default_ttl=120),
+                            update=True)
+        assert out["Id"] == policy_id
+        cfg = cloudfront.get_cache_policy(Id=policy_id)["CachePolicy"]["CachePolicyConfig"]
+        assert cfg["Comment"] == "v2"
+        assert cfg["DefaultTTL"] == 120
+        # The nested whitelist still round-trips after the update.
+        params = cfg["ParametersInCacheKeyAndForwardedToOrigin"]
+        assert params["HeadersConfig"]["Headers"]["Items"] == ["X-Service"]
+
+        # A rename is "No interruption" too: same policy, new name, and the
+        # account holds one policy rather than a replacement pair.
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _cache_policy_template(renamed, comment="v2", default_ttl=120),
+                            update=True)
+        assert out["Id"] == policy_id
+        cfg = cloudfront.get_cache_policy(Id=policy_id)["CachePolicy"]["CachePolicyConfig"]
+        assert cfg["Name"] == renamed
+        names = [p["CachePolicy"]["CachePolicyConfig"]["Name"]
+                 for p in cloudfront.list_cache_policies()["CachePolicyList"]["Items"]]
+        assert names.count(renamed) == 1
+        assert name not in names
+
+        # Dropping Comment reverts it to the create default rather than
+        # leaving the previous value behind.
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _cache_policy_template(renamed, default_ttl=120),
+                            update=True)
+        assert out["Id"] == policy_id
+        cfg = cloudfront.get_cache_policy(Id=policy_id)["CachePolicy"]["CachePolicyConfig"]
+        assert cfg.get("Comment", "") == ""
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    if policy_id:
+        with pytest.raises(ClientError):
+            cloudfront.get_cache_policy(Id=policy_id)
+
+
+def test_cfn_cloudfront_cache_policy_deleted_out_of_band_is_recreated(cfn, cloudfront):
+    """The policy handlers take a different path than the function on an
+    out-of-band delete: no record under the physical id sends the update
+    straight to the create handler, which mints a new policy under the
+    template's name rather than failing the stack. The new Id is what Ref
+    hands out from then on."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-cp-gone-{uid}"
+    name = f"cfn-cp-gone-{uid}"
+    try:
+        out = _cfn_cf_stack(cfn, stack_name, _cache_policy_template(name, comment="v1"))
+        old_id = out["Id"]
+        etag = cloudfront.get_cache_policy(Id=old_id)["ETag"]
+        cloudfront.delete_cache_policy(Id=old_id, IfMatch=etag)
+        with pytest.raises(ClientError):
+            cloudfront.get_cache_policy(Id=old_id)
+
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _cache_policy_template(name, comment="v2"), update=True)
+        cfg = cloudfront.get_cache_policy(Id=out["Id"])["CachePolicy"]["CachePolicyConfig"]
+        assert cfg["Name"] == name
+        assert cfg["Comment"] == "v2"
+        names = [p["CachePolicy"]["CachePolicyConfig"]["Name"]
+                 for p in cloudfront.list_cache_policies()["CachePolicyList"]["Items"]]
+        assert names.count(name) == 1
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cloudfront_policy_rename_onto_a_taken_name_is_refused(cfn, cloudfront):
+    """A cache policy renamed onto a name another policy holds is refused the way
+    UpdateCachePolicy refuses it: the update rolls back, the stack's policy keeps
+    its name and its Id, and the other policy is untouched."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-cp-taken-{uid}"
+    name = f"cfn-cp-mine-{uid}"
+    taken = f"cfn-cp-taken-{uid}"
+    # The API shape, not the template's: the wire form carries Quantity/Items.
+    other = cloudfront.create_cache_policy(CachePolicyConfig={
+        "Name": taken, "MinTTL": 1, "DefaultTTL": 60, "MaxTTL": 120,
+        "ParametersInCacheKeyAndForwardedToOrigin": {
+            "EnableAcceptEncodingGzip": True,
+            "HeadersConfig": {"HeaderBehavior": "none"},
+            "QueryStringsConfig": {"QueryStringBehavior": "none"},
+            "CookiesConfig": {"CookieBehavior": "none"},
+        },
+    })["CachePolicy"]["Id"]
+    try:
+        out = _cfn_cf_stack(cfn, stack_name, _cache_policy_template(name))
+        policy_id = out["Id"]
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=json.dumps(_cache_policy_template(taken)))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert "already exists" in _stack_event_reasons(cfn, stack_name)
+        cfg = cloudfront.get_cache_policy(Id=policy_id)["CachePolicy"]["CachePolicyConfig"]
+        assert cfg["Name"] == name
+        cfg = cloudfront.get_cache_policy(Id=other)["CachePolicy"]["CachePolicyConfig"]
+        assert cfg["Name"] == taken
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        etag = cloudfront.get_cache_policy(Id=other)["ETag"]
+        cloudfront.delete_cache_policy(Id=other, IfMatch=etag)
+
+
 def test_cfn_cloudfront_distribution_consumes_provisioned_policies(cfn, cloudfront):
     """The payoff: a distribution in the same stack references the policies and
     the function by Ref/GetAtt. This is what a CDK app emits, and it only works
@@ -8935,6 +9097,50 @@ def test_cfn_cloudfront_distribution_consumes_provisioned_policies(cfn, cloudfro
 
     cfn.delete_stack(StackName="cfn-cf-dist-policies")
     _wait_stack(cfn, "cfn-cf-dist-policies")
+
+
+def test_cfn_cloudfront_distribution_keeps_its_policy_ref_across_a_rename(cfn, cloudfront):
+    """The payoff of updating in place: a distribution that took the cache
+    policy's Ref keeps pointing at the same policy after the policy is renamed
+    through the stack. Only the Ref and the policy itself can be asserted here;
+    GetDistributionConfig on a CloudFormation-provisioned distribution is the
+    separate, pre-existing 500."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-dist-rename-{uid}"
+    template = json.loads(_cloudfront_template(f"ren{uid}"))
+    template["Resources"]["Dist"] = {
+        "Type": "AWS::CloudFront::Distribution",
+        "Properties": {"DistributionConfig": {
+            "Enabled": True,
+            "Comment": "keeps its policy ref",
+            "Origins": [{"Id": "origin1", "DomainName": "example.test",
+                         "CustomOriginConfig": {"OriginProtocolPolicy": "https-only"}}],
+            "DefaultCacheBehavior": {
+                "TargetOriginId": "origin1",
+                "ViewerProtocolPolicy": "allow-all",
+                "CachePolicyId": {"Ref": "CachePolicy"},
+            },
+        }},
+    }
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        before = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+
+        renamed = f"cfn-cp-ren{uid}-v2"
+        template["Resources"]["CachePolicy"]["Properties"]["CachePolicyConfig"]["Name"] = renamed
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        after = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+        assert after["CachePolicyRef"] == before["CachePolicyRef"]
+        cfg = cloudfront.get_cache_policy(Id=after["CachePolicyRef"])["CachePolicy"]["CachePolicyConfig"]
+        assert cfg["Name"] == renamed
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def _mrap_template(name, buckets):
     return json.dumps({
         "AWSTemplateFormatVersion": "2010-09-09",
