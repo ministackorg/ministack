@@ -793,6 +793,49 @@ def test_location_position_properties_validated(location):
     location.delete_tracker(TrackerName=name)
 
 
+def test_location_accuracy_validated(location):
+    """Accuracy is a PositionalAccuracy, whose Horizontal is required and runs
+    "Minimum value of 0. Maximum value of 10000000" (API_PositionalAccuracy
+    reference). Under AccuracyBased it is the filter's own threshold, so an
+    unchecked negative value would move the threshold instead of being
+    refused. Nothing of the batch is stored. Wordings unmeasured.
+
+    Every invalid shape here is one botocore refuses to send — it checks the
+    numeric range client-side as well as the required member — so they go
+    over the raw wire, which is where another SDK or a hand-built request
+    would arrive anyway."""
+    name = _uid()
+    location.create_tracker(TrackerName=name, PositionFiltering="AccuracyBased")
+    accuracies = (
+        {"Horizontal": -1.0},      # below the minimum, and under AccuracyBased
+                                   # a threshold-lowering value
+        {"Horizontal": 10000000.5},  # above the maximum
+        {},                        # Horizontal is required
+        {"Horizontal": "5"},       # a double, not a string
+        5.0,                       # not a structure
+    )
+    for accuracy in accuracies:
+        status, body = _raw_post(
+            f"/tracking/v0/trackers/{name}/positions",
+            {"Updates": [{"DeviceId": "veh-1", "SampleTime": _ts(0).timestamp(),
+                          "Position": [1.0, 1.0], "Accuracy": accuracy}]},
+        )
+        assert status == 400, body
+        assert "accuracy" in json.dumps(body)
+        with pytest.raises(ClientError):
+            location.get_device_position(TrackerName=name, DeviceId="veh-1")
+
+    # The bounds themselves pass and round-trip.
+    location.batch_update_device_position(
+        TrackerName=name,
+        Updates=[{"DeviceId": "veh-1", "SampleTime": _ts(0),
+                  "Position": [1.0, 1.0], "Accuracy": {"Horizontal": 0.0}}],
+    )
+    assert location.get_device_position(
+        TrackerName=name, DeviceId="veh-1")["Accuracy"] == {"Horizontal": 0.0}
+    location.delete_tracker(TrackerName=name)
+
+
 def test_location_batch_get_device_ids_bounded(location):
     name = _uid()
     location.create_tracker(TrackerName=name)

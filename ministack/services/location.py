@@ -51,8 +51,9 @@ Scope boundaries (metadata-only control plane + in-memory position store):
     front of the operation does, not 404: ``Description``
     0..1000, ``KmsKeyId`` 1..2048, ``Tags`` at most 50 entries with keys
     1..128 and values 0..256 on the tag pattern, ``PositionProperties`` at
-    most 4 entries with keys 1..20 and values 1..150. The message wordings
-    are unmeasured.
+    most 4 entries with keys 1..20 and values 1..150, ``Accuracy`` a
+    structure whose required ``Horizontal`` runs 0..10000000. The message
+    wordings are unmeasured.
   * ``BatchUpdateDevicePosition`` answers a structurally invalid entry (a
     required member missing, ``Position`` not two numbers) with a
     request-level ``ValidationException``; the per-entry ``Errors`` list is
@@ -364,6 +365,30 @@ def _validate_string_map(value, field, max_entries, key_len, value_len, pattern=
     return None
 
 
+def _validate_accuracy(value, field):
+    """A documented PositionalAccuracy: the structure's ``Horizontal`` is
+    required and a double in 0..10000000 (API_PositionalAccuracy reference).
+    Wordings unmeasured (see ``_constraint``)."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return _constraint(value, field, "Member must be a structure")
+    horizontal = value.get("Horizontal")
+    if not _is_number(horizontal):
+        return _constraint(horizontal, f"{field}.horizontal", "Member must not be null")
+    if horizontal > 10000000:
+        return _constraint(
+            horizontal, f"{field}.horizontal",
+            "Member must have value less than or equal to 10000000",
+        )
+    if horizontal < 0:
+        return _constraint(
+            horizontal, f"{field}.horizontal",
+            "Member must have value greater than or equal to 0",
+        )
+    return None
+
+
 def _validate_tracker_name(name):
     """The model's ResourceName shape: a 1..100 string on ``[-._\\w]+``. Every
     operation documents it, the path ones included, so a malformed name in the
@@ -578,6 +603,12 @@ def _parse_update(index, update):
         return None, _constraint(
             position, f"{member}.position", "Member must have length equal to 2"
         )
+    # Accuracy: a PositionalAccuracy, whose Horizontal is required and runs
+    # 0..10000000 metres. It is not decoration — under AccuracyBased it is the
+    # filter's threshold, and a negative one would lower it.
+    err = _validate_accuracy(update.get("Accuracy"), f"{member}.accuracy")
+    if err is not None:
+        return None, err
     # PositionProperties: at most 4 entries, keys 1..20, values 1..150
     # (DevicePositionUpdate reference).
     err = _validate_string_map(
