@@ -8467,6 +8467,108 @@ def test_cfn_apigwv2_ms_custom_id(cfn, apigw):
     _wait_stack(cfn, stack_name)
 
 
+def _apigwv2_api_update_template(name, protocol="HTTP", cors=True, description="first",
+                                 route_selection=None):
+    props = {"Name": name, "ProtocolType": protocol, "Description": description,
+             "Version": "v1", "Tags": {"env": "a"}}
+    if cors:
+        props["CorsConfiguration"] = {"AllowOrigins": ["https://a.example"],
+                                      "AllowMethods": ["GET"]}
+    if route_selection:
+        props["RouteSelectionExpression"] = route_selection
+    return json.dumps({
+        "Resources": {"HttpApi": {"Type": "AWS::ApiGatewayV2::Api", "Properties": props}},
+        "Outputs": {"ApiId": {"Value": {"Ref": "HttpApi"}},
+                    "Endpoint": {"Value": {"Fn::GetAtt": ["HttpApi", "ApiEndpoint"]}}},
+    })
+
+
+def test_cfn_apigwv2_api_updates_in_place(cfn, apigw):
+    """Every property but ProtocolType is No interruption on the
+    AWS::ApiGatewayV2::Api reference: an update keeps the apiId and the
+    ApiEndpoint and the service reads the new values through GetApi. The
+    create fallback minted a new id and endpoint on every change. A dropped
+    property reverts to the create default (no CorsConfiguration, the
+    protocol's route selection expression); a ProtocolType change replaces
+    the API and removes the old one."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-apigwv2-api-update-{uid}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_apigwv2_api_update_template(f"api-{uid}"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        api_id, endpoint = _output(stack, "ApiId"), _output(stack, "Endpoint")
+        assert "CorsConfiguration" in apigw.get_api(ApiId=api_id)
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_apigwv2_api_update_template(
+            f"api-{uid}-renamed", cors=False, description="second"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "ApiId") == api_id
+        assert _output(stack, "Endpoint") == endpoint
+        api = apigw.get_api(ApiId=api_id)
+        assert api["Name"] == f"api-{uid}-renamed"
+        assert api["Description"] == "second"
+        assert "CorsConfiguration" not in api
+        assert _template_tags(api["Tags"]) == {"env": "a"}
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_apigwv2_api_update_template(
+            f"api-{uid}-ws", protocol="WEBSOCKET"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        new_id = _output(stack, "ApiId")
+        assert new_id != api_id
+        api = apigw.get_api(ApiId=new_id)
+        assert api["ProtocolType"] == "WEBSOCKET"
+        assert api["RouteSelectionExpression"] == "$request.body.action"
+        _assert_apigwv2_api_not_found(lambda: apigw.get_api(ApiId=api_id))
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_apigwv2_api_update_template(
+            f"api-{uid}-ws", protocol="WEBSOCKET", route_selection="$request.body.op"))
+        _wait_stack(cfn, stack_name)
+        assert apigw.get_api(ApiId=new_id)["RouteSelectionExpression"] == "$request.body.op"
+        cfn.update_stack(StackName=stack_name, TemplateBody=_apigwv2_api_update_template(
+            f"api-{uid}-ws", protocol="WEBSOCKET"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "ApiId") == new_id
+        assert apigw.get_api(ApiId=new_id)["RouteSelectionExpression"] == "$request.body.action"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_apigwv2_api_update_keeps_pinned_id(cfn, apigw):
+    """With an ms-custom-id tag the create fallback resolved the pinned id a
+    second time, which refused it as already in use and rolled the stack
+    back; the update now keeps the pinned id and applies the change."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-apigwv2-api-pinned-{uid}"
+    pinned = f"pinned-{uid}"
+
+    def template(description):
+        return json.dumps({"Resources": {"HttpApi": {
+            "Type": "AWS::ApiGatewayV2::Api",
+            "Properties": {"Name": f"api-{uid}", "ProtocolType": "HTTP",
+                           "Description": description,
+                           "Tags": {"ms-custom-id": pinned}},
+        }}, "Outputs": {"ApiId": {"Value": {"Ref": "HttpApi"}}}})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("first"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        assert _output(stack, "ApiId") == pinned
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("second"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "ApiId") == pinned
+        assert apigw.get_api(ApiId=pinned)["Description"] == "second"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_apigwv2_route_basic(cfn, apigw):
     """CFN stack with ApiGatewayV2 Api + Integration + Route deploys successfully."""
     template = {

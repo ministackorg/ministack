@@ -7603,22 +7603,36 @@ def _cw_dashboard_delete(physical_id, props):
 # ApiGatewayV2 Api
 # ---------------------------------------------------------------------------
 
-def _apigw_v2_api_create(logical_id, props, stack_name):
-    api_id = _apigw_v2._resolve_custom_api_id(props.get("Tags", {}), _apigw_v2._apis) or new_uuid()[:8]
-    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=128)
-    protocol = props.get("ProtocolType", "HTTP")
-    api = {
-        "apiId": api_id,
-        "name": name,
-        "protocolType": protocol,
-        "apiEndpoint": f"http://{api_id}.execute-api.{_MINISTACK_HOST}:{os.environ.get('GATEWAY_PORT', '4566')}",
-        "createdDate": now_iso(),
-        "routeSelectionExpression": props.get("RouteSelectionExpression", "$request.method $request.path"),
+def _apigw_v2_api_props(props, stack_name, logical_id):
+    """The mutable part of an API record from its template properties, with
+    the create's defaults: what the create stores and what an update writes
+    over the existing record."""
+    # The HTTP default is the documented one; AWS requires the expression
+    # for a WebSocket API, and "$request.body.action" is the emulator's own
+    # fallback, the one its CreateApi uses.
+    default_rse = ("$request.body.action" if props.get("ProtocolType") == "WEBSOCKET"
+                   else "$request.method $request.path")
+    return {
+        "name": props.get("Name") or _physical_name(stack_name, logical_id, max_len=128),
+        "routeSelectionExpression": props.get("RouteSelectionExpression", default_rse),
         "apiKeySelectionExpression": props.get("ApiKeySelectionExpression", "$request.header.x-api-key"),
-        "tags": props.get("Tags", {}),
         "disableSchemaValidation": props.get("DisableSchemaValidation", False),
         "disableExecuteApiEndpoint": props.get("DisableExecuteApiEndpoint", False),
         "version": props.get("Version", ""),
+        "description": props.get("Description", ""),
+    }
+
+
+def _apigw_v2_api_create(logical_id, props, stack_name):
+    api_id = _apigw_v2._resolve_custom_api_id(props.get("Tags", {}), _apigw_v2._apis) or new_uuid()[:8]
+    protocol = props.get("ProtocolType", "HTTP")
+    api = {
+        "apiId": api_id,
+        "protocolType": protocol,
+        "apiEndpoint": f"http://{api_id}.execute-api.{_MINISTACK_HOST}:{os.environ.get('GATEWAY_PORT', '4566')}",
+        "createdDate": now_iso(),
+        "tags": dict(props.get("Tags") or {}),
+        **_apigw_v2_api_props(props, stack_name, logical_id),
     }
     if props.get("CorsConfiguration"):
         api["corsConfiguration"] = props["CorsConfiguration"]
@@ -7628,6 +7642,36 @@ def _apigw_v2_api_create(logical_id, props, stack_name):
     _apigw_v2._stages[api_id] = {}
     _apigw_v2._deployments[api_id] = {}
     return api_id, {"ApiId": api_id, "ApiEndpoint": api["apiEndpoint"]}
+
+
+def _apigw_v2_api_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update an API in place: every property but ProtocolType is No
+    interruption on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigatewayv2-api.html),
+    so the record keeps its apiId, its apiEndpoint and the routes,
+    integrations and stages stored under the id, as UpdateApi does. The
+    create fallback minted a new id on every change, which re-created every
+    child that Refs the API, and with an ms-custom-id tag its second
+    _resolve_custom_api_id call refused the pinned id as already in use and
+    rolled the stack back. A property the template drops reverts to the
+    create's default. ProtocolType requires replacement: the new API is
+    created before the old one is removed (a pinned id cannot be replaced,
+    and the create's own refusal fails the update)."""
+    api = _apigw_v2._apis.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        new_props.get("ProtocolType", "HTTP"), api["protocolType"] if api else None,
+        _apigw_v2_api_create, _apigw_v2_api_delete,
+    )
+    if replaced is not None:
+        return replaced
+    api.update(_apigw_v2_api_props(new_props, stack_name, logical_id or physical_id))
+    if new_props.get("CorsConfiguration"):
+        api["corsConfiguration"] = new_props["CorsConfiguration"]
+    else:
+        api.pop("corsConfiguration", None)
+    _reconcile_tag_map(api.setdefault("tags", {}), old_props, new_props)
+    return physical_id, {"ApiId": physical_id, "ApiEndpoint": api["apiEndpoint"]}
 
 
 def _apigw_v2_api_delete(physical_id, props):
@@ -9555,7 +9599,12 @@ _RESOURCE_HANDLERS = {
     },
     "AWS::Route53::HostedZone": {"create": _r53_hosted_zone_create, "delete": _r53_hosted_zone_delete},
     "AWS::Route53::RecordSet": {"create": _r53_record_set_create, "update": _r53_record_set_update, "delete": _r53_record_set_delete},
-    "AWS::ApiGatewayV2::Api": {"create": _apigw_v2_api_create, "delete": _apigw_v2_api_delete},
+    "AWS::ApiGatewayV2::Api": {
+        "create": _apigw_v2_api_create,
+        "update": _apigw_v2_api_update,
+        "update_with_logical_id": True,
+        "delete": _apigw_v2_api_delete,
+    },
     "AWS::ApiGatewayV2::Stage": {"create": _apigw_v2_stage_create, "delete": _apigw_v2_stage_delete},
     "AWS::ApiGatewayV2::Integration": {"create": _apigw_v2_integration_create, "delete": _apigw_v2_integration_delete},
     "AWS::ApiGatewayV2::Route": {"create": _apigw_v2_route_create, "delete": _apigw_v2_route_delete},
