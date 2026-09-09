@@ -16185,6 +16185,184 @@ def test_cfn_cognito_role_attachment_pool_move_replaces_the_attachment(
             cognito_identity.delete_identity_pool(IdentityPoolId=pool_id)
 
 
+def test_cfn_cognito_resource_server_update_keeps_the_identifier(cfn, cognito_idp):
+    """Name and Scopes are "Update requires: No interruption" on
+    AWS::Cognito::UserPoolResourceServer: both change through
+    UpdateResourceServer on the resource server DescribeResourceServer
+    already knows, with Ref still the Identifier. Dropping Scopes reverts it
+    to the empty list CreateResourceServer defaults to."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-rs-upd-{uid}"
+    pool_id = cognito_idp.create_user_pool(PoolName=f"cfn-rs-upd-{uid}")["UserPool"]["Id"]
+    read = {"ScopeName": "read", "ScopeDescription": "Read access"}
+    write = {"ScopeName": "write", "ScopeDescription": "Write access"}
+
+    def template(name, scopes):
+        props = {"UserPoolId": pool_id, "Identifier": "solar-system-data", "Name": name}
+        if scopes is not None:
+            props["Scopes"] = scopes
+        return json.dumps({
+            "Resources": {"Server": {
+                "Type": "AWS::Cognito::UserPoolResourceServer", "Properties": props}},
+            "Outputs": {"ServerRef": {"Value": {"Ref": "Server"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("Solar data", [read]))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "ServerRef") == "solar-system-data"
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=template("Solar system data", [read, write]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "ServerRef") == "solar-system-data"
+        server = cognito_idp.describe_resource_server(
+            UserPoolId=pool_id, Identifier="solar-system-data")["ResourceServer"]
+        assert server["Name"] == "Solar system data"
+        assert server["Scopes"] == [read, write]
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=template("Solar system data", None))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        server = cognito_idp.describe_resource_server(
+            UserPoolId=pool_id, Identifier="solar-system-data")["ResourceServer"]
+        assert server["Scopes"] == []
+        assert server["Name"] == "Solar system data"
+        assert [s["Identifier"] for s in cognito_idp.list_resource_servers(
+            UserPoolId=pool_id, MaxResults=50)["ResourceServers"]] == ["solar-system-data"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_cfn_cognito_resource_server_rename_replaces_the_server(cfn, cognito_idp):
+    """Identifier requires replacement, and it is the physical id, so a
+    changed Identifier is the rename CloudFormation allows: the new resource
+    server is created and the one under the old identifier is gone."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-rs-rename-{uid}"
+    pool_id = cognito_idp.create_user_pool(PoolName=f"cfn-rs-rename-{uid}")["UserPool"]["Id"]
+    scope = {"ScopeName": "read", "ScopeDescription": "Read access"}
+
+    def template(identifier):
+        return json.dumps({
+            "Resources": {"Server": {
+                "Type": "AWS::Cognito::UserPoolResourceServer", "Properties": {
+                    "UserPoolId": pool_id, "Identifier": identifier,
+                    "Name": "Solar data", "Scopes": [scope]}}},
+            "Outputs": {"ServerRef": {"Value": {"Ref": "Server"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("solar-v1"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "ServerRef") == "solar-v1"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("solar-v2"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "ServerRef") == "solar-v2"
+
+        renamed = cognito_idp.describe_resource_server(
+            UserPoolId=pool_id, Identifier="solar-v2")["ResourceServer"]
+        assert renamed["Scopes"] == [scope]
+        assert [s["Identifier"] for s in cognito_idp.list_resource_servers(
+            UserPoolId=pool_id, MaxResults=50)["ResourceServers"]] == ["solar-v2"]
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.describe_resource_server(UserPoolId=pool_id, Identifier="solar-v1")
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_cfn_cognito_resource_server_rename_under_retain_keeps_both(cfn, cognito_idp):
+    """UpdateReplacePolicy Retain on a resource server whose Identifier
+    changes: the replacement is created and the resource server under the
+    old identifier is kept, scopes and all, instead of being deleted."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-rs-retain-{uid}"
+    pool_id = cognito_idp.create_user_pool(PoolName=f"cfn-rs-retain-{uid}")["UserPool"]["Id"]
+    scope = {"ScopeName": "read", "ScopeDescription": "Read access"}
+
+    def template(identifier):
+        return json.dumps({
+            "Resources": {"Server": {
+                "Type": "AWS::Cognito::UserPoolResourceServer",
+                "UpdateReplacePolicy": "Retain",
+                "Properties": {
+                    "UserPoolId": pool_id, "Identifier": identifier,
+                    "Name": "Solar data", "Scopes": [scope]}}},
+            "Outputs": {"ServerRef": {"Value": {"Ref": "Server"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("solar-v1"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("solar-v2"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "ServerRef") == "solar-v2"
+
+        retained = cognito_idp.describe_resource_server(
+            UserPoolId=pool_id, Identifier="solar-v1")["ResourceServer"]
+        assert retained["Scopes"] == [scope]
+        assert sorted(s["Identifier"] for s in cognito_idp.list_resource_servers(
+            UserPoolId=pool_id, MaxResults=50)["ResourceServers"]) == ["solar-v1", "solar-v2"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_cfn_cognito_resource_server_move_under_custom_name_fails_loudly(cfn, cognito_idp):
+    """UserPoolId requires replacement, which CloudFormation refuses for a
+    resource server, whose Identifier is always a custom name: the stack
+    rolls back, the resource server stays in the pool it was created in with
+    its scopes, and the pool the template pointed at gets nothing. The pools
+    live outside the stack, so the rollback has nothing else to undo."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-rs-move-{uid}"
+    pool_a = cognito_idp.create_user_pool(PoolName=f"cfn-rs-move-a-{uid}")["UserPool"]["Id"]
+    pool_b = cognito_idp.create_user_pool(PoolName=f"cfn-rs-move-b-{uid}")["UserPool"]["Id"]
+    scope = {"ScopeName": "read", "ScopeDescription": "Read access"}
+
+    def template(pool_id):
+        return json.dumps({
+            "Resources": {"Server": {
+                "Type": "AWS::Cognito::UserPoolResourceServer", "Properties": {
+                    "UserPoolId": pool_id, "Identifier": "solar-system-data",
+                    "Name": "Solar data", "Scopes": [scope]}}},
+            "Outputs": {"ServerRef": {"Value": {"Ref": "Server"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(pool_a))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(pool_b))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert "custom-named resource requires replacing" in _stack_event_reasons(cfn, stack_name)
+        assert _output(stack, "ServerRef") == "solar-system-data"
+
+        stayed = cognito_idp.describe_resource_server(
+            UserPoolId=pool_a, Identifier="solar-system-data")["ResourceServer"]
+        assert stayed["Scopes"] == [scope]
+        assert cognito_idp.list_resource_servers(
+            UserPoolId=pool_b, MaxResults=50)["ResourceServers"] == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for pool_id in (pool_a, pool_b):
+            cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
 def test_cfn_secret_update_publishes_a_new_version(cfn, sm):
     """A changed SecretString publishes a new AWSCURRENT version of the same
     secret: same ARN, the first value still there as AWSPREVIOUS, and the

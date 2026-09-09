@@ -566,6 +566,16 @@ def _requires_replacement_cognito_user_pool_group(old_props, new_props):
     return old_props.get("UserPoolId") != new_props.get("UserPoolId")
 
 
+def _requires_replacement_cognito_resource_server(old_props, new_props):
+    """AWS::Cognito::UserPoolResourceServer requires replacement when
+    UserPoolId changes (the resource reference marks the property "Update
+    requires: Replacement"). Identifier is "Replacement" as well, but it is
+    also the physical name, so a change to it is a replacement under a new
+    name, which the custom-name guard does not block; only the pool move is
+    a replacement under an unchanged name."""
+    return old_props.get("UserPoolId") != new_props.get("UserPoolId")
+
+
 # Resource types that carry a user-supplied physical name AND can require
 # replacement. Real CloudFormation refuses an update that would replace a
 # custom-named resource (you must rename it first), so MiniStack must fail the
@@ -583,6 +593,12 @@ _CUSTOM_NAME_REPLACEMENT = {
     "AWS::Cognito::UserPoolGroup": {
         "name": "GroupName",
         "requires_replacement": _requires_replacement_cognito_user_pool_group,
+    },
+    "AWS::Cognito::UserPoolResourceServer": {
+        # Identifier is the physical id of the resource server and the prefix
+        # of every scope string it vends, so it is always a custom name.
+        "name": "Identifier",
+        "requires_replacement": _requires_replacement_cognito_resource_server,
     },
     "AWS::IoT::ThingGroup": {
         "name": "ThingGroupName",
@@ -5341,6 +5357,57 @@ def _cognito_user_pool_resource_server_create(logical_id, props, stack_name):
     return identifier, {}
 
 
+def _cognito_user_pool_resource_server_update(physical_id, old_props, new_props,
+                                              stack_name, logical_id=None):
+    """Update a resource server in place, keeping its Identifier (what Ref
+    returns). Name and Scopes are "Update requires: No interruption" on the
+    resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cognito-userpoolresourceserver.html)
+    and go through UpdateResourceServer; a dropped Scopes goes back to the
+    empty list the call defaults it to ("If you don't provide a value for an
+    attribute, it is set to the default value"). Name is "Required: Yes" on
+    the reference; a template that leaves it off gets the Identifier as
+    MiniStack's own fallback. Identifier and UserPoolId require replacement,
+    and the new resource server is created before the old one is removed.
+
+    The replacement test is spelled out here rather than going through
+    _rename_replacement because a resource server is keyed by (pool,
+    identifier) while its physical id is the identifier alone: a move to
+    another pool keeps the id, so the helper would see no replacement, the
+    engine's cleanup would not run either, and the resource server would stay
+    behind in the pool the template left. The pool has to be part of the
+    test. Under a declared Identifier the move is refused before we get here
+    (_custom_named_replacement_error, the way CloudFormation refuses to
+    replace a custom-named resource); this branch carries the case where the
+    template leaves the Identifier off. A resource server the template
+    retains on replacement is left where it is, since the engine's own
+    cleanup does not see a replacement it can skip when the identifier
+    stayed the same.
+    """
+    identifier = new_props.get("Identifier", "")
+    old_pid = old_props.get("UserPoolId", "")
+    new_pid = new_props.get("UserPoolId", "")
+    pool = _cognito._user_pools.get(old_pid)
+    server = _cognito._pool_resource_servers(pool).get(physical_id) if pool else None
+    if server is None or identifier != physical_id or new_pid != old_pid:
+        created = _cognito_user_pool_resource_server_create(
+            logical_id or physical_id, new_props, stack_name
+        )
+        if server is not None and not _RETAIN_REPLACED.get():
+            _cognito_user_pool_resource_server_delete(physical_id, old_props)
+        return created
+
+    status, _, body = _cognito._update_resource_server({
+        "UserPoolId": new_pid,
+        "Identifier": identifier,
+        "Name": new_props.get("Name", identifier),
+        "Scopes": new_props.get("Scopes", []),
+    })
+    if status >= 400:
+        raise ValueError(f"AWS::Cognito::UserPoolResourceServer update failed: {body!r}")
+    return identifier, {}
+
+
 def _cognito_user_pool_resource_server_delete(physical_id, props):
     pid = props.get("UserPoolId", "")
     pool = _cognito._user_pools.get(pid)
@@ -9112,7 +9179,12 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _cognito_user_pool_client_delete,
     },
-    "AWS::Cognito::UserPoolResourceServer": {"create": _cognito_user_pool_resource_server_create, "delete": _cognito_user_pool_resource_server_delete},
+    "AWS::Cognito::UserPoolResourceServer": {
+        "create": _cognito_user_pool_resource_server_create,
+        "update": _cognito_user_pool_resource_server_update,
+        "update_with_logical_id": True,
+        "delete": _cognito_user_pool_resource_server_delete,
+    },
     "AWS::Cognito::UserPoolGroup": {
         "create": _cognito_user_pool_group_create,
         "update": _cognito_user_pool_group_update,
