@@ -9127,6 +9127,88 @@ def test_cfn_cloudfront_origin_request_policy_updates_in_place(cfn, cloudfront):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def _response_headers_policy_template(name, max_age=86400, custom_header=None,
+                                      with_cors=True):
+    config = {"Name": name}
+    if with_cors:
+        config["CorsConfig"] = {
+            "AccessControlAllowCredentials": False,
+            "AccessControlAllowHeaders": {"Items": ["Authorization"]},
+            "AccessControlAllowMethods": {"Items": ["GET", "HEAD"]},
+            "AccessControlAllowOrigins": {"Items": ["https://example.test"]},
+            "AccessControlMaxAgeSec": max_age,
+            "OriginOverride": True,
+        }
+    if custom_header is not None:
+        config["CustomHeadersConfig"] = {"Items": [
+            {"Header": "X-Env", "Value": custom_header, "Override": True},
+        ]}
+    return {
+        "Resources": {"Rhp": {"Type": "AWS::CloudFront::ResponseHeadersPolicy",
+                              "Properties": {"ResponseHeadersPolicyConfig": config}}},
+        "Outputs": {"Id": {"Value": {"Ref": "Rhp"}}},
+    }
+
+
+def test_cfn_cloudfront_response_headers_policy_updates_in_place(cfn, cloudfront):
+    """AWS::CloudFront::ResponseHeadersPolicy is "No interruption" throughout.
+    The CORS max-age and the custom headers follow the template on an
+    UpdateStack under the same Id, and dropping CorsConfig removes the block
+    rather than leaving the previous one in the policy."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-rhp-update-{uid}"
+    name = f"cfn-rhp-update-{uid}"
+    renamed = f"cfn-rhp-renamed-{uid}"
+    try:
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _response_headers_policy_template(name, custom_header="local"))
+        policy_id = out["Id"]
+        cfg = cloudfront.get_response_headers_policy(
+            Id=policy_id)["ResponseHeadersPolicy"]["ResponseHeadersPolicyConfig"]
+        assert cfg["CorsConfig"]["AccessControlMaxAgeSec"] == 86400
+        assert cfg["CustomHeadersConfig"]["Items"][0]["Value"] == "local"
+
+        # In-place: max-age and the custom header value change, Id does not.
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _response_headers_policy_template(
+                                name, max_age=600, custom_header="staging"),
+                            update=True)
+        assert out["Id"] == policy_id
+        cfg = cloudfront.get_response_headers_policy(
+            Id=policy_id)["ResponseHeadersPolicy"]["ResponseHeadersPolicyConfig"]
+        assert cfg["CorsConfig"]["AccessControlMaxAgeSec"] == 600
+        assert cfg["CustomHeadersConfig"]["Items"][0]["Value"] == "staging"
+
+        # A rename keeps the same policy.
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _response_headers_policy_template(
+                                renamed, max_age=600, custom_header="staging"),
+                            update=True)
+        assert out["Id"] == policy_id
+        cfg = cloudfront.get_response_headers_policy(
+            Id=policy_id)["ResponseHeadersPolicy"]["ResponseHeadersPolicyConfig"]
+        assert cfg["Name"] == renamed
+        names = [p["ResponseHeadersPolicy"]["ResponseHeadersPolicyConfig"]["Name"]
+                 for p in cloudfront.list_response_headers_policies()[
+                     "ResponseHeadersPolicyList"]["Items"]]
+        assert names.count(renamed) == 1
+        assert name not in names
+
+        # Dropping CorsConfig removes the block; dropping CustomHeadersConfig
+        # leaves an empty one, which is what the parser builds for an absent
+        # element.
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _response_headers_policy_template(renamed, with_cors=False),
+                            update=True)
+        assert out["Id"] == policy_id
+        cfg = cloudfront.get_response_headers_policy(
+            Id=policy_id)["ResponseHeadersPolicy"]["ResponseHeadersPolicyConfig"]
+        assert "CorsConfig" not in cfg
+        assert cfg["CustomHeadersConfig"]["Quantity"] == 0
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_cloudfront_distribution_consumes_provisioned_policies(cfn, cloudfront):
     """The payoff: a distribution in the same stack references the policies and
     the function by Ref/GetAtt. This is what a CDK app emits, and it only works

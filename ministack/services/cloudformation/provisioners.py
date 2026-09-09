@@ -309,6 +309,15 @@ def _cf_response_headers_policy_create(logical_id, props, stack_name):
                              "ResponseHeadersPolicyConfig", logical_id, stack_name)
 
 
+def _cf_response_headers_policy_update(physical_id, old_props, new_props, stack_name,
+                                       logical_id=None):
+    return _cf_policy_update(_cf._response_headers_policies, _cf._RHP_SPEC["parse"],
+                             "AWS::CloudFront::ResponseHeadersPolicy",
+                             _cf_response_headers_policy_create,
+                             physical_id, new_props, "ResponseHeadersPolicyConfig",
+                             logical_id, stack_name)
+
+
 def _cf_response_headers_policy_delete(physical_id, props):
     _cf._response_headers_policies.pop(physical_id, None)
 
@@ -8938,7 +8947,12 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _cf_origin_request_policy_delete,
     },
-    "AWS::CloudFront::ResponseHeadersPolicy": {"create": _cf_response_headers_policy_create, "delete": _cf_response_headers_policy_delete},
+    "AWS::CloudFront::ResponseHeadersPolicy": {
+        "create": _cf_response_headers_policy_create,
+        "update": _cf_response_headers_policy_update,
+        "update_with_logical_id": True,
+        "delete": _cf_response_headers_policy_delete,
+    },
     "AWS::CloudFront::OriginAccessControl": {"create": _cf_oac_create, "delete": _cf_oac_delete},
     "AWS::CloudFront::Function": {"create": _cf_function_create, "delete": _cf_function_delete},
     "AWS::CloudWatch::Alarm": {
