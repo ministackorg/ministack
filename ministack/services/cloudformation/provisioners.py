@@ -3527,6 +3527,7 @@ def _apigw_method_create(logical_id, props, stack_name):
     data = {
         "authorizationType": props.get("AuthorizationType", "NONE"),
         "authorizerId": props.get("AuthorizerId"),
+        "authorizationScopes": props.get("AuthorizationScopes", []),
         "apiKeyRequired": props.get("ApiKeyRequired", False),
         "operationName": props.get("OperationName", ""),
         "requestParameters": props.get("RequestParameters", {}),
