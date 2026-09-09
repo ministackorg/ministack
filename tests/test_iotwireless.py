@@ -26,9 +26,11 @@ from conftest import ENDPOINT
 _TIMESTAMP = datetime(2026, 8, 26, 14, 6, 11, tzinfo=timezone.utc)
 _TIMESTAMP_RENDERED = "2026-08-26T14:06:11Z"
 
-# The five members that are accepted but never resolve the position, with the
+# The members that are accepted but never resolve the position, with the
 # sample values of the AWS developer guide's payload. `CellTowers` is an
-# object keyed by radio type, not an array.
+# object keyed by radio type, not an array. `AdvancedConfiguration` is not
+# here: `ConfidencePercent` is the caller's say over the reported confidence
+# level, so it does move the payload (see its own tests below).
 _NON_IP_MEMBERS = {
     "WiFiAccessPoints": [{"MacAddress": "A0:EC:F9:1E:32:C1", "Rss": -75}],
     "CellTowers": {
@@ -36,7 +38,6 @@ _NON_IP_MEMBERS = {
     },
     "Gnss": {"Payload": "8295D1B1B1B1B1B1B1"},
     "Timestamp": _TIMESTAMP,
-    "AdvancedConfiguration": {"WiFiCellular": {"ConfidencePercent": 90}},
 }
 
 
@@ -79,10 +80,46 @@ def test_iotwireless_position_estimate_is_geojson_point_blob(iotwireless):
 
 def test_iotwireless_accuracy_properties_carry_the_measured_values(iotwireless):
     """The two accuracy properties carry the values of the one live call
-    (eu-west-1, 2026-08-26)."""
+    (eu-west-1, 2026-08-26), which sent no `AdvancedConfiguration`."""
     properties = json.loads(_estimate_bytes(iotwireless, "1.2.3.4"))["properties"]
     assert properties["horizontalAccuracy"] == 1000000
     assert properties["horizontalConfidenceLevel"] == 0.67
+
+
+@pytest.mark.parametrize("percent,level", [(50, 0.5), (68, 0.68), (99, 0.99)])
+def test_iotwireless_confidence_percent_drives_the_confidence_level(
+    iotwireless, percent, level
+):
+    """`ConfidencePercent` is documented as the confidence level of the
+    estimate expressed as a percentage, so the caller's value is the level
+    the payload reports, over 100. 68 is the default AWS documents for the
+    member, and asking for it gets it."""
+    properties = json.loads(_estimate_bytes(
+        iotwireless, "1.2.3.4",
+        AdvancedConfiguration={"WiFiCellular": {"ConfidencePercent": percent}},
+    ))["properties"]
+    assert properties["horizontalConfidenceLevel"] == level
+
+
+@pytest.mark.parametrize("percent", [100, 1000])
+def test_iotwireless_confidence_percent_above_the_range_is_refused(
+    iotwireless, percent
+):
+    """The model constrains the member to 50..99 inclusive. botocore checks
+    the minimum client-side but not the maximum, so a value above the range
+    is the one an SDK caller can still put on the wire; the below-minimum
+    half is covered by the raw-wire test."""
+    with pytest.raises(ClientError) as excinfo:
+        iotwireless.get_position_estimate(
+            Ip={"IpAddress": "1.2.3.4"},
+            AdvancedConfiguration={"WiFiCellular": {"ConfidencePercent": percent}},
+        )
+    error = excinfo.value.response["Error"]
+    assert error["Code"] == "ValidationException"
+    assert error["Message"] == (
+        "AdvancedConfiguration.WiFiCellular.ConfidencePercent must be an "
+        "integer from 50 to 99"
+    )
 
 
 def test_iotwireless_same_ip_answers_identical_bytes(iotwireless):
@@ -294,6 +331,33 @@ def test_iotwireless_raw_timestamp_that_is_not_a_timestamp_is_refused(value):
     assert document["message"] == (
         "Timestamp must be a Unix timestamp, in seconds since the epoch"
     )
+
+
+@pytest.mark.parametrize("advanced", [
+    {"WiFiCellular": {"ConfidencePercent": 49}},     # below the model minimum
+    {"WiFiCellular": {"ConfidencePercent": 0}},
+    {"WiFiCellular": {"ConfidencePercent": "90"}},   # an integer member
+    {"WiFiCellular": {"ConfidencePercent": 90.5}},
+    {"WiFiCellular": {"ConfidencePercent": True}},
+    {"WiFiCellular": []},
+    "not-an-object",
+])
+def test_iotwireless_raw_advanced_configuration_must_be_the_shape(advanced):
+    """`ConfidencePercent` is modelled as an integer from 50 to 99 inside two
+    structures, so a value below the range or of another type never reaches
+    the confidence level. The SDK refuses all of these before the wire (it
+    checks types and the documented minimum), so only raw HTTP gets here."""
+    status, _content_type, raw = _raw(
+        "/position-estimate",
+        json.dumps({
+            "Ip": {"IpAddress": "1.2.3.4"},
+            "AdvancedConfiguration": advanced,
+        }).encode(),
+    )
+    assert status == 400
+    document = json.loads(raw)
+    assert document["__type"] == "ValidationException"
+    assert "ConfidencePercent" in document["message"]
 
 
 @pytest.mark.parametrize("ip_member", [{}, {"IpAddress": ""}])

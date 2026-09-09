@@ -13,16 +13,20 @@ Answering ``{"GeoJsonPayload": ...}`` would break every SDK client.
 
 Resolver scope: the real service resolves WLAN, cell-tower, GNSS and IP
 measurements through third-party solvers. MiniStack resolves from ``Ip``
-only. ``WiFiAccessPoints``, ``CellTowers``, ``Gnss`` and
-``AdvancedConfiguration`` are accepted and ignored, and none of them moves
-the estimate. The estimate is synthetic and deterministic: the canonical
+only. ``WiFiAccessPoints``, ``CellTowers`` and ``Gnss`` are accepted and
+ignored, and none of them moves the estimate. The estimate is synthetic
+and deterministic: the canonical
 form of ``Ip.IpAddress`` is hashed (SHA-256) onto lon [-180, 180) / lat
 [-60, 60), 4 decimals, so the same address always answers the same estimate
 and a consumer test can assert on it.
 
 The blob's ``properties`` carry the two accuracy fields with the values of
 the single live call recorded for this work (eu-west-1, 2026-08-26):
-``horizontalAccuracy`` 1000000 and ``horizontalConfidenceLevel`` 0.67. The
+``horizontalAccuracy`` 1000000 and ``horizontalConfidenceLevel`` 0.67. That
+call asked for nothing, so 0.67 is the default level;
+``AdvancedConfiguration.WiFiCellular.ConfidencePercent`` is the caller's own
+say over it and drives the reported level, over 100, within the 50 to 99 the
+model allows. The
 ``timestamp`` property is always there: AWS documents the request's
 ``Timestamp`` as the time at which the position is resolved and says "if not
 specified, the time at which the request was received will be used", so the
@@ -56,7 +60,8 @@ data input", where the real service would run the third-party solvers.
 
 An IPv4-mapped IPv6 address hashes as its IPv4 form. A malformed JSON body
 is a ``ValidationException``, as is a ``Timestamp`` that is not a Unix
-timestamp (a raw HTTP caller can send one; an SDK cannot).
+timestamp (a raw HTTP caller can send one; an SDK cannot) and a
+``ConfidencePercent`` outside the range the model allows.
 """
 
 from __future__ import annotations
@@ -117,9 +122,16 @@ _HINT_MEMBERS = ("WiFiAccessPoints", "CellTowers", "Ip", "Gnss")
 
 # The values of the one live call recorded for this work (eu-west-1,
 # 2026-08-26). Fixed, because the estimate is synthetic: there is no solver
-# behind it whose accuracy could vary per address.
+# behind it whose accuracy could vary per address. That call sent no
+# `AdvancedConfiguration`, so 0.67 is what the service reports when the
+# caller asks for nothing; a caller that does ask drives the level itself.
 _HORIZONTAL_ACCURACY = 1000000
 _HORIZONTAL_CONFIDENCE_LEVEL = 0.67
+
+# `AdvancedConfiguration.WiFiCellular.ConfidencePercent`, as the model
+# constrains it: an integer, 50 to 99 inclusive.
+_CONFIDENCE_PERCENT_MIN = 50
+_CONFIDENCE_PERCENT_MAX = 99
 
 # What a member reader answers when the request's value is not one the member
 # accepts, so the caller gets the documented 400 instead of the value.
@@ -153,6 +165,13 @@ def _get_position_estimate(body: bytes) -> tuple:
         # is not a timestamp is the documented 400 whatever the address does.
         return _validation(
             "Timestamp must be a Unix timestamp, in seconds since the epoch"
+        )
+    confidence_level = _confidence_level(payload)
+    if confidence_level is _INVALID:
+        return _validation(
+            "AdvancedConfiguration.WiFiCellular.ConfidencePercent must be an "
+            f"integer from {_CONFIDENCE_PERCENT_MIN} to "
+            f"{_CONFIDENCE_PERCENT_MAX}"
         )
     if "Ip" not in payload:
         # A WLAN/cell/GNSS-only request is well formed, MiniStack simply has
@@ -191,7 +210,7 @@ def _get_position_estimate(body: bytes) -> tuple:
     lon, lat = _coordinates_for(canonical)
     properties = {
         "horizontalAccuracy": _HORIZONTAL_ACCURACY,
-        "horizontalConfidenceLevel": _HORIZONTAL_CONFIDENCE_LEVEL,
+        "horizontalConfidenceLevel": confidence_level,
         "timestamp": resolved_at,
     }
     geojson = {
@@ -249,6 +268,41 @@ def _resolved_timestamp(payload: dict):
 
 def _render_timestamp(moment: datetime) -> str:
     return moment.isoformat().replace("+00:00", "Z")
+
+
+def _confidence_level(payload: dict):
+    """The value for ``properties.horizontalConfidenceLevel``, or ``_INVALID``.
+
+    ``AdvancedConfiguration.WiFiCellular.ConfidencePercent`` is documented as
+    "confidence level for WiFi and cellular position estimates, expressed as
+    a percentage", so a value the caller supplies IS the level the payload
+    reports, over 100. The model constrains it to an integer from 50 to 99
+    inclusive and a value outside that is refused rather than clamped.
+
+    Omitted, the level stays the 0.67 of the one live call, which sent no
+    ``AdvancedConfiguration`` at all. AWS documents the member's own default
+    as 68, and a caller who sends ``ConfidencePercent: 68`` gets 0.68 here;
+    what 0.67 records is what the service answered a request that asked for
+    nothing, which is the thing an emulator has to reproduce.
+    """
+    advanced = payload.get("AdvancedConfiguration")
+    if advanced is None:
+        return _HORIZONTAL_CONFIDENCE_LEVEL
+    if not isinstance(advanced, dict):
+        return _INVALID
+    wifi_cellular = advanced.get("WiFiCellular")
+    if wifi_cellular is None:
+        return _HORIZONTAL_CONFIDENCE_LEVEL
+    if not isinstance(wifi_cellular, dict):
+        return _INVALID
+    percent = wifi_cellular.get("ConfidencePercent")
+    if percent is None:
+        return _HORIZONTAL_CONFIDENCE_LEVEL
+    if isinstance(percent, bool) or not isinstance(percent, int):
+        return _INVALID
+    if not _CONFIDENCE_PERCENT_MIN <= percent <= _CONFIDENCE_PERCENT_MAX:
+        return _INVALID
+    return percent / 100
 
 
 def _coordinates_for(canonical_ip: str) -> tuple[float, float]:
