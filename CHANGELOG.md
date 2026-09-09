@@ -21,6 +21,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 - **CloudFormation — `AWS::Cognito::UserPoolResourceServer` updates in place, and a move between pools is refused** — the type had no update handler either. The physical id of a resource server is its `Identifier` alone while the record is keyed by pool and identifier, so a template that repointed `UserPoolId` provisioned a second resource server in the new pool and left the old one behind in the old pool, with no replacement for the engine to clean up: two live copies of a resource server the template declares once, both vending scopes. `Name` and `Scopes` now go through `UpdateResourceServer` on the resource server that is already there, a dropped `Scopes` reverts to the empty list `UpdateResourceServer` defaults it to, a changed `Identifier` is the rename CloudFormation allows and replaces (retained when the resource says so), and a changed `UserPoolId` under an unchanged identifier gets CloudFormation's own refusal, since `Identifier` is always a custom name. Contributed by @iot-rocket.
 
+- **CloudFormation — `AWS::SQS::QueuePolicy` updates in place** — the type had no update handler, so a stack update that changed the policy fell through to create, which minted a new physical id; the engine recorded a replacement and the cleanup delete then removed `Policy` from the very queues the new document had just been written to (measured: after the update the queue had no policy at all). `PolicyDocument` and `Queues` are both No interruption on the resource reference, so the resource now keeps its physical id, writes the new document on every queue the template names and removes it from a queue dropped from `Queues`. Contributed by @iot-rocket.
+
 ## [1.5.10] — 2026-09-10
 
 ### Added

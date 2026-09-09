@@ -4734,12 +4734,45 @@ def _lambda_alias_delete(physical_id, props):
         func["aliases"].pop(alias_name, None)
 
 
-# --- SQS QueuePolicy ---
+# --- Resource policy attachments (SQS QueuePolicy, SNS TopicPolicy) ---
 
-def _sqs_queue_policy_create(logical_id, props, stack_name):
+def _policy_document_json(props):
+    """The PolicyDocument of a policy-attachment resource as the JSON string
+    the service stores under the ``Policy`` attribute."""
     policy_doc = props.get("PolicyDocument", {})
     if isinstance(policy_doc, dict):
         policy_doc = json.dumps(policy_doc)
+    return policy_doc
+
+
+def _policy_attachment_update(physical_id, old_props, new_props, members, store):
+    """Shared update for the two policy-attachment types, AWS::SQS::QueuePolicy
+    and AWS::SNS::TopicPolicy: PolicyDocument and the member list (Queues,
+    Topics) are both No interruption on the resource references, so the
+    physical id is kept, the new document is written on every member the
+    new template names, and it is removed from a member the old template
+    named and the new one dropped. ``store`` is the service's record map,
+    keyed the way the member list refers to it (queue URL, topic ARN).
+    A member dropped from the list loses its policy even when another resource
+    put it there: last writer wins, as on AWS.
+    """
+    policy_doc = _policy_document_json(new_props)
+    new_members = new_props.get(members, [])
+    for member in old_props.get(members, []):
+        record = store.get(member)
+        if record and member not in new_members:
+            record["attributes"].pop("Policy", None)
+    for member in new_members:
+        record = store.get(member)
+        if record:
+            record["attributes"]["Policy"] = policy_doc
+    return physical_id, {}
+
+
+# --- SQS QueuePolicy ---
+
+def _sqs_queue_policy_create(logical_id, props, stack_name):
+    policy_doc = _policy_document_json(props)
     queues = props.get("Queues", [])
     for queue_url in queues:
         queue = _sqs._queues.get(queue_url)
@@ -4747,6 +4780,10 @@ def _sqs_queue_policy_create(logical_id, props, stack_name):
             queue["attributes"]["Policy"] = policy_doc
     pid = f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
     return pid, {}
+
+
+def _sqs_queue_policy_update(physical_id, old_props, new_props, stack_name):
+    return _policy_attachment_update(physical_id, old_props, new_props, "Queues", _sqs._queues)
 
 
 def _sqs_queue_policy_delete(physical_id, props):
@@ -9149,7 +9186,11 @@ _RESOURCE_HANDLERS = {
     },
     "AWS::Pipes::Pipe": {"create": _pipes_pipe_create, "delete": _pipes_pipe_delete},
     "AWS::Lambda::Alias": {"create": _lambda_alias_create, "delete": _lambda_alias_delete},
-    "AWS::SQS::QueuePolicy": {"create": _sqs_queue_policy_create, "delete": _sqs_queue_policy_delete},
+    "AWS::SQS::QueuePolicy": {
+        "create": _sqs_queue_policy_create,
+        "update": _sqs_queue_policy_update,
+        "delete": _sqs_queue_policy_delete,
+    },
     "AWS::SNS::TopicPolicy": {"create": _sns_topic_policy_create, "delete": _sns_topic_policy_delete},
     "AWS::AppSync::GraphQLApi": {"create": _appsync_api_create, "delete": _appsync_api_delete},
     "AWS::AppSync::DataSource": {"create": _appsync_ds_create, "delete": _appsync_ds_delete},

@@ -6192,6 +6192,76 @@ def test_cfn_sns_subscription_raw_message_delivery(cfn, sns, sqs):
     _wait_stack(cfn, stack_name)
 
 
+def _sqs_policy_sids(sqs, queue_url):
+    """The statement ids of the queue's Policy attribute, [] when it has none."""
+    policy = sqs.get_queue_attributes(
+        QueueUrl=queue_url, AttributeNames=["Policy"],
+    )["Attributes"].get("Policy")
+    if not policy:
+        return []
+    return [st.get("Sid") for st in json.loads(policy)["Statement"]]
+
+
+def _sqs_policy_document(sid, queue_arns):
+    return {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": sid,
+            "Effect": "Allow",
+            "Principal": {"Service": "sns.amazonaws.com"},
+            "Action": "sqs:SendMessage",
+            "Resource": queue_arns,
+        }],
+    }
+
+
+def test_cfn_sqs_queue_policy_updates_in_place(cfn, sqs):
+    """PolicyDocument and Queues are both No interruption on the resource
+    reference: the policy resource keeps its physical id, the queues it
+    still names carry the new document, and a queue dropped from Queues
+    loses its policy. Without an update handler the resource was replaced
+    and the replacement's cleanup delete stripped the policy off the very
+    queues the new document had just been written to."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sqs-qpol-{uid}"
+
+    def template(sid, queues):
+        return json.dumps({
+            "Resources": {
+                "QueueA": {"Type": "AWS::SQS::Queue",
+                           "Properties": {"QueueName": f"cfn-qpol-a-{uid}"}},
+                "QueueB": {"Type": "AWS::SQS::Queue",
+                           "Properties": {"QueueName": f"cfn-qpol-b-{uid}"}},
+                "Policy": {"Type": "AWS::SQS::QueuePolicy", "Properties": {
+                    "Queues": [{"Ref": q} for q in queues],
+                    "PolicyDocument": _sqs_policy_document(
+                        sid, [{"Fn::GetAtt": [q, "Arn"]} for q in queues]),
+                }},
+            },
+            "Outputs": {"QueueA": {"Value": {"Ref": "QueueA"}},
+                        "QueueB": {"Value": {"Ref": "QueueB"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("AllowSns", ["QueueA", "QueueB"]))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        queue_a = _output(stack, "QueueA")
+        queue_b = _output(stack, "QueueB")
+        assert _sqs_policy_sids(sqs, queue_a) == ["AllowSns"]
+        assert _sqs_policy_sids(sqs, queue_b) == ["AllowSns"]
+        physical_id = _stack_physical_id(cfn, stack_name, "Policy")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("AllowSnsV2", ["QueueA"]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _sqs_policy_sids(sqs, queue_a) == ["AllowSnsV2"]
+        assert _sqs_policy_sids(sqs, queue_b) == []
+        assert _stack_physical_id(cfn, stack_name, "Policy") == physical_id
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 # ===========================================================================
 # CodeBuild Project Tests
 # ===========================================================================
