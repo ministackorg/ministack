@@ -609,6 +609,10 @@ _CUSTOM_NAME_REPLACEMENT = {
         "name": "TrackerName",
         "requires_replacement": lambda old, new: old.get("KmsKeyId") != new.get("KmsKeyId"),
     },
+    "AWS::IAM::InstanceProfile": {
+        "name": "InstanceProfileName",
+        "requires_replacement": lambda old, new: old.get("Path", "/") != new.get("Path", "/"),
+    },
 }
 
 
@@ -2241,29 +2245,67 @@ def _iam_policy_delete(physical_id, props):
 
 # --- IAM InstanceProfile ---
 
+def _iam_ip_arn(name, path):
+    return f"arn:aws:iam::{get_account_id()}:instance-profile{path}{name}"
+
+
+def _iam_ip_roles(props):
+    """The role names of the Roles property that exist, the shape the
+    service keeps on the record (its XML resolves them against the role
+    store); a role the template names that does not exist is skipped."""
+    return [rname for rname in props.get("Roles", []) if rname in _iam._roles]
+
+
 def _iam_ip_create(logical_id, props, stack_name):
     name = props.get("InstanceProfileName") or _physical_name(stack_name, logical_id, max_len=128)
     path = props.get("Path", "/")
-    arn = f"arn:aws:iam::{get_account_id()}:instance-profile{path}{name}"
+    arn = _iam_ip_arn(name, path)
+    if props.get("InstanceProfileName") and name in _iam._instance_profiles:
+        # CreateInstanceProfile answers EntityAlreadyExists for any duplicate
+        # name: a custom-named profile must not write over one that another
+        # stack or the API owns. A generated name is the emulator's
+        # deterministic one, so its replacement lands under the same name
+        # (AWS would mint a new one) and is not refused.
+        raise ValueError(f"AWS::IAM::InstanceProfile: {name} already exists")
     ip_id = new_uuid().replace("-", "")[:21].upper()
-
-    roles = []
-    for rname in props.get("Roles", []):
-        role = _iam._roles.get(rname)
-        if role:
-            roles.append(role)
 
     profile = {
         "InstanceProfileName": name,
         "InstanceProfileId": ip_id,
         "Arn": arn,
         "Path": path,
-        "Roles": roles,
+        "Roles": _iam_ip_roles(props),
         "CreateDate": now_iso(),
         "Tags": [],
     }
     _iam._instance_profiles[name] = profile
     return arn, {"Arn": arn}
+
+
+def _iam_ip_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update an instance profile in place: Roles is No interruption on the
+    resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-iam-instanceprofile.html),
+    so the role list is replaced on the record, which keeps its ARN, id,
+    creation date and the tags set through TagInstanceProfile (the create
+    rebuilt the record with no tags). InstanceProfileName and Path require
+    replacement: the profile under the new ARN is created before the old
+    one is removed; a custom-named profile whose Path changes was already
+    refused by _custom_named_replacement_error, as CloudFormation refuses
+    to replace a custom-named resource."""
+    name = new_props.get("InstanceProfileName") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=128)
+    profile = next(
+        (ip for ip in _iam._instance_profiles.values() if ip.get("Arn") == physical_id), None)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        _iam_ip_arn(name, new_props.get("Path", "/")), profile["Arn"] if profile else None,
+        _iam_ip_create, _iam_ip_delete,
+    )
+    if replaced is not None:
+        return replaced
+    profile["Roles"] = _iam_ip_roles(new_props)
+    return physical_id, {"Arn": physical_id}
 
 
 def _iam_ip_delete(physical_id, props):
@@ -9226,7 +9268,12 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _iam_policy_delete,
     },
-    "AWS::IAM::InstanceProfile": {"create": _iam_ip_create, "delete": _iam_ip_delete},
+    "AWS::IAM::InstanceProfile": {
+        "create": _iam_ip_create,
+        "update": _iam_ip_update,
+        "update_with_logical_id": True,
+        "delete": _iam_ip_delete,
+    },
     "AWS::SSM::Parameter": {"create": _ssm_create, "update": _ssm_update, "delete": _ssm_delete},
     "AWS::AppConfig::Application": {
         "create": _appconfig_application_create,

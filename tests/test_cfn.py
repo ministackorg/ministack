@@ -18614,6 +18614,125 @@ def test_cfn_iam_managed_policy_delete_detaches_entities(cfn, iam):
         _cfn_policy_test_roles_cleanup(iam, [role])
 
 
+def _cfn_instance_profile_template(uid, profile_props):
+    def role(name):
+        return {"Type": "AWS::IAM::Role", "Properties": {
+            "RoleName": f"cfn-ip-{name}-{uid}",
+            "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow", "Principal": {"Service": "ec2.amazonaws.com"},
+                "Action": "sts:AssumeRole"}]},
+        }}
+    return json.dumps({
+        "Resources": {"RoleA": role("a"), "RoleB": role("b"),
+                      "Profile": {"Type": "AWS::IAM::InstanceProfile", "Properties": profile_props}},
+        "Outputs": {"ProfileRef": {"Value": {"Ref": "Profile"}},
+                    "ProfileArn": {"Value": {"Fn::GetAtt": ["Profile", "Arn"]}}},
+    })
+
+
+def test_cfn_iam_instance_profile_roles_update_in_place(cfn, iam):
+    """Roles is No interruption on the resource reference: the profile keeps
+    its ARN and id, GetInstanceProfile reads the new role, and a tag set
+    through TagInstanceProfile survives the update (the create rebuilt the
+    record without tags)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iam-ip-upd-{uid}"
+    name = f"cfn-ip-upd-{uid}"
+
+    def props(role):
+        return {"InstanceProfileName": name, "Roles": [{"Ref": role}]}
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_instance_profile_template(
+        uid, props("RoleA")), Capabilities=["CAPABILITY_NAMED_IAM"])
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        ref = _output(stack, "ProfileRef")
+        arn = _output(stack, "ProfileArn")
+        profile = iam.get_instance_profile(InstanceProfileName=name)["InstanceProfile"]
+        assert profile["Arn"] == arn
+        assert [r["RoleName"] for r in profile["Roles"]] == [f"cfn-ip-a-{uid}"]
+        profile_id = profile["InstanceProfileId"]
+        iam.tag_instance_profile(InstanceProfileName=name, Tags=[{"Key": "team", "Value": "ops"}])
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_instance_profile_template(
+            uid, props("RoleB")), Capabilities=["CAPABILITY_NAMED_IAM"])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "ProfileRef") == ref
+        assert _output(stack, "ProfileArn") == arn
+        profile = iam.get_instance_profile(InstanceProfileName=name)["InstanceProfile"]
+        assert [r["RoleName"] for r in profile["Roles"]] == [f"cfn-ip-b-{uid}"]
+        assert profile["InstanceProfileId"] == profile_id
+        assert profile.get("Tags") == [{"Key": "team", "Value": "ops"}]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_iam_instance_profile_path_change_under_custom_name_fails_loudly(cfn, iam):
+    """Path requires replacement, which CloudFormation refuses for a
+    custom-named profile: the stack rolls back and the profile keeps its
+    path and role. Without an update handler the create silently rebuilt
+    the profile under the new path."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iam-ip-path-{uid}"
+    name = f"cfn-ip-named-{uid}"
+
+    def props(path):
+        return {"InstanceProfileName": name, "Path": path, "Roles": [{"Ref": "RoleA"}]}
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_instance_profile_template(
+        uid, props("/")), Capabilities=["CAPABILITY_NAMED_IAM"])
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_instance_profile_template(
+            uid, props("/moved/")), Capabilities=["CAPABILITY_NAMED_IAM"])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert "custom-named resource requires replacing" in _stack_event_reasons(cfn, stack_name)
+        profile = iam.get_instance_profile(InstanceProfileName=name)["InstanceProfile"]
+        assert profile["Path"] == "/"
+        assert profile["Arn"].endswith(f":instance-profile/{name}")
+        assert [r["RoleName"] for r in profile["Roles"]] == [f"cfn-ip-a-{uid}"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_iam_instance_profile_path_change_under_generated_name_replaces_it(cfn, iam):
+    """Under a generated name a Path change is a replacement: the profile
+    is re-created under the new path, so its ARN changes and its role
+    comes along."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iam-ip-gen-{uid}"
+
+    def props(path):
+        return {"Path": path, "Roles": [{"Ref": "RoleA"}]}
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_instance_profile_template(
+        uid, props("/")), Capabilities=["CAPABILITY_NAMED_IAM"])
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        old_arn = _output(stack, "ProfileArn")
+        # Ref returns the ARN here; the generated name is its last segment.
+        name = old_arn.rsplit("/", 1)[1]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_instance_profile_template(
+            uid, props("/moved/")), Capabilities=["CAPABILITY_NAMED_IAM"])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        new_arn = _output(stack, "ProfileArn")
+        assert new_arn != old_arn
+        assert new_arn.endswith(f":instance-profile/moved/{name}")
+        profile = iam.get_instance_profile(InstanceProfileName=name)["InstanceProfile"]
+        assert profile["Arn"] == new_arn
+        assert profile["Path"] == "/moved/"
+        assert [r["RoleName"] for r in profile["Roles"]] == [f"cfn-ip-a-{uid}"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_iam_policy_version_cap_prunes_on_sixth_document(cfn, iam):
     """Every PolicyDocument change becomes a new default version; at the IAM
     five-version cap the oldest non-default version is pruned first, so the
