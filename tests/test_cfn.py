@@ -10250,7 +10250,8 @@ def test_cfn_cloudfront_distribution_consumes_provisioned_policies(cfn, cloudfro
     """The payoff: a distribution in the same stack references the policies and
     the function by Ref/GetAtt. This is what a CDK app emits, and it only works
     if Ref yields the value the distribution's own parser expects."""
-    template = json.loads(_cloudfront_template("prov2"))
+    uid = _uuid_mod.uuid4().hex[:8]
+    template = json.loads(_cloudfront_template(f"prov2{uid}"))
     template["Resources"]["Dist"] = {
         "Type": "AWS::CloudFront::Distribution",
         "Properties": {"DistributionConfig": {
@@ -10273,34 +10274,216 @@ def test_cfn_cloudfront_distribution_consumes_provisioned_policies(cfn, cloudfro
     }
     template["Outputs"]["DistId"] = {"Value": {"Ref": "Dist"}}
 
-    cfn.create_stack(StackName="cfn-cf-dist-policies", TemplateBody=json.dumps(template))
-    stack = _wait_stack(cfn, "cfn-cf-dist-policies")
-    assert stack["StackStatus"] == "CREATE_COMPLETE"
-    out = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+    stack_name = f"cfn-cf-dist-policies-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        out = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
 
-    # The distribution provisioner accepted every Ref without rolling back, and
-    # each one addresses a real object. Asserting the stored DefaultCacheBehavior
-    # would be the stronger check, but GetDistribution and GetDistributionConfig
-    # both 500 on any CloudFormation-provisioned distribution (the record carries
-    # an empty config_xml) — that is a separate, pre-existing bug.
-    assert cloudfront.get_cache_policy(Id=out["CachePolicyRef"])["CachePolicy"]["Id"]
-    assert cloudfront.get_origin_request_policy(
-        Id=out["OrpRef"])["OriginRequestPolicy"]["Id"]
-    assert cloudfront.get_response_headers_policy(
-        Id=out["RhpRef"])["ResponseHeadersPolicy"]["Id"]
-    assert out["FunctionArn"].endswith(":function/cfn-fn-prov2")
-    assert out["DistId"]
+        # The distribution provisioner accepted every Ref without rolling back,
+        # and each one addresses a real object; the stored DefaultCacheBehavior
+        # names the same ids the policies were created under.
+        assert cloudfront.get_cache_policy(Id=out["CachePolicyRef"])["CachePolicy"]["Id"]
+        assert cloudfront.get_origin_request_policy(
+            Id=out["OrpRef"])["OriginRequestPolicy"]["Id"]
+        assert cloudfront.get_response_headers_policy(
+            Id=out["RhpRef"])["ResponseHeadersPolicy"]["Id"]
+        assert out["FunctionArn"].endswith(f":function/cfn-fn-prov2{uid}")
+        behavior = cloudfront.get_distribution_config(
+            Id=out["DistId"])["DistributionConfig"]["DefaultCacheBehavior"]
+        assert behavior["CachePolicyId"] == out["CachePolicyRef"]
+        assert behavior["OriginRequestPolicyId"] == out["OrpRef"]
+        assert behavior["ResponseHeadersPolicyId"] == out["RhpRef"]
+        assert behavior["FunctionAssociations"]["Items"][0]["FunctionARN"] == out["FunctionArn"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
 
-    cfn.delete_stack(StackName="cfn-cf-dist-policies")
-    _wait_stack(cfn, "cfn-cf-dist-policies")
+
+def _cf_distribution_update_template(comment="first", aliases=("a.example",),
+                                     origins=("origin1",), enabled=True, tags=None):
+    return json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {"Dist": {
+            "Type": "AWS::CloudFront::Distribution",
+            "Properties": {
+                "DistributionConfig": {
+                    "Enabled": enabled,
+                    "Comment": comment,
+                    "Aliases": list(aliases),
+                    "DefaultRootObject": "index.html",
+                    "IPV6Enabled": True,
+                    "Origins": [{"Id": o, "DomainName": f"{o}.example.test",
+                                 "OriginCustomHeaders": [{"HeaderName": "X-Origin",
+                                                          "HeaderValue": o}],
+                                 "CustomOriginConfig": {"OriginProtocolPolicy": "https-only",
+                                                        "OriginSSLProtocols": ["TLSv1.2"]}}
+                                for o in origins],
+                    "DefaultCacheBehavior": {
+                        "TargetOriginId": origins[0],
+                        "ViewerProtocolPolicy": "redirect-to-https",
+                        "AllowedMethods": ["GET", "HEAD", "OPTIONS"],
+                        "CachedMethods": ["GET", "HEAD"],
+                        "Compress": True,
+                        "ForwardedValues": {"QueryString": False,
+                                            "Cookies": {"Forward": "none"}},
+                    },
+                    "CustomErrorResponses": [{"ErrorCode": 404, "ResponseCode": 200,
+                                              "ResponsePagePath": "/index.html"}],
+                    "Restrictions": {"GeoRestriction": {"RestrictionType": "whitelist",
+                                                        "Locations": ["DE", "AT"]}},
+                    "ViewerCertificate": {
+                        "AcmCertificateArn": "arn:aws:acm:us-east-1:000000000000:certificate/cfn",
+                        "SslSupportMethod": "sni-only",
+                        "MinimumProtocolVersion": "TLSv1.2_2021",
+                    },
+                },
+                "Tags": [{"Key": k, "Value": v} for k, v in (tags or {"env": "a"}).items()],
+            },
+        }},
+        "Outputs": {"DistId": {"Value": {"Ref": "Dist"}},
+                    "DomainName": {"Value": {"Fn::GetAtt": ["Dist", "DomainName"]}}},
+    })
+
+
+def test_cfn_cloudfront_distribution_readable_through_the_api(cfn, cloudfront):
+    """A CloudFormation-provisioned distribution stored an empty config, so
+    GetDistribution and GetDistributionConfig failed with a 500 on it and
+    ListDistributions showed empty blocks. The create now stores the
+    DistributionConfig rendered the way CreateDistribution stores it, in the
+    API's shape: plain lists become Quantity/Items blocks, CachedMethods
+    nests under AllowedMethods, IPV6Enabled is IsIPV6Enabled, the
+    ViewerCertificate members take the API's capitalisation."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-dist-read-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cf_distribution_update_template())
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        dist_id = _output(stack, "DistId")
+
+        response = cloudfront.get_distribution(Id=dist_id)
+        dist, dist_etag = response["Distribution"], response["ETag"]
+        assert dist["Id"] == dist_id
+        assert dist["DomainName"] == _output(stack, "DomainName")
+        cfg = dist["DistributionConfig"]
+        assert cfg["CallerReference"]
+        assert cfg["Comment"] == "first"
+        assert cfg["Aliases"] == {"Quantity": 1, "Items": ["a.example"]}
+        assert cfg["IsIPV6Enabled"] is True
+        origin = cfg["Origins"]["Items"][0]
+        assert origin["DomainName"] == "origin1.example.test"
+        assert origin["CustomHeaders"]["Items"] == [{"HeaderName": "X-Origin", "HeaderValue": "origin1"}]
+        assert origin["CustomOriginConfig"]["OriginSslProtocols"]["Items"] == ["TLSv1.2"]
+        behavior = cfg["DefaultCacheBehavior"]
+        assert behavior["AllowedMethods"]["Items"] == ["GET", "HEAD", "OPTIONS"]
+        assert behavior["AllowedMethods"]["CachedMethods"]["Items"] == ["GET", "HEAD"]
+        assert cfg["CustomErrorResponses"]["Items"][0]["ResponsePagePath"] == "/index.html"
+        assert cfg["Restrictions"]["GeoRestriction"] == {
+            "RestrictionType": "whitelist", "Quantity": 2, "Items": ["DE", "AT"]}
+        assert cfg["ViewerCertificate"] == {
+            "ACMCertificateArn": "arn:aws:acm:us-east-1:000000000000:certificate/cfn",
+            "SSLSupportMethod": "sni-only", "MinimumProtocolVersion": "TLSv1.2_2021"}
+
+        config = cloudfront.get_distribution_config(Id=dist_id)
+        assert config["DistributionConfig"]["Origins"] == cfg["Origins"]
+        assert config["ETag"] == dist_etag
+        summary = next(d for d in cloudfront.list_distributions()["DistributionList"]["Items"]
+                       if d["Id"] == dist_id)
+        assert summary["Aliases"]["Items"] == ["a.example"]
+        assert summary["Origins"]["Quantity"] == 1
+        # The distribution is in _STACK_TAG_PROPERTY, so the three
+        # aws:cloudformation: tags reach it alongside the template's own,
+        # the way every other tag-storing type receives them.
+        tags = {t["Key"]: t["Value"]
+                for t in cloudfront.list_tags_for_resource(Resource=dist["ARN"])["Tags"]["Items"]}
+        assert tags["env"] == "a"
+        assert tags["aws:cloudformation:stack-name"] == stack_name
+        assert tags["aws:cloudformation:logical-id"] == "Dist"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cloudfront_distribution_updates_in_place(cfn, cloudfront, tagging):
+    """DistributionConfig and Tags are both No interruption on the
+    AWS::CloudFront::Distribution reference, so an update never replaces:
+    Id, ARN and DomainName stay, the ETag rolls, GetDistributionConfig reads
+    the new configuration, a dropped alias is gone, Enabled: false reaches
+    the summary, tags are reconciled and the invalidation history survives.
+    The create fallback minted a new Id and DomainName on every change and
+    the engine deleted the old distribution. Deleting the stack removes the
+    tags with the distribution, so the tagging API stops listing it."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-dist-update-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cf_distribution_update_template())
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        dist_id, domain = _output(stack, "DistId"), _output(stack, "DomainName")
+        before = cloudfront.get_distribution(Id=dist_id)
+        cloudfront.create_invalidation(
+            DistributionId=dist_id,
+            InvalidationBatch={"Paths": {"Quantity": 1, "Items": ["/*"]},
+                               "CallerReference": f"inv-{uid}"})
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cf_distribution_update_template(
+            comment="second", aliases=("b.example",), origins=("origin1", "origin2"),
+            enabled=False, tags={"env": "b", "team": "web"}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "DistId") == dist_id
+        assert _output(stack, "DomainName") == domain
+
+        after = cloudfront.get_distribution(Id=dist_id)
+        assert after["ETag"] != before["ETag"]
+        dist = after["Distribution"]
+        assert dist["ARN"] == before["Distribution"]["ARN"]
+        assert dist["LastModifiedTime"] >= before["Distribution"]["LastModifiedTime"]
+        cfg = cloudfront.get_distribution_config(Id=dist_id)["DistributionConfig"]
+        assert cfg["Comment"] == "second"
+        assert cfg["Enabled"] is False
+        assert cfg["Aliases"] == {"Quantity": 1, "Items": ["b.example"]}
+        assert [o["Id"] for o in cfg["Origins"]["Items"]] == ["origin1", "origin2"]
+        assert cfg["CallerReference"] == before["Distribution"]["DistributionConfig"]["CallerReference"]
+        summary = next(d for d in cloudfront.list_distributions()["DistributionList"]["Items"]
+                       if d["Id"] == dist_id)
+        assert summary["Enabled"] is False
+        # The template's own tags are reconciled (env moved from a to b,
+        # team added); the stack tags the type now receives alongside them
+        # survive the update rather than being reconciled away.
+        tags = {t["Key"]: t["Value"]
+                for t in cloudfront.list_tags_for_resource(Resource=dist["ARN"])["Tags"]["Items"]}
+        assert tags["env"] == "b"
+        assert tags["team"] == "web"
+        assert tags["aws:cloudformation:stack-name"] == stack_name
+        assert tags["aws:cloudformation:logical-id"] == "Dist"
+        invalidations = cloudfront.list_invalidations(DistributionId=dist_id)["InvalidationList"]
+        assert invalidations["Quantity"] == 1
+
+        # A dropped property reverts to the create default: no aliases.
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cf_distribution_update_template(
+            comment="second", aliases=(), origins=("origin1", "origin2"), enabled=False,
+            tags={"env": "b", "team": "web"}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "DistId") == dist_id
+        cfg = cloudfront.get_distribution_config(Id=dist_id)["DistributionConfig"]
+        assert cfg["Aliases"]["Quantity"] == 0
+        assert "Items" not in cfg["Aliases"]
+
+        _delete_cfn_test_stack(cfn, stack_name)
+        listed = [r["ResourceARN"] for r in tagging.get_resources(
+            ResourceTypeFilters=["cloudfront"])["ResourceTagMappingList"]]
+        assert dist["ARN"] not in listed
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
 
 
 def test_cfn_cloudfront_distribution_keeps_its_policy_ref_across_a_rename(cfn, cloudfront):
     """The payoff of updating in place: a distribution that took the cache
     policy's Ref keeps pointing at the same policy after the policy is renamed
-    through the stack. Only the Ref and the policy itself can be asserted here;
-    GetDistributionConfig on a CloudFormation-provisioned distribution is the
-    separate, pre-existing 500."""
+    through the stack. The Ref and the policy itself are what the rename is
+    about, so they are what this asserts."""
     uid = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-cf-dist-rename-{uid}"
     template = json.loads(_cloudfront_template(f"ren{uid}"))

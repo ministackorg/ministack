@@ -774,7 +774,7 @@ def _reconcile_tag_list(store: list, old_props: dict, new_props: dict,
 # The types whose provisioner stores a tag property, with that property's name
 # and shape. Stack-level tags and the three ``aws:cloudformation:`` tags are
 # merged into the property before the resource is created or updated; a type
-# outside this table has no tag store the stack tags could reach.
+# outside this table has no tag store to merge them into.
 _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::ApiGateway::ApiKey": ("Tags", "list"),
     "AWS::ApiGateway::DomainName": ("Tags", "list"),
@@ -793,6 +793,7 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::Backup::BackupVault": ("BackupVaultTags", "map"),
     "AWS::CertificateManager::Certificate": ("Tags", "list"),
     "AWS::CloudFormation::Stack": ("Tags", "list"),
+    "AWS::CloudFront::Distribution": ("Tags", "list"),
     "AWS::CloudWatch::Alarm": ("Tags", "list"),
     "AWS::CodeBuild::Project": ("Tags", "list"),
     "AWS::Cognito::IdentityPool": ("IdentityPoolTags", "map"),
@@ -8072,31 +8073,69 @@ def _cf_oai_delete(physical_id, props):
 # CloudFront Distribution
 # ---------------------------------------------------------------------------
 
+def _cf_distribution_config(props, caller_reference):
+    """The DistributionConfig element the service stores, rendered from the
+    template's JSON with the CallerReference the record carries."""
+    # DistributionConfig is Required: Yes on the resource reference; a
+    # template without it renders an empty configuration rather than the
+    # resource's other properties (Tags) as if they were one.
+    dist_config = props.get("DistributionConfig") or {}
+    return _cf._distribution_config_xml({"CallerReference": caller_reference, **dist_config})
+
+
 def _cf_distribution_create(logical_id, props, stack_name):
-    dist_config = props.get("DistributionConfig", props)
     dist_id = _cf._dist_id()
     arn = f"arn:aws:cloudfront::{get_account_id()}:distribution/{dist_id}"
-
-    origins = dist_config.get("Origins", [])
-    default_cache = dist_config.get("DefaultCacheBehavior", {})
-
+    # The API's DistributionConfig carries a CallerReference and a template
+    # has none; without one GetDistributionConfig would answer a config
+    # missing a member the SDKs expect. The update keeps it.
+    caller_reference = new_uuid()
+    config_el = _cf_distribution_config(props, caller_reference)
     _cf._distributions[dist_id] = {
         "Id": dist_id,
         "ARN": arn,
         "Status": "Deployed",
         "DomainName": f"{dist_id}.cloudfront.net",
-        "LastModifiedTime": now_iso(),
+        "LastModifiedTime": _cf._now_iso(),
         "ETag": new_uuid(),
-        "config_xml": "",
-        "enabled": dist_config.get("Enabled", True),
+        "CallerReference": caller_reference,
+        "config_xml": _cf.tostring(config_el, encoding="unicode"),
+        "enabled": _cf._get_enabled(config_el),
     }
     _cf._invalidations[dist_id] = []
+    _cf._tags[arn] = [{"Key": k, "Value": v} for k, v in _tag_map(props.get("Tags")).items()]
     return dist_id, {"Arn": arn, "DomainName": f"{dist_id}.cloudfront.net", "Id": dist_id}
 
 
+def _cf_distribution_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a distribution in place: DistributionConfig and Tags, the two
+    properties of the type, are both No interruption on the resource
+    reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cloudfront-distribution.html),
+    so there is no replacement path at all. The record keeps its Id, ARN
+    and DomainName and its invalidation history; the configuration is
+    stored anew, the ETag rolls and LastModifiedTime moves, as
+    UpdateDistribution does. The create fallback minted a new id and domain
+    name on every change and the engine then deleted the old distribution."""
+    dist = _cf._distributions.get(physical_id)
+    if dist is None:
+        return _cf_distribution_create(logical_id or physical_id, new_props, stack_name)
+    config_el = _cf_distribution_config(new_props, dist.get("CallerReference") or new_uuid())
+    dist["config_xml"] = _cf.tostring(config_el, encoding="unicode")
+    dist["enabled"] = _cf._get_enabled(config_el)
+    dist["ETag"] = new_uuid()
+    dist["LastModifiedTime"] = _cf._now_iso()
+    _reconcile_tag_list(_cf._tags.setdefault(dist["ARN"], []), old_props, new_props)
+    return physical_id, {"Arn": dist["ARN"], "DomainName": dist["DomainName"], "Id": physical_id}
+
+
 def _cf_distribution_delete(physical_id, props):
-    _cf._distributions.pop(physical_id, None)
+    dist = _cf._distributions.pop(physical_id, None)
     _cf._invalidations.pop(physical_id, None)
+    if dist:
+        # The tagging API reads the store as it is, so a deleted
+        # distribution would keep answering GetResources.
+        _cf._tags.pop(dist["ARN"], None)
 
 
 # ---------------------------------------------------------------------------
@@ -9725,7 +9764,12 @@ _RESOURCE_HANDLERS = {
         "update": _cf_oai_update,
         "delete": _cf_oai_delete,
     },
-    "AWS::CloudFront::Distribution": {"create": _cf_distribution_create, "delete": _cf_distribution_delete},
+    "AWS::CloudFront::Distribution": {
+        "create": _cf_distribution_create,
+        "update": _cf_distribution_update,
+        "update_with_logical_id": True,
+        "delete": _cf_distribution_delete,
+    },
     "AWS::CloudFront::KeyValueStore": {"create": _cf_kvs_create, "update": _cf_kvs_update, "delete": _cf_kvs_delete},
     "AWS::CloudFront::CachePolicy": {
         "create": _cf_cache_policy_create,
