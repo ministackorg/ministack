@@ -128,6 +128,24 @@ def stack_name_problems(stack_name: str) -> list[str]:
     return problems
 
 
+CAPABILITY_VALUES = ("CAPABILITY_IAM", "CAPABILITY_NAMED_IAM", "CAPABILITY_AUTO_EXPAND")
+
+
+def capabilities_problems(values: list[str]) -> list[str]:
+    """The enum constraint on ``Capabilities``. CreateStack, UpdateStack and
+    CreateChangeSet document exactly three values, so anything else is a
+    parameter validation error rather than a capability the stack quietly
+    keeps. One sentence for the whole member, in the shape the API uses for a
+    list of enums (unmeasured wording; the enum itself is the API reference's
+    Valid Values)."""
+    unknown = [v for v in values if v not in CAPABILITY_VALUES]
+    if not unknown:
+        return []
+    return [f"Value '[{', '.join(values)}]' at 'capabilities' failed to satisfy "
+            f"constraint: Member must satisfy enum value set: "
+            f"[{', '.join(CAPABILITY_VALUES)}]"]
+
+
 def _template_body_problem(body: str) -> str | None:
     """The request-level constraint on ``TemplateBody`` (the quota page:
     "Template body size in a request", 51,200 bytes), as one sentence of the
@@ -143,14 +161,16 @@ def _template_body_problem(body: str) -> str | None:
 
 def _request_problems(params, stack_name: str = ""):
     """The request-level constraints of a call that carries a template: the
-    stack name where the call names one, and the size of an inline
-    ``TemplateBody``. The API reports every violation of a request in one
-    message, so both are collected before it answers. Returns the error
-    response, or None when the request passes."""
+    stack name where the call names one, the size of an inline
+    ``TemplateBody`` and the ``Capabilities`` enum. The API reports every
+    violation of a request in one message, so all of them are collected
+    before it answers. Returns the error response, or None when the request
+    passes."""
     problems = stack_name_problems(stack_name) if stack_name else []
     body_problem = _template_body_problem(_p(params, "TemplateBody"))
     if body_problem:
         problems.append(body_problem)
+    problems.extend(capabilities_problems(_extract_string_members(params, "Capabilities")))
     if problems:
         return _error("ValidationError", validation_error_message(problems))
     return None

@@ -2401,6 +2401,51 @@ def test_cfn_stack_and_change_set_report_their_capabilities(cfn):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def test_cfn_unknown_capability_is_refused(cfn):
+    """Capabilities is an enum of three values, so a fourth is a parameter
+    validation error rather than something the stack silently keeps, on
+    CreateStack, CreateChangeSet and UpdateStack alike."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-caps-enum-{uid}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Q": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": f"{stack_name}-q"}},
+        },
+    }
+    bad = ["CAPABILITY_IAM", "CAPABILITY_RESOURCE_POLICY"]
+    with pytest.raises(ClientError) as exc:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template),
+                         Capabilities=bad)
+    message = exc.value.response["Error"]["Message"]
+    assert "validation error detected" in message
+    assert "'capabilities'" in message
+    assert "CAPABILITY_AUTO_EXPAND" in message
+    with pytest.raises(ClientError):
+        cfn.describe_stacks(StackName=stack_name)
+    with pytest.raises(ClientError) as exc:
+        cfn.create_change_set(StackName=stack_name, ChangeSetName="cs",
+                              TemplateBody=json.dumps(template), ChangeSetType="CREATE",
+                              Capabilities=bad)
+    assert "'capabilities'" in exc.value.response["Error"]["Message"]
+
+    try:
+        # The three documented values are accepted.
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template),
+            Capabilities=["CAPABILITY_IAM", "CAPABILITY_NAMED_IAM", "CAPABILITY_AUTO_EXPAND"],
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        with pytest.raises(ClientError) as exc:
+            cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(template),
+                             Capabilities=bad)
+        assert "'capabilities'" in exc.value.response["Error"]["Message"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_change_set_create_emits_review_event(cfn):
     template = {
         "AWSTemplateFormatVersion": "2010-09-09",
