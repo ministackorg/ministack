@@ -673,6 +673,19 @@ def test_signer_put_profile_requires_platform_id(signer):
     assert exc.value.response["Error"]["Code"] == "ValidationException"
 
 
+def test_signer_put_profile_accepts_a_partial_validity_period(signer):
+    """Both members of SignatureValidityPeriod are documented Required: No, so
+    a period carrying only one of them is a valid request."""
+    for period in ({"type": "DAYS"}, {"value": 12}, {}):
+        name = f"partial_{_uid()}"
+        signer.put_signing_profile(
+            profileName=name,
+            platformId=_IOT_PLATFORM,
+            signatureValidityPeriod=period,
+        )
+        assert signer.get_signing_profile(profileName=name)["profileName"] == name
+
+
 def test_signer_put_profile_rejects_unknown_validity_unit(signer):
     """SignatureValidityPeriod.type: DAYS | MONTHS | YEARS."""
     with pytest.raises(ClientError) as exc:

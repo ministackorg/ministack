@@ -548,13 +548,22 @@ def _put_signing_profile(name, body):
         return _error(400, "ValidationException", "platformId is required.")
     period = body.get("signatureValidityPeriod")
     if period is not None:
-        if (not isinstance(period, dict)
-                or period.get("type") not in _VALIDITY_UNITS
-                or not isinstance(period.get("value"), int)
-                or period["value"] <= 0):
+        # Both members are documented Required: No, so a period carrying only
+        # one of them is a valid request; _signature_expires_at falls back to
+        # MONTHS for a missing type and to the 135-month default for a missing
+        # value. Only the shapes the model cannot express are refused.
+        if not isinstance(period, dict):
             return _error(400, "ValidationException",
-                          "signatureValidityPeriod needs a positive integer "
-                          f"value and a type of {', '.join(_VALIDITY_UNITS)}.")
+                          "signatureValidityPeriod must be a structure.")
+        unit = period.get("type")
+        if unit is not None and unit not in _VALIDITY_UNITS:
+            return _error(400, "ValidationException",
+                          f"Invalid value for signatureValidityPeriod.type: {unit!r}; "
+                          f"expected one of {', '.join(_VALIDITY_UNITS)}.")
+        value = period.get("value")
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+            return _error(400, "ValidationException",
+                          "signatureValidityPeriod.value must be an integer.")
     profile = _register_profile(name, body)
     return json_response({
         "arn": profile["arn"],
