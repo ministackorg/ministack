@@ -2438,6 +2438,50 @@ def test_cfn_validate_template(cfn):
     with pytest.raises(ClientError):
         cfn.validate_template(TemplateBody=json.dumps(invalid_template))
 
+
+def test_cfn_validate_template_reports_capabilities_and_transforms(cfn):
+    """ValidateTemplate answers Capabilities, CapabilitiesReason and
+    DeclaredTransforms, the three response elements the API documents next to
+    Description and Parameters."""
+    plain = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {"B": {"Type": "AWS::S3::Bucket"}},
+    }
+    result = cfn.validate_template(TemplateBody=json.dumps(plain))
+    assert result.get("Capabilities", []) == []
+    assert result.get("DeclaredTransforms", []) == []
+
+    iam = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Transform": "AWS::Serverless-2016-10-31",
+        "Resources": {
+            "R": {
+                "Type": "AWS::IAM::Role",
+                "Properties": {
+                    "RoleName": "vt-caps-role",
+                    "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": []},
+                },
+            },
+        },
+    }
+    result = cfn.validate_template(TemplateBody=json.dumps(iam))
+    assert result["Capabilities"] == ["CAPABILITY_NAMED_IAM", "CAPABILITY_AUTO_EXPAND"]
+    assert "AWS::IAM::Role" in result["CapabilitiesReason"]
+    assert result["DeclaredTransforms"] == ["AWS::Serverless-2016-10-31"]
+
+    # The list form and the macro object, the shape the AWS::Include reference
+    # documents at the top level, report their names too.
+    listed = dict(plain, Transform=["AWS::LanguageExtensions",
+                                    {"Name": "AWS::Include",
+                                     "Parameters": {"Location": "s3://bucket/snippet.yaml"}}])
+    result = cfn.validate_template(TemplateBody=json.dumps(listed))
+    assert result["DeclaredTransforms"] == ["AWS::LanguageExtensions", "AWS::Include"]
+    macro = dict(plain, Transform={"Name": "AWS::Include",
+                                   "Parameters": {"Location": "s3://bucket/snippet.yaml"}})
+    result = cfn.validate_template(TemplateBody=json.dumps(macro))
+    assert result["DeclaredTransforms"] == ["AWS::Include"]
+
+
 def test_cfn_get_template_summary(cfn):
     # Basic template: parameters and resource types surfaced, no capabilities
     basic = {

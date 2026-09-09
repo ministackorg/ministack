@@ -159,6 +159,44 @@ def _required_capabilities(template, strict=False):
     return capabilities, reason_types
 
 
+def _declared_transforms(template):
+    """The template's top-level ``Transform``, always as a list of names.
+
+    The section takes a string, a list, or the macro object
+    (``Transform: {Name: ..., Parameters: {...}}``, the documented shape for
+    ``AWS::Include``); a list entry may be either of the last two.
+    """
+    declared = template.get("Transform")
+    if not declared:
+        return []
+    entries = declared if isinstance(declared, list) else [declared]
+    names = []
+    for entry in entries:
+        if isinstance(entry, dict):
+            entry = entry.get("Name")
+        if isinstance(entry, str):
+            names.append(entry)
+    return names
+
+
+def _capabilities_xml(template):
+    """The ``Capabilities`` / ``CapabilitiesReason`` pair that
+    GetTemplateSummary and ValidateTemplate both report, or an empty string
+    when the template needs none (AWS omits both elements then)."""
+    capabilities, reason_types = _required_capabilities(template)
+    if not capabilities:
+        return ""
+    caps_xml = "".join(f"<member>{c}</member>" for c in capabilities)
+    # AWS'es behavior here is very inconsistent with their docs. AWS doesn't necessarily return
+    # all of the types it should every time. We're doing the best we can here.
+    reason = (
+        "The following resource(s) require capabilities: [" + ", ".join(reason_types) + "]"
+        if reason_types else ""
+    )
+    return (f"<Capabilities>{caps_xml}</Capabilities>"
+            f"<CapabilitiesReason>{_esc(reason)}</CapabilitiesReason>")
+
+
 def _check_capabilities(sent, template, params, macros=True):
     """Refuse a template whose required capabilities the request does not
     acknowledge, the way CreateStack does: HTTP 400
@@ -1004,10 +1042,17 @@ def _validate_template(params):
             "</member>"
         )
 
+    transforms_xml = "".join(
+        f"<member>{_esc(t)}</member>" for t in _declared_transforms(template))
+    declared_block = (f"<DeclaredTransforms>{transforms_xml}</DeclaredTransforms>"
+                      if transforms_xml else "")
+
     return _xml(200, "ValidateTemplateResponse",
                 f"<ValidateTemplateResult>"
                 f"<Description>{_esc(description)}</Description>"
                 f"<Parameters>{params_xml}</Parameters>"
+                f"{_capabilities_xml(template)}"
+                f"{declared_block}"
                 f"</ValidateTemplateResult>")
 
 
@@ -1081,21 +1126,7 @@ def _get_template_summary(params):
             "</member>"
         )
 
-    capabilities, caps_reason_types = _required_capabilities(template)
-
-    caps_xml = "".join(f"<member>{c}</member>" for c in capabilities)
-    # AWS'es behavior here is very inconsistent with their docs. AWS doesn't necessarily return
-    # all of the types it should every time. We're doing the best we can here.
-    caps_reason = (
-        "The following resource(s) require capabilities: [" + ", ".join(caps_reason_types) + "]"
-        if caps_reason_types else ""
-    )
-
-    caps_block = (
-        f"<Capabilities>{caps_xml}</Capabilities>"
-        f"<CapabilitiesReason>{_esc(caps_reason)}</CapabilitiesReason>"
-        if capabilities else ""
-    )
+    caps_block = _capabilities_xml(template)
 
     return _xml(200, "GetTemplateSummaryResponse",
                 f"<GetTemplateSummaryResult>"
