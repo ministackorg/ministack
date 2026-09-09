@@ -592,6 +592,35 @@ def test_signer_list_jobs_last_page_has_no_next_token(signer, s3, buckets, profi
     assert "nextToken" not in page
 
 
+def test_signer_job_records_the_calling_principal(signer, s3, buckets, profile):
+    """AWS reports the IAM principal that requested the job. A job started
+    with an IAM user's access key records that user, not the account root,
+    so the requestedBy filter can find it again."""
+    import boto3
+
+    iam = make_client("iam")
+    user_name = f"signer-caller-{_uid()}"
+    user_arn = iam.create_user(UserName=user_name)["User"]["Arn"]
+    key = iam.create_access_key(UserName=user_name)["AccessKey"]
+    src, dst = buckets
+    s3.put_object(Bucket=src, Key="who.bin", Body=b"w")
+    try:
+        as_user = boto3.client(
+            "signer",
+            endpoint_url=signer.meta.endpoint_url,
+            region_name=signer.meta.region_name,
+            aws_access_key_id=key["AccessKeyId"],
+            aws_secret_access_key=key["SecretAccessKey"],
+        )
+        job = _start(as_user, src, dst, key="who.bin", profile=profile)
+        described = signer.describe_signing_job(jobId=job["jobId"])
+        assert described["requestedBy"] == user_arn
+        assert signer.list_signing_jobs(requestedBy=user_arn)["jobs"]
+    finally:
+        iam.delete_access_key(UserName=user_name, AccessKeyId=key["AccessKeyId"])
+        iam.delete_user(UserName=user_name)
+
+
 def test_signer_list_jobs_token_is_bound_to_its_filter_set(signer, s3, buckets, profile):
     """A token is only meaningful for the list it came from, so resuming with
     a different filter is refused rather than served from a position that

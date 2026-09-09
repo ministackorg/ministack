@@ -187,10 +187,25 @@ def _new_profile_version():
     return uuid.uuid4().hex[:10]
 
 
-def _requested_by():
-    # AWS reports the caller's IAM principal; there is no per-request
-    # principal here, so the account root stands in.
-    return f"arn:aws:iam::{get_account_id()}:root"
+def _requested_by(headers):
+    """The caller's IAM principal, which is what AWS reports on the job.
+
+    The access key in the request is resolved the way the IAM layer resolves
+    it, so a job started under an assumed role or an IAM user records that
+    principal and the requestedBy filter can find it again. Without AUTH
+    there is nothing to resolve, and an unknown or unresolvable key is not an
+    error here, so the account root stands in as it did before.
+    """
+    from ministack.core.iam_evaluator import PrincipalInfo, resolve_principal
+    from ministack.core.router import extract_access_key_id
+
+    account = get_account_id()
+    access_key = extract_access_key_id(headers or {})
+    if access_key:
+        principal = resolve_principal(access_key, account)
+        if isinstance(principal, PrincipalInfo) and principal.arn:
+            return principal.arn
+    return f"arn:aws:iam::{account}:root"
 
 
 def _drop_none(record):
@@ -387,7 +402,7 @@ def _signed_key(prefix, job_id, platform_id, src_key):
 # Handlers
 # ---------------------------------------------------------------------------
 
-def _start_signing_job(body):
+def _start_signing_job(body, headers=None):
     s3_source = (body.get("source") or {}).get("s3") or {}
     s3_dest = (body.get("destination") or {}).get("s3") or {}
     profile_name = body.get("profileName")
@@ -509,7 +524,7 @@ def _start_signing_job(body):
         "statusReason": "Signing Succeeded",  # live-measured Describe wording
         "createdAt": now,
         "completedAt": now,
-        "requestedBy": _requested_by(),
+        "requestedBy": _requested_by(headers),
         "jobOwner": account,
         "jobInvoker": account,
     }
@@ -721,7 +736,7 @@ async def handle_request(method, path, headers, body_bytes, query_params):
 
     # POST /signing-jobs -- StartSigningJob
     if path == "/signing-jobs" and method == "POST":
-        return _start_signing_job(body)
+        return _start_signing_job(body, headers)
 
     # GET /signing-jobs -- ListSigningJobs
     if path == "/signing-jobs" and method == "GET":
