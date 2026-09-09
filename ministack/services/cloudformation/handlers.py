@@ -219,20 +219,39 @@ def _check_capabilities(sent, template, params, macros=True):
     if not AUTH:
         return None
     given = set(_extract_string_members(params, "Capabilities"))
-    required = [cap for cap in _required_capabilities(template, strict=True)[0]
-                if cap != "CAPABILITY_AUTO_EXPAND"]
+    required = _required_iam_capabilities(template)
     if macros and _uses_macro(sent):
         required.append("CAPABILITY_AUTO_EXPAND")
+    missing = _missing_capabilities(given, required)
+    if not missing:
+        return None
+    return _error("InsufficientCapabilitiesException", _insufficient_capabilities_message(missing))
+
+
+def _required_iam_capabilities(template):
+    """The capabilities a template's IAM resources demand, which is the rule
+    both the request-level check and the nested-stack check enforce.
+    CAPABILITY_AUTO_EXPAND is dropped here: a transform is the caller's own
+    declaration, judged per call site, not a property of the IAM resources.
+    """
+    return [cap for cap in _required_capabilities(template, strict=True)[0]
+            if cap != "CAPABILITY_AUTO_EXPAND"]
+
+
+def _missing_capabilities(given, required):
+    """The capabilities of ``required`` that ``given`` does not acknowledge;
+    ``CAPABILITY_IAM`` is satisfied by ``CAPABILITY_NAMED_IAM`` as well."""
     missing = []
     for cap in required:
         if cap == "CAPABILITY_IAM" and "CAPABILITY_NAMED_IAM" in given:
             continue
         if cap not in given:
             missing.append(cap)
-    if not missing:
-        return None
-    return _error("InsufficientCapabilitiesException",
-                  "Requires capabilities : [" + ", ".join(missing) + "]")
+    return missing
+
+
+def _insufficient_capabilities_message(missing):
+    return "Requires capabilities : [" + ", ".join(missing) + "]"
 
 
 # --- CreateStack ---
