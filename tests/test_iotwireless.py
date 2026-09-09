@@ -251,6 +251,47 @@ def test_iotwireless_unsigned_raw_post_answers_the_bare_geojson_blob(iotwireless
     assert body == _estimate_bytes(iotwireless, "1.2.3.4", Timestamp=_TIMESTAMP)
 
 
+def test_iotwireless_raw_timestamp_may_be_the_number_as_a_string(iotwireless):
+    """A hand-written request may spell the Unix timestamp as a JSON string.
+    That is the same timestamp, so it resolves to the instant boto3 sends the
+    member as, byte for byte."""
+    status, _content_type, body = _raw(
+        "/position-estimate",
+        json.dumps({
+            "Ip": {"IpAddress": "1.2.3.4"},
+            "Timestamp": str(_TIMESTAMP.timestamp()),
+        }).encode(),
+    )
+    assert status == 200
+    assert body == _estimate_bytes(iotwireless, "1.2.3.4", Timestamp=_TIMESTAMP)
+
+
+@pytest.mark.parametrize("value", [
+    "2026-08-26T14:06:11Z",                 # ISO-8601 is not a Unix timestamp
+    "not-a-timestamp",
+    True,
+    None,
+    [],
+    {},
+    1e30,                                   # beyond the range of a date
+])
+def test_iotwireless_raw_timestamp_that_is_not_a_timestamp_is_refused(value):
+    """AWS models `Timestamp` as a timestamp in Unix timestamp format, so a
+    value that is not one is measurement data formatted incorrectly, the
+    documented 400. Only raw HTTP can send this: boto3 serializes the member
+    from a datetime."""
+    status, _content_type, raw = _raw(
+        "/position-estimate",
+        json.dumps({"Ip": {"IpAddress": "1.2.3.4"}, "Timestamp": value}).encode(),
+    )
+    assert status == 400
+    document = json.loads(raw)
+    assert document["__type"] == "ValidationException"
+    assert document["message"] == (
+        "Timestamp must be a Unix timestamp, in seconds since the epoch"
+    )
+
+
 @pytest.mark.parametrize("ip_member", [{}, {"IpAddress": ""}])
 def test_iotwireless_raw_ip_without_an_address_is_not_valid(ip_member):
     """An `Ip` member that carries no usable address is a present hint, so it

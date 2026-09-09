@@ -49,7 +49,9 @@ view: private, loopback, link-local, reserved, TEST-NET and multicast
 addresses do not resolve.
 
 An IPv4-mapped IPv6 address hashes as its IPv4 form. A malformed JSON body
-is a ``ValidationException`` too, and an input whose only hints are
+is a ``ValidationException`` too, as is a ``Timestamp`` that is not a Unix
+timestamp (a raw HTTP caller can send one; an SDK cannot), and an input
+whose only hints are
 WLAN/cell/GNSS measurements is answered ``ValidationException`` with a
 message naming the IP-only scope, where the real service would run the
 third-party solvers.
@@ -117,6 +119,10 @@ _HINT_MEMBERS = ("WiFiAccessPoints", "CellTowers", "Ip", "Gnss")
 _HORIZONTAL_ACCURACY = 1000000
 _HORIZONTAL_CONFIDENCE_LEVEL = 0.67
 
+# What a member reader answers when the request's value is not one the member
+# accepts, so the caller gets the documented 400 instead of the value.
+_INVALID = object()
+
 
 def _validation(message: str) -> tuple:
     return error_response_json("ValidationException", message, 400)
@@ -138,6 +144,13 @@ def _get_position_estimate(body: bytes) -> tuple:
         return _validation(
             "1 validation error detected: Request must have at least 1 valid "
             "position measurement."
+        )
+    resolved_at = _resolved_timestamp(payload)
+    if resolved_at is _INVALID:
+        # The input is checked before the resolver runs, so a Timestamp that
+        # is not a timestamp is the documented 400 whatever the address does.
+        return _validation(
+            "Timestamp must be a Unix timestamp, in seconds since the epoch"
         )
     if "Ip" not in payload:
         return _validation(
@@ -169,7 +182,7 @@ def _get_position_estimate(body: bytes) -> tuple:
     properties = {
         "horizontalAccuracy": _HORIZONTAL_ACCURACY,
         "horizontalConfidenceLevel": _HORIZONTAL_CONFIDENCE_LEVEL,
-        "timestamp": _resolved_timestamp(payload),
+        "timestamp": resolved_at,
     }
     geojson = {
         "coordinates": [lon, lat],
@@ -185,8 +198,8 @@ def _get_position_estimate(body: bytes) -> tuple:
     return 200, {"Content-Type": "application/octet-stream"}, blob
 
 
-def _resolved_timestamp(payload: dict) -> str:
-    """The value for ``properties.timestamp``. Always a value.
+def _resolved_timestamp(payload: dict):
+    """The value for ``properties.timestamp``, or ``_INVALID``.
 
     AWS documents the request's ``Timestamp`` as "the time when the position
     information will be resolved", in Unix timestamp format, and adds "if not
@@ -196,20 +209,32 @@ def _resolved_timestamp(payload: dict) -> str:
     resolved" and both documented sample payloads have it, as did the one
     live call recorded for this work, so the property is never left out.
 
+    The member is modelled as a timestamp, and rest-json puts one on the wire
+    as the Unix number, so a value that is not that number is not a timestamp
+    and the request is refused. A string is read as the same number spelled
+    the JSON way, which is all a hand-written request can add; an ISO-8601
+    string is not a Unix timestamp and does not pass.
+
     The caller's value is rendered the way the live payload reports the
     resolve time, as an ISO-8601 string. The substituted receive time stands
     in for a member in Unix timestamp format, so it is taken at whole-second
     resolution.
     """
-    value = payload.get("Timestamp")
+    if "Timestamp" not in payload:
+        return _render_timestamp(datetime.now(timezone.utc).replace(microsecond=0))
+    value = payload["Timestamp"]
     if isinstance(value, str):
-        return value
-    if not isinstance(value, bool) and isinstance(value, (int, float)):
         try:
-            return _render_timestamp(datetime.fromtimestamp(value, timezone.utc))
-        except (OSError, OverflowError, ValueError):
-            pass
-    return _render_timestamp(datetime.now(timezone.utc).replace(microsecond=0))
+            value = float(value)
+        except ValueError:
+            return _INVALID
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return _INVALID
+    try:
+        return _render_timestamp(datetime.fromtimestamp(value, timezone.utc))
+    except (OSError, OverflowError, ValueError):
+        # Out of the range a date can be built from, NaN, an infinity.
+        return _INVALID
 
 
 def _render_timestamp(moment: datetime) -> str:
