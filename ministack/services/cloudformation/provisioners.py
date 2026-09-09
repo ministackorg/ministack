@@ -8542,20 +8542,57 @@ def _iot_ca_certificate_delete(physical_id, props):
     _iot._handle_ca_certificate("DELETE", f"/cacertificate/{physical_id}", b"", {})
 
 
-def _cognito_identity_pool_role_attachment_create(logical_id, props, stack_name):
+def _cognito_identity_pool_role_attachment_apply(props):
+    """Push Roles and RoleMappings onto the identity pool through
+    SetIdentityPoolRoles, which takes the whole configuration: a property the
+    template drops is cleared, its create default."""
     iid = props.get("IdentityPoolId")
     if not iid:
         raise ValueError("AWS::Cognito::IdentityPoolRoleAttachment requires IdentityPoolId")
-    resp = _cognito._set_identity_pool_roles({"IdentityPoolId": iid, "Roles": props.get("Roles", {})})
+    resp = _cognito._set_identity_pool_roles({
+        "IdentityPoolId": iid,
+        "Roles": props.get("Roles", {}),
+        "RoleMappings": props.get("RoleMappings", {}),
+    })
     if resp[0] >= 400:
-        raise ValueError(f"AWS::Cognito::IdentityPoolRoleAttachment create failed: {resp[2]!r}")
+        raise ValueError(
+            f"AWS::Cognito::IdentityPoolRoleAttachment: SetIdentityPoolRoles failed: {resp[2]!r}")
+    # Ref returns the IdentityPoolId (resource reference); Fn::GetAtt Id is
+    # documented as "the resource ID" only, and here that is the same value,
+    # because the pool id is the physical id of the attachment.
     return iid, {"Id": iid}
+
+
+def _cognito_identity_pool_role_attachment_create(logical_id, props, stack_name):
+    return _cognito_identity_pool_role_attachment_apply(props)
+
+
+def _cognito_identity_pool_role_attachment_update(physical_id, old_props, new_props,
+                                                  stack_name):
+    """Roles and RoleMappings are "Update requires: No interruption" on the
+    resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cognito-identitypoolroleattachment.html),
+    so both are re-applied to the pool the attachment already sits on.
+    IdentityPoolId requires replacement: the new pool is configured first and
+    the old pool's configuration cleared afterwards, CloudFormation's
+    replacement order, which without this handler happened only because the
+    physical id of this type is the pool id itself."""
+    replacement = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, None,
+        new_props.get("IdentityPoolId"), physical_id,
+        _cognito_identity_pool_role_attachment_create,
+        _cognito_identity_pool_role_attachment_delete,
+    )
+    if replacement is not None:
+        return replacement
+    return _cognito_identity_pool_role_attachment_apply(new_props)
 
 
 def _cognito_identity_pool_role_attachment_delete(physical_id, props):
     pool = _cognito._identity_pools.get(physical_id)
     if pool is not None:
         pool["_roles"] = {}
+        pool["_role_mappings"] = {}
 
 
 def _cognito_identity_pool_principal_tag_apply(props):
@@ -9234,6 +9271,7 @@ _RESOURCE_HANDLERS = {
     },
     "AWS::Cognito::IdentityPoolRoleAttachment": {
         "create": _cognito_identity_pool_role_attachment_create,
+        "update": _cognito_identity_pool_role_attachment_update,
         "delete": _cognito_identity_pool_role_attachment_delete,
     },
     "AWS::Cognito::IdentityPoolPrincipalTag": {

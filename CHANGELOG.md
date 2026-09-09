@@ -17,6 +17,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 - **Cognito — `SetIdentityPoolRoles` keeps the role mappings it is given** — the call stored `Roles` only and `GetIdentityPoolRoles` answered a hard-coded `RoleMappings: {}`, so a mapping set through the API, or declared on a CloudFormation `AWS::Cognito::IdentityPoolRoleAttachment`, was accepted and silently dropped. Both members are stored on the identity pool and served back now; the call sets the whole configuration and the API has no call that removes a mapping on its own, so an omitted `RoleMappings` clears what was there (reasoned from the API surface, not measured against a live account). The map is stored as sent rather than validated, and takes no part in credential vending, which still picks the role by `authenticated` or `unauthenticated`. Contributed by @iot-rocket.
 
+- **CloudFormation — `AWS::Cognito::IdentityPoolRoleAttachment` updates in place** — the type had no update handler, so a stack update fell through to the create handler and nothing in the code said which property may change in place and which one replaces. `Roles` and `RoleMappings` are "Update requires: No interruption" on the resource reference and are re-applied to the pool the attachment already sits on, a property the template drops reverts to its create default (`SetIdentityPoolRoles` takes the whole configuration), and `IdentityPoolId` requires replacement, so the new pool is configured before the old one is cleared. Contributed by @iot-rocket.
+
 ## [1.5.10] — 2026-09-10
 
 ### Added

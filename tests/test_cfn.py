@@ -16030,6 +16030,161 @@ def test_cfn_cognito_user_pool_enabled_mfas_update(cfn, cognito_idp):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def _role_mapping(role_arn, resolution="Deny"):
+    """A RoleMappings entry in the shape the resource reference's own example
+    uses (a Rules mapping with one claim rule)."""
+    return {
+        "Type": "Rules",
+        "AmbiguousRoleResolution": resolution,
+        "RulesConfiguration": {"Rules": [{
+            "Claim": "sub", "MatchType": "Equals", "Value": "goodvalue",
+            "RoleARN": role_arn,
+        }]},
+    }
+
+
+def test_cfn_cognito_role_attachment_update_applies_roles_and_mappings(
+    cfn, cognito_identity
+):
+    """Roles and RoleMappings are both "Update requires: No interruption" on
+    AWS::Cognito::IdentityPoolRoleAttachment: a changed role ARN and an added
+    role mapping reach GetIdentityPoolRoles on the pool the attachment
+    already sits on, with Ref and Fn::GetAtt Id still the identity pool id."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-attach-upd-{uid}"
+    pool_id = cognito_identity.create_identity_pool(
+        IdentityPoolName=f"cfn_attach_upd_{uid}", AllowUnauthenticatedIdentities=True,
+    )["IdentityPoolId"]
+    auth_v1 = "arn:aws:iam::000000000000:role/attach-auth-v1"
+    auth_v2 = "arn:aws:iam::000000000000:role/attach-auth-v2"
+
+    def template(role_arn, mappings):
+        props = {"IdentityPoolId": pool_id, "Roles": {"authenticated": role_arn}}
+        if mappings is not None:
+            props["RoleMappings"] = mappings
+        return json.dumps({
+            "Resources": {"Attach": {
+                "Type": "AWS::Cognito::IdentityPoolRoleAttachment", "Properties": props}},
+            "Outputs": {"AttachRef": {"Value": {"Ref": "Attach"}},
+                        "AttachId": {"Value": {"Fn::GetAtt": ["Attach", "Id"]}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(auth_v1, None))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "AttachRef") == pool_id
+        assert _output(stack, "AttachId") == pool_id
+        attached = cognito_identity.get_identity_pool_roles(IdentityPoolId=pool_id)
+        assert attached["Roles"] == {"authenticated": auth_v1}
+        assert attached["RoleMappings"] == {}
+
+        mappings = {"graph.facebook.com": _role_mapping(auth_v2)}
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(auth_v2, mappings))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "AttachRef") == pool_id
+        assert _output(stack, "AttachId") == pool_id
+        attached = cognito_identity.get_identity_pool_roles(IdentityPoolId=pool_id)
+        assert attached["Roles"] == {"authenticated": auth_v2}
+        assert attached["RoleMappings"] == mappings
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        cognito_identity.delete_identity_pool(IdentityPoolId=pool_id)
+
+
+def test_cfn_cognito_role_attachment_dropped_mappings_revert(cfn, cognito_identity):
+    """A role attachment property the new template drops reverts to its
+    create default, because SetIdentityPoolRoles takes the whole
+    configuration: the mappings go away and the roles stay."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-attach-drop-{uid}"
+    pool_id = cognito_identity.create_identity_pool(
+        IdentityPoolName=f"cfn_attach_drop_{uid}", AllowUnauthenticatedIdentities=True,
+    )["IdentityPoolId"]
+    role_arn = "arn:aws:iam::000000000000:role/attach-drop"
+    mappings = {"graph.facebook.com": _role_mapping(role_arn)}
+
+    def template(declared):
+        props = {"IdentityPoolId": pool_id, "Roles": {"authenticated": role_arn}}
+        if declared:
+            props["RoleMappings"] = mappings
+        return json.dumps({
+            "Resources": {"Attach": {
+                "Type": "AWS::Cognito::IdentityPoolRoleAttachment", "Properties": props}},
+            "Outputs": {"AttachRef": {"Value": {"Ref": "Attach"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(True))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert cognito_identity.get_identity_pool_roles(
+            IdentityPoolId=pool_id)["RoleMappings"] == mappings
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(False))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "AttachRef") == pool_id
+        attached = cognito_identity.get_identity_pool_roles(IdentityPoolId=pool_id)
+        assert attached["RoleMappings"] == {}
+        assert attached["Roles"] == {"authenticated": role_arn}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        cognito_identity.delete_identity_pool(IdentityPoolId=pool_id)
+
+
+def test_cfn_cognito_role_attachment_pool_move_replaces_the_attachment(
+    cfn, cognito_identity
+):
+    """IdentityPoolId is the one property of the type that requires
+    replacement: the attachment moves to the new pool, Ref follows it, and
+    the pool it left keeps neither the roles nor the mappings. The pools live
+    outside the stack, so nothing else moves with it."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cog-attach-move-{uid}"
+    pool_a, pool_b = (
+        cognito_identity.create_identity_pool(
+            IdentityPoolName=f"cfn_attach_move_{side}_{uid}",
+            AllowUnauthenticatedIdentities=True)["IdentityPoolId"]
+        for side in ("a", "b")
+    )
+    role_arn = "arn:aws:iam::000000000000:role/attach-move"
+    mappings = {"graph.facebook.com": _role_mapping(role_arn)}
+
+    def template(pool_id):
+        return json.dumps({
+            "Resources": {"Attach": {
+                "Type": "AWS::Cognito::IdentityPoolRoleAttachment", "Properties": {
+                    "IdentityPoolId": pool_id,
+                    "Roles": {"authenticated": role_arn},
+                    "RoleMappings": mappings}}},
+            "Outputs": {"AttachRef": {"Value": {"Ref": "Attach"}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(pool_a))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "AttachRef") == pool_a
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(pool_b))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "AttachRef") == pool_b
+
+        left = cognito_identity.get_identity_pool_roles(IdentityPoolId=pool_a)
+        assert left["Roles"] == {}
+        assert left["RoleMappings"] == {}
+        moved = cognito_identity.get_identity_pool_roles(IdentityPoolId=pool_b)
+        assert moved["Roles"] == {"authenticated": role_arn}
+        assert moved["RoleMappings"] == mappings
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for pool_id in (pool_a, pool_b):
+            cognito_identity.delete_identity_pool(IdentityPoolId=pool_id)
+
+
 def test_cfn_secret_update_publishes_a_new_version(cfn, sm):
     """A changed SecretString publishes a new AWSCURRENT version of the same
     secret: same ARN, the first value still there as AWSPREVIOUS, and the
