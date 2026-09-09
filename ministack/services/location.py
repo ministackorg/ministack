@@ -466,9 +466,10 @@ def _validate_tracker_name(name):
 
 def _validate_settings(body):
     """The members CreateTracker and UpdateTracker share. botocore enforces
-    only the minimum lengths client-side, so a maximum length, an enum value
-    or a pattern from a real SDK call reaches this. Everything here runs
-    before the request is processed."""
+    required members and the minimum of a length or a numeric range
+    client-side, so those shapes only arrive over the raw wire, while a
+    maximum, an enum value or a pattern from a real SDK call reaches this.
+    Everything here runs before the request is processed."""
     err = _validate_string_length(body, "Description", "description", 0, 1000)
     if err is not None:
         return err
