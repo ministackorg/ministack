@@ -322,7 +322,7 @@ def test_signer_credential_scope_routes():
 
 def test_signer_host_routes():
     headers = {"host": "signer.us-east-1.localhost:4566"}
-    assert detect_service("GET", "/signing-jobs/abc", headers, {}) == "signer"
+    assert detect_service("GET", "/signing-jobs/9d2c58d6-4a1b-4c3d-8e5f-0a1b2c3d4e5f", headers, {}) == "signer"
 
 
 @pytest.mark.parametrize(
@@ -330,7 +330,7 @@ def test_signer_host_routes():
     [
         ("POST", "/signing-jobs"),
         ("GET", "/signing-jobs"),
-        ("GET", "/signing-jobs/0000-1111"),
+        ("GET", "/signing-jobs/9d2c58d6-4a1b-4c3d-8e5f-0a1b2c3d4e5f"),
         ("PUT", "/signing-profiles/prof1"),
         ("GET", "/signing-profiles/prof1"),
     ],
@@ -340,6 +340,23 @@ def test_signer_unsigned_paths_route_by_prefix(method, path):
     /signing-profiles path rules must claim signer's REST-JSON surface
     before that fallback."""
     assert detect_service(method, path, _HEADERS, {}) == "signer"
+
+
+@pytest.mark.parametrize(("method", "path", "query"), [
+    # A key that is not a job id: DescribeSigningJob takes a uuid.
+    ("GET", "/signing-jobs/report.json", {}),
+    ("GET", "/signing-jobs/2026-09-09", {}),
+    # S3 marks its own listing and its multipart/delete POSTs in the query,
+    # and ListSigningJobs has none of those parameters.
+    ("GET", "/signing-jobs", {"list-type": "2"}),
+    ("GET", "/signing-jobs", {"prefix": "signed/"}),
+    ("POST", "/signing-jobs", {"delete": ""}),
+    ("POST", "/signing-jobs", {"uploads": ""}),
+])
+def test_signer_paths_leave_s3_traffic_alone(method, path, query):
+    """A bucket named exactly "signing-jobs" keeps the requests that carry an
+    S3 marker; only the shapes signer's own surface uses are claimed."""
+    assert detect_service(method, path, _HEADERS, query) == "s3"
 
 
 @pytest.mark.parametrize(("method", "path"), [
