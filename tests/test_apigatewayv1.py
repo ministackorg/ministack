@@ -4281,3 +4281,219 @@ def test_apigwv1_aws_iam_method_fills_caller_identity(apigw_v1, lam, cognito_idp
     finally:
         apigw_v1.delete_rest_api(restApiId=api_id)
         lam.delete_function(FunctionName=fname)
+
+
+def _v1_signed_token(claims: dict) -> str:
+    """Mint an RS256 token signed with the local Cognito pool key."""
+    import base64 as _b64
+
+    from ministack.services import cognito as _cognito
+
+    if _cognito._RSA_PRIVATE_KEY is None:
+        pytest.skip("cryptography-backed Cognito signing key unavailable")
+
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    header = {"alg": "RS256", "kid": "ministack-key-1"}
+    h = _b64.urlsafe_b64encode(json.dumps(header).encode()).rstrip(b"=").decode()
+    p = _b64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=").decode()
+    sig = _cognito._RSA_PRIVATE_KEY.sign(f"{h}.{p}".encode(), padding.PKCS1v15(), hashes.SHA256())
+    s = _b64.urlsafe_b64encode(sig).rstrip(b"=").decode()
+    return f"{h}.{p}.{s}"
+
+
+def test_apigwv1_cognito_user_pools_authorizer_enforced(apigw_v1, lam, cognito_idp):
+    """A COGNITO_USER_POOLS method verifies the pool token and injects claims.
+
+    The REST path previously served these methods unconditionally, so an
+    anonymous request reached the backend and requestContext.authorizer.claims
+    was never populated.
+    """
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    suffix = _uuid.uuid4().hex[:8]
+    fname = f"intg-v1-cognito-{suffix}"
+    code = (
+        b"import json\n"
+        b"def handler(event, context):\n"
+        b"    auth = event.get('requestContext', {}).get('authorizer')\n"
+        b"    return {'statusCode': 200, 'body': json.dumps(auth)}\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler", Code={"ZipFile": buf.getvalue()},
+    )
+
+    pool_id = cognito_idp.create_user_pool(PoolName=f"apigwv1-{suffix}")["UserPool"]["Id"]
+    pool_region = pool_id.split("_")[0]
+    issuer = f"https://cognito-idp.{pool_region}.amazonaws.com/{pool_id}"
+    pool_arn = f"arn:aws:cognito-idp:{pool_region}:000000000000:userpool/{pool_id}"
+
+    api_id = apigw_v1.create_rest_api(name=f"v1-cognito-{suffix}")["id"]
+    try:
+        root = next(r for r in apigw_v1.get_resources(restApiId=api_id)["items"] if r["path"] == "/")
+        resource_id = apigw_v1.create_resource(
+            restApiId=api_id, parentId=root["id"], pathPart="private",
+        )["id"]
+        authorizer_id = apigw_v1.create_authorizer(
+            restApiId=api_id, name="pool-auth", type="COGNITO_USER_POOLS",
+            providerARNs=[pool_arn],
+            identitySource="method.request.header.Authorization",
+        )["id"]
+        apigw_v1.put_method(
+            restApiId=api_id, resourceId=resource_id, httpMethod="GET",
+            authorizationType="COGNITO_USER_POOLS", authorizerId=authorizer_id,
+        )
+        apigw_v1.put_integration(
+            restApiId=api_id, resourceId=resource_id, httpMethod="GET",
+            type="AWS_PROXY", integrationHttpMethod="POST",
+            uri=(
+                f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+                f"arn:aws:lambda:us-east-1:000000000000:function:{fname}/invocations"
+            ),
+        )
+        dep_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
+        apigw_v1.create_stage(restApiId=api_id, stageName="dev", deploymentId=dep_id)
+
+        host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+        url = f"http://{host}/dev/private"
+
+        def _call(token):
+            req = _urlreq.Request(url, method="GET")
+            req.add_header("Host", host)
+            if token is not None:
+                req.add_header("Authorization", token)
+            try:
+                r = _urlreq.urlopen(req)
+                return r.status, r.read()
+            except _urlerr.HTTPError as e:
+                return e.code, e.read()
+
+        now = int(time.time())
+
+        def _claims(**overrides):
+            base = {
+                "sub": "user-123", "iss": issuer, "aud": "client-1",
+                "token_use": "id", "iat": now, "exp": now + 3600,
+                "cognito:username": "alice", "cognito:groups": ["admins", "staff"],
+            }
+            base.update(overrides)
+            return base
+
+        # No token at all: the gap this closes — previously a 200.
+        assert _call(None)[0] == 401
+        # Structurally invalid token.
+        assert _call("not-a-jwt")[0] == 401
+        # Correctly signed but expired.
+        assert _call(_v1_signed_token(_claims(exp=now - 60)))[0] == 401
+        # Signed by this pool's key but claiming another pool as issuer.
+        other = f"https://cognito-idp.{pool_region}.amazonaws.com/{pool_region}_ffffffff"
+        assert _call(_v1_signed_token(_claims(iss=other)))[0] == 401
+        # Tampered payload fails the signature check.
+        good = _v1_signed_token(_claims())
+        h, _p, s = good.split(".")
+        forged = json.dumps(_claims(sub="attacker")).encode()
+        import base64 as _b64
+        tampered = f"{h}.{_b64.urlsafe_b64encode(forged).rstrip(b'=').decode()}.{s}"
+        assert _call(tampered)[0] == 401
+
+        # Valid token: 200, with claims stringified as the backend sees them.
+        status, body = _call(good)
+        assert status == 200
+        auth = json.loads(body)
+        assert auth["claims"]["sub"] == "user-123"
+        assert auth["claims"]["cognito:username"] == "alice"
+        # A list claim arrives space-joined in brackets, as on AWS.
+        assert auth["claims"]["cognito:groups"] == "[admins staff]"
+
+        # The Bearer prefix is tolerated.
+        assert _call(f"Bearer {good}")[0] == 200
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_apigwv1_cognito_authorization_scopes(apigw_v1, lam, cognito_idp):
+    """authorizationScopes on the method turns the check into an OAuth one."""
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    suffix = _uuid.uuid4().hex[:8]
+    fname = f"intg-v1-scope-{suffix}"
+    code = b"def handler(event, context):\n    return {'statusCode': 200, 'body': 'ok'}\n"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler", Code={"ZipFile": buf.getvalue()},
+    )
+
+    pool_id = cognito_idp.create_user_pool(PoolName=f"apigwv1-scope-{suffix}")["UserPool"]["Id"]
+    pool_region = pool_id.split("_")[0]
+    issuer = f"https://cognito-idp.{pool_region}.amazonaws.com/{pool_id}"
+    pool_arn = f"arn:aws:cognito-idp:{pool_region}:000000000000:userpool/{pool_id}"
+
+    api_id = apigw_v1.create_rest_api(name=f"v1-scope-{suffix}")["id"]
+    try:
+        root = next(r for r in apigw_v1.get_resources(restApiId=api_id)["items"] if r["path"] == "/")
+        resource_id = apigw_v1.create_resource(
+            restApiId=api_id, parentId=root["id"], pathPart="files",
+        )["id"]
+        authorizer_id = apigw_v1.create_authorizer(
+            restApiId=api_id, name="pool-auth", type="COGNITO_USER_POOLS",
+            providerARNs=[pool_arn],
+        )["id"]
+        method = apigw_v1.put_method(
+            restApiId=api_id, resourceId=resource_id, httpMethod="GET",
+            authorizationType="COGNITO_USER_POOLS", authorizerId=authorizer_id,
+            authorizationScopes=["files/read"],
+        )
+        # PutMethod used to discard the field, so GetMethod never reported it.
+        assert method["authorizationScopes"] == ["files/read"]
+
+        apigw_v1.put_integration(
+            restApiId=api_id, resourceId=resource_id, httpMethod="GET",
+            type="AWS_PROXY", integrationHttpMethod="POST",
+            uri=(
+                f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+                f"arn:aws:lambda:us-east-1:000000000000:function:{fname}/invocations"
+            ),
+        )
+        dep_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
+        apigw_v1.create_stage(restApiId=api_id, stageName="dev", deploymentId=dep_id)
+
+        host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+        url = f"http://{host}/dev/files"
+        now = int(time.time())
+
+        def _call(token):
+            req = _urlreq.Request(url, method="GET")
+            req.add_header("Host", host)
+            req.add_header("Authorization", token)
+            try:
+                return _urlreq.urlopen(req).status
+            except _urlerr.HTTPError as e:
+                return e.code
+
+        base = {"sub": "u1", "iss": issuer, "iat": now, "exp": now + 3600}
+
+        assert _call(_v1_signed_token({**base, "scope": "files/read files/write"})) == 200
+        # A token whose scopes do not overlap is authenticated but not authorized.
+        assert _call(_v1_signed_token({**base, "scope": "other/scope"})) == 403
+        # An ID token carries no scopes at all, so it can never satisfy one.
+        assert _call(_v1_signed_token({**base, "token_use": "id", "aud": "c1"})) == 403
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)

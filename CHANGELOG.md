@@ -5,6 +5,9 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+### Changed
+- **API Gateway — a REST method's `COGNITO_USER_POOLS` authorizer is enforced** — the v1 data plane matched only `NONE`, `AWS_IAM` and `CUSTOM` and passed everything else through, so a method fronted by a user-pool authorizer served every caller: an anonymous request reached the backend, and `requestContext.authorizer.claims` was never populated, leaving a handler that branches on `claims` to take its no-claims path locally while the same code denied the request on AWS. The token named by the authorizer's `identitySource` (defaulting to the Authorization header, with or without a `Bearer` prefix) is now verified against the pools in `providerARNs` — RS256 signature against the pool's JWKS, `iss` naming one of those pools, and `exp`/`nbf`/`iat` — and its claims reach the backend as `requestContext.authorizer.claims`, stringified as API Gateway passes them, a list claim such as `cognito:groups` space-joined in brackets (`[admins staff]`). ID and access tokens are both accepted and the app client is never checked, matching AWS: a REST authorizer is configured with pool ARNs only, which is why it has no audience to validate. A method carrying `authorizationScopes` additionally requires one of those scopes in the token's `scope`/`scp` and answers `403` otherwise; everything else that fails is `401`. `PutMethod` also stops discarding `authorizationScopes`, so `GetMethod` reports it and a CloudFormation `AWS::ApiGateway::Method` declaring it provisions it.
+
 ## [1.5.9] — 2026-09-08
 
 ### Added
