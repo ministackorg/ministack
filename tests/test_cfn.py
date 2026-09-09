@@ -8691,6 +8691,71 @@ def test_cfn_apigwv2_route_basic(cfn, apigw):
     _assert_apigwv2_api_not_found(lambda: apigw.get_routes(ApiId=api_id))
 
 
+def _apigwv2_route_update_template(uid, operation_name="first", scopes=True,
+                                   on_second_api=False):
+    props = {
+        "ApiId": {"Ref": "SecondApi" if on_second_api else "HttpApi"},
+        "RouteKey": "GET /items",
+        "AuthorizationType": "JWT" if scopes else "NONE",
+        "OperationName": operation_name,
+    }
+    if scopes:
+        props["AuthorizationScopes"] = ["items:read"]
+    return json.dumps({
+        "Resources": {
+            "HttpApi": {"Type": "AWS::ApiGatewayV2::Api",
+                        "Properties": {"Name": f"api-{uid}", "ProtocolType": "HTTP"}},
+            "SecondApi": {"Type": "AWS::ApiGatewayV2::Api",
+                          "Properties": {"Name": f"api-{uid}-2", "ProtocolType": "HTTP"}},
+            "Route": {"Type": "AWS::ApiGatewayV2::Route", "Properties": props},
+        },
+        "Outputs": {"ApiId": {"Value": {"Ref": "HttpApi"}},
+                    "SecondApiId": {"Value": {"Ref": "SecondApi"}},
+                    "RouteId": {"Value": {"Fn::GetAtt": ["Route", "RouteId"]}}},
+    })
+
+
+def test_cfn_apigwv2_route_updates_in_place(cfn, apigw):
+    """Every property but ApiId is No interruption on the
+    AWS::ApiGatewayV2::Route reference: an update keeps the routeId and
+    GetRoute reads the new values. The create fallback minted a new id on
+    every change and left the old route on the API. A dropped
+    AuthorizationScopes reverts to the create default (none); an ApiId
+    change replaces the route on the new API and removes it from the old
+    one."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-apigwv2-route-update-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_apigwv2_route_update_template(uid))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        api_id, route_id = _output(stack, "ApiId"), _output(stack, "RouteId")
+        before = apigw.get_route(ApiId=api_id, RouteId=route_id)
+        assert before["AuthorizationScopes"] == ["items:read"]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_apigwv2_route_update_template(
+            uid, operation_name="second", scopes=False))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "RouteId") == route_id
+        after = apigw.get_route(ApiId=api_id, RouteId=route_id)
+        assert after["OperationName"] == "second"
+        assert after["AuthorizationType"] == "NONE"
+        assert not after.get("AuthorizationScopes")
+        assert len(apigw.get_routes(ApiId=api_id)["Items"]) == 1
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_apigwv2_route_update_template(
+            uid, operation_name="second", scopes=False, on_second_api=True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        second_api_id, new_route_id = _output(stack, "SecondApiId"), _output(stack, "RouteId")
+        assert new_route_id != route_id
+        assert apigw.get_route(ApiId=second_api_id, RouteId=new_route_id)["RouteKey"] == "GET /items"
+        assert apigw.get_routes(ApiId=api_id)["Items"] == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_apigwv2_authorizer_jwt(cfn, apigw):
     """CFN stack with an AWS::ApiGatewayV2::Authorizer deploys successfully and
     a Route referencing it via AuthorizerId is enforced at request time.

@@ -37,6 +37,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 - **CloudFormation — `AWS::ApiGatewayV2::Integration` updates in place** — a stack update that changed an integration fell through to the create handler: a second integration under a new id, `Ref` flipping to it, the old one left on the API while every route's `Target` still named it. Every property but `ApiId` is *No interruption* on the resource reference, so the integration now keeps its id as `UpdateIntegration` does; a property the template drops reverts to the create's default (no `RequestParameters`, a 30 s timeout, the `POST` method), and an `ApiId` change creates the integration on the new API before the old one is removed. Contributed by @iot-rocket.
 
+- **CloudFormation — `AWS::ApiGatewayV2::Route` updates in place** — a stack update that changed a route fell through to the create handler: a second route under a new id, `Ref` flipping to it, the old one left on the API with its route key still matching requests. Every property but `ApiId` is *No interruption* on the resource reference, so the route now keeps its id as `UpdateRoute` does; a property the template drops reverts to the create's default (no `AuthorizationScopes`, `AuthorizationType` `NONE`, no `AuthorizerId`), and an `ApiId` change creates the route on the new API before the old one is removed. Contributed by @iot-rocket.
+
 ## [1.5.10] — 2026-09-10
 
 ### Added

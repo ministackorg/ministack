@@ -7787,11 +7787,11 @@ def _apigw_v2_integration_delete(physical_id, props):
 # ApiGatewayV2 Route
 # ---------------------------------------------------------------------------
 
-def _apigw_v2_route_create(logical_id, props, stack_name):
-    api_id = props.get("ApiId", "")
-    route_id = new_uuid()[:8]
-    route = {
-        "routeId": route_id,
+def _apigw_v2_route_props(props):
+    """The mutable part of a route record from its template properties,
+    with the create's defaults: what the create stores and what an update
+    writes over the existing record."""
+    return {
         "routeKey": props.get("RouteKey", "$default"),
         "target": props.get("Target", ""),
         "authorizationType": props.get("AuthorizationType", "NONE"),
@@ -7802,8 +7802,36 @@ def _apigw_v2_route_create(logical_id, props, stack_name):
         "requestModels": props.get("RequestModels", {}),
         "requestParameters": props.get("RequestParameters", {}),
     }
+
+
+def _apigw_v2_route_create(logical_id, props, stack_name):
+    api_id = props.get("ApiId", "")
+    route_id = new_uuid()[:8]
+    route = {"routeId": route_id, **_apigw_v2_route_props(props)}
     _apigw_v2._routes.setdefault(api_id, {})[route_id] = route
     physical_id = f"{api_id}/{route_id}"
+    return physical_id, {"RouteId": route_id}
+
+
+def _apigw_v2_route_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a route in place: every property but ApiId is No interruption
+    on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigatewayv2-route.html),
+    so the record keeps its routeId as UpdateRoute does. The create fallback
+    minted a new id on every change and left the old route on the API,
+    where its route key kept matching requests. A property the template
+    drops reverts to the create's default. ApiId requires replacement: the
+    route is created on the new API before the old one is removed."""
+    api_id, _, route_id = physical_id.partition("/")
+    route = _apigw_v2._routes.get(api_id, {}).get(route_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        new_props.get("ApiId", ""), api_id if route else None,
+        _apigw_v2_route_create, _apigw_v2_route_delete,
+    )
+    if replaced is not None:
+        return replaced
+    route.update(_apigw_v2_route_props(new_props))
     return physical_id, {"RouteId": route_id}
 
 
@@ -9642,7 +9670,12 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _apigw_v2_integration_delete,
     },
-    "AWS::ApiGatewayV2::Route": {"create": _apigw_v2_route_create, "delete": _apigw_v2_route_delete},
+    "AWS::ApiGatewayV2::Route": {
+        "create": _apigw_v2_route_create,
+        "update": _apigw_v2_route_update,
+        "update_with_logical_id": True,
+        "delete": _apigw_v2_route_delete,
+    },
     "AWS::ApiGatewayV2::Authorizer": {"create": _apigw_v2_authorizer_create, "update": _apigw_v2_authorizer_update, "delete": _apigw_v2_authorizer_delete},
     "AWS::SES::EmailIdentity": {"create": _ses_email_identity_create, "delete": _ses_email_identity_delete},
     "AWS::SES::ConfigurationSet": {"create": _ses_configuration_set_create, "delete": _ses_configuration_set_delete},
