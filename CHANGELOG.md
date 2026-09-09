@@ -35,6 +35,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 - **CloudFormation — `AWS::ApiGatewayV2::Api` updates in place** — a stack update that changed an API fell through to the create handler: a new `ApiId` and `ApiEndpoint` on every change, every route, integration and stage re-created under the new id, and with an `ms-custom-id` tag the second lookup refused the pinned id as already in use and rolled the stack back. Every property but `ProtocolType` is *No interruption* on the resource reference, so the API now keeps its id, its endpoint and the children stored under it; a property the template drops reverts to the create's default (no `CorsConfiguration`, the protocol's route selection expression, which the create hard-coded to the HTTP value for both protocols), `Tags` are reconciled, and a `ProtocolType` change replaces the API in CloudFormation's order. `Description` is stored, as `CreateApi` does. Contributed by @iot-rocket.
 
+- **CloudFormation — `AWS::ApiGatewayV2::Integration` updates in place** — a stack update that changed an integration fell through to the create handler: a second integration under a new id, `Ref` flipping to it, the old one left on the API while every route's `Target` still named it. Every property but `ApiId` is *No interruption* on the resource reference, so the integration now keeps its id as `UpdateIntegration` does; a property the template drops reverts to the create's default (no `RequestParameters`, a 30 s timeout, the `POST` method), and an `ApiId` change creates the integration on the new API before the old one is removed. Contributed by @iot-rocket.
+
 ## [1.5.10] — 2026-09-10
 
 ### Added

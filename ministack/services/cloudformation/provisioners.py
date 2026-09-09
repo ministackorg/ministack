@@ -7717,11 +7717,11 @@ def _apigw_v2_stage_delete(physical_id, props):
 # ApiGatewayV2 Integration
 # ---------------------------------------------------------------------------
 
-def _apigw_v2_integration_create(logical_id, props, stack_name):
-    api_id = props.get("ApiId", "")
-    int_id = new_uuid()[:8]
-    integration = {
-        "integrationId": int_id,
+def _apigw_v2_integration_props(props):
+    """The mutable part of an integration record from its template
+    properties, with the create's defaults: what the create stores and what
+    an update writes over the existing record."""
+    return {
         "integrationType": props.get("IntegrationType", "AWS_PROXY"),
         "integrationUri": props.get("IntegrationUri", ""),
         "integrationMethod": props.get("IntegrationMethod", "POST"),
@@ -7735,10 +7735,40 @@ def _apigw_v2_integration_create(logical_id, props, stack_name):
         "responseParameters": props.get("ResponseParameters", {}),
         "contentHandlingStrategy": props.get("ContentHandlingStrategy"),
     }
+
+
+def _apigw_v2_integration_create(logical_id, props, stack_name):
+    api_id = props.get("ApiId", "")
+    int_id = new_uuid()[:8]
+    integration = {"integrationId": int_id, **_apigw_v2_integration_props(props)}
     _apigw_v2._integrations.setdefault(api_id, {})[int_id] = integration
     # AWS returns just the integration ID as the physical ID (Ref).
     # Store apiId in outputs so delete can find the right API.
     return int_id, {"IntegrationId": int_id, "ApiId": api_id}
+
+
+def _apigw_v2_integration_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update an integration in place: every property but ApiId is No
+    interruption on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigatewayv2-integration.html),
+    so the record keeps its integrationId, which every Route's Target
+    names, as UpdateIntegration does. The create fallback minted a new id
+    on every change and left the old integration on the API. A property the
+    template drops reverts to the create's default. ApiId requires
+    replacement: the integration is created on the new API before the old
+    one is removed."""
+    old_api_id = old_props.get("ApiId", "")
+    int_id = physical_id.split("/", 1)[1] if "/" in physical_id else physical_id
+    integration = _apigw_v2._integrations.get(old_api_id, {}).get(int_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        new_props.get("ApiId", ""), old_api_id if integration else None,
+        _apigw_v2_integration_create, _apigw_v2_integration_delete,
+    )
+    if replaced is not None:
+        return replaced
+    integration.update(_apigw_v2_integration_props(new_props))
+    return physical_id, {"IntegrationId": int_id, "ApiId": old_api_id}
 
 
 def _apigw_v2_integration_delete(physical_id, props):
@@ -9606,7 +9636,12 @@ _RESOURCE_HANDLERS = {
         "delete": _apigw_v2_api_delete,
     },
     "AWS::ApiGatewayV2::Stage": {"create": _apigw_v2_stage_create, "delete": _apigw_v2_stage_delete},
-    "AWS::ApiGatewayV2::Integration": {"create": _apigw_v2_integration_create, "delete": _apigw_v2_integration_delete},
+    "AWS::ApiGatewayV2::Integration": {
+        "create": _apigw_v2_integration_create,
+        "update": _apigw_v2_integration_update,
+        "update_with_logical_id": True,
+        "delete": _apigw_v2_integration_delete,
+    },
     "AWS::ApiGatewayV2::Route": {"create": _apigw_v2_route_create, "delete": _apigw_v2_route_delete},
     "AWS::ApiGatewayV2::Authorizer": {"create": _apigw_v2_authorizer_create, "update": _apigw_v2_authorizer_update, "delete": _apigw_v2_authorizer_delete},
     "AWS::SES::EmailIdentity": {"create": _ses_email_identity_create, "delete": _ses_email_identity_delete},

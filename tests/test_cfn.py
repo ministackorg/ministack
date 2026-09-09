@@ -8435,6 +8435,76 @@ def test_cfn_apigwv2_integration_basic(cfn, apigw):
     _assert_apigwv2_api_not_found(lambda: apigw.get_integrations(ApiId=api_id))
 
 
+def _apigwv2_integration_update_template(uid, description="first", timeout=5000,
+                                         request_parameters=True, on_second_api=False):
+    props = {
+        "ApiId": {"Ref": "SecondApi" if on_second_api else "HttpApi"},
+        "IntegrationType": "HTTP_PROXY",
+        "IntegrationMethod": "ANY",
+        "IntegrationUri": "https://backend.example",
+        "PayloadFormatVersion": "1.0",
+        "Description": description,
+        "TimeoutInMillis": timeout,
+    }
+    if request_parameters:
+        props["RequestParameters"] = {"append:header.x-trace": "$context.requestId"}
+    return json.dumps({
+        "Resources": {
+            "HttpApi": {"Type": "AWS::ApiGatewayV2::Api",
+                        "Properties": {"Name": f"api-{uid}", "ProtocolType": "HTTP"}},
+            "SecondApi": {"Type": "AWS::ApiGatewayV2::Api",
+                          "Properties": {"Name": f"api-{uid}-2", "ProtocolType": "HTTP"}},
+            "Integration": {"Type": "AWS::ApiGatewayV2::Integration", "Properties": props},
+        },
+        "Outputs": {"ApiId": {"Value": {"Ref": "HttpApi"}},
+                    "SecondApiId": {"Value": {"Ref": "SecondApi"}},
+                    "IntegrationId": {"Value": {"Ref": "Integration"}}},
+    })
+
+
+def test_cfn_apigwv2_integration_updates_in_place(cfn, apigw):
+    """Every property but ApiId is No interruption on the
+    AWS::ApiGatewayV2::Integration reference: an update keeps the
+    integrationId (what every Route's Target names) and GetIntegration reads
+    the new values. The create fallback minted a new id on every change and
+    left the old integration on the API. A dropped RequestParameters reverts
+    to the create default (none); an ApiId change replaces the integration
+    on the new API and removes it from the old one."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-apigwv2-integration-update-{uid}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_apigwv2_integration_update_template(uid))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        api_id, int_id = _output(stack, "ApiId"), _output(stack, "IntegrationId")
+        before = apigw.get_integration(ApiId=api_id, IntegrationId=int_id)
+        assert before["RequestParameters"] == {"append:header.x-trace": "$context.requestId"}
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_apigwv2_integration_update_template(
+            uid, description="second", timeout=9000, request_parameters=False))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "IntegrationId") == int_id
+        after = apigw.get_integration(ApiId=api_id, IntegrationId=int_id)
+        assert after["Description"] == "second"
+        assert after["TimeoutInMillis"] == 9000
+        assert not after.get("RequestParameters")
+        assert len(apigw.get_integrations(ApiId=api_id)["Items"]) == 1
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_apigwv2_integration_update_template(
+            uid, description="second", timeout=9000, request_parameters=False,
+            on_second_api=True))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        second_api_id, new_int_id = _output(stack, "SecondApiId"), _output(stack, "IntegrationId")
+        assert new_int_id != int_id
+        assert apigw.get_integration(ApiId=second_api_id, IntegrationId=new_int_id)["Description"] == "second"
+        assert apigw.get_integrations(ApiId=api_id)["Items"] == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_apigwv2_ms_custom_id(cfn, apigw):
     """CloudFormation ms-custom-id tag pins the ApiGatewayV2 API id (issue #400)."""
     template = {
