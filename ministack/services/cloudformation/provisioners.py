@@ -382,8 +382,8 @@ def _cf_oac_delete(physical_id, props):
     _cf._oacs.pop(physical_id, None)
 
 
-def _cf_function_create(logical_id, props, stack_name):
-    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
+def _cf_function_body(name, props):
+    """The FunctionConfig, source and AutoPublish flag a template carries."""
     cfg_el = _cf_props_to_element("FunctionConfig", props.get("FunctionConfig") or {})
     cfg, err = _cf._cf_parse_function_config(cfg_el)
     if err is not None:
@@ -394,14 +394,25 @@ def _cf_function_create(logical_id, props, stack_name):
     if isinstance(code, str):
         code = code.encode("utf-8")
 
-    now = now_iso()
-    dev_etag = new_uuid()
     # "By default, when you create a function, it's in the DEVELOPMENT stage"
     # (AWS::CloudFront::Function reference) — publishing to LIVE happens only
     # when the template sets AutoPublish to true, which CDK emits explicitly.
     auto_publish = props.get("AutoPublish", False)
     if isinstance(auto_publish, str):
         auto_publish = auto_publish.lower() == "true"
+    return cfg, code, auto_publish
+
+
+def _cf_function_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
+    if name in _cf._functions:
+        # CreateFunction answers FunctionAlreadyExists; a stack must not write
+        # over a function it does not own, on a create or on a rename.
+        raise ValueError(f"AWS::CloudFront::Function: {name} already exists")
+    cfg, code, auto_publish = _cf_function_body(name, props)
+
+    now = now_iso()
+    dev_etag = new_uuid()
 
     _cf._functions[name] = {
         "name": name,
@@ -420,6 +431,48 @@ def _cf_function_create(logical_id, props, stack_name):
     # GetAtt attributes — no Stage.
     arn = _cf._func_arn(name)
     return name, {"FunctionARN": arn, "FunctionMetadata.FunctionARN": arn}
+
+
+def _cf_function_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a CloudFront function in place.
+
+    `Name` is the type's one "Update requires: Replacement" property; AutoPublish,
+    FunctionCode, FunctionConfig, FunctionMetadata and Tags are "No interruption".
+    A renamed function is therefore created under the new name and the old one
+    removed, while everything else keeps the physical id — the function name,
+    which is what its ARN is built from — and its creation time.
+
+    The stage handling follows MiniStack's own UpdateFunction model, which the
+    reference does not describe: the new source lands in DEVELOPMENT and the
+    LIVE stage is dropped, because the record holds one body for both stages
+    and an unpublished change must not be served as published. `AutoPublish:
+    true` republishes right after, which is what the reference means by
+    "updating the AWS::CloudFront::Function resource with the AutoPublish
+    property set to true".
+    """
+    name = new_props.get("Name") or _physical_name(stack_name,
+                                                   logical_id or physical_id, max_len=64)
+    record = _cf._functions.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        name, record.get("name") if record else None,
+        _cf_function_create, _cf_function_delete,
+    )
+    if replaced is not None:
+        return replaced
+
+    cfg, code, auto_publish = _cf_function_body(name, new_props)
+    now = now_iso()
+    record["comment"] = cfg["comment"]
+    record["runtime"] = cfg["runtime"]
+    record["kvs_arns"] = cfg["kvs_arns"]
+    record["code"] = code
+    record["last_modified_dev"] = now
+    record["dev_etag"] = new_uuid()
+    record["last_modified_live"] = now if auto_publish else None
+    record["live_etag"] = new_uuid() if auto_publish else None
+    arn = _cf._func_arn(name)
+    return physical_id, {"FunctionARN": arn, "FunctionMetadata.FunctionARN": arn}
 
 
 def _cf_function_delete(physical_id, props):
@@ -8996,7 +9049,12 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _cf_oac_delete,
     },
-    "AWS::CloudFront::Function": {"create": _cf_function_create, "delete": _cf_function_delete},
+    "AWS::CloudFront::Function": {
+        "create": _cf_function_create,
+        "update": _cf_function_update,
+        "update_with_logical_id": True,
+        "delete": _cf_function_delete,
+    },
     "AWS::CloudWatch::Alarm": {
         "create": _cw_metric_alarm_create,
         "update": _cw_metric_alarm_update,

@@ -9308,6 +9308,131 @@ def test_cfn_cloudfront_oac_rename_onto_a_taken_name_is_refused(cfn, cloudfront)
         cloudfront.delete_origin_access_control(Id=other, IfMatch=etag)
 
 
+def _cf_function_template(name, comment="v1", code=_FUNCTION_CODE, auto_publish=True):
+    props = {"Name": name, "FunctionCode": code,
+             "FunctionConfig": {"Comment": comment, "Runtime": "cloudfront-js-2.0"}}
+    if auto_publish is not None:
+        props["AutoPublish"] = auto_publish
+    return {
+        "Resources": {"Fn": {"Type": "AWS::CloudFront::Function", "Properties": props}},
+        "Outputs": {"Arn": {"Value": {"Fn::GetAtt": ["Fn", "FunctionARN"]}}},
+    }
+
+
+def test_cfn_cloudfront_function_updates_in_place(cfn, cloudfront):
+    """AWS::CloudFront::Function: FunctionCode, FunctionConfig and AutoPublish are
+    "No interruption", so an UpdateStack edits the function the create made —
+    same name, same CreatedTime — and republishes it when AutoPublish is set."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-fn-update-{uid}"
+    name = f"cfn-fn-update-{uid}"
+    try:
+        out = _cfn_cf_stack(cfn, stack_name, _cf_function_template(name, comment="v1"))
+        before = cloudfront.describe_function(Name=name, Stage="LIVE")["FunctionSummary"]
+        created = before["FunctionMetadata"]["CreatedTime"]
+        assert before["FunctionConfig"]["Comment"] == "v1"
+
+        new_code = _FUNCTION_CODE.replace("cloudformation", "updated-by-cfn")
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _cf_function_template(name, comment="v2", code=new_code),
+                            update=True)
+        assert out["Arn"].endswith(f":function/{name}")
+        after = cloudfront.describe_function(Name=name, Stage="LIVE")["FunctionSummary"]
+        assert after["FunctionConfig"]["Comment"] == "v2"
+        # An in-place update is not a re-create: the function keeps the time it
+        # was created at, which the fall-through to the create handler reset.
+        assert after["FunctionMetadata"]["CreatedTime"] == created
+        body = cloudfront.get_function(Name=name, Stage="LIVE")["FunctionCode"].read()
+        assert b"updated-by-cfn" in body
+
+        # Dropping AutoPublish leaves the new code unpublished, as the service's
+        # own UpdateFunction does.
+        _cfn_cf_stack(cfn, stack_name,
+                      _cf_function_template(name, comment="v3", code=new_code,
+                                            auto_publish=None),
+                      update=True)
+        dev = cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")["FunctionSummary"]
+        assert dev["FunctionConfig"]["Comment"] == "v3"
+        assert dev["FunctionMetadata"]["CreatedTime"] == created
+        with pytest.raises(ClientError):
+            cloudfront.describe_function(Name=name, Stage="LIVE")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cloudfront_function_rename_replaces(cfn, cloudfront):
+    """`Name` is the one "Update requires: Replacement" property of
+    AWS::CloudFront::Function: the renamed function is created and the
+    predecessor removed, so the ARN moves and only one function is left."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-fn-rename-{uid}"
+    before, after = f"cfn-fn-before-{uid}", f"cfn-fn-after-{uid}"
+    try:
+        out = _cfn_cf_stack(cfn, stack_name, _cf_function_template(before))
+        assert out["Arn"].endswith(f":function/{before}")
+        out = _cfn_cf_stack(cfn, stack_name, _cf_function_template(after), update=True)
+        assert out["Arn"].endswith(f":function/{after}")
+        cloudfront.describe_function(Name=after, Stage="LIVE")
+        with pytest.raises(ClientError):
+            cloudfront.describe_function(Name=before, Stage="DEVELOPMENT")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    with pytest.raises(ClientError):
+        cloudfront.describe_function(Name=after, Stage="DEVELOPMENT")
+
+
+def test_cfn_cloudfront_function_rename_onto_a_taken_name_is_refused(cfn, cloudfront):
+    """A function renamed onto a name another function holds is refused the way
+    CreateFunction refuses it with FunctionAlreadyExists: the update rolls back,
+    the stack's function keeps its name and the other function is untouched
+    rather than written over."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-fn-taken-{uid}"
+    name = f"cfn-fn-mine-{uid}"
+    taken = f"cfn-fn-taken-{uid}"
+    cloudfront.create_function(
+        Name=taken, FunctionCode=b"function handler(event) { return event.request; }",
+        FunctionConfig={"Comment": "not the stack's", "Runtime": "cloudfront-js-2.0"})
+    try:
+        _cfn_cf_stack(cfn, stack_name, _cf_function_template(name))
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=json.dumps(_cf_function_template(taken)))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        assert "already exists" in _stack_event_reasons(cfn, stack_name)
+        cloudfront.describe_function(Name=name, Stage="LIVE")
+        other = cloudfront.describe_function(Name=taken, Stage="DEVELOPMENT")["FunctionSummary"]
+        assert other["FunctionConfig"]["Comment"] == "not the stack's"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        etag = cloudfront.describe_function(Name=taken, Stage="DEVELOPMENT")["ETag"]
+        cloudfront.delete_function(Name=taken, IfMatch=etag)
+
+
+def test_cfn_cloudfront_function_deleted_out_of_band_is_recreated(cfn, cloudfront):
+    """A function removed through the API between two stack updates converges:
+    the update handler finds no record under the physical id, so the shared
+    _rename_replacement prologue treats it as a replacement and creates the
+    function the template asks for rather than failing the stack."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cf-fn-gone-{uid}"
+    name = f"cfn-fn-gone-{uid}"
+    try:
+        _cfn_cf_stack(cfn, stack_name, _cf_function_template(name, comment="v1"))
+        etag = cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")["ETag"]
+        cloudfront.delete_function(Name=name, IfMatch=etag)
+        with pytest.raises(ClientError):
+            cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")
+
+        out = _cfn_cf_stack(cfn, stack_name,
+                            _cf_function_template(name, comment="v2"), update=True)
+        assert out["Arn"].endswith(f":function/{name}")
+        summary = cloudfront.describe_function(Name=name, Stage="LIVE")["FunctionSummary"]
+        assert summary["FunctionConfig"]["Comment"] == "v2"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_cloudfront_distribution_consumes_provisioned_policies(cfn, cloudfront):
     """The payoff: a distribution in the same stack references the policies and
     the function by Ref/GetAtt. This is what a CDK app emits, and it only works
