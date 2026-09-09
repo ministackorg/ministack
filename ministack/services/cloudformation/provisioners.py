@@ -1382,6 +1382,42 @@ def _sns_delete(physical_id, props):
 
 # --- SNS Subscription (standalone) ---
 
+# The properties of the type that are subscription attributes, with the value
+# the create stores when the template leaves the property out. They are the
+# No-interruption properties of the resource reference
+# (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-sns-subscription.html),
+# minus ReplayPolicy, which the service does not store.
+_SNS_SUBSCRIPTION_ATTRIBUTE_DEFAULTS = {
+    "DeliveryPolicy": "",
+    "FilterPolicy": "",
+    "FilterPolicyScope": "MessageAttributes",
+    "RawMessageDelivery": False,
+    "RedrivePolicy": "",
+    "SubscriptionRoleArn": "",
+}
+
+# The properties whose change replaces the subscription (Update requires:
+# Replacement on the resource reference).
+_SNS_SUBSCRIPTION_IDENTITY = ("TopicArn", "Protocol", "Endpoint")
+
+
+def _sns_sub_attributes(props):
+    """The subscription attributes ``props`` declares, as the strings the
+    service stores: a JSON property rendered, RawMessageDelivery normalised
+    to ``true``/``false``."""
+    attrs = {}
+    for name in _SNS_SUBSCRIPTION_ATTRIBUTE_DEFAULTS:
+        if name not in props:
+            continue
+        value = props[name]
+        if name == "RawMessageDelivery":
+            value = "true" if (value is True or str(value).lower() == "true") else "false"
+        elif isinstance(value, (dict, list)):
+            value = json.dumps(value)
+        attrs[name] = "" if value is None else str(value)
+    return attrs
+
+
 def _sns_sub_create(logical_id, props, stack_name):
     topic_arn = props.get("TopicArn", "")
     protocol = props.get("Protocol", "")
@@ -1392,8 +1428,12 @@ def _sns_sub_create(logical_id, props, stack_name):
         return sub_arn, {"SubscriptionArn": sub_arn}
 
     sub_arn = f"{topic_arn}:{new_uuid()}"
-    raw = props.get("RawMessageDelivery", False)
-    raw_str = "true" if (raw is True or str(raw).lower() == "true") else "false"
+    attributes = {
+        "FilterPolicyScope": "MessageAttributes",
+        "FilterPolicy": "",
+        "RawMessageDelivery": "false",
+    }
+    attributes.update(_sns_sub_attributes(props))
     sub = {
         "arn": sub_arn,
         "topic_arn": topic_arn,
@@ -1401,19 +1441,46 @@ def _sns_sub_create(logical_id, props, stack_name):
         "endpoint": endpoint,
         "confirmed": protocol not in ("http", "https"),
         "owner": get_account_id(),
-        "attributes": {
-            "FilterPolicyScope": props.get("FilterPolicyScope", "MessageAttributes"),
-            "FilterPolicy": (
-                json.dumps(props.get("FilterPolicy"))
-                if isinstance(props.get("FilterPolicy"), (dict, list))
-                else (props.get("FilterPolicy", "") or "")
-            ),
-            "RawMessageDelivery": raw_str,
-        },
+        "attributes": attributes,
     }
     topic["subscriptions"].append(sub)
     _sns._sub_arn_to_topic[sub_arn] = topic_arn
     return sub_arn, {"SubscriptionArn": sub_arn}
+
+
+def _sns_sub_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a subscription in place through SetSubscriptionAttributes,
+    keeping its ARN, for the No-interruption properties of the resource
+    reference (DeliveryPolicy, FilterPolicy, FilterPolicyScope,
+    RawMessageDelivery, RedrivePolicy, SubscriptionRoleArn). A property the
+    template drops reverts to what the create stores without it. TopicArn,
+    Protocol and Endpoint require replacement: the new subscription is
+    created before the old one is removed, so the ARN changes there, as on
+    AWS. Region (Some interruptions) and ReplayPolicy are not stored by the
+    service and are ignored."""
+    topic_arn = _sns._sub_arn_to_topic.get(physical_id, "")
+    sub = _sns._find_subscription(topic_arn, physical_id) if topic_arn else None
+    identity = tuple(new_props.get(key, "") for key in _SNS_SUBSCRIPTION_IDENTITY)
+    current = (sub["topic_arn"], sub["protocol"], sub["endpoint"]) if sub else None
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        identity, current, _sns_sub_create, _sns_sub_delete,
+    )
+    if replaced is not None:
+        return replaced
+
+    attributes = _sns_sub_attributes(
+        _declared_or_default(old_props, new_props, _SNS_SUBSCRIPTION_ATTRIBUTE_DEFAULTS)
+    )
+    for name, value in attributes.items():
+        resp = _sns._set_subscription_attributes({
+            "SubscriptionArn": physical_id,
+            "AttributeName": name,
+            "AttributeValue": value,
+        })
+        if resp[0] >= 400:
+            raise ValueError(f"AWS::SNS::Subscription update failed: {resp[2]!r}")
+    return physical_id, {"SubscriptionArn": physical_id}
 
 
 def _sns_sub_delete(physical_id, props):
@@ -8991,7 +9058,12 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _sns_delete,
     },
-    "AWS::SNS::Subscription": {"create": _sns_sub_create, "delete": _sns_sub_delete},
+    "AWS::SNS::Subscription": {
+        "create": _sns_sub_create,
+        "update": _sns_sub_update,
+        "update_with_logical_id": True,
+        "delete": _sns_sub_delete,
+    },
     "AWS::DynamoDB::Table": {
         "create": _ddb_create,
         "update": _ddb_update,

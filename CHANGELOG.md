@@ -25,6 +25,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 - **CloudFormation — `AWS::SNS::TopicPolicy` updates in place** — the same defect as the queue policy: no update handler, so a changed policy fell through to create under a fresh physical id, the engine recorded a replacement and the cleanup delete removed `Policy` from the topics the new document had just been written to (measured: after the update `GetTopicAttributes` returned no policy). `PolicyDocument` and `Topics` are both No interruption on the resource reference, so the resource now keeps its physical id, writes the new document on every topic the template names and removes it from a topic dropped from `Topics`. Contributed by @iot-rocket.
 
+- **CloudFormation — `AWS::SNS::Subscription` updates in place** — the type had no update handler, so a changed `FilterPolicy` or `RawMessageDelivery` re-subscribed under a fresh `SubscriptionArn` and the old subscription was deleted (measured: the `Ref` changed on every update), while the resource reference marks `DeliveryPolicy`, `FilterPolicy`, `FilterPolicyScope`, `RawMessageDelivery`, `RedrivePolicy` and `SubscriptionRoleArn` No interruption. Those now go through `SetSubscriptionAttributes` on the existing subscription, a dropped property reverts to what the create stores without it, and only `TopicArn`, `Protocol` or `Endpoint` replaces the subscription. The create also stores `DeliveryPolicy`, `RedrivePolicy` and `SubscriptionRoleArn`, which it dropped, and `SetSubscriptionAttributes` accepts `SubscriptionRoleArn` as the API does. Contributed by @iot-rocket.
+
 ## [1.5.10] — 2026-09-10
 
 ### Added

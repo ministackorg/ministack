@@ -6192,6 +6192,115 @@ def test_cfn_sns_subscription_raw_message_delivery(cfn, sns, sqs):
     _wait_stack(cfn, stack_name)
 
 
+def _sns_subscription_stack_template(uid, subscription):
+    return json.dumps({
+        "Resources": {
+            "Topic": {"Type": "AWS::SNS::Topic",
+                      "Properties": {"TopicName": f"cfn-sub-upd-topic-{uid}"}},
+            "QueueA": {"Type": "AWS::SQS::Queue",
+                       "Properties": {"QueueName": f"cfn-sub-upd-a-{uid}"}},
+            "QueueB": {"Type": "AWS::SQS::Queue",
+                       "Properties": {"QueueName": f"cfn-sub-upd-b-{uid}"}},
+            "Sub": {"Type": "AWS::SNS::Subscription", "Properties": subscription},
+        },
+        "Outputs": {"TopicArn": {"Value": {"Ref": "Topic"}},
+                    "SubscriptionArn": {"Value": {"Ref": "Sub"}}},
+    })
+
+
+def test_cfn_sns_subscription_updates_attributes_in_place(cfn, sns):
+    """FilterPolicy, FilterPolicyScope, RawMessageDelivery, DeliveryPolicy,
+    RedrivePolicy and SubscriptionRoleArn are No interruption on the resource reference: the
+    subscription keeps its ARN and GetSubscriptionAttributes reads the new
+    values. A property the template drops reverts to what the create
+    stores without it (no filter policy, MessageAttributes scope, raw
+    delivery off). Without an update handler every change re-subscribed
+    under a fresh ARN."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sns-sub-upd-{uid}"
+    base = {"TopicArn": {"Ref": "Topic"}, "Protocol": "sqs",
+            "Endpoint": {"Fn::GetAtt": ["QueueA", "Arn"]}}
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_sns_subscription_stack_template(uid, {
+        **base, "FilterPolicy": {"color": ["blue"]}, "RawMessageDelivery": True,
+    }))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        sub_arn = _output(stack, "SubscriptionArn")
+        attrs = sns.get_subscription_attributes(SubscriptionArn=sub_arn)["Attributes"]
+        assert json.loads(attrs["FilterPolicy"]) == {"color": ["blue"]}
+        assert attrs["RawMessageDelivery"] == "true"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_sns_subscription_stack_template(uid, {
+            **base,
+            "FilterPolicy": {"color": ["red"]},
+            "FilterPolicyScope": "MessageBody",
+            "RawMessageDelivery": True,
+            "DeliveryPolicy": {"healthyRetryPolicy": {"numRetries": 5}},
+            "RedrivePolicy": {"deadLetterTargetArn": {"Fn::GetAtt": ["QueueB", "Arn"]}},
+            "SubscriptionRoleArn": "arn:aws:iam::000000000000:role/cfn-sub-upd-role",
+        }))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "SubscriptionArn") == sub_arn
+        attrs = sns.get_subscription_attributes(SubscriptionArn=sub_arn)["Attributes"]
+        assert json.loads(attrs["FilterPolicy"]) == {"color": ["red"]}
+        assert attrs["FilterPolicyScope"] == "MessageBody"
+        assert attrs["RawMessageDelivery"] == "true"
+        assert json.loads(attrs["DeliveryPolicy"]) == {"healthyRetryPolicy": {"numRetries": 5}}
+        assert json.loads(attrs["RedrivePolicy"])["deadLetterTargetArn"].endswith(f":cfn-sub-upd-b-{uid}")
+        assert attrs["SubscriptionRoleArn"] == "arn:aws:iam::000000000000:role/cfn-sub-upd-role"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_sns_subscription_stack_template(uid, base))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "SubscriptionArn") == sub_arn
+        attrs = sns.get_subscription_attributes(SubscriptionArn=sub_arn)["Attributes"]
+        assert attrs.get("FilterPolicy", "") == ""
+        assert attrs["FilterPolicyScope"] == "MessageAttributes"
+        assert attrs["RawMessageDelivery"] == "false"
+        assert attrs.get("DeliveryPolicy", "") == ""
+        assert attrs.get("RedrivePolicy", "") == ""
+        assert attrs.get("SubscriptionRoleArn", "") == ""
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_sns_subscription_endpoint_change_replaces_it(cfn, sns):
+    """Endpoint requires replacement: the subscription to the new endpoint
+    is created and the old one removed, so the ARN changes and the topic
+    ends up with exactly one subscription."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sns-sub-rep-{uid}"
+
+    def subscription(queue):
+        return {"TopicArn": {"Ref": "Topic"}, "Protocol": "sqs",
+                "Endpoint": {"Fn::GetAtt": [queue, "Arn"]}}
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_sns_subscription_stack_template(uid, subscription("QueueA")))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        topic_arn = _output(stack, "TopicArn")
+        old_arn = _output(stack, "SubscriptionArn")
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_sns_subscription_stack_template(uid, subscription("QueueB")))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        new_arn = _output(stack, "SubscriptionArn")
+        assert new_arn != old_arn
+        subs = sns.list_subscriptions_by_topic(TopicArn=topic_arn)["Subscriptions"]
+        assert [s["SubscriptionArn"] for s in subs] == [new_arn]
+        assert subs[0]["Endpoint"].endswith(f":cfn-sub-upd-b-{uid}")
+        with pytest.raises(ClientError):
+            sns.get_subscription_attributes(SubscriptionArn=old_arn)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def _sqs_policy_sids(sqs, queue_url):
     """The statement ids of the queue's Policy attribute, [] when it has none."""
     policy = sqs.get_queue_attributes(
