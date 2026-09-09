@@ -17,18 +17,21 @@ only. ``WiFiAccessPoints``, ``CellTowers``, ``Gnss`` and
 ``AdvancedConfiguration`` are accepted and ignored, and none of them moves
 the estimate. The estimate is synthetic and deterministic: the canonical
 form of ``Ip.IpAddress`` is hashed (SHA-256) onto lon [-180, 180) / lat
-[-60, 60), 4 decimals, so the same request always answers byte-identical
-GeoJSON and a consumer test can assert on it.
+[-60, 60), 4 decimals, so the same address always answers the same estimate
+and a consumer test can assert on it.
 
 The blob's ``properties`` carry the two accuracy fields with the values of
 the single live call recorded for this work (eu-west-1, 2026-08-26):
 ``horizontalAccuracy`` 1000000 and ``horizontalConfidenceLevel`` 0.67. The
-``timestamp`` property is echoed from the request's ``Timestamp`` when the
-caller sends one, because AWS documents that member as the time at which the
-position is resolved, and is left out otherwise, so the payload stays a
-function of the input. The live payload's ``country`` is left out for the
-same reason, as are the ``city`` / ``state`` / ``postalCode`` properties the
-developer guide lists for IP lookups (documented divergence).
+``timestamp`` property is always there: AWS documents the request's
+``Timestamp`` as the time at which the position is resolved and says "if not
+specified, the time at which the request was received will be used", so the
+caller's value is echoed when there is one and the receive time stands in
+otherwise. That is the one part of the payload that is not a function of the
+request; send a ``Timestamp`` and the same request answers byte-identical
+GeoJSON. The live payload's ``country`` is left out for determinism, as are
+the ``city`` / ``state`` / ``postalCode`` properties the developer guide
+lists for IP lookups (documented divergence).
 
 Refusals mirror the live service verbatim (measured eu-west-1 2026-08-26).
 An input with no resolver hint answers ``ValidationException`` ``"1
@@ -166,10 +169,8 @@ def _get_position_estimate(body: bytes) -> tuple:
     properties = {
         "horizontalAccuracy": _HORIZONTAL_ACCURACY,
         "horizontalConfidenceLevel": _HORIZONTAL_CONFIDENCE_LEVEL,
+        "timestamp": _resolved_timestamp(payload),
     }
-    resolved_at = _resolved_timestamp(payload)
-    if resolved_at is not None:
-        properties["timestamp"] = resolved_at
     geojson = {
         "coordinates": [lon, lat],
         "type": "Point",
@@ -184,27 +185,34 @@ def _get_position_estimate(body: bytes) -> tuple:
     return 200, {"Content-Type": "application/octet-stream"}, blob
 
 
-def _resolved_timestamp(payload: dict) -> str | None:
-    """The value for ``properties.timestamp``, or None when there is none.
+def _resolved_timestamp(payload: dict) -> str:
+    """The value for ``properties.timestamp``. Always a value.
 
     AWS documents the request's ``Timestamp`` as "the time when the position
-    information will be resolved", in Unix timestamp format, and the live
-    payload reports that resolve time as an ISO-8601 string. MiniStack has no
-    clock in the answer, so it echoes what the caller sent: a number is
-    rendered the way the documented sample renders it, a string is passed
-    through unchanged, and anything else emits no property at all.
+    information will be resolved", in Unix timestamp format, and adds "if not
+    specified, the time at which the request was received will be used". The
+    developer guide lists the payload as carrying "the timestamp information,
+    which corresponds to the date and time at which the location was
+    resolved" and both documented sample payloads have it, as did the one
+    live call recorded for this work, so the property is never left out.
+
+    The caller's value is rendered the way the live payload reports the
+    resolve time, as an ISO-8601 string. The substituted receive time stands
+    in for a member in Unix timestamp format, so it is taken at whole-second
+    resolution.
     """
-    if "Timestamp" not in payload:
-        return None
-    value = payload["Timestamp"]
+    value = payload.get("Timestamp")
     if isinstance(value, str):
         return value
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    try:
-        moment = datetime.fromtimestamp(value, timezone.utc)
-    except (OSError, OverflowError, ValueError):
-        return None
+    if not isinstance(value, bool) and isinstance(value, (int, float)):
+        try:
+            return _render_timestamp(datetime.fromtimestamp(value, timezone.utc))
+        except (OSError, OverflowError, ValueError):
+            pass
+    return _render_timestamp(datetime.now(timezone.utc).replace(microsecond=0))
+
+
+def _render_timestamp(moment: datetime) -> str:
     return moment.isoformat().replace("+00:00", "Z")
 
 

@@ -54,9 +54,18 @@ def _raw(path, body, method="POST"):
         return e.code, e.headers.get("content-type"), e.read()
 
 
-def _estimate_bytes(client, ip):
-    response = client.get_position_estimate(Ip={"IpAddress": ip})
+def _estimate_bytes(client, ip, **members):
+    response = client.get_position_estimate(Ip={"IpAddress": ip}, **members)
     return response["GeoJsonPayload"].read()
+
+
+def _estimate_without_timestamp(client, ip, **members):
+    """The parsed blob with `properties.timestamp` removed. Without a
+    `Timestamp` in the request that property carries the receive time, so it
+    is the one part of the payload that is not a function of the request."""
+    document = json.loads(_estimate_bytes(client, ip, **members))
+    document["properties"].pop("timestamp")
+    return document
 
 
 def test_iotwireless_position_estimate_is_geojson_point_blob(iotwireless):
@@ -77,21 +86,29 @@ def test_iotwireless_accuracy_properties_carry_the_measured_values(iotwireless):
 
 
 def test_iotwireless_same_ip_answers_identical_bytes(iotwireless):
-    """The estimate is deterministic, so a consumer test can assert on it."""
-    first = _estimate_bytes(iotwireless, "5.6.7.8")
-    second = _estimate_bytes(iotwireless, "5.6.7.8")
+    """With a `Timestamp` the whole blob is a function of the request, so a
+    consumer test can assert on the bytes."""
+    first = _estimate_bytes(iotwireless, "5.6.7.8", Timestamp=_TIMESTAMP)
+    second = _estimate_bytes(iotwireless, "5.6.7.8", Timestamp=_TIMESTAMP)
+    assert first == second
+
+
+def test_iotwireless_same_ip_answers_the_same_estimate(iotwireless):
+    """Without a `Timestamp` everything but the resolve time still repeats."""
+    first = _estimate_without_timestamp(iotwireless, "5.6.7.8")
+    second = _estimate_without_timestamp(iotwireless, "5.6.7.8")
     assert first == second
 
 
 def test_iotwireless_equivalent_ip_spellings_answer_identical_bytes(iotwireless):
     """The hash runs over the canonical address, not the raw string."""
-    assert _estimate_bytes(iotwireless, "2600::1") == _estimate_bytes(
-        iotwireless, "2600:0:0:0:0:0:0:1"
-    )
+    assert _estimate_bytes(
+        iotwireless, "2600::1", Timestamp=_TIMESTAMP
+    ) == _estimate_bytes(iotwireless, "2600:0:0:0:0:0:0:1", Timestamp=_TIMESTAMP)
     # An IPv4-mapped IPv6 address is the IPv4 address.
-    assert _estimate_bytes(iotwireless, "::ffff:1.2.3.4") == _estimate_bytes(
-        iotwireless, "1.2.3.4"
-    )
+    assert _estimate_bytes(
+        iotwireless, "::ffff:1.2.3.4", Timestamp=_TIMESTAMP
+    ) == _estimate_bytes(iotwireless, "1.2.3.4", Timestamp=_TIMESTAMP)
 
 
 def test_iotwireless_different_ips_answer_different_coordinates(iotwireless):
@@ -104,15 +121,12 @@ def test_iotwireless_different_ips_answer_different_coordinates(iotwireless):
 def test_iotwireless_non_ip_members_do_not_move_the_estimate(iotwireless, member):
     """Each non-Ip member is accepted and none of them resolves the position.
     `Timestamp` is the one that leaves a trace: AWS documents it as the time
-    the position is resolved, so it is echoed into `properties.timestamp` and
-    dropped here before the comparison. Nothing else may differ."""
-    document = json.loads(
-        iotwireless.get_position_estimate(
-            Ip={"IpAddress": "5.6.7.8"}, **{member: _NON_IP_MEMBERS[member]}
-        )["GeoJsonPayload"].read()
+    the position is resolved, so it reaches `properties.timestamp`, which the
+    comparison drops on both sides. Nothing else may differ."""
+    with_member = _estimate_without_timestamp(
+        iotwireless, "5.6.7.8", **{member: _NON_IP_MEMBERS[member]}
     )
-    document["properties"].pop("timestamp", None)
-    assert document == json.loads(_estimate_bytes(iotwireless, "5.6.7.8"))
+    assert with_member == _estimate_without_timestamp(iotwireless, "5.6.7.8")
 
 
 def test_iotwireless_timestamp_is_echoed_into_the_properties(iotwireless):
@@ -120,17 +134,23 @@ def test_iotwireless_timestamp_is_echoed_into_the_properties(iotwireless):
     resolved, and the live payload reports that time in `properties`. The
     request's value is echoed, so the blob stays a function of the input."""
     document = json.loads(
-        iotwireless.get_position_estimate(
-            Ip={"IpAddress": "5.6.7.8"}, Timestamp=_TIMESTAMP
-        )["GeoJsonPayload"].read()
+        _estimate_bytes(iotwireless, "5.6.7.8", Timestamp=_TIMESTAMP)
     )
     assert document["properties"]["timestamp"] == _TIMESTAMP_RENDERED
 
 
-def test_iotwireless_timestamp_absent_leaves_the_property_out(iotwireless):
-    """No `Timestamp` in the request, no `timestamp` in the payload."""
+def test_iotwireless_timestamp_absent_is_the_receive_time(iotwireless):
+    """AWS documents the member as "if not specified, the time at which the
+    request was received will be used", the developer guide describes the
+    payload's `timestamp` as the time the location was resolved, and both
+    documented sample payloads carry it, so it is never left out."""
+    before = datetime.now(timezone.utc).replace(microsecond=0)
     document = json.loads(_estimate_bytes(iotwireless, "5.6.7.8"))
-    assert "timestamp" not in document["properties"]
+    after = datetime.now(timezone.utc)
+    resolved = datetime.fromisoformat(
+        document["properties"]["timestamp"].replace("Z", "+00:00")
+    )
+    assert before <= resolved <= after
 
 
 def test_iotwireless_coordinates_clamped_to_half_open_intervals():
@@ -215,14 +235,20 @@ def test_iotwireless_unsigned_raw_post_answers_the_bare_geojson_blob(iotwireless
     body is the raw GeoJSON Point with no envelope key, byte-identical to
     what the SDK client streams."""
     status, content_type, body = _raw(
-        "/position-estimate", json.dumps({"Ip": {"IpAddress": "1.2.3.4"}}).encode()
+        "/position-estimate",
+        json.dumps({
+            "Ip": {"IpAddress": "1.2.3.4"},
+            # A Unix timestamp, the wire form boto3 sends the member in, so
+            # the two answers are comparable byte for byte.
+            "Timestamp": _TIMESTAMP.timestamp(),
+        }).encode(),
     )
     assert status == 200
     assert content_type == "application/octet-stream"
     document = json.loads(body)
     assert document["type"] == "Point"
     assert "GeoJsonPayload" not in document
-    assert body == _estimate_bytes(iotwireless, "1.2.3.4")
+    assert body == _estimate_bytes(iotwireless, "1.2.3.4", Timestamp=_TIMESTAMP)
 
 
 @pytest.mark.parametrize("ip_member", [{}, {"IpAddress": ""}])
