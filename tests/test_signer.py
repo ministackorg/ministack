@@ -686,6 +686,94 @@ def test_signer_put_profile_accepts_a_partial_validity_period(signer):
         assert signer.get_signing_profile(profileName=name)["profileName"] == name
 
 
+def test_signer_put_profile_rejects_an_unknown_override_enum(signer):
+    """SigningPlatformOverrides.signingImageFormat is JSON | JSONEmbedded |
+    JSONDetached, and the nested configuration overrides are RSA | ECDSA and
+    SHA1 | SHA256. botocore does not check enums client-side."""
+    for overrides in (
+        {"signingImageFormat": "PNG"},
+        {"signingConfiguration": {"encryptionAlgorithm": "DSA"}},
+        {"signingConfiguration": {"hashAlgorithm": "MD5"}},
+    ):
+        with pytest.raises(ClientError) as exc:
+            signer.put_signing_profile(
+                profileName=f"ovr_{_uid()}",
+                platformId=_IOT_PLATFORM,
+                overrides=overrides,
+            )
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+    # The documented values are accepted.
+    name = f"ovr_{_uid()}"
+    signer.put_signing_profile(
+        profileName=name,
+        platformId=_IOT_PLATFORM,
+        overrides={
+            "signingImageFormat": "JSONDetached",
+            "signingConfiguration": {"encryptionAlgorithm": "ECDSA",
+                                     "hashAlgorithm": "SHA256"},
+        },
+    )
+    profile = signer.get_signing_profile(profileName=name)
+    assert profile["overrides"]["signingImageFormat"] == "JSONDetached"
+
+
+def test_signer_put_profile_requires_the_signing_material_certificate(signer):
+    """SigningMaterial.certificateArn is the shape's one member and is
+    Required: Yes."""
+    # botocore enforces the required member client-side, so the server-side
+    # check is reachable only from a client that does not validate.
+    raw_signer = make_client("signer", {"parameter_validation": False})
+    with pytest.raises(ClientError) as exc:
+        raw_signer.put_signing_profile(
+            profileName=f"mat_{_uid()}",
+            platformId=_IOT_PLATFORM,
+            signingMaterial={},
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_signer_put_profile_enforces_the_tag_constraints(signer):
+    """Keys are 1..128 and match ^(?!aws:)[a-zA-Z+-=._:/]+$, values are at
+    most 256 characters, and the map takes at most 200 entries."""
+    for tags in (
+        {"aws:reserved": "x"},
+        {"has space": "x"},
+        {"k" * 129: "x"},
+        {"k": "v" * 257},
+        {f"k{i}": "v" for i in range(201)},
+    ):
+        with pytest.raises(ClientError) as exc:
+            signer.put_signing_profile(
+                profileName=f"tag_{_uid()}", platformId=_IOT_PLATFORM, tags=tags)
+        assert exc.value.response["Error"]["Code"] == "ValidationException", tags
+
+    name = f"tag_{_uid()}"
+    signer.put_signing_profile(
+        profileName=name, platformId=_IOT_PLATFORM, tags={"team.name": "iot"})
+    assert signer.get_signing_profile(profileName=name)["tags"] == {"team.name": "iot"}
+
+
+def test_signer_rejects_malformed_account_id_members(signer, s3, buckets, profile):
+    """jobInvoker on ListSigningJobs and profileOwner on StartSigningJob are
+    both a fixed length of 12 digits."""
+    raw_signer = make_client("signer", {"parameter_validation": False})
+    with pytest.raises(ClientError) as exc:
+        raw_signer.list_signing_jobs(jobInvoker="not-an-account")
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+    src, dst = buckets
+    s3.put_object(Bucket=src, Key="owner.bin", Body=b"x")
+    with pytest.raises(ClientError) as exc:
+        raw_signer.start_signing_job(
+            source={"s3": {"bucketName": src, "key": "owner.bin"}},
+            destination={"s3": {"bucketName": dst}},
+            profileName=profile,
+            profileOwner="12345",
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
 def test_signer_put_profile_rejects_unknown_validity_unit(signer):
     """SignatureValidityPeriod.type: DAYS | MONTHS | YEARS."""
     with pytest.raises(ClientError) as exc:

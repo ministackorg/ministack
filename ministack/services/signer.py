@@ -151,6 +151,14 @@ _PROFILE_NAME_RE = re.compile(r"[a-zA-Z0-9_]{2,64}")
 
 _JOB_STATUSES = ("InProgress", "Failed", "Succeeded")
 _VALIDITY_UNITS = ("DAYS", "MONTHS", "YEARS")
+# SigningPlatformOverrides / SigningConfigurationOverrides valid values, and
+# the tags map constraints PutSigningProfile documents.
+_IMAGE_FORMATS = ("JSON", "JSONEmbedded", "JSONDetached")
+_ENCRYPTION_ALGORITHMS = ("RSA", "ECDSA")
+_HASH_ALGORITHMS = ("SHA1", "SHA256")
+_MAX_TAGS = 200
+_TAG_KEY_RE = re.compile(r"[a-zA-Z+\-=._:/]+")
+_ACCOUNT_ID_RE = re.compile(r"[0-9]{12}")
 # PutSigningProfile reference: "If unspecified, the default is 135 months."
 _DEFAULT_VALIDITY = {"type": "MONTHS", "value": 135}
 # The one platform whose signed-object key was measured to differ.
@@ -197,6 +205,87 @@ def _validate_profile_name(name):
         return _error(400, "ValidationException",
                       f"profileName {name!r} must be 2 to 64 characters "
                       "matching ^[a-zA-Z0-9_]{2,}.")
+    return None
+
+
+def _validate_overrides(overrides):
+    """The two enums SigningPlatformOverrides documents, plus the pair on the
+    SigningConfigurationOverrides it nests. botocore does not check enums
+    client-side, so an unknown value reaches the service, which refuses it."""
+    if overrides is None:
+        return None
+    if not isinstance(overrides, dict):
+        return _error(400, "ValidationException", "overrides must be a structure.")
+    image_format = overrides.get("signingImageFormat")
+    if image_format is not None and image_format not in _IMAGE_FORMATS:
+        return _error(400, "ValidationException",
+                      f"Invalid value for overrides.signingImageFormat: "
+                      f"{image_format!r}; expected one of "
+                      f"{', '.join(_IMAGE_FORMATS)}.")
+    config = overrides.get("signingConfiguration")
+    if config is None:
+        return None
+    if not isinstance(config, dict):
+        return _error(400, "ValidationException",
+                      "overrides.signingConfiguration must be a structure.")
+    for member, allowed in (("encryptionAlgorithm", _ENCRYPTION_ALGORITHMS),
+                            ("hashAlgorithm", _HASH_ALGORITHMS)):
+        value = config.get(member)
+        if value is not None and value not in allowed:
+            return _error(400, "ValidationException",
+                          f"Invalid value for overrides.signingConfiguration."
+                          f"{member}: {value!r}; expected one of "
+                          f"{', '.join(allowed)}.")
+    return None
+
+
+def _validate_signing_material(material):
+    """certificateArn is the shape's one member and is Required: Yes. The
+    certificate itself is not resolved: nothing signs for real here, so there
+    is no ACM lookup to make."""
+    if material is None:
+        return None
+    if not isinstance(material, dict):
+        return _error(400, "ValidationException",
+                      "signingMaterial must be a structure.")
+    if not isinstance(material.get("certificateArn"), str) or not material["certificateArn"]:
+        return _error(400, "ValidationException",
+                      "signingMaterial.certificateArn is required.")
+    return None
+
+
+def _validate_tags(tags):
+    """The map constraints PutSigningProfile documents: at most 200 entries,
+    keys 1..128 matching `^(?!aws:)[a-zA-Z+-=._:/]+$`, values at most 256."""
+    if tags is None:
+        return None
+    if not isinstance(tags, dict):
+        return _error(400, "ValidationException", "tags must be a map.")
+    if len(tags) > _MAX_TAGS:
+        return _error(400, "ValidationException",
+                      f"tags must have at most {_MAX_TAGS} entries, got {len(tags)}.")
+    for key, value in tags.items():
+        if not isinstance(key, str) or not 1 <= len(key) <= 128:
+            return _error(400, "ValidationException",
+                          f"Invalid tag key: {key!r}; keys are 1 to 128 characters.")
+        if key.startswith("aws:") or not _TAG_KEY_RE.fullmatch(key):
+            return _error(400, "ValidationException",
+                          f"Invalid tag key: {key!r}; keys match "
+                          "^(?!aws:)[a-zA-Z+-=._:/]+$.")
+        if not isinstance(value, str) or len(value) > 256:
+            return _error(400, "ValidationException",
+                          f"Invalid tag value for {key!r}; values are at most "
+                          "256 characters.")
+    return None
+
+
+def _validate_account_id(value, field):
+    """jobInvoker and profileOwner are both a fixed length of 12 digits."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _ACCOUNT_ID_RE.fullmatch(value):
+        return _error(400, "ValidationException",
+                      f"Invalid value for {field}: {value!r}; expected 12 digits.")
     return None
 
 
@@ -302,6 +391,12 @@ def _start_signing_job(body):
     s3_source = (body.get("source") or {}).get("s3") or {}
     s3_dest = (body.get("destination") or {}).get("s3") or {}
     profile_name = body.get("profileName")
+
+    # profileOwner is accepted without effect, but its shape is documented and
+    # a malformed value is a 400 on AWS rather than a silently ignored member.
+    owner_problem = _validate_account_id(body.get("profileOwner"), "profileOwner")
+    if owner_problem is not None:
+        return owner_problem
 
     src_bucket = s3_source.get("bucketName")
     src_key = s3_source.get("key")
@@ -504,6 +599,9 @@ def _list_signing_jobs(query):
                           f"Invalid value for isRevoked: {is_revoked!r}.")
         if str(is_revoked).lower() == "true":
             return json_response({"jobs": []})
+    invoker_problem = _validate_account_id(query.get("jobInvoker"), "jobInvoker")
+    if invoker_problem is not None:
+        return invoker_problem
     equality = {
         field: query[field]
         for field in ("platformId", "requestedBy", "jobInvoker")
@@ -564,6 +662,11 @@ def _put_signing_profile(name, body):
         if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
             return _error(400, "ValidationException",
                           "signatureValidityPeriod.value must be an integer.")
+    for problem in (_validate_overrides(body.get("overrides")),
+                    _validate_signing_material(body.get("signingMaterial")),
+                    _validate_tags(body.get("tags"))):
+        if problem is not None:
+            return problem
     profile = _register_profile(name, body)
     return json_response({
         "arn": profile["arn"],
