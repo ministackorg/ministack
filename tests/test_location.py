@@ -175,6 +175,35 @@ def test_location_unknown_tracker_operations_404(location):
     assert excinfo.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
+def test_location_invalid_request_beats_the_missing_tracker(location):
+    """An invalid member is refused before the tracker is looked up: AWS
+    validates the request in front of the operation, so a bad request naming
+    a tracker that does not exist answers 400, not the 404 of the lookup."""
+    missing = "no-such-tracker"
+    with pytest.raises(ClientError) as excinfo:
+        location.update_tracker(TrackerName=missing, PositionFiltering="Bogus")
+    assert excinfo.value.response["Error"]["Code"] == "ValidationException"
+    with pytest.raises(ClientError) as excinfo:
+        location.batch_update_device_position(
+            TrackerName=missing,
+            Updates=[{
+                "DeviceId": "veh-1", "SampleTime": _ts(0), "Position": [1.0, 1.0],
+                "PositionProperties": {f"p{i}": "v" for i in range(5)},
+            }],
+        )
+    assert excinfo.value.response["Error"]["Code"] == "ValidationException"
+    with pytest.raises(ClientError) as excinfo:
+        location.batch_get_device_position(
+            TrackerName=missing, DeviceIds=[f"d{i}" for i in range(11)]
+        )
+    assert excinfo.value.response["Error"]["Code"] == "ValidationException"
+    with pytest.raises(ClientError) as excinfo:
+        location.get_device_position_history(
+            TrackerName=missing, DeviceId="veh-1", MaxResults=101
+        )
+    assert excinfo.value.response["Error"]["Code"] == "ValidationException"
+
+
 def test_location_update_tracker_round_trip(location):
     name = _uid()
     location.create_tracker(TrackerName=name, Description="v1")

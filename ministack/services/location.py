@@ -45,7 +45,10 @@ Scope boundaries (metadata-only control plane + in-memory position store):
     (1..100, default 100) with a ``NextToken`` carrying the sort position of
     the last item returned.
   * The documented member constraints are refused with a
-    ``ValidationException`` before the request is processed: ``Description``
+    ``ValidationException`` before the request is processed — before the
+    tracker is looked up, so an invalid request naming a tracker that does
+    not exist answers 400, the way a real request-validation layer sitting in
+    front of the operation does, not 404: ``Description``
     0..1000, ``KmsKeyId`` 1..2048, ``Tags`` at most 50 entries with keys
     1..128 and values 0..256 on the tag pattern, ``PositionProperties`` at
     most 4 entries with keys 1..20 and values 1..150. The message wordings
@@ -478,12 +481,12 @@ def _describe_tracker(name):
 
 
 def _update_tracker(name, body):
-    rec = _trackers.get(name)
-    if rec is None:
-        return _not_found(name)
     err = _validate_settings(body)
     if err is not None:
         return err
+    rec = _trackers.get(name)
+    if rec is None:
+        return _not_found(name)
     for field in _MUTABLE_FIELDS:
         if field in body:
             rec[field] = body[field]
@@ -627,9 +630,6 @@ def _is_filtered_out(mode, previous, sample_time, position, accuracy):
 
 
 def _batch_update_positions(name, body):
-    rec = _trackers.get(name)
-    if rec is None:
-        return _not_found(name)
     updates = body.get("Updates")
     if not isinstance(updates, list) or not updates:
         return _constraint(
@@ -645,6 +645,9 @@ def _batch_update_positions(name, body):
         if err is not None:
             return err
         parsed.append((update, *members))
+    rec = _trackers.get(name)
+    if rec is None:
+        return _not_found(name)
     errors = []
     # One receive time for the whole batch: the request arrived once, and a
     # per-entry clock read would make the order of two samples that share a
@@ -709,9 +712,6 @@ def _get_device_position(name, device_id):
 
 
 def _batch_get_positions(name, body):
-    rec = _trackers.get(name)
-    if rec is None:
-        return _not_found(name)
     device_ids = body.get("DeviceIds")
     if not isinstance(device_ids, list) or not device_ids:
         return _constraint(
@@ -721,6 +721,9 @@ def _batch_get_positions(name, body):
         return _constraint(
             len(device_ids), "deviceIds", "Member must have length less than or equal to 10"
         )
+    rec = _trackers.get(name)
+    if rec is None:
+        return _not_found(name)
     # A device without a position is left out and Errors stays empty, as the
     # live service answered (probed 2026-08-26, one found + one missing).
     found = []
@@ -732,9 +735,6 @@ def _batch_get_positions(name, body):
 
 
 def _get_position_history(name, device_id, body):
-    rec = _trackers.get(name)
-    if rec is None:
-        return _not_found(name)
     max_results, err = _max_results(body)
     if err is not None:
         return err
@@ -744,6 +744,9 @@ def _get_position_history(name, device_id, body):
         cursor = _decode_token(token, (float, float, int))
         if cursor is None:
             return _validation(_INVALID_TOKEN)
+    rec = _trackers.get(name)
+    if rec is None:
+        return _not_found(name)
     device = rec["positions"].get(device_id, {})
     # Documented defaults when the members are omitted: the 24 hours up to now.
     start = _parse_timestamp(body.get("StartTimeInclusive"))
